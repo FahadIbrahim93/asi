@@ -995,7 +995,19 @@ class _HCCLRoutedContinualDyadOperationalExecutor:
         self,
         next_hard_action_masks: Array | None = None,
     ) -> HCCLRoutedContinualDyadOperationalEventResult:
-        """Compute and bind one result to the owned source before publication."""
+        """Prepare, validate, and bind one result before atomic publication.
+
+        Failure atomicity: no owned attribute is read beyond the executor's own
+        counters and no owned field is written until every gate below has
+        passed, so a failing step leaves ``state`` and ``absolute_step``
+        exactly as they were.  Any non-domain exception raised inside the
+        preparation dispatch surfaces as the typed ``routed-preparation``
+        error; a checkpoint-due candidate is validated before the source and
+        transcript are ever dereferenced, so a rejected candidate surfaces as
+        its checkpoint-stage error rather than an incidental attribute error.
+        The owned source is a frozen pytree, so reading its clock after the
+        dispatch observes the same values it held before.
+        """
 
         if self._absolute_step >= self._maximum_transitions:
             raise HCCLRoutedContinualDyadOperationalError(
@@ -1003,18 +1015,6 @@ class _HCCLRoutedContinualDyadOperationalExecutor:
                 "configured routed life has no remaining transition capacity",
             )
         source = self._state
-        source_words = _host_array(
-            source.hccl_state.world_state.step_words,
-            name="executor routed source clock",
-            shape=(2,),
-            dtype=np.dtype(np.uint32),
-        )
-        source_token = _host_array(
-            source.content_token,
-            name="executor routed source content token",
-            shape=(_TOKEN_NBYTES,),
-            dtype=np.dtype(np.uint8),
-        )
         try:
             result = _execute_routed_operational_event(
                 self._owner,
@@ -1035,24 +1035,60 @@ class _HCCLRoutedContinualDyadOperationalExecutor:
             )
 
         next_step = self._absolute_step + 1
-        transcript_pre = _host_array(
-            result.transcript.pre_transaction_words,
-            name="result transcript pre clock",
-            shape=(2,),
-            dtype=np.dtype(np.uint32),
+        final_step = next_step == self._maximum_transitions
+        periodic_due = (
+            self._checkpoint_interval is not None
+            and next_step % self._checkpoint_interval == 0
         )
-        transcript_post = _host_array(
-            result.transcript.post_transaction_words,
-            name="result transcript post clock",
-            shape=(2,),
-            dtype=np.dtype(np.uint32),
-        )
-        transcript_token = _host_array(
-            result.transcript.source_state_content_token,
-            name="result transcript source content token",
-            shape=(_TOKEN_NBYTES,),
-            dtype=np.dtype(np.uint8),
-        )
+        checkpoint_due = final_step or periodic_due
+        stage = "final-checkpoint" if final_step else "periodic-checkpoint"
+        if checkpoint_due:
+            try:
+                _host_true(
+                    self._owner.state_valid(result.state),
+                    name=f"{stage} routed candidate validity",
+                )
+            except (AttributeError, RuntimeError, TypeError, ValueError) as error:
+                raise HCCLRoutedContinualDyadOperationalError(stage, str(error)) from error
+
+        try:
+            source_words = _host_array(
+                source.hccl_state.world_state.step_words,
+                name="executor routed source clock",
+                shape=(2,),
+                dtype=np.dtype(np.uint32),
+            )
+            source_token = _host_array(
+                source.content_token,
+                name="executor routed source content token",
+                shape=(_TOKEN_NBYTES,),
+                dtype=np.dtype(np.uint8),
+            )
+            transcript_pre = _host_array(
+                result.transcript.pre_transaction_words,
+                name="result transcript pre clock",
+                shape=(2,),
+                dtype=np.dtype(np.uint32),
+            )
+            transcript_post = _host_array(
+                result.transcript.post_transaction_words,
+                name="result transcript post clock",
+                shape=(2,),
+                dtype=np.dtype(np.uint32),
+            )
+            transcript_token = _host_array(
+                result.transcript.source_state_content_token,
+                name="result transcript source content token",
+                shape=(_TOKEN_NBYTES,),
+                dtype=np.dtype(np.uint8),
+            )
+        except HCCLRoutedContinualDyadOperationalError:
+            raise
+        except (AttributeError, RuntimeError, TypeError, ValueError) as error:
+            raise HCCLRoutedContinualDyadOperationalError(
+                "source-transcript-binding",
+                str(error),
+            ) from error
         expected_pre = np.asarray((0, self._absolute_step), dtype=np.uint32)
         expected_post = np.asarray((0, next_step), dtype=np.uint32)
         if not (
@@ -1066,21 +1102,7 @@ class _HCCLRoutedContinualDyadOperationalExecutor:
                 "result does not name the executor's exact source token and next clock",
             )
 
-        final_step = next_step == self._maximum_transitions
-        periodic_due = (
-            self._checkpoint_interval is not None
-            and next_step % self._checkpoint_interval == 0
-        )
-        checkpoint_due = final_step or periodic_due
         if checkpoint_due:
-            stage = "final-checkpoint" if final_step else "periodic-checkpoint"
-            try:
-                _host_true(
-                    self._owner.state_valid(result.state),
-                    name=f"{stage} routed candidate validity",
-                )
-            except (AttributeError, RuntimeError, TypeError, ValueError) as error:
-                raise HCCLRoutedContinualDyadOperationalError(stage, str(error)) from error
             result = dataclasses.replace(
                 result,
                 work=dataclasses.replace(
