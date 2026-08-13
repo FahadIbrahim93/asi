@@ -1,7 +1,12 @@
-# Alberta Framework
+# ASI — Alberta Framework
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
+
+The elizaOS continual-reinforcement-learning research track, extracted from
+[`elizaOS/eliza`](https://github.com/elizaOS/eliza)'s research tree with full
+history. Accepted contributions share a pledged **$5,000 USDC monthly pool**
+via [slop.cash/projects/asi](https://slop.cash/projects/asi).
 
 A JAX-based research framework for investigating
 [The Alberta Plan for AI Research](https://arxiv.org/abs/2208.11173). The
