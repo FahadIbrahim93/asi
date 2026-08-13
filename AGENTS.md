@@ -10,9 +10,14 @@ floor intact.
 
 **Current headline lane:** the IPMNIST screening/confirmation campaign —
 development-grade and permanently nonpromoting. Best stored development
-means: `sigma0_ndecay099` 0.86245 (protocol-extended: EMA input
-normalization decay 0.99 + utility-gated SGD, no noise) and `adamw_cbp_r3e4`
-0.80126 (protocol-pure) vs the 0.7791 published-config UPGD-W reproduction.
+means at 200 tasks, n=20 (seeds 0–19): `rls_head_resid_l1_preset005`
+**0.87114** ± 0.00010 (RLS-residual-trained body — the standing record) and
+`sigma0_shiftnorm_d099` **0.86449** ± 0.00009 (the incumbent A/B baseline;
+paired diff +0.00665, all 20 seeds improve). Protocol-pure best remains
+`adamw_cbp_r3e4` 0.80126, vs the 0.7791 published-config UPGD-W
+reproduction. These move — read `summary_*.json` and
+`publication_runs/RESULTS.md` under `outputs/ipmnist_screening/` rather than
+this line, and re-measure the baseline yourself before any A/B.
 Theory of record: `CONTINUAL_LEARNING_THEORY.md`; forward plan:
 `RESEARCH_REPORT_AGE_OF_EXPERIENCE.md`; raw record + audit:
 `outputs/ipmnist_screening/`. Second active lane: the Forager matched-v3
