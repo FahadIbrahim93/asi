@@ -1026,8 +1026,23 @@ def _differential_q_update(
     action_mask = jax.nn.one_hot(last_action, n_actions, dtype=jnp.float32)
     new_traces = lam * traces + action_mask[:, None] * last_obs[None, :]
     delta_w = alpha * td_error * new_traces
-    new_q_weights = q_weights + delta_w
-    new_average_reward = average_reward + beta * td_error
+    proposed_q = q_weights + delta_w
+    proposed_rbar = average_reward + beta * td_error
+    inputs_valid = (
+        jnp.all(jnp.isfinite(last_obs))
+        & jnp.isfinite(jnp.asarray(reward, dtype=jnp.float32))
+        & jnp.all(jnp.isfinite(next_obs))
+    )
+    proposed_finite = (
+        jnp.all(jnp.isfinite(proposed_q))
+        & jnp.all(jnp.isfinite(new_traces))
+        & jnp.isfinite(proposed_rbar)
+    )
+    new_q_weights, new_traces, new_average_reward = jax.lax.cond(
+        inputs_valid & proposed_finite,
+        lambda: (proposed_q, new_traces, proposed_rbar),
+        lambda: (q_weights, traces, average_reward),
+    )
     return new_q_weights, new_traces, new_average_reward, td_error
 
 
@@ -1089,8 +1104,25 @@ def _differential_semidp_q_update(
     action_mask = jax.nn.one_hot(last_action, n_actions, dtype=jnp.float32)
     new_traces = lam * traces + action_mask[:, None] * last_obs[None, :]
     delta_w = alpha * td_error * new_traces
-    new_q_weights = q_weights + delta_w
-    new_average_reward = average_reward + beta * td_error
+    proposed_q = q_weights + delta_w
+    proposed_rbar = average_reward + beta * td_error
+    inputs_valid = (
+        jnp.all(jnp.isfinite(last_obs))
+        & jnp.isfinite(jnp.asarray(reward, dtype=jnp.float32))
+        & jnp.all(jnp.isfinite(next_obs))
+        & jnp.isfinite(baseline_coefficient)
+        & jnp.isfinite(gamma_o)
+    )
+    proposed_finite = (
+        jnp.all(jnp.isfinite(proposed_q))
+        & jnp.all(jnp.isfinite(new_traces))
+        & jnp.isfinite(proposed_rbar)
+    )
+    new_q_weights, new_traces, new_average_reward = jax.lax.cond(
+        inputs_valid & proposed_finite,
+        lambda: (proposed_q, new_traces, proposed_rbar),
+        lambda: (q_weights, traces, average_reward),
+    )
     return new_q_weights, new_traces, new_average_reward, td_error
 
 
@@ -1262,8 +1294,25 @@ def _update_intra_option_policy(
 
     action_mask = jax.nn.one_hot(last_intra_action, n_primitive_actions, dtype=jnp.float32)
     new_traces_i = rho * (lam * traces_i + action_mask[:, None] * last_obs[None, :])
-    new_q_i = q_i + alpha * td_error * new_traces_i
-    new_avg_r_i = avg_r_i + beta * rho * td_error
+    proposed_q_i = q_i + alpha * td_error * new_traces_i
+    proposed_avg_r_i = avg_r_i + beta * rho * td_error
+    inputs_valid = (
+        jnp.all(jnp.isfinite(last_obs))
+        & jnp.isfinite(jnp.asarray(pseudo_reward, dtype=jnp.float32))
+        & jnp.all(jnp.isfinite(next_obs))
+        & jnp.isfinite(transition_discount)
+        & jnp.isfinite(rho)
+    )
+    proposed_finite = (
+        jnp.all(jnp.isfinite(proposed_q_i))
+        & jnp.all(jnp.isfinite(new_traces_i))
+        & jnp.isfinite(proposed_avg_r_i)
+    )
+    new_q_i, new_traces_i, new_avg_r_i = jax.lax.cond(
+        inputs_valid & proposed_finite,
+        lambda: (proposed_q_i, new_traces_i, proposed_avg_r_i),
+        lambda: (q_i, traces_i, avg_r_i),
+    )
 
     n_opts = option_policies.average_rewards.shape[0]
     option_mask = jnp.arange(n_opts, dtype=jnp.int32) == option_idx

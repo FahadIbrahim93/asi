@@ -15,6 +15,8 @@ from alberta_framework.core.options import (
     STOMPSpecArrays,
     STOMPState,
     SubtaskSpec,
+    _differential_q_update,
+    _differential_semidp_q_update,
     load_stomp_state_with_migration,
     replace_dispatched_primitive_action,
     stomp_state_to_checkpoint_payload,
@@ -259,3 +261,53 @@ def test_primitive_only_stomp_has_typed_empty_option_state_and_base_only_updates
             n_primitive_actions=N_PRIMITIVE,
             option_planning_backups_per_step=1,
         )
+
+
+def test_differential_q_infinite_reward_does_not_poison_weights() -> None:
+    """Inf reward is 0*inf = NaN on silent features and unused actions."""
+    n_actions, dim = 2, 2
+    q = jnp.zeros((n_actions, dim), dtype=jnp.float32)
+    z = jnp.zeros((n_actions, dim), dtype=jnp.float32)
+    rbar = jnp.array(0.0, dtype=jnp.float32)
+    obs = jnp.array([0.0, 1.0], dtype=jnp.float32)
+    action = jnp.int32(0)
+    nxt = jnp.array([0.0, 1.0], dtype=jnp.float32)
+    kw = dict(step_size=0.1, avg_reward_step_size=0.01, trace_decay=0.0, n_actions=n_actions)
+
+    new_q, new_z, new_rbar, _td = _differential_q_update(
+        q, z, rbar, obs, action, jnp.array(jnp.inf, dtype=jnp.float32), nxt, **kw
+    )
+    chex.assert_trees_all_close(new_q, q)
+    chex.assert_trees_all_close(new_z, z)
+    chex.assert_trees_all_close(new_rbar, rbar)
+
+    recovered_q, _, recovered_rbar, _ = _differential_q_update(
+        new_q, new_z, new_rbar, obs, action, jnp.array(1.0, dtype=jnp.float32), nxt, **kw
+    )
+    chex.assert_tree_all_finite(recovered_q)
+    chex.assert_tree_all_finite(recovered_rbar)
+
+
+def test_semidp_q_infinite_reward_does_not_poison_weights() -> None:
+    n_actions, dim = 2, 2
+    q = jnp.zeros((n_actions, dim), dtype=jnp.float32)
+    z = jnp.zeros((n_actions, dim), dtype=jnp.float32)
+    rbar = jnp.array(0.0, dtype=jnp.float32)
+    obs = jnp.array([0.0, 1.0], dtype=jnp.float32)
+    action = jnp.int32(0)
+    nxt = jnp.array([0.0, 1.0], dtype=jnp.float32)
+    kw = dict(
+        step_size=0.1,
+        avg_reward_step_size=0.01,
+        trace_decay=0.0,
+        n_actions=n_actions,
+        baseline_mass=jnp.array(1.0, dtype=jnp.float32),
+        discount=jnp.array(1.0, dtype=jnp.float32),
+    )
+
+    new_q, new_z, new_rbar, _td = _differential_semidp_q_update(
+        q, z, rbar, obs, action, jnp.array(jnp.inf, dtype=jnp.float32), nxt, **kw
+    )
+    chex.assert_trees_all_close(new_q, q)
+    chex.assert_trees_all_close(new_z, z)
+    chex.assert_trees_all_close(new_rbar, rbar)
