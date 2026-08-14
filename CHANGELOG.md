@@ -89,9 +89,10 @@ measurements remain in their primary output records; none promotes a registry cl
   from being merged or deterministic trajectories from being counted twice.
 - IDBD now preserves finite weight and bias step-size state when a non-finite meta-update
   reaches the clip guard, while retaining the existing bitwise finite-update trajectory.
-- IPMNIST shard merging now refuses a missing named control instead of emitting a
-  comparison-less summary. Sigma-zero screening factories share one RNG-free noise path,
-  keeping the reference and inert extension on identical lowered graphs.
+- IPMNIST shard merging now refuses a missing named control or a candidate with no shared
+  control seeds instead of ranking a comparison-less entry. Sigma-zero screening factories
+  share one RNG-free noise path, keeping the reference and inert extension on identical
+  lowered graphs.
 
 ### Removed
 
