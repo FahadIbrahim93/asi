@@ -252,20 +252,31 @@ class CumulantDiscovery:
 
         # Predictor update (per-candidate semi-gradient TD step)
         # weights_i += alpha * td_i * obs
-        new_weights = state.weights + alpha * td[:, None] * observation[None, :]
-        new_biases = state.biases + alpha * td
-
-        # Utility EMA on squared surprise
-        new_utility = decay * state.utility + (1.0 - decay) * (td**2)
-        new_ages = state.ages + 1
-
-        return CumulantDiscoveryState(  # type: ignore[call-arg]
+        proposed_weights = state.weights + alpha * td[:, None] * observation[None, :]
+        proposed_biases = state.biases + alpha * td
+        proposed_utility = decay * state.utility + (1.0 - decay) * (td**2)
+        proposed_state = CumulantDiscoveryState(  # type: ignore[call-arg]
             projections=state.projections,
-            weights=new_weights,
-            biases=new_biases,
-            utility=new_utility,
-            ages=new_ages,
+            weights=proposed_weights,
+            biases=proposed_biases,
+            utility=proposed_utility,
+            ages=state.ages + 1,
             key=state.key,
+        )
+        # Inf next obs makes 0 @ inf = NaN in V(s') at zero init, then
+        # alpha * nan * obs poisons every candidate. Hold the finite state.
+        inputs_valid = jnp.all(jnp.isfinite(observation)) & jnp.all(
+            jnp.isfinite(next_observation)
+        )
+        proposed_finite = (
+            jnp.all(jnp.isfinite(proposed_weights))
+            & jnp.all(jnp.isfinite(proposed_biases))
+            & jnp.all(jnp.isfinite(proposed_utility))
+        )
+        return jax.lax.cond(
+            inputs_valid & proposed_finite,
+            lambda: proposed_state,
+            lambda: state,
         )
 
     @functools.partial(jax.jit, static_argnums=(0,))
