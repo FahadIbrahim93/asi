@@ -62,6 +62,9 @@ measurements remain in their primary output records; none promotes a registry cl
 
 - No Unreleased result promotes an evidence-registry claim. IPMNIST, micro-suite,
   rule-discovery, partner, memory, and planning measurements remain development-only.
+- The live evidence registry remains fail-closed with all five claims `invalid` because
+  registered source bytes have changed since their artifacts were pinned. The immutable
+  artifacts are unchanged; this release does not renew or promote those claims.
 - Closed and consumed conclusions are indexed in `docs/evidence/negative-results.md`.
 
 ### Fixed
@@ -84,6 +87,11 @@ measurements remain in their primary output records; none promotes a registry cl
 - Multi-seed experiments now reject duplicate configuration names and duplicate explicit
   seeds before executing any learner or stream factory, preventing distinct treatments
   from being merged or deterministic trajectories from being counted twice.
+- IDBD now preserves finite weight and bias step-size state when a non-finite meta-update
+  reaches the clip guard, while retaining the existing bitwise finite-update trajectory.
+- IPMNIST shard merging now refuses a missing named control instead of emitting a
+  comparison-less summary. Sigma-zero screening factories share one RNG-free noise path,
+  keeping the reference and inert extension on identical lowered graphs.
 
 ### Removed
 
