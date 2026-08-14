@@ -83,6 +83,7 @@ import functools
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import pytest
 from jax import Array
 
 from alberta_framework.core.average_reward import (
@@ -104,6 +105,8 @@ from alberta_framework.streams.closed_loop import (
     SwitchingTwoStateConfig,
     SwitchingTwoStateMDP,
 )
+
+pytestmark = pytest.mark.slow
 
 _OBS_DIM = 2
 _N_ACTIONS = 2

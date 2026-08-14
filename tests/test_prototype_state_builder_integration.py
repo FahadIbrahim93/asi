@@ -35,7 +35,7 @@ from alberta_framework.core.state_builder import (
 )
 from alberta_framework.core.world_model import ActionConditionedWorldModelConfig
 
-pytestmark = pytest.mark.unit
+pytestmark = [pytest.mark.unit, pytest.mark.slow]
 
 RAW_DIM = 2
 N_ACTIONS = 2
