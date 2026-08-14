@@ -49,6 +49,7 @@ from alberta_framework.benchmarks.ipmnist_screening import (
     _make_snr_ema_norm_learner,
     _make_upgd_alpha_utility_learner,
     _make_upgd_ema_norm_ext_learner,
+    _make_upgd_ema_norm_learner,
     _make_upgd_idbd_learner,
     _make_upgd_shiftnorm_learner,
     _make_upgd_w_fade_head_learner,
@@ -1615,6 +1616,30 @@ class TestSigma0Frontier:
         np.testing.assert_array_equal(ours.per_task_accuracy, ref.per_task_accuracy)
         np.testing.assert_array_equal(ours.per_task_loss, ref.per_task_loss)
         np.testing.assert_array_equal(ours.per_task_plasticity, ref.per_task_plasticity)
+
+    def test_ext_defaults_lower_to_identical_hlo(self):
+        """At inert defaults the extension factory compiles to the same graph
+        as upgd_ema_norm_sigma0's factory.  Identical lowered HLO leaves XLA
+        no fusion or reassociation freedom, so derived float32 metrics cannot
+        drift between the two factories on any backend — value equality alone
+        does not guarantee this (issue #46)."""
+        base = screening_spec("upgd_ema_norm_sigma0")
+        params = init_mlp_params(jr.key(11), SMALL)
+        x = jr.normal(jr.key(12), (SMALL.input_dim,))
+        y = jnp.array(1, jnp.int32)
+        key = jr.key(13)
+
+        def lowered_text(factory, hp):
+            init_fn, step_fn = factory(hp)
+            jitted = jax.jit(lambda p, s, xx, yy, k: step_fn(p, s, xx, yy, k))
+            return jitted.lower(params, init_fn(params), x, y, key).as_text()
+
+        ref = lowered_text(_make_upgd_ema_norm_learner, base.hyperparameters)
+        ext = lowered_text(
+            _make_upgd_ema_norm_ext_learner,
+            {**base.hyperparameters, **self.EXT_DEFAULTS},
+        )
+        assert ref == ext
 
     def test_key_is_unused_on_every_arm(self):
         """sigma0 arms consume no randomness: different RNG keys, same step."""

@@ -249,7 +249,20 @@ def _sorted_flat_noise(
     Identical construction (sorted names, one flat draw) to the lean UPGD-W
     learner in :mod:`alberta_framework.benchmarks.upgd_ipmnist`, so a combo
     that degenerates to plain UPGD-W consumes the same noise stream.
+
+    ``noise_std`` is a trace-time Python float; at exactly ``0.0`` the draw
+    is skipped and exact zeros are returned.  The values are identical either
+    way (``0.0 * normal`` is exact zeros), but XLA cannot fold the draw away
+    itself (a normal draw is not provably finite), so a factory that keeps
+    the draw and one that shortcuts it compile to structurally different
+    graphs whose fusions can reassociate derived float32 metrics by ~1 ulp
+    on some backends even when every parameter update is bit-identical
+    (issue #46).  The shortcut lives here, not in the callers, so every
+    sigma=0 factory sharing this helper lowers to the same RNG-free graph
+    while still skipping the draw's ~85-90% share of the UPGD step cost.
     """
+    if noise_std == 0.0:
+        return {name: jnp.zeros_like(value) for name, value in params.items()}
     names = sorted(params)
     shapes = [params[name].shape for name in names]
     counts = [int(np.prod(shape)) for shape in shapes]
@@ -1020,10 +1033,11 @@ def _make_upgd_ema_norm_ext_learner(
 
     With every switch at its default the trajectory is bit-exact against
     ``upgd_ema_norm_sigma0`` (pinned by a unit test): the perturbation term
-    is the same explicit zeros the champion's ``noise_std=0`` draw produces,
-    without paying for the 282,160-element normal draw, and the RNG key is
-    left untouched.  ``noise_std > 0`` keeps the champion's exact noise
-    stream (``_sorted_flat_noise``) for completeness.
+    comes from the same ``_sorted_flat_noise`` call as the champion's
+    factory, whose sigma=0 short-circuit skips the 282,160-element normal
+    draw and leaves the RNG key untouched for both factories, so the two
+    lower to identical HLO (pinned; issue #46).  ``noise_std > 0`` keeps
+    the champion's exact noise stream for completeness.
     """
     noise_std = hp["noise_std"]
     step_size = hp["step_size"]
@@ -1082,10 +1096,7 @@ def _make_upgd_ema_norm_ext_learner(
                 name: hp[name]
                 for name in ("step_size", "utility_decay", "noise_std", "weight_decay")
             }
-            if noise_std == 0.0:
-                noise = {name: jnp.zeros_like(value) for name, value in params.items()}
-            else:
-                noise = _sorted_flat_noise(key, params, noise_std)
+            noise = _sorted_flat_noise(key, params, noise_std)
             reduced_params, reduced_lean = lean_upgd_w_update(
                 params, lean_state, grads, noise, lean_hp
             )
@@ -1093,11 +1104,7 @@ def _make_upgd_ema_norm_ext_learner(
             return reduced_params, UPGDNormState(  # type: ignore[call-arg]
                 utility=reduced_lean.utility, step=reduced_lean.step, norm=new_norm
             ), metrics
-        if noise_std == 0.0:
-            # Exactly the zeros the sigma=0 draw produces, minus the draw.
-            noise = {name: jnp.zeros_like(value) for name, value in params.items()}
-        else:
-            noise = _sorted_flat_noise(key, params, noise_std)
+        noise = _sorted_flat_noise(key, params, noise_std)
         count = state.step + jnp.array(1, dtype=jnp.int32)
         utility = {
             name: utility_decay * state.utility[name]
