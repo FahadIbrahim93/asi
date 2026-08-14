@@ -26,6 +26,8 @@ Calibration (measured on this machine, scripts in the session scratchpad):
   superset always and strictness on >= 50 draws.
 """
 
+import warnings
+
 import numpy as np
 import pytest
 
@@ -74,6 +76,18 @@ class TestComputeStatistics:
         assert s.ci_upper == pytest.approx(4.2)
         assert s.n_seeds == 1
 
+    def test_empty_values_rejected_without_warnings(self) -> None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with pytest.raises(ValueError, match=r"^values must be non-empty$"):
+                compute_statistics([])
+
+    def test_empty_array_rejected_without_warnings(self) -> None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with pytest.raises(ValueError, match=r"^values must be non-empty$"):
+                compute_statistics(np.array([], dtype=np.float64))
+
     def test_empirical_ci_coverage(self) -> None:
         """95% t-CI covers the true mean ~95% of the time.
 
@@ -111,6 +125,14 @@ class TestTimeseriesStatistics:
             assert mean[step] == pytest.approx(s.mean)
             assert lo[step] == pytest.approx(s.ci_lower)
             assert hi[step] == pytest.approx(s.ci_upper)
+
+    def test_zero_seed_matrix_rejected_without_warnings(self) -> None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with pytest.raises(
+                ValueError, match=r"^metric_array must contain at least one seed row$"
+            ):
+                compute_timeseries_statistics(np.empty((0, 3)))
 
 
 class TestBootstrapCI:

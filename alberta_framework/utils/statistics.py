@@ -73,9 +73,14 @@ def compute_statistics(
 
     Returns:
         StatisticalSummary with all statistics
+
+    Raises:
+        ValueError: If values is empty
     """
     arr = np.asarray(values)
     n = len(arr)
+    if n == 0:
+        raise ValueError("values must be non-empty")
 
     mean = float(np.mean(arr))
     std = float(np.std(arr, ddof=1)) if n > 1 else 0.0
@@ -129,8 +134,13 @@ def compute_timeseries_statistics(
 
     Returns:
         Tuple of (mean, ci_lower, ci_upper) arrays of shape (n_steps,)
+
+    Raises:
+        ValueError: If metric_array has no seed rows
     """
     n_seeds = metric_array.shape[0]
+    if n_seeds == 0:
+        raise ValueError("metric_array must contain at least one seed row")
     mean = np.mean(metric_array, axis=0)
     std = np.std(metric_array, axis=0, ddof=1)
     sem = std / np.sqrt(n_seeds)
