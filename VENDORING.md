@@ -10,7 +10,8 @@ intentional.
 
 - **Fork point:** `lalalune/alberta` @
   `2ac35333efae45cf969ce02ec1f2703476fed6c2`
-- **Canonical repository URL:** https://github.com/lalalune/alberta
+- **Development repository:** https://github.com/elizaOS/asi
+- **Canonical upstream repository:** https://github.com/lalalune/alberta
   (this is the single upstream identity; the `j-klawson/alberta-framework`
   URLs that older `pyproject.toml`/`CITATION.cff` revisions pointed at are
   stale and are no longer referenced)

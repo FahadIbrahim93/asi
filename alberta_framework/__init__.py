@@ -29,7 +29,7 @@ References
 - Tuning-free Step-size Adaptation (Mahmood et al., 2012)
 - Streaming Deep Reinforcement Learning Finally Works (Elsayed et al., 2024)
 """
-__version__ = "0.28.0"
+__version__ = "0.29.0"
 # Baseline optimizers
 from alberta_framework.core.actor_critic import (
     ActorCriticAgent,

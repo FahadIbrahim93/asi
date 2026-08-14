@@ -6,10 +6,10 @@ authors:
   - family-names: Lawson
     given-names: Keith
   - name: "elizaOS research contributors"
-repository-code: "https://github.com/lalalune/alberta"
+repository-code: "https://github.com/elizaOS/asi"
 license: Apache-2.0
-version: "0.28.0"
-date-released: "2026-08-01"
+version: "0.29.0"
+date-released: "2026-08-14"
 keywords:
   - continual learning
   - meta-learning

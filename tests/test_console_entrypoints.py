@@ -16,15 +16,9 @@ pytestmark = pytest.mark.unit
 
 _ROOT = Path(__file__).resolve().parents[1]
 _LAZY_SCRIPTS = {
-    "alberta-forager-benchmark": (
-        "alberta_framework.console_entrypoints:forager_benchmark_main"
-    ),
-    "alberta-historical-forager": (
-        "alberta_framework.console_entrypoints:historical_forager_main"
-    ),
-    "alberta-foragax-oci": (
-        "alberta_framework.console_entrypoints:official_foragax_oci_main"
-    ),
+    "alberta-forager-benchmark": ("alberta_framework.console_entrypoints:forager_benchmark_main"),
+    "alberta-historical-forager": ("alberta_framework.console_entrypoints:historical_forager_main"),
+    "alberta-foragax-oci": ("alberta_framework.console_entrypoints:official_foragax_oci_main"),
 }
 
 

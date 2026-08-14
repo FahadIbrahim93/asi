@@ -39,7 +39,8 @@ contracts, and validator semantics.
 
 ## Install
 
-Alberta Framework requires Python 3.12 or newer.
+Alberta Framework requires Python 3.12 or newer, JAX/JAXlib 0.7.1 or newer, and
+NumPy 1.26 or newer.
 
 ```bash
 pip install alberta-framework

@@ -4,14 +4,15 @@ build-backend = "hatchling.build"
 
 [project]
 name = "alberta-framework"
-version = "0.28.0"
+version = "0.29.0"
 description = "JAX research framework for investigating continual learning and the Alberta Plan"
 readme = "README.md"
 license = "Apache-2.0"
 # Vendored into elizaOS at packages/research/alberta (see VENDORING.md). Relaxed from
 # upstream ">=3.13" to ">=3.12": the continual-RL subset only uses PEP 695
 # syntax (3.12+), and eliza-robot imports it in-process on Python 3.12 where
-# brax/mujoco pin numpy<2. numpy floor relaxed to match that constraint.
+# brax/mujoco pin numpy<2. JAX 0.7.1 is the tested floor that remains
+# compatible with the robot track's NumPy 1.26 runtime.
 requires-python = ">=3.12"
 authors = [
     { name = "J. Klawson", email = "j-klawson@users.noreply.github.com" }
@@ -27,8 +28,8 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    "jax>=0.8.1",
-    "jaxlib>=0.8.1",
+    "jax>=0.7.1",
+    "jaxlib>=0.7.1",
     "numpy>=1.26",
     "pandas>=2.2",
     "matplotlib>=3.8",
@@ -55,13 +56,14 @@ forager = [
     "gymnax==0.0.9",
 ]
 gpu = [
-    "jax[cuda12]>=0.8.1",
+    "jax[cuda12]>=0.7.1",
 ]
 
 [project.urls]
-Homepage = "https://github.com/lalalune/alberta"
-Repository = "https://github.com/lalalune/alberta"
-Issues = "https://github.com/lalalune/alberta/issues"
+Homepage = "https://github.com/elizaOS/asi"
+Repository = "https://github.com/elizaOS/asi"
+Issues = "https://github.com/elizaOS/asi/issues"
+Upstream = "https://github.com/lalalune/alberta"
 
 [project.scripts]
 alberta-step1-smoke = "alberta_framework.cli:step1_smoke_main"

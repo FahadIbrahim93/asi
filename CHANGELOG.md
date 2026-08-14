@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.29.0] - 2026-08-14
+
 Changes since 0.28.0 are summarized by durable user-visible behavior. Development campaign
 measurements remain in their primary output records; none promotes a registry claim.
 
@@ -42,8 +44,13 @@ measurements remain in their primary output records; none promotes a registry cl
   experimental-optimizer, and prototype-integration APIs now require imports from their
   defining modules instead of the package convenience namespaces. The robot track's documented
   continual-RL imports remain available.
-- CI now runs the complete non-slow suite on pull requests; the redundant main-only matrix
-  and the sparse `unit`-marker-only gate were removed.
+- CI now runs the complete non-slow suite on Python 3.12 and 3.13, checks the lock and built
+  distributions, exercises the exact NumPy/JAX floor, and exposes the retained slow lane by
+  manual dispatch. The redundant main-only and sparse `unit`-only gates were removed.
+- Raised the supported JAX/JAXlib floor from 0.4 to 0.7.1 while retaining NumPy 1.26
+  compatibility for the robot track. The GPU extra uses the same JAX floor.
+- Console-script loading is now safe when uv installs wheel files as hard links. The strict
+  Forager source-identity checks still run when an attested command is actually executed.
 - Normalizer coverage now uses a small deterministic exact-moment sequence instead of
   thousands of eager random JAX updates, so the file returns to the normal CI lane.
 - Removed the unused direct Flax dependency from the base installation. The Forager extra
