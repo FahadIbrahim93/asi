@@ -196,7 +196,8 @@ def run_multi_seed_experiment(
 
     Args:
         configs: List of experiment configurations to run. Names must be unique.
-        seeds: Number of seeds (generates 0..n-1) or explicit list of seeds
+        seeds: Number of seeds (generates 0..n-1) or explicit list of seeds.
+            Explicit seeds must be unique.
         parallel: Whether to use parallel execution (requires joblib)
         n_jobs: Number of parallel jobs (-1 for all CPUs)
         show_progress: Whether to show progress bar (requires tqdm)
@@ -205,7 +206,8 @@ def run_multi_seed_experiment(
         Dictionary mapping config name to AggregatedResults
 
     Raises:
-        ValueError: If two or more configurations have the same name
+        ValueError: If two or more configurations have the same name, or if the
+            explicit seed list contains duplicates
     """
     seen_names: set[str] = set()
     duplicate_names: set[str] = set()
@@ -226,6 +228,18 @@ def run_multi_seed_experiment(
         seed_list = list(range(seeds))
     else:
         seed_list = list(seeds)
+
+    seen_seeds: set[int] = set()
+    duplicate_seeds: set[int] = set()
+    for seed in seed_list:
+        if seed in seen_seeds:
+            duplicate_seeds.add(seed)
+        else:
+            seen_seeds.add(seed)
+
+    if duplicate_seeds:
+        formatted_seeds = ", ".join(str(seed) for seed in sorted(duplicate_seeds))
+        raise ValueError(f"Experiment seeds must be unique; duplicates: {formatted_seeds}")
 
     # Build list of (config, seed) pairs
     tasks: list[tuple[ExperimentConfig, int]] = []
