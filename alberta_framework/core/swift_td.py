@@ -308,18 +308,28 @@ class SwiftTD:
         delta_w = delta * z_ext - z_delta * v_delta
 
         # Meta-update: beta_i += (theta / alpha_i) * (delta' - v_delta) * p_i,
-        # clipped to [ln(eta_min), ln(eta)].
-        new_log_step_sizes = log_alphas + (theta / jnp.exp(log_alphas)) * (
-            delta - v_delta
-        ) * p_ext
-        new_log_step_sizes = jnp.clip(
-            new_log_step_sizes, jnp.log(state.eta_min), jnp.log(eta)
+        # clipped to [ln(eta_min), ln(eta)]. inf * p=0 is NaN; clip(NaN) is
+        # NaN, so skip that channel instead of poisoning log step-sizes.
+        meta_delta = (theta / jnp.exp(log_alphas)) * (delta - v_delta) * p_ext
+        new_log_step_sizes = jnp.where(
+            jnp.isfinite(meta_delta),
+            jnp.clip(
+                log_alphas + meta_delta, jnp.log(state.eta_min), jnp.log(eta)
+            ),
+            log_alphas,
         )
 
-        # h-trace generation shift.
-        new_h_old = h_ext
-        new_h = h_temp_ext + delta * z_bar_ext - z_delta * v_delta
-        new_h_temp = new_h
+        # h-trace generation shift. Non-finite delta would store inf/NaN h
+        # and prev_weight_update, so the next finite TD error becomes inf
+        # via v_delta and never recovers.
+        finite_delta = jnp.isfinite(delta)
+        updated_h = h_temp_ext + delta * z_bar_ext - z_delta * v_delta
+        new_h_old = jnp.where(finite_delta, h_ext, state.h_old_traces)
+        new_h = jnp.where(finite_delta, updated_h, state.h_traces)
+        new_h_temp = jnp.where(finite_delta, new_h, state.h_temp_traces)
+        new_prev_weight_update = jnp.where(
+            finite_delta, delta_w, state.prev_weight_update
+        )
 
         # Decay eligibility-side traces for the next transition.
         decay_factor = gamma_scalar * state.trace_decay
@@ -335,7 +345,7 @@ class SwiftTD:
             h_traces=new_h,
             h_old_traces=new_h_old,
             h_temp_traces=new_h_temp,
-            prev_weight_update=delta_w,
+            prev_weight_update=new_prev_weight_update,
             meta_step_size=theta,
             trace_decay=state.trace_decay,
             eta=eta,

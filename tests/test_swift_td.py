@@ -361,6 +361,39 @@ class TestSwiftTDBehavior:
         result = optimizer.update(state, jnp.array(1.0), obs, obs, jnp.array(0.9))
         assert float(jnp.max(jnp.abs(result.new_state.eligibility_traces))) > 0.0
 
+    def test_infinite_td_error_does_not_poison_step_sizes(self):
+        """Inf TD error against fresh p=0 must skip meta-adaptation.
+
+        beta += (theta / alpha) * (delta - v_delta) * p with p=0 is inf * 0
+        = NaN, and clip(NaN) leaves every log step-size permanently NaN,
+        the same class as IDBD #42/#43.
+        """
+        optimizer = SwiftTD(initial_step_size=0.01, meta_step_size=0.01)
+        state = optimizer.init(feature_dim=2)
+        observation = jnp.ones(2, dtype=jnp.float32)
+        next_obs = observation * 0.9
+        gamma = jnp.array(0.99, dtype=jnp.float32)
+
+        poisoned = optimizer.update(
+            state, jnp.array(jnp.inf, dtype=jnp.float32), observation, next_obs, gamma
+        )
+        assert bool(jnp.all(jnp.isfinite(poisoned.new_state.log_step_sizes)))
+        chex.assert_trees_all_close(
+            poisoned.new_state.log_step_sizes, state.log_step_sizes
+        )
+        assert bool(jnp.all(jnp.isfinite(poisoned.new_state.h_traces)))
+        chex.assert_trees_all_close(poisoned.new_state.h_traces, state.h_traces)
+
+        recovered = optimizer.update(
+            poisoned.new_state,
+            jnp.array(1.0, dtype=jnp.float32),
+            observation,
+            next_obs,
+            gamma,
+        )
+        assert bool(jnp.all(jnp.isfinite(recovered.new_state.log_step_sizes)))
+        assert bool(jnp.all(jnp.isfinite(recovered.new_state.h_traces)))
+
     def test_integrates_with_td_linear_learner(self):
         """SwiftTD follows the TDOptimizer interface and drives TDLinearLearner."""
         learner = TDLinearLearner(optimizer=SwiftTD(initial_step_size=0.01))
