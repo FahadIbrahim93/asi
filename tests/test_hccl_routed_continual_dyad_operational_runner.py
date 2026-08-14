@@ -8,6 +8,7 @@ import inspect
 from typing import Any, cast
 
 import jax.numpy as jnp
+import numpy as np
 import pytest
 
 import alberta_framework.core.hccl_routed_continual_dyad_operational_runner as operational
@@ -321,3 +322,143 @@ def test_routed_executor_checks_candidate_before_publication(
         executor.step(cast(Any, object()))
     assert executor.state is source
     assert executor.absolute_step == absolute_step
+
+
+def _structured_source(step: int) -> object:
+    class _WorldState:
+        step_words = np.asarray((0, step), dtype=np.uint32)
+
+    class _HcclState:
+        world_state = _WorldState()
+
+    class _Source:
+        hccl_state = _HcclState()
+        content_token = np.zeros(32, dtype=np.uint8)
+
+    return _Source()
+
+
+def _structured_result(
+    state: object,
+    *,
+    pre: tuple[int, int],
+    post: tuple[int, int],
+    token_fill: int = 0,
+) -> operational.HCCLRoutedContinualDyadOperationalEventResult:
+    class _Transcript:
+        pre_transaction_words = np.asarray(pre, dtype=np.uint32)
+        post_transaction_words = np.asarray(post, dtype=np.uint32)
+        source_state_content_token = np.full(32, token_fill, dtype=np.uint8)
+
+    result = _raw_result(state)
+    object.__setattr__(result, "transcript", _Transcript())
+    return result
+
+
+def test_routed_executor_bounds_gate_precedes_preparation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executor = _raw_executor(owner=object(), state=object(), checkpoint_interval=None)
+    object.__setattr__(executor, "_absolute_step", 10)
+
+    def forbidden(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("preparation must not run once life capacity is exhausted")
+
+    monkeypatch.setattr(operational, "_execute_routed_operational_event", forbidden)
+    with pytest.raises(operational.HCCLRoutedContinualDyadOperationalError, match="bounds"):
+        executor.step(cast(Any, object()))
+    assert executor.absolute_step == 10
+
+
+def test_routed_executor_rejects_a_result_of_the_wrong_shape(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = object()
+    executor = _raw_executor(owner=object(), state=source, checkpoint_interval=None)
+    monkeypatch.setattr(
+        operational,
+        "_execute_routed_operational_event",
+        lambda *_args, **_kwargs: object(),
+    )
+    with pytest.raises(
+        operational.HCCLRoutedContinualDyadOperationalError, match="result-contract"
+    ):
+        executor.step(cast(Any, object()))
+    assert executor.state is source
+    assert executor.absolute_step == 0
+
+
+def test_routed_executor_wraps_malformed_binding_reads_as_typed_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A bare-object source survives the preparation and shape gates (dispatch is
+    # doubled), so the first dereference happens in the binding read window.
+    # That window must surface the typed source-transcript-binding error, never
+    # a raw AttributeError, and must leave the owned state unpublished.
+    source = object()
+    candidate = object()
+    executor = _raw_executor(owner=object(), state=source, checkpoint_interval=None)
+    monkeypatch.setattr(
+        operational,
+        "_execute_routed_operational_event",
+        lambda *_args, **_kwargs: _raw_result(candidate),
+    )
+    with pytest.raises(
+        operational.HCCLRoutedContinualDyadOperationalError,
+        match="source-transcript-binding",
+    ):
+        executor.step(cast(Any, object()))
+    assert executor.state is source
+    assert executor.absolute_step == 0
+
+
+def test_routed_executor_rejects_a_transcript_naming_the_wrong_clock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Structurally valid source and transcript, but the transcript's post clock
+    # names step 5 while the executor's next step is 1: the exact-binding
+    # equality check must refuse publication.
+    source = _structured_source(0)
+    executor = _raw_executor(owner=object(), state=source, checkpoint_interval=None)
+    monkeypatch.setattr(
+        operational,
+        "_execute_routed_operational_event",
+        lambda *_args, **_kwargs: _structured_result(object(), pre=(0, 0), post=(0, 5)),
+    )
+    with pytest.raises(
+        operational.HCCLRoutedContinualDyadOperationalError,
+        match="exact source token and next clock",
+    ):
+        executor.step(cast(Any, object()))
+    assert executor.state is source
+    assert executor.absolute_step == 0
+
+
+def test_routed_executor_still_binds_after_an_accepted_checkpoint_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Complements the rejecting-owner cases: when the checkpoint-due candidate
+    # is ACCEPTED, the binding gate must still run before publication, so a
+    # malformed transcript surfaces as source-transcript-binding rather than
+    # slipping through on the validation success.
+    class _AcceptingOwner:
+        @staticmethod
+        def state_valid(_state: object) -> object:
+            return np.asarray(True)
+
+    source = object()
+    executor = _raw_executor(
+        owner=_AcceptingOwner(), state=source, checkpoint_interval=1
+    )
+    monkeypatch.setattr(
+        operational,
+        "_execute_routed_operational_event",
+        lambda *_args, **_kwargs: _raw_result(object()),
+    )
+    with pytest.raises(
+        operational.HCCLRoutedContinualDyadOperationalError,
+        match="source-transcript-binding",
+    ):
+        executor.step(cast(Any, object()))
+    assert executor.state is source
+    assert executor.absolute_step == 0
