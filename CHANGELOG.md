@@ -77,6 +77,10 @@ measurements remain in their primary output records; none promotes a registry cl
 - Seed-axis summaries, final-performance helpers, and per-step spread bands now use the
   sample standard deviation consistently, with zero spread for one seed. The within-run
   `compare_learners` helper remains explicitly population dispersion over recorded steps.
+- Statistical helpers now reject nonpositive comparison windows, empty metric step axes,
+  invalid confidence levels, unknown bootstrap statistics, and nonpositive bootstrap
+  counts. Cohen's d reports a signed infinite effect for separated zero-variance groups
+  instead of falsely reporting no effect.
 - Multi-seed experiments now reject duplicate configuration names and duplicate explicit
   seeds before executing any learner or stream factory, preventing distinct treatments
   from being merged or deterministic trajectories from being counted twice.
