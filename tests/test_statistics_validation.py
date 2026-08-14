@@ -286,23 +286,35 @@ class TestPairedTests:
 
 
 class TestOneSampleRejection:
-    """Length-1 groups are rejected with ValueError, not divide-by-zero (#35).
+    """Undefined one-sample contracts reject without narrowing valid t-tests (#35).
 
     A 1-vs-1 comparison has zero pooled degrees of freedom, so neither the
     paired/independent t statistic nor Cohen's d is defined. The helpers must
     reject before SciPy instead of emitting RuntimeWarning and crashing with
-    ZeroDivisionError. Mann-Whitney keeps its defined length-1 behavior.
+    ZeroDivisionError. An equal-variance independent t-test with one singleton
+    group and one multi-value group has positive pooled degrees of freedom and
+    stays defined. Mann-Whitney keeps its defined length-1 behavior.
     """
 
     def test_cohens_d_length_one_both_groups_raises(self) -> None:
-        with pytest.raises(ValueError, match="at least 2"):
+        with pytest.raises(ValueError, match="positive pooled degrees of freedom"):
             cohens_d([1.0], [2.0])
 
-    def test_cohens_d_length_one_either_group_raises(self) -> None:
-        with pytest.raises(ValueError, match="at least 2"):
-            cohens_d([1.0, 2.0], [3.0])
-        with pytest.raises(ValueError, match="at least 2"):
-            cohens_d([1.0], [2.0, 3.0])
+    def test_cohens_d_singleton_group_with_positive_pooled_df_stays_defined(self) -> None:
+        expected = 3.0 / np.sqrt(2.0)
+        assert cohens_d([1.0], [2.0, 3.0]) == pytest.approx(-expected)
+        assert cohens_d([2.0, 3.0], [1.0]) == pytest.approx(expected)
+
+    @pytest.mark.parametrize("values_a, values_b", [([], [1.0, 2.0]), ([1.0, 2.0], [])])
+    def test_cohens_d_empty_group_raises_without_warning(
+        self,
+        values_a: list[float],
+        values_b: list[float],
+    ) -> None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with pytest.raises(ValueError, match="non-empty groups"):
+                cohens_d(values_a, values_b)
 
     def test_paired_ttest_length_one_raises_without_runtime_warning(self) -> None:
         with warnings.catch_warnings():
@@ -317,14 +329,31 @@ class TestOneSampleRejection:
     def test_unpaired_ttest_length_one_raises_without_runtime_warning(self) -> None:
         with warnings.catch_warnings():
             warnings.simplefilter("error")
-            with pytest.raises(ValueError, match="at least 2"):
+            with pytest.raises(ValueError, match="positive pooled degrees of freedom"):
                 ttest_comparison([1.0], [2.0], paired=False)
 
-    def test_unpaired_ttest_length_one_either_side_raises(self) -> None:
-        with pytest.raises(ValueError, match="at least 2"):
-            ttest_comparison([1.0, 2.0, 3.0], [4.0], paired=False)
-        with pytest.raises(ValueError, match="at least 2"):
-            ttest_comparison([1.0], [2.0, 3.0, 4.0], paired=False)
+    def test_unpaired_ttest_singleton_with_positive_pooled_df_stays_defined(self) -> None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            forward = ttest_comparison([1.0], [2.0, 3.0], paired=False)
+            reverse = ttest_comparison([2.0, 3.0], [1.0], paired=False)
+        assert forward.statistic == pytest.approx(-np.sqrt(3.0))
+        assert forward.p_value == pytest.approx(1.0 / 3.0)
+        assert forward.effect_size == pytest.approx(-3.0 / np.sqrt(2.0))
+        assert reverse.statistic == pytest.approx(-forward.statistic)
+        assert reverse.p_value == pytest.approx(forward.p_value)
+        assert reverse.effect_size == pytest.approx(-forward.effect_size)
+
+    @pytest.mark.parametrize("values_a, values_b", [([], [1.0, 2.0]), ([1.0, 2.0], [])])
+    def test_unpaired_ttest_empty_group_raises_without_warning(
+        self,
+        values_a: list[float],
+        values_b: list[float],
+    ) -> None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with pytest.raises(ValueError, match="non-empty groups"):
+                ttest_comparison(values_a, values_b, paired=False)
 
     def test_mann_whitney_length_one_contract_unchanged(self) -> None:
         res = mann_whitney_comparison([1.0], [2.0])

@@ -182,8 +182,8 @@ def cohens_d(
         Cohen's d (positive means a > b)
 
     Raises:
-        ValueError: If either group has fewer than 2 values; the pooled
-            degrees of freedom ``n_a + n_b - 2`` would be zero.
+        ValueError: If either group is empty or the pooled degrees of freedom
+            ``n_a + n_b - 2`` are not positive.
     """
     a = np.asarray(values_a)
     b = np.asarray(values_b)
@@ -191,10 +191,16 @@ def cohens_d(
     n_a = len(a)
     n_b = len(b)
 
-    if n_a < 2 or n_b < 2:
+    if n_a == 0 or n_b == 0:
         raise ValueError(
-            "cohens_d requires at least 2 values in each group "
-            f"(got n_a={n_a}, n_b={n_b}): pooled degrees of freedom would be zero"
+            f"cohens_d requires non-empty groups (got n_a={n_a}, n_b={n_b})"
+        )
+
+    pooled_df = n_a + n_b - 2
+    if pooled_df <= 0:
+        raise ValueError(
+            "cohens_d requires positive pooled degrees of freedom "
+            f"(got n_a={n_a}, n_b={n_b}, pooled_df={pooled_df})"
         )
 
     mean_a = np.mean(a)
@@ -204,7 +210,7 @@ def cohens_d(
     var_a = np.var(a, ddof=1) if n_a > 1 else 0.0
     var_b = np.var(b, ddof=1) if n_b > 1 else 0.0
 
-    pooled_std = np.sqrt(((n_a - 1) * var_a + (n_b - 1) * var_b) / (n_a + n_b - 2))
+    pooled_std = np.sqrt(((n_a - 1) * var_a + (n_b - 1) * var_b) / pooled_df)
 
     if pooled_std == 0:
         return 0.0
@@ -235,10 +241,9 @@ def ttest_comparison(
 
     Raises:
         ValueError: If ``paired`` and the samples differ in length or hold
-            fewer than 2 pairs or are identical, or if either unpaired group
-            has fewer than 2 values. One-sample groups leave the t statistic
-            undefined and would emit RuntimeWarning inside SciPy before
-            crashing in ``cohens_d``.
+            fewer than 2 pairs or are identical, or if an unpaired group is
+            empty or the two unpaired groups have no positive pooled degrees
+            of freedom.
     """
     a = np.asarray(values_a)
     b = np.asarray(values_b)
@@ -255,9 +260,13 @@ def ttest_comparison(
                 f"Paired comparison {method_a!r} vs {method_b!r} has identical "
                 "samples; the paired t statistic is undefined"
             )
-    elif len(a) < 2 or len(b) < 2:
+    elif len(a) == 0 or len(b) == 0:
         raise ValueError(
-            "independent t-test requires at least 2 values in each group "
+            f"independent t-test requires non-empty groups (got {len(a)} and {len(b)})"
+        )
+    elif len(a) + len(b) - 2 <= 0:
+        raise ValueError(
+            "independent t-test requires positive pooled degrees of freedom "
             f"(got {len(a)} and {len(b)})"
         )
 
