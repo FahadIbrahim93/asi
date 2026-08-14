@@ -135,6 +135,52 @@ class TestTDIDBD:
         chex.assert_tree_all_finite(result.weight_delta)
         chex.assert_tree_all_finite(result.new_state.log_step_sizes)
 
+    def test_infinite_td_error_does_not_poison_step_sizes(self):
+        """An inf TD error against fresh zero h-traces must skip adaptation.
+
+        h=0 means no gradient correlation yet: inf * 0 = NaN used to flow
+        through the clip (clip(NaN) is NaN), leaving log step-sizes and the
+        bias twin permanently NaN, the same class as IDBD #42/#43.
+        """
+        optimizer = TDIDBD(initial_step_size=0.01, meta_step_size=0.01)
+        state = optimizer.init(feature_dim=2)
+        observation = jnp.ones(2, dtype=jnp.float32)
+        next_obs = observation * 0.9
+        gamma = jnp.array(0.99, dtype=jnp.float32)
+
+        poisoned = optimizer.update(
+            state, jnp.array(jnp.inf, dtype=jnp.float32), observation, next_obs, gamma
+        )
+        assert bool(jnp.all(jnp.isfinite(poisoned.new_state.log_step_sizes)))
+        assert bool(jnp.isfinite(poisoned.new_state.bias_log_step_size))
+        chex.assert_trees_all_close(
+            poisoned.new_state.log_step_sizes, state.log_step_sizes
+        )
+        chex.assert_trees_all_close(
+            poisoned.new_state.bias_log_step_size, state.bias_log_step_size
+        )
+
+        recovered = optimizer.update(
+            poisoned.new_state, jnp.array(1.0, dtype=jnp.float32), observation, next_obs, gamma
+        )
+        assert bool(jnp.all(jnp.isfinite(recovered.new_state.log_step_sizes)))
+        assert bool(jnp.isfinite(recovered.new_state.bias_log_step_size))
+
+    def test_infinite_td_error_does_not_poison_ordinary_gradient(self):
+        optimizer = TDIDBD(
+            initial_step_size=0.01, meta_step_size=0.01, use_semi_gradient=False
+        )
+        state = optimizer.init(feature_dim=2)
+        observation = jnp.ones(2, dtype=jnp.float32)
+        next_obs = observation * 0.9
+        gamma = jnp.array(0.99, dtype=jnp.float32)
+
+        poisoned = optimizer.update(
+            state, jnp.array(jnp.inf, dtype=jnp.float32), observation, next_obs, gamma
+        )
+        assert bool(jnp.all(jnp.isfinite(poisoned.new_state.log_step_sizes)))
+        assert bool(jnp.isfinite(poisoned.new_state.bias_log_step_size))
+
 
 class TestAutoTDIDBD:
     """Tests for the AutoTDIDBD optimizer."""
@@ -235,6 +281,38 @@ class TestAutoTDIDBD:
 
         chex.assert_tree_all_finite(result.weight_delta)
         chex.assert_tree_all_finite(result.new_state.log_step_sizes)
+
+    def test_infinite_td_error_does_not_poison_step_sizes(self):
+        """Inf TD error against h=0 must not NaN AutoStep normalizers or alphas.
+
+        max(NaN, v) is NaN, and the 1e-8 floor does not rescue it; the
+        normalized meta-update then writes NaN log step-sizes forever.
+        """
+        optimizer = AutoTDIDBD(initial_step_size=0.01, meta_step_size=0.01)
+        state = optimizer.init(feature_dim=2)
+        observation = jnp.ones(2, dtype=jnp.float32)
+        next_obs = observation * 0.9
+        gamma = jnp.array(0.99, dtype=jnp.float32)
+
+        poisoned = optimizer.update(
+            state, jnp.array(jnp.inf, dtype=jnp.float32), observation, next_obs, gamma
+        )
+        assert bool(jnp.all(jnp.isfinite(poisoned.new_state.log_step_sizes)))
+        assert bool(jnp.all(jnp.isfinite(poisoned.new_state.normalizers)))
+        assert bool(jnp.isfinite(poisoned.new_state.bias_log_step_size))
+        assert bool(jnp.isfinite(poisoned.new_state.bias_normalizer))
+        chex.assert_trees_all_close(
+            poisoned.new_state.log_step_sizes, state.log_step_sizes
+        )
+        chex.assert_trees_all_close(
+            poisoned.new_state.normalizers, state.normalizers
+        )
+
+        recovered = optimizer.update(
+            poisoned.new_state, jnp.array(1.0, dtype=jnp.float32), observation, next_obs, gamma
+        )
+        assert bool(jnp.all(jnp.isfinite(recovered.new_state.log_step_sizes)))
+        assert bool(jnp.all(jnp.isfinite(recovered.new_state.normalizers)))
 
 
 class TestTDOptimizerComparison:

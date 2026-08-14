@@ -1508,36 +1508,47 @@ class TDIDBD(TDOptimizer[TDIDBDState]):
 
         if self._use_semi_gradient:
             gradient_correlation = delta * observation * state.h_traces
-            new_log_step_sizes = state.log_step_sizes + theta * gradient_correlation
+            meta_delta = theta * gradient_correlation
         else:
             feature_diff = gamma_scalar * next_observation - observation
             gradient_correlation = delta * feature_diff * state.h_traces
-            new_log_step_sizes = state.log_step_sizes - theta * gradient_correlation
+            meta_delta = -theta * gradient_correlation
 
-        new_log_step_sizes = jnp.clip(new_log_step_sizes, -10.0, 2.0)
+        # clip(NaN) is NaN, so inf * h=0 must skip adaptation for that weight.
+        new_log_step_sizes = jnp.where(
+            jnp.isfinite(meta_delta),
+            jnp.clip(state.log_step_sizes + meta_delta, -10.0, 2.0),
+            state.log_step_sizes,
+        )
         new_alphas = jnp.exp(new_log_step_sizes)
 
         new_eligibility_traces = gamma_scalar * lam * state.eligibility_traces + observation
         weight_delta = new_alphas * delta * new_eligibility_traces
 
+        finite_delta = jnp.isfinite(delta)
         if self._use_semi_gradient:
             h_decay = jnp.maximum(0.0, 1.0 - new_alphas * observation * new_eligibility_traces)
-            new_h_traces = state.h_traces * h_decay + new_alphas * delta * new_eligibility_traces
+            updated_h = state.h_traces * h_decay + new_alphas * delta * new_eligibility_traces
         else:
             feature_diff = gamma_scalar * next_observation - observation
             h_decay = jnp.maximum(0.0, 1.0 + new_alphas * new_eligibility_traces * feature_diff)
-            new_h_traces = state.h_traces * h_decay + new_alphas * delta * new_eligibility_traces
+            updated_h = state.h_traces * h_decay + new_alphas * delta * new_eligibility_traces
+        new_h_traces = jnp.where(finite_delta, updated_h, state.h_traces)
 
         # Bias updates
         if self._use_semi_gradient:
             bias_gradient_correlation = delta * state.bias_h_trace
-            new_bias_log_step_size = state.bias_log_step_size + theta * bias_gradient_correlation
+            bias_meta_delta = theta * bias_gradient_correlation
         else:
             bias_feature_diff = gamma_scalar - 1.0
             bias_gradient_correlation = delta * bias_feature_diff * state.bias_h_trace
-            new_bias_log_step_size = state.bias_log_step_size - theta * bias_gradient_correlation
+            bias_meta_delta = -theta * bias_gradient_correlation
 
-        new_bias_log_step_size = jnp.clip(new_bias_log_step_size, -10.0, 2.0)
+        new_bias_log_step_size = jnp.where(
+            jnp.isfinite(bias_meta_delta),
+            jnp.clip(state.bias_log_step_size + bias_meta_delta, -10.0, 2.0),
+            state.bias_log_step_size,
+        )
         new_bias_alpha = jnp.exp(new_bias_log_step_size)
 
         new_bias_eligibility_trace = gamma_scalar * lam * state.bias_eligibility_trace + 1.0
@@ -1545,7 +1556,7 @@ class TDIDBD(TDOptimizer[TDIDBDState]):
 
         if self._use_semi_gradient:
             bias_h_decay = jnp.maximum(0.0, 1.0 - new_bias_alpha * new_bias_eligibility_trace)
-            new_bias_h_trace = (
+            updated_bias_h = (
                 state.bias_h_trace * bias_h_decay
                 + new_bias_alpha * delta * new_bias_eligibility_trace
             )
@@ -1554,10 +1565,11 @@ class TDIDBD(TDOptimizer[TDIDBDState]):
             bias_h_decay = jnp.maximum(
                 0.0, 1.0 + new_bias_alpha * new_bias_eligibility_trace * bias_feature_diff
             )
-            new_bias_h_trace = (
+            updated_bias_h = (
                 state.bias_h_trace * bias_h_decay
                 + new_bias_alpha * delta * new_bias_eligibility_trace
             )
+        new_bias_h_trace = jnp.where(finite_delta, updated_bias_h, state.bias_h_trace)
 
         new_state = TDIDBDState(
             log_step_sizes=new_log_step_sizes,
@@ -1675,7 +1687,9 @@ class AutoTDIDBD(TDOptimizer[AutoTDIDBDState]):
         alphas = jnp.exp(state.log_step_sizes)
 
         # Update normalizers
-        abs_weight_update = jnp.abs(delta * feature_diff * state.h_traces)
+        weight_meta = delta * feature_diff * state.h_traces
+        finite_meta = jnp.isfinite(weight_meta)
+        abs_weight_update = jnp.abs(weight_meta)
         normalizer_decay_term = (
             (1.0 / tau)
             * alphas
@@ -1683,12 +1697,20 @@ class AutoTDIDBD(TDOptimizer[AutoTDIDBDState]):
             * state.eligibility_traces
             * (jnp.abs(delta * observation * state.h_traces) - state.normalizers)
         )
-        new_normalizers = jnp.maximum(abs_weight_update, state.normalizers - normalizer_decay_term)
+        new_normalizers = jnp.where(
+            finite_meta,
+            jnp.maximum(abs_weight_update, state.normalizers - normalizer_decay_term),
+            state.normalizers,
+        )
         new_normalizers = jnp.maximum(new_normalizers, 1e-8)
 
         # Normalized meta-update
-        normalized_gradient = delta * feature_diff * state.h_traces / new_normalizers
-        new_log_step_sizes = state.log_step_sizes - theta * normalized_gradient
+        normalized_gradient = weight_meta / new_normalizers
+        new_log_step_sizes = jnp.where(
+            finite_meta,
+            state.log_step_sizes - theta * normalized_gradient,
+            state.log_step_sizes,
+        )
 
         # Effective step-size normalization
         effective_step_size = -jnp.sum(
@@ -1697,21 +1719,29 @@ class AutoTDIDBD(TDOptimizer[AutoTDIDBDState]):
         normalization_factor = jnp.maximum(effective_step_size, 1.0)
         new_log_step_sizes = new_log_step_sizes - jnp.log(normalization_factor)
 
-        new_log_step_sizes = jnp.clip(new_log_step_sizes, -10.0, 2.0)
+        new_log_step_sizes = jnp.where(
+            jnp.isfinite(new_log_step_sizes),
+            jnp.clip(new_log_step_sizes, -10.0, 2.0),
+            state.log_step_sizes,
+        )
         new_alphas = jnp.exp(new_log_step_sizes)
 
         new_eligibility_traces = gamma_scalar * lam * state.eligibility_traces + observation
         weight_delta = new_alphas * delta * new_eligibility_traces
 
         # Update h traces
+        finite_delta = jnp.isfinite(delta)
         h_decay = jnp.maximum(0.0, 1.0 + new_alphas * feature_diff * new_eligibility_traces)
-        new_h_traces = state.h_traces * h_decay + new_alphas * delta * new_eligibility_traces
+        updated_h = state.h_traces * h_decay + new_alphas * delta * new_eligibility_traces
+        new_h_traces = jnp.where(finite_delta, updated_h, state.h_traces)
 
         # Bias updates
         bias_alpha = jnp.exp(state.bias_log_step_size)
         bias_feature_diff = gamma_scalar - 1.0
 
-        abs_bias_weight_update = jnp.abs(delta * bias_feature_diff * state.bias_h_trace)
+        bias_meta = delta * bias_feature_diff * state.bias_h_trace
+        finite_bias_meta = jnp.isfinite(bias_meta)
+        abs_bias_weight_update = jnp.abs(bias_meta)
         bias_normalizer_decay_term = (
             (1.0 / tau)
             * bias_alpha
@@ -1719,15 +1749,21 @@ class AutoTDIDBD(TDOptimizer[AutoTDIDBDState]):
             * state.bias_eligibility_trace
             * (jnp.abs(delta * state.bias_h_trace) - state.bias_normalizer)
         )
-        new_bias_normalizer = jnp.maximum(
-            abs_bias_weight_update, state.bias_normalizer - bias_normalizer_decay_term
+        new_bias_normalizer = jnp.where(
+            finite_bias_meta,
+            jnp.maximum(
+                abs_bias_weight_update, state.bias_normalizer - bias_normalizer_decay_term
+            ),
+            state.bias_normalizer,
         )
         new_bias_normalizer = jnp.maximum(new_bias_normalizer, 1e-8)
 
-        normalized_bias_gradient = (
-            delta * bias_feature_diff * state.bias_h_trace / new_bias_normalizer
+        normalized_bias_gradient = bias_meta / new_bias_normalizer
+        new_bias_log_step_size = jnp.where(
+            finite_bias_meta,
+            state.bias_log_step_size - theta * normalized_bias_gradient,
+            state.bias_log_step_size,
         )
-        new_bias_log_step_size = state.bias_log_step_size - theta * normalized_bias_gradient
 
         bias_effective_step_size = (
             -jnp.exp(new_bias_log_step_size) * bias_feature_diff * state.bias_eligibility_trace
@@ -1735,7 +1771,11 @@ class AutoTDIDBD(TDOptimizer[AutoTDIDBDState]):
         bias_norm_factor = jnp.maximum(bias_effective_step_size, 1.0)
         new_bias_log_step_size = new_bias_log_step_size - jnp.log(bias_norm_factor)
 
-        new_bias_log_step_size = jnp.clip(new_bias_log_step_size, -10.0, 2.0)
+        new_bias_log_step_size = jnp.where(
+            jnp.isfinite(new_bias_log_step_size),
+            jnp.clip(new_bias_log_step_size, -10.0, 2.0),
+            state.bias_log_step_size,
+        )
         new_bias_alpha = jnp.exp(new_bias_log_step_size)
 
         new_bias_eligibility_trace = gamma_scalar * lam * state.bias_eligibility_trace + 1.0
@@ -1744,9 +1784,10 @@ class AutoTDIDBD(TDOptimizer[AutoTDIDBDState]):
         bias_h_decay = jnp.maximum(
             0.0, 1.0 + new_bias_alpha * bias_feature_diff * new_bias_eligibility_trace
         )
-        new_bias_h_trace = (
+        updated_bias_h = (
             state.bias_h_trace * bias_h_decay + new_bias_alpha * delta * new_bias_eligibility_trace
         )
+        new_bias_h_trace = jnp.where(finite_delta, updated_bias_h, state.bias_h_trace)
 
         new_state = AutoTDIDBDState(
             log_step_sizes=new_log_step_sizes,
