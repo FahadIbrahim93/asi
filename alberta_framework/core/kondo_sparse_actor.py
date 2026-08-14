@@ -375,6 +375,16 @@ class KondoActorBackwardResult:
 
 
 @chex.dataclass(frozen=True)
+class KondoActorBackwardSummary:
+    """Evaluation-facing backward fields available from a committed actor step."""
+
+    loss: Float[Array, ""]
+    gradient: KondoActorParameters
+    selected_count: Int[Array, ""]
+    gradient_finite: Bool[Array, ""]
+
+
+@chex.dataclass(frozen=True)
 class KondoSparseActorResult:
     """One proposed/committed Kondo actor transaction."""
 
@@ -1296,6 +1306,7 @@ __all__ = [
     "KONDO_SPARSE_ACTOR_SCHEMA",
     "KondoActorBackwardBatch",
     "KondoActorBackwardResult",
+    "KondoActorBackwardSummary",
     "KondoActorParameters",
     "KondoActorProtectedInputs",
     "KondoSparseActor",
