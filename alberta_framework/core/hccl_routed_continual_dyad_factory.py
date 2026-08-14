@@ -17,7 +17,7 @@ from __future__ import annotations
 import dataclasses
 import json
 from collections.abc import Mapping
-from typing import Final, cast
+from typing import Final
 
 from jax import Array
 
@@ -156,10 +156,7 @@ class HCCLRoutedContinualDyadFactoryConfig:
     def maximum_committed_transitions(self) -> int:
         """Return the exact world horizon selected by the versioned profile."""
 
-        return cast(
-            int,
-            hccl_causal_core_lifetime_for_profile(self.schedule_profile),
-        )
+        return hccl_causal_core_lifetime_for_profile(self.schedule_profile)
 
     @property
     def agent_lifetime_events(self) -> int:

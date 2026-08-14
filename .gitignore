@@ -12,6 +12,7 @@ dist/
 outputs/forager/frozen_src_*/
 outputs/forager/*failed_source_drift*/
 outputs/forager/relearning_logs/
+outputs/forager/local_toolchain/
 outputs/forager/**/*.running
 outputs/upgd_ipmnist/reconstructed_openml_cache/
 outputs/upgd_label_emnist/openml_cache/
