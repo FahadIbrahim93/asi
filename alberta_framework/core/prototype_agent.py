@@ -92,6 +92,7 @@ from alberta_framework.core.model_replay_rehearsal import (
     ModelReplayRehearsalConfig,
     RealModelReplayEvent,
 )
+from alberta_framework.core.normalizers import _lifetime_counter_valid
 from alberta_framework.core.oak import (
     OaKAgent,
     OaKConfig,
@@ -3851,9 +3852,40 @@ class PrototypeAgent:
             return self._config.gru_perception.observation_dim
         return self._config.oak.observation_dim
 
+    @staticmethod
+    def _oak_state_numeric_valid(
+        oak_agent: OaKAgent,
+        state: OaKState,
+    ) -> Array:
+        """Authenticate one OaK wrapper and its complete nested STOMP state."""
+
+        counter_ceiling = jnp.where(
+            state.step_count < jnp.asarray(_INT32_MAX, dtype=jnp.int32),
+            state.step_count + jnp.asarray(1, dtype=jnp.int32),
+            state.step_count,
+        )
+        return (
+            _lifetime_counter_valid(state.step_words, state.step_count)
+            & _lifetime_counter_valid(
+                state.stomp_state.step_words,
+                state.stomp_state.step_count,
+            )
+            & jnp.all(state.step_words == state.stomp_state.step_words)
+            & (state.step_count == state.stomp_state.step_count)
+            & jnp.all(state.execution_counts >= 0)
+            & jnp.all(state.execution_counts <= counter_ceiling)
+            & jnp.all(jnp.isfinite(state.cumulative_pseudo_rewards))
+            & jnp.all(jnp.isfinite(state.utility_ema))
+            & oak_agent.stomp_agent.state_valid(state.stomp_state)
+        )
+
     def _state_numeric_valid(self, state: PrototypeAgentState) -> Array:
         """Validate state numerics while preserving world-model init sentinels."""
         sanitized_state = state
+        oak_state_valid = self._oak_state_numeric_valid(
+            self._oak,
+            self._oak_component_state(state.oak_state),
+        )
         world_model_bounds_valid = jnp.asarray(True)
         state_builder_valid = jnp.asarray(True)
         feature_lifecycle_valid = jnp.asarray(True, dtype=jnp.bool_)
@@ -4004,7 +4036,8 @@ class PrototypeAgent:
                 state.replace(world_model_state=sanitized_world_model_state),
             )
         return (
-            world_model_bounds_valid
+            oak_state_valid
+            & world_model_bounds_valid
             & state_builder_valid
             & feature_lifecycle_valid
             & interaction_state_valid

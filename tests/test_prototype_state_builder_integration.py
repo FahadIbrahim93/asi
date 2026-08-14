@@ -395,6 +395,7 @@ def test_signed_counter_capacity_processes_final_outcome_then_disarms() -> None:
     agent = _agent(_builder_configs()[0])
     state = agent.start(agent.init(jr.key(241)), jnp.zeros(RAW_DIM))
     maximum = np.iinfo(np.int32).max
+    near_maximum_words = jnp.asarray((0, maximum - 1), dtype=jnp.uint32)
     near_maximum = state.replace(
         state_builder_state=state.state_builder_state.replace(
             step_count=jnp.asarray(maximum - 2, dtype=jnp.int32)
@@ -403,28 +404,62 @@ def test_signed_counter_capacity_processes_final_outcome_then_disarms() -> None:
         step_count=jnp.asarray(maximum - 1, dtype=jnp.int32),
         oak_state=state.oak_state.replace(
             step_count=jnp.asarray(maximum - 1, dtype=jnp.int32),
+            step_words=near_maximum_words,
             stomp_state=state.oak_state.stomp_state.replace(
-                step_count=jnp.asarray(maximum - 1, dtype=jnp.int32)
+                step_count=jnp.asarray(maximum - 1, dtype=jnp.int32),
+                step_words=near_maximum_words,
             ),
         ),
     )
+    transition = _transition(near_maximum, jnp.ones(RAW_DIM))
+    compiled_update = jax.jit(agent.update_transition)
 
-    result = agent.update_transition(
-        near_maximum,
-        _transition(near_maximum, jnp.ones(RAW_DIM)),
-    )
+    for result in (
+        agent.update_transition(near_maximum, transition),
+        compiled_update(near_maximum, transition),
+    ):
+        assert bool(result.transition_diagnostics.valid)
+        assert not bool(
+            result.transition_diagnostics.next_counter_capacity_available
+        )
+        assert int(result.state.step_count) == maximum
+        assert int(result.state.oak_state.step_count) == maximum
+        assert int(result.state.oak_state.stomp_state.step_count) == maximum
+        assert not bool(result.state.started)
+        assert int(result.action) == -1
+        assert bool(agent._checkpoint_state_valid(result.state))
+        assert not bool(agent.decision(result.state).armed)
 
-    assert bool(result.transition_diagnostics.valid)
-    assert not bool(
-        result.transition_diagnostics.next_counter_capacity_available
+    batched = jax.tree.map(lambda leaf: leaf[None], transition)
+    scanned = jax.jit(agent.scan_transitions)(near_maximum, batched)
+    chex.assert_trees_all_equal(scanned.transition_valid, jnp.asarray([True]))
+    assert int(scanned.state.step_count) == maximum
+    assert not bool(scanned.state.started)
+    assert int(scanned.actions[0]) == -1
+
+    corrupt_nested_clock = near_maximum.replace(
+        oak_state=near_maximum.oak_state.replace(
+            stomp_state=near_maximum.oak_state.stomp_state.replace(
+                step_words=jnp.asarray((0, maximum - 2), dtype=jnp.uint32)
+            )
+        )
     )
-    assert int(result.state.step_count) == maximum
-    assert int(result.state.oak_state.step_count) == maximum
-    assert int(result.state.oak_state.stomp_state.step_count) == maximum
-    assert not bool(result.state.started)
-    assert int(result.action) == -1
-    assert bool(agent._checkpoint_state_valid(result.state))
-    assert not bool(agent.decision(result.state).armed)
+    for rejected in (
+        agent.update_transition(
+            corrupt_nested_clock,
+            _transition(corrupt_nested_clock, jnp.ones(RAW_DIM)),
+        ),
+        compiled_update(
+            corrupt_nested_clock,
+            _transition(corrupt_nested_clock, jnp.ones(RAW_DIM)),
+        ),
+    ):
+        assert not bool(rejected.transition_diagnostics.state_consistent)
+        assert not bool(rejected.transition_diagnostics.post_update_checked)
+        chex.assert_trees_all_equal(
+            _materialize_keys(rejected.state),
+            _materialize_keys(corrupt_nested_clock),
+        )
 
     corrupt_armed = near_maximum.replace(
         step_count=jnp.asarray(maximum, dtype=jnp.int32),
@@ -435,7 +470,7 @@ def test_signed_counter_capacity_processes_final_outcome_then_disarms() -> None:
             ),
         ),
     )
-    rejected = jax.jit(agent.update_transition)(
+    rejected = compiled_update(
         corrupt_armed,
         _transition(corrupt_armed, jnp.ones(RAW_DIM)),
     )
