@@ -194,6 +194,20 @@ class TestBootstrapCI:
         coverage = covered / n_reps
         assert 0.85 <= coverage <= 0.99, f"coverage {coverage} outside [0.85, 0.99]"
 
+    @pytest.mark.parametrize(
+        "empty", [[], np.array([], dtype=np.float64)], ids=["list", "ndarray"]
+    )
+    def test_empty_input_rejected(self, empty: list[float] | np.ndarray) -> None:
+        """Empty input raises a descriptive ValueError, with no RuntimeWarning.
+
+        Before the guard, ``np.mean([])`` warned and the helper returned
+        ``(nan, nan, nan)`` — a NaN interval indistinguishable from a real CI.
+        """
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with pytest.raises(ValueError, match="empty"):
+                bootstrap_ci(empty)
+
 
 # ---------------------------------------------------------------------------
 # 2. Paired significance tests: null calibration + power
