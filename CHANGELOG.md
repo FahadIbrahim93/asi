@@ -68,8 +68,10 @@ measurements remain in their primary output records; none promotes a registry cl
 
 - Paired statistical comparisons now validate seed identities and metric-row counts,
   align paired t-test and Wilcoxon samples by seed, and reject unequal seed sets instead
-  of silently pairing rows by position. Undefined empty, undersized, or identical paired
-  t-test inputs fail closed; valid unpaired singleton-vs-multi-value tests remain supported.
+  of silently pairing rows by position. Paired t-tests reject empty, undersized, or
+  identical inputs; Wilcoxon rejects identical pairs instead of inheriting
+  version-dependent SciPy outcomes; and empty bootstrap samples reject instead of
+  producing NaN intervals. Valid unpaired singleton-vs-multi-value tests remain supported,
   Mann-Whitney comparisons remain unpaired, and one-seed time-series confidence intervals
   return the finite point trajectory.
 - Seed-axis summaries, final-performance helpers, and per-step spread bands now use the
