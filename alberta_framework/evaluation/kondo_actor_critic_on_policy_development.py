@@ -809,12 +809,13 @@ def _selected_log_probability(
     actor_features: Array,
     actions: Array,
 ) -> Array:
-    hidden = jnp.tanh(
-        actor_features @ parameters.hidden_weight + parameters.hidden_bias
-    )
-    logits = hidden @ parameters.output_weight + parameters.output_bias
-    log_probabilities = jax.nn.log_softmax(logits, axis=-1)
-    return jnp.take_along_axis(log_probabilities, actions[:, None], axis=1)[:, 0]
+    def one_row(row: tuple[Array, Array]) -> Array:
+        features, action = row
+        hidden = jnp.tanh(features @ parameters.hidden_weight + parameters.hidden_bias)
+        logits = hidden @ parameters.output_weight + parameters.output_bias
+        return jax.nn.log_softmax(logits, axis=-1)[action]
+
+    return jax.lax.map(one_row, (actor_features, actions))
 
 
 @functools.partial(jax.jit, static_argnums=())
