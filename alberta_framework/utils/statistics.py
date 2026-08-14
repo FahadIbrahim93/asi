@@ -375,9 +375,19 @@ def wilcoxon_comparison(
 
     Returns:
         SignificanceResult with test results
+
+    Raises:
+        ValueError: If the non-empty paired samples are identical, for which
+            the Wilcoxon signed-rank statistic is undefined.
     """
     a = np.asarray(values_a)
     b = np.asarray(values_b)
+
+    if a.size > 0 and np.array_equal(a, b):
+        raise ValueError(
+            f"Paired comparison {method_a!r} vs {method_b!r} has identical "
+            "samples; the Wilcoxon signed-rank statistic is undefined"
+        )
 
     try:
         from scipy import stats

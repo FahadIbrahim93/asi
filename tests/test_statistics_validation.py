@@ -299,6 +299,26 @@ class TestPairedTests:
         assert res.significant
 
 
+class TestIdenticalWilcoxonRejection:
+    """All-zero paired differences fail closed before version-dependent SciPy behavior."""
+
+    def test_wilcoxon_rejects_identical_samples_without_warning(self) -> None:
+        values = [0.91, 0.88, 0.95]
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with pytest.raises(
+                ValueError,
+                match=r"^Paired comparison 'pin' vs 'base' has identical samples; "
+                r"the Wilcoxon signed-rank statistic is undefined$",
+            ):
+                wilcoxon_comparison(
+                    values,
+                    list(values),
+                    method_a="pin",
+                    method_b="base",
+                )
+
+
 class TestOneSampleRejection:
     """Undefined one-sample contracts reject without narrowing valid t-tests (#35).
 
@@ -634,6 +654,21 @@ class TestPairwiseComparisons:
             r"samples; the paired t statistic is undefined$",
         ):
             pairwise_comparisons(results, metric="squared_error", test="ttest")
+
+    def test_reduction_pin_pair_rejected_for_wilcoxon(self) -> None:
+        rows = [0.10, 0.11, 0.09]
+        results = {
+            "base_arm": _make_seeded_aggregated("base_arm", [0, 1, 2], rows),
+            "pinned_inert": _make_seeded_aggregated("pinned_inert", [0, 1, 2], list(rows)),
+        }
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with pytest.raises(
+                ValueError,
+                match=r"^Paired comparison 'base_arm' vs 'pinned_inert' has identical "
+                r"samples; the Wilcoxon signed-rank statistic is undefined$",
+            ):
+                pairwise_comparisons(results, metric="squared_error", test="wilcoxon")
 
     def test_duplicate_seeds_rejected(self) -> None:
         malformed = _make_seeded_aggregated("malformed", [0, 0, 1], [0.0, 1.0, 2.0])
