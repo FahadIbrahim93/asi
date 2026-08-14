@@ -68,10 +68,16 @@ measurements remain in their primary output records; none promotes a registry cl
 
 - Paired statistical comparisons now validate seed identities and metric-row counts,
   align paired t-test and Wilcoxon samples by seed, and reject unequal seed sets instead
-  of silently pairing rows by position. Mann-Whitney comparisons remain unpaired.
-- Multi-seed experiments now reject duplicate configuration names before executing any
-  learner or stream factory, preventing distinct treatments from being merged under one
-  aggregate identity.
+  of silently pairing rows by position. Undefined empty, undersized, or identical paired
+  t-test inputs fail closed; valid unpaired singleton-vs-multi-value tests remain supported.
+  Mann-Whitney comparisons remain unpaired, and one-seed time-series confidence intervals
+  return the finite point trajectory.
+- Seed-axis summaries, final-performance helpers, and per-step spread bands now use the
+  sample standard deviation consistently, with zero spread for one seed. The within-run
+  `compare_learners` helper remains explicitly population dispersion over recorded steps.
+- Multi-seed experiments now reject duplicate configuration names and duplicate explicit
+  seeds before executing any learner or stream factory, preventing distinct treatments
+  from being merged or deterministic trajectories from being counted twice.
 
 ### Removed
 
