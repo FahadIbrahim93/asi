@@ -215,9 +215,19 @@ def ttest_comparison(
 
     Returns:
         SignificanceResult with test results
+
+    Raises:
+        ValueError: If a paired comparison receives identical samples, for
+            which the paired t statistic is undefined
     """
     a = np.asarray(values_a)
     b = np.asarray(values_b)
+
+    if paired and a.size > 0 and np.array_equal(a, b):
+        raise ValueError(
+            f"Paired comparison {method_a!r} vs {method_b!r} has identical "
+            "samples; the paired t statistic is undefined"
+        )
 
     try:
         from scipy import stats
