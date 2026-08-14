@@ -221,6 +221,27 @@ class TestPairedTests:
         # every a_i < b_i: effect size sign must reflect a < b
         assert res.effect_size < 0.0
 
+    def test_paired_ttest_rejects_identical_samples(self) -> None:
+        values = [0.91, 0.88, 0.95]
+        with pytest.raises(
+            ValueError,
+            match=r"^Paired comparison 'pin' vs 'base' has identical samples; "
+            r"the paired t statistic is undefined$",
+        ):
+            ttest_comparison(values, list(values), paired=True, method_a="pin", method_b="base")
+
+    def test_constant_nonzero_shift_stays_out_of_scope(self) -> None:
+        res = ttest_comparison([1.0, 2.0, 3.0], [0.5, 1.5, 2.5], paired=True)
+        assert np.isposinf(res.statistic)
+        assert res.p_value == 0.0
+
+    def test_unpaired_identical_samples_stay_out_of_scope(self) -> None:
+        values = [0.91, 0.88, 0.95]
+        res = ttest_comparison(values, list(values), paired=False)
+        assert res.test_name == "independent t-test"
+        assert res.p_value == pytest.approx(1.0)
+        assert not res.significant
+
     def test_unpaired_ttest_separated_groups(self) -> None:
         rng = np.random.default_rng(5)
         a = rng.normal(10.0, 0.5, size=15)
@@ -485,6 +506,19 @@ class TestPairwiseComparisons:
 
         with pytest.raises(ValueError, match="equal seed sets"):
             pairwise_comparisons({"a": a, "b": b}, test=test, window=1)
+
+    def test_reduction_pin_pair_rejected_for_paired_ttest(self) -> None:
+        rows = [0.10, 0.11, 0.09]
+        results = {
+            "base_arm": _make_seeded_aggregated("base_arm", [0, 1, 2], rows),
+            "pinned_inert": _make_seeded_aggregated("pinned_inert", [0, 1, 2], list(rows)),
+        }
+        with pytest.raises(
+            ValueError,
+            match=r"^Paired comparison 'base_arm' vs 'pinned_inert' has identical "
+            r"samples; the paired t statistic is undefined$",
+        ):
+            pairwise_comparisons(results, metric="squared_error", test="ttest")
 
     def test_duplicate_seeds_rejected(self) -> None:
         malformed = _make_seeded_aggregated("malformed", [0, 0, 1], [0.0, 1.0, 2.0])
