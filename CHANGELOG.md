@@ -49,6 +49,8 @@ measurements remain in their primary output records; none promotes a registry cl
   manual dispatch. The redundant main-only and sparse `unit`-only gates were removed.
 - Raised the supported JAX/JAXlib floor from 0.4 to 0.7.1 while retaining NumPy 1.26
   compatibility for the robot track. The GPU extra uses the same JAX floor.
+- The test harness preserves Chex tree-assertion semantics when exercising the NumPy 1.26
+  floor, whose `numpy.testing.assert_allclose` predates the `strict` keyword Chex passes.
 - Console-script loading is now safe when uv installs wheel files as hard links. The strict
   Forager source-identity checks still run when an attested command is actually executed.
 - Normalizer coverage now uses a small deterministic exact-moment sequence instead of

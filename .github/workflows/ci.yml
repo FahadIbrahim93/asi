@@ -160,6 +160,8 @@ jobs:
         run: |
           initializer_node="tests/test_initializers.py::"
           initializer_node+="TestSparseInit::test_correct_output_shape"
+          chex_node="tests/test_initializers.py::"
+          chex_node+="TestSparseInit::test_correct_sparsity_fraction"
           optimizer_node="tests/test_optimizer_registry.py::"
           optimizer_node+="test_round_trip_with_default_args[IDBD]"
           sarsa_node="tests/test_sarsa.py::"
@@ -168,6 +170,7 @@ jobs:
           actor_node+="test_actor_critic_update_is_jittable"
           "$RUNNER_TEMP/exact-floor/bin/python" -m pytest \
             "$initializer_node" \
+            "$chex_node" \
             "$optimizer_node" \
             "$sarsa_node" \
             "$actor_node" \
