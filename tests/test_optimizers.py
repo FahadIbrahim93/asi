@@ -8,6 +8,7 @@ from alberta_framework import (
     IDBD,
     LMS,
     AdaptiveObGDBounding,
+    AGCBounding,
     Autostep,
     AutostepGTDLambda,
     ObGD,
@@ -617,6 +618,29 @@ class TestObGDBounding:
         )
         assert float(scale) == pytest.approx(0.0)
         for actual in bounded:
+            assert bool(jnp.all(jnp.isfinite(actual)))
+            chex.assert_trees_all_close(actual, jnp.zeros_like(actual))
+
+
+class TestAGCBounding:
+    """Tests for Adaptive Gradient Clipping."""
+
+    def test_infinite_step_times_zero_scale_is_zero_not_nan(self):
+        """Inf g_norm drives clip scale to 0; 0*inf was NaN."""
+        bounder = AGCBounding(clip_factor=0.01)
+        steps = (
+            jnp.array([jnp.inf, jnp.inf], dtype=jnp.float32),
+            jnp.array(jnp.inf, dtype=jnp.float32),
+        )
+        params = (
+            jnp.ones(2, dtype=jnp.float32),
+            jnp.array(1.0, dtype=jnp.float32),
+        )
+        clipped, frac = bounder.bound(
+            steps, jnp.array(jnp.inf, dtype=jnp.float32), params
+        )
+        assert float(frac) == pytest.approx(1.0)
+        for actual in clipped:
             assert bool(jnp.all(jnp.isfinite(actual)))
             chex.assert_trees_all_close(actual, jnp.zeros_like(actual))
 

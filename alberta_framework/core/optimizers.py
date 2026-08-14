@@ -275,7 +275,7 @@ class AGCBounding(Bounder):
             scale = max_norm / jnp.maximum(g_norm, 1e-6)
             needs_clip = g_norm > max_norm
             clipped_step = jnp.where(needs_clip, step * scale, step)
-            clipped.append(clipped_step)
+            clipped.append(_replace_nan_with_zero(clipped_step))
 
             total_units += needs_clip.size
             clipped_units = clipped_units + jnp.sum(needs_clip.astype(jnp.float32))
