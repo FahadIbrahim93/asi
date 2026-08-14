@@ -548,8 +548,16 @@ def bootstrap_ci(
 
     Returns:
         Tuple of (point_estimate, ci_lower, ci_upper)
+
+    Raises:
+        ValueError: If ``values`` is empty.
     """
     arr = np.asarray(values)
+    if len(arr) == 0:
+        raise ValueError(
+            "bootstrap_ci requires at least one value; got an empty array "
+            "(a NaN interval would be indistinguishable from a real CI)"
+        )
     rng = np.random.default_rng(seed)
 
     stat_func = np.mean if statistic == "mean" else np.median
