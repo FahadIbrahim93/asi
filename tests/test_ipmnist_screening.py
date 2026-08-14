@@ -19,6 +19,7 @@ import pytest
 
 from alberta_framework.benchmarks.ipmnist_screening import (
     _CBP_LAYERS,
+    CONFIRMATION_THRESHOLD,
     PROXY_N_TASKS,
     SCREENING_REGISTRY,
     SHARD_SCHEMA,
@@ -839,6 +840,66 @@ class TestShardsAndMerge:
         assert l2["seeds"] == [1, 2]
         assert l2["paired_vs_control"]["seeds"] == [1]
         assert len(l2["paired_vs_control"]["per_seed_diff"]) == 1
+
+    def _write_inband_shard(self, tmp_path, name, seed, accuracy):
+        """Structurally valid shard with a constant per-task accuracy."""
+        n_tasks = SMALL.n_tasks
+        payload = {
+            "schema": SHARD_SCHEMA,
+            "config_name": name,
+            "base_learner": "upgd_w",
+            "hyperparameters": {},
+            "seed": seed,
+            "noise_mode": "step",
+            "config": SMALL.to_config(),
+            "per_task_accuracy": [float(accuracy)] * n_tasks,
+            "per_task_loss": [0.1] * n_tasks,
+            "per_task_plasticity": [0.5] * n_tasks,
+            "wall_clock_seconds": 1.0,
+        }
+        path = tmp_path / f"{name}_seed{seed}.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        return path
+
+    def test_confirmation_candidate_false_with_one_paired_seed(self, tmp_path):
+        """A single shared seed that clears CONFIRMATION_THRESHOLD must not
+        green-light a confirmation wave: n=1 has no spread, stderr_diff is
+        0.0 by construction, and all_seeds_improve is vacuous (issue #53)."""
+        control_acc = 0.50
+        candidate_acc = 0.56  # +0.06 on the shared seed
+        paths = [
+            self._write_inband_shard(tmp_path, "upgd_w_control", 0, control_acc),
+            self._write_inband_shard(tmp_path, "upgd_l2init", 0, candidate_acc),
+            self._write_inband_shard(tmp_path, "upgd_l2init", 1, candidate_acc),
+            self._write_inband_shard(tmp_path, "upgd_l2init", 2, candidate_acc),
+        ]
+        summary = merge_shards(paths, control_name="upgd_w_control", slope_window=2)
+        l2 = next(e for e in summary["results"] if e["config_name"] == "upgd_l2init")
+        paired = l2["paired_vs_control"]
+        assert paired["seeds"] == [0]
+        assert paired["mean_diff"] > CONFIRMATION_THRESHOLD
+        assert paired["stderr_diff"] == 0.0
+        assert paired["all_seeds_improve"] is True
+        assert paired["beats_control"] is True
+        assert paired["confirmation_candidate"] is False
+
+    def test_confirmation_candidate_true_with_two_paired_seeds(self, tmp_path):
+        """Two shared seeds that clear the threshold still flag a candidate.
+        The two-seed floor must not change this already-decidable case."""
+        control_acc = 0.50
+        candidate_acc = 0.56
+        paths = [
+            self._write_inband_shard(tmp_path, "upgd_w_control", 0, control_acc),
+            self._write_inband_shard(tmp_path, "upgd_w_control", 1, control_acc),
+            self._write_inband_shard(tmp_path, "upgd_l2init", 0, candidate_acc),
+            self._write_inband_shard(tmp_path, "upgd_l2init", 1, candidate_acc),
+        ]
+        summary = merge_shards(paths, control_name="upgd_w_control", slope_window=2)
+        l2 = next(e for e in summary["results"] if e["config_name"] == "upgd_l2init")
+        paired = l2["paired_vs_control"]
+        assert paired["seeds"] == [0, 1]
+        assert paired["mean_diff"] > CONFIRMATION_THRESHOLD
+        assert paired["confirmation_candidate"] is True
 
     def test_atomic_writer_refuses_duplicate_without_mutating_first_result(
         self, tmp_path: Path

@@ -7115,7 +7115,9 @@ def merge_shards(
                 ),
                 "all_seeds_improve": bool(np.all(diff > 0.0)),
                 "beats_control": bool(diff.mean() > 0.0),
-                "confirmation_candidate": bool(diff.mean() > CONFIRMATION_THRESHOLD),
+                "confirmation_candidate": bool(
+                    len(common) >= 2 and diff.mean() > CONFIRMATION_THRESHOLD
+                ),
             }
         entries.append(entry)
 
