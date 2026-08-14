@@ -370,6 +370,13 @@ class TestIdenticalWilcoxonRejection:
                     method_b="base",
                 )
 
+    def test_constant_nonzero_shift_stays_defined(self) -> None:
+        result = wilcoxon_comparison([1.0, 2.0, 3.0], [0.5, 1.5, 2.5])
+
+        assert result.test_name == "Wilcoxon signed-rank"
+        assert result.statistic == pytest.approx(0.0)
+        assert result.p_value < 1.0
+
 
 class TestOneSampleRejection:
     """Undefined one-sample contracts reject without narrowing valid t-tests (#35).
