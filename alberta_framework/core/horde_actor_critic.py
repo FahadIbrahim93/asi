@@ -54,6 +54,41 @@ from alberta_framework.core.optimizers import (
 from alberta_framework.core.types import AutostepParamState, DemonType, MLPParams
 
 
+def _floating_tree_is_finite(tree: object) -> Array:
+    """Return whether every floating/complex persistent leaf is finite."""
+    valid = jnp.asarray(True, dtype=jnp.bool_)
+    for leaf in jax.tree.leaves(tree):
+        array = jnp.asarray(leaf)
+        if jnp.issubdtype(array.dtype, jnp.inexact):
+            valid = valid & jnp.all(jnp.isfinite(array))
+    return valid
+
+
+def _commit_scan_safe_actor_state(
+    previous: Any,
+    proposed: Any,
+    reward: Array,
+    observation: Array,
+    td_error: Array,
+) -> Any:
+    """Keep finite weights when ObGD zeros a step and ``error * 0`` is NaN.
+
+    Still increments ``step_count`` on the held path so scan loops stay aligned.
+    Callers write ``last_observation`` / action / rng after this returns.
+    """
+    inputs_valid = (
+        jnp.isfinite(jnp.squeeze(reward))
+        & jnp.all(jnp.isfinite(observation))
+        & jnp.isfinite(td_error)
+    )
+    params_ok = inputs_valid & _floating_tree_is_finite(proposed)
+    return jax.lax.cond(
+        params_ok,
+        lambda: proposed,
+        lambda: previous.replace(step_count=previous.step_count + 1),  # type: ignore[attr-defined]
+    )
+
+
 @dataclasses.dataclass(frozen=True)
 class HordeActorCriticConfig:
     """Configuration for a Horde-backed discrete actor-critic agent.
@@ -437,12 +472,18 @@ class QHordeActorCriticAgent:
             critic_state=critic_result.state,
             step_count=state.step_count + 1,
         )
+        # Inf TD error zeros the ObGD step, then actor_scale * step is 0*inf=NaN.
+        # Keep previous finite weights/traces; still advance the observation
+        # so a scan loop does not desynchronize.
+        held = _commit_scan_safe_actor_state(
+            state, updated, reward, observation, td_error
+        )
         next_action, key, policy = (
             (sampled_next_action, sampled_key, sampled_policy)
             if cfg.critic_target == "sampled_sarsa"
-            else self.select_action(updated, observation)
+            else self.select_action(held, observation)
         )
-        new_state = updated.replace(
+        new_state = held.replace(
             last_observation=observation,
             last_action=next_action,
             rng_key=key,
@@ -727,8 +768,14 @@ class HordeActorCriticAgent:
             critic_state=critic_result.state,
             step_count=state.step_count + 1,
         )
-        next_action, key, next_policy = self.select_action(updated, observation)
-        new_state = updated.replace(
+        # Inf TD error zeros the ObGD step, then td_error * step is 0*inf=NaN.
+        # Keep previous finite weights/traces; still advance the observation
+        # so a scan loop does not desynchronize.
+        held = _commit_scan_safe_actor_state(
+            state, updated, reward, observation, td_error
+        )
+        next_action, key, next_policy = self.select_action(held, observation)
+        new_state = held.replace(
             last_observation=observation,
             last_action=next_action,
             rng_key=key,
@@ -1470,8 +1517,14 @@ class NonlinearHordeActorCriticAgent:
             critic_state=critic_result.state,
             step_count=state.step_count + 1,
         )
-        next_action, key, next_policy = self.select_action(updated, observation)
-        new_state = updated.replace(
+        # Inf TD error zeros the ObGD step, then td_error * step is 0*inf=NaN.
+        # Keep previous finite weights/traces; still advance the observation
+        # so a scan loop does not desynchronize.
+        held = _commit_scan_safe_actor_state(
+            state, updated, reward, observation, td_error
+        )
+        next_action, key, next_policy = self.select_action(held, observation)
+        new_state = held.replace(
             last_observation=observation,
             last_action=next_action,
             rng_key=key,
@@ -1988,12 +2041,18 @@ class NonlinearQHordeActorCriticAgent:
             critic_state=critic_result.state,
             step_count=state.step_count + 1,
         )
+        # Inf TD error zeros the ObGD step, then actor_signal * step is 0*inf=NaN.
+        # Keep previous finite weights/traces; still advance the observation
+        # so a scan loop does not desynchronize.
+        held = _commit_scan_safe_actor_state(
+            state, updated, reward, observation, td_error
+        )
         next_action, key, policy = (
             (sampled_next_action, sampled_key, sampled_policy)
             if cfg.critic_target == "sampled_sarsa"
-            else self.select_action(updated, observation)
+            else self.select_action(held, observation)
         )
-        new_state = updated.replace(
+        new_state = held.replace(
             last_observation=observation,
             last_action=next_action,
             rng_key=key,

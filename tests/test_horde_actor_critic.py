@@ -282,6 +282,41 @@ def test_horde_actor_critic_actor_bounder_hook_runs() -> None:
     chex.assert_tree_all_finite((result.state.actor_weights, result.bound_metric))
 
 
+def test_horde_actor_critic_infinite_reward_with_obgd_does_not_poison_actor() -> None:
+    """Inf TD error zeros the ObGD step, then td_error*step is 0*inf=NaN."""
+    base_agent = _make_agent()
+    agent = HordeActorCriticAgent(
+        base_agent.config,
+        base_agent.critic,
+        actor_bounder=ObGDBounding(kappa=2.0),
+    )
+    state = agent.init(feature_dim=2, key=jr.key(0)).replace(  # type: ignore[attr-defined]
+        last_observation=jnp.array([1.0, 0.0], dtype=jnp.float32),
+        last_action=jnp.array(0, dtype=jnp.int32),
+    )
+    next_obs = jnp.array([0.0, 1.0], dtype=jnp.float32)
+
+    poisoned = agent.update(
+        state,
+        reward=jnp.array(jnp.inf, dtype=jnp.float32),
+        observation=next_obs,
+    )
+
+    assert bool(jnp.all(jnp.isfinite(poisoned.state.actor_weights)))
+    assert bool(jnp.all(jnp.isfinite(poisoned.state.actor_bias)))
+    chex.assert_trees_all_close(poisoned.state.actor_weights, state.actor_weights)
+    chex.assert_trees_all_close(poisoned.state.last_observation, next_obs)
+    assert int(poisoned.state.step_count) == int(state.step_count) + 1
+
+    recovered = agent.update(
+        poisoned.state,
+        reward=jnp.array(1.0, dtype=jnp.float32),
+        observation=jnp.array([1.0, 0.0], dtype=jnp.float32),
+    )
+    assert bool(jnp.all(jnp.isfinite(recovered.state.actor_weights)))
+    assert bool(jnp.all(jnp.isfinite(recovered.state.actor_bias)))
+
+
 def test_qhorde_actor_critic_updates_only_taken_q_head_and_actor() -> None:
     agent = _make_qhorde_agent(n_actions=2)
     state = agent.init(feature_dim=2, key=jr.key(10)).replace(  # type: ignore[attr-defined]
@@ -304,6 +339,41 @@ def test_qhorde_actor_critic_updates_only_taken_q_head_and_actor() -> None:
     chex.assert_tree_all_finite(
         (result.policy, result.q_values, result.next_q_values, result.td_error)
     )
+
+
+def test_qhorde_infinite_reward_with_obgd_does_not_poison_actor() -> None:
+    """Inf TD error zeros the ObGD step, then actor_scale*step is 0*inf=NaN."""
+    base_agent = _make_qhorde_agent(n_actions=2)
+    agent = QHordeActorCriticAgent(
+        base_agent.config,
+        base_agent.critic,
+        actor_bounder=ObGDBounding(kappa=2.0),
+    )
+    state = agent.init(feature_dim=2, key=jr.key(0)).replace(  # type: ignore[attr-defined]
+        last_observation=jnp.array([1.0, 0.0], dtype=jnp.float32),
+        last_action=jnp.array(0, dtype=jnp.int32),
+    )
+    next_obs = jnp.array([0.0, 1.0], dtype=jnp.float32)
+
+    poisoned = agent.update(
+        state,
+        reward=jnp.array(jnp.inf, dtype=jnp.float32),
+        observation=next_obs,
+        terminated=jnp.array(0.0, dtype=jnp.float32),
+    )
+
+    assert bool(jnp.all(jnp.isfinite(poisoned.state.actor_weights)))
+    chex.assert_trees_all_close(poisoned.state.actor_weights, state.actor_weights)
+    chex.assert_trees_all_close(poisoned.state.last_observation, next_obs)
+    assert int(poisoned.state.step_count) == int(state.step_count) + 1
+
+    recovered = agent.update(
+        poisoned.state,
+        reward=jnp.array(1.0, dtype=jnp.float32),
+        observation=jnp.array([1.0, 0.0], dtype=jnp.float32),
+        terminated=jnp.array(0.0, dtype=jnp.float32),
+    )
+    assert bool(jnp.all(jnp.isfinite(recovered.state.actor_weights)))
 
 
 def test_qhorde_actor_critic_auxiliary_prediction_and_terminal_trace_reset() -> None:
@@ -666,6 +736,47 @@ class TestNonlinearHordeActorCriticUpdate:
         result = agent.update(state, jnp.array(1.0), jnp.ones(OBS_DIM))
         assert jnp.isfinite(result.td_error)
 
+    def test_infinite_reward_with_obgd_does_not_poison_actor(self) -> None:
+        """Inf TD error zeros the ObGD step, then td_error*step is 0*inf=NaN."""
+        critic = HordeLearner(
+            create_horde_spec(
+                [GVFSpec(  # type: ignore[call-arg]
+                    name="v",
+                    demon_type=DemonType.PREDICTION,
+                    gamma=0.0,
+                    lamda=0.0,
+                    cumulant_index=0,
+                )]
+            ),
+            hidden_sizes=(),
+            step_size=0.03,
+        )
+        agent = NonlinearHordeActorCriticAgent(
+            NonlinearHordeActorCriticConfig(
+                n_actions=2,
+                hidden_sizes=(),
+                actor_sparsity=0.0,
+            ),
+            critic,
+            actor_optimizer=Autostep(initial_step_size=0.5),
+            actor_bounder=ObGDBounding(kappa=2.0),
+        )
+        observation = jnp.array([1.0, -0.5], dtype=jnp.float32)
+        next_obs = jnp.array([0.5, 1.0], dtype=jnp.float32)
+        state = agent.init(2, jr.key(27))
+        state, _, _ = agent.start(state, observation)
+
+        poisoned = agent.update(state, jnp.array(jnp.inf, dtype=jnp.float32), next_obs)
+        assert bool(jnp.all(jnp.isfinite(poisoned.state.actor_head_w)))
+        chex.assert_trees_all_close(poisoned.state.actor_head_w, state.actor_head_w)
+        chex.assert_trees_all_close(poisoned.state.last_observation, next_obs)
+        assert int(poisoned.state.step_count) == int(state.step_count) + 1
+
+        recovered = agent.update(
+            poisoned.state, jnp.array(1.0, dtype=jnp.float32), observation
+        )
+        assert bool(jnp.all(jnp.isfinite(recovered.state.actor_head_w)))
+
     def test_actor_td_error_normalizer_updates(self) -> None:
         critic = HordeLearner(
             create_horde_spec(
@@ -976,6 +1087,57 @@ class TestNonlinearQHordeActorCritic:
         chex.assert_shape(result.q_values, (N_ACTIONS,))
         chex.assert_tree_all_finite(result.q_values)
         assert int(result.state.step_count) == 1
+
+    def test_infinite_reward_with_obgd_does_not_poison_actor(self) -> None:
+        """Inf TD error zeros the ObGD step, then actor_signal*step is 0*inf=NaN."""
+        demons = [
+            GVFSpec(  # type: ignore[call-arg]
+                name=f"q_{action}",
+                demon_type=DemonType.CONTROL,
+                gamma=0.0,
+                lamda=0.0,
+                cumulant_index=-1,
+            )
+            for action in range(2)
+        ]
+        critic = HordeLearner(
+            create_horde_spec(demons),
+            hidden_sizes=(),
+            step_size=0.03,
+        )
+        agent = NonlinearQHordeActorCriticAgent(
+            NonlinearQHordeActorCriticConfig(
+                n_actions=2,
+                hidden_sizes=(),
+                actor_sparsity=0.0,
+            ),
+            critic,
+            actor_optimizer=Autostep(initial_step_size=0.5),
+            actor_bounder=ObGDBounding(kappa=2.0),
+        )
+        observation = jnp.array([1.0, 0.0], dtype=jnp.float32)
+        next_obs = jnp.array([0.0, 1.0], dtype=jnp.float32)
+        state = agent.init(2, jr.key(18))
+        state, _, _ = agent.start(state, observation)
+
+        poisoned = agent.update(
+            state,
+            jnp.array(jnp.inf, dtype=jnp.float32),
+            next_obs,
+            jnp.array(0.0, dtype=jnp.float32),
+        )
+        assert bool(jnp.all(jnp.isfinite(poisoned.state.actor_head_w)))
+        chex.assert_trees_all_close(poisoned.state.actor_head_w, state.actor_head_w)
+        chex.assert_trees_all_close(poisoned.state.last_observation, next_obs)
+        assert int(poisoned.state.step_count) == int(state.step_count) + 1
+
+        recovered = agent.update(
+            poisoned.state,
+            jnp.array(1.0, dtype=jnp.float32),
+            observation,
+            jnp.array(0.0, dtype=jnp.float32),
+        )
+        assert bool(jnp.all(jnp.isfinite(recovered.state.actor_head_w)))
 
     def test_requires_control_heads(self) -> None:
         critic = HordeLearner(
