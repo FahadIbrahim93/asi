@@ -426,6 +426,8 @@ def compare_learners(
 
     ``final_100_mean`` averages the last 100 steps (the whole trace when it is
     shorter), estimating settled performance less noisily than the last value.
+    ``std`` is the population standard deviation over the complete recorded
+    time-step trajectory; it is not a spread estimate across independent seeds.
 
     Args:
         results: Dictionary mapping learner name to metrics history

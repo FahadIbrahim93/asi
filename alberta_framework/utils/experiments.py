@@ -67,7 +67,7 @@ class MetricSummary(NamedTuple):
 
     Attributes:
         mean: Mean across seeds
-        std: Standard deviation across seeds
+        std: Sample standard deviation across seeds (zero for one seed)
         min: Minimum value across seeds
         max: Maximum value across seeds
         n_seeds: Number of seeds
@@ -170,7 +170,7 @@ def aggregate_metrics(results: list[SingleRunResult]) -> AggregatedResults:
         final_values = np.mean(metric_arrays[key][:, -window:], axis=1)
         summary[key] = MetricSummary(
             mean=float(np.mean(final_values)),
-            std=float(np.std(final_values)),
+            std=float(np.std(final_values, ddof=1)) if n_seeds > 1 else 0.0,
             min=float(np.min(final_values)),
             max=float(np.max(final_values)),
             n_seeds=n_seeds,
@@ -294,18 +294,19 @@ def get_metric_timeseries(
     results: AggregatedResults,
     metric: str = "squared_error",
 ) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
-    """Get mean and standard deviation timeseries for a metric.
+    """Get the mean and one-sample-standard-deviation band for a metric.
 
     Args:
         results: Aggregated results
         metric: Name of the metric
 
     Returns:
-        Tuple of (mean, lower_bound, upper_bound) arrays
+        Tuple of ``(mean, mean - sample_std, mean + sample_std)`` arrays. A
+        one-seed aggregate has zero spread and therefore a point band.
     """
     arr = results.metric_arrays[metric]
     mean = np.mean(arr, axis=0)
-    std = np.std(arr, axis=0)
+    std = np.zeros_like(mean) if arr.shape[0] == 1 else np.std(arr, axis=0, ddof=1)
     return mean, mean - std, mean + std
 
 
@@ -314,7 +315,7 @@ def get_final_performance(
     metric: str = "squared_error",
     window: int = 100,
 ) -> dict[str, tuple[float, float]]:
-    """Get final performance (mean, std) for each config.
+    """Get final performance (mean, sample std) for each config.
 
     Args:
         results: Dictionary of aggregated results
@@ -322,14 +323,16 @@ def get_final_performance(
         window: Number of final steps to average
 
     Returns:
-        Dictionary mapping config name to (mean, std) tuple
+        Dictionary mapping config name to ``(mean, sample_std)``. A one-seed
+        aggregate reports zero spread.
     """
     performance: dict[str, tuple[float, float]] = {}
     for name, agg in results.items():
         arr = agg.metric_arrays[metric]
         final_window = min(window, arr.shape[1])
         final_means = np.mean(arr[:, -final_window:], axis=1)
-        performance[name] = (float(np.mean(final_means)), float(np.std(final_means)))
+        std = float(np.std(final_means, ddof=1)) if len(final_means) > 1 else 0.0
+        performance[name] = (float(np.mean(final_means)), std)
     return performance
 
 
