@@ -112,6 +112,25 @@ class TestStep:
         s2 = d.step(s0, jnp.array([0.0, 0.0]), jnp.array([2.0, 0.0]))
         assert float(s2.utility[0]) > 0.0
 
+    def test_infinite_next_obs_does_not_poison_predictors(self) -> None:
+        """Zero init V(s') is 0 @ inf = NaN, then alpha * nan * obs poisons all."""
+        d = CumulantDiscovery(raw_dim=2, n_candidates=3, predictor_step_size=0.1)
+        state = d.init(jr.key(0))
+        obs = jnp.array([0.0, 1.0], dtype=jnp.float32)
+        nxt = jnp.array([jnp.inf, 1.0], dtype=jnp.float32)
+
+        poisoned = d.step(state, obs, nxt)
+        chex.assert_trees_all_close(poisoned.weights, state.weights)
+        chex.assert_trees_all_close(poisoned.biases, state.biases)
+        chex.assert_trees_all_close(poisoned.utility, state.utility)
+        chex.assert_trees_all_close(poisoned.ages, state.ages)
+
+        recovered = d.step(poisoned, obs, jnp.array([1.0, 1.0], dtype=jnp.float32))
+        chex.assert_tree_all_finite(recovered.weights)
+        chex.assert_tree_all_finite(recovered.biases)
+        chex.assert_tree_all_finite(recovered.utility)
+        chex.assert_trees_all_close(recovered.ages, state.ages + 1)
+
     def test_predictor_reduces_td_error(self) -> None:
         d = CumulantDiscovery(
             raw_dim=2, n_candidates=1, predictor_step_size=0.1, gamma=0.0
