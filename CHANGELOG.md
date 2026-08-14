@@ -64,6 +64,15 @@ measurements remain in their primary output records; none promotes a registry cl
   rule-discovery, partner, memory, and planning measurements remain development-only.
 - Closed and consumed conclusions are indexed in `docs/evidence/negative-results.md`.
 
+### Fixed
+
+- Paired statistical comparisons now validate seed identities and metric-row counts,
+  align paired t-test and Wilcoxon samples by seed, and reject unequal seed sets instead
+  of silently pairing rows by position. Mann-Whitney comparisons remain unpaired.
+- Multi-seed experiments now reject duplicate configuration names before executing any
+  learner or stream factory, preventing distinct treatments from being merged under one
+  aggregate identity.
+
 ### Removed
 
 - Removed pytest-embedded lifetime, gauntlet, planning, discovery-control, and
