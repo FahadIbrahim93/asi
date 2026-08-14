@@ -460,8 +460,9 @@ class HCCLContinualDyadOperationalLifeError(RuntimeError):
     def __init__(self, step_index: int, stage: str, detail: str) -> None:
         self.step_index = step_index
         self.stage = stage
+        location = "before step 0" if step_index < 0 else f"at step {step_index}"
         super().__init__(
-            f"primitive operational life aborted at step {step_index} "
+            f"primitive operational life aborted {location} "
             f"during {stage}: {detail}"
         )
 
@@ -672,7 +673,11 @@ def _collect_operational_life(
             str(error),
         ) from error
     if not np.array_equal(initial_clock, np.zeros((2,), dtype=np.uint32)):
-        raise ValueError("operational executor must begin at the exact zero world clock")
+        raise HCCLContinualDyadOperationalLifeError(
+            -1,
+            "source-clock",
+            "executor must begin at the exact zero world clock",
+        )
 
     steps = config.total_steps
     regime_ids = np.empty((steps,), dtype=np.int32)

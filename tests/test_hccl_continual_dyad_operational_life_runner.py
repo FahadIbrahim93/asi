@@ -155,8 +155,14 @@ class _FakeOperationalExecutor:
 class _MalformedSourceExecutor:
     """Executor double that exposes a malformed source at a chosen read."""
 
-    def __init__(self, malformed_read: int) -> None:
+    def __init__(
+        self,
+        malformed_read: int | None,
+        *,
+        initial_clock: tuple[int, int] = (0, 0),
+    ) -> None:
         self.malformed_read = malformed_read
+        self.initial_clock = initial_clock
         self.source_reads = 0
         self.step_called = False
 
@@ -165,7 +171,7 @@ class _MalformedSourceExecutor:
         self.source_reads += 1
         if self.source_reads == self.malformed_read:
             return object()
-        return _state((0, 0))
+        return _state(self.initial_clock if self.source_reads == 1 else (0, 0))
 
     @property
     def absolute_step(self) -> int:
@@ -389,6 +395,22 @@ def test_collection_wraps_malformed_source_clock_before_executor_step(
 
     assert captured.value.step_index == (-1 if malformed_read == 1 else 0)
     assert captured.value.stage == "source-clock"
+    assert executor.step_called is False
+
+
+def test_collection_wraps_wrong_initial_clock_before_step_zero() -> None:
+    config = HCCLContinualDyadOperationalLifeRunnerConfig.mechanics_smoke()
+    executor = _MalformedSourceExecutor(None, initial_clock=(1, 0))
+
+    with pytest.raises(HCCLContinualDyadOperationalLifeError) as captured:
+        _collect_operational_life(config, executor, _score_for_regime)
+
+    assert captured.value.step_index == -1
+    assert captured.value.stage == "source-clock"
+    assert str(captured.value) == (
+        "primitive operational life aborted before step 0 during source-clock: "
+        "executor must begin at the exact zero world clock"
+    )
     assert executor.step_called is False
 
 
