@@ -846,7 +846,10 @@ class AverageRewardHordeLearner:
     ) -> AverageRewardHordeUpdateResult:
         """Apply one shared-trunk differential Horde update."""
         next_predictions = self._learner.predict(state.learner_state, next_observation)
-        active = ~jnp.isnan(cumulants)
+        # NaN is the inactive-head sentinel. Inf is not NaN, so it used to
+        # stay "active", MultiHead refused the whole trunk, and rbar still
+        # took an inf step.
+        active = jnp.isfinite(cumulants)
         targets = cumulants - state.average_rewards + next_predictions
         targets = jnp.where(active, targets, jnp.nan)
         result = self._learner.update(state.learner_state, observation, targets)
@@ -855,10 +858,19 @@ class AverageRewardHordeLearner:
         new_average_rewards = (
             state.average_rewards + self._average_reward_step_size * safe_td_errors
         )
+        new_average_rewards = jnp.where(
+            result.update_applied,
+            new_average_rewards,
+            state.average_rewards,
+        )
         new_state = state.replace(
             learner_state=result.state,
             average_rewards=new_average_rewards,
-            step_count=_saturating_int32_increment(state.step_count),
+            step_count=jnp.where(
+                result.update_applied,
+                _saturating_int32_increment(state.step_count),
+                state.step_count,
+            ),
         )
         return AverageRewardHordeUpdateResult(
             state=new_state,
@@ -984,7 +996,7 @@ class DifferentialGTDLearner:
         secondary_bias_step = beta * (td_error * bias_trace - secondary_dot_obs)
         new_average_reward = state.average_reward + eta * rho_s * td_error
 
-        new_state = state.replace(
+        proposed_state = state.replace(
             weights=state.weights + primary_weight_step,
             bias=state.bias + primary_bias_step,
             secondary_weights=state.secondary_weights + secondary_weight_step,
@@ -994,13 +1006,35 @@ class DifferentialGTDLearner:
             average_reward=new_average_reward,
             step_count=_saturating_int32_increment(state.step_count),
         )
+        # Inf reward makes alpha * delta * z = 0*inf = NaN on silent features
+        # and sends rbar to inf. Differential SARSA already refuses that.
+        inputs_valid = (
+            jnp.all(jnp.isfinite(observation))
+            & jnp.isfinite(reward_s)
+            & jnp.all(jnp.isfinite(next_observation))
+            & jnp.isfinite(jnp.squeeze(jnp.asarray(rho, dtype=jnp.float32)))
+        )
+        proposed_finite = (
+            jnp.all(jnp.isfinite(proposed_state.weights))
+            & jnp.isfinite(proposed_state.bias)
+            & jnp.all(jnp.isfinite(proposed_state.secondary_weights))
+            & jnp.isfinite(proposed_state.secondary_bias)
+            & jnp.all(jnp.isfinite(proposed_state.eligibility_traces))
+            & jnp.isfinite(proposed_state.bias_eligibility_trace)
+            & jnp.isfinite(proposed_state.average_reward)
+        )
+        new_state = jax.lax.cond(
+            inputs_valid & proposed_finite,
+            lambda: proposed_state,
+            lambda: state,
+        )
         metrics = jnp.array(
             [
                 td_error**2,
                 td_error,
                 rho_s,
-                new_average_reward,
-                jnp.mean(jnp.abs(traces)),
+                new_state.average_reward,
+                jnp.mean(jnp.abs(new_state.eligibility_traces)),
                 jnp.sqrt(jnp.mean(new_state.secondary_weights**2)),
             ],
             dtype=jnp.float32,
@@ -1011,7 +1045,7 @@ class DifferentialGTDLearner:
             next_prediction=next_prediction,
             td_error=td_error,
             rho_clipped=rho_s,
-            average_reward=new_average_reward,
+            average_reward=new_state.average_reward,
             metrics=metrics,
         )
 
@@ -1112,7 +1146,7 @@ class DifferentialTDLearner:
 
         traces = lamda * state.eligibility_traces + observation
         bias_trace = lamda * state.bias_eligibility_trace + 1.0
-        new_state = state.replace(
+        proposed_state = state.replace(
             weights=state.weights + alpha * td_error * traces,
             bias=state.bias + alpha * td_error * bias_trace,
             eligibility_traces=traces,
@@ -1120,12 +1154,31 @@ class DifferentialTDLearner:
             average_reward=state.average_reward + beta * td_error,
             step_count=_saturating_int32_increment(state.step_count),
         )
+        # Inf reward makes alpha * delta * z = 0*inf = NaN on silent features
+        # and sends rbar to inf. Differential SARSA already refuses that.
+        inputs_valid = (
+            jnp.all(jnp.isfinite(observation))
+            & jnp.isfinite(reward_s)
+            & jnp.all(jnp.isfinite(next_observation))
+        )
+        proposed_finite = (
+            jnp.all(jnp.isfinite(proposed_state.weights))
+            & jnp.isfinite(proposed_state.bias)
+            & jnp.all(jnp.isfinite(proposed_state.eligibility_traces))
+            & jnp.isfinite(proposed_state.bias_eligibility_trace)
+            & jnp.isfinite(proposed_state.average_reward)
+        )
+        new_state = jax.lax.cond(
+            inputs_valid & proposed_finite,
+            lambda: proposed_state,
+            lambda: state,
+        )
         metrics = jnp.array(
             [
                 td_error**2,
                 td_error,
                 new_state.average_reward,
-                jnp.mean(jnp.abs(traces)),
+                jnp.mean(jnp.abs(new_state.eligibility_traces)),
             ],
             dtype=jnp.float32,
         )
