@@ -303,6 +303,147 @@ class TestAutostep:
         ratio = float(v[2]) / float(jnp.maximum(v[0], 1e-10))
         assert ratio > 4.0  # Well above linear (3), closer to quadratic (9)
 
+    def test_infinite_error_does_not_poison_step_sizes(self):
+        """An inf error against fresh zero traces must skip meta-adaptation.
+
+        h=0 means "no gradient correlation yet": inf * 0 = NaN used to flow
+        through max(v) (max(NaN) is NaN) and stay there. The v>0 gate keeps
+        alpha on that step (NaN>0 is False) but stores a NaN normalizer, so
+        every later finite update keeps a poisoned v.
+        """
+        optimizer = Autostep(initial_step_size=0.01, meta_step_size=0.01)
+        state = optimizer.init(feature_dim=2)
+        observation = jnp.ones(2, dtype=jnp.float32)
+
+        poisoned = optimizer.update(
+            state, jnp.array(jnp.inf, dtype=jnp.float32), observation
+        )
+        assert bool(jnp.all(jnp.isfinite(poisoned.new_state.step_sizes)))
+        assert bool(jnp.all(jnp.isfinite(poisoned.new_state.normalizers)))
+        assert bool(jnp.isfinite(poisoned.new_state.bias_step_size))
+        assert bool(jnp.isfinite(poisoned.new_state.bias_normalizer))
+        chex.assert_trees_all_close(
+            poisoned.new_state.step_sizes, state.step_sizes
+        )
+        chex.assert_trees_all_close(
+            poisoned.new_state.normalizers, state.normalizers
+        )
+        chex.assert_trees_all_close(
+            poisoned.new_state.bias_step_size, state.bias_step_size
+        )
+        chex.assert_trees_all_close(
+            poisoned.new_state.bias_normalizer, state.bias_normalizer
+        )
+
+        recovered = optimizer.update(
+            poisoned.new_state, jnp.array(1.0, dtype=jnp.float32), observation
+        )
+        assert bool(jnp.all(jnp.isfinite(recovered.new_state.step_sizes)))
+        assert bool(jnp.all(jnp.isfinite(recovered.new_state.normalizers)))
+        assert bool(jnp.isfinite(recovered.new_state.bias_step_size))
+        assert bool(jnp.isfinite(recovered.new_state.bias_normalizer))
+
+    def test_finite_overflow_product_keeps_meta_update_zero(self):
+        """|error * x| overflowing float32 must not NaN a zero-trace channel.
+
+        (error * x) * h evaluates inf * 0 = NaN when the finite product
+        overflows; the non-finite guard skips the Eq. 4/5 write for that
+        channel (previous v kept, which is 0). Joint M-normalization may
+        still shrink every alpha when one x_i^2 overflows; that path is
+        not this guard.
+        """
+        optimizer = Autostep(initial_step_size=0.01, meta_step_size=0.01)
+        state = optimizer.init(feature_dim=2)
+        observation = jnp.array([1e20, 1.0], dtype=jnp.float32)
+
+        result = optimizer.update(
+            state, jnp.array(1e20, dtype=jnp.float32), observation
+        )
+        assert bool(jnp.all(jnp.isfinite(result.new_state.normalizers)))
+        assert bool(jnp.all(jnp.isfinite(result.new_state.step_sizes)))
+        # Overflowed channel: h=0 so the skipped meta-write leaves v at 0.
+        assert float(result.new_state.normalizers[0]) == 0.0
+        # Quiet channel: meta is 0, v stays 0.
+        assert float(result.new_state.normalizers[1]) == 0.0
+
+    def test_warmed_infinite_error_does_not_poison_step_sizes(self):
+        """Inf error after nonzero h must not NaN alpha via inf/inf.
+
+        Once h and v are finite nonzero, inf error makes meta=inf and
+        v=inf; the v>0 gate then evaluates exp(mu * inf / inf) = NaN and
+        clip(NaN) stores NaN step-sizes (and the bias twin) forever.
+        """
+        optimizer = Autostep(initial_step_size=0.01, meta_step_size=0.01)
+        state = optimizer.init(feature_dim=2)
+        observation = jnp.ones(2, dtype=jnp.float32)
+        for _ in range(5):
+            state = optimizer.update(
+                state, jnp.array(1.0, dtype=jnp.float32), observation
+            ).new_state
+        pre_step = state.step_sizes
+        pre_v = state.normalizers
+        pre_bias_step = state.bias_step_size
+        pre_bias_v = state.bias_normalizer
+
+        poisoned = optimizer.update(
+            state, jnp.array(jnp.inf, dtype=jnp.float32), observation
+        )
+        assert bool(jnp.all(jnp.isfinite(poisoned.new_state.step_sizes)))
+        assert bool(jnp.all(jnp.isfinite(poisoned.new_state.normalizers)))
+        assert bool(jnp.isfinite(poisoned.new_state.bias_step_size))
+        assert bool(jnp.isfinite(poisoned.new_state.bias_normalizer))
+        chex.assert_trees_all_close(poisoned.new_state.step_sizes, pre_step)
+        chex.assert_trees_all_close(poisoned.new_state.normalizers, pre_v)
+        chex.assert_trees_all_close(
+            poisoned.new_state.bias_step_size, pre_bias_step
+        )
+        chex.assert_trees_all_close(
+            poisoned.new_state.bias_normalizer, pre_bias_v
+        )
+
+        recovered = optimizer.update(
+            poisoned.new_state, jnp.array(1.0, dtype=jnp.float32), observation
+        )
+        assert bool(jnp.all(jnp.isfinite(recovered.new_state.step_sizes)))
+        assert bool(jnp.all(jnp.isfinite(recovered.new_state.normalizers)))
+
+    def test_finite_gradients_still_adapt_after_guard(self):
+        """The non-finite guard must not change ordinary adaptation."""
+        optimizer = Autostep(initial_step_size=0.01, meta_step_size=0.05)
+        state = optimizer.init(feature_dim=2)
+        observation = jnp.ones(2, dtype=jnp.float32)
+
+        first = optimizer.update(state, jnp.array(1.0), observation)
+        second = optimizer.update(first.new_state, jnp.array(1.0), observation)
+        # Second step has nonzero h, so correlated errors raise alpha.
+        assert bool(jnp.all(second.new_state.step_sizes > state.step_sizes))
+        assert bool(jnp.all(second.new_state.normalizers > 0))
+
+    def test_update_from_gradient_infinite_z_does_not_poison_step_sizes(self):
+        """The gradient path's meta-update has the same inf * 0 = NaN hole.
+
+        z * traces with fresh zero traces and an inf gradient produced NaN
+        normalizers through max(v), exactly like the linear path.
+        """
+        optimizer = Autostep(initial_step_size=0.01, meta_step_size=0.01)
+        state = optimizer.init_for_shape((4, 3))
+
+        gradient = jnp.full((4, 3), jnp.inf, dtype=jnp.float32)
+        step, poisoned = optimizer.update_from_gradient(
+            state, gradient, error=jnp.array(1.0)
+        )
+        del step
+        assert bool(jnp.all(jnp.isfinite(poisoned.step_sizes)))
+        assert bool(jnp.all(jnp.isfinite(poisoned.normalizers)))
+        chex.assert_trees_all_close(poisoned.normalizers, state.normalizers)
+
+        finite_step, recovered = optimizer.update_from_gradient(
+            poisoned, jnp.ones((4, 3)) * 0.1, error=jnp.array(1.0)
+        )
+        chex.assert_tree_all_finite(finite_step)
+        chex.assert_tree_all_finite(recovered.step_sizes)
+        chex.assert_tree_all_finite(recovered.normalizers)
+
 
 class TestAutostepGTDLambda:
     """Tests for the Autostep-for-GTD(lambda) optimizer.

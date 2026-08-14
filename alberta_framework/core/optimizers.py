@@ -942,16 +942,23 @@ class Autostep(Optimizer[AutostepState]):
 
         abs_meta_gradient = jnp.abs(meta_gradient)
 
-        # Eq. 4: v_i = max(|meta_grad|, v_i + (1/τ)*α_i*z_i²*(|meta_grad| - v_i))
+        # Eq. 4: v_i = max(|meta_grad|, v_i + (1/τ)*α_i*z_i²*(|meta_grad| - v_i)).
+        # max(NaN) is NaN, so a non-finite meta-gradient (inf*0 or overflow)
+        # must keep the previous normalizer instead of poisoning v.
         v_update = state.normalizers + (1.0 / tau) * state.step_sizes * z_sq * (
             abs_meta_gradient - state.normalizers
         )
-        new_normalizers = jnp.maximum(abs_meta_gradient, v_update)
+        new_normalizers = jnp.where(
+            jnp.isfinite(meta_gradient),
+            jnp.maximum(abs_meta_gradient, v_update),
+            state.normalizers,
+        )
 
-        # Eq. 5: α_i *= exp(μ * meta_grad / v_i) where v_i > 0
+        # Eq. 5: α_i *= exp(μ * meta_grad / v_i) where v_i > 0. The v>0 gate
+        # is not an isfinite skip: inf/inf = NaN and clip(NaN) is NaN.
         safe_v = jnp.maximum(new_normalizers, 1e-38)
         new_step_sizes = jnp.where(
-            new_normalizers > 0,
+            jnp.logical_and(jnp.isfinite(meta_gradient), new_normalizers > 0),
             state.step_sizes * jnp.exp(mu * meta_gradient / safe_v),
             state.step_sizes,
         )
@@ -1020,16 +1027,22 @@ class Autostep(Optimizer[AutostepState]):
         meta_gradient = error_scalar * x * state.traces
         abs_meta_gradient = jnp.abs(meta_gradient)
 
-        # Eq. 4: v_i update (self-regulated EMA)
+        # Eq. 4: v_i update (self-regulated EMA). max(NaN) is NaN, so a
+        # non-finite meta-gradient must keep the previous normalizer.
         v_update = state.normalizers + (1.0 / tau) * state.step_sizes * x_sq * (
             abs_meta_gradient - state.normalizers
         )
-        new_normalizers = jnp.maximum(abs_meta_gradient, v_update)
+        new_normalizers = jnp.where(
+            jnp.isfinite(meta_gradient),
+            jnp.maximum(abs_meta_gradient, v_update),
+            state.normalizers,
+        )
 
-        # Eq. 5: α_i *= exp(μ * meta_grad / v_i) where v_i > 0
+        # Eq. 5: α_i *= exp(μ * meta_grad / v_i) where v_i > 0. The v>0 gate
+        # is not an isfinite skip: inf/inf = NaN and clip(NaN) is NaN.
         safe_v = jnp.maximum(new_normalizers, 1e-38)
         new_step_sizes = jnp.where(
-            new_normalizers > 0,
+            jnp.logical_and(jnp.isfinite(meta_gradient), new_normalizers > 0),
             state.step_sizes * jnp.exp(mu * meta_gradient / safe_v),
             state.step_sizes,
         )
@@ -1039,16 +1052,22 @@ class Autostep(Optimizer[AutostepState]):
         bias_meta_gradient = error_scalar * state.bias_trace
         abs_bias_meta_gradient = jnp.abs(bias_meta_gradient)
 
-        # Eq. 4 for bias
+        # Eq. 4 for bias. Same guard: a non-finite correlation keeps v.
         bias_v_update = state.bias_normalizer + (1.0 / tau) * state.bias_step_size * (
             abs_bias_meta_gradient - state.bias_normalizer
         )
-        new_bias_normalizer = jnp.maximum(abs_bias_meta_gradient, bias_v_update)
+        new_bias_normalizer = jnp.where(
+            jnp.isfinite(bias_meta_gradient),
+            jnp.maximum(abs_bias_meta_gradient, bias_v_update),
+            state.bias_normalizer,
+        )
 
-        # Eq. 5 for bias
+        # Eq. 5 for bias. Same isfinite skip so inf/inf cannot NaN alpha.
         safe_bias_v = jnp.maximum(new_bias_normalizer, 1e-38)
         new_bias_step_size = jnp.where(
-            new_bias_normalizer > 0,
+            jnp.logical_and(
+                jnp.isfinite(bias_meta_gradient), new_bias_normalizer > 0
+            ),
             state.bias_step_size * jnp.exp(mu * bias_meta_gradient / safe_bias_v),
             state.bias_step_size,
         )
