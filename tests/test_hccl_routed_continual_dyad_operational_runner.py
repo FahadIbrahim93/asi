@@ -358,7 +358,8 @@ def _structured_result(
 def test_routed_executor_bounds_gate_precedes_preparation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    executor = _raw_executor(owner=object(), state=object(), checkpoint_interval=None)
+    source = object()
+    executor = _raw_executor(owner=object(), state=source, checkpoint_interval=None)
     object.__setattr__(executor, "_absolute_step", 10)
 
     def forbidden(*_args: object, **_kwargs: object) -> object:
@@ -367,6 +368,7 @@ def test_routed_executor_bounds_gate_precedes_preparation(
     monkeypatch.setattr(operational, "_execute_routed_operational_event", forbidden)
     with pytest.raises(operational.HCCLRoutedContinualDyadOperationalError, match="bounds"):
         executor.step(cast(Any, object()))
+    assert executor.state is source
     assert executor.absolute_step == 10
 
 
