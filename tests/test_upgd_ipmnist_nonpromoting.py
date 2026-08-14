@@ -33,6 +33,7 @@ from alberta_framework.evaluation.upgd_ipmnist_nonpromoting import (
 )
 
 _ROOT = Path(__file__).resolve().parents[1]
+_IMMUTABLE_V1_ARTIFACT = _ROOT / "outputs/upgd_ipmnist/results.v1.json"
 _IMMUTABLE_V1_RECEIPT = _ROOT / "outputs/upgd_ipmnist/nonpromoting_receipt.v1.json"
 _IMMUTABLE_V1_RECEIPT_SHA256 = (
     "c32595829f93ac86b96c6eefc722291bf365dbf724982a70f207d193bbcfc26e"
@@ -83,6 +84,11 @@ def _write_artifact(tmp_path: Path, paths: list[Path]) -> Path:
         tmp_path / "openml-cache",
         notes=(EXPECTED_NOTE,),
     )
+    # This fixture exercises the immutable historical v1 contract.  The
+    # builder records the live runner, while the validator correctly requires
+    # the exact audited environment stored in the pinned artifact.
+    historical_artifact = json.loads(_IMMUTABLE_V1_ARTIFACT.read_text(encoding="utf-8"))
+    artifact["environment"] = historical_artifact["environment"]
     path = tmp_path / "results.v1.json"
     path.write_text(json.dumps(artifact, sort_keys=True), encoding="utf-8")
     return path

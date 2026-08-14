@@ -59,7 +59,7 @@ jobs:
         run: |
           python -m pytest \
             tests/test_historical_forager_cli_package.py \
-            -k test_wheel_and_sdist_ship_historical_code_and_entrypoint \
+            -k test_wheel_and_sdist_are_complete_and_hard_link_safe \
             -q -o addopts=""
 
   exact-floor:
