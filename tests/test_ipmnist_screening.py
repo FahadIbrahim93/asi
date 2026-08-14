@@ -927,6 +927,28 @@ class TestShardsAndMerge:
         assert status == expected_status
         assert json.loads(output.read_text(encoding="utf-8")) == report
 
+    def test_merge_rejects_absent_control(self, tmp_path, small_data):
+        paths = [
+            self._make_shard(tmp_path, small_data, "upgd_l2init", 0),
+            self._make_shard(tmp_path, small_data, "upgd_l2init", 1),
+        ]
+        with pytest.raises(
+            ValueError,
+            match=r"control 'upgd_w_control' is not among the merged shards",
+        ):
+            merge_shards(paths, control_name="upgd_w_control", slope_window=2)
+
+    def test_merge_rejects_typoed_control_name(self, tmp_path, small_data):
+        paths = [
+            self._make_shard(tmp_path, small_data, "upgd_w_control", 0),
+            self._make_shard(tmp_path, small_data, "upgd_l2init", 0),
+        ]
+        with pytest.raises(
+            ValueError,
+            match=r"control 'upgd_w_contrl' is not among the merged shards",
+        ):
+            merge_shards(paths, control_name="upgd_w_contrl", slope_window=2)
+
     def test_merge_rejects_duplicate_seed(self, tmp_path, small_data):
         p1 = self._make_shard(tmp_path, small_data, "upgd_w_control", 0)
         p2 = tmp_path / "dup.json"
