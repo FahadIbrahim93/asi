@@ -11,6 +11,7 @@ from alberta_framework import (
     Autostep,
     AutostepGTDLambda,
     ObGD,
+    ObGDBounding,
     optimizer_from_config,
 )
 
@@ -571,6 +572,54 @@ class TestObGD:
         chex.assert_tree_all_finite(result.weight_delta)
         chex.assert_tree_all_finite(result.bias_delta)
 
+    def test_infinite_error_bound_does_not_nan_weight_delta(self):
+        """Inf error drives alpha_eff to 0; 0 * inf * z must not NaN the step.
+
+        The bound's intent at M=inf is a no-op, not a poisoned weight update.
+        """
+        optimizer = ObGD(step_size=1.0, kappa=2.0)
+        state = optimizer.init(feature_dim=2)
+        observation = jnp.ones(2, dtype=jnp.float32)
+
+        result = optimizer.update(
+            state, jnp.array(jnp.inf, dtype=jnp.float32), observation
+        )
+        assert bool(jnp.all(jnp.isfinite(result.weight_delta)))
+        assert bool(jnp.isfinite(result.bias_delta))
+        chex.assert_trees_all_close(result.weight_delta, jnp.zeros(2, dtype=jnp.float32))
+        assert float(result.bias_delta) == pytest.approx(0.0)
+
+        recovered = optimizer.update(
+            result.new_state, jnp.array(1.0, dtype=jnp.float32), observation
+        )
+        assert bool(jnp.all(jnp.isfinite(recovered.weight_delta)))
+        assert bool(jnp.isfinite(recovered.bias_delta))
+
+
+class TestObGDBounding:
+    """Tests for the shared ObGD bounder used by MLP/UPGD learners."""
+
+    def test_infinite_step_times_zero_scale_is_zero_not_nan(self):
+        """Inf LMS steps against inf error make scale=0; 0*inf was NaN.
+
+        The bounder is supposed to prevent overshooting. At M=inf that means
+        emit a zero step, not poison the weights for every later finite update.
+        """
+        bounder = ObGDBounding(kappa=2.0)
+        steps = (
+            jnp.array([jnp.inf, jnp.inf], dtype=jnp.float32),
+            jnp.array(jnp.inf, dtype=jnp.float32),
+        )
+        bounded, scale = bounder.bound(
+            steps,
+            jnp.array(jnp.inf, dtype=jnp.float32),
+            tuple(jnp.zeros_like(step) for step in steps),
+        )
+        assert float(scale) == pytest.approx(0.0)
+        for actual in bounded:
+            assert bool(jnp.all(jnp.isfinite(actual)))
+            chex.assert_trees_all_close(actual, jnp.zeros_like(actual))
+
 
 class TestAdaptiveObGDBounding:
     """Tests for the adaptive ObGD bounder."""
@@ -613,6 +662,22 @@ class TestAdaptiveObGDBounding:
         assert scale == pytest.approx(1.0)
         chex.assert_trees_all_close(bounded[0], steps[0] / rms)
         chex.assert_trees_all_close(bounded[1], steps[1] / rms)
+
+    def test_infinite_step_times_zero_scale_is_zero_not_nan(self):
+        bounder = AdaptiveObGDBounding(kappa=2.0)
+        steps = (
+            jnp.array([jnp.inf, jnp.inf], dtype=jnp.float32),
+            jnp.array(jnp.inf, dtype=jnp.float32),
+        )
+        bounded, scale = bounder.bound(
+            steps,
+            jnp.array(jnp.inf, dtype=jnp.float32),
+            tuple(jnp.zeros_like(step) for step in steps),
+        )
+        assert float(scale) == pytest.approx(0.0)
+        for actual in bounded:
+            assert bool(jnp.all(jnp.isfinite(actual)))
+            chex.assert_trees_all_close(actual, jnp.zeros_like(actual))
 
     def test_produces_finite_zero_steps(self):
         """Zero steps should remain finite and unchanged."""

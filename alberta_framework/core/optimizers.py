@@ -71,6 +71,11 @@ class Bounder(ABC):
         ...
 
 
+def _replace_nan_with_zero(value: Array) -> Array:
+    """Turn 0*inf NaNs into a no-op while leaving genuine infs intact."""
+    return jnp.where(jnp.isnan(value), jnp.zeros_like(value), value)
+
+
 def _apply_obgd_bound(
     steps: tuple[Array, ...],
     error: Array,
@@ -83,7 +88,7 @@ def _apply_obgd_bound(
         total_step = total_step + jnp.sum(jnp.abs(s))
     delta_bar = jnp.maximum(jnp.abs(error_scalar), 1.0)
     scale = 1.0 / jnp.maximum(kappa * delta_bar * total_step, 1.0)
-    return tuple(scale * s for s in steps), scale
+    return tuple(_replace_nan_with_zero(scale * s) for s in steps), scale
 
 
 class ObGDBounding(Bounder):
@@ -1325,9 +1330,10 @@ class ObGD(Optimizer[ObGDState]):
         # Effective step-size: alpha / max(M, 1)
         alpha_eff = alpha / jnp.maximum(dot_product, 1.0)
 
-        # Weight and bias deltas
-        weight_delta = alpha_eff * error_scalar * new_traces
-        bias_delta = alpha_eff * error_scalar * new_bias_trace
+        # Weight and bias deltas. alpha_eff=0 against inf error is 0*inf=NaN;
+        # the bound's intent is a no-op, not a poisoned update.
+        weight_delta = _replace_nan_with_zero(alpha_eff * error_scalar * new_traces)
+        bias_delta = _replace_nan_with_zero(alpha_eff * error_scalar * new_bias_trace)
 
         new_state = ObGDState(
             step_size=alpha,

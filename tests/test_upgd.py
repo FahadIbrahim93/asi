@@ -675,6 +675,22 @@ class TestUpdateMetrics:
             chex.assert_tree_all_finite(result.predictions)
             state = result.state
 
+    def test_obgd_kappa_path_infinite_step_is_zero_not_nan(self):
+        """Inf LMS steps against inf error make scale=0; 0*inf was NaN."""
+        steps = (
+            jnp.array([jnp.inf, jnp.inf], dtype=jnp.float32),
+            jnp.array(jnp.inf, dtype=jnp.float32),
+        )
+        bounded, scale = UPGDLearner._obgd_bound_with_kappa(
+            steps,
+            jnp.array(jnp.inf, dtype=jnp.float32),
+            jnp.array(2.0, dtype=jnp.float32),
+        )
+        assert float(scale) == 0.0
+        for actual in bounded:
+            assert bool(jnp.all(jnp.isfinite(actual)))
+            chex.assert_trees_all_close(actual, jnp.zeros_like(actual))
+
     def test_sum_loss_normalization_scales_multihead_gradient(self):
         """Sum loss should avoid diluting gradients by active head count."""
         base_kwargs = dict(
