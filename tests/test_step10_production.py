@@ -273,16 +273,20 @@ def test_step10_off_policy_intra_option_importance_ratio_is_clipped() -> None:
     q_weights = state.option_policies.q_weights.at[0, 1, 0].set(1.0)
     state = state.replace(
         base_last_obs=jnp.array([1.0, 0.0], dtype=jnp.float32),
+        base_last_action=jnp.array(2, dtype=jnp.int32),
+        last_primitive_action=jnp.array(1, dtype=jnp.int32),
         executing_option=jnp.array(0, dtype=jnp.int32),
         option_last_intra_action=jnp.array(1, dtype=jnp.int32),
         option_policies=state.option_policies.replace(q_weights=q_weights),
     )
+    assert bool(agent.state_valid(state))
     result = step10_update(
         agent,
         state,
         jnp.array(0.0, dtype=jnp.float32),
         jnp.array([0.0, 0.0], dtype=jnp.float32),
     )
+    assert bool(result.update_applied)
     chex.assert_trees_all_close(
         result.option_importance_ratio,
         jnp.array(1.25, dtype=jnp.float32),
@@ -308,15 +312,19 @@ def test_option_terminates_when_threshold_exceeded() -> None:
 
     # Force option execution by injecting executing_option=0 into state
     state_with_option = state.replace(
+        base_last_action=jnp.array(2, dtype=jnp.int32),
         executing_option=jnp.array(0, dtype=jnp.int32),
         option_start_obs=jnp.zeros(2, dtype=jnp.float32),
+        option_last_intra_action=state.last_primitive_action,
         option_steps=jnp.array(0, dtype=jnp.int32),
         option_cumreward=jnp.array(0.0, dtype=jnp.float32),
         option_discount=jnp.array(1.0, dtype=jnp.float32),
     )
+    assert bool(agent.state_valid(state_with_option))
     # Observation with feature 0 = 0.5 > threshold 0.1 → terminates immediately
     high_obs = jnp.array([0.5, 0.0], dtype=jnp.float32)
     result = step10_update(agent, state_with_option, jnp.array(0.0), high_obs)
+    assert bool(result.update_applied)
     assert bool(result.option_terminated)
 
 
@@ -332,14 +340,18 @@ def test_option_does_not_terminate_below_threshold() -> None:
         agent, key=jr.key(3), initial_observation=jnp.zeros(2)
     )
     state_with_option = state.replace(
+        base_last_action=jnp.array(2, dtype=jnp.int32),
         executing_option=jnp.array(0, dtype=jnp.int32),
         option_start_obs=jnp.zeros(2, dtype=jnp.float32),
+        option_last_intra_action=state.last_primitive_action,
         option_steps=jnp.array(0, dtype=jnp.int32),
         option_cumreward=jnp.array(0.0, dtype=jnp.float32),
         option_discount=jnp.array(1.0, dtype=jnp.float32),
     )
+    assert bool(agent.state_valid(state_with_option))
     low_obs = jnp.array([0.1, 0.0], dtype=jnp.float32)
     result = step10_update(agent, state_with_option, jnp.array(0.0), low_obs)
+    assert bool(result.update_applied)
     assert not bool(result.option_terminated)
 
 
@@ -353,13 +365,17 @@ def test_option_terminates_at_max_steps() -> None:
     agent = make_step10_stomp_agent(cfg)
     state = init_step10_state(agent, key=jr.key(0), initial_observation=jnp.zeros(2))
     state_with_option = state.replace(
+        base_last_action=jnp.array(2, dtype=jnp.int32),
         executing_option=jnp.array(0, dtype=jnp.int32),
         option_start_obs=jnp.zeros(2, dtype=jnp.float32),
+        option_last_intra_action=state.last_primitive_action,
         option_steps=jnp.array(0, dtype=jnp.int32),
         option_cumreward=jnp.array(0.0, dtype=jnp.float32),
         option_discount=jnp.array(1.0, dtype=jnp.float32),
     )
+    assert bool(agent.state_valid(state_with_option))
     result = step10_update(agent, state_with_option, jnp.array(0.0), jnp.zeros(2))
+    assert bool(result.update_applied)
     assert bool(result.option_terminated)
 
 

@@ -202,6 +202,8 @@ def make_step10_stomp_agent(config: Step10STOMPConfig | None = None) -> STOMPAge
         config = Step10STOMPConfig(
             subtask_specs=(SubtaskSpec(feature_index=0),),
         )
+    if not config.subtask_specs:
+        raise ValueError("Step 10 STOMP requires at least one subtask")
     return STOMPAgent(config.to_stomp_config())
 
 
