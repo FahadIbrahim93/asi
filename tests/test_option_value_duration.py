@@ -10,6 +10,7 @@ import jax.numpy as jnp
 import pytest
 
 from alberta_framework.core.option_value_duration import (
+    DURATION_HEAD,
     OptionValueDurationConfig,
     OptionValueDurationLearner,
 )
@@ -165,3 +166,36 @@ def test_reward_rate_prediction_preserves_raw_duration_and_floors_only_score() -
         prediction.reward_rates,
         jnp.array([0.6, 8.0], dtype=jnp.float32),
     )
+
+
+def test_infinite_reward_on_zero_feature_does_not_poison_duration_head() -> None:
+    """Inf reward is 0*inf = NaN on a silent feature of the reward head.
+
+    The duration head's TD error stays finite. Map NaN products back to the
+    previous weight so that head can keep learning, and leave genuine infs.
+    """
+    learner = OptionValueDurationLearner(
+        1,
+        OptionValueDurationConfig(reward_step_size=0.1, duration_step_size=0.2),
+    )
+    state = learner.init(2)
+    obs = jnp.array([0.0, 1.0], dtype=jnp.float32)
+    nxt = jnp.array([0.0, 1.0], dtype=jnp.float32)
+    option = jnp.array(0, dtype=jnp.int32)
+    discount = jnp.array(0.0, dtype=jnp.float32)
+
+    poisoned = learner.update(
+        state, obs, option, jnp.array(jnp.inf, dtype=jnp.float32), nxt, discount
+    )
+    assert not bool(jnp.any(jnp.isnan(poisoned.state.weights)))
+    chex.assert_tree_all_finite(poisoned.state.weights[0, DURATION_HEAD])
+    chex.assert_trees_all_close(
+        poisoned.state.weights[0, 0, 0],
+        state.weights[0, 0, 0],
+    )
+
+    recovered = learner.update(
+        poisoned.state, obs, option, jnp.array(1.0, dtype=jnp.float32), nxt, discount
+    )
+    assert not bool(jnp.any(jnp.isnan(recovered.state.weights)))
+    chex.assert_tree_all_finite(recovered.state.weights[0, DURATION_HEAD])

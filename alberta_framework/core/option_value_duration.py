@@ -283,11 +283,24 @@ class OptionValueDurationLearner:
         updated_option_weights = (
             option_weights + step_sizes[:, None] * td_errors[:, None] * observation[None, :]
         )
-        new_state = state.replace(
+        # Inf reward * silent feature is 0*inf = NaN on the reward head.
+        # The duration head must keep learning. Genuine infs stay inf.
+        updated_option_weights = jnp.where(
+            jnp.isnan(updated_option_weights),
+            option_weights,
+            updated_option_weights,
+        )
+        proposed_state = state.replace(
             weights=state.weights.at[option_index].set(updated_option_weights),
             option_update_counts=state.option_update_counts.at[option_index].add(1),
             step_count=state.step_count + 1,
         )
+        inputs_valid = (
+            jnp.all(jnp.isfinite(observation))
+            & jnp.all(jnp.isfinite(next_observation))
+            & jnp.isfinite(continuation_discount)
+        )
+        new_state = jax.lax.cond(inputs_valid, lambda: proposed_state, lambda: state)
         return OptionValueDurationUpdateResult(
             state=new_state,
             predictions=predictions,
