@@ -180,15 +180,25 @@ def cohens_d(
 
     Returns:
         Cohen's d (positive means a > b)
+
+    Raises:
+        ValueError: If either group has fewer than 2 values; the pooled
+            degrees of freedom ``n_a + n_b - 2`` would be zero.
     """
     a = np.asarray(values_a)
     b = np.asarray(values_b)
 
-    mean_a = np.mean(a)
-    mean_b = np.mean(b)
-
     n_a = len(a)
     n_b = len(b)
+
+    if n_a < 2 or n_b < 2:
+        raise ValueError(
+            "cohens_d requires at least 2 values in each group "
+            f"(got n_a={n_a}, n_b={n_b}): pooled degrees of freedom would be zero"
+        )
+
+    mean_a = np.mean(a)
+    mean_b = np.mean(b)
 
     # Pooled standard deviation
     var_a = np.var(a, ddof=1) if n_a > 1 else 0.0
@@ -224,16 +234,31 @@ def ttest_comparison(
         SignificanceResult with test results
 
     Raises:
-        ValueError: If a paired comparison receives identical samples, for
-            which the paired t statistic is undefined
+        ValueError: If ``paired`` and the samples differ in length or hold
+            fewer than 2 pairs or are identical, or if either unpaired group
+            has fewer than 2 values. One-sample groups leave the t statistic
+            undefined and would emit RuntimeWarning inside SciPy before
+            crashing in ``cohens_d``.
     """
     a = np.asarray(values_a)
     b = np.asarray(values_b)
 
-    if paired and a.size > 0 and np.array_equal(a, b):
+    if paired:
+        if len(a) != len(b):
+            raise ValueError(
+                f"paired t-test requires equal-length samples (got {len(a)} and {len(b)})"
+            )
+        if len(a) < 2:
+            raise ValueError(f"paired t-test requires at least 2 pairs (got {len(a)})")
+        if np.array_equal(a, b):
+            raise ValueError(
+                f"Paired comparison {method_a!r} vs {method_b!r} has identical "
+                "samples; the paired t statistic is undefined"
+            )
+    elif len(a) < 2 or len(b) < 2:
         raise ValueError(
-            f"Paired comparison {method_a!r} vs {method_b!r} has identical "
-            "samples; the paired t statistic is undefined"
+            "independent t-test requires at least 2 values in each group "
+            f"(got {len(a)} and {len(b)})"
         )
 
     try:
