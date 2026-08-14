@@ -1084,7 +1084,10 @@ def _make_upgd_ema_norm_ext_learner(
                 name: hp[name]
                 for name in ("step_size", "utility_decay", "noise_std", "weight_decay")
             }
-            noise = _sorted_flat_noise(key, params, noise_std)
+            if noise_std == 0.0:
+                noise = {name: jnp.zeros_like(value) for name, value in params.items()}
+            else:
+                noise = _sorted_flat_noise(key, params, noise_std)
             reduced_params, reduced_lean = lean_upgd_w_update(
                 params, lean_state, grads, noise, lean_hp
             )
