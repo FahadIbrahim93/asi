@@ -1,22 +1,23 @@
 name: ci
 
-# CI for ASI (Alberta Framework, JAX continual-RL). Two lanes:
+# CI for ASI (JAX continual-RL). The suite is ~15,900 tests across ~700 files
+# and was written for a 24-core workstation. Run whole on a 4-core hosted
+# runner it exhausts the box and the job is killed (exit 143 / "operation was
+# canceled") partway through, which reports a red run that says nothing about
+# the code. So the test lanes are sharded by file and capped at two xdist
+# workers per job, which keeps each shard inside the runner's memory and well
+# inside its timeout.
 #
-#   fast — per-PR (and non-main push) gate: ruff + `pytest -m "not slow"`.
-#          The full suite is ~36 min serial on a 24-core dev box; hosted
-#          runners are slower, so the fast lane drops the `slow`-marked
-#          modules (>~30s each serial) and parallelizes the rest with
-#          pytest-xdist (`-n auto --dist loadfile`).
-#   full — the whole suite, on push to main and manual dispatch only.
-#          Budget: expect tens of minutes on hosted runners even under
-#          xdist; both lanes carry timeout-minutes: 90.
+#   lint — ruff + mypy on both supported interpreters. Cheap and always run.
+#   test — per-PR gate: the `unit` lane, sharded, on 3.12 (the version the
+#          elizaOS robot track consumes in process). Measured ~740 tests per
+#          shard, which finishes well inside the timeout.
+#   full — `-m "not slow"` on both interpreters, sharded. Manual dispatch and
+#          push to main only; a shard of that lane measured ~30 minutes at two
+#          workers, so it does not belong in the per-PR path.
 #
-# Both lanes run a python matrix of 3.12 + 3.13: the elizaOS robot lane
-# consumes this package in-process on 3.12 (brax/mujoco pin numpy<2 there),
-# while upstream targets 3.13. Tests for upstream-only benchmarks/, examples/,
-# and docs/ trees remain visible as skips in this standalone repository. The
-# full lane installs the supported Gymnasium and Foragax extras so those gated
-# tests run.
+# Benchmarks never run in CI. They are executed through their CLIs on hardware
+# that can afford them; see outputs/ipmnist_screening/RUNBOOK.md.
 on:
   push:
     branches: [main]
@@ -30,11 +31,13 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  SHARD_COUNT: "8"
+
 jobs:
-  # Per-PR gate: lint + everything not marked `slow`.
-  fast:
+  lint:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -52,15 +55,51 @@ jobs:
       - name: Install (editable, with dev extras)
         run: |
           python -m pip install -U pip
-          pip install -e '.[dev]' pytest-xdist
+          pip install -e '.[dev]'
 
-      - name: Lint
+      - name: Ruff
         run: ruff check .
 
-      - name: Test (fast lane, -m "not slow")
-        run: python -m pytest tests/ -q -rs -o addopts="" -m "not slow" -n auto --dist loadfile --durations=25
+      - name: Mypy
+        run: mypy
 
-  # Full suite: push to main + manual dispatch.
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install (editable, with dev extras)
+        run: |
+          python -m pip install -U pip
+          pip install -e '.[dev]' pytest-xdist
+
+      - name: Test shard ${{ matrix.shard }} of ${{ env.SHARD_COUNT }}
+        run: |
+          set -euo pipefail
+          mapfile -t files < <(
+            find tests -name 'test_*.py' | sort |
+              awk -v n="$SHARD_COUNT" -v s="${{ matrix.shard }}" 'NR % n == s % n'
+          )
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "::error::shard ${{ matrix.shard }} selected no test files"
+            exit 1
+          fi
+          echo "shard ${{ matrix.shard }}: ${#files[@]} files"
+          python -m pytest "${files[@]}" -q -rs -o addopts="" \
+            -m unit -n 2 --dist loadfile --durations=10
+
   full:
     if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
@@ -69,6 +108,7 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ["3.12", "3.13"]
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
     steps:
       - uses: actions/checkout@v4
 
@@ -84,8 +124,17 @@ jobs:
           python -m pip install -U pip
           pip install -e '.[dev,gymnasium,forager]' pytest-xdist
 
-      - name: Lint
-        run: ruff check .
-
-      - name: Test (full suite)
-        run: python -m pytest tests/ -q -rs -o addopts="" -n auto --dist loadfile --durations=25
+      - name: Test shard ${{ matrix.shard }} of ${{ env.SHARD_COUNT }}
+        run: |
+          set -euo pipefail
+          mapfile -t files < <(
+            find tests -name 'test_*.py' | sort |
+              awk -v n="$SHARD_COUNT" -v s="${{ matrix.shard }}" 'NR % n == s % n'
+          )
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "::error::shard ${{ matrix.shard }} selected no test files"
+            exit 1
+          fi
+          echo "shard ${{ matrix.shard }}: ${#files[@]} files"
+          python -m pytest "${files[@]}" -q -rs -o addopts="" \
+            -m "not slow" -n 2 --dist loadfile --durations=10
