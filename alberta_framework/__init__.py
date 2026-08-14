@@ -1379,7 +1379,6 @@ __all__ = [
     "RecurrentLatentWorldModelUpdateResult",
     "load_recurrent_latent_world_model_ensemble_checkpoint",
     "save_recurrent_latent_world_model_ensemble_checkpoint",
-    "run_action_conditioned_world_model_learning_loop",
     "run_latent_world_model_learning_loop",
     # Typed predict-before-update learning signals
     "LearningSignalAvailability",

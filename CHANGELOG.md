@@ -35,6 +35,13 @@ measurements remain in their primary output records; none promotes a registry cl
 
 - OaK extended-action masks now exclude cold options consistently from selection, real
   bootstraps, planning selection, and planning bootstraps.
+- **Pre-1.0 breaking API cleanup:** contracted the `alberta_framework` and
+  `alberta_framework.core` convenience re-export namespaces. APIs owned by retired HCCL,
+  embodied, prototype-expansion, and self-certifying evaluation modules were removed with
+  those modules. Retained low-level schema, checkpoint-migration, resource-accounting,
+  experimental-optimizer, and prototype-integration APIs now require imports from their
+  defining modules instead of the package convenience namespaces. The robot track's documented
+  continual-RL imports remain available.
 - CI now runs the complete non-slow suite on pull requests; the redundant main-only matrix
   and the sparse `unit`-marker-only gate were removed.
 - Normalizer coverage now uses a small deterministic exact-moment sequence instead of
