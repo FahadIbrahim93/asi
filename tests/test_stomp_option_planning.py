@@ -76,7 +76,7 @@ def _state_with_completed_model(
         next_state_weights=jnp.zeros((1, OBS_DIM, OBS_DIM), dtype=jnp.float32),
         n_completions=jnp.array([completions], dtype=jnp.int32),
     )
-    return state.replace(
+    candidate = state.replace(
         base_learner_state=learner_state,
         base_average_reward=jnp.array(0.5, dtype=jnp.float32),
         base_last_obs=start_obs,
@@ -84,12 +84,15 @@ def _state_with_completed_model(
         option_models=model_state,
         executing_option=jnp.array(0, dtype=jnp.int32),
         option_start_obs=start_obs,
+        option_last_intra_action=state.last_primitive_action,
         option_cumreward=jnp.array(0.0, dtype=jnp.float32),
         option_env_cumreward=jnp.array(0.0, dtype=jnp.float32),
         option_baseline_mass=jnp.array(0.0, dtype=jnp.float32),
         option_discount=jnp.array(1.0, dtype=jnp.float32),
         option_steps=jnp.array(0, dtype=jnp.int32),
     )
+    assert bool(agent.state_valid(candidate))
+    return candidate
 
 
 def _assert_learner_equal(actual, expected) -> None:
@@ -116,19 +119,24 @@ def test_completed_option_model_records_task_and_subtask_outcomes_separately() -
     agent = STOMPAgent(config)
     observations = jnp.array([[1.0, 0.0], [2.0, 0.0], [3.0, 0.0]], dtype=jnp.float32)
     rewards = jnp.array([2.0, 6.0], dtype=jnp.float32)
-    state = agent.start(agent.init(jr.key(0)), observations[0]).replace(
+    state = agent.start(agent.init(jr.key(0)), observations[0])
+    state = state.replace(
         executing_option=jnp.array(0, dtype=jnp.int32),
         base_last_action=jnp.array(OPTION_ACTION, dtype=jnp.int32),
         option_start_obs=observations[0],
+        option_last_intra_action=state.last_primitive_action,
         option_cumreward=jnp.array(0.0, dtype=jnp.float32),
         option_env_cumreward=jnp.array(0.0, dtype=jnp.float32),
         option_baseline_mass=jnp.array(0.0, dtype=jnp.float32),
         option_discount=jnp.array(1.0, dtype=jnp.float32),
         option_steps=jnp.array(0, dtype=jnp.int32),
     )
+    assert bool(agent.state_valid(state))
 
     first = agent.update(state, rewards[0], observations[1])
+    assert bool(first.update_applied)
     result = agent.update(first.state, rewards[1], observations[2])
+    assert bool(result.update_applied)
     models = result.state.option_models
 
     assert bool(result.option_terminated)
@@ -196,6 +204,7 @@ def test_no_planning_before_any_model_completion() -> None:
 
     result = agent.update(state, jnp.array(0.0), ANCHOR_OBS)
 
+    assert bool(result.update_applied)
     assert int(result.planning_backups) == 0
     assert float(result.planning_td_error) == 0.0
     _assert_learner_equal(result.state.base_learner_state, before)
@@ -213,6 +222,7 @@ def test_planning_can_be_suppressed_for_imagined_transition() -> None:
         enable_planning=False,
     )
 
+    assert bool(result.update_applied)
     assert int(result.planning_backups) == 0
     assert float(result.planning_td_error) == 0.0
     _assert_learner_equal(result.state.base_learner_state, before)
@@ -281,11 +291,14 @@ def test_planning_selects_only_models_with_completions() -> None:
         option_start_obs=jnp.array([0.0, 1.0], dtype=jnp.float32),
         base_last_obs=jnp.array([0.0, 1.0], dtype=jnp.float32),
         base_last_action=jnp.array(OPTION_ACTION, dtype=jnp.int32),
+        option_last_intra_action=state.last_primitive_action,
         option_steps=jnp.array(0, dtype=jnp.int32),
     )
+    assert bool(agent.state_valid(state))
 
     result = agent.update(state, jnp.array(0.0), ANCHOR_OBS)
 
+    assert bool(result.update_applied)
     assert int(result.planning_backups) == 2
     after_weights = result.state.base_learner_state.head_params.weights
     completed_option_action = N_PRIMITIVE + 1
@@ -338,6 +351,8 @@ def test_raw_duration_is_diagnostic_not_a_discounted_bellman_coefficient() -> No
     )
     counterfactual = agent.update(mutated, jnp.array(0.0), ANCHOR_OBS)
 
+    assert bool(baseline.update_applied)
+    assert bool(counterfactual.update_applied)
     np.testing.assert_allclose(
         float(counterfactual.planning_td_error),
         float(baseline.planning_td_error),
@@ -359,6 +374,8 @@ def test_pseudo_return_is_not_consumed_by_base_planning() -> None:
     )
     counterfactual = agent.update(mutated, jnp.array(0.0), ANCHOR_OBS)
 
+    assert bool(baseline.update_applied)
+    assert bool(counterfactual.update_applied)
     np.testing.assert_allclose(
         float(counterfactual.planning_td_error),
         float(baseline.planning_td_error),

@@ -153,9 +153,14 @@ class TestIdleStepsDoNotTouchOptionLearner:
         for t in range(1, 5):
             # Force the pre-update state to be idle regardless of what the
             # previous step selected.
-            state = state.replace(executing_option=jnp.array(-1, dtype=jnp.int32))
+            state = state.replace(
+                executing_option=jnp.array(-1, dtype=jnp.int32),
+                base_last_action=state.last_primitive_action,
+            )
+            assert bool(agent.state_valid(state))
             before = state.option_policies
             result = agent.update(state, rewards[t], observations[t])
+            assert bool(result.update_applied)
             state = result.state
             after = state.option_policies
 

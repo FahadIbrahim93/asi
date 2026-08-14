@@ -218,15 +218,21 @@ def test_curate_defers_when_worst_option_is_currently_executing() -> None:
     state = state.replace(
         utility_ema=jnp.array([0.8, 0.1], dtype=jnp.float32),
         stomp_state=state.stomp_state.replace(
+            base_last_action=jnp.array(
+                cfg.n_primitive_actions + 1,
+                dtype=jnp.int32,
+            ),
             executing_option=jnp.array(1, dtype=jnp.int32),
             option_start_obs=jnp.ones(OBS_DIM, dtype=jnp.float32),
+            option_last_intra_action=state.stomp_state.last_primitive_action,
             option_cumreward=jnp.array(3.0, dtype=jnp.float32),
             option_env_cumreward=jnp.array(4.0, dtype=jnp.float32),
             option_baseline_mass=jnp.array(2.5, dtype=jnp.float32),
             option_discount=jnp.array(0.7, dtype=jnp.float32),
-            option_steps=jnp.array(3, dtype=jnp.int32),
+            option_steps=jnp.array(0, dtype=jnp.int32),
         ),
     )
+    assert bool(agent.stomp_agent.state_valid(state.stomp_state))
 
     new_agent, new_state = agent.curate(state, jr.key(9))
 
@@ -241,10 +247,16 @@ def test_prototype_propagates_active_option_curation_deferral() -> None:
         oak_state=state.oak_state.replace(
             utility_ema=jnp.array([0.8, 0.1], dtype=jnp.float32),
             stomp_state=state.oak_state.stomp_state.replace(
-                executing_option=jnp.array(1, dtype=jnp.int32)
+                base_last_action=jnp.array(
+                    proto.config.oak.n_primitive_actions + 1,
+                    dtype=jnp.int32,
+                ),
+                executing_option=jnp.array(1, dtype=jnp.int32),
+                option_last_intra_action=state.current_action,
             ),
         )
     )
+    assert bool(proto._checkpoint_state_valid(state))
 
     new_proto, new_state = proto.curate(state, jr.key(11))
 
