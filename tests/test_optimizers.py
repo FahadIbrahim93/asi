@@ -140,8 +140,9 @@ class TestIDBD:
         """|error * x| overflowing float32 must not NaN a zero-trace channel.
 
         (error * x) * h evaluates inf * 0 = NaN when the finite product
-        overflows; associating error * (x * h) makes the zero trace win, so
-        the meta-update is exactly 0 wherever h is 0 and inputs are finite.
+        overflows; the non-finite guard skips adaptation for that channel
+        (previous log step-size kept), which equals the zero meta-update the
+        h=0 contract demands.
         """
         optimizer = IDBD(initial_step_size=0.01, meta_step_size=0.01)
         state = optimizer.init(feature_dim=2)

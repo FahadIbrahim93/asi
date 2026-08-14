@@ -742,10 +742,10 @@ class IDBD(Optimizer[IDBDState]):
         error_scalar = jnp.squeeze(error)
         beta = state.meta_step_size
 
-        # 1. Meta-update: adapt step-sizes using OLD traces. Associate as
-        # error * (x * h) so a float32 overflow of |error * x| dies at the
-        # zero trace instead of producing inf * 0 = NaN.
-        gradient_correlation = error_scalar * (observation * state.traces)
+        # 1. Meta-update: adapt step-sizes using OLD traces. The product is
+        # textually unchanged so ordinary finite trajectories stay
+        # bit-identical; the guard below is the only behavioral change.
+        gradient_correlation = error_scalar * observation * state.traces
         meta_delta = beta * gradient_correlation
 
         # Clip log step-sizes to prevent numerical issues. clip(NaN) is NaN,
