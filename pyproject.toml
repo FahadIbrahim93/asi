@@ -67,9 +67,9 @@ Issues = "https://github.com/lalalune/alberta/issues"
 alberta-step1-smoke = "alberta_framework.cli:step1_smoke_main"
 alberta-step2-smoke = "alberta_framework.cli:step2_smoke_main"
 alberta-evidence-status = "alberta_framework.evaluation.evidence_manifest_cli:main"
-alberta-forager-benchmark = "alberta_framework.forager_cli:main"
-alberta-historical-forager = "alberta_framework.forager_cli:historical_main"
-alberta-foragax-oci = "alberta_framework.benchmarks.official_foragax_oci:main"
+alberta-forager-benchmark = "alberta_framework.console_entrypoints:forager_benchmark_main"
+alberta-historical-forager = "alberta_framework.console_entrypoints:historical_forager_main"
+alberta-foragax-oci = "alberta_framework.console_entrypoints:official_foragax_oci_main"
 alberta-foragax-open-screen = "alberta_framework.benchmarks.foragax_open_screen:main"
 alberta-forager-matched-campaign = "alberta_framework.benchmarks.forager_matched_campaign:main"
 alberta-forager-matched-qualification = "alberta_framework.benchmarks.forager_matched_qualification:main"
@@ -90,6 +90,7 @@ include = [
     "/LICENSE",
     "/README.md",
     "/FORAGER_BENCHMARK.md",
+    "/VENDORING.md",
     "/docs",
     "/pyproject.toml",
     "/alberta_framework",
