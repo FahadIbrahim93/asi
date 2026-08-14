@@ -93,6 +93,39 @@ def test_multiple_duplicate_names_are_reported_deterministically() -> None:
     )
 
 
+def test_duplicate_seeds_reject_before_factories_execute() -> None:
+    configs = [
+        _config(
+            "baseline",
+            learner_factory=_fail_if_called,
+            stream_factory=_fail_if_called,
+        )
+    ]
+
+    with pytest.raises(
+        ValueError,
+        match=r"^Experiment seeds must be unique; duplicates: 0$",
+    ):
+        run_multi_seed_experiment(configs, seeds=[0, 0, 1], parallel=False, show_progress=False)
+
+
+def test_multiple_duplicate_seeds_are_reported_deterministically() -> None:
+    configs = [
+        _config(
+            "baseline",
+            learner_factory=_fail_if_called,
+            stream_factory=_fail_if_called,
+        )
+    ]
+
+    with pytest.raises(ValueError) as exc_info:
+        run_multi_seed_experiment(
+            configs, seeds=[7, 3, 7, 0, 3, 7], parallel=False, show_progress=False
+        )
+
+    assert str(exc_info.value) == "Experiment seeds must be unique; duplicates: 3, 7"
+
+
 def test_unique_names_preserve_config_and_seed_order() -> None:
     results = run_multi_seed_experiment(
         [_config("second"), _config("first")],
