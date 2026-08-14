@@ -26,6 +26,8 @@ Calibration (measured on this machine, scripts in the session scratchpad):
   superset always and strictness on >= 50 draws.
 """
 
+import warnings
+
 import numpy as np
 import pytest
 
@@ -484,3 +486,37 @@ class TestPairwiseComparisons:
         result = pairwise_comparisons({"a": a, "b": b}, test="mann_whitney", window=1)
 
         assert result[("a", "b")].statistic == pytest.approx(0.0)
+
+
+class TestWilcoxonIdenticalSamples:
+    """The signed-rank statistic over zero nonzero differences is undefined (#39)."""
+
+    def test_identical_samples_rejected_without_warnings(self) -> None:
+        values = [0.91, 0.88, 0.95]
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with pytest.raises(
+                ValueError,
+                match=r"^Paired comparison 'pin' vs 'base' has identical samples; "
+                r"the Wilcoxon signed-rank statistic is undefined$",
+            ):
+                wilcoxon_comparison(values, list(values), method_a="pin", method_b="base")
+
+    def test_constant_nonzero_shift_stays_out_of_scope(self) -> None:
+        res = wilcoxon_comparison([1.0, 2.0, 3.0], [0.5, 1.5, 2.5])
+        assert res.test_name == "Wilcoxon signed-rank"
+        assert res.statistic == pytest.approx(0.0)
+        assert res.p_value < 1.0
+
+    def test_reduction_pin_pair_rejected_on_wilcoxon_grid(self) -> None:
+        rows = [0.10, 0.11, 0.09]
+        results = {
+            "base_arm": _make_seeded_aggregated("base_arm", [0, 1, 2], rows),
+            "pinned_inert": _make_seeded_aggregated("pinned_inert", [0, 1, 2], list(rows)),
+        }
+        with pytest.raises(
+            ValueError,
+            match=r"^Paired comparison 'base_arm' vs 'pinned_inert' has identical "
+            r"samples; the Wilcoxon signed-rank statistic is undefined$",
+        ):
+            pairwise_comparisons(results, metric="squared_error", test="wilcoxon")
