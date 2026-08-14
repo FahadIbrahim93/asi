@@ -160,15 +160,19 @@ class _MalformedSourceExecutor:
         malformed_read: int | None,
         *,
         initial_clock: tuple[int, int] = (0, 0),
+        raising_read: int | None = None,
     ) -> None:
         self.malformed_read = malformed_read
         self.initial_clock = initial_clock
+        self.raising_read = raising_read
         self.source_reads = 0
         self.step_called = False
 
     @property
     def state(self) -> object:
         self.source_reads += 1
+        if self.source_reads == self.raising_read:
+            raise ValueError("executor state property failed")
         if self.source_reads == self.malformed_read:
             return object()
         return _state(self.initial_clock if self.source_reads == 1 else (0, 0))
@@ -395,6 +399,22 @@ def test_collection_wraps_malformed_source_clock_before_executor_step(
 
     assert captured.value.step_index == (-1 if malformed_read == 1 else 0)
     assert captured.value.stage == "source-clock"
+    assert executor.step_called is False
+
+
+@pytest.mark.parametrize("raising_read", (1, 2))
+def test_collection_wraps_raising_source_property_before_executor_step(
+    raising_read: int,
+) -> None:
+    config = HCCLContinualDyadOperationalLifeRunnerConfig.mechanics_smoke()
+    executor = _MalformedSourceExecutor(None, raising_read=raising_read)
+
+    with pytest.raises(HCCLContinualDyadOperationalLifeError) as captured:
+        _collect_operational_life(config, executor, _score_for_regime)
+
+    assert captured.value.step_index == (-1 if raising_read == 1 else 0)
+    assert captured.value.stage == "source-clock"
+    assert str(captured.value).endswith("executor state property failed")
     assert executor.step_called is False
 
 

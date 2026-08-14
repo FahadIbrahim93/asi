@@ -702,8 +702,8 @@ def _collect_operational_life(
                 "source-clock",
                 "executor absolute step is discontinuous",
             )
-        source = executor.state
         try:
+            source = executor.state
             source_clock = _state_clock(source, name="executor source")
         except (AttributeError, TypeError, ValueError) as error:
             raise HCCLContinualDyadOperationalLifeError(
