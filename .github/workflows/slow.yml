@@ -1,0 +1,189 @@
+---
+name: slow tests
+
+"on":
+  workflow_dispatch:
+
+concurrency:
+  group: slow-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  SLOW_SHARD_COUNT: "4"
+  XLA_PYTHON_CLIENT_PREALLOCATE: "false"
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install collection dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install \
+            -e '.[dev,gymnasium,forager]' \
+            pytest-xdist
+
+      - name: Collect selected slow tests
+        run: |
+          python -m pytest tests \
+            --collect-only \
+            -q \
+            --disable-warnings \
+            -m slow \
+            -o addopts="" \
+            > "$RUNNER_TEMP/slow-nodeids.txt"
+
+      - name: Build a balanced nonempty slow matrix
+        id: plan
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from collections import Counter
+          from pathlib import Path
+
+          nodeids = Path(
+              os.environ["RUNNER_TEMP"], "slow-nodeids.txt"
+          ).read_text(encoding="utf-8").splitlines()
+          counts = Counter(
+              line.split("::", 1)[0]
+              for raw in nodeids
+              if (line := raw.strip()).startswith("tests/") and "::" in line
+          )
+          if not counts:
+              raise SystemExit("pytest selected no slow test nodes")
+
+          limit = int(os.environ["SLOW_SHARD_COUNT"])
+          shard_count = min(limit, len(counts))
+          buckets = [[] for _ in range(shard_count)]
+          totals = [0 for _ in range(shard_count)]
+          ordered = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+          for path, count in ordered:
+              index = min(
+                  range(shard_count),
+                  key=lambda candidate: (totals[candidate], candidate),
+              )
+              buckets[index].append(path)
+              totals[index] += count
+
+          include = [
+              {
+                  "shard": index + 1,
+                  "files_json": json.dumps(sorted(files)),
+                  "node_count": totals[index],
+              }
+              for index, files in enumerate(buckets)
+              if files
+          ]
+          matrix = json.dumps({"include": include}, separators=(",", ":"))
+          output_path = os.environ["GITHUB_OUTPUT"]
+          with open(output_path, "a", encoding="utf-8") as output:
+              output.write(f"matrix={matrix}\n")
+          with open(
+              os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8"
+          ) as summary:
+              summary.write(
+                  f"Selected {sum(counts.values())} slow nodes in "
+                  f"{len(counts)} files across {shard_count} shards.\n"
+              )
+          PY
+
+  slow:
+    name: slow py3.12 shard ${{ matrix.shard }}
+    needs: discover
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.discover.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install slow-test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install \
+            -e '.[dev,gymnasium,forager]' \
+            pytest-xdist
+
+      - name: Run selected slow tests
+        env:
+          JUNIT_PATH: >-
+            ${{ runner.temp }}/junit-slow-py312-shard-${{
+            matrix.shard }}.xml
+          TEST_FILES_JSON: ${{ matrix.files_json }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          files = json.loads(os.environ["TEST_FILES_JSON"])
+          if not files:
+              raise SystemExit("the slow plan emitted an empty shard")
+          for value in files:
+              path = Path(value)
+              if path.parts[0] != "tests" or not path.is_file():
+                  raise SystemExit(f"invalid selected slow file: {value}")
+
+          command = [
+              sys.executable,
+              "-m",
+              "pytest",
+              *files,
+              "-q",
+              "-rs",
+              "-o",
+              "addopts=",
+              "-m",
+              "slow",
+              "-n",
+              "2",
+              "--dist",
+              "loadfile",
+              "--durations=50",
+              "--durations-min=1.0",
+              f"--junitxml={os.environ['JUNIT_PATH']}",
+          ]
+          print(
+              f"running {len(files)} files; planned selected nodes: "
+              "${{ matrix.node_count }}",
+              flush=True,
+          )
+          raise SystemExit(subprocess.run(command, check=False).returncode)
+          PY
+
+      - name: Upload slow timing evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-slow-py312-shard-${{ matrix.shard }}
+          path: >-
+            ${{ runner.temp }}/junit-slow-py312-shard-${{
+            matrix.shard }}.xml
+          if-no-files-found: warn
+          retention-days: 14
