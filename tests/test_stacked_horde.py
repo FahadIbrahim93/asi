@@ -142,6 +142,31 @@ class TestExactSemantics:
             np.asarray(r2.state.traces), 2.0 * np.asarray(r1.state.traces), rtol=1e-6
         )
 
+    def test_infinite_rho_on_zero_feature_does_not_poison_traces(self):
+        """rho * x is 0*inf = NaN on a silent feature; hold the finite state."""
+        cfg = StackedHordeConfig(
+            n_demons=1,
+            feature_dim=2,
+            gammas=(0.9,),
+            lamdas=(0.0,),
+            cumulant_indices=(0,),
+            step_size=0.1,
+        )
+        horde = StackedLinearHorde(cfg)
+        state = horde.init()
+        x = jnp.array([0.0, 1.0], dtype=jnp.float32)
+        c = jnp.array([1.0], dtype=jnp.float32)
+
+        poisoned = horde.update(state, x, x, c, rho=jnp.inf)
+        np.testing.assert_array_equal(np.asarray(poisoned.state.weights), 0.0)
+        np.testing.assert_array_equal(np.asarray(poisoned.state.traces), 0.0)
+        assert int(poisoned.state.step_count) == 0
+
+        recovered = horde.update(poisoned.state, x, x, c, rho=1.0)
+        assert bool(jnp.all(jnp.isfinite(recovered.state.weights)))
+        assert bool(jnp.all(jnp.isfinite(recovered.state.traces)))
+        assert int(recovered.state.step_count) == 1
+
 
 class TestConvergence:
     def test_three_state_cycle_analytic_fixed_point(self):

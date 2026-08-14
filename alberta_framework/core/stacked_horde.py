@@ -269,12 +269,25 @@ class StackedLinearHorde:
         new_traces = rho_vec[:, None] * jnp.where(active[:, None], accumulated, decayed_only)
 
         masked_delta = jnp.where(active, td_errors, 0.0)
-        new_weights = state.weights + cfg.step_size * masked_delta[:, None] * new_traces
-
-        new_state = StackedHordeState(
-            weights=new_weights,
+        proposed_state = StackedHordeState(
+            weights=state.weights + cfg.step_size * masked_delta[:, None] * new_traces,
             traces=new_traces,
             step_count=state.step_count + 1,
+        )
+        # Inf rho * silent feature is 0*inf = NaN in the trace. Inf features
+        # make v = 0 @ inf = NaN at zero init. Hold the previous finite state.
+        inputs_valid = (
+            jnp.all(jnp.isfinite(features))
+            & jnp.all(jnp.isfinite(next_features))
+            & jnp.all(jnp.isfinite(rho_vec))
+        )
+        proposed_finite = jnp.all(jnp.isfinite(proposed_state.weights)) & jnp.all(
+            jnp.isfinite(proposed_state.traces)
+        )
+        new_state = jax.lax.cond(
+            inputs_valid & proposed_finite,
+            lambda: proposed_state,
+            lambda: state,
         )
         return StackedHordeUpdateResult(
             state=new_state,
