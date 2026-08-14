@@ -72,7 +72,7 @@ bsuite = [
     "plotnine>=0.12",
 ]
 gpu = [
-    "jax[cuda12]>=0.4",
+    "jax[cuda12]>=0.8.1",
 ]
 
 [project.urls]
