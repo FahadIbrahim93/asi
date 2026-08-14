@@ -808,6 +808,37 @@ class TestShardsAndMerge:
         control = next(e for e in summary["results"] if e["config_name"] == "upgd_w_control")
         assert "paired_vs_control" not in control
 
+    def test_merge_rejects_zero_seed_overlap_with_control(self, tmp_path, small_data):
+        """An arm sharing no seeds with a present control must refuse to merge:
+        the entry would rank in the summary with no paired_vs_control block and
+        nothing in the artifact marking it unpaired (issue #49)."""
+        paths = [
+            self._make_shard(tmp_path, small_data, "upgd_w_control", 0),
+            self._make_shard(tmp_path, small_data, "upgd_w_control", 1),
+            self._make_shard(tmp_path, small_data, "upgd_l2init", 2),
+        ]
+        with pytest.raises(
+            ValueError,
+            match=r"'upgd_l2init' shares no seeds with control 'upgd_w_control'",
+        ):
+            merge_shards(paths, control_name="upgd_w_control", slope_window=2)
+
+    def test_merge_pairs_on_partial_seed_overlap(self, tmp_path, small_data):
+        """Partial overlap keeps merging and pairs on the intersection, which
+        the block records visibly — the zero-overlap refusal must not
+        over-reach into this legitimate case."""
+        paths = [
+            self._make_shard(tmp_path, small_data, "upgd_w_control", 0),
+            self._make_shard(tmp_path, small_data, "upgd_w_control", 1),
+            self._make_shard(tmp_path, small_data, "upgd_l2init", 1),
+            self._make_shard(tmp_path, small_data, "upgd_l2init", 2),
+        ]
+        summary = merge_shards(paths, control_name="upgd_w_control", slope_window=2)
+        l2 = next(e for e in summary["results"] if e["config_name"] == "upgd_l2init")
+        assert l2["seeds"] == [1, 2]
+        assert l2["paired_vs_control"]["seeds"] == [1]
+        assert len(l2["paired_vs_control"]["per_seed_diff"]) == 1
+
     def test_atomic_writer_refuses_duplicate_without_mutating_first_result(
         self, tmp_path: Path
     ) -> None:

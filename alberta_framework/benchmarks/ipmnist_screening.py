@@ -7066,6 +7066,16 @@ def merge_shards(
             ),
         }
         common = [s for s in seeds if s in control]
+        if name != control_name and not common:
+            # Every comparison in this campaign is paired on shared seeds; an
+            # arm with no seed in common with the control would still rank in
+            # the summary by raw mean with no paired_vs_control block and
+            # nothing marking it unpaired (issue #49).  Refuse instead.
+            raise ValueError(
+                f"config {name!r} shares no seeds with control {control_name!r} "
+                f"(seeds {seeds} vs {sorted(control)}); refusing to rank an "
+                "unpaired entry in the summary"
+            )
         if name != control_name and common:
             control_avg = np.asarray(
                 [
