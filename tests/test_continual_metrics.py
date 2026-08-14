@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 
 from alberta_framework.utils.metrics import (
+    compare_learners,
     compute_backward_transfer,
     compute_forward_transfer,
     compute_per_task_forgetting,
@@ -14,6 +15,19 @@ from alberta_framework.utils.metrics import (
     compute_stability_gap,
     summarize_continual_learning,
 )
+
+
+def test_compare_learners_uses_population_spread_over_recorded_steps() -> None:
+    summary = compare_learners(
+        {
+            "learner": [
+                {"squared_error": 0.0},
+                {"squared_error": 2.0},
+            ]
+        }
+    )
+
+    assert summary["learner"]["std"] == pytest.approx(1.0)
 
 
 def test_accuracy_matrix_forgetting_and_backward_transfer() -> None:
