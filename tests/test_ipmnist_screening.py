@@ -840,6 +840,79 @@ class TestShardsAndMerge:
         assert l2["paired_vs_control"]["seeds"] == [1]
         assert len(l2["paired_vs_control"]["per_seed_diff"]) == 1
 
+    def _write_synthetic_shard(self, tmp_path, name, seed, accuracy):
+        """An in-band-valid shard with controlled per-task accuracy.
+
+        The merge/summary logic under test is pure shard arithmetic; real
+        small-scale runs tie at this scale (diff 0.0), so the flag's decision
+        boundary needs shards whose accuracy the test chooses.
+        """
+        payload = {
+            "schema": SHARD_SCHEMA,
+            "config_name": name,
+            "base_learner": "upgd",
+            "hyperparameters": {"step_size": 0.01},
+            "seed": seed,
+            "noise_mode": "step",
+            "config": {
+                "n_tasks": SMALL.n_tasks,
+                "task_length": SMALL.task_length,
+                "input_dim": SMALL.input_dim,
+                "hidden1": SMALL.hidden1,
+                "hidden2": SMALL.hidden2,
+                "n_classes": SMALL.n_classes,
+            },
+            "per_task_accuracy": [accuracy] * SMALL.n_tasks,
+            "per_task_loss": [0.5] * SMALL.n_tasks,
+            "per_task_plasticity": [0.1] * SMALL.n_tasks,
+            "wall_clock_seconds": 1.0,
+        }
+        path = tmp_path / f"synth_{name}_seed{seed}.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        return path
+
+    def test_confirmation_candidate_requires_two_paired_seeds(
+        self, tmp_path, small_data
+    ):
+        """``confirmation_candidate`` green-lights 200-task confirmation
+        compute.  With exactly one shared seed the paired mean is a single
+        draw: ``stderr_diff`` reports 0.0 (undefined, not high confidence)
+        and ``all_seeds_improve`` is vacuously true, so a lucky seed could
+        spend the confirmation budget alone.  The flag must stay False until
+        at least two seeds are actually paired, while the merge itself and
+        the paired block stay available for mid-wave inspection."""
+        paths = [
+            self._write_synthetic_shard(tmp_path, "upgd_w_control", 0, 0.70),
+            self._write_synthetic_shard(tmp_path, "upgd_l2init", 0, 0.76),
+            self._write_synthetic_shard(tmp_path, "upgd_l2init", 1, 0.76),
+        ]
+        summary = merge_shards(paths, control_name="upgd_w_control", slope_window=2)
+        l2 = next(e for e in summary["results"] if e["config_name"] == "upgd_l2init")
+        paired = l2["paired_vs_control"]
+        assert paired["seeds"] == [0]
+        assert len(paired["per_seed_diff"]) == 1
+        assert paired["mean_diff"] > 0.005
+        assert paired["confirmation_candidate"] is False
+        assert paired["all_seeds_improve"] is True  # vacuously, on one seed
+
+    def test_confirmation_candidate_true_on_two_paired_seeds(
+        self, tmp_path, small_data
+    ):
+        """The two-seed floor must not over-reach: with two shared seeds
+        clearing the threshold the flag stays True exactly as before."""
+        paths = [
+            self._write_synthetic_shard(tmp_path, "upgd_w_control", 0, 0.70),
+            self._write_synthetic_shard(tmp_path, "upgd_w_control", 1, 0.70),
+            self._write_synthetic_shard(tmp_path, "upgd_l2init", 0, 0.76),
+            self._write_synthetic_shard(tmp_path, "upgd_l2init", 1, 0.76),
+        ]
+        summary = merge_shards(paths, control_name="upgd_w_control", slope_window=2)
+        l2 = next(e for e in summary["results"] if e["config_name"] == "upgd_l2init")
+        paired = l2["paired_vs_control"]
+        assert paired["seeds"] == [0, 1]
+        assert paired["mean_diff"] > 0.005
+        assert paired["confirmation_candidate"] is True
+
     def test_atomic_writer_refuses_duplicate_without_mutating_first_result(
         self, tmp_path: Path
     ) -> None:

@@ -7115,7 +7115,16 @@ def merge_shards(
                 ),
                 "all_seeds_improve": bool(np.all(diff > 0.0)),
                 "beats_control": bool(diff.mean() > 0.0),
-                "confirmation_candidate": bool(diff.mean() > CONFIRMATION_THRESHOLD),
+                # A paired mean over one seed has no spread: stderr_diff
+                # reports 0.0 (undefined, not high confidence) and
+                # all_seeds_improve is vacuously true, so a single lucky
+                # seed could green-light the 200-task confirmation budget
+                # alone.  The flag is a compute-spending decision; require
+                # at least two actually-paired seeds.  The merge itself and
+                # this paired block stay available for mid-wave inspection.
+                "confirmation_candidate": bool(
+                    len(common) >= 2 and diff.mean() > CONFIRMATION_THRESHOLD
+                ),
             }
         entries.append(entry)
 
