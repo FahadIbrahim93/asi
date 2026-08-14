@@ -48,6 +48,7 @@ from alberta_framework.benchmarks.ipmnist_screening import (
     _make_sgd_momentum_gate_learner,
     _make_snr_ema_norm_learner,
     _make_upgd_alpha_utility_learner,
+    _make_upgd_autostep_learner,
     _make_upgd_ema_norm_ext_learner,
     _make_upgd_ema_norm_learner,
     _make_upgd_idbd_learner,
@@ -74,6 +75,7 @@ from alberta_framework.benchmarks.ipmnist_screening import (
     shift_adaptive_normalize,
     snr_maybe_reset_layer,
     upgd_alpha_utility_update,
+    upgd_autostep_update,
     upgd_idbd_swift_update,
     upgd_idbd_update,
     upgd_l2init_update,
@@ -301,6 +303,57 @@ class TestIDBDCombo:
             assert bool(jnp.all(state.log_alpha[n] <= 0.0))
             assert bool(jnp.all(jnp.isfinite(params[n])))
 
+    def test_infinite_gated_gradient_does_not_poison_log_alpha(self):
+        """Inf * h=0 is NaN; clip(NaN) used to leave log_alpha permanently NaN,
+        the same class core IDBD closed in #42/#43. Skip that channel."""
+        params = init_mlp_params(jr.key(0), SMALL)
+        hp = dict(UPGD_W_PROTOCOL_HYPERPARAMETERS)
+        hp.update({"meta_step_size": 0.01, "initial_step_size": 0.01})
+        init_fn, _ = _make_upgd_idbd_learner(hp)
+        state = init_fn(params)
+        grads = {n: jnp.zeros_like(v) for n, v in params.items()}
+        grads["w1"] = jnp.full_like(params["w1"], jnp.inf)
+        noise = {n: jnp.zeros_like(v) for n, v in params.items()}
+
+        _, poisoned = upgd_idbd_update(params, state, grads, noise, hp)
+        assert bool(jnp.all(jnp.isfinite(poisoned.log_alpha["w1"])))
+        np.testing.assert_array_equal(
+            np.asarray(poisoned.log_alpha["w1"]), np.asarray(state.log_alpha["w1"])
+        )
+
+        finite = {n: jnp.ones_like(v) * 0.1 for n, v in params.items()}
+        _, recovered = upgd_idbd_update(params, poisoned, finite, noise, hp)
+        assert bool(jnp.all(jnp.isfinite(recovered.log_alpha["w1"])))
+
+
+class TestAutostepCombo:
+    def test_infinite_gated_gradient_does_not_poison_normalizers(self):
+        """Table-1 v = max(NaN, ...) stays NaN, then clip(NaN) on alpha. The
+        screening copy still has the leak core Autostep #55 names."""
+        params = init_mlp_params(jr.key(0), SMALL)
+        hp = dict(UPGD_W_PROTOCOL_HYPERPARAMETERS)
+        hp.update({"meta_step_size": 0.01, "initial_step_size": 0.01, "tau": 1e4})
+        init_fn, _ = _make_upgd_autostep_learner(hp)
+        state = init_fn(params)
+        grads = {n: jnp.zeros_like(v) for n, v in params.items()}
+        grads["w1"] = jnp.full_like(params["w1"], jnp.inf)
+        noise = {n: jnp.zeros_like(v) for n, v in params.items()}
+
+        _, poisoned = upgd_autostep_update(params, state, grads, noise, hp)
+        assert bool(jnp.all(jnp.isfinite(poisoned.normalizer["w1"])))
+        assert bool(jnp.all(jnp.isfinite(poisoned.alpha["w1"])))
+        np.testing.assert_array_equal(
+            np.asarray(poisoned.normalizer["w1"]), np.asarray(state.normalizer["w1"])
+        )
+        np.testing.assert_array_equal(
+            np.asarray(poisoned.alpha["w1"]), np.asarray(state.alpha["w1"])
+        )
+
+        finite = {n: jnp.ones_like(v) * 0.1 for n, v in params.items()}
+        _, recovered = upgd_autostep_update(params, poisoned, finite, noise, hp)
+        assert bool(jnp.all(jnp.isfinite(recovered.normalizer["w1"])))
+        assert bool(jnp.all(jnp.isfinite(recovered.alpha["w1"])))
+
 
 class TestFadeHead:
     """FADE meta-learned per-parameter weight decay on the output layer."""
@@ -475,6 +528,21 @@ class TestIDBDSwift:
                     np.asarray(state_swift.trace[n]), np.asarray(state_plain.trace[n])
                 )
             params = p_swift
+
+    def test_infinite_gated_gradient_does_not_poison_log_alpha(self):
+        params = init_mlp_params(jr.key(0), SMALL)
+        hp = self._hp()
+        init_fn, _ = _make_upgd_idbd_learner(hp)
+        state = init_fn(params)
+        grads = {n: jnp.zeros_like(v) for n, v in params.items()}
+        grads["w1"] = jnp.full_like(params["w1"], jnp.inf)
+        noise = {n: jnp.zeros_like(v) for n, v in params.items()}
+
+        _, poisoned = upgd_idbd_swift_update(params, state, grads, noise, hp)
+        assert bool(jnp.all(jnp.isfinite(poisoned.log_alpha["w1"])))
+        np.testing.assert_array_equal(
+            np.asarray(poisoned.log_alpha["w1"]), np.asarray(state.log_alpha["w1"])
+        )
 
     def test_overshoot_bound_triggers_and_caps_effective_step(self):
         """Large alpha: sum_i alpha_i z_i^2 >> eta, so the applied step is the
@@ -1532,7 +1600,21 @@ class TestAlphaUtility:
                 np.testing.assert_array_equal(
                     np.asarray(new_params[n]), np.asarray(expected)
                 )
-            params = new_params
+
+    def test_infinite_raw_gradient_does_not_poison_log_alpha(self):
+        params = init_mlp_params(jr.key(0), SMALL)
+        hp = self._hp()
+        init_fn, _ = _make_upgd_alpha_utility_learner(hp)
+        state = init_fn(params)
+        grads = {n: jnp.zeros_like(v) for n, v in params.items()}
+        grads["w1"] = jnp.full_like(params["w1"], jnp.inf)
+        noise = {n: jnp.zeros_like(v) for n, v in params.items()}
+
+        _, poisoned = upgd_alpha_utility_update(params, state, grads, noise, hp)
+        assert bool(jnp.all(jnp.isfinite(poisoned.log_alpha["w1"])))
+        np.testing.assert_array_equal(
+            np.asarray(poisoned.log_alpha["w1"]), np.asarray(state.log_alpha["w1"])
+        )
 
     def test_consistent_gradient_earns_more_protection(self):
         """A weight with a persistent-sign gradient must end with higher

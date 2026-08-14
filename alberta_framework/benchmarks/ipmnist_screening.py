@@ -203,6 +203,20 @@ _IDBD_LOG_ALPHA_MAX = 0.0  # alpha <= 1 keeps per-weight decay factors positive
 _AUTOSTEP_ALPHA_MIN = 1e-8
 _AUTOSTEP_ALPHA_MAX = 1.0
 
+
+def _clip_finite_log_alpha(log_alpha: Array, meta_delta: Array) -> Array:
+    """Clip an IDBD log-step-size update; skip a non-finite meta-gradient.
+
+    ``clip(NaN)`` is NaN, so inf * h=0 (or a float32 overflow of a finite
+    product) would permanently poison ``log_alpha``. Core IDBD (#42/#43)
+    keeps the previous value on that channel; screening copies must too.
+    """
+    return jnp.where(
+        jnp.isfinite(meta_delta),
+        jnp.clip(log_alpha + meta_delta, _IDBD_LOG_ALPHA_MIN, _IDBD_LOG_ALPHA_MAX),
+        log_alpha,
+    )
+
 # Metrics returned by every screening step: (accuracy, loss, plasticity).
 StepMetrics = tuple[Array, Array, Array]
 ScreeningStepFn = Callable[
@@ -402,10 +416,8 @@ def upgd_idbd_update(
     for name in params:
         keep = 1.0 - gate[name]
         z = grads[name] * keep
-        log_alpha = jnp.clip(
-            state.log_alpha[name] + meta * z * state.trace[name],
-            _IDBD_LOG_ALPHA_MIN,
-            _IDBD_LOG_ALPHA_MAX,
+        log_alpha = _clip_finite_log_alpha(
+            state.log_alpha[name], meta * z * state.trace[name]
         )
         alpha = jnp.exp(log_alpha)
         new_params[name] = params[name] * (1.0 - alpha * wd) - alpha * (
@@ -459,10 +471,8 @@ def upgd_idbd_swift_update(
     log_alpha_all: dict[str, Array] = {}
     for name in params:
         z_all[name] = grads[name] * (1.0 - gate[name])
-        log_alpha_all[name] = jnp.clip(
-            state.log_alpha[name] + meta * z_all[name] * state.trace[name],
-            _IDBD_LOG_ALPHA_MIN,
-            _IDBD_LOG_ALPHA_MAX,
+        log_alpha_all[name] = _clip_finite_log_alpha(
+            state.log_alpha[name], meta * z_all[name] * state.trace[name]
         )
     alpha_all = {name: jnp.exp(log_alpha_all[name]) for name in params}
     tau = jnp.sum(
@@ -584,21 +594,33 @@ def upgd_autostep_update(
     for name in params:
         z = z_all[name]
         meta_gradient = z * state.trace[name]
+        finite_meta = jnp.isfinite(meta_gradient)
         abs_meta = jnp.abs(meta_gradient)
         v_update = state.normalizer[name] + (1.0 / tau) * state.alpha[name] * z * z * (
             abs_meta - state.normalizer[name]
         )
-        v_new = jnp.maximum(abs_meta, v_update)
+        v_new = jnp.where(
+            finite_meta, jnp.maximum(abs_meta, v_update), state.normalizer[name]
+        )
         safe_v = jnp.maximum(v_new, 1e-38)
         raw_alpha[name] = jnp.where(
-            v_new > 0.0,
+            finite_meta & (v_new > 0.0),
             state.alpha[name] * jnp.exp(mu * meta_gradient / safe_v),
             state.alpha[name],
         )
         new_normalizer[name] = v_new
     effective = jnp.sum(
         jnp.stack(
-            [jnp.sum(raw_alpha[name] * z_all[name] * z_all[name]) for name in sorted(params)]
+            [
+                jnp.sum(
+                    jnp.where(
+                        jnp.isfinite(z_all[name] * z_all[name]),
+                        raw_alpha[name] * z_all[name] * z_all[name],
+                        0.0,
+                    )
+                )
+                for name in sorted(params)
+            ]
         )
     )
     m_factor = jnp.maximum(effective, 1.0)
@@ -613,7 +635,11 @@ def upgd_autostep_update(
             (grads[name] + noise[name]) * keep
         )
         new_alpha[name] = alpha
-        new_trace[name] = state.trace[name] * (1.0 - alpha * z * z) + alpha * z
+        new_trace[name] = jnp.where(
+            jnp.isfinite(z),
+            state.trace[name] * (1.0 - alpha * z * z) + alpha * z,
+            state.trace[name],
+        )
     return new_params, UPGDAutostepState(  # type: ignore[call-arg]
         utility=utility,
         step=count,
@@ -2667,10 +2693,8 @@ def upgd_alpha_utility_update(
     new_trace: dict[str, Array] = {}
     for name in params:
         g = grads[name]
-        la = jnp.clip(
-            state.log_alpha[name] + meta * g * state.trace[name],
-            _IDBD_LOG_ALPHA_MIN,
-            _IDBD_LOG_ALPHA_MAX,
+        la = _clip_finite_log_alpha(
+            state.log_alpha[name], meta * g * state.trace[name]
         )
         alpha = jnp.exp(la)
         new_log_alpha[name] = la
