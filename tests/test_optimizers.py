@@ -110,6 +110,66 @@ class TestIDBD:
         assert "min_step_size" in result.metrics
         assert "max_step_size" in result.metrics
 
+    def test_infinite_error_does_not_poison_step_sizes(self):
+        """An inf error against fresh zero traces must skip adaptation.
+
+        h=0 means "no gradient correlation yet": inf * 0 = NaN used to flow
+        through the clip (clip(NaN) is NaN), leaving log step-sizes, the bias
+        step-size, and every later finite update permanently NaN.
+        """
+        optimizer = IDBD(initial_step_size=0.01, meta_step_size=0.01)
+        state = optimizer.init(feature_dim=2)
+        observation = jnp.ones(2, dtype=jnp.float32)
+
+        poisoned = optimizer.update(
+            state, jnp.array(jnp.inf, dtype=jnp.float32), observation
+        )
+        assert bool(jnp.all(jnp.isfinite(poisoned.new_state.log_step_sizes)))
+        assert bool(jnp.isfinite(poisoned.new_state.bias_step_size))
+        # Skipped adaptation keeps the previous (clipped) log step-sizes.
+        chex.assert_trees_all_close(
+            poisoned.new_state.log_step_sizes, state.log_step_sizes
+        )
+
+        recovered = optimizer.update(
+            poisoned.new_state, jnp.array(1.0, dtype=jnp.float32), observation
+        )
+        assert bool(jnp.all(jnp.isfinite(recovered.new_state.log_step_sizes)))
+
+    def test_finite_overflow_product_keeps_meta_update_zero(self):
+        """|error * x| overflowing float32 must not NaN a zero-trace channel.
+
+        (error * x) * h evaluates inf * 0 = NaN when the finite product
+        overflows; associating error * (x * h) makes the zero trace win, so
+        the meta-update is exactly 0 wherever h is 0 and inputs are finite.
+        """
+        optimizer = IDBD(initial_step_size=0.01, meta_step_size=0.01)
+        state = optimizer.init(feature_dim=2)
+        observation = jnp.array([1e20, 1.0], dtype=jnp.float32)
+
+        result = optimizer.update(
+            state, jnp.array(1e20, dtype=jnp.float32), observation
+        )
+        assert bool(jnp.all(jnp.isfinite(result.new_state.log_step_sizes)))
+        chex.assert_trees_all_close(
+            result.new_state.log_step_sizes, state.log_step_sizes
+        )
+
+    def test_finite_gradients_still_adapt_after_guard(self):
+        """The non-finite guard must not change ordinary adaptation."""
+        optimizer = IDBD(initial_step_size=0.01, meta_step_size=0.05)
+        state = optimizer.init(feature_dim=2)
+        observation = jnp.ones(2, dtype=jnp.float32)
+
+        first = optimizer.update(state, jnp.array(1.0), observation)
+        second = optimizer.update(first.new_state, jnp.array(1.0), observation)
+        # Correlated errors on the same feature raise the log step-sizes.
+        assert bool(
+            jnp.all(
+                second.new_state.log_step_sizes > state.log_step_sizes
+            )
+        )
+
 
 class TestAutostep:
     """Tests for the Autostep optimizer."""
@@ -612,6 +672,29 @@ class TestIDBDParamState:
         chex.assert_tree_all_finite(step)
         chex.assert_tree_all_finite(new_state.log_step_sizes)
         chex.assert_tree_all_finite(new_state.traces)
+
+    def test_update_from_gradient_infinite_z_does_not_poison_step_sizes(self):
+        """The gradient path's meta-update has the same inf * 0 = NaN hole.
+
+        z * traces with fresh zero traces and an inf gradient produced NaN
+        past the clip, exactly like the linear path.
+        """
+        optimizer = IDBD(initial_step_size=0.01, meta_step_size=0.01)
+        state = optimizer.init_for_shape((4, 3))
+
+        gradient = jnp.full((4, 3), jnp.inf, dtype=jnp.float32)
+        step, poisoned = optimizer.update_from_gradient(
+            state, gradient, error=jnp.array(1.0)
+        )
+        del step
+        assert bool(jnp.all(jnp.isfinite(poisoned.log_step_sizes)))
+        chex.assert_trees_all_close(poisoned.log_step_sizes, state.log_step_sizes)
+
+        finite_step, recovered = optimizer.update_from_gradient(
+            poisoned, jnp.ones((4, 3)) * 0.1, error=jnp.array(1.0)
+        )
+        chex.assert_tree_all_finite(finite_step)
+        chex.assert_tree_all_finite(recovered.log_step_sizes)
 
     def test_update_from_gradient_without_error(self):
         """update_from_gradient should work without error (trunk path)."""
