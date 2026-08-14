@@ -1103,6 +1103,39 @@ class FixedBudgetFeatureLearner:
             candidate_output_delta = bounding_scale * candidate_output_delta
             candidate_weight_delta = bounding_scale * candidate_weight_delta
             candidate_bias_delta = bounding_scale * candidate_bias_delta
+            output_delta = jnp.where(
+                jnp.isnan(output_delta), jnp.zeros_like(output_delta), output_delta
+            )
+            output_bias_delta = jnp.where(
+                jnp.isnan(output_bias_delta),
+                jnp.zeros_like(output_bias_delta),
+                output_bias_delta,
+            )
+            feature_weight_delta = jnp.where(
+                jnp.isnan(feature_weight_delta),
+                jnp.zeros_like(feature_weight_delta),
+                feature_weight_delta,
+            )
+            feature_bias_delta = jnp.where(
+                jnp.isnan(feature_bias_delta),
+                jnp.zeros_like(feature_bias_delta),
+                feature_bias_delta,
+            )
+            candidate_output_delta = jnp.where(
+                jnp.isnan(candidate_output_delta),
+                jnp.zeros_like(candidate_output_delta),
+                candidate_output_delta,
+            )
+            candidate_weight_delta = jnp.where(
+                jnp.isnan(candidate_weight_delta),
+                jnp.zeros_like(candidate_weight_delta),
+                candidate_weight_delta,
+            )
+            candidate_bias_delta = jnp.where(
+                jnp.isnan(candidate_bias_delta),
+                jnp.zeros_like(candidate_bias_delta),
+                candidate_bias_delta,
+            )
 
         feature_weights = state.feature_weights + feature_weight_delta
         feature_biases = state.feature_biases + feature_bias_delta

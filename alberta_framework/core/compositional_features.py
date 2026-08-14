@@ -2827,6 +2827,27 @@ class CompositionalFeatureLearner:
             theta_delta = bounding_scale * theta_delta
             candidate_output_delta = bounding_scale * candidate_output_delta
             candidate_theta_delta = bounding_scale * candidate_theta_delta
+            output_delta = jnp.where(
+                jnp.isnan(output_delta), jnp.zeros_like(output_delta), output_delta
+            )
+            output_bias_delta = jnp.where(
+                jnp.isnan(output_bias_delta),
+                jnp.zeros_like(output_bias_delta),
+                output_bias_delta,
+            )
+            theta_delta = jnp.where(
+                jnp.isnan(theta_delta), jnp.zeros_like(theta_delta), theta_delta
+            )
+            candidate_output_delta = jnp.where(
+                jnp.isnan(candidate_output_delta),
+                jnp.zeros_like(candidate_output_delta),
+                candidate_output_delta,
+            )
+            candidate_theta_delta = jnp.where(
+                jnp.isnan(candidate_theta_delta),
+                jnp.zeros_like(candidate_theta_delta),
+                candidate_theta_delta,
+            )
 
         output_weights = state.output_weights + output_delta
         output_bias = state.output_bias + output_bias_delta

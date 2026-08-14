@@ -97,6 +97,35 @@ class TestCompositionalFeatureLearner:
             assert pa_np[i] < i
             assert pb_np[i] < i
 
+    def test_infinite_target_obgd_does_not_nan_weights(self) -> None:
+        """Inf error drives ObGD scale to 0; 0*inf must not NaN the bank."""
+        learner = CompositionalFeatureLearner(
+            n_features=2,
+            n_tasks=1,
+            candidate_count=0,
+            use_obgd=True,
+            obgd_kappa=2.0,
+            replacement_interval=100_000,
+            min_feature_age=100_000,
+        )
+        state = learner.init(feature_dim=2, key=jr.key(0))
+        poisoned = learner.update(
+            state,
+            jnp.ones(2, dtype=jnp.float32),
+            jnp.array([jnp.inf], dtype=jnp.float32),
+        )
+        assert bool(jnp.all(jnp.isfinite(poisoned.state.output_weights)))
+        chex.assert_trees_all_close(
+            poisoned.state.output_weights, state.output_weights
+        )
+
+        recovered = learner.update(
+            poisoned.state,
+            jnp.ones(2, dtype=jnp.float32),
+            jnp.array([1.0], dtype=jnp.float32),
+        )
+        assert bool(jnp.all(jnp.isfinite(recovered.state.output_weights)))
+
     def test_forward_pass_topological_order(self) -> None:
         """Build a tiny DAG by hand and verify the forward gives the right values."""
         # Slots: [raw 0, raw 1, product(0, 1)] -> values [x[0], x[1], x[0]*x[1]]
