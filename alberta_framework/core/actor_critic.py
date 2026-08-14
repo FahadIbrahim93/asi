@@ -32,6 +32,16 @@ from jaxtyping import Float, Int
 from alberta_framework.core.optimizers import Bounder, bounder_from_config
 
 
+def _floating_tree_is_finite(tree: object) -> Array:
+    """Return whether every floating/complex persistent leaf is finite."""
+    valid = jnp.asarray(True, dtype=jnp.bool_)
+    for leaf in jax.tree.leaves(tree):
+        array = jnp.asarray(leaf)
+        if jnp.issubdtype(array.dtype, jnp.inexact):
+            valid = valid & jnp.all(jnp.isfinite(array))
+    return valid
+
+
 @dataclasses.dataclass(frozen=True)
 class ActorCriticConfig:
     """Configuration for a linear softmax actor-critic agent.
@@ -399,8 +409,22 @@ class ActorCriticAgent:
             critic_trace_bias=stored_critic_trace_bias,
             step_count=state.step_count + 1,
         )
-        next_action, key, next_policy = self.select_action(updated, observation)
-        new_state = updated.replace(
+        # Inf TD error zeros the ObGD step, then td_error * step is 0*inf=NaN.
+        # Keep previous finite weights/traces; still advance the observation
+        # so a scan loop does not desynchronize.
+        inputs_valid = (
+            jnp.isfinite(jnp.squeeze(reward))
+            & jnp.all(jnp.isfinite(observation))
+            & jnp.isfinite(td_error)
+        )
+        params_ok = inputs_valid & _floating_tree_is_finite(updated)
+        held = jax.lax.cond(
+            params_ok,
+            lambda: updated,
+            lambda: state.replace(step_count=state.step_count + 1),  # type: ignore[attr-defined]
+        )
+        next_action, key, next_policy = self.select_action(held, observation)
+        new_state = held.replace(
             last_observation=observation,
             last_action=next_action,
             rng_key=key,
@@ -952,8 +976,19 @@ class ContinuousActorCriticAgent:
             critic_trace_bias=stored_critic_trace_bias,
             step_count=state.step_count + 1,
         )
-        next_action, key, next_mean, next_sigma = self.select_action(updated, observation)
-        new_state = updated.replace(
+        inputs_valid = (
+            jnp.isfinite(jnp.squeeze(reward))
+            & jnp.all(jnp.isfinite(observation))
+            & jnp.isfinite(td_error)
+        )
+        params_ok = inputs_valid & _floating_tree_is_finite(updated)
+        held = jax.lax.cond(
+            params_ok,
+            lambda: updated,
+            lambda: state.replace(step_count=state.step_count + 1),  # type: ignore[attr-defined]
+        )
+        next_action, key, next_mean, next_sigma = self.select_action(held, observation)
+        new_state = held.replace(
             last_observation=observation,
             last_action=next_action,
             rng_key=key,

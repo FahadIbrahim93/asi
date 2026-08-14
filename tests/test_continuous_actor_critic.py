@@ -319,3 +319,38 @@ def test_continuous_actor_critic_with_obgd_bounder_is_finite() -> None:
     )
     _assert_continuous_actor_critic_state_finite(result.state)
     chex.assert_tree_all_finite(result.bound_metric)
+
+
+def test_continuous_actor_critic_infinite_reward_with_obgd_does_not_poison() -> None:
+    """Inf TD error zeros the ObGD step, then td_error*step is 0*inf=NaN."""
+    agent = ContinuousActorCriticAgent(
+        ContinuousActorCriticConfig(
+            action_dim=2,
+            actor_step_size=0.1,
+            critic_step_size=0.1,
+        ),
+        bounder=ObGDBounding(kappa=2.0),
+    )
+    state = agent.init(feature_dim=3, key=jr.key(8))
+    state, _, _, _ = agent.start(
+        state, jnp.array([1.0, 0.0, -1.0], dtype=jnp.float32)
+    )
+    poisoned = agent.update(
+        state,
+        reward=jnp.array(jnp.inf, dtype=jnp.float32),
+        observation=jnp.array([0.0, 1.0, 0.5], dtype=jnp.float32),
+        terminated=jnp.array(False),
+    )
+    assert bool(jnp.all(jnp.isfinite(poisoned.state.mean_weights)))
+    assert bool(jnp.all(jnp.isfinite(poisoned.state.critic_weights)))
+    chex.assert_trees_all_close(poisoned.state.mean_weights, state.mean_weights)
+    chex.assert_trees_all_close(poisoned.state.critic_weights, state.critic_weights)
+
+    recovered = agent.update(
+        poisoned.state,
+        reward=jnp.array(1.0, dtype=jnp.float32),
+        observation=jnp.array([0.5, 0.0, 0.0], dtype=jnp.float32),
+        terminated=jnp.array(False),
+    )
+    assert bool(jnp.all(jnp.isfinite(recovered.state.mean_weights)))
+    assert bool(jnp.all(jnp.isfinite(recovered.state.critic_weights)))
