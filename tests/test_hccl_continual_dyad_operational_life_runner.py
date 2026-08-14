@@ -152,6 +152,37 @@ class _FakeOperationalExecutor:
         return self._state
 
 
+class _MalformedSourceExecutor:
+    """Executor double that exposes a malformed source at a chosen read."""
+
+    def __init__(self, malformed_read: int) -> None:
+        self.malformed_read = malformed_read
+        self.source_reads = 0
+        self.step_called = False
+
+    @property
+    def state(self) -> object:
+        self.source_reads += 1
+        if self.source_reads == self.malformed_read:
+            return object()
+        return _state((0, 0))
+
+    @property
+    def absolute_step(self) -> int:
+        return 0
+
+    @property
+    def checkpoint_interval(self) -> int:
+        return 64
+
+    def step(self, _next_hard_action_masks: object) -> object:
+        self.step_called = True
+        raise AssertionError("malformed source must fail before executor.step")
+
+    def validate_checkpoint(self) -> object:
+        raise AssertionError("malformed source must fail before checkpoint validation")
+
+
 @pytest.mark.parametrize(
     (
         "config",
@@ -344,6 +375,21 @@ def test_fake_collection_fails_closed_on_clock_or_checkpoint_mismatch(
         _collect_operational_life(config, executor, _score_for_regime)
     assert captured.value.stage == stage
     assert not hasattr(captured.value, "trace")
+
+
+@pytest.mark.parametrize("malformed_read", (1, 2))
+def test_collection_wraps_malformed_source_clock_before_executor_step(
+    malformed_read: int,
+) -> None:
+    config = HCCLContinualDyadOperationalLifeRunnerConfig.mechanics_smoke()
+    executor = _MalformedSourceExecutor(malformed_read)
+
+    with pytest.raises(HCCLContinualDyadOperationalLifeError) as captured:
+        _collect_operational_life(config, executor, _score_for_regime)
+
+    assert captured.value.step_index == (-1 if malformed_read == 1 else 0)
+    assert captured.value.stage == "source-clock"
+    assert executor.step_called is False
 
 
 def test_metadata_is_strict_and_runner_construction_does_not_execute() -> None:
