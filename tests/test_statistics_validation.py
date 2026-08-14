@@ -26,6 +26,8 @@ Calibration (measured on this machine, scripts in the session scratchpad):
   superset always and strictness on >= 50 draws.
 """
 
+import warnings
+
 import numpy as np
 import pytest
 
@@ -215,6 +217,53 @@ class TestPairedTests:
         res = mann_whitney_comparison(a, b, alpha=0.01)
         assert res.test_name == "Mann-Whitney U"
         assert res.significant
+
+
+class TestOneSampleRejection:
+    """Length-1 groups are rejected with ValueError, not divide-by-zero (#35).
+
+    A 1-vs-1 comparison has zero pooled degrees of freedom, so neither the
+    paired/independent t statistic nor Cohen's d is defined. The helpers must
+    reject before SciPy instead of emitting RuntimeWarning and crashing with
+    ZeroDivisionError. Mann-Whitney keeps its defined length-1 behavior.
+    """
+
+    def test_cohens_d_length_one_both_groups_raises(self) -> None:
+        with pytest.raises(ValueError, match="at least 2"):
+            cohens_d([1.0], [2.0])
+
+    def test_cohens_d_length_one_either_group_raises(self) -> None:
+        with pytest.raises(ValueError, match="at least 2"):
+            cohens_d([1.0, 2.0], [3.0])
+        with pytest.raises(ValueError, match="at least 2"):
+            cohens_d([1.0], [2.0, 3.0])
+
+    def test_paired_ttest_length_one_raises_without_runtime_warning(self) -> None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with pytest.raises(ValueError, match="at least 2"):
+                ttest_comparison([1.0], [2.0], paired=True)
+
+    def test_paired_ttest_mismatched_lengths_raise_before_scipy(self) -> None:
+        with pytest.raises(ValueError, match="equal-length"):
+            ttest_comparison([1.0, 2.0], [1.0, 2.0, 3.0], paired=True)
+
+    def test_unpaired_ttest_length_one_raises_without_runtime_warning(self) -> None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with pytest.raises(ValueError, match="at least 2"):
+                ttest_comparison([1.0], [2.0], paired=False)
+
+    def test_unpaired_ttest_length_one_either_side_raises(self) -> None:
+        with pytest.raises(ValueError, match="at least 2"):
+            ttest_comparison([1.0, 2.0, 3.0], [4.0], paired=False)
+        with pytest.raises(ValueError, match="at least 2"):
+            ttest_comparison([1.0], [2.0, 3.0, 4.0], paired=False)
+
+    def test_mann_whitney_length_one_contract_unchanged(self) -> None:
+        res = mann_whitney_comparison([1.0], [2.0])
+        assert res.p_value == pytest.approx(1.0)
+        assert res.effect_size == pytest.approx(-1.0)
 
 
 # ---------------------------------------------------------------------------
