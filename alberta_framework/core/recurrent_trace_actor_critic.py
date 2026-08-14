@@ -1217,6 +1217,11 @@ def exact_rtrl_gradient(
     )
 
 
+def _replace_nan_with_zero(value: Array) -> Array:
+    """Map ``0 * inf`` NaNs to 0 so genuine infs stay inf."""
+    return jnp.where(jnp.isnan(value), jnp.zeros_like(value), value)
+
+
 def obgd_update(
     traces: Any,
     signal: Array,
@@ -1236,17 +1241,17 @@ def obgd_update(
     z_sum = jnp.asarray(0.0, dtype=signal.dtype)
     for leaf in jax.tree_util.tree_leaves(traces):
         z_sum = z_sum + jnp.sum(jnp.abs(leaf))
-    denominator = jnp.maximum(
-        1.0,
+    bound_term = (
         jnp.asarray(alpha, dtype=signal.dtype)
         * jnp.asarray(kappa, dtype=signal.dtype)
         * jnp.maximum(jnp.abs(signal), 1.0)
-        * z_sum,
+        * z_sum
     )
+    denominator = jnp.maximum(1.0, _replace_nan_with_zero(bound_term))
     scale = jnp.reciprocal(denominator)
     step_size = jnp.asarray(alpha, dtype=signal.dtype) * scale
     updates = jax.tree_util.tree_map(
-        lambda trace: step_size * signal * trace,
+        lambda trace: _replace_nan_with_zero(step_size * signal * trace),
         traces,
     )
     return ObGDUpdate(updates=updates, step_size=step_size, scale=scale)
@@ -1285,7 +1290,7 @@ def adaptive_obgd_update(
     new_second_moment = jax.tree_util.tree_map(
         lambda previous, trace: (
             beta * previous
-            + (1.0 - beta) * jnp.square(signal * trace)
+            + (1.0 - beta) * jnp.square(_replace_nan_with_zero(signal * trace))
         ),
         second_moment,
         traces,
@@ -1304,17 +1309,19 @@ def adaptive_obgd_update(
     z_sum = jnp.asarray(0.0, dtype=signal.dtype)
     for leaf in jax.tree_util.tree_leaves(normalized_traces):
         z_sum = z_sum + jnp.sum(jnp.abs(leaf))
-    denominator = jnp.maximum(
-        1.0,
+    bound_term = (
         jnp.maximum(jnp.abs(signal), 1.0)
         * z_sum
         * jnp.asarray(alpha, dtype=signal.dtype)
-        * jnp.asarray(kappa, dtype=signal.dtype),
+        * jnp.asarray(kappa, dtype=signal.dtype)
     )
+    denominator = jnp.maximum(1.0, _replace_nan_with_zero(bound_term))
     scale = jnp.reciprocal(denominator)
     step_size = jnp.asarray(alpha, dtype=signal.dtype) / denominator
     updates = jax.tree_util.tree_map(
-        lambda normalized_trace: step_size * signal * normalized_trace,
+        lambda normalized_trace: _replace_nan_with_zero(
+            step_size * signal * normalized_trace
+        ),
         normalized_traces,
     )
     return AdaptiveObGDUpdate(
