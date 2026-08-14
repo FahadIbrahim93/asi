@@ -32,6 +32,7 @@ from jaxtyping import Float, Int
 
 from alberta_framework.core.horde import HordeLearner
 from alberta_framework.core.multi_head_learner import (
+    MULTI_HEAD_MLP_STATE_SCHEMA,
     AnyOptimizer,
     MultiHeadMLPState,
 )
@@ -368,6 +369,9 @@ class SARSAAgent:
 
         config = dict(config)
         config.pop("type", None)
+        state_schema = config.pop("state_schema", MULTI_HEAD_MLP_STATE_SCHEMA)
+        if state_schema != MULTI_HEAD_MLP_STATE_SCHEMA:
+            raise ValueError(f"unsupported SARSA Horde state schema: {state_schema!r}")
 
         sarsa_config = SARSAConfig.from_config(config.pop("sarsa_config"))
         optimizer = optimizer_from_config(config.pop("optimizer"))

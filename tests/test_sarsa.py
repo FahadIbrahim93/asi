@@ -684,6 +684,14 @@ class TestSARSAConfigSerialization:
         assert restored.n_actions == 2
         assert restored.horde.n_demons == 2
 
+    def test_agent_config_rejects_unknown_state_schema(self):
+        """Serialized state schemas fail closed when the loader does not support them."""
+        config = _make_agent(n_actions=2).to_config()
+        config["state_schema"] = "alberta.multi-head-mlp-state.v999"
+
+        with pytest.raises(ValueError, match="unsupported SARSA Horde state schema"):
+            SARSAAgent.from_config(config)
+
 
 # =============================================================================
 # Scan-based (array) loop tests
