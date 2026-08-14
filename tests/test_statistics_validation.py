@@ -353,6 +353,20 @@ def _make_aggregated(name: str, level: float, seed: int, n_seeds: int = 12) -> A
     )
 
 
+def _make_seeded_aggregated(
+    name: str,
+    seeds: list[int],
+    values: list[float],
+) -> AggregatedResults:
+    """AggregatedResults with one metric value per explicitly identified seed."""
+    return AggregatedResults(
+        config_name=name,
+        seeds=seeds,
+        metric_arrays={"squared_error": np.asarray(values, dtype=np.float64)[:, None]},
+        summary={},
+    )
+
+
 class TestPairwiseComparisons:
     def _results(self) -> dict[str, AggregatedResults]:
         return {
@@ -404,3 +418,69 @@ class TestPairwiseComparisons:
     def test_non_aggregated_results_raises_type_error(self) -> None:
         with pytest.raises(TypeError):
             pairwise_comparisons({"a": object(), "b": object()})  # type: ignore[dict-item]
+
+    @pytest.mark.parametrize("test", ["ttest", "wilcoxon"])
+    @pytest.mark.parametrize("correction", ["bonferroni", "holm"])
+    def test_paired_tests_align_reordered_equal_seed_sets(
+        self,
+        test: str,
+        correction: str,
+    ) -> None:
+        a = _make_seeded_aggregated("a", [0, 1, 2, 3], [0.0, 10.0, 20.0, 30.0])
+        aligned_b = _make_seeded_aggregated("b", [0, 1, 2, 3], [2.0, 11.0, 24.0, 28.0])
+        aligned_c = _make_seeded_aggregated("c", [0, 1, 2, 3], [1.0, 14.0, 16.0, 35.0])
+        reordered_b = _make_seeded_aggregated("b", [2, 0, 3, 1], [24.0, 2.0, 28.0, 11.0])
+        reordered_c = _make_seeded_aggregated("c", [1, 3, 0, 2], [14.0, 35.0, 1.0, 16.0])
+
+        aligned = pairwise_comparisons(
+            {"a": a, "b": aligned_b, "c": aligned_c},
+            test=test,
+            correction=correction,
+            window=1,
+        )
+        reordered = pairwise_comparisons(
+            {"a": a, "b": reordered_b, "c": reordered_c},
+            test=test,
+            correction=correction,
+            window=1,
+        )
+
+        assert reordered == aligned
+
+    def test_paired_ttest_aligns_adversarial_seed_order(self) -> None:
+        a = _make_seeded_aggregated("a", [0, 1, 2], [0.0, 10.0, 20.0])
+        reversed_b = _make_seeded_aggregated("b", [2, 1, 0], [21.0, 11.0, 1.0])
+
+        result = pairwise_comparisons({"a": a, "b": reversed_b}, window=1)[("a", "b")]
+
+        assert np.isneginf(result.statistic)
+        assert result.p_value == 0.0
+
+    @pytest.mark.parametrize("test", ["ttest", "wilcoxon"])
+    def test_paired_tests_reject_different_seed_sets(self, test: str) -> None:
+        a = _make_seeded_aggregated("a", [0, 1, 2], [0.0, 1.0, 2.0])
+        b = _make_seeded_aggregated("b", [1, 2, 3], [1.0, 2.0, 3.0])
+
+        with pytest.raises(ValueError, match="equal seed sets"):
+            pairwise_comparisons({"a": a, "b": b}, test=test, window=1)
+
+    def test_duplicate_seeds_rejected(self) -> None:
+        malformed = _make_seeded_aggregated("malformed", [0, 0, 1], [0.0, 1.0, 2.0])
+        valid = _make_seeded_aggregated("valid", [10, 11, 12], [3.0, 4.0, 5.0])
+
+        with pytest.raises(ValueError, match="duplicate seeds"):
+            pairwise_comparisons({"malformed": malformed, "valid": valid}, test="mann_whitney")
+
+    def test_seed_count_must_match_metric_rows(self) -> None:
+        malformed = _make_seeded_aggregated("malformed", [0, 1], [0.0, 1.0, 2.0])
+
+        with pytest.raises(ValueError, match="seed count.*metric rows"):
+            pairwise_comparisons({"malformed": malformed})
+
+    def test_mann_whitney_accepts_distinct_seed_sets(self) -> None:
+        a = _make_seeded_aggregated("a", [0, 1, 2], [0.0, 1.0, 2.0])
+        b = _make_seeded_aggregated("b", [10, 11, 12], [3.0, 4.0, 5.0])
+
+        result = pairwise_comparisons({"a": a, "b": b}, test="mann_whitney", window=1)
+
+        assert result[("a", "b")].statistic == pytest.approx(0.0)

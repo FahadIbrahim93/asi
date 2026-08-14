@@ -421,23 +421,37 @@ def pairwise_comparisons(
 
     Returns:
         Dictionary mapping (method_a, method_b) to SignificanceResult
+
+    Raises:
+        ValueError: If seed identities are duplicated, do not match metric rows, or differ
+            between methods used by a paired test. Paired rows are aligned by seed identity;
+            Mann-Whitney samples remain unpaired.
     """
     from alberta_framework.utils.experiments import AggregatedResults
 
     names = list(results.keys())
     n = len(names)
 
-    if n < 2:
-        return {}
-
     # Extract final values for each method
     final_values: dict[str, NDArray[np.float64]] = {}
+    seeds_by_name: dict[str, list[int]] = {}
     for name, agg in results.items():
         if not isinstance(agg, AggregatedResults):
             raise TypeError(f"Expected AggregatedResults, got {type(agg)}")
         arr = agg.metric_arrays[metric]
+        if len(set(agg.seeds)) != len(agg.seeds):
+            raise ValueError(f"AggregatedResults {name!r} contains duplicate seeds")
+        if len(agg.seeds) != arr.shape[0]:
+            raise ValueError(
+                f"AggregatedResults {name!r} seed count ({len(agg.seeds)}) does not match "
+                f"metric rows ({arr.shape[0]}) for {metric!r}"
+            )
         final_window = min(window, arr.shape[1])
         final_values[name] = np.mean(arr[:, -final_window:], axis=1)
+        seeds_by_name[name] = agg.seeds
+
+    if n < 2:
+        return {}
 
     if test not in ("ttest", "mann_whitney", "wilcoxon"):
         raise ValueError(f"Unknown test: {test}")
@@ -451,6 +465,16 @@ def pairwise_comparisons(
             name_a, name_b = names[i], names[j]
             values_a = final_values[name_a]
             values_b = final_values[name_b]
+
+            if test in ("ttest", "wilcoxon"):
+                seeds_a = seeds_by_name[name_a]
+                seeds_b = seeds_by_name[name_b]
+                if set(seeds_a) != set(seeds_b):
+                    raise ValueError(
+                        f"Paired comparison {name_a!r} vs {name_b!r} requires equal seed sets"
+                    )
+                index_b_by_seed = {seed: index for index, seed in enumerate(seeds_b)}
+                values_b = values_b[[index_b_by_seed[seed] for seed in seeds_a]]
 
             if test == "ttest":
                 result = ttest_comparison(
