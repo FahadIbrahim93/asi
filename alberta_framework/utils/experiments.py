@@ -195,7 +195,7 @@ def run_multi_seed_experiment(
     """Run experiments across multiple seeds with optional parallelization.
 
     Args:
-        configs: List of experiment configurations to run
+        configs: List of experiment configurations to run. Names must be unique.
         seeds: Number of seeds (generates 0..n-1) or explicit list of seeds
         parallel: Whether to use parallel execution (requires joblib)
         n_jobs: Number of parallel jobs (-1 for all CPUs)
@@ -203,7 +203,24 @@ def run_multi_seed_experiment(
 
     Returns:
         Dictionary mapping config name to AggregatedResults
+
+    Raises:
+        ValueError: If two or more configurations have the same name
     """
+    seen_names: set[str] = set()
+    duplicate_names: set[str] = set()
+    for config in configs:
+        if config.name in seen_names:
+            duplicate_names.add(config.name)
+        else:
+            seen_names.add(config.name)
+
+    if duplicate_names:
+        formatted_names = ", ".join(repr(name) for name in sorted(duplicate_names))
+        raise ValueError(
+            f"Experiment configuration names must be unique; duplicates: {formatted_names}"
+        )
+
     # Convert seeds to list
     if isinstance(seeds, int):
         seed_list = list(range(seeds))
