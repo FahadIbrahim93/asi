@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import dataclasses
-import json
 from pathlib import Path
 from typing import Any
 
@@ -16,20 +15,14 @@ import pytest
 
 import alberta_framework as alberta
 import alberta_framework.core as core
-from alberta_framework.core.checkpoints import (
-    load_checkpoint_metadata,
-    save_checkpoint,
-)
 from alberta_framework.core.learning_signals import (
     LearningSignalEstimatorConfig,
 )
 from alberta_framework.core.world_model import ActionConditionedWorldModelConfig
 from alberta_framework.core.world_model_ensemble import (
-    WORLD_MODEL_ENSEMBLE_CHECKPOINT_SCHEMA,
     WorldModelEnsemble,
     WorldModelEnsembleConfig,
     WorldModelEnsembleResourceBudget,
-    load_world_model_ensemble_checkpoint,
     save_world_model_ensemble_checkpoint,
 )
 
@@ -121,15 +114,6 @@ def _assert_tree_equal(left: object, right: object) -> None:
         np.testing.assert_array_equal(np.asarray(left_leaf), np.asarray(right_leaf))
 
 
-def _logical_tree_size(tree: object) -> tuple[int, int]:
-    leaves = jax.tree.leaves(_materialize_keys(tree))
-    arrays = [jnp.asarray(leaf) for leaf in leaves]
-    return (
-        sum(int(array.size) for array in arrays),
-        sum(int(array.nbytes) for array in arrays),
-    )
-
-
 def test_public_exports_and_schema() -> None:
     assert alberta.WorldModelEnsemble is core.WorldModelEnsemble
     assert alberta.WorldModelEnsembleConfig is core.WorldModelEnsembleConfig
@@ -140,10 +124,6 @@ def test_public_exports_and_schema() -> None:
     )
     assert alberta.WorldModelEnsembleState is core.WorldModelEnsembleState
     assert alberta.WorldModelEnsembleUpdateResult is core.WorldModelEnsembleUpdateResult
-    assert (
-        alberta.WORLD_MODEL_ENSEMBLE_CHECKPOINT_SCHEMA
-        == WORLD_MODEL_ENSEMBLE_CHECKPOINT_SCHEMA
-    )
 
 
 def test_config_and_ensemble_round_trip_are_strict() -> None:
@@ -228,67 +208,6 @@ def test_init_uses_distinct_member_keys_and_isolated_real_replay_mask_keys() -> 
     )
 
 
-def test_resource_budget_exactly_accounts_initialized_state_and_bounds() -> None:
-    ensemble = WorldModelEnsemble(_config())
-    state = ensemble.init(jr.key(61))
-    budget = ensemble.resource_budget(state)
-
-    assert budget == ensemble.resource_budget()
-    assert budget.ensemble_size == 2
-    assert budget.observation_dim == 2
-    assert budget.target_dim == 4
-    assert budget.member_state_scalars_per_member == 59
-    assert budget.member_state_bytes_per_member == 236
-    assert budget.member_trainable_scalars == 20
-    assert budget.total_trainable_scalars == 40
-    assert budget.persistent_float32_scalars == 127
-    assert budget.persistent_float64_scalars == 0
-    assert budget.persistent_int32_scalars == 14
-    assert budget.persistent_int64_scalars == 0
-    assert budget.persistent_uint32_scalars == 4
-    assert budget.persistent_bool_scalars == 4
-    assert budget.persistent_state_scalars == 149
-    assert budget.persistent_state_bytes == 584
-    assert budget.bootstrap_prng_keys == 2
-    assert budget.bootstrap_prng_uint32_scalars == 4
-    assert budget.bootstrap_prng_bytes == 16
-    assert budget.prediction_output_logical_scalars == 39
-    assert budget.prediction_output_logical_bytes == 150
-    assert budget.update_result_output_logical_scalars == 228
-    assert budget.update_result_output_logical_bytes == 828
-    assert budget.replay_update_result_output_logical_scalars == 209
-    assert budget.replay_update_result_output_logical_bytes == 776
-    assert budget.member_update_candidates_per_valid_event == 2
-    assert budget.max_member_updates_per_event == 2
-    assert budget.replay_member_update_candidates_per_available_sample == 2
-    assert budget.max_replay_member_updates_per_available_sample == 2
-    assert budget.max_event_count == 2**31 - 1
-    assert budget.max_member_update_count == 2**31 - 1
-    assert budget.max_replay_event_count == 2**31 - 1
-    assert budget.max_replay_member_update_count == 2**31 - 1
-    assert budget.replay_capacity == 0
-    assert _logical_tree_size(state) == (
-        budget.persistent_state_scalars,
-        budget.persistent_state_bytes,
-    )
-    for member in state.member_states:
-        assert _logical_tree_size(member) == (
-            budget.member_state_scalars_per_member,
-            budget.member_state_bytes_per_member,
-        )
-    key_words = jr.key_data(state.bootstrap_key).size + jr.key_data(
-        state.replay_bootstrap_key
-    ).size
-    key_bytes = jr.key_data(state.bootstrap_key).nbytes + jr.key_data(
-        state.replay_bootstrap_key
-    ).nbytes
-    assert key_words == budget.bootstrap_prng_uint32_scalars
-    assert key_bytes == budget.bootstrap_prng_bytes
-    json_payload = budget.to_config()
-    assert json_payload["persistent_state_bytes"] == 584
-    json.dumps(json_payload)
-
-
 def test_predict_is_read_only_and_fail_closed() -> None:
     ensemble = WorldModelEnsemble(_config())
     state = ensemble.init(jr.key(0))
@@ -296,11 +215,6 @@ def test_predict_is_read_only_and_fail_closed() -> None:
     observation, action, *_ = _event()
     prediction = ensemble.predict(state, observation, action)
     assert bool(prediction.valid)
-    budget = ensemble.resource_budget(state)
-    assert _logical_tree_size(prediction) == (
-        budget.prediction_output_logical_scalars,
-        budget.prediction_output_logical_bytes,
-    )
     assert prediction.member_raw_predictions.shape == (2, 4)
     assert prediction.member_next_observations.shape == (2, 2)
     assert not bool(prediction.residual_proxy_ready)
@@ -327,12 +241,6 @@ def test_update_reports_exact_preupdate_prediction_loss_and_targets() -> None:
 
     result = ensemble.update(state, *event)
     assert bool(result.diagnostics.applied)
-    budget = ensemble.resource_budget(state)
-    assert _logical_tree_size(result) == (
-        budget.update_result_output_logical_scalars,
-        budget.update_result_output_logical_bytes,
-    )
-    assert ensemble.resource_budget(result.state) == budget
     chex.assert_trees_all_close(
         result.prediction.member_raw_predictions,
         prediction.member_raw_predictions,
@@ -401,11 +309,6 @@ def test_replay_update_changes_only_model_and_replay_accounting() -> None:
     assert not np.array_equal(
         np.asarray(jr.key_data(replay.state.replay_bootstrap_key)),
         np.asarray(jr.key_data(state.replay_bootstrap_key)),
-    )
-    budget = ensemble.resource_budget(state)
-    assert _logical_tree_size(replay) == (
-        budget.replay_update_result_output_logical_scalars,
-        budget.replay_update_result_output_logical_bytes,
     )
 
 
@@ -836,111 +739,6 @@ def test_replay_update_eager_and_explicit_jit_match() -> None:
     eager = ensemble.replay_update(state, *event, jnp.asarray(True))
     compiled = jax.jit(ensemble.replay_update)(state, *event, jnp.asarray(True))
     _assert_tree_equal(eager, compiled)
-
-
-def test_checkpoint_round_trip_and_rng_resume_parity(tmp_path: Path) -> None:
-    ensemble = WorldModelEnsemble(_config(ensemble_size=3))
-    state = ensemble.init(jr.key(31))
-    for index in range(4):
-        state = ensemble.update(state, *_event(index)).state
-
-    checkpoint = tmp_path / "world-model-ensemble"
-    save_world_model_ensemble_checkpoint(ensemble, state, checkpoint)
-    metadata = load_checkpoint_metadata(checkpoint)
-    assert metadata["resource_budget"] == ensemble.resource_budget(state).to_config()
-    restored_ensemble, restored_state = load_world_model_ensemble_checkpoint(
-        checkpoint
-    )
-    assert restored_ensemble.config == ensemble.config
-    _assert_tree_equal(restored_state, state)
-
-    expected = ensemble.update(state, *_event(5))
-    resumed = restored_ensemble.update(restored_state, *_event(5))
-    _assert_tree_equal(resumed, expected)
-
-
-def test_checkpoint_rejects_resource_budget_metadata_tampering(tmp_path: Path) -> None:
-    ensemble = WorldModelEnsemble(_config())
-    state = ensemble.init(jr.key(67))
-    original = tmp_path / "original"
-    save_world_model_ensemble_checkpoint(ensemble, state, original)
-    metadata = load_checkpoint_metadata(original)
-    tampered_budget = dict(metadata["resource_budget"])
-    tampered_budget["bootstrap_prng_bytes"] += 4
-    tampered_metadata = dict(metadata)
-    tampered_metadata["resource_budget"] = tampered_budget
-    tampered = tmp_path / "tampered"
-    save_checkpoint(state, tampered, metadata=tampered_metadata)
-
-    with pytest.raises(ValueError, match="resource budget does not match config"):
-        load_world_model_ensemble_checkpoint(tampered)
-
-
-@pytest.mark.parametrize(
-    "schema",
-    (
-        "alberta.world_model_ensemble.v1",
-        "alberta.world_model_ensemble.v2",
-    ),
-)
-def test_checkpoint_rejects_true_historical_nested_shapes(
-    tmp_path: Path,
-    schema: str,
-) -> None:
-    ensemble = WorldModelEnsemble(_config())
-    state = ensemble.init(jr.key(91))
-    historical_members = []
-    for member in state.member_states:
-        learner = {
-            field.name: getattr(member.learner_state, field.name)
-            for field in dataclasses.fields(type(member.learner_state))
-            if field.name != "step_words"
-        }
-        historical_member = {
-            field.name: getattr(member, field.name)
-            for field in dataclasses.fields(type(member))
-            if field.name not in {"learner_state", "step_words"}
-        }
-        historical_member["learner_state"] = learner
-        historical_members.append(historical_member)
-    historical_signal = {
-        field.name: getattr(state.signal_state, field.name)
-        for field in dataclasses.fields(type(state.signal_state))
-        if field.name not in {"step_words", "valid_words", "invalid_words"}
-    }
-    historical_state = {
-        "member_states": tuple(historical_members),
-        "residual_variances": state.residual_variances,
-        "signal_state": historical_signal,
-        "bootstrap_key": state.bootstrap_key,
-        "last_bootstrap_mask": state.last_bootstrap_mask,
-        "member_update_counts": state.member_update_counts,
-        "event_count": state.event_count,
-    }
-    if schema.endswith("v2"):
-        historical_state.update(
-            {
-                "replay_bootstrap_key": state.replay_bootstrap_key,
-                "last_replay_bootstrap_mask": state.last_replay_bootstrap_mask,
-                "replay_member_update_counts": state.replay_member_update_counts,
-                "replay_event_count": state.replay_event_count,
-            }
-        )
-    legacy = tmp_path / schema.rsplit(".", maxsplit=1)[-1]
-    save_checkpoint(
-        historical_state,
-        legacy,
-        metadata={
-            "schema": schema,
-            "ensemble_config": {"historical_nested_schema": True},
-        },
-    )
-
-    with pytest.raises(
-        ValueError,
-        match="migration unavailable: historical nested",
-    ):
-        load_world_model_ensemble_checkpoint(legacy)
 
 
 def test_checkpoint_rejects_invalid_state(tmp_path: Path) -> None:

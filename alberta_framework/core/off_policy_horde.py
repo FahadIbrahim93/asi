@@ -18,7 +18,7 @@ import chex
 import jax
 import jax.numpy as jnp
 from jax import Array
-from jaxtyping import Bool, Float, UInt
+from jaxtyping import Float
 
 from alberta_framework.core.multi_head_learner import (
     AnyOptimizer,
@@ -26,10 +26,10 @@ from alberta_framework.core.multi_head_learner import (
     MultiHeadMLPState,
 )
 from alberta_framework.core.normalizers import (
-    AnyNormalizerState,
     EMANormalizerState,
     Normalizer,
     WelfordNormalizerState,
+    _checked_lifetime_words_increment,
     _saturating_int32_counter_increment,
 )
 from alberta_framework.core.optimizers import LMS, Bounder
@@ -64,16 +64,6 @@ class OffPolicyHordeUpdateResult:
             ``[squared_td_error, td_error, rho, clipped_rho, trace_coeff,
             mean_step_size]``.
         trunk_bounding_metric: Scalar metric returned by the bounder.
-        pre_step_words: Exact lifetime identity before the transaction.
-        post_step_words: Exact lifetime identity after the transaction.
-        lifetime_counter_valid: Whether the outer and nested counters were
-            structurally valid and aligned before the transaction.
-        lifetime_capacity_available: Whether all exact word clocks had room.
-        normalizer_counter_aligned: Whether the configured normalizer clock
-            matched the learner clock.
-        normalizer_estimator_capacity_available: Whether the configured
-            estimator could honestly accept another sample.
-        update_applied: Whether the complete learner transaction committed.
     """
 
     state: MultiHeadMLPState
@@ -86,13 +76,6 @@ class OffPolicyHordeUpdateResult:
     trace_coefficients: Float[Array, " n_demons"]
     per_demon_metrics: Float[Array, "n_demons 6"]
     trunk_bounding_metric: Float[Array, ""]
-    pre_step_words: UInt[Array, " 2"]
-    post_step_words: UInt[Array, " 2"]
-    lifetime_counter_valid: Bool[Array, ""]
-    lifetime_capacity_available: Bool[Array, ""]
-    normalizer_counter_aligned: Bool[Array, ""]
-    normalizer_estimator_capacity_available: Bool[Array, ""]
-    update_applied: Bool[Array, ""]
 
 
 @chex.dataclass(frozen=True)
@@ -376,16 +359,8 @@ class OffPolicyHordeLearner:
         rhos: Array,
         discounts: Array,
     ) -> OffPolicyHordeUpdateResult:
-        """Update using explicit ratios and transition discounts.
-
-        The shared learner and configured normalizer form one atomic clock
-        transaction. A validity, alignment, estimator-horizon, or uint64-
-        capacity failure prevents the nested normalizer update and preserves
-        every persistent JAX learning/counter leaf. Host-only timing floats
-        remain outside that bit-exact contract.
-        """
+        """Update using explicit ratios and transition discounts."""
         n_demons = self.n_demons
-        counter_status = self._learner._counter_status(state)
         replacing = self._trace_mode == TraceMode.REPLACING
 
         rhos = jnp.asarray(rhos, dtype=jnp.float32)
@@ -408,25 +383,9 @@ class OffPolicyHordeLearner:
         new_normalizer_state = state.normalizer_state
         if self._normalizer is not None and state.normalizer_state is not None:
             normalizer: Any = self._normalizer
-            normalizer_state = state.normalizer_state
-
-            def update_normalizer(_: None) -> tuple[Array, AnyNormalizerState]:
-                return cast(
-                    tuple[Array, AnyNormalizerState],
-                    normalizer.normalize(normalizer_state, observation),
-                )
-
-            def preserve_normalizer(_: None) -> tuple[Array, AnyNormalizerState]:
-                return (
-                    normalizer.normalize_only(normalizer_state, observation),
-                    normalizer_state,
-                )
-
-            obs, new_normalizer_state = jax.lax.cond(
-                counter_status.update_available,
-                update_normalizer,
-                preserve_normalizer,
-                operand=None,
+            obs, new_normalizer_state = normalizer.normalize(
+                state.normalizer_state,
+                observation,
             )
 
         slope = self._leaky_relu_slope
@@ -680,7 +639,8 @@ class OffPolicyHordeLearner:
             weights=tuple(new_head_weights),
             biases=tuple(new_head_biases),
         )  # type: ignore[call-arg]
-        proposed_state = MultiHeadMLPState(
+        next_step_words, _ = _checked_lifetime_words_increment(state.step_words)
+        new_state = MultiHeadMLPState(
             trunk_params=new_trunk_params,
             head_params=new_head_params,
             trunk_optimizer_states=tuple(new_trunk_opt_states),
@@ -690,15 +650,10 @@ class OffPolicyHordeLearner:
             hidden_unit_utilities=tuple(new_hidden_unit_utilities),
             normalizer_state=new_normalizer_state,
             step_count=_saturating_int32_counter_increment(state.step_count),
-            step_words=counter_status.proposed_step_words,
+            step_words=next_step_words,
             birth_timestamp=state.birth_timestamp,
             uptime_s=state.uptime_s,
         )  # type: ignore[call-arg]
-        new_state = jax.lax.cond(
-            counter_status.update_available,
-            lambda: proposed_state,
-            lambda: state,
-        )
 
         return OffPolicyHordeUpdateResult(
             state=new_state,
@@ -711,19 +666,6 @@ class OffPolicyHordeLearner:
             trace_coefficients=jnp.where(active_mask, trace_coefficients, jnp.nan),
             per_demon_metrics=jnp.stack(per_demon_metrics),
             trunk_bounding_metric=trunk_bounding_metric,
-            pre_step_words=state.step_words,
-            post_step_words=new_state.step_words,
-            lifetime_counter_valid=counter_status.lifetime_counter_valid,
-            lifetime_capacity_available=(
-                counter_status.lifetime_capacity_available
-            ),
-            normalizer_counter_aligned=(
-                counter_status.normalizer_counter_aligned
-            ),
-            normalizer_estimator_capacity_available=(
-                counter_status.normalizer_estimator_capacity_available
-            ),
-            update_applied=counter_status.update_available,
         )  # type: ignore[call-arg]
 
     def to_config(self) -> dict[str, Any]:

@@ -61,13 +61,11 @@ complete published-protocol exactness):
   scan-optimized step, which is pinned by a supplied-noise parity test to the
   audited ``CanonicalUPGD`` ``official_experiment_global`` protecting profile.
 
-The CLI exposes a ``plan`` / ``shard`` / ``merge`` lifecycle modelled on the
-strict v3 IPMNIST lane, at reduced provenance depth (no source-closure or
-runtime-content binding): a plan pins config, learner arms, seeds, and dataset
-digests; each shard runs one learner x seed and binds the plan hash; merge
-validates the exact planned Cartesian product (or records incomplete coverage
-explicitly). Benchmark executions happen through this CLI, never inside
-pytest.
+The CLI exposes a small ``plan`` / ``shard`` / ``merge`` lifecycle: a plan
+pins config, learner arms, seeds, and dataset digests; each shard runs one
+learner x seed and binds the plan hash; merge validates the exact planned
+Cartesian product (or records incomplete coverage explicitly). Benchmark
+executions happen through this CLI, never inside pytest.
 
 **EMA input-conditioning transfer arms** (mechanism-transfer diagnostic from
 the IPMNIST screening campaign; factories imported from
@@ -119,10 +117,10 @@ from alberta_framework.benchmarks.upgd_ipmnist import (
     _LEARNER_FACTORIES,
     IPMNISTConfig,
     LearnerInitFn,
+    atomic_write_new_json,
     init_mlp_params,
     task_index_for_step,
 )
-from alberta_framework.benchmarks.upgd_ipmnist_v3 import atomic_write_new_json
 
 logger = logging.getLogger(__name__)
 

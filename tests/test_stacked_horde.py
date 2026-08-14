@@ -8,7 +8,7 @@ demon axis is a stacked array axis, so program size is constant in
 ``n_demons`` and 1024 demons run a 2000-step scan in well under a second
 after compile (the loop-unrolled hordes measured ~14 steps/s = ~140 s for
 the same workload, with a ~144 s compile; see the scaling notes in
-CONTINUAL_LEARNING_EVIDENCE.md).
+docs/evidence/methodology.md).
 """
 
 import time

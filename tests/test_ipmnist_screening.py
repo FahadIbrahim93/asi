@@ -3249,7 +3249,7 @@ class TestComparisonArms:
 
 
 class TestNaiveBayes:
-    """V3 (NEW_DIRECTIONS.md): streaming class-conditional diagonal Gaussians.
+    """V3 validation: streaming class-conditional diagonal Gaussians.
 
     No gradients, no MLP — prediction is the argmax class posterior under
     annealed fast-EMA per-class feature statistics (equation parity with

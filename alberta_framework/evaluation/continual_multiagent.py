@@ -122,7 +122,7 @@ class AcceptanceThresholds:
     """Frozen thresholds for the multi-seed acceptance decision.
 
     Values were calibrated on development seeds 0--29 and frozen before the
-    single promoted run on held-out seeds 30--59 (see RESEARCH_STATUS.md);
+    single promoted run on held-out seeds 30--59 (see docs/status.md);
     ``evidence_seed_start=30`` with ``minimum_seed_count=30`` pins exactly
     that consumed schedule.  The uplift thresholds gate the bootstrap
     interval's *lower* bound, not the point estimate.  Retuning any value

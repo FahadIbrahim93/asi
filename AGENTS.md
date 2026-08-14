@@ -8,71 +8,47 @@ and the canonical upstream URL. The robot track imports the continual-RL
 subset in-process; keep `requires-python >= 3.12` and the `numpy >= 1.26`
 floor intact.
 
-**Current headline lane:** the IPMNIST screening/confirmation campaign —
-development-grade and permanently nonpromoting. Best stored development
-means at 200 tasks, n=20 (seeds 0–19): `rls_head_resid_l1_preset005`
-**0.87114** ± 0.00010 (RLS-residual-trained body — the standing record) and
-`sigma0_shiftnorm_d099` **0.86449** ± 0.00009 (the incumbent A/B baseline;
-paired diff +0.00665, all 20 seeds improve). Protocol-pure best remains
-`adamw_cbp_r3e4` 0.80126, vs the 0.7791 published-config UPGD-W
-reproduction. These move — read `summary_*.json` and
-`publication_runs/RESULTS.md` under `outputs/ipmnist_screening/` rather than
-this line, and re-measure the baseline yourself before any A/B.
-Theory of record: `CONTINUAL_LEARNING_THEORY.md`; forward plan:
-`RESEARCH_REPORT_AGE_OF_EXPERIENCE.md`; raw record + audit:
-`outputs/ipmnist_screening/`. Second active lane: the Forager matched-v3
-campaign (`FORAGER_MATCHED_V3_RUNBOOK.md`, unissued). Negative and bounded
-conclusions live in `NEGATIVE_RESULTS_LEDGER.md` — check it before re-trying
-an idea.
+**Current headline lane:** the IPMNIST screening/confirmation campaign,
+which is development-grade and permanently nonpromoting. Results move; read
+the `summary_*.json` files and `publication_runs/RESULTS.md` under
+`outputs/ipmnist_screening/` instead of copying numbers into overview docs,
+and re-measure the selected baseline before any A/B. The theory snapshot is
+`docs/research/ipmnist-theory.md`; raw records and audits live beside the
+outputs. Check `docs/evidence/negative-results.md` before retrying an idea.
 
 ## Layout
 
 ```
 alberta_framework/
-  core/        ~100 modules: learners, optimizers (IDBD/Autostep/SwiftTD/
-               UPGD), Horde + stacked_horde, SARSA/actor-critic, average-
-               reward control, world models, dreaming, options/STOMP/OaK,
-               PrototypeAgent, state_builder, learning_signals,
-               experiential/consolidated memory, delight/Kondo,
-               feature lifecycles, embodied_safety_envelope,
-               hidden-partner substrates
+  core/        learners and adaptive optimizers, Horde, prediction/control,
+               learned state, memory, world models, dreaming,
+               options/STOMP/OaK, feature lifecycles, and PrototypeAgent
   streams/     synthetic prediction streams + gauntlet, closed_loop,
-               opponent, matrix_game, pavlovian, hidden_partner_mapping,
-               hidden_regime_signaling, recurring_multiagent
+               pavlovian, recurring_multiagent
   evaluation/  strict evidence artifacts, validators, the evidence registry,
-               evaluation CLIs (~98 modules; many are development lanes)
-  benchmarks/  IPMNIST lanes (upgd_ipmnist, upgd_ipmnist_v3,
-               ipmnist_screening, upgd_label_emnist), forager family
-               (official_foragax, matched-current + matched-v3 campaign
-               machinery, foragax_open_screen), slowly_changing_regression
+               evidence CLIs, and bounded development diagnostics
+  benchmarks/  IPMNIST lanes (upgd_ipmnist, ipmnist_screening,
+               upgd_label_emnist), Forager integrations
   utils/       multi-seed experiments, statistics, metrics, export
   steps/       public Step 1–12 kernels: smoke CLIs for Steps 1–2,
                pipeline.py consumes Steps 3–4, Steps 5–12 are
-               library-surface only (cited by RESEARCH_STATUS's matrix)
+               library-surface only (cited by docs/status.md)
 outputs/       evidence + campaign artifacts — see immutability rules below
-tests/         ~450 test files (run `pytest --collect-only -q` for the
-               current count; it grows weekly)
+tests/         unit, integration, scientific, and replay checks
 ```
 
 Key documents:
 
-- Status & evidence: `RESEARCH_STATUS.md` (levels L0–L3, completion gates) ·
-  `CONTINUAL_LEARNING_EVIDENCE.md` (property-by-property map)
-- Active campaign: `CONTINUAL_LEARNING_THEORY.md` ·
-  `RESEARCH_REPORT_AGE_OF_EXPERIENCE.md` ·
+- Status & evidence: `docs/status.md` (levels L0–L3, completion gates) ·
+  `docs/evidence/methodology.md` (property-by-property map)
+- Active campaign: `docs/research/ipmnist-theory.md` ·
   `outputs/ipmnist_screening/{RUNBOOK,FINAL_REPORT,AUDIT,CEILING_ANALYSIS,SOTA_LANDSCAPE_2026}.md`
-- Roadmap: `CONTINUAL_AGENT_IMPLEMENTATION_PLAN.md` (WP0–WP9, live — cited
-  from source docstrings) · `CONTINUAL_DYAD_BENCHMARK.md` (staged,
-  nonexecuting HCCL causal-core/HCCL-v1 design)
-- Frozen records: `CONTINUAL_AGENT_RESEARCH.md` (2026-07-30 audit snapshot) ·
-  `FORAGER_COMPARATOR_AUDIT.md` · `FORAGER_ALBERTA_CANDIDATE_AUDIT.md` ·
-  `RTU_TAYLOR_CORRECTION.md` · `NEGATIVE_RESULTS_LEDGER.md` ·
-  `PRUNING_REPORT.md`
-- Runbooks: `UPGD_IPMNIST_V3_RUNBOOK.md` · `FORAGER_MATCHED_V3_RUNBOOK.md` ·
-  `CONTINUAL_IA_V2_RUNBOOK.md` · `OPMNIST_DEVELOPMENT_INGESTION.md` ·
-  `FORAGAX_OPEN_DEVELOPMENT_SCREEN.md`
+- Durable records: `docs/archive/forager-comparator-audit.md` ·
+  `docs/design/rtu-taylor-correction.md` ·
+  `docs/evidence/negative-results.md`
+- Runbook: `docs/runbooks/foragax-open-screen.md`
 - Benchmarks/infra: `FORAGER_BENCHMARK.md` ·
-  `HISTORICAL_FORAGER_RECONSTRUCTED.md` · `VENDORING.md` · `CHANGELOG.md`
+  `docs/archive/historical-forager-reconstruction.md` · `VENDORING.md` · `CHANGELOG.md`
 
 `README.md` is the index; if you add a root doc, link it there.
 
@@ -81,17 +57,16 @@ Key documents:
 Always use the project venv:
 
 ```bash
-.venv/bin/python -m pytest tests/<file> -q -o addopts=""   # one file
-.venv/bin/python -m pytest tests -q -o addopts=""          # full suite
+.venv/bin/python -m pytest tests/<file> -q                  # one file
+.venv/bin/python -m pytest tests -q                         # full suite
 .venv/bin/python -m pytest --collect-only -q | tail -1     # count of record
 .venv/bin/python -m ruff check .                           # lint (line length 100)
 .venv/bin/python -m mypy                                   # strict, py312
 .venv/bin/alberta-evidence-status                          # evidence registry
 ```
 
-`addopts` defaults to `-v`; override with `-o addopts=""` for quiet runs.
-There are 18 console scripts — see `[project.scripts]` in `pyproject.toml`;
-the ones you'll reach for are `alberta-evidence-status`,
+See `[project.scripts]` in `pyproject.toml` for the current console-script
+inventory. The ones you'll reach for are `alberta-evidence-status`,
 `alberta-forager-benchmark`, `alberta-foragax-open-screen`, and the
 `alberta-forager-matched-*` family. Benchmark executions happen through
 scripts/CLIs, never inside pytest — tests must stay CI-cheap unless
@@ -103,10 +78,6 @@ explicitly registered as a scientific lane.
 - `integration` — spans components, persistence, or process/CLI boundaries.
 - `scientific` — frozen promoted-evidence protocols; may be expensive and
   require preregistered seeds.
-- `development` — calibration/exploratory protocols; must never promote
-  scientific claims.
-- `replication` — historical Step 1/2 replays; skip without upstream
-  artifacts.
 - `slow` — wall-clock heavy modules (>~30s serial); excluded from the fast
   per-PR CI lane (`-m "not slow"`).
 
@@ -132,10 +103,9 @@ explicitly registered as a scientific lane.
 - **Registered source hashes are load-bearing.** Editing a registered source
   file invalidates persisted evidence until the frozen protocol is rerun; the
   registry reports `invalid` (exit 2) — that is working-as-designed, not a
-  bug to silence. The 5-claim registry in
-  `evaluation/evidence_manifest.py` registers 21 files; two development
-  lanes hash 6 more (see `PRUNING_REPORT.md` for the full do-not-touch
-  list). Check which files a claim registers before touching them.
+  bug to silence. Read `evaluation/evidence_manifest.py` for the current
+  five-claim source inventory, and inspect each development lane's own source
+  manifest before touching it. Counts in narrative docs are not authoritative.
 - Thresholds are calibrated empirically on development data with ≥2x margins,
   then frozen. Retuning a threshold after seeing held-out results is
   disallowed (a failed gate stays a valid rejection).
@@ -146,12 +116,12 @@ explicitly registered as a scientific lane.
 
 `alberta-evidence-status` exits `0` (all accepted), `1` (valid rejection or
 missing), `2` (invalid). Each claim's CLI is also
-`python -m alberta_framework.evaluation.<module>`.
+`.venv/bin/python -m alberta_framework.evaluation.<module>`.
 
-**Live status (2026-08-02): all five claims `invalid` (exit 2)** because
-registered source files were edited after the artifacts were pinned — the
-fail-closed design working as intended (a dirty worktree alone forces
-`invalid`). The frozen outcomes recorded in the pinned artifacts:
+Run the command for live status. A claim becomes `invalid` when its registered
+source bytes no longer match the pinned artifact; unrelated dirty-worktree
+changes alone are not a registered-source mismatch. The frozen outcomes
+recorded in the pinned artifacts are:
 
 | Claim | Frozen artifact outcome | Artifact | CLI |
 |---|---|---|---|
@@ -168,11 +138,7 @@ narrow and honest.
 
 - `FORAGER_BENCHMARK.md` is hashed into Forager run provenance
   (`forager_cli._source_tree_sha256`) — edits change benchmark receipts.
-- README/CHANGELOG/RESEARCH_STATUS/CONTINUAL_LEARNING_EVIDENCE/
-  FORAGER_BENCHMARK/HISTORICAL_FORAGER_RECONSTRUCTED ship in the sdist
-  (`pyproject.toml`) with byte-equality tests.
-- `CONTINUAL_AGENT_IMPLEMENTATION_PLAN.md` section numbers are cited from
-  source docstrings (delight.py, learning_signals.py, …).
+- `README.md`, `CHANGELOG.md`, and `FORAGER_BENCHMARK.md` ship in the sdist.
 - The CHANGELOG version heading is asserted by `test_release_metadata.py`.
 - The robot track imports `core/{actor_critic,continual_backprop,
   initializers,normalizers,optimizers,sarsa}` via `import

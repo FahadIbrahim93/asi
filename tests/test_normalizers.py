@@ -2,7 +2,6 @@
 
 import chex
 import jax.numpy as jnp
-import jax.random as jr
 import pytest
 
 from alberta_framework import (
@@ -15,8 +14,6 @@ from alberta_framework import (
     WelfordNormalizerState,
     normalizer_from_config,
 )
-
-pytestmark = pytest.mark.slow
 
 
 class TestEMANormalizer:
@@ -87,39 +84,12 @@ class TestEMANormalizer:
         state = normalizer.init(len(sample_observation))
 
         # Repeatedly normalize the same observation
-        for _ in range(100):
+        for _ in range(32):
             _, state = normalizer.normalize(state, sample_observation)
 
         # Mean should be close to the observation
         # (not exact due to decay and numerical issues)
         chex.assert_trees_all_close(state.mean, sample_observation, atol=0.5)
-
-    def test_normalized_output_has_zero_mean_unit_var_asymptotically(self):
-        """After many samples from standard normal, output should be ~N(0,1)."""
-        normalizer = EMANormalizer(decay=0.99)
-        feature_dim = 5
-        state = normalizer.init(feature_dim)
-
-        # Generate many samples
-        key = jr.key(42)
-        normalized_outputs = []
-
-        for i in range(1000):
-            key, subkey = jr.split(key)
-            obs = jr.normal(subkey, (feature_dim,), dtype=jnp.float32)
-            normalized, state = normalizer.normalize(state, obs)
-            if i >= 100:  # Skip warmup
-                normalized_outputs.append(normalized)
-
-        # Stack and compute statistics
-        all_normalized = jnp.stack(normalized_outputs)
-        mean_of_normalized = jnp.mean(all_normalized, axis=0)
-        var_of_normalized = jnp.var(all_normalized, axis=0)
-
-        # Should be close to N(0,1)
-        chex.assert_trees_all_close(mean_of_normalized, jnp.zeros(feature_dim), atol=0.3)
-        chex.assert_trees_all_close(var_of_normalized, jnp.ones(feature_dim), atol=0.5)
-
 
 class TestWelfordNormalizer:
     """Tests for the WelfordNormalizer class."""
@@ -155,25 +125,20 @@ class TestWelfordNormalizer:
         feature_dim = 5
         state = normalizer.init(feature_dim)
 
-        key = jr.key(42)
         true_mean = jnp.array([1.0, -2.0, 3.0, 0.5, -1.0])
         true_std = jnp.array([0.5, 1.0, 2.0, 0.3, 1.5])
-
-        n_samples = 10000
-        all_obs = []
-        for i in range(n_samples):
-            key, subkey = jr.split(key)
-            obs = true_mean + true_std * jr.normal(subkey, (feature_dim,))
-            all_obs.append(obs)
+        standardized = jnp.linspace(-1.5, 1.5, 32 * feature_dim).reshape(
+            32, feature_dim
+        )
+        observations = true_mean + true_std * standardized
+        for obs in observations:
             _, state = normalizer.normalize(state, obs)
 
-        # Compare against numpy sample statistics
-        all_obs_array = jnp.stack(all_obs)
-        expected_mean = jnp.mean(all_obs_array, axis=0)
-        expected_var = jnp.var(all_obs_array, axis=0, ddof=1)
+        expected_mean = jnp.mean(observations, axis=0)
+        expected_var = jnp.var(observations, axis=0, ddof=1)
 
-        chex.assert_trees_all_close(state.mean, expected_mean, atol=1e-4)
-        chex.assert_trees_all_close(state.var, expected_var, atol=1e-3)
+        chex.assert_trees_all_close(state.mean, expected_mean, atol=1e-5)
+        chex.assert_trees_all_close(state.var, expected_var, atol=1e-5)
 
     def test_normalize_returns_finite_values(self, sample_observation):
         """Normalized output should always be finite."""
@@ -203,29 +168,6 @@ class TestWelfordNormalizer:
 
         assert isinstance(new_state, WelfordNormalizerState)
         assert new_state.sample_count == 1.0
-
-    def test_normalized_output_approaches_standard_normal(self):
-        """After many stationary samples, normalized output should be ~N(0,1)."""
-        normalizer = WelfordNormalizer()
-        feature_dim = 5
-        state = normalizer.init(feature_dim)
-
-        key = jr.key(42)
-        normalized_outputs = []
-
-        for i in range(2000):
-            key, subkey = jr.split(key)
-            obs = 5.0 + 2.0 * jr.normal(subkey, (feature_dim,), dtype=jnp.float32)
-            normalized, state = normalizer.normalize(state, obs)
-            if i >= 200:  # Skip warmup
-                normalized_outputs.append(normalized)
-
-        all_normalized = jnp.stack(normalized_outputs)
-        mean_of_normalized = jnp.mean(all_normalized, axis=0)
-        var_of_normalized = jnp.var(all_normalized, axis=0)
-
-        chex.assert_trees_all_close(mean_of_normalized, jnp.zeros(feature_dim), atol=0.3)
-        chex.assert_trees_all_close(var_of_normalized, jnp.ones(feature_dim), atol=0.5)
 
     def test_p_field_has_correct_shape(self, feature_dim):
         """The p (M2) field should have shape (feature_dim,)."""

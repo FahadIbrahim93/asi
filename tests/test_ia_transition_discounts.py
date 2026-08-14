@@ -19,11 +19,6 @@ from alberta_framework.core.intelligence_amplification import (
 )
 from alberta_framework.core.oak import OaKConfig
 from alberta_framework.core.options import STOMPConfig, SubtaskSpec
-from alberta_framework.core.prototype_agent import (
-    PrototypeAgent,
-    PrototypeAgentConfig,
-    PrototypeTransition,
-)
 
 OBS = jnp.array([1.0, 0.0], dtype=jnp.float32)
 REWARD = jnp.array(1.7, dtype=jnp.float32)
@@ -246,86 +241,6 @@ def test_checked_partner_action_accepts_closed_over_action_under_cond() -> None:
 
     assert int(executed) == EXECUTED_ACTION
     assert bool(valid)
-
-
-@pytest.mark.parametrize(("discount", "expected_discount"), [(0.0, 0.0), (0.4, 0.4)])
-def test_prototype_explicit_transition_routes_discount_to_ia(
-    discount: float,
-    expected_discount: float,
-) -> None:
-    """Prototype forwards continuation separately from the dispatched action."""
-    agent = PrototypeAgent(PrototypeAgentConfig(oak=_oak_config(), ia=_ia_config()))
-    state = agent.start(agent.init(jr.key(2)), OBS)
-    main_stomp = state.oak_state.stomp_state.replace(
-        base_last_obs=OBS,
-        base_last_action=jnp.array(EXECUTED_ACTION, dtype=jnp.int32),
-        last_primitive_action=jnp.array(EXECUTED_ACTION, dtype=jnp.int32),
-    )
-    state = state.replace(
-        oak_state=state.oak_state.replace(stomp_state=main_stomp),
-        ia_state=_prepare_ia_state(state.ia_state),
-        current_action=jnp.array(EXECUTED_ACTION, dtype=jnp.int32),
-    )
-
-    result = agent.update_transition(
-        state,
-        PrototypeTransition(
-            observation=state.current_raw_observation,
-            action=state.current_action,
-            decision_id=state.current_decision_id,
-            reward=REWARD,
-            discount=jnp.array(discount, dtype=jnp.float32),
-            terminated=jnp.array(discount == 0.0),
-            truncated=jnp.array(False),
-            next_observation=OBS,
-            next_decision_observation=OBS,
-        ),
-    )
-
-    expected_td = _expected_td(expected_discount)
-    np.testing.assert_allclose(
-        _head_weight(result.state.ia_state, EXECUTED_ACTION),
-        EXECUTED_Q + BASE_STEP_SIZE * expected_td,
-        rtol=1e-6,
-        atol=1e-6,
-    )
-    np.testing.assert_allclose(
-        _head_weight(result.state.ia_state, IA_OWN_ACTION),
-        NEXT_MAX_Q,
-        rtol=0.0,
-        atol=0.0,
-    )
-
-
-def test_prototype_legacy_update_keeps_ia_legacy_bootstrap() -> None:
-    agent = PrototypeAgent(PrototypeAgentConfig(oak=_oak_config(), ia=_ia_config()))
-    state = agent.start(agent.init(jr.key(3)), OBS)
-    state = state.replace(
-        oak_state=state.oak_state.replace(
-            stomp_state=state.oak_state.stomp_state.replace(
-                base_last_obs=OBS,
-                base_last_action=jnp.array(EXECUTED_ACTION, dtype=jnp.int32),
-                last_primitive_action=jnp.array(EXECUTED_ACTION, dtype=jnp.int32),
-            )
-        ),
-        ia_state=_prepare_ia_state(state.ia_state),
-    )
-
-    result = agent.update(state, REWARD, OBS)
-
-    expected_td = _expected_td(1.0)
-    np.testing.assert_allclose(
-        _head_weight(result.state.ia_state, EXECUTED_ACTION),
-        EXECUTED_Q + BASE_STEP_SIZE * expected_td,
-        rtol=1e-6,
-        atol=1e-6,
-    )
-    np.testing.assert_allclose(
-        _head_weight(result.state.ia_state, IA_OWN_ACTION),
-        NEXT_MAX_Q,
-        rtol=0.0,
-        atol=0.0,
-    )
 
 
 def test_discounted_scan_matches_loop_and_jit() -> None:

@@ -9,7 +9,7 @@ This module packages the stable Step 3 surface for downstream use:
 
 It intentionally does not claim general TD/GVF feature-discovery closure.
 Research-scale evidence and open boundaries for Step 3 are tracked in
-``RESEARCH_STATUS.md``.
+``docs/status.md``.
 """
 
 from __future__ import annotations

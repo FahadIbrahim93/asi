@@ -2977,9 +2977,9 @@ def subtasks_from_feature_scores(
     """Create SubtaskSpecs for the top-K highest-scoring features.
 
     This is the auto-discovery pathway for Step 10 STOMP: instead of
-    hand-specifying subtasks, caller computes a per-feature relevance score
-    (e.g. from ``compute_feature_relevance``) and this function converts the
-    top-ranked features into ``SubtaskSpec`` objects.
+    hand-specifying subtasks, the caller supplies per-feature relevance scores
+    and this function converts the top-ranked features into ``SubtaskSpec``
+    objects.
 
     The feature scores may come from any source:
     - ``jnp.sum(relevance.weight_relevance, axis=0)`` for path-norm relevance
@@ -3004,13 +3004,6 @@ def subtasks_from_feature_scores(
         descending feature score. May be shorter than ``top_k`` if fewer
         features exceed ``min_score``.
 
-    Example:
-        Build subtasks from a HordeLearner's weight relevance::
-
-            relevance = compute_feature_relevance(horde_state.learner_state)
-            agg_scores = jnp.sum(relevance.weight_relevance, axis=0)
-            specs = subtasks_from_feature_scores(agg_scores, top_k=3)
-            stomp_config = Step10STOMPConfig(subtask_specs=tuple(specs), ...)
     """
     import numpy as _np
 

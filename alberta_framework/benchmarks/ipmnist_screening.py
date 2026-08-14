@@ -155,8 +155,10 @@ from alberta_framework.benchmarks.upgd_ipmnist import (
     LearnerStepFn,
     _make_adamw_learner,
     _make_upgd_w_learner,
+    _preflight_new_output,
     _sorted_param_shapes,
     _split_flat_noise,
+    atomic_write_new,
     build_schedule,
     cross_entropy_loss,
     default_openml_data_home,
@@ -164,10 +166,6 @@ from alberta_framework.benchmarks.upgd_ipmnist import (
     lean_upgd_w_update,
     load_mnist_train,
     mlp_logits,
-)
-from alberta_framework.benchmarks.upgd_ipmnist_v3 import (
-    _preflight_new_output,
-    atomic_write_new,
 )
 from alberta_framework.evaluation.recurring_ipmnist_retention import (
     RecurringIPMNISTPhase,
@@ -3263,7 +3261,7 @@ def naive_bayes_logits(state: NaiveBayesState, x: Array) -> Array:
 def _make_naive_bayes_learner(
     hp: Mapping[str, float],
 ) -> tuple[LearnerInitFn, ScreeningStepFn]:
-    """V3 of NEW_DIRECTIONS.md: streaming generative classifier, no gradients.
+    """V3 development validation: streaming generative classifier, no gradients.
 
     Direction (B) made protocol-exact: online class-conditional diagonal
     Gaussians with the campaign's own annealed fast-EMA statistics. Per
@@ -5747,7 +5745,7 @@ def _build_registry() -> dict[str, ScreeningSpec]:
             ),
         )
     )
-    # --- NEW_DIRECTIONS.md V3: streaming generative classifier (no network).
+    # --- V3 development validation: streaming generative classifier (no network).
     specs.append(
         ScreeningSpec(
             name="naive_bayes",
@@ -5764,7 +5762,7 @@ def _build_registry() -> dict[str, ScreeningSpec]:
             factory=_make_naive_bayes_learner,
             frozen_probe_input=_naive_bayes_frozen_probe_input,
             description=(
-                "Streaming naive Bayes (NEW_DIRECTIONS.md V3): online "
+                "Streaming naive Bayes (V3 development validation): online "
                 "class-conditional diagonal Gaussians with annealed "
                 "fast-EMA statistics, prediction = argmax posterior; no "
                 "gradients, no MLP. nb_decay 0.98 / var floor 0.1 from the "

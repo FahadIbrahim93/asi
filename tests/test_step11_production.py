@@ -79,12 +79,6 @@ def _setup(
 # ---------------------------------------------------------------------------
 
 
-def test_oak_config_no_subtasks_raises() -> None:
-    stomp = STOMPConfig(subtask_specs=())
-    with pytest.raises(ValueError, match="subtask"):
-        OaKConfig(stomp=stomp)
-
-
 def test_oak_config_invalid_ema_decay_raises() -> None:
     stomp = STOMPConfig(subtask_specs=(_SPEC0,))
     with pytest.raises(ValueError, match="utility_ema_decay"):

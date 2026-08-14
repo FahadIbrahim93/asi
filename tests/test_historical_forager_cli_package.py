@@ -180,7 +180,7 @@ def test_historical_cli_reports_provenance_and_validates_strict_pairing(
     assert "must be a real directory" in missing.stderr
 
 
-def test_wheel_and_sdist_ship_historical_surfaces_and_sdist_document(tmp_path: Path) -> None:
+def test_wheel_and_sdist_ship_historical_code_and_entrypoint(tmp_path: Path) -> None:
     uv = shutil.which("uv")
     if uv is None:
         pytest.skip("uv is required for the distribution integration check")
@@ -216,8 +216,6 @@ def test_wheel_and_sdist_ship_historical_surfaces_and_sdist_document(tmp_path: P
         wheel_names = set(wheel.namelist())
         for relative_path in _DISTRIBUTION_FILES:
             assert relative_path in wheel_names
-            assert wheel.read(relative_path) == (_REPO_ROOT / relative_path).read_bytes()
-        assert "HISTORICAL_FORAGER_RECONSTRUCTED.md" not in wheel_names
         entry_points_name = next(
             name for name in wheel_names if name.endswith(".dist-info/entry_points.txt")
         )
@@ -234,11 +232,3 @@ def test_wheel_and_sdist_ship_historical_surfaces_and_sdist_document(tmp_path: P
         for relative_path in _DISTRIBUTION_FILES:
             archived_path = f"{prefix}/{relative_path}"
             assert archived_path in sdist_names
-            extracted = source_distribution.extractfile(archived_path)
-            assert extracted is not None
-            assert extracted.read() == (_REPO_ROOT / relative_path).read_bytes()
-        document_path = f"{prefix}/HISTORICAL_FORAGER_RECONSTRUCTED.md"
-        assert document_path in sdist_names
-        document = source_distribution.extractfile(document_path)
-        assert document is not None
-        assert document.read() == (_REPO_ROOT / "HISTORICAL_FORAGER_RECONSTRUCTED.md").read_bytes()

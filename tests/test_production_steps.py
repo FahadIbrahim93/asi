@@ -230,4 +230,3 @@ def test_documented_cli_scripts_are_packaged() -> None:
 
     assert scripts["alberta-step1-smoke"] == "alberta_framework.cli:step1_smoke_main"
     assert scripts["alberta-step2-smoke"] == "alberta_framework.cli:step2_smoke_main"
-    assert scripts["alberta-evidence-gate"] == "alberta_framework.cli:evidence_gate_main"

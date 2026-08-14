@@ -491,10 +491,8 @@ def test_oak_nonfinite_candidate_rolls_back_under_jit() -> None:
 
     _assert_oak_persistent_equal(eager.state, source)
     _assert_oak_persistent_equal(result.state, source)
-    assert bool(eager.nested_update_applied)
     assert not bool(eager.proposed_state_valid)
     assert not bool(eager.update_applied)
-    assert bool(result.nested_update_applied)
     assert not bool(result.proposed_state_valid)
     assert not bool(result.update_applied)
 

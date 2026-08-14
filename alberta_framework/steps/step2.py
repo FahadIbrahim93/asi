@@ -10,11 +10,9 @@ matrix.
 
 For retained class-view memory, Step 2 also exposes a JAX fixed-budget
 prototype memory and a packaged UPGD-memory learner that updates both the
-differentiable UPGD path and the memory path every step.  The prototype
-memory is distilled from the D20 multi-prototype development lane of the
-online permuted-MNIST (OPMNIST) protocol from the loss-of-plasticity
-literature (Dohare et al. 2024); see the README's "Online Permuted MNIST"
-section and ``tests/test_d20_multiprototype_opmnist.py``.
+differentiable UPGD path and the memory path every step. Their current
+contracts are exercised in ``tests/test_prototype_memory.py`` and
+``tests/test_upgd_memory.py``.
 """
 
 from __future__ import annotations
@@ -603,10 +601,9 @@ def run_step2_associative_smoke(
     """Run a deterministic associative-memory integration probe.
 
     This is a package-quality smoke test for the sequence-memory path, not a
-    replacement for the external sparse key-value recall probes that promoted
-    the ``token_suffix_pair`` feature family (gate tests:
-    ``tests/test_step2_associative_evidence_gate.py``).  It repeats a small
-    set of contexts so a healthy associative table should lower NLL over time.
+    replacement for the external sparse key-value recall protocols, which are
+    not shipped in this fork. It repeats a small set of contexts so a healthy
+    associative table should lower NLL over time.
     """
     cfg = config or Step2AssociativeConfig()
     if steps < 2:

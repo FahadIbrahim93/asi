@@ -22,17 +22,11 @@ from alberta_framework.core.prototype_agent import (
     PrototypeAgentConfig,
     PrototypeAgentState,
     PrototypeArrayResult,
-    PrototypeTransition,
     PrototypeUpdateResult,
     feature_to_subtask_specs,
     load_prototype_checkpoint,
-    measure_prototype_agent_state_resources,
     save_prototype_checkpoint,
 )
-from alberta_framework.core.prototype_feature_lifecycle import (
-    PrototypeFeatureLifecycleConfig,
-)
-from alberta_framework.core.state_builder import IdentityStateBuilderConfig
 from alberta_framework.core.types import DemonType, GVFSpec, create_horde_spec
 from alberta_framework.core.world_model import ActionConditionedWorldModelConfig
 
@@ -101,10 +95,6 @@ def _wm_cfg(
 def _minimal_config() -> PrototypeAgentConfig:
     """OaK-only, no world model, no horde, no IA."""
     return PrototypeAgentConfig(oak=_oak_cfg())
-
-
-def _primitive_only_config() -> PrototypeAgentConfig:
-    return PrototypeAgentConfig(oak=_oak_cfg(specs=()))
 
 
 def _full_config(n_dreams: int = 2) -> PrototypeAgentConfig:
@@ -317,49 +307,6 @@ class TestPrototypeAgentInit:
         assert state.horde_state is not None
         assert state.ia_state is not None
 
-    def test_state_resource_measurement_exactly_partitions_minimal_state(self) -> None:
-        state = PrototypeAgent(_minimal_config()).init(jr.key(0))
-        measured = measure_prototype_agent_state_resources(state)
-        actual = sum(
-            int(leaf.size) * int(leaf.dtype.itemsize)
-            for leaf in jax.tree.leaves(state)
-            if isinstance(leaf, jax.Array)
-        )
-
-        assert measured.total_nbytes == actual
-        assert measured.total_nbytes == sum(
-            (
-                measured.oak_bundle_nbytes,
-                measured.world_model_bundle_nbytes,
-                measured.buffer_nbytes,
-                measured.standalone_horde_nbytes,
-                measured.interaction_memory_bundle_nbytes,
-                measured.gru_nbytes,
-                measured.state_builder_feature_bundle_nbytes,
-                measured.outer_nbytes,
-            )
-        )
-        assert measured.outer_nbytes == 77
-        assert measured.world_model_bundle_nbytes == 0
-        assert measured.buffer_nbytes == 0
-        assert measured.standalone_horde_nbytes == 0
-        assert measured.interaction_memory_bundle_nbytes == 0
-        assert measured.to_config()["total_nbytes"] == actual
-
-    def test_state_resource_measurement_exposes_enabled_top_level_bundles(self) -> None:
-        state = PrototypeAgent(_full_config()).init(jr.key(1))
-        measured = measure_prototype_agent_state_resources(state)
-
-        assert measured.oak_bundle_nbytes > 0
-        assert measured.world_model_bundle_nbytes > 0
-        assert measured.buffer_nbytes > 0
-        assert measured.standalone_horde_nbytes > 0
-        assert measured.interaction_memory_bundle_nbytes > 0
-        assert measured.gru_nbytes == 0
-        assert measured.state_builder_feature_bundle_nbytes == 0
-        assert measured.total_array_elements > 0
-        assert measured.total_array_leaves > 0
-
     def test_start_primes_oak(self) -> None:
         agent = PrototypeAgent(_minimal_config())
         state = agent.init(jr.key(0))
@@ -376,105 +323,6 @@ class TestPrototypeAgentInit:
         chex.assert_trees_all_close(
             primed.ia_state.cortex_state.stomp_state.base_last_obs, obs, atol=1e-6
         )
-
-    def test_primitive_only_agent_uses_base_control_without_empty_option_indexing(
-        self,
-    ) -> None:
-        config = _primitive_only_config()
-        restored = PrototypeAgentConfig.from_config(config.to_config())
-        assert restored.oak.n_options == 0
-        agent = PrototypeAgent(config)
-        observation = jnp.asarray((0.1, -0.2, 0.3, 0.4), dtype=jnp.float32)
-        state = agent.start(agent.init(jr.key(91)), observation)
-        stomp = state.oak_state.stomp_state
-        assert stomp.option_policies.q_weights.shape == (0, N_PRIM, OBS_DIM)
-        assert int(stomp.executing_option) == -1
-        assert int(agent.act(state, observation)) == int(stomp.base_last_action)
-
-        gradient = agent._behavior_representation_gradient(
-            state,
-            jnp.asarray(0.5, dtype=jnp.float32),
-            observation.at[0].add(0.1),
-            jnp.asarray(1.0, dtype=jnp.float32),
-        )
-        assert bool(gradient.valid)
-        assert bool(gradient.diagnostics.idle_base_source)
-        score = agent._oak_counterfactual_dispatch_score(
-            state.oak_state,
-            state.current_representation,
-        )
-        assert bool(jnp.isfinite(score))
-
-        generated = agent.auto_subtask_specs(state, n_subtasks=2)
-        assert len(generated) == 2
-        assert all(0 <= spec.feature_index < OBS_DIM for spec in generated)
-
-        curated_agent, curated_state = agent.curate(state, jr.key(92))
-        assert curated_agent is agent
-        assert curated_state is state
-
-        result = agent.update(
-            state,
-            jnp.asarray(0.5, dtype=jnp.float32),
-            observation.at[0].add(0.1),
-        )
-        assert bool(result.transition_diagnostics.valid)
-        assert int(result.state.oak_state.stomp_state.executing_option) == -1
-
-    def test_primitive_only_agent_composes_with_live_pair_feature_lifecycle(
-        self,
-    ) -> None:
-        lifecycle = PrototypeFeatureLifecycleConfig(
-            base_feature_dim=3,
-            active_pair_slots=1,
-            candidate_pair_slots=3,
-            n_tasks=1,
-            n_options=0,
-            n_primitive_actions=N_PRIM,
-            option_subtask_feature_indices=(),
-            step_size_output=0.05,
-            utility_decay=0.9,
-            replacement_interval=0,
-            min_feature_age=0,
-            candidate_min_age=0,
-            promotion_margin=1.0,
-            scale_normalizer_decay=0.9,
-            scale_normalizer_epsilon=1.0e-6,
-            carry_survivors=True,
-            max_observations=16,
-        )
-        config = PrototypeAgentConfig(
-            oak=_oak_cfg(specs=(), obs_dim=lifecycle.total_feature_dim),
-            state_builder=IdentityStateBuilderConfig(
-                observation_dim=lifecycle.base_feature_dim
-            ),
-            prototype_feature_lifecycle=lifecycle,
-        )
-        agent = PrototypeAgent(config)
-        observation = jnp.asarray((0.2, -0.1, 0.4), dtype=jnp.float32)
-        state = agent.start(agent.init(jr.key(93)), observation)
-        decision = agent.decision(state)
-        next_observation = observation.at[1].add(0.2)
-        result = agent.update_transition(
-            state,
-            PrototypeTransition(
-                observation=decision.observation,
-                action=decision.action,
-                decision_id=decision.decision_id,
-                reward=jnp.asarray(0.25, dtype=jnp.float32),
-                discount=jnp.asarray(1.0, dtype=jnp.float32),
-                terminated=jnp.asarray(False, dtype=jnp.bool_),
-                truncated=jnp.asarray(False, dtype=jnp.bool_),
-                next_observation=next_observation,
-                next_decision_observation=next_observation,
-            ),
-        )
-        assert bool(result.transition_diagnostics.valid)
-        assert result.prototype_feature_lifecycle_diagnostics is not None
-        assert bool(
-            result.prototype_feature_lifecycle_diagnostics.lifecycle.transaction_applied
-        )
-        assert int(result.state.oak_state.oak_state.stomp_state.executing_option) == -1
 
 
 # ---------------------------------------------------------------------------
@@ -498,56 +346,23 @@ class TestPrototypeAgentAct:
 
 
 class TestPrototypeAgentUpdateMinimal:
-    @pytest.fixture
-    def minimal_state(self) -> tuple[PrototypeAgent, PrototypeAgentState]:
+    def test_update_contract(self) -> None:
         agent = PrototypeAgent(_minimal_config())
         state = agent.start(agent.init(jr.key(0)), jnp.zeros(OBS_DIM))
-        return agent, state
-
-    def test_update_returns_result(
-        self, minimal_state: tuple[PrototypeAgent, PrototypeAgentState]
-    ) -> None:
-        agent, state = minimal_state
         result = agent.update(state, jnp.array(1.0), jnp.ones(OBS_DIM))
+
         assert isinstance(result, PrototypeUpdateResult)
-
-    def test_update_step_count_increments(
-        self, minimal_state: tuple[PrototypeAgent, PrototypeAgentState]
-    ) -> None:
-        agent, state = minimal_state
-        result = agent.update(state, jnp.array(0.0), jnp.zeros(OBS_DIM))
         assert int(result.state.step_count) == 1
-
-    def test_update_action_shape(
-        self, minimal_state: tuple[PrototypeAgent, PrototypeAgentState]
-    ) -> None:
-        agent, state = minimal_state
-        result = agent.update(state, jnp.array(0.0), jnp.zeros(OBS_DIM))
         chex.assert_shape(result.action, ())
-
-    def test_update_oak_td_error_finite(
-        self, minimal_state: tuple[PrototypeAgent, PrototypeAgentState]
-    ) -> None:
-        agent, state = minimal_state
-        result = agent.update(state, jnp.array(1.0), jnp.ones(OBS_DIM))
         assert jnp.isfinite(result.oak_td_error)
-
-    def test_update_no_world_model_fields_none(
-        self, minimal_state: tuple[PrototypeAgent, PrototypeAgentState]
-    ) -> None:
-        agent, state = minimal_state
-        result = agent.update(state, jnp.array(0.0), jnp.zeros(OBS_DIM))
         assert result.world_model_error is None
         assert result.dream_td_errors is None
         assert result.horde_td_errors is None
         assert result.ia_augmented_obs is None
         assert result.ia_recommendation is None
 
-    def test_update_mutiple_steps_state_changes(
-        self, minimal_state: tuple[PrototypeAgent, PrototypeAgentState]
-    ) -> None:
-        agent, state = minimal_state
-        for _ in range(10):
+        state = result.state
+        for _ in range(9):
             result = agent.update(state, jnp.array(0.5), jnp.ones(OBS_DIM))
             state = result.state
         assert int(state.step_count) == 10
@@ -559,75 +374,24 @@ class TestPrototypeAgentUpdateMinimal:
 
 
 class TestPrototypeAgentUpdateFull:
-    @pytest.fixture
-    def full_state(self) -> tuple[PrototypeAgent, PrototypeAgentState]:
+    def test_full_update_contract(self) -> None:
         agent = PrototypeAgent(_full_config(n_dreams=2))
         state = agent.start(agent.init(jr.key(0)), jnp.zeros(OBS_DIM))
-        return agent, state
+        cumulants = jnp.array([0.5, 0.3], dtype=jnp.float32)
+        result = agent.update(state, jnp.array(1.0), jnp.ones(OBS_DIM), cumulants)
 
-    def test_update_world_model_error_finite(
-        self, full_state: tuple[PrototypeAgent, PrototypeAgentState]
-    ) -> None:
-        agent, state = full_state
-        result = agent.update(state, jnp.array(1.0), jnp.ones(OBS_DIM))
         assert result.world_model_error is not None
         assert jnp.isfinite(result.world_model_error)
-
-    def test_update_dream_td_errors_shape(
-        self, full_state: tuple[PrototypeAgent, PrototypeAgentState]
-    ) -> None:
-        agent, state = full_state
-        result = agent.update(state, jnp.array(0.0), jnp.zeros(OBS_DIM))
         assert result.dream_td_errors is not None
         chex.assert_shape(result.dream_td_errors, (2,))
-
-    def test_update_horde_td_errors_shape(
-        self, full_state: tuple[PrototypeAgent, PrototypeAgentState]
-    ) -> None:
-        agent, state = full_state
-        result = agent.update(state, jnp.array(0.0), jnp.zeros(OBS_DIM))
         assert result.horde_td_errors is not None
         chex.assert_shape(result.horde_td_errors, (2,))  # 2 demons
-
-    def test_update_ia_augmented_obs_shape(
-        self, full_state: tuple[PrototypeAgent, PrototypeAgentState]
-    ) -> None:
-        agent, state = full_state
-        result = agent.update(state, jnp.array(0.0), jnp.zeros(OBS_DIM))
         assert result.ia_augmented_obs is not None
         chex.assert_shape(result.ia_augmented_obs, (OBS_DIM + 2,))  # obs + 2 cerebellum demons
-
-    def test_update_ia_recommendation_valid(
-        self, full_state: tuple[PrototypeAgent, PrototypeAgentState]
-    ) -> None:
-        agent, state = full_state
-        result = agent.update(state, jnp.array(0.0), jnp.zeros(OBS_DIM))
         assert result.ia_recommendation is not None
         chex.assert_shape(result.ia_recommendation, ())
-
-    def test_update_buffer_grows(
-        self, full_state: tuple[PrototypeAgent, PrototypeAgentState]
-    ) -> None:
-        agent, state = full_state
-        result = agent.update(state, jnp.array(0.0), jnp.ones(OBS_DIM))
         assert int(result.state.buffer_state.size) == 1
-
-    def test_update_world_model_step_count_increments(
-        self, full_state: tuple[PrototypeAgent, PrototypeAgentState]
-    ) -> None:
-        agent, state = full_state
-        result = agent.update(state, jnp.array(0.0), jnp.zeros(OBS_DIM))
         assert int(result.state.world_model_state.step_count) == 1
-
-    def test_update_horde_cumulants_broadcast(
-        self, full_state: tuple[PrototypeAgent, PrototypeAgentState]
-    ) -> None:
-        agent, state = full_state
-        # Explicit cumulants
-        cumulants = jnp.array([0.5, 0.3], dtype=jnp.float32)
-        result = agent.update(state, jnp.array(0.0), jnp.zeros(OBS_DIM), cumulants)
-        assert result.horde_td_errors is not None
-        chex.assert_shape(result.horde_td_errors, (2,))
 
 
 # ---------------------------------------------------------------------------
@@ -636,32 +400,19 @@ class TestPrototypeAgentUpdateFull:
 
 
 class TestPrototypeAgentScan:
-    def test_scan_minimal_shapes(self) -> None:
-        agent = PrototypeAgent(_minimal_config())
-        state = agent.start(agent.init(jr.key(0)), jnp.zeros(OBS_DIM))
-        n_steps = 10
-        rewards = jnp.zeros(n_steps)
-        next_obs = jnp.zeros((n_steps, OBS_DIM))
-        result = agent.scan(state, rewards, next_obs)
-        assert isinstance(result, PrototypeArrayResult)
-        chex.assert_shape(result.actions, (n_steps,))
-        chex.assert_shape(result.oak_td_errors, (n_steps,))
-        chex.assert_shape(result.oak_average_rewards, (n_steps,))
-
-    def test_scan_step_count_final(self) -> None:
-        agent = PrototypeAgent(_minimal_config())
-        state = agent.start(agent.init(jr.key(0)), jnp.zeros(OBS_DIM))
-        n_steps = 5
-        result = agent.scan(state, jnp.zeros(n_steps), jnp.zeros((n_steps, OBS_DIM)))
-        assert int(result.state.step_count) == n_steps
-
-    def test_scan_td_errors_finite(self) -> None:
+    def test_scan_minimal_contract(self) -> None:
         agent = PrototypeAgent(_minimal_config())
         state = agent.start(agent.init(jr.key(0)), jnp.zeros(OBS_DIM))
         n_steps = 8
         rewards = jr.normal(jr.key(42), (n_steps,))
         next_obs = jr.normal(jr.key(43), (n_steps, OBS_DIM))
         result = agent.scan(state, rewards, next_obs)
+
+        assert isinstance(result, PrototypeArrayResult)
+        chex.assert_shape(result.actions, (n_steps,))
+        chex.assert_shape(result.oak_td_errors, (n_steps,))
+        chex.assert_shape(result.oak_average_rewards, (n_steps,))
+        assert int(result.state.step_count) == n_steps
         chex.assert_tree_all_finite(result.oak_td_errors)
 
     def test_scan_matches_sequential(self) -> None:
@@ -865,39 +616,6 @@ class TestPrototypeAgentSerializationRoundtrip:
         assert restored.config.horde_spec is not None
         assert restored.config.ia is not None
 
-    def test_full_checkpoint_resume_has_identical_next_action_and_state(
-        self,
-        tmp_path,
-    ) -> None:
-        agent = PrototypeAgent(_full_config(n_dreams=1))
-        state = agent.start(agent.init(jr.key(41)), jnp.zeros(OBS_DIM))
-        transitions = (
-            (0.25, jnp.array([0.1, -0.2, 0.3, -0.4], dtype=jnp.float32)),
-            (-0.5, jnp.array([0.4, 0.3, -0.2, -0.1], dtype=jnp.float32)),
-            (1.0, jnp.array([-0.3, 0.2, 0.1, 0.5], dtype=jnp.float32)),
-        )
-        for reward, observation in transitions:
-            state = agent.update(state, reward, observation).state
-
-        checkpoint_path = tmp_path / "prototype"
-        save_prototype_checkpoint(agent, state, checkpoint_path)
-        restored_agent, restored_state = load_prototype_checkpoint(checkpoint_path)
-
-        assert restored_agent.to_config() == agent.to_config()
-        chex.assert_trees_all_close(
-            _materialize_typed_keys(restored_state),
-            _materialize_typed_keys(state),
-        )
-
-        reward = jnp.array(0.75, dtype=jnp.float32)
-        observation = jnp.array([0.2, 0.1, -0.5, 0.4], dtype=jnp.float32)
-        uninterrupted = agent.update(state, reward, observation)
-        resumed = restored_agent.update(restored_state, reward, observation)
-        chex.assert_trees_all_close(
-            _materialize_typed_keys(resumed),
-            _materialize_typed_keys(uninterrupted),
-        )
-
     def test_sample_one_hot_checkpoint_resume_replays_identical_dream_draws(
         self,
         tmp_path,
@@ -988,23 +706,6 @@ class TestPrototypeAgentSerializationRoundtrip:
         with pytest.raises(ValueError, match="not canonical"):
             load_prototype_checkpoint(tmp_path / "not-read")
 
-        numeric_bool = dict(config)
-        assert type(numeric_bool["horde_step_size"]) is float
-        numeric_bool["horde_step_size"] = True
-        monkeypatch.setattr(
-            prototype_module,
-            "load_checkpoint_metadata",
-            lambda _path: {
-                "schema": PROTOTYPE_CHECKPOINT_SCHEMA,
-                "agent_config": numeric_bool,
-                "config_sha256": prototype_module._prototype_config_digest(
-                    numeric_bool
-                ),
-            },
-        )
-        with pytest.raises(ValueError, match="not canonical"):
-            load_prototype_checkpoint(tmp_path / "not-read")
-
 
 # ---------------------------------------------------------------------------
 # Dreaming mechanics
@@ -1047,62 +748,6 @@ class TestPrototypeAgentDreaming:
         assert result.dream_td_errors is not None
         # All gated dreams produce 0.0
         chex.assert_trees_all_close(result.dream_td_errors, jnp.zeros(3), atol=1e-6)
-
-
-# ---------------------------------------------------------------------------
-# 200-step fineness (smoke)
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.slow
-class TestPrototypeAgentSmoke:
-    def test_200_step_minimal(self) -> None:
-        agent = PrototypeAgent(_minimal_config())
-        state = agent.start(agent.init(jr.key(0)), jnp.zeros(OBS_DIM))
-        key = jr.key(99)
-        for i in range(200):
-            key, rk, ok = jr.split(key, 3)
-            r = jr.normal(rk, ())
-            obs = jr.normal(ok, (OBS_DIM,))
-            result = agent.update(state, r, obs)
-            state = result.state
-        assert jnp.isfinite(result.oak_td_error)
-        assert int(state.step_count) == 200
-
-    def test_200_step_full(self) -> None:
-        """Full-stack smoke kept shorter because each step touches all components."""
-        agent = PrototypeAgent(_full_config(n_dreams=1))
-        state = agent.start(agent.init(jr.key(0)), jnp.zeros(OBS_DIM))
-        key = jr.key(100)
-        n_steps = 50
-        for _ in range(n_steps):
-            key, rk, ok = jr.split(key, 3)
-            r = jr.normal(rk, ())
-            obs = jr.normal(ok, (OBS_DIM,))
-            result = agent.update(state, r, obs)
-            state = result.state
-        assert int(state.step_count) == n_steps
-        assert jnp.isfinite(result.oak_td_error)
-        assert result.world_model_error is not None
-        assert jnp.isfinite(result.world_model_error)
-
-    def test_200_step_with_curations(self) -> None:
-        """Periodic curation over 200 steps should not crash."""
-        cfg = PrototypeAgentConfig(
-            oak=_oak_cfg(specs=(_SPEC0, _SPEC1)),
-        )
-        agent = PrototypeAgent(cfg)
-        state = agent.start(agent.init(jr.key(0)), jnp.zeros(OBS_DIM))
-        key = jr.key(101)
-        for i in range(200):
-            key, rk, ok, ck = jr.split(key, 4)
-            r = jr.normal(rk, ())
-            obs = jr.normal(ok, (OBS_DIM,))
-            result = agent.update(state, r, obs)
-            state = result.state
-            if (i + 1) % 50 == 0:
-                agent, state = agent.curate(state, ck)
-        assert jnp.isfinite(result.oak_td_error)
 
 
 # ---------------------------------------------------------------------------

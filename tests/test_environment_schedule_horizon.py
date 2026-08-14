@@ -11,7 +11,6 @@ import jax.numpy as jnp
 import jax.random as jr
 import pytest
 
-import alberta_framework.streams as streams
 from alberta_framework.streams.gauntlet import (
     LIFETIME_GAUNTLET_CLOCK_DELTA_NBYTES,
     LIFETIME_GAUNTLET_CONFIG_SCHEMA,
@@ -286,22 +285,3 @@ def test_lifetime_schema_migration_resources_and_checkpoint(tmp_path) -> None:
     restored_stream, restored = load_lifetime_gauntlet_checkpoint(path)
     assert restored_stream.to_config() == payload
     chex.assert_trees_all_equal(restored, state)
-
-
-def test_exact_environment_schedule_public_exports_are_available() -> None:
-    """The streams surface exposes clocks, results, persistence, and migration."""
-    names = (
-        "RECURRING_TWO_AGENT_CONFIG_SCHEMA",
-        "RECURRING_TWO_AGENT_STATE_SCHEMA",
-        "RecurringTwoAgentStepResult",
-        "load_recurring_two_agent_checkpoint",
-        "migrate_legacy_recurring_two_agent_state",
-        "LIFETIME_GAUNTLET_CONFIG_SCHEMA",
-        "LIFETIME_GAUNTLET_STATE_SCHEMA",
-        "LifetimeGauntletStepResult",
-        "load_lifetime_gauntlet_checkpoint",
-        "migrate_legacy_lifetime_gauntlet_state",
-    )
-    for name in names:
-        assert hasattr(streams, name)
-        assert streams.__all__.count(name) == 1

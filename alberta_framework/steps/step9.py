@@ -104,18 +104,7 @@ class Step9DreamingConfig:
             (default False). Dyna doctrine: planning backups improve *value*
             estimates, while the reward-rate estimate is a property of actual
             behavior in the real environment — imagined experience should not
-            move it. Coupling dreams to rbar distorts the rate estimate in
-            whichever direction the model's reward bias points; the measured
-            effect depends on the bootstrap regime. Under undiscounted
-            updates (discount 1.0) corrupt imagined rewards inflate rbar,
-            which makes real TD errors more negative, speeds unlearning, and
-            *masks* the damage corrupt dreams do to the Q-function. Under
-            discounted updates (e.g. the 0.99 used by :func:`step9_update`)
-            the coupling measured strictly worse on both sides of a
-            payoff-flip stress: gated mean regret 113.5-115.6 vs ~97
-            protected, permissive 239.3-251.5 vs ~131
-            (see tests/test_planning_benefit.py). Set True to let dream TD
-            errors move rbar anyway.
+            move it. Set True only when dream TD errors should update rbar.
     """
 
     control: Step6DifferentialSARSAConfig = field(

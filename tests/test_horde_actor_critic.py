@@ -1,12 +1,9 @@
 """Tests for Horde-backed actor-critic integration."""
 
-from pathlib import Path
-
 import chex
 import jax
 import jax.numpy as jnp
 import jax.random as jr
-import numpy as np
 import pytest
 
 from alberta_framework import HordeActorCriticAgent as TopLevelHordeActorCriticAgent
@@ -25,12 +22,6 @@ from alberta_framework.core.types import (
     DemonType,
     GVFSpec,
     create_horde_spec,
-)
-
-BSUITE_ADAPTER_ROOT = Path(__file__).resolve().parents[1] / "benchmarks" / "bsuite"
-BSUITE_ADAPTER_REASON = (
-    "benchmarks/bsuite adapters are not shipped in the standalone checkout "
-    "(see VENDORING.md)"
 )
 
 
@@ -289,71 +280,6 @@ def test_horde_actor_critic_actor_bounder_hook_runs() -> None:
 
     assert float(result.bound_metric) < 1.0
     chex.assert_tree_all_finite((result.state.actor_weights, result.bound_metric))
-
-
-@pytest.mark.skipif(not BSUITE_ADAPTER_ROOT.is_dir(), reason=BSUITE_ADAPTER_REASON)
-def test_bsuite_horde_ac_pairwise_feature_lift_values() -> None:
-    """The adapter's pairwise lift should expose relational actor features."""
-    pytest.importorskip("dm_env", reason="dm_env not installed")
-    pytest.importorskip("bsuite", reason="bsuite not installed")
-    from benchmarks.bsuite.agents.horde_actor_critic import _FeatureLift
-
-    lift = _FeatureLift(raw_dim=3, mode="pairwise")
-    features = lift.transform(jnp.array([1.0, 2.0, 3.0], dtype=jnp.float32))
-
-    chex.assert_shape(features, (9,))
-    chex.assert_trees_all_close(
-        features,
-        jnp.array([1.0, 2.0, 3.0, 1.0, 2.0, 3.0, 4.0, 6.0, 9.0]),
-    )
-
-
-@pytest.mark.skipif(not BSUITE_ADAPTER_ROOT.is_dir(), reason=BSUITE_ADAPTER_REASON)
-def test_bsuite_horde_ac_pairwise_feature_dim_reaches_actor() -> None:
-    """Pairwise lift should initialize the core actor on the lifted feature dim."""
-    dm_env = pytest.importorskip("dm_env", reason="dm_env not installed")
-    pytest.importorskip("bsuite", reason="bsuite not installed")
-    from benchmarks.bsuite.agents import horde_actor_critic
-    from dm_env import specs
-
-    obs_spec = specs.Array(shape=(4,), dtype=np.float32, name="obs")
-    action_spec = specs.DiscreteArray(num_values=3, name="action")
-    agent = horde_actor_critic.default_agent(
-        obs_spec,
-        action_spec,
-        hidden_sizes=(8,),
-        feature_lift="pairwise",
-        max_feature_dim=64,
-    )
-
-    assert agent.feature_lift_mode == "pairwise"
-    assert agent.state.actor_weights.shape == (3, 14)
-    action = agent.select_action(dm_env.restart(jnp.ones((4,), dtype=jnp.float32)))
-    assert 0 <= action < 3
-
-
-@pytest.mark.skipif(not BSUITE_ADAPTER_ROOT.is_dir(), reason=BSUITE_ADAPTER_REASON)
-def test_bsuite_qhorde_ac_pairwise_feature_dim_reaches_actor() -> None:
-    """Q-Horde adapter should initialize core actor on lifted features."""
-    dm_env = pytest.importorskip("dm_env", reason="dm_env not installed")
-    pytest.importorskip("bsuite", reason="bsuite not installed")
-    from benchmarks.bsuite.agents import qhorde_ac
-    from dm_env import specs
-
-    obs_spec = specs.Array(shape=(4,), dtype=np.float32, name="obs")
-    action_spec = specs.DiscreteArray(num_values=3, name="action")
-    agent = qhorde_ac.default_agent(
-        obs_spec,
-        action_spec,
-        hidden_sizes=(8,),
-        feature_lift="pairwise",
-        max_feature_dim=64,
-    )
-
-    assert agent.feature_lift_mode == "pairwise"
-    assert agent.state.actor_weights.shape == (3, 14)
-    action = agent.select_action(dm_env.restart(jnp.ones((4,), dtype=jnp.float32)))
-    assert 0 <= action < 3
 
 
 def test_qhorde_actor_critic_updates_only_taken_q_head_and_actor() -> None:

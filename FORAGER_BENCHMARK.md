@@ -11,14 +11,14 @@ keeps the environment state opaque to learning policies.
 
 Companion documents for this lane:
 
-- `FORAGAX_OPEN_DEVELOPMENT_SCREEN.md` — the strict OCI harness for the frozen
+- `docs/runbooks/foragax-open-screen.md` — the strict OCI harness for the frozen
   nonpromoting FOV development screens.
-- `FORAGER_ALBERTA_CANDIDATE_AUDIT.md` and `FORAGER_COMPARATOR_AUDIT.md` —
-  read-only audits of the frozen matched-current campaign (see the
+- `docs/archive/forager-comparator-audit.md` — a read-only audit of the frozen
+  matched-current campaign (see the
   matched-current section below).
-- `HISTORICAL_FORAGER_RECONSTRUCTED.md` — the separate reconstructed
+- `docs/archive/historical-forager-reconstruction.md` — the separate reconstructed
   paper-era NumPy environment family.
-- `RESEARCH_STATUS.md` ("Forager benchmark lane") — the canonical
+- `docs/status.md` ("Forager benchmark lane") — the canonical
   evidence-status statement; no Forager performance result is registered in
   the scientific evidence manifest.
 
@@ -27,7 +27,7 @@ Companion documents for this lane:
 Use the optional dependency group:
 
 ```bash
-python -m pip install -e '.[forager]'
+.venv/bin/python -m pip install -e '.[forager]'
 ```
 
 This installs `continual-foragax==0.55.0` (imported as `foragax`) and
@@ -126,7 +126,7 @@ learning baseline.
 
 ## Resumable Alberta variant matrices
 
-`python -m alberta_framework.benchmarks.forager_matrix` runs the strict,
+`.venv/bin/python -m alberta_framework.benchmarks.forager_matrix` runs the strict,
 resumable Alberta-only matrix harness. Manifest schema `2.2` remains frozen to
 the original `alberta_horde_ac` and `alberta_causal_map` kinds. Schema `2.3`
 adds `alberta_rtu_rtrl`, backed by `RTURTRLForagerConfig`; its run records use
@@ -425,10 +425,8 @@ repository, the fixed-action RNG-parity receipt
 remains `content_complete_external_executor_receipt_unverified` with
 `promotion_authorized: false`, and no `forager_matched` claim is registered
 in the evidence manifest. In-tree code alone therefore cannot produce a
-promoted matched-current result. `FORAGER_ALBERTA_CANDIDATE_AUDIT.md` records
-the internal GO/authority-NOT-CLEARED review of the 14 Alberta candidates;
-`FORAGER_COMPARATOR_AUDIT.md` records comparator provenance and the frozen
-protocol's statistical scope limits.
+promoted matched-current result. `docs/archive/forager-comparator-audit.md`
+records comparator provenance and the frozen protocol's statistical scope limits.
 
 ## Development receipts
 

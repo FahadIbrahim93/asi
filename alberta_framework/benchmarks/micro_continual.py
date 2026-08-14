@@ -2,7 +2,7 @@
 
 Seconds-scale synthetic non-stationary online classification streams that
 distill each difficulty axis the IPMNIST campaign measured
-(``CONTINUAL_LEARNING_THEORY.md``) into its minimal form. The base
+(``docs/research/ipmnist-theory.md``) into its minimal form. The base
 distribution is ``n_classes`` Gaussian mixture classes in ``dim`` dimensions,
 with three MNIST-mimicking structural ingredients that calibration proved
 load-bearing for proxy validity (see ``outputs/micro_continual/SUITE.md``):
@@ -95,9 +95,9 @@ from alberta_framework.benchmarks.upgd_ipmnist import (
     LearnerInitFn,
     _make_adamw_learner,
     _make_upgd_w_learner,
+    atomic_write_new,
     init_mlp_params,
 )
-from alberta_framework.benchmarks.upgd_ipmnist_v3 import atomic_write_new
 
 logger = logging.getLogger(__name__)
 
@@ -1080,7 +1080,7 @@ def transfer_validation(
             and conditioning_delta.mean() >= 2.0 * max(float(gate_delta.mean()), 0.0)
         ),
         "full protocol: conditioning +0.061 vs gate +0.011 "
-        "(CONTINUAL_LEARNING_THEORY.md decomposition)",
+        "(docs/research/ipmnist-theory.md decomposition)",
         {
             "conditioning_delta_mean": float(conditioning_delta.mean()),
             "per_seed_conditioning_delta": [round(float(v), 6) for v in conditioning_delta],
@@ -1140,7 +1140,7 @@ def transfer_validation(
             < overall["naive_bayes"].mean()
             < overall["sgd_norm"].mean()
         ),
-        "V3 (NEW_DIRECTIONS.md): naive Bayes 0.7851 beats published UPGD-W "
+        "V3 development validation: naive Bayes 0.7851 beats published UPGD-W "
         "0.7778 but stays below conditioned SGD 0.8399",
         {
             "upgd_raw_overall_mean": float(overall["upgd_raw"].mean()),

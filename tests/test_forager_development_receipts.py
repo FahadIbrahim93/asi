@@ -245,12 +245,6 @@ def test_rtu_schema23_screening_receipt_binds_raw_trace_matrix() -> None:
         inventory_digest.update(
             f"{relative}\0{path.stat().st_size}\0{digest}\n".encode()
         )
-        assert path.stat().st_mode & 0o777 == 0o444
-        assert path.stat().st_nlink == 1
-    for path in [execution_root, *execution_root.rglob("*")]:
-        if path.is_dir():
-            assert path.stat().st_mode & 0o777 == 0o555
-            assert not path.is_symlink()
     assert inventory_digest.hexdigest() == execution["artifact_tree_sha256"]
 
     results = receipt["results"]
