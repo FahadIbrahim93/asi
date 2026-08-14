@@ -62,6 +62,17 @@ from jaxtyping import Float, Int
 
 from alberta_framework.core.types import Observation
 
+
+def _floating_tree_is_finite(tree: object) -> Array:
+    """Return whether every floating/complex persistent leaf is finite."""
+    valid = jnp.asarray(True, dtype=jnp.bool_)
+    for leaf in jax.tree.leaves(tree):
+        array = jnp.asarray(leaf)
+        if jnp.issubdtype(array.dtype, jnp.inexact):
+            valid = valid & jnp.all(jnp.isfinite(array))
+    return valid
+
+
 # =============================================================================
 # State / result types
 # =============================================================================
@@ -330,21 +341,31 @@ class OffPolicyTDLinearLearner:
 
         # Update with rho_clipped * delta * e
         scaled_update = alpha * rho_clipped * td_error
-        new_weights = state.weights + scaled_update * new_e
-        new_bias = state.bias + scaled_update * new_e_b
-
-        new_state = OffPolicyTDState(  # type: ignore[call-arg]
-            weights=new_weights,
-            bias=new_bias,
+        proposed_state = OffPolicyTDState(  # type: ignore[call-arg]
+            weights=state.weights + scaled_update * new_e,
+            bias=state.bias + scaled_update * new_e_b,
             eligibility_traces=new_e,
             bias_eligibility_trace=new_e_b,
             step_count=state.step_count + 1,
             birth_timestamp=state.birth_timestamp,
             uptime_s=state.uptime_s,
         )
+        # Inf reward makes scaled_update * e = 0*inf = NaN on a silent feature.
+        inputs_valid = (
+            jnp.all(jnp.isfinite(observation))
+            & jnp.isfinite(reward_s)
+            & jnp.all(jnp.isfinite(next_observation))
+            & jnp.isfinite(gamma_s)
+            & jnp.isfinite(rho_s)
+        )
+        new_state = jax.lax.cond(
+            inputs_valid & _floating_tree_is_finite(proposed_state),
+            lambda: proposed_state,
+            lambda: state,
+        )
 
         squared_td = td_error**2
-        mean_e = jnp.mean(jnp.abs(new_e))
+        mean_e = jnp.mean(jnp.abs(new_state.eligibility_traces))
         metrics = jnp.array(
             [squared_td, td_error, rho_clipped, alpha, mean_e],
             dtype=jnp.float32,
@@ -486,12 +507,9 @@ class ETDLinearLearner:
         new_e = rho_s * (trace_decay * state.eligibility_traces + emphasis * observation)
         new_e_b = rho_s * (trace_decay * state.bias_eligibility_trace + emphasis)
 
-        new_weights = state.weights + alpha * td_error * new_e
-        new_bias = state.bias + alpha * td_error * new_e_b
-
-        new_state = ETDState(  # type: ignore[call-arg]
-            weights=new_weights,
-            bias=new_bias,
+        proposed_state = ETDState(  # type: ignore[call-arg]
+            weights=state.weights + alpha * td_error * new_e,
+            bias=state.bias + alpha * td_error * new_e_b,
             eligibility_traces=new_e,
             bias_eligibility_trace=new_e_b,
             follow_on_trace=follow_on,
@@ -500,9 +518,22 @@ class ETDLinearLearner:
             birth_timestamp=state.birth_timestamp,
             uptime_s=state.uptime_s,
         )
+        inputs_valid = (
+            jnp.all(jnp.isfinite(observation))
+            & jnp.isfinite(reward_s)
+            & jnp.all(jnp.isfinite(next_observation))
+            & jnp.isfinite(gamma_s)
+            & jnp.isfinite(rho_s)
+            & jnp.isfinite(interest_s)
+        )
+        new_state = jax.lax.cond(
+            inputs_valid & _floating_tree_is_finite(proposed_state),
+            lambda: proposed_state,
+            lambda: state,
+        )
 
         squared_td = td_error**2
-        mean_e = jnp.mean(jnp.abs(new_e))
+        mean_e = jnp.mean(jnp.abs(new_state.eligibility_traces))
         metrics = jnp.array(
             [squared_td, td_error, rho_s, alpha, mean_e, follow_on, emphasis],
             dtype=jnp.float32,
@@ -659,13 +690,25 @@ class GradientTDLinearLearner:
         )
         secondary_step = beta * (td_error * traces - secondary_dot_phi * phi)
 
-        new_state = GradientTDState(  # type: ignore[call-arg]
+        proposed_state = GradientTDState(  # type: ignore[call-arg]
             weights=state.weights + primary_step,
             secondary_weights=state.secondary_weights + secondary_step,
             eligibility_traces=traces,
             step_count=state.step_count + 1,
             birth_timestamp=state.birth_timestamp,
             uptime_s=state.uptime_s,
+        )
+        inputs_valid = (
+            jnp.all(jnp.isfinite(observation))
+            & jnp.isfinite(reward_s)
+            & jnp.all(jnp.isfinite(next_observation))
+            & jnp.isfinite(gamma_s)
+            & jnp.isfinite(rho_s)
+        )
+        new_state = jax.lax.cond(
+            inputs_valid & _floating_tree_is_finite(proposed_state),
+            lambda: proposed_state,
+            lambda: state,
         )
         metrics = jnp.array(
             [
@@ -674,7 +717,7 @@ class GradientTDLinearLearner:
                 rho_clipped,
                 jnp.sqrt(jnp.mean(new_state.weights**2)),
                 jnp.sqrt(jnp.mean(new_state.secondary_weights**2)),
-                jnp.mean(jnp.abs(traces)),
+                jnp.mean(jnp.abs(new_state.eligibility_traces)),
             ],
             dtype=jnp.float32,
         )
