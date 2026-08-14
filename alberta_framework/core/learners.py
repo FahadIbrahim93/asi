@@ -774,6 +774,16 @@ def metrics_to_dicts(metrics: Array, normalized: bool = False) -> list[dict[str,
 # =============================================================================
 
 
+def _floating_tree_is_finite(tree: object) -> Array:
+    """Return whether every floating/complex persistent leaf is finite."""
+    valid = jnp.asarray(True, dtype=jnp.bool_)
+    for leaf in jax.tree.leaves(tree):
+        array = jnp.asarray(leaf)
+        if jnp.issubdtype(array.dtype, jnp.inexact):
+            valid = valid & jnp.all(jnp.isfinite(array))
+    return valid
+
+
 class MLPLearner:
     """Multi-layer perceptron with composable optimizer, bounder, and normalizer.
 
@@ -1323,7 +1333,7 @@ class MLPLearner:
                 for i in range(len(self._hidden_sizes))
             )
 
-        new_state = MLPLearnerState(
+        proposed_state = MLPLearnerState(
             params=new_params,
             optimizer_states=tuple(new_opt_states),
             traces=tuple(new_traces),
@@ -1333,6 +1343,11 @@ class MLPLearner:
             birth_timestamp=state.birth_timestamp,
             uptime_s=state.uptime_s,
         )
+        # Inf target/obs, or a 0*inf ObGD apply, would commit NaN weights.
+        # MultiHead already refuses that; keep the previous finite state.
+        inputs_valid = jnp.all(jnp.isfinite(observation)) & jnp.isfinite(target_scalar)
+        update_applied = inputs_valid & _floating_tree_is_finite(proposed_state)
+        new_state = jax.lax.cond(update_applied, lambda: proposed_state, lambda: state)
 
         squared_error = error**2
 
