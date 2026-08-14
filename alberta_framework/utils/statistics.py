@@ -142,6 +142,13 @@ def compute_timeseries_statistics(
     if n_seeds == 0:
         raise ValueError("metric_array must contain at least one seed row")
     mean = np.mean(metric_array, axis=0)
+
+    if n_seeds == 1:
+        # One seed has no between-seed spread estimate; return the degenerate
+        # point interval, matching compute_statistics([x]). The ddof=1 /
+        # Student-t path below would produce all-NaN bounds (df=0).
+        return mean, mean.copy(), mean.copy()
+
     std = np.std(metric_array, axis=0, ddof=1)
     sem = std / np.sqrt(n_seeds)
 

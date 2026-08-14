@@ -134,6 +134,31 @@ class TestTimeseriesStatistics:
             ):
                 compute_timeseries_statistics(np.empty((0, 3)))
 
+    def test_single_seed_returns_finite_point_interval(self) -> None:
+        """One seed yields the point trajectory, finite, without any warning."""
+        arr = np.asarray([[1.0, 2.0, 3.0]], dtype=np.float64)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            mean, lo, hi = compute_timeseries_statistics(arr, confidence_level=0.95)
+        assert mean.shape == lo.shape == hi.shape == (3,)
+        np.testing.assert_array_equal(mean, np.asarray([1.0, 2.0, 3.0]))
+        np.testing.assert_array_equal(lo, mean)
+        np.testing.assert_array_equal(hi, mean)
+        assert np.isfinite(mean).all()
+        assert np.isfinite(lo).all()
+        assert np.isfinite(hi).all()
+
+    def test_single_seed_matches_per_column_compute_statistics(self) -> None:
+        """The n_seeds == 1 contract agrees with the scalar degenerate case."""
+        rng = np.random.default_rng(8)
+        arr = rng.normal(0.0, 1.0, size=(1, 5))
+        mean, lo, hi = compute_timeseries_statistics(arr, confidence_level=0.95)
+        for step in range(5):
+            s = compute_statistics(arr[:, step], confidence_level=0.95)
+            assert mean[step] == pytest.approx(s.mean)
+            assert lo[step] == pytest.approx(s.ci_lower)
+            assert hi[step] == pytest.approx(s.ci_upper)
+
 
 class TestBootstrapCI:
     def test_deterministic_and_brackets_estimate(self) -> None:
