@@ -7029,7 +7029,13 @@ def merge_shards(
             )
         per_seed[shard["seed"]] = shard
 
-    control = by_config.get(control_name, {})
+    if control_name not in by_config:
+        raise ValueError(
+            f"control {control_name!r} is not among the merged shards "
+            f"(present: {sorted(by_config)}); a summary without its control "
+            "would silently carry no paired_vs_control blocks"
+        )
+    control = by_config[control_name]
     entries: list[dict[str, Any]] = []
     for name, per_seed in sorted(by_config.items()):
         seeds = sorted(per_seed)
