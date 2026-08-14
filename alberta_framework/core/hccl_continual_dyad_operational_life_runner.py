@@ -460,8 +460,9 @@ class HCCLContinualDyadOperationalLifeError(RuntimeError):
     def __init__(self, step_index: int, stage: str, detail: str) -> None:
         self.step_index = step_index
         self.stage = stage
+        location = "before step 0" if step_index < 0 else f"at step {step_index}"
         super().__init__(
-            f"primitive operational life aborted at step {step_index} "
+            f"primitive operational life aborted {location} "
             f"during {stage}: {detail}"
         )
 
@@ -663,11 +664,20 @@ def _collect_operational_life(
         raise ValueError("operational executor checkpoint interval must equal 64")
     if type(executor.absolute_step) is not int or executor.absolute_step != 0:
         raise ValueError("operational executor must begin at exact absolute step zero")
-    if not np.array_equal(
-        _state_clock(executor.state, name="initial executor state"),
-        np.zeros((2,), dtype=np.uint32),
-    ):
-        raise ValueError("operational executor must begin at the exact zero world clock")
+    try:
+        initial_clock = _state_clock(executor.state, name="initial executor state")
+    except (AttributeError, TypeError, ValueError) as error:
+        raise HCCLContinualDyadOperationalLifeError(
+            -1,
+            "source-clock",
+            str(error),
+        ) from error
+    if not np.array_equal(initial_clock, np.zeros((2,), dtype=np.uint32)):
+        raise HCCLContinualDyadOperationalLifeError(
+            -1,
+            "source-clock",
+            "executor must begin at the exact zero world clock",
+        )
 
     steps = config.total_steps
     regime_ids = np.empty((steps,), dtype=np.int32)
@@ -692,11 +702,16 @@ def _collect_operational_life(
                 "source-clock",
                 "executor absolute step is discontinuous",
             )
-        source = executor.state
-        if not np.array_equal(
-            _state_clock(source, name="executor source"),
-            expected_pre,
-        ):
+        try:
+            source = executor.state
+            source_clock = _state_clock(source, name="executor source")
+        except (AttributeError, TypeError, ValueError) as error:
+            raise HCCLContinualDyadOperationalLifeError(
+                step_index,
+                "source-clock",
+                str(error),
+            ) from error
+        if not np.array_equal(source_clock, expected_pre):
             raise HCCLContinualDyadOperationalLifeError(
                 step_index,
                 "source-clock",
