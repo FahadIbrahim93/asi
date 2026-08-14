@@ -587,18 +587,25 @@ class OffPolicyHordeLearner:
 
             new_w = head_w + error_i * w_step
             new_b = head_b + error_i * b_step
-
-            new_w = jnp.where(active_mask[i], new_w, head_w)
-            new_b = jnp.where(active_mask[i], new_b, head_b)
-            new_w_trace = jnp.where(active_mask[i], new_w_trace, old_w_trace)
-            new_b_trace = jnp.where(active_mask[i], new_b_trace, old_b_trace)
+            # Inf TD error zeros the ObGD step, then error_i * step is 0*inf=NaN.
+            # Hold that head's previous finite params/traces/opt like a NaN cumulant.
+            head_ok = (
+                active_mask[i]
+                & jnp.isfinite(error_i)
+                & jnp.all(jnp.isfinite(new_w))
+                & jnp.all(jnp.isfinite(new_b))
+            )
+            new_w = jnp.where(head_ok, new_w, head_w)
+            new_b = jnp.where(head_ok, new_b, head_b)
+            new_w_trace = jnp.where(head_ok, new_w_trace, old_w_trace)
+            new_b_trace = jnp.where(head_ok, new_b_trace, old_b_trace)
             new_w_opt = jax.tree.map(
-                lambda new, old: jnp.where(active_mask[i], new, old),
+                lambda new, old: jnp.where(head_ok, new, old),
                 new_w_opt,
                 old_w_opt,
             )
             new_b_opt = jax.tree.map(
-                lambda new, old: jnp.where(active_mask[i], new, old),
+                lambda new, old: jnp.where(head_ok, new, old),
                 new_b_opt,
                 old_b_opt,
             )
