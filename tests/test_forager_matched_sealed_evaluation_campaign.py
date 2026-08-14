@@ -693,6 +693,7 @@ def test_run_recovers_bound_raw_then_repairs_missing_completion_pointer(
     assert len(auth_calls) == 3
 
 
+@pytest.mark.slow
 def test_full_evaluation_finalizes_stage_specific_unresolved_content(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -2381,6 +2381,7 @@ def _result_signature(result: Any) -> tuple[Any, ...]:
     )
 
 
+@pytest.mark.slow
 def test_scan_host_chunk_and_batch_parity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
