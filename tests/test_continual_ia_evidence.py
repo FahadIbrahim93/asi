@@ -39,7 +39,7 @@ from alberta_framework.evaluation.continual_ia_cli import (
     main as continual_ia_cli_main,
 )
 
-pytestmark = pytest.mark.scientific
+pytestmark = [pytest.mark.scientific, pytest.mark.slow]
 
 
 def _as_dict(value: object) -> dict[str, object]:

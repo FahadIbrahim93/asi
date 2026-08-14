@@ -30,6 +30,8 @@ from alberta_framework.core.prototype_agent import (
 from alberta_framework.core.types import DemonType, GVFSpec, create_horde_spec
 from alberta_framework.core.world_model import ActionConditionedWorldModelConfig
 
+pytestmark = pytest.mark.slow
+
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
