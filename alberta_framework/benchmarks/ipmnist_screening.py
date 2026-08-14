@@ -1069,6 +1069,29 @@ def _make_upgd_ema_norm_ext_learner(
         (loss, logits), grads = jax.value_and_grad(loss_fn, has_aux=True)(
             params, x_norm, y
         )
+        if not hidden_rms and not local_gate and gate_beta == 1.0:
+            # Keep the inert extension on the authoritative lean-UPGD path.
+            # Repeating the same equations here can produce low-bit parameter
+            # differences under JAX even when the accuracy and loss traces
+            # remain equal, which invalidates the reduction pin's plasticity
+            # metric.  The shared path also preserves the exact noise stream
+            # when a nonzero noise arm uses this factory.
+            lean_state = LeanUPGDState(  # type: ignore[call-arg]
+                utility=state.utility,
+                step=state.step,
+            )
+            lean_hp = {
+                name: hp[name]
+                for name in ("step_size", "utility_decay", "noise_std", "weight_decay")
+            }
+            noise = _sorted_flat_noise(key, params, noise_std)
+            reduced_params, reduced_lean = lean_upgd_w_update(
+                params, lean_state, grads, noise, lean_hp
+            )
+            metrics = _step_metrics(reduced_params, x_norm, y, loss, logits)
+            return reduced_params, UPGDNormState(  # type: ignore[call-arg]
+                utility=reduced_lean.utility, step=reduced_lean.step, norm=new_norm
+            ), metrics
         if noise_std == 0.0:
             # Exactly the zeros the sigma=0 draw produces, minus the draw.
             noise = {name: jnp.zeros_like(value) for name, value in params.items()}
