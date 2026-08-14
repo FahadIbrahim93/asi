@@ -112,6 +112,16 @@ class TestComputeStatistics:
         s99 = compute_statistics(values, confidence_level=0.99)
         assert (s99.ci_upper - s99.ci_lower) > (s95.ci_upper - s95.ci_lower)
 
+    @pytest.mark.parametrize("confidence_level", [0.0, 1.0, -0.1, 1.1, float("nan")])
+    def test_invalid_confidence_level_rejected_without_warnings(
+        self,
+        confidence_level: float,
+    ) -> None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with pytest.raises(ValueError, match="confidence_level.*strictly between 0 and 1"):
+                compute_statistics([4.2], confidence_level=confidence_level)
+
 
 class TestTimeseriesStatistics:
     def test_matches_per_column_compute_statistics(self) -> None:
@@ -158,6 +168,17 @@ class TestTimeseriesStatistics:
             assert mean[step] == pytest.approx(s.mean)
             assert lo[step] == pytest.approx(s.ci_lower)
             assert hi[step] == pytest.approx(s.ci_upper)
+
+    @pytest.mark.parametrize("confidence_level", [0.0, 1.0, -0.1, 1.1, float("nan")])
+    def test_invalid_confidence_level_rejected_without_warnings(
+        self,
+        confidence_level: float,
+    ) -> None:
+        arr = np.asarray([[1.0, 2.0, 3.0]], dtype=np.float64)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with pytest.raises(ValueError, match="confidence_level.*strictly between 0 and 1"):
+                compute_timeseries_statistics(arr, confidence_level=confidence_level)
 
 
 class TestBootstrapCI:
@@ -207,6 +228,37 @@ class TestBootstrapCI:
             warnings.simplefilter("error")
             with pytest.raises(ValueError, match="empty"):
                 bootstrap_ci(empty)
+
+    @pytest.mark.parametrize("statistic", ["typo", "Mean", ""])
+    def test_unknown_statistic_rejected_without_warnings(self, statistic: str) -> None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with pytest.raises(ValueError, match="statistic.*mean.*median"):
+                bootstrap_ci([1.0, 2.0, 100.0], statistic=statistic, n_bootstrap=10)
+
+    @pytest.mark.parametrize("n_bootstrap", [0, -1])
+    def test_nonpositive_bootstrap_count_rejected_without_warnings(
+        self,
+        n_bootstrap: int,
+    ) -> None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with pytest.raises(ValueError, match="n_bootstrap.*positive"):
+                bootstrap_ci([1.0, 2.0, 3.0], n_bootstrap=n_bootstrap)
+
+    @pytest.mark.parametrize("confidence_level", [0.0, 1.0, -0.1, 1.1, float("nan")])
+    def test_invalid_confidence_level_rejected_without_warnings(
+        self,
+        confidence_level: float,
+    ) -> None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with pytest.raises(ValueError, match="confidence_level.*strictly between 0 and 1"):
+                bootstrap_ci(
+                    [4.2],
+                    confidence_level=confidence_level,
+                    n_bootstrap=10,
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -484,6 +536,25 @@ class TestEffectSizes:
     def test_cohens_d_zero_variance_returns_zero(self) -> None:
         assert cohens_d([3.0, 3.0, 3.0], [3.0, 3.0, 3.0]) == 0.0
 
+    @pytest.mark.parametrize(
+        "values_a, values_b, expected_sign",
+        [
+            ([2.0, 2.0], [1.0, 1.0], 1.0),
+            ([1.0, 1.0], [2.0, 2.0], -1.0),
+            ([2.0], [1.0, 1.0], 1.0),
+            ([1.0, 1.0], [2.0], -1.0),
+        ],
+    )
+    def test_cohens_d_unequal_zero_variance_groups_returns_signed_infinity(
+        self,
+        values_a: list[float],
+        values_b: list[float],
+        expected_sign: float,
+    ) -> None:
+        effect = cohens_d(values_a, values_b)
+        assert np.isinf(effect)
+        assert np.sign(effect) == expected_sign
+
     def test_cohens_d_positive_means_a_greater(self) -> None:
         rng = np.random.default_rng(7)
         a = rng.normal(2.0, 1.0, size=50)
@@ -592,6 +663,26 @@ class TestPairwiseComparisons:
     def test_unknown_correction_raises(self) -> None:
         with pytest.raises(ValueError, match="Unknown correction"):
             pairwise_comparisons(self._results(), correction="fdr")
+
+    @pytest.mark.parametrize("window", [0, -1])
+    def test_nonpositive_window_rejected_without_warnings(self, window: int) -> None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with pytest.raises(ValueError, match="window.*positive"):
+                pairwise_comparisons(self._results(), window=window)
+
+    def test_zero_step_metric_rejected_without_warnings(self) -> None:
+        empty_steps = AggregatedResults(
+            config_name="empty_steps",
+            seeds=[0, 1],
+            metric_arrays={"squared_error": np.empty((2, 0), dtype=np.float64)},
+            summary={},
+        )
+        valid = _make_seeded_aggregated("valid", [0, 1], [1.0, 2.0])
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with pytest.raises(ValueError, match="at least one metric step"):
+                pairwise_comparisons({"empty_steps": empty_steps, "valid": valid})
 
     def test_non_aggregated_results_raises_type_error(self) -> None:
         with pytest.raises(TypeError):

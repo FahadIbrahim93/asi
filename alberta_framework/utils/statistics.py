@@ -61,6 +61,14 @@ class SignificanceResult(NamedTuple):
     method_b: str
 
 
+def _validate_confidence_level(confidence_level: float) -> None:
+    if not 0.0 < confidence_level < 1.0:
+        raise ValueError(
+            "confidence_level must be strictly between 0 and 1 "
+            f"(got {confidence_level!r})"
+        )
+
+
 def compute_statistics(
     values: NDArray[np.float64] | list[float],
     confidence_level: float = 0.95,
@@ -75,12 +83,14 @@ def compute_statistics(
         StatisticalSummary with all statistics
 
     Raises:
-        ValueError: If values is empty
+        ValueError: If values is empty or ``confidence_level`` is not strictly
+            between 0 and 1.
     """
     arr = np.asarray(values)
     n = len(arr)
     if n == 0:
         raise ValueError("values must be non-empty")
+    _validate_confidence_level(confidence_level)
 
     mean = float(np.mean(arr))
     std = float(np.std(arr, ddof=1)) if n > 1 else 0.0
@@ -136,11 +146,13 @@ def compute_timeseries_statistics(
         Tuple of (mean, ci_lower, ci_upper) arrays of shape (n_steps,)
 
     Raises:
-        ValueError: If metric_array has no seed rows
+        ValueError: If metric_array has no seed rows or ``confidence_level`` is
+            not strictly between 0 and 1.
     """
     n_seeds = metric_array.shape[0]
     if n_seeds == 0:
         raise ValueError("metric_array must contain at least one seed row")
+    _validate_confidence_level(confidence_level)
     mean = np.mean(metric_array, axis=0)
 
     if n_seeds == 1:
@@ -179,7 +191,8 @@ def cohens_d(
         values_b: Values for second group
 
     Returns:
-        Cohen's d (positive means a > b)
+        Cohen's d (positive means a > b). Unequal groups with zero pooled
+        variance have a signed-infinite standardized difference.
 
     Raises:
         ValueError: If either group is empty or the pooled degrees of freedom
@@ -213,7 +226,10 @@ def cohens_d(
     pooled_std = np.sqrt(((n_a - 1) * var_a + (n_b - 1) * var_b) / pooled_df)
 
     if pooled_std == 0:
-        return 0.0
+        mean_difference = mean_a - mean_b
+        if mean_difference == 0:
+            return 0.0
+        return float(np.copysign(np.inf, mean_difference))
 
     return float((mean_a - mean_b) / pooled_std)
 
@@ -494,11 +510,15 @@ def pairwise_comparisons(
         Dictionary mapping (method_a, method_b) to SignificanceResult
 
     Raises:
-        ValueError: If seed identities are duplicated, do not match metric rows, or differ
-            between methods used by a paired test. Paired rows are aligned by seed identity;
-            Mann-Whitney samples remain unpaired.
+        ValueError: If ``window`` is not positive, a metric has no steps, seed identities are
+            duplicated, seeds do not match metric rows, or seeds differ between methods used
+            by a paired test. Paired rows are aligned by seed identity; Mann-Whitney samples
+            remain unpaired.
     """
     from alberta_framework.utils.experiments import AggregatedResults
+
+    if window <= 0:
+        raise ValueError(f"window must be positive (got {window})")
 
     names = list(results.keys())
     n = len(names)
@@ -516,6 +536,11 @@ def pairwise_comparisons(
             raise ValueError(
                 f"AggregatedResults {name!r} seed count ({len(agg.seeds)}) does not match "
                 f"metric rows ({arr.shape[0]}) for {metric!r}"
+            )
+        if arr.shape[1] == 0:
+            raise ValueError(
+                f"AggregatedResults {name!r} must contain at least one metric step "
+                f"for {metric!r}"
             )
         final_window = min(window, arr.shape[1])
         final_values[name] = np.mean(arr[:, -final_window:], axis=1)
@@ -621,7 +646,9 @@ def bootstrap_ci(
         Tuple of (point_estimate, ci_lower, ci_upper)
 
     Raises:
-        ValueError: If ``values`` is empty.
+        ValueError: If ``values`` is empty, ``statistic`` is not ``"mean"`` or
+            ``"median"``, ``confidence_level`` is not strictly between 0 and 1,
+            or ``n_bootstrap`` is not positive.
     """
     arr = np.asarray(values)
     if len(arr) == 0:
@@ -629,6 +656,13 @@ def bootstrap_ci(
             "bootstrap_ci requires at least one value; got an empty array "
             "(a NaN interval would be indistinguishable from a real CI)"
         )
+    if statistic not in ("mean", "median"):
+        raise ValueError(
+            f"statistic must be either 'mean' or 'median' (got {statistic!r})"
+        )
+    _validate_confidence_level(confidence_level)
+    if n_bootstrap <= 0:
+        raise ValueError(f"n_bootstrap must be positive (got {n_bootstrap})")
     rng = np.random.default_rng(seed)
 
     stat_func = np.mean if statistic == "mean" else np.median
