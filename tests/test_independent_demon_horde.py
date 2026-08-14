@@ -166,6 +166,60 @@ class TestIndependence:
 
 
 # =============================================================================
+# ObGD apply site: inf error * zeroed step must not NaN weights
+# =============================================================================
+
+
+class TestObgdApplyFinite:
+    """Inf TD error zeros the ObGD step, then error*step is 0*inf=NaN."""
+
+    def test_infinite_cumulant_with_obgd_does_not_poison_weights(self) -> None:
+        spec = create_horde_spec(_make_all_gamma0_spec(2))
+        horde = IndependentDemonHorde(
+            horde_spec=spec,
+            hidden_sizes=(4,),
+            sparsity=0.0,
+            bounder=ObGDBounding(kappa=2.0),
+        )
+        state = horde.init(3, jr.key(0))
+        obs = jnp.ones(3, dtype=jnp.float32)
+        next_obs = jnp.zeros(3, dtype=jnp.float32)
+
+        poisoned = horde.update(
+            state, obs, jnp.array([jnp.inf, 1.0], dtype=jnp.float32), next_obs
+        )
+        d0_old = state.demon_states[0]
+        d0_new = poisoned.state.demon_states[0]  # type: ignore[attr-defined]
+        for w_old, w_new in zip(
+            d0_old.params.weights, d0_new.params.weights, strict=True
+        ):
+            assert bool(jnp.all(jnp.isfinite(w_new)))
+            chex.assert_trees_all_close(w_old, w_new)
+
+        d1_old = state.demon_states[1]
+        d1_new = poisoned.state.demon_states[1]  # type: ignore[attr-defined]
+        any_changed = False
+        for w_old, w_new in zip(
+            d1_old.params.weights, d1_new.params.weights, strict=True
+        ):
+            assert bool(jnp.all(jnp.isfinite(w_new)))
+            if not jnp.allclose(w_old, w_new):
+                any_changed = True
+        assert any_changed, "finite demon 1 should still update"
+        assert int(poisoned.state.step_count) == int(state.step_count) + 1  # type: ignore[attr-defined]
+
+        recovered = horde.update(
+            poisoned.state,  # type: ignore[arg-type]
+            obs,
+            jnp.array([1.0, 0.5], dtype=jnp.float32),
+            next_obs,
+        )
+        for ds in recovered.state.demon_states:  # type: ignore[attr-defined]
+            for w in ds.params.weights:
+                assert bool(jnp.all(jnp.isfinite(w)))
+
+
+# =============================================================================
 # gamma*lamda > 0 with hidden layers must NOT raise (the point of this class)
 # =============================================================================
 

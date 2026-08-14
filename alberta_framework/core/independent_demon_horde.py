@@ -60,6 +60,17 @@ from alberta_framework.core.types import (
     TraceMode,
 )
 
+
+def _floating_tree_is_finite(tree: object) -> Array:
+    """Return whether every floating/complex persistent leaf is finite."""
+    valid = jnp.asarray(True, dtype=jnp.bool_)
+    for leaf in jax.tree.leaves(tree):
+        array = jnp.asarray(leaf)
+        if jnp.issubdtype(array.dtype, jnp.inexact):
+            valid = valid & jnp.all(jnp.isfinite(array))
+    return valid
+
+
 # =============================================================================
 # Types
 # =============================================================================
@@ -457,6 +468,7 @@ class IndependentDemonHorde:
         ``active`` is ``False`` the demon's parameters, traces, and
         optimizer states are preserved unchanged; ``error`` and
         ``mean_step_size`` are returned as NaN to flag inactivity.
+        Non-finite proposed weights (ObGD ``0 * inf``) are also held.
 
         This mirrors the body of ``MLPLearner.update`` but: (a) accepts
         an external active mask so NaN cumulants suppress the update,
@@ -567,30 +579,45 @@ class IndependentDemonHorde:
             biases=tuple(new_biases),
         )
 
-        # 7. Mask inactive demons: keep old params/traces/opt-states/normalizer
+        # Inf error zeros the ObGD step, then error * step is 0*inf=NaN.
+        # Treat that the same as an inactive demon: keep previous finite
+        # params, traces, and optimizer states.
+        proposed_finite = (
+            _floating_tree_is_finite(new_params)
+            & _floating_tree_is_finite(tuple(new_traces))
+            & _floating_tree_is_finite(tuple(new_opt_states))
+        )
+        commit = (
+            active
+            & jnp.all(jnp.isfinite(obs))
+            & jnp.isfinite(error)
+            & proposed_finite
+        )
+
+        # 7. Mask inactive / non-finite updates: keep old params/traces/opt
         new_params = MLPParams(
             weights=tuple(
-                jnp.where(active, new_w, old_w)
+                jnp.where(commit, new_w, old_w)
                 for new_w, old_w in zip(
                     new_params.weights, demon_state.params.weights, strict=True
                 )
             ),
             biases=tuple(
-                jnp.where(active, new_b, old_b)
+                jnp.where(commit, new_b, old_b)
                 for new_b, old_b in zip(
                     new_params.biases, demon_state.params.biases, strict=True
                 )
             ),
         )
         masked_traces = tuple(
-            jnp.where(active, new_t, old_t)
+            jnp.where(commit, new_t, old_t)
             for new_t, old_t in zip(
                 new_traces, demon_state.traces, strict=True
             )
         )
         masked_opt_states = tuple(
             jax.tree.map(
-                lambda new, old: jnp.where(active, new, old),
+                lambda new, old: jnp.where(commit, new, old),
                 new_opt,
                 old_opt,
             )
@@ -604,7 +631,7 @@ class IndependentDemonHorde:
             and new_normalizer_state is not None
         ):
             masked_normalizer_state = jax.tree.map(
-                lambda new, old: jnp.where(active, new, old),
+                lambda new, old: jnp.where(commit, new, old),
                 new_normalizer_state,
                 demon_state.normalizer_state,
             )
@@ -616,7 +643,7 @@ class IndependentDemonHorde:
             optimizer_states=masked_opt_states,
             traces=masked_traces,
             normalizer_state=masked_normalizer_state,
-            step_count=demon_state.step_count + jnp.where(active, 1, 0),
+            step_count=demon_state.step_count + jnp.where(commit, 1, 0),
             birth_timestamp=demon_state.birth_timestamp,
             uptime_s=demon_state.uptime_s,
         )
