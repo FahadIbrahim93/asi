@@ -373,6 +373,39 @@ class TestAdamWTransaction:
             np.asarray(recovered.params["weight"]), np.asarray(params["weight"])
         )
 
+    def test_finite_post_apply_overflow_rejects_entire_transaction(self):
+        import jax
+
+        hp = dict(ADAMW_PROTOCOL_HYPERPARAMETERS)
+        hp["step_size"] = 3e38
+        hp["weight_decay"] = 0.0
+        init_fn, step_fn = _make_adamw_learner(hp)
+        params = {
+            "bias": jnp.asarray([-3e38], dtype=jnp.float32),
+            "weight": self._params()["weight"],
+        }
+        state = init_fn(params)
+        grads = {
+            "bias": jnp.asarray([1.0], dtype=jnp.float32),
+            "weight": jnp.zeros_like(params["weight"]),
+        }
+
+        compiled_step = jax.jit(step_fn)
+        result = compiled_step(params, state, grads, jr.key(2))
+
+        assert not bool(result.update_applied)
+        self._assert_tree_equal(result.params, params)
+        self._assert_tree_equal(result.state, state)
+
+        recovered = compiled_step(
+            result.params,
+            result.state,
+            {name: jnp.zeros_like(value) for name, value in grads.items()},
+            jr.key(3),
+        )
+        assert bool(recovered.update_applied)
+        self._assert_tree_equal(recovered.params, params)
+
     def test_finite_step_matches_leafwise_adamw_and_jit(self):
         import jax
 
