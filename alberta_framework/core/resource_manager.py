@@ -47,6 +47,33 @@ from alberta_framework.core.update_safety import (
 )
 
 
+def _skip_zero_scale(scale: float, value: Array) -> Array:
+    """Keep finite multiplication exact while repairing zero-scaled poison."""
+    product = scale * value
+    if scale != 0.0:
+        return product
+    return jnp.where(jnp.isfinite(value), product, jnp.zeros_like(value))
+
+
+def _recover_nonfinite_at_zero_scale(scale: float, value: Array) -> Array:
+    """Repair only non-finite history that a zero scale is configured to forget."""
+    if scale != 0.0:
+        return value
+    return jnp.where(~jnp.isfinite(value), jnp.zeros_like(value), value)
+
+
+def _mask_unused_history(
+    history: Array,
+    context: Array,
+    unused: Array,
+) -> Array:
+    """Zero only history entries that the candidate update does not consume."""
+    current = history[context]
+    recoverable = unused & ~jnp.isfinite(current)
+    checked = jnp.where(recoverable, jnp.zeros_like(current), current)
+    return history.at[context].set(checked)
+
+
 def _validated_cost_weight(value: float) -> float:
     """Return a non-negative weight that stays finite and nonzero in float32."""
     numeric = float(value)
@@ -320,6 +347,7 @@ class LearnedResourceManager:
             self._n_contexts,
         )
         logits = state.log_weights[context]
+        logits = _recover_nonfinite_at_zero_scale(self._discount, logits)
         weights = jax.nn.softmax(logits)
         if self._exploration > 0.0:
             uniform = jnp.full_like(weights, 1.0 / float(self._n_actions))
@@ -380,7 +408,8 @@ class LearnedResourceManager:
 
         old_context_logits = state.log_weights[context]
         new_context_logits = (
-            self._discount * old_context_logits + self._learning_rate * advantages
+            _skip_zero_scale(self._discount, old_context_logits)
+            + self._learning_rate * advantages
         )
         # Remove an arbitrary additive constant for numerical stability.
         new_context_logits = new_context_logits - jnp.mean(new_context_logits)
@@ -389,7 +418,8 @@ class LearnedResourceManager:
         old_ema = state.loss_ema[context]
         new_ema = jnp.where(
             valid_actions,
-            self._loss_decay * old_ema + (1.0 - self._loss_decay) * adjusted,
+            _skip_zero_scale(self._loss_decay, old_ema)
+            + (1.0 - self._loss_decay) * adjusted,
             old_ema,
         )
         new_loss_ema = state.loss_ema.at[context].set(new_ema)
@@ -401,9 +431,25 @@ class LearnedResourceManager:
             action_counts=new_counts,
             step_count=state.step_count + 1,
         )
+        checked_log_weights = _mask_unused_history(
+            state.log_weights,
+            context,
+            jnp.asarray(self._discount == 0.0, dtype=jnp.bool_),
+        )
+        checked_loss_ema = _mask_unused_history(
+            state.loss_ema,
+            context,
+            valid_actions & jnp.asarray(self._loss_decay == 0.0, dtype=jnp.bool_),
+        )
+        previous_checked = LearnedResourceManagerState(  # type: ignore[call-arg]
+            log_weights=checked_log_weights,
+            loss_ema=checked_loss_ema,
+            action_counts=state.action_counts,
+            step_count=state.step_count,
+        )
         update_applied = (
             context_valid
-            & floating_tree_is_finite(state)
+            & floating_tree_is_finite(previous_checked)
             & floating_tree_is_finite(candidate_state)
             & jnp.all(jnp.isfinite(weights))
             & jnp.all(jnp.isfinite(adjusted))
@@ -668,7 +714,9 @@ class GeneratorMetaResourceManager:
             context_id,
             self._n_contexts,
         )
-        weights = jax.nn.softmax(state.log_weights[context])
+        logits = state.log_weights[context]
+        logits = _recover_nonfinite_at_zero_scale(self._discount, logits)
+        weights = jax.nn.softmax(logits)
         if self._exploration > 0.0:
             uniform = jnp.full_like(weights, 1.0 / float(self.n_policies))
             weights = (1.0 - self._exploration) * weights + self._exploration * uniform
@@ -823,7 +871,8 @@ class GeneratorMetaResourceManager:
 
         old_context_logits = state.log_weights[context]
         new_context_logits = (
-            self._discount * old_context_logits + self._learning_rate * advantages
+            _skip_zero_scale(self._discount, old_context_logits)
+            + self._learning_rate * advantages
         )
         new_context_logits = new_context_logits - jnp.mean(new_context_logits)
         new_log_weights = state.log_weights.at[context].set(new_context_logits)
@@ -831,7 +880,8 @@ class GeneratorMetaResourceManager:
         old_ema = state.reward_ema[context]
         new_ema = jnp.where(
             finite,
-            self._reward_decay * old_ema + (1.0 - self._reward_decay) * adjusted,
+            _skip_zero_scale(self._reward_decay, old_ema)
+            + (1.0 - self._reward_decay) * adjusted,
             old_ema,
         )
         new_reward_ema = state.reward_ema.at[context].set(new_ema)
@@ -843,10 +893,26 @@ class GeneratorMetaResourceManager:
             action_counts=new_counts,
             step_count=state.step_count + 1,
         )
+        checked_log_weights = _mask_unused_history(
+            state.log_weights,
+            context,
+            jnp.asarray(self._discount == 0.0, dtype=jnp.bool_),
+        )
+        checked_reward_ema = _mask_unused_history(
+            state.reward_ema,
+            context,
+            finite & jnp.asarray(self._reward_decay == 0.0, dtype=jnp.bool_),
+        )
+        previous_checked = GeneratorMetaResourceManagerState(  # type: ignore[call-arg]
+            log_weights=checked_log_weights,
+            reward_ema=checked_reward_ema,
+            action_counts=state.action_counts,
+            step_count=state.step_count,
+        )
         update_applied = (
             context_valid
             & selection_input_valid
-            & floating_tree_is_finite(state)
+            & floating_tree_is_finite(previous_checked)
             & floating_tree_is_finite(candidate_state)
             & jnp.all(jnp.isfinite(weights))
             & jnp.all(jnp.isfinite(adjusted))

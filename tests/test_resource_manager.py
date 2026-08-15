@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 
 import chex
+import jax
 import jax.numpy as jnp
 import jax.random as jr
 import numpy as np
@@ -109,6 +110,78 @@ class TestLearnedResourceManager:
         assert result.state.action_counts[0, 0] == pytest.approx(1.0)
         assert result.state.action_counts[0, 1] == pytest.approx(0.0)
 
+    def test_zero_discount_recovers_nonfinite_logits(self) -> None:
+        manager = LearnedResourceManager(
+            n_actions=2,
+            learning_rate=1.0,
+            discount=0.0,
+            exploration=0.0,
+        )
+        finite_state = manager.init().replace(
+            log_weights=jnp.asarray([[2.0, -2.0]], dtype=jnp.float32)
+        )
+        chex.assert_trees_all_equal(
+            manager.weights(finite_state),
+            jax.nn.softmax(finite_state.log_weights[0]),
+        )
+
+        state = finite_state.replace(
+            log_weights=jnp.full((1, 2), jnp.inf, dtype=jnp.float32)
+        )
+        raw = jnp.asarray(0.0, dtype=jnp.float32) * jnp.asarray(jnp.inf, dtype=jnp.float32)
+        assert not bool(jnp.isfinite(raw))
+        assert manager.weights(state).tolist() == pytest.approx([0.5, 0.5])
+
+        result = manager.update(state, jnp.asarray([0.1, 1.0], dtype=jnp.float32))
+        assert bool(result.update_applied)
+        assert bool(jnp.all(jnp.isfinite(result.state.log_weights)))
+        assert bool(jnp.all(jnp.isfinite(result.weights)))
+
+    def test_nonzero_discount_rejects_nonfinite_logits(self) -> None:
+        manager = LearnedResourceManager(n_actions=2, discount=0.5)
+        state = manager.init().replace(
+            log_weights=jnp.full((1, 2), jnp.inf, dtype=jnp.float32)
+        )
+
+        assert not bool(jnp.all(jnp.isfinite(manager.weights(state))))
+        result = manager.update(state, jnp.asarray([0.1, 1.0], dtype=jnp.float32))
+
+        assert not bool(result.update_applied)
+        chex.assert_trees_all_equal(result.state, state)
+
+    def test_zero_loss_decay_recovers_observed_nonfinite_ema(self) -> None:
+        manager = LearnedResourceManager(n_actions=2, loss_decay=0.0)
+        state = manager.init().replace(
+            loss_ema=jnp.asarray([[jnp.inf, 7.0]], dtype=jnp.float32)
+        )
+
+        result = manager.update(state, jnp.asarray([0.1, jnp.nan], dtype=jnp.float32))
+
+        assert bool(result.update_applied)
+        assert result.state.loss_ema[0].tolist() == pytest.approx([0.1, 7.0])
+
+    def test_zero_loss_decay_rejects_poisoned_ema_in_ignored_slot(self) -> None:
+        manager = LearnedResourceManager(n_actions=2, loss_decay=0.0)
+        state = manager.init().replace(
+            loss_ema=jnp.asarray([[0.0, jnp.inf]], dtype=jnp.float32)
+        )
+
+        result = manager.update(state, jnp.asarray([0.1, jnp.nan], dtype=jnp.float32))
+
+        assert not bool(result.update_applied)
+        chex.assert_trees_all_equal(result.state, state)
+
+    def test_nonzero_loss_decay_rejects_consumed_nonfinite_ema(self) -> None:
+        manager = LearnedResourceManager(n_actions=2, loss_decay=0.5)
+        state = manager.init().replace(
+            loss_ema=jnp.asarray([[jnp.inf, 0.0]], dtype=jnp.float32)
+        )
+
+        result = manager.update(state, jnp.asarray([0.1, 1.0], dtype=jnp.float32))
+
+        assert not bool(result.update_applied)
+        chex.assert_trees_all_equal(result.state, state)
+
     def test_config_roundtrip(self) -> None:
         manager = LearnedResourceManager(
             n_actions=4,
@@ -175,6 +248,100 @@ class TestLearnedResourceManager:
 
 class TestGeneratorMetaResourceManager:
     """Behavioral checks for generator-internal meta-resource policies."""
+
+    @staticmethod
+    def _manager(
+        *,
+        discount: float = 0.995,
+        reward_decay: float = 0.99,
+    ) -> GeneratorMetaResourceManager:
+        return GeneratorMetaResourceManager(
+            policy_names=("safe", "residual"),
+            op_ids=(1, 3),
+            parent_modes=(0, 3),
+            replacement_multipliers=(0.5, 2.0),
+            promotion_margin_multipliers=(1.25, 0.75),
+            candidate_min_age_multipliers=(1.5, 0.5),
+            imprint_scales=(0.0, 1.0),
+            learning_rate=1.0,
+            discount=discount,
+            exploration=0.0,
+            reward_decay=reward_decay,
+        )
+
+    def test_zero_discount_recovers_nonfinite_logits(self) -> None:
+        manager = self._manager(discount=0.0)
+        finite_state = manager.init().replace(  # type: ignore[attr-defined]
+            log_weights=jnp.asarray([[2.0, -2.0]], dtype=jnp.float32)
+        )
+        chex.assert_trees_all_equal(
+            manager.weights(finite_state),
+            jax.nn.softmax(finite_state.log_weights[0]),
+        )
+
+        state = finite_state.replace(  # type: ignore[attr-defined]
+            log_weights=jnp.full((1, 2), jnp.inf, dtype=jnp.float32)
+        )
+        assert manager.weights(state).tolist() == pytest.approx([0.5, 0.5])
+
+        result = manager.update(state, jnp.asarray([1.0, 0.1], dtype=jnp.float32))
+
+        assert bool(result.update_applied)
+        assert bool(jnp.all(jnp.isfinite(result.state.log_weights)))
+        assert bool(jnp.all(jnp.isfinite(result.weights)))
+
+    def test_nonzero_discount_rejects_nonfinite_logits(self) -> None:
+        manager = self._manager(discount=0.5)
+        state = manager.init().replace(  # type: ignore[attr-defined]
+            log_weights=jnp.full((1, 2), jnp.inf, dtype=jnp.float32)
+        )
+
+        assert not bool(jnp.all(jnp.isfinite(manager.weights(state))))
+        result = manager.update(state, jnp.asarray([1.0, 0.1], dtype=jnp.float32))
+
+        assert not bool(result.update_applied)
+        chex.assert_trees_all_equal(result.state, state)
+
+    def test_zero_reward_decay_recovers_observed_nonfinite_ema(self) -> None:
+        manager = self._manager(reward_decay=0.0)
+        state = manager.init().replace(  # type: ignore[attr-defined]
+            reward_ema=jnp.asarray([[jnp.inf, 7.0]], dtype=jnp.float32)
+        )
+
+        result = manager.update(
+            state,
+            jnp.asarray([1.0, 0.1], dtype=jnp.float32),
+            finite_mask=jnp.asarray([True, False]),
+        )
+
+        assert bool(result.update_applied)
+        assert result.state.reward_ema[0].tolist() == pytest.approx([1.0, 7.0])
+
+    def test_zero_reward_decay_rejects_poisoned_ema_in_masked_slot(self) -> None:
+        manager = self._manager(reward_decay=0.0)
+        state = manager.init().replace(  # type: ignore[attr-defined]
+            reward_ema=jnp.asarray([[0.0, jnp.inf]], dtype=jnp.float32)
+        )
+
+        result = manager.update(
+            state,
+            jnp.asarray([1.0, 0.1], dtype=jnp.float32),
+            finite_mask=jnp.asarray([True, False]),
+        )
+
+        assert not bool(result.update_applied)
+        chex.assert_trees_all_equal(result.state, state)
+
+    def test_nonzero_reward_decay_rejects_consumed_nonfinite_ema(self) -> None:
+        manager = self._manager(reward_decay=0.5)
+        state = manager.init().replace(  # type: ignore[attr-defined]
+            reward_ema=jnp.asarray([[jnp.inf, 0.0]], dtype=jnp.float32)
+        )
+
+        result = manager.update(state, jnp.asarray([1.0, 0.1], dtype=jnp.float32))
+
+        assert not bool(result.update_applied)
+        chex.assert_trees_all_equal(result.state, state)
 
     def test_contexts_learn_independently_from_rewards(self) -> None:
         manager = GeneratorMetaResourceManager(
