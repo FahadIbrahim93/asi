@@ -354,8 +354,10 @@ class TestPairedTests:
 class TestIdenticalWilcoxonRejection:
     """All-zero paired differences fail closed before version-dependent SciPy behavior."""
 
-    def test_wilcoxon_rejects_identical_samples_without_warning(self) -> None:
-        values = [0.91, 0.88, 0.95]
+    @pytest.mark.parametrize("values", [[0.91], [0.91, 0.88, 0.95]])
+    def test_wilcoxon_rejects_identical_samples_without_warning(
+        self, values: list[float]
+    ) -> None:
         with warnings.catch_warnings():
             warnings.simplefilter("error")
             with pytest.raises(
@@ -376,6 +378,7 @@ class TestIdenticalWilcoxonRejection:
         assert result.test_name == "Wilcoxon signed-rank"
         assert result.statistic == pytest.approx(0.0)
         assert result.p_value < 1.0
+        assert result.effect_size == cohens_d([1.0, 2.0, 3.0], [0.5, 1.5, 2.5])
 
 
 class TestOneSampleRejection:
@@ -418,6 +421,21 @@ class TestOneSampleRejection:
     def test_paired_ttest_mismatched_lengths_raise_before_scipy(self) -> None:
         with pytest.raises(ValueError, match="equal-length"):
             ttest_comparison([1.0, 2.0], [1.0, 2.0, 3.0], paired=True)
+
+    def test_wilcoxon_mismatched_lengths_raise_before_scipy(self) -> None:
+        with pytest.raises(ValueError, match="equal-length"):
+            wilcoxon_comparison([1.0, 2.0], [1.0, 2.0, 3.0])
+
+    @pytest.mark.parametrize("values_a, values_b", [([], []), ([1.0], [2.0])])
+    def test_wilcoxon_requires_two_pairs_without_warning(
+        self,
+        values_a: list[float],
+        values_b: list[float],
+    ) -> None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with pytest.raises(ValueError, match="at least 2 pairs"):
+                wilcoxon_comparison(values_a, values_b)
 
     def test_unpaired_ttest_length_one_raises_without_runtime_warning(self) -> None:
         with warnings.catch_warnings():

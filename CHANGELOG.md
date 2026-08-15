@@ -34,6 +34,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `get_final_performance` now refuses a non-positive `window` and an empty time
+  axis instead of silently averaging the whole trace (`window=0`, because
+  `arr[:, -0:]` is a full slice) or a prefix (`window < 0`) and publishing NaN.
 - Removed broad package-import fallbacks that hid internal failures, and broke the
   learner/stream import cycle without making Gymnasium a base dependency.
 - Added regression coverage for package import boundaries, release metadata, CI shard

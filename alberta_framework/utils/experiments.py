@@ -334,15 +334,31 @@ def get_final_performance(
     Args:
         results: Dictionary of aggregated results
         metric: Metric to evaluate
-        window: Number of final steps to average
+        window: Number of final steps to average. Must be positive. A window
+            longer than the trace uses the whole trace, matching
+            :func:`aggregate_metrics`.
 
     Returns:
         Dictionary mapping config name to ``(mean, sample_std)``. A one-seed
         aggregate reports zero spread.
+
+    Raises:
+        ValueError: If ``window`` is not positive, or a metric array has no
+            time steps. ``window=0`` is not "the last step": ``arr[:, -0:]``
+            is the full trace, so the helper refuses rather than silently
+            reporting a full-horizon mean.
     """
+    if window <= 0:
+        raise ValueError(f"window must be positive (got {window})")
+
     performance: dict[str, tuple[float, float]] = {}
     for name, agg in results.items():
         arr = agg.metric_arrays[metric]
+        if arr.shape[1] == 0:
+            raise ValueError(
+                f"AggregatedResults {name!r} must contain at least one metric step "
+                f"for {metric!r}"
+            )
         final_window = min(window, arr.shape[1])
         final_means = np.mean(arr[:, -final_window:], axis=1)
         std = float(np.std(final_means, ddof=1)) if len(final_means) > 1 else 0.0
