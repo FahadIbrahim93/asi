@@ -277,6 +277,65 @@ class TestSARSAUpdate:
         q_old = agent.horde.predict(state.learner_state, obs)[0]
         chex.assert_trees_all_close(result.td_error, jnp.float32(1.0) - q_old)
 
+    def test_zero_gamma_inf_next_q_is_not_nan_td_error(self) -> None:
+        """Continuing 0 * inf Q(s', a') is NaN when gamma is exactly 0.
+
+        jnp.where still evaluates both branches, so skip the product when
+        gamma is 0 rather than selecting after 0 * inf.
+        """
+        agent = _make_agent(n_actions=2, gamma=0.0, epsilon_start=0.0, hidden_sizes=())
+        state = agent.init(feature_dim=2, key=jr.key(0))
+        obs = jnp.ones(2, dtype=jnp.float32)
+        state = state.replace(  # type: ignore[attr-defined]
+            last_action=jnp.array(0, dtype=jnp.int32),
+            last_observation=obs,
+        )
+        result = agent.update(
+            state,
+            reward=jnp.array(1.0, dtype=jnp.float32),
+            observation=jnp.array([jnp.inf, 0.0], dtype=jnp.float32),
+            terminated=jnp.array(False),
+            next_action=jnp.array(0, dtype=jnp.int32),
+        )
+        assert bool(jnp.isfinite(result.td_error))
+        q_old = agent.horde.predict(state.learner_state, obs)[0]
+        chex.assert_trees_all_close(result.td_error, jnp.float32(1.0) - q_old)
+
+    def test_zero_gamma_does_not_decay_inf_inactive_traces(self) -> None:
+        """Inactive-head decay is gamma*lamda; 0 * inf traces is NaN."""
+        agent = _make_agent(
+            n_actions=2,
+            hidden_sizes=(),
+            gamma=0.0,
+            epsilon_start=0.0,
+            lamda=0.8,
+        )
+        state = agent.init(feature_dim=2, key=jr.key(1))
+        obs = jnp.ones(2, dtype=jnp.float32)
+        inf_w = jnp.full_like(state.learner_state.head_traces[1][0], jnp.inf)
+        inf_b = jnp.full_like(state.learner_state.head_traces[1][1], jnp.inf)
+        traces = list(state.learner_state.head_traces)
+        traces[1] = (inf_w, inf_b)
+        state = state.replace(  # type: ignore[attr-defined]
+            last_action=jnp.array(0, dtype=jnp.int32),
+            last_observation=obs,
+            learner_state=state.learner_state.replace(head_traces=tuple(traces)),
+        )
+        raw = jnp.asarray(0.0, dtype=jnp.float32) * jnp.asarray(jnp.inf, dtype=jnp.float32)
+        assert not bool(jnp.isfinite(raw))
+        result = agent.update(
+            state,
+            reward=jnp.array(0.5, dtype=jnp.float32),
+            observation=obs * 0.5,
+            terminated=jnp.array(False),
+            next_action=jnp.array(0, dtype=jnp.int32),
+        )
+        w_trace, b_trace = result.state.learner_state.head_traces[1]
+        assert bool(jnp.all(jnp.isfinite(w_trace)))
+        assert bool(jnp.all(jnp.isfinite(b_trace)))
+        chex.assert_trees_all_close(w_trace, jnp.zeros_like(w_trace))
+        chex.assert_trees_all_close(b_trace, jnp.zeros_like(b_trace))
+
 
     def test_nan_masking(self):
         """Only the taken action's head receives a weight update."""
