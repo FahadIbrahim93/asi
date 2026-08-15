@@ -7028,11 +7028,18 @@ def merge_shards(
         )
     noise_mode = noise_modes.pop()
     reference_environment = shards[0]["environment"]
+    reference_keys = set(reference_environment)
     mismatched_environment: dict[str, set[str]] = {}
     for shard in shards[1:]:
+        shard_id = f"{shard['config_name']} seed={shard['seed']}"
+        # Key sets must match symmetrically: a shard *missing* a key the
+        # reference carries (or carrying an extra one) is drift too, and an
+        # asymmetric values-only scan would silently inherit the reference's
+        # value for it in the published summary.
+        for key in reference_keys.symmetric_difference(shard["environment"]):
+            mismatched_environment.setdefault(key, set()).add(shard_id)
         for key, value in shard["environment"].items():
-            if value != reference_environment.get(key):
-                shard_id = f"{shard['config_name']} seed={shard['seed']}"
+            if key in reference_keys and value != reference_environment[key]:
                 mismatched_environment.setdefault(key, set()).add(shard_id)
     if mismatched_environment:
         # jax/numpy/python/platform drift across shards for one merge is a

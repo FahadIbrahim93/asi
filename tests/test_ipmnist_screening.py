@@ -1012,6 +1012,24 @@ class TestShardsAndMerge:
         ):
             merge_shards([p0, p1], control_name="upgd_w_control", slope_window=2)
 
+    def test_merge_rejects_missing_environment_key(self, tmp_path, small_data):
+        """A shard missing a key the reference environment carries must be
+        refused, not silently absorbed: an asymmetric values-only comparison
+        would let it pass and inherit the reference's value for that key in
+        the published summary."""
+        p0 = self._make_shard(tmp_path, small_data, "upgd_w_control", 0)
+        p1 = self._make_shard(tmp_path, small_data, "upgd_w_control", 1)
+
+        payload1 = json.loads(p1.read_text(encoding="utf-8"))
+        del payload1["environment"]["platform"]
+        p1.write_text(json.dumps(payload1), encoding="utf-8")
+
+        with pytest.raises(
+            ValueError,
+            match=r"shards were produced under different environments",
+        ):
+            merge_shards([p0, p1], control_name="upgd_w_control", slope_window=2)
+
     def test_merge_carries_consistent_environment_into_summary(
         self, tmp_path, small_data
     ):
