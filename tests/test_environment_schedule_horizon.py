@@ -17,6 +17,7 @@ from alberta_framework.streams.gauntlet import (
     LIFETIME_GAUNTLET_STATE_SCHEMA,
     GauntletConfig,
     LifetimeGauntletStream,
+    ema_smooth,
     load_lifetime_gauntlet_checkpoint,
     migrate_legacy_lifetime_gauntlet_state,
     save_lifetime_gauntlet_checkpoint,
@@ -34,6 +35,27 @@ from alberta_framework.streams.recurring_multiagent import (
 INT32_MAX = 2**31 - 1
 UINT32_MAX = 2**32 - 1
 pytestmark = pytest.mark.unit
+
+
+def test_ema_smooth_preserves_leading_batch_axes() -> None:
+    """EMA smoothing follows the last axis for higher-rank measurements."""
+    values = jnp.arange(24, dtype=jnp.float32).reshape(2, 3, 4)
+
+    actual = ema_smooth(values, halflife=1.0)
+
+    expected = jnp.asarray(
+        [
+            [[0.0, 0.5, 1.25, 2.125], [4.0, 4.5, 5.25, 6.125], [8.0, 8.5, 9.25, 10.125]],
+            [
+                [12.0, 12.5, 13.25, 14.125],
+                [16.0, 16.5, 17.25, 18.125],
+                [20.0, 20.5, 21.25, 22.125],
+            ],
+        ],
+        dtype=jnp.float32,
+    )
+    chex.assert_shape(actual, values.shape)
+    chex.assert_trees_all_close(actual, expected)
 
 
 def _words(value: int) -> jax.Array:
