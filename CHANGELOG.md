@@ -34,8 +34,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Preserved the initialized Step 1 input-scale vector for one complete configured segment
-  before `XDistShiftStream` performs its first abrupt distribution change.
+- Preserved initialized weights and input-scale vectors for one complete configured segment
+  before `XDistShiftStream`, `AbruptChangeStream`, and `DynamicScaleShiftStream` perform
+  their first abrupt changes.
 - Made RiverSwim reject malformed, non-finite, subnormal, or jointly invalid
   transition probabilities before float32 narrowing can create a negative or
   non-stochastic transition row.

@@ -323,7 +323,9 @@ class AbruptChangeStream:
         del idx  # unused
         key, key_weights, key_x, key_noise = jr.split(state.key, 4)
 
-        should_change = state.step_count % self._change_interval == 0
+        should_change = (state.step_count > 0) & (
+            state.step_count % self._change_interval == 0
+        )
 
         # Generate new weights (always generated but only used if should_change)
         new_random_weights = jr.normal(key_weights, (self._feature_dim,), dtype=jnp.float32)
@@ -972,7 +974,9 @@ class DynamicScaleShiftStream:
         del idx  # unused
         key, k_weights, k_scales, k_x, k_noise = jr.split(state.key, 5)
 
-        should_change_scales = state.step_count % self._scale_change_interval == 0
+        should_change_scales = (state.step_count > 0) & (
+            state.step_count % self._scale_change_interval == 0
+        )
         new_log_scales = jr.uniform(
             k_scales,
             (self._feature_dim,),
@@ -982,7 +986,9 @@ class DynamicScaleShiftStream:
         new_random_scales = jnp.exp(new_log_scales).astype(jnp.float32)
         new_scales = jnp.where(should_change_scales, new_random_scales, state.current_scales)
 
-        should_change_weights = state.step_count % self._weight_change_interval == 0
+        should_change_weights = (state.step_count > 0) & (
+            state.step_count % self._weight_change_interval == 0
+        )
         new_random_weights = jr.normal(k_weights, (self._feature_dim,), dtype=jnp.float32)
         new_weights = jnp.where(should_change_weights, new_random_weights, state.true_weights)
 
