@@ -1312,11 +1312,24 @@ class MLPLearner:
 
         new_traces = []
         for i in range(n_layers):
-            # Weight trace (index 2*i)
-            new_wt = gamma_lamda * state.traces[2 * i] + weight_grads[i]
+            # Weight trace (index 2*i). Skip 0 * inf before adding the gradient.
+            new_wt = (
+                jnp.where(
+                    gamma_lamda == 0.0,
+                    jnp.zeros_like(state.traces[2 * i]),
+                    gamma_lamda * state.traces[2 * i],
+                )
+                + weight_grads[i]
+            )
             new_traces.append(new_wt)
-            # Bias trace (index 2*i + 1)
-            new_bt = gamma_lamda * state.traces[2 * i + 1] + bias_grads[i]
+            new_bt = (
+                jnp.where(
+                    gamma_lamda == 0.0,
+                    jnp.zeros_like(state.traces[2 * i + 1]),
+                    gamma_lamda * state.traces[2 * i + 1],
+                )
+                + bias_grads[i]
+            )
             new_traces.append(new_bt)
 
         # Per-parameter optimizer step from traces
@@ -1369,8 +1382,13 @@ class MLPLearner:
         if state.neuron_utility is not None:
             decay = jnp.array(self._neuron_utility_decay, dtype=jnp.float32)
             new_neuron_utility = tuple(
-                decay * state.neuron_utility[i]
-                + (1.0 - decay) * jnp.sqrt(jnp.sum(weight_grads[i] ** 2, axis=1) + 1e-12)
+                jnp.where(
+                    decay == 0.0,
+                    jnp.zeros_like(state.neuron_utility[i]),
+                    decay * state.neuron_utility[i],
+                )
+                + (1.0 - decay)
+                * jnp.sqrt(jnp.sum(weight_grads[i] ** 2, axis=1) + 1e-12)
                 for i in range(len(self._hidden_sizes))
             )
 
@@ -1384,12 +1402,24 @@ class MLPLearner:
             birth_timestamp=state.birth_timestamp,
             uptime_s=state.uptime_s,
         )
-        # Inf target/obs, or a 0*inf ObGD apply, would commit NaN weights.
-        # MultiHead already refuses that; keep the previous finite state.
+        previous_checked = state
+        if self._gamma * self._lamda == 0.0:
+            previous_checked = state.replace(
+                traces=tuple(jnp.zeros_like(trace) for trace in state.traces),
+            )
+        if (
+            state.neuron_utility is not None
+            and self._neuron_utility_decay == 0.0
+        ):
+            previous_checked = previous_checked.replace(
+                neuron_utility=tuple(
+                    jnp.zeros_like(utility) for utility in state.neuron_utility
+                ),
+            )
         inputs_valid = jnp.all(jnp.isfinite(observation)) & jnp.isfinite(target_scalar)
         update_applied = (
             inputs_valid
-            & floating_tree_is_finite(state)
+            & floating_tree_is_finite(previous_checked)
             & floating_tree_is_finite(proposed_state)
             & normalizer_update_applied
             & jnp.all(jnp.stack(optimizer_updates_applied))
