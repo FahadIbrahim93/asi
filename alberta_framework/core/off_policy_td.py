@@ -65,6 +65,11 @@ from alberta_framework.core.update_safety import (
     floating_tree_is_finite as _floating_tree_is_finite,
 )
 
+
+def _skip_zero_scale(scale: Array, value: Array) -> Array:
+    """Return 0 when ``scale`` is 0 so a 0*inf product cannot form."""
+    return jnp.where(scale == 0.0, jnp.zeros_like(value), scale * value)
+
 # =============================================================================
 # State / result types
 # =============================================================================
@@ -328,12 +333,12 @@ class OffPolicyTDLinearLearner:
 
         v_t = jnp.dot(state.weights, observation) + state.bias
         v_next = jnp.dot(state.weights, next_observation) + state.bias
-        td_error = reward_s + gamma_s * v_next - v_t
+        td_error = reward_s + _skip_zero_scale(gamma_s, v_next) - v_t
 
         # IS-weighted accumulating eligibility trace
         decay = gamma_s * lam * rho_clipped
-        new_e = decay * state.eligibility_traces + observation
-        new_e_b = decay * state.bias_eligibility_trace + 1.0
+        new_e = _skip_zero_scale(decay, state.eligibility_traces) + observation
+        new_e_b = _skip_zero_scale(decay, state.bias_eligibility_trace) + 1.0
 
         # Update with rho_clipped * delta * e
         scaled_update = alpha * rho_clipped * td_error
@@ -350,7 +355,7 @@ class OffPolicyTDLinearLearner:
         inputs_valid = (
             jnp.all(jnp.isfinite(observation))
             & jnp.isfinite(reward_s)
-            & jnp.all(jnp.isfinite(next_observation))
+            & ((gamma_s == 0.0) | jnp.all(jnp.isfinite(next_observation)))
             & jnp.isfinite(gamma_s)
             & jnp.isfinite(rho_s)
         )
@@ -504,14 +509,18 @@ class ETDLinearLearner:
 
         v_t = jnp.dot(state.weights, observation) + state.bias
         v_next = jnp.dot(state.weights, next_observation) + state.bias
-        td_error = reward_s + gamma_s * v_next - v_t
+        td_error = reward_s + _skip_zero_scale(gamma_s, v_next) - v_t
 
-        follow_on = rho_s * gamma_s * state.follow_on_trace + interest_s
+        follow_on = rho_s * _skip_zero_scale(gamma_s, state.follow_on_trace) + interest_s
         emphasis = lam * interest_s + (1.0 - lam) * follow_on
 
         trace_decay = gamma_s * lam
-        new_e = rho_s * (trace_decay * state.eligibility_traces + emphasis * observation)
-        new_e_b = rho_s * (trace_decay * state.bias_eligibility_trace + emphasis)
+        new_e = rho_s * (
+            _skip_zero_scale(trace_decay, state.eligibility_traces) + emphasis * observation
+        )
+        new_e_b = rho_s * (
+            _skip_zero_scale(trace_decay, state.bias_eligibility_trace) + emphasis
+        )
 
         proposed_state = ETDState(  # type: ignore[call-arg]
             weights=state.weights + alpha * td_error * new_e,
@@ -527,7 +536,7 @@ class ETDLinearLearner:
         inputs_valid = (
             jnp.all(jnp.isfinite(observation))
             & jnp.isfinite(reward_s)
-            & jnp.all(jnp.isfinite(next_observation))
+            & ((gamma_s == 0.0) | jnp.all(jnp.isfinite(next_observation)))
             & jnp.isfinite(gamma_s)
             & jnp.isfinite(rho_s)
             & jnp.isfinite(interest_s)
@@ -694,16 +703,18 @@ class GradientTDLinearLearner:
         next_phi = self._augment(next_observation)
         prediction = jnp.dot(state.weights, phi)
         next_prediction = jnp.dot(state.weights, next_phi)
-        td_error = reward_s + gamma_s * next_prediction - prediction
+        td_error = reward_s + _skip_zero_scale(gamma_s, next_prediction) - prediction
 
-        traces = rho_clipped * (phi + gamma_s * lam * state.eligibility_traces)
+        traces = rho_clipped * (
+            phi + _skip_zero_scale(gamma_s * lam, state.eligibility_traces)
+        )
         secondary_dot_trace = jnp.dot(state.secondary_weights, traces)
         secondary_dot_phi = jnp.dot(state.secondary_weights, phi)
 
-        primary_step = alpha * (
-            td_error * traces
-            - gamma_s * (1.0 - lam) * secondary_dot_trace * next_phi
+        bootstrap_correction = _skip_zero_scale(
+            gamma_s * (1.0 - lam) * secondary_dot_trace, next_phi
         )
+        primary_step = alpha * (td_error * traces - bootstrap_correction)
         secondary_step = beta * (td_error * traces - secondary_dot_phi * phi)
 
         proposed_state = GradientTDState(  # type: ignore[call-arg]
@@ -717,7 +728,7 @@ class GradientTDLinearLearner:
         inputs_valid = (
             jnp.all(jnp.isfinite(observation))
             & jnp.isfinite(reward_s)
-            & jnp.all(jnp.isfinite(next_observation))
+            & ((gamma_s == 0.0) | jnp.all(jnp.isfinite(next_observation)))
             & jnp.isfinite(gamma_s)
             & jnp.isfinite(rho_s)
         )
