@@ -7046,6 +7046,23 @@ def merge_shards(
     entries: list[dict[str, Any]] = []
     for name, per_seed in sorted(by_config.items()):
         seeds = sorted(per_seed)
+        reference_base = per_seed[seeds[0]]["base_learner"]
+        mismatched_base = [
+            s for s in seeds if per_seed[s]["base_learner"] != reference_base
+        ]
+        if mismatched_base:
+            # `base_learner` is the cost/reporting bucket for an arm; a
+            # registry name normally pins it, but a config that was re-pointed
+            # at a different base learner between `run` invocations can leave
+            # shards of two different mechanisms in one directory. Without this
+            # check they merge silently under one config_name and report only
+            # seeds[0]'s base_learner as if representative of the whole arm.
+            raise ValueError(
+                f"config {name!r} has inconsistent base_learner across seeds: "
+                f"seed {seeds[0]} used {reference_base!r}, seed(s) {mismatched_base} used "
+                "different values; refusing to merge runs of different base learners "
+                "under one config_name"
+            )
         acc = np.stack(
             [np.asarray(per_seed[s]["per_task_accuracy"], dtype=np.float64) for s in seeds]
         )

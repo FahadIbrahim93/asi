@@ -988,6 +988,26 @@ class TestShardsAndMerge:
         with pytest.raises(ValueError, match="duplicate shard"):
             merge_shards([p1, p2])
 
+    def test_merge_rejects_base_learner_drift_across_seeds(self, tmp_path, small_data):
+        """Two shards under one config_name with different base_learner must
+        not merge: base_learner is the cost/reporting bucket, and a silent
+        merge would report only seeds[0]'s base_learner as if representative
+        of the whole arm (the gap #107 closes — #97 guards hyperparameters
+        but leaves base_learner unguarded)."""
+        p0 = self._make_shard(tmp_path, small_data, "upgd_w_control", 0)
+        p1 = self._make_shard(tmp_path, small_data, "upgd_l2init", 0)
+        p2 = self._make_shard(tmp_path, small_data, "upgd_l2init", 1)
+
+        payload2 = json.loads(p2.read_text(encoding="utf-8"))
+        payload2["base_learner"] = "adamw"
+        p2.write_text(json.dumps(payload2), encoding="utf-8")
+
+        with pytest.raises(
+            ValueError,
+            match=r"'upgd_l2init' has inconsistent base_learner across seeds",
+        ):
+            merge_shards([p0, p1, p2], control_name="upgd_w_control", slope_window=2)
+
     def test_validate_proxy_prefix_and_ordering(self, tmp_path, small_data):
         x, y = small_data
         partials = tmp_path / "partials"
