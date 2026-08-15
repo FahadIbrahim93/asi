@@ -796,3 +796,54 @@ class TestPerHeadGammaLamda:
         restored = MultiHeadMLPLearner.from_config(config)
         restored_config = restored.to_config()
         assert restored_config["per_head_gamma_lamda"] == [0.0, 0.5, 0.9]
+
+
+def test_gamma_zero_inf_next_pred_is_not_nan_target() -> None:
+    """gamma=0 * inf V(s') is 0*inf = NaN and inactivates a prediction demon.
+
+    Fail-closed: a zero discount does not multiply V(s'). The target is the
+    cumulant, matching the finite-path algebra.
+    """
+    spec = create_horde_spec(
+        [
+            GVFSpec(
+                name="p",
+                demon_type=DemonType.PREDICTION,
+                gamma=0.0,
+                lamda=0.0,
+                cumulant_index=0,
+            ),
+            GVFSpec(
+                name="v",
+                demon_type=DemonType.PREDICTION,
+                gamma=0.9,
+                lamda=0.0,
+                cumulant_index=1,
+            ),
+        ]
+    )
+    horde = HordeLearner(
+        horde_spec=spec,
+        hidden_sizes=(),
+        step_size=0.1,
+        sparsity=0.0,
+        bounder=ObGDBounding(kappa=2.0),
+    )
+    state = horde.init(2, jr.key(0))
+    result = horde.update(
+        state,
+        jnp.zeros(2, dtype=jnp.float32),
+        jnp.array([1.25, 0.5], dtype=jnp.float32),
+        jnp.array([jnp.inf, 0.0], dtype=jnp.float32),
+    )
+    assert bool(jnp.isfinite(result.td_targets[0]))
+    chex.assert_trees_all_close(result.td_targets[0], jnp.float32(1.25))
+    discounted = horde.update_with_discounts(
+        state,
+        jnp.zeros(2, dtype=jnp.float32),
+        jnp.array([1.25, 0.5], dtype=jnp.float32),
+        jnp.array([jnp.inf, 0.0], dtype=jnp.float32),
+        jnp.array([0.0, 0.9], dtype=jnp.float32),
+    )
+    assert bool(jnp.isfinite(discounted.td_targets[0]))
+    chex.assert_trees_all_close(discounted.td_targets[0], jnp.float32(1.25))

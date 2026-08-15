@@ -368,7 +368,8 @@ class HordeLearner:
         # For gamma=0 demons: target = cumulant (single-step prediction)
         # NaN cumulants stay NaN (inactive demons)
         gammas = self._horde_spec.gammas
-        targets = cumulants + gammas * next_preds
+        bootstrap = jnp.where(gammas == 0.0, 0.0, gammas * next_preds)
+        targets = cumulants + bootstrap
 
         # 3. Delegate to MultiHeadMLPLearner
         result = self._learner.update(state, observation, targets)
@@ -412,7 +413,8 @@ class HordeLearner:
         """
         next_preds = self._learner.predict(state, next_observation)
         discounts = jnp.asarray(discounts, dtype=jnp.float32)
-        targets = cumulants + discounts * next_preds
+        bootstrap = jnp.where(discounts == 0.0, 0.0, discounts * next_preds)
+        targets = cumulants + bootstrap
         result = self._learner.update(state, observation, targets)
 
         return HordeUpdateResult(  # type: ignore[call-arg]
