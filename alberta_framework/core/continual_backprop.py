@@ -283,7 +283,12 @@ def update_utility(
     new_ages: list[Array] = []
     for i in range(n_layers):
         contribution = jnp.abs(activations[i] * activation_grads[i])
+        # Inf activation * a silent gradient is 0*inf = NaN. Hold the
+        # previous finite utility so replacement does not treat NaN as
+        # the lowest-utility unit.
+        contribution_finite = jnp.isfinite(contribution)
         u_new = decay * cbp_state.utilities[i] + (1.0 - decay) * contribution
+        u_new = jnp.where(contribution_finite, u_new, cbp_state.utilities[i])
         new_utilities.append(u_new)
         new_ages.append(cbp_state.ages[i] + 1)
 
@@ -305,8 +310,8 @@ def _select_replacement_index(
     exists, ``selected`` is ``-1`` (sentinel) and ``has_candidate`` is
     ``False``.
 
-    Implementation: replace the utility of immature units with ``+inf``
-    before taking ``argmin`` so they are never chosen.
+    Implementation: replace the utility of immature or non-finite units
+    with ``+inf`` before taking ``argmin`` so they are never chosen.
 
     Args:
         utility: Per-unit utility array, shape ``(num_units,)``.
@@ -318,8 +323,9 @@ def _select_replacement_index(
         unit (or ``-1``) and ``has_candidate`` is a boolean scalar.
     """
     mature = age >= jnp.asarray(maturity_threshold, dtype=age.dtype)
-    masked_utility = jnp.where(mature, utility, jnp.inf)
-    has_candidate = jnp.any(mature)
+    eligible = mature & jnp.isfinite(utility)
+    masked_utility = jnp.where(eligible, utility, jnp.inf)
+    has_candidate = jnp.any(eligible)
     idx = jnp.argmin(masked_utility)
     selected = jnp.where(has_candidate, idx, jnp.int32(-1))
     return selected.astype(jnp.int32), has_candidate

@@ -17,6 +17,7 @@ from alberta_framework.core.continual_backprop import (
     ContinualBackpropConfig,
     ContinualBackpropState,
     ContinualBackpropTracker,
+    _select_replacement_index,
     init_cbp_state,
     maybe_replace_units,
     run_cbp_learning_loop,
@@ -128,6 +129,27 @@ class TestUtilityUpdate:
         assert int(state.ages[0][0]) == 10
         assert int(state.ages[0][1]) == 10
         assert int(state.ages[0][2]) == 10
+
+    def test_inf_activation_silent_grad_holds_finite_utility(self) -> None:
+        """Inf activation * a silent gradient is 0*inf = NaN utility.
+
+        Fail-closed: keep the previous finite EMA for that unit so
+        replacement does not treat NaN as the lowest-utility mature unit.
+        """
+        cbp_state = ContinualBackpropState(  # type: ignore[call-arg]
+            utilities=(jnp.array([0.9, 0.1], dtype=jnp.float32),),
+            ages=(jnp.array([100, 100], dtype=jnp.int32),),
+            replacement_accumulators=jnp.zeros(1, dtype=jnp.float32),
+            rng_key=jr.key(0),
+        )
+        activations = (jnp.array([jnp.inf, 1.0], dtype=jnp.float32),)
+        grads = (jnp.array([0.0, 0.2], dtype=jnp.float32),)
+        new = update_utility(cbp_state, activations, grads, 0.9)
+        assert bool(jnp.all(jnp.isfinite(new.utilities[0])))
+        chex.assert_trees_all_close(new.utilities[0][0], cbp_state.utilities[0][0])
+        idx, has = _select_replacement_index(new.utilities[0], new.ages[0], 10)
+        assert bool(has)
+        assert int(idx) == 1
 
 
 class TestWrapperUtilityGradients:
