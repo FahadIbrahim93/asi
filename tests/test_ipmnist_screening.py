@@ -926,6 +926,12 @@ class TestShardsAndMerge:
             "per_task_loss": [0.1] * SMALL.n_tasks,
             "per_task_plasticity": [0.5] * SMALL.n_tasks,
             "wall_clock_seconds": 1.0,
+            "environment": {
+                "jax": "test-jax",
+                "numpy": "test-numpy",
+                "python": "test-python",
+                "platform": "test-platform",
+            },
         }
         path = tmp_path / f"{config_name}_seed{seed}.json"
         path.write_text(json.dumps(payload), encoding="utf-8")
@@ -1140,6 +1146,63 @@ class TestShardsAndMerge:
             match=r"'upgd_l2init' has inconsistent hyperparameters across seeds",
         ):
             merge_shards([p0, p1, p2], control_name="upgd_w_control", slope_window=2)
+
+    def test_merge_rejects_base_learner_drift_across_seeds(self, tmp_path, small_data):
+        p0 = self._make_shard(tmp_path, small_data, "upgd_w_control", 0)
+        p1 = self._make_shard(tmp_path, small_data, "upgd_l2init", 0)
+        p2 = self._make_shard(tmp_path, small_data, "upgd_l2init", 1)
+
+        payload2 = json.loads(p2.read_text(encoding="utf-8"))
+        payload2["base_learner"] = "adamw"
+        p2.write_text(json.dumps(payload2), encoding="utf-8")
+
+        with pytest.raises(
+            ValueError,
+            match=r"'upgd_l2init' has inconsistent base_learner across seeds",
+        ):
+            merge_shards([p0, p1, p2], control_name="upgd_w_control", slope_window=2)
+
+    def test_merge_rejects_environment_drift_and_records_environment(
+        self, tmp_path, small_data
+    ):
+        p0 = self._make_shard(tmp_path, small_data, "upgd_w_control", 0)
+        p1 = self._make_shard(tmp_path, small_data, "upgd_w_control", 1)
+        reference_environment = load_shard(p0)["environment"]
+
+        summary = merge_shards([p0, p1], control_name="upgd_w_control", slope_window=2)
+        assert summary["environment"] == reference_environment
+
+        payload1 = json.loads(p1.read_text(encoding="utf-8"))
+        payload1["environment"] = {
+            "jax": "0.0-test",
+            "numpy": "0.0-test",
+            "python": "0.0-test",
+            "platform": "different-test-platform",
+        }
+        p1.write_text(json.dumps(payload1), encoding="utf-8")
+
+        with pytest.raises(ValueError, match="shards span multiple runtime environments"):
+            merge_shards([p0, p1], control_name="upgd_w_control", slope_window=2)
+
+    @pytest.mark.parametrize(
+        "environment",
+        [
+            None,
+            {},
+            {"jax": "test", "numpy": "test", "python": "test"},
+            {"jax": "", "numpy": "test", "python": "test", "platform": "test"},
+        ],
+    )
+    def test_load_rejects_incomplete_environment(
+        self, tmp_path, small_data, environment
+    ):
+        path = self._make_shard(tmp_path, small_data, "upgd_w_control", 0)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["environment"] = environment
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+        with pytest.raises(ValueError, match="environment must record"):
+            load_shard(path)
 
     def test_validate_proxy_prefix_and_ordering(self, tmp_path, small_data):
         x, y = small_data

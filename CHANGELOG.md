@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Added the code-only, permanently nonpromoting IPMNIST gate-ablation arm
+  `rls_head_resid_l1_preset005_nogate`. It has no result artifact and does not authorize a
+  benchmark run; execution remains gated by the issue's source receipt and owner-approved
+  compute budget.
+
 ### Changed
 
 - Moved plotting, dataset, progress, and parallel-execution dependencies from the base
@@ -16,6 +23,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `alberta-framework` project on PyPI is a different distribution.
 - Consolidated locked CI setup, pytest shard planning, and package validation so each concern
   has one implementation and built artifacts are tested without rebuilding them.
+- Extended pre-1.0 learner and optimizer result schemas with explicit scalar or per-channel
+  `update_applied` masks. Transaction-aware callers use the checked optimizer boundary while
+  the legacy two-value `update_from_gradient` API remains available.
+- Kept finite one-step optimizer results byte-pinned. The added JAX transaction predicates can
+  lower differently in compiled multi-step scans and may change last-bit rounding without
+  changing the finite-path equations or acceptance semantics.
 
 ### Fixed
 
@@ -27,6 +40,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   compute; one-seed paired summaries remain available for development inspection.
 - Kept core Autostep and the screening lane's IDBD/Autostep meta-state finite when a
   non-finite correlation would otherwise turn a silent trace into a persistent NaN.
+- Made optimizer, learner, Horde, actor-critic, model, option, normalizer, and utility updates
+  reject non-finite transactions atomically, preserve the last valid state, expose the
+  rejection, and return neutral outward diagnostics instead of partially committing a model.
+- Selected exact zero bootstraps before multiplication in Horde, SARSA, nexting, and
+  Gymnasium value streams, so terminal or disabled channels do not manufacture `0 * inf`
+  NaNs while nonzero channels still expose invalid inputs.
+- Held temporal/history context state on non-finite observations and kept valid finite
+  coordinates observable without silently converting arbitrary invalid inputs into evidence.
+- Strengthened IPMNIST and micro-continual shard merging to reject cross-seed learner,
+  hyperparameter, mechanism, or runtime-environment drift. The common runtime environment is
+  now retained in the IPMNIST summary instead of being silently discarded.
+- Left the immutable evidence artifacts untouched. Registered-source hardening keeps the live
+  five-claim registry fail-closed and `invalid` until separately authorized evidence renewal.
 
 ### Removed
 

@@ -92,7 +92,7 @@ def _assert_neutral_metrics(metrics: dict[str, jax.Array]) -> None:
         ),
     ],
 )
-def test_linear_optimizer_finite_path_is_bitwise_unchanged(
+def test_linear_optimizer_finite_one_step_is_bitwise_unchanged(
     factory: Callable[[], Any], expected_digest: str
 ) -> None:
     optimizer = factory()
@@ -272,7 +272,7 @@ def test_checked_param_update_reports_internal_meta_guard(
         ),
     ],
 )
-def test_td_optimizer_finite_path_is_bitwise_unchanged(
+def test_td_optimizer_finite_one_step_is_bitwise_unchanged(
     factory: Callable[[], Any], expected_digest: str
 ) -> None:
     optimizer = factory()
@@ -510,7 +510,7 @@ def test_feature_learners_allow_nan_missing_target_and_report_commit() -> None:
         assert bool(jnp.isnan(result.errors[1]))
 
 
-def test_feature_finite_paths_are_bitwise_unchanged() -> None:
+def test_feature_finite_one_steps_are_bitwise_unchanged() -> None:
     fixed = FixedBudgetFeatureLearner(
         n_features=5,
         n_tasks=2,

@@ -853,6 +853,10 @@ def load_micro_shard(path: Path | str) -> dict[str, Any]:
         raise ValueError(f"{path}: schema mismatch (expected {MICRO_SHARD_SCHEMA})")
     if payload.get("arm_name") not in MICRO_ARM_REGISTRY:
         raise ValueError(f"{path}: unknown arm {payload.get('arm_name')!r}")
+    if not isinstance(payload.get("mechanism"), str) or not payload["mechanism"]:
+        raise ValueError(f"{path}: mechanism must be a non-empty string")
+    if not isinstance(payload.get("hyperparameters"), dict):
+        raise ValueError(f"{path}: hyperparameters must be an object")
     config = MicroStreamConfig(**payload["stream_config"])
     for fieldname in ("per_regime_accuracy", "per_regime_loss", "per_regime_plasticity"):
         values = np.asarray(payload.get(fieldname, []), dtype=np.float64)
@@ -911,6 +915,17 @@ def merge_micro_shards(
     for arm_name, per_seed in sorted(by_arm.items()):
         seeds = sorted(per_seed)
         all_seeds.update(seeds)
+        for fieldname in ("hyperparameters", "mechanism"):
+            reference = per_seed[seeds[0]][fieldname]
+            mismatched = [
+                seed for seed in seeds if per_seed[seed][fieldname] != reference
+            ]
+            if mismatched:
+                raise ValueError(
+                    f"arm {arm_name!r} has inconsistent {fieldname} across seeds: "
+                    f"seed {seeds[0]} used {reference!r}, seed(s) {mismatched} used "
+                    "different values"
+                )
         curves = np.stack(
             [
                 np.asarray(per_seed[s]["per_regime_accuracy"], dtype=np.float64)

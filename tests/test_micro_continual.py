@@ -674,6 +674,21 @@ class TestShards:
         with pytest.raises(ValueError, match="per_regime_accuracy"):
             load_micro_shard(path)
 
+    @pytest.mark.parametrize(
+        ("fieldname", "bad_value"),
+        [("mechanism", ""), ("hyperparameters", [])],
+    )
+    def test_load_rejects_invalid_arm_contract_field(
+        self, tmp_path: Path, fieldname: str, bad_value: object
+    ):
+        payload = micro_shard_payload(self._result())
+        payload[fieldname] = bad_value
+        path = tmp_path / "bad.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+        with pytest.raises(ValueError, match=fieldname):
+            load_micro_shard(path)
+
     def test_merge_ranks_and_pairs(self, tmp_path: Path):
         paths = []
         for arm in ("sgd_raw", "naive_bayes"):
@@ -703,6 +718,27 @@ class TestShards:
         write_micro_shard(path_a, micro_shard_payload(result_a))
         write_micro_shard(path_b, micro_shard_payload(result_b))
         with pytest.raises(ValueError, match="stream config"):
+            merge_micro_shards([path_a, path_b], bayes_samples=1_000)
+
+    @pytest.mark.parametrize("fieldname", ["hyperparameters", "mechanism"])
+    def test_merge_rejects_arm_contract_drift(self, tmp_path: Path, fieldname: str):
+        payload_a = micro_shard_payload(self._result(seed=0))
+        payload_b = json.loads(json.dumps(payload_a))
+        payload_b["seed"] = 1
+        if fieldname == "hyperparameters":
+            payload_b[fieldname] = {**payload_b[fieldname], "step_size": 999.0}
+        else:
+            payload_b[fieldname] = "different-test-mechanism"
+
+        path_a = tmp_path / "a.json"
+        path_b = tmp_path / "b.json"
+        write_micro_shard(path_a, payload_a)
+        write_micro_shard(path_b, payload_b)
+
+        with pytest.raises(
+            ValueError,
+            match=rf"arm 'sgd_raw' has inconsistent {fieldname} across seeds",
+        ):
             merge_micro_shards([path_a, path_b], bayes_samples=1_000)
 
 

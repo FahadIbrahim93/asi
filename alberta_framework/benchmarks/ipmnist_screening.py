@@ -7068,6 +7068,15 @@ def load_shard(path: Path) -> dict[str, Any]:
         raise ValueError(f"{path}: seed must be a non-negative integer")
     if payload.get("config_name") not in SCREENING_REGISTRY:
         raise ValueError(f"{path}: unknown config_name {payload.get('config_name')!r}")
+    environment = payload.get("environment")
+    required_environment_fields = ("jax", "numpy", "python", "platform")
+    if not isinstance(environment, dict) or any(
+        not isinstance(environment.get(field), str) or not environment[field]
+        for field in required_environment_fields
+    ):
+        raise ValueError(
+            f"{path}: environment must record non-empty jax, numpy, python, and platform strings"
+        )
     return payload
 
 
@@ -7101,6 +7110,17 @@ def merge_shards(
             "approximation); merge them separately"
         )
     noise_mode = noise_modes.pop()
+    reference_environment = shards[0]["environment"]
+    environment_mismatches = [
+        f"{shard['config_name']}/seed={shard['seed']}"
+        for shard in shards
+        if shard["environment"] != reference_environment
+    ]
+    if environment_mismatches:
+        raise ValueError(
+            "shards span multiple runtime environments; merge same-environment runs "
+            f"separately (mismatched: {environment_mismatches})"
+        )
     by_config: dict[str, dict[int, dict[str, Any]]] = {}
     for shard in shards:
         per_seed = by_config.setdefault(shard["config_name"], {})
@@ -7120,6 +7140,18 @@ def merge_shards(
     entries: list[dict[str, Any]] = []
     for name, per_seed in sorted(by_config.items()):
         seeds = sorted(per_seed)
+        reference_base_learner = per_seed[seeds[0]]["base_learner"]
+        mismatched_base_learners = [
+            seed
+            for seed in seeds
+            if per_seed[seed]["base_learner"] != reference_base_learner
+        ]
+        if mismatched_base_learners:
+            raise ValueError(
+                f"config {name!r} has inconsistent base_learner across seeds: "
+                f"seed {seeds[0]} used {reference_base_learner!r}, seed(s) "
+                f"{mismatched_base_learners} used different values"
+            )
         reference_hp = per_seed[seeds[0]]["hyperparameters"]
         mismatched = [s for s in seeds if per_seed[s]["hyperparameters"] != reference_hp]
         if mismatched:
@@ -7220,6 +7252,7 @@ def merge_shards(
         "evidence_policy": dict(NONPROMOTING_POLICY),
         "created_unix": time.time(),
         "protocol_config": dict(shards[0]["config"]),
+        "environment": dict(reference_environment),
         "noise_mode": noise_mode,
         "control_name": control_name,
         "confirmation_threshold": CONFIRMATION_THRESHOLD,
