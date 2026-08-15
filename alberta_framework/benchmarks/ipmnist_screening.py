@@ -6660,6 +6660,7 @@ def _untracked_python_sources(repo_root: Path) -> bytes:
         "--exclude-standard",
         "--",
         "*.py",
+        "*.pyc",
     )
 
 
@@ -7731,6 +7732,55 @@ def _is_finite_json_number(value: object) -> bool:
         return False
 
 
+def _require_screening_curve_domain(
+    values: np.ndarray, field: str, *, context: str
+) -> None:
+    if field in {"per_task_accuracy", "per_task_plasticity"}:
+        if np.any(values < 0.0) or np.any(values > 1.0):
+            raise ValueError(f"{context}: {field} values must be in [0, 1]")
+    elif field == "per_task_loss" and np.any(values < 0.0):
+        raise ValueError(f"{context}: {field} values must be non-negative")
+
+
+def _validated_nonpromoting_policy(value: object, *, context: str) -> dict[str, object]:
+    policy = _require_exact_keys(
+        value,
+        set(NONPROMOTING_POLICY),
+        context=f"{context} evidence_policy",
+    )
+    if any(
+        type(policy[name]) is not type(expected) or policy[name] != expected
+        for name, expected in NONPROMOTING_POLICY.items()
+    ):
+        raise ValueError(
+            f"{context}: evidence_policy must be the frozen nonpromoting policy"
+        )
+    return dict(policy)
+
+
+def _validated_registered_hyperparameters(
+    value: object, spec: ScreeningSpec, *, context: str
+) -> dict[str, float]:
+    hyperparameters = _require_exact_keys(
+        value,
+        set(spec.hyperparameters),
+        context=f"{context} hyperparameters",
+    )
+    invalid = [
+        name
+        for name, expected in spec.hyperparameters.items()
+        if type(hyperparameters[name]) is not float
+        or not math.isfinite(cast(float, hyperparameters[name]))
+        or cast(float, hyperparameters[name]).hex() != expected.hex()
+    ]
+    if invalid:
+        raise ValueError(
+            f"{context}: hyperparameters must exactly match the registered arm; "
+            f"invalid field(s): {sorted(invalid)}"
+        )
+    return {name: cast(float, hyperparameters[name]) for name in spec.hyperparameters}
+
+
 def _validated_source_provenance(value: object, *, context: str) -> dict[str, Any]:
     provenance = _require_exact_keys(
         value,
@@ -7909,20 +7959,35 @@ def _validated_runtime_environment(value: object, *, context: str) -> dict[str, 
     devices = jax_binding["devices"]
     if not isinstance(devices, list) or not devices:
         raise ValueError(f"{context} runtime environment JAX devices must be non-empty")
+    device_identities: set[tuple[str, int, int]] = set()
     for index, device in enumerate(devices):
         binding = _require_exact_keys(
             device,
             {"id", "platform", "device_kind", "process_index"},
             context=f"{context} runtime environment JAX device {index}",
         )
-        if type(binding["id"]) is not int or type(binding["process_index"]) is not int:
+        device_id = binding["id"]
+        process_index = binding["process_index"]
+        if (
+            type(device_id) is not int
+            or type(process_index) is not int
+            or device_id < 0
+            or process_index < 0
+        ):
             raise ValueError(
-                f"{context} runtime environment JAX device IDs must be integers"
+                f"{context} runtime environment JAX device IDs must be "
+                "non-negative integers"
             )
-        _required_nonempty_string(
+        device_platform = _required_nonempty_string(
             binding["platform"],
             context=f"{context} runtime environment JAX device {index}.platform",
         )
+        identity = (device_platform, process_index, device_id)
+        if identity in device_identities:
+            raise ValueError(
+                f"{context} runtime environment JAX device identities must be unique"
+            )
+        device_identities.add(identity)
         _required_nonempty_string(
             binding["device_kind"],
             context=f"{context} runtime environment JAX device {index}.device_kind",
@@ -7976,8 +8041,9 @@ def shard_payload(
         raise ValueError(
             f"new shard base_learner must match registered arm {spec.base_learner!r}"
         )
-    if result.hyperparameters != spec.hyperparameters:
-        raise ValueError("new shard hyperparameters must exactly match the registered arm")
+    hyperparameters = _validated_registered_hyperparameters(
+        result.hyperparameters, spec, context="new shard"
+    )
     noise_mode = _validated_screening_noise_mode(result.noise_mode, spec)
     noise_pool_steps = _validated_screening_noise_pool_steps(
         noise_mode, result.noise_pool_steps
@@ -7988,10 +8054,6 @@ def shard_payload(
     _validate_dataset_config_binding(dataset_binding, result.config, context="new shard")
     if not isinstance(result.base_learner, str) or not result.base_learner:
         raise ValueError("new shard base_learner must be a non-empty string")
-    if not isinstance(result.hyperparameters, dict) or any(
-        not isinstance(name, str) for name in result.hyperparameters
-    ):
-        raise ValueError("new shard hyperparameters must be an object with string keys")
     curves: dict[str, np.ndarray] = {}
     for field in ("per_task_accuracy", "per_task_loss", "per_task_plasticity"):
         try:
@@ -8007,6 +8069,7 @@ def shard_payload(
             raise ValueError(
                 f"new shard {field} must be finite with shape ({result.config.n_tasks},)"
             )
+        _require_screening_curve_domain(values, field, context="new shard")
         curves[field] = values
     wall_clock_seconds = _validated_wall_clock_seconds(
         result.wall_clock_seconds, "new shard"
@@ -8016,7 +8079,7 @@ def shard_payload(
         "evidence_policy": dict(NONPROMOTING_POLICY),
         "config_name": result.config_name,
         "base_learner": result.base_learner,
-        "hyperparameters": dict(result.hyperparameters),
+        "hyperparameters": hyperparameters,
         "seed": seed,
         "noise_mode": noise_mode,
         "noise_pool_steps": noise_pool_steps,
@@ -8050,8 +8113,9 @@ def load_shard(path: Path) -> dict[str, Any]:
     is_v2 = schema == SHARD_SCHEMA
     if is_v2:
         _require_exact_keys(payload, _V2_SHARD_FIELDS, context=str(path))
-        if payload["evidence_policy"] != NONPROMOTING_POLICY:
-            raise ValueError(f"{path}: evidence_policy must be the frozen nonpromoting policy")
+        payload["evidence_policy"] = _validated_nonpromoting_policy(
+            payload["evidence_policy"], context=str(path)
+        )
         created_unix = payload["created_unix"]
         if type(created_unix) not in (int, float):
             raise ValueError(f"{path}: created_unix must be a finite, non-negative number")
@@ -8093,6 +8157,8 @@ def load_shard(path: Path) -> dict[str, Any]:
         values = np.asarray(payload[fieldname], dtype=np.float64)
         if values.shape != (config.n_tasks,) or not np.all(np.isfinite(values)):
             raise ValueError(f"{path}: {fieldname} must be finite with shape ({config.n_tasks},)")
+        if is_v2:
+            _require_screening_curve_domain(values, fieldname, context=str(path))
     payload["wall_clock_seconds"] = _validated_wall_clock_seconds(
         payload.get("wall_clock_seconds"), path
     )
@@ -8104,8 +8170,10 @@ def load_shard(path: Path) -> dict[str, Any]:
         raise ValueError(
             f"{path}: base_learner must match registered arm {spec.base_learner!r}"
         )
-    if is_v2 and payload.get("hyperparameters") != spec.hyperparameters:
-        raise ValueError(f"{path}: hyperparameters must exactly match the registered arm")
+    if is_v2:
+        payload["hyperparameters"] = _validated_registered_hyperparameters(
+            payload.get("hyperparameters"), spec, context=str(path)
+        )
     noise_mode = _validated_screening_noise_mode(
         payload.get("noise_mode", "step"), spec, context=path
     )
@@ -8133,6 +8201,73 @@ def load_shard(path: Path) -> dict[str, Any]:
                 "and platform strings"
             )
     return payload
+
+
+def _artifact_file_binding(path: Path, *, context: str) -> dict[str, object]:
+    artifact_path = Path(path)
+    try:
+        raw = artifact_path.read_bytes()
+    except OSError as exc:
+        raise ValueError(f"{context}: could not read artifact {artifact_path}") from exc
+    return {
+        "path": artifact_path.as_posix(),
+        "size_bytes": len(raw),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+    }
+
+
+def _artifact_file_bindings(
+    paths: Sequence[Path], *, context: str
+) -> list[dict[str, object]]:
+    return [
+        _artifact_file_binding(Path(path), context=context)
+        for path in paths
+    ]
+
+
+def _require_artifact_bindings_unchanged(
+    paths: Sequence[Path],
+    expected: Sequence[Mapping[str, object]],
+    *,
+    context: str,
+) -> None:
+    current = _artifact_file_bindings(paths, context=context)
+    expected_base = [
+        {
+            "path": binding["path"],
+            "size_bytes": binding["size_bytes"],
+            "sha256": binding["sha256"],
+        }
+        for binding in expected
+    ]
+    if current != expected_base:
+        raise RuntimeError(f"{context} changed while the derived receipt was built")
+
+
+def _require_embedded_artifact_manifest_unchanged(
+    manifest: object, *, context: str
+) -> None:
+    if not isinstance(manifest, list) or not manifest:
+        raise RuntimeError(f"{context} is missing an input artifact manifest")
+    paths: list[Path] = []
+    bindings: list[Mapping[str, object]] = []
+    for item in manifest:
+        if not isinstance(item, Mapping):
+            raise RuntimeError(f"{context} has an invalid input artifact manifest")
+        path = item.get("path")
+        size_bytes = item.get("size_bytes")
+        sha256 = item.get("sha256")
+        if (
+            not isinstance(path, str)
+            or not path
+            or type(size_bytes) is not int
+            or size_bytes < 0
+            or not _is_lower_hex(sha256, 64)
+        ):
+            raise RuntimeError(f"{context} has an invalid input artifact manifest")
+        paths.append(Path(path))
+        bindings.append(cast(Mapping[str, object], item))
+    _require_artifact_bindings_unchanged(paths, bindings, context=context)
 
 
 def _screening_batch_environment(
@@ -8217,13 +8352,28 @@ def _late_window_slope(per_task_accuracy: np.ndarray, window: int) -> float:
     return float(np.sum(x * (tail - tail.mean())) / denom)
 
 
+def _validated_proxy_atol(value: object) -> float:
+    if (
+        type(value) is not float
+        or not math.isfinite(value)
+        or value < 0.0
+        or value > 1e-6
+    ):
+        raise ValueError("proxy validation atol must be a finite float in [0, 1e-6]")
+    return value
+
+
 def merge_shards(
     paths: Sequence[Path],
     control_name: str = "upgd_w_control",
     slope_window: int = 15,
 ) -> dict[str, Any]:
     """Merge shards into a ranked screening summary with paired comparisons."""
-    shards = [load_shard(Path(p)) for p in paths]
+    normalized_paths = [Path(path) for path in paths]
+    input_bindings = _artifact_file_bindings(
+        normalized_paths, context="screening shard input"
+    )
+    shards = [load_shard(path) for path in normalized_paths]
     if not shards:
         raise ValueError("no shards given")
     shard_schemas = {shard["schema"] for shard in shards}
@@ -8245,6 +8395,8 @@ def merge_shards(
     configs = {tuple(sorted(s["config"].items())) for s in shards}
     if len(configs) != 1:
         raise ValueError("shards span multiple protocol configs; merge them separately")
+    if type(slope_window) is not int or slope_window < 2:
+        raise ValueError("slope_window must be a built-in integer of at least 2")
     noise_modes = {s["noise_mode"] for s in shards}
     if len(noise_modes) != 1:
         raise ValueError(
@@ -8391,6 +8543,26 @@ def merge_shards(
     if source_provenance is not None and dataset_provenance is not None:
         summary["source_provenance"] = source_provenance
         summary["dataset_provenance"] = dataset_provenance
+        summary["shard_manifest"] = sorted(
+            (
+                {
+                    **binding,
+                    "config_name": shard["config_name"],
+                    "seed": shard["seed"],
+                }
+                for binding, shard in zip(input_bindings, shards, strict=True)
+            ),
+            key=lambda entry: (
+                cast(str, entry["config_name"]),
+                cast(int, entry["seed"]),
+                cast(str, entry["path"]),
+            ),
+        )
+    _require_artifact_bindings_unchanged(
+        normalized_paths,
+        input_bindings,
+        context="screening shard input",
+    )
     return summary
 
 
@@ -8407,8 +8579,13 @@ def validate_proxy(
     UPGD-W > AdamW ordering both in the proxy runs and in the full-run
     prefixes at the same task index.
     """
+    atol = _validated_proxy_atol(atol)
     partials_dir = Path(partials_dir)
-    shards = [load_shard(Path(path)) for path in shard_paths]
+    normalized_shard_paths = [Path(path) for path in shard_paths]
+    shard_bindings = _artifact_file_bindings(
+        normalized_shard_paths, context="proxy-validation shard input"
+    )
+    shards = [load_shard(path) for path in normalized_shard_paths]
     if not shards:
         raise ValueError("no shards given")
     shard_schemas = {shard["schema"] for shard in shards}
@@ -8487,16 +8664,31 @@ def validate_proxy(
     proxy_avg: dict[str, list[float]] = {"upgd_w": [], "adamw": []}
     full_avg: dict[str, list[float]] = {"upgd_w": [], "adamw": []}
     n_tasks_seen: set[int] = set()
+    reference_paths: list[Path] = []
+    reference_bindings: list[dict[str, object]] = []
+    reference_manifest: list[dict[str, object]] = []
     for path, shard in zip(shard_paths, shards, strict=True):
         learner = learner_by_control[shard["config_name"]]
         seed = shard["seed"]
         n_tasks = int(shard["config"]["n_tasks"])
         n_tasks_seen.add(n_tasks)
         partial_path = partials_dir / f"{learner}_seed{seed}.json"
+        reference_binding = _artifact_file_binding(
+            partial_path, context="proxy-validation reference partial"
+        )
         reference = _validated_partial_payload(
             partial_path,
             schema=PARTIAL_SCHEMA_V1,
             seed_field="seeds",
+        )
+        reference_paths.append(partial_path)
+        reference_bindings.append(reference_binding)
+        reference_manifest.append(
+            {
+                **reference_binding,
+                "learner": learner,
+                "seed": seed,
+            }
         )
         if reference["learner"] != learner:
             raise ValueError(
@@ -8580,8 +8772,42 @@ def validate_proxy(
         ),
     }
     if source_provenance is not None and dataset_provenance is not None:
+        report["evidence_policy"] = dict(NONPROMOTING_POLICY)
         report["source_provenance"] = source_provenance
         report["dataset_provenance"] = dataset_provenance
+        report["shard_manifest"] = sorted(
+            (
+                {
+                    **binding,
+                    "config_name": shard["config_name"],
+                    "seed": shard["seed"],
+                }
+                for binding, shard in zip(shard_bindings, shards, strict=True)
+            ),
+            key=lambda entry: (
+                cast(str, entry["config_name"]),
+                cast(int, entry["seed"]),
+                cast(str, entry["path"]),
+            ),
+        )
+        report["reference_partial_manifest"] = sorted(
+            reference_manifest,
+            key=lambda entry: (
+                cast(str, entry["learner"]),
+                cast(int, entry["seed"]),
+                cast(str, entry["path"]),
+            ),
+        )
+    _require_artifact_bindings_unchanged(
+        normalized_shard_paths,
+        shard_bindings,
+        context="proxy-validation shard input",
+    )
+    _require_artifact_bindings_unchanged(
+        reference_paths,
+        reference_bindings,
+        context="proxy-validation reference partial",
+    )
     return report
 
 
@@ -8602,6 +8828,50 @@ def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
         json.dumps(payload, allow_nan=False, indent=1, sort_keys=True) + "\n"
     ).encode("utf-8")
     atomic_write_new(Path(path), encoded)
+
+
+def _screening_derivation_bindings(
+    shard_paths: Sequence[Path],
+) -> tuple[dict[str, object], dict[str, object]] | None:
+    """Capture the current derivation context only for strict v2 inputs."""
+    if not shard_paths:
+        return None
+    first = load_strict_json_object(Path(shard_paths[0]))
+    if first.get("schema") != SHARD_SCHEMA:
+        return None
+    return _screening_source_provenance(), _screening_runtime_environment()
+
+
+def _require_v2_derivation_context(
+    payload: Mapping[str, Any],
+    bindings: tuple[dict[str, object], dict[str, object]] | None,
+) -> None:
+    schema = payload.get("schema")
+    if schema not in {SUMMARY_SCHEMA, VALIDATION_SCHEMA}:
+        return
+    if bindings is None:
+        raise RuntimeError("v2 derivation did not capture a source/runtime context")
+    source_provenance, runtime_environment = bindings
+    if payload.get("source_provenance") != source_provenance:
+        raise RuntimeError(
+            "v2 derivation source does not match the source recorded by its shards"
+        )
+    if payload.get("environment") != runtime_environment:
+        raise RuntimeError(
+            "v2 derivation runtime does not match the runtime recorded by its shards"
+        )
+    if _screening_source_provenance() != source_provenance:
+        raise RuntimeError("screening source provenance changed during derivation")
+    if _screening_runtime_environment() != runtime_environment:
+        raise RuntimeError("screening runtime environment changed during derivation")
+    _require_embedded_artifact_manifest_unchanged(
+        payload.get("shard_manifest"), context="v2 shard inputs"
+    )
+    if schema == VALIDATION_SCHEMA:
+        _require_embedded_artifact_manifest_unchanged(
+            payload.get("reference_partial_manifest"),
+            context="v2 proxy reference partials",
+        )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -8660,6 +8930,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     output_path = _preflight_new_output(
         args.out if args.command == "run" else args.output
     )
+    derivation_bindings = (
+        _screening_derivation_bindings(args.shards)
+        if args.command in {"merge", "validate-proxy"}
+        else None
+    )
 
     if args.command == "run":
         assert run_seed is not None
@@ -8713,10 +8988,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         summary = merge_shards(
             args.shards, control_name=args.control_name, slope_window=args.slope_window
         )
+        _require_v2_derivation_context(summary, derivation_bindings)
         _atomic_write_json(output_path, summary)
         logger.info("merged %d shards -> %s", summary["n_shards"], args.output)
     elif args.command == "validate-proxy":
         report = validate_proxy(args.shards, args.partials_dir, atol=args.atol)
+        _require_v2_derivation_context(report, derivation_bindings)
         _atomic_write_json(output_path, report)
         logger.info(
             "proxy_validated=%s (prefix_match=%s ordering=%s) -> %s",

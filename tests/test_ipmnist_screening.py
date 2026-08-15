@@ -5,6 +5,7 @@ prefix property), pin combination steps to their reference equations, and
 test shard/merge/validation plumbing. Benchmark executions never run here.
 """
 
+import hashlib
 import json
 import math
 import threading
@@ -23,6 +24,7 @@ from alberta_framework.benchmarks.ipmnist_screening import (
     _CBP_LAYERS,
     CONFIRMATION_THRESHOLD,
     LEGACY_SHARD_SCHEMA,
+    NONPROMOTING_POLICY,
     PROXY_N_TASKS,
     SCREENING_REGISTRY,
     SHARD_SCHEMA,
@@ -1597,6 +1599,9 @@ class TestShardsAndMerge:
             "proxy_preserves_upgd_over_adamw": accepted,
         }
         monkeypatch.setattr(screening, "validate_proxy", lambda *_args, **_kwargs: report)
+        monkeypatch.setattr(
+            screening, "_screening_derivation_bindings", lambda _paths: None
+        )
         output = tmp_path / f"proxy-{accepted}.json"
 
         status = screening.main(
@@ -1770,9 +1775,17 @@ class TestShardsAndMerge:
         report = validate_proxy(shard_paths, partials, atol=1e-6)
         assert report["all_prefixes_match"] is True
         assert report["environment"] == load_shard(shard_paths[0])["environment"]
+        assert report["evidence_policy"] == NONPROMOTING_POLICY
         assert report["source_provenance"] == _test_source_provenance()
         assert report["dataset_provenance"] == _test_dataset_provenance()
         assert report["schema"].endswith(".v2")
+        assert len(report["shard_manifest"]) == 2
+        assert len(report["reference_partial_manifest"]) == 2
+        for field in ("shard_manifest", "reference_partial_manifest"):
+            for entry in report[field]:
+                raw = Path(entry["path"]).read_bytes()
+                assert entry["size_bytes"] == len(raw)
+                assert entry["sha256"] == hashlib.sha256(raw).hexdigest()
         for check in report["checks"]:
             assert check["max_abs_per_task_diff"] <= 1e-6
         # ordering flags are booleans (tiny-scale runs may order either way)

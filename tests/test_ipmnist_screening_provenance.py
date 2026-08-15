@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import py_compile
 import subprocess
 from dataclasses import replace
 from pathlib import Path
@@ -175,7 +176,13 @@ def test_clean_source_provenance_binds_head_tree_lock_and_actual_bytes(tmp_path:
 
 @pytest.mark.parametrize(
     "mutation",
-    ["tracked", "tracked-nonsource", "untracked-package", "untracked-python"],
+    [
+        "tracked",
+        "tracked-nonsource",
+        "untracked-package",
+        "untracked-python",
+        "untracked-root-bytecode",
+    ],
 )
 def test_source_provenance_rejects_dirty_or_untracked_package_source(
     tmp_path: Path, mutation: str
@@ -189,8 +196,17 @@ def test_source_provenance_rejects_dirty_or_untracked_package_source(
         (repo / "README.md").write_text("changed\n", encoding="utf-8")
     elif mutation == "untracked-package":
         (repo / "alberta_framework/untracked.py").write_text("VALUE = 2\n", encoding="utf-8")
-    else:
+    elif mutation == "untracked-python":
         (repo / "local_override.py").write_text("VALUE = 2\n", encoding="utf-8")
+    else:
+        source = repo / "bytecode_source.py"
+        source.write_text("VALUE = 7\n", encoding="utf-8")
+        py_compile.compile(
+            str(source),
+            cfile=str(repo / "shadowmodule.pyc"),
+            doraise=True,
+        )
+        source.unlink()
 
     with pytest.raises(RuntimeError, match="source worktree is not clean"):
         screening._screening_source_provenance(repo)
@@ -367,6 +383,58 @@ def test_v2_writer_and_loader_bind_registered_mechanism(
         screening.load_shard(path)
 
 
+@pytest.mark.parametrize(
+    ("field", "alias"),
+    [("noise_std", False), ("gate_beta", 1)],
+)
+def test_v2_writer_and_loader_reject_registered_float_type_aliases(
+    tmp_path: Path, field: str, alias: object
+) -> None:
+    spec = screening.screening_spec("sigma0_shiftnorm_d099")
+    aliased_hyperparameters = {**spec.hyperparameters, field: alias}
+    result = replace(
+        _result(),
+        config_name=spec.name,
+        base_learner=spec.base_learner,
+        hyperparameters=aliased_hyperparameters,
+    )
+    with pytest.raises(ValueError, match="registered arm"):
+        screening.shard_payload(
+            result,
+            source_provenance=_source_binding(),
+            dataset_provenance=_dataset_binding(),
+            environment=_runtime_binding(),
+        )
+
+    payload = _payload()
+    payload["config_name"] = spec.name
+    payload["base_learner"] = spec.base_learner
+    payload["hyperparameters"] = aliased_hyperparameters
+    path = tmp_path / f"aliased-{field}.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="registered arm"):
+        screening.load_shard(path)
+
+
+@pytest.mark.parametrize(
+    ("field", "alias"),
+    [("development_only", 1), ("scientific_promotion_allowed", 0)],
+)
+def test_v2_loader_rejects_boolean_policy_number_aliases(
+    tmp_path: Path, field: str, alias: object
+) -> None:
+    payload = _payload()
+    payload["evidence_policy"] = {
+        **screening.NONPROMOTING_POLICY,
+        field: alias,
+    }
+    path = tmp_path / f"aliased-policy-{field}.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="frozen nonpromoting policy"):
+        screening.load_shard(path)
+
+
 @pytest.mark.parametrize("value", [True, "0.5"])
 def test_v2_curves_reject_boolean_and_string_numbers(tmp_path: Path, value: object) -> None:
     payload = _payload()
@@ -387,6 +455,38 @@ def test_v2_curves_reject_boolean_and_string_numbers(tmp_path: Path, value: obje
             dataset_provenance=_dataset_binding(),
             environment=_runtime_binding(),
         )
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid"),
+    [
+        ("per_task_accuracy", -0.01),
+        ("per_task_accuracy", 1.01),
+        ("per_task_loss", -0.01),
+        ("per_task_plasticity", -0.01),
+        ("per_task_plasticity", 1.01),
+    ],
+)
+def test_v2_writer_and_loader_reject_out_of_domain_curves(
+    tmp_path: Path, field: str, invalid: float
+) -> None:
+    curve = np.full(SMALL.n_tasks, 0.5, dtype=np.float64)
+    curve[1] = invalid
+    result = replace(_result(), **{field: curve})
+    with pytest.raises(ValueError, match=field):
+        screening.shard_payload(
+            result,
+            source_provenance=_source_binding(),
+            dataset_provenance=_dataset_binding(),
+            environment=_runtime_binding(),
+        )
+
+    payload = _payload()
+    payload[field] = curve.tolist()
+    path = tmp_path / f"invalid-domain-{field}.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match=field):
+        screening.load_shard(path)
 
 
 @pytest.mark.parametrize("failure", ["curve", "wall-clock"])
@@ -456,6 +556,43 @@ def test_v2_loader_is_strict_and_legacy_v1_remains_readable(tmp_path: Path) -> N
     assert screening.load_shard(legacy_path)["schema"].endswith(".v1")
 
 
+@pytest.mark.parametrize(
+    "mutation",
+    ["negative-id", "negative-process", "duplicate-device"],
+)
+def test_v2_writer_and_loader_reject_invalid_runtime_device_topology(
+    tmp_path: Path, mutation: str
+) -> None:
+    environment = _runtime_binding()
+    jax_binding = environment["jax"]
+    assert isinstance(jax_binding, dict)
+    devices = jax_binding["devices"]
+    assert isinstance(devices, list)
+    device = devices[0]
+    assert isinstance(device, dict)
+    if mutation == "negative-id":
+        device["id"] = -1
+    elif mutation == "negative-process":
+        device["process_index"] = -1
+    elif mutation == "duplicate-device":
+        devices.append(dict(device))
+
+    with pytest.raises(ValueError, match="runtime environment"):
+        screening.shard_payload(
+            _result(),
+            source_provenance=_source_binding(),
+            dataset_provenance=_dataset_binding(),
+            environment=environment,
+        )
+
+    payload = _payload()
+    payload["environment"] = environment
+    path = tmp_path / f"invalid-runtime-{mutation}.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="runtime environment"):
+        screening.load_shard(path)
+
+
 def test_homogeneous_legacy_merge_emits_legacy_summary(tmp_path: Path) -> None:
     paths = [tmp_path / f"legacy-seed{seed}.json" for seed in (0, 1)]
     for seed, path in enumerate(paths):
@@ -482,6 +619,14 @@ def test_v2_merge_carries_identical_bindings_and_rejects_all_drift(tmp_path: Pat
     assert summary["source_provenance"] == _source_binding()
     assert summary["dataset_provenance"] == _dataset_binding()
     assert summary["environment"] == _runtime_binding()
+    assert [(entry["config_name"], entry["seed"]) for entry in summary["shard_manifest"]] == [
+        ("upgd_w_control", 0),
+        ("upgd_w_control", 1),
+    ]
+    for entry in summary["shard_manifest"]:
+        raw = Path(entry["path"]).read_bytes()
+        assert entry["size_bytes"] == len(raw)
+        assert entry["sha256"] == hashlib.sha256(raw).hexdigest()
 
     for field, replacement, message in (
         ("source_provenance", _source_binding(source_sha256="9" * 64), "source provenance"),
@@ -494,6 +639,12 @@ def test_v2_merge_carries_identical_bindings_and_rejects_all_drift(tmp_path: Pat
         with pytest.raises(ValueError, match=message):
             screening.merge_shards(paths, control_name="upgd_w_control", slope_window=2)
 
+    paths[0].write_text(paths[0].read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="changed"):
+        screening._require_embedded_artifact_manifest_unchanged(
+            summary["shard_manifest"], context="test shard inputs"
+        )
+
 
 def test_merge_rejects_mixed_v1_v2_shards(tmp_path: Path) -> None:
     current = _payload(0)
@@ -504,6 +655,21 @@ def test_merge_rejects_mixed_v1_v2_shards(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="multiple shard schemas"):
         screening.merge_shards(paths, control_name="upgd_w_control", slope_window=2)
+
+
+@pytest.mark.parametrize("slope_window", [True, 0, 1])
+def test_merge_rejects_invalid_slope_window(
+    tmp_path: Path, slope_window: object
+) -> None:
+    path = tmp_path / "shard.json"
+    path.write_text(json.dumps(_payload()), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="slope_window"):
+        screening.merge_shards(
+            [path],
+            control_name="upgd_w_control",
+            slope_window=slope_window,  # type: ignore[arg-type]
+        )
 
 
 def test_proxy_validation_refuses_mixed_or_mismatched_v2_provenance(
@@ -521,6 +687,17 @@ def test_proxy_validation_refuses_mixed_or_mismatched_v2_provenance(
     second.write_text(json.dumps(_legacy_payload(1)), encoding="utf-8")
     with pytest.raises(ValueError, match="multiple shard schemas"):
         screening.validate_proxy([first, second], tmp_path)
+
+
+@pytest.mark.parametrize(
+    "atol",
+    [True, 0, -1e-8, 1.000001e-6, float("nan"), float("inf")],
+)
+def test_proxy_validation_rejects_unsafe_tolerance(
+    tmp_path: Path, atol: object
+) -> None:
+    with pytest.raises(ValueError, match="atol"):
+        screening.validate_proxy([], tmp_path, atol=atol)  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize("drift", ["source", "environment", "dataset"])
@@ -578,3 +755,38 @@ def test_run_cli_binds_before_execution_and_refuses_prepublication_drift(
 
     assert events[:3] == ["source", "environment", "load"]
     assert events[-1] != "publish"
+
+
+@pytest.mark.parametrize("drift", ["source", "environment"])
+def test_v2_derivation_requires_current_shard_binding_before_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, drift: str
+) -> None:
+    path = tmp_path / "shard.json"
+    path.write_text(json.dumps(_payload()), encoding="utf-8")
+    summary = screening.merge_shards(
+        [path], control_name="upgd_w_control", slope_window=2
+    )
+    source = _source_binding()
+    environment = _runtime_binding()
+    bindings = (source, environment)
+    monkeypatch.setattr(
+        screening,
+        "_screening_source_provenance",
+        lambda: (
+            _source_binding(source_sha256="9" * 64)
+            if drift == "source"
+            else source
+        ),
+    )
+    monkeypatch.setattr(
+        screening,
+        "_screening_runtime_environment",
+        lambda: (
+            _runtime_binding(machine="different")
+            if drift == "environment"
+            else environment
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="changed during derivation"):
+        screening._require_v2_derivation_context(summary, bindings)
