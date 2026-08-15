@@ -287,7 +287,12 @@ def update_utility(
         # previous finite utility so replacement does not treat NaN as
         # the lowest-utility unit.
         contribution_finite = jnp.isfinite(contribution)
-        u_new = decay * cbp_state.utilities[i] + (1.0 - decay) * contribution
+        decayed = jnp.where(
+            decay == 0.0,
+            jnp.zeros_like(cbp_state.utilities[i]),
+            decay * cbp_state.utilities[i],
+        )
+        u_new = decayed + (1.0 - decay) * contribution
         u_new = jnp.where(contribution_finite, u_new, cbp_state.utilities[i])
         new_utilities.append(u_new)
         new_ages.append(cbp_state.ages[i] + 1)
