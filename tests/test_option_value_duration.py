@@ -137,6 +137,40 @@ def test_termination_discount_zeros_bootstrap_and_no_average_reward_is_subtracte
     assert not hasattr(result.state, "average_reward")
 
 
+def test_termination_does_not_multiply_inf_next_prediction() -> None:
+    """gamma=0 * inf V(s') is 0*inf = NaN and would freeze both option heads."""
+    learner = OptionValueDurationLearner(
+        1,
+        OptionValueDurationConfig(
+            reward_step_size=0.1,
+            duration_step_size=0.0,
+        ),
+    )
+    state = learner.init(1).replace(  # type: ignore[attr-defined]
+        weights=jnp.array([[[2.0], [7.0]]], dtype=jnp.float32)
+    )
+    next_obs = jnp.array([jnp.inf], dtype=jnp.float32)
+    raw = jnp.asarray(0.0, dtype=jnp.float32) * (jnp.array([2.0], dtype=jnp.float32) @ next_obs)
+    assert not bool(jnp.isfinite(raw))
+
+    result = learner.update(
+        state,
+        jnp.array([1.0], dtype=jnp.float32),
+        jnp.array(0, dtype=jnp.int32),
+        jnp.array(5.0, dtype=jnp.float32),
+        next_obs,
+        jnp.array(0.0, dtype=jnp.float32),
+    )
+
+    chex.assert_trees_all_close(
+        result.td_targets,
+        jnp.array([5.0, 1.0], dtype=jnp.float32),
+    )
+    chex.assert_tree_all_finite(result.state.weights)
+    chex.assert_tree_all_finite(result.next_predictions)
+    assert bool(result.update_applied)
+
+
 def test_reward_rate_prediction_preserves_raw_duration_and_floors_only_score() -> None:
     learner = OptionValueDurationLearner(
         2,

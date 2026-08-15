@@ -277,7 +277,13 @@ class OptionValueDurationLearner:
         cumulants = jnp.stack(
             (reward, jnp.array(1.0, dtype=jnp.float32)),
         )
-        td_targets = cumulants + continuation_discount * next_predictions
+        terminated = continuation_discount == 0.0
+        bootstrap = jnp.where(
+            terminated,
+            jnp.zeros_like(next_predictions),
+            continuation_discount * next_predictions,
+        )
+        td_targets = cumulants + bootstrap
         td_errors = td_targets - predictions
         step_sizes = jnp.array(
             [
@@ -290,9 +296,10 @@ class OptionValueDurationLearner:
             option_weights + step_sizes[:, None] * td_errors[:, None] * observation[None, :]
         )
         source_finite = jnp.all(jnp.isfinite(state.weights))
+        next_needed = continuation_discount != 0.0
         shared_inputs_valid = (
             jnp.all(jnp.isfinite(observation))
-            & jnp.all(jnp.isfinite(next_observation))
+            & ((~next_needed) | jnp.all(jnp.isfinite(next_observation)))
             & jnp.isfinite(continuation_discount)
             & (continuation_discount >= 0.0)
             & (continuation_discount <= 1.0)
@@ -329,7 +336,9 @@ class OptionValueDurationLearner:
                 head_updates_applied, predictions, jnp.zeros_like(predictions)
             ),
             next_predictions=jnp.where(
-                head_updates_applied, next_predictions, jnp.zeros_like(next_predictions)
+                head_updates_applied & (~terminated),
+                next_predictions,
+                jnp.zeros_like(next_predictions),
             ),
             td_targets=jnp.where(
                 head_updates_applied, td_targets, jnp.zeros_like(td_targets)
