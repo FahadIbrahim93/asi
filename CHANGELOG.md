@@ -34,6 +34,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Protected the reserved checkpoint `_format_version` metadata key so every newly saved
+  checkpoint carries the canonical on-disk format stamp even if caller metadata collides.
 - Made sparse initialization reject malformed dimensions and non-finite or out-of-range
   sparsity before array allocation, while retaining the paper-specified uniform bound.
 - Validated rule-discovery and UPGD run, plan, CLI, shard, and artifact seed identities before
