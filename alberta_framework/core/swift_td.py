@@ -330,6 +330,10 @@ class SwiftTD:
         new_prev_weight_update = jnp.where(
             finite_delta, delta_w, state.prev_weight_update
         )
+        # TDLinearLearner always applies weight_delta/bias_delta. Returning
+        # the inf product would commit inf weights, so the next real TD
+        # error cannot recover. Hold a zero primary update instead.
+        returned_delta_w = jnp.where(finite_delta, delta_w, jnp.zeros_like(delta_w))
 
         # Decay eligibility-side traces for the next transition.
         decay_factor = gamma_scalar * state.trace_decay
@@ -355,8 +359,8 @@ class SwiftTD:
 
         weight_alphas = jnp.exp(new_log_step_sizes[:-1])
         return SwiftTDUpdate(
-            weight_delta=delta_w[:-1],
-            bias_delta=delta_w[-1],
+            weight_delta=returned_delta_w[:-1],
+            bias_delta=returned_delta_w[-1],
             new_state=new_state,
             metrics={
                 "mean_step_size": jnp.mean(weight_alphas),

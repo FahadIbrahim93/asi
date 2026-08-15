@@ -383,6 +383,10 @@ class TestSwiftTDBehavior:
         )
         assert bool(jnp.all(jnp.isfinite(poisoned.new_state.h_traces)))
         chex.assert_trees_all_close(poisoned.new_state.h_traces, state.h_traces)
+        chex.assert_trees_all_close(
+            poisoned.weight_delta, jnp.zeros(2, dtype=jnp.float32)
+        )
+        chex.assert_trees_all_close(poisoned.bias_delta, jnp.array(0.0, dtype=jnp.float32))
 
         recovered = optimizer.update(
             poisoned.new_state,
@@ -393,6 +397,40 @@ class TestSwiftTDBehavior:
         )
         assert bool(jnp.all(jnp.isfinite(recovered.new_state.log_step_sizes)))
         assert bool(jnp.all(jnp.isfinite(recovered.new_state.h_traces)))
+
+    def test_infinite_reward_through_td_linear_learner_keeps_weights_finite(self):
+        """TDLinearLearner always applies the returned deltas.
+
+        Recovery must go through the learner, not a second optimizer call
+        with a hand-injected finite TD error.
+        """
+        learner = TDLinearLearner(optimizer=SwiftTD(initial_step_size=0.01))
+        state = learner.init(feature_dim=2)
+        observation = jnp.ones(2, dtype=jnp.float32)
+        next_obs = observation * 0.9
+        gamma = jnp.array(0.99, dtype=jnp.float32)
+
+        poisoned = learner.update(
+            state,
+            observation,
+            jnp.array(jnp.inf, dtype=jnp.float32),
+            next_obs,
+            gamma,
+        )
+        chex.assert_trees_all_close(poisoned.state.weights, state.weights)
+        chex.assert_trees_all_close(poisoned.state.bias, state.bias)
+        assert bool(jnp.all(jnp.isfinite(poisoned.state.optimizer_state.log_step_sizes)))
+
+        recovered = learner.update(
+            poisoned.state,
+            observation,
+            jnp.array(1.0, dtype=jnp.float32),
+            next_obs,
+            gamma,
+        )
+        chex.assert_tree_all_finite(recovered.state.weights)
+        chex.assert_tree_all_finite(recovered.state.bias)
+        assert bool(jnp.isfinite(recovered.td_error))
 
     def test_integrates_with_td_linear_learner(self):
         """SwiftTD follows the TDOptimizer interface and drives TDLinearLearner."""
