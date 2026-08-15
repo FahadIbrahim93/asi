@@ -369,6 +369,22 @@ def test_global_normalization_spans_all_pytree_leaves() -> None:
     assert float(result.metrics["global_maximum_utility"]) == pytest.approx(2.0)
 
 
+def test_zero_utility_decay_does_not_multiply_inf_ema() -> None:
+    """utility_decay=0 times an infinite EMA is NaN and would be committed."""
+    params = {"w": jnp.ones(2, dtype=jnp.float32)}
+    gradients = {"w": jnp.array([-1.0, -0.5], dtype=jnp.float32)}
+    optimizer = CanonicalUPGD(CanonicalUPGDConfig(utility_decay=0.0, noise_std=0.0))
+    state = optimizer.init(params).replace(
+        utility_ema={"w": jnp.full(2, jnp.inf, dtype=jnp.float32)}
+    )
+    raw = jnp.asarray(0.0, dtype=jnp.float32) * jnp.asarray(jnp.inf, dtype=jnp.float32)
+    assert not bool(jnp.isfinite(raw))
+
+    result = optimizer.update(state, params, gradients, jr.key(0))
+    chex.assert_tree_all_finite(result.state.utility_ema)
+    chex.assert_tree_all_finite(result.params)
+
+
 def test_paper_global_all_negative_uses_signed_maximum_and_reverses_order() -> None:
     """Pin the literal, potentially undesirable all-negative source equation."""
 
