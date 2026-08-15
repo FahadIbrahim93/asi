@@ -237,6 +237,27 @@ class TestSmoke:
         second = run_ipmnist(data_x, data_y, "upgd_w", seeds=(5,), config=TINY)
         np.testing.assert_array_equal(first.per_task_accuracy, second.per_task_accuracy)
 
+    @pytest.mark.parametrize(
+        ("seeds", "error"),
+        [
+            ((True,), "non-boolean Python integers"),
+            ((1.0,), "non-boolean Python integers"),
+            ((np.int64(1),), "non-boolean Python integers"),
+            ((-1,), "uint32 range"),
+            ((2**32,), "uint32 range"),
+            ((0, 0), "unique"),
+        ],
+    )
+    def test_rejects_noncanonical_run_seeds(self, seeds, error):
+        data_x, data_y = _synthetic_dataset(3, N_TRAIN, TINY.input_dim, TINY.n_classes)
+        with pytest.raises(ValueError, match=error):
+            run_ipmnist(data_x, data_y, "upgd_w", seeds=seeds, config=TINY)
+
+    def test_accepts_unique_uint32_boundary_seeds(self):
+        data_x, data_y = _synthetic_dataset(3, N_TRAIN, TINY.input_dim, TINY.n_classes)
+        result = run_ipmnist(data_x, data_y, "upgd_w", seeds=(0, 2**32 - 1), config=TINY)
+        assert result.seeds == (0, 2**32 - 1)
+
     def test_hyperparameter_override_is_recorded(self):
         data_x, data_y = _synthetic_dataset(3, N_TRAIN, TINY.input_dim, TINY.n_classes)
         result = run_ipmnist(

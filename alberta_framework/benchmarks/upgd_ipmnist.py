@@ -679,6 +679,17 @@ def run_ipmnist(
     Returns:
         Host-side result arrays; see :class:`IPMNISTRunResult`.
     """
+    seed_tuple = tuple(seeds)
+    if not seed_tuple:
+        raise ValueError("at least one seed is required")
+    for seed in seed_tuple:
+        if not isinstance(seed, int) or isinstance(seed, bool):
+            raise ValueError("seeds must be non-boolean Python integers")
+        if not 0 <= seed <= 2**32 - 1:
+            raise ValueError("seeds must be in the inclusive uint32 range")
+    if len(set(seed_tuple)) != len(seed_tuple):
+        raise ValueError("seeds must be unique")
+
     if config is None:
         config = IPMNISTConfig()
     if noise_mode not in ("step", "pool"):
@@ -702,9 +713,6 @@ def run_ipmnist(
     if n_train < config.task_length:
         raise ValueError("dataset smaller than task_length; cannot sample without replacement")
 
-    seed_tuple = tuple(int(seed) for seed in seeds)
-    if not seed_tuple:
-        raise ValueError("at least one seed is required")
     seeds_array = jnp.asarray(seed_tuple, dtype=jnp.uint32)
 
     use_pool = noise_mode == "pool" and learner in _STOCHASTIC_LEARNERS
