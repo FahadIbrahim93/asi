@@ -90,3 +90,44 @@ class TestSparseInit:
         actual_sparsity = float(total_zeros) / total_elements
 
         assert actual_sparsity == pytest.approx(0.9, abs=0.01)
+
+    def test_one_sparsity(self):
+        """With sparsity=1.0, all weights should be zero."""
+        key = jr.key(42)
+        weights = sparse_init(key, (32, 16), sparsity=1.0)
+
+        chex.assert_shape(weights, (32, 16))
+        assert jnp.all(weights == 0)
+
+    @pytest.mark.parametrize(
+        "invalid_shape",
+        [
+            (0, 10),
+            (10, 0),
+            (-1, 10),
+            (10, -5),
+            (0, 0),
+            (10,),
+            (10, 10, 10),
+            (),
+            (True, 10),
+            (10, False),
+            (10.5, 5),
+            (10, 5.5),
+        ],
+    )
+    def test_invalid_shapes_raise(self, invalid_shape):
+        """Invalid shape tuples should raise ValueError."""
+        key = jr.key(42)
+        with pytest.raises(ValueError, match=r"shape|dimension"):
+            sparse_init(key, invalid_shape)
+
+    @pytest.mark.parametrize(
+        "invalid_sparsity",
+        [-0.1, 1.1, float("nan"), float("inf"), float("-inf"), True, False, "0.5"],
+    )
+    def test_invalid_sparsity_raises(self, invalid_sparsity):
+        """Out-of-bounds or non-finite sparsity should raise ValueError."""
+        key = jr.key(42)
+        with pytest.raises(ValueError, match="sparsity"):
+            sparse_init(key, (32, 16), sparsity=invalid_sparsity)
