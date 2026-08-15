@@ -98,7 +98,7 @@ import os
 import platform
 import tempfile
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -112,6 +112,10 @@ from jax import Array
 
 from alberta_framework.core.baseline_optimizers import Adam
 from alberta_framework.core.canonical_upgd import CanonicalUPGD, CanonicalUPGDConfig
+from alberta_framework.core.update_safety import (
+    floating_tree_is_finite,
+    select_transaction,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -407,9 +411,30 @@ def cross_entropy_loss(
 
 
 LearnerInitFn = Callable[[dict[str, Array]], Any]
+
+
+@chex.dataclass(frozen=True, mappable_dataclass=False)
+class LearnerUpdateResult:
+    """Checked learner step with backward-compatible two-value unpacking.
+
+    Existing benchmark and screening callers unpack learner steps as
+    ``params, state = step_fn(...)``.  Iteration deliberately preserves that
+    surface while ``update_applied`` makes an atomic rejection observable to
+    callers that need the checked contract.
+    """
+
+    params: dict[str, Array]
+    state: Any
+    update_applied: Array
+
+    def __iter__(self) -> Iterator[Any]:
+        yield self.params
+        yield self.state
+
+
 LearnerStepFn = Callable[
     [dict[str, Array], Any, dict[str, Array], Array],
-    tuple[dict[str, Array], Any],
+    tuple[dict[str, Array], Any] | LearnerUpdateResult,
 ]
 
 
@@ -567,17 +592,36 @@ def _make_adamw_learner(hp: dict[str, float]) -> tuple[LearnerInitFn, LearnerSte
 
     def step_fn(
         params: dict[str, Array], state: dict[str, Any], grads: dict[str, Array], key: Array
-    ) -> tuple[dict[str, Array], dict[str, Any]]:
+    ) -> LearnerUpdateResult:
         del key  # AdamW is deterministic
-        new_params: dict[str, Array] = {}
-        new_state: dict[str, Any] = {}
+        candidate_params: dict[str, Array] = {}
+        candidate_state: dict[str, Any] = {}
+        update_applied = jnp.asarray(True, dtype=jnp.bool_)
         for name, value in params.items():
-            step_arr, leaf_state = optimizer.update_from_gradient(
+            leaf_update = optimizer.update_from_gradient_checked(
                 state[name], grads[name], error=None, param=value
             )
-            new_params[name] = value - step_arr
-            new_state[name] = leaf_state
-        return new_params, new_state
+            candidate_params[name] = value - leaf_update.step
+            candidate_state[name] = leaf_update.new_state
+            update_applied = update_applied & leaf_update.update_applied
+
+        # A finite optimizer step can still overflow when it is applied to a
+        # finite parameter.  The learner owns the enclosing transaction, so
+        # validate and select the complete parameter and optimizer-state
+        # trees only after every leaf candidate has been assembled.
+        update_applied = (
+            update_applied
+            & floating_tree_is_finite(params)
+            & floating_tree_is_finite(state)
+            & floating_tree_is_finite(grads)
+            & floating_tree_is_finite(candidate_params)
+            & floating_tree_is_finite(candidate_state)
+        )
+        return LearnerUpdateResult(
+            params=select_transaction(update_applied, candidate_params, params),
+            state=select_transaction(update_applied, candidate_state, state),
+            update_applied=update_applied,
+        )  # type: ignore[call-arg]
 
     return init_fn, step_fn
 

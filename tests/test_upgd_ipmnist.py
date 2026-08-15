@@ -19,6 +19,8 @@ from alberta_framework.benchmarks.upgd_ipmnist import (
     UPGD_W_PROTOCOL_HYPERPARAMETERS,
     IPMNISTConfig,
     LeanUPGDState,
+    LearnerUpdateResult,
+    _make_adamw_learner,
     _split_flat_noise,
     build_artifact,
     build_comparison,
@@ -307,6 +309,108 @@ class TestLeanUPGDParity:
                     atol=1e-6,
                     err_msg=f"step {step} utility {name}",
                 )
+
+
+class TestAdamWTransaction:
+    """AdamW's parameter leaves form one checked learner transaction."""
+
+    @staticmethod
+    def _params() -> dict[str, jnp.ndarray]:
+        return {
+            "bias": jnp.asarray([0.2, -0.1], dtype=jnp.float32),
+            "weight": jnp.asarray([[0.4, -0.3], [0.1, 0.5]], dtype=jnp.float32),
+        }
+
+    @staticmethod
+    def _assert_tree_equal(actual, expected) -> None:
+        import jax
+
+        actual_leaves, actual_structure = jax.tree.flatten(actual)
+        expected_leaves, expected_structure = jax.tree.flatten(expected)
+        assert actual_structure == expected_structure
+        for actual_leaf, expected_leaf in zip(
+            actual_leaves, expected_leaves, strict=True
+        ):
+            np.testing.assert_array_equal(
+                np.asarray(actual_leaf), np.asarray(expected_leaf)
+            )
+
+    def test_nonfinite_leaf_rejects_entire_params_and_optimizer_state(self):
+        import jax
+
+        hp = dict(ADAMW_PROTOCOL_HYPERPARAMETERS)
+        init_fn, step_fn = _make_adamw_learner(hp)
+        params = self._params()
+        state = init_fn(params)
+        grads = {
+            "bias": jnp.asarray([jnp.inf, 0.25], dtype=jnp.float32),
+            "weight": jnp.asarray([[0.3, -0.2], [0.4, 0.1]], dtype=jnp.float32),
+        }
+
+        compiled_step = jax.jit(step_fn)
+        result = compiled_step(params, state, grads, jr.key(0))
+
+        assert isinstance(result, LearnerUpdateResult)
+        assert not bool(result.update_applied)
+        self._assert_tree_equal(result.params, params)
+        self._assert_tree_equal(result.state, state)
+        # The established two-value caller surface remains available.
+        unpacked_params, unpacked_state = result
+        self._assert_tree_equal(unpacked_params, params)
+        self._assert_tree_equal(unpacked_state, state)
+
+        recovered = compiled_step(
+            result.params,
+            result.state,
+            {
+                "bias": jnp.asarray([0.1, 0.25], dtype=jnp.float32),
+                "weight": grads["weight"],
+            },
+            jr.key(1),
+        )
+        assert bool(recovered.update_applied)
+        assert not np.array_equal(
+            np.asarray(recovered.params["weight"]), np.asarray(params["weight"])
+        )
+
+    def test_finite_step_matches_leafwise_adamw_and_jit(self):
+        import jax
+
+        from alberta_framework.core.baseline_optimizers import Adam
+
+        hp = dict(ADAMW_PROTOCOL_HYPERPARAMETERS)
+        hp["weight_decay"] = 0.02
+        init_fn, step_fn = _make_adamw_learner(hp)
+        params = self._params()
+        state = init_fn(params)
+        grads = {
+            "bias": jnp.asarray([-0.3, 0.25], dtype=jnp.float32),
+            "weight": jnp.asarray([[0.3, -0.2], [0.4, 0.1]], dtype=jnp.float32),
+        }
+        optimizer = Adam(
+            step_size=hp["step_size"],
+            beta1=hp["beta1"],
+            beta2=hp["beta2"],
+            eps=hp["eps"],
+            weight_decay=hp["weight_decay"],
+        )
+        expected_params: dict[str, jnp.ndarray] = {}
+        expected_state = {}
+        for name, value in params.items():
+            step, leaf_state = optimizer.update_from_gradient(
+                state[name], grads[name], error=None, param=value
+            )
+            expected_params[name] = value - step
+            expected_state[name] = leaf_state
+
+        eager = step_fn(params, state, grads, jr.key(1))
+        compiled = jax.jit(step_fn)(params, state, grads, jr.key(1))
+
+        assert bool(eager.update_applied)
+        assert bool(compiled.update_applied)
+        self._assert_tree_equal(eager.params, expected_params)
+        self._assert_tree_equal(eager.state, expected_state)
+        self._assert_tree_equal(compiled, eager)
 
 
 class TestSplitFlatNoise:

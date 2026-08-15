@@ -168,6 +168,73 @@ def test_infinite_cumulant_with_obgd_does_not_poison_head() -> None:
     assert bool(jnp.all(recovered.head_updates_applied))
 
 
+def test_terminal_lifetime_counter_rejects_entire_update_under_jit() -> None:
+    """An exhausted outer clock cannot commit parameters or report success."""
+    learner = OffPolicyHordeLearner(
+        _spec(gammas=(0.0,)),
+        hidden_sizes=(),
+        optimizer=LMS(step_size=0.1),
+        sparsity=0.0,
+        use_layer_norm=False,
+    )
+    state = learner.init(2, jax.random.key(17)).replace(
+        step_count=jnp.asarray(jnp.iinfo(jnp.int32).max, dtype=jnp.int32),
+        step_words=jnp.full(
+            (2,), jnp.iinfo(jnp.uint32).max, dtype=jnp.uint32
+        ),
+    )
+
+    rejected = learner.update_with_ratios(
+        state,
+        jnp.array([1.0, -0.5], dtype=jnp.float32),
+        jnp.array([1.0], dtype=jnp.float32),
+        jnp.zeros(2, dtype=jnp.float32),
+        jnp.ones(1, dtype=jnp.float32),
+    )
+
+    assert not bool(rejected.update_applied)
+    chex.assert_trees_all_close(rejected.state, state)
+    chex.assert_trees_all_equal(
+        rejected.head_updates_applied, jnp.array([False])
+    )
+    chex.assert_trees_all_close(rejected.predictions, jnp.zeros(1))
+    chex.assert_trees_all_close(rejected.td_errors, jnp.zeros(1))
+    chex.assert_trees_all_close(rejected.per_demon_metrics, jnp.zeros((1, 6)))
+    assert float(rejected.trunk_bounding_metric) == 0.0
+
+
+def test_invalid_lifetime_counter_rejects_then_repaired_state_recovers() -> None:
+    """Counter inconsistency is transient once an authorized state is restored."""
+    learner = OffPolicyHordeLearner(
+        _spec(gammas=(0.0,)),
+        hidden_sizes=(),
+        optimizer=LMS(step_size=0.1),
+        sparsity=0.0,
+        use_layer_norm=False,
+    )
+    initial = learner.init(2, jax.random.key(18))
+    invalid = initial.replace(
+        step_words=jnp.array([0, 1], dtype=jnp.uint32),
+    )
+    inputs = (
+        jnp.array([1.0, -0.5], dtype=jnp.float32),
+        jnp.array([1.0], dtype=jnp.float32),
+        jnp.zeros(2, dtype=jnp.float32),
+        jnp.ones(1, dtype=jnp.float32),
+    )
+
+    rejected = learner.update_with_ratios(invalid, *inputs)
+    assert not bool(rejected.update_applied)
+    chex.assert_trees_all_close(rejected.state, invalid)
+
+    recovered = learner.update_with_ratios(initial, *inputs)
+    assert bool(recovered.update_applied)
+    assert int(recovered.state.step_count) == 1
+    chex.assert_trees_all_equal(
+        recovered.state.step_words, jnp.array([0, 1], dtype=jnp.uint32)
+    )
+
+
 def test_probability_api_matches_explicit_ratios() -> None:
     learner = OffPolicyHordeLearner(
         _spec(gammas=(0.0, 0.0)),

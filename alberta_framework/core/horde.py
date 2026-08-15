@@ -824,7 +824,11 @@ class MixedHorde:
             td_errors=td_errors,
             td_targets=td_targets,
             per_demon_metrics=per_demon_metrics,
-            trunk_bounding_metric=trunk_bounding_metric,
+            trunk_bounding_metric=jnp.where(
+                update_applied,
+                trunk_bounding_metric,
+                jnp.asarray(0.0, dtype=jnp.float32),
+            ),
             head_updates_applied=head_updates_applied,
             update_applied=update_applied,
         )

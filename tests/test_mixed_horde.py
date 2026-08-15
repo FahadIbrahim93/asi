@@ -14,6 +14,7 @@ configs run without trunk-trace assertion errors, and that
 """
 
 import chex
+import jax
 import jax.numpy as jnp
 import jax.random as jr
 
@@ -272,6 +273,42 @@ class TestAllIndependentEqualsIndependentDemonHorde:
         chex.assert_trees_all_close(
             m_result.td_errors, i_result.td_errors, rtol=1e-5
         )
+
+    def test_rejected_update_has_neutral_trunk_metric_and_recovers_under_jit(
+        self,
+    ) -> None:
+        """An all-independent refusal must not report a successful bound."""
+        spec = create_horde_spec(
+            [_temporal_demon("temporal", 0, gamma=0.9, lamda=0.5)]
+        )
+        horde = MixedHorde(
+            horde_spec=spec,
+            hidden_sizes=(),
+            step_size=0.05,
+            sparsity=0.0,
+        )
+        state = horde.init(2, jr.key(23))
+        update = jax.jit(horde.update)
+
+        rejected = update(
+            state,
+            jnp.ones(2, dtype=jnp.float32),
+            jnp.array([jnp.inf], dtype=jnp.float32),
+            jnp.zeros(2, dtype=jnp.float32),
+        )
+
+        assert not bool(rejected.update_applied)
+        assert float(rejected.trunk_bounding_metric) == 0.0
+        chex.assert_trees_all_close(rejected.state, state)
+
+        recovered = update(
+            rejected.state,
+            jnp.ones(2, dtype=jnp.float32),
+            jnp.array([1.0], dtype=jnp.float32),
+            jnp.zeros(2, dtype=jnp.float32),
+        )
+        assert bool(recovered.update_applied)
+        assert float(recovered.trunk_bounding_metric) == 1.0
 
 
 # =============================================================================

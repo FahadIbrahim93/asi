@@ -30,7 +30,6 @@ from alberta_framework.core.normalizers import (
     EMANormalizerState,
     Normalizer,
     WelfordNormalizerState,
-    _checked_lifetime_words_increment,
     _saturating_int32_counter_increment,
 )
 from alberta_framework.core.optimizers import LMS, Bounder
@@ -390,6 +389,7 @@ class OffPolicyHordeLearner:
         """Update using explicit ratios and transition discounts."""
         n_demons = self.n_demons
         replacing = self._trace_mode == TraceMode.REPLACING
+        counter_status = self._learner._counter_status(state)
 
         rhos = jnp.asarray(rhos, dtype=jnp.float32)
         discounts = jnp.asarray(discounts, dtype=jnp.float32)
@@ -724,7 +724,6 @@ class OffPolicyHordeLearner:
             weights=tuple(new_head_weights),
             biases=tuple(new_head_biases),
         )  # type: ignore[call-arg]
-        next_step_words, _ = _checked_lifetime_words_increment(state.step_words)
         new_state = MultiHeadMLPState(
             trunk_params=new_trunk_params,
             head_params=new_head_params,
@@ -735,7 +734,7 @@ class OffPolicyHordeLearner:
             hidden_unit_utilities=tuple(new_hidden_unit_utilities),
             normalizer_state=new_normalizer_state,
             step_count=_saturating_int32_counter_increment(state.step_count),
-            step_words=next_step_words,
+            step_words=counter_status.proposed_step_words,
             birth_timestamp=state.birth_timestamp,
             uptime_s=state.uptime_s,
         )  # type: ignore[call-arg]
@@ -744,7 +743,8 @@ class OffPolicyHordeLearner:
         all_active_candidates_finite = jnp.all(jnp.stack(head_candidates_finite))
         has_accepted_work = jnp.any(active_mask) | jnp.all(~requested_mask)
         update_applied = (
-            global_inputs_valid
+            counter_status.update_available
+            & global_inputs_valid
             & source_state_finite
             & normalizer_update_applied
             & all_active_candidates_finite
