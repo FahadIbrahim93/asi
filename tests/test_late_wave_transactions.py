@@ -24,6 +24,8 @@ from alberta_framework.core.resource_manager import (
     LearnedResourceManager,
 )
 from alberta_framework.core.state_builder import (
+    FixedTraceStateBuilder,
+    FixedTraceStateBuilderConfig,
     OnlineGatedStateBuilder,
     OnlineGatedStateBuilderConfig,
 )
@@ -183,6 +185,53 @@ def test_discrete_action_casts_cannot_launder_invalid_builder_events(
         jnp.asarray(invalid_action),
         jnp.asarray(0.0),
         jnp.asarray(1.0),
+    )
+
+    chex.assert_trees_all_equal(rejected, state)
+    assert not bool(jnp.all(jnp.isfinite(representation)))
+    recovered, recovered_representation = builder.update(
+        rejected,
+        jnp.asarray([0.0, 0.0]),
+        jnp.asarray(1),
+        jnp.asarray(0.0),
+        jnp.asarray(1.0),
+    )
+    chex.assert_tree_all_finite(recovered)
+    chex.assert_tree_all_finite(recovered_representation)
+
+
+@pytest.mark.parametrize(
+    ("invalid_action", "invalid_reward", "invalid_discount"),
+    [
+        (jnp.nan, 0.0, 1.0),
+        (jnp.inf, 0.0, 1.0),
+        (0.5, 0.0, 1.0),
+        (2.0, 0.0, 1.0),
+        (1.0, jnp.nan, 1.0),
+        (1.0, 0.0, jnp.inf),
+    ],
+)
+def test_fixed_trace_builder_propagates_rejected_event_signals(
+    invalid_action: float,
+    invalid_reward: float,
+    invalid_discount: float,
+) -> None:
+    builder = FixedTraceStateBuilder(
+        FixedTraceStateBuilderConfig(
+            observation_dim=2,
+            n_actions=2,
+            include_raw_observation=False,
+            observation_decay_rates=(0.5,),
+        )
+    )
+    state, _ = builder.start(builder.init(jr.key(75)), jnp.asarray([1.0, 1.0]))
+
+    rejected, representation = jax.jit(builder.update)(
+        state,
+        jnp.asarray([0.0, 0.0]),
+        jnp.asarray(invalid_action),
+        jnp.asarray(invalid_reward),
+        jnp.asarray(invalid_discount),
     )
 
     chex.assert_trees_all_equal(rejected, state)

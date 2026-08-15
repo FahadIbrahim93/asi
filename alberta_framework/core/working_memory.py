@@ -13,7 +13,7 @@ from __future__ import annotations
 import functools
 from collections.abc import Iterator
 from dataclasses import asdict, dataclass
-from typing import Any
+from typing import Any, cast
 
 import chex
 import jax
@@ -449,13 +449,16 @@ class WorkingMemoryFeaturizer:
 
         Transaction-aware callers should use :meth:`update_checked`.
         """
-        return self.update_checked(
-            state,
-            observation,
-            action,
-            reward,
-            external_gate,
-        ).state
+        return cast(
+            WorkingMemoryState,
+            self.update_checked(
+                state,
+                observation,
+                action,
+                reward,
+                external_gate,
+            ).state,
+        )
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def step(

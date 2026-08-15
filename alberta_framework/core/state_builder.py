@@ -995,20 +995,33 @@ class FixedTraceStateBuilder:
         observation = jnp.asarray(raw_observation, dtype=jnp.float32).reshape(
             (self._config.observation_dim,)
         )
-        action_vector = _action_features(previous_action, self._config.n_actions)
+        safe_action, action_valid = safe_discrete_action(
+            previous_action,
+            self._config.n_actions,
+            allow_unset=True,
+        )
+        action_vector = _action_features(safe_action, self._config.n_actions)
         outcomes = jnp.stack(
             [
                 jnp.asarray(previous_reward, dtype=jnp.float32),
                 jnp.asarray(previous_discount, dtype=jnp.float32),
             ]
         )
-        next_state = self._memory.update(
+        memory_update = self._memory.update_checked(
             state,
             observation,
             action_vector,
             outcomes,
         )
-        return next_state, self.encode(next_state, observation)
+        update_applied = action_valid & memory_update.update_applied
+        next_state = select_transaction(update_applied, memory_update.state, state)
+        representation = self.encode(next_state, observation)
+        reported_representation = jnp.where(
+            update_applied,
+            representation,
+            jnp.full_like(representation, jnp.nan),
+        )
+        return next_state, reported_representation
 
     def start(
         self,
