@@ -128,6 +128,11 @@ def run_single_experiment(
     )
 
 
+def _require_finite_metric_array(arr: NDArray[np.float64], metric: str) -> None:
+    if arr.size == 0 or not np.all(np.isfinite(arr)):
+        raise ValueError(f"metric {metric!r} contains non-finite samples")
+
+
 def aggregate_metrics(results: list[SingleRunResult]) -> AggregatedResults:
     """Aggregate results from multiple seeds into summary statistics.
 
@@ -142,6 +147,9 @@ def aggregate_metrics(results: list[SingleRunResult]) -> AggregatedResults:
 
     Returns:
         AggregatedResults with aggregated metrics
+
+    Raises:
+        ValueError: If ``results`` is empty, or any metric sample is non-finite.
     """
     if not results:
         raise ValueError("Cannot aggregate empty results list")
@@ -160,6 +168,7 @@ def aggregate_metrics(results: list[SingleRunResult]) -> AggregatedResults:
             values = np.array([m[key] for m in r.metrics_history])
             arrays.append(values)
         metric_arrays[key] = np.stack(arrays)
+        _require_finite_metric_array(metric_arrays[key], key)
 
     # Compute summary statistics for final values (mean of last 100 steps)
     summary: dict[str, MetricSummary] = {}
@@ -319,6 +328,7 @@ def get_metric_timeseries(
         one-seed aggregate has zero spread and therefore a point band.
     """
     arr = results.metric_arrays[metric]
+    _require_finite_metric_array(arr, metric)
     mean = np.mean(arr, axis=0)
     std = np.zeros_like(mean) if arr.shape[0] == 1 else np.std(arr, axis=0, ddof=1)
     return mean, mean - std, mean + std
@@ -342,11 +352,11 @@ def get_final_performance(
         Dictionary mapping config name to ``(mean, sample_std)``. A one-seed
         aggregate reports zero spread.
 
-    Raises:
-        ValueError: If ``window`` is not positive, or a metric array has no
-            time steps. ``window=0`` is not "the last step": ``arr[:, -0:]``
-            is the full trace, so the helper refuses rather than silently
-            reporting a full-horizon mean.
+        Raises:
+        ValueError: If ``window`` is not positive, a metric array has no
+            time steps, or any metric sample is non-finite. ``window=0`` is
+            not "the last step": ``arr[:, -0:]`` is the full trace, so the
+            helper refuses rather than silently reporting a full-horizon mean.
     """
     if window <= 0:
         raise ValueError(f"window must be positive (got {window})")
@@ -359,6 +369,7 @@ def get_final_performance(
                 f"AggregatedResults {name!r} must contain at least one metric step "
                 f"for {metric!r}"
             )
+        _require_finite_metric_array(arr, metric)
         final_window = min(window, arr.shape[1])
         final_means = np.mean(arr[:, -final_window:], axis=1)
         std = float(np.std(final_means, ddof=1)) if len(final_means) > 1 else 0.0
