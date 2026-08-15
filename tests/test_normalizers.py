@@ -277,3 +277,32 @@ class TestNormalizerABC:
         state = normalizer.init(len(sample_observation))
         new_state = normalizer.update_only(state, sample_observation)
         assert new_state.sample_count == 1.0
+
+    @pytest.mark.parametrize(
+        "normalizer",
+        [EMANormalizer(), WelfordNormalizer(), StreamingBatchNormalizer()],
+        ids=["EMA", "Welford", "StreamingBatch"],
+    )
+    def test_inf_observation_holds_finite_statistics(self, normalizer) -> None:
+        """Inf observation minus an inf mean is inf-inf = NaN.
+
+        Fail-closed: skip the statistics update and keep the previous finite
+        mean/variance so later finite samples are not poisoned.
+        """
+        state = normalizer.init(2)
+        inf_obs = jnp.array([jnp.inf, 1.0], dtype=jnp.float32)
+        out, held = normalizer.normalize(state, inf_obs)
+        assert bool(jnp.all(jnp.isfinite(out)))
+        assert bool(jnp.all(jnp.isfinite(held.mean)))
+        assert bool(jnp.all(jnp.isfinite(held.var)))
+        chex.assert_trees_all_close(held.mean, state.mean)
+        chex.assert_trees_all_close(held.var, state.var)
+        assert int(held.sample_count) == int(state.sample_count)
+
+        finite_obs = jnp.array([0.0, 2.0], dtype=jnp.float32)
+        out2, recovered = normalizer.normalize(held, finite_obs)
+        assert bool(jnp.all(jnp.isfinite(out2)))
+        assert bool(jnp.all(jnp.isfinite(recovered.mean)))
+        assert bool(jnp.all(jnp.isfinite(recovered.var)))
+        assert int(recovered.sample_count) == 1
+

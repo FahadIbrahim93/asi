@@ -366,7 +366,15 @@ class Normalizer[
             Normalized observation
         """
         std = jnp.sqrt(state.var)
-        return (observation - state.mean) / (std + self._epsilon)
+        normalized = (observation - state.mean) / (std + self._epsilon)
+        # Inf observation minus an inf mean is inf-inf = NaN. Do not
+        # emit non-finite coordinates; keep zeros so downstream learners
+        # are not poisoned when the update is refused.
+        return jnp.where(
+            jnp.isfinite(observation) & jnp.isfinite(normalized),
+            normalized,
+            jnp.zeros_like(normalized),
+        )
 
     def update_only(
         self,
@@ -473,6 +481,8 @@ class EMANormalizer(Normalizer[EMANormalizerState]):
             Tuple of (normalized_observation, new_state)
         """
         status = self.counter_status(state)
+        observation_valid = jnp.all(jnp.isfinite(observation))
+        update_available = status.update_available & observation_valid
 
         def accepted(_: None) -> tuple[Array, EMANormalizerState]:
             new_words, ignored_capacity = _checked_lifetime_words_increment(
@@ -502,7 +512,7 @@ class EMANormalizer(Normalizer[EMANormalizerState]):
             return self.normalize_only(state, observation), state
 
         normalized, new_state = jax.lax.cond(
-            status.update_available,
+            update_available,
             accepted,
             refused,
             operand=None,
@@ -515,7 +525,7 @@ class EMANormalizer(Normalizer[EMANormalizerState]):
             counter_valid=status.counter_valid,
             lifetime_capacity_available=status.lifetime_capacity_available,
             estimator_capacity_available=status.estimator_capacity_available,
-            update_applied=status.update_available,
+            update_applied=update_available,
         )
 
 
@@ -583,6 +593,8 @@ class WelfordNormalizer(Normalizer[WelfordNormalizerState]):
             Tuple of (normalized_observation, new_state)
         """
         status = self.counter_status(state)
+        observation_valid = jnp.all(jnp.isfinite(observation))
+        update_available = status.update_available & observation_valid
 
         def accepted(_: None) -> tuple[Array, WelfordNormalizerState]:
             new_words, ignored_capacity = _checked_lifetime_words_increment(
@@ -612,7 +624,7 @@ class WelfordNormalizer(Normalizer[WelfordNormalizerState]):
             return self.normalize_only(state, observation), state
 
         normalized, new_state = jax.lax.cond(
-            status.update_available,
+            update_available,
             accepted,
             refused,
             operand=None,
@@ -625,7 +637,7 @@ class WelfordNormalizer(Normalizer[WelfordNormalizerState]):
             counter_valid=status.counter_valid,
             lifetime_capacity_available=status.lifetime_capacity_available,
             estimator_capacity_available=status.estimator_capacity_available,
-            update_applied=status.update_available,
+            update_applied=update_available,
         )
 
 
@@ -685,6 +697,8 @@ class StreamingBatchNormalizer(Normalizer[StreamingBatchNormalizerState]):
     ) -> NormalizerUpdateResult:
         """Normalize and conditionally commit BatchNorm-style moments."""
         status = self.counter_status(state)
+        observation_valid = jnp.all(jnp.isfinite(observation))
+        update_available = status.update_available & observation_valid
 
         def accepted(_: None) -> tuple[Array, StreamingBatchNormalizerState]:
             new_words, ignored_capacity = _checked_lifetime_words_increment(
@@ -716,7 +730,7 @@ class StreamingBatchNormalizer(Normalizer[StreamingBatchNormalizerState]):
             return self.normalize_only(state, observation), state
 
         normalized, new_state = jax.lax.cond(
-            status.update_available,
+            update_available,
             accepted,
             refused,
             operand=None,
@@ -729,7 +743,7 @@ class StreamingBatchNormalizer(Normalizer[StreamingBatchNormalizerState]):
             counter_valid=status.counter_valid,
             lifetime_capacity_available=status.lifetime_capacity_available,
             estimator_capacity_available=status.estimator_capacity_available,
-            update_applied=status.update_available,
+            update_applied=update_available,
         )
 
 
