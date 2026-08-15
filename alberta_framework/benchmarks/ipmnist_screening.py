@@ -3440,11 +3440,12 @@ class RLSHeadState:
     """Champion-body carry plus the RLS readout on penultimate features.
 
     ``utility``/``step`` are the champion's utility EMA and clock (over all
-    six tensors in parallel mode; the four body tensors in resid mode carry
-    the signal, the head tensors' utility stays zero).  ``norm``/``fast_mean``
-    are the shift-adaptive normalizer.  ``p`` is the (h2+1, h2+1) inverse
-    feature-correlation matrix and ``wout`` the (h2+1, n_classes) one-vs-all
-    readout on bias-augmented penultimate features.
+    six tensors in parallel mode; the four body tensors in gated resid mode
+    carry the signal, and both remain at their initial values in the no-gate
+    resid ablation).  ``norm``/``fast_mean`` are the shift-adaptive
+    normalizer.  ``p`` is the (h2+1, h2+1) inverse feature-correlation matrix
+    and ``wout`` the (h2+1, n_classes) one-vs-all readout on bias-augmented
+    penultimate features.
     """
 
     utility: dict[str, Array]
@@ -3464,7 +3465,9 @@ def _rls_head_hp(**overrides: float) -> dict[str, float]:
     ``rls_reset_frac`` defaults untriggerable (2.0 > any shifted fraction),
     which is bitwise the plain no-reset path (build-time composition,
     pinned).  ``head_resid`` selects the body error signal (0 = parallel
-    champion SGD head, 1 = RLS residual).
+    champion SGD head, 1 = RLS residual).  ``gate_scale`` is a frozen
+    endpoint switch, not a tuning knob: 1 keeps the incumbent utility-gated
+    update and 0 selects plain decayed SGD for the residual body.
     """
     merged = {
         "step_size": 0.01,
@@ -3482,6 +3485,7 @@ def _rls_head_hp(**overrides: float) -> dict[str, float]:
         "rls_reset_frac": 2.0,
         "rls_p_trace_cap": 0.0,
         "head_resid": 0.0,
+        "gate_scale": 1.0,
     }
     merged.update(overrides)
     return merged
@@ -3505,6 +3509,8 @@ def _make_rls_head_learner(
        ``head_resid = 1``: the same gated step on
        ``d(0.5*||onehot - wout.T @ phi||^2)/d(body)`` with ``wout`` held
        constant (w3/b3 untouched, zero-utility gate guarded to 0.5).
+       The frozen ``gate_scale = 0`` endpoint instead applies plain decayed
+       SGD to that residual gradient and skips all utility bookkeeping.
     4. Sherman-Morrison RLS with forgetting ``rls_lambda`` (symmetrized P,
        the rff_rls equations), then the optional detector-driven P reset
        (``mean(shifted) >= rls_reset_frac`` => ``p = eye/ridge``, wout kept).
@@ -3522,6 +3528,14 @@ def _make_rls_head_learner(
     trace_cap = hp["rls_p_trace_cap"]
     cap_enabled = trace_cap > 0.0
     resid = hp["head_resid"] != 0.0
+    gate_scale = hp.get("gate_scale", 1.0)
+    if gate_scale not in (0.0, 1.0):
+        raise ValueError(
+            "gate_scale is a frozen ablation endpoint and must be 0.0 or 1.0"
+        )
+    gate_enabled = gate_scale == 1.0
+    if not gate_enabled and not resid:
+        raise ValueError("gate_scale=0.0 is supported only for the residual body")
 
     def normalize(
         state: EMANormState, fast_mean: Array, x: Array
@@ -3607,7 +3621,11 @@ def _make_rls_head_learner(
         x_norm, new_norm, new_fast, shifted = normalize(
             state.norm, state.fast_mean, x
         )
-        count = state.step + jnp.array(1, dtype=jnp.int32)
+        count = (
+            state.step + jnp.array(1, dtype=jnp.int32)
+            if gate_enabled
+            else state.step
+        )
         n_classes = state.wout.shape[1]
         y_onehot = jax.nn.one_hot(y, n_classes, dtype=jnp.float32)
         if resid:
@@ -3626,10 +3644,26 @@ def _make_rls_head_learner(
             (loss, (logits, phi)), body_grads = jax.value_and_grad(
                 head_loss, has_aux=True
             )(body)
-            new_params, new_utility = _gated_sgd(
-                params, body_grads, state.utility, count,
-                _RLS_HEAD_BODY, guard_zero_max=True,
-            )
+            if gate_enabled:
+                new_params, new_utility = _gated_sgd(
+                    params,
+                    body_grads,
+                    state.utility,
+                    count,
+                    _RLS_HEAD_BODY,
+                    guard_zero_max=True,
+                )
+            else:
+                # Issue #52's frozen ablation endpoint: do not compute or
+                # carry utility EMA, bias correction, or sigmoid bookkeeping.
+                # The Python closure flag makes this a build-time branch, so
+                # the no-gate compiled graph contains only decayed SGD.
+                new_params = dict(params)
+                for name in _RLS_HEAD_BODY:
+                    new_params[name] = (
+                        params[name] * param_decay - step_size * body_grads[name]
+                    )
+                new_utility = state.utility
         else:
             _, grads = jax.value_and_grad(cross_entropy_loss, has_aux=True)(
                 params, x_norm, y
@@ -5924,6 +5958,18 @@ def _build_registry() -> dict[str, ScreeningSpec]:
             "residual-driven body on the wind-up-immune head (probe c "
             "rerun on the stable configuration)",
         ),
+        (
+            "rls_head_resid_l1_preset005_nogate",
+            {
+                "rls_lambda": 1.0,
+                "rls_reset_frac": 0.05,
+                "head_resid": 1.0,
+                "gate_scale": 0.0,
+            },
+            "issue #52's preregistered gate ablation of the standing "
+            "residual-trained incumbent: plain decayed SGD on the body, "
+            "with no utility EMA, bias correction, or sigmoid gate",
+        ),
         # Wave 3 — ridge star.  2-task seed-0 diagnostic: the initial/reset
         # ridge is the head's convergence-speed knob (P0 = I/ridge bounds
         # the earliest gains); means .8328/.8465/.8530/.8578/.8596 for
@@ -5969,6 +6015,11 @@ def _build_registry() -> dict[str, ScreeningSpec]:
             "probe on the residual loop)",
         ),
     ):
+        body_update = (
+            "plain decayed residual SGD (utility bookkeeping removed)"
+            if rls_overrides.get("gate_scale", 1.0) == 0.0
+            else "utility-gated sigma-0 SGD"
+        )
         specs.append(
             ScreeningSpec(
                 name=rls_name,
@@ -5979,7 +6030,8 @@ def _build_registry() -> dict[str, ScreeningSpec]:
                 frozen_probe_input=_rls_head_frozen_probe_input,
                 description=(
                     "Champion body (shift-adaptive EMA-norm d099 + "
-                    "utility-gated sigma-0 SGD) with a streaming-RLS "
+                    + body_update
+                    + ") with a streaming-RLS "
                     "one-hot readout on the bias-augmented 150-dim "
                     "penultimate features — " + rls_extra + ". One-hot LS "
                     "regression + argmax by design (softmax/logistic "

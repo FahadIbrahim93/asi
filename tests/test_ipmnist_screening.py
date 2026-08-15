@@ -209,6 +209,7 @@ class TestRegistry:
             "rls_head_l1_preset003",
             "rls_head_l0999_pcap",
             "rls_head_resid_l1_preset005",
+            "rls_head_resid_l1_preset005_nogate",
             "rls_head_l0999_preset005_r01",
             "rls_head_l0999_preset005_r003",
             "rls_head_l0999_preset005_r001",
@@ -4115,6 +4116,210 @@ class TestRLSHead:
                 np.asarray(rls_state.norm.count), np.asarray(champ_state.norm.count)
             )
 
+    def test_gate_scale_one_is_bitexact_legacy_incumbent(self):
+        """The explicit gate-on endpoint must preserve the pre-ablation
+        incumbent trajectory, including every carried state and metric bit."""
+        from alberta_framework.benchmarks.ipmnist_screening import (
+            _make_rls_head_learner,
+        )
+
+        incumbent = {
+            "rls_lambda": 1.0,
+            "rls_reset_frac": 0.05,
+            "head_resid": 1.0,
+        }
+        legacy_hp = self._hp(**incumbent)
+        assert legacy_hp["gate_scale"] == 1.0
+        legacy_hp.pop("gate_scale")
+        legacy_init, legacy_step = _make_rls_head_learner(legacy_hp)
+        gated_init, gated_step = self._factory(**incumbent, gate_scale=1.0)
+        params = init_mlp_params(jr.key(31), SMALL)
+        legacy_params = gated_params = params
+        legacy_state, gated_state = legacy_init(params), gated_init(params)
+        xs, ys = self._stream(n_steps=10, seed=37)
+        for step, (x, y) in enumerate(zip(xs, ys)):
+            legacy_params, legacy_state, legacy_metrics = legacy_step(
+                legacy_params, legacy_state, x, y, jr.key(step)
+            )
+            gated_params, gated_state, gated_metrics = gated_step(
+                gated_params, gated_state, x, y, jr.key(step)
+            )
+            for name in sorted(params):
+                np.testing.assert_array_equal(
+                    np.asarray(gated_params[name]), np.asarray(legacy_params[name]), name
+                )
+                np.testing.assert_array_equal(
+                    np.asarray(gated_state.utility[name]),
+                    np.asarray(legacy_state.utility[name]),
+                    name,
+                )
+            for field in ("step", "fast_mean", "p", "wout"):
+                np.testing.assert_array_equal(
+                    np.asarray(getattr(gated_state, field)),
+                    np.asarray(getattr(legacy_state, field)),
+                    field,
+                )
+            for field in ("mean", "var", "count"):
+                np.testing.assert_array_equal(
+                    np.asarray(getattr(gated_state.norm, field)),
+                    np.asarray(getattr(legacy_state.norm, field)),
+                    f"norm.{field}",
+                )
+            for actual, expected in zip(gated_metrics, legacy_metrics):
+                np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
+
+    @pytest.mark.parametrize("gate_scale", [-1.0, 0.25, 0.5, 2.0, math.nan])
+    def test_gate_scale_rejects_non_endpoint_values(self, gate_scale):
+        with pytest.raises(ValueError, match="gate_scale"):
+            self._factory(head_resid=1.0, gate_scale=gate_scale)
+
+    def test_gate_off_requires_residual_body(self):
+        with pytest.raises(ValueError, match="residual"):
+            self._factory(gate_scale=0.0)
+
+    def test_gate_off_two_step_plain_sgd_and_identical_head(self):
+        """The ablation does only decayed SGD on the residual body.
+
+        Step one has a zero residual-body gradient because the readout starts
+        at zero, so the gated incumbent and ablation enter step two with the
+        same body.  Their RLS transitions must therefore remain bit-identical
+        for both steps, while the second ablation body update follows the
+        explicit chain-rule gradient and carries no utility clock or EMA.
+        """
+        params = {
+            "w1": jnp.full((SMALL.input_dim, SMALL.hidden1), 0.01, jnp.float32),
+            "b1": jnp.full((SMALL.hidden1,), 0.5, jnp.float32),
+            "w2": jnp.full((SMALL.hidden1, SMALL.hidden2), 0.02, jnp.float32),
+            "b2": jnp.full((SMALL.hidden2,), 0.5, jnp.float32),
+            "w3": jnp.full((SMALL.hidden2, SMALL.n_classes), 0.03, jnp.float32),
+            "b3": jnp.full((SMALL.n_classes,), 0.04, jnp.float32),
+        }
+        overrides = {
+            "rls_lambda": 1.0,
+            "rls_reset_frac": 0.05,
+            "head_resid": 1.0,
+        }
+        plain_init, plain_step = self._factory(**overrides, gate_scale=0.0)
+        gated_init, gated_step = self._factory(**overrides, gate_scale=1.0)
+        plain_state, gated_state = plain_init(params), gated_init(params)
+        plain_params = gated_params = params
+        expected_params = {name: jnp.asarray(value) for name, value in params.items()}
+        expected_norm = plain_state.norm
+        expected_fast = plain_state.fast_mean
+        expected_p = plain_state.p
+        expected_wout = plain_state.wout
+        hp = self._hp(**overrides, gate_scale=0.0)
+        decay = jnp.asarray(
+            1.0 - hp["step_size"] * hp["weight_decay"], jnp.float32
+        )
+        scale = jnp.asarray(
+            1.0 / math.sqrt(SMALL.hidden2 + 1), dtype=jnp.float32
+        )
+        xs = (
+            jnp.linspace(0.2, 1.3, SMALL.input_dim, dtype=jnp.float32),
+            jnp.linspace(1.1, 0.1, SMALL.input_dim, dtype=jnp.float32),
+        )
+        ys = (jnp.array(0, jnp.int32), jnp.array(1, jnp.int32))
+
+        for step, (x, y) in enumerate(zip(xs, ys)):
+            x_norm, expected_norm, expected_fast, shifted = shift_adaptive_normalize(
+                expected_norm,
+                expected_fast,
+                x,
+                decay=hp["norm_decay"],
+                fast_decay=hp["fast_decay"],
+                epsilon=hp["norm_epsilon"],
+                shift_k=hp["shift_k"],
+                shift_delta=hp["shift_delta"],
+                shift_refractory=hp["shift_refractory"],
+            )
+            assert not bool(jnp.any(shifted))
+            z1 = x_norm @ expected_params["w1"] + expected_params["b1"]
+            a1 = jax.nn.relu(z1)
+            z2 = a1 @ expected_params["w2"] + expected_params["b2"]
+            a2 = jax.nn.relu(z2)
+            phi = jnp.concatenate([a2 * scale, jnp.ones((1,), jnp.float32)])
+            logits = expected_wout.T @ phi
+            target = jax.nn.one_hot(y, SMALL.n_classes, dtype=jnp.float32)
+            dlogits = logits - target
+            dphi = expected_wout @ dlogits
+            dz2 = (dphi[:-1] * scale) * (z2 > 0.0)
+            grads = {
+                "w2": jnp.outer(a1, dz2),
+                "b2": dz2,
+            }
+            dz1 = (expected_params["w2"] @ dz2) * (z1 > 0.0)
+            grads["w1"] = jnp.outer(x_norm, dz1)
+            grads["b1"] = dz1
+            for name in ("w1", "b1", "w2", "b2"):
+                expected_params[name] = (
+                    expected_params[name] * decay - hp["step_size"] * grads[name]
+                )
+
+            err = target - logits
+            pp = expected_p @ phi
+            gain = pp / (hp["rls_lambda"] + phi @ pp)
+            expected_wout = expected_wout + jnp.outer(gain, err)
+            expected_p = (expected_p - jnp.outer(gain, pp)) / hp["rls_lambda"]
+            expected_p = 0.5 * (expected_p + expected_p.T)
+
+            plain_params, plain_state, plain_metrics = plain_step(
+                plain_params, plain_state, x, y, jr.key(step)
+            )
+            gated_params, gated_state, gated_metrics = gated_step(
+                gated_params, gated_state, x, y, jr.key(step)
+            )
+            for name in ("w1", "b1", "w2", "b2"):
+                np.testing.assert_allclose(
+                    np.asarray(plain_params[name]),
+                    np.asarray(expected_params[name]),
+                    rtol=0.0,
+                    atol=2e-7,
+                    err_msg=name,
+                )
+            for name in ("w3", "b3"):
+                np.testing.assert_array_equal(
+                    np.asarray(plain_params[name]), np.asarray(params[name]), name
+                )
+            np.testing.assert_array_equal(
+                np.asarray(plain_state.p), np.asarray(expected_p)
+            )
+            np.testing.assert_array_equal(
+                np.asarray(plain_state.wout), np.asarray(expected_wout)
+            )
+            np.testing.assert_array_equal(
+                np.asarray(plain_state.p), np.asarray(gated_state.p)
+            )
+            np.testing.assert_array_equal(
+                np.asarray(plain_state.wout), np.asarray(gated_state.wout)
+            )
+            np.testing.assert_array_equal(
+                np.asarray(plain_state.fast_mean), np.asarray(expected_fast)
+            )
+            np.testing.assert_array_equal(
+                np.asarray(plain_state.fast_mean), np.asarray(gated_state.fast_mean)
+            )
+            for field in ("mean", "var", "count"):
+                np.testing.assert_array_equal(
+                    np.asarray(getattr(plain_state.norm, field)),
+                    np.asarray(getattr(expected_norm, field)),
+                    f"norm.{field}",
+                )
+                np.testing.assert_array_equal(
+                    np.asarray(getattr(plain_state.norm, field)),
+                    np.asarray(getattr(gated_state.norm, field)),
+                    f"gated norm.{field}",
+                )
+            for actual, expected in zip(plain_metrics, gated_metrics):
+                np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
+            assert int(plain_state.step) == 0
+            for name in sorted(params):
+                assert not np.any(np.asarray(plain_state.utility[name])), name
+
+        assert not np.array_equal(
+            np.asarray(plain_params["w1"]), np.asarray(gated_params["w1"])
+        )
+
     def test_infinite_ridge_is_frozen_degenerate_head(self):
         """Reduction pin: rls_ridge_init=inf gives P=0 exactly, so the head
         never updates (wout stays 0), every prediction is the constant argmax
@@ -4357,14 +4562,18 @@ class TestRLSHead:
         )
         assert bool(jnp.all(jnp.isfinite(new_state.p)))
 
-    def test_smoke_runs_above_chance_both_modes(self):
+    def test_smoke_runs_above_chance_all_body_modes(self):
         x, y = self._learnable_stream()
         config = IPMNISTConfig(
             n_tasks=2, task_length=200, input_dim=12, hidden1=8, hidden2=6, n_classes=5
         )
         from alberta_framework.benchmarks.ipmnist_screening import _rls_head_hp
 
-        for overrides in ({}, {"head_resid": 1.0}):
+        for overrides in (
+            {},
+            {"head_resid": 1.0},
+            {"head_resid": 1.0, "gate_scale": 0.0},
+        ):
             spec = ScreeningSpec(
                 name="rls_head_smoke",
                 base_learner="upgd_w",
@@ -4492,6 +4701,12 @@ class TestRLSHead:
             "rls_head_resid_l1_preset005": {
                 "rls_lambda": 1.0, "rls_reset_frac": 0.05, "head_resid": 1.0
             },
+            "rls_head_resid_l1_preset005_nogate": {
+                "rls_lambda": 1.0,
+                "rls_reset_frac": 0.05,
+                "head_resid": 1.0,
+                "gate_scale": 0.0,
+            },
             # Wave 3 — ridge star (2-task seed-0 diagnostic: smaller initial
             # ridge = larger early/post-reset gains; .8328/.8465/.853/.8578/
             # .8596 for ridge 1.0/0.3/0.1/0.03/0.01, monotone), plus the
@@ -4537,6 +4752,13 @@ class TestRLSHead:
             assert hp["shift_k"] == pytest.approx(1.0), name
             assert hp["shift_delta"] == pytest.approx(0.02), name
             assert hp["noise_std"] == 0.0, name
+        incumbent_hp = screening_spec(
+            "rls_head_resid_l1_preset005"
+        ).hyperparameters
+        nogate_hp = screening_spec(
+            "rls_head_resid_l1_preset005_nogate"
+        ).hyperparameters
+        assert nogate_hp == {**incumbent_hp, "gate_scale": 0.0}
 
 
 class TestNBEnsemble:
