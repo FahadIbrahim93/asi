@@ -34,6 +34,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Isolated Step 9 candidate, behavior-rollout, and control-rollout RNG branches, persisted
+  a reserved future master through real and dream control-update rejection, rejected dreams
+  with any failed rollout transaction, and kept zero-budget updates identical to the
+  real-only path.
+- Kept Step 7 real and rollout control RNG streams linear through transactional rejection
+  whenever planning is enabled, while retaining the exact real-only path at planning zero.
 - Rejected nonfinite and out-of-range Pavlovian phase contingencies before they can
   silently behave like zero- or certain-reinforcement probabilities.
 - Preserved every leading batch axis when applying gauntlet EMA smoothing along the last
