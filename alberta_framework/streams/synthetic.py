@@ -19,6 +19,13 @@ from alberta_framework.core.types import TimeStep
 from alberta_framework.streams.base import ScanStream
 
 
+def _require_positive_int(name: str, value: object) -> int:
+    """Reject 0 / negative / bool / non-int schedule moduli (``n % 0``, ``t / 0``)."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{name} must be a positive integer, got {value!r}")
+    return value
+
+
 @chex.dataclass(frozen=True)
 class RandomWalkState:
     """State for RandomWalkStream.
@@ -268,7 +275,7 @@ class AbruptChangeStream:
             feature_std: Std dev of feature values
         """
         self._feature_dim = feature_dim
-        self._change_interval = change_interval
+        self._change_interval = _require_positive_int("change_interval", change_interval)
         self._noise_std = noise_std
         self._feature_std = feature_std
 
@@ -391,7 +398,7 @@ class SuttonExperiment1Stream:
         """
         self._num_relevant = num_relevant
         self._num_irrelevant = num_irrelevant
-        self._change_interval = change_interval
+        self._change_interval = _require_positive_int("change_interval", change_interval)
         self._noise_std = noise_std
         self._bias_drift_rate = bias_drift_rate
 
@@ -522,8 +529,10 @@ class CyclicStream:
             feature_std: Std dev of feature values
         """
         self._feature_dim = feature_dim
-        self._cycle_length = cycle_length
-        self._num_configurations = num_configurations
+        self._cycle_length = _require_positive_int("cycle_length", cycle_length)
+        self._num_configurations = _require_positive_int(
+            "num_configurations", num_configurations
+        )
         self._noise_std = noise_std
         self._feature_std = feature_std
 
@@ -636,7 +645,7 @@ class PeriodicChangeStream:
             feature_std: Std dev of feature values
         """
         self._feature_dim = feature_dim
-        self._period = period
+        self._period = _require_positive_int("period", period)
         self._amplitude = amplitude
         self._noise_std = noise_std
         self._feature_std = feature_std
@@ -898,8 +907,12 @@ class DynamicScaleShiftStream:
             noise_std: Std dev of target noise
         """
         self._feature_dim = feature_dim
-        self._scale_change_interval = scale_change_interval
-        self._weight_change_interval = weight_change_interval
+        self._scale_change_interval = _require_positive_int(
+            "scale_change_interval", scale_change_interval
+        )
+        self._weight_change_interval = _require_positive_int(
+            "weight_change_interval", weight_change_interval
+        )
         self._min_scale = min_scale
         self._max_scale = max_scale
         self._noise_std = noise_std
