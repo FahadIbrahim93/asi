@@ -911,11 +911,11 @@ class TestShardsAndMerge:
         assert l2["paired_vs_control"]["seeds"] == [1]
         assert len(l2["paired_vs_control"]["per_seed_diff"]) == 1
 
-    def _write_inband_shard(self, tmp_path, name, seed, accuracy):
+    def _write_inband_shard(self, tmp_path, config_name, seed, accuracy):
         """Write a structurally valid shard with controlled accuracy."""
         payload = {
             "schema": SHARD_SCHEMA,
-            "config_name": name,
+            "config_name": config_name,
             "base_learner": "upgd_w",
             "hyperparameters": {},
             "seed": seed,
@@ -926,7 +926,7 @@ class TestShardsAndMerge:
             "per_task_plasticity": [0.5] * SMALL.n_tasks,
             "wall_clock_seconds": 1.0,
         }
-        path = tmp_path / f"{name}_seed{seed}.json"
+        path = tmp_path / f"{config_name}_seed{seed}.json"
         path.write_text(json.dumps(payload), encoding="utf-8")
         return path
 
