@@ -528,8 +528,23 @@ class BehaviorModel:
             accuracy_ema=accuracy_ema,
             confidence_ema=confidence_ema,
         )
+        # Inf observation makes softmax NaN and logit_error * x = 0*inf = NaN
+        # on silent features. Hold the previous finite state.
+        inputs_valid = jnp.all(jnp.isfinite(obs))
+        proposed_finite = (
+            jnp.all(jnp.isfinite(new_state.weights))
+            & jnp.all(jnp.isfinite(new_state.bias))
+            & jnp.isfinite(new_state.nll_ema)
+            & jnp.isfinite(new_state.accuracy_ema)
+            & jnp.isfinite(new_state.confidence_ema)
+        )
+        committed = jax.lax.cond(
+            inputs_valid & proposed_finite,
+            lambda: new_state,
+            lambda: state,
+        )
         return BehaviorModelUpdateResult(
-            state=new_state,
+            state=committed,
             logits=logits,
             probabilities=probabilities,
             action_probability=action_prob,
