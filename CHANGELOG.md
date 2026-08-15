@@ -37,12 +37,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `get_final_performance` now refuses a non-positive `window` and an empty time
   axis instead of silently averaging the whole trace (`window=0`, because
   `arr[:, -0:]` is a full slice) or a prefix (`window < 0`) and publishing NaN.
+- Statistical helpers now reject empty Mann–Whitney groups and unequal or
+  underpowered Wilcoxon pairs before calling SciPy; an empty Bonferroni family
+  is a stable no-op that retains the requested family-wise alpha.
+- Continual-learning metrics now require finite first and final evaluations and
+  reject infinite post-exposure trajectories instead of backfilling across
+  numerical divergence; intermediate NaN gaps remain valid missing probes.
 - Removed broad package-import fallbacks that hid internal failures, and broke the
   learner/stream import cycle without making Gymnasium a base dependency.
 - Added regression coverage for package import boundaries, release metadata, CI shard
   planning, synchronized agent guides, and local documentation links.
-- Required at least two shared seeds before an IPMNIST arm can authorize confirmation
-  compute; one-seed paired summaries remain available for development inspection.
+- Required at least two shared seeds and a positive candidate-minus-control
+  difference on every aligned seed before an IPMNIST arm can authorize
+  confirmation compute; one-seed paired summaries remain available for
+  development inspection.
 - Kept core Autostep and the screening lane's IDBD/Autostep meta-state finite when a
   non-finite correlation would otherwise turn a silent trace into a persistent NaN.
 - Made optimizer, learner, Horde, actor-critic, model, option, normalizer, and utility updates
@@ -62,8 +70,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Discrete action/context identifiers and Exp3 credit probabilities are validated before any
   integer cast, lookup, or state update, and invalid prediction/selection queries stay visible.
 - Strengthened IPMNIST and micro-continual shard merging to reject cross-seed learner,
-  hyperparameter, mechanism, or runtime-environment drift. The common runtime environment is
-  now retained in derived summaries and validation receipts instead of being discarded.
+  hyperparameter, mechanism, or runtime-environment drift, plus malformed or
+  aggregate-overflowing wall-clock timings. The common runtime environment is now retained in
+  derived summaries and validation receipts instead of being discarded.
 - Made proxy receipts require strict historical reference schemas, frozen control identities
   and hyperparameters, compatible horizons, unique paired control seeds, and one common
   protocol before a validation result can be issued.
