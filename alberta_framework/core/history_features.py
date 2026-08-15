@@ -186,16 +186,22 @@ class HistoryFeatureExtractor:
         """
         # Select tracked channels
         channel_indices = jnp.asarray(self._channels, dtype=jnp.int32)
-        obs_tracked = observation[channel_indices]  # shape (n_channels,)
+        observation = jnp.asarray(observation, dtype=jnp.float32)
+        observation_valid = jnp.all(jnp.isfinite(observation))
+        safe_observation = jnp.where(
+            jnp.isfinite(observation), observation, jnp.zeros_like(observation)
+        )
+        obs_tracked = observation[channel_indices]
 
         # EMA decay per trace row
         decay = jnp.asarray(self._decay_rates, dtype=jnp.float32)[:, None]
-        new_traces = decay * state.traces + (1.0 - decay) * obs_tracked[None, :]
+        proposed_traces = decay * state.traces + (1.0 - decay) * obs_tracked[None, :]
+        new_traces = jnp.where(observation_valid, proposed_traces, state.traces)
 
         # Flatten and concatenate
         flat_traces = new_traces.reshape(-1)
         if self._include_raw:
-            augmented = jnp.concatenate([observation, flat_traces])
+            augmented = jnp.concatenate([safe_observation, flat_traces])
         else:
             augmented = flat_traces
 
