@@ -639,6 +639,41 @@ class TestShards:
             atol=1e-8,
         )
 
+    def test_load_rejects_invalid_wall_clock_types_and_values(self, tmp_path: Path):
+        payload = micro_shard_payload(self._result())
+        path = tmp_path / "bad-wall-clock.json"
+
+        for wall_clock in (None, True, False, "1.0", [], {}, math.inf, -math.inf, math.nan, -1):
+            payload["wall_clock_seconds"] = wall_clock
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            with pytest.raises(ValueError, match="wall_clock_seconds"):
+                load_micro_shard(path)
+
+    @pytest.mark.parametrize("wall_clock", [0, 0.0, 1, 1.25])
+    def test_load_preserves_valid_wall_clock(self, tmp_path: Path, wall_clock: int | float):
+        payload = micro_shard_payload(self._result())
+        payload["wall_clock_seconds"] = wall_clock
+        path = tmp_path / "valid-wall-clock.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+        assert load_micro_shard(path)["wall_clock_seconds"] == wall_clock
+
+    def test_merge_preserves_valid_wall_clock_summary(self, tmp_path: Path):
+        payload = micro_shard_payload(self._result())
+        paths = []
+        for seed, wall_clock in enumerate((0, 1.25)):
+            shard = json.loads(json.dumps(payload))
+            shard["seed"] = seed
+            shard["wall_clock_seconds"] = wall_clock
+            path = tmp_path / f"valid-wall-clock-{seed}.json"
+            path.write_text(json.dumps(shard), encoding="utf-8")
+            paths.append(path)
+
+        summary = merge_micro_shards(paths, bayes_samples=128)
+
+        assert summary["results"][0]["wall_clock_seconds_total"] == 1.25
+        assert summary["results"][0]["wall_clock_seconds_mean"] == 0.625
+
     def test_shard_path_convention(self, tmp_path: Path):
         path = micro_shard_path(tmp_path, "input_permutation", "gated_norm", 2)
         assert path.name == "input_permutation_gated_norm_seed2.json"

@@ -73,7 +73,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any
+from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
@@ -883,6 +883,13 @@ def load_micro_shard(path: Path | str) -> dict[str, Any]:
             raise ValueError(
                 f"{path}: {fieldname} must be finite with shape ({config.n_regimes},)"
             )
+    wall_clock_seconds = cast(int | float, payload.get("wall_clock_seconds"))
+    if (
+        type(wall_clock_seconds) not in (int, float)
+        or not math.isfinite(wall_clock_seconds)
+        or wall_clock_seconds < 0
+    ):
+        raise ValueError(f"{path}: wall_clock_seconds must be a finite, non-negative number")
     if type(payload.get("seed")) is not int or payload["seed"] < 0:
         raise ValueError(f"{path}: seed must be a non-negative integer")
     for fieldname in ("hidden1", "hidden2"):
