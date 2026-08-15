@@ -921,16 +921,27 @@ def update_keyboard_chord_learner(
         + (1.0 - config.baseline_decay) * reward_arr
     )
     advantage = reward_arr - state.reward_baseline
-    new_vector = (
+    proposed_vector = (
         state.chord_vector * (1.0 - config.step_size * config.l2_penalty)
         + config.step_size * advantage * chord_norm
     )
-    norm = jnp.linalg.norm(new_vector)
+    norm = jnp.linalg.norm(proposed_vector)
     scale = jnp.minimum(1.0, jnp.asarray(config.max_norm, dtype=jnp.float32) / (norm + 1.0e-8))
-    return KeyboardChordLearnerState(
-        chord_vector=new_vector * scale,
+    proposed_state = KeyboardChordLearnerState(
+        chord_vector=proposed_vector * scale,
         reward_baseline=baseline,
         step_count=state.step_count + 1,
+    )
+    # Inf reward * a zero chord coordinate is 0*inf = NaN, then the
+    # max-norm rescaling is nan/inf and the whole vector stays poisoned.
+    inputs_valid = jnp.all(jnp.isfinite(chord)) & jnp.isfinite(reward_arr)
+    proposed_finite = jnp.all(jnp.isfinite(proposed_state.chord_vector)) & jnp.isfinite(
+        proposed_state.reward_baseline
+    )
+    return jax.lax.cond(
+        inputs_valid & proposed_finite,
+        lambda: proposed_state,
+        lambda: state,
     )
 
 
