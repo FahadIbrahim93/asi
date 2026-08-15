@@ -1839,7 +1839,7 @@ class TrueOnlineTDLearner:
         stored_traces = jnp.where(terminal, jnp.zeros_like(new_traces), new_traces)
         stored_bias_trace = jnp.where(terminal, 0.0, new_bias_trace)
         new_v_old = jnp.where(terminal, 0.0, next_value)
-        new_state = TrueOnlineTDState(
+        proposed_state = TrueOnlineTDState(
             weights=new_weights,
             bias=new_bias,
             eligibility_traces=stored_traces,
@@ -1849,12 +1849,32 @@ class TrueOnlineTDLearner:
             birth_timestamp=state.birth_timestamp,
             uptime_s=state.uptime_s,
         )
+        # Inf reward * a silent feature is 0*inf = NaN in the Dutch-trace
+        # update. Hold the previous finite state.
+        inputs_valid = (
+            jnp.all(jnp.isfinite(observation))
+            & jnp.isfinite(jnp.squeeze(reward))
+            & jnp.all(jnp.isfinite(next_observation))
+            & jnp.isfinite(gamma_scalar)
+        )
+        proposed_finite = (
+            jnp.all(jnp.isfinite(proposed_state.weights))
+            & jnp.isfinite(proposed_state.bias)
+            & jnp.all(jnp.isfinite(proposed_state.eligibility_traces))
+            & jnp.isfinite(proposed_state.bias_eligibility_trace)
+            & jnp.isfinite(proposed_state.v_old)
+        )
+        new_state = jax.lax.cond(
+            inputs_valid & proposed_finite,
+            lambda: proposed_state,
+            lambda: state,
+        )
         metrics = jnp.array(
             [
                 td_error**2,
                 td_error,
-                jnp.mean(jnp.abs(new_traces)),
-                new_v_old,
+                jnp.mean(jnp.abs(new_state.eligibility_traces)),
+                new_state.v_old,
             ],
             dtype=jnp.float32,
         )
