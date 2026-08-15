@@ -52,6 +52,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Rejected SIGReg samples, embeddings, directions, and derived projections that are
+  non-finite in float32 arithmetic before they can become silent NaN losses, including
+  under compiled and vectorized JAX calls.
 - Required automatic feature-to-subtask counts to be non-negative integer scalars before
   ranking, while retaining NumPy/JAX integer-scalar compatibility and zero/oversized bounds.
 - Aligned plotted trailing-window learning-curve means and confidence intervals with the
