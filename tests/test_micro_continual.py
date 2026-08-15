@@ -705,6 +705,61 @@ class TestShards:
         with pytest.raises(ValueError, match="stream config"):
             merge_micro_shards([path_a, path_b], bayes_samples=1_000)
 
+    @pytest.mark.parametrize(
+        ("value", "label"),
+        [
+            (math.inf, "inf"),
+            (math.nan, "nan"),
+            (-1.0, "negative"),
+        ],
+    )
+    def test_load_rejects_non_finite_wall_clock_seconds(
+        self, tmp_path: Path, value, label
+    ):
+        """load_micro_shard gates per_regime_accuracy/per_regime_loss/
+        per_regime_plasticity for finiteness but never validated
+        wall_clock_seconds: a shard with an infinite, NaN, or negative
+        wall_clock_seconds loaded cleanly, and merge_micro_shards would carry
+        it straight into both wall_clock_seconds_total and
+        wall_clock_seconds_mean, whose json.dump then emits the non-standard
+        `Infinity`/`NaN` token in place of a number — an artifact this
+        pipeline's own tooling produced but a strict JSON parser (e.g. JS
+        `JSON.parse`) refuses to read back."""
+        payload = micro_shard_payload(self._result())
+        payload["wall_clock_seconds"] = value
+        path = tmp_path / "bad.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+        with pytest.raises(
+            ValueError,
+            match=r"wall_clock_seconds must be a finite, non-negative number",
+        ):
+            load_micro_shard(path)
+
+    def test_merge_propagates_finite_wall_clock_into_both_totals(
+        self, tmp_path: Path
+    ):
+        """Positive control: shards with genuinely finite, non-negative
+        wall_clock_seconds still load and merge, and merge_micro_shards
+        still sums/averages them into both wall_clock_seconds_total and
+        wall_clock_seconds_mean exactly as before the guard existed."""
+        paths = []
+        wall_clocks = []
+        for seed in (0, 1):
+            payload = micro_shard_payload(self._result(seed=seed))
+            wall_clocks.append(payload["wall_clock_seconds"])
+            path = micro_shard_path(tmp_path, TINY.family, "sgd_raw", seed)
+            write_micro_shard(path, payload)
+            paths.append(path)
+
+        summary = merge_micro_shards(paths, bayes_samples=1_000)
+
+        entry = next(e for e in summary["results"] if e["arm_name"] == "sgd_raw")
+        assert entry["wall_clock_seconds_total"] == round(sum(wall_clocks), 3)
+        assert entry["wall_clock_seconds_mean"] == round(
+            sum(wall_clocks) / len(wall_clocks), 3
+        )
+
 
 # =============================================================================
 # Canonical suite: transfer validation

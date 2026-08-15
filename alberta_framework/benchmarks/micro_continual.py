@@ -860,6 +860,12 @@ def load_micro_shard(path: Path | str) -> dict[str, Any]:
             raise ValueError(
                 f"{path}: {fieldname} must be finite with shape ({config.n_regimes},)"
             )
+    if (
+        type(payload.get("wall_clock_seconds")) not in (int, float)
+        or not math.isfinite(payload["wall_clock_seconds"])
+        or payload["wall_clock_seconds"] < 0
+    ):
+        raise ValueError(f"{path}: wall_clock_seconds must be a finite, non-negative number")
     if type(payload.get("seed")) is not int or payload["seed"] < 0:
         raise ValueError(f"{path}: seed must be a non-negative integer")
     for fieldname in ("hidden1", "hidden2"):
