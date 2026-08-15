@@ -711,10 +711,13 @@ from alberta_framework.core.upgd_memory import (
     run_upgd_memory_arrays,
 )
 from alberta_framework.core.working_memory import (
+    WorkingMemoryArrayResult,
     WorkingMemoryConfig,
     WorkingMemoryDiagnostics,
     WorkingMemoryFeaturizer,
     WorkingMemoryState,
+    WorkingMemoryStepResult,
+    WorkingMemoryUpdateResult,
     transform_working_memory_arrays,
 )
 from alberta_framework.core.world_model import (
@@ -1276,10 +1279,13 @@ __all__ = [
     "PartnerPolicyFusionState",
     "GeneratorMetaResourceManager",
     "HistoryFeatureExtractor",
+    "WorkingMemoryArrayResult",
     "WorkingMemoryConfig",
     "WorkingMemoryDiagnostics",
     "WorkingMemoryFeaturizer",
     "WorkingMemoryState",
+    "WorkingMemoryStepResult",
+    "WorkingMemoryUpdateResult",
     "transform_working_memory_arrays",
     # Causal state construction
     "STATE_BUILDER_CHECKPOINT_SCHEMA",

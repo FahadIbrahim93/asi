@@ -26,6 +26,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Extended pre-1.0 learner and optimizer result schemas with explicit scalar or per-channel
   `update_applied` masks. Transaction-aware callers use the checked optimizer boundary while
   the legacy two-value `update_from_gradient` API remains available.
+- Added explicit scalar and per-event transaction masks to working-memory checked-update,
+  step, and array results while preserving the latter two legacy unpacking surfaces.
 - Kept finite one-step optimizer results byte-pinned. The added JAX transaction predicates can
   lower differently in compiled multi-step scans and may change last-bit rounding without
   changing the finite-path equations or acceptance semantics.

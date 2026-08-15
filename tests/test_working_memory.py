@@ -168,6 +168,167 @@ def test_working_memory_scan_and_jit_compatibility() -> None:
     assert int(final_state.step_count) == 10
 
 
+def test_working_memory_step_reports_rejection_with_neutral_features_and_recovers() -> None:
+    memory = WorkingMemoryFeaturizer(
+        WorkingMemoryConfig(
+            observation_dim=1,
+            action_dim=0,
+            reward_dim=0,
+            observation_decay_rates=(0.0,),
+            include_current_observation=False,
+            include_current_action=False,
+            include_current_reward=False,
+        )
+    )
+    state = memory.update(
+        memory.init(),
+        jnp.asarray([2.0]),
+        memory.zero_action(),
+        memory.zero_reward(),
+    )
+
+    checked_update = memory.update_checked(
+        state,
+        jnp.asarray([jnp.inf]),
+        memory.zero_action(),
+        memory.zero_reward(),
+    )
+    assert not bool(checked_update.update_applied)
+    chex.assert_trees_all_equal(checked_update.state, state)
+
+    result = memory.step(
+        state,
+        jnp.asarray([jnp.inf]),
+        memory.zero_action(),
+        memory.zero_reward(),
+    )
+
+    assert not bool(result.update_applied)
+    chex.assert_trees_all_equal(result.state, state)
+    chex.assert_trees_all_equal(result.features, jnp.zeros((1,), dtype=jnp.float32))
+    legacy_state, legacy_features = result
+    chex.assert_trees_all_equal(legacy_state, result.state)
+    chex.assert_trees_all_equal(legacy_features, result.features)
+
+    recovered = memory.step(
+        result.state,
+        jnp.asarray([3.0]),
+        memory.zero_action(),
+        memory.zero_reward(),
+    )
+    assert bool(recovered.update_applied)
+    assert int(recovered.state.step_count) == int(state.step_count) + 1
+
+
+def test_working_memory_step_rejects_finite_post_apply_overflow() -> None:
+    memory = WorkingMemoryFeaturizer(
+        WorkingMemoryConfig(
+            observation_dim=1,
+            action_dim=0,
+            reward_dim=0,
+            observation_decay_rates=(0.5,),
+            include_current_observation=False,
+            include_current_action=False,
+            include_current_reward=False,
+        )
+    )
+    limit = jnp.asarray(jnp.finfo(jnp.float32).max, dtype=jnp.float32)
+    state = memory.init().replace(observation_traces=-limit.reshape((1, 1)))
+
+    rejected = memory.step(
+        state,
+        jnp.asarray([limit]),
+        memory.zero_action(),
+        memory.zero_reward(),
+    )
+
+    assert not bool(rejected.update_applied)
+    chex.assert_trees_all_equal(rejected.state, state)
+    chex.assert_trees_all_equal(rejected.features, jnp.zeros((1,), dtype=jnp.float32))
+    recovered = memory.step(
+        rejected.state,
+        jnp.asarray([-limit]),
+        memory.zero_action(),
+        memory.zero_reward(),
+    )
+    assert bool(recovered.update_applied)
+    chex.assert_tree_all_finite(recovered.state)
+
+
+def test_working_memory_jit_reports_gate_only_rejection_and_rolls_back() -> None:
+    memory = WorkingMemoryFeaturizer(
+        WorkingMemoryConfig(
+            observation_dim=1,
+            action_dim=0,
+            reward_dim=0,
+            observation_decay_rates=(0.5,),
+            include_current_observation=False,
+            include_current_action=False,
+            include_current_reward=False,
+        )
+    )
+    state = memory.update(
+        memory.init(),
+        jnp.asarray([2.0]),
+        memory.zero_action(),
+        memory.zero_reward(),
+    )
+
+    compiled_step = jax.jit(
+        lambda current, gate: memory.step(
+            current,
+            jnp.asarray([1.0]),
+            memory.zero_action(),
+            memory.zero_reward(),
+            gate,
+        )
+    )
+    rejected = compiled_step(state, jnp.asarray(jnp.nan, dtype=jnp.float32))
+
+    assert not bool(rejected.update_applied)
+    chex.assert_trees_all_equal(rejected.state, state)
+    chex.assert_trees_all_equal(rejected.features, jnp.zeros((1,), dtype=jnp.float32))
+
+
+def test_working_memory_array_result_exposes_per_step_transaction_mask() -> None:
+    memory = WorkingMemoryFeaturizer(
+        WorkingMemoryConfig(
+            observation_dim=1,
+            action_dim=0,
+            reward_dim=0,
+            observation_decay_rates=(0.0,),
+            include_current_observation=False,
+            include_current_action=False,
+            include_current_reward=False,
+        )
+    )
+    observations = jnp.asarray([[1.0], [jnp.inf], [2.0], [3.0]], dtype=jnp.float32)
+    actions = jnp.zeros((4, 0), dtype=jnp.float32)
+    rewards = jnp.zeros((4, 0), dtype=jnp.float32)
+    gates = jnp.asarray([1.0, 1.0, jnp.nan, 1.0], dtype=jnp.float32)
+
+    result = jax.jit(
+        lambda: transform_working_memory_arrays(
+            memory,
+            observations,
+            actions,
+            rewards,
+            external_gates=gates,
+        )
+    )()
+
+    chex.assert_trees_all_equal(
+        result.updates_applied,
+        jnp.asarray([True, False, False, True]),
+    )
+    chex.assert_trees_all_equal(result.features[:, 0], jnp.asarray([0.0, 0.0, 0.0, 1.0]))
+    assert int(result.state.step_count) == 2
+    chex.assert_trees_all_close(result.state.observation_traces, jnp.asarray([[3.0]]))
+    legacy_state, legacy_features = result
+    chex.assert_trees_all_equal(legacy_state, result.state)
+    chex.assert_trees_all_equal(legacy_features, result.features)
+
+
 def test_working_memory_diagnostics_are_finite() -> None:
     memory = WorkingMemoryFeaturizer(WorkingMemoryConfig(observation_dim=2, action_dim=1))
     state = memory.update(

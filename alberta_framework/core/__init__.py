@@ -520,10 +520,13 @@ from alberta_framework.core.types import (
     create_horde_spec,
 )
 from alberta_framework.core.working_memory import (
+    WorkingMemoryArrayResult,
     WorkingMemoryConfig,
     WorkingMemoryDiagnostics,
     WorkingMemoryFeaturizer,
     WorkingMemoryState,
+    WorkingMemoryStepResult,
+    WorkingMemoryUpdateResult,
     transform_working_memory_arrays,
 )
 from alberta_framework.core.world_model import (
@@ -936,10 +939,13 @@ __all__ = [
     "state_builder_config_from_config",
     "state_builder_from_config",
     # Working memory / predictive state
+    "WorkingMemoryArrayResult",
     "WorkingMemoryConfig",
     "WorkingMemoryDiagnostics",
     "WorkingMemoryFeaturizer",
     "WorkingMemoryState",
+    "WorkingMemoryStepResult",
+    "WorkingMemoryUpdateResult",
     "transform_working_memory_arrays",
     "LatentWorldModel",
     "LatentWorldModelConfig",

@@ -45,7 +45,7 @@ from alberta_framework.core.world_model import (
 )
 
 
-def test_working_memory_rejects_nonfinite_event_atomically_without_hiding_output() -> None:
+def test_working_memory_rejects_nonfinite_event_atomically_with_explicit_verdict() -> None:
     memory = WorkingMemoryFeaturizer(
         WorkingMemoryConfig(
             observation_dim=1,
@@ -61,7 +61,7 @@ def test_working_memory_rejects_nonfinite_event_atomically_without_hiding_output
     state = memory.update(
         memory.init(), jnp.asarray([2.0]), memory.zero_action(), memory.zero_reward()
     )
-    rejected, features = memory.step(
+    result = memory.step(
         state,
         jnp.asarray([jnp.inf]),
         memory.zero_action(),
@@ -69,10 +69,11 @@ def test_working_memory_rejects_nonfinite_event_atomically_without_hiding_output
         external_gate=0.0,
     )
 
-    chex.assert_trees_all_equal(rejected, state)
-    assert not bool(jnp.all(jnp.isfinite(features)))
+    assert not bool(result.update_applied)
+    chex.assert_trees_all_equal(result.state, state)
+    chex.assert_trees_all_equal(result.features, jnp.zeros_like(result.features))
     recovered = memory.update(
-        rejected, jnp.asarray([0.0]), memory.zero_action(), memory.zero_reward()
+        result.state, jnp.asarray([0.0]), memory.zero_action(), memory.zero_reward()
     )
     chex.assert_tree_all_finite(recovered)
 

@@ -11,17 +11,19 @@ updates.
 from __future__ import annotations
 
 import functools
+from collections.abc import Iterator
 from dataclasses import asdict, dataclass
-from typing import Any, cast
+from typing import Any
 
 import chex
 import jax
 import jax.numpy as jnp
 from jax import Array
-from jaxtyping import Float
+from jaxtyping import Bool, Float
 
 from alberta_framework.core.update_safety import (
     floating_tree_is_finite,
+    neutralize_array,
     select_transaction,
 )
 
@@ -133,6 +135,49 @@ class WorkingMemoryDiagnostics:
     action_energy: Array
     reward_energy: Array
     last_gate: Float[Array, " 3"]
+
+
+@chex.dataclass(frozen=True)
+class WorkingMemoryUpdateResult:
+    """Checked state transition for one working-memory event."""
+
+    state: WorkingMemoryState
+    update_applied: Bool[Array, ""]
+
+
+@chex.dataclass(frozen=True, mappable_dataclass=False)
+class WorkingMemoryStepResult:
+    """Checked feature-and-update result with legacy two-value unpacking.
+
+    Iteration intentionally yields ``(state, features)`` so existing callers
+    retain their pre-1.0 unpacking surface. Transaction-aware callers should
+    inspect :attr:`update_applied` before consuming the features.
+    """
+
+    state: WorkingMemoryState
+    features: Float[Array, " feature_dim"]
+    update_applied: Bool[Array, ""]
+
+    def __iter__(self) -> Iterator[Any]:
+        yield self.state
+        yield self.features
+
+
+@chex.dataclass(frozen=True, mappable_dataclass=False)
+class WorkingMemoryArrayResult:
+    """Checked causal transform with one transaction verdict per event.
+
+    Iteration preserves the historical ``(state, features)`` return surface;
+    new callers should also consume :attr:`updates_applied`.
+    """
+
+    state: WorkingMemoryState
+    features: Float[Array, "steps feature_dim"]
+    updates_applied: Bool[Array, " steps"]
+
+    def __iter__(self) -> Iterator[Any]:
+        yield self.state
+        yield self.features
 
 
 def _validate_decay_rates(name: str, rates: tuple[float, ...]) -> None:
@@ -313,15 +358,15 @@ class WorkingMemoryFeaturizer:
         return jnp.concatenate(blocks, axis=0)
 
     @functools.partial(jax.jit, static_argnums=(0,))
-    def update(
+    def update_checked(
         self,
         state: WorkingMemoryState,
         observation: Float[Array, " observation_dim"],
         action: Float[Array, " action_dim"],
         reward: Float[Array, " reward_dim"],
         external_gate: Float[Array, ""] | float = 1.0,
-    ) -> WorkingMemoryState:
-        """Advance memory after one observation/action/reward transition."""
+    ) -> WorkingMemoryUpdateResult:
+        """Advance one event and report whether the transaction committed."""
         cfg = self._config
         obs = _empty_or_vector(observation, cfg.observation_dim)
         act = _empty_or_vector(action, cfg.action_dim)
@@ -386,7 +431,31 @@ class WorkingMemoryFeaturizer:
             & floating_tree_is_finite(state)
             & floating_tree_is_finite(candidate)
         )
-        return select_transaction(update_applied, candidate, state)
+        return WorkingMemoryUpdateResult(
+            state=select_transaction(update_applied, candidate, state),
+            update_applied=update_applied,
+        )
+
+    @functools.partial(jax.jit, static_argnums=(0,))
+    def update(
+        self,
+        state: WorkingMemoryState,
+        observation: Float[Array, " observation_dim"],
+        action: Float[Array, " action_dim"],
+        reward: Float[Array, " reward_dim"],
+        external_gate: Float[Array, ""] | float = 1.0,
+    ) -> WorkingMemoryState:
+        """Advance memory, retaining the legacy state-only return surface.
+
+        Transaction-aware callers should use :meth:`update_checked`.
+        """
+        return self.update_checked(
+            state,
+            observation,
+            action,
+            reward,
+            external_gate,
+        ).state
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def step(
@@ -396,11 +465,15 @@ class WorkingMemoryFeaturizer:
         action: Float[Array, " action_dim"],
         reward: Float[Array, " reward_dim"],
         external_gate: Float[Array, ""] | float = 1.0,
-    ) -> tuple[WorkingMemoryState, Float[Array, " feature_dim"]]:
-        """Return pre-update features, then advance memory."""
-        features = self.features(state, observation, action, reward)
-        next_state = self.update(state, observation, action, reward, external_gate)
-        return next_state, features
+    ) -> WorkingMemoryStepResult:
+        """Return neutral pre-update features and an explicit update verdict."""
+        raw_features = self.features(state, observation, action, reward)
+        update = self.update_checked(state, observation, action, reward, external_gate)
+        return WorkingMemoryStepResult(
+            state=update.state,
+            features=neutralize_array(update.update_applied, raw_features),
+            update_applied=update.update_applied,
+        )
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def diagnostics(self, state: WorkingMemoryState) -> WorkingMemoryDiagnostics:
@@ -425,8 +498,8 @@ def transform_working_memory_arrays(
     *,
     state: WorkingMemoryState | None = None,
     external_gates: Float[Array, " steps"] | None = None,
-) -> tuple[WorkingMemoryState, Float[Array, "steps feature_dim"]]:
-    """Transform transition arrays into causal working-memory features."""
+) -> WorkingMemoryArrayResult:
+    """Transform arrays and expose one checked transaction mask per event."""
     if state is None:
         state = featurizer.init()
     gates = (
@@ -438,14 +511,18 @@ def transform_working_memory_arrays(
     def step_fn(
         carry: WorkingMemoryState,
         inputs: tuple[Array, Array, Array, Array],
-    ) -> tuple[WorkingMemoryState, Array]:
+    ) -> tuple[WorkingMemoryState, tuple[Array, Array]]:
         obs, act, rew, gate = inputs
-        return cast(
-            tuple[WorkingMemoryState, Array],
-            featurizer.step(carry, obs, act, rew, gate),
-        )
+        result = featurizer.step(carry, obs, act, rew, gate)
+        return result.state, (result.features, result.update_applied)
 
-    return cast(
-        tuple[WorkingMemoryState, Float[Array, "steps feature_dim"]],
-        jax.lax.scan(step_fn, state, (observations, actions, rewards, gates)),
+    final_state, (features, updates_applied) = jax.lax.scan(
+        step_fn,
+        state,
+        (observations, actions, rewards, gates),
+    )
+    return WorkingMemoryArrayResult(
+        state=final_state,
+        features=features,
+        updates_applied=updates_applied,
     )
