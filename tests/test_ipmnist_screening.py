@@ -976,6 +976,122 @@ class TestShardsAndMerge:
         assert type(loaded) is float
         assert loaded == float(wall_clock)
 
+    def test_load_shard_rejects_unknown_noise_mode(self, tmp_path):
+        path = self._write_inband_shard(tmp_path, "upgd_w_control", 0, 0.5)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["noise_mode"] = "teleport"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+        with pytest.raises(ValueError) as exc_info:
+            load_shard(path)
+
+        assert str(exc_info.value) == (
+            f"{path}: noise_mode must be 'step' or 'pool', got 'teleport'"
+        )
+
+    @pytest.mark.parametrize("noise_mode", [None, True, 0, [], {}])
+    def test_load_shard_rejects_non_string_noise_mode(self, tmp_path, noise_mode):
+        path = self._write_inband_shard(tmp_path, "upgd_w_control", 0, 0.5)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["noise_mode"] = noise_mode
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+        with pytest.raises(ValueError, match="noise_mode must be"):
+            load_shard(path)
+
+    def test_load_shard_rejects_pool_mode_for_incompatible_arm(self, tmp_path):
+        path = self._write_inband_shard(tmp_path, "upgd_idbd", 0, 0.5)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["noise_mode"] = "pool"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+        with pytest.raises(ValueError) as exc_info:
+            load_shard(path)
+
+        assert str(exc_info.value) == (
+            f"{path}: noise_mode='pool' is unsupported for 'upgd_idbd': "
+            "the arm declares no noise-consuming update"
+        )
+
+    @pytest.mark.parametrize(
+        ("config_name", "noise_mode"),
+        [("upgd_idbd", "step"), ("upgd_w_control", "pool")],
+    )
+    def test_load_shard_accepts_runner_supported_noise_modes(
+        self, tmp_path, config_name, noise_mode
+    ):
+        path = self._write_inband_shard(tmp_path, config_name, 0, 0.5)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["noise_mode"] = noise_mode
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+        assert load_shard(path)["noise_mode"] == noise_mode
+
+    @pytest.mark.parametrize(
+        ("config_name", "noise_mode", "error"),
+        [
+            (
+                "upgd_w_control",
+                "teleport",
+                "noise_mode must be 'step' or 'pool'",
+            ),
+            (
+                "upgd_idbd",
+                "pool",
+                "noise_mode='pool' is unsupported for 'upgd_idbd'",
+            ),
+        ],
+    )
+    def test_merge_cli_rejects_impossible_noise_mode_without_publishing(
+        self, tmp_path, config_name, noise_mode, error
+    ):
+        paths = [
+            self._write_inband_shard(tmp_path, config_name, seed, 0.5)
+            for seed in (0, 1)
+        ]
+        for path in paths:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload["noise_mode"] = noise_mode
+            path.write_text(json.dumps(payload), encoding="utf-8")
+        output = tmp_path / "summary.json"
+
+        with pytest.raises(ValueError, match=error):
+            main(
+                [
+                    "merge",
+                    "--shards",
+                    *(str(path) for path in paths),
+                    "--control-name",
+                    config_name,
+                    "--slope-window",
+                    "2",
+                    "--output",
+                    str(output),
+                ]
+            )
+
+        assert not output.exists()
+
+    @pytest.mark.parametrize("noise_mode", [None, "step", "pool"])
+    def test_merge_preserves_legacy_and_supported_noise_modes(
+        self, tmp_path, noise_mode
+    ):
+        path = self._write_inband_shard(tmp_path, "upgd_w_control", 0, 0.5)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if noise_mode is None:
+            del payload["noise_mode"]
+            expected = "step"
+        else:
+            payload["noise_mode"] = noise_mode
+            expected = noise_mode
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+        summary = merge_shards(
+            [path], control_name="upgd_w_control", slope_window=2
+        )
+
+        assert summary["noise_mode"] == expected
+
     def test_merge_preserves_valid_wall_clock_summary(self, tmp_path):
         paths = [
             self._write_inband_shard(tmp_path, "upgd_w_control", seed, 0.5)

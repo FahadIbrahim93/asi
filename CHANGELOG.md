@@ -73,6 +73,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hyperparameter, mechanism, or runtime-environment drift, plus malformed or
   aggregate-overflowing wall-clock timings. The common runtime environment is now retained in
   derived summaries and validation receipts instead of being discarded.
+- Aligned IPMNIST screening shard loading with the runner's noise-mode contract: unknown modes
+  and pool attribution to arms without a noise-consuming update now fail before publication,
+  while legacy shards with no mode remain compatible as exact step-mode runs.
 - Made proxy receipts require strict historical reference schemas, frozen control identities
   and hyperparameters, compatible horizons, unique paired control seeds, and one common
   protocol before a validation result can be issued.

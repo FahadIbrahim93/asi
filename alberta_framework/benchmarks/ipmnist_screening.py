@@ -6330,6 +6330,26 @@ def screening_spec(name: str) -> ScreeningSpec:
     return SCREENING_REGISTRY[name]
 
 
+def _validated_screening_noise_mode(
+    noise_mode: object,
+    spec: ScreeningSpec,
+    *,
+    context: Path | str | None = None,
+) -> str:
+    """Validate one screening noise mode against the named arm's runner contract."""
+    prefix = "" if context is None else f"{context}: "
+    if not isinstance(noise_mode, str) or noise_mode not in ("step", "pool"):
+        raise ValueError(
+            f"{prefix}noise_mode must be 'step' or 'pool', got {noise_mode!r}"
+        )
+    if noise_mode == "pool" and spec.noise_update is None:
+        raise ValueError(
+            f"{prefix}noise_mode='pool' is unsupported for {spec.name!r}: the arm "
+            "declares no noise-consuming update"
+        )
+    return noise_mode
+
+
 # =============================================================================
 # Development-only recurring A/B/A retention adapter
 # =============================================================================
@@ -6920,13 +6940,7 @@ def run_screening_config(
     approximation: they record ``noise_mode`` and never merge with exact
     shards nor pass proxy validation.
     """
-    if noise_mode not in ("step", "pool"):
-        raise ValueError(f"noise_mode must be 'step' or 'pool', got {noise_mode!r}")
-    if noise_mode == "pool" and spec.noise_update is None:
-        raise ValueError(
-            f"noise_mode='pool' is unsupported for {spec.name!r}: the arm "
-            "declares no noise-consuming update"
-        )
+    noise_mode = _validated_screening_noise_mode(noise_mode, spec)
     if noise_mode == "pool" and noise_pool_steps < 2:
         raise ValueError(f"noise_pool_steps must be >= 2, got {noise_pool_steps}")
     data_x = jnp.asarray(data_x, dtype=jnp.float32)
@@ -7099,6 +7113,10 @@ def load_shard(path: Path) -> dict[str, Any]:
         raise ValueError(f"{path}: seed must be a non-negative integer")
     if payload.get("config_name") not in SCREENING_REGISTRY:
         raise ValueError(f"{path}: unknown config_name {payload.get('config_name')!r}")
+    spec = SCREENING_REGISTRY[payload["config_name"]]
+    _validated_screening_noise_mode(
+        payload.get("noise_mode", "step"), spec, context=path
+    )
     if not isinstance(payload.get("base_learner"), str) or not payload["base_learner"]:
         raise ValueError(f"{path}: base_learner must be a non-empty string")
     if not isinstance(payload.get("hyperparameters"), dict):
