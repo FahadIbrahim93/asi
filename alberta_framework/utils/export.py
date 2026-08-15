@@ -13,6 +13,11 @@ import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING, SupportsFloat
 
+import numpy as np
+from numpy.typing import NDArray
+
+from alberta_framework._seed_validation import require_unique_jax_seeds
+
 if TYPE_CHECKING:
     import pandas as pd
 
@@ -26,6 +31,60 @@ def _exported_number(value: SupportsFloat) -> str:
     if not math.isfinite(number):
         raise ValueError(f"refusing to export non-finite measurement: {number!r}")
     return repr(number)
+
+
+def _require_finite_array(values: NDArray[np.float64], *, name: str) -> None:
+    """Reject an array that cannot serve as finite numeric export data."""
+    try:
+        all_finite = bool(np.all(np.isfinite(values)))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must contain finite numeric measurements") from exc
+    if not all_finite:
+        raise ValueError(f"{name} contains a non-finite measurement")
+
+
+def _preflight_export_results(results: dict[str, "AggregatedResults"]) -> None:
+    """Validate the complete aggregate before any export touches the filesystem."""
+    if not results:
+        raise ValueError("export results must be non-empty")
+
+    for name, aggregate in results.items():
+        seeds = require_unique_jax_seeds(
+            aggregate.seeds,
+            name=f"AggregatedResults {name!r} seeds",
+        )
+        seed_count = len(seeds)
+
+        for metric_name, values in aggregate.metric_arrays.items():
+            qualified_name = f"AggregatedResults {name!r} metric {metric_name!r}"
+            if values.ndim != 2:
+                raise ValueError(
+                    f"{qualified_name} must be a two-dimensional seed-by-step array"
+                )
+            if values.shape[0] != seed_count:
+                raise ValueError(
+                    f"AggregatedResults {name!r} seed count ({seed_count}) does not match "
+                    f"metric rows ({values.shape[0]}) for {metric_name!r}"
+                )
+            if values.shape[1] == 0:
+                raise ValueError(f"{qualified_name} must contain at least one metric step")
+            _require_finite_array(values, name=qualified_name)
+
+        for metric_name, summary in aggregate.summary.items():
+            qualified_name = f"AggregatedResults {name!r} summary {metric_name!r}"
+            if summary.values.ndim != 1:
+                raise ValueError(f"{qualified_name} values must be one-dimensional")
+            if type(summary.n_seeds) is not int:
+                raise ValueError(f"{qualified_name} n_seeds must be a built-in integer")
+            value_count = summary.values.shape[0]
+            if summary.n_seeds != seed_count or value_count != seed_count:
+                raise ValueError(
+                    f"{qualified_name} seed counts disagree: seeds={seed_count}, "
+                    f"n_seeds={summary.n_seeds}, values={value_count}"
+                )
+            for statistic in (summary.mean, summary.std, summary.min, summary.max):
+                _exported_number(statistic)
+            _require_finite_array(summary.values, name=f"{qualified_name} values")
 
 
 def _write_text_atomically(filepath: Path, payload: str) -> None:
@@ -81,6 +140,7 @@ def _export_summary_csv(
     metric: str,
 ) -> None:
     """Export summary statistics to CSV."""
+    _preflight_export_results(results)
     output = io.StringIO(newline="")
     writer = csv.writer(output)
     writer.writerow(["config", "mean", "std", "min", "max", "n_seeds"])
@@ -91,8 +151,6 @@ def _export_summary_csv(
         std = _exported_number(summary.std)
         minimum = _exported_number(summary.min)
         maximum = _exported_number(summary.max)
-        for value in summary.values:
-            _exported_number(value)
         writer.writerow(
             [
                 name,
@@ -113,20 +171,7 @@ def _export_timeseries_csv(
     metric: str,
 ) -> None:
     """Export full timeseries to CSV."""
-    for name, agg in results.items():
-        arr = agg.metric_arrays[metric]
-        if len(set(agg.seeds)) != len(agg.seeds):
-            raise ValueError(f"AggregatedResults {name!r} contains duplicate seeds")
-        if arr.ndim != 2:
-            raise ValueError(
-                f"AggregatedResults {name!r} metric {metric!r} must be a two-dimensional "
-                "seed-by-step array"
-            )
-        if len(agg.seeds) != arr.shape[0]:
-            raise ValueError(
-                f"AggregatedResults {name!r} seed count ({len(agg.seeds)}) does not match "
-                f"metric rows ({arr.shape[0]}) for {metric!r}"
-            )
+    _preflight_export_results(results)
 
     output = io.StringIO(newline="")
     writer = csv.writer(output)
@@ -167,6 +212,7 @@ def export_to_json(
         filepath: Path to output JSON file
         include_timeseries: Whether to include full timeseries (large!)
     """
+    _preflight_export_results(results)
     filepath = Path(filepath)
 
     from typing import Any
