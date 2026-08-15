@@ -335,6 +335,10 @@ class RiverSwimMDP:
         config = RiverSwimConfig() if config is None else config
         if config.n_states < 2:
             raise ValueError(f"n_states must be at least 2, got {config.n_states}")
+        if not np.isfinite(config.p_right_up):
+            raise ValueError(f"p_right_up must be finite, got {config.p_right_up}")
+        if not np.isfinite(config.p_right_down):
+            raise ValueError(f"p_right_down must be finite, got {config.p_right_down}")
         if config.p_right_up <= 0.0:
             raise ValueError(f"p_right_up must be positive, got {config.p_right_up}")
         if config.p_right_down <= 0.0:

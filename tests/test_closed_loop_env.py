@@ -356,6 +356,10 @@ class TestRiverSwim:
         """Chain length, drift, and start-state validation."""
         with pytest.raises(ValueError, match="n_states"):
             RiverSwimMDP(RiverSwimConfig(n_states=1))
+        with pytest.raises(ValueError, match="p_right_up must be finite"):
+            RiverSwimMDP(RiverSwimConfig(p_right_up=float("nan")))
+        with pytest.raises(ValueError, match="p_right_down must be finite"):
+            RiverSwimMDP(RiverSwimConfig(p_right_down=float("nan")))
         with pytest.raises(ValueError, match="p_right_down"):
             RiverSwimMDP(RiverSwimConfig(p_right_down=0.0))
         with pytest.raises(ValueError, match="must not exceed 1"):
