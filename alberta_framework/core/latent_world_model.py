@@ -418,13 +418,21 @@ class LatentWorldModel:
             self._config.n_actions,
             dtype=jnp.float32,
         )
-        features = [z, action_one_hot]
+        latent_valid = jnp.all(jnp.isfinite(z))
+        features_valid = action_valid & latent_valid
+        # Inf latent times a silent one-hot is 0*inf = NaN. Zero both
+        # factors before the product; keep the invalid-action NaN reject.
+        safe_z = jnp.where(features_valid, z, jnp.zeros_like(z))
+        safe_action_one_hot = jnp.where(
+            features_valid, action_one_hot, jnp.zeros_like(action_one_hot)
+        )
+        features = [safe_z, safe_action_one_hot]
         if self._config.include_action_interactions:
-            interactions = (z[:, None] * action_one_hot[None, :]).reshape((-1,))
+            interactions = (safe_z[:, None] * safe_action_one_hot[None, :]).reshape((-1,))
             features.append(interactions)
         encoded = jnp.concatenate(features, axis=0)
         return jnp.where(
-            action_valid,
+            features_valid,
             encoded,
             jnp.full_like(encoded, jnp.nan),
         )

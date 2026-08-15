@@ -137,6 +137,25 @@ def test_latent_world_model_scan_loop_and_config_roundtrip() -> None:
     chex.assert_tree_all_finite(result.prediction_errors)
 
 
+def test_latent_action_interactions_do_not_form_zero_times_inf() -> None:
+    """Inf latent times a silent action one-hot is 0*inf = NaN in the product."""
+    model = LatentWorldModel(
+        LatentWorldModelConfig(
+            observation_dim=2,
+            n_actions=3,
+            latent_dim=2,
+            hidden_sizes=(),
+            include_action_interactions=True,
+        )
+    )
+    latent = jnp.array([jnp.inf, 1.0], dtype=jnp.float32)
+    raw = latent[:, None] * jnp.array([1.0, 0.0, 0.0], dtype=jnp.float32)[None, :]
+    assert not bool(jnp.all(jnp.isfinite(raw)))
+
+    features = model.input_features_from_latent(latent, jnp.array(0, dtype=jnp.int32))
+    assert bool(jnp.all(jnp.isnan(features)))
+
+
 def test_score_dream_candidates_selects_surprising_useful_valid_items() -> None:
     result = score_dream_candidates(
         surprises=jnp.array([0.1, 0.9, 0.7, 0.3], dtype=jnp.float32),
