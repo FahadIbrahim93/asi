@@ -28,7 +28,7 @@ import chex
 import jax
 import jax.numpy as jnp
 from jax import Array
-from jaxtyping import Float
+from jaxtyping import Bool, Float
 
 from alberta_framework.core.initializers import sparse_init
 from alberta_framework.core.normalizers import (
@@ -1752,6 +1752,11 @@ class TrueOnlineTDUpdateResult:
 
     ``metrics`` columns: squared TD error, TD error, mean absolute
     eligibility trace, and the stored ``v_old`` bootstrap value.
+
+    Rejected updates (non-finite input or proposed state) keep the previous
+    learner state and report a zero TD-error diagnostic. ``update_applied``
+    is False on that path so callers do not treat the sentinel as a real
+    TD error.
     """
 
     state: TrueOnlineTDState
@@ -1759,6 +1764,7 @@ class TrueOnlineTDUpdateResult:
     next_prediction: Prediction
     td_error: Float[Array, ""]
     metrics: Float[Array, " 4"]
+    update_applied: Bool[Array, ""]
 
 
 class TrueOnlineTDLearner:
@@ -1864,15 +1870,17 @@ class TrueOnlineTDLearner:
             & jnp.isfinite(proposed_state.bias_eligibility_trace)
             & jnp.isfinite(proposed_state.v_old)
         )
+        accepted = inputs_valid & proposed_finite
         new_state = jax.lax.cond(
-            inputs_valid & proposed_finite,
+            accepted,
             lambda: proposed_state,
             lambda: state,
         )
+        reported_td_error = jnp.where(accepted, td_error, jnp.zeros_like(td_error))
         metrics = jnp.array(
             [
-                td_error**2,
-                td_error,
+                reported_td_error**2,
+                reported_td_error,
                 jnp.mean(jnp.abs(new_state.eligibility_traces)),
                 new_state.v_old,
             ],
@@ -1882,8 +1890,9 @@ class TrueOnlineTDLearner:
             state=new_state,
             prediction=jnp.atleast_1d(value),
             next_prediction=jnp.atleast_1d(next_value),
-            td_error=jnp.atleast_1d(td_error),
+            td_error=jnp.atleast_1d(reported_td_error),
             metrics=metrics,
+            update_applied=accepted,
         )
 
 

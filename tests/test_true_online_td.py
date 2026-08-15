@@ -72,6 +72,11 @@ class TestInit:
         chex.assert_trees_all_close(result.state.weights, state.weights)
         chex.assert_trees_all_close(result.state.eligibility_traces, state.eligibility_traces)
         chex.assert_trees_all_close(result.state.v_old, state.v_old)
+        assert bool(jnp.all(jnp.isfinite(result.td_error)))
+        assert bool(jnp.all(jnp.isfinite(result.metrics)))
+        chex.assert_trees_all_close(result.td_error, jnp.array([0.0], dtype=jnp.float32))
+        chex.assert_trees_all_close(result.metrics[:2], jnp.zeros(2, dtype=jnp.float32))
+        assert not bool(result.update_applied)
 
 
 # =============================================================================
