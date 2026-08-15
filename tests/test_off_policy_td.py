@@ -557,3 +557,75 @@ class TestBairdStyle:
         chex.assert_tree_all_finite(state.weights)
         # Without clipping this is unbounded; with c=1 it's bounded.
         assert float(jnp.max(jnp.abs(state.weights))) < 50.0
+
+
+class TestInfiniteRewardDoesNotPoisonWeights:
+    def test_off_policy_td(self) -> None:
+        learner = OffPolicyTDLinearLearner(step_size=0.1, trace_decay=0.0)
+        state = learner.init(2)
+        obs = jnp.array([0.0, 1.0], dtype=jnp.float32)
+        nxt = jnp.zeros(2, dtype=jnp.float32)
+        gamma = jnp.array(0.0, dtype=jnp.float32)
+        rho = jnp.array(1.0, dtype=jnp.float32)
+
+        poisoned = learner.update(
+            state, obs, jnp.array(jnp.inf, dtype=jnp.float32), nxt, gamma, rho
+        )
+        chex.assert_trees_all_close(poisoned.state.weights, state.weights)
+        assert int(poisoned.state.step_count) == int(state.step_count)
+        assert not bool(poisoned.update_applied)
+        assert float(poisoned.td_error) == 0.0
+        chex.assert_trees_all_close(poisoned.metrics, jnp.zeros_like(poisoned.metrics))
+
+        recovered = learner.update(
+            poisoned.state, obs, jnp.array(1.0, dtype=jnp.float32), nxt, gamma, rho
+        )
+        chex.assert_tree_all_finite(recovered.state.weights)
+        assert int(recovered.state.step_count) == int(state.step_count) + 1
+        assert bool(recovered.update_applied)
+
+    def test_etd(self) -> None:
+        learner = ETDLinearLearner(step_size=0.1, trace_decay=0.0)
+        state = learner.init(2)
+        obs = jnp.array([0.0, 1.0], dtype=jnp.float32)
+        nxt = jnp.zeros(2, dtype=jnp.float32)
+        gamma = jnp.array(0.0, dtype=jnp.float32)
+        rho = jnp.array(1.0, dtype=jnp.float32)
+
+        poisoned = learner.update(
+            state, obs, jnp.array(jnp.inf, dtype=jnp.float32), nxt, gamma, rho
+        )
+        chex.assert_trees_all_close(poisoned.state.weights, state.weights)
+        assert not bool(poisoned.update_applied)
+        assert float(poisoned.td_error) == 0.0
+
+        recovered = learner.update(
+            poisoned.state, obs, jnp.array(1.0, dtype=jnp.float32), nxt, gamma, rho
+        )
+        chex.assert_tree_all_finite(recovered.state.weights)
+        assert bool(recovered.update_applied)
+
+    def test_gradient_td(self) -> None:
+        learner = GradientTDLinearLearner(step_size=0.1)
+        state = learner.init(2)
+        obs = jnp.array([0.0, 1.0], dtype=jnp.float32)
+        nxt = jnp.zeros(2, dtype=jnp.float32)
+        gamma = jnp.array(0.0, dtype=jnp.float32)
+        rho = jnp.array(1.0, dtype=jnp.float32)
+
+        poisoned = learner.update(
+            state, obs, jnp.array(jnp.inf, dtype=jnp.float32), nxt, gamma, rho
+        )
+        chex.assert_trees_all_close(poisoned.state.weights, state.weights)
+        chex.assert_trees_all_close(
+            poisoned.state.secondary_weights, state.secondary_weights
+        )
+        assert not bool(poisoned.update_applied)
+        assert float(poisoned.td_error) == 0.0
+
+        recovered = learner.update(
+            poisoned.state, obs, jnp.array(1.0, dtype=jnp.float32), nxt, gamma, rho
+        )
+        chex.assert_tree_all_finite(recovered.state.weights)
+        chex.assert_tree_all_finite(recovered.state.secondary_weights)
+        assert bool(recovered.update_applied)

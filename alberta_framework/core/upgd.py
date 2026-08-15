@@ -48,6 +48,7 @@ from jaxtyping import Float
 from alberta_framework.core.initializers import sparse_init
 from alberta_framework.core.optimizers import Bounder, ObGDBounding
 from alberta_framework.core.types import MLPParams
+from alberta_framework.core.update_safety import zero_if_collapsed_infinity
 
 # =============================================================================
 # Types
@@ -1781,7 +1782,14 @@ class UPGDLearner:
         delta_bar = jnp.maximum(jnp.abs(error_scalar), 1.0)
         bound_magnitude = kappa * delta_bar * total_step
         scale = 1.0 / jnp.maximum(bound_magnitude, 1.0)
-        return tuple(scale * step for step in steps), scale
+        collapsed = scale == 0
+        return (
+            tuple(
+                zero_if_collapsed_infinity(scale * step, step, collapsed)
+                for step in steps
+            ),
+            scale,
+        )
 
     @staticmethod
     def _tuple_dot(xs: tuple[Array, ...], ys: tuple[Array, ...]) -> Array:

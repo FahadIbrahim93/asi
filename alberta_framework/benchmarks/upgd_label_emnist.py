@@ -107,6 +107,7 @@ import jax.random as jr
 import numpy as np
 from jax import Array
 
+from alberta_framework._seed_validation import require_jax_seed, require_unique_jax_seeds
 from alberta_framework.benchmarks.ipmnist_screening import (
     ScreeningStepFn,
     _make_sgd_ema_norm_learner,
@@ -476,6 +477,7 @@ def run_label_emnist(
     Returns:
         Host-side result arrays; see :class:`LabelEMNISTRunResult`.
     """
+    seed_tuple = require_unique_jax_seeds(seeds, name="seeds")
     if config is None:
         config = LabelEMNISTConfig()
     hp = resolve_hyperparameters(learner, hyperparameters)
@@ -493,9 +495,6 @@ def run_label_emnist(
     if n_train < config.task_length:
         raise ValueError("dataset smaller than task_length; cannot sample without replacement")
 
-    seed_tuple = tuple(int(seed) for seed in seeds)
-    if not seed_tuple:
-        raise ValueError("at least one seed is required")
     seeds_array = jnp.asarray(seed_tuple, dtype=jnp.uint32)
     initialization_config = IPMNISTConfig(**config.to_config())
 
@@ -642,7 +641,7 @@ def load_emnist_balanced_train(
     if x_path.is_file() and y_path.is_file() and meta_path.is_file():
         x = np.load(x_path)
         y = np.load(y_path)
-        cached_meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        cached_meta = _strict_json_object(meta_path)
         if (
             materialized_array_sha256(x) != cached_meta["x_sha256"]
             or materialized_array_sha256(y) != cached_meta["y_sha256"]
@@ -806,13 +805,10 @@ def build_plan_payload(
     notes: Sequence[str] = (),
 ) -> dict[str, Any]:
     """Build the pre-run plan binding config, arms, seeds, and dataset digests."""
-    seeds = tuple(int(seed) for seed in seed_ids)
-    if not seeds:
+    raw_seeds = tuple(seed_ids)
+    if not raw_seeds:
         raise ValueError("a plan requires at least one seed")
-    if any(seed < 0 for seed in seeds):
-        raise ValueError("seed IDs must be non-negative")
-    if len(set(seeds)) != len(seeds):
-        raise ValueError("seed IDs must be unique")
+    seeds = require_unique_jax_seeds(raw_seeds, name="seed IDs")
     if seeds != tuple(sorted(seeds)):
         raise ValueError("seed IDs must be sorted")
     learner_ids = tuple(learners)
@@ -867,10 +863,17 @@ def _strict_json_object(path: Path) -> dict[str, Any]:
     def reject_constant(value: str) -> object:
         raise ValueError(f"non-finite JSON constant is forbidden: {value}")
 
+    def parse_float(value: str) -> float:
+        parsed = float(value)
+        if not math.isfinite(parsed):
+            raise ValueError(f"non-finite JSON number is forbidden: {value}")
+        return parsed
+
     payload = json.loads(
         Path(path).read_text(encoding="utf-8"),
         object_pairs_hook=pairs_hook,
         parse_constant=reject_constant,
+        parse_float=parse_float,
     )
     if not isinstance(payload, dict):
         raise ValueError(f"{path}: payload must be one JSON object")
@@ -906,9 +909,12 @@ def load_plan(path: Path) -> dict[str, Any]:
         )
         if resolved != {k: float(v) for k, v in body["hyperparameters"][learner].items()}:
             raise ValueError(f"{path}: {learner} hyperparameters have unknown keys")
-    seeds = body["seed_ids"]
-    if len(set(seeds)) != len(seeds) or seeds != sorted(seeds):
-        raise ValueError(f"{path}: plan seed_ids must be unique and sorted")
+    raw_seeds = body.get("seed_ids")
+    if not isinstance(raw_seeds, list):
+        raise ValueError(f"{path}: plan seed_ids must be a list")
+    seeds = require_unique_jax_seeds(raw_seeds, name=f"{path}: plan seed_ids")
+    if seeds != tuple(sorted(seeds)):
+        raise ValueError(f"{path}: plan seed_ids must be sorted")
     if body["planned_shard_count"] != len(learner_ids) * len(seeds):
         raise ValueError(f"{path}: planned_shard_count is inconsistent")
     return payload
@@ -918,7 +924,8 @@ def partial_payload(
     result: LabelEMNISTRunResult, plan_sha256: str
 ) -> dict[str, Any]:
     """Serialize one single-seed run shard bound to its plan hash."""
-    if len(result.seeds) != 1:
+    seeds = require_unique_jax_seeds(result.seeds, name="result seeds")
+    if len(seeds) != 1:
         raise ValueError("a v1 partial must contain exactly one seed")
     return {
         "schema": PARTIAL_SCHEMA,
@@ -927,7 +934,7 @@ def partial_payload(
         "plan_sha256": plan_sha256,
         "learner": result.learner,
         "hyperparameters": result.hyperparameters,
-        "seed_id": result.seeds[0],
+        "seed_id": seeds[0],
         "config": result.config.to_config(),
         "per_task_accuracy": [round(float(v), 6) for v in result.per_task_accuracy[0]],
         "per_task_loss": [round(float(v), 6) for v in result.per_task_loss[0]],
@@ -951,8 +958,8 @@ def _validated_partial(path: Path, plan: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(f"{path}: learner {learner!r} is not planned")
     if payload.get("hyperparameters") != body["hyperparameters"][learner]:
         raise ValueError(f"{path}: hyperparameters differ from the plan")
-    seed = payload.get("seed_id")
-    if not isinstance(seed, int) or isinstance(seed, bool) or seed not in body["seed_ids"]:
+    seed = require_jax_seed(payload.get("seed_id"), name=f"{path}: seed_id")
+    if seed not in body["seed_ids"]:
         raise ValueError(f"{path}: seed_id {seed!r} is not planned")
     plan_config = {k: v for k, v in body["config"].items() if k != "n_steps"}
     if payload.get("config") != plan_config:
@@ -1092,9 +1099,10 @@ def build_artifact(
 
 def _cmd_plan(args: argparse.Namespace) -> None:
     config = LabelEMNISTConfig(n_tasks=args.n_tasks, task_length=args.task_length)
+    raw_seeds = [int(part) for part in args.seed_list.split(",") if part.strip()]
+    seeds = require_unique_jax_seeds(raw_seeds, name="seed IDs")
     data_home = args.data_home if args.data_home is not None else default_openml_data_home()
     _, _, meta = load_emnist_balanced_train(data_home)
-    seeds = [int(part) for part in args.seed_list.split(",") if part.strip()]
     learners = [name.strip() for name in args.learners.split(",") if name.strip()]
     payload = build_plan_payload(config, seeds, meta, learners, notes=args.note)
     atomic_write_new_json(args.plan_out, payload)

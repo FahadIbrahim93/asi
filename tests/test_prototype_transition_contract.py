@@ -321,6 +321,50 @@ def test_world_model_error_uses_supplied_discount_target() -> None:
     )
 
 
+def test_rejected_world_model_update_rejects_the_complete_prototype_transition() -> None:
+    agent = PrototypeAgent(_prototype_config(world_model=True))
+    state = agent.start(agent.init(jr.key(303)), jnp.asarray([0.4, -0.2]))
+    warm = agent.update_transition(
+        state,
+        _explicit_transition(
+            state,
+            reward=jnp.asarray(0.5),
+            next_observation=jnp.asarray([0.1, 0.3]),
+            discount=jnp.asarray(0.9),
+        ),
+    )
+    state = warm.state
+    maximum = jnp.asarray(2_147_483_647, dtype=jnp.int32)
+    world_model_state = state.world_model_state
+    exhausted_world_model_state = world_model_state.replace(
+        learner_state=world_model_state.learner_state.replace(
+            step_count=maximum,
+            step_words=jnp.asarray([0xFFFFFFFF, 0xFFFFFFFF], dtype=jnp.uint32),
+        ),
+        step_count=maximum,
+    )
+    exhausted = state.replace(world_model_state=exhausted_world_model_state)
+
+    result = agent.update_transition(
+        exhausted,
+        _explicit_transition(
+            exhausted,
+            reward=jnp.asarray(0.25),
+            next_observation=jnp.asarray([-0.2, 0.6]),
+            discount=jnp.asarray(0.9),
+        ),
+    )
+
+    assert not bool(result.transition_diagnostics.valid)
+    assert bool(result.transition_diagnostics.rejected)
+    chex.assert_trees_all_equal(
+        _materialize_typed_keys(result.state),
+        _materialize_typed_keys(exhausted),
+    )
+    assert float(result.world_model_error) == 0.0
+    assert int(result.state.buffer_state.size) == int(exhausted.buffer_state.size)
+
+
 def test_legacy_prototype_wrapper_retains_split_discount_behavior() -> None:
     agent = PrototypeAgent(_prototype_config(world_model=True))
     last_obs = jnp.array([0.4, -0.2], dtype=jnp.float32)

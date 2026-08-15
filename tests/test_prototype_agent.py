@@ -10,6 +10,7 @@ import chex
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 import pytest
 
 from alberta_framework.core.dreaming import DreamingConfig
@@ -529,6 +530,30 @@ class TestPrototypeAgentCurate:
 
 
 class TestAutoSubtaskSpecs:
+    @pytest.mark.parametrize(
+        "n_subtasks",
+        [np.int64(2), np.array(2, dtype=np.int64), jnp.int32(2)],
+        ids=["numpy-scalar", "numpy-array", "jax-scalar"],
+    )
+    def test_auto_subtask_specs_accepts_integer_scalars(self, n_subtasks) -> None:
+        agent = PrototypeAgent(_minimal_config())
+        state = agent.init(jr.key(0))
+
+        specs = agent.auto_subtask_specs(state, n_subtasks=n_subtasks)
+
+        assert len(specs) == 2
+
+    @pytest.mark.parametrize("n_subtasks", [-1, True, False, 1.5, "2"])
+    def test_auto_subtask_specs_rejects_invalid_counts(self, n_subtasks) -> None:
+        agent = PrototypeAgent(_minimal_config())
+        state = agent.init(jr.key(0))
+
+        with pytest.raises(
+            ValueError,
+            match="^n_subtasks must be a non-negative integer$",
+        ):
+            agent.auto_subtask_specs(state, n_subtasks=n_subtasks)
+
     def test_auto_subtask_specs_count(self) -> None:
         agent = PrototypeAgent(_minimal_config())
         state = agent.start(agent.init(jr.key(0)), jnp.zeros(OBS_DIM))
@@ -565,6 +590,45 @@ class TestAutoSubtaskSpecs:
 
 
 class TestFeatureToSubtaskSpecs:
+    @pytest.mark.parametrize("n_subtasks", [-1, True, False, 1.5, "2"])
+    def test_rejects_invalid_subtask_counts(self, n_subtasks) -> None:
+        agent = PrototypeAgent(_minimal_config())
+        state = agent.init(jr.key(0))
+
+        with pytest.raises(
+            ValueError,
+            match="^n_subtasks must be a non-negative integer$",
+        ):
+            feature_to_subtask_specs(state.oak_state, n_subtasks=n_subtasks)
+
+    @pytest.mark.parametrize(
+        "n_subtasks",
+        [np.int64(2), np.array(2, dtype=np.int64), jnp.int32(2)],
+        ids=["numpy-scalar", "numpy-array", "jax-scalar"],
+    )
+    def test_accepts_integer_scalar_counts(self, n_subtasks) -> None:
+        agent = PrototypeAgent(_minimal_config())
+        state = agent.init(jr.key(0))
+
+        specs = feature_to_subtask_specs(state.oak_state, n_subtasks=n_subtasks)
+
+        assert len(specs) == 2
+
+    @pytest.mark.parametrize("n_subtasks", [0, np.int64(0), jnp.int32(0)])
+    def test_zero_subtask_count_returns_empty(self, n_subtasks) -> None:
+        agent = PrototypeAgent(_minimal_config())
+        state = agent.init(jr.key(0))
+
+        assert feature_to_subtask_specs(state.oak_state, n_subtasks=n_subtasks) == ()
+
+    def test_huge_subtask_count_caps_at_observation_dim(self) -> None:
+        agent = PrototypeAgent(_minimal_config())
+        state = agent.init(jr.key(0))
+
+        specs = feature_to_subtask_specs(state.oak_state, n_subtasks=10**100)
+
+        assert len(specs) == OBS_DIM
+
     def test_returns_correct_count(self) -> None:
         agent = PrototypeAgent(_minimal_config())
         state = agent.init(jr.key(0))

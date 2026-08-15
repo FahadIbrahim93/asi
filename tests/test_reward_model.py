@@ -67,3 +67,28 @@ def test_rls_reward_model_rejects_invalid_config() -> None:
             pass
         else:
             raise AssertionError(f"expected ValueError for {config}")
+
+
+def test_rls_infinite_reward_on_zero_feature_does_not_poison_weights() -> None:
+    """Inf reward * a silent feature's zero gain is 0*inf = NaN."""
+    model = RLSRewardModel(
+        RLSRewardModelConfig(feature_dim=2, forgetting=1.0, ridge=1.0)
+    )
+    state = model.init()
+    features = jnp.array([0.0, 1.0], dtype=jnp.float32)
+
+    poisoned = model.update(state, features, jnp.array(jnp.inf, dtype=jnp.float32))
+    chex.assert_trees_all_close(poisoned.state.weights, state.weights)
+    chex.assert_trees_all_close(poisoned.state.covariance, state.covariance)
+    assert int(poisoned.state.step_count) == int(state.step_count)
+    assert not bool(poisoned.update_applied)
+    assert float(poisoned.prediction) == 0.0
+    assert float(poisoned.error) == 0.0
+    chex.assert_trees_all_close(poisoned.gain, jnp.zeros_like(poisoned.gain))
+
+    recovered = model.update(
+        poisoned.state, features, jnp.array(1.0, dtype=jnp.float32)
+    )
+    chex.assert_tree_all_finite(recovered.state.weights)
+    chex.assert_tree_all_finite(recovered.state.covariance)
+    assert bool(recovered.update_applied)

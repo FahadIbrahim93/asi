@@ -336,29 +336,6 @@ def _tree_equal(left: object, right: object) -> Array:
     return equal
 
 
-def _zero_signals() -> TypedLearningSignals:
-    zero = jnp.asarray(0.0, dtype=jnp.float32)
-    false = jnp.asarray(False)
-    return TypedLearningSignals(
-        epistemic_disagreement=zero,
-        epistemic_surprise=zero,
-        aleatoric_uncertainty=zero,
-        normalized_residual=zero,
-        learning_progress=zero,
-        calibrated_residual_z=zero,
-        instantaneous_change_probability=zero,
-        change_probability=zero,
-        availability=LearningSignalAvailability(
-            input_valid=false,
-            epistemic=false,
-            aleatoric=false,
-            normalized_residual=false,
-            learning_progress=false,
-            change_probability=false,
-        ),
-    )
-
-
 def _gate_signals(signals: TypedLearningSignals, available: Array) -> TypedLearningSignals:
     zero = jnp.asarray(0.0, dtype=jnp.float32)
 

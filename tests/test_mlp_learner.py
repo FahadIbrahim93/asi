@@ -98,6 +98,43 @@ class TestMLPLearner:
         # State should have same structure
         assert len(result.state.params.weights) == len(state.params.weights)
 
+    def test_infinite_target_with_obgd_does_not_poison_weights(self):
+        """Inf target makes ObGD scale 0, then error*step is 0*inf=NaN.
+
+        MultiHead already refuses inf targets (NaN is the missing-head
+        sentinel). MLPLearner used to commit the NaN weights. Keep the
+        previous finite state so a later finite target can recover.
+        """
+        learner = MLPLearner(
+            hidden_sizes=(4,),
+            sparsity=0.0,
+            bounder=ObGDBounding(kappa=2.0),
+            optimizer=LMS(0.1),
+        )
+        state = learner.init(feature_dim=3, key=jr.key(0))
+        observation = jnp.ones(3, dtype=jnp.float32)
+
+        poisoned = learner.update(
+            state, observation, jnp.array(jnp.inf, dtype=jnp.float32)
+        )
+        for new_w, old_w in zip(
+            poisoned.state.params.weights, state.params.weights, strict=True
+        ):
+            assert bool(jnp.all(jnp.isfinite(new_w)))
+            chex.assert_trees_all_close(new_w, old_w)
+        assert int(poisoned.state.step_count) == int(state.step_count)
+        assert not bool(poisoned.update_applied)
+        chex.assert_trees_all_close(poisoned.prediction, jnp.zeros_like(poisoned.prediction))
+        chex.assert_trees_all_close(poisoned.error, jnp.zeros_like(poisoned.error))
+        chex.assert_trees_all_close(poisoned.metrics, jnp.zeros_like(poisoned.metrics))
+
+        recovered = learner.update(
+            poisoned.state, observation, jnp.array(1.0, dtype=jnp.float32)
+        )
+        for new_w in recovered.state.params.weights:
+            assert bool(jnp.all(jnp.isfinite(new_w)))
+        assert bool(recovered.update_applied)
+
     def test_update_reduces_error(self):
         """Multiple updates on a fixed target should reduce error."""
         learner = MLPLearner(

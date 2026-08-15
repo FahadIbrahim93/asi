@@ -11,6 +11,7 @@ import jax.random as jr
 import numpy as np
 import pytest
 
+import alberta_framework.benchmarks.upgd_ipmnist as upgd_ipmnist
 from alberta_framework.benchmarks.upgd_ipmnist import (
     ADAMW_PROTOCOL_HYPERPARAMETERS,
     ARTIFACT_SCHEMA,
@@ -19,6 +20,8 @@ from alberta_framework.benchmarks.upgd_ipmnist import (
     UPGD_W_PROTOCOL_HYPERPARAMETERS,
     IPMNISTConfig,
     LeanUPGDState,
+    LearnerUpdateResult,
+    _make_adamw_learner,
     _split_flat_noise,
     build_artifact,
     build_comparison,
@@ -129,6 +132,83 @@ class TestSchedule:
     def test_schedule_rejects_dataset_smaller_than_task(self):
         with pytest.raises(ValueError, match="without replacement"):
             build_schedule(jr.key(0), TINY, TINY.task_length - 1)
+
+
+class TestSeedBoundary:
+    @pytest.mark.parametrize(
+        "seeds",
+        [
+            (),
+            (0, 0),
+            (True,),
+            (np.int64(0),),
+            (0.0,),
+            (-1,),
+            (2**32,),
+            (0, 2**32),
+        ],
+    )
+    def test_run_rejects_noncanonical_seed_identities_before_setup(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        seeds: tuple[object, ...],
+    ) -> None:
+        def unexpected_setup(*args: object, **kwargs: object) -> None:
+            del args, kwargs
+            raise AssertionError("invalid seeds reached learner setup")
+
+        monkeypatch.setattr(upgd_ipmnist, "resolve_hyperparameters", unexpected_setup)
+        with pytest.raises(ValueError, match="seeds"):
+            run_ipmnist(
+                np.empty((1, 1), dtype=np.float32),
+                np.empty((1,), dtype=np.int32),
+                "adamw",
+                seeds=seeds,  # type: ignore[arg-type]
+            )
+
+    def test_run_preserves_full_uint32_seed_identities(self) -> None:
+        config = IPMNISTConfig(
+            n_tasks=1,
+            task_length=1,
+            input_dim=2,
+            hidden1=2,
+            hidden2=2,
+            n_classes=2,
+        )
+        data_x = np.asarray([[0.25, -0.5]], dtype=np.float32)
+        data_y = np.asarray([1], dtype=np.int32)
+        result = run_ipmnist(
+            data_x,
+            data_y,
+            "adamw",
+            seeds=(2**32 - 1, 0),
+            config=config,
+            return_per_step=True,
+        )
+
+        assert result.seeds == (2**32 - 1, 0)
+        assert result.initial_params is not None
+        assert not np.array_equal(result.initial_params["w1"][0], result.initial_params["w1"][1])
+
+    def test_cli_rejects_aliased_seed_before_loading_mnist(
+        self, tmp_path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def unexpected_load(*args: object, **kwargs: object) -> None:
+            del args, kwargs
+            raise AssertionError("invalid CLI seeds reached dataset loading")
+
+        monkeypatch.setattr(upgd_ipmnist, "load_mnist_train", unexpected_load)
+        with pytest.raises(ValueError, match=r"seeds\[1\].*uint32"):
+            upgd_ipmnist.main_v2_compat(
+                [
+                    "--learners",
+                    "adamw",
+                    "--seed-list",
+                    f"0,{2**32}",
+                    "--partial-out",
+                    str(tmp_path / "must-not-exist.json"),
+                ]
+            )
 
 
 @pytest.fixture(scope="module")
@@ -309,6 +389,141 @@ class TestLeanUPGDParity:
                 )
 
 
+class TestAdamWTransaction:
+    """AdamW's parameter leaves form one checked learner transaction."""
+
+    @staticmethod
+    def _params() -> dict[str, jnp.ndarray]:
+        return {
+            "bias": jnp.asarray([0.2, -0.1], dtype=jnp.float32),
+            "weight": jnp.asarray([[0.4, -0.3], [0.1, 0.5]], dtype=jnp.float32),
+        }
+
+    @staticmethod
+    def _assert_tree_equal(actual, expected) -> None:
+        import jax
+
+        actual_leaves, actual_structure = jax.tree.flatten(actual)
+        expected_leaves, expected_structure = jax.tree.flatten(expected)
+        assert actual_structure == expected_structure
+        for actual_leaf, expected_leaf in zip(
+            actual_leaves, expected_leaves, strict=True
+        ):
+            np.testing.assert_array_equal(
+                np.asarray(actual_leaf), np.asarray(expected_leaf)
+            )
+
+    def test_nonfinite_leaf_rejects_entire_params_and_optimizer_state(self):
+        import jax
+
+        hp = dict(ADAMW_PROTOCOL_HYPERPARAMETERS)
+        init_fn, step_fn = _make_adamw_learner(hp)
+        params = self._params()
+        state = init_fn(params)
+        grads = {
+            "bias": jnp.asarray([jnp.inf, 0.25], dtype=jnp.float32),
+            "weight": jnp.asarray([[0.3, -0.2], [0.4, 0.1]], dtype=jnp.float32),
+        }
+
+        compiled_step = jax.jit(step_fn)
+        result = compiled_step(params, state, grads, jr.key(0))
+
+        assert isinstance(result, LearnerUpdateResult)
+        assert not bool(result.update_applied)
+        self._assert_tree_equal(result.params, params)
+        self._assert_tree_equal(result.state, state)
+        # The established two-value caller surface remains available.
+        unpacked_params, unpacked_state = result
+        self._assert_tree_equal(unpacked_params, params)
+        self._assert_tree_equal(unpacked_state, state)
+
+        recovered = compiled_step(
+            result.params,
+            result.state,
+            {
+                "bias": jnp.asarray([0.1, 0.25], dtype=jnp.float32),
+                "weight": grads["weight"],
+            },
+            jr.key(1),
+        )
+        assert bool(recovered.update_applied)
+        assert not np.array_equal(
+            np.asarray(recovered.params["weight"]), np.asarray(params["weight"])
+        )
+
+    def test_finite_post_apply_overflow_rejects_entire_transaction(self):
+        import jax
+
+        hp = dict(ADAMW_PROTOCOL_HYPERPARAMETERS)
+        hp["step_size"] = 3e38
+        hp["weight_decay"] = 0.0
+        init_fn, step_fn = _make_adamw_learner(hp)
+        params = {
+            "bias": jnp.asarray([-3e38], dtype=jnp.float32),
+            "weight": self._params()["weight"],
+        }
+        state = init_fn(params)
+        grads = {
+            "bias": jnp.asarray([1.0], dtype=jnp.float32),
+            "weight": jnp.zeros_like(params["weight"]),
+        }
+
+        compiled_step = jax.jit(step_fn)
+        result = compiled_step(params, state, grads, jr.key(2))
+
+        assert not bool(result.update_applied)
+        self._assert_tree_equal(result.params, params)
+        self._assert_tree_equal(result.state, state)
+
+        recovered = compiled_step(
+            result.params,
+            result.state,
+            {name: jnp.zeros_like(value) for name, value in grads.items()},
+            jr.key(3),
+        )
+        assert bool(recovered.update_applied)
+        self._assert_tree_equal(recovered.params, params)
+
+    def test_finite_step_matches_leafwise_adamw_and_jit(self):
+        import jax
+
+        from alberta_framework.core.baseline_optimizers import Adam
+
+        hp = dict(ADAMW_PROTOCOL_HYPERPARAMETERS)
+        hp["weight_decay"] = 0.02
+        init_fn, step_fn = _make_adamw_learner(hp)
+        params = self._params()
+        state = init_fn(params)
+        grads = {
+            "bias": jnp.asarray([-0.3, 0.25], dtype=jnp.float32),
+            "weight": jnp.asarray([[0.3, -0.2], [0.4, 0.1]], dtype=jnp.float32),
+        }
+        optimizer = Adam(
+            step_size=hp["step_size"],
+            beta1=hp["beta1"],
+            beta2=hp["beta2"],
+            eps=hp["eps"],
+            weight_decay=hp["weight_decay"],
+        )
+        expected_params: dict[str, jnp.ndarray] = {}
+        expected_state = {}
+        for name, value in params.items():
+            step, leaf_state = optimizer.update_from_gradient(
+                state[name], grads[name], error=None, param=value
+            )
+            expected_params[name] = value - step
+            expected_state[name] = leaf_state
+
+        eager = step_fn(params, state, grads, jr.key(1))
+        compiled = jax.jit(step_fn)(params, state, grads, jr.key(1))
+
+        assert bool(eager.update_applied)
+        assert bool(compiled.update_applied)
+        self._assert_tree_equal(eager.params, expected_params)
+        self._assert_tree_equal(eager.state, expected_state)
+        self._assert_tree_equal(compiled, eager)
+
+
 class TestSplitFlatNoise:
     def test_slices_in_sorted_name_order_with_exact_values(self):
         shapes = {"b1": (5,), "b2": (3,), "w1": (7, 5), "w2": (5, 3)}
@@ -480,6 +695,17 @@ class TestPartialMerge:
         path_b.write_text(json.dumps(partial_payload(other)))
         with pytest.raises(ValueError, match="disagree on config"):
             merge_partial_results([path_a, path_b])
+
+    def test_merge_rejects_seed_identity_outside_jax_key_domain(self, tmp_path) -> None:
+        data_x, data_y = _synthetic_dataset(6, N_TRAIN, TINY.input_dim, TINY.n_classes)
+        shard = run_ipmnist(data_x, data_y, "adamw", seeds=(0,), config=TINY)
+        payload = partial_payload(shard)
+        payload["seed_id"] = 2**32
+        path = tmp_path / "aliased-seed.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+        with pytest.raises(ValueError, match="uint32"):
+            merge_partial_results([path])
 
     def test_v2_partial_is_single_seed_and_recursively_omits_legacy_marker(
         self, tmp_path, debug_run

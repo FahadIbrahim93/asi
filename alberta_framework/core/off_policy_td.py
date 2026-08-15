@@ -58,9 +58,12 @@ import chex
 import jax
 import jax.numpy as jnp
 from jax import Array
-from jaxtyping import Float, Int
+from jaxtyping import Bool, Float, Int
 
 from alberta_framework.core.types import Observation
+from alberta_framework.core.update_safety import (
+    floating_tree_is_finite as _floating_tree_is_finite,
+)
 
 # =============================================================================
 # State / result types
@@ -109,6 +112,7 @@ class OffPolicyTDUpdateResult:
     td_error: Float[Array, ""]
     rho_clipped: Float[Array, ""]
     metrics: Float[Array, " 5"]
+    update_applied: Bool[Array, ""]
 
 
 @chex.dataclass(frozen=True)
@@ -159,6 +163,7 @@ class ETDUpdateResult:
     follow_on_trace: Float[Array, ""]
     emphasis: Float[Array, ""]
     metrics: Float[Array, " 7"]
+    update_applied: Bool[Array, ""]
 
 
 @chex.dataclass(frozen=True)
@@ -186,6 +191,7 @@ class GradientTDUpdateResult:
     td_error: Float[Array, ""]
     rho_clipped: Float[Array, ""]
     metrics: Float[Array, " 6"]
+    update_applied: Bool[Array, ""]
 
 
 @chex.dataclass(frozen=True)
@@ -197,6 +203,7 @@ class GradientTDArrayResult:
     td_errors: Float[Array, " num_steps"]
     rho_clipped: Float[Array, " num_steps"]
     metrics: Float[Array, "num_steps 6"]
+    updates_applied: Bool[Array, " num_steps"]
 
 
 # =============================================================================
@@ -330,21 +337,36 @@ class OffPolicyTDLinearLearner:
 
         # Update with rho_clipped * delta * e
         scaled_update = alpha * rho_clipped * td_error
-        new_weights = state.weights + scaled_update * new_e
-        new_bias = state.bias + scaled_update * new_e_b
-
-        new_state = OffPolicyTDState(  # type: ignore[call-arg]
-            weights=new_weights,
-            bias=new_bias,
+        proposed_state = OffPolicyTDState(  # type: ignore[call-arg]
+            weights=state.weights + scaled_update * new_e,
+            bias=state.bias + scaled_update * new_e_b,
             eligibility_traces=new_e,
             bias_eligibility_trace=new_e_b,
             step_count=state.step_count + 1,
             birth_timestamp=state.birth_timestamp,
             uptime_s=state.uptime_s,
         )
+        # Inf reward makes scaled_update * e = 0*inf = NaN on a silent feature.
+        inputs_valid = (
+            jnp.all(jnp.isfinite(observation))
+            & jnp.isfinite(reward_s)
+            & jnp.all(jnp.isfinite(next_observation))
+            & jnp.isfinite(gamma_s)
+            & jnp.isfinite(rho_s)
+        )
+        update_applied = (
+            inputs_valid
+            & _floating_tree_is_finite(state)
+            & _floating_tree_is_finite(proposed_state)
+        )
+        new_state = jax.lax.cond(
+            update_applied,
+            lambda: proposed_state,
+            lambda: state,
+        )
 
         squared_td = td_error**2
-        mean_e = jnp.mean(jnp.abs(new_e))
+        mean_e = jnp.mean(jnp.abs(new_state.eligibility_traces))
         metrics = jnp.array(
             [squared_td, td_error, rho_clipped, alpha, mean_e],
             dtype=jnp.float32,
@@ -352,10 +374,15 @@ class OffPolicyTDLinearLearner:
 
         return OffPolicyTDUpdateResult(  # type: ignore[call-arg]
             state=new_state,
-            prediction=jnp.atleast_1d(v_t),
-            td_error=jnp.asarray(td_error),
-            rho_clipped=jnp.asarray(rho_clipped),
-            metrics=metrics,
+            prediction=jnp.where(
+                update_applied, jnp.atleast_1d(v_t), jnp.zeros_like(jnp.atleast_1d(v_t))
+            ),
+            td_error=jnp.where(update_applied, td_error, jnp.zeros_like(td_error)),
+            rho_clipped=jnp.where(
+                update_applied, rho_clipped, jnp.zeros_like(rho_clipped)
+            ),
+            metrics=jnp.where(update_applied, metrics, jnp.zeros_like(metrics)),
+            update_applied=update_applied,
         )
 
     def to_config(self) -> dict[str, Any]:
@@ -486,12 +513,9 @@ class ETDLinearLearner:
         new_e = rho_s * (trace_decay * state.eligibility_traces + emphasis * observation)
         new_e_b = rho_s * (trace_decay * state.bias_eligibility_trace + emphasis)
 
-        new_weights = state.weights + alpha * td_error * new_e
-        new_bias = state.bias + alpha * td_error * new_e_b
-
-        new_state = ETDState(  # type: ignore[call-arg]
-            weights=new_weights,
-            bias=new_bias,
+        proposed_state = ETDState(  # type: ignore[call-arg]
+            weights=state.weights + alpha * td_error * new_e,
+            bias=state.bias + alpha * td_error * new_e_b,
             eligibility_traces=new_e,
             bias_eligibility_trace=new_e_b,
             follow_on_trace=follow_on,
@@ -500,9 +524,27 @@ class ETDLinearLearner:
             birth_timestamp=state.birth_timestamp,
             uptime_s=state.uptime_s,
         )
+        inputs_valid = (
+            jnp.all(jnp.isfinite(observation))
+            & jnp.isfinite(reward_s)
+            & jnp.all(jnp.isfinite(next_observation))
+            & jnp.isfinite(gamma_s)
+            & jnp.isfinite(rho_s)
+            & jnp.isfinite(interest_s)
+        )
+        update_applied = (
+            inputs_valid
+            & _floating_tree_is_finite(state)
+            & _floating_tree_is_finite(proposed_state)
+        )
+        new_state = jax.lax.cond(
+            update_applied,
+            lambda: proposed_state,
+            lambda: state,
+        )
 
         squared_td = td_error**2
-        mean_e = jnp.mean(jnp.abs(new_e))
+        mean_e = jnp.mean(jnp.abs(new_state.eligibility_traces))
         metrics = jnp.array(
             [squared_td, td_error, rho_s, alpha, mean_e, follow_on, emphasis],
             dtype=jnp.float32,
@@ -510,11 +552,16 @@ class ETDLinearLearner:
 
         return ETDUpdateResult(  # type: ignore[call-arg]
             state=new_state,
-            prediction=jnp.atleast_1d(v_t),
-            td_error=jnp.asarray(td_error),
-            follow_on_trace=jnp.asarray(follow_on),
-            emphasis=jnp.asarray(emphasis),
-            metrics=metrics,
+            prediction=jnp.where(
+                update_applied, jnp.atleast_1d(v_t), jnp.zeros_like(jnp.atleast_1d(v_t))
+            ),
+            td_error=jnp.where(update_applied, td_error, jnp.zeros_like(td_error)),
+            follow_on_trace=jnp.where(
+                update_applied, follow_on, jnp.zeros_like(follow_on)
+            ),
+            emphasis=jnp.where(update_applied, emphasis, jnp.zeros_like(emphasis)),
+            metrics=jnp.where(update_applied, metrics, jnp.zeros_like(metrics)),
+            update_applied=update_applied,
         )
 
     def to_config(self) -> dict[str, Any]:
@@ -659,13 +706,30 @@ class GradientTDLinearLearner:
         )
         secondary_step = beta * (td_error * traces - secondary_dot_phi * phi)
 
-        new_state = GradientTDState(  # type: ignore[call-arg]
+        proposed_state = GradientTDState(  # type: ignore[call-arg]
             weights=state.weights + primary_step,
             secondary_weights=state.secondary_weights + secondary_step,
             eligibility_traces=traces,
             step_count=state.step_count + 1,
             birth_timestamp=state.birth_timestamp,
             uptime_s=state.uptime_s,
+        )
+        inputs_valid = (
+            jnp.all(jnp.isfinite(observation))
+            & jnp.isfinite(reward_s)
+            & jnp.all(jnp.isfinite(next_observation))
+            & jnp.isfinite(gamma_s)
+            & jnp.isfinite(rho_s)
+        )
+        update_applied = (
+            inputs_valid
+            & _floating_tree_is_finite(state)
+            & _floating_tree_is_finite(proposed_state)
+        )
+        new_state = jax.lax.cond(
+            update_applied,
+            lambda: proposed_state,
+            lambda: state,
         )
         metrics = jnp.array(
             [
@@ -674,16 +738,23 @@ class GradientTDLinearLearner:
                 rho_clipped,
                 jnp.sqrt(jnp.mean(new_state.weights**2)),
                 jnp.sqrt(jnp.mean(new_state.secondary_weights**2)),
-                jnp.mean(jnp.abs(traces)),
+                jnp.mean(jnp.abs(new_state.eligibility_traces)),
             ],
             dtype=jnp.float32,
         )
         return GradientTDUpdateResult(  # type: ignore[call-arg]
             state=new_state,
-            prediction=jnp.atleast_1d(prediction),
-            td_error=jnp.asarray(td_error),
-            rho_clipped=jnp.asarray(rho_clipped),
-            metrics=metrics,
+            prediction=jnp.where(
+                update_applied,
+                jnp.atleast_1d(prediction),
+                jnp.zeros_like(jnp.atleast_1d(prediction)),
+            ),
+            td_error=jnp.where(update_applied, td_error, jnp.zeros_like(td_error)),
+            rho_clipped=jnp.where(
+                update_applied, rho_clipped, jnp.zeros_like(rho_clipped)
+            ),
+            metrics=jnp.where(update_applied, metrics, jnp.zeros_like(metrics)),
+            update_applied=update_applied,
         )
 
     def to_config(self) -> dict[str, Any]:
@@ -718,7 +789,7 @@ def run_gradient_td_learning_loop(
     def step_fn(
         carry: GradientTDState,
         inputs: tuple[Array, Array, Array, Array, Array],
-    ) -> tuple[GradientTDState, tuple[Array, Array, Array, Array]]:
+    ) -> tuple[GradientTDState, tuple[Array, Array, Array, Array, Array]]:
         obs, reward, next_obs, gamma, rho = inputs
         result = learner.update(carry, obs, reward, next_obs, gamma, rho)
         return (
@@ -728,14 +799,17 @@ def run_gradient_td_learning_loop(
                 result.td_error,
                 result.rho_clipped,
                 result.metrics,
+                result.update_applied,
             ),
         )
 
     t0 = time.time()
-    final_state, (predictions, td_errors, rho_clipped, metrics) = jax.lax.scan(
+    final_state, (predictions, td_errors, rho_clipped, metrics, updates_applied) = (
+        jax.lax.scan(
         step_fn,
         state,
         (observations, rewards, next_observations, gammas, rhos),
+        )
     )
     elapsed = time.time() - t0
     final_state = final_state.replace(  # type: ignore[attr-defined]
@@ -747,4 +821,5 @@ def run_gradient_td_learning_loop(
         td_errors=td_errors,
         rho_clipped=rho_clipped,
         metrics=metrics,
+        updates_applied=updates_applied,
     )

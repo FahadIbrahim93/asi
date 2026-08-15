@@ -40,6 +40,7 @@ import dataclasses
 import hashlib
 import io
 import json
+import math
 import os
 import posixpath
 import re
@@ -233,11 +234,20 @@ def _strict_json_bytes(contents: bytes, *, label: str) -> Any:
             f"{label} contains non-finite constant {value}"
         )
 
+    def parse_float(value: str) -> float:
+        parsed = float(value)
+        if not math.isfinite(parsed):
+            raise OfficialForagaxOciError(
+                f"{label} contains non-finite JSON number {value}"
+            )
+        return parsed
+
     try:
         return json.loads(
             contents,
             object_pairs_hook=pairs,
             parse_constant=constant,
+            parse_float=parse_float,
         )
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise OfficialForagaxOciError(f"{label} is not strict JSON") from exc

@@ -136,7 +136,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any
+from typing import Any, cast
 
 import chex
 import jax
@@ -145,9 +145,12 @@ import jax.random as jr
 import numpy as np
 from jax import Array
 
+from alberta_framework._seed_validation import require_jax_seed
+from alberta_framework._strict_json import load_strict_json_object
 from alberta_framework.benchmarks.upgd_ipmnist import (
     _PLASTICITY_LOSS_FLOOR,
     ADAMW_PROTOCOL_HYPERPARAMETERS,
+    PARTIAL_SCHEMA_V1,
     UPGD_W_PROTOCOL_HYPERPARAMETERS,
     IPMNISTConfig,
     LeanUPGDState,
@@ -158,6 +161,7 @@ from alberta_framework.benchmarks.upgd_ipmnist import (
     _preflight_new_output,
     _sorted_param_shapes,
     _split_flat_noise,
+    _validated_partial_payload,
     atomic_write_new,
     build_schedule,
     cross_entropy_loss,
@@ -202,6 +206,43 @@ _IDBD_LOG_ALPHA_MIN = -10.0
 _IDBD_LOG_ALPHA_MAX = 0.0  # alpha <= 1 keeps per-weight decay factors positive
 _AUTOSTEP_ALPHA_MIN = 1e-8
 _AUTOSTEP_ALPHA_MAX = 1.0
+_MISSING_NOISE_POOL_STEPS = object()
+
+
+def _validated_wall_clock_seconds(value: object, path: Path | str) -> float:
+    """Return one shard wall clock as a finite, non-negative Python float."""
+    message = f"{path}: wall_clock_seconds must be a finite, non-negative number"
+    if type(value) not in (int, float):
+        raise ValueError(message)
+    numeric_value = cast(int | float, value)
+    try:
+        wall_clock_seconds = float(numeric_value)
+    except (OverflowError, ValueError) as exc:
+        raise ValueError(message) from exc
+    if not math.isfinite(wall_clock_seconds) or wall_clock_seconds < 0.0:
+        raise ValueError(message)
+    return wall_clock_seconds
+
+
+def _finite_wall_clock_total(values: Sequence[float], *, context: str) -> float:
+    """Preserve the existing sum order while refusing float overflow."""
+    try:
+        total = float(sum(values))
+    except OverflowError as exc:
+        raise ValueError(f"{context}: wall_clock_seconds_total must be finite") from exc
+    if not math.isfinite(total):
+        raise ValueError(f"{context}: wall_clock_seconds_total must be finite")
+    return total
+
+
+def _clip_finite_log_alpha(log_alpha: Array, meta_delta: Array) -> Array:
+    """Clip an IDBD log-step-size update, skipping non-finite channels."""
+    return jnp.where(
+        jnp.isfinite(meta_delta),
+        jnp.clip(log_alpha + meta_delta, _IDBD_LOG_ALPHA_MIN, _IDBD_LOG_ALPHA_MAX),
+        log_alpha,
+    )
+
 
 # Metrics returned by every screening step: (accuracy, loss, plasticity).
 StepMetrics = tuple[Array, Array, Array]
@@ -402,10 +443,8 @@ def upgd_idbd_update(
     for name in params:
         keep = 1.0 - gate[name]
         z = grads[name] * keep
-        log_alpha = jnp.clip(
-            state.log_alpha[name] + meta * z * state.trace[name],
-            _IDBD_LOG_ALPHA_MIN,
-            _IDBD_LOG_ALPHA_MAX,
+        log_alpha = _clip_finite_log_alpha(
+            state.log_alpha[name], meta * z * state.trace[name]
         )
         alpha = jnp.exp(log_alpha)
         new_params[name] = params[name] * (1.0 - alpha * wd) - alpha * (
@@ -459,10 +498,8 @@ def upgd_idbd_swift_update(
     log_alpha_all: dict[str, Array] = {}
     for name in params:
         z_all[name] = grads[name] * (1.0 - gate[name])
-        log_alpha_all[name] = jnp.clip(
-            state.log_alpha[name] + meta * z_all[name] * state.trace[name],
-            _IDBD_LOG_ALPHA_MIN,
-            _IDBD_LOG_ALPHA_MAX,
+        log_alpha_all[name] = _clip_finite_log_alpha(
+            state.log_alpha[name], meta * z_all[name] * state.trace[name]
         )
     alpha_all = {name: jnp.exp(log_alpha_all[name]) for name in params}
     tau = jnp.sum(
@@ -588,17 +625,30 @@ def upgd_autostep_update(
         v_update = state.normalizer[name] + (1.0 / tau) * state.alpha[name] * z * z * (
             abs_meta - state.normalizer[name]
         )
-        v_new = jnp.maximum(abs_meta, v_update)
+        v_candidate = jnp.maximum(abs_meta, v_update)
+        valid_meta_update = jnp.logical_and(
+            jnp.isfinite(meta_gradient), jnp.isfinite(v_candidate)
+        )
+        v_new = jnp.where(valid_meta_update, v_candidate, state.normalizer[name])
         safe_v = jnp.maximum(v_new, 1e-38)
         raw_alpha[name] = jnp.where(
-            v_new > 0.0,
+            valid_meta_update & (v_new > 0.0),
             state.alpha[name] * jnp.exp(mu * meta_gradient / safe_v),
             state.alpha[name],
         )
         new_normalizer[name] = v_new
     effective = jnp.sum(
         jnp.stack(
-            [jnp.sum(raw_alpha[name] * z_all[name] * z_all[name]) for name in sorted(params)]
+            [
+                jnp.sum(
+                    jnp.where(
+                        jnp.isfinite(z_all[name]),
+                        raw_alpha[name] * z_all[name] * z_all[name],
+                        0.0,
+                    )
+                )
+                for name in sorted(params)
+            ]
         )
     )
     m_factor = jnp.maximum(effective, 1.0)
@@ -613,7 +663,12 @@ def upgd_autostep_update(
             (grads[name] + noise[name]) * keep
         )
         new_alpha[name] = alpha
-        new_trace[name] = state.trace[name] * (1.0 - alpha * z * z) + alpha * z
+        trace_candidate = state.trace[name] * (1.0 - alpha * z * z) + alpha * z
+        new_trace[name] = jnp.where(
+            jnp.isfinite(trace_candidate),
+            trace_candidate,
+            state.trace[name],
+        )
     return new_params, UPGDAutostepState(  # type: ignore[call-arg]
         utility=utility,
         step=count,
@@ -2667,10 +2722,8 @@ def upgd_alpha_utility_update(
     new_trace: dict[str, Array] = {}
     for name in params:
         g = grads[name]
-        la = jnp.clip(
-            state.log_alpha[name] + meta * g * state.trace[name],
-            _IDBD_LOG_ALPHA_MIN,
-            _IDBD_LOG_ALPHA_MAX,
+        la = _clip_finite_log_alpha(
+            state.log_alpha[name], meta * g * state.trace[name]
         )
         alpha = jnp.exp(la)
         new_log_alpha[name] = la
@@ -3418,11 +3471,12 @@ class RLSHeadState:
     """Champion-body carry plus the RLS readout on penultimate features.
 
     ``utility``/``step`` are the champion's utility EMA and clock (over all
-    six tensors in parallel mode; the four body tensors in resid mode carry
-    the signal, the head tensors' utility stays zero).  ``norm``/``fast_mean``
-    are the shift-adaptive normalizer.  ``p`` is the (h2+1, h2+1) inverse
-    feature-correlation matrix and ``wout`` the (h2+1, n_classes) one-vs-all
-    readout on bias-augmented penultimate features.
+    six tensors in parallel mode; the four body tensors in gated resid mode
+    carry the signal, and both remain at their initial values in the no-gate
+    resid ablation).  ``norm``/``fast_mean`` are the shift-adaptive
+    normalizer.  ``p`` is the (h2+1, h2+1) inverse feature-correlation matrix
+    and ``wout`` the (h2+1, n_classes) one-vs-all readout on bias-augmented
+    penultimate features.
     """
 
     utility: dict[str, Array]
@@ -3442,7 +3496,9 @@ def _rls_head_hp(**overrides: float) -> dict[str, float]:
     ``rls_reset_frac`` defaults untriggerable (2.0 > any shifted fraction),
     which is bitwise the plain no-reset path (build-time composition,
     pinned).  ``head_resid`` selects the body error signal (0 = parallel
-    champion SGD head, 1 = RLS residual).
+    champion SGD head, 1 = RLS residual).  ``gate_scale`` is a frozen
+    endpoint switch, not a tuning knob: 1 keeps the incumbent utility-gated
+    update and 0 selects plain decayed SGD for the residual body.
     """
     merged = {
         "step_size": 0.01,
@@ -3460,6 +3516,7 @@ def _rls_head_hp(**overrides: float) -> dict[str, float]:
         "rls_reset_frac": 2.0,
         "rls_p_trace_cap": 0.0,
         "head_resid": 0.0,
+        "gate_scale": 1.0,
     }
     merged.update(overrides)
     return merged
@@ -3483,6 +3540,8 @@ def _make_rls_head_learner(
        ``head_resid = 1``: the same gated step on
        ``d(0.5*||onehot - wout.T @ phi||^2)/d(body)`` with ``wout`` held
        constant (w3/b3 untouched, zero-utility gate guarded to 0.5).
+       The frozen ``gate_scale = 0`` endpoint instead applies plain decayed
+       SGD to that residual gradient and skips all utility bookkeeping.
     4. Sherman-Morrison RLS with forgetting ``rls_lambda`` (symmetrized P,
        the rff_rls equations), then the optional detector-driven P reset
        (``mean(shifted) >= rls_reset_frac`` => ``p = eye/ridge``, wout kept).
@@ -3500,6 +3559,14 @@ def _make_rls_head_learner(
     trace_cap = hp["rls_p_trace_cap"]
     cap_enabled = trace_cap > 0.0
     resid = hp["head_resid"] != 0.0
+    gate_scale = hp.get("gate_scale", 1.0)
+    if gate_scale not in (0.0, 1.0):
+        raise ValueError(
+            "gate_scale is a frozen ablation endpoint and must be 0.0 or 1.0"
+        )
+    gate_enabled = gate_scale == 1.0
+    if not gate_enabled and not resid:
+        raise ValueError("gate_scale=0.0 is supported only for the residual body")
 
     def normalize(
         state: EMANormState, fast_mean: Array, x: Array
@@ -3585,7 +3652,11 @@ def _make_rls_head_learner(
         x_norm, new_norm, new_fast, shifted = normalize(
             state.norm, state.fast_mean, x
         )
-        count = state.step + jnp.array(1, dtype=jnp.int32)
+        count = (
+            state.step + jnp.array(1, dtype=jnp.int32)
+            if gate_enabled
+            else state.step
+        )
         n_classes = state.wout.shape[1]
         y_onehot = jax.nn.one_hot(y, n_classes, dtype=jnp.float32)
         if resid:
@@ -3604,10 +3675,26 @@ def _make_rls_head_learner(
             (loss, (logits, phi)), body_grads = jax.value_and_grad(
                 head_loss, has_aux=True
             )(body)
-            new_params, new_utility = _gated_sgd(
-                params, body_grads, state.utility, count,
-                _RLS_HEAD_BODY, guard_zero_max=True,
-            )
+            if gate_enabled:
+                new_params, new_utility = _gated_sgd(
+                    params,
+                    body_grads,
+                    state.utility,
+                    count,
+                    _RLS_HEAD_BODY,
+                    guard_zero_max=True,
+                )
+            else:
+                # Issue #52's frozen ablation endpoint: do not compute or
+                # carry utility EMA, bias correction, or sigmoid bookkeeping.
+                # The Python closure flag makes this a build-time branch, so
+                # the no-gate compiled graph contains only decayed SGD.
+                new_params = dict(params)
+                for name in _RLS_HEAD_BODY:
+                    new_params[name] = (
+                        params[name] * param_decay - step_size * body_grads[name]
+                    )
+                new_utility = state.utility
         else:
             _, grads = jax.value_and_grad(cross_entropy_loss, has_aux=True)(
                 params, x_norm, y
@@ -5902,6 +5989,18 @@ def _build_registry() -> dict[str, ScreeningSpec]:
             "residual-driven body on the wind-up-immune head (probe c "
             "rerun on the stable configuration)",
         ),
+        (
+            "rls_head_resid_l1_preset005_nogate",
+            {
+                "rls_lambda": 1.0,
+                "rls_reset_frac": 0.05,
+                "head_resid": 1.0,
+                "gate_scale": 0.0,
+            },
+            "issue #52's preregistered gate ablation of the standing "
+            "residual-trained incumbent: plain decayed SGD on the body, "
+            "with no utility EMA, bias correction, or sigmoid gate",
+        ),
         # Wave 3 — ridge star.  2-task seed-0 diagnostic: the initial/reset
         # ridge is the head's convergence-speed knob (P0 = I/ridge bounds
         # the earliest gains); means .8328/.8465/.8530/.8578/.8596 for
@@ -5947,6 +6046,11 @@ def _build_registry() -> dict[str, ScreeningSpec]:
             "probe on the residual loop)",
         ),
     ):
+        body_update = (
+            "plain decayed residual SGD (utility bookkeeping removed)"
+            if rls_overrides.get("gate_scale", 1.0) == 0.0
+            else "utility-gated sigma-0 SGD"
+        )
         specs.append(
             ScreeningSpec(
                 name=rls_name,
@@ -5957,7 +6061,8 @@ def _build_registry() -> dict[str, ScreeningSpec]:
                 frozen_probe_input=_rls_head_frozen_probe_input,
                 description=(
                     "Champion body (shift-adaptive EMA-norm d099 + "
-                    "utility-gated sigma-0 SGD) with a streaming-RLS "
+                    + body_update
+                    + ") with a streaming-RLS "
                     "one-hot readout on the bias-augmented 150-dim "
                     "penultimate features — " + rls_extra + ". One-hot LS "
                     "regression + argmax by design (softmax/logistic "
@@ -6228,13 +6333,72 @@ def screening_spec(name: str) -> ScreeningSpec:
     return SCREENING_REGISTRY[name]
 
 
+def _validated_screening_noise_mode(
+    noise_mode: object,
+    spec: ScreeningSpec,
+    *,
+    context: Path | str | None = None,
+) -> str:
+    """Validate one screening noise mode against the named arm's runner contract."""
+    prefix = "" if context is None else f"{context}: "
+    if not isinstance(noise_mode, str) or noise_mode not in ("step", "pool"):
+        raise ValueError(
+            f"{prefix}noise_mode must be 'step' or 'pool', got {noise_mode!r}"
+        )
+    if noise_mode == "pool" and spec.noise_update is None:
+        raise ValueError(
+            f"{prefix}noise_mode='pool' is unsupported for {spec.name!r}: the arm "
+            "declares no noise-consuming update"
+        )
+    return noise_mode
+
+
+def _validated_screening_noise_pool_steps(
+    noise_mode: str,
+    noise_pool_steps: object,
+    *,
+    context: Path | str | None = None,
+    allow_unrecorded_pool: bool = False,
+) -> int | None:
+    """Return the effective pool-size contract for one screening run or shard.
+
+    Exact step-mode runs do not consume a noise pool, so their canonical
+    effective value is ``None``.  This also keeps pre-pool legacy shards,
+    which omit both fields, readable as exact step-mode runs.  A loader may
+    preserve an omitted pool size as unknown so historical files remain
+    inspectable, but new results must record it and downstream merges refuse
+    the unknown value.  Inferring the historical default would relabel any
+    old custom-size run and recreate the ambiguity this provenance field
+    closes.
+    """
+    prefix = "" if context is None else f"{context}: "
+    if noise_mode == "step":
+        if noise_pool_steps is not _MISSING_NOISE_POOL_STEPS and noise_pool_steps is not None:
+            raise ValueError(
+                f"{prefix}noise_pool_steps must be null or absent when "
+                "noise_mode='step'"
+            )
+        return None
+    if noise_pool_steps is _MISSING_NOISE_POOL_STEPS:
+        if allow_unrecorded_pool:
+            return None
+        raise ValueError(
+            f"{prefix}noise_pool_steps must be recorded when noise_mode='pool'"
+        )
+    if type(noise_pool_steps) is not int or noise_pool_steps < 2:
+        raise ValueError(
+            f"{prefix}noise_pool_steps must be recorded as a built-in integer >= 2 "
+            "when noise_mode='pool'"
+        )
+    return noise_pool_steps
+
+
 # =============================================================================
 # Development-only recurring A/B/A retention adapter
 # =============================================================================
 
 
 RECURRING_IPMNIST_ADAPTER_SCHEMA = "alberta.ipmnist-screening.recurring-adapter.v1"
-_MAX_UINT32 = 2**32 - 1
 
 
 def _canonical_hash_array(array: object) -> np.ndarray:
@@ -6312,9 +6476,7 @@ def _validated_recurring_phase_lengths(
 
 
 def _validated_recurring_seed(seed: int) -> int:
-    if not isinstance(seed, int) or isinstance(seed, bool) or not 0 <= seed <= _MAX_UINT32:
-        raise ValueError("seed must be a canonical uint32 integer")
-    return seed
+    return require_jax_seed(seed, name="seed")
 
 
 def build_recurring_ipmnist_online_indices(
@@ -6791,6 +6953,7 @@ class ScreeningRunResult:
     per_task_plasticity: np.ndarray
     wall_clock_seconds: float
     noise_mode: str = "step"
+    noise_pool_steps: int | None = None
 
 
 def run_screening_config(
@@ -6815,18 +6978,16 @@ def run_screening_config(
     control arm reproduces the full lane's pool trajectories bit-for-bit
     (pinned by a unit test) -- but consumes ``spec.noise_update`` instead of
     the fixed UPGD-W equations. Pool shards are a screening-only
-    approximation: they record ``noise_mode`` and never merge with exact
-    shards nor pass proxy validation.
+    approximation: they record ``noise_mode`` and their effective
+    ``noise_pool_steps`` and never merge with exact shards nor pass proxy
+    validation.
     """
-    if noise_mode not in ("step", "pool"):
-        raise ValueError(f"noise_mode must be 'step' or 'pool', got {noise_mode!r}")
-    if noise_mode == "pool" and spec.noise_update is None:
-        raise ValueError(
-            f"noise_mode='pool' is unsupported for {spec.name!r}: the arm "
-            "declares no noise-consuming update"
-        )
-    if noise_mode == "pool" and noise_pool_steps < 2:
-        raise ValueError(f"noise_pool_steps must be >= 2, got {noise_pool_steps}")
+    resolved_seed = require_jax_seed(seed, name="seed")
+    noise_mode = _validated_screening_noise_mode(noise_mode, spec)
+    effective_noise_pool_steps = _validated_screening_noise_pool_steps(
+        noise_mode,
+        noise_pool_steps if noise_mode == "pool" else None,
+    )
     data_x = jnp.asarray(data_x, dtype=jnp.float32)
     data_y = jnp.asarray(data_y, dtype=jnp.int32)
     if data_x.ndim != 2 or data_x.shape[1] != config.input_dim:
@@ -6839,7 +7000,7 @@ def run_screening_config(
 
     init_fn, step_fn = spec.factory(spec.hyperparameters)
 
-    root = jr.key(jnp.uint32(seed))
+    root = jr.key(jnp.uint32(resolved_seed))
     key_init, key_schedule, key_noise = jr.split(root, 3)
     params = init_mlp_params(key_init, config)
     schedule = build_schedule(key_schedule, config, n_train)
@@ -6869,7 +7030,11 @@ def run_screening_config(
 
     shapes = _sorted_param_shapes(config)
     n_flat = int(sum(np.prod(shape) for shape in shapes.values()))
-    pool_len = int(noise_pool_steps) * n_flat
+    pool_len = (
+        effective_noise_pool_steps * n_flat
+        if effective_noise_pool_steps is not None
+        else 0
+    )
     pool_noise_std = float(spec.hyperparameters.get("noise_std", 0.0))
     noise_update = spec.noise_update
     hp = spec.hyperparameters
@@ -6930,7 +7095,7 @@ def run_screening_config(
             logger.info(
                 "%s seed=%d task %d/%d online_acc=%.4f elapsed=%.1fs",
                 spec.name,
-                seed,
+                resolved_seed,
                 task + 1,
                 config.n_tasks,
                 task_accuracy[-1],
@@ -6940,13 +7105,14 @@ def run_screening_config(
         config_name=spec.name,
         base_learner=spec.base_learner,
         hyperparameters=dict(spec.hyperparameters),
-        seed=int(seed),
+        seed=resolved_seed,
         config=config,
         per_task_accuracy=np.asarray(task_accuracy, dtype=np.float64),
         per_task_loss=np.asarray(task_loss, dtype=np.float64),
         per_task_plasticity=np.asarray(task_plasticity, dtype=np.float64),
         wall_clock_seconds=time.monotonic() - started,
         noise_mode=noise_mode,
+        noise_pool_steps=effective_noise_pool_steps,
     )
 
 
@@ -6957,14 +7123,21 @@ def run_screening_config(
 
 def shard_payload(result: ScreeningRunResult) -> dict[str, Any]:
     """Serialize one (config, seed) screening run to a mergeable shard."""
+    seed = require_jax_seed(result.seed, name="result seed")
+    spec = screening_spec(result.config_name)
+    noise_mode = _validated_screening_noise_mode(result.noise_mode, spec)
+    noise_pool_steps = _validated_screening_noise_pool_steps(
+        noise_mode, result.noise_pool_steps
+    )
     return {
         "schema": SHARD_SCHEMA,
         "evidence_policy": dict(NONPROMOTING_POLICY),
         "config_name": result.config_name,
         "base_learner": result.base_learner,
         "hyperparameters": result.hyperparameters,
-        "seed": result.seed,
-        "noise_mode": result.noise_mode,
+        "seed": seed,
+        "noise_mode": noise_mode,
+        "noise_pool_steps": noise_pool_steps,
         "config": result.config.to_config(),
         "per_task_accuracy": [round(float(v), 8) for v in result.per_task_accuracy],
         "per_task_loss": [round(float(v), 8) for v in result.per_task_loss],
@@ -6982,19 +7155,97 @@ def shard_payload(result: ScreeningRunResult) -> dict[str, Any]:
 
 def load_shard(path: Path) -> dict[str, Any]:
     """Load and structurally validate one screening shard."""
-    payload = json.loads(Path(path).read_text(encoding="utf-8"))
-    if not isinstance(payload, dict) or payload.get("schema") != SHARD_SCHEMA:
+    payload = load_strict_json_object(path)
+    if payload.get("schema") != SHARD_SCHEMA:
         raise ValueError(f"{path}: not an {SHARD_SCHEMA} shard")
     config = IPMNISTConfig(**payload["config"])
     for fieldname in ("per_task_accuracy", "per_task_loss", "per_task_plasticity"):
         values = np.asarray(payload[fieldname], dtype=np.float64)
         if values.shape != (config.n_tasks,) or not np.all(np.isfinite(values)):
             raise ValueError(f"{path}: {fieldname} must be finite with shape ({config.n_tasks},)")
-    if type(payload.get("seed")) is not int or payload["seed"] < 0:
-        raise ValueError(f"{path}: seed must be a non-negative integer")
+    payload["wall_clock_seconds"] = _validated_wall_clock_seconds(
+        payload.get("wall_clock_seconds"), path
+    )
+    payload["seed"] = require_jax_seed(payload.get("seed"), name=f"{path}: seed")
     if payload.get("config_name") not in SCREENING_REGISTRY:
         raise ValueError(f"{path}: unknown config_name {payload.get('config_name')!r}")
+    spec = SCREENING_REGISTRY[payload["config_name"]]
+    noise_mode = _validated_screening_noise_mode(
+        payload.get("noise_mode", "step"), spec, context=path
+    )
+    noise_pool_steps = _validated_screening_noise_pool_steps(
+        noise_mode,
+        payload.get("noise_pool_steps", _MISSING_NOISE_POOL_STEPS),
+        context=path,
+        allow_unrecorded_pool=True,
+    )
+    payload["noise_mode"] = noise_mode
+    payload["noise_pool_steps"] = noise_pool_steps
+    if not isinstance(payload.get("base_learner"), str) or not payload["base_learner"]:
+        raise ValueError(f"{path}: base_learner must be a non-empty string")
+    if not isinstance(payload.get("hyperparameters"), dict):
+        raise ValueError(f"{path}: hyperparameters must be an object")
+    environment = payload.get("environment")
+    required_environment_fields = ("jax", "numpy", "python", "platform")
+    if not isinstance(environment, dict) or any(
+        not isinstance(environment.get(field), str) or not environment[field]
+        for field in required_environment_fields
+    ):
+        raise ValueError(
+            f"{path}: environment must record non-empty jax, numpy, python, and platform strings"
+        )
     return payload
+
+
+def _screening_batch_environment(
+    shards: Sequence[dict[str, Any]],
+) -> dict[str, str]:
+    """Return the exact runtime contract shared by one derived artifact."""
+    if not shards:
+        raise ValueError("no shards given")
+    reference_environment = shards[0]["environment"]
+    environment_mismatches = [
+        f"{shard['config_name']}/seed={shard['seed']}"
+        for shard in shards
+        if shard["environment"] != reference_environment
+    ]
+    if environment_mismatches:
+        raise ValueError(
+            "shards span multiple runtime environments; process same-environment runs "
+            f"separately (mismatched: {environment_mismatches})"
+        )
+    return dict(reference_environment)
+
+
+def _validate_screening_arm_contract(
+    config_name: str,
+    per_seed: Mapping[int, dict[str, Any]],
+) -> None:
+    """Reject learner or hyperparameter drift within one named arm."""
+    seeds = sorted(per_seed)
+    reference_base_learner = per_seed[seeds[0]]["base_learner"]
+    mismatched_base_learners = [
+        seed
+        for seed in seeds
+        if per_seed[seed]["base_learner"] != reference_base_learner
+    ]
+    if mismatched_base_learners:
+        raise ValueError(
+            f"config {config_name!r} has inconsistent base_learner across seeds: "
+            f"seed {seeds[0]} used {reference_base_learner!r}, seed(s) "
+            f"{mismatched_base_learners} used different values"
+        )
+    reference_hp = per_seed[seeds[0]]["hyperparameters"]
+    mismatched_hp = [
+        seed for seed in seeds if per_seed[seed]["hyperparameters"] != reference_hp
+    ]
+    if mismatched_hp:
+        raise ValueError(
+            f"config {config_name!r} has inconsistent hyperparameters across seeds: "
+            f"seed {seeds[0]} used {reference_hp!r}, seed(s) {mismatched_hp} used "
+            "different values; refusing to merge runs of different mechanisms "
+            "under one config_name"
+        )
 
 
 def _late_window_slope(per_task_accuracy: np.ndarray, window: int) -> float:
@@ -7020,13 +7271,30 @@ def merge_shards(
     configs = {tuple(sorted(s["config"].items())) for s in shards}
     if len(configs) != 1:
         raise ValueError("shards span multiple protocol configs; merge them separately")
-    noise_modes = {s.get("noise_mode", "step") for s in shards}
+    noise_modes = {s["noise_mode"] for s in shards}
     if len(noise_modes) != 1:
         raise ValueError(
             "shards span multiple noise modes (pool results are a screening-only "
             "approximation); merge them separately"
         )
     noise_mode = noise_modes.pop()
+    unrecorded_pool_shards = [
+        f"{s['config_name']}/seed={s['seed']}"
+        for s in shards
+        if noise_mode == "pool" and s["noise_pool_steps"] is None
+    ]
+    if unrecorded_pool_shards:
+        raise ValueError(
+            "pool-mode shard(s) do not record noise_pool_steps; rerun them to a new path "
+            f"before merging (unrecorded: {unrecorded_pool_shards})"
+        )
+    noise_pool_sizes = {s["noise_pool_steps"] for s in shards}
+    if len(noise_pool_sizes) != 1:
+        raise ValueError(
+            "pool-mode shards span multiple noise_pool_steps values; merge them separately"
+        )
+    noise_pool_steps = noise_pool_sizes.pop()
+    reference_environment = _screening_batch_environment(shards)
     by_config: dict[str, dict[int, dict[str, Any]]] = {}
     for shard in shards:
         per_seed = by_config.setdefault(shard["config_name"], {})
@@ -7046,6 +7314,11 @@ def merge_shards(
     entries: list[dict[str, Any]] = []
     for name, per_seed in sorted(by_config.items()):
         seeds = sorted(per_seed)
+        _validate_screening_arm_contract(name, per_seed)
+        wall_clock_total = _finite_wall_clock_total(
+            [per_seed[s]["wall_clock_seconds"] for s in seeds],
+            context=f"config {name!r}",
+        )
         acc = np.stack(
             [np.asarray(per_seed[s]["per_task_accuracy"], dtype=np.float64) for s in seeds]
         )
@@ -7074,9 +7347,7 @@ def merge_shards(
                     ]
                 )
             ),
-            "wall_clock_seconds_total": round(
-                float(sum(per_seed[s]["wall_clock_seconds"] for s in seeds)), 2
-            ),
+            "wall_clock_seconds_total": round(wall_clock_total, 2),
         }
         common = [s for s in seeds if s in control]
         if name != control_name and not common:
@@ -7115,7 +7386,16 @@ def merge_shards(
                 ),
                 "all_seeds_improve": bool(np.all(diff > 0.0)),
                 "beats_control": bool(diff.mean() > 0.0),
-                "confirmation_candidate": bool(diff.mean() > CONFIRMATION_THRESHOLD),
+                # A one-seed paired mean has no spread, so it cannot authorize
+                # the expensive confirmation wave. Keep the paired summary
+                # available for mid-wave inspection, but require two shared
+                # seeds that all improve before setting the compute-spending
+                # flag.
+                "confirmation_candidate": bool(
+                    len(common) >= 2
+                    and np.all(diff > 0.0)
+                    and diff.mean() > CONFIRMATION_THRESHOLD
+                ),
             }
         entries.append(entry)
 
@@ -7125,7 +7405,9 @@ def merge_shards(
         "evidence_policy": dict(NONPROMOTING_POLICY),
         "created_unix": time.time(),
         "protocol_config": dict(shards[0]["config"]),
+        "environment": dict(reference_environment),
         "noise_mode": noise_mode,
+        "noise_pool_steps": noise_pool_steps,
         "control_name": control_name,
         "confirmation_threshold": CONFIRMATION_THRESHOLD,
         "slope_window": slope_window,
@@ -7148,27 +7430,108 @@ def validate_proxy(
     prefixes at the same task index.
     """
     partials_dir = Path(partials_dir)
-    checks: list[dict[str, Any]] = []
-    proxy_avg: dict[str, list[float]] = {"upgd_w": [], "adamw": []}
-    full_avg: dict[str, list[float]] = {"upgd_w": [], "adamw": []}
-    n_tasks_seen: set[int] = set()
-    for path in shard_paths:
-        shard = load_shard(Path(path))
+    shards = [load_shard(Path(path)) for path in shard_paths]
+    environment = _screening_batch_environment(shards)
+    configs = {tuple(sorted(shard["config"].items())) for shard in shards}
+    if len(configs) != 1:
+        raise ValueError(
+            "proxy-validation shards span multiple protocol configs or horizons; "
+            "validate them separately"
+        )
+    learner_by_control = {
+        "upgd_w_control": "upgd_w",
+        "adamw_control": "adamw",
+    }
+    by_control: dict[str, dict[int, dict[str, Any]]] = {}
+    for path, shard in zip(shard_paths, shards, strict=True):
         if shard.get("noise_mode", "step") != "step":
             raise ValueError(
                 f"{path}: proxy validation requires noise_mode='step' shards "
                 f"(got {shard.get('noise_mode')!r})"
             )
-        learner = {"upgd_w_control": "upgd_w", "adamw_control": "adamw"}.get(
-            shard["config_name"]
-        )
+        learner = learner_by_control.get(shard["config_name"])
         if learner is None:
             raise ValueError(f"{path}: proxy validation accepts only control shards")
+        if shard["base_learner"] != learner:
+            raise ValueError(
+                f"{path}: control {shard['config_name']!r} must record "
+                f"base_learner={learner!r}"
+            )
+        expected_hp = SCREENING_REGISTRY[shard["config_name"]].hyperparameters
+        if shard["hyperparameters"] != expected_hp:
+            raise ValueError(
+                f"{path}: control {shard['config_name']!r} must record its frozen "
+                f"hyperparameters {expected_hp!r}"
+            )
+        per_seed = by_control.setdefault(shard["config_name"], {})
+        if shard["seed"] in per_seed:
+            raise ValueError(
+                f"duplicate proxy-validation shard for control={shard['config_name']} "
+                f"seed={shard['seed']}"
+            )
+        per_seed[shard["seed"]] = shard
+    missing_controls = sorted(set(learner_by_control) - set(by_control))
+    if missing_controls:
+        raise ValueError(f"proxy validation is missing control shard(s): {missing_controls}")
+    for config_name, per_seed in by_control.items():
+        _validate_screening_arm_contract(config_name, per_seed)
+    control_seed_sets = {
+        config_name: tuple(sorted(per_seed))
+        for config_name, per_seed in by_control.items()
+    }
+    if len(set(control_seed_sets.values())) != 1:
+        raise ValueError(
+            f"proxy-validation control seed sets differ: {control_seed_sets}; "
+            "paired controls are required"
+        )
+    checks: list[dict[str, Any]] = []
+    proxy_avg: dict[str, list[float]] = {"upgd_w": [], "adamw": []}
+    full_avg: dict[str, list[float]] = {"upgd_w": [], "adamw": []}
+    n_tasks_seen: set[int] = set()
+    for path, shard in zip(shard_paths, shards, strict=True):
+        learner = learner_by_control[shard["config_name"]]
         seed = shard["seed"]
         n_tasks = int(shard["config"]["n_tasks"])
         n_tasks_seen.add(n_tasks)
         partial_path = partials_dir / f"{learner}_seed{seed}.json"
-        reference = json.loads(partial_path.read_text(encoding="utf-8"))
+        reference = _validated_partial_payload(
+            partial_path,
+            schema=PARTIAL_SCHEMA_V1,
+            seed_field="seeds",
+        )
+        if reference["learner"] != learner:
+            raise ValueError(
+                f"{partial_path}: reference learner {reference['learner']!r} does not "
+                f"match expected learner {learner!r}"
+            )
+        if reference["seeds"] != [seed]:
+            raise ValueError(
+                f"{partial_path}: reference seeds must equal the shard seed [{seed}]"
+            )
+        expected_reference_hp = {
+            "upgd_w": UPGD_W_PROTOCOL_HYPERPARAMETERS,
+            "adamw": ADAMW_PROTOCOL_HYPERPARAMETERS,
+        }[learner]
+        if reference["hyperparameters"] != expected_reference_hp:
+            raise ValueError(
+                f"{partial_path}: reference hyperparameters do not match the frozen "
+                f"{learner} protocol"
+            )
+        reference_config = dict(reference["config"])
+        proxy_config = dict(shard["config"])
+        reference_shape = {
+            key: value for key, value in reference_config.items() if key != "n_tasks"
+        }
+        proxy_shape = {
+            key: value for key, value in proxy_config.items() if key != "n_tasks"
+        }
+        if (
+            reference_shape != proxy_shape
+            or int(reference_config["n_tasks"]) < int(proxy_config["n_tasks"])
+        ):
+            raise ValueError(
+                f"{partial_path}: reference config is incompatible with the proxy prefix"
+            )
         full_curve = np.asarray(reference["per_task_accuracy"][0], dtype=np.float64)
         proxy_curve = np.asarray(shard["per_task_accuracy"], dtype=np.float64)
         max_abs_diff = float(np.max(np.abs(proxy_curve - full_curve[:n_tasks])))
@@ -7197,6 +7560,7 @@ def validate_proxy(
         "schema": VALIDATION_SCHEMA,
         "created_unix": time.time(),
         "atol": atol,
+        "environment": environment,
         "n_tasks": sorted(n_tasks_seen),
         "checks": checks,
         "all_prefixes_match": bool(all(c["prefix_match"] for c in checks)),
@@ -7251,7 +7615,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="'pool' = screening-only pool-noise approximation "
              "(lean-UPGD-family arms only; never mergeable with exact shards)",
     )
-    run_p.add_argument("--noise-pool-steps", type=int, default=64)
+    run_p.add_argument(
+        "--noise-pool-steps",
+        type=int,
+        default=64,
+        help="effective pool size recorded in pool-mode shards (must be >= 2)",
+    )
 
     merge_p = sub.add_parser("merge", help="merge shards into a ranked summary")
     merge_p.add_argument("--shards", type=Path, nargs="+", required=True)
@@ -7270,6 +7639,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", force=True
     )
+    run_seed = (
+        require_jax_seed(args.seed, name="seed")
+        if args.command == "run"
+        else None
+    )
 
     # Refuse an already-published destination before loading data or processing
     # shards.  This is intentionally only a preflight: a claim file or advisory
@@ -7281,17 +7655,25 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
 
     if args.command == "run":
+        assert run_seed is not None
+        seed = run_seed
         spec = screening_spec(args.config_name)
         config = IPMNISTConfig(n_tasks=args.n_tasks, task_length=args.task_length)
         data_home = args.data_home if args.data_home is not None else default_openml_data_home()
         logger.info("loading MNIST from data_home=%s", data_home)
         data_x, data_y = load_mnist_train(data_home)
         logger.info(
-            "running %s seed=%d for %d tasks x %d steps (noise_mode=%s)",
-            spec.name, args.seed, config.n_tasks, config.task_length, args.noise_mode,
+            "running %s seed=%d for %d tasks x %d steps "
+            "(noise_mode=%s, noise_pool_steps=%s)",
+            spec.name,
+            seed,
+            config.n_tasks,
+            config.task_length,
+            args.noise_mode,
+            args.noise_pool_steps if args.noise_mode == "pool" else None,
         )
         result = run_screening_config(
-            data_x, data_y, spec, args.seed, config,
+            data_x, data_y, spec, seed, config,
             progress_every=args.progress_every,
             noise_mode=args.noise_mode,
             noise_pool_steps=args.noise_pool_steps,
@@ -7300,7 +7682,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         logger.info(
             "%s seed=%d done: avg online acc %.4f (wall %.1fs) -> %s",
             spec.name,
-            args.seed,
+            seed,
             float(result.per_task_accuracy.mean()),
             result.wall_clock_seconds,
             args.out,

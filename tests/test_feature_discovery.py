@@ -160,6 +160,126 @@ class TestNonlinearFeatureDiscoveryStream:
 class TestInteractionFeatureDiscoveryStream:
     """Tests for the hidden pair-product Step 2 benchmark stream."""
 
+    def test_init_selects_exact_active_count_when_scores_tie(self, monkeypatch) -> None:
+        stream = InteractionFeatureDiscoveryStream(
+            feature_dim=4, n_tasks=1, n_contexts=1, active_pairs_per_context=2
+        )
+
+        def tied_uniform(key, shape, dtype=jnp.float32, **kwargs):
+            return jnp.zeros(shape, dtype=dtype)
+
+        monkeypatch.setattr(
+            "alberta_framework.streams.feature_discovery.jr.uniform", tied_uniform
+        )
+        state = stream.init(jr.key(0))
+        assert int(jnp.count_nonzero(state.context_weights)) == 2
+
+    @pytest.mark.parametrize("active_count", [0, -1, True, 1.0, np.int64(1)])
+    def test_active_pair_count_requires_positive_builtin_int(
+        self, active_count: object
+    ) -> None:
+        with pytest.raises(ValueError, match="positive built-in integer"):
+            InteractionFeatureDiscoveryStream(
+                feature_dim=4,
+                active_pairs_per_context=active_count,  # type: ignore[arg-type]
+            )
+
+    def test_active_pair_count_caps_at_available_pairs(self) -> None:
+        stream = InteractionFeatureDiscoveryStream(
+            feature_dim=4,
+            n_tasks=2,
+            n_contexts=2,
+            active_pairs_per_context=100,
+        )
+        state = stream.init(jr.key(91))
+
+        assert state.context_weights.shape == (2, 2, 6)
+        assert int(jnp.count_nonzero(state.context_weights)) == state.context_weights.size
+
+    def test_unique_finite_scores_preserve_legacy_context_weights(self) -> None:
+        stream = InteractionFeatureDiscoveryStream(
+            feature_dim=4,
+            n_tasks=2,
+            n_contexts=2,
+            active_pairs_per_context=3,
+        )
+        root_key = jr.key(314)
+        state = stream.init(root_key)
+        _, context_key, mask_key, _ = jr.split(root_key, 4)
+        pair_count = state.pair_left.shape[0]
+        dense_weights = jr.normal(
+            context_key,
+            (2, 2, pair_count),
+            dtype=jnp.float32,
+        )
+        scores = jr.uniform(mask_key, (2, 2, pair_count), dtype=jnp.float32)
+        for row in np.asarray(scores).reshape((-1, pair_count)):
+            assert np.unique(row).size == pair_count
+        threshold = jnp.sort(scores, axis=-1)[..., 2:3]
+        legacy_mask = scores <= threshold
+        expected = dense_weights * legacy_mask.astype(jnp.float32) / jnp.sqrt(
+            jnp.sum(legacy_mask, axis=-1, keepdims=True)
+        )
+
+        np.testing.assert_array_equal(
+            np.asarray(state.context_weights),
+            np.asarray(expected),
+        )
+
+    @pytest.mark.parametrize("compiled", [False, True])
+    @pytest.mark.parametrize(
+        ("scores", "expected_mask"),
+        [
+            ([0.5, 0.5, 0.5, 0.5, 0.5, 0.5], [True, True, False, False, False, False]),
+            ([0.1, 0.5, 0.5, 0.2, 0.9, 0.8], [True, True, False, True, False, False]),
+        ],
+    )
+    def test_init_selects_exact_stable_active_count_under_ties(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        compiled: bool,
+        scores: list[float],
+        expected_mask: list[bool],
+    ) -> None:
+        stream = InteractionFeatureDiscoveryStream(
+            feature_dim=4,
+            n_tasks=2,
+            n_contexts=2,
+            active_pairs_per_context=3 if scores[0] != scores[1] else 2,
+            noise_std=0.0,
+        )
+
+        def fixed_normal(key, shape, dtype=jnp.float32, **kwargs):
+            del key, kwargs
+            return jnp.ones(shape, dtype=dtype)
+
+        def fixed_uniform(key, shape, dtype=jnp.float32, **kwargs):
+            del key, kwargs
+            return jnp.broadcast_to(jnp.asarray(scores, dtype=dtype), shape)
+
+        monkeypatch.setattr(
+            "alberta_framework.streams.feature_discovery.jr.normal", fixed_normal
+        )
+        monkeypatch.setattr(
+            "alberta_framework.streams.feature_discovery.jr.uniform", fixed_uniform
+        )
+        init = jax.jit(stream.init) if compiled else stream.init
+        state = init(jr.key(0))
+
+        actual_mask = state.context_weights != 0.0
+        expected = jnp.broadcast_to(
+            jnp.asarray(expected_mask), state.context_weights.shape
+        )
+        chex.assert_trees_all_equal(actual_mask, expected)
+
+        def body(carry, idx):
+            timestep, next_state = stream.step(carry, idx)
+            return next_state, (timestep.observation, timestep.target)
+
+        final_state, outputs = jax.lax.scan(body, state, jnp.arange(4))
+        assert int(final_state.step_count) == 4
+        chex.assert_tree_all_finite(outputs)
+
     def test_step_shapes(self) -> None:
         stream = InteractionFeatureDiscoveryStream(
             feature_dim=6,

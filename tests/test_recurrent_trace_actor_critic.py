@@ -8,6 +8,7 @@ import pickle
 from collections.abc import Callable
 from typing import Any, cast
 
+import chex
 import jax
 import jax.numpy as jnp
 import jax.random as jr
@@ -607,6 +608,72 @@ def test_obgd_large_error_contract_applies_signal_once() -> None:
     )
     # In the bounded regime, a second signal multiplication would make this 5.
     assert jnp.allclose(update_l1, 1.0 / 2.0)
+
+
+def test_obgd_infinite_signal_zeros_bounded_update() -> None:
+    """Inf signal zeros the ObGD scale, then scale*signal*z is 0*inf=NaN."""
+    traces = {
+        "first": jnp.asarray((2.0, -1.0), dtype=jnp.float32),
+        "second": jnp.asarray((3.0,), dtype=jnp.float32),
+    }
+    result = obgd_update(traces, jnp.asarray(jnp.inf, dtype=jnp.float32), alpha=0.5, kappa=2.0)
+    for leaf in jax.tree_util.tree_leaves(result.updates):
+        assert bool(jnp.all(jnp.isfinite(leaf)))
+        assert bool(jnp.allclose(leaf, 0.0))
+    assert bool(jnp.isfinite(result.scale))
+    assert bool(jnp.allclose(result.scale, 0.0))
+    assert not bool(result.update_applied)
+
+    unbounded = obgd_update(
+        traces, jnp.asarray(jnp.inf, dtype=jnp.float32), alpha=0.5, kappa=0.0
+    )
+    for leaf in jax.tree_util.tree_leaves(unbounded.updates):
+        assert bool(jnp.all(jnp.isfinite(leaf)))
+        assert bool(jnp.allclose(leaf, 0.0))
+    assert not bool(unbounded.update_applied)
+
+
+def test_adaptive_obgd_infinite_signal_keeps_finite_updates() -> None:
+    traces = {
+        "first": jnp.asarray((2.0, -1.0), dtype=jnp.float32),
+        "second": jnp.asarray((0.5,), dtype=jnp.float32),
+    }
+    second_moment = {
+        "first": jnp.asarray((0.25, 0.5), dtype=jnp.float32),
+        "second": jnp.asarray((1.0,), dtype=jnp.float32),
+    }
+    result = adaptive_obgd_update(
+        traces,
+        second_moment,
+        jnp.asarray(jnp.inf, dtype=jnp.float32),
+        alpha=0.2,
+        kappa=2.0,
+        beta2=0.9,
+        epsilon=1e-4,
+        step=4,
+    )
+    for leaf in jax.tree_util.tree_leaves(result.updates):
+        assert bool(jnp.all(jnp.isfinite(leaf)))
+        assert bool(jnp.allclose(leaf, 0.0))
+    assert not bool(result.update_applied)
+    chex.assert_trees_all_close(result.second_moment, second_moment)
+    zero_traces = jax.tree_util.tree_map(jnp.zeros_like, traces)
+    zeroed = adaptive_obgd_update(
+        zero_traces,
+        second_moment,
+        jnp.asarray(jnp.inf, dtype=jnp.float32),
+        alpha=0.2,
+        kappa=2.0,
+        beta2=0.9,
+        epsilon=1e-4,
+        step=4,
+    )
+    for leaf in jax.tree_util.tree_leaves(zeroed.second_moment):
+        assert bool(jnp.all(jnp.isfinite(leaf)))
+    for leaf in jax.tree_util.tree_leaves(zeroed.updates):
+        assert bool(jnp.all(jnp.isfinite(leaf)))
+    assert not bool(zeroed.update_applied)
+    chex.assert_trees_all_close(zeroed.second_moment, second_moment)
 
 
 def test_adaptive_obgd_matches_memorax_second_moment_formula() -> None:

@@ -47,7 +47,14 @@ from typing import Any
 import chex
 import jax.numpy as jnp
 from jax import Array
-from jaxtyping import Float
+from jaxtyping import Bool, Float
+
+from alberta_framework.core.update_safety import (
+    floating_tree_is_finite,
+    neutralize_array,
+    neutralize_metrics,
+    select_transaction,
+)
 
 # Paper default for the step-size floor: eta_min = e^-15.
 _DEFAULT_ETA_MIN = math.exp(-15.0)
@@ -110,6 +117,7 @@ class SwiftTDUpdate:
     bias_delta: Float[Array, ""]
     new_state: SwiftTDState
     metrics: dict[str, Array]
+    update_applied: Bool[Array, ""]
 
 
 class SwiftTD:
@@ -257,7 +265,9 @@ class SwiftTD:
         Returns:
             SwiftTDUpdate with weight deltas and updated state
         """
-        del next_observation  # V(s') already folded into td_error
+        # V(s') is already folded into td_error, but the public transition is
+        # accepted only when every supplied component is finite.
+        next_observation_finite = jnp.all(jnp.isfinite(next_observation))
         phi = jnp.concatenate(
             [jnp.asarray(observation, dtype=jnp.float32), jnp.ones(1, dtype=jnp.float32)]
         )
@@ -309,11 +319,15 @@ class SwiftTD:
 
         # Meta-update: beta_i += (theta / alpha_i) * (delta' - v_delta) * p_i,
         # clipped to [ln(eta_min), ln(eta)].
-        new_log_step_sizes = log_alphas + (theta / jnp.exp(log_alphas)) * (
-            delta - v_delta
-        ) * p_ext
-        new_log_step_sizes = jnp.clip(
-            new_log_step_sizes, jnp.log(state.eta_min), jnp.log(eta)
+        meta_delta = (theta / jnp.exp(log_alphas)) * (delta - v_delta) * p_ext
+        new_log_step_sizes = jnp.where(
+            jnp.isfinite(meta_delta),
+            jnp.clip(
+                log_alphas + meta_delta,
+                jnp.log(state.eta_min),
+                jnp.log(eta),
+            ),
+            log_alphas,
         )
 
         # h-trace generation shift.
@@ -327,7 +341,7 @@ class SwiftTD:
         new_p = decay_factor * p_ext
         new_z_bar = decay_factor * z_bar_ext
 
-        new_state = SwiftTDState(
+        candidate_state = SwiftTDState(
             log_step_sizes=new_log_step_sizes,
             eligibility_traces=new_z,
             z_bar_traces=new_z_bar,
@@ -344,16 +358,34 @@ class SwiftTD:
         )
 
         weight_alphas = jnp.exp(new_log_step_sizes[:-1])
+        candidate_metrics = {
+            "mean_step_size": jnp.mean(weight_alphas),
+            "min_step_size": jnp.min(weight_alphas),
+            "max_step_size": jnp.max(weight_alphas),
+            "mean_eligibility_trace": jnp.mean(jnp.abs(new_z[:-1])),
+            "bound_scale": bound_scale,
+            "decay_triggered": decay_triggered.astype(jnp.float32),
+        }
+        inputs_valid = (
+            jnp.all(jnp.isfinite(td_error))
+            & jnp.all(jnp.isfinite(observation))
+            & next_observation_finite
+            & jnp.isfinite(gamma_scalar)
+        )
+        update_applied = (
+            floating_tree_is_finite(state)
+            & inputs_valid
+            & jnp.all(jnp.isfinite(meta_delta))
+            & jnp.all(jnp.isfinite(delta_w))
+            & floating_tree_is_finite(candidate_state)
+            & floating_tree_is_finite(candidate_metrics)
+        )
+        new_state = select_transaction(update_applied, candidate_state, state)
+        metrics = neutralize_metrics(update_applied, candidate_metrics)
         return SwiftTDUpdate(
-            weight_delta=delta_w[:-1],
-            bias_delta=delta_w[-1],
+            weight_delta=neutralize_array(update_applied, delta_w[:-1]),
+            bias_delta=neutralize_array(update_applied, delta_w[-1]),
             new_state=new_state,
-            metrics={
-                "mean_step_size": jnp.mean(weight_alphas),
-                "min_step_size": jnp.min(weight_alphas),
-                "max_step_size": jnp.max(weight_alphas),
-                "mean_eligibility_trace": jnp.mean(jnp.abs(new_z[:-1])),
-                "bound_scale": bound_scale,
-                "decay_triggered": decay_triggered.astype(jnp.float32),
-            },
+            metrics=metrics,
+            update_applied=update_applied,
         )

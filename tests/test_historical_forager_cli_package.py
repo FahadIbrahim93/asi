@@ -38,23 +38,43 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 provenance_module = importlib.import_module(
     "alberta_framework.benchmarks.historical_forager_provenance"
 )
-_WHEEL_FILES = (
-    "alberta_framework/console_entrypoints.py",
-    "alberta_framework/benchmarks/__init__.py",
-    "alberta_framework/benchmarks/historical_forager.py",
-    "alberta_framework/benchmarks/historical_forager_provenance.py",
-    "alberta_framework/benchmarks/official_foragax.py",
-    "alberta_framework/benchmarks/runtime_profile.py",
-    "alberta_framework/benchmarks/forager_results.py",
-    "alberta_framework/forager_cli.py",
+_WHEEL_FILES = tuple(
+    path.relative_to(_REPO_ROOT).as_posix()
+    for path in sorted((_REPO_ROOT / "alberta_framework").rglob("*"))
+    if path.is_file()
+    and "__pycache__" not in path.parts
+    and (path.suffix == ".py" or path.name == "py.typed")
 )
+_EXPECTED_SCRIPT_NAMES = {
+    "alberta-evidence-status",
+    "alberta-forager-benchmark",
+    "alberta-forager-matched-campaign",
+    "alberta-forager-matched-qualification",
+    "alberta-forager-matched-sealed-evaluation",
+    "alberta-foragax-oci",
+    "alberta-foragax-open-screen",
+    "alberta-ftl-evidence",
+    "alberta-historical-forager",
+    "alberta-ia-evidence",
+    "alberta-multiagent-evidence",
+    "alberta-recurring-feature-evidence",
+    "alberta-scale-robust-evidence",
+    "alberta-step1-smoke",
+    "alberta-step2-smoke",
+}
 _HARD_LINK_SENSITIVE_SOURCES = (
     "alberta_framework/benchmarks/official_foragax.py",
     "alberta_framework/benchmarks/runtime_profile.py",
     "alberta_framework/benchmarks/forager_results.py",
 )
-_DOCUMENT_FILES = (
+_SDIST_EXTRA_FILES = (
+    "CHANGELOG.md",
+    "CITATION.cff",
+    "FORAGER_BENCHMARK.md",
+    "LICENSE",
+    "README.md",
     "VENDORING.md",
+    "pyproject.toml",
     *(
         path.relative_to(_REPO_ROOT).as_posix()
         for path in sorted((_REPO_ROOT / "docs").rglob("*.md"))
@@ -199,38 +219,52 @@ def test_historical_cli_reports_provenance_and_validates_strict_pairing(
     assert "must be a real directory" in missing.stderr
 
 
+@pytest.mark.package
 def test_wheel_and_sdist_are_complete_and_hard_link_safe(tmp_path: Path) -> None:
     uv = shutil.which("uv")
     if uv is None:
-        pytest.skip("uv is required for the distribution integration check")
-    output_directory = tmp_path / "dist"
-    build_arguments = [uv, "build"]
-    if os.environ.get("ALBERTA_PACKAGE_BUILD_ALLOW_NETWORK") != "1":
-        build_arguments.append("--offline")
-    build_arguments.extend(
-        (
-            "--no-build-logs",
-            "--no-create-gitignore",
-            "--no-python-downloads",
-            "--out-dir",
-            str(output_directory),
-            str(_REPO_ROOT),
+        interpreter_bin = str(Path(sys.executable).parent)
+        uv = shutil.which("uv", path=interpreter_bin)
+    if uv is None:
+        pytest.fail("uv is required; install the project's dev dependencies")
+    prebuilt_directory = os.environ.get("ALBERTA_PREBUILT_DIST_DIR")
+    if prebuilt_directory:
+        output_directory = Path(prebuilt_directory)
+    else:
+        output_directory = tmp_path / "dist"
+        build_arguments = [uv, "build", "--no-build-isolation"]
+        if os.environ.get("ALBERTA_PACKAGE_BUILD_ALLOW_NETWORK") != "1":
+            build_arguments.append("--offline")
+        build_arguments.extend(
+            (
+                "--no-build-logs",
+                "--no-create-gitignore",
+                "--no-python-downloads",
+                "--out-dir",
+                str(output_directory),
+                str(_REPO_ROOT),
+            )
         )
-    )
-    completed = subprocess.run(
-        build_arguments,
-        cwd=_REPO_ROOT,
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
-    assert completed.returncode == 0, completed.stderr
+        build_environment = os.environ.copy()
+        build_environment["VIRTUAL_ENV"] = sys.prefix
+        build_environment["PATH"] = os.pathsep.join(
+            (str(Path(sys.executable).parent), build_environment.get("PATH", ""))
+        )
+        completed = subprocess.run(
+            build_arguments,
+            cwd=_REPO_ROOT,
+            env=build_environment,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        assert completed.returncode == 0, completed.stderr
 
     project = tomllib.loads((_REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     version = project["project"]["version"]
     expected_scripts = project["project"]["scripts"]
-    assert len(expected_scripts) == 15
+    assert set(expected_scripts) == _EXPECTED_SCRIPT_NAMES
     wheel_path = output_directory / f"alberta_framework-{version}-py3-none-any.whl"
     sdist_path = output_directory / f"alberta_framework-{version}.tar.gz"
     assert wheel_path.is_file()
@@ -377,7 +411,7 @@ print(
     prefix = f"alberta_framework-{version}"
     with tarfile.open(sdist_path, mode="r:gz") as source_distribution:
         sdist_names = set(source_distribution.getnames())
-        for relative_path in (*_WHEEL_FILES, *_DOCUMENT_FILES):
+        for relative_path in (*_WHEEL_FILES, *_SDIST_EXTRA_FILES):
             archived_path = f"{prefix}/{relative_path}"
             assert archived_path in sdist_names
             extracted = source_distribution.extractfile(archived_path)

@@ -194,11 +194,18 @@ def _json_without_duplicate_keys(payload: bytes, *, path: Path) -> Mapping[str, 
     def invalid_constant(value: str) -> None:
         raise ValueError(f"{path} contains non-standard JSON constant {value!r}")
 
+    def parse_float(value: str) -> float:
+        parsed = float(value)
+        if not math.isfinite(parsed):
+            raise ValueError(f"{path} contains non-finite JSON number {value!r}")
+        return parsed
+
     try:
         parsed = json.loads(
             payload,
             object_pairs_hook=object_pairs,
             parse_constant=invalid_constant,
+            parse_float=parse_float,
         )
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError(f"{path} is not valid UTF-8 JSON") from exc

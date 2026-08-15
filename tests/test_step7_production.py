@@ -223,7 +223,36 @@ class TestStep7Scan:
         chex.assert_shape(result.real_td_errors, (n_steps,))
         chex.assert_shape(result.average_rewards, (n_steps,))
         chex.assert_shape(result.actions, (n_steps,))
+        chex.assert_shape(result.model_updates_applied, (n_steps,))
+        assert bool(jnp.all(result.model_updates_applied))
         chex.assert_shape(result.planning_td_errors, (n_steps, 2))
+
+    def test_scan_exposes_rejected_model_updates(self) -> None:
+        cfg = _cfg(planning_steps=0)
+        agent, model, state = _init(cfg)
+        maximum = jnp.asarray(2_147_483_647, dtype=jnp.int32)
+        model_state = state.world_model_state.replace(
+            learner_state=state.world_model_state.learner_state.replace(
+                step_count=maximum,
+                step_words=jnp.asarray([0xFFFFFFFF, 0xFFFFFFFF], dtype=jnp.uint32),
+            ),
+            step_count=maximum,
+        )
+        state = state.replace(world_model_state=model_state)
+
+        result = run_step7_scan(
+            cfg,
+            agent,
+            model,
+            state,
+            jnp.zeros((1,), dtype=jnp.float32),
+            jnp.zeros((1, OBS_DIM), dtype=jnp.float32),
+        )
+
+        chex.assert_trees_all_equal(
+            result.model_updates_applied,
+            jnp.asarray([False]),
+        )
 
     def test_scan_td_errors_finite(self) -> None:
         cfg = _cfg(planning_steps=1)

@@ -72,60 +72,48 @@ __all__ = [
     "save_experiment_report",
 ]
 
-# Optional: Statistics (requires scipy for full functionality)
-try:
-    from alberta_framework.utils.statistics import (
-        SignificanceResult,
-        StatisticalSummary,
-        bonferroni_correction,
-        bootstrap_ci,
-        cohens_d,
-        compute_statistics,
-        compute_timeseries_statistics,
-        holm_correction,
-        mann_whitney_comparison,
-        pairwise_comparisons,
-        ttest_comparison,
-        wilcoxon_comparison,
-    )
+from alberta_framework.utils.statistics import (
+    SignificanceResult,
+    StatisticalSummary,
+    bonferroni_correction,
+    bootstrap_ci,
+    cohens_d,
+    compute_statistics,
+    compute_timeseries_statistics,
+    holm_correction,
+    mann_whitney_comparison,
+    pairwise_comparisons,
+    ttest_comparison,
+    wilcoxon_comparison,
+)
+from alberta_framework.utils.visualization import (
+    create_comparison_figure,
+    plot_final_performance_bars,
+    plot_hyperparameter_heatmap,
+    plot_learning_curves,
+    plot_step_size_evolution,
+    save_figure,
+    set_publication_style,
+)
 
-    __all__ += [
-        "SignificanceResult",
-        "StatisticalSummary",
-        "bonferroni_correction",
-        "bootstrap_ci",
-        "cohens_d",
-        "compute_statistics",
-        "compute_timeseries_statistics",
-        "holm_correction",
-        "mann_whitney_comparison",
-        "pairwise_comparisons",
-        "ttest_comparison",
-        "wilcoxon_comparison",
-    ]
-except ImportError:
-    pass
-
-# Optional: Visualization (requires matplotlib)
-try:
-    from alberta_framework.utils.visualization import (
-        create_comparison_figure,
-        plot_final_performance_bars,
-        plot_hyperparameter_heatmap,
-        plot_learning_curves,
-        plot_step_size_evolution,
-        save_figure,
-        set_publication_style,
-    )
-
-    __all__ += [
-        "create_comparison_figure",
-        "plot_final_performance_bars",
-        "plot_hyperparameter_heatmap",
-        "plot_learning_curves",
-        "plot_step_size_evolution",
-        "save_figure",
-        "set_publication_style",
-    ]
-except ImportError:
-    pass
+__all__ += [
+    "SignificanceResult",
+    "StatisticalSummary",
+    "bonferroni_correction",
+    "bootstrap_ci",
+    "cohens_d",
+    "compute_statistics",
+    "compute_timeseries_statistics",
+    "holm_correction",
+    "mann_whitney_comparison",
+    "pairwise_comparisons",
+    "ttest_comparison",
+    "wilcoxon_comparison",
+    "create_comparison_figure",
+    "plot_final_performance_bars",
+    "plot_hyperparameter_heatmap",
+    "plot_learning_curves",
+    "plot_step_size_evolution",
+    "save_figure",
+    "set_publication_style",
+]

@@ -7,11 +7,14 @@ tiny synthetic smoke run. Benchmark executions never happen inside pytest.
 
 from __future__ import annotations
 
+import json
+
 import jax.numpy as jnp
 import jax.random as jr
 import numpy as np
 import pytest
 
+import alberta_framework.benchmarks.upgd_label_emnist as upgd_label_emnist
 from alberta_framework.benchmarks.upgd_label_emnist import (
     ADAMW_PROTOCOL_HYPERPARAMETERS,
     SGD_EMA_NORM_HYPERPARAMETERS,
@@ -180,13 +183,149 @@ class TestScheduleExactness:
             build_schedule(jr.key(0), TINY, n_train=TINY.task_length - 1)
 
 
-class TestTinySmokeRun:
-    @pytest.fixture(scope="class")
-    def debug_run(self):
-        x, y = _tiny_data()
-        return run_label_emnist(
-            x, y, "upgd_w", seeds=[0, 1], config=TINY, return_per_step=True
+class TestSeedBoundary:
+    @pytest.mark.parametrize(
+        "seeds",
+        [
+            (),
+            (0, 0),
+            (True,),
+            (np.int64(0),),
+            (0.0,),
+            (-1,),
+            (2**32,),
+            (0, 2**32),
+        ],
+    )
+    def test_run_rejects_noncanonical_seed_identities_before_setup(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        seeds: tuple[object, ...],
+    ) -> None:
+        def unexpected_setup(*args: object, **kwargs: object) -> None:
+            del args, kwargs
+            raise AssertionError("invalid seeds reached learner setup")
+
+        monkeypatch.setattr(upgd_label_emnist, "resolve_hyperparameters", unexpected_setup)
+        with pytest.raises(ValueError, match="seeds"):
+            run_label_emnist(
+                np.empty((1, 1), dtype=np.float32),
+                np.empty((1,), dtype=np.int32),
+                "adamw",
+                seeds=seeds,  # type: ignore[arg-type]
+            )
+
+    @pytest.mark.parametrize("seeds", [(True,), (np.int64(0),), (-1,), (2**32,)])
+    def test_plan_rejects_noncanonical_seed_identities(
+        self, seeds: tuple[object, ...]
+    ) -> None:
+        with pytest.raises(ValueError, match="seed IDs"):
+            build_plan_payload(
+                TINY,
+                seeds,  # type: ignore[arg-type]
+                DATASET_META,
+            )
+
+    def test_plan_cli_rejects_aliased_seed_before_loading_emnist(
+        self, tmp_path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def unexpected_load(*args: object, **kwargs: object) -> None:
+            del args, kwargs
+            raise AssertionError("invalid CLI seeds reached dataset loading")
+
+        monkeypatch.setattr(
+            upgd_label_emnist, "load_emnist_balanced_train", unexpected_load
         )
+        with pytest.raises(ValueError, match=r"seed IDs\[1\].*uint32"):
+            upgd_label_emnist.main(
+                [
+                    "plan",
+                    "--plan-out",
+                    str(tmp_path / "must-not-exist.json"),
+                    "--seed-list",
+                    f"0,{2**32}",
+                ]
+            )
+
+
+class TestEMNISTArrayCache:
+    @staticmethod
+    def _write_cache(tmp_path, x: np.ndarray, y: np.ndarray, meta_text: str) -> None:
+        x_path, y_path, meta_path = upgd_label_emnist._npy_cache_paths(tmp_path)
+        np.save(x_path, x)
+        np.save(y_path, y)
+        meta_path.write_text(meta_text, encoding="utf-8")
+
+    @staticmethod
+    def _metadata(x: np.ndarray, y: np.ndarray) -> dict[str, object]:
+        return {
+            "source": "synthetic:test-cache",
+            "details": {"parser": "fixture"},
+            "x_sha256": upgd_label_emnist.materialized_array_sha256(x),
+            "y_sha256": upgd_label_emnist.materialized_array_sha256(y),
+        }
+
+    def test_clean_cache_metadata_remains_compatible(self, tmp_path) -> None:
+        x = np.asarray([[0.0, 1.0], [-1.0, 0.5]], dtype=np.float32)
+        y = np.asarray([1, 0], dtype=np.int32)
+        metadata = self._metadata(x, y)
+        self._write_cache(tmp_path, x, y, json.dumps(metadata))
+
+        loaded_x, loaded_y, loaded_metadata = (
+            upgd_label_emnist.load_emnist_balanced_train(tmp_path)
+        )
+
+        np.testing.assert_array_equal(loaded_x, x)
+        np.testing.assert_array_equal(loaded_y, y)
+        assert loaded_metadata == metadata
+
+    def test_cache_metadata_rejects_duplicate_top_level_key(self, tmp_path) -> None:
+        x = np.asarray([[0.0]], dtype=np.float32)
+        y = np.asarray([0], dtype=np.int32)
+        metadata = self._metadata(x, y)
+        meta_text = json.dumps(metadata).replace(
+            '"source": "synthetic:test-cache"',
+            '"source": "first", "source": "second"',
+        )
+        self._write_cache(tmp_path, x, y, meta_text)
+
+        with pytest.raises(ValueError, match="duplicate JSON key: 'source'"):
+            upgd_label_emnist.load_emnist_balanced_train(tmp_path)
+
+    def test_cache_metadata_rejects_duplicate_nested_key(self, tmp_path) -> None:
+        x = np.asarray([[0.0]], dtype=np.float32)
+        y = np.asarray([0], dtype=np.int32)
+        metadata = self._metadata(x, y)
+        meta_text = json.dumps(metadata).replace(
+            '"details": {"parser": "fixture"}',
+            '"details": {"parser": "first", "parser": "second"}',
+        )
+        self._write_cache(tmp_path, x, y, meta_text)
+
+        with pytest.raises(ValueError, match="duplicate JSON key: 'parser'"):
+            upgd_label_emnist.load_emnist_balanced_train(tmp_path)
+
+    def test_cache_metadata_still_enforces_array_digests(self, tmp_path) -> None:
+        x = np.asarray([[0.0]], dtype=np.float32)
+        y = np.asarray([0], dtype=np.int32)
+        metadata = self._metadata(x, y)
+        metadata["x_sha256"] = "0" * 64
+        self._write_cache(tmp_path, x, y, json.dumps(metadata))
+
+        with pytest.raises(RuntimeError, match="does not match its pinned digests"):
+            upgd_label_emnist.load_emnist_balanced_train(tmp_path)
+
+
+@pytest.fixture(scope="class")
+def debug_run():
+    """Run the shared tiny diagnostic once for this test module."""
+    x, y = _tiny_data()
+    return run_label_emnist(
+        x, y, "upgd_w", seeds=[0, 1], config=TINY, return_per_step=True
+    )
+
+
+class TestTinySmokeRun:
 
     def test_shapes_and_bounds(self, debug_run):
         assert debug_run.per_task_accuracy.shape == (2, TINY.n_tasks)

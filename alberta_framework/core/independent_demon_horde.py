@@ -42,11 +42,14 @@ import chex
 import jax
 import jax.numpy as jnp
 from jax import Array
-from jaxtyping import Float
+from jaxtyping import Bool, Float
 
 from alberta_framework.core.horde import HordeUpdateResult
 from alberta_framework.core.initializers import sparse_init
-from alberta_framework.core.learners import AnyOptimizer
+from alberta_framework.core.learners import (
+    AnyOptimizer,
+    _update_from_gradient_with_diagnostics,
+)
 from alberta_framework.core.normalizers import Normalizer
 from alberta_framework.core.optimizers import LMS, Bounder
 from alberta_framework.core.types import (
@@ -58,6 +61,9 @@ from alberta_framework.core.types import (
     MLPLearnerState,
     MLPParams,
     TraceMode,
+)
+from alberta_framework.core.update_safety import (
+    floating_tree_is_finite as _floating_tree_is_finite,
 )
 
 # =============================================================================
@@ -103,6 +109,8 @@ class IndependentDemonHordeLearningResult:
     state: IndependentDemonHordeState
     per_demon_metrics: Float[Array, "num_steps n_demons 3"]
     td_errors: Float[Array, "num_steps n_demons"]
+    head_updates_applied: Bool[Array, "num_steps n_demons"]
+    updates_applied: Bool[Array, " num_steps"]
 
 
 @chex.dataclass(frozen=True)
@@ -119,6 +127,8 @@ class BatchedIndependentDemonHordeResult:
     states: IndependentDemonHordeState
     per_demon_metrics: Float[Array, "n_seeds num_steps n_demons 3"]
     td_errors: Float[Array, "n_seeds num_steps n_demons"]
+    head_updates_applied: Bool[Array, "n_seeds num_steps n_demons"]
+    updates_applied: Bool[Array, "n_seeds num_steps"]
 
 
 # =============================================================================
@@ -450,13 +460,14 @@ class IndependentDemonHorde:
         target: Array,
         gamma_lamda: Array,
         active: Array,
-    ) -> tuple[MLPLearnerState, Array, Array, Array]:
+    ) -> tuple[MLPLearnerState, Array, Array, Array, Array]:
         """Run a single demon's update step.
 
         Returns ``(new_state, prediction, error, mean_step_size)``. When
         ``active`` is ``False`` the demon's parameters, traces, and
         optimizer states are preserved unchanged; ``error`` and
         ``mean_step_size`` are returned as NaN to flag inactivity.
+        Non-finite proposed weights (ObGD ``0 * inf``) are also held.
 
         This mirrors the body of ``MLPLearner.update`` but: (a) accepts
         an external active mask so NaN cumulants suppress the update,
@@ -468,13 +479,17 @@ class IndependentDemonHorde:
         # 1. Normalize observation if needed (and update normalizer state)
         obs = observation
         new_normalizer_state = demon_state.normalizer_state
+        normalizer_update_applied = jnp.asarray(True, dtype=jnp.bool_)
         if (
             self._normalizer is not None
             and demon_state.normalizer_state is not None
         ):
-            obs, new_normalizer_state = self._normalizer.normalize(
+            normalizer_result = self._normalizer.normalize_with_diagnostics(
                 demon_state.normalizer_state, observation
             )
+            obs = normalizer_result.normalized
+            new_normalizer_state = normalizer_result.state
+            normalizer_update_applied = normalizer_result.update_applied
 
         # 2. Forward + prediction-gradient via jax.grad
         slope = self._leaky_relu_slope
@@ -522,6 +537,7 @@ class IndependentDemonHorde:
         n_trace_entries = len(new_traces)
         all_steps: list[Array] = []
         new_opt_states: list[Any] = []
+        optimizer_updates_applied: list[Array] = []
         for j in range(n_trace_entries):
             is_output = (
                 self._head_optimizer is not None
@@ -532,11 +548,17 @@ class IndependentDemonHorde:
                 if (is_output and self._head_optimizer is not None)
                 else self._optimizer
             )
-            step, new_opt = opt.update_from_gradient(
-                demon_state.optimizer_states[j], new_traces[j], error=error
+            step, new_opt, optimizer_update_applied = (
+                _update_from_gradient_with_diagnostics(
+                    opt,
+                    demon_state.optimizer_states[j],
+                    new_traces[j],
+                    error=error,
+                )
             )
             all_steps.append(step)
             new_opt_states.append(new_opt)
+            optimizer_updates_applied.append(optimizer_update_applied)
 
         # 5. Optional bounding (per-demon)
         if self._bounder is not None:
@@ -567,30 +589,48 @@ class IndependentDemonHorde:
             biases=tuple(new_biases),
         )
 
-        # 7. Mask inactive demons: keep old params/traces/opt-states/normalizer
+        # Inf error zeros the ObGD step, then error * step is 0*inf=NaN.
+        # Treat that the same as an inactive demon: keep previous finite
+        # params, traces, and optimizer states.
+        proposed_finite = (
+            _floating_tree_is_finite(new_params)
+            & _floating_tree_is_finite(tuple(new_traces))
+            & _floating_tree_is_finite(tuple(new_opt_states))
+        )
+        commit = (
+            active
+            & jnp.all(jnp.isfinite(observation))
+            & jnp.isfinite(error)
+            & _floating_tree_is_finite(demon_state)
+            & proposed_finite
+            & normalizer_update_applied
+            & jnp.all(jnp.stack(optimizer_updates_applied))
+        )
+
+        # 7. Mask inactive / non-finite updates: keep old params/traces/opt
         new_params = MLPParams(
             weights=tuple(
-                jnp.where(active, new_w, old_w)
+                jnp.where(commit, new_w, old_w)
                 for new_w, old_w in zip(
                     new_params.weights, demon_state.params.weights, strict=True
                 )
             ),
             biases=tuple(
-                jnp.where(active, new_b, old_b)
+                jnp.where(commit, new_b, old_b)
                 for new_b, old_b in zip(
                     new_params.biases, demon_state.params.biases, strict=True
                 )
             ),
         )
         masked_traces = tuple(
-            jnp.where(active, new_t, old_t)
+            jnp.where(commit, new_t, old_t)
             for new_t, old_t in zip(
                 new_traces, demon_state.traces, strict=True
             )
         )
         masked_opt_states = tuple(
             jax.tree.map(
-                lambda new, old: jnp.where(active, new, old),
+                lambda new, old: jnp.where(commit, new, old),
                 new_opt,
                 old_opt,
             )
@@ -604,7 +644,7 @@ class IndependentDemonHorde:
             and new_normalizer_state is not None
         ):
             masked_normalizer_state = jax.tree.map(
-                lambda new, old: jnp.where(active, new, old),
+                lambda new, old: jnp.where(commit, new, old),
                 new_normalizer_state,
                 demon_state.normalizer_state,
             )
@@ -616,7 +656,7 @@ class IndependentDemonHorde:
             optimizer_states=masked_opt_states,
             traces=masked_traces,
             normalizer_state=masked_normalizer_state,
-            step_count=demon_state.step_count + jnp.where(active, 1, 0),
+            step_count=demon_state.step_count + jnp.where(commit, 1, 0),
             birth_timestamp=demon_state.birth_timestamp,
             uptime_s=demon_state.uptime_s,
         )
@@ -626,9 +666,20 @@ class IndependentDemonHorde:
         mean_ss = _extract_mean_step_size(new_opt_states[0])
         # NaN out reporting metrics for inactive demons (matches
         # MultiHeadMLPLearner's NaN convention).
-        reported_error = jnp.where(active, target - prediction_val, jnp.nan)
-        reported_mean_ss = jnp.where(active, mean_ss, jnp.nan)
-        return new_state, prediction_val, reported_error, reported_mean_ss
+        reported_error = jnp.where(
+            commit,
+            target - prediction_val,
+            jnp.where(active, 0.0, jnp.nan),
+        )
+        reported_mean_ss = jnp.where(
+            commit,
+            mean_ss,
+            jnp.where(active, 0.0, jnp.nan),
+        )
+        reported_prediction = jnp.where(
+            jnp.isfinite(prediction_val), prediction_val, jnp.zeros_like(prediction_val)
+        )
+        return new_state, reported_prediction, reported_error, reported_mean_ss, commit
 
     # -------------------------------------------------------------------------
     # Public predict / update
@@ -699,8 +750,19 @@ class IndependentDemonHorde:
         # 2. TD targets: r + gamma * V(s')
         targets = cumulants + gammas * next_preds  # NaN propagates as desired
 
-        # 3. Active mask (NaN cumulant -> inactive)
-        active_mask = ~jnp.isnan(cumulants)
+        # 3. NaN means inactive; other non-finite values are rejected heads.
+        requested_mask = ~jnp.isnan(cumulants)
+        global_inputs_valid = (
+            jnp.all(jnp.isfinite(observation))
+            & jnp.all(jnp.isfinite(next_observation))
+            & _floating_tree_is_finite(state)
+        )
+        active_mask = (
+            requested_mask
+            & jnp.isfinite(cumulants)
+            & jnp.isfinite(targets)
+            & global_inputs_valid
+        )
         safe_targets = jnp.where(active_mask, targets, 0.0)
 
         # 4. Per-demon update
@@ -708,9 +770,10 @@ class IndependentDemonHorde:
         predictions_list: list[Array] = []
         errors_list: list[Array] = []
         mean_ss_list: list[Array] = []
+        commits_list: list[Array] = []
         for i in range(n_demons):
             gamma_lamda_i = gammas[i] * lamdas[i]
-            new_ds, pred_i, err_i, mss_i = self._update_single(
+            new_ds, pred_i, err_i, mss_i, commit_i = self._update_single(
                 state.demon_states[i],
                 observation,
                 safe_targets[i],
@@ -721,36 +784,79 @@ class IndependentDemonHorde:
             predictions_list.append(pred_i)
             errors_list.append(err_i)
             mean_ss_list.append(mss_i)
+            commits_list.append(commit_i)
 
         predictions = jnp.stack(predictions_list)
         td_errors = jnp.stack(errors_list)
+        head_updates_applied = jnp.stack(commits_list)
         # Per-demon metrics: [squared_error, raw_error, mean_step_size]
         # NaN columns for inactive demons (matches HordeUpdateResult convention).
         squared_errors = jnp.where(
-            active_mask, td_errors**2, jnp.nan
+            head_updates_applied,
+            td_errors**2,
+            jnp.where(requested_mask, 0.0, jnp.nan),
         )
-        per_demon_metrics = jnp.stack(
-            [squared_errors, td_errors, jnp.stack(mean_ss_list)], axis=1
-        )
-
         # NaN-out td_targets for inactive demons to match HordeLearner.
-        reported_targets = jnp.where(active_mask, targets, jnp.nan)
+        reported_targets = jnp.where(
+            head_updates_applied,
+            targets,
+            jnp.where(requested_mask, jnp.zeros_like(targets), jnp.nan),
+        )
 
-        new_state = IndependentDemonHordeState(
+        update_applied = global_inputs_valid & (
+            jnp.any(head_updates_applied) | jnp.all(~requested_mask)
+        )
+        proposed_state = IndependentDemonHordeState(
             demon_states=tuple(new_demon_states),
             step_count=state.step_count + 1,
             birth_timestamp=state.birth_timestamp,
             uptime_s=state.uptime_s,
         )
+        new_state = jax.lax.cond(
+            update_applied,
+            lambda: proposed_state,
+            lambda: state,
+        )
+        reported_errors = jnp.where(
+            head_updates_applied,
+            td_errors,
+            jnp.where(requested_mask, jnp.zeros_like(td_errors), jnp.nan),
+        )
+        reported_metrics = jnp.stack(
+            (
+                squared_errors,
+                reported_errors,
+                jnp.where(
+                    head_updates_applied,
+                    jnp.stack(mean_ss_list),
+                    jnp.where(requested_mask, 0.0, jnp.nan),
+                ),
+            ),
+            axis=1,
+        )
 
         return HordeUpdateResult(
             state=new_state,
-            predictions=predictions,
-            td_errors=td_errors,
+            predictions=jnp.where(
+                update_applied,
+                jnp.where(
+                    requested_mask & ~head_updates_applied,
+                    jnp.zeros_like(predictions),
+                    predictions,
+                ),
+                jnp.zeros_like(predictions),
+            ),
+            td_errors=reported_errors,
             td_targets=reported_targets,
-            per_demon_metrics=per_demon_metrics,
+            per_demon_metrics=reported_metrics,
             # No shared trunk -> no scalar trunk bounding metric.
-            trunk_bounding_metric=jnp.array(1.0, dtype=jnp.float32),
+            trunk_bounding_metric=jnp.where(
+                update_applied,
+                jnp.array(1.0, dtype=jnp.float32),
+                jnp.array(0.0, dtype=jnp.float32),
+            ),
+            head_updates_applied=head_updates_applied,
+            update_applied=update_applied,
         )
 
 
@@ -787,16 +893,24 @@ def run_independent_horde_learning_loop(
     def step_fn(
         carry: IndependentDemonHordeState,
         inputs: tuple[Array, Array, Array],
-    ) -> tuple[IndependentDemonHordeState, tuple[Array, Array]]:
+    ) -> tuple[IndependentDemonHordeState, tuple[Array, Array, Array, Array]]:
         l_state = carry
         obs, cums, next_obs = inputs
         result = horde.update(l_state, obs, cums, next_obs)
-        return result.state, (result.per_demon_metrics, result.td_errors)
+        return result.state, (
+            result.per_demon_metrics,
+            result.td_errors,
+            result.head_updates_applied,
+            result.update_applied,
+        )
 
     t0 = time.time()
-    final_state, (per_demon_metrics, td_errors) = jax.lax.scan(
-        step_fn, state, (observations, cumulants, next_observations)
-    )
+    final_state, (
+        per_demon_metrics,
+        td_errors,
+        head_updates_applied,
+        updates_applied,
+    ) = jax.lax.scan(step_fn, state, (observations, cumulants, next_observations))
     elapsed = time.time() - t0
     final_state = final_state.replace(  # type: ignore[attr-defined]
         uptime_s=final_state.uptime_s + elapsed
@@ -806,6 +920,8 @@ def run_independent_horde_learning_loop(
         state=final_state,
         per_demon_metrics=per_demon_metrics,
         td_errors=td_errors,
+        head_updates_applied=head_updates_applied,
+        updates_applied=updates_applied,
     )
 
 
@@ -835,17 +951,27 @@ def run_independent_horde_learning_loop_batched(
 
     def single_run(
         key: Array,
-    ) -> tuple[IndependentDemonHordeState, Array, Array]:
+    ) -> tuple[IndependentDemonHordeState, Array, Array, Array, Array]:
         init_state = horde.init(feature_dim, key)
         result = run_independent_horde_learning_loop(
             horde, init_state, observations, cumulants, next_observations
         )
-        return result.state, result.per_demon_metrics, result.td_errors
+        return (
+            result.state,
+            result.per_demon_metrics,
+            result.td_errors,
+            result.head_updates_applied,
+            result.updates_applied,
+        )
 
     t0 = time.time()
-    batched_states, batched_metrics, batched_td_errors = jax.vmap(single_run)(
-        keys
-    )
+    (
+        batched_states,
+        batched_metrics,
+        batched_td_errors,
+        batched_head_updates_applied,
+        batched_updates_applied,
+    ) = jax.vmap(single_run)(keys)
     elapsed = time.time() - t0
     batched_states = batched_states.replace(  # type: ignore[attr-defined]
         uptime_s=batched_states.uptime_s + elapsed
@@ -855,4 +981,6 @@ def run_independent_horde_learning_loop_batched(
         states=batched_states,
         per_demon_metrics=batched_metrics,
         td_errors=batched_td_errors,
+        head_updates_applied=batched_head_updates_applied,
+        updates_applied=batched_updates_applied,
     )

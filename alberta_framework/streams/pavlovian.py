@@ -217,6 +217,11 @@ class ClassicalConditioningStream:
             raise ValueError(f"need 0 <= iti_min <= iti_max, got {iti_min}, {iti_max}")
 
         for phase in phases:
+            if not 0.0 <= phase.cs_us_contingency <= 1.0:
+                raise ValueError(
+                    f"phase {phase.name!r} cs_us_contingency must be in [0, 1], "
+                    f"got {phase.cs_us_contingency}"
+                )
             for cs_idx in phase.cs_active:
                 if not (0 <= cs_idx < n_cs):
                     raise ValueError(

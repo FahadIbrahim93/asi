@@ -1227,11 +1227,20 @@ def _strict_json_loads(
             f"{label} contains non-finite JSON constant {constant}"
         )
 
+    def parse_float(value: str) -> float:
+        parsed = float(value)
+        if not math.isfinite(parsed):
+            raise OfficialForagaxValidationError(
+                f"{label} contains non-finite JSON number {value}"
+            )
+        return parsed
+
     try:
         return json.loads(
             value,
             object_pairs_hook=object_pairs,
             parse_constant=reject_constant,
+            parse_float=parse_float,
         )
     except OfficialForagaxValidationError:
         raise
@@ -6239,17 +6248,6 @@ def prepare_official_foragax_batch_run(
     )
 
 
-def _fsync_directory(path: Path) -> None:
-    descriptor, _metadata = _open_directory_path_nofollow(
-        path,
-        label="fsync directory",
-    )
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-
-
 def _create_and_open_directory_path_nofollow(
     path: Path,
     *,
@@ -6884,42 +6882,6 @@ def _recover_stale_running_lock_at(root_descriptor: int) -> None:
     )
 
 
-def _unlink_and_fsync(path: Path, *, missing_ok: bool = False) -> None:
-    try:
-        path.unlink()
-    except FileNotFoundError:
-        if not missing_ok:
-            raise
-        return
-    _fsync_directory(path.parent)
-
-
-def _atomic_write_bytes(path: Path, contents: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.",
-        suffix=".tmp",
-        dir=path.parent,
-    )
-    temporary_path = Path(temporary_name)
-    try:
-        with os.fdopen(descriptor, "wb") as handle:
-            handle.write(contents)
-            handle.flush()
-            os.fsync(handle.fileno())
-        temporary_path.replace(path)
-        _fsync_directory(path.parent)
-    finally:
-        _unlink_and_fsync(temporary_path, missing_ok=True)
-
-
-def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
-    encoded = (
-        json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n"
-    ).encode()
-    _atomic_write_bytes(path, encoded)
-
-
 def _atomic_write_json_at(
     root_descriptor: int,
     relative_value: str,
@@ -7202,38 +7164,6 @@ def _verify_output_tree_sections(
         raise OfficialForagaxValidationError(
             "official complete output-tree digest does not verify"
         )
-
-
-def _publish_sanitized_log(
-    partial_path: Path,
-    destination: Path,
-    plan: OfficialForagaxRunPlan | OfficialForagaxBatchRunPlan,
-) -> None:
-    """Publish a byte-faithful log except for host-local path placeholders."""
-    relative_partial = partial_path.relative_to(plan.output_dir).as_posix()
-    _metadata, contents = _read_bound_regular_file(
-        plan.output_dir,
-        relative_partial,
-        label="partial execution log",
-        capture_bytes=True,
-    )
-    assert contents is not None
-    interpreter = _absolute_without_resolving_symlinks(plan.request.interpreter)
-    replacements = {
-        str(plan.output_dir).encode(): b"<OUTPUT_DIR>",
-        str(plan.request.repository).encode(): b"<OFFICIAL_CHECKOUT>",
-        str(interpreter).encode(): b"<OFFICIAL_PYTHON>",
-        str(interpreter.parent.parent).encode(): b"<OFFICIAL_ENV>",
-    }
-    for original, logical in sorted(
-        replacements.items(),
-        key=lambda item: len(item[0]),
-        reverse=True,
-    ):
-        if original:
-            contents = contents.replace(original, logical)
-    _atomic_write_bytes(destination, contents)
-    _unlink_and_fsync(partial_path, missing_ok=True)
 
 
 def _completion_attestation(

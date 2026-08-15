@@ -1666,10 +1666,9 @@ def test_snapshot_only_atomic_prefix_is_resumable(
     output = tmp_path / "snapshot-prefix"
     output.mkdir()
     snapshot = matrix._build_source_snapshot()
-    matrix._atomic_create_bytes(
-        output / matrix.SOURCE_SNAPSHOT_FILENAME,
-        snapshot.archive_bytes,
-    )
+    snapshot_path = output / matrix.SOURCE_SNAPSHOT_FILENAME
+    snapshot_path.write_bytes(snapshot.archive_bytes)
+    snapshot_path.chmod(0o600)
 
     report = matrix.run_forager_matrix(manifest, output)
 

@@ -25,7 +25,6 @@ import heapq
 import json
 import math
 import pickle
-from collections import deque
 from collections.abc import Mapping
 from typing import Any, cast
 
@@ -49,10 +48,8 @@ from alberta_framework.benchmarks.causal_map_forager import (
     _estimated_respawn_delay,
     _integrate_observation,
     _merge_channel_interval_bounds,
-    _merge_channel_samples,
     _merge_exact_channel_samples,
     _retry_delay,
-    _safe_distance_grid,
     _saturating_add_int32,
     causal_map_rng_contract,
     causal_map_start,
@@ -610,130 +607,6 @@ def _routing_state(
     )
 
 
-def _legacy_safe_distance_grid(
-    source: jax.Array,
-    negative_cells: jax.Array,
-    config: CausalMapForagerConfig,
-) -> jax.Array:
-    """Return the former fixed-V relaxation for exact differential tests."""
-    infinity = jnp.asarray(config.height * config.width + 1, dtype=jnp.int32)
-    source_x, source_y = source[0], source[1]
-    passable = (~negative_cells).at[source_y, source_x].set(True)
-    distances = jnp.full(config.world_shape, infinity, dtype=jnp.int32)
-    distances = distances.at[source_y, source_x].set(0)
-
-    def relax(_index: int, current: jax.Array) -> jax.Array:
-        neighbor_minimum = jnp.minimum(
-            jnp.minimum(
-                jnp.roll(current, 1, axis=0),
-                jnp.roll(current, -1, axis=0),
-            ),
-            jnp.minimum(
-                jnp.roll(current, 1, axis=1),
-                jnp.roll(current, -1, axis=1),
-            ),
-        )
-        candidate = jnp.minimum(current, neighbor_minimum + 1)
-        return jnp.where(passable, candidate, infinity)
-
-    return jax.lax.fori_loop(
-        0,
-        config.height * config.width,
-        relax,
-        distances,
-    )
-
-
-def _host_safe_distance_grid(
-    source: tuple[int, int],
-    negative_cells: np.ndarray,
-) -> np.ndarray:
-    """Return an independent queue-BFS oracle for a small toroidal grid."""
-    height, width = negative_cells.shape
-    infinity = height * width + 1
-    source_x, source_y = source
-    passable = ~negative_cells.copy()
-    passable[source_y, source_x] = True
-    distances = np.full((height, width), infinity, dtype=np.int32)
-    distances[source_y, source_x] = 0
-    queue: deque[tuple[int, int]] = deque((source,))
-    while queue:
-        x, y = queue.popleft()
-        for dx, dy in _DIRECTION_STEPS:
-            neighbor_x = (x + dx) % width
-            neighbor_y = (y + dy) % height
-            if (
-                passable[neighbor_y, neighbor_x]
-                and distances[neighbor_y, neighbor_x] == infinity
-            ):
-                distances[neighbor_y, neighbor_x] = distances[y, x] + 1
-                queue.append((neighbor_x, neighbor_y))
-    return distances
-
-
-@pytest.mark.parametrize(
-    "world_shape",
-    ((1, 1), (1, 5), (5, 1), (2, 2), (2, 3), (3, 3)),
-)
-def test_safe_distance_grid_is_exact_for_every_small_toroidal_mask(
-    world_shape: tuple[int, int],
-) -> None:
-    """Degenerate, disconnected, and source-negative masks match queue BFS."""
-    config = CausalMapForagerConfig(world_shape=world_shape)
-    height, width = world_shape
-    cell_count = height * width
-    masks: list[np.ndarray] = []
-    sources: list[tuple[int, int]] = []
-    expected: list[np.ndarray] = []
-    for bits in range(1 << cell_count):
-        negative = np.asarray(
-            [(bits >> index) & 1 for index in range(cell_count)],
-            dtype=np.bool_,
-        ).reshape(world_shape)
-        for source_y in range(height):
-            for source_x in range(width):
-                source = (source_x, source_y)
-                masks.append(negative)
-                sources.append(source)
-                expected.append(_host_safe_distance_grid(source, negative))
-
-    distance_batch = jax.jit(
-        jax.vmap(lambda source, mask: _safe_distance_grid(source, mask, config))
-    )
-    actual = distance_batch(
-        jnp.asarray(sources, dtype=jnp.int32),
-        jnp.asarray(np.stack(masks), dtype=jnp.bool_),
-    )
-    np.testing.assert_array_equal(np.asarray(actual), np.stack(expected))
-
-
-def test_safe_distance_grid_early_exit_is_legacy_exact_under_jit_vmap() -> None:
-    """Convergence stopping preserves every legacy int32 distance sentinel."""
-    config = CausalMapForagerConfig()
-    rng = np.random.default_rng(20260731)
-    batch_size = 128
-    sources = np.column_stack(
-        (
-            rng.integers(config.width, size=batch_size),
-            rng.integers(config.height, size=batch_size),
-        )
-    ).astype(np.int32)
-    densities = np.linspace(0.0, 1.0, batch_size)[:, None, None]
-    negative_cells = rng.random((batch_size, config.height, config.width)) < densities
-
-    candidate = jax.jit(
-        jax.vmap(
-            lambda source, mask: _safe_distance_grid(source, mask, config)
-        )
-    )(jnp.asarray(sources), jnp.asarray(negative_cells))
-    legacy = jax.jit(
-        jax.vmap(
-            lambda source, mask: _legacy_safe_distance_grid(source, mask, config)
-        )
-    )(jnp.asarray(sources), jnp.asarray(negative_cells))
-    np.testing.assert_array_equal(np.asarray(candidate), np.asarray(legacy))
-
-
 def _host_cost_aware_route_grid(
     source: tuple[int, int],
     negative_cells: np.ndarray,
@@ -832,11 +705,12 @@ def test_safe_toroidal_routing_uses_wrap_and_routes_around_barriers() -> None:
         negatives=((1, 0), (4, 0)),
     )
     negative_mask = barrier_state.cell_channel == 0
-    distances = _safe_distance_grid(
+    crossing_risk, distances = _cost_aware_route_grid(
         jnp.asarray((2, 0), dtype=jnp.int32),
         negative_mask,
         config,
     )
+    assert int(crossing_risk[0, 0]) == 0
     assert int(distances[0, 0]) == 4
     planned, barrier_action = _choose_action(barrier_state, config)
     assert int(barrier_action) in (0, 2)
@@ -853,12 +727,6 @@ def test_safe_grid_marks_enclosure_but_cost_route_can_cross_with_explicit_fallba
     ring = ((2, 1), (3, 2), (2, 3), (1, 2))
     enclosed = _routing_state(config, target=(2, 2), negatives=ring)
     negative_mask = enclosed.cell_channel == 0
-    distances = _safe_distance_grid(
-        jnp.asarray((2, 2), dtype=jnp.int32),
-        negative_mask,
-        config,
-    )
-    assert int(distances[0, 0]) > config.height * config.width
     crossing_risk, crossing_distance = _cost_aware_route_grid(
         jnp.asarray((0, 0), dtype=jnp.int32),
         negative_mask,
@@ -2030,21 +1898,6 @@ def test_checkpoint_binds_initial_seed_to_agent() -> None:
         destination.load_state_dict(payload)
 
 
-def test_welford_merge_saturates_count_without_wraparound() -> None:
-    maximum = np.iinfo(np.int32).max
-    count, mean, m2 = _merge_channel_samples(
-        jnp.asarray((maximum,), dtype=jnp.int32),
-        jnp.asarray((5.0,), dtype=jnp.float32),
-        jnp.asarray((0.0,), dtype=jnp.float32),
-        jnp.asarray((0,), dtype=jnp.int32),
-        jnp.asarray((7.0,), dtype=jnp.float32),
-        jnp.asarray((True,)),
-    )
-    assert int(count[0]) == maximum
-    assert float(mean[0]) == 5.0
-    assert float(m2[0]) == 0.0
-
-
 def test_exact_interval_merge_saturates_count_without_wraparound() -> None:
     maximum = np.iinfo(np.int32).max
     result = _merge_channel_interval_bounds(
@@ -2077,18 +1930,6 @@ def test_exact_sample_merge_is_stable_canonical_and_chunk_invariant() -> None:
     mask = jnp.ones((81,), dtype=jnp.bool_)
     zero_i = jnp.zeros((1,), dtype=jnp.int32)
     zero_f = jnp.zeros((1,), dtype=jnp.float32)
-
-    raw = _merge_channel_samples(
-        zero_i,
-        zero_f,
-        zero_f,
-        channels,
-        samples.astype(jnp.float32),
-        mask,
-    )
-    assert int(raw[0][0]) == 81
-    assert float(raw[1][0]) == 1_000_040.0
-    assert float(raw[2][0]) == 44_280.0
 
     def merge(
         count: jax.Array,

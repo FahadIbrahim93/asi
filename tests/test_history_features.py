@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import cast
+
 import chex
 import jax
 import jax.numpy as jnp
@@ -123,14 +125,107 @@ class TestJitAndScan:
         s0 = ex.init()
         observations = jr.normal(jr.key(0), (50, 3))
 
-        def step_fn(state: HistoryFeatureState, obs: jax.Array):
-            aug, new_state = ex.step(state, obs)
+        def step_fn(
+            state: HistoryFeatureState,
+            obs: jax.Array,
+        ) -> tuple[HistoryFeatureState, jax.Array]:
+            aug, new_state = cast(
+                tuple[jax.Array, HistoryFeatureState],
+                ex.step(state, obs),
+            )
             return new_state, aug
 
         final_state, augmented = jax.lax.scan(step_fn, s0, observations)
         chex.assert_shape(augmented, (50, 6))
         chex.assert_tree_all_finite(augmented)
         chex.assert_tree_all_finite(final_state.traces)
+
+    def test_nonfinite_observation_holds_warm_traces_and_recovers(self) -> None:
+        ex = HistoryFeatureExtractor(
+            raw_dim=3,
+            decay_rates=(0.5, 0.9),
+            channels=(0, 2),
+        )
+        _, warm_state = ex.step(
+            ex.init(),
+            jnp.asarray([2.0, 4.0, 6.0], dtype=jnp.float32),
+        )
+
+        @jax.jit
+        def run(
+            state: HistoryFeatureState,
+            observation: jax.Array,
+        ) -> tuple[jax.Array, HistoryFeatureState]:
+            return cast(
+                tuple[jax.Array, HistoryFeatureState],
+                ex.step(state, observation),
+            )
+
+        augmented, held_state = run(
+            warm_state,
+            jnp.asarray([jnp.inf, 8.0, jnp.nan], dtype=jnp.float32),
+        )
+
+        chex.assert_tree_all_finite((augmented, held_state))
+        chex.assert_trees_all_equal(held_state, warm_state)
+        chex.assert_trees_all_equal(augmented[:3], jnp.asarray([0.0, 8.0, 0.0]))
+        chex.assert_trees_all_equal(augmented[3:], warm_state.traces.reshape(-1))
+
+        recovered_augmented, recovered_state = run(
+            held_state,
+            jnp.asarray([4.0, -2.0, 2.0], dtype=jnp.float32),
+        )
+
+        chex.assert_tree_all_finite((recovered_augmented, recovered_state))
+        chex.assert_trees_all_close(
+            recovered_state.traces,
+            jnp.asarray([[2.5, 2.5], [0.58, 0.74]], dtype=jnp.float32),
+        )
+
+    def test_untracked_nonfinite_coordinate_holds_raw_disabled_traces(self) -> None:
+        ex = HistoryFeatureExtractor(
+            raw_dim=3,
+            decay_rates=(0.5,),
+            channels=(0, 2),
+            include_raw=False,
+        )
+        _, warm_state = ex.step(
+            ex.init(),
+            jnp.asarray([2.0, 4.0, 6.0], dtype=jnp.float32),
+        )
+
+        augmented, held_state = ex.step(
+            warm_state,
+            jnp.asarray([10.0, jnp.inf, 14.0], dtype=jnp.float32),
+        )
+
+        chex.assert_tree_all_finite((augmented, held_state))
+        chex.assert_trees_all_equal(held_state, warm_state)
+        chex.assert_trees_all_equal(augmented, warm_state.traces.reshape(-1))
+
+    def test_finite_step_is_bitwise_unchanged(self) -> None:
+        ex = HistoryFeatureExtractor(
+            raw_dim=3,
+            decay_rates=(0.25, 0.75),
+            channels=(0, 2),
+        )
+        state = HistoryFeatureState(
+            traces=jnp.asarray([[1.0, -2.0], [3.0, 4.0]], dtype=jnp.float32)
+        )  # type: ignore[call-arg]
+        observation = jnp.asarray([8.0, -5.0, 6.0], dtype=jnp.float32)
+
+        augmented, next_state = ex.step(state, observation)
+        tracked = observation[jnp.asarray(ex.channels, dtype=jnp.int32)]
+        decay = jnp.asarray(ex.decay_rates, dtype=jnp.float32)[:, None]
+        expected_traces = decay * state.traces + (1.0 - decay) * tracked[None, :]
+        expected_augmented = jnp.concatenate([observation, expected_traces.reshape(-1)])
+
+        assert np.asarray(next_state.traces).tobytes() == np.asarray(
+            expected_traces
+        ).tobytes()
+        assert np.asarray(augmented).tobytes() == np.asarray(
+            expected_augmented
+        ).tobytes()
 
 
 class TestConfig:

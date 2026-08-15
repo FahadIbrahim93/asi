@@ -406,6 +406,20 @@ def test_construct_rejects_bad_cs_index():
         raise AssertionError("expected ValueError for invalid CS index")
 
 
+@pytest.mark.parametrize("contingency", [-0.1, 1.1, float("nan")])
+def test_construct_rejects_invalid_phase_contingency(contingency: float):
+    """Every phase contingency must be a finite probability."""
+    bad_phase = PavlovianPhase(
+        name="bad",
+        n_steps=10,
+        cs_us_contingency=contingency,
+        cs_active=(0,),
+    )
+
+    with pytest.raises(ValueError, match="cs_us_contingency must be in"):
+        ClassicalConditioningStream(phases=(bad_phase,), n_cs=1)
+
+
 def test_partial_reinforcement_rejects_invalid_p():
     """``p`` outside [0, 1] is rejected."""
     for bad_p in (-0.1, 1.1):

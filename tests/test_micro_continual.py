@@ -19,6 +19,7 @@ import json
 import math
 from pathlib import Path
 
+import chex
 import jax
 import jax.numpy as jnp
 import jax.random as jr
@@ -440,6 +441,59 @@ class TestBayesReference:
         active = np.asarray(jnp.sum(jnp.abs(diffs) > 0.0, axis=-1))
         assert active.max() <= 2 * config.component_sparsity
 
+    @pytest.mark.parametrize("compiled", [False, True])
+    @pytest.mark.parametrize(
+        ("scores", "expected_mask"),
+        [
+            ([0.5, 0.5, 0.5, 0.5, 0.5, 0.5], [True, True, False, False, False, False]),
+            ([0.1, 0.2, 0.2, 0.2, 0.9, 0.8], [True, True, False, False, False, False]),
+        ],
+    )
+    def test_component_sparsity_is_exact_and_stable_under_ties(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        compiled: bool,
+        scores: list[float],
+        expected_mask: list[bool],
+    ) -> None:
+        config = tiny(
+            "input_permutation",
+            dim=6,
+            n_classes=2,
+            n_components=2,
+            component_sparsity=2,
+            spectrum_decades=0.0,
+            component_scale=1.0,
+        )
+        component_shape = (config.n_classes, config.n_components, config.dim)
+
+        def fixed_normal(key, shape, dtype=jnp.float32):
+            del key
+            if shape == component_shape:
+                return jnp.ones(shape, dtype=dtype)
+            return jnp.zeros(shape, dtype=dtype)
+
+        def fixed_uniform(key, shape, dtype=jnp.float32):
+            del key
+            if shape == component_shape:
+                return jnp.broadcast_to(jnp.asarray(scores, dtype=dtype), shape)
+            return jnp.zeros(shape, dtype=dtype)
+
+        monkeypatch.setattr(
+            "alberta_framework.benchmarks.micro_continual.jr.normal", fixed_normal
+        )
+        monkeypatch.setattr(
+            "alberta_framework.benchmarks.micro_continual.jr.uniform", fixed_uniform
+        )
+        generate = jax.jit(lambda: class_geometry(config, seed=3)) if compiled else (
+            lambda: class_geometry(config, seed=3)
+        )
+        component_means, _ = generate()
+
+        actual_mask = component_means != 0.0
+        expected = jnp.broadcast_to(jnp.asarray(expected_mask), component_shape)
+        chex.assert_trees_all_equal(actual_mask, expected)
+
     def test_zero_component_scale_collapses_to_unimodal(self):
         config = tiny("input_permutation", component_scale=0.0)
         means, _ = class_geometry(config, seed=1)
@@ -639,6 +693,96 @@ class TestShards:
             atol=1e-8,
         )
 
+    @pytest.mark.parametrize("location", ["top-level", "nested"])
+    def test_load_rejects_duplicate_top_level_and_nested_keys(
+        self, tmp_path: Path, location: str
+    ):
+        payload = micro_shard_payload(self._result())
+        encoded = json.dumps(payload, separators=(",", ":"))
+        encoded_config = json.dumps(payload["stream_config"], separators=(",", ":"))
+        duplicate_config = '{"n_regimes":999,' + encoded_config[1:]
+        variants = {
+            "top-level": '{"suite_version":"forged",' + encoded[1:],
+            "nested": encoded.replace(
+                f'"stream_config":{encoded_config}',
+                f'"stream_config":{duplicate_config}',
+                1,
+            ),
+        }
+
+        path = tmp_path / f"duplicate-{location}.json"
+        path.write_text(variants[location], encoding="utf-8")
+        with pytest.raises(ValueError, match="duplicate JSON object key"):
+            load_micro_shard(path)
+
+    def test_load_rejects_invalid_wall_clock_types_and_values(self, tmp_path: Path):
+        payload = micro_shard_payload(self._result())
+        path = tmp_path / "bad-wall-clock.json"
+
+        for wall_clock in (
+            None,
+            True,
+            False,
+            "1.0",
+            [],
+            {},
+            math.inf,
+            -math.inf,
+            math.nan,
+            -1,
+            10**309,
+        ):
+            payload["wall_clock_seconds"] = wall_clock
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            message = (
+                "non-standard JSON numeric constant"
+                if type(wall_clock) is float and not math.isfinite(wall_clock)
+                else "wall_clock_seconds"
+            )
+            with pytest.raises(ValueError, match=message):
+                load_micro_shard(path)
+
+    @pytest.mark.parametrize("wall_clock", [0, 0.0, 1, 1.25, 1e308])
+    def test_load_preserves_valid_wall_clock(self, tmp_path: Path, wall_clock: int | float):
+        payload = micro_shard_payload(self._result())
+        payload["wall_clock_seconds"] = wall_clock
+        path = tmp_path / "valid-wall-clock.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+        loaded = load_micro_shard(path)["wall_clock_seconds"]
+        assert type(loaded) is float
+        assert loaded == float(wall_clock)
+
+    def test_merge_preserves_valid_wall_clock_summary(self, tmp_path: Path):
+        payload = micro_shard_payload(self._result())
+        paths = []
+        for seed, wall_clock in enumerate((0, 1.25)):
+            shard = json.loads(json.dumps(payload))
+            shard["seed"] = seed
+            shard["wall_clock_seconds"] = wall_clock
+            path = tmp_path / f"valid-wall-clock-{seed}.json"
+            path.write_text(json.dumps(shard), encoding="utf-8")
+            paths.append(path)
+
+        summary = merge_micro_shards(paths, bayes_samples=128)
+
+        assert summary["results"][0]["wall_clock_seconds_total"] == 1.25
+        assert summary["results"][0]["wall_clock_seconds_mean"] == 0.625
+
+    def test_merge_rejects_wall_clock_total_overflow(self, tmp_path: Path):
+        payload = micro_shard_payload(self._result())
+        paths = []
+        for seed in (0, 1):
+            shard = json.loads(json.dumps(payload))
+            shard["seed"] = seed
+            shard["wall_clock_seconds"] = 1e308
+            path = tmp_path / f"overflow-wall-clock-{seed}.json"
+            path.write_text(json.dumps(shard), encoding="utf-8")
+            paths.append(path)
+
+        with pytest.raises(ValueError, match="wall_clock_seconds_total must be finite"):
+            merge_micro_shards(paths, bayes_samples=128)
+
     def test_shard_path_convention(self, tmp_path: Path):
         path = micro_shard_path(tmp_path, "input_permutation", "gated_norm", 2)
         assert path.name == "input_permutation_gated_norm_seed2.json"
@@ -674,6 +818,47 @@ class TestShards:
         with pytest.raises(ValueError, match="per_regime_accuracy"):
             load_micro_shard(path)
 
+    @pytest.mark.parametrize(
+        ("fieldname", "bad_value"),
+        [
+            ("mechanism", ""),
+            ("hyperparameters", []),
+            ("family", "scale_shift"),
+            ("suite_version", "different-suite"),
+            ("suite_version", None),
+        ],
+    )
+    def test_load_rejects_invalid_shard_contract_field(
+        self, tmp_path: Path, fieldname: str, bad_value: object
+    ):
+        payload = micro_shard_payload(self._result())
+        payload[fieldname] = bad_value
+        path = tmp_path / "bad.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+        with pytest.raises(ValueError, match=fieldname):
+            load_micro_shard(path)
+
+    @pytest.mark.parametrize(
+        "environment",
+        [
+            None,
+            {},
+            {"jax": "test", "numpy": "test", "python": "test"},
+            {"jax": "", "numpy": "test", "python": "test", "platform": "test"},
+        ],
+    )
+    def test_load_rejects_incomplete_environment(
+        self, tmp_path: Path, environment: object
+    ):
+        payload = micro_shard_payload(self._result())
+        payload["environment"] = environment
+        path = tmp_path / "bad.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+        with pytest.raises(ValueError, match="environment must record"):
+            load_micro_shard(path)
+
     def test_merge_ranks_and_pairs(self, tmp_path: Path):
         paths = []
         for arm in ("sgd_raw", "naive_bayes"):
@@ -704,6 +889,53 @@ class TestShards:
         write_micro_shard(path_b, micro_shard_payload(result_b))
         with pytest.raises(ValueError, match="stream config"):
             merge_micro_shards([path_a, path_b], bayes_samples=1_000)
+
+    @pytest.mark.parametrize("fieldname", ["hyperparameters", "mechanism"])
+    def test_merge_rejects_arm_contract_drift(self, tmp_path: Path, fieldname: str):
+        payload_a = micro_shard_payload(self._result(seed=0))
+        payload_b = json.loads(json.dumps(payload_a))
+        payload_b["seed"] = 1
+        if fieldname == "hyperparameters":
+            payload_b[fieldname] = {**payload_b[fieldname], "step_size": 999.0}
+        else:
+            payload_b[fieldname] = "different-test-mechanism"
+
+        path_a = tmp_path / "a.json"
+        path_b = tmp_path / "b.json"
+        write_micro_shard(path_a, payload_a)
+        write_micro_shard(path_b, payload_b)
+
+        with pytest.raises(
+            ValueError,
+            match=rf"arm 'sgd_raw' has inconsistent {fieldname} across seeds",
+        ):
+            merge_micro_shards([path_a, path_b], bayes_samples=1_000)
+
+    def test_merge_rejects_environment_drift_and_records_environment(
+        self, tmp_path: Path
+    ):
+        payload_a = micro_shard_payload(self._result(seed=0))
+        payload_b = json.loads(json.dumps(payload_a))
+        payload_b["seed"] = 1
+        path_a = tmp_path / "a.json"
+        path_b = tmp_path / "b.json"
+        write_micro_shard(path_a, payload_a)
+        write_micro_shard(path_b, payload_b)
+
+        summary = merge_micro_shards([path_a, path_b], bayes_samples=1_000)
+        assert summary["environment"] == payload_a["environment"]
+
+        payload_b["environment"] = {
+            "jax": "0.0-test",
+            "numpy": "0.0-test",
+            "python": "0.0-test",
+            "platform": "different-test-platform",
+        }
+        drifted_path = tmp_path / "b-drifted.json"
+        write_micro_shard(drifted_path, payload_b)
+
+        with pytest.raises(ValueError, match="shards span multiple runtime environments"):
+            merge_micro_shards([path_a, drifted_path], bayes_samples=1_000)
 
 
 # =============================================================================
@@ -794,12 +1026,68 @@ class TestTransferValidation:
         report = transfer_validation_from_shards(paths)
         assert report["schema"] == MICRO_VALIDATION_SCHEMA
         assert report["family"] == TINY.family
+        assert report["environment"] == load_micro_shard(paths[0])["environment"]
         assert isinstance(report["transfer_valid"], bool)
         assert {c["name"] for c in report["checks"]} >= {
             "conditioning_dominates",
             "gate_small_positive",
             "adam_decays",
         }
+
+        changed = json.loads(paths[-1].read_text(encoding="utf-8"))
+        changed["environment"] = {
+            "jax": "0.0-test",
+            "numpy": "0.0-test",
+            "python": "0.0-test",
+            "platform": "different-test-platform",
+        }
+        changed_path = tmp_path / "changed-environment.json"
+        write_micro_shard(changed_path, changed)
+        with pytest.raises(ValueError, match="shards span multiple runtime environments"):
+            transfer_validation_from_shards([*paths[:-1], changed_path])
+
+    def test_from_shards_rejects_mixed_network_sizes(self, tmp_path: Path):
+        """The public transfer receipt must retain the shared width contract."""
+        paths = []
+        for arm in LADDER_ARMS:
+            hidden1, hidden2 = (7, 5) if arm == "gated_norm" else (8, 6)
+            result = run_micro_arm(
+                TINY,
+                arm,
+                seed=0,
+                hidden1=hidden1,
+                hidden2=hidden2,
+            )
+            path = micro_shard_path(tmp_path, TINY.family, arm, 0)
+            write_micro_shard(path, micro_shard_payload(result))
+            paths.append(path)
+
+        with pytest.raises(ValueError, match="network sizes"):
+            transfer_validation_from_shards(paths)
+
+    def test_from_shards_rejects_arm_contract_drift(self, tmp_path: Path):
+        paths = []
+        sgd_payload = None
+        for arm in LADDER_ARMS:
+            result = run_micro_arm(TINY, arm, seed=0, hidden1=8, hidden2=6)
+            payload = micro_shard_payload(result)
+            path = micro_shard_path(tmp_path, TINY.family, arm, 0)
+            write_micro_shard(path, payload)
+            paths.append(path)
+            if arm == "sgd_raw":
+                sgd_payload = payload
+        assert sgd_payload is not None
+        drifted = json.loads(json.dumps(sgd_payload))
+        drifted["seed"] = 1
+        drifted["mechanism"] = "different-test-mechanism"
+        drifted_path = micro_shard_path(tmp_path, TINY.family, "sgd_raw", 1)
+        write_micro_shard(drifted_path, drifted)
+
+        with pytest.raises(
+            ValueError,
+            match="arm 'sgd_raw' has inconsistent mechanism across seeds",
+        ):
+            transfer_validation_from_shards([*paths, drifted_path])
 
     def test_from_shards_rejects_non_m1(self, tmp_path: Path):
         config = tiny("scale_shift")

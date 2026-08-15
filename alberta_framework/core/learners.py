@@ -28,7 +28,7 @@ import chex
 import jax
 import jax.numpy as jnp
 from jax import Array
-from jaxtyping import Float
+from jaxtyping import Bool, Float
 
 from alberta_framework.core.initializers import sparse_init
 from alberta_framework.core.normalizers import (
@@ -68,6 +68,11 @@ from alberta_framework.core.types import (
     TDLearnerState,
     TDTimeStep,
 )
+from alberta_framework.core.update_safety import (
+    floating_tree_is_finite,
+    neutralize_array,
+    select_transaction,
+)
 from alberta_framework.streams.base import ScanStream
 
 # Type variable for TD stream state
@@ -97,12 +102,14 @@ class UpdateResult:
         error: Prediction error
         metrics: Array of metrics -- shape (3,) without normalizer,
             (4,) with normalizer
+        update_applied: Whether the complete learner transaction committed
     """
 
     state: LearnerState
     prediction: Prediction
     error: Float[Array, ""]
     metrics: Array
+    update_applied: Bool[Array, ""]
 
 
 @chex.dataclass(frozen=True)
@@ -121,6 +128,7 @@ class MLPUpdateResult:
     prediction: Prediction
     error: Float[Array, ""]
     metrics: Array
+    update_applied: Bool[Array, ""]
 
 
 class LinearLearner:
@@ -261,7 +269,7 @@ class LinearLearner:
         new_weights = state.weights + opt_update.weight_delta
         new_bias = state.bias + opt_update.bias_delta
 
-        new_state = LearnerState(
+        candidate_state = LearnerState(
             weights=new_weights,
             bias=new_bias,
             optimizer_state=opt_update.new_state,
@@ -286,11 +294,31 @@ class LinearLearner:
                 [squared_error, error, mean_step_size], dtype=jnp.float32
             )
 
+        inputs_valid = jnp.all(jnp.isfinite(observation)) & jnp.all(
+            jnp.isfinite(target)
+        )
+        update_applied = (
+            floating_tree_is_finite(state)
+            & inputs_valid
+            & opt_update.update_applied
+            & floating_tree_is_finite(candidate_state)
+            & jnp.all(jnp.isfinite(prediction))
+            & jnp.isfinite(error)
+            & jnp.all(jnp.isfinite(metrics))
+        )
+        new_state = select_transaction(
+            update_applied, candidate_state, state
+        ).replace(  # type: ignore[attr-defined]
+            birth_timestamp=state.birth_timestamp,
+            uptime_s=state.uptime_s,
+        )
+
         return UpdateResult(
             state=new_state,
-            prediction=prediction,
-            error=jnp.atleast_1d(error),
-            metrics=metrics,
+            prediction=neutralize_array(update_applied, prediction),
+            error=neutralize_array(update_applied, jnp.atleast_1d(error)),
+            metrics=neutralize_array(update_applied, metrics),
+            update_applied=update_applied,
         )
 
 
@@ -774,6 +802,18 @@ def metrics_to_dicts(metrics: Array, normalized: bool = False) -> list[dict[str,
 # =============================================================================
 
 
+def _update_from_gradient_with_diagnostics(
+    optimizer: Any,
+    state: Any,
+    gradient: Array,
+    *,
+    error: Array | None,
+) -> tuple[Array, Any, Bool[Array, ""]]:
+    """Use the checked optimizer boundary for an enclosing transaction."""
+    result = optimizer.update_from_gradient_checked(state, gradient, error=error)
+    return result.step, result.new_state, result.update_applied
+
+
 class MLPLearner:
     """Multi-layer perceptron with composable optimizer, bounder, and normalizer.
 
@@ -1235,10 +1275,14 @@ class MLPLearner:
 
         obs = observation
         new_normalizer_state = state.normalizer_state
+        normalizer_update_applied = jnp.asarray(True, dtype=jnp.bool_)
         if self._normalizer is not None and state.normalizer_state is not None:
-            obs, new_normalizer_state = self._normalizer.normalize(
+            normalizer_result = self._normalizer.normalize_with_diagnostics(
                 state.normalizer_state, observation
             )
+            obs = normalizer_result.normalized
+            new_normalizer_state = normalizer_result.state
+            normalizer_update_applied = normalizer_result.update_applied
 
         # Forward pass for prediction
         prediction_val = self._forward(
@@ -1280,14 +1324,21 @@ class MLPLearner:
         n_trace_entries = len(new_traces)
         all_steps = []
         new_opt_states = []
+        optimizer_updates_applied = []
         for j in range(n_trace_entries):
             is_output = self._head_optimizer is not None and j >= n_trace_entries - 2
             opt = self._head_optimizer if is_output else self._optimizer
-            step, new_opt = opt.update_from_gradient(
-                state.optimizer_states[j], new_traces[j], error=error
+            step, new_opt, optimizer_update_applied = (
+                _update_from_gradient_with_diagnostics(
+                    opt,
+                    state.optimizer_states[j],
+                    new_traces[j],
+                    error=error,
+                )
             )
             all_steps.append(step)
             new_opt_states.append(new_opt)
+            optimizer_updates_applied.append(optimizer_update_applied)
 
         # Bounding (optional)
         bounding_metric = jnp.array(1.0, dtype=jnp.float32)
@@ -1323,7 +1374,7 @@ class MLPLearner:
                 for i in range(len(self._hidden_sizes))
             )
 
-        new_state = MLPLearnerState(
+        proposed_state = MLPLearnerState(
             params=new_params,
             optimizer_states=tuple(new_opt_states),
             traces=tuple(new_traces),
@@ -1333,6 +1384,20 @@ class MLPLearner:
             birth_timestamp=state.birth_timestamp,
             uptime_s=state.uptime_s,
         )
+        # Inf target/obs, or a 0*inf ObGD apply, would commit NaN weights.
+        # MultiHead already refuses that; keep the previous finite state.
+        inputs_valid = jnp.all(jnp.isfinite(observation)) & jnp.isfinite(target_scalar)
+        update_applied = (
+            inputs_valid
+            & floating_tree_is_finite(state)
+            & floating_tree_is_finite(proposed_state)
+            & normalizer_update_applied
+            & jnp.all(jnp.stack(optimizer_updates_applied))
+            & jnp.isfinite(prediction_val)
+            & jnp.isfinite(error)
+            & jnp.isfinite(bounding_metric)
+        )
+        new_state = jax.lax.cond(update_applied, lambda: proposed_state, lambda: state)
 
         squared_error = error**2
 
@@ -1349,9 +1414,14 @@ class MLPLearner:
 
         return MLPUpdateResult(
             state=new_state,
-            prediction=prediction,
-            error=jnp.atleast_1d(error),
-            metrics=metrics,
+            prediction=jnp.where(update_applied, prediction, jnp.zeros_like(prediction)),
+            error=jnp.where(
+                update_applied,
+                jnp.atleast_1d(error),
+                jnp.zeros_like(jnp.atleast_1d(error)),
+            ),
+            metrics=jnp.where(update_applied, metrics, jnp.zeros_like(metrics)),
+            update_applied=update_applied,
         )
 
 
@@ -1599,6 +1669,7 @@ class TDUpdateResult:
     prediction: Prediction
     td_error: Float[Array, ""]
     metrics: Float[Array, " 4"]
+    update_applied: Bool[Array, ""]
 
 
 class TDLinearLearner:
@@ -1706,7 +1777,7 @@ class TDLinearLearner:
         new_weights = state.weights + opt_update.weight_delta
         new_bias = state.bias + opt_update.bias_delta
 
-        new_state = TDLearnerState(
+        candidate_state = TDLearnerState(
             weights=new_weights,
             bias=new_bias,
             optimizer_state=opt_update.new_state,
@@ -1724,11 +1795,34 @@ class TDLinearLearner:
             dtype=jnp.float32,
         )
 
+        inputs_valid = (
+            jnp.all(jnp.isfinite(observation))
+            & jnp.all(jnp.isfinite(reward))
+            & jnp.all(jnp.isfinite(next_observation))
+            & jnp.all(jnp.isfinite(gamma))
+        )
+        update_applied = (
+            floating_tree_is_finite(state)
+            & inputs_valid
+            & opt_update.update_applied
+            & floating_tree_is_finite(candidate_state)
+            & jnp.all(jnp.isfinite(prediction))
+            & jnp.isfinite(td_error)
+            & jnp.all(jnp.isfinite(metrics))
+        )
+        new_state = select_transaction(
+            update_applied, candidate_state, state
+        ).replace(  # type: ignore[attr-defined]
+            birth_timestamp=state.birth_timestamp,
+            uptime_s=state.uptime_s,
+        )
+
         return TDUpdateResult(
             state=new_state,
-            prediction=prediction,
-            td_error=jnp.atleast_1d(td_error),
-            metrics=metrics,
+            prediction=neutralize_array(update_applied, prediction),
+            td_error=neutralize_array(update_applied, jnp.atleast_1d(td_error)),
+            metrics=neutralize_array(update_applied, metrics),
+            update_applied=update_applied,
         )
 
 
@@ -1759,6 +1853,7 @@ class TrueOnlineTDUpdateResult:
     next_prediction: Prediction
     td_error: Float[Array, ""]
     metrics: Float[Array, " 4"]
+    update_applied: Bool[Array, ""]
 
 
 class TrueOnlineTDLearner:
@@ -1839,7 +1934,7 @@ class TrueOnlineTDLearner:
         stored_traces = jnp.where(terminal, jnp.zeros_like(new_traces), new_traces)
         stored_bias_trace = jnp.where(terminal, 0.0, new_bias_trace)
         new_v_old = jnp.where(terminal, 0.0, next_value)
-        new_state = TrueOnlineTDState(
+        proposed_state = TrueOnlineTDState(
             weights=new_weights,
             bias=new_bias,
             eligibility_traces=stored_traces,
@@ -1849,21 +1944,55 @@ class TrueOnlineTDLearner:
             birth_timestamp=state.birth_timestamp,
             uptime_s=state.uptime_s,
         )
+        # Inf reward * a silent feature is 0*inf = NaN in the Dutch-trace
+        # update. Hold the previous finite state.
+        inputs_valid = (
+            jnp.all(jnp.isfinite(observation))
+            & jnp.isfinite(jnp.squeeze(reward))
+            & jnp.all(jnp.isfinite(next_observation))
+            & jnp.isfinite(gamma_scalar)
+        )
+        proposed_finite = (
+            jnp.all(jnp.isfinite(proposed_state.weights))
+            & jnp.isfinite(proposed_state.bias)
+            & jnp.all(jnp.isfinite(proposed_state.eligibility_traces))
+            & jnp.isfinite(proposed_state.bias_eligibility_trace)
+            & jnp.isfinite(proposed_state.v_old)
+        )
+        update_applied = inputs_valid & floating_tree_is_finite(state) & proposed_finite
+        new_state = jax.lax.cond(
+            update_applied,
+            lambda: proposed_state,
+            lambda: state,
+        )
         metrics = jnp.array(
             [
                 td_error**2,
                 td_error,
-                jnp.mean(jnp.abs(new_traces)),
-                new_v_old,
+                jnp.mean(jnp.abs(new_state.eligibility_traces)),
+                new_state.v_old,
             ],
             dtype=jnp.float32,
         )
         return TrueOnlineTDUpdateResult(
             state=new_state,
-            prediction=jnp.atleast_1d(value),
-            next_prediction=jnp.atleast_1d(next_value),
-            td_error=jnp.atleast_1d(td_error),
-            metrics=metrics,
+            prediction=jnp.where(
+                update_applied,
+                jnp.atleast_1d(value),
+                jnp.zeros_like(jnp.atleast_1d(value)),
+            ),
+            next_prediction=jnp.where(
+                update_applied,
+                jnp.atleast_1d(next_value),
+                jnp.zeros_like(jnp.atleast_1d(next_value)),
+            ),
+            td_error=jnp.where(
+                update_applied,
+                jnp.atleast_1d(td_error),
+                jnp.zeros_like(jnp.atleast_1d(td_error)),
+            ),
+            metrics=jnp.where(update_applied, metrics, jnp.zeros_like(metrics)),
+            update_applied=update_applied,
         )
 
 

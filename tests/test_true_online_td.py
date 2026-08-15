@@ -49,6 +49,35 @@ class TestInit:
         pred = learner.predict(state, jnp.array([1.0, 2.0, 3.0]))
         chex.assert_trees_all_close(pred, jnp.array([0.0]))
 
+    def test_inf_reward_silent_feature_holds_finite_state(self) -> None:
+        """Inf reward * a silent feature is 0*inf = NaN in the Dutch-trace update.
+
+        Fail-closed: keep the previous finite weights, traces, and v_old.
+        """
+        learner = TrueOnlineTDLearner(step_size=0.1, trace_decay=0.5)
+        state = learner.init(2)
+        obs = jnp.array([0.0, 1.0], dtype=jnp.float32)
+        nxt = jnp.zeros(2, dtype=jnp.float32)
+        result = learner.update(
+            state,
+            obs,
+            jnp.array(jnp.inf, dtype=jnp.float32),
+            nxt,
+            jnp.array(0.0, dtype=jnp.float32),
+        )
+        assert bool(jnp.all(jnp.isfinite(result.state.weights)))
+        assert bool(jnp.isfinite(result.state.bias))
+        assert bool(jnp.all(jnp.isfinite(result.state.eligibility_traces)))
+        assert bool(jnp.isfinite(result.state.v_old))
+        chex.assert_trees_all_close(result.state.weights, state.weights)
+        chex.assert_trees_all_close(result.state.eligibility_traces, state.eligibility_traces)
+        chex.assert_trees_all_close(result.state.v_old, state.v_old)
+        assert not bool(result.update_applied)
+        chex.assert_trees_all_close(result.td_error, jnp.zeros_like(result.td_error))
+        chex.assert_trees_all_close(result.metrics, jnp.zeros_like(result.metrics))
+        assert bool(jnp.all(jnp.isfinite(result.prediction)))
+        assert bool(jnp.all(jnp.isfinite(result.next_prediction)))
+
 
 # =============================================================================
 # TD(0) equivalence to supervised LMS for one-step gamma=0 supervision

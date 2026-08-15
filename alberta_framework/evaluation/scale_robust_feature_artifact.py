@@ -1558,6 +1558,13 @@ def _reject_json_constant(value: str) -> NoReturn:
     raise ValueError(f"non-standard JSON constant is forbidden: {value}")
 
 
+def _parse_finite_json_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError(f"non-finite JSON number is forbidden: {value}")
+    return parsed
+
+
 def _object_without_duplicates(
     pairs: list[tuple[str, object]],
 ) -> dict[str, object]:
@@ -1575,6 +1582,7 @@ def load_evidence_artifact(path: Path) -> dict[str, object]:
     loaded = json.loads(
         path.read_text(encoding="utf-8"),
         parse_constant=_reject_json_constant,
+        parse_float=_parse_finite_json_float,
         object_pairs_hook=_object_without_duplicates,
     )
     if not isinstance(loaded, dict):

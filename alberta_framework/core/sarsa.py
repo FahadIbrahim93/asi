@@ -504,9 +504,11 @@ class SARSAAgent:
             state.last_observation,
         )[:n_actions]
 
-        # SARSA target: r + gamma * Q(s', a') with terminal handling
-        effective_gamma = jnp.where(terminated, 0.0, gamma)
-        sarsa_target = reward + effective_gamma * q_next[next_action]
+        # SARSA target: r + gamma * Q(s', a') with terminal handling.
+        # A terminal transition must not multiply Q(s', a'); 0 * inf is NaN.
+        q_sa_next = q_next[next_action]
+        bootstrap = jnp.where(terminated, 0.0, gamma * q_sa_next)
+        sarsa_target = reward + bootstrap
 
         # Build cumulants: NaN for all except last_action gets sarsa_target
         cumulants = jnp.full(self._horde.n_demons, jnp.nan, dtype=jnp.float32)
@@ -538,12 +540,13 @@ class SARSAAgent:
         new_learner_state = horde_result.state
         if self._lamda > 0.0:
             gl = jnp.asarray(gamma * self._lamda, dtype=jnp.float32)
-            carry = 1.0 - jnp.asarray(terminated, dtype=jnp.float32)
             head_traces = list(new_learner_state.head_traces)
             for i in range(n_actions):
                 w_trace, b_trace = head_traces[i]
-                decay = jnp.where(state.last_action == i, 1.0, gl) * carry
-                head_traces[i] = (decay * w_trace, decay * b_trace)
+                decay = jnp.where(state.last_action == i, 1.0, gl)
+                new_w = jnp.where(terminated, jnp.zeros_like(w_trace), decay * w_trace)
+                new_b = jnp.where(terminated, jnp.zeros_like(b_trace), decay * b_trace)
+                head_traces[i] = (new_w, new_b)
             new_learner_state = new_learner_state.replace(head_traces=tuple(head_traces))
 
         # TD error for the taken action

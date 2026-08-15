@@ -354,8 +354,10 @@ class TestPairedTests:
 class TestIdenticalWilcoxonRejection:
     """All-zero paired differences fail closed before version-dependent SciPy behavior."""
 
-    def test_wilcoxon_rejects_identical_samples_without_warning(self) -> None:
-        values = [0.91, 0.88, 0.95]
+    @pytest.mark.parametrize("values", [[0.91], [0.91, 0.88, 0.95]])
+    def test_wilcoxon_rejects_identical_samples_without_warning(
+        self, values: list[float]
+    ) -> None:
         with warnings.catch_warnings():
             warnings.simplefilter("error")
             with pytest.raises(
@@ -376,6 +378,7 @@ class TestIdenticalWilcoxonRejection:
         assert result.test_name == "Wilcoxon signed-rank"
         assert result.statistic == pytest.approx(0.0)
         assert result.p_value < 1.0
+        assert result.effect_size == cohens_d([1.0, 2.0, 3.0], [0.5, 1.5, 2.5])
 
 
 class TestOneSampleRejection:
@@ -419,6 +422,21 @@ class TestOneSampleRejection:
         with pytest.raises(ValueError, match="equal-length"):
             ttest_comparison([1.0, 2.0], [1.0, 2.0, 3.0], paired=True)
 
+    def test_wilcoxon_mismatched_lengths_raise_before_scipy(self) -> None:
+        with pytest.raises(ValueError, match="equal-length"):
+            wilcoxon_comparison([1.0, 2.0], [1.0, 2.0, 3.0])
+
+    @pytest.mark.parametrize("values_a, values_b", [([], []), ([1.0], [2.0])])
+    def test_wilcoxon_requires_two_pairs_without_warning(
+        self,
+        values_a: list[float],
+        values_b: list[float],
+    ) -> None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with pytest.raises(ValueError, match="at least 2 pairs"):
+                wilcoxon_comparison(values_a, values_b)
+
     def test_unpaired_ttest_length_one_raises_without_runtime_warning(self) -> None:
         with warnings.catch_warnings():
             warnings.simplefilter("error")
@@ -448,6 +466,24 @@ class TestOneSampleRejection:
             with pytest.raises(ValueError, match="non-empty groups"):
                 ttest_comparison(values_a, values_b, paired=False)
 
+    @pytest.mark.parametrize(
+        ("values_a", "values_b"),
+        [
+            ([], [1.0, 2.0]),
+            ([1.0, 2.0], []),
+            ([], []),
+            (np.array([], dtype=np.float64), np.array([1.0, 2.0], dtype=np.float64)),
+            (np.array([1.0, 2.0], dtype=np.float64), np.array([], dtype=np.float64)),
+        ],
+    )
+    def test_mann_whitney_empty_group_raises_without_warning(
+        self, values_a: list[float] | np.ndarray, values_b: list[float] | np.ndarray
+    ) -> None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with pytest.raises(ValueError, match="non-empty groups"):
+                mann_whitney_comparison(values_a, values_b)
+
     def test_mann_whitney_length_one_contract_unchanged(self) -> None:
         res = mann_whitney_comparison([1.0], [2.0])
         assert res.p_value == pytest.approx(1.0)
@@ -460,6 +496,11 @@ class TestOneSampleRejection:
 
 
 class TestCorrections:
+    def test_bonferroni_empty_p_values(self) -> None:
+        significant, corrected_alpha = bonferroni_correction([], alpha=0.05)
+        assert significant == []
+        assert corrected_alpha == 0.05
+
     def test_bonferroni_hand_computed(self) -> None:
         significant, corrected_alpha = bonferroni_correction([0.01, 0.02, 0.04], alpha=0.05)
         assert corrected_alpha == pytest.approx(0.05 / 3)

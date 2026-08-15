@@ -32,6 +32,10 @@ import jax.random as jr
 from jax import Array
 from jaxtyping import Float, Int, PRNGKeyArray
 
+from alberta_framework._fixed_count_selection import (
+    require_positive_builtin_int,
+    stable_smallest_mask,
+)
 from alberta_framework.core.types import TimeStep
 
 # =============================================================================
@@ -100,8 +104,8 @@ class OutOfClassPolynomialStream:
             n_tasks: Number of supervised output heads.
             n_contexts: Number of recurring relevance contexts.
             context_length: Steps before switching context.
-            active_triples_per_context: Expected active triple products per
-                task/context.
+            active_triples_per_context: Number of active triple products per
+                task/context, capped at the available triple count.
             feature_std: Standard deviation of raw observations.
             linear_scale: Scale of the small direct linear component.
             noise_std: Standard deviation of target noise.
@@ -117,8 +121,10 @@ class OutOfClassPolynomialStream:
             raise ValueError("n_contexts must be positive")
         if context_length < 1:
             raise ValueError("context_length must be positive")
-        if active_triples_per_context < 1:
-            raise ValueError("active_triples_per_context must be positive")
+        active_triples_per_context = require_positive_builtin_int(
+            active_triples_per_context,
+            name="active_triples_per_context",
+        )
 
         self._feature_dim = feature_dim
         self._n_tasks = n_tasks
@@ -192,8 +198,7 @@ class OutOfClassPolynomialStream:
             (self._n_contexts, self._n_tasks, n_triples),
             dtype=jnp.float32,
         )
-        threshold = jnp.sort(mask_scores, axis=-1)[..., active_count - 1 : active_count]
-        mask = mask_scores <= threshold
+        mask = stable_smallest_mask(mask_scores, active_count)
         context_weights = dense_context_weights * mask.astype(jnp.float32)
         norm = jnp.sqrt(jnp.maximum(jnp.sum(mask, axis=-1, keepdims=True), 1.0))
         context_weights = context_weights / norm

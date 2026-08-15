@@ -20,6 +20,7 @@ import ctypes
 import errno
 import hashlib
 import json
+import math
 import os
 import re
 import secrets
@@ -205,6 +206,13 @@ def _reject_nonfinite(value: str) -> NoReturn:
     raise ForagerMatchedSealError(f"non-finite JSON number {value!r} is forbidden")
 
 
+def _parse_finite_json_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ForagerMatchedSealError(f"non-finite JSON number {value!r} is forbidden")
+    return parsed
+
+
 def _validate_json_complexity(value: Any, label: str) -> None:
     pending: list[tuple[Any, int]] = [(value, 0)]
     nodes = 0
@@ -232,6 +240,7 @@ def _decode_canonical(raw: bytes, label: str) -> dict[str, Any]:
             raw.decode("utf-8"),
             object_pairs_hook=_reject_duplicate_keys,
             parse_constant=_reject_nonfinite,
+            parse_float=_parse_finite_json_float,
         )
     except ForagerMatchedSealError:
         raise

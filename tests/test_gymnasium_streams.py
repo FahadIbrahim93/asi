@@ -146,6 +146,18 @@ class TestGymnasiumStreamValueMode:
         # So targets with estimator should generally be larger
         assert sum(targets_with_estimator) > sum(targets_without)
 
+    def test_zero_gamma_skips_inf_bootstrap(self) -> None:
+        """gamma=0 is the next reward; 0 * inf V(s') is NaN.
+
+        Fail-closed: a zero discount does not multiply the bootstrap value.
+        """
+        env = gymnasium.make("CartPole-v1")
+        stream = GymnasiumStream(env, mode=PredictionMode.VALUE, gamma=0.0, seed=0)
+        stream.set_value_estimator(lambda _obs: float("inf"))
+        target = stream._construct_target(1.25, jnp.ones(4, dtype=jnp.float32), terminated=False)
+        assert bool(jnp.isfinite(target).all())
+        assert float(target[0]) == pytest.approx(1.25)
+
 
 class TestGymnasiumStreamAutoReset:
     """Tests for auto-reset behavior on episode boundaries."""
@@ -305,6 +317,17 @@ class TestTDStream:
         # Non-terminal targets with V(s')=5 should be larger: r + 0.99*5 vs r + 0.99*0
         # At least some should be larger (terminal states will be the same)
         assert sum(targets_with_value) > sum(targets_zero)
+
+    def test_zero_gamma_skips_inf_value_function(self) -> None:
+        """gamma=0 times inf V(s') is NaN in TDStream targets.
+
+        Fail-closed: a zero discount does not multiply the value function.
+        """
+        env = gymnasium.make("CartPole-v1")
+        stream = TDStream(env, gamma=0.0, seed=0)
+        stream.update_value_function(lambda _obs: float("inf"))
+        target = next(stream).target
+        assert bool(jnp.isfinite(target).all())
 
     def test_episode_tracking(self):
         """TDStream should track episode count."""
@@ -488,6 +511,23 @@ class TestCollectTrajectoryValueMode:
         assert bool(jnp.all(bootstrapped | terminal))
         # Random CartPole rollouts of 60 steps contain non-terminal steps.
         assert bool(jnp.any(bootstrapped))
+
+    def test_zero_gamma_skips_inf_bootstrap(self) -> None:
+        """gamma=0 times inf V(s') is NaN in collected VALUE targets.
+
+        Fail-closed: a zero discount does not multiply the estimator.
+        """
+        env = gymnasium.make("CartPole-v1")
+        _, targets = collect_trajectory(
+            env,
+            None,
+            num_steps=20,
+            mode=PredictionMode.VALUE,
+            seed=11,
+            value_estimator=lambda _obs: float("inf"),
+            gamma=0.0,
+        )
+        assert bool(jnp.all(jnp.isfinite(targets)))
 
     def test_estimator_receives_next_observation(self):
         """The bootstrap value is computed from the next observation."""

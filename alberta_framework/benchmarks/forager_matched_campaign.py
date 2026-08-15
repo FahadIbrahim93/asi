@@ -24,6 +24,7 @@ import fcntl
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -33,7 +34,7 @@ import tempfile
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Final, NoReturn, cast
 
@@ -249,6 +250,13 @@ def _reject_nonfinite(value: str) -> NoReturn:
     raise ForagerMatchedCampaignError(f"non-finite JSON number {value!r}")
 
 
+def _parse_finite_json_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ForagerMatchedCampaignError(f"non-finite JSON number {value!r}")
+    return parsed
+
+
 def _decode_canonical(raw: bytes, label: str) -> dict[str, Any]:
     if not raw or len(raw) > _MAX_JSON_BYTES or raw.startswith(b"\xef\xbb\xbf"):
         raise ForagerMatchedCampaignError(f"{label} violates the JSON byte contract")
@@ -257,6 +265,7 @@ def _decode_canonical(raw: bytes, label: str) -> dict[str, Any]:
             raw.decode("ascii"),
             object_pairs_hook=_reject_duplicate_keys,
             parse_constant=_reject_nonfinite,
+            parse_float=_parse_finite_json_float,
         )
     except ForagerMatchedCampaignError:
         raise
@@ -268,15 +277,6 @@ def _decode_canonical(raw: bytes, label: str) -> dict[str, Any]:
     if raw != canonical_json_bytes(result):
         raise ForagerMatchedCampaignError(f"{label} is not canonical JSON")
     return result
-
-
-def _safe_relative(value: str, label: str) -> PurePosixPath:
-    if not value or "\x00" in value or "\\" in value:
-        raise ForagerMatchedCampaignError(f"{label} is not a safe relative path")
-    path = PurePosixPath(value)
-    if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
-        raise ForagerMatchedCampaignError(f"{label} is not a safe relative path")
-    return path
 
 
 def _regular_directory(path: Path, label: str) -> Path:

@@ -98,7 +98,7 @@ import os
 import platform
 import tempfile
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -110,8 +110,16 @@ import jax.random as jr
 import numpy as np
 from jax import Array
 
+from alberta_framework._seed_validation import (
+    require_jax_seed,
+    require_unique_jax_seeds,
+)
 from alberta_framework.core.baseline_optimizers import Adam
 from alberta_framework.core.canonical_upgd import CanonicalUPGD, CanonicalUPGDConfig
+from alberta_framework.core.update_safety import (
+    floating_tree_is_finite,
+    select_transaction,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -407,9 +415,30 @@ def cross_entropy_loss(
 
 
 LearnerInitFn = Callable[[dict[str, Array]], Any]
+
+
+@chex.dataclass(frozen=True, mappable_dataclass=False)
+class LearnerUpdateResult:
+    """Checked learner step with backward-compatible two-value unpacking.
+
+    Existing benchmark and screening callers unpack learner steps as
+    ``params, state = step_fn(...)``.  Iteration deliberately preserves that
+    surface while ``update_applied`` makes an atomic rejection observable to
+    callers that need the checked contract.
+    """
+
+    params: dict[str, Array]
+    state: Any
+    update_applied: Array
+
+    def __iter__(self) -> Iterator[Any]:
+        yield self.params
+        yield self.state
+
+
 LearnerStepFn = Callable[
     [dict[str, Array], Any, dict[str, Array], Array],
-    tuple[dict[str, Array], Any],
+    tuple[dict[str, Array], Any] | LearnerUpdateResult,
 ]
 
 
@@ -567,17 +596,36 @@ def _make_adamw_learner(hp: dict[str, float]) -> tuple[LearnerInitFn, LearnerSte
 
     def step_fn(
         params: dict[str, Array], state: dict[str, Any], grads: dict[str, Array], key: Array
-    ) -> tuple[dict[str, Array], dict[str, Any]]:
+    ) -> LearnerUpdateResult:
         del key  # AdamW is deterministic
-        new_params: dict[str, Array] = {}
-        new_state: dict[str, Any] = {}
+        candidate_params: dict[str, Array] = {}
+        candidate_state: dict[str, Any] = {}
+        update_applied = jnp.asarray(True, dtype=jnp.bool_)
         for name, value in params.items():
-            step_arr, leaf_state = optimizer.update_from_gradient(
+            leaf_update = optimizer.update_from_gradient_checked(
                 state[name], grads[name], error=None, param=value
             )
-            new_params[name] = value - step_arr
-            new_state[name] = leaf_state
-        return new_params, new_state
+            candidate_params[name] = value - leaf_update.step
+            candidate_state[name] = leaf_update.new_state
+            update_applied = update_applied & leaf_update.update_applied
+
+        # A finite optimizer step can still overflow when it is applied to a
+        # finite parameter.  The learner owns the enclosing transaction, so
+        # validate and select the complete parameter and optimizer-state
+        # trees only after every leaf candidate has been assembled.
+        update_applied = (
+            update_applied
+            & floating_tree_is_finite(params)
+            & floating_tree_is_finite(state)
+            & floating_tree_is_finite(grads)
+            & floating_tree_is_finite(candidate_params)
+            & floating_tree_is_finite(candidate_state)
+        )
+        return LearnerUpdateResult(
+            params=select_transaction(update_applied, candidate_params, params),
+            state=select_transaction(update_applied, candidate_state, state),
+            update_applied=update_applied,
+        )  # type: ignore[call-arg]
 
     return init_fn, step_fn
 
@@ -679,6 +727,7 @@ def run_ipmnist(
     Returns:
         Host-side result arrays; see :class:`IPMNISTRunResult`.
     """
+    seed_tuple = require_unique_jax_seeds(seeds, name="seeds")
     if config is None:
         config = IPMNISTConfig()
     if noise_mode not in ("step", "pool"):
@@ -702,9 +751,6 @@ def run_ipmnist(
     if n_train < config.task_length:
         raise ValueError("dataset smaller than task_length; cannot sample without replacement")
 
-    seed_tuple = tuple(int(seed) for seed in seeds)
-    if not seed_tuple:
-        raise ValueError("at least one seed is required")
     seeds_array = jnp.asarray(seed_tuple, dtype=jnp.uint32)
 
     use_pool = noise_mode == "pool" and learner in _STOCHASTIC_LEARNERS
@@ -986,10 +1032,7 @@ def _validate_result_set(
             raise ValueError(f"result key {learner!r} does not match payload learner")
         if result.config != config:
             raise ValueError(f"{learner}: result config does not match artifact config")
-        if not result.seeds:
-            raise ValueError(f"{learner}: at least one seed is required")
-        if len(set(result.seeds)) != len(result.seeds):
-            raise ValueError(f"{learner}: duplicate seed ids")
+        require_unique_jax_seeds(result.seeds, name=f"{learner} seeds")
 
 
 def _study_design_payload(results: Mapping[str, IPMNISTRunResult]) -> dict[str, object]:
@@ -1124,7 +1167,8 @@ _V2_PARTIAL_FIELDS = {
 
 def partial_payload(result: IPMNISTRunResult) -> dict[str, Any]:
     """Serialize one run shard with the strict, nonpromoting v2 schema."""
-    if len(result.seeds) != 1:
+    seeds = require_unique_jax_seeds(result.seeds, name="result seeds")
+    if len(seeds) != 1:
         raise ValueError("a v2 partial must contain exactly one seed")
     if result.noise_mode != "step":
         raise ValueError(
@@ -1137,7 +1181,7 @@ def partial_payload(result: IPMNISTRunResult) -> dict[str, Any]:
         "evidence_policy": dict(NONPROMOTING_POLICY),
         "learner": result.learner,
         "hyperparameters": result.hyperparameters,
-        "seed_id": result.seeds[0],
+        "seed_id": seeds[0],
         "seed_count": 1,
         "config": result.config.to_config(),
         "matches_selected_publication_configuration": (
@@ -1166,10 +1210,17 @@ def _strict_json_object(path: Path) -> dict[str, Any]:
     def reject_constant(value: str) -> object:
         raise ValueError(f"non-finite JSON constant is forbidden: {value}")
 
+    def parse_float(value: str) -> float:
+        parsed = float(value)
+        if not math.isfinite(parsed):
+            raise ValueError(f"non-finite JSON number is forbidden: {value}")
+        return parsed
+
     payload = json.loads(
         Path(path).read_text(encoding="utf-8"),
         object_pairs_hook=pairs_hook,
         parse_constant=reject_constant,
+        parse_float=parse_float,
     )
     if not isinstance(payload, dict):
         raise ValueError(f"{path}: payload must be one JSON object")
@@ -1180,9 +1231,11 @@ def _v2_partial_manifest(paths: Sequence[Path]) -> list[dict[str, object]]:
     """Bind supplied v2 shard bytes to exact learner/seed identities."""
     def identity(entry: Mapping[str, object]) -> tuple[str, int]:
         learner = entry["learner"]
-        seed = entry["seed_id"]
-        if not isinstance(learner, str) or type(seed) is not int:
+        if not isinstance(learner, str):
             raise ValueError("v2 partial manifest contains an invalid identity")
+        seed = require_jax_seed(
+            entry["seed_id"], name="v2 partial manifest seed_id"
+        )
         return learner, seed
 
     entries: list[dict[str, object]] = []
@@ -1193,9 +1246,11 @@ def _v2_partial_manifest(paths: Sequence[Path]) -> list[dict[str, object]]:
         if payload.get("schema") != PARTIAL_SCHEMA:
             raise ValueError(f"{path}: partial manifest accepts only strict v2 shards")
         learner = payload.get("learner")
-        seed = payload.get("seed_id")
-        if not isinstance(learner, str) or type(seed) is not int:
+        if not isinstance(learner, str):
             raise ValueError(f"{path}: partial manifest identity is invalid")
+        seed = require_jax_seed(
+            payload.get("seed_id"), name=f"{path}: partial manifest seed_id"
+        )
         entries.append(
             {
                 "learner": learner,
@@ -1261,20 +1316,18 @@ def _validated_partial_payload(
 
     raw_seeds = payload.get(seed_field)
     if schema == PARTIAL_SCHEMA:
-        if type(raw_seeds) is not int or raw_seeds < 0:
-            raise ValueError(f"{path}: seed_id must be one non-negative integer")
-        seed_ids = [raw_seeds]
+        seed_ids = list(
+            require_unique_jax_seeds((raw_seeds,), name=f"{path}: seed_id")
+        )
         seed_count = payload.get("seed_count")
         if type(seed_count) is not int or seed_count != 1:
             raise ValueError(f"{path}: seed_count must equal one")
     else:
         if not isinstance(raw_seeds, list) or not raw_seeds:
             raise ValueError(f"{path}: {seed_field} must be a non-empty list")
-        if any(type(seed) is not int or seed < 0 for seed in raw_seeds):
-            raise ValueError(f"{path}: {seed_field} must contain non-negative integers")
-        if len(set(raw_seeds)) != len(raw_seeds):
-            raise ValueError(f"{path}: duplicate seed ids within shard")
-        seed_ids = raw_seeds
+        seed_ids = list(
+            require_unique_jax_seeds(raw_seeds, name=f"{path}: {seed_field}")
+        )
 
     expected_shape = (len(seed_ids), config.n_tasks)
     matrix_bounds = {
@@ -1428,14 +1481,15 @@ def main_v2_compat(argv: Sequence[str] | None = None) -> None:
         if name not in _LEARNER_FACTORIES:
             raise SystemExit(f"unknown learner {name!r}")
 
+    if args.seed_list is not None:
+        raw_seeds = [int(part) for part in args.seed_list.split(",") if part.strip()]
+    else:
+        raw_seeds = list(range(args.seed_start, args.seed_start + args.seeds))
+    seeds = require_unique_jax_seeds(raw_seeds, name="seeds")
+
     logger.info("loading MNIST from data_home=%s", data_home)
     data_x, data_y = load_mnist_train(data_home)
     logger.info("train split: x=%s y=%s", data_x.shape, data_y.shape)
-
-    if args.seed_list is not None:
-        seeds = [int(part) for part in args.seed_list.split(",") if part.strip()]
-    else:
-        seeds = list(range(args.seed_start, args.seed_start + args.seeds))
     results = {}
     for name in learners:
         logger.info("running %s for %d seeds x %d steps", name, len(seeds), config.n_steps)

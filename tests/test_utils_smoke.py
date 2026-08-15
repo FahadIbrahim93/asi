@@ -104,6 +104,25 @@ def _aggregated(name: str, seed_offset: int, n_steps: int = 120) -> AggregatedRe
     )
 
 
+def _aggregated_from_error(name: str, error: np.ndarray) -> AggregatedResults:
+    finals = error[:, -1]
+    return AggregatedResults(
+        config_name=name,
+        seeds=list(range(error.shape[0])),
+        metric_arrays={"squared_error": error},
+        summary={
+            "squared_error": MetricSummary(
+                mean=float(finals.mean()),
+                std=float(finals.std()),
+                min=float(finals.min()),
+                max=float(finals.max()),
+                n_seeds=error.shape[0],
+                values=finals,
+            )
+        },
+    )
+
+
 @pytest.fixture
 def results() -> dict[str, AggregatedResults]:
     return {"lms": _aggregated("lms", 0), "idbd": _aggregated("idbd", 1)}
@@ -121,6 +140,75 @@ def test_plot_learning_curves_returns_figure_and_axes(results) -> None:
     assert ax.figure is fig
     assert len(ax.lines) == 2
     assert {line.get_label() for line in ax.lines} == {"lms", "idbd"}
+
+
+def test_plot_learning_curves_omits_future_informed_running_mean_padding() -> None:
+    values = np.arange(6, dtype=float)[None, :]
+    result = _aggregated_from_error("linear", values)
+
+    _, ax = plot_learning_curves(
+        {"linear": result},
+        window_size=3,
+        show_ci=False,
+        log_scale=False,
+    )
+
+    np.testing.assert_array_equal(ax.lines[0].get_xdata(), np.arange(2, 6))
+    np.testing.assert_allclose(ax.lines[0].get_ydata(), (1.0, 2.0, 3.0, 4.0))
+
+
+def test_plot_learning_curves_preserves_short_input_coordinates() -> None:
+    result = _aggregated_from_error("short", np.array([[2.0, 4.0]]))
+
+    _, ax = plot_learning_curves(
+        {"short": result},
+        window_size=3,
+        show_ci=False,
+        log_scale=False,
+    )
+
+    np.testing.assert_array_equal(ax.lines[0].get_xdata(), (0, 1))
+    np.testing.assert_array_equal(ax.lines[0].get_ydata(), (2.0, 4.0))
+
+
+def test_plot_learning_curves_aligns_multiseed_confidence_band() -> None:
+    values = np.array(
+        [
+            [0.0, 2.0, 4.0, 6.0],
+            [2.0, 4.0, 6.0, 8.0],
+        ]
+    )
+    result = _aggregated_from_error("multiseed", values)
+
+    _, ax = plot_learning_curves(
+        {"multiseed": result},
+        window_size=2,
+        show_ci=True,
+        log_scale=False,
+    )
+
+    expected_steps = np.arange(1, 4)
+    np.testing.assert_array_equal(ax.lines[0].get_xdata(), expected_steps)
+    np.testing.assert_allclose(ax.lines[0].get_ydata(), (2.0, 4.0, 6.0))
+    assert len(ax.collections) == 1
+    band_x = np.unique(ax.collections[0].get_paths()[0].vertices[:, 0])
+    np.testing.assert_array_equal(band_x, expected_steps)
+
+
+def test_create_comparison_figure_uses_causal_learning_curve_coordinates() -> None:
+    values = np.vstack(
+        [
+            np.arange(1.0, 103.0),
+            np.arange(3.0, 105.0),
+        ]
+    )
+    result = _aggregated_from_error("comparison", values)
+
+    fig = create_comparison_figure({"comparison": result})
+    learning_ax = next(ax for ax in fig.axes if ax.get_title() == "Learning Curves")
+
+    np.testing.assert_array_equal(learning_ax.lines[0].get_xdata(), (99, 100, 101))
+    np.testing.assert_allclose(learning_ax.lines[0].get_ydata(), (51.5, 52.5, 53.5))
 
 
 def test_plot_final_performance_bars(results) -> None:

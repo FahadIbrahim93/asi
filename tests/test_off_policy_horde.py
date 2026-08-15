@@ -14,7 +14,7 @@ from alberta_framework.core.off_policy_horde import (
     OffPolicyHordeUpdateResult,
     run_off_policy_horde_learning_loop,
 )
-from alberta_framework.core.optimizers import LMS
+from alberta_framework.core.optimizers import LMS, ObGDBounding
 from alberta_framework.core.types import DemonType, GVFSpec, HordeSpec, create_horde_spec
 
 
@@ -118,6 +118,246 @@ def test_ratio_zero_blocks_that_demon_update() -> None:
     assert float(jnp.linalg.norm(result.state.head_params.weights[1] - before_w1)) > 0.0
     assert float(result.clipped_rhos[0]) == pytest.approx(0.0)
     assert float(result.clipped_rhos[1]) == pytest.approx(2.0)
+
+
+def test_infinite_cumulant_with_obgd_does_not_poison_head() -> None:
+    """Inf TD error zeros the ObGD step, then error_i*step is 0*inf=NaN."""
+    learner = OffPolicyHordeLearner(
+        _spec(gammas=(0.0, 0.0)),
+        hidden_sizes=(),
+        optimizer=LMS(step_size=0.1),
+        bounder=ObGDBounding(kappa=2.0),
+        ratio_clip=10.0,
+        sparsity=0.0,
+        use_layer_norm=False,
+    )
+    state = learner.init(2, jax.random.key(0))
+    before_w0 = state.head_params.weights[0]
+    before_w1 = state.head_params.weights[1]
+
+    poisoned = learner.update_with_ratios(
+        state,
+        jnp.array([1.0, 0.0], dtype=jnp.float32),
+        jnp.array([jnp.inf, 1.0], dtype=jnp.float32),
+        jnp.zeros(2, dtype=jnp.float32),
+        jnp.array([1.0, 1.0], dtype=jnp.float32),
+    )
+    assert bool(jnp.all(jnp.isfinite(poisoned.state.head_params.weights[0])))
+    chex.assert_trees_all_close(poisoned.state.head_params.weights[0], before_w0)
+    assert bool(jnp.all(jnp.isfinite(poisoned.state.head_params.weights[1])))
+    assert float(
+        jnp.linalg.norm(poisoned.state.head_params.weights[1] - before_w1)
+    ) > 0.0
+    assert int(poisoned.state.step_count) == int(state.step_count) + 1
+    assert bool(poisoned.update_applied)
+    chex.assert_trees_all_equal(
+        poisoned.head_updates_applied,
+        jnp.array([False, True]),
+    )
+    assert float(poisoned.td_errors[0]) == 0.0
+
+    recovered = learner.update_with_ratios(
+        poisoned.state,
+        jnp.array([1.0, 0.0], dtype=jnp.float32),
+        jnp.array([1.0, 0.5], dtype=jnp.float32),
+        jnp.zeros(2, dtype=jnp.float32),
+        jnp.array([1.0, 1.0], dtype=jnp.float32),
+    )
+    chex.assert_tree_all_finite(recovered.state.head_params)
+    assert bool(recovered.update_applied)
+    assert bool(jnp.all(recovered.head_updates_applied))
+
+
+def test_zero_discount_ignores_nonfinite_next_observation_under_jit() -> None:
+    """A terminal head must not evaluate an irrelevant bootstrap value."""
+    learner = OffPolicyHordeLearner(
+        _spec(gammas=(0.0,)),
+        hidden_sizes=(),
+        optimizer=LMS(step_size=0.1),
+        sparsity=0.0,
+        use_layer_norm=False,
+    )
+    state = learner.init(2, jax.random.key(19))
+    observation = jnp.array([1.0, -0.5], dtype=jnp.float32)
+    nonfinite_next = jnp.array([jnp.inf, 0.0], dtype=jnp.float32)
+    assert not bool(jnp.isfinite(learner.predict(state, nonfinite_next)[0]))
+
+    result = learner.update_with_ratios_and_discounts(
+        state,
+        observation,
+        jnp.array([1.25], dtype=jnp.float32),
+        nonfinite_next,
+        jnp.ones(1, dtype=jnp.float32),
+        jnp.zeros(1, dtype=jnp.float32),
+    )
+
+    assert bool(result.update_applied)
+    chex.assert_trees_all_equal(result.head_updates_applied, jnp.array([True]))
+    chex.assert_trees_all_close(result.td_targets, jnp.array([1.25]))
+    chex.assert_trees_all_close(result.next_predictions, jnp.zeros(1))
+    chex.assert_tree_all_finite(result.state)
+    assert int(result.state.step_count) == int(state.step_count) + 1
+    assert float(
+        jnp.linalg.norm(result.state.head_params.weights[0] - state.head_params.weights[0])
+    ) > 0.0
+
+
+def test_nonzero_discount_rejects_nonfinite_next_then_recovers_under_jit() -> None:
+    learner = OffPolicyHordeLearner(
+        _spec(gammas=(0.9,)),
+        hidden_sizes=(),
+        optimizer=LMS(step_size=0.1),
+        sparsity=0.0,
+        use_layer_norm=False,
+    )
+    state = learner.init(2, jax.random.key(20))
+    observation = jnp.array([1.0, -0.5], dtype=jnp.float32)
+    cumulants = jnp.array([1.0], dtype=jnp.float32)
+    rhos = jnp.ones(1, dtype=jnp.float32)
+    discounts = jnp.array([0.9], dtype=jnp.float32)
+
+    rejected = learner.update_with_ratios_and_discounts(
+        state,
+        observation,
+        cumulants,
+        jnp.array([jnp.inf, 0.0], dtype=jnp.float32),
+        rhos,
+        discounts,
+    )
+    assert not bool(rejected.update_applied)
+    chex.assert_trees_all_equal(rejected.head_updates_applied, jnp.array([False]))
+    chex.assert_trees_all_close(rejected.state, state)
+    chex.assert_trees_all_close(rejected.next_predictions, jnp.zeros(1))
+    chex.assert_trees_all_close(rejected.td_targets, jnp.zeros(1))
+
+    recovered = learner.update_with_ratios_and_discounts(
+        rejected.state,
+        observation,
+        cumulants,
+        jnp.array([0.25, -0.25], dtype=jnp.float32),
+        rhos,
+        discounts,
+    )
+    assert bool(recovered.update_applied)
+    chex.assert_trees_all_equal(recovered.head_updates_applied, jnp.array([True]))
+    chex.assert_tree_all_finite(recovered.state)
+    assert int(recovered.state.step_count) == int(state.step_count) + 1
+
+
+def test_mixed_discounts_isolate_nonfinite_next_to_consuming_head() -> None:
+    learner = OffPolicyHordeLearner(
+        _spec(gammas=(0.0, 0.9)),
+        hidden_sizes=(),
+        optimizer=LMS(step_size=0.1),
+        sparsity=0.0,
+        use_layer_norm=False,
+    )
+    state = learner.init(2, jax.random.key(21))
+    next_observation = jnp.array([jnp.inf, 0.0], dtype=jnp.float32)
+    assert bool(jnp.all(~jnp.isfinite(learner.predict(state, next_observation))))
+
+    result = learner.update_with_ratios_and_discounts(
+        state,
+        jnp.array([1.0, -0.5], dtype=jnp.float32),
+        jnp.array([1.25, 0.5], dtype=jnp.float32),
+        next_observation,
+        jnp.ones(2, dtype=jnp.float32),
+        jnp.array([0.0, 0.9], dtype=jnp.float32),
+    )
+
+    assert bool(result.update_applied)
+    chex.assert_trees_all_equal(
+        result.head_updates_applied,
+        jnp.array([True, False]),
+    )
+    chex.assert_trees_all_close(result.td_targets, jnp.array([1.25, 0.0]))
+    chex.assert_trees_all_close(result.next_predictions, jnp.zeros(2))
+    assert float(
+        jnp.linalg.norm(result.state.head_params.weights[0] - state.head_params.weights[0])
+    ) > 0.0
+    chex.assert_trees_all_close(
+        result.state.head_params.weights[1],
+        state.head_params.weights[1],
+    )
+    chex.assert_trees_all_close(
+        result.state.head_params.biases[1],
+        state.head_params.biases[1],
+    )
+    chex.assert_trees_all_close(
+        result.state.head_traces[1],
+        state.head_traces[1],
+    )
+    chex.assert_trees_all_close(
+        result.state.head_optimizer_states[1],
+        state.head_optimizer_states[1],
+    )
+
+
+def test_terminal_lifetime_counter_rejects_entire_update_under_jit() -> None:
+    """An exhausted outer clock cannot commit parameters or report success."""
+    learner = OffPolicyHordeLearner(
+        _spec(gammas=(0.0,)),
+        hidden_sizes=(),
+        optimizer=LMS(step_size=0.1),
+        sparsity=0.0,
+        use_layer_norm=False,
+    )
+    state = learner.init(2, jax.random.key(17)).replace(
+        step_count=jnp.asarray(jnp.iinfo(jnp.int32).max, dtype=jnp.int32),
+        step_words=jnp.full(
+            (2,), jnp.iinfo(jnp.uint32).max, dtype=jnp.uint32
+        ),
+    )
+
+    rejected = learner.update_with_ratios(
+        state,
+        jnp.array([1.0, -0.5], dtype=jnp.float32),
+        jnp.array([1.0], dtype=jnp.float32),
+        jnp.zeros(2, dtype=jnp.float32),
+        jnp.ones(1, dtype=jnp.float32),
+    )
+
+    assert not bool(rejected.update_applied)
+    chex.assert_trees_all_close(rejected.state, state)
+    chex.assert_trees_all_equal(
+        rejected.head_updates_applied, jnp.array([False])
+    )
+    chex.assert_trees_all_close(rejected.predictions, jnp.zeros(1))
+    chex.assert_trees_all_close(rejected.td_errors, jnp.zeros(1))
+    chex.assert_trees_all_close(rejected.per_demon_metrics, jnp.zeros((1, 6)))
+    assert float(rejected.trunk_bounding_metric) == 0.0
+
+
+def test_invalid_lifetime_counter_rejects_then_repaired_state_recovers() -> None:
+    """Counter inconsistency is transient once an authorized state is restored."""
+    learner = OffPolicyHordeLearner(
+        _spec(gammas=(0.0,)),
+        hidden_sizes=(),
+        optimizer=LMS(step_size=0.1),
+        sparsity=0.0,
+        use_layer_norm=False,
+    )
+    initial = learner.init(2, jax.random.key(18))
+    invalid = initial.replace(
+        step_words=jnp.array([0, 1], dtype=jnp.uint32),
+    )
+    inputs = (
+        jnp.array([1.0, -0.5], dtype=jnp.float32),
+        jnp.array([1.0], dtype=jnp.float32),
+        jnp.zeros(2, dtype=jnp.float32),
+        jnp.ones(1, dtype=jnp.float32),
+    )
+
+    rejected = learner.update_with_ratios(invalid, *inputs)
+    assert not bool(rejected.update_applied)
+    chex.assert_trees_all_close(rejected.state, invalid)
+
+    recovered = learner.update_with_ratios(initial, *inputs)
+    assert bool(recovered.update_applied)
+    assert int(recovered.state.step_count) == 1
+    chex.assert_trees_all_equal(
+        recovered.state.step_words, jnp.array([0, 1], dtype=jnp.uint32)
+    )
 
 
 def test_probability_api_matches_explicit_ratios() -> None:

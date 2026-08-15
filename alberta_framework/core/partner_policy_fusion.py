@@ -874,22 +874,6 @@ class PartnerPolicyFusion:
         if messages.available.shape != (cfg.max_partners,) or messages.available.dtype != jnp.bool_:
             raise ValueError("message availability has the wrong shape or dtype")
 
-    def _model_features(self, context_features: Array, confidence: Array) -> Array:
-        """Construct one finite normalized contextual reliability feature row."""
-
-        safe_context = jnp.where(jnp.isfinite(context_features), context_features, 0.0)
-        normalized_context = jnp.clip(
-            safe_context / jnp.float32(self._config.max_abs_context), -1.0, 1.0
-        )
-        safe_confidence = jnp.where(jnp.isfinite(confidence), confidence, 0.0)
-        return jnp.concatenate(
-            (
-                jnp.ones((1,), dtype=jnp.float32),
-                normalized_context,
-                jnp.reshape(jnp.clip(safe_confidence, 0.0, 1.0), (1,)),
-            )
-        )
-
     def decide(
         self,
         state: PartnerPolicyFusionState,

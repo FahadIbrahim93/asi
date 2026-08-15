@@ -46,6 +46,9 @@ from jax import Array
 from jax.nn.initializers import lecun_normal
 
 from alberta_framework.core.initializers import sparse_init
+from alberta_framework.core.update_safety import (
+    floating_tree_is_finite as _floating_tree_is_finite,
+)
 
 _FLOAT32_MAX = float(np.finfo(np.float32).max)
 _FLOAT32_TINY = float(np.finfo(np.float32).tiny)
@@ -212,6 +215,7 @@ class RecurrentTraceActorCriticUpdateResult(NamedTuple):
     critic_step_size: Array
     actor_obgd_scale: Array
     critic_obgd_scale: Array
+    update_applied: Array
 
 
 class ObGDUpdate(NamedTuple):
@@ -220,6 +224,7 @@ class ObGDUpdate(NamedTuple):
     updates: Any
     step_size: Array
     scale: Array
+    update_applied: Array
 
 
 class AdaptiveObGDUpdate(NamedTuple):
@@ -229,6 +234,7 @@ class AdaptiveObGDUpdate(NamedTuple):
     second_moment: Any
     step_size: Array
     scale: Array
+    update_applied: Array
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1236,20 +1242,37 @@ def obgd_update(
     z_sum = jnp.asarray(0.0, dtype=signal.dtype)
     for leaf in jax.tree_util.tree_leaves(traces):
         z_sum = z_sum + jnp.sum(jnp.abs(leaf))
-    denominator = jnp.maximum(
-        1.0,
-        jnp.asarray(alpha, dtype=signal.dtype)
-        * jnp.asarray(kappa, dtype=signal.dtype)
-        * jnp.maximum(jnp.abs(signal), 1.0)
-        * z_sum,
-    )
+    alpha_array = jnp.asarray(alpha, dtype=signal.dtype)
+    kappa_array = jnp.asarray(kappa, dtype=signal.dtype)
+    bound_term = alpha_array * kappa_array * jnp.maximum(jnp.abs(signal), 1.0) * z_sum
+    denominator = jnp.maximum(1.0, bound_term)
     scale = jnp.reciprocal(denominator)
-    step_size = jnp.asarray(alpha, dtype=signal.dtype) * scale
-    updates = jax.tree_util.tree_map(
+    step_size = alpha_array * scale
+    proposed_updates = jax.tree_util.tree_map(
         lambda trace: step_size * signal * trace,
         traces,
     )
-    return ObGDUpdate(updates=updates, step_size=step_size, scale=scale)
+    update_applied = (
+        jnp.isfinite(signal)
+        & jnp.isfinite(alpha_array)
+        & (alpha_array >= 0.0)
+        & jnp.isfinite(kappa_array)
+        & (kappa_array >= 0.0)
+        & _floating_tree_is_finite(traces)
+        & _floating_tree_is_finite(proposed_updates)
+        & jnp.isfinite(step_size)
+        & jnp.isfinite(scale)
+    )
+    updates = jax.tree_util.tree_map(
+        lambda proposed: jnp.where(update_applied, proposed, jnp.zeros_like(proposed)),
+        proposed_updates,
+    )
+    return ObGDUpdate(
+        updates=updates,
+        step_size=jnp.where(update_applied, step_size, jnp.zeros_like(step_size)),
+        scale=jnp.where(update_applied, scale, jnp.zeros_like(scale)),
+        update_applied=update_applied,
+    )
 
 
 def adaptive_obgd_update(
@@ -1282,7 +1305,7 @@ def adaptive_obgd_update(
 
     beta = jnp.asarray(beta2, dtype=signal.dtype)
     epsilon_array = jnp.asarray(epsilon, dtype=signal.dtype)
-    new_second_moment = jax.tree_util.tree_map(
+    proposed_second_moment = jax.tree_util.tree_map(
         lambda previous, trace: (
             beta * previous
             + (1.0 - beta) * jnp.square(signal * trace)
@@ -1293,7 +1316,7 @@ def adaptive_obgd_update(
     bias_correction = 1.0 - beta ** step_array
     corrected_second_moment = jax.tree_util.tree_map(
         lambda moment: moment / bias_correction,
-        new_second_moment,
+        proposed_second_moment,
     )
     normalized_traces = jax.tree_util.tree_map(
         lambda trace, corrected: trace / (jnp.sqrt(corrected) + epsilon_array),
@@ -1304,24 +1327,54 @@ def adaptive_obgd_update(
     z_sum = jnp.asarray(0.0, dtype=signal.dtype)
     for leaf in jax.tree_util.tree_leaves(normalized_traces):
         z_sum = z_sum + jnp.sum(jnp.abs(leaf))
-    denominator = jnp.maximum(
-        1.0,
+    bound_term = (
         jnp.maximum(jnp.abs(signal), 1.0)
         * z_sum
         * jnp.asarray(alpha, dtype=signal.dtype)
-        * jnp.asarray(kappa, dtype=signal.dtype),
+        * jnp.asarray(kappa, dtype=signal.dtype)
     )
+    denominator = jnp.maximum(1.0, bound_term)
     scale = jnp.reciprocal(denominator)
     step_size = jnp.asarray(alpha, dtype=signal.dtype) / denominator
-    updates = jax.tree_util.tree_map(
+    proposed_updates = jax.tree_util.tree_map(
         lambda normalized_trace: step_size * signal * normalized_trace,
         normalized_traces,
+    )
+    alpha_array = jnp.asarray(alpha, dtype=signal.dtype)
+    kappa_array = jnp.asarray(kappa, dtype=signal.dtype)
+    update_applied = (
+        jnp.isfinite(signal)
+        & jnp.isfinite(alpha_array)
+        & (alpha_array >= 0.0)
+        & jnp.isfinite(kappa_array)
+        & (kappa_array >= 0.0)
+        & jnp.isfinite(beta)
+        & (beta >= 0.0)
+        & (beta < 1.0)
+        & jnp.isfinite(epsilon_array)
+        & (epsilon_array > 0.0)
+        & _floating_tree_is_finite(traces)
+        & _floating_tree_is_finite(second_moment)
+        & _floating_tree_is_finite(proposed_second_moment)
+        & _floating_tree_is_finite(proposed_updates)
+        & jnp.isfinite(step_size)
+        & jnp.isfinite(scale)
+    )
+    updates = jax.tree_util.tree_map(
+        lambda proposed: jnp.where(update_applied, proposed, jnp.zeros_like(proposed)),
+        proposed_updates,
+    )
+    new_second_moment = jax.tree_util.tree_map(
+        lambda proposed, previous: jnp.where(update_applied, proposed, previous),
+        proposed_second_moment,
+        second_moment,
     )
     return AdaptiveObGDUpdate(
         updates=updates,
         second_moment=new_second_moment,
-        step_size=step_size,
-        scale=scale,
+        step_size=jnp.where(update_applied, step_size, jnp.zeros_like(step_size)),
+        scale=jnp.where(update_applied, scale, jnp.zeros_like(scale)),
+        update_applied=update_applied,
     )
 
 
@@ -2497,6 +2550,8 @@ class RecurrentTraceActorCriticAgent:
             critic_step_size = critic_adaptive_obgd.step_size
             actor_obgd_scale = actor_adaptive_obgd.scale
             critic_obgd_scale = critic_adaptive_obgd.scale
+            actor_update_applied = actor_adaptive_obgd.update_applied
+            critic_update_applied = critic_adaptive_obgd.update_applied
         else:
             actor_legacy_obgd = obgd_update(
                 actor_traces,
@@ -2518,6 +2573,8 @@ class RecurrentTraceActorCriticAgent:
             critic_step_size = critic_legacy_obgd.step_size
             actor_obgd_scale = actor_legacy_obgd.scale
             critic_obgd_scale = critic_legacy_obgd.scale
+            actor_update_applied = actor_legacy_obgd.update_applied
+            critic_update_applied = critic_legacy_obgd.update_applied
         actor_params = cast(
             RTUNetworkParameters,
             jax.tree_util.tree_map(
@@ -2607,7 +2664,7 @@ class RecurrentTraceActorCriticAgent:
             parameter_delta=critic_rtu_delta,
         )
 
-        updated = parameter_state.replace(
+        proposed_state = parameter_state.replace(
             actor_rtu_state=next_actor_state,
             critic_rtu_state=next_critic_state,
             actor_sensitivities=next_actor_sensitivities,
@@ -2622,24 +2679,56 @@ class RecurrentTraceActorCriticAgent:
             last_observation=stored_raw_observation,
             step_count=step_count,
         )
-        next_action, key, next_policy = self.select_action(updated)
-        updated = updated.replace(
+        candidate_applied = (
+            actor_update_applied
+            & critic_update_applied
+            & _floating_tree_is_finite(state)
+            & _floating_tree_is_finite(proposed_state)
+            & state.started
+            & (state.last_action >= 0)
+            & (state.last_action < self._config.n_actions)
+        )
+        action_state = jax.lax.cond(
+            candidate_applied,
+            lambda: proposed_state,
+            lambda: state,
+        )
+        next_action, key, next_policy = self.select_action(action_state)
+        committed_state = proposed_state.replace(
             last_action=next_action,
             rng_key=key,
         )
+        update_applied = (
+            candidate_applied
+            & _floating_tree_is_finite(committed_state)
+            & jnp.all(jnp.isfinite(next_policy))
+            & (next_action >= 0)
+            & (next_action < self._config.n_actions)
+        )
+        updated = jax.lax.cond(
+            update_applied,
+            lambda: committed_state,
+            lambda: state,
+        )
+        zero = jnp.asarray(0.0, dtype=jnp.float32)
         return RecurrentTraceActorCriticUpdateResult(
             state=updated,
-            action=next_action,
-            policy=next_policy,
-            value=value,
-            next_value=next_value,
-            td_error=td_error,
-            entropy=current_entropy,
-            normalized_reward=normalized_reward,
-            actor_step_size=actor_step_size,
-            critic_step_size=critic_step_size,
-            actor_obgd_scale=actor_obgd_scale,
-            critic_obgd_scale=critic_obgd_scale,
+            action=jnp.where(
+                update_applied,
+                next_action,
+                jnp.asarray(0, dtype=jnp.int32),
+            ),
+            policy=jnp.where(update_applied, next_policy, jnp.zeros_like(next_policy)),
+            value=jnp.where(update_applied, value, zero),
+            next_value=jnp.where(update_applied, next_value, zero),
+            td_error=jnp.where(update_applied, td_error, zero),
+            entropy=jnp.where(update_applied, current_entropy, zero),
+            normalized_reward=jnp.where(update_applied, normalized_reward, zero),
+            actor_step_size=jnp.where(update_applied, actor_step_size, zero),
+            critic_step_size=jnp.where(update_applied, critic_step_size, zero),
+            actor_obgd_scale=jnp.where(update_applied, actor_obgd_scale, zero),
+            critic_obgd_scale=jnp.where(update_applied, critic_obgd_scale, zero),
+            update_applied=update_applied,
         )
 
 

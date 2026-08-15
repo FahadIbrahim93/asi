@@ -493,6 +493,27 @@ def test_keyboard_chord_learner_max_norm_bounds_vector() -> None:
     assert float(jnp.linalg.norm(updated.chord_vector)) <= 0.750001
 
 
+def test_keyboard_chord_learner_infinite_reward_does_not_poison_vector() -> None:
+    """Inf advantage * a zero chord coordinate is 0*inf = NaN."""
+    cfg = KeyboardChordLearnerConfig(n_options=3, step_size=0.1, max_norm=10.0)
+    state = init_keyboard_chord_learner(cfg)
+    selected = jnp.array([0.0, 1.0, 0.0], dtype=jnp.float32)
+
+    poisoned = update_keyboard_chord_learner(
+        cfg, state, selected, jnp.array(jnp.inf, dtype=jnp.float32)
+    )
+    chex.assert_trees_all_close(poisoned.chord_vector, state.chord_vector)
+    chex.assert_trees_all_close(poisoned.reward_baseline, state.reward_baseline)
+    assert int(poisoned.step_count) == int(state.step_count)
+
+    recovered = update_keyboard_chord_learner(
+        cfg, poisoned, selected, jnp.array(1.0, dtype=jnp.float32)
+    )
+    chex.assert_tree_all_finite(recovered.chord_vector)
+    chex.assert_tree_all_finite(recovered.reward_baseline)
+    assert int(recovered.step_count) == int(state.step_count) + 1
+
+
 # ---------------------------------------------------------------------------
 # Smoke test
 # ---------------------------------------------------------------------------

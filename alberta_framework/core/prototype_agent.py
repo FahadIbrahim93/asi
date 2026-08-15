@@ -199,7 +199,7 @@ def feature_to_subtask_specs(
 
     Args:
         oak_state: Current OaK state.
-        n_subtasks: Number of subtask specs to return.
+        n_subtasks: Non-negative integer scalar number of subtask specs to return.
         threshold: Pseudo-reward threshold for subtask completion.
         pseudo_reward_scale: Pseudo-reward multiplier for generated specs.
         max_option_steps: Hard cap on option duration.
@@ -208,6 +208,15 @@ def feature_to_subtask_specs(
         Tuple of up to ``n_subtasks`` :class:`SubtaskSpec` instances, ordered
         by descending feature importance.
     """
+    if isinstance(n_subtasks, bool):
+        raise ValueError("n_subtasks must be a non-negative integer")
+    try:
+        normalized_n_subtasks = operator.index(n_subtasks)
+    except TypeError as exc:
+        raise ValueError("n_subtasks must be a non-negative integer") from exc
+    if normalized_n_subtasks < 0:
+        raise ValueError("n_subtasks must be a non-negative integer")
+
     bls = oak_state.stomp_state.base_learner_state
     trunk_ws = bls.trunk_params.weights
     if len(trunk_ws) == 0:
@@ -224,7 +233,7 @@ def feature_to_subtask_specs(
     opt_importance = jnp.max(opt_q_abs.reshape(-1, obs_dim), axis=0)  # (obs_dim,)
 
     combined = feature_importance + opt_importance
-    n = min(n_subtasks, obs_dim)
+    n = min(normalized_n_subtasks, obs_dim)
     ranking = sorted(range(obs_dim), key=lambda i: float(combined[i]), reverse=True)[:n]
 
     return tuple(
@@ -5882,6 +5891,7 @@ class PrototypeAgent:
             post_valid = (
                 post_finite
                 & post_consistent
+                & result.transition_diagnostics.valid
                 & recurrent_transaction_valid
                 & memory_transaction_valid
             )
@@ -6194,6 +6204,10 @@ class PrototypeAgent:
         model_replay_sampled = jnp.asarray(False)
         model_replay_updates_applied = jnp.asarray(0, dtype=jnp.int32)
         model_replay_padding_count = jnp.asarray(0, dtype=jnp.int32)
+        plain_world_model_transaction_applied = jnp.asarray(
+            True,
+            dtype=jnp.bool_,
+        )
 
         if self._world_model is not None and self._buffer is not None:
             wm_result = self._world_model.update(
@@ -6205,6 +6219,7 @@ class PrototypeAgent:
                 bootstrap_obs,
             )
             new_wm_state = wm_result.state
+            plain_world_model_transaction_applied = wm_result.update_applied
             bootstrap_buffer_state = self._buffer.add(
                 state.buffer_state,
                 bootstrap_obs,
@@ -6849,6 +6864,19 @@ class PrototypeAgent:
             step_count=next_step_count,
         )
 
+        component_diagnostics = cast(
+            PrototypeTransitionDiagnostics,
+            diagnostics.replace(
+                valid=(
+                    diagnostics.valid
+                    & plain_world_model_transaction_applied
+                ),
+                rejected=~(
+                    diagnostics.valid
+                    & plain_world_model_transaction_applied
+                ),
+            ),
+        )
         return PrototypeUpdateResult(
             state=new_state,
             action=next_action,
@@ -6885,7 +6913,7 @@ class PrototypeAgent:
             ia_recommendation=ia_recommendation,
             experiential_memory_diagnostics=memory_diagnostics,
             partner_policy_fusion_diagnostics=partner_fusion_diagnostics,
-            transition_diagnostics=diagnostics,
+            transition_diagnostics=component_diagnostics,
         )
 
     # -- Scan-based loop ------------------------------------------------------
@@ -7572,7 +7600,7 @@ class PrototypeAgent:
 
         Args:
             state: Current agent state.
-            n_subtasks: Number of subtask specs to return.
+            n_subtasks: Non-negative integer scalar number of subtask specs to return.
 
         Returns:
             Tuple of :class:`SubtaskSpec` instances ranked by importance.

@@ -21,7 +21,7 @@ import chex
 import jax
 import jax.numpy as jnp
 from jax import Array
-from jaxtyping import Float
+from jaxtyping import Bool, Float
 
 
 @dataclass(frozen=True)
@@ -79,6 +79,7 @@ class RLSRewardModelUpdateResult:
     prediction: Float[Array, ""]
     error: Float[Array, ""]
     gain: Float[Array, " feature_dim"]
+    update_applied: Bool[Array, ""]
 
 
 class RLSRewardModel:
@@ -183,11 +184,31 @@ class RLSRewardModel:
             abs_error_ema=next_abs_error_ema,
             step_count=state.step_count + 1,
         )
+        # Inf reward * a silent feature's zero gain is 0*inf = NaN, and
+        # that channel stays poisoned. Hold the previous finite state.
+        source_finite = (
+            jnp.all(jnp.isfinite(state.weights))
+            & jnp.all(jnp.isfinite(state.covariance))
+            & jnp.isfinite(state.abs_error_ema)
+        )
+        inputs_valid = jnp.all(jnp.isfinite(x)) & jnp.isfinite(jnp.squeeze(target))
+        proposed_finite = (
+            jnp.all(jnp.isfinite(next_weights))
+            & jnp.all(jnp.isfinite(next_covariance))
+            & jnp.isfinite(next_abs_error_ema)
+        )
+        update_applied = source_finite & inputs_valid & proposed_finite
+        committed = jax.lax.cond(
+            update_applied,
+            lambda: next_state,
+            lambda: state,
+        )
         return RLSRewardModelUpdateResult(
-            state=next_state,
-            prediction=prediction,
-            error=error,
-            gain=gain,
+            state=committed,
+            prediction=jnp.where(update_applied, prediction, jnp.zeros_like(prediction)),
+            error=jnp.where(update_applied, error, jnp.zeros_like(error)),
+            gain=jnp.where(update_applied, gain, jnp.zeros_like(gain)),
+            update_applied=update_applied,
         )
 
     def _validate_config(self, config: RLSRewardModelConfig) -> None:

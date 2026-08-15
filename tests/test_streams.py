@@ -1,6 +1,7 @@
 """Tests for experience streams."""
 
 import chex
+import jax
 import jax.numpy as jnp
 import pytest
 
@@ -16,6 +17,9 @@ from alberta_framework import (
     TimeStep,
     make_scale_range,
 )
+
+_INT32_MAX = 2**31 - 1
+_INVALID_SCHEDULE_MODULI = (0, -1, False, True, 1.5, None, 2**31, 10**100)
 
 
 class TestRandomWalkStream:
@@ -90,25 +94,21 @@ class TestRandomWalkStream:
 class TestAbruptChangeStream:
     """Tests for the AbruptChangeStream class."""
 
-    def test_weights_change_at_interval(self, rng_key):
-        """Weights should change at specified interval."""
-        stream = AbruptChangeStream(feature_dim=10, change_interval=10)
+    @pytest.mark.parametrize("compiled", [False, True], ids=["eager", "jit"])
+    def test_initial_weights_last_for_first_full_segment(self, rng_key, compiled):
+        """Initialized weights govern exactly one complete change interval."""
+        change_interval = 3
+        stream = AbruptChangeStream(feature_dim=10, change_interval=change_interval)
         state = stream.init(rng_key)
+        initial_weights = state.true_weights
+        step = jax.jit(stream.step) if compiled else stream.step
 
-        # Step count starts at 0, changes happen when step_count % interval == 0
-        # So first change at step 0 (initial), then step 10, 20, etc.
-        weights_at_0 = state.true_weights.copy()
+        for i in range(change_interval):
+            _, state = step(state, jnp.array(i, dtype=jnp.int32))
+            chex.assert_trees_all_equal(state.true_weights, initial_weights)
 
-        # Run 9 steps (step_count goes 0->9)
-        for i in range(9):
-            _, state = stream.step(state, jnp.array(i))
-
-        # Run one more step (step_count becomes 10)
-        _, state = stream.step(state, jnp.array(9))
-
-        # Weights should have changed at step 10
-        with pytest.raises(AssertionError):
-            chex.assert_trees_all_close(weights_at_0, state.true_weights)
+        _, state = step(state, jnp.array(change_interval, dtype=jnp.int32))
+        assert not bool(jnp.array_equal(state.true_weights, initial_weights))
 
     def test_generates_valid_timesteps(self, rng_key):
         """Should generate valid TimeStep instances."""
@@ -445,46 +445,28 @@ class TestDynamicScaleShiftStream:
         stream = DynamicScaleShiftStream(feature_dim=20)
         assert stream.feature_dim == 20
 
-    def test_scales_change_at_interval(self, rng_key):
-        """Scales should change at specified interval."""
-        stream = DynamicScaleShiftStream(
-            feature_dim=10,
-            scale_change_interval=10,
-            weight_change_interval=1000,  # Don't change weights
-        )
+    @pytest.mark.parametrize("field", ["current_scales", "true_weights"])
+    @pytest.mark.parametrize("compiled", [False, True], ids=["eager", "jit"])
+    def test_initial_parameters_last_for_first_full_segment(
+        self, rng_key, field, compiled
+    ):
+        """Initialized scales and weights each govern one complete interval."""
+        change_interval = 3
+        intervals = {
+            "scale_change_interval": change_interval if field == "current_scales" else 97,
+            "weight_change_interval": change_interval if field == "true_weights" else 97,
+        }
+        stream = DynamicScaleShiftStream(feature_dim=10, **intervals)
         state = stream.init(rng_key)
+        initial_value = getattr(state, field)
+        step = jax.jit(stream.step) if compiled else stream.step
 
-        initial_scales = state.current_scales.copy()
+        for i in range(change_interval):
+            _, state = step(state, jnp.array(i, dtype=jnp.int32))
+            chex.assert_trees_all_equal(getattr(state, field), initial_value)
 
-        # Run 9 steps (step_count goes 0->9)
-        for i in range(9):
-            _, state = stream.step(state, jnp.array(i))
-
-        # Run one more step (step_count becomes 10)
-        _, state = stream.step(state, jnp.array(9))
-
-        # Scales should have changed at step 10
-        with pytest.raises(AssertionError):
-            chex.assert_trees_all_close(initial_scales, state.current_scales)
-
-    def test_weights_change_at_interval(self, rng_key):
-        """Weights should change at specified interval."""
-        stream = DynamicScaleShiftStream(
-            feature_dim=10,
-            scale_change_interval=1000,  # Don't change scales
-            weight_change_interval=10,
-        )
-        state = stream.init(rng_key)
-
-        initial_weights = state.true_weights.copy()
-
-        # Run 10 steps
-        for i in range(10):
-            _, state = stream.step(state, jnp.array(i))
-
-        # Weights should have changed at step 10
-        with pytest.raises(AssertionError):
-            chex.assert_trees_all_close(initial_weights, state.true_weights)
+        _, state = step(state, jnp.array(change_interval, dtype=jnp.int32))
+        assert not bool(jnp.array_equal(getattr(state, field), initial_value))
 
     def test_scales_within_bounds(self, rng_key):
         """Scales should be within min_scale and max_scale."""
@@ -621,3 +603,83 @@ class TestScaleDriftStream:
             assert isinstance(timestep, TimeStep)
             chex.assert_tree_all_finite(timestep.observation)
             chex.assert_tree_all_finite(timestep.target)
+
+
+class TestScheduleModuliRejectInvalid:
+    """Schedule divisors must be positive JAX-int32 integers before arithmetic."""
+
+    @pytest.mark.parametrize("period", _INVALID_SCHEDULE_MODULI)
+    def test_periodic_change_period_must_be_positive_int(self, period):
+        with pytest.raises(
+            ValueError,
+            match=rf"period must be a positive integer in \[1, {_INT32_MAX}\]",
+        ):
+            PeriodicChangeStream(feature_dim=3, period=period)
+
+    @pytest.mark.parametrize("cycle_length", _INVALID_SCHEDULE_MODULI)
+    def test_cyclic_cycle_length_must_be_positive_int(self, cycle_length):
+        with pytest.raises(
+            ValueError,
+            match=rf"cycle_length must be a positive integer in \[1, {_INT32_MAX}\]",
+        ):
+            CyclicStream(feature_dim=3, cycle_length=cycle_length)
+
+    @pytest.mark.parametrize("num_configurations", _INVALID_SCHEDULE_MODULI)
+    def test_cyclic_num_configurations_must_be_positive_int(self, num_configurations):
+        with pytest.raises(
+            ValueError,
+            match=rf"num_configurations must be a positive integer in \[1, {_INT32_MAX}\]",
+        ):
+            CyclicStream(feature_dim=3, num_configurations=num_configurations)
+
+    @pytest.mark.parametrize("change_interval", _INVALID_SCHEDULE_MODULI)
+    def test_abrupt_change_interval_must_be_positive_int(self, change_interval):
+        with pytest.raises(
+            ValueError,
+            match=rf"change_interval must be a positive integer in \[1, {_INT32_MAX}\]",
+        ):
+            AbruptChangeStream(feature_dim=3, change_interval=change_interval)
+
+    @pytest.mark.parametrize("change_interval", _INVALID_SCHEDULE_MODULI)
+    def test_sutton_change_interval_must_be_positive_int(self, change_interval):
+        with pytest.raises(
+            ValueError,
+            match=rf"change_interval must be a positive integer in \[1, {_INT32_MAX}\]",
+        ):
+            SuttonExperiment1Stream(change_interval=change_interval)
+
+    @pytest.mark.parametrize("name", ["scale_change_interval", "weight_change_interval"])
+    @pytest.mark.parametrize("value", _INVALID_SCHEDULE_MODULI)
+    def test_dynamic_scale_shift_intervals_must_be_positive_ints(self, name, value):
+        with pytest.raises(
+            ValueError,
+            match=rf"{name} must be a positive integer in \[1, {_INT32_MAX}\]",
+        ):
+            DynamicScaleShiftStream(feature_dim=3, **{name: value})
+
+    @pytest.mark.parametrize(
+        "stream",
+        [
+            AbruptChangeStream(feature_dim=3, change_interval=_INT32_MAX),
+            SuttonExperiment1Stream(change_interval=_INT32_MAX),
+            CyclicStream(feature_dim=3, cycle_length=_INT32_MAX),
+            PeriodicChangeStream(feature_dim=3, period=_INT32_MAX),
+            DynamicScaleShiftStream(feature_dim=3, scale_change_interval=_INT32_MAX),
+            DynamicScaleShiftStream(feature_dim=3, weight_change_interval=_INT32_MAX),
+        ],
+        ids=["abrupt", "sutton", "cyclic", "periodic", "dynamic-scale", "dynamic-weight"],
+    )
+    def test_int32_max_schedule_runs_first_eager_and_jit_step(self, stream, rng_key):
+        state = stream.init(rng_key)
+        eager_timestep, eager_state = stream.step(state, jnp.array(0, dtype=jnp.int32))
+        jit_timestep, jit_state = jax.jit(stream.step)(state, jnp.array(0, dtype=jnp.int32))
+
+        chex.assert_tree_all_finite(eager_timestep)
+        chex.assert_tree_all_finite(jit_timestep)
+        chex.assert_trees_all_close(eager_timestep, jit_timestep)
+        jax.block_until_ready((eager_state, jit_state))
+
+    def test_cyclic_int32_max_num_configurations_constructs(self):
+        """The representable boundary is valid even when allocation would be impractical."""
+        stream = CyclicStream(feature_dim=3, num_configurations=_INT32_MAX)
+        assert stream.feature_dim == 3

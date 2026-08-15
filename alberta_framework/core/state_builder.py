@@ -60,6 +60,7 @@ from alberta_framework.core.checkpoints import (
     load_checkpoint_metadata,
     save_checkpoint,
 )
+from alberta_framework.core.update_safety import safe_discrete_action, select_transaction
 from alberta_framework.core.working_memory import (
     WorkingMemoryConfig,
     WorkingMemoryFeaturizer,
@@ -994,20 +995,33 @@ class FixedTraceStateBuilder:
         observation = jnp.asarray(raw_observation, dtype=jnp.float32).reshape(
             (self._config.observation_dim,)
         )
-        action_vector = _action_features(previous_action, self._config.n_actions)
+        safe_action, action_valid = safe_discrete_action(
+            previous_action,
+            self._config.n_actions,
+            allow_unset=True,
+        )
+        action_vector = _action_features(safe_action, self._config.n_actions)
         outcomes = jnp.stack(
             [
                 jnp.asarray(previous_reward, dtype=jnp.float32),
                 jnp.asarray(previous_discount, dtype=jnp.float32),
             ]
         )
-        next_state = self._memory.update(
+        memory_update = self._memory.update_checked(
             state,
             observation,
             action_vector,
             outcomes,
         )
-        return next_state, self.encode(next_state, observation)
+        update_applied = action_valid & memory_update.update_applied
+        next_state = select_transaction(update_applied, memory_update.state, state)
+        representation = self.encode(next_state, observation)
+        reported_representation = jnp.where(
+            update_applied,
+            representation,
+            jnp.full_like(representation, jnp.nan),
+        )
+        return next_state, reported_representation
 
     def start(
         self,
@@ -1386,23 +1400,30 @@ class OnlineGatedStateBuilder:
         previous_discount: Array | float,
     ) -> tuple[OnlineGatedStateBuilderState, Float[Array, " feature_dim"]]:
         """Advance recurrence and its RTRL-style eligibility sensitivity."""
+        safe_action, action_valid = safe_discrete_action(
+            previous_action,
+            self._config.n_actions,
+            allow_unset=True,
+        )
         event = self._event(
             raw_observation,
-            previous_action,
+            safe_action,
             previous_reward,
             previous_discount,
         )
-        new_hidden = self._transition(state.parameters, state.hidden, event)
+        event_valid = action_valid & jnp.all(jnp.isfinite(event))
+        safe_event = jnp.where(event_valid, event, jnp.zeros_like(event))
+        new_hidden = self._transition(state.parameters, state.hidden, safe_event)
         direct_sensitivity = jax.jacfwd(self._transition, argnums=0)(
             state.parameters,
             state.hidden,
-            event,
+            safe_event,
         )
 
         gate_weights, gate_bias, _, _ = self._unpack_parameters(state.parameters)
-        gate = jax.nn.sigmoid(gate_weights @ event + gate_bias)
+        gate = jax.nn.sigmoid(gate_weights @ safe_event + gate_bias)
         new_sensitivity = direct_sensitivity + ((1.0 - gate)[:, None] * state.parameter_sensitivity)
-        next_state = OnlineGatedStateBuilderState(
+        candidate_state = OnlineGatedStateBuilderState(
             parameters=state.parameters,
             hidden=new_hidden,
             parameter_sensitivity=new_sensitivity,
@@ -1410,7 +1431,19 @@ class OnlineGatedStateBuilder:
             update_count=state.update_count,
             last_gradient_norm=state.last_gradient_norm,
         )
-        return next_state, self.encode(next_state, raw_observation)
+        update_applied = (
+            event_valid
+            & self._state_is_valid(state)
+            & self._state_is_valid(candidate_state)
+        )
+        next_state = select_transaction(update_applied, candidate_state, state)
+        representation = self.encode(next_state, raw_observation)
+        reported_representation = jnp.where(
+            update_applied,
+            representation,
+            jnp.full_like(representation, jnp.nan),
+        )
+        return next_state, reported_representation
 
     def start(
         self,

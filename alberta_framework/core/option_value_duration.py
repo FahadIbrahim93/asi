@@ -35,7 +35,7 @@ import chex
 import jax
 import jax.numpy as jnp
 from jax import Array
-from jaxtyping import Float, Int
+from jaxtyping import Bool, Float, Int
 
 REWARD_HEAD = 0
 DURATION_HEAD = 1
@@ -128,6 +128,8 @@ class OptionValueDurationUpdateResult:
     td_targets: Float[Array, " 2"]
     td_errors: Float[Array, " 2"]
     continuation_discount: Float[Array, ""]
+    head_updates_applied: Bool[Array, " 2"]
+    update_applied: Bool[Array, ""]
 
 
 @chex.dataclass(frozen=True)
@@ -140,6 +142,8 @@ class OptionValueDurationArrayResult:
     td_targets: Float[Array, "num_steps 2"]
     td_errors: Float[Array, "num_steps 2"]
     continuation_discounts: Float[Array, " num_steps"]
+    head_updates_applied: Bool[Array, "num_steps 2"]
+    updates_applied: Bool[Array, " num_steps"]
 
 
 class OptionValueDurationLearner:
@@ -262,10 +266,12 @@ class OptionValueDurationLearner:
         observation = jnp.asarray(observation, dtype=jnp.float32)
         next_observation = jnp.asarray(next_observation, dtype=jnp.float32)
         option_index = jnp.asarray(option_index, dtype=jnp.int32)
+        option_index_valid = (option_index >= 0) & (option_index < self._n_options)
+        safe_option_index = jnp.clip(option_index, 0, self._n_options - 1)
         reward = jnp.squeeze(jnp.asarray(reward, dtype=jnp.float32))
         continuation_discount = jnp.squeeze(jnp.asarray(continuation_discount, dtype=jnp.float32))
 
-        option_weights = state.weights[option_index]
+        option_weights = state.weights[safe_option_index]
         predictions = option_weights @ observation
         next_predictions = option_weights @ next_observation
         cumulants = jnp.stack(
@@ -280,21 +286,64 @@ class OptionValueDurationLearner:
             ],
             dtype=jnp.float32,
         )
-        updated_option_weights = (
+        proposed_option_weights = (
             option_weights + step_sizes[:, None] * td_errors[:, None] * observation[None, :]
         )
-        new_state = state.replace(
-            weights=state.weights.at[option_index].set(updated_option_weights),
-            option_update_counts=state.option_update_counts.at[option_index].add(1),
+        source_finite = jnp.all(jnp.isfinite(state.weights))
+        shared_inputs_valid = (
+            jnp.all(jnp.isfinite(observation))
+            & jnp.all(jnp.isfinite(next_observation))
+            & jnp.isfinite(continuation_discount)
+            & (continuation_discount >= 0.0)
+            & (continuation_discount <= 1.0)
+            & option_index_valid
+            & source_finite
+        )
+        head_inputs_valid = jnp.stack(
+            (
+                jnp.isfinite(reward),
+                jnp.asarray(True, dtype=jnp.bool_),
+            )
+        )
+        candidate_finite = jnp.all(jnp.isfinite(proposed_option_weights), axis=1)
+        head_updates_applied = (
+            shared_inputs_valid & head_inputs_valid & candidate_finite
+        )
+        updated_option_weights = jnp.where(
+            head_updates_applied[:, None], proposed_option_weights, option_weights
+        )
+        update_applied = jnp.any(head_updates_applied)
+        proposed_state = state.replace(
+            weights=state.weights.at[safe_option_index].set(updated_option_weights),
+            option_update_counts=state.option_update_counts.at[safe_option_index].add(1),
             step_count=state.step_count + 1,
+        )
+        new_state = jax.lax.cond(
+            update_applied,
+            lambda: proposed_state,
+            lambda: state,
         )
         return OptionValueDurationUpdateResult(
             state=new_state,
-            predictions=predictions,
-            next_predictions=next_predictions,
-            td_targets=td_targets,
-            td_errors=td_errors,
-            continuation_discount=continuation_discount,
+            predictions=jnp.where(
+                head_updates_applied, predictions, jnp.zeros_like(predictions)
+            ),
+            next_predictions=jnp.where(
+                head_updates_applied, next_predictions, jnp.zeros_like(next_predictions)
+            ),
+            td_targets=jnp.where(
+                head_updates_applied, td_targets, jnp.zeros_like(td_targets)
+            ),
+            td_errors=jnp.where(
+                head_updates_applied, td_errors, jnp.zeros_like(td_errors)
+            ),
+            continuation_discount=jnp.where(
+                update_applied,
+                continuation_discount,
+                jnp.asarray(0.0, dtype=jnp.float32),
+            ),
+            head_updates_applied=head_updates_applied,
+            update_applied=update_applied,
         )
 
 
@@ -313,7 +362,10 @@ def run_option_value_duration_from_arrays(
     def _scan_fn(
         carry: OptionValueDurationState,
         inputs: tuple[Array, Array, Array, Array, Array],
-    ) -> tuple[OptionValueDurationState, tuple[Array, Array, Array, Array, Array]]:
+    ) -> tuple[
+        OptionValueDurationState,
+        tuple[Array, Array, Array, Array, Array, Array, Array],
+    ]:
         observation, option_index, reward, next_observation, discount = inputs
         result = learner.update(
             carry,
@@ -329,6 +381,8 @@ def run_option_value_duration_from_arrays(
             result.td_targets,
             result.td_errors,
             result.continuation_discount,
+            result.head_updates_applied,
+            result.update_applied,
         )
 
     (
@@ -339,6 +393,8 @@ def run_option_value_duration_from_arrays(
             td_targets,
             td_errors,
             discounts,
+            head_updates_applied,
+            updates_applied,
         ),
     ) = jax.lax.scan(
         _scan_fn,
@@ -359,4 +415,6 @@ def run_option_value_duration_from_arrays(
         td_targets=td_targets,
         td_errors=td_errors,
         continuation_discounts=discounts,
+        head_updates_applied=head_updates_applied,
+        updates_applied=updates_applied,
     )

@@ -30,13 +30,18 @@ import jax
 import jax.numpy as jnp
 import jax.random as jr
 from jax import Array
-from jaxtyping import Float, Int, PRNGKeyArray
+from jaxtyping import Bool, Float, Int, PRNGKeyArray
 
 from alberta_framework.core.future_utility import (
     contribution_trace_output_loss_reduction,
     normalize_future_utility_signal,
     one_step_output_loss_reduction,
     trace_output_loss_reduction,
+)
+from alberta_framework.core.update_safety import (
+    floating_tree_is_finite,
+    neutralize_array,
+    select_transaction,
 )
 
 GENERATOR_RANDOM = 0
@@ -100,6 +105,7 @@ class FeatureDiscoveryUpdateResult:
     metrics: Float[Array, " 7"]
     replaced_slot: Int[Array, ""]
     promoted_candidate: Int[Array, ""]
+    update_applied: Bool[Array, ""]
 
 
 @chex.dataclass(frozen=True)
@@ -108,6 +114,7 @@ class FeatureDiscoveryLearningResult:
 
     state: FeatureDiscoveryState
     metrics: Float[Array, "num_steps 7"]
+    updates_applied: Bool[Array, " num_steps"]
 
 
 class FixedBudgetFeatureLearner:
@@ -913,6 +920,11 @@ class FixedBudgetFeatureLearner:
         targets: Array,
     ) -> FeatureDiscoveryUpdateResult:
         """Perform one temporally-uniform feature-discovery update."""
+        source_state_finite = floating_tree_is_finite(state)
+        inputs_valid = (
+            jnp.all(jnp.isfinite(observation))
+            & jnp.all(jnp.isfinite(targets) | jnp.isnan(targets))
+        )
         active_mask = ~jnp.isnan(targets)
         safe_targets = jnp.where(active_mask, targets, 0.0)
         active_count = jnp.maximum(jnp.sum(active_mask.astype(jnp.float32)), 1.0)
@@ -1556,7 +1568,7 @@ class FixedBudgetFeatureLearner:
             reset_candidate_traces, 0.0, candidate_utility_signal_second_moment
         )
 
-        new_state = FeatureDiscoveryState(
+        candidate_state = FeatureDiscoveryState(
             key=key,
             feature_weights=feature_weights,
             feature_biases=feature_biases,
@@ -1620,13 +1632,29 @@ class FixedBudgetFeatureLearner:
             dtype=jnp.float32,
         )
 
+        update_applied = (
+            source_state_finite
+            & inputs_valid
+            & floating_tree_is_finite(candidate_state)
+            & jnp.all(jnp.isfinite(predictions))
+            & jnp.all(jnp.isfinite(reported_errors) | jnp.isnan(reported_errors))
+            & jnp.all(jnp.isfinite(metrics))
+        )
+        new_state = select_transaction(update_applied, candidate_state, state)
+        neutral_slot = jnp.asarray(-1, dtype=jnp.int32)
+
         return FeatureDiscoveryUpdateResult(
             state=new_state,
-            predictions=predictions,
-            errors=reported_errors,
-            metrics=metrics,
-            replaced_slot=replaced_slot,
-            promoted_candidate=promoted_candidate,
+            predictions=neutralize_array(update_applied, predictions),
+            errors=neutralize_array(update_applied, reported_errors),
+            metrics=neutralize_array(update_applied, metrics),
+            replaced_slot=jnp.where(update_applied, replaced_slot, neutral_slot),
+            promoted_candidate=jnp.where(
+                update_applied,
+                promoted_candidate,
+                neutral_slot,
+            ),
+            update_applied=update_applied,
         )
 
 
@@ -1641,16 +1669,22 @@ def run_feature_discovery_arrays(
     def step_fn(
         carry: FeatureDiscoveryState,
         inputs: tuple[Array, Array],
-    ) -> tuple[FeatureDiscoveryState, Array]:
+    ) -> tuple[FeatureDiscoveryState, tuple[Array, Array]]:
         observation, target = inputs
         result = learner.update(carry, observation, target)
-        return result.state, result.metrics
+        return result.state, (result.metrics, result.update_applied)
 
     t0 = time.time()
-    final_state, metrics = jax.lax.scan(step_fn, state, (observations, targets))
+    final_state, (metrics, updates_applied) = jax.lax.scan(
+        step_fn, state, (observations, targets)
+    )
     elapsed = time.time() - t0
     final_state = final_state.replace(uptime_s=final_state.uptime_s + elapsed)  # type: ignore[attr-defined]
-    return FeatureDiscoveryLearningResult(state=final_state, metrics=metrics)
+    return FeatureDiscoveryLearningResult(
+        state=final_state,
+        metrics=metrics,
+        updates_applied=updates_applied,
+    )
 
 
 def run_feature_discovery_loop(
@@ -1669,16 +1703,23 @@ def run_feature_discovery_loop(
     def step_fn(
         carry: tuple[FeatureDiscoveryState, Any],
         idx: Array,
-    ) -> tuple[tuple[FeatureDiscoveryState, Any], Array]:
+    ) -> tuple[tuple[FeatureDiscoveryState, Any], tuple[Array, Array]]:
         l_state, s_state = carry
         timestep, new_s_state = stream.step(s_state, idx)
         result = learner.update(l_state, timestep.observation, timestep.target)
-        return (result.state, new_s_state), result.metrics
+        return (
+            result.state,
+            new_s_state,
+        ), (result.metrics, result.update_applied)
 
     t0 = time.time()
-    (final_state, _), metrics = jax.lax.scan(
+    (final_state, _), (metrics, updates_applied) = jax.lax.scan(
         step_fn, (learner_state, stream_state), jnp.arange(num_steps)
     )
     elapsed = time.time() - t0
     final_state = final_state.replace(uptime_s=final_state.uptime_s + elapsed)  # type: ignore[attr-defined]
-    return FeatureDiscoveryLearningResult(state=final_state, metrics=metrics)
+    return FeatureDiscoveryLearningResult(
+        state=final_state,
+        metrics=metrics,
+        updates_applied=updates_applied,
+    )

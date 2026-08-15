@@ -63,7 +63,9 @@ def forward_view_returns(
     init = jnp.asarray(terminal_value, dtype=cumulants.dtype)
 
     def step(carry: Array, c: Array) -> tuple[Array, Array]:
-        new_carry = c + gamma_s * carry
+        # gamma=0 must not multiply an inf later return (0*inf).
+        bootstrap = jnp.where(gamma_s == 0.0, jnp.zeros_like(carry), gamma_s * carry)
+        new_carry = c + bootstrap
         return new_carry, new_carry
 
     _, returns_reversed = jax.lax.scan(step, init, cumulants[::-1])
@@ -118,6 +120,25 @@ def multi_channel_horizon_returns(
     return jax.vmap(per_channel, in_axes=1, out_axes=1)(cumulants)
 
 
+def _validate_rmse_inputs(
+    predictions: Float[Array, "T H"],
+    forward_returns: Float[Array, "T H"],
+) -> int:
+    if (
+        predictions.ndim != 2
+        or forward_returns.ndim != 2
+        or predictions.shape != forward_returns.shape
+        or 0 in predictions.shape
+    ):
+        raise ValueError(
+            "predictions and forward_returns must be rank-2 arrays with identical "
+            "nonempty shape (T, H) "
+            f"(got predictions.shape={predictions.shape}, "
+            f"forward_returns.shape={forward_returns.shape})"
+        )
+    return predictions.shape[0]
+
+
 def per_horizon_rmse(
     predictions: Float[Array, "T H"],
     forward_returns: Float[Array, "T H"],
@@ -128,12 +149,27 @@ def per_horizon_rmse(
     Args:
         predictions: Predictions over time at each horizon, shape ``(T, H)``.
         forward_returns: Ground-truth forward-view returns, shape ``(T, H)``.
-        burn_in: Number of initial steps to skip (helps when the learner
-            has not yet warmed up). Defaults to 0.
+        burn_in: Exact built-in ``int`` number of initial steps to skip (helps
+            when the learner has not yet warmed up). Defaults to 0. When JIT
+            compiling a non-default value, close over it or mark ``burn_in``
+            static with ``static_argnames``.
 
     Returns:
         Array of shape ``(H,)`` with RMSE per horizon.
+
+    Raises:
+        ValueError: If the arrays do not have identical nonempty ``(T, H)``
+            shapes, or if ``burn_in`` is not an exact built-in ``int`` in
+            ``[0, T)``.
     """
+    if type(burn_in) is not int:
+        raise ValueError("burn_in must be a built-in int")
+    n_steps = _validate_rmse_inputs(predictions, forward_returns)
+    if not 0 <= burn_in < n_steps:
+        raise ValueError(
+            f"burn_in must satisfy 0 <= burn_in < n_steps "
+            f"(got burn_in={burn_in}, n_steps={n_steps})"
+        )
     if burn_in:
         predictions = predictions[burn_in:]
         forward_returns = forward_returns[burn_in:]
@@ -154,12 +190,27 @@ def per_horizon_running_rmse(
     Args:
         predictions: Shape ``(T, H)``.
         forward_returns: Shape ``(T, H)``.
-        window_size: Length of the trailing average window.
+        window_size: Exact built-in ``int`` length of the trailing average
+            window. When JIT compiling a non-default value, close over it or
+            mark ``window_size`` static with ``static_argnames``.
 
     Returns:
         Array of shape ``(T, H)``. The first ``window_size - 1`` rows are
         equal to ``running_rmse[window_size - 1]``.
+
+    Raises:
+        ValueError: If the arrays do not have identical nonempty ``(T, H)``
+            shapes, or if ``window_size`` is not an exact built-in ``int`` in
+            ``[1, T]``.
     """
+    if type(window_size) is not int:
+        raise ValueError("window_size must be a built-in int")
+    n_steps = _validate_rmse_inputs(predictions, forward_returns)
+    if not 1 <= window_size <= n_steps:
+        raise ValueError(
+            f"window_size must satisfy 1 <= window_size <= n_steps "
+            f"(got window_size={window_size}, n_steps={n_steps})"
+        )
     sq_err = (predictions - forward_returns) ** 2  # (T, H)
     cumsum = jnp.cumsum(jnp.concatenate([jnp.zeros((1, sq_err.shape[1])), sq_err]), axis=0)
     window = cumsum[window_size:] - cumsum[:-window_size]

@@ -153,9 +153,17 @@ def plot_learning_curves(
             ]
         )
 
+        # ``compute_running_mean`` preserves length by padding the leading
+        # positions with the first complete trailing-window mean. Do not plot
+        # those future-informed padding values at earlier time steps.
+        first_complete_window = (
+            window_size - 1 if metric_array.shape[1] >= window_size else 0
+        )
+        smoothed = smoothed[:, first_complete_window:]
+
         mean, ci_lower, ci_upper = compute_timeseries_statistics(smoothed)
 
-        steps = np.arange(len(mean))
+        steps = np.arange(first_complete_window, first_complete_window + len(mean))
         ax.plot(steps, mean, color=color, label=label, linewidth=_current_style["line_width"])
 
         if show_ci:

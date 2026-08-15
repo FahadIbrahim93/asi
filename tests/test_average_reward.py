@@ -88,6 +88,104 @@ def test_differential_td_update_moves_average_reward_and_is_jittable() -> None:
     chex.assert_tree_all_finite(result)
 
 
+def test_differential_td_infinite_reward_does_not_poison_weights() -> None:
+    """Inf reward is 0*inf = NaN on a silent feature and inf rbar.
+
+    Differential SARSA already refuses non-finite rewards. Hold the
+    previous finite state so a later finite reward can still learn.
+    """
+    learner = DifferentialTDLearner(
+        DifferentialTDConfig(step_size=0.1, average_reward_step_size=0.2, trace_decay=0.0)
+    )
+    state = learner.init(2)
+    obs = jnp.array([0.0, 1.0], dtype=jnp.float32)
+    nxt = jnp.array([0.0, 1.0], dtype=jnp.float32)
+
+    poisoned = learner.update(state, obs, jnp.array(jnp.inf, dtype=jnp.float32), nxt)
+    chex.assert_trees_all_close(poisoned.state.weights, state.weights)
+    chex.assert_trees_all_close(poisoned.state.average_reward, state.average_reward)
+    assert int(poisoned.state.step_count) == int(state.step_count)
+    assert not bool(poisoned.update_applied)
+    assert float(poisoned.td_error) == 0.0
+    chex.assert_trees_all_close(poisoned.metrics, jnp.zeros_like(poisoned.metrics))
+
+    recovered = learner.update(
+        poisoned.state, obs, jnp.array(1.0, dtype=jnp.float32), nxt
+    )
+    chex.assert_tree_all_finite(recovered.state.weights)
+    chex.assert_tree_all_finite(recovered.state.average_reward)
+    assert int(recovered.state.step_count) == int(state.step_count) + 1
+    assert bool(recovered.update_applied)
+
+
+def test_differential_gtd_infinite_reward_does_not_poison_weights() -> None:
+    """Same 0*inf hole on the GTD primary/secondary products."""
+    learner = DifferentialGTDLearner(
+        DifferentialGTDConfig(value_step_size=0.1, secondary_step_size=0.01)
+    )
+    state = learner.init(2)
+    obs = jnp.array([0.0, 1.0], dtype=jnp.float32)
+    nxt = jnp.array([0.0, 1.0], dtype=jnp.float32)
+    rho = jnp.array(1.0, dtype=jnp.float32)
+
+    poisoned = learner.update(state, obs, jnp.array(jnp.inf, dtype=jnp.float32), nxt, rho)
+    chex.assert_trees_all_close(poisoned.state.weights, state.weights)
+    chex.assert_trees_all_close(poisoned.state.secondary_weights, state.secondary_weights)
+    chex.assert_trees_all_close(poisoned.state.average_reward, state.average_reward)
+    assert not bool(poisoned.update_applied)
+    assert float(poisoned.td_error) == 0.0
+    chex.assert_trees_all_close(poisoned.metrics, jnp.zeros_like(poisoned.metrics))
+
+    recovered = learner.update(
+        poisoned.state, obs, jnp.array(1.0, dtype=jnp.float32), nxt, rho
+    )
+    chex.assert_tree_all_finite(recovered.state.weights)
+    chex.assert_tree_all_finite(recovered.state.secondary_weights)
+    assert bool(recovered.update_applied)
+
+
+def test_average_reward_horde_infinite_cumulant_does_not_poison_rbar() -> None:
+    """Inf is not NaN, so it used to keep a demon 'active'.
+
+    MultiHead then refused the whole trunk, while rbar still added the
+    inf TD error. Treat non-finite cumulants as inactive and only move
+    rbar when the nested learner actually commits.
+    """
+    learner = AverageRewardHordeLearner(
+        n_demons=2,
+        hidden_sizes=(4,),
+        sparsity=0.0,
+        use_layer_norm=False,
+        average_reward_step_size=0.01,
+    )
+    state = learner.init(3, jr.key(0))
+    obs = jnp.ones(3, dtype=jnp.float32)
+    nxt = jnp.ones(3, dtype=jnp.float32)
+
+    poisoned = learner.update(
+        state, obs, jnp.array([jnp.inf, 1.0], dtype=jnp.float32), nxt
+    )
+    chex.assert_trees_all_close(
+        poisoned.average_rewards[0], state.average_rewards[0]
+    )
+    assert bool(jnp.isfinite(poisoned.average_rewards[1]))
+    assert int(poisoned.state.step_count) == 1
+    assert bool(poisoned.update_applied)
+    chex.assert_trees_all_equal(
+        poisoned.head_updates_applied,
+        jnp.array([False, True]),
+    )
+    assert float(poisoned.td_errors[0]) == 0.0
+
+    recovered = learner.update(
+        poisoned.state, obs, jnp.array([0.5, 1.0], dtype=jnp.float32), nxt
+    )
+    chex.assert_tree_all_finite(recovered.average_rewards)
+    assert int(recovered.state.step_count) == 2
+    assert bool(recovered.update_applied)
+    assert bool(jnp.all(recovered.head_updates_applied))
+
+
 def test_differential_td_scan_shapes_and_finite_metrics() -> None:
     learner = DifferentialTDLearner(DifferentialTDConfig(trace_decay=0.2))
     state = learner.init(2)
@@ -255,6 +353,7 @@ def test_average_reward_horde_actor_critic_single_update_is_finite() -> None:
     assert int(action) in (0, 1)
     assert int(result.action) in (0, 1)
     assert int(result.state.step_count) == 1
+    assert bool(result.update_applied)
     chex.assert_tree_all_finite(
         (
             result.policy,
@@ -270,6 +369,33 @@ def test_average_reward_horde_actor_critic_single_update_is_finite() -> None:
             result.state.critic_state.average_rewards,
         )
     )
+
+
+def test_average_reward_horde_actor_critic_rejects_nonfinite_reward() -> None:
+    agent = AverageRewardHordeActorCriticAgent(
+        AverageRewardHordeActorCriticConfig(n_actions=2, hidden_sizes=(4,))
+    )
+    state, _ = agent.start(
+        agent.init(2, jr.key(41)),
+        jnp.array([1.0, 0.0], dtype=jnp.float32),
+    )
+    result = agent.update(
+        state,
+        jnp.asarray(jnp.inf, dtype=jnp.float32),
+        jnp.array([0.0, 1.0], dtype=jnp.float32),
+    )
+
+    assert not bool(result.update_applied)
+    chex.assert_trees_all_equal(
+        jr.key_data(result.state.rng_key), jr.key_data(state.rng_key)
+    )
+    chex.assert_trees_all_close(
+        result.state.replace(rng_key=jr.key_data(result.state.rng_key)),
+        state.replace(rng_key=jr.key_data(state.rng_key)),
+    )
+    chex.assert_trees_all_close(result.policy, jnp.zeros_like(result.policy))
+    chex.assert_trees_all_close(result.target_policy, jnp.zeros_like(result.target_policy))
+    assert float(result.td_error) == 0.0
 
 
 def test_average_reward_actor_critic_behavior_policy_is_exact_epsilon_mixture() -> None:
@@ -499,6 +625,7 @@ def test_average_reward_actor_critic_scan_logs_action_probabilities() -> None:
     )
 
     row = jnp.arange(result.actions.shape[0])
+    assert bool(jnp.all(result.updates_applied))
     chex.assert_trees_all_close(
         result.behavior_action_probabilities,
         result.policies[row, result.actions],

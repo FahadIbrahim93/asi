@@ -93,6 +93,32 @@ def test_init_predict_update_finite_and_shapes() -> None:
     assert float(result.loss) > 0.0
 
 
+def test_infinite_observation_does_not_poison_weights() -> None:
+    """Inf obs makes softmax NaN and logit_error * x = 0*inf on a silent feature."""
+    model = BehaviorModel(BehaviorModelConfig(n_actions=2, step_size=0.1))
+    state = model.init(feature_dim=2, key=jax.random.key(0))
+    obs = jnp.array([0.0, jnp.inf], dtype=jnp.float32)
+    action = jnp.array(0, dtype=jnp.int32)
+
+    poisoned = model.update(state, obs, action)
+    chex.assert_trees_all_close(poisoned.state.weights, state.weights)
+    chex.assert_trees_all_close(poisoned.state.bias, state.bias)
+    assert int(poisoned.state.step_count) == int(state.step_count)
+    assert not bool(poisoned.update_applied)
+    assert float(poisoned.loss) == 0.0
+    assert int(poisoned.predicted_action) == 0
+    chex.assert_trees_all_close(poisoned.probabilities, jnp.zeros_like(poisoned.probabilities))
+
+    recovered = model.update(
+        poisoned.state,
+        jnp.array([0.0, 1.0], dtype=jnp.float32),
+        action,
+    )
+    chex.assert_tree_all_finite(recovered.state.weights)
+    chex.assert_tree_all_finite(recovered.state.bias)
+    assert bool(recovered.update_applied)
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [

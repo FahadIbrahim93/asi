@@ -18,8 +18,9 @@ import chex
 import jax
 import jax.numpy as jnp
 from jax import Array
-from jaxtyping import Float
+from jaxtyping import Bool, Float
 
+from alberta_framework.core.learners import _update_from_gradient_with_diagnostics
 from alberta_framework.core.multi_head_learner import (
     AnyOptimizer,
     MultiHeadMLPLearner,
@@ -29,11 +30,33 @@ from alberta_framework.core.normalizers import (
     EMANormalizerState,
     Normalizer,
     WelfordNormalizerState,
-    _checked_lifetime_words_increment,
     _saturating_int32_counter_increment,
 )
 from alberta_framework.core.optimizers import LMS, Bounder
 from alberta_framework.core.types import HordeSpec, MLPParams, TraceMode
+from alberta_framework.core.update_safety import (
+    floating_tree_is_finite as _floating_tree_is_finite,
+)
+
+
+def _report_demon_values(
+    values: Array,
+    requested: Array,
+    updates_applied: Array,
+) -> Array:
+    """Preserve inactive NaN sentinels and neutralize rejected demons."""
+    mask_shape = (requested.shape[0],) + (1,) * (values.ndim - 1)
+    requested_mask = jnp.reshape(requested, mask_shape)
+    applied_mask = jnp.reshape(updates_applied, mask_shape)
+    return jnp.where(
+        applied_mask,
+        values,
+        jnp.where(
+            requested_mask,
+            jnp.zeros_like(values),
+            jnp.full_like(values, jnp.nan),
+        ),
+    )
 
 
 def _extract_mean_step_size(opt_state: Any) -> Array:
@@ -76,6 +99,8 @@ class OffPolicyHordeUpdateResult:
     trace_coefficients: Float[Array, " n_demons"]
     per_demon_metrics: Float[Array, "n_demons 6"]
     trunk_bounding_metric: Float[Array, ""]
+    head_updates_applied: Bool[Array, " n_demons"]
+    update_applied: Bool[Array, ""]
 
 
 @chex.dataclass(frozen=True)
@@ -86,6 +111,8 @@ class OffPolicyHordeLearningResult:
     per_demon_metrics: Float[Array, "num_steps n_demons 6"]
     td_errors: Float[Array, "num_steps n_demons"]
     clipped_rhos: Float[Array, "num_steps n_demons"]
+    head_updates_applied: Bool[Array, "num_steps n_demons"]
+    updates_applied: Bool[Array, " num_steps"]
 
 
 @chex.dataclass(frozen=True)
@@ -362,6 +389,7 @@ class OffPolicyHordeLearner:
         """Update using explicit ratios and transition discounts."""
         n_demons = self.n_demons
         replacing = self._trace_mode == TraceMode.REPLACING
+        counter_status = self._learner._counter_status(state)
 
         rhos = jnp.asarray(rhos, dtype=jnp.float32)
         discounts = jnp.asarray(discounts, dtype=jnp.float32)
@@ -375,18 +403,48 @@ class OffPolicyHordeLearner:
         )
 
         next_predictions = self._learner.predict(state, next_observation)
-        td_targets = cumulants + discounts * next_predictions
-        active_mask = ~jnp.isnan(td_targets)
+        zero_discount_mask = discounts == 0.0
+        bootstrap_predictions = jnp.where(
+            zero_discount_mask,
+            jnp.zeros_like(next_predictions),
+            next_predictions,
+        )
+        td_targets = cumulants + discounts * bootstrap_predictions
+        requested_mask = ~jnp.isnan(cumulants)
+        source_state_finite = _floating_tree_is_finite(state)
+        global_inputs_valid = jnp.all(jnp.isfinite(observation))
+        next_observation_valid = jnp.all(jnp.isfinite(next_observation))
+        head_inputs_valid = (
+            requested_mask
+            & jnp.isfinite(cumulants)
+            & jnp.isfinite(rhos)
+            & jnp.isfinite(discounts)
+            & (discounts >= 0.0)
+            & (discounts <= 1.0)
+            & (
+                zero_discount_mask
+                | (next_observation_valid & jnp.isfinite(next_predictions))
+            )
+            & jnp.isfinite(td_targets)
+        )
+        active_mask = head_inputs_valid & global_inputs_valid & source_state_finite
         safe_targets = jnp.where(active_mask, td_targets, 0.0)
+        safe_clipped_rhos = jnp.where(active_mask, clipped_rhos, 0.0)
+        safe_trace_coefficients = jnp.where(active_mask, trace_coefficients, 0.0)
+        safe_discounts = jnp.where(active_mask, discounts, 0.0)
 
         obs = observation
         new_normalizer_state = state.normalizer_state
+        normalizer_update_applied = jnp.asarray(True, dtype=jnp.bool_)
         if self._normalizer is not None and state.normalizer_state is not None:
             normalizer: Any = self._normalizer
-            obs, new_normalizer_state = normalizer.normalize(
+            normalizer_result = normalizer.normalize_with_diagnostics(
                 state.normalizer_state,
                 observation,
             )
+            obs = normalizer_result.normalized
+            new_normalizer_state = normalizer_result.state
+            normalizer_update_applied = normalizer_result.update_applied
 
         slope = self._leaky_relu_slope
         use_layer_norm = self._use_layer_norm
@@ -429,7 +487,7 @@ class OffPolicyHordeLearner:
             )
             td_error_i = safe_targets[i] - pred_i
             masked_td_error_i = jnp.where(active_mask[i], td_error_i, 0.0)
-            effective_error_i = clipped_rhos[i] * masked_td_error_i
+            effective_error_i = safe_clipped_rhos[i] * masked_td_error_i
 
             predictions_list.append(pred_i)
             td_errors_list.append(
@@ -463,6 +521,7 @@ class OffPolicyHordeLearner:
         new_trunk_traces: list[Array] = []
         trunk_steps: list[Array] = []
         new_trunk_opt_states: list[Any] = []
+        optimizer_updates_applied: list[Array] = []
         n_trunk_layers = len(state.trunk_params.weights)
 
         for i in range(n_trunk_layers):
@@ -473,13 +532,17 @@ class OffPolicyHordeLearner:
             else:
                 new_w_trace = w_grad_i
             new_trunk_traces.append(new_w_trace)
-            w_step, new_w_opt = self._optimizer.update_from_gradient(
-                state.trunk_optimizer_states[2 * i],
-                new_w_trace,
-                error=None,
+            w_step, new_w_opt, w_update_applied = (
+                _update_from_gradient_with_diagnostics(
+                    self._optimizer,
+                    state.trunk_optimizer_states[2 * i],
+                    new_w_trace,
+                    error=None,
+                )
             )
             trunk_steps.append(w_step)
             new_trunk_opt_states.append(new_w_opt)
+            optimizer_updates_applied.append(w_update_applied)
 
             b_grad_i = trunk_bias_grads[i]
             old_b_trace = state.trunk_traces[2 * i + 1]
@@ -488,13 +551,17 @@ class OffPolicyHordeLearner:
             else:
                 new_b_trace = b_grad_i
             new_trunk_traces.append(new_b_trace)
-            b_step, new_b_opt = self._optimizer.update_from_gradient(
-                state.trunk_optimizer_states[2 * i + 1],
-                new_b_trace,
-                error=None,
+            b_step, new_b_opt, b_update_applied = (
+                _update_from_gradient_with_diagnostics(
+                    self._optimizer,
+                    state.trunk_optimizer_states[2 * i + 1],
+                    new_b_trace,
+                    error=None,
+                )
             )
             trunk_steps.append(b_step)
             new_trunk_opt_states.append(new_b_opt)
+            optimizer_updates_applied.append(b_update_applied)
 
         trunk_bounding_metric = jnp.array(1.0, dtype=jnp.float32)
         if self._bounder is not None and n_trunk_layers > 0:
@@ -530,6 +597,7 @@ class OffPolicyHordeLearner:
         new_head_traces: list[tuple[Array, Array]] = []
         new_head_opt_states: list[tuple[Any, Any]] = []
         per_demon_metrics: list[Array] = []
+        head_candidates_finite: list[Array] = []
         head_optimizer = self._head_optimizer or self._optimizer
         lamdas = self._horde_spec.lamdas
 
@@ -544,9 +612,10 @@ class OffPolicyHordeLearner:
             # (trace-clipped) ratio forward, so ``z = rho (gl z + grad)``
             # when the two clips agree.  The update below is ``delta * z``
             # with no additional ratio.
-            w_grad = clipped_rhos[i] * hidden.reshape(1, -1)
-            b_grad = clipped_rhos[i] * jnp.ones(1, dtype=jnp.float32)
-            head_gl = discounts[i] * lamdas[i] * trace_coefficients[i]
+            safe_hidden = jnp.where(active_mask[i], hidden, jnp.zeros_like(hidden))
+            w_grad = safe_clipped_rhos[i] * safe_hidden.reshape(1, -1)
+            b_grad = safe_clipped_rhos[i] * jnp.ones(1, dtype=jnp.float32)
+            head_gl = safe_discounts[i] * lamdas[i] * safe_trace_coefficients[i]
 
             if replacing:
                 new_w_trace = jnp.where(
@@ -564,16 +633,23 @@ class OffPolicyHordeLearner:
                 new_b_trace = head_gl * old_b_trace + b_grad
 
             error_i = masked_td_errors[i]
-            w_step, new_w_opt = head_optimizer.update_from_gradient(
-                old_w_opt,
-                new_w_trace,
-                error=error_i,
+            w_step, new_w_opt, w_update_applied = (
+                _update_from_gradient_with_diagnostics(
+                    head_optimizer,
+                    old_w_opt,
+                    new_w_trace,
+                    error=error_i,
+                )
             )
-            b_step, new_b_opt = head_optimizer.update_from_gradient(
-                old_b_opt,
-                new_b_trace,
-                error=error_i,
+            b_step, new_b_opt, b_update_applied = (
+                _update_from_gradient_with_diagnostics(
+                    head_optimizer,
+                    old_b_opt,
+                    new_b_trace,
+                    error=error_i,
+                )
             )
+            optimizer_updates_applied.extend((w_update_applied, b_update_applied))
 
             if self._bounder is not None:
                 bounded_head_steps, bound_scale = self._bounder.bound(
@@ -587,18 +663,34 @@ class OffPolicyHordeLearner:
 
             new_w = head_w + error_i * w_step
             new_b = head_b + error_i * b_step
-
-            new_w = jnp.where(active_mask[i], new_w, head_w)
-            new_b = jnp.where(active_mask[i], new_b, head_b)
-            new_w_trace = jnp.where(active_mask[i], new_w_trace, old_w_trace)
-            new_b_trace = jnp.where(active_mask[i], new_b_trace, old_b_trace)
+            # Inf TD error zeros the ObGD step, then error_i * step is 0*inf=NaN.
+            # Hold that head's previous finite params/traces/opt like a NaN cumulant.
+            head_ok = (
+                active_mask[i]
+                & jnp.isfinite(error_i)
+                & _floating_tree_is_finite(
+                    (
+                        new_w,
+                        new_b,
+                        new_w_trace,
+                        new_b_trace,
+                        new_w_opt,
+                        new_b_opt,
+                    )
+                )
+            )
+            head_candidates_finite.append((~active_mask[i]) | head_ok)
+            new_w = jnp.where(head_ok, new_w, head_w)
+            new_b = jnp.where(head_ok, new_b, head_b)
+            new_w_trace = jnp.where(head_ok, new_w_trace, old_w_trace)
+            new_b_trace = jnp.where(head_ok, new_b_trace, old_b_trace)
             new_w_opt = jax.tree.map(
-                lambda new, old: jnp.where(active_mask[i], new, old),
+                lambda new, old: jnp.where(head_ok, new, old),
                 new_w_opt,
                 old_w_opt,
             )
             new_b_opt = jax.tree.map(
-                lambda new, old: jnp.where(active_mask[i], new, old),
+                lambda new, old: jnp.where(head_ok, new, old),
                 new_b_opt,
                 old_b_opt,
             )
@@ -639,7 +731,6 @@ class OffPolicyHordeLearner:
             weights=tuple(new_head_weights),
             biases=tuple(new_head_biases),
         )  # type: ignore[call-arg]
-        next_step_words, _ = _checked_lifetime_words_increment(state.step_words)
         new_state = MultiHeadMLPState(
             trunk_params=new_trunk_params,
             head_params=new_head_params,
@@ -650,22 +741,80 @@ class OffPolicyHordeLearner:
             hidden_unit_utilities=tuple(new_hidden_unit_utilities),
             normalizer_state=new_normalizer_state,
             step_count=_saturating_int32_counter_increment(state.step_count),
-            step_words=next_step_words,
+            step_words=counter_status.proposed_step_words,
             birth_timestamp=state.birth_timestamp,
             uptime_s=state.uptime_s,
         )  # type: ignore[call-arg]
 
+        candidate_state_finite = _floating_tree_is_finite(new_state)
+        all_active_candidates_finite = jnp.all(jnp.stack(head_candidates_finite))
+        has_accepted_work = jnp.any(active_mask) | jnp.all(~requested_mask)
+        update_applied = (
+            counter_status.update_available
+            & global_inputs_valid
+            & source_state_finite
+            & normalizer_update_applied
+            & all_active_candidates_finite
+            & candidate_state_finite
+            & has_accepted_work
+            & jnp.all(jnp.stack(optimizer_updates_applied))
+        )
+        head_updates_applied = active_mask & update_applied
+        committed_state = jax.lax.cond(update_applied, lambda: new_state, lambda: state)
+        raw_metrics = jnp.stack(per_demon_metrics)
+        reported_predictions = jnp.where(
+            update_applied,
+            jnp.where(
+                requested_mask & ~head_updates_applied,
+                jnp.zeros_like(predictions),
+                predictions,
+            ),
+            jnp.zeros_like(predictions),
+        )
+        sanitized_next_predictions = jnp.where(
+            head_updates_applied
+            & zero_discount_mask
+            & ~jnp.isfinite(next_predictions),
+            jnp.zeros_like(next_predictions),
+            next_predictions,
+        )
+        reported_next_predictions = jnp.where(
+            update_applied,
+            jnp.where(
+                requested_mask & ~head_updates_applied,
+                jnp.zeros_like(next_predictions),
+                sanitized_next_predictions,
+            ),
+            jnp.zeros_like(next_predictions),
+        )
+
         return OffPolicyHordeUpdateResult(
-            state=new_state,
-            predictions=predictions,
-            next_predictions=next_predictions,
-            td_targets=td_targets,
-            td_errors=td_errors,
-            rhos=rhos,
-            clipped_rhos=jnp.where(active_mask, clipped_rhos, jnp.nan),
-            trace_coefficients=jnp.where(active_mask, trace_coefficients, jnp.nan),
-            per_demon_metrics=jnp.stack(per_demon_metrics),
-            trunk_bounding_metric=trunk_bounding_metric,
+            state=committed_state,
+            predictions=reported_predictions,
+            next_predictions=reported_next_predictions,
+            td_targets=_report_demon_values(
+                td_targets, requested_mask, head_updates_applied
+            ),
+            td_errors=_report_demon_values(
+                td_errors, requested_mask, head_updates_applied
+            ),
+            rhos=jnp.where(head_updates_applied, rhos, jnp.zeros_like(rhos)),
+            clipped_rhos=_report_demon_values(
+                clipped_rhos, requested_mask, head_updates_applied
+            ),
+            trace_coefficients=_report_demon_values(
+                trace_coefficients, requested_mask, head_updates_applied
+            ),
+            per_demon_metrics=_report_demon_values(
+                raw_metrics, requested_mask, head_updates_applied
+            ),
+            trunk_bounding_metric=jnp.where(
+                update_applied,
+                trunk_bounding_metric,
+                jnp.asarray(0.0, dtype=jnp.float32),
+            ),
+            head_updates_applied=head_updates_applied,
+            update_applied=update_applied,
         )  # type: ignore[call-arg]
 
     def to_config(self) -> dict[str, Any]:
@@ -970,7 +1119,7 @@ def run_off_policy_horde_learning_loop(
     def step_fn(
         carry: MultiHeadMLPState,
         inputs: tuple[Array, Array, Array, Array, Array],
-    ) -> tuple[MultiHeadMLPState, tuple[Array, Array, Array]]:
+    ) -> tuple[MultiHeadMLPState, tuple[Array, Array, Array, Array, Array]]:
         obs, cums, next_obs, rho_t, discount_t = inputs
         result = learner.update_with_ratios_and_discounts(
             carry,
@@ -986,11 +1135,19 @@ def run_off_policy_horde_learning_loop(
                 result.per_demon_metrics,
                 result.td_errors,
                 result.clipped_rhos,
+                result.head_updates_applied,
+                result.update_applied,
             ),
         )
 
     t0 = time.time()
-    final_state, (per_demon_metrics, td_errors, clipped_rhos) = jax.lax.scan(
+    final_state, (
+        per_demon_metrics,
+        td_errors,
+        clipped_rhos,
+        head_updates_applied,
+        updates_applied,
+    ) = jax.lax.scan(
         step_fn,
         state,
         (observations, cumulants, next_observations, rhos, discounts),
@@ -1005,6 +1162,8 @@ def run_off_policy_horde_learning_loop(
         per_demon_metrics=per_demon_metrics,
         td_errors=td_errors,
         clipped_rhos=clipped_rhos,
+        head_updates_applied=head_updates_applied,
+        updates_applied=updates_applied,
     )  # type: ignore[call-arg]
 
 
@@ -1019,7 +1178,9 @@ def run_off_policy_horde_learning_loop_batched(
 ) -> OffPolicyHordeLearningResult:
     """Run the off-policy Horde loop for multiple initialization keys."""
 
-    def single_run(key: Array) -> tuple[MultiHeadMLPState, Array, Array, Array]:
+    def single_run(
+        key: Array,
+    ) -> tuple[MultiHeadMLPState, Array, Array, Array, Array, Array]:
         init_state = learner.init(observations.shape[1], key)
         result = run_off_policy_horde_learning_loop(
             learner,
@@ -1035,14 +1196,25 @@ def run_off_policy_horde_learning_loop_batched(
             result.per_demon_metrics,
             result.td_errors,
             result.clipped_rhos,
+            result.head_updates_applied,
+            result.updates_applied,
         )
 
-    states, per_demon_metrics, td_errors, clipped_rhos = jax.vmap(single_run)(keys)
+    (
+        states,
+        per_demon_metrics,
+        td_errors,
+        clipped_rhos,
+        head_updates_applied,
+        updates_applied,
+    ) = jax.vmap(single_run)(keys)
     return OffPolicyHordeLearningResult(
         state=states,
         per_demon_metrics=per_demon_metrics,
         td_errors=td_errors,
         clipped_rhos=clipped_rhos,
+        head_updates_applied=head_updates_applied,
+        updates_applied=updates_applied,
     )  # type: ignore[call-arg]
 
 

@@ -333,9 +333,17 @@ def mann_whitney_comparison(
 
     Returns:
         SignificanceResult with test results
+
+    Raises:
+        ValueError: If either sample is empty.
     """
     a = np.asarray(values_a)
     b = np.asarray(values_b)
+
+    if len(a) == 0 or len(b) == 0:
+        raise ValueError(
+            f"independent Mann-Whitney test requires non-empty groups (got {len(a)} and {len(b)})"
+        )
 
     try:
         from scipy import stats
@@ -393,16 +401,26 @@ def wilcoxon_comparison(
         SignificanceResult with test results
 
     Raises:
-        ValueError: If the non-empty paired samples are identical, for which
-            the Wilcoxon signed-rank statistic is undefined.
+        ValueError: If the paired samples differ in length, hold fewer than 2
+            pairs, or are identical, for which the Wilcoxon signed-rank
+            statistic is undefined.
     """
     a = np.asarray(values_a)
     b = np.asarray(values_b)
 
+    if len(a) != len(b):
+        raise ValueError(
+            f"Wilcoxon signed-rank test requires equal-length samples "
+            f"(got {len(a)} and {len(b)})"
+        )
     if a.size > 0 and np.array_equal(a, b):
         raise ValueError(
             f"Paired comparison {method_a!r} vs {method_b!r} has identical "
             "samples; the Wilcoxon signed-rank statistic is undefined"
+        )
+    if len(a) < 2:
+        raise ValueError(
+            f"Wilcoxon signed-rank test requires at least 2 pairs (got {len(a)})"
         )
 
     try:
@@ -443,6 +461,8 @@ def bonferroni_correction(
         Tuple of (list of significant booleans, corrected alpha)
     """
     n_tests = len(p_values)
+    if n_tests == 0:
+        return [], alpha
     corrected_alpha = alpha / n_tests
     significant = [p < corrected_alpha for p in p_values]
     return significant, corrected_alpha

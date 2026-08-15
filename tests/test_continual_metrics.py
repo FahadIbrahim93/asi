@@ -170,3 +170,28 @@ def test_task_matrix_validation(
 ) -> None:
     with pytest.raises(ValueError, match=message):
         compute_per_task_forgetting(matrix, first_exposure)
+
+
+@pytest.mark.parametrize(
+    ("matrix", "message"),
+    [
+        ([[np.nan], [0.6]], "first-post-exposure"),
+        ([[0.8], [np.nan]], "final evaluation"),
+    ],
+)
+def test_task_metrics_reject_missing_boundary_evaluations(
+    matrix: list[list[float]],
+    message: str,
+) -> None:
+    """Do not silently backfill required first/final checkpoints."""
+
+    with pytest.raises(ValueError, match=message):
+        compute_per_task_forgetting(matrix, [0])
+
+
+@pytest.mark.parametrize("value", [np.inf, -np.inf])
+def test_task_metrics_reject_infinite_post_exposure_evaluations(value: float) -> None:
+    """Do not treat a divergent metric as an unevaluated probe gap."""
+
+    with pytest.raises(ValueError, match="infinite evaluation"):
+        compute_per_task_forgetting([[0.8], [value], [0.6]], [0])
