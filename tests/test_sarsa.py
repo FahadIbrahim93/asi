@@ -253,6 +253,31 @@ class TestSARSAUpdate:
         assert not jnp.isnan(result_nt.td_error)
         assert not jnp.isnan(result_t.td_error)
 
+    def test_terminated_inf_next_q_is_not_nan_td_error(self) -> None:
+        """Terminal 0 * inf Q(s', a') is NaN and poisons the SARSA target.
+
+        Fail-closed: a terminal transition does not multiply Q(s', a').
+        The target is the reward, matching the finite-path algebra.
+        """
+        agent = _make_agent(n_actions=2, gamma=0.99, epsilon_start=0.0, hidden_sizes=())
+        state = agent.init(feature_dim=2, key=jr.key(0))
+        obs = jnp.ones(2, dtype=jnp.float32)
+        state = state.replace(  # type: ignore[attr-defined]
+            last_action=jnp.array(0, dtype=jnp.int32),
+            last_observation=obs,
+        )
+        result = agent.update(
+            state,
+            reward=jnp.array(1.0, dtype=jnp.float32),
+            observation=jnp.array([jnp.inf, 0.0], dtype=jnp.float32),
+            terminated=jnp.array(True),
+            next_action=jnp.array(0, dtype=jnp.int32),
+        )
+        assert bool(jnp.isfinite(result.td_error))
+        q_old = agent.horde.predict(state.learner_state, obs)[0]
+        chex.assert_trees_all_close(result.td_error, jnp.float32(1.0) - q_old)
+
+
     def test_nan_masking(self):
         """Only the taken action's head receives a weight update."""
         agent = _make_agent(n_actions=3, gamma=0.9, epsilon_start=0.0)
