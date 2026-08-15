@@ -1234,9 +1234,19 @@ class TestShardsAndMerge:
         shard_paths = []
         for name, learner in (("upgd_w_control", "upgd_w"), ("adamw_control", "adamw")):
             full = run_ipmnist(x, y, learner, seeds=[0], config=SMALL)
+            reference_payload = {
+                "schema": "upgd_ipmnist.partial.v1",
+                "learner": learner,
+                "hyperparameters": full.hyperparameters,
+                "seeds": [0],
+                "config": full.config.to_config(),
+                "per_task_accuracy": full.per_task_accuracy.tolist(),
+                "per_task_loss": full.per_task_loss.tolist(),
+                "per_task_plasticity": full.per_task_plasticity.tolist(),
+                "wall_clock_seconds": full.wall_clock_seconds,
+            }
             (partials / f"{learner}_seed0.json").write_text(
-                json.dumps({"per_task_accuracy": full.per_task_accuracy.tolist()}),
-                encoding="utf-8",
+                json.dumps(reference_payload), encoding="utf-8"
             )
             proxy = run_screening_config(
                 x, y, screening_spec(name), seed=0, config=IPMNISTConfig(
@@ -1267,6 +1277,45 @@ class TestShardsAndMerge:
         changed_path.write_text(json.dumps(changed), encoding="utf-8")
         with pytest.raises(ValueError, match="shards span multiple runtime environments"):
             validate_proxy([shard_paths[0], changed_path], partials, atol=1e-6)
+
+        reference_payloads = {
+            path.name: json.loads(path.read_text(encoding="utf-8"))
+            for path in partials.iterdir()
+        }
+        tamper_cases = [
+            (
+                "learner",
+                lambda payload: payload.update(learner="adamw"),
+                "does not match expected learner",
+            ),
+            (
+                "seed",
+                lambda payload: payload.update(seeds=[1]),
+                "reference seeds must equal",
+            ),
+            (
+                "config",
+                lambda payload: payload["config"].update(hidden1=999),
+                "reference config is incompatible",
+            ),
+            (
+                "hyperparameters",
+                lambda payload: payload["hyperparameters"].update(step_size=999.0),
+                "reference hyperparameters do not match",
+            ),
+        ]
+        for case_name, mutate, message in tamper_cases:
+            tampered_dir = tmp_path / f"tampered-{case_name}"
+            tampered_dir.mkdir()
+            for filename, payload in reference_payloads.items():
+                candidate = json.loads(json.dumps(payload))
+                if filename == "upgd_w_seed0.json":
+                    mutate(candidate)
+                (tampered_dir / filename).write_text(
+                    json.dumps(candidate), encoding="utf-8"
+                )
+            with pytest.raises(ValueError, match=message):
+                validate_proxy(shard_paths, tampered_dir, atol=1e-6)
 
     def test_validate_proxy_rejects_duplicate_control_seed(self, tmp_path, small_data):
         path = self._make_shard(tmp_path, small_data, "upgd_w_control", 0)
@@ -1306,6 +1355,22 @@ class TestShardsAndMerge:
         changed_path.write_text(json.dumps(changed), encoding="utf-8")
 
         with pytest.raises(ValueError, match="must record base_learner='adamw'"):
+            validate_proxy([upgd, changed_path], tmp_path)
+
+    def test_validate_proxy_rejects_misreported_control_hyperparameters(
+        self, tmp_path, small_data
+    ):
+        upgd = self._make_shard(tmp_path, small_data, "upgd_w_control", 0)
+        adam = self._make_shard(tmp_path, small_data, "adamw_control", 0)
+        changed = json.loads(adam.read_text(encoding="utf-8"))
+        changed["hyperparameters"] = {
+            **changed["hyperparameters"],
+            "step_size": 999.0,
+        }
+        changed_path = tmp_path / "changed-hyperparameters.json"
+        changed_path.write_text(json.dumps(changed), encoding="utf-8")
+
+        with pytest.raises(ValueError, match="must record its frozen hyperparameters"):
             validate_proxy([upgd, changed_path], tmp_path)
 
 

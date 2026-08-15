@@ -148,6 +148,7 @@ from jax import Array
 from alberta_framework.benchmarks.upgd_ipmnist import (
     _PLASTICITY_LOSS_FLOOR,
     ADAMW_PROTOCOL_HYPERPARAMETERS,
+    PARTIAL_SCHEMA_V1,
     UPGD_W_PROTOCOL_HYPERPARAMETERS,
     IPMNISTConfig,
     LeanUPGDState,
@@ -158,6 +159,7 @@ from alberta_framework.benchmarks.upgd_ipmnist import (
     _preflight_new_output,
     _sorted_param_shapes,
     _split_flat_noise,
+    _validated_partial_payload,
     atomic_write_new,
     build_schedule,
     cross_entropy_loss,
@@ -7322,6 +7324,12 @@ def validate_proxy(
                 f"{path}: control {shard['config_name']!r} must record "
                 f"base_learner={learner!r}"
             )
+        expected_hp = SCREENING_REGISTRY[shard["config_name"]].hyperparameters
+        if shard["hyperparameters"] != expected_hp:
+            raise ValueError(
+                f"{path}: control {shard['config_name']!r} must record its frozen "
+                f"hyperparameters {expected_hp!r}"
+            )
         per_seed = by_control.setdefault(shard["config_name"], {})
         if shard["seed"] in per_seed:
             raise ValueError(
@@ -7353,7 +7361,44 @@ def validate_proxy(
         n_tasks = int(shard["config"]["n_tasks"])
         n_tasks_seen.add(n_tasks)
         partial_path = partials_dir / f"{learner}_seed{seed}.json"
-        reference = json.loads(partial_path.read_text(encoding="utf-8"))
+        reference = _validated_partial_payload(
+            partial_path,
+            schema=PARTIAL_SCHEMA_V1,
+            seed_field="seeds",
+        )
+        if reference["learner"] != learner:
+            raise ValueError(
+                f"{partial_path}: reference learner {reference['learner']!r} does not "
+                f"match expected learner {learner!r}"
+            )
+        if reference["seeds"] != [seed]:
+            raise ValueError(
+                f"{partial_path}: reference seeds must equal the shard seed [{seed}]"
+            )
+        expected_reference_hp = {
+            "upgd_w": UPGD_W_PROTOCOL_HYPERPARAMETERS,
+            "adamw": ADAMW_PROTOCOL_HYPERPARAMETERS,
+        }[learner]
+        if reference["hyperparameters"] != expected_reference_hp:
+            raise ValueError(
+                f"{partial_path}: reference hyperparameters do not match the frozen "
+                f"{learner} protocol"
+            )
+        reference_config = dict(reference["config"])
+        proxy_config = dict(shard["config"])
+        reference_shape = {
+            key: value for key, value in reference_config.items() if key != "n_tasks"
+        }
+        proxy_shape = {
+            key: value for key, value in proxy_config.items() if key != "n_tasks"
+        }
+        if (
+            reference_shape != proxy_shape
+            or int(reference_config["n_tasks"]) < int(proxy_config["n_tasks"])
+        ):
+            raise ValueError(
+                f"{partial_path}: reference config is incompatible with the proxy prefix"
+            )
         full_curve = np.asarray(reference["per_task_accuracy"][0], dtype=np.float64)
         proxy_curve = np.asarray(shard["per_task_accuracy"], dtype=np.float64)
         max_abs_diff = float(np.max(np.abs(proxy_curve - full_curve[:n_tasks])))
