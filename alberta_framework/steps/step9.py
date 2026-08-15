@@ -347,7 +347,7 @@ def step9_update(
         _: Array,
     ) -> tuple[tuple[DifferentialSARSAState, BehaviorModelState, Array], tuple[Array, Array]]:
         ctrl_state, behavior_state, key = carry
-        key, candidate_key = jr.split(key)
+        key, candidate_key, rollout_key = jr.split(key, 3)
         candidate_keys = jr.split(candidate_key, config.dream_candidate_count)
 
         def candidate_step(candidate_item: tuple[Array, Array]) -> tuple[Array, ...]:
@@ -414,7 +414,7 @@ def step9_update(
         anchor_obs = candidate_anchors[selected_index]
         action = candidate_actions[selected_index]
         initial_behavior_state = behavior_state.replace(
-            rng_key=key
+            rng_key=rollout_key
         )
 
         def rollout_step(
