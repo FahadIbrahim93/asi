@@ -221,9 +221,14 @@ def _masked_softmax(logits: Array, mask: Array) -> Array:
 
 def _cross_entropy_from_logits(logits: Array, label: Array) -> Array:
     safe_label = jnp.clip(label.astype(jnp.int32), 0, logits.shape[0] - 1)
+    logits_finite = jnp.all(jnp.isfinite(logits))
     shifted = logits - jnp.max(logits)
     log_z = jnp.log(jnp.sum(jnp.exp(shifted))) + jnp.max(logits)
-    return log_z - logits[safe_label]
+    loss = log_z - logits[safe_label]
+    # Inf logits are inf-inf = NaN in the log-sum-exp. Report uniform
+    # loss instead of poisoning utility and replacement.
+    uniform = jnp.log(jnp.asarray(logits.shape[0], dtype=jnp.float32))
+    return jnp.where(logits_finite & jnp.isfinite(loss), loss, uniform)
 
 
 class AssociativeMemoryLearner:
@@ -499,7 +504,8 @@ class AssociativeMemoryLearner:
         empty = (state.counts <= 0.0) & eligible
         has_empty = jnp.any(empty)
         empty_slot = jnp.argmax(empty.astype(jnp.int32))
-        utility_score = jnp.where(eligible & (~empty), state.utility, jnp.inf)
+        occupied = eligible & (~empty) & jnp.isfinite(state.utility)
+        utility_score = jnp.where(occupied, state.utility, jnp.inf)
         low_utility_slot = jnp.argmin(utility_score)
         return jnp.where(has_empty, empty_slot, low_utility_slot), has_empty
 
@@ -661,6 +667,9 @@ class AssociativeMemoryLearner:
             # caps how deeply a row can saturate and keeps the number of
             # opposing-sign updates needed to recover bounded.
             new_utility = jnp.clip(new_utility, -8.0, 8.0)
+            new_utility = jnp.where(
+                jnp.isfinite(new_utility), new_utility, old_utility
+            )
             new_row = old_row * self._config.retention
             new_row = new_row.at[label].add(self._config.write_lr)
             active_bool = active > 0

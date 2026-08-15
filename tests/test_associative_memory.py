@@ -9,6 +9,7 @@ import pytest
 from alberta_framework.core.associative_memory import (
     AssociativeMemoryConfig,
     AssociativeMemoryLearner,
+    _cross_entropy_from_logits,
     run_associative_memory_arrays,
 )
 from alberta_framework.steps.step2 import (
@@ -245,3 +246,40 @@ def test_step2_associative_facade_smoke_and_roundtrip() -> None:
     assert result.finite
     assert result.metrics_shape == (64, 8)
     assert result.final_window_nll < result.initial_window_nll
+
+
+def test_inf_logits_cross_entropy_is_finite_uniform() -> None:
+    """Inf logits are inf-inf = NaN in the log-sum-exp.
+
+    Fail-closed: report uniform loss instead of poisoning utility.
+    """
+    loss = _cross_entropy_from_logits(
+        jnp.array([jnp.inf, 0.0, 0.0], dtype=jnp.float32),
+        jnp.array(0, dtype=jnp.int32),
+    )
+    assert bool(jnp.isfinite(loss))
+    assert float(loss) == pytest.approx(math.log(3), abs=1e-5)
+
+
+def test_nan_utility_is_not_selected_as_lowest() -> None:
+    """argmin treats NaN as the lowest occupied slot.
+
+    Fail-closed: ignore non-finite utilities so a finite low-utility row
+    is replaced instead.
+    """
+    learner = AssociativeMemoryLearner(
+        AssociativeMemoryConfig(
+            vocab_size=5,
+            block_size=4,
+            suffix_length=3,
+            max_features=4,
+        )
+    )
+    state = learner.init()
+    state = state.replace(
+        counts=jnp.ones((4,), dtype=jnp.float32),
+        utility=jnp.array([jnp.nan, 0.5, -1.0, 0.2], dtype=jnp.float32),
+    )
+    slot, has_empty = learner._replacement_slot(state)
+    assert not bool(has_empty)
+    assert int(slot) == 2
