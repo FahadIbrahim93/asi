@@ -361,6 +361,24 @@ class TestSwiftTDBehavior:
         result = optimizer.update(state, jnp.array(1.0), obs, obs, jnp.array(0.9))
         assert float(jnp.max(jnp.abs(result.new_state.eligibility_traces))) > 0.0
 
+    def test_zero_gamma_does_not_require_finite_next_observation(self) -> None:
+        """gamma=0 still required a finite next obs even though V(s') is unused."""
+        optimizer = SwiftTD(initial_step_size=0.01, trace_decay=0.9)
+        state = optimizer.init(2)
+        obs = jnp.asarray([0.5, -0.25], dtype=jnp.float32)
+        result = optimizer.update(
+            state,
+            jnp.asarray(1.0, dtype=jnp.float32),
+            obs,
+            jnp.asarray([jnp.inf, 0.0], dtype=jnp.float32),
+            jnp.asarray(0.0, dtype=jnp.float32),
+        )
+        assert bool(result.update_applied)
+        assert bool(jnp.all(jnp.isfinite(result.weight_delta)))
+        chex.assert_trees_all_close(
+            result.new_state.eligibility_traces, jnp.zeros(3), atol=1e-7
+        )
+
     def test_integrates_with_td_linear_learner(self):
         """SwiftTD follows the TDOptimizer interface and drives TDLinearLearner."""
         learner = TDLinearLearner(optimizer=SwiftTD(initial_step_size=0.01))
