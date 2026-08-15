@@ -177,19 +177,19 @@ def _validate_config(config: AssociativeMemoryConfig) -> None:
         raise ValueError("unknown feature_family")
     if config.max_features < 1:
         raise ValueError("max_features must be positive")
-    if config.write_lr <= 0.0:
+    if not math.isfinite(config.write_lr) or config.write_lr <= 0.0:
         raise ValueError("write_lr must be positive")
-    if not 0.0 <= config.retention <= 1.0:
+    if not math.isfinite(config.retention) or not 0.0 <= config.retention <= 1.0:
         raise ValueError("retention must be in [0, 1]")
-    if config.utility_lr < 0.0:
+    if not math.isfinite(config.utility_lr) or config.utility_lr < 0.0:
         raise ValueError("utility_lr must be non-negative")
-    if not 0.0 <= config.utility_decay <= 1.0:
+    if not math.isfinite(config.utility_decay) or not 0.0 <= config.utility_decay <= 1.0:
         raise ValueError("utility_decay must be in [0, 1]")
-    if config.min_weight <= 0.0:
+    if not math.isfinite(config.min_weight) or config.min_weight <= 0.0:
         raise ValueError("min_weight must be positive")
-    if config.max_weight < config.min_weight:
+    if not math.isfinite(config.max_weight) or config.max_weight < config.min_weight:
         raise ValueError("max_weight must be >= min_weight")
-    if config.logit_scale <= 0.0:
+    if not math.isfinite(config.logit_scale) or config.logit_scale <= 0.0:
         raise ValueError("logit_scale must be positive")
     if config.scope_lr < 0.0:
         raise ValueError("scope_lr must be non-negative")
@@ -206,9 +206,12 @@ def _validate_config(config: AssociativeMemoryConfig) -> None:
 
 
 def _softmax(logits: Array) -> Array:
+    finite = jnp.all(jnp.isfinite(logits))
     shifted = logits - jnp.max(logits)
     exp = jnp.exp(shifted)
-    return exp / jnp.maximum(jnp.sum(exp), 1e-12)
+    probabilities = exp / jnp.maximum(jnp.sum(exp), 1e-12)
+    uniform = jnp.full_like(probabilities, 1.0 / probabilities.shape[0])
+    return jnp.where(finite, probabilities, uniform)
 
 
 def _masked_softmax(logits: Array, mask: Array) -> Array:
@@ -465,7 +468,13 @@ class AssociativeMemoryLearner:
         window_scope, window_probs = self._window_scope_weights(state)
         scope_weights = family_scope * window_scope * mask.astype(jnp.float32)
         weights = base_weights * scope_weights
-        evidence = jnp.sum(weights[:, None] * row_values, axis=0)
+        weight_col = weights[:, None]
+        # Silent features have weight 0. An inf stored value times that
+        # weight is 0*inf = NaN. Skip the product on exact zeros.
+        evidence = jnp.sum(
+            jnp.where(weight_col == 0.0, jnp.zeros_like(row_values), weight_col * row_values),
+            axis=0,
+        )
         # The decayed label-frequency prior enters with a small fixed weight:
         # it dominates only when no feature rows match (evidence is zero, so
         # the prediction falls back to base rates) and is otherwise a weak
@@ -731,11 +740,25 @@ class AssociativeMemoryLearner:
             ],
             dtype=jnp.float32,
         )
+        accepted = (
+            jnp.all(jnp.isfinite(prediction.logits))
+            & jnp.all(jnp.isfinite(prediction.probabilities))
+            & jnp.isfinite(loss)
+            & jnp.all(jnp.isfinite(next_state.values))
+            & jnp.all(jnp.isfinite(next_state.prior))
+            & jnp.all(jnp.isfinite(next_state.utility))
+            & jnp.isfinite(next_state.budget_logit)
+            & jnp.all(jnp.isfinite(metrics))
+        )
+        committed = jax.lax.cond(accepted, lambda: next_state, lambda: state)
+        zero_metrics = jnp.zeros_like(metrics)
         return AssociativeMemoryUpdateResult(
-            state=next_state,
-            predictions=prediction.probabilities,
-            logits=prediction.logits,
-            metrics=metrics,
+            state=committed,
+            predictions=jnp.where(
+                accepted, prediction.probabilities, jnp.zeros_like(prediction.probabilities)
+            ),
+            logits=jnp.where(accepted, prediction.logits, jnp.zeros_like(prediction.logits)),
+            metrics=jnp.where(accepted, metrics, zero_metrics),
         )
 
 

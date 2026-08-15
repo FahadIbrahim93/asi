@@ -35,6 +35,40 @@ def test_associative_config_roundtrip() -> None:
     chex.assert_shape(learner.init().keys, (31, 5))
 
 
+def test_config_rejects_infinite_write_lr() -> None:
+    with pytest.raises(ValueError, match="write_lr"):
+        AssociativeMemoryLearner(
+            AssociativeMemoryConfig(
+                vocab_size=4,
+                block_size=3,
+                suffix_length=2,
+                write_lr=float("inf"),
+            )
+        )
+
+
+def test_silent_feature_does_not_turn_inf_value_into_nan() -> None:
+    """Weight 0 times an inf stored row is 0*inf = NaN in the evidence sum."""
+    learner = AssociativeMemoryLearner(
+        AssociativeMemoryConfig(vocab_size=4, block_size=3, suffix_length=2, max_features=8)
+    )
+    state = learner.init()
+    poisoned = state.replace(
+        values=state.values.at[0].set(jnp.full((4,), jnp.inf, dtype=jnp.float32))
+    )
+    context = jnp.asarray([1, 2, 3], dtype=jnp.int32)
+    raw = jnp.array([0.0], dtype=jnp.float32)[:, None] * poisoned.values[0][None, :]
+    assert not bool(jnp.all(jnp.isfinite(raw)))
+
+    prediction = learner.predict(poisoned, context)
+    chex.assert_tree_all_finite(prediction.logits)
+    chex.assert_tree_all_finite(prediction.probabilities)
+    assert float(jnp.sum(prediction.probabilities)) == pytest.approx(1.0)
+
+    result = learner.update(poisoned, context, jnp.asarray(1, dtype=jnp.int32))
+    chex.assert_trees_all_close(result.state.values, poisoned.values)
+
+
 def test_associative_prediction_is_before_write() -> None:
     learner = AssociativeMemoryLearner(
         AssociativeMemoryConfig(vocab_size=5, block_size=4, suffix_length=3)
