@@ -962,6 +962,20 @@ class TestShardsAndMerge:
 
         assert load_shard(path)["wall_clock_seconds"] == wall_clock
 
+    def test_merge_preserves_valid_wall_clock_summary(self, tmp_path):
+        paths = [
+            self._write_inband_shard(tmp_path, "upgd_w_control", seed, 0.5)
+            for seed in (0, 1)
+        ]
+        for path, wall_clock in zip(paths, (0, 1.25), strict=True):
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload["wall_clock_seconds"] = wall_clock
+            path.write_text(json.dumps(payload), encoding="utf-8")
+
+        summary = merge_shards(paths, control_name="upgd_w_control", slope_window=2)
+
+        assert summary["results"][0]["wall_clock_seconds_total"] == 1.25
+
     def test_confirmation_candidate_requires_two_paired_seeds(self, tmp_path):
         """One lucky shared seed cannot authorize a confirmation wave."""
         paths = [
