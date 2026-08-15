@@ -943,6 +943,25 @@ class TestShardsAndMerge:
         path.write_text(json.dumps(payload), encoding="utf-8")
         return path
 
+    def test_load_shard_rejects_invalid_wall_clock_types_and_values(self, tmp_path):
+        path = self._write_inband_shard(tmp_path, "upgd_w_control", 0, 0.5)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+
+        for wall_clock in (None, True, False, "1.0", [], {}, math.inf, -math.inf, math.nan, -1):
+            payload["wall_clock_seconds"] = wall_clock
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            with pytest.raises(ValueError, match="wall_clock_seconds"):
+                load_shard(path)
+
+    @pytest.mark.parametrize("wall_clock", [0, 0.0, 1, 1.25])
+    def test_load_shard_preserves_valid_wall_clock(self, tmp_path, wall_clock):
+        path = self._write_inband_shard(tmp_path, "upgd_w_control", 0, 0.5)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["wall_clock_seconds"] = wall_clock
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+        assert load_shard(path)["wall_clock_seconds"] == wall_clock
+
     def test_confirmation_candidate_requires_two_paired_seeds(self, tmp_path):
         """One lucky shared seed cannot authorize a confirmation wave."""
         paths = [
