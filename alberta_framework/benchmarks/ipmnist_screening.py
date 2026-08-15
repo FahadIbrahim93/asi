@@ -6990,6 +6990,12 @@ def load_shard(path: Path) -> dict[str, Any]:
         values = np.asarray(payload[fieldname], dtype=np.float64)
         if values.shape != (config.n_tasks,) or not np.all(np.isfinite(values)):
             raise ValueError(f"{path}: {fieldname} must be finite with shape ({config.n_tasks},)")
+    if (
+        type(payload.get("wall_clock_seconds")) not in (int, float)
+        or not math.isfinite(payload["wall_clock_seconds"])
+        or payload["wall_clock_seconds"] < 0
+    ):
+        raise ValueError(f"{path}: wall_clock_seconds must be a finite, non-negative number")
     if type(payload.get("seed")) is not int or payload["seed"] < 0:
         raise ValueError(f"{path}: seed must be a non-negative integer")
     if payload.get("config_name") not in SCREENING_REGISTRY:

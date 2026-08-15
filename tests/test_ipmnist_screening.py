@@ -988,6 +988,49 @@ class TestShardsAndMerge:
         with pytest.raises(ValueError, match="duplicate shard"):
             merge_shards([p1, p2])
 
+    @pytest.mark.parametrize(
+        ("value", "label"),
+        [
+            (math.inf, "inf"),
+            (math.nan, "nan"),
+            (-1.0, "negative"),
+        ],
+    )
+    def test_load_shard_rejects_non_finite_wall_clock_seconds(
+        self, tmp_path, small_data, value, label
+    ):
+        """load_shard gates per_task_accuracy/loss/plasticity for finiteness
+        but never validated wall_clock_seconds: a shard with an infinite,
+        NaN, or negative wall_clock_seconds loaded cleanly, and merge_shards
+        would carry it straight into wall_clock_seconds_total, whose
+        json.dump then emits the non-standard `Infinity`/`NaN` token — an
+        artifact the pipeline's own tooling produced but a strict JSON
+        parser (e.g. JS `JSON.parse`) refuses to read back."""
+        path = self._make_shard(tmp_path, small_data, "upgd_w_control", 0)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["wall_clock_seconds"] = value
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+        with pytest.raises(
+            ValueError,
+            match=r"wall_clock_seconds must be a finite, non-negative number",
+        ):
+            load_shard(path)
+
+    def test_merge_propagates_finite_wall_clock_into_total(self, tmp_path, small_data):
+        """Positive control: shards with genuinely finite, non-negative
+        wall_clock_seconds still load and merge, and merge_shards sums them
+        into wall_clock_seconds_total exactly as before the guard."""
+        p0 = self._make_shard(tmp_path, small_data, "upgd_w_control", 0)
+        p1 = self._make_shard(tmp_path, small_data, "upgd_w_control", 1)
+        wc0 = json.loads(p0.read_text(encoding="utf-8"))["wall_clock_seconds"]
+        wc1 = json.loads(p1.read_text(encoding="utf-8"))["wall_clock_seconds"]
+
+        summary = merge_shards([p0, p1], control_name="upgd_w_control", slope_window=2)
+
+        entry = next(e for e in summary["results"] if e["config_name"] == "upgd_w_control")
+        assert entry["wall_clock_seconds_total"] == round(wc0 + wc1, 2)
+
     def test_validate_proxy_prefix_and_ordering(self, tmp_path, small_data):
         x, y = small_data
         partials = tmp_path / "partials"
