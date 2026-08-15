@@ -223,3 +223,38 @@ def test_sigreg_diagnostics_are_finite() -> None:
 
     chex.assert_tree_all_finite(diagnostics)
     chex.assert_shape(diagnostics.loss, ())
+
+
+def test_epps_pulley_rejects_nonfinite_samples() -> None:
+    """Two inf samples make inf-inf diffs, so the kernel statistic is NaN."""
+    samples = jnp.asarray([jnp.inf, jnp.inf], dtype=jnp.float32)
+
+    assert not bool(jnp.isfinite(jnp.mean(samples[:, None] - samples[None, :])))
+    with pytest.raises(ValueError, match="samples must be finite"):
+        epps_pulley_gaussian_statistic(samples)
+
+
+def test_sliced_sigreg_rejects_inf_embedding_times_silent_direction() -> None:
+    """Inf embedding @ a zero direction coordinate is 0*inf = NaN in the slice."""
+    embeddings = jnp.asarray([[jnp.inf, 1.0], [0.0, -0.5]], dtype=jnp.float32)
+    directions = jnp.asarray([[0.0, 1.0]], dtype=jnp.float32)
+
+    assert not bool(jnp.isfinite(embeddings @ directions.T).all())
+    with pytest.raises(ValueError, match="embeddings must be finite"):
+        sliced_sigreg_loss(embeddings, directions)
+
+
+def test_sliced_sigreg_rejects_nonfinite_directions() -> None:
+    embeddings = jnp.asarray([[-1.0, 0.5], [0.0, -0.5]], dtype=jnp.float32)
+    directions = jnp.asarray([[jnp.inf, 0.0]], dtype=jnp.float32)
+
+    with pytest.raises(ValueError, match="directions must be finite"):
+        sliced_sigreg_loss(embeddings, directions)
+
+
+def test_sigreg_diagnostics_reject_nonfinite_embeddings() -> None:
+    embeddings = jnp.asarray([[jnp.nan, 0.0]], dtype=jnp.float32)
+    directions = jnp.eye(2, dtype=jnp.float32)
+
+    with pytest.raises(ValueError, match="embeddings must be finite"):
+        sigreg_diagnostics(embeddings, directions)

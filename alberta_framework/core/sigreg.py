@@ -39,6 +39,9 @@ _FLOAT32_TINY = float(np.finfo(np.float32).tiny)
 _KERNEL_WIDTH_ERROR = (
     "kernel_width must be positive and finite in float32 kernel arithmetic"
 )
+_SAMPLES_FINITE_ERROR = "samples must be finite"
+_EMBEDDINGS_FINITE_ERROR = "embeddings must be finite"
+_DIRECTIONS_FINITE_ERROR = "directions must be finite"
 
 
 def _normalized_positive_float32(
@@ -198,6 +201,17 @@ def _validated_kernel_width(kernel_width: float | Array) -> Array:
     return _runtime_checked_value(width, predicate, _KERNEL_WIDTH_ERROR)
 
 
+def _require_finite_array(values: Array, message: str) -> Array:
+    """Reject non-finite coordinates without rewriting them to a fake zero."""
+    array = jnp.asarray(values)
+    predicate = jnp.all(jnp.isfinite(array))
+    if not isinstance(predicate, jax.core.Tracer):
+        if not bool(predicate):
+            raise ValueError(message)
+        return array
+    return _runtime_checked_value(array, predicate, message)
+
+
 def _epps_pulley_gaussian_statistic(samples: Array, width: Array) -> Array:
     """Compute the statistic after ``width`` has passed boundary validation."""
     x = jnp.ravel(jnp.asarray(samples, dtype=jnp.float32))
@@ -247,7 +261,8 @@ def epps_pulley_gaussian_statistic(
     :class:`jax.errors.JaxRuntimeError` when the result is synchronized.
     """
     width = _validated_kernel_width(kernel_width)
-    return _epps_pulley_gaussian_statistic(samples, width)
+    checked = _require_finite_array(samples, _SAMPLES_FINITE_ERROR)
+    return _epps_pulley_gaussian_statistic(checked, width)
 
 
 def sliced_sigreg_loss(
@@ -272,6 +287,8 @@ def sliced_sigreg_loss(
     if z.ndim < 2:
         raise ValueError("embeddings must have shape (..., latent_dim)")
     width = _validated_kernel_width(kernel_width)
+    z = _require_finite_array(z, _EMBEDDINGS_FINITE_ERROR)
+    dirs = _require_finite_array(dirs, _DIRECTIONS_FINITE_ERROR)
     flat = jnp.reshape(z, (-1, z.shape[-1]))
     projections = flat @ dirs.T
     per_projection = jax.vmap(
@@ -290,6 +307,8 @@ def sigreg_diagnostics(
     cfg = config or SIGRegConfig()
     z = jnp.asarray(embeddings, dtype=jnp.float32)
     dirs = jnp.asarray(directions, dtype=jnp.float32)
+    z = _require_finite_array(z, _EMBEDDINGS_FINITE_ERROR)
+    dirs = _require_finite_array(dirs, _DIRECTIONS_FINITE_ERROR)
     flat = jnp.reshape(z, (-1, z.shape[-1]))
     projected = flat @ dirs.T
     latent_std = jnp.std(flat, axis=0)
