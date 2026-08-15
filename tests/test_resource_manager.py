@@ -100,6 +100,30 @@ class TestLearnedResourceManager:
         assert int(jnp.argmax(weights)) == 0
         assert float(weights[0]) > 0.99
 
+    def test_zero_cost_weight_skips_inf_resource_cost(self) -> None:
+        """Default cost_weight is 0: 0 * inf cost is NaN in the Hedge update.
+
+        Fail-closed: a zero cost weight does not multiply the cost channel, so
+        finite losses still shift the allocation.
+        """
+        manager = LearnedResourceManager(
+            n_actions=2,
+            learning_rate=2.0,
+            discount=1.0,
+            cost_weight=0.0,
+        )
+        state = manager.init()
+        losses = jnp.asarray([0.1, 1.0], dtype=jnp.float32)
+        costs = jnp.asarray([jnp.inf, 0.0], dtype=jnp.float32)
+        result = manager.update(state, losses, resource_costs=costs)
+        for _ in range(9):
+            result = manager.update(result.state, losses, resource_costs=costs)
+
+        chex.assert_tree_all_finite(result.advantages)
+        chex.assert_tree_all_finite(result.state.log_weights)
+        assert int(jnp.argmax(manager.weights(result.state))) == 0
+        assert float(manager.weights(result.state)[0]) > 0.99
+
     def test_nan_loss_is_ignored(self) -> None:
         manager = LearnedResourceManager(n_actions=2, learning_rate=1.0)
         state = manager.init()

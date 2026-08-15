@@ -39,6 +39,15 @@ from jax import Array
 from jaxtyping import Float
 
 
+def _cost_term(cost_weight: float, costs: Array) -> tuple[Array, Array]:
+    """Return ``weight * costs``, skipping 0*inf, plus a per-action cost mask."""
+    weight = jnp.asarray(cost_weight, dtype=jnp.float32)
+    term = jnp.where(weight == 0.0, jnp.zeros_like(costs), weight * costs)
+    term = jnp.where(jnp.isfinite(term), term, jnp.zeros_like(term))
+    cost_ok = (weight == 0.0) | jnp.isfinite(costs)
+    return term, cost_ok
+
+
 def optimal_hedge_learning_rate(
     n_actions: int,
     horizon: int,
@@ -307,14 +316,15 @@ class LearnedResourceManager:
         """
         context = jnp.asarray(context_id, dtype=jnp.int32)
         losses = jnp.asarray(losses, dtype=jnp.float32)
-        finite = jnp.isfinite(losses)
-        safe_losses = jnp.where(finite, losses, 0.0)
         costs = (
-            jnp.zeros_like(safe_losses)
+            jnp.zeros_like(losses)
             if resource_costs is None
             else jnp.asarray(resource_costs, dtype=jnp.float32)
         )
-        adjusted = safe_losses + jnp.asarray(self._cost_weight, dtype=jnp.float32) * costs
+        cost_term, cost_ok = _cost_term(self._cost_weight, costs)
+        finite = jnp.isfinite(losses) & cost_ok
+        safe_losses = jnp.where(finite, losses, 0.0)
+        adjusted = safe_losses + cost_term
 
         weights = self.weights(state, context)
         finite_weight_sum = jnp.maximum(jnp.sum(jnp.where(finite, weights, 0.0)), 1e-12)
@@ -662,16 +672,17 @@ class GeneratorMetaResourceManager:
         """
         context = jnp.asarray(context_id, dtype=jnp.int32)
         rewards = jnp.asarray(rewards, dtype=jnp.float32)
-        finite = jnp.isfinite(rewards)
-        if finite_mask is not None:
-            finite = finite & jnp.asarray(finite_mask, dtype=jnp.bool_)
-        safe_rewards = jnp.where(finite, rewards, 0.0)
         costs = (
-            jnp.zeros_like(safe_rewards)
+            jnp.zeros_like(rewards)
             if resource_costs is None
             else jnp.asarray(resource_costs, dtype=jnp.float32)
         )
-        adjusted = safe_rewards - jnp.asarray(self._cost_weight, dtype=jnp.float32) * costs
+        cost_term, cost_ok = _cost_term(self._cost_weight, costs)
+        finite = jnp.isfinite(rewards) & cost_ok
+        if finite_mask is not None:
+            finite = finite & jnp.asarray(finite_mask, dtype=jnp.bool_)
+        safe_rewards = jnp.where(finite, rewards, 0.0)
+        adjusted = safe_rewards - cost_term
 
         weights = self.weights(state, context)
         finite_weight_sum = jnp.maximum(jnp.sum(jnp.where(finite, weights, 0.0)), 1e-12)
