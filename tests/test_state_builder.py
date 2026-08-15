@@ -255,6 +255,38 @@ def test_online_gated_episode_reset_preserves_learning_and_lifetime_counters() -
     assert bool(jnp.any(restarted_state.parameter_sensitivity != 0.0))
 
 
+def test_online_gated_builder_holds_sensitivity_on_inf_observation() -> None:
+    """Inf events poison RTRL sensitivity via jacfwd and 0*inf gate carry.
+
+    Fail-closed: hold the previous finite hidden state and eligibility so a
+    later finite observation can still learn.
+    """
+    builder = OnlineGatedStateBuilder(
+        OnlineGatedStateBuilderConfig(
+            observation_dim=2,
+            hidden_dim=3,
+            step_size=0.05,
+        )
+    )
+    state, _ = builder.start(builder.init(jr.key(7)), jnp.asarray([1.0, 1.0]))
+    finite_hidden = state.hidden
+    finite_sensitivity = state.parameter_sensitivity
+    inf_obs = jnp.asarray([jnp.inf, 0.0])
+    poisoned, _ = builder.update(state, inf_obs, -1, 0.0, 1.0)
+    twice, _ = builder.update(poisoned, inf_obs, -1, 0.0, 1.0)
+    recovered, _ = builder.update(twice, jnp.asarray([0.0, 0.0]), -1, 0.0, 1.0)
+    learned, diagnostics = builder.learn(
+        recovered, jnp.concatenate([jnp.zeros(2), jnp.ones(3)])
+    )
+
+    chex.assert_trees_all_close(poisoned.hidden, finite_hidden)
+    chex.assert_trees_all_close(poisoned.parameter_sensitivity, finite_sensitivity)
+    chex.assert_tree_all_finite(twice)
+    chex.assert_tree_all_finite(recovered)
+    assert bool(diagnostics.valid)
+    chex.assert_tree_all_finite(learned)
+
+
 def _online_learning_source() -> tuple[
     OnlineGatedStateBuilder,
     object,

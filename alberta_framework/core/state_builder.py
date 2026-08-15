@@ -1401,11 +1401,17 @@ class OnlineGatedStateBuilder:
 
         gate_weights, gate_bias, _, _ = self._unpack_parameters(state.parameters)
         gate = jax.nn.sigmoid(gate_weights @ event + gate_bias)
-        new_sensitivity = direct_sensitivity + ((1.0 - gate)[:, None] * state.parameter_sensitivity)
+        carry = (1.0 - gate)[:, None]
+        # Closed gates must not multiply an inf eligibility (0*inf).
+        carried_sensitivity = jnp.where(carry == 0.0, 0.0, carry * state.parameter_sensitivity)
+        new_sensitivity = direct_sensitivity + carried_sensitivity
+        event_finite = jnp.all(jnp.isfinite(event))
         next_state = OnlineGatedStateBuilderState(
             parameters=state.parameters,
-            hidden=new_hidden,
-            parameter_sensitivity=new_sensitivity,
+            hidden=jnp.where(event_finite, new_hidden, state.hidden),
+            parameter_sensitivity=jnp.where(
+                event_finite, new_sensitivity, state.parameter_sensitivity
+            ),
             step_count=_saturating_int32_increment(state.step_count),
             update_count=state.update_count,
             last_gradient_norm=state.last_gradient_norm,
