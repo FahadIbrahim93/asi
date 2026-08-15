@@ -342,7 +342,10 @@ class ActorCriticAgent:
             else:
                 discount = jnp.where(terminated, 0.0, cfg.gamma)
         discount = jnp.asarray(discount, dtype=jnp.float32)
-        bootstrap = discount * next_value
+        # Terminal 0 * inf V(s') is NaN and would freeze the critic.
+        bootstrap = jnp.where(
+            discount == 0.0, jnp.zeros_like(next_value), discount * next_value
+        )
         td_error = reward + bootstrap - value
 
         one_hot = jax.nn.one_hot(action, cfg.n_actions, dtype=jnp.float32)
@@ -351,10 +354,38 @@ class ActorCriticAgent:
 
         actor_decay = discount * cfg.actor_lamda
         critic_decay = discount * cfg.critic_lamda
-        actor_trace_weights = actor_decay * state.actor_trace_weights + actor_grad_weights
-        actor_trace_bias = actor_decay * state.actor_trace_bias + actor_grad_bias
-        critic_trace_weights = critic_decay * state.critic_trace_weights + prev_obs
-        critic_trace_bias = critic_decay * state.critic_trace_bias + 1.0
+        actor_trace_weights = (
+            jnp.where(
+                actor_decay == 0.0,
+                jnp.zeros_like(state.actor_trace_weights),
+                actor_decay * state.actor_trace_weights,
+            )
+            + actor_grad_weights
+        )
+        actor_trace_bias = (
+            jnp.where(
+                actor_decay == 0.0,
+                jnp.zeros_like(state.actor_trace_bias),
+                actor_decay * state.actor_trace_bias,
+            )
+            + actor_grad_bias
+        )
+        critic_trace_weights = (
+            jnp.where(
+                critic_decay == 0.0,
+                jnp.zeros_like(state.critic_trace_weights),
+                critic_decay * state.critic_trace_weights,
+            )
+            + prev_obs
+        )
+        critic_trace_bias = (
+            jnp.where(
+                critic_decay == 0.0,
+                jnp.zeros_like(state.critic_trace_bias),
+                critic_decay * state.critic_trace_bias,
+            )
+            + 1.0
+        )
 
         actor_steps: tuple[Array, ...] = (
             cfg.actor_step_size * actor_trace_weights,
@@ -417,7 +448,7 @@ class ActorCriticAgent:
             & (action < cfg.n_actions)
             & jnp.all(jnp.isfinite(old_policy))
             & jnp.isfinite(value)
-            & jnp.isfinite(next_value)
+            & ((discount == 0.0) | jnp.isfinite(next_value))
             & jnp.isfinite(actor_metric)
             & jnp.isfinite(critic_metric)
         )
@@ -461,7 +492,9 @@ class ActorCriticAgent:
             ),
             policy=jnp.where(params_ok, next_policy, jnp.zeros_like(next_policy)),
             value=jnp.where(params_ok, value, zero),
-            next_value=jnp.where(params_ok, next_value, zero),
+            next_value=jnp.where(
+                params_ok & jnp.isfinite(next_value), next_value, zero
+            ),
             td_error=jnp.where(params_ok, td_error, zero),
             bound_metric=jnp.where(
                 params_ok, (actor_metric + critic_metric) / 2.0, zero
@@ -939,7 +972,10 @@ class ContinuousActorCriticAgent:
             else:
                 discount = jnp.where(terminated, 0.0, cfg.gamma)
         discount = jnp.asarray(discount, dtype=jnp.float32)
-        bootstrap = discount * next_value
+        # Terminal 0 * inf V(s') is NaN and would freeze the critic.
+        bootstrap = jnp.where(
+            discount == 0.0, jnp.zeros_like(next_value), discount * next_value
+        )
         td_error = reward + bootstrap - value
 
         sigma_sq = prev_sigma * prev_sigma + 1e-8
@@ -953,11 +989,46 @@ class ContinuousActorCriticAgent:
 
         actor_decay = discount * cfg.actor_lamda
         critic_decay = discount * cfg.critic_lamda
-        mean_trace_weights = actor_decay * state.mean_trace_weights + mean_grad_weights
-        mean_trace_bias = actor_decay * state.mean_trace_bias + mean_grad_bias
-        log_sigma_trace = actor_decay * state.log_sigma_trace + log_sigma_grad
-        critic_trace_weights = critic_decay * state.critic_trace_weights + prev_obs
-        critic_trace_bias = critic_decay * state.critic_trace_bias + 1.0
+        mean_trace_weights = (
+            jnp.where(
+                actor_decay == 0.0,
+                jnp.zeros_like(state.mean_trace_weights),
+                actor_decay * state.mean_trace_weights,
+            )
+            + mean_grad_weights
+        )
+        mean_trace_bias = (
+            jnp.where(
+                actor_decay == 0.0,
+                jnp.zeros_like(state.mean_trace_bias),
+                actor_decay * state.mean_trace_bias,
+            )
+            + mean_grad_bias
+        )
+        log_sigma_trace = (
+            jnp.where(
+                actor_decay == 0.0,
+                jnp.zeros_like(state.log_sigma_trace),
+                actor_decay * state.log_sigma_trace,
+            )
+            + log_sigma_grad
+        )
+        critic_trace_weights = (
+            jnp.where(
+                critic_decay == 0.0,
+                jnp.zeros_like(state.critic_trace_weights),
+                critic_decay * state.critic_trace_weights,
+            )
+            + prev_obs
+        )
+        critic_trace_bias = (
+            jnp.where(
+                critic_decay == 0.0,
+                jnp.zeros_like(state.critic_trace_bias),
+                critic_decay * state.critic_trace_bias,
+            )
+            + 1.0
+        )
 
         actor_steps: tuple[Array, ...] = (
             cfg.actor_step_size * mean_trace_weights,
@@ -1028,7 +1099,7 @@ class ContinuousActorCriticAgent:
             & jnp.all(jnp.isfinite(prev_mean))
             & jnp.all(jnp.isfinite(prev_sigma))
             & jnp.isfinite(value)
-            & jnp.isfinite(next_value)
+            & ((discount == 0.0) | jnp.isfinite(next_value))
             & jnp.isfinite(actor_metric)
             & jnp.isfinite(critic_metric)
         )
@@ -1071,7 +1142,9 @@ class ContinuousActorCriticAgent:
             mean=jnp.where(params_ok, next_mean, jnp.zeros_like(next_mean)),
             sigma=jnp.where(params_ok, next_sigma, jnp.zeros_like(next_sigma)),
             value=jnp.where(params_ok, value, zero),
-            next_value=jnp.where(params_ok, next_value, zero),
+            next_value=jnp.where(
+                params_ok & jnp.isfinite(next_value), next_value, zero
+            ),
             td_error=jnp.where(params_ok, td_error, zero),
             bound_metric=jnp.where(
                 params_ok, (actor_metric + critic_metric) / 2.0, zero

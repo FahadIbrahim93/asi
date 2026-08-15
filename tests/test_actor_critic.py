@@ -399,6 +399,33 @@ def test_actor_critic_infinite_reward_with_obgd_does_not_poison_weights() -> Non
     assert bool(recovered.update_applied)
 
 
+def test_actor_critic_terminal_does_not_multiply_inf_next_value() -> None:
+    """gamma=0 * inf V(s') is 0*inf = NaN and would freeze a terminal update."""
+    agent = ActorCriticAgent(
+        ActorCriticConfig(n_actions=2, actor_step_size=0.1, critic_step_size=0.1)
+    )
+    huge = jnp.float32(1e38)
+    state = agent.init(feature_dim=2, key=jr.key(1)).replace(  # type: ignore[attr-defined]
+        last_observation=jnp.array([0.0, 1.0], dtype=jnp.float32),
+        last_action=jnp.array(0, dtype=jnp.int32),
+        critic_weights=jnp.array([huge, 0.0], dtype=jnp.float32),
+        critic_bias=jnp.array(0.0, dtype=jnp.float32),
+    )
+    next_obs = jnp.array([huge, 0.0], dtype=jnp.float32)
+    raw = jnp.asarray(0.0, dtype=jnp.float32) * (huge * huge)
+    assert not bool(jnp.isfinite(raw))
+
+    result = agent.update(
+        state,
+        reward=jnp.array(3.0, dtype=jnp.float32),
+        observation=next_obs,
+        terminated=jnp.array(True),
+    )
+    assert bool(result.update_applied)
+    chex.assert_trees_all_close(result.td_error, jnp.array(3.0, dtype=jnp.float32))
+    _assert_actor_critic_numeric_state_finite(result.state)
+
+
 def test_actor_critic_exports() -> None:
     assert TopLevelActorCriticAgent is ActorCriticAgent
     assert CoreActorCriticAgent is ActorCriticAgent
