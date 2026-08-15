@@ -195,3 +195,51 @@ def test_empty_config_sequence_still_returns_empty_results() -> None:
     assert (
         run_multi_seed_experiment([], seeds=[0], parallel=False, show_progress=False) == {}
     )
+
+
+def _two_seed_trace() -> AggregatedResults:
+    return AggregatedResults(
+        config_name="candidate",
+        seeds=[0, 1],
+        metric_arrays={
+            "squared_error": np.asarray([[1.0, 2.0, 3.0], [10.0, 20.0, 30.0]], dtype=np.float64)
+        },
+        summary={},
+    )
+
+
+@pytest.mark.parametrize("window", [0, -1, -5])
+def test_get_final_performance_rejects_non_positive_window(window: int) -> None:
+    """window<=0 is undefined: window=0 slices the whole trace, negatives drop a prefix."""
+    with pytest.raises(ValueError, match=rf"^window must be positive \(got {window}\)$"):
+        get_final_performance({"candidate": _two_seed_trace()}, window=window)
+
+
+def test_get_final_performance_rejects_empty_time_axis() -> None:
+    empty = AggregatedResults(
+        config_name="empty",
+        seeds=[0, 1],
+        metric_arrays={"squared_error": np.zeros((2, 0), dtype=np.float64)},
+        summary={},
+    )
+    with pytest.raises(
+        ValueError,
+        match=r"^AggregatedResults 'empty' must contain at least one metric step "
+        r"for 'squared_error'$",
+    ):
+        get_final_performance({"empty": empty}, window=1)
+
+
+def test_get_final_performance_window_longer_than_trace_uses_full_trace() -> None:
+    """The documented min(window, n_steps) convention is unchanged for window > 0."""
+    result = get_final_performance({"candidate": _two_seed_trace()}, window=100)
+    expected_values = np.asarray([2.0, 20.0], dtype=np.float64)
+    assert result["candidate"][0] == pytest.approx(float(np.mean(expected_values)))
+    assert result["candidate"][1] == pytest.approx(float(np.std(expected_values, ddof=1)))
+
+
+def test_get_final_performance_positive_window_is_a_suffix() -> None:
+    result = get_final_performance({"candidate": _two_seed_trace()}, window=2)
+    expected_values = np.asarray([2.5, 25.0], dtype=np.float64)
+    assert result["candidate"][0] == pytest.approx(float(np.mean(expected_values)))
+    assert result["candidate"][1] == pytest.approx(float(np.std(expected_values, ddof=1)))
