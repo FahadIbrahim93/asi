@@ -448,6 +448,24 @@ class TestOneSampleRejection:
             with pytest.raises(ValueError, match="non-empty groups"):
                 ttest_comparison(values_a, values_b, paired=False)
 
+    @pytest.mark.parametrize(
+        ("values_a", "values_b"),
+        [
+            ([], [1.0, 2.0]),
+            ([1.0, 2.0], []),
+            ([], []),
+            (np.array([], dtype=np.float64), np.array([1.0, 2.0], dtype=np.float64)),
+            (np.array([1.0, 2.0], dtype=np.float64), np.array([], dtype=np.float64)),
+        ],
+    )
+    def test_mann_whitney_empty_group_raises_without_warning(
+        self, values_a: list[float] | np.ndarray, values_b: list[float] | np.ndarray
+    ) -> None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with pytest.raises(ValueError, match="non-empty groups"):
+                mann_whitney_comparison(values_a, values_b)
+
     def test_mann_whitney_length_one_contract_unchanged(self) -> None:
         res = mann_whitney_comparison([1.0], [2.0])
         assert res.p_value == pytest.approx(1.0)
@@ -460,6 +478,11 @@ class TestOneSampleRejection:
 
 
 class TestCorrections:
+    def test_bonferroni_empty_p_values(self) -> None:
+        significant, corrected_alpha = bonferroni_correction([], alpha=0.05)
+        assert significant == []
+        assert corrected_alpha == 0.05
+
     def test_bonferroni_hand_computed(self) -> None:
         significant, corrected_alpha = bonferroni_correction([0.01, 0.02, 0.04], alpha=0.05)
         assert corrected_alpha == pytest.approx(0.05 / 3)
