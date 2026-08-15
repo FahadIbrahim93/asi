@@ -982,6 +982,25 @@ class TestShardsAndMerge:
         assert paired["mean_diff"] > CONFIRMATION_THRESHOLD
         assert paired["confirmation_candidate"] is True
 
+    def test_confirmation_candidate_rejects_mixed_sign_paired_differences(self, tmp_path):
+        """A strong mean cannot hide an aligned seed that regresses."""
+        paths = [
+            self._write_inband_shard(tmp_path, "upgd_w_control", 0, 0.50),
+            self._write_inband_shard(tmp_path, "upgd_w_control", 1, 0.50),
+            self._write_inband_shard(tmp_path, "upgd_l2init", 0, 0.60),
+            self._write_inband_shard(tmp_path, "upgd_l2init", 1, 0.499),
+        ]
+        summary = merge_shards(paths, control_name="upgd_w_control", slope_window=2)
+        result = next(
+            entry for entry in summary["results"] if entry["config_name"] == "upgd_l2init"
+        )
+        paired = result["paired_vs_control"]
+
+        assert paired["seeds"] == [0, 1]
+        assert paired["mean_diff"] > CONFIRMATION_THRESHOLD
+        assert paired["all_seeds_improve"] is False
+        assert paired["confirmation_candidate"] is False
+
     def test_atomic_writer_refuses_duplicate_without_mutating_first_result(
         self, tmp_path: Path
     ) -> None:

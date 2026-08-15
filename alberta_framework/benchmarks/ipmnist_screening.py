@@ -7260,9 +7260,12 @@ def merge_shards(
                 # A one-seed paired mean has no spread, so it cannot authorize
                 # the expensive confirmation wave. Keep the paired summary
                 # available for mid-wave inspection, but require two shared
-                # seeds before setting the compute-spending flag.
+                # seeds that all improve before setting the compute-spending
+                # flag.
                 "confirmation_candidate": bool(
-                    len(common) >= 2 and diff.mean() > CONFIRMATION_THRESHOLD
+                    len(common) >= 2
+                    and np.all(diff > 0.0)
+                    and diff.mean() > CONFIRMATION_THRESHOLD
                 ),
             }
         entries.append(entry)
