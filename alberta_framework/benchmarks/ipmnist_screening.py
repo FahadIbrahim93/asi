@@ -7152,6 +7152,7 @@ def validate_proxy(
     proxy_avg: dict[str, list[float]] = {"upgd_w": [], "adamw": []}
     full_avg: dict[str, list[float]] = {"upgd_w": [], "adamw": []}
     n_tasks_seen: set[int] = set()
+    seen_shards: set[tuple[str, int]] = set()
     for path in shard_paths:
         shard = load_shard(Path(path))
         if shard.get("noise_mode", "step") != "step":
@@ -7165,6 +7166,12 @@ def validate_proxy(
         if learner is None:
             raise ValueError(f"{path}: proxy validation accepts only control shards")
         seed = shard["seed"]
+        shard_identity = (shard["config_name"], seed)
+        if shard_identity in seen_shards:
+            raise ValueError(
+                f"duplicate proxy shard for config={shard['config_name']} seed={seed}"
+            )
+        seen_shards.add(shard_identity)
         n_tasks = int(shard["config"]["n_tasks"])
         n_tasks_seen.add(n_tasks)
         partial_path = partials_dir / f"{learner}_seed{seed}.json"

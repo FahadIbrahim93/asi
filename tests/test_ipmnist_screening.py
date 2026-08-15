@@ -988,6 +988,32 @@ class TestShardsAndMerge:
         with pytest.raises(ValueError, match="duplicate shard"):
             merge_shards([p1, p2])
 
+    def test_validate_proxy_rejects_duplicate_shards(self, tmp_path, small_data):
+        """The same (config_name, seed) shard listed twice must refuse: every
+        occurrence re-enters proxy_avg/full_avg, so one seed's curve carries
+        double weight in the ordering means behind proxy_validated (issue #152).
+        merge_shards already refuses this identity; the validation harness
+        did not."""
+        x, y = small_data
+        partials = tmp_path / "partials"
+        partials.mkdir()
+        full = run_ipmnist(x, y, "upgd_w", seeds=[0], config=SMALL)
+        (partials / "upgd_w_seed0.json").write_text(
+            json.dumps({"per_task_accuracy": full.per_task_accuracy.tolist()}),
+            encoding="utf-8",
+        )
+        proxy = run_screening_config(
+            x, y, screening_spec("upgd_w_control"), seed=0, config=SMALL
+        )
+        path = tmp_path / "upgd_w_control_seed0.json"
+        path.write_text(json.dumps(shard_payload(proxy)), encoding="utf-8")
+
+        with pytest.raises(
+            ValueError,
+            match=r"duplicate proxy shard for config=upgd_w_control seed=0",
+        ):
+            validate_proxy([path, path], partials, atol=1e-6)
+
     def test_validate_proxy_prefix_and_ordering(self, tmp_path, small_data):
         x, y = small_data
         partials = tmp_path / "partials"
