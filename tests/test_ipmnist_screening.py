@@ -944,6 +944,41 @@ class TestShardsAndMerge:
         with pytest.raises(ValueError, match="seed.*uint32"):
             load_shard(path)
 
+    @pytest.mark.parametrize("location", ["top-level", "nested"])
+    def test_load_shard_rejects_duplicate_top_level_and_nested_keys(
+        self, tmp_path: Path, location: str
+    ) -> None:
+        spec = screening_spec("upgd_w_control")
+        payload = shard_payload(
+            ipmnist_screening.ScreeningRunResult(
+                config_name=spec.name,
+                base_learner=spec.base_learner,
+                hyperparameters=dict(spec.hyperparameters),
+                seed=0,
+                config=SMALL,
+                per_task_accuracy=np.zeros(SMALL.n_tasks),
+                per_task_loss=np.zeros(SMALL.n_tasks),
+                per_task_plasticity=np.zeros(SMALL.n_tasks),
+                wall_clock_seconds=0.0,
+            )
+        )
+        encoded = json.dumps(payload, separators=(",", ":"))
+        encoded_config = json.dumps(payload["config"], separators=(",", ":"))
+        duplicate_config = '{"n_tasks":999,' + encoded_config[1:]
+        variants = {
+            "top-level": '{"schema":"forged",' + encoded[1:],
+            "nested": encoded.replace(
+                f'"config":{encoded_config}',
+                f'"config":{duplicate_config}',
+                1,
+            ),
+        }
+
+        path = tmp_path / f"duplicate-{location}.json"
+        path.write_text(variants[location], encoding="utf-8")
+        with pytest.raises(ValueError, match="duplicate JSON object key"):
+            load_shard(path)
+
     def test_merge_rejects_zero_seed_overlap_with_control(self, tmp_path, small_data):
         """An arm sharing no seeds with a present control must refuse to merge:
         the entry would rank in the summary with no paired_vs_control block and
@@ -1019,7 +1054,12 @@ class TestShardsAndMerge:
         ):
             payload["wall_clock_seconds"] = wall_clock
             path.write_text(json.dumps(payload), encoding="utf-8")
-            with pytest.raises(ValueError, match="wall_clock_seconds"):
+            message = (
+                "non-standard JSON numeric constant"
+                if type(wall_clock) is float and not math.isfinite(wall_clock)
+                else "wall_clock_seconds"
+            )
+            with pytest.raises(ValueError, match=message):
                 load_shard(path)
 
     @pytest.mark.parametrize("wall_clock", [0, 0.0, 1, 1.25, 1e308])

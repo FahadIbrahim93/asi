@@ -20,7 +20,11 @@ from alberta_framework.evaluation.recurring_feature_artifact import (
 pytestmark = pytest.mark.unit
 
 _DUPLICATE_SCHEMA = '{"schema_version":"forged.v0","schema_version":"honest.v1"}'
+_DUPLICATE_DIGEST = (
+    '{"content_digest":{"sha256":"forged","sha256":"honest"}}'
+)
 _NONFINITE = '{"value":NaN}'
+_CLEAN = '{"schema_version":"honest.v1","content_digest":{"sha256":"honest"}}'
 
 
 @pytest.mark.parametrize(
@@ -28,12 +32,18 @@ _NONFINITE = '{"value":NaN}'
     [load_ia_evidence_artifact, load_recurring_feature_artifact],
     ids=["continual_ia", "recurring_feature"],
 )
+@pytest.mark.parametrize(
+    "raw",
+    [_DUPLICATE_SCHEMA, _DUPLICATE_DIGEST],
+    ids=["top_level", "nested"],
+)
 def test_evidence_loaders_reject_duplicate_object_keys(
     tmp_path: Path,
     loader,
+    raw: str,
 ) -> None:
     path = tmp_path / "duplicate.json"
-    path.write_text(_DUPLICATE_SCHEMA, encoding="utf-8")
+    path.write_text(raw, encoding="utf-8")
 
     with pytest.raises(ValueError, match="duplicate JSON object key"):
         loader(path)
@@ -53,3 +63,21 @@ def test_evidence_loaders_still_reject_nonstandard_numeric_constants(
 
     with pytest.raises(ValueError, match="non-standard JSON"):
         loader(path)
+
+
+@pytest.mark.parametrize(
+    "loader",
+    [load_ia_evidence_artifact, load_recurring_feature_artifact],
+    ids=["continual_ia", "recurring_feature"],
+)
+def test_evidence_loaders_preserve_clean_nested_objects(
+    tmp_path: Path,
+    loader,
+) -> None:
+    path = tmp_path / "clean.json"
+    path.write_text(_CLEAN, encoding="utf-8")
+
+    assert loader(path) == {
+        "schema_version": "honest.v1",
+        "content_digest": {"sha256": "honest"},
+    }

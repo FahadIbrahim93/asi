@@ -34,6 +34,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Made evidence, IPMNIST-screening, and micro-continual artifact loaders reject duplicate
+  JSON object keys at every nesting depth instead of silently retaining the last value.
 - Protected the reserved checkpoint `_format_version` metadata key so every newly saved
   checkpoint carries the canonical on-disk format stamp even if caller metadata collides.
 - Made sparse initialization reject malformed dimensions and non-finite or out-of-range

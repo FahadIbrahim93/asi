@@ -81,6 +81,7 @@ import jax.random as jr
 import numpy as np
 from jax import Array
 
+from alberta_framework._strict_json import load_strict_json_object
 from alberta_framework.benchmarks.ipmnist_screening import (
     ScreeningStepFn,
     _finite_wall_clock_total,
@@ -850,8 +851,8 @@ def write_micro_shard(path: Path | str, payload: dict[str, Any]) -> None:
 def load_micro_shard(path: Path | str) -> dict[str, Any]:
     """Load and structurally validate one micro shard."""
     path = Path(path)
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(payload, dict) or payload.get("schema") != MICRO_SHARD_SCHEMA:
+    payload = load_strict_json_object(path)
+    if payload.get("schema") != MICRO_SHARD_SCHEMA:
         raise ValueError(f"{path}: schema mismatch (expected {MICRO_SHARD_SCHEMA})")
     if payload.get("suite_version") != MICRO_GAUSS_SUITE_VERSION:
         raise ValueError(

@@ -146,6 +146,7 @@ import numpy as np
 from jax import Array
 
 from alberta_framework._seed_validation import require_jax_seed
+from alberta_framework._strict_json import load_strict_json_object
 from alberta_framework.benchmarks.upgd_ipmnist import (
     _PLASTICITY_LOSS_FLOOR,
     ADAMW_PROTOCOL_HYPERPARAMETERS,
@@ -7098,8 +7099,8 @@ def shard_payload(result: ScreeningRunResult) -> dict[str, Any]:
 
 def load_shard(path: Path) -> dict[str, Any]:
     """Load and structurally validate one screening shard."""
-    payload = json.loads(Path(path).read_text(encoding="utf-8"))
-    if not isinstance(payload, dict) or payload.get("schema") != SHARD_SCHEMA:
+    payload = load_strict_json_object(path)
+    if payload.get("schema") != SHARD_SCHEMA:
         raise ValueError(f"{path}: not an {SHARD_SCHEMA} shard")
     config = IPMNISTConfig(**payload["config"])
     for fieldname in ("per_task_accuracy", "per_task_loss", "per_task_plasticity"):

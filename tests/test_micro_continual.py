@@ -639,6 +639,28 @@ class TestShards:
             atol=1e-8,
         )
 
+    @pytest.mark.parametrize("location", ["top-level", "nested"])
+    def test_load_rejects_duplicate_top_level_and_nested_keys(
+        self, tmp_path: Path, location: str
+    ):
+        payload = micro_shard_payload(self._result())
+        encoded = json.dumps(payload, separators=(",", ":"))
+        encoded_config = json.dumps(payload["stream_config"], separators=(",", ":"))
+        duplicate_config = '{"n_regimes":999,' + encoded_config[1:]
+        variants = {
+            "top-level": '{"suite_version":"forged",' + encoded[1:],
+            "nested": encoded.replace(
+                f'"stream_config":{encoded_config}',
+                f'"stream_config":{duplicate_config}',
+                1,
+            ),
+        }
+
+        path = tmp_path / f"duplicate-{location}.json"
+        path.write_text(variants[location], encoding="utf-8")
+        with pytest.raises(ValueError, match="duplicate JSON object key"):
+            load_micro_shard(path)
+
     def test_load_rejects_invalid_wall_clock_types_and_values(self, tmp_path: Path):
         payload = micro_shard_payload(self._result())
         path = tmp_path / "bad-wall-clock.json"
@@ -658,7 +680,12 @@ class TestShards:
         ):
             payload["wall_clock_seconds"] = wall_clock
             path.write_text(json.dumps(payload), encoding="utf-8")
-            with pytest.raises(ValueError, match="wall_clock_seconds"):
+            message = (
+                "non-standard JSON numeric constant"
+                if type(wall_clock) is float and not math.isfinite(wall_clock)
+                else "wall_clock_seconds"
+            )
+            with pytest.raises(ValueError, match=message):
                 load_micro_shard(path)
 
     @pytest.mark.parametrize("wall_clock", [0, 0.0, 1, 1.25, 1e308])
