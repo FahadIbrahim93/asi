@@ -33,7 +33,7 @@ import tempfile
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Final, NoReturn, cast
 
@@ -268,15 +268,6 @@ def _decode_canonical(raw: bytes, label: str) -> dict[str, Any]:
     if raw != canonical_json_bytes(result):
         raise ForagerMatchedCampaignError(f"{label} is not canonical JSON")
     return result
-
-
-def _safe_relative(value: str, label: str) -> PurePosixPath:
-    if not value or "\x00" in value or "\\" in value:
-        raise ForagerMatchedCampaignError(f"{label} is not a safe relative path")
-    path = PurePosixPath(value)
-    if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
-        raise ForagerMatchedCampaignError(f"{label} is not a safe relative path")
-    return path
 
 
 def _regular_directory(path: Path, label: str) -> Path:

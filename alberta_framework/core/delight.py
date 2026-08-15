@@ -535,12 +535,6 @@ def _tree_norm_certificate(tree: Any) -> tuple[Array, Array, Array, Array]:
     return point, lower, upper, resolved
 
 
-def _tree_has_nonzero(tree: Any) -> Array:
-    """Return whether any PyTree element differs from exact zero."""
-    nonzero = [jnp.any(leaf != 0.0) for leaf in jax.tree_util.tree_leaves(tree)]
-    return jnp.any(jnp.stack(nonzero))
-
-
 def _tree_normalized_dot_certificate(
     left: Any,
     right: Any,

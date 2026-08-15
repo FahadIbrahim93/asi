@@ -5,7 +5,7 @@ The production pipeline composes the existing packaged pieces conservatively:
 
 1. Step 1 enters through the adaptive optimizers used by later learners.
 2. Step 2 supplies feature augmentation in one of four modes: the lightweight
-   temporal-context featurizer, the promoted nonlinear UPGD learner (whose
+   temporal-context featurizer, the packaged nonlinear UPGD learner (whose
    penultimate hidden activations become the feature vector for downstream
    Step 3 and Step 4 learners), the associative-memory learner (whose
    next-token probability vector becomes the features), or raw identity
@@ -94,7 +94,7 @@ class Step2FeatureConfig:
 
     This is the historical "raw + EMA + delta + phase products" featurizer
     retained for back-compatibility. New deployments should consider
-    :class:`Step2UPGDConfig` for the promoted nonlinear Step 2 path.
+    :class:`Step2UPGDConfig` for the packaged nonlinear Step 2 path.
     """
 
     observation_dim: int = 4
@@ -163,7 +163,7 @@ class Step2FeatureConfig:
 
 @dataclass(frozen=True)
 class Step2UPGDConfig:
-    """Config for the promoted UPGD-backed Step 2 featurizer.
+    """Config for the packaged UPGD-backed Step 2 featurizer.
 
     The UPGD learner's penultimate hidden activations are exposed as the
     feature vector for downstream Step 3 and Step 4 learners. The number of
@@ -250,7 +250,7 @@ class Step2UPGDConfig:
         hidden_sizes: tuple[int, ...] = (64, 64),
         step_size: float = 0.018,
     ) -> Step2UPGDConfig:
-        """Return the promoted strict digit/readout Step 2 config."""
+        """Return the packaged strict digit/readout Step 2 config."""
         return cls(
             observation_dim=observation_dim,
             n_heads=n_heads,

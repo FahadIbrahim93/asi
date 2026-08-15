@@ -4,7 +4,13 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
+.hypothesis/
+.coverage
+.coverage.*
+htmlcov/
+build/
 dist/
+*.egg-info/
 
 # Benchmark-run bulk that is NOT evidence: frozen source duplicates used for
 # concurrent-edit-proof matrix execution, failed-run diagnostic retries, and

@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Moved plotting, dataset, progress, and parallel-execution dependencies from the base
+  installation into a `research` extra; the `dev` extra retains the complete contributor
+  toolchain.
+- Made the source-checkout installation path explicit and documented that the existing
+  `alberta-framework` project on PyPI is a different distribution.
+- Consolidated locked CI setup, pytest shard planning, and package validation so each concern
+  has one implementation and built artifacts are tested without rebuilding them.
+
+### Fixed
+
+- Removed broad package-import fallbacks that hid internal failures, and broke the
+  learner/stream import cycle without making Gymnasium a base dependency.
+- Added regression coverage for package import boundaries, release metadata, CI shard
+  planning, synchronized agent guides, and local documentation links.
+- Required at least two shared seeds before an IPMNIST arm can authorize confirmation
+  compute; one-seed paired summaries remain available for development inspection.
+- Kept core Autostep and the screening lane's IDBD/Autostep meta-state finite when a
+  non-finite correlation would otherwise turn a silent trace into a persistent NaN.
+
+### Removed
+
+- Removed superseded private helpers, unreachable branches, and the duplicate documentation
+  index while preserving public APIs, evidence validators, and protocol boundaries.
+
 ## [0.29.0] - 2026-08-14
 
 Changes since 0.28.0 are summarized by durable user-visible behavior. Development campaign
@@ -60,7 +86,7 @@ measurements remain in their primary output records; none promotes a registry cl
 
 #### Scientific and evidence status
 
-- No Unreleased result promotes an evidence-registry claim. IPMNIST, micro-suite,
+- No 0.29.0 result promotes an evidence-registry claim. IPMNIST, micro-suite,
   rule-discovery, partner, memory, and planning measurements remain development-only.
 - The live evidence registry remains fail-closed with all five claims `invalid` because
   registered source bytes have changed since their artifacts were pinned. The immutable

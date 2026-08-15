@@ -11,7 +11,7 @@ softmax over nearest-prototype class logits.
 
 The budget is static, every step can update the memory, and the state is a
 JAX PyTree, so the learner runs under ``jax.lax.scan``.  It is the core of
-the promoted Step 2 retained-view memory
+the packaged Step 2 retained-view memory
 (:func:`alberta_framework.steps.step2.make_step2_memory_learner`).
 """
 
@@ -43,7 +43,7 @@ class PrototypeMemoryConfig:
     ``novelty_threshold`` and ``bandwidth`` are both in units of *mean
     per-dimension* squared distance, so they are insensitive to
     ``feature_dim`` but scale with the square of the input magnitude. The
-    defaults are the promoted Step 2 MNIST-pixel calibration
+    defaults are the development-selected Step 2 MNIST-pixel calibration
     (:class:`~alberta_framework.steps.step2.Step2MemoryConfig` uses the same
     values); retune them for features on a different scale.
     """

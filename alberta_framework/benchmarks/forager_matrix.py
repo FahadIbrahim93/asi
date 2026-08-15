@@ -1894,14 +1894,6 @@ def _decode_canonical_artifact(
     return payload
 
 
-def _load_canonical_artifact(path: Path, *, description: str) -> Mapping[str, Any]:
-    try:
-        raw = _read_regular_file_bytes(path)
-    except ForagerMatrixStateError as exc:
-        raise ForagerMatrixStateError(f"could not read {description}: {exc}") from exc
-    return _decode_canonical_artifact(raw, description=description)
-
-
 @dataclass
 class _BoundPathComponent:
     parent_descriptor: int
@@ -2495,89 +2487,6 @@ def _atomic_create_bound_json(
     )
 
 
-def _atomic_create_bytes(path: Path, encoded: bytes) -> None:
-    """Atomically create bytes through a no-follow directory descriptor."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    flags = os.O_RDONLY | os.O_DIRECTORY
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    try:
-        directory_descriptor = os.open(path.parent, flags)
-    except OSError as exc:
-        raise ForagerMatrixStateError(
-            f"could not open artifact directory without following links: {path.parent}"
-        ) from exc
-    temporary_name: str | None = None
-    descriptor: int | None = None
-    try:
-        try:
-            os.stat(path.name, dir_fd=directory_descriptor, follow_symlinks=False)
-        except FileNotFoundError:
-            pass
-        else:
-            raise ForagerMatrixStateError(f"refusing to overwrite existing artifact {path}")
-
-        create_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-        if hasattr(os, "O_NOFOLLOW"):
-            create_flags |= os.O_NOFOLLOW
-        for attempt in range(100):
-            candidate = f".{path.name}.{os.getpid()}.{time.time_ns()}.{attempt}.tmp"
-            try:
-                descriptor = os.open(
-                    candidate,
-                    create_flags,
-                    0o600,
-                    dir_fd=directory_descriptor,
-                )
-            except FileExistsError:
-                continue
-            temporary_name = candidate
-            break
-        if descriptor is None or temporary_name is None:  # pragma: no cover
-            raise ForagerMatrixStateError(f"could not allocate a temporary artifact for {path}")
-        try:
-            view = memoryview(encoded)
-            while view:
-                written = os.write(descriptor, view)
-                if written <= 0:  # pragma: no cover - defensive OS contract check
-                    raise ForagerMatrixStateError(f"short write while creating artifact {path}")
-                view = view[written:]
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
-            descriptor = None
-        try:
-            os.link(
-                temporary_name,
-                path.name,
-                src_dir_fd=directory_descriptor,
-                dst_dir_fd=directory_descriptor,
-                follow_symlinks=False,
-            )
-        except FileExistsError as exc:
-            raise ForagerMatrixStateError(
-                f"refusing to overwrite concurrently created artifact {path}"
-            ) from exc
-        try:
-            os.fsync(directory_descriptor)
-        except OSError as exc:  # pragma: no cover - filesystem-specific
-            raise ForagerMatrixStateError(
-                f"could not synchronize artifact directory {path.parent}"
-            ) from exc
-    finally:
-        if descriptor is not None:
-            os.close(descriptor)
-        if temporary_name is not None:
-            with contextlib.suppress(FileNotFoundError):
-                os.unlink(temporary_name, dir_fd=directory_descriptor)
-        os.close(directory_descriptor)
-
-
-def _atomic_create_json(path: Path, payload: Mapping[str, Any]) -> None:
-    """Atomically create a canonical artifact without replacing any file."""
-    _atomic_create_bytes(path, _canonical_json_bytes(payload) + b"\n")
-
-
 def _read_regular_file_bytes(
     path: Path,
     *,
@@ -2771,15 +2680,6 @@ def _build_source_snapshot() -> _SourceSnapshot:
 def _source_tree_sha256() -> str:
     """Hash the exact reconstructible source inventory."""
     return _build_source_snapshot().tree_sha256
-
-
-def _verify_source_snapshot_file(path: Path, expected: _SourceSnapshot) -> None:
-    actual = _read_regular_file_bytes(path)
-    actual_sha256 = hashlib.sha256(actual).hexdigest()
-    if actual_sha256 != expected.archive_sha256 or actual != expected.archive_bytes:
-        raise ForagerMatrixStateError(
-            "immutable source snapshot does not match the current source tree"
-        )
 
 
 def _validate_source_snapshot_bytes(
@@ -4144,25 +4044,6 @@ def _validate_tuning_reference(
         "identity, and environment RNG schedule. Bare manifest declarations are "
         "never trusted."
     )
-
-    # The return shape remains documented here for the external adapter. The
-    # host runner cannot reach it without a verifier-issued envelope.
-    return {
-        "report_path": selection.report_path,
-        "file_sha256": actual_file_sha256,
-        "report_payload_sha256": report["payload_sha256"],
-        "matrix_config_sha256": report["matrix_config_sha256"],
-        "tuning_seeds": list(tuning_seeds),
-        "stage_protocol_conformant": protocol["stage_protocol_conformant"],
-        "selection_protocol_conformant": protocol["selection_protocol_conformant"],
-        "immutable_source_execution": protocol["immutable_source_execution"],
-        "runtime_immutable": protocol["runtime_immutable"],
-        "metric_evidence_conformant": protocol["metric_evidence_conformant"],
-        "rng_schedule_conformant": protocol["rng_schedule_conformant"],
-        "execution_manifest_sha256": tuning_execution["payload_sha256"],
-        "selected_variants": selected_details,
-    }
-
 
 def _protocol_conformance(
     manifest: ForagerMatrixManifest,

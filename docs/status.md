@@ -36,94 +36,39 @@ evidence are different kinds of progress. A public class or passing test proves
 that a mechanism exists; it does not by itself prove benefit, retention,
 resource parity, or integration.
 
-## Evidence levels
+## Evidence interpretation
 
-- **L0 — mechanism:** API, shape, finite-value, serialization, ownership, or
-  local-update contracts pass.
-- **L1 — learning:** a component learns in a controlled toy problem.
-- **L2 — comparison:** a preregistered, multi-seed, matched-resource benchmark
-  establishes the frozen claim against strong baselines.
-- **L3 — integration:** one uninterrupted agent life demonstrates the required
-  interactions, retention, recovery, bounded resources, and causal ablations.
+The stable evidence scale is L0 for mechanism contracts, L1 for learning in a
+controlled toy problem, L2 for preregistered matched-resource comparison, and
+L3 for integration across one uninterrupted agent life. The
+[evidence methodology](evidence/methodology.md) defines these levels,
+promotion rules, artifact contracts, registered frozen outcomes, and the two
+narrow historical compatibility routes in detail.
 
 For this repository, a Step is complete only when its defining outcome reaches
 L2 and its required links to earlier Steps are exercised at L3. Missing
-promoted evidence must fail closed; it must not be treated as a skipped test or
-inferred from adjacent results.
+promoting evidence must fail closed; it must not be treated as a skipped test
+or inferred from adjacent results. All twelve public Step modules contain
+mechanism or smoke surfaces. Only the Step 1 and Step 2 smoke probes are
+console scripts; smoke execution is L0 and structurally nonpromoting.
 
-All twelve public Step modules contain mechanism or smoke surfaces. Only the
-Step 1 and Step 2 smoke probes are console scripts. Smoke execution is L0 and
-is structurally nonpromoting.
+## Live evidence registry
 
-## Registered evidence
-
-The five-claim registry is intentionally narrow. Even an `accepted` overall
-registry result would mean only that every listed narrow gate passed. It would
-not certify the package, complete a Step, or establish Alberta Plan completion.
-
-The immutable stored artifacts record these frozen outcomes:
-
-| Claim ID | Frozen scope | Artifact | Frozen outcome |
-|---|---|---|---|
-| `recurring_pair_features` | Retention and active-bank allocation of supplied pair-product features in a Gaussian/L2 recurring probe | [`evidence.v1.json`](../outputs/recurring_feature/evidence.v1.json) | Accepted, narrow L2 |
-| `scale_robust_pair_features` | Scale-robust selection and structural retention of relevant pair products in a visibly cued regression gauntlet | [`evidence.v2.json`](../outputs/scale_robust_feature/evidence.v2.json) | Accepted, narrow L2 |
-| `ftl_world_model_decision_fidelity` | Low menu regret for a sparse online transition model in one deterministic A–B–A decision-fidelity protocol | [`evidence.v1.json`](../outputs/ftl_decision/evidence.v1.json) | Accepted historical L2 |
-| `recurring_multiagent_coadaptation` | Fixed-memory coadaptation and retention in one visibly cued two-agent A–B–A sanity benchmark | [`evidence.json`](../outputs/continual_multiagent/evidence.json) | Accepted, narrow L2 |
-| `continual_intelligence_amplification` | Causal recommendation-channel uplift in one deterministic hidden-phase micro-MDP | [`evidence.json`](../outputs/continual_ia/evidence.json) | Valid rejection at the frozen L2 gate |
-
-The IA artifact remains a scientifically useful rejection. Its reward uplift
-and augmentation-control checks do not override the failed frozen
-action-changing-intervention gate. The threshold must not be lowered after the
-result.
-
-### Live validation semantics
-
-Run the registry from a repository checkout:
+The registry is intentionally limited to five narrow claims. Its exact claim
+inventory, source closures, and exit-code semantics live in
+[`evidence_manifest.py`](../alberta_framework/evaluation/evidence_manifest.py),
+while versioned artifacts and their strict validators own frozen outcomes. Run
+the live check from a repository checkout:
 
 ```bash
 .venv/bin/alberta-evidence-status
 ```
 
-The operational statuses are:
-
-- `accepted`: a valid promoting L2/L3 artifact passed its frozen gate;
-- `valid-rejection`: a valid promoting artifact failed at least one gate;
-- `not-run`: a required artifact is absent;
-- `invalid`: schema, provenance, source, integrity, reconstruction, or
-  contract validation failed; and
-- `verified-nonpromoting`: a valid unit or smoke record that cannot promote.
-
-The command exits `0` only when all registered promoting claims are accepted,
-`1` for a missing artifact, valid rejection, or nonpromoting-only result, and
-`2` when any claim is invalid.
-
-Validation hashes each claim's exact registered source paths. A clean worktree
-is not required. Changes outside a claim's source closure are recorded as
-operational provenance but are not independently disqualifying. A change to a
-registered source is a source mismatch and normally makes the persisted
-artifact invalid until a newly authorized frozen protocol writes a new
-artifact that passes its strict validator.
-
-Two historical compatibility routes are deliberately narrower than a general
-source-drift waiver:
-
-- The FTL route is eligible only for its exact v1 contract and prescribed
-  builder-only drift. It reconstructs the historical acceptance and checks an
-  already-consumed-seed replay against unchanged invariant sources. That replay
-  is compatibility evidence, never fresh promotion evidence.
-- The IA route is eligible only for its exact v1 historical-rejection chain.
-  Its archived source snapshot and consumed-seed replay can preserve the
-  original rejection classification, never turn it into current-source
-  acceptance.
-
-Any additional source drift, artifact mutation, schema mismatch, or failed
-reconstruction remains invalid. Pinned artifacts must not be edited, repaired,
-or overwritten. New work writes a new path and, when the contract requires it,
-a new schema version with untouched preregistered seeds.
-
-Normal package installations do not include `outputs/`, so registry execution
-from an installed wheel or sdist normally reports artifacts as missing. Use a
-checkout to inspect the stored evidence chain.
+An accepted registry does not certify the package, complete a Step, or
+establish Alberta Plan completion. Source mismatches and invalid artifacts fail
+closed; pinned artifacts must not be edited or repaired. Normal wheel and
+sdist installations exclude `outputs/`, so their registry checks ordinarily
+report artifacts as missing.
 
 ## Alberta Steps 1–12
 

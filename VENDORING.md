@@ -11,6 +11,10 @@ intentional.
 - **Fork point:** `lalalune/alberta` @
   `2ac35333efae45cf969ce02ec1f2703476fed6c2`
 - **Development repository:** https://github.com/elizaOS/asi
+- **Distribution status:** this fork is not published under a fork-controlled
+  PyPI name. The existing `alberta-framework` project on PyPI is a different
+  distribution; publishing this fork requires an explicit namespace and owner
+  decision.
 - **Canonical upstream repository:** https://github.com/lalalune/alberta
   (this is the single upstream identity; the `j-klawson/alberta-framework`
   URLs that older `pyproject.toml`/`CITATION.cff` revisions pointed at are
@@ -19,7 +23,7 @@ intentional.
 
 ## Why it lives here
 
-`eliza-robot` (`packages/research/robot`) uses the Alberta continual-RL
+The elizaOS `eliza-robot` research package uses the Alberta continual-RL
 control subset to train robot policies that learn a sequence of tasks without
 catastrophic forgetting, and benchmarks it against standard RL (PPO). The
 framework is imported in-process from the robot's Python 3.12 environment,
@@ -79,9 +83,9 @@ stack during every base-package import.
 
 ## Continual-RL subset used by the robot package
 
-The robot tree's direct imports are `alberta_framework.core.actor_critic`,
+The robot package's direct imports are `alberta_framework.core.actor_critic`,
 `core.continual_backprop`, `core.initializers`, `core.normalizers`,
 `core.optimizers`, and the top-level re-exports `SARSAAgent`, `SARSAConfig`,
 and `ObGDBounding`. The top-level package must remain importable from the
-robot environment, but benchmark campaigns and the 12-step / `diffeml_*` /
-prototype machinery are not robot dependencies.
+robot environment, but benchmark campaigns and the 12-step and prototype
+machinery are not robot dependencies.

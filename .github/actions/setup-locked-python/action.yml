@@ -1,0 +1,48 @@
+---
+name: Set up locked Alberta environment
+description: Install one Python and synchronize the committed uv lockfile.
+
+inputs:
+  python-version:
+    description: Python version understood by actions/setup-python.
+    required: true
+  extras:
+    description: Space-separated uv extra arguments.
+    required: false
+    default: "--extra dev"
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Python ${{ inputs.python-version }}
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python-version }}
+
+    - name: Set up uv
+      uses: astral-sh/setup-uv@v6
+      with:
+        version: "0.9.24"
+        enable-cache: true
+        cache-dependency-glob: uv.lock
+
+    - name: Synchronize locked dependencies
+      shell: bash
+      env:
+        ALBERTA_UV_EXTRAS: ${{ inputs.extras }}
+      run: |
+        set -euo pipefail
+        extra_args=()
+        if [[ -n "$ALBERTA_UV_EXTRAS" ]]; then
+          read -r -a extra_args <<< "$ALBERTA_UV_EXTRAS"
+        fi
+        uv sync \
+          --no-install-project \
+          --locked \
+          --python "$(command -v python)" \
+          "${extra_args[@]}"
+        uv sync \
+          --no-build-isolation \
+          --locked \
+          --python "$(command -v python)" \
+          "${extra_args[@]}"

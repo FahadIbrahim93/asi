@@ -24,87 +24,35 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python 3.12
-        uses: actions/setup-python@v5
+      - name: Set up locked Python 3.12
+        uses: ./.github/actions/setup-locked-python
         with:
           python-version: "3.12"
-          cache: pip
-          cache-dependency-path: pyproject.toml
-
-      - name: Install collection dependencies
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install \
-            -e '.[dev,gymnasium,forager]' \
-            pytest-xdist
+          extras: --extra dev --extra gymnasium --extra forager
 
       - name: Collect selected slow tests
         run: |
-          python -m pytest tests \
+          uv run --no-sync python -m pytest tests \
             --collect-only \
             -q \
             --disable-warnings \
-            -m slow \
+            -m "slow and not package" \
             -o addopts="" \
+            --strict-config \
+            --strict-markers \
             > "$RUNNER_TEMP/slow-nodeids.txt"
 
       - name: Build a balanced nonempty slow matrix
         id: plan
         run: |
-          python - <<'PY'
-          import json
-          import os
-          from collections import Counter
-          from pathlib import Path
-
-          nodeids = Path(
-              os.environ["RUNNER_TEMP"], "slow-nodeids.txt"
-          ).read_text(encoding="utf-8").splitlines()
-          counts = Counter(
-              line.split("::", 1)[0]
-              for raw in nodeids
-              if (line := raw.strip()).startswith("tests/") and "::" in line
-          )
-          if not counts:
-              raise SystemExit("pytest selected no slow test nodes")
-
-          limit = int(os.environ["SLOW_SHARD_COUNT"])
-          shard_count = min(limit, len(counts))
-          buckets = [[] for _ in range(shard_count)]
-          totals = [0 for _ in range(shard_count)]
-          ordered = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
-          for path, count in ordered:
-              index = min(
-                  range(shard_count),
-                  key=lambda candidate: (totals[candidate], candidate),
-              )
-              buckets[index].append(path)
-              totals[index] += count
-
-          include = [
-              {
-                  "shard": index + 1,
-                  "files_json": json.dumps(sorted(files)),
-                  "node_count": totals[index],
-              }
-              for index, files in enumerate(buckets)
-              if files
-          ]
-          matrix = json.dumps({"include": include}, separators=(",", ":"))
-          output_path = os.environ["GITHUB_OUTPUT"]
-          with open(output_path, "a", encoding="utf-8") as output:
-              output.write(f"matrix={matrix}\n")
-          with open(
-              os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8"
-          ) as summary:
-              summary.write(
-                  f"Selected {sum(counts.values())} slow nodes in "
-                  f"{len(counts)} files across {shard_count} shards.\n"
-              )
-          PY
+          uv run --no-sync python .github/scripts/plan_pytest_shards.py \
+            --nodeids "$RUNNER_TEMP/slow-nodeids.txt" \
+            --shards "$SLOW_SHARD_COUNT" \
+            --python-version 3.12 \
+            --label "slow, non-package"
 
   slow:
-    name: slow py3.12 shard ${{ matrix.shard }}
+    name: slow py${{ matrix.python }} shard ${{ matrix.shard }}
     needs: discover
     runs-on: ubuntu-latest
     timeout-minutes: 180
@@ -114,28 +62,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python 3.12
-        uses: actions/setup-python@v5
+      - name: Set up locked Python ${{ matrix.python }}
+        uses: ./.github/actions/setup-locked-python
         with:
-          python-version: "3.12"
-          cache: pip
-          cache-dependency-path: pyproject.toml
-
-      - name: Install slow-test dependencies
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install \
-            -e '.[dev,gymnasium,forager]' \
-            pytest-xdist
+          python-version: ${{ matrix.python }}
+          extras: --extra dev --extra gymnasium --extra forager
 
       - name: Run selected slow tests
         env:
           JUNIT_PATH: >-
-            ${{ runner.temp }}/junit-slow-py312-shard-${{
+            ${{ runner.temp }}/junit-slow-py${{ matrix.python }}-shard-${{
             matrix.shard }}.xml
           TEST_FILES_JSON: ${{ matrix.files_json }}
         run: |
-          python - <<'PY'
+          uv run --no-sync python - <<'PY'
           import json
           import os
           import subprocess
@@ -159,8 +99,10 @@ jobs:
               "-rs",
               "-o",
               "addopts=",
+              "--strict-config",
+              "--strict-markers",
               "-m",
-              "slow",
+              "slow and not package",
               "-n",
               "2",
               "--dist",
@@ -181,9 +123,10 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: junit-slow-py312-shard-${{ matrix.shard }}
+          name: >-
+            junit-slow-py${{ matrix.python }}-shard-${{ matrix.shard }}
           path: >-
-            ${{ runner.temp }}/junit-slow-py312-shard-${{
+            ${{ runner.temp }}/junit-slow-py${{ matrix.python }}-shard-${{
             matrix.shard }}.xml
           if-no-files-found: warn
           retention-days: 14

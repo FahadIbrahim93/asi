@@ -42,25 +42,28 @@ contracts, and validator semantics.
 Alberta Framework requires Python 3.12 or newer, JAX/JAXlib 0.7.1 or newer, and
 NumPy 1.26 or newer.
 
+This development fork is not published under a fork-controlled PyPI name. The
+existing `alberta-framework` project on PyPI is a different distribution and
+does not install this repository. Install from a checkout:
+
 ```bash
-pip install alberta-framework
+git clone https://github.com/elizaOS/asi.git
+cd asi
+python3.12 -m venv .venv
+.venv/bin/python -m pip install -e .
 ```
 
 Optional dependency groups are available for common workflows:
 
 ```bash
-pip install 'alberta-framework[gymnasium]'  # Gymnasium adapters
-pip install 'alberta-framework[forager]'    # continual-foragax testbed
-pip install 'alberta-framework[gpu]'        # JAX CUDA 12 build
-pip install 'alberta-framework[dev]'        # tests, lint, and type checking
+.venv/bin/python -m pip install -e '.[gymnasium]'  # Gymnasium adapters
+.venv/bin/python -m pip install -e '.[forager]'    # continual-foragax testbed
+.venv/bin/python -m pip install -e '.[research]'   # plotting, datasets, parallel helpers
+.venv/bin/python -m pip install -e '.[gpu]'        # JAX CUDA 12 build
+.venv/bin/python -m pip install -e '.[dev]'        # tests, lint, and type checking
 ```
 
-For repository development, use the project virtual environment for every command:
-
-```bash
-python3.12 -m venv .venv
-.venv/bin/python -m pip install -e '.[dev]'
-```
+For repository development, use that project virtual environment for every command.
 
 ## Quick start
 
@@ -97,6 +100,25 @@ The repository also exposes short Step 1 and Step 2 integration probes:
 
 These commands check that the selected kernel runs and returns finite metrics. They are not
 scientific experiments or evidence gates.
+
+## Command-line interfaces
+
+The console scripts are grouped by responsibility; every command supports `--help`.
+
+| Commands | Purpose |
+|---|---|
+| `alberta-step1-smoke`, `alberta-step2-smoke` | Nonpromoting mechanism smoke checks |
+| `alberta-evidence-status` | Validate the complete five-claim evidence registry |
+| `alberta-recurring-feature-evidence`, `alberta-scale-robust-evidence`, `alberta-ftl-evidence`, `alberta-multiagent-evidence`, `alberta-ia-evidence` | Validate or build one claim's versioned artifact under its strict protocol |
+| `alberta-forager-benchmark` | Run development Forager comparisons; its `historical` subcommand exposes reconstructed historical-family inspection |
+| `alberta-historical-forager` | Compatibility alias for the historical inspection subcommand |
+| `alberta-foragax-open-screen` | Operate the bounded open-screen workflow documented in the runbook |
+| `alberta-foragax-oci` | Prepare, archive, build, inspect, probe, emit, or qualify the attested OCI execution environment |
+| `alberta-forager-matched-campaign`, `alberta-forager-matched-qualification`, `alberta-forager-matched-sealed-evaluation` | Operate the matched-comparison campaign stages |
+
+Benchmark commands are not shortcuts around the evidence rules. Read
+[`FORAGER_BENCHMARK.md`](FORAGER_BENCHMARK.md) and the
+[`foragax-open-screen` runbook](docs/runbooks/foragax-open-screen.md) before using them.
 
 ## Package layout
 
@@ -202,6 +224,7 @@ The repository uses these pytest markers:
 - `integration`: component, persistence, process, or CLI boundaries
 - `scientific`: frozen promoted-evidence protocols
 - `slow`: wall-clock-heavy tests excluded from the fast per-change lane
+- `package`: built-distribution and installed-entry-point contracts run only in the package lane
 
 Benchmark campaigns run through their scripts or console CLIs, never as ordinary pytest work.
 Keep tests CI-cheap unless the protocol is deliberately registered as scientific evidence.

@@ -303,6 +303,120 @@ class TestAutostep:
         ratio = float(v[2]) / float(jnp.maximum(v[0], 1e-10))
         assert ratio > 4.0  # Well above linear (3), closer to quadratic (9)
 
+    def test_nonfinite_meta_gradient_does_not_poison_adaptation_state(self):
+        """A non-finite correlation must preserve the last finite meta-state."""
+        optimizer = Autostep(initial_step_size=0.01, meta_step_size=0.01)
+        observation = jnp.ones(2, dtype=jnp.float32)
+        state = optimizer.init(feature_dim=2)
+
+        fresh = optimizer.update(state, jnp.array(jnp.inf), observation).new_state
+        chex.assert_trees_all_close(fresh.step_sizes, state.step_sizes)
+        chex.assert_trees_all_close(fresh.normalizers, state.normalizers)
+        chex.assert_trees_all_close(fresh.traces, state.traces)
+        chex.assert_trees_all_close(fresh.bias_step_size, state.bias_step_size)
+        chex.assert_trees_all_close(fresh.bias_normalizer, state.bias_normalizer)
+        chex.assert_trees_all_close(fresh.bias_trace, state.bias_trace)
+
+        warmed = state
+        for _ in range(5):
+            warmed = optimizer.update(warmed, jnp.array(1.0), observation).new_state
+        finite_reference = optimizer.update(warmed, jnp.array(1.0), observation).new_state
+        guarded = optimizer.update(warmed, jnp.array(jnp.inf), observation).new_state
+        chex.assert_trees_all_close(guarded.step_sizes, warmed.step_sizes)
+        chex.assert_trees_all_close(guarded.normalizers, warmed.normalizers)
+        chex.assert_trees_all_close(guarded.traces, warmed.traces)
+        chex.assert_trees_all_close(guarded.bias_step_size, warmed.bias_step_size)
+        chex.assert_trees_all_close(guarded.bias_normalizer, warmed.bias_normalizer)
+        chex.assert_trees_all_close(guarded.bias_trace, warmed.bias_trace)
+
+        recovered = optimizer.update(guarded, jnp.array(1.0), observation).new_state
+        chex.assert_trees_all_close(recovered, finite_reference)
+
+    def test_gradient_path_nonfinite_correlation_keeps_meta_state_finite(self):
+        """The arbitrary-shape Autostep path has the same guarded meta-update."""
+        optimizer = Autostep(initial_step_size=0.01, meta_step_size=0.01)
+        state = optimizer.init_for_shape((4, 3))
+
+        _, guarded = optimizer.update_from_gradient(
+            state,
+            jnp.full((4, 3), jnp.inf, dtype=jnp.float32),
+            error=jnp.array(1.0),
+        )
+
+        chex.assert_trees_all_close(guarded.step_sizes, state.step_sizes)
+        chex.assert_trees_all_close(guarded.normalizers, state.normalizers)
+        chex.assert_trees_all_close(guarded.traces, state.traces)
+
+        finite_gradient = jnp.full((4, 3), 0.1, dtype=jnp.float32)
+        finite_step, recovered = optimizer.update_from_gradient(
+            guarded, finite_gradient, error=jnp.array(1.0)
+        )
+        reference_step, reference = optimizer.update_from_gradient(
+            state, finite_gradient, error=jnp.array(1.0)
+        )
+        chex.assert_trees_all_close(finite_step, reference_step)
+        chex.assert_trees_all_close(recovered, reference)
+
+    def test_finite_square_overflow_does_not_poison_autostep_state(self):
+        """Finite inputs whose squared feature overflows must fail closed."""
+        optimizer = Autostep(initial_step_size=0.01, meta_step_size=0.01)
+        state = optimizer.init(feature_dim=2)
+
+        result = optimizer.update(
+            state,
+            jnp.array(0.0, dtype=jnp.float32),
+            jnp.array([1e20, 1.0], dtype=jnp.float32),
+        )
+
+        chex.assert_tree_all_finite(result.new_state)
+        chex.assert_trees_all_close(result.new_state.normalizers, state.normalizers)
+        chex.assert_trees_all_close(result.new_state.traces, state.traces)
+        chex.assert_trees_all_close(
+            result.new_state.step_sizes, jnp.full(2, 1e-8, dtype=jnp.float32)
+        )
+        assert float(result.new_state.bias_step_size) == pytest.approx(1e-8)
+        chex.assert_trees_all_close(result.new_state.bias_trace, state.bias_trace)
+        chex.assert_trees_all_close(
+            result.new_state.bias_normalizer, state.bias_normalizer
+        )
+        chex.assert_tree_all_finite(result.weight_delta)
+
+    def test_infinite_error_on_silent_feature_has_zero_channel_update(self):
+        """The undefined 0*inf channel stays inert without hiding genuine inf."""
+        optimizer = Autostep(initial_step_size=0.01, meta_step_size=0.01)
+        state = optimizer.init(feature_dim=2)
+
+        result = optimizer.update(
+            state,
+            jnp.array(jnp.inf, dtype=jnp.float32),
+            jnp.array([0.0, 1.0], dtype=jnp.float32),
+        )
+
+        assert float(result.weight_delta[0]) == 0.0
+        assert bool(jnp.isinf(result.weight_delta[1]))
+        chex.assert_trees_all_close(result.new_state, state)
+
+    def test_nonfinite_guards_compile_under_jit(self):
+        import jax
+
+        optimizer = Autostep(initial_step_size=0.01, meta_step_size=0.01)
+        state = optimizer.init(feature_dim=2)
+        result = jax.jit(optimizer.update)(
+            state,
+            jnp.array(jnp.inf, dtype=jnp.float32),
+            jnp.array([0.0, 1.0], dtype=jnp.float32),
+        )
+        assert float(result.weight_delta[0]) == 0.0
+        chex.assert_tree_all_finite(result.new_state)
+
+        param_state = optimizer.init_for_shape((2,))
+        _, guarded = jax.jit(
+            lambda current, gradient: optimizer.update_from_gradient(
+                current, gradient, error=jnp.array(1.0)
+            )
+        )(param_state, jnp.full((2,), jnp.inf, dtype=jnp.float32))
+        chex.assert_tree_all_finite(guarded)
+
 
 class TestAutostepGTDLambda:
     """Tests for the Autostep-for-GTD(lambda) optimizer.

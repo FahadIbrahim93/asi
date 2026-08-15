@@ -19,6 +19,7 @@ import pytest
 
 from alberta_framework.benchmarks.ipmnist_screening import (
     _CBP_LAYERS,
+    CONFIRMATION_THRESHOLD,
     PROXY_N_TASKS,
     SCREENING_REGISTRY,
     SHARD_SCHEMA,
@@ -48,6 +49,7 @@ from alberta_framework.benchmarks.ipmnist_screening import (
     _make_sgd_momentum_gate_learner,
     _make_snr_ema_norm_learner,
     _make_upgd_alpha_utility_learner,
+    _make_upgd_autostep_learner,
     _make_upgd_ema_norm_ext_learner,
     _make_upgd_ema_norm_learner,
     _make_upgd_idbd_learner,
@@ -74,6 +76,7 @@ from alberta_framework.benchmarks.ipmnist_screening import (
     shift_adaptive_normalize,
     snr_maybe_reset_layer,
     upgd_alpha_utility_update,
+    upgd_autostep_update,
     upgd_idbd_swift_update,
     upgd_idbd_update,
     upgd_l2init_update,
@@ -301,6 +304,60 @@ class TestIDBDCombo:
             assert bool(jnp.all(state.log_alpha[n] <= 0.0))
             assert bool(jnp.all(jnp.isfinite(params[n])))
 
+    def test_nonfinite_gated_gradient_does_not_poison_log_alpha(self):
+        params = init_mlp_params(jr.key(0), SMALL)
+        hp = dict(UPGD_W_PROTOCOL_HYPERPARAMETERS)
+        hp.update({"meta_step_size": 0.01, "initial_step_size": 0.01})
+        init_fn, _ = _make_upgd_idbd_learner(hp)
+        state = init_fn(params)
+        grads = {name: jnp.zeros_like(value) for name, value in params.items()}
+        grads["w1"] = jnp.full_like(params["w1"], jnp.inf)
+        noise = {name: jnp.zeros_like(value) for name, value in params.items()}
+
+        _, guarded = upgd_idbd_update(params, state, grads, noise, hp)
+
+        np.testing.assert_array_equal(guarded.log_alpha["w1"], state.log_alpha["w1"])
+        assert bool(jnp.all(jnp.isfinite(guarded.log_alpha["w1"])))
+
+
+class TestAutostepCombo:
+    def test_nonfinite_gated_gradient_does_not_poison_meta_state(self):
+        params = init_mlp_params(jr.key(0), SMALL)
+        hp = dict(UPGD_W_PROTOCOL_HYPERPARAMETERS)
+        hp.update({"meta_step_size": 0.01, "initial_step_size": 0.01, "tau": 1e4})
+        init_fn, _ = _make_upgd_autostep_learner(hp)
+        state = init_fn(params)
+        grads = {name: jnp.zeros_like(value) for name, value in params.items()}
+        grads["w1"] = jnp.full_like(params["w1"], jnp.inf)
+        noise = {name: jnp.zeros_like(value) for name, value in params.items()}
+
+        _, guarded = upgd_autostep_update(params, state, grads, noise, hp)
+
+        np.testing.assert_array_equal(guarded.normalizer["w1"], state.normalizer["w1"])
+        np.testing.assert_array_equal(guarded.alpha["w1"], state.alpha["w1"])
+        np.testing.assert_array_equal(guarded.trace["w1"], state.trace["w1"])
+        assert bool(jnp.all(jnp.isfinite(guarded.normalizer["w1"])))
+        assert bool(jnp.all(jnp.isfinite(guarded.alpha["w1"])))
+
+    def test_finite_square_overflow_keeps_state_finite_and_triggers_bound(self):
+        params = init_mlp_params(jr.key(0), SMALL)
+        hp = dict(UPGD_W_PROTOCOL_HYPERPARAMETERS)
+        hp.update({"meta_step_size": 0.01, "initial_step_size": 0.01, "tau": 1e4})
+        init_fn, _ = _make_upgd_autostep_learner(hp)
+        state = init_fn(params)
+        grads = {name: jnp.zeros_like(value) for name, value in params.items()}
+        grads["w1"] = jnp.full_like(params["w1"], 1e30)
+        noise = {name: jnp.zeros_like(value) for name, value in params.items()}
+
+        _, guarded = upgd_autostep_update(params, state, grads, noise, hp)
+
+        assert bool(jnp.all(jnp.isfinite(guarded.normalizer["w1"])))
+        assert bool(jnp.all(jnp.isfinite(guarded.trace["w1"])))
+        np.testing.assert_array_equal(guarded.normalizer["w1"], state.normalizer["w1"])
+        np.testing.assert_array_equal(
+            guarded.alpha["w1"], jnp.full_like(state.alpha["w1"], 1e-8)
+        )
+
 
 class TestFadeHead:
     """FADE meta-learned per-parameter weight decay on the output layer."""
@@ -475,6 +532,20 @@ class TestIDBDSwift:
                     np.asarray(state_swift.trace[n]), np.asarray(state_plain.trace[n])
                 )
             params = p_swift
+
+    def test_nonfinite_gated_gradient_does_not_poison_log_alpha(self):
+        params = init_mlp_params(jr.key(0), SMALL)
+        hp = self._hp()
+        init_fn, _ = _make_upgd_idbd_learner(hp)
+        state = init_fn(params)
+        grads = {name: jnp.zeros_like(value) for name, value in params.items()}
+        grads["w1"] = jnp.full_like(params["w1"], jnp.inf)
+        noise = {name: jnp.zeros_like(value) for name, value in params.items()}
+
+        _, guarded = upgd_idbd_swift_update(params, state, grads, noise, hp)
+
+        np.testing.assert_array_equal(guarded.log_alpha["w1"], state.log_alpha["w1"])
+        assert bool(jnp.all(jnp.isfinite(guarded.log_alpha["w1"])))
 
     def test_overshoot_bound_triggers_and_caps_effective_step(self):
         """Large alpha: sum_i alpha_i z_i^2 >> eta, so the applied step is the
@@ -839,6 +910,64 @@ class TestShardsAndMerge:
         assert l2["seeds"] == [1, 2]
         assert l2["paired_vs_control"]["seeds"] == [1]
         assert len(l2["paired_vs_control"]["per_seed_diff"]) == 1
+
+    def _write_inband_shard(self, tmp_path, name, seed, accuracy):
+        """Write a structurally valid shard with controlled accuracy."""
+        payload = {
+            "schema": SHARD_SCHEMA,
+            "config_name": name,
+            "base_learner": "upgd_w",
+            "hyperparameters": {},
+            "seed": seed,
+            "noise_mode": "step",
+            "config": SMALL.to_config(),
+            "per_task_accuracy": [float(accuracy)] * SMALL.n_tasks,
+            "per_task_loss": [0.1] * SMALL.n_tasks,
+            "per_task_plasticity": [0.5] * SMALL.n_tasks,
+            "wall_clock_seconds": 1.0,
+        }
+        path = tmp_path / f"{name}_seed{seed}.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        return path
+
+    def test_confirmation_candidate_requires_two_paired_seeds(self, tmp_path):
+        """One lucky shared seed cannot authorize a confirmation wave."""
+        paths = [
+            self._write_inband_shard(tmp_path, "upgd_w_control", 0, 0.50),
+            self._write_inband_shard(tmp_path, "upgd_l2init", 0, 0.56),
+            self._write_inband_shard(tmp_path, "upgd_l2init", 1, 0.56),
+            self._write_inband_shard(tmp_path, "upgd_l2init", 2, 0.56),
+        ]
+        summary = merge_shards(paths, control_name="upgd_w_control", slope_window=2)
+        result = next(
+            entry for entry in summary["results"] if entry["config_name"] == "upgd_l2init"
+        )
+        paired = result["paired_vs_control"]
+
+        assert paired["seeds"] == [0]
+        assert paired["mean_diff"] > CONFIRMATION_THRESHOLD
+        assert paired["stderr_diff"] == 0.0
+        assert paired["all_seeds_improve"] is True
+        assert paired["beats_control"] is True
+        assert paired["confirmation_candidate"] is False
+
+    def test_confirmation_candidate_allows_two_paired_seeds(self, tmp_path):
+        """Two shared improving seeds preserve the existing decision boundary."""
+        paths = [
+            self._write_inband_shard(tmp_path, "upgd_w_control", 0, 0.50),
+            self._write_inband_shard(tmp_path, "upgd_w_control", 1, 0.50),
+            self._write_inband_shard(tmp_path, "upgd_l2init", 0, 0.56),
+            self._write_inband_shard(tmp_path, "upgd_l2init", 1, 0.56),
+        ]
+        summary = merge_shards(paths, control_name="upgd_w_control", slope_window=2)
+        result = next(
+            entry for entry in summary["results"] if entry["config_name"] == "upgd_l2init"
+        )
+        paired = result["paired_vs_control"]
+
+        assert paired["seeds"] == [0, 1]
+        assert paired["mean_diff"] > CONFIRMATION_THRESHOLD
+        assert paired["confirmation_candidate"] is True
 
     def test_atomic_writer_refuses_duplicate_without_mutating_first_result(
         self, tmp_path: Path
@@ -1533,6 +1662,20 @@ class TestAlphaUtility:
                     np.asarray(new_params[n]), np.asarray(expected)
                 )
             params = new_params
+
+    def test_nonfinite_raw_gradient_does_not_poison_log_alpha(self):
+        params = init_mlp_params(jr.key(0), SMALL)
+        hp = self._hp()
+        init_fn, _ = _make_upgd_alpha_utility_learner(hp)
+        state = init_fn(params)
+        grads = {name: jnp.zeros_like(value) for name, value in params.items()}
+        grads["w1"] = jnp.full_like(params["w1"], jnp.inf)
+        noise = {name: jnp.zeros_like(value) for name, value in params.items()}
+
+        _, guarded = upgd_alpha_utility_update(params, state, grads, noise, hp)
+
+        np.testing.assert_array_equal(guarded.log_alpha["w1"], state.log_alpha["w1"])
+        assert bool(jnp.all(jnp.isfinite(guarded.log_alpha["w1"])))
 
     def test_consistent_gradient_earns_more_protection(self):
         """A weight with a persistent-sign gradient must end with higher

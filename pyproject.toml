@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling==1.32.0", "editables==0.6"]
 build-backend = "hatchling.build"
 
 [project]
@@ -8,7 +8,7 @@ version = "0.29.0"
 description = "JAX research framework for investigating continual learning and the Alberta Plan"
 readme = "README.md"
 license = "Apache-2.0"
-# Vendored into elizaOS at packages/research/alberta (see VENDORING.md). Relaxed from
+# Developed alongside the elizaOS robot research package (see VENDORING.md). Relaxed from
 # upstream ">=3.13" to ">=3.12": the continual-RL subset only uses PEP 695
 # syntax (3.12+), and eliza-robot imports it in-process on Python 3.12 where
 # brax/mujoco pin numpy<2. JAX 0.7.1 is the tested floor that remains
@@ -31,12 +31,7 @@ dependencies = [
     "jax>=0.7.1",
     "jaxlib>=0.7.1",
     "numpy>=1.26",
-    "pandas>=2.2",
-    "matplotlib>=3.8",
     "scipy>=1.11",
-    "scikit-learn>=1.5",
-    "joblib>=1.3",
-    "tqdm>=4.66",
     "chex>=0.1.86",
     "jaxtyping>=0.2.28",
     "orbax-checkpoint>=0.11",
@@ -44,9 +39,26 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+    "editables==0.6",
+    "hatchling==1.32.0",
+    "uv==0.9.24",
     "pytest>=8.0",
+    "pytest-xdist>=3.6",
     "ruff",
     "mypy",
+    "twine>=5.1",
+    "pandas>=2.2",
+    "matplotlib>=3.8",
+    "scikit-learn>=1.5",
+    "joblib>=1.3",
+    "tqdm>=4.66",
+]
+research = [
+    "pandas>=2.2",
+    "matplotlib>=3.8",
+    "scikit-learn>=1.5",
+    "joblib>=1.3",
+    "tqdm>=4.66",
 ]
 gymnasium = [
     "gymnasium>=0.29.0",
@@ -264,9 +276,11 @@ disable_error_code = ["call-arg", "no-any-return"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "--strict-config --strict-markers"
 markers = [
     "unit: fast isolated behavior or contract tests; never scientific evidence",
     "integration: tests spanning components, persistence, or process/CLI boundaries",
     "scientific: frozen promoted-evidence protocols; may be expensive and require preregistered seeds",
     "slow: wall-clock heavy modules (>~30s serial); excluded from the fast per-PR CI lane",
+    "package: built-distribution and installed-entry-point contracts; run in the package lane",
 ]

@@ -79,7 +79,11 @@ explicitly registered as a scientific lane.
 - `scientific` — frozen promoted-evidence protocols; may be expensive and
   require preregistered seeds.
 - `slow` — wall-clock heavy modules (>~30s serial); excluded from the fast
-  per-PR CI lane (`-m "not slow"`).
+  per-PR CI lane.
+- `package` — built-distribution and installed-entry-point contracts; isolated
+  in the package CI lane.
+
+The fast runtime selector is `-m "not slow and not package"`.
 
 ## Evidence-promotion rules (fail-closed)
 

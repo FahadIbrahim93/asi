@@ -1,11 +1,11 @@
 # mypy: disable-error-code="call-arg"
 """Production Step 2 kernel.
 
-The Step 2 production surface exposes the current promoted learner:
+The Step 2 production surface exposes the current packaged learner:
 target-structure UPGD.  It is a single learner with online hidden-feature
 utility, low-utility perturbation, ObGD-bounded updates, and vector-output
 heads.  It is not a theorem of universal representation learning; it is the
-current empirically promoted kernel for the supervised Step 2 acceptance
+current development-selected kernel for the supervised Step 2 acceptance
 matrix.
 
 For retained class-view memory, Step 2 also exposes a JAX fixed-budget
@@ -271,7 +271,7 @@ class Step2HybridConfig:
 
 @dataclass(frozen=True)
 class Step2TemporalContextConfig:
-    """Config for the promoted phase-context UPGD stressor kernel.
+    """Config for the packaged phase-context UPGD stressor kernel.
 
     ``periods`` drives the sin/cos clock features of
     :class:`~alberta_framework.core.temporal_context.TemporalContextConfig`:
@@ -361,7 +361,7 @@ class Step2AssociativeSmokeResult:
 
 
 def make_step2_learner(config: Step2KernelConfig | None = None) -> UPGDLearner:
-    """Create the promoted Step 2 target-structure UPGD learner."""
+    """Create the packaged Step 2 target-structure UPGD learner."""
     cfg = config or Step2KernelConfig()
     return UPGDLearner.step2_default(
         n_heads=cfg.n_heads,
@@ -377,7 +377,7 @@ def make_step2_strict_digit_readout_learner(
 ) -> UPGDLearner:
     """Create the strict online-MSE digit/readout Step 2 learner.
 
-    This is the heavier two-timescale simplex branch promoted for
+    This is the heavier two-timescale simplex branch selected for
     sklearn-digits-style one-hot online classification streams.  The broad
     supervised default remains :func:`make_step2_learner`.
     """
@@ -392,7 +392,7 @@ def make_step2_strict_digit_readout_learner(
 def make_step2_memory_learner(
     config: Step2MemoryConfig | None = None,
 ) -> PrototypeMemoryLearner:
-    """Create the promoted Step 2 retained-view memory learner."""
+    """Create the packaged Step 2 retained-view memory learner."""
     cfg = config or Step2MemoryConfig()
     return PrototypeMemoryLearner(
         PrototypeMemoryConfig(
@@ -472,7 +472,7 @@ def make_step2_hybrid_learner(
 def make_step2_temporal_context(
     config: Step2TemporalContextConfig | None = None,
 ) -> TemporalContextFeaturizer:
-    """Create the promoted causal phase-product context featurizer."""
+    """Create the packaged causal phase-product context featurizer."""
     cfg = config or Step2TemporalContextConfig()
     return TemporalContextFeaturizer(
         TemporalContextConfig(

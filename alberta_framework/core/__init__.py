@@ -829,7 +829,6 @@ __all__ = [
     "FeatureBankRouterResourceBudget",
     "FeatureBankRouterState",
     "PairDescriptorValidation",
-    # L0 bounded hidden-partner integration mechanism
     # Average reward (Steps 5/6)
     "AverageRewardHordeLearner",
     "AverageRewardHordeActorCriticAgent",

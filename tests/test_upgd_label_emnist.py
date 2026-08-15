@@ -180,13 +180,16 @@ class TestScheduleExactness:
             build_schedule(jr.key(0), TINY, n_train=TINY.task_length - 1)
 
 
+@pytest.fixture(scope="class")
+def debug_run():
+    """Run the shared tiny diagnostic once for this test module."""
+    x, y = _tiny_data()
+    return run_label_emnist(
+        x, y, "upgd_w", seeds=[0, 1], config=TINY, return_per_step=True
+    )
+
+
 class TestTinySmokeRun:
-    @pytest.fixture(scope="class")
-    def debug_run(self):
-        x, y = _tiny_data()
-        return run_label_emnist(
-            x, y, "upgd_w", seeds=[0, 1], config=TINY, return_per_step=True
-        )
 
     def test_shapes_and_bounds(self, debug_run):
         assert debug_run.per_task_accuracy.shape == (2, TINY.n_tasks)

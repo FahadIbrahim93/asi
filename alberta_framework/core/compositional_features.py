@@ -716,7 +716,6 @@ def _theta_local_grads(
     ops: Array,
     parent_a: Array,
     parent_b: Array,
-    theta: Array,
     feature_values: Array,
 ) -> tuple[Array, Array]:
     """Compute per-feature theta gradients for the local op output.
@@ -728,7 +727,6 @@ def _theta_local_grads(
         ops: Op types per slot.
         parent_a: First parent indices.
         parent_b: Second parent indices.
-        theta: Per-feature parameter vectors.
         feature_values: Already-computed feature values for this observation.
 
     Returns:
@@ -748,47 +746,10 @@ def _theta_local_grads(
     return d_theta0, d_theta1
 
 
-def _compute_candidate_value(
-    op: Array,
-    parent_a: Array,
-    parent_b: Array,
-    theta: Array,
-    active_values: Array,
-    observation: Array,
-) -> Array:
-    """Evaluate one candidate op against the current active feature values."""
-    n_features = active_values.shape[0]
-    feature_dim = observation.shape[0]
-    safe_a_obs = jnp.clip(parent_a, 0, feature_dim - 1)
-    safe_a_feat = jnp.clip(parent_a, 0, n_features - 1)
-    safe_b_feat = jnp.clip(parent_b, 0, n_features - 1)
-
-    raw = observation[safe_a_obs]
-    val_a = active_values[safe_a_feat]
-    val_b = jnp.where(parent_b >= 0, active_values[safe_b_feat], 0.0)
-    product = val_a * val_b
-    summ = val_a + val_b
-    tanh_val = jnp.tanh(theta[0] * val_a + theta[1] * val_b)
-    gated = val_a * jax.nn.sigmoid(val_b)
-    value = jnp.select(
-        [
-            op == OP_RAW,
-            op == OP_PRODUCT,
-            op == OP_SUM,
-            op == OP_TANH,
-            op == OP_GATED,
-        ],
-        [raw, product, summ, tanh_val, gated],
-        default=jnp.array(0.0, dtype=jnp.float32),
-    )
-    return jnp.clip(value, -FEATURE_VALUE_CLIP, FEATURE_VALUE_CLIP)
-
-
 def _candidate_theta_local_grads(
     ops: Array,
     parent_a: Array,
     parent_b: Array,
-    theta: Array,
     candidate_values: Array,
     active_values: Array,
 ) -> tuple[Array, Array]:
@@ -1393,34 +1354,6 @@ class CompositionalFeatureLearner:
         config = dict(config)
         config.pop("type", None)
         return cls(**config)
-
-    def _init_active_slot(
-        self,
-        slot: int,
-        key: Array,
-        feature_dim: int,
-    ) -> tuple[int, int, int, Array, int]:
-        """Generate Python-side initialization for one composed slot.
-
-        Used by ``init`` to set up randomly composed features above the
-        raw-input prefix.  Returns ``(op, parent_a, parent_b, theta, depth)``
-        as plain Python / JAX arrays of static shapes.
-        """
-        # Choose an op uniformly from the composing ops (skip OP_RAW).
-        sub_keys = jr.split(key, 3)
-        op_key, parent_key, theta_key = sub_keys
-        op = int(jr.randint(op_key, (), 1, NUM_OPS))
-        # Pick parents uniformly from earlier slots.  At minimum, we have
-        # the raw-input prefix [0, feature_dim) and any earlier composed
-        # slots [feature_dim, slot).
-        max_parent = max(slot, 1)
-        parents = jr.randint(parent_key, (2,), 0, max_parent)
-        a = int(parents[0])
-        b = int(parents[1])
-        theta = 0.5 * jr.normal(theta_key, (2,), dtype=jnp.float32)
-        # Depth is computed from parents in init below; return a neutral
-        # seed value here and let init compute the precise depth array.
-        return op, a, b, theta, 1
 
     def init(self, feature_dim: int, key: Array) -> CompositionalFeatureState:
         """Initialize the active and candidate banks.
@@ -2609,7 +2542,6 @@ class CompositionalFeatureLearner:
             state.ops,
             state.parent_a,
             state.parent_b,
-            state.theta,
             feature_values,
         )
         theta_delta = self._step_size_theta * jnp.stack(
@@ -2722,7 +2654,6 @@ class CompositionalFeatureLearner:
                 state.candidate_ops,
                 state.candidate_parent_a,
                 state.candidate_parent_b,
-                state.candidate_theta,
                 candidate_feature_values,
                 feature_values,
             )
