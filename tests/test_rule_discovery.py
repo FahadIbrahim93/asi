@@ -335,12 +335,21 @@ def test_describe_genome_names_active_primitives() -> None:
     assert "surprise_budget" not in text
 
 
+@pytest.mark.parametrize("seeds", [(), (0, 0)])
+def test_evaluate_population_rejects_empty_or_duplicate_seeds(seeds: tuple[int, ...]) -> None:
+    config = dataclasses.replace(MICRO_SUITE["M1"], n_tasks=2, task_length=20)
+    genomes = jnp.asarray([champion_form_genome()])
+
+    with pytest.raises(ValueError, match="seeds"):
+        evaluate_population(genomes, config, seeds=seeds)
+
+
 def test_evaluate_population_is_paired_and_bounded() -> None:
     config = dataclasses.replace(MICRO_SUITE["M1"], n_tasks=2, task_length=20)
     genomes = jnp.stack(
         [jnp.asarray(champion_form_genome()), jnp.asarray(champion_form_genome())]
     )
-    accuracy = evaluate_population(genomes, config, seeds=(0,))
+    accuracy = evaluate_population(genomes, config, seeds=(0, 1))
     assert accuracy.shape == (2,)
     assert float(accuracy[0]) == pytest.approx(float(accuracy[1]), abs=1e-7)
     assert 0.0 <= float(accuracy[0]) <= 1.0

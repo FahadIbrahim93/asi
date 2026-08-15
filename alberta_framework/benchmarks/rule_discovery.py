@@ -778,6 +778,11 @@ def evaluate_population(
     Paired evaluation: every genome sees the identical stream and identical
     network init per seed (the screening convention).
     """
+    if not seeds:
+        raise ValueError("seeds must not be empty")
+    if len(set(seeds)) != len(seeds):
+        raise ValueError("seeds must be unique")
+
     genomes = jnp.asarray(genomes, dtype=jnp.float32)
     n_genomes = int(genomes.shape[0])
     total = np.zeros((n_genomes,), dtype=np.float64)
