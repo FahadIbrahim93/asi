@@ -5,6 +5,7 @@ using chex dataclasses for JAX compatibility and jaxtyping for shape annotations
 """
 
 import enum
+import math
 import time
 from collections.abc import Sequence
 from typing import Any
@@ -683,6 +684,14 @@ class GVFSpec:
     lamda: float
     cumulant_index: int
     terminal_reward: float = 0.0
+
+    def __post_init__(self) -> None:
+        """Reject invalid discount and trace-decay parameters."""
+
+        if not math.isfinite(self.gamma) or not 0.0 <= self.gamma <= 1.0:
+            raise ValueError(f"gamma must be finite and in [0, 1], got {self.gamma}")
+        if not math.isfinite(self.lamda) or not 0.0 <= self.lamda <= 1.0:
+            raise ValueError(f"lamda must be finite and in [0, 1], got {self.lamda}")
 
     def to_config(self) -> dict[str, Any]:
         """Serialize to dict.

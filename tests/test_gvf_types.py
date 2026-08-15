@@ -2,6 +2,7 @@
 
 import chex
 import jax.numpy as jnp
+import pytest
 
 from alberta_framework import (
     DemonType,
@@ -86,6 +87,44 @@ class TestGVFSpec:
         assert config["demon_type"] == "control"
         assert config["name"] == "test"
         assert config["gamma"] == 0.99
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("gamma", -0.01),
+            ("gamma", 1.01),
+            ("gamma", float("nan")),
+            ("gamma", float("inf")),
+            ("lamda", -0.01),
+            ("lamda", 1.01),
+            ("lamda", float("nan")),
+            ("lamda", float("inf")),
+        ],
+    )
+    def test_invalid_discount_or_trace_decay_is_rejected(self, field, value):
+        kwargs = {
+            "name": "invalid",
+            "demon_type": DemonType.PREDICTION,
+            "gamma": 0.9,
+            "lamda": 0.8,
+            "cumulant_index": 0,
+        }
+        kwargs[field] = value
+
+        with pytest.raises(ValueError, match=field):
+            GVFSpec(**kwargs)
+
+        config = {
+            "name": "invalid",
+            "demon_type": "prediction",
+            "gamma": 0.9,
+            "lamda": 0.8,
+            "cumulant_index": 0,
+            "terminal_reward": 0.0,
+        }
+        config[field] = value
+        with pytest.raises(ValueError, match=field):
+            GVFSpec.from_config(config)
 
 
 class TestHordeSpec:
