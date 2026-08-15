@@ -119,12 +119,12 @@ def test_infinite_observation_does_not_poison_weights() -> None:
     assert bool(recovered.update_applied)
 
 
-def test_infinite_observation_does_not_poison_input_loss_gradient() -> None:
-    """The state-builder bridge must not emit NaN when update would no-op.
+def test_infinite_observation_marks_input_loss_gradient_invalid() -> None:
+    """The state-builder bridge returns a neutral payload with a false verdict.
 
     Inf observation makes softmax NaN and ``W.T @ (p - one_hot)`` non-finite,
-    even on a silent feature coordinate. Return a zero gradient instead of a
-    NaN that callers would apply into the state builder.
+    even on a silent feature coordinate. The explicit verdict prevents the
+    neutral zero gradient from being mistaken for a valid training signal.
     """
     model = BehaviorModel(BehaviorModelConfig(n_actions=2, step_size=0.1))
     state = model.init(feature_dim=2, key=jax.random.key(0))
@@ -133,8 +133,73 @@ def test_infinite_observation_does_not_poison_input_loss_gradient() -> None:
     result = jax.jit(model.input_loss_gradient)(state, obs, jnp.array(0, dtype=jnp.int32))
 
     chex.assert_tree_all_finite(result)
+    assert not bool(result.valid)
     chex.assert_trees_all_close(result.gradient, jnp.zeros(2, dtype=jnp.float32))
     assert float(result.loss) == 0.0
+    assert float(result.gradient_norm) == 0.0
+
+
+def test_input_loss_gradient_verdict_is_consistent_eager_jit_and_vmap() -> None:
+    """The traced verdict gates mutation in every supported transform."""
+    model = BehaviorModel(BehaviorModelConfig(n_actions=2, step_size=0.1))
+    state = model.init(feature_dim=2, key=jax.random.key(1))
+    valid_obs = jnp.array([0.25, -0.5], dtype=jnp.float32)
+    invalid_obs = jnp.array([0.25, jnp.inf], dtype=jnp.float32)
+    action = jnp.array(1, dtype=jnp.int32)
+    builder_state = jnp.array([3.0, -2.0], dtype=jnp.float32)
+
+    def consume(observation: jax.Array) -> tuple[Any, jax.Array]:
+        result = model.input_loss_gradient(state, observation, action)
+        proposal = builder_state - jnp.asarray(0.1, dtype=jnp.float32) * result.gradient
+        committed = jnp.where(result.valid, proposal, builder_state)
+        return result, committed
+
+    with jax.disable_jit():
+        eager_valid, eager_committed = consume(valid_obs)
+        eager_invalid, eager_rejected = consume(invalid_obs)
+    compiled_valid, compiled_committed = jax.jit(consume)(valid_obs)
+    compiled_invalid, compiled_rejected = jax.jit(consume)(invalid_obs)
+    batched_results, batched_committed = jax.vmap(consume)(
+        jnp.stack([valid_obs, invalid_obs])
+    )
+
+    assert bool(eager_valid.valid)
+    assert bool(compiled_valid.valid)
+    assert bool(batched_results.valid[0])
+    assert not bool(eager_invalid.valid)
+    assert not bool(compiled_invalid.valid)
+    assert not bool(batched_results.valid[1])
+    chex.assert_trees_all_close(eager_valid, compiled_valid)
+    chex.assert_trees_all_close(eager_valid, jax.tree.map(lambda x: x[0], batched_results))
+    chex.assert_trees_all_close(eager_committed, compiled_committed)
+    chex.assert_trees_all_close(eager_committed, batched_committed[0])
+    chex.assert_trees_all_close(eager_rejected, builder_state)
+    chex.assert_trees_all_close(compiled_rejected, builder_state)
+    chex.assert_trees_all_close(batched_committed[1], builder_state)
+
+
+def test_input_loss_gradient_rejects_finite_gradient_with_overflowed_norm() -> None:
+    """The verdict covers every numeric field, including derived diagnostics."""
+    model = BehaviorModel(BehaviorModelConfig(n_actions=2, step_size=0.1))
+    state = model.init(feature_dim=2, key=jax.random.key(2))
+    maximum = jnp.finfo(jnp.float32).max
+    state = state.replace(  # type: ignore[attr-defined]
+        weights=jnp.array(
+            [[maximum, maximum], [-maximum, -maximum]],
+            dtype=jnp.float32,
+        ),
+        bias=jnp.zeros((2,), dtype=jnp.float32),
+    )
+
+    result = model.input_loss_gradient(
+        state,
+        jnp.zeros((2,), dtype=jnp.float32),
+        jnp.array(0, dtype=jnp.int32),
+    )
+
+    assert not bool(result.valid)
+    chex.assert_tree_all_finite(result)
+    chex.assert_trees_all_close(result.gradient, jnp.zeros((2,), dtype=jnp.float32))
     assert float(result.gradient_norm) == 0.0
 
 
