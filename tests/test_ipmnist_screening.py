@@ -210,6 +210,7 @@ class TestRegistry:
             "rls_head_l1_preset003",
             "rls_head_l0999_pcap",
             "rls_head_resid_l1_preset005",
+            "rls_head_resid_l1_preset005_l2init",
             "rls_head_resid_l1_preset005_nogate",
             "rls_head_l0999_preset005_r01",
             "rls_head_l0999_preset005_r003",
@@ -5442,6 +5443,287 @@ class TestRLSHead:
             "rls_head_resid_l1_preset005_nogate"
         ).hyperparameters
         assert nogate_hp == {**incumbent_hp, "gate_scale": 0.0}
+
+
+class TestRLSHeadL2Init:
+    """Issue #14's body-only L2-to-initialization code prerequisite."""
+
+    _BODY = ("w1", "b1", "w2", "b2")
+
+    @staticmethod
+    def _assert_tree_equal(actual, expected):
+        actual_leaves, actual_tree = jax.tree_util.tree_flatten(actual)
+        expected_leaves, expected_tree = jax.tree_util.tree_flatten(expected)
+        assert actual_tree == expected_tree
+        assert len(actual_leaves) == len(expected_leaves)
+        for actual_leaf, expected_leaf in zip(actual_leaves, expected_leaves, strict=True):
+            np.testing.assert_array_equal(
+                np.asarray(actual_leaf), np.asarray(expected_leaf)
+            )
+
+    @staticmethod
+    def _manual_params() -> dict[str, jax.Array]:
+        return {
+            "w1": jnp.full((SMALL.input_dim, SMALL.hidden1), 0.05, jnp.float32),
+            "b1": jnp.full((SMALL.hidden1,), 0.10, jnp.float32),
+            "w2": jnp.full((SMALL.hidden1, SMALL.hidden2), 0.04, jnp.float32),
+            "b2": jnp.full((SMALL.hidden2,), 0.10, jnp.float32),
+            "w3": jnp.full((SMALL.hidden2, SMALL.n_classes), 0.03, jnp.float32),
+            "b3": jnp.full((SMALL.n_classes,), 0.02, jnp.float32),
+        }
+
+    def test_registry_is_exactly_incumbent_plus_frozen_endpoint(self):
+        from alberta_framework.benchmarks.ipmnist_screening import (
+            RLSHeadL2InitState,
+            RLSHeadState,
+            _make_rls_head_l2init_learner,
+            _rls_head_frozen_probe_input,
+        )
+
+        incumbent = screening_spec("rls_head_resid_l1_preset005")
+        candidate = screening_spec("rls_head_resid_l1_preset005_l2init")
+        assert candidate.base_learner == incumbent.base_learner == "upgd_w"
+        assert candidate.mechanism == incumbent.mechanism == "rls_readout"
+        assert candidate.factory is _make_rls_head_l2init_learner
+        assert candidate.frozen_probe_input is _rls_head_frozen_probe_input
+        assert candidate.noise_update is None
+        assert candidate.hyperparameters == {
+            **incumbent.hyperparameters,
+            "decay_to_init": 1.0,
+        }
+
+        params = self._manual_params()
+        incumbent_state = incumbent.factory(incumbent.hyperparameters)[0](params)
+        candidate_state = candidate.factory(candidate.hyperparameters)[0](params)
+        assert type(incumbent_state) is RLSHeadState
+        assert not hasattr(incumbent_state, "init_params")
+        assert type(candidate_state) is RLSHeadL2InitState
+        assert set(candidate_state.init_params) == set(self._BODY)
+        for name in self._BODY:
+            np.testing.assert_array_equal(
+                np.asarray(candidate_state.init_params[name]), np.asarray(params[name])
+            )
+        for field in ("utility", "step", "norm", "fast_mean", "p", "wout"):
+            self._assert_tree_equal(
+                jax.device_get(getattr(candidate_state, field)),
+                jax.device_get(getattr(incumbent_state, field)),
+            )
+
+    def test_factory_rejects_every_nonfrozen_config(self):
+        from alberta_framework.benchmarks.ipmnist_screening import (
+            _make_rls_head_l2init_learner,
+            _rls_head_l2init_hp,
+        )
+
+        expected = _rls_head_l2init_hp()
+        invalid = []
+        without_endpoint = dict(expected)
+        without_endpoint.pop("decay_to_init")
+        invalid.append(without_endpoint)
+        invalid.extend(
+            [
+                {**expected, "decay_to_init": 0.0},
+                {**expected, "decay_to_init": True},
+                {**expected, "step_size": 0.02},
+                {**expected, "rls_lambda": 1},
+                {**expected, "noise_std": -0.0},
+                {**expected, "unexpected": 0.0},
+            ]
+        )
+        for hp in invalid:
+            with pytest.raises(ValueError, match="frozen L2-Init configuration"):
+                _make_rls_head_l2init_learner(hp)
+
+        _make_rls_head_l2init_learner(expected)
+
+    def test_body_and_rls_updates_match_equations_and_freeze_sgd_head(self):
+        import dataclasses
+
+        from alberta_framework.benchmarks.ipmnist_screening import (
+            _make_rls_head_l2init_learner,
+            _rls_head_l2init_hp,
+        )
+
+        hp = _rls_head_l2init_hp()
+        init_fn, step_fn = _make_rls_head_l2init_learner(hp)
+        init_params = self._manual_params()
+        state = init_fn(init_params)
+        params = dict(init_params)
+        for index, name in enumerate(self._BODY, start=1):
+            params[name] = init_params[name] + jnp.asarray(
+                0.01 * index, dtype=jnp.float32
+            )
+
+        m = SMALL.hidden2 + 1
+        wout = jnp.linspace(
+            -0.2, 0.3, m * SMALL.n_classes, dtype=jnp.float32
+        ).reshape((m, SMALL.n_classes))
+        state = dataclasses.replace(
+            state,
+            p=jnp.eye(m, dtype=jnp.float32) * 0.7,
+            wout=wout,
+        )
+        x = jnp.linspace(0.1, 0.4, SMALL.input_dim, dtype=jnp.float32)
+        y = jnp.asarray(2, dtype=jnp.int32)
+
+        x_norm, expected_norm, expected_fast, shifted = shift_adaptive_normalize(
+            state.norm,
+            state.fast_mean,
+            x,
+            decay=hp["norm_decay"],
+            fast_decay=hp["fast_decay"],
+            epsilon=hp["norm_epsilon"],
+            shift_k=hp["shift_k"],
+            shift_delta=hp["shift_delta"],
+            shift_refractory=hp["shift_refractory"],
+        )
+        assert not bool(jnp.any(shifted))
+
+        body = {name: params[name] for name in self._BODY}
+
+        def residual_loss(
+            body_params: dict[str, jax.Array],
+        ) -> jax.Array:
+            merged = dict(params)
+            merged.update(body_params)
+            a1 = jax.nn.relu(x_norm @ merged["w1"] + merged["b1"])
+            a2 = jax.nn.relu(a1 @ merged["w2"] + merged["b2"])
+            phi = jnp.concatenate(
+                [
+                    a2 * (1.0 / math.sqrt(m)),
+                    jnp.ones((1,), dtype=jnp.float32),
+                ]
+            )
+            logits = state.wout.T @ phi
+            target = jax.nn.one_hot(y, SMALL.n_classes, dtype=jnp.float32)
+            error = target - logits
+            return 0.5 * jnp.sum(error * error)
+
+        grads = jax.grad(residual_loss)(body)
+        count = state.step + jnp.asarray(1, dtype=jnp.int32)
+        utility = dict(state.utility)
+        for name in self._BODY:
+            utility[name] = hp["utility_decay"] * state.utility[name] + (
+                1.0 - hp["utility_decay"]
+            ) * (-grads[name] * params[name])
+        bias_correction = 1.0 - jnp.power(
+            jnp.asarray(hp["utility_decay"], dtype=jnp.float32),
+            count.astype(jnp.float32),
+        )
+        global_max = jnp.max(
+            jnp.stack([jnp.max(utility[name]) for name in sorted(self._BODY)])
+        )
+        global_max = jnp.where(global_max == 0.0, 1.0, global_max)
+        expected_params = dict(params)
+        for name in self._BODY:
+            gated_gradient = grads[name] * (
+                1.0
+                - jax.nn.sigmoid((utility[name] / bias_correction) / global_max)
+            )
+            expected_params[name] = (
+                params[name]
+                - hp["step_size"]
+                * hp["weight_decay"]
+                * (params[name] - state.init_params[name])
+                - hp["step_size"] * gated_gradient
+            )
+
+        a1 = jax.nn.relu(x_norm @ params["w1"] + params["b1"])
+        a2 = jax.nn.relu(a1 @ params["w2"] + params["b2"])
+        phi = jnp.concatenate(
+            [
+                a2 * (1.0 / math.sqrt(m)),
+                jnp.ones((1,), dtype=jnp.float32),
+            ]
+        )
+        target = jax.nn.one_hot(y, SMALL.n_classes, dtype=jnp.float32)
+        error = target - state.wout.T @ phi
+        pp = state.p @ phi
+        gain = pp / (hp["rls_lambda"] + phi @ pp)
+        expected_wout = state.wout + jnp.outer(gain, error)
+        expected_p = (state.p - jnp.outer(gain, pp)) / hp["rls_lambda"]
+        expected_p = 0.5 * (expected_p + expected_p.T)
+
+        new_params, new_state, _ = step_fn(params, state, x, y, jr.key(99))
+
+        for name in self._BODY:
+            np.testing.assert_array_equal(
+                np.asarray(new_params[name]), np.asarray(expected_params[name]), name
+            )
+            np.testing.assert_array_equal(
+                np.asarray(new_state.utility[name]), np.asarray(utility[name]), name
+            )
+            np.testing.assert_array_equal(
+                np.asarray(new_state.init_params[name]),
+                np.asarray(state.init_params[name]),
+                name,
+            )
+        for name in ("w3", "b3"):
+            np.testing.assert_array_equal(
+                np.asarray(new_params[name]), np.asarray(params[name]), name
+            )
+            np.testing.assert_array_equal(
+                np.asarray(new_state.utility[name]),
+                np.asarray(state.utility[name]),
+                name,
+            )
+        assert not np.array_equal(np.asarray(expected_p), np.asarray(state.p))
+        assert not np.array_equal(np.asarray(expected_wout), np.asarray(state.wout))
+        np.testing.assert_array_equal(
+            np.asarray(new_state.p), np.asarray(expected_p)
+        )
+        np.testing.assert_array_equal(
+            np.asarray(new_state.wout), np.asarray(expected_wout)
+        )
+        self._assert_tree_equal(
+            jax.device_get(new_state.norm), jax.device_get(expected_norm)
+        )
+        np.testing.assert_array_equal(
+            np.asarray(new_state.fast_mean), np.asarray(expected_fast)
+        )
+        assert int(new_state.step) == 1
+
+    def test_jit_and_pytree_state_roundtrip_preserve_initial_snapshot(self):
+        from alberta_framework.benchmarks.ipmnist_screening import (
+            RLSHeadL2InitState,
+            _make_rls_head_l2init_learner,
+            _rls_head_l2init_hp,
+        )
+
+        init_fn, step_fn = _make_rls_head_l2init_learner(_rls_head_l2init_hp())
+        params = self._manual_params()
+        state = init_fn(params)
+        leaves, tree = jax.tree_util.tree_flatten(state)
+        restored = jax.tree_util.tree_unflatten(tree, leaves)
+        assert type(restored) is RLSHeadL2InitState
+        self._assert_tree_equal(jax.device_get(restored), jax.device_get(state))
+
+        compiled = jax.jit(step_fn)
+        x = jnp.linspace(-0.2, 0.4, SMALL.input_dim, dtype=jnp.float32)
+        new_params, new_state, metrics = compiled(
+            params, restored, x, jnp.asarray(1, jnp.int32), jr.key(7)
+        )
+        assert type(new_state) is RLSHeadL2InitState
+        for name in self._BODY:
+            np.testing.assert_array_equal(
+                np.asarray(new_state.init_params[name]), np.asarray(params[name]), name
+            )
+        for name in ("w3", "b3"):
+            np.testing.assert_array_equal(
+                np.asarray(new_params[name]), np.asarray(params[name]), name
+            )
+        assert all(bool(jnp.isfinite(metric)) for metric in metrics)
+
+    @pytest.mark.integration
+    def test_registered_arm_runs_through_synthetic_screening_harness(self, small_data):
+        x, y = small_data
+        spec = screening_spec("rls_head_resid_l1_preset005_l2init")
+        result = run_screening_config(x, y, spec, seed=2, config=SMALL)
+        assert result.config_name == spec.name
+        assert result.hyperparameters == spec.hyperparameters
+        assert np.all(np.isfinite(result.per_task_accuracy))
+        assert np.all(np.isfinite(result.per_task_loss))
+        assert np.all(np.isfinite(result.per_task_plasticity))
 
 
 class TestNBEnsemble:
