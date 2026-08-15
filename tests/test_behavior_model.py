@@ -119,6 +119,25 @@ def test_infinite_observation_does_not_poison_weights() -> None:
     assert bool(recovered.update_applied)
 
 
+def test_infinite_observation_does_not_poison_input_loss_gradient() -> None:
+    """The state-builder bridge must not emit NaN when update would no-op.
+
+    Inf observation makes softmax NaN and ``W.T @ (p - one_hot)`` non-finite,
+    even on a silent feature coordinate. Return a zero gradient instead of a
+    NaN that callers would apply into the state builder.
+    """
+    model = BehaviorModel(BehaviorModelConfig(n_actions=2, step_size=0.1))
+    state = model.init(feature_dim=2, key=jax.random.key(0))
+    obs = jnp.array([0.0, jnp.inf], dtype=jnp.float32)
+
+    result = jax.jit(model.input_loss_gradient)(state, obs, jnp.array(0, dtype=jnp.int32))
+
+    chex.assert_tree_all_finite(result)
+    chex.assert_trees_all_close(result.gradient, jnp.zeros(2, dtype=jnp.float32))
+    assert float(result.loss) == 0.0
+    assert float(result.gradient_norm) == 0.0
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
