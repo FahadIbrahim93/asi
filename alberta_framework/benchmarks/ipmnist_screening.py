@@ -7046,6 +7046,21 @@ def merge_shards(
     entries: list[dict[str, Any]] = []
     for name, per_seed in sorted(by_config.items()):
         seeds = sorted(per_seed)
+        # base_learner is reported from seeds[0] below; a registry edit that
+        # reclassifies a config_name's learner family mid-wave would otherwise
+        # blend two families' curves under one arm while the summary
+        # misreports what ran for every seed but the first (#107).
+        reference_base_learner = per_seed[seeds[0]]["base_learner"]
+        mismatched_base_learner = sorted(
+            s for s in seeds if per_seed[s]["base_learner"] != reference_base_learner
+        )
+        if mismatched_base_learner:
+            raise ValueError(
+                f"config {name!r} has inconsistent base_learner across seeds: "
+                f"seed {seeds[0]} used {reference_base_learner!r}, seed(s) "
+                f"{mismatched_base_learner} used different values; refusing to "
+                "merge runs of different learner families under one config_name"
+            )
         acc = np.stack(
             [np.asarray(per_seed[s]["per_task_accuracy"], dtype=np.float64) for s in seeds]
         )

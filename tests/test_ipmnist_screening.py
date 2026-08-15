@@ -981,6 +981,24 @@ class TestShardsAndMerge:
         ):
             merge_shards(paths, control_name="upgd_w_contrl", slope_window=2)
 
+    def test_merge_rejects_base_learner_drift_across_seeds(self, tmp_path, small_data):
+        """A registry edit that reclassifies a config_name's learner family
+        between runs must refuse to merge, not report seeds[0]'s base_learner
+        while blending both families' curves (#107; the field #97's
+        hyperparameters guard leaves out)."""
+        p0 = self._make_shard(tmp_path, small_data, "upgd_w_control", 0)
+        p1 = self._make_shard(tmp_path, small_data, "upgd_w_control", 1)
+
+        payload1 = json.loads(p1.read_text(encoding="utf-8"))
+        payload1["base_learner"] = "adamw"
+        p1.write_text(json.dumps(payload1), encoding="utf-8")
+
+        with pytest.raises(
+            ValueError,
+            match=r"inconsistent base_learner across seeds",
+        ):
+            merge_shards([p0, p1], control_name="upgd_w_control", slope_window=2)
+
     def test_merge_rejects_duplicate_seed(self, tmp_path, small_data):
         p1 = self._make_shard(tmp_path, small_data, "upgd_w_control", 0)
         p2 = tmp_path / "dup.json"
