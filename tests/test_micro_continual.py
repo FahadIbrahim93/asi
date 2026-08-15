@@ -801,6 +801,24 @@ class TestTransferValidation:
             "adam_decays",
         }
 
+    def test_from_shards_rejects_mixed_network_sizes(self, tmp_path: Path):
+        paths = []
+        for arm in LADDER_ARMS:
+            hidden1, hidden2 = (7, 5) if arm == "gated_norm" else (8, 6)
+            result = run_micro_arm(
+                TINY,
+                arm,
+                seed=0,
+                hidden1=hidden1,
+                hidden2=hidden2,
+            )
+            path = micro_shard_path(tmp_path, TINY.family, arm, 0)
+            write_micro_shard(path, micro_shard_payload(result))
+            paths.append(path)
+
+        with pytest.raises(ValueError, match="network sizes"):
+            transfer_validation_from_shards(paths)
+
     def test_from_shards_rejects_non_m1(self, tmp_path: Path):
         config = tiny("scale_shift")
         result = run_micro_arm(config, "sgd_raw", seed=0, hidden1=8, hidden2=6)

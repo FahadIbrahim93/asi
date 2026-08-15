@@ -1201,6 +1201,9 @@ def transfer_validation_from_shards(paths: Sequence[Path | str]) -> dict[str, An
     configs = {tuple(sorted(shard["stream_config"].items())) for shard in shards}
     if len(configs) != 1:
         raise ValueError("shards span multiple stream configs; validate them separately")
+    nets = {(shard["hidden1"], shard["hidden2"]) for shard in shards}
+    if len(nets) != 1:
+        raise ValueError("shards span multiple network sizes; validate them separately")
     per_arm: dict[str, dict[int, np.ndarray]] = {}
     for shard in shards:
         per_seed = per_arm.setdefault(shard["arm_name"], {})
