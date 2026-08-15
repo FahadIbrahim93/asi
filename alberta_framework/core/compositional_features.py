@@ -2799,6 +2799,7 @@ class CompositionalFeatureLearner:
         promotion_margin = jnp.asarray(self._promotion_margin, dtype=jnp.float32)
         candidate_min_age = jnp.asarray(self._candidate_min_age, dtype=jnp.float32)
         replacement_accumulator = state.replacement_accumulator
+        generator_decision_valid = jnp.asarray(True, dtype=jnp.bool_)
         if self._learn_generator_resources:
             decision = self._generator_resource_manager.select(
                 state.generator_resource_state,
@@ -2806,6 +2807,7 @@ class CompositionalFeatureLearner:
                 context,
             )
             generator_policy = decision.action
+            generator_decision_valid = decision.valid
             forced_op = decision.op_id
             parent_mode = decision.parent_mode
             imprint_scale = decision.imprint_scale
@@ -4309,6 +4311,7 @@ class CompositionalFeatureLearner:
         update_applied = (
             source_state_finite
             & inputs_valid
+            & generator_decision_valid
             & floating_tree_is_finite(candidate_state)
             & floating_tree_is_finite(curation_trace)
             & jnp.all(jnp.isfinite(predictions))

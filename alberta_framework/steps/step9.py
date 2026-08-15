@@ -217,6 +217,7 @@ class Step9ArrayResult:
     average_rewards: Array
     actions: Array
     model_prediction_errors: Array
+    model_updates_applied: Array
     dream_td_errors: Array
     dream_accepted: Array
 
@@ -556,6 +557,7 @@ def run_step9_scan(
             result.real_control_result.average_reward,
             result.real_control_result.action,
             result.real_model_result.prediction_error,
+            result.real_model_result.update_applied,
             result.dream_td_errors,
             result.dream_accepted,
         )
@@ -565,6 +567,7 @@ def run_step9_scan(
         average_rewards,
         actions,
         model_prediction_errors,
+        model_updates_applied,
         dream_td_errors,
         dream_accepted,
     ) = jax.lax.scan(scan_step, state, (rewards, next_observations))
@@ -574,6 +577,7 @@ def run_step9_scan(
         average_rewards=average_rewards,
         actions=actions,
         model_prediction_errors=model_prediction_errors,
+        model_updates_applied=model_updates_applied,
         dream_td_errors=dream_td_errors,
         dream_accepted=dream_accepted,
     )

@@ -199,6 +199,7 @@ class Step7DynaArrayResult:
     actions: Array
     model_reward_errors: Array
     model_next_observation_errors: Array
+    model_updates_applied: Array
     planning_td_errors: Array
     planning_priorities: Array
     planning_anchor_indices: Array
@@ -845,6 +846,7 @@ def run_step7_scan(
             result.real_control_result.action,
             result.real_model_result.reward_error,
             result.real_model_result.next_observation_errors,
+            result.real_model_result.update_applied,
             result.planning_td_errors,
             result.planning_priorities,
             result.planning_anchor_indices,
@@ -860,6 +862,7 @@ def run_step7_scan(
         actions,
         model_reward_errors,
         model_next_observation_errors,
+        model_updates_applied,
         planning_td_errors,
         planning_priorities,
         planning_anchor_indices,
@@ -875,6 +878,7 @@ def run_step7_scan(
         actions=actions,
         model_reward_errors=model_reward_errors,
         model_next_observation_errors=model_next_observation_errors,
+        model_updates_applied=model_updates_applied,
         planning_td_errors=planning_td_errors,
         planning_priorities=planning_priorities,
         planning_anchor_indices=planning_anchor_indices,

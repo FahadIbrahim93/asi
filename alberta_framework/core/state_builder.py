@@ -60,7 +60,7 @@ from alberta_framework.core.checkpoints import (
     load_checkpoint_metadata,
     save_checkpoint,
 )
-from alberta_framework.core.update_safety import select_transaction
+from alberta_framework.core.update_safety import safe_discrete_action, select_transaction
 from alberta_framework.core.working_memory import (
     WorkingMemoryConfig,
     WorkingMemoryFeaturizer,
@@ -1387,13 +1387,18 @@ class OnlineGatedStateBuilder:
         previous_discount: Array | float,
     ) -> tuple[OnlineGatedStateBuilderState, Float[Array, " feature_dim"]]:
         """Advance recurrence and its RTRL-style eligibility sensitivity."""
+        safe_action, action_valid = safe_discrete_action(
+            previous_action,
+            self._config.n_actions,
+            allow_unset=True,
+        )
         event = self._event(
             raw_observation,
-            previous_action,
+            safe_action,
             previous_reward,
             previous_discount,
         )
-        event_valid = jnp.all(jnp.isfinite(event))
+        event_valid = action_valid & jnp.all(jnp.isfinite(event))
         safe_event = jnp.where(event_valid, event, jnp.zeros_like(event))
         new_hidden = self._transition(state.parameters, state.hidden, safe_event)
         direct_sensitivity = jax.jacfwd(self._transition, argnums=0)(

@@ -42,6 +42,7 @@ from jaxtyping import Bool, Float
 from alberta_framework.core.update_safety import (
     floating_tree_is_finite,
     neutralize_array,
+    safe_discrete_action,
     select_transaction,
 )
 
@@ -65,7 +66,11 @@ def _weighted_cost_terms(costs: Array, cost_weight: float) -> tuple[Array, Array
     weight = jnp.asarray(cost_weight, dtype=jnp.float32)
     weighted = weight * costs
     used = weight != 0.0
-    valid = (~used) | (jnp.isfinite(costs) & jnp.isfinite(weighted))
+    valid = (~used) | (
+        jnp.isfinite(costs)
+        & (costs >= 0.0)
+        & jnp.isfinite(weighted)
+    )
     terms = jnp.where(used & valid, weighted, jnp.zeros_like(weighted))
     return terms, valid
 
@@ -310,13 +315,20 @@ class LearnedResourceManager:
         context_id: Array | int = 0,
     ) -> Float[Array, " n_actions"]:
         """Return the current allocation for ``context_id``."""
-        context = jnp.asarray(context_id, dtype=jnp.int32)
+        context, context_valid = safe_discrete_action(
+            context_id,
+            self._n_contexts,
+        )
         logits = state.log_weights[context]
         weights = jax.nn.softmax(logits)
         if self._exploration > 0.0:
             uniform = jnp.full_like(weights, 1.0 / float(self._n_actions))
             weights = (1.0 - self._exploration) * weights + self._exploration * uniform
-        return weights
+        return jnp.where(
+            context_valid,
+            weights,
+            jnp.full_like(weights, jnp.nan),
+        )
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def update(
@@ -337,7 +349,10 @@ class LearnedResourceManager:
         Returns:
             :class:`LearnedResourceManagerUpdateResult`.
         """
-        context = jnp.asarray(context_id, dtype=jnp.int32)
+        context, context_valid = safe_discrete_action(
+            context_id,
+            self._n_contexts,
+        )
         losses = jnp.asarray(losses, dtype=jnp.float32)
         finite_losses = jnp.isfinite(losses)
         safe_losses = jnp.where(finite_losses, losses, 0.0)
@@ -387,7 +402,8 @@ class LearnedResourceManager:
             step_count=state.step_count + 1,
         )
         update_applied = (
-            floating_tree_is_finite(state)
+            context_valid
+            & floating_tree_is_finite(state)
             & floating_tree_is_finite(candidate_state)
             & jnp.all(jnp.isfinite(weights))
             & jnp.all(jnp.isfinite(adjusted))
@@ -432,6 +448,7 @@ class GeneratorMetaResourceDecision:
     promotion_margin_multiplier: Array
     candidate_min_age_multiplier: Array
     imprint_scale: Array
+    valid: Bool[Array, ""]
 
 
 @chex.dataclass(frozen=True)
@@ -647,12 +664,19 @@ class GeneratorMetaResourceManager:
         context_id: Array | int = 0,
     ) -> Float[Array, " n_policies"]:
         """Return the current policy allocation for ``context_id``."""
-        context = jnp.asarray(context_id, dtype=jnp.int32)
+        context, context_valid = safe_discrete_action(
+            context_id,
+            self._n_contexts,
+        )
         weights = jax.nn.softmax(state.log_weights[context])
         if self._exploration > 0.0:
             uniform = jnp.full_like(weights, 1.0 / float(self.n_policies))
             weights = (1.0 - self._exploration) * weights + self._exploration * uniform
-        return weights
+        return jnp.where(
+            context_valid,
+            weights,
+            jnp.full_like(weights, jnp.nan),
+        )
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def select(
@@ -662,7 +686,16 @@ class GeneratorMetaResourceManager:
         context_id: Array | int = 0,
     ) -> GeneratorMetaResourceDecision:
         """Sample one policy and return the generator knobs it controls."""
-        weights = self.weights(state, context_id)
+        context, context_valid = safe_discrete_action(
+            context_id,
+            self._n_contexts,
+        )
+        weights = self.weights(state, context)
+        selection_valid = (
+            context_valid
+            & floating_tree_is_finite(state)
+            & jnp.all(jnp.isfinite(weights))
+        )
         action = jr.categorical(key, jnp.log(weights + 1e-8)).astype(jnp.int32)
         op_ids = jnp.asarray(self._op_ids, dtype=jnp.int32)
         parent_modes = jnp.asarray(self._parent_modes, dtype=jnp.int32)
@@ -677,14 +710,35 @@ class GeneratorMetaResourceManager:
         )
         imprints = jnp.asarray(self._imprint_scales, dtype=jnp.float32)
         return GeneratorMetaResourceDecision(  # type: ignore[call-arg]
-            action=action,
-            weights=weights,
-            op_id=op_ids[action],
-            parent_mode=parent_modes[action],
-            replacement_multiplier=replacement[action],
-            promotion_margin_multiplier=margins[action],
-            candidate_min_age_multiplier=ages[action],
-            imprint_scale=imprints[action],
+            action=jnp.where(selection_valid, action, -1),
+            weights=jnp.where(
+                selection_valid,
+                weights,
+                jnp.full_like(weights, jnp.nan),
+            ),
+            op_id=jnp.where(selection_valid, op_ids[action], -1),
+            parent_mode=jnp.where(selection_valid, parent_modes[action], -1),
+            replacement_multiplier=jnp.where(
+                selection_valid,
+                replacement[action],
+                jnp.asarray(jnp.nan, dtype=jnp.float32),
+            ),
+            promotion_margin_multiplier=jnp.where(
+                selection_valid,
+                margins[action],
+                jnp.asarray(jnp.nan, dtype=jnp.float32),
+            ),
+            candidate_min_age_multiplier=jnp.where(
+                selection_valid,
+                ages[action],
+                jnp.asarray(jnp.nan, dtype=jnp.float32),
+            ),
+            imprint_scale=jnp.where(
+                selection_valid,
+                imprints[action],
+                jnp.asarray(jnp.nan, dtype=jnp.float32),
+            ),
+            valid=selection_valid,
         )
 
     @functools.partial(jax.jit, static_argnums=(0,))
@@ -706,7 +760,10 @@ class GeneratorMetaResourceManager:
         importance-weighted update.  This is useful when provenance rewards are
         sparse and the experiment wants explicit exploration credit.
         """
-        context = jnp.asarray(context_id, dtype=jnp.int32)
+        context, context_valid = safe_discrete_action(
+            context_id,
+            self._n_contexts,
+        )
         rewards = jnp.asarray(rewards, dtype=jnp.float32)
         finite = jnp.isfinite(rewards)
         if finite_mask is not None:
@@ -729,15 +786,20 @@ class GeneratorMetaResourceManager:
         if self._update_rule == "exp3":
             if selected_action is None:
                 raise ValueError("selected_action is required for update_rule='exp3'")
-            requested_action = jnp.asarray(selected_action, dtype=jnp.int32)
-            action_valid = (requested_action >= 0) & (requested_action < self.n_policies)
-            action = jnp.where(action_valid, requested_action, 0)
+            action, action_valid = safe_discrete_action(
+                selected_action,
+                self.n_policies,
+            )
             raw_probability = (
                 weights[action]
                 if selected_probability is None
                 else jnp.asarray(selected_probability, dtype=jnp.float32)
             )
-            probability_valid = jnp.all(jnp.isfinite(raw_probability))
+            probability_valid = (
+                jnp.all(jnp.isfinite(raw_probability))
+                & jnp.all(raw_probability > 0.0)
+                & jnp.all(raw_probability <= 1.0)
+            )
             probability = jnp.maximum(
                 jnp.where(probability_valid, raw_probability, 1.0), 1e-6
             )
@@ -782,7 +844,8 @@ class GeneratorMetaResourceManager:
             step_count=state.step_count + 1,
         )
         update_applied = (
-            selection_input_valid
+            context_valid
+            & selection_input_valid
             & floating_tree_is_finite(state)
             & floating_tree_is_finite(candidate_state)
             & jnp.all(jnp.isfinite(weights))

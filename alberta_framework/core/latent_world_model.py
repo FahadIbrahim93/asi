@@ -68,6 +68,7 @@ from alberta_framework.core.types import TraceMode
 from alberta_framework.core.update_safety import (
     floating_tree_is_finite,
     neutralize_array,
+    safe_discrete_action,
     select_transaction,
 )
 
@@ -408,8 +409,12 @@ class LatentWorldModel:
     ) -> Float[Array, " input_dim"]:
         """Return ``concat(latent, one_hot(action), optional interactions)``."""
         z = jnp.asarray(latent, dtype=jnp.float32).reshape((self._config.latent_dim,))
+        safe_action, action_valid = safe_discrete_action(
+            action,
+            self._config.n_actions,
+        )
         action_one_hot = jax.nn.one_hot(
-            action.astype(jnp.int32),
+            safe_action,
             self._config.n_actions,
             dtype=jnp.float32,
         )
@@ -417,7 +422,12 @@ class LatentWorldModel:
         if self._config.include_action_interactions:
             interactions = (z[:, None] * action_one_hot[None, :]).reshape((-1,))
             features.append(interactions)
-        return jnp.concatenate(features, axis=0)
+        encoded = jnp.concatenate(features, axis=0)
+        return jnp.where(
+            action_valid,
+            encoded,
+            jnp.full_like(encoded, jnp.nan),
+        )
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def input_features(
@@ -605,7 +615,10 @@ class LatentWorldModel:
         observation_arr = jnp.asarray(observation, dtype=jnp.float32).reshape(
             (self._config.observation_dim,)
         )
-        action_arr = jnp.asarray(action)
+        action_arr, action_valid = safe_discrete_action(
+            action,
+            self._config.n_actions,
+        )
         reward_arr = jnp.asarray(reward, dtype=jnp.float32)
         discount_arr = jnp.asarray(discount, dtype=jnp.float32)
         next_observation_arr = jnp.asarray(
@@ -613,7 +626,7 @@ class LatentWorldModel:
         ).reshape((self._config.observation_dim,))
         inputs_valid = (
             jnp.all(jnp.isfinite(observation_arr))
-            & jnp.all(jnp.isfinite(action_arr))
+            & action_valid
             & jnp.all(jnp.isfinite(reward_arr))
             & jnp.all(jnp.isfinite(discount_arr))
             & jnp.all(jnp.isfinite(next_observation_arr))

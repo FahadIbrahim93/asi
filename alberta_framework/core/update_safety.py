@@ -10,6 +10,41 @@ from jax import Array
 from jaxtyping import Bool
 
 
+def safe_discrete_action(
+    action: Array | int,
+    n_actions: int,
+    *,
+    allow_unset: bool = False,
+) -> tuple[Array, Bool[Array, ""]]:
+    """Return a safe scalar action code and its exact discrete-domain verdict.
+
+    Casting a floating action to ``int32`` before validation can turn ``NaN``,
+    infinity, fractions, and out-of-range values into an innocuous all-zero
+    one-hot vector.  Validate the floating scalar first, then expose only a
+    safe code to downstream one-hot arithmetic.  ``allow_unset`` admits the
+    conventional ``-1`` episode-start sentinel.
+    """
+
+    if n_actions < 0:
+        raise ValueError("n_actions must be non-negative")
+    if n_actions == 0:
+        return (
+            jnp.asarray(0, dtype=jnp.int32),
+            jnp.asarray(True, dtype=jnp.bool_),
+        )
+    raw = jnp.asarray(action, dtype=jnp.float32).reshape(())
+    lower = -1.0 if allow_unset else 0.0
+    valid = (
+        jnp.isfinite(raw)
+        & (raw == jnp.floor(raw))
+        & (raw >= lower)
+        & (raw < float(n_actions))
+    )
+    fallback = -1 if allow_unset else 0
+    safe = jnp.where(valid, raw, jnp.asarray(fallback, dtype=jnp.float32))
+    return safe.astype(jnp.int32), valid
+
+
 def floating_tree_is_finite(tree: object) -> Bool[Array, ""]:
     """Return whether every floating or complex leaf in ``tree`` is finite."""
 

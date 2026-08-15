@@ -363,11 +363,55 @@ def test_step9_scan_shapes() -> None:
     chex.assert_shape(result.average_rewards, (steps,))
     chex.assert_shape(result.actions, (steps,))
     chex.assert_shape(result.model_prediction_errors, (steps,))
+    chex.assert_shape(result.model_updates_applied, (steps,))
+    assert bool(jnp.all(result.model_updates_applied))
     chex.assert_shape(result.dream_td_errors, (steps, 2))
     chex.assert_shape(result.dream_accepted, (steps, 2))
     chex.assert_tree_all_finite(result.real_td_errors)
     chex.assert_tree_all_finite(result.average_rewards)
     chex.assert_tree_all_finite(result.model_prediction_errors)
+
+
+def test_step9_scan_exposes_rejected_model_updates() -> None:
+    cfg = Step9DreamingConfig(
+        observation_dim=3,
+        n_actions=2,
+        model_hidden_sizes=(),
+        model_sparsity=0.0,
+        planning_budget=0,
+    )
+    agent, model, buffer = make_step9_components(cfg)
+    state = init_step9_state(
+        agent,
+        model,
+        buffer,
+        key=jr.key(70),
+        initial_observation=jnp.zeros((3,), dtype=jnp.float32),
+    )
+    maximum = jnp.asarray(2_147_483_647, dtype=jnp.int32)
+    model_state = state.world_model_state.replace(
+        learner_state=state.world_model_state.learner_state.replace(
+            step_count=maximum,
+            step_words=jnp.asarray([0xFFFFFFFF, 0xFFFFFFFF], dtype=jnp.uint32),
+        ),
+        step_count=maximum,
+    )
+    state = state.replace(world_model_state=model_state)
+
+    result = run_step9_scan(
+        cfg,
+        agent,
+        model,
+        buffer,
+        state,
+        jnp.zeros((1,), dtype=jnp.float32),
+        jnp.zeros((1, 3), dtype=jnp.float32),
+    )
+
+    chex.assert_trees_all_equal(
+        result.model_updates_applied,
+        jnp.asarray([False]),
+    )
 
 
 def test_step9_scan_actions_in_range() -> None:

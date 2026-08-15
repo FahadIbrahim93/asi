@@ -50,9 +50,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   coordinates observable without silently converting arbitrary invalid inputs into evidence.
 - Made working/prototype/UPGD memory, state builders, world models, and their scan wrappers
   roll back complete invalid transitions. Rejected results expose explicit verdicts where the
-  public result schema supports them and never report plausible success metrics.
+  public result schema supports them and never report plausible success metrics; the Step 7
+  and Step 9 scan facades retain the per-event model verdict.
 - Rejected non-finite dream candidates and invalid or float32-unrepresentable resource costs;
   exact zero-weight channels remain unused, while positive-weight products must be finite.
+  Discrete action/context identifiers and Exp3 credit probabilities are validated before any
+  integer cast, lookup, or state update, and invalid prediction/selection queries stay visible.
 - Strengthened IPMNIST and micro-continual shard merging to reject cross-seed learner,
   hyperparameter, mechanism, or runtime-environment drift. The common runtime environment is
   now retained in derived summaries and validation receipts instead of being discarded.

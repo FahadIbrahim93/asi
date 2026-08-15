@@ -5882,6 +5882,7 @@ class PrototypeAgent:
             post_valid = (
                 post_finite
                 & post_consistent
+                & result.transition_diagnostics.valid
                 & recurrent_transaction_valid
                 & memory_transaction_valid
             )
@@ -6194,6 +6195,10 @@ class PrototypeAgent:
         model_replay_sampled = jnp.asarray(False)
         model_replay_updates_applied = jnp.asarray(0, dtype=jnp.int32)
         model_replay_padding_count = jnp.asarray(0, dtype=jnp.int32)
+        plain_world_model_transaction_applied = jnp.asarray(
+            True,
+            dtype=jnp.bool_,
+        )
 
         if self._world_model is not None and self._buffer is not None:
             wm_result = self._world_model.update(
@@ -6205,6 +6210,7 @@ class PrototypeAgent:
                 bootstrap_obs,
             )
             new_wm_state = wm_result.state
+            plain_world_model_transaction_applied = wm_result.update_applied
             bootstrap_buffer_state = self._buffer.add(
                 state.buffer_state,
                 bootstrap_obs,
@@ -6849,6 +6855,19 @@ class PrototypeAgent:
             step_count=next_step_count,
         )
 
+        component_diagnostics = cast(
+            PrototypeTransitionDiagnostics,
+            diagnostics.replace(
+                valid=(
+                    diagnostics.valid
+                    & plain_world_model_transaction_applied
+                ),
+                rejected=~(
+                    diagnostics.valid
+                    & plain_world_model_transaction_applied
+                ),
+            ),
+        )
         return PrototypeUpdateResult(
             state=new_state,
             action=next_action,
@@ -6885,7 +6904,7 @@ class PrototypeAgent:
             ia_recommendation=ia_recommendation,
             experiential_memory_diagnostics=memory_diagnostics,
             partner_policy_fusion_diagnostics=partner_fusion_diagnostics,
-            transition_diagnostics=diagnostics,
+            transition_diagnostics=component_diagnostics,
         )
 
     # -- Scan-based loop ------------------------------------------------------

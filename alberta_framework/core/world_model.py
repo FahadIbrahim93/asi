@@ -40,6 +40,7 @@ from alberta_framework.core.types import TraceMode
 from alberta_framework.core.update_safety import (
     floating_tree_is_finite,
     neutralize_array,
+    safe_discrete_action,
     select_transaction,
 )
 
@@ -373,11 +374,7 @@ class ActionConditionedWorldModel:
         obs = jnp.asarray(observation, dtype=jnp.float32).reshape(
             (self._config.observation_dim,)
         )
-        action_one_hot = jax.nn.one_hot(
-            action.astype(jnp.int32),
-            self._config.n_actions,
-            dtype=jnp.float32,
-        )
+        action_one_hot = self.encode_action(action)
         if self._config.include_action_interactions:
             interactions = (obs[:, None] * action_one_hot[None, :]).reshape((-1,))
             return jnp.concatenate([obs, action_one_hot, interactions], axis=0)
@@ -385,11 +382,20 @@ class ActionConditionedWorldModel:
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def encode_action(self, action: Array) -> Array:
-        """Return the one-hot action code used by the model."""
-        return jax.nn.one_hot(
-            action.astype(jnp.int32),
+        """Return the action code, leaving invalid discrete inputs visible."""
+        safe_action, action_valid = safe_discrete_action(
+            action,
+            self._config.n_actions,
+        )
+        encoded = jax.nn.one_hot(
+            safe_action,
             self._config.n_actions,
             dtype=jnp.float32,
+        )
+        return jnp.where(
+            action_valid,
+            encoded,
+            jnp.full_like(encoded, jnp.nan),
         )
 
     @functools.partial(jax.jit, static_argnums=(0,))
@@ -492,7 +498,10 @@ class ActionConditionedWorldModel:
         obs = jnp.asarray(observation, dtype=jnp.float32).reshape(
             (self._config.observation_dim,)
         )
-        action_arr = jnp.asarray(action)
+        action_arr, action_valid = safe_discrete_action(
+            action,
+            self._config.n_actions,
+        )
         reward_arr = jnp.asarray(reward, dtype=jnp.float32)
         discount_arr = jnp.asarray(discount, dtype=jnp.float32)
         next_obs = jnp.asarray(next_observation, dtype=jnp.float32).reshape(
@@ -500,7 +509,7 @@ class ActionConditionedWorldModel:
         )
         inputs_valid = (
             jnp.all(jnp.isfinite(obs))
-            & jnp.all(jnp.isfinite(action_arr))
+            & action_valid
             & jnp.all(jnp.isfinite(reward_arr))
             & jnp.all(jnp.isfinite(discount_arr))
             & jnp.all(jnp.isfinite(next_obs))
@@ -880,10 +889,19 @@ class OneStepWorldModel:
     def encode_action(self, action: Array) -> Array:
         """Encode a discrete or vector action."""
         if self._config.n_actions is not None:
-            return jax.nn.one_hot(
-                action.astype(jnp.int32),
+            safe_action, action_valid = safe_discrete_action(
+                action,
+                self._config.n_actions,
+            )
+            encoded = jax.nn.one_hot(
+                safe_action,
                 self._config.n_actions,
                 dtype=jnp.float32,
+            )
+            return jnp.where(
+                action_valid,
+                encoded,
+                jnp.full_like(encoded, jnp.nan),
             )
         return jnp.asarray(action, dtype=jnp.float32).reshape((self._config.action_dim,))
 
@@ -947,11 +965,26 @@ class OneStepWorldModel:
         next_observation: Array,
     ) -> WorldModelUpdateResult:
         """Update from one real transition."""
-        prediction = self.predict(state, observation, action)
+        if self._config.n_actions is not None:
+            safe_action, action_valid = safe_discrete_action(
+                action,
+                self._config.n_actions,
+            )
+        else:
+            action_arr = jnp.asarray(action, dtype=jnp.float32).reshape(
+                (self._config.action_dim,)
+            )
+            action_valid = jnp.all(jnp.isfinite(action_arr))
+            safe_action = jnp.where(
+                action_valid,
+                action_arr,
+                jnp.zeros_like(action_arr),
+            )
+        prediction = self.predict(state, observation, safe_action)
         targets = self.targets(observation, reward, next_observation)
         learner_result = self._learner.update(
             state.learner_state,
-            self.input_features(observation, action),
+            self.input_features(observation, safe_action),
             targets,
         )
         next_obs = jnp.asarray(next_observation, dtype=jnp.float32).reshape(
@@ -967,7 +1000,8 @@ class OneStepWorldModel:
             step_count=state.step_count + 1,
         )
         update_applied = (
-            learner_result.update_applied
+            action_valid
+            & learner_result.update_applied
             & floating_tree_is_finite(state)
             & floating_tree_is_finite(candidate_state)
         )

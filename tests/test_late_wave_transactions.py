@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import chex
+import jax
 import jax.numpy as jnp
 import jax.random as jr
 import pytest
@@ -38,6 +39,8 @@ from alberta_framework.core.working_memory import (
 from alberta_framework.core.world_model import (
     ActionConditionedWorldModel,
     ActionConditionedWorldModelConfig,
+    OneStepWorldModel,
+    WorldModelConfig,
     run_action_conditioned_world_model_learning_loop,
 )
 
@@ -159,6 +162,125 @@ def test_online_gated_builder_holds_full_state_and_keeps_invalid_raw_output_visi
     chex.assert_tree_all_finite(recovered)
 
 
+@pytest.mark.parametrize("invalid_action", [jnp.nan, jnp.inf, -2.0, 0.5, 2.0])
+def test_discrete_action_casts_cannot_launder_invalid_builder_events(
+    invalid_action: float,
+) -> None:
+    builder = OnlineGatedStateBuilder(
+        OnlineGatedStateBuilderConfig(
+            observation_dim=2,
+            n_actions=2,
+            hidden_dim=3,
+            step_size=0.05,
+        )
+    )
+    state, _ = builder.start(builder.init(jr.key(70)), jnp.asarray([1.0, 1.0]))
+
+    rejected, representation = jax.jit(builder.update)(
+        state,
+        jnp.asarray([0.0, 0.0]),
+        jnp.asarray(invalid_action),
+        jnp.asarray(0.0),
+        jnp.asarray(1.0),
+    )
+
+    chex.assert_trees_all_equal(rejected, state)
+    assert not bool(jnp.all(jnp.isfinite(representation)))
+    recovered, recovered_representation = builder.update(
+        rejected,
+        jnp.asarray([0.0, 0.0]),
+        jnp.asarray(1),
+        jnp.asarray(0.0),
+        jnp.asarray(1.0),
+    )
+    chex.assert_tree_all_finite(recovered)
+    chex.assert_tree_all_finite(recovered_representation)
+
+
+@pytest.mark.parametrize("invalid_action", [jnp.nan, jnp.inf, -1.0, 0.5, 2.0])
+def test_discrete_world_models_reject_actions_before_integer_cast(
+    invalid_action: float,
+) -> None:
+    observation = jnp.asarray([0.2, -0.1], dtype=jnp.float32)
+    next_observation = jnp.asarray([0.3, 0.1], dtype=jnp.float32)
+    action = jnp.asarray(invalid_action)
+
+    one_step = OneStepWorldModel(
+        WorldModelConfig(
+            observation_dim=2,
+            n_actions=2,
+            hidden_sizes=(),
+            sparsity=0.0,
+        )
+    )
+    one_step_state = one_step.init(jr.key(71))
+    one_step_prediction = one_step.predict(one_step_state, observation, action)
+    assert not bool(jnp.all(jnp.isfinite(one_step_prediction.raw_predictions)))
+    one_step_result = jax.jit(one_step.update)(
+        one_step_state,
+        observation,
+        action,
+        jnp.asarray(0.5),
+        next_observation,
+    )
+    assert not bool(one_step_result.update_applied)
+    chex.assert_trees_all_equal(
+        one_step_result.state,
+        jax.jit(lambda value: value)(one_step_state),
+    )
+
+    action_model = ActionConditionedWorldModel(
+        ActionConditionedWorldModelConfig(
+            observation_dim=2,
+            n_actions=2,
+            hidden_sizes=(),
+            sparsity=0.0,
+        )
+    )
+    action_state = action_model.init(jr.key(72))
+    action_prediction = action_model.predict(action_state, observation, action)
+    assert not bool(jnp.all(jnp.isfinite(action_prediction.raw_predictions)))
+    action_result = jax.jit(action_model.update)(
+        action_state,
+        observation,
+        action,
+        jnp.asarray(0.5),
+        jnp.asarray(0.95),
+        next_observation,
+    )
+    assert not bool(action_result.update_applied)
+    chex.assert_trees_all_equal(
+        action_result.state,
+        jax.jit(lambda value: value)(action_state),
+    )
+
+    latent_model = LatentWorldModel(
+        LatentWorldModelConfig(
+            observation_dim=2,
+            n_actions=2,
+            latent_dim=3,
+            hidden_sizes=(),
+            sparsity=0.0,
+        )
+    )
+    latent_state = latent_model.init(jr.key(73))
+    latent_prediction = latent_model.predict(latent_state, observation, action)
+    assert not bool(jnp.all(jnp.isfinite(latent_prediction.raw_predictions)))
+    latent_result = jax.jit(latent_model.update)(
+        latent_state,
+        observation,
+        action,
+        jnp.asarray(0.5),
+        jnp.asarray(0.95),
+        next_observation,
+    )
+    assert not bool(latent_result.update_applied)
+    chex.assert_trees_all_equal(
+        latent_result.state,
+        jax.jit(lambda value: value)(latent_state),
+    )
+
+
 def test_dream_selection_rejects_nonfinite_unused_channels() -> None:
     result = score_dream_candidates(
         surprises=jnp.asarray([1.0, 0.5]),
@@ -267,6 +389,139 @@ def test_resource_cost_product_validity_is_explicit_and_zero_weight_is_exact() -
         weighted_generator_result.state.action_counts[0], jnp.asarray([0.0, 1.0])
     )
     chex.assert_tree_all_finite(weighted_generator_result.state)
+
+
+def test_negative_resource_costs_are_never_treated_as_benefits() -> None:
+    values = jnp.asarray([0.25, 0.5], dtype=jnp.float32)
+    costs = jnp.asarray([-1.0, 0.25], dtype=jnp.float32)
+
+    learned = LearnedResourceManager(n_actions=2, cost_weight=1.0)
+    learned_result = learned.update(learned.init(), values, resource_costs=costs)
+    chex.assert_trees_all_equal(
+        learned_result.valid_actions,
+        jnp.asarray([False, True]),
+    )
+    assert float(learned_result.adjusted_losses[0]) == 0.0
+
+    generator = _generator_manager(1.0)
+    generator_result = generator.update(
+        generator.init(),
+        values,
+        resource_costs=costs,
+    )
+    chex.assert_trees_all_equal(
+        generator_result.valid_actions,
+        jnp.asarray([False, True]),
+    )
+    assert float(generator_result.adjusted_rewards[0]) == 0.0
+
+
+@pytest.mark.parametrize(
+    "selected_probability",
+    [jnp.nan, jnp.inf, -1.0, 0.0, 1.01],
+)
+def test_exp3_rejects_invalid_selected_probability_atomically(
+    selected_probability: float,
+) -> None:
+    manager = GeneratorMetaResourceManager(
+        policy_names=("a", "b"),
+        op_ids=(0, 1),
+        parent_modes=(0, 1),
+        replacement_multipliers=(1.0, 1.0),
+        promotion_margin_multipliers=(1.0, 1.0),
+        candidate_min_age_multipliers=(1.0, 1.0),
+        imprint_scales=(0.0, 0.0),
+        update_rule="exp3",
+    )
+    state = manager.init()
+    result = manager.update(
+        state,
+        jnp.asarray([0.5, 1.0], dtype=jnp.float32),
+        selected_action=jnp.asarray(1),
+        selected_probability=jnp.asarray(selected_probability),
+    )
+
+    assert not bool(result.update_applied)
+    chex.assert_trees_all_equal(result.state, state)
+    chex.assert_trees_all_equal(result.advantages, jnp.zeros((2,), dtype=jnp.float32))
+
+
+@pytest.mark.parametrize("selected_action", [jnp.nan, jnp.inf, -1.0, 0.5, 2.0])
+def test_exp3_rejects_invalid_selected_action_before_integer_cast(
+    selected_action: float,
+) -> None:
+    manager = GeneratorMetaResourceManager(
+        policy_names=("a", "b"),
+        op_ids=(0, 1),
+        parent_modes=(0, 1),
+        replacement_multipliers=(1.0, 1.0),
+        promotion_margin_multipliers=(1.0, 1.0),
+        candidate_min_age_multipliers=(1.0, 1.0),
+        imprint_scales=(0.0, 0.0),
+        update_rule="exp3",
+    )
+    state = manager.init()
+    result = manager.update(
+        state,
+        jnp.asarray([0.5, 1.0], dtype=jnp.float32),
+        selected_action=jnp.asarray(selected_action),
+        selected_probability=jnp.asarray(0.5),
+    )
+
+    assert not bool(result.update_applied)
+    chex.assert_trees_all_equal(result.state, state)
+
+
+@pytest.mark.parametrize("context_id", [jnp.nan, jnp.inf, -1.0, 0.5, 2.0])
+def test_resource_updates_reject_invalid_context_before_integer_cast(
+    context_id: float,
+) -> None:
+    learned = LearnedResourceManager(n_actions=2, n_contexts=2)
+    learned_state = learned.init()
+    learned_weights = learned.weights(
+        learned_state,
+        context_id=jnp.asarray(context_id),
+    )
+    assert not bool(jnp.all(jnp.isfinite(learned_weights)))
+    learned_result = learned.update(
+        learned_state,
+        jnp.asarray([0.25, 0.5], dtype=jnp.float32),
+        context_id=jnp.asarray(context_id),
+    )
+    assert not bool(learned_result.update_applied)
+    chex.assert_trees_all_equal(learned_result.state, learned_state)
+
+    generator = GeneratorMetaResourceManager(
+        policy_names=("a", "b"),
+        op_ids=(0, 1),
+        parent_modes=(0, 1),
+        replacement_multipliers=(1.0, 1.0),
+        promotion_margin_multipliers=(1.0, 1.0),
+        candidate_min_age_multipliers=(1.0, 1.0),
+        imprint_scales=(0.0, 0.0),
+        n_contexts=2,
+    )
+    generator_state = generator.init()
+    generator_weights = generator.weights(
+        generator_state,
+        context_id=jnp.asarray(context_id),
+    )
+    assert not bool(jnp.all(jnp.isfinite(generator_weights)))
+    decision = generator.select(
+        generator_state,
+        jr.key(74),
+        context_id=jnp.asarray(context_id),
+    )
+    assert not bool(decision.valid)
+    assert int(decision.action) == -1
+    assert not bool(jnp.all(jnp.isfinite(decision.weights)))
+    generator_result = generator.update(
+        generator_state,
+        jnp.asarray([0.25, 0.5], dtype=jnp.float32),
+        context_id=jnp.asarray(context_id),
+    )
+    assert not bool(generator_result.update_applied)
+    chex.assert_trees_all_equal(generator_result.state, generator_state)
 
 
 def test_latent_world_model_rolls_back_learner_encoder_and_scan_state() -> None:
