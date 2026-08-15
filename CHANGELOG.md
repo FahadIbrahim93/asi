@@ -34,6 +34,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Rejected malformed or float32-unsafe SIGReg kernel widths before Epps-Pulley
+  arithmetic can emit NaN, while preserving valid dynamic JIT and vectorized calls;
+  SIGReg configuration scalars now enforce the same finite representability contract.
 - Rejected nonfinite and out-of-range Pavlovian phase contingencies before they can
   silently behave like zero- or certain-reinforcement probabilities.
 - Required nexting RMSE inputs to be equal nonempty rank-two arrays and their

@@ -24,13 +24,50 @@ References:
 from __future__ import annotations
 
 import dataclasses
-from typing import Any
+import math
+import numbers
+from typing import Any, cast
 
 import chex
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import Array
 from jaxtyping import Float
+
+_FLOAT32_TINY = float(np.finfo(np.float32).tiny)
+_KERNEL_WIDTH_ERROR = (
+    "kernel_width must be positive and finite in float32 kernel arithmetic"
+)
+
+
+def _normalized_positive_float32(
+    name: str,
+    value: object,
+    *,
+    squared: bool,
+) -> float:
+    """Return a concrete real as ``float`` after float32-domain validation."""
+    message = f"{name} must be positive and finite in float32 arithmetic"
+    if isinstance(value, bool) or not isinstance(value, numbers.Real):
+        raise ValueError(message)
+    try:
+        concrete = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(message) from exc
+    if not math.isfinite(concrete) or concrete <= 0.0:
+        raise ValueError(message)
+
+    with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+        value32 = np.float32(concrete)
+        squared32 = np.float32(value32 * value32)
+    if not math.isfinite(float(value32)) or float(value32) < _FLOAT32_TINY:
+        raise ValueError(message)
+    if squared and (
+        not math.isfinite(float(squared32)) or float(squared32) < _FLOAT32_TINY
+    ):
+        raise ValueError(message)
+    return concrete
 
 
 @dataclasses.dataclass(frozen=True)
@@ -52,12 +89,16 @@ class SIGRegConfig:
 
     def __post_init__(self) -> None:
         """Validate the configuration."""
-        if self.n_projections <= 0:
+        if type(self.n_projections) is not int or self.n_projections <= 0:
             raise ValueError("n_projections must be positive")
-        if self.kernel_width <= 0.0:
-            raise ValueError("kernel_width must be positive")
-        if self.eps <= 0.0:
-            raise ValueError("eps must be positive")
+        kernel_width = _normalized_positive_float32(
+            "kernel_width",
+            self.kernel_width,
+            squared=True,
+        )
+        eps = _normalized_positive_float32("eps", self.eps, squared=False)
+        object.__setattr__(self, "kernel_width", kernel_width)
+        object.__setattr__(self, "eps", eps)
 
     def to_config(self) -> dict[str, Any]:
         """Serialize to a JSON-compatible dictionary."""
@@ -85,6 +126,92 @@ class SIGRegDiagnostics:
     projected_std_mean: Float[Array, ""]
 
 
+def _runtime_checked_value(
+    value: Array,
+    predicate: Array,
+    message: str,
+) -> Array:
+    """Enforce a scalar predicate without breaking valid JAX transforms.
+
+    Eager invalid inputs are rejected before this helper. Under ``jax.jit``
+    or ``jax.vmap``, a failed check surfaces on synchronization as
+    :class:`jax.errors.JaxRuntimeError` wrapping the host ``ValueError``.
+    """
+    predicate = jnp.reshape(jnp.asarray(predicate, dtype=jnp.bool_), ())
+
+    def valid_branch(operand: tuple[Array, Array]) -> Array:
+        checked_value, _ = operand
+        return checked_value
+
+    def invalid_branch(operand: tuple[Array, Array]) -> Array:
+        checked_value, runtime_predicate = operand
+
+        def raise_if_false(concrete_predicate: Any) -> None:
+            if not bool(concrete_predicate):
+                raise ValueError(message)
+
+        jax.debug.callback(raise_if_false, runtime_predicate, ordered=True)
+        return checked_value
+
+    return cast(
+        Array,
+        jax.lax.cond(
+            predicate,
+            valid_branch,
+            invalid_branch,
+            (value, predicate),
+        ),
+    )
+
+
+def _validated_kernel_width(kernel_width: float | Array) -> Array:
+    """Validate the width in the float32 domain used by the statistic."""
+    if isinstance(kernel_width, bool):
+        raise ValueError(_KERNEL_WIDTH_ERROR)
+    try:
+        if isinstance(kernel_width, numbers.Real):
+            uncast = jnp.asarray(float(kernel_width), dtype=jnp.float32)
+        else:
+            uncast = jnp.asarray(kernel_width)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(_KERNEL_WIDTH_ERROR) from exc
+    if uncast.shape != ():
+        raise ValueError(_KERNEL_WIDTH_ERROR)
+    if not (
+        jnp.issubdtype(uncast.dtype, jnp.integer)
+        or jnp.issubdtype(uncast.dtype, jnp.floating)
+    ):
+        raise ValueError(_KERNEL_WIDTH_ERROR)
+
+    width = jnp.asarray(uncast, dtype=jnp.float32)
+    width_squared = width * width
+    predicate = (
+        jnp.isfinite(width)
+        & (width > 0.0)
+        & jnp.isfinite(width_squared)
+        & (width_squared >= jnp.asarray(_FLOAT32_TINY, dtype=jnp.float32))
+    )
+    if not isinstance(width, jax.core.Tracer):
+        if not bool(predicate):
+            raise ValueError(_KERNEL_WIDTH_ERROR)
+        return width
+    return _runtime_checked_value(width, predicate, _KERNEL_WIDTH_ERROR)
+
+
+def _epps_pulley_gaussian_statistic(samples: Array, width: Array) -> Array:
+    """Compute the statistic after ``width`` has passed boundary validation."""
+    x = jnp.ravel(jnp.asarray(samples, dtype=jnp.float32))
+    width_squared = width * width
+    diffs = x[:, None] - x[None, :]
+    empirical = jnp.mean(jnp.exp(-(diffs**2) / (2.0 * width_squared)))
+    cross_scale = jnp.sqrt(width_squared / (width_squared + 1.0))
+    cross = jnp.mean(
+        cross_scale * jnp.exp(-(x**2) / (2.0 * (width_squared + 1.0)))
+    )
+    target = jnp.sqrt(width_squared / (width_squared + 2.0))
+    return jnp.maximum(empirical - 2.0 * cross + target, 0.0)
+
+
 def sample_sigreg_directions(
     key: Array,
     latent_dim: int,
@@ -106,7 +233,7 @@ def sample_sigreg_directions(
 def epps_pulley_gaussian_statistic(
     samples: Array,
     *,
-    kernel_width: float = 1.0,
+    kernel_width: float | Array = 1.0,
 ) -> Float[Array, ""]:
     """Return the one-dimensional Epps-Pulley/BHEP Gaussian statistic.
 
@@ -114,24 +241,20 @@ def epps_pulley_gaussian_statistic(
     dimensional sample distribution and ``N(0, 1)`` (Epps & Pulley 1983; the
     BHEP form of Baringhaus & Henze 1988). It is zero only when the projected
     distribution matches the target Gaussian in the population limit.
+
+    ``kernel_width`` may be a dynamic scalar under JAX transforms. Invalid
+    eager values raise :class:`ValueError`; invalid compiled values raise a
+    :class:`jax.errors.JaxRuntimeError` when the result is synchronized.
     """
-    width = jnp.asarray(kernel_width, dtype=jnp.float32)
-    x = jnp.ravel(jnp.asarray(samples, dtype=jnp.float32))
-    diffs = x[:, None] - x[None, :]
-    empirical = jnp.mean(jnp.exp(-(diffs**2) / (2.0 * width**2)))
-    cross_scale = jnp.sqrt((width**2) / (width**2 + 1.0))
-    cross = jnp.mean(
-        cross_scale * jnp.exp(-(x**2) / (2.0 * (width**2 + 1.0)))
-    )
-    target = jnp.sqrt((width**2) / (width**2 + 2.0))
-    return jnp.maximum(empirical - 2.0 * cross + target, 0.0)
+    width = _validated_kernel_width(kernel_width)
+    return _epps_pulley_gaussian_statistic(samples, width)
 
 
 def sliced_sigreg_loss(
     embeddings: Array,
     directions: Array,
     *,
-    kernel_width: float = 1.0,
+    kernel_width: float | Array = 1.0,
 ) -> Float[Array, ""]:
     """Compute sliced isotropic Gaussian regularization loss.
 
@@ -148,13 +271,11 @@ def sliced_sigreg_loss(
     dirs = jnp.asarray(directions, dtype=jnp.float32)
     if z.ndim < 2:
         raise ValueError("embeddings must have shape (..., latent_dim)")
+    width = _validated_kernel_width(kernel_width)
     flat = jnp.reshape(z, (-1, z.shape[-1]))
     projections = flat @ dirs.T
     per_projection = jax.vmap(
-        lambda values: epps_pulley_gaussian_statistic(
-            values,
-            kernel_width=kernel_width,
-        ),
+        lambda values: _epps_pulley_gaussian_statistic(values, width),
         in_axes=1,
     )(projections)
     return jnp.mean(per_projection)

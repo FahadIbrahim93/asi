@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import chex
+import jax
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
+import pytest
 
 from alberta_framework.core.sigreg import (
     SIGRegConfig,
@@ -38,6 +41,157 @@ def test_epps_pulley_statistic_penalizes_collapsed_samples() -> None:
     collapsed_loss = epps_pulley_gaussian_statistic(collapsed)
 
     assert float(collapsed_loss) > float(gaussian_loss)
+
+
+@pytest.mark.parametrize(
+    "kernel_width",
+    [
+        0.0,
+        -1.0,
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+        True,
+        "1.0",
+        None,
+        1.0e-30,
+        1.0e30,
+        10**400,
+        jnp.asarray([1.0]),
+    ],
+)
+def test_epps_pulley_rejects_invalid_static_kernel_width(kernel_width: object) -> None:
+    samples = jnp.asarray([-1.0, 0.0, 1.0], dtype=jnp.float32)
+
+    with pytest.raises(ValueError, match="kernel_width must be positive and finite"):
+        epps_pulley_gaussian_statistic(
+            samples,
+            kernel_width=kernel_width,  # type: ignore[arg-type]
+        )
+
+
+def test_epps_pulley_dynamic_jit_keeps_valid_width_and_signals_invalid_widths() -> None:
+    samples = jnp.asarray([-1.0, 0.0, 1.0], dtype=jnp.float32)
+    compiled = jax.jit(
+        lambda width: epps_pulley_gaussian_statistic(samples, kernel_width=width)
+    )
+
+    eager = epps_pulley_gaussian_statistic(samples, kernel_width=1.0)
+    chex.assert_trees_all_close(compiled(jnp.asarray(1.0)), eager, atol=1.0e-6)
+    for invalid in (0.0, -1.0, float("nan"), float("inf"), 1.0e-30, 1.0e30):
+        with pytest.raises(
+            jax.errors.JaxRuntimeError,
+            match="kernel_width must be positive and finite",
+        ):
+            compiled(jnp.asarray(invalid)).block_until_ready()
+
+
+def test_epps_pulley_accepts_supported_concrete_real_scalars() -> None:
+    samples = jnp.asarray([-1.0, 0.0, 1.0], dtype=jnp.float32)
+
+    for width in (1, 10**10, np.int64(1), np.float64(0.75)):
+        assert bool(
+            jnp.isfinite(
+                epps_pulley_gaussian_statistic(
+                    samples,
+                    kernel_width=width,  # type: ignore[arg-type]
+                )
+            )
+        )
+
+
+def test_epps_pulley_vmap_preserves_valid_widths_and_signals_invalid_lanes() -> None:
+    samples = jnp.asarray([-1.0, 0.0, 1.0], dtype=jnp.float32)
+    mapped = jax.jit(
+        jax.vmap(
+            lambda width: epps_pulley_gaussian_statistic(samples, kernel_width=width)
+        )
+    )
+    valid_widths = jnp.asarray([0.5, 1.0, 2.0], dtype=jnp.float32)
+    expected = jnp.asarray(
+        [
+            epps_pulley_gaussian_statistic(samples, kernel_width=float(width))
+            for width in valid_widths
+        ]
+    )
+    chex.assert_trees_all_close(mapped(valid_widths), expected, atol=1.0e-6)
+
+    with pytest.raises(
+        jax.errors.JaxRuntimeError,
+        match="kernel_width must be positive and finite",
+    ):
+        mapped(jnp.asarray([0.5, 0.0, 2.0], dtype=jnp.float32)).block_until_ready()
+
+
+def test_sliced_sigreg_dynamic_jit_keeps_valid_width_and_signals_invalid_width() -> None:
+    embeddings = jnp.asarray(
+        [[-1.0, 0.5], [0.0, -0.5], [1.0, 1.5]],
+        dtype=jnp.float32,
+    )
+    directions = jnp.eye(2, dtype=jnp.float32)
+    compiled_sliced = jax.jit(
+        lambda width: sliced_sigreg_loss(
+            embeddings,
+            directions,
+            kernel_width=width,
+        )
+    )
+
+    eager = sliced_sigreg_loss(embeddings, directions, kernel_width=1.0)
+    chex.assert_trees_all_close(compiled_sliced(jnp.asarray(1.0)), eager, atol=1.0e-6)
+
+    with pytest.raises(
+        jax.errors.JaxRuntimeError,
+        match="kernel_width must be positive and finite",
+    ):
+        compiled_sliced(jnp.asarray(0.0)).block_until_ready()
+
+
+def test_sigreg_config_rejects_invalid_static_numeric_contracts() -> None:
+    for bad_width in (
+        0.0,
+        -1.0,
+        float("nan"),
+        float("inf"),
+        True,
+        "1.0",
+        None,
+        1.0e-30,
+        1.0e30,
+        10**400,
+        jnp.asarray(1.0),
+    ):
+        with pytest.raises(ValueError):
+            SIGRegConfig(kernel_width=bad_width)  # type: ignore[arg-type]
+    for bad_eps in (
+        0.0,
+        -1.0,
+        float("nan"),
+        float("inf"),
+        True,
+        "1.0",
+        None,
+        1.0e-50,
+        1.0e50,
+        10**400,
+        jnp.asarray(1.0),
+    ):
+        with pytest.raises(ValueError):
+            SIGRegConfig(eps=bad_eps)  # type: ignore[arg-type]
+    for bad_count in (0, -1, True, 1.0, np.int64(1)):
+        with pytest.raises(ValueError):
+            SIGRegConfig(n_projections=bad_count)  # type: ignore[arg-type]
+
+
+def test_sigreg_config_normalizes_supported_real_scalars() -> None:
+    config = SIGRegConfig(
+        n_projections=3,
+        kernel_width=np.float64(0.75),
+        eps=np.float32(1.0e-6),  # type: ignore[arg-type]
+    )
+
+    assert type(config.kernel_width) is float
+    assert type(config.eps) is float
 
 
 def test_sliced_sigreg_penalizes_shifted_and_collapsed_embeddings() -> None:
