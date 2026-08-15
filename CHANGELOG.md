@@ -58,6 +58,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added an explicit traced validity verdict to behavior-model input gradients so finite neutral
   payloads from rejected inputs cannot be mistaken for valid state-builder updates; eager,
   compiled, and vectorized consumers can gate mutation on the same result field.
+- Built action-conditioned world-model interaction features from finite internal operands while
+  preserving NaN as the fail-visible public result for non-finite observations or invalid actions;
+  valid eager, compiled, and vectorized predictions retain the same values.
 - Required automatic feature-to-subtask counts to be non-negative integer scalars before
   ranking, while retaining NumPy/JAX integer-scalar compatibility and zero/oversized bounds.
 - Aligned plotted trailing-window learning-curve means and confidence intervals with the

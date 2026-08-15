@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import chex
+import jax
 import jax.numpy as jnp
 import jax.random as jr
 
@@ -20,6 +21,7 @@ from alberta_framework.core.dreaming import (
 from alberta_framework.core.world_model import (
     ActionConditionedWorldModel,
     ActionConditionedWorldModelConfig,
+    WorldModelPrediction,
     run_action_conditioned_world_model_learning_loop,
 )
 
@@ -99,8 +101,8 @@ def test_action_conditioned_world_model_optional_interaction_features() -> None:
     )
 
 
-def test_action_interactions_do_not_form_zero_times_inf() -> None:
-    """Inf obs times a silent action one-hot is 0*inf = NaN in the product."""
+def test_action_interactions_keep_invalid_public_results_fail_visible() -> None:
+    """Internal operands stay finite while invalid public results remain NaN."""
     model = ActionConditionedWorldModel(
         ActionConditionedWorldModelConfig(
             observation_dim=2,
@@ -113,13 +115,74 @@ def test_action_interactions_do_not_form_zero_times_inf() -> None:
     raw = obs[:, None] * jnp.array([1.0, 0.0, 0.0], dtype=jnp.float32)[None, :]
     assert not bool(jnp.all(jnp.isfinite(raw)))
 
-    features = model.input_features(obs, jnp.array(0, dtype=jnp.int32))
-    chex.assert_tree_all_finite(features)
-    chex.assert_trees_all_close(features, jnp.zeros_like(features))
-
     state = model.init(jr.key(0))
-    prediction = model.predict(state, obs, jnp.array(0, dtype=jnp.int32))
-    chex.assert_tree_all_finite(prediction)
+    safe_features, features_valid, safe_obs = model._safe_input_features(
+        obs,
+        jnp.array(0, dtype=jnp.int32),
+    )
+    assert not bool(features_valid)
+    chex.assert_tree_all_finite((safe_features, safe_obs))
+
+    def evaluate(observation: jax.Array) -> tuple[jax.Array, WorldModelPrediction]:
+        features = model.input_features(observation, jnp.array(0, dtype=jnp.int32))
+        return features, model.predict(state, observation, jnp.array(0, dtype=jnp.int32))
+
+    with jax.disable_jit():
+        eager_features, eager_prediction = evaluate(obs)
+    compiled_features, compiled_prediction = jax.jit(evaluate)(obs)
+
+    assert bool(jnp.all(jnp.isnan(eager_features)))
+    assert bool(jnp.all(jnp.isnan(compiled_features)))
+    for prediction in (eager_prediction, compiled_prediction):
+        assert bool(jnp.all(jnp.isnan(prediction.next_observation)))
+        assert bool(jnp.isnan(prediction.reward))
+        assert bool(jnp.isnan(prediction.discount))
+        assert bool(jnp.all(jnp.isnan(prediction.raw_predictions)))
+
+
+def test_world_model_feature_and_prediction_validity_parity_under_vmap() -> None:
+    """Valid rows retain exact results while invalid rows stay fail-visible."""
+    model = ActionConditionedWorldModel(
+        ActionConditionedWorldModelConfig(
+            observation_dim=2,
+            n_actions=3,
+            hidden_sizes=(),
+            include_action_interactions=True,
+        )
+    )
+    state = model.init(jr.key(2))
+    valid_obs = jnp.array([2.0, -3.0], dtype=jnp.float32)
+    invalid_obs = jnp.array([jnp.inf, -3.0], dtype=jnp.float32)
+    observations = jnp.stack([valid_obs, invalid_obs, valid_obs])
+    actions = jnp.array([1, 1, 3], dtype=jnp.int32)
+
+    with jax.disable_jit():
+        eager_features = model.input_features(valid_obs, actions[0])
+        eager_prediction = model.predict(state, valid_obs, actions[0])
+    compiled_features = model.input_features(valid_obs, actions[0])
+    compiled_prediction = model.predict(state, valid_obs, actions[0])
+    batched_features = jax.vmap(model.input_features)(
+        observations,
+        actions,
+    )
+    batched_predictions = jax.vmap(lambda obs, action: model.predict(state, obs, action))(
+        observations,
+        actions,
+    )
+
+    chex.assert_trees_all_equal(eager_features, compiled_features)
+    chex.assert_trees_all_equal(eager_features, batched_features[0])
+    chex.assert_trees_all_equal(eager_prediction, compiled_prediction)
+    chex.assert_trees_all_equal(
+        eager_prediction,
+        jax.tree.map(lambda value: value[0], batched_predictions),
+    )
+    for row in (1, 2):
+        assert bool(jnp.all(jnp.isnan(batched_features[row])))
+        assert bool(jnp.all(jnp.isnan(batched_predictions.next_observation[row])))
+        assert bool(jnp.isnan(batched_predictions.reward[row]))
+        assert bool(jnp.isnan(batched_predictions.discount[row]))
+        assert bool(jnp.all(jnp.isnan(batched_predictions.raw_predictions[row])))
 
 
 def test_action_conditioned_world_model_scan_loop_shapes() -> None:
