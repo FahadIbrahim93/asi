@@ -209,6 +209,28 @@ class LatentWorldModelLearningResult:
     encoder_gradient_norms: Float[Array, " num_steps"]
 
 
+def _blend_ema(previous: Array, value: Array, decay: Array) -> Array:
+    """Return decay * previous + (1-decay) * value without a 0*inf product."""
+    one_minus = 1.0 - decay
+    decayed_prev = jnp.where(decay == 0.0, jnp.zeros_like(previous), decay * previous)
+    decayed_new = jnp.where(one_minus == 0.0, jnp.zeros_like(value), one_minus * value)
+    return decayed_prev + decayed_new
+
+
+def _hold_or_blend(
+    previous: Array,
+    value: Array,
+    decay: Array,
+    *,
+    first: Array,
+    hold: Array,
+) -> Array:
+    """Keep previous when hold is set or value is non-finite."""
+    value_ok = jnp.all(jnp.isfinite(value))
+    proposed = jnp.where(first, value, _blend_ema(previous, value, decay))
+    return jnp.where(hold | ~value_ok, previous, proposed)
+
+
 class LatentWorldModel:
     """Latent model for ``(z_t, a_t) -> (z_{t+1}, r, gamma)``.
 
@@ -568,26 +590,57 @@ class LatentWorldModel:
             self.input_features_from_latent(prediction.latent, action),
             targets,
         )
+        obs = jnp.asarray(observation, dtype=jnp.float32).reshape(
+            (self._config.observation_dim,)
+        )
+        next_obs = jnp.asarray(next_observation, dtype=jnp.float32).reshape(
+            (self._config.observation_dim,)
+        )
+        reward_arr = jnp.asarray(reward, dtype=jnp.float32)
+        discount_arr = jnp.asarray(discount, dtype=jnp.float32)
+        transition_finite = (
+            jnp.all(jnp.isfinite(obs))
+            & jnp.all(jnp.isfinite(next_obs))
+            & jnp.isfinite(reward_arr)
+            & jnp.isfinite(discount_arr)
+        )
+        next_learner_state = jax.lax.cond(
+            transition_finite,
+            lambda: learner_result.state,
+            lambda: state.learner_state,
+        )
         target_next_latent = self.encode(state, next_observation)
         surprise = jnp.mean((prediction.next_latent - target_next_latent) ** 2)
-        reward_error = prediction.reward - jnp.asarray(reward, dtype=jnp.float32)
-        discount_error = prediction.discount - jnp.asarray(discount, dtype=jnp.float32)
+        reward_error = prediction.reward - reward_arr
+        discount_error = prediction.discount - discount_arr
         prediction_error = surprise + reward_error**2 + discount_error**2
+        diagnostics_finite = (
+            transition_finite
+            & jnp.all(jnp.isfinite(target_next_latent))
+            & jnp.isfinite(surprise)
+            & jnp.isfinite(prediction_error)
+            & jnp.isfinite(reward_error)
+            & jnp.isfinite(discount_error)
+        )
+        hold = ~diagnostics_finite
 
         collapse_decay = jnp.asarray(self._config.collapse_decay, dtype=jnp.float32)
         surprise_decay = jnp.asarray(self._config.surprise_decay, dtype=jnp.float32)
         first = state.step_count == 0
-        next_mean = jnp.where(
-            first,
+        next_mean = _hold_or_blend(
+            state.latent_mean_ema,
             target_next_latent,
-            collapse_decay * state.latent_mean_ema
-            + (1.0 - collapse_decay) * target_next_latent,
+            collapse_decay,
+            first=first,
+            hold=hold,
         )
         centered = target_next_latent - next_mean
-        next_var = jnp.where(
-            first,
+        next_var = _hold_or_blend(
+            state.latent_var_ema,
             centered**2,
-            collapse_decay * state.latent_var_ema + (1.0 - collapse_decay) * centered**2,
+            collapse_decay,
+            first=first,
+            hold=hold,
         )
         latent_std = jnp.sqrt(jnp.maximum(next_var, jnp.asarray(1e-8, dtype=jnp.float32)))
         latent_std_mean = jnp.mean(latent_std)
@@ -596,21 +649,22 @@ class LatentWorldModel:
                 jnp.float32
             )
         )
-        next_surprise_ema = jnp.where(
-            first,
-            surprise,
-            surprise_decay * state.surprise_ema + (1.0 - surprise_decay) * surprise,
+        next_surprise_ema = _hold_or_blend(
+            state.surprise_ema, surprise, surprise_decay, first=first, hold=hold
         )
-        next_prediction_error_ema = jnp.where(
-            first,
+        next_prediction_error_ema = _hold_or_blend(
+            state.prediction_error_ema,
             prediction_error,
-            surprise_decay * state.prediction_error_ema
-            + (1.0 - surprise_decay) * prediction_error,
+            surprise_decay,
+            first=first,
+            hold=hold,
         )
-        next_collapse_score_ema = jnp.where(
-            first,
+        next_collapse_score_ema = _hold_or_blend(
+            state.collapse_score_ema,
             collapse_score,
-            collapse_decay * state.collapse_score_ema + (1.0 - collapse_decay) * collapse_score,
+            collapse_decay,
+            first=first,
+            hold=hold,
         )
 
         if self._config.encoder_learning:
@@ -631,26 +685,39 @@ class LatentWorldModel:
         new_state = LatentWorldModelState(
             encoder_matrix=encoder_matrix,
             encoder_bias=encoder_bias,
-            learner_state=learner_result.state,
+            learner_state=next_learner_state,
             latent_mean_ema=next_mean,
             latent_var_ema=next_var,
             surprise_ema=next_surprise_ema,
             prediction_error_ema=next_prediction_error_ema,
             collapse_score_ema=next_collapse_score_ema,
-            step_count=state.step_count + 1,
+            step_count=jnp.where(transition_finite, state.step_count + 1, state.step_count),
         )
+        zero = jnp.zeros_like(surprise)
         return LatentWorldModelUpdateResult(
             state=new_state,
             prediction=prediction,
-            target_next_latent=target_next_latent,
+            target_next_latent=jnp.where(
+                jnp.isfinite(target_next_latent),
+                target_next_latent,
+                jnp.zeros_like(target_next_latent),
+            ),
             targets=targets,
             errors=learner_result.errors,
-            surprise=surprise,
-            reward_error=reward_error,
-            discount_error=discount_error,
-            prediction_error=prediction_error,
-            latent_std_mean=latent_std_mean,
-            collapse_score=collapse_score,
+            surprise=jnp.where(diagnostics_finite, surprise, zero),
+            reward_error=jnp.where(diagnostics_finite, reward_error, jnp.zeros_like(reward_error)),
+            discount_error=jnp.where(
+                diagnostics_finite, discount_error, jnp.zeros_like(discount_error)
+            ),
+            prediction_error=jnp.where(
+                diagnostics_finite, prediction_error, jnp.zeros_like(prediction_error)
+            ),
+            latent_std_mean=jnp.where(
+                diagnostics_finite, latent_std_mean, jnp.zeros_like(latent_std_mean)
+            ),
+            collapse_score=jnp.where(
+                diagnostics_finite, collapse_score, jnp.zeros_like(collapse_score)
+            ),
             per_head_metrics=learner_result.per_head_metrics,
             learner_result=learner_result,
             encoder_update_applied=encoder_update_applied,
