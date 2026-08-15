@@ -55,6 +55,67 @@ def test_action_conditioned_world_model_update_and_prediction_shapes() -> None:
     chex.assert_tree_all_finite(result.prediction_error)
 
 
+def test_action_conditioned_world_model_holds_error_ema_on_inf_next_obs() -> None:
+    """Inf next observations are inf-inf in delta targets and error EMA.
+
+    Fail-closed: hold the previous finite error EMA and observation bounds so
+    later finite transitions keep a usable diagnostic and clip range.
+    """
+    config = ActionConditionedWorldModelConfig(
+        observation_dim=2,
+        n_actions=2,
+        hidden_sizes=(),
+        step_size=0.05,
+        sparsity=0.0,
+        error_decay=0.5,
+    )
+    model = ActionConditionedWorldModel(config)
+    state = model.init(jr.key(0))
+    obs = jnp.array([0.2, -0.1], dtype=jnp.float32)
+    action = jnp.array(1, dtype=jnp.int32)
+    reward = jnp.array(0.5, dtype=jnp.float32)
+    discount = jnp.array(0.95, dtype=jnp.float32)
+    seeded = model.update(
+        state,
+        obs,
+        action,
+        reward,
+        discount,
+        jnp.array([0.3, 0.1], dtype=jnp.float32),
+    )
+    inf_next = jnp.array([jnp.inf, 0.1], dtype=jnp.float32)
+    poisoned = model.update(
+        seeded.state, obs, action, reward, discount, inf_next
+    )
+    twice = model.update(
+        poisoned.state, obs, action, reward, discount, inf_next
+    )
+    recovered = model.update(
+        twice.state,
+        obs,
+        action,
+        reward,
+        discount,
+        jnp.array([0.3, 0.1], dtype=jnp.float32),
+    )
+
+    assert bool(jnp.isfinite(poisoned.state.model_error_ema))
+    chex.assert_trees_all_close(
+        poisoned.state.model_error_ema, seeded.state.model_error_ema
+    )
+    chex.assert_trees_all_close(
+        poisoned.state.observation_min, seeded.state.observation_min
+    )
+    chex.assert_trees_all_close(
+        poisoned.state.observation_max, seeded.state.observation_max
+    )
+    assert bool(jnp.isfinite(poisoned.prediction_error))
+    chex.assert_tree_all_finite(twice.state.model_error_ema)
+    assert bool(jnp.isfinite(recovered.state.model_error_ema))
+    assert bool(jnp.all(jnp.isfinite(recovered.state.observation_min)))
+    assert bool(jnp.all(jnp.isfinite(recovered.state.observation_max)))
+
+
 def test_action_conditioned_world_model_config_roundtrip() -> None:
     config = ActionConditionedWorldModelConfig(
         observation_dim=3,

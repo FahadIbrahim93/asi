@@ -436,12 +436,34 @@ class ActionConditionedWorldModel:
         discount_error = prediction.discount - discount_arr
         next_observation_errors = prediction.next_observation - next_obs
         prediction_error = observation_mse + reward_error**2 + discount_error**2
+        diagnostics_finite = (
+            jnp.isfinite(prediction_error)
+            & jnp.isfinite(observation_mse)
+            & jnp.isfinite(reward_error)
+            & jnp.isfinite(discount_error)
+            & jnp.all(jnp.isfinite(next_observation_errors))
+        )
+        zero = jnp.zeros_like(prediction_error)
+        safe_prediction_error = jnp.where(diagnostics_finite, prediction_error, zero)
 
         error_decay = jnp.asarray(self._config.error_decay, dtype=jnp.float32)
+        one_minus_decay = 1.0 - error_decay
+        # Frozen or inf diagnostics must not form 0*inf or inf-inf in the EMA.
+        decayed_prev = jnp.where(
+            error_decay == 0.0,
+            jnp.zeros_like(state.model_error_ema),
+            error_decay * state.model_error_ema,
+        )
+        decayed_new = jnp.where(
+            one_minus_decay == 0.0,
+            jnp.zeros_like(safe_prediction_error),
+            one_minus_decay * safe_prediction_error,
+        )
+        blended = decayed_prev + decayed_new
         next_error_ema = jnp.where(
-            state.step_count == 0,
-            prediction_error,
-            error_decay * state.model_error_ema + (1.0 - error_decay) * prediction_error,
+            ~diagnostics_finite,
+            state.model_error_ema,
+            jnp.where(state.step_count == 0, safe_prediction_error, blended),
         )
 
         obs = jnp.asarray(observation, dtype=jnp.float32).reshape(
@@ -449,14 +471,36 @@ class ActionConditionedWorldModel:
         )
         observed_stack_min = jnp.minimum(obs, next_obs)
         observed_stack_max = jnp.maximum(obs, next_obs)
+        obs_bounds_finite = jnp.isfinite(obs) & jnp.isfinite(next_obs)
+        reward_bounds_finite = jnp.isfinite(reward_arr)
         new_state = ActionConditionedWorldModelState(
             learner_state=learner_result.state,
-            observation_min=jnp.minimum(state.observation_min, observed_stack_min),
-            observation_max=jnp.maximum(state.observation_max, observed_stack_max),
-            reward_min=jnp.minimum(state.reward_min, reward_arr),
-            reward_max=jnp.maximum(state.reward_max, reward_arr),
+            observation_min=jnp.where(
+                obs_bounds_finite,
+                jnp.minimum(state.observation_min, observed_stack_min),
+                state.observation_min,
+            ),
+            observation_max=jnp.where(
+                obs_bounds_finite,
+                jnp.maximum(state.observation_max, observed_stack_max),
+                state.observation_max,
+            ),
+            reward_min=jnp.where(
+                reward_bounds_finite,
+                jnp.minimum(state.reward_min, reward_arr),
+                state.reward_min,
+            ),
+            reward_max=jnp.where(
+                reward_bounds_finite,
+                jnp.maximum(state.reward_max, reward_arr),
+                state.reward_max,
+            ),
             model_error_ema=next_error_ema,
-            step_count=state.step_count + 1,
+            step_count=jnp.where(
+                jnp.all(obs_bounds_finite) & reward_bounds_finite & jnp.isfinite(discount_arr),
+                state.step_count + 1,
+                state.step_count,
+            ),
         )
 
         return WorldModelUpdateResult(
@@ -465,11 +509,21 @@ class ActionConditionedWorldModel:
             targets=targets,
             errors=learner_result.errors,
             per_head_metrics=learner_result.per_head_metrics,
-            prediction_error=prediction_error,
-            observation_mse=observation_mse,
-            reward_error=reward_error,
-            next_observation_errors=next_observation_errors,
-            discount_error=discount_error,
+            prediction_error=safe_prediction_error,
+            observation_mse=jnp.where(
+                diagnostics_finite, observation_mse, jnp.zeros_like(observation_mse)
+            ),
+            reward_error=jnp.where(
+                diagnostics_finite, reward_error, jnp.zeros_like(reward_error)
+            ),
+            next_observation_errors=jnp.where(
+                jnp.isfinite(next_observation_errors),
+                next_observation_errors,
+                jnp.zeros_like(next_observation_errors),
+            ),
+            discount_error=jnp.where(
+                diagnostics_finite, discount_error, jnp.zeros_like(discount_error)
+            ),
             learner_result=learner_result,
         )
 
