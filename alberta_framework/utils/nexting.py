@@ -63,7 +63,9 @@ def forward_view_returns(
     init = jnp.asarray(terminal_value, dtype=cumulants.dtype)
 
     def step(carry: Array, c: Array) -> tuple[Array, Array]:
-        new_carry = c + gamma_s * carry
+        # gamma=0 must not multiply an inf later return (0*inf).
+        bootstrap = jnp.where(gamma_s == 0.0, jnp.zeros_like(carry), gamma_s * carry)
+        new_carry = c + bootstrap
         return new_carry, new_carry
 
     _, returns_reversed = jax.lax.scan(step, init, cumulants[::-1])
