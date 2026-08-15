@@ -21,6 +21,19 @@ class TestForwardViewReturns:
         g = forward_view_returns(c, gamma=0.0)
         chex.assert_trees_all_close(g, c)
 
+    def test_gamma_zero_skips_inf_later_return(self) -> None:
+        """gamma=0 is G_t = c_{t+1}; 0 * inf G_{t+1} is NaN.
+
+        Fail-closed: a zero discount does not multiply the later return.
+        """
+        c = jnp.array([1.0, jnp.inf, 3.0])
+        g = forward_view_returns(c, gamma=0.0)
+        assert bool(jnp.isfinite(g[0]))
+        assert bool(jnp.isfinite(g[2]))
+        chex.assert_trees_all_close(g[0], jnp.float32(1.0))
+        chex.assert_trees_all_close(g[2], jnp.float32(3.0))
+        assert bool(jnp.isinf(g[1]))
+
     def test_gamma_one_undiscounted(self) -> None:
         c = jnp.array([1.0, 2.0, 3.0, 4.0, 5.0])
         g = forward_view_returns(c, gamma=1.0)
