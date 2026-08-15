@@ -118,6 +118,14 @@ class TestPeriodic:
         with pytest.raises(ValueError, match="schedule"):
             PartialObservationWrapper(inner, mode=MaskMode.PERIODIC, schedule=())
 
+    def test_periodic_rejects_masks_with_extra_axis(self) -> None:
+        inner = RandomWalkStream(feature_dim=3, drift_rate=0.0)
+        schedule = (jnp.array([[True], [False], [True]]),)
+        with pytest.raises(ValueError, match="schedule masks"):
+            PartialObservationWrapper(
+                inner, mode=MaskMode.PERIODIC, schedule=schedule
+            )
+
 
 class TestScanCompatibility:
     def test_scan_with_fixed_mask(self) -> None:

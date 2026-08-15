@@ -137,11 +137,12 @@ class PartialObservationWrapper[InnerStateT]:
                 raise ValueError(
                     "MaskMode.PERIODIC requires a non-empty schedule."
                 )
-            sched = jnp.stack([jnp.asarray(m, dtype=jnp.bool_) for m in schedule], axis=0)
-            if sched.shape[1] != feature_dim:
+            masks = [jnp.asarray(m, dtype=jnp.bool_) for m in schedule]
+            if any(mask.shape != (feature_dim,) for mask in masks):
                 raise ValueError(
                     f"schedule masks must each have shape (feature_dim={feature_dim},)"
                 )
+            sched = jnp.stack(masks, axis=0)
             self._schedule: Array | None = sched
         else:
             self._schedule = None
