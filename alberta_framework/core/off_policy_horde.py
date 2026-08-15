@@ -403,13 +403,17 @@ class OffPolicyHordeLearner:
         )
 
         next_predictions = self._learner.predict(state, next_observation)
-        td_targets = cumulants + discounts * next_predictions
+        zero_discount_mask = discounts == 0.0
+        bootstrap_predictions = jnp.where(
+            zero_discount_mask,
+            jnp.zeros_like(next_predictions),
+            next_predictions,
+        )
+        td_targets = cumulants + discounts * bootstrap_predictions
         requested_mask = ~jnp.isnan(cumulants)
         source_state_finite = _floating_tree_is_finite(state)
-        global_inputs_valid = (
-            jnp.all(jnp.isfinite(observation))
-            & jnp.all(jnp.isfinite(next_observation))
-        )
+        global_inputs_valid = jnp.all(jnp.isfinite(observation))
+        next_observation_valid = jnp.all(jnp.isfinite(next_observation))
         head_inputs_valid = (
             requested_mask
             & jnp.isfinite(cumulants)
@@ -417,7 +421,10 @@ class OffPolicyHordeLearner:
             & jnp.isfinite(discounts)
             & (discounts >= 0.0)
             & (discounts <= 1.0)
-            & jnp.isfinite(next_predictions)
+            & (
+                zero_discount_mask
+                | (next_observation_valid & jnp.isfinite(next_predictions))
+            )
             & jnp.isfinite(td_targets)
         )
         active_mask = head_inputs_valid & global_inputs_valid & source_state_finite
@@ -764,13 +771,27 @@ class OffPolicyHordeLearner:
             ),
             jnp.zeros_like(predictions),
         )
+        sanitized_next_predictions = jnp.where(
+            head_updates_applied
+            & zero_discount_mask
+            & ~jnp.isfinite(next_predictions),
+            jnp.zeros_like(next_predictions),
+            next_predictions,
+        )
+        reported_next_predictions = jnp.where(
+            update_applied,
+            jnp.where(
+                requested_mask & ~head_updates_applied,
+                jnp.zeros_like(next_predictions),
+                sanitized_next_predictions,
+            ),
+            jnp.zeros_like(next_predictions),
+        )
 
         return OffPolicyHordeUpdateResult(
             state=committed_state,
             predictions=reported_predictions,
-            next_predictions=jnp.where(
-                update_applied, next_predictions, jnp.zeros_like(next_predictions)
-            ),
+            next_predictions=reported_next_predictions,
             td_targets=_report_demon_values(
                 td_targets, requested_mask, head_updates_applied
             ),

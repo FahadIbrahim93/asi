@@ -168,6 +168,131 @@ def test_infinite_cumulant_with_obgd_does_not_poison_head() -> None:
     assert bool(jnp.all(recovered.head_updates_applied))
 
 
+def test_zero_discount_ignores_nonfinite_next_observation_under_jit() -> None:
+    """A terminal head must not evaluate an irrelevant bootstrap value."""
+    learner = OffPolicyHordeLearner(
+        _spec(gammas=(0.0,)),
+        hidden_sizes=(),
+        optimizer=LMS(step_size=0.1),
+        sparsity=0.0,
+        use_layer_norm=False,
+    )
+    state = learner.init(2, jax.random.key(19))
+    observation = jnp.array([1.0, -0.5], dtype=jnp.float32)
+    nonfinite_next = jnp.array([jnp.inf, 0.0], dtype=jnp.float32)
+    assert not bool(jnp.isfinite(learner.predict(state, nonfinite_next)[0]))
+
+    result = learner.update_with_ratios_and_discounts(
+        state,
+        observation,
+        jnp.array([1.25], dtype=jnp.float32),
+        nonfinite_next,
+        jnp.ones(1, dtype=jnp.float32),
+        jnp.zeros(1, dtype=jnp.float32),
+    )
+
+    assert bool(result.update_applied)
+    chex.assert_trees_all_equal(result.head_updates_applied, jnp.array([True]))
+    chex.assert_trees_all_close(result.td_targets, jnp.array([1.25]))
+    chex.assert_trees_all_close(result.next_predictions, jnp.zeros(1))
+    chex.assert_tree_all_finite(result.state)
+    assert int(result.state.step_count) == int(state.step_count) + 1
+    assert float(
+        jnp.linalg.norm(result.state.head_params.weights[0] - state.head_params.weights[0])
+    ) > 0.0
+
+
+def test_nonzero_discount_rejects_nonfinite_next_then_recovers_under_jit() -> None:
+    learner = OffPolicyHordeLearner(
+        _spec(gammas=(0.9,)),
+        hidden_sizes=(),
+        optimizer=LMS(step_size=0.1),
+        sparsity=0.0,
+        use_layer_norm=False,
+    )
+    state = learner.init(2, jax.random.key(20))
+    observation = jnp.array([1.0, -0.5], dtype=jnp.float32)
+    cumulants = jnp.array([1.0], dtype=jnp.float32)
+    rhos = jnp.ones(1, dtype=jnp.float32)
+    discounts = jnp.array([0.9], dtype=jnp.float32)
+
+    rejected = learner.update_with_ratios_and_discounts(
+        state,
+        observation,
+        cumulants,
+        jnp.array([jnp.inf, 0.0], dtype=jnp.float32),
+        rhos,
+        discounts,
+    )
+    assert not bool(rejected.update_applied)
+    chex.assert_trees_all_equal(rejected.head_updates_applied, jnp.array([False]))
+    chex.assert_trees_all_close(rejected.state, state)
+    chex.assert_trees_all_close(rejected.next_predictions, jnp.zeros(1))
+    chex.assert_trees_all_close(rejected.td_targets, jnp.zeros(1))
+
+    recovered = learner.update_with_ratios_and_discounts(
+        rejected.state,
+        observation,
+        cumulants,
+        jnp.array([0.25, -0.25], dtype=jnp.float32),
+        rhos,
+        discounts,
+    )
+    assert bool(recovered.update_applied)
+    chex.assert_trees_all_equal(recovered.head_updates_applied, jnp.array([True]))
+    chex.assert_tree_all_finite(recovered.state)
+    assert int(recovered.state.step_count) == int(state.step_count) + 1
+
+
+def test_mixed_discounts_isolate_nonfinite_next_to_consuming_head() -> None:
+    learner = OffPolicyHordeLearner(
+        _spec(gammas=(0.0, 0.9)),
+        hidden_sizes=(),
+        optimizer=LMS(step_size=0.1),
+        sparsity=0.0,
+        use_layer_norm=False,
+    )
+    state = learner.init(2, jax.random.key(21))
+    next_observation = jnp.array([jnp.inf, 0.0], dtype=jnp.float32)
+    assert bool(jnp.all(~jnp.isfinite(learner.predict(state, next_observation))))
+
+    result = learner.update_with_ratios_and_discounts(
+        state,
+        jnp.array([1.0, -0.5], dtype=jnp.float32),
+        jnp.array([1.25, 0.5], dtype=jnp.float32),
+        next_observation,
+        jnp.ones(2, dtype=jnp.float32),
+        jnp.array([0.0, 0.9], dtype=jnp.float32),
+    )
+
+    assert bool(result.update_applied)
+    chex.assert_trees_all_equal(
+        result.head_updates_applied,
+        jnp.array([True, False]),
+    )
+    chex.assert_trees_all_close(result.td_targets, jnp.array([1.25, 0.0]))
+    chex.assert_trees_all_close(result.next_predictions, jnp.zeros(2))
+    assert float(
+        jnp.linalg.norm(result.state.head_params.weights[0] - state.head_params.weights[0])
+    ) > 0.0
+    chex.assert_trees_all_close(
+        result.state.head_params.weights[1],
+        state.head_params.weights[1],
+    )
+    chex.assert_trees_all_close(
+        result.state.head_params.biases[1],
+        state.head_params.biases[1],
+    )
+    chex.assert_trees_all_close(
+        result.state.head_traces[1],
+        state.head_traces[1],
+    )
+    chex.assert_trees_all_close(
+        result.state.head_optimizer_states[1],
+        state.head_optimizer_states[1],
+    )
+
+
 def test_terminal_lifetime_counter_rejects_entire_update_under_jit() -> None:
     """An exhausted outer clock cannot commit parameters or report success."""
     learner = OffPolicyHordeLearner(
