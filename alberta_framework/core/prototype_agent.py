@@ -199,7 +199,7 @@ def feature_to_subtask_specs(
 
     Args:
         oak_state: Current OaK state.
-        n_subtasks: Number of subtask specs to return.
+        n_subtasks: Non-negative integer scalar number of subtask specs to return.
         threshold: Pseudo-reward threshold for subtask completion.
         pseudo_reward_scale: Pseudo-reward multiplier for generated specs.
         max_option_steps: Hard cap on option duration.
@@ -208,7 +208,13 @@ def feature_to_subtask_specs(
         Tuple of up to ``n_subtasks`` :class:`SubtaskSpec` instances, ordered
         by descending feature importance.
     """
-    if isinstance(n_subtasks, bool) or not isinstance(n_subtasks, int) or n_subtasks < 0:
+    if isinstance(n_subtasks, bool):
+        raise ValueError("n_subtasks must be a non-negative integer")
+    try:
+        normalized_n_subtasks = operator.index(n_subtasks)
+    except TypeError as exc:
+        raise ValueError("n_subtasks must be a non-negative integer") from exc
+    if normalized_n_subtasks < 0:
         raise ValueError("n_subtasks must be a non-negative integer")
 
     bls = oak_state.stomp_state.base_learner_state
@@ -227,7 +233,7 @@ def feature_to_subtask_specs(
     opt_importance = jnp.max(opt_q_abs.reshape(-1, obs_dim), axis=0)  # (obs_dim,)
 
     combined = feature_importance + opt_importance
-    n = min(n_subtasks, obs_dim)
+    n = min(normalized_n_subtasks, obs_dim)
     ranking = sorted(range(obs_dim), key=lambda i: float(combined[i]), reverse=True)[:n]
 
     return tuple(
@@ -7594,7 +7600,7 @@ class PrototypeAgent:
 
         Args:
             state: Current agent state.
-            n_subtasks: Number of subtask specs to return.
+            n_subtasks: Non-negative integer scalar number of subtask specs to return.
 
         Returns:
             Tuple of :class:`SubtaskSpec` instances ranked by importance.
