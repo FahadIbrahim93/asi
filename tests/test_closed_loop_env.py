@@ -1,5 +1,7 @@
 """Tests for the closed-loop micro-MDPs (actions affect observations)."""
 
+from fractions import Fraction
+
 import chex
 import jax
 import jax.numpy as jnp
@@ -387,3 +389,73 @@ class TestRiverSwim:
             RiverSwimMDP(RiverSwimConfig(n_states=3, initial_state=3))
         with pytest.raises(ValueError, match="policy"):
             RiverSwimMDP(RiverSwimConfig(n_states=3)).policy_average_reward([0, 1])
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            True,
+            False,
+            "0.2",
+            None,
+            10**400,
+            1.0e-50,
+            np.nextafter(np.longdouble(0.0), np.longdouble(1.0)),
+            jnp.asarray(0.2),
+            jnp.asarray([0.2]),
+        ],
+    )
+    @pytest.mark.parametrize("field", ["p_right_up", "p_right_down"])
+    def test_transition_probabilities_require_positive_float32_reals(
+        self,
+        field,
+        value,
+    ):
+        kwargs = {field: value}
+        with pytest.raises(ValueError, match=field):
+            RiverSwimMDP(RiverSwimConfig(**kwargs))
+
+    def test_transition_probabilities_preserve_real_scalars_and_normalize_runtime(self):
+        env = RiverSwimMDP(
+            RiverSwimConfig(
+                p_right_up=Fraction(1, 5),
+                p_right_down=np.float64(0.1),
+            )
+        )
+
+        assert type(env.config.p_right_up) is float
+        assert type(env.config.p_right_down) is float
+        assert env.config.p_right_up == float(np.float32(0.2))
+        assert env.config.p_right_down == float(np.float32(0.1))
+        np.testing.assert_allclose(env.transition_tensor.sum(axis=2), 1.0, atol=1e-7)
+
+    def test_float32_probability_sum_cannot_create_invalid_stay_mass(self):
+        with pytest.raises(ValueError, match="must not exceed 1"):
+            RiverSwimMDP(
+                RiverSwimConfig(
+                    p_right_up=0.6,
+                    p_right_down=0.4,
+                )
+            )
+
+    @pytest.mark.parametrize(
+        ("p_right_up", "p_right_down"),
+        [
+            (
+                np.nextafter(np.longdouble(0.5), np.longdouble(1.0)),
+                np.longdouble(0.5),
+            ),
+            (Fraction((2**100) + 1, 2**101), Fraction(1, 2)),
+        ],
+    )
+    def test_transition_probability_sum_is_checked_before_narrowing(
+        self,
+        p_right_up,
+        p_right_down,
+    ):
+        with pytest.raises(ValueError, match="must not exceed 1"):
+            RiverSwimMDP(
+                RiverSwimConfig(
+                    p_right_up=p_right_up,
+                    p_right_down=p_right_down,
+                )
+            )

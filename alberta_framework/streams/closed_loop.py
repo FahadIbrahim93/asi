@@ -37,6 +37,8 @@ The state and config records are immutable chex dataclasses.
 from __future__ import annotations
 
 import itertools
+from numbers import Integral, Real
+from typing import Any, cast
 
 import chex
 import jax
@@ -58,6 +60,47 @@ RIGHT_ACTION = 1
 _TWO_STATE_N = 2
 _TWO_STATE_ACTIONS = 2
 _INT32_MAX = 2**31 - 1
+_FLOAT32_TINY = float(np.finfo(np.float32).tiny)
+_FLOAT32_TINY_RATIO = _FLOAT32_TINY.as_integer_ratio()
+
+
+def _exact_real_ratio(name: str, value: object) -> tuple[int, int]:
+    """Return the exact ratio of a supported concrete real scalar."""
+    message = f"{name} must be finite, positive, and a normal float32 probability"
+    if not isinstance(value, Real) or isinstance(value, (bool, np.bool_)):
+        raise ValueError(message)
+    try:
+        if isinstance(value, Integral):
+            ratio = (int(value), 1)
+        else:
+            ratio = cast(Any, value).as_integer_ratio()
+        numerator, denominator = ratio
+    except (AttributeError, TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(message) from exc
+    if type(numerator) is not int or type(denominator) is not int or denominator <= 0:
+        raise ValueError(message)
+    return numerator, denominator
+
+
+def _normalized_positive_float32_probability(name: str, value: object) -> float:
+    """Return a concrete positive probability with stable float32 semantics."""
+    message = f"{name} must be finite, positive, and a normal float32 probability"
+    numerator, denominator = _exact_real_ratio(name, value)
+    tiny_numerator, tiny_denominator = _FLOAT32_TINY_RATIO
+    if numerator <= 0 or numerator > denominator:
+        raise ValueError(message)
+    if numerator * tiny_denominator < tiny_numerator * denominator:
+        raise ValueError(message)
+    try:
+        normalized = float(cast(Any, value))
+        narrowed = float(np.float32(normalized))
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(message) from exc
+    if not np.isfinite(normalized) or not np.isfinite(narrowed):
+        raise ValueError(message)
+    if not 0.0 < narrowed <= 1.0 or narrowed < _FLOAT32_TINY:
+        raise ValueError(message)
+    return narrowed
 
 
 def _stationary_average_reward(
@@ -345,17 +388,31 @@ class RiverSwimMDP:
         config = RiverSwimConfig() if config is None else config
         if config.n_states < 2:
             raise ValueError(f"n_states must be at least 2, got {config.n_states}")
-        if not np.isfinite(config.p_right_up):
-            raise ValueError(f"p_right_up must be finite, got {config.p_right_up}")
-        if not np.isfinite(config.p_right_down):
-            raise ValueError(f"p_right_down must be finite, got {config.p_right_down}")
-        if config.p_right_up <= 0.0:
-            raise ValueError(f"p_right_up must be positive, got {config.p_right_up}")
-        if config.p_right_down <= 0.0:
+        up_numerator, up_denominator = _exact_real_ratio(
+            "p_right_up",
+            config.p_right_up,
+        )
+        down_numerator, down_denominator = _exact_real_ratio(
+            "p_right_down",
+            config.p_right_down,
+        )
+        if (
+            up_numerator * down_denominator + down_numerator * up_denominator
+            > up_denominator * down_denominator
+        ):
             raise ValueError(
-                f"p_right_down must be positive (unichain requirement), got {config.p_right_down}"
+                "p_right_up + p_right_down must not exceed 1, got "
+                f"{config.p_right_up} + {config.p_right_down}"
             )
-        if config.p_right_up + config.p_right_down > 1.0:
+        p_right_up = _normalized_positive_float32_probability(
+            "p_right_up",
+            config.p_right_up,
+        )
+        p_right_down = _normalized_positive_float32_probability(
+            "p_right_down",
+            config.p_right_down,
+        )
+        if p_right_up + p_right_down > 1.0:
             raise ValueError(
                 "p_right_up + p_right_down must not exceed 1, got "
                 f"{config.p_right_up} + {config.p_right_down}"
@@ -364,6 +421,10 @@ class RiverSwimMDP:
             raise ValueError(
                 f"initial_state must lie in [0, {config.n_states}), got {config.initial_state}"
             )
+        config = config.replace(  # type: ignore[attr-defined]
+            p_right_up=p_right_up,
+            p_right_down=p_right_down,
+        )
         self._config = config
         self._n_states = int(config.n_states)
         self._transitions_np = self._build_transitions(config)
@@ -389,7 +450,9 @@ class RiverSwimMDP:
             down = max(state - 1, 0)
             transitions[RIGHT_ACTION, state, up] += config.p_right_up
             transitions[RIGHT_ACTION, state, down] += config.p_right_down
-            transitions[RIGHT_ACTION, state, state] += 1.0 - config.p_right_up - config.p_right_down
+            transitions[RIGHT_ACTION, state, state] += 1.0 - (
+                config.p_right_up + config.p_right_down
+            )
         return transitions
 
     @staticmethod

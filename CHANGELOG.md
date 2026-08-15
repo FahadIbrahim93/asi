@@ -34,6 +34,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Made RiverSwim reject malformed, non-finite, subnormal, or jointly invalid
+  transition probabilities before float32 narrowing can create a negative or
+  non-stochastic transition row.
 - Required GVF discount and eligibility-decay parameters to be concrete finite
   float32-domain probabilities, preventing invalid or silently narrowed values from
   corrupting Horde TD targets and traces.
