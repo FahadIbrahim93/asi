@@ -978,7 +978,13 @@ class NonlinearSharedGTDHordeLearner:
         next_hidden = jnp.tanh(state.trunk_w @ next_observation + state.trunk_b)
         predictions = state.head_w @ hidden + state.head_b
         next_predictions = state.head_w @ next_hidden + state.head_b
-        td_targets = cumulants + discounts * next_predictions
+        zero_discount_mask = discounts == 0.0
+        bootstrap_predictions = jnp.where(
+            zero_discount_mask,
+            jnp.zeros_like(next_predictions),
+            next_predictions,
+        )
+        td_targets = cumulants + discounts * bootstrap_predictions
         td_errors = td_targets - predictions
         active_mask = ~jnp.isnan(td_targets)
         safe_td_errors = jnp.where(active_mask, td_errors, 0.0)
@@ -1026,11 +1032,32 @@ class NonlinearSharedGTDHordeLearner:
             # GQ(0) with e = rho grad, Maei & Sutton 2010).  Inactive demons
             # (NaN cumulant) contribute nothing this step.
             masked_rho = jnp.where(active_mask[i], clipped_rhos[i], 0.0)
-            rho_dot = masked_rho * discounts[i] * secondary_dot
-            correction_trunk_w = rho_dot * next_grad_trunk_w
-            correction_trunk_b = rho_dot * next_grad_trunk_b
-            correction_head_w = rho_dot * next_grad_head_w
-            correction_head_b = rho_dot * next_grad_head_b
+            terminated_i = discounts[i] == 0.0
+            rho_dot = jnp.where(
+                terminated_i,
+                jnp.zeros_like(secondary_dot),
+                masked_rho * discounts[i] * secondary_dot,
+            )
+            correction_trunk_w = jnp.where(
+                terminated_i,
+                jnp.zeros_like(next_grad_trunk_w),
+                rho_dot * next_grad_trunk_w,
+            )
+            correction_trunk_b = jnp.where(
+                terminated_i,
+                jnp.zeros_like(next_grad_trunk_b),
+                rho_dot * next_grad_trunk_b,
+            )
+            correction_head_w = jnp.where(
+                terminated_i,
+                jnp.zeros_like(next_grad_head_w),
+                rho_dot * next_grad_head_w,
+            )
+            correction_head_b = jnp.where(
+                terminated_i,
+                jnp.zeros_like(next_grad_head_b),
+                rho_dot * next_grad_head_b,
+            )
             rho_delta = masked_rho * safe_td_errors[i]
 
             trunk_w_step = trunk_w_step + primary_alpha * (
@@ -1094,7 +1121,9 @@ class NonlinearSharedGTDHordeLearner:
         return NonlinearSharedGTDHordeUpdateResult(  # type: ignore[call-arg]
             state=new_state,
             predictions=predictions,
-            next_predictions=next_predictions,
+            next_predictions=jnp.where(
+                zero_discount_mask, jnp.zeros_like(next_predictions), next_predictions
+            ),
             td_targets=td_targets,
             td_errors=td_errors,
             clipped_rhos=clipped_rhos,

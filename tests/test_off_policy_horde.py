@@ -556,3 +556,30 @@ def test_nonlinear_shared_gtd_horde_two_state_positive_control() -> None:
     assert float(jnp.mean(jnp.abs(predictions - target))) < 0.8
     assert float(jnp.mean(updates.secondary_norms[-100:])) > 0.0
     assert float(jnp.mean(updates.correction_norms[-100:])) > 0.0
+
+
+def test_nonlinear_shared_gtd_zero_discount_does_not_multiply_inf_next() -> None:
+    """gamma=0 * inf next-grad is 0*inf = NaN in the TDC correction."""
+    learner = NonlinearSharedGTDHordeLearner(
+        _spec(gammas=(0.0,)),
+        hidden_size=2,
+        primary_step_size=0.01,
+        secondary_step_size=0.01,
+        ratio_clip=10.0,
+    )
+    state = learner.init(2, jax.random.key(0))
+    next_obs = jnp.array([jnp.inf, 0.0], dtype=jnp.float32)
+    raw = jnp.asarray(0.0, dtype=jnp.float32) * next_obs[0]
+    assert not bool(jnp.isfinite(raw))
+
+    result = learner.update_with_ratios_and_discounts(
+        state,
+        jnp.array([1.0, 0.0], dtype=jnp.float32),
+        jnp.array([3.0], dtype=jnp.float32),
+        next_obs,
+        jnp.array([1.0], dtype=jnp.float32),
+        jnp.array([0.0], dtype=jnp.float32),
+    )
+    chex.assert_tree_all_finite(result.state)
+    chex.assert_trees_all_close(result.td_targets, jnp.array([3.0], dtype=jnp.float32))
+    chex.assert_tree_all_finite(result.correction_norms)
