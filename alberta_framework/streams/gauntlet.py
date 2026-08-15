@@ -1146,13 +1146,14 @@ def run_gauntlet_batched(
 def ema_smooth(values: Array, halflife: float = 50.0) -> Array:
     """Exponential-moving-average smoothing along the last axis."""
     decay = 0.5 ** (1.0 / halflife)
+    time_major = jnp.moveaxis(values, -1, 0)
 
     def step(carry: Array, v: Array) -> tuple[Array, Array]:
         new = decay * carry + (1.0 - decay) * v
         return new, new
 
-    _, smoothed = jax.lax.scan(step, values[..., 0], values.T)
-    return smoothed.T
+    _, smoothed = jax.lax.scan(step, values[..., 0], time_major)
+    return jnp.moveaxis(smoothed, 0, -1)
 
 
 def steps_to_criterion(sq_segment: Array, threshold: float) -> Array:
