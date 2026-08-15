@@ -40,6 +40,11 @@ from alberta_framework.core.update_safety import (
     zero_if_collapsed_infinity,
 )
 
+
+def _skip_zero_scale(scale: Array, value: Array) -> Array:
+    """Return 0 when ``scale`` is 0 so IEEE ``0 * inf`` does not become NaN."""
+    return jnp.where(scale == 0.0, jnp.zeros_like(value), scale * value)
+
 # =============================================================================
 # Bounder ABC
 # =============================================================================
@@ -1411,8 +1416,12 @@ class AutostepGTDLambda(Optimizer[AutostepGTDLambdaState]):
         observation: Array,
     ) -> OptimizerUpdate:
         """Compute one supervised-limit Autostep-for-GTD(lambda) update."""
-        eligibility = state.trace_decay * state.eligibility_traces + observation
-        bias_eligibility = state.trace_decay * state.bias_eligibility_trace + 1.0
+        eligibility = (
+            _skip_zero_scale(state.trace_decay, state.eligibility_traces) + observation
+        )
+        bias_eligibility = (
+            _skip_zero_scale(state.trace_decay, state.bias_eligibility_trace) + 1.0
+        )
         base_state = AutostepState(
             step_sizes=state.step_sizes,
             traces=state.traces,
@@ -1438,9 +1447,15 @@ class AutostepGTDLambda(Optimizer[AutostepGTDLambdaState]):
             bias_normalizer=new_base_state.bias_normalizer,
             bias_eligibility_trace=bias_eligibility,
         )
+        previous_checked = state
+        if self._trace_decay == 0.0:
+            previous_checked = state.replace(
+                eligibility_traces=jnp.zeros_like(state.eligibility_traces),
+                bias_eligibility_trace=jnp.zeros_like(state.bias_eligibility_trace),
+            )
         update_applied = (
             base_update.update_applied
-            & floating_tree_is_finite(state)
+            & floating_tree_is_finite(previous_checked)
             & jnp.all(jnp.isfinite(observation))
             & floating_tree_is_finite(candidate_state)
         )
@@ -1559,9 +1574,15 @@ class ObGD(Optimizer[ObGDState]):
         alpha = state.step_size
         kappa = state.kappa
 
-        # Update eligibility traces: z = gamma * lamda * z + observation
-        new_traces = state.gamma * state.lamda * state.traces + observation
-        new_bias_trace = state.gamma * state.lamda * state.bias_trace + 1.0
+        # Update eligibility traces: z = gamma * lamda * z + observation.
+        # Skip 0 * inf before adding the current observation.
+        decay_scale = jnp.where(
+            (state.gamma == 0.0) | (state.lamda == 0.0),
+            jnp.zeros_like(state.gamma),
+            state.gamma * state.lamda,
+        )
+        new_traces = _skip_zero_scale(decay_scale, state.traces) + observation
+        new_bias_trace = _skip_zero_scale(decay_scale, state.bias_trace) + 1.0
 
         # Compute z_sum (L1 norm of all traces)
         z_sum = jnp.sum(jnp.abs(new_traces)) + jnp.abs(new_bias_trace)
@@ -1604,8 +1625,14 @@ class ObGD(Optimizer[ObGDState]):
             "bounding_factor": dot_product,
         }
 
+        previous_checked = state
+        if self._gamma == 0.0 or self._lamda == 0.0:
+            previous_checked = state.replace(
+                traces=jnp.zeros_like(state.traces),
+                bias_trace=jnp.zeros_like(state.bias_trace),
+            )
         update_applied = (
-            floating_tree_is_finite(state)
+            floating_tree_is_finite(previous_checked)
             & jnp.isfinite(error_scalar)
             & jnp.all(jnp.isfinite(observation))
             & jnp.all(jnp.isfinite(weight_delta))
@@ -1786,7 +1813,7 @@ class TDIDBD(TDOptimizer[TDIDBDState]):
             gradient_correlation = delta * observation * state.h_traces
             meta_delta = theta * gradient_correlation
         else:
-            feature_diff = gamma_scalar * next_observation - observation
+            feature_diff = _skip_zero_scale(gamma_scalar, next_observation) - observation
             gradient_correlation = delta * feature_diff * state.h_traces
             meta_delta = -theta * gradient_correlation
 
@@ -1797,14 +1824,21 @@ class TDIDBD(TDOptimizer[TDIDBDState]):
         )
         new_alphas = jnp.exp(new_log_step_sizes)
 
-        new_eligibility_traces = gamma_scalar * lam * state.eligibility_traces + observation
+        decay_scale = jnp.where(
+            (gamma_scalar == 0.0) | (lam == 0.0),
+            jnp.zeros_like(gamma_scalar),
+            gamma_scalar * lam,
+        )
+        new_eligibility_traces = (
+            _skip_zero_scale(decay_scale, state.eligibility_traces) + observation
+        )
         weight_delta = new_alphas * delta * new_eligibility_traces
 
         if self._use_semi_gradient:
             h_decay = jnp.maximum(0.0, 1.0 - new_alphas * observation * new_eligibility_traces)
             new_h_traces = state.h_traces * h_decay + new_alphas * delta * new_eligibility_traces
         else:
-            feature_diff = gamma_scalar * next_observation - observation
+            feature_diff = _skip_zero_scale(gamma_scalar, next_observation) - observation
             h_decay = jnp.maximum(0.0, 1.0 + new_alphas * new_eligibility_traces * feature_diff)
             new_h_traces = state.h_traces * h_decay + new_alphas * delta * new_eligibility_traces
 
@@ -1824,7 +1858,9 @@ class TDIDBD(TDOptimizer[TDIDBDState]):
         )
         new_bias_alpha = jnp.exp(new_bias_log_step_size)
 
-        new_bias_eligibility_trace = gamma_scalar * lam * state.bias_eligibility_trace + 1.0
+        new_bias_eligibility_trace = (
+            _skip_zero_scale(decay_scale, state.bias_eligibility_trace) + 1.0
+        )
         bias_delta = new_bias_alpha * delta * new_bias_eligibility_trace
 
         if self._use_semi_gradient:
@@ -1863,11 +1899,23 @@ class TDIDBD(TDOptimizer[TDIDBDState]):
         inputs_valid = (
             jnp.isfinite(delta)
             & jnp.all(jnp.isfinite(observation))
-            & jnp.all(jnp.isfinite(next_observation))
+            & (jnp.all(jnp.isfinite(next_observation)) | (gamma_scalar == 0.0))
             & jnp.isfinite(gamma_scalar)
         )
+        previous_checked = state.replace(
+            eligibility_traces=jnp.where(
+                (gamma_scalar == 0.0) | (lam == 0.0),
+                jnp.zeros_like(state.eligibility_traces),
+                state.eligibility_traces,
+            ),
+            bias_eligibility_trace=jnp.where(
+                (gamma_scalar == 0.0) | (lam == 0.0),
+                jnp.zeros_like(state.bias_eligibility_trace),
+                state.bias_eligibility_trace,
+            ),
+        )
         update_applied = (
-            floating_tree_is_finite(state)
+            floating_tree_is_finite(previous_checked)
             & inputs_valid
             & jnp.all(jnp.isfinite(meta_delta))
             & jnp.isfinite(bias_meta_delta)
@@ -1976,7 +2024,7 @@ class AutoTDIDBD(TDOptimizer[AutoTDIDBDState]):
         tau = state.normalizer_decay
         gamma_scalar = jnp.squeeze(gamma)
 
-        feature_diff = gamma_scalar * next_observation - observation
+        feature_diff = _skip_zero_scale(gamma_scalar, next_observation) - observation
         alphas = jnp.exp(state.log_step_sizes)
 
         # Update normalizers
@@ -2005,7 +2053,14 @@ class AutoTDIDBD(TDOptimizer[AutoTDIDBDState]):
         new_log_step_sizes = jnp.clip(new_log_step_sizes, -10.0, 2.0)
         new_alphas = jnp.exp(new_log_step_sizes)
 
-        new_eligibility_traces = gamma_scalar * lam * state.eligibility_traces + observation
+        decay_scale = jnp.where(
+            (gamma_scalar == 0.0) | (lam == 0.0),
+            jnp.zeros_like(gamma_scalar),
+            gamma_scalar * lam,
+        )
+        new_eligibility_traces = (
+            _skip_zero_scale(decay_scale, state.eligibility_traces) + observation
+        )
         weight_delta = new_alphas * delta * new_eligibility_traces
 
         # Update h traces
@@ -2043,7 +2098,9 @@ class AutoTDIDBD(TDOptimizer[AutoTDIDBDState]):
         new_bias_log_step_size = jnp.clip(new_bias_log_step_size, -10.0, 2.0)
         new_bias_alpha = jnp.exp(new_bias_log_step_size)
 
-        new_bias_eligibility_trace = gamma_scalar * lam * state.bias_eligibility_trace + 1.0
+        new_bias_eligibility_trace = (
+            _skip_zero_scale(decay_scale, state.bias_eligibility_trace) + 1.0
+        )
         bias_delta = new_bias_alpha * delta * new_bias_eligibility_trace
 
         bias_h_decay = jnp.maximum(
@@ -2077,11 +2134,23 @@ class AutoTDIDBD(TDOptimizer[AutoTDIDBDState]):
         inputs_valid = (
             jnp.isfinite(delta)
             & jnp.all(jnp.isfinite(observation))
-            & jnp.all(jnp.isfinite(next_observation))
+            & (jnp.all(jnp.isfinite(next_observation)) | (gamma_scalar == 0.0))
             & jnp.isfinite(gamma_scalar)
         )
+        previous_checked = state.replace(
+            eligibility_traces=jnp.where(
+                (gamma_scalar == 0.0) | (lam == 0.0),
+                jnp.zeros_like(state.eligibility_traces),
+                state.eligibility_traces,
+            ),
+            bias_eligibility_trace=jnp.where(
+                (gamma_scalar == 0.0) | (lam == 0.0),
+                jnp.zeros_like(state.bias_eligibility_trace),
+                state.bias_eligibility_trace,
+            ),
+        )
         update_applied = (
-            floating_tree_is_finite(state)
+            floating_tree_is_finite(previous_checked)
             & inputs_valid
             & jnp.all(jnp.isfinite(weight_delta))
             & jnp.isfinite(bias_delta)
