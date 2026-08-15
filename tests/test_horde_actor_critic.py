@@ -396,6 +396,34 @@ def test_qhorde_infinite_reward_with_obgd_does_not_poison_actor() -> None:
     assert bool(recovered.update_applied)
 
 
+def test_qhorde_terminal_does_not_multiply_inf_next_value() -> None:
+    """gamma=0 * inf Q(s', a') is 0*inf = NaN and would freeze a terminal update."""
+    agent = _make_qhorde_agent(n_actions=2)
+    huge = jnp.float32(1e38)
+    state = agent.init(feature_dim=2, key=jr.key(0)).replace(  # type: ignore[attr-defined]
+        last_observation=jnp.array([0.0, 1.0], dtype=jnp.float32),
+        last_action=jnp.array(0, dtype=jnp.int32),
+    )
+    poisoned_w = jnp.asarray([[huge, 0.0]], dtype=jnp.float32)
+    head_params = state.critic_state.head_params.replace(weights=(poisoned_w, poisoned_w))
+    state = state.replace(  # type: ignore[attr-defined]
+        critic_state=state.critic_state.replace(head_params=head_params)
+    )
+    next_obs = jnp.array([huge, 0.0], dtype=jnp.float32)
+    raw = jnp.asarray(0.0, dtype=jnp.float32) * (huge * huge)
+    assert not bool(jnp.isfinite(raw))
+
+    result = agent.update(
+        state,
+        reward=jnp.array(3.0, dtype=jnp.float32),
+        observation=next_obs,
+        terminated=jnp.array(1.0, dtype=jnp.float32),
+    )
+    assert bool(result.update_applied)
+    chex.assert_trees_all_close(result.td_error, jnp.array(3.0, dtype=jnp.float32))
+    assert bool(jnp.all(jnp.isfinite(result.state.actor_weights)))
+
+
 def test_qhorde_actor_critic_auxiliary_prediction_and_terminal_trace_reset() -> None:
     agent = _make_qhorde_agent(n_actions=2, n_aux=1)
     state = agent.init(feature_dim=2, key=jr.key(11)).replace(  # type: ignore[attr-defined]
