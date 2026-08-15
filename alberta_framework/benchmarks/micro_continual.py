@@ -73,7 +73,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, cast
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -83,9 +83,11 @@ from jax import Array
 
 from alberta_framework.benchmarks.ipmnist_screening import (
     ScreeningStepFn,
+    _finite_wall_clock_total,
     _make_naive_bayes_learner,
     _make_sgd_ema_norm_learner,
     _make_upgd_shiftnorm_learner,
+    _validated_wall_clock_seconds,
     _wrap_grad_learner,
 )
 from alberta_framework.benchmarks.upgd_ipmnist import (
@@ -883,13 +885,9 @@ def load_micro_shard(path: Path | str) -> dict[str, Any]:
             raise ValueError(
                 f"{path}: {fieldname} must be finite with shape ({config.n_regimes},)"
             )
-    wall_clock_seconds = cast(int | float, payload.get("wall_clock_seconds"))
-    if (
-        type(wall_clock_seconds) not in (int, float)
-        or not math.isfinite(wall_clock_seconds)
-        or wall_clock_seconds < 0
-    ):
-        raise ValueError(f"{path}: wall_clock_seconds must be a finite, non-negative number")
+    payload["wall_clock_seconds"] = _validated_wall_clock_seconds(
+        payload.get("wall_clock_seconds"), path
+    )
     if type(payload.get("seed")) is not int or payload["seed"] < 0:
         raise ValueError(f"{path}: seed must be a non-negative integer")
     for fieldname in ("hidden1", "hidden2"):
@@ -982,6 +980,11 @@ def merge_micro_shards(
         seeds = sorted(per_seed)
         all_seeds.update(seeds)
         _validate_micro_arm_contract(arm_name, per_seed)
+        wall_clock_values = [per_seed[s]["wall_clock_seconds"] for s in seeds]
+        wall_clock_total = _finite_wall_clock_total(
+            wall_clock_values,
+            context=f"arm {arm_name!r}",
+        )
         curves = np.stack(
             [
                 np.asarray(per_seed[s]["per_regime_accuracy"], dtype=np.float64)
@@ -1012,13 +1015,9 @@ def merge_micro_shards(
                 "first_window_accuracy_mean": float(curves[:, :quarter].mean()),
                 "late_window_accuracy_mean": float(curves[:, -quarter:].mean()),
                 "late_window_slope_mean": float(slopes.mean()),
-                "wall_clock_seconds_total": round(
-                    float(sum(per_seed[s]["wall_clock_seconds"] for s in seeds)), 3
-                ),
+                "wall_clock_seconds_total": round(wall_clock_total, 3),
                 "wall_clock_seconds_mean": round(
-                    float(
-                        np.mean([per_seed[s]["wall_clock_seconds"] for s in seeds])
-                    ),
+                    float(np.mean(wall_clock_values)),
                     3,
                 ),
             }

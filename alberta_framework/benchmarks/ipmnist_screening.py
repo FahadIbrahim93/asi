@@ -206,6 +206,32 @@ _AUTOSTEP_ALPHA_MIN = 1e-8
 _AUTOSTEP_ALPHA_MAX = 1.0
 
 
+def _validated_wall_clock_seconds(value: object, path: Path | str) -> float:
+    """Return one shard wall clock as a finite, non-negative Python float."""
+    message = f"{path}: wall_clock_seconds must be a finite, non-negative number"
+    if type(value) not in (int, float):
+        raise ValueError(message)
+    numeric_value = cast(int | float, value)
+    try:
+        wall_clock_seconds = float(numeric_value)
+    except (OverflowError, ValueError) as exc:
+        raise ValueError(message) from exc
+    if not math.isfinite(wall_clock_seconds) or wall_clock_seconds < 0.0:
+        raise ValueError(message)
+    return wall_clock_seconds
+
+
+def _finite_wall_clock_total(values: Sequence[float], *, context: str) -> float:
+    """Preserve the existing sum order while refusing float overflow."""
+    try:
+        total = float(sum(values))
+    except OverflowError as exc:
+        raise ValueError(f"{context}: wall_clock_seconds_total must be finite") from exc
+    if not math.isfinite(total):
+        raise ValueError(f"{context}: wall_clock_seconds_total must be finite")
+    return total
+
+
 def _clip_finite_log_alpha(log_alpha: Array, meta_delta: Array) -> Array:
     """Clip an IDBD log-step-size update, skipping non-finite channels."""
     return jnp.where(
@@ -7066,13 +7092,9 @@ def load_shard(path: Path) -> dict[str, Any]:
         values = np.asarray(payload[fieldname], dtype=np.float64)
         if values.shape != (config.n_tasks,) or not np.all(np.isfinite(values)):
             raise ValueError(f"{path}: {fieldname} must be finite with shape ({config.n_tasks},)")
-    wall_clock_seconds = cast(int | float, payload.get("wall_clock_seconds"))
-    if (
-        type(wall_clock_seconds) not in (int, float)
-        or not math.isfinite(wall_clock_seconds)
-        or wall_clock_seconds < 0
-    ):
-        raise ValueError(f"{path}: wall_clock_seconds must be a finite, non-negative number")
+    payload["wall_clock_seconds"] = _validated_wall_clock_seconds(
+        payload.get("wall_clock_seconds"), path
+    )
     if type(payload.get("seed")) is not int or payload["seed"] < 0:
         raise ValueError(f"{path}: seed must be a non-negative integer")
     if payload.get("config_name") not in SCREENING_REGISTRY:
@@ -7195,6 +7217,10 @@ def merge_shards(
     for name, per_seed in sorted(by_config.items()):
         seeds = sorted(per_seed)
         _validate_screening_arm_contract(name, per_seed)
+        wall_clock_total = _finite_wall_clock_total(
+            [per_seed[s]["wall_clock_seconds"] for s in seeds],
+            context=f"config {name!r}",
+        )
         acc = np.stack(
             [np.asarray(per_seed[s]["per_task_accuracy"], dtype=np.float64) for s in seeds]
         )
@@ -7223,9 +7249,7 @@ def merge_shards(
                     ]
                 )
             ),
-            "wall_clock_seconds_total": round(
-                float(sum(per_seed[s]["wall_clock_seconds"] for s in seeds)), 2
-            ),
+            "wall_clock_seconds_total": round(wall_clock_total, 2),
         }
         common = [s for s in seeds if s in control]
         if name != control_name and not common:

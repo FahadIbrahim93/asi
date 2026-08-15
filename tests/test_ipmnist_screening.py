@@ -947,20 +947,34 @@ class TestShardsAndMerge:
         path = self._write_inband_shard(tmp_path, "upgd_w_control", 0, 0.5)
         payload = json.loads(path.read_text(encoding="utf-8"))
 
-        for wall_clock in (None, True, False, "1.0", [], {}, math.inf, -math.inf, math.nan, -1):
+        for wall_clock in (
+            None,
+            True,
+            False,
+            "1.0",
+            [],
+            {},
+            math.inf,
+            -math.inf,
+            math.nan,
+            -1,
+            10**309,
+        ):
             payload["wall_clock_seconds"] = wall_clock
             path.write_text(json.dumps(payload), encoding="utf-8")
             with pytest.raises(ValueError, match="wall_clock_seconds"):
                 load_shard(path)
 
-    @pytest.mark.parametrize("wall_clock", [0, 0.0, 1, 1.25])
+    @pytest.mark.parametrize("wall_clock", [0, 0.0, 1, 1.25, 1e308])
     def test_load_shard_preserves_valid_wall_clock(self, tmp_path, wall_clock):
         path = self._write_inband_shard(tmp_path, "upgd_w_control", 0, 0.5)
         payload = json.loads(path.read_text(encoding="utf-8"))
         payload["wall_clock_seconds"] = wall_clock
         path.write_text(json.dumps(payload), encoding="utf-8")
 
-        assert load_shard(path)["wall_clock_seconds"] == wall_clock
+        loaded = load_shard(path)["wall_clock_seconds"]
+        assert type(loaded) is float
+        assert loaded == float(wall_clock)
 
     def test_merge_preserves_valid_wall_clock_summary(self, tmp_path):
         paths = [
@@ -975,6 +989,19 @@ class TestShardsAndMerge:
         summary = merge_shards(paths, control_name="upgd_w_control", slope_window=2)
 
         assert summary["results"][0]["wall_clock_seconds_total"] == 1.25
+
+    def test_merge_rejects_wall_clock_total_overflow(self, tmp_path):
+        paths = [
+            self._write_inband_shard(tmp_path, "upgd_w_control", seed, 0.5)
+            for seed in (0, 1)
+        ]
+        for path in paths:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload["wall_clock_seconds"] = 1e308
+            path.write_text(json.dumps(payload), encoding="utf-8")
+
+        with pytest.raises(ValueError, match="wall_clock_seconds_total must be finite"):
+            merge_shards(paths, control_name="upgd_w_control", slope_window=2)
 
     def test_confirmation_candidate_requires_two_paired_seeds(self, tmp_path):
         """One lucky shared seed cannot authorize a confirmation wave."""

@@ -643,20 +643,34 @@ class TestShards:
         payload = micro_shard_payload(self._result())
         path = tmp_path / "bad-wall-clock.json"
 
-        for wall_clock in (None, True, False, "1.0", [], {}, math.inf, -math.inf, math.nan, -1):
+        for wall_clock in (
+            None,
+            True,
+            False,
+            "1.0",
+            [],
+            {},
+            math.inf,
+            -math.inf,
+            math.nan,
+            -1,
+            10**309,
+        ):
             payload["wall_clock_seconds"] = wall_clock
             path.write_text(json.dumps(payload), encoding="utf-8")
             with pytest.raises(ValueError, match="wall_clock_seconds"):
                 load_micro_shard(path)
 
-    @pytest.mark.parametrize("wall_clock", [0, 0.0, 1, 1.25])
+    @pytest.mark.parametrize("wall_clock", [0, 0.0, 1, 1.25, 1e308])
     def test_load_preserves_valid_wall_clock(self, tmp_path: Path, wall_clock: int | float):
         payload = micro_shard_payload(self._result())
         payload["wall_clock_seconds"] = wall_clock
         path = tmp_path / "valid-wall-clock.json"
         path.write_text(json.dumps(payload), encoding="utf-8")
 
-        assert load_micro_shard(path)["wall_clock_seconds"] == wall_clock
+        loaded = load_micro_shard(path)["wall_clock_seconds"]
+        assert type(loaded) is float
+        assert loaded == float(wall_clock)
 
     def test_merge_preserves_valid_wall_clock_summary(self, tmp_path: Path):
         payload = micro_shard_payload(self._result())
@@ -673,6 +687,20 @@ class TestShards:
 
         assert summary["results"][0]["wall_clock_seconds_total"] == 1.25
         assert summary["results"][0]["wall_clock_seconds_mean"] == 0.625
+
+    def test_merge_rejects_wall_clock_total_overflow(self, tmp_path: Path):
+        payload = micro_shard_payload(self._result())
+        paths = []
+        for seed in (0, 1):
+            shard = json.loads(json.dumps(payload))
+            shard["seed"] = seed
+            shard["wall_clock_seconds"] = 1e308
+            path = tmp_path / f"overflow-wall-clock-{seed}.json"
+            path.write_text(json.dumps(shard), encoding="utf-8")
+            paths.append(path)
+
+        with pytest.raises(ValueError, match="wall_clock_seconds_total must be finite"):
+            merge_micro_shards(paths, bayes_samples=128)
 
     def test_shard_path_convention(self, tmp_path: Path):
         path = micro_shard_path(tmp_path, "input_permutation", "gated_norm", 2)
