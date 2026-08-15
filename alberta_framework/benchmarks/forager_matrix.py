@@ -761,6 +761,15 @@ def _reject_nonfinite_json(token: str) -> Any:
     raise ForagerMatrixManifestError(f"non-finite JSON number {token!r} is not allowed")
 
 
+def _parse_finite_json_float(token: str) -> float:
+    parsed = float(token)
+    if not math.isfinite(parsed):
+        raise ForagerMatrixManifestError(
+            f"non-finite JSON number {token!r} is not allowed"
+        )
+    return parsed
+
+
 def _validate_json_complexity(value: Any, *, description: str) -> None:
     """Bound decoded JSON traversal before recursive canonicalization."""
     pending: list[tuple[Any, int]] = [(value, 0)]
@@ -788,6 +797,7 @@ def _decode_strict_json(data: str, *, description: str) -> Any:
             data,
             object_pairs_hook=_reject_duplicate_object_keys,
             parse_constant=_reject_nonfinite_json,
+            parse_float=_parse_finite_json_float,
         )
     except ForagerMatrixManifestError:
         raise

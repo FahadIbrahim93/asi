@@ -256,10 +256,17 @@ def _decode_strict_json_object(raw: bytes) -> dict[str, object]:
     def reject_constant(value: str) -> object:
         raise ValueError(f"non-finite JSON constant is forbidden: {value}")
 
+    def parse_float(value: str) -> float:
+        parsed = float(value)
+        if not math.isfinite(parsed):
+            raise ValueError(f"non-finite JSON number is forbidden: {value}")
+        return parsed
+
     parsed = json.loads(
         raw.decode("utf-8"),
         object_pairs_hook=pairs_hook,
         parse_constant=reject_constant,
+        parse_float=parse_float,
     )
     if not isinstance(parsed, dict):
         raise ValueError("payload must contain one JSON object")

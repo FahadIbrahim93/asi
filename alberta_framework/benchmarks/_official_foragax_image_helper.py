@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import posixpath
 import re
@@ -80,6 +81,12 @@ def _strict_json(path: Path) -> dict[str, Any]:
             result[key] = value
         return result
 
+    def parse_float(value: str) -> float:
+        parsed = float(value)
+        if not math.isfinite(parsed):
+            raise ImageHelperError(f"{path} contains non-finite JSON number {value!r}")
+        return parsed
+
     try:
         value = json.loads(
             path.read_bytes(),
@@ -87,6 +94,7 @@ def _strict_json(path: Path) -> dict[str, Any]:
             parse_constant=lambda value: (_ for _ in ()).throw(
                 ImageHelperError(f"{path} contains JSON constant {value}")
             ),
+            parse_float=parse_float,
         )
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ImageHelperError(f"{path} is not strict JSON") from exc

@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import stat
 import subprocess
@@ -779,8 +780,24 @@ def _strict_json(raw: bytes) -> dict[str, Any]:
             result[key] = value
         return result
 
+    def reject_constant(value: str) -> Any:
+        raise ContainerError(f"scorer JSON contains non-finite number {value!r}")
+
+    def parse_float(value: str) -> float:
+        parsed = float(value)
+        if not math.isfinite(parsed):
+            raise ContainerError(f"scorer JSON contains non-finite number {value!r}")
+        return parsed
+
     try:
-        value = json.loads(raw.decode("utf-8"), object_pairs_hook=reject_pairs)
+        value = json.loads(
+            raw.decode("utf-8"),
+            object_pairs_hook=reject_pairs,
+            parse_constant=reject_constant,
+            parse_float=parse_float,
+        )
+    except ContainerError:
+        raise
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ContainerError("scorer did not return strict UTF-8 JSON") from exc
     if not isinstance(value, dict):

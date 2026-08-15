@@ -1210,10 +1210,17 @@ def _strict_json_object(path: Path) -> dict[str, Any]:
     def reject_constant(value: str) -> object:
         raise ValueError(f"non-finite JSON constant is forbidden: {value}")
 
+    def parse_float(value: str) -> float:
+        parsed = float(value)
+        if not math.isfinite(parsed):
+            raise ValueError(f"non-finite JSON number is forbidden: {value}")
+        return parsed
+
     payload = json.loads(
         Path(path).read_text(encoding="utf-8"),
         object_pairs_hook=pairs_hook,
         parse_constant=reject_constant,
+        parse_float=parse_float,
     )
     if not isinstance(payload, dict):
         raise ValueError(f"{path}: payload must be one JSON object")

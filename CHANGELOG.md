@@ -34,9 +34,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Made evidence, IPMNIST-screening, and micro-continual artifact loaders plus the
-  Label-EMNIST array-cache metadata loader reject duplicate JSON object keys at every nesting
-  depth instead of silently retaining the last value.
+- Made strict evidence, IPMNIST-screening, micro-continual, UPGD/Label-EMNIST, and sealed
+  Forager artifact loaders reject duplicate JSON object keys at every nesting depth and JSON
+  numeric tokens whose float conversion overflows to infinity.
 - Rejected out-of-int32-range, zero, negative, boolean, and non-integer schedule divisors in
   synthetic and closed-loop streams before JAX modulo, floor-division, or periodic arithmetic
   can silently corrupt a regime clock or raise late overflow errors; valid int32 schedules

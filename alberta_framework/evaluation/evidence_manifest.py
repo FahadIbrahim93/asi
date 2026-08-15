@@ -29,6 +29,7 @@ from __future__ import annotations
 import hashlib
 import importlib.metadata
 import json
+import math
 import platform
 import shlex
 import subprocess
@@ -700,6 +701,13 @@ def _reject_json_constant(value: str) -> NoReturn:
     raise ValueError(f"non-standard JSON numeric constant: {value}")
 
 
+def _parse_finite_json_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError(f"non-finite JSON number is forbidden: {value}")
+    return parsed
+
+
 def _reject_duplicate_json_keys(
     pairs: list[tuple[str, object]],
 ) -> dict[str, object]:
@@ -717,6 +725,7 @@ def _load_strict_json_object(path: Path) -> dict[str, object]:
     parsed = json.loads(
         path.read_bytes(),
         parse_constant=_reject_json_constant,
+        parse_float=_parse_finite_json_float,
         object_pairs_hook=_reject_duplicate_json_keys,
     )
     if not isinstance(parsed, dict):

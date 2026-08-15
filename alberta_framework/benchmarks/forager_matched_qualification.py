@@ -490,6 +490,13 @@ def _reject_nonfinite(value: str) -> NoReturn:
     raise ForagerMatchedQualificationError(f"non-finite JSON number {value!r}")
 
 
+def _parse_finite_json_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ForagerMatchedQualificationError(f"non-finite JSON number {value!r}")
+    return parsed
+
+
 def _decode_json(raw: bytes, label: str) -> Any:
     if not raw or len(raw) > _MAX_JSON_BYTES or raw.startswith(b"\xef\xbb\xbf"):
         raise ForagerMatchedQualificationError(f"{label} violates the JSON byte contract")
@@ -498,6 +505,7 @@ def _decode_json(raw: bytes, label: str) -> Any:
             raw.decode("utf-8"),
             object_pairs_hook=_reject_duplicate_keys,
             parse_constant=_reject_nonfinite,
+            parse_float=_parse_finite_json_float,
         )
     except ForagerMatchedQualificationError:
         raise

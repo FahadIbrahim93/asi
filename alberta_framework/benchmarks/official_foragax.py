@@ -1227,11 +1227,20 @@ def _strict_json_loads(
             f"{label} contains non-finite JSON constant {constant}"
         )
 
+    def parse_float(value: str) -> float:
+        parsed = float(value)
+        if not math.isfinite(parsed):
+            raise OfficialForagaxValidationError(
+                f"{label} contains non-finite JSON number {value}"
+            )
+        return parsed
+
     try:
         return json.loads(
             value,
             object_pairs_hook=object_pairs,
             parse_constant=reject_constant,
+            parse_float=parse_float,
         )
     except OfficialForagaxValidationError:
         raise

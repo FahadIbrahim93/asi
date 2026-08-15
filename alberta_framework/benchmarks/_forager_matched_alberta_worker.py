@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import os
 import shutil
 import stat
@@ -97,6 +98,15 @@ def _reject_nonfinite(token: str) -> Any:
     )
 
 
+def _parse_finite_json_float(token: str) -> float:
+    parsed = float(token)
+    if not math.isfinite(parsed):
+        raise MatchedAlbertaWorkerError(
+            f"non-finite configuration number {token!r} is forbidden"
+        )
+    return parsed
+
+
 def _feature_configuration(value: Any) -> ForagerFeatureConfig:
     if not isinstance(value, Mapping):
         raise MatchedAlbertaWorkerError("feature configuration must be an object")
@@ -172,6 +182,7 @@ def _load_configuration(path: Path) -> MatchedAlbertaWorkerConfiguration:
             text,
             object_pairs_hook=_reject_duplicate_keys,
             parse_constant=_reject_nonfinite,
+            parse_float=_parse_finite_json_float,
         )
     except MatchedAlbertaWorkerError:
         raise

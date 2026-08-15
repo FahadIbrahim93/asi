@@ -1576,6 +1576,13 @@ def _reject_json_constant(value: str) -> NoReturn:
     raise MatchedStatisticsError(f"nonfinite JSON constant is forbidden: {value}")
 
 
+def _parse_finite_json_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise MatchedStatisticsError(f"nonfinite JSON number is forbidden: {value}")
+    return parsed
+
+
 def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
     result: dict[str, object] = {}
     for key, value in pairs:
@@ -1627,6 +1634,7 @@ def load_canonical_result(
                 decoded,
                 object_pairs_hook=_reject_duplicate_keys,
                 parse_constant=_reject_json_constant,
+                parse_float=_parse_finite_json_float,
             ),
         )
     except MatchedStatisticsError:
