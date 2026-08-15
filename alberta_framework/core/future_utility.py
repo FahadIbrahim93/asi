@@ -14,6 +14,11 @@ from jax import Array
 from jaxtyping import Bool, Float
 
 
+def _skip_zero_scale(scale: Array, value: Array) -> Array:
+    """Skip ``0 * inf`` so a disabled decay does not poison the next trace."""
+    return jnp.where(scale == 0.0, jnp.zeros_like(value), scale * value)
+
+
 class FutureUtilityEstimate(NamedTuple):
     """One-step utility estimate with an explicit transaction verdict."""
 
@@ -165,7 +170,7 @@ def contribution_trace_output_loss_reduction_with_diagnostics(
     count = jnp.asarray(active_count, dtype=jnp.float32)
 
     active_errors = jnp.where(active_mask, errors, 0.0)
-    decayed_contribution = decay * contribution_trace
+    decayed_contribution = _skip_zero_scale(decay, contribution_trace)
     new_contribution_trace = (
         decayed_contribution + active_errors[:, None] * feature_values[None, :]
     )
@@ -174,7 +179,9 @@ def contribution_trace_output_loss_reduction_with_diagnostics(
         new_contribution_trace,
         decayed_contribution,
     )
-    new_feature_energy_trace = decay * feature_energy_trace + feature_values**2
+    new_feature_energy_trace = (
+        _skip_zero_scale(decay, feature_energy_trace) + feature_values**2
+    )
 
     delta_weight = (
         step_size
@@ -191,8 +198,11 @@ def contribution_trace_output_loss_reduction_with_diagnostics(
     inputs_valid = (
         jnp.all(jnp.where(active_mask, jnp.isfinite(errors), True))
         & jnp.all(jnp.isfinite(feature_values))
-        & jnp.all(jnp.isfinite(contribution_trace))
-        & jnp.all(jnp.isfinite(feature_energy_trace))
+        & jnp.logical_or(
+            decay == 0.0,
+            jnp.all(jnp.isfinite(contribution_trace))
+            & jnp.all(jnp.isfinite(feature_energy_trace)),
+        )
         & jnp.isfinite(decay)
         & (decay >= 0.0)
         & (decay <= 1.0)
@@ -297,10 +307,13 @@ def trace_output_loss_reduction_with_diagnostics(
     count = jnp.asarray(active_count, dtype=jnp.float32)
 
     active_errors = jnp.where(active_mask, errors, 0.0)
-    new_error_trace = decay * error_trace + active_errors
-    new_error_trace = jnp.where(active_mask, new_error_trace, decay * error_trace)
-    new_feature_trace = decay * feature_trace + feature_values
-    new_feature_energy_trace = decay * feature_energy_trace + feature_values**2
+    decayed_error = _skip_zero_scale(decay, error_trace)
+    new_error_trace = decayed_error + active_errors
+    new_error_trace = jnp.where(active_mask, new_error_trace, decayed_error)
+    new_feature_trace = _skip_zero_scale(decay, feature_trace) + feature_values
+    new_feature_energy_trace = (
+        _skip_zero_scale(decay, feature_energy_trace) + feature_values**2
+    )
 
     delta_weight = (
         step_size
@@ -319,9 +332,12 @@ def trace_output_loss_reduction_with_diagnostics(
     inputs_valid = (
         jnp.all(jnp.where(active_mask, jnp.isfinite(errors), True))
         & jnp.all(jnp.isfinite(feature_values))
-        & jnp.all(jnp.isfinite(error_trace))
-        & jnp.all(jnp.isfinite(feature_trace))
-        & jnp.all(jnp.isfinite(feature_energy_trace))
+        & jnp.logical_or(
+            decay == 0.0,
+            jnp.all(jnp.isfinite(error_trace))
+            & jnp.all(jnp.isfinite(feature_trace))
+            & jnp.all(jnp.isfinite(feature_energy_trace)),
+        )
         & jnp.isfinite(decay)
         & (decay >= 0.0)
         & (decay <= 1.0)
@@ -404,7 +420,9 @@ def normalize_future_utility_signal(
     """
     decay = jnp.asarray(moment_decay, dtype=jnp.float32)
     utility_decay_arr = jnp.asarray(utility_decay, dtype=jnp.float32)
-    new_second_moment = decay * second_moment + (1.0 - decay) * signal**2
+    new_second_moment = (
+        _skip_zero_scale(decay, second_moment) + (1.0 - decay) * signal**2
+    )
     normalized = signal
 
     if mode in {"age", "uncertainty_age"}:
