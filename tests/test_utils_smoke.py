@@ -218,6 +218,19 @@ def test_plot_final_performance_bars(results) -> None:
     assert [label.get_text() for label in ax.get_xticklabels()] == ["lms", "idbd"]
 
 
+def test_plot_final_performance_bars_rejects_nonfinite_mean(results) -> None:
+    """np.argmin treats NaN as the best bar, so a failed run would be crowned."""
+    poisoned = dict(results)
+    summary = results["lms"].summary["squared_error"]
+    poisoned["lms"] = results["lms"]._replace(
+        summary={
+            "squared_error": summary._replace(mean=float("nan")),
+        }
+    )
+    with pytest.raises(ValueError, match="finite metric means"):
+        plot_final_performance_bars(poisoned)
+
+
 def test_plot_step_size_evolution(results) -> None:
     fig, ax = plot_step_size_evolution(results)
     assert isinstance(fig, plt.Figure)

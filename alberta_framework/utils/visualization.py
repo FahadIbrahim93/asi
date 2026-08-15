@@ -213,8 +213,14 @@ def plot_final_performance_bars(
     else:
         fig = cast("Figure", ax.figure)
     names = list(results.keys())
+    if not names:
+        raise ValueError("plot_final_performance_bars requires at least one result")
     means = [results[name].summary[metric].mean for name in names]
     stds = [results[name].summary[metric].std for name in names]
+    means_arr = np.asarray(means, dtype=np.float64)
+    stds_arr = np.asarray(stds, dtype=np.float64)
+    if not np.all(np.isfinite(means_arr)) or not np.all(np.isfinite(stds_arr)):
+        raise ValueError("plot_final_performance_bars requires finite metric means and stds")
 
     # Default colors
     default_colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
