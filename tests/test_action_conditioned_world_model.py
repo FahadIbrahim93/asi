@@ -99,6 +99,29 @@ def test_action_conditioned_world_model_optional_interaction_features() -> None:
     )
 
 
+def test_action_interactions_do_not_form_zero_times_inf() -> None:
+    """Inf obs times a silent action one-hot is 0*inf = NaN in the product."""
+    model = ActionConditionedWorldModel(
+        ActionConditionedWorldModelConfig(
+            observation_dim=2,
+            n_actions=3,
+            hidden_sizes=(),
+            include_action_interactions=True,
+        )
+    )
+    obs = jnp.array([jnp.inf, 1.0], dtype=jnp.float32)
+    raw = obs[:, None] * jnp.array([1.0, 0.0, 0.0], dtype=jnp.float32)[None, :]
+    assert not bool(jnp.all(jnp.isfinite(raw)))
+
+    features = model.input_features(obs, jnp.array(0, dtype=jnp.int32))
+    chex.assert_tree_all_finite(features)
+    chex.assert_trees_all_close(features, jnp.zeros_like(features))
+
+    state = model.init(jr.key(0))
+    prediction = model.predict(state, obs, jnp.array(0, dtype=jnp.int32))
+    chex.assert_tree_all_finite(prediction)
+
+
 def test_action_conditioned_world_model_scan_loop_shapes() -> None:
     config = ActionConditionedWorldModelConfig(
         observation_dim=2,

@@ -375,10 +375,19 @@ class ActionConditionedWorldModel:
             (self._config.observation_dim,)
         )
         action_one_hot = self.encode_action(action)
+        features_valid = jnp.all(jnp.isfinite(obs)) & jnp.all(
+            jnp.isfinite(action_one_hot)
+        )
+        # Inf observation times a silent one-hot is 0*inf = NaN. Zero both
+        # factors before the product so that product is never formed.
+        safe_obs = jnp.where(features_valid, obs, jnp.zeros_like(obs))
+        safe_action = jnp.where(
+            features_valid, action_one_hot, jnp.zeros_like(action_one_hot)
+        )
         if self._config.include_action_interactions:
-            interactions = (obs[:, None] * action_one_hot[None, :]).reshape((-1,))
-            return jnp.concatenate([obs, action_one_hot, interactions], axis=0)
-        return jnp.concatenate([obs, action_one_hot], axis=0)
+            interactions = (safe_obs[:, None] * safe_action[None, :]).reshape((-1,))
+            return jnp.concatenate([safe_obs, safe_action, interactions], axis=0)
+        return jnp.concatenate([safe_obs, safe_action], axis=0)
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def encode_action(self, action: Array) -> Array:
@@ -469,6 +478,16 @@ class ActionConditionedWorldModel:
             raw_predictions[self._config.observation_dim + 1],
             0.0,
             self._config.gamma,
+        )
+
+        decode_valid = jnp.all(jnp.isfinite(obs)) & jnp.all(jnp.isfinite(inputs))
+        next_observation = jnp.where(
+            decode_valid, next_observation, jnp.zeros_like(next_observation)
+        )
+        reward = jnp.where(decode_valid, reward, jnp.zeros_like(reward))
+        discount = jnp.where(decode_valid, discount, jnp.zeros_like(discount))
+        raw_predictions = jnp.where(
+            decode_valid, raw_predictions, jnp.zeros_like(raw_predictions)
         )
 
         return WorldModelPrediction(
