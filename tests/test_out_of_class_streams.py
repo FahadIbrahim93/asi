@@ -45,6 +45,33 @@ def _scan_collect(stream, num_steps: int, key) -> tuple[jnp.ndarray, jnp.ndarray
 class TestOutOfClassPolynomialStream:
     """Tests for the degree-3 polynomial out-of-class stream."""
 
+    def test_init_selects_exact_active_count_when_scores_tie(self, monkeypatch) -> None:
+        """All-tied mask scores must still retain exactly the configured
+        triple count per task/context (issue #164, same class as #150)."""
+        stream = OutOfClassPolynomialStream(
+            feature_dim=5, n_tasks=1, n_contexts=1, active_triples_per_context=2
+        )
+
+        def tied_uniform(key, shape, dtype=jnp.float32, **kwargs):
+            return jnp.zeros(shape, dtype=dtype)
+
+        monkeypatch.setattr(
+            "alberta_framework.streams.out_of_class.jr.uniform", tied_uniform
+        )
+        state = stream.init(jr.key(0))
+        assert int(jnp.count_nonzero(state.context_weights)) == 2
+
+    def test_init_tie_free_selection_count(self) -> None:
+        """Distinct scores keep the exact configured count for a fixed seed."""
+        stream = OutOfClassPolynomialStream(
+            feature_dim=6, n_tasks=2, n_contexts=3, active_triples_per_context=3
+        )
+        state = stream.init(jr.key(4))
+        per_row = jnp.count_nonzero(
+            state.context_weights.reshape(3 * 2, -1), axis=1
+        )
+        assert bool(jnp.all(per_row == 3))
+
     def test_step_shapes(self):
         stream = OutOfClassPolynomialStream(
             feature_dim=5,

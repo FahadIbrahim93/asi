@@ -192,8 +192,8 @@ class OutOfClassPolynomialStream:
             (self._n_contexts, self._n_tasks, n_triples),
             dtype=jnp.float32,
         )
-        threshold = jnp.sort(mask_scores, axis=-1)[..., active_count - 1 : active_count]
-        mask = mask_scores <= threshold
+        ranks = jnp.argsort(jnp.argsort(mask_scores, axis=-1), axis=-1)
+        mask = ranks < active_count
         context_weights = dense_context_weights * mask.astype(jnp.float32)
         norm = jnp.sqrt(jnp.maximum(jnp.sum(mask, axis=-1, keepdims=True), 1.0))
         context_weights = context_weights / norm
