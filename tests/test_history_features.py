@@ -178,3 +178,24 @@ class TestIntegration:
 
         chex.assert_tree_all_finite(l_state.weights)
         chex.assert_tree_all_finite(h_state.traces)
+
+
+def test_inf_observation_holds_finite_traces() -> None:
+    """Inf observation writes inf traces that never recover on later finite steps.
+
+    Fail-closed: skip the trace update and emit zeros for non-finite raw
+    coordinates.
+    """
+    extractor = HistoryFeatureExtractor(raw_dim=2, decay_rates=(0.5, 0.9))
+    state = extractor.init()
+    inf_obs = jnp.array([jnp.inf, 1.0], dtype=jnp.float32)
+    aug, held = extractor.step(state, inf_obs)
+    assert bool(jnp.all(jnp.isfinite(aug)))
+    assert bool(jnp.all(jnp.isfinite(held.traces)))
+    chex.assert_trees_all_close(held.traces, state.traces)
+
+    finite_obs = jnp.zeros(2, dtype=jnp.float32)
+    aug2, recovered = extractor.step(held, finite_obs)
+    assert bool(jnp.all(jnp.isfinite(aug2)))
+    assert bool(jnp.all(jnp.isfinite(recovered.traces)))
+
