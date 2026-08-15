@@ -2121,3 +2121,21 @@ def test_paper_specific_dg_rejects_shape_mismatch_and_empty_batches() -> None:
     )
     with pytest.raises(ValueError, match="rare_mask"):
         stratify_delight_outcomes(result, jnp.zeros((3,), dtype=jnp.bool_))
+
+
+def test_paper_specific_dg_zero_surprisal_does_not_nan_inf_advantage() -> None:
+    """log_prob=0 is zero surprisal: inf advantage is 0*inf = NaN delight.
+
+    Fail-closed: drop the non-finite sample so the remaining finite term
+    keeps a finite actor loss.
+    """
+    result = discrete_delightful_policy_gradient(
+        jnp.array([0.0, -1.0], dtype=jnp.float32),
+        jnp.array([jnp.inf, 1.0], dtype=jnp.float32),
+    )
+    chex.assert_tree_all_finite(result.delight)
+    chex.assert_tree_all_finite(result.actor_loss)
+    chex.assert_tree_all_finite(result.sample_weights)
+    chex.assert_trees_all_close(result.delight[0], jnp.float32(0.0))
+    chex.assert_trees_all_close(result.sample_weights[0], jnp.float32(0.0))
+    chex.assert_trees_all_close(result.delight[1], jnp.float32(1.0))

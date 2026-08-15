@@ -1907,14 +1907,25 @@ def discrete_delightful_policy_gradient(
     if log_prob.size == 0:
         raise ValueError("at least one policy-gradient sample is required")
 
+    finite = jnp.isfinite(log_prob) & jnp.isfinite(advantage)
+    log_prob = jnp.where(finite, log_prob, jnp.zeros_like(log_prob))
+    advantage = jnp.where(finite, advantage, jnp.zeros_like(advantage))
     action_surprisal = -log_prob
-    delight = jax.lax.stop_gradient(advantage * action_surprisal)
+    # Zero surprisal or zero advantage must not multiply an inf counterpart.
+    delight = jax.lax.stop_gradient(
+        jnp.where(
+            (action_surprisal == 0.0) | (advantage == 0.0),
+            jnp.zeros_like(advantage),
+            advantage * action_surprisal,
+        )
+    )
     if cfg.mode == "ordinary_pg":
         sample_weights = jnp.ones_like(delight)
     else:
         temperature = jnp.asarray(cfg.temperature, dtype=jnp.float32)
         sample_weights = jax.nn.sigmoid(delight / temperature)
     sample_weights = jax.lax.stop_gradient(sample_weights)
+    sample_weights = jnp.where(finite, sample_weights, jnp.zeros_like(sample_weights))
     actor_coefficients = jax.lax.stop_gradient(sample_weights * advantage)
     ordinary_coefficients = jax.lax.stop_gradient(advantage)
 
