@@ -100,6 +100,44 @@ def test_invalid_target_advances_time_without_allocating() -> None:
     assert float(result.metrics[4]) == 0.0
 
 
+def test_nonfinite_observation_does_not_allocate_or_poison() -> None:
+    """Inf observations must not claim a slot or write inf-inf NaNs into means.
+
+    A first inf sample would allocate an inf prototype. A second is
+    inf - inf in the EMA residual, and argmin treats NaN distances as nearest.
+    Fail-closed: skip the memory write and keep class logits uniform.
+    """
+    learner = PrototypeMemoryLearner(
+        PrototypeMemoryConfig(feature_dim=2, n_classes=2, slots_per_class=2)
+    )
+    target = jnp.asarray([1.0, 0.0], dtype=jnp.float32)
+    seeded = learner.update(
+        learner.init(),
+        jnp.asarray([0.25, 0.75], dtype=jnp.float32),
+        target,
+    ).state
+    finite_means = seeded.means
+    inf_obs = jnp.asarray([jnp.inf, 0.0], dtype=jnp.float32)
+    first = learner.update(seeded, inf_obs, target)
+    second = learner.update(first.state, inf_obs, target)
+    recovered = learner.update(
+        second.state,
+        jnp.asarray([0.25, 0.75], dtype=jnp.float32),
+        target,
+    )
+
+    assert int(first.state.step_count) == int(seeded.step_count) + 1
+    chex.assert_trees_all_close(first.state.means, finite_means)
+    chex.assert_trees_all_close(first.state.counts, seeded.counts)
+    chex.assert_tree_all_finite(second.state)
+    chex.assert_tree_all_finite(learner.predict(seeded, inf_obs))
+    chex.assert_trees_all_close(
+        learner.predict(seeded, inf_obs),
+        jnp.full((2,), 0.5, dtype=jnp.float32),
+    )
+    assert int(jnp.argmax(recovered.predictions)) == 0
+
+
 def test_run_prototype_memory_arrays_is_scan_compatible() -> None:
     """Array runner should return fixed-width predictions and metrics."""
     learner = PrototypeMemoryLearner(

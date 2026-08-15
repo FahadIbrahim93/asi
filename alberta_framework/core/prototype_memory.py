@@ -184,7 +184,8 @@ class PrototypeMemoryLearner:
         any_active = jnp.any(state.counts > 0.0, axis=1)
         logits = jnp.where(any_active, logits, -1e9)
         logits = jnp.where(jnp.any(any_active), logits, jnp.zeros_like(logits))
-        return logits
+        finite_obs = jnp.all(jnp.isfinite(x))
+        return jnp.where(finite_obs, logits, jnp.zeros_like(logits))
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def predict(
@@ -267,7 +268,9 @@ class PrototypeMemoryLearner:
             )
             old_mean = current.means[head, slot]
             eta = jnp.asarray(self._config.update_rate, dtype=jnp.float32)
-            new_mean = jnp.where(novel, observation, old_mean + eta * (observation - old_mean))
+            residual = observation - old_mean
+            ema = jnp.where(eta == 0.0, old_mean, old_mean + eta * residual)
+            new_mean = jnp.where(novel, observation, ema)
             new_count = jnp.where(novel, 1.0, current.counts[head, slot] + 1.0)
             next_state = PrototypeMemoryState(
                 means=current.means.at[head, slot].set(new_mean),
@@ -290,7 +293,12 @@ class PrototypeMemoryLearner:
                 jnp.array(0.0, dtype=jnp.float32),
             )
 
-        new_state, allocated = jax.lax.cond(valid_target, do_update, skip_update, state)
+        new_state, allocated = jax.lax.cond(
+            valid_target & jnp.all(jnp.isfinite(observation)),
+            do_update,
+            skip_update,
+            state,
+        )
         active = jnp.sum(new_state.counts > 0.0).astype(jnp.float32)
         metrics = jnp.asarray(
             [
