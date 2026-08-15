@@ -180,3 +180,46 @@ def test_upgd_memory_novelty_threshold_adapts() -> None:
         ).state
 
     assert float(jnp.exp(state.novelty_log_threshold)) > config.initial_novelty_threshold
+
+
+def test_upgd_memory_holds_state_on_inf_observation() -> None:
+    """Inf observations NaN the loss EMAs and allocate inf prototypes.
+
+    Fail-closed: skip UPGD/memory writes and hold finite EMAs and blend
+    logit so a later finite sample can still learn.
+    """
+    learner = UPGDMemoryLearner(
+        UPGDMemoryConfig(
+            feature_dim=2,
+            n_heads=2,
+            hidden_sizes=(4,),
+            slots_per_class=2,
+            target_trace_blend_scale=0.0,
+        )
+    )
+    target = jnp.asarray([1.0, 0.0], dtype=jnp.float32)
+    seeded = learner.update(
+        learner.init(jr.key(1)),
+        jnp.asarray([1.0, -1.0], dtype=jnp.float32),
+        target,
+    ).state
+    inf_obs = jnp.asarray([jnp.inf, -1.0], dtype=jnp.float32)
+    poisoned = learner.update(seeded, inf_obs, target)
+    twice = learner.update(poisoned.state, inf_obs, target)
+    recovered = learner.update(
+        twice.state,
+        jnp.asarray([1.0, -1.0], dtype=jnp.float32),
+        target,
+    )
+
+    chex.assert_trees_all_close(poisoned.state.upgd_loss_ema, seeded.upgd_loss_ema)
+    chex.assert_trees_all_close(poisoned.state.memory_loss_ema, seeded.memory_loss_ema)
+    chex.assert_trees_all_close(poisoned.state.memory_logit, seeded.memory_logit)
+    chex.assert_trees_all_close(poisoned.state.memory_state.means, seeded.memory_state.means)
+    assert bool(jnp.all(jnp.isfinite(twice.state.upgd_loss_ema)))
+    assert bool(jnp.all(jnp.isfinite(twice.state.memory_loss_ema)))
+    assert bool(jnp.all(jnp.isfinite(twice.state.memory_logit)))
+    assert bool(jnp.all(jnp.isfinite(twice.state.memory_state.means)))
+    chex.assert_tree_all_finite(poisoned.metrics)
+    chex.assert_tree_all_finite(recovered.metrics)
+    assert int(recovered.state.memory_state.step_count) >= int(seeded.memory_state.step_count)

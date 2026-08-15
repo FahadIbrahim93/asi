@@ -245,6 +245,16 @@ def _active_mse(prediction: Array, target: Array) -> Array:
     return jnp.sum(squared) / jnp.maximum(jnp.sum(active.astype(jnp.float32)), 1.0)
 
 
+def _hold_ema(previous: Array, value: Array, decay: Array, *, hold: Array) -> Array:
+    """Blend an EMA, or keep previous when value is non-finite or hold is set."""
+    one_minus = 1.0 - decay
+    decayed_prev = jnp.where(decay == 0.0, jnp.zeros_like(previous), decay * previous)
+    safe_value = jnp.where(jnp.isfinite(value), value, jnp.zeros_like(value))
+    decayed_new = jnp.where(one_minus == 0.0, jnp.zeros_like(safe_value), one_minus * safe_value)
+    blended = decayed_prev + decayed_new
+    return jnp.where(hold | ~jnp.isfinite(value), previous, blended)
+
+
 def _normalize_simplex(prediction: Array) -> Array:
     clipped = jnp.maximum(prediction, 0.0)
     return clipped / jnp.maximum(jnp.sum(clipped), 1e-12)
@@ -446,14 +456,16 @@ class UPGDMemoryLearner:
             return _active_mse(probe_prediction, target)
 
         dloss_dlogit = jax.grad(blend_loss)(state.memory_logit)
-        next_memory_logit = state.memory_logit - (
+        logit_step = (
             jnp.asarray(self._config.memory_logit_step_size, dtype=jnp.float32) * dloss_dlogit
         )
-        # Bound the learned base logit: sigmoid(+/-8) is already ~0.9997, so
-        # the clip costs nothing in gate range but stops unbounded drift during
-        # long one-sided regimes, keeping the additive confidence/reliability
-        # terms able to reverse the gate after a regime change.
-        next_memory_logit = jnp.clip(next_memory_logit, -8.0, 8.0)
+        obs_finite = jnp.all(jnp.isfinite(observation))
+        logit_ok = obs_finite & jnp.isfinite(dloss_dlogit) & jnp.isfinite(logit_step)
+        next_memory_logit = jnp.where(
+            logit_ok,
+            jnp.clip(state.memory_logit - logit_step, -8.0, 8.0),
+            state.memory_logit,
+        )
 
         threshold = jnp.exp(state.novelty_log_threshold)
         upgd_result = self._upgd.update(state.upgd_state, observation, target)
@@ -465,51 +477,71 @@ class UPGDMemoryLearner:
         )
         allocated = memory_result.metrics[5]
         decay = jnp.asarray(self._config.reliability_decay, dtype=jnp.float32)
-        one_minus_decay = 1.0 - decay
-        next_allocation_ema = decay * state.allocation_ema + one_minus_decay * allocated
+        hold = ~obs_finite
+        next_allocation_ema = _hold_ema(
+            state.allocation_ema, allocated, decay, hold=hold
+        )
         allocation_error = next_allocation_ema - jnp.asarray(
             self._config.target_allocation_rate,
             dtype=jnp.float32,
         )
-        next_log_threshold = state.novelty_log_threshold + (
+        log_step = (
             jnp.asarray(self._config.novelty_adaptation_rate, dtype=jnp.float32) * allocation_error
         )
-        next_log_threshold = jnp.clip(
-            next_log_threshold,
-            jnp.log(jnp.asarray(self._config.min_novelty_threshold, dtype=jnp.float32)),
-            jnp.log(jnp.asarray(self._config.max_novelty_threshold, dtype=jnp.float32)),
+        next_log_threshold = jnp.where(
+            obs_finite & jnp.isfinite(log_step),
+            jnp.clip(
+                state.novelty_log_threshold + log_step,
+                jnp.log(jnp.asarray(self._config.min_novelty_threshold, dtype=jnp.float32)),
+                jnp.log(jnp.asarray(self._config.max_novelty_threshold, dtype=jnp.float32)),
+            ),
+            state.novelty_log_threshold,
         )
 
+        next_upgd_state = jax.lax.cond(
+            obs_finite,
+            lambda: upgd_result.state,
+            lambda: state.upgd_state,
+        )
+        next_memory_state = jax.lax.cond(
+            obs_finite,
+            lambda: memory_result.state,
+            lambda: state.memory_state,
+        )
         next_state = UPGDMemoryState(
-            upgd_state=upgd_result.state,
-            memory_state=memory_result.state,
+            upgd_state=next_upgd_state,
+            memory_state=next_memory_state,
             memory_logit=next_memory_logit,
             novelty_log_threshold=next_log_threshold,
-            upgd_loss_ema=decay * state.upgd_loss_ema + one_minus_decay * upgd_loss,
-            memory_loss_ema=decay * state.memory_loss_ema + one_minus_decay * memory_loss,
-            blended_loss_ema=(decay * state.blended_loss_ema + one_minus_decay * blended_loss),
+            upgd_loss_ema=_hold_ema(state.upgd_loss_ema, upgd_loss, decay, hold=hold),
+            memory_loss_ema=_hold_ema(state.memory_loss_ema, memory_loss, decay, hold=hold),
+            blended_loss_ema=_hold_ema(
+                state.blended_loss_ema, blended_loss, decay, hold=hold
+            ),
             allocation_ema=next_allocation_ema,
             step_count=state.step_count + 1,
         )
+        safe_prediction = jnp.where(obs_finite, prediction, jnp.zeros_like(prediction))
+        safe_errors = jnp.where(obs_finite, errors, jnp.zeros_like(errors))
         metrics = jnp.asarray(
             [
-                blended_loss,
-                upgd_loss,
-                memory_loss,
-                gate,
+                jnp.where(obs_finite & jnp.isfinite(blended_loss), blended_loss, 0.0),
+                jnp.where(obs_finite & jnp.isfinite(upgd_loss), upgd_loss, 0.0),
+                jnp.where(obs_finite & jnp.isfinite(memory_loss), memory_loss, 0.0),
+                jnp.where(obs_finite & jnp.isfinite(gate), gate, 0.0),
                 next_memory_logit,
                 threshold,
                 next_allocation_ema,
-                jnp.sum(memory_result.state.counts > 0.0).astype(jnp.float32),
-                jnp.max(upgd_prediction),
-                jnp.max(memory_prediction),
+                jnp.sum(next_memory_state.counts > 0.0).astype(jnp.float32),
+                jnp.where(obs_finite, jnp.max(upgd_prediction), 0.0),
+                jnp.where(obs_finite, jnp.max(memory_prediction), 0.0),
             ],
             dtype=jnp.float32,
         )
         return UPGDMemoryUpdateResult(
             state=next_state,
-            predictions=prediction,
-            errors=errors,
+            predictions=safe_prediction,
+            errors=safe_errors,
             metrics=metrics,
         )
 
