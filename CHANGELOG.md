@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `wilcoxon_comparison` now refuses empty and unequal-length pairs with a
+  deterministic `ValueError` before SciPy, matching the paired t-test's
+  input contract. Identical-sample refusal is unchanged.
+
 ## [0.29.0] - 2026-08-14
 
 Changes since 0.28.0 are summarized by durable user-visible behavior. Development campaign

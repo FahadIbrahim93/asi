@@ -393,13 +393,21 @@ def wilcoxon_comparison(
         SignificanceResult with test results
 
     Raises:
-        ValueError: If the non-empty paired samples are identical, for which
-            the Wilcoxon signed-rank statistic is undefined.
+        ValueError: If the samples have unequal length, if there are no
+            pairs, or if the non-empty paired samples are identical, for
+            which the Wilcoxon signed-rank statistic is undefined.
     """
     a = np.asarray(values_a)
     b = np.asarray(values_b)
 
-    if a.size > 0 and np.array_equal(a, b):
+    if len(a) != len(b):
+        raise ValueError(
+            "Wilcoxon signed-rank requires equal-length samples "
+            f"(got {len(a)} and {len(b)})"
+        )
+    if len(a) == 0:
+        raise ValueError(f"Wilcoxon signed-rank requires at least 1 pair (got {len(a)})")
+    if np.array_equal(a, b):
         raise ValueError(
             f"Paired comparison {method_a!r} vs {method_b!r} has identical "
             "samples; the Wilcoxon signed-rank statistic is undefined"

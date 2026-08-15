@@ -378,6 +378,49 @@ class TestIdenticalWilcoxonRejection:
         assert result.p_value < 1.0
 
 
+class TestWilcoxonEmptyAndUnequalRejection:
+    """Empty and unequal pairs fail closed before SciPy (#112).
+
+    The paired t-test already refuses these inputs (#32/#35). Wilcoxon only
+    gained the identical-samples refusal in #39. Length-1 Wilcoxon is left
+    alone: a single nonzero difference is a defined signed-rank observation,
+    and adding an n>=2 floor is out of scope.
+    """
+
+    def test_unequal_lengths_raise_before_scipy(self) -> None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with pytest.raises(
+                ValueError,
+                match=r"^Wilcoxon signed-rank requires equal-length samples \(got 2 and 3\)$",
+            ):
+                wilcoxon_comparison([1.0, 2.0], [1.0, 2.0, 3.0])
+
+    @pytest.mark.parametrize("values_a, values_b", [([], [1.0, 2.0]), ([1.0, 2.0], [])])
+    def test_empty_versus_nonempty_is_unequal_length(
+        self,
+        values_a: list[float],
+        values_b: list[float],
+    ) -> None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with pytest.raises(
+                ValueError,
+                match=r"^Wilcoxon signed-rank requires equal-length samples "
+                rf"\(got {len(values_a)} and {len(values_b)}\)$",
+            ):
+                wilcoxon_comparison(values_a, values_b)
+
+    def test_both_empty_raises_without_warning(self) -> None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with pytest.raises(
+                ValueError,
+                match=r"^Wilcoxon signed-rank requires at least 1 pair \(got 0\)$",
+            ):
+                wilcoxon_comparison([], [])
+
+
 class TestOneSampleRejection:
     """Undefined one-sample contracts reject without narrowing valid t-tests (#35).
 
