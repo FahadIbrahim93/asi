@@ -809,6 +809,36 @@ class TestShardsAndMerge:
         control = next(e for e in summary["results"] if e["config_name"] == "upgd_w_control")
         assert "paired_vs_control" not in control
 
+    def test_load_shard_rejects_unknown_noise_mode(self, tmp_path, small_data):
+        path = self._make_shard(tmp_path, small_data, "upgd_w_control", 0)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["noise_mode"] = "teleport"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+        with pytest.raises(ValueError, match="noise_mode must be 'step' or 'pool'"):
+            load_shard(path)
+
+    def test_load_shard_rejects_pool_for_unsupported_arm(self, tmp_path, small_data):
+        path = self._make_shard(tmp_path, small_data, "upgd_idbd", 0)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["noise_mode"] = "pool"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+        with pytest.raises(ValueError, match="declares no noise-consuming update"):
+            load_shard(path)
+
+    def test_load_shard_treats_missing_noise_mode_as_legacy_step(
+        self, tmp_path, small_data
+    ):
+        path = self._make_shard(tmp_path, small_data, "upgd_w_control", 0)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        del payload["noise_mode"]
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+        loaded = load_shard(path)
+
+        assert "noise_mode" not in loaded
+
     def test_merge_rejects_zero_seed_overlap_with_control(self, tmp_path, small_data):
         """An arm sharing no seeds with a present control must refuse to merge:
         the entry would rank in the summary with no paired_vs_control block and

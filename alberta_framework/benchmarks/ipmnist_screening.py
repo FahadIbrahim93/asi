@@ -6992,8 +6992,20 @@ def load_shard(path: Path) -> dict[str, Any]:
             raise ValueError(f"{path}: {fieldname} must be finite with shape ({config.n_tasks},)")
     if type(payload.get("seed")) is not int or payload["seed"] < 0:
         raise ValueError(f"{path}: seed must be a non-negative integer")
-    if payload.get("config_name") not in SCREENING_REGISTRY:
-        raise ValueError(f"{path}: unknown config_name {payload.get('config_name')!r}")
+    config_name = payload.get("config_name")
+    if not isinstance(config_name, str) or config_name not in SCREENING_REGISTRY:
+        raise ValueError(f"{path}: unknown config_name {config_name!r}")
+    spec = SCREENING_REGISTRY[config_name]
+    noise_mode = payload.get("noise_mode", "step")
+    if noise_mode not in ("step", "pool"):
+        raise ValueError(
+            f"{path}: noise_mode must be 'step' or 'pool', got {noise_mode!r}"
+        )
+    if noise_mode == "pool" and spec.noise_update is None:
+        raise ValueError(
+            f"{path}: noise_mode='pool' is unsupported for {config_name!r}: "
+            "the arm declares no noise-consuming update"
+        )
     return payload
 
 
