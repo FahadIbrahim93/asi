@@ -9,6 +9,7 @@ import jax.random as jr
 from alberta_framework.core.dreaming import (
     DreamBehaviorModelPrediction,
     DreamRolloutConfig,
+    DreamSelectionConfig,
     DreamWorldModelPrediction,
     dream_one_step,
     dream_rollout,
@@ -17,6 +18,7 @@ from alberta_framework.core.dreaming import (
     imagined_transition_to_gvf_item,
     imagined_transition_to_supervised_item,
     init_dream_rollout_state,
+    score_dream_candidates,
     slice_imagined_transition,
 )
 
@@ -262,3 +264,21 @@ def test_rollout_to_sarsa_items_shift_actions_and_mask_last_without_bootstrap() 
         jnp.array(1, dtype=jnp.int32),
     )
     chex.assert_trees_all_close(bootstrapped.weights, rollout.transitions.valid.astype(jnp.float32))
+
+
+def test_score_dream_candidates_zero_weight_skips_inf_confidence() -> None:
+    """Default confidence_weight is 0: 0 * inf confidence is NaN in the score.
+
+    Fail-closed: a zero weight does not multiply that channel, so ranking
+    still follows surprise and utility.
+    """
+    result = score_dream_candidates(
+        surprises=jnp.array([1.0, 0.5], dtype=jnp.float32),
+        utilities=jnp.array([1.0, 0.5], dtype=jnp.float32),
+        confidences=jnp.array([jnp.inf, 1.0], dtype=jnp.float32),
+        config=DreamSelectionConfig(max_items=1, min_utility=0.0),
+    )
+    assert bool(jnp.isfinite(result.scores[0]))
+    chex.assert_trees_all_close(result.scores[0], jnp.float32(2.0))
+    assert int(result.selected_indices[0]) == 0
+    assert bool(result.selected_mask[0])

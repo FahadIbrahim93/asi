@@ -318,6 +318,12 @@ class BehaviorModelDreamPolicy:
         )
 
 
+def _weighted_term(weight: float, values: Array) -> Array:
+    """Return weight * values, or zeros when weight is 0 so 0*inf stays 0."""
+    w = jnp.asarray(weight, dtype=jnp.float32)
+    return jnp.where(w == 0.0, jnp.zeros_like(values), w * values)
+
+
 def score_dream_candidates(
     surprises: Array,
     utilities: Array,
@@ -368,10 +374,10 @@ def score_dream_candidates(
         & (error_arr <= jnp.asarray(cfg.max_model_error, dtype=jnp.float32))
     )
     raw_scores = (
-        cfg.surprise_weight * surprise_arr
-        + cfg.utility_weight * utility_arr
-        + cfg.confidence_weight * confidence_arr
-        - cfg.model_error_weight * error_arr
+        _weighted_term(cfg.surprise_weight, surprise_arr)
+        + _weighted_term(cfg.utility_weight, utility_arr)
+        + _weighted_term(cfg.confidence_weight, confidence_arr)
+        - _weighted_term(cfg.model_error_weight, error_arr)
     )
     scores = jnp.where(accepted, raw_scores, -jnp.inf)
     selected_indices = jnp.argsort(-scores)[: cfg.max_items].astype(jnp.int32)
