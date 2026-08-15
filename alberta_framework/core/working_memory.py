@@ -157,6 +157,12 @@ def _empty_or_vector(value: Array, dim: int) -> Array:
     return jnp.asarray(value, dtype=jnp.float32).reshape((dim,))
 
 
+def _finite_innovation(value: Array, fast_trace: Array) -> Array:
+    """Return value - fast_trace, or zeros where that difference is non-finite."""
+    delta = value - fast_trace
+    return jnp.where(jnp.isfinite(delta), delta, jnp.zeros_like(delta))
+
+
 def _trace_bank(decay_count: int, dim: int) -> Array:
     return jnp.zeros((decay_count, dim), dtype=jnp.float32)
 
@@ -252,9 +258,11 @@ class WorkingMemoryFeaturizer:
     def _surprise_gate(self, traces: Array, value: Array, threshold: Array) -> Array:
         if (not self._config.gated_update) or traces.shape[0] == 0 or value.size == 0:
             return jnp.asarray(1.0, dtype=jnp.float32)
+        finite = jnp.all(jnp.isfinite(value)) & jnp.all(jnp.isfinite(traces[0]))
         surprise = _root_mean_square(value - traces[0])
         temperature = jnp.asarray(self._config.gate_temperature, dtype=jnp.float32)
-        return jax.nn.sigmoid((surprise - threshold) / temperature)
+        opened = jax.nn.sigmoid((surprise - threshold) / temperature)
+        return jnp.where(finite, opened, jnp.asarray(0.0, dtype=jnp.float32))
 
     @staticmethod
     def _update_trace_bank(
@@ -267,7 +275,12 @@ class WorkingMemoryFeaturizer:
             return traces
         decay = jnp.asarray(decay_rates, dtype=jnp.float32)[:, None]
         update_rate = (1.0 - decay) * gate
-        return traces + update_rate * (value[None, :] - traces)
+        finite_value = jnp.isfinite(value)[None, :]
+        residual = jnp.where(finite_value, value[None, :] - traces, 0.0)
+        # Frozen banks (update_rate=0) must not multiply an inf residual (0*inf).
+        delta = jnp.where(update_rate == 0.0, 0.0, update_rate * residual)
+        proposed = traces + delta
+        return jnp.where(finite_value, proposed, traces)
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def features(
@@ -300,11 +313,11 @@ class WorkingMemoryFeaturizer:
             )
         if cfg.include_innovations:
             if len(cfg.observation_decay_rates) > 0:
-                blocks.append(obs - state.observation_traces[0])
+                blocks.append(_finite_innovation(obs, state.observation_traces[0]))
             if len(cfg.action_decay_rates) > 0:
-                blocks.append(act - state.action_traces[0])
+                blocks.append(_finite_innovation(act, state.action_traces[0]))
             if len(cfg.reward_decay_rates) > 0:
-                blocks.append(rew - state.reward_traces[0])
+                blocks.append(_finite_innovation(rew, state.reward_traces[0]))
         return jnp.concatenate(blocks, axis=0)
 
     @functools.partial(jax.jit, static_argnums=(0,))

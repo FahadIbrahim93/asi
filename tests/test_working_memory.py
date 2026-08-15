@@ -214,3 +214,83 @@ def test_working_memory_delayed_action_positive_control() -> None:
 
     chex.assert_trees_all_close(memory_mse, 0.0)
     assert float(memory_mse) < float(raw_mse)
+
+
+def test_working_memory_frozen_trace_skips_inf_observation() -> None:
+    """A closed gate is a frozen EMA: 0 * (inf - traces) is 0*inf = NaN.
+
+    Fail-closed: a frozen bank keeps its previous finite traces.
+    """
+    memory = WorkingMemoryFeaturizer(
+        WorkingMemoryConfig(
+            observation_dim=1,
+            action_dim=0,
+            reward_dim=0,
+            observation_decay_rates=(0.5,),
+            include_current_observation=False,
+            include_current_action=False,
+            include_current_reward=False,
+        )
+    )
+    state = memory.update(
+        memory.init(),
+        jnp.asarray([2.0]),
+        memory.zero_action(),
+        memory.zero_reward(),
+    )
+    poisoned = memory.update(
+        state,
+        jnp.asarray([jnp.inf]),
+        memory.zero_action(),
+        memory.zero_reward(),
+        external_gate=0.0,
+    )
+    assert bool(jnp.all(jnp.isfinite(poisoned.observation_traces)))
+    chex.assert_trees_all_close(poisoned.observation_traces, state.observation_traces)
+
+
+def test_working_memory_inf_observation_does_not_poison_ema() -> None:
+    """A second inf observation is inf - inf = NaN in the EMA residual.
+
+    Fail-closed: skip the trace update on a non-finite coordinate so a later
+    finite sample keeps learning from the previous finite traces.
+    """
+    memory = WorkingMemoryFeaturizer(
+        WorkingMemoryConfig(
+            observation_dim=1,
+            action_dim=0,
+            reward_dim=0,
+            observation_decay_rates=(0.5,),
+            include_current_observation=False,
+            include_current_action=False,
+            include_current_reward=False,
+            include_innovations=True,
+            gated_update=True,
+        )
+    )
+    state = memory.init()
+    state = memory.update(state, jnp.asarray([2.0]), memory.zero_action(), memory.zero_reward())
+    finite_traces = state.observation_traces
+    for _ in range(2):
+        state = memory.update(
+            state,
+            jnp.asarray([jnp.inf]),
+            memory.zero_action(),
+            memory.zero_reward(),
+        )
+    assert bool(jnp.all(jnp.isfinite(state.observation_traces)))
+    chex.assert_trees_all_close(state.observation_traces, finite_traces)
+    recovered = memory.update(
+        state,
+        jnp.asarray([0.0]),
+        memory.zero_action(),
+        memory.zero_reward(),
+    )
+    assert bool(jnp.all(jnp.isfinite(recovered.observation_traces)))
+    features = memory.features(
+        recovered,
+        jnp.asarray([jnp.inf]),
+        memory.zero_action(),
+        memory.zero_reward(),
+    )
+    assert bool(jnp.all(jnp.isfinite(features)))
