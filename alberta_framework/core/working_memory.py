@@ -20,6 +20,11 @@ import jax.numpy as jnp
 from jax import Array
 from jaxtyping import Float
 
+from alberta_framework.core.update_safety import (
+    floating_tree_is_finite,
+    select_transaction,
+)
+
 
 @dataclass(frozen=True)
 class WorkingMemoryConfig:
@@ -321,47 +326,67 @@ class WorkingMemoryFeaturizer:
         obs = _empty_or_vector(observation, cfg.observation_dim)
         act = _empty_or_vector(action, cfg.action_dim)
         rew = _empty_or_vector(reward, cfg.reward_dim)
-        outer_gate = jnp.clip(jnp.asarray(external_gate, dtype=jnp.float32), 0.0, 1.0)
+        raw_outer_gate = jnp.asarray(external_gate, dtype=jnp.float32)
+        inputs_valid = (
+            jnp.all(jnp.isfinite(obs))
+            & jnp.all(jnp.isfinite(act))
+            & jnp.all(jnp.isfinite(rew))
+            & jnp.all(jnp.isfinite(raw_outer_gate))
+        )
+        safe_obs = jnp.where(inputs_valid, obs, jnp.zeros_like(obs))
+        safe_act = jnp.where(inputs_valid, act, jnp.zeros_like(act))
+        safe_rew = jnp.where(inputs_valid, rew, jnp.zeros_like(rew))
+        outer_gate = jnp.clip(
+            jnp.where(inputs_valid, raw_outer_gate, jnp.zeros_like(raw_outer_gate)),
+            0.0,
+            1.0,
+        )
         threshold = jnp.asarray(cfg.gate_threshold, dtype=jnp.float32)
 
         observation_gate = outer_gate * self._surprise_gate(
             state.observation_traces,
-            obs,
+            safe_obs,
             threshold,
         )
         action_gate = outer_gate * self._surprise_gate(
             state.action_traces,
-            act,
+            safe_act,
             threshold,
         )
         reward_gate = outer_gate * self._surprise_gate(
             state.reward_traces,
-            rew,
+            safe_rew,
             threshold,
         )
 
-        return WorkingMemoryState(
+        candidate = WorkingMemoryState(
             observation_traces=self._update_trace_bank(
                 state.observation_traces,
-                obs,
+                safe_obs,
                 cfg.observation_decay_rates,
                 observation_gate,
             ),
             action_traces=self._update_trace_bank(
                 state.action_traces,
-                act,
+                safe_act,
                 cfg.action_decay_rates,
                 action_gate,
             ),
             reward_traces=self._update_trace_bank(
                 state.reward_traces,
-                rew,
+                safe_rew,
                 cfg.reward_decay_rates,
                 reward_gate,
             ),
             step_count=state.step_count + 1,
             last_gate=jnp.stack([observation_gate, action_gate, reward_gate]),
         )
+        update_applied = (
+            inputs_valid
+            & floating_tree_is_finite(state)
+            & floating_tree_is_finite(candidate)
+        )
+        return select_transaction(update_applied, candidate, state)
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def step(

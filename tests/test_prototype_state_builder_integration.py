@@ -702,14 +702,15 @@ def test_nonfinite_candidate_state_is_atomic_eager_jit_and_scan() -> None:
     next_observation = jnp.asarray([extreme, -extreme], dtype=jnp.float32)
     transition = _transition(state, next_observation)
     assert agent.state_builder is not None
-    candidate_builder, _ = agent.state_builder.update(
+    candidate_builder, candidate_representation = agent.state_builder.update(
         state.state_builder_state,
         next_observation,
         state.current_action,
         transition.reward,
         transition.discount,
     )
-    assert not bool(jnp.all(jnp.isfinite(candidate_builder.parameter_sensitivity)))
+    chex.assert_trees_all_equal(candidate_builder, state.state_builder_state)
+    assert not bool(jnp.all(jnp.isfinite(candidate_representation)))
 
     for result in (
         agent.update_transition(state, transition),
@@ -717,7 +718,7 @@ def test_nonfinite_candidate_state_is_atomic_eager_jit_and_scan() -> None:
     ):
         assert bool(result.transition_diagnostics.post_update_checked)
         assert not bool(result.transition_diagnostics.post_update_finite)
-        assert bool(result.transition_diagnostics.post_update_consistent)
+        assert not bool(result.transition_diagnostics.post_update_consistent)
         assert not bool(result.transition_diagnostics.valid)
         assert bool(result.transition_diagnostics.rejected)
         assert float(result.oak_td_error) == 0.0

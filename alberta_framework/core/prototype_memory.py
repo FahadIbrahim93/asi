@@ -24,7 +24,13 @@ import chex
 import jax
 import jax.numpy as jnp
 from jax import Array
-from jaxtyping import Float
+from jaxtyping import Bool, Float
+
+from alberta_framework.core.update_safety import (
+    floating_tree_is_finite,
+    neutralize_array,
+    select_transaction,
+)
 
 
 @chex.dataclass(frozen=True)
@@ -93,6 +99,7 @@ class PrototypeMemoryUpdateResult:
     predictions: Float[Array, " n_classes"]
     errors: Float[Array, " n_classes"]
     metrics: Float[Array, " 6"]
+    update_applied: Bool[Array, ""]
 
 
 @chex.dataclass(frozen=True)
@@ -102,6 +109,7 @@ class PrototypeMemoryLearningResult:
     state: PrototypeMemoryState
     predictions: Float[Array, "steps n_classes"]
     metrics: Float[Array, "steps 6"]
+    updates_applied: Bool[Array, " steps"]
 
 
 def _validate_config(config: PrototypeMemoryConfig) -> None:
@@ -184,7 +192,8 @@ class PrototypeMemoryLearner:
         any_active = jnp.any(state.counts > 0.0, axis=1)
         logits = jnp.where(any_active, logits, -1e9)
         logits = jnp.where(jnp.any(any_active), logits, jnp.zeros_like(logits))
-        return logits
+        inputs_valid = floating_tree_is_finite(state) & jnp.all(jnp.isfinite(x))
+        return jnp.where(inputs_valid, logits, jnp.full_like(logits, jnp.nan))
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def predict(
@@ -228,7 +237,15 @@ class PrototypeMemoryLearner:
         novelty_threshold: Float[Array, ""],
     ) -> PrototypeMemoryUpdateResult:
         """Perform one causal update with a runtime novelty threshold."""
-        prediction = self.predict(state, observation)
+        observation_arr = jnp.asarray(observation, dtype=jnp.float32)
+        threshold_arr = jnp.asarray(novelty_threshold, dtype=jnp.float32)
+        inputs_valid = jnp.all(jnp.isfinite(observation_arr)) & jnp.isfinite(
+            threshold_arr
+        )
+        safe_observation = jnp.where(
+            inputs_valid, observation_arr, jnp.zeros_like(observation_arr)
+        )
+        prediction = self.predict(state, safe_observation)
         valid_target = self.valid_one_hot_target(target)
         safe_target = jnp.where(jnp.isfinite(target), target, 0.0)
         errors = prediction - safe_target
@@ -246,7 +263,7 @@ class PrototypeMemoryLearner:
             has_used = jnp.any(used)
             has_empty = jnp.any(~used)
             distances = jnp.mean(
-                (current.means[head] - observation[None, :]) ** 2,
+                (current.means[head] - safe_observation[None, :]) ** 2,
                 axis=1,
             )
             used_distances = jnp.where(used, distances, jnp.inf)
@@ -254,8 +271,7 @@ class PrototypeMemoryLearner:
             nearest_distance = used_distances[nearest_slot]
             empty_slot = jnp.argmax((~used).astype(jnp.int32))
             replacement_slot = self._replacement_slot(current, head)
-            threshold = jnp.asarray(novelty_threshold, dtype=jnp.float32)
-            novel = (~has_used) | (nearest_distance > threshold)
+            novel = (~has_used) | (nearest_distance > threshold_arr)
             slot = jnp.where(
                 ~has_used,
                 jnp.array(0, dtype=nearest_slot.dtype),
@@ -267,7 +283,11 @@ class PrototypeMemoryLearner:
             )
             old_mean = current.means[head, slot]
             eta = jnp.asarray(self._config.update_rate, dtype=jnp.float32)
-            new_mean = jnp.where(novel, observation, old_mean + eta * (observation - old_mean))
+            new_mean = jnp.where(
+                novel,
+                safe_observation,
+                old_mean + eta * (safe_observation - old_mean),
+            )
             new_count = jnp.where(novel, 1.0, current.counts[head, slot] + 1.0)
             next_state = PrototypeMemoryState(
                 means=current.means.at[head, slot].set(new_mean),
@@ -290,8 +310,10 @@ class PrototypeMemoryLearner:
                 jnp.array(0.0, dtype=jnp.float32),
             )
 
-        new_state, allocated = jax.lax.cond(valid_target, do_update, skip_update, state)
-        active = jnp.sum(new_state.counts > 0.0).astype(jnp.float32)
+        candidate_state, allocated = jax.lax.cond(
+            valid_target, do_update, skip_update, state
+        )
+        active = jnp.sum(candidate_state.counts > 0.0).astype(jnp.float32)
         metrics = jnp.asarray(
             [
                 mse,
@@ -303,11 +325,20 @@ class PrototypeMemoryLearner:
             ],
             dtype=jnp.float32,
         )
+        update_applied = (
+            inputs_valid
+            & floating_tree_is_finite(state)
+            & floating_tree_is_finite(candidate_state)
+            & jnp.all(jnp.isfinite(prediction))
+            & jnp.all(jnp.isfinite(errors))
+            & jnp.all(jnp.isfinite(metrics))
+        )
         return PrototypeMemoryUpdateResult(
-            state=new_state,
-            predictions=prediction,
-            errors=errors,
-            metrics=metrics,
+            state=select_transaction(update_applied, candidate_state, state),
+            predictions=neutralize_array(update_applied, prediction),
+            errors=neutralize_array(update_applied, errors),
+            metrics=neutralize_array(update_applied, metrics),
+            update_applied=update_applied,
         )
 
     @functools.partial(jax.jit, static_argnums=(0,))
@@ -347,12 +378,16 @@ def run_prototype_memory_arrays(
     def step_fn(
         carry: PrototypeMemoryState,
         batch: tuple[Array, Array],
-    ) -> tuple[PrototypeMemoryState, tuple[Array, Array]]:
+    ) -> tuple[PrototypeMemoryState, tuple[Array, Array, Array]]:
         observation, target = batch
         result = learner.update(carry, observation, target)
-        return result.state, (result.predictions, result.metrics)
+        return result.state, (
+            result.predictions,
+            result.metrics,
+            result.update_applied,
+        )
 
-    final_state, (predictions, metrics) = jax.lax.scan(
+    final_state, (predictions, metrics, updates_applied) = jax.lax.scan(
         step_fn,
         state,
         (observations, targets),
@@ -361,4 +396,5 @@ def run_prototype_memory_arrays(
         state=final_state,
         predictions=predictions,
         metrics=metrics,
+        updates_applied=updates_applied,
     )

@@ -65,6 +65,11 @@ from alberta_framework.core.multi_head_learner import (
 )
 from alberta_framework.core.optimizers import Bounder
 from alberta_framework.core.types import TraceMode
+from alberta_framework.core.update_safety import (
+    floating_tree_is_finite,
+    neutralize_array,
+    select_transaction,
+)
 
 EVIDENCE_LEVEL = "L0"
 SCIENTIFIC_PROMOTION_ALLOWED = False
@@ -185,6 +190,7 @@ class LatentWorldModelUpdateResult:
     encoder_update_applied: Bool[Array, ""]
     encoder_collapse_gated: Bool[Array, ""]
     encoder_gradient_norm: Float[Array, ""]
+    update_applied: Bool[Array, ""]
 
 
 @chex.dataclass(frozen=True)
@@ -207,6 +213,41 @@ class LatentWorldModelLearningResult:
     encoder_updates_applied: Bool[Array, " num_steps"]
     encoder_collapse_gates: Bool[Array, " num_steps"]
     encoder_gradient_norms: Float[Array, " num_steps"]
+    updates_applied: Bool[Array, " num_steps"]
+
+
+def _rollback_multi_head_result(
+    result: MultiHeadMLPUpdateResult,
+    previous_state: MultiHeadMLPState,
+    outer_update_applied: Array,
+) -> MultiHeadMLPUpdateResult:
+    """Make the nested learner result match the committed latent transaction."""
+    requested = ~jnp.isnan(result.errors)
+    return cast(
+        MultiHeadMLPUpdateResult,
+        dataclasses.replace(
+            cast(Any, result),
+            state=select_transaction(outer_update_applied, result.state, previous_state),
+            predictions=neutralize_array(outer_update_applied, result.predictions),
+            errors=jnp.where(
+                requested,
+                neutralize_array(outer_update_applied, result.errors),
+                jnp.nan,
+            ),
+            per_head_metrics=jnp.where(
+                requested[:, None],
+                neutralize_array(outer_update_applied, result.per_head_metrics),
+                jnp.nan,
+            ),
+            trunk_bounding_metric=neutralize_array(
+                outer_update_applied, result.trunk_bounding_metric
+            ),
+            post_step_words=jnp.where(
+                outer_update_applied, result.post_step_words, result.pre_step_words
+            ),
+            update_applied=result.update_applied & outer_update_applied,
+        ),
+    )
 
 
 class LatentWorldModel:
@@ -561,17 +602,53 @@ class LatentWorldModel:
         ``encoder_learning=False`` the computation is exactly the
         fixed-encoder path.
         """
-        prediction = self.predict(state, observation, action)
-        targets = self.targets(state, observation, reward, discount, next_observation)
+        observation_arr = jnp.asarray(observation, dtype=jnp.float32).reshape(
+            (self._config.observation_dim,)
+        )
+        action_arr = jnp.asarray(action)
+        reward_arr = jnp.asarray(reward, dtype=jnp.float32)
+        discount_arr = jnp.asarray(discount, dtype=jnp.float32)
+        next_observation_arr = jnp.asarray(
+            next_observation, dtype=jnp.float32
+        ).reshape((self._config.observation_dim,))
+        inputs_valid = (
+            jnp.all(jnp.isfinite(observation_arr))
+            & jnp.all(jnp.isfinite(action_arr))
+            & jnp.all(jnp.isfinite(reward_arr))
+            & jnp.all(jnp.isfinite(discount_arr))
+            & jnp.all(jnp.isfinite(next_observation_arr))
+        )
+        safe_observation = jnp.where(
+            inputs_valid, observation_arr, jnp.zeros_like(observation_arr)
+        )
+        safe_action = jnp.where(inputs_valid, action_arr, jnp.zeros_like(action_arr))
+        safe_reward = jnp.where(inputs_valid, reward_arr, jnp.zeros_like(reward_arr))
+        safe_discount = jnp.where(
+            inputs_valid, discount_arr, jnp.zeros_like(discount_arr)
+        )
+        safe_next_observation = jnp.where(
+            inputs_valid,
+            next_observation_arr,
+            jnp.zeros_like(next_observation_arr),
+        )
+
+        prediction = self.predict(state, safe_observation, safe_action)
+        targets = self.targets(
+            state,
+            safe_observation,
+            safe_reward,
+            safe_discount,
+            safe_next_observation,
+        )
         learner_result = self._learner.update(
             state.learner_state,
-            self.input_features_from_latent(prediction.latent, action),
+            self.input_features_from_latent(prediction.latent, safe_action),
             targets,
         )
-        target_next_latent = self.encode(state, next_observation)
+        target_next_latent = self.encode(state, safe_next_observation)
         surprise = jnp.mean((prediction.next_latent - target_next_latent) ** 2)
-        reward_error = prediction.reward - jnp.asarray(reward, dtype=jnp.float32)
-        discount_error = prediction.discount - jnp.asarray(discount, dtype=jnp.float32)
+        reward_error = prediction.reward - safe_reward
+        discount_error = prediction.discount - safe_discount
         prediction_error = surprise + reward_error**2 + discount_error**2
 
         collapse_decay = jnp.asarray(self._config.collapse_decay, dtype=jnp.float32)
@@ -620,7 +697,13 @@ class LatentWorldModel:
                 encoder_update_applied,
                 encoder_collapse_gated,
                 encoder_gradient_norm,
-            ) = self._encoder_step(state, observation, action, next_observation, collapse_score)
+            ) = self._encoder_step(
+                state,
+                safe_observation,
+                safe_action,
+                safe_next_observation,
+                collapse_score,
+            )
         else:
             encoder_matrix = state.encoder_matrix
             encoder_bias = state.encoder_bias
@@ -628,7 +711,7 @@ class LatentWorldModel:
             encoder_collapse_gated = jnp.asarray(False, dtype=jnp.bool_)
             encoder_gradient_norm = jnp.asarray(0.0, dtype=jnp.float32)
 
-        new_state = LatentWorldModelState(
+        candidate_state = LatentWorldModelState(
             encoder_matrix=encoder_matrix,
             encoder_bias=encoder_bias,
             learner_state=learner_result.state,
@@ -639,23 +722,60 @@ class LatentWorldModel:
             collapse_score_ema=next_collapse_score_ema,
             step_count=state.step_count + 1,
         )
+        diagnostics_finite = (
+            floating_tree_is_finite(prediction)
+            & jnp.all(jnp.isfinite(target_next_latent))
+            & jnp.all(jnp.isfinite(targets))
+            & jnp.all(jnp.isfinite(learner_result.errors))
+            & jnp.all(jnp.isfinite(learner_result.per_head_metrics))
+            & jnp.isfinite(surprise)
+            & jnp.isfinite(reward_error)
+            & jnp.isfinite(discount_error)
+            & jnp.isfinite(prediction_error)
+            & jnp.isfinite(latent_std_mean)
+            & jnp.isfinite(collapse_score)
+            & jnp.isfinite(encoder_gradient_norm)
+        )
+        update_applied = (
+            inputs_valid
+            & learner_result.update_applied
+            & floating_tree_is_finite(state)
+            & floating_tree_is_finite(candidate_state)
+            & diagnostics_finite
+        )
+        committed_state = select_transaction(update_applied, candidate_state, state)
+        reported_learner_result = _rollback_multi_head_result(
+            learner_result, state.learner_state, update_applied
+        )
+        reported_prediction = LatentWorldModelPrediction(
+            latent=neutralize_array(update_applied, prediction.latent),
+            next_latent=neutralize_array(update_applied, prediction.next_latent),
+            reward=neutralize_array(update_applied, prediction.reward),
+            discount=neutralize_array(update_applied, prediction.discount),
+            raw_predictions=neutralize_array(
+                update_applied, prediction.raw_predictions
+            ),
+        )
         return LatentWorldModelUpdateResult(
-            state=new_state,
-            prediction=prediction,
-            target_next_latent=target_next_latent,
-            targets=targets,
-            errors=learner_result.errors,
-            surprise=surprise,
-            reward_error=reward_error,
-            discount_error=discount_error,
-            prediction_error=prediction_error,
-            latent_std_mean=latent_std_mean,
-            collapse_score=collapse_score,
-            per_head_metrics=learner_result.per_head_metrics,
-            learner_result=learner_result,
-            encoder_update_applied=encoder_update_applied,
-            encoder_collapse_gated=encoder_collapse_gated,
-            encoder_gradient_norm=encoder_gradient_norm,
+            state=committed_state,
+            prediction=reported_prediction,
+            target_next_latent=neutralize_array(update_applied, target_next_latent),
+            targets=neutralize_array(update_applied, targets),
+            errors=reported_learner_result.errors,
+            surprise=neutralize_array(update_applied, surprise),
+            reward_error=neutralize_array(update_applied, reward_error),
+            discount_error=neutralize_array(update_applied, discount_error),
+            prediction_error=neutralize_array(update_applied, prediction_error),
+            latent_std_mean=neutralize_array(update_applied, latent_std_mean),
+            collapse_score=neutralize_array(update_applied, collapse_score),
+            per_head_metrics=reported_learner_result.per_head_metrics,
+            learner_result=reported_learner_result,
+            encoder_update_applied=encoder_update_applied & update_applied,
+            encoder_collapse_gated=encoder_collapse_gated & update_applied,
+            encoder_gradient_norm=neutralize_array(
+                update_applied, encoder_gradient_norm
+            ),
+            update_applied=update_applied,
         )
 
     def _validate_config(self, config: LatentWorldModelConfig) -> None:
@@ -736,6 +856,7 @@ def run_latent_world_model_learning_loop(
             result.encoder_update_applied,
             result.encoder_collapse_gated,
             result.encoder_gradient_norm,
+            result.update_applied,
         )
 
     final_state, (
@@ -754,6 +875,7 @@ def run_latent_world_model_learning_loop(
         encoder_updates_applied,
         encoder_collapse_gates,
         encoder_gradient_norms,
+        updates_applied,
     ) = jax.lax.scan(
         _scan_fn,
         state,
@@ -776,6 +898,7 @@ def run_latent_world_model_learning_loop(
         encoder_updates_applied=encoder_updates_applied,
         encoder_collapse_gates=encoder_collapse_gates,
         encoder_gradient_norms=encoder_gradient_norms,
+        updates_applied=updates_applied,
     )
 
 

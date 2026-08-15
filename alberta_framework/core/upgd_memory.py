@@ -22,13 +22,18 @@ import jax
 import jax.numpy as jnp
 import jax.random as jr
 from jax import Array
-from jaxtyping import Float
+from jaxtyping import Bool, Float
 
 from alberta_framework.core.optimizers import ObGDBounding
 from alberta_framework.core.prototype_memory import (
     PrototypeMemoryConfig,
     PrototypeMemoryLearner,
     PrototypeMemoryState,
+)
+from alberta_framework.core.update_safety import (
+    floating_tree_is_finite,
+    neutralize_array,
+    select_transaction,
 )
 from alberta_framework.core.upgd import UPGDLearner, UPGDState
 
@@ -170,6 +175,7 @@ class UPGDMemoryUpdateResult:
     predictions: Float[Array, " n_heads"]
     errors: Float[Array, " n_heads"]
     metrics: Float[Array, " 10"]
+    update_applied: Bool[Array, ""]
 
 
 @chex.dataclass(frozen=True)
@@ -179,6 +185,7 @@ class UPGDMemoryLearningResult:
     state: UPGDMemoryState
     predictions: Float[Array, "steps n_heads"]
     metrics: Float[Array, "steps 10"]
+    updates_applied: Bool[Array, " steps"]
 
 
 def _validate_config(config: UPGDMemoryConfig) -> None:
@@ -422,19 +429,27 @@ class UPGDMemoryLearner:
         target: Float[Array, " n_heads"],
     ) -> UPGDMemoryUpdateResult:
         """Update UPGD, memory, blend reliability, and novelty threshold."""
-        upgd_prediction = self._upgd.predict(state.upgd_state, observation)
-        memory_prediction = self._memory.predict(state.memory_state, observation)
+        observation_arr = jnp.asarray(observation, dtype=jnp.float32)
+        target_arr = jnp.asarray(target, dtype=jnp.float32)
+        observation_valid = jnp.all(jnp.isfinite(observation_arr))
+        target_valid = jnp.all(~jnp.isinf(target_arr))
+        safe_observation = jnp.where(
+            observation_valid, observation_arr, jnp.zeros_like(observation_arr)
+        )
+        safe_update_target = jnp.where(jnp.isinf(target_arr), jnp.nan, target_arr)
+        upgd_prediction = self._upgd.predict(state.upgd_state, safe_observation)
+        memory_prediction = self._memory.predict(state.memory_state, safe_observation)
         prediction, gate = self._blend_predictions(
             state,
             upgd_prediction,
             memory_prediction,
             include_target_trace=True,
         )
-        safe_target = jnp.where(jnp.isfinite(target), target, 0.0)
+        safe_target = jnp.where(jnp.isfinite(safe_update_target), safe_update_target, 0.0)
         errors = prediction - safe_target
-        blended_loss = _active_mse(prediction, target)
-        upgd_loss = _active_mse(upgd_prediction, target)
-        memory_loss = _active_mse(memory_prediction, target)
+        blended_loss = _active_mse(prediction, safe_update_target)
+        upgd_loss = _active_mse(upgd_prediction, safe_update_target)
+        memory_loss = _active_mse(memory_prediction, safe_update_target)
 
         def blend_loss(memory_logit: Array) -> Array:
             probe_prediction, _probe_gate = self._blend_predictions(
@@ -443,7 +458,7 @@ class UPGDMemoryLearner:
                 memory_prediction,
                 include_target_trace=True,
             )
-            return _active_mse(probe_prediction, target)
+            return _active_mse(probe_prediction, safe_update_target)
 
         dloss_dlogit = jax.grad(blend_loss)(state.memory_logit)
         next_memory_logit = state.memory_logit - (
@@ -456,11 +471,13 @@ class UPGDMemoryLearner:
         next_memory_logit = jnp.clip(next_memory_logit, -8.0, 8.0)
 
         threshold = jnp.exp(state.novelty_log_threshold)
-        upgd_result = self._upgd.update(state.upgd_state, observation, target)
+        upgd_result = self._upgd.update(
+            state.upgd_state, safe_observation, safe_update_target
+        )
         memory_result = self._memory.update_with_novelty_threshold(
             state.memory_state,
-            observation,
-            target,
+            safe_observation,
+            safe_update_target,
             threshold,
         )
         allocated = memory_result.metrics[5]
@@ -480,7 +497,7 @@ class UPGDMemoryLearner:
             jnp.log(jnp.asarray(self._config.max_novelty_threshold, dtype=jnp.float32)),
         )
 
-        next_state = UPGDMemoryState(
+        candidate_state = UPGDMemoryState(
             upgd_state=upgd_result.state,
             memory_state=memory_result.state,
             memory_logit=next_memory_logit,
@@ -506,11 +523,22 @@ class UPGDMemoryLearner:
             ],
             dtype=jnp.float32,
         )
+        update_applied = (
+            observation_valid
+            & target_valid
+            & memory_result.update_applied
+            & floating_tree_is_finite(state)
+            & floating_tree_is_finite(candidate_state)
+            & jnp.all(jnp.isfinite(prediction))
+            & jnp.all(jnp.isfinite(errors))
+            & jnp.all(jnp.isfinite(metrics))
+        )
         return UPGDMemoryUpdateResult(
-            state=next_state,
-            predictions=prediction,
-            errors=errors,
-            metrics=metrics,
+            state=select_transaction(update_applied, candidate_state, state),
+            predictions=neutralize_array(update_applied, prediction),
+            errors=neutralize_array(update_applied, errors),
+            metrics=neutralize_array(update_applied, metrics),
+            update_applied=update_applied,
         )
 
 
@@ -530,12 +558,16 @@ def run_upgd_memory_arrays(
     def step_fn(
         carry: UPGDMemoryState,
         batch: tuple[Array, Array],
-    ) -> tuple[UPGDMemoryState, tuple[Array, Array]]:
+    ) -> tuple[UPGDMemoryState, tuple[Array, Array, Array]]:
         observation, target = batch
         result = learner.update(carry, observation, target)
-        return result.state, (result.predictions, result.metrics)
+        return result.state, (
+            result.predictions,
+            result.metrics,
+            result.update_applied,
+        )
 
-    final_state, (predictions, metrics) = jax.lax.scan(
+    final_state, (predictions, metrics, updates_applied) = jax.lax.scan(
         step_fn,
         state,
         (observations, targets),
@@ -544,4 +576,5 @@ def run_upgd_memory_arrays(
         state=final_state,
         predictions=predictions,
         metrics=metrics,
+        updates_applied=updates_applied,
     )

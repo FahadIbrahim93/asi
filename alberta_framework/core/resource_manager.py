@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import functools
 import math
+import struct
 from typing import Any
 
 import chex
@@ -36,7 +37,37 @@ import jax
 import jax.numpy as jnp
 import jax.random as jr
 from jax import Array
-from jaxtyping import Float
+from jaxtyping import Bool, Float
+
+from alberta_framework.core.update_safety import (
+    floating_tree_is_finite,
+    neutralize_array,
+    select_transaction,
+)
+
+
+def _validated_cost_weight(value: float) -> float:
+    """Return a non-negative weight that stays finite and nonzero in float32."""
+    numeric = float(value)
+    if not math.isfinite(numeric) or numeric < 0.0:
+        raise ValueError("cost_weight must be finite and non-negative")
+    try:
+        float32_value = struct.unpack("!f", struct.pack("!f", numeric))[0]
+    except OverflowError as error:
+        raise ValueError("cost_weight must be float32-representable") from error
+    if not math.isfinite(float32_value) or (numeric > 0.0 and float32_value <= 0.0):
+        raise ValueError("cost_weight must be float32-representable")
+    return numeric
+
+
+def _weighted_cost_terms(costs: Array, cost_weight: float) -> tuple[Array, Array]:
+    """Return finite cost terms and whether each requested product is valid."""
+    weight = jnp.asarray(cost_weight, dtype=jnp.float32)
+    weighted = weight * costs
+    used = weight != 0.0
+    valid = (~used) | (jnp.isfinite(costs) & jnp.isfinite(weighted))
+    terms = jnp.where(used & valid, weighted, jnp.zeros_like(weighted))
+    return terms, valid
 
 
 def optimal_hedge_learning_rate(
@@ -134,6 +165,8 @@ class LearnedResourceManagerUpdateResult:
     weights: Float[Array, " n_actions"]
     adjusted_losses: Float[Array, " n_actions"]
     advantages: Float[Array, " n_actions"]
+    valid_actions: Bool[Array, " n_actions"]
+    update_applied: Bool[Array, ""]
 
 
 class LearnedResourceManager:
@@ -196,8 +229,7 @@ class LearnedResourceManager:
             raise ValueError("exploration must be in [0, 1)")
         if not 0.0 <= loss_decay < 1.0:
             raise ValueError("loss_decay must be in [0, 1)")
-        if cost_weight < 0.0:
-            raise ValueError("cost_weight must be non-negative")
+        validated_cost_weight = _validated_cost_weight(cost_weight)
         if advantage_clip <= 0.0:
             raise ValueError("advantage_clip must be positive")
 
@@ -207,7 +239,7 @@ class LearnedResourceManager:
         self._discount = float(discount)
         self._exploration = float(exploration)
         self._loss_decay = float(loss_decay)
-        self._cost_weight = float(cost_weight)
+        self._cost_weight = validated_cost_weight
         self._advantage_clip = float(advantage_clip)
 
     @property
@@ -307,20 +339,24 @@ class LearnedResourceManager:
         """
         context = jnp.asarray(context_id, dtype=jnp.int32)
         losses = jnp.asarray(losses, dtype=jnp.float32)
-        finite = jnp.isfinite(losses)
-        safe_losses = jnp.where(finite, losses, 0.0)
+        finite_losses = jnp.isfinite(losses)
+        safe_losses = jnp.where(finite_losses, losses, 0.0)
         costs = (
             jnp.zeros_like(safe_losses)
             if resource_costs is None
             else jnp.asarray(resource_costs, dtype=jnp.float32)
         )
-        adjusted = safe_losses + jnp.asarray(self._cost_weight, dtype=jnp.float32) * costs
+        cost_terms, costs_valid = _weighted_cost_terms(costs, self._cost_weight)
+        valid_actions = finite_losses & costs_valid
+        adjusted = jnp.where(valid_actions, safe_losses + cost_terms, 0.0)
 
         weights = self.weights(state, context)
-        finite_weight_sum = jnp.maximum(jnp.sum(jnp.where(finite, weights, 0.0)), 1e-12)
-        masked_weights = jnp.where(finite, weights / finite_weight_sum, 0.0)
+        finite_weight_sum = jnp.maximum(
+            jnp.sum(jnp.where(valid_actions, weights, 0.0)), 1e-12
+        )
+        masked_weights = jnp.where(valid_actions, weights / finite_weight_sum, 0.0)
         baseline = jnp.sum(masked_weights * adjusted)
-        advantages = jnp.where(finite, baseline - adjusted, 0.0)
+        advantages = jnp.where(valid_actions, baseline - adjusted, 0.0)
         advantages = jnp.clip(
             advantages,
             -self._advantage_clip,
@@ -337,24 +373,33 @@ class LearnedResourceManager:
 
         old_ema = state.loss_ema[context]
         new_ema = jnp.where(
-            finite,
+            valid_actions,
             self._loss_decay * old_ema + (1.0 - self._loss_decay) * adjusted,
             old_ema,
         )
         new_loss_ema = state.loss_ema.at[context].set(new_ema)
-        new_counts = state.action_counts.at[context].add(finite.astype(jnp.float32))
+        new_counts = state.action_counts.at[context].add(valid_actions.astype(jnp.float32))
 
-        new_state = LearnedResourceManagerState(  # type: ignore[call-arg]
+        candidate_state = LearnedResourceManagerState(  # type: ignore[call-arg]
             log_weights=new_log_weights,
             loss_ema=new_loss_ema,
             action_counts=new_counts,
             step_count=state.step_count + 1,
         )
+        update_applied = (
+            floating_tree_is_finite(state)
+            & floating_tree_is_finite(candidate_state)
+            & jnp.all(jnp.isfinite(weights))
+            & jnp.all(jnp.isfinite(adjusted))
+            & jnp.all(jnp.isfinite(advantages))
+        )
         return LearnedResourceManagerUpdateResult(  # type: ignore[call-arg]
-            state=new_state,
-            weights=weights,
-            adjusted_losses=adjusted,
-            advantages=advantages,
+            state=select_transaction(update_applied, candidate_state, state),
+            weights=neutralize_array(update_applied, weights),
+            adjusted_losses=neutralize_array(update_applied, adjusted),
+            advantages=neutralize_array(update_applied, advantages),
+            valid_actions=valid_actions & update_applied,
+            update_applied=update_applied,
         )
 
 
@@ -397,6 +442,8 @@ class GeneratorMetaResourceUpdateResult:
     weights: Float[Array, " n_policies"]
     adjusted_rewards: Float[Array, " n_policies"]
     advantages: Float[Array, " n_policies"]
+    valid_actions: Bool[Array, " n_policies"]
+    update_applied: Bool[Array, ""]
 
 
 class GeneratorMetaResourceManager:
@@ -477,8 +524,7 @@ class GeneratorMetaResourceManager:
             raise ValueError("exploration must be in [0, 1)")
         if not 0.0 <= reward_decay < 1.0:
             raise ValueError("reward_decay must be in [0, 1)")
-        if cost_weight < 0.0:
-            raise ValueError("cost_weight must be non-negative")
+        validated_cost_weight = _validated_cost_weight(cost_weight)
         if advantage_clip <= 0.0:
             raise ValueError("advantage_clip must be positive")
         if update_rule not in {"hedge", "exp3"}:
@@ -510,7 +556,7 @@ class GeneratorMetaResourceManager:
         self._discount = float(discount)
         self._exploration = float(exploration)
         self._reward_decay = float(reward_decay)
-        self._cost_weight = float(cost_weight)
+        self._cost_weight = validated_cost_weight
         self._advantage_clip = float(advantage_clip)
         self._update_rule = update_rule
         self._initial_preferences = (
@@ -671,23 +717,32 @@ class GeneratorMetaResourceManager:
             if resource_costs is None
             else jnp.asarray(resource_costs, dtype=jnp.float32)
         )
-        adjusted = safe_rewards - jnp.asarray(self._cost_weight, dtype=jnp.float32) * costs
+        cost_terms, costs_valid = _weighted_cost_terms(costs, self._cost_weight)
+        finite = finite & costs_valid
+        adjusted = jnp.where(finite, safe_rewards - cost_terms, 0.0)
 
         weights = self.weights(state, context)
         finite_weight_sum = jnp.maximum(jnp.sum(jnp.where(finite, weights, 0.0)), 1e-12)
         masked_weights = jnp.where(finite, weights / finite_weight_sum, 0.0)
         baseline = jnp.sum(masked_weights * adjusted)
+        selection_input_valid = jnp.asarray(True, dtype=jnp.bool_)
         if self._update_rule == "exp3":
             if selected_action is None:
                 raise ValueError("selected_action is required for update_rule='exp3'")
-            action = jnp.asarray(selected_action, dtype=jnp.int32)
-            probability = (
+            requested_action = jnp.asarray(selected_action, dtype=jnp.int32)
+            action_valid = (requested_action >= 0) & (requested_action < self.n_policies)
+            action = jnp.where(action_valid, requested_action, 0)
+            raw_probability = (
                 weights[action]
                 if selected_probability is None
                 else jnp.asarray(selected_probability, dtype=jnp.float32)
             )
-            probability = jnp.maximum(probability, 1e-6)
-            selected_finite = finite[action]
+            probability_valid = jnp.all(jnp.isfinite(raw_probability))
+            probability = jnp.maximum(
+                jnp.where(probability_valid, raw_probability, 1.0), 1e-6
+            )
+            selection_input_valid = action_valid & probability_valid
+            selected_finite = finite[action] & selection_input_valid
             reward_hat = jnp.where(
                 selected_finite,
                 adjusted[action] / probability,
@@ -720,15 +775,25 @@ class GeneratorMetaResourceManager:
         new_reward_ema = state.reward_ema.at[context].set(new_ema)
         new_counts = state.action_counts.at[context].add(finite.astype(jnp.float32))
 
-        new_state = GeneratorMetaResourceManagerState(  # type: ignore[call-arg]
+        candidate_state = GeneratorMetaResourceManagerState(  # type: ignore[call-arg]
             log_weights=new_log_weights,
             reward_ema=new_reward_ema,
             action_counts=new_counts,
             step_count=state.step_count + 1,
         )
+        update_applied = (
+            selection_input_valid
+            & floating_tree_is_finite(state)
+            & floating_tree_is_finite(candidate_state)
+            & jnp.all(jnp.isfinite(weights))
+            & jnp.all(jnp.isfinite(adjusted))
+            & jnp.all(jnp.isfinite(advantages))
+        )
         return GeneratorMetaResourceUpdateResult(  # type: ignore[call-arg]
-            state=new_state,
-            weights=weights,
-            adjusted_rewards=adjusted,
-            advantages=advantages,
+            state=select_transaction(update_applied, candidate_state, state),
+            weights=neutralize_array(update_applied, weights),
+            adjusted_rewards=neutralize_array(update_applied, adjusted),
+            advantages=neutralize_array(update_applied, advantages),
+            valid_actions=finite & update_applied,
+            update_applied=update_applied,
         )

@@ -360,19 +360,35 @@ def score_dream_candidates(
     if valid_arr.shape != surprise_arr.shape:
         raise ValueError("valid must match surprises")
 
+    inputs_finite = (
+        jnp.isfinite(surprise_arr)
+        & jnp.isfinite(utility_arr)
+        & jnp.isfinite(confidence_arr)
+        & jnp.isfinite(error_arr)
+    )
     accepted = (
         valid_arr
+        & inputs_finite
         & (surprise_arr >= jnp.asarray(cfg.min_surprise, dtype=jnp.float32))
         & (utility_arr >= jnp.asarray(cfg.min_utility, dtype=jnp.float32))
         & (confidence_arr >= jnp.asarray(cfg.min_confidence, dtype=jnp.float32))
         & (error_arr <= jnp.asarray(cfg.max_model_error, dtype=jnp.float32))
     )
+    def weighted_term(weight: float, values: Array) -> Array:
+        weight_arr = jnp.asarray(weight, dtype=jnp.float32)
+        return jnp.where(
+            weight_arr == 0.0,
+            jnp.zeros_like(values),
+            weight_arr * values,
+        )
+
     raw_scores = (
-        cfg.surprise_weight * surprise_arr
-        + cfg.utility_weight * utility_arr
-        + cfg.confidence_weight * confidence_arr
-        - cfg.model_error_weight * error_arr
+        weighted_term(cfg.surprise_weight, surprise_arr)
+        + weighted_term(cfg.utility_weight, utility_arr)
+        + weighted_term(cfg.confidence_weight, confidence_arr)
+        - weighted_term(cfg.model_error_weight, error_arr)
     )
+    accepted = accepted & jnp.isfinite(raw_scores)
     scores = jnp.where(accepted, raw_scores, -jnp.inf)
     selected_indices = jnp.argsort(-scores)[: cfg.max_items].astype(jnp.int32)
     selected_accepted = accepted[selected_indices]

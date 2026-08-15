@@ -16,13 +16,13 @@ from __future__ import annotations
 
 import dataclasses
 import functools
-from typing import Any
+from typing import Any, cast
 
 import chex
 import jax
 import jax.numpy as jnp
 from jax import Array
-from jaxtyping import Float
+from jaxtyping import Bool, Float
 
 from alberta_framework.core.multi_head_learner import (
     AnyOptimizer,
@@ -37,6 +37,11 @@ from alberta_framework.core.normalizers import (
 )
 from alberta_framework.core.optimizers import Bounder
 from alberta_framework.core.types import TraceMode
+from alberta_framework.core.update_safety import (
+    floating_tree_is_finite,
+    neutralize_array,
+    select_transaction,
+)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -154,6 +159,7 @@ class WorldModelUpdateResult:
     next_observation_errors: Float[Array, " observation_dim"]
     discount_error: Float[Array, ""]
     learner_result: MultiHeadMLPUpdateResult
+    update_applied: Bool[Array, ""]
 
 
 @chex.dataclass(frozen=True)
@@ -173,6 +179,68 @@ class ActionConditionedWorldModelLearningResult:
     next_observation_errors: Float[Array, "num_steps observation_dim"]
     discount_errors: Float[Array, " num_steps"]
     per_head_metrics: Float[Array, "num_steps model_heads metrics"]
+    updates_applied: Bool[Array, " num_steps"]
+
+
+def _rollback_multi_head_result(
+    result: MultiHeadMLPUpdateResult,
+    previous_state: MultiHeadMLPState,
+    outer_update_applied: Array,
+) -> MultiHeadMLPUpdateResult:
+    """Make a nested learner result describe the outer committed transaction."""
+    requested = ~jnp.isnan(result.errors)
+    reported_errors = jnp.where(
+        requested,
+        neutralize_array(outer_update_applied, result.errors),
+        jnp.nan,
+    )
+    reported_metrics = jnp.where(
+        requested[:, None],
+        neutralize_array(outer_update_applied, result.per_head_metrics),
+        jnp.nan,
+    )
+    return cast(
+        MultiHeadMLPUpdateResult,
+        dataclasses.replace(
+            cast(Any, result),
+            state=select_transaction(outer_update_applied, result.state, previous_state),
+            predictions=neutralize_array(outer_update_applied, result.predictions),
+            errors=reported_errors,
+            per_head_metrics=reported_metrics,
+            trunk_bounding_metric=neutralize_array(
+                outer_update_applied, result.trunk_bounding_metric
+            ),
+            post_step_words=jnp.where(
+                outer_update_applied, result.post_step_words, result.pre_step_words
+            ),
+            update_applied=result.update_applied & outer_update_applied,
+        ),
+    )
+
+
+def _action_world_model_state_is_valid(
+    state: ActionConditionedWorldModelState,
+) -> Bool[Array, ""]:
+    """Accept either the intentional empty-bound sentinels or finite learned bounds."""
+    finite_bounds = (
+        jnp.all(jnp.isfinite(state.observation_min))
+        & jnp.all(jnp.isfinite(state.observation_max))
+        & jnp.isfinite(state.reward_min)
+        & jnp.isfinite(state.reward_max)
+    )
+    empty_bounds = (
+        (state.step_count == 0)
+        & jnp.all(jnp.isposinf(state.observation_min))
+        & jnp.all(jnp.isneginf(state.observation_max))
+        & jnp.isposinf(state.reward_min)
+        & jnp.isneginf(state.reward_max)
+    )
+    return (
+        floating_tree_is_finite(state.learner_state)
+        & jnp.isfinite(state.model_error_ema)
+        & (state.step_count >= 0)
+        & (finite_bounds | empty_bounds)
+    )
 
 
 class ActionConditionedWorldModel:
@@ -420,21 +488,46 @@ class ActionConditionedWorldModel:
             next_observation = discount_or_next_observation
         else:
             discount = discount_or_next_observation
-        prediction = self.predict(state, observation, action)
-        targets = self.targets(observation, reward, discount, next_observation)
-        inputs = self.input_features(observation, action)
-        learner_result = self._learner.update(state.learner_state, inputs, targets)
 
+        obs = jnp.asarray(observation, dtype=jnp.float32).reshape(
+            (self._config.observation_dim,)
+        )
+        action_arr = jnp.asarray(action)
+        reward_arr = jnp.asarray(reward, dtype=jnp.float32)
+        discount_arr = jnp.asarray(discount, dtype=jnp.float32)
         next_obs = jnp.asarray(next_observation, dtype=jnp.float32).reshape(
             (self._config.observation_dim,)
         )
-        reward_arr = jnp.asarray(reward, dtype=jnp.float32)
-        discount_arr = jnp.asarray(discount, dtype=jnp.float32)
+        inputs_valid = (
+            jnp.all(jnp.isfinite(obs))
+            & jnp.all(jnp.isfinite(action_arr))
+            & jnp.all(jnp.isfinite(reward_arr))
+            & jnp.all(jnp.isfinite(discount_arr))
+            & jnp.all(jnp.isfinite(next_obs))
+        )
+        safe_obs = jnp.where(inputs_valid, obs, jnp.zeros_like(obs))
+        safe_action = jnp.where(inputs_valid, action_arr, jnp.zeros_like(action_arr))
+        safe_reward = jnp.where(inputs_valid, reward_arr, jnp.zeros_like(reward_arr))
+        safe_discount = jnp.where(
+            inputs_valid, discount_arr, jnp.zeros_like(discount_arr)
+        )
+        safe_next_obs = jnp.where(
+            inputs_valid, next_obs, jnp.zeros_like(next_obs)
+        )
 
-        observation_mse = jnp.mean((prediction.next_observation - next_obs) ** 2)
-        reward_error = prediction.reward - reward_arr
-        discount_error = prediction.discount - discount_arr
-        next_observation_errors = prediction.next_observation - next_obs
+        prediction = self.predict(state, safe_obs, safe_action)
+        targets = self.targets(
+            safe_obs, safe_reward, safe_discount, safe_next_obs
+        )
+        inputs = self.input_features(safe_obs, safe_action)
+        learner_result = self._learner.update(state.learner_state, inputs, targets)
+
+        observation_mse = jnp.mean(
+            (prediction.next_observation - safe_next_obs) ** 2
+        )
+        reward_error = prediction.reward - safe_reward
+        discount_error = prediction.discount - safe_discount
+        next_observation_errors = prediction.next_observation - safe_next_obs
         prediction_error = observation_mse + reward_error**2 + discount_error**2
 
         error_decay = jnp.asarray(self._config.error_decay, dtype=jnp.float32)
@@ -444,33 +537,66 @@ class ActionConditionedWorldModel:
             error_decay * state.model_error_ema + (1.0 - error_decay) * prediction_error,
         )
 
-        obs = jnp.asarray(observation, dtype=jnp.float32).reshape(
-            (self._config.observation_dim,)
-        )
-        observed_stack_min = jnp.minimum(obs, next_obs)
-        observed_stack_max = jnp.maximum(obs, next_obs)
-        new_state = ActionConditionedWorldModelState(
+        observed_stack_min = jnp.minimum(safe_obs, safe_next_obs)
+        observed_stack_max = jnp.maximum(safe_obs, safe_next_obs)
+        candidate_state = ActionConditionedWorldModelState(
             learner_state=learner_result.state,
             observation_min=jnp.minimum(state.observation_min, observed_stack_min),
             observation_max=jnp.maximum(state.observation_max, observed_stack_max),
-            reward_min=jnp.minimum(state.reward_min, reward_arr),
-            reward_max=jnp.maximum(state.reward_max, reward_arr),
+            reward_min=jnp.minimum(state.reward_min, safe_reward),
+            reward_max=jnp.maximum(state.reward_max, safe_reward),
             model_error_ema=next_error_ema,
             step_count=state.step_count + 1,
         )
 
+        diagnostics_finite = (
+            floating_tree_is_finite(prediction)
+            & jnp.all(jnp.isfinite(targets))
+            & jnp.all(jnp.isfinite(learner_result.errors))
+            & jnp.all(jnp.isfinite(learner_result.per_head_metrics))
+            & jnp.isfinite(prediction_error)
+            & jnp.isfinite(observation_mse)
+            & jnp.isfinite(reward_error)
+            & jnp.all(jnp.isfinite(next_observation_errors))
+            & jnp.isfinite(discount_error)
+        )
+        update_applied = (
+            inputs_valid
+            & learner_result.update_applied
+            & _action_world_model_state_is_valid(state)
+            & floating_tree_is_finite(candidate_state)
+            & diagnostics_finite
+        )
+        committed_state = select_transaction(update_applied, candidate_state, state)
+        reported_learner_result = _rollback_multi_head_result(
+            learner_result, state.learner_state, update_applied
+        )
+        reported_prediction = WorldModelPrediction(
+            next_observation=neutralize_array(
+                update_applied, prediction.next_observation
+            ),
+            reward=neutralize_array(update_applied, prediction.reward),
+            raw_predictions=neutralize_array(
+                update_applied, prediction.raw_predictions
+            ),
+            discount=neutralize_array(update_applied, prediction.discount),
+        )
+
         return WorldModelUpdateResult(
-            state=new_state,
-            prediction=prediction,
-            targets=targets,
-            errors=learner_result.errors,
-            per_head_metrics=learner_result.per_head_metrics,
-            prediction_error=prediction_error,
-            observation_mse=observation_mse,
-            reward_error=reward_error,
-            next_observation_errors=next_observation_errors,
-            discount_error=discount_error,
-            learner_result=learner_result,
+            state=committed_state,
+            prediction=reported_prediction,
+            targets=neutralize_array(update_applied, targets),
+            errors=reported_learner_result.errors,
+            per_head_metrics=reported_learner_result.per_head_metrics,
+            prediction_error=neutralize_array(update_applied, prediction_error),
+            observation_mse=neutralize_array(update_applied, observation_mse),
+            reward_error=neutralize_array(update_applied, reward_error),
+            next_observation_errors=neutralize_array(
+                update_applied, next_observation_errors
+            ),
+            discount_error=neutralize_array(update_applied, discount_error),
+            learner_result=reported_learner_result,
+            update_applied=update_applied,
         )
 
     def _validate_config(self, config: ActionConditionedWorldModelConfig) -> None:
@@ -534,6 +660,7 @@ def run_action_conditioned_world_model_learning_loop(
             result.next_observation_errors,
             result.discount_error,
             result.per_head_metrics,
+            result.update_applied,
         )
 
     final_state, (
@@ -549,6 +676,7 @@ def run_action_conditioned_world_model_learning_loop(
         next_observation_errors,
         discount_errors,
         per_head_metrics,
+        updates_applied,
     ) = jax.lax.scan(
         _scan_fn,
         state,
@@ -568,6 +696,7 @@ def run_action_conditioned_world_model_learning_loop(
         next_observation_errors=next_observation_errors,
         discount_errors=discount_errors,
         per_head_metrics=per_head_metrics,
+        updates_applied=updates_applied,
     )
 
 
@@ -643,6 +772,7 @@ class WorldModelLearningResult:
     reward_errors: Float[Array, " num_steps"]
     next_observation_errors: Float[Array, "num_steps observation_dim"]
     per_head_metrics: Float[Array, "num_steps model_heads 3"]
+    updates_applied: Bool[Array, " num_steps"]
 
 
 class OneStepWorldModel:
@@ -832,22 +962,52 @@ class OneStepWorldModel:
         reward_error = prediction.reward - reward_arr
         observation_mse = jnp.nanmean(next_observation_errors**2)
         prediction_error = jnp.nanmean(learner_result.errors**2)
-        new_state = WorldModelState(
+        candidate_state = WorldModelState(
             learner_state=learner_result.state,
             step_count=state.step_count + 1,
         )
+        update_applied = (
+            learner_result.update_applied
+            & floating_tree_is_finite(state)
+            & floating_tree_is_finite(candidate_state)
+        )
+        new_state = select_transaction(update_applied, candidate_state, state)
+        reported_learner_result = _rollback_multi_head_result(
+            learner_result, state.learner_state, update_applied
+        )
+        reported_prediction = WorldModelPrediction(
+            next_observation=neutralize_array(
+                update_applied, prediction.next_observation
+            ),
+            reward=neutralize_array(update_applied, prediction.reward),
+            raw_predictions=neutralize_array(
+                update_applied, prediction.raw_predictions
+            ),
+            discount=prediction.discount,
+        )
+        reported_targets = jnp.where(
+            jnp.isnan(targets),
+            jnp.nan,
+            neutralize_array(update_applied, targets),
+        )
+        reported_next_errors = jnp.where(
+            jnp.isnan(next_observation_errors),
+            jnp.nan,
+            neutralize_array(update_applied, next_observation_errors),
+        )
         return WorldModelUpdateResult(
             state=new_state,
-            prediction=prediction,
-            targets=targets,
-            errors=learner_result.errors,
-            per_head_metrics=learner_result.per_head_metrics,
-            prediction_error=prediction_error,
-            observation_mse=observation_mse,
-            reward_error=reward_error,
-            next_observation_errors=next_observation_errors,
+            prediction=reported_prediction,
+            targets=reported_targets,
+            errors=reported_learner_result.errors,
+            per_head_metrics=reported_learner_result.per_head_metrics,
+            prediction_error=jnp.where(update_applied, prediction_error, 0.0),
+            observation_mse=jnp.where(update_applied, observation_mse, 0.0),
+            reward_error=jnp.where(update_applied, reward_error, 0.0),
+            next_observation_errors=reported_next_errors,
             discount_error=jnp.array(jnp.nan, dtype=jnp.float32),
-            learner_result=learner_result,
+            learner_result=reported_learner_result,
+            update_applied=update_applied,
         )
 
     def _validate_config(self, config: WorldModelConfig) -> None:
@@ -876,7 +1036,7 @@ def run_world_model_learning_loop(
     def step_fn(
         carry: WorldModelState,
         inputs: tuple[Array, Array, Array, Array],
-    ) -> tuple[WorldModelState, tuple[Array, Array, Array, Array, Array]]:
+    ) -> tuple[WorldModelState, tuple[Array, Array, Array, Array, Array, Array]]:
         obs, action, reward, next_obs = inputs
         result = model.update(carry, obs, action, reward, next_obs)
         return result.state, (
@@ -885,6 +1045,7 @@ def run_world_model_learning_loop(
             result.reward_error,
             result.next_observation_errors,
             result.per_head_metrics,
+            result.update_applied,
         )
 
     final_state, (
@@ -893,6 +1054,7 @@ def run_world_model_learning_loop(
         reward_errors,
         next_observation_errors,
         per_head_metrics,
+        updates_applied,
     ) = jax.lax.scan(step_fn, state, (observations, actions, rewards, next_observations))
     return WorldModelLearningResult(
         state=final_state,
@@ -901,4 +1063,5 @@ def run_world_model_learning_loop(
         reward_errors=reward_errors,
         next_observation_errors=next_observation_errors,
         per_head_metrics=per_head_metrics,
+        updates_applied=updates_applied,
     )
