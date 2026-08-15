@@ -354,8 +354,10 @@ class TestPairedTests:
 class TestIdenticalWilcoxonRejection:
     """All-zero paired differences fail closed before version-dependent SciPy behavior."""
 
-    def test_wilcoxon_rejects_identical_samples_without_warning(self) -> None:
-        values = [0.91, 0.88, 0.95]
+    @pytest.mark.parametrize("values", [[0.91], [0.91, 0.88, 0.95]])
+    def test_wilcoxon_rejects_identical_samples_without_warning(
+        self, values: list[float]
+    ) -> None:
         with warnings.catch_warnings():
             warnings.simplefilter("error")
             with pytest.raises(

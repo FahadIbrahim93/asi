@@ -405,14 +405,14 @@ def wilcoxon_comparison(
             f"Wilcoxon signed-rank test requires equal-length samples "
             f"(got {len(a)} and {len(b)})"
         )
-    if len(a) < 2:
-        raise ValueError(
-            f"Wilcoxon signed-rank test requires at least 2 pairs (got {len(a)})"
-        )
-    if np.array_equal(a, b):
+    if a.size > 0 and np.array_equal(a, b):
         raise ValueError(
             f"Paired comparison {method_a!r} vs {method_b!r} has identical "
             "samples; the Wilcoxon signed-rank statistic is undefined"
+        )
+    if len(a) < 2:
+        raise ValueError(
+            f"Wilcoxon signed-rank test requires at least 2 pairs (got {len(a)})"
         )
 
     try:
