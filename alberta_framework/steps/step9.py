@@ -287,6 +287,34 @@ def init_step9_state(
     )
 
 
+def _update_control_with_linear_rng(
+    agent: DifferentialSARSAAgent,
+    state: DifferentialSARSAState,
+    reward: Array,
+    next_observation: Array,
+    discount: Array,
+) -> DifferentialSARSAUpdateResult:
+    """Apply one control backup while advancing its RNG on rejection.
+
+    ``DifferentialSARSAAgent.update`` rolls its whole state back when a
+    transaction is rejected, including the key consumed while selecting the
+    proposed next action.  Select that action explicitly so the advanced key
+    can remain linear even when the numerical update is rejected.
+    """
+    next_action, next_key = agent.select_action(state, next_observation)
+    advanced_state = state.replace(rng_key=next_key)
+    return cast(
+        DifferentialSARSAUpdateResult,
+        agent.update(
+            advanced_state,
+            reward,
+            next_observation,
+            next_action=next_action,
+            discount=discount,
+        ),
+    )
+
+
 @functools.partial(jax.jit, static_argnums=(0, 1, 2, 3))
 def step9_update(
     config: Step9DreamingConfig,
@@ -303,7 +331,8 @@ def step9_update(
     error EMA then gates each dream in the planning budget: a dream is
     accepted when ``model_state.step_count >= dreaming_warmup_steps`` AND
     ``model_state.model_error_ema <= dreaming_max_model_error`` AND the
-    predicted transition is numerically finite.
+    predicted transition is numerically finite AND every rollout control
+    transaction applies.
     """
     real_discount = jnp.asarray(config.model_gamma, dtype=jnp.float32)
     real_model_result = model.update(
@@ -314,12 +343,26 @@ def step9_update(
         real_discount,
         next_observation,
     )
-    real_control_result = agent.update(
-        state.control_state,
-        reward,
-        next_observation,
-        discount=real_discount,
-    )
+    if config.planning_budget == 0:
+        # The real-only lane remains the exact pre-dreaming control path: no
+        # additional selection or split is introduced for a zero budget.
+        real_control_result = agent.update(
+            state.control_state,
+            reward,
+            next_observation,
+            discount=real_discount,
+        )
+    else:
+        # A rejected real update must not hand its already-consumed parent key
+        # to the dream scheduler, whose four-way split would reproduce the
+        # failed action selection's sibling keys.
+        real_control_result = _update_control_with_linear_rng(
+            agent,
+            state.control_state,
+            reward,
+            next_observation,
+            real_discount,
+        )
     control_after_real = real_control_result.state
     model_state = cast(ActionConditionedWorldModelState, real_model_result.state)
     behavior_model = BehaviorModel(
@@ -344,11 +387,13 @@ def step9_update(
     dream_gate = warmup_ready & error_ok
 
     def dream_step(
-        carry: tuple[DifferentialSARSAState, BehaviorModelState, Array],
+        carry: tuple[DifferentialSARSAState, BehaviorModelState],
         _: Array,
-    ) -> tuple[tuple[DifferentialSARSAState, BehaviorModelState, Array], tuple[Array, Array]]:
-        ctrl_state, behavior_state, key = carry
-        key, candidate_key = jr.split(key)
+    ) -> tuple[tuple[DifferentialSARSAState, BehaviorModelState], tuple[Array, Array]]:
+        ctrl_state, behavior_state = carry
+        next_master_key, candidate_key, behavior_rollout_key, control_rollout_key = (
+            jr.split(ctrl_state.rng_key, 4)
+        )
         candidate_keys = jr.split(candidate_key, config.dream_candidate_count)
 
         def candidate_step(candidate_item: tuple[Array, Array]) -> tuple[Array, ...]:
@@ -414,8 +459,11 @@ def step9_update(
         selected_index = selection.selected_indices[0]
         anchor_obs = candidate_anchors[selected_index]
         action = candidate_actions[selected_index]
+        initial_control_state = ctrl_state.replace(
+            rng_key=control_rollout_key
+        )
         initial_behavior_state = behavior_state.replace(
-            rng_key=key
+            rng_key=behavior_rollout_key
         )
 
         def rollout_step(
@@ -428,7 +476,7 @@ def step9_update(
             _: Array,
         ) -> tuple[
             tuple[DifferentialSARSAState, BehaviorModelState, Array, Array],
-            tuple[Array, Array],
+            tuple[Array, Array, Array],
         ]:
             rollout_ctrl, rollout_behavior, rollout_obs, rollout_action = (
                 rollout_carry
@@ -438,11 +486,12 @@ def step9_update(
                 last_observation=rollout_obs,
                 last_action=rollout_action,
             )
-            dream_result = agent.update(
+            dream_result = _update_control_with_linear_rng(
+                agent,
                 temp_state,
                 prediction.reward,
                 prediction.next_observation,
-                discount=prediction.discount,
+                prediction.discount,
             )
             dream_state = dream_result.state
             if not config.dreams_update_average_reward:
@@ -464,14 +513,15 @@ def step9_update(
             ), (
                 dream_result.td_error,
                 prediction.discount,
+                dream_result.update_applied,
             )
 
         (
             (rollout_ctrl, rollout_behavior, _rollout_obs, _rollout_action),
-            (rollout_td_errors, rollout_discounts),
+            (rollout_td_errors, rollout_discounts, rollout_updates_applied),
         ) = jax.lax.scan(
             rollout_step,
-            (ctrl_state, initial_behavior_state, anchor_obs, action),
+            (initial_control_state, initial_behavior_state, anchor_obs, action),
             jnp.arange(config.dream_rollout_horizon, dtype=jnp.int32),
         )
         rollout_td_signal = jnp.sum(rollout_td_errors)
@@ -485,12 +535,12 @@ def step9_update(
             & finite
             & selected_accepted
             & (selected_discount >= 0.0)
+            & jnp.all(rollout_updates_applied)
         )
 
         restored = rollout_ctrl.replace(
             last_observation=control_after_real.last_observation,
             last_action=control_after_real.last_action,
-            rng_key=rollout_ctrl.rng_key,
         )
         next_ctrl = cast(
             DifferentialSARSAState,
@@ -500,6 +550,10 @@ def step9_update(
                 ctrl_state,
             ),
         )
+        # The reserved master branch always survives the transaction.  This
+        # keeps future dreams independent even when the gate or a rollout
+        # control update rejects every learned-state change.
+        next_ctrl = next_ctrl.replace(rng_key=next_master_key)
         next_behavior = cast(
             BehaviorModelState,
             jax.tree_util.tree_map(
@@ -508,14 +562,14 @@ def step9_update(
                 behavior_state,
             ),
         )
-        return (next_ctrl, next_behavior, key), (
+        return (next_ctrl, next_behavior), (
             jnp.where(accepted, rollout_td_signal, jnp.array(0.0, dtype=jnp.float32)),
             accepted,
         )
 
-    (final_ctrl, final_behavior, _), (dream_td_errors, dream_accepted) = jax.lax.scan(
+    (final_ctrl, final_behavior), (dream_td_errors, dream_accepted) = jax.lax.scan(
         dream_step,
-        (control_after_real, behavior_after_real, control_after_real.rng_key),
+        (control_after_real, behavior_after_real),
         jnp.arange(config.planning_budget, dtype=jnp.int32),
     )
 

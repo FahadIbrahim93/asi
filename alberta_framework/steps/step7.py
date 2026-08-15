@@ -300,6 +300,32 @@ def _select_planning_action(
     return action, key
 
 
+def _update_control_with_linear_rng(
+    agent: DifferentialSARSAAgent,
+    state: DifferentialSARSAState,
+    reward: Array,
+    next_observation: Array,
+    *,
+    discount: Array | float = 1.0,
+) -> DifferentialSARSAUpdateResult:
+    """Apply a control backup while advancing its RNG on rejection."""
+    next_action, next_key = agent.select_action(state, next_observation)
+    advanced_state = cast(
+        DifferentialSARSAState,
+        state.replace(rng_key=next_key),  # type: ignore[attr-defined]
+    )
+    return cast(
+        DifferentialSARSAUpdateResult,
+        agent.update(
+            advanced_state,
+            reward,
+            next_observation,
+            next_action=next_action,
+            discount=discount,
+        ),
+    )
+
+
 def _score_planning_actions(
     model: OneStepWorldModel,
     model_state: WorldModelState,
@@ -563,7 +589,23 @@ def step7_update(
         reward,
         next_observation,
     )
-    real_control_result = agent.update(state.control_state, reward, next_observation)
+    if config.planning_steps == 0:
+        # Preserve the exact real-only path, including transactional RNG
+        # rollback, when no planning work is requested.
+        real_control_result = agent.update(
+            state.control_state,
+            reward,
+            next_observation,
+        )
+    else:
+        # The planner must start below the real action selection's reserved
+        # child even when the real numerical update rolls back.
+        real_control_result = _update_control_with_linear_rng(
+            agent,
+            state.control_state,
+            reward,
+            next_observation,
+        )
     control_after_real = real_control_result.state
     model_state = cast(WorldModelState, real_model_result.state)
     planning_ready = model_state.step_count >= config.planning_warmup_steps
@@ -685,7 +727,8 @@ def step7_update(
                 last_action=rollout_action,
                 rng_key=rollout_key,
             )
-            planned = agent.update(
+            planned = _update_control_with_linear_rng(
+                agent,
                 temp_state,
                 prediction.reward,
                 prediction.next_observation,
