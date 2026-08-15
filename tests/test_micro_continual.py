@@ -19,6 +19,7 @@ import json
 import math
 from pathlib import Path
 
+import chex
 import jax
 import jax.numpy as jnp
 import jax.random as jr
@@ -439,6 +440,59 @@ class TestBayesReference:
         diffs = means[:, :, None, :] - means[:, None, :, :]
         active = np.asarray(jnp.sum(jnp.abs(diffs) > 0.0, axis=-1))
         assert active.max() <= 2 * config.component_sparsity
+
+    @pytest.mark.parametrize("compiled", [False, True])
+    @pytest.mark.parametrize(
+        ("scores", "expected_mask"),
+        [
+            ([0.5, 0.5, 0.5, 0.5, 0.5, 0.5], [True, True, False, False, False, False]),
+            ([0.1, 0.2, 0.2, 0.2, 0.9, 0.8], [True, True, False, False, False, False]),
+        ],
+    )
+    def test_component_sparsity_is_exact_and_stable_under_ties(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        compiled: bool,
+        scores: list[float],
+        expected_mask: list[bool],
+    ) -> None:
+        config = tiny(
+            "input_permutation",
+            dim=6,
+            n_classes=2,
+            n_components=2,
+            component_sparsity=2,
+            spectrum_decades=0.0,
+            component_scale=1.0,
+        )
+        component_shape = (config.n_classes, config.n_components, config.dim)
+
+        def fixed_normal(key, shape, dtype=jnp.float32):
+            del key
+            if shape == component_shape:
+                return jnp.ones(shape, dtype=dtype)
+            return jnp.zeros(shape, dtype=dtype)
+
+        def fixed_uniform(key, shape, dtype=jnp.float32):
+            del key
+            if shape == component_shape:
+                return jnp.broadcast_to(jnp.asarray(scores, dtype=dtype), shape)
+            return jnp.zeros(shape, dtype=dtype)
+
+        monkeypatch.setattr(
+            "alberta_framework.benchmarks.micro_continual.jr.normal", fixed_normal
+        )
+        monkeypatch.setattr(
+            "alberta_framework.benchmarks.micro_continual.jr.uniform", fixed_uniform
+        )
+        generate = jax.jit(lambda: class_geometry(config, seed=3)) if compiled else (
+            lambda: class_geometry(config, seed=3)
+        )
+        component_means, _ = generate()
+
+        actual_mask = component_means != 0.0
+        expected = jnp.broadcast_to(jnp.asarray(expected_mask), component_shape)
+        chex.assert_trees_all_equal(actual_mask, expected)
 
     def test_zero_component_scale_collapses_to_unimodal(self):
         config = tiny("input_permutation", component_scale=0.0)

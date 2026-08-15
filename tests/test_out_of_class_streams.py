@@ -11,6 +11,8 @@ import chex
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
+import pytest
 
 from alberta_framework.streams.out_of_class import (
     CompositionalStream,
@@ -44,6 +46,109 @@ def _scan_collect(stream, num_steps: int, key) -> tuple[jnp.ndarray, jnp.ndarray
 
 class TestOutOfClassPolynomialStream:
     """Tests for the degree-3 polynomial out-of-class stream."""
+
+    @pytest.mark.parametrize("active_count", [0, -1, True, 1.0, np.int64(1)])
+    def test_active_triple_count_requires_positive_builtin_int(
+        self, active_count: object
+    ) -> None:
+        with pytest.raises(ValueError, match="positive built-in integer"):
+            OutOfClassPolynomialStream(
+                feature_dim=4,
+                active_triples_per_context=active_count,  # type: ignore[arg-type]
+            )
+
+    def test_active_triple_count_caps_at_available_triples(self) -> None:
+        stream = OutOfClassPolynomialStream(
+            feature_dim=4,
+            n_tasks=2,
+            n_contexts=2,
+            active_triples_per_context=100,
+        )
+        state = stream.init(jr.key(92))
+
+        assert state.context_weights.shape == (2, 2, 4)
+        assert int(jnp.count_nonzero(state.context_weights)) == state.context_weights.size
+
+    def test_unique_finite_scores_preserve_legacy_context_weights(self) -> None:
+        stream = OutOfClassPolynomialStream(
+            feature_dim=4,
+            n_tasks=2,
+            n_contexts=2,
+            active_triples_per_context=2,
+        )
+        root_key = jr.key(315)
+        state = stream.init(root_key)
+        _, context_key, mask_key, _ = jr.split(root_key, 4)
+        triple_count = state.triples_left.shape[0]
+        dense_weights = jr.normal(
+            context_key,
+            (2, 2, triple_count),
+            dtype=jnp.float32,
+        )
+        scores = jr.uniform(mask_key, (2, 2, triple_count), dtype=jnp.float32)
+        for row in np.asarray(scores).reshape((-1, triple_count)):
+            assert np.unique(row).size == triple_count
+        threshold = jnp.sort(scores, axis=-1)[..., 1:2]
+        legacy_mask = scores <= threshold
+        expected = dense_weights * legacy_mask.astype(jnp.float32) / jnp.sqrt(
+            jnp.sum(legacy_mask, axis=-1, keepdims=True)
+        )
+
+        np.testing.assert_array_equal(
+            np.asarray(state.context_weights),
+            np.asarray(expected),
+        )
+
+    @pytest.mark.parametrize("compiled", [False, True])
+    @pytest.mark.parametrize(
+        ("scores", "expected_mask"),
+        [
+            ([0.5, 0.5, 0.5, 0.5], [True, True, False, False]),
+            ([0.5, 0.5, 0.2, 0.9], [True, False, True, False]),
+        ],
+    )
+    def test_init_selects_exact_stable_active_count_under_ties(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        compiled: bool,
+        scores: list[float],
+        expected_mask: list[bool],
+    ) -> None:
+        stream = OutOfClassPolynomialStream(
+            feature_dim=4,
+            n_tasks=2,
+            n_contexts=2,
+            active_triples_per_context=2,
+            noise_std=0.0,
+        )
+
+        def fixed_normal(key, shape, dtype=jnp.float32, **kwargs):
+            del key, kwargs
+            return jnp.ones(shape, dtype=dtype)
+
+        def fixed_uniform(key, shape, dtype=jnp.float32, **kwargs):
+            del key, kwargs
+            return jnp.broadcast_to(jnp.asarray(scores, dtype=dtype), shape)
+
+        monkeypatch.setattr(
+            "alberta_framework.streams.out_of_class.jr.normal", fixed_normal
+        )
+        monkeypatch.setattr(
+            "alberta_framework.streams.out_of_class.jr.uniform", fixed_uniform
+        )
+        init = jax.jit(stream.init) if compiled else stream.init
+        state = init(jr.key(0))
+
+        actual_mask = state.context_weights != 0.0
+        expected = jnp.broadcast_to(
+            jnp.asarray(expected_mask), state.context_weights.shape
+        )
+        chex.assert_trees_all_equal(actual_mask, expected)
+
+        observations, targets = jax.jit(
+            lambda key: _scan_collect(stream, num_steps=4, key=key)
+        )(jr.key(1))
+        chex.assert_tree_all_finite((observations, targets))
 
     def test_step_shapes(self):
         stream = OutOfClassPolynomialStream(

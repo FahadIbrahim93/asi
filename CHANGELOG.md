@@ -34,6 +34,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Made the pair-, triple-, and micro-component stream generators select exactly their
+  configured fixed count under tied random scores, with stable source-index tie-breaking;
+  pair/triple counts now require positive built-in integers before JAX initialization.
 - Bound each new IPMNIST screening pool shard and merged summary to its effective
   `noise_pool_steps`, rejected malformed or cross-shard pool sizes, and made merge refuse
   legacy pool shards whose omitted size remains inspectable but unknowable. Legacy shards

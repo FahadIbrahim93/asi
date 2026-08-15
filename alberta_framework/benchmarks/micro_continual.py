@@ -81,6 +81,7 @@ import jax.random as jr
 import numpy as np
 from jax import Array
 
+from alberta_framework._fixed_count_selection import stable_smallest_mask
 from alberta_framework._strict_json import load_strict_json_object
 from alberta_framework.benchmarks.ipmnist_screening import (
     ScreeningStepFn,
@@ -334,8 +335,9 @@ def class_geometry(config: MicroStreamConfig, seed: int) -> tuple[Array, Array]:
         component_mask = jnp.ones((c, k, d), dtype=jnp.float32)
     else:
         scores = jr.uniform(key_component_mask, (c, k, d))
-        threshold = jnp.sort(scores, axis=-1)[:, :, config.component_sparsity][:, :, None]
-        component_mask = (scores < threshold).astype(jnp.float32)
+        component_mask = stable_smallest_mask(scores, config.component_sparsity).astype(
+            jnp.float32
+        )
     displacements = config.component_scale * scales * jr.normal(
         key_displacement, (c, k, d), jnp.float32
     ) * component_mask
