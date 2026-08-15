@@ -5,15 +5,52 @@ and markdown, suitable for academic publications.
 """
 
 import csv
+import io
 import json
+import math
+import os
+import tempfile
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, SupportsFloat
 
 if TYPE_CHECKING:
     import pandas as pd
 
     from alberta_framework.utils.experiments import AggregatedResults
     from alberta_framework.utils.statistics import SignificanceResult
+
+
+def _exported_number(value: SupportsFloat) -> str:
+    """Return the shortest text that round-trips one finite binary64 value."""
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(f"refusing to export non-finite measurement: {number!r}")
+    return repr(number)
+
+
+def _write_text_atomically(filepath: Path, payload: str) -> None:
+    """Replace ``filepath`` only after complete text is staged beside it."""
+    filepath.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{filepath.name}.",
+        suffix=".tmp",
+        dir=filepath.parent,
+        text=True,
+    )
+    temporary = Path(temporary_name)
+    open_descriptor: int | None = descriptor
+    try:
+        handle = os.fdopen(descriptor, "w", encoding="utf-8", newline="")
+        open_descriptor = None
+        with handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, filepath)
+    finally:
+        if open_descriptor is not None:
+            os.close(open_descriptor)
+        temporary.unlink(missing_ok=True)
 
 
 def export_to_csv(
@@ -31,7 +68,6 @@ def export_to_csv(
         include_timeseries: Whether to include full timeseries (large!)
     """
     filepath = Path(filepath)
-    filepath.parent.mkdir(parents=True, exist_ok=True)
 
     if include_timeseries:
         _export_timeseries_csv(results, filepath, metric)
@@ -45,22 +81,30 @@ def _export_summary_csv(
     metric: str,
 ) -> None:
     """Export summary statistics to CSV."""
-    with open(filepath, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["config", "mean", "std", "min", "max", "n_seeds"])
+    output = io.StringIO(newline="")
+    writer = csv.writer(output)
+    writer.writerow(["config", "mean", "std", "min", "max", "n_seeds"])
 
-        for name, agg in results.items():
-            summary = agg.summary[metric]
-            writer.writerow(
-                [
-                    name,
-                    f"{summary.mean:.6f}",
-                    f"{summary.std:.6f}",
-                    f"{summary.min:.6f}",
-                    f"{summary.max:.6f}",
-                    summary.n_seeds,
-                ]
-            )
+    for name, agg in results.items():
+        summary = agg.summary[metric]
+        mean = _exported_number(summary.mean)
+        std = _exported_number(summary.std)
+        minimum = _exported_number(summary.min)
+        maximum = _exported_number(summary.max)
+        for value in summary.values:
+            _exported_number(value)
+        writer.writerow(
+            [
+                name,
+                mean,
+                std,
+                minimum,
+                maximum,
+                summary.n_seeds,
+            ]
+        )
+
+    _write_text_atomically(filepath, output.getvalue())
 
 
 def _export_timeseries_csv(
@@ -69,32 +113,46 @@ def _export_timeseries_csv(
     metric: str,
 ) -> None:
     """Export full timeseries to CSV."""
-    with open(filepath, "w", newline="") as f:
-        writer = csv.writer(f)
+    for name, agg in results.items():
+        arr = agg.metric_arrays[metric]
+        if len(set(agg.seeds)) != len(agg.seeds):
+            raise ValueError(f"AggregatedResults {name!r} contains duplicate seeds")
+        if arr.ndim != 2:
+            raise ValueError(
+                f"AggregatedResults {name!r} metric {metric!r} must be a two-dimensional "
+                "seed-by-step array"
+            )
+        if len(agg.seeds) != arr.shape[0]:
+            raise ValueError(
+                f"AggregatedResults {name!r} seed count ({len(agg.seeds)}) does not match "
+                f"metric rows ({arr.shape[0]}) for {metric!r}"
+            )
 
-        # Determine max steps
-        max_steps = max(agg.metric_arrays[metric].shape[1] for agg in results.values())
+    output = io.StringIO(newline="")
+    writer = csv.writer(output)
 
-        # Header
-        headers = ["step"]
-        for name, agg in results.items():
-            for seed in agg.seeds:
-                headers.append(f"{name}_seed{seed}")
-        writer.writerow(headers)
+    max_steps = max(agg.metric_arrays[metric].shape[1] for agg in results.values())
 
-        # Data rows
-        for step in range(max_steps):
-            row: list[str | int] = [step]
-            for agg in results.values():
-                arr = agg.metric_arrays[metric]
-                n_seeds = arr.shape[0]
-                n_steps = arr.shape[1]
-                for seed_idx in range(n_seeds):
-                    if step < n_steps:
-                        row.append(f"{arr[seed_idx, step]:.6f}")
-                    else:
-                        row.append("")
-            writer.writerow(row)
+    headers = ["step"]
+    for name, agg in results.items():
+        for seed in agg.seeds:
+            headers.append(f"{name}_seed{seed}")
+    writer.writerow(headers)
+
+    for step in range(max_steps):
+        row: list[str | int] = [step]
+        for agg in results.values():
+            arr = agg.metric_arrays[metric]
+            n_seeds = arr.shape[0]
+            n_steps = arr.shape[1]
+            for seed_idx in range(n_seeds):
+                if step < n_steps:
+                    row.append(_exported_number(arr[seed_idx, step]))
+                else:
+                    row.append("")
+        writer.writerow(row)
+
+    _write_text_atomically(filepath, output.getvalue())
 
 
 def export_to_json(
@@ -110,7 +168,6 @@ def export_to_json(
         include_timeseries: Whether to include full timeseries (large!)
     """
     filepath = Path(filepath)
-    filepath.parent.mkdir(parents=True, exist_ok=True)
 
     from typing import Any
 
@@ -139,8 +196,8 @@ def export_to_json(
 
         data[name] = config_data
 
-    with open(filepath, "w") as f:
-        json.dump(data, f, indent=2)
+    payload = json.dumps(data, indent=2, allow_nan=False)
+    _write_text_atomically(filepath, payload)
 
 
 def generate_latex_table(

@@ -39,6 +39,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Rejected zero, negative, boolean, and non-integer schedule divisors in synthetic and
   closed-loop streams before JAX modulo, floor-division, or periodic arithmetic can silently
   corrupt a regime clock; positive integer schedules retain their existing trajectories.
+- Made experiment CSV and JSON artifacts preserve finite binary64 measurements exactly,
+  reject non-finite summaries and trajectories before touching the destination, and publish
+  complete serialized files atomically; display-only table rounding remains unchanged.
 - Protected the reserved checkpoint `_format_version` metadata key so every newly saved
   checkpoint carries the canonical on-disk format stamp even if caller metadata collides.
 - Made sparse initialization reject malformed dimensions and non-finite or out-of-range
