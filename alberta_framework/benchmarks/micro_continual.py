@@ -857,7 +857,21 @@ def load_micro_shard(path: Path | str) -> dict[str, Any]:
         raise ValueError(f"{path}: mechanism must be a non-empty string")
     if not isinstance(payload.get("hyperparameters"), dict):
         raise ValueError(f"{path}: hyperparameters must be an object")
+    environment = payload.get("environment")
+    required_environment_fields = ("jax", "numpy", "python", "platform")
+    if not isinstance(environment, dict) or any(
+        not isinstance(environment.get(field), str) or not environment[field]
+        for field in required_environment_fields
+    ):
+        raise ValueError(
+            f"{path}: environment must record non-empty jax, numpy, python, and platform strings"
+        )
     config = MicroStreamConfig(**payload["stream_config"])
+    if payload.get("family") != config.family:
+        raise ValueError(
+            f"{path}: family {payload.get('family')!r} does not match "
+            f"stream_config family {config.family!r}"
+        )
     for fieldname in ("per_regime_accuracy", "per_regime_loss", "per_regime_plasticity"):
         values = np.asarray(payload.get(fieldname, []), dtype=np.float64)
         if values.shape != (config.n_regimes,) or not np.all(np.isfinite(values)):
@@ -884,12 +898,10 @@ def _late_window_slope(per_regime: np.ndarray, window: int) -> float:
     return float(np.sum(x * (tail - tail.mean())) / denominator)
 
 
-def merge_micro_shards(
-    paths: Sequence[Path | str], bayes_samples: int = 200_000
-) -> dict[str, Any]:
-    """Merge shards of one (family, config) into a ranked summary with the
-    analytic Bayes reference attached."""
-    shards = [load_micro_shard(path) for path in paths]
+def _micro_shard_batch_contract(
+    shards: Sequence[dict[str, Any]],
+) -> tuple[MicroStreamConfig, dict[str, str]]:
+    """Validate fields that must be identical across one derived artifact."""
     if not shards:
         raise ValueError("no shards given")
     configs = {tuple(sorted(shard["stream_config"].items())) for shard in shards}
@@ -898,7 +910,49 @@ def merge_micro_shards(
     nets = {(shard["hidden1"], shard["hidden2"]) for shard in shards}
     if len(nets) != 1:
         raise ValueError("shards span multiple network sizes; merge them separately")
-    config = MicroStreamConfig(**shards[0]["stream_config"])
+    reference_environment = shards[0]["environment"]
+    environment_mismatches = [
+        f"{shard['arm_name']}/seed={shard['seed']}"
+        for shard in shards
+        if shard["environment"] != reference_environment
+    ]
+    if environment_mismatches:
+        raise ValueError(
+            "shards span multiple runtime environments; process same-environment runs "
+            f"separately (mismatched: {environment_mismatches})"
+        )
+    return (
+        MicroStreamConfig(**shards[0]["stream_config"]),
+        dict(reference_environment),
+    )
+
+
+def _validate_micro_arm_contract(
+    arm_name: str,
+    per_seed: Mapping[int, dict[str, Any]],
+) -> None:
+    """Reject cross-seed mechanism or hyperparameter drift within one arm."""
+    seeds = sorted(per_seed)
+    for fieldname in ("hyperparameters", "mechanism"):
+        reference = per_seed[seeds[0]][fieldname]
+        mismatched = [
+            seed for seed in seeds if per_seed[seed][fieldname] != reference
+        ]
+        if mismatched:
+            raise ValueError(
+                f"arm {arm_name!r} has inconsistent {fieldname} across seeds: "
+                f"seed {seeds[0]} used {reference!r}, seed(s) {mismatched} used "
+                "different values"
+            )
+
+
+def merge_micro_shards(
+    paths: Sequence[Path | str], bayes_samples: int = 200_000
+) -> dict[str, Any]:
+    """Merge shards of one (family, config) into a ranked summary with the
+    analytic Bayes reference attached."""
+    shards = [load_micro_shard(path) for path in paths]
+    config, reference_environment = _micro_shard_batch_contract(shards)
     quarter = max(1, config.n_regimes // 4)
 
     by_arm: dict[str, dict[int, dict[str, Any]]] = {}
@@ -915,17 +969,7 @@ def merge_micro_shards(
     for arm_name, per_seed in sorted(by_arm.items()):
         seeds = sorted(per_seed)
         all_seeds.update(seeds)
-        for fieldname in ("hyperparameters", "mechanism"):
-            reference = per_seed[seeds[0]][fieldname]
-            mismatched = [
-                seed for seed in seeds if per_seed[seed][fieldname] != reference
-            ]
-            if mismatched:
-                raise ValueError(
-                    f"arm {arm_name!r} has inconsistent {fieldname} across seeds: "
-                    f"seed {seeds[0]} used {reference!r}, seed(s) {mismatched} used "
-                    "different values"
-                )
+        _validate_micro_arm_contract(arm_name, per_seed)
         curves = np.stack(
             [
                 np.asarray(per_seed[s]["per_regime_accuracy"], dtype=np.float64)
@@ -993,6 +1037,7 @@ def merge_micro_shards(
         "created_unix": time.time(),
         "family": config.family,
         "stream_config": config.to_config(),
+        "environment": dict(reference_environment),
         "hidden1": shards[0]["hidden1"],
         "hidden2": shards[0]["hidden2"],
         "n_shards": len(shards),
@@ -1205,30 +1250,32 @@ def transfer_validation(
 def transfer_validation_from_shards(paths: Sequence[Path | str]) -> dict[str, Any]:
     """Build and run :func:`transfer_validation` from ladder shards (M1 only)."""
     shards = [load_micro_shard(path) for path in paths]
-    if not shards:
-        raise ValueError("no shards given")
+    config, environment = _micro_shard_batch_contract(shards)
     families = {shard["family"] for shard in shards}
     if families != {"input_permutation"}:
         raise ValueError(
             "transfer validation is defined on the input_permutation family "
             f"(M1); got {sorted(families)}"
         )
-    configs = {tuple(sorted(shard["stream_config"].items())) for shard in shards}
-    if len(configs) != 1:
-        raise ValueError("shards span multiple stream configs; validate them separately")
-    per_arm: dict[str, dict[int, np.ndarray]] = {}
+    raw_per_arm: dict[str, dict[int, dict[str, Any]]] = {}
     for shard in shards:
-        per_seed = per_arm.setdefault(shard["arm_name"], {})
+        per_seed = raw_per_arm.setdefault(shard["arm_name"], {})
         if shard["seed"] in per_seed:
             raise ValueError(
                 f"duplicate shard for arm={shard['arm_name']} seed={shard['seed']}"
             )
-        per_seed[shard["seed"]] = np.asarray(
-            shard["per_regime_accuracy"], dtype=np.float64
-        )
+        per_seed[shard["seed"]] = shard
+    per_arm: dict[str, dict[int, np.ndarray]] = {}
+    for arm_name, raw_per_seed in raw_per_arm.items():
+        _validate_micro_arm_contract(arm_name, raw_per_seed)
+        per_arm[arm_name] = {
+            seed: np.asarray(shard["per_regime_accuracy"], dtype=np.float64)
+            for seed, shard in raw_per_seed.items()
+        }
     report = transfer_validation(per_arm)
     report["family"] = "input_permutation"
-    report["stream_config"] = dict(shards[0]["stream_config"])
+    report["stream_config"] = config.to_config()
+    report["environment"] = environment
     report["hidden1"] = shards[0]["hidden1"]
     report["hidden2"] = shards[0]["hidden2"]
     return report

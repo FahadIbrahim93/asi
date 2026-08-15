@@ -676,9 +676,13 @@ class TestShards:
 
     @pytest.mark.parametrize(
         ("fieldname", "bad_value"),
-        [("mechanism", ""), ("hyperparameters", [])],
+        [
+            ("mechanism", ""),
+            ("hyperparameters", []),
+            ("family", "scale_shift"),
+        ],
     )
-    def test_load_rejects_invalid_arm_contract_field(
+    def test_load_rejects_invalid_shard_contract_field(
         self, tmp_path: Path, fieldname: str, bad_value: object
     ):
         payload = micro_shard_payload(self._result())
@@ -687,6 +691,26 @@ class TestShards:
         path.write_text(json.dumps(payload), encoding="utf-8")
 
         with pytest.raises(ValueError, match=fieldname):
+            load_micro_shard(path)
+
+    @pytest.mark.parametrize(
+        "environment",
+        [
+            None,
+            {},
+            {"jax": "test", "numpy": "test", "python": "test"},
+            {"jax": "", "numpy": "test", "python": "test", "platform": "test"},
+        ],
+    )
+    def test_load_rejects_incomplete_environment(
+        self, tmp_path: Path, environment: object
+    ):
+        payload = micro_shard_payload(self._result())
+        payload["environment"] = environment
+        path = tmp_path / "bad.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+        with pytest.raises(ValueError, match="environment must record"):
             load_micro_shard(path)
 
     def test_merge_ranks_and_pairs(self, tmp_path: Path):
@@ -740,6 +764,32 @@ class TestShards:
             match=rf"arm 'sgd_raw' has inconsistent {fieldname} across seeds",
         ):
             merge_micro_shards([path_a, path_b], bayes_samples=1_000)
+
+    def test_merge_rejects_environment_drift_and_records_environment(
+        self, tmp_path: Path
+    ):
+        payload_a = micro_shard_payload(self._result(seed=0))
+        payload_b = json.loads(json.dumps(payload_a))
+        payload_b["seed"] = 1
+        path_a = tmp_path / "a.json"
+        path_b = tmp_path / "b.json"
+        write_micro_shard(path_a, payload_a)
+        write_micro_shard(path_b, payload_b)
+
+        summary = merge_micro_shards([path_a, path_b], bayes_samples=1_000)
+        assert summary["environment"] == payload_a["environment"]
+
+        payload_b["environment"] = {
+            "jax": "0.0-test",
+            "numpy": "0.0-test",
+            "python": "0.0-test",
+            "platform": "different-test-platform",
+        }
+        drifted_path = tmp_path / "b-drifted.json"
+        write_micro_shard(drifted_path, payload_b)
+
+        with pytest.raises(ValueError, match="shards span multiple runtime environments"):
+            merge_micro_shards([path_a, drifted_path], bayes_samples=1_000)
 
 
 # =============================================================================
@@ -830,12 +880,49 @@ class TestTransferValidation:
         report = transfer_validation_from_shards(paths)
         assert report["schema"] == MICRO_VALIDATION_SCHEMA
         assert report["family"] == TINY.family
+        assert report["environment"] == load_micro_shard(paths[0])["environment"]
         assert isinstance(report["transfer_valid"], bool)
         assert {c["name"] for c in report["checks"]} >= {
             "conditioning_dominates",
             "gate_small_positive",
             "adam_decays",
         }
+
+        changed = json.loads(paths[-1].read_text(encoding="utf-8"))
+        changed["environment"] = {
+            "jax": "0.0-test",
+            "numpy": "0.0-test",
+            "python": "0.0-test",
+            "platform": "different-test-platform",
+        }
+        changed_path = tmp_path / "changed-environment.json"
+        write_micro_shard(changed_path, changed)
+        with pytest.raises(ValueError, match="shards span multiple runtime environments"):
+            transfer_validation_from_shards([*paths[:-1], changed_path])
+
+    def test_from_shards_rejects_arm_contract_drift(self, tmp_path: Path):
+        paths = []
+        sgd_payload = None
+        for arm in LADDER_ARMS:
+            result = run_micro_arm(TINY, arm, seed=0, hidden1=8, hidden2=6)
+            payload = micro_shard_payload(result)
+            path = micro_shard_path(tmp_path, TINY.family, arm, 0)
+            write_micro_shard(path, payload)
+            paths.append(path)
+            if arm == "sgd_raw":
+                sgd_payload = payload
+        assert sgd_payload is not None
+        drifted = json.loads(json.dumps(sgd_payload))
+        drifted["seed"] = 1
+        drifted["mechanism"] = "different-test-mechanism"
+        drifted_path = micro_shard_path(tmp_path, TINY.family, "sgd_raw", 1)
+        write_micro_shard(drifted_path, drifted)
+
+        with pytest.raises(
+            ValueError,
+            match="arm 'sgd_raw' has inconsistent mechanism across seeds",
+        ):
+            transfer_validation_from_shards([*paths, drifted_path])
 
     def test_from_shards_rejects_non_m1(self, tmp_path: Path):
         config = tiny("scale_shift")
