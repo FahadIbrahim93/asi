@@ -19,7 +19,7 @@ from typing import Any, cast
 import chex
 import jax.numpy as jnp
 from jax import Array
-from jaxtyping import Float
+from jaxtyping import Bool, Float
 
 from alberta_framework.core.types import (
     AutostepGTDLambdaState,
@@ -31,6 +31,13 @@ from alberta_framework.core.types import (
     LMSState,
     ObGDState,
     TDIDBDState,
+)
+from alberta_framework.core.update_safety import (
+    floating_tree_is_finite,
+    neutralize_array,
+    neutralize_metrics,
+    select_transaction,
+    zero_if_collapsed_infinity,
 )
 
 # =============================================================================
@@ -83,7 +90,14 @@ def _apply_obgd_bound(
         total_step = total_step + jnp.sum(jnp.abs(s))
     delta_bar = jnp.maximum(jnp.abs(error_scalar), 1.0)
     scale = 1.0 / jnp.maximum(kappa * delta_bar * total_step, 1.0)
-    return tuple(scale * s for s in steps), scale
+    collapsed = scale == 0
+    return (
+        tuple(
+            zero_if_collapsed_infinity(scale * step, step, collapsed)
+            for step in steps
+        ),
+        scale,
+    )
 
 
 class ObGDBounding(Bounder):
@@ -270,7 +284,10 @@ class AGCBounding(Bounder):
             scale = max_norm / jnp.maximum(g_norm, 1e-6)
             needs_clip = g_norm > max_norm
             clipped_step = jnp.where(needs_clip, step * scale, step)
-            clipped.append(clipped_step)
+            collapsed = needs_clip & (scale == 0)
+            clipped.append(
+                zero_if_collapsed_infinity(clipped_step, step, collapsed)
+            )
 
             total_units += needs_clip.size
             clipped_units = clipped_units + jnp.sum(needs_clip.astype(jnp.float32))
@@ -302,6 +319,22 @@ class OptimizerUpdate:
         | IDBDParamState
     )
     metrics: dict[str, Array]
+    update_applied: Bool[Array, ""]
+
+
+@chex.dataclass(frozen=True)
+class ParamOptimizerUpdate:
+    """Checked result for an arbitrary-shape parameter update.
+
+    ``update_from_gradient`` retains its historical two-tuple API.  Callers
+    that own a larger state transaction use ``update_from_gradient_checked``
+    so a rejected parameter update cannot be mistaken for a legitimate zero
+    step.
+    """
+
+    step: Array
+    new_state: Any
+    update_applied: Bool[Array, ""]
 
 
 class Optimizer[
@@ -423,6 +456,35 @@ class Optimizer[
             "Only LMS, IDBD, and Autostep currently implement this."
         )
 
+    def update_from_gradient_checked(
+        self, state: Any, gradient: Array, error: Array | None = None
+    ) -> ParamOptimizerUpdate:
+        """Return a checked parameter update without changing the legacy API.
+
+        This fallback makes externally defined optimizers transaction-aware.
+        Built-in adaptive optimizers override it so finite candidate overflow
+        can be reported explicitly after their internal guard runs.
+        """
+
+        step, new_state = self.update_from_gradient(state, gradient, error=error)
+        error_is_finite = (
+            jnp.asarray(True, dtype=jnp.bool_)
+            if error is None
+            else jnp.all(jnp.isfinite(error))
+        )
+        update_applied = (
+            floating_tree_is_finite(state)
+            & jnp.all(jnp.isfinite(gradient))
+            & error_is_finite
+            & jnp.all(jnp.isfinite(step))
+            & floating_tree_is_finite(new_state)
+        )
+        return ParamOptimizerUpdate(
+            step=neutralize_array(update_applied, step),
+            new_state=select_transaction(update_applied, new_state, state),
+            update_applied=update_applied,
+        )
+
 
 class LMS(Optimizer[LMSState]):
     """Least Mean Square optimizer with fixed step-size.
@@ -480,8 +542,31 @@ class LMS(Optimizer[LMSState]):
         Returns:
             ``(step, state)`` -- state is unchanged for LMS
         """
-        del error  # LMS doesn't meta-learn
-        return state.step_size * gradient, state
+        result = self.update_from_gradient_checked(state, gradient, error)
+        return result.step, cast(LMSState, result.new_state)
+
+    def update_from_gradient_checked(
+        self, state: LMSState, gradient: Array, error: Array | None = None
+    ) -> ParamOptimizerUpdate:
+        """Compute an LMS parameter step with an explicit transaction signal."""
+
+        step = state.step_size * gradient
+        error_is_finite = (
+            jnp.asarray(True, dtype=jnp.bool_)
+            if error is None
+            else jnp.all(jnp.isfinite(error))
+        )
+        update_applied = (
+            floating_tree_is_finite(state)
+            & jnp.all(jnp.isfinite(gradient))
+            & error_is_finite
+            & jnp.all(jnp.isfinite(step))
+        )
+        return ParamOptimizerUpdate(
+            step=neutralize_array(update_applied, step),
+            new_state=state,
+            update_applied=update_applied,
+        )
 
     def update(
         self,
@@ -509,12 +594,24 @@ class LMS(Optimizer[LMSState]):
 
         # Bias update: alpha * error
         bias_delta = alpha * error_scalar
+        candidate_metrics = {"step_size": alpha}
+
+        update_applied = (
+            floating_tree_is_finite(state)
+            & jnp.isfinite(error_scalar)
+            & jnp.all(jnp.isfinite(observation))
+            & jnp.all(jnp.isfinite(weight_delta))
+            & jnp.isfinite(bias_delta)
+            & floating_tree_is_finite(candidate_metrics)
+        )
+        metrics = neutralize_metrics(update_applied, candidate_metrics)
 
         return OptimizerUpdate(
-            weight_delta=weight_delta,
-            bias_delta=bias_delta,
+            weight_delta=neutralize_array(update_applied, weight_delta),
+            bias_delta=neutralize_array(update_applied, bias_delta),
             new_state=state,  # LMS state doesn't change
-            metrics={"step_size": alpha},
+            metrics=metrics,
+            update_applied=update_applied,
         )
 
 
@@ -621,6 +718,17 @@ class IDBD(Optimizer[IDBDState]):
         gradient: Array,
         error: Array | None = None,
     ) -> tuple[Array, IDBDParamState]:
+        """Return the historical unchecked pair for compatibility."""
+
+        result = self.update_from_gradient_checked(state, gradient, error)
+        return result.step, cast(IDBDParamState, result.new_state)
+
+    def update_from_gradient_checked(
+        self,
+        state: IDBDParamState,
+        gradient: Array,
+        error: Array | None = None,
+    ) -> ParamOptimizerUpdate:
         """Compute IDBD update from pre-computed gradient (MLP path).
 
         Implements Meyer's adaptation of IDBD to nonlinear models. The key
@@ -708,8 +816,25 @@ class IDBD(Optimizer[IDBDState]):
             traces=new_traces,
             meta_step_size=beta,
         )
+        error_is_finite = (
+            jnp.asarray(True, dtype=jnp.bool_)
+            if error is None
+            else jnp.all(jnp.isfinite(error))
+        )
+        update_applied = (
+            floating_tree_is_finite(state)
+            & jnp.all(jnp.isfinite(gradient))
+            & error_is_finite
+            & jnp.all(jnp.isfinite(meta_delta))
+            & jnp.all(jnp.isfinite(step))
+            & floating_tree_is_finite(new_state)
+        )
 
-        return step, new_state
+        return ParamOptimizerUpdate(
+            step=neutralize_array(update_applied, step),
+            new_state=select_transaction(update_applied, new_state, state),
+            update_applied=update_applied,
+        )
 
     def update(
         self,
@@ -784,23 +909,39 @@ class IDBD(Optimizer[IDBDState]):
         bias_decay = jnp.maximum(0.0, 1.0 - new_bias_step_size)
         new_bias_trace = state.bias_trace * bias_decay + new_bias_step_size * error_scalar
 
-        new_state = IDBDState(
+        candidate_state = IDBDState(
             log_step_sizes=new_log_step_sizes,
             traces=new_traces,
             meta_step_size=beta,
             bias_step_size=new_bias_step_size,
             bias_trace=new_bias_trace,
         )
+        candidate_metrics = {
+            "mean_step_size": jnp.mean(new_alphas),
+            "min_step_size": jnp.min(new_alphas),
+            "max_step_size": jnp.max(new_alphas),
+        }
+
+        update_applied = (
+            floating_tree_is_finite(state)
+            & jnp.isfinite(error_scalar)
+            & jnp.all(jnp.isfinite(observation))
+            & jnp.all(jnp.isfinite(meta_delta))
+            & jnp.isfinite(bias_meta_delta)
+            & jnp.all(jnp.isfinite(weight_delta))
+            & jnp.isfinite(bias_delta)
+            & floating_tree_is_finite(candidate_state)
+            & floating_tree_is_finite(candidate_metrics)
+        )
+        new_state = select_transaction(update_applied, candidate_state, state)
+        metrics = neutralize_metrics(update_applied, candidate_metrics)
 
         return OptimizerUpdate(
-            weight_delta=weight_delta,
-            bias_delta=bias_delta,
+            weight_delta=neutralize_array(update_applied, weight_delta),
+            bias_delta=neutralize_array(update_applied, bias_delta),
             new_state=new_state,
-            metrics={
-                "mean_step_size": jnp.mean(new_alphas),
-                "min_step_size": jnp.min(new_alphas),
-                "max_step_size": jnp.max(new_alphas),
-            },
+            metrics=metrics,
+            update_applied=update_applied,
         )
 
 
@@ -905,6 +1046,17 @@ class Autostep(Optimizer[AutostepState]):
         gradient: Array,
         error: Array | None = None,
     ) -> tuple[Array, AutostepParamState]:
+        """Return the historical unchecked pair for compatibility."""
+
+        result = self.update_from_gradient_checked(state, gradient, error)
+        return result.step, cast(AutostepParamState, result.new_state)
+
+    def update_from_gradient_checked(
+        self,
+        state: AutostepParamState,
+        gradient: Array,
+        error: Array | None = None,
+    ) -> ParamOptimizerUpdate:
         """Compute Autostep update from pre-computed gradient (MLP path).
 
         Implements the Table 1 algorithm generalized for arbitrary-shape
@@ -969,9 +1121,7 @@ class Autostep(Optimizer[AutostepState]):
 
         # Eq. 6-7: M = max(Σ α_i*z_i², 1); α_i /= M
         effective_terms = new_step_sizes * z_sq
-        effective_step = jnp.sum(
-            jnp.where(jnp.isfinite(z), effective_terms, 0.0)
-        )
+        effective_step = jnp.sum(effective_terms)
         m_factor = jnp.maximum(effective_step, 1.0)
         new_step_sizes = new_step_sizes / m_factor
 
@@ -993,15 +1143,33 @@ class Autostep(Optimizer[AutostepState]):
             jnp.isfinite(trace_candidate), trace_candidate, state.traces
         )
 
-        new_state = AutostepParamState(
+        candidate_state = AutostepParamState(
             step_sizes=new_step_sizes,
             traces=new_traces,
             normalizers=new_normalizers,
             meta_step_size=mu,
             tau=tau,
         )
+        error_is_finite = (
+            jnp.asarray(True, dtype=jnp.bool_)
+            if error is None
+            else jnp.all(jnp.isfinite(error))
+        )
+        update_applied = (
+            floating_tree_is_finite(state)
+            & jnp.all(jnp.isfinite(gradient))
+            & error_is_finite
+            & jnp.all(valid_meta_update)
+            & jnp.all(jnp.isfinite(trace_candidate))
+            & jnp.all(jnp.isfinite(step))
+            & floating_tree_is_finite(candidate_state)
+        )
 
-        return step, new_state
+        return ParamOptimizerUpdate(
+            step=neutralize_array(update_applied, step),
+            new_state=select_transaction(update_applied, candidate_state, state),
+            update_applied=update_applied,
+        )
 
     def update(
         self,
@@ -1097,10 +1265,7 @@ class Autostep(Optimizer[AutostepState]):
         # Eq. 6-7: Overshoot prevention (joint over weights + bias)
         # M = max(Σ α_i*x_i² + α_bias*1², 1)
         effective_terms = new_step_sizes * x_sq
-        effective_step = (
-            jnp.sum(jnp.where(jnp.isfinite(x), effective_terms, 0.0))
-            + new_bias_step_size
-        )
+        effective_step = jnp.sum(effective_terms) + new_bias_step_size
         m_factor = jnp.maximum(effective_step, 1.0)
         new_step_sizes = new_step_sizes / m_factor
         new_bias_step_size = new_bias_step_size / m_factor
@@ -1111,9 +1276,6 @@ class Autostep(Optimizer[AutostepState]):
 
         # Weight update with NEW alpha: α_i * δ * x_i
         weight_delta = new_step_sizes * error_scalar * x
-        weight_delta = jnp.where(
-            jnp.isnan(weight_delta), jnp.zeros_like(weight_delta), weight_delta
-        )
 
         # Bias update: α_bias * δ
         bias_delta = new_bias_step_size * error_scalar
@@ -1138,7 +1300,7 @@ class Autostep(Optimizer[AutostepState]):
             state.bias_trace,
         )
 
-        new_state = AutostepState(
+        candidate_state = AutostepState(
             step_sizes=new_step_sizes,
             traces=new_traces,
             normalizers=new_normalizers,
@@ -1148,17 +1310,35 @@ class Autostep(Optimizer[AutostepState]):
             bias_trace=new_bias_trace,
             bias_normalizer=new_bias_normalizer,
         )
+        candidate_metrics = {
+            "mean_step_size": jnp.mean(new_step_sizes),
+            "min_step_size": jnp.min(new_step_sizes),
+            "max_step_size": jnp.max(new_step_sizes),
+            "mean_normalizer": jnp.mean(new_normalizers),
+        }
+
+        update_applied = (
+            floating_tree_is_finite(state)
+            & jnp.isfinite(error_scalar)
+            & jnp.all(jnp.isfinite(observation))
+            & jnp.all(valid_meta_update)
+            & valid_bias_meta_update
+            & jnp.all(jnp.isfinite(trace_candidate))
+            & jnp.isfinite(bias_trace_candidate)
+            & jnp.all(jnp.isfinite(weight_delta))
+            & jnp.isfinite(bias_delta)
+            & floating_tree_is_finite(candidate_state)
+            & floating_tree_is_finite(candidate_metrics)
+        )
+        new_state = select_transaction(update_applied, candidate_state, state)
+        metrics = neutralize_metrics(update_applied, candidate_metrics)
 
         return OptimizerUpdate(
-            weight_delta=weight_delta,
-            bias_delta=bias_delta,
+            weight_delta=neutralize_array(update_applied, weight_delta),
+            bias_delta=neutralize_array(update_applied, bias_delta),
             new_state=new_state,
-            metrics={
-                "mean_step_size": jnp.mean(new_step_sizes),
-                "min_step_size": jnp.min(new_step_sizes),
-                "max_step_size": jnp.max(new_step_sizes),
-                "mean_normalizer": jnp.mean(new_normalizers),
-            },
+            metrics=metrics,
+            update_applied=update_applied,
         )
 
 
@@ -1245,7 +1425,7 @@ class AutostepGTDLambda(Optimizer[AutostepGTDLambdaState]):
         )
         base_update = self._base.update(base_state, error, eligibility)
         new_base_state = cast(AutostepState, base_update.new_state)
-        new_state = AutostepGTDLambdaState(
+        candidate_state = AutostepGTDLambdaState(
             step_sizes=new_base_state.step_sizes,
             traces=new_base_state.traces,
             normalizers=new_base_state.normalizers,
@@ -1258,11 +1438,19 @@ class AutostepGTDLambda(Optimizer[AutostepGTDLambdaState]):
             bias_normalizer=new_base_state.bias_normalizer,
             bias_eligibility_trace=bias_eligibility,
         )
+        update_applied = (
+            base_update.update_applied
+            & floating_tree_is_finite(state)
+            & jnp.all(jnp.isfinite(observation))
+            & floating_tree_is_finite(candidate_state)
+        )
+        new_state = select_transaction(update_applied, candidate_state, state)
         return OptimizerUpdate(
-            weight_delta=base_update.weight_delta,
-            bias_delta=base_update.bias_delta,
+            weight_delta=neutralize_array(update_applied, base_update.weight_delta),
+            bias_delta=neutralize_array(update_applied, base_update.bias_delta),
             new_state=new_state,
-            metrics=base_update.metrics,
+            metrics=neutralize_metrics(update_applied, base_update.metrics),
+            update_applied=update_applied,
         )
 
 
@@ -1385,11 +1573,24 @@ class ObGD(Optimizer[ObGDState]):
         # Effective step-size: alpha / max(M, 1)
         alpha_eff = alpha / jnp.maximum(dot_product, 1.0)
 
-        # Weight and bias deltas
-        weight_delta = alpha_eff * error_scalar * new_traces
-        bias_delta = alpha_eff * error_scalar * new_bias_trace
+        # Weight and bias deltas. An infinite bound collapses ``alpha_eff``
+        # to zero, so the resulting 0*inf is the bound's exact no-op. A NaN
+        # from any other source remains visible.
+        collapsed = alpha_eff == 0
+        raw_weight_step = error_scalar * new_traces
+        raw_bias_step = error_scalar * new_bias_trace
+        weight_delta = zero_if_collapsed_infinity(
+            alpha_eff * raw_weight_step,
+            error_scalar,
+            collapsed,
+        )
+        bias_delta = zero_if_collapsed_infinity(
+            alpha_eff * raw_bias_step,
+            error_scalar,
+            collapsed,
+        )
 
-        new_state = ObGDState(
+        candidate_state = ObGDState(
             step_size=alpha,
             kappa=kappa,
             traces=new_traces,
@@ -1397,16 +1598,30 @@ class ObGD(Optimizer[ObGDState]):
             gamma=state.gamma,
             lamda=state.lamda,
         )
+        candidate_metrics = {
+            "step_size": alpha,
+            "effective_step_size": alpha_eff,
+            "bounding_factor": dot_product,
+        }
+
+        update_applied = (
+            floating_tree_is_finite(state)
+            & jnp.isfinite(error_scalar)
+            & jnp.all(jnp.isfinite(observation))
+            & jnp.all(jnp.isfinite(weight_delta))
+            & jnp.isfinite(bias_delta)
+            & floating_tree_is_finite(candidate_state)
+            & floating_tree_is_finite(candidate_metrics)
+        )
+        new_state = select_transaction(update_applied, candidate_state, state)
+        metrics = neutralize_metrics(update_applied, candidate_metrics)
 
         return OptimizerUpdate(
-            weight_delta=weight_delta,
-            bias_delta=bias_delta,
+            weight_delta=neutralize_array(update_applied, weight_delta),
+            bias_delta=neutralize_array(update_applied, bias_delta),
             new_state=new_state,
-            metrics={
-                "step_size": alpha,
-                "effective_step_size": alpha_eff,
-                "bounding_factor": dot_product,
-            },
+            metrics=metrics,
+            update_applied=update_applied,
         )
 
 
@@ -1430,6 +1645,7 @@ class TDOptimizerUpdate:
     bias_delta: Float[Array, ""]
     new_state: TDIDBDState | AutoTDIDBDState
     metrics: dict[str, Array]
+    update_applied: Bool[Array, ""]
 
 
 class TDOptimizer[StateT: (TDIDBDState, AutoTDIDBDState)](ABC):
@@ -1568,13 +1784,17 @@ class TDIDBD(TDOptimizer[TDIDBDState]):
 
         if self._use_semi_gradient:
             gradient_correlation = delta * observation * state.h_traces
-            new_log_step_sizes = state.log_step_sizes + theta * gradient_correlation
+            meta_delta = theta * gradient_correlation
         else:
             feature_diff = gamma_scalar * next_observation - observation
             gradient_correlation = delta * feature_diff * state.h_traces
-            new_log_step_sizes = state.log_step_sizes - theta * gradient_correlation
+            meta_delta = -theta * gradient_correlation
 
-        new_log_step_sizes = jnp.clip(new_log_step_sizes, -10.0, 2.0)
+        new_log_step_sizes = jnp.where(
+            jnp.isfinite(meta_delta),
+            jnp.clip(state.log_step_sizes + meta_delta, -10.0, 2.0),
+            state.log_step_sizes,
+        )
         new_alphas = jnp.exp(new_log_step_sizes)
 
         new_eligibility_traces = gamma_scalar * lam * state.eligibility_traces + observation
@@ -1591,13 +1811,17 @@ class TDIDBD(TDOptimizer[TDIDBDState]):
         # Bias updates
         if self._use_semi_gradient:
             bias_gradient_correlation = delta * state.bias_h_trace
-            new_bias_log_step_size = state.bias_log_step_size + theta * bias_gradient_correlation
+            bias_meta_delta = theta * bias_gradient_correlation
         else:
             bias_feature_diff = gamma_scalar - 1.0
             bias_gradient_correlation = delta * bias_feature_diff * state.bias_h_trace
-            new_bias_log_step_size = state.bias_log_step_size - theta * bias_gradient_correlation
+            bias_meta_delta = -theta * bias_gradient_correlation
 
-        new_bias_log_step_size = jnp.clip(new_bias_log_step_size, -10.0, 2.0)
+        new_bias_log_step_size = jnp.where(
+            jnp.isfinite(bias_meta_delta),
+            jnp.clip(state.bias_log_step_size + bias_meta_delta, -10.0, 2.0),
+            state.bias_log_step_size,
+        )
         new_bias_alpha = jnp.exp(new_bias_log_step_size)
 
         new_bias_eligibility_trace = gamma_scalar * lam * state.bias_eligibility_trace + 1.0
@@ -1619,7 +1843,7 @@ class TDIDBD(TDOptimizer[TDIDBDState]):
                 + new_bias_alpha * delta * new_bias_eligibility_trace
             )
 
-        new_state = TDIDBDState(
+        candidate_state = TDIDBDState(
             log_step_sizes=new_log_step_sizes,
             eligibility_traces=new_eligibility_traces,
             h_traces=new_h_traces,
@@ -1629,17 +1853,38 @@ class TDIDBD(TDOptimizer[TDIDBDState]):
             bias_eligibility_trace=new_bias_eligibility_trace,
             bias_h_trace=new_bias_h_trace,
         )
+        candidate_metrics = {
+            "mean_step_size": jnp.mean(new_alphas),
+            "min_step_size": jnp.min(new_alphas),
+            "max_step_size": jnp.max(new_alphas),
+            "mean_eligibility_trace": jnp.mean(jnp.abs(new_eligibility_traces)),
+        }
+
+        inputs_valid = (
+            jnp.isfinite(delta)
+            & jnp.all(jnp.isfinite(observation))
+            & jnp.all(jnp.isfinite(next_observation))
+            & jnp.isfinite(gamma_scalar)
+        )
+        update_applied = (
+            floating_tree_is_finite(state)
+            & inputs_valid
+            & jnp.all(jnp.isfinite(meta_delta))
+            & jnp.isfinite(bias_meta_delta)
+            & jnp.all(jnp.isfinite(weight_delta))
+            & jnp.isfinite(bias_delta)
+            & floating_tree_is_finite(candidate_state)
+            & floating_tree_is_finite(candidate_metrics)
+        )
+        new_state = select_transaction(update_applied, candidate_state, state)
+        metrics = neutralize_metrics(update_applied, candidate_metrics)
 
         return TDOptimizerUpdate(
-            weight_delta=weight_delta,
-            bias_delta=bias_delta,
+            weight_delta=neutralize_array(update_applied, weight_delta),
+            bias_delta=neutralize_array(update_applied, bias_delta),
             new_state=new_state,
-            metrics={
-                "mean_step_size": jnp.mean(new_alphas),
-                "min_step_size": jnp.min(new_alphas),
-                "max_step_size": jnp.max(new_alphas),
-                "mean_eligibility_trace": jnp.mean(jnp.abs(new_eligibility_traces)),
-            },
+            metrics=metrics,
+            update_applied=update_applied,
         )
 
 
@@ -1808,7 +2053,7 @@ class AutoTDIDBD(TDOptimizer[AutoTDIDBDState]):
             state.bias_h_trace * bias_h_decay + new_bias_alpha * delta * new_bias_eligibility_trace
         )
 
-        new_state = AutoTDIDBDState(
+        candidate_state = AutoTDIDBDState(
             log_step_sizes=new_log_step_sizes,
             eligibility_traces=new_eligibility_traces,
             h_traces=new_h_traces,
@@ -1821,18 +2066,37 @@ class AutoTDIDBD(TDOptimizer[AutoTDIDBDState]):
             bias_h_trace=new_bias_h_trace,
             bias_normalizer=new_bias_normalizer,
         )
+        candidate_metrics = {
+            "mean_step_size": jnp.mean(new_alphas),
+            "min_step_size": jnp.min(new_alphas),
+            "max_step_size": jnp.max(new_alphas),
+            "mean_eligibility_trace": jnp.mean(jnp.abs(new_eligibility_traces)),
+            "mean_normalizer": jnp.mean(new_normalizers),
+        }
+
+        inputs_valid = (
+            jnp.isfinite(delta)
+            & jnp.all(jnp.isfinite(observation))
+            & jnp.all(jnp.isfinite(next_observation))
+            & jnp.isfinite(gamma_scalar)
+        )
+        update_applied = (
+            floating_tree_is_finite(state)
+            & inputs_valid
+            & jnp.all(jnp.isfinite(weight_delta))
+            & jnp.isfinite(bias_delta)
+            & floating_tree_is_finite(candidate_state)
+            & floating_tree_is_finite(candidate_metrics)
+        )
+        new_state = select_transaction(update_applied, candidate_state, state)
+        metrics = neutralize_metrics(update_applied, candidate_metrics)
 
         return TDOptimizerUpdate(
-            weight_delta=weight_delta,
-            bias_delta=bias_delta,
+            weight_delta=neutralize_array(update_applied, weight_delta),
+            bias_delta=neutralize_array(update_applied, bias_delta),
             new_state=new_state,
-            metrics={
-                "mean_step_size": jnp.mean(new_alphas),
-                "min_step_size": jnp.min(new_alphas),
-                "max_step_size": jnp.max(new_alphas),
-                "mean_eligibility_trace": jnp.mean(jnp.abs(new_eligibility_traces)),
-                "mean_normalizer": jnp.mean(new_normalizers),
-            },
+            metrics=metrics,
+            update_applied=update_applied,
         )
 
 

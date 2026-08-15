@@ -41,6 +41,11 @@ from alberta_framework.core.resource_manager import (
     GeneratorMetaResourceManager,
     GeneratorMetaResourceManagerState,
 )
+from alberta_framework.core.update_safety import (
+    floating_tree_is_finite,
+    neutralize_array,
+    select_transaction,
+)
 
 OP_RAW = 0
 OP_PRODUCT = 1
@@ -356,6 +361,7 @@ class CompositionalFeatureUpdateResult:
     replaced_slot: Int[Array, ""]
     promoted_candidate: Int[Array, ""]
     curation_trace: CompositionalCurationTrace
+    update_applied: Bool[Array, ""]
 
 
 @chex.dataclass(frozen=True)
@@ -364,6 +370,7 @@ class CompositionalFeatureLearningResult:
 
     state: CompositionalFeatureState
     metrics: Float[Array, "num_steps 7"]
+    updates_applied: Bool[Array, " num_steps"]
 
 
 @chex.dataclass(frozen=True)
@@ -2506,6 +2513,13 @@ class CompositionalFeatureLearner:
         context_id: Array | int = 0,
     ) -> CompositionalFeatureUpdateResult:
         """Perform one temporally-uniform compositional-feature update."""
+        source_state_finite = floating_tree_is_finite(state)
+        context_input = jnp.asarray(context_id)
+        inputs_valid = (
+            jnp.all(jnp.isfinite(observation))
+            & jnp.all(jnp.isfinite(targets) | jnp.isnan(targets))
+            & jnp.all(jnp.isfinite(context_input))
+        )
         context = jnp.asarray(context_id, dtype=jnp.int32)
         active_mask = ~jnp.isnan(targets)
         safe_targets = jnp.where(active_mask, targets, 0.0)
@@ -4117,7 +4131,7 @@ class CompositionalFeatureLearner:
                 selected_probability=decision.weights[decision.action],
             ).state
 
-        new_state = CompositionalFeatureState(
+        candidate_state = CompositionalFeatureState(
             key=key,
             ops=ops,
             parent_a=parent_a,
@@ -4292,14 +4306,39 @@ class CompositionalFeatureLearner:
             logical_event_count=logical_event_count,
         )
 
+        update_applied = (
+            source_state_finite
+            & inputs_valid
+            & floating_tree_is_finite(candidate_state)
+            & floating_tree_is_finite(curation_trace)
+            & jnp.all(jnp.isfinite(predictions))
+            & jnp.all(jnp.isfinite(reported_errors) | jnp.isnan(reported_errors))
+            & jnp.all(jnp.isfinite(metrics))
+        )
+        new_state = select_transaction(update_applied, candidate_state, state)
+        neutral_slot = jnp.asarray(-1, dtype=jnp.int32)
+        neutral_curation_trace = jax.tree.map(jnp.zeros_like, curation_trace).replace(
+            pre_step=state.step_count,
+            post_step=state.step_count,
+        )
+
         return CompositionalFeatureUpdateResult(
             state=new_state,
-            predictions=predictions,
-            errors=reported_errors,
-            metrics=metrics,
-            replaced_slot=replaced_slot,
-            promoted_candidate=promoted_candidate,
-            curation_trace=curation_trace,
+            predictions=neutralize_array(update_applied, predictions),
+            errors=neutralize_array(update_applied, reported_errors),
+            metrics=neutralize_array(update_applied, metrics),
+            replaced_slot=jnp.where(update_applied, replaced_slot, neutral_slot),
+            promoted_candidate=jnp.where(
+                update_applied,
+                promoted_candidate,
+                neutral_slot,
+            ),
+            curation_trace=select_transaction(
+                update_applied,
+                curation_trace,
+                neutral_curation_trace,
+            ),
+            update_applied=update_applied,
         )
 
 
@@ -4314,18 +4353,24 @@ def run_compositional_arrays(
     def step_fn(
         carry: CompositionalFeatureState,
         inputs: tuple[Array, Array],
-    ) -> tuple[CompositionalFeatureState, Array]:
+    ) -> tuple[CompositionalFeatureState, tuple[Array, Array]]:
         observation, target = inputs
         result = learner.update(carry, observation, target)
-        return result.state, result.metrics
+        return result.state, (result.metrics, result.update_applied)
 
     t0 = time.time()
-    final_state, metrics = jax.lax.scan(step_fn, state, (observations, targets))
+    final_state, (metrics, updates_applied) = jax.lax.scan(
+        step_fn, state, (observations, targets)
+    )
     elapsed = time.time() - t0
     final_state = final_state.replace(  # type: ignore[attr-defined]
         uptime_s=final_state.uptime_s + elapsed
     )
-    return CompositionalFeatureLearningResult(state=final_state, metrics=metrics)
+    return CompositionalFeatureLearningResult(
+        state=final_state,
+        metrics=metrics,
+        updates_applied=updates_applied,
+    )
 
 
 def run_compositional_loop(
@@ -4344,18 +4389,25 @@ def run_compositional_loop(
     def step_fn(
         carry: tuple[CompositionalFeatureState, Any],
         idx: Array,
-    ) -> tuple[tuple[CompositionalFeatureState, Any], Array]:
+    ) -> tuple[tuple[CompositionalFeatureState, Any], tuple[Array, Array]]:
         l_state, s_state = carry
         timestep, new_s_state = stream.step(s_state, idx)
         result = learner.update(l_state, timestep.observation, timestep.target)
-        return (result.state, new_s_state), result.metrics
+        return (
+            result.state,
+            new_s_state,
+        ), (result.metrics, result.update_applied)
 
     t0 = time.time()
-    (final_state, _), metrics = jax.lax.scan(
+    (final_state, _), (metrics, updates_applied) = jax.lax.scan(
         step_fn, (learner_state, stream_state), jnp.arange(num_steps)
     )
     elapsed = time.time() - t0
     final_state = final_state.replace(  # type: ignore[attr-defined]
         uptime_s=final_state.uptime_s + elapsed
     )
-    return CompositionalFeatureLearningResult(state=final_state, metrics=metrics)
+    return CompositionalFeatureLearningResult(
+        state=final_state,
+        metrics=metrics,
+        updates_applied=updates_applied,
+    )

@@ -34,14 +34,24 @@ References:
   for AI Research" (arXiv: 2208.11173)
 """
 
-from typing import Any
+from typing import Any, cast
 
 import chex
 import jax.numpy as jnp
 from jax import Array
 from jaxtyping import Float
 
-from alberta_framework.core.optimizers import Optimizer, OptimizerUpdate
+from alberta_framework.core.optimizers import (
+    Optimizer,
+    OptimizerUpdate,
+    ParamOptimizerUpdate,
+)
+from alberta_framework.core.update_safety import (
+    floating_tree_is_finite,
+    neutralize_array,
+    neutralize_metrics,
+    select_transaction,
+)
 
 # =============================================================================
 # State dataclasses
@@ -277,7 +287,7 @@ class AdaGain(Optimizer[Any]):
             + trace_mix * bias_gradient
         )
 
-        new_state = AdaGainState(
+        candidate_state = AdaGainState(
             step_sizes=new_step_sizes,
             gradient_trace=new_gradient_trace,
             bias_step_size=new_bias_step_size,
@@ -285,15 +295,28 @@ class AdaGain(Optimizer[Any]):
             meta_step_size=state.meta_step_size,
             forgetting_rate=state.forgetting_rate,
         )
+        candidate_metrics = {
+            "mean_step_size": jnp.mean(new_step_sizes),
+            "min_step_size": jnp.min(new_step_sizes),
+            "max_step_size": jnp.max(new_step_sizes),
+        }
+        update_applied = (
+            floating_tree_is_finite(state)
+            & jnp.isfinite(error_scalar)
+            & jnp.all(jnp.isfinite(observation))
+            & jnp.all(jnp.isfinite(weight_delta))
+            & jnp.isfinite(bias_delta)
+            & floating_tree_is_finite(candidate_state)
+            & floating_tree_is_finite(candidate_metrics)
+        )
+        new_state = select_transaction(update_applied, candidate_state, state)
+        metrics = neutralize_metrics(update_applied, candidate_metrics)
         return OptimizerUpdate(
-            weight_delta=weight_delta,
-            bias_delta=bias_delta,
+            weight_delta=neutralize_array(update_applied, weight_delta),
+            bias_delta=neutralize_array(update_applied, bias_delta),
             new_state=new_state,
-            metrics={
-                "mean_step_size": jnp.mean(new_step_sizes),
-                "min_step_size": jnp.min(new_step_sizes),
-                "max_step_size": jnp.max(new_step_sizes),
-            },
+            metrics=metrics,
+            update_applied=update_applied,
         )
 
 
@@ -422,6 +445,18 @@ class Adam(Optimizer[Any]):
         error: Array | None = None,
         param: Array | None = None,
     ) -> tuple[Array, AdamParamState]:
+        """Return the historical unchecked pair for compatibility."""
+
+        result = self.update_from_gradient_checked(state, gradient, error, param)
+        return result.step, cast(AdamParamState, result.new_state)
+
+    def update_from_gradient_checked(
+        self,
+        state: AdamParamState,
+        gradient: Array,
+        error: Array | None = None,
+        param: Array | None = None,
+    ) -> ParamOptimizerUpdate:
         """Compute Adam step from a pre-computed gradient (MLP path).
 
         The returned step has the SAME sign as the descent step, i.e.
@@ -471,7 +506,7 @@ class Adam(Optimizer[Any]):
         if self._weight_decay != 0.0 and param is not None:
             step = step + state.step_size * self._weight_decay * param
 
-        new_state = AdamParamState(
+        candidate_state = AdamParamState(
             m=new_m,
             v=new_v,
             t=new_t,
@@ -480,7 +515,29 @@ class Adam(Optimizer[Any]):
             beta2=state.beta2,
             eps=state.eps,
         )
-        return step, new_state
+        error_is_finite = (
+            jnp.asarray(True, dtype=jnp.bool_)
+            if error is None
+            else jnp.all(jnp.isfinite(error))
+        )
+        param_is_finite = (
+            jnp.asarray(True, dtype=jnp.bool_)
+            if param is None
+            else jnp.all(jnp.isfinite(param))
+        )
+        update_applied = (
+            floating_tree_is_finite(state)
+            & jnp.all(jnp.isfinite(gradient))
+            & error_is_finite
+            & param_is_finite
+            & jnp.all(jnp.isfinite(step))
+            & floating_tree_is_finite(candidate_state)
+        )
+        return ParamOptimizerUpdate(
+            step=neutralize_array(update_applied, step),
+            new_state=select_transaction(update_applied, candidate_state, state),
+            update_applied=update_applied,
+        )
 
     def update(
         self,
@@ -527,7 +584,7 @@ class Adam(Optimizer[Any]):
         weight_delta = -state.step_size * m_hat / (jnp.sqrt(v_hat) + state.eps)
         bias_delta = -state.step_size * bias_m_hat / (jnp.sqrt(bias_v_hat) + state.eps)
 
-        new_state = AdamState(
+        candidate_state = AdamState(
             m=new_m,
             v=new_v,
             bias_m=new_bias_m,
@@ -538,17 +595,31 @@ class Adam(Optimizer[Any]):
             beta2=state.beta2,
             eps=state.eps,
         )
+        candidate_metrics = {
+            "step_size": state.step_size,
+            "mean_m": jnp.mean(new_m),
+            "mean_v": jnp.mean(new_v),
+            "t": new_t,
+        }
+
+        update_applied = (
+            floating_tree_is_finite(state)
+            & jnp.isfinite(error_scalar)
+            & jnp.all(jnp.isfinite(observation))
+            & jnp.all(jnp.isfinite(weight_delta))
+            & jnp.isfinite(bias_delta)
+            & floating_tree_is_finite(candidate_state)
+            & floating_tree_is_finite(candidate_metrics)
+        )
+        new_state = select_transaction(update_applied, candidate_state, state)
+        metrics = neutralize_metrics(update_applied, candidate_metrics)
 
         return OptimizerUpdate(
-            weight_delta=weight_delta,
-            bias_delta=bias_delta,
+            weight_delta=neutralize_array(update_applied, weight_delta),
+            bias_delta=neutralize_array(update_applied, bias_delta),
             new_state=new_state,
-            metrics={
-                "step_size": state.step_size,
-                "mean_m": jnp.mean(new_m),
-                "mean_v": jnp.mean(new_v),
-                "t": new_t,
-            },
+            metrics=metrics,
+            update_applied=update_applied,
         )
 
 
@@ -639,6 +710,17 @@ class RMSprop(Optimizer[Any]):
         gradient: Array,
         error: Array | None = None,
     ) -> tuple[Array, RMSpropParamState]:
+        """Return the historical unchecked pair for compatibility."""
+
+        result = self.update_from_gradient_checked(state, gradient, error)
+        return result.step, cast(RMSpropParamState, result.new_state)
+
+    def update_from_gradient_checked(
+        self,
+        state: RMSpropParamState,
+        gradient: Array,
+        error: Array | None = None,
+    ) -> ParamOptimizerUpdate:
         """Compute RMSprop step from a pre-computed gradient (MLP path).
 
         When ``error`` is supplied, the effective gradient is treated as
@@ -661,13 +743,29 @@ class RMSprop(Optimizer[Any]):
         new_v = state.decay * state.v + (1.0 - state.decay) * g**2
         step = state.step_size * g / (jnp.sqrt(new_v) + state.eps)
 
-        new_state = RMSpropParamState(
+        candidate_state = RMSpropParamState(
             v=new_v,
             step_size=state.step_size,
             decay=state.decay,
             eps=state.eps,
         )
-        return step, new_state
+        error_is_finite = (
+            jnp.asarray(True, dtype=jnp.bool_)
+            if error is None
+            else jnp.all(jnp.isfinite(error))
+        )
+        update_applied = (
+            floating_tree_is_finite(state)
+            & jnp.all(jnp.isfinite(gradient))
+            & error_is_finite
+            & jnp.all(jnp.isfinite(step))
+            & floating_tree_is_finite(candidate_state)
+        )
+        return ParamOptimizerUpdate(
+            step=neutralize_array(update_applied, step),
+            new_state=select_transaction(update_applied, candidate_state, state),
+            update_applied=update_applied,
+        )
 
     def update(
         self,
@@ -701,22 +799,36 @@ class RMSprop(Optimizer[Any]):
         weight_delta = -state.step_size * g / (jnp.sqrt(new_v) + state.eps)
         bias_delta = -state.step_size * g_b / (jnp.sqrt(new_bias_v) + state.eps)
 
-        new_state = RMSpropState(
+        candidate_state = RMSpropState(
             v=new_v,
             bias_v=new_bias_v,
             step_size=state.step_size,
             decay=state.decay,
             eps=state.eps,
         )
+        candidate_metrics = {
+            "step_size": state.step_size,
+            "mean_v": jnp.mean(new_v),
+        }
+
+        update_applied = (
+            floating_tree_is_finite(state)
+            & jnp.isfinite(error_scalar)
+            & jnp.all(jnp.isfinite(observation))
+            & jnp.all(jnp.isfinite(weight_delta))
+            & jnp.isfinite(bias_delta)
+            & floating_tree_is_finite(candidate_state)
+            & floating_tree_is_finite(candidate_metrics)
+        )
+        new_state = select_transaction(update_applied, candidate_state, state)
+        metrics = neutralize_metrics(update_applied, candidate_metrics)
 
         return OptimizerUpdate(
-            weight_delta=weight_delta,
-            bias_delta=bias_delta,
+            weight_delta=neutralize_array(update_applied, weight_delta),
+            bias_delta=neutralize_array(update_applied, bias_delta),
             new_state=new_state,
-            metrics={
-                "step_size": state.step_size,
-                "mean_v": jnp.mean(new_v),
-            },
+            metrics=metrics,
+            update_applied=update_applied,
         )
 
 
@@ -818,20 +930,34 @@ class NADALINE(Optimizer[Any]):
         # Bias uses plain LMS -- no normalization (x_b == 1).
         bias_delta = state.step_size * error_scalar
 
-        new_state = NadalineState(
+        candidate_state = NadalineState(
             feature_second_moment=new_second_moment,
             step_size=state.step_size,
             decay=state.decay,
             eps=state.eps,
         )
+        candidate_metrics = {
+            "step_size": state.step_size,
+            "mean_second_moment": jnp.mean(new_second_moment),
+            "mean_denom": jnp.mean(denom),
+        }
+
+        update_applied = (
+            floating_tree_is_finite(state)
+            & jnp.isfinite(error_scalar)
+            & jnp.all(jnp.isfinite(observation))
+            & jnp.all(jnp.isfinite(weight_delta))
+            & jnp.isfinite(bias_delta)
+            & floating_tree_is_finite(candidate_state)
+            & floating_tree_is_finite(candidate_metrics)
+        )
+        new_state = select_transaction(update_applied, candidate_state, state)
+        metrics = neutralize_metrics(update_applied, candidate_metrics)
 
         return OptimizerUpdate(
-            weight_delta=weight_delta,
-            bias_delta=bias_delta,
+            weight_delta=neutralize_array(update_applied, weight_delta),
+            bias_delta=neutralize_array(update_applied, bias_delta),
             new_state=new_state,
-            metrics={
-                "step_size": state.step_size,
-                "mean_second_moment": jnp.mean(new_second_moment),
-                "mean_denom": jnp.mean(denom),
-            },
+            metrics=metrics,
+            update_applied=update_applied,
         )

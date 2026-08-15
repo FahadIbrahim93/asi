@@ -28,7 +28,7 @@ import chex
 import jax
 import jax.numpy as jnp
 from jax import Array
-from jaxtyping import Float
+from jaxtyping import Bool, Float
 
 from alberta_framework.core.initializers import sparse_init
 from alberta_framework.core.normalizers import (
@@ -68,6 +68,11 @@ from alberta_framework.core.types import (
     TDLearnerState,
     TDTimeStep,
 )
+from alberta_framework.core.update_safety import (
+    floating_tree_is_finite,
+    neutralize_array,
+    select_transaction,
+)
 from alberta_framework.streams.base import ScanStream
 
 # Type variable for TD stream state
@@ -97,12 +102,14 @@ class UpdateResult:
         error: Prediction error
         metrics: Array of metrics -- shape (3,) without normalizer,
             (4,) with normalizer
+        update_applied: Whether the complete learner transaction committed
     """
 
     state: LearnerState
     prediction: Prediction
     error: Float[Array, ""]
     metrics: Array
+    update_applied: Bool[Array, ""]
 
 
 @chex.dataclass(frozen=True)
@@ -261,7 +268,7 @@ class LinearLearner:
         new_weights = state.weights + opt_update.weight_delta
         new_bias = state.bias + opt_update.bias_delta
 
-        new_state = LearnerState(
+        candidate_state = LearnerState(
             weights=new_weights,
             bias=new_bias,
             optimizer_state=opt_update.new_state,
@@ -286,11 +293,31 @@ class LinearLearner:
                 [squared_error, error, mean_step_size], dtype=jnp.float32
             )
 
+        inputs_valid = jnp.all(jnp.isfinite(observation)) & jnp.all(
+            jnp.isfinite(target)
+        )
+        update_applied = (
+            floating_tree_is_finite(state)
+            & inputs_valid
+            & opt_update.update_applied
+            & floating_tree_is_finite(candidate_state)
+            & jnp.all(jnp.isfinite(prediction))
+            & jnp.isfinite(error)
+            & jnp.all(jnp.isfinite(metrics))
+        )
+        new_state = select_transaction(
+            update_applied, candidate_state, state
+        ).replace(  # type: ignore[attr-defined]
+            birth_timestamp=state.birth_timestamp,
+            uptime_s=state.uptime_s,
+        )
+
         return UpdateResult(
             state=new_state,
-            prediction=prediction,
-            error=jnp.atleast_1d(error),
-            metrics=metrics,
+            prediction=neutralize_array(update_applied, prediction),
+            error=neutralize_array(update_applied, jnp.atleast_1d(error)),
+            metrics=neutralize_array(update_applied, metrics),
+            update_applied=update_applied,
         )
 
 
@@ -1599,6 +1626,7 @@ class TDUpdateResult:
     prediction: Prediction
     td_error: Float[Array, ""]
     metrics: Float[Array, " 4"]
+    update_applied: Bool[Array, ""]
 
 
 class TDLinearLearner:
@@ -1706,7 +1734,7 @@ class TDLinearLearner:
         new_weights = state.weights + opt_update.weight_delta
         new_bias = state.bias + opt_update.bias_delta
 
-        new_state = TDLearnerState(
+        candidate_state = TDLearnerState(
             weights=new_weights,
             bias=new_bias,
             optimizer_state=opt_update.new_state,
@@ -1724,11 +1752,34 @@ class TDLinearLearner:
             dtype=jnp.float32,
         )
 
+        inputs_valid = (
+            jnp.all(jnp.isfinite(observation))
+            & jnp.all(jnp.isfinite(reward))
+            & jnp.all(jnp.isfinite(next_observation))
+            & jnp.all(jnp.isfinite(gamma))
+        )
+        update_applied = (
+            floating_tree_is_finite(state)
+            & inputs_valid
+            & opt_update.update_applied
+            & floating_tree_is_finite(candidate_state)
+            & jnp.all(jnp.isfinite(prediction))
+            & jnp.isfinite(td_error)
+            & jnp.all(jnp.isfinite(metrics))
+        )
+        new_state = select_transaction(
+            update_applied, candidate_state, state
+        ).replace(  # type: ignore[attr-defined]
+            birth_timestamp=state.birth_timestamp,
+            uptime_s=state.uptime_s,
+        )
+
         return TDUpdateResult(
             state=new_state,
-            prediction=prediction,
-            td_error=jnp.atleast_1d(td_error),
-            metrics=metrics,
+            prediction=neutralize_array(update_applied, prediction),
+            td_error=neutralize_array(update_applied, jnp.atleast_1d(td_error)),
+            metrics=neutralize_array(update_applied, metrics),
+            update_applied=update_applied,
         )
 
 

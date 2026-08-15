@@ -368,21 +368,15 @@ class TestAutostep:
             jnp.array([1e20, 1.0], dtype=jnp.float32),
         )
 
+        assert not bool(result.update_applied)
         chex.assert_tree_all_finite(result.new_state)
-        chex.assert_trees_all_close(result.new_state.normalizers, state.normalizers)
-        chex.assert_trees_all_close(result.new_state.traces, state.traces)
-        chex.assert_trees_all_close(
-            result.new_state.step_sizes, jnp.full(2, 1e-8, dtype=jnp.float32)
-        )
-        assert float(result.new_state.bias_step_size) == pytest.approx(1e-8)
-        chex.assert_trees_all_close(result.new_state.bias_trace, state.bias_trace)
-        chex.assert_trees_all_close(
-            result.new_state.bias_normalizer, state.bias_normalizer
-        )
+        chex.assert_trees_all_equal(result.new_state, state)
+        chex.assert_trees_all_equal(result.weight_delta, jnp.zeros(2))
+        chex.assert_trees_all_equal(result.bias_delta, jnp.array(0.0))
         chex.assert_tree_all_finite(result.weight_delta)
 
     def test_infinite_error_on_silent_feature_has_zero_channel_update(self):
-        """The undefined 0*inf channel stays inert without hiding genuine inf."""
+        """A non-finite public error rejects the complete optimizer update."""
         optimizer = Autostep(initial_step_size=0.01, meta_step_size=0.01)
         state = optimizer.init(feature_dim=2)
 
@@ -392,9 +386,10 @@ class TestAutostep:
             jnp.array([0.0, 1.0], dtype=jnp.float32),
         )
 
-        assert float(result.weight_delta[0]) == 0.0
-        assert bool(jnp.isinf(result.weight_delta[1]))
-        chex.assert_trees_all_close(result.new_state, state)
+        assert not bool(result.update_applied)
+        chex.assert_trees_all_equal(result.weight_delta, jnp.zeros(2))
+        chex.assert_trees_all_equal(result.bias_delta, jnp.array(0.0))
+        chex.assert_trees_all_equal(result.new_state, state)
 
     def test_nonfinite_guards_compile_under_jit(self):
         import jax
@@ -406,7 +401,8 @@ class TestAutostep:
             jnp.array(jnp.inf, dtype=jnp.float32),
             jnp.array([0.0, 1.0], dtype=jnp.float32),
         )
-        assert float(result.weight_delta[0]) == 0.0
+        assert not bool(result.update_applied)
+        chex.assert_trees_all_equal(result.weight_delta, jnp.zeros(2))
         chex.assert_tree_all_finite(result.new_state)
 
         param_state = optimizer.init_for_shape((2,))
