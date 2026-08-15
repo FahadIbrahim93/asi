@@ -30,30 +30,50 @@ governing both paths.
 
 ## Decision
 
-ASI will define one semantic reference-agent protocol and implement adapters for
-concrete agents and environments. The protocol owns lifecycle, dispatch,
+ASI defines one semantic reference-agent protocol and will implement adapters
+for concrete agents and environments. The protocol owns lifecycle, dispatch,
 transition, checkpoint, and measurement semantics; it does not prescribe a
 particular learner, observation encoding, or action tensor shape.
 
-There is one authoritative life runner. Agent, environment, dispatch/safety,
-and metric adapters expose all mutable state to that runner. They may use
-functional or object-oriented internals, but no protocol implementation may
-hide mutable state that affects a future observation, action, update, metric,
-or replay decision.
+A conforming implementation requires one authoritative life runner. Agent,
+environment, dispatch/safety, and metric adapters expose all mutable state to
+that runner. They may use functional or object-oriented internals, but no
+protocol implementation may hide mutable state that affects a future
+observation, action, update, metric, or replay decision.
 
 The selected direction is therefore the shared-protocol path. The ADR remains
 Proposed until the conformance and exact-resume gates below pass. A separate
 record must name the first `reference-dev` configuration after those gates; this
 document cannot do so by assertion.
 
+### Implemented L0 transaction slice
+
+The [versioned host transaction module](../../alberta_framework/reference_agent.py)
+and its [14 retained tests](../../tests/test_reference_agent_protocol.py)
+implement the first acceptance slice:
+
+- canonical configuration and manifest identities plus fixed, exact-dtype
+  observation/action spaces;
+- deeply immutable typed payloads and manifest-bound, lifecycle-scoped decisions;
+- separate independent authorization, learner settlement, executor receipt, and
+  receipt-bound outcome records;
+- explicit bootstrap and post-reset observation identities at episode boundaries;
+- an immutable transaction state and functional phase ledger from `ready` through
+  `armed`, `authorized`, `settled`, `dispatched`, and `outcome`, with fail-closed
+  halt behavior; and
+- acceptance/rejection records that forbid a rejected event from reporting a
+  parameter change or arming a next decision and require it to remain retryable.
+
+This is an L0 host transaction contract, not an agent, environment, safety, or
+metrics adapter. It does not implement the canonical life configuration,
+aggregate life state, authoritative runner, whole-life checkpoint, exact resume,
+or `reference-dev`. The `exact_checkpoint_resume` capability is a declaration,
+not evidence that the exact-resume gate passed.
+
 ## Protocol records
 
 Exact Python names and packaging may be refined during implementation, but the
 following semantic records are required and versioned.
-
-The initial L0 record and structural protocol surface is implemented in
-`alberta_framework.reference_agent`. It does not yet provide a concrete adapter,
-aggregate life runner, checkpoint bundle, or exact-resume conformance result.
 
 ### Life configuration
 
@@ -92,22 +112,26 @@ owner and no parameter-only checkpoint exception.
 
 ### Decision, authorization, and outcome
 
-Every decision has a lifecycle-scoped, non-reusable decision ID, the observation
-identity from which it was produced, the proposed action, an action-codec ID,
-and an armed/disarmed status.
+Every decision has a manifest identity, lifecycle-scoped non-reusable decision
+ID and index, the observation identity from which it was produced, an immutable
+typed proposed action carrying its codec semantic ID, and an armed/disarmed
+status.
 
 Before an action reaches an environment, an independent dispatch/safety adapter
 returns an authorization record bound to that decision ID. It contains the
-actual action to dispatch, whether it differs from the proposal, the authority
-and policy version that made the decision, and a dispatch receipt ID. The agent
-adapter must settle credit ownership on the actual action before dispatch. A
-configuration that cannot safely settle a changed action must reject the
-authorization rather than learn from a counterfactual proposal.
+authorized action, whether it differs from the proposal, the authority and
+policy version that made the decision, and an authorization ID. The agent
+adapter then returns a distinct settlement record binding learner credit to the
+authorized action. A configuration that cannot safely settle a changed action
+must halt rather than learn from a counterfactual proposal. After execution, a
+distinct receipt binds the settlement, effective action, executor, and receipt
+ID.
 
-An outcome is bound to the lifecycle ID, decision ID, and dispatch receipt. It
-contains reward or other declared learning signals, continuation discount,
-termination and truncation flags, the final observation used for bootstrapping,
-and the potentially distinct post-reset observation used for the next decision.
+An outcome is bound to the exact dispatch receipt and therefore to its
+lifecycle and decision. It contains reward or other declared learning signals,
+continuation discount, termination and truncation flags, the final observation
+and identity used for bootstrapping, and the potentially distinct post-reset
+observation and identity used for the next decision.
 
 ## Lifecycle
 
@@ -126,10 +150,10 @@ One life follows this order:
 10. Continue across task and episode boundaries without reinitializing learned
     agent state. Only explicitly declared episodic state may reset.
 
-The first protocol version checkpoints only after an outcome has been consumed
-and before the next action has been dispatched. In-flight physical actions are
-outside its exact-resume claim until a later protocol defines durable,
-idempotent dispatch and acknowledgement semantics.
+The planned first whole-life runner checkpoints only after an outcome has been
+consumed and before the next action has been dispatched. In-flight physical
+actions are outside its planned exact-resume gate until a later protocol defines
+durable, idempotent dispatch and acknowledgement semantics.
 
 ## Dispatch and transition invariants
 
@@ -145,8 +169,9 @@ Conforming implementations must enforce all of the following:
 - Extended or hierarchical action identity remains available while the
   environment receives its primitive action. Rebinding a primitive must update
   the correct base or intra-option owner without erasing the extended owner.
-- The final observation and next decision observation are distinct at an
-  autoreset boundary and identical otherwise.
+- The final and next-decision observation identities are distinct at an
+  autoreset boundary, identical on a continuing transition, and the next
+  observation is absent until an explicit arm after a non-autoreset boundary.
 - Termination, truncation, and discount semantics are explicit and validated.
 - One accepted environment event causes one atomic learner transaction. A
   rejected transaction leaves every agent state and RNG synchronized with the
@@ -247,27 +272,35 @@ This ADR does not:
 
 The proposal advances only in this order:
 
-1. **Protocol schema and conformance fixture.** Freeze a versioned development
-   schema, aggregate state, mock adapters, transaction state machine, and
-   fail-closed ownership tests.
-2. **Prototype closed-loop adapter.** Run one canonical but explicitly
+1. **Host transaction contract — implemented at L0.** The versioned manifest and
+   transaction-state schemas, immutable typed payloads, distinct authorization,
+   settlement, receipt, and outcome records, explicit reset identities,
+   functional phase ledger, and 14 retained fail-closed tests implement the host
+   transaction slice. This is structural and nonpromoting.
+2. **Whole-life conformance core — open.** Define the canonical life
+   configuration and aggregate life state; implement agent, environment,
+   dispatch/safety, and metric adapter contracts plus the authoritative runner;
+   add the whole-life checkpoint schema and mock whole-life conformance fixture.
+   Every mutable owner and RNG must be explicit. Step 1 does not satisfy this
+   gate.
+3. **Prototype closed-loop adapter.** Run one canonical but explicitly
    development-only configuration on both retained continuing micro-MDPs.
    Exercise active-option dispatch, action replacement/veto, boundary semantics,
    stale-event rejection, and counter disarming.
-3. **Prototype exact resume.** Pass the uninterrupted-versus-restored gate,
+4. **Prototype exact resume.** Pass the uninterrupted-versus-restored gate,
    including environment, runner, metrics, decision lineage, and every RNG.
-4. **Forager bridge.** Implement the ordinary-observation policy adapter, retain
+5. **Forager bridge.** Implement the ordinary-observation policy adapter, retain
    extended-action ownership through the host runner, and declare measured
    compute, memory, and latency costs. This remains development work unless a
    separate frozen protocol says otherwise.
-5. **Robot simulation adapter.** Externalize complete controller state, bind
+6. **Robot simulation adapter.** Externalize complete controller state, bind
    actual continuous dispatch after safety/residual transforms, pass deterministic
    exact resume where the simulator supports it, and pass fault/latency checks.
-6. **Whole-life regression panel.** Provide one CI-cheap command covering
+7. **Whole-life regression panel.** Provide one CI-cheap command covering
    ownership, uninterrupted operation, checkpoint recovery, recurrence,
    numerical stability, and resource ceilings. Benchmark execution remains
    outside pytest.
-7. **Separate `reference-dev` selection.** Only after steps 1–6 pass may a new
+8. **Separate `reference-dev` selection.** Only after steps 1–7 pass may a new
    decision name a concrete agent adapter, configuration, runner command, and
    rollback policy as `reference-dev`. That channel is permanently
    nonpromoting.

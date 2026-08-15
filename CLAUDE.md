@@ -24,13 +24,18 @@ not casually rename them. The robot track imports the continual-RL subset
 in-process; keep `requires-python >= 3.12`, the `numpy >= 1.26` floor, and the
 existing import surface intact.
 
-**Current program hillclimb:** implement the selected shared reference-agent
-protocol in `docs/design/asi-reference-agent-protocol.md`. It is a Proposed ADR,
-not a current `reference-dev` designation: the Prototype and robot adapters,
-whole-life state owner, dispatch settlement, exact-resume checkpoint, and
-CI-cheap regression panel still have to pass its acceptance sequence. The
-current robot and Forager paths do not consume `PrototypeAgent`, and Forager's
-extended-action dispatch edge remains open. In the monorepo, use
+**Current program hillclimb:** continue implementing the selected shared
+reference-agent protocol in `docs/design/asi-reference-agent-protocol.md`. The
+versioned L0 transaction ledger in `alberta_framework/reference_agent.py` and
+its 14 retained tests cover immutable typed payloads, separate authorization,
+settlement, receipt, and outcome records, explicit reset identities, and
+fail-closed phase/rejection semantics. It is not a current `reference-dev`
+designation: concrete Prototype and robot adapters, aggregate life state and
+runner, adapter-level dispatch settlement, whole-life checkpoint/exact resume,
+and a CI-cheap regression panel still have to pass the Proposed ADR's remaining
+acceptance sequence. The current robot and Forager paths do not consume
+`PrototypeAgent`, and Forager's extended-action dispatch edge remains open. In
+the monorepo, use
 `../robot/docs/asimov-1.md` and
 `../robot/docs/ALBERTA_PRODUCTION_READINESS.md` as the existing ASIMOV-1
 application interface and open-gate record; do not create a duplicate robotics
@@ -97,6 +102,7 @@ Key documents:
 
 - Mission and hillclimb ladder: `docs/research/asi-roadmap.md`
 - Proposed reference-agent protocol: `docs/design/asi-reference-agent-protocol.md`
+- Implemented L0 transaction ledger: `alberta_framework/reference_agent.py`
 - Status & evidence: `docs/status.md` (levels L0–L3, completion gates) ·
   `docs/evidence/methodology.md` (property-by-property map)
 - Active campaign: `docs/research/ipmnist-theory.md` ·

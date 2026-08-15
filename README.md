@@ -59,12 +59,16 @@ robustness, and robotics gates remain open.
 
 The selected architectural direction is a shared reference-agent protocol with adapters for the
 retained `PrototypeAgent` and the sibling robot controller. The
-[Proposed protocol ADR](docs/design/asi-reference-agent-protocol.md) defines state ownership,
-dispatch lineage, exact resume, and its acceptance sequence. It does not yet populate
-`reference-dev`: neither adapter nor a whole-life checkpoint/runner has passed conformance, the
-robot and Forager paths do not currently consume `PrototypeAgent`, and Forager still records an
-unresolved extended-action dispatch edge. The initial L0 record and structural protocol surface
-lives in `alberta_framework.reference_agent`; it is not a concrete adapter or conformance claim.
+[Proposed protocol ADR](docs/design/asi-reference-agent-protocol.md) specifies state ownership,
+dispatch lineage, an exact-resume acceptance gate, and its ordered implementation sequence. The
+[initial L0 transaction contract](alberta_framework/reference_agent.py) and its
+[14 retained tests](tests/test_reference_agent_protocol.py) now cover immutable typed payloads,
+separate authorization, learner settlement, dispatch receipt, and receipt-bound outcome records,
+explicit reset identities, and a fail-closed functional phase ledger. This is not a concrete
+adapter or whole-life conformance result. It does not populate `reference-dev`: no Prototype or
+robot adapter, aggregate life state or runner, whole-life checkpoint, or exact-resume result
+exists. The robot and Forager paths do not currently consume `PrototypeAgent`, and Forager still
+records an unresolved extended-action dispatch edge.
 
 The package also contains inherited surfaces related to all twelve steps of the Alberta Plan.
 That crosswalk is useful for finding gaps, but completing a checklist of Plan mechanisms would

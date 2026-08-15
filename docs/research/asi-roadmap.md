@@ -74,11 +74,17 @@ explicit migration is justified by evidence.
 The architectural direction is selected in the
 [Proposed reference-agent protocol ADR](../design/asi-reference-agent-protocol.md):
 one semantic lifecycle, dispatch, state-ownership, and exact-resume contract with
-adapters for `PrototypeAgent` and the sibling robot controller. This resolves the
-outer architecture choice, not the implementation or baseline selection. The
-robot path still does not import `PrototypeAgent`, the retained Forager agent
-still excludes it because closed-loop dispatch has not demonstrated preservation
-of the OaK/STOMP credited extended action, and neither adapter has passed the ADR's
+adapters for `PrototypeAgent` and the sibling robot controller. The
+[versioned L0 transaction ledger](../../alberta_framework/reference_agent.py) and
+its [14 retained tests](../../tests/test_reference_agent_protocol.py) now cover
+immutable typed payloads, distinct authorization/settlement/receipt/outcome
+records, explicit reset identities, and fail-closed phase and rejection
+semantics. This resolves the initial host transaction slice, not completion of
+the implementation or baseline selection. No concrete adapter, aggregate life
+state or runner, whole-life checkpoint, or exact-resume result exists. The robot
+path still does not import `PrototypeAgent`, the retained Forager agent still
+excludes it because closed-loop dispatch has not demonstrated preservation of
+the OaK/STOMP credited extended action, and neither adapter has passed the ADR's
 acceptance sequence. None is already canonical.
 
 Every proposed subsystem should answer four questions:
@@ -194,11 +200,13 @@ dimensions. Post-hoc tradeoff weights cannot turn a regression into a win.
 
 ## Current program priorities
 
-1. **Implement the selected reference-life protocol.** Complete the Proposed
-   ADR's shared state owner, dispatch settlement, Prototype and robot adapters,
-   exact-resume bundle, and low-cost whole-life regression panel. Only then may
-   a separate decision select one executable `reference-dev` configuration,
-   environment interface, checkpoint contract, command, and rollback policy.
+1. **Continue implementing the selected reference-life protocol.** Build the
+   aggregate life configuration/state, authoritative runner, whole-life
+   checkpoint, and adapter-level dispatch settlement around the completed L0
+   transaction ledger. Then add the Prototype and robot adapters, exact-resume
+   gate, and low-cost whole-life regression panel. Only then may a separate
+   decision select one executable `reference-dev` configuration, environment
+   interface, checkpoint contract, command, and rollback policy.
 2. **Turn plasticity gains into agent gains.** Use the development-only IPMNIST
    campaign to generate mechanisms, then remeasure controls and test survivors
    on recurrence, a complementary stream, and continual control. Do not promote
