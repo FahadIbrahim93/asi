@@ -1,7 +1,5 @@
 """Reproducible benchmark integrations for Alberta agents.
-
-This package re-exports the public surface of five benchmark families:
-
+This package re-exports the public surface of four benchmark families:
 * **Forager/Foragax** (``forager``, ``forager_results``, ``causal_map_forager``)
   — the continual foraging testbed (arXiv:2605.01131) with Alberta agents,
   importers for the authors' official per-seed result archives, and paired
@@ -12,17 +10,12 @@ This package re-exports the public surface of five benchmark families:
   current Foragax runs.
 * **Runtime profiles** (``runtime_profile``) — structural validation and
   hashing of cross-harness environment/RNG identity.
-* **Slowly changing regression** (``slowly_changing_regression``,
-  ``slowly_changing_regression_v2``) — the Dohare et al. (2024)
-  loss-of-plasticity regression stream and its sharded development protocol.
 * **Input-permuted MNIST** (``upgd_ipmnist``) — the UPGD replication lane
   (Elsayed & Mahmood, ICLR 2024).
-
 The matched-current campaign machinery (``forager_matched_*``,
 ``foragax_open_screen``) is deliberately not re-exported here; those modules
 are imported explicitly by their runners and CLIs.
 """
-
 from alberta_framework.benchmarks.causal_map_forager import (
     CAUSAL_MAP_STATE_SCHEMA,
     CAUSAL_MAP_VARIANT_KIND,
@@ -153,46 +146,6 @@ from alberta_framework.benchmarks.runtime_profile import (
     validate_environment_runtime_identity,
     validate_environment_runtime_profile,
 )
-from alberta_framework.benchmarks.slowly_changing_regression import (
-    SCR_LEARNER_KINDS,
-    SCR_PAPER_CLAIM,
-    SCR_PAPER_REFERENCE,
-    SCRLearnerParams,
-    SlowlyChangingRegressionConfig,
-    SlowlyChangingRegressionEnv,
-    build_scr_learner,
-    describe_scr_curve_windows,
-    make_scr_env,
-    run_scr_binned_errors,
-    scr_example,
-    scr_target_output,
-    summarize_scr_curve,
-)
-from alberta_framework.benchmarks.slowly_changing_regression_v2 import (
-    LOCAL_CBP_METHOD,
-    LOCAL_UPGD_METHOD,
-    PUBLICATION_BP_METHOD,
-    SCR_V2_ARTIFACT_SCHEMA,
-    SCR_V2_METHOD_IDS,
-    SCR_V2_PLAN_SCHEMA,
-    SCR_V2_SHARD_SCHEMA,
-    PublicationBPState,
-    SCRV2ValidationError,
-    SCRV2ValidationReport,
-    build_scr_v2_run_plan,
-    build_scr_v2_run_spec,
-    init_publication_bp,
-    merge_scr_v2_shards,
-    publication_bp_predict,
-    publication_bp_update,
-    run_scr_v2_seed,
-    run_scr_v2_shard,
-    strict_scr_json_loads,
-    validate_scr_v2_artifact,
-    validate_scr_v2_run_plan,
-    validate_scr_v2_shard,
-    write_scr_v2_run_plan,
-)
 from alberta_framework.benchmarks.upgd_ipmnist import (
     ADAMW_PROTOCOL_HYPERPARAMETERS,
     UPGD_W_PROTOCOL_HYPERPARAMETERS,
@@ -242,22 +195,6 @@ __all__ = [
     "FORAGAX_CAMERA_READY_CONFIG_COMMIT",
     "FORAGAX_PAPER_CONFIG_COMMIT",
     "FORAGER_RESULT_SCHEMA_VERSION",
-    "SCR_LEARNER_KINDS",
-    "SCR_PAPER_CLAIM",
-    "SCR_PAPER_REFERENCE",
-    "SCR_V2_ARTIFACT_SCHEMA",
-    "SCR_V2_METHOD_IDS",
-    "SCR_V2_PLAN_SCHEMA",
-    "SCR_V2_SHARD_SCHEMA",
-    "SCRLearnerParams",
-    "SCRV2ValidationError",
-    "SCRV2ValidationReport",
-    "SlowlyChangingRegressionConfig",
-    "SlowlyChangingRegressionEnv",
-    "PublicationBPState",
-    "PUBLICATION_BP_METHOD",
-    "LOCAL_CBP_METHOD",
-    "LOCAL_UPGD_METHOD",
     "AlbertaForagerAgent",
     "AlbertaForagerConfig",
     "CausalMapForagerAgent",
@@ -308,9 +245,6 @@ __all__ = [
     "assert_historical_family_pairing",
     "bootstrap_mean_interval",
     "build_forager_comparison_report",
-    "build_scr_learner",
-    "build_scr_v2_run_plan",
-    "build_scr_v2_run_spec",
     "compare_forager_agents",
     "causal_map_start",
     "causal_map_state_from_dict",
@@ -319,7 +253,6 @@ __all__ = [
     "causal_map_variant_spec",
     "forager_metric_contract",
     "development_historical_environment_adapter",
-    "describe_scr_curve_windows",
     "environment_rng_schedule_sha256",
     "environment_runtime_profile_sha256",
     "foragax_install_tree_sha256",
@@ -332,37 +265,21 @@ __all__ = [
     "historical_forager_runtime_identity",
     "historical_forager_semantic_contract",
     "historical_fov_metrics",
-    "make_scr_env",
-    "merge_scr_v2_shards",
     "paired_forager_comparison",
     "paper_baselines",
     "paper_protocol",
     "paper_reference_targets",
-    "publication_bp_predict",
-    "publication_bp_update",
     "run_alberta_forager_seeds",
     "run_causal_map_forager",
     "run_causal_map_forager_seeds",
     "run_forager",
     "run_historical_forager",
     "run_rtu_rtrl_forager_seeds",
-    "run_scr_binned_errors",
-    "run_scr_v2_seed",
-    "run_scr_v2_shard",
-    "scr_example",
-    "scr_target_output",
-    "strict_scr_json_loads",
     "summarize_forager_runs",
-    "summarize_scr_curve",
     "validate_causal_map_state",
     "validate_environment_runtime_identity",
     "validate_environment_runtime_profile",
     "validate_historical_forager_artifact",
     "validate_historical_forager_provenance",
-    "validate_scr_v2_artifact",
-    "validate_scr_v2_run_plan",
-    "validate_scr_v2_shard",
     "verify_historical_environment_factory",
-    "write_scr_v2_run_plan",
-    "init_publication_bp",
 ]

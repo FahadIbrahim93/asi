@@ -223,6 +223,18 @@ def test_cli_smoke_entrypoints_return_success(
     assert '"finite": true' in capsys.readouterr().out
 
 
+def test_cli_short_horizons_do_not_require_a_matching_window_override(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The advertised ``--steps`` option must work below the default window."""
+
+    assert step1_smoke_main(["--steps", "8"]) == 0
+    assert '"steps": 8' in capsys.readouterr().out
+
+    assert step2_smoke_main(["--steps", "8"]) == 0
+    assert '"steps": 8' in capsys.readouterr().out
+
+
 def test_documented_cli_scripts_are_packaged() -> None:
     pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
     payload = tomllib.loads(pyproject.read_text())
@@ -230,4 +242,3 @@ def test_documented_cli_scripts_are_packaged() -> None:
 
     assert scripts["alberta-step1-smoke"] == "alberta_framework.cli:step1_smoke_main"
     assert scripts["alberta-step2-smoke"] == "alberta_framework.cli:step2_smoke_main"
-    assert scripts["alberta-evidence-gate"] == "alberta_framework.cli:evidence_gate_main"

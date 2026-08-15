@@ -262,11 +262,13 @@ def test_option_return_product_baseline_and_terminal_are_hand_derived() -> None:
 def test_legacy_stomp_update_retains_configured_option_gamma() -> None:
     agent = STOMPAgent(_stomp_config(option_gamma=0.6, max_option_steps=8))
     observation = jnp.array([0.0, 1.0], dtype=jnp.float32)
-    state = agent.start(agent.init(jr.key(2)), observation).replace(
+    state = agent.start(agent.init(jr.key(2)), observation)
+    state = state.replace(
         executing_option=jnp.array(0, dtype=jnp.int32),
         base_last_obs=observation,
         base_last_action=jnp.array(2, dtype=jnp.int32),
         option_start_obs=observation,
+        option_last_intra_action=state.last_primitive_action,
         option_discount=jnp.array(1.0, dtype=jnp.float32),
         option_steps=jnp.array(0, dtype=jnp.int32),
     )

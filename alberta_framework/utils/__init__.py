@@ -1,4 +1,4 @@
-"""Utility functions for the Alberta Framework."""
+"""Utility functions for ASI's ``alberta_framework`` compatibility package."""
 
 # Experiment runner (no external deps)
 from alberta_framework.utils.experiments import (

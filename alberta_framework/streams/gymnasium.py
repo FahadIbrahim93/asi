@@ -1,7 +1,7 @@
 """Gymnasium environment wrappers as experience streams.
 
 This module wraps Gymnasium environments to provide temporally-uniform experience
-streams compatible with the Alberta Framework's learners.
+streams compatible with ASI's ``alberta_framework`` learners.
 
 Gymnasium environments cannot be JIT-compiled, so this module provides:
 1. Trajectory collection: Collect data using Python loop, then learn with scan
@@ -31,8 +31,8 @@ import jax.numpy as jnp
 import jax.random as jr
 from jax import Array
 
-from alberta_framework.core.learners import LearnerState, LinearLearner
-from alberta_framework.core.types import TimeStep
+from alberta_framework.core.learners import LinearLearner
+from alberta_framework.core.types import LearnerState, TimeStep
 
 if TYPE_CHECKING:
     import gymnasium

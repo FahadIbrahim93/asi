@@ -81,11 +81,6 @@ from alberta_framework.benchmarks.historical_forager_provenance import (
     HistoricalForagerProvenanceError,
     historical_forager_provenance,
 )
-from alberta_framework.benchmarks.official_foragax import (
-    OfficialForagaxValidationError,
-    official_foragax_batch_run_specs_from_manifest,
-    official_foragax_run_spec_from_manifest,
-)
 
 LOGGER = logging.getLogger("alberta.forager")
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -748,16 +743,20 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"--reference-manifest {manifest_path} must contain a JSON object"
             )
         manifest_kind = dispatch.get("manifest_kind")
+        from alberta_framework.benchmarks import (
+            official_foragax as official_foragax_module,
+        )
+
         try:
             if manifest_kind == "official_foragax_single":
                 specs = (
-                    official_foragax_run_spec_from_manifest(
+                    official_foragax_module.official_foragax_run_spec_from_manifest(
                         manifest_path,
                         environment=environment,
                     ),
                 )
             elif manifest_kind == "official_foragax_batch":
-                specs = official_foragax_batch_run_specs_from_manifest(
+                specs = official_foragax_module.official_foragax_batch_run_specs_from_manifest(
                     manifest_path,
                     environment=environment,
                 )
@@ -766,7 +765,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                     f"--reference-manifest {manifest_path} has unsupported "
                     f"manifest_kind {manifest_kind!r}"
                 )
-        except (OfficialForagaxValidationError, FileNotFoundError) as exc:
+        except (
+            official_foragax_module.OfficialForagaxValidationError,
+            FileNotFoundError,
+        ) as exc:
             parser.error(
                 f"--reference-manifest {manifest_path} did not verify: {exc}"
             )

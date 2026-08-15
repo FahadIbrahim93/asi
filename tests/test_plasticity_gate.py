@@ -47,7 +47,6 @@ import logging
 import jax
 import jax.numpy as jnp
 import jax.random as jr
-import pytest
 from jaxtyping import Array, Float
 
 from alberta_framework.core.continual_backprop import (
@@ -59,8 +58,6 @@ from alberta_framework.core.optimizers import LMS
 from alberta_framework.core.upgd import UPGDLearner
 
 logger = logging.getLogger(__name__)
-
-pytestmark = [pytest.mark.development, pytest.mark.slow]
 
 # --- protocol constants ------------------------------------------------------
 FEATURE_DIM = 16

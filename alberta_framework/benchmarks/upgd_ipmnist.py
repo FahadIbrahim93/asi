@@ -74,17 +74,15 @@ complete published-protocol exactness):
 - ``run_ipmnist(noise_mode="pool")`` is a screening-only fast mode that
   replaces the dominant per-step perturbation generation with random slices
   of a per-task noise pool (see the noise-pool section below); pool results
-  are refused by :func:`partial_payload` and never enter v2/v3 artifacts.
+  are refused by :func:`partial_payload` and never enter stored artifacts.
 
 MNIST arrives through the same OpenML plumbing the step2 runners use
 (``sklearn.datasets.fetch_openml("mnist_784", version=1)``); the loader
 reuses the existing step2 cache when present instead of re-downloading. The
 first 60,000 OpenML rows are the canonical torchvision train split.
 
-The public module entry point exposes the strict v3 ``plan`` / ``shard`` /
-``merge`` lifecycle.  The old v2 parser remains available only as the
-explicit :func:`main_v2_compat` development-compatibility entry point; it has
-no direct aggregate mode.
+The module retains the historical v2 one-seed shard and merge interface for
+reproducing existing development records. It has no direct aggregate mode.
 
 Benchmark executions happen through this CLI, never inside pytest.
 """
@@ -96,7 +94,9 @@ import hashlib
 import json
 import logging
 import math
+import os
 import platform
+import tempfile
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -114,6 +114,58 @@ from alberta_framework.core.baseline_optimizers import Adam
 from alberta_framework.core.canonical_upgd import CanonicalUPGD, CanonicalUPGDConfig
 
 logger = logging.getLogger(__name__)
+
+
+def _preflight_new_output(path: Path) -> Path:
+    """Reject an occupied output before an expensive benchmark starts."""
+
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists() or destination.is_symlink():
+        raise FileExistsError(f"refusing to overwrite immutable output: {destination}")
+    return destination
+
+
+def atomic_write_new(path: Path, data: bytes) -> Path:
+    """Publish complete bytes at a new path without replacing existing data."""
+
+    destination = _preflight_new_output(path)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=destination.parent,
+            prefix=f".{destination.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            temporary.write(data)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        temporary_path.chmod(0o444)
+        try:
+            os.link(temporary_path, destination)
+        except FileExistsError as exc:
+            raise FileExistsError(
+                f"refusing to overwrite immutable output: {destination}"
+            ) from exc
+        return destination
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
+def atomic_write_new_json(path: Path, value: object) -> Path:
+    """Publish a deterministic JSON document at a new path."""
+
+    encoded = json.dumps(
+        value,
+        allow_nan=False,
+        ensure_ascii=True,
+        indent=2,
+        sort_keys=True,
+    )
+    return atomic_write_new(path, (encoded + "\n").encode("utf-8"))
 
 IPMNISTLearner = Literal["upgd_w", "adamw"]
 
@@ -439,7 +491,7 @@ def lean_upgd_w_update(
 # ``N(0, sigma^2)`` and elements within a step stay independent, but values
 # are REUSED across steps at random alignments, so pool trajectories are a
 # screening-only approximation: :func:`partial_payload` refuses them and they
-# must never feed the v2/v3 artifact lifecycle. The update equations are the
+# must never feed stored artifacts. The update equations are the
 # unchanged parity-tested :func:`lean_upgd_w_update` consuming supplied noise.
 
 
@@ -620,7 +672,7 @@ def run_ipmnist(
             style shared noise table). Per-step marginals stay exactly
             ``N(0, sigma^2)`` but values are reused across steps, so pool
             results are refused by :func:`partial_payload` and must never
-            feed the v2/v3 artifact lifecycle.
+            feed stored artifacts.
         noise_pool_steps: Pool size in steps (>= 2) for ``noise_mode="pool"``;
             memory is ``noise_pool_steps * n_params * 4`` bytes per seed.
 
@@ -1314,11 +1366,10 @@ def merge_legacy_v1_partial_results(paths: Sequence[Path]) -> dict[str, IPMNISTR
 
 
 def main_v2_compat(argv: Sequence[str] | None = None) -> None:
-    """Explicit legacy/development v2 compatibility CLI.
+    """Historical development-v2 shard and merge CLI.
 
-    Only one-seed shard writing and historical v2 shard merging remain
-    available.  The unverifiable direct aggregate mode is intentionally
-    disabled; the public :func:`main` entry point always dispatches to v3.
+    One-seed shard writing and historical v2 shard merging remain available.
+    The unverifiable direct aggregate mode is intentionally disabled.
     """
     parser = argparse.ArgumentParser(
         description="LEGACY DEVELOPMENT ONLY: UPGD IPMNIST v2 compatibility"
@@ -1346,8 +1397,7 @@ def main_v2_compat(argv: Sequence[str] | None = None) -> None:
 
     if args.partial_out is None and args.merge_partials is None:
         parser.error(
-            "legacy v2 direct aggregate output is disabled; use the active v3 "
-            "plan/shard/merge lifecycle"
+            "direct aggregate output is disabled; use --partial-out or --merge-partials"
         )
 
     logging.basicConfig(
@@ -1369,8 +1419,6 @@ def main_v2_compat(argv: Sequence[str] | None = None) -> None:
             notes=args.note,
             partial_paths=args.merge_partials,
         )
-        from alberta_framework.benchmarks.upgd_ipmnist_v3 import atomic_write_new_json
-
         atomic_write_new_json(args.output, artifact)
         logger.info("merged %d shards -> %s", len(args.merge_partials), args.output)
         return
@@ -1411,8 +1459,6 @@ def main_v2_compat(argv: Sequence[str] | None = None) -> None:
             raise SystemExit("--partial-out expects exactly one learner per shard")
         if len(seeds) != 1:
             raise SystemExit("--partial-out expects exactly one seed per v2 shard")
-        from alberta_framework.benchmarks.upgd_ipmnist_v3 import atomic_write_new_json
-
         atomic_write_new_json(args.partial_out, partial_payload(results[learners[0]]))
         logger.info("wrote shard %s", args.partial_out)
         return
@@ -1421,10 +1467,9 @@ def main_v2_compat(argv: Sequence[str] | None = None) -> None:
 
 
 def main(argv: Sequence[str] | None = None) -> None:
-    """Dispatch exclusively to the active strict v3 lifecycle."""
-    from alberta_framework.benchmarks.upgd_ipmnist_v3 import main as main_v3
+    """Run the retained development-v2 shard and merge interface."""
 
-    main_v3(argv)
+    main_v2_compat(argv)
 
 
 if __name__ == "__main__":

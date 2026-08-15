@@ -1,7 +1,7 @@
 """Automated update-rule discovery over the campaign's primitive vocabulary.
 
 The IPMNIST campaign hand-designed ~60 arms; its theory
-(``CONTINUAL_LEARNING_THEORY.md``) identifies a small primitive vocabulary —
+(``docs/research/ipmnist-theory.md``) identifies a small primitive vocabulary —
 per-feature EMA statistics at multiple decays, shift detectors, gates
 (utility, L2-init pull), decays, resets, normalizations, and error signals.
 This module makes that vocabulary a **composable DSL**: one branchless

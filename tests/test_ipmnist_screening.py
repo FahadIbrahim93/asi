@@ -11,6 +11,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import chex
 import jax
 import jax.numpy as jnp
 import jax.random as jr
@@ -56,7 +57,6 @@ from alberta_framework.benchmarks.ipmnist_screening import (
     _make_upgd_warmnorm_learner,
     _make_wclip_ema_norm_learner,
     _newton_schulz_orthogonalize,
-    _rff_frozen_probe_input,
     _upgd_utility_and_gate,
     adam_elem_step,
     adam_elem_update,
@@ -89,6 +89,7 @@ from alberta_framework.benchmarks.upgd_ipmnist import (
     cross_entropy_loss,
     init_mlp_params,
     lean_upgd_w_update,
+    mlp_logits,
     run_ipmnist,
 )
 from alberta_framework.core.baseline_optimizers import Adam
@@ -798,7 +799,12 @@ class TestShardsAndMerge:
         ]
         for p in paths:
             assert load_shard(p)["schema"] == SHARD_SCHEMA
-        summary = merge_shards(paths, control_name="upgd_w_control", slope_window=2)
+        summary = merge_shards(
+            paths,
+            control_name="upgd_w_control",
+            slope_window=2,
+            expected_seeds=(0, 1),
+        )
         names = {e["config_name"] for e in summary["results"]}
         assert names == {"upgd_w_control", "upgd_l2init"}
         l2 = next(e for e in summary["results"] if e["config_name"] == "upgd_l2init")
@@ -860,7 +866,17 @@ class TestShardsAndMerge:
                 ["run", "--config-name", "upgd_w_control", "--seed", "0", "--out"],
                 "load_mnist_train",
             ),
-            (["merge", "--shards", "unused-shard", "--output"], "merge_shards"),
+            (
+                [
+                    "merge",
+                    "--shards",
+                    "unused-shard",
+                    "--expected-seeds",
+                    "0",
+                    "--output",
+                ],
+                "merge_shards",
+            ),
             (
                 [
                     "validate-proxy",
@@ -932,7 +948,7 @@ class TestShardsAndMerge:
         p2 = tmp_path / "dup.json"
         p2.write_text(p1.read_text(encoding="utf-8"), encoding="utf-8")
         with pytest.raises(ValueError, match="duplicate shard"):
-            merge_shards([p1, p2])
+            merge_shards([p1, p2], expected_seeds=(0,), slope_window=2)
 
     def test_validate_proxy_prefix_and_ordering(self, tmp_path, small_data):
         x, y = small_data
@@ -1028,7 +1044,9 @@ class TestPoolConfirmation:
         p_exact.write_text(json.dumps(exact_payload), encoding="utf-8")
         p_pool.write_text(json.dumps(pool_payload), encoding="utf-8")
         with pytest.raises(ValueError, match="noise mode"):
-            merge_shards([p_exact, p_pool])
+            merge_shards(
+                [p_exact, p_pool], expected_seeds=(0,), slope_window=2
+            )
 
     def test_validate_proxy_rejects_pool_shards(self, tmp_path, small_data):
         x, y = small_data
@@ -1775,14 +1793,31 @@ class TestSigma0Frontier:
                     np.asarray(params[n]), np.asarray(ref_params[n])
                 )
 
-    def test_hidden_norm_frozen_probe_rejected(self):
-        """The plain-MLP sentinel probe cannot describe the RMS-normalized
-        forward pass; the arm must refuse instead of probing the wrong model."""
+    def test_hidden_norm_frozen_probe_uses_deployed_forward(self):
+        """The frozen sentinel path includes input EMA and both hidden RMS layers."""
         spec = screening_spec("sigma0_hidden_norm")
-        with pytest.raises(NotImplementedError, match="hidden"):
-            spec.frozen_probe_input(
-                None, jnp.zeros((2, SMALL.input_dim)), spec.hyperparameters
+        params = init_mlp_params(jr.key(70), SMALL)
+        init_fn, _ = spec.factory(spec.hyperparameters)
+        state = init_fn(params)
+        inputs = jr.normal(jr.key(71), (3, SMALL.input_dim))
+        assert spec.frozen_probe_logits is not None
+        logits = spec.frozen_probe_logits(params, state, inputs, spec.hyperparameters)
+
+        model_inputs = _ema_frozen_probe_input(state, inputs, spec.hyperparameters)
+        epsilon = spec.hyperparameters["hidden_rms_epsilon"]
+
+        def expected_one(x):
+            h1 = _hidden_rms_normalize(
+                jax.nn.relu(x @ params["w1"] + params["b1"]), epsilon
             )
+            h2 = _hidden_rms_normalize(
+                jax.nn.relu(h1 @ params["w2"] + params["b2"]), epsilon
+            )
+            return h2 @ params["w3"] + params["b3"]
+
+        expected = jax.vmap(expected_one)(model_inputs)
+        chex.assert_shape(logits, (3, SMALL.n_classes))
+        np.testing.assert_allclose(np.asarray(logits), np.asarray(expected), rtol=1e-6)
 
     def test_each_axis_changes_the_trajectory(self, small_data):
         """Sanity against silently-ignored hyperparameters: every arm's
@@ -1971,7 +2006,7 @@ class TestSpecShape:
     def test_specs_are_json_serializable(self):
         for spec in SCREENING_REGISTRY.values():
             assert isinstance(spec, ScreeningSpec)
-            json.dumps(spec.hyperparameters)
+            json.dumps(dict(spec.hyperparameters))
             assert spec.base_learner in ("upgd_w", "adamw")
 
     def test_noise_update_present_exactly_on_lean_family_arms(self):
@@ -2423,7 +2458,7 @@ class TestRFFRLS:
         assert spec.mechanism == "random_features"
         assert spec.noise_update is None
         assert spec.factory is _make_rff_rls_learner
-        assert spec.frozen_probe_input is _rff_frozen_probe_input
+        assert spec.frozen_probe_logits is not None
         assert spec.hyperparameters == self.EXPECTED_HP
 
     def test_lin_rls_registry_and_smoke(self):
@@ -2434,7 +2469,7 @@ class TestRFFRLS:
         spec = screening_spec("lin_rls")
         assert spec.mechanism == "random_features"
         assert spec.factory is _make_lin_rls_learner
-        assert spec.frozen_probe_input is _rff_frozen_probe_input
+        assert spec.frozen_probe_logits is not None
         init_fn, step_fn = spec.factory(spec.hyperparameters)
         params = init_mlp_params(jr.key(7), SMALL)
         state = init_fn(params)
@@ -2536,17 +2571,40 @@ class TestRFFRLS:
         assert np.all(np.asarray(result.per_task_plasticity) <= 1.0)
         assert float(acc.mean()) > 0.2
 
-    def test_frozen_probe_fails_closed(self):
-        """No trained protocol MLP exists — sentinel probes must refuse, like
-        the _hidden_rms_frozen_probe_input precedent, so merge/reporting can
-        never emit a meaningless probe number."""
-        spec = screening_spec("rff_rls")
-        init_fn, _ = spec.factory(spec.hyperparameters)
-        state = init_fn(init_mlp_params(jr.key(0), SMALL))
-        with pytest.raises(NotImplementedError, match="rff_rls"):
-            spec.frozen_probe_input(
-                state, jnp.zeros((3, SMALL.input_dim)), spec.hyperparameters
+    @pytest.mark.parametrize("name", ["rff_rls", "lin_rls"])
+    def test_frozen_probe_uses_deployed_rls_readout(self, name):
+        """Frozen probes score each arm's learned RLS readout, never inert MLP params."""
+        spec = screening_spec(name)
+        init_fn, step_fn = spec.factory(spec.hyperparameters)
+        params = init_mlp_params(jr.key(0), SMALL)
+        state = init_fn(params)
+        train_x = jr.normal(jr.key(1), (SMALL.input_dim,))
+        _, state, _ = step_fn(params, state, train_x, jnp.array(2), jr.key(2))
+        inputs = jr.normal(jr.key(3), (3, SMALL.input_dim))
+        assert spec.frozen_probe_logits is not None
+        logits = spec.frozen_probe_logits(params, state, inputs, spec.hyperparameters)
+
+        normalized = _ema_frozen_probe_input(state, inputs, spec.hyperparameters)
+        clipped = jnp.clip(
+            normalized,
+            -spec.hyperparameters["rff_clip"],
+            spec.hyperparameters["rff_clip"],
+        )
+        if name == "rff_rls":
+            features = jnp.sqrt(2.0 / state.omega.shape[0]) * jnp.cos(
+                clipped @ state.omega.T + state.phase
             )
+        else:
+            features = jnp.concatenate(
+                [
+                    clipped / jnp.sqrt(jnp.float32(clipped.shape[1])),
+                    jnp.ones((clipped.shape[0], 1), dtype=jnp.float32),
+                ],
+                axis=1,
+            )
+        expected = features @ state.wout
+        chex.assert_shape(logits, (3, SMALL.n_classes))
+        np.testing.assert_allclose(np.asarray(logits), np.asarray(expected), rtol=1e-6)
 
 
 class TestOptimizerFloorHybrids:
@@ -3249,7 +3307,7 @@ class TestComparisonArms:
 
 
 class TestNaiveBayes:
-    """V3 (NEW_DIRECTIONS.md): streaming class-conditional diagonal Gaussians.
+    """V3 validation: streaming class-conditional diagonal Gaussians.
 
     No gradients, no MLP — prediction is the argmax class posterior under
     annealed fast-EMA per-class feature statistics (equation parity with
@@ -3264,8 +3322,24 @@ class TestNaiveBayes:
         assert 0.0 < spec.hyperparameters["nb_decay"] < 1.0
         assert spec.hyperparameters["nb_var_epsilon"] > 0.0
         assert spec.noise_update is None
-        with pytest.raises(NotImplementedError):
-            spec.frozen_probe_input(None, jnp.zeros(4), spec.hyperparameters)
+        assert spec.frozen_probe_logits is not None
+
+    def test_frozen_probe_uses_naive_bayes_posterior(self):
+        spec = screening_spec("naive_bayes")
+        params = init_mlp_params(jr.key(80), SMALL)
+        init_fn, step_fn = spec.factory(spec.hyperparameters)
+        state = init_fn(params)
+        for step in range(6):
+            x = jr.normal(jr.key(81 + step), (SMALL.input_dim,))
+            _, state, _ = step_fn(
+                params, state, x, jnp.array(step % SMALL.n_classes), jr.key(step)
+            )
+        inputs = jr.normal(jr.key(90), (4, SMALL.input_dim))
+        assert spec.frozen_probe_logits is not None
+        logits = spec.frozen_probe_logits(params, state, inputs, spec.hyperparameters)
+        expected = jax.vmap(lambda x: naive_bayes_logits(state, x))(inputs)
+        chex.assert_shape(logits, (4, SMALL.n_classes))
+        np.testing.assert_allclose(np.asarray(logits), np.asarray(expected), rtol=1e-6)
 
     def test_first_update_hand_computed(self):
         """One step from init: annealed EMA gives running-average semantics."""
@@ -4162,17 +4236,36 @@ class TestRLSHead:
             assert np.all((plas >= 0.0) & (plas <= 1.0)), overrides
             assert float(acc.mean()) > 1.0 / config.n_classes, overrides
 
-    def test_frozen_probe_fails_closed(self):
-        from alberta_framework.benchmarks.ipmnist_screening import (
-            _rls_head_frozen_probe_input,
+    def test_frozen_probe_uses_body_and_rls_readout(self):
+        hp = self._hp()
+        init_fn, step_fn = self._factory()
+        params = init_mlp_params(jr.key(0), SMALL)
+        state = init_fn(params)
+        params, state, _ = step_fn(
+            params,
+            state,
+            jr.normal(jr.key(1), (SMALL.input_dim,)),
+            jnp.array(2),
+            jr.key(2),
         )
+        inputs = jr.normal(jr.key(3), (3, SMALL.input_dim))
+        spec = screening_spec("rls_head_l0999")
+        assert spec.frozen_probe_logits is not None
+        logits = spec.frozen_probe_logits(params, state, inputs, hp)
 
-        init_fn, _ = self._factory()
-        state = init_fn(init_mlp_params(jr.key(0), SMALL))
-        with pytest.raises(NotImplementedError, match="rls_head"):
-            _rls_head_frozen_probe_input(
-                state, jnp.zeros((3, SMALL.input_dim)), self._hp()
-            )
+        normalized = _ema_frozen_probe_input(state, inputs, hp)
+        h1 = jax.nn.relu(normalized @ params["w1"] + params["b1"])
+        h2 = jax.nn.relu(h1 @ params["w2"] + params["b2"])
+        features = jnp.concatenate(
+            [
+                h2 / jnp.sqrt(jnp.float32(h2.shape[1] + 1)),
+                jnp.ones((h2.shape[0], 1), dtype=jnp.float32),
+            ],
+            axis=1,
+        )
+        expected = features @ state.wout
+        chex.assert_shape(logits, (3, SMALL.n_classes))
+        np.testing.assert_allclose(np.asarray(logits), np.asarray(expected), rtol=1e-6)
 
     def test_p_trace_cap_zero_is_bitexact_off(self):
         """rls_p_trace_cap=0 disables the cap at build time and must be
@@ -4240,7 +4333,6 @@ class TestRLSHead:
         is deliberately not registered)."""
         from alberta_framework.benchmarks.ipmnist_screening import (
             _make_rls_head_learner,
-            _rls_head_frozen_probe_input,
             _rls_head_hp,
         )
 
@@ -4303,7 +4395,7 @@ class TestRLSHead:
             assert spec.base_learner == "upgd_w", name
             assert spec.mechanism == "rls_readout", name
             assert spec.factory is _make_rls_head_learner, name
-            assert spec.frozen_probe_input is _rls_head_frozen_probe_input, name
+            assert spec.frozen_probe_logits is not None, name
             assert spec.noise_update is None, name
             assert spec.hyperparameters == _rls_head_hp(**overrides), name
             # Champion-body constants are intact on every arm.
@@ -4402,8 +4494,7 @@ class TestNBEnsemble:
             assert 0.0 < hp["ens_decay"] < 1.0, name
             assert hp["ens_beta"] > 0.0, name
             assert hp["ens_lock_network"] == 0.0, name
-            with pytest.raises(NotImplementedError, match="nb_ensemble"):
-                spec.frozen_probe_input(None, jnp.zeros(4), hp)
+            assert spec.frozen_probe_logits is not None, name
         assert screening_spec("nb_ensemble_champion").hyperparameters[
             "ens_nb_reset"
         ] == 0.0
@@ -4418,6 +4509,56 @@ class TestNBEnsemble:
         hp3 = screening_spec("nb_ensemble_rls3").hyperparameters
         for k in ("rff_clip", "rls_lambda", "rls_ridge_init"):
             assert hp3[k] == lin[k], k
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [{}, {"ens_use_rls": 1.0}, {"ens_lock_network": 1.0}],
+    )
+    def test_frozen_probe_uses_deployed_member_semantics(self, overrides):
+        hp = self._hp(**overrides)
+        init_fn, step_fn = self._factory(**overrides)
+        params = init_mlp_params(jr.key(100), SMALL)
+        state = init_fn(params)
+        for step, (x, y) in enumerate(zip(*self._stream(n_steps=6, seed=101))):
+            params, state, _ = step_fn(params, state, x, y, jr.key(step))
+        inputs = jr.normal(jr.key(102), (3, SMALL.input_dim))
+        callback = screening_spec("nb_ensemble_champion").frozen_probe_logits
+        assert callback is not None
+        logits = callback(params, state, inputs, hp)
+
+        normalized = _ema_frozen_probe_input(state.net, inputs, hp)
+        net_logits = mlp_logits(params, normalized)
+        if overrides.get("ens_lock_network", 0.0) != 0.0:
+            expected = net_logits
+        else:
+            member_logp = [
+                jax.nn.log_softmax(net_logits),
+                jax.nn.log_softmax(
+                    jax.vmap(lambda x: naive_bayes_logits(state.nb, x))(inputs)
+                ),
+            ]
+            if overrides.get("ens_use_rls", 0.0) != 0.0:
+                assert state.rls is not None
+                rls_normalized = _ema_frozen_probe_input(state.rls, inputs, hp)
+                clipped = jnp.clip(
+                    rls_normalized, -hp["rff_clip"], hp["rff_clip"]
+                )
+                features = jnp.concatenate(
+                    [
+                        clipped / jnp.sqrt(jnp.float32(clipped.shape[1])),
+                        jnp.ones((clipped.shape[0], 1), dtype=jnp.float32),
+                    ],
+                    axis=1,
+                )
+                member_logp.append(jax.nn.log_softmax(features @ state.rls.wout))
+            log_weights = jax.nn.log_softmax(hp["ens_beta"] * state.member_acc)
+            expected = jax.nn.log_softmax(
+                jax.nn.logsumexp(
+                    jnp.stack(member_logp) + log_weights[:, None, None], axis=0
+                )
+            )
+        chex.assert_shape(logits, (3, SMALL.n_classes))
+        np.testing.assert_allclose(np.asarray(logits), np.asarray(expected), rtol=1e-6)
 
     def test_lock_network_reduces_to_shiftnorm_champion_bitwise(self):
         """ens_lock_network=1: params AND metrics follow the registered

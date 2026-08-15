@@ -385,24 +385,3 @@ def test_current_checkpoint_resumes_exactly_and_v1_is_rejected_precisely(
     )
     with pytest.raises(ValueError, match="lacks exact step_words.*resave"):
         load_interaction_feature_checkpoint(legacy_path)
-
-
-def test_exact_clock_contract_is_exported_once_from_both_public_packages() -> None:
-    import alberta_framework
-    import alberta_framework.core as core
-
-    names = (
-        "INTERACTION_FEATURE_CHECKPOINT_SCHEMA",
-        "INTERACTION_FEATURE_LIFETIME_COUNTER_DELTA_NBYTES",
-        "INTERACTION_FEATURE_LIFETIME_COUNTER_NBYTES",
-        "INTERACTION_FEATURE_STATE_SCHEMA",
-        "INTERACTION_FEATURE_TRANSACTION_CLOCK_DELTA_NBYTES",
-        "INTERACTION_FEATURE_TRANSACTION_CLOCK_NBYTES",
-        "interaction_feature_lifetime_counter_nbytes",
-        "interaction_feature_transaction_clock_nbytes",
-        "measure_interaction_feature_state_nbytes",
-        "migrate_legacy_interaction_feature_state",
-    )
-    for package in (alberta_framework, core):
-        assert all(hasattr(package, name) for name in names)
-        assert all(package.__all__.count(name) == 1 for name in names)

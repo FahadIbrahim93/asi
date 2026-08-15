@@ -7204,38 +7204,6 @@ def _verify_output_tree_sections(
         )
 
 
-def _publish_sanitized_log(
-    partial_path: Path,
-    destination: Path,
-    plan: OfficialForagaxRunPlan | OfficialForagaxBatchRunPlan,
-) -> None:
-    """Publish a byte-faithful log except for host-local path placeholders."""
-    relative_partial = partial_path.relative_to(plan.output_dir).as_posix()
-    _metadata, contents = _read_bound_regular_file(
-        plan.output_dir,
-        relative_partial,
-        label="partial execution log",
-        capture_bytes=True,
-    )
-    assert contents is not None
-    interpreter = _absolute_without_resolving_symlinks(plan.request.interpreter)
-    replacements = {
-        str(plan.output_dir).encode(): b"<OUTPUT_DIR>",
-        str(plan.request.repository).encode(): b"<OFFICIAL_CHECKOUT>",
-        str(interpreter).encode(): b"<OFFICIAL_PYTHON>",
-        str(interpreter.parent.parent).encode(): b"<OFFICIAL_ENV>",
-    }
-    for original, logical in sorted(
-        replacements.items(),
-        key=lambda item: len(item[0]),
-        reverse=True,
-    ):
-        if original:
-            contents = contents.replace(original, logical)
-    _atomic_write_bytes(destination, contents)
-    _unlink_and_fsync(partial_path, missing_ok=True)
-
-
 def _completion_attestation(
     plan: OfficialForagaxRunPlan | OfficialForagaxBatchRunPlan,
 ) -> dict[str, Any]:

@@ -51,15 +51,6 @@ def _make_step11_cfg(
     )
 
 
-def _make_oak_cfg(
-    *,
-    specs: tuple[SubtaskSpec, ...] = (_SPEC0,),
-    obs_dim: int = 4,
-) -> OaKConfig:
-    stomp = STOMPConfig(subtask_specs=specs, observation_dim=obs_dim)
-    return OaKConfig(stomp=stomp)
-
-
 def _setup(
     cfg: Step11OaKConfig | None = None,
     *,
@@ -77,12 +68,6 @@ def _setup(
 # ---------------------------------------------------------------------------
 # OaKConfig validation and serialization
 # ---------------------------------------------------------------------------
-
-
-def test_oak_config_no_subtasks_raises() -> None:
-    stomp = STOMPConfig(subtask_specs=())
-    with pytest.raises(ValueError, match="subtask"):
-        OaKConfig(stomp=stomp)
 
 
 def test_oak_config_invalid_ema_decay_raises() -> None:

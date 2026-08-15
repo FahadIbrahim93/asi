@@ -1,5 +1,5 @@
 # mypy: disable-error-code="attr-defined,call-arg"
-"""Production-facing Step 11 OaK facade.
+"""Public Step 11 OaK facade.
 
 Step 11 of the Alberta Plan introduces the OaK (Options and Knowledge)
 architecture.  OaK extends the STOMP progression from Step 10 with three

@@ -1,5 +1,5 @@
 # mypy: disable-error-code="call-arg"
-"""Production-facing Step 6 average-reward control facade (Control II).
+"""Public Step 6 average-reward control facade (Control II).
 
 Step 6 of the Alberta Plan is continuing control: the agent maximizes the
 long-run reward *rate* rather than a discounted or episodic return.  The

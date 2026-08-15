@@ -1,5 +1,5 @@
 # mypy: disable-error-code="call-arg"
-"""Production-facing Step 8 one-step world-model facade.
+"""Public Step 8 one-step world-model facade.
 
 Step 8 is the environment-prediction surface of the model-based progression:
 learn a one-step model — expected reward and next observation (or observation

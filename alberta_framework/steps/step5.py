@@ -1,5 +1,5 @@
 # mypy: disable-error-code="call-arg"
-"""Production-facing Step 5 average-reward prediction facade (Predict II).
+"""Public Step 5 average-reward prediction facade (Predict II).
 
 Step 5 of the Alberta Plan moves prediction to the continuing, average-reward
 setting: no discounting, no episodes.  The learner behind this facade is the

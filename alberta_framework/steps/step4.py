@@ -1,5 +1,5 @@
 # mypy: disable-error-code="attr-defined,call-arg"
-"""Production-facing Step 4 SARSA control facade (Alberta Plan Step 4, Control I).
+"""Public Step 4 SARSA control facade (Alberta Plan Step 4, Control I).
 
 This module keeps the packaged Step 4 surface narrow: construct a SARSA agent,
 prime it with an initial feature vector, run one online transition, or scan over

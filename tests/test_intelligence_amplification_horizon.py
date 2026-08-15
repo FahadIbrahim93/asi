@@ -12,17 +12,13 @@ import jax.random as jr
 import numpy as np
 import pytest
 
-import alberta_framework.core as public_core
 from alberta_framework.core.intelligence_amplification import (
     EXO_CEREBELLUM_LIFETIME_COUNTER_DELTA_NBYTES,
     EXO_CEREBELLUM_LIFETIME_COUNTER_NBYTES,
-    EXO_CEREBELLUM_STATE_SCHEMA,
     IA_LIFETIME_COUNTER_DELTA_NBYTES,
     IA_LIFETIME_COUNTER_NBYTES,
-    IA_STATE_SCHEMA,
     RECOMMENDATION_PROTOCOL_LIFETIME_COUNTER_DELTA_NBYTES,
     RECOMMENDATION_PROTOCOL_LIFETIME_COUNTER_NBYTES,
-    RECOMMENDATION_PROTOCOL_STATE_SCHEMA,
     ExoCerebellumAgent,
     ExoCerebellumConfig,
     ExoCerebellumState,
@@ -47,12 +43,6 @@ from alberta_framework.core.intelligence_amplification import (
 )
 from alberta_framework.core.oak import OaKConfig, measure_oak_state_nbytes
 from alberta_framework.core.options import STOMPConfig, SubtaskSpec
-from alberta_framework.core.prototype_agent import (
-    PrototypeAgent,
-    PrototypeAgentConfig,
-    PrototypeAgentState,
-    PrototypeTransition,
-)
 
 pytestmark = pytest.mark.unit
 
@@ -166,80 +156,6 @@ def _protocol_state(
     )
 
 
-def _prototype_with_primitive_clock(
-    state: PrototypeAgentState,
-    words: tuple[int, int],
-    observation_words: tuple[int, int],
-) -> PrototypeAgentState:
-    """Move the Prototype and both IA learners to one exact history."""
-
-    exact = jnp.asarray(words, dtype=jnp.uint32)
-    observation_exact = jnp.asarray(observation_words, dtype=jnp.uint32)
-    telemetry = jnp.asarray(_telemetry(words), dtype=jnp.int32)
-    observation_telemetry = jnp.asarray(
-        _telemetry(observation_words),
-        dtype=jnp.int32,
-    )
-    base = state.oak_state.stomp_state.base_learner_state.replace(
-        step_count=telemetry,
-        step_words=exact,
-    )
-    stomp = state.oak_state.stomp_state.replace(
-        base_learner_state=base,
-        step_count=telemetry,
-        step_words=exact,
-    )
-    oak = state.oak_state.replace(
-        stomp_state=stomp,
-        step_count=telemetry,
-        step_words=exact,
-    )
-    return cast(
-        PrototypeAgentState,
-        state.replace(
-            oak_state=oak,
-            ia_state=_with_primitive_clock(state.ia_state, words),
-            step_count=telemetry,
-            step_words=exact,
-            observation_event_count=observation_telemetry,
-            observation_event_words=observation_exact,
-        ),
-    )
-
-
-def test_v2_schemas_and_public_exact_clock_surface() -> None:
-    assert EXO_CEREBELLUM_STATE_SCHEMA.endswith(".v2")
-    assert IA_STATE_SCHEMA.endswith(".v2")
-    assert RECOMMENDATION_PROTOCOL_STATE_SCHEMA.endswith(".v2")
-    expected = {
-        "EXO_CEREBELLUM_LIFETIME_COUNTER_DELTA_NBYTES",
-        "EXO_CEREBELLUM_LIFETIME_COUNTER_NBYTES",
-        "EXO_CEREBELLUM_STATE_SCHEMA",
-        "IA_LIFETIME_COUNTER_DELTA_NBYTES",
-        "IA_LIFETIME_COUNTER_NBYTES",
-        "IA_STATE_SCHEMA",
-        "RECOMMENDATION_PROTOCOL_LIFETIME_COUNTER_DELTA_NBYTES",
-        "RECOMMENDATION_PROTOCOL_LIFETIME_COUNTER_NBYTES",
-        "RECOMMENDATION_PROTOCOL_STATE_SCHEMA",
-        "ExoCerebellumUpdateResult",
-        "ExoCortexConfig",
-        "ExoCortexState",
-        "exo_cerebellum_lifetime_counter_nbytes",
-        "ia_lifetime_counter_nbytes",
-        "measure_exo_cerebellum_state_nbytes",
-        "measure_ia_state_nbytes",
-        "measure_ia_wrapper_state_nbytes",
-        "measure_recommendation_protocol_state_nbytes",
-        "migrate_legacy_exo_cerebellum_state",
-        "migrate_legacy_ia_state",
-        "migrate_legacy_recommendation_protocol_state",
-        "recommendation_protocol_lifetime_counter_nbytes",
-        "recommendation_protocol_state_is_valid",
-    }
-    assert expected <= set(public_core.__all__)
-    assert all(hasattr(public_core, name) for name in expected)
-
-
 def test_cerebellum_eager_jit_and_scan_cross_low_word_carry() -> None:
     agent = ExoCerebellumAgent(ExoCerebellumConfig(n_demons=2, obs_dim=2))
     source = cast(
@@ -313,53 +229,6 @@ def test_ia_eager_jit_and_scan_cross_low_word_carry() -> None:
         scanned.state.step_words,
         scanned.state.cortex_state.stomp_state.step_words,
     )
-
-
-def test_prototype_and_ia_share_exact_history_after_int32_saturation() -> None:
-    ia_config = _config()
-    agent = PrototypeAgent(
-        PrototypeAgentConfig(
-            oak=ia_config.cortex,
-            ia=ia_config,
-        )
-    )
-    source = agent.start(agent.init(jr.key(71)), _OBS)
-    source = _prototype_with_primitive_clock(
-        source,
-        (0, _INT32_MAX),
-        (0, _INT32_MAX + 1),
-    )
-    assert bool(agent._checkpoint_state_valid(source))
-
-    result = agent.update_transition(
-        source,
-        PrototypeTransition(
-            observation=source.current_raw_observation,
-            action=source.current_action,
-            decision_id=source.current_decision_id,
-            reward=jnp.asarray(0.25, dtype=jnp.float32),
-            discount=jnp.asarray(1.0, dtype=jnp.float32),
-            terminated=jnp.asarray(False, dtype=jnp.bool_),
-            truncated=jnp.asarray(False, dtype=jnp.bool_),
-            next_observation=_OBS,
-            next_decision_observation=_OBS,
-        ),
-    )
-
-    assert bool(result.transition_diagnostics.valid)
-    assert bool(result.ia_update_applied)
-    expected = jnp.asarray((0, _INT32_MAX + 1), dtype=jnp.uint32)
-    ia_state = cast(IAState, result.state.ia_state)
-    chex.assert_trees_all_equal(result.state.step_words, expected)
-    chex.assert_trees_all_equal(ia_state.step_words, expected)
-    chex.assert_trees_all_equal(ia_state.cerebellum_state.step_words, expected)
-    chex.assert_trees_all_equal(ia_state.cortex_state.step_words, expected)
-    chex.assert_trees_all_equal(
-        ia_state.cortex_state.stomp_state.step_words,
-        expected,
-    )
-    assert int(result.state.step_count) == _INT32_MAX
-    assert int(ia_state.step_count) == _INT32_MAX
 
 
 def test_ia_telemetry_saturates_while_exact_identity_advances() -> None:

@@ -32,18 +32,15 @@ values — feature discovery plus step-size relevance *is* the memory mechanism.
 :class:`ContextGatedFeatures` provides that feature map explicitly (the oracle
 representation); discovery learners should find it autonomously.
 
-The diagnostic is comparative, against two ablated baselines run on the same
-stream (see ``tests/test_gauntlet_certification.py``):
+The stream supports comparison against two useful ablated baselines:
 
 - a fixed step-size LMS learner (best of a small sweep) — probes whether
   meta-learned step-sizes are load-bearing for tracking;
 - a fresh-reinit-at-every-segment twin (perfect plasticity, zero memory) —
   probes whether retained state is load-bearing on recurrence segments.
 
-The checked-in tests use a small development-seed set and a supplied
-context-gated feature map.  They are mechanism diagnostics, not held-out
-certification of autonomous feature discovery or an integrated continual
-agent.
+Those comparisons are diagnostics, not evidence of autonomous feature
+discovery or an integrated continual agent.
 
 Everything here is pure JAX: the stream is a ``ScanStream``, the runner is a
 single ``jax.lax.scan`` per seed and ``jax.vmap`` across seeds.

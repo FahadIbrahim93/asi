@@ -13,14 +13,8 @@ from alberta_framework.core.option_value_duration import (
     OptionValueDurationConfig,
     OptionValueDurationLearner,
 )
-from alberta_framework.evaluation.option_value_duration_diagnostic import (
-    FAST_OPTION,
-    SLOW_OPTION,
-    OptionValueDurationDiagnosticConfig,
-    run_option_value_duration_diagnostic,
-)
 
-pytestmark = pytest.mark.development
+pytestmark = pytest.mark.unit
 
 
 def test_config_roundtrip_validation_and_fixed_parameter_count() -> None:
@@ -171,35 +165,3 @@ def test_reward_rate_prediction_preserves_raw_duration_and_floors_only_score() -
         prediction.reward_rates,
         jnp.array([0.6, 8.0], dtype=jnp.float32),
     )
-
-
-def test_continuing_semi_markov_diagnostic_exposes_value_only_misranking() -> None:
-    result = run_option_value_duration_diagnostic()
-
-    assert result.evidence_level == "L1 deterministic development diagnostic"
-    assert result.transition_count == 12 * (10 + 2)
-    assert result.option_update_counts == (12 * 10, 12 * 2)
-    assert result.learned_reward_values == pytest.approx((6.0, 4.0))
-    assert result.learned_durations == pytest.approx((10.0, 2.0))
-    assert result.learned_reward_rates == pytest.approx((0.6, 2.0))
-    assert result.true_reward_rates == pytest.approx((0.6, 2.0))
-    assert result.value_only_choice == SLOW_OPTION
-    assert result.reward_rate_choice == FAST_OPTION
-    assert result.optimal_reward_rate_choice == FAST_OPTION
-    assert result.mechanism_passed
-
-
-def test_diagnostic_rejects_non_diagnostic_or_undertrained_configuration() -> None:
-    with pytest.raises(ValueError, match="returns must be finite"):
-        OptionValueDurationDiagnosticConfig(slow_return=float("nan"))
-    with pytest.raises(ValueError, match="slow_return"):
-        OptionValueDurationDiagnosticConfig(slow_return=3.0, fast_return=4.0)
-    with pytest.raises(ValueError, match="larger true reward rate"):
-        OptionValueDurationDiagnosticConfig(
-            slow_return=6.0,
-            slow_duration=2,
-            fast_return=4.0,
-            fast_duration=2,
-        )
-    with pytest.raises(ValueError, match="longest TD"):
-        OptionValueDurationDiagnosticConfig(executions_per_option=9)

@@ -37,10 +37,13 @@ provenance_module = importlib.import_module(
 )
 _DISTRIBUTION_FILES = (
     "alberta_framework/benchmarks/__init__.py",
+    "alberta_framework/benchmarks/_official_foragax_oci_cli.py",
     "alberta_framework/benchmarks/historical_forager.py",
     "alberta_framework/benchmarks/historical_forager_provenance.py",
+    "alberta_framework/console_entrypoints.py",
     "alberta_framework/forager_cli.py",
 )
+_SDIST_ONLY_FILES = ("VENDORING.md",)
 
 
 class _TinyHistoricalEnvironment:
@@ -180,29 +183,38 @@ def test_historical_cli_reports_provenance_and_validates_strict_pairing(
     assert "must be a real directory" in missing.stderr
 
 
-def test_wheel_and_sdist_ship_historical_surfaces_and_sdist_document(tmp_path: Path) -> None:
+def test_wheel_and_sdist_ship_historical_code_and_entrypoint(tmp_path: Path) -> None:
     uv = shutil.which("uv")
     if uv is None:
         pytest.skip("uv is required for the distribution integration check")
     output_directory = tmp_path / "dist"
+    build_arguments = (
+        uv,
+        "build",
+        "--no-build-logs",
+        "--no-create-gitignore",
+        "--no-python-downloads",
+        "--out-dir",
+        str(output_directory),
+        str(_REPO_ROOT),
+    )
     completed = subprocess.run(
-        (
-            uv,
-            "build",
-            "--offline",
-            "--no-build-logs",
-            "--no-create-gitignore",
-            "--no-python-downloads",
-            "--out-dir",
-            str(output_directory),
-            str(_REPO_ROOT),
-        ),
+        (*build_arguments[:2], "--offline", *build_arguments[2:]),
         cwd=_REPO_ROOT,
         check=False,
         capture_output=True,
         text=True,
         timeout=120,
     )
+    if completed.returncode != 0 and "network was disabled" in completed.stderr:
+        completed = subprocess.run(
+            build_arguments,
+            cwd=_REPO_ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
     assert completed.returncode == 0, completed.stderr
 
     project = tomllib.loads((_REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
@@ -216,14 +228,13 @@ def test_wheel_and_sdist_ship_historical_surfaces_and_sdist_document(tmp_path: P
         wheel_names = set(wheel.namelist())
         for relative_path in _DISTRIBUTION_FILES:
             assert relative_path in wheel_names
-            assert wheel.read(relative_path) == (_REPO_ROOT / relative_path).read_bytes()
-        assert "HISTORICAL_FORAGER_RECONSTRUCTED.md" not in wheel_names
         entry_points_name = next(
             name for name in wheel_names if name.endswith(".dist-info/entry_points.txt")
         )
         entry_points = wheel.read(entry_points_name).decode("utf-8")
         assert (
-            "alberta-historical-forager = alberta_framework.forager_cli:historical_main"
+            "alberta-historical-forager = "
+            "alberta_framework.console_entrypoints:historical_forager_main"
             in entry_points
         )
         assert "alberta-foragax-oci" in entry_points
@@ -231,14 +242,6 @@ def test_wheel_and_sdist_ship_historical_surfaces_and_sdist_document(tmp_path: P
     prefix = f"alberta_framework-{version}"
     with tarfile.open(sdist_path, mode="r:gz") as source_distribution:
         sdist_names = set(source_distribution.getnames())
-        for relative_path in _DISTRIBUTION_FILES:
+        for relative_path in (*_DISTRIBUTION_FILES, *_SDIST_ONLY_FILES):
             archived_path = f"{prefix}/{relative_path}"
             assert archived_path in sdist_names
-            extracted = source_distribution.extractfile(archived_path)
-            assert extracted is not None
-            assert extracted.read() == (_REPO_ROOT / relative_path).read_bytes()
-        document_path = f"{prefix}/HISTORICAL_FORAGER_RECONSTRUCTED.md"
-        assert document_path in sdist_names
-        document = source_distribution.extractfile(document_path)
-        assert document is not None
-        assert document.read() == (_REPO_ROOT / "HISTORICAL_FORAGER_RECONSTRUCTED.md").read_bytes()

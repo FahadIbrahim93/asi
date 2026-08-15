@@ -969,36 +969,3 @@ def test_official_typed_rng_jit_scan_checkpoint_and_resources(tmp_path) -> None:
     assert resources.source_commit == OFFICIAL_ADAUPGD_COMMIT
     assert resources.source_path == OFFICIAL_ADAUPGD_PATH
     assert measure_official_adaupgd_state_nbytes(loop_state) == 40
-
-
-def test_public_roots_export_exact_adaptive_extension_symbols() -> None:
-    import alberta_framework as package_root
-    import alberta_framework.core as core_root
-    from alberta_framework.core import canonical_upgd
-
-    names = (
-        "ALBERTA_ADAUPGD_PROFILE",
-        "OFFICIAL_ADAUPGD_COMMIT",
-        "OFFICIAL_ADAUPGD_PATH",
-        "OFFICIAL_ADAUPGD_PROFILE",
-        "AlbertaAdaUPGD",
-        "AlbertaAdaUPGDConfig",
-        "AlbertaAdaUPGDProfile",
-        "AlbertaAdaUPGDResources",
-        "AlbertaAdaUPGDState",
-        "AlbertaAdaUPGDUpdate",
-        "OfficialAdaUPGD",
-        "OfficialAdaUPGDConfig",
-        "OfficialAdaUPGDProfile",
-        "OfficialAdaUPGDResources",
-        "OfficialAdaUPGDState",
-        "OfficialAdaUPGDUpdate",
-        "measure_alberta_adaupgd_state_nbytes",
-        "measure_official_adaupgd_state_nbytes",
-    )
-    for name in names:
-        implementation = getattr(canonical_upgd, name)
-        assert getattr(core_root, name) is implementation
-        assert getattr(package_root, name) is implementation
-        assert name in core_root.__all__
-        assert name in package_root.__all__

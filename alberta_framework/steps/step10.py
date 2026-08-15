@@ -1,5 +1,5 @@
 # mypy: disable-error-code="attr-defined,call-arg"
-"""Production-facing Step 10 STOMP facade.
+"""Public Step 10 STOMP facade.
 
 Step 10 of the Alberta Plan introduces the STOMP progression: SubTasks,
 Options, Models, Planning.  This is the first step that enables temporal
@@ -202,6 +202,8 @@ def make_step10_stomp_agent(config: Step10STOMPConfig | None = None) -> STOMPAge
         config = Step10STOMPConfig(
             subtask_specs=(SubtaskSpec(feature_index=0),),
         )
+    if not config.subtask_specs:
+        raise ValueError("Step 10 STOMP requires at least one subtask")
     return STOMPAgent(config.to_stomp_config())
 
 

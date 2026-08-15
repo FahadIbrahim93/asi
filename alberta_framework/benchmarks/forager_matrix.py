@@ -2573,11 +2573,6 @@ def _atomic_create_bytes(path: Path, encoded: bytes) -> None:
         os.close(directory_descriptor)
 
 
-def _atomic_create_json(path: Path, payload: Mapping[str, Any]) -> None:
-    """Atomically create a canonical artifact without replacing any file."""
-    _atomic_create_bytes(path, _canonical_json_bytes(payload) + b"\n")
-
-
 def _read_regular_file_bytes(
     path: Path,
     *,
@@ -2771,15 +2766,6 @@ def _build_source_snapshot() -> _SourceSnapshot:
 def _source_tree_sha256() -> str:
     """Hash the exact reconstructible source inventory."""
     return _build_source_snapshot().tree_sha256
-
-
-def _verify_source_snapshot_file(path: Path, expected: _SourceSnapshot) -> None:
-    actual = _read_regular_file_bytes(path)
-    actual_sha256 = hashlib.sha256(actual).hexdigest()
-    if actual_sha256 != expected.archive_sha256 or actual != expected.archive_bytes:
-        raise ForagerMatrixStateError(
-            "immutable source snapshot does not match the current source tree"
-        )
 
 
 def _validate_source_snapshot_bytes(
@@ -3942,6 +3928,13 @@ def _validate_tuning_reference(
     *,
     evaluation_context: Mapping[str, Any],
 ) -> dict[str, Any] | None:
+    """Validate host tuning inputs while keeping them ineligible for evaluation.
+
+    A future verifier-issued OCI adapter may return the documented reference
+    fields consumed by :func:`_protocol_conformance`: report and execution
+    digests, tuning seeds, selected variants, and the six conformance booleans.
+    This host/snapshot path always fails closed before producing that mapping.
+    """
     selection = manifest.tuning_selection
     if selection is None:
         return None
@@ -4028,7 +4021,7 @@ def _validate_tuning_reference(
             "evaluation selection rule does not match the referenced tuning report"
         )
     try:
-        tuning_variants, tuning_execution, recomputed_protocol = (
+        tuning_variants, _tuning_execution, recomputed_protocol = (
             _validate_tuning_artifact_chain(
                 report_path=report_path,
                 report=report,
@@ -4060,7 +4053,6 @@ def _validate_tuning_reference(
         selection_results.get("groups"),
         "referenced selection_results.groups",
     )
-    selected_details: dict[str, Any] = {}
     expected_groups = set(groups)
     evaluation_groups = {
         variant.selection_group for variant in manifest.variants.values()
@@ -4113,12 +4105,6 @@ def _validate_tuning_reference(
                 f"evaluation variant {evaluation_id!r} does not match selected "
                 f"tuning variant {tuning_id!r}"
             )
-        selected_details[evaluation_id] = {
-            "tuning_variant_id": tuning_id,
-            "selection_group": evaluation_variant.selection_group,
-            "kind": evaluation_variant.kind,
-            "config_sha256": evaluation_hash,
-        }
     tuning_seed_values = matrix_config.get("seeds")
     tuning_seeds = _require_seed_list(tuning_seed_values, "referenced matrix_config.seeds")
     if tuning_manifest.evaluation_seeds != manifest.evaluation_seeds:
@@ -4144,24 +4130,6 @@ def _validate_tuning_reference(
         "identity, and environment RNG schedule. Bare manifest declarations are "
         "never trusted."
     )
-
-    # The return shape remains documented here for the external adapter. The
-    # host runner cannot reach it without a verifier-issued envelope.
-    return {
-        "report_path": selection.report_path,
-        "file_sha256": actual_file_sha256,
-        "report_payload_sha256": report["payload_sha256"],
-        "matrix_config_sha256": report["matrix_config_sha256"],
-        "tuning_seeds": list(tuning_seeds),
-        "stage_protocol_conformant": protocol["stage_protocol_conformant"],
-        "selection_protocol_conformant": protocol["selection_protocol_conformant"],
-        "immutable_source_execution": protocol["immutable_source_execution"],
-        "runtime_immutable": protocol["runtime_immutable"],
-        "metric_evidence_conformant": protocol["metric_evidence_conformant"],
-        "rng_schedule_conformant": protocol["rng_schedule_conformant"],
-        "execution_manifest_sha256": tuning_execution["payload_sha256"],
-        "selected_variants": selected_details,
-    }
 
 
 def _protocol_conformance(

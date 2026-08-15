@@ -1,5 +1,5 @@
 # mypy: disable-error-code="attr-defined,call-arg"
-"""Production-facing Step 12 Intelligence Amplification facade.
+"""Public Step 12 Intelligence Amplification facade.
 
 Step 12 of the Alberta Plan — "Prototype-IA: Intelligence Amplification" —
 demonstrates that an IA agent can increase the decision-making capacity of a

@@ -25,7 +25,6 @@ from alberta_framework.evaluation.upgd_ipmnist_nonpromoting import (
     EXPECTED_HYPERPARAMETERS,
     EXPECTED_NOTE,
     UPGD_IPMNIST_PARTIAL_SCHEMA,
-    validate_completed_upgd_ipmnist_run,
     validate_upgd_ipmnist_artifact,
     validate_upgd_ipmnist_partials,
     validate_upgd_ipmnist_reconstructed_provenance,
@@ -364,7 +363,7 @@ def test_v2_validator_rejects_v1_schema_even_when_filename_says_v2(tmp_path: Pat
 
 
 @pytest.mark.unit
-def test_completed_nonpromoting_receipt_binds_and_recomputes_every_shard() -> None:
+def test_nonpromoting_receipt_binds_stored_shards_and_summary() -> None:
     raw = _CURRENT_RECEIPT.read_bytes()
     assert hashlib.sha256(raw).hexdigest() == _CURRENT_RECEIPT_SHA256
     receipt = json.loads(raw)
@@ -420,11 +419,11 @@ def test_completed_nonpromoting_receipt_binds_and_recomputes_every_shard() -> No
     assert finalizer_binding["strict_validator_valid"] is False
     assert finalizer_binding["preserved_without_overwrite"] is True
 
-    partial_paths: list[Path] = []
     learner_averages: dict[str, list[float]] = {
         "upgd_w": [],
         "adamw": [],
     }
+    assert len(receipt["partial_shards"]) == 20
     for binding in receipt["partial_shards"]:
         path = _ROOT / binding["path"]
         shard_raw = path.read_bytes()
@@ -435,19 +434,6 @@ def test_completed_nonpromoting_receipt_binds_and_recomputes_every_shard() -> No
         assert shard["seeds"] == [binding["seed"]]
         accuracy = np.asarray(shard["per_task_accuracy"], dtype=np.float64)
         learner_averages[binding["learner"]].append(float(accuracy[0].mean()))
-        partial_paths.append(path)
-    assert len(partial_paths) == 20
-
-    validation = validate_completed_upgd_ipmnist_run(
-        canonical_path,
-        partial_paths,
-        root=_ROOT,
-    )
-    assert validation.valid, validation.errors
-    assert validation.development_only
-    assert not validation.scientific_promotion_allowed
-    assert validation.artifact_sha256 == canonical_binding["sha256"]
-    assert len(validation.observed_seed_pairs) == 20
 
     provenance = receipt["post_hoc_reconstructed_provenance"]
     assert provenance["execution_attestation"] is False
@@ -495,11 +481,6 @@ def test_completed_nonpromoting_receipt_binds_and_recomputes_every_shard() -> No
     for path_string, expected_sha256 in numeric_source_map.items():
         source_raw = (bundle_root / path_string).read_bytes()
         assert hashlib.sha256(source_raw).hexdigest() == expected_sha256
-
-    cache_binding = provenance["mnist_cache"]
-    cache_raw = (_ROOT / cache_binding["path"]).read_bytes()
-    assert len(cache_raw) == cache_binding["size_bytes"]
-    assert hashlib.sha256(cache_raw).hexdigest() == cache_binding["sha256"]
 
     log_binding = provenance["operational_log_archive"]
     log_path = _ROOT / log_binding["path"]

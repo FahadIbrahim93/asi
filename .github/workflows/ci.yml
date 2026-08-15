@@ -1,20 +1,12 @@
 name: ci
 
-# CI for ASI (JAX continual-RL). The suite is ~15,900 tests across ~700 files
-# and was written for a 24-core workstation. Run whole on a 4-core hosted
-# runner it exhausts the box and the job is killed (exit 143 / "operation was
-# canceled") partway through, which reports a red run that says nothing about
-# the code. So the test lanes are sharded by file and capped at two xdist
-# workers per job, which keeps each shard inside the runner's memory and well
-# inside its timeout.
+# JAX compilation makes the suite memory-intensive on hosted runners. Test
+# files are sharded and each job is capped at two xdist workers to keep memory
+# use bounded.
 #
-#   lint — ruff + mypy on both supported interpreters. Cheap and always run.
-#   test — per-PR gate: the `unit` lane, sharded, on 3.12 (the version the
-#          elizaOS robot track consumes in process). Measured ~740 tests per
-#          shard, which finishes well inside the timeout.
-#   full — `-m "not slow"` on both interpreters, sharded. Manual dispatch and
-#          push to main only; a shard of that lane measured ~30 minutes at two
-#          workers, so it does not belong in the per-PR path.
+#   lint — ruff + mypy on both supported interpreters.
+#   test — the complete non-slow suite on Python 3.12 for pull requests and
+#          both supported interpreters on main/manual runs.
 #
 # Benchmarks never run in CI. They are executed through their CLIs on hardware
 # that can afford them; see outputs/ipmnist_screening/RUNBOOK.md.
@@ -69,45 +61,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4, 5, 6, 7, 8]
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Python 3.12
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-          cache: pip
-          cache-dependency-path: pyproject.toml
-
-      - name: Install (editable, with dev extras)
-        run: |
-          python -m pip install -U pip
-          pip install -e '.[dev]' pytest-xdist
-
-      - name: Test shard ${{ matrix.shard }} of ${{ env.SHARD_COUNT }}
-        run: |
-          set -euo pipefail
-          mapfile -t files < <(
-            find tests -name 'test_*.py' | sort |
-              awk -v n="$SHARD_COUNT" -v s="${{ matrix.shard }}" 'NR % n == s % n'
-          )
-          if [ "${#files[@]}" -eq 0 ]; then
-            echo "::error::shard ${{ matrix.shard }} selected no test files"
-            exit 1
-          fi
-          echo "shard ${{ matrix.shard }}: ${#files[@]} files"
-          python -m pytest "${files[@]}" -q -rs -o addopts="" \
-            -m unit -n 2 --dist loadfile --durations=10
-
-  full:
-    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ["3.12", "3.13"]
+        python-version: ${{ fromJSON(github.event_name == 'pull_request' && '["3.12"]' || '["3.12", "3.13"]') }}
         shard: [1, 2, 3, 4, 5, 6, 7, 8]
     steps:
       - uses: actions/checkout@v4
@@ -119,7 +73,7 @@ jobs:
           cache: pip
           cache-dependency-path: pyproject.toml
 
-      - name: Install (editable, with full-suite extras)
+      - name: Install (editable, with test extras)
         run: |
           python -m pip install -U pip
           pip install -e '.[dev,gymnasium,forager]' pytest-xdist
@@ -136,5 +90,5 @@ jobs:
             exit 1
           fi
           echo "shard ${{ matrix.shard }}: ${#files[@]} files"
-          python -m pytest "${files[@]}" -q -rs -o addopts="" \
+          python -m pytest "${files[@]}" -q -rs \
             -m "not slow" -n 2 --dist loadfile --durations=10

@@ -182,7 +182,8 @@ class TestScheduleExactness:
 
 class TestTinySmokeRun:
     @pytest.fixture(scope="class")
-    def debug_run(self):
+    @classmethod
+    def debug_run(cls):
         x, y = _tiny_data()
         return run_label_emnist(
             x, y, "upgd_w", seeds=[0, 1], config=TINY, return_per_step=True
@@ -317,7 +318,7 @@ class TestNormalizedTransferArms:
         np.testing.assert_array_equal(first.per_task_loss, second.per_task_loss)
 
     def test_plan_binds_normalized_arm_hyperparameters(self, tmp_path):
-        from alberta_framework.benchmarks.upgd_ipmnist_v3 import atomic_write_new_json
+        from alberta_framework.benchmarks.upgd_ipmnist import atomic_write_new_json
 
         learners = ("upgd_ema_norm", "upgd_ema_norm_sigma0", "sgd_ema_norm")
         payload = build_plan_payload(TINY, [0, 1], DATASET_META, learners=learners)
@@ -342,7 +343,7 @@ class TestPlanShardMergeAccounting:
         return run_label_emnist(x, y, learner, seeds=[seed], config=TINY)
 
     def test_plan_roundtrip_and_validation(self, tmp_path):
-        from alberta_framework.benchmarks.upgd_ipmnist_v3 import atomic_write_new_json
+        from alberta_framework.benchmarks.upgd_ipmnist import atomic_write_new_json
 
         payload = self._plan()
         path = tmp_path / "plan.json"
@@ -360,7 +361,7 @@ class TestPlanShardMergeAccounting:
             build_plan_payload(TINY, [], DATASET_META)
 
     def test_merge_full_coverage_and_accounting(self, tmp_path):
-        from alberta_framework.benchmarks.upgd_ipmnist_v3 import atomic_write_new_json
+        from alberta_framework.benchmarks.upgd_ipmnist import atomic_write_new_json
 
         plan = self._plan()
         paths = []
@@ -399,7 +400,7 @@ class TestPlanShardMergeAccounting:
         )
 
     def test_merge_rejects_duplicates_missing_and_foreign_shards(self, tmp_path):
-        from alberta_framework.benchmarks.upgd_ipmnist_v3 import atomic_write_new_json
+        from alberta_framework.benchmarks.upgd_ipmnist import atomic_write_new_json
 
         plan = self._plan()
         result = self._result("adamw", 0)
@@ -421,7 +422,7 @@ class TestPlanShardMergeAccounting:
             merge_partials(plan, [good, foreign], allow_incomplete=True)
 
     def test_partial_rejects_multi_seed_and_unplanned_identity(self, tmp_path):
-        from alberta_framework.benchmarks.upgd_ipmnist_v3 import atomic_write_new_json
+        from alberta_framework.benchmarks.upgd_ipmnist import atomic_write_new_json
 
         plan = self._plan()
         x, y = _tiny_data()

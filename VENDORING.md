@@ -1,16 +1,17 @@
-# Fork status: Alberta Framework
+# Fork status: ASI and Alberta Framework
 
 This directory began as a vendored copy of the **Alberta Framework** — a JAX
 implementation of
 [The Alberta Plan for AI Research](https://arxiv.org/abs/2208.11173) (Sutton,
-Bowling, Pilarski 2022). It is now a **development fork**, not a
-lightly-patched vendor drop: the continual-learning research campaign happens
-in this tree, and the divergence from the imported snapshot is substantial and
-intentional.
+Bowling, Pilarski 2022). It is now **ASI**, an independent continual-learning
+research and hillclimbing line, not a lightly-patched vendor drop. The Alberta
+Plan remains a major inspiration and historical foundation, but it is not
+ASI's binding roadmap. The divergence from the imported snapshot is
+substantial and intentional.
 
 - **Fork point:** `lalalune/alberta` @
   `2ac35333efae45cf969ce02ec1f2703476fed6c2`
-- **Canonical repository URL:** https://github.com/lalalune/alberta
+- **Canonical upstream repository URL:** https://github.com/lalalune/alberta
   (this is the single upstream identity; the `j-klawson/alberta-framework`
   URLs that older `pyproject.toml`/`CITATION.cff` revisions pointed at are
   stale and are no longer referenced)
@@ -18,60 +19,71 @@ intentional.
 
 ## Why it lives here
 
-`eliza-robot` (`packages/research/robot`) uses the Alberta continual-RL
-control subset to train robot policies that learn a sequence of tasks without
-catastrophic forgetting, and benchmarks it against standard RL (PPO). The
-framework is imported in-process from the robot's Python 3.12 environment,
-which is why `requires-python` is `>=3.12` and the numpy floor is `>=1.26`
-(brax/mujoco pin `numpy<2` there).
+ASI targets an end-to-end continual-learning agent that can scale to real work,
+especially robotics. Today, `eliza-robot` (`packages/research/robot`) uses the
+inherited Alberta continual-RL control subset to train across sequences of
+robot tasks with the intent of
+mitigating catastrophic forgetting, and provides standard-RL comparison paths
+including PPO. Its ASIMOV-1 task, checkpoint, bridge, and validation plumbing
+is an integration target, not yet ASI performance or robotics-readiness
+evidence. The framework is imported in-process from the robot's Python 3.12
+environment, which is why `requires-python` is `>=3.12` and the NumPy floor is
+`>=1.26` to preserve the supported lower-bound runtime. The robot package
+currently permits NumPy 2.x; the `>=1.26` constraint is a compatibility floor,
+not a claim about its current lockfile.
+
+## Naming and compatibility
+
+**ASI** is the current project, repository, and documentation identity. The
+following Alberta names remain intentionally stable:
+
+- the `alberta-framework` Python distribution;
+- the `alberta_framework` import namespace;
+- the `alberta-*` console commands and Alberta-specific Step APIs; and
+- historical `alberta.*` artifact schemas, benchmark candidate IDs, paths,
+  and immutable records.
+
+The software names are compatibility interfaces used by the robot track,
+packaging, tests, and artifact validators. The historical names are provenance
+and must not be cosmetically rewritten. A future namespace migration would be
+a separate versioned compatibility project, not part of this documentation
+rebrand.
 
 ## Divergence from the fork point
 
 The fork-point commit is not present in this repository's history (the tree
-arrived already diverged), so the divergence is described by current
-inventory rather than a recomputed diff. Measured 2026-08-01; the tree is
-under active campaign development, so exact counts move:
+arrived already diverged), so the divergence is described by capabilities
+rather than brittle file and test counts:
 
-- **`alberta_framework/evaluation/`** — fork-local subpackage, 74 modules:
+- **`alberta_framework/evaluation/`** — fork-local subpackage containing
   strict evidence artifacts and validators, the evidence-registry manifest
   (`evidence_manifest.py` / `alberta-evidence-status`), and the evidence
   CLIs.
-- **`alberta_framework/benchmarks/`** — fork-local subpackage, 40 modules:
+- **`alberta_framework/benchmarks/`** — fork-local subpackage containing
   the Forager family (matched-current campaign machinery, RNG parity,
   `official_foragax`/OCI, open screen, historical reconstruction), the
-  published-protocol replication lanes (`upgd_ipmnist` + v3,
-  `upgd_label_emnist`, `ipmnist_screening`), and
-  `slowly_changing_regression` v1/v2.
-- **`alberta_framework/core/`** — 89 modules; the additions since the fork
-  point include `swift_td`, `stacked_horde`, `context_inference`,
-  `state_builder`, `learning_signals`, `experiential_memory`,
-  `canonical_upgd`, `option_value_duration`, `ftl_world_model`,
-  `behavior_model`, `joint_partner_world`, `feature_bank_router`,
-  `integrated_hidden_partner`, and the world-model/hidden-partner/delight
-  substrates.
-- **`alberta_framework/streams/`** — 17 modules; fork-local additions include
-  `gauntlet`, `closed_loop`, `opponent`, `matrix_game`,
-  `recurring_multiagent`, `hidden_partner_mapping`,
-  `hidden_partner_world_feedback`, and `hidden_regime_signaling`.
-- **`tests/`** — 325 `test_*.py` files (~6,900 tests collected).
-  `tests/conftest.py` and focused import adapters report visible module-level
-  skips when tests require the upstream-only root `benchmarks/` scripts tree
-  or `examples/`; those omissions are no longer hidden by `collect_ignore`.
-  The suite here is therefore a strict superset of upstream logic but not of
-  upstream's own runnable test list.
-- **Top level**: `RESEARCH_STATUS.md`, `CONTINUAL_LEARNING_EVIDENCE.md`,
+  published-protocol replication lanes (`upgd_ipmnist`,
+  `upgd_label_emnist`, `ipmnist_screening`).
+- **`alberta_framework/core/`** — additions since the fork point include
+  `swift_td`, `stacked_horde`, learned-state and memory components, UPGD,
+  option/value-duration support, world models, feature lifecycles,
+  and the `PrototypeAgent` composition surface.
+- **`alberta_framework/streams/`** — fork-local additions include
+  `gauntlet`, `closed_loop`, and `recurring_multiagent`.
+- **`tests/`** — tests for upstream-only `benchmarks/`, `examples/`, and
+  narrative documents are not carried when their implementation is absent.
+- **Top level**: `docs/status.md`, `docs/evidence/methodology.md`,
   `FORAGER_BENCHMARK.md`, the execution runbooks and campaign audits, the
   `outputs/` evidence artifacts, and this file are fork-local.
-  `CHANGELOG.md` continues upstream numbering (0.27.0 was cut here);
-  `pyproject.toml` registers 15 console scripts, including the deprecated
-  `alberta-evidence-gate` compatibility alias for `alberta-evidence-status`.
+  `CHANGELOG.md` continues upstream numbering (0.27.0 was cut here), and
+  `pyproject.toml` registers the current console scripts.
 
 Because of this, "re-sync from upstream" is no longer a patch-reapplication
 exercise; treat any future sync as a merge between diverged development lines.
 
-Not carried from upstream: repository metadata and non-runtime trees such as
-`.github/`, the root-level `benchmarks/` scripts tree, `docs/`, `examples/`,
-and `scripts/`.
+Not carried from upstream: its repository metadata and non-runtime trees such
+as the root-level `benchmarks/` tree, historical `docs/`, `examples/`, and
+scripts. This fork has its own `.github/` and `docs/` contents.
 
 ## The benchmarks-shim hazard (fixed in 0.27.0)
 
@@ -84,18 +96,15 @@ importable (for example an upstream checkout on `sys.path`), the shim could
 bind the foreign package into `sys.modules` under the subpackage's name and
 shadow the packaged integrations.
 
-As of 0.27.0 the shim is removed: the real subpackage is imported eagerly at
-the end of `alberta_framework/__init__.py` and always wins.
-`tests/test_benchmarks_shim.py` pins this with a subprocess probe that puts a
-dummy root `benchmarks` package on `sys.path` and asserts the packaged
-subpackage still resolves.
+As of 0.27.0 the shim is removed. Normal Python submodule resolution loads the
+packaged `alberta_framework.benchmarks` tree without importing the benchmark
+stack during every base-package import.
 
 ## Continual-RL subset used by the robot package
 
 The robot tree's direct imports are `alberta_framework.core.actor_critic`,
 `core.continual_backprop`, `core.initializers`, `core.normalizers`,
 `core.optimizers`, and the top-level re-exports `SARSAAgent`, `SARSAConfig`,
-and `ObGDBounding`. Because the top-level import triggers the package's eager
-module imports, the whole `alberta_framework` package must remain importable
-from the robot environment — but the 12-step / `diffeml_*` / prototype /
-campaign machinery is otherwise not required by the robot integration.
+and `ObGDBounding`. The top-level package must remain importable from the
+robot environment, but benchmark campaigns and the 12-step / `diffeml_*` /
+prototype machinery are not robot dependencies.

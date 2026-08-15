@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import tomllib
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
@@ -13,7 +13,6 @@ from typing import cast
 
 import pytest
 
-from alberta_framework import cli as framework_cli
 from alberta_framework.evaluation import evidence_manifest_cli
 from alberta_framework.evaluation.evidence_manifest import (
     CLAIM_CONTRACT_VERSION,
@@ -355,64 +354,105 @@ def test_cli_emits_manifest_and_propagates_nonzero_status(
     assert json.loads(capsys.readouterr().out) == fake_manifest
 
 
-@pytest.mark.parametrize("status", (0, 1, 2))
 @pytest.mark.unit
-def test_deprecated_evidence_gate_delegates_without_corrupting_json_stdout(
-    status: int,
+def test_cli_refuses_pinned_output_even_when_missing_before_validation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    delegated_argv: list[tuple[str, ...]] = []
-    payload = {"schema_version": MANIFEST_SCHEMA_VERSION, "overall_status": "fixture"}
+    pinned = tmp_path / "outputs" / "evidence_manifest.json"
+    assert not pinned.exists()
+    monkeypatch.setattr(evidence_manifest_cli, "DEFAULT_OUTPUT", pinned)
 
-    def fake_status_main(argv: Sequence[str] | None = None) -> int:
-        assert argv is not None
-        delegated_argv.append(tuple(argv))
-        print(json.dumps(payload))
-        return status
+    def forbidden_build(root: Path) -> dict[str, object]:
+        raise AssertionError(f"validation must not run for refused output {root}")
 
-    monkeypatch.setattr(evidence_manifest_cli, "main", fake_status_main)
+    monkeypatch.setattr(evidence_manifest_cli, "build_evidence_manifest", forbidden_build)
 
-    argv = ["--root", str(tmp_path)]
-    assert framework_cli.evidence_gate_main(argv) == status
+    assert evidence_manifest_cli.main(["--root", str(tmp_path), "--output", str(pinned)]) == 2
     captured = capsys.readouterr()
-    assert json.loads(captured.out) == payload
-    assert "alberta-evidence-gate is deprecated" in captured.err
-    assert "alberta-evidence-status" in captured.err
-    assert delegated_argv == [tuple(argv)]
+    assert captured.out == ""
+    assert "pinned canonical artifact path" in captured.err
+    assert not pinned.exists()
 
 
-@pytest.mark.parametrize("argv", (["--step", "1"], ["--step=all"]))
 @pytest.mark.unit
-def test_deprecated_evidence_gate_rejects_legacy_step_selector(
-    argv: list[str],
+def test_cli_refuses_existing_output_before_validation(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    delegated = False
+    output = tmp_path / "existing.json"
+    sentinel = b"existing manifest must survive"
+    output.write_bytes(sentinel)
 
-    def fake_status_main(_argv: Sequence[str] | None = None) -> int:
-        nonlocal delegated
-        delegated = True
-        return 0
+    def forbidden_build(root: Path) -> dict[str, object]:
+        raise AssertionError(f"validation must not run for refused output {root}")
 
-    monkeypatch.setattr(evidence_manifest_cli, "main", fake_status_main)
+    monkeypatch.setattr(evidence_manifest_cli, "build_evidence_manifest", forbidden_build)
 
-    assert framework_cli.evidence_gate_main(argv) == 2
+    assert evidence_manifest_cli.main(["--root", str(tmp_path), "--output", str(output)]) == 2
     captured = capsys.readouterr()
     assert captured.out == ""
-    assert "--step belonged to the retired" in captured.err
-    assert "alberta-evidence-status" in captured.err
-    assert delegated is False
+    assert "existing output path" in captured.err
+    assert output.read_bytes() == sentinel
 
 
 @pytest.mark.unit
-def test_deprecated_and_canonical_evidence_entrypoints_are_packaged() -> None:
+def test_cli_exclusive_create_preserves_output_created_during_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    output = tmp_path / "racing.json"
+    sentinel = b"concurrent writer wins"
+    fake_manifest: dict[str, object] = {
+        "schema_version": MANIFEST_SCHEMA_VERSION,
+        "overall_status": "not-run",
+    }
+
+    def racing_build(root: Path) -> dict[str, object]:
+        assert root == tmp_path
+        output.write_bytes(sentinel)
+        return fake_manifest
+
+    monkeypatch.setattr(evidence_manifest_cli, "build_evidence_manifest", racing_build)
+
+    assert evidence_manifest_cli.main(["--root", str(tmp_path), "--output", str(output)]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "File exists" in captured.err
+    assert output.read_bytes() == sentinel
+
+
+@pytest.mark.unit
+def test_cli_writes_manifest_to_new_output_exclusively(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    output = tmp_path / "new" / "manifest.json"
+    fake_manifest: dict[str, object] = {
+        "schema_version": MANIFEST_SCHEMA_VERSION,
+        "overall_status": "not-run",
+    }
+    monkeypatch.setattr(
+        evidence_manifest_cli,
+        "build_evidence_manifest",
+        lambda root: fake_manifest,
+    )
+
+    assert evidence_manifest_cli.main(["--root", str(tmp_path), "--output", str(output)]) == 1
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == fake_manifest
+    assert json.loads(output.read_text(encoding="utf-8")) == fake_manifest
+
+
+@pytest.mark.unit
+def test_evidence_status_entrypoint_is_packaged() -> None:
     pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
     scripts = tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]["scripts"]
 
-    assert scripts["alberta-evidence-gate"] == "alberta_framework.cli:evidence_gate_main"
     assert (
         scripts["alberta-evidence-status"]
         == "alberta_framework.evaluation.evidence_manifest_cli:main"

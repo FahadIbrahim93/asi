@@ -29,13 +29,9 @@ import chex
 import jax
 import jax.numpy as jnp
 from jax import Array
-from jaxtyping import Bool, Float, Int, UInt
+from jaxtyping import Bool, Float, Int
 
-from alberta_framework.core.multi_head_learner import (
-    MULTI_HEAD_LIFETIME_COUNTER_DELTA_NBYTES,
-    MULTI_HEAD_MLP_STATE_SCHEMA,
-    MultiHeadMLPState,
-)
+from alberta_framework.core.multi_head_learner import MultiHeadMLPState
 from alberta_framework.core.options import (
     OptionModelsState,
     STOMPAgent,
@@ -44,17 +40,10 @@ from alberta_framework.core.options import (
 )
 from alberta_framework.core.types import LMSState, MLPParams
 
-OPTION_SEARCH_CONTROL_CONFIG_SCHEMA = "alberta.option-search-control.config.v2"
-OPTION_SEARCH_CONTROL_BASE_LEARNER_STATE_SCHEMA = MULTI_HEAD_MLP_STATE_SCHEMA
-OPTION_SEARCH_CONTROL_EXACT_IDENTITY_NBYTES = (
-    MULTI_HEAD_LIFETIME_COUNTER_DELTA_NBYTES
-)
+OPTION_SEARCH_CONTROL_CONFIG_SCHEMA = "alberta.option-search-control.config.v1"
 OPTION_SEARCH_CONTROL_MECHANISM_STATUS = "development_mechanism_only"
 OPTION_SEARCH_CONTROL_SCIENTIFIC_PROMOTION_ALLOWED = False
 
-_LEGACY_OPTION_SEARCH_CONTROL_CONFIG_SCHEMA = (
-    "alberta.option-search-control.config.v1"
-)
 _CONFIG_TYPE = "OptionSearchControlConfig"
 _MAX_BACKUP_BUDGET = 4_096
 _MAX_CANDIDATE_DIAGNOSTIC_SLOTS = 262_144
@@ -90,9 +79,6 @@ class OptionSearchControlConfig:
         return {
             "schema": OPTION_SEARCH_CONTROL_CONFIG_SCHEMA,
             "type": _CONFIG_TYPE,
-            "base_learner_state_schema": (
-                OPTION_SEARCH_CONTROL_BASE_LEARNER_STATE_SCHEMA
-            ),
             "mechanism_status": OPTION_SEARCH_CONTROL_MECHANISM_STATUS,
             "scientific_promotion_allowed": (
                 OPTION_SEARCH_CONTROL_SCIENTIFIC_PROMOTION_ALLOWED
@@ -112,27 +98,17 @@ class OptionSearchControlConfig:
         expected = {
             "schema",
             "type",
-            "base_learner_state_schema",
             "mechanism_status",
             "scientific_promotion_allowed",
             "backup_budget",
             "min_model_completions",
         }
         if set(payload) != expected:
-            if payload.get("schema") == _LEGACY_OPTION_SEARCH_CONTROL_CONFIG_SCHEMA:
-                raise ValueError(
-                    "legacy option search control config requires explicit migration"
-                )
-            raise ValueError("option search control config fields do not match v2")
+            raise ValueError("option search control config fields do not match v1")
         if payload.pop("schema") != OPTION_SEARCH_CONTROL_CONFIG_SCHEMA:
             raise ValueError("unexpected option search control config schema")
         if payload.pop("type") != _CONFIG_TYPE:
             raise ValueError("unexpected option search control config type")
-        if (
-            payload.pop("base_learner_state_schema")
-            != OPTION_SEARCH_CONTROL_BASE_LEARNER_STATE_SCHEMA
-        ):
-            raise ValueError("unexpected option search base-learner state schema")
         if (
             payload.pop("mechanism_status")
             != OPTION_SEARCH_CONTROL_MECHANISM_STATUS
@@ -149,38 +125,6 @@ class OptionSearchControlConfig:
         return cls(**cast(dict[str, Any], payload))
 
 
-def migrate_legacy_option_search_control_config(
-    legacy_config: Mapping[str, object],
-) -> OptionSearchControlConfig:
-    """Explicitly migrate one exact v1 config to the v2 clock contract."""
-
-    if not isinstance(legacy_config, Mapping):
-        raise TypeError("legacy option search control config must be a mapping")
-    payload = dict(legacy_config)
-    expected = {
-        "schema",
-        "type",
-        "mechanism_status",
-        "scientific_promotion_allowed",
-        "backup_budget",
-        "min_model_completions",
-    }
-    if set(payload) != expected:
-        missing = sorted(expected - set(payload))
-        extra = sorted(set(payload) - expected)
-        raise ValueError(
-            "legacy option search control config fields are not exact; "
-            f"missing={missing}, extra={extra}"
-        )
-    if payload["schema"] != _LEGACY_OPTION_SEARCH_CONTROL_CONFIG_SCHEMA:
-        raise ValueError("legacy option search control schema is unsupported")
-    payload["schema"] = OPTION_SEARCH_CONTROL_CONFIG_SCHEMA
-    payload["base_learner_state_schema"] = (
-        OPTION_SEARCH_CONTROL_BASE_LEARNER_STATE_SCHEMA
-    )
-    return OptionSearchControlConfig.from_config(payload)
-
-
 @dataclasses.dataclass(frozen=True)
 class OptionSearchControlResourceBudget:
     """Exact logical work bounds for the stateless option search boundary."""
@@ -189,9 +133,6 @@ class OptionSearchControlResourceBudget:
     observation_dim: int
     backup_budget: int
     persistent_state_bytes: int
-    nested_exact_lifetime_identity_bytes: int
-    lifetime_identity_bits: int
-    telemetry_saturation: int
     rng_draws_per_call: int
     candidate_values_per_evaluation: int
     max_candidate_evaluations_per_call: int
@@ -199,7 +140,6 @@ class OptionSearchControlResourceBudget:
     max_model_matrix_vector_products_per_call: int
     max_base_value_forward_calls_per_call: int
     max_base_value_backward_calls_per_call: int
-    max_nested_update_verdicts_per_call: int
     stomp_self_audits_per_call: int
     max_diagnostic_payload_bytes_per_call: int
 
@@ -226,7 +166,6 @@ class OptionSearchControlDiagnostics:
     base_state_static_contract_valid: Bool[Array, ""]
     base_state_values_finite: Bool[Array, ""]
     option_model_values_finite: Bool[Array, ""]
-    base_exact_identity_static_contract_valid: Bool[Array, ""]
     state_counters_valid: Bool[Array, ""]
     base_update_capacity_available: Bool[Array, ""]
     stomp_state_static_contract_valid: Bool[Array, ""]
@@ -251,14 +190,6 @@ class OptionSearchControlDiagnostics:
     selected_extended_action_indices: Int[Array, " backup_budget"]
     selected_priorities: Float[Array, " backup_budget"]
     td_errors: Float[Array, " backup_budget"]
-    base_pre_step_words: UInt[Array, " 2"]
-    base_post_step_words: UInt[Array, " 2"]
-    nested_pre_step_words: UInt[Array, "backup_budget 2"]
-    nested_post_step_words: UInt[Array, "backup_budget 2"]
-    nested_lifetime_counter_valid: Bool[Array, " backup_budget"]
-    nested_lifetime_capacity_available: Bool[Array, " backup_budget"]
-    nested_update_applied: Bool[Array, " backup_budget"]
-    nested_transaction_authenticated: Bool[Array, " backup_budget"]
     candidate_update_finite: Bool[Array, " backup_budget"]
     trace_isolation_preserved: Bool[Array, " backup_budget"]
     applied: Bool[Array, " backup_budget"]
@@ -326,60 +257,6 @@ def _array_has_contract(
     )
 
 
-def _checked_lifetime_words_advance(
-    words: Array,
-    increment: int,
-) -> tuple[UInt[Array, " 2"], Bool[Array, ""]]:
-    """Propose one bounded uint64-word advance without wraparound."""
-
-    array = jnp.asarray(words)
-    if array.shape != (2,):
-        raise ValueError("option-search base step_words must have shape (2,)")
-    if array.dtype != jnp.dtype(jnp.uint32):
-        raise TypeError("option-search base step_words must have dtype uint32")
-    if type(increment) is not int or not 1 <= increment <= _MAX_BACKUP_BUDGET:
-        raise ValueError("option-search lifetime increment is outside its static budget")
-    increment_u = jnp.asarray(increment, dtype=jnp.uint32)
-    low = array[1] + increment_u
-    carry = (low < array[1]).astype(jnp.uint32)
-    high = array[0] + carry
-    overflow = (carry != 0) & (high == jnp.asarray(0, dtype=jnp.uint32))
-    proposed = jnp.stack((high, low)).astype(jnp.uint32)
-    return jnp.where(overflow, array, proposed), ~overflow
-
-
-def _words_to_saturating_int32(words: Array) -> Int[Array, ""]:
-    """Project an exact identity to non-negative saturating telemetry."""
-
-    array = jnp.asarray(words)
-    if array.shape != (2,):
-        raise ValueError("option-search base step_words must have shape (2,)")
-    if array.dtype != jnp.dtype(jnp.uint32):
-        raise TypeError("option-search base step_words must have dtype uint32")
-    below_saturation = (array[0] == jnp.asarray(0, dtype=jnp.uint32)) & (
-        array[1] < jnp.asarray(_INT32_MAX, dtype=jnp.uint32)
-    )
-    return jnp.where(
-        below_saturation,
-        array[1].astype(jnp.int32),
-        jnp.asarray(_INT32_MAX, dtype=jnp.int32),
-    )
-
-
-def _lifetime_counter_valid(
-    words: Array,
-    telemetry: Array,
-) -> Bool[Array, ""]:
-    """Authenticate saturating telemetry against the exact identity."""
-
-    count = jnp.asarray(telemetry)
-    if count.shape != ():
-        raise ValueError("option-search base step_count must be scalar")
-    if count.dtype != jnp.dtype(jnp.int32):
-        raise TypeError("option-search base step_count must have dtype int32")
-    return (count >= 0) & (count == _words_to_saturating_int32(words))
-
-
 class OptionSearchControl:
     """Stateless stable Bellman-residual search over completed option models."""
 
@@ -412,18 +289,17 @@ class OptionSearchControl:
         n_options = self._agent.config.n_options
         backup_budget = self._config.backup_budget
         candidate_slots = n_options * backup_budget
-        # Dense logical payload: decision observation; nineteen boolean scalar
+        # Dense logical payload: decision observation; eighteen boolean scalar
         # validity flags; completion counts; four boolean and three float32
-        # candidate matrices; two int32, two float32, seven boolean, and four
-        # uint32 backup vectors; two uint32 call-boundary identities; and the
-        # final int32 applied count.
+        # candidate matrices; two int32, two float32, and three boolean backup
+        # vectors; and the final int32 applied count.
         diagnostic_payload_bytes = (
             4 * self._agent.config.observation_dim
-            + 19
+            + 18
             + 4 * n_options
             + 16 * candidate_slots
-            + 39 * backup_budget
-            + 20
+            + 19 * backup_budget
+            + 4
         )
         # Every backup iteration performs one current-anchor Q forward, one
         # successor forward per option, and at most one learner-update
@@ -433,11 +309,6 @@ class OptionSearchControl:
             observation_dim=self._agent.config.observation_dim,
             backup_budget=backup_budget,
             persistent_state_bytes=0,
-            nested_exact_lifetime_identity_bytes=(
-                OPTION_SEARCH_CONTROL_EXACT_IDENTITY_NBYTES
-            ),
-            lifetime_identity_bits=64,
-            telemetry_saturation=_INT32_MAX,
             rng_draws_per_call=0,
             candidate_values_per_evaluation=n_options,
             max_candidate_evaluations_per_call=n_options * backup_budget,
@@ -445,7 +316,6 @@ class OptionSearchControl:
             max_model_matrix_vector_products_per_call=n_options * backup_budget,
             max_base_value_forward_calls_per_call=(n_options + 2) * backup_budget,
             max_base_value_backward_calls_per_call=backup_budget,
-            max_nested_update_verdicts_per_call=backup_budget,
             stomp_self_audits_per_call=1,
             max_diagnostic_payload_bytes_per_call=diagnostic_payload_bytes,
         )
@@ -491,7 +361,6 @@ class OptionSearchControl:
             and len(learner.head_traces) == n_heads
             and learner.normalizer_state is None
             and _array_has_contract(learner.step_count, (), jnp.int32)
-            and _array_has_contract(learner.step_words, (2,), jnp.uint32)
             and _array_has_contract(state.base_average_reward, (), jnp.float32)
             and _array_has_contract(state.option_steps, (), jnp.int32)
             and _array_has_contract(state.step_count, (), jnp.int32)
@@ -605,7 +474,6 @@ class OptionSearchControl:
         stomp_action_ownership_valid: bool | Array = False,
         stomp_state_valid: bool | Array = False,
         decision_observation_matches_state: bool | Array = False,
-        base_step_words: Any = None,
     ) -> OptionSearchControlDiagnostics:
         """Return fixed finite diagnostics for a nonexecuted search call."""
 
@@ -629,16 +497,6 @@ class OptionSearchControl:
         budget = self._config.backup_budget
         n_options = self._agent.config.n_options
         matrix_shape = (budget, n_options)
-        exact_identity_static_valid = _array_has_contract(
-            base_step_words,
-            (2,),
-            jnp.uint32,
-        )
-        exact_identity = (
-            jnp.asarray(base_step_words)
-            if exact_identity_static_valid
-            else jnp.zeros((2,), dtype=jnp.uint32)
-        )
         return OptionSearchControlDiagnostics(
             decision_observation=jnp.where(values_finite, observation, 0.0),
             decision_observation_static_contract_valid=jnp.asarray(
@@ -653,10 +511,6 @@ class OptionSearchControl:
             ),
             base_state_values_finite=jnp.asarray(False, dtype=jnp.bool_),
             option_model_values_finite=jnp.asarray(False, dtype=jnp.bool_),
-            base_exact_identity_static_contract_valid=jnp.asarray(
-                exact_identity_static_valid,
-                dtype=jnp.bool_,
-            ),
             state_counters_valid=jnp.asarray(
                 state_counters_valid, dtype=jnp.bool_
             ),
@@ -705,24 +559,6 @@ class OptionSearchControl:
             ),
             selected_priorities=jnp.zeros((budget,), dtype=jnp.float32),
             td_errors=jnp.zeros((budget,), dtype=jnp.float32),
-            base_pre_step_words=exact_identity,
-            base_post_step_words=exact_identity,
-            nested_pre_step_words=jnp.zeros(
-                (budget, 2), dtype=jnp.uint32
-            ),
-            nested_post_step_words=jnp.zeros(
-                (budget, 2), dtype=jnp.uint32
-            ),
-            nested_lifetime_counter_valid=jnp.zeros(
-                (budget,), dtype=jnp.bool_
-            ),
-            nested_lifetime_capacity_available=jnp.zeros(
-                (budget,), dtype=jnp.bool_
-            ),
-            nested_update_applied=jnp.zeros((budget,), dtype=jnp.bool_),
-            nested_transaction_authenticated=jnp.zeros(
-                (budget,), dtype=jnp.bool_
-            ),
             candidate_update_finite=jnp.zeros((budget,), dtype=jnp.bool_),
             trace_isolation_preserved=jnp.zeros(
                 (budget,), dtype=jnp.bool_
@@ -737,7 +573,6 @@ class OptionSearchControl:
         state: STOMPState,
         observation: Array,
         planner_inputs_valid: Array,
-        extended_action_mask: Array,
     ) -> tuple[Array, Array, Array, Array, Array, Array, Array]:
         """Evaluate all option targets and residuals from one learner state."""
 
@@ -750,10 +585,7 @@ class OptionSearchControl:
         option_values = base_values[
             self._agent.config.n_primitive_actions :
         ]
-        option_live = extended_action_mask[
-            self._agent.config.n_primitive_actions :
-        ]
-        completion_supported = option_live & (
+        completion_supported = (
             models.n_completions
             >= jnp.asarray(
                 self._config.min_model_completions,
@@ -787,15 +619,10 @@ class OptionSearchControl:
                 learner_state,
                 predicted_next,
             )
-            eligible_next_values = jnp.where(
-                extended_action_mask,
-                next_values,
-                -jnp.inf,
-            )
             target = (
                 models.env_return_ema[index]
                 - state.base_average_reward * models.baseline_mass_ema[index]
-                + models.discount_ema[index] * jnp.max(eligible_next_values)
+                + models.discount_ema[index] * jnp.max(next_values)
             )
             residual = target - option_values[index]
             prediction_finite = (
@@ -835,8 +662,6 @@ class OptionSearchControl:
         self,
         state: STOMPState,
         decision_observation: Array,
-        *,
-        extended_action_mask: Array | None = None,
     ) -> OptionSearchControlResult:
         """Apply fixed-budget planner-only backups at one real decision state.
 
@@ -848,29 +673,6 @@ class OptionSearchControl:
 
         if not isinstance(state, STOMPState):
             raise TypeError("state must be a STOMPState")
-
-        if extended_action_mask is None:
-            action_mask = jnp.ones(
-                (self._agent.config.n_total_actions,),
-                dtype=jnp.bool_,
-            )
-        else:
-            raw_action_mask = jnp.asarray(extended_action_mask)
-            if raw_action_mask.shape != (self._agent.config.n_total_actions,):
-                raise ValueError(
-                    "extended_action_mask must have shape "
-                    f"({self._agent.config.n_total_actions},), got "
-                    f"{raw_action_mask.shape}"
-                )
-            if raw_action_mask.dtype != jnp.bool_:
-                raise TypeError(
-                    "extended_action_mask must have dtype bool, "
-                    f"got {raw_action_mask.dtype}"
-                )
-            action_mask = raw_action_mask
-        action_mask_valid = jnp.all(
-            action_mask[: self._agent.config.n_primitive_actions]
-        ) & jnp.any(action_mask)
 
         raw_observation = jnp.asarray(decision_observation)
         observation_static_valid = (
@@ -890,11 +692,6 @@ class OptionSearchControl:
                     raw_observation,
                     option_model_static_contract_valid=model_static_valid,
                     base_state_static_contract_valid=base_static_valid,
-                    base_step_words=getattr(
-                        state.base_learner_state,
-                        "step_words",
-                        None,
-                    ),
                 ),
             )
 
@@ -916,7 +713,6 @@ class OptionSearchControl:
                     observation,
                     option_model_static_contract_valid=model_static_valid,
                     base_state_static_contract_valid=base_static_valid,
-                    base_step_words=state.base_learner_state.step_words,
                 ),
             )
         observation_values_finite = jnp.all(jnp.isfinite(observation))
@@ -926,23 +722,16 @@ class OptionSearchControl:
         option_model_values_finite = _floating_tree_is_finite(
             state.option_models
         )
-        base_exact_identity_static_contract_valid = _array_has_contract(
-            state.base_learner_state.step_words,
-            (2,),
-            jnp.uint32,
-        )
-        base_lifetime_counter_valid = _lifetime_counter_valid(
-            state.base_learner_state.step_words,
-            state.base_learner_state.step_count,
-        )
         state_counters_valid = (
             stomp_audit.state_counters_valid
-            & base_lifetime_counter_valid
             & _all_integer_leaves_nonnegative(state.base_learner_state)
         )
-        _, base_update_capacity_available = _checked_lifetime_words_advance(
-            state.base_learner_state.step_words,
-            self._config.backup_budget,
+        max_step_count_before_call = jnp.asarray(
+            _INT32_MAX - self._config.backup_budget,
+            dtype=jnp.int32,
+        )
+        base_update_capacity_available = (
+            state.base_learner_state.step_count <= max_step_count_before_call
         )
         average_reward_valid = jnp.isfinite(state.base_average_reward)
         planner_inputs_valid = (
@@ -954,7 +743,6 @@ class OptionSearchControl:
             & stomp_audit.state_valid
             & stomp_audit.observation_matches
             & average_reward_valid
-            & action_mask_valid
         )
         safe_observation = jnp.where(
             observation_values_finite,
@@ -978,14 +766,6 @@ class OptionSearchControl:
         )
         selected_priorities = jnp.zeros((budget,), dtype=jnp.float32)
         td_errors = jnp.zeros((budget,), dtype=jnp.float32)
-        nested_pre_words_log = jnp.zeros((budget, 2), dtype=jnp.uint32)
-        nested_post_words_log = jnp.zeros((budget, 2), dtype=jnp.uint32)
-        nested_counter_valid_log = jnp.zeros((budget,), dtype=jnp.bool_)
-        nested_capacity_log = jnp.zeros((budget,), dtype=jnp.bool_)
-        nested_update_applied_log = jnp.zeros((budget,), dtype=jnp.bool_)
-        nested_transaction_authenticated_log = jnp.zeros(
-            (budget,), dtype=jnp.bool_
-        )
         update_finite_log = jnp.zeros((budget,), dtype=jnp.bool_)
         trace_isolation_log = jnp.zeros((budget,), dtype=jnp.bool_)
         applied_log = jnp.zeros((budget,), dtype=jnp.bool_)
@@ -1003,12 +783,6 @@ class OptionSearchControl:
             selected_extended_actions,
             selected_priorities,
             td_errors,
-            nested_pre_words_log,
-            nested_post_words_log,
-            nested_counter_valid_log,
-            nested_capacity_log,
-            nested_update_applied_log,
-            nested_transaction_authenticated_log,
             update_finite_log,
             trace_isolation_log,
             applied_log,
@@ -1028,12 +802,6 @@ class OptionSearchControl:
                 selected_extended_log,
                 selected_priority_log,
                 td_error_log,
-                nested_pre_words,
-                nested_post_words,
-                nested_counter_valid,
-                nested_capacity,
-                nested_update_applied,
-                nested_transaction_authenticated,
                 update_finite,
                 trace_isolation,
                 applied,
@@ -1051,7 +819,6 @@ class OptionSearchControl:
                 state,
                 safe_observation,
                 planner_inputs_valid,
-                action_mask,
             )
             ranking_scores = jnp.where(
                 candidate_valid,
@@ -1075,16 +842,6 @@ class OptionSearchControl:
             )
             selected_target = candidate_targets[safe_option]
             selected_priority = candidate_priorities[safe_option]
-            expected_step_words, one_step_capacity = (
-                _checked_lifetime_words_advance(
-                    learner_state.step_words,
-                    1,
-                )
-            )
-            source_counter_valid = _lifetime_counter_valid(
-                learner_state.step_words,
-                learner_state.step_count,
-            )
 
             # Planning uses one-step synthetic traces.  The real traces are
             # restored after the parameter/optimizer proposal, preventing an
@@ -1112,18 +869,7 @@ class OptionSearchControl:
                 dtype=jnp.float32,
             ).at[selected_extended].set(selected_target)
 
-            def propose_update(
-                _: None,
-            ) -> tuple[
-                MultiHeadMLPState,
-                Array,
-                Array,
-                Array,
-                Array,
-                Array,
-                Array,
-                Array,
-            ]:
+            def propose_update(_: None) -> tuple[MultiHeadMLPState, Array]:
                 update = self._agent.base_learner.update(
                     trace_neutral_state,
                     safe_observation,
@@ -1137,87 +883,12 @@ class OptionSearchControl:
                         normalizer_state=learner_state.normalizer_state,
                     ),
                 )
-                reported_update_applied = jnp.asarray(
-                    update.update_applied,
-                    dtype=jnp.bool_,
-                )
-                expected_reported_post = jnp.where(
-                    reported_update_applied,
-                    expected_step_words,
-                    learner_state.step_words,
-                )
-                transaction_authenticated = (
-                    jnp.array_equal(
-                        update.pre_step_words,
-                        learner_state.step_words,
-                    )
-                    & jnp.array_equal(
-                        update.post_step_words,
-                        update.state.step_words,
-                    )
-                    & jnp.array_equal(
-                        update.post_step_words,
-                        expected_reported_post,
-                    )
-                    & (
-                        update.lifetime_counter_valid
-                        == source_counter_valid
-                    )
-                    & (
-                        update.lifetime_capacity_available
-                        == one_step_capacity
-                    )
-                    & update.normalizer_counter_aligned
-                    & update.normalizer_estimator_capacity_available
-                    & _lifetime_counter_valid(
-                        update.state.step_words,
-                        update.state.step_count,
-                    )
-                )
-                return (
-                    restored,
-                    update.errors[selected_extended],
-                    update.pre_step_words,
-                    update.post_step_words,
-                    update.lifetime_counter_valid,
-                    update.lifetime_capacity_available,
-                    reported_update_applied,
-                    transaction_authenticated,
-                )
+                return restored, update.errors[selected_extended]
 
-            def skip_update(
-                _: None,
-            ) -> tuple[
-                MultiHeadMLPState,
-                Array,
-                Array,
-                Array,
-                Array,
-                Array,
-                Array,
-                Array,
-            ]:
-                return (
-                    learner_state,
-                    jnp.float32(0.0),
-                    learner_state.step_words,
-                    learner_state.step_words,
-                    source_counter_valid,
-                    one_step_capacity,
-                    jnp.asarray(False, dtype=jnp.bool_),
-                    jnp.asarray(False, dtype=jnp.bool_),
-                )
+            def skip_update(_: None) -> tuple[MultiHeadMLPState, Array]:
+                return learner_state, jnp.float32(0.0)
 
-            (
-                candidate_state,
-                candidate_td_error,
-                child_pre_words,
-                child_post_words,
-                child_counter_valid,
-                child_capacity_available,
-                child_update_applied,
-                child_transaction_authenticated,
-            ) = jax.lax.cond(
+            candidate_state, candidate_td_error = jax.lax.cond(
                 any_valid,
                 propose_update,
                 skip_update,
@@ -1239,14 +910,7 @@ class OptionSearchControl:
                     learner_state.head_traces,
                 )
             )
-            accepted = (
-                candidate_finite
-                & traces_preserved
-                & child_counter_valid
-                & child_capacity_available
-                & child_update_applied
-                & child_transaction_authenticated
-            )
+            accepted = candidate_finite & traces_preserved
             next_learner_state = jax.lax.cond(
                 accepted,
                 lambda _: candidate_state,
@@ -1273,14 +937,6 @@ class OptionSearchControl:
                 td_error_log.at[index].set(
                     jnp.where(accepted, candidate_td_error, jnp.float32(0.0))
                 ),
-                nested_pre_words.at[index].set(child_pre_words),
-                nested_post_words.at[index].set(child_post_words),
-                nested_counter_valid.at[index].set(child_counter_valid),
-                nested_capacity.at[index].set(child_capacity_available),
-                nested_update_applied.at[index].set(child_update_applied),
-                nested_transaction_authenticated.at[index].set(
-                    child_transaction_authenticated
-                ),
                 update_finite.at[index].set(candidate_finite),
                 trace_isolation.at[index].set(traces_preserved),
                 applied.at[index].set(accepted),
@@ -1299,12 +955,6 @@ class OptionSearchControl:
             selected_extended_actions,
             selected_priorities,
             td_errors,
-            nested_pre_words_log,
-            nested_post_words_log,
-            nested_counter_valid_log,
-            nested_capacity_log,
-            nested_update_applied_log,
-            nested_transaction_authenticated_log,
             update_finite_log,
             trace_isolation_log,
             applied_log,
@@ -1332,10 +982,6 @@ class OptionSearchControl:
             ),
             base_state_values_finite=base_state_values_finite,
             option_model_values_finite=option_model_values_finite,
-            base_exact_identity_static_contract_valid=jnp.asarray(
-                base_exact_identity_static_contract_valid,
-                dtype=jnp.bool_,
-            ),
             state_counters_valid=state_counters_valid,
             base_update_capacity_available=base_update_capacity_available,
             stomp_state_static_contract_valid=(
@@ -1372,16 +1018,6 @@ class OptionSearchControl:
             selected_extended_action_indices=selected_extended_actions,
             selected_priorities=selected_priorities,
             td_errors=td_errors,
-            base_pre_step_words=state.base_learner_state.step_words,
-            base_post_step_words=final_learner_state.step_words,
-            nested_pre_step_words=nested_pre_words_log,
-            nested_post_step_words=nested_post_words_log,
-            nested_lifetime_counter_valid=nested_counter_valid_log,
-            nested_lifetime_capacity_available=nested_capacity_log,
-            nested_update_applied=nested_update_applied_log,
-            nested_transaction_authenticated=(
-                nested_transaction_authenticated_log
-            ),
             candidate_update_finite=update_finite_log,
             trace_isolation_preserved=trace_isolation_log,
             applied=applied_log,
@@ -1394,9 +1030,7 @@ class OptionSearchControl:
 
 
 __all__ = [
-    "OPTION_SEARCH_CONTROL_BASE_LEARNER_STATE_SCHEMA",
     "OPTION_SEARCH_CONTROL_CONFIG_SCHEMA",
-    "OPTION_SEARCH_CONTROL_EXACT_IDENTITY_NBYTES",
     "OPTION_SEARCH_CONTROL_MECHANISM_STATUS",
     "OPTION_SEARCH_CONTROL_SCIENTIFIC_PROMOTION_ALLOWED",
     "OptionSearchControl",
@@ -1404,5 +1038,4 @@ __all__ = [
     "OptionSearchControlDiagnostics",
     "OptionSearchControlResourceBudget",
     "OptionSearchControlResult",
-    "migrate_legacy_option_search_control_config",
 ]

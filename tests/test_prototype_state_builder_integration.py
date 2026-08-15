@@ -29,8 +29,6 @@ from alberta_framework.core.prototype_agent import (
 from alberta_framework.core.state_builder import (
     FixedTraceStateBuilderConfig,
     IdentityStateBuilderConfig,
-    LearnableGRUStateBuilderConfig,
-    OnlineGatedStateBuilder,
     OnlineGatedStateBuilderConfig,
     StateBuilderConfig,
     state_builder_from_config,
@@ -55,13 +53,6 @@ def _builder_configs() -> tuple[StateBuilderConfig, ...]:
             include_raw_observation=True,
         ),
         OnlineGatedStateBuilderConfig(
-            observation_dim=RAW_DIM,
-            n_actions=N_ACTIONS,
-            hidden_dim=2,
-            include_raw_observation=True,
-            step_size=0.01,
-        ),
-        LearnableGRUStateBuilderConfig(
             observation_dim=RAW_DIM,
             n_actions=N_ACTIONS,
             hidden_dim=2,
@@ -400,30 +391,26 @@ def test_final_decision_generation_processes_outcome_then_disarms() -> None:
         chex.assert_trees_all_equal(decision.decision_id, exhausted_id)
 
 
-def test_signed_counter_telemetry_saturates_without_disarming_exact_clock() -> None:
+def test_signed_counter_capacity_processes_final_outcome_then_disarms() -> None:
     agent = _agent(_builder_configs()[0])
     state = agent.start(agent.init(jr.key(241)), jnp.zeros(RAW_DIM))
     maximum = np.iinfo(np.int32).max
-    near_maximum_words = jnp.asarray(
-        (0, maximum - 1),
-        dtype=jnp.uint32,
+    near_maximum_words = jnp.asarray((0, maximum - 1), dtype=jnp.uint32)
+    near_maximum_base_learner = state.oak_state.stomp_state.base_learner_state.replace(
+        step_count=jnp.asarray(maximum - 1, dtype=jnp.int32),
+        step_words=near_maximum_words,
     )
     near_maximum = state.replace(
         state_builder_state=state.state_builder_state.replace(
-            step_count=jnp.asarray(maximum, dtype=jnp.int32),
-            step_words=jnp.asarray((0, maximum), dtype=jnp.uint32),
+            step_count=jnp.asarray(maximum - 2, dtype=jnp.int32)
         ),
-        observation_event_count=jnp.asarray(maximum, dtype=jnp.int32),
-        observation_event_words=jnp.asarray(
-            (0, maximum),
-            dtype=jnp.uint32,
-        ),
+        observation_event_count=jnp.asarray(maximum - 2, dtype=jnp.int32),
         step_count=jnp.asarray(maximum - 1, dtype=jnp.int32),
-        step_words=near_maximum_words,
         oak_state=state.oak_state.replace(
             step_count=jnp.asarray(maximum - 1, dtype=jnp.int32),
             step_words=near_maximum_words,
             stomp_state=state.oak_state.stomp_state.replace(
+                base_learner_state=near_maximum_base_learner,
                 step_count=jnp.asarray(maximum - 1, dtype=jnp.int32),
                 step_words=near_maximum_words,
             ),
@@ -436,24 +423,16 @@ def test_signed_counter_telemetry_saturates_without_disarming_exact_clock() -> N
     )
 
     assert bool(result.transition_diagnostics.valid)
-    assert bool(
+    assert not bool(
         result.transition_diagnostics.next_counter_capacity_available
     )
     assert int(result.state.step_count) == maximum
     assert int(result.state.oak_state.step_count) == maximum
     assert int(result.state.oak_state.stomp_state.step_count) == maximum
-    assert bool(result.state.started)
-    assert 0 <= int(result.action) < N_ACTIONS
-    chex.assert_trees_all_equal(
-        result.state.step_words,
-        jnp.asarray((0, maximum), dtype=jnp.uint32),
-    )
-    chex.assert_trees_all_equal(
-        result.state.observation_event_words,
-        jnp.asarray((0, maximum + 1), dtype=jnp.uint32),
-    )
+    assert not bool(result.state.started)
+    assert int(result.action) == -1
     assert bool(agent._checkpoint_state_valid(result.state))
-    assert bool(agent.decision(result.state).armed)
+    assert not bool(agent.decision(result.state).armed)
 
     corrupt_armed = near_maximum.replace(
         step_count=jnp.asarray(maximum, dtype=jnp.int32),
@@ -472,45 +451,6 @@ def test_signed_counter_telemetry_saturates_without_disarming_exact_clock() -> N
     chex.assert_trees_all_equal(
         _materialize_keys(rejected.state),
         _materialize_keys(corrupt_armed),
-    )
-
-
-@pytest.mark.parametrize("builder_config", _builder_configs()[:2])
-def test_fixed_builder_terminal_double_observation_exhaustion_rolls_back(
-    builder_config: StateBuilderConfig,
-) -> None:
-    agent = _agent(builder_config)
-    state = agent.start(agent.init(jr.key(242)), jnp.zeros(RAW_DIM))
-    maximum_i32 = np.iinfo(np.int32).max
-    near_terminal = jnp.asarray(
-        (2**32 - 1, 2**32 - 2),
-        dtype=jnp.uint32,
-    )
-    exhausted = state.replace(
-        state_builder_state=state.state_builder_state.replace(
-            step_count=jnp.asarray(maximum_i32, dtype=jnp.int32),
-            step_words=near_terminal,
-        ),
-        observation_event_count=jnp.asarray(maximum_i32, dtype=jnp.int32),
-        observation_event_words=near_terminal,
-    )
-
-    result = jax.jit(agent.update_transition)(
-        exhausted,
-        _transition(
-            exhausted,
-            jnp.ones(RAW_DIM, dtype=jnp.float32),
-            discount=0.0,
-            terminated=True,
-            next_decision_observation=-jnp.ones(RAW_DIM, dtype=jnp.float32),
-        ),
-    )
-
-    assert not bool(result.transition_diagnostics.next_counter_capacity_available)
-    assert bool(result.transition_diagnostics.rejected)
-    chex.assert_trees_all_equal(
-        _materialize_keys(result.state),
-        _materialize_keys(exhausted),
     )
 
 
@@ -735,26 +675,22 @@ def test_nonfinite_candidate_state_is_atomic_eager_jit_and_scan() -> None:
     next_observation = jnp.asarray([extreme, -extreme], dtype=jnp.float32)
     transition = _transition(state, next_observation)
     assert agent.state_builder is not None
-    online_builder = agent.state_builder
-    assert isinstance(online_builder, OnlineGatedStateBuilder)
-    builder_result = online_builder.update_with_status(
+    candidate_builder, _ = agent.state_builder.update(
         state.state_builder_state,
         next_observation,
         state.current_action,
         transition.reward,
         transition.discount,
     )
-    assert not bool(builder_result.candidate_state_valid)
-    assert not bool(builder_result.transition_applied)
-    assert bool(jnp.all(jnp.isfinite(builder_result.state.parameter_sensitivity)))
+    assert not bool(jnp.all(jnp.isfinite(candidate_builder.parameter_sensitivity)))
 
     for result in (
         agent.update_transition(state, transition),
         jax.jit(agent.update_transition)(state, transition),
     ):
         assert bool(result.transition_diagnostics.post_update_checked)
-        assert bool(result.transition_diagnostics.post_update_finite)
-        assert not bool(result.transition_diagnostics.post_update_consistent)
+        assert not bool(result.transition_diagnostics.post_update_finite)
+        assert bool(result.transition_diagnostics.post_update_consistent)
         assert not bool(result.transition_diagnostics.valid)
         assert bool(result.transition_diagnostics.rejected)
         assert float(result.oak_td_error) == 0.0
@@ -940,26 +876,12 @@ def test_generic_builder_checkpoint_roundtrip_restores_caches_and_state(
     save_prototype_checkpoint(agent, state, checkpoint)
     restored_agent, restored_state = load_prototype_checkpoint(checkpoint)
 
-    assert PROTOTYPE_CHECKPOINT_SCHEMA == "alberta.prototype_agent.v13"
+    assert PROTOTYPE_CHECKPOINT_SCHEMA == "alberta.prototype_agent.v3"
     assert restored_agent.to_config() == agent.to_config()
     chex.assert_trees_all_close(
         _materialize_keys(restored_state),
         _materialize_keys(state),
     )
-
-    relabeled_legacy = tmp_path / "prototype-relabeled-v10"
-    config = agent.to_config()
-    save_checkpoint(
-        state,
-        relabeled_legacy,
-        metadata={
-            "schema": "alberta.prototype_agent.v10",
-            "agent_config": config,
-            "config_sha256": _prototype_config_digest(config),
-        },
-    )
-    with pytest.raises(ValueError, match="predate exact identity"):
-        load_prototype_checkpoint(relabeled_legacy)
 
 
 def test_v2_checkpoint_roundtrips_pristine_state_and_rejects_corrupt_cache(
