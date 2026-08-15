@@ -34,6 +34,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Required GVF discount and eligibility-decay parameters to be concrete finite
+  float32-domain probabilities, preventing invalid or silently narrowed values from
+  corrupting Horde TD targets and traces.
 - Rejected malformed or float32-unsafe SIGReg kernel widths before Epps-Pulley
   arithmetic can emit NaN, while preserving valid dynamic JIT and vectorized calls;
   SIGReg configuration scalars now enforce the same finite representability contract.

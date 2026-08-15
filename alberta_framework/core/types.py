@@ -8,10 +8,12 @@ import enum
 import math
 import time
 from collections.abc import Sequence
-from typing import Any
+from numbers import Real
+from typing import Any, cast
 
 import chex
 import jax.numpy as jnp
+import numpy as np
 from jax import Array
 from jaxtyping import Float, Int
 
@@ -24,6 +26,7 @@ Observation = Array  # x_t: feature vector
 Target = Array  # y*_t: desired output
 Prediction = Array  # y_t: model output
 Reward = float  # r_t: scalar reward
+_FLOAT32_TINY = float(np.finfo(np.float32).tiny)
 
 
 @chex.dataclass(frozen=True)
@@ -662,6 +665,25 @@ class TraceMode(enum.Enum):
     REPLACING = "replacing"
 
 
+def _normalized_gvf_probability(name: str, value: object) -> float:
+    """Return one static GVF probability with stable float32 semantics."""
+    message = f"{name} must be a real non-boolean scalar in [0, 1]"
+    if not isinstance(value, Real) or isinstance(value, (bool, np.bool_)):
+        raise ValueError(message)
+    try:
+        comparable = cast(Any, value)
+        if comparable < 0 or comparable > 1:
+            raise ValueError(message)
+        if comparable != 0 and comparable < _FLOAT32_TINY:
+            raise ValueError(f"{name} must be zero or a normal float32 value in [0, 1]")
+        normalized = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(message) from exc
+    if not math.isfinite(normalized) or not 0.0 <= normalized <= 1.0:
+        raise ValueError(message)
+    return normalized
+
+
 @chex.dataclass(frozen=True)
 class GVFSpec:
     """One GVF demon's question functions (Sutton et al. 2011).
@@ -687,11 +709,10 @@ class GVFSpec:
 
     def __post_init__(self) -> None:
         """Reject invalid discount and trace-decay parameters."""
-
-        if not math.isfinite(self.gamma) or not 0.0 <= self.gamma <= 1.0:
-            raise ValueError(f"gamma must be finite and in [0, 1], got {self.gamma}")
-        if not math.isfinite(self.lamda) or not 0.0 <= self.lamda <= 1.0:
-            raise ValueError(f"lamda must be finite and in [0, 1], got {self.lamda}")
+        gamma = _normalized_gvf_probability("gamma", self.gamma)
+        lamda = _normalized_gvf_probability("lamda", self.lamda)
+        object.__setattr__(self, "gamma", gamma)
+        object.__setattr__(self, "lamda", lamda)
 
     def to_config(self) -> dict[str, Any]:
         """Serialize to dict.

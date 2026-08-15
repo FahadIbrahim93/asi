@@ -1,7 +1,10 @@
 """Tests for GVF types: DemonType, GVFSpec, HordeSpec, create_horde_spec."""
 
+from fractions import Fraction
+
 import chex
 import jax.numpy as jnp
+import numpy as np
 import pytest
 
 from alberta_framework import (
@@ -95,10 +98,12 @@ class TestGVFSpec:
             ("gamma", 1.01),
             ("gamma", float("nan")),
             ("gamma", float("inf")),
+            ("gamma", float("-inf")),
             ("lamda", -0.01),
             ("lamda", 1.01),
             ("lamda", float("nan")),
             ("lamda", float("inf")),
+            ("lamda", float("-inf")),
         ],
     )
     def test_invalid_discount_or_trace_decay_is_rejected(self, field, value):
@@ -125,6 +130,63 @@ class TestGVFSpec:
         config[field] = value
         with pytest.raises(ValueError, match=field):
             GVFSpec.from_config(config)
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            True,
+            False,
+            "0.5",
+            None,
+            10**400,
+            1.0e-50,
+            Fraction(1, 10**1000),
+            Fraction((2**100) + 1, 2**100),
+            np.nextafter(np.longdouble(1.0), np.longdouble(2.0)),
+            jnp.asarray(0.5),
+            jnp.asarray([0.5]),
+        ],
+    )
+    @pytest.mark.parametrize("field", ["gamma", "lamda"])
+    def test_discount_and_trace_decay_require_concrete_float32_reals(
+        self,
+        field,
+        value,
+    ):
+        kwargs = {
+            "name": "invalid",
+            "demon_type": DemonType.PREDICTION,
+            "gamma": 0.9,
+            "lamda": 0.8,
+            "cumulant_index": 0,
+        }
+        kwargs[field] = value
+
+        with pytest.raises(ValueError, match=field):
+            GVFSpec(**kwargs)
+
+        config = {
+            **kwargs,
+            "demon_type": "prediction",
+            "terminal_reward": 0.0,
+        }
+        with pytest.raises(ValueError, match=field):
+            GVFSpec.from_config(config)
+
+    def test_discount_and_trace_decay_normalize_supported_real_scalars(self):
+        spec = GVFSpec(
+            name="boundary",
+            demon_type=DemonType.PREDICTION,
+            gamma=np.float64(0.0),
+            lamda=np.int64(1),
+            cumulant_index=0,
+        )
+
+        assert type(spec.gamma) is float
+        assert type(spec.lamda) is float
+        horde = create_horde_spec([spec])
+        chex.assert_trees_all_equal(horde.gammas, jnp.asarray([0.0], dtype=jnp.float32))
+        chex.assert_trees_all_equal(horde.lamdas, jnp.asarray([1.0], dtype=jnp.float32))
 
 
 class TestHordeSpec:
