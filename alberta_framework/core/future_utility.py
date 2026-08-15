@@ -7,9 +7,37 @@ drop if a feature's output weight received the LMS update implied by the
 current residual.
 """
 
+from typing import NamedTuple
+
 import jax.numpy as jnp
 from jax import Array
-from jaxtyping import Float
+from jaxtyping import Bool, Float
+
+
+class FutureUtilityEstimate(NamedTuple):
+    """One-step utility estimate with an explicit transaction verdict."""
+
+    reductions: Float[Array, "n_tasks n_features"]
+    update_applied: Bool[Array, ""]
+
+
+class ContributionTraceFutureUtilityEstimate(NamedTuple):
+    """Contribution-trace estimate and an explicit transaction verdict."""
+
+    reductions: Float[Array, "n_tasks n_features"]
+    contribution_trace: Float[Array, "n_tasks n_features"]
+    feature_energy_trace: Float[Array, " n_features"]
+    update_applied: Bool[Array, ""]
+
+
+class TraceFutureUtilityEstimate(NamedTuple):
+    """Factored-trace estimate and an explicit transaction verdict."""
+
+    reductions: Float[Array, "n_tasks n_features"]
+    error_trace: Float[Array, " n_tasks"]
+    feature_trace: Float[Array, " n_features"]
+    feature_energy_trace: Float[Array, " n_features"]
+    update_applied: Bool[Array, ""]
 
 
 def trace_decay_from_half_life(half_life: float | Array) -> Float[Array, ""]:
@@ -27,14 +55,14 @@ def trace_decay_from_half_life(half_life: float | Array) -> Float[Array, ""]:
     )
 
 
-def one_step_output_loss_reduction(
+def one_step_output_loss_reduction_with_diagnostics(
     errors: Float[Array, " n_tasks"],
     feature_values: Float[Array, " n_features"],
     active_mask: Array,
     step_size_output: float | Array,
     active_count: float | Array,
-) -> Float[Array, "n_tasks n_features"]:
-    """Estimate per-task future loss reduction for each feature.
+) -> FutureUtilityEstimate:
+    """Estimate utility, rejecting non-finite active inputs atomically.
 
     For output LMS,
     ``delta_w_ij = alpha * error_i * feature_j / active_count``.  If the same
@@ -67,10 +95,40 @@ def one_step_output_loss_reduction(
     )
     reduction = errors[:, None] * delta_prediction - 0.5 * delta_prediction**2
     reduction = jnp.maximum(reduction, 0.0)
-    return jnp.where(active_mask[:, None], reduction, 0.0)
+    proposed = jnp.where(active_mask[:, None], reduction, 0.0)
+    inputs_valid = (
+        jnp.all(jnp.where(active_mask, jnp.isfinite(errors), True))
+        & jnp.all(jnp.isfinite(feature_values))
+        & jnp.isfinite(step_size)
+        & (step_size >= 0.0)
+        & jnp.isfinite(count)
+        & (count >= 0.0)
+    )
+    update_applied = inputs_valid & jnp.all(jnp.isfinite(proposed))
+    return FutureUtilityEstimate(
+        reductions=jnp.where(update_applied, proposed, jnp.zeros_like(proposed)),
+        update_applied=update_applied,
+    )
 
 
-def contribution_trace_output_loss_reduction(
+def one_step_output_loss_reduction(
+    errors: Float[Array, " n_tasks"],
+    feature_values: Float[Array, " n_features"],
+    active_mask: Array,
+    step_size_output: float | Array,
+    active_count: float | Array,
+) -> Float[Array, "n_tasks n_features"]:
+    """Compatibility wrapper returning only the fail-closed reductions."""
+    return one_step_output_loss_reduction_with_diagnostics(
+        errors,
+        feature_values,
+        active_mask,
+        step_size_output,
+        active_count,
+    ).reductions
+
+
+def contribution_trace_output_loss_reduction_with_diagnostics(
     errors: Float[Array, " n_tasks"],
     feature_values: Float[Array, " n_features"],
     active_mask: Array,
@@ -79,11 +137,7 @@ def contribution_trace_output_loss_reduction(
     contribution_trace: Float[Array, "n_tasks n_features"],
     feature_energy_trace: Float[Array, " n_features"],
     trace_decay: float | Array,
-) -> tuple[
-    Float[Array, "n_tasks n_features"],
-    Float[Array, "n_tasks n_features"],
-    Float[Array, " n_features"],
-]:
+) -> ContributionTraceFutureUtilityEstimate:
     """Estimate delayed usefulness from a TD(lambda)-style contribution trace.
 
     This variant traces the actual per-task/per-feature output contribution
@@ -112,8 +166,8 @@ def contribution_trace_output_loss_reduction(
 
     active_errors = jnp.where(active_mask, errors, 0.0)
     decayed_contribution = decay * contribution_trace
-    new_contribution_trace = decayed_contribution + (
-        active_errors[:, None] * feature_values[None, :]
+    new_contribution_trace = (
+        decayed_contribution + active_errors[:, None] * feature_values[None, :]
     )
     new_contribution_trace = jnp.where(
         active_mask[:, None],
@@ -133,14 +187,69 @@ def contribution_trace_output_loss_reduction(
         - 0.5 * (delta_weight**2) * new_feature_energy_trace[None, :]
     )
     reduction = jnp.maximum(reduction, 0.0)
-    return (
-        jnp.where(active_mask[:, None], reduction, 0.0),
-        new_contribution_trace,
-        new_feature_energy_trace,
+    proposed_reductions = jnp.where(active_mask[:, None], reduction, 0.0)
+    inputs_valid = (
+        jnp.all(jnp.where(active_mask, jnp.isfinite(errors), True))
+        & jnp.all(jnp.isfinite(feature_values))
+        & jnp.all(jnp.isfinite(contribution_trace))
+        & jnp.all(jnp.isfinite(feature_energy_trace))
+        & jnp.isfinite(decay)
+        & (decay >= 0.0)
+        & (decay <= 1.0)
+        & jnp.isfinite(step_size)
+        & (step_size >= 0.0)
+        & jnp.isfinite(count)
+        & (count >= 0.0)
+    )
+    candidate_finite = (
+        jnp.all(jnp.isfinite(proposed_reductions))
+        & jnp.all(jnp.isfinite(new_contribution_trace))
+        & jnp.all(jnp.isfinite(new_feature_energy_trace))
+    )
+    update_applied = inputs_valid & candidate_finite
+    return ContributionTraceFutureUtilityEstimate(
+        reductions=jnp.where(
+            update_applied, proposed_reductions, jnp.zeros_like(proposed_reductions)
+        ),
+        contribution_trace=jnp.where(
+            update_applied, new_contribution_trace, contribution_trace
+        ),
+        feature_energy_trace=jnp.where(
+            update_applied, new_feature_energy_trace, feature_energy_trace
+        ),
+        update_applied=update_applied,
     )
 
 
-def trace_output_loss_reduction(
+def contribution_trace_output_loss_reduction(
+    errors: Float[Array, " n_tasks"],
+    feature_values: Float[Array, " n_features"],
+    active_mask: Array,
+    step_size_output: float | Array,
+    active_count: float | Array,
+    contribution_trace: Float[Array, "n_tasks n_features"],
+    feature_energy_trace: Float[Array, " n_features"],
+    trace_decay: float | Array,
+) -> tuple[
+    Float[Array, "n_tasks n_features"],
+    Float[Array, "n_tasks n_features"],
+    Float[Array, " n_features"],
+]:
+    """Compatibility wrapper returning fail-closed estimates and traces."""
+    result = contribution_trace_output_loss_reduction_with_diagnostics(
+        errors,
+        feature_values,
+        active_mask,
+        step_size_output,
+        active_count,
+        contribution_trace,
+        feature_energy_trace,
+        trace_decay,
+    )
+    return result.reductions, result.contribution_trace, result.feature_energy_trace
+
+
+def trace_output_loss_reduction_with_diagnostics(
     errors: Float[Array, " n_tasks"],
     feature_values: Float[Array, " n_features"],
     active_mask: Array,
@@ -150,12 +259,7 @@ def trace_output_loss_reduction(
     feature_trace: Float[Array, " n_features"],
     feature_energy_trace: Float[Array, " n_features"],
     trace_decay: float | Array,
-) -> tuple[
-    Float[Array, "n_tasks n_features"],
-    Float[Array, " n_tasks"],
-    Float[Array, " n_features"],
-    Float[Array, " n_features"],
-]:
+) -> TraceFutureUtilityEstimate:
     """Estimate temporally extended output-loss reduction with causal traces.
 
     The one-step estimator asks how much the current squared error would drop
@@ -211,11 +315,74 @@ def trace_output_loss_reduction(
         - 0.5 * (delta_weight**2) * recurring_feature_energy
     )
     reduction = jnp.maximum(reduction, 0.0)
+    proposed_reductions = jnp.where(active_mask[:, None], reduction, 0.0)
+    inputs_valid = (
+        jnp.all(jnp.where(active_mask, jnp.isfinite(errors), True))
+        & jnp.all(jnp.isfinite(feature_values))
+        & jnp.all(jnp.isfinite(error_trace))
+        & jnp.all(jnp.isfinite(feature_trace))
+        & jnp.all(jnp.isfinite(feature_energy_trace))
+        & jnp.isfinite(decay)
+        & (decay >= 0.0)
+        & (decay <= 1.0)
+        & jnp.isfinite(step_size)
+        & (step_size >= 0.0)
+        & jnp.isfinite(count)
+        & (count >= 0.0)
+    )
+    candidate_finite = (
+        jnp.all(jnp.isfinite(proposed_reductions))
+        & jnp.all(jnp.isfinite(new_error_trace))
+        & jnp.all(jnp.isfinite(new_feature_trace))
+        & jnp.all(jnp.isfinite(new_feature_energy_trace))
+    )
+    update_applied = inputs_valid & candidate_finite
+    return TraceFutureUtilityEstimate(
+        reductions=jnp.where(
+            update_applied, proposed_reductions, jnp.zeros_like(proposed_reductions)
+        ),
+        error_trace=jnp.where(update_applied, new_error_trace, error_trace),
+        feature_trace=jnp.where(update_applied, new_feature_trace, feature_trace),
+        feature_energy_trace=jnp.where(
+            update_applied, new_feature_energy_trace, feature_energy_trace
+        ),
+        update_applied=update_applied,
+    )
+
+
+def trace_output_loss_reduction(
+    errors: Float[Array, " n_tasks"],
+    feature_values: Float[Array, " n_features"],
+    active_mask: Array,
+    step_size_output: float | Array,
+    active_count: float | Array,
+    error_trace: Float[Array, " n_tasks"],
+    feature_trace: Float[Array, " n_features"],
+    feature_energy_trace: Float[Array, " n_features"],
+    trace_decay: float | Array,
+) -> tuple[
+    Float[Array, "n_tasks n_features"],
+    Float[Array, " n_tasks"],
+    Float[Array, " n_features"],
+    Float[Array, " n_features"],
+]:
+    """Compatibility wrapper returning fail-closed estimates and traces."""
+    result = trace_output_loss_reduction_with_diagnostics(
+        errors,
+        feature_values,
+        active_mask,
+        step_size_output,
+        active_count,
+        error_trace,
+        feature_trace,
+        feature_energy_trace,
+        trace_decay,
+    )
     return (
-        jnp.where(active_mask[:, None], reduction, 0.0),
-        new_error_trace,
-        new_feature_trace,
-        new_feature_energy_trace,
+        result.reductions,
+        result.error_trace,
+        result.feature_trace,
+        result.feature_energy_trace,
     )
 
 

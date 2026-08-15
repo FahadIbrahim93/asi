@@ -36,8 +36,20 @@ import jax.random as jr
 from jax import Array
 from jaxtyping import Bool, Float, Int, UInt
 
+from alberta_framework.core.learners import _update_from_gradient_with_diagnostics
 from alberta_framework.core.multi_head_learner import MultiHeadMLPLearner, MultiHeadMLPState
 from alberta_framework.core.optimizers import Autostep, AutostepParamState, optimizer_from_config
+
+
+def _floating_tree_is_finite(tree: object) -> Bool[Array, ""]:
+    """Return whether all floating leaves in a persistent state are finite."""
+    valid = jnp.asarray(True, dtype=jnp.bool_)
+    for leaf in jax.tree.leaves(tree):
+        array = jnp.asarray(leaf)
+        if jnp.issubdtype(array.dtype, jnp.inexact):
+            valid = valid & jnp.all(jnp.isfinite(array))
+    return valid
+
 
 _INT32_MAX = 2**31 - 1
 _UINT32_MAX = 2**32 - 1
@@ -170,6 +182,7 @@ class DifferentialTDUpdateResult:
     td_error: Float[Array, ""]
     average_reward: Float[Array, ""]
     metrics: Float[Array, " 4"]
+    update_applied: Bool[Array, ""]
 
 
 @chex.dataclass(frozen=True)
@@ -181,6 +194,7 @@ class DifferentialTDArrayResult:
     td_errors: Float[Array, " num_steps"]
     average_rewards: Float[Array, " num_steps"]
     metrics: Float[Array, "num_steps 4"]
+    updates_applied: Bool[Array, " num_steps"]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -260,6 +274,7 @@ class DifferentialGTDUpdateResult:
     rho_clipped: Float[Array, ""]
     average_reward: Float[Array, ""]
     metrics: Float[Array, " 6"]
+    update_applied: Bool[Array, ""]
 
 
 @chex.dataclass(frozen=True)
@@ -272,6 +287,7 @@ class DifferentialGTDArrayResult:
     average_rewards: Float[Array, " num_steps"]
     rho_clipped: Float[Array, " num_steps"]
     metrics: Float[Array, "num_steps 6"]
+    updates_applied: Bool[Array, " num_steps"]
 
 
 @chex.dataclass(frozen=True)
@@ -296,6 +312,8 @@ class AverageRewardHordeUpdateResult:
     td_targets: Float[Array, " n_demons"]
     average_rewards: Float[Array, " n_demons"]
     per_demon_metrics: Float[Array, "n_demons 3"]
+    head_updates_applied: Bool[Array, " n_demons"]
+    update_applied: Bool[Array, ""]
 
 
 @chex.dataclass(frozen=True)
@@ -306,6 +324,8 @@ class AverageRewardHordeLearningResult:
     td_errors: Float[Array, "num_steps n_demons"]
     average_rewards: Float[Array, "num_steps n_demons"]
     per_demon_metrics: Float[Array, "num_steps n_demons 3"]
+    head_updates_applied: Bool[Array, "num_steps n_demons"]
+    updates_applied: Bool[Array, " num_steps"]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -413,6 +433,7 @@ class AverageRewardHordeActorCriticUpdateResult:
     td_error: Float[Array, ""]
     average_reward: Float[Array, ""]
     critic_prediction: Float[Array, ""]
+    update_applied: Bool[Array, ""]
 
 
 @chex.dataclass(frozen=True)
@@ -429,6 +450,7 @@ class AverageRewardHordeActorCriticArrayResult:
     actor_score_scales: Float[Array, " num_steps"]
     td_errors: Float[Array, " num_steps"]
     average_rewards: Float[Array, " num_steps"]
+    updates_applied: Bool[Array, " num_steps"]
 
 
 class AverageRewardHordeActorCriticAgent:
@@ -658,6 +680,15 @@ class AverageRewardHordeActorCriticAgent:
         next_observation: Array,
     ) -> AverageRewardHordeActorCriticUpdateResult:
         """Apply one average-reward actor-critic update."""
+        action_valid = (
+            (state.last_action >= 0)
+            & (state.last_action < self._config.n_actions)
+        )
+        safe_last_action = jnp.clip(
+            state.last_action,
+            0,
+            self._config.n_actions - 1,
+        )
         old_features = self._actor_features(state, state.last_observation)
         old_sample = state.last_policy_sample
         critic_result = self._critic.update(
@@ -673,7 +704,7 @@ class AverageRewardHordeActorCriticAgent:
             self._config.logit_clip,
         )
         action_mask = jax.nn.one_hot(
-            state.last_action,
+            safe_last_action,
             self._config.n_actions,
             dtype=jnp.float32,
         )
@@ -687,11 +718,21 @@ class AverageRewardHordeActorCriticAgent:
         )
         grad_log_policy = score[:, None] * old_features[None, :]
         bias_grad = score
-        raw_w, new_opt_w = self._actor_optimizer.update_from_gradient(
-            state.actor_opt_w, grad_log_policy, error=actor_td_error
+        raw_w, new_opt_w, weight_update_applied = (
+            _update_from_gradient_with_diagnostics(
+                self._actor_optimizer,
+                state.actor_opt_w,
+                grad_log_policy,
+                error=actor_td_error,
+            )
         )
-        raw_b, new_opt_b = self._actor_optimizer.update_from_gradient(
-            state.actor_opt_b, bias_grad, error=actor_td_error
+        raw_b, new_opt_b, bias_update_applied = (
+            _update_from_gradient_with_diagnostics(
+                self._actor_optimizer,
+                state.actor_opt_b,
+                bias_grad,
+                error=actor_td_error,
+            )
         )
         weight_step = jnp.clip(
             actor_td_error * raw_w,
@@ -703,12 +744,10 @@ class AverageRewardHordeActorCriticAgent:
             -self._config.actor_update_clip,
             self._config.actor_update_clip,
         )
-        actor_weights = jnp.nan_to_num(state.actor_weights + weight_step)
-        actor_bias = jnp.nan_to_num(state.actor_bias + bias_step)
-        committed_state = state.replace(
+        candidate_state = state.replace(
             critic_state=critic_result.state,
-            actor_weights=actor_weights,
-            actor_bias=actor_bias,
+            actor_weights=state.actor_weights + weight_step,
+            actor_bias=state.actor_bias + bias_step,
             actor_opt_w=new_opt_w,
             actor_opt_b=new_opt_b,
             step_count=_saturating_int32_increment(state.step_count),
@@ -717,24 +756,67 @@ class AverageRewardHordeActorCriticAgent:
         # Sample the successor only after the critic trunk, actor, optimizer,
         # reward-rate baseline, and step counter have committed atomically, so
         # the stored policy is exactly the current policy at next_observation.
-        next_sample, key = self.sample_policy(committed_state, next_observation)
-        new_state = committed_state.replace(
+        next_sample, key = self.sample_policy(candidate_state, next_observation)
+        proposed_state = candidate_state.replace(
             last_observation=next_observation,
             last_action=next_sample.action,
             last_policy_sample=next_sample,
             rng_key=key,
         )
+        inputs_valid = (
+            action_valid
+            & jnp.isfinite(jnp.squeeze(reward))
+            & jnp.all(jnp.isfinite(next_observation))
+            & jnp.all(jnp.isfinite(old_features))
+            & jnp.isfinite(td_error)
+            & jnp.isfinite(actor_score_scale)
+        )
+        update_applied = (
+            inputs_valid
+            & _floating_tree_is_finite(state)
+            & _floating_tree_is_finite(proposed_state)
+            & critic_result.update_applied
+            & critic_result.head_updates_applied[0]
+            & weight_update_applied
+            & bias_update_applied
+        )
+        new_state = jax.lax.cond(
+            update_applied,
+            lambda: proposed_state,
+            lambda: state,
+        )
         return AverageRewardHordeActorCriticUpdateResult(
             state=new_state,
-            action=next_sample.action,
-            policy=next_sample.behavior_policy,
-            target_policy=next_sample.target_policy,
-            behavior_action_probability=next_sample.behavior_probability,
-            target_action_probability=next_sample.target_probability,
-            actor_score_scale=actor_score_scale,
-            td_error=td_error,
-            average_reward=critic_result.average_rewards[0],
-            critic_prediction=critic_result.predictions[0],
+            action=jnp.where(
+                update_applied,
+                next_sample.action,
+                jnp.asarray(0, dtype=jnp.int32),
+            ),
+            policy=jnp.where(
+                update_applied,
+                next_sample.behavior_policy,
+                jnp.zeros_like(next_sample.behavior_policy),
+            ),
+            target_policy=jnp.where(
+                update_applied,
+                next_sample.target_policy,
+                jnp.zeros_like(next_sample.target_policy),
+            ),
+            behavior_action_probability=jnp.where(
+                update_applied, next_sample.behavior_probability, 0.0
+            ),
+            target_action_probability=jnp.where(
+                update_applied, next_sample.target_probability, 0.0
+            ),
+            actor_score_scale=jnp.where(update_applied, actor_score_scale, 0.0),
+            td_error=jnp.where(update_applied, td_error, 0.0),
+            average_reward=jnp.where(
+                update_applied, critic_result.average_rewards[0], 0.0
+            ),
+            critic_prediction=jnp.where(
+                update_applied, critic_result.predictions[0], 0.0
+            ),
+            update_applied=update_applied,
         )
 
 
@@ -846,28 +928,79 @@ class AverageRewardHordeLearner:
     ) -> AverageRewardHordeUpdateResult:
         """Apply one shared-trunk differential Horde update."""
         next_predictions = self._learner.predict(state.learner_state, next_observation)
-        active = ~jnp.isnan(cumulants)
-        targets = cumulants - state.average_rewards + next_predictions
-        targets = jnp.where(active, targets, jnp.nan)
+        # NaN remains the inactive-head sentinel. Other non-finite cumulants
+        # are rejected per head and reported separately from inactivity.
+        requested = ~jnp.isnan(cumulants)
+        raw_targets = cumulants - state.average_rewards + next_predictions
+        active = requested & jnp.isfinite(cumulants) & jnp.isfinite(raw_targets)
+        targets = jnp.where(active, raw_targets, jnp.nan)
         result = self._learner.update(state.learner_state, observation, targets)
         td_errors = result.errors
         safe_td_errors = jnp.where(active, td_errors, 0.0)
-        new_average_rewards = (
+        proposed_average_rewards = (
             state.average_rewards + self._average_reward_step_size * safe_td_errors
         )
-        new_state = state.replace(
+        inputs_valid = (
+            jnp.all(jnp.isfinite(observation))
+            & jnp.all(jnp.isfinite(next_observation))
+            & jnp.all(jnp.isfinite(state.average_rewards))
+        )
+        transaction_applied = (
+            inputs_valid
+            & result.update_applied
+            & jnp.all(jnp.isfinite(proposed_average_rewards))
+            & (jnp.any(active) | jnp.all(~requested))
+        )
+        proposed_state = state.replace(
             learner_state=result.state,
-            average_rewards=new_average_rewards,
+            average_rewards=proposed_average_rewards,
             step_count=_saturating_int32_increment(state.step_count),
         )
+        new_state = jax.lax.cond(
+            transaction_applied,
+            lambda: proposed_state,
+            lambda: state,
+        )
+        head_updates_applied = active & transaction_applied
+
+        def report_per_head(value: Array) -> Array:
+            neutral = jnp.zeros_like(value)
+            inactive = jnp.full_like(value, jnp.nan)
+            return jnp.where(
+                active,
+                jnp.where(transaction_applied, value, neutral),
+                jnp.where(requested, neutral, inactive),
+            )
+
         return AverageRewardHordeUpdateResult(
             state=new_state,
-            predictions=result.predictions,
-            next_predictions=next_predictions,
-            td_errors=td_errors,
-            td_targets=targets,
-            average_rewards=new_average_rewards,
-            per_demon_metrics=result.per_head_metrics,
+            predictions=jnp.where(
+                transaction_applied,
+                jnp.where(
+                    requested & ~head_updates_applied,
+                    jnp.zeros_like(result.predictions),
+                    result.predictions,
+                ),
+                jnp.zeros_like(result.predictions),
+            ),
+            next_predictions=jnp.where(
+                transaction_applied,
+                jnp.where(
+                    requested & ~head_updates_applied,
+                    jnp.zeros_like(next_predictions),
+                    next_predictions,
+                ),
+                jnp.zeros_like(next_predictions),
+            ),
+            td_errors=report_per_head(td_errors),
+            td_targets=report_per_head(targets),
+            average_rewards=new_state.average_rewards,
+            per_demon_metrics=jnp.stack(
+                [report_per_head(result.per_head_metrics[:, i]) for i in range(3)],
+                axis=1,
+            ),
+            head_updates_applied=head_updates_applied,
+            update_applied=transaction_applied,
         )
 
 
@@ -984,7 +1117,7 @@ class DifferentialGTDLearner:
         secondary_bias_step = beta * (td_error * bias_trace - secondary_dot_obs)
         new_average_reward = state.average_reward + eta * rho_s * td_error
 
-        new_state = state.replace(
+        proposed_state = state.replace(
             weights=state.weights + primary_weight_step,
             bias=state.bias + primary_bias_step,
             secondary_weights=state.secondary_weights + secondary_weight_step,
@@ -994,25 +1127,51 @@ class DifferentialGTDLearner:
             average_reward=new_average_reward,
             step_count=_saturating_int32_increment(state.step_count),
         )
+        # Inf reward makes alpha * delta * z = 0*inf = NaN on silent features
+        # and sends rbar to inf. Differential SARSA already refuses that.
+        inputs_valid = (
+            jnp.all(jnp.isfinite(observation))
+            & jnp.isfinite(reward_s)
+            & jnp.all(jnp.isfinite(next_observation))
+            & jnp.isfinite(jnp.squeeze(jnp.asarray(rho, dtype=jnp.float32)))
+        )
+        proposed_finite = (
+            jnp.all(jnp.isfinite(proposed_state.weights))
+            & jnp.isfinite(proposed_state.bias)
+            & jnp.all(jnp.isfinite(proposed_state.secondary_weights))
+            & jnp.isfinite(proposed_state.secondary_bias)
+            & jnp.all(jnp.isfinite(proposed_state.eligibility_traces))
+            & jnp.isfinite(proposed_state.bias_eligibility_trace)
+            & jnp.isfinite(proposed_state.average_reward)
+        )
+        update_applied = inputs_valid & _floating_tree_is_finite(state) & proposed_finite
+        new_state = jax.lax.cond(
+            update_applied,
+            lambda: proposed_state,
+            lambda: state,
+        )
         metrics = jnp.array(
             [
                 td_error**2,
                 td_error,
                 rho_s,
-                new_average_reward,
-                jnp.mean(jnp.abs(traces)),
+                new_state.average_reward,
+                jnp.mean(jnp.abs(new_state.eligibility_traces)),
                 jnp.sqrt(jnp.mean(new_state.secondary_weights**2)),
             ],
             dtype=jnp.float32,
         )
         return DifferentialGTDUpdateResult(
             state=new_state,
-            prediction=prediction,
-            next_prediction=next_prediction,
-            td_error=td_error,
-            rho_clipped=rho_s,
-            average_reward=new_average_reward,
-            metrics=metrics,
+            prediction=jnp.where(update_applied, prediction, jnp.zeros_like(prediction)),
+            next_prediction=jnp.where(
+                update_applied, next_prediction, jnp.zeros_like(next_prediction)
+            ),
+            td_error=jnp.where(update_applied, td_error, jnp.zeros_like(td_error)),
+            rho_clipped=jnp.where(update_applied, rho_s, jnp.zeros_like(rho_s)),
+            average_reward=new_state.average_reward,
+            metrics=jnp.where(update_applied, metrics, jnp.zeros_like(metrics)),
+            update_applied=update_applied,
         )
 
 
@@ -1112,7 +1271,7 @@ class DifferentialTDLearner:
 
         traces = lamda * state.eligibility_traces + observation
         bias_trace = lamda * state.bias_eligibility_trace + 1.0
-        new_state = state.replace(
+        proposed_state = state.replace(
             weights=state.weights + alpha * td_error * traces,
             bias=state.bias + alpha * td_error * bias_trace,
             eligibility_traces=traces,
@@ -1120,22 +1279,45 @@ class DifferentialTDLearner:
             average_reward=state.average_reward + beta * td_error,
             step_count=_saturating_int32_increment(state.step_count),
         )
+        # Inf reward makes alpha * delta * z = 0*inf = NaN on silent features
+        # and sends rbar to inf. Differential SARSA already refuses that.
+        inputs_valid = (
+            jnp.all(jnp.isfinite(observation))
+            & jnp.isfinite(reward_s)
+            & jnp.all(jnp.isfinite(next_observation))
+        )
+        proposed_finite = (
+            jnp.all(jnp.isfinite(proposed_state.weights))
+            & jnp.isfinite(proposed_state.bias)
+            & jnp.all(jnp.isfinite(proposed_state.eligibility_traces))
+            & jnp.isfinite(proposed_state.bias_eligibility_trace)
+            & jnp.isfinite(proposed_state.average_reward)
+        )
+        update_applied = inputs_valid & _floating_tree_is_finite(state) & proposed_finite
+        new_state = jax.lax.cond(
+            update_applied,
+            lambda: proposed_state,
+            lambda: state,
+        )
         metrics = jnp.array(
             [
                 td_error**2,
                 td_error,
                 new_state.average_reward,
-                jnp.mean(jnp.abs(traces)),
+                jnp.mean(jnp.abs(new_state.eligibility_traces)),
             ],
             dtype=jnp.float32,
         )
         return DifferentialTDUpdateResult(
             state=new_state,
-            prediction=prediction,
-            next_prediction=next_prediction,
-            td_error=td_error,
+            prediction=jnp.where(update_applied, prediction, jnp.zeros_like(prediction)),
+            next_prediction=jnp.where(
+                update_applied, next_prediction, jnp.zeros_like(next_prediction)
+            ),
+            td_error=jnp.where(update_applied, td_error, jnp.zeros_like(td_error)),
             average_reward=new_state.average_reward,
-            metrics=metrics,
+            metrics=jnp.where(update_applied, metrics, jnp.zeros_like(metrics)),
+            update_applied=update_applied,
         )
 
 
@@ -1152,7 +1334,7 @@ def run_differential_td_from_arrays(
     def _scan_fn(
         carry: DifferentialTDState,
         inputs: tuple[Array, Array, Array],
-    ) -> tuple[DifferentialTDState, tuple[Array, Array, Array, Array]]:
+    ) -> tuple[DifferentialTDState, tuple[Array, Array, Array, Array, Array]]:
         obs, reward, next_obs = inputs
         result = learner.update(carry, obs, reward, next_obs)
         return result.state, (
@@ -1160,12 +1342,15 @@ def run_differential_td_from_arrays(
             result.td_error,
             result.average_reward,
             result.metrics,
+            result.update_applied,
         )
 
-    final_state, (predictions, td_errors, average_rewards, metrics) = jax.lax.scan(
-        _scan_fn,
-        state,
-        (observations, rewards, next_observations),
+    final_state, (predictions, td_errors, average_rewards, metrics, updates_applied) = (
+        jax.lax.scan(
+            _scan_fn,
+            state,
+            (observations, rewards, next_observations),
+        )
     )
     elapsed = time.time() - start
     final_state = final_state.replace(uptime_s=final_state.uptime_s + elapsed)
@@ -1175,6 +1360,7 @@ def run_differential_td_from_arrays(
         td_errors=td_errors,
         average_rewards=average_rewards,
         metrics=metrics,
+        updates_applied=updates_applied,
     )
 
 
@@ -1192,7 +1378,10 @@ def run_differential_gtd_from_arrays(
     def _scan_fn(
         carry: DifferentialGTDState,
         inputs: tuple[Array, Array, Array, Array],
-    ) -> tuple[DifferentialGTDState, tuple[Array, Array, Array, Array, Array]]:
+    ) -> tuple[
+        DifferentialGTDState,
+        tuple[Array, Array, Array, Array, Array, Array],
+    ]:
         obs, reward, next_obs, rho = inputs
         result = learner.update(carry, obs, reward, next_obs, rho)
         return result.state, (
@@ -1201,9 +1390,20 @@ def run_differential_gtd_from_arrays(
             result.average_reward,
             result.rho_clipped,
             result.metrics,
+            result.update_applied,
         )
 
-    final_state, (predictions, td_errors, average_rewards, rho_clipped, metrics) = jax.lax.scan(
+    (
+        final_state,
+        (
+            predictions,
+            td_errors,
+            average_rewards,
+            rho_clipped,
+            metrics,
+            updates_applied,
+        ),
+    ) = jax.lax.scan(
         _scan_fn,
         state,
         (observations, rewards, next_observations, rhos),
@@ -1217,6 +1417,7 @@ def run_differential_gtd_from_arrays(
         average_rewards=average_rewards,
         rho_clipped=rho_clipped,
         metrics=metrics,
+        updates_applied=updates_applied,
     )
 
 
@@ -1233,16 +1434,27 @@ def run_average_reward_horde_from_arrays(
     def _scan_fn(
         carry: AverageRewardHordeState,
         inputs: tuple[Array, Array, Array],
-    ) -> tuple[AverageRewardHordeState, tuple[Array, Array, Array]]:
+    ) -> tuple[AverageRewardHordeState, tuple[Array, Array, Array, Array, Array]]:
         obs, cumulant, next_obs = inputs
         result = learner.update(carry, obs, cumulant, next_obs)
         return result.state, (
             result.td_errors,
             result.average_rewards,
             result.per_demon_metrics,
+            result.head_updates_applied,
+            result.update_applied,
         )
 
-    final_state, (td_errors, average_rewards, per_demon_metrics) = jax.lax.scan(
+    (
+        final_state,
+        (
+            td_errors,
+            average_rewards,
+            per_demon_metrics,
+            head_updates_applied,
+            updates_applied,
+        ),
+    ) = jax.lax.scan(
         _scan_fn,
         state,
         (observations, cumulants, next_observations),
@@ -1254,6 +1466,8 @@ def run_average_reward_horde_from_arrays(
         td_errors=td_errors,
         average_rewards=average_rewards,
         per_demon_metrics=per_demon_metrics,
+        head_updates_applied=head_updates_applied,
+        updates_applied=updates_applied,
     )
 
 
@@ -1271,11 +1485,16 @@ def run_average_reward_horde_actor_critic_from_arrays(
         inputs: tuple[Array, Array],
     ) -> tuple[
         AverageRewardHordeActorCriticState,
-        tuple[Array, Array, Array, Array, Array, Array, Array, Array],
+        tuple[Array, Array, Array, Array, Array, Array, Array, Array, Array],
     ]:
         reward, next_observation = inputs
         result = agent.update(carry, reward, next_observation)
-        return result.state, (
+        committed_state = jax.lax.cond(
+            result.update_applied,
+            lambda: result.state,
+            lambda: carry,
+        )
+        return committed_state, (
             result.action,
             result.policy,
             result.target_policy,
@@ -1284,6 +1503,7 @@ def run_average_reward_horde_actor_critic_from_arrays(
             result.actor_score_scale,
             result.td_error,
             result.average_reward,
+            result.update_applied,
         )
 
     (
@@ -1297,6 +1517,7 @@ def run_average_reward_horde_actor_critic_from_arrays(
             actor_score_scales,
             td_errors,
             average_rewards,
+            updates_applied,
         ),
     ) = jax.lax.scan(_scan_fn, state, (rewards, next_observations))
     elapsed = time.time() - start
@@ -1311,6 +1532,7 @@ def run_average_reward_horde_actor_critic_from_arrays(
         actor_score_scales=actor_score_scales,
         td_errors=td_errors,
         average_rewards=average_rewards,
+        updates_applied=updates_applied,
     )
 
 

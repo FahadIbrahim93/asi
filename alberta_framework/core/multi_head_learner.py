@@ -29,6 +29,7 @@ from jax import Array
 from jaxtyping import Bool, Float, UInt
 
 from alberta_framework.core.initializers import sparse_init
+from alberta_framework.core.learners import _update_from_gradient_with_diagnostics
 from alberta_framework.core.normalizers import (
     AnyNormalizerState,
     Normalizer,
@@ -798,20 +799,29 @@ class MultiHeadMLPLearner:
         # 2. Normalize observation if needed
         obs = observation
         new_normalizer_state = state.normalizer_state
+        normalizer_update_applied = jnp.asarray(True, dtype=jnp.bool_)
         if self._normalizer is not None and state.normalizer_state is not None:
             normalizer = self._normalizer
             normalizer_state = state.normalizer_state
 
-            def update_normalizer(_: None) -> tuple[Array, AnyNormalizerState]:
-                return normalizer.normalize(normalizer_state, observation)
+            def update_normalizer(
+                _: None,
+            ) -> tuple[Array, AnyNormalizerState, Bool[Array, ""]]:
+                result = normalizer.normalize_with_diagnostics(
+                    normalizer_state, observation
+                )
+                return result.normalized, result.state, result.update_applied
 
-            def preserve_normalizer(_: None) -> tuple[Array, AnyNormalizerState]:
+            def preserve_normalizer(
+                _: None,
+            ) -> tuple[Array, AnyNormalizerState, Bool[Array, ""]]:
                 return (
                     normalizer.normalize_only(normalizer_state, observation),
                     normalizer_state,
+                    jnp.asarray(False, dtype=jnp.bool_),
                 )
 
-            obs, new_normalizer_state = jax.lax.cond(
+            obs, new_normalizer_state, normalizer_update_applied = jax.lax.cond(
                 counter_status.update_available,
                 update_normalizer,
                 preserve_normalizer,
@@ -890,6 +900,7 @@ class MultiHeadMLPLearner:
         new_trunk_traces: list[Array] = []
         trunk_steps: list[Array] = []
         new_trunk_opt_states: list[LMSState | AutostepParamState] = []
+        optimizer_updates_applied: list[Bool[Array, ""]] = []
 
         for i in range(n_trunk_layers):
             # Weight trace (index 2*i)
@@ -901,11 +912,13 @@ class MultiHeadMLPLearner:
             else:
                 new_wt = gamma_lamda * old_wt + w_grad_i
             new_trunk_traces.append(new_wt)
-            w_step, new_w_opt = self._optimizer.update_from_gradient(
+            w_step, new_w_opt, w_update_applied = _update_from_gradient_with_diagnostics(
+                self._optimizer,
                 state.trunk_optimizer_states[2 * i], new_wt, error=None
             )
             trunk_steps.append(w_step)
             new_trunk_opt_states.append(new_w_opt)
+            optimizer_updates_applied.append(w_update_applied)
 
             # Bias trace (index 2*i + 1)
             b_grad_i = trunk_bias_grads[i]
@@ -915,11 +928,13 @@ class MultiHeadMLPLearner:
             else:
                 new_bt = gamma_lamda * old_bt + b_grad_i
             new_trunk_traces.append(new_bt)
-            b_step, new_b_opt = self._optimizer.update_from_gradient(
+            b_step, new_b_opt, b_update_applied = _update_from_gradient_with_diagnostics(
+                self._optimizer,
                 state.trunk_optimizer_states[2 * i + 1], new_bt, error=None
             )
             trunk_steps.append(b_step)
             new_trunk_opt_states.append(new_b_opt)
+            optimizer_updates_applied.append(b_update_applied)
 
         # Trunk bounding (pseudo_error=1.0 since error is in gradient)
         # Scale traces by the bounding factor for consistency with future updates
@@ -988,12 +1003,13 @@ class MultiHeadMLPLearner:
 
             # Optimizer step (with error for meta-learning)
             head_opt = self._head_optimizer if self._head_optimizer is not None else self._optimizer
-            w_step, new_w_opt = head_opt.update_from_gradient(
-                old_w_opt, new_w_trace, error=error_i
+            w_step, new_w_opt, w_update_applied = _update_from_gradient_with_diagnostics(
+                head_opt, old_w_opt, new_w_trace, error=error_i
             )
-            b_step, new_b_opt = head_opt.update_from_gradient(
-                old_b_opt, new_b_trace, error=error_i
+            b_step, new_b_opt, b_update_applied = _update_from_gradient_with_diagnostics(
+                head_opt, old_b_opt, new_b_trace, error=error_i
             )
+            optimizer_updates_applied.extend((w_update_applied, b_update_applied))
 
             # Head bounding — scale traces by the bounding factor so that
             # future trace-based updates reflect the effective step magnitude
@@ -1063,6 +1079,8 @@ class MultiHeadMLPLearner:
         candidate_state_finite = _floating_tree_is_finite(proposed_state)
         update_applied = (
             counter_status.update_available
+            & normalizer_update_applied
+            & jnp.all(jnp.stack(optimizer_updates_applied))
             & source_state_finite
             & inputs_valid
             & candidate_state_finite
@@ -1074,13 +1092,28 @@ class MultiHeadMLPLearner:
         )
 
         per_head_metrics = jnp.stack(per_head_metrics_list)  # (n_heads, 3)
+        reported_predictions = jnp.where(
+            update_applied, predictions_arr, jnp.zeros_like(predictions_arr)
+        )
+        reported_errors = jnp.where(
+            active_mask,
+            jnp.where(update_applied, errors_arr, jnp.zeros_like(errors_arr)),
+            jnp.nan,
+        )
+        reported_metrics = jnp.where(
+            active_mask[:, None],
+            jnp.where(update_applied, per_head_metrics, jnp.zeros_like(per_head_metrics)),
+            jnp.nan,
+        )
 
         return MultiHeadMLPUpdateResult(
             state=new_state,
-            predictions=predictions_arr,
-            errors=errors_arr,
-            per_head_metrics=per_head_metrics,
-            trunk_bounding_metric=trunk_bounding_metric,
+            predictions=reported_predictions,
+            errors=reported_errors,
+            per_head_metrics=reported_metrics,
+            trunk_bounding_metric=jnp.where(
+                update_applied, trunk_bounding_metric, jnp.asarray(0.0)
+            ),
             pre_step_words=state.step_words,
             post_step_words=new_state.step_words,
             lifetime_counter_valid=(

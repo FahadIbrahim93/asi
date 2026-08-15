@@ -40,10 +40,11 @@ import jax
 import jax.numpy as jnp
 import jax.random as jr
 from jax import Array
-from jaxtyping import Float, Int
+from jaxtyping import Bool, Float, Int
 
 from alberta_framework.core.horde import HordeLearner, HordeUpdateResult
 from alberta_framework.core.initializers import sparse_init
+from alberta_framework.core.learners import _update_from_gradient_with_diagnostics
 from alberta_framework.core.multi_head_learner import MultiHeadMLPLearner, MultiHeadMLPState
 from alberta_framework.core.optimizers import (
     Autostep,
@@ -52,6 +53,79 @@ from alberta_framework.core.optimizers import (
     optimizer_from_config,
 )
 from alberta_framework.core.types import AutostepParamState, DemonType, MLPParams
+
+
+def _floating_tree_is_finite(tree: object) -> Array:
+    """Return whether every floating/complex persistent leaf is finite."""
+    valid = jnp.asarray(True, dtype=jnp.bool_)
+    for leaf in jax.tree.leaves(tree):
+        array = jnp.asarray(leaf)
+        if jnp.issubdtype(array.dtype, jnp.inexact):
+            valid = valid & jnp.all(jnp.isfinite(array))
+    return valid
+
+
+def _commit_scan_safe_actor_state(
+    previous: Any,
+    proposed: Any,
+    inputs_valid: Array,
+    nested_update_applied: Array,
+) -> tuple[Any, Bool[Array, ""]]:
+    """Commit one actor/critic transaction only when every component is valid."""
+    update_applied = (
+        jnp.asarray(inputs_valid, dtype=jnp.bool_)
+        & jnp.asarray(nested_update_applied, dtype=jnp.bool_)
+        & _floating_tree_is_finite(previous)
+        & _floating_tree_is_finite(proposed)
+    )
+    state = jax.lax.cond(update_applied, lambda: proposed, lambda: previous)
+    return state, update_applied
+
+
+def _rollback_critic_result(
+    result: HordeUpdateResult,
+    previous_state: MultiHeadMLPState,
+    outer_update_applied: Array,
+) -> HordeUpdateResult:
+    """Make a nested Horde result describe the outer committed transaction."""
+    requested = ~jnp.isnan(result.td_targets)
+    head_updates_applied = result.head_updates_applied & outer_update_applied
+    mask_shape = (requested.shape[0],) + (1,) * (result.per_demon_metrics.ndim - 1)
+    requested_metrics = jnp.reshape(requested, mask_shape)
+    applied_metrics = jnp.reshape(head_updates_applied, mask_shape)
+    rejected_td = jnp.where(requested, jnp.zeros_like(result.td_errors), jnp.nan)
+    rejected_targets = jnp.where(requested, jnp.zeros_like(result.td_targets), jnp.nan)
+    rejected_metrics = jnp.where(
+        requested_metrics,
+        jnp.zeros_like(result.per_demon_metrics),
+        jnp.nan,
+    )
+    return HordeUpdateResult(  # type: ignore[call-arg]
+        state=jax.lax.cond(
+            outer_update_applied,
+            lambda: result.state,
+            lambda: previous_state,
+        ),
+        predictions=jnp.where(
+            outer_update_applied,
+            result.predictions,
+            jnp.zeros_like(result.predictions),
+        ),
+        td_errors=jnp.where(head_updates_applied, result.td_errors, rejected_td),
+        td_targets=jnp.where(head_updates_applied, result.td_targets, rejected_targets),
+        per_demon_metrics=jnp.where(
+            applied_metrics,
+            result.per_demon_metrics,
+            rejected_metrics,
+        ),
+        trunk_bounding_metric=jnp.where(
+            outer_update_applied,
+            result.trunk_bounding_metric,
+            jnp.asarray(0.0, dtype=jnp.float32),
+        ),
+        head_updates_applied=head_updates_applied,
+        update_applied=result.update_applied & outer_update_applied,
+    )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -127,6 +201,7 @@ class HordeActorCriticUpdateResult:
     td_error: Float[Array, ""]
     bound_metric: Float[Array, ""]
     critic_result: HordeUpdateResult
+    update_applied: Bool[Array, ""]
 
 
 @chex.dataclass(frozen=True)
@@ -139,6 +214,7 @@ class HordeActorCriticArrayResult:
     values: Float[Array, " num_steps"]
     td_errors: Float[Array, " num_steps"]
     critic_td_errors: Float[Array, "num_steps n_demons"]
+    updates_applied: Bool[Array, " num_steps"]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -198,6 +274,7 @@ class QHordeActorCriticUpdateResult:
     td_error: Float[Array, ""]
     bound_metric: Float[Array, ""]
     critic_result: HordeUpdateResult
+    update_applied: Bool[Array, ""]
 
 
 class QHordeActorCriticAgent:
@@ -360,6 +437,8 @@ class QHordeActorCriticAgent:
         """Update actor and action-value Horde critic from one transition."""
         cfg = self._config
         prev_obs = state.last_observation
+        action_valid = (state.last_action >= 0) & (state.last_action < cfg.n_actions)
+        safe_last_action = jnp.clip(state.last_action, 0, cfg.n_actions - 1)
         old_policy = self.policy(state, prev_obs)
         next_policy = self.policy(state, observation)
         sampled_next_action, sampled_key, sampled_policy = self.select_action(
@@ -375,11 +454,11 @@ class QHordeActorCriticAgent:
             else jnp.dot(next_policy, q_next)
         )
         target = jnp.asarray(reward, dtype=jnp.float32) + effective_gamma * next_value
-        q_old = q_previous[state.last_action]
+        q_old = q_previous[safe_last_action]
         td_error = target - q_old
 
         cumulants = jnp.full(self._critic.n_demons, jnp.nan, dtype=jnp.float32)
-        cumulants = cumulants.at[state.last_action].set(target)
+        cumulants = cumulants.at[safe_last_action].set(target)
         if prediction_cumulants is not None:
             cumulants = cumulants.at[cfg.n_actions :].set(prediction_cumulants)
         critic_result = self._critic.update(
@@ -394,7 +473,7 @@ class QHordeActorCriticAgent:
             if cfg.actor_td_error_clip is None
             else jnp.clip(td_error, -cfg.actor_td_error_clip, cfg.actor_td_error_clip)
         )
-        one_hot = jax.nn.one_hot(state.last_action, cfg.n_actions, dtype=jnp.float32)
+        one_hot = jax.nn.one_hot(safe_last_action, cfg.n_actions, dtype=jnp.float32)
         sampled_actor_grad_bias = (one_hot - old_policy) / cfg.temperature
         state_value = jnp.dot(old_policy, q_previous)
         expected_actor_grad_bias = old_policy * (q_previous - state_value) / cfg.temperature
@@ -442,21 +521,56 @@ class QHordeActorCriticAgent:
             if cfg.critic_target == "sampled_sarsa"
             else self.select_action(updated, observation)
         )
-        new_state = updated.replace(
+        proposed_state = updated.replace(
             last_observation=observation,
             last_action=next_action,
             rng_key=key,
         )
+        inputs_valid = (
+            action_valid
+            & jnp.isfinite(jnp.squeeze(reward))
+            & jnp.all(jnp.isfinite(observation))
+            & jnp.all(jnp.isfinite(old_policy))
+            & jnp.all(jnp.isfinite(next_policy))
+            & jnp.all(jnp.isfinite(q_previous))
+            & jnp.all(jnp.isfinite(q_next))
+            & jnp.isfinite(target)
+            & jnp.isfinite(td_error)
+            & jnp.isfinite(bound_metric)
+            & jnp.all(jnp.isfinite(policy))
+            & (next_action >= 0)
+            & (next_action < cfg.n_actions)
+        )
+        nested_update_applied = (
+            critic_result.update_applied
+            & critic_result.head_updates_applied[safe_last_action]
+        )
+        new_state, update_applied = _commit_scan_safe_actor_state(
+            state,
+            proposed_state,
+            inputs_valid,
+            nested_update_applied,
+        )
+        committed_critic_result = _rollback_critic_result(
+            critic_result,
+            state.critic_state,
+            update_applied,
+        )
         return QHordeActorCriticUpdateResult(  # type: ignore[call-arg]
             state=new_state,
-            action=next_action,
-            policy=policy,
-            q_values=q_previous,
-            next_q_values=q_next,
-            target=target,
-            td_error=td_error,
-            bound_metric=bound_metric,
-            critic_result=critic_result,
+            action=jnp.where(update_applied, next_action, jnp.asarray(0, jnp.int32)),
+            policy=jnp.where(update_applied, policy, jnp.zeros_like(policy)),
+            q_values=jnp.where(
+                update_applied, q_previous, jnp.zeros_like(q_previous)
+            ),
+            next_q_values=jnp.where(
+                update_applied, q_next, jnp.zeros_like(q_next)
+            ),
+            target=jnp.where(update_applied, target, 0.0),
+            td_error=jnp.where(update_applied, td_error, 0.0),
+            bound_metric=jnp.where(update_applied, bound_metric, 0.0),
+            critic_result=committed_critic_result,
+            update_applied=update_applied,
         )
 
 
@@ -646,6 +760,8 @@ class HordeActorCriticAgent:
         """
         cfg = self._config
         prev_obs = state.last_observation
+        action_valid = (state.last_action >= 0) & (state.last_action < cfg.n_actions)
+        safe_last_action = jnp.clip(state.last_action, 0, cfg.n_actions - 1)
         old_policy = self.policy(state, prev_obs)
         value = self.value(state, prev_obs)
         next_value = self.value(state, observation)
@@ -695,7 +811,7 @@ class HordeActorCriticAgent:
             else jnp.clip(td_error, -cfg.actor_td_error_clip, cfg.actor_td_error_clip)
         )
 
-        one_hot = jax.nn.one_hot(state.last_action, cfg.n_actions, dtype=jnp.float32)
+        one_hot = jax.nn.one_hot(safe_last_action, cfg.n_actions, dtype=jnp.float32)
         actor_grad_bias = (one_hot - old_policy) / cfg.temperature
         actor_grad_weights = actor_grad_bias[:, None] * prev_obs[None, :]
         actor_decay = value_discount * cfg.actor_lamda
@@ -728,20 +844,54 @@ class HordeActorCriticAgent:
             step_count=state.step_count + 1,
         )
         next_action, key, next_policy = self.select_action(updated, observation)
-        new_state = updated.replace(
+        proposed_state = updated.replace(
             last_observation=observation,
             last_action=next_action,
             rng_key=key,
         )
+        inputs_valid = (
+            action_valid
+            & jnp.isfinite(jnp.squeeze(reward))
+            & jnp.all(jnp.isfinite(observation))
+            & jnp.isfinite(value_discount)
+            & (value_discount >= 0.0)
+            & (value_discount <= 1.0)
+            & jnp.all(jnp.isfinite(old_policy))
+            & jnp.isfinite(value)
+            & jnp.isfinite(next_value)
+            & jnp.isfinite(td_error)
+            & jnp.isfinite(bound_metric)
+            & jnp.all(jnp.isfinite(next_policy))
+            & (next_action >= 0)
+            & (next_action < cfg.n_actions)
+        )
+        nested_update_applied = (
+            critic_result.update_applied
+            & critic_result.head_updates_applied[cfg.value_head_index]
+        )
+        new_state, update_applied = _commit_scan_safe_actor_state(
+            state,
+            proposed_state,
+            inputs_valid,
+            nested_update_applied,
+        )
+        committed_critic_result = _rollback_critic_result(
+            critic_result,
+            state.critic_state,
+            update_applied,
+        )
         return HordeActorCriticUpdateResult(  # type: ignore[call-arg]
             state=new_state,
-            action=next_action,
-            policy=next_policy,
-            value=value,
-            next_value=next_value,
-            td_error=td_error,
-            bound_metric=bound_metric,
-            critic_result=critic_result,
+            action=jnp.where(update_applied, next_action, jnp.asarray(0, jnp.int32)),
+            policy=jnp.where(
+                update_applied, next_policy, jnp.zeros_like(next_policy)
+            ),
+            value=jnp.where(update_applied, value, 0.0),
+            next_value=jnp.where(update_applied, next_value, 0.0),
+            td_error=jnp.where(update_applied, td_error, 0.0),
+            bound_metric=jnp.where(update_applied, bound_metric, 0.0),
+            critic_result=committed_critic_result,
+            update_applied=update_applied,
         )
 
 
@@ -781,7 +931,10 @@ def run_horde_actor_critic_from_arrays(
     def _scan_fn(
         carry: HordeActorCriticState,
         inputs: tuple[Array, Array, Array, Array, Array, Array],
-    ) -> tuple[HordeActorCriticState, tuple[Array, Array, Array, Array, Array]]:
+    ) -> tuple[
+        HordeActorCriticState,
+        tuple[Array, Array, Array, Array, Array, Array],
+    ]:
         obs, reward, next_obs, fixed_action, aux, transition_discount = inputs
         if use_fixed_actions:
             started_state = carry.replace(  # type: ignore[attr-defined]
@@ -798,27 +951,42 @@ def run_horde_actor_critic_from_arrays(
             aux,
             transition_discount,
         )
-        return result.state, (
-            current_action,
+        committed_state = jax.lax.cond(
+            result.update_applied,
+            lambda: result.state,
+            lambda: carry,
+        )
+        return committed_state, (
+            jnp.where(
+                result.update_applied,
+                current_action,
+                jnp.asarray(0, dtype=jnp.int32),
+            ),
             result.policy,
             result.value,
             result.td_error,
             result.critic_result.td_errors,
+            result.update_applied,
         )
 
-    final_state, (out_actions, policies, values, td_errors, critic_td_errors) = (
-        jax.lax.scan(
-            _scan_fn,
-            state,
-            (
-                observations,
-                rewards,
-                next_observations,
-                actions,
-                auxiliary_cumulants,
-                discounts,
-            ),
-        )
+    final_state, (
+        out_actions,
+        policies,
+        values,
+        td_errors,
+        critic_td_errors,
+        updates_applied,
+    ) = jax.lax.scan(
+        _scan_fn,
+        state,
+        (
+            observations,
+            rewards,
+            next_observations,
+            actions,
+            auxiliary_cumulants,
+            discounts,
+        ),
     )
     return HordeActorCriticArrayResult(  # type: ignore[call-arg]
         state=final_state,
@@ -827,6 +995,7 @@ def run_horde_actor_critic_from_arrays(
         values=values,
         td_errors=td_errors,
         critic_td_errors=critic_td_errors,
+        updates_applied=updates_applied,
     )
 
 
@@ -1024,6 +1193,7 @@ class NonlinearHordeActorCriticUpdateResult:
     td_error: Float[Array, ""]
     bound_metric: Float[Array, ""]
     critic_result: HordeUpdateResult
+    update_applied: Bool[Array, ""]
 
 
 @chex.dataclass(frozen=True)
@@ -1036,6 +1206,7 @@ class NonlinearHordeActorCriticArrayResult:
     values: Float[Array, " num_steps"]
     td_errors: Float[Array, " num_steps"]
     critic_td_errors: Float[Array, "num_steps n_demons"]
+    updates_applied: Bool[Array, " num_steps"]
 
 
 class NonlinearHordeActorCriticAgent:
@@ -1292,6 +1463,8 @@ class NonlinearHordeActorCriticAgent:
         """
         cfg = self._config
         prev_obs = state.last_observation
+        action_valid = (state.last_action >= 0) & (state.last_action < cfg.n_actions)
+        safe_last_action = jnp.clip(state.last_action, 0, cfg.n_actions - 1)
         value = self.value(state, prev_obs)
         next_value = self.value(state, observation)
 
@@ -1352,7 +1525,7 @@ class NonlinearHordeActorCriticAgent:
         grads = _nlhac_grad(
             actor_params,
             prev_obs,
-            state.last_action,
+            safe_last_action,
             cfg.leaky_relu_slope,
             cfg.use_layer_norm,
             cfg.temperature,
@@ -1386,24 +1559,47 @@ class NonlinearHordeActorCriticAgent:
         new_trunk_opt_states: list[AutostepParamState] = []
         trunk_w_steps: list[Array] = []
         trunk_b_steps: list[Array] = []
+        optimizer_updates_applied: list[Array] = []
         for i in range(n_hidden):
-            raw_w, new_opt_w = self._actor_optimizer.update_from_gradient(
-                state.actor_trunk_opt_states[2 * i], new_trunk_traces[2 * i], error=actor_td_error
+            raw_w, new_opt_w, w_update_applied = (
+                _update_from_gradient_with_diagnostics(
+                    self._actor_optimizer,
+                    state.actor_trunk_opt_states[2 * i],
+                    new_trunk_traces[2 * i],
+                    error=actor_td_error,
+                )
             )
-            raw_b, new_opt_b = self._actor_optimizer.update_from_gradient(
-                state.actor_trunk_opt_states[2 * i + 1],
-                new_trunk_traces[2 * i + 1],
-                error=actor_td_error,
+            raw_b, new_opt_b, b_update_applied = (
+                _update_from_gradient_with_diagnostics(
+                    self._actor_optimizer,
+                    state.actor_trunk_opt_states[2 * i + 1],
+                    new_trunk_traces[2 * i + 1],
+                    error=actor_td_error,
+                )
             )
             new_trunk_opt_states.extend([new_opt_w, new_opt_b])
             trunk_w_steps.append(raw_w)
             trunk_b_steps.append(raw_b)
+            optimizer_updates_applied.extend((w_update_applied, b_update_applied))
 
-        raw_head_w, new_head_opt_w = self._actor_optimizer.update_from_gradient(
-            state.actor_head_opt_w, new_head_trace_w, error=actor_td_error
+        raw_head_w, new_head_opt_w, head_w_update_applied = (
+            _update_from_gradient_with_diagnostics(
+                self._actor_optimizer,
+                state.actor_head_opt_w,
+                new_head_trace_w,
+                error=actor_td_error,
+            )
         )
-        raw_head_b, new_head_opt_b = self._actor_optimizer.update_from_gradient(
-            state.actor_head_opt_b, new_head_trace_b, error=actor_td_error
+        raw_head_b, new_head_opt_b, head_b_update_applied = (
+            _update_from_gradient_with_diagnostics(
+                self._actor_optimizer,
+                state.actor_head_opt_b,
+                new_head_trace_b,
+                error=actor_td_error,
+            )
+        )
+        optimizer_updates_applied.extend(
+            (head_w_update_applied, head_b_update_applied)
         )
         head_w_step = raw_head_w
         head_b_step = raw_head_b
@@ -1471,20 +1667,54 @@ class NonlinearHordeActorCriticAgent:
             step_count=state.step_count + 1,
         )
         next_action, key, next_policy = self.select_action(updated, observation)
-        new_state = updated.replace(
+        proposed_state = updated.replace(
             last_observation=observation,
             last_action=next_action,
             rng_key=key,
         )
+        inputs_valid = (
+            action_valid
+            & jnp.isfinite(jnp.squeeze(reward))
+            & jnp.all(jnp.isfinite(observation))
+            & jnp.isfinite(value_discount)
+            & (value_discount >= 0.0)
+            & (value_discount <= 1.0)
+            & jnp.isfinite(value)
+            & jnp.isfinite(next_value)
+            & jnp.isfinite(td_error)
+            & jnp.isfinite(bound_metric)
+            & jnp.all(jnp.isfinite(next_policy))
+            & (next_action >= 0)
+            & (next_action < cfg.n_actions)
+        )
+        nested_update_applied = (
+            critic_result.update_applied
+            & critic_result.head_updates_applied[cfg.value_head_index]
+            & jnp.all(jnp.stack(optimizer_updates_applied))
+        )
+        new_state, update_applied = _commit_scan_safe_actor_state(
+            state,
+            proposed_state,
+            inputs_valid,
+            nested_update_applied,
+        )
+        committed_critic_result = _rollback_critic_result(
+            critic_result,
+            state.critic_state,
+            update_applied,
+        )
         return NonlinearHordeActorCriticUpdateResult(  # type: ignore[call-arg]
             state=new_state,
-            action=next_action,
-            policy=next_policy,
-            value=value,
-            next_value=next_value,
-            td_error=td_error,
-            bound_metric=bound_metric,
-            critic_result=critic_result,
+            action=jnp.where(update_applied, next_action, jnp.asarray(0, jnp.int32)),
+            policy=jnp.where(
+                update_applied, next_policy, jnp.zeros_like(next_policy)
+            ),
+            value=jnp.where(update_applied, value, 0.0),
+            next_value=jnp.where(update_applied, next_value, 0.0),
+            td_error=jnp.where(update_applied, td_error, 0.0),
+            bound_metric=jnp.where(update_applied, bound_metric, 0.0),
+            critic_result=committed_critic_result,
+            update_applied=update_applied,
         )
 
 
@@ -1526,25 +1756,40 @@ def run_nonlinear_horde_actor_critic_from_arrays(
         inputs: tuple[Array, Array, Array, Array, Array],
     ) -> tuple[
         NonlinearHordeActorCriticState,
-        tuple[Array, Array, Array, Array, Array],
+        tuple[Array, Array, Array, Array, Array, Array],
     ]:
         obs, reward, next_obs, aux, disc = inputs
         started, current_action, _policy = agent.start(carry, obs)
         result = agent.update(started, reward, next_obs, aux, disc)
-        return result.state, (
-            current_action,
+        committed_state = jax.lax.cond(
+            result.update_applied,
+            lambda: result.state,
+            lambda: carry,
+        )
+        return committed_state, (
+            jnp.where(
+                result.update_applied,
+                current_action,
+                jnp.asarray(0, dtype=jnp.int32),
+            ),
             result.policy,
             result.value,
             result.td_error,
             result.critic_result.td_errors,
+            result.update_applied,
         )
 
-    final_state, (out_actions, policies, values, td_errors, critic_td_errors) = (
-        jax.lax.scan(
-            _scan_fn,
-            state,
-            (observations, rewards, next_observations, auxiliary_cumulants, discounts),
-        )
+    final_state, (
+        out_actions,
+        policies,
+        values,
+        td_errors,
+        critic_td_errors,
+        updates_applied,
+    ) = jax.lax.scan(
+        _scan_fn,
+        state,
+        (observations, rewards, next_observations, auxiliary_cumulants, discounts),
     )
     return NonlinearHordeActorCriticArrayResult(  # type: ignore[call-arg]
         state=final_state,
@@ -1553,6 +1798,7 @@ def run_nonlinear_horde_actor_critic_from_arrays(
         values=values,
         td_errors=td_errors,
         critic_td_errors=critic_td_errors,
+        updates_applied=updates_applied,
     )
 
 
@@ -1600,6 +1846,7 @@ class NonlinearQHordeActorCriticUpdateResult:
     td_error: Float[Array, ""]
     bound_metric: Float[Array, ""]
     critic_result: HordeUpdateResult
+    update_applied: Bool[Array, ""]
 
 
 class NonlinearQHordeActorCriticAgent:
@@ -1822,6 +2069,8 @@ class NonlinearQHordeActorCriticAgent:
         """Update actor and action-value Horde critic from one transition."""
         cfg = self._config
         prev_obs = state.last_observation
+        action_valid = (state.last_action >= 0) & (state.last_action < cfg.n_actions)
+        safe_last_action = jnp.clip(state.last_action, 0, cfg.n_actions - 1)
         next_policy = self.policy(state, observation)
         sampled_next_action, sampled_key, sampled_policy = self.select_action(
             state,
@@ -1836,10 +2085,10 @@ class NonlinearQHordeActorCriticAgent:
             else jnp.dot(next_policy, q_next)
         )
         target = jnp.asarray(reward, dtype=jnp.float32) + effective_gamma * next_value
-        td_error = target - q_previous[state.last_action]
+        td_error = target - q_previous[safe_last_action]
 
         cumulants = jnp.full(self._critic.n_demons, jnp.nan, dtype=jnp.float32)
-        cumulants = cumulants.at[state.last_action].set(target)
+        cumulants = cumulants.at[safe_last_action].set(target)
         if prediction_cumulants is not None:
             cumulants = cumulants.at[cfg.n_actions :].set(prediction_cumulants)
         critic_result = self._critic.update(
@@ -1877,7 +2126,7 @@ class NonlinearQHordeActorCriticAgent:
             grads = _nlhac_grad(
                 actor_params,
                 prev_obs,
-                state.last_action,
+                safe_last_action,
                 cfg.leaky_relu_slope,
                 cfg.use_layer_norm,
                 cfg.temperature,
@@ -1911,26 +2160,47 @@ class NonlinearQHordeActorCriticAgent:
         new_trunk_opt_states: list[AutostepParamState] = []
         trunk_w_steps: list[Array] = []
         trunk_b_steps: list[Array] = []
+        optimizer_updates_applied: list[Array] = []
         for i in range(n_hidden):
-            raw_w, new_opt_w = self._actor_optimizer.update_from_gradient(
-                state.actor_trunk_opt_states[2 * i],
-                new_trunk_traces[2 * i],
-                error=actor_signal,
+            raw_w, new_opt_w, w_update_applied = (
+                _update_from_gradient_with_diagnostics(
+                    self._actor_optimizer,
+                    state.actor_trunk_opt_states[2 * i],
+                    new_trunk_traces[2 * i],
+                    error=actor_signal,
+                )
             )
-            raw_b, new_opt_b = self._actor_optimizer.update_from_gradient(
-                state.actor_trunk_opt_states[2 * i + 1],
-                new_trunk_traces[2 * i + 1],
-                error=actor_signal,
+            raw_b, new_opt_b, b_update_applied = (
+                _update_from_gradient_with_diagnostics(
+                    self._actor_optimizer,
+                    state.actor_trunk_opt_states[2 * i + 1],
+                    new_trunk_traces[2 * i + 1],
+                    error=actor_signal,
+                )
             )
             new_trunk_opt_states.extend([new_opt_w, new_opt_b])
             trunk_w_steps.append(raw_w)
             trunk_b_steps.append(raw_b)
+            optimizer_updates_applied.extend((w_update_applied, b_update_applied))
 
-        raw_head_w, new_head_opt_w = self._actor_optimizer.update_from_gradient(
-            state.actor_head_opt_w, new_head_trace_w, error=actor_signal
+        raw_head_w, new_head_opt_w, head_w_update_applied = (
+            _update_from_gradient_with_diagnostics(
+                self._actor_optimizer,
+                state.actor_head_opt_w,
+                new_head_trace_w,
+                error=actor_signal,
+            )
         )
-        raw_head_b, new_head_opt_b = self._actor_optimizer.update_from_gradient(
-            state.actor_head_opt_b, new_head_trace_b, error=actor_signal
+        raw_head_b, new_head_opt_b, head_b_update_applied = (
+            _update_from_gradient_with_diagnostics(
+                self._actor_optimizer,
+                state.actor_head_opt_b,
+                new_head_trace_b,
+                error=actor_signal,
+            )
+        )
+        optimizer_updates_applied.extend(
+            (head_w_update_applied, head_b_update_applied)
         )
         head_w_step = raw_head_w
         head_b_step = raw_head_b
@@ -1993,19 +2263,54 @@ class NonlinearQHordeActorCriticAgent:
             if cfg.critic_target == "sampled_sarsa"
             else self.select_action(updated, observation)
         )
-        new_state = updated.replace(
+        proposed_state = updated.replace(
             last_observation=observation,
             last_action=next_action,
             rng_key=key,
         )
+        inputs_valid = (
+            action_valid
+            & jnp.isfinite(jnp.squeeze(reward))
+            & jnp.all(jnp.isfinite(observation))
+            & jnp.all(jnp.isfinite(next_policy))
+            & jnp.all(jnp.isfinite(q_previous))
+            & jnp.all(jnp.isfinite(q_next))
+            & jnp.isfinite(target)
+            & jnp.isfinite(td_error)
+            & jnp.isfinite(bound_metric)
+            & jnp.all(jnp.isfinite(policy))
+            & (next_action >= 0)
+            & (next_action < cfg.n_actions)
+        )
+        nested_update_applied = (
+            critic_result.update_applied
+            & critic_result.head_updates_applied[safe_last_action]
+            & jnp.all(jnp.stack(optimizer_updates_applied))
+        )
+        new_state, update_applied = _commit_scan_safe_actor_state(
+            state,
+            proposed_state,
+            inputs_valid,
+            nested_update_applied,
+        )
+        committed_critic_result = _rollback_critic_result(
+            critic_result,
+            state.critic_state,
+            update_applied,
+        )
         return NonlinearQHordeActorCriticUpdateResult(  # type: ignore[call-arg]
             state=new_state,
-            action=next_action,
-            policy=policy,
-            q_values=q_previous,
-            next_q_values=q_next,
-            target=target,
-            td_error=td_error,
-            bound_metric=bound_metric,
-            critic_result=critic_result,
+            action=jnp.where(update_applied, next_action, jnp.asarray(0, jnp.int32)),
+            policy=jnp.where(update_applied, policy, jnp.zeros_like(policy)),
+            q_values=jnp.where(
+                update_applied, q_previous, jnp.zeros_like(q_previous)
+            ),
+            next_q_values=jnp.where(
+                update_applied, q_next, jnp.zeros_like(q_next)
+            ),
+            target=jnp.where(update_applied, target, 0.0),
+            td_error=jnp.where(update_applied, td_error, 0.0),
+            bound_metric=jnp.where(update_applied, bound_metric, 0.0),
+            critic_result=committed_critic_result,
+            update_applied=update_applied,
         )

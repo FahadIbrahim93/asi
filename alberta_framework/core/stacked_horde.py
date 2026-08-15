@@ -43,7 +43,7 @@ import chex
 import jax
 import jax.numpy as jnp
 from jax import Array
-from jaxtyping import Float
+from jaxtyping import Bool, Float
 
 __all__ = [
     "StackedHordeConfig",
@@ -183,6 +183,8 @@ class StackedHordeUpdateResult:
     state: StackedHordeState
     predictions: Float[Array, " n_demons"]
     td_errors: Float[Array, " n_demons"]
+    head_updates_applied: Bool[Array, " n_demons"]
+    update_applied: Bool[Array, ""]
 
 
 class StackedLinearHorde:
@@ -252,12 +254,19 @@ class StackedLinearHorde:
         """
         cfg = self._config
         cumulants = cumulant_source[self._cumulant_idx]  # (n_demons,)
+        requested = ~jnp.isnan(cumulants)
         active = jnp.isfinite(cumulants)
-        safe_cumulants = jnp.nan_to_num(cumulants)
         rho_vec = jnp.broadcast_to(jnp.asarray(rho, dtype=jnp.float32), (cfg.n_demons,))
+        rho_valid = jnp.isfinite(rho_vec)
 
         v = state.weights @ features  # (n_demons,)
         v_next = state.weights @ next_features
+        raw_td_errors = cumulants + self._gammas * v_next - v
+        prediction_valid = jnp.isfinite(v) & jnp.isfinite(v_next)
+        channel_valid = (
+            active & rho_valid & prediction_valid & jnp.isfinite(raw_td_errors)
+        )
+        safe_cumulants = jnp.where(channel_valid, cumulants, 0.0)
         td_errors = safe_cumulants + self._gammas * v_next - v
 
         # Per-decision IS with the ratio composed into the trace:
@@ -266,20 +275,77 @@ class StackedLinearHorde:
         accumulated = decay * state.traces + features[None, :]
         # Inactive demons: trace decays but the current gradient is withheld.
         decayed_only = decay * state.traces
-        new_traces = rho_vec[:, None] * jnp.where(active[:, None], accumulated, decayed_only)
+        safe_rho = jnp.where(rho_valid, rho_vec, 0.0)
+        proposed_traces = safe_rho[:, None] * jnp.where(
+            active[:, None], accumulated, decayed_only
+        )
 
-        masked_delta = jnp.where(active, td_errors, 0.0)
-        new_weights = state.weights + cfg.step_size * masked_delta[:, None] * new_traces
-
-        new_state = StackedHordeState(
+        masked_delta = jnp.where(channel_valid, td_errors, 0.0)
+        proposed_weights = (
+            state.weights
+            + cfg.step_size * masked_delta[:, None] * proposed_traces
+        )
+        source_finite = (
+            jnp.all(jnp.isfinite(state.weights))
+            & jnp.all(jnp.isfinite(state.traces))
+        )
+        shared_inputs_valid = (
+            jnp.all(jnp.isfinite(features))
+            & jnp.all(jnp.isfinite(next_features))
+            & source_finite
+        )
+        candidate_finite = jnp.all(jnp.isfinite(proposed_weights), axis=1) & jnp.all(
+            jnp.isfinite(proposed_traces), axis=1
+        )
+        head_updates_applied = shared_inputs_valid & channel_valid & candidate_finite
+        inactive_trace_applied = (
+            shared_inputs_valid
+            & ~requested
+            & rho_valid
+            & prediction_valid
+            & candidate_finite
+        )
+        accepted_channels = head_updates_applied | inactive_trace_applied
+        new_weights = jnp.where(
+            head_updates_applied[:, None], proposed_weights, state.weights
+        )
+        new_traces = jnp.where(
+            accepted_channels[:, None], proposed_traces, state.traces
+        )
+        update_applied = jnp.any(accepted_channels)
+        proposed_state = StackedHordeState(
             weights=new_weights,
             traces=new_traces,
             step_count=state.step_count + 1,
         )
+        new_state = jax.lax.cond(
+            update_applied,
+            lambda: proposed_state,
+            lambda: state,
+        )
+        reported_td_errors = jnp.where(
+            head_updates_applied,
+            td_errors,
+            jnp.where(
+                requested,
+                jnp.zeros_like(td_errors),
+                jnp.full_like(td_errors, jnp.nan),
+            ),
+        )
         return StackedHordeUpdateResult(
             state=new_state,
-            predictions=v,
-            td_errors=jnp.where(active, td_errors, jnp.nan),
+            predictions=jnp.where(
+                update_applied,
+                jnp.where(
+                    (requested & ~head_updates_applied) | ~prediction_valid,
+                    jnp.zeros_like(v),
+                    v,
+                ),
+                jnp.zeros_like(v),
+            ),
+            td_errors=reported_td_errors,
+            head_updates_applied=head_updates_applied,
+            update_applied=update_applied,
         )
 
 

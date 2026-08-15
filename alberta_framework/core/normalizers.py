@@ -118,6 +118,16 @@ def _lifetime_words_to_float32(words: Array) -> Float[Array, ""]:
     return words[0].astype(jnp.float32) * high_scale + words[1].astype(jnp.float32)
 
 
+def _floating_tree_is_finite(tree: object) -> Bool[Array, ""]:
+    """Return whether every floating/complex persistent leaf is finite."""
+    valid = jnp.asarray(True, dtype=jnp.bool_)
+    for leaf in jax.tree.leaves(tree):
+        array = jnp.asarray(leaf)
+        if jnp.issubdtype(array.dtype, jnp.inexact):
+            valid = valid & jnp.all(jnp.isfinite(array))
+    return valid
+
+
 @chex.dataclass(frozen=True)
 class EMANormalizerState:
     """State for EMA-based online feature normalization.
@@ -366,7 +376,14 @@ class Normalizer[
             Normalized observation
         """
         std = jnp.sqrt(state.var)
-        return (observation - state.mean) / (std + self._epsilon)
+        normalized = (observation - state.mean) / (std + self._epsilon)
+        # Inf observation minus an inf mean is inf-inf = NaN. Zero only
+        # those coordinates. Finite-input overflow must stay visible.
+        return jnp.where(
+            jnp.isfinite(observation),
+            normalized,
+            jnp.zeros_like(normalized),
+        )
 
     def update_only(
         self,
@@ -473,6 +490,11 @@ class EMANormalizer(Normalizer[EMANormalizerState]):
             Tuple of (normalized_observation, new_state)
         """
         status = self.counter_status(state)
+        observation_valid = jnp.all(jnp.isfinite(observation))
+        source_state_finite = _floating_tree_is_finite(state)
+        update_available = (
+            status.update_available & observation_valid & source_state_finite
+        )
 
         def accepted(_: None) -> tuple[Array, EMANormalizerState]:
             new_words, ignored_capacity = _checked_lifetime_words_increment(
@@ -501,11 +523,26 @@ class EMANormalizer(Normalizer[EMANormalizerState]):
         def refused(_: None) -> tuple[Array, EMANormalizerState]:
             return self.normalize_only(state, observation), state
 
-        normalized, new_state = jax.lax.cond(
-            status.update_available,
+        candidate_normalized, candidate_state = jax.lax.cond(
+            update_available,
             accepted,
             refused,
             operand=None,
+        )
+        update_applied = (
+            update_available
+            & jnp.all(jnp.isfinite(candidate_normalized))
+            & _floating_tree_is_finite(candidate_state)
+        )
+        new_state = jax.lax.cond(
+            update_applied,
+            lambda: candidate_state,
+            lambda: state,
+        )
+        normalized = jnp.where(
+            update_applied | (observation_valid & source_state_finite),
+            candidate_normalized,
+            jnp.zeros_like(candidate_normalized),
         )
         return NormalizerUpdateResult(
             normalized=normalized,
@@ -515,7 +552,7 @@ class EMANormalizer(Normalizer[EMANormalizerState]):
             counter_valid=status.counter_valid,
             lifetime_capacity_available=status.lifetime_capacity_available,
             estimator_capacity_available=status.estimator_capacity_available,
-            update_applied=status.update_available,
+            update_applied=update_applied,
         )
 
 
@@ -583,6 +620,11 @@ class WelfordNormalizer(Normalizer[WelfordNormalizerState]):
             Tuple of (normalized_observation, new_state)
         """
         status = self.counter_status(state)
+        observation_valid = jnp.all(jnp.isfinite(observation))
+        source_state_finite = _floating_tree_is_finite(state)
+        update_available = (
+            status.update_available & observation_valid & source_state_finite
+        )
 
         def accepted(_: None) -> tuple[Array, WelfordNormalizerState]:
             new_words, ignored_capacity = _checked_lifetime_words_increment(
@@ -611,11 +653,26 @@ class WelfordNormalizer(Normalizer[WelfordNormalizerState]):
         def refused(_: None) -> tuple[Array, WelfordNormalizerState]:
             return self.normalize_only(state, observation), state
 
-        normalized, new_state = jax.lax.cond(
-            status.update_available,
+        candidate_normalized, candidate_state = jax.lax.cond(
+            update_available,
             accepted,
             refused,
             operand=None,
+        )
+        update_applied = (
+            update_available
+            & jnp.all(jnp.isfinite(candidate_normalized))
+            & _floating_tree_is_finite(candidate_state)
+        )
+        new_state = jax.lax.cond(
+            update_applied,
+            lambda: candidate_state,
+            lambda: state,
+        )
+        normalized = jnp.where(
+            update_applied | (observation_valid & source_state_finite),
+            candidate_normalized,
+            jnp.zeros_like(candidate_normalized),
         )
         return NormalizerUpdateResult(
             normalized=normalized,
@@ -625,7 +682,7 @@ class WelfordNormalizer(Normalizer[WelfordNormalizerState]):
             counter_valid=status.counter_valid,
             lifetime_capacity_available=status.lifetime_capacity_available,
             estimator_capacity_available=status.estimator_capacity_available,
-            update_applied=status.update_available,
+            update_applied=update_applied,
         )
 
 
@@ -685,6 +742,11 @@ class StreamingBatchNormalizer(Normalizer[StreamingBatchNormalizerState]):
     ) -> NormalizerUpdateResult:
         """Normalize and conditionally commit BatchNorm-style moments."""
         status = self.counter_status(state)
+        observation_valid = jnp.all(jnp.isfinite(observation))
+        source_state_finite = _floating_tree_is_finite(state)
+        update_available = (
+            status.update_available & observation_valid & source_state_finite
+        )
 
         def accepted(_: None) -> tuple[Array, StreamingBatchNormalizerState]:
             new_words, ignored_capacity = _checked_lifetime_words_increment(
@@ -715,11 +777,26 @@ class StreamingBatchNormalizer(Normalizer[StreamingBatchNormalizerState]):
         def refused(_: None) -> tuple[Array, StreamingBatchNormalizerState]:
             return self.normalize_only(state, observation), state
 
-        normalized, new_state = jax.lax.cond(
-            status.update_available,
+        candidate_normalized, candidate_state = jax.lax.cond(
+            update_available,
             accepted,
             refused,
             operand=None,
+        )
+        update_applied = (
+            update_available
+            & jnp.all(jnp.isfinite(candidate_normalized))
+            & _floating_tree_is_finite(candidate_state)
+        )
+        new_state = jax.lax.cond(
+            update_applied,
+            lambda: candidate_state,
+            lambda: state,
+        )
+        normalized = jnp.where(
+            update_applied | (observation_valid & source_state_finite),
+            candidate_normalized,
+            jnp.zeros_like(candidate_normalized),
         )
         return NormalizerUpdateResult(
             normalized=normalized,
@@ -729,7 +806,7 @@ class StreamingBatchNormalizer(Normalizer[StreamingBatchNormalizerState]):
             counter_valid=status.counter_valid,
             lifetime_capacity_available=status.lifetime_capacity_available,
             estimator_capacity_available=status.estimator_capacity_available,
-            update_applied=status.update_available,
+            update_applied=update_applied,
         )
 
 

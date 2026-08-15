@@ -19,7 +19,7 @@ import jax
 import jax.numpy as jnp
 import jax.random as jr
 from jax import Array
-from jaxtyping import Float, Int
+from jaxtyping import Bool, Float, Int
 
 _INT32_MAX = 2**31 - 1
 
@@ -276,6 +276,7 @@ class BehaviorModelUpdateResult:
     confidence: Float[Array, ""]
     predicted_action: Int[Array, ""]
     correct: Float[Array, ""]
+    update_applied: Bool[Array, ""]
 
 
 @chex.dataclass(frozen=True)
@@ -301,6 +302,7 @@ class BehaviorModelArrayResult:
     entropies: Float[Array, " num_steps"]
     confidences: Float[Array, " num_steps"]
     correct: Float[Array, " num_steps"]
+    updates_applied: Bool[Array, " num_steps"]
 
 
 class BehaviorModel:
@@ -528,17 +530,52 @@ class BehaviorModel:
             accuracy_ema=accuracy_ema,
             confidence_ema=confidence_ema,
         )
+        # Inf observation makes softmax NaN and logit_error * x = 0*inf = NaN
+        # on silent features. Hold the previous finite state.
+        source_finite = (
+            jnp.all(jnp.isfinite(state.weights))
+            & jnp.all(jnp.isfinite(state.bias))
+            & jnp.isfinite(state.nll_ema)
+            & jnp.isfinite(state.accuracy_ema)
+            & jnp.isfinite(state.confidence_ema)
+        )
+        inputs_valid = (
+            jnp.all(jnp.isfinite(obs))
+            & (action_id >= 0)
+            & (action_id < cfg.n_actions)
+        )
+        proposed_finite = (
+            jnp.all(jnp.isfinite(new_state.weights))
+            & jnp.all(jnp.isfinite(new_state.bias))
+            & jnp.isfinite(new_state.nll_ema)
+            & jnp.isfinite(new_state.accuracy_ema)
+            & jnp.isfinite(new_state.confidence_ema)
+        )
+        update_applied = source_finite & inputs_valid & proposed_finite
+        committed = jax.lax.cond(
+            update_applied,
+            lambda: new_state,
+            lambda: state,
+        )
+        neutral_float = jnp.asarray(0.0, dtype=jnp.float32)
         return BehaviorModelUpdateResult(
-            state=new_state,
-            logits=logits,
-            probabilities=probabilities,
-            action_probability=action_prob,
-            log_likelihood=log_likelihood,
-            loss=loss,
-            entropy=entropy,
-            confidence=confidence,
-            predicted_action=predicted_action,
-            correct=correct,
+            state=committed,
+            logits=jnp.where(update_applied, logits, jnp.zeros_like(logits)),
+            probabilities=jnp.where(
+                update_applied, probabilities, jnp.zeros_like(probabilities)
+            ),
+            action_probability=jnp.where(update_applied, action_prob, neutral_float),
+            log_likelihood=jnp.where(update_applied, log_likelihood, neutral_float),
+            loss=jnp.where(update_applied, loss, neutral_float),
+            entropy=jnp.where(update_applied, entropy, neutral_float),
+            confidence=jnp.where(update_applied, confidence, neutral_float),
+            predicted_action=jnp.where(
+                update_applied,
+                predicted_action,
+                jnp.asarray(0, dtype=jnp.int32),
+            ),
+            correct=jnp.where(update_applied, correct, neutral_float),
+            update_applied=update_applied,
         )
 
     @functools.partial(jax.jit, static_argnums=(0,))
@@ -601,7 +638,10 @@ def run_behavior_model_from_arrays(
     def _scan_fn(
         carry: BehaviorModelState,
         inputs: tuple[Array, Array],
-    ) -> tuple[BehaviorModelState, tuple[Array, Array, Array, Array, Array, Array, Array]]:
+    ) -> tuple[
+        BehaviorModelState,
+        tuple[Array, Array, Array, Array, Array, Array, Array, Array],
+    ]:
         obs, action = inputs
         result = model.update(carry, obs, action)
         return result.state, (
@@ -612,6 +652,7 @@ def run_behavior_model_from_arrays(
             result.entropy,
             result.confidence,
             result.correct,
+            result.update_applied,
         )
 
     (
@@ -624,6 +665,7 @@ def run_behavior_model_from_arrays(
             entropies,
             confidences,
             correct,
+            updates_applied,
         ),
     ) = jax.lax.scan(_scan_fn, state, (observations, actions))
     return BehaviorModelArrayResult(
@@ -635,6 +677,7 @@ def run_behavior_model_from_arrays(
         entropies=entropies,
         confidences=confidences,
         correct=correct,
+        updates_applied=updates_applied,
     )
 
 

@@ -8,8 +8,9 @@ from alberta_framework.core.compositional_features import CompositionalFeatureLe
 from alberta_framework.core.feature_discovery import FixedBudgetFeatureLearner
 from alberta_framework.core.future_utility import (
     contribution_trace_output_loss_reduction,
+    contribution_trace_output_loss_reduction_with_diagnostics,
     normalize_future_utility_signal,
-    one_step_output_loss_reduction,
+    one_step_output_loss_reduction_with_diagnostics,
     trace_decay_from_half_life,
 )
 
@@ -20,7 +21,7 @@ def test_contribution_trace_matches_one_step_at_zero_decay() -> None:
     features = jnp.array([1.0, 2.0], dtype=jnp.float32)
     active_mask = jnp.array([True, False])
 
-    one_step = one_step_output_loss_reduction(
+    one_step = one_step_output_loss_reduction_with_diagnostics(
         errors=errors,
         feature_values=features,
         active_mask=active_mask,
@@ -38,7 +39,7 @@ def test_contribution_trace_matches_one_step_at_zero_decay() -> None:
         trace_decay=0.0,
     )
 
-    chex.assert_trees_all_close(traced, one_step)
+    chex.assert_trees_all_close(traced, one_step.reductions)
     chex.assert_trees_all_close(
         contribution_trace,
         jnp.array([[2.0, 4.0], [0.0, 0.0]], dtype=jnp.float32),
@@ -203,3 +204,46 @@ def test_compositional_future_utility_metrics_remain_finite_with_variants() -> N
     chex.assert_tree_all_finite(result.metrics)
     chex.assert_tree_all_finite(result.state.utilities)
     chex.assert_tree_all_finite(result.state.candidate_utilities)
+
+
+def test_inf_error_silent_feature_scores_zero_not_nan() -> None:
+    """Inf error * a silent feature is 0*inf = NaN in the LMS counterfactual.
+
+    Fail-closed: score that pair as zero usefulness instead of poisoning
+    replacement with NaN.
+    """
+    errors = jnp.array([jnp.inf], dtype=jnp.float32)
+    features = jnp.array([0.0, 1.0], dtype=jnp.float32)
+    active_mask = jnp.array([True])
+    one_step = one_step_output_loss_reduction_with_diagnostics(
+        errors=errors,
+        feature_values=features,
+        active_mask=active_mask,
+        step_size_output=0.1,
+        active_count=1.0,
+    )
+    assert not bool(one_step.update_applied)
+    assert bool(jnp.all(jnp.isfinite(one_step.reductions)))
+    chex.assert_trees_all_close(
+        one_step.reductions, jnp.zeros((1, 2), dtype=jnp.float32)
+    )
+
+    initial_contribution_trace = jnp.zeros((1, 2), dtype=jnp.float32)
+    initial_energy_trace = jnp.zeros(2, dtype=jnp.float32)
+    traced = contribution_trace_output_loss_reduction_with_diagnostics(
+        errors=errors,
+        feature_values=features,
+        active_mask=active_mask,
+        step_size_output=0.1,
+        active_count=1.0,
+        contribution_trace=initial_contribution_trace,
+        feature_energy_trace=initial_energy_trace,
+        trace_decay=0.5,
+    )
+    assert not bool(traced.update_applied)
+    assert bool(jnp.all(jnp.isfinite(traced.reductions)))
+    chex.assert_trees_all_close(
+        traced.reductions, jnp.zeros((1, 2), dtype=jnp.float32)
+    )
+    chex.assert_trees_all_close(traced.contribution_trace, initial_contribution_trace)
+    chex.assert_trees_all_close(traced.feature_energy_trace, initial_energy_trace)

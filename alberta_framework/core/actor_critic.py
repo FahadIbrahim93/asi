@@ -27,9 +27,19 @@ import jax
 import jax.numpy as jnp
 import jax.random as jr
 from jax import Array
-from jaxtyping import Float, Int
+from jaxtyping import Bool, Float, Int
 
 from alberta_framework.core.optimizers import Bounder, bounder_from_config
+
+
+def _floating_tree_is_finite(tree: object) -> Bool[Array, ""]:
+    """Return whether every floating/complex persistent leaf is finite."""
+    valid = jnp.asarray(True, dtype=jnp.bool_)
+    for leaf in jax.tree.leaves(tree):
+        array = jnp.asarray(leaf)
+        if jnp.issubdtype(array.dtype, jnp.inexact):
+            valid = valid & jnp.all(jnp.isfinite(array))
+    return valid
 
 
 @dataclasses.dataclass(frozen=True)
@@ -126,6 +136,7 @@ class ActorCriticUpdateResult:
     next_value: Float[Array, ""]
     td_error: Float[Array, ""]
     bound_metric: Float[Array, ""]
+    update_applied: Bool[Array, ""]
 
 
 @chex.dataclass(frozen=True)
@@ -145,6 +156,7 @@ class ActorCriticArrayResult:
     policies: Float[Array, "num_steps n_actions"]
     values: Float[Array, " num_steps"]
     td_errors: Float[Array, " num_steps"]
+    updates_applied: Bool[Array, " num_steps"]
 
 
 class ActorCriticAgent:
@@ -399,21 +411,69 @@ class ActorCriticAgent:
             critic_trace_bias=stored_critic_trace_bias,
             step_count=state.step_count + 1,
         )
-        next_action, key, next_policy = self.select_action(updated, observation)
-        new_state = updated.replace(
+        # Reject the complete transition if its inputs or proposed persistent
+        # state are non-finite. The result carries the rejection explicitly.
+        inputs_valid = (
+            jnp.isfinite(jnp.squeeze(reward))
+            & jnp.all(jnp.isfinite(observation))
+            & jnp.isfinite(td_error)
+            & jnp.isfinite(discount)
+            & (discount >= 0.0)
+            & (discount <= 1.0)
+            & (action >= 0)
+            & (action < cfg.n_actions)
+            & jnp.all(jnp.isfinite(old_policy))
+            & jnp.isfinite(value)
+            & jnp.isfinite(next_value)
+            & jnp.isfinite(actor_metric)
+            & jnp.isfinite(critic_metric)
+        )
+        candidate_ok = (
+            inputs_valid
+            & _floating_tree_is_finite(state)
+            & _floating_tree_is_finite(updated)
+        )
+        held = jax.lax.cond(
+            candidate_ok,
+            lambda: updated,
+            lambda: state,
+        )
+        safe_observation = jnp.where(candidate_ok, observation, state.last_observation)
+        next_action, key, next_policy = self.select_action(held, safe_observation)
+        proposed_final_state = held.replace(
             last_observation=observation,
             last_action=next_action,
             rng_key=key,
         )
+        params_ok = (
+            candidate_ok
+            & _floating_tree_is_finite(proposed_final_state)
+            & jnp.all(jnp.isfinite(next_policy))
+            & (next_action >= 0)
+            & (next_action < cfg.n_actions)
+        )
+        new_state = jax.lax.cond(
+            params_ok,
+            lambda: proposed_final_state,
+            lambda: state,
+        )
+        zero = jnp.asarray(0.0, dtype=jnp.float32)
 
         return ActorCriticUpdateResult(  # type: ignore[call-arg]
             state=new_state,
-            action=next_action,
-            policy=next_policy,
-            value=value,
-            next_value=next_value,
-            td_error=td_error,
-            bound_metric=(actor_metric + critic_metric) / 2.0,
+            action=jnp.where(
+                params_ok,
+                next_action,
+                jnp.asarray(0, dtype=jnp.int32),
+            ),
+            policy=jnp.where(params_ok, next_policy, jnp.zeros_like(next_policy)),
+            value=jnp.where(params_ok, value, zero),
+            next_value=jnp.where(params_ok, next_value, zero),
+            td_error=jnp.where(params_ok, td_error, zero),
+            bound_metric=jnp.where(
+                params_ok, (actor_metric + critic_metric) / 2.0, zero
+            ),
+            update_applied=params_ok,
         )
 
 
@@ -466,7 +526,7 @@ def run_actor_critic_from_arrays(
     def _scan_fn(
         carry: ActorCriticState,
         inputs: tuple[Array, Array, Array, Array, Array],
-    ) -> tuple[ActorCriticState, tuple[Array, Array, Array, Array]]:
+    ) -> tuple[ActorCriticState, tuple[Array, Array, Array, Array, Array]]:
         obs, reward, term_discount, next_obs, fixed_action = inputs
         if use_fixed_actions:
             started_state = carry.replace(  # type: ignore[attr-defined]
@@ -482,14 +542,24 @@ def run_actor_critic_from_arrays(
             next_obs,
             discount=term_discount,
         )
-        return result.state, (
-            current_action,
+        next_carry = jax.lax.cond(
+            result.update_applied,
+            lambda: result.state,
+            lambda: carry,
+        )
+        return next_carry, (
+            jnp.where(
+                result.update_applied,
+                current_action,
+                jnp.asarray(0, dtype=jnp.int32),
+            ),
             result.policy,
             result.value,
             result.td_error,
+            result.update_applied,
         )
 
-    final_state, (actions, policies, values, td_errors) = jax.lax.scan(
+    final_state, (actions, policies, values, td_errors, updates_applied) = jax.lax.scan(
         _scan_fn,
         state,
         (observations, rewards, discounts, next_observations, actions),
@@ -500,6 +570,7 @@ def run_actor_critic_from_arrays(
         policies=policies,
         values=values,
         td_errors=td_errors,
+        updates_applied=updates_applied,
     )
 
 
@@ -628,6 +699,7 @@ class ContinuousActorCriticUpdateResult:
     next_value: Float[Array, ""]
     td_error: Float[Array, ""]
     bound_metric: Float[Array, ""]
+    update_applied: Bool[Array, ""]
 
 
 @chex.dataclass(frozen=True)
@@ -649,6 +721,7 @@ class ContinuousActorCriticArrayResult:
     sigmas: Float[Array, "num_steps action_dim"]
     values: Float[Array, " num_steps"]
     td_errors: Float[Array, " num_steps"]
+    updates_applied: Bool[Array, " num_steps"]
 
 
 class ContinuousActorCriticAgent:
@@ -952,22 +1025,65 @@ class ContinuousActorCriticAgent:
             critic_trace_bias=stored_critic_trace_bias,
             step_count=state.step_count + 1,
         )
-        next_action, key, next_mean, next_sigma = self.select_action(updated, observation)
-        new_state = updated.replace(
+        inputs_valid = (
+            jnp.isfinite(jnp.squeeze(reward))
+            & jnp.all(jnp.isfinite(observation))
+            & jnp.isfinite(td_error)
+            & jnp.isfinite(discount)
+            & (discount >= 0.0)
+            & (discount <= 1.0)
+            & jnp.all(jnp.isfinite(prev_mean))
+            & jnp.all(jnp.isfinite(prev_sigma))
+            & jnp.isfinite(value)
+            & jnp.isfinite(next_value)
+            & jnp.isfinite(actor_metric)
+            & jnp.isfinite(critic_metric)
+        )
+        candidate_ok = (
+            inputs_valid
+            & _floating_tree_is_finite(state)
+            & _floating_tree_is_finite(updated)
+        )
+        held = jax.lax.cond(
+            candidate_ok,
+            lambda: updated,
+            lambda: state,
+        )
+        safe_observation = jnp.where(candidate_ok, observation, state.last_observation)
+        next_action, key, next_mean, next_sigma = self.select_action(
+            held, safe_observation
+        )
+        proposed_final_state = held.replace(
             last_observation=observation,
             last_action=next_action,
             rng_key=key,
         )
+        params_ok = (
+            candidate_ok
+            & _floating_tree_is_finite(proposed_final_state)
+            & jnp.all(jnp.isfinite(next_action))
+            & jnp.all(jnp.isfinite(next_mean))
+            & jnp.all(jnp.isfinite(next_sigma))
+        )
+        new_state = jax.lax.cond(
+            params_ok,
+            lambda: proposed_final_state,
+            lambda: state,
+        )
+        zero = jnp.asarray(0.0, dtype=jnp.float32)
 
         return ContinuousActorCriticUpdateResult(  # type: ignore[call-arg]
             state=new_state,
-            action=next_action,
-            mean=next_mean,
-            sigma=next_sigma,
-            value=value,
-            next_value=next_value,
-            td_error=td_error,
-            bound_metric=(actor_metric + critic_metric) / 2.0,
+            action=jnp.where(params_ok, next_action, jnp.zeros_like(next_action)),
+            mean=jnp.where(params_ok, next_mean, jnp.zeros_like(next_mean)),
+            sigma=jnp.where(params_ok, next_sigma, jnp.zeros_like(next_sigma)),
+            value=jnp.where(params_ok, value, zero),
+            next_value=jnp.where(params_ok, next_value, zero),
+            td_error=jnp.where(params_ok, td_error, zero),
+            bound_metric=jnp.where(
+                params_ok, (actor_metric + critic_metric) / 2.0, zero
+            ),
+            update_applied=params_ok,
         )
 
 
@@ -1017,7 +1133,10 @@ def run_continuous_actor_critic_from_arrays(
     def _scan_fn(
         carry: ContinuousActorCriticState,
         inputs: tuple[Array, Array, Array, Array, Array],
-    ) -> tuple[ContinuousActorCriticState, tuple[Array, Array, Array, Array, Array]]:
+    ) -> tuple[
+        ContinuousActorCriticState,
+        tuple[Array, Array, Array, Array, Array, Array],
+    ]:
         obs, reward, term_discount, next_obs, fixed_action = inputs
         if use_fixed_actions:
             started_state = carry.replace(  # type: ignore[attr-defined]
@@ -1036,15 +1155,30 @@ def run_continuous_actor_critic_from_arrays(
             next_obs,
             discount=term_discount,
         )
-        return result.state, (
-            current_action,
-            current_mean,
-            current_sigma,
+        next_carry = jax.lax.cond(
+            result.update_applied,
+            lambda: result.state,
+            lambda: carry,
+        )
+        return next_carry, (
+            jnp.where(
+                result.update_applied, current_action, jnp.zeros_like(current_action)
+            ),
+            jnp.where(
+                result.update_applied, current_mean, jnp.zeros_like(current_mean)
+            ),
+            jnp.where(
+                result.update_applied, current_sigma, jnp.zeros_like(current_sigma)
+            ),
             result.value,
             result.td_error,
+            result.update_applied,
         )
 
-    final_state, (actions_out, means_out, sigmas_out, values, td_errors) = jax.lax.scan(
+    (
+        final_state,
+        (actions_out, means_out, sigmas_out, values, td_errors, updates_applied),
+    ) = jax.lax.scan(
         _scan_fn,
         state,
         (observations, rewards, discounts, next_observations, actions),
@@ -1056,4 +1190,5 @@ def run_continuous_actor_critic_from_arrays(
         sigmas=sigmas_out,
         values=values,
         td_errors=td_errors,
+        updates_applied=updates_applied,
     )

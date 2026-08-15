@@ -54,7 +54,7 @@ Reference:
 from __future__ import annotations
 
 import functools
-from typing import Any
+from typing import Any, cast
 
 import chex
 import jax
@@ -273,10 +273,13 @@ class CumulantDiscovery:
             & jnp.all(jnp.isfinite(proposed_biases))
             & jnp.all(jnp.isfinite(proposed_utility))
         )
-        return jax.lax.cond(
-            inputs_valid & proposed_finite,
-            lambda: proposed_state,
-            lambda: state,
+        return cast(
+            CumulantDiscoveryState,
+            jax.lax.cond(
+                inputs_valid & proposed_finite,
+                lambda: proposed_state,
+                lambda: state,
+            ),
         )
 
     @functools.partial(jax.jit, static_argnums=(0,))

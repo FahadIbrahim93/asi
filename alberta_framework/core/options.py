@@ -1010,7 +1010,7 @@ def _differential_q_update(
     avg_reward_step_size: float,
     trace_decay: float,
     n_actions: int,
-) -> tuple[Array, Array, Array, Array]:
+) -> tuple[Array, Array, Array, Array, Bool[Array, ""]]:
     """One differential SARSA Q-update step.
 
     Returns (new_q_weights, new_traces, new_average_reward, td_error).
@@ -1026,9 +1026,36 @@ def _differential_q_update(
     action_mask = jax.nn.one_hot(last_action, n_actions, dtype=jnp.float32)
     new_traces = lam * traces + action_mask[:, None] * last_obs[None, :]
     delta_w = alpha * td_error * new_traces
-    new_q_weights = q_weights + delta_w
-    new_average_reward = average_reward + beta * td_error
-    return new_q_weights, new_traces, new_average_reward, td_error
+    proposed_q = q_weights + delta_w
+    proposed_rbar = average_reward + beta * td_error
+    inputs_valid = (
+        jnp.all(jnp.isfinite(last_obs))
+        & jnp.isfinite(jnp.asarray(reward, dtype=jnp.float32))
+        & jnp.all(jnp.isfinite(next_obs))
+        & (last_action >= 0)
+        & (last_action < n_actions)
+        & jnp.all(jnp.isfinite(q_weights))
+        & jnp.all(jnp.isfinite(traces))
+        & jnp.isfinite(average_reward)
+    )
+    proposed_finite = (
+        jnp.all(jnp.isfinite(proposed_q))
+        & jnp.all(jnp.isfinite(new_traces))
+        & jnp.isfinite(proposed_rbar)
+    )
+    update_applied = inputs_valid & proposed_finite
+    new_q_weights, new_traces, new_average_reward = jax.lax.cond(
+        update_applied,
+        lambda: (proposed_q, new_traces, proposed_rbar),
+        lambda: (q_weights, traces, average_reward),
+    )
+    return (
+        new_q_weights,
+        new_traces,
+        new_average_reward,
+        jnp.where(update_applied, td_error, jnp.zeros_like(td_error)),
+        update_applied,
+    )
 
 
 def _differential_semidp_q_update(
@@ -1046,7 +1073,7 @@ def _differential_semidp_q_update(
     n_actions: int,
     baseline_mass: Array,
     discount: Array,
-) -> tuple[Array, Array, Array, Array]:
+) -> tuple[Array, Array, Array, Array, Bool[Array, ""]]:
     """Discounted differential Q-update for semi-MDP option returns.
 
     Extends :func:`_differential_q_update` to correctly account for
@@ -1089,9 +1116,38 @@ def _differential_semidp_q_update(
     action_mask = jax.nn.one_hot(last_action, n_actions, dtype=jnp.float32)
     new_traces = lam * traces + action_mask[:, None] * last_obs[None, :]
     delta_w = alpha * td_error * new_traces
-    new_q_weights = q_weights + delta_w
-    new_average_reward = average_reward + beta * td_error
-    return new_q_weights, new_traces, new_average_reward, td_error
+    proposed_q = q_weights + delta_w
+    proposed_rbar = average_reward + beta * td_error
+    inputs_valid = (
+        jnp.all(jnp.isfinite(last_obs))
+        & jnp.isfinite(jnp.asarray(reward, dtype=jnp.float32))
+        & jnp.all(jnp.isfinite(next_obs))
+        & jnp.isfinite(baseline_coefficient)
+        & jnp.isfinite(gamma_o)
+        & (last_action >= 0)
+        & (last_action < n_actions)
+        & jnp.all(jnp.isfinite(q_weights))
+        & jnp.all(jnp.isfinite(traces))
+        & jnp.isfinite(average_reward)
+    )
+    proposed_finite = (
+        jnp.all(jnp.isfinite(proposed_q))
+        & jnp.all(jnp.isfinite(new_traces))
+        & jnp.isfinite(proposed_rbar)
+    )
+    update_applied = inputs_valid & proposed_finite
+    new_q_weights, new_traces, new_average_reward = jax.lax.cond(
+        update_applied,
+        lambda: (proposed_q, new_traces, proposed_rbar),
+        lambda: (q_weights, traces, average_reward),
+    )
+    return (
+        new_q_weights,
+        new_traces,
+        new_average_reward,
+        jnp.where(update_applied, td_error, jnp.zeros_like(td_error)),
+        update_applied,
+    )
 
 
 def _update_option_model(
@@ -1235,7 +1291,7 @@ def _update_intra_option_policy(
     trace_decay: float,
     n_primitive_actions: int,
     importance_ratio: Array,
-) -> tuple[IntraOptionPoliciesState, Array]:
+) -> tuple[IntraOptionPoliciesState, Array, Bool[Array, ""]]:
     """Update one intra-option Q-function with a transition discount.
 
     ``terminated`` is the option's own termination decision (goal, duration,
@@ -1262,8 +1318,33 @@ def _update_intra_option_policy(
 
     action_mask = jax.nn.one_hot(last_intra_action, n_primitive_actions, dtype=jnp.float32)
     new_traces_i = rho * (lam * traces_i + action_mask[:, None] * last_obs[None, :])
-    new_q_i = q_i + alpha * td_error * new_traces_i
-    new_avg_r_i = avg_r_i + beta * rho * td_error
+    proposed_q_i = q_i + alpha * td_error * new_traces_i
+    proposed_avg_r_i = avg_r_i + beta * rho * td_error
+    inputs_valid = (
+        jnp.all(jnp.isfinite(last_obs))
+        & jnp.isfinite(jnp.asarray(pseudo_reward, dtype=jnp.float32))
+        & jnp.all(jnp.isfinite(next_obs))
+        & jnp.isfinite(transition_discount)
+        & jnp.isfinite(rho)
+        & (transition_discount >= 0.0)
+        & (transition_discount <= 1.0)
+        & (last_intra_action >= 0)
+        & (last_intra_action < n_primitive_actions)
+        & jnp.all(jnp.isfinite(q_i))
+        & jnp.all(jnp.isfinite(traces_i))
+        & jnp.isfinite(avg_r_i)
+    )
+    proposed_finite = (
+        jnp.all(jnp.isfinite(proposed_q_i))
+        & jnp.all(jnp.isfinite(new_traces_i))
+        & jnp.isfinite(proposed_avg_r_i)
+    )
+    update_applied = inputs_valid & proposed_finite
+    new_q_i, new_traces_i, new_avg_r_i = jax.lax.cond(
+        update_applied,
+        lambda: (proposed_q_i, new_traces_i, proposed_avg_r_i),
+        lambda: (q_i, traces_i, avg_r_i),
+    )
 
     n_opts = option_policies.average_rewards.shape[0]
     option_mask = jnp.arange(n_opts, dtype=jnp.int32) == option_idx
@@ -1272,11 +1353,15 @@ def _update_intra_option_policy(
     new_traces = option_policies.traces.at[option_idx].set(new_traces_i)
     new_avg_rewards = jnp.where(option_mask, new_avg_r_i, option_policies.average_rewards)
 
-    return IntraOptionPoliciesState(
-        q_weights=new_q_weights,
-        traces=new_traces,
-        average_rewards=new_avg_rewards,
-    ), td_error
+    return (
+        IntraOptionPoliciesState(
+            q_weights=new_q_weights,
+            traces=new_traces,
+            average_rewards=new_avg_rewards,
+        ),
+        jnp.where(update_applied, td_error, jnp.zeros_like(td_error)),
+        update_applied,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2383,7 +2468,9 @@ class STOMPAgent:
         # --- Intra-option policy update (only active when executing) ---
         # Gated on is_executing: idle steps must not pollute option 0 (the
         # clamped index) with spurious pseudo-reward updates.
-        def do_intra_update(_: None) -> tuple[IntraOptionPoliciesState, Array]:
+        def do_intra_update(
+            _: None,
+        ) -> tuple[IntraOptionPoliciesState, Array, Bool[Array, ""]]:
             return _update_intra_option_policy(
                 state.option_policies,
                 option_idx,
@@ -2400,10 +2487,16 @@ class STOMPAgent:
                 importance_ratio=option_importance_ratio,
             )
 
-        def skip_intra_update(_: None) -> tuple[IntraOptionPoliciesState, Array]:
-            return state.option_policies, jnp.array(0.0, dtype=jnp.float32)
+        def skip_intra_update(
+            _: None,
+        ) -> tuple[IntraOptionPoliciesState, Array, Bool[Array, ""]]:
+            return (
+                state.option_policies,
+                jnp.array(0.0, dtype=jnp.float32),
+                jnp.asarray(True, dtype=jnp.bool_),
+            )
 
-        new_option_policies, option_td = jax.lax.cond(
+        new_option_policies, option_td, intra_update_applied = jax.lax.cond(
             is_executing, do_intra_update, skip_intra_update, None
         )
         # A censored boundary retains the positive bootstrap above, so the
@@ -2731,6 +2824,7 @@ class STOMPAgent:
         proposed_state_valid = self.state_valid(proposed_state)
         transaction_applied = (
             transaction_preflight
+            & intra_update_applied
             & real_base_update_applied
             & nested_post_matches
             & proposed_state_valid

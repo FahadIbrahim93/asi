@@ -14,7 +14,7 @@ from alberta_framework.core.off_policy_horde import (
     OffPolicyHordeUpdateResult,
     run_off_policy_horde_learning_loop,
 )
-from alberta_framework.core.optimizers import LMS
+from alberta_framework.core.optimizers import LMS, ObGDBounding
 from alberta_framework.core.types import DemonType, GVFSpec, HordeSpec, create_horde_spec
 
 
@@ -118,6 +118,54 @@ def test_ratio_zero_blocks_that_demon_update() -> None:
     assert float(jnp.linalg.norm(result.state.head_params.weights[1] - before_w1)) > 0.0
     assert float(result.clipped_rhos[0]) == pytest.approx(0.0)
     assert float(result.clipped_rhos[1]) == pytest.approx(2.0)
+
+
+def test_infinite_cumulant_with_obgd_does_not_poison_head() -> None:
+    """Inf TD error zeros the ObGD step, then error_i*step is 0*inf=NaN."""
+    learner = OffPolicyHordeLearner(
+        _spec(gammas=(0.0, 0.0)),
+        hidden_sizes=(),
+        optimizer=LMS(step_size=0.1),
+        bounder=ObGDBounding(kappa=2.0),
+        ratio_clip=10.0,
+        sparsity=0.0,
+        use_layer_norm=False,
+    )
+    state = learner.init(2, jax.random.key(0))
+    before_w0 = state.head_params.weights[0]
+    before_w1 = state.head_params.weights[1]
+
+    poisoned = learner.update_with_ratios(
+        state,
+        jnp.array([1.0, 0.0], dtype=jnp.float32),
+        jnp.array([jnp.inf, 1.0], dtype=jnp.float32),
+        jnp.zeros(2, dtype=jnp.float32),
+        jnp.array([1.0, 1.0], dtype=jnp.float32),
+    )
+    assert bool(jnp.all(jnp.isfinite(poisoned.state.head_params.weights[0])))
+    chex.assert_trees_all_close(poisoned.state.head_params.weights[0], before_w0)
+    assert bool(jnp.all(jnp.isfinite(poisoned.state.head_params.weights[1])))
+    assert float(
+        jnp.linalg.norm(poisoned.state.head_params.weights[1] - before_w1)
+    ) > 0.0
+    assert int(poisoned.state.step_count) == int(state.step_count) + 1
+    assert bool(poisoned.update_applied)
+    chex.assert_trees_all_equal(
+        poisoned.head_updates_applied,
+        jnp.array([False, True]),
+    )
+    assert float(poisoned.td_errors[0]) == 0.0
+
+    recovered = learner.update_with_ratios(
+        poisoned.state,
+        jnp.array([1.0, 0.0], dtype=jnp.float32),
+        jnp.array([1.0, 0.5], dtype=jnp.float32),
+        jnp.zeros(2, dtype=jnp.float32),
+        jnp.array([1.0, 1.0], dtype=jnp.float32),
+    )
+    chex.assert_tree_all_finite(recovered.state.head_params)
+    assert bool(recovered.update_applied)
+    assert bool(jnp.all(recovered.head_updates_applied))
 
 
 def test_probability_api_matches_explicit_ratios() -> None:
