@@ -855,10 +855,16 @@ class TestSmokeRuns:
 
 
 class TestShardsAndMerge:
-    def _make_shard(self, tmp_path, small_data, name, seed):
+    def _make_shard(self, tmp_path, small_data, config_name, seed):
         x, y = small_data
-        result = run_screening_config(x, y, screening_spec(name), seed=seed, config=SMALL)
-        path = tmp_path / f"{name}_seed{seed}.json"
+        result = run_screening_config(
+            x,
+            y,
+            screening_spec(config_name),
+            seed=seed,
+            config=SMALL,
+        )
+        path = tmp_path / f"{config_name}_seed{seed}.json"
         path.write_text(json.dumps(shard_payload(result)), encoding="utf-8")
         return path
 
