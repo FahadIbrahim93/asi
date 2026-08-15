@@ -705,6 +705,67 @@ class TestShards:
         with pytest.raises(ValueError, match="stream config"):
             merge_micro_shards([path_a, path_b], bayes_samples=1_000)
 
+    def test_merge_rejects_hyperparameter_drift_across_seeds(self, tmp_path: Path):
+        """Two shards under one arm_name with different hyperparameters must
+        not merge: nothing else catches a registry value that changed
+        between two `run` invocations, and a silent merge would blend
+        per-regime accuracy across genuinely different mechanisms while
+        reporting only the first seed's hyperparameters as if
+        representative of the arm."""
+        path0 = micro_shard_path(tmp_path, TINY.family, "sgd_raw", 0)
+        path1 = micro_shard_path(tmp_path, TINY.family, "sgd_raw", 1)
+        result0 = run_micro_arm(TINY, "sgd_raw", seed=0, hidden1=8, hidden2=6)
+        result1 = run_micro_arm(TINY, "sgd_raw", seed=1, hidden1=8, hidden2=6)
+        write_micro_shard(path0, micro_shard_payload(result0))
+        payload1 = micro_shard_payload(result1)
+        payload1["hyperparameters"] = {
+            **payload1["hyperparameters"],
+            "step_size": payload1["hyperparameters"]["step_size"] + 1.0,
+        }
+        write_micro_shard(path1, payload1)
+
+        with pytest.raises(
+            ValueError,
+            match=r"'sgd_raw' has inconsistent hyperparameters across seeds",
+        ):
+            merge_micro_shards([path0, path1], bayes_samples=1_000)
+
+    def test_merge_rejects_mechanism_drift_across_seeds(self, tmp_path: Path):
+        """Same defect as above but on `mechanism`: seed 1's mechanism
+        string is mutated while its hyperparameters stay identical, so only
+        the mechanism check can catch it."""
+        path0 = micro_shard_path(tmp_path, TINY.family, "sgd_raw", 0)
+        path1 = micro_shard_path(tmp_path, TINY.family, "sgd_raw", 1)
+        result0 = run_micro_arm(TINY, "sgd_raw", seed=0, hidden1=8, hidden2=6)
+        result1 = run_micro_arm(TINY, "sgd_raw", seed=1, hidden1=8, hidden2=6)
+        write_micro_shard(path0, micro_shard_payload(result0))
+        payload1 = micro_shard_payload(result1)
+        payload1["mechanism"] = "mutated_mechanism_string"
+        write_micro_shard(path1, payload1)
+
+        with pytest.raises(
+            ValueError,
+            match=r"'sgd_raw' has inconsistent mechanism across seeds",
+        ):
+            merge_micro_shards([path0, path1], bayes_samples=1_000)
+
+    def test_merge_accepts_identical_hyperparameters_and_mechanism(
+        self, tmp_path: Path
+    ):
+        """Positive control: seeds that genuinely share hyperparameters and
+        mechanism must still merge under the new cross-seed consistency
+        check."""
+        paths = []
+        for seed in (0, 1):
+            result = run_micro_arm(TINY, "sgd_raw", seed=seed, hidden1=8, hidden2=6)
+            path = micro_shard_path(tmp_path, TINY.family, "sgd_raw", seed)
+            write_micro_shard(path, micro_shard_payload(result))
+            paths.append(path)
+        summary = merge_micro_shards(paths, bayes_samples=1_000)
+        entry = next(e for e in summary["results"] if e["arm_name"] == "sgd_raw")
+        assert entry["n_seeds"] == 2
+        assert entry["seeds"] == [0, 1]
+
 
 # =============================================================================
 # Canonical suite: transfer validation

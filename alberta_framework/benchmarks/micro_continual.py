@@ -911,6 +911,33 @@ def merge_micro_shards(
     for arm_name, per_seed in sorted(by_arm.items()):
         seeds = sorted(per_seed)
         all_seeds.update(seeds)
+        reference_hp = per_seed[seeds[0]]["hyperparameters"]
+        mismatched_hp = [s for s in seeds if per_seed[s]["hyperparameters"] != reference_hp]
+        if mismatched_hp:
+            # A registry entry is not literally immutable while an arm is
+            # still being tuned; shards from before and after a
+            # hyperparameter change can land in the same directory. Without
+            # this check they merge silently under one arm_name, blend
+            # per-regime accuracy across genuinely different mechanisms, and
+            # report only seeds[0]'s hyperparameters as if representative of
+            # the whole arm.
+            raise ValueError(
+                f"arm {arm_name!r} has inconsistent hyperparameters across seeds: "
+                f"seed {seeds[0]} used {reference_hp!r}, seed(s) {mismatched_hp} used "
+                "different values; refusing to merge runs with different "
+                "hyperparameters under one arm_name"
+            )
+        reference_mechanism = per_seed[seeds[0]]["mechanism"]
+        mismatched_mechanism = [
+            s for s in seeds if per_seed[s]["mechanism"] != reference_mechanism
+        ]
+        if mismatched_mechanism:
+            raise ValueError(
+                f"arm {arm_name!r} has inconsistent mechanism across seeds: "
+                f"seed {seeds[0]} used {reference_mechanism!r}, seed(s) "
+                f"{mismatched_mechanism} used different values; refusing to merge "
+                "runs of different mechanisms under one arm_name"
+            )
         curves = np.stack(
             [
                 np.asarray(per_seed[s]["per_regime_accuracy"], dtype=np.float64)
