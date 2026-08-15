@@ -187,3 +187,11 @@ def test_task_metrics_reject_missing_boundary_evaluations(
 
     with pytest.raises(ValueError, match=message):
         compute_per_task_forgetting(matrix, [0])
+
+
+@pytest.mark.parametrize("value", [np.inf, -np.inf])
+def test_task_metrics_reject_infinite_post_exposure_evaluations(value: float) -> None:
+    """Do not treat a divergent metric as an unevaluated probe gap."""
+
+    with pytest.raises(ValueError, match="infinite evaluation"):
+        compute_per_task_forgetting([[0.8], [value], [0.6]], [0])

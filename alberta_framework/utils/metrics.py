@@ -90,6 +90,8 @@ def _task_trajectories(
     trajectories: list[NDArray[np.float64]] = []
     for task, first_row in enumerate(rows):
         values = matrix[first_row:, task]
+        if np.any(np.isinf(values)):
+            raise ValueError(f"task {task} has an infinite evaluation at or after first exposure")
         if not np.isfinite(values[0]):
             raise ValueError(
                 f"task {task} has no finite evaluation at first-post-exposure checkpoint"
