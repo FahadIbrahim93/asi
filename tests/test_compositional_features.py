@@ -275,6 +275,33 @@ class TestCompositionalFeatureLearner:
         assert float(result.state.utilities[0]) == 1.5
         assert float(result.state.candidate_utilities[0]) == 1.5
 
+    def test_zero_utility_decay_does_not_multiply_inf_utilities(self) -> None:
+        """utility_decay=0 times an infinite tracker is NaN and would freeze."""
+        learner = CompositionalFeatureLearner(
+            n_features=2,
+            n_tasks=1,
+            candidate_count=1,
+            utility_decay=0.0,
+            replacement_interval=0,
+            use_obgd=False,
+        )
+        state = learner.init(feature_dim=2, key=jr.key(17))
+        state = state.replace(  # type: ignore[attr-defined]
+            utilities=jnp.full_like(state.utilities, jnp.inf),
+            candidate_utilities=jnp.full_like(state.candidate_utilities, jnp.inf),
+        )
+        raw = jnp.asarray(0.0, dtype=jnp.float32) * jnp.asarray(jnp.inf, dtype=jnp.float32)
+        assert not bool(jnp.isfinite(raw))
+
+        result = learner.update(
+            state,
+            jnp.array([1.0, -0.5], dtype=jnp.float32),
+            jnp.array([0.25], dtype=jnp.float32),
+        )
+        assert bool(result.update_applied)
+        assert bool(jnp.all(jnp.isfinite(result.state.utilities)))
+        assert bool(jnp.all(jnp.isfinite(result.state.candidate_utilities)))
+
     def test_energy_novelty_scoring_normalizes_candidate_scale(self) -> None:
         learner = CompositionalFeatureLearner(
             n_features=2,
