@@ -120,6 +120,25 @@ def multi_channel_horizon_returns(
     return jax.vmap(per_channel, in_axes=1, out_axes=1)(cumulants)
 
 
+def _validate_rmse_inputs(
+    predictions: Float[Array, "T H"],
+    forward_returns: Float[Array, "T H"],
+) -> int:
+    if (
+        predictions.ndim != 2
+        or forward_returns.ndim != 2
+        or predictions.shape != forward_returns.shape
+        or 0 in predictions.shape
+    ):
+        raise ValueError(
+            "predictions and forward_returns must be rank-2 arrays with identical "
+            "nonempty shape (T, H) "
+            f"(got predictions.shape={predictions.shape}, "
+            f"forward_returns.shape={forward_returns.shape})"
+        )
+    return predictions.shape[0]
+
+
 def per_horizon_rmse(
     predictions: Float[Array, "T H"],
     forward_returns: Float[Array, "T H"],
@@ -130,16 +149,22 @@ def per_horizon_rmse(
     Args:
         predictions: Predictions over time at each horizon, shape ``(T, H)``.
         forward_returns: Ground-truth forward-view returns, shape ``(T, H)``.
-        burn_in: Number of initial steps to skip (helps when the learner
-            has not yet warmed up). Defaults to 0.
+        burn_in: Exact built-in ``int`` number of initial steps to skip (helps
+            when the learner has not yet warmed up). Defaults to 0. When JIT
+            compiling a non-default value, close over it or mark ``burn_in``
+            static with ``static_argnames``.
 
     Returns:
         Array of shape ``(H,)`` with RMSE per horizon.
 
     Raises:
-        ValueError: If ``burn_in`` is negative or consumes the whole trace.
+        ValueError: If the arrays do not have identical nonempty ``(T, H)``
+            shapes, or if ``burn_in`` is not an exact built-in ``int`` in
+            ``[0, T)``.
     """
-    n_steps = predictions.shape[0]
+    if type(burn_in) is not int:
+        raise ValueError("burn_in must be a built-in int")
+    n_steps = _validate_rmse_inputs(predictions, forward_returns)
     if not 0 <= burn_in < n_steps:
         raise ValueError(
             f"burn_in must satisfy 0 <= burn_in < n_steps "
@@ -165,17 +190,22 @@ def per_horizon_running_rmse(
     Args:
         predictions: Shape ``(T, H)``.
         forward_returns: Shape ``(T, H)``.
-        window_size: Length of the trailing average window.
+        window_size: Exact built-in ``int`` length of the trailing average
+            window. When JIT compiling a non-default value, close over it or
+            mark ``window_size`` static with ``static_argnames``.
 
     Returns:
         Array of shape ``(T, H)``. The first ``window_size - 1`` rows are
         equal to ``running_rmse[window_size - 1]``.
 
     Raises:
-        ValueError: If ``window_size`` is non-positive or longer than the
-            trace.
+        ValueError: If the arrays do not have identical nonempty ``(T, H)``
+            shapes, or if ``window_size`` is not an exact built-in ``int`` in
+            ``[1, T]``.
     """
-    n_steps = predictions.shape[0]
+    if type(window_size) is not int:
+        raise ValueError("window_size must be a built-in int")
+    n_steps = _validate_rmse_inputs(predictions, forward_returns)
     if not 1 <= window_size <= n_steps:
         raise ValueError(
             f"window_size must satisfy 1 <= window_size <= n_steps "
