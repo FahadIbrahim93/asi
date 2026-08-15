@@ -436,10 +436,29 @@ def _parse_partial(path: Path, errors: list[str]) -> _Shard | None:
     )
 
 
+def _normalize_expected_seeds(expected_seeds: Sequence[int]) -> tuple[tuple[int, ...], list[str]]:
+    normalized = tuple(expected_seeds)
+    errors: list[str] = []
+    if not normalized:
+        errors.append("expected_seeds must not be empty")
+    for seed in normalized:
+        if isinstance(seed, bool):
+            errors.append("expected_seeds must not contain boolean values")
+        elif not isinstance(seed, int):
+            errors.append("expected_seeds must contain only integers")
+        elif seed < 0:
+            errors.append("expected_seeds must not contain negative values")
+    if not errors and len(set(normalized)) != len(normalized):
+        errors.append("expected_seeds must not contain duplicates")
+    return (normalized if not errors else ()), errors
+
+
 def _parse_partials(
     paths: Sequence[Path], expected_seeds: Sequence[int]
-) -> tuple[list[_Shard], list[str], tuple[tuple[str, str], ...]]:
+) -> tuple[list[_Shard], list[str], tuple[tuple[str, str], ...], tuple[int, ...]]:
     errors: list[str] = []
+    normalized_expected_seeds, seed_errors = _normalize_expected_seeds(expected_seeds)
+    errors.extend(seed_errors)
     normalized_paths = sorted((Path(path) for path in paths), key=lambda path: path.as_posix())
     if not normalized_paths:
         errors.append("no partial result files were supplied")
@@ -458,20 +477,22 @@ def _parse_partials(
     if len(set(observed)) != len(observed):
         errors.append("duplicate learner/seed identities occur across shards")
     expected = {
-        (learner, int(seed)) for learner in EXPECTED_HYPERPARAMETERS for seed in expected_seeds
+        (learner, seed)
+        for learner in EXPECTED_HYPERPARAMETERS
+        for seed in normalized_expected_seeds
     }
     if set(observed) != expected:
         missing = sorted(expected - set(observed))
         extra = sorted(set(observed) - expected)
         errors.append(f"shard coverage mismatch; missing={missing}, extra={extra}")
-    return shards, errors, tuple(digests)
+    return shards, errors, tuple(digests), normalized_expected_seeds
 
 
 def validate_upgd_ipmnist_partials(
     paths: Sequence[Path], *, expected_seeds: Sequence[int] = EXPECTED_SEEDS
 ) -> UPGDIPMNISTValidation:
     """Strictly validate complete raw shard coverage and primitive values."""
-    shards, errors, digests = _parse_partials(paths, expected_seeds)
+    shards, errors, digests, _ = _parse_partials(paths, expected_seeds)
     observed = tuple(sorted((shard.learner, shard.seed) for shard in shards))
     return UPGDIPMNISTValidation(
         valid=not errors,
@@ -603,14 +624,16 @@ def validate_upgd_ipmnist_artifact(
     expected_seeds: Sequence[int] = EXPECTED_SEEDS,
 ) -> UPGDIPMNISTValidation:
     """Recompute and validate a v1 result artifact from its complete shards."""
-    shards, errors, digests = _parse_partials(partial_paths, expected_seeds)
+    shards, errors, digests, normalized_expected_seeds = _parse_partials(
+        partial_paths, expected_seeds
+    )
     artifact_digest: str | None = None
     try:
         artifact, artifact_digest = _strict_json_object_with_sha256(Path(artifact_path))
     except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
         errors.append(f"{artifact_path}: {exc}")
         artifact = {}
-    expected_count = len(EXPECTED_HYPERPARAMETERS) * len(tuple(expected_seeds))
+    expected_count = len(EXPECTED_HYPERPARAMETERS) * len(normalized_expected_seeds)
     # A forged set can have the expected file count while duplicating one
     # learner/seed identity and omitting another.  Recompute aggregates only
     # after the shard matrix itself is valid; otherwise an empty learner stack

@@ -283,6 +283,44 @@ def test_expected_file_count_with_duplicate_identities_fails_without_raising(
 
 
 @pytest.mark.unit
+def test_duplicate_expected_seeds_fail_closed_before_artifact_validation(tmp_path: Path) -> None:
+    paths = _write_shards(tmp_path, seeds=(0,))
+    artifact = tmp_path / "results.v1.json"
+    artifact.write_text("{}", encoding="utf-8")
+
+    validation = validate_upgd_ipmnist_artifact(
+        artifact,
+        paths,
+        expected_seeds=(0, 0),
+    )
+
+    assert not validation.valid
+    assert any("expected_seeds must not contain duplicates" in error for error in validation.errors)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("expected_seeds", "expected_error"),
+    [
+        ((), "expected_seeds must not be empty"),
+        ((False,), "expected_seeds must not contain boolean values"),
+        ((0.0,), "expected_seeds must contain only integers"),
+        (([0],), "expected_seeds must contain only integers"),
+        ((-1,), "expected_seeds must not contain negative values"),
+    ],
+)
+def test_invalid_expected_seeds_fail_closed(
+    tmp_path: Path,
+    expected_seeds: tuple[object, ...],
+    expected_error: str,
+) -> None:
+    validation = validate_upgd_ipmnist_partials([], expected_seeds=expected_seeds)  # type: ignore[arg-type]
+
+    assert not validation.valid
+    assert any(expected_error in error for error in validation.errors)
+
+
+@pytest.mark.unit
 def test_posthoc_provenance_check_fails_when_source_and_cache_are_absent(
     tmp_path: Path,
 ) -> None:
