@@ -123,6 +123,36 @@ def test_plot_learning_curves_returns_figure_and_axes(results) -> None:
     assert {line.get_label() for line in ax.lines} == {"lms", "idbd"}
 
 
+def test_plot_learning_curves_omits_future_informed_running_mean_padding() -> None:
+    values = np.arange(6, dtype=float)[None, :]
+    finals = values[:, -1]
+    result = AggregatedResults(
+        config_name="linear",
+        seeds=[0],
+        metric_arrays={"squared_error": values},
+        summary={
+            "squared_error": MetricSummary(
+                mean=float(finals.mean()),
+                std=float(finals.std()),
+                min=float(finals.min()),
+                max=float(finals.max()),
+                n_seeds=1,
+                values=finals,
+            )
+        },
+    )
+
+    _, ax = plot_learning_curves(
+        {"linear": result},
+        window_size=3,
+        show_ci=False,
+        log_scale=False,
+    )
+
+    np.testing.assert_array_equal(ax.lines[0].get_xdata(), np.arange(2, 6))
+    np.testing.assert_allclose(ax.lines[0].get_ydata(), (1.0, 2.0, 3.0, 4.0))
+
+
 def test_plot_final_performance_bars(results) -> None:
     fig, ax = plot_final_performance_bars(results)
     assert isinstance(fig, plt.Figure)
