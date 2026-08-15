@@ -1600,6 +1600,7 @@ class TestAlphaUtility:
                 np.testing.assert_array_equal(
                     np.asarray(new_params[n]), np.asarray(expected)
                 )
+            params = new_params
 
     def test_infinite_raw_gradient_does_not_poison_log_alpha(self):
         params = init_mlp_params(jr.key(0), SMALL)
