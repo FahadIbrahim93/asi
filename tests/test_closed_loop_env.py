@@ -18,6 +18,9 @@ from alberta_framework.streams import (
     SwitchingTwoStateMDP,
 )
 
+_INT32_MAX = 2**31 - 1
+_INVALID_PHASE_LENGTHS = (0, -1, False, True, 1.5, None, 2**31, 10**100)
+
 
 def _rollout_two_state(
     env: SwitchingTwoStateMDP,
@@ -121,13 +124,23 @@ class TestSwitchingTwoStateDynamics:
         assert float(reward_a) == 1.0
         assert float(reward_b) == 0.0
 
-    @pytest.mark.parametrize("phase_length", [0, -1, False, True, 1.5, None])
+    @pytest.mark.parametrize("phase_length", _INVALID_PHASE_LENGTHS)
     def test_invalid_phase_length_raises(self, phase_length):
-        """Schedule divisors must be built-in positive integers."""
-        with pytest.raises(ValueError, match="phase_length must be a positive integer"):
+        """Schedule divisors must be built-in positive JAX-int32 integers."""
+        with pytest.raises(
+            ValueError,
+            match=rf"phase_length must be a positive integer in \[1, {_INT32_MAX}\]",
+        ):
             SwitchingTwoStateMDP(
                 SwitchingTwoStateConfig(phase_length=phase_length)  # type: ignore[arg-type]
             )
+
+    def test_int32_max_phase_length_runs_first_eager_and_jit_query(self):
+        """The largest JAX-int32 phase divisor is accepted without overflow."""
+        env = SwitchingTwoStateMDP(SwitchingTwoStateConfig(phase_length=_INT32_MAX))
+        state = env.init(jr.key(0))
+        assert int(env.phase_id(state)) == PHASE_A
+        assert int(jax.jit(env.phase_id)(state)) == PHASE_A
 
     def test_invalid_payoff_shape_raises(self):
         """Payoff matrices must preserve the fixed state/action shape."""

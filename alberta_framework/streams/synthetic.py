@@ -18,11 +18,20 @@ from jaxtyping import Float, Int, PRNGKeyArray
 from alberta_framework.core.types import TimeStep
 from alberta_framework.streams.base import ScanStream
 
+_INT32_MAX = 2**31 - 1
+
 
 def _require_positive_int(name: str, value: object) -> int:
-    """Reject 0 / negative / bool / non-int schedule moduli (``n % 0``, ``t / 0``)."""
-    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-        raise ValueError(f"{name} must be a positive integer, got {value!r}")
+    """Require a positive schedule modulus representable by JAX's int32 clock."""
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < 1
+        or value > _INT32_MAX
+    ):
+        raise ValueError(
+            f"{name} must be a positive integer in [1, {_INT32_MAX}], got {value!r}"
+        )
     return value
 
 
@@ -254,7 +263,7 @@ class AbruptChangeStream:
 
     Attributes:
         feature_dim: Dimension of observation vectors
-        change_interval: Number of steps between weight changes
+        change_interval: Positive int32 number of steps between weight changes
         noise_std: Standard deviation of observation noise
         feature_std: Standard deviation of features
     """
@@ -270,7 +279,7 @@ class AbruptChangeStream:
 
         Args:
             feature_dim: Dimension of feature vectors
-            change_interval: Steps between abrupt weight changes
+            change_interval: Positive int32 steps between abrupt weight changes
             noise_std: Std dev of target noise
             feature_std: Std dev of feature values
         """
@@ -373,7 +382,7 @@ class SuttonExperiment1Stream:
     Attributes:
         num_relevant: Number of relevant inputs (default 5)
         num_irrelevant: Number of irrelevant inputs (default 15)
-        change_interval: Steps between sign changes (default 20)
+        change_interval: Positive int32 steps between sign changes (default 20)
     """
 
     def __init__(
@@ -389,7 +398,7 @@ class SuttonExperiment1Stream:
         Args:
             num_relevant: Number of relevant inputs with ±1 weights
             num_irrelevant: Number of irrelevant inputs with 0 weights
-            change_interval: Number of steps between sign flips
+            change_interval: Positive int32 number of steps between sign flips
             noise_std: Std dev of additive target noise (0.0 = the
                 noise-free paper task)
             bias_drift_rate: Per-step random-walk std dev applied to the
@@ -505,8 +514,8 @@ class CyclicStream:
 
     Attributes:
         feature_dim: Dimension of observation vectors
-        cycle_length: Number of steps per configuration before switching
-        num_configurations: Number of weight configurations to cycle through
+        cycle_length: Positive int32 steps per configuration before switching
+        num_configurations: Positive int32 number of weight configurations
         noise_std: Standard deviation of observation noise
         feature_std: Standard deviation of features
     """
@@ -523,8 +532,8 @@ class CyclicStream:
 
         Args:
             feature_dim: Dimension of feature vectors
-            cycle_length: Steps spent in each configuration
-            num_configurations: Number of configurations to cycle through
+            cycle_length: Positive int32 steps spent in each configuration
+            num_configurations: Positive int32 number of configurations to cycle through
             noise_std: Std dev of target noise
             feature_std: Std dev of feature values
         """
@@ -621,7 +630,7 @@ class PeriodicChangeStream:
 
     Attributes:
         feature_dim: Dimension of observation vectors
-        period: Number of steps for one complete oscillation
+        period: Positive int32 steps for one complete oscillation
         amplitude: Magnitude of weight oscillation
         noise_std: Standard deviation of observation noise
         feature_std: Standard deviation of features
@@ -639,7 +648,7 @@ class PeriodicChangeStream:
 
         Args:
             feature_dim: Dimension of feature vectors
-            period: Steps for one complete oscillation cycle
+            period: Positive int32 steps for one complete oscillation cycle
             amplitude: Magnitude of weight oscillations around base
             noise_std: Std dev of target noise
             feature_std: Std dev of feature values
@@ -880,8 +889,8 @@ class DynamicScaleShiftStream:
 
     Attributes:
         feature_dim: Dimension of observation vectors
-        scale_change_interval: Steps between scale changes
-        weight_change_interval: Steps between weight changes
+        scale_change_interval: Positive int32 steps between scale changes
+        weight_change_interval: Positive int32 steps between weight changes
         min_scale: Minimum scale factor
         max_scale: Maximum scale factor
         noise_std: Standard deviation of observation noise
@@ -900,8 +909,8 @@ class DynamicScaleShiftStream:
 
         Args:
             feature_dim: Dimension of feature vectors
-            scale_change_interval: Steps between abrupt scale changes
-            weight_change_interval: Steps between abrupt weight changes
+            scale_change_interval: Positive int32 steps between abrupt scale changes
+            weight_change_interval: Positive int32 steps between abrupt weight changes
             min_scale: Minimum scale factor (log-uniform sampling)
             max_scale: Maximum scale factor (log-uniform sampling)
             noise_std: Std dev of target noise

@@ -57,6 +57,7 @@ RIGHT_ACTION = 1
 # Payoff matrices are indexed ``payoff[state, action]``.
 _TWO_STATE_N = 2
 _TWO_STATE_ACTIONS = 2
+_INT32_MAX = 2**31 - 1
 
 
 def _stationary_average_reward(
@@ -97,8 +98,9 @@ class SwitchingTwoStateConfig:
     """Configuration for :class:`SwitchingTwoStateMDP`.
 
     Attributes:
-        phase_length: Transitions per reward phase. The active payoff matrix
-            alternates ``A -> B -> A -> ...`` every ``phase_length`` steps.
+        phase_length: Positive int32 transitions per reward phase. The active
+            payoff matrix alternates ``A -> B -> A -> ...`` every
+            ``phase_length`` steps.
         payoffs_a: Phase-A payoff matrix as nested tuples,
             ``payoffs_a[state][action]``. The default rewards *toggling*:
             in state 0 take action 1, in state 1 take action 0.
@@ -147,9 +149,11 @@ class SwitchingTwoStateMDP:
             isinstance(config.phase_length, bool)
             or not isinstance(config.phase_length, int)
             or config.phase_length < 1
+            or config.phase_length > _INT32_MAX
         ):
             raise ValueError(
-                f"phase_length must be a positive integer, got {config.phase_length!r}"
+                "phase_length must be a positive integer in "
+                f"[1, {_INT32_MAX}], got {config.phase_length!r}"
             )
         phase_payoffs = []
         for name in ("payoffs_a", "payoffs_b"):

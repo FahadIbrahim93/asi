@@ -37,9 +37,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Made evidence, IPMNIST-screening, and micro-continual artifact loaders plus the
   Label-EMNIST array-cache metadata loader reject duplicate JSON object keys at every nesting
   depth instead of silently retaining the last value.
-- Rejected zero, negative, boolean, and non-integer schedule divisors in synthetic and
-  closed-loop streams before JAX modulo, floor-division, or periodic arithmetic can silently
-  corrupt a regime clock; positive integer schedules retain their existing trajectories.
+- Rejected out-of-int32-range, zero, negative, boolean, and non-integer schedule divisors in
+  synthetic and closed-loop streams before JAX modulo, floor-division, or periodic arithmetic
+  can silently corrupt a regime clock or raise late overflow errors; valid int32 schedules
+  retain their existing trajectories.
 - Made experiment CSV and JSON artifacts preserve finite binary64 measurements exactly. A
   shared preflight now requires nonempty aggregates, canonical uint32 seed identities,
   aligned nonempty metric arrays and summary samples, and finite measurements before touching
