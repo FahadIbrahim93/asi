@@ -3490,6 +3490,25 @@ class RLSHeadState:
 _RLS_HEAD_BODY = ("w1", "b1", "w2", "b2")
 
 
+@chex.dataclass(frozen=True)
+class RLSHeadL2InitState:
+    """Opt-in RLS carry with an immutable body-initialization snapshot.
+
+    This distinct state keeps the incumbent :class:`RLSHeadState` schema
+    unchanged.  ``init_params`` contains exactly the four residual-trained
+    body tensors; the parallel protocol head and the RLS state are not part
+    of the L2-to-initialization mechanism.
+    """
+
+    utility: dict[str, Array]
+    step: Array
+    norm: EMANormState
+    fast_mean: Array
+    p: Array
+    wout: Array
+    init_params: dict[str, Array]
+
+
 def _rls_head_hp(**overrides: float) -> dict[str, float]:
     """Champion (``sigma0_shiftnorm_d099``) constants plus RLS-head defaults.
 
@@ -3522,8 +3541,47 @@ def _rls_head_hp(**overrides: float) -> dict[str, float]:
     return merged
 
 
+def _rls_head_l2init_hp() -> dict[str, float]:
+    """Frozen issue-#14 endpoint: incumbent plus body L2-Init."""
+    return {
+        **_rls_head_hp(
+            rls_lambda=1.0,
+            rls_reset_frac=0.05,
+            head_resid=1.0,
+        ),
+        "decay_to_init": 1.0,
+    }
+
+
+def _make_rls_head_l2init_learner(
+    hp: Mapping[str, float],
+) -> tuple[LearnerInitFn, ScreeningStepFn]:
+    """Build the one frozen body-only L2-Init arm, failing closed on drift."""
+    expected = _rls_head_l2init_hp()
+    if set(hp) != set(expected):
+        raise ValueError(
+            "frozen L2-Init configuration requires exactly the registered keys"
+        )
+    invalid = [
+        name
+        for name, expected_value in expected.items()
+        if type(hp[name]) is not float
+        or not math.isfinite(hp[name])
+        or hp[name].hex() != expected_value.hex()
+    ]
+    if invalid:
+        raise ValueError(
+            "frozen L2-Init configuration differs at: " + ", ".join(invalid)
+        )
+    base_hp = dict(hp)
+    del base_hp["decay_to_init"]
+    return _make_rls_head_learner(base_hp, _decay_to_init=True)
+
+
 def _make_rls_head_learner(
     hp: Mapping[str, float],
+    *,
+    _decay_to_init: bool = False,
 ) -> tuple[LearnerInitFn, ScreeningStepFn]:
     """Champion body + streaming-RLS readout on the penultimate features.
 
@@ -3541,7 +3599,11 @@ def _make_rls_head_learner(
        ``d(0.5*||onehot - wout.T @ phi||^2)/d(body)`` with ``wout`` held
        constant (w3/b3 untouched, zero-utility gate guarded to 0.5).
        The frozen ``gate_scale = 0`` endpoint instead applies plain decayed
-       SGD to that residual gradient and skips all utility bookkeeping.
+       SGD to that residual gradient and skips all utility bookkeeping.  The
+       private, opt-in L2-Init composition changes only the four residual
+       body tensors' decay target; it has a distinct state and strict
+       registered factory so the incumbent path and state schema remain
+       unchanged.
     4. Sherman-Morrison RLS with forgetting ``rls_lambda`` (symmetrized P,
        the rff_rls equations), then the optional detector-driven P reset
        (``mean(shifted) >= rls_reset_frac`` => ``p = eye/ridge``, wout kept).
@@ -3551,7 +3613,8 @@ def _make_rls_head_learner(
     """
     step_size = hp["step_size"]
     utility_decay = hp["utility_decay"]
-    param_decay = 1.0 - step_size * hp["weight_decay"]
+    weight_decay = hp["weight_decay"]
+    param_decay = 1.0 - step_size * weight_decay
     rls_lambda = hp["rls_lambda"]
     ridge_init = hp["rls_ridge_init"]
     reset_frac = hp["rls_reset_frac"]
@@ -3567,6 +3630,8 @@ def _make_rls_head_learner(
     gate_enabled = gate_scale == 1.0
     if not gate_enabled and not resid:
         raise ValueError("gate_scale=0.0 is supported only for the residual body")
+    if _decay_to_init and (not resid or not gate_enabled):
+        raise ValueError("L2-Init is supported only for the gated residual body")
 
     def normalize(
         state: EMANormState, fast_mean: Array, x: Array
@@ -3581,10 +3646,28 @@ def _make_rls_head_learner(
             shift_refractory=hp["shift_refractory"],
         )
 
-    def init_fn(params: dict[str, Array]) -> RLSHeadState:
+    def init_fn(
+        params: dict[str, Array],
+    ) -> RLSHeadState | RLSHeadL2InitState:
         input_dim = params["w1"].shape[0]
         m = params["w2"].shape[1] + 1
         n_classes = params["w3"].shape[1]
+        if _decay_to_init:
+            return RLSHeadL2InitState(  # type: ignore[call-arg]
+                utility={
+                    name: jnp.zeros_like(value) for name, value in params.items()
+                },
+                step=jnp.array(0, dtype=jnp.int32),
+                norm=EMANormState(  # type: ignore[call-arg]
+                    mean=jnp.zeros(input_dim, dtype=jnp.float32),
+                    var=jnp.ones(input_dim, dtype=jnp.float32),
+                    count=jnp.zeros(input_dim, dtype=jnp.float32),
+                ),
+                fast_mean=jnp.zeros(input_dim, dtype=jnp.float32),
+                p=jnp.eye(m, dtype=jnp.float32) / ridge_init,
+                wout=jnp.zeros((m, n_classes), dtype=jnp.float32),
+                init_params={name: params[name] for name in _RLS_HEAD_BODY},
+            )
         return RLSHeadState(  # type: ignore[call-arg]
             utility={name: jnp.zeros_like(value) for name, value in params.items()},
             step=jnp.array(0, dtype=jnp.int32),
@@ -3612,6 +3695,7 @@ def _make_rls_head_learner(
         count: Array,
         names: tuple[str, ...],
         guard_zero_max: bool,
+        init_params: Mapping[str, Array] | None = None,
     ) -> tuple[dict[str, Array], dict[str, Array]]:
         """Champion utility-EMA + global-max sigmoid gate + gated decayed SGD
         over ``names``; other tensors pass through with untouched utility."""
@@ -3630,25 +3714,52 @@ def _make_rls_head_learner(
             global_max = jnp.where(global_max == 0.0, 1.0, global_max)
         new_params = dict(params)
         for name in names:
-            new_params[name] = params[name] * param_decay - step_size * (
-                grads[name]
-                * (
-                    1.0
-                    - jax.nn.sigmoid(
-                        (new_utility[name] / bias_correction) / global_max
+            if init_params is None:
+                # Keep the incumbent expression byte-for-byte unchanged.
+                new_params[name] = params[name] * param_decay - step_size * (
+                    grads[name]
+                    * (
+                        1.0
+                        - jax.nn.sigmoid(
+                            (new_utility[name] / bias_correction) / global_max
+                        )
                     )
                 )
-            )
+            else:
+                new_params[name] = (
+                    params[name]
+                    - step_size
+                    * weight_decay
+                    * (params[name] - init_params[name])
+                    - step_size
+                    * (
+                        grads[name]
+                        * (
+                            1.0
+                            - jax.nn.sigmoid(
+                                (new_utility[name] / bias_correction) / global_max
+                            )
+                        )
+                    )
+                )
         return new_params, new_utility
 
     def full_step(
         params: dict[str, Array],
-        state: RLSHeadState,
+        state: RLSHeadState | RLSHeadL2InitState,
         x: Array,
         y: Array,
         key: Array,
-    ) -> tuple[dict[str, Array], RLSHeadState, StepMetrics]:
+    ) -> tuple[
+        dict[str, Array], RLSHeadState | RLSHeadL2InitState, StepMetrics
+    ]:
         del key  # sigma-0 body, closed-form head: no randomness consumed
+        if _decay_to_init:
+            if not isinstance(state, RLSHeadL2InitState):
+                raise TypeError("L2-Init learner requires RLSHeadL2InitState")
+            init_params: Mapping[str, Array] | None = state.init_params
+        else:
+            init_params = None
         x_norm, new_norm, new_fast, shifted = normalize(
             state.norm, state.fast_mean, x
         )
@@ -3683,6 +3794,7 @@ def _make_rls_head_learner(
                     count,
                     _RLS_HEAD_BODY,
                     guard_zero_max=True,
+                    init_params=init_params,
                 )
             else:
                 # Issue #52's frozen ablation endpoint: do not compute or
@@ -3733,6 +3845,17 @@ def _make_rls_head_learner(
         plasticity = jnp.clip(
             1.0 - loss_after / jnp.maximum(loss, _PLASTICITY_LOSS_FLOOR), 0.0, 1.0
         )
+        if _decay_to_init:
+            assert isinstance(state, RLSHeadL2InitState)
+            return new_params, RLSHeadL2InitState(  # type: ignore[call-arg]
+                utility=new_utility,
+                step=count,
+                norm=new_norm,
+                fast_mean=new_fast,
+                p=new_p,
+                wout=new_wout,
+                init_params=state.init_params,
+            ), (accuracy, loss, plasticity)
         return new_params, RLSHeadState(  # type: ignore[call-arg]
             utility=new_utility,
             step=count,
@@ -6070,6 +6193,23 @@ def _build_registry() -> dict[str, ScreeningSpec]:
                 ),
             )
         )
+    specs.append(
+        ScreeningSpec(
+            name="rls_head_resid_l1_preset005_l2init",
+            base_learner="upgd_w",
+            mechanism="rls_readout",
+            hyperparameters=_rls_head_l2init_hp(),
+            factory=_make_rls_head_l2init_learner,
+            frozen_probe_input=_rls_head_frozen_probe_input,
+            description=(
+                "Code-only issue-#14 endpoint: the exact "
+                "rls_head_resid_l1_preset005 incumbent with decoupled "
+                "L2-to-initialization on w1/b1/w2/b2 only; w3/b3 and the "
+                "RLS recursion are unchanged. This registry entry has no "
+                "result artifact and does not authorize execution."
+            ),
+        )
+    )
     # --- Optimizer-floor hybrid wave (section (s) factories): Adam-class
     # step adaptation under the champion's full stability package.  The
     # naive composition adamw_cbp_ema_norm proved Adam-class task-1
