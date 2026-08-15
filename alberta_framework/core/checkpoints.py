@@ -69,9 +69,8 @@ def save_checkpoint(
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    meta_to_save = {_VERSION_KEY: _FORMAT_VERSION}
-    if metadata is not None:
-        meta_to_save.update(metadata)
+    meta_to_save = dict(metadata) if metadata is not None else {}
+    meta_to_save[_VERSION_KEY] = _FORMAT_VERSION
 
     with ocp.Checkpointer(ocp.CompositeCheckpointHandler()) as ckptr:
         ckptr.save(

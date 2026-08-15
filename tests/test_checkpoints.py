@@ -3,6 +3,7 @@
 import chex
 import jax.numpy as jnp
 import jax.random as jr
+import orbax.checkpoint as ocp
 import pytest
 
 from alberta_framework import (
@@ -183,6 +184,26 @@ class TestMetadata:
         _, loaded_meta = load_checkpoint(state, tmp_path / "nometa")
 
         assert loaded_meta == {}
+
+    def test_user_metadata_cannot_override_internal_format_version(self, tmp_path):
+        """The on-disk format stamp must describe the actual saver format."""
+        learner = LinearLearner()
+        state = learner.init(feature_dim=5)
+        path = tmp_path / "reserved_metadata"
+
+        save_checkpoint(
+            state,
+            path,
+            metadata={"_format_version": 999, "epoch": 7},
+        )
+
+        with ocp.Checkpointer(ocp.CompositeCheckpointHandler()) as ckptr:
+            restored = ckptr.restore(
+                str(path),
+                args=ocp.args.Composite(metadata=ocp.args.JsonRestore()),
+            )
+
+        assert dict(restored.metadata) == {"_format_version": 2, "epoch": 7}
 
     def test_checkpoint_directory_created(self, tmp_path):
         """Checkpoint should be saved as a directory with state/ subdirectory."""
