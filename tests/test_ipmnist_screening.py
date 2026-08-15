@@ -809,6 +809,30 @@ class TestShardsAndMerge:
         control = next(e for e in summary["results"] if e["config_name"] == "upgd_w_control")
         assert "paired_vs_control" not in control
 
+    def test_load_shard_rejects_duplicate_top_level_key(self, tmp_path, small_data):
+        path = self._make_shard(tmp_path, small_data, "upgd_w_control", 0)
+        payload = path.read_text(encoding="utf-8")
+        doctored = payload.replace('"seed": 0', '"seed": 999999, "seed": 0', 1)
+        assert doctored != payload
+        path.write_text(doctored, encoding="utf-8")
+
+        with pytest.raises(ValueError, match=r"duplicate JSON object key: seed"):
+            load_shard(path)
+
+    def test_load_shard_rejects_duplicate_nested_key(self, tmp_path, small_data):
+        path = self._make_shard(tmp_path, small_data, "upgd_w_control", 0)
+        payload = path.read_text(encoding="utf-8")
+        doctored = payload.replace(
+            '"config": {"n_tasks":',
+            '"config": {"n_tasks": 999999, "n_tasks":',
+            1,
+        )
+        assert doctored != payload
+        path.write_text(doctored, encoding="utf-8")
+
+        with pytest.raises(ValueError, match=r"duplicate JSON object key: n_tasks"):
+            load_shard(path)
+
     def test_merge_rejects_zero_seed_overlap_with_control(self, tmp_path, small_data):
         """An arm sharing no seeds with a present control must refuse to merge:
         the entry would rank in the summary with no paired_vs_control block and

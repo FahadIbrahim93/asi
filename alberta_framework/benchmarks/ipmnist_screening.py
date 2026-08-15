@@ -6980,9 +6980,22 @@ def shard_payload(result: ScreeningRunResult) -> dict[str, Any]:
     }
 
 
+def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """Build one JSON object while refusing ambiguous duplicate keys."""
+    parsed: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in parsed:
+            raise ValueError(f"duplicate JSON object key: {key}")
+        parsed[key] = value
+    return parsed
+
+
 def load_shard(path: Path) -> dict[str, Any]:
     """Load and structurally validate one screening shard."""
-    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    payload = json.loads(
+        Path(path).read_text(encoding="utf-8"),
+        object_pairs_hook=_reject_duplicate_json_keys,
+    )
     if not isinstance(payload, dict) or payload.get("schema") != SHARD_SCHEMA:
         raise ValueError(f"{path}: not an {SHARD_SCHEMA} shard")
     config = IPMNISTConfig(**payload["config"])
