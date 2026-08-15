@@ -336,6 +336,32 @@ class TestFixedBudgetFeatureLearner:
         chex.assert_tree_all_finite(result.metrics)
         assert int(result.state.step_count) == 1
 
+    def test_zero_utility_decay_does_not_multiply_inf_utilities(self) -> None:
+        """utility_decay=0 times an infinite tracker is NaN and would freeze."""
+        learner = FixedBudgetFeatureLearner(
+            n_features=4,
+            n_tasks=2,
+            candidate_count=2,
+            replacement_interval=0,
+            utility_decay=0.0,
+        )
+        state = learner.init(feature_dim=3, key=jr.key(4))
+        state = state.replace(
+            utilities=jnp.full_like(state.utilities, jnp.inf),
+            candidate_utilities=jnp.full_like(state.candidate_utilities, jnp.inf),
+        )
+        raw = jnp.asarray(0.0, dtype=jnp.float32) * jnp.asarray(jnp.inf, dtype=jnp.float32)
+        assert not bool(jnp.isfinite(raw))
+
+        result = learner.update(
+            state,
+            jnp.array([0.1, -0.2, 0.3], dtype=jnp.float32),
+            jnp.array([1.0, -1.0], dtype=jnp.float32),
+        )
+        assert bool(result.update_applied)
+        assert bool(jnp.all(jnp.isfinite(result.state.utilities)))
+        assert bool(jnp.all(jnp.isfinite(result.state.candidate_utilities)))
+
     def test_constructed_and_augmented_feature_shapes(self) -> None:
         learner = FixedBudgetFeatureLearner(n_features=6, n_tasks=2)
         state = learner.init(feature_dim=4, key=jr.key(14))

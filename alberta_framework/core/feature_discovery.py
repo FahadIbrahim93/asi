@@ -44,6 +44,11 @@ from alberta_framework.core.update_safety import (
     select_transaction,
 )
 
+
+def _skip_zero_scale(scale: Array, value: Array) -> Array:
+    """Return 0 when ``scale`` is 0 so IEEE ``0 * inf`` does not become NaN."""
+    return jnp.where(scale == 0.0, jnp.zeros_like(value), scale * value)
+
 GENERATOR_RANDOM = 0
 GENERATOR_MUTATE_PARENT = 1
 GENERATOR_IMPRINT = 2
@@ -553,10 +558,10 @@ class FixedBudgetFeatureLearner:
         active_mask: Array,
     ) -> Array:
         """Track active target heads for opt-in task-balanced utility."""
-        return (
-            self._task_activity_decay * old_activity
-            + (1.0 - self._task_activity_decay) * active_mask.astype(jnp.float32)
-        )
+        decay = jnp.asarray(self._task_activity_decay, dtype=old_activity.dtype)
+        return _skip_zero_scale(decay, old_activity) + (
+            1.0 - decay
+        ) * active_mask.astype(jnp.float32)
 
     def _output_utility_signal(
         self,
@@ -747,13 +752,12 @@ class FixedBudgetFeatureLearner:
 
     def _utility_update(self, old_utilities: Array, utility_signal: Array) -> Array:
         """Update utility, optionally retaining recurrent-context peaks longer."""
-        ema = (
-            self._utility_decay * old_utilities
-            + (1.0 - self._utility_decay) * utility_signal
-        )
+        decay = jnp.asarray(self._utility_decay, dtype=old_utilities.dtype)
+        ema = _skip_zero_scale(decay, old_utilities) + (1.0 - decay) * utility_signal
         if self._utility_retention_decay is None:
             return ema
-        retained = self._utility_retention_decay * old_utilities
+        retention = jnp.asarray(self._utility_retention_decay, dtype=old_utilities.dtype)
+        retained = _skip_zero_scale(retention, old_utilities)
         return jnp.maximum(ema, retained)
 
     def _resource_weights(self, log_weights: Array) -> Array:
@@ -784,8 +788,9 @@ class FixedBudgetFeatureLearner:
             -self._resource_advantage_clip,
             self._resource_advantage_clip,
         )
+        discount = jnp.asarray(self._resource_discount, dtype=log_weights.dtype)
         new_log_weights = (
-            self._resource_discount * log_weights
+            _skip_zero_scale(discount, log_weights)
             + self._resource_learning_rate * advantages
         )
         return new_log_weights - jnp.mean(new_log_weights)
@@ -920,7 +925,24 @@ class FixedBudgetFeatureLearner:
         targets: Array,
     ) -> FeatureDiscoveryUpdateResult:
         """Perform one temporally-uniform feature-discovery update."""
-        source_state_finite = floating_tree_is_finite(state)
+        previous_checked = state
+        if self._utility_decay == 0.0:
+            previous_checked = previous_checked.replace(
+                utilities=jnp.zeros_like(state.utilities),
+                candidate_utilities=jnp.zeros_like(state.candidate_utilities),
+            )
+        if self._task_activity_decay == 0.0:
+            previous_checked = previous_checked.replace(
+                task_activity_ema=jnp.zeros_like(state.task_activity_ema),
+            )
+        if self._resource_discount == 0.0:
+            previous_checked = previous_checked.replace(
+                generator_log_weights=jnp.zeros_like(state.generator_log_weights),
+                generator_utility_ema=jnp.zeros_like(state.generator_utility_ema),
+                plasticity_log_weights=jnp.zeros_like(state.plasticity_log_weights),
+                plasticity_signal_ema=jnp.zeros_like(state.plasticity_signal_ema),
+            )
+        source_state_finite = floating_tree_is_finite(previous_checked)
         inputs_valid = (
             jnp.all(jnp.isfinite(observation))
             & jnp.all(jnp.isfinite(targets) | jnp.isnan(targets))
@@ -1482,10 +1504,13 @@ class FixedBudgetFeatureLearner:
                 new_candidate_utilities,
                 candidate_generator,
             )
+            resource_discount = jnp.asarray(
+                self._resource_discount, dtype=generator_utility_ema.dtype
+            )
             generator_utility_ema = jnp.where(
                 generator_finite,
-                self._resource_discount * generator_utility_ema
-                + (1.0 - self._resource_discount) * generator_scores,
+                _skip_zero_scale(resource_discount, generator_utility_ema)
+                + (1.0 - resource_discount) * generator_scores,
                 generator_utility_ema,
             )
             generator_log_weights = self._resource_log_weight_update(
@@ -1528,10 +1553,9 @@ class FixedBudgetFeatureLearner:
             plasticity_scores = jnp.stack(
                 [-pressure, jnp.array(0.0, dtype=jnp.float32), pressure]
             )
-            plasticity_signal_ema = (
-                self._resource_discount * plasticity_signal_ema
-                + (1.0 - self._resource_discount) * plasticity_scores
-            )
+            plasticity_signal_ema = _skip_zero_scale(
+                resource_discount, plasticity_signal_ema
+            ) + (1.0 - resource_discount) * plasticity_scores
             plasticity_log_weights = self._resource_log_weight_update(
                 plasticity_log_weights,
                 plasticity_weights,
