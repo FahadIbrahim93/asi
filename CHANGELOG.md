@@ -34,6 +34,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Rejected nonfinite and out-of-range Pavlovian phase contingencies before they can
+  silently behave like zero- or certain-reinforcement probabilities.
 - Preserved every leading batch axis when applying gauntlet EMA smoothing along the last
   axis, fixing rank-three and higher inputs while retaining rank-one and rank-two behavior.
 - Made the pair-, triple-, and micro-component stream generators select exactly their
