@@ -988,6 +988,44 @@ class TestShardsAndMerge:
         with pytest.raises(ValueError, match="duplicate shard"):
             merge_shards([p1, p2])
 
+    def test_merge_rejects_environment_drift_across_shards(self, tmp_path, small_data):
+        """Shards recorded under different jax/numpy/python/platform
+        combinations must not merge silently: #46 already documents a real,
+        measured divergence on exactly this axis for this codebase, and
+        nothing else in merge_shards reads or compares the `environment`
+        field shard_payload writes."""
+        p0 = self._make_shard(tmp_path, small_data, "upgd_w_control", 0)
+        p1 = self._make_shard(tmp_path, small_data, "upgd_w_control", 1)
+
+        payload1 = json.loads(p1.read_text(encoding="utf-8"))
+        payload1["environment"] = {
+            "jax": "0.4.20",
+            "numpy": "1.26.4",
+            "python": "3.11.9",
+            "platform": "Linux-5.15-x86_64",
+        }
+        p1.write_text(json.dumps(payload1), encoding="utf-8")
+
+        with pytest.raises(
+            ValueError,
+            match=r"shards were produced under different environments",
+        ):
+            merge_shards([p0, p1], control_name="upgd_w_control", slope_window=2)
+
+    def test_merge_carries_consistent_environment_into_summary(
+        self, tmp_path, small_data
+    ):
+        """Positive control: shards that genuinely share one environment
+        still merge, and the published summary carries that environment
+        forward at the top level so the artifact is self-describing."""
+        p0 = self._make_shard(tmp_path, small_data, "upgd_w_control", 0)
+        p1 = self._make_shard(tmp_path, small_data, "upgd_w_control", 1)
+        expected_environment = json.loads(p0.read_text(encoding="utf-8"))["environment"]
+
+        summary = merge_shards([p0, p1], control_name="upgd_w_control", slope_window=2)
+
+        assert summary["environment"] == expected_environment
+
     def test_validate_proxy_prefix_and_ordering(self, tmp_path, small_data):
         x, y = small_data
         partials = tmp_path / "partials"

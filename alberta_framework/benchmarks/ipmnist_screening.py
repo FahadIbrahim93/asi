@@ -7027,6 +7027,31 @@ def merge_shards(
             "approximation); merge them separately"
         )
     noise_mode = noise_modes.pop()
+    reference_environment = shards[0]["environment"]
+    mismatched_environment: dict[str, set[str]] = {}
+    for shard in shards[1:]:
+        for key, value in shard["environment"].items():
+            if value != reference_environment.get(key):
+                shard_id = f"{shard['config_name']} seed={shard['seed']}"
+                mismatched_environment.setdefault(key, set()).add(shard_id)
+    if mismatched_environment:
+        # jax/numpy/python/platform drift across shards for one merge is a
+        # real, measured hazard on this codebase (#46): a derived metric can
+        # reassociate by ~1e-8 despite bitwise-identical accuracy/loss
+        # trajectories. shard_payload records `environment` per shard but
+        # nothing previously compared it, so two shards from different
+        # runners merged and paired against the control with no flag
+        # anywhere in the artifact.
+        detail = "; ".join(
+            f"{key}: {sorted(shard_ids)}"
+            for key, shard_ids in sorted(mismatched_environment.items())
+        )
+        raise ValueError(
+            f"shards were produced under different environments ({detail}); "
+            "refusing to merge runs from mismatched jax/numpy/python/platform "
+            "combinations"
+        )
+    environment = dict(reference_environment)
     by_config: dict[str, dict[int, dict[str, Any]]] = {}
     for shard in shards:
         per_seed = by_config.setdefault(shard["config_name"], {})
@@ -7126,6 +7151,7 @@ def merge_shards(
         "created_unix": time.time(),
         "protocol_config": dict(shards[0]["config"]),
         "noise_mode": noise_mode,
+        "environment": environment,
         "control_name": control_name,
         "confirmation_threshold": CONFIRMATION_THRESHOLD,
         "slope_window": slope_window,
