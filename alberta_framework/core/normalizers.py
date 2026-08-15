@@ -32,6 +32,10 @@ import jax.numpy as jnp
 from jax import Array
 from jaxtyping import Bool, Float, Int, UInt
 
+from alberta_framework.core.update_safety import (
+    floating_tree_is_finite as _floating_tree_is_finite,
+)
+
 NORMALIZER_STATE_SCHEMA = "alberta.normalizer-state.v2"
 WELFORD_ESTIMATOR_SCHEMA = "alberta.welford-cumulative-float32-fail-stop-at-2p24.v2"
 BOUNDED_RECENCY_ESTIMATOR_SEMANTICS = "bounded-recency"
@@ -116,16 +120,6 @@ def _lifetime_words_to_float32(words: Array) -> Float[Array, ""]:
 
     high_scale = jnp.asarray(2.0**32, dtype=jnp.float32)
     return words[0].astype(jnp.float32) * high_scale + words[1].astype(jnp.float32)
-
-
-def _floating_tree_is_finite(tree: object) -> Bool[Array, ""]:
-    """Return whether every floating/complex persistent leaf is finite."""
-    valid = jnp.asarray(True, dtype=jnp.bool_)
-    for leaf in jax.tree.leaves(tree):
-        array = jnp.asarray(leaf)
-        if jnp.issubdtype(array.dtype, jnp.inexact):
-            valid = valid & jnp.all(jnp.isfinite(array))
-    return valid
 
 
 @chex.dataclass(frozen=True)

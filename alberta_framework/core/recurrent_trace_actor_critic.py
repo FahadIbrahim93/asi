@@ -46,6 +46,9 @@ from jax import Array
 from jax.nn.initializers import lecun_normal
 
 from alberta_framework.core.initializers import sparse_init
+from alberta_framework.core.update_safety import (
+    floating_tree_is_finite as _floating_tree_is_finite,
+)
 
 _FLOAT32_MAX = float(np.finfo(np.float32).max)
 _FLOAT32_TINY = float(np.finfo(np.float32).tiny)
@@ -1218,16 +1221,6 @@ def exact_rtrl_gradient(
         head_weights=head_weights_gradient,
         head_bias=head_bias_gradient,
     )
-
-
-def _floating_tree_is_finite(tree: Any) -> Array:
-    """Return whether every floating leaf is finite."""
-    valid = jnp.asarray(True, dtype=jnp.bool_)
-    for leaf in jax.tree_util.tree_leaves(tree):
-        value = jnp.asarray(leaf)
-        if jnp.issubdtype(value.dtype, jnp.inexact):
-            valid = valid & jnp.all(jnp.isfinite(value))
-    return valid
 
 
 def obgd_update(

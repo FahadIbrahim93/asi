@@ -802,16 +802,6 @@ def metrics_to_dicts(metrics: Array, normalized: bool = False) -> list[dict[str,
 # =============================================================================
 
 
-def _floating_tree_is_finite(tree: object) -> Array:
-    """Return whether every floating/complex persistent leaf is finite."""
-    valid = jnp.asarray(True, dtype=jnp.bool_)
-    for leaf in jax.tree.leaves(tree):
-        array = jnp.asarray(leaf)
-        if jnp.issubdtype(array.dtype, jnp.inexact):
-            valid = valid & jnp.all(jnp.isfinite(array))
-    return valid
-
-
 def _update_from_gradient_with_diagnostics(
     optimizer: Any,
     state: Any,
@@ -819,13 +809,9 @@ def _update_from_gradient_with_diagnostics(
     *,
     error: Array | None,
 ) -> tuple[Array, Any, Bool[Array, ""]]:
-    """Use the checked optimizer boundary when the integrated API provides it."""
-    checked_update = getattr(optimizer, "update_from_gradient_checked", None)
-    if checked_update is not None:
-        result = checked_update(state, gradient, error=error)
-        return result.step, result.new_state, result.update_applied
-    step, new_state = optimizer.update_from_gradient(state, gradient, error=error)
-    return step, new_state, jnp.asarray(True, dtype=jnp.bool_)
+    """Use the checked optimizer boundary for an enclosing transaction."""
+    result = optimizer.update_from_gradient_checked(state, gradient, error=error)
+    return result.step, result.new_state, result.update_applied
 
 
 class MLPLearner:
@@ -1403,8 +1389,8 @@ class MLPLearner:
         inputs_valid = jnp.all(jnp.isfinite(observation)) & jnp.isfinite(target_scalar)
         update_applied = (
             inputs_valid
-            & _floating_tree_is_finite(state)
-            & _floating_tree_is_finite(proposed_state)
+            & floating_tree_is_finite(state)
+            & floating_tree_is_finite(proposed_state)
             & normalizer_update_applied
             & jnp.all(jnp.stack(optimizer_updates_applied))
             & jnp.isfinite(prediction_val)
@@ -1973,7 +1959,7 @@ class TrueOnlineTDLearner:
             & jnp.isfinite(proposed_state.bias_eligibility_trace)
             & jnp.isfinite(proposed_state.v_old)
         )
-        update_applied = inputs_valid & _floating_tree_is_finite(state) & proposed_finite
+        update_applied = inputs_valid & floating_tree_is_finite(state) & proposed_finite
         new_state = jax.lax.cond(
             update_applied,
             lambda: proposed_state,

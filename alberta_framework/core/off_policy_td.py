@@ -61,17 +61,9 @@ from jax import Array
 from jaxtyping import Bool, Float, Int
 
 from alberta_framework.core.types import Observation
-
-
-def _floating_tree_is_finite(tree: object) -> Array:
-    """Return whether every floating/complex persistent leaf is finite."""
-    valid = jnp.asarray(True, dtype=jnp.bool_)
-    for leaf in jax.tree.leaves(tree):
-        array = jnp.asarray(leaf)
-        if jnp.issubdtype(array.dtype, jnp.inexact):
-            valid = valid & jnp.all(jnp.isfinite(array))
-    return valid
-
+from alberta_framework.core.update_safety import (
+    floating_tree_is_finite as _floating_tree_is_finite,
+)
 
 # =============================================================================
 # State / result types

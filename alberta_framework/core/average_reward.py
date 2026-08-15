@@ -39,17 +39,9 @@ from jaxtyping import Bool, Float, Int, UInt
 from alberta_framework.core.learners import _update_from_gradient_with_diagnostics
 from alberta_framework.core.multi_head_learner import MultiHeadMLPLearner, MultiHeadMLPState
 from alberta_framework.core.optimizers import Autostep, AutostepParamState, optimizer_from_config
-
-
-def _floating_tree_is_finite(tree: object) -> Bool[Array, ""]:
-    """Return whether all floating leaves in a persistent state are finite."""
-    valid = jnp.asarray(True, dtype=jnp.bool_)
-    for leaf in jax.tree.leaves(tree):
-        array = jnp.asarray(leaf)
-        if jnp.issubdtype(array.dtype, jnp.inexact):
-            valid = valid & jnp.all(jnp.isfinite(array))
-    return valid
-
+from alberta_framework.core.update_safety import (
+    floating_tree_is_finite as _floating_tree_is_finite,
+)
 
 _INT32_MAX = 2**31 - 1
 _UINT32_MAX = 2**32 - 1

@@ -53,6 +53,9 @@ from alberta_framework.core.types import (
     ObGDState,
     TraceMode,
 )
+from alberta_framework.core.update_safety import (
+    floating_tree_is_finite as _floating_tree_is_finite,
+)
 
 MULTI_HEAD_MLP_STATE_SCHEMA = "alberta.multi-head-mlp-state.v2"
 MULTI_HEAD_LIFETIME_COUNTER_NBYTES = 12
@@ -78,17 +81,6 @@ def _extract_mean_step_size(
         # LMSState
         return opt_state.step_size
     return jnp.array(0.0, dtype=jnp.float32)
-
-
-def _floating_tree_is_finite(tree: object) -> Bool[Array, ""]:
-    """Return whether every floating/complex persistent leaf is finite."""
-
-    valid = jnp.asarray(True, dtype=jnp.bool_)
-    for leaf in jax.tree.leaves(tree):
-        array = jnp.asarray(leaf)
-        if jnp.issubdtype(array.dtype, jnp.inexact):
-            valid = valid & jnp.all(jnp.isfinite(array))
-    return valid
 
 
 # =============================================================================
