@@ -628,6 +628,12 @@ def test_obgd_infinite_signal_zeros_bounded_update() -> None:
     for leaf in jax.tree_util.tree_leaves(unbounded.updates):
         assert bool(jnp.all(jnp.isinf(leaf)))
 
+    genuine_nan = obgd_update(
+        traces, jnp.asarray(jnp.nan, dtype=jnp.float32), alpha=0.5, kappa=0.0
+    )
+    for leaf in jax.tree_util.tree_leaves(genuine_nan.updates):
+        assert bool(jnp.all(jnp.isnan(leaf)))
+
 
 def test_adaptive_obgd_infinite_signal_keeps_finite_updates() -> None:
     traces = {

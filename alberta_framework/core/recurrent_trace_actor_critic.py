@@ -1217,9 +1217,24 @@ def exact_rtrl_gradient(
     )
 
 
-def _replace_nan_with_zero(value: Array) -> Array:
-    """Map ``0 * inf`` NaNs to 0 so genuine infs stay inf."""
-    return jnp.where(jnp.isnan(value), jnp.zeros_like(value), value)
+def _zero_if_collapsed_inf(product: Array, infinite_input: Array, collapsed: Array) -> Array:
+    """Zero ``0 * inf`` only when a bound collapsed an infinite input.
+
+    Genuine upstream NaNs stay NaN. Inactive bounds (``kappa=0``) keep inf.
+    """
+    return jnp.where(
+        collapsed & jnp.isinf(infinite_input) & jnp.isnan(product),
+        jnp.zeros_like(product),
+        product,
+    )
+
+
+def _zero_if_zero_times_inf(product: Array, left: Array, right: Array) -> Array:
+    """Zero a product only when it is the ``0 * inf`` NaN, not a genuine NaN."""
+    zero_times_inf = jnp.isnan(product) & (
+        (jnp.isinf(left) & (right == 0)) | (jnp.isinf(right) & (left == 0))
+    )
+    return jnp.where(zero_times_inf, jnp.zeros_like(product), product)
 
 
 def obgd_update(
@@ -1241,17 +1256,21 @@ def obgd_update(
     z_sum = jnp.asarray(0.0, dtype=signal.dtype)
     for leaf in jax.tree_util.tree_leaves(traces):
         z_sum = z_sum + jnp.sum(jnp.abs(leaf))
-    bound_term = (
-        jnp.asarray(alpha, dtype=signal.dtype)
-        * jnp.asarray(kappa, dtype=signal.dtype)
-        * jnp.maximum(jnp.abs(signal), 1.0)
-        * z_sum
-    )
-    denominator = jnp.maximum(1.0, _replace_nan_with_zero(bound_term))
+    kappa_arr = jnp.asarray(kappa, dtype=signal.dtype)
+    abs_signal = jnp.maximum(jnp.abs(signal), 1.0)
+    weighted_z = _zero_if_zero_times_inf(abs_signal * z_sum, abs_signal, z_sum)
+    bound_core = jnp.asarray(alpha, dtype=signal.dtype) * weighted_z
+    bound_term = _zero_if_zero_times_inf(kappa_arr * bound_core, kappa_arr, bound_core)
+    denominator = jnp.maximum(1.0, bound_term)
     scale = jnp.reciprocal(denominator)
+    collapsed = scale == 0
     step_size = jnp.asarray(alpha, dtype=signal.dtype) * scale
     updates = jax.tree_util.tree_map(
-        lambda trace: _replace_nan_with_zero(step_size * signal * trace),
+        lambda trace: _zero_if_zero_times_inf(
+            _zero_if_collapsed_inf(step_size * signal * trace, signal, collapsed),
+            signal,
+            trace,
+        ),
         traces,
     )
     return ObGDUpdate(updates=updates, step_size=step_size, scale=scale)
@@ -1290,7 +1309,8 @@ def adaptive_obgd_update(
     new_second_moment = jax.tree_util.tree_map(
         lambda previous, trace: (
             beta * previous
-            + (1.0 - beta) * jnp.square(_replace_nan_with_zero(signal * trace))
+            + (1.0 - beta)
+            * jnp.square(_zero_if_zero_times_inf(signal * trace, signal, trace))
         ),
         second_moment,
         traces,
@@ -1309,18 +1329,22 @@ def adaptive_obgd_update(
     z_sum = jnp.asarray(0.0, dtype=signal.dtype)
     for leaf in jax.tree_util.tree_leaves(normalized_traces):
         z_sum = z_sum + jnp.sum(jnp.abs(leaf))
-    bound_term = (
-        jnp.maximum(jnp.abs(signal), 1.0)
-        * z_sum
-        * jnp.asarray(alpha, dtype=signal.dtype)
-        * jnp.asarray(kappa, dtype=signal.dtype)
-    )
-    denominator = jnp.maximum(1.0, _replace_nan_with_zero(bound_term))
+    kappa_arr = jnp.asarray(kappa, dtype=signal.dtype)
+    abs_signal = jnp.maximum(jnp.abs(signal), 1.0)
+    weighted_z = _zero_if_zero_times_inf(abs_signal * z_sum, abs_signal, z_sum)
+    bound_core = weighted_z * jnp.asarray(alpha, dtype=signal.dtype)
+    bound_term = _zero_if_zero_times_inf(kappa_arr * bound_core, kappa_arr, bound_core)
+    denominator = jnp.maximum(1.0, bound_term)
     scale = jnp.reciprocal(denominator)
+    collapsed = scale == 0
     step_size = jnp.asarray(alpha, dtype=signal.dtype) / denominator
     updates = jax.tree_util.tree_map(
-        lambda normalized_trace: _replace_nan_with_zero(
-            step_size * signal * normalized_trace
+        lambda normalized_trace: _zero_if_zero_times_inf(
+            _zero_if_collapsed_inf(
+                step_size * signal * normalized_trace, signal, collapsed
+            ),
+            signal,
+            normalized_trace,
         ),
         normalized_traces,
     )
