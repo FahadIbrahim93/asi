@@ -53,6 +53,13 @@ class PredictionMode(Enum):
     VALUE = "value"
 
 
+def _discounted_bootstrap(gamma: float, next_value: float) -> float:
+    """Return ``gamma * V(s')``, or 0 when gamma is 0 so 0*inf stays 0."""
+    if float(gamma) == 0.0:
+        return 0.0
+    return float(gamma) * float(next_value)
+
+
 def _flatten_space(space: gymnasium.spaces.Space[Any]) -> int:
     """Get the flattened dimension of a Gymnasium space.
 
@@ -260,7 +267,7 @@ def collect_trajectory(
             # estimator (documented on PredictionMode.VALUE) and on
             # termination, where the post-terminal value is defined as zero.
             if value_estimator is not None and not terminated:
-                bootstrap = gamma * float(value_estimator(next_obs))
+                bootstrap = _discounted_bootstrap(gamma, float(value_estimator(next_obs)))
             else:
                 bootstrap = 0.0
             target = jnp.atleast_1d(
@@ -475,7 +482,7 @@ class GymnasiumStream:
             else:
                 next_value = 0.0
 
-            target = reward + self._gamma * next_value
+            target = reward + _discounted_bootstrap(self._gamma, next_value)
             return jnp.atleast_1d(jnp.array(target, dtype=jnp.float32))
 
         else:
@@ -630,7 +637,7 @@ class TDStream:
             target = jnp.atleast_1d(jnp.array(reward, dtype=jnp.float32))
         else:
             bootstrap = self._value_fn(next_features)
-            target_val = float(reward) + self._gamma * float(bootstrap)
+            target_val = float(reward) + _discounted_bootstrap(self._gamma, float(bootstrap))
             target = jnp.atleast_1d(jnp.array(target_val, dtype=jnp.float32))
 
         self._step_count += 1
