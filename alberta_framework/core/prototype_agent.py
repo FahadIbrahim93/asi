@@ -208,6 +208,9 @@ def feature_to_subtask_specs(
         Tuple of up to ``n_subtasks`` :class:`SubtaskSpec` instances, ordered
         by descending feature importance.
     """
+    if isinstance(n_subtasks, bool) or not isinstance(n_subtasks, int) or n_subtasks < 0:
+        raise ValueError("n_subtasks must be a non-negative integer")
+
     bls = oak_state.stomp_state.base_learner_state
     trunk_ws = bls.trunk_params.weights
     if len(trunk_ws) == 0:

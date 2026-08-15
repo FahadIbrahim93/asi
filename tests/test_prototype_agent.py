@@ -565,6 +565,13 @@ class TestAutoSubtaskSpecs:
 
 
 class TestFeatureToSubtaskSpecs:
+    def test_rejects_negative_subtask_count(self) -> None:
+        agent = PrototypeAgent(_minimal_config())
+        state = agent.init(jr.key(0))
+
+        with pytest.raises(ValueError, match="n_subtasks"):
+            feature_to_subtask_specs(state.oak_state, n_subtasks=-1)
+
     def test_returns_correct_count(self) -> None:
         agent = PrototypeAgent(_minimal_config())
         state = agent.init(jr.key(0))
