@@ -261,20 +261,25 @@ class StackedLinearHorde:
 
         v = state.weights @ features  # (n_demons,)
         v_next = state.weights @ next_features
-        raw_td_errors = cumulants + self._gammas * v_next - v
-        prediction_valid = jnp.isfinite(v) & jnp.isfinite(v_next)
+        # gamma=0 must not multiply an inf bootstrap (0*inf).
+        bootstrap = jnp.where(self._gammas == 0.0, 0.0, self._gammas * v_next)
+        raw_td_errors = cumulants + bootstrap - v
+        prediction_valid = jnp.isfinite(v) & (
+            (self._gammas == 0.0) | jnp.isfinite(v_next)
+        )
         channel_valid = (
             active & rho_valid & prediction_valid & jnp.isfinite(raw_td_errors)
         )
         safe_cumulants = jnp.where(channel_valid, cumulants, 0.0)
-        td_errors = safe_cumulants + self._gammas * v_next - v
+        td_errors = safe_cumulants + bootstrap - v
 
         # Per-decision IS with the ratio composed into the trace:
         # z_d = rho_d * (gamma_d * lamda_d * z_d + x).
         decay = (self._gammas * self._lamdas)[:, None]  # (n_demons, 1)
-        accumulated = decay * state.traces + features[None, :]
+        carried = jnp.where(decay == 0.0, jnp.zeros_like(state.traces), decay * state.traces)
+        accumulated = carried + features[None, :]
         # Inactive demons: trace decays but the current gradient is withheld.
-        decayed_only = decay * state.traces
+        decayed_only = carried
         safe_rho = jnp.where(rho_valid, rho_vec, 0.0)
         proposed_traces = safe_rho[:, None] * jnp.where(
             active[:, None], accumulated, decayed_only
@@ -285,25 +290,27 @@ class StackedLinearHorde:
             state.weights
             + cfg.step_size * masked_delta[:, None] * proposed_traces
         )
-        source_finite = (
-            jnp.all(jnp.isfinite(state.weights))
-            & jnp.all(jnp.isfinite(state.traces))
-        )
+        source_weights_finite = jnp.all(jnp.isfinite(state.weights))
+        traces_needed = decay[:, 0] != 0.0
+        traces_usable = (~traces_needed) | jnp.all(jnp.isfinite(state.traces), axis=1)
         shared_inputs_valid = (
             jnp.all(jnp.isfinite(features))
             & jnp.all(jnp.isfinite(next_features))
-            & source_finite
+            & source_weights_finite
         )
         candidate_finite = jnp.all(jnp.isfinite(proposed_weights), axis=1) & jnp.all(
             jnp.isfinite(proposed_traces), axis=1
         )
-        head_updates_applied = shared_inputs_valid & channel_valid & candidate_finite
+        head_updates_applied = (
+            shared_inputs_valid & channel_valid & candidate_finite & traces_usable
+        )
         inactive_trace_applied = (
             shared_inputs_valid
             & ~requested
             & rho_valid
             & prediction_valid
             & candidate_finite
+            & traces_usable
         )
         accepted_channels = head_updates_applied | inactive_trace_applied
         new_weights = jnp.where(
