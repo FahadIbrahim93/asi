@@ -71,9 +71,17 @@ class Bounder(ABC):
         ...
 
 
-def _replace_nan_with_zero(value: Array) -> Array:
-    """Turn 0*inf NaNs into a no-op while leaving genuine infs intact."""
-    return jnp.where(jnp.isnan(value), jnp.zeros_like(value), value)
+def _zero_if_collapsed_inf(product: Array, infinite_input: Array, collapsed: Array) -> Array:
+    """Map 0*inf to 0 only when a bound collapsed an infinite input.
+
+    Genuine upstream NaNs stay NaN so an inactive or unclipped bound cannot
+    hide a numerical failure as a zero no-op.
+    """
+    return jnp.where(
+        jnp.isnan(product) & jnp.isinf(infinite_input) & collapsed,
+        jnp.zeros_like(product),
+        product,
+    )
 
 
 def _apply_obgd_bound(
@@ -88,7 +96,11 @@ def _apply_obgd_bound(
         total_step = total_step + jnp.sum(jnp.abs(s))
     delta_bar = jnp.maximum(jnp.abs(error_scalar), 1.0)
     scale = 1.0 / jnp.maximum(kappa * delta_bar * total_step, 1.0)
-    return tuple(_replace_nan_with_zero(scale * s) for s in steps), scale
+    collapsed = scale == 0
+    return (
+        tuple(_zero_if_collapsed_inf(scale * s, s, collapsed) for s in steps),
+        scale,
+    )
 
 
 class ObGDBounding(Bounder):
@@ -275,7 +287,8 @@ class AGCBounding(Bounder):
             scale = max_norm / jnp.maximum(g_norm, 1e-6)
             needs_clip = g_norm > max_norm
             clipped_step = jnp.where(needs_clip, step * scale, step)
-            clipped.append(_replace_nan_with_zero(clipped_step))
+            collapsed = needs_clip & (scale == 0)
+            clipped.append(_zero_if_collapsed_inf(clipped_step, step, collapsed))
 
             total_units += needs_clip.size
             clipped_units = clipped_units + jnp.sum(needs_clip.astype(jnp.float32))
@@ -1331,9 +1344,17 @@ class ObGD(Optimizer[ObGDState]):
         alpha_eff = alpha / jnp.maximum(dot_product, 1.0)
 
         # Weight and bias deltas. alpha_eff=0 against inf error is 0*inf=NaN;
-        # the bound's intent is a no-op, not a poisoned update.
-        weight_delta = _replace_nan_with_zero(alpha_eff * error_scalar * new_traces)
-        bias_delta = _replace_nan_with_zero(alpha_eff * error_scalar * new_bias_trace)
+        # the bound's intent is a no-op, not a poisoned update. Genuine NaN
+        # error is not an infinite collapse and stays NaN.
+        raw_weight_step = error_scalar * new_traces
+        raw_bias_step = error_scalar * new_bias_trace
+        collapsed = alpha_eff == 0
+        weight_delta = _zero_if_collapsed_inf(
+            alpha_eff * raw_weight_step, error_scalar, collapsed
+        )
+        bias_delta = _zero_if_collapsed_inf(
+            alpha_eff * raw_bias_step, error_scalar, collapsed
+        )
 
         new_state = ObGDState(
             step_size=alpha,

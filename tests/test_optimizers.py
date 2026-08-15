@@ -596,6 +596,18 @@ class TestObGD:
         assert bool(jnp.all(jnp.isfinite(recovered.weight_delta)))
         assert bool(jnp.isfinite(recovered.bias_delta))
 
+    def test_unbounded_nan_error_is_not_silenced_to_zero(self):
+        """kappa=0 does not collapse, so a NaN error must stay a NaN delta."""
+        optimizer = ObGD(step_size=1.0, kappa=0.0)
+        state = optimizer.init(feature_dim=2)
+        observation = jnp.ones(2, dtype=jnp.float32)
+
+        result = optimizer.update(
+            state, jnp.array(jnp.nan, dtype=jnp.float32), observation
+        )
+        assert bool(jnp.all(jnp.isnan(result.weight_delta)))
+        assert bool(jnp.isnan(result.bias_delta))
+
 
 class TestObGDBounding:
     """Tests for the shared ObGD bounder used by MLP/UPGD learners."""
@@ -621,6 +633,23 @@ class TestObGDBounding:
             assert bool(jnp.all(jnp.isfinite(actual)))
             chex.assert_trees_all_close(actual, jnp.zeros_like(actual))
 
+    def test_inactive_bound_preserves_genuine_nan_step(self):
+        """kappa=0 leaves scale=1, so an upstream NaN must not become 0."""
+        bounder = ObGDBounding(kappa=0.0)
+        steps = (
+            jnp.array([jnp.nan, 0.5], dtype=jnp.float32),
+            jnp.array(0.25, dtype=jnp.float32),
+        )
+        bounded, scale = bounder.bound(
+            steps,
+            jnp.array(1.0, dtype=jnp.float32),
+            tuple(jnp.zeros_like(step) for step in steps),
+        )
+        # kappa=0 still lets a NaN L1 total make scale itself NaN; the
+        # helper must not rewrite that NaN step to a silent zero.
+        assert bool(jnp.isnan(bounded[0][0]))
+        assert not bool(jnp.isfinite(scale) and float(scale) == 0.0)
+
 
 class TestAGCBounding:
     """Tests for Adaptive Gradient Clipping."""
@@ -643,6 +672,24 @@ class TestAGCBounding:
         for actual in clipped:
             assert bool(jnp.all(jnp.isfinite(actual)))
             chex.assert_trees_all_close(actual, jnp.zeros_like(actual))
+
+    def test_unclipped_branch_preserves_genuine_nan_step(self):
+        """A finite-norm NaN that never trips the clip must stay NaN."""
+        bounder = AGCBounding(clip_factor=100.0)
+        steps = (
+            jnp.array([jnp.nan, 0.0], dtype=jnp.float32),
+            jnp.array(0.0, dtype=jnp.float32),
+        )
+        params = (
+            jnp.ones(2, dtype=jnp.float32),
+            jnp.array(1.0, dtype=jnp.float32),
+        )
+        clipped, _frac = bounder.bound(
+            steps, jnp.array(1.0, dtype=jnp.float32), params
+        )
+        assert bool(jnp.isnan(clipped[0][0]))
+        chex.assert_trees_all_close(clipped[0][1], jnp.array(0.0, dtype=jnp.float32))
+        chex.assert_trees_all_close(clipped[1], jnp.array(0.0, dtype=jnp.float32))
 
 
 class TestAdaptiveObGDBounding:
