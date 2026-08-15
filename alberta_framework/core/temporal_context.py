@@ -157,8 +157,13 @@ class TemporalContextFeaturizer:
         decay = jnp.asarray(self._config.ema_decay, dtype=jnp.float32)
         obs = jnp.asarray(observation, dtype=jnp.float32)
         observation_valid = jnp.all(jnp.isfinite(obs))
+        decayed_ema = jnp.where(
+            decay == 0.0,
+            jnp.zeros_like(state.observation_ema),
+            decay * state.observation_ema,
+        )
         proposed = TemporalContextState(
-            observation_ema=decay * state.observation_ema + (1.0 - decay) * obs,
+            observation_ema=decayed_ema + (1.0 - decay) * obs,
             step_count=state.step_count + 1,
         )
         return cast(
