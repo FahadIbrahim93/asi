@@ -965,6 +965,25 @@ class TestTransferValidation:
         with pytest.raises(ValueError, match="shards span multiple runtime environments"):
             transfer_validation_from_shards([*paths[:-1], changed_path])
 
+    def test_from_shards_rejects_mixed_network_sizes(self, tmp_path: Path):
+        """The public transfer receipt must retain the shared width contract."""
+        paths = []
+        for arm in LADDER_ARMS:
+            hidden1, hidden2 = (7, 5) if arm == "gated_norm" else (8, 6)
+            result = run_micro_arm(
+                TINY,
+                arm,
+                seed=0,
+                hidden1=hidden1,
+                hidden2=hidden2,
+            )
+            path = micro_shard_path(tmp_path, TINY.family, arm, 0)
+            write_micro_shard(path, micro_shard_payload(result))
+            paths.append(path)
+
+        with pytest.raises(ValueError, match="network sizes"):
+            transfer_validation_from_shards(paths)
+
     def test_from_shards_rejects_arm_contract_drift(self, tmp_path: Path):
         paths = []
         sgd_payload = None
