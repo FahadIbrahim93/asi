@@ -75,6 +75,7 @@ import jax.random as jr
 import numpy as np
 from jax import Array
 
+from alberta_framework._seed_validation import require_jax_seed, require_unique_jax_seeds
 from alberta_framework.benchmarks.ipmnist_screening import _atomic_write_json
 from alberta_framework.benchmarks.micro_continual import (
     _INIT_DOMAIN,
@@ -778,6 +779,7 @@ def evaluate_population(
     Paired evaluation: every genome sees the identical stream and identical
     network init per seed (the screening convention).
     """
+    seeds = require_unique_jax_seeds(seeds, name="seeds")
     genomes = jnp.asarray(genomes, dtype=jnp.float32)
     n_genomes = int(genomes.shape[0])
     total = np.zeros((n_genomes,), dtype=np.float64)
@@ -1036,6 +1038,9 @@ def run_search(
     :func:`tune_champion_baseline`). Never promotes anything by itself —
     promotion to the real protocol goes through ``ipmnist_screening`` arms.
     """
+    eval_seeds = require_unique_jax_seeds(eval_seeds, name="eval_seeds")
+    holdout_seeds = require_unique_jax_seeds(holdout_seeds, name="holdout_seeds")
+    search_seed = require_jax_seed(search_seed, name="search_seed")
     if set(task_names) & set(holdout_names):
         raise ValueError("search tasks and holdout tasks must be disjoint")
     if set(eval_seeds) & set(holdout_seeds):

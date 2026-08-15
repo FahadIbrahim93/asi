@@ -145,6 +145,7 @@ import jax.random as jr
 import numpy as np
 from jax import Array
 
+from alberta_framework._seed_validation import require_jax_seed
 from alberta_framework.benchmarks.upgd_ipmnist import (
     _PLASTICITY_LOSS_FLOOR,
     ADAMW_PROTOCOL_HYPERPARAMETERS,
@@ -6356,7 +6357,6 @@ def _validated_screening_noise_mode(
 
 
 RECURRING_IPMNIST_ADAPTER_SCHEMA = "alberta.ipmnist-screening.recurring-adapter.v1"
-_MAX_UINT32 = 2**32 - 1
 
 
 def _canonical_hash_array(array: object) -> np.ndarray:
@@ -6434,9 +6434,7 @@ def _validated_recurring_phase_lengths(
 
 
 def _validated_recurring_seed(seed: int) -> int:
-    if not isinstance(seed, int) or isinstance(seed, bool) or not 0 <= seed <= _MAX_UINT32:
-        raise ValueError("seed must be a canonical uint32 integer")
-    return seed
+    return require_jax_seed(seed, name="seed")
 
 
 def build_recurring_ipmnist_online_indices(
@@ -6940,6 +6938,7 @@ def run_screening_config(
     approximation: they record ``noise_mode`` and never merge with exact
     shards nor pass proxy validation.
     """
+    resolved_seed = require_jax_seed(seed, name="seed")
     noise_mode = _validated_screening_noise_mode(noise_mode, spec)
     if noise_mode == "pool" and noise_pool_steps < 2:
         raise ValueError(f"noise_pool_steps must be >= 2, got {noise_pool_steps}")
@@ -6955,7 +6954,7 @@ def run_screening_config(
 
     init_fn, step_fn = spec.factory(spec.hyperparameters)
 
-    root = jr.key(jnp.uint32(seed))
+    root = jr.key(jnp.uint32(resolved_seed))
     key_init, key_schedule, key_noise = jr.split(root, 3)
     params = init_mlp_params(key_init, config)
     schedule = build_schedule(key_schedule, config, n_train)
@@ -7046,7 +7045,7 @@ def run_screening_config(
             logger.info(
                 "%s seed=%d task %d/%d online_acc=%.4f elapsed=%.1fs",
                 spec.name,
-                seed,
+                resolved_seed,
                 task + 1,
                 config.n_tasks,
                 task_accuracy[-1],
@@ -7056,7 +7055,7 @@ def run_screening_config(
         config_name=spec.name,
         base_learner=spec.base_learner,
         hyperparameters=dict(spec.hyperparameters),
-        seed=int(seed),
+        seed=resolved_seed,
         config=config,
         per_task_accuracy=np.asarray(task_accuracy, dtype=np.float64),
         per_task_loss=np.asarray(task_loss, dtype=np.float64),
@@ -7073,13 +7072,14 @@ def run_screening_config(
 
 def shard_payload(result: ScreeningRunResult) -> dict[str, Any]:
     """Serialize one (config, seed) screening run to a mergeable shard."""
+    seed = require_jax_seed(result.seed, name="result seed")
     return {
         "schema": SHARD_SCHEMA,
         "evidence_policy": dict(NONPROMOTING_POLICY),
         "config_name": result.config_name,
         "base_learner": result.base_learner,
         "hyperparameters": result.hyperparameters,
-        "seed": result.seed,
+        "seed": seed,
         "noise_mode": result.noise_mode,
         "config": result.config.to_config(),
         "per_task_accuracy": [round(float(v), 8) for v in result.per_task_accuracy],
@@ -7109,8 +7109,7 @@ def load_shard(path: Path) -> dict[str, Any]:
     payload["wall_clock_seconds"] = _validated_wall_clock_seconds(
         payload.get("wall_clock_seconds"), path
     )
-    if type(payload.get("seed")) is not int or payload["seed"] < 0:
-        raise ValueError(f"{path}: seed must be a non-negative integer")
+    payload["seed"] = require_jax_seed(payload.get("seed"), name=f"{path}: seed")
     if payload.get("config_name") not in SCREENING_REGISTRY:
         raise ValueError(f"{path}: unknown config_name {payload.get('config_name')!r}")
     spec = SCREENING_REGISTRY[payload["config_name"]]
@@ -7553,6 +7552,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", force=True
     )
+    run_seed = (
+        require_jax_seed(args.seed, name="seed")
+        if args.command == "run"
+        else None
+    )
 
     # Refuse an already-published destination before loading data or processing
     # shards.  This is intentionally only a preflight: a claim file or advisory
@@ -7564,6 +7568,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
 
     if args.command == "run":
+        assert run_seed is not None
+        seed = run_seed
         spec = screening_spec(args.config_name)
         config = IPMNISTConfig(n_tasks=args.n_tasks, task_length=args.task_length)
         data_home = args.data_home if args.data_home is not None else default_openml_data_home()
@@ -7571,10 +7577,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         data_x, data_y = load_mnist_train(data_home)
         logger.info(
             "running %s seed=%d for %d tasks x %d steps (noise_mode=%s)",
-            spec.name, args.seed, config.n_tasks, config.task_length, args.noise_mode,
+            spec.name, seed, config.n_tasks, config.task_length, args.noise_mode,
         )
         result = run_screening_config(
-            data_x, data_y, spec, args.seed, config,
+            data_x, data_y, spec, seed, config,
             progress_every=args.progress_every,
             noise_mode=args.noise_mode,
             noise_pool_steps=args.noise_pool_steps,
@@ -7583,7 +7589,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         logger.info(
             "%s seed=%d done: avg online acc %.4f (wall %.1fs) -> %s",
             spec.name,
-            args.seed,
+            seed,
             float(result.per_task_accuracy.mean()),
             result.wall_clock_seconds,
             args.out,

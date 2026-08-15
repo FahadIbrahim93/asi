@@ -24,6 +24,7 @@ import jax.random as jr
 import numpy as np
 import pytest
 
+import alberta_framework.benchmarks.rule_discovery as rule_discovery
 from alberta_framework.benchmarks.ipmnist_screening import (
     _make_upgd_shiftnorm_learner,
     _sigma0_ext_hp,
@@ -344,6 +345,115 @@ def test_evaluate_population_is_paired_and_bounded() -> None:
     assert accuracy.shape == (2,)
     assert float(accuracy[0]) == pytest.approx(float(accuracy[1]), abs=1e-7)
     assert 0.0 <= float(accuracy[0]) <= 1.0
+
+
+@pytest.mark.parametrize(
+    "seeds",
+    [
+        (),
+        (0, 0),
+        (True,),
+        (np.int64(0),),
+        (0.0,),
+        (-1,),
+        (2**32,),
+        (0, 2**32),
+    ],
+)
+def test_evaluate_population_rejects_noncanonical_seed_schedules_before_materialization(
+    monkeypatch: pytest.MonkeyPatch,
+    seeds: tuple[object, ...],
+) -> None:
+    def unexpected_materialization(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise AssertionError("invalid seeds reached stream materialization")
+
+    monkeypatch.setattr(rule_discovery, "_materialize_eval", unexpected_materialization)
+    with pytest.raises(ValueError, match="seeds"):
+        evaluate_population(
+            jnp.zeros((1, GENOME_SIZE), dtype=jnp.float32),
+            MICRO_SUITE["M1"],
+            seeds=seeds,  # type: ignore[arg-type]
+        )
+
+
+def test_evaluate_population_preserves_distinct_seed_order_and_mean(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: list[int] = []
+
+    def materialize(
+        config: object, seed: int
+    ) -> tuple[jnp.ndarray, jnp.ndarray, dict[str, jnp.ndarray], int]:
+        del config
+        observed.append(seed)
+        return (
+            jnp.zeros((1, 1), dtype=jnp.float32),
+            jnp.zeros((1,), dtype=jnp.int32),
+            {},
+            1,
+        )
+
+    def batched_run(
+        genomes: jnp.ndarray,
+        params: dict[str, jnp.ndarray],
+        xs: jnp.ndarray,
+        ys: jnp.ndarray,
+        task_length: int,
+    ) -> tuple[jnp.ndarray, jnp.ndarray]:
+        del params, xs, ys, task_length
+        return (
+            jnp.full((genomes.shape[0],), observed[-1], dtype=jnp.float32),
+            jnp.zeros((genomes.shape[0], 1), dtype=jnp.float32),
+        )
+
+    monkeypatch.setattr(rule_discovery, "_materialize_eval", materialize)
+    monkeypatch.setattr(rule_discovery, "_batched_run", batched_run)
+    result = evaluate_population(
+        jnp.zeros((2, GENOME_SIZE), dtype=jnp.float32),
+        MICRO_SUITE["M1"],
+        seeds=(7, 3),
+    )
+
+    assert observed == [7, 3]
+    np.testing.assert_array_equal(result, np.asarray([5.0, 5.0]))
+
+
+def test_cli_rejects_duplicate_evaluation_seeds_before_search(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def unexpected_search(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise AssertionError("invalid CLI seeds reached genome generation")
+
+    monkeypatch.setattr(rule_discovery, "random_genomes", unexpected_search)
+    output = tmp_path / "must-not-exist.json"
+    with pytest.raises(ValueError, match="eval_seeds.*unique"):
+        rule_discovery.main(
+            [
+                "search",
+                "--out",
+                str(output),
+                "--n-random",
+                "2",
+                "--population",
+                "2",
+                "--generations",
+                "0",
+                "--elite",
+                "1",
+                "--eval-seeds",
+                "0",
+                "0",
+                "--holdout-seeds",
+                "101",
+                "--tasks",
+                "M1",
+                "--holdout-tasks",
+                "M1p",
+            ]
+        )
+    assert not output.exists()
 
 
 @pytest.mark.integration

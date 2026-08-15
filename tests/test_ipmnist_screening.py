@@ -17,6 +17,7 @@ import jax.random as jr
 import numpy as np
 import pytest
 
+import alberta_framework.benchmarks.ipmnist_screening as ipmnist_screening
 from alberta_framework.benchmarks.ipmnist_screening import (
     _CBP_LAYERS,
     CONFIRMATION_THRESHOLD,
@@ -827,6 +828,51 @@ class TestLocalGateNorm:
         )
 
 
+class TestSeedBoundary:
+    @pytest.mark.parametrize("seed", [True, np.int64(0), 0.0, -1, 2**32])
+    def test_runner_rejects_noncanonical_seed_before_setup(
+        self, monkeypatch: pytest.MonkeyPatch, seed: object
+    ) -> None:
+        def unexpected_setup(*args: object, **kwargs: object) -> None:
+            del args, kwargs
+            raise AssertionError("invalid seed reached screening setup")
+
+        monkeypatch.setattr(
+            ipmnist_screening, "_validated_screening_noise_mode", unexpected_setup
+        )
+        with pytest.raises(ValueError, match="seed.*uint32"):
+            run_screening_config(
+                np.empty((1, 1), dtype=np.float32),
+                np.empty((1,), dtype=np.int32),
+                screening_spec("upgd_w_control"),
+                seed=seed,  # type: ignore[arg-type]
+                config=SMALL,
+            )
+
+    def test_cli_rejects_aliased_seed_before_loading_mnist(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def unexpected_load(*args: object, **kwargs: object) -> None:
+            del args, kwargs
+            raise AssertionError("invalid seed reached dataset loading")
+
+        monkeypatch.setattr(ipmnist_screening, "load_mnist_train", unexpected_load)
+        output = tmp_path / "must-not-exist.json"
+        with pytest.raises(ValueError, match="seed.*uint32"):
+            main(
+                [
+                    "run",
+                    "--config-name",
+                    "upgd_w_control",
+                    "--seed",
+                    str(2**32),
+                    "--out",
+                    str(output),
+                ]
+            )
+        assert not output.exists()
+
+
 class TestSmokeRuns:
     """Every combination runs at tiny scale, learns above chance, stays finite."""
 
@@ -886,6 +932,17 @@ class TestShardsAndMerge:
         assert isinstance(l2["paired_vs_control"]["confirmation_candidate"], bool)
         control = next(e for e in summary["results"] if e["config_name"] == "upgd_w_control")
         assert "paired_vs_control" not in control
+
+    def test_load_shard_rejects_seed_outside_jax_key_domain(
+        self, tmp_path, small_data
+    ) -> None:
+        path = self._make_shard(tmp_path, small_data, "upgd_w_control", 0)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["seed"] = 2**32
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+        with pytest.raises(ValueError, match="seed.*uint32"):
+            load_shard(path)
 
     def test_merge_rejects_zero_seed_overlap_with_control(self, tmp_path, small_data):
         """An arm sharing no seeds with a present control must refuse to merge:

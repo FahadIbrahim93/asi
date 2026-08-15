@@ -11,6 +11,7 @@ import jax.random as jr
 import numpy as np
 import pytest
 
+import alberta_framework.benchmarks.upgd_ipmnist as upgd_ipmnist
 from alberta_framework.benchmarks.upgd_ipmnist import (
     ADAMW_PROTOCOL_HYPERPARAMETERS,
     ARTIFACT_SCHEMA,
@@ -131,6 +132,83 @@ class TestSchedule:
     def test_schedule_rejects_dataset_smaller_than_task(self):
         with pytest.raises(ValueError, match="without replacement"):
             build_schedule(jr.key(0), TINY, TINY.task_length - 1)
+
+
+class TestSeedBoundary:
+    @pytest.mark.parametrize(
+        "seeds",
+        [
+            (),
+            (0, 0),
+            (True,),
+            (np.int64(0),),
+            (0.0,),
+            (-1,),
+            (2**32,),
+            (0, 2**32),
+        ],
+    )
+    def test_run_rejects_noncanonical_seed_identities_before_setup(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        seeds: tuple[object, ...],
+    ) -> None:
+        def unexpected_setup(*args: object, **kwargs: object) -> None:
+            del args, kwargs
+            raise AssertionError("invalid seeds reached learner setup")
+
+        monkeypatch.setattr(upgd_ipmnist, "resolve_hyperparameters", unexpected_setup)
+        with pytest.raises(ValueError, match="seeds"):
+            run_ipmnist(
+                np.empty((1, 1), dtype=np.float32),
+                np.empty((1,), dtype=np.int32),
+                "adamw",
+                seeds=seeds,  # type: ignore[arg-type]
+            )
+
+    def test_run_preserves_full_uint32_seed_identities(self) -> None:
+        config = IPMNISTConfig(
+            n_tasks=1,
+            task_length=1,
+            input_dim=2,
+            hidden1=2,
+            hidden2=2,
+            n_classes=2,
+        )
+        data_x = np.asarray([[0.25, -0.5]], dtype=np.float32)
+        data_y = np.asarray([1], dtype=np.int32)
+        result = run_ipmnist(
+            data_x,
+            data_y,
+            "adamw",
+            seeds=(2**32 - 1, 0),
+            config=config,
+            return_per_step=True,
+        )
+
+        assert result.seeds == (2**32 - 1, 0)
+        assert result.initial_params is not None
+        assert not np.array_equal(result.initial_params["w1"][0], result.initial_params["w1"][1])
+
+    def test_cli_rejects_aliased_seed_before_loading_mnist(
+        self, tmp_path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def unexpected_load(*args: object, **kwargs: object) -> None:
+            del args, kwargs
+            raise AssertionError("invalid CLI seeds reached dataset loading")
+
+        monkeypatch.setattr(upgd_ipmnist, "load_mnist_train", unexpected_load)
+        with pytest.raises(ValueError, match=r"seeds\[1\].*uint32"):
+            upgd_ipmnist.main_v2_compat(
+                [
+                    "--learners",
+                    "adamw",
+                    "--seed-list",
+                    f"0,{2**32}",
+                    "--partial-out",
+                    str(tmp_path / "must-not-exist.json"),
+                ]
+            )
 
 
 @pytest.fixture(scope="module")
@@ -617,6 +695,17 @@ class TestPartialMerge:
         path_b.write_text(json.dumps(partial_payload(other)))
         with pytest.raises(ValueError, match="disagree on config"):
             merge_partial_results([path_a, path_b])
+
+    def test_merge_rejects_seed_identity_outside_jax_key_domain(self, tmp_path) -> None:
+        data_x, data_y = _synthetic_dataset(6, N_TRAIN, TINY.input_dim, TINY.n_classes)
+        shard = run_ipmnist(data_x, data_y, "adamw", seeds=(0,), config=TINY)
+        payload = partial_payload(shard)
+        payload["seed_id"] = 2**32
+        path = tmp_path / "aliased-seed.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+        with pytest.raises(ValueError, match="uint32"):
+            merge_partial_results([path])
 
     def test_v2_partial_is_single_seed_and_recursively_omits_legacy_marker(
         self, tmp_path, debug_run

@@ -169,6 +169,39 @@ def test_complete_artifact_recomputes_but_can_never_promote(tmp_path: Path) -> N
 
 
 @pytest.mark.unit
+def test_duplicate_expected_seeds_cannot_bypass_artifact_validation(tmp_path: Path) -> None:
+    paths = _write_shards(tmp_path, seeds=(0,))
+    artifact = tmp_path / "empty-artifact.json"
+    artifact.write_text("{}", encoding="utf-8")
+
+    validation = validate_upgd_ipmnist_artifact(
+        artifact,
+        paths,
+        expected_seeds=(0, 0),
+    )
+
+    assert not validation.valid
+    assert any("expected_seeds must contain unique seeds" in error for error in validation.errors)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "expected_seeds",
+    [(), (True,), (np.int64(0),), (0.0,), (-1,), (2**32,)],
+)
+def test_invalid_expected_seed_schedules_fail_closed(
+    tmp_path: Path, expected_seeds: tuple[object, ...]
+) -> None:
+    validation = validate_upgd_ipmnist_partials(
+        [],
+        expected_seeds=expected_seeds,  # type: ignore[arg-type]
+    )
+
+    assert not validation.valid
+    assert any("expected_seeds" in error for error in validation.errors)
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize(
     ("tamper", "expected_error"),
     [

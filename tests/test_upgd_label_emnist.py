@@ -12,6 +12,7 @@ import jax.random as jr
 import numpy as np
 import pytest
 
+import alberta_framework.benchmarks.upgd_label_emnist as upgd_label_emnist
 from alberta_framework.benchmarks.upgd_label_emnist import (
     ADAMW_PROTOCOL_HYPERPARAMETERS,
     SGD_EMA_NORM_HYPERPARAMETERS,
@@ -178,6 +179,71 @@ class TestScheduleExactness:
     def test_schedule_rejects_dataset_smaller_than_task(self):
         with pytest.raises(ValueError, match="without replacement"):
             build_schedule(jr.key(0), TINY, n_train=TINY.task_length - 1)
+
+
+class TestSeedBoundary:
+    @pytest.mark.parametrize(
+        "seeds",
+        [
+            (),
+            (0, 0),
+            (True,),
+            (np.int64(0),),
+            (0.0,),
+            (-1,),
+            (2**32,),
+            (0, 2**32),
+        ],
+    )
+    def test_run_rejects_noncanonical_seed_identities_before_setup(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        seeds: tuple[object, ...],
+    ) -> None:
+        def unexpected_setup(*args: object, **kwargs: object) -> None:
+            del args, kwargs
+            raise AssertionError("invalid seeds reached learner setup")
+
+        monkeypatch.setattr(upgd_label_emnist, "resolve_hyperparameters", unexpected_setup)
+        with pytest.raises(ValueError, match="seeds"):
+            run_label_emnist(
+                np.empty((1, 1), dtype=np.float32),
+                np.empty((1,), dtype=np.int32),
+                "adamw",
+                seeds=seeds,  # type: ignore[arg-type]
+            )
+
+    @pytest.mark.parametrize("seeds", [(True,), (np.int64(0),), (-1,), (2**32,)])
+    def test_plan_rejects_noncanonical_seed_identities(
+        self, seeds: tuple[object, ...]
+    ) -> None:
+        with pytest.raises(ValueError, match="seed IDs"):
+            build_plan_payload(
+                TINY,
+                seeds,  # type: ignore[arg-type]
+                DATASET_META,
+            )
+
+    def test_plan_cli_rejects_aliased_seed_before_loading_emnist(
+        self, tmp_path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def unexpected_load(*args: object, **kwargs: object) -> None:
+            del args, kwargs
+            raise AssertionError("invalid CLI seeds reached dataset loading")
+
+        monkeypatch.setattr(
+            upgd_label_emnist, "load_emnist_balanced_train", unexpected_load
+        )
+        with pytest.raises(ValueError, match=r"seed IDs\[1\].*uint32"):
+            upgd_label_emnist.main(
+                [
+                    "plan",
+                    "--plan-out",
+                    str(tmp_path / "must-not-exist.json"),
+                    "--seed-list",
+                    f"0,{2**32}",
+                ]
+            )
 
 
 @pytest.fixture(scope="class")
