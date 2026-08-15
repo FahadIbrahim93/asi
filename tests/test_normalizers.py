@@ -306,3 +306,21 @@ class TestNormalizerABC:
         assert bool(jnp.all(jnp.isfinite(recovered.var)))
         assert int(recovered.sample_count) == 1
 
+    @pytest.mark.parametrize(
+        "normalizer",
+        [EMANormalizer(), WelfordNormalizer(), StreamingBatchNormalizer()],
+        ids=["EMA", "Welford", "StreamingBatch"],
+    )
+    def test_finite_overflow_is_not_rewritten_to_zero(self, normalizer) -> None:
+        """Finite observation minus a finite opposite-max mean can overflow.
+
+        That is a real arithmetic failure. Do not hide it as a zero feature.
+        """
+        state = normalizer.init(1)
+        max_f32 = jnp.finfo(jnp.float32).max
+        state = state.replace(mean=jnp.array([-max_f32], dtype=jnp.float32))
+        out = normalizer.normalize_only(state, jnp.array([max_f32], dtype=jnp.float32))
+        assert bool(jnp.isfinite(jnp.array([max_f32])))
+        assert not bool(jnp.isfinite(out[0]))
+        assert float(out[0]) != 0.0
+

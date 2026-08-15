@@ -367,11 +367,10 @@ class Normalizer[
         """
         std = jnp.sqrt(state.var)
         normalized = (observation - state.mean) / (std + self._epsilon)
-        # Inf observation minus an inf mean is inf-inf = NaN. Do not
-        # emit non-finite coordinates; keep zeros so downstream learners
-        # are not poisoned when the update is refused.
+        # Inf observation minus an inf mean is inf-inf = NaN. Zero only
+        # those coordinates. Finite-input overflow must stay visible.
         return jnp.where(
-            jnp.isfinite(observation) & jnp.isfinite(normalized),
+            jnp.isfinite(observation),
             normalized,
             jnp.zeros_like(normalized),
         )
