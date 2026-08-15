@@ -6,6 +6,7 @@ and markdown, suitable for academic publications.
 
 import csv
 import json
+import math
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -14,6 +15,14 @@ if TYPE_CHECKING:
 
     from alberta_framework.utils.experiments import AggregatedResults
     from alberta_framework.utils.statistics import SignificanceResult
+
+
+def _exported_number(value: object) -> str:
+    """Format one measured float so a CSV reader recovers the same value."""
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(f"refusing to export non-finite measurement: {number!r}")
+    return format(number, ".16g")
 
 
 def export_to_csv(
@@ -54,10 +63,10 @@ def _export_summary_csv(
             writer.writerow(
                 [
                     name,
-                    f"{summary.mean:.6f}",
-                    f"{summary.std:.6f}",
-                    f"{summary.min:.6f}",
-                    f"{summary.max:.6f}",
+                    _exported_number(summary.mean),
+                    _exported_number(summary.std),
+                    _exported_number(summary.min),
+                    _exported_number(summary.max),
                     summary.n_seeds,
                 ]
             )
@@ -91,7 +100,7 @@ def _export_timeseries_csv(
                 n_steps = arr.shape[1]
                 for seed_idx in range(n_seeds):
                     if step < n_steps:
-                        row.append(f"{arr[seed_idx, step]:.6f}")
+                        row.append(_exported_number(arr[seed_idx, step]))
                     else:
                         row.append("")
             writer.writerow(row)
@@ -139,8 +148,8 @@ def export_to_json(
 
         data[name] = config_data
 
-    with open(filepath, "w") as f:
-        json.dump(data, f, indent=2)
+    payload = json.dumps(data, indent=2, allow_nan=False)
+    filepath.write_text(payload, encoding="utf-8")
 
 
 def generate_latex_table(
