@@ -621,3 +621,38 @@ class TestScaleDriftStream:
             assert isinstance(timestep, TimeStep)
             chex.assert_tree_all_finite(timestep.observation)
             chex.assert_tree_all_finite(timestep.target)
+
+
+class TestScheduleModuliRejectInvalid:
+    """Schedule divisors must be positive integers before JAX arithmetic."""
+
+    @pytest.mark.parametrize("period", [0, -1, False, True, 1.5, None])
+    def test_periodic_change_period_must_be_positive_int(self, period):
+        with pytest.raises(ValueError, match="period must be a positive integer"):
+            PeriodicChangeStream(feature_dim=3, period=period)
+
+    @pytest.mark.parametrize("cycle_length", [0, -1, False, True, 1.5, None])
+    def test_cyclic_cycle_length_must_be_positive_int(self, cycle_length):
+        with pytest.raises(ValueError, match="cycle_length must be a positive integer"):
+            CyclicStream(feature_dim=3, cycle_length=cycle_length)
+
+    @pytest.mark.parametrize("num_configurations", [0, -1, False, True, 1.5, None])
+    def test_cyclic_num_configurations_must_be_positive_int(self, num_configurations):
+        with pytest.raises(ValueError, match="num_configurations must be a positive integer"):
+            CyclicStream(feature_dim=3, num_configurations=num_configurations)
+
+    @pytest.mark.parametrize("change_interval", [0, -1, False, True, 1.5, None])
+    def test_abrupt_change_interval_must_be_positive_int(self, change_interval):
+        with pytest.raises(ValueError, match="change_interval must be a positive integer"):
+            AbruptChangeStream(feature_dim=3, change_interval=change_interval)
+
+    @pytest.mark.parametrize("change_interval", [0, -1, False, True, 1.5, None])
+    def test_sutton_change_interval_must_be_positive_int(self, change_interval):
+        with pytest.raises(ValueError, match="change_interval must be a positive integer"):
+            SuttonExperiment1Stream(change_interval=change_interval)
+
+    @pytest.mark.parametrize("name", ["scale_change_interval", "weight_change_interval"])
+    @pytest.mark.parametrize("value", [0, -1, False, True, 1.5, None])
+    def test_dynamic_scale_shift_intervals_must_be_positive_ints(self, name, value):
+        with pytest.raises(ValueError, match=rf"{name} must be a positive integer"):
+            DynamicScaleShiftStream(feature_dim=3, **{name: value})

@@ -143,8 +143,14 @@ class SwitchingTwoStateMDP:
 
     def __init__(self, config: SwitchingTwoStateConfig | None = None) -> None:
         config = SwitchingTwoStateConfig() if config is None else config
-        if config.phase_length <= 0:
-            raise ValueError(f"phase_length must be positive, got {config.phase_length}")
+        if (
+            isinstance(config.phase_length, bool)
+            or not isinstance(config.phase_length, int)
+            or config.phase_length < 1
+        ):
+            raise ValueError(
+                f"phase_length must be a positive integer, got {config.phase_length!r}"
+            )
         phase_payoffs = []
         for name in ("payoffs_a", "payoffs_b"):
             payoff = np.asarray(getattr(config, name), dtype=np.float32)
