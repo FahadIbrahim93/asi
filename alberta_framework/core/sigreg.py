@@ -42,6 +42,7 @@ _KERNEL_WIDTH_ERROR = (
 _SAMPLES_FINITE_ERROR = "samples must be finite"
 _EMBEDDINGS_FINITE_ERROR = "embeddings must be finite"
 _DIRECTIONS_FINITE_ERROR = "directions must be finite"
+_PROJECTIONS_FINITE_ERROR = "projected samples must be finite"
 
 
 def _normalized_positive_float32(
@@ -136,9 +137,10 @@ def _runtime_checked_value(
 ) -> Array:
     """Enforce a scalar predicate without breaking valid JAX transforms.
 
-    Eager invalid inputs are rejected before this helper. Under ``jax.jit``
-    or ``jax.vmap``, a failed check surfaces on synchronization as
-    :class:`jax.errors.JaxRuntimeError` wrapping the host ``ValueError``.
+    Eager invalid inputs are rejected before this helper. Under compiled JAX
+    transforms, a failed check surfaces on synchronization as
+    :class:`jax.errors.JaxRuntimeError` wrapping the host ``ValueError``;
+    an uncompiled ``jax.vmap`` may surface the host ``ValueError`` directly.
     """
     predicate = jnp.reshape(jnp.asarray(predicate, dtype=jnp.bool_), ())
 
@@ -261,7 +263,10 @@ def epps_pulley_gaussian_statistic(
     :class:`jax.errors.JaxRuntimeError` when the result is synchronized.
     """
     width = _validated_kernel_width(kernel_width)
-    checked = _require_finite_array(samples, _SAMPLES_FINITE_ERROR)
+    checked = _require_finite_array(
+        jnp.asarray(samples, dtype=jnp.float32),
+        _SAMPLES_FINITE_ERROR,
+    )
     return _epps_pulley_gaussian_statistic(checked, width)
 
 
@@ -290,7 +295,7 @@ def sliced_sigreg_loss(
     z = _require_finite_array(z, _EMBEDDINGS_FINITE_ERROR)
     dirs = _require_finite_array(dirs, _DIRECTIONS_FINITE_ERROR)
     flat = jnp.reshape(z, (-1, z.shape[-1]))
-    projections = flat @ dirs.T
+    projections = _require_finite_array(flat @ dirs.T, _PROJECTIONS_FINITE_ERROR)
     per_projection = jax.vmap(
         lambda values: _epps_pulley_gaussian_statistic(values, width),
         in_axes=1,
@@ -310,7 +315,7 @@ def sigreg_diagnostics(
     z = _require_finite_array(z, _EMBEDDINGS_FINITE_ERROR)
     dirs = _require_finite_array(dirs, _DIRECTIONS_FINITE_ERROR)
     flat = jnp.reshape(z, (-1, z.shape[-1]))
-    projected = flat @ dirs.T
+    projected = _require_finite_array(flat @ dirs.T, _PROJECTIONS_FINITE_ERROR)
     latent_std = jnp.std(flat, axis=0)
     projected_std = jnp.std(projected, axis=0)
     return SIGRegDiagnostics(
