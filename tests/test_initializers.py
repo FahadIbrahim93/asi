@@ -124,7 +124,17 @@ class TestSparseInit:
 
     @pytest.mark.parametrize(
         "invalid_sparsity",
-        [-0.1, 1.1, float("nan"), float("inf"), float("-inf"), True, False, "0.5"],
+        [
+            -0.1,
+            1.1,
+            10**309,
+            float("nan"),
+            float("inf"),
+            float("-inf"),
+            True,
+            False,
+            "0.5",
+        ],
     )
     def test_invalid_sparsity_raises(self, invalid_sparsity):
         """Out-of-bounds or non-finite sparsity should raise ValueError."""

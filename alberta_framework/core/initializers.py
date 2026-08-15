@@ -39,9 +39,9 @@ def sparse_init(
         Weight matrix of given shape with specified sparsity
 
     Raises:
-        ValueError: If shape is not a 2-tuple, dimensions are not positive integers,
-            sparsity is not a finite real number in [0.0, 1.0], or init_type is not
-            'uniform' or 'normal'.
+        ValueError: If shape is not a two-element tuple or list, dimensions are not
+            positive integers, sparsity is not a finite real number in [0.0, 1.0], or
+            init_type is not 'uniform' or 'normal'.
 
     Examples:
     ```python
@@ -70,8 +70,8 @@ def sparse_init(
     if (
         isinstance(sparsity, bool)
         or not isinstance(sparsity, (int, float, jnp.floating, jnp.integer))
-        or not math.isfinite(sparsity)
         or not (0.0 <= sparsity <= 1.0)
+        or not math.isfinite(sparsity)
     ):
         raise ValueError(
             f"sparsity must be a finite real number in [0.0, 1.0], got {sparsity!r}"

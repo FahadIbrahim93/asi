@@ -34,6 +34,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Made sparse initialization reject malformed dimensions and non-finite or out-of-range
+  sparsity before array allocation, while retaining the paper-specified uniform bound.
 - `get_final_performance` now refuses a non-positive `window` and an empty time
   axis instead of silently averaging the whole trace (`window=0`, because
   `arr[:, -0:]` is a full slice) or a prefix (`window < 0`) and publishing NaN.
