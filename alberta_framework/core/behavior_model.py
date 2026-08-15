@@ -450,12 +450,36 @@ class BehaviorModel:
         loss = -jnp.sum(one_hot * jax.nn.log_softmax(scaled_logits))
         logit_gradient = (probabilities - one_hot) / cfg.temperature
         gradient = state.weights.T @ logit_gradient
+        # Inf observation makes softmax NaN and W.T @ (p - one_hot)
+        # non-finite, including 0*inf on a silent feature. The parameter
+        # update already no-ops; this pre-update bridge must not hand a
+        # NaN gradient to the state builder.
+        inputs_valid = (
+            jnp.all(jnp.isfinite(obs))
+            & (action_id >= 0)
+            & (action_id < cfg.n_actions)
+        )
+        source_finite = jnp.all(jnp.isfinite(state.weights)) & jnp.all(
+            jnp.isfinite(state.bias)
+        )
+        proposed_finite = (
+            jnp.all(jnp.isfinite(logits))
+            & jnp.all(jnp.isfinite(probabilities))
+            & jnp.isfinite(loss)
+            & jnp.all(jnp.isfinite(gradient))
+        )
+        valid = source_finite & inputs_valid & proposed_finite
+        zero_logits = jnp.zeros_like(logits)
+        zero_gradient = jnp.zeros_like(gradient)
+        zero_loss = jnp.asarray(0.0, dtype=jnp.float32)
         return BehaviorModelInputGradient(
-            logits=logits,
-            probabilities=probabilities,
-            loss=loss,
-            gradient=gradient,
-            gradient_norm=jnp.linalg.norm(gradient),
+            logits=jnp.where(valid, logits, zero_logits),
+            probabilities=jnp.where(valid, probabilities, jnp.zeros_like(probabilities)),
+            loss=jnp.where(valid, loss, zero_loss),
+            gradient=jnp.where(valid, gradient, zero_gradient),
+            gradient_norm=jnp.where(
+                valid, jnp.linalg.norm(gradient), zero_loss
+            ),
         )
 
     @functools.partial(jax.jit, static_argnums=(0,))
