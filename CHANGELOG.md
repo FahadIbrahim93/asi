@@ -48,9 +48,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   NaNs while nonzero channels still expose invalid inputs.
 - Held temporal/history context state on non-finite observations and kept valid finite
   coordinates observable without silently converting arbitrary invalid inputs into evidence.
+- Made working/prototype/UPGD memory, state builders, world models, and their scan wrappers
+  roll back complete invalid transitions. Rejected results expose explicit verdicts where the
+  public result schema supports them and never report plausible success metrics.
+- Rejected non-finite dream candidates and invalid or float32-unrepresentable resource costs;
+  exact zero-weight channels remain unused, while positive-weight products must be finite.
 - Strengthened IPMNIST and micro-continual shard merging to reject cross-seed learner,
   hyperparameter, mechanism, or runtime-environment drift. The common runtime environment is
-  now retained in the IPMNIST summary instead of being silently discarded.
+  now retained in derived summaries and validation receipts instead of being discarded.
+- Made proxy receipts require strict historical reference schemas, frozen control identities
+  and hyperparameters, compatible horizons, unique paired control seeds, and one common
+  protocol before a validation result can be issued.
 - Left the immutable evidence artifacts untouched. Registered-source hardening keeps the live
   five-claim registry fail-closed and `invalid` until separately authorized evidence renewal.
 
