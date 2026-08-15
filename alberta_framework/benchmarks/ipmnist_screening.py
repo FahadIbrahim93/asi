@@ -7153,12 +7153,19 @@ def validate_proxy(
     full_avg: dict[str, list[float]] = {"upgd_w": [], "adamw": []}
     n_tasks_seen: set[int] = set()
     seen_shards: set[tuple[str, int]] = set()
+    reference_config: dict[str, Any] | None = None
     for path in shard_paths:
         shard = load_shard(Path(path))
         if shard.get("noise_mode", "step") != "step":
             raise ValueError(
                 f"{path}: proxy validation requires noise_mode='step' shards "
                 f"(got {shard.get('noise_mode')!r})"
+            )
+        if reference_config is None:
+            reference_config = shard["config"]
+        elif shard["config"] != reference_config:
+            raise ValueError(
+                "shards span multiple protocol configs; validate them separately"
             )
         learner = {"upgd_w_control": "upgd_w", "adamw_control": "adamw"}.get(
             shard["config_name"]

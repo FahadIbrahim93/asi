@@ -1014,6 +1014,38 @@ class TestShardsAndMerge:
         ):
             validate_proxy([path, path], partials, atol=1e-6)
 
+    def test_validate_proxy_rejects_mixed_protocol_configs(self, tmp_path, small_data):
+        """Shards from different protocol configs must not validate together:
+        the ordering means behind proxy_validated would compare curves of
+        different horizons, a mixture merge_shards already refuses (issue
+        #154)."""
+        x, y = small_data
+        other = IPMNISTConfig(
+            n_tasks=2, task_length=20, input_dim=12, hidden1=8, hidden2=6, n_classes=5
+        )
+        partials = tmp_path / "partials"
+        partials.mkdir()
+        paths = []
+        for cfg, learner, name, seed in (
+            (SMALL, "upgd_w", "upgd_w_control", 0),
+            (other, "adamw", "adamw_control", 1),
+        ):
+            full = run_ipmnist(x, y, learner, seeds=[seed], config=cfg)
+            (partials / f"{learner}_seed{seed}.json").write_text(
+                json.dumps({"per_task_accuracy": full.per_task_accuracy.tolist()}),
+                encoding="utf-8",
+            )
+            proxy = run_screening_config(x, y, screening_spec(name), seed=seed, config=cfg)
+            path = tmp_path / f"{name}_seed{seed}.json"
+            path.write_text(json.dumps(shard_payload(proxy)), encoding="utf-8")
+            paths.append(path)
+
+        with pytest.raises(
+            ValueError,
+            match=r"shards span multiple protocol configs; validate them separately",
+        ):
+            validate_proxy(paths, partials, atol=1e-6)
+
     def test_validate_proxy_prefix_and_ordering(self, tmp_path, small_data):
         x, y = small_data
         partials = tmp_path / "partials"
