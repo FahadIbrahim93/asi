@@ -41,6 +41,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   synthetic and closed-loop streams before JAX modulo, floor-division, or periodic arithmetic
   can silently corrupt a regime clock or raise late overflow errors; valid int32 schedules
   retain their existing trajectories.
+- Required every periodic partial-observation mask to match the wrapped stream's exact feature
+  shape before stacking, preventing broadcast expansion of feature vectors into matrices.
 - Made experiment CSV and JSON artifacts preserve finite binary64 measurements exactly. A
   shared preflight now requires nonempty aggregates, canonical uint32 seed identities,
   aligned nonempty metric arrays and summary samples, and finite measurements before touching
