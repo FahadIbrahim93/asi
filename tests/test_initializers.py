@@ -17,6 +17,11 @@ class TestSparseInit:
         weights = sparse_init(key, (128, 10))
         chex.assert_shape(weights, (128, 10))
 
+    def test_list_shape_preserves_legacy_sequence_input(self):
+        """A two-element list remains a valid static shape input."""
+        weights = sparse_init(jr.key(42), [8, 5])  # type: ignore[arg-type]
+        chex.assert_shape(weights, (8, 5))
+
     def test_correct_sparsity_fraction(self):
         """Each output neuron should have approximately the right sparsity."""
         key = jr.key(42)
@@ -31,8 +36,8 @@ class TestSparseInit:
         # Each row should have exactly expected_zeros zeros
         chex.assert_trees_all_close(zeros_per_row, jnp.full(fan_out, expected_zeros))
 
-    def test_nonzero_values_within_lecun_bounds(self):
-        """Non-zero values should be within LeCun uniform bounds."""
+    def test_nonzero_values_within_paper_sparse_init_bounds(self):
+        """Non-zero values should stay within SparseInit Algorithm 1 bounds."""
         key = jr.key(42)
         fan_out, fan_in = 64, 32
         weights = sparse_init(key, (fan_out, fan_in), sparsity=0.5)
