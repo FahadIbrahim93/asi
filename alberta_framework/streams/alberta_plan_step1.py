@@ -350,7 +350,9 @@ class XDistShiftStream:
 
         # Decide whether to redraw scales this step. Always sample candidate
         # scales (jit-friendly) and use jnp.where to commit conditionally.
-        should_change = state.step_count % self._scale_change_interval == 0
+        should_change = (state.step_count > 0) & (
+            state.step_count % self._scale_change_interval == 0
+        )
         candidate_scales = jr.uniform(
             k_scales,
             (self._feature_dim,),

@@ -222,6 +222,22 @@ class TestXDistShiftStream:
         chex.assert_tree_all_finite(timestep.observation)
         chex.assert_tree_all_finite(timestep.target)
 
+    def test_initial_scales_last_for_the_first_full_segment(self):
+        stream = XDistShiftStream(
+            feature_dim=4,
+            num_relevant=2,
+            scale_change_interval=3,
+        )
+        state = stream.init(jr.key(7))
+        initial_scales = state.current_scales
+
+        for i in range(3):
+            _, state = stream.step(state, jnp.array(i))
+            chex.assert_trees_all_equal(state.current_scales, initial_scales)
+
+        _, state = stream.step(state, jnp.array(3))
+        assert not bool(jnp.array_equal(state.current_scales, initial_scales))
+
     def test_xdist_shift_stream_input_scale_changes(self):
         """Per-feature input std must measurably differ between segments
         separated by a scale change."""
