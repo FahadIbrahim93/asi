@@ -12,6 +12,15 @@ from jax import Array
 from jaxtyping import Float
 
 
+def _finite_or_zero(value: Array) -> Array:
+    """Replace non-finite entries with zero.
+
+    Inf error * a silent feature is ``0 * inf = NaN`` in the LMS
+    counterfactual. Scoring that as usefulness would poison replacement.
+    """
+    return jnp.where(jnp.isfinite(value), value, jnp.zeros_like(value))
+
+
 def trace_decay_from_half_life(half_life: float | Array) -> Float[Array, ""]:
     """Convert an eligibility half-life in steps to a trace decay.
 
@@ -66,7 +75,7 @@ def one_step_output_loss_reduction(
         / jnp.maximum(count, 1.0)
     )
     reduction = errors[:, None] * delta_prediction - 0.5 * delta_prediction**2
-    reduction = jnp.maximum(reduction, 0.0)
+    reduction = jnp.maximum(_finite_or_zero(reduction), 0.0)
     return jnp.where(active_mask[:, None], reduction, 0.0)
 
 
@@ -110,9 +119,9 @@ def contribution_trace_output_loss_reduction(
     step_size = jnp.asarray(step_size_output, dtype=jnp.float32)
     count = jnp.asarray(active_count, dtype=jnp.float32)
 
-    active_errors = jnp.where(active_mask, errors, 0.0)
+    active_errors = _finite_or_zero(jnp.where(active_mask, errors, 0.0))
     decayed_contribution = decay * contribution_trace
-    new_contribution_trace = decayed_contribution + (
+    new_contribution_trace = decayed_contribution + _finite_or_zero(
         active_errors[:, None] * feature_values[None, :]
     )
     new_contribution_trace = jnp.where(
@@ -120,9 +129,11 @@ def contribution_trace_output_loss_reduction(
         new_contribution_trace,
         decayed_contribution,
     )
-    new_feature_energy_trace = decay * feature_energy_trace + feature_values**2
+    new_feature_energy_trace = decay * feature_energy_trace + _finite_or_zero(
+        feature_values**2
+    )
 
-    delta_weight = (
+    delta_weight = _finite_or_zero(
         step_size
         * active_errors[:, None]
         * feature_values[None, :]
@@ -132,7 +143,7 @@ def contribution_trace_output_loss_reduction(
         delta_weight * new_contribution_trace
         - 0.5 * (delta_weight**2) * new_feature_energy_trace[None, :]
     )
-    reduction = jnp.maximum(reduction, 0.0)
+    reduction = jnp.maximum(_finite_or_zero(reduction), 0.0)
     return (
         jnp.where(active_mask[:, None], reduction, 0.0),
         new_contribution_trace,
@@ -192,25 +203,29 @@ def trace_output_loss_reduction(
     step_size = jnp.asarray(step_size_output, dtype=jnp.float32)
     count = jnp.asarray(active_count, dtype=jnp.float32)
 
-    active_errors = jnp.where(active_mask, errors, 0.0)
+    active_errors = _finite_or_zero(jnp.where(active_mask, errors, 0.0))
     new_error_trace = decay * error_trace + active_errors
     new_error_trace = jnp.where(active_mask, new_error_trace, decay * error_trace)
-    new_feature_trace = decay * feature_trace + feature_values
-    new_feature_energy_trace = decay * feature_energy_trace + feature_values**2
+    new_feature_trace = decay * feature_trace + _finite_or_zero(feature_values)
+    new_feature_energy_trace = decay * feature_energy_trace + _finite_or_zero(
+        feature_values**2
+    )
 
-    delta_weight = (
+    delta_weight = _finite_or_zero(
         step_size
         * active_errors[:, None]
         * feature_values[None, :]
         / jnp.maximum(count, 1.0)
     )
-    recurring_error_feature = new_error_trace[:, None] * new_feature_trace[None, :]
+    recurring_error_feature = _finite_or_zero(
+        new_error_trace[:, None] * new_feature_trace[None, :]
+    )
     recurring_feature_energy = new_feature_energy_trace[None, :]
     reduction = (
         delta_weight * recurring_error_feature
         - 0.5 * (delta_weight**2) * recurring_feature_energy
     )
-    reduction = jnp.maximum(reduction, 0.0)
+    reduction = jnp.maximum(_finite_or_zero(reduction), 0.0)
     return (
         jnp.where(active_mask[:, None], reduction, 0.0),
         new_error_trace,

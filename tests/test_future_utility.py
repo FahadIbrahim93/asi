@@ -203,3 +203,39 @@ def test_compositional_future_utility_metrics_remain_finite_with_variants() -> N
     chex.assert_tree_all_finite(result.metrics)
     chex.assert_tree_all_finite(result.state.utilities)
     chex.assert_tree_all_finite(result.state.candidate_utilities)
+
+
+def test_inf_error_silent_feature_scores_zero_not_nan() -> None:
+    """Inf error * a silent feature is 0*inf = NaN in the LMS counterfactual.
+
+    Fail-closed: score that pair as zero usefulness instead of poisoning
+    replacement with NaN.
+    """
+    errors = jnp.array([jnp.inf], dtype=jnp.float32)
+    features = jnp.array([0.0, 1.0], dtype=jnp.float32)
+    active_mask = jnp.array([True])
+    one_step = one_step_output_loss_reduction(
+        errors=errors,
+        feature_values=features,
+        active_mask=active_mask,
+        step_size_output=0.1,
+        active_count=1.0,
+    )
+    assert bool(jnp.all(jnp.isfinite(one_step)))
+    chex.assert_trees_all_close(one_step, jnp.zeros((1, 2), dtype=jnp.float32))
+
+    traced, contribution_trace, energy_trace = contribution_trace_output_loss_reduction(
+        errors=errors,
+        feature_values=features,
+        active_mask=active_mask,
+        step_size_output=0.1,
+        active_count=1.0,
+        contribution_trace=jnp.zeros((1, 2), dtype=jnp.float32),
+        feature_energy_trace=jnp.zeros(2, dtype=jnp.float32),
+        trace_decay=0.5,
+    )
+    assert bool(jnp.all(jnp.isfinite(traced)))
+    assert bool(jnp.all(jnp.isfinite(contribution_trace)))
+    assert bool(jnp.all(jnp.isfinite(energy_trace)))
+    chex.assert_trees_all_close(traced, jnp.zeros((1, 2), dtype=jnp.float32))
+
