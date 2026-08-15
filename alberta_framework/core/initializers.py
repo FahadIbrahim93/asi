@@ -4,6 +4,8 @@ Implements sparse initialization following Elsayed et al. 2024
 ("Streaming Deep Reinforcement Learning Finally Works").
 """
 
+import math
+
 import jax
 import jax.numpy as jnp
 import jax.random as jr
@@ -36,6 +38,11 @@ def sparse_init(
     Returns:
         Weight matrix of given shape with specified sparsity
 
+    Raises:
+        ValueError: If shape is not a 2-tuple, dimensions are not positive integers,
+            sparsity is not a finite real number in [0.0, 1.0], or init_type is not
+            'uniform' or 'normal'.
+
     Examples:
     ```python
     import jax.random as jr
@@ -46,7 +53,29 @@ def sparse_init(
     # weights has shape (128, 10), ~90% zeros per row
     ```
     """
+    if not isinstance(shape, (tuple, list)) or len(shape) != 2:
+        raise ValueError(f"shape must be a 2-tuple (fan_out, fan_in), got {shape!r}")
     fan_out, fan_in = shape
+    if (
+        isinstance(fan_out, bool)
+        or isinstance(fan_in, bool)
+        or not isinstance(fan_out, (int, jnp.integer))
+        or not isinstance(fan_in, (int, jnp.integer))
+        or fan_out <= 0
+        or fan_in <= 0
+    ):
+        raise ValueError(
+            f"shape dimensions must be positive integers, got fan_out={fan_out}, fan_in={fan_in}"
+        )
+    if (
+        isinstance(sparsity, bool)
+        or not isinstance(sparsity, (int, float, jnp.floating, jnp.integer))
+        or not math.isfinite(sparsity)
+        or not (0.0 <= sparsity <= 1.0)
+    ):
+        raise ValueError(
+            f"sparsity must be a finite real number in [0.0, 1.0], got {sparsity!r}"
+        )
     num_zeros = int(sparsity * fan_in + 0.5)  # round to nearest int
 
     # Split key for init and sparsity mask
