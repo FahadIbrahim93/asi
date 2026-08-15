@@ -127,10 +127,13 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.metadata
 import json
 import logging
 import math
+import os
 import platform
+import subprocess
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -183,9 +186,36 @@ from alberta_framework.evaluation.recurring_ipmnist_retention import (
 
 logger = logging.getLogger(__name__)
 
-SHARD_SCHEMA = "alberta.ipmnist_screening.shard.v1"
-SUMMARY_SCHEMA = "alberta.ipmnist_screening.summary.v1"
-VALIDATION_SCHEMA = "alberta.ipmnist_screening.proxy_validation.v1"
+LEGACY_SHARD_SCHEMA = "alberta.ipmnist_screening.shard.v1"
+SHARD_SCHEMA = "alberta.ipmnist_screening.shard.v2"
+LEGACY_SUMMARY_SCHEMA = "alberta.ipmnist_screening.summary.v1"
+SUMMARY_SCHEMA = "alberta.ipmnist_screening.summary.v2"
+LEGACY_VALIDATION_SCHEMA = "alberta.ipmnist_screening.proxy_validation.v1"
+VALIDATION_SCHEMA = "alberta.ipmnist_screening.proxy_validation.v2"
+SOURCE_PROVENANCE_SCHEMA = "alberta.ipmnist_screening.source_provenance.v1"
+DATASET_PROVENANCE_SCHEMA = "alberta.ipmnist_screening.dataset_provenance.v1"
+RUNTIME_SCHEMA = "alberta.ipmnist_screening.runtime.v1"
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_SOURCE_SCOPE = ("alberta_framework", "pyproject.toml", "uv.lock")
+_SOURCE_SCOPE_LABEL = "tracked:alberta_framework/**,pyproject.toml,uv.lock"
+_RUNTIME_ENVIRONMENT_KEYS = (
+    "CUDA_VISIBLE_DEVICES",
+    "JAX_DEFAULT_MATMUL_PRECISION",
+    "JAX_ENABLE_X64",
+    "JAX_PLATFORM_NAME",
+    "JAX_PLATFORMS",
+    "OMP_NUM_THREADS",
+    "XLA_FLAGS",
+)
+_DATASET_SOURCE = {
+    "provider": "openml",
+    "name": "mnist_784",
+    "version": 1,
+    "row_start": 0,
+    "row_stop_exclusive": 60_000,
+}
+_DATASET_MATERIALIZATION = "alberta.ipmnist.float32-neg1-pos1-int32-labels.v1"
 
 #: Default reduced-horizon proxy: 60 tasks x 5,000 steps. At this horizon the
 #: completed 10-seed full runs separate UPGD-W from AdamW by ~+0.022 average
@@ -6566,10 +6596,394 @@ def _array_bundle_sha256(domain: str, arrays: Mapping[str, object]) -> str:
         digest.update(encoded_name)
         digest.update(len(header).to_bytes(8, "little"))
         digest.update(header)
-        payload = array.tobytes(order="C")
-        digest.update(len(payload).to_bytes(8, "little"))
-        digest.update(payload)
+        digest.update(array.nbytes.to_bytes(8, "little"))
+        digest.update(memoryview(array).cast("B"))
     return digest.hexdigest()
+
+
+def _is_lower_hex(value: object, length: int) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == length
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _git_capture(repo_root: Path, *args: str) -> bytes:
+    try:
+        completed = subprocess.run(
+            ("git", "-C", str(repo_root), *args),
+            check=False,
+            capture_output=True,
+        )
+    except OSError as exc:
+        raise RuntimeError(
+            "screening source provenance requires an available Git repository"
+        ) from exc
+    if completed.returncode != 0:
+        detail = completed.stderr.decode("utf-8", errors="replace").strip()
+        suffix = f": {detail}" if detail else ""
+        raise RuntimeError(
+            "screening source provenance requires an available Git repository" + suffix
+        )
+    return completed.stdout
+
+
+def _source_scope_status(repo_root: Path) -> bytes:
+    return _git_capture(
+        repo_root,
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "--untracked-files=all",
+        "--",
+        *_SOURCE_SCOPE,
+    )
+
+
+def _tracked_worktree_status(repo_root: Path) -> bytes:
+    return _git_capture(
+        repo_root,
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "--untracked-files=no",
+    )
+
+
+def _untracked_python_sources(repo_root: Path) -> bytes:
+    return _git_capture(
+        repo_root,
+        "ls-files",
+        "-z",
+        "--others",
+        "--exclude-standard",
+        "--",
+        "*.py",
+    )
+
+
+def _ignored_python_sources(repo_root: Path) -> bytes:
+    raw = _git_capture(
+        repo_root,
+        "ls-files",
+        "-z",
+        "--others",
+        "--ignored",
+        "--exclude-standard",
+        "--",
+        "*.py",
+        "*.pyc",
+    )
+    unsafe: list[bytes] = []
+    for entry in raw.split(b"\0"):
+        parts = entry.split(b"/")
+        if not entry or parts[0] in {b".venv", b"outputs"} or b"__pycache__" in parts:
+            continue
+        unsafe.append(entry)
+    return b"\0".join(unsafe)
+
+
+def _tracked_index_flags(repo_root: Path) -> bytes:
+    return _git_capture(repo_root, "ls-files", "-v", "-z")
+
+
+def _head_source_blobs(raw_tree: bytes) -> dict[Path, str]:
+    blobs: dict[Path, str] = {}
+    try:
+        for raw_entry in raw_tree.split(b"\0"):
+            if not raw_entry:
+                continue
+            metadata, raw_path = raw_entry.split(b"\t", 1)
+            _mode, object_type, object_id = metadata.split(b" ", 2)
+            if object_type != b"blob":
+                raise ValueError("non-blob source object")
+            path = Path(os.fsdecode(raw_path))
+            object_id_text = object_id.decode("ascii")
+            if not _is_lower_hex(object_id_text, 40):
+                raise ValueError("noncanonical source blob ID")
+            blobs[path] = object_id_text
+    except (UnicodeError, ValueError) as exc:
+        raise RuntimeError("screening source provenance could not parse the HEAD tree") from exc
+    return blobs
+
+
+def _screening_source_provenance(repo_root: Path | None = None) -> dict[str, object]:
+    """Bind a clean checkout and the actual package/lock bytes used by a run.
+
+    The cleanliness scope intentionally excludes ``outputs/`` so sequential workers can
+    append immutable shards. Any tracked change in the package/lock scope, including a
+    staged change, is rejected. Untracked or ignored package files are found independently
+    of Git status so an importable local module cannot evade the receipt.
+    """
+    requested_root = _REPO_ROOT if repo_root is None else Path(repo_root)
+    try:
+        root = requested_root.resolve(strict=True)
+    except OSError as exc:
+        raise RuntimeError(
+            "screening source provenance requires an available Git repository"
+        ) from exc
+    top_level_raw = _git_capture(root, "rev-parse", "--show-toplevel")
+    try:
+        top_level = Path(top_level_raw.decode("utf-8").strip()).resolve(strict=True)
+    except (OSError, UnicodeError) as exc:
+        raise RuntimeError(
+            "screening source provenance could not resolve the Git repository"
+        ) from exc
+    if top_level != root:
+        raise RuntimeError(
+            f"screening source provenance root {root} is not the Git top level {top_level}"
+        )
+
+    if _tracked_worktree_status(root):
+        raise RuntimeError("screening source worktree is not clean: tracked files changed")
+    if (
+        _source_scope_status(root)
+        or _untracked_python_sources(root)
+        or _ignored_python_sources(root)
+    ):
+        raise RuntimeError(
+            "screening source worktree is not clean: untracked Python/package source "
+            "or source-scope file"
+        )
+
+    index_flags = _tracked_index_flags(root)
+    if any(
+        not entry.startswith(b"H ")
+        for entry in index_flags.split(b"\0")
+        if entry
+    ):
+        raise RuntimeError(
+            "screening source worktree is not clean: tracked index flags can hide changes"
+        )
+
+    commit = _git_capture(root, "rev-parse", "--verify", "HEAD").decode("ascii").strip()
+    tree = _git_capture(root, "rev-parse", "--verify", "HEAD^{tree}").decode("ascii").strip()
+    object_format = _git_capture(root, "rev-parse", "--show-object-format").decode(
+        "ascii"
+    ).strip()
+    if object_format != "sha1" or not _is_lower_hex(commit, 40) or not _is_lower_hex(tree, 40):
+        raise RuntimeError("screening source provenance requires canonical SHA-1 Git identities")
+
+    tracked_raw = _git_capture(root, "ls-files", "-z", "--", *_SOURCE_SCOPE)
+    head_tree_raw = _git_capture(root, "ls-tree", "-r", "-z", "HEAD", "--", *_SOURCE_SCOPE)
+    try:
+        tracked = tuple(
+            sorted(
+                Path(os.fsdecode(raw))
+                for raw in tracked_raw.split(b"\0")
+                if raw
+            )
+        )
+    except UnicodeError as exc:
+        raise RuntimeError("screening source provenance requires UTF-8 source paths") from exc
+    head_blobs = _head_source_blobs(head_tree_raw)
+    if set(tracked) != set(head_blobs):
+        raise RuntimeError("screening source inventory does not exactly match HEAD")
+    required = {
+        Path("pyproject.toml"),
+        Path("uv.lock"),
+        Path("alberta_framework/benchmarks/ipmnist_screening.py"),
+    }
+    if not required.issubset(tracked):
+        missing = sorted(path.as_posix() for path in required.difference(tracked))
+        raise RuntimeError(
+            f"screening source provenance is missing tracked source files: {missing}"
+        )
+
+    tracked_set = set(tracked)
+    package_root = root / "alberta_framework"
+    for candidate in package_root.rglob("*"):
+        relative = candidate.relative_to(root)
+        if "__pycache__" in relative.parts:
+            continue
+        if (candidate.is_file() or candidate.is_symlink()) and relative not in tracked_set:
+            raise RuntimeError(
+                "screening source worktree is not clean: untracked package source "
+                f"{relative.as_posix()}"
+            )
+
+    digest = hashlib.sha256()
+    digest.update(b"alberta.ipmnist_screening.relevant_source.v1\0")
+    uv_lock_sha256: str | None = None
+    for relative in tracked:
+        if relative.is_absolute() or ".." in relative.parts:
+            raise RuntimeError(f"invalid tracked source path {relative}")
+        source_path = root / relative
+        if source_path.is_symlink() or not source_path.is_file():
+            raise RuntimeError(f"tracked source is unavailable or not a regular file: {relative}")
+        try:
+            contents = source_path.read_bytes()
+            encoded_path = relative.as_posix().encode("utf-8")
+        except (OSError, UnicodeError) as exc:
+            raise RuntimeError(f"could not read tracked source bytes: {relative}") from exc
+        git_blob_digest = hashlib.sha1(
+            b"blob " + str(len(contents)).encode("ascii") + b"\0" + contents,
+            usedforsecurity=False,
+        ).hexdigest()
+        if git_blob_digest != head_blobs[relative]:
+            raise RuntimeError(
+                f"screening source worktree is not clean: {relative} differs from HEAD"
+            )
+        digest.update(len(encoded_path).to_bytes(4, "little"))
+        digest.update(encoded_path)
+        digest.update(len(contents).to_bytes(8, "little"))
+        digest.update(contents)
+        if relative == Path("uv.lock"):
+            uv_lock_sha256 = hashlib.sha256(contents).hexdigest()
+
+    if uv_lock_sha256 is None:
+        raise RuntimeError("screening source provenance could not bind uv.lock")
+    final_identity = (
+        _git_capture(root, "rev-parse", "--verify", "HEAD").decode("ascii").strip(),
+        _git_capture(root, "rev-parse", "--verify", "HEAD^{tree}").decode("ascii").strip(),
+        _git_capture(root, "rev-parse", "--show-object-format").decode("ascii").strip(),
+    )
+    final_inventory = _git_capture(root, "ls-files", "-z", "--", *_SOURCE_SCOPE)
+    final_head_tree = _git_capture(
+        root, "ls-tree", "-r", "-z", "HEAD", "--", *_SOURCE_SCOPE
+    )
+    if final_identity != (commit, tree, object_format):
+        raise RuntimeError("screening source identity changed while provenance was captured")
+    if final_inventory != tracked_raw or final_head_tree != head_tree_raw:
+        raise RuntimeError("screening source inventory changed while provenance was captured")
+    if (
+        _tracked_worktree_status(root)
+        or _source_scope_status(root)
+        or _untracked_python_sources(root)
+        or _ignored_python_sources(root)
+        or _tracked_index_flags(root) != index_flags
+    ):
+        raise RuntimeError("screening source files changed while provenance was captured")
+    return {
+        "schema": SOURCE_PROVENANCE_SCHEMA,
+        "git_commit": commit,
+        "git_tree": tree,
+        "git_object_format": object_format,
+        "relevant_source_scope": _SOURCE_SCOPE_LABEL,
+        "relevant_source_file_count": len(tracked),
+        "relevant_source_sha256": digest.hexdigest(),
+        "uv_lock_sha256": uv_lock_sha256,
+        "worktree_clean": True,
+    }
+
+
+def _screening_runtime_environment() -> dict[str, object]:
+    """Return the runtime contract that must stay fixed through a screening run."""
+    try:
+        package_versions = {
+            name: importlib.metadata.version(name)
+            for name in ("chex", "jax", "jaxlib", "numpy", "scikit-learn")
+        }
+        backend = jax.default_backend()
+        devices = [
+            {
+                "id": int(device.id),
+                "platform": str(device.platform),
+                "device_kind": str(device.device_kind),
+                "process_index": int(device.process_index),
+            }
+            for device in jax.devices()
+        ]
+    except Exception as exc:
+        raise RuntimeError("screening runtime provenance is unavailable") from exc
+    if not devices:
+        raise RuntimeError("screening runtime provenance found no JAX devices")
+    return {
+        "schema": RUNTIME_SCHEMA,
+        "python": {
+            "implementation": platform.python_implementation(),
+            "version": platform.python_version(),
+        },
+        "platform": {
+            "system": platform.system(),
+            "release": platform.release(),
+            "machine": platform.machine(),
+        },
+        "packages": package_versions,
+        "jax": {
+            "backend": backend,
+            "devices": devices,
+            "config": {
+                "jax_enable_x64": bool(jax.config.jax_enable_x64),
+                "jax_default_matmul_precision": (
+                    None
+                    if jax.config.jax_default_matmul_precision is None
+                    else str(jax.config.jax_default_matmul_precision)
+                ),
+                "jax_disable_jit": bool(jax.config.jax_disable_jit),
+                "jax_numpy_dtype_promotion": str(jax.config.jax_numpy_dtype_promotion),
+                "jax_numpy_rank_promotion": str(jax.config.jax_numpy_rank_promotion),
+                "jax_random_seed_offset": int(jax.config.jax_random_seed_offset),
+                "jax_threefry_partitionable": bool(
+                    jax.config.jax_threefry_partitionable
+                ),
+                "jax_default_prng_impl": str(jax.config.jax_default_prng_impl),
+            },
+        },
+        "process_environment": {
+            name: os.environ.get(name) for name in _RUNTIME_ENVIRONMENT_KEYS
+        },
+    }
+
+
+def _materialized_dataset_provenance(
+    data_x: object, data_y: object
+) -> dict[str, object]:
+    """Hash the exact effective float32 features and int32 labels consumed by JAX."""
+    raw_x = np.asarray(jax.device_get(data_x))
+    raw_y = np.asarray(jax.device_get(data_y))
+    if raw_x.dtype.kind not in {"f", "i", "u"} or raw_x.ndim != 2 or raw_x.size == 0:
+        raise ValueError("dataset features must be a non-empty rank-two numeric array")
+    if raw_y.dtype.kind not in {"i", "u"} or raw_y.ndim != 1:
+        raise ValueError("dataset labels must be a rank-one integer array")
+    if raw_x.shape[0] != raw_y.shape[0] or raw_y.size == 0:
+        raise ValueError("dataset feature and label rows must be non-empty and aligned")
+    int32_info = np.iinfo(np.int32)
+    if np.any(raw_y < int32_info.min) or np.any(raw_y > int32_info.max):
+        raise ValueError("dataset labels must be representable as int32")
+    effective_x = _canonical_hash_array(np.asarray(raw_x, dtype=np.float32))
+    effective_y = _canonical_hash_array(np.asarray(raw_y, dtype=np.int32))
+    if not np.all(np.isfinite(effective_x)):
+        raise ValueError("dataset features must remain finite after float32 materialization")
+    return {
+        "schema": DATASET_PROVENANCE_SCHEMA,
+        "source": dict(_DATASET_SOURCE),
+        "materialization": _DATASET_MATERIALIZATION,
+        "x": {
+            "dtype": effective_x.dtype.str,
+            "shape": list(effective_x.shape),
+            "sha256": _array_bundle_sha256(
+                "alberta.ipmnist_screening.materialized_x.v1", {"x": effective_x}
+            ),
+        },
+        "y": {
+            "dtype": effective_y.dtype.str,
+            "shape": list(effective_y.shape),
+            "sha256": _array_bundle_sha256(
+                "alberta.ipmnist_screening.materialized_y.v1", {"y": effective_y}
+            ),
+        },
+    }
+
+
+def _screening_dataset_provenance(
+    data_x: object, data_y: object
+) -> dict[str, object]:
+    """Bind and validate the frozen OpenML MNIST training materialization."""
+    provenance = _materialized_dataset_provenance(data_x, data_y)
+    x = np.asarray(jax.device_get(data_x), dtype=np.float32)
+    y = np.asarray(jax.device_get(data_y), dtype=np.int32)
+    if x.shape != (60_000, 784) or y.shape != (60_000,):
+        raise ValueError(
+            "screening dataset must materialize OpenML mnist_784 v1 rows 0:60000 "
+            "as x=(60000, 784) and y=(60000,)"
+        )
+    if np.any(x < -1.0) or np.any(x > 1.0):
+        raise ValueError("screening dataset features must use the frozen [-1, 1] scaling")
+    if np.any(y < 0) or np.any(y > 9):
+        raise ValueError("screening dataset labels must be in [0, 9]")
+    return provenance
 
 
 def _validated_permutation(permutation: object, *, input_dim: int) -> np.ndarray:
@@ -7261,45 +7675,421 @@ def run_screening_config(
 # =============================================================================
 
 
-def shard_payload(result: ScreeningRunResult) -> dict[str, Any]:
-    """Serialize one (config, seed) screening run to a mergeable shard."""
+_V2_SHARD_FIELDS = frozenset(
+    {
+        "schema",
+        "evidence_policy",
+        "config_name",
+        "base_learner",
+        "hyperparameters",
+        "seed",
+        "noise_mode",
+        "noise_pool_steps",
+        "config",
+        "per_task_accuracy",
+        "per_task_loss",
+        "per_task_plasticity",
+        "wall_clock_seconds",
+        "created_unix",
+        "source_provenance",
+        "dataset_provenance",
+        "environment",
+    }
+)
+
+
+def _require_exact_keys(
+    value: object, expected: frozenset[str] | set[str], *, context: str
+) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{context} must be an object")
+    actual = set(value)
+    missing = sorted(expected.difference(actual))
+    unexpected = sorted(actual.difference(expected))
+    if missing or unexpected:
+        parts: list[str] = []
+        if missing:
+            parts.append(f"missing field(s) {missing}")
+        if unexpected:
+            parts.append(f"unexpected field(s) {unexpected}")
+        raise ValueError(f"{context}: {'; '.join(parts)}")
+    return cast(Mapping[str, Any], value)
+
+
+def _required_nonempty_string(value: object, *, context: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{context} must be a non-empty string")
+    return value
+
+
+def _is_finite_json_number(value: object) -> bool:
+    if type(value) not in (int, float):
+        return False
+    try:
+        return math.isfinite(float(cast(int | float, value)))
+    except (OverflowError, ValueError):
+        return False
+
+
+def _validated_source_provenance(value: object, *, context: str) -> dict[str, Any]:
+    provenance = _require_exact_keys(
+        value,
+        {
+            "schema",
+            "git_commit",
+            "git_tree",
+            "git_object_format",
+            "relevant_source_scope",
+            "relevant_source_file_count",
+            "relevant_source_sha256",
+            "uv_lock_sha256",
+            "worktree_clean",
+        },
+        context=f"{context} source provenance",
+    )
+    if provenance["schema"] != SOURCE_PROVENANCE_SCHEMA:
+        raise ValueError(f"{context} source provenance has an unsupported schema")
+    if provenance["git_object_format"] != "sha1":
+        raise ValueError(f"{context} source provenance git_object_format must be 'sha1'")
+    if not _is_lower_hex(provenance["git_commit"], 40) or not _is_lower_hex(
+        provenance["git_tree"], 40
+    ):
+        raise ValueError(f"{context} source provenance must record lowercase Git SHA-1 IDs")
+    if provenance["relevant_source_scope"] != _SOURCE_SCOPE_LABEL:
+        raise ValueError(f"{context} source provenance has an unsupported source scope")
+    file_count = provenance["relevant_source_file_count"]
+    if type(file_count) is not int or file_count <= 0:
+        raise ValueError(f"{context} source provenance file count must be positive")
+    if not _is_lower_hex(provenance["relevant_source_sha256"], 64) or not _is_lower_hex(
+        provenance["uv_lock_sha256"], 64
+    ):
+        raise ValueError(f"{context} source provenance must record lowercase SHA-256 digests")
+    if provenance["worktree_clean"] is not True:
+        raise ValueError(f"{context} source provenance must record a clean source worktree")
+    return dict(provenance)
+
+
+def _validated_dataset_provenance(value: object, *, context: str) -> dict[str, Any]:
+    provenance = _require_exact_keys(
+        value,
+        {"schema", "source", "materialization", "x", "y"},
+        context=f"{context} dataset provenance",
+    )
+    if provenance["schema"] != DATASET_PROVENANCE_SCHEMA:
+        raise ValueError(f"{context} dataset provenance has an unsupported schema")
+    source = _require_exact_keys(
+        provenance["source"],
+        {"provider", "name", "version", "row_start", "row_stop_exclusive"},
+        context=f"{context} dataset provenance source",
+    )
+    if (
+        not isinstance(source["provider"], str)
+        or not isinstance(source["name"], str)
+        or type(source["version"]) is not int
+        or type(source["row_start"]) is not int
+        or type(source["row_stop_exclusive"]) is not int
+        or dict(source) != _DATASET_SOURCE
+    ):
+        raise ValueError(f"{context} dataset provenance has an unsupported source selection")
+    if provenance["materialization"] != _DATASET_MATERIALIZATION:
+        raise ValueError(f"{context} dataset provenance has an unsupported materialization")
+
+    arrays: dict[str, Mapping[str, Any]] = {}
+    expected_ranks = {"x": 2, "y": 1}
+    expected_dtypes = {"x": "<f4", "y": "<i4"}
+    for name in ("x", "y"):
+        binding = _require_exact_keys(
+            provenance[name],
+            {"dtype", "shape", "sha256"},
+            context=f"{context} dataset provenance {name}",
+        )
+        shape = binding["shape"]
+        if (
+            not isinstance(shape, list)
+            or len(shape) != expected_ranks[name]
+            or any(type(dimension) is not int or dimension <= 0 for dimension in shape)
+        ):
+            raise ValueError(
+                f"{context} dataset provenance {name} shape must be a positive "
+                f"rank-{expected_ranks[name]} integer list"
+            )
+        if binding["dtype"] != expected_dtypes[name]:
+            raise ValueError(
+                f"{context} dataset provenance {name} dtype must be {expected_dtypes[name]!r}"
+            )
+        if not _is_lower_hex(binding["sha256"], 64):
+            raise ValueError(
+                f"{context} dataset provenance {name} must record a lowercase SHA-256"
+            )
+        arrays[name] = binding
+    if arrays["x"]["shape"][0] != arrays["y"]["shape"][0]:
+        raise ValueError(f"{context} dataset provenance x/y row counts must match")
+    if arrays["x"]["shape"] != [60_000, 784] or arrays["y"]["shape"] != [60_000]:
+        raise ValueError(
+            f"{context} dataset provenance must bind canonical x=[60000, 784] and "
+            "y=[60000] materializations"
+        )
+    return dict(provenance)
+
+
+def _validate_dataset_config_binding(
+    provenance: Mapping[str, Any], config: IPMNISTConfig, *, context: str
+) -> None:
+    x_binding = cast(Mapping[str, Any], provenance["x"])
+    x_shape = cast(list[int], x_binding["shape"])
+    if config.input_dim != x_shape[1]:
+        raise ValueError(
+            f"{context}: protocol input_dim={config.input_dim} does not match the "
+            f"dataset width {x_shape[1]}"
+        )
+    if config.n_classes != 10:
+        raise ValueError(f"{context}: canonical MNIST protocol n_classes must be 10")
+
+
+def _validated_runtime_environment(value: object, *, context: str) -> dict[str, Any]:
+    environment = _require_exact_keys(
+        value,
+        {"schema", "python", "platform", "packages", "jax", "process_environment"},
+        context=f"{context} runtime environment",
+    )
+    if environment["schema"] != RUNTIME_SCHEMA:
+        raise ValueError(f"{context} runtime environment has an unsupported schema")
+    python = _require_exact_keys(
+        environment["python"],
+        {"implementation", "version"},
+        context=f"{context} runtime environment python",
+    )
+    platform_binding = _require_exact_keys(
+        environment["platform"],
+        {"system", "release", "machine"},
+        context=f"{context} runtime environment platform",
+    )
+    packages = _require_exact_keys(
+        environment["packages"],
+        {"chex", "jax", "jaxlib", "numpy", "scikit-learn"},
+        context=f"{context} runtime environment packages",
+    )
+    jax_binding = _require_exact_keys(
+        environment["jax"],
+        {"backend", "devices", "config"},
+        context=f"{context} runtime environment jax",
+    )
+    jax_config = _require_exact_keys(
+        jax_binding["config"],
+        {
+            "jax_enable_x64",
+            "jax_default_matmul_precision",
+            "jax_disable_jit",
+            "jax_numpy_dtype_promotion",
+            "jax_numpy_rank_promotion",
+            "jax_random_seed_offset",
+            "jax_threefry_partitionable",
+            "jax_default_prng_impl",
+        },
+        context=f"{context} runtime environment jax.config",
+    )
+    process_environment = _require_exact_keys(
+        environment["process_environment"],
+        set(_RUNTIME_ENVIRONMENT_KEYS),
+        context=f"{context} runtime environment process_environment",
+    )
+    for field, item in python.items():
+        _required_nonempty_string(item, context=f"{context} runtime environment python.{field}")
+    for field, item in platform_binding.items():
+        _required_nonempty_string(
+            item, context=f"{context} runtime environment platform.{field}"
+        )
+    for field, item in packages.items():
+        _required_nonempty_string(
+            item, context=f"{context} runtime environment packages.{field}"
+        )
+    _required_nonempty_string(
+        jax_binding["backend"], context=f"{context} runtime environment jax.backend"
+    )
+    devices = jax_binding["devices"]
+    if not isinstance(devices, list) or not devices:
+        raise ValueError(f"{context} runtime environment JAX devices must be non-empty")
+    for index, device in enumerate(devices):
+        binding = _require_exact_keys(
+            device,
+            {"id", "platform", "device_kind", "process_index"},
+            context=f"{context} runtime environment JAX device {index}",
+        )
+        if type(binding["id"]) is not int or type(binding["process_index"]) is not int:
+            raise ValueError(
+                f"{context} runtime environment JAX device IDs must be integers"
+            )
+        _required_nonempty_string(
+            binding["platform"],
+            context=f"{context} runtime environment JAX device {index}.platform",
+        )
+        _required_nonempty_string(
+            binding["device_kind"],
+            context=f"{context} runtime environment JAX device {index}.device_kind",
+        )
+    for field in (
+        "jax_enable_x64",
+        "jax_disable_jit",
+        "jax_threefry_partitionable",
+    ):
+        if type(jax_config[field]) is not bool:
+            raise ValueError(f"{context} runtime environment {field} must be boolean")
+    precision = jax_config["jax_default_matmul_precision"]
+    if precision is not None and (not isinstance(precision, str) or not precision):
+        raise ValueError(
+            f"{context} runtime environment jax_default_matmul_precision must be a "
+            "string or null"
+        )
+    for field in (
+        "jax_numpy_dtype_promotion",
+        "jax_numpy_rank_promotion",
+        "jax_default_prng_impl",
+    ):
+        _required_nonempty_string(
+            jax_config[field], context=f"{context} runtime environment {field}"
+        )
+    if type(jax_config["jax_random_seed_offset"]) is not int:
+        raise ValueError(
+            f"{context} runtime environment jax_random_seed_offset must be an integer"
+        )
+    if any(
+        value is not None and not isinstance(value, str)
+        for value in process_environment.values()
+    ):
+        raise ValueError(
+            f"{context} runtime environment process values must be strings or null"
+        )
+    return dict(environment)
+
+
+def shard_payload(
+    result: ScreeningRunResult,
+    *,
+    source_provenance: Mapping[str, object],
+    dataset_provenance: Mapping[str, object],
+    environment: Mapping[str, object],
+) -> dict[str, Any]:
+    """Serialize one bound (config, seed) screening run as a strict v2 shard."""
     seed = require_jax_seed(result.seed, name="result seed")
     spec = screening_spec(result.config_name)
+    if result.base_learner != spec.base_learner:
+        raise ValueError(
+            f"new shard base_learner must match registered arm {spec.base_learner!r}"
+        )
+    if result.hyperparameters != spec.hyperparameters:
+        raise ValueError("new shard hyperparameters must exactly match the registered arm")
     noise_mode = _validated_screening_noise_mode(result.noise_mode, spec)
     noise_pool_steps = _validated_screening_noise_pool_steps(
         noise_mode, result.noise_pool_steps
     )
-    return {
+    source_binding = _validated_source_provenance(source_provenance, context="new shard")
+    dataset_binding = _validated_dataset_provenance(dataset_provenance, context="new shard")
+    runtime_binding = _validated_runtime_environment(environment, context="new shard")
+    _validate_dataset_config_binding(dataset_binding, result.config, context="new shard")
+    if not isinstance(result.base_learner, str) or not result.base_learner:
+        raise ValueError("new shard base_learner must be a non-empty string")
+    if not isinstance(result.hyperparameters, dict) or any(
+        not isinstance(name, str) for name in result.hyperparameters
+    ):
+        raise ValueError("new shard hyperparameters must be an object with string keys")
+    curves: dict[str, np.ndarray] = {}
+    for field in ("per_task_accuracy", "per_task_loss", "per_task_plasticity"):
+        try:
+            raw_values = np.asarray(jax.device_get(getattr(result, field)))
+            if raw_values.dtype.kind not in {"i", "u", "f"}:
+                raise TypeError("non-numeric curve")
+            values = np.asarray(raw_values, dtype=np.float64)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"new shard {field} must be finite with shape ({result.config.n_tasks},)"
+            ) from exc
+        if values.shape != (result.config.n_tasks,) or not np.all(np.isfinite(values)):
+            raise ValueError(
+                f"new shard {field} must be finite with shape ({result.config.n_tasks},)"
+            )
+        curves[field] = values
+    wall_clock_seconds = _validated_wall_clock_seconds(
+        result.wall_clock_seconds, "new shard"
+    )
+    payload: dict[str, Any] = {
         "schema": SHARD_SCHEMA,
         "evidence_policy": dict(NONPROMOTING_POLICY),
         "config_name": result.config_name,
         "base_learner": result.base_learner,
-        "hyperparameters": result.hyperparameters,
+        "hyperparameters": dict(result.hyperparameters),
         "seed": seed,
         "noise_mode": noise_mode,
         "noise_pool_steps": noise_pool_steps,
         "config": result.config.to_config(),
-        "per_task_accuracy": [round(float(v), 8) for v in result.per_task_accuracy],
-        "per_task_loss": [round(float(v), 8) for v in result.per_task_loss],
-        "per_task_plasticity": [round(float(v), 8) for v in result.per_task_plasticity],
-        "wall_clock_seconds": round(result.wall_clock_seconds, 2),
+        "per_task_accuracy": [round(float(v), 8) for v in curves["per_task_accuracy"]],
+        "per_task_loss": [round(float(v), 8) for v in curves["per_task_loss"]],
+        "per_task_plasticity": [
+            round(float(v), 8) for v in curves["per_task_plasticity"]
+        ],
+        "wall_clock_seconds": round(wall_clock_seconds, 2),
         "created_unix": time.time(),
-        "environment": {
-            "jax": jax.__version__,
-            "numpy": np.__version__,
-            "python": platform.python_version(),
-            "platform": platform.platform(),
-        },
+        "source_provenance": source_binding,
+        "dataset_provenance": dataset_binding,
+        "environment": runtime_binding,
     }
+    try:
+        json.dumps(payload, allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("new shard payload must be strict JSON") from exc
+    return payload
 
 
 def load_shard(path: Path) -> dict[str, Any]:
-    """Load and structurally validate one screening shard."""
+    """Load legacy v1 or strictly validate a source-bound v2 screening shard."""
     payload = load_strict_json_object(path)
-    if payload.get("schema") != SHARD_SCHEMA:
-        raise ValueError(f"{path}: not an {SHARD_SCHEMA} shard")
+    schema = payload.get("schema")
+    if schema not in {LEGACY_SHARD_SCHEMA, SHARD_SCHEMA}:
+        raise ValueError(
+            f"{path}: not a supported {LEGACY_SHARD_SCHEMA} or {SHARD_SCHEMA} shard"
+        )
+    is_v2 = schema == SHARD_SCHEMA
+    if is_v2:
+        _require_exact_keys(payload, _V2_SHARD_FIELDS, context=str(path))
+        if payload["evidence_policy"] != NONPROMOTING_POLICY:
+            raise ValueError(f"{path}: evidence_policy must be the frozen nonpromoting policy")
+        created_unix = payload["created_unix"]
+        if type(created_unix) not in (int, float):
+            raise ValueError(f"{path}: created_unix must be a finite, non-negative number")
+        try:
+            created_value = float(created_unix)
+        except (OverflowError, ValueError) as exc:
+            raise ValueError(
+                f"{path}: created_unix must be a finite, non-negative number"
+            ) from exc
+        if not math.isfinite(created_value) or created_value < 0.0:
+            raise ValueError(f"{path}: created_unix must be a finite, non-negative number")
+        payload["created_unix"] = created_value
+        payload["source_provenance"] = _validated_source_provenance(
+            payload["source_provenance"], context=str(path)
+        )
+        payload["dataset_provenance"] = _validated_dataset_provenance(
+            payload["dataset_provenance"], context=str(path)
+        )
+        payload["environment"] = _validated_runtime_environment(
+            payload["environment"], context=str(path)
+        )
     config = IPMNISTConfig(**payload["config"])
+    if is_v2:
+        _validate_dataset_config_binding(
+            payload["dataset_provenance"], config, context=str(path)
+        )
     for fieldname in ("per_task_accuracy", "per_task_loss", "per_task_plasticity"):
+        if is_v2:
+            raw_values = payload[fieldname]
+            if (
+                not isinstance(raw_values, list)
+                or len(raw_values) != config.n_tasks
+                or any(not _is_finite_json_number(value) for value in raw_values)
+            ):
+                raise ValueError(
+                    f"{path}: {fieldname} must be a list of finite JSON numbers "
+                    f"with length {config.n_tasks}"
+                )
         values = np.asarray(payload[fieldname], dtype=np.float64)
         if values.shape != (config.n_tasks,) or not np.all(np.isfinite(values)):
             raise ValueError(f"{path}: {fieldname} must be finite with shape ({config.n_tasks},)")
@@ -7310,6 +8100,12 @@ def load_shard(path: Path) -> dict[str, Any]:
     if payload.get("config_name") not in SCREENING_REGISTRY:
         raise ValueError(f"{path}: unknown config_name {payload.get('config_name')!r}")
     spec = SCREENING_REGISTRY[payload["config_name"]]
+    if is_v2 and payload.get("base_learner") != spec.base_learner:
+        raise ValueError(
+            f"{path}: base_learner must match registered arm {spec.base_learner!r}"
+        )
+    if is_v2 and payload.get("hyperparameters") != spec.hyperparameters:
+        raise ValueError(f"{path}: hyperparameters must exactly match the registered arm")
     noise_mode = _validated_screening_noise_mode(
         payload.get("noise_mode", "step"), spec, context=path
     )
@@ -7317,7 +8113,7 @@ def load_shard(path: Path) -> dict[str, Any]:
         noise_mode,
         payload.get("noise_pool_steps", _MISSING_NOISE_POOL_STEPS),
         context=path,
-        allow_unrecorded_pool=True,
+        allow_unrecorded_pool=not is_v2,
     )
     payload["noise_mode"] = noise_mode
     payload["noise_pool_steps"] = noise_pool_steps
@@ -7325,21 +8121,23 @@ def load_shard(path: Path) -> dict[str, Any]:
         raise ValueError(f"{path}: base_learner must be a non-empty string")
     if not isinstance(payload.get("hyperparameters"), dict):
         raise ValueError(f"{path}: hyperparameters must be an object")
-    environment = payload.get("environment")
-    required_environment_fields = ("jax", "numpy", "python", "platform")
-    if not isinstance(environment, dict) or any(
-        not isinstance(environment.get(field), str) or not environment[field]
-        for field in required_environment_fields
-    ):
-        raise ValueError(
-            f"{path}: environment must record non-empty jax, numpy, python, and platform strings"
-        )
+    if not is_v2:
+        environment = payload.get("environment")
+        required_environment_fields = ("jax", "numpy", "python", "platform")
+        if not isinstance(environment, dict) or any(
+            not isinstance(environment.get(field), str) or not environment[field]
+            for field in required_environment_fields
+        ):
+            raise ValueError(
+                f"{path}: environment must record non-empty jax, numpy, python, "
+                "and platform strings"
+            )
     return payload
 
 
 def _screening_batch_environment(
     shards: Sequence[dict[str, Any]],
-) -> dict[str, str]:
+) -> dict[str, Any]:
     """Return the exact runtime contract shared by one derived artifact."""
     if not shards:
         raise ValueError("no shards given")
@@ -7355,6 +8153,26 @@ def _screening_batch_environment(
             f"separately (mismatched: {environment_mismatches})"
         )
     return dict(reference_environment)
+
+
+def _screening_batch_binding(
+    shards: Sequence[dict[str, Any]], *, field: str, label: str
+) -> dict[str, Any]:
+    """Return an exact provenance binding shared by every v2 shard."""
+    if not shards:
+        raise ValueError("no shards given")
+    reference = shards[0][field]
+    mismatches = [
+        f"{shard['config_name']}/seed={shard['seed']}"
+        for shard in shards
+        if shard[field] != reference
+    ]
+    if mismatches:
+        raise ValueError(
+            f"shards span multiple {label} bindings; process matching runs separately "
+            f"(mismatched: {mismatches})"
+        )
+    return dict(reference)
 
 
 def _validate_screening_arm_contract(
@@ -7408,6 +8226,22 @@ def merge_shards(
     shards = [load_shard(Path(p)) for p in paths]
     if not shards:
         raise ValueError("no shards given")
+    shard_schemas = {shard["schema"] for shard in shards}
+    if len(shard_schemas) != 1:
+        raise ValueError("shards span multiple shard schemas; merge v1 and v2 separately")
+    shard_schema = shard_schemas.pop()
+    source_provenance = (
+        _screening_batch_binding(
+            shards, field="source_provenance", label="source provenance"
+        )
+        if shard_schema == SHARD_SCHEMA
+        else None
+    )
+    dataset_provenance = (
+        _screening_batch_binding(shards, field="dataset_provenance", label="dataset")
+        if shard_schema == SHARD_SCHEMA
+        else None
+    )
     configs = {tuple(sorted(s["config"].items())) for s in shards}
     if len(configs) != 1:
         raise ValueError("shards span multiple protocol configs; merge them separately")
@@ -7540,8 +8374,8 @@ def merge_shards(
         entries.append(entry)
 
     entries.sort(key=lambda e: e["average_online_accuracy_mean"], reverse=True)
-    return {
-        "schema": SUMMARY_SCHEMA,
+    summary: dict[str, Any] = {
+        "schema": SUMMARY_SCHEMA if shard_schema == SHARD_SCHEMA else LEGACY_SUMMARY_SCHEMA,
         "evidence_policy": dict(NONPROMOTING_POLICY),
         "created_unix": time.time(),
         "protocol_config": dict(shards[0]["config"]),
@@ -7554,6 +8388,10 @@ def merge_shards(
         "n_shards": len(shards),
         "results": entries,
     }
+    if source_provenance is not None and dataset_provenance is not None:
+        summary["source_provenance"] = source_provenance
+        summary["dataset_provenance"] = dataset_provenance
+    return summary
 
 
 def validate_proxy(
@@ -7571,6 +8409,27 @@ def validate_proxy(
     """
     partials_dir = Path(partials_dir)
     shards = [load_shard(Path(path)) for path in shard_paths]
+    if not shards:
+        raise ValueError("no shards given")
+    shard_schemas = {shard["schema"] for shard in shards}
+    if len(shard_schemas) != 1:
+        raise ValueError(
+            "proxy-validation shards span multiple shard schemas; validate v1 and v2 "
+            "separately"
+        )
+    shard_schema = shard_schemas.pop()
+    source_provenance = (
+        _screening_batch_binding(
+            shards, field="source_provenance", label="source provenance"
+        )
+        if shard_schema == SHARD_SCHEMA
+        else None
+    )
+    dataset_provenance = (
+        _screening_batch_binding(shards, field="dataset_provenance", label="dataset")
+        if shard_schema == SHARD_SCHEMA
+        else None
+    )
     environment = _screening_batch_environment(shards)
     configs = {tuple(sorted(shard["config"].items())) for shard in shards}
     if len(configs) != 1:
@@ -7696,8 +8555,10 @@ def validate_proxy(
         if full_avg["upgd_w"] and full_avg["adamw"]
         else None
     )
-    return {
-        "schema": VALIDATION_SCHEMA,
+    report: dict[str, Any] = {
+        "schema": (
+            VALIDATION_SCHEMA if shard_schema == SHARD_SCHEMA else LEGACY_VALIDATION_SCHEMA
+        ),
         "created_unix": time.time(),
         "atol": atol,
         "environment": environment,
@@ -7718,6 +8579,10 @@ def validate_proxy(
             and ordering_full_prefix is True
         ),
     }
+    if source_provenance is not None and dataset_provenance is not None:
+        report["source_provenance"] = source_provenance
+        report["dataset_provenance"] = dataset_provenance
+    return report
 
 
 # =============================================================================
@@ -7733,7 +8598,9 @@ def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
     keeps a duplicate launch from silently replacing another worker's shard.
     """
 
-    encoded = (json.dumps(payload, indent=1, sort_keys=True) + "\n").encode("utf-8")
+    encoded = (
+        json.dumps(payload, allow_nan=False, indent=1, sort_keys=True) + "\n"
+    ).encode("utf-8")
     atomic_write_new(Path(path), encoded)
 
 
@@ -7799,9 +8666,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         seed = run_seed
         spec = screening_spec(args.config_name)
         config = IPMNISTConfig(n_tasks=args.n_tasks, task_length=args.task_length)
+        source_provenance = _screening_source_provenance()
+        runtime_environment = _screening_runtime_environment()
         data_home = args.data_home if args.data_home is not None else default_openml_data_home()
         logger.info("loading MNIST from data_home=%s", data_home)
         data_x, data_y = load_mnist_train(data_home)
+        dataset_provenance = _screening_dataset_provenance(data_x, data_y)
         logger.info(
             "running %s seed=%d for %d tasks x %d steps "
             "(noise_mode=%s, noise_pool_steps=%s)",
@@ -7818,7 +8688,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             noise_mode=args.noise_mode,
             noise_pool_steps=args.noise_pool_steps,
         )
-        _atomic_write_json(output_path, shard_payload(result))
+        if _screening_source_provenance() != source_provenance:
+            raise RuntimeError("screening source provenance changed during execution")
+        if _screening_runtime_environment() != runtime_environment:
+            raise RuntimeError("screening runtime environment changed during execution")
+        if _screening_dataset_provenance(data_x, data_y) != dataset_provenance:
+            raise RuntimeError("screening dataset provenance changed during execution")
+        payload = shard_payload(
+            result,
+            source_provenance=source_provenance,
+            dataset_provenance=dataset_provenance,
+            environment=runtime_environment,
+        )
+        _atomic_write_json(output_path, payload)
         logger.info(
             "%s seed=%d done: avg online acc %.4f (wall %.1fs) -> %s",
             spec.name,

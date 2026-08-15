@@ -22,6 +22,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Made new IPMNIST screening shards and summaries strict v2 artifacts bound to a clean Git
+  commit/tree, the actual tracked package and `uv.lock` bytes, runtime/JAX details, and the
+  canonical materialized MNIST feature/label bytes. The run CLI now captures these bindings
+  before execution and verifies them again before immutable publication; merge and proxy
+  validation reject mixed or mismatched provenance while legacy v1 shards remain readable.
 - Moved plotting, dataset, progress, and parallel-execution dependencies from the base
   installation into a `research` extra; the `dev` extra retains the complete contributor
   toolchain.

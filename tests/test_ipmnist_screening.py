@@ -9,6 +9,7 @@ import json
 import math
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 
 import jax
@@ -21,6 +22,7 @@ import alberta_framework.benchmarks.ipmnist_screening as ipmnist_screening
 from alberta_framework.benchmarks.ipmnist_screening import (
     _CBP_LAYERS,
     CONFIRMATION_THRESHOLD,
+    LEGACY_SHARD_SCHEMA,
     PROXY_N_TASKS,
     SCREENING_REGISTRY,
     SHARD_SCHEMA,
@@ -102,6 +104,99 @@ from alberta_framework.core.normalizers import EMANormalizer
 SMALL = IPMNISTConfig(
     n_tasks=3, task_length=30, input_dim=12, hidden1=8, hidden2=6, n_classes=5
 )
+
+
+def _test_source_provenance(
+    *, source_sha256: str = "3" * 64,
+) -> dict[str, object]:
+    return {
+        "schema": "alberta.ipmnist_screening.source_provenance.v1",
+        "git_commit": "1" * 40,
+        "git_tree": "2" * 40,
+        "git_object_format": "sha1",
+        "relevant_source_scope": "tracked:alberta_framework/**,pyproject.toml,uv.lock",
+        "relevant_source_file_count": 3,
+        "relevant_source_sha256": source_sha256,
+        "uv_lock_sha256": "4" * 64,
+        "worktree_clean": True,
+    }
+
+
+def _test_runtime_environment(
+    *, machine: str = "test-machine",
+) -> dict[str, object]:
+    return {
+        "schema": "alberta.ipmnist_screening.runtime.v1",
+        "python": {"implementation": "CPython", "version": "3.12.12"},
+        "platform": {"system": "TestOS", "release": "1", "machine": machine},
+        "packages": {
+            "chex": "0.1.91",
+            "jax": "0.11.0",
+            "jaxlib": "0.11.0",
+            "numpy": "2.5.1",
+            "scikit-learn": "1.7.1",
+        },
+        "jax": {
+            "backend": "cpu",
+            "devices": [
+                {"id": 0, "platform": "cpu", "device_kind": "test-cpu", "process_index": 0}
+            ],
+            "config": {
+                "jax_enable_x64": False,
+                "jax_default_matmul_precision": None,
+                "jax_disable_jit": False,
+                "jax_numpy_dtype_promotion": "standard",
+                "jax_numpy_rank_promotion": "allow",
+                "jax_random_seed_offset": 0,
+                "jax_threefry_partitionable": True,
+                "jax_default_prng_impl": "threefry2x32",
+            },
+        },
+        "process_environment": {
+            "CUDA_VISIBLE_DEVICES": None,
+            "JAX_DEFAULT_MATMUL_PRECISION": None,
+            "JAX_ENABLE_X64": None,
+            "JAX_PLATFORM_NAME": None,
+            "JAX_PLATFORMS": None,
+            "OMP_NUM_THREADS": "1",
+            "XLA_FLAGS": None,
+        },
+    }
+
+
+def _test_dataset_provenance() -> dict[str, object]:
+    return {
+        "schema": "alberta.ipmnist_screening.dataset_provenance.v1",
+        "source": {
+            "provider": "openml",
+            "name": "mnist_784",
+            "version": 1,
+            "row_start": 0,
+            "row_stop_exclusive": 60000,
+        },
+        "materialization": "alberta.ipmnist.float32-neg1-pos1-int32-labels.v1",
+        "x": {"dtype": "<f4", "shape": [60000, 784], "sha256": "5" * 64},
+        "y": {"dtype": "<i4", "shape": [60000], "sha256": "6" * 64},
+    }
+
+
+def _bound_shard_payload(
+    result: ipmnist_screening.ScreeningRunResult,
+) -> dict[str, object]:
+    artifact_config = IPMNISTConfig(
+        n_tasks=result.config.n_tasks,
+        task_length=result.config.task_length,
+        input_dim=784,
+        hidden1=result.config.hidden1,
+        hidden2=result.config.hidden2,
+        n_classes=10,
+    )
+    return shard_payload(
+        replace(result, config=artifact_config),
+        source_provenance=_test_source_provenance(),
+        dataset_provenance=_test_dataset_provenance(),
+        environment=_test_runtime_environment(),
+    )
 
 
 @pytest.fixture(scope="module")
@@ -912,7 +1007,7 @@ class TestShardsAndMerge:
             config=SMALL,
         )
         path = tmp_path / f"{config_name}_seed{seed}.json"
-        path.write_text(json.dumps(shard_payload(result)), encoding="utf-8")
+        path.write_text(json.dumps(_bound_shard_payload(result)), encoding="utf-8")
         return path
 
     def test_shard_roundtrip_and_merge(self, tmp_path, small_data):
@@ -950,7 +1045,7 @@ class TestShardsAndMerge:
         self, tmp_path: Path, location: str
     ) -> None:
         spec = screening_spec("upgd_w_control")
-        payload = shard_payload(
+        payload = _bound_shard_payload(
             ipmnist_screening.ScreeningRunResult(
                 config_name=spec.name,
                 base_learner=spec.base_learner,
@@ -1014,7 +1109,7 @@ class TestShardsAndMerge:
     def _write_inband_shard(self, tmp_path, config_name, seed, accuracy):
         """Write a structurally valid shard with controlled accuracy."""
         payload = {
-            "schema": SHARD_SCHEMA,
+            "schema": LEGACY_SHARD_SCHEMA,
             "config_name": config_name,
             "base_learner": "upgd_w",
             "hyperparameters": {},
@@ -1546,15 +1641,15 @@ class TestShardsAndMerge:
         with pytest.raises(ValueError, match="duplicate shard"):
             merge_shards([p1, p2])
 
-    def test_merge_rejects_hyperparameter_drift_across_seeds(self, tmp_path, small_data):
+    def test_merge_rejects_hyperparameter_drift_across_seeds(self, tmp_path):
         """Two shards under one config_name with different hyperparameters must
         not merge: nothing else catches a registry value that changed between
         two `run` invocations, and a silent merge would average per-task
         accuracy across genuinely different mechanisms while reporting only
         the first seed's hyperparameters as if representative of the arm."""
-        p0 = self._make_shard(tmp_path, small_data, "upgd_w_control", 0)
-        p1 = self._make_shard(tmp_path, small_data, "upgd_l2init", 0)
-        p2 = self._make_shard(tmp_path, small_data, "upgd_l2init", 1)
+        p0 = self._write_inband_shard(tmp_path, "upgd_w_control", 0, 0.5)
+        p1 = self._write_inband_shard(tmp_path, "upgd_l2init", 0, 0.5)
+        p2 = self._write_inband_shard(tmp_path, "upgd_l2init", 1, 0.5)
 
         payload2 = json.loads(p2.read_text(encoding="utf-8"))
         payload2["hyperparameters"] = {
@@ -1569,10 +1664,10 @@ class TestShardsAndMerge:
         ):
             merge_shards([p0, p1, p2], control_name="upgd_w_control", slope_window=2)
 
-    def test_merge_rejects_base_learner_drift_across_seeds(self, tmp_path, small_data):
-        p0 = self._make_shard(tmp_path, small_data, "upgd_w_control", 0)
-        p1 = self._make_shard(tmp_path, small_data, "upgd_l2init", 0)
-        p2 = self._make_shard(tmp_path, small_data, "upgd_l2init", 1)
+    def test_merge_rejects_base_learner_drift_across_seeds(self, tmp_path):
+        p0 = self._write_inband_shard(tmp_path, "upgd_w_control", 0, 0.5)
+        p1 = self._write_inband_shard(tmp_path, "upgd_l2init", 0, 0.5)
+        p2 = self._write_inband_shard(tmp_path, "upgd_l2init", 1, 0.5)
 
         payload2 = json.loads(p2.read_text(encoding="utf-8"))
         payload2["base_learner"] = "adamw"
@@ -1595,12 +1690,7 @@ class TestShardsAndMerge:
         assert summary["environment"] == reference_environment
 
         payload1 = json.loads(p1.read_text(encoding="utf-8"))
-        payload1["environment"] = {
-            "jax": "0.0-test",
-            "numpy": "0.0-test",
-            "python": "0.0-test",
-            "platform": "different-test-platform",
-        }
+        payload1["environment"] = _test_runtime_environment(machine="different-machine")
         p1.write_text(json.dumps(payload1), encoding="utf-8")
 
         with pytest.raises(ValueError, match="shards span multiple runtime environments"):
@@ -1623,7 +1713,7 @@ class TestShardsAndMerge:
         payload["environment"] = environment
         path.write_text(json.dumps(payload), encoding="utf-8")
 
-        with pytest.raises(ValueError, match="environment must record"):
+        with pytest.raises(ValueError, match="runtime environment"):
             load_shard(path)
 
     @pytest.mark.parametrize(
@@ -1655,7 +1745,11 @@ class TestShardsAndMerge:
                 "learner": learner,
                 "hyperparameters": full.hyperparameters,
                 "seeds": [0],
-                "config": full.config.to_config(),
+                "config": {
+                    **full.config.to_config(),
+                    "input_dim": 784,
+                    "n_classes": 10,
+                },
                 "per_task_accuracy": full.per_task_accuracy.tolist(),
                 "per_task_loss": full.per_task_loss.tolist(),
                 "per_task_plasticity": full.per_task_plasticity.tolist(),
@@ -1671,11 +1765,14 @@ class TestShardsAndMerge:
                 )
             )
             path = shard_dir / f"{name}_seed0.json"
-            path.write_text(json.dumps(shard_payload(proxy)), encoding="utf-8")
+            path.write_text(json.dumps(_bound_shard_payload(proxy)), encoding="utf-8")
             shard_paths.append(path)
         report = validate_proxy(shard_paths, partials, atol=1e-6)
         assert report["all_prefixes_match"] is True
         assert report["environment"] == load_shard(shard_paths[0])["environment"]
+        assert report["source_provenance"] == _test_source_provenance()
+        assert report["dataset_provenance"] == _test_dataset_provenance()
+        assert report["schema"].endswith(".v2")
         for check in report["checks"]:
             assert check["max_abs_per_task_diff"] <= 1e-6
         # ordering flags are booleans (tiny-scale runs may order either way)
@@ -1683,12 +1780,7 @@ class TestShardsAndMerge:
         assert isinstance(report["full_prefix_preserves_upgd_over_adamw"], bool)
 
         changed = json.loads(shard_paths[-1].read_text(encoding="utf-8"))
-        changed["environment"] = {
-            "jax": "0.0-test",
-            "numpy": "0.0-test",
-            "python": "0.0-test",
-            "platform": "different-test-platform",
-        }
+        changed["environment"] = _test_runtime_environment(machine="different-machine")
         changed_path = tmp_path / "changed-environment.json"
         changed_path.write_text(json.dumps(changed), encoding="utf-8")
         with pytest.raises(ValueError, match="shards span multiple runtime environments"):
@@ -1770,7 +1862,7 @@ class TestShardsAndMerge:
         changed_path = tmp_path / "changed-base.json"
         changed_path.write_text(json.dumps(changed), encoding="utf-8")
 
-        with pytest.raises(ValueError, match="must record base_learner='adamw'"):
+        with pytest.raises(ValueError, match="base_learner must match registered arm 'adamw'"):
             validate_proxy([upgd, changed_path], tmp_path)
 
     def test_validate_proxy_rejects_misreported_control_hyperparameters(
@@ -1786,7 +1878,7 @@ class TestShardsAndMerge:
         changed_path = tmp_path / "changed-hyperparameters.json"
         changed_path.write_text(json.dumps(changed), encoding="utf-8")
 
-        with pytest.raises(ValueError, match="must record its frozen hyperparameters"):
+        with pytest.raises(ValueError, match="hyperparameters must exactly match"):
             validate_proxy([upgd, changed_path], tmp_path)
 
 
@@ -1830,7 +1922,7 @@ class TestPoolConfirmation:
         )
 
         with pytest.raises(ValueError, match="noise_pool_steps"):
-            shard_payload(result)
+            _bound_shard_payload(result)
 
     def test_pool_control_matches_run_ipmnist_pool(self, small_data):
         """Control arm under pool mode reproduces run_ipmnist's pool chain."""
@@ -1845,7 +1937,7 @@ class TestPoolConfirmation:
         )
         assert ours.noise_mode == "pool"
         assert ours.noise_pool_steps == 8
-        assert shard_payload(ours)["noise_pool_steps"] == 8
+        assert _bound_shard_payload(ours)["noise_pool_steps"] == 8
         np.testing.assert_allclose(
             ours.per_task_accuracy, reference.per_task_accuracy[0], atol=1e-7
         )
@@ -1885,8 +1977,8 @@ class TestPoolConfirmation:
             x, y, screening_spec("upgd_w_localgate"), seed=0, config=SMALL,
             noise_mode="pool", noise_pool_steps=8,
         )
-        exact_payload = shard_payload(exact)
-        pool_payload = shard_payload(pool)
+        exact_payload = _bound_shard_payload(exact)
+        pool_payload = _bound_shard_payload(pool)
         assert exact_payload["noise_mode"] == "step"
         assert exact_payload["noise_pool_steps"] is None
         assert pool_payload["noise_mode"] == "pool"
@@ -1905,7 +1997,7 @@ class TestPoolConfirmation:
             noise_mode="pool", noise_pool_steps=8,
         )
         path = tmp_path / "pool.json"
-        path.write_text(json.dumps(shard_payload(pool)), encoding="utf-8")
+        path.write_text(json.dumps(_bound_shard_payload(pool)), encoding="utf-8")
         with pytest.raises(ValueError, match="noise_mode"):
             validate_proxy([path], tmp_path)
 
