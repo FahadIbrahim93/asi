@@ -212,7 +212,7 @@ def test_stomp_rejects_an_unauthenticated_outer_clock_atomically() -> None:
     assert not bool(result.update_applied)
 
 
-def test_stomp_nonfinite_candidate_rolls_back_under_eager_and_scan() -> None:
+def test_stomp_rejected_nested_candidate_rolls_back_under_eager_and_scan() -> None:
     agent = STOMPAgent(_config())
     maximum = jnp.asarray(np.finfo(np.float32).max, dtype=jnp.float32)
     source = _idle_state(agent).replace(base_last_obs=jnp.full((2,), maximum, dtype=jnp.float32))
@@ -224,9 +224,16 @@ def test_stomp_nonfinite_candidate_rolls_back_under_eager_and_scan() -> None:
     _assert_stomp_persistent_equal(eager.state, source)
     _assert_stomp_persistent_equal(scanned.state, source)
     assert bool(eager.inputs_valid)
-    assert not bool(eager.proposed_state_valid)
+    # The nested learner rejects its nonfinite candidate and returns a finite,
+    # rolled-back state.  The resulting outer proposal is therefore valid, but
+    # STOMP must still propagate the nested rejection and reject atomically.
+    assert bool(eager.proposed_state_valid)
+    assert int(eager.nested_updates_required) == 1
+    assert int(eager.nested_updates_applied) == 0
     assert not bool(eager.update_applied)
-    assert not bool(scanned.proposed_state_valid[0])
+    assert bool(scanned.proposed_state_valid[0])
+    assert int(scanned.nested_updates_required[0]) == 1
+    assert int(scanned.nested_updates_applied[0]) == 0
     assert not bool(scanned.update_applied[0])
 
 
