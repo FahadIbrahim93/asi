@@ -7120,6 +7120,21 @@ def merge_shards(
     entries: list[dict[str, Any]] = []
     for name, per_seed in sorted(by_config.items()):
         seeds = sorted(per_seed)
+        reference_hp = per_seed[seeds[0]]["hyperparameters"]
+        mismatched = [s for s in seeds if per_seed[s]["hyperparameters"] != reference_hp]
+        if mismatched:
+            # A registry entry is not literally immutable while a config is
+            # still being tuned; shards from before and after a hyperparameter
+            # change can land in the same directory. Without this check they
+            # merge silently under one config_name, average per-task accuracy
+            # across genuinely different mechanisms, and report only
+            # seeds[0]'s hyperparameters as if representative of the whole arm.
+            raise ValueError(
+                f"config {name!r} has inconsistent hyperparameters across seeds: "
+                f"seed {seeds[0]} used {reference_hp!r}, seed(s) {mismatched} used "
+                "different values; refusing to merge runs of different mechanisms "
+                "under one config_name"
+            )
         acc = np.stack(
             [np.asarray(per_seed[s]["per_task_accuracy"], dtype=np.float64) for s in seeds]
         )
