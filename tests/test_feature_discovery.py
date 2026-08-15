@@ -160,6 +160,20 @@ class TestNonlinearFeatureDiscoveryStream:
 class TestInteractionFeatureDiscoveryStream:
     """Tests for the hidden pair-product Step 2 benchmark stream."""
 
+    def test_init_selects_exact_active_count_when_scores_tie(self, monkeypatch) -> None:
+        stream = InteractionFeatureDiscoveryStream(
+            feature_dim=4, n_tasks=1, n_contexts=1, active_pairs_per_context=2
+        )
+
+        def tied_uniform(key, shape, dtype=jnp.float32, **kwargs):
+            return jnp.zeros(shape, dtype=dtype)
+
+        monkeypatch.setattr(
+            "alberta_framework.streams.feature_discovery.jr.uniform", tied_uniform
+        )
+        state = stream.init(jr.key(0))
+        assert int(jnp.count_nonzero(state.context_weights)) == 2
+
     def test_step_shapes(self) -> None:
         stream = InteractionFeatureDiscoveryStream(
             feature_dim=6,

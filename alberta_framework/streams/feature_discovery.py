@@ -339,8 +339,8 @@ class InteractionFeatureDiscoveryStream:
             (self._n_contexts, self._n_tasks, n_pairs),
             dtype=jnp.float32,
         )
-        threshold = jnp.sort(mask_scores, axis=-1)[..., active_count - 1 : active_count]
-        mask = mask_scores <= threshold
+        ranks = jnp.argsort(jnp.argsort(mask_scores, axis=-1), axis=-1)
+        mask = ranks < active_count
         # Same sqrt(#active) normalization as the nonlinear stream: context
         # switches redirect relevance without changing the target scale.
         context_weights = dense_context_weights * mask.astype(jnp.float32)
