@@ -69,6 +69,12 @@ def _validate_confidence_level(confidence_level: float) -> None:
         )
 
 
+def _require_finite_values(values: NDArray[np.floating], *, name: str) -> None:
+    """Reject NaN/inf samples so summaries cannot gold-plate a poisoned seed."""
+    if not np.isfinite(values).all():
+        raise ValueError(f"{name} must be finite")
+
+
 def compute_statistics(
     values: NDArray[np.float64] | list[float],
     confidence_level: float = 0.95,
@@ -83,13 +89,14 @@ def compute_statistics(
         StatisticalSummary with all statistics
 
     Raises:
-        ValueError: If values is empty or ``confidence_level`` is not strictly
-            between 0 and 1.
+        ValueError: If values is empty, any sample is non-finite, or
+            ``confidence_level`` is not strictly between 0 and 1.
     """
     arr = np.asarray(values)
     n = len(arr)
     if n == 0:
         raise ValueError("values must be non-empty")
+    _require_finite_values(arr, name="values")
     _validate_confidence_level(confidence_level)
 
     mean = float(np.mean(arr))
@@ -146,12 +153,13 @@ def compute_timeseries_statistics(
         Tuple of (mean, ci_lower, ci_upper) arrays of shape (n_steps,)
 
     Raises:
-        ValueError: If metric_array has no seed rows or ``confidence_level`` is
-            not strictly between 0 and 1.
+        ValueError: If metric_array has no seed rows, any sample is
+            non-finite, or ``confidence_level`` is not strictly between 0 and 1.
     """
     n_seeds = metric_array.shape[0]
     if n_seeds == 0:
         raise ValueError("metric_array must contain at least one seed row")
+    _require_finite_values(metric_array, name="metric_array")
     _validate_confidence_level(confidence_level)
     mean = np.mean(metric_array, axis=0)
 
