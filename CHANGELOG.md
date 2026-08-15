@@ -36,6 +36,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Rejected nonfinite and out-of-range Pavlovian phase contingencies before they can
   silently behave like zero- or certain-reinforcement probabilities.
+- Required nexting RMSE inputs to be equal nonempty rank-two arrays and their
+  burn-in/window controls to be static built-in integers within trace bounds, preventing
+  broadcasted metrics, empty outputs, and late JAX slicing errors.
 - Preserved every leading batch axis when applying gauntlet EMA smoothing along the last
   axis, fixing rank-three and higher inputs while retaining rank-one and rank-two behavior.
 - Made the pair-, triple-, and micro-component stream generators select exactly their
