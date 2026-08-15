@@ -69,6 +69,27 @@ def test_silent_feature_does_not_turn_inf_value_into_nan() -> None:
     chex.assert_trees_all_close(result.state.values, poisoned.values)
 
 
+def test_masked_family_softmax_stays_finite_on_inf_logits() -> None:
+    """All-inf family logits minus their max is inf-inf = NaN."""
+    learner = AssociativeMemoryLearner(
+        AssociativeMemoryConfig(
+            vocab_size=4,
+            block_size=3,
+            suffix_length=2,
+            max_features=8,
+            adaptive_feature_family=True,
+        )
+    )
+    state = learner.init().replace(
+        family_logits=jnp.full((2,), jnp.inf, dtype=jnp.float32)
+    )
+    context = jnp.asarray([1, 2, 3], dtype=jnp.int32)
+    prediction = learner.predict(state, context)
+    chex.assert_tree_all_finite(prediction.logits)
+    chex.assert_tree_all_finite(prediction.probabilities)
+    assert float(jnp.sum(prediction.probabilities)) == pytest.approx(1.0)
+
+
 def test_associative_prediction_is_before_write() -> None:
     learner = AssociativeMemoryLearner(
         AssociativeMemoryConfig(vocab_size=5, block_size=4, suffix_length=3)

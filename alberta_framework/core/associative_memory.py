@@ -216,10 +216,15 @@ def _softmax(logits: Array) -> Array:
 
 def _masked_softmax(logits: Array, mask: Array) -> Array:
     active = mask > 0
+    n_active = jnp.maximum(jnp.sum(active.astype(jnp.float32)), 1.0)
+    uniform = jnp.where(active, 1.0 / n_active, 0.0)
+    uniform = jnp.where(jnp.any(active), uniform, jnp.full_like(logits, 1.0 / logits.shape[0]))
+    finite_active = jnp.all(jnp.where(active, jnp.isfinite(logits), True))
     masked = jnp.where(active, logits, -1.0e9)
     shifted = masked - jnp.max(masked)
     exp = jnp.where(active, jnp.exp(shifted), 0.0)
-    return exp / jnp.maximum(jnp.sum(exp), 1e-12)
+    probabilities = exp / jnp.maximum(jnp.sum(exp), 1e-12)
+    return jnp.where(finite_active, probabilities, uniform)
 
 
 def _cross_entropy_from_logits(logits: Array, label: Array) -> Array:
