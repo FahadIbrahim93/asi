@@ -7068,6 +7068,10 @@ def load_shard(path: Path) -> dict[str, Any]:
         raise ValueError(f"{path}: seed must be a non-negative integer")
     if payload.get("config_name") not in SCREENING_REGISTRY:
         raise ValueError(f"{path}: unknown config_name {payload.get('config_name')!r}")
+    if not isinstance(payload.get("base_learner"), str) or not payload["base_learner"]:
+        raise ValueError(f"{path}: base_learner must be a non-empty string")
+    if not isinstance(payload.get("hyperparameters"), dict):
+        raise ValueError(f"{path}: hyperparameters must be an object")
     environment = payload.get("environment")
     required_environment_fields = ("jax", "numpy", "python", "platform")
     if not isinstance(environment, dict) or any(
@@ -7078,6 +7082,57 @@ def load_shard(path: Path) -> dict[str, Any]:
             f"{path}: environment must record non-empty jax, numpy, python, and platform strings"
         )
     return payload
+
+
+def _screening_batch_environment(
+    shards: Sequence[dict[str, Any]],
+) -> dict[str, str]:
+    """Return the exact runtime contract shared by one derived artifact."""
+    if not shards:
+        raise ValueError("no shards given")
+    reference_environment = shards[0]["environment"]
+    environment_mismatches = [
+        f"{shard['config_name']}/seed={shard['seed']}"
+        for shard in shards
+        if shard["environment"] != reference_environment
+    ]
+    if environment_mismatches:
+        raise ValueError(
+            "shards span multiple runtime environments; process same-environment runs "
+            f"separately (mismatched: {environment_mismatches})"
+        )
+    return dict(reference_environment)
+
+
+def _validate_screening_arm_contract(
+    config_name: str,
+    per_seed: Mapping[int, dict[str, Any]],
+) -> None:
+    """Reject learner or hyperparameter drift within one named arm."""
+    seeds = sorted(per_seed)
+    reference_base_learner = per_seed[seeds[0]]["base_learner"]
+    mismatched_base_learners = [
+        seed
+        for seed in seeds
+        if per_seed[seed]["base_learner"] != reference_base_learner
+    ]
+    if mismatched_base_learners:
+        raise ValueError(
+            f"config {config_name!r} has inconsistent base_learner across seeds: "
+            f"seed {seeds[0]} used {reference_base_learner!r}, seed(s) "
+            f"{mismatched_base_learners} used different values"
+        )
+    reference_hp = per_seed[seeds[0]]["hyperparameters"]
+    mismatched_hp = [
+        seed for seed in seeds if per_seed[seed]["hyperparameters"] != reference_hp
+    ]
+    if mismatched_hp:
+        raise ValueError(
+            f"config {config_name!r} has inconsistent hyperparameters across seeds: "
+            f"seed {seeds[0]} used {reference_hp!r}, seed(s) {mismatched_hp} used "
+            "different values; refusing to merge runs of different mechanisms "
+            "under one config_name"
+        )
 
 
 def _late_window_slope(per_task_accuracy: np.ndarray, window: int) -> float:
@@ -7110,17 +7165,7 @@ def merge_shards(
             "approximation); merge them separately"
         )
     noise_mode = noise_modes.pop()
-    reference_environment = shards[0]["environment"]
-    environment_mismatches = [
-        f"{shard['config_name']}/seed={shard['seed']}"
-        for shard in shards
-        if shard["environment"] != reference_environment
-    ]
-    if environment_mismatches:
-        raise ValueError(
-            "shards span multiple runtime environments; merge same-environment runs "
-            f"separately (mismatched: {environment_mismatches})"
-        )
+    reference_environment = _screening_batch_environment(shards)
     by_config: dict[str, dict[int, dict[str, Any]]] = {}
     for shard in shards:
         per_seed = by_config.setdefault(shard["config_name"], {})
@@ -7140,33 +7185,7 @@ def merge_shards(
     entries: list[dict[str, Any]] = []
     for name, per_seed in sorted(by_config.items()):
         seeds = sorted(per_seed)
-        reference_base_learner = per_seed[seeds[0]]["base_learner"]
-        mismatched_base_learners = [
-            seed
-            for seed in seeds
-            if per_seed[seed]["base_learner"] != reference_base_learner
-        ]
-        if mismatched_base_learners:
-            raise ValueError(
-                f"config {name!r} has inconsistent base_learner across seeds: "
-                f"seed {seeds[0]} used {reference_base_learner!r}, seed(s) "
-                f"{mismatched_base_learners} used different values"
-            )
-        reference_hp = per_seed[seeds[0]]["hyperparameters"]
-        mismatched = [s for s in seeds if per_seed[s]["hyperparameters"] != reference_hp]
-        if mismatched:
-            # A registry entry is not literally immutable while a config is
-            # still being tuned; shards from before and after a hyperparameter
-            # change can land in the same directory. Without this check they
-            # merge silently under one config_name, average per-task accuracy
-            # across genuinely different mechanisms, and report only
-            # seeds[0]'s hyperparameters as if representative of the whole arm.
-            raise ValueError(
-                f"config {name!r} has inconsistent hyperparameters across seeds: "
-                f"seed {seeds[0]} used {reference_hp!r}, seed(s) {mismatched} used "
-                "different values; refusing to merge runs of different mechanisms "
-                "under one config_name"
-            )
+        _validate_screening_arm_contract(name, per_seed)
         acc = np.stack(
             [np.asarray(per_seed[s]["per_task_accuracy"], dtype=np.float64) for s in seeds]
         )
@@ -7276,22 +7295,60 @@ def validate_proxy(
     prefixes at the same task index.
     """
     partials_dir = Path(partials_dir)
-    checks: list[dict[str, Any]] = []
-    proxy_avg: dict[str, list[float]] = {"upgd_w": [], "adamw": []}
-    full_avg: dict[str, list[float]] = {"upgd_w": [], "adamw": []}
-    n_tasks_seen: set[int] = set()
-    for path in shard_paths:
-        shard = load_shard(Path(path))
+    shards = [load_shard(Path(path)) for path in shard_paths]
+    environment = _screening_batch_environment(shards)
+    configs = {tuple(sorted(shard["config"].items())) for shard in shards}
+    if len(configs) != 1:
+        raise ValueError(
+            "proxy-validation shards span multiple protocol configs or horizons; "
+            "validate them separately"
+        )
+    learner_by_control = {
+        "upgd_w_control": "upgd_w",
+        "adamw_control": "adamw",
+    }
+    by_control: dict[str, dict[int, dict[str, Any]]] = {}
+    for path, shard in zip(shard_paths, shards, strict=True):
         if shard.get("noise_mode", "step") != "step":
             raise ValueError(
                 f"{path}: proxy validation requires noise_mode='step' shards "
                 f"(got {shard.get('noise_mode')!r})"
             )
-        learner = {"upgd_w_control": "upgd_w", "adamw_control": "adamw"}.get(
-            shard["config_name"]
-        )
+        learner = learner_by_control.get(shard["config_name"])
         if learner is None:
             raise ValueError(f"{path}: proxy validation accepts only control shards")
+        if shard["base_learner"] != learner:
+            raise ValueError(
+                f"{path}: control {shard['config_name']!r} must record "
+                f"base_learner={learner!r}"
+            )
+        per_seed = by_control.setdefault(shard["config_name"], {})
+        if shard["seed"] in per_seed:
+            raise ValueError(
+                f"duplicate proxy-validation shard for control={shard['config_name']} "
+                f"seed={shard['seed']}"
+            )
+        per_seed[shard["seed"]] = shard
+    missing_controls = sorted(set(learner_by_control) - set(by_control))
+    if missing_controls:
+        raise ValueError(f"proxy validation is missing control shard(s): {missing_controls}")
+    for config_name, per_seed in by_control.items():
+        _validate_screening_arm_contract(config_name, per_seed)
+    control_seed_sets = {
+        config_name: tuple(sorted(per_seed))
+        for config_name, per_seed in by_control.items()
+    }
+    if len(set(control_seed_sets.values())) != 1:
+        raise ValueError(
+            f"proxy-validation control seed sets differ: {control_seed_sets}; "
+            "paired controls are required"
+        )
+    checks: list[dict[str, Any]] = []
+    proxy_avg: dict[str, list[float]] = {"upgd_w": [], "adamw": []}
+    full_avg: dict[str, list[float]] = {"upgd_w": [], "adamw": []}
+    n_tasks_seen: set[int] = set()
+    for path, shard in zip(shard_paths, shards, strict=True):
+        learner = learner_by_control[shard["config_name"]]
         seed = shard["seed"]
         n_tasks = int(shard["config"]["n_tasks"])
         n_tasks_seen.add(n_tasks)
@@ -7325,6 +7382,7 @@ def validate_proxy(
         "schema": VALIDATION_SCHEMA,
         "created_unix": time.time(),
         "atol": atol,
+        "environment": environment,
         "n_tasks": sorted(n_tasks_seen),
         "checks": checks,
         "all_prefixes_match": bool(all(c["prefix_match"] for c in checks)),

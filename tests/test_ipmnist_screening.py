@@ -1210,6 +1210,21 @@ class TestShardsAndMerge:
         with pytest.raises(ValueError, match="environment must record"):
             load_shard(path)
 
+    @pytest.mark.parametrize(
+        ("fieldname", "bad_value"),
+        [("base_learner", []), ("hyperparameters", "not-an-object")],
+    )
+    def test_load_rejects_invalid_arm_contract_field(
+        self, tmp_path, small_data, fieldname, bad_value
+    ):
+        path = self._make_shard(tmp_path, small_data, "upgd_w_control", 0)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload[fieldname] = bad_value
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+        with pytest.raises(ValueError, match=fieldname):
+            load_shard(path)
+
     def test_validate_proxy_prefix_and_ordering(self, tmp_path, small_data):
         x, y = small_data
         partials = tmp_path / "partials"
@@ -1234,11 +1249,64 @@ class TestShardsAndMerge:
             shard_paths.append(path)
         report = validate_proxy(shard_paths, partials, atol=1e-6)
         assert report["all_prefixes_match"] is True
+        assert report["environment"] == load_shard(shard_paths[0])["environment"]
         for check in report["checks"]:
             assert check["max_abs_per_task_diff"] <= 1e-6
         # ordering flags are booleans (tiny-scale runs may order either way)
         assert isinstance(report["proxy_preserves_upgd_over_adamw"], bool)
         assert isinstance(report["full_prefix_preserves_upgd_over_adamw"], bool)
+
+        changed = json.loads(shard_paths[-1].read_text(encoding="utf-8"))
+        changed["environment"] = {
+            "jax": "0.0-test",
+            "numpy": "0.0-test",
+            "python": "0.0-test",
+            "platform": "different-test-platform",
+        }
+        changed_path = tmp_path / "changed-environment.json"
+        changed_path.write_text(json.dumps(changed), encoding="utf-8")
+        with pytest.raises(ValueError, match="shards span multiple runtime environments"):
+            validate_proxy([shard_paths[0], changed_path], partials, atol=1e-6)
+
+    def test_validate_proxy_rejects_duplicate_control_seed(self, tmp_path, small_data):
+        path = self._make_shard(tmp_path, small_data, "upgd_w_control", 0)
+        with pytest.raises(ValueError, match="duplicate proxy-validation shard"):
+            validate_proxy([path, path], tmp_path)
+
+    def test_validate_proxy_requires_paired_control_seed_sets(
+        self, tmp_path, small_data
+    ):
+        paths = [
+            self._make_shard(tmp_path, small_data, "upgd_w_control", 0),
+            self._make_shard(tmp_path, small_data, "upgd_w_control", 1),
+            self._make_shard(tmp_path, small_data, "adamw_control", 0),
+        ]
+        with pytest.raises(ValueError, match="control seed sets differ"):
+            validate_proxy(paths, tmp_path)
+
+    def test_validate_proxy_rejects_mixed_protocol_configs(self, tmp_path, small_data):
+        upgd = self._make_shard(tmp_path, small_data, "upgd_w_control", 0)
+        adam = self._make_shard(tmp_path, small_data, "adamw_control", 0)
+        changed = json.loads(adam.read_text(encoding="utf-8"))
+        changed["config"] = {**changed["config"], "hidden1": changed["config"]["hidden1"] + 1}
+        changed_path = tmp_path / "changed-config.json"
+        changed_path.write_text(json.dumps(changed), encoding="utf-8")
+
+        with pytest.raises(ValueError, match="multiple protocol configs or horizons"):
+            validate_proxy([upgd, changed_path], tmp_path)
+
+    def test_validate_proxy_rejects_misreported_base_learner(
+        self, tmp_path, small_data
+    ):
+        upgd = self._make_shard(tmp_path, small_data, "upgd_w_control", 0)
+        adam = self._make_shard(tmp_path, small_data, "adamw_control", 0)
+        changed = json.loads(adam.read_text(encoding="utf-8"))
+        changed["base_learner"] = "upgd_w"
+        changed_path = tmp_path / "changed-base.json"
+        changed_path.write_text(json.dumps(changed), encoding="utf-8")
+
+        with pytest.raises(ValueError, match="must record base_learner='adamw'"):
+            validate_proxy([upgd, changed_path], tmp_path)
 
 
 class TestPoolConfirmation:

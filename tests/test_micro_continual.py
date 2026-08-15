@@ -680,6 +680,8 @@ class TestShards:
             ("mechanism", ""),
             ("hyperparameters", []),
             ("family", "scale_shift"),
+            ("suite_version", "different-suite"),
+            ("suite_version", None),
         ],
     )
     def test_load_rejects_invalid_shard_contract_field(

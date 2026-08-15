@@ -851,6 +851,11 @@ def load_micro_shard(path: Path | str) -> dict[str, Any]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(payload, dict) or payload.get("schema") != MICRO_SHARD_SCHEMA:
         raise ValueError(f"{path}: schema mismatch (expected {MICRO_SHARD_SCHEMA})")
+    if payload.get("suite_version") != MICRO_GAUSS_SUITE_VERSION:
+        raise ValueError(
+            f"{path}: suite_version mismatch (expected {MICRO_GAUSS_SUITE_VERSION!r}, "
+            f"got {payload.get('suite_version')!r})"
+        )
     if payload.get("arm_name") not in MICRO_ARM_REGISTRY:
         raise ValueError(f"{path}: unknown arm {payload.get('arm_name')!r}")
     if not isinstance(payload.get("mechanism"), str) or not payload["mechanism"]:
