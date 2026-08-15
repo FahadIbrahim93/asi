@@ -183,8 +183,21 @@ class RLSRewardModel:
             abs_error_ema=next_abs_error_ema,
             step_count=state.step_count + 1,
         )
+        # Inf reward * a silent feature's zero gain is 0*inf = NaN, and
+        # that channel stays poisoned. Hold the previous finite state.
+        inputs_valid = jnp.all(jnp.isfinite(x)) & jnp.isfinite(jnp.squeeze(target))
+        proposed_finite = (
+            jnp.all(jnp.isfinite(next_weights))
+            & jnp.all(jnp.isfinite(next_covariance))
+            & jnp.isfinite(next_abs_error_ema)
+        )
+        committed = jax.lax.cond(
+            inputs_valid & proposed_finite,
+            lambda: next_state,
+            lambda: state,
+        )
         return RLSRewardModelUpdateResult(
-            state=next_state,
+            state=committed,
             prediction=prediction,
             error=error,
             gain=gain,
