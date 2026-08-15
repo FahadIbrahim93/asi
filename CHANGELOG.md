@@ -34,8 +34,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Made evidence, IPMNIST-screening, and micro-continual artifact loaders reject duplicate
-  JSON object keys at every nesting depth instead of silently retaining the last value.
+- Made evidence, IPMNIST-screening, and micro-continual artifact loaders plus the
+  Label-EMNIST array-cache metadata loader reject duplicate JSON object keys at every nesting
+  depth instead of silently retaining the last value.
 - Rejected zero, negative, boolean, and non-integer schedule divisors in synthetic and
   closed-loop streams before JAX modulo, floor-division, or periodic arithmetic can silently
   corrupt a regime clock; positive integer schedules retain their existing trajectories.

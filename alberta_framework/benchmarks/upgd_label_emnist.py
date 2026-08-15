@@ -641,7 +641,7 @@ def load_emnist_balanced_train(
     if x_path.is_file() and y_path.is_file() and meta_path.is_file():
         x = np.load(x_path)
         y = np.load(y_path)
-        cached_meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        cached_meta = _strict_json_object(meta_path)
         if (
             materialized_array_sha256(x) != cached_meta["x_sha256"]
             or materialized_array_sha256(y) != cached_meta["y_sha256"]

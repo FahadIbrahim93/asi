@@ -7,6 +7,8 @@ tiny synthetic smoke run. Benchmark executions never happen inside pytest.
 
 from __future__ import annotations
 
+import json
+
 import jax.numpy as jnp
 import jax.random as jr
 import numpy as np
@@ -244,6 +246,74 @@ class TestSeedBoundary:
                     f"0,{2**32}",
                 ]
             )
+
+
+class TestEMNISTArrayCache:
+    @staticmethod
+    def _write_cache(tmp_path, x: np.ndarray, y: np.ndarray, meta_text: str) -> None:
+        x_path, y_path, meta_path = upgd_label_emnist._npy_cache_paths(tmp_path)
+        np.save(x_path, x)
+        np.save(y_path, y)
+        meta_path.write_text(meta_text, encoding="utf-8")
+
+    @staticmethod
+    def _metadata(x: np.ndarray, y: np.ndarray) -> dict[str, object]:
+        return {
+            "source": "synthetic:test-cache",
+            "details": {"parser": "fixture"},
+            "x_sha256": upgd_label_emnist.materialized_array_sha256(x),
+            "y_sha256": upgd_label_emnist.materialized_array_sha256(y),
+        }
+
+    def test_clean_cache_metadata_remains_compatible(self, tmp_path) -> None:
+        x = np.asarray([[0.0, 1.0], [-1.0, 0.5]], dtype=np.float32)
+        y = np.asarray([1, 0], dtype=np.int32)
+        metadata = self._metadata(x, y)
+        self._write_cache(tmp_path, x, y, json.dumps(metadata))
+
+        loaded_x, loaded_y, loaded_metadata = (
+            upgd_label_emnist.load_emnist_balanced_train(tmp_path)
+        )
+
+        np.testing.assert_array_equal(loaded_x, x)
+        np.testing.assert_array_equal(loaded_y, y)
+        assert loaded_metadata == metadata
+
+    def test_cache_metadata_rejects_duplicate_top_level_key(self, tmp_path) -> None:
+        x = np.asarray([[0.0]], dtype=np.float32)
+        y = np.asarray([0], dtype=np.int32)
+        metadata = self._metadata(x, y)
+        meta_text = json.dumps(metadata).replace(
+            '"source": "synthetic:test-cache"',
+            '"source": "first", "source": "second"',
+        )
+        self._write_cache(tmp_path, x, y, meta_text)
+
+        with pytest.raises(ValueError, match="duplicate JSON key: 'source'"):
+            upgd_label_emnist.load_emnist_balanced_train(tmp_path)
+
+    def test_cache_metadata_rejects_duplicate_nested_key(self, tmp_path) -> None:
+        x = np.asarray([[0.0]], dtype=np.float32)
+        y = np.asarray([0], dtype=np.int32)
+        metadata = self._metadata(x, y)
+        meta_text = json.dumps(metadata).replace(
+            '"details": {"parser": "fixture"}',
+            '"details": {"parser": "first", "parser": "second"}',
+        )
+        self._write_cache(tmp_path, x, y, meta_text)
+
+        with pytest.raises(ValueError, match="duplicate JSON key: 'parser'"):
+            upgd_label_emnist.load_emnist_balanced_train(tmp_path)
+
+    def test_cache_metadata_still_enforces_array_digests(self, tmp_path) -> None:
+        x = np.asarray([[0.0]], dtype=np.float32)
+        y = np.asarray([0], dtype=np.int32)
+        metadata = self._metadata(x, y)
+        metadata["x_sha256"] = "0" * 64
+        self._write_cache(tmp_path, x, y, json.dumps(metadata))
+
+        with pytest.raises(RuntimeError, match="does not match its pinned digests"):
+            upgd_label_emnist.load_emnist_balanced_train(tmp_path)
 
 
 @pytest.fixture(scope="class")
