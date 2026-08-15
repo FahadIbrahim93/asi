@@ -333,9 +333,17 @@ def mann_whitney_comparison(
 
     Returns:
         SignificanceResult with test results
+
+    Raises:
+        ValueError: If either sample is empty.
     """
     a = np.asarray(values_a)
     b = np.asarray(values_b)
+
+    if len(a) == 0 or len(b) == 0:
+        raise ValueError(
+            f"independent Mann-Whitney test requires non-empty groups (got {len(a)} and {len(b)})"
+        )
 
     try:
         from scipy import stats
@@ -453,6 +461,8 @@ def bonferroni_correction(
         Tuple of (list of significant booleans, corrected alpha)
     """
     n_tests = len(p_values)
+    if n_tests == 0:
+        return [], alpha
     corrected_alpha = alpha / n_tests
     significant = [p < corrected_alpha for p in p_values]
     return significant, corrected_alpha
