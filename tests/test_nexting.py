@@ -5,6 +5,7 @@ from __future__ import annotations
 import chex
 import jax.numpy as jnp
 import numpy as np
+import pytest
 
 from alberta_framework.utils.nexting import (
     forward_view_returns,
@@ -139,6 +140,34 @@ class TestRMSE:
         assert float(rmse_no_burn[0]) > 0.0
         chex.assert_trees_all_close(rmse_burn, jnp.zeros(h), atol=1e-6)
 
+    def test_burn_in_consuming_whole_trace_rejected(self) -> None:
+        """burn_in >= n_steps must refuse: the empty slice returned all-NaN
+        RMSE with no warning under JAX (issue #158)."""
+        preds = jnp.ones((3, 2))
+        truths = jnp.zeros((3, 2))
+        for burn_in in (3, 5):
+            with pytest.raises(
+                ValueError, match=r"burn_in must satisfy 0 <= burn_in < n_steps"
+            ):
+                per_horizon_rmse(preds, truths, burn_in=burn_in)
+
+    def test_negative_burn_in_rejected(self) -> None:
+        """burn_in < 0 must refuse: Python negative-slice semantics silently
+        computed RMSE over only the trailing steps (issue #158)."""
+        preds = jnp.ones((3, 2))
+        truths = jnp.zeros((3, 2))
+        with pytest.raises(
+            ValueError, match=r"burn_in must satisfy 0 <= burn_in < n_steps"
+        ):
+            per_horizon_rmse(preds, truths, burn_in=-1)
+
+    def test_burn_in_boundary_unchanged(self) -> None:
+        preds = jnp.ones((3, 2))
+        truths = jnp.zeros((3, 2))
+        rmse = per_horizon_rmse(preds, truths, burn_in=2)
+        chex.assert_shape(rmse, (2,))
+        assert bool(jnp.all(jnp.isfinite(rmse)))
+
 
 class TestRunningRMSE:
     def test_shape(self) -> None:
@@ -155,6 +184,34 @@ class TestRunningRMSE:
         running = per_horizon_running_rmse(preds, truths, window_size=5)
         # All windows should contain the same constant error
         np.testing.assert_allclose(np.asarray(running), 2.0, atol=1e-6)
+
+    def test_window_longer_than_trace_rejected(self) -> None:
+        """window_size > n_steps must refuse: the empty windowed array raised
+        a raw IndexError from the pad lookup (issue #158)."""
+        preds = jnp.ones((3, 2))
+        truths = jnp.zeros((3, 2))
+        with pytest.raises(
+            ValueError, match=r"window_size must satisfy 1 <= window_size <= n_steps"
+        ):
+            per_horizon_running_rmse(preds, truths, window_size=5)
+
+    def test_non_positive_window_rejected(self) -> None:
+        """window_size <= 0 must refuse: the cumsum algebra raised a raw
+        TypeError from a shape mismatch (issue #158)."""
+        preds = jnp.ones((3, 2))
+        truths = jnp.zeros((3, 2))
+        for window_size in (0, -1):
+            with pytest.raises(
+                ValueError, match=r"window_size must satisfy 1 <= window_size <= n_steps"
+            ):
+                per_horizon_running_rmse(preds, truths, window_size=window_size)
+
+    def test_window_equal_to_trace_unchanged(self) -> None:
+        preds = jnp.ones((3, 2))
+        truths = jnp.zeros((3, 2))
+        running = per_horizon_running_rmse(preds, truths, window_size=3)
+        chex.assert_shape(running, (3, 2))
+        assert bool(jnp.all(jnp.isfinite(running)))
 
     def test_decay(self) -> None:
         # First half big errors, second half no errors. Running RMSE

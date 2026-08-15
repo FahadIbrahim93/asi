@@ -135,7 +135,16 @@ def per_horizon_rmse(
 
     Returns:
         Array of shape ``(H,)`` with RMSE per horizon.
+
+    Raises:
+        ValueError: If ``burn_in`` is negative or consumes the whole trace.
     """
+    n_steps = predictions.shape[0]
+    if not 0 <= burn_in < n_steps:
+        raise ValueError(
+            f"burn_in must satisfy 0 <= burn_in < n_steps "
+            f"(got burn_in={burn_in}, n_steps={n_steps})"
+        )
     if burn_in:
         predictions = predictions[burn_in:]
         forward_returns = forward_returns[burn_in:]
@@ -161,7 +170,17 @@ def per_horizon_running_rmse(
     Returns:
         Array of shape ``(T, H)``. The first ``window_size - 1`` rows are
         equal to ``running_rmse[window_size - 1]``.
+
+    Raises:
+        ValueError: If ``window_size`` is non-positive or longer than the
+            trace.
     """
+    n_steps = predictions.shape[0]
+    if not 1 <= window_size <= n_steps:
+        raise ValueError(
+            f"window_size must satisfy 1 <= window_size <= n_steps "
+            f"(got window_size={window_size}, n_steps={n_steps})"
+        )
     sq_err = (predictions - forward_returns) ** 2  # (T, H)
     cumsum = jnp.cumsum(jnp.concatenate([jnp.zeros((1, sq_err.shape[1])), sq_err]), axis=0)
     window = cumsum[window_size:] - cumsum[:-window_size]
