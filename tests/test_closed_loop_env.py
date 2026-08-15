@@ -121,10 +121,16 @@ class TestSwitchingTwoStateDynamics:
         assert float(reward_a) == 1.0
         assert float(reward_b) == 0.0
 
-    def test_invalid_config_raises(self):
-        """Bad phase lengths and payoff shapes are rejected."""
-        with pytest.raises(ValueError, match="phase_length"):
-            SwitchingTwoStateMDP(SwitchingTwoStateConfig(phase_length=0))
+    @pytest.mark.parametrize("phase_length", [0, -1, False, True, 1.5, None])
+    def test_invalid_phase_length_raises(self, phase_length):
+        """Schedule divisors must be built-in positive integers."""
+        with pytest.raises(ValueError, match="phase_length must be a positive integer"):
+            SwitchingTwoStateMDP(
+                SwitchingTwoStateConfig(phase_length=phase_length)  # type: ignore[arg-type]
+            )
+
+    def test_invalid_payoff_shape_raises(self):
+        """Payoff matrices must preserve the fixed state/action shape."""
         with pytest.raises(ValueError, match="2x2"):
             SwitchingTwoStateMDP(
                 SwitchingTwoStateConfig(payoffs_a=((0.0, 1.0, 2.0),) * 2)  # type: ignore[arg-type]
