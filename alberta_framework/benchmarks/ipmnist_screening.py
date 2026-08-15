@@ -206,6 +206,7 @@ _IDBD_LOG_ALPHA_MIN = -10.0
 _IDBD_LOG_ALPHA_MAX = 0.0  # alpha <= 1 keeps per-weight decay factors positive
 _AUTOSTEP_ALPHA_MIN = 1e-8
 _AUTOSTEP_ALPHA_MAX = 1.0
+_MISSING_NOISE_POOL_STEPS = object()
 
 
 def _validated_wall_clock_seconds(value: object, path: Path | str) -> float:
@@ -6352,6 +6353,46 @@ def _validated_screening_noise_mode(
     return noise_mode
 
 
+def _validated_screening_noise_pool_steps(
+    noise_mode: str,
+    noise_pool_steps: object,
+    *,
+    context: Path | str | None = None,
+    allow_unrecorded_pool: bool = False,
+) -> int | None:
+    """Return the effective pool-size contract for one screening run or shard.
+
+    Exact step-mode runs do not consume a noise pool, so their canonical
+    effective value is ``None``.  This also keeps pre-pool legacy shards,
+    which omit both fields, readable as exact step-mode runs.  A loader may
+    preserve an omitted pool size as unknown so historical files remain
+    inspectable, but new results must record it and downstream merges refuse
+    the unknown value.  Inferring the historical default would relabel any
+    old custom-size run and recreate the ambiguity this provenance field
+    closes.
+    """
+    prefix = "" if context is None else f"{context}: "
+    if noise_mode == "step":
+        if noise_pool_steps is not _MISSING_NOISE_POOL_STEPS and noise_pool_steps is not None:
+            raise ValueError(
+                f"{prefix}noise_pool_steps must be null or absent when "
+                "noise_mode='step'"
+            )
+        return None
+    if noise_pool_steps is _MISSING_NOISE_POOL_STEPS:
+        if allow_unrecorded_pool:
+            return None
+        raise ValueError(
+            f"{prefix}noise_pool_steps must be recorded when noise_mode='pool'"
+        )
+    if type(noise_pool_steps) is not int or noise_pool_steps < 2:
+        raise ValueError(
+            f"{prefix}noise_pool_steps must be recorded as a built-in integer >= 2 "
+            "when noise_mode='pool'"
+        )
+    return noise_pool_steps
+
+
 # =============================================================================
 # Development-only recurring A/B/A retention adapter
 # =============================================================================
@@ -6912,6 +6953,7 @@ class ScreeningRunResult:
     per_task_plasticity: np.ndarray
     wall_clock_seconds: float
     noise_mode: str = "step"
+    noise_pool_steps: int | None = None
 
 
 def run_screening_config(
@@ -6936,13 +6978,16 @@ def run_screening_config(
     control arm reproduces the full lane's pool trajectories bit-for-bit
     (pinned by a unit test) -- but consumes ``spec.noise_update`` instead of
     the fixed UPGD-W equations. Pool shards are a screening-only
-    approximation: they record ``noise_mode`` and never merge with exact
-    shards nor pass proxy validation.
+    approximation: they record ``noise_mode`` and their effective
+    ``noise_pool_steps`` and never merge with exact shards nor pass proxy
+    validation.
     """
     resolved_seed = require_jax_seed(seed, name="seed")
     noise_mode = _validated_screening_noise_mode(noise_mode, spec)
-    if noise_mode == "pool" and noise_pool_steps < 2:
-        raise ValueError(f"noise_pool_steps must be >= 2, got {noise_pool_steps}")
+    effective_noise_pool_steps = _validated_screening_noise_pool_steps(
+        noise_mode,
+        noise_pool_steps if noise_mode == "pool" else None,
+    )
     data_x = jnp.asarray(data_x, dtype=jnp.float32)
     data_y = jnp.asarray(data_y, dtype=jnp.int32)
     if data_x.ndim != 2 or data_x.shape[1] != config.input_dim:
@@ -6985,7 +7030,11 @@ def run_screening_config(
 
     shapes = _sorted_param_shapes(config)
     n_flat = int(sum(np.prod(shape) for shape in shapes.values()))
-    pool_len = int(noise_pool_steps) * n_flat
+    pool_len = (
+        effective_noise_pool_steps * n_flat
+        if effective_noise_pool_steps is not None
+        else 0
+    )
     pool_noise_std = float(spec.hyperparameters.get("noise_std", 0.0))
     noise_update = spec.noise_update
     hp = spec.hyperparameters
@@ -7063,6 +7112,7 @@ def run_screening_config(
         per_task_plasticity=np.asarray(task_plasticity, dtype=np.float64),
         wall_clock_seconds=time.monotonic() - started,
         noise_mode=noise_mode,
+        noise_pool_steps=effective_noise_pool_steps,
     )
 
 
@@ -7074,6 +7124,11 @@ def run_screening_config(
 def shard_payload(result: ScreeningRunResult) -> dict[str, Any]:
     """Serialize one (config, seed) screening run to a mergeable shard."""
     seed = require_jax_seed(result.seed, name="result seed")
+    spec = screening_spec(result.config_name)
+    noise_mode = _validated_screening_noise_mode(result.noise_mode, spec)
+    noise_pool_steps = _validated_screening_noise_pool_steps(
+        noise_mode, result.noise_pool_steps
+    )
     return {
         "schema": SHARD_SCHEMA,
         "evidence_policy": dict(NONPROMOTING_POLICY),
@@ -7081,7 +7136,8 @@ def shard_payload(result: ScreeningRunResult) -> dict[str, Any]:
         "base_learner": result.base_learner,
         "hyperparameters": result.hyperparameters,
         "seed": seed,
-        "noise_mode": result.noise_mode,
+        "noise_mode": noise_mode,
+        "noise_pool_steps": noise_pool_steps,
         "config": result.config.to_config(),
         "per_task_accuracy": [round(float(v), 8) for v in result.per_task_accuracy],
         "per_task_loss": [round(float(v), 8) for v in result.per_task_loss],
@@ -7114,9 +7170,17 @@ def load_shard(path: Path) -> dict[str, Any]:
     if payload.get("config_name") not in SCREENING_REGISTRY:
         raise ValueError(f"{path}: unknown config_name {payload.get('config_name')!r}")
     spec = SCREENING_REGISTRY[payload["config_name"]]
-    _validated_screening_noise_mode(
+    noise_mode = _validated_screening_noise_mode(
         payload.get("noise_mode", "step"), spec, context=path
     )
+    noise_pool_steps = _validated_screening_noise_pool_steps(
+        noise_mode,
+        payload.get("noise_pool_steps", _MISSING_NOISE_POOL_STEPS),
+        context=path,
+        allow_unrecorded_pool=True,
+    )
+    payload["noise_mode"] = noise_mode
+    payload["noise_pool_steps"] = noise_pool_steps
     if not isinstance(payload.get("base_learner"), str) or not payload["base_learner"]:
         raise ValueError(f"{path}: base_learner must be a non-empty string")
     if not isinstance(payload.get("hyperparameters"), dict):
@@ -7207,13 +7271,29 @@ def merge_shards(
     configs = {tuple(sorted(s["config"].items())) for s in shards}
     if len(configs) != 1:
         raise ValueError("shards span multiple protocol configs; merge them separately")
-    noise_modes = {s.get("noise_mode", "step") for s in shards}
+    noise_modes = {s["noise_mode"] for s in shards}
     if len(noise_modes) != 1:
         raise ValueError(
             "shards span multiple noise modes (pool results are a screening-only "
             "approximation); merge them separately"
         )
     noise_mode = noise_modes.pop()
+    unrecorded_pool_shards = [
+        f"{s['config_name']}/seed={s['seed']}"
+        for s in shards
+        if noise_mode == "pool" and s["noise_pool_steps"] is None
+    ]
+    if unrecorded_pool_shards:
+        raise ValueError(
+            "pool-mode shard(s) do not record noise_pool_steps; rerun them to a new path "
+            f"before merging (unrecorded: {unrecorded_pool_shards})"
+        )
+    noise_pool_sizes = {s["noise_pool_steps"] for s in shards}
+    if len(noise_pool_sizes) != 1:
+        raise ValueError(
+            "pool-mode shards span multiple noise_pool_steps values; merge them separately"
+        )
+    noise_pool_steps = noise_pool_sizes.pop()
     reference_environment = _screening_batch_environment(shards)
     by_config: dict[str, dict[int, dict[str, Any]]] = {}
     for shard in shards:
@@ -7327,6 +7407,7 @@ def merge_shards(
         "protocol_config": dict(shards[0]["config"]),
         "environment": dict(reference_environment),
         "noise_mode": noise_mode,
+        "noise_pool_steps": noise_pool_steps,
         "control_name": control_name,
         "confirmation_threshold": CONFIRMATION_THRESHOLD,
         "slope_window": slope_window,
@@ -7534,7 +7615,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="'pool' = screening-only pool-noise approximation "
              "(lean-UPGD-family arms only; never mergeable with exact shards)",
     )
-    run_p.add_argument("--noise-pool-steps", type=int, default=64)
+    run_p.add_argument(
+        "--noise-pool-steps",
+        type=int,
+        default=64,
+        help="effective pool size recorded in pool-mode shards (must be >= 2)",
+    )
 
     merge_p = sub.add_parser("merge", help="merge shards into a ranked summary")
     merge_p.add_argument("--shards", type=Path, nargs="+", required=True)
@@ -7577,8 +7663,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         logger.info("loading MNIST from data_home=%s", data_home)
         data_x, data_y = load_mnist_train(data_home)
         logger.info(
-            "running %s seed=%d for %d tasks x %d steps (noise_mode=%s)",
-            spec.name, seed, config.n_tasks, config.task_length, args.noise_mode,
+            "running %s seed=%d for %d tasks x %d steps "
+            "(noise_mode=%s, noise_pool_steps=%s)",
+            spec.name,
+            seed,
+            config.n_tasks,
+            config.task_length,
+            args.noise_mode,
+            args.noise_pool_steps if args.noise_mode == "pool" else None,
         )
         result = run_screening_config(
             data_x, data_y, spec, seed, config,

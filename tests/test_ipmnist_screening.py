@@ -1120,9 +1120,129 @@ class TestShardsAndMerge:
         path = self._write_inband_shard(tmp_path, config_name, 0, 0.5)
         payload = json.loads(path.read_text(encoding="utf-8"))
         payload["noise_mode"] = noise_mode
+        if noise_mode == "pool":
+            payload["noise_pool_steps"] = 64
         path.write_text(json.dumps(payload), encoding="utf-8")
 
-        assert load_shard(path)["noise_mode"] == noise_mode
+        loaded = load_shard(path)
+        assert loaded["noise_mode"] == noise_mode
+        assert loaded["noise_pool_steps"] == (64 if noise_mode == "pool" else None)
+
+    @pytest.mark.parametrize(
+        "noise_pool_steps",
+        [None, True, False, 8.0, "8", [], {}, 1, 0, -1],
+    )
+    def test_load_shard_rejects_invalid_pool_size(
+        self, tmp_path: Path, noise_pool_steps: object
+    ) -> None:
+        path = self._write_inband_shard(tmp_path, "upgd_w_control", 0, 0.5)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["noise_mode"] = "pool"
+        payload["noise_pool_steps"] = noise_pool_steps
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+        with pytest.raises(ValueError, match="noise_pool_steps"):
+            load_shard(path)
+
+    def test_load_shard_preserves_unrecorded_legacy_pool_size_as_unknown(
+        self, tmp_path: Path
+    ) -> None:
+        path = self._write_inband_shard(tmp_path, "upgd_w_control", 0, 0.5)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["noise_mode"] = "pool"
+        payload.pop("noise_pool_steps", None)
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+        loaded = load_shard(path)
+        assert loaded["noise_mode"] == "pool"
+        assert loaded["noise_pool_steps"] is None
+
+        with pytest.raises(ValueError, match="do not record noise_pool_steps"):
+            merge_shards([path], control_name="upgd_w_control", slope_window=2)
+
+    def test_load_shard_rejects_pool_size_for_step_mode(self, tmp_path: Path) -> None:
+        path = self._write_inband_shard(tmp_path, "upgd_w_control", 0, 0.5)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["noise_pool_steps"] = 64
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+        with pytest.raises(ValueError, match="null or absent.*noise_mode='step'"):
+            load_shard(path)
+
+    @pytest.mark.parametrize("noise_mode", [None, "step"])
+    def test_load_shard_normalizes_legacy_and_step_pool_size_to_none(
+        self, tmp_path: Path, noise_mode: str | None
+    ) -> None:
+        path = self._write_inband_shard(tmp_path, "upgd_w_control", 0, 0.5)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if noise_mode is None:
+            payload.pop("noise_mode")
+        payload.pop("noise_pool_steps", None)
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+        loaded = load_shard(path)
+        assert loaded["noise_mode"] == "step"
+        assert loaded["noise_pool_steps"] is None
+
+    def test_merge_rejects_mixed_pool_sizes(self, tmp_path: Path) -> None:
+        paths = [
+            self._write_inband_shard(tmp_path, "upgd_w_control", seed, 0.5)
+            for seed in (0, 1)
+        ]
+        for path, noise_pool_steps in zip(paths, (8, 512), strict=True):
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload["noise_mode"] = "pool"
+            payload["noise_pool_steps"] = noise_pool_steps
+            path.write_text(json.dumps(payload), encoding="utf-8")
+
+        with pytest.raises(ValueError, match="multiple noise_pool_steps"):
+            merge_shards(paths, control_name="upgd_w_control", slope_window=2)
+
+    def test_merge_rejects_known_and_unrecorded_pool_sizes(self, tmp_path: Path) -> None:
+        paths = [
+            self._write_inband_shard(tmp_path, "upgd_w_control", seed, 0.5)
+            for seed in (0, 1)
+        ]
+        for path in paths:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload["noise_mode"] = "pool"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+        known = json.loads(paths[0].read_text(encoding="utf-8"))
+        known["noise_pool_steps"] = 8
+        paths[0].write_text(json.dumps(known), encoding="utf-8")
+
+        with pytest.raises(ValueError, match="do not record noise_pool_steps"):
+            merge_shards(paths, control_name="upgd_w_control", slope_window=2)
+
+    def test_merge_requires_one_pool_size_across_all_arms(self, tmp_path: Path) -> None:
+        paths = [
+            self._write_inband_shard(tmp_path, "upgd_w_control", 0, 0.5),
+            self._write_inband_shard(tmp_path, "upgd_w_localgate", 0, 0.6),
+        ]
+        for path, noise_pool_steps in zip(paths, (8, 512), strict=True):
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload["noise_mode"] = "pool"
+            payload["noise_pool_steps"] = noise_pool_steps
+            path.write_text(json.dumps(payload), encoding="utf-8")
+
+        with pytest.raises(ValueError, match="multiple noise_pool_steps"):
+            merge_shards(paths, control_name="upgd_w_control", slope_window=2)
+
+    def test_merge_records_one_pool_size_across_all_arms(self, tmp_path: Path) -> None:
+        paths = [
+            self._write_inband_shard(tmp_path, "upgd_w_control", 0, 0.5),
+            self._write_inband_shard(tmp_path, "upgd_w_localgate", 0, 0.6),
+        ]
+        for path in paths:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload["noise_mode"] = "pool"
+            payload["noise_pool_steps"] = 8
+            path.write_text(json.dumps(payload), encoding="utf-8")
+
+        summary = merge_shards(paths, control_name="upgd_w_control", slope_window=2)
+
+        assert summary["noise_mode"] == "pool"
+        assert summary["noise_pool_steps"] == 8
 
     @pytest.mark.parametrize(
         ("config_name", "noise_mode", "error"),
@@ -1181,6 +1301,8 @@ class TestShardsAndMerge:
         else:
             payload["noise_mode"] = noise_mode
             expected = noise_mode
+        if noise_mode == "pool":
+            payload["noise_pool_steps"] = 64
         path.write_text(json.dumps(payload), encoding="utf-8")
 
         summary = merge_shards(
@@ -1188,6 +1310,7 @@ class TestShardsAndMerge:
         )
 
         assert summary["noise_mode"] == expected
+        assert summary["noise_pool_steps"] == (64 if noise_mode == "pool" else None)
 
     def test_merge_preserves_valid_wall_clock_summary(self, tmp_path):
         paths = [
@@ -1669,6 +1792,45 @@ class TestShardsAndMerge:
 class TestPoolConfirmation:
     """Screening-only pool-noise mode for full-protocol confirmation runs."""
 
+    @pytest.mark.parametrize(
+        "noise_pool_steps", [None, True, False, np.int64(8), 8.0, "8", 1, 0, -1]
+    )
+    def test_pool_rejects_noncanonical_pool_size_before_data_setup(
+        self, noise_pool_steps: object
+    ) -> None:
+        with pytest.raises(ValueError, match="noise_pool_steps.*built-in integer >= 2"):
+            run_screening_config(
+                np.empty((1, 1), dtype=np.float32),
+                np.empty((1,), dtype=np.int32),
+                screening_spec("upgd_w_control"),
+                seed=0,
+                config=SMALL,
+                noise_mode="pool",
+                noise_pool_steps=noise_pool_steps,  # type: ignore[arg-type]
+            )
+
+    @pytest.mark.parametrize("noise_pool_steps", [None, True, np.int64(8), 8.0, 1])
+    def test_shard_payload_rejects_noncanonical_pool_size(
+        self, noise_pool_steps: object
+    ) -> None:
+        spec = screening_spec("upgd_w_control")
+        result = ipmnist_screening.ScreeningRunResult(
+            config_name=spec.name,
+            base_learner=spec.base_learner,
+            hyperparameters=dict(spec.hyperparameters),
+            seed=0,
+            config=SMALL,
+            per_task_accuracy=np.zeros(SMALL.n_tasks),
+            per_task_loss=np.zeros(SMALL.n_tasks),
+            per_task_plasticity=np.zeros(SMALL.n_tasks),
+            wall_clock_seconds=0.0,
+            noise_mode="pool",
+            noise_pool_steps=noise_pool_steps,  # type: ignore[arg-type]
+        )
+
+        with pytest.raises(ValueError, match="noise_pool_steps"):
+            shard_payload(result)
+
     def test_pool_control_matches_run_ipmnist_pool(self, small_data):
         """Control arm under pool mode reproduces run_ipmnist's pool chain."""
         x, y = small_data
@@ -1681,6 +1843,8 @@ class TestPoolConfirmation:
             noise_mode="pool", noise_pool_steps=8,
         )
         assert ours.noise_mode == "pool"
+        assert ours.noise_pool_steps == 8
+        assert shard_payload(ours)["noise_pool_steps"] == 8
         np.testing.assert_allclose(
             ours.per_task_accuracy, reference.per_task_accuracy[0], atol=1e-7
         )
@@ -1723,7 +1887,9 @@ class TestPoolConfirmation:
         exact_payload = shard_payload(exact)
         pool_payload = shard_payload(pool)
         assert exact_payload["noise_mode"] == "step"
+        assert exact_payload["noise_pool_steps"] is None
         assert pool_payload["noise_mode"] == "pool"
+        assert pool_payload["noise_pool_steps"] == 8
         p_exact = tmp_path / "exact.json"
         p_pool = tmp_path / "pool.json"
         p_exact.write_text(json.dumps(exact_payload), encoding="utf-8")

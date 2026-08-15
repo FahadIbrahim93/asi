@@ -34,6 +34,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Bound each new IPMNIST screening pool shard and merged summary to its effective
+  `noise_pool_steps`, rejected malformed or cross-shard pool sizes, and made merge refuse
+  legacy pool shards whose omitted size remains inspectable but unknowable. Legacy shards
+  without a noise mode remain compatible as exact step-mode runs.
 - Made strict evidence, IPMNIST-screening, micro-continual, UPGD/Label-EMNIST, and sealed
   Forager artifact loaders reject duplicate JSON object keys at every nesting depth and JSON
   numeric tokens whose float conversion overflows to infinity.
