@@ -51,6 +51,10 @@ document cannot do so by assertion.
 Exact Python names and packaging may be refined during implementation, but the
 following semantic records are required and versioned.
 
+The initial L0 record and structural protocol surface is implemented in
+`alberta_framework.reference_agent`. It does not yet provide a concrete adapter,
+aggregate life runner, checkpoint bundle, or exact-resume conformance result.
+
 ### Life configuration
 
 The canonical, JSON-compatible life configuration binds:

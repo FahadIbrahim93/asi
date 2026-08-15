@@ -63,7 +63,8 @@ retained `PrototypeAgent` and the sibling robot controller. The
 dispatch lineage, exact resume, and its acceptance sequence. It does not yet populate
 `reference-dev`: neither adapter nor a whole-life checkpoint/runner has passed conformance, the
 robot and Forager paths do not currently consume `PrototypeAgent`, and Forager still records an
-unresolved extended-action dispatch edge.
+unresolved extended-action dispatch edge. The initial L0 record and structural protocol surface
+lives in `alberta_framework.reference_agent`; it is not a concrete adapter or conformance claim.
 
 The package also contains inherited surfaces related to all twelve steps of the Alberta Plan.
 That crosswalk is useful for finding gaps, but completing a checklist of Plan mechanisms would

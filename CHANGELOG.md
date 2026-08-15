@@ -17,6 +17,15 @@ reproducible results. See `VENDORING.md` for the exact scope.
 
 ### Added
 
+#### Reference-agent protocol
+
+- Added the first versioned, host-facing reference-agent records and structural
+  protocol: canonical configuration digests, discrete/box space declarations,
+  lifecycle-scoped decisions, explicit dispatch settlement, transition
+  boundaries, and atomic step results. This is the ADR's initial L0 contract
+  surface; no concrete adapter, whole-life runner, exact-resume gate, or
+  `reference-dev` selection is implied.
+
 #### Continual-learning benchmarks
 
 - Added strict nonpromoting IPMNIST `shard.v2` and `summary.v2` records. They bind
