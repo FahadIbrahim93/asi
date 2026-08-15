@@ -19,6 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the RLS recursion unchanged. It has no result artifact and does not authorize a benchmark
   run; execution still requires a replacement frozen protocol, fresh eligible seeds, and
   owner-approved compute.
+- Added the code-only, permanently nonpromoting IPMNIST reset ablation
+  `rls_head_resid_l1_noreset`, which changes only the incumbent's detector-driven covariance
+  reset threshold to its existing untriggerable endpoint. It has no result artifact and does
+  not authorize a benchmark run; execution remains gated on protocol, seed, and compute
+  approval.
 
 ### Changed
 

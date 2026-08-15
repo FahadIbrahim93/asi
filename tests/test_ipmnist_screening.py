@@ -307,6 +307,7 @@ class TestRegistry:
             "rls_head_l1_preset003",
             "rls_head_l0999_pcap",
             "rls_head_resid_l1_preset005",
+            "rls_head_resid_l1_noreset",
             "rls_head_resid_l1_preset005_l2init",
             "rls_head_resid_l1_preset005_nogate",
             "rls_head_l0999_preset005_r01",
@@ -5490,6 +5491,9 @@ class TestRLSHead:
             "rls_head_resid_l1_preset005": {
                 "rls_lambda": 1.0, "rls_reset_frac": 0.05, "head_resid": 1.0
             },
+            "rls_head_resid_l1_noreset": {
+                "rls_lambda": 1.0, "rls_reset_frac": 2.0, "head_resid": 1.0
+            },
             "rls_head_resid_l1_preset005_nogate": {
                 "rls_lambda": 1.0,
                 "rls_reset_frac": 0.05,
@@ -5548,6 +5552,145 @@ class TestRLSHead:
             "rls_head_resid_l1_preset005_nogate"
         ).hyperparameters
         assert nogate_hp == {**incumbent_hp, "gate_scale": 0.0}
+
+
+class TestRLSHeadNoReset:
+    """Issue #184's code-only detector-reset ablation endpoint."""
+
+    @staticmethod
+    def _assert_tree_equal(actual, expected):
+        actual_leaves, actual_tree = jax.tree_util.tree_flatten(actual)
+        expected_leaves, expected_tree = jax.tree_util.tree_flatten(expected)
+        assert actual_tree == expected_tree
+        assert len(actual_leaves) == len(expected_leaves)
+        for actual_leaf, expected_leaf in zip(actual_leaves, expected_leaves, strict=True):
+            np.testing.assert_array_equal(
+                np.asarray(actual_leaf), np.asarray(expected_leaf)
+            )
+
+    def test_registry_differs_from_incumbent_only_at_reset_fraction(self):
+        incumbent = screening_spec("rls_head_resid_l1_preset005")
+        candidate = screening_spec("rls_head_resid_l1_noreset")
+        assert candidate.base_learner == incumbent.base_learner == "upgd_w"
+        assert candidate.mechanism == incumbent.mechanism == "rls_readout"
+        assert candidate.factory is incumbent.factory
+        assert candidate.frozen_probe_input is incumbent.frozen_probe_input
+        assert candidate.noise_update is incumbent.noise_update is None
+        assert candidate.hyperparameters == {
+            **incumbent.hyperparameters,
+            "rls_reset_frac": 2.0,
+        }
+        assert {
+            name
+            for name in incumbent.hyperparameters
+            if incumbent.hyperparameters[name] != candidate.hyperparameters[name]
+        } == {"rls_reset_frac"}
+
+    @pytest.mark.parametrize("compiled", [False, True])
+    def test_pretrigger_trajectory_is_bitexact_incumbent(self, compiled):
+        incumbent = screening_spec("rls_head_resid_l1_preset005")
+        candidate = screening_spec("rls_head_resid_l1_noreset")
+        incumbent_init, incumbent_step = incumbent.factory(incumbent.hyperparameters)
+        candidate_init, candidate_step = candidate.factory(candidate.hyperparameters)
+        if compiled:
+            incumbent_step = jax.jit(incumbent_step)
+            candidate_step = jax.jit(candidate_step)
+
+        params = init_mlp_params(jr.key(184), SMALL)
+        incumbent_params = candidate_params = params
+        incumbent_state = incumbent_init(params)
+        candidate_state = candidate_init(params)
+        xs = [
+            jnp.linspace(0.05 * i, 0.05 * i + 0.3, SMALL.input_dim, dtype=jnp.float32)
+            for i in range(1, 7)
+        ]
+        ys = [jnp.array(i % SMALL.n_classes, jnp.int32) for i in range(6)]
+        for step, (x, y) in enumerate(zip(xs, ys)):
+            incumbent_out = incumbent_step(
+                incumbent_params, incumbent_state, x, y, jr.key(step)
+            )
+            candidate_out = candidate_step(
+                candidate_params, candidate_state, x, y, jr.key(step)
+            )
+            self._assert_tree_equal(candidate_out, incumbent_out)
+            incumbent_params, incumbent_state, _ = incumbent_out
+            candidate_params, candidate_state, _ = candidate_out
+
+    @pytest.mark.parametrize("compiled", [False, True])
+    def test_forced_trigger_resets_only_incumbent_covariance(self, compiled):
+        incumbent = screening_spec("rls_head_resid_l1_preset005")
+        candidate = screening_spec("rls_head_resid_l1_noreset")
+        incumbent_init, incumbent_step = incumbent.factory(incumbent.hyperparameters)
+        candidate_init, candidate_step = candidate.factory(candidate.hyperparameters)
+        if compiled:
+            incumbent_step = jax.jit(incumbent_step)
+            candidate_step = jax.jit(candidate_step)
+
+        params = init_mlp_params(jr.key(185), SMALL)
+        state = incumbent_init(params)
+        candidate_state = candidate_init(params)
+        self._assert_tree_equal(candidate_state, state)
+        mature = replace(
+            state,
+            norm=replace(
+                state.norm,
+                mean=jnp.zeros(SMALL.input_dim, jnp.float32),
+                var=jnp.full((SMALL.input_dim,), 1e-4, jnp.float32),
+                count=jnp.full((SMALL.input_dim,), 1000.0, jnp.float32),
+            ),
+            fast_mean=jnp.zeros(SMALL.input_dim, jnp.float32),
+        )
+        x_shift = jnp.full((SMALL.input_dim,), 10.0, jnp.float32)
+        y = jnp.array(2, jnp.int32)
+        incumbent_out = incumbent_step(params, mature, x_shift, y, jr.key(0))
+        candidate_out = candidate_step(params, mature, x_shift, y, jr.key(0))
+        incumbent_params, incumbent_state, incumbent_metrics = incumbent_out
+        candidate_params, candidate_state, candidate_metrics = candidate_out
+
+        self._assert_tree_equal(candidate_params, incumbent_params)
+        self._assert_tree_equal(candidate_metrics, incumbent_metrics)
+        np.testing.assert_array_equal(
+            np.asarray(candidate_state.wout), np.asarray(incumbent_state.wout)
+        )
+        ridge = incumbent.hyperparameters["rls_ridge_init"]
+        expected_reset = np.eye(mature.p.shape[0], dtype=np.float32) / ridge
+        np.testing.assert_array_equal(np.asarray(incumbent_state.p), expected_reset)
+        assert not np.array_equal(np.asarray(candidate_state.p), expected_reset)
+        assert not np.array_equal(np.asarray(candidate_state.p), np.asarray(mature.p))
+        assert np.any(np.asarray(candidate_state.wout))
+
+        x_norm, _, _, shifted = shift_adaptive_normalize(
+            mature.norm,
+            mature.fast_mean,
+            x_shift,
+            decay=incumbent.hyperparameters["norm_decay"],
+            fast_decay=incumbent.hyperparameters["fast_decay"],
+            epsilon=incumbent.hyperparameters["norm_epsilon"],
+            shift_k=incumbent.hyperparameters["shift_k"],
+            shift_delta=incumbent.hyperparameters["shift_delta"],
+            shift_refractory=incumbent.hyperparameters["shift_refractory"],
+        )
+        assert bool(jnp.all(shifted))
+        a1 = jax.nn.relu(x_norm @ params["w1"] + params["b1"])
+        a2 = jax.nn.relu(a1 @ params["w2"] + params["b2"])
+        phi = jnp.concatenate(
+            [
+                a2 / math.sqrt(SMALL.hidden2 + 1),
+                jnp.ones((1,), jnp.float32),
+            ]
+        )
+        pp = mature.p @ phi
+        gain = pp / (incumbent.hyperparameters["rls_lambda"] + phi @ pp)
+        expected_p = mature.p - jnp.outer(gain, pp)
+        expected_p = 0.5 * (expected_p + expected_p.T)
+        np.testing.assert_allclose(
+            np.asarray(candidate_state.p), np.asarray(expected_p), rtol=1e-6, atol=1e-7
+        )
+
+        for field in ("utility", "step", "norm", "fast_mean"):
+            self._assert_tree_equal(
+                getattr(candidate_state, field), getattr(incumbent_state, field)
+            )
 
 
 class TestRLSHeadL2Init:
