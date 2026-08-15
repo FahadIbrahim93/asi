@@ -74,3 +74,26 @@ def test_temporal_context_array_transform_is_jittable() -> None:
     chex.assert_shape(features, (2, config.output_dim()))
     assert int(state.step_count) == 2
     chex.assert_tree_all_finite(features)
+
+
+def test_inf_observation_holds_finite_ema() -> None:
+    """Inf observation minus an inf EMA is inf-inf = NaN in the delta block.
+
+    Fail-closed: skip the EMA update and emit zeros for non-finite raw
+    coordinates so later finite samples are not poisoned.
+    """
+    config = TemporalContextConfig(input_dim=2, ema_decay=0.5, periods=())
+    featurizer = TemporalContextFeaturizer(config)
+    state = featurizer.init()
+    inf_obs = jnp.array([jnp.inf, 1.0], dtype=jnp.float32)
+    held, features = featurizer.step(state, inf_obs)
+    assert bool(jnp.all(jnp.isfinite(features)))
+    assert bool(jnp.all(jnp.isfinite(held.observation_ema)))
+    chex.assert_trees_all_close(held.observation_ema, state.observation_ema)
+    assert int(held.step_count) == int(state.step_count)
+
+    finite_obs = jnp.array([0.0, 2.0], dtype=jnp.float32)
+    recovered, recovered_features = featurizer.step(held, finite_obs)
+    assert bool(jnp.all(jnp.isfinite(recovered_features)))
+    assert bool(jnp.all(jnp.isfinite(recovered.observation_ema)))
+    assert int(recovered.step_count) == 1

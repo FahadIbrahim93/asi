@@ -127,13 +127,14 @@ class TemporalContextFeaturizer:
         """Return current causal context features without advancing state."""
         cfg = self._config
         obs = jnp.asarray(observation, dtype=jnp.float32)
+        safe_obs = jnp.where(jnp.isfinite(obs), obs, jnp.zeros_like(obs))
         blocks = []
         if cfg.include_raw:
-            blocks.append(obs)
+            blocks.append(safe_obs)
         if cfg.include_ema:
             blocks.append(state.observation_ema)
         if cfg.include_delta:
-            blocks.append(obs - state.observation_ema)
+            blocks.append(safe_obs - state.observation_ema)
         if cfg.periods:
             step = state.step_count.astype(jnp.float32)
             periods = jnp.asarray(cfg.periods, dtype=jnp.float32)
@@ -141,7 +142,7 @@ class TemporalContextFeaturizer:
             phase = jnp.ravel(jnp.stack([jnp.sin(angles), jnp.cos(angles)], axis=1))
             blocks.append(phase)
             if cfg.include_phase_products:
-                blocks.append(jnp.ravel(phase[:, None] * obs[None, :]))
+                blocks.append(jnp.ravel(phase[:, None] * safe_obs[None, :]))
         return jnp.concatenate(blocks, axis=0)
 
     @functools.partial(jax.jit, static_argnums=(0,))
@@ -153,9 +154,15 @@ class TemporalContextFeaturizer:
         """Advance the context state after observing one input."""
         decay = jnp.asarray(self._config.ema_decay, dtype=jnp.float32)
         obs = jnp.asarray(observation, dtype=jnp.float32)
-        return TemporalContextState(
+        observation_valid = jnp.all(jnp.isfinite(obs))
+        proposed = TemporalContextState(
             observation_ema=decay * state.observation_ema + (1.0 - decay) * obs,
             step_count=state.step_count + 1,
+        )
+        return jax.lax.cond(
+            observation_valid,
+            lambda: proposed,
+            lambda: state,
         )
 
     @functools.partial(jax.jit, static_argnums=(0,))
