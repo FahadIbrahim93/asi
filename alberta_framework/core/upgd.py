@@ -50,6 +50,12 @@ from alberta_framework.core.optimizers import Bounder, ObGDBounding
 from alberta_framework.core.types import MLPParams
 from alberta_framework.core.update_safety import zero_if_collapsed_infinity
 
+
+def _skip_zero_scale(scale: Array, value: Array) -> Array:
+    """Skip ``0 * inf`` so a disabled decay does not poison the next EMA."""
+    return jnp.where(scale == 0.0, jnp.zeros_like(value), scale * value)
+
+
 # =============================================================================
 # Types
 # =============================================================================
@@ -2242,13 +2248,15 @@ class UPGDLearner:
 
         sq_for_metric = (predictions - safe_targets) ** 2
         step_mse = jnp.sum(jnp.where(active_mask, sq_for_metric, 0.0)) / n_active
+        fast_decay = jnp.asarray(self._loss_fast_decay, dtype=jnp.float32)
+        slow_decay = jnp.asarray(self._loss_slow_decay, dtype=jnp.float32)
         new_loss_fast_ema = (
-            jnp.asarray(self._loss_fast_decay, dtype=jnp.float32) * state.loss_fast_ema
-            + (1.0 - jnp.asarray(self._loss_fast_decay, dtype=jnp.float32)) * step_mse
+            _skip_zero_scale(fast_decay, state.loss_fast_ema)
+            + (1.0 - fast_decay) * step_mse
         )
         new_loss_slow_ema = (
-            jnp.asarray(self._loss_slow_decay, dtype=jnp.float32) * state.loss_slow_ema
-            + (1.0 - jnp.asarray(self._loss_slow_decay, dtype=jnp.float32)) * step_mse
+            _skip_zero_scale(slow_decay, state.loss_slow_ema)
+            + (1.0 - slow_decay) * step_mse
         )
         loss_pressure = jnp.array(1.0, dtype=jnp.float32)
         if self._unit_replacement_loss_gate_ratio > 0.0:
@@ -2292,23 +2300,14 @@ class UPGDLearner:
             self._head_repetition_delta_threshold,
             dtype=jnp.float32,
         )
+        repetition_decay = jnp.asarray(self._head_repetition_decay, dtype=jnp.float32)
         new_target_repeat_ema = (
-            jnp.asarray(self._head_repetition_decay, dtype=jnp.float32)
-            * state.target_repeat_ema
-            + (
-                1.0
-                - jnp.asarray(self._head_repetition_decay, dtype=jnp.float32)
-            )
-            * repeat_now.astype(jnp.float32)
+            _skip_zero_scale(repetition_decay, state.target_repeat_ema)
+            + (1.0 - repetition_decay) * repeat_now.astype(jnp.float32)
         )
         new_target_simplex_ema = (
-            jnp.asarray(self._head_repetition_decay, dtype=jnp.float32)
-            * state.target_simplex_ema
-            + (
-                1.0
-                - jnp.asarray(self._head_repetition_decay, dtype=jnp.float32)
-            )
-            * simplex_like_target.astype(jnp.float32)
+            _skip_zero_scale(repetition_decay, state.target_simplex_ema)
+            + (1.0 - repetition_decay) * simplex_like_target.astype(jnp.float32)
         )
         repetition_warm = state.step_count >= jnp.asarray(
             self._head_repetition_warmup_steps,
@@ -2740,7 +2739,10 @@ class UPGDLearner:
         new_unit_ages: list[Array] = []
         for i in range(n_trunk):
             instantaneous = jnp.abs(state.trunk_params.weights[i] * trunk_w_grads[i])
-            u_new = decay * state.utilities[i] + (1.0 - decay) * instantaneous
+            u_new = (
+                _skip_zero_scale(decay, state.utilities[i])
+                + (1.0 - decay) * instantaneous
+            )
             new_utilities.append(u_new)
 
             if track_unit_utilities:
@@ -2778,16 +2780,16 @@ class UPGDLearner:
                         * outgoing_signal
                     )
                 new_unit_utilities.append(
-                    unit_decay * state.unit_utilities[i]
+                    _skip_zero_scale(unit_decay, state.unit_utilities[i])
                     + (1.0 - unit_decay) * unit_signal
                 )
                 new_unit_long_utilities.append(
-                    unit_long_decay * state.unit_long_utilities[i]
+                    _skip_zero_scale(unit_long_decay, state.unit_long_utilities[i])
                     + (1.0 - unit_long_decay) * unit_signal
                 )
                 unit_gradient_signal = jnp.mean(jnp.abs(trunk_w_grads[i]), axis=1)
                 new_unit_gradient_emas.append(
-                    unit_gradient_decay * state.unit_gradient_emas[i]
+                    _skip_zero_scale(unit_gradient_decay, state.unit_gradient_emas[i])
                     + (1.0 - unit_gradient_decay) * unit_gradient_signal
                 )
                 new_unit_ages.append(state.unit_ages[i] + 1)

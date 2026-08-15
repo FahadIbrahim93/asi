@@ -1422,6 +1422,50 @@ class TestUtilityTracking:
             jnp.ones_like(result.state.unit_ages[0]),
         )
 
+    def test_zero_utility_decay_does_not_multiply_inf_ema(self):
+        """utility_decay=0 times an infinite EMA is NaN and would be committed."""
+        learner = UPGDLearner(
+            n_heads=1,
+            hidden_sizes=(4,),
+            sparsity=0.0,
+            step_size=0.0,
+            perturbation_sigma=0.0,
+            utility_decay=0.0,
+            unit_utility_decay=0.0,
+            unit_long_utility_decay=0.0,
+            unit_gradient_decay=0.0,
+            loss_fast_decay=0.0,
+            loss_slow_decay=0.0,
+            head_repetition_decay=0.0,
+        )
+        state = learner.init(feature_dim=3, key=jr.key(0))
+        state = state.replace(  # type: ignore[attr-defined]
+            utilities=tuple(jnp.full_like(u, jnp.inf) for u in state.utilities),
+            unit_utilities=tuple(jnp.full_like(u, jnp.inf) for u in state.unit_utilities),
+            unit_long_utilities=tuple(
+                jnp.full_like(u, jnp.inf) for u in state.unit_long_utilities
+            ),
+            unit_gradient_emas=tuple(
+                jnp.full_like(u, jnp.inf) for u in state.unit_gradient_emas
+            ),
+            loss_fast_ema=jnp.asarray(jnp.inf, dtype=jnp.float32),
+            loss_slow_ema=jnp.asarray(jnp.inf, dtype=jnp.float32),
+            target_repeat_ema=jnp.asarray(jnp.inf, dtype=jnp.float32),
+            target_simplex_ema=jnp.asarray(jnp.inf, dtype=jnp.float32),
+        )
+        raw = jnp.asarray(0.0, dtype=jnp.float32) * jnp.asarray(jnp.inf, dtype=jnp.float32)
+        assert not bool(jnp.isfinite(raw))
+
+        result = learner.update(state, jnp.ones(3), jnp.array([1.0]))
+        chex.assert_tree_all_finite(result.state.utilities)
+        chex.assert_tree_all_finite(result.state.unit_utilities)
+        chex.assert_tree_all_finite(result.state.unit_long_utilities)
+        chex.assert_tree_all_finite(result.state.unit_gradient_emas)
+        assert bool(jnp.isfinite(result.state.loss_fast_ema))
+        assert bool(jnp.isfinite(result.state.loss_slow_ema))
+        assert bool(jnp.isfinite(result.state.target_repeat_ema))
+        assert bool(jnp.isfinite(result.state.target_simplex_ema))
+
     def test_unit_recycling_reinitializes_lowest_mature_unit(self):
         learner = UPGDLearner(
             n_heads=2,
