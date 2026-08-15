@@ -18,6 +18,7 @@ from alberta_framework.utils.export import (
     export_to_json,
     generate_latex_table,
     generate_markdown_table,
+    save_experiment_report,
 )
 
 pytestmark = pytest.mark.unit
@@ -159,6 +160,10 @@ def _preflight_invalid_results(case: str) -> dict[str, AggregatedResults]:
         result = result._replace(
             summary={_METRIC: summary, "unselected": bad_summary}
         )
+    elif case == "empty_metric_arrays":
+        result = result._replace(metric_arrays={})
+    elif case == "empty_summary":
+        result = result._replace(summary={})
     else:
         raise AssertionError(f"unknown preflight test case: {case}")
 
@@ -309,6 +314,8 @@ def test_nonfinite_export_rejects_before_any_destination_mutation(
         "summary_value_count",
         "nonfinite_unselected_array",
         "nonfinite_unselected_summary",
+        "empty_metric_arrays",
+        "empty_summary",
     ],
 )
 def test_shared_preflight_rejects_invalid_aggregate_before_filesystem_mutation(
@@ -331,6 +338,71 @@ def test_shared_preflight_rejects_invalid_aggregate_before_filesystem_mutation(
         _export_mode(mode, results, absent)
     assert not absent.exists()
     assert not absent.parent.exists()
+
+
+@pytest.mark.parametrize("include_timeseries", [False, True], ids=["summary", "timeseries"])
+def test_csv_preflight_requires_requested_metric_in_every_aggregate(
+    include_timeseries: bool,
+    tmp_path: Path,
+) -> None:
+    valid = _constant_result("valid")
+    missing = _constant_result("missing")
+    if include_timeseries:
+        missing = missing._replace(
+            metric_arrays={"other": missing.metric_arrays[_METRIC]}
+        )
+    else:
+        missing = missing._replace(summary={"other": missing.summary[_METRIC]})
+    results = {"valid": valid, "missing": missing}
+
+    existing = tmp_path / "existing.csv"
+    sentinel = "existing artifact\n"
+    existing.write_text(sentinel, encoding="utf-8")
+    with pytest.raises(ValueError, match="requested metric"):
+        export_to_csv(
+            results,
+            existing,
+            metric=_METRIC,
+            include_timeseries=include_timeseries,
+        )
+    assert existing.read_text(encoding="utf-8") == sentinel
+
+    absent = tmp_path / "not-created" / "absent.csv"
+    with pytest.raises(ValueError, match="requested metric"):
+        export_to_csv(
+            results,
+            absent,
+            metric=_METRIC,
+            include_timeseries=include_timeseries,
+        )
+    assert not absent.parent.exists()
+
+
+@pytest.mark.parametrize("case", ["empty_results", "zero_step_axis", "missing_metric"])
+def test_report_preflight_rejects_before_output_directory_mutation(
+    case: str,
+    tmp_path: Path,
+) -> None:
+    if case == "missing_metric":
+        valid = _constant_result("valid")
+        missing = _constant_result("missing")._replace(summary={})
+        results = {"valid": valid, "missing": missing}
+    else:
+        results = _preflight_invalid_results(case)
+
+    absent = tmp_path / "absent-report"
+    with pytest.raises(ValueError):
+        save_experiment_report(results, absent, "invalid", metric=_METRIC)
+    assert not absent.exists()
+
+    existing = tmp_path / "existing-report"
+    existing.mkdir()
+    sentinel = existing / "keep.txt"
+    sentinel.write_text("existing artifact\n", encoding="utf-8")
+    with pytest.raises(ValueError):
+        save_experiment_report(results, existing, "invalid", metric=_METRIC)
+    assert sentinel.read_text(encoding="utf-8") == "existing artifact\n"
+    assert list(existing.iterdir()) == [sentinel]
 
 
 @pytest.mark.parametrize("mode", ["summary_csv", "timeseries_csv", "json"])

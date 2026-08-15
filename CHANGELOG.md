@@ -45,9 +45,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shape before stacking, preventing broadcast expansion of feature vectors into matrices.
 - Made experiment CSV and JSON artifacts preserve finite binary64 measurements exactly. A
   shared preflight now requires nonempty aggregates, canonical uint32 seed identities,
-  aligned nonempty metric arrays and summary samples, and finite measurements before touching
-  a parent or destination; complete serialized files publish atomically, while display-only
-  table rounding remains unchanged.
+  aligned nonempty metric arrays and summary samples, finite measurements, and the requested
+  report metric before touching a parent, destination, or report directory; complete
+  serialized files publish atomically, while display-only table rounding remains unchanged.
 - Protected the reserved checkpoint `_format_version` metadata key so every newly saved
   checkpoint carries the canonical on-disk format stamp even if caller metadata collides.
 - Made sparse initialization reject malformed dimensions and non-finite or out-of-range

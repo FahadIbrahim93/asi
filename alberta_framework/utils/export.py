@@ -43,7 +43,11 @@ def _require_finite_array(values: NDArray[np.float64], *, name: str) -> None:
         raise ValueError(f"{name} contains a non-finite measurement")
 
 
-def _preflight_export_results(results: dict[str, "AggregatedResults"]) -> None:
+def _preflight_export_results(
+    results: dict[str, "AggregatedResults"],
+    *,
+    metric: str | None = None,
+) -> None:
     """Validate the complete aggregate before any export touches the filesystem."""
     if not results:
         raise ValueError("export results must be non-empty")
@@ -54,6 +58,18 @@ def _preflight_export_results(results: dict[str, "AggregatedResults"]) -> None:
             name=f"AggregatedResults {name!r} seeds",
         )
         seed_count = len(seeds)
+
+        if not aggregate.metric_arrays:
+            raise ValueError(f"AggregatedResults {name!r} metric_arrays must be non-empty")
+        if not aggregate.summary:
+            raise ValueError(f"AggregatedResults {name!r} summary must be non-empty")
+        if metric is not None and (
+            metric not in aggregate.metric_arrays or metric not in aggregate.summary
+        ):
+            raise ValueError(
+                f"AggregatedResults {name!r} must contain requested metric {metric!r} "
+                "in both metric_arrays and summary"
+            )
 
         for metric_name, values in aggregate.metric_arrays.items():
             qualified_name = f"AggregatedResults {name!r} metric {metric_name!r}"
@@ -140,7 +156,7 @@ def _export_summary_csv(
     metric: str,
 ) -> None:
     """Export summary statistics to CSV."""
-    _preflight_export_results(results)
+    _preflight_export_results(results, metric=metric)
     output = io.StringIO(newline="")
     writer = csv.writer(output)
     writer.writerow(["config", "mean", "std", "min", "max", "n_seeds"])
@@ -171,7 +187,7 @@ def _export_timeseries_csv(
     metric: str,
 ) -> None:
     """Export full timeseries to CSV."""
-    _preflight_export_results(results)
+    _preflight_export_results(results, metric=metric)
 
     output = io.StringIO(newline="")
     writer = csv.writer(output)
@@ -523,6 +539,7 @@ def save_experiment_report(
     Returns:
         Dictionary mapping artifact type to file path
     """
+    _preflight_export_results(results, metric=metric)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
