@@ -21,6 +21,7 @@ from typing import Any, Literal, cast
 
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 from jax import Array
 
 from alberta_framework.core.baseline_optimizers import NADALINE, AdaGain, Adam, RMSprop
@@ -62,33 +63,62 @@ _VALID_NORMALIZERS: frozenset[str] = frozenset({"none", "ema", "welford", "strea
 _VALID_STREAMS: frozenset[str] = frozenset({"alberta", "xdist_shift"})
 
 
-def _require_real(name: str, value: object) -> float:
+def _require_real(name: str, value: object) -> tuple[float, float]:
+    """Return a JSON scalar and the value consumed by float32 JAX sinks."""
+
     if isinstance(value, bool) or not isinstance(value, Real):
         raise ValueError(f"{name} must be a real number, got {value!r}")
-    number = float(value)
+    try:
+        with np.errstate(invalid="ignore", over="ignore", under="ignore"):
+            narrowed = np.asarray(value, dtype=np.float32)
+    except (FloatingPointError, OverflowError, TypeError, ValueError):
+        raise ValueError(f"{name} must narrow to a finite float32, got {value!r}") from None
+    if narrowed.shape != () or not bool(np.isfinite(narrowed)):
+        raise ValueError(f"{name} must narrow to a finite float32, got {value!r}")
+    try:
+        number = float(value)
+    except (OverflowError, TypeError, ValueError):
+        raise ValueError(f"{name} must be a finite real number, got {value!r}") from None
     if not math.isfinite(number):
         raise ValueError(f"{name} must be finite, got {value!r}")
-    return number
+
+    # Preserve ordinary built-in/NumPy-float serialization when it narrows to
+    # exactly the checked sink value.  Extended-precision inputs at a rounding
+    # boundary must instead retain the direct float32 value: routing them
+    # through binary64 can double-round a finite float32 to infinity.
+    with np.errstate(invalid="ignore", over="ignore", under="ignore"):
+        renarrowed = np.asarray(number, dtype=np.float32)
+    if not bool(np.array_equal(narrowed, renarrowed)):
+        number = float(narrowed)
+    return number, float(narrowed)
 
 
 def _require_unit_interval(name: str, value: object) -> float:
-    number = _require_real(name, value)
-    if not 0.0 <= number <= 1.0:
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError(f"{name} must be a real number, got {value!r}")
+    if value < 0.0 or not value <= 1.0:
         raise ValueError(f"{name} must be in [0, 1], got {value!r}")
+    number, _ = _require_real(name, value)
     return number
 
 
 def _require_nonnegative_real(name: str, value: object) -> float:
-    number = _require_real(name, value)
-    if number < 0.0:
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError(f"{name} must be a real number, got {value!r}")
+    if value < 0.0:
         raise ValueError(f"{name} must be non-negative, got {value!r}")
+    number, _ = _require_real(name, value)
     return number
 
 
 def _require_positive_real(name: str, value: object) -> float:
-    number = _require_real(name, value)
-    if number <= 0.0:
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError(f"{name} must be a real number, got {value!r}")
+    if value <= 0.0:
         raise ValueError(f"{name} must be positive, got {value!r}")
+    number, narrowed = _require_real(name, value)
+    if narrowed <= 0.0:
+        raise ValueError(f"{name} must remain positive in float32, got {value!r}")
     return number
 
 
@@ -151,6 +181,9 @@ def _validate_step1_config(config: Step1KernelConfig) -> None:
     )
     object.__setattr__(config, "feature_dim", feature_dim)
     object.__setattr__(config, "num_relevant", num_relevant)
+    object.__setattr__(config, "optimizer", config.optimizer.lower())
+    object.__setattr__(config, "normalizer", config.normalizer.lower())
+    object.__setattr__(config, "stream", config.stream.lower())
     object.__setattr__(config, "step_size", step_size)
     object.__setattr__(config, "meta_step_size", meta_step_size)
     object.__setattr__(config, "drift_rate_w", drift_rate_w)

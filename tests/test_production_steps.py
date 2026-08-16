@@ -21,6 +21,7 @@ from alberta_framework.steps import (
     Step2StrictDigitReadoutConfig,
     Step2TemporalContextConfig,
     make_step1_learner,
+    make_step1_optimizer,
     make_step1_stream,
     make_step2_hybrid_learner,
     make_step2_learner,
@@ -89,6 +90,26 @@ def test_step1_kernel_rejects_unpublished_auto_alias() -> None:
 def test_step1_kernel_rejects_misspelled_adagain_alias() -> None:
     with pytest.raises(ValueError, match="optimizer"):
         Step1KernelConfig(optimizer="adagiven")  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "expected"),
+    [
+        ("optimizer", "LMS", "lms"),
+        ("normalizer", "EMA", "ema"),
+        ("stream", "ALBERTA", "alberta"),
+    ],
+)
+def test_step1_kernel_canonicalizes_supported_enum_spellings(
+    field: str,
+    value: object,
+    expected: str,
+) -> None:
+    config = Step1KernelConfig(**{field: value})
+
+    assert getattr(config, field) == expected
+    make_step1_learner(config)
+    make_step1_stream(config)
 
 
 _INVALID_STEP1_FIELDS: tuple[tuple[str, Any], ...] = (
@@ -224,8 +245,6 @@ def test_step1_fields_preserve_legal_endpoints() -> None:
 
 
 def test_step1_fields_canonicalize_nonbuiltin_numbers() -> None:
-    import numpy as np
-
     value = np.float64(0.05)
     config = Step1KernelConfig(
         feature_dim=np.int64(10),
@@ -254,6 +273,75 @@ def test_step1_fields_canonicalize_nonbuiltin_numbers() -> None:
     assert type(payload["feature_std"]) is float
     assert type(payload["ema_decay"]) is float
     assert type(payload["streaming_batch_momentum"]) is float
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "step_size",
+        "meta_step_size",
+        "drift_rate_w",
+        "drift_rate_b",
+        "noise_std",
+        "feature_std",
+    ],
+)
+def test_step1_float32_consumed_fields_reject_finite_wide_overflow(field: str) -> None:
+    with pytest.raises(ValueError, match=field):
+        Step1KernelConfig(**{field: 1e100})
+
+
+def test_step1_positive_float32_field_rejects_positive_to_zero_collapse() -> None:
+    with pytest.raises(ValueError, match="feature_std"):
+        Step1KernelConfig(feature_std=1e-50)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("step_size", Fraction(-1, 10**1000)),
+        ("meta_step_size", Fraction(-1, 10**1000)),
+        ("drift_rate_w", Fraction(-1, 10**1000)),
+        ("drift_rate_b", Fraction(-1, 10**1000)),
+        ("noise_std", Fraction(-1, 10**1000)),
+        ("feature_std", Fraction(1, 10**1000)),
+        ("ema_decay", Fraction(-1, 10**1000)),
+        ("ema_decay", Fraction(10**1000 + 1, 10**1000)),
+        ("streaming_batch_momentum", Fraction(-1, 10**1000)),
+        (
+            "streaming_batch_momentum",
+            Fraction(10**1000 + 1, 10**1000),
+        ),
+    ],
+)
+def test_step1_fields_check_exact_domains_before_float_conversion(
+    field: str,
+    value: object,
+) -> None:
+    with pytest.raises(ValueError, match=field):
+        Step1KernelConfig(**{field: value})
+
+
+def test_step1_fields_wrap_real_conversion_overflow_as_config_error() -> None:
+    with pytest.raises(ValueError, match="step_size"):
+        Step1KernelConfig(step_size=Fraction(10**1000, 1))
+
+
+def test_step1_field_uses_direct_float32_narrowing_at_overflow_boundary() -> None:
+    overflow_midpoint = np.ldexp(
+        np.longdouble(2) - np.ldexp(np.longdouble(1), -24),
+        127,
+    )
+    largest_finite_input = np.nextafter(
+        overflow_midpoint,
+        np.longdouble("-inf"),
+    )
+
+    config = Step1KernelConfig(optimizer="lms", step_size=largest_finite_input)
+    optimizer = make_step1_optimizer(config)
+
+    assert bool(np.isfinite(np.asarray(config.step_size, dtype=np.float32)))
+    assert optimizer.to_config()["step_size"] == config.step_size
 
 
 def test_step2_kernel_factory_and_smoke_are_finite() -> None:
