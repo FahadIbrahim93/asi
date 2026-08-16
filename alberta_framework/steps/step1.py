@@ -354,9 +354,9 @@ def run_step1_smoke(
     the production kernel can initialize, compile, update online, and return
     finite metrics.
     """
-    if steps < 1:
-        raise ValueError(f"steps must be positive, got {steps}")
-    if final_window < 1 or final_window > steps:
+    steps = _require_int("steps", steps, minimum=1)
+    final_window = _require_int("final_window", final_window, minimum=1)
+    if final_window > steps:
         raise ValueError(
             f"final_window must be in [1, steps], got {final_window}"
         )
