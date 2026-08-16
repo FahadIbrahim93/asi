@@ -478,11 +478,15 @@ def _require_float32_real(
         if not in_domain(real_value):
             raise ValueError
         narrowed = round_real_to_float32(real_value)
-    except (FloatingPointError, OverflowError, TypeError, ValueError) as error:
+    except Exception as error:
         raise ValueError(f"{name} must be finite and {domain}") from error
     if not math.isfinite(narrowed):
         raise ValueError(f"{name} must narrow to a finite float32")
-    if real_value != 0 and narrowed == 0.0:
+    try:
+        exact_nonzero = bool(real_value != 0)
+    except Exception as error:
+        raise ValueError(f"{name} must be finite and {domain}") from error
+    if exact_nonzero and narrowed == 0.0:
         raise ValueError(f"{name} must not underflow to zero in float32")
     if not in_domain(narrowed):
         raise ValueError(f"{name} must remain {domain} once narrowed to float32")
