@@ -202,7 +202,24 @@ class PrototypeMemoryConfig:
             payload = dict(config)
         except Exception as error:
             raise ValueError("PrototypeMemoryConfig mapping could not be read") from error
-        payload.pop("type", None)
+        if payload.pop("type", None) != "PrototypeMemoryConfig":
+            raise ValueError("PrototypeMemoryConfig type is invalid")
+        expected = {
+            "feature_dim",
+            "n_classes",
+            "slots_per_class",
+            "update_rate",
+            "novelty_threshold",
+            "bandwidth",
+        }
+        if set(payload) != expected:
+            raise ValueError("PrototypeMemoryConfig fields do not match its schema")
+        for name in ("feature_dim", "n_classes", "slots_per_class"):
+            if type(payload[name]) is not int:
+                raise ValueError(f"serialized {name} must be a JSON integer")
+        for name in ("update_rate", "novelty_threshold", "bandwidth"):
+            if type(payload[name]) is not float:
+                raise ValueError(f"serialized {name} must be a JSON number")
         return cls(**payload)
 
 
@@ -309,7 +326,11 @@ class PrototypeMemoryLearner:
             payload = dict(config)
         except Exception as error:
             raise ValueError("PrototypeMemoryLearner mapping could not be read") from error
-        inner_raw = payload.get("config")
+        if set(payload) != {"type", "config"}:
+            raise ValueError("PrototypeMemoryLearner fields do not match its schema")
+        if payload["type"] != "PrototypeMemoryLearner":
+            raise ValueError("PrototypeMemoryLearner type is invalid")
+        inner_raw = payload["config"]
         if not issubclass(type(inner_raw), Mapping):
             raise ValueError("PrototypeMemoryLearner config must be a mapping")
         try:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+from collections.abc import Iterator, Mapping
 from types import MappingProxyType
 
 import jax
@@ -255,6 +256,16 @@ def test_prototype_config_mapping_compatibility_rejects_spoofs_before_hooks() ->
         def __repr__(self) -> str:
             raise AssertionError("repr hook executed")
 
+    class HostileMapping(Mapping[str, object]):
+        def __getitem__(self, key: str) -> object:
+            raise RuntimeError("getitem hook")
+
+        def __iter__(self) -> Iterator[str]:
+            raise RuntimeError("iteration hook")
+
+        def __len__(self) -> int:
+            return 1
+
     config = PrototypeMemoryConfig(feature_dim=2, n_classes=2)
     assert PrototypeMemoryConfig.from_config(MappingProxyType(config.to_config())) == config
     learner = PrototypeMemoryLearner(config)
@@ -264,6 +275,36 @@ def test_prototype_config_mapping_compatibility_rejects_spoofs_before_hooks() ->
         PrototypeMemoryConfig.from_config(MappingSpoof())  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="mapping"):
         PrototypeMemoryLearner.from_config(MappingSpoof())  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="mapping could not be read"):
+        PrototypeMemoryConfig.from_config(HostileMapping())
+    with pytest.raises(ValueError, match="mapping could not be read"):
+        PrototypeMemoryLearner.from_config(HostileMapping())
+
+
+def test_prototype_serialized_schema_is_exact_and_uses_json_scalars() -> None:
+    config = PrototypeMemoryConfig(feature_dim=2, n_classes=2)
+    payload = config.to_config()
+    for mutation, match in (
+        ({"type": "OtherConfig"}, "type"),
+        ({"feature_dim": np.int32(2)}, "feature_dim"),
+        ({"update_rate": np.float32(0.3)}, "update_rate"),
+        ({"extra": 1}, "fields"),
+    ):
+        invalid = dict(payload)
+        invalid.update(mutation)
+        with pytest.raises(ValueError, match=match):
+            PrototypeMemoryConfig.from_config(invalid)
+
+    missing = dict(payload)
+    missing.pop("bandwidth")
+    with pytest.raises(ValueError, match="fields"):
+        PrototypeMemoryConfig.from_config(missing)
+
+    learner_payload = PrototypeMemoryLearner(config).to_config()
+    with pytest.raises(ValueError, match="type"):
+        PrototypeMemoryLearner.from_config({**learner_payload, "type": "OtherLearner"})
+    with pytest.raises(ValueError, match="fields"):
+        PrototypeMemoryLearner.from_config({**learner_payload, "extra": 1})
 
 
 @pytest.mark.parametrize(
