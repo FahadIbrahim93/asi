@@ -13,8 +13,8 @@ import numpy as np
 import pytest
 
 from alberta_framework.core.options import SubtaskSpec
-from alberta_framework.steps.step3 import Step3HordeConfig
-from alberta_framework.steps.step4 import Step4SARSAConfig
+from alberta_framework.steps.step3 import Step3HordeConfig, make_step3_horde_spec
+from alberta_framework.steps.step4 import Step4SARSAConfig, make_step4_sarsa_agent
 from alberta_framework.steps.step5 import Step5AverageRewardTDConfig
 from alberta_framework.steps.step7 import Step7DynaConfig
 from alberta_framework.steps.step8 import Step8WorldModelConfig, make_step8_world_model
@@ -260,6 +260,71 @@ def test_unit_interval_rejects_exact_value_above_endpoint() -> None:
 
 
 @pytest.mark.parametrize(
+    "value",
+    [Fraction(1, 2**150), Fraction(1, 2**149)],
+    ids=("underflows-to-zero", "minimum-subnormal"),
+)
+def test_gvf_probabilities_reject_nonzero_subnormal_inputs(value: Fraction) -> None:
+    with pytest.raises(ValueError, match="zero or a normal float32"):
+        Step3HordeConfig(gammas=(value,), lamdas=(0.0,))
+    with pytest.raises(ValueError, match="zero or a normal float32"):
+        Step4SARSAConfig(gamma=value)
+    with pytest.raises(ValueError, match="zero or a normal float32"):
+        Step4SARSAConfig(lamda=value)
+
+
+def test_gvf_probabilities_accept_minimum_normal_and_reach_core() -> None:
+    minimum_normal = Fraction(1, 2**126)
+    expected = float.fromhex("0x1.0p-126")
+    step3 = Step3HordeConfig(gammas=(minimum_normal,), lamdas=(minimum_normal,))
+    step4 = Step4SARSAConfig(gamma=minimum_normal, lamda=minimum_normal)
+
+    assert step3.gammas == (expected,)
+    assert step3.lamdas == (expected,)
+    assert step4.gamma == expected
+    assert step4.lamda == expected
+    make_step3_horde_spec(step3)
+    make_step4_sarsa_agent(step4)
+
+
+def test_zero_host_with_subnormal_ratio_is_rejected_before_core() -> None:
+    class SubnormalRatioFloat(float):
+        def as_integer_ratio(self) -> tuple[int, int]:
+            return (1, 2**149)
+
+    value = SubnormalRatioFloat(0.0)
+
+    with pytest.raises(ValueError, match="zero or a normal float32"):
+        Step3HordeConfig(gammas=(value,), lamdas=(0.0,))
+    with pytest.raises(ValueError, match="zero or a normal float32"):
+        Step4SARSAConfig(gamma=value)
+
+
+def test_host_comparisons_cannot_hide_invalid_narrowed_domains() -> None:
+    class NegativeRatioFloat(float):
+        def as_integer_ratio(self) -> tuple[int, int]:
+            return (-1, 1)
+
+    class AboveUnitRatioFloat(float):
+        def as_integer_ratio(self) -> tuple[int, int]:
+            return (2, 1)
+
+    negative = NegativeRatioFloat(0.5)
+    above_unit = AboveUnitRatioFloat(0.5)
+
+    with pytest.raises(ValueError, match="step_size must be non-negative"):
+        Step4SARSAConfig(step_size=negative)
+    with pytest.raises(ValueError, match="step_size must be non-negative"):
+        Step5AverageRewardTDConfig(step_size=negative)
+    with pytest.raises(ValueError, match="option_importance_clip must be positive"):
+        Step10STOMPConfig(option_importance_clip=negative)
+    with pytest.raises(ValueError, match=r"gammas must be in \[0, 1\]"):
+        Step3HordeConfig(gammas=(above_unit,), lamdas=(0.0,))
+    with pytest.raises(ValueError, match=r"trace_decay must be in \[0, 1\]"):
+        Step5AverageRewardTDConfig(trace_decay=above_unit)
+
+
+@pytest.mark.parametrize(
     ("config_type", "field"),
     [
         pytest.param(Step8WorldModelConfig, "utility_decay", id="step8"),
@@ -286,9 +351,40 @@ def test_half_open_interval_rejects_value_that_rounds_to_one(
 def test_half_open_interval_accepts_value_that_rounds_below_one() -> None:
     value = Fraction(1, 1) - Fraction(1, 2**25) - Fraction(1, 2**200)
     expected = float(np.nextafter(np.float32(1.0), np.float32(0.0)))
+    step8 = Step8WorldModelConfig(utility_decay=value)
+    step9 = Step9DreamingConfig(model_error_decay=value)
+
+    assert step8.utility_decay == expected
+    assert step9.model_error_decay == expected
+    make_step8_world_model(step8)
+    make_step9_components(step9)
+
+
+@pytest.mark.parametrize(
+    ("offset", "accepted"),
+    [
+        (-Fraction(1, 2**80), True),
+        (Fraction(0, 1), False),
+        (Fraction(1, 2**80), False),
+    ],
+    ids=("below", "tie", "above"),
+)
+def test_half_open_decay_rejects_values_that_round_to_one(
+    offset: Fraction,
+    accepted: bool,
+) -> None:
+    value = Fraction(1, 1) - Fraction(1, 2**25) + offset
+
+    if not accepted:
+        with pytest.raises(ValueError, match=r"must be in \[0, 1\)"):
+            Step8WorldModelConfig(utility_decay=value)
+        with pytest.raises(ValueError, match=r"must be in \[0, 1\)"):
+            Step9DreamingConfig(model_error_decay=value)
+        return
 
     step8 = Step8WorldModelConfig(utility_decay=value)
     step9 = Step9DreamingConfig(model_error_decay=value)
+    expected = float(np.nextafter(np.float32(1.0), np.float32(0.0)))
 
     assert step8.utility_decay == expected
     assert step9.model_error_decay == expected
@@ -351,6 +447,43 @@ def test_numpy_float64_midpoint_neighborhood_rounds_once() -> None:
     assert above_config.step_size == expected_upper
 
 
+def test_float_subclass_cannot_disagree_with_its_exact_ratio() -> None:
+    class RatioFloat(float):
+        def as_integer_ratio(self) -> tuple[int, int]:
+            return (3, 4)
+
+    value = RatioFloat(0.5)
+
+    assert Step3HordeConfig(step_size=value).step_size == 0.75
+    assert Step8WorldModelConfig(step_size=value).step_size == 0.75
+
+
+def test_float_subclass_cannot_spoof_builtin_identity() -> None:
+    class RatioFloat(float):
+        def __getattribute__(self, name: str) -> object:
+            if name == "__class__":
+                return float
+            return super().__getattribute__(name)
+
+        def as_integer_ratio(self) -> tuple[int, int]:
+            return (3, 4)
+
+    value = RatioFloat(0.5)
+
+    assert Step3HordeConfig(step_size=value).step_size == 0.75
+
+
+def test_nonfinite_float_subclass_cannot_bypass_exact_ratio_storage() -> None:
+    class RatioFloat(float):
+        def as_integer_ratio(self) -> tuple[int, int]:
+            return (1, 1)
+
+    config = Step9DreamingConfig(dream_surprise_weight=RatioFloat(float("nan")))
+
+    assert config.dream_surprise_weight == 1.0
+    json.dumps(config.to_dict(), allow_nan=False)
+
+
 @pytest.mark.parametrize(
     "value",
     [np.float16(0.1), np.float32(0.1), np.float64(0.1), np.int32(1), np.int64(1)],
@@ -369,13 +502,14 @@ def test_jax_array_scalars_remain_outside_the_real_facade(value: object) -> None
 
 
 @pytest.mark.parametrize(
-    "config_and_payload",
+    ("config_and_payload", "field"),
     [
         pytest.param(
             lambda: (
                 Step3HordeConfig(step_size=0.1),
                 Step3HordeConfig(step_size=0.1).to_dict(),
             ),
+            "step_size",
             id="step3",
         ),
         pytest.param(
@@ -383,6 +517,7 @@ def test_jax_array_scalars_remain_outside_the_real_facade(value: object) -> None
                 Step4SARSAConfig(step_size=0.1),
                 Step4SARSAConfig(step_size=0.1).to_dict(),
             ),
+            "step_size",
             id="step4",
         ),
         pytest.param(
@@ -390,6 +525,7 @@ def test_jax_array_scalars_remain_outside_the_real_facade(value: object) -> None
                 Step5AverageRewardTDConfig(step_size=0.1),
                 Step5AverageRewardTDConfig(step_size=0.1).to_dict(),
             ),
+            "step_size",
             id="step5",
         ),
         pytest.param(
@@ -397,6 +533,7 @@ def test_jax_array_scalars_remain_outside_the_real_facade(value: object) -> None
                 Step7DynaConfig(planning_priority_propagation=0.1),
                 Step7DynaConfig(planning_priority_propagation=0.1).to_dict(),
             ),
+            "planning_priority_propagation",
             id="step7",
         ),
         pytest.param(
@@ -404,6 +541,7 @@ def test_jax_array_scalars_remain_outside_the_real_facade(value: object) -> None
                 Step8WorldModelConfig(step_size=0.1),
                 Step8WorldModelConfig(step_size=0.1).to_dict(),
             ),
+            "step_size",
             id="step8",
         ),
         pytest.param(
@@ -411,6 +549,7 @@ def test_jax_array_scalars_remain_outside_the_real_facade(value: object) -> None
                 Step9DreamingConfig(model_step_size=0.1),
                 Step9DreamingConfig(model_step_size=0.1).to_dict(),
             ),
+            "model_step_size",
             id="step9",
         ),
         pytest.param(
@@ -418,16 +557,19 @@ def test_jax_array_scalars_remain_outside_the_real_facade(value: object) -> None
                 Step10STOMPConfig(base_step_size=0.1),
                 Step10STOMPConfig(base_step_size=0.1).to_config(),
             ),
+            "base_step_size",
             id="step10",
         ),
     ],
 )
 def test_builtin_float_serialization_value_is_preserved(
     config_and_payload: Callable[[], tuple[object, dict[str, Any]]],
+    field: str,
 ) -> None:
     _, payload = config_and_payload()
 
-    selected = next(value for value in payload.values() if value == 0.1)
+    selected = payload[field]
+    assert type(selected) is float
     assert selected == 0.1
     json.dumps(payload, allow_nan=False)
 

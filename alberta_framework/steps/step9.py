@@ -186,21 +186,21 @@ def _require_real(name: str, value: object) -> float:
 
 def _require_nonneg_real(name: str, value: object) -> float:
     real, narrowed = finite_real_and_float32(name, value)
-    if real < 0.0:
+    if real < 0.0 or narrowed < 0.0:
         raise ValueError(f"{name} must be non-negative, got {value!r}")
     return canonical_float32_storage(real, narrowed)
 
 
 def _require_unit_interval(name: str, value: object) -> float:
     real, narrowed = finite_real_and_float32(name, value)
-    if real < 0.0 or not real <= 1.0:
+    if real < 0.0 or not real <= 1.0 or narrowed < 0.0 or not narrowed <= 1.0:
         raise ValueError(f"{name} must be in [0, 1], got {value!r}")
     return canonical_float32_storage(real, narrowed)
 
 
 def _require_half_open_unit_interval(name: str, value: object) -> float:
     real, narrowed = finite_real_and_float32(name, value)
-    if real < 0.0 or not real < 1.0 or not narrowed < 1.0:
+    if real < 0.0 or not real < 1.0 or narrowed < 0.0 or not narrowed < 1.0:
         raise ValueError(f"{name} must be in [0, 1), got {value!r}")
     return canonical_float32_storage(real, narrowed)
 

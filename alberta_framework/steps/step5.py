@@ -67,11 +67,11 @@ class Step5AverageRewardTDConfig:
             "average_reward_step_size", self.average_reward_step_size
         )
         trace_decay = _finite_float32_scalar("trace_decay", self.trace_decay)
-        if self.step_size < 0.0:
+        if self.step_size < 0.0 or step_size < 0.0:
             raise ValueError("step_size must be non-negative")
-        if self.average_reward_step_size < 0.0:
+        if self.average_reward_step_size < 0.0 or average_reward_step_size < 0.0:
             raise ValueError("average_reward_step_size must be non-negative")
-        if not 0.0 <= self.trace_decay <= 1.0:
+        if not 0.0 <= self.trace_decay <= 1.0 or not 0.0 <= trace_decay <= 1.0:
             raise ValueError("trace_decay must be in [0, 1]")
         # Preserve the exact built-in JSON scalar values accepted by the
         # existing facade. Non-built-in Real scalars need canonicalization so

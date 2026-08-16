@@ -46,6 +46,7 @@ from alberta_framework.steps._float32_validation import (
 
 Step3NormalizerName = Literal["none", "ema"]
 Step3TraceModeName = Literal["accumulating", "replacing"]
+_FLOAT32_MIN_NORMAL = float.fromhex("0x1.0p-126")
 Step3RoutingName = Literal["shared", "independent", "mixed"]
 
 
@@ -175,21 +176,30 @@ class Step3OneStepResult:
 
 def _require_unit_interval(name: str, value: object) -> float:
     real, narrowed = finite_real_and_float32(name, value)
-    if real < 0.0 or not real <= 1.0:
+    if real < 0.0 or not real <= 1.0 or narrowed < 0.0 or not narrowed <= 1.0:
         raise ValueError(f"{name} must be in [0, 1], got {value!r}")
+    return canonical_float32_storage(real, narrowed)
+
+
+def _require_gvf_probability(name: str, value: object) -> float:
+    real, narrowed = finite_real_and_float32(name, value)
+    if real < 0.0 or not real <= 1.0 or narrowed < 0.0 or not narrowed <= 1.0:
+        raise ValueError(f"{name} must be in [0, 1], got {value!r}")
+    if narrowed < _FLOAT32_MIN_NORMAL and (real != 0.0 or narrowed != 0.0):
+        raise ValueError(f"{name} must be zero or a normal float32 value in [0, 1]")
     return canonical_float32_storage(real, narrowed)
 
 
 def _require_nonnegative_real(name: str, value: object) -> float:
     real, narrowed = finite_real_and_float32(name, value)
-    if real < 0.0:
+    if real < 0.0 or narrowed < 0.0:
         raise ValueError(f"{name} must be non-negative, got {value!r}")
     return canonical_float32_storage(real, narrowed)
 
 
 def _require_positive_real(name: str, value: object) -> float:
     real, narrowed = finite_real_and_float32(name, value)
-    if real <= 0.0 or narrowed == 0.0:
+    if real <= 0.0 or narrowed <= 0.0:
         raise ValueError(f"{name} must be positive, got {value!r}")
     return canonical_float32_storage(real, narrowed)
 
@@ -212,8 +222,8 @@ def _validate_horde_config(config: Step3HordeConfig) -> None:
             f"got {len(config.gammas)} and {len(config.lamdas)}"
         )
         raise ValueError(msg)
-    gammas = tuple(_require_unit_interval("gammas", value) for value in config.gammas)
-    lamdas = tuple(_require_unit_interval("lamdas", value) for value in config.lamdas)
+    gammas = tuple(_require_gvf_probability("gammas", value) for value in config.gammas)
+    lamdas = tuple(_require_gvf_probability("lamdas", value) for value in config.lamdas)
     step_size = _require_nonnegative_real("step_size", config.step_size)
     sparsity = _require_unit_interval("sparsity", config.sparsity)
     obgd_kappa = _require_positive_real("obgd_kappa", config.obgd_kappa)

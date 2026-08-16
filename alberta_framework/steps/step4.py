@@ -53,6 +53,7 @@ from alberta_framework.steps._float32_validation import (
 
 Step4OptimizerName = Literal["lms", "idbd", "autostep"]
 Step4BounderName = Literal["none", "obgd"]
+_FLOAT32_MIN_NORMAL = float.fromhex("0x1.0p-126")
 
 
 @dataclass(frozen=True)
@@ -139,21 +140,30 @@ class Step4OneStepResult:
 
 def _require_unit_interval(name: str, value: object) -> float:
     real, narrowed = finite_real_and_float32(name, value)
-    if real < 0.0 or not real <= 1.0:
+    if real < 0.0 or not real <= 1.0 or narrowed < 0.0 or not narrowed <= 1.0:
         raise ValueError(f"{name} must be in [0, 1], got {value!r}")
+    return canonical_float32_storage(real, narrowed)
+
+
+def _require_gvf_probability(name: str, value: object) -> float:
+    real, narrowed = finite_real_and_float32(name, value)
+    if real < 0.0 or not real <= 1.0 or narrowed < 0.0 or not narrowed <= 1.0:
+        raise ValueError(f"{name} must be in [0, 1], got {value!r}")
+    if narrowed < _FLOAT32_MIN_NORMAL and (real != 0.0 or narrowed != 0.0):
+        raise ValueError(f"{name} must be zero or a normal float32 value in [0, 1]")
     return canonical_float32_storage(real, narrowed)
 
 
 def _require_nonnegative_real(name: str, value: object) -> float:
     real, narrowed = finite_real_and_float32(name, value)
-    if real < 0.0:
+    if real < 0.0 or narrowed < 0.0:
         raise ValueError(f"{name} must be non-negative, got {value!r}")
     return canonical_float32_storage(real, narrowed)
 
 
 def _require_positive_real(name: str, value: object) -> float:
     real, narrowed = finite_real_and_float32(name, value)
-    if real <= 0.0 or narrowed == 0.0:
+    if real <= 0.0 or narrowed <= 0.0:
         raise ValueError(f"{name} must be positive, got {value!r}")
     return canonical_float32_storage(real, narrowed)
 
@@ -181,11 +191,11 @@ def _validate_sarsa_config(config: Step4SARSAConfig) -> None:
     hidden_sizes = tuple(
         _require_positive_int("hidden_sizes", size) for size in config.hidden_sizes
     )
-    gamma = _require_unit_interval("gamma", config.gamma)
+    gamma = _require_gvf_probability("gamma", config.gamma)
     epsilon_start = _require_unit_interval("epsilon_start", config.epsilon_start)
     epsilon_end = _require_unit_interval("epsilon_end", config.epsilon_end)
     epsilon_decay_steps = _require_nonneg_int("epsilon_decay_steps", config.epsilon_decay_steps)
-    lamda = _require_unit_interval("lamda", config.lamda)
+    lamda = _require_gvf_probability("lamda", config.lamda)
     step_size = _require_nonnegative_real("step_size", config.step_size)
     meta_step_size = _require_nonnegative_real("meta_step_size", config.meta_step_size)
     bounder_kappa = _require_positive_real("bounder_kappa", config.bounder_kappa)
