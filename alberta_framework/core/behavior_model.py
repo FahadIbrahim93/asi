@@ -252,7 +252,10 @@ class BehaviorModelInputGradient:
     This result is read-only: computing it does not advance diagnostics, RNG,
     or parameters. ``gradient`` is the derivative of the unfloored softmax
     cross entropy. Probability flooring remains confined to reporting and
-    importance-ratio safety.
+    importance-ratio safety. ``valid`` is the traced transaction verdict for
+    the complete result: callers must gate any downstream state mutation on
+    it. Numeric fields are neutralized when it is false so an invalid operand
+    cannot poison a speculative update.
     """
 
     logits: Float[Array, " n_actions"]
@@ -260,6 +263,7 @@ class BehaviorModelInputGradient:
     loss: Float[Array, ""]
     gradient: Float[Array, " feature_dim"]
     gradient_norm: Float[Array, ""]
+    valid: Bool[Array, ""]
 
 
 @chex.dataclass(frozen=True)
@@ -438,7 +442,9 @@ class BehaviorModel:
         trainable state builder. Callers must invoke it before
         :meth:`update`, and before advancing a recurrent state builder to the
         next observation, so the gradient refers to the representation that
-        produced the scored prediction.
+        produced the scored prediction. Any consumer that proposes a state
+        mutation from this result must commit it only when ``result.valid`` is
+        true.
         """
         cfg = self._config
         obs = jnp.asarray(observation, dtype=jnp.float32)
@@ -450,12 +456,37 @@ class BehaviorModel:
         loss = -jnp.sum(one_hot * jax.nn.log_softmax(scaled_logits))
         logit_gradient = (probabilities - one_hot) / cfg.temperature
         gradient = state.weights.T @ logit_gradient
+        gradient_norm = jnp.linalg.norm(gradient)
+        # Inf observation makes softmax NaN and W.T @ (p - one_hot)
+        # non-finite, including 0*inf on a silent feature. The parameter
+        # update already no-ops; this pre-update bridge must not hand a
+        # NaN gradient to the state builder.
+        inputs_valid = (
+            jnp.all(jnp.isfinite(obs))
+            & (action_id >= 0)
+            & (action_id < cfg.n_actions)
+        )
+        source_finite = jnp.all(jnp.isfinite(state.weights)) & jnp.all(
+            jnp.isfinite(state.bias)
+        )
+        proposed_finite = (
+            jnp.all(jnp.isfinite(logits))
+            & jnp.all(jnp.isfinite(probabilities))
+            & jnp.isfinite(loss)
+            & jnp.all(jnp.isfinite(gradient))
+            & jnp.isfinite(gradient_norm)
+        )
+        valid = source_finite & inputs_valid & proposed_finite
+        zero_logits = jnp.zeros_like(logits)
+        zero_gradient = jnp.zeros_like(gradient)
+        zero_loss = jnp.asarray(0.0, dtype=jnp.float32)
         return BehaviorModelInputGradient(
-            logits=logits,
-            probabilities=probabilities,
-            loss=loss,
-            gradient=gradient,
-            gradient_norm=jnp.linalg.norm(gradient),
+            logits=jnp.where(valid, logits, zero_logits),
+            probabilities=jnp.where(valid, probabilities, jnp.zeros_like(probabilities)),
+            loss=jnp.where(valid, loss, zero_loss),
+            gradient=jnp.where(valid, gradient, zero_gradient),
+            gradient_norm=jnp.where(valid, gradient_norm, zero_loss),
+            valid=valid,
         )
 
     @functools.partial(jax.jit, static_argnums=(0,))
