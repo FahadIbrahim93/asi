@@ -12,7 +12,9 @@ from alberta_framework.utils.metrics import (
     compute_per_task_forgetting,
     compute_prequential_performance,
     compute_recovery_lengths,
+    compute_running_mean,
     compute_stability_gap,
+    compute_tracking_error,
     summarize_continual_learning,
 )
 
@@ -195,3 +197,64 @@ def test_task_metrics_reject_infinite_post_exposure_evaluations(value: float) ->
 
     with pytest.raises(ValueError, match="infinite evaluation"):
         compute_per_task_forgetting([[0.8], [value], [0.6]], [0])
+
+
+def test_running_mean_does_not_backdate_a_future_informed_value() -> None:
+    """The leading positions must not be filled with a later window's mean.
+
+    Before this fix, ``compute_running_mean`` padded the first
+    ``window_size - 1`` entries with the mean of the *first complete*
+    trailing window -- a value that depends on observations from steps that
+    had not yet occurred at those earlier positions. #175/#176 documented
+    and worked around exactly this defect at one call site
+    (``plot_learning_curves``) without fixing the underlying function, so
+    every other caller of the public, top-level-exported
+    ``compute_running_mean``/``compute_tracking_error`` still received the
+    corrupted, future-informed trace directly.
+    """
+
+    result = compute_running_mean([0.0, 1.0, 2.0, 3.0, 4.0, 5.0], window_size=3)
+
+    assert result.shape == (6,)
+    assert np.all(np.isnan(result[:2]))
+    np.testing.assert_allclose(result[2:], [1.0, 2.0, 3.0, 4.0])
+
+
+def test_running_mean_exact_window_length_has_one_valid_entry() -> None:
+    result = compute_running_mean([1.0, 2.0, 3.0], window_size=3)
+
+    assert np.all(np.isnan(result[:2]))
+    np.testing.assert_allclose(result[2:], [2.0])
+
+
+def test_running_mean_shorter_than_window_has_no_computable_values() -> None:
+    result = compute_running_mean([2, 4], window_size=3)
+
+    assert result.shape == (2,)
+    assert result.dtype == np.float64
+    assert np.all(np.isnan(result))
+
+
+def test_tracking_error_inherits_the_causal_running_mean_fix() -> None:
+    history = [{"squared_error": float(v)} for v in range(6)]
+
+    result = compute_tracking_error(history, window_size=3)
+
+    assert np.all(np.isnan(result[:2]))
+    np.testing.assert_allclose(result[2:], [1.0, 2.0, 3.0, 4.0])
+
+
+def test_tracking_error_shorter_than_window_has_no_computable_values() -> None:
+    result = compute_tracking_error(
+        [{"squared_error": 2.0}, {"squared_error": 4.0}],
+        window_size=3,
+    )
+
+    assert result.shape == (2,)
+    assert np.all(np.isnan(result))
+
+
+@pytest.mark.parametrize("window_size", [True, False, np.int64(3), 3.0, 0, -1])
+def test_running_mean_rejects_invalid_window_size(window_size: object) -> None:
+    with pytest.raises(ValueError, match="window_size"):
+        compute_running_mean([1.0, 2.0, 3.0], window_size=window_size)  # type: ignore[arg-type]

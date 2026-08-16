@@ -153,13 +153,16 @@ def plot_learning_curves(
             ]
         )
 
-        # ``compute_running_mean`` preserves length by padding the leading
-        # positions with the first complete trailing-window mean. Do not plot
-        # those future-informed padding values at earlier time steps.
-        first_complete_window = (
-            window_size - 1 if metric_array.shape[1] >= window_size else 0
-        )
-        smoothed = smoothed[:, first_complete_window:]
+        # ``compute_running_mean`` marks every position NaN when the trace is
+        # shorter than the requested window. Preserve this plotting API's
+        # established raw short-trace fallback; otherwise drop the leading
+        # NaN prefix before plotting or computing confidence intervals.
+        if metric_array.shape[1] < window_size:
+            smoothed = np.asarray(metric_array, dtype=np.float64)
+            first_complete_window = 0
+        else:
+            first_complete_window = window_size - 1
+            smoothed = smoothed[:, first_complete_window:]
 
         mean, ci_lower, ci_upper = compute_timeseries_statistics(smoothed)
 
