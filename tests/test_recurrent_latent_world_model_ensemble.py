@@ -343,29 +343,41 @@ def test_member_gradient_validity_is_finiteness_only_not_a_raw_norm_ceiling() ->
     assert bool(result.diagnostics.candidate_state_valid)
 
 
-def test_rejection_returns_a_retryable_cache_not_a_permanent_deadlock() -> None:
-    """Regression for issue #366.
-
-    A rejection must not poison every later event.  When the incoming state
-    and decision cache were themselves sound, the returned ``next_start_cache``
-    must re-own the unchanged state so the next legal event is judged on its
-    own merits instead of being auto-rejected by a permanently invalid cache.
-    """
-    model = RecurrentLatentWorldModelEnsemble(_config())
+def test_late_numeric_rejection_returns_a_retryable_authoritative_cache() -> None:
+    """A trusted off-boundary event may recover after a late numerical veto."""
+    model = RecurrentLatentWorldModelEnsemble(
+        _config(
+            gradient_clip_norm=1.0,
+            max_raw_gradient_norm=1.0,
+            max_loss_magnitude=1.0e8,
+        )
+    )
     state = model.init(jr.key(21))
     decision = _decision(model, state)
-    wrong_reset = jnp.asarray((-9.0, -9.0), dtype=jnp.float32)
+    far_bootstrap = jnp.asarray((50.0, -50.0), dtype=jnp.float32)
 
-    rejected = model.update(state, decision, _transition(next_decision_observation=wrong_reset))
+    rejected = model.update(
+        state,
+        decision,
+        _transition(
+            bootstrap_observation=far_bootstrap,
+            next_decision_observation=far_bootstrap,
+        ),
+    )
     assert bool(rejected.diagnostics.rejected)
-    assert not bool(rejected.diagnostics.boundary_semantics_valid)
-    # Sanity: this rejection's own recoverability precondition holds.
     assert bool(rejected.diagnostics.state_valid)
     assert bool(rejected.diagnostics.cache_valid)
+    assert bool(rejected.diagnostics.input_valid)
+    assert bool(rejected.diagnostics.ownership_valid)
+    assert bool(rejected.diagnostics.boundary_semantics_valid)
+    assert bool(rejected.diagnostics.capacity_available)
+    assert bool(rejected.diagnostics.cached_prediction_exact)
+    assert bool(rejected.diagnostics.predictions_valid)
+    assert not bool(rejected.diagnostics.representation_gradient_valid)
     _assert_tree_equal(rejected.state, state)
 
     assert bool(rejected.next_start_cache.valid)
-    np.testing.assert_array_equal(rejected.next_start_cache.observation, wrong_reset)
+    np.testing.assert_array_equal(rejected.next_start_cache.observation, far_bootstrap)
     np.testing.assert_array_equal(
         rejected.next_start_cache.owner_hidden_states, state.member_hidden_states
     )
@@ -378,15 +390,116 @@ def test_rejection_returns_a_retryable_cache_not_a_permanent_deadlock() -> None:
     recovered = model.update(
         state,
         next_decision,
-        _transition(observation=wrong_reset, next_decision_observation=BOOTSTRAP),
+        _transition(
+            observation=far_bootstrap,
+            bootstrap_observation=far_bootstrap,
+            next_decision_observation=far_bootstrap,
+        ),
     )
     assert bool(recovered.diagnostics.applied)
+
+
+def test_stale_decision_cannot_launder_a_new_observation_into_an_owned_cache() -> None:
+    """A locally valid cache flag is not authority to mint the next owner."""
+    model = RecurrentLatentWorldModelEnsemble(_config())
+    state = model.init(jr.key(22))
+    decision = _decision(model, state)
+    stale_decision = cast(Any, decision).replace(
+        owner_event_count=decision.owner_event_count + jnp.int32(1)
+    )
+    untrusted_next = jnp.asarray((7.0, -8.0), dtype=jnp.float32)
+
+    rejected = model.update(
+        state,
+        stale_decision,
+        _transition(
+            bootstrap_observation=untrusted_next,
+            next_decision_observation=untrusted_next,
+        ),
+    )
+    assert bool(rejected.diagnostics.state_valid)
+    assert bool(rejected.diagnostics.cache_valid)
+    assert bool(rejected.diagnostics.input_valid)
+    assert not bool(rejected.diagnostics.ownership_valid)
+    assert not bool(rejected.next_start_cache.valid)
+    assert not bool(model.decide(state, rejected.next_start_cache, ACTION).valid)
+
+
+def test_invalid_transition_or_boundary_cannot_mint_a_recovery_cache() -> None:
+    model = RecurrentLatentWorldModelEnsemble(_config())
+    state = model.init(jr.key(23))
+    decision = _decision(model, state)
+    nonfinite_next = jnp.asarray((jnp.inf, 0.0), dtype=jnp.float32)
+    wrong_reset = jnp.asarray((-9.0, -9.0), dtype=jnp.float32)
+
+    invalid_input = model.update(
+        state,
+        decision,
+        _transition(
+            bootstrap_observation=nonfinite_next,
+            next_decision_observation=nonfinite_next,
+        ),
+    )
+    assert not bool(invalid_input.diagnostics.input_valid)
+    assert not bool(invalid_input.next_start_cache.valid)
+
+    invalid_boundary = model.update(
+        state,
+        decision,
+        _transition(next_decision_observation=wrong_reset),
+    )
+    assert not bool(invalid_boundary.diagnostics.boundary_semantics_valid)
+    assert not bool(invalid_boundary.next_start_cache.valid)
+
+
+def test_tampered_cached_prediction_cannot_mint_a_recovery_cache() -> None:
+    model = RecurrentLatentWorldModelEnsemble(_config())
+    state = model.init(jr.key(24))
+    decision = _decision(model, state)
+    tampered_prediction = cast(Any, decision.prediction).replace(
+        mean_reward=decision.prediction.mean_reward + jnp.float32(1.0)
+    )
+    tampered_decision = cast(Any, decision).replace(prediction=tampered_prediction)
+
+    rejected = model.update(state, tampered_decision, _transition())
+    assert bool(rejected.diagnostics.ownership_valid)
+    assert not bool(rejected.diagnostics.cached_prediction_exact)
+    assert not bool(rejected.next_start_cache.valid)
+
+
+def test_late_boundary_rejection_cannot_skip_the_required_recurrent_reset() -> None:
+    model = RecurrentLatentWorldModelEnsemble(
+        _config(
+            gradient_clip_norm=1.0,
+            max_raw_gradient_norm=1.0,
+            max_loss_magnitude=1.0e8,
+        )
+    )
+    state = model.init(jr.key(25))
+    decision = _decision(model, state)
+    far_bootstrap = jnp.asarray((50.0, -50.0), dtype=jnp.float32)
+    reset_observation = jnp.asarray((-2.0, 3.0), dtype=jnp.float32)
+
+    rejected = model.update(
+        state,
+        decision,
+        _transition(
+            discount=0.0,
+            terminated=True,
+            bootstrap_observation=far_bootstrap,
+            next_decision_observation=reset_observation,
+        ),
+    )
+    assert bool(rejected.diagnostics.boundary_semantics_valid)
+    assert bool(rejected.diagnostics.cached_prediction_exact)
+    assert not bool(rejected.diagnostics.representation_gradient_valid)
+    assert not bool(rejected.next_start_cache.valid)
 
 
 def test_state_invalid_rejection_still_returns_a_non_recoverable_cache() -> None:
     """A corrupt/invalid *state* must not be re-owned as if it were legal."""
     model = RecurrentLatentWorldModelEnsemble(_config())
-    valid_state = model.init(jr.key(22))
+    valid_state = model.init(jr.key(26))
     valid_decision = _decision(model, valid_state)
     corrupt_state = cast(Any, valid_state).replace(
         event_count=jnp.asarray(1, dtype=jnp.int32)

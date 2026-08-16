@@ -1067,6 +1067,7 @@ class RecurrentLatentWorldModelEnsemble:
         state: RecurrentLatentWorldModelEnsembleState,
         diagnostics: RecurrentLatentWorldModelDiagnostics,
         next_decision_observation: Array | None = None,
+        transition_boundary: Array | None = None,
     ) -> RecurrentLatentWorldModelUpdateResult:
         # A rejection never mutates `state`, but the *cache* previously
         # defaulted to the invalid zero cache unconditionally.  Since `decide`
@@ -1074,19 +1075,30 @@ class RecurrentLatentWorldModelEnsemble:
         # every rejection -- regardless of cause -- a permanent deadlock: no
         # later event, however legal, could ever be accepted again.
         #
-        # When the incoming state and decision cache were themselves sound
-        # (`state_valid & cache_valid`), we know `state` is a legitimate
-        # anchor and `next_decision_observation` was at least well-typed (the
-        # shape/dtype contract in `update` runs unconditionally before any
-        # validity gate). Re-owning `state` with that observation makes the
-        # rejection retryable: the very next `decide`/`update` call
-        # independently re-validates the observation and every other input,
-        # so nothing unsound is smuggled through -- it only stops a single
-        # bad or over-strict event from freezing every event after it.
-        if next_decision_observation is None:
+        # Re-owning the unchanged state is safe only after an authoritative,
+        # in-domain, off-boundary transition reached a *late* numerical or
+        # candidate-state rejection.  In particular, `cache_valid` says only
+        # that the caller supplied a cache whose own flags are true; ownership
+        # and exact cached-prediction checks are what bind it to this state,
+        # observation, and action.  Minting a valid cache before those checks
+        # would launder an arbitrary `next_decision_observation` through a
+        # stale or tampered decision.  A rejected boundary also cannot recover
+        # this way because the unchanged state has not committed the required
+        # recurrent reset.
+        if next_decision_observation is None or transition_boundary is None:
             recoverable_cache = self._zero_start_cache()
         else:
-            recoverable = diagnostics.state_valid & diagnostics.cache_valid
+            recoverable = (
+                diagnostics.state_valid
+                & diagnostics.cache_valid
+                & diagnostics.input_valid
+                & diagnostics.ownership_valid
+                & diagnostics.boundary_semantics_valid
+                & diagnostics.capacity_available
+                & diagnostics.cached_prediction_exact
+                & diagnostics.predictions_valid
+                & ~transition_boundary
+            )
             recoverable_cache = cast(
                 RecurrentLatentStartCache,
                 jax.lax.cond(
@@ -1419,7 +1431,10 @@ class RecurrentLatentWorldModelEnsemble:
                     applied,
                     lambda: result,
                     lambda: self._rejected_result(
-                        state, diagnostics, next_decision_observation
+                        state,
+                        diagnostics,
+                        next_decision_observation,
+                        boundary,
                     ),
                 ),
             )
@@ -1430,7 +1445,10 @@ class RecurrentLatentWorldModelEnsemble:
                 can_attempt,
                 accepted_branch,
                 lambda _: self._rejected_result(
-                    state, rejected_diagnostics, next_decision_observation
+                    state,
+                    rejected_diagnostics,
+                    next_decision_observation,
+                    boundary,
                 ),
                 operand=None,
             ),
