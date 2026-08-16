@@ -1410,7 +1410,7 @@ def test_sarsa_agent_from_config_rejects_prediction_demon_dict_subclasses() -> N
         SARSAConfig(n_actions=2), hidden_sizes=(), prediction_demons=[demon]
     ).to_config()
     payload["prediction_demons"][0] = DictSubclass(payload["prediction_demons"][0])
-    with pytest.raises(ValueError, match="prediction_demons entries"):
+    with pytest.raises(ValueError, match="prediction_demons"):
         SARSAAgent.from_config(payload)
 
 
@@ -1446,6 +1446,51 @@ def test_sarsa_agent_loader_requires_exact_json_scalars(field: str, value: objec
     payload[field] = value
     with pytest.raises(ValueError, match="serialized"):
         SARSAAgent.from_config(payload)
+
+
+def test_sarsa_prediction_demons_require_exact_nested_scalar_schema() -> None:
+    class HostileFloat(float):
+        def __float__(self) -> float:
+            raise AssertionError("untrusted __float__ must not run")
+
+        def as_integer_ratio(self) -> tuple[int, int]:
+            raise AssertionError("untrusted ratio hook must not run")
+
+        def __repr__(self) -> str:
+            raise AssertionError("untrusted repr hook must not run")
+
+    hostile_direct = GVFSpec(
+        name="prediction",
+        demon_type=DemonType.PREDICTION,
+        gamma=0.5,
+        lamda=0.5,
+        cumulant_index=0,
+        terminal_reward=HostileFloat(0.0),
+    )
+    with pytest.raises(ValueError, match="terminal_reward"):
+        SARSAAgent(SARSAConfig(n_actions=2), prediction_demons=[hostile_direct])
+
+    valid = GVFSpec(
+        name="prediction",
+        demon_type=DemonType.PREDICTION,
+        gamma=0.5,
+        lamda=0.5,
+        cumulant_index=0,
+    )
+    payload = SARSAAgent(
+        SARSAConfig(n_actions=2), hidden_sizes=(), prediction_demons=[valid]
+    ).to_config()
+    nested = payload["prediction_demons"][0]
+    for replacement, message in (
+        ({**nested, "unknown": 1}, "fields"),
+        ({**nested, "demon_type": True}, "demon_type"),
+        ({**nested, "cumulant_index": True}, "cumulant_index"),
+        ({**nested, "terminal_reward": HostileFloat(0.0)}, "terminal_reward"),
+    ):
+        candidate = dict(payload)
+        candidate["prediction_demons"] = [replacement]
+        with pytest.raises(ValueError, match=message):
+            SARSAAgent.from_config(candidate)
 
 
 def test_sarsa_init_rejects_aggregate_state_overflow_before_jax_allocation() -> None:

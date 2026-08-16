@@ -86,6 +86,14 @@ _SARSA_AGENT_CONFIG_FIELDS = {
     "trace_mode",
     "utility_decay",
 }
+_PREDICTION_DEMON_CONFIG_FIELDS = {
+    "name",
+    "demon_type",
+    "gamma",
+    "lamda",
+    "cumulant_index",
+    "terminal_reward",
+}
 _ACTUAL_INT_TYPES = frozenset(
     {
         int,
@@ -129,6 +137,63 @@ def _validated_config_float_with_ratio(
 
 def _validated_config_float(name: str, value: object, **bounds: Any) -> float:
     return _validated_config_float_with_ratio(name, value, **bounds)[0]
+
+
+def _canonical_prediction_demon(demon: object, *, name: str) -> GVFSpec:
+    """Validate one direct prediction spec without invoking hostile hooks."""
+    if type(demon) is not GVFSpec:
+        raise ValueError(f"{name} must be an actual GVFSpec")
+    spec = demon
+    if type(spec.name) is not str:
+        raise ValueError(f"{name}.name must be an actual string")
+    if type(spec.demon_type) is not DemonType:
+        raise ValueError(f"{name}.demon_type must be an actual DemonType")
+    return GVFSpec(  # type: ignore[call-arg]
+        name=spec.name,
+        demon_type=spec.demon_type,
+        gamma=_validated_config_float(f"{name}.gamma", spec.gamma, lower=0.0, upper=1.0),
+        lamda=_validated_config_float(f"{name}.lamda", spec.lamda, lower=0.0, upper=1.0),
+        cumulant_index=_require_int32(
+            f"{name}.cumulant_index", spec.cumulant_index, minimum=-1
+        ),
+        terminal_reward=_validated_config_float(
+            f"{name}.terminal_reward", spec.terminal_reward
+        ),
+    )
+
+
+def _prediction_demon_from_config(config: object, *, index: int) -> GVFSpec:
+    """Decode one exact serialized prediction-demon schema."""
+    name = f"prediction_demons[{index}]"
+    if type(config) is not dict:
+        raise ValueError(f"serialized {name} must be an actual dict")
+    payload = cast(dict[object, object], config)
+    if (
+        any(type(key) is not str for key in payload)
+        or set(payload) != _PREDICTION_DEMON_CONFIG_FIELDS
+    ):
+        raise ValueError(f"serialized {name} fields do not match the schema")
+    if type(payload["name"]) is not str:
+        raise ValueError(f"serialized {name}.name must be an actual string")
+    demon_type = payload["demon_type"]
+    if type(demon_type) is not str or demon_type not in {member.value for member in DemonType}:
+        raise ValueError(f"serialized {name}.demon_type is unsupported")
+    return GVFSpec(  # type: ignore[call-arg]
+        name=payload["name"],
+        demon_type=DemonType(demon_type),
+        gamma=_validated_config_float(
+            f"serialized {name}.gamma", payload["gamma"], lower=0.0, upper=1.0
+        ),
+        lamda=_validated_config_float(
+            f"serialized {name}.lamda", payload["lamda"], lower=0.0, upper=1.0
+        ),
+        cumulant_index=_require_int32(
+            f"serialized {name}.cumulant_index", payload["cumulant_index"], minimum=-1
+        ),
+        terminal_reward=_validated_config_float(
+            f"serialized {name}.terminal_reward", payload["terminal_reward"]
+        ),
+    )
 
 
 def _preflight_sarsa_direct_state(
@@ -445,11 +510,15 @@ class SARSAAgent:
             raise ValueError("trace_mode must be an actual TraceMode")
         if prediction_demons is not None and type(prediction_demons) is not list:
             raise ValueError("prediction_demons must be an actual list or None")
-        if prediction_demons is not None and any(
-            type(demon) is not GVFSpec for demon in prediction_demons
-        ):
-            raise ValueError("prediction_demons entries must be actual GVFSpec values")
-        n_predictions = len(prediction_demons) if prediction_demons is not None else 0
+        canonical_predictions = (
+            [
+                _canonical_prediction_demon(demon, name=f"prediction_demons[{index}]")
+                for index, demon in enumerate(prediction_demons)
+            ]
+            if prediction_demons is not None
+            else None
+        )
+        n_predictions = len(canonical_predictions) if canonical_predictions is not None else 0
         total_heads = _require_int32(
             "total control and prediction demons",
             sarsa_config.n_actions + n_predictions,
@@ -476,8 +545,8 @@ class SARSAAgent:
             sarsa_config.n_actions, gamma=sarsa_config.gamma, lamda=lamda
         )
         all_demons: list[GVFSpec] = list(control_demons)
-        if prediction_demons is not None:
-            all_demons.extend(prediction_demons)
+        if canonical_predictions is not None:
+            all_demons.extend(canonical_predictions)
         self._n_prediction_demons = n_predictions
 
         horde_spec = create_horde_spec(all_demons)
@@ -584,9 +653,10 @@ class SARSAAgent:
         pred_demons_cfg = config.pop("prediction_demons", None)
         prediction_demons = None
         if pred_demons_cfg is not None:
-            if any(type(demon) is not dict for demon in pred_demons_cfg):
-                raise ValueError("serialized prediction_demons entries must be actual dicts")
-            prediction_demons = [GVFSpec.from_config(d) for d in pred_demons_cfg]
+            prediction_demons = [
+                _prediction_demon_from_config(demon, index=index)
+                for index, demon in enumerate(pred_demons_cfg)
+            ]
 
         trace_mode_str = config.pop("trace_mode", None)
         trace_mode = (
