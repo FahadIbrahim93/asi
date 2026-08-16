@@ -12,6 +12,7 @@ from alberta_framework.core.future_utility import (
     normalize_future_utility_signal,
     one_step_output_loss_reduction_with_diagnostics,
     trace_decay_from_half_life,
+    trace_output_loss_reduction_with_diagnostics,
 )
 
 
@@ -45,6 +46,60 @@ def test_contribution_trace_matches_one_step_at_zero_decay() -> None:
         jnp.array([[2.0, 4.0], [0.0, 0.0]], dtype=jnp.float32),
     )
     chex.assert_trees_all_close(energy_trace, features**2)
+
+
+def test_zero_trace_decay_does_not_multiply_inf_traces() -> None:
+    """trace_decay=0 times an infinite previous trace is NaN and would be held."""
+    errors = jnp.array([2.0], dtype=jnp.float32)
+    features = jnp.array([1.0], dtype=jnp.float32)
+    active_mask = jnp.array([True])
+    inf_trace = jnp.array([[jnp.inf]], dtype=jnp.float32)
+    inf_energy = jnp.array([jnp.inf], dtype=jnp.float32)
+    raw = jnp.asarray(0.0, dtype=jnp.float32) * jnp.asarray(jnp.inf, dtype=jnp.float32)
+    assert not bool(jnp.isfinite(raw))
+
+    contribution = contribution_trace_output_loss_reduction_with_diagnostics(
+        errors=errors,
+        feature_values=features,
+        active_mask=active_mask,
+        step_size_output=0.5,
+        active_count=1.0,
+        contribution_trace=inf_trace,
+        feature_energy_trace=inf_energy,
+        trace_decay=0.0,
+    )
+    assert bool(contribution.update_applied)
+    chex.assert_tree_all_finite(contribution.reductions)
+    chex.assert_tree_all_finite(contribution.contribution_trace)
+    chex.assert_tree_all_finite(contribution.feature_energy_trace)
+
+    factored = trace_output_loss_reduction_with_diagnostics(
+        errors=errors,
+        feature_values=features,
+        active_mask=active_mask,
+        step_size_output=0.5,
+        active_count=1.0,
+        error_trace=jnp.array([jnp.inf], dtype=jnp.float32),
+        feature_trace=jnp.array([jnp.inf], dtype=jnp.float32),
+        feature_energy_trace=inf_energy,
+        trace_decay=0.0,
+    )
+    assert bool(factored.update_applied)
+    chex.assert_tree_all_finite(factored.reductions)
+    chex.assert_tree_all_finite(factored.error_trace)
+    chex.assert_tree_all_finite(factored.feature_trace)
+    chex.assert_tree_all_finite(factored.feature_energy_trace)
+
+    normalized, second_moment = normalize_future_utility_signal(
+        signal=jnp.array([1.0], dtype=jnp.float32),
+        ages=jnp.array([1], dtype=jnp.int32),
+        second_moment=jnp.array([jnp.inf], dtype=jnp.float32),
+        moment_decay=0.0,
+        utility_decay=0.0,
+        mode="none",
+    )
+    chex.assert_tree_all_finite(normalized)
+    chex.assert_tree_all_finite(second_moment)
 
 
 def test_contribution_trace_has_no_future_label_leakage() -> None:
