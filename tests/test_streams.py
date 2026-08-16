@@ -801,3 +801,9 @@ class TestScheduleModuliRejectInvalid:
         """The representable boundary is valid even when allocation would be impractical."""
         stream = CyclicStream(feature_dim=3, num_configurations=_INT32_MAX)
         assert stream.feature_dim == 3
+
+
+def test_scaled_stream_wrapper_rejects_non_vector_feature_scales():
+    """Per-feature scales must stay one-dimensional to preserve observation shape."""
+    with pytest.raises(ValueError, match=r"feature_scales shape \(\(3, 1\)\)"):
+        ScaledStreamWrapper(RandomWalkStream(feature_dim=3), jnp.ones((3, 1)))
