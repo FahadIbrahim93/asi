@@ -27,9 +27,10 @@ import dataclasses
 import hashlib
 import json
 import math
+import operator
 from collections.abc import Mapping
 from numbers import Real
-from typing import Any, cast
+from typing import Any, SupportsIndex, cast
 
 import chex
 import jax
@@ -65,12 +66,33 @@ _FLOAT32_MAX = float(np.finfo(np.float32).max)
 _FLOAT32_TINY = float(np.finfo(np.float32).tiny)
 
 
+_ACTUAL_INT_TYPES = frozenset(
+    {
+        int,
+        np.int8,
+        np.int16,
+        np.int32,
+        np.int64,
+        np.uint8,
+        np.uint16,
+        np.uint32,
+        np.uint64,
+        np.longlong,
+        np.ulonglong,
+    }
+)
+_ACTUAL_FLOAT_TYPES = frozenset((float, np.float16, np.float32, np.float64, np.longdouble))
+
+
 def _strict_positive_int(value: object, *, name: str, maximum: int = _INT32_MAX) -> int:
     """Return a strict positive integer within an explicit bound."""
 
-    if type(value) is not int or not 1 <= value <= maximum:
+    if type(value) not in _ACTUAL_INT_TYPES:
         raise ValueError(f"{name} must be a strict integer in [1, {maximum}]")
-    return value
+    canonical = operator.index(cast(SupportsIndex, value))
+    if not 1 <= canonical <= maximum:
+        raise ValueError(f"{name} must be a strict integer in [1, {maximum}]")
+    return canonical
 
 
 def _strict_float32(
@@ -85,7 +107,7 @@ def _strict_float32(
     """Return a finite normal float32-compatible configuration scalar."""
 
     actual_type = type(value)
-    if issubclass(actual_type, bool) or not issubclass(actual_type, Real):
+    if actual_type not in (_ACTUAL_INT_TYPES | _ACTUAL_FLOAT_TYPES):
         raise ValueError(f"{name} must be a real scalar, not boolean")
     normalized = float(cast(Real, value))
     if not math.isfinite(normalized) or abs(normalized) > _FLOAT32_MAX:
@@ -199,20 +221,44 @@ class PartnerPolicyFusionConfig:
     def __post_init__(self) -> None:
         """Reject dynamic dimensions, ambiguous thresholds, and unsafe bounds."""
 
-        _strict_positive_int(self.max_partners, name="max_partners", maximum=1024)
-        _strict_positive_int(self.context_dim, name="context_dim", maximum=65_536)
-        _strict_positive_int(self.n_actions, name="n_actions", maximum=65_536)
-        _strict_positive_int(
-            self.max_message_horizon,
-            name="max_message_horizon",
-            maximum=_INT32_MAX,
+        object.__setattr__(
+            self,
+            "max_partners",
+            _strict_positive_int(self.max_partners, name="max_partners", maximum=1024),
         )
-        _strict_positive_int(
-            self.min_feedback_for_learned_routing,
-            name="min_feedback_for_learned_routing",
-            maximum=_INT32_MAX,
+        object.__setattr__(
+            self,
+            "context_dim",
+            _strict_positive_int(self.context_dim, name="context_dim", maximum=65_536),
         )
-        _strict_positive_int(self.counter_cap, name="counter_cap", maximum=_INT32_MAX)
+        object.__setattr__(
+            self,
+            "n_actions",
+            _strict_positive_int(self.n_actions, name="n_actions", maximum=65_536),
+        )
+        object.__setattr__(
+            self,
+            "max_message_horizon",
+            _strict_positive_int(
+                self.max_message_horizon,
+                name="max_message_horizon",
+                maximum=_INT32_MAX,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "min_feedback_for_learned_routing",
+            _strict_positive_int(
+                self.min_feedback_for_learned_routing,
+                name="min_feedback_for_learned_routing",
+                maximum=_INT32_MAX,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "counter_cap",
+            _strict_positive_int(self.counter_cap, name="counter_cap", maximum=_INT32_MAX),
+        )
         if self.min_feedback_for_learned_routing > self.counter_cap:
             raise ValueError("min_feedback_for_learned_routing exceeds counter_cap")
 
@@ -224,11 +270,15 @@ class PartnerPolicyFusionConfig:
             "assistance_value_bound",
             "max_abs_declared_score",
         ):
-            _strict_float32(
-                getattr(self, name),
-                name=name,
-                positive=True,
-                allow_zero=False,
+            object.__setattr__(
+                self,
+                name,
+                _strict_float32(
+                    getattr(self, name),
+                    name=name,
+                    positive=True,
+                    allow_zero=False,
+                ),
             )
         for name in (
             "communication_cost_weight",
@@ -236,42 +286,57 @@ class PartnerPolicyFusionConfig:
             "option_blend_weight",
             "partner_blend_weight",
         ):
-            _strict_float32(
-                getattr(self, name),
-                name=name,
-                positive=True,
-                allow_zero=True,
+            object.__setattr__(
+                self,
+                name,
+                _strict_float32(
+                    getattr(self, name),
+                    name=name,
+                    positive=True,
+                    allow_zero=True,
+                ),
             )
-        _strict_float32(
-            self.safety_target_weight,
-            name="safety_target_weight",
-            lower=0.0,
-            upper=1.0,
-        )
-        _strict_float32(
-            self.clarification_confidence_threshold,
-            name="clarification_confidence_threshold",
-            lower=0.0,
-            upper=1.0,
-        )
-        _strict_float32(
-            self.max_query_cost,
-            name="max_query_cost",
-            lower=0.0,
-            upper=float(self.max_communication_cost),
-        )
-        _strict_float32(
-            self.blend_net_value_threshold,
-            name="blend_net_value_threshold",
-        )
-        _strict_float32(
-            self.accept_net_value_threshold,
-            name="accept_net_value_threshold",
-        )
+        for name, lower, upper in (
+            ("safety_target_weight", 0.0, 1.0),
+            ("clarification_confidence_threshold", 0.0, 1.0),
+            ("max_query_cost", 0.0, float(self.max_communication_cost)),
+            ("blend_net_value_threshold", None, None),
+            ("accept_net_value_threshold", None, None),
+        ):
+            object.__setattr__(
+                self,
+                name,
+                _strict_float32(getattr(self, name), name=name, lower=lower, upper=upper),
+            )
         if self.blend_net_value_threshold >= self.accept_net_value_threshold:
             raise ValueError("blend_net_value_threshold must be below accept threshold")
 
         feature_width = self.model_feature_dim
+        partners = self.max_partners
+        persistent_f32 = partners * feature_width + feature_width + 1
+        persistent_i32 = 2 * partners + 9
+        decision_f32 = self.context_dim + 2 + 2 * partners
+        decision_i32 = 6 + 9 * partners
+        decision_bool = self.n_actions + 1 + partners
+        derived_resources = {
+            "model_feature_dim": feature_width,
+            "reliability_weight_scalars": partners * feature_width,
+            "reliability_weight_nbytes": 4 * partners * feature_width,
+            "persistent_state_scalars": persistent_f32 + persistent_i32 + 2,
+            "persistent_state_nbytes": 4 * (persistent_f32 + persistent_i32) + 2,
+            "partner_message_scalars": 12 * partners,
+            "partner_message_nbytes": 45 * partners,
+            "pairwise_comparisons": partners * partners,
+            "context_input_nbytes": 4 * self.context_dim,
+            "action_mask_nbytes": self.n_actions,
+            "decision_input_float32_scalars": decision_f32,
+            "decision_input_int32_scalars": decision_i32,
+            "decision_input_bool_scalars": decision_bool,
+            "decision_input_nbytes": 4 * (decision_f32 + decision_i32) + decision_bool,
+        }
+        for name, value in derived_resources.items():
+            if value > _INT32_MAX:
+                raise ValueError(f"derived {name} must be at most {_INT32_MAX}")
         maximum_update = (
             float(self.learning_rate)
             * math.sqrt(float(feature_width))
@@ -327,7 +392,11 @@ class PartnerPolicyFusionConfig:
     def from_config(cls, config: Mapping[str, object]) -> PartnerPolicyFusionConfig:
         """Strictly reconstruct only an exact :meth:`to_config` record."""
 
-        payload = dict(config)
+        if type(config) is not dict:
+            raise ValueError("partner-fusion config must be an actual dict")
+        if not all(type(key) is str for key in config):
+            raise ValueError("partner-fusion config keys must be strings")
+        payload = config.copy()
         field_names = {field.name for field in dataclasses.fields(cls)}
         expected = field_names | {
             "schema",
@@ -337,11 +406,14 @@ class PartnerPolicyFusionConfig:
         }
         if set(payload) != expected:
             raise ValueError("config fields do not match the partner-fusion v1 schema")
-        if payload.pop("schema") != PARTNER_POLICY_FUSION_CONFIG_SCHEMA:
+        schema = payload.pop("schema")
+        if type(schema) is not str or schema != PARTNER_POLICY_FUSION_CONFIG_SCHEMA:
             raise ValueError("unexpected partner-fusion config schema")
-        if payload.pop("type") != _CONFIG_TYPE:
+        config_type = payload.pop("type")
+        if type(config_type) is not str or config_type != _CONFIG_TYPE:
             raise ValueError("unexpected partner-fusion config type")
-        if payload.pop("mechanism_status") != MECHANISM_STATUS:
+        mechanism_status = payload.pop("mechanism_status")
+        if type(mechanism_status) is not str or mechanism_status != MECHANISM_STATUS:
             raise ValueError("partner fusion must remain a development L0 mechanism")
         if payload.pop("scientific_promotion_allowed") is not False:
             raise ValueError("partner fusion configuration cannot claim promotion")
@@ -648,14 +720,19 @@ class PartnerPolicyFusion:
     def from_config(cls, config: Mapping[str, object]) -> PartnerPolicyFusion:
         """Strictly restore :class:`PartnerPolicyFusion` construction."""
 
-        payload = dict(config)
+        if type(config) is not dict:
+            raise ValueError("fusion construction must be an actual dict")
+        if not all(type(key) is str for key in config):
+            raise ValueError("fusion construction keys must be strings")
+        payload = config.copy()
         if set(payload) != {"type", "config"}:
             raise ValueError("fusion construction fields do not match the v1 schema")
-        if payload.get("type") != _FUSION_TYPE:
+        config_type = payload.get("type")
+        if type(config_type) is not str or config_type != _FUSION_TYPE:
             raise ValueError("unexpected partner-fusion construction type")
         nested = payload.get("config")
-        if not isinstance(nested, Mapping):
-            raise ValueError("fusion construction config must be a mapping")
+        if type(nested) is not dict:
+            raise ValueError("fusion construction config must be an actual dict")
         return cls(PartnerPolicyFusionConfig.from_config(nested))
 
     def init(self) -> PartnerPolicyFusionState:

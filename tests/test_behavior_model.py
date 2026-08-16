@@ -9,7 +9,18 @@ from typing import Any
 import chex
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
+
+
+class _HostileFloat(float):
+    def as_integer_ratio(self) -> tuple[int, int]:
+        raise AssertionError("scalar hook must not run")
+
+
+class _HostileDict(dict[str, Any]):
+    def __iter__(self):
+        raise AssertionError("mapping hook must not run")
 
 try:
     from alberta_framework.core.behavior_model import (
@@ -454,3 +465,102 @@ def test_importance_ratio_and_epsilon_greedy_helpers() -> None:
         jnp.array([0.1, 0.9], dtype=jnp.float32),
     )
     assert float(ratio) == 1.25
+
+
+def test_behavior_model_config_rejects_booleans_and_non_integers() -> None:
+    with pytest.raises(ValueError, match="n_actions"):
+        BehaviorModelConfig(n_actions=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="n_actions"):
+        BehaviorModelConfig(n_actions=2.5)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="step_size"):
+        BehaviorModelConfig(n_actions=2, step_size=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="diagnostic_decay"):
+        BehaviorModelConfig(n_actions=2, diagnostic_decay=1.0 - 1e-10)
+
+
+def test_behavior_model_config_accepts_and_canonicalizes_numpy_integers() -> None:
+    config = BehaviorModelConfig(n_actions=np.int32(3))
+    assert type(config.n_actions) is int
+    assert config.n_actions == 3
+
+    model = BehaviorModel(config)
+    state = model.init(feature_dim=np.int64(4), key=jax.random.key(0))
+    assert state.weights.shape == (3, 4)
+
+    budget = model.resource_budget(np.uint16(4))
+    assert budget.feature_dim == 4
+    assert type(budget.feature_dim) is int
+
+
+@pytest.mark.parametrize(
+    "scalar_type",
+    [
+        np.int8,
+        np.int16,
+        np.int32,
+        np.int64,
+        np.uint8,
+        np.uint16,
+        np.uint32,
+        np.uint64,
+        np.longlong,
+        np.ulonglong,
+    ],
+)
+def test_behavior_model_accepts_full_numpy_integer_family(scalar_type: type) -> None:
+    config = BehaviorModelConfig(n_actions=scalar_type(2))  # type: ignore[call-arg,arg-type]
+    assert type(config.n_actions) is int
+    assert config.n_actions == 2
+
+
+def test_behavior_model_rejects_hostile_scalar_without_running_hooks() -> None:
+    with pytest.raises(ValueError, match="step_size"):
+        BehaviorModelConfig(n_actions=2, step_size=_HostileFloat(0.1))
+
+
+def test_behavior_model_deserialization_requires_exact_complete_dicts() -> None:
+    model = BehaviorModel(BehaviorModelConfig(n_actions=2))
+    construction = model.to_config()
+    with pytest.raises(ValueError, match="actual dict"):
+        BehaviorModel.from_config(_HostileDict(construction))
+
+    wrong_type = model.to_config()
+    wrong_type["type"] = _HostileFloat(0.0)
+    with pytest.raises(ValueError, match="type"):
+        BehaviorModel.from_config(wrong_type)
+    missing = model.to_config()
+    missing.pop("type")
+    with pytest.raises(ValueError, match="fields"):
+        BehaviorModel.from_config(missing)
+    nested_subclass = model.to_config()
+    nested = nested_subclass["config"]
+    assert isinstance(nested, dict)
+    nested_subclass["config"] = _HostileDict(nested)
+    with pytest.raises(ValueError, match="nested config"):
+        BehaviorModel.from_config(nested_subclass)
+
+
+def test_behavior_model_preflights_resource_bytes_before_allocation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = BehaviorModel(BehaviorModelConfig(n_actions=2))
+    max_feature_dim = ((2**31 - 1) - 32) // 8
+    budget = model.resource_budget(max_feature_dim)
+    assert budget.state_nbytes <= 2**31 - 1
+    with pytest.raises(ValueError, match="state_nbytes"):
+        model.resource_budget(max_feature_dim + 1)
+
+    calls = 0
+
+    def forbidden_zeros(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        raise AssertionError("allocator reached")
+
+    monkeypatch.setattr("alberta_framework.core.behavior_model.jnp.zeros", forbidden_zeros)
+    with pytest.raises(ValueError, match="state_nbytes"):
+        model.init(max_feature_dim + 1, jax.random.key(0))
+    assert calls == 0
+    with pytest.raises(AssertionError, match="allocator reached"):
+        model.init(max_feature_dim, jax.random.key(0))
+    assert calls == 1
