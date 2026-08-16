@@ -13,6 +13,7 @@ import jax.numpy as jnp
 import jax.random as jr
 import numpy as np
 import pytest
+from jax.experimental import checkify
 
 from alberta_framework.core.interaction_features import (
     FixedBudgetInteractionLearner,
@@ -249,6 +250,93 @@ def test_weighted_topk_normalizes_only_selected_positive_weight_mass() -> None:
         _utility_after_one_update(sparse, values, all_inactive),
         np.asarray((0.0,), dtype=np.float32),
     )
+
+
+def test_unweighted_active_topk_excludes_inactive_zero_placeholders() -> None:
+    learner = _learner(
+        utility_aggregation="topk",
+        utility_top_k=2,
+        utility_task_balancing="active",
+    )
+    active_mask = jnp.asarray((True, False, False, False, False), dtype=jnp.bool_)
+    activity = jnp.ones((5,), dtype=jnp.float32)
+    signed_signal = jnp.asarray(
+        ((-4.0,), (99.0,), (99.0,), (99.0,), (99.0,)),
+        dtype=jnp.float32,
+    )
+
+    utility = learner._aggregate_task_feature_signal(
+        signed_signal,
+        active_mask,
+        activity,
+    )
+
+    np.testing.assert_array_equal(utility, np.asarray((-4.0,), dtype=np.float32))
+
+
+@pytest.mark.parametrize(
+    "reducer_name",
+    ["_aggregate_task_feature_signal", "_utility_signal"],
+)
+def test_unweighted_active_topk_all_inactive_avoids_zero_division(
+    reducer_name: str,
+) -> None:
+    """An all-inactive mask must not form 0 / 0 inside jnp.where.
+
+    jnp.where evaluates both branches eagerly, so a denominator that can hit
+    zero must be guarded even though the outer where discards the result:
+    JAX_DEBUG_NANS and checkify both observe the invalid intermediate.
+    """
+    learner = _learner(
+        utility_aggregation="topk",
+        utility_top_k=2,
+        utility_task_balancing="active",
+    )
+    active_mask = jnp.zeros((5,), dtype=jnp.bool_)
+    activity = jnp.ones((5,), dtype=jnp.float32)
+    reducer = getattr(learner, reducer_name)
+    if reducer_name == "_aggregate_task_feature_signal":
+        signal = jnp.asarray(((1.0,), (2.0,), (3.0,), (4.0,), (5.0,)), dtype=jnp.float32)
+        args = (signal, active_mask, activity)
+    else:
+        output_weights = jnp.asarray(
+            ((1.0,), (2.0,), (3.0,), (4.0,), (5.0,)), dtype=jnp.float32
+        )
+        features = jnp.asarray((1.0,), dtype=jnp.float32)
+        args = (output_weights, features, active_mask, activity)
+
+    expected = np.zeros((1,), dtype=np.float32)
+
+    eager = reducer(*args)
+    np.testing.assert_array_equal(eager, expected)
+
+    compiled = jax.jit(reducer)(*args)
+    np.testing.assert_array_equal(compiled, expected)
+
+    with jax.debug_nans(True):
+        debug_nans_result = reducer(*args)
+    np.testing.assert_array_equal(debug_nans_result, expected)
+
+    checked_reducer = checkify.checkify(reducer, errors=checkify.float_checks)
+    err, checkified_result = checked_reducer(*args)
+    err.throw()
+    np.testing.assert_array_equal(checkified_result, expected)
+
+
+@pytest.mark.parametrize("invalid", [jnp.nan, jnp.inf, -jnp.inf])
+def test_unweighted_active_topk_does_not_hide_invalid_active_signal(invalid: float) -> None:
+    learner = _learner(
+        utility_aggregation="topk",
+        utility_top_k=2,
+        utility_task_balancing="active",
+    )
+    active_mask = jnp.asarray((True, False, False, False, False), dtype=jnp.bool_)
+    activity = jnp.ones((5,), dtype=jnp.float32)
+    signal = jnp.asarray(((invalid,), (0.0,), (0.0,), (0.0,), (0.0,)), dtype=jnp.float32)
+
+    value = learner._aggregate_task_feature_signal(signal, active_mask, activity)
+
+    assert not bool(jnp.all(jnp.isfinite(value)))
 
 
 def test_weighted_update_is_eager_jit_and_scan_compatible() -> None:
