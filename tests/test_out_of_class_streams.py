@@ -257,6 +257,16 @@ class TestOutOfClassPolynomialStream:
 class TestFrequencyMismatchStream:
     """Tests for the trigonometric out-of-class stream."""
 
+    @pytest.mark.parametrize(
+        ("omega_min", "omega_max"),
+        [(float("nan"), 3.0), (0.5, float("inf")), (float("inf"), float("inf"))],
+    )
+    def test_frequency_bounds_must_be_finite(
+        self, omega_min: float, omega_max: float
+    ) -> None:
+        with pytest.raises(ValueError):
+            FrequencyMismatchStream(omega_min=omega_min, omega_max=omega_max)
+
     def test_step_shapes(self):
         stream = FrequencyMismatchStream(
             feature_dim=4,

@@ -26,6 +26,8 @@ or tanh feature bank:
   compositional DAG that builds features-of-features can.
 """
 
+import math
+
 import chex
 import jax.numpy as jnp
 import jax.random as jr
@@ -340,9 +342,9 @@ class FrequencyMismatchStream:
             raise ValueError("n_contexts must be positive")
         if context_length < 1:
             raise ValueError("context_length must be positive")
-        if omega_min <= 0:
-            raise ValueError("omega_min must be positive")
-        if omega_max <= omega_min:
+        if not math.isfinite(omega_min) or omega_min <= 0:
+            raise ValueError("omega_min must be finite and positive")
+        if not math.isfinite(omega_max) or omega_max <= omega_min:
             raise ValueError("omega_max must exceed omega_min")
 
         self._feature_dim = feature_dim
