@@ -103,6 +103,34 @@ _NUMPY_INTEGER_SCALAR_TYPES = frozenset(
         np.ulonglong,
     )
 )
+_CBP_CONFIG_FIELDS = frozenset(
+    {"decay_rate", "replacement_rate", "maturity_threshold", "enabled"}
+)
+_CBP_MULTI_CONFIG_FIELDS = frozenset(
+    {
+        "type",
+        "state_schema",
+        "cbp_config",
+        "n_heads",
+        "hidden_sizes",
+        "optimizer",
+        "bounder",
+        "normalizer",
+        "head_optimizer",
+        "sparsity",
+        "leaky_relu_slope",
+        "use_layer_norm",
+        "gamma",
+        "lamda",
+        "per_head_gamma_lamda",
+        "trace_mode",
+        "utility_decay",
+    }
+)
+_CBP_SINGLE_CONFIG_FIELDS = _CBP_MULTI_CONFIG_FIELDS - {
+    "n_heads",
+    "per_head_gamma_lamda",
+}
 
 # =============================================================================
 # Config / state
@@ -177,6 +205,10 @@ class ContinualBackpropConfig:
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> ContinualBackpropConfig:
         """Reconstruct from dict."""
+        if type(config) is not dict:
+            raise ValueError("ContinualBackpropConfig payload must be an actual dict")
+        if not all(type(key) is str for key in config) or set(config) != _CBP_CONFIG_FIELDS:
+            raise ValueError("ContinualBackpropConfig fields do not match the schema")
         return cls(**config)
 
 
@@ -771,8 +803,6 @@ class CBPMultiHeadMLPLearner:
             utility_decay: EMA decay for the underlying MLP's native
                 hidden-unit utility diagnostics.
         """
-        self._n_heads = n_heads
-        self._hidden_sizes = hidden_sizes
         self._cbp_config = cbp_config or ContinualBackpropConfig()
         self._sparsity = sparsity
         self._leaky_relu_slope = leaky_relu_slope
@@ -795,6 +825,8 @@ class CBPMultiHeadMLPLearner:
             trace_mode=trace_mode,
             utility_decay=utility_decay,
         )
+        self._n_heads = self._learner.n_heads
+        self._hidden_sizes = self._learner.hidden_sizes
 
     @property
     def learner(self) -> MultiHeadMLPLearner:
@@ -835,13 +867,27 @@ class CBPMultiHeadMLPLearner:
             optimizer_from_config,
         )
 
-        config = dict(config)
-        config.pop("type", None)
-        state_schema = config.pop("state_schema", MULTI_HEAD_MLP_STATE_SCHEMA)
-        if state_schema != MULTI_HEAD_MLP_STATE_SCHEMA:
-            raise ValueError(
-                f"Unsupported MultiHeadMLP state schema: {state_schema!r}"
-            )
+        if type(config) is not dict:
+            raise ValueError("CBPMultiHeadMLPLearner config must be an actual dict")
+        if not all(type(key) is str for key in config) or set(config) != _CBP_MULTI_CONFIG_FIELDS:
+            raise ValueError("CBPMultiHeadMLPLearner config fields do not match the schema")
+        if type(config["type"]) is not str or config["type"] != "CBPMultiHeadMLPLearner":
+            raise ValueError("unexpected CBPMultiHeadMLPLearner config type")
+        if (
+            type(config["state_schema"]) is not str
+            or config["state_schema"] != MULTI_HEAD_MLP_STATE_SCHEMA
+        ):
+            raise ValueError("unsupported MultiHeadMLP state schema")
+        if type(config["hidden_sizes"]) is not list:
+            raise ValueError("hidden_sizes must be a list")
+        if (
+            config["per_head_gamma_lamda"] is not None
+            and type(config["per_head_gamma_lamda"]) is not list
+        ):
+            raise ValueError("per_head_gamma_lamda must be a list")
+        config = config.copy()
+        config.pop("type")
+        config.pop("state_schema")
         cbp_cfg_dict = config.pop("cbp_config")
         cbp_config = ContinualBackpropConfig.from_config(cbp_cfg_dict)
 
@@ -857,20 +903,19 @@ class CBPMultiHeadMLPLearner:
             optimizer_from_config(head_opt_cfg) if head_opt_cfg is not None else None
         )
 
-        per_head_gl = config.pop("per_head_gamma_lamda", None)
+        per_head_gl = config.pop("per_head_gamma_lamda")
         if per_head_gl is not None:
             per_head_gl = tuple(per_head_gl)
 
-        trace_mode_str = config.pop("trace_mode", None)
-        trace_mode = (
-            TraceMode(trace_mode_str)
-            if trace_mode_str is not None
-            else TraceMode.ACCUMULATING
-        )
+        trace_mode_str = config.pop("trace_mode")
+        if type(trace_mode_str) is not str:
+            raise ValueError("trace_mode must be a string")
+        trace_mode = TraceMode(trace_mode_str)
 
+        raw_hidden = config.pop("hidden_sizes")
         return cls(
             n_heads=config.pop("n_heads"),
-            hidden_sizes=tuple(config.pop("hidden_sizes")),
+            hidden_sizes=tuple(raw_hidden),
             cbp_config=cbp_config,
             optimizer=optimizer,
             bounder=bounder,
@@ -1108,9 +1153,16 @@ class CBPMLPLearner:
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> CBPMLPLearner:
         """Reconstruct from a config dict produced by :meth:`to_config`."""
-        config = dict(config)
+        if type(config) is not dict:
+            raise ValueError("CBPMLPLearner config must be an actual dict")
+        if not all(type(key) is str for key in config) or set(config) != _CBP_SINGLE_CONFIG_FIELDS:
+            raise ValueError("CBPMLPLearner config fields do not match the schema")
+        if type(config["type"]) is not str or config["type"] != "CBPMLPLearner":
+            raise ValueError("unexpected CBPMLPLearner config type")
+        config = config.copy()
         config["type"] = "CBPMultiHeadMLPLearner"
         config["n_heads"] = 1
+        config["per_head_gamma_lamda"] = None
         rebuilt = CBPMultiHeadMLPLearner.from_config(config)
         instance = cls.__new__(cls)
         instance._learner = rebuilt

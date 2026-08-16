@@ -29,6 +29,21 @@ from alberta_framework import (
     run_multi_head_learning_loop_batched,
 )
 
+
+class _HostileRepr:
+    def __repr__(self) -> str:
+        raise AssertionError("repr hook must not run")
+
+
+class _HostileTuple(tuple[object, ...]):
+    def __len__(self) -> int:
+        raise AssertionError("tuple subclass hook must not run")
+
+
+class _HostileDict(dict[str, object]):
+    def __iter__(self):
+        raise AssertionError("dict subclass hook must not run")
+
 # =============================================================================
 # Init tests
 # =============================================================================
@@ -43,6 +58,163 @@ class TestMultiHeadInit:
 
         with pytest.raises(ValueError, match="head_optimizer.*MLP"):
             MultiHeadMLPLearner(n_heads=2, head_optimizer=AutostepGTDLambda())
+
+    @pytest.mark.parametrize(
+        "value",
+        [True, np.bool_(True), 1.5, "2", 0, -1, 2**31],
+    )
+    def test_rejects_invalid_head_count_before_allocation(self, value: object):
+        with pytest.raises(ValueError, match="n_heads"):
+            MultiHeadMLPLearner(n_heads=value)  # type: ignore[arg-type]
+
+    def test_rejected_integer_spoof_does_not_run_repr(self):
+        with pytest.raises(ValueError, match="n_heads"):
+            MultiHeadMLPLearner(n_heads=_HostileRepr())  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize(
+        "value",
+        [True, np.bool_(True), 1.5, "2", 0, -1, 2**31],
+    )
+    def test_rejects_invalid_hidden_width_before_allocation(self, value: object):
+        with pytest.raises(ValueError, match=r"hidden_sizes\[0\]"):
+            MultiHeadMLPLearner(n_heads=1, hidden_sizes=(value,))  # type: ignore[arg-type]
+
+    def test_direct_sequence_boundaries_require_actual_tuples(self):
+        with pytest.raises(ValueError, match="hidden_sizes.*tuple"):
+            MultiHeadMLPLearner(n_heads=1, hidden_sizes=[2])  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="per_head_gamma_lamda.*tuple"):
+            MultiHeadMLPLearner(
+                n_heads=1,
+                hidden_sizes=(),
+                per_head_gamma_lamda=[0.5],  # type: ignore[arg-type]
+            )
+        with pytest.raises(ValueError, match="per_head_gamma_lamda.*tuple"):
+            MultiHeadMLPLearner(
+                n_heads=1,
+                hidden_sizes=(),
+                per_head_gamma_lamda=_HostileTuple((0.5,)),  # type: ignore[arg-type]
+            )
+
+    @pytest.mark.parametrize(
+        "scalar_type",
+        [
+            np.int8,
+            np.int16,
+            np.int32,
+            np.int64,
+            np.uint8,
+            np.uint16,
+            np.uint32,
+            np.uint64,
+            np.longlong,
+            np.ulonglong,
+        ],
+    )
+    def test_numpy_integer_family_is_canonicalized(self, scalar_type: type):
+        learner = MultiHeadMLPLearner(
+            n_heads=scalar_type(2),  # type: ignore[call-arg,arg-type]
+            hidden_sizes=(scalar_type(3),),  # type: ignore[call-arg,arg-type]
+        )
+        config = learner.to_config()
+        assert type(learner.n_heads) is int
+        assert type(learner.hidden_sizes[0]) is int
+        assert type(config["n_heads"]) is int
+        assert type(config["hidden_sizes"][0]) is int
+
+    @pytest.mark.parametrize("feature_dim", [True, np.bool_(True), 1.5, "2", 0, -1, 2**31])
+    def test_init_rejects_invalid_feature_dimension_before_allocation(
+        self, feature_dim: object
+    ):
+        learner = MultiHeadMLPLearner(n_heads=1, hidden_sizes=())
+        with pytest.raises(ValueError, match="feature_dim"):
+            learner.init(feature_dim, jr.key(0))  # type: ignore[arg-type]
+
+    def test_from_config_requires_json_lists_and_delegates_element_validation(self):
+        learner = MultiHeadMLPLearner(
+            n_heads=2,
+            hidden_sizes=(),
+            per_head_gamma_lamda=(0.0, 0.5),
+        )
+        hidden_tuple = learner.to_config()
+        hidden_tuple["hidden_sizes"] = ()
+        with pytest.raises(ValueError, match="hidden_sizes.*list"):
+            MultiHeadMLPLearner.from_config(hidden_tuple)
+
+        per_head_tuple = learner.to_config()
+        per_head_tuple["per_head_gamma_lamda"] = (0.0, 0.5)
+        with pytest.raises(ValueError, match="per_head_gamma_lamda.*list"):
+            MultiHeadMLPLearner.from_config(per_head_tuple)
+
+        invalid_element = learner.to_config()
+        invalid_element["per_head_gamma_lamda"] = [0.0, True]
+        with pytest.raises(ValueError, match=r"per_head_gamma_lamda\[1\]"):
+            MultiHeadMLPLearner.from_config(invalid_element)
+
+    def test_from_config_requires_exact_outer_schema_before_dispatch(self):
+        config = MultiHeadMLPLearner(n_heads=1, hidden_sizes=()).to_config()
+        with pytest.raises(ValueError, match="actual dict"):
+            MultiHeadMLPLearner.from_config(_HostileDict(config))  # type: ignore[arg-type]
+
+        for field, value in (
+            ("type", "WrongLearner"),
+            ("type", _HostileRepr()),
+            ("state_schema", "wrong-schema"),
+            ("state_schema", _HostileRepr()),
+        ):
+            invalid = dict(config)
+            invalid[field] = value
+            with pytest.raises(ValueError):
+                MultiHeadMLPLearner.from_config(invalid)
+
+        missing = dict(config)
+        missing.pop("optimizer")
+        with pytest.raises(ValueError, match="fields"):
+            MultiHeadMLPLearner.from_config(missing)
+        unknown = dict(config)
+        unknown["unknown"] = 1
+        with pytest.raises(ValueError, match="fields"):
+            MultiHeadMLPLearner.from_config(unknown)
+
+    def test_constructor_rejects_derived_allocation_counts(self):
+        with pytest.raises(ValueError, match="hidden_layer"):
+            MultiHeadMLPLearner(n_heads=1, hidden_sizes=(46_341, 46_341))
+        with pytest.raises(ValueError, match="head_weight"):
+            MultiHeadMLPLearner(n_heads=46_341, hidden_sizes=(46_341,))
+        with pytest.raises(ValueError, match="per_head_metrics"):
+            MultiHeadMLPLearner(n_heads=(2**31 - 1) // 3 + 1, hidden_sizes=())
+
+        boundary = MultiHeadMLPLearner(
+            n_heads=1,
+            hidden_sizes=(1, 2**31 - 1),
+        )
+        assert boundary.hidden_sizes == (1, 2**31 - 1)
+
+    def test_init_preflights_derived_allocations_before_sparse_init(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        calls = 0
+
+        def forbidden_allocator(*_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            raise AssertionError("allocator reached")
+
+        monkeypatch.setattr(
+            "alberta_framework.core.multi_head_learner.sparse_init",
+            forbidden_allocator,
+        )
+        trunk = MultiHeadMLPLearner(n_heads=1, hidden_sizes=(2,))
+        with pytest.raises(ValueError, match="input_layer"):
+            trunk.init(2**30, jr.key(0))
+        linear = MultiHeadMLPLearner(n_heads=2, hidden_sizes=())
+        with pytest.raises(ValueError, match="linear_head"):
+            linear.init(2**30, jr.key(0))
+        assert calls == 0
+
+        boundary = MultiHeadMLPLearner(n_heads=1, hidden_sizes=(1,))
+        with pytest.raises(AssertionError, match="allocator reached"):
+            boundary.init(2**31 - 1, jr.key(0))
+        assert calls == 1
 
     def test_trunk_shapes_single_hidden(self):
         """Trunk with one hidden layer has correct shapes."""
