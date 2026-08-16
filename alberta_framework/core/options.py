@@ -69,8 +69,10 @@ class SubtaskSpec:
     Args:
         feature_index: Index of the observation feature the option drives toward.
         threshold: Pseudo-reward value at which the option is considered
-            complete.  Must be positive; choose relative to the feature scale.
+            complete.  Must be finite and positive; choose relative to the
+            feature scale.
         pseudo_reward_scale: Multiplicative scale for the pseudo-reward signal.
+            Must be finite and positive.
         max_option_steps: Hard cap on option duration to prevent infinite loops.
     """
 
@@ -83,8 +85,10 @@ class SubtaskSpec:
         """Validate subtask specification."""
         if self.feature_index < 0:
             raise ValueError("feature_index must be non-negative")
-        if self.threshold <= 0.0:
-            raise ValueError("threshold must be positive")
+        if not math.isfinite(self.threshold) or self.threshold <= 0.0:
+            raise ValueError("threshold must be finite and positive")
+        if not math.isfinite(self.pseudo_reward_scale) or self.pseudo_reward_scale <= 0.0:
+            raise ValueError("pseudo_reward_scale must be finite and positive")
         if self.max_option_steps < 1:
             raise ValueError("max_option_steps must be at least 1")
 
