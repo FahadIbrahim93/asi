@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from decimal import Decimal
+from fractions import Fraction
 from typing import Any, Never
 
 import numpy as np
@@ -396,7 +398,11 @@ def test_extract_hyperparameter_results_keeps_injective_extractors() -> None:
         float("inf"),
         float("-inf"),
         complex(float("nan"), 0.0),
+        Decimal("NaN"),
+        Decimal("Infinity"),
+        np.longdouble("nan"),
         ("nested", float("nan")),
+        frozenset(("nested", float("inf"))),
     ],
 )
 def test_extract_hyperparameter_results_rejects_nonfinite_coordinates(
@@ -436,6 +442,104 @@ def test_extract_hyperparameter_results_keeps_canonical_categorical_coordinates(
         ("optimizer", "sgd"): (1.0, 0.0),
         ("optimizer", "adam"): (3.0, 0.0),
     }
+
+
+@pytest.mark.parametrize(
+    "coordinate",
+    [
+        None,
+        True,
+        -7,
+        0.125,
+        1.0 + 2.0j,
+        "adam",
+        b"adam",
+        Decimal("0.125"),
+        Fraction(1, 8),
+        np.bool_(True),
+        np.int64(7),
+        np.float32(0.125),
+        np.complex64(1.0 + 2.0j),
+        np.str_("adam"),
+        np.bytes_("adam"),
+        ("optimizer", np.float32(0.125)),
+        frozenset(("optimizer", np.int16(7))),
+    ],
+)
+def test_extract_hyperparameter_results_keeps_canonical_coordinate_families(
+    coordinate: object,
+) -> None:
+    extracted = extract_hyperparameter_results(
+        {"candidate": _flat_trace("candidate", 1.0)},
+        param_extractor=lambda _: coordinate,
+    )
+
+    assert len(extracted) == 1
+    assert next(iter(extracted)) is coordinate
+
+
+class _NonfiniteFloatThatConvertsFinite(float):
+    def __new__(cls) -> _NonfiniteFloatThatConvertsFinite:
+        return super().__new__(cls, float("inf"))
+
+    def __complex__(self) -> complex:
+        return 0j
+
+
+def test_extract_hyperparameter_results_rejects_spoofed_numeric_subclasses() -> None:
+    coordinate = _NonfiniteFloatThatConvertsFinite()
+    assert coordinate == float("inf")
+
+    with pytest.raises(ValueError, match=r"noncanonical coordinate"):
+        extract_hyperparameter_results(
+            {"candidate": _flat_trace("candidate", 1.0)},
+            param_extractor=lambda _: coordinate,
+        )
+
+
+@pytest.mark.parametrize(
+    "coordinate",
+    [
+        10**1000,
+        Fraction(10**1000, 3),
+        Decimal("1e4000"),
+        np.longdouble("1e4000"),
+    ],
+)
+def test_extract_hyperparameter_results_keeps_wide_finite_numeric_coordinates(
+    coordinate: object,
+) -> None:
+    extracted = extract_hyperparameter_results(
+        {"candidate": _flat_trace("candidate", 1.0)},
+        param_extractor=lambda _: coordinate,
+    )
+
+    assert len(extracted) == 1
+    assert next(iter(extracted)) is coordinate
+
+
+class _DelayedHashDrift:
+    def __init__(self) -> None:
+        self.hash_calls = 0
+
+    def __hash__(self) -> int:
+        self.hash_calls += 1
+        return 7 if self.hash_calls <= 2 else self.hash_calls
+
+    def __eq__(self, other: object) -> bool:
+        return self is other
+
+
+def test_extract_hyperparameter_results_rejects_user_defined_coordinate_keys() -> None:
+    coordinate = _DelayedHashDrift()
+
+    with pytest.raises(ValueError, match=r"noncanonical coordinate"):
+        extract_hyperparameter_results(
+            {"candidate": _flat_trace("candidate", 1.0)},
+            param_extractor=lambda _: coordinate,
+        )
+
+    assert coordinate.hash_calls == 0
 
 
 def test_get_metric_timeseries_rejects_nonfinite_samples() -> None:

@@ -15,8 +15,9 @@ Two conventions matter for downstream analysis:
 """
 
 import math
-from collections.abc import Callable, Iterable, Sequence
-from numbers import Complex, Number
+from collections.abc import Callable, Sequence
+from decimal import Decimal
+from fractions import Fraction
 from typing import Any, NamedTuple, NoReturn, cast
 
 import jax.random as jr
@@ -31,6 +32,32 @@ from alberta_framework.core.learners import (
 from alberta_framework.core.types import LearnerState
 from alberta_framework.streams.base import ScanStream
 from alberta_framework.utils.statistics import common_final_window
+
+_NUMPY_COORDINATE_TYPES = frozenset(
+    np.dtype(dtype_code).type
+    for dtype_code in (
+        "?",
+        "b",
+        "B",
+        "h",
+        "H",
+        "i",
+        "I",
+        "l",
+        "L",
+        "q",
+        "Q",
+        "e",
+        "f",
+        "d",
+        "g",
+        "F",
+        "D",
+        "G",
+        "S",
+        "U",
+    )
+)
 
 
 class ExperimentConfig(NamedTuple):
@@ -417,15 +444,19 @@ def extract_hyperparameter_results(
     Args:
         results: Dictionary of aggregated results
         metric: Metric to evaluate
-        param_extractor: Function to extract param value from config name
+        param_extractor: Function to extract a canonical immutable coordinate
+            from a config name. Accepted scalar coordinates are exact ``None``,
+            ``bool``, ``int``, finite ``float`` or ``complex``, finite ``Decimal``,
+            ``Fraction``, ``str``, ``bytes``, and the corresponding supported exact
+            NumPy scalar types. Exact tuples and frozensets may compose them.
 
     Returns:
         Dictionary mapping param value to (mean, std) tuple
 
     Raises:
-        ValueError: If ``param_extractor`` returns a noncanonical dictionary
-            coordinate or maps more than one configuration to the same value;
-            a sensitivity curve built from a silently truncated,
+        ValueError: If ``param_extractor`` returns a coordinate outside the
+            canonical immutable-key contract or maps more than one configuration
+            to the same value; a sensitivity curve built from a silently truncated,
             insertion-order-dependent subset is not a measurement.
     """
     performance = get_final_performance(results, metric)
@@ -447,45 +478,53 @@ def extract_hyperparameter_results(
 
 
 def _require_hyperparameter_coordinate(value: object, *, name: str) -> Any:
-    """Require one stable dictionary coordinate without narrowing valid key types."""
+    """Require one coordinate whose finiteness and hash semantics are intrinsic.
+
+    Accepted coordinates are exact immutable Python scalar types, ``Decimal``,
+    ``Fraction``, supported exact NumPy scalar types, and exact ``tuple`` or
+    ``frozenset`` compositions of those types. User-defined subclasses and keys
+    are deliberately excluded because calling their conversion, equality, or hash
+    methods cannot establish a durable dictionary-key contract.
+    """
 
     def reject() -> NoReturn:
         raise ValueError(
             "param_extractor returned a noncanonical coordinate for "
-            f"configuration {name!r}; coordinates must be hashable, reflexive, "
-            "and finite when numeric"
+            f"configuration {name!r}; coordinates must use canonical immutable "
+            "scalar types or exact tuple/frozenset compositions, and floating "
+            "or complex coordinates must be finite"
         )
 
     value_type = type(value)
-    if issubclass(value_type, (tuple, frozenset)):
-        try:
-            for component in cast(Iterable[object], value):
-                _require_hyperparameter_coordinate(component, name=name)
-        except Exception:
-            reject()
+    if value_type in (tuple, frozenset):
+        for component in cast(tuple[object, ...] | frozenset[object], value):
+            _require_hyperparameter_coordinate(component, name=name)
+        return value
 
-    if issubclass(value_type, Complex):
-        try:
-            number = complex(cast(Complex, value))
-        except Exception:
+    if value is None or value_type in (bool, int, str, bytes, Fraction):
+        return value
+
+    if value_type is float:
+        if not math.isfinite(cast(float, value)):
             reject()
+        return value
+
+    if value_type is complex:
+        number = cast(complex, value)
         if not math.isfinite(number.real) or not math.isfinite(number.imag):
             reject()
-    elif issubclass(value_type, Number):
-        try:
-            number_real = float(cast(Any, value))
-        except Exception:
-            reject()
-        if not math.isfinite(number_real):
-            reject()
+        return value
 
-    try:
-        first_hash = hash(value)
-        if hash(value) != first_hash:
+    if value_type is Decimal:
+        if not cast(Decimal, value).is_finite():
             reject()
-        reflexive = value == value
-        if type(reflexive) not in (bool, np.bool_) or not bool(reflexive):
+        return value
+
+    if value_type in _NUMPY_COORDINATE_TYPES:
+        if np.dtype(value_type).kind in ("f", "c") and not bool(
+            np.isfinite(cast(Any, value))
+        ):
             reject()
-    except Exception:
-        reject()
-    return value
+        return value
+
+    reject()
