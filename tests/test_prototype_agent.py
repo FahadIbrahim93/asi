@@ -85,10 +85,12 @@ def _oak_cfg(
 def _wm_cfg(
     obs_dim: int = OBS_DIM,
     n_actions: int = N_PRIM,
+    gamma: float = 0.99,
 ) -> ActionConditionedWorldModelConfig:
     return ActionConditionedWorldModelConfig(
         observation_dim=obs_dim,
         n_actions=n_actions,
+        gamma=gamma,
         hidden_sizes=(),  # linear for speed
         step_size=0.1,
         error_decay=0.99,
@@ -220,6 +222,17 @@ class TestPrototypeAgentConfigValidation:
     def test_horde_step_size_positive(self) -> None:
         with pytest.raises(ValueError, match="horde_step_size"):
             PrototypeAgentConfig(oak=_oak_cfg(), horde_step_size=0.0)
+
+    @pytest.mark.parametrize("value", [float("nan"), float("inf")])
+    def test_horde_step_size_finite(self, value: float) -> None:
+        """A NaN/inf step size passed the `<= 0` check and died later blaming the agent state."""
+        with pytest.raises(ValueError, match="horde_step_size must be finite"):
+            PrototypeAgentConfig(oak=_oak_cfg(), horde_step_size=value)
+
+    def test_legacy_world_model_gamma_zero_is_rejected(self) -> None:
+        """gamma == 0 makes the legacy update synthesize discount=0, terminated=False forever."""
+        with pytest.raises(ValueError, match="world_model.gamma must be positive"):
+            PrototypeAgentConfig(oak=_oak_cfg(), world_model=_wm_cfg(gamma=0.0))
 
 
 # ---------------------------------------------------------------------------

@@ -563,6 +563,8 @@ class PrototypeAgentConfig:
                 "dream_next_observation_mode must be "
                 "'model_prediction' or 'sample_one_hot'"
             )
+        if not math.isfinite(self.horde_step_size):
+            raise ValueError("horde_step_size must be finite")
         if self.horde_step_size <= 0.0:
             raise ValueError("horde_step_size must be positive")
         if self.auto_curate_every < 0:
@@ -608,6 +610,12 @@ class PrototypeAgentConfig:
                     "world_model.n_actions must match oak.n_primitive_actions, "
                     f"got {self.world_model.n_actions} and "
                     f"{self.oak.n_primitive_actions}"
+                )
+            if self.world_model.gamma <= 0.0:
+                raise ValueError(
+                    "world_model.gamma must be positive: the legacy update synthesizes "
+                    "transitions with discount=gamma and terminated=False, which the "
+                    "boundary contract rejects when gamma is zero"
                 )
         if self.world_model_ensemble is not None:
             ensemble_model = self.world_model_ensemble.model
