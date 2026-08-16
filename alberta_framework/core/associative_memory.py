@@ -20,6 +20,7 @@ from typing import Any, Literal, cast
 import chex
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import Array
 from jaxtyping import Bool, Float, Int
 
@@ -658,7 +659,6 @@ class AssociativeMemoryLearner:
             next_state.replace(budget_logit=budget_logit),  # type: ignore[attr-defined]
         )
 
-    @functools.partial(jax.jit, static_argnums=(0,))
     def update(
         self,
         state: AssociativeMemoryState,
@@ -666,8 +666,49 @@ class AssociativeMemoryLearner:
         label: Int[Array, ""],
     ) -> AssociativeMemoryUpdateResult:
         """Predict, then update active associative rows."""
+        safe_label, label_valid = self._prepare_label(label)
+        return cast(
+            AssociativeMemoryUpdateResult,
+            self._update(state, context, safe_label, label_valid),
+        )
+
+    def _prepare_label(self, label: object) -> tuple[Array, Array]:
+        """Validate a discrete label before JAX can narrow or reshape it."""
+        actual_type = type(label)
+        if issubclass(actual_type, jax.core.Tracer):
+            array = jnp.asarray(label)
+            valid_type = jnp.issubdtype(array.dtype, jnp.integer) and array.shape == ()
+            return array, jnp.asarray(valid_type, dtype=jnp.bool_)
+
+        allowed = (
+            actual_type is int
+            or issubclass(actual_type, np.integer)
+            or actual_type is np.ndarray
+            or issubclass(actual_type, jax.Array)
+        )
+        if not allowed:
+            return jnp.asarray(0, dtype=jnp.int32), jnp.asarray(False)
+        try:
+            host = np.asarray(label)
+        except (OverflowError, TypeError, ValueError):
+            return jnp.asarray(0, dtype=jnp.int32), jnp.asarray(False)
+        if host.shape != () or host.dtype.kind not in ("i", "u"):
+            return jnp.asarray(0, dtype=jnp.int32), jnp.asarray(False)
+        value = int(host.item())
+        if value < 0 or value >= self._config.vocab_size:
+            return jnp.asarray(0, dtype=jnp.int32), jnp.asarray(False)
+        return jnp.asarray(value, dtype=jnp.int32), jnp.asarray(True)
+
+    @functools.partial(jax.jit, static_argnums=(0,))
+    def _update(
+        self,
+        state: AssociativeMemoryState,
+        context: Int[Array, " block_size"],
+        label: Int[Array, ""],
+        label_valid: Bool[Array, ""],
+    ) -> AssociativeMemoryUpdateResult:
+        """Execute one already-domain-checked associative transaction."""
         prediction = self.predict(state, context)
-        label = jnp.clip(label.astype(jnp.int32), 0, self._config.vocab_size - 1)
         loss = _cross_entropy_from_logits(prediction.logits, label)
         accuracy = (jnp.argmax(prediction.logits) == label).astype(jnp.float32)
         next_state = state.replace(  # type: ignore[attr-defined]
@@ -781,7 +822,8 @@ class AssociativeMemoryLearner:
             dtype=jnp.float32,
         )
         update_applied = (
-            floating_tree_is_finite(state)
+            label_valid
+            & floating_tree_is_finite(state)
             & floating_tree_is_finite(prediction)
             & jnp.isfinite(loss)
             & floating_tree_is_finite(next_state)
