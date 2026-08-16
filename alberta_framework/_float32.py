@@ -79,8 +79,9 @@ def _float32_from_ratio(
 
 def _real_ratio(value: Real) -> tuple[int, int, bool]:
     """Return one normalized exact ratio and its zero-sign metadata."""
-    if isinstance(value, bool):
-        raise TypeError("real value must not be a bool")
+    actual_type = type(value)
+    if issubclass(actual_type, bool) or not issubclass(actual_type, Real):
+        raise TypeError("value must be an actual non-bool real")
     if isinstance(value, Integral):
         ratio: object = (int(value), 1)
     else:

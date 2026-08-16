@@ -1,6 +1,7 @@
 """Exact boundary tests for host-real to IEEE binary32 narrowing."""
 
 from fractions import Fraction
+from numbers import Real
 
 import numpy as np
 import pytest
@@ -59,4 +60,21 @@ def test_preserves_signed_zero(value: float) -> None:
 @pytest.mark.parametrize("value", [True, False, np.bool_(True), np.bool_(False)])
 def test_rejects_bool_aliases(value: object) -> None:
     with pytest.raises(TypeError):
+        round_real_to_float32(value)  # type: ignore[arg-type]
+
+
+def test_rejects_non_real_whose_class_property_spoofs_float() -> None:
+    class ClassSpoof:
+        @property
+        def __class__(self) -> type[float]:
+            return float
+
+        def as_integer_ratio(self) -> tuple[int, int]:
+            return (1, 2)
+
+    value = ClassSpoof()
+    assert isinstance(value, Real)
+    assert not issubclass(type(value), Real)
+
+    with pytest.raises(TypeError, match="actual non-bool real"):
         round_real_to_float32(value)  # type: ignore[arg-type]

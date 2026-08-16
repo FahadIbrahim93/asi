@@ -6,6 +6,7 @@ import json
 import math
 from collections.abc import Callable
 from fractions import Fraction
+from numbers import Real
 from typing import Any, cast
 
 import jax.numpy as jnp
@@ -16,6 +17,7 @@ from alberta_framework.core.options import SubtaskSpec
 from alberta_framework.steps.step3 import Step3HordeConfig, make_step3_horde_spec
 from alberta_framework.steps.step4 import Step4SARSAConfig, make_step4_sarsa_agent
 from alberta_framework.steps.step5 import Step5AverageRewardTDConfig
+from alberta_framework.steps.step6 import Step6DifferentialSARSAConfig
 from alberta_framework.steps.step7 import Step7DynaConfig
 from alberta_framework.steps.step8 import Step8WorldModelConfig, make_step8_world_model
 from alberta_framework.steps.step9 import Step9DreamingConfig, make_step9_components
@@ -77,6 +79,24 @@ def _step5_values(value: object) -> tuple[float, ...]:
         config.step_size,
         config.average_reward_step_size,
         config.trace_decay,
+    )
+
+
+def _step6_values(value: object) -> tuple[float, ...]:
+    scalar = cast(Any, value)
+    config = Step6DifferentialSARSAConfig(
+        q_step_size=scalar,
+        average_reward_step_size=scalar,
+        trace_decay=scalar,
+        epsilon_start=scalar,
+        epsilon_end=scalar,
+    )
+    return (
+        config.q_step_size,
+        config.average_reward_step_size,
+        config.trace_decay,
+        config.epsilon_start,
+        config.epsilon_end,
     )
 
 
@@ -184,6 +204,7 @@ def _step10_values(value: object) -> tuple[float, ...]:
         pytest.param(_step3_values, id="step3"),
         pytest.param(_step4_values, id="step4"),
         pytest.param(_step5_values, id="step5"),
+        pytest.param(_step6_values, id="step6"),
         pytest.param(_step7_values, id="step7"),
         pytest.param(_step8_values, id="step8"),
         pytest.param(_step9_values, id="step9"),
@@ -365,6 +386,10 @@ def test_host_comparisons_cannot_hide_invalid_narrowed_domains() -> None:
             id="step5",
         ),
         pytest.param(
+            lambda value: Step6DifferentialSARSAConfig(epsilon_start=value),
+            id="step6",
+        ),
+        pytest.param(
             lambda value: Step7DynaConfig(planning_utility_step_size=value),
             id="step7",
         ),
@@ -400,6 +425,10 @@ def test_exact_ratio_cannot_hide_outside_closed_unit_domain(
         pytest.param(
             lambda value: Step5AverageRewardTDConfig(step_size=value),
             id="step5",
+        ),
+        pytest.param(
+            lambda value: Step6DifferentialSARSAConfig(q_step_size=value),
+            id="step6",
         ),
         pytest.param(
             lambda value: Step7DynaConfig(planning_priority_propagation=value),
@@ -484,6 +513,62 @@ def test_exact_ratio_is_read_once_during_validation() -> None:
 
     assert StatefulRatioFloat.calls == 1
     assert config.step_size == 0.5
+
+
+@pytest.mark.parametrize(
+    "build_config",
+    [
+        pytest.param(lambda value: Step3HordeConfig(step_size=value), id="step3"),
+        pytest.param(lambda value: Step4SARSAConfig(step_size=value), id="step4"),
+        pytest.param(
+            lambda value: Step5AverageRewardTDConfig(step_size=value),
+            id="step5",
+        ),
+        pytest.param(
+            lambda value: Step6DifferentialSARSAConfig(q_step_size=value),
+            id="step6",
+        ),
+        pytest.param(
+            lambda value: Step7DynaConfig(planning_priority_propagation=value),
+            id="step7",
+        ),
+        pytest.param(lambda value: Step8WorldModelConfig(step_size=value), id="step8"),
+        pytest.param(
+            lambda value: Step9DreamingConfig(dreaming_max_model_error=value),
+            id="step9",
+        ),
+        pytest.param(lambda value: Step10STOMPConfig(base_step_size=value), id="step10"),
+    ],
+)
+def test_class_property_cannot_spoof_actual_real_type(
+    build_config: Callable[[Any], object],
+) -> None:
+    class ClassSpoof:
+        @property
+        def __class__(self) -> type[float]:
+            return float
+
+        def as_integer_ratio(self) -> tuple[int, int]:
+            return (1, 2)
+
+        def __lt__(self, other: object) -> bool:
+            return 0.5 < cast(Any, other)
+
+        def __le__(self, other: object) -> bool:
+            return 0.5 <= cast(Any, other)
+
+        def __gt__(self, other: object) -> bool:
+            return 0.5 > cast(Any, other)
+
+        def __ge__(self, other: object) -> bool:
+            return 0.5 >= cast(Any, other)
+
+    value = ClassSpoof()
+    assert isinstance(value, Real)
+    assert not issubclass(type(value), Real)
+
+    with pytest.raises(ValueError, match="must be a real number"):
+        build_config(value)
 
 
 @pytest.mark.parametrize(
@@ -751,6 +836,14 @@ def test_jax_array_scalars_remain_outside_the_real_facade(value: object) -> None
             ),
             "step_size",
             id="step5",
+        ),
+        pytest.param(
+            lambda: (
+                Step6DifferentialSARSAConfig(q_step_size=0.1),
+                Step6DifferentialSARSAConfig(q_step_size=0.1).to_dict(),
+            ),
+            "q_step_size",
+            id="step6",
         ),
         pytest.param(
             lambda: (
