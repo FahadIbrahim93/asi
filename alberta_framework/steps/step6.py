@@ -18,13 +18,13 @@ References:
 
 from __future__ import annotations
 
-import math
 from dataclasses import asdict, dataclass
 from numbers import Integral, Real
 from typing import Any, cast
 
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 from jax import Array
 
 from alberta_framework.core.average_reward import (
@@ -39,27 +39,38 @@ from alberta_framework.core.average_reward import (
 _INT32_MAX = 2**31 - 1
 
 
-def _require_real(name: str, value: object) -> float:
+def _require_real(name: str, value: object) -> Any:
     if isinstance(value, bool) or not isinstance(value, Real):
         raise ValueError(f"{name} must be a real number, got {value!r}")
-    number = float(value)
-    if not math.isfinite(number):
-        raise ValueError(f"{name} must be finite, got {value!r}")
-    return number
+    return value
+
+
+def _narrow_float32(name: str, value: Any) -> float:
+    """Narrow exactly as the JAX core does, without an intermediate float64."""
+    try:
+        with np.errstate(invalid="ignore", over="ignore"):
+            narrowed = np.asarray(value, dtype=np.float32)
+    except (FloatingPointError, OverflowError, TypeError, ValueError):
+        raise ValueError(f"{name} must narrow to a finite float32, got {value!r}") from None
+    if narrowed.shape != () or not bool(np.isfinite(narrowed)):
+        raise ValueError(f"{name} must narrow to a finite float32, got {value!r}")
+    if type(value) in (int, float) and (bool(narrowed != 0.0) or value == 0):
+        return float(value)
+    return float(narrowed)
 
 
 def _require_unit_interval(name: str, value: object) -> float:
-    number = _require_real(name, value)
-    if not 0.0 <= number <= 1.0:
+    original = _require_real(name, value)
+    if not 0.0 <= original <= 1.0:
         raise ValueError(f"{name} must be in [0, 1], got {value!r}")
-    return number
+    return _narrow_float32(name, original)
 
 
 def _require_nonnegative_real(name: str, value: object) -> float:
-    number = _require_real(name, value)
-    if number < 0.0:
+    original = _require_real(name, value)
+    if original < 0.0:
         raise ValueError(f"{name} must be non-negative, got {value!r}")
-    return number
+    return _narrow_float32(name, original)
 
 
 def _require_int(
@@ -67,7 +78,7 @@ def _require_int(
     value: object,
     *,
     minimum: int | None = None,
-    exclusive_maximum: int | None = None,
+    maximum: int | None = None,
 ) -> int:
     if isinstance(value, bool) or not isinstance(value, Integral):
         raise ValueError(f"{name} must be an integer, got {value!r}")
@@ -78,13 +89,18 @@ def _require_int(
         if minimum == 0:
             raise ValueError(f"{name} must be non-negative, got {value!r}")
         raise ValueError(f"{name} must be >= {minimum}, got {value!r}")
-    if exclusive_maximum is not None and number >= exclusive_maximum:
-        raise ValueError(f"{name} must be smaller than int32 max, got {value!r}")
+    if maximum is not None and number > maximum:
+        raise ValueError(f"{name} must be at most int32 max, got {value!r}")
     return number
 
 
 def _validate_step6_config(config: Step6DifferentialSARSAConfig) -> None:
-    n_actions = _require_int("n_actions", config.n_actions, minimum=1)
+    n_actions = _require_int(
+        "n_actions",
+        config.n_actions,
+        minimum=1,
+        maximum=_INT32_MAX,
+    )
     q_step_size = _require_nonnegative_real("q_step_size", config.q_step_size)
     average_reward_step_size = _require_nonnegative_real(
         "average_reward_step_size",
@@ -97,7 +113,7 @@ def _validate_step6_config(config: Step6DifferentialSARSAConfig) -> None:
         "epsilon_decay_steps",
         config.epsilon_decay_steps,
         minimum=0,
-        exclusive_maximum=_INT32_MAX,
+        maximum=_INT32_MAX,
     )
     object.__setattr__(config, "n_actions", n_actions)
     object.__setattr__(config, "q_step_size", q_step_size)
@@ -249,6 +265,7 @@ def run_step6_smoke(
         & jnp.all(jnp.isfinite(result.average_rewards))
         & jnp.all(result.actions >= 0)
         & jnp.all(result.actions < cfg.n_actions)
+        & jnp.all(result.updates_applied)
     )
     return Step6SmokeResult(
         config=cfg,
