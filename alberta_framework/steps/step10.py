@@ -23,6 +23,11 @@ Architecture:
 The base control is a linear differential Q-function (average-reward
 formulation) over the extended action set, exactly as in Step 6.
 
+The facade rejects illegal dimensions and scientific scalars — epsilons,
+gamma, decays, step sizes, and clipping/threshold values — before
+constructing the core agent. Accepted numbers are canonicalized to builtin
+ints and floats; legal endpoints stay valid.
+
 References:
     Sutton, Bowling, & Pilarski (2022). "The Alberta Plan for AI Research."
     Sutton, Precup, & Singh (1999). "Between MDPs and semi-MDPs: A Framework
@@ -31,7 +36,9 @@ References:
 
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass
+from numbers import Integral, Real
 from typing import Any, cast
 
 import jax.numpy as jnp
@@ -99,6 +106,10 @@ class Step10STOMPConfig:
     option_target_epsilon: float | None = None
     option_importance_clip: float = 10.0
 
+    def __post_init__(self) -> None:
+        """Reject illegal dimensions and scientific scalars, then canonicalize."""
+        _validate_stomp_facade_config(self)
+
     def to_config(self) -> dict[str, Any]:
         """Return a JSON-serializable representation."""
         payload: dict[str, Any] = {
@@ -153,6 +164,167 @@ class Step10STOMPConfig:
             option_target_epsilon=self.option_target_epsilon,
             option_importance_clip=self.option_importance_clip,
         )
+
+
+_INT32_MAX = 2**31 - 1
+
+
+def _require_real(name: str, value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError(f"{name} must be a real number, got {value!r}")
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(f"{name} must be finite, got {value!r}")
+    return number
+
+
+def _require_unit_interval(name: str, value: object) -> float:
+    number = _require_real(name, value)
+    if not 0.0 <= number <= 1.0:
+        raise ValueError(f"{name} must be in [0, 1], got {value!r}")
+    return number
+
+
+def _require_nonnegative_real(name: str, value: object) -> float:
+    number = _require_real(name, value)
+    if number < 0.0:
+        raise ValueError(f"{name} must be non-negative, got {value!r}")
+    return number
+
+
+def _require_positive_real(name: str, value: object) -> float:
+    number = _require_real(name, value)
+    if number <= 0.0:
+        raise ValueError(f"{name} must be positive, got {value!r}")
+    return number
+
+
+def _require_int(
+    name: str,
+    value: object,
+    *,
+    minimum: int | None = None,
+    exclusive_maximum: int | None = None,
+) -> int:
+    if isinstance(value, bool) or not isinstance(value, Integral):
+        raise ValueError(f"{name} must be an integer, got {value!r}")
+    number = int(value)
+    if minimum is not None and number < minimum:
+        if minimum == 1:
+            raise ValueError(f"{name} must be positive, got {value!r}")
+        if minimum == 0:
+            raise ValueError(f"{name} must be non-negative, got {value!r}")
+        raise ValueError(f"{name} must be >= {minimum}, got {value!r}")
+    if exclusive_maximum is not None and number >= exclusive_maximum:
+        raise ValueError(f"{name} must be smaller than int32 max, got {value!r}")
+    return number
+
+
+def _validate_stomp_facade_config(config: Step10STOMPConfig) -> None:
+    observation_dim = _require_int("observation_dim", config.observation_dim, minimum=1)
+    n_primitive_actions = _require_int(
+        "n_primitive_actions",
+        config.n_primitive_actions,
+        minimum=1,
+    )
+    option_planning_backups_per_step = _require_int(
+        "option_planning_backups_per_step",
+        config.option_planning_backups_per_step,
+        minimum=0,
+        exclusive_maximum=_INT32_MAX,
+    )
+    if not isinstance(config.subtask_specs, tuple):
+        raise ValueError(
+            f"subtask_specs must be a tuple of SubtaskSpec, got {config.subtask_specs!r}"
+        )
+    canonical_specs: list[SubtaskSpec] = []
+    for spec in config.subtask_specs:
+        if not isinstance(spec, SubtaskSpec):
+            raise ValueError(f"subtask_specs must contain SubtaskSpec values, got {spec!r}")
+        feature_index = _require_int("feature_index", spec.feature_index, minimum=0)
+        if feature_index >= observation_dim:
+            raise ValueError(
+                f"feature_index must be < observation_dim, got {spec.feature_index!r}"
+            )
+        threshold = _require_positive_real("threshold", spec.threshold)
+        pseudo_reward_scale = _require_real(
+            "pseudo_reward_scale",
+            spec.pseudo_reward_scale,
+        )
+        max_option_steps = _require_int(
+            "max_option_steps",
+            spec.max_option_steps,
+            minimum=1,
+        )
+        if max_option_steps > _INT32_MAX:
+            raise ValueError("max_option_steps must fit int32 telemetry")
+        canonical_specs.append(
+            SubtaskSpec(
+                feature_index=feature_index,
+                threshold=threshold,
+                pseudo_reward_scale=pseudo_reward_scale,
+                max_option_steps=max_option_steps,
+            )
+        )
+    base_step_size = _require_nonnegative_real("base_step_size", config.base_step_size)
+    base_avg_reward_step_size = _require_nonnegative_real(
+        "base_avg_reward_step_size",
+        config.base_avg_reward_step_size,
+    )
+    base_trace_decay = _require_unit_interval("base_trace_decay", config.base_trace_decay)
+    option_step_size = _require_nonnegative_real(
+        "option_step_size",
+        config.option_step_size,
+    )
+    option_avg_reward_step_size = _require_nonnegative_real(
+        "option_avg_reward_step_size",
+        config.option_avg_reward_step_size,
+    )
+    option_trace_decay = _require_unit_interval(
+        "option_trace_decay",
+        config.option_trace_decay,
+    )
+    option_gamma = _require_unit_interval("option_gamma", config.option_gamma)
+    option_model_decay = _require_unit_interval(
+        "option_model_decay",
+        config.option_model_decay,
+    )
+    option_model_step_size = _require_nonnegative_real(
+        "option_model_step_size",
+        config.option_model_step_size,
+    )
+    epsilon_base = _require_unit_interval("epsilon_base", config.epsilon_base)
+    epsilon_option = _require_unit_interval("epsilon_option", config.epsilon_option)
+    option_target_epsilon = (
+        None
+        if config.option_target_epsilon is None
+        else _require_unit_interval("option_target_epsilon", config.option_target_epsilon)
+    )
+    option_importance_clip = _require_positive_real(
+        "option_importance_clip",
+        config.option_importance_clip,
+    )
+    object.__setattr__(config, "subtask_specs", tuple(canonical_specs))
+    object.__setattr__(config, "observation_dim", observation_dim)
+    object.__setattr__(config, "n_primitive_actions", n_primitive_actions)
+    object.__setattr__(config, "base_step_size", base_step_size)
+    object.__setattr__(config, "base_avg_reward_step_size", base_avg_reward_step_size)
+    object.__setattr__(config, "base_trace_decay", base_trace_decay)
+    object.__setattr__(config, "option_step_size", option_step_size)
+    object.__setattr__(config, "option_avg_reward_step_size", option_avg_reward_step_size)
+    object.__setattr__(config, "option_trace_decay", option_trace_decay)
+    object.__setattr__(config, "option_gamma", option_gamma)
+    object.__setattr__(config, "option_model_decay", option_model_decay)
+    object.__setattr__(config, "option_model_step_size", option_model_step_size)
+    object.__setattr__(
+        config,
+        "option_planning_backups_per_step",
+        option_planning_backups_per_step,
+    )
+    object.__setattr__(config, "epsilon_base", epsilon_base)
+    object.__setattr__(config, "epsilon_option", epsilon_option)
+    object.__setattr__(config, "option_target_epsilon", option_target_epsilon)
+    object.__setattr__(config, "option_importance_clip", option_importance_clip)
 
 
 @dataclass(frozen=True)
