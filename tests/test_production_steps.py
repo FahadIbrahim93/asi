@@ -122,6 +122,7 @@ _INVALID_STEP1_FIELDS: tuple[tuple[str, Any], ...] = (
     ("feature_dim", float("nan")),
     ("feature_dim", float("inf")),
     ("feature_dim", None),
+    ("feature_dim", 2**31),
     ("num_relevant", 0),
     ("num_relevant", -1),
     ("num_relevant", True),
@@ -131,6 +132,7 @@ _INVALID_STEP1_FIELDS: tuple[tuple[str, Any], ...] = (
     ("num_relevant", float("nan")),
     ("num_relevant", float("inf")),
     ("num_relevant", None),
+    ("num_relevant", 2**31),
     ("optimizer", "unknown_opt"),
     ("optimizer", 123),
     ("optimizer", None),
@@ -148,26 +150,31 @@ _INVALID_STEP1_FIELDS: tuple[tuple[str, Any], ...] = (
     ("step_size", -1.0),
     ("step_size", "0.01"),
     ("step_size", None),
+    ("step_size", 1e100),
     ("meta_step_size", float("nan")),
     ("meta_step_size", float("inf")),
     ("meta_step_size", True),
     ("meta_step_size", False),
     ("meta_step_size", -0.01),
+    ("meta_step_size", 1e100),
     ("drift_rate_w", float("nan")),
     ("drift_rate_w", float("inf")),
     ("drift_rate_w", True),
     ("drift_rate_w", False),
     ("drift_rate_w", -0.001),
+    ("drift_rate_w", 1e100),
     ("drift_rate_b", float("nan")),
     ("drift_rate_b", float("inf")),
     ("drift_rate_b", True),
     ("drift_rate_b", False),
     ("drift_rate_b", -0.001),
+    ("drift_rate_b", 1e100),
     ("noise_std", float("nan")),
     ("noise_std", float("inf")),
     ("noise_std", True),
     ("noise_std", False),
     ("noise_std", -1.0),
+    ("noise_std", 1e100),
     ("feature_std", float("nan")),
     ("feature_std", float("inf")),
     ("feature_std", True),
@@ -176,6 +183,7 @@ _INVALID_STEP1_FIELDS: tuple[tuple[str, Any], ...] = (
     ("feature_std", -1.0),
     ("feature_std", "1.0"),
     ("feature_std", None),
+    ("feature_std", 1e100),
     ("ema_decay", float("nan")),
     ("ema_decay", float("inf")),
     ("ema_decay", True),
@@ -183,6 +191,7 @@ _INVALID_STEP1_FIELDS: tuple[tuple[str, Any], ...] = (
     ("ema_decay", -0.1),
     ("ema_decay", 1.1),
     ("ema_decay", "0.99"),
+    ("ema_decay", 1e100),
     ("streaming_batch_momentum", float("nan")),
     ("streaming_batch_momentum", float("inf")),
     ("streaming_batch_momentum", True),
@@ -190,6 +199,7 @@ _INVALID_STEP1_FIELDS: tuple[tuple[str, Any], ...] = (
     ("streaming_batch_momentum", -0.1),
     ("streaming_batch_momentum", 1.1),
     ("streaming_batch_momentum", "0.99"),
+    ("streaming_batch_momentum", 1e100),
 )
 
 
@@ -373,6 +383,111 @@ def test_step1_fraction_float32_overflow_midpoint_is_exact() -> None:
     assert just_below.step_size == float(np.finfo(np.float32).max)
     with pytest.raises(ValueError, match="step_size"):
         Step1KernelConfig(optimizer="lms", step_size=overflow_midpoint)
+
+
+def test_step1_config_preserves_float32_boundaries() -> None:
+    f32_max = float(np.finfo(np.float32).max)
+    config = Step1KernelConfig(
+        feature_dim=2**31 - 1,
+        num_relevant=2**31 - 1,
+        optimizer="lms",
+        normalizer="ema",
+        stream="alberta",
+        step_size=f32_max,
+        meta_step_size=f32_max,
+        drift_rate_w=f32_max,
+        drift_rate_b=f32_max,
+        noise_std=f32_max,
+        feature_std=f32_max,
+        ema_decay=1.0,
+        streaming_batch_momentum=1.0,
+    )
+    assert config.feature_dim == 2**31 - 1
+    assert config.num_relevant == 2**31 - 1
+    assert config.step_size == f32_max
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"steps": 0}, "steps"),
+        ({"steps": -1}, "steps"),
+        ({"steps": 2**31}, "steps"),
+        ({"steps": True}, "steps"),
+        ({"steps": "64"}, "steps"),
+        ({"seed": -1}, "seed"),
+        ({"seed": 2**31}, "seed"),
+        ({"seed": True}, "seed"),
+        ({"final_window": 0}, "final_window"),
+        ({"final_window": -1}, "final_window"),
+        ({"final_window": 300}, "final_window"),
+        ({"final_window": True}, "final_window"),
+    ],
+)
+def test_step1_smoke_rejects_invalid_inputs(kwargs: dict[str, Any], match: str) -> None:
+    with pytest.raises(ValueError, match=match):
+        run_step1_smoke(**kwargs)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "ema_decay",
+        "streaming_batch_momentum",
+    ],
+)
+@pytest.mark.parametrize(
+    "ratio",
+    [
+        pytest.param((-1, 1), id="negative-ratio"),
+        pytest.param((2, 1), id="above-unit-ratio"),
+        pytest.param((-1, 2**200), id="negative-rounds-to-negative-zero"),
+        pytest.param((2**200 + 1, 2**200), id="above-one-rounds-to-one"),
+    ],
+)
+def test_step1_unit_interval_rejects_adversarial_ratio_floats(
+    field: str, ratio: tuple[int, int]
+) -> None:
+    class HiddenBoundaryFloat(float):
+        def as_integer_ratio(self) -> tuple[int, int]:
+            return ratio
+
+    with pytest.raises(ValueError, match=rf"{field} must be in \[0, 1\]"):
+        Step1KernelConfig(**{field: HiddenBoundaryFloat(0.5)})
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "step_size",
+        "meta_step_size",
+        "drift_rate_w",
+        "drift_rate_b",
+        "noise_std",
+    ],
+)
+def test_step1_nonnegative_rejects_adversarial_negative_ratio(field: str) -> None:
+    class HiddenNegativeFloat(float):
+        def as_integer_ratio(self) -> tuple[int, int]:
+            return (-1, 1)
+
+    with pytest.raises(ValueError, match=rf"{field} must be non-negative"):
+        Step1KernelConfig(**{field: HiddenNegativeFloat(0.5)})
+
+
+def test_step1_rejects_class_property_spoofing_float() -> None:
+    class ClassSpoof:
+        @property
+        def __class__(self) -> type[float]:
+            return float
+
+        def as_integer_ratio(self) -> tuple[int, int]:
+            return (1, 2)
+
+    value = ClassSpoof()
+    with pytest.raises(ValueError, match="must be a real number"):
+        Step1KernelConfig(step_size=value)  # type: ignore[arg-type]
+
 
 
 def test_step2_kernel_factory_and_smoke_are_finite() -> None:
