@@ -687,8 +687,11 @@ class AssociativeMemoryLearner:
             existing_slot = indices[0]
             replacement_slot, used_empty = self._replacement_slot(carry)
             slot = jnp.where(found_scalar, existing_slot, replacement_slot)
-            old_row = carry.values[slot]
-            old_utility = carry.utility[slot]
+            # A slot allocated or reused for a new key starts empty: the values,
+            # utility, and count of an evicted occupant must not be inherited.
+            slot_values = carry.values[slot]
+            old_row = jnp.where(found_scalar, slot_values, jnp.zeros_like(slot_values))
+            old_utility = jnp.where(found_scalar, carry.utility[slot], 0.0)
             row_logits = self._config.logit_scale * old_row
             feature_loss = jnp.where(
                 found_scalar,
@@ -732,7 +735,9 @@ class AssociativeMemoryLearner:
                 ),
                 counts=jnp.where(
                     active_bool,
-                    carry.counts.at[slot].add(1.0),
+                    carry.counts.at[slot].set(
+                        jnp.where(found_scalar, carry.counts[slot] + 1.0, 1.0)
+                    ),
                     carry.counts,
                 ),
                 last_update=jnp.where(
