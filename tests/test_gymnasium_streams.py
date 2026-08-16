@@ -7,6 +7,7 @@ import pytest
 # Skip all tests if gymnasium is not installed
 gymnasium = pytest.importorskip("gymnasium")
 
+import alberta_framework.streams.gymnasium as gymnasium_stream_module  # noqa: E402
 from alberta_framework import TimeStep  # noqa: E402
 from alberta_framework.streams.gymnasium import (  # noqa: E402
     GymnasiumStream,
@@ -178,6 +179,50 @@ def test_random_box_policy_rejects_nonfinite_bounds() -> None:
 
     with pytest.raises(ValueError, match="finite ordered"):
         make_random_policy(StubEnv(), seed=0)  # type: ignore[arg-type]
+
+
+def test_random_box_policy_rejects_float32_span_overflow() -> None:
+    maximum = np.finfo(np.float32).max
+
+    class StubEnv:
+        action_space = gymnasium.spaces.Box(
+            -maximum, maximum, shape=(1,), dtype=np.float32
+        )
+
+    with pytest.raises(ValueError, match="finite float32 span"):
+        make_random_policy(StubEnv(), seed=0)  # type: ignore[arg-type]
+
+
+def test_random_box_preflights_dimension_before_jax_bound_conversion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class StubEnv:
+        action_space = gymnasium.spaces.Box(-1.0, 1.0, shape=(1,), dtype=np.float32)
+
+    monkeypatch.setattr(
+        gymnasium_stream_module,
+        "_flatten_space",
+        lambda _space: (_ for _ in ()).throw(ValueError("dimension preflight")),
+    )
+    monkeypatch.setattr(
+        gymnasium_stream_module.jnp,
+        "asarray",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("JAX conversion ran before dimension preflight")
+        ),
+    )
+    with pytest.raises(ValueError, match="dimension preflight"):
+        make_random_policy(StubEnv(), seed=0)  # type: ignore[arg-type]
+
+
+def test_epsilon_wrapper_rejects_base_policy_before_environment_access() -> None:
+    class HostileEnv:
+        @property
+        def action_space(self) -> object:
+            raise AssertionError("environment accessed before base-policy validation")
+
+    with pytest.raises(ValueError, match="base_policy"):
+        make_epsilon_greedy_policy(object(), HostileEnv())  # type: ignore[arg-type]
 
 
 def test_runtime_values_must_match_declared_flattened_shapes_and_be_finite() -> None:

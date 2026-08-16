@@ -212,15 +212,28 @@ def make_random_policy(env: gymnasium.Env[Any, Any], seed: int = 0) -> Callable[
     action_space = env.action_space
 
     if isinstance(action_space, gymnasium.spaces.Discrete):
+        _require_float32_allocation("random Discrete action", _flatten_space(action_space))
         discrete_low = int(action_space.start)
         discrete_high = discrete_low + int(action_space.n)
         if not _INT32_MIN <= discrete_low < discrete_high <= _INT32_MAX:
             raise ValueError("Discrete action bounds must fit JAX signed int32")
     elif isinstance(action_space, gymnasium.spaces.Box):
+        action_dim = _flatten_space(action_space)
+        _require_float32_allocation("random Box bounds and action", 3 * action_dim)
         low = jnp.asarray(action_space.low, dtype=jnp.float32)
         high = jnp.asarray(action_space.high, dtype=jnp.float32)
-        if not bool(jnp.all(jnp.isfinite(low) & jnp.isfinite(high) & (low <= high))):
-            raise ValueError("Box random actions require finite ordered float32 bounds")
+        span = high - low
+        if not bool(
+            jnp.all(
+                jnp.isfinite(low)
+                & jnp.isfinite(high)
+                & (low <= high)
+                & jnp.isfinite(span)
+            )
+        ):
+            raise ValueError(
+                "Box random actions require finite ordered bounds with a finite float32 span"
+            )
     elif isinstance(action_space, gymnasium.spaces.MultiDiscrete):
         dimension = _flatten_space(action_space)
         _require_float32_allocation("MultiDiscrete action bounds", 2 * dimension)
@@ -271,6 +284,8 @@ def make_epsilon_greedy_policy(
     Returns:
         Epsilon-greedy policy
     """
+    if not callable(base_policy):
+        raise ValueError("base_policy must be callable")
     epsilon = validated_float32_scalar("epsilon", epsilon, lower=0.0, upper=1.0)
     seed = require_jax_seed(seed)
     if seed == JAX_KEY_SEED_MAX:
