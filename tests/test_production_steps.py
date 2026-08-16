@@ -31,6 +31,7 @@ from alberta_framework.steps import (
     make_step2_temporal_context,
     make_step2_temporal_learner,
     run_step1_smoke,
+    run_step2_associative_smoke,
     run_step2_smoke,
 )
 
@@ -979,8 +980,9 @@ def test_step2_config_from_dict_requires_exact_keys(config: Any) -> None:
         ({"steps": True}, "steps"),
         ({"steps": "64"}, "steps"),
         ({"seed": -1}, "seed"),
-        ({"seed": 2**31}, "seed"),
+        ({"seed": 2**32}, "seed"),
         ({"seed": True}, "seed"),
+        ({"seed": "7"}, "seed"),
         ({"final_window": 0}, "final_window"),
         ({"final_window": -1}, "final_window"),
         ({"final_window": 300}, "final_window"),
@@ -990,6 +992,29 @@ def test_step2_config_from_dict_requires_exact_keys(config: Any) -> None:
 def test_step2_smoke_rejects_invalid_inputs(kwargs: dict[str, Any], match: str) -> None:
     with pytest.raises(ValueError, match=match):
         run_step2_smoke(**kwargs)
+
+
+@pytest.mark.parametrize("seed", [2**31, 2**32 - 1])
+def test_step2_smoke_accepts_full_uint32_seed_domain(seed: int) -> None:
+    result = run_step2_smoke(steps=4, seed=seed, final_window=2)
+    assert result.seed == seed
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"seed": -1}, "seed"),
+        ({"seed": 2**32}, "seed"),
+        ({"seed": True}, "seed"),
+        ({"steps": 1}, "steps"),
+        ({"window": 0}, "window"),
+    ],
+)
+def test_step2_associative_smoke_rejects_invalid_inputs(
+    kwargs: dict[str, Any], match: str
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        run_step2_associative_smoke(**kwargs)
 
 
 @pytest.mark.parametrize(

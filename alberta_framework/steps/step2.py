@@ -27,6 +27,7 @@ import jax.random as jr
 from jax import Array
 
 from alberta_framework._float32 import round_real_to_float32_with_ratio
+from alberta_framework._seed_validation import require_jax_seed
 from alberta_framework.core.associative_memory import (
     AssociativeFeatureFamily,
     AssociativeMemoryConfig,
@@ -844,7 +845,7 @@ def run_step2_smoke(
     canonical MLP comparison.
     """
     steps = _require_int("steps", steps, minimum=1, maximum=_INT32_MAX)
-    seed = _require_int("seed", seed, minimum=0, maximum=_INT32_MAX)
+    seed = require_jax_seed(seed, name="seed")
     final_window = _require_int("final_window", final_window, minimum=1, maximum=steps)
     cfg = config or Step2KernelConfig()
     learner = make_step2_learner(cfg)
@@ -883,7 +884,7 @@ def run_step2_associative_smoke(
     """
     cfg = config or Step2AssociativeConfig()
     steps = _require_int("steps", steps, minimum=2, maximum=_INT32_MAX)
-    seed = _require_int("seed", seed, minimum=0, maximum=_INT32_MAX)
+    seed = require_jax_seed(seed, name="seed")
     window = _require_int("window", window, minimum=1, maximum=steps // 2)
     pattern_count = min(8, max(2, steps // 8))
     key = jr.key(seed)
