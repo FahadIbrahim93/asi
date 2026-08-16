@@ -327,7 +327,10 @@ class UPGDLearner:
             when no gradient-alignment meta-rule is active. Disable for lean
             non-meta UPGD benchmarks to reduce carry traffic.
         adaptive_kappa_mode: Optional online control law for ObGD ``kappa``.
-            ``"none"`` uses the configured bounder unchanged. ``"loss_ratio"``
+            ``"none"`` uses the configured bounder unchanged; every other mode
+            bounds with plain ObGD at ``adaptive_kappa_base`` (scaled by the
+            law), so a configured ``bounder`` must be ``None`` or an
+            :class:`ObGDBounding` with that same kappa. ``"loss_ratio"``
             computes an effective kappa from the learner's fast/slow loss EMAs,
             lowering kappa when fast loss exceeds slow loss and raising it when
             the stream appears stable. ``"gradient_alignment"`` learns a
@@ -755,6 +758,24 @@ class UPGDLearner:
         if adaptive_kappa_base <= 0.0:
             msg = f"adaptive_kappa_base must be positive, got {adaptive_kappa_base}"
             raise ValueError(msg)
+        if adaptive_kappa_mode != "none" and bounder is not None:
+            configured = bounder.to_config()
+            if type(bounder) is not ObGDBounding:
+                msg = (
+                    "adaptive_kappa_mode bounds every update with plain ObGD at "
+                    "adaptive_kappa_base and would silently discard the configured "
+                    f"{configured.get('type', type(bounder).__name__)} bounder; pass "
+                    "bounder=None or an ObGDBounding whose kappa equals adaptive_kappa_base"
+                )
+                raise ValueError(msg)
+            if float(configured["kappa"]) != float(adaptive_kappa_base):
+                msg = (
+                    "adaptive_kappa_mode bounds every update at adaptive_kappa_base="
+                    f"{adaptive_kappa_base}, which disagrees with the configured "
+                    f"ObGDBounding kappa={configured['kappa']}; make them equal or use "
+                    "adaptive_kappa_mode='none'"
+                )
+                raise ValueError(msg)
         if adaptive_kappa_min <= 0.0:
             msg = f"adaptive_kappa_min must be positive, got {adaptive_kappa_min}"
             raise ValueError(msg)

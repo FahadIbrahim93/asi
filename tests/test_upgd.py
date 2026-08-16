@@ -23,8 +23,9 @@ so noise effects are unmistakable) and ``sparsity=0.5`` round-trips.
 import chex
 import jax.numpy as jnp
 import jax.random as jr
+import pytest
 
-from alberta_framework.core.optimizers import ObGDBounding
+from alberta_framework.core.optimizers import AdaptiveObGDBounding, ObGDBounding
 from alberta_framework.core.upgd import (
     UPGDLearner,
     UPGDLearningResult,
@@ -1098,6 +1099,36 @@ class TestUpdateMetrics:
         )
 
         assert float(adaptive_delta) > float(static_delta)
+
+    @pytest.mark.parametrize(
+        ("bounder", "reason"),
+        [
+            (ObGDBounding(kappa=2.0), "kappa 2.0 disagrees with adaptive_kappa_base=0.5"),
+            (AdaptiveObGDBounding(kappa=0.5), "the RMS stage would be silently dropped"),
+        ],
+    )
+    def test_adaptive_kappa_refuses_a_bounder_it_would_silently_discard(self, bounder, reason):
+        del reason
+        with pytest.raises(ValueError, match="adaptive_kappa_mode"):
+            UPGDLearner(
+                n_heads=1,
+                hidden_sizes=(4,),
+                bounder=bounder,
+                adaptive_kappa_mode="loss_ratio",
+                adaptive_kappa_base=0.5,
+            )
+
+    def test_adaptive_kappa_accepts_a_matching_obgd_bounder_or_none(self):
+        UPGDLearner(
+            n_heads=1,
+            hidden_sizes=(4,),
+            bounder=ObGDBounding(kappa=0.5),
+            adaptive_kappa_mode="loss_ratio",
+            adaptive_kappa_base=0.5,
+        )
+        UPGDLearner(
+            n_heads=1, hidden_sizes=(4,), adaptive_kappa_mode="loss_ratio", adaptive_kappa_base=0.5
+        )
 
     def test_gradient_alignment_can_learn_kappa_multiplier(self):
         learner = UPGDLearner(
