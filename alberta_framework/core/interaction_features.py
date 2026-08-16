@@ -1388,7 +1388,8 @@ class FixedBudgetInteractionLearner:
             selected_mask = jnp.isfinite(selected)
             selected_count = jnp.sum(selected_mask, axis=1)
             selected_sum = jnp.sum(jnp.where(selected_mask, selected, 0.0), axis=1)
-            return jnp.where(selected_count > 0, selected_sum / selected_count, 0.0)
+            safe_count = jnp.maximum(selected_count, 1.0)
+            return jnp.where(selected_count > 0, selected_sum / safe_count, 0.0)
 
         if self._utility_task_balancing == "active":
             active_count = jnp.maximum(jnp.sum(active_mask.astype(jnp.float32)), 1.0)
@@ -1482,7 +1483,8 @@ class FixedBudgetInteractionLearner:
             selected_mask = jnp.isfinite(selected)
             selected_count = jnp.sum(selected_mask, axis=1)
             selected_sum = jnp.sum(jnp.where(selected_mask, selected, 0.0), axis=1)
-            return jnp.where(selected_count > 0, selected_sum / selected_count, 0.0)
+            safe_count = jnp.maximum(selected_count, 1.0)
+            return jnp.where(selected_count > 0, selected_sum / safe_count, 0.0)
         if self._utility_task_balancing in {"active", "active_inverse_frequency"}:
             active_count = jnp.maximum(jnp.sum(active_mask.astype(jnp.float32)), 1.0)
             return jnp.sum(weighted_signal, axis=0) / active_count
