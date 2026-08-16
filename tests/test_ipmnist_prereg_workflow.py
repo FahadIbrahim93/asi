@@ -61,6 +61,10 @@ def test_issue184_protocol_pins_exact_arms_namespace_and_seeds() -> None:
     assert issue184.summary_filename == "summary.json"
     assert issue184.requires_amendment is True
     assert issue184.prerequisite == "issue51"
+    assert (
+        issue184.prerequisite_artifact_condition
+        == "unexpired-90-day-github-actions-artifact"
+    )
 
 
 def test_issue184_workflow_pins_every_shell_mapping() -> None:
@@ -71,17 +75,35 @@ def test_issue184_workflow_pins_every_shell_mapping() -> None:
     assert 'issue184) namespace="rls_preset_ablation_r1" ;;' in workflow
     assert 'candidate="rls_head_resid_l1_noreset"' in workflow
     assert 'seeds=(0 1 2)' in workflow
-    assert "outputs/ipmnist_screening/rls_preset_ablation_r1" in workflow
+    assert 'echo "output_root=$target" >> "$GITHUB_OUTPUT"' in workflow
     assert ".github/scripts/ipmnist_prereg.py seal" in workflow
     assert "group: ipmnist-prereg-${{ inputs.protocol }}\n" in workflow
+    early_index = workflow.index(
+        "- name: Require exact owner authorization and sole dispatch before setup"
+    )
+    setup_index = workflow.index("- name: Set up exact uv 0.9.24")
     sync_index = workflow.index("- name: Synchronize the committed environment")
     authorization_index = workflow.index(
-        "- name: Require one pre-data project-owner authorization and one dispatch"
+        "- name: Recheck authorization and reconstruct prerequisites after sync"
     )
     test_index = workflow.index("- name: Run code-only preregistration preflight tests")
     measurement_index = workflow.index("- name: Run the frozen arms sequentially and merge once")
-    assert sync_index < authorization_index < test_index < measurement_index
+    assert (
+        early_index
+        < setup_index
+        < sync_index
+        < authorization_index
+        < test_index
+        < measurement_index
+    )
+    assert "python3 .github/scripts/ipmnist_prereg.py authorize" in workflow
     assert "uv run --no-sync python .github/scripts/ipmnist_prereg.py preflight" in workflow
+    upload = workflow[workflow.index("- name: Upload 90-day result or partial recovery bundle") :]
+    assert "${{ steps.protocol.outputs.output_root }}" in upload
+    assert "outputs/ipmnist_screening/replication_r1" not in upload
+    assert "outputs/ipmnist_screening/rls_preset_ablation_r1" not in upload
+    assert "outputs/ipmnist_screening/gate_ablation_r3" not in upload
+    assert "retention-days: 90" in upload
 
 
 def test_issue184_github_and_local_protocols_cannot_drift() -> None:
@@ -188,7 +210,9 @@ def test_issue184_amendment_line_binds_the_complete_registered_change() -> None:
         f"source={'1' * 40} tree={'2' * 40} uv_lock_sha256={'3' * 64} "
         f"workflow_blob_sha1={'4' * 40} driver_blob_sha1={'5' * 40} "
         "ref=ipmnist-prereg-example "
-        "runner=github-hosted-macos-14-arm64-apple-m1 seeds=0,1,2 n=3 "
+        "runner=github-hosted-macos-14-arm64-apple-m1 "
+        "prerequisite_artifact=unexpired-90-day-github-actions-artifact "
+        "seeds=0,1,2 n=3 "
         "compute=uncompensated"
     )
 
@@ -356,6 +380,37 @@ def test_launch_authorization_accepts_exact_unedited_project_owner_comment(
     assert payload["authorization_comment_id"] == 456
     assert payload["authorization_created_at"] == "2026-08-16T09:00:00Z"
     assert payload["authorization_updated_at"] == "2026-08-16T09:00:00Z"
+
+
+def test_synchronized_preflight_binds_the_early_owner_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    comment = _authorization_comment()
+    owner = _verify_with_comment(monkeypatch, comment)
+    owner.pop("prerequisite_completion")
+    owner.pop("early_owner_authorization_schema")
+    owner.pop("early_owner_authorization_sha256")
+    owner["schema"] = "asi.ipmnist_prereg.owner_authorization.v1"
+    receipt = tmp_path / "owner.json"
+    _write_json(receipt, owner)
+    payload = _verify_with_comment(
+        monkeypatch,
+        comment,
+        invocation_overrides={"owner_authorization": receipt},
+    )
+    assert payload["early_owner_authorization_sha256"] == hashlib.sha256(
+        receipt.read_bytes()
+    ).hexdigest()
+
+    owner["authorization_comment_id"] = 999
+    receipt.unlink()
+    _write_json(receipt, owner)
+    with pytest.raises(RuntimeError, match="early owner authorization receipt differs"):
+        _verify_with_comment(
+            monkeypatch,
+            comment,
+            invocation_overrides={"owner_authorization": receipt},
+        )
 
 
 @pytest.mark.parametrize(
@@ -904,7 +959,7 @@ def test_completion_seal_copies_runner_and_binds_fresh_reconstruction(
     namespace = tmp_path / "outputs" / "ipmnist_screening" / protocol.namespace
     namespace.mkdir(parents=True)
     launch = {
-        "schema": "asi.ipmnist_prereg.launch_preflight.v2",
+        "schema": "asi.ipmnist_prereg.launch_preflight.v3",
         "protocol": asdict(protocol),
         "source": "1" * 40,
         "tree": "2" * 40,
@@ -1010,6 +1065,10 @@ def test_issue184_prerequisite_requires_eligible_committed_result_live_success_a
         "validate_result_bundle",
         lambda **_kwargs: result,
     )
+    artifact_times = {
+        "created_at": "2026-05-18T08:59:00Z",
+        "expires_at": "2026-08-16T08:59:00Z",
+    }
 
     def fake_github_json(path: str, *, token: str) -> dict[str, Any]:
         assert token == "token"
@@ -1036,6 +1095,7 @@ def test_issue184_prerequisite_requires_eligible_committed_result_live_success_a
                         "id": 456,
                         "name": f"ipmnist-issue51-{'1' * 40}-123",
                         "expired": False,
+                        **artifact_times,
                         "workflow_run": {"id": 123, "head_sha": "1" * 40},
                     }
                 ],
@@ -1060,7 +1120,20 @@ def test_issue184_prerequisite_requires_eligible_committed_result_live_success_a
     assert receipt["issue_closed_at"] == "2026-08-16T09:00:00Z"
     assert receipt["outcome"] == outcome
     assert receipt["artifact_id"] == 456
+    assert receipt["artifact_retention_days"] == 90
+    assert receipt["artifact_expires_at"] == "2026-08-16T08:59:00Z"
     assert receipt["artifact_archive_sha256"] == hashlib.sha256(archive_bytes).hexdigest()
+
+    artifact_times["expires_at"] = "2026-08-15T08:59:00Z"
+    with pytest.raises(RuntimeError, match="registered 90-day"):
+        _verify_prerequisite_completion(
+            _PROTOCOLS["issue184"],
+            repository="elizaOS/asi",
+            launch_source="5" * 40,
+            root=tmp_path,
+            token="token",
+        )
+    artifact_times["expires_at"] = "2026-08-16T08:59:00Z"
 
     tampered_stream = io.BytesIO()
     with zipfile.ZipFile(tampered_stream, "w") as archive:
