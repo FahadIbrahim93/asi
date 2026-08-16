@@ -292,8 +292,9 @@ class UPGDLearner:
         head_repetition_warmup_steps: Number of initial steps before the
             repeated-target boost can turn on.
         unit_replacement_rate: Optional hidden-unit recycling rate per step,
-            expressed as a fraction of units per layer. ``0`` disables
-            recycling while still tracking per-unit utility.
+            expressed as a fraction of the layer's mature units; at most one
+            unit per layer is recycled per step. ``0`` disables recycling
+            while still tracking per-unit utility.
         unit_maturity_threshold: Minimum age before a hidden unit can be
             recycled.
         unit_utility_decay: Optional EMA decay for hidden-unit utilities. When
@@ -2933,9 +2934,6 @@ class UPGDLearner:
             new_accumulators = []
             new_replacement_counts = []
             for i in range(n_trunk):
-                layer_size = new_unit_utilities[i].shape[0]
-                layer_size_f = jnp.array(layer_size, dtype=jnp.float32)
-
                 mature = new_unit_ages[i] >= maturity
                 if self._unit_replacement_criterion == "stale_gradient_ratio":
                     util_norm = new_unit_long_utilities[i] / (
@@ -2994,9 +2992,13 @@ class UPGDLearner:
                     )
                 else:
                     rate_scale = jnp.array(1.0, dtype=jnp.float32)
+                # Budget accrues against the units that are eligible (mature)
+                # right now, as in the reference GnT scheduler; immature units
+                # earn no budget, so warm-up cannot bank a replacement burst.
+                n_mature = jnp.sum(mature).astype(jnp.float32)
                 accum = (
                     state.unit_replacement_accumulators[i]
-                    + rate * layer_size_f * rate_scale
+                    + rate * n_mature * rate_scale
                 )
                 do_replace = accum >= 1.0
                 gated = jnp.logical_and(
@@ -3096,7 +3098,10 @@ class UPGDLearner:
                 new_unit_ages[i] = unit_age.at[unit_idx].set(
                     jnp.where(gated, jnp.int32(0), unit_age[unit_idx])
                 )
-                new_accumulators.append(jnp.where(gated, accum - 1.0, accum))
+                # Never carry more than the one replacement a step can deliver.
+                new_accumulators.append(
+                    jnp.minimum(jnp.where(gated, accum - 1.0, accum), 1.0)
+                )
                 new_replacement_counts.append(
                     unit_replacement_counts[i] + gated.astype(jnp.float32)
                 )
