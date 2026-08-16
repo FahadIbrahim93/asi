@@ -816,7 +816,7 @@ class ContinuousActorCriticAgent:
                 raise ValueError(f"{name} must be finite when set") from exc
             if not math.isfinite(narrowed):
                 raise ValueError(f"{name} must remain finite once narrowed to float32")
-            preserve_builtin = actual_type is int or actual_type is float
+            preserve_builtin = type(bound) is int or type(bound) is float
             canonical_bounds[name] = float(bound) if preserve_builtin else narrowed
         low = canonical_bounds["action_low"]
         high = canonical_bounds["action_high"]
