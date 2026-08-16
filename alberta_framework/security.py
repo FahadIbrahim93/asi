@@ -9,10 +9,19 @@ requiring either sibling repository at import time.
 from __future__ import annotations
 
 import dataclasses
+import json
 import time
 from collections.abc import Mapping, Sequence
 from enum import IntEnum
 from typing import Any
+
+
+def _require_rfc_json_mapping(payload: Mapping[str, Any], *, name: str) -> None:
+    """Raise ``ValueError`` unless ``payload`` serializes as RFC-compliant JSON."""
+    try:
+        json.dumps(payload, allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be RFC-compliant JSON") from exc
 
 
 class SecurityAction(IntEnum):
@@ -86,7 +95,9 @@ class SecurityRewardWeights:
 
     def to_dict(self) -> dict[str, float]:
         """Return a JSON-serializable weight mapping."""
-        return dataclasses.asdict(self)
+        payload = dataclasses.asdict(self)
+        _require_rfc_json_mapping(payload, name="security reward weights")
+        return payload
 
 
 def security_reward(
@@ -135,12 +146,14 @@ class SecurityFeatureSchema:
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serializable schema mapping."""
-        return {
+        payload = {
             "version": self.version,
             "dtype": self.dtype,
             "names": list(self.names),
             "feature_dim": self.feature_dim,
         }
+        _require_rfc_json_mapping(payload, name="security feature schema")
+        return payload
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> SecurityFeatureSchema:
@@ -166,7 +179,7 @@ class SecurityRolloutStep:
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serializable transition mapping."""
-        return {
+        payload = {
             "state": list(self.state),
             "action": int(self.action),
             "action_name": self.action.name.lower(),
@@ -176,6 +189,8 @@ class SecurityRolloutStep:
             "truncated": self.truncated,
             "policy_metadata": dict(self.policy_metadata),
         }
+        _require_rfc_json_mapping(payload, name="security rollout step")
+        return payload
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> SecurityRolloutStep:
@@ -204,7 +219,7 @@ class SecurityOracleExperience:
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serializable oracle experience mapping."""
-        return {
+        payload = {
             "schema": self.schema,
             "state": list(self.state),
             "action": int(self.action),
@@ -213,6 +228,8 @@ class SecurityOracleExperience:
             "outcome": dict(self.outcome),
             "policy_metadata": dict(self.policy_metadata),
         }
+        _require_rfc_json_mapping(payload, name="security oracle experience")
+        return payload
 
 
 def security_rollout_step_to_oracle_experience(
@@ -336,11 +353,13 @@ class ThroughputMeasurement:
 
     def to_dict(self) -> dict[str, float | int]:
         """Return a JSON-serializable measurement mapping."""
-        return {
+        payload = {
             "n_events": self.n_events,
             "elapsed_s": self.elapsed_s,
             "events_per_second": self.events_per_second,
         }
+        _require_rfc_json_mapping(payload, name="throughput measurement")
+        return payload
 
 
 class ThroughputMeter:
