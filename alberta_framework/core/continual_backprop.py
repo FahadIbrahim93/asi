@@ -64,6 +64,7 @@ References
 from __future__ import annotations
 
 import functools
+import math
 import time
 from typing import Any
 
@@ -91,6 +92,24 @@ from alberta_framework.core.types import TraceMode
 # =============================================================================
 
 
+def _require_exact_int(value: object, name: str, *, minimum: int) -> None:
+    """Reject bools, floats, and other non-int scalars for count fields."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        raise ValueError(f"{name} must be an int >= {minimum}")
+
+
+def _require_finite(value: object, name: str) -> None:
+    """Reject NaN, infinities, and non-real scalars (sign-agnostic)."""
+    if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value):
+        raise ValueError(f"{name} must be finite")
+
+
+def _require_bool(value: object, name: str) -> None:
+    """Reject truthy stand-ins for exact bools."""
+    if not isinstance(value, bool):
+        raise ValueError(f"{name} must be a bool")
+
+
 @chex.dataclass(frozen=True)
 class ContinualBackpropConfig:
     """Hyperparameters for Continual Backprop.
@@ -115,6 +134,17 @@ class ContinualBackpropConfig:
     replacement_rate: float = 1e-4
     maturity_threshold: int = 100
     enabled: bool = True
+
+    def __post_init__(self) -> None:
+        """Validate scalar configuration, rejecting NaN and type stand-ins."""
+        _require_finite(self.decay_rate, "decay_rate")
+        if not 0.0 <= self.decay_rate < 1.0:
+            raise ValueError("decay_rate must be in [0, 1)")
+        _require_finite(self.replacement_rate, "replacement_rate")
+        if not 0.0 <= self.replacement_rate <= 1.0:
+            raise ValueError("replacement_rate must be in [0, 1]")
+        _require_exact_int(self.maturity_threshold, "maturity_threshold", minimum=0)
+        _require_bool(self.enabled, "enabled")
 
     def to_config(self) -> dict[str, Any]:
         """Serialize to dict."""
