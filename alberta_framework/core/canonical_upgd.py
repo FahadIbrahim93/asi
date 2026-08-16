@@ -98,9 +98,11 @@ _RAW_GLOBAL_PROFILES = frozenset(
 )
 
 
-def _skip_zero_scale(scale: Array, value: Array) -> Array:
-    """Return 0 when ``scale`` is 0 so IEEE ``0 * inf`` does not become NaN."""
-    return jnp.where(scale == 0.0, jnp.zeros_like(value), scale * value)
+def _static_zero_scale(scale: float, value: Array) -> Array:
+    """Skip a statically disabled EMA without changing enabled JAX graphs."""
+    if scale == 0.0:
+        return jnp.zeros_like(value)
+    return scale * value
 
 
 @dataclass(frozen=True)
@@ -430,7 +432,7 @@ class CanonicalUPGD:
             instantaneous = -clean_gradient * param
             next_utility = jnp.where(
                 active,
-                _skip_zero_scale(jnp.asarray(beta, dtype=param.dtype), utility)
+                _static_zero_scale(beta, utility)
                 + (1.0 - beta) * instantaneous,
                 utility,
             )
@@ -1086,17 +1088,27 @@ class AlbertaAdaUPGD:
         state_is_valid = self.state_valid(state, params)
         if self._config.utility_decay == 0.0 or self._config.second_moment_decay == 0.0:
             checked_utility = (
-                jax.tree.map(jnp.zeros_like, state.utility_ema)
+                jax.tree.map(
+                    lambda value: jnp.where(
+                        jnp.isfinite(value), value, jnp.zeros_like(value)
+                    ),
+                    state.utility_ema,
+                )
                 if self._config.utility_decay == 0.0
                 else state.utility_ema
             )
             checked_moment = (
-                jax.tree.map(jnp.zeros_like, state.gradient_second_moment)
+                jax.tree.map(
+                    lambda value: jnp.where(
+                        jnp.isfinite(value), value, jnp.zeros_like(value)
+                    ),
+                    state.gradient_second_moment,
+                )
                 if self._config.second_moment_decay == 0.0
                 else state.gradient_second_moment
             )
             state_is_valid = self.state_valid(
-                state.replace(
+                state.replace(  # type: ignore[attr-defined]
                     utility_ema=checked_utility,
                     gradient_second_moment=checked_moment,
                 ),
@@ -1183,7 +1195,7 @@ class AlbertaAdaUPGD:
             instantaneous_utility = -gradient * param
             proposed_utility = jnp.where(
                 eligible,
-                _skip_zero_scale(jnp.asarray(beta_utility, dtype=param.dtype), utility)
+                _static_zero_scale(beta_utility, utility)
                 + (1.0 - beta_utility) * instantaneous_utility,
                 utility,
             )
@@ -1200,9 +1212,9 @@ class AlbertaAdaUPGD:
                 0.0,
             )
 
-            proposed_moment = _skip_zero_scale(
-                jnp.asarray(beta_second, dtype=param.dtype), moment
-            ) + (1.0 - beta_second) * jnp.square(gradient)
+            proposed_moment = _static_zero_scale(beta_second, moment) + (
+                1.0 - beta_second
+            ) * jnp.square(gradient)
             moment_clock = jnp.maximum(proposed_step, 1).astype(param.dtype)
             moment_correction = 1.0 - jnp.power(beta_second, moment_clock)
             corrected_moment = proposed_moment / jnp.maximum(
@@ -1810,19 +1822,16 @@ class OfficialAdaUPGD:
             second_leaves,
             strict=True,
         ):
-            utility_scale = jnp.asarray(self._config.utility_decay, dtype=param.dtype)
-            first_scale = jnp.asarray(self._config.beta1, dtype=param.dtype)
-            second_scale = jnp.asarray(self._config.beta2, dtype=param.dtype)
             proposed_utility_leaves.append(
-                _skip_zero_scale(utility_scale, utility)
+                _static_zero_scale(self._config.utility_decay, utility)
                 + (1.0 - self._config.utility_decay) * (-gradient * param)
             )
             proposed_first_leaves.append(
-                _skip_zero_scale(first_scale, first)
+                _static_zero_scale(self._config.beta1, first)
                 + (1.0 - self._config.beta1) * gradient
             )
             proposed_second_leaves.append(
-                _skip_zero_scale(second_scale, second)
+                _static_zero_scale(self._config.beta2, second)
                 + (1.0 - self._config.beta2) * jnp.square(gradient)
             )
 

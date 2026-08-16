@@ -11,6 +11,7 @@ import pytest
 from alberta_framework.core.canonical_upgd import (
     CanonicalUPGD,
     CanonicalUPGDConfig,
+    _static_zero_scale,
 )
 from alberta_framework.core.checkpoints import load_checkpoint, save_checkpoint
 
@@ -383,6 +384,26 @@ def test_zero_utility_decay_does_not_multiply_inf_ema() -> None:
     result = optimizer.update(state, params, gradients, jr.key(0))
     chex.assert_tree_all_finite(result.state.utility_ema)
     chex.assert_tree_all_finite(result.params)
+
+
+def test_nonzero_static_decay_preserves_legacy_hlo() -> None:
+    value = jnp.ones((4,), dtype=jnp.float32)
+    decay = 0.999
+
+    legacy_hlo = (
+        jax.jit(lambda leaf: decay * leaf)
+        .lower(value)
+        .compiler_ir(dialect="hlo")
+        .as_hlo_text()
+    )
+    guarded_hlo = (
+        jax.jit(lambda leaf: _static_zero_scale(decay, leaf))
+        .lower(value)
+        .compiler_ir(dialect="hlo")
+        .as_hlo_text()
+    )
+
+    assert legacy_hlo.splitlines()[1:] == guarded_hlo.splitlines()[1:]
 
 
 def test_paper_global_all_negative_uses_signed_maximum_and_reverses_order() -> None:
