@@ -186,6 +186,30 @@ def test_init_state_is_valid_for_every_accepted_default_scale() -> None:
         assert bool(model.state_valid(model.init(jr.key(seed))))
 
 
+def test_initial_variance_bias_bound_is_exact_at_its_float32_endpoint() -> None:
+    """The bound is compared against the stored float32 bias, not its binary64 origin."""
+    default = _config()
+    sink = float(np.float32(abs(default.initial_variance_logit)))
+    assert default.initial_variance_bias_magnitude == sink
+    assert sink != abs(default.initial_variance_logit)
+
+    endpoint = RecurrentLatentWorldModelEnsemble(_config(max_parameter_magnitude=sink))
+    state = endpoint.init(jr.key(0))
+    assert bool(endpoint.state_valid(state))
+    stored = float(jnp.max(jnp.abs(state.member_parameters[0].variance_bias)))
+    assert stored == sink
+
+    below = float(np.nextafter(np.float32(sink), np.float32(0.0)))
+    with pytest.raises(ValueError, match="initial variance bias magnitude"):
+        _config(max_parameter_magnitude=below)
+
+
+def test_init_is_a_host_side_entry_point() -> None:
+    model = RecurrentLatentWorldModelEnsemble(_config())
+    with pytest.raises(jax.errors.TracerBoolConversionError):
+        jax.jit(model.init)(jr.key(0))
+
+
 def test_start_and_decide_are_read_only_predict_before_update_caches() -> None:
     model = RecurrentLatentWorldModelEnsemble(_config())
     state = model.init(jr.key(0))

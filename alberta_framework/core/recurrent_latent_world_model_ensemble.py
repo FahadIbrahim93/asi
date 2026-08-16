@@ -304,7 +304,7 @@ class RecurrentLatentWorldModelEnsembleConfig:
             raise ValueError("gradient_clip_norm cannot exceed max_raw_gradient_norm")
         if self.learning_rate * self.gradient_clip_norm > self.max_parameter_magnitude:
             raise ValueError("one clipped update exceeds max_parameter_magnitude")
-        initial_variance_bias = abs(self.initial_variance_logit)
+        initial_variance_bias = self.initial_variance_bias_magnitude
         if initial_variance_bias > self.max_parameter_magnitude:
             raise ValueError(
                 f"initial variance bias magnitude {initial_variance_bias} exceeds "
@@ -348,6 +348,11 @@ class RecurrentLatentWorldModelEnsembleConfig:
             self.max_variance - self.variance_floor
         )
         return math.log(variance_ratio / (1.0 - variance_ratio))
+
+    @property
+    def initial_variance_bias_magnitude(self) -> float:
+        """Magnitude of the stored float32 variance bias, as ``_parameters_valid`` sees it."""
+        return float(np.float32(abs(self.initial_variance_logit)))
 
     @property
     def state_nbytes(self) -> int:
@@ -681,6 +686,11 @@ class RecurrentLatentWorldModelEnsemble:
 
     def init(self, key: Array) -> RecurrentLatentWorldModelEnsembleState:
         """Initialize distinct member parameters and an isolated bootstrap key.
+
+        This is a deliberately host-side entry point: it evaluates the drawn
+        parameters against ``max_parameter_magnitude`` eagerly and raises, so
+        it must not be wrapped in ``jax.jit``; compile the ``start`` /
+        ``decide`` / ``update`` transitions instead.
 
         Raises:
             ValueError: If ``key`` is not one JAX PRNG key, or the drawn
