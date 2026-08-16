@@ -18,6 +18,7 @@ import math
 import os
 import platform
 import re
+import stat
 import subprocess
 import sys
 import urllib.error
@@ -1378,6 +1379,49 @@ def _reject_symlinks(root: Path) -> None:
                 raise ValueError(f"result namespace contains a symlink: {path}")
 
 
+def _namespace_file_manifest(root: Path) -> list[dict[str, object]]:
+    """Capture every namespace file from stable, unaliased regular bytes."""
+    _reject_symlinks(root)
+    entries: list[dict[str, object]] = []
+    for path in sorted(root.rglob("*")):
+        if path.is_dir():
+            entries.append(
+                {"path": path.relative_to(root).as_posix(), "kind": "directory"}
+            )
+            continue
+        before = path.stat(follow_symlinks=False)
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError(f"result namespace contains a non-regular file: {path}")
+        if before.st_nlink != 1:
+            raise ValueError(f"result namespace file has an external hard-link alias: {path}")
+        try:
+            raw = path.read_bytes()
+        except OSError as exc:
+            raise RuntimeError(f"result namespace file became unreadable: {path}") from exc
+        after = path.stat(follow_symlinks=False)
+        if (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+        ) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+        ):
+            raise RuntimeError(f"result namespace file changed while it was read: {path}")
+        entries.append(
+            {
+                "path": path.relative_to(root).as_posix(),
+                "kind": "file",
+                "size_bytes": len(raw),
+                "sha256": hashlib.sha256(raw).hexdigest(),
+            }
+        )
+    return entries
+
+
 def _require_real_directory(path: Path, *, label: str) -> None:
     if path.is_symlink() or not path.is_dir():
         raise ValueError(f"{label} must be one existing non-symlink directory")
@@ -1470,6 +1514,7 @@ def _validate_collection(
     if len(paths) != len(expected_pairs) or {path.name for path in paths} != expected_names:
         raise ValueError("shard filename coverage is not exact")
     shards = [screening.load_shard(path) for path in paths]
+    initial_manifest = _expected_manifest(paths, shards, root=root)
     observed_pairs: set[tuple[str, int]] = set()
     first_dataset: Mapping[str, Any] | None = None
     shard_created_times: list[float] = []
@@ -1532,7 +1577,16 @@ def _validate_collection(
         control_name=protocol.control,
         slope_window=15,
     )
-    expected_manifest = _expected_manifest(paths, shards, root=root)
+    final_manifest = _expected_manifest(paths, shards, root=root)
+    if _canonical_json(final_manifest) != _canonical_json(initial_manifest):
+        raise RuntimeError("screening shard inputs changed while results were reconstructed")
+    try:
+        final_summary_raw = summary_path.read_bytes()
+    except OSError as exc:
+        raise RuntimeError("stage summary changed while results were reconstructed") from exc
+    if final_summary_raw != summary_raw:
+        raise RuntimeError("stage summary changed while results were reconstructed")
+    expected_manifest = initial_manifest
     _validate_summary_reconstruction(
         summary=summary,
         recomputed=recomputed,
@@ -1651,10 +1705,16 @@ def _require_same_stage_dataset(
         raise ValueError(f"{stage} dataset provenance differs from the prior stage")
 
 
-def _expected_root_entries(*stages: str, include_result_claim: bool) -> set[str]:
+def _expected_root_entries(
+    *stages: str,
+    include_result_claim: bool,
+    include_result: bool,
+) -> set[str]:
     entries = {"runner.v1.json", "launch.v1.json", "cache.v1.json", *stages}
     if include_result_claim:
         entries.add("result-claim.v1.json")
+    if include_result:
+        entries.add("result.v1.json")
     return entries
 
 
@@ -1667,6 +1727,56 @@ def _require_root_entries(
             f"{context} has missing or unexpected namespace entries; "
             f"missing={sorted(expected - observed)}, unexpected={sorted(observed - expected)}"
         )
+
+
+def _finalize_result_bundle(
+    *,
+    namespace: Path,
+    protocol: LocalProtocol,
+    result: Mapping[str, Any],
+    last_summary_created_unix: object,
+    initial_namespace_manifest: Sequence[Mapping[str, object]],
+) -> dict[str, Any]:
+    _reject_symlinks(namespace)
+    claim_path = namespace / "result-claim.v1.json"
+    result_path = namespace / "result.v1.json"
+    claim_exists = os.path.lexists(claim_path)
+    result_exists = os.path.lexists(result_path)
+    if result_exists and not claim_exists:
+        raise ValueError("published result exists without its result claim")
+    finalized = dict(result)
+    if claim_exists:
+        claim, claim_raw = _strict_json_bytes(claim_path)
+        _require_exact_keys(
+            claim,
+            {"schema", "protocol_key", "claimed_at", "rerun_allowed"},
+            context="result claim",
+        )
+        if (
+            claim["schema"] != "asi.ipmnist_local_prereg.result_claim.v1"
+            or claim["protocol_key"] != protocol.key
+            or claim["rerun_allowed"] is not False
+        ):
+            raise ValueError("result claim differs from the frozen local protocol")
+        claimed_at = _parse_utc(claim["claimed_at"], label="result claim")
+        last_summary = _finite_float(
+            last_summary_created_unix, name="last summary created_unix"
+        )
+        if claimed_at.timestamp() <= last_summary:
+            raise ValueError("result claim must be created after every stage summary")
+        finalized["result_claim_sha256"] = hashlib.sha256(claim_raw).hexdigest()
+    if result_exists:
+        stored_result = _strict_json(result_path)
+        if _canonical_json(stored_result) != _canonical_json(finalized):
+            raise ValueError(
+                "published result differs from strict reconstruction of its bound inputs"
+            )
+    _reject_symlinks(namespace)
+    if _canonical_json(_namespace_file_manifest(namespace)) != _canonical_json(
+        initial_namespace_manifest
+    ):
+        raise RuntimeError("result namespace changed while the result was reconstructed")
+    return finalized
 
 
 def validate_result_bundle(
@@ -1690,6 +1800,7 @@ def validate_result_bundle(
     ):
         _require_real_directory(directory, label=label)
     _reject_symlinks(namespace)
+    initial_namespace_manifest = _namespace_file_manifest(namespace)
     stored_runner, runner_raw = _strict_json_bytes(namespace / "runner.v1.json")
     cpu = cast(dict[str, Any], stored_runner.get("cpu"))
     cpuset = cpu.get("requested_cpuset") if isinstance(cpu, dict) else None
@@ -1716,7 +1827,7 @@ def validate_result_bundle(
         runner_raw=runner_raw,
     )
     stored_cache, cache_raw = _strict_json_bytes(namespace / "cache.v1.json")
-    _validate_cache_receipt(
+    cache = _validate_cache_receipt(
         stored_cache,
         protocol=protocol,
         launch=launch,
@@ -1729,7 +1840,8 @@ def validate_result_bundle(
         "launch_receipt_sha256": hashlib.sha256(launch_raw).hexdigest(),
         "cache_receipt_sha256": cache_receipt_sha256,
     }
-    include_claim = (namespace / "result-claim.v1.json").is_file()
+    include_claim = os.path.lexists(namespace / "result-claim.v1.json")
+    include_result = os.path.lexists(namespace / "result.v1.json")
     stages: list[dict[str, Any]] = []
     first = _validate_stage(
         root=resolved_root,
@@ -1739,11 +1851,20 @@ def validate_result_bundle(
         identity=current_identity,
         runner=stored_runner,
     )
+    cache_checked_at = _parse_utc(cache["checked_at"], label="cache receipt")
+    if _finite_float(
+        first.get("first_shard_created_unix"), name="first shard created_unix"
+    ) <= cache_checked_at.timestamp():
+        raise ValueError("the first stage must be created after the cache receipt")
     stages.append(first)
     if protocol.key == "issue184":
         _require_root_entries(
             namespace,
-            _expected_root_entries("screen_60", include_result_claim=include_claim),
+            _expected_root_entries(
+                "screen_60",
+                include_result_claim=include_claim,
+                include_result=include_result,
+            ),
             context="issue184 terminal result",
         )
         outcome = classify_issue184(first["mean_diff"], first["per_seed_diff"])
@@ -1758,7 +1879,13 @@ def validate_result_bundle(
             "screen": first,
             **receipt_bindings,
         }
-        return result
+        return _finalize_result_bundle(
+            namespace=namespace,
+            protocol=protocol,
+            result=result,
+            last_summary_created_unix=first["summary_created_unix"],
+            initial_namespace_manifest=initial_namespace_manifest,
+        )
     if l2init_gate_passes(first["mean_diff"], first["per_seed_diff"]):
         second = _validate_stage(
             root=resolved_root,
@@ -1774,10 +1901,14 @@ def validate_result_bundle(
     else:
         _require_root_entries(
             namespace,
-            _expected_root_entries("screen_60", include_result_claim=include_claim),
+            _expected_root_entries(
+                "screen_60",
+                include_result_claim=include_claim,
+                include_result=include_result,
+            ),
             context="issue14 stage-1 terminal result",
         )
-        return {
+        result = {
             "schema": "asi.ipmnist_local_prereg.result.v1",
             "protocol_key": protocol.key,
             "source": current_identity["source"],
@@ -1787,6 +1918,13 @@ def validate_result_bundle(
             "stages": stages,
             **receipt_bindings,
         }
+        return _finalize_result_bundle(
+            namespace=namespace,
+            protocol=protocol,
+            result=result,
+            last_summary_created_unix=first["summary_created_unix"],
+            initial_namespace_manifest=initial_namespace_manifest,
+        )
     if l2init_gate_passes(second["mean_diff"], second["per_seed_diff"]):
         evaluation = _validate_stage(
             root=resolved_root,
@@ -1807,11 +1945,14 @@ def validate_result_bundle(
         _require_root_entries(
             namespace,
             _expected_root_entries(
-                "screen_60", "confirm_200_tuning", include_result_claim=include_claim
+                "screen_60",
+                "confirm_200_tuning",
+                include_result_claim=include_claim,
+                include_result=include_result,
             ),
             context="issue14 stage-2 terminal result",
         )
-        return {
+        result = {
             "schema": "asi.ipmnist_local_prereg.result.v1",
             "protocol_key": protocol.key,
             "source": current_identity["source"],
@@ -1821,6 +1962,13 @@ def validate_result_bundle(
             "stages": stages,
             **receipt_bindings,
         }
+        return _finalize_result_bundle(
+            namespace=namespace,
+            protocol=protocol,
+            result=result,
+            last_summary_created_unix=second["summary_created_unix"],
+            initial_namespace_manifest=initial_namespace_manifest,
+        )
     combined_root = namespace / "confirm_200_all"
     if not combined_root.is_dir() or combined_root.is_symlink():
         raise ValueError("required stage confirm_200_all is missing or invalid")
@@ -1852,6 +2000,7 @@ def validate_result_bundle(
             "confirm_200_evaluation",
             "confirm_200_all",
             include_result_claim=include_claim,
+            include_result=include_result,
         ),
         context="issue14 full terminal result",
     )
@@ -1860,7 +2009,7 @@ def validate_result_bundle(
         if l2init_gate_passes(combined["mean_diff"], combined["per_seed_diff"])
         else "no_win"
     )
-    return {
+    result = {
         "schema": "asi.ipmnist_local_prereg.result.v1",
         "protocol_key": protocol.key,
         "source": current_identity["source"],
@@ -1872,6 +2021,13 @@ def validate_result_bundle(
         "combined": combined,
         **receipt_bindings,
     }
+    return _finalize_result_bundle(
+        namespace=namespace,
+        protocol=protocol,
+        result=result,
+        last_summary_created_unix=combined["summary_created_unix"],
+        initial_namespace_manifest=initial_namespace_manifest,
+    )
 
 
 def validate_and_publish_result(
@@ -1900,9 +2056,20 @@ def validate_and_publish_result(
         runner_receipt=runner_receipt,
         verify_cache_file=verify_cache_file,
     )
-    published = {**result, "result_claim_sha256": _receipt_sha256(claim)}
-    _write_json_exclusive(namespace / "result.v1.json", published)
-    return published
+    expected_claim_sha256 = _receipt_sha256(claim)
+    if result.get("result_claim_sha256") != expected_claim_sha256:
+        raise RuntimeError("result reconstruction did not bind the exact result claim")
+    _write_json_exclusive(namespace / "result.v1.json", result)
+    reloaded = validate_result_bundle(
+        protocol_key=protocol_key,
+        root=resolved_root,
+        repository_identity=repository_identity,
+        runner_receipt=runner_receipt,
+        verify_cache_file=verify_cache_file,
+    )
+    if _canonical_json(reloaded) != _canonical_json(result):
+        raise RuntimeError("published result did not survive strict on-disk reconstruction")
+    return reloaded
 
 
 def _github_token() -> str:

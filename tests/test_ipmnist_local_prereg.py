@@ -988,6 +988,7 @@ def test_result_publication_is_one_shot_after_success(tmp_path: Path) -> None:
     assert result["outcome"] == "no_reset_win"
     assert (namespace / "result-claim.v1.json").is_file()
     assert (namespace / "result.v1.json").is_file()
+    assert _validate(tmp_path, "issue184") == result
     with pytest.raises(FileExistsError):
         _validate_and_publish_result(
             protocol_key="issue184",
@@ -1014,6 +1015,169 @@ def test_failed_result_validation_consumes_the_only_attempt(tmp_path: Path) -> N
     assert not (namespace / "result.v1.json").exists()
     with pytest.raises(FileExistsError):
         _validate_and_publish_result(**kwargs)
+
+
+def test_result_validation_rejects_shards_created_before_cache_receipt(
+    tmp_path: Path,
+) -> None:
+    from alberta_framework.benchmarks.ipmnist_screening import merge_shards
+
+    namespace = _write_protocol_receipts(tmp_path, "issue184")
+    _write_stage(tmp_path, "issue184", "screen_60", differences=(0.003,) * 3)
+    paths = sorted((namespace / "screen_60/shards").iterdir())
+    for path in paths:
+        shard = json.loads(path.read_text(encoding="utf-8"))
+        shard["created_unix"] = 1.0
+        path.write_text(json.dumps(shard, allow_nan=False, sort_keys=True), encoding="utf-8")
+    prior = Path.cwd()
+    os.chdir(tmp_path)
+    try:
+        summary = merge_shards(
+            [path.relative_to(tmp_path) for path in paths],
+            control_name="rls_head_resid_l1_preset005",
+            slope_window=15,
+        )
+    finally:
+        os.chdir(prior)
+    (namespace / "screen_60/summary.json").write_text(
+        json.dumps(summary, allow_nan=False, sort_keys=True), encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="after the cache receipt"):
+        _validate(tmp_path, "issue184")
+
+
+@pytest.mark.parametrize(
+    "claim",
+    [
+        {},
+        {
+            "schema": "asi.ipmnist_local_prereg.result_claim.v1",
+            "protocol_key": "issue184",
+            "claimed_at": "1970-01-01T00:00:01Z",
+            "rerun_allowed": False,
+        },
+    ],
+)
+def test_result_validation_rejects_malformed_or_premature_claim(
+    tmp_path: Path, claim: dict[str, Any]
+) -> None:
+    namespace = _write_protocol_receipts(tmp_path, "issue184")
+    _write_stage(tmp_path, "issue184", "screen_60", differences=(0.003,) * 3)
+    (namespace / "result-claim.v1.json").write_text(
+        json.dumps(claim, allow_nan=False, sort_keys=True), encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="result claim"):
+        _validate(tmp_path, "issue184")
+
+
+def test_published_result_tamper_is_rejected_on_strict_reload(tmp_path: Path) -> None:
+    namespace = _write_protocol_receipts(tmp_path, "issue184")
+    _write_stage(tmp_path, "issue184", "screen_60", differences=(0.003,) * 3)
+    result = _validate_and_publish_result(
+        protocol_key="issue184",
+        root=tmp_path,
+        repository_identity=_repository_identity(),
+        runner_receipt=_runner_receipt(),
+        verify_cache_file=False,
+    )
+    stored = json.loads((namespace / "result.v1.json").read_text(encoding="utf-8"))
+    assert stored == result
+    stored["outcome"] = "inconclusive"
+    (namespace / "result.v1.json").write_text(
+        json.dumps(stored, allow_nan=False, sort_keys=True), encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="published result"):
+        _validate(tmp_path, "issue184")
+
+
+def test_result_validation_rejects_shard_swap_during_reconstruction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import hashlib
+
+    import alberta_framework.benchmarks.ipmnist_screening as screening
+
+    namespace = _write_protocol_receipts(tmp_path, "issue184")
+    summary_path = _write_stage(
+        tmp_path, "issue184", "screen_60", differences=(0.003,) * 3
+    )
+    target = sorted((namespace / "screen_60/shards").iterdir())[0]
+    replacement = json.loads(target.read_text(encoding="utf-8"))
+    replacement["per_task_accuracy"] = [0.9] * 60
+    replacement_raw = json.dumps(
+        replacement, allow_nan=False, sort_keys=True
+    ).encode()
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    relative = target.relative_to(tmp_path).as_posix()
+    entry = next(item for item in summary["shard_manifest"] if item["path"] == relative)
+    entry["size_bytes"] = len(replacement_raw)
+    entry["sha256"] = hashlib.sha256(replacement_raw).hexdigest()
+    summary_path.write_text(
+        json.dumps(summary, allow_nan=False, sort_keys=True), encoding="utf-8"
+    )
+    original_merge = screening.merge_shards
+
+    def swap_after_merge(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        merged = original_merge(*args, **kwargs)
+        target.write_bytes(replacement_raw)
+        return merged
+
+    monkeypatch.setattr(screening, "merge_shards", swap_after_merge)
+    with pytest.raises(RuntimeError, match="changed while"):
+        _validate(tmp_path, "issue184")
+
+
+def test_result_validation_rejects_summary_swap_during_reconstruction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import alberta_framework.benchmarks.ipmnist_screening as screening
+
+    _write_protocol_receipts(tmp_path, "issue184")
+    summary_path = _write_stage(
+        tmp_path, "issue184", "screen_60", differences=(0.003,) * 3
+    )
+    original_merge = screening.merge_shards
+
+    def swap_after_merge(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        merged = original_merge(*args, **kwargs)
+        summary_path.write_text("{}", encoding="utf-8")
+        return merged
+
+    monkeypatch.setattr(screening, "merge_shards", swap_after_merge)
+    with pytest.raises(RuntimeError, match="changed while"):
+        _validate(tmp_path, "issue184")
+
+
+def test_result_validation_rejects_empty_directory_added_during_reconstruction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import alberta_framework.benchmarks.ipmnist_screening as screening
+
+    namespace = _write_protocol_receipts(tmp_path, "issue184")
+    _write_stage(tmp_path, "issue184", "screen_60", differences=(0.003,) * 3)
+    original_merge = screening.merge_shards
+
+    def add_directory_after_merge(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        merged = original_merge(*args, **kwargs)
+        (namespace / "screen_60/shards/unexpected").mkdir()
+        return merged
+
+    monkeypatch.setattr(screening, "merge_shards", add_directory_after_merge)
+    with pytest.raises(RuntimeError, match="namespace changed while"):
+        _validate(tmp_path, "issue184")
+
+
+def test_result_validation_rejects_external_hard_link_alias(tmp_path: Path) -> None:
+    namespace = _write_protocol_receipts(tmp_path, "issue184")
+    _write_stage(tmp_path, "issue184", "screen_60", differences=(0.003,) * 3)
+    target = sorted((namespace / "screen_60/shards").iterdir())[0]
+    os.link(target, tmp_path / "external-shard-alias.json")
+
+    with pytest.raises(ValueError, match="hard-link alias"):
+        _validate(tmp_path, "issue184")
 
 
 @pytest.mark.parametrize(
