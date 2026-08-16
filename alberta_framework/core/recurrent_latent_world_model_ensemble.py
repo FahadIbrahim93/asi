@@ -226,15 +226,27 @@ class RecurrentLatentWorldModelEnsembleConfig:
     """Fixed architecture, optimizer, warmup, and numeric bounds.
 
     The ``max_*`` fields are fail-closed validity gates, not tuned
-    hyperparameters: an observation, reward, parameter, prediction, loss, or
-    raw gradient whose magnitude exceeds its bound causes the whole event to
-    be rejected with persistent state untouched.  Their internal consistency
-    is validated at construction: ``variance_floor < max_variance``,
-    ``gradient_clip_norm <= max_raw_gradient_norm``, and
-    ``learning_rate * gradient_clip_norm <= max_parameter_magnitude`` (so a
-    single clipped step cannot itself breach the parameter bound).  The
-    default magnitudes are coarse sanity ceilings far above any healthy
-    operating range, not derived quantities.
+    hyperparameters: an observation, reward, parameter, prediction, or loss
+    whose magnitude exceeds its bound causes the whole event to be rejected
+    with persistent state untouched.  Their internal consistency is validated
+    at construction: ``variance_floor < max_variance``, ``gradient_clip_norm
+    <= max_raw_gradient_norm``, and ``learning_rate * gradient_clip_norm <=
+    max_parameter_magnitude`` (so a single clipped step cannot itself breach
+    the parameter bound).  The default magnitudes are coarse sanity ceilings
+    far above any healthy operating range, not derived quantities.
+
+    Per-member raw NLL gradients are validated for finiteness only, not
+    against ``max_raw_gradient_norm``: the reachable raw gradient scales as
+    ``residual / variance``, so a well-trained low-noise member can legally
+    exceed any fixed ceiling on an ordinary in-bounds transition, and because
+    a rejection leaves state unchanged, a norm ceiling here creates a
+    deadlock rather than a safety gate.  ``gradient_clip_norm`` already
+    bounds the committed step magnitude, and ``candidate_parameters_valid`` /
+    ``candidate_state_valid`` independently confirm the post-clip candidate is
+    finite and in-bounds before it is committed.  ``max_raw_gradient_norm``
+    still bounds the representation gradient (a returned diagnostic signal,
+    never itself clipped) and constrains ``gradient_clip_norm`` at
+    construction.
     """
 
     observation_dim: int
@@ -1054,7 +1066,40 @@ class RecurrentLatentWorldModelEnsemble:
         self,
         state: RecurrentLatentWorldModelEnsembleState,
         diagnostics: RecurrentLatentWorldModelDiagnostics,
+        next_decision_observation: Array | None = None,
     ) -> RecurrentLatentWorldModelUpdateResult:
+        # A rejection never mutates `state`, but the *cache* previously
+        # defaulted to the invalid zero cache unconditionally.  Since `decide`
+        # and `update` both require a valid, owned start cache, that made
+        # every rejection -- regardless of cause -- a permanent deadlock: no
+        # later event, however legal, could ever be accepted again.
+        #
+        # When the incoming state and decision cache were themselves sound
+        # (`state_valid & cache_valid`), we know `state` is a legitimate
+        # anchor and `next_decision_observation` was at least well-typed (the
+        # shape/dtype contract in `update` runs unconditionally before any
+        # validity gate). Re-owning `state` with that observation makes the
+        # rejection retryable: the very next `decide`/`update` call
+        # independently re-validates the observation and every other input,
+        # so nothing unsound is smuggled through -- it only stops a single
+        # bad or over-strict event from freezing every event after it.
+        if next_decision_observation is None:
+            recoverable_cache = self._zero_start_cache()
+        else:
+            recoverable = diagnostics.state_valid & diagnostics.cache_valid
+            recoverable_cache = cast(
+                RecurrentLatentStartCache,
+                jax.lax.cond(
+                    recoverable,
+                    lambda: RecurrentLatentStartCache(
+                        owner_event_count=state.event_count,
+                        owner_hidden_states=state.member_hidden_states,
+                        observation=next_decision_observation,
+                        valid=jnp.asarray(True, dtype=jnp.bool_),
+                    ),
+                    self._zero_start_cache,
+                ),
+            )
         return RecurrentLatentWorldModelUpdateResult(
             state=state,
             prediction=self._zero_prediction(),
@@ -1072,7 +1117,7 @@ class RecurrentLatentWorldModelEnsemble:
             member_updates_applied=jnp.zeros(
                 (self._config.ensemble_size,), dtype=jnp.bool_
             ),
-            next_start_cache=self._zero_start_cache(),
+            next_start_cache=recoverable_cache,
             diagnostics=diagnostics,
         )
 
@@ -1217,10 +1262,14 @@ class RecurrentLatentWorldModelEnsemble:
                 member_losses.append(loss)
                 member_gradients.append(gradient)
                 gradient_norms.append(gradient_norm)
+                # Finiteness only -- see the class docstring.  The raw norm is
+                # not compared against max_raw_gradient_norm: a well-trained
+                # low-noise member legally produces residual / variance
+                # gradients that dwarf any fixed ceiling on an ordinary
+                # in-bounds transition, and gradient_clip_norm (applied below)
+                # already bounds the committed step regardless of raw scale.
                 member_gradients_valid.append(
-                    _tree_all_finite(gradient)
-                    & jnp.isfinite(gradient_norm)
-                    & (gradient_norm <= cfg.max_raw_gradient_norm)
+                    _tree_all_finite(gradient) & jnp.isfinite(gradient_norm)
                 )
             losses = jnp.stack(member_losses)
             gradient_norm_array = jnp.stack(gradient_norms)
@@ -1369,7 +1418,9 @@ class RecurrentLatentWorldModelEnsemble:
                 jax.lax.cond(
                     applied,
                     lambda: result,
-                    lambda: self._rejected_result(state, diagnostics),
+                    lambda: self._rejected_result(
+                        state, diagnostics, next_decision_observation
+                    ),
                 ),
             )
 
@@ -1378,7 +1429,9 @@ class RecurrentLatentWorldModelEnsemble:
             jax.lax.cond(
                 can_attempt,
                 accepted_branch,
-                lambda _: self._rejected_result(state, rejected_diagnostics),
+                lambda _: self._rejected_result(
+                    state, rejected_diagnostics, next_decision_observation
+                ),
                 operand=None,
             ),
         )

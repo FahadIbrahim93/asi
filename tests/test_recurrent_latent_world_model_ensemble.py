@@ -25,6 +25,7 @@ from alberta_framework.core.recurrent_latent_world_model_ensemble import (
     RecurrentLatentWorldModelEnsemble,
     RecurrentLatentWorldModelEnsembleConfig,
     RecurrentLatentWorldModelEnsembleState,
+    _tree_l2_norm,
     load_recurrent_latent_world_model_ensemble_checkpoint,
     save_recurrent_latent_world_model_ensemble_checkpoint,
 )
@@ -294,6 +295,108 @@ def test_off_boundary_reset_substitution_and_boundary_discount_errors_reject_ato
         _assert_tree_equal(rejected.state, state)
         assert not bool(rejected.prediction.availability.prediction)
         assert not bool(rejected.representation_gradient_available)
+
+
+def test_member_gradient_validity_is_finiteness_only_not_a_raw_norm_ceiling() -> None:
+    """Regression for issue #366.
+
+    ``residual / variance`` scaling means a well-trained low-noise member can
+    legally produce a per-member raw NLL gradient far above any fixed
+    ``max_raw_gradient_norm`` ceiling on an ordinary in-bounds transition.
+    ``gradient_clip_norm`` already bounds the committed step regardless of
+    raw scale, so the finite-but-huge case must still apply, not reject.
+    """
+    model = RecurrentLatentWorldModelEnsemble(
+        _config(gradient_clip_norm=1.0, max_raw_gradient_norm=5_000.0)
+    )
+    state = model.init(jr.key(20))
+    decision = _decision(model, state)
+    far_bootstrap = jnp.asarray((900.0, -900.0), dtype=jnp.float32)
+    stopped_targets = jnp.concatenate(
+        (far_bootstrap, jnp.asarray((0.5, 0.9), dtype=jnp.float32))
+    )
+    member_norms = []
+    for index in range(model.config.ensemble_size):
+        _, gradient = jax.value_and_grad(model._member_nll)(  # noqa: SLF001
+            state.member_parameters[index],
+            state.member_hidden_states[index],
+            OBSERVATION,
+            ACTION,
+            stopped_targets,
+        )
+        member_norms.append(float(_tree_l2_norm(gradient)))
+
+    # The whole point of the regression: the raw gradient genuinely, legally
+    # exceeds the configured ceiling before this fix would have rejected it.
+    assert all(norm > model.config.max_raw_gradient_norm for norm in member_norms)
+
+    result = model.update(
+        state,
+        decision,
+        _transition(
+            bootstrap_observation=far_bootstrap,
+            next_decision_observation=far_bootstrap,
+        ),
+    )
+    assert bool(result.diagnostics.applied)
+    assert bool(jnp.all(result.diagnostics.member_gradients_valid))
+    assert bool(result.diagnostics.candidate_state_valid)
+
+
+def test_rejection_returns_a_retryable_cache_not_a_permanent_deadlock() -> None:
+    """Regression for issue #366.
+
+    A rejection must not poison every later event.  When the incoming state
+    and decision cache were themselves sound, the returned ``next_start_cache``
+    must re-own the unchanged state so the next legal event is judged on its
+    own merits instead of being auto-rejected by a permanently invalid cache.
+    """
+    model = RecurrentLatentWorldModelEnsemble(_config())
+    state = model.init(jr.key(21))
+    decision = _decision(model, state)
+    wrong_reset = jnp.asarray((-9.0, -9.0), dtype=jnp.float32)
+
+    rejected = model.update(state, decision, _transition(next_decision_observation=wrong_reset))
+    assert bool(rejected.diagnostics.rejected)
+    assert not bool(rejected.diagnostics.boundary_semantics_valid)
+    # Sanity: this rejection's own recoverability precondition holds.
+    assert bool(rejected.diagnostics.state_valid)
+    assert bool(rejected.diagnostics.cache_valid)
+    _assert_tree_equal(rejected.state, state)
+
+    assert bool(rejected.next_start_cache.valid)
+    np.testing.assert_array_equal(rejected.next_start_cache.observation, wrong_reset)
+    np.testing.assert_array_equal(
+        rejected.next_start_cache.owner_hidden_states, state.member_hidden_states
+    )
+    assert int(rejected.next_start_cache.owner_event_count) == int(state.event_count)
+
+    # Prove the chain is genuinely un-poisoned: decide/update from the
+    # recovered cache work normally, evaluated on their own merits.
+    next_decision = model.decide(state, rejected.next_start_cache, ACTION)
+    assert bool(next_decision.valid)
+    recovered = model.update(
+        state,
+        next_decision,
+        _transition(observation=wrong_reset, next_decision_observation=BOOTSTRAP),
+    )
+    assert bool(recovered.diagnostics.applied)
+
+
+def test_state_invalid_rejection_still_returns_a_non_recoverable_cache() -> None:
+    """A corrupt/invalid *state* must not be re-owned as if it were legal."""
+    model = RecurrentLatentWorldModelEnsemble(_config())
+    valid_state = model.init(jr.key(22))
+    valid_decision = _decision(model, valid_state)
+    corrupt_state = cast(Any, valid_state).replace(
+        event_count=jnp.asarray(1, dtype=jnp.int32)
+    )
+    assert not bool(model.state_valid(corrupt_state))
+
+    result = model.update(corrupt_state, valid_decision, _transition())
+    assert not bool(result.diagnostics.state_valid)
+    assert bool(result.diagnostics.rejected)
+    assert not bool(result.next_start_cache.valid)
 
 
 def test_exact_observation_action_and_cache_ownership_reject_stale_or_tampered_inputs() -> None:
