@@ -38,13 +38,18 @@ the NaN-masking convention of the loop-based hordes.
 
 import math
 from dataclasses import dataclass
-from typing import Any
+from fractions import Fraction
+from numbers import Real
+from typing import Any, cast
 
 import chex
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import Array
 from jaxtyping import Bool, Float
+
+from alberta_framework._float32 import round_real_to_float32_with_ratio
 
 __all__ = [
     "StackedHordeConfig",
@@ -53,6 +58,78 @@ __all__ = [
     "StackedLinearHorde",
     "nexting_spec",
 ]
+
+_FLOAT32_MIN_NORMAL = float.fromhex("0x1.0p-126")
+_STEP_SIZE_ERROR = "step_size must be positive"
+_NUMPY_STEP_SIZE_TYPES = tuple(
+    np.dtype(dtype_code).type
+    for dtype_code in (
+        "b",
+        "B",
+        "h",
+        "H",
+        "i",
+        "I",
+        "l",
+        "L",
+        "q",
+        "Q",
+        "e",
+        "f",
+        "d",
+        "g",
+    )
+)
+_TRUSTED_STEP_SIZE_TYPES = (int, float, Fraction, *_NUMPY_STEP_SIZE_TYPES)
+
+
+def _snapshot_exact_fraction(value: Fraction) -> Fraction:
+    """Copy a structurally canonical exact Fraction without conversion hooks."""
+    try:
+        numerator = value.numerator
+        denominator = value.denominator
+    except AttributeError:
+        raise ValueError(_STEP_SIZE_ERROR) from None
+    if (
+        type(numerator) is not int
+        or type(denominator) is not int
+        or denominator <= 0
+    ):
+        raise ValueError(_STEP_SIZE_ERROR)
+    return Fraction(numerator, denominator)
+
+
+def _require_positive_normal_float32_step_size(value: object) -> float:
+    """Return a JSON-safe scalar whose float32 execution value is usable.
+
+    JAX CPU execution flushes float32 subnormals to zero, so accepting a
+    positive host value whose binary32 sink is zero or subnormal can create a
+    Horde that reports applied updates while its weights never move. Only
+    exact trusted scalar families are admitted, so user subclasses are
+    refused before conversion hooks can run. Exact Fractions additionally
+    require exact builtin-integer components and are copied before shared
+    conversion. Exact-ratio conversion prevents overloaded host comparisons
+    from hiding a negative value and avoids double-rounding supported
+    third-party reals.
+    """
+    value_type = type(value)
+    preserve_builtin_float = value_type is float
+    if not any(value_type is trusted_type for trusted_type in _TRUSTED_STEP_SIZE_TYPES):
+        raise ValueError(_STEP_SIZE_ERROR)
+    real = (
+        _snapshot_exact_fraction(cast(Fraction, value))
+        if value_type is Fraction
+        else cast(Real, value)
+    )
+    try:
+        numerator, _, narrowed = round_real_to_float32_with_ratio(real)
+    except (FloatingPointError, OverflowError, TypeError, ValueError):
+        raise ValueError(_STEP_SIZE_ERROR) from None
+    if numerator <= 0 or not math.isfinite(narrowed) or narrowed < _FLOAT32_MIN_NORMAL:
+        raise ValueError(_STEP_SIZE_ERROR)
+    # Preserve an already JSON-safe builtin float for payload compatibility.
+    # Every other accepted Real is stored as the validated binary32 value.
+    return cast(float, value) if preserve_builtin_float else narrowed
 
 
 @dataclass(frozen=True)
@@ -66,7 +143,9 @@ class StackedHordeConfig:
         lamdas: Per-demon trace decays, length ``n_demons``.
         cumulant_indices: Per-demon index into the cumulant-source vector
             handed to :meth:`StackedLinearHorde.update`.
-        step_size: Shared TD step-size alpha.
+        step_size: Shared TD step-size alpha. Its float32 execution value must
+            be finite, positive, and normal; accepted supported non-builtin
+            reals are canonicalized to a JSON-safe builtin float.
     """
 
     n_demons: int
@@ -93,8 +172,11 @@ class StackedHordeConfig:
             raise ValueError("every gamma must be in [0, 1]")
         if any(not 0.0 <= la <= 1.0 for la in self.lamdas):
             raise ValueError("every lamda must be in [0, 1]")
-        if not math.isfinite(self.step_size) or self.step_size <= 0.0:
-            raise ValueError("step_size must be positive")
+        object.__setattr__(
+            self,
+            "step_size",
+            _require_positive_normal_float32_step_size(self.step_size),
+        )
 
     def to_config(self) -> dict[str, Any]:
         """Serialize this config to a dictionary."""
