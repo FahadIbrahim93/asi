@@ -1,6 +1,7 @@
 """Tests for the closed-loop micro-MDPs (actions affect observations)."""
 
 from fractions import Fraction
+from numbers import Real
 
 import chex
 import jax
@@ -453,6 +454,30 @@ class TestRiverSwim:
         kwargs = {field: value}
         with pytest.raises(ValueError, match=field):
             RiverSwimMDP(RiverSwimConfig(**kwargs))
+
+    @pytest.mark.parametrize("field", ["p_right_up", "p_right_down"])
+    def test_transition_probabilities_reject_class_spoofed_reals(self, field):
+        """``__class__``-spoofed non-``Real`` objects must not defeat validation."""
+
+        class _SpoofedFloat:
+            """Mimics ``float`` via ``__class__`` to defeat ``isinstance``."""
+
+            @property
+            def __class__(self) -> type:  # type: ignore[override]
+                return float
+
+            def __float__(self) -> float:
+                return 0.3
+
+            def as_integer_ratio(self) -> tuple[int, int]:
+                return (3, 10)
+
+        assert isinstance(_SpoofedFloat(), Real)
+        assert not issubclass(type(_SpoofedFloat()), Real)
+
+        kwargs = {field: _SpoofedFloat()}
+        with pytest.raises(ValueError, match=field):
+            RiverSwimMDP(RiverSwimConfig(**kwargs))  # type: ignore[arg-type]
 
     def test_transition_probabilities_preserve_real_scalars_and_normalize_runtime(self):
         env = RiverSwimMDP(

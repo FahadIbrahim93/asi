@@ -67,11 +67,12 @@ _FLOAT32_TINY_RATIO = _FLOAT32_TINY.as_integer_ratio()
 def _exact_real_ratio(name: str, value: object) -> tuple[int, int]:
     """Return the exact ratio of a supported concrete real scalar."""
     message = f"{name} must be finite, positive, and a normal float32 probability"
-    if not isinstance(value, Real) or isinstance(value, (bool, np.bool_)):
+    actual_type = type(value)
+    if issubclass(actual_type, (bool, np.bool_)) or not issubclass(actual_type, Real):
         raise ValueError(message)
     try:
-        if isinstance(value, Integral):
-            ratio = (int(value), 1)
+        if issubclass(actual_type, Integral):
+            ratio = (int(cast(Any, value)), 1)
         else:
             ratio = cast(Any, value).as_integer_ratio()
         numerator, denominator = ratio
