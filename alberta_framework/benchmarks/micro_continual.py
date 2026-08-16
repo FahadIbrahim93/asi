@@ -637,9 +637,12 @@ class MicroArmSpec:
 
     name: str
     mechanism: str
-    hyperparameters: dict[str, float]
+    hyperparameters: Mapping[str, float]
     factory: MicroArmFactory
     description: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "hyperparameters", MappingProxyType(dict(self.hyperparameters)))
 
 
 def _make_sgd_raw_learner(
@@ -774,6 +777,8 @@ class MicroRunResult:
 
     family: str
     arm_name: str
+    mechanism: str
+    hyperparameters: Mapping[str, float]
     seed: int
     hidden1: int
     hidden2: int
@@ -850,6 +855,8 @@ def run_micro_arm(
     return MicroRunResult(
         family=config.family,
         arm_name=spec.name,
+        mechanism=spec.mechanism,
+        hyperparameters=MappingProxyType(dict(spec.hyperparameters)),
         seed=int(seed),
         hidden1=hidden1,
         hidden2=hidden2,
@@ -873,16 +880,15 @@ def micro_shard_path(out_dir: Path | str, family: str, arm_name: str, seed: int)
 
 
 def micro_shard_payload(result: MicroRunResult) -> dict[str, Any]:
-    """Serialize one run to a mergeable shard."""
-    spec = micro_arm_spec(result.arm_name)
+    """Serialize one run to a mergeable shard, recording the spec that actually ran."""
     return {
         "schema": MICRO_SHARD_SCHEMA,
         "suite_version": MICRO_GAUSS_SUITE_VERSION,
         "evidence_policy": dict(NONPROMOTING_POLICY),
         "family": result.family,
         "arm_name": result.arm_name,
-        "mechanism": spec.mechanism,
-        "hyperparameters": dict(spec.hyperparameters),
+        "mechanism": result.mechanism,
+        "hyperparameters": dict(result.hyperparameters),
         "seed": result.seed,
         "hidden1": result.hidden1,
         "hidden2": result.hidden2,

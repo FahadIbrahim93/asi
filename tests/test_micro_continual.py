@@ -786,6 +786,40 @@ class TestShards:
     def _result(self, seed=0, arm="sgd_raw"):
         return run_micro_arm(TINY, arm, seed=seed, hidden1=8, hidden2=6)
 
+    def test_payload_records_the_spec_that_actually_ran(self, tmp_path: Path):
+        """A custom spec sharing a registry name must not be serialized as the registry arm."""
+        registry = micro_arm_spec("sgd_raw")
+        custom = dataclasses.replace(
+            registry, hyperparameters={"step_size": 0.5, "weight_decay": 0.3}
+        )
+        registry_run = run_micro_arm(TINY, "sgd_raw", seed=0, hidden1=8, hidden2=6)
+        custom_run = run_micro_arm(TINY, custom, seed=0, hidden1=8, hidden2=6)
+        assert custom_run.overall_accuracy != registry_run.overall_accuracy
+        assert custom_run.mechanism == registry.mechanism
+        assert custom_run.hyperparameters == {"step_size": 0.5, "weight_decay": 0.3}
+        assert registry_run.hyperparameters == registry.hyperparameters
+
+        payload = micro_shard_payload(custom_run)
+        assert payload["hyperparameters"] == {"step_size": 0.5, "weight_decay": 0.3}
+        assert payload["mechanism"] == registry.mechanism
+        assert payload["hyperparameters"] is not custom_run.hyperparameters
+
+        path_a = micro_shard_path(tmp_path, TINY.family, "sgd_raw", 0)
+        write_micro_shard(path_a, payload)
+        path_b = micro_shard_path(tmp_path, TINY.family, "sgd_raw", 1)
+        write_micro_shard(
+            path_b,
+            micro_shard_payload(run_micro_arm(TINY, "sgd_raw", seed=1, hidden1=8, hidden2=6)),
+        )
+        with pytest.raises(ValueError, match="hyperparameters"):
+            merge_micro_shards([path_a, path_b], bayes_samples=1_000)
+
+    def test_registry_specs_cannot_be_mutated_through_lookup(self):
+        spec = micro_arm_spec("sgd_raw")
+        with pytest.raises(TypeError):
+            spec.hyperparameters["step_size"] = 123.0  # type: ignore[index]
+        assert micro_arm_spec("sgd_raw").hyperparameters["step_size"] != 123.0
+
     def test_payload_roundtrip(self, tmp_path: Path):
         result = self._result()
         payload = micro_shard_payload(result)
