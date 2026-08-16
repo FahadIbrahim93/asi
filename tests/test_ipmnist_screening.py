@@ -4581,13 +4581,19 @@ class TestDiscoveredRuleFactory:
     def test_discovered_arms_registered(self, name, flags, lr):
         from alberta_framework.benchmarks.ipmnist_screening import (
             _ema_frozen_probe_input,
+            _hidden_rms_frozen_probe_input,
             _make_discovered_rule_learner,
         )
 
         spec = screening_spec(name)
         assert spec.mechanism == "discovered_rule"
         assert spec.factory is _make_discovered_rule_learner
-        assert spec.frozen_probe_input is _ema_frozen_probe_input
+        expected_probe = (
+            _hidden_rms_frozen_probe_input
+            if flags["flag_hidden_rms"] != 0.0
+            else _ema_frozen_probe_input
+        )
+        assert spec.frozen_probe_input is expected_probe
         assert spec.hyperparameters["step_size"] == pytest.approx(lr, rel=1e-12)
         for key, value in flags.items():
             assert spec.hyperparameters[key] == value
