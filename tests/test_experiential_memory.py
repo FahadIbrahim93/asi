@@ -484,6 +484,24 @@ def test_eviction_is_deterministic_and_reward_does_not_replace_explicit_utility(
     assert int(accounting.evictions) == 1
 
 
+def test_large_relative_eviction_weights_do_not_overflow_priority() -> None:
+    maximum = float(np.finfo(np.float32).max)
+    memory = ExperientialMemory(
+        _config(
+            capacity=1,
+            top_k=1,
+            eviction_utility_weight=maximum,
+            eviction_recency_weight=maximum,
+        )
+    )
+    state = _write(memory, memory.init(), _entry(10, utility=maximum))
+    result = memory.write(state, _entry(20, utility=1.0))
+
+    assert bool(result.wrote)
+    assert bool(result.evicted)
+    assert int(result.evicted_provenance_id) == 10
+
+
 def test_accepted_access_updates_recency_before_deterministic_eviction() -> None:
     memory = ExperientialMemory(
         _config(

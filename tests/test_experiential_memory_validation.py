@@ -339,3 +339,30 @@ def test_experiential_memory_exact_serialized_boundaries() -> None:
     outer = ExperientialMemory(config).to_config()
     with pytest.raises(ValueError, match="nested config"):
         ExperientialMemory.from_config({**outer, "config": HostileDict(payload)})
+
+
+@pytest.mark.parametrize("field", ["staleness_scale", "recency_scale"])
+def test_age_scale_rejects_float32_division_overflow(field: str) -> None:
+    with pytest.raises(ValueError, match=field):
+        ExperientialMemoryConfig(
+            capacity=4,
+            observation_dim=2,
+            key_dim=2,
+            action_dim=1,
+            outcome_dim=1,
+            **{field: np.nextafter(np.float32(0.0), np.float32(1.0))},
+        )
+
+
+def test_eviction_weight_sum_must_be_positive_at_the_float32_sink() -> None:
+    tiny = float(np.nextafter(np.float32(0.0), np.float32(1.0))) / 2.0
+    with pytest.raises(ValueError, match="retention weight"):
+        ExperientialMemoryConfig(
+            capacity=4,
+            observation_dim=2,
+            key_dim=2,
+            action_dim=1,
+            outcome_dim=1,
+            eviction_utility_weight=tiny,
+            eviction_recency_weight=tiny,
+        )

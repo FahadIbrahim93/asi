@@ -285,6 +285,12 @@ def _validated_config_float(name: str, value: object, **bounds: Any) -> float:
         raise ValueError(f"{name} must be a finite real scalar")
     return validated_float32_scalar(name, value, **bounds)
 
+
+def _require_float32_allocation(name: str, scalars: int) -> None:
+    if scalars > _INT32_MAX or 4 * scalars > _INT32_MAX:
+        raise ValueError(f"{name} scalar and byte counts must fit signed int32")
+
+
 def _validate_config(config: ExperientialMemoryConfig) -> None:
     for name in (
         "capacity",
@@ -317,6 +323,16 @@ def _validate_config(config: ExperientialMemoryConfig) -> None:
         raise ValueError("ExperientialMemoryConfig state byte count must fit signed int32")
     if persistent_bytes > _UINT32_MAX:
         raise ValueError("persistent memory allocation exceeds uint32 byte accounting")
+    for name, scalars in (
+        ("query key-distance work", config.capacity * config.key_dim),
+        ("query observation gather", config.top_k * config.observation_dim),
+        ("query key gather", config.top_k * config.key_dim),
+        ("query action gather", config.top_k * config.action_dim),
+        ("query outcome gather", config.top_k * config.outcome_dim),
+        ("query gathered payload", config.top_k * vector_values),
+        ("query neighbor diagnostics", 7 * config.top_k),
+    ):
+        _require_float32_allocation(f"ExperientialMemoryConfig {name}", scalars)
 
     object.__setattr__(
         config,
@@ -369,13 +385,20 @@ def _validate_config(config: ExperientialMemoryConfig) -> None:
             "eviction_recency_weight", config.eviction_recency_weight, lower=0
         ),
     )
-    if config.eviction_utility_weight + config.eviction_recency_weight <= 0.0:
+    utility_weight_f32 = float(np.asarray(config.eviction_utility_weight, dtype=np.float32))
+    recency_weight_f32 = float(np.asarray(config.eviction_recency_weight, dtype=np.float32))
+    if utility_weight_f32 + recency_weight_f32 <= 0.0:
         raise ValueError("at least one eviction retention weight must be positive")
     object.__setattr__(
         config,
         "recency_scale",
         _validated_config_float("recency_scale", config.recency_scale, positive=True),
     )
+    minimum_safe_scale = _INT32_MAX / float(np.finfo(np.float32).max)
+    if config.staleness_scale < minimum_safe_scale:
+        raise ValueError("staleness_scale must keep saturated age division finite in float32")
+    if config.recency_scale < minimum_safe_scale:
+        raise ValueError("recency_scale must keep saturated age division finite in float32")
 
 def _saturating_increment(value: Array) -> Array:
     maximum_minus_one = jnp.asarray(_INT32_MAX - 1, dtype=jnp.int32)
@@ -1134,10 +1157,14 @@ class ExperientialMemory:
                 current_entries.utilities,
                 0.0,
             )
+            utility_weight = jnp.asarray(cfg.eviction_utility_weight, dtype=jnp.float32)
+            recency_weight = jnp.asarray(cfg.eviction_recency_weight, dtype=jnp.float32)
+            # These weights are relative. Normalization preserves ordering and
+            # prevents finite configured weights from overflowing their products.
+            weight_scale = jnp.maximum(utility_weight, recency_weight)
             retention_score = (
-                jnp.asarray(cfg.eviction_utility_weight, dtype=jnp.float32)
-                * eviction_utilities
-                + jnp.asarray(cfg.eviction_recency_weight, dtype=jnp.float32) * recency_score
+                utility_weight / weight_scale * eviction_utilities
+                + recency_weight / weight_scale * recency_score
             )
             retention_score = jnp.where(current_entries.valid, retention_score, jnp.inf)
             eviction_slot = jnp.argmin(retention_score)
