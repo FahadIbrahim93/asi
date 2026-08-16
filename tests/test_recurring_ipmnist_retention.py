@@ -281,6 +281,22 @@ def test_sentinel_probes_at_different_checkpoints_must_use_distinct_frozen_state
         )
 
 
+@pytest.mark.parametrize(
+    ("field", "message"),
+    [
+        ("sentinel_set_sha256", "A and B must bind distinct sentinel set digests"),
+        ("sentinel_set_id", "A and B must bind distinct sentinel set identities"),
+    ],
+)
+def test_protocol_rejects_a_and_b_sharing_one_sentinel_set(field: str, message: str) -> None:
+    """Distinct permutations transform the sentinel inputs, so shared sets cannot be genuine."""
+    protocol = _protocol()
+    a_binding, b_binding = protocol.sentinel_bindings
+    shared = dataclasses.replace(b_binding, **{field: getattr(a_binding, field)})
+    with pytest.raises(ValueError, match=f"^{message}$"):
+        dataclasses.replace(protocol, sentinel_bindings=(a_binding, shared))
+
+
 def test_report_is_explicitly_threshold_free_development_only_and_nonpromoting() -> None:
     protocol = _protocol()
     report = build_recurring_ipmnist_retention_report(
