@@ -177,7 +177,7 @@ def init_cbp_state(
         mlp_state: An initialized :class:`MultiHeadMLPState`. Used only
             to validate that ``hidden_sizes`` matches the trunk shape.
         hidden_sizes: Hidden layer sizes from the learner constructor.
-            Must match ``len(mlp_state.trunk_params.weights)``.
+            Must match the trunk layer count and every layer's width.
         key: JAX random key for replacement weight sampling.
 
     Returns:
@@ -191,6 +191,14 @@ def init_cbp_state(
             f"count ({len(mlp_state.trunk_params.weights)})."
         )
         raise ValueError(msg)
+    for layer_idx, (width, weight) in enumerate(
+        zip(hidden_sizes, mlp_state.trunk_params.weights, strict=True)
+    ):
+        if int(weight.shape[0]) != int(width):
+            raise ValueError(
+                f"hidden_sizes[{layer_idx}]={width} does not match trunk layer "
+                f"{layer_idx} width ({weight.shape[0]})"
+            )
 
     utilities = tuple(
         jnp.zeros(h, dtype=jnp.float32) for h in hidden_sizes
