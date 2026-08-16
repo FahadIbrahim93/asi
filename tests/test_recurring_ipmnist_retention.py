@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 
+import numpy as np
 import pytest
 
 from alberta_framework.evaluation.recurring_ipmnist_retention import (
@@ -114,8 +115,7 @@ def _snapshots(
             requirement,
             learner_state_sha256_before=state_hash,
             learner_state_sha256_after=state_hash,
-            correctness=(True,) * count
-            + (False,) * (requirement.sentinel_case_count - count),
+            correctness=(True,) * count + (False,) * (requirement.sentinel_case_count - count),
         )
         for requirement, count, state_hash in zip(
             protocol.required_probe_snapshots,
@@ -167,9 +167,7 @@ def test_protocol_binds_aba_identity_exposures_and_keeps_trace_task_id_free() ->
         "pre_update_online_accuracy",
         "post_update_one_step_plasticity",
     )
-    assert tuple(
-        (phase.permutation_id, phase.exposure_index) for phase in protocol.phases
-    ) == (
+    assert tuple((phase.permutation_id, phase.exposure_index) for phase in protocol.phases) == (
         ("permutation-a.v1", 0),
         ("permutation-b.v1", 0),
         ("permutation-a.v1", 1),
@@ -320,3 +318,47 @@ def test_trace_requires_binary_pre_update_outcomes(bad_accuracy: float) -> None:
             pre_update_online_accuracy=(bad_accuracy,),
             post_update_one_step_plasticity=(0.2,),
         )
+
+
+def test_recurring_ipmnist_dataclasses_reject_booleans_and_non_integers() -> None:
+    with pytest.raises(ValueError, match="phase_index"):
+        RecurringIPMNISTPhase(
+            phase_index=True,  # type: ignore[arg-type]
+            start_step=0,
+            length=4,
+            permutation_id="permutation-a.v1",
+            exposure_index=0,
+        )
+    with pytest.raises(ValueError, match="sentinel_case_count"):
+        SentinelProbeBinding(
+            permutation_id="permutation-a.v1",
+            permutation_sha256=_sha("a"),
+            sentinel_set_id="sentinel-a.v1",
+            sentinel_set_sha256=_sha("2"),
+            sentinel_case_count=2.5,  # type: ignore[arg-type]
+        )
+
+
+def test_recurring_ipmnist_dataclasses_accept_and_canonicalize_numpy_integers() -> None:
+    binding = SentinelProbeBinding(
+        permutation_id="permutation-a.v1",
+        permutation_sha256=_sha("a"),
+        sentinel_set_id="sentinel-a.v1",
+        sentinel_set_sha256=_sha("2"),
+        sentinel_case_count=np.int32(4),
+    )
+    assert type(binding.sentinel_case_count) is int
+    assert binding.sentinel_case_count == 4
+
+    phase = RecurringIPMNISTPhase(
+        phase_index=np.int32(0),
+        start_step=np.int64(0),
+        length=np.uint16(4),
+        permutation_id="permutation-a.v1",
+        exposure_index=np.uint8(0),
+    )
+    assert type(phase.phase_index) is int
+    assert type(phase.start_step) is int
+    assert type(phase.length) is int
+    assert type(phase.exposure_index) is int
+    assert phase.length == 4

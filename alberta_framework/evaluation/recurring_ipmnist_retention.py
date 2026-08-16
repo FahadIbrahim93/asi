@@ -28,8 +28,12 @@ import dataclasses
 import hashlib
 import json
 import math
+import operator
 import re
 from collections.abc import Mapping, Sequence
+from typing import SupportsIndex, cast
+
+import numpy as np
 
 RECURRING_IPMNIST_PROTOCOL_SCHEMA = "alberta.recurring-ipmnist-retention.protocol.v1"
 RECURRING_IPMNIST_TRACE_SCHEMA = "alberta.recurring-ipmnist-retention.trace.v1"
@@ -61,9 +65,7 @@ METRIC_DEFINITIONS: Mapping[str, str] = {
     "peak_to_revisit_forgetting": (
         "non-negative peak sentinel accuracy before revisit minus the pre-revisit score"
     ),
-    "revisit_recovery": (
-        "revisit-end sentinel accuracy minus pre-revisit sentinel accuracy"
-    ),
+    "revisit_recovery": ("revisit-end sentinel accuracy minus pre-revisit sentinel accuracy"),
     "relearning_savings_mistakes": (
         "first-exposure leading-window mistakes minus revisit leading-window mistakes"
     ),
@@ -104,17 +106,40 @@ def _sha256(value: object, *, name: str) -> str:
     return value
 
 
-def _nonnegative_int(value: object, *, name: str) -> int:
-    if type(value) is not int or value < 0:
-        raise ValueError(f"{name} must be a non-negative integer")
-    return value
+_INT32_MAX = 2**31 - 1
+_ACTUAL_INT_TYPES = frozenset(
+    {
+        int,
+        np.int8,
+        np.int16,
+        np.int32,
+        np.int64,
+        np.uint8,
+        np.uint16,
+        np.uint32,
+        np.uint64,
+        np.longlong,
+        np.ulonglong,
+    }
+)
 
 
-def _positive_int(value: object, *, name: str) -> int:
-    result = _nonnegative_int(value, name=name)
-    if result == 0:
-        raise ValueError(f"{name} must be positive")
-    return result
+def _nonnegative_int(value: object, *, name: str, maximum: int = _INT32_MAX) -> int:
+    if type(value) not in _ACTUAL_INT_TYPES:
+        raise ValueError(f"{name} must be a non-negative integer in [0, {maximum}]")
+    canonical = operator.index(cast(SupportsIndex, value))
+    if not 0 <= canonical <= maximum:
+        raise ValueError(f"{name} must be a non-negative integer in [0, {maximum}]")
+    return canonical
+
+
+def _positive_int(value: object, *, name: str, maximum: int = _INT32_MAX) -> int:
+    if type(value) not in _ACTUAL_INT_TYPES:
+        raise ValueError(f"{name} must be a positive integer in [1, {maximum}]")
+    canonical = operator.index(cast(SupportsIndex, value))
+    if not 1 <= canonical <= maximum:
+        raise ValueError(f"{name} must be a positive integer in [1, {maximum}]")
+    return canonical
 
 
 def _unit_float(value: object, *, name: str, binary: bool = False) -> float:
@@ -161,7 +186,11 @@ class SentinelProbeBinding:
         _sha256(self.permutation_sha256, name="permutation_sha256")
         _identifier(self.sentinel_set_id, name="sentinel_set_id", versioned=True)
         _sha256(self.sentinel_set_sha256, name="sentinel_set_sha256")
-        _positive_int(self.sentinel_case_count, name="sentinel_case_count")
+        object.__setattr__(
+            self,
+            "sentinel_case_count",
+            _positive_int(self.sentinel_case_count, name="sentinel_case_count"),
+        )
 
     def to_config(self) -> dict[str, object]:
         return {
@@ -184,11 +213,27 @@ class RecurringIPMNISTPhase:
     exposure_index: int
 
     def __post_init__(self) -> None:
-        _nonnegative_int(self.phase_index, name="phase_index")
-        _nonnegative_int(self.start_step, name="start_step")
-        _positive_int(self.length, name="length")
+        object.__setattr__(
+            self,
+            "phase_index",
+            _nonnegative_int(self.phase_index, name="phase_index"),
+        )
+        object.__setattr__(
+            self,
+            "start_step",
+            _nonnegative_int(self.start_step, name="start_step"),
+        )
+        object.__setattr__(
+            self,
+            "length",
+            _positive_int(self.length, name="length"),
+        )
         _identifier(self.permutation_id, name="permutation_id", versioned=True)
-        _nonnegative_int(self.exposure_index, name="exposure_index")
+        object.__setattr__(
+            self,
+            "exposure_index",
+            _nonnegative_int(self.exposure_index, name="exposure_index"),
+        )
 
     @property
     def stop_step(self) -> int:
@@ -306,7 +351,11 @@ class RecurringIPMNISTProtocol:
         if len(set(sentinel_ids)) != len(sentinel_ids):
             raise ValueError("A and B must bind distinct sentinel set identities")
 
-        _positive_int(self.relearning_window, name="relearning_window")
+        object.__setattr__(
+            self,
+            "relearning_window",
+            _positive_int(self.relearning_window, name="relearning_window"),
+        )
         if self.relearning_window > self.phases[0].length:
             raise ValueError("relearning_window cannot exceed either equal-length A phase")
 
@@ -359,9 +408,7 @@ class RecurringIPMNISTProtocol:
             "evaluator_only_fields": list(EVALUATOR_ONLY_FIELDS),
             "protocol_id": self.protocol_id,
             "phases": [phase.to_config() for phase in self.phases],
-            "sentinel_bindings": [
-                binding.to_config() for binding in self.sentinel_bindings
-            ],
+            "sentinel_bindings": [binding.to_config() for binding in self.sentinel_bindings],
             "required_probe_snapshots": [
                 requirement.to_config() for requirement in self.required_probe_snapshots
             ],
@@ -389,9 +436,7 @@ class RecurringIPMNISTTrace:
             raise TypeError("post_update_one_step_plasticity must be an exact tuple")
         if not self.pre_update_online_accuracy:
             raise ValueError("the online trace must be non-empty")
-        if len(self.pre_update_online_accuracy) != len(
-            self.post_update_one_step_plasticity
-        ):
+        if len(self.pre_update_online_accuracy) != len(self.post_update_one_step_plasticity):
             raise ValueError("accuracy and plasticity traces must have equal length")
         for index, value in enumerate(self.pre_update_online_accuracy):
             _unit_float(value, name=f"pre_update_online_accuracy[{index}]", binary=True)
@@ -404,9 +449,7 @@ class RecurringIPMNISTTrace:
             "ordering": "predict-before-update",
             "learner_visible_fields": list(LEARNER_VISIBLE_TRACE_FIELDS),
             "pre_update_online_accuracy": list(self.pre_update_online_accuracy),
-            "post_update_one_step_plasticity": list(
-                self.post_update_one_step_plasticity
-            ),
+            "post_update_one_step_plasticity": list(self.post_update_one_step_plasticity),
         }
 
 
@@ -617,26 +660,20 @@ def _validate_sentinel_snapshots(
     resolved = tuple(snapshots)
     expected = protocol.required_probe_snapshots
     if len(resolved) != len(expected):
-        raise ValueError(
-            "sentinel snapshots must appear once each in the exact required order"
-        )
+        raise ValueError("sentinel snapshots must appear once each in the exact required order")
     checkpoint_states: dict[int, str] = {}
     for index, (snapshot, requirement) in enumerate(zip(resolved, expected, strict=True)):
         if type(snapshot) is not SentinelProbeSnapshot:
             raise TypeError(f"sentinel_snapshots[{index}] must be SentinelProbeSnapshot")
         if snapshot.ordering_key != requirement.ordering_key:
-            raise ValueError(
-                "sentinel snapshots must appear once each in the exact required order"
-            )
+            raise ValueError("sentinel snapshots must appear once each in the exact required order")
         if snapshot.frozen_binding != requirement.frozen_binding:
             if len(snapshot.correctness) != requirement.sentinel_case_count:
                 raise ValueError(
                     f"sentinel snapshot {index} correctness case count does not match "
                     "its frozen requirement"
                 )
-            raise ValueError(
-                f"sentinel snapshot {index} does not match its frozen requirement"
-            )
+            raise ValueError(f"sentinel snapshot {index} does not match its frozen requirement")
         prior_state = checkpoint_states.setdefault(
             snapshot.checkpoint_step,
             snapshot.learner_state_sha256_before,
@@ -662,9 +699,7 @@ def _phase_summaries(
     summaries: list[PhaseOnlineSummary] = []
     for phase in protocol.phases:
         accuracies = trace.pre_update_online_accuracy[phase.start_step : phase.stop_step]
-        plasticities = trace.post_update_one_step_plasticity[
-            phase.start_step : phase.stop_step
-        ]
+        plasticities = trace.post_update_one_step_plasticity[phase.start_step : phase.stop_step]
         summaries.append(
             PhaseOnlineSummary(
                 phase_index=phase.phase_index,
@@ -778,9 +813,7 @@ def build_recurring_ipmnist_retention_report(
         protocol=protocol,
         protocol_sha256=_digest(protocol.to_config()),
         trace_sha256=_digest(trace.to_config()),
-        sentinel_snapshots_sha256=_digest(
-            [snapshot.to_config() for snapshot in snapshots]
-        ),
+        sentinel_snapshots_sha256=_digest([snapshot.to_config() for snapshot in snapshots]),
         phase_summaries=_phase_summaries(protocol, trace),
         sentinel_scores=_sentinel_scores(snapshots),
         recurrence=_recurrence_metrics(protocol, trace, snapshots),
