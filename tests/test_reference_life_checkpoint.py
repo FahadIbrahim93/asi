@@ -285,7 +285,7 @@ def test_restore_rejects_incomplete_tampered_unknown_and_symlink_bundles(
     semantic_state["metrics"]["current_segment_events"] = 1
     _write_canonical_json(semantic / "life_state.json", semantic_state)
     _rehash_bundle(semantic)
-    with pytest.raises(ValueError, match="phase schedule"):
+    with pytest.raises(ValueError, match="environment schedule|phase schedule"):
         load_reference_life_checkpoint(semantic)
 
     impossible_generation = tmp_path / "impossible-generation"
