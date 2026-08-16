@@ -53,6 +53,7 @@ from alberta_framework.steps._float32_validation import (
 
 Step4OptimizerName = Literal["lms", "idbd", "autostep"]
 Step4BounderName = Literal["none", "obgd"]
+_INT32_MAX = 2**31 - 1
 _FLOAT32_MIN_NORMAL = float.fromhex("0x1.0p-126")
 
 
@@ -176,6 +177,8 @@ def _require_positive_int(name: str, value: object) -> int:
     number = int(value)
     if number < 1:
         raise ValueError(f"{name} must be positive, got {value!r}")
+    if number > _INT32_MAX:
+        raise ValueError(f"{name} must be at most int32 max, got {value!r}")
     return number
 
 
@@ -185,6 +188,8 @@ def _require_nonneg_int(name: str, value: object) -> int:
     number = int(value)
     if number < 0:
         raise ValueError(f"{name} must be a non-negative integer, got {value!r}")
+    if number > _INT32_MAX:
+        raise ValueError(f"{name} must be at most int32 max, got {value!r}")
     return number
 
 
