@@ -5,7 +5,10 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from alberta_framework.core.experiential_memory import ExperientialMemoryConfig
+from alberta_framework.core.experiential_memory import (
+    ExperientialMemory,
+    ExperientialMemoryConfig,
+)
 
 _INT32_MAX = 2**31 - 1
 
@@ -209,7 +212,10 @@ def test_experiential_float_validators_reject_nonfinite_and_hostile() -> None:
 
 def test_experiential_float_validators_reject_hostile_ratio() -> None:
     class HostileFloat(float):
+        calls = 0
+
         def as_integer_ratio(self) -> tuple[int, int]:  # pragma: no cover
+            type(self).calls += 1
             raise RuntimeError("ratio hook")
 
     with pytest.raises(ValueError, match="distance_scale"):
@@ -221,6 +227,7 @@ def test_experiential_float_validators_reject_hostile_ratio() -> None:
             outcome_dim=1,
             distance_scale=HostileFloat(1.0),  # type: ignore[arg-type]
         )
+    assert HostileFloat.calls == 0
 
 
 def test_experiential_eviction_weights_require_positive_sum() -> None:
@@ -307,3 +314,28 @@ def test_experiential_state_preflight_bytes_without_allocation() -> None:
             outcome_dim=1,
         )
 
+
+def test_experiential_memory_exact_serialized_boundaries() -> None:
+    config = ExperientialMemoryConfig(
+        capacity=4,
+        observation_dim=2,
+        key_dim=2,
+        action_dim=1,
+        outcome_dim=1,
+    )
+    payload = config.to_config()
+
+    class HostileDict(dict[str, object]):
+        def __iter__(self):
+            raise AssertionError("iteration must not run")
+
+    with pytest.raises(ValueError, match="exact built-in dict"):
+        ExperientialMemoryConfig.from_config(HostileDict(payload))
+    with pytest.raises(ValueError, match="serialized schema"):
+        ExperientialMemoryConfig.from_config({**payload, "extra": 1})
+    with pytest.raises(ValueError, match="config type"):
+        ExperientialMemoryConfig.from_config({**payload, "type": "wrong"})
+
+    outer = ExperientialMemory(config).to_config()
+    with pytest.raises(ValueError, match="nested config"):
+        ExperientialMemory.from_config({**outer, "config": HostileDict(payload)})

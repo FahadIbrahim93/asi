@@ -46,6 +46,9 @@ _ACTUAL_INT_TYPES = frozenset(
           for code in ("b", "B", "h", "H", "i", "I", "l", "L", "q", "Q")),
     }
 )
+_ACTUAL_FLOAT_TYPES = frozenset(
+    {float, *(np.dtype(code).type for code in ("e", "f", "d", "g"))}
+)
 _FLOAT32_TINY = float.fromhex("0x1.000000p-126")
 _MIN_KERNEL_WIDTH = float.fromhex("0x1.000000p-63")
 _MAX_KERNEL_WIDTH = float.fromhex("0x1.fffffep+63")
@@ -80,6 +83,8 @@ def _normalized_positive_float32(
 ) -> float:
     """Return one operation-safe exact-host and float32 scalar."""
     message = f"{name} must be positive and finite in float32 arithmetic"
+    if type(value) not in (_ACTUAL_INT_TYPES | _ACTUAL_FLOAT_TYPES):
+        raise ValueError(message)
     try:
         return validated_float32_scalar(
             name,
@@ -111,6 +116,7 @@ class SIGRegConfig:
     def __post_init__(self) -> None:
         """Validate the configuration."""
         n_projections = _require_int32("n_projections", self.n_projections, minimum=1)
+        _require_float32_resource("SIGReg directions", n_projections)
         kernel_width = _normalized_positive_float32(
             "kernel_width",
             self.kernel_width,
@@ -133,7 +139,12 @@ class SIGRegConfig:
         if type(config) is not dict:
             raise ValueError("SIGRegConfig must be an actual dict")
         payload = dict(config)
-        if set(payload) != {"type", "n_projections", "kernel_width", "eps"}:
+        if any(type(key) is not str for key in payload) or set(payload) != {
+            "type",
+            "n_projections",
+            "kernel_width",
+            "eps",
+        }:
             raise ValueError("SIGRegConfig fields do not match its schema")
         type_name = payload.pop("type")
         if type(type_name) is not str or type_name != "SIGRegConfig":

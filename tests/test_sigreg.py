@@ -73,7 +73,7 @@ def test_sigreg_config_schema_is_exact() -> None:
         SIGRegConfig.from_config({**payload, "type": "wrong"})
 
 
-def test_sigreg_config_float_hooks_fail_closed_once() -> None:
+def test_sigreg_config_float_hooks_are_not_run() -> None:
     class HostileFloat(float):
         calls = 0
 
@@ -86,13 +86,15 @@ def test_sigreg_config_float_hooks_fail_closed_once() -> None:
 
     with pytest.raises(ValueError, match="kernel_width"):
         SIGRegConfig(kernel_width=HostileFloat(1.0))
-    assert HostileFloat.calls == 1
+    assert HostileFloat.calls == 0
 
 
 def test_sigreg_preflights_direction_and_pairwise_resources_without_allocating() -> None:
-    config = SIGRegConfig(n_projections=(2**31 - 1) // 4 + 1)
     with pytest.raises(ValueError, match="directions"):
-        sample_sigreg_directions(jr.key(0), 1, config)
+        SIGRegConfig(n_projections=(2**31 - 1) // 4 + 1)
+    config = SIGRegConfig(n_projections=2)
+    with pytest.raises(ValueError, match="directions"):
+        sample_sigreg_directions(jr.key(0), (2**31 - 1) // 4, config)
 
     samples = jnp.zeros((23_171,), dtype=jnp.float32)
     with pytest.raises(ValueError, match="pairwise workspace"):

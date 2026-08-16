@@ -43,6 +43,9 @@ _ACTUAL_INT_TYPES = frozenset(
         np.ulonglong,
     }
 )
+_ACTUAL_FLOAT_TYPES = frozenset(
+    {float, *(np.dtype(code).type for code in ("e", "f", "d", "g"))}
+)
 
 
 def _require_int32(name: str, value: object, *, minimum: int, maximum: int = _INT32_MAX) -> int:
@@ -60,6 +63,12 @@ def _preflight_state_resources(feature_dim: int) -> None:
         raise ValueError("reward-model state scalars must fit signed int32")
     if 4 * state_scalars > _INT32_MAX:
         raise ValueError("reward-model state bytes must fit signed int32")
+
+
+def _validated_config_float(name: str, value: object, **bounds: Any) -> float:
+    if type(value) not in (_ACTUAL_INT_TYPES | _ACTUAL_FLOAT_TYPES):
+        raise ValueError(f"{name} must be a finite real scalar")
+    return validated_float32_scalar(name, value, **bounds)
 
 
 def _skip_zero_scale(scale: Array, value: Array) -> Array:
@@ -89,11 +98,11 @@ class RLSRewardModelConfig:
     def __post_init__(self) -> None:
         feature_dim = _require_int32("feature_dim", self.feature_dim, minimum=1)
         _preflight_state_resources(feature_dim)
-        forgetting = validated_float32_scalar(
+        forgetting = _validated_config_float(
             "forgetting", self.forgetting, positive=True, upper=1.0
         )
-        ridge = validated_float32_scalar("ridge", self.ridge, positive=True)
-        error_decay = validated_float32_scalar(
+        ridge = _validated_config_float("ridge", self.ridge, positive=True)
+        error_decay = _validated_config_float(
             "error_decay", self.error_decay, lower=0.0, upper=1.0, upper_inclusive=False
         )
 
@@ -115,8 +124,15 @@ class RLSRewardModelConfig:
     @classmethod
     def from_config(cls, payload: dict[str, Any]) -> RLSRewardModelConfig:
         """Reconstruct from :meth:`to_config` output."""
+        if type(payload) is not dict:
+            raise ValueError("payload must be an exact built-in dict")
+        expected = {"type", "feature_dim", "forgetting", "ridge", "error_decay"}
+        if any(type(key) is not str for key in payload) or set(payload) != expected:
+            raise ValueError("payload fields do not match the serialized schema")
+        if type(payload["type"]) is not str or payload["type"] != "RLSRewardModelConfig":
+            raise ValueError("payload type differs")
         data = dict(payload)
-        data.pop("type", None)
+        data.pop("type")
         return cls(**data)
 
 
@@ -171,9 +187,15 @@ class RLSRewardModel:
     @classmethod
     def from_config(cls, payload: dict[str, Any]) -> RLSRewardModel:
         """Reconstruct from :meth:`to_config` output."""
-        data = dict(payload)
-        data.pop("type", None)
-        return cls(RLSRewardModelConfig.from_config(data["config"]))
+        if type(payload) is not dict:
+            raise ValueError("payload must be an exact built-in dict")
+        if any(type(key) is not str for key in payload) or set(payload) != {"type", "config"}:
+            raise ValueError("payload fields do not match the serialized schema")
+        if type(payload["type"]) is not str or payload["type"] != "RLSRewardModel":
+            raise ValueError("payload type differs")
+        if type(payload["config"]) is not dict:
+            raise ValueError("payload config must be an exact built-in dict")
+        return cls(RLSRewardModelConfig.from_config(payload["config"]))
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def init(self) -> RLSRewardModelState:

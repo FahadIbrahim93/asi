@@ -24,9 +24,8 @@ References:
 from __future__ import annotations
 
 import functools
-import math
 import operator
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from typing import Any, SupportsIndex, cast
 
 import chex
@@ -53,6 +52,9 @@ _ACTUAL_INT_TYPES: tuple[type, ...] = (
     np.uint64,
     np.longlong,
     np.ulonglong,
+)
+_ACTUAL_FLOAT_TYPES = frozenset(
+    {float, *(np.dtype(code).type for code in ("e", "f", "d", "g"))}
 )
 
 @dataclass(frozen=True)
@@ -118,13 +120,16 @@ class ExperientialMemoryConfig:
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> ExperientialMemoryConfig:
         """Reconstruct and validate a configuration dictionary."""
+        if type(config) is not dict:
+            raise ValueError("config must be an exact built-in dict")
+        expected = {field.name for field in fields(cls)} | {"type"}
+        if any(type(key) is not str for key in config) or set(config) != expected:
+            raise ValueError("config fields do not match the serialized schema")
+        if type(config["type"]) is not str or config["type"] != "ExperientialMemoryConfig":
+            raise ValueError("config type differs")
         payload = dict(config)
-        type_name = payload.pop("type", None)
-        if type_name not in {None, "ExperientialMemoryConfig"}:
-            raise ValueError(f"unexpected config type: {type_name!r}")
-        result = cls(**payload)
-        _validate_config(result)
-        return result
+        payload.pop("type")
+        return cls(**payload)
 
 @chex.dataclass(frozen=True)
 class ExperientialMemoryEntry:
@@ -275,24 +280,10 @@ def _require_nonnegative_int(name: str, value: object) -> int:
         raise ValueError(f"{name} must be an integer in [0, {_INT32_MAX}]")
     return number
 
-def _require_float32_resource(
-    name: str,
-    *,
-    vector_scalars: int,
-    fixed_scalars: int = 0,
-) -> None:
-    total_scalars = vector_scalars + fixed_scalars
-    if total_scalars > _INT32_MAX:
-        raise ValueError(f"{name} scalar count must fit signed int32")
-    if 4 * total_scalars > _INT32_MAX:
-        raise ValueError(f"{name} byte count must fit signed int32")
-
-
-def _validate_finite(name: str, value: float) -> None:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError(f"{name} must be a real number")
-    if not math.isfinite(value):
-        raise ValueError(f"{name} must be finite")
+def _validated_config_float(name: str, value: object, **bounds: Any) -> float:
+    if type(value) not in (frozenset(_ACTUAL_INT_TYPES) | _ACTUAL_FLOAT_TYPES):
+        raise ValueError(f"{name} must be a finite real scalar")
+    return validated_float32_scalar(name, value, **bounds)
 
 def _validate_config(config: ExperientialMemoryConfig) -> None:
     for name in (
@@ -318,12 +309,10 @@ def _validate_config(config: ExperientialMemoryConfig) -> None:
     )
     if vector_values > _INT32_MAX:
         raise ValueError("ExperientialMemoryConfig dimensions must fit signed int32")
-    _require_float32_resource(
-        "ExperientialMemoryConfig state",
-        vector_scalars=config.capacity * vector_values,
-        fixed_scalars=config.capacity * 11 + 8,
-    )
+    logical_scalars = config.capacity * (vector_values + 15) + 8
     persistent_bytes = config.capacity * (4 * (vector_values + 11) + 4) + 32
+    if logical_scalars > _INT32_MAX:
+        raise ValueError("ExperientialMemoryConfig state scalar count must fit signed int32")
     if persistent_bytes > _INT32_MAX:
         raise ValueError("ExperientialMemoryConfig state byte count must fit signed int32")
     if persistent_bytes > _UINT32_MAX:
@@ -332,51 +321,51 @@ def _validate_config(config: ExperientialMemoryConfig) -> None:
     object.__setattr__(
         config,
         "distance_scale",
-        validated_float32_scalar("distance_scale", config.distance_scale, positive=True),
+        _validated_config_float("distance_scale", config.distance_scale, positive=True),
     )
     object.__setattr__(
         config,
         "min_similarity",
-        validated_float32_scalar("min_similarity", config.min_similarity, lower=0, upper=1),
+        _validated_config_float("min_similarity", config.min_similarity, lower=0, upper=1),
     )
     object.__setattr__(
         config,
         "min_effective_reliability",
-        validated_float32_scalar(
+        _validated_config_float(
             "min_effective_reliability", config.min_effective_reliability, positive=True, upper=1
         ),
     )
     object.__setattr__(
         config,
         "max_uncertainty",
-        validated_float32_scalar("max_uncertainty", config.max_uncertainty, lower=0),
+        _validated_config_float("max_uncertainty", config.max_uncertainty, lower=0),
     )
     object.__setattr__(
         config,
         "max_safety_cost",
-        validated_float32_scalar("max_safety_cost", config.max_safety_cost, lower=0),
+        _validated_config_float("max_safety_cost", config.max_safety_cost, lower=0),
     )
     object.__setattr__(
         config,
         "staleness_scale",
-        validated_float32_scalar("staleness_scale", config.staleness_scale, positive=True),
+        _validated_config_float("staleness_scale", config.staleness_scale, positive=True),
     )
     object.__setattr__(
         config,
         "utility_decay",
-        validated_float32_scalar("utility_decay", config.utility_decay, lower=0, upper=1),
+        _validated_config_float("utility_decay", config.utility_decay, lower=0, upper=1),
     )
     object.__setattr__(
         config,
         "eviction_utility_weight",
-        validated_float32_scalar(
+        _validated_config_float(
             "eviction_utility_weight", config.eviction_utility_weight, lower=0
         ),
     )
     object.__setattr__(
         config,
         "eviction_recency_weight",
-        validated_float32_scalar(
+        _validated_config_float(
             "eviction_recency_weight", config.eviction_recency_weight, lower=0
         ),
     )
@@ -385,7 +374,7 @@ def _validate_config(config: ExperientialMemoryConfig) -> None:
     object.__setattr__(
         config,
         "recency_scale",
-        validated_float32_scalar("recency_scale", config.recency_scale, positive=True),
+        _validated_config_float("recency_scale", config.recency_scale, positive=True),
     )
 
 def _saturating_increment(value: Array) -> Array:
@@ -463,8 +452,14 @@ class ExperientialMemory:
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> ExperientialMemory:
         """Reconstruct a memory from :meth:`to_config` output."""
-        if config.get("type") not in {None, "ExperientialMemory"}:
-            raise ValueError(f"unexpected memory type: {config.get('type')!r}")
+        if type(config) is not dict:
+            raise ValueError("config must be an exact built-in dict")
+        if any(type(key) is not str for key in config) or set(config) != {"type", "config"}:
+            raise ValueError("config fields do not match the serialized schema")
+        if type(config["type"]) is not str or config["type"] != "ExperientialMemory":
+            raise ValueError("config type differs")
+        if type(config["config"]) is not dict:
+            raise ValueError("nested config must be an exact built-in dict")
         inner = cast(dict[str, Any], config["config"])
         return cls(ExperientialMemoryConfig.from_config(inner))
 

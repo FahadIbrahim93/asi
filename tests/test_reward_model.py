@@ -291,6 +291,32 @@ def test_rls_reward_model_config_rejects_hostile_integer_types_without_repr() ->
             RLSRewardModelConfig(feature_dim=value)  # type: ignore[arg-type]
 
 
+def test_reward_model_exact_schema_and_hostile_float_hooks() -> None:
+    config = RLSRewardModelConfig(feature_dim=4)
+    payload = config.to_config()
+
+    class HostileDict(dict[str, object]):
+        def __iter__(self):
+            raise AssertionError("iteration must not run")
+
+    class HostileFloat(float):
+        def as_integer_ratio(self) -> tuple[int, int]:
+            raise AssertionError("ratio must not run")
+
+        def __repr__(self) -> str:
+            raise AssertionError("repr must not run")
+
+    with pytest.raises(ValueError, match="exact built-in dict"):
+        RLSRewardModelConfig.from_config(HostileDict(payload))
+    with pytest.raises(ValueError, match="serialized schema"):
+        RLSRewardModelConfig.from_config({**payload, "extra": 1})
+    with pytest.raises(ValueError, match="payload type"):
+        RLSRewardModelConfig.from_config({**payload, "type": "wrong"})
+    for field in ("forgetting", "ridge", "error_decay"):
+        with pytest.raises(ValueError, match=field):
+            RLSRewardModelConfig(feature_dim=1, **{field: HostileFloat(0.5)})
+
+
 def test_rls_reward_model_preflights_quadratic_state_before_allocation() -> None:
     scalar_limit = (2**31 - 1) // 4
     last_legal = (math.isqrt(1 + 4 * (scalar_limit - 2)) - 1) // 2
