@@ -82,13 +82,20 @@ class Step5AverageRewardTDConfig:
             raise ValueError("average_reward_step_size must be non-negative")
         if not 0.0 <= self.trace_decay <= 1.0:
             raise ValueError("trace_decay must be in [0, 1]")
-        object.__setattr__(self, "step_size", step_size)
-        object.__setattr__(
-            self,
-            "average_reward_step_size",
-            average_reward_step_size,
-        )
-        object.__setattr__(self, "trace_decay", trace_decay)
+        # Preserve the exact built-in JSON scalar values accepted by the
+        # existing facade. Non-built-in Real scalars need canonicalization so
+        # persistence remains JSON-safe and the stored value exactly matches
+        # the float32 value validated above.
+        if type(self.step_size) not in (int, float):
+            object.__setattr__(self, "step_size", step_size)
+        if type(self.average_reward_step_size) not in (int, float):
+            object.__setattr__(
+                self,
+                "average_reward_step_size",
+                average_reward_step_size,
+            )
+        if type(self.trace_decay) not in (int, float):
+            object.__setattr__(self, "trace_decay", trace_decay)
 
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-serializable representation."""

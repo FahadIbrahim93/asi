@@ -50,9 +50,9 @@ def test_step5_facade_config_roundtrip_and_smoke() -> None:
 
     assert restored == config
     assert config.to_dict() == {
-        "step_size": float(np.float32(0.03)),
-        "average_reward_step_size": float(np.float32(0.02)),
-        "trace_decay": float(np.float32(0.25)),
+        "step_size": 0.03,
+        "average_reward_step_size": 0.02,
+        "trace_decay": 0.25,
     }
     assert learner.config.trace_decay == 0.25
     assert result.finite
