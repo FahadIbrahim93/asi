@@ -232,7 +232,7 @@ def feature_to_subtask_specs(
     obs_dim = int(opt_q.shape[-1])
     opt_importance = jnp.max(opt_q_abs.reshape(-1, obs_dim), axis=0)  # (obs_dim,)
 
-    combined = feature_importance + opt_importance
+    combined = jnp.maximum(feature_importance, opt_importance)
     n = min(normalized_n_subtasks, obs_dim)
     ranking = sorted(range(obs_dim), key=lambda i: float(combined[i]), reverse=True)[:n]
 
