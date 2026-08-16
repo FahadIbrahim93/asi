@@ -65,9 +65,13 @@ class TestConfig:
         "step_size",
         [
             1,
+            np.int8(1),
+            np.int64(1),
+            np.uint64(1),
+            np.float16(0.5),
             np.float32(0.5),
             np.float64(0.5),
-            np.int64(1),
+            np.longdouble(0.5),
             Fraction(1, 2),
         ],
     )
@@ -143,6 +147,56 @@ class TestConfig:
 
         with pytest.raises(ValueError, match="step_size"):
             _simple_config(step_size=NegativeSpoof())
+
+    @pytest.mark.parametrize("serialized", [False, True], ids=("direct", "from-config"))
+    def test_step_size_rejects_numeric_subclasses_before_conversion_hooks(
+        self, serialized: bool
+    ) -> None:
+        calls: list[str] = []
+
+        class RatioSpoof(float):
+            def __new__(cls) -> "RatioSpoof":
+                return super().__new__(cls, -0.25)
+
+            def as_integer_ratio(self) -> tuple[int, int]:
+                calls.append("ratio")
+                return (1, 4)
+
+        class IntegerSpoof(int):
+            def __new__(cls) -> "IntegerSpoof":
+                return super().__new__(cls, -1)
+
+            def __int__(self) -> int:
+                calls.append("int")
+                return 1
+
+        class FractionSpoof(Fraction):
+            def as_integer_ratio(self) -> tuple[int, int]:
+                calls.append("fraction-ratio")
+                return (1, 4)
+
+        class ExplodingRatio(float):
+            def as_integer_ratio(self) -> tuple[int, int]:
+                calls.append("exploding")
+                raise RuntimeError("conversion hook must not run")
+
+        for step_size in (
+            RatioSpoof(),
+            IntegerSpoof(),
+            FractionSpoof(-1, 4),
+            ExplodingRatio(0.25),
+        ):
+            with pytest.raises(ValueError, match="step_size"):
+                if serialized:
+                    payload = _simple_config().to_config()
+                    payload["step_size"] = step_size
+                    StackedLinearHorde.from_config(
+                        {"type": "StackedLinearHorde", "config": payload}
+                    )
+                else:
+                    _simple_config(step_size=step_size)
+
+        assert calls == []
 
     @pytest.mark.parametrize(
         "step_size",

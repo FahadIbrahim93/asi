@@ -38,12 +38,14 @@ the NaN-masking convention of the loop-based hordes.
 
 import math
 from dataclasses import dataclass
+from fractions import Fraction
 from numbers import Real
 from typing import Any, cast
 
 import chex
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import Array
 from jaxtyping import Bool, Float
 
@@ -59,6 +61,25 @@ __all__ = [
 
 _FLOAT32_MIN_NORMAL = float.fromhex("0x1.0p-126")
 _STEP_SIZE_ERROR = "step_size must be positive"
+_NUMPY_STEP_SIZE_TYPES = frozenset(
+    np.dtype(dtype_code).type
+    for dtype_code in (
+        "b",
+        "B",
+        "h",
+        "H",
+        "i",
+        "I",
+        "l",
+        "L",
+        "q",
+        "Q",
+        "e",
+        "f",
+        "d",
+        "g",
+    )
+)
 
 
 def _require_positive_normal_float32_step_size(value: object) -> float:
@@ -66,13 +87,15 @@ def _require_positive_normal_float32_step_size(value: object) -> float:
 
     JAX CPU execution flushes float32 subnormals to zero, so accepting a
     positive host value whose binary32 sink is zero or subnormal can create a
-    Horde that reports applied updates while its weights never move.  The
-    exact-ratio conversion also prevents overloaded host comparisons from
-    hiding a negative value and avoids double-rounding third-party reals.
+    Horde that reports applied updates while its weights never move. Only
+    exact trusted scalar families are admitted, so user subclasses are
+    refused before conversion hooks can run. Exact-ratio conversion prevents
+    overloaded host comparisons from hiding a negative value and avoids
+    double-rounding supported third-party reals.
     """
-    actual_type = type(value)
-    preserve_builtin_float = actual_type is float
-    if issubclass(actual_type, bool) or not issubclass(actual_type, Real):
+    value_type = type(value)
+    preserve_builtin_float = value_type is float
+    if value_type not in (int, float, Fraction) and value_type not in _NUMPY_STEP_SIZE_TYPES:
         raise ValueError(_STEP_SIZE_ERROR)
     real = cast(Real, value)
     try:
@@ -98,8 +121,8 @@ class StackedHordeConfig:
         cumulant_indices: Per-demon index into the cumulant-source vector
             handed to :meth:`StackedLinearHorde.update`.
         step_size: Shared TD step-size alpha. Its float32 execution value must
-            be finite, positive, and normal; accepted non-builtin reals are
-            canonicalized to a JSON-safe builtin float.
+            be finite, positive, and normal; accepted supported non-builtin
+            reals are canonicalized to a JSON-safe builtin float.
     """
 
     n_demons: int
