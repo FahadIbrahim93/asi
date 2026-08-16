@@ -25,6 +25,7 @@ from alberta_framework.steps import (
     make_step2_hybrid_learner,
     make_step2_learner,
     make_step2_memory_learner,
+    make_step2_stream,
     make_step2_strict_digit_readout_learner,
     make_step2_temporal_context,
     make_step2_temporal_learner,
@@ -34,6 +35,8 @@ from alberta_framework.steps import (
 
 # The module is ~40 seconds serial on the supported development environment.
 pytestmark = pytest.mark.slow
+
+_INT32_MAX = int(np.iinfo(np.int32).max)
 
 
 def test_step1_kernel_factory_and_smoke_are_finite() -> None:
@@ -151,17 +154,20 @@ _INVALID_STEP2_KERNEL_FIELDS: tuple[tuple[str, Any], ...] = (
     ("feature_dim", float("nan")),
     ("feature_dim", float("inf")),
     ("feature_dim", None),
+    ("feature_dim", _INT32_MAX + 1),
     ("n_heads", 0),
     ("n_heads", -1),
     ("n_heads", True),
     ("n_heads", False),
     ("n_heads", "3"),
     ("n_heads", None),
+    ("n_heads", _INT32_MAX + 1),
     ("hidden_sizes", [32]),
     ("hidden_sizes", (0,)),
     ("hidden_sizes", (-1,)),
     ("hidden_sizes", (True,)),
     ("hidden_sizes", (32.5,)),
+    ("hidden_sizes", (_INT32_MAX + 1,)),
     ("stream", "unknown_stream"),
     ("readout_mode", "unknown_mode"),
     ("step_size", float("nan")),
@@ -179,6 +185,7 @@ _INVALID_STEP2_KERNEL_FIELDS: tuple[tuple[str, Any], ...] = (
     ("context_length", False),
     ("context_length", "128"),
     ("context_length", None),
+    ("context_length", _INT32_MAX + 1),
     ("noise_std", float("nan")),
     ("noise_std", float("inf")),
     ("noise_std", True),
@@ -200,6 +207,7 @@ _INVALID_STEP2_MEMORY_FIELDS: tuple[tuple[str, Any], ...] = (
     ("feature_dim", False),
     ("feature_dim", "784"),
     ("feature_dim", None),
+    ("feature_dim", _INT32_MAX + 1),
     ("n_classes", 1),
     ("n_classes", 0),
     ("n_classes", -1),
@@ -207,12 +215,14 @@ _INVALID_STEP2_MEMORY_FIELDS: tuple[tuple[str, Any], ...] = (
     ("n_classes", False),
     ("n_classes", "10"),
     ("n_classes", None),
+    ("n_classes", _INT32_MAX + 1),
     ("slots_per_class", 0),
     ("slots_per_class", -1),
     ("slots_per_class", True),
     ("slots_per_class", False),
     ("slots_per_class", "20"),
     ("slots_per_class", None),
+    ("slots_per_class", _INT32_MAX + 1),
     ("update_rate", float("nan")),
     ("update_rate", float("inf")),
     ("update_rate", True),
@@ -359,12 +369,28 @@ def test_step2_configs_use_direct_float32_narrowing_without_double_rounding() ->
     ("field", "value"),
     [
         ("n_heads", 0),
+        ("n_heads", -1),
         ("n_heads", True),
+        ("n_heads", False),
+        ("n_heads", "10"),
+        ("n_heads", 10.5),
+        ("n_heads", None),
+        ("n_heads", _INT32_MAX + 1),
         ("hidden_sizes", [8]),
         ("hidden_sizes", (0,)),
+        ("hidden_sizes", (-1,)),
         ("hidden_sizes", (False,)),
+        ("hidden_sizes", (8.5,)),
+        ("hidden_sizes", (_INT32_MAX + 1,)),
         ("step_size", float("nan")),
+        ("step_size", float("inf")),
+        ("step_size", float("-inf")),
+        ("step_size", True),
+        ("step_size", False),
+        ("step_size", -1.0),
         ("step_size", 3.5e38),
+        ("step_size", "0.018"),
+        ("step_size", None),
         ("step_size", jnp.asarray(0.25)),
     ],
 )
@@ -374,6 +400,85 @@ def test_step2_strict_digit_config_rejects_malformed_fields(
 ) -> None:
     with pytest.raises(ValueError, match=field):
         Step2StrictDigitReadoutConfig(**{field: value})
+
+
+@pytest.mark.parametrize(
+    ("config_type", "field"),
+    [
+        (Step2KernelConfig, "step_size"),
+        (Step2KernelConfig, "noise_std"),
+        (Step2StrictDigitReadoutConfig, "step_size"),
+        (Step2MemoryConfig, "update_rate"),
+        (Step2MemoryConfig, "novelty_threshold"),
+        (Step2MemoryConfig, "bandwidth"),
+    ],
+)
+def test_step2_real_conversion_overflow_is_a_value_error(
+    config_type: type[Any],
+    field: str,
+) -> None:
+    with pytest.raises(ValueError, match=field):
+        config_type(**{field: Fraction(10**1000, 1)})
+
+
+def test_step2_integer_fields_accept_int32_maximum() -> None:
+    kernel = Step2KernelConfig(
+        feature_dim=_INT32_MAX,
+        n_heads=_INT32_MAX,
+        hidden_sizes=(_INT32_MAX,),
+        stream="frequency",
+        context_length=_INT32_MAX,
+    )
+    strict = Step2StrictDigitReadoutConfig(
+        n_heads=_INT32_MAX,
+        hidden_sizes=(_INT32_MAX,),
+    )
+    memory = Step2MemoryConfig(
+        feature_dim=_INT32_MAX,
+        n_classes=_INT32_MAX,
+        slots_per_class=_INT32_MAX,
+    )
+
+    assert kernel.feature_dim == _INT32_MAX
+    assert kernel.n_heads == _INT32_MAX
+    assert kernel.hidden_sizes == (_INT32_MAX,)
+    assert kernel.context_length == _INT32_MAX
+    assert strict.n_heads == _INT32_MAX
+    assert strict.hidden_sizes == (_INT32_MAX,)
+    assert memory.feature_dim == _INT32_MAX
+    assert memory.n_classes == _INT32_MAX
+    assert memory.slots_per_class == _INT32_MAX
+
+
+def test_step2_context_length_int32_maximum_reaches_stream_step() -> None:
+    stream = make_step2_stream(Step2KernelConfig(context_length=_INT32_MAX))
+    state = stream.init(jr.key(0))
+
+    timestep, next_state = stream.step(state, jnp.asarray(0, dtype=jnp.int32))
+
+    assert timestep.observation.shape == (8,)
+    assert int(next_state.step_count) == 1
+
+
+def test_step2_strict_digit_config_canonical_json_roundtrip() -> None:
+    config = Step2StrictDigitReadoutConfig(
+        n_heads=np.int64(3),
+        hidden_sizes=(np.int64(8), np.int64(16)),
+        step_size=np.float64(0.018),
+    )
+
+    payload = json.loads(json.dumps(config.to_dict(), allow_nan=False))
+    restored = Step2StrictDigitReadoutConfig.from_dict(payload)
+
+    assert type(config.n_heads) is int
+    assert all(type(size) is int for size in config.hidden_sizes)
+    assert type(config.step_size) is float
+    assert payload == {
+        "n_heads": 3,
+        "hidden_sizes": [8, 16],
+        "step_size": float(np.float32(0.018)),
+    }
+    assert restored == config
 
 
 @pytest.mark.parametrize(

@@ -101,6 +101,7 @@ _STEP2_MEMORY_CONFIG_KEYS = frozenset(
         "bandwidth",
     }
 )
+_INT32_MAX = int(np.iinfo(np.int32).max)
 
 
 def _require_exact_keys(
@@ -165,32 +166,43 @@ def _require_int(
     value: object,
     *,
     minimum: int | None = None,
-    exclusive_maximum: int | None = None,
+    maximum: int | None = None,
 ) -> int:
     if isinstance(value, bool) or not isinstance(value, Integral):
         raise ValueError(f"{name} must be an integer, got {value!r}")
-    number = int(value)
+    try:
+        number = int(value)
+    except (OverflowError, TypeError, ValueError):
+        raise ValueError(f"{name} must be an integer, got {value!r}") from None
     if minimum is not None and number < minimum:
         if minimum == 1:
             raise ValueError(f"{name} must be positive, got {value!r}")
         if minimum == 0:
             raise ValueError(f"{name} must be non-negative, got {value!r}")
         raise ValueError(f"{name} must be >= {minimum}, got {value!r}")
-    if exclusive_maximum is not None and number >= exclusive_maximum:
-        raise ValueError(f"{name} must be smaller than int32 max, got {value!r}")
+    if maximum is not None and number > maximum:
+        raise ValueError(f"{name} must be <= {maximum}, got {value!r}")
     return number
 
 
 def _validate_step2_kernel_config(config: Step2KernelConfig) -> None:
-    feature_dim = _require_int("feature_dim", config.feature_dim, minimum=1)
-    n_heads = _require_int("n_heads", config.n_heads, minimum=1)
+    feature_dim = _require_int(
+        "feature_dim", config.feature_dim, minimum=1, maximum=_INT32_MAX
+    )
+    n_heads = _require_int(
+        "n_heads", config.n_heads, minimum=1, maximum=_INT32_MAX
+    )
     if not isinstance(config.hidden_sizes, tuple):
         raise ValueError(
             f"hidden_sizes must be a tuple of integers, got {config.hidden_sizes!r}"
         )
     canonical_hidden: list[int] = []
     for h in config.hidden_sizes:
-        canonical_hidden.append(_require_int("hidden_sizes element", h, minimum=1))
+        canonical_hidden.append(
+            _require_int(
+                "hidden_sizes element", h, minimum=1, maximum=_INT32_MAX
+            )
+        )
     if not isinstance(config.stream, str) or config.stream not in _VALID_STEP2_STREAMS:
         raise ValueError(
             f"unknown Step 2 stream field {config.stream!r}; "
@@ -215,7 +227,12 @@ def _validate_step2_kernel_config(config: Step2KernelConfig) -> None:
             f"expected one of {sorted(_VALID_STEP2_LOSS_NORMALIZATIONS)}"
         )
     step_size = _require_nonnegative_real("step_size", config.step_size)
-    context_length = _require_int("context_length", config.context_length, minimum=1)
+    context_length = _require_int(
+        "context_length",
+        config.context_length,
+        minimum=1,
+        maximum=_INT32_MAX,
+    )
     noise_std = _require_nonnegative_real("noise_std", config.noise_std)
     object.__setattr__(config, "feature_dim", feature_dim)
     object.__setattr__(config, "n_heads", n_heads)
@@ -226,14 +243,20 @@ def _validate_step2_kernel_config(config: Step2KernelConfig) -> None:
 
 
 def _validate_step2_strict_digit_config(config: Step2StrictDigitReadoutConfig) -> None:
-    n_heads = _require_int("n_heads", config.n_heads, minimum=1)
+    n_heads = _require_int(
+        "n_heads", config.n_heads, minimum=1, maximum=_INT32_MAX
+    )
     if not isinstance(config.hidden_sizes, tuple):
         raise ValueError(
             f"hidden_sizes must be a tuple of integers, got {config.hidden_sizes!r}"
         )
     canonical_hidden: list[int] = []
     for h in config.hidden_sizes:
-        canonical_hidden.append(_require_int("hidden_sizes element", h, minimum=1))
+        canonical_hidden.append(
+            _require_int(
+                "hidden_sizes element", h, minimum=1, maximum=_INT32_MAX
+            )
+        )
     step_size = _require_nonnegative_real("step_size", config.step_size)
     object.__setattr__(config, "n_heads", n_heads)
     object.__setattr__(config, "hidden_sizes", tuple(canonical_hidden))
@@ -253,9 +276,18 @@ def _require_half_open_unit_interval(name: str, value: object) -> float:
 
 
 def _validate_step2_memory_config(config: Step2MemoryConfig) -> None:
-    feature_dim = _require_int("feature_dim", config.feature_dim, minimum=1)
-    n_classes = _require_int("n_classes", config.n_classes, minimum=2)
-    slots_per_class = _require_int("slots_per_class", config.slots_per_class, minimum=1)
+    feature_dim = _require_int(
+        "feature_dim", config.feature_dim, minimum=1, maximum=_INT32_MAX
+    )
+    n_classes = _require_int(
+        "n_classes", config.n_classes, minimum=2, maximum=_INT32_MAX
+    )
+    slots_per_class = _require_int(
+        "slots_per_class",
+        config.slots_per_class,
+        minimum=1,
+        maximum=_INT32_MAX,
+    )
     update_rate = _require_half_open_unit_interval("update_rate", config.update_rate)
     novelty_threshold = _require_nonnegative_real(
         "novelty_threshold",
