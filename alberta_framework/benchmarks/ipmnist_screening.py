@@ -8393,7 +8393,12 @@ def merge_shards(
     control_name: str = "upgd_w_control",
     slope_window: int = 15,
 ) -> dict[str, Any]:
-    """Merge shards into a ranked screening summary with paired comparisons."""
+    """Merge shards into a ranked screening summary with paired comparisons.
+
+    Every config must carry exactly the same seed set. The headline ranking
+    and every comparison against the control are therefore computed over the
+    same paired runs; an incomplete worker batch is rejected before ranking.
+    """
     normalized_paths = [Path(path) for path in paths]
     input_bindings = _artifact_file_bindings(
         normalized_paths, context="screening shard input"
@@ -8461,11 +8466,31 @@ def merge_shards(
             f"(present: {sorted(by_config)}); a summary without its control "
             "would silently carry no paired_vs_control blocks"
         )
+    for name, per_seed in sorted(by_config.items()):
+        _validate_screening_arm_contract(name, per_seed)
     control = by_config[control_name]
+    control_seeds = sorted(control)
+    for name, per_seed in sorted(by_config.items()):
+        seeds = sorted(per_seed)
+        if name != control_name and not any(seed in control for seed in seeds):
+            raise ValueError(
+                f"config {name!r} shares no seeds with control {control_name!r} "
+                f"(seeds {seeds} vs {control_seeds}); refusing to rank an "
+                "unpaired entry in the summary"
+            )
+    seed_sets = {
+        name: tuple(sorted(per_seed))
+        for name, per_seed in sorted(by_config.items())
+    }
+    if len(set(seed_sets.values())) != 1:
+        raise ValueError(
+            f"seed sets differ across configs: {seed_sets}; "
+            "merge_shards ranks configs on paired seeds only"
+        )
+
     entries: list[dict[str, Any]] = []
     for name, per_seed in sorted(by_config.items()):
         seeds = sorted(per_seed)
-        _validate_screening_arm_contract(name, per_seed)
         wall_clock_total = _finite_wall_clock_total(
             [per_seed[s]["wall_clock_seconds"] for s in seeds],
             context=f"config {name!r}",
@@ -8501,16 +8526,6 @@ def merge_shards(
             "wall_clock_seconds_total": round(wall_clock_total, 2),
         }
         common = [s for s in seeds if s in control]
-        if name != control_name and not common:
-            # Every comparison in this campaign is paired on shared seeds; an
-            # arm with no seed in common with the control would still rank in
-            # the summary by raw mean with no paired_vs_control block and
-            # nothing marking it unpaired (issue #49).  Refuse instead.
-            raise ValueError(
-                f"config {name!r} shares no seeds with control {control_name!r} "
-                f"(seeds {seeds} vs {sorted(control)}); refusing to rank an "
-                "unpaired entry in the summary"
-            )
         if name != control_name and common:
             control_avg = np.asarray(
                 [
