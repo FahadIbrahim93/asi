@@ -501,6 +501,68 @@ def test_step6_exact_ratio_is_read_once() -> None:
     assert config.q_step_size == 0.5
 
 
+def test_step6_class_spoof_cannot_bypass_exact_ratio_dispatch() -> None:
+    class IntegralSpoofFloat(float):
+        calls = 0
+
+        @property
+        def __class__(self) -> type[int]:
+            return int
+
+        def as_integer_ratio(self) -> tuple[int, int]:
+            type(self).calls += 1
+            return (-1, 2**200)
+
+    with pytest.raises(ValueError, match="q_step_size"):
+        Step6DifferentialSARSAConfig(q_step_size=IntegralSpoofFloat(0.5))
+    assert IntegralSpoofFloat.calls == 1
+
+
+@pytest.mark.parametrize("field", ["n_actions", "epsilon_decay_steps"])
+def test_step6_integer_fields_reject_class_spoof(field: str) -> None:
+    class IntegerSpoof:
+        @property
+        def __class__(self) -> type[int]:
+            return int
+
+        def __int__(self) -> int:
+            return 2
+
+    with pytest.raises(ValueError, match=field):
+        Step6DifferentialSARSAConfig(**{field: IntegerSpoof()})
+
+
+@pytest.mark.parametrize(
+    "config_type",
+    [
+        pytest.param(Step7DynaConfig, id="step7"),
+        pytest.param(Step9DreamingConfig, id="step9"),
+    ],
+)
+def test_nested_step6_payload_refuses_integral_class_spoof(
+    config_type: type[Step7DynaConfig] | type[Step9DreamingConfig],
+) -> None:
+    class IntegralSpoofFloat(float):
+        calls = 0
+
+        @property
+        def __class__(self) -> type[int]:
+            return int
+
+        def as_integer_ratio(self) -> tuple[int, int]:
+            type(self).calls += 1
+            return (-1, 2**200)
+
+    payload = config_type().to_dict()
+    control = payload["control"]
+    assert isinstance(control, dict)
+    control["q_step_size"] = IntegralSpoofFloat(0.5)
+
+    with pytest.raises(ValueError, match="q_step_size"):
+        config_type.from_dict(payload)
+    assert IntegralSpoofFloat.calls == 1
+
+
 def test_step6_builtin_float_serialization_and_signed_zero_are_preserved() -> None:
     config = Step6DifferentialSARSAConfig(
         q_step_size=0.1,

@@ -5,6 +5,13 @@ from __future__ import annotations
 import math
 import struct
 from numbers import Integral, Real
+from typing import cast
+
+
+def _is_actual_integral(value: object) -> bool:
+    """Return whether the runtime type is a non-bool Integral subtype."""
+    actual_type = type(value)
+    return not issubclass(actual_type, bool) and issubclass(actual_type, Integral)
 
 
 def _round_quotient_ties_to_even(numerator: int, denominator: int) -> int:
@@ -82,25 +89,25 @@ def _real_ratio(value: Real) -> tuple[int, int, bool]:
     actual_type = type(value)
     if issubclass(actual_type, bool) or not issubclass(actual_type, Real):
         raise TypeError("value must be an actual non-bool real")
-    if isinstance(value, Integral):
-        ratio: object = (int(value), 1)
+    if _is_actual_integral(value):
+        ratio: object = (int(cast(Integral, value)), 1)
     else:
         ratio_method = getattr(value, "as_integer_ratio", None)
         if not callable(ratio_method):
             raise TypeError("real value must expose as_integer_ratio")
         ratio = ratio_method()
-    if not isinstance(ratio, tuple) or len(ratio) != 2:
+    if not issubclass(type(ratio), tuple):
         raise TypeError("as_integer_ratio must return an integer pair")
-    numerator_raw, denominator_raw = ratio
-    if (
-        isinstance(numerator_raw, bool)
-        or not isinstance(numerator_raw, Integral)
-        or isinstance(denominator_raw, bool)
-        or not isinstance(denominator_raw, Integral)
+    ratio_tuple = cast(tuple[object, ...], ratio)
+    if len(ratio_tuple) != 2:
+        raise TypeError("as_integer_ratio must return an integer pair")
+    numerator_raw, denominator_raw = ratio_tuple
+    if not _is_actual_integral(numerator_raw) or not _is_actual_integral(
+        denominator_raw
     ):
         raise TypeError("as_integer_ratio must return an integer pair")
-    numerator = int(numerator_raw)
-    denominator = int(denominator_raw)
+    numerator = int(cast(Integral, numerator_raw))
+    denominator = int(cast(Integral, denominator_raw))
     if denominator < 0:
         numerator = -numerator
         denominator = -denominator
