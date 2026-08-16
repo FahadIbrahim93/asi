@@ -375,7 +375,7 @@ def compute_running_mean(
     and are ``NaN`` (not yet computable; see the module docstring's
     NaN-for-"not evaluated" convention), rather than being backdated with a
     later window's mean. If the input is shorter than ``window_size``, no
-    window is ever complete and the input is returned unchanged.
+    window is ever complete and every returned position is ``NaN``.
 
     Args:
         values: Array of values
@@ -385,7 +385,15 @@ def compute_running_mean(
         Array of running mean values (same length as input), with ``NaN``
         wherever a complete trailing window is not yet available.
     """
-    values_arr = np.asarray(values)
+    if type(window_size) is not int:
+        raise ValueError("window_size must be a built-in int")
+    if window_size < 1:
+        raise ValueError("window_size must be positive")
+
+    values_arr = np.asarray(values, dtype=np.float64)
+    if len(values_arr) < window_size:
+        return np.full(values_arr.shape, np.nan, dtype=np.float64)
+
     cumsum = np.cumsum(np.insert(values_arr, 0, 0))
     running_mean = (cumsum[window_size:] - cumsum[:-window_size]) / window_size
 
@@ -394,7 +402,7 @@ def compute_running_mean(
     if len(running_mean) > 0:
         padding = np.full(window_size - 1, np.nan)
         return np.concatenate([padding, running_mean])
-    return values_arr
+    return np.full(values_arr.shape, np.nan, dtype=np.float64)
 
 
 def compute_tracking_error(

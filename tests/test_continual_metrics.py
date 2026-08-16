@@ -227,12 +227,12 @@ def test_running_mean_exact_window_length_has_one_valid_entry() -> None:
     np.testing.assert_allclose(result[2:], [2.0])
 
 
-def test_running_mean_shorter_than_window_is_returned_unchanged() -> None:
-    """Documented short-input fallback is unaffected by the padding fix."""
+def test_running_mean_shorter_than_window_has_no_computable_values() -> None:
+    result = compute_running_mean([2, 4], window_size=3)
 
-    result = compute_running_mean([2.0, 4.0], window_size=3)
-
-    np.testing.assert_array_equal(result, [2.0, 4.0])
+    assert result.shape == (2,)
+    assert result.dtype == np.float64
+    assert np.all(np.isnan(result))
 
 
 def test_tracking_error_inherits_the_causal_running_mean_fix() -> None:
@@ -242,3 +242,19 @@ def test_tracking_error_inherits_the_causal_running_mean_fix() -> None:
 
     assert np.all(np.isnan(result[:2]))
     np.testing.assert_allclose(result[2:], [1.0, 2.0, 3.0, 4.0])
+
+
+def test_tracking_error_shorter_than_window_has_no_computable_values() -> None:
+    result = compute_tracking_error(
+        [{"squared_error": 2.0}, {"squared_error": 4.0}],
+        window_size=3,
+    )
+
+    assert result.shape == (2,)
+    assert np.all(np.isnan(result))
+
+
+@pytest.mark.parametrize("window_size", [True, False, np.int64(3), 3.0, 0, -1])
+def test_running_mean_rejects_invalid_window_size(window_size: object) -> None:
+    with pytest.raises(ValueError, match="window_size"):
+        compute_running_mean([1.0, 2.0, 3.0], window_size=window_size)  # type: ignore[arg-type]
