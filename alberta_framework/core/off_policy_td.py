@@ -70,6 +70,11 @@ def _skip_zero_scale(scale: Array, value: Array) -> Array:
     """Return 0 when ``scale`` is 0 so a 0*inf product cannot form."""
     return jnp.where(scale == 0.0, jnp.zeros_like(value), scale * value)
 
+
+def _zero_if_unused(scale: Array, value: Array) -> Array:
+    """Sanitize leftover inf only in the finite-state check when unused."""
+    return jnp.where(scale == 0.0, jnp.zeros_like(value), value)
+
 # =============================================================================
 # State / result types
 # =============================================================================
@@ -365,10 +370,26 @@ class OffPolicyTDLinearLearner:
             & jnp.isfinite(gamma_s)
             & jnp.isfinite(rho_s)
         )
+        previous_checked = state.replace(  # type: ignore[attr-defined]
+            eligibility_traces=_zero_if_unused(decay, state.eligibility_traces),
+            bias_eligibility_trace=_zero_if_unused(decay, state.bias_eligibility_trace),
+        )
         update_applied = (
             inputs_valid
-            & _floating_tree_is_finite(state)
+            & _floating_tree_is_finite(previous_checked)
             & _floating_tree_is_finite(proposed_state)
+        )
+        new_state = jax.lax.cond(
+            update_applied,
+            lambda: proposed_state,
+            lambda: state,
+        )
+
+        squared_td = td_error**2
+        mean_e = jnp.mean(jnp.abs(new_state.eligibility_traces))
+        metrics = jnp.array(
+            [squared_td, td_error, rho_clipped, alpha, mean_e],
+            dtype=jnp.float32,
         )
         new_state = jax.lax.cond(
             update_applied,
@@ -518,7 +539,9 @@ class ETDLinearLearner:
         td_error = reward_s + _skip_zero_scale(gamma_s, v_next) - v_t
 
         follow_on = rho_s * _skip_zero_scale(gamma_s, state.follow_on_trace) + interest_s
-        emphasis = lam * interest_s + (1.0 - lam) * follow_on
+        emphasis = _skip_zero_scale(lam, interest_s) + _skip_zero_scale(
+            1.0 - lam, follow_on
+        )
 
         trace_decay = gamma_s * lam
         new_e = rho_s * (
@@ -547,9 +570,16 @@ class ETDLinearLearner:
             & jnp.isfinite(rho_s)
             & jnp.isfinite(interest_s)
         )
+        previous_checked = state.replace(  # type: ignore[attr-defined]
+            eligibility_traces=_zero_if_unused(trace_decay, state.eligibility_traces),
+            bias_eligibility_trace=_zero_if_unused(
+                trace_decay, state.bias_eligibility_trace
+            ),
+            follow_on_trace=_zero_if_unused(gamma_s, state.follow_on_trace),
+        )
         update_applied = (
             inputs_valid
-            & _floating_tree_is_finite(state)
+            & _floating_tree_is_finite(previous_checked)
             & _floating_tree_is_finite(proposed_state)
         )
         new_state = jax.lax.cond(
@@ -742,9 +772,14 @@ class GradientTDLinearLearner:
             & jnp.isfinite(gamma_s)
             & jnp.isfinite(rho_s)
         )
+        previous_checked = state.replace(  # type: ignore[attr-defined]
+            eligibility_traces=_zero_if_unused(
+                gamma_s * lam, state.eligibility_traces
+            ),
+        )
         update_applied = (
             inputs_valid
-            & _floating_tree_is_finite(state)
+            & _floating_tree_is_finite(previous_checked)
             & _floating_tree_is_finite(proposed_state)
         )
         new_state = jax.lax.cond(
