@@ -70,7 +70,11 @@ def _preflight_export_results(
                 f"AggregatedResults {name!r} must contain requested metric {metric!r} "
                 "in both metric_arrays and summary"
             )
-
+        if set(aggregate.metric_arrays) != set(aggregate.summary):
+            raise ValueError(
+                f"AggregatedResults {name!r} metric_arrays and summary must contain "
+                "the same metric names"
+            )
         for metric_name, values in aggregate.metric_arrays.items():
             qualified_name = f"AggregatedResults {name!r} metric {metric_name!r}"
             if values.ndim != 2:
