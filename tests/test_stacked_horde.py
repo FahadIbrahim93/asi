@@ -198,6 +198,77 @@ class TestConfig:
 
         assert calls == []
 
+    @pytest.mark.parametrize("component", ["numerator", "denominator"])
+    @pytest.mark.parametrize("serialized", [False, True], ids=("direct", "from-config"))
+    def test_step_size_rejects_hooks_laundered_through_an_exact_fraction(
+        self, serialized: bool, component: str
+    ) -> None:
+        calls: list[str] = []
+
+        class IntegerSpoof(int):
+            def __int__(self) -> int:
+                calls.append("int")
+                return 1
+
+        class Carrier(Fraction):
+            @property
+            def numerator(self) -> int:
+                return IntegerSpoof(-1) if component == "numerator" else 1
+
+            @property
+            def denominator(self) -> int:
+                return IntegerSpoof(-4) if component == "denominator" else 4
+
+        step_size = Fraction(Carrier(1, 4))
+        assert type(step_size) is Fraction
+        assert step_size.numerator < 0 or step_size.denominator < 0
+
+        with pytest.raises(ValueError, match="step_size"):
+            if serialized:
+                payload = _simple_config().to_config()
+                payload["step_size"] = step_size
+                StackedLinearHorde.from_config(
+                    {"type": "StackedLinearHorde", "config": payload}
+                )
+            else:
+                _simple_config(step_size=step_size)
+
+        assert calls == []
+
+    @pytest.mark.parametrize("serialized", [False, True], ids=("direct", "from-config"))
+    def test_step_size_rejects_exact_fraction_with_zero_denominator(
+        self, serialized: bool
+    ) -> None:
+        property_calls: list[str] = []
+
+        class Carrier(Fraction):
+            @property
+            def numerator(self) -> int:
+                property_calls.append("numerator")
+                return 1
+
+            @property
+            def denominator(self) -> int:
+                property_calls.append("denominator")
+                return 0
+
+        step_size = Fraction(Carrier(1, 1))
+        assert type(step_size) is Fraction
+        assert step_size.denominator == 0
+        calls_after_construction = tuple(property_calls)
+
+        with pytest.raises(ValueError, match="step_size"):
+            if serialized:
+                payload = _simple_config().to_config()
+                payload["step_size"] = step_size
+                StackedLinearHorde.from_config(
+                    {"type": "StackedLinearHorde", "config": payload}
+                )
+            else:
+                _simple_config(step_size=step_size)
+
+        assert tuple(property_calls) == calls_after_construction
+
     @pytest.mark.parametrize(
         "step_size",
         [1.0e100, Fraction(1, 2**149), Decimal("0.1"), jnp.asarray(0.1)],

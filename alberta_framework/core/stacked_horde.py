@@ -82,6 +82,19 @@ _NUMPY_STEP_SIZE_TYPES = frozenset(
 )
 
 
+def _snapshot_exact_fraction(value: Fraction) -> Fraction:
+    """Copy a structurally canonical exact Fraction without conversion hooks."""
+    numerator = value.numerator
+    denominator = value.denominator
+    if (
+        type(numerator) is not int
+        or type(denominator) is not int
+        or denominator <= 0
+    ):
+        raise ValueError(_STEP_SIZE_ERROR)
+    return Fraction(numerator, denominator)
+
+
 def _require_positive_normal_float32_step_size(value: object) -> float:
     """Return a JSON-safe scalar whose float32 execution value is usable.
 
@@ -89,15 +102,21 @@ def _require_positive_normal_float32_step_size(value: object) -> float:
     positive host value whose binary32 sink is zero or subnormal can create a
     Horde that reports applied updates while its weights never move. Only
     exact trusted scalar families are admitted, so user subclasses are
-    refused before conversion hooks can run. Exact-ratio conversion prevents
-    overloaded host comparisons from hiding a negative value and avoids
-    double-rounding supported third-party reals.
+    refused before conversion hooks can run. Exact Fractions additionally
+    require exact builtin-integer components and are copied before shared
+    conversion. Exact-ratio conversion prevents overloaded host comparisons
+    from hiding a negative value and avoids double-rounding supported
+    third-party reals.
     """
     value_type = type(value)
     preserve_builtin_float = value_type is float
     if value_type not in (int, float, Fraction) and value_type not in _NUMPY_STEP_SIZE_TYPES:
         raise ValueError(_STEP_SIZE_ERROR)
-    real = cast(Real, value)
+    real = (
+        _snapshot_exact_fraction(cast(Fraction, value))
+        if value_type is Fraction
+        else cast(Real, value)
+    )
     try:
         numerator, _, narrowed = round_real_to_float32_with_ratio(real)
     except (FloatingPointError, OverflowError, TypeError, ValueError):
