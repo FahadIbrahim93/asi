@@ -158,6 +158,12 @@ def aggregate_metrics(results: list[SingleRunResult]) -> AggregatedResults:
     seeds = [r.seed for r in results]
 
     # Get all metric keys from first result
+    if any(
+        not r.metrics_history
+        or any(set(metrics) != set(results[0].metrics_history[0]) for metrics in r.metrics_history)
+        for r in results
+    ):
+        raise ValueError("all runs must contain the same metric keys at every step")
     metric_keys = list(results[0].metrics_history[0].keys())
 
     # Build metric arrays: (n_seeds, n_steps)

@@ -269,6 +269,25 @@ def test_aggregate_metrics_rejects_nonfinite_samples() -> None:
         )
 
 
+def test_aggregate_metrics_rejects_metric_schema_drift_in_later_seed() -> None:
+    """A metric appearing in only one seed must not be silently discarded."""
+    with pytest.raises(ValueError, match="same metric keys"):
+        aggregate_metrics(
+            [
+                _single_run(0, [1.0, 2.0]),
+                SingleRunResult(
+                    config_name="candidate",
+                    seed=1,
+                    metrics_history=[
+                        {"squared_error": 3.0, "accuracy": 0.4},
+                        {"squared_error": 4.0, "accuracy": 0.8},
+                    ],
+                    final_state=LinearLearner().init(2),
+                ),
+            ]
+        )
+
+
 def test_get_metric_timeseries_rejects_nonfinite_samples() -> None:
     poisoned = _two_seed_trace()
     poisoned.metric_arrays["squared_error"][0, 1] = np.inf
