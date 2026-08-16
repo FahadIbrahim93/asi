@@ -171,6 +171,10 @@ from alberta_framework.core.world_model_ensemble import (
 PROTOTYPE_CHECKPOINT_SCHEMA = "alberta.prototype_agent.v3"
 _PROTOTYPE_CHECKPOINT_SCHEMA_V2 = "alberta.prototype_agent.v2"
 _PROTOTYPE_CHECKPOINT_SCHEMA_V1 = "alberta.prototype_agent.v1"
+_PROTOTYPE_EMPTY_ARRAY_CODEC_KEY = "empty_array_codec"
+_PROTOTYPE_EMPTY_ARRAY_CODEC = "alberta.prototype_agent.empty_array_projection.v1"
+_PROTOTYPE_PRNG_IMPL_KEY = "prng_impl"
+_PROTOTYPE_SUPPORTED_PRNG_IMPLS = frozenset({"threefry2x32", "rbg"})
 _DREAM_NEXT_OBSERVATION_STREAM_TAG = 0x44524D4F
 _PROTOTYPE_V2_REPLAY_MIGRATION_TAG = 0x50525632
 _PROTOTYPE_FEATURE_LIFECYCLE_KEY_TAG = 0x50464C43
@@ -7566,6 +7570,220 @@ def _prototype_config_digest(config: dict[str, Any]) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def _is_empty_array_leaf(value: Any) -> bool:
+    """Return whether ``value`` is a concrete array leaf with zero elements."""
+
+    shape = getattr(value, "shape", None)
+    dtype = getattr(value, "dtype", None)
+    size = getattr(value, "size", None)
+    return (
+        isinstance(shape, tuple)
+        and dtype is not None
+        and isinstance(size, int)
+        and size == 0
+    )
+
+
+def _empty_array_storage_sentinel(value: Any) -> Array:
+    """Create the deterministic nonempty storage value for one empty array."""
+
+    return jnp.zeros((1,), dtype=value.dtype)
+
+
+def _project_empty_array_leaves(state: PrototypeAgentState) -> PrototypeAgentState:
+    """Replace semantic empty arrays with Orbax-compatible storage sentinels."""
+
+    return cast(
+        PrototypeAgentState,
+        jax.tree.map(
+            lambda leaf: (
+                _empty_array_storage_sentinel(leaf)
+                if _is_empty_array_leaf(leaf)
+                else leaf
+            ),
+            state,
+        ),
+    )
+
+
+def _array_leaf_signature(value: Any) -> tuple[tuple[int, ...], Any] | None:
+    """Return a concrete array leaf's exact shape and dtype, if it has them."""
+
+    if not isinstance(value, jax.Array):
+        return None
+    shape = getattr(value, "shape", None)
+    dtype = getattr(value, "dtype", None)
+    if not isinstance(shape, tuple) or dtype is None:
+        return None
+    return cast(tuple[int, ...], shape), dtype
+
+
+def _validate_checkpoint_array_contract(
+    state: PrototypeAgentState,
+    canonical_template: PrototypeAgentState,
+) -> None:
+    """Require exact array identity, shape, and dtype against the config template."""
+
+    state_leaves, state_structure = jax.tree_util.tree_flatten(state)
+    template_leaves, template_structure = jax.tree_util.tree_flatten(
+        canonical_template
+    )
+    if cast(Any, state_structure) != template_structure or len(state_leaves) != len(
+        template_leaves
+    ):
+        raise ValueError(
+            "prototype checkpoint array contract does not match canonical template"
+        )
+
+    for state_leaf, template_leaf in zip(
+        state_leaves,
+        template_leaves,
+        strict=True,
+    ):
+        state_signature = _array_leaf_signature(state_leaf)
+        template_signature = _array_leaf_signature(template_leaf)
+        if (
+            state_signature is None
+            or template_signature is None
+            or state_signature != template_signature
+        ):
+            raise ValueError(
+                "prototype checkpoint array contract does not match canonical template"
+            )
+
+
+def _typed_prng_key_impl(value: Any) -> str | None:
+    """Return a typed JAX key's implementation, or ``None`` for non-keys."""
+
+    dtype = getattr(value, "dtype", None)
+    if dtype is None:
+        return None
+    try:
+        is_typed_key = jax.dtypes.issubdtype(dtype, jax.dtypes.prng_key)
+    except (TypeError, ValueError):
+        return None
+    if not is_typed_key:
+        return None
+    try:
+        return str(jr.key_impl(value))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("prototype state contains an invalid typed PRNG key") from exc
+
+
+def _prototype_state_prng_impl(state: PrototypeAgentState) -> str:
+    """Return the single supported implementation shared by every state key."""
+
+    implementations = {
+        implementation
+        for leaf in jax.tree_util.tree_leaves(state)
+        if (implementation := _typed_prng_key_impl(leaf)) is not None
+    }
+    if not implementations:
+        raise ValueError("prototype state does not contain a typed PRNG key")
+    if len(implementations) != 1:
+        raise ValueError("prototype state mixes PRNG implementations")
+    implementation = next(iter(implementations))
+    if implementation not in _PROTOTYPE_SUPPORTED_PRNG_IMPLS:
+        raise ValueError(
+            f"prototype state uses unsupported PRNG implementation {implementation!r}"
+        )
+    return implementation
+
+
+def _prototype_template_key_impl(key: Array) -> str:
+    """Validate one supported typed scalar key supplied as a restore hint."""
+
+    if getattr(key, "shape", None) != ():
+        raise ValueError("template_key must be a typed scalar JAX PRNG key")
+    implementation = _typed_prng_key_impl(key)
+    if implementation is None:
+        raise ValueError("template_key must be a typed scalar JAX PRNG key")
+    if implementation not in _PROTOTYPE_SUPPORTED_PRNG_IMPLS:
+        raise ValueError(
+            "template_key uses an unsupported PRNG implementation "
+            f"{implementation!r}"
+        )
+    return implementation
+
+
+def _prototype_checkpoint_lifecycle_id(key: Array) -> Array:
+    """Derive a stable two-word restore-template lifecycle from any key width."""
+
+    try:
+        session_key = jr.split(key, 7)[0]
+        key_words = jr.key_data(session_key).reshape((-1,))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("checkpoint template key is not a valid JAX PRNG key") from exc
+    if key_words.dtype != jnp.uint32 or key_words.size < 2:
+        raise ValueError("checkpoint template key must provide two uint32 words")
+    return key_words[:2]
+
+
+def _checkpoint_prng_impl(metadata: dict[str, Any], schema: Any) -> str | None:
+    """Validate optional v3 PRNG binding metadata for legacy compatibility."""
+
+    if _PROTOTYPE_PRNG_IMPL_KEY not in metadata:
+        return None
+    implementation = metadata.get(_PROTOTYPE_PRNG_IMPL_KEY)
+    if schema != PROTOTYPE_CHECKPOINT_SCHEMA:
+        raise ValueError("prototype PRNG implementation metadata is valid only for v3")
+    if (
+        type(implementation) is not str
+        or implementation not in _PROTOTYPE_SUPPORTED_PRNG_IMPLS
+    ):
+        raise ValueError("prototype checkpoint uses an unsupported PRNG implementation")
+    return implementation
+
+
+def _array_leaves_exactly_equal(left: Any, right: Any) -> bool:
+    """Compare concrete array leaves without coercing typed PRNG keys."""
+
+    if (
+        getattr(left, "shape", None) != getattr(right, "shape", None)
+        or getattr(left, "dtype", None) != getattr(right, "dtype", None)
+    ):
+        return False
+    dtype = getattr(left, "dtype", None)
+    if dtype is None:
+        return False
+    if jax.dtypes.issubdtype(dtype, jax.dtypes.prng_key):
+        return bool(jnp.array_equal(jr.key_data(left), jr.key_data(right)))
+    return bool(jnp.array_equal(left, right))
+
+
+def _restore_empty_array_leaves(
+    projected_state: PrototypeAgentState,
+    semantic_template: PrototypeAgentState,
+) -> PrototypeAgentState:
+    """Validate storage sentinels and restore exact semantic empty leaves."""
+
+    projected_leaves, projected_structure = jax.tree_util.tree_flatten(projected_state)
+    template_leaves, template_structure = jax.tree_util.tree_flatten(semantic_template)
+    if cast(Any, projected_structure) != template_structure or len(
+        projected_leaves
+    ) != len(template_leaves):
+        raise ValueError("prototype empty-array checkpoint structure is inconsistent")
+
+    semantic_leaves: list[Any] = []
+    for projected_leaf, template_leaf in zip(
+        projected_leaves,
+        template_leaves,
+        strict=True,
+    ):
+        if not _is_empty_array_leaf(template_leaf):
+            semantic_leaves.append(projected_leaf)
+            continue
+        expected = _empty_array_storage_sentinel(template_leaf)
+        if not _array_leaves_exactly_equal(projected_leaf, expected):
+            raise ValueError("prototype empty-array storage sentinel is inconsistent")
+        semantic_leaves.append(template_leaf)
+
+    return cast(
+        PrototypeAgentState,
+        jax.tree_util.tree_unflatten(template_structure, semantic_leaves),
+    )
+
+
 def save_prototype_checkpoint(
     agent: PrototypeAgent,
     state: PrototypeAgentState,
@@ -7573,22 +7791,33 @@ def save_prototype_checkpoint(
 ) -> None:
     """Persist the complete prototype config, PyTree state, and every RNG.
 
-    The generic checkpoint layer stores the state exactly as supplied.  This
-    wrapper adds the configuration needed to reconstruct a matching template
-    and a digest that makes accidental config/metadata edits fail closed.
+    This wrapper adds the configuration needed to reconstruct a matching
+    template, a digest that makes accidental config/metadata edits fail closed,
+    and a reversible storage projection for semantic empty arrays.
     """
 
+    prng_impl = _prototype_state_prng_impl(state)
+    canonical_key = jr.key(0, impl=prng_impl)
+    canonical_template = agent.init(
+        canonical_key,
+        lifecycle_id=_prototype_checkpoint_lifecycle_id(canonical_key),
+    )
+    if _prototype_state_prng_impl(canonical_template) != prng_impl:
+        raise ValueError("prototype config does not preserve its state PRNG implementation")
+    _validate_checkpoint_array_contract(state, canonical_template)
     if not bool(agent._checkpoint_state_valid(state)):
         raise ValueError("cannot save an inconsistent PrototypeAgent state")
 
     config = agent.to_config()
     save_checkpoint(
-        state,
+        _project_empty_array_leaves(state),
         path,
         metadata={
             "schema": PROTOTYPE_CHECKPOINT_SCHEMA,
             "agent_config": config,
             "config_sha256": _prototype_config_digest(config),
+            _PROTOTYPE_EMPTY_ARRAY_CODEC_KEY: _PROTOTYPE_EMPTY_ARRAY_CODEC,
+            _PROTOTYPE_PRNG_IMPL_KEY: prng_impl,
         },
     )
 
@@ -7622,6 +7851,15 @@ def load_prototype_checkpoint(
         raise ValueError(
             "checkpoint is not an Alberta PrototypeAgent v1/v2/v3 checkpoint"
         )
+    has_empty_array_codec = _PROTOTYPE_EMPTY_ARRAY_CODEC_KEY in metadata
+    empty_array_codec = metadata.get(_PROTOTYPE_EMPTY_ARRAY_CODEC_KEY)
+    if has_empty_array_codec and empty_array_codec != _PROTOTYPE_EMPTY_ARRAY_CODEC:
+        raise ValueError("prototype checkpoint uses an unknown empty-array codec")
+    if has_empty_array_codec and schema != PROTOTYPE_CHECKPOINT_SCHEMA:
+        raise ValueError("prototype empty-array codec is valid only for v3 checkpoints")
+    checkpoint_prng_impl = _checkpoint_prng_impl(metadata, schema)
+    if has_empty_array_codec and checkpoint_prng_impl is None:
+        raise ValueError("prototype checkpoint is missing PRNG implementation metadata")
     config = metadata.get("agent_config")
     if not isinstance(config, dict):
         raise ValueError("prototype checkpoint is missing agent_config")
@@ -7642,13 +7880,47 @@ def load_prototype_checkpoint(
             "prototype_feature_lifecycle is unsupported by legacy v1/v2 "
             "PrototypeAgent checkpoints"
         )
-    key = jr.key(0) if template_key is None else template_key
-    template = agent.init(key)
+    if checkpoint_prng_impl is None:
+        key = jr.key(0) if template_key is None else template_key
+    elif template_key is None:
+        key = jr.key(0, impl=checkpoint_prng_impl)
+    else:
+        template_prng_impl = _prototype_template_key_impl(template_key)
+        if template_prng_impl != checkpoint_prng_impl:
+            raise ValueError(
+                "template_key PRNG implementation does not match checkpoint metadata"
+            )
+        key = template_key
+    template = agent.init(
+        key,
+        lifecycle_id=_prototype_checkpoint_lifecycle_id(key),
+    )
+    if (
+        checkpoint_prng_impl is not None
+        and _prototype_state_prng_impl(template) != checkpoint_prng_impl
+    ):
+        raise ValueError(
+            "prototype config does not preserve the checkpoint PRNG implementation"
+        )
     if schema == PROTOTYPE_CHECKPOINT_SCHEMA:
-        restored, restored_metadata = load_checkpoint(template, path)
+        storage_template = (
+            _project_empty_array_leaves(template)
+            if has_empty_array_codec
+            else template
+        )
+        restored, restored_metadata = load_checkpoint(storage_template, path)
         if restored_metadata != metadata:
             raise ValueError("prototype checkpoint metadata changed between reads")
         restored_state = cast(PrototypeAgentState, restored)
+        if has_empty_array_codec:
+            restored_state = _restore_empty_array_leaves(restored_state, template)
+        if (
+            checkpoint_prng_impl is not None
+            and _prototype_state_prng_impl(restored_state) != checkpoint_prng_impl
+        ):
+            raise ValueError(
+                "restored prototype state does not match its PRNG implementation metadata"
+            )
         if not bool(agent._checkpoint_state_valid(restored_state)):
             raise ValueError("prototype checkpoint decision/cache state is inconsistent")
         return agent, restored_state

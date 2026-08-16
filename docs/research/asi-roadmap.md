@@ -92,18 +92,46 @@ manifest-bound, primitive-only, exact-dispatch L0 agent transaction bridge for
 continuing tasks. It owns host decision identity around functional Prototype state
 and rejects foreign-configuration state, replacement or vetoed authorization,
 and boundaries.
-The live ledger cannot be pickled and supplies no durable replay, restore, or
-exact-resume guarantee. Reward/discount are scalar-only, no sidecar or wire
-decoder exists, replacement rebinding remains an unproven adapter assertion, and
-the receipt is an executor acknowledgement rather than physical-dispatch proof.
-The Prototype bridge is not an environment/executor adapter, closed-loop runner,
-whole-life checkpoint or exact-resume result, options/rebinding/boundary conformance,
-`reference-dev`, or evidence. No aggregate life state, authoritative runner,
-whole-life checkpoint, or robot adapter exists. The robot path still does not
-import `PrototypeAgent`, the retained Forager agent still excludes it because
-closed-loop dispatch has not demonstrated preservation of the OaK/STOMP credited
-extended action, and no concrete adapter has passed the ADR's closed-loop acceptance
-gate. None is already canonical.
+The development-only
+[aggregate reference-life runner](../../alberta_framework/reference_life.py)
+and its [base retained tests](../../tests/test_reference_life.py), plus its
+[RiverSwim tests](../../tests/test_reference_life_riverswim.py) add a canonical
+immutable life configuration, immutable aggregate state, pure transaction
+reducer, strict SwitchingTwoState and RiverSwim environment adapters,
+phase/stationary metrics, capacity preflight, and process-local outer-lock/CAS
+runner. Primitive Prototype lives for both environments execute authority,
+settlement, command, functional environment step, post-execution receipt,
+outcome, agent/metric staging, and aggregate commit. The tests cover
+concurrency, horizon completion, failure retention, semantic result validation,
+and complete-outcome recovery without redispatch. RiverSwim uses a distinct
+manifest/state discriminator and stationary metrics, is capped at
+`2 <= n_states <= 12` before its exponential exact oracle is constructed, sends
+the identical runner-derived JAX key through execution and validation, and
+replays the keyed stochastic transition during strict validation.
+
+The development-only
+[checkpoint codec](../../alberta_framework/reference_life_checkpoint.py), its
+[Switching tests](../../tests/test_reference_life_checkpoint.py), and its
+[RiverSwim tests](../../tests/test_reference_life_riverswim_checkpoint.py) now
+close the current-schema quiescent exact-resume gate for both primitive lives.
+On Linux a successful save atomically publishes an immutable no-replace
+generation, nests complete Prototype v3 state, binds the aggregate plus current
+source/runtime/dependency identities, reconstructs fresh components from the
+environment discriminator, validates cross-component adoption, and matches
+exact original-versus-restored continuation from the same persisted barrier.
+
+This is still an unfrozen `preview1` L0 construction. It establishes neither
+RiverSwim learning/performance benefit nor a portable checkpoint standard.
+Only quiescent pre-completion state for these two simulators is restored, and
+compatibility fails closed across current source/runtime/dependency drift. The
+hashes bind consistency but are not authenticated execution attestation. There is no
+in-flight dispatch replay, process-death or `BaseException` guarantee, durable
+executor, independent safety authority, additional/general environment adapter,
+option/rebinding/boundary conformance, robot or Forager adapter, selected
+`reference-dev`, or evidence. The Forager path still excludes
+Prototype because extended-action credit ownership has not survived real runner
+dispatch. These closed loops and checkpoint gates remain L0 development slices,
+not a canonical reference baseline.
 
 Every proposed subsystem should answer four questions:
 
@@ -218,27 +246,21 @@ dimensions. Post-hoc tradeoff weights cannot turn a regression into a win.
 
 ## Current program priorities
 
-1. **Continue implementing the selected reference-life protocol.** Build the
-   aggregate life configuration/state, authoritative runner, whole-life
-   checkpoint, recovery contract, wire decoder/extension policy, and adapter-level
-   dispatch settlement around the implemented `preview1` L0 transaction ledger.
-   Canonically bind `max_accepted_events` and reject runner construction when it
-   exceeds any selected agent or environment adapter's non-wrapping counter capacity;
-   the current Prototype bridge can disarm at its int32 capacity before the host
-   ledger's uint64 limit.
-   The runner must own transaction state durably and define replay/restore across
-   process restarts. Then carry the primitive Prototype bridge through a real
-   environment/executor path, add the robot adapter, exact-resume gate, and
-   low-cost whole-life regression panel. Only then may a separate decision
-   select one executable `reference-dev` configuration, environment interface,
-   checkpoint contract, command, and rollback policy.
+1. **Run the matched Switching + RiverSwim development scorecard.** Compare the
+   primitive reference life across both environments against frozen/no-learning,
+   random, analytic-oracle, and strong SARSA-family controls with explicit
+   compute, memory, and latency accounting. Freeze the development protocol
+   before the run and keep every result permanently nonpromoting. This scorecard
+   does not populate `reference-dev` or constitute performance or scientific
+   evidence.
 2. **Turn plasticity gains into agent gains.** Use the development-only IPMNIST
    campaign to generate mechanisms, then remeasure controls and test survivors
    on recurrence, a complementary stream, and continual control. Do not promote
    or directly ship an inspected campaign winner.
-3. **Strengthen the benchmark ladder.** Maintain strong baselines, matched
-   resource accounting, scaling curves, and separate development and held-out
-   seed roles. Add a workload only when it tests a named open gate.
+3. **Broaden reference-life conformance after the scorecard.** Add no
+   environment or mechanism without a named gate. Options/rebinding,
+   boundaries, independent safety, Forager, robot adapters, and general
+   environment support remain separate open integration work.
 4. **Close the robotics path.** Adopt the sibling robot track's existing
    ASIMOV-1 sequence (`stand_up`, `walk_forward`, `walk_backward`,
    `sidestep_left`, `sidestep_right`, `turn_left`, and `turn_right`) and its

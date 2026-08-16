@@ -70,20 +70,29 @@ below supplies a second view over the inherited research program.
 | Learned state and representation | Feature construction, utility, routing, lifecycle, temporal-context, and recurrent-state mechanisms | No autonomous representation lifecycle has a whole-life downstream control result |
 | Prediction, memory, and world modeling | Horde/GVF learners, working and experiential memory, one-step/latent/recurrent models, and dreaming | No reference agent shows that these components causally improve retained control under one owner and budget |
 | Continual control and planning | SARSA, actor-critic, average-reward/off-policy control, options, STOMP/OaK, and bounded planning | No promoted matched-resource continual-control result closes adaptation, retention, and planning-benefit gates |
-| Agent composition | [`preview1` L0 reference transaction contract](../alberta_framework/reference_agent.py), versioned but not frozen v1, with immutable typed payloads, separate authorization/settlement/receipt/outcome records, explicit bootstrap/reset observation IDs, and a process-local ledger whose lock/current-object CAS rejects stale snapshots and repeated initialization; rejection preserves the unconsumed event in `HALTED`, while an accepted final uint64 event enters `EXHAUSTED`; covered by [retained contract tests](../tests/test_reference_agent_protocol.py). A [manifest-bound primitive-only Prototype bridge](../alberta_framework/prototype_reference_adapter.py) and its [retained tests](../tests/test_prototype_reference_adapter.py) implement exact dispatch and continuing-task outcome updates at L0, alongside explicit Prototype transition ownership, agent-only checkpoints, and Step/pipeline kernels | The Prototype bridge is not an environment/executor adapter, runner, whole-life checkpoint/exact resume, options/rebinding/boundary conformance, `reference-dev`, or evidence. No closed-loop Prototype or robot adapter, replacement-settlement proof, durable aggregate life state or authoritative runner, recovery protocol, wire decoder/sidecar policy, durable replay/restore, exact-resume result, selected `reference-dev`, or uninterrupted L3 life exists; reward/discount are scalar-only preview fields, the live ledger is non-picklable, the receipt is only an executor acknowledgement, and robot and Forager paths do not consume `PrototypeAgent`, whose closed-loop extended-action dispatch remains unresolved |
+| Agent composition | The unfrozen [`preview1` transaction/reducer/CAS ledger](../alberta_framework/reference_agent.py), [primitive exact-dispatch Prototype bridge](../alberta_framework/prototype_reference_adapter.py), aggregate [Prototype + SwitchingTwoState/RiverSwim runner](../alberta_framework/reference_life.py), and current-schema [quiescent checkpoint codec](../alberta_framework/reference_life_checkpoint.py) are covered by retained L0 tests. RiverSwim has a distinct manifest/state discriminator and stationary metrics, sends the identical derived JAX key through execution and validation, replays the stochastic transition during validation, and is bounded to 2–12 states. Both primitive lives reconstruct fresh components under strict adoption and pass exact original/restored continuation from the same persisted barrier | No frozen/portable checkpoint contract, authenticated execution provenance, in-flight or physical replay, process-death/`BaseException`/durable executor guarantee, independent safety, additional/general environment support, options/rebinding/boundary conformance, robot or Forager adapter, matched development scorecard, selected `reference-dev`, RiverSwim learning/performance benefit, evidence result, or uninterrupted L3 life exists |
 | Multi-agent learning | Recurring coadaptation surfaces, partner-policy fusion, and an IA intervention protocol | A frozen historical coadaptation outcome is not causal amplification; the frozen historical IA outcome is a valid rejection, while live validity must be checked separately |
-| Scale and operations | JAX scan/PyTree kernels, fixed-shape state in many paths, artifact tooling, and robot-compatible imports | Long-horizon compute, memory, latency, numerical stability, checkpoint recovery, and workload scaling are not jointly established |
+| Scale and operations | Fixed-shape JAX state, artifact tooling, robot-compatible imports, and bounded same-runtime exact checkpoint/recovery gates for one deterministic and one keyed stochastic simulator | Long-horizon compute, memory, latency, numerical stability, checkpoint migration, broader environment recovery, and workload scaling are not jointly established |
 | Robotics and real work | The sibling robot track consumes a continual-RL subset and defines an ASIMOV-1 task sequence plus checkpoint, bridge, and validation plumbing | No ASI reference-life binding or matched full-budget adaptation/retention result closes the control-rate, fault/safety, and guarded-hardware gates |
 
 Implementation presence in the middle column is not a benefit claim. Each open
 gate needs its own matched protocol, and the integrated target needs the
 whole-life dimensions to pass together.
 
-The current Prototype bridge's fail-stop counter test does not establish the host
-ledger's full uint64 horizon: Prototype may disarm at its int32 capacity first. A
-future canonical life configuration must bind `max_accepted_events` at or below
-every selected adapter and environment counter capacity, and runner construction must
-reject an oversized life rather than halt unexpectedly during execution.
+The current primitive Prototype runners bind
+`PROTOTYPE_REFERENCE_MAX_ACCEPTED_EVENTS = 2**31 - 4` and reject a larger
+`max_accepted_events` during construction. That preflight does not establish
+uint64-long-horizon stability, learning, or resource behavior. Every future
+adapter must declare its own non-wrapping capacity and remain part of the
+canonical minimum. The RiverSwim path separately rejects `n_states` outside
+`[2, 12]` before constructing its exponential exact stationary oracle. This is
+a strict resource guard, not a RiverSwim scale or performance result.
+
+The next reference-life hillclimb is a permanently nonpromoting matched
+development scorecard across SwitchingTwoState and RiverSwim with
+frozen/no-learning, random, analytic-oracle, and strong SARSA-family controls
+plus explicit resource accounting. It does not populate `reference-dev` or
+create performance or scientific evidence.
 
 ## Registered evidence
 

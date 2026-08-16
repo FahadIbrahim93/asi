@@ -10,8 +10,13 @@ import chex
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 import pytest
 
+from alberta_framework.core.checkpoints import (
+    load_checkpoint_metadata,
+    save_checkpoint,
+)
 from alberta_framework.core.dreaming import DreamingConfig
 from alberta_framework.core.intelligence_amplification import IAConfig
 from alberta_framework.core.oak import OaKConfig
@@ -25,6 +30,7 @@ from alberta_framework.core.prototype_agent import (
     PrototypeUpdateResult,
     feature_to_subtask_specs,
     load_prototype_checkpoint,
+    save_prototype_checkpoint,
 )
 from alberta_framework.core.types import DemonType, GVFSpec, create_horde_spec
 from alberta_framework.core.world_model import ActionConditionedWorldModelConfig
@@ -492,6 +498,207 @@ class TestPrototypeAgentSerializationRoundtrip:
         assert restored_full.config.horde_spec is not None
         assert restored_full.config.ia is not None
 
+    def test_primitive_only_checkpoint_roundtrips_empty_option_state_exactly(
+        self,
+        tmp_path,
+    ) -> None:
+        config = PrototypeAgentConfig(
+            oak=_oak_cfg(specs=(), obs_dim=2, n_prim=2),
+        )
+        agent = PrototypeAgent(config)
+        lifecycle_id = jnp.asarray((1, 2), dtype=jnp.uint32)
+        state = agent.start(
+            agent.init(jr.key(17), lifecycle_id=lifecycle_id),
+            jnp.asarray((1.0, 0.0), dtype=jnp.float32),
+        )
+        assert state.oak_state.cumulative_pseudo_rewards.size == 0
+
+        checkpoint = tmp_path / "primitive-only"
+        save_prototype_checkpoint(agent, state, checkpoint)
+        metadata = load_checkpoint_metadata(checkpoint)
+        restored_agent, restored_state = load_prototype_checkpoint(checkpoint)
+
+        assert (
+            metadata["empty_array_codec"]
+            == "alberta.prototype_agent.empty_array_projection.v1"
+        )
+        assert restored_agent.to_config() == agent.to_config()
+        chex.assert_trees_all_equal(restored_state, state)
+
+    def test_rbg_explicit_lifecycle_checkpoint_roundtrips_exactly(
+        self,
+        tmp_path,
+    ) -> None:
+        agent = PrototypeAgent(
+            PrototypeAgentConfig(
+                oak=_oak_cfg(specs=(), obs_dim=2, n_prim=2),
+            )
+        )
+        state = agent.start(
+            agent.init(
+                jr.key(23, impl="rbg"),
+                lifecycle_id=jnp.asarray((3, 4), dtype=jnp.uint32),
+            ),
+            jnp.asarray((0.25, -0.5), dtype=jnp.float32),
+        )
+        checkpoint = tmp_path / "primitive-only-rbg"
+        save_prototype_checkpoint(agent, state, checkpoint)
+
+        hinted_agent, hinted_state = load_prototype_checkpoint(
+            checkpoint,
+            template_key=jr.key(0, impl="rbg"),
+        )
+        restored_agent, restored_state = load_prototype_checkpoint(checkpoint)
+
+        assert load_checkpoint_metadata(checkpoint)["prng_impl"] == "rbg"
+        assert (
+            hinted_agent.to_config()
+            == restored_agent.to_config()
+            == agent.to_config()
+        )
+        chex.assert_trees_all_equal(hinted_state, state)
+        chex.assert_trees_all_equal(restored_state, state)
+        with pytest.raises(ValueError, match="PRNG implementation"):
+            load_prototype_checkpoint(checkpoint, template_key=jr.key(0))
+
+    @pytest.mark.parametrize(
+        ("shape", "dtype"),
+        [
+            pytest.param((0, 1), jnp.float32, id="shape"),
+            pytest.param((0,), jnp.int32, id="dtype"),
+        ],
+    )
+    def test_checkpoint_save_rejects_malformed_empty_leaf_contract(
+        self,
+        tmp_path,
+        shape,
+        dtype,
+    ) -> None:
+        agent = PrototypeAgent(
+            PrototypeAgentConfig(
+                oak=_oak_cfg(specs=(), obs_dim=2, n_prim=2),
+            )
+        )
+        state = agent.start(
+            agent.init(jr.key(18)),
+            jnp.asarray((1.0, 0.0), dtype=jnp.float32),
+        )
+        malformed_state = state.replace(
+            oak_state=state.oak_state.replace(
+                cumulative_pseudo_rewards=jnp.zeros(shape, dtype=dtype),
+            )
+        )
+        assert bool(agent._checkpoint_state_valid(malformed_state))
+
+        with pytest.raises(ValueError, match="array contract"):
+            save_prototype_checkpoint(
+                agent,
+                malformed_state,
+                tmp_path / "malformed-empty-leaf",
+            )
+
+    @pytest.mark.parametrize(
+        ("field", "dtype"),
+        [
+            pytest.param("utility_ema", jnp.int32, id="utility-dtype"),
+            pytest.param("execution_counts", jnp.float32, id="count-dtype"),
+        ],
+    )
+    def test_checkpoint_save_rejects_malformed_nonempty_array_dtype(
+        self,
+        tmp_path,
+        field,
+        dtype,
+    ) -> None:
+        agent = PrototypeAgent(_minimal_config())
+        state = agent.start(
+            agent.init(jr.key(20)),
+            jnp.zeros((OBS_DIM,), dtype=jnp.float32),
+        )
+        original = getattr(state.oak_state, field)
+        assert original.size > 0
+        malformed_state = state.replace(
+            oak_state=state.oak_state.replace(
+                **{field: jnp.asarray(original, dtype=dtype)},
+            )
+        )
+        assert bool(agent._checkpoint_state_valid(malformed_state))
+
+        with pytest.raises(ValueError, match="array contract"):
+            save_prototype_checkpoint(
+                agent,
+                malformed_state,
+                tmp_path / "malformed-nonempty-leaf",
+            )
+
+    def test_checkpoint_save_rejects_scalar_replacing_array_leaf(
+        self,
+        tmp_path,
+    ) -> None:
+        agent = PrototypeAgent(_minimal_config())
+        state = agent.start(
+            agent.init(jr.key(21)),
+            jnp.zeros((OBS_DIM,), dtype=jnp.float32),
+        )
+        malformed_state = state.replace(step_count=0)
+        assert bool(agent._checkpoint_state_valid(malformed_state))
+
+        with pytest.raises(ValueError, match="array contract"):
+            save_prototype_checkpoint(
+                agent,
+                malformed_state,
+                tmp_path / "scalar-state-leaf",
+            )
+
+    def test_checkpoint_save_rejects_numpy_replacing_jax_array_leaf(
+        self,
+        tmp_path,
+    ) -> None:
+        agent = PrototypeAgent(_minimal_config())
+        state = agent.start(
+            agent.init(jr.key(22)),
+            jnp.zeros((OBS_DIM,), dtype=jnp.float32),
+        )
+        malformed_state = state.replace(
+            step_count=np.asarray(0, dtype=np.int32),
+        )
+        assert bool(agent._checkpoint_state_valid(malformed_state))
+
+        with pytest.raises(ValueError, match="array contract"):
+            save_prototype_checkpoint(
+                agent,
+                malformed_state,
+                tmp_path / "numpy-state-leaf",
+            )
+
+    def test_v3_checkpoint_without_empty_array_codec_remains_loadable(
+        self,
+        tmp_path,
+    ) -> None:
+        import alberta_framework.core.prototype_agent as prototype_module
+
+        agent = PrototypeAgent(_minimal_config())
+        state = agent.start(
+            agent.init(jr.key(19)),
+            jnp.zeros((OBS_DIM,), dtype=jnp.float32),
+        )
+        config = agent.to_config()
+        checkpoint = tmp_path / "legacy-v3-storage"
+        save_checkpoint(
+            state,
+            checkpoint,
+            metadata={
+                "schema": PROTOTYPE_CHECKPOINT_SCHEMA,
+                "agent_config": config,
+                "config_sha256": prototype_module._prototype_config_digest(config),
+            },
+        )
+
+        restored_agent, restored_state = load_prototype_checkpoint(checkpoint)
+
+        assert restored_agent.to_config() == config
+        chex.assert_trees_all_equal(restored_state, state)
+
     def test_checkpoint_loader_rejects_wrong_schema_or_config_digest(
         self,
         monkeypatch,
@@ -538,6 +745,35 @@ class TestPrototypeAgentSerializationRoundtrip:
             },
         )
         with pytest.raises(ValueError, match="not canonical"):
+            load_prototype_checkpoint(tmp_path / "not-read")
+
+        monkeypatch.setattr(
+            prototype_module,
+            "load_checkpoint_metadata",
+            lambda _path: {
+                "schema": PROTOTYPE_CHECKPOINT_SCHEMA,
+                "agent_config": config,
+                "config_sha256": prototype_module._prototype_config_digest(config),
+                "empty_array_codec": "unknown.empty-array-codec.v9",
+            },
+        )
+        with pytest.raises(ValueError, match="empty-array codec"):
+            load_prototype_checkpoint(tmp_path / "not-read")
+
+        monkeypatch.setattr(
+            prototype_module,
+            "load_checkpoint_metadata",
+            lambda _path: {
+                "schema": PROTOTYPE_CHECKPOINT_SCHEMA,
+                "agent_config": config,
+                "config_sha256": prototype_module._prototype_config_digest(config),
+                "empty_array_codec": (
+                    "alberta.prototype_agent.empty_array_projection.v1"
+                ),
+                "prng_impl": "unknown-prng-v9",
+            },
+        )
+        with pytest.raises(ValueError, match="PRNG implementation"):
             load_prototype_checkpoint(tmp_path / "not-read")
 
 

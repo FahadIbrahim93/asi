@@ -24,28 +24,55 @@ not casually rename them. The robot track imports the continual-RL subset
 in-process; keep `requires-python >= 3.12`, the `numpy >= 1.26` floor, and the
 existing import surface intact.
 
-**Current program hillclimb:** continue implementing the selected shared
-reference-agent protocol in `docs/design/asi-reference-agent-protocol.md`. The
-`preview1` transaction schemas in `alberta_framework/reference_agent.py` are
-versioned but not frozen v1. The retained tests cover immutable typed payloads,
-separate authorization/settlement/receipt/outcome records, reset observation IDs,
-and a process-local single-writer ledger whose lock/current-object CAS rejects
-stale snapshots and repeated initialization. Rejection leaves the event
-unconsumed and the ledger `HALTED` with recovery required; the final uint64 event
-is consumed before `EXHAUSTED`. The live ledger is deliberately non-picklable,
-reward/discount are scalar-only, and no sidecars, wire decoder, durable
-replay/restore, or exact-resume guarantee exists. Rebinding remains an adapter
-assertion awaiting conformance, and the receipt is only an executor
-acknowledgement. A development-only manifest-bound, primitive-only,
-exact-dispatch, continuing-task L0 agent transaction bridge now connects these
-records to `PrototypeAgent`; its retained tests are in
-`tests/test_prototype_reference_adapter.py`. It is not an environment/executor
-adapter, closed-loop runner, whole-life checkpoint/exact resume,
-options/rebinding/boundary conformance, `reference-dev`, or evidence. The
-closed-loop Prototype slice, robot adapter, aggregate life state and runner,
-and CI-cheap regression panel remain open. The current robot and Forager paths
-do not consume `PrototypeAgent`, and Forager's extended-action dispatch edge
-remains open. In the monorepo, use
+**Current program hillclimb:** run a permanently nonpromoting matched
+development scorecard across `SwitchingTwoStateMDP` and `RiverSwimMDP` with
+frozen/no-learning, random, analytic-oracle, and strong SARSA-family controls
+plus explicit resource accounting. This is development selection only; it does
+not populate `reference-dev` or create performance or scientific evidence.
+
+The unfrozen `preview1` transaction protocol, pure reducer/CAS ledger,
+primitive-only exact-dispatch Prototype bridge, and aggregate runner are in
+`alberta_framework/{reference_agent,prototype_reference_adapter,reference_life}.py`.
+One immutable aggregate owns agent, environment, transaction, dispatch, RNG
+cursor, metrics, counters, recovery state, transcript, and generations. Its
+process-local outer lock covers command issuance through execution, receipt,
+outcome, learning/metrics staging, and one aggregate commit; retained tests
+cover concurrency, horizon, strict execution validation, faults, and
+no-redispatch pending-outcome recovery. The primitive RiverSwim slice uses a
+distinct environment manifest/state discriminator and stationary metrics,
+rejects configurations outside `2 <= n_states <= 12` before its exponential
+oracle is constructed, passes the exact same runner-derived JAX key to
+execution and validation, and replays the keyed stochastic transition during
+strict validation.
+
+The development-only checkpoint codec in
+`alberta_framework/reference_life_checkpoint.py`, covered by
+`tests/test_reference_life_checkpoint.py` and
+`tests/test_reference_life_riverswim_checkpoint.py`, now implements the
+current-schema quiescent whole-life checkpoint and exact-resume gate for the
+primitive Prototype + SwitchingTwoState and Prototype + RiverSwim lives. A
+successful save uses Linux atomic no-replace publication for one immutable
+generation, advances commit/checkpoint generations, nests the complete
+Prototype v3 checkpoint, binds the aggregate state plus current
+source/runtime/dependency identities and consistency hashes, reconstructs fresh
+components from the environment discriminator, validates strict
+cross-component adoption, and produces exact original-versus-restored
+continuation from the same persisted barrier.
+
+This remains a `preview1` L0 mechanism, not a frozen or portable checkpoint
+contract, `reference-dev`, safety conformance, robotics readiness, RiverSwim
+learning or performance benefit, performance evidence, or scientific evidence.
+Checkpoints support only quiescent pre-completion state for the two implemented
+simulators and fail closed across current source/runtime/dependency drift; they
+do not restore in-flight, halted,
+pending-outcome, completed, or physical state. The hashes bind consistency but
+are not authenticated execution attestation. The ordinary-`Exception`
+at-most-once guard remains process-local and supplies no process-death,
+`BaseException`, durable/idempotent executor, hardware-delivery, or
+reconciled-resume guarantee. Independent safety/veto, options,
+replacement/rebinding, boundaries, wire/durable dispatch replay,
+additional/general environment support, Forager, and robot adapters remain
+open. In the monorepo, use
 `../robot/docs/asimov-1.md` and
 `../robot/docs/ALBERTA_PRODUCTION_READINESS.md` as the existing ASIMOV-1
 application interface and open-gate record; do not create a duplicate robotics
@@ -112,9 +139,16 @@ Key documents:
 
 - Mission and hillclimb ladder: `docs/research/asi-roadmap.md`
 - Proposed reference-agent protocol: `docs/design/asi-reference-agent-protocol.md`
-- Implemented `preview1` L0 transaction ledger and primitive Prototype bridge:
+- Implemented `preview1` transaction ledger, primitive Prototype bridge,
+  aggregate Switching/RiverSwim life runner, and quiescent exact-resume gates:
   `alberta_framework/reference_agent.py` ·
-  `alberta_framework/prototype_reference_adapter.py`
+  `alberta_framework/prototype_reference_adapter.py` ·
+  `alberta_framework/reference_life.py` ·
+  `alberta_framework/reference_life_checkpoint.py` ·
+  `tests/test_reference_life.py` ·
+  `tests/test_reference_life_checkpoint.py` ·
+  `tests/test_reference_life_riverswim.py` ·
+  `tests/test_reference_life_riverswim_checkpoint.py`
 - Status & evidence: `docs/status.md` (levels L0–L3, completion gates) ·
   `docs/evidence/methodology.md` (property-by-property map)
 - Active campaign: `docs/research/ipmnist-theory.md` ·

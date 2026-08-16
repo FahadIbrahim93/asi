@@ -10,15 +10,29 @@ The package overview and normal development entry points remain in
   application ladder, whole-life scorecard, and current program priorities.
 - [`design/asi-reference-agent-protocol.md`](design/asi-reference-agent-protocol.md) — Proposed
   shared reference-life protocol, state ownership, dispatch invariants, adapter boundaries, and
-  exact-resume acceptance gate. Its
-  [`preview1` L0 transaction ledger](../alberta_framework/reference_agent.py) and
-  [retained contract tests](../tests/test_reference_agent_protocol.py), plus the
-  primitive-only exact-dispatch
-  [Prototype bridge](../alberta_framework/prototype_reference_adapter.py) and its
-  [retained tests](../tests/test_prototype_reference_adapter.py), implement narrow
-  L0 slices. The schemas are not frozen v1, and no environment/executor adapter,
-  authoritative runner, whole-life checkpoint/exact-resume result, options/rebinding/boundary
-  conformance, `reference-dev`, or evidence exists.
+  exact-resume acceptance gate. Implemented narrow L0 slices include the
+  unfrozen [`preview1` transaction ledger](../alberta_framework/reference_agent.py),
+  the [primitive Prototype bridge](../alberta_framework/prototype_reference_adapter.py),
+  the [aggregate Switching/RiverSwim runner](../alberta_framework/reference_life.py), and
+  the [quiescent checkpoint codec](../alberta_framework/reference_life_checkpoint.py),
+  covered by
+  [transaction](../tests/test_reference_agent_protocol.py),
+  [bridge](../tests/test_prototype_reference_adapter.py),
+  [runner](../tests/test_reference_life.py),
+  [Switching checkpoint](../tests/test_reference_life_checkpoint.py),
+  [RiverSwim runner](../tests/test_reference_life_riverswim.py), and
+  [RiverSwim checkpoint](../tests/test_reference_life_riverswim_checkpoint.py)
+  tests. RiverSwim has a distinct manifest/state discriminator and stationary
+  metrics, an exact `2 <= n_states <= 12` resource bound, identical derived JAX
+  keys at execution and replay validation, and exact original/restored
+  continuation from the same quiescent barrier. This is not a frozen/portable
+  checkpoint contract, safety/options/boundary/Forager/robot conformance,
+  broader environment support, `reference-dev`, RiverSwim
+  learning/performance benefit, or scientific evidence. The next hillclimb is
+  the permanently nonpromoting matched SwitchingTwoState + RiverSwim
+  development scorecard with frozen/no-learning,
+  random, analytic-oracle, and strong SARSA-family controls plus resource
+  accounting.
 - [`status.md`](status.md) — requirement-to-evidence status and completion gates.
 - [`evidence/methodology.md`](evidence/methodology.md) — evidence levels, artifact rules,
   validators, and the property map.

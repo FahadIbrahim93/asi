@@ -21,9 +21,10 @@ reproducible results. See `VENDORING.md` for the exact scope.
 
 - Added the host-facing `preview1` reference-agent transaction contract. Its
   preview schemas are versioned but not frozen v1: canonical configuration and
-  manifest identities, exact-dtype immutable payloads, distinct
-  authorization/settlement/receipt/outcome records, explicit bootstrap/reset
-  observation IDs, and a process-local single-writer ledger are covered at L0.
+  manifest identities, exact-dtype immutable payloads, distinct authorization,
+  settlement, pre-execution command, post-execution applied-action receipt, and
+  outcome records, explicit bootstrap/reset observation IDs, a pure semantic
+  reducer, and a process-local single-writer ledger are covered at L0.
   The live ledger uses lock-protected current-object identity compare-and-swap,
   rejects stale snapshots and repeated initialization, and deliberately cannot
   be pickled. Rejection leaves the event unconsumed and the ledger halted with
@@ -31,16 +32,60 @@ reproducible results. See `VENDORING.md` for the exact scope.
   becomes exhausted. Preview restrictions include scalar reward/discount, no
   sidecars or wire decoder, adapter-asserted rather than adapter-proven
   rebinding, and executor acknowledgements rather than physical-dispatch proof.
-  No durable replay/restore, aggregate life state or runner, whole-life
-  checkpoint, exact-resume gate, or `reference-dev` is implied.
+  The transaction module alone supplies no durable replay/restore, aggregate
+  runner, whole-life checkpoint, exact-resume gate, or `reference-dev`.
 - Added a development-only, manifest-bound Prototype L0 agent transaction
   bridge and retained tests. It supports only primitive actions, exact dispatch,
   and continuing-task outcomes; foreign-configuration state, replacement/veto,
   boundary transactions, stale or relabelled decisions, and premature disarming
-  fail closed without committing the functional candidate. This is not an
-  environment/executor adapter, closed-loop runner, whole-life checkpoint or
-  exact-resume result, options/rebinding/boundary conformance, `reference-dev`,
-  or evidence.
+  fail closed without committing the functional candidate. The bridge is not
+  by itself an environment/executor adapter or runner and supplies no whole-life
+  checkpoint, exact-resume result, options/rebinding/boundary conformance,
+  `reference-dev`, or evidence.
+- Added the development-only aggregate Prototype + SwitchingTwoState/RiverSwim
+  L0 life runner and retained tests. Its canonical immutable configuration
+  binds the complete selected agent, environment, exact-dispatch, and metric
+  configurations/digests plus the smallest component event capacity. One
+  immutable aggregate owns agent, environment, transaction, dispatch, RNG
+  cursor, metrics, counters, pending outcome, halt, transcript, and
+  commit/checkpoint generations. A process-local outer lock/CAS covers
+  authority, settlement, command, strict environment execution validation,
+  post-execution receipt, outcome, agent/metric staging, and aggregate commit.
+  The CI-cheap panel covers concurrency, phase/stationary reward/oracle/regret
+  metrics, horizon completion, transcript hashing, capacity preflight, abort,
+  fault retention, and complete-outcome recovery without redispatch. RiverSwim
+  uses a distinct manifest/state discriminator and stationary metrics, rejects
+  configurations outside `2 <= n_states <= 12` before exponential exact-oracle
+  construction, supplies the identical runner-derived JAX key to execution and
+  validation, and replays the keyed stochastic transition during validation.
+  This is a `preview1` L0 mechanism, not `reference-dev`, evidence, safety conformance,
+  or robotics readiness. The declared static exact authority is not a safety
+  policy; the ordinary-`Exception` at-most-once guard is process-local and is
+  not a durable executor guarantee or protection from process death or
+  `BaseException`. The runner alone does not provide checkpoint persistence,
+  process-crash recovery, durable dispatch, safety, or evidence.
+- Added the development-only current-schema quiescent whole-life checkpoint
+  codec and retained exact-resume tests for primitive Prototype +
+  SwitchingTwoState and Prototype + RiverSwim. Successful save uses Linux
+  atomic no-replace publication for one immutable generation, advances
+  commit/checkpoint generations, nests
+  the complete Prototype v3 checkpoint, encodes all aggregate owners, binds
+  current source/runtime/dependency identities plus child consistency hashes,
+  reconstructs fresh components, and validates strict cross-component
+  adoption. Original and restored runners produce exact continuation from the
+  same persisted barrier. This is an unfrozen `preview1` L0
+  simulation mechanism, not a portable migration contract,
+  authenticated execution attestation, process-crash or durable-executor
+  guarantee, safety result, `reference-dev`, RiverSwim learning/performance
+  result, or evidence. Only quiescent pre-completion state for the two
+  implemented simulators is supported. The RiverSwim gate reconstructs from its
+  distinct environment discriminator and produces exact original/restored keyed
+  stochastic continuation from the same persisted barrier. It supplies no
+  safety/options/boundary/Forager/robot conformance or broader environment
+  support. The next hillclimb is a permanently nonpromoting matched
+  SwitchingTwoState + RiverSwim development scorecard with frozen/no-learning,
+  random, analytic-oracle, and strong SARSA-family controls plus resource
+  accounting.
 
 #### Continual-learning benchmarks
 
