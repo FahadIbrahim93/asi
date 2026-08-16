@@ -1401,6 +1401,12 @@ def _require_false(value: Mapping[str, Any], key: str, context: str) -> None:
         raise ForagerMatchedCandidateUniverseError(f"{context}.{key} must be false")
 
 
+def _require_exact_int(value: Any, path: str) -> int:
+    if type(value) is not int:
+        raise ForagerMatchedCandidateUniverseError(f"{path} must be an integer")
+    return value
+
+
 def _verify_one_screen(
     binding: ScreeningArtifactBinding,
     protocol: Mapping[str, Any],
@@ -1995,11 +2001,14 @@ def _verify_rtu_candidate_generation(
         protocol.get("future_evaluation"),
         "rtu_schema23_screening_v1.future_evaluation",
     )
+    aperture_size = _require_exact_int(
+        task.get("aperture_size"), "rtu_schema23_screening_v1.task.aperture_size"
+    )
     if any(
         (
             task.get("env_id") != "ForagaxTwoBiomeLarge-v1",
             task.get("observation_type") != "color",
-            task.get("aperture_size") != 9,
+            aperture_size != 9,
             task.get("steps") != binding.horizon_per_seed,
             task.get("seeds") != list(binding.seeds),
             protocol_matrix.get("file_sha256")

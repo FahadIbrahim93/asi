@@ -432,6 +432,26 @@ def test_external_screen_validator_rejects_duplicate_rank_rows() -> None:
 
 
 @pytest.mark.unit
+def test_rtu_source_validator_rejects_float_alias_for_integer_aperture() -> None:
+    binding = next(
+        item
+        for item in universe._LOCAL_CANDIDATE_GENERATION_BINDINGS
+        if item.screen_id == "rtu_schema23_screening_v1"
+    )
+    artifacts = {
+        artifact.role: json.loads((_REPOSITORY_ROOT / artifact.path).read_bytes())
+        for artifact in binding.artifacts
+    }
+    artifacts["protocol"]["task"]["aperture_size"] = 9.0
+
+    with pytest.raises(
+        universe.ForagerMatchedCandidateUniverseError,
+        match=r"task\.aperture_size must be an integer",
+    ):
+        universe._verify_rtu_candidate_generation(binding, artifacts)
+
+
+@pytest.mark.unit
 def test_external_screen_validator_reconciles_snapshot_configuration_hashes() -> None:
     binding = universe._SCREEN_BINDINGS[0]
     protocol = json.loads((_REPOSITORY_ROOT / binding.protocol_path).read_bytes())
