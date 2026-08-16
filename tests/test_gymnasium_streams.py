@@ -180,6 +180,34 @@ def test_random_box_policy_rejects_nonfinite_bounds() -> None:
         make_random_policy(StubEnv(), seed=0)  # type: ignore[arg-type]
 
 
+def test_runtime_values_must_match_declared_flattened_shapes_and_be_finite() -> None:
+    box = gymnasium.spaces.Box(-1.0, 1.0, shape=(2,), dtype=np.float32)
+    with pytest.raises(ValueError, match="observation.*shape"):
+        _flatten_observation(np.zeros((1,), dtype=np.float32), box)
+    with pytest.raises(ValueError, match="action.*shape"):
+        _flatten_action(np.zeros((3,), dtype=np.float32), box)
+    with pytest.raises(ValueError, match="observation.*finite"):
+        _flatten_observation(np.asarray((0.0, np.nan), dtype=np.float32), box)
+    with pytest.raises(ValueError, match="action.*finite"):
+        _flatten_action(np.asarray((0.0, np.inf), dtype=np.float32), box)
+
+
+def test_factory_rejects_noncallable_policy_before_environment_construction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    def forbidden_make(*_args: object, **_kwargs: object) -> None:
+        nonlocal calls
+        calls += 1
+        raise AssertionError("environment constructed before policy validation")
+
+    monkeypatch.setattr(gymnasium, "make", forbidden_make)
+    with pytest.raises(ValueError, match="policy"):
+        make_gymnasium_stream("CartPole-v1", policy=object())  # type: ignore[arg-type]
+    assert calls == 0
+
+
 class TestGymnasiumStreamRewardMode:
     """Tests for GymnasiumStream with REWARD prediction mode."""
 

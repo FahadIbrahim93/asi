@@ -149,14 +149,21 @@ def _flatten_observation(obs: Any, space: gymnasium.spaces.Space[Any]) -> Array:
     """
     import gymnasium
 
-    if isinstance(space, gymnasium.spaces.Box):
-        return jnp.asarray(obs, dtype=jnp.float32).flatten()
-    elif isinstance(space, gymnasium.spaces.Discrete):
-        return jnp.array([float(obs)], dtype=jnp.float32)
-    elif isinstance(space, gymnasium.spaces.MultiDiscrete):
-        return jnp.asarray(obs, dtype=jnp.float32).reshape((-1,))
-    else:
-        raise ValueError(f"Unsupported space type: {type(space).__name__}")
+    try:
+        if isinstance(space, gymnasium.spaces.Box):
+            flattened = jnp.asarray(obs, dtype=jnp.float32).reshape((-1,))
+        elif isinstance(space, gymnasium.spaces.Discrete):
+            flattened = jnp.asarray([obs], dtype=jnp.float32)
+        elif isinstance(space, gymnasium.spaces.MultiDiscrete):
+            flattened = jnp.asarray(obs, dtype=jnp.float32).reshape((-1,))
+        else:
+            raise ValueError(f"Unsupported space type: {type(space).__name__}")
+    except Exception as error:
+        raise ValueError("observation could not be converted to float32") from error
+    expected = _flatten_space(space)
+    if flattened.shape != (expected,) or not bool(jnp.all(jnp.isfinite(flattened))):
+        raise ValueError("observation must match its declared flattened shape and be finite")
+    return flattened
 
 
 def _flatten_action(action: Any, space: gymnasium.spaces.Space[Any]) -> Array:
@@ -171,14 +178,21 @@ def _flatten_action(action: Any, space: gymnasium.spaces.Space[Any]) -> Array:
     """
     import gymnasium
 
-    if isinstance(space, gymnasium.spaces.Box):
-        return jnp.asarray(action, dtype=jnp.float32).flatten()
-    elif isinstance(space, gymnasium.spaces.Discrete):
-        return jnp.array([float(action)], dtype=jnp.float32)
-    elif isinstance(space, gymnasium.spaces.MultiDiscrete):
-        return jnp.asarray(action, dtype=jnp.float32).reshape((-1,))
-    else:
-        raise ValueError(f"Unsupported space type: {type(space).__name__}")
+    try:
+        if isinstance(space, gymnasium.spaces.Box):
+            flattened = jnp.asarray(action, dtype=jnp.float32).reshape((-1,))
+        elif isinstance(space, gymnasium.spaces.Discrete):
+            flattened = jnp.asarray([action], dtype=jnp.float32)
+        elif isinstance(space, gymnasium.spaces.MultiDiscrete):
+            flattened = jnp.asarray(action, dtype=jnp.float32).reshape((-1,))
+        else:
+            raise ValueError(f"Unsupported space type: {type(space).__name__}")
+    except Exception as error:
+        raise ValueError("action could not be converted to float32") from error
+    expected = _flatten_space(space)
+    if flattened.shape != (expected,) or not bool(jnp.all(jnp.isfinite(flattened))):
+        raise ValueError("action must match its declared flattened shape and be finite")
+    return flattened
 
 
 def make_random_policy(env: gymnasium.Env[Any, Any], seed: int = 0) -> Callable[[Array], Any]:
@@ -208,6 +222,8 @@ def make_random_policy(env: gymnasium.Env[Any, Any], seed: int = 0) -> Callable[
         if not bool(jnp.all(jnp.isfinite(low) & jnp.isfinite(high) & (low <= high))):
             raise ValueError("Box random actions require finite ordered float32 bounds")
     elif isinstance(action_space, gymnasium.spaces.MultiDiscrete):
+        dimension = _flatten_space(action_space)
+        _require_float32_allocation("MultiDiscrete action bounds", 2 * dimension)
         starts = tuple(int(value) for value in np.asarray(action_space.start).reshape((-1,)))
         counts = tuple(int(value) for value in np.asarray(action_space.nvec).reshape((-1,)))
         bounds = tuple(zip(starts, counts, strict=True))
@@ -792,8 +808,6 @@ def make_gymnasium_stream(
     Returns:
         GymnasiumStream wrapping the environment
     """
-    import gymnasium
-
     if type(env_id) is not str or not env_id:
         raise ValueError("env_id must be a non-empty exact string")
     mode = _require_mode(mode)
@@ -802,6 +816,10 @@ def make_gymnasium_stream(
     )
     seed = require_jax_seed(seed)
     gamma = validated_float32_scalar("gamma", gamma, lower=0.0, upper=1.0)
+    if policy is not None and not callable(policy):
+        raise ValueError("policy must be callable or None")
+
+    import gymnasium
 
     env = gymnasium.make(env_id, **env_kwargs)
     return GymnasiumStream(
