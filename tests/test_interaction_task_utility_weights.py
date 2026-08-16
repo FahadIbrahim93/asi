@@ -251,6 +251,28 @@ def test_weighted_topk_normalizes_only_selected_positive_weight_mass() -> None:
     )
 
 
+def test_unweighted_active_topk_excludes_inactive_zero_placeholders() -> None:
+    learner = _learner(
+        utility_aggregation="topk",
+        utility_top_k=2,
+        utility_task_balancing="active",
+    )
+    active_mask = jnp.asarray((True, False, False, False, False), dtype=jnp.bool_)
+    activity = jnp.ones((5,), dtype=jnp.float32)
+    signed_signal = jnp.asarray(
+        ((-4.0,), (99.0,), (99.0,), (99.0,), (99.0,)),
+        dtype=jnp.float32,
+    )
+
+    utility = learner._aggregate_task_feature_signal(
+        signed_signal,
+        active_mask,
+        activity,
+    )
+
+    np.testing.assert_array_equal(utility, np.asarray((-4.0,), dtype=np.float32))
+
+
 def test_weighted_update_is_eager_jit_and_scan_compatible() -> None:
     learner = _learner(
         task_utility_weights=_GROUP_WEIGHTS,

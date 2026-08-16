@@ -1381,7 +1381,14 @@ class FixedBudgetInteractionLearner:
             return jnp.max(weighted_activity, axis=0)
         if self._utility_aggregation == "topk":
             k = min(self._utility_top_k, self._n_tasks)
-            return jnp.mean(jnp.sort(weighted_activity, axis=0)[-k:, :], axis=0)
+            if self._utility_task_balancing == "none":
+                return jnp.mean(jnp.sort(weighted_activity, axis=0)[-k:, :], axis=0)
+            scores = jnp.where(active_mask[:, None], weighted_activity, -jnp.inf)
+            selected, _ = jax.lax.top_k(jnp.swapaxes(scores, 0, 1), k)
+            selected_mask = jnp.isfinite(selected)
+            selected_count = jnp.sum(selected_mask, axis=1)
+            selected_sum = jnp.sum(jnp.where(selected_mask, selected, 0.0), axis=1)
+            return jnp.where(selected_count > 0, selected_sum / selected_count, 0.0)
 
         if self._utility_task_balancing == "active":
             active_count = jnp.maximum(jnp.sum(active_mask.astype(jnp.float32)), 1.0)
@@ -1468,7 +1475,14 @@ class FixedBudgetInteractionLearner:
             return jnp.max(weighted_signal, axis=0)
         if self._utility_aggregation == "topk":
             k = min(self._utility_top_k, self._n_tasks)
-            return jnp.mean(jnp.sort(weighted_signal, axis=0)[-k:, :], axis=0)
+            if self._utility_task_balancing == "none":
+                return jnp.mean(jnp.sort(weighted_signal, axis=0)[-k:, :], axis=0)
+            scores = jnp.where(active_mask[:, None], weighted_signal, -jnp.inf)
+            selected, _ = jax.lax.top_k(jnp.swapaxes(scores, 0, 1), k)
+            selected_mask = jnp.isfinite(selected)
+            selected_count = jnp.sum(selected_mask, axis=1)
+            selected_sum = jnp.sum(jnp.where(selected_mask, selected, 0.0), axis=1)
+            return jnp.where(selected_count > 0, selected_sum / selected_count, 0.0)
         if self._utility_task_balancing in {"active", "active_inverse_frequency"}:
             active_count = jnp.maximum(jnp.sum(active_mask.astype(jnp.float32)), 1.0)
             return jnp.sum(weighted_signal, axis=0) / active_count
