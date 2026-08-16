@@ -58,15 +58,11 @@ class TestOnPolicyEquivalence:
         alpha = 0.1
         n_steps = 30
 
-        learner = OffPolicyTDLinearLearner(
-            step_size=alpha, trace_decay=0.0, retrace_clip=10.0
-        )
+        learner = OffPolicyTDLinearLearner(step_size=alpha, trace_decay=0.0, retrace_clip=10.0)
         state = learner.init(feature_dim)
 
         rng = np.random.default_rng(0)
-        observations = jnp.asarray(
-            rng.normal(size=(n_steps, feature_dim)).astype(np.float32)
-        )
+        observations = jnp.asarray(rng.normal(size=(n_steps, feature_dim)).astype(np.float32))
         rewards = jnp.asarray(rng.normal(size=n_steps).astype(np.float32))
 
         for t in range(n_steps):
@@ -190,9 +186,7 @@ class TestETDLambda:
         n_steps = 40
 
         rng = np.random.default_rng(123)
-        observations = jnp.asarray(
-            rng.normal(size=(n_steps, feature_dim)).astype(np.float32)
-        )
+        observations = jnp.asarray(rng.normal(size=(n_steps, feature_dim)).astype(np.float32))
         rewards = jnp.asarray(rng.normal(size=n_steps).astype(np.float32))
 
         etd = ETDLinearLearner(step_size=alpha, trace_decay=0.0)
@@ -504,9 +498,7 @@ class TestOffPolicyConvergence:
         # rho(action=1) = 1 / 0.5 = 2
         # rho(action=0) = 0 / 0.5 = 0  (the trajectory contributes nothing)
 
-        learner = OffPolicyTDLinearLearner(
-            step_size=0.05, trace_decay=0.0, retrace_clip=2.0
-        )
+        learner = OffPolicyTDLinearLearner(step_size=0.05, trace_decay=0.0, retrace_clip=2.0)
         state = learner.init(n_states)
 
         rng = np.random.default_rng(42)
@@ -536,16 +528,12 @@ class TestOffPolicyConvergence:
         # Target V per state
         v_true = np.ones(n_states, dtype=np.float32)
         rmse = float(np.sqrt(np.mean((v_estimated - v_true) ** 2)))
-        assert rmse < 0.20, (
-            f"Off-policy TD did not converge: V_est={v_estimated}, RMSE={rmse}"
-        )
+        assert rmse < 0.20, f"Off-policy TD did not converge: V_est={v_estimated}, RMSE={rmse}"
 
     def test_naive_is_finite_with_clipping(self) -> None:
         """Even with a high IS-ratio target/behavior mismatch, clipping at
         c=1 should keep weights finite over many steps."""
-        learner = OffPolicyTDLinearLearner(
-            step_size=0.01, trace_decay=0.7, retrace_clip=1.0
-        )
+        learner = OffPolicyTDLinearLearner(step_size=0.01, trace_decay=0.7, retrace_clip=1.0)
         state = learner.init(5)
 
         rng = np.random.default_rng(7)
@@ -555,9 +543,7 @@ class TestOffPolicyConvergence:
             r = jnp.float32(rng.normal())
             # Wildly varying rho
             rho = jnp.float32(rng.uniform(0.0, 50.0))
-            res = learner.update(
-                state, phi, r, phi_next, jnp.float32(0.95), rho
-            )
+            res = learner.update(state, phi, r, phi_next, jnp.float32(0.95), rho)
             state = res.state
 
         chex.assert_tree_all_finite(state.weights)
@@ -596,9 +582,7 @@ class TestJit:
 
 class TestConfig:
     def test_roundtrip(self) -> None:
-        original = OffPolicyTDLinearLearner(
-            step_size=0.07, trace_decay=0.6, retrace_clip=2.5
-        )
+        original = OffPolicyTDLinearLearner(step_size=0.07, trace_decay=0.6, retrace_clip=2.5)
         config = original.to_config()
         assert config["type"] == "OffPolicyTDLinearLearner"
         restored = OffPolicyTDLinearLearner.from_config(config)
@@ -621,9 +605,7 @@ class TestBairdStyle:
     """
 
     def test_no_divergence_with_clip(self) -> None:
-        learner = OffPolicyTDLinearLearner(
-            step_size=0.01, trace_decay=0.5, retrace_clip=1.0
-        )
+        learner = OffPolicyTDLinearLearner(step_size=0.01, trace_decay=0.5, retrace_clip=1.0)
         state = learner.init(4)
 
         rng = np.random.default_rng(11)
@@ -633,9 +615,7 @@ class TestBairdStyle:
             r = jnp.float32(rng.normal())
             # Heavy-tailed rho but mostly modest values
             rho = jnp.float32(rng.exponential(1.0))
-            res = learner.update(
-                state, phi, r, phi_next, jnp.float32(0.9), rho
-            )
+            res = learner.update(state, phi, r, phi_next, jnp.float32(0.9), rho)
             state = res.state
 
         chex.assert_tree_all_finite(state.weights)
@@ -701,9 +681,7 @@ class TestInfiniteRewardDoesNotPoisonWeights:
             state, obs, jnp.array(jnp.inf, dtype=jnp.float32), nxt, gamma, rho
         )
         chex.assert_trees_all_close(poisoned.state.weights, state.weights)
-        chex.assert_trees_all_close(
-            poisoned.state.secondary_weights, state.secondary_weights
-        )
+        chex.assert_trees_all_close(poisoned.state.secondary_weights, state.secondary_weights)
         assert not bool(poisoned.update_applied)
         assert float(poisoned.td_error) == 0.0
 
@@ -861,3 +839,25 @@ class TestZeroGammaDoesNotMultiplyInfBootstrap:
         )
         assert bool(result.update_applied)
         chex.assert_tree_all_finite(result.state.eligibility_traces)
+
+
+def test_off_policy_td_learners_integer_validation() -> None:
+    optd = OffPolicyTDLinearLearner()
+    etd = ETDLinearLearner()
+    gtd = GradientTDLinearLearner()
+
+    with pytest.raises(ValueError, match="feature_dim"):
+        optd.init(feature_dim=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="feature_dim"):
+        etd.init(feature_dim=4.5)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="feature_dim"):
+        gtd.init(feature_dim=0)
+
+    s_optd = optd.init(feature_dim=np.int32(4))
+    s_etd = etd.init(feature_dim=np.int64(4))
+    s_gtd = gtd.init(feature_dim=np.int32(4))
+
+    assert s_optd.weights.shape == (4,)
+    assert s_etd.weights.shape == (4,)
+    assert s_gtd.weights.shape == (5,)
+    assert s_gtd.secondary_weights.shape == (5,)
