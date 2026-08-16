@@ -621,6 +621,59 @@ def test_step12_narrows_original_real_directly_without_double_rounding() -> None
     )
 
 
+@pytest.mark.parametrize(
+    ("pseudo_reward_scale", "expected"),
+    [
+        (
+            Fraction(1, 1) + Fraction(1, 2**24) - Fraction(1, 2**60),
+            1.0,
+        ),
+        (Fraction(1, 1) + Fraction(1, 2**24), 1.0),
+        (
+            Fraction(1, 1) + Fraction(1, 2**24) + Fraction(1, 2**60),
+            float(np.nextafter(np.float32(1.0), np.float32(2.0))),
+        ),
+    ],
+    ids=("below", "tie-to-even", "above"),
+)
+def test_step12_rounds_fraction_midpoints_once(
+    pseudo_reward_scale: Fraction,
+    expected: float,
+) -> None:
+    config = _config_with(
+        subtask_specs=(
+            SubtaskSpec(
+                feature_index=0,
+                pseudo_reward_scale=pseudo_reward_scale,
+            ),
+        )
+    )
+    assert config.subtask_specs[0].pseudo_reward_scale == expected
+
+
+def test_step12_fraction_float32_overflow_midpoint_is_exact() -> None:
+    maximum = Fraction((2**24 - 1) * 2**104)
+    overflow_midpoint = maximum + 2**103
+
+    just_below = _config_with(cerebellum_step_size=overflow_midpoint - 1)
+    assert just_below.cerebellum_step_size == _FLOAT32_MAX
+    with pytest.raises(ValueError, match="cerebellum_step_size"):
+        _config_with(cerebellum_step_size=overflow_midpoint)
+
+
+def test_step12_fraction_subnormal_midpoint_obeys_ties_to_even() -> None:
+    half_min_subnormal = Fraction(1, 2**150)
+
+    collapsed = _config_with(base_step_size=half_min_subnormal)
+    assert collapsed.base_step_size == 0.0
+    with pytest.raises(ValueError, match="cerebellum_step_size"):
+        _config_with(cerebellum_step_size=half_min_subnormal)
+    accepted = _config_with(
+        cerebellum_step_size=half_min_subnormal + Fraction(1, 2**200)
+    )
+    assert accepted.cerebellum_step_size == _FLOAT32_MIN_SUBNORMAL
+
+
 def test_step12_smoke_health_gate_reports_any_refused_update(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

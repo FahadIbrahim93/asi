@@ -38,6 +38,7 @@ import jax.random as jr
 import numpy as np
 from jax import Array
 
+from alberta_framework._float32 import round_real_to_float32
 from alberta_framework.core.intelligence_amplification import (
     ExoCerebellumConfig,
     IAAgent,
@@ -152,13 +153,12 @@ def _require_real(name: str, value: object) -> float:
     if isinstance(value, (bool, np.bool_)) or not isinstance(value, Real):
         raise ValueError(f"{name} must be a real number, got {value!r}")
     try:
-        with np.errstate(over="ignore", under="ignore", invalid="ignore"):
-            narrowed = np.asarray(value, dtype=np.float32).reshape(())
+        narrowed = round_real_to_float32(value)
     except (FloatingPointError, OverflowError, TypeError, ValueError) as exc:
         raise ValueError(f"{name} must be finite in float32, got {value!r}") from exc
     if not bool(np.isfinite(narrowed)):
         raise ValueError(f"{name} must be finite in float32, got {value!r}")
-    return float(narrowed)
+    return narrowed
 
 
 def _require_unit_interval(name: str, value: object) -> float:
