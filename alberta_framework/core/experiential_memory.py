@@ -417,15 +417,6 @@ def _validate_config(config: ExperientialMemoryConfig) -> None:
         "recency_scale",
         _validated_config_float("recency_scale", config.recency_scale, positive=True),
     )
-    rounded_boundary = np.float32(_INT32_MAX / float(np.finfo(np.float32).max))
-    minimum_safe_scale = float(
-        np.nextafter(rounded_boundary, np.float32(np.inf), dtype=np.float32)
-    )
-    if config.staleness_scale < minimum_safe_scale:
-        raise ValueError("staleness_scale must keep saturated age division finite in float32")
-    if config.recency_scale < minimum_safe_scale:
-        raise ValueError("recency_scale must keep saturated age division finite in float32")
-
 def _saturating_increment(value: Array) -> Array:
     maximum_minus_one = jnp.asarray(_INT32_MAX - 1, dtype=jnp.int32)
     return jnp.minimum(value, maximum_minus_one) + jnp.asarray(1, dtype=jnp.int32)
@@ -934,10 +925,19 @@ class ExperientialMemory:
             -squared_distance / jnp.asarray(cfg.distance_scale, dtype=jnp.float32)
         )
         safe_ages = jnp.where(entries.ages >= 0, entries.ages, 0)
-        staleness = jnp.exp(
-            -safe_ages.astype(jnp.float32)
-            / jnp.asarray(cfg.staleness_scale, dtype=jnp.float32)
+        staleness_scale = jnp.asarray(cfg.staleness_scale, dtype=jnp.float32)
+        # Every positive float32 scale is legal. Cap the mathematically huge
+        # quotient before division so a tiny scale yields exact zero staleness
+        # without first creating an infinity in the JAX operation graph.
+        maximum_exponent = jnp.asarray(
+            np.finfo(np.float32).max / 2.0,
+            dtype=jnp.float32,
         )
+        bounded_staleness_age = jnp.minimum(
+            safe_ages.astype(jnp.float32),
+            maximum_exponent * jnp.minimum(staleness_scale, 1.0),
+        )
+        staleness = jnp.exp(-bounded_staleness_age / staleness_scale)
         safe_reliabilities = jnp.where(
             jnp.isfinite(entries.reliabilities)
             & (entries.reliabilities >= 0.0)
@@ -1173,10 +1173,11 @@ class ExperientialMemory:
             current_entries = current.entries
             has_empty = jnp.any(~current_entries.valid)
             empty_slot = jnp.argmax((~current_entries.valid).astype(jnp.int32))
-            recency_score = 1.0 / (
-                1.0
-                + current_entries.recency_ages.astype(jnp.float32)
-                / jnp.asarray(cfg.recency_scale, dtype=jnp.float32)
+            recency_scale = jnp.asarray(cfg.recency_scale, dtype=jnp.float32)
+            # Algebraically equivalent to 1 / (1 + age / scale), but remains
+            # finite for every positive float32 scale in the public contract.
+            recency_score = recency_scale / (
+                recency_scale + current_entries.recency_ages.astype(jnp.float32)
             )
             eviction_utilities = jnp.where(
                 current_entries.utility_available,

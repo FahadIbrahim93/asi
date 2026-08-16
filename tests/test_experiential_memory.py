@@ -502,6 +502,33 @@ def test_large_relative_eviction_weights_do_not_overflow_priority() -> None:
     assert int(result.evicted_provenance_id) == 10
 
 
+def test_smallest_positive_age_scales_remain_operation_finite() -> None:
+    smallest = float(np.nextafter(np.float32(0.0), np.float32(1.0)))
+    memory = ExperientialMemory(
+        _config(
+            capacity=1,
+            top_k=1,
+            staleness_scale=smallest,
+            recency_scale=smallest,
+        )
+    )
+    state = _write(memory, memory.init(), _entry(10, age=2**31 - 1))
+    retrieval = memory.query(
+        state,
+        jnp.zeros((2,), dtype=jnp.float32),
+        jnp.asarray(1, dtype=jnp.int32),
+        jnp.asarray(0.1, dtype=jnp.float32),
+        jnp.asarray(True, dtype=jnp.bool_),
+    )
+    for leaf in jax.tree.leaves(retrieval):
+        if jnp.issubdtype(leaf.dtype, jnp.floating):
+            assert bool(jnp.all(jnp.isfinite(leaf)))
+
+    result = memory.write(state, _entry(20, utility=1.0))
+    assert bool(result.wrote)
+    assert bool(result.evicted)
+
+
 def test_accepted_access_updates_recency_before_deterministic_eviction() -> None:
     memory = ExperientialMemory(
         _config(
