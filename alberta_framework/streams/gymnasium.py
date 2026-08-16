@@ -70,9 +70,13 @@ def _require_positive_int32(name: str, value: object) -> int:
     return canonical
 
 
-def _require_float32_allocation(name: str, scalars: int) -> None:
-    if scalars > _INT32_MAX or 4 * scalars > _INT32_MAX:
+def _require_allocation(name: str, scalars: int, *, itemsize: int) -> None:
+    if scalars > _INT32_MAX or itemsize * scalars > _INT32_MAX:
         raise ValueError(f"derived {name} scalar and byte counts must fit signed int32")
+
+
+def _require_float32_allocation(name: str, scalars: int) -> None:
+    _require_allocation(name, scalars, itemsize=4)
 
 
 def _require_exact_bool(name: str, value: object) -> bool:
@@ -195,6 +199,93 @@ def _flatten_action(action: Any, space: gymnasium.spaces.Space[Any]) -> Array:
     return flattened
 
 
+def _make_random_policy(
+    env: gymnasium.Env[Any, Any], rng: Array
+) -> Callable[[Array], Any]:
+    """Build a bounded random policy from one already validated JAX key."""
+    import gymnasium
+
+    action_space = env.action_space
+    action_dim = _flatten_space(action_space)
+
+    if isinstance(action_space, gymnasium.spaces.Discrete):
+        discrete_low = int(action_space.start)
+        discrete_count = int(action_space.n)
+        discrete_high = discrete_low + discrete_count
+        if not (
+            1 <= discrete_count <= _INT32_MAX
+            and _INT32_MIN <= discrete_low < discrete_high <= _INT32_MAX
+        ):
+            raise ValueError("Discrete action bounds must fit JAX signed int32")
+    elif isinstance(action_space, gymnasium.spaces.Box):
+        _require_float32_allocation("random Box bounds and action", 3 * action_dim)
+        with np.errstate(over="ignore", invalid="ignore"):
+            low_array = np.asarray(action_space.low, dtype=np.float32)
+            high_array = np.asarray(action_space.high, dtype=np.float32)
+            finite_span = np.isfinite(high_array - low_array)
+        if not bool(
+            np.all(
+                np.isfinite(low_array)
+                & np.isfinite(high_array)
+                & finite_span
+                & (low_array <= high_array)
+            )
+        ):
+            raise ValueError(
+                "Box random actions require finite ordered bounds with a finite float32 span"
+            )
+        low = jnp.asarray(low_array)
+        high = jnp.asarray(high_array)
+    elif isinstance(action_space, gymnasium.spaces.MultiDiscrete):
+        starts = np.asarray(action_space.start).reshape((-1,))
+        counts = np.asarray(action_space.nvec).reshape((-1,))
+        action_dtype = np.dtype(action_space.dtype)
+        _require_allocation(
+            "random MultiDiscrete action",
+            action_dim,
+            itemsize=action_dtype.itemsize,
+        )
+        for index in range(action_dim):
+            start = int(starts[index])
+            count = int(counts[index])
+            if not (
+                1 <= count <= _INT32_MAX
+                and _INT32_MIN <= start < start + count <= _INT32_MAX
+            ):
+                raise ValueError("MultiDiscrete action bounds must fit JAX signed int32")
+    else:
+        raise ValueError(f"Unsupported action space: {type(action_space).__name__}")
+
+    def policy(_obs: Array) -> Any:
+        nonlocal rng
+        rng, key = jr.split(rng)
+
+        if isinstance(action_space, gymnasium.spaces.Discrete):
+            return int(jr.randint(key, (), discrete_low, discrete_high))
+        if isinstance(action_space, gymnasium.spaces.Box):
+            return jr.uniform(key, action_space.shape, minval=low, maxval=high)
+        if isinstance(action_space, gymnasium.spaces.MultiDiscrete):
+            samples = np.fromiter(
+                (
+                    int(
+                        jr.randint(
+                            jr.fold_in(key, index),
+                            (),
+                            int(starts[index]),
+                            int(starts[index]) + int(counts[index]),
+                        )
+                    )
+                    for index in range(action_dim)
+                ),
+                dtype=action_dtype,
+                count=action_dim,
+            )
+            return samples.reshape(action_space.shape)
+        raise AssertionError("action-space validation and dispatch diverged")
+
+    return policy
+
+
 def make_random_policy(env: gymnasium.Env[Any, Any], seed: int = 0) -> Callable[[Array], Any]:
     """Create a random action policy for an environment.
 
@@ -205,66 +296,8 @@ def make_random_policy(env: gymnasium.Env[Any, Any], seed: int = 0) -> Callable[
     Returns:
         A callable that takes an observation and returns a random action
     """
-    import gymnasium
-
     seed = require_jax_seed(seed)
-    rng = jr.key(seed)
-    action_space = env.action_space
-
-    if isinstance(action_space, gymnasium.spaces.Discrete):
-        _require_float32_allocation("random Discrete action", _flatten_space(action_space))
-        discrete_low = int(action_space.start)
-        discrete_high = discrete_low + int(action_space.n)
-        if not _INT32_MIN <= discrete_low < discrete_high <= _INT32_MAX:
-            raise ValueError("Discrete action bounds must fit JAX signed int32")
-    elif isinstance(action_space, gymnasium.spaces.Box):
-        action_dim = _flatten_space(action_space)
-        _require_float32_allocation("random Box bounds and action", 3 * action_dim)
-        low = jnp.asarray(action_space.low, dtype=jnp.float32)
-        high = jnp.asarray(action_space.high, dtype=jnp.float32)
-        span = high - low
-        if not bool(
-            jnp.all(
-                jnp.isfinite(low)
-                & jnp.isfinite(high)
-                & (low <= high)
-                & jnp.isfinite(span)
-            )
-        ):
-            raise ValueError(
-                "Box random actions require finite ordered bounds with a finite float32 span"
-            )
-    elif isinstance(action_space, gymnasium.spaces.MultiDiscrete):
-        dimension = _flatten_space(action_space)
-        _require_float32_allocation("MultiDiscrete action bounds", 2 * dimension)
-        starts = tuple(int(value) for value in np.asarray(action_space.start).reshape((-1,)))
-        counts = tuple(int(value) for value in np.asarray(action_space.nvec).reshape((-1,)))
-        bounds = tuple(zip(starts, counts, strict=True))
-        if any(
-            not _INT32_MIN <= start < start + count <= _INT32_MAX
-            for start, count in bounds
-        ):
-            raise ValueError("MultiDiscrete action bounds must fit JAX signed int32")
-    else:
-        raise ValueError(f"Unsupported action space: {type(action_space).__name__}")
-
-    def policy(_obs: Array) -> Any:
-        nonlocal rng
-        rng, key = jr.split(rng)
-
-        if isinstance(action_space, gymnasium.spaces.Discrete):
-            return int(jr.randint(key, (), discrete_low, discrete_high))
-        elif isinstance(action_space, gymnasium.spaces.Box):
-            return jr.uniform(key, action_space.shape, minval=low, maxval=high)
-        elif isinstance(action_space, gymnasium.spaces.MultiDiscrete):
-            samples = [
-                int(jr.randint(jr.fold_in(key, index), (), start, start + count))
-                for index, (start, count) in enumerate(bounds)
-            ]
-            return np.asarray(samples, dtype=action_space.dtype).reshape(action_space.shape)
-        raise AssertionError("action-space validation and dispatch diverged")
-
-    return policy
+    return _make_random_policy(env, jr.key(seed))
 
 
 def make_epsilon_greedy_policy(
@@ -288,10 +321,9 @@ def make_epsilon_greedy_policy(
         raise ValueError("base_policy must be callable")
     epsilon = validated_float32_scalar("epsilon", epsilon, lower=0.0, upper=1.0)
     seed = require_jax_seed(seed)
-    if seed == JAX_KEY_SEED_MAX:
-        raise ValueError("seed must leave room for the epsilon-greedy random-policy subkey")
-    random_policy = make_random_policy(env, seed + 1)
     rng = jr.key(seed)
+    random_rng = jr.key(seed + 1) if seed < JAX_KEY_SEED_MAX else jr.fold_in(rng, 1)
+    random_policy = _make_random_policy(env, random_rng)
 
     def policy(obs: Array) -> Any:
         nonlocal rng
@@ -521,34 +553,30 @@ class GymnasiumStream:
         seed = require_jax_seed(seed)
         if policy is not None and not callable(policy):
             raise ValueError("policy must be callable or None")
+        gamma = validated_float32_scalar("gamma", gamma, lower=0.0, upper=1.0)
+        observation_dim = _flatten_space(env.observation_space)
+        action_dim = _flatten_space(env.action_space)
+        feature_dim = (
+            observation_dim + action_dim
+            if include_action_in_features
+            else observation_dim
+        )
+        target_dim = observation_dim if mode is PredictionMode.NEXT_STATE else 1
+        _require_float32_allocation("stream feature vector", feature_dim)
+        _require_float32_allocation("stream target vector", target_dim)
+
+        selected_policy = make_random_policy(env, seed) if policy is None else policy
         self._env = env
         self._mode = mode
-        self._gamma = validated_float32_scalar(
-            "gamma", gamma, lower=0.0, upper=1.0
-        )
+        self._gamma = gamma
         self._include_action_in_features = include_action_in_features
         self._seed = seed
         self._reset_count = 0
-
-        if policy is None:
-            self._policy = make_random_policy(env, seed)
-        else:
-            self._policy = policy
-
-        self._obs_dim = _flatten_space(env.observation_space)
-        self._action_dim = _flatten_space(env.action_space)
-
-        if include_action_in_features:
-            self._feature_dim = self._obs_dim + self._action_dim
-        else:
-            self._feature_dim = self._obs_dim
-
-        if mode == PredictionMode.NEXT_STATE:
-            self._target_dim = self._obs_dim
-        else:
-            self._target_dim = 1
-        _require_float32_allocation("stream feature vector", self._feature_dim)
-        _require_float32_allocation("stream target vector", self._target_dim)
+        self._policy = selected_policy
+        self._obs_dim = observation_dim
+        self._action_dim = action_dim
+        self._feature_dim = feature_dim
+        self._target_dim = target_dim
 
         self._current_obs: Array | None = None
         self._episode_count = 0
@@ -696,27 +724,26 @@ class TDStream:
         seed = require_jax_seed(seed)
         if policy is not None and not callable(policy):
             raise ValueError("policy must be callable or None")
-        self._env = env
-        self._gamma = validated_float32_scalar(
-            "gamma", gamma, lower=0.0, upper=1.0
+        gamma = validated_float32_scalar("gamma", gamma, lower=0.0, upper=1.0)
+        observation_dim = _flatten_space(env.observation_space)
+        action_dim = _flatten_space(env.action_space)
+        feature_dim = (
+            observation_dim + action_dim
+            if include_action_in_features
+            else observation_dim
         )
+        _require_float32_allocation("TD stream feature vector", feature_dim)
+
+        selected_policy = make_random_policy(env, seed) if policy is None else policy
+        self._env = env
+        self._gamma = gamma
         self._include_action_in_features = include_action_in_features
         self._seed = seed
         self._reset_count = 0
-
-        if policy is None:
-            self._policy = make_random_policy(env, seed)
-        else:
-            self._policy = policy
-
-        self._obs_dim = _flatten_space(env.observation_space)
-        self._action_dim = _flatten_space(env.action_space)
-
-        if include_action_in_features:
-            self._feature_dim = self._obs_dim + self._action_dim
-        else:
-            self._feature_dim = self._obs_dim
-        _require_float32_allocation("TD stream feature vector", self._feature_dim)
+        self._policy = selected_policy
+        self._obs_dim = observation_dim
+        self._action_dim = action_dim
+        self._feature_dim = feature_dim
 
         self._current_obs: Array | None = None
         self._episode_count = 0
@@ -837,11 +864,18 @@ def make_gymnasium_stream(
     import gymnasium
 
     env = gymnasium.make(env_id, **env_kwargs)
-    return GymnasiumStream(
-        env=env,
-        mode=mode,
-        policy=policy,
-        gamma=gamma,
-        include_action_in_features=include_action_in_features,
-        seed=seed,
-    )
+    try:
+        return GymnasiumStream(
+            env=env,
+            mode=mode,
+            policy=policy,
+            gamma=gamma,
+            include_action_in_features=include_action_in_features,
+            seed=seed,
+        )
+    except Exception:
+        try:
+            env.close()
+        except Exception:
+            pass
+        raise

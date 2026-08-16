@@ -127,7 +127,7 @@ def test_schedule_and_shape_contracts_fail_before_environment_execution(
         env.close()
 
 
-def test_seed_contracts_reject_aliases_spoofs_and_epsilon_subkey_overflow() -> None:
+def test_seed_contracts_reject_aliases_and_spoofs_without_shrinking_uint32_domain() -> None:
     class Spoof:
         @property
         def __class__(self) -> type[int]:  # type: ignore[override,misc]
@@ -144,8 +144,13 @@ def test_seed_contracts_reject_aliases_spoofs_and_epsilon_subkey_overflow() -> N
         for seed in (True, np.uint32(1), -1, 2**32, Spoof()):
             with pytest.raises(ValueError, match="seed"):
                 make_random_policy(env, seed=seed)  # type: ignore[arg-type]
-        with pytest.raises(ValueError, match="leave room"):
-            make_epsilon_greedy_policy(lambda _observation: 0, env, seed=2**32 - 1)
+        policy = make_epsilon_greedy_policy(
+            lambda _observation: 0,
+            env,
+            epsilon=1.0,
+            seed=2**32 - 1,
+        )
+        assert env.action_space.contains(policy(jnp.zeros(4)))
     finally:
         env.close()
 
@@ -171,6 +176,23 @@ def test_random_policy_respects_nonzero_and_multiaxis_discrete_starts() -> None:
     assert _flatten_space(multi) == 4
     assert _flatten_observation(multi.start, multi).shape == (4,)
     assert _flatten_action(action, multi).shape == (4,)
+
+
+def test_random_policy_rejects_discrete_ranges_wider_than_jax_int32() -> None:
+    class StubEnv:
+        def __init__(self, action_space: object):
+            self.action_space = action_space
+
+    discrete = gymnasium.spaces.Discrete(2**31, start=-(2**30))
+    with pytest.raises(ValueError, match="signed int32"):
+        make_random_policy(StubEnv(discrete), seed=0)  # type: ignore[arg-type]
+
+    multi = gymnasium.spaces.MultiDiscrete(
+        np.asarray([2**31], dtype=np.uint32),
+        start=np.asarray([-(2**30)], dtype=np.int64),
+    )
+    with pytest.raises(ValueError, match="signed int32"):
+        make_random_policy(StubEnv(multi), seed=0)  # type: ignore[arg-type]
 
 
 def test_random_box_policy_rejects_nonfinite_bounds() -> None:
@@ -251,6 +273,26 @@ def test_factory_rejects_noncallable_policy_before_environment_construction(
     with pytest.raises(ValueError, match="policy"):
         make_gymnasium_stream("CartPole-v1", policy=object())  # type: ignore[arg-type]
     assert calls == 0
+
+
+def test_factory_closes_environment_when_stream_validation_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class InvalidEnv:
+        observation_space = gymnasium.spaces.Tuple(
+            (gymnasium.spaces.Discrete(2), gymnasium.spaces.Discrete(2))
+        )
+        action_space = gymnasium.spaces.Discrete(2)
+        closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    env = InvalidEnv()
+    monkeypatch.setattr(gymnasium, "make", lambda *args, **kwargs: env)
+    with pytest.raises(ValueError, match="Unsupported space type"):
+        make_gymnasium_stream("invalid-v0")
+    assert env.closed
 
 
 class TestGymnasiumStreamRewardMode:
