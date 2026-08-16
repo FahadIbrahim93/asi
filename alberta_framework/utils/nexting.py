@@ -139,6 +139,41 @@ def _validate_rmse_inputs(
     return predictions.shape[0]
 
 
+def _scaled_rmse_terms(errors: Array) -> tuple[Array, Array, Array]:
+    """Return power-of-two scale, scaled errors, and their RMS."""
+    scale = jnp.max(jnp.abs(errors), axis=0)
+    _, exponent = jnp.frexp(scale)
+    scaled_errors = jnp.ldexp(errors, -exponent)
+    scaled_rmse = jnp.sqrt(jnp.mean(scaled_errors**2, axis=0))
+    return exponent, scaled_errors, scaled_rmse
+
+
+@jax.custom_jvp
+def _finite_rmse(errors: Array) -> Array:
+    """Compute finite-column RMSE without overflow or reciprocal underflow."""
+    exponent, _, scaled_rmse = _scaled_rmse_terms(errors)
+    return jnp.ldexp(scaled_rmse, exponent)
+
+
+@_finite_rmse.defjvp
+def _finite_rmse_jvp(
+    primals: tuple[Array],
+    tangents: tuple[Array],
+) -> tuple[Array, Array]:
+    """Differentiate in the scaled domain so huge finite gradients stay valid."""
+    (errors,), (errors_dot,) = primals, tangents
+    exponent, scaled_errors, scaled_rmse = _scaled_rmse_terms(errors)
+    rmse = jnp.ldexp(scaled_rmse, exponent)
+    # Zero is a valid subgradient for an all-zero column and avoids a 0 / 0.
+    safe_scaled_rmse = jnp.where(
+        scaled_rmse > 0.0,
+        scaled_rmse,
+        jnp.ones_like(scaled_rmse),
+    )
+    rmse_dot = jnp.mean(scaled_errors * errors_dot, axis=0) / safe_scaled_rmse
+    return rmse, rmse_dot
+
+
 def per_horizon_rmse(
     predictions: Float[Array, "T H"],
     forward_returns: Float[Array, "T H"],
@@ -173,8 +208,24 @@ def per_horizon_rmse(
     if burn_in:
         predictions = predictions[burn_in:]
         forward_returns = forward_returns[burn_in:]
-    sq_err = (predictions - forward_returns) ** 2
-    return jnp.sqrt(jnp.mean(sq_err, axis=0))
+    errors = predictions - forward_returns
+
+    # Scale before squaring so large, finite float32 errors do not overflow.
+    # Mask non-finite columns before every arithmetic operation, and divide by
+    # one for all-zero columns.  This keeps debug/checkify modes free of
+    # discarded overflow and 0/0 operations while retaining NaN/Inf diagnostics
+    # in the final result.
+    finite_columns = jnp.all(jnp.isfinite(errors), axis=0)
+    safe_errors = jnp.where(finite_columns[None, :], errors, jnp.zeros_like(errors))
+    # Arbitrary division by a near-max float32 scale can lower to a reciprocal
+    # that underflows to zero.  ldexp performs exact power-of-two scaling and
+    # keeps the normalized magnitudes in range without that reciprocal.
+    stable_rmse = _finite_rmse(safe_errors)
+    # A maximum absolute error carries the desired diagnostic: NaN if any
+    # error is NaN, otherwise Inf if any error is infinite.  Deriving it from
+    # the input avoids constructing discarded NaN/Inf literals on finite calls.
+    nonfinite_rmse = jnp.max(jnp.abs(errors), axis=0)
+    return jnp.where(finite_columns, stable_rmse, nonfinite_rmse)
 
 
 def per_horizon_running_rmse(

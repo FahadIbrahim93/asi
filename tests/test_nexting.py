@@ -9,6 +9,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.experimental import checkify
 
 from alberta_framework.utils.nexting import (
     forward_view_returns,
@@ -120,6 +121,107 @@ class TestMultiChannel:
 
 
 class TestRMSE:
+    def test_large_finite_errors_do_not_overflow(self) -> None:
+        predictions = jnp.asarray([[2.0e20], [2.0e20]], dtype=jnp.float32)
+        returns = jnp.zeros_like(predictions)
+
+        with jax.debug_infs(True):
+            rmse = per_horizon_rmse(predictions, returns)
+
+        assert bool(jnp.isfinite(rmse[0]))
+        np.testing.assert_allclose(np.asarray(rmse), np.asarray([2.0e20], dtype=np.float32))
+
+    def test_zero_error_does_not_form_a_discarded_zero_division(self) -> None:
+        predictions = jnp.zeros((3, 2), dtype=jnp.float32)
+
+        with jax.debug_nans(True):
+            rmse = per_horizon_rmse(predictions, predictions)
+
+        np.testing.assert_array_equal(np.asarray(rmse), np.zeros(2, dtype=np.float32))
+
+    def test_near_max_finite_errors_do_not_underflow_during_scaling(self) -> None:
+        values = np.linspace(-1.0e38, 1.0e38, 257, dtype=np.float32)[:, None]
+        predictions = jnp.asarray(values)
+        returns = jnp.zeros_like(predictions)
+        reference = np.sqrt(np.mean(np.square(values.astype(np.float64)), axis=0))
+
+        with jax.debug_infs(True):
+            rmse = per_horizon_rmse(predictions, returns)
+
+        assert bool(jnp.isfinite(rmse[0]))
+        np.testing.assert_allclose(np.asarray(rmse), reference, rtol=2e-6)
+        compiled = jax.jit(per_horizon_rmse)(predictions, returns)
+        np.testing.assert_allclose(np.asarray(compiled), reference, rtol=2e-6)
+
+    def test_finite_stable_rmse_has_no_checkify_float_errors(self) -> None:
+        checked = checkify.checkify(per_horizon_rmse, errors=checkify.float_checks)
+
+        for predictions in (
+            jnp.zeros((3, 1), dtype=jnp.float32),
+            jnp.full((3, 1), 2.0e20, dtype=jnp.float32),
+            jnp.linspace(-1.0e38, 1.0e38, 257, dtype=jnp.float32)[:, None],
+        ):
+            error, rmse = checked(predictions, jnp.zeros_like(predictions))
+            error.throw()
+            chex.assert_tree_all_finite(rmse)
+
+    def test_huge_finite_error_gradient_is_correct_eager_and_jit(self) -> None:
+        predictions = jnp.asarray([[3.0e38], [-1.0e38]], dtype=jnp.float32)
+        returns = jnp.zeros_like(predictions)
+
+        def scalar_rmse(values: jax.Array) -> jax.Array:
+            return per_horizon_rmse(values, returns)[0]
+
+        reference_values = np.asarray(predictions, dtype=np.float64)
+        reference_rmse = np.sqrt(np.mean(reference_values**2, axis=0))[0]
+        expected = reference_values / (predictions.shape[0] * reference_rmse)
+
+        eager = jax.grad(scalar_rmse)(predictions)
+        compiled = jax.jit(jax.grad(scalar_rmse))(predictions)
+
+        assert bool(jnp.all(jnp.isfinite(eager)))
+        assert bool(jnp.all(jnp.isfinite(compiled)))
+        np.testing.assert_allclose(np.asarray(eager), expected, rtol=2e-6, atol=0.0)
+        np.testing.assert_allclose(np.asarray(compiled), expected, rtol=2e-6, atol=0.0)
+
+    @pytest.mark.parametrize("magnitude", [2.0e20, 1.0e38, 3.0e38])
+    def test_large_finite_rmse_has_stable_eager_and_jit_gradients(
+        self,
+        magnitude: float,
+    ) -> None:
+        predictions = jnp.full((2, 1), magnitude, dtype=jnp.float32)
+        returns = jnp.zeros_like(predictions)
+
+        def loss(values: jax.Array) -> jax.Array:
+            return jnp.sum(per_horizon_rmse(values, returns))
+
+        expected = jnp.full_like(predictions, 0.5)
+        eager = jax.grad(loss)(predictions)
+        compiled = jax.jit(jax.grad(loss))(predictions)
+
+        chex.assert_trees_all_close(eager, expected, rtol=5e-6, atol=0.0)
+        chex.assert_trees_all_close(compiled, expected, rtol=5e-6, atol=0.0)
+
+    def test_zero_rmse_uses_zero_eager_jit_and_forward_gradient_convention(self) -> None:
+        predictions = jnp.zeros((3, 2), dtype=jnp.float32)
+        returns = jnp.zeros_like(predictions)
+
+        def loss(values: jax.Array) -> jax.Array:
+            return jnp.sum(per_horizon_rmse(values, returns))
+
+        expected = jnp.zeros_like(predictions)
+        eager = jax.grad(loss)(predictions)
+        compiled = jax.jit(jax.grad(loss))(predictions)
+        _primal, tangent = jax.jvp(
+            lambda values: per_horizon_rmse(values, returns),
+            (predictions,),
+            (jnp.ones_like(predictions),),
+        )
+
+        chex.assert_trees_all_equal(eager, expected)
+        chex.assert_trees_all_equal(compiled, expected)
+        chex.assert_trees_all_equal(tangent, jnp.zeros((2,), dtype=jnp.float32))
+
     def test_zero_error_when_predictions_match(self) -> None:
         t, h = 50, 4
         truths = jnp.ones((t, h))
