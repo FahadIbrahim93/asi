@@ -1404,14 +1404,14 @@ class MLPLearner:
         )
         previous_checked = state
         if self._gamma * self._lamda == 0.0:
-            previous_checked = state.replace(
+            previous_checked = state.replace(  # type: ignore[attr-defined]
                 traces=tuple(jnp.zeros_like(trace) for trace in state.traces),
             )
         if (
             state.neuron_utility is not None
             and self._neuron_utility_decay == 0.0
         ):
-            previous_checked = previous_checked.replace(
+            previous_checked = previous_checked.replace(  # type: ignore[attr-defined]
                 neuron_utility=tuple(
                     jnp.zeros_like(utility) for utility in state.neuron_utility
                 ),
