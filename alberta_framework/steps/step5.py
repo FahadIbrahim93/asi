@@ -24,12 +24,10 @@ References:
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from numbers import Real
 from typing import Any, cast
 
 import jax.numpy as jnp
 import jax.random as jr
-import numpy as np
 
 from alberta_framework.core.average_reward import (
     DifferentialTDArrayResult,
@@ -37,6 +35,7 @@ from alberta_framework.core.average_reward import (
     DifferentialTDLearner,
     run_differential_td_from_arrays,
 )
+from alberta_framework.steps._float32_validation import finite_real_and_float32
 
 _STEP5_CONFIG_KEYS = frozenset(
     {"step_size", "average_reward_step_size", "trace_decay"}
@@ -49,16 +48,8 @@ _STEP5_CONFIG_KEYS_ERROR = (
 
 def _finite_float32_scalar(name: str, value: object) -> float:
     """Validate a real scalar before the core narrows it to float32."""
-    if isinstance(value, bool) or not isinstance(value, Real):
-        raise ValueError(f"{name} must be a real scalar")
-    try:
-        with np.errstate(invalid="ignore", over="ignore"):
-            narrowed = np.asarray(value, dtype=np.float32)
-    except (FloatingPointError, OverflowError, TypeError, ValueError):
-        raise ValueError(f"{name} must narrow to a finite float32") from None
-    if narrowed.shape != () or not bool(np.isfinite(narrowed)):
-        raise ValueError(f"{name} must narrow to a finite float32")
-    return float(narrowed)
+    _, narrowed = finite_real_and_float32(name, value)
+    return narrowed
 
 
 @dataclass(frozen=True)
