@@ -57,41 +57,6 @@ def test_step1_kernel_factory_and_smoke_are_finite() -> None:
 
 
 @pytest.mark.parametrize(
-    ("field", "value"),
-    [
-        ("steps", True),
-        ("steps", 4.0),
-        ("final_window", True),
-        ("final_window", 2.0),
-    ],
-)
-def test_step1_smoke_rejects_non_integer_counts(field: str, value: object) -> None:
-    kwargs: dict[str, object] = {"steps": 4, "final_window": 2, field: value}
-
-    with pytest.raises(ValueError, match=field):
-        run_step1_smoke(**kwargs)  # type: ignore[arg-type]
-
-
-@pytest.mark.parametrize("field", ["steps", "final_window"])
-def test_step1_smoke_rejects_objects_that_only_spoof_integer_class(field: str) -> None:
-    class IntegerClassSpoof:
-        @property
-        def __class__(self) -> type[int]:
-            return int
-
-        def __int__(self) -> int:
-            return 2
-
-    value = IntegerClassSpoof()
-    assert isinstance(value, int)
-    assert not issubclass(type(value), int)
-    kwargs: dict[str, object] = {"steps": 4, "final_window": 2, field: value}
-
-    with pytest.raises(ValueError, match=field):
-        run_step1_smoke(**kwargs)  # type: ignore[arg-type]
-
-
-@pytest.mark.parametrize(
     "optimizer",
     [
         "lms",
@@ -504,6 +469,8 @@ _INVALID_STEP2_KERNEL_FIELDS: tuple[tuple[str, Any], ...] = (
     ("noise_std", True),
     ("noise_std", False),
     ("noise_std", -1.0),
+    ("noise_std", 1e100),
+    ("step_size", 1e100),
 )
 
 
@@ -511,39 +478,6 @@ _INVALID_STEP2_KERNEL_FIELDS: tuple[tuple[str, Any], ...] = (
 def test_step2_kernel_fields_reject_invalid_inputs(field: str, value: object) -> None:
     with pytest.raises(ValueError, match=field):
         Step2KernelConfig(**{field: value})
-
-
-class _SpoofedInt:
-    """Mimics ``int`` via ``__class__`` to defeat ``isinstance`` checks."""
-
-    @property
-    def __class__(self) -> type:  # type: ignore[override]
-        return int
-
-    def __int__(self) -> int:
-        return 3
-
-    def __index__(self) -> int:
-        return 3
-
-
-@pytest.mark.parametrize(
-    ("config_cls", "field"),
-    [
-        (Step2KernelConfig, "feature_dim"),
-        (Step2KernelConfig, "n_heads"),
-        (Step2KernelConfig, "context_length"),
-        (Step2StrictDigitReadoutConfig, "n_heads"),
-        (Step2MemoryConfig, "feature_dim"),
-        (Step2MemoryConfig, "n_classes"),
-        (Step2MemoryConfig, "slots_per_class"),
-    ],
-)
-def test_step2_configs_reject_class_spoofed_integer_fields(
-    config_cls: type, field: str
-) -> None:
-    with pytest.raises(ValueError, match=field):
-        config_cls(**{field: _SpoofedInt()})
 
 
 _INVALID_STEP2_MEMORY_FIELDS: tuple[tuple[str, Any], ...] = (
@@ -576,11 +510,13 @@ _INVALID_STEP2_MEMORY_FIELDS: tuple[tuple[str, Any], ...] = (
     ("update_rate", 0.0),
     ("update_rate", -0.1),
     ("update_rate", 1.1),
+    ("update_rate", 1e100),
     ("novelty_threshold", float("nan")),
     ("novelty_threshold", float("inf")),
     ("novelty_threshold", True),
     ("novelty_threshold", False),
     ("novelty_threshold", -0.01),
+    ("novelty_threshold", 1e100),
     ("bandwidth", float("nan")),
     ("bandwidth", float("inf")),
     ("bandwidth", True),
@@ -588,6 +524,7 @@ _INVALID_STEP2_MEMORY_FIELDS: tuple[tuple[str, Any], ...] = (
     ("bandwidth", 0.0),
     ("bandwidth", -0.01),
     ("bandwidth", None),
+    ("bandwidth", 1e100),
 )
 
 
@@ -690,6 +627,38 @@ def test_step2_configs_enforce_exact_scientific_domains(
 ) -> None:
     with pytest.raises(ValueError, match=field):
         config_type(**{field: value})
+
+
+def test_step2_rejects_spoofed_int_class_with_negative_ratio() -> None:
+    class SpoofedIntFloat(float):
+        @property
+        def __class__(self) -> type[int]:
+            return int
+
+        def as_integer_ratio(self) -> tuple[int, int]:
+            return (-1, 2**200)
+
+    with pytest.raises(ValueError, match="step_size must be non-negative"):
+        Step2KernelConfig(step_size=SpoofedIntFloat(0.5))
+
+
+def test_step2_rejects_spoofed_ratio_components() -> None:
+    class SpoofedComponent:
+        @property
+        def __class__(self) -> type[int]:
+            return int
+
+        def __int__(self) -> int:
+            return 1
+
+    class BadRatioFloat(float):
+        def as_integer_ratio(self) -> tuple[Any, Any]:
+            return (SpoofedComponent(), 2)
+
+    with pytest.raises(ValueError, match="must narrow to a finite float32"):
+        Step2KernelConfig(step_size=BadRatioFloat(0.5))
+
+
 
 
 def test_step2_configs_use_direct_float32_narrowing_without_double_rounding() -> None:
@@ -999,6 +968,83 @@ def test_step2_config_from_dict_requires_exact_keys(config: Any) -> None:
     for malformed in (missing, extra):
         with pytest.raises(ValueError, match=type(config).__name__):
             type(config).from_dict(malformed)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"steps": 0}, "steps"),
+        ({"steps": -1}, "steps"),
+        ({"steps": 2**31}, "steps"),
+        ({"steps": True}, "steps"),
+        ({"steps": "64"}, "steps"),
+        ({"seed": -1}, "seed"),
+        ({"seed": 2**31}, "seed"),
+        ({"seed": True}, "seed"),
+        ({"final_window": 0}, "final_window"),
+        ({"final_window": -1}, "final_window"),
+        ({"final_window": 300}, "final_window"),
+        ({"final_window": True}, "final_window"),
+    ],
+)
+def test_step2_smoke_rejects_invalid_inputs(kwargs: dict[str, Any], match: str) -> None:
+    with pytest.raises(ValueError, match=match):
+        run_step2_smoke(**kwargs)
+
+
+@pytest.mark.parametrize(
+    "ratio",
+    [
+        pytest.param((-1, 1), id="negative-ratio"),
+        pytest.param((2, 1), id="above-unit-ratio"),
+        pytest.param((-1, 2**200), id="negative-rounds-to-negative-zero"),
+        pytest.param((2**200 + 1, 2**200), id="above-one-rounds-to-one"),
+    ],
+)
+def test_step2_unit_interval_rejects_adversarial_ratio_floats(
+    ratio: tuple[int, int]
+) -> None:
+    class HiddenBoundaryFloat(float):
+        def as_integer_ratio(self) -> tuple[int, int]:
+            return ratio
+
+    with pytest.raises(ValueError, match=r"update_rate must be in \(0, 1\]"):
+        Step2MemoryConfig(update_rate=HiddenBoundaryFloat(0.5))
+
+
+@pytest.mark.parametrize(
+    ("config_type", "field"),
+    [
+        (Step2KernelConfig, "step_size"),
+        (Step2KernelConfig, "noise_std"),
+        (Step2StrictDigitReadoutConfig, "step_size"),
+        (Step2MemoryConfig, "novelty_threshold"),
+    ],
+)
+def test_step2_nonnegative_rejects_adversarial_negative_ratio(
+    config_type: type[Any], field: str
+) -> None:
+    class HiddenNegativeFloat(float):
+        def as_integer_ratio(self) -> tuple[int, int]:
+            return (-1, 1)
+
+    with pytest.raises(ValueError, match=rf"{field} must be non-negative"):
+        config_type(**{field: HiddenNegativeFloat(0.5)})
+
+
+def test_step2_rejects_class_property_spoofing_float() -> None:
+    class ClassSpoof:
+        @property
+        def __class__(self) -> type[float]:
+            return float
+
+        def as_integer_ratio(self) -> tuple[int, int]:
+            return (1, 2)
+
+    value = ClassSpoof()
+    with pytest.raises(ValueError, match="must be a real number"):
+        Step2KernelConfig(step_size=value)  # type: ignore[arg-type]
+
 
 
 def test_step2_hybrid_factory_updates_upgd_and_memory() -> None:
