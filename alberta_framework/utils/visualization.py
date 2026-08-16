@@ -208,10 +208,6 @@ def plot_final_performance_bars(
     except ImportError:
         raise ImportError("matplotlib is required. Install with: pip install matplotlib")
 
-    if ax is None:
-        fig, ax = plt.subplots()
-    else:
-        fig = cast("Figure", ax.figure)
     names = list(results.keys())
     if not names:
         raise ValueError("plot_final_performance_bars requires at least one result")
@@ -221,6 +217,11 @@ def plot_final_performance_bars(
     stds_arr = np.asarray(stds, dtype=np.float64)
     if not np.all(np.isfinite(means_arr)) or not np.all(np.isfinite(stds_arr)):
         raise ValueError("plot_final_performance_bars requires finite metric means and stds")
+
+    if ax is None:
+        fig, ax = plt.subplots()
+    else:
+        fig = cast("Figure", ax.figure)
 
     # Default colors
     default_colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
