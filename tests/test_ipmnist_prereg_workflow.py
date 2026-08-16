@@ -12,8 +12,10 @@ _ROOT = Path(__file__).resolve().parents[1]
 _DRIVER = runpy.run_path(_ROOT / ".github" / "scripts" / "ipmnist_prereg.py")
 _PROTOCOLS = cast(dict[str, Any], _DRIVER["PROTOCOLS"])
 _authorization_line = cast(Any, _DRIVER["authorization_line"])
+_registration_amendment_line = cast(Any, _DRIVER["registration_amendment_line"])
 _classify_outcome = cast(Any, _DRIVER["classify_outcome"])
 _strict_json = cast(Any, _DRIVER["_strict_json"])
+_validate_runtime = cast(Any, _DRIVER["_validate_runtime"])
 _validate_summary_reconstruction = cast(Any, _DRIVER["_validate_summary_reconstruction"])
 _validate_result_bundle = cast(Any, _DRIVER["validate_result_bundle"])
 _verify_launch_authorization = cast(Any, _DRIVER["verify_launch_authorization"])
@@ -53,9 +55,29 @@ def test_authorization_line_binds_every_launch_identity() -> None:
         "ASI_PREREG_LAUNCH_V1 issue=51 protocol=issue51 "
         f"source={'1' * 40} tree={'2' * 40} uv_lock_sha256={'3' * 64} "
         f"workflow_blob_sha1={'4' * 40} driver_blob_sha1={'5' * 40} "
-        "ref=ipmnist-prereg-example runner=macos-14-arm64 seeds=0,1,2 "
-        "registration_amendment=source-and-runner-as-bound "
+        "ref=ipmnist-prereg-example "
+        "runner=github-hosted-macos-14-arm64-apple-m1 seeds=0,1,2 n=3 "
         "protocol_approval=approved seed_budget=approved compute=authorized-uncompensated"
+    )
+
+
+def test_issue188_amendment_line_binds_the_complete_registered_change() -> None:
+    line = _registration_amendment_line(
+        _PROTOCOLS["issue188"],
+        source="1" * 40,
+        tree="2" * 40,
+        uv_lock_sha256="3" * 64,
+        workflow_blob_sha1="4" * 40,
+        driver_blob_sha1="5" * 40,
+        ref_name="ipmnist-prereg-example",
+    )
+    assert line == (
+        "ASI_PREREG_AMENDMENT_V1 issue=188 protocol=issue188 "
+        f"source={'1' * 40} tree={'2' * 40} uv_lock_sha256={'3' * 64} "
+        f"workflow_blob_sha1={'4' * 40} driver_blob_sha1={'5' * 40} "
+        "ref=ipmnist-prereg-example "
+        "runner=github-hosted-macos-14-arm64-apple-m1 seeds=3,4,5,6,7,8,9,10,11,12 "
+        "n=10 compute=uncompensated"
     )
 
 
@@ -222,6 +244,144 @@ def test_launch_authorization_requires_valid_utc_timestamps(
         )
 
 
+def _issue188_authorization_comment(**overrides: Any) -> dict[str, Any]:
+    body = _authorization_line(
+        _PROTOCOLS["issue188"],
+        source="1" * 40,
+        tree="2" * 40,
+        uv_lock_sha256="3" * 64,
+        workflow_blob_sha1="4" * 40,
+        driver_blob_sha1="5" * 40,
+        ref_name="ipmnist-prereg-example",
+    )
+    comment: dict[str, Any] = {
+        "id": 456,
+        "body": body,
+        "user": {"id": 18_633_264, "login": "lalalune"},
+        "author_association": "MEMBER",
+        "created_at": "2026-08-16T09:30:00Z",
+        "updated_at": "2026-08-16T09:30:00Z",
+        "html_url": "https://example.invalid/comment/456",
+    }
+    comment.update(overrides)
+    return comment
+
+
+def _issue188_amendment_comment(**overrides: Any) -> dict[str, Any]:
+    body = _registration_amendment_line(
+        _PROTOCOLS["issue188"],
+        source="1" * 40,
+        tree="2" * 40,
+        uv_lock_sha256="3" * 64,
+        workflow_blob_sha1="4" * 40,
+        driver_blob_sha1="5" * 40,
+        ref_name="ipmnist-prereg-example",
+    )
+    comment: dict[str, Any] = {
+        "id": 455,
+        "body": body,
+        "user": {"id": 18_633_264, "login": "lalalune"},
+        "author_association": "MEMBER",
+        "created_at": "2026-08-16T09:00:00Z",
+        "updated_at": "2026-08-16T09:00:00Z",
+        "html_url": "https://example.invalid/comment/455",
+    }
+    comment.update(overrides)
+    return comment
+
+
+def _verify_issue188(
+    monkeypatch: pytest.MonkeyPatch,
+    comments: list[dict[str, Any]],
+) -> dict[str, Any]:
+    current = {
+        "id": 123,
+        "event": "workflow_dispatch",
+        "head_sha": "1" * 40,
+        "display_title": f"ipmnist-issue188-{'1' * 40}",
+        "run_attempt": 1,
+        "path": ".github/workflows/ipmnist-prereg.yml",
+        "created_at": "2026-08-16T10:00:00Z",
+        "html_url": "https://example.invalid/run/123",
+    }
+    monkeypatch.setitem(_DRIVER_GLOBALS, "_github_json", lambda *_args, **_kwargs: current)
+    monkeypatch.setitem(_DRIVER_GLOBALS, "_workflow_runs", lambda *_args, **_kwargs: [current])
+    monkeypatch.setitem(_DRIVER_GLOBALS, "_github_pages", lambda *_args, **_kwargs: comments)
+    return cast(
+        dict[str, Any],
+        _verify_launch_authorization(
+            protocol_key="issue188",
+            repository="elizaOS/asi",
+            source="1" * 40,
+            tree="2" * 40,
+            uv_lock_sha256="3" * 64,
+            workflow_blob_sha1="4" * 40,
+            driver_blob_sha1="5" * 40,
+            ref_name="ipmnist-prereg-example",
+            run_id=123,
+            run_attempt=1,
+            token="token",
+        ),
+    )
+
+
+def test_issue188_requires_one_exact_amendment_before_final_authorization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    amendment = _issue188_amendment_comment()
+    authorization = _issue188_authorization_comment()
+    payload = _verify_issue188(monkeypatch, [amendment, authorization])
+    assert payload["registration_amendment_comment_id"] == 455
+    assert payload["registration_amendment_created_at"] == "2026-08-16T09:00:00Z"
+
+    with pytest.raises(RuntimeError, match="amendment"):
+        _verify_issue188(monkeypatch, [authorization])
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"body": "ASI_PREREG_AMENDMENT_V1 source=wrong"},
+        {"author_association": "OWNER"},
+        {"user": {"id": 1, "login": "lalalune"}},
+        {"updated_at": "2026-08-16T09:15:00Z"},
+    ],
+)
+def test_issue188_rejects_inexact_edited_or_wrong_author_amendment(
+    monkeypatch: pytest.MonkeyPatch,
+    overrides: dict[str, Any],
+) -> None:
+    with pytest.raises(RuntimeError, match="amendment"):
+        _verify_issue188(
+            monkeypatch,
+            [_issue188_amendment_comment(**overrides), _issue188_authorization_comment()],
+        )
+
+
+@pytest.mark.parametrize(
+    "timestamp",
+    [
+        "not-a-timestamp",
+        "2026-08-16T09:00:00",
+        "2026-08-16T10:00:00+01:00",
+        "2026-08-16T09:30:00Z",
+        "2026-08-16T09:45:00Z",
+    ],
+)
+def test_issue188_amendment_must_be_valid_utc_and_precede_authorization(
+    monkeypatch: pytest.MonkeyPatch,
+    timestamp: str,
+) -> None:
+    with pytest.raises(RuntimeError, match="amendment|timestamp"):
+        _verify_issue188(
+            monkeypatch,
+            [
+                _issue188_amendment_comment(created_at=timestamp, updated_at=timestamp),
+                _issue188_authorization_comment(),
+            ],
+        )
+
+
 def _searched_workflow_run(run_id: int) -> dict[str, Any]:
     return {
         "id": run_id,
@@ -339,6 +499,10 @@ def test_workflow_installs_exact_uv_managed_python() -> None:
     assert 'uv python find --managed-python --no-project 3.12.12' in workflow
     assert "CPython 3.12.12 arm64" in workflow
     assert '--python "$PYTHON_PATH"' in workflow
+    assert '"jax_disable_jit": False' in workflow
+    assert '"jax_random_seed_offset": 0' in workflow
+    assert '"jax_default_prng_impl": "threefry2x32"' in workflow
+    assert '[[ -e "$target" || -L "$target" ]]' in workflow
 
 
 def test_summary_reconstruction_rejects_resigned_derived_metrics_and_manifest() -> None:
@@ -470,6 +634,28 @@ def _runtime_environment() -> dict[str, object]:
     }
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("jax_enable_x64", True),
+        ("jax_default_matmul_precision", "highest"),
+        ("jax_disable_jit", True),
+        ("jax_numpy_dtype_promotion", "strict"),
+        ("jax_numpy_rank_promotion", "raise"),
+        ("jax_random_seed_offset", 1),
+        ("jax_threefry_partitionable", False),
+        ("jax_default_prng_impl", "rbg"),
+    ],
+)
+def test_runtime_rejects_any_jax_semantic_config_drift(field: str, value: object) -> None:
+    environment = _runtime_environment()
+    jax_binding = cast(dict[str, Any], environment["jax"])
+    config = cast(dict[str, Any], jax_binding["config"])
+    config[field] = value
+    with pytest.raises(ValueError, match="JAX config"):
+        _validate_runtime(environment)
+
+
 def _write_issue51_bundle(root: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     from alberta_framework.benchmarks.ipmnist_screening import (
         ScreeningRunResult,
@@ -537,7 +723,7 @@ def _write_runner_receipt(root: Path) -> Path:
     environment = _runtime_environment()
     jax_binding = cast(dict[str, Any], environment["jax"])
     receipt = {
-        "schema": "asi.ipmnist_prereg.runner.v1",
+        "schema": "asi.ipmnist_prereg.runner.v2",
         "runner_label": "macos-14",
         "cpu_brand": "Apple M1 (Virtual)",
         "platform": "macOS-14-arm64",
@@ -549,6 +735,7 @@ def _write_runner_receipt(root: Path) -> Path:
         },
         "jax_backend": "cpu",
         "jax_devices": jax_binding["devices"],
+        "jax_config": jax_binding["config"],
     }
     path = root / "runner.json"
     path.write_text(json.dumps(receipt, allow_nan=False), encoding="utf-8")
@@ -570,6 +757,58 @@ def test_result_bundle_recomputes_summary_from_exact_shards(
     )
     assert result["outcome"] == "replicated"
     assert result["mean_diff"] == pytest.approx(0.005)
+
+
+def test_result_bundle_rejects_consistently_resigned_jax_config_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from alberta_framework.benchmarks.ipmnist_screening import merge_shards
+
+    summary_path = _write_issue51_bundle(tmp_path, monkeypatch)
+    shards_dir = summary_path.parent / "shards"
+    for path in shards_dir.glob("*.json"):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["environment"]["jax"]["config"]["jax_disable_jit"] = True
+        path.write_text(json.dumps(payload, allow_nan=False), encoding="utf-8")
+    paths = sorted(path.relative_to(tmp_path) for path in shards_dir.glob("*.json"))
+    summary_path.write_text(
+        json.dumps(
+            merge_shards(paths, control_name="sigma0_shiftnorm_d099", slope_window=15),
+            allow_nan=False,
+        ),
+        encoding="utf-8",
+    )
+    runner_receipt = _write_runner_receipt(tmp_path)
+
+    with pytest.raises(ValueError, match="JAX config"):
+        _validate_result_bundle(
+            protocol_key="issue51",
+            root=tmp_path,
+            runner_receipt=runner_receipt,
+            source="1" * 40,
+            tree="2" * 40,
+            uv_lock_sha256="4" * 64,
+        )
+
+
+def test_result_bundle_rejects_runner_jax_config_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_issue51_bundle(tmp_path, monkeypatch)
+    runner_receipt = _write_runner_receipt(tmp_path)
+    payload = json.loads(runner_receipt.read_text(encoding="utf-8"))
+    payload["jax_config"]["jax_random_seed_offset"] = 1
+    runner_receipt.write_text(json.dumps(payload, allow_nan=False), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="JAX config"):
+        _validate_result_bundle(
+            protocol_key="issue51",
+            root=tmp_path,
+            runner_receipt=runner_receipt,
+            source="1" * 40,
+            tree="2" * 40,
+            uv_lock_sha256="4" * 64,
+        )
 
 
 def test_result_bundle_rejects_resigned_summary_metric(

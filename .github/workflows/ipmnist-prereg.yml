@@ -113,7 +113,7 @@ jobs:
             *) echo "unsupported protocol" >&2; exit 1 ;;
           esac
           target="outputs/ipmnist_screening/$namespace"
-          if [[ -e "$target" ]]; then
+          if [[ -e "$target" || -L "$target" ]]; then
             echo "append-only namespace is already occupied: $target" >&2
             exit 1
           fi
@@ -194,6 +194,16 @@ jobs:
               "numpy": "2.5.1",
               "scikit-learn": "1.9.0",
           }
+          expected_jax_config = {
+              "jax_enable_x64": False,
+              "jax_default_matmul_precision": None,
+              "jax_disable_jit": False,
+              "jax_numpy_dtype_promotion": "standard",
+              "jax_numpy_rank_promotion": "allow",
+              "jax_random_seed_offset": 0,
+              "jax_threefry_partitionable": True,
+              "jax_default_prng_impl": "threefry2x32",
+          }
           assert platform.python_implementation() == "CPython"
           assert platform.python_version() == "3.12.12"
           assert platform.system() == "Darwin"
@@ -203,12 +213,29 @@ jobs:
           assert jax.default_backend() == "cpu"
           assert len(devices) == 1
           assert devices[0].platform == "cpu"
+          jax_config = {
+              "jax_enable_x64": bool(jax.config.jax_enable_x64),
+              "jax_default_matmul_precision": (
+                  None
+                  if jax.config.jax_default_matmul_precision is None
+                  else str(jax.config.jax_default_matmul_precision)
+              ),
+              "jax_disable_jit": bool(jax.config.jax_disable_jit),
+              "jax_numpy_dtype_promotion": str(jax.config.jax_numpy_dtype_promotion),
+              "jax_numpy_rank_promotion": str(jax.config.jax_numpy_rank_promotion),
+              "jax_random_seed_offset": int(jax.config.jax_random_seed_offset),
+              "jax_threefry_partitionable": bool(
+                  jax.config.jax_threefry_partitionable
+              ),
+              "jax_default_prng_impl": str(jax.config.jax_default_prng_impl),
+          }
+          assert jax_config == expected_jax_config
           destination = Path(sys.argv[2])
           destination.parent.mkdir(parents=True, exist_ok=True)
           encoded = (
               json.dumps(
                   {
-                      "schema": "asi.ipmnist_prereg.runner.v1",
+                      "schema": "asi.ipmnist_prereg.runner.v2",
                       "runner_label": "macos-14",
                       "cpu_brand": sys.argv[1],
                       "platform": platform.platform(),
@@ -216,6 +243,7 @@ jobs:
                       "python": platform.python_version(),
                       "packages": expected,
                       "jax_backend": jax.default_backend(),
+                      "jax_config": jax_config,
                       "jax_devices": [
                           {
                               "id": int(device.id),

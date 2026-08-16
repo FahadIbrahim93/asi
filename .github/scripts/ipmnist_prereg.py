@@ -21,6 +21,7 @@ DRIVER_PATH: Final = ".github/scripts/ipmnist_prereg.py"
 AUTHORIZED_LOGIN: Final = "lalalune"
 AUTHORIZED_USER_ID: Final = 18_633_264
 AUTHORIZED_ASSOCIATION: Final = "MEMBER"
+RUNNER_IDENTITY: Final = "github-hosted-macos-14-arm64-apple-m1"
 EXPECTED_CONFIG: Final = {
     "n_tasks": 60,
     "task_length": 5000,
@@ -33,6 +34,16 @@ EXPECTED_POLICY: Final = {
     "evidence_class": "development_screening_diagnostic",
     "development_only": True,
     "scientific_promotion_allowed": False,
+}
+EXPECTED_JAX_CONFIG: Final = {
+    "jax_enable_x64": False,
+    "jax_default_matmul_precision": None,
+    "jax_disable_jit": False,
+    "jax_numpy_dtype_promotion": "standard",
+    "jax_numpy_rank_promotion": "allow",
+    "jax_random_seed_offset": 0,
+    "jax_threefry_partitionable": True,
+    "jax_default_prng_impl": "threefry2x32",
 }
 
 
@@ -79,7 +90,7 @@ def _lower_hex(value: str, length: int, *, name: str) -> str:
     return value
 
 
-def authorization_line(
+def _launch_binding(
     protocol: Protocol,
     *,
     source: str,
@@ -98,14 +109,61 @@ def authorization_line(
         raise ValueError("ref_name must be a non-empty tag name without whitespace")
     seeds = ",".join(str(seed) for seed in protocol.seeds)
     return (
-        f"ASI_PREREG_LAUNCH_V1 issue={protocol.issue} protocol={protocol.key} "
+        f"issue={protocol.issue} protocol={protocol.key} "
         f"source={source} tree={tree} uv_lock_sha256={uv_lock_sha256} "
         f"workflow_blob_sha1={workflow_blob_sha1} driver_blob_sha1={driver_blob_sha1} "
-        f"ref={ref_name} runner=macos-14-arm64 seeds={seeds} "
-        "registration_amendment=source-and-runner-as-bound "
+        f"ref={ref_name} runner={RUNNER_IDENTITY} seeds={seeds} n={len(protocol.seeds)}"
+    )
+
+
+def authorization_line(
+    protocol: Protocol,
+    *,
+    source: str,
+    tree: str,
+    uv_lock_sha256: str,
+    workflow_blob_sha1: str,
+    driver_blob_sha1: str,
+    ref_name: str,
+) -> str:
+    binding = _launch_binding(
+        protocol,
+        source=source,
+        tree=tree,
+        uv_lock_sha256=uv_lock_sha256,
+        workflow_blob_sha1=workflow_blob_sha1,
+        driver_blob_sha1=driver_blob_sha1,
+        ref_name=ref_name,
+    )
+    return (
+        f"ASI_PREREG_LAUNCH_V1 {binding} "
         "protocol_approval=approved seed_budget=approved "
         "compute=authorized-uncompensated"
     )
+
+
+def registration_amendment_line(
+    protocol: Protocol,
+    *,
+    source: str,
+    tree: str,
+    uv_lock_sha256: str,
+    workflow_blob_sha1: str,
+    driver_blob_sha1: str,
+    ref_name: str,
+) -> str:
+    if protocol.key != "issue188":
+        raise ValueError("a separate registration amendment is required only for issue188")
+    binding = _launch_binding(
+        protocol,
+        source=source,
+        tree=tree,
+        uv_lock_sha256=uv_lock_sha256,
+        workflow_blob_sha1=workflow_blob_sha1,
+        driver_blob_sha1=driver_blob_sha1,
+        ref_name=ref_name,
+    )
+    return f"ASI_PREREG_AMENDMENT_V1 {binding} compute=uncompensated"
 
 
 def classify_outcome(
@@ -139,6 +197,35 @@ def _parse_utc(value: str) -> dt.datetime:
     if parsed.tzinfo is None or parsed.utcoffset() != dt.timedelta(0):
         raise RuntimeError("authorization timestamp must identify UTC")
     return parsed
+
+
+def _matching_owner_comments(
+    comments: list[Any], *, expected_body: str
+) -> list[dict[str, Any]]:
+    return [
+        cast(dict[str, Any], comment)
+        for comment in comments
+        if isinstance(comment, dict)
+        and comment.get("body") == expected_body
+        and isinstance(comment.get("user"), dict)
+        and comment["user"].get("login") == AUTHORIZED_LOGIN
+        and comment["user"].get("id") == AUTHORIZED_USER_ID
+        and comment.get("author_association") == AUTHORIZED_ASSOCIATION
+    ]
+
+
+def _unchanged_comment_timestamp(
+    comment: dict[str, Any], *, label: str
+) -> tuple[str, dt.datetime]:
+    created_at = comment.get("created_at")
+    updated_at = comment.get("updated_at")
+    if not isinstance(created_at, str) or not created_at:
+        raise RuntimeError(f"{label} timestamps are missing or invalid")
+    if not isinstance(updated_at, str) or not updated_at:
+        raise RuntimeError(f"{label} timestamps are missing or invalid")
+    if updated_at != created_at:
+        raise RuntimeError(f"{label} comment must be exact and never edited")
+    return created_at, _parse_utc(updated_at)
 
 
 def _github_json(path: str, *, token: str) -> Any:
@@ -250,6 +337,19 @@ def verify_launch_authorization(
         driver_blob_sha1=driver_blob_sha1,
         ref_name=ref_name,
     )
+    expected_amendment = (
+        registration_amendment_line(
+            protocol,
+            source=source,
+            tree=tree,
+            uv_lock_sha256=uv_lock_sha256,
+            workflow_blob_sha1=workflow_blob_sha1,
+            driver_blob_sha1=driver_blob_sha1,
+            ref_name=ref_name,
+        )
+        if protocol.key == "issue188"
+        else None
+    )
     if run_attempt != 1:
         raise RuntimeError("rerun attempts are forbidden; dispatch a new reviewed source instead")
 
@@ -288,16 +388,7 @@ def verify_launch_authorization(
         )
 
     comments = _github_pages(f"/repos/{repository}/issues/{protocol.issue}/comments", token=token)
-    matches = [
-        cast(dict[str, Any], comment)
-        for comment in comments
-        if isinstance(comment, dict)
-        and comment.get("body") == expected_line
-        and isinstance(comment.get("user"), dict)
-        and comment["user"].get("login") == AUTHORIZED_LOGIN
-        and comment["user"].get("id") == AUTHORIZED_USER_ID
-        and comment.get("author_association") == AUTHORIZED_ASSOCIATION
-    ]
+    matches = _matching_owner_comments(comments, expected_body=expected_line)
     if len(matches) != 1:
         raise RuntimeError(
             "expected exactly one standalone project-owner authorization comment; "
@@ -305,20 +396,34 @@ def verify_launch_authorization(
         )
     comment = matches[0]
     run_created_at = current.get("created_at")
-    comment_created_at = comment.get("created_at")
-    comment_updated_at = comment.get("updated_at")
     if not isinstance(run_created_at, str) or not run_created_at:
         raise RuntimeError("authorization timestamps are missing or invalid")
-    if not isinstance(comment_created_at, str) or not comment_created_at:
-        raise RuntimeError("authorization timestamps are missing or invalid")
-    if not isinstance(comment_updated_at, str) or not comment_updated_at:
-        raise RuntimeError("authorization timestamps are missing or invalid")
-    if comment_updated_at != comment_created_at:
-        raise RuntimeError("authorization comment must be exact and never edited")
-    if _parse_utc(comment_updated_at) >= _parse_utc(run_created_at):
+    authorization_created_at, authorization_time = _unchanged_comment_timestamp(
+        comment, label="authorization"
+    )
+    if authorization_time >= _parse_utc(run_created_at):
         raise RuntimeError("project-owner authorization must be durable before workflow dispatch")
+    amendment: dict[str, Any] | None = None
+    amendment_created_at: str | None = None
+    if expected_amendment is not None:
+        amendment_matches = _matching_owner_comments(
+            comments, expected_body=expected_amendment
+        )
+        if len(amendment_matches) != 1:
+            raise RuntimeError(
+                "expected exactly one standalone issue188 registration amendment comment; "
+                f"found {len(amendment_matches)}"
+            )
+        amendment = amendment_matches[0]
+        amendment_created_at, amendment_time = _unchanged_comment_timestamp(
+            amendment, label="registration amendment"
+        )
+        if amendment_time >= authorization_time:
+            raise RuntimeError(
+                "issue188 registration amendment must be durable before final authorization"
+            )
     return {
-        "schema": "asi.ipmnist_prereg.launch_preflight.v1",
+        "schema": "asi.ipmnist_prereg.launch_preflight.v2",
         "protocol": asdict(protocol),
         "source": source,
         "tree": tree,
@@ -326,16 +431,30 @@ def verify_launch_authorization(
         "workflow_blob_sha1": workflow_blob_sha1,
         "driver_blob_sha1": driver_blob_sha1,
         "ref_name": ref_name,
-        "runner": "macos-14-arm64",
+        "runner": RUNNER_IDENTITY,
         "run_id": run_id,
         "run_attempt": run_attempt,
         "run_url": current.get("html_url"),
         "authorization_comment_id": comment.get("id"),
         "authorization_comment_url": comment.get("html_url"),
-        "authorization_created_at": comment.get("created_at"),
-        "authorization_updated_at": comment.get("updated_at"),
+        "authorization_created_at": authorization_created_at,
+        "authorization_updated_at": authorization_created_at,
         "authorization_line": expected_line,
         "authorization_sha256": hashlib.sha256(expected_line.encode()).hexdigest(),
+        "registration_amendment_comment_id": (
+            amendment.get("id") if amendment is not None else None
+        ),
+        "registration_amendment_comment_url": (
+            amendment.get("html_url") if amendment is not None else None
+        ),
+        "registration_amendment_created_at": amendment_created_at,
+        "registration_amendment_updated_at": amendment_created_at,
+        "registration_amendment_line": expected_amendment,
+        "registration_amendment_sha256": (
+            hashlib.sha256(expected_amendment.encode()).hexdigest()
+            if expected_amendment is not None
+            else None
+        ),
     }
 
 
@@ -438,6 +557,8 @@ def _validate_runtime(environment: dict[str, Any]) -> None:
     }
     if any(packages.get(name) != version for name, version in expected_packages.items()):
         raise ValueError(f"unexpected locked package receipt: {packages}")
+    if jax.get("config") != EXPECTED_JAX_CONFIG:
+        raise ValueError(f"unexpected JAX config receipt: {jax.get('config')}")
     devices = jax.get("devices")
     if jax.get("backend") != "cpu" or not isinstance(devices, list) or len(devices) != 1:
         raise ValueError(f"expected exactly one JAX CPU device, got {jax}")
@@ -472,12 +593,13 @@ def _validate_runner_receipt(
             "packages",
             "jax_backend",
             "jax_devices",
+            "jax_config",
         },
         context="runner receipt",
     )
     cpu_brand = payload["cpu_brand"]
     if (
-        payload["schema"] != "asi.ipmnist_prereg.runner.v1"
+        payload["schema"] != "asi.ipmnist_prereg.runner.v2"
         or payload["runner_label"] != "macos-14"
         or not isinstance(cpu_brand, str)
         or "Apple M1" not in cpu_brand
@@ -497,6 +619,10 @@ def _validate_runner_receipt(
     jax_binding = cast(dict[str, Any], environment["jax"])
     if payload["jax_devices"] != jax_binding["devices"]:
         raise ValueError("runner receipt JAX devices differ from shard provenance")
+    if payload["jax_config"] != EXPECTED_JAX_CONFIG:
+        raise ValueError("runner receipt JAX config differs from the frozen launch contract")
+    if payload["jax_config"] != jax_binding["config"]:
+        raise ValueError("runner receipt JAX config differs from shard provenance")
 
 
 def validate_result_bundle(
