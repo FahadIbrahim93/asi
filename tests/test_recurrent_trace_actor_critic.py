@@ -12,6 +12,7 @@ import chex
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 import pytest
 from jax import Array
 
@@ -624,9 +625,7 @@ def test_obgd_infinite_signal_zeros_bounded_update() -> None:
     assert bool(jnp.allclose(result.scale, 0.0))
     assert not bool(result.update_applied)
 
-    unbounded = obgd_update(
-        traces, jnp.asarray(jnp.inf, dtype=jnp.float32), alpha=0.5, kappa=0.0
-    )
+    unbounded = obgd_update(traces, jnp.asarray(jnp.inf, dtype=jnp.float32), alpha=0.5, kappa=0.0)
     for leaf in jax.tree_util.tree_leaves(unbounded.updates):
         assert bool(jnp.all(jnp.isfinite(leaf)))
         assert bool(jnp.allclose(leaf, 0.0))
@@ -767,9 +766,7 @@ def test_adaptive_obgd_matches_memorax_second_moment_formula() -> None:
         step=step,
     )
     expected_second_moment = jax.tree_util.tree_map(
-        lambda previous, trace: (
-            beta2 * previous + (1.0 - beta2) * jnp.square(signal * trace)
-        ),
+        lambda previous, trace: beta2 * previous + (1.0 - beta2) * jnp.square(signal * trace),
         second_moment,
         traces,
     )
@@ -783,10 +780,7 @@ def test_adaptive_obgd_matches_memorax_second_moment_formula() -> None:
         expected_corrected,
     )
     expected_z_sum = sum(
-        (
-            jnp.sum(jnp.abs(leaf))
-            for leaf in jax.tree_util.tree_leaves(expected_normalized)
-        ),
+        (jnp.sum(jnp.abs(leaf)) for leaf in jax.tree_util.tree_leaves(expected_normalized)),
         start=jnp.asarray(0.0, dtype=jnp.float32),
     )
     expected_denominator = jnp.maximum(
@@ -1122,10 +1116,7 @@ def test_counters_and_welford_moments_saturate_without_wrap_eager_or_jit() -> No
         assert int(result.state.observation_statistics.sample_count) == maximum
         assert int(result.state.reward_statistics.sample_count) == maximum
         assert int(result.state.step_count) == maximum
-        assert jnp.all(
-            result.state.observation_statistics.m2
-            >= state.observation_statistics.m2
-        )
+        assert jnp.all(result.state.observation_statistics.m2 >= state.observation_statistics.m2)
         assert result.state.reward_statistics.m2 >= state.reward_statistics.m2
         _assert_tree_finite(result)
 
@@ -1351,18 +1342,14 @@ def test_adaptive_moments_persist_across_restart_and_checkpoint_resume() -> None
     actor_moment_l1 = sum(
         (
             jnp.sum(jnp.abs(leaf))
-            for leaf in jax.tree_util.tree_leaves(
-                first.state.actor_second_moments
-            )
+            for leaf in jax.tree_util.tree_leaves(first.state.actor_second_moments)
         ),
         start=jnp.asarray(0.0),
     )
     critic_moment_l1 = sum(
         (
             jnp.sum(jnp.abs(leaf))
-            for leaf in jax.tree_util.tree_leaves(
-                first.state.critic_second_moments
-            )
+            for leaf in jax.tree_util.tree_leaves(first.state.critic_second_moments)
         ),
         start=jnp.asarray(0.0),
     )
@@ -2235,3 +2222,31 @@ def test_phase_initialization_matches_upstream_and_ignores_rtu_epsilon() -> None
 
     recovered_phase = jnp.exp(params.rtu.theta_log)
     assert jnp.min(recovered_phase) < config.rtu_epsilon * config.max_phase
+
+
+def test_rtac_config_rejects_booleans_and_non_integers() -> None:
+    with pytest.raises(ValueError, match="n_actions"):
+        RecurrentTraceActorCriticConfig(n_actions=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="n_actions"):
+        RecurrentTraceActorCriticConfig(n_actions=3.5)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="hidden_size"):
+        RecurrentTraceActorCriticConfig(n_actions=2, hidden_size=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="encoder_width"):
+        RecurrentTraceActorCriticConfig(n_actions=2, encoder_width=1)
+
+
+def test_rtac_config_accepts_and_canonicalizes_numpy_integers() -> None:
+    cfg = RecurrentTraceActorCriticConfig(
+        n_actions=np.int32(3),
+        hidden_size=np.int64(64),
+        encoder_width=np.int32(32),
+        output_width=np.int64(32),
+    )
+    assert type(cfg.n_actions) is int
+    assert type(cfg.hidden_size) is int
+    assert type(cfg.encoder_width) is int
+    assert type(cfg.output_width) is int
+    assert cfg.n_actions == 3
+    assert cfg.hidden_size == 64
+    assert cfg.encoder_width == 32
+    assert cfg.output_width == 32
