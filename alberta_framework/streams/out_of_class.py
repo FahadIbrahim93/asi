@@ -49,32 +49,49 @@ from alberta_framework.core.types import TimeStep
 
 _FLOAT32_MULTIPLIER_MAX = float(np.sqrt(np.finfo(np.float32).max))
 _INT32_MAX = int(np.iinfo(np.int32).max)
-_SUPPORTED_NUMPY_REAL_SCALAR_TYPES = frozenset(
-    {
-        np.int8,
-        np.int16,
-        np.int32,
-        np.int64,
-        np.longlong,
-        np.uint8,
-        np.uint16,
-        np.uint32,
-        np.uint64,
-        np.ulonglong,
-        np.float16,
-        np.float32,
-        np.float64,
-        np.longdouble,
-    }
+_SUPPORTED_NUMPY_REAL_SCALAR_TYPES: tuple[type[object], ...] = (
+    np.int8,
+    np.int16,
+    np.int32,
+    np.int64,
+    np.longlong,
+    np.uint8,
+    np.uint16,
+    np.uint32,
+    np.uint64,
+    np.ulonglong,
+    np.float16,
+    np.float32,
+    np.float64,
+    np.longdouble,
 )
 
 
-def _is_supported_real_scalar(value: object) -> bool:
-    """Return whether ``value`` has an exact trusted host scalar type."""
+def _trusted_multiplier_real(value: object, message: str) -> Real:
+    """Return a hook-free concrete real for Polynomial stream multipliers."""
     actual_type = type(value)
-    if actual_type in (int, float, Fraction):
-        return True
-    return actual_type in _SUPPORTED_NUMPY_REAL_SCALAR_TYPES
+    if actual_type is int or actual_type is float:
+        return cast(Real, value)
+    for supported_type in _SUPPORTED_NUMPY_REAL_SCALAR_TYPES:
+        if actual_type is supported_type:
+            return cast(Real, value)
+    if actual_type is not Fraction:
+        raise ValueError(message)
+
+    fraction = cast(Fraction, value)
+    try:
+        numerator: object = object.__getattribute__(fraction, "_numerator")
+        denominator: object = object.__getattribute__(fraction, "_denominator")
+    except Exception as error:
+        raise ValueError(message) from error
+    if type(numerator) is not int or type(denominator) is not int:
+        raise ValueError(message)
+    if denominator <= 0:
+        raise ValueError(message)
+    try:
+        return Fraction(numerator, denominator)
+    except Exception as error:
+        raise ValueError(message) from error
 
 
 def _require_positive_float32(value: object, name: str) -> float:
@@ -100,11 +117,10 @@ def _require_finite_float32_multiplier(
 ) -> float:
     """Return a canonical finite multiplier with conservative float32 headroom."""
     message = f"{name} must be a finite real in the safe float32 multiplier range"
-    if not _is_supported_real_scalar(value):
-        raise ValueError(message)
     try:
-        numerator, _, narrowed = round_real_to_float32_with_ratio(cast(Real, value))
-    except (FloatingPointError, OverflowError, TypeError, ValueError) as error:
+        trusted_value = _trusted_multiplier_real(value, message)
+        numerator, _, narrowed = round_real_to_float32_with_ratio(trusted_value)
+    except Exception as error:
         raise ValueError(message) from error
     if nonnegative and numerator < 0:
         raise ValueError(message)

@@ -181,6 +181,84 @@ class TestOutOfClassPolynomialStream:
         with pytest.raises(ValueError, match=field):
             OutOfClassPolynomialStream(**{field: value})  # type: ignore[arg-type]
 
+    @pytest.mark.parametrize("field", ["feature_std", "linear_scale", "noise_std"])
+    def test_scientific_scalars_do_not_hash_or_compare_untrusted_actual_types(
+        self,
+        field: str,
+    ) -> None:
+        calls: list[str] = []
+
+        class HostileNumericMeta(type):
+            def __hash__(cls) -> int:
+                calls.append("hash")
+                raise RuntimeError("untrusted metaclass hash hook executed")
+
+            def __eq__(cls, other: object) -> bool:
+                del other
+                calls.append("eq")
+                raise RuntimeError("untrusted metaclass equality hook executed")
+
+        class HostileFloat(float, metaclass=HostileNumericMeta):
+            pass
+
+        calls.clear()
+        with pytest.raises(ValueError, match=field):
+            OutOfClassPolynomialStream(  # type: ignore[arg-type]
+                **{field: HostileFloat(1.0)}
+            )
+
+        assert calls == []
+
+    @pytest.mark.parametrize("field", ["feature_std", "linear_scale", "noise_std"])
+    @pytest.mark.parametrize("slot", ["_numerator", "_denominator"])
+    def test_scientific_scalars_reject_poisoned_exact_fraction_components_without_hooks(
+        self,
+        field: str,
+        slot: str,
+    ) -> None:
+        calls = 0
+
+        class ExplodingInt(int):
+            def __int__(self) -> int:
+                nonlocal calls
+                calls += 1
+                raise RuntimeError("untrusted Fraction component hook executed")
+
+        value = Fraction(1, 4)
+        component = ExplodingInt(1 if slot == "_numerator" else 4)
+        object.__setattr__(value, slot, component)
+
+        with pytest.raises(ValueError, match=field):
+            OutOfClassPolynomialStream(**{field: value})  # type: ignore[arg-type]
+
+        assert calls == 0
+
+    @pytest.mark.parametrize("field", ["feature_std", "linear_scale", "noise_std"])
+    @pytest.mark.parametrize("slot", ["_numerator", "_denominator"])
+    def test_scientific_scalars_normalize_missing_exact_fraction_slots(
+        self,
+        field: str,
+        slot: str,
+    ) -> None:
+        value = Fraction(1, 4)
+        object.__delattr__(value, slot)
+
+        with pytest.raises(ValueError, match=field):
+            OutOfClassPolynomialStream(**{field: value})  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize("field", ["feature_std", "linear_scale", "noise_std"])
+    @pytest.mark.parametrize("denominator", [0, -4])
+    def test_scientific_scalars_reject_nonpositive_exact_fraction_denominators(
+        self,
+        field: str,
+        denominator: int,
+    ) -> None:
+        value = Fraction(1, 4)
+        object.__setattr__(value, "_denominator", denominator)
+
+        with pytest.raises(ValueError, match=field):
+            OutOfClassPolynomialStream(**{field: value})  # type: ignore[arg-type]
+
     @pytest.mark.parametrize(
         "scalar_type",
         [
@@ -214,6 +292,19 @@ class TestOutOfClassPolynomialStream:
         assert stream._feature_std == 1.0  # noqa: SLF001
         assert stream._linear_scale == 1.0  # noqa: SLF001
         assert stream._noise_std == 1.0  # noqa: SLF001
+
+    @pytest.mark.parametrize("field", ["feature_std", "linear_scale", "noise_std"])
+    @pytest.mark.parametrize("scalar_type", [np.longlong, np.ulonglong])
+    def test_scientific_scalars_preserve_distinct_numpy_long_integer_types(
+        self,
+        field: str,
+        scalar_type: type[np.generic],
+    ) -> None:
+        stream = OutOfClassPolynomialStream(  # type: ignore[arg-type]
+            **{field: scalar_type(1)}
+        )
+
+        assert getattr(stream, f"_{field}") == 1.0
 
     @pytest.mark.parametrize("field", ["feature_std", "noise_std"])
     @pytest.mark.parametrize("value", [-1.0, -Fraction(1, 2**200)])
