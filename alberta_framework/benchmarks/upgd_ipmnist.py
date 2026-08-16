@@ -94,6 +94,7 @@ import hashlib
 import json
 import logging
 import math
+import operator
 import os
 import platform
 import tempfile
@@ -101,7 +102,7 @@ import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, SupportsIndex, cast
 
 import chex
 import jax
@@ -270,6 +271,26 @@ REPRODUCTION_GAP_THRESHOLD = 0.02
 
 _PLASTICITY_LOSS_FLOOR = 1e-8
 
+_INT32_MAX: int = 2**31 - 1
+_ACTUAL_INT_TYPES = frozenset(
+    {
+        int,
+        *(np.dtype(code).type for code in ("b", "B", "h", "H", "i", "I", "l", "L", "q", "Q")),
+    }
+)
+
+
+def _require_int32(name: str, value: object, *, minimum: int = 1) -> int:
+    if type(value) not in _ACTUAL_INT_TYPES:
+        raise ValueError(f"{name} must be an integer")
+    try:
+        number = operator.index(cast(SupportsIndex, value))
+    except Exception as error:
+        raise ValueError(f"{name} must be an integer") from error
+    if number < minimum or number > _INT32_MAX:
+        raise ValueError(f"{name} must be in [{minimum}, {_INT32_MAX}]")
+    return number
+
 
 @dataclass(frozen=True)
 class IPMNISTConfig:
@@ -296,14 +317,31 @@ class IPMNISTConfig:
 
     def __post_init__(self) -> None:
         for name in ("n_tasks", "task_length", "input_dim", "hidden1", "hidden2", "n_classes"):
-            value = getattr(self, name)
-            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
-                raise ValueError(f"{name} must be a positive integer, got {value!r}")
+            value = _require_int32(name, getattr(self, name), minimum=1)
+            object.__setattr__(self, name, value)
+        if self.n_tasks * self.task_length > _INT32_MAX:
+            raise ValueError("derived run horizon must fit in signed int32")
+        if self.n_tasks * self.input_dim > _INT32_MAX:
+            raise ValueError("derived permutation schedule must fit in signed int32")
+        if self.parameter_count > _INT32_MAX:
+            raise ValueError("derived total parameter allocation must fit in signed int32")
 
     @property
     def n_steps(self) -> int:
         """Total online steps (examples) in a run."""
         return self.n_tasks * self.task_length
+
+    @property
+    def parameter_count(self) -> int:
+        """Total flattened MLP parameter count used by perturbation draws."""
+        return (
+            self.input_dim * self.hidden1
+            + self.hidden1 * self.hidden2
+            + self.hidden2 * self.n_classes
+            + self.hidden1
+            + self.hidden2
+            + self.n_classes
+        )
 
     @property
     def matches_selected_publication_configuration(self) -> bool:
@@ -819,8 +857,10 @@ def run_ipmnist(
         config = IPMNISTConfig()
     if noise_mode not in ("step", "pool"):
         raise ValueError(f"noise_mode must be 'step' or 'pool', got {noise_mode!r}")
-    if noise_mode == "pool" and noise_pool_steps < 2:
-        raise ValueError(f"noise_pool_steps must be >= 2, got {noise_pool_steps}")
+    if noise_mode == "pool":
+        noise_pool_steps = _require_int32(
+            "noise_pool_steps", noise_pool_steps, minimum=2
+        )
     resolved_x, resolved_y = validated_ipmnist_data(
         data_x,
         data_y,
@@ -831,7 +871,7 @@ def run_ipmnist(
     hp = resolve_hyperparameters(learner, hyperparameters)
     init_fn, step_fn = _LEARNER_FACTORIES[learner](hp)
     shapes = _sorted_param_shapes(config)
-    n_flat = int(sum(np.prod(shape) for shape in shapes.values()))
+    n_flat = config.parameter_count
 
     data_x = jnp.asarray(resolved_x, dtype=jnp.float32)
     data_y = jnp.asarray(resolved_y, dtype=jnp.int32)
@@ -841,6 +881,10 @@ def run_ipmnist(
 
     use_pool = noise_mode == "pool" and learner in _STOCHASTIC_LEARNERS
     pool_len = int(noise_pool_steps) * n_flat if use_pool else 0
+    if pool_len > _INT32_MAX:
+        raise ValueError(
+            "derived noise_pool_steps * parameter_count must fit in signed int32"
+        )
     pool_noise_std = float(hp["noise_std"]) if use_pool else 0.0
 
     def init_seed(seed: Array) -> tuple[dict[str, Array], Any, IPMNISTSchedule, Array]:
