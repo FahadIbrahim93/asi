@@ -150,13 +150,22 @@ def aggregate_metrics(results: list[SingleRunResult]) -> AggregatedResults:
         AggregatedResults with aggregated metrics
 
     Raises:
-        ValueError: If ``results`` is empty, or any metric sample is non-finite.
+        ValueError: If ``results`` is empty, mixes configuration names or seed
+            identities, drifts in metric keys, or any metric sample is
+            non-finite.
     """
     if not results:
         raise ValueError("Cannot aggregate empty results list")
 
-    config_name = results[0].config_name
+    config_names = sorted({r.config_name for r in results})
+    if len(config_names) != 1:
+        raise ValueError(
+            f"aggregate_metrics requires runs from one configuration; got {config_names}"
+        )
+    config_name = config_names[0]
     seeds = [r.seed for r in results]
+    if len(set(seeds)) != len(seeds):
+        raise ValueError(f"aggregate_metrics requires unique seed identities; got {seeds}")
 
     # Get all metric keys from first result
     if any(
