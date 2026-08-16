@@ -20,7 +20,9 @@ Reference: Sutton & Barto 2018, Section 10.1 (Episodic Semi-gradient SARSA)
 
 import dataclasses
 import functools
+import math
 import time
+from numbers import Real
 from typing import Any
 
 import chex
@@ -72,6 +74,32 @@ class SARSAConfig:
     epsilon_start: float = 0.1
     epsilon_end: float = 0.01
     epsilon_decay_steps: int = 0
+
+    def __post_init__(self) -> None:
+        """Validate SARSA hyperparameters at construction time."""
+        if self.n_actions < 1:
+            raise ValueError("n_actions must be at least 1")
+        if not isinstance(self.gamma, Real) or isinstance(self.gamma, bool):
+            raise ValueError("gamma must be a real number")
+        if not math.isfinite(self.gamma) or not 0.0 <= self.gamma < 1.0:
+            raise ValueError("gamma must be a finite value in [0, 1)")
+        for name, value in (
+            ("epsilon_start", self.epsilon_start),
+            ("epsilon_end", self.epsilon_end),
+        ):
+            if not isinstance(value, Real) or isinstance(value, bool):
+                raise ValueError(f"{name} must be a real number")
+            if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+                raise ValueError(f"{name} must be a finite value in [0, 1]")
+        if self.epsilon_decay_steps < 0:
+            raise ValueError("epsilon_decay_steps must be non-negative")
+        if (
+            self.epsilon_decay_steps > 0
+            and self.epsilon_end > self.epsilon_start
+        ):
+            raise ValueError(
+                "epsilon_end must not exceed epsilon_start when decaying"
+            )
 
     def to_config(self) -> dict[str, Any]:
         """Serialize to dict."""
