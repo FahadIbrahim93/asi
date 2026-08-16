@@ -23,7 +23,10 @@ References:
 
 from __future__ import annotations
 
+import math
+import struct
 from dataclasses import asdict, dataclass
+from numbers import Real
 from typing import Any, cast
 
 import jax.numpy as jnp
@@ -36,6 +39,28 @@ from alberta_framework.core.average_reward import (
     run_differential_td_from_arrays,
 )
 
+_STEP5_CONFIG_KEYS = frozenset(
+    {"step_size", "average_reward_step_size", "trace_decay"}
+)
+_STEP5_CONFIG_KEYS_ERROR = (
+    "Step5AverageRewardTDConfig payload keys must be exactly "
+    "['average_reward_step_size', 'step_size', 'trace_decay']"
+)
+
+
+def _finite_float32_scalar(name: str, value: object) -> float:
+    """Validate a real scalar before the core narrows it to float32."""
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError(f"{name} must be a real scalar")
+    try:
+        scalar = float(value)
+        narrowed = struct.unpack("!f", struct.pack("!f", scalar))[0]
+    except (OverflowError, TypeError, ValueError, struct.error):
+        raise ValueError(f"{name} must narrow to a finite float32") from None
+    if not math.isfinite(scalar) or not math.isfinite(narrowed):
+        raise ValueError(f"{name} must narrow to a finite float32")
+    return scalar
+
 
 @dataclass(frozen=True)
 class Step5AverageRewardTDConfig:
@@ -45,6 +70,20 @@ class Step5AverageRewardTDConfig:
     average_reward_step_size: float = 0.01
     trace_decay: float = 0.0
 
+    def __post_init__(self) -> None:
+        """Reject malformed scientific scalars before JAX execution."""
+        step_size = _finite_float32_scalar("step_size", self.step_size)
+        average_reward_step_size = _finite_float32_scalar(
+            "average_reward_step_size", self.average_reward_step_size
+        )
+        trace_decay = _finite_float32_scalar("trace_decay", self.trace_decay)
+        if step_size < 0.0:
+            raise ValueError("step_size must be non-negative")
+        if average_reward_step_size < 0.0:
+            raise ValueError("average_reward_step_size must be non-negative")
+        if not 0.0 <= trace_decay <= 1.0:
+            raise ValueError("trace_decay must be in [0, 1]")
+
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-serializable representation."""
         return asdict(self)
@@ -52,6 +91,8 @@ class Step5AverageRewardTDConfig:
     @classmethod
     def from_dict(cls, payload: dict[str, object]) -> Step5AverageRewardTDConfig:
         """Reconstruct from :meth:`to_dict` output."""
+        if set(payload) != _STEP5_CONFIG_KEYS:
+            raise ValueError(_STEP5_CONFIG_KEYS_ERROR)
         return cls(**cast(Any, payload))
 
     def to_core_config(self) -> DifferentialTDConfig:
@@ -145,6 +186,7 @@ def run_step5_smoke(
         jnp.all(jnp.isfinite(result.predictions))
         & jnp.all(jnp.isfinite(result.td_errors))
         & jnp.all(jnp.isfinite(result.average_rewards))
+        & jnp.all(result.updates_applied)
     )
     return Step5SmokeResult(
         config=cfg,
