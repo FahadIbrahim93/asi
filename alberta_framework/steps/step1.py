@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import asdict, dataclass
-from numbers import Integral, Real
+from numbers import Real
 from typing import Any, Literal, cast
 
 import jax.numpy as jnp
@@ -123,6 +123,15 @@ def _require_positive_real(name: str, value: object) -> float:
     return number
 
 
+# Exact trusted integer scalar types, compared by identity in _require_int.
+# ``longlong``/``ulonglong`` are listed via their dtype codes because they can
+# be distinct types from the fixed-width aliases on some platforms.
+_TRUSTED_INT_TYPES: tuple[type, ...] = (
+    int,
+    *(np.dtype(code).type for code in ("b", "B", "h", "H", "i", "I", "l", "L", "q", "Q")),
+)
+
+
 def _require_int(
     name: str,
     value: object,
@@ -130,9 +139,13 @@ def _require_int(
     minimum: int | None = None,
     exclusive_maximum: int | None = None,
 ) -> int:
+    # Identity-only admission: an actual ``int`` subclass can override
+    # ``__int__``/``__index__``/``__repr__`` with hostile hooks, so anything
+    # that is not an exact trusted builtin/NumPy integer scalar type is
+    # rejected before conversion, without interpolating the untrusted value.
     actual_type = type(value)
-    if issubclass(actual_type, bool) or not issubclass(actual_type, Integral):
-        raise ValueError(f"{name} must be an integer, got {value!r}")
+    if not any(actual_type is trusted_type for trusted_type in _TRUSTED_INT_TYPES):
+        raise ValueError(f"{name} must be an integer of an exact trusted type")
     number: int = int(cast(Any, value))
     if minimum is not None and number < minimum:
         if minimum == 1:
