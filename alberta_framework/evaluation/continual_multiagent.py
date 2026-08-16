@@ -32,10 +32,11 @@ solution.  All updates are predict-act-observe-update and use no replay.
 
 from __future__ import annotations
 
+import operator
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from time import perf_counter, perf_counter_ns
-from typing import Literal
+from typing import Literal, SupportsIndex, cast
 
 import jax
 import jax.numpy as jnp
@@ -44,6 +45,7 @@ import numpy as np
 from jax import Array
 from numpy.typing import NDArray
 
+from alberta_framework.core._float32_scalars import validated_float32_scalar
 from alberta_framework.streams.recurring_multiagent import (
     AVOID_CONTEXT,
     AVOID_CONTEXT_INDEX,
@@ -71,6 +73,81 @@ CONDITION_MASKS: tuple[tuple[ConditionName, tuple[bool, bool]], ...] = (
     ("learner_only", (True, False)),
     ("joint_adaptive", (True, True)),
 )
+_INT32_MAX = 2**31 - 1
+_UINT32_MAX = 2**32 - 1
+_MAX_CONFIGURED_ARRAY_NBYTES = 256 * 1024 * 1024
+_ACTUAL_INT_TYPES = frozenset(
+    {
+        int,
+        np.int8,
+        np.int16,
+        np.int32,
+        np.int64,
+        np.uint8,
+        np.uint16,
+        np.uint32,
+        np.uint64,
+        np.longlong,
+        np.ulonglong,
+    }
+)
+
+
+def _require_int32(name: str, value: object, *, minimum: int, maximum: int = _INT32_MAX) -> int:
+    if type(value) not in _ACTUAL_INT_TYPES:
+        raise ValueError(f"{name} must be an integer in [{minimum}, {maximum}]")
+    canonical = operator.index(cast(SupportsIndex, value))
+    if not minimum <= canonical <= maximum:
+        raise ValueError(f"{name} must be an integer in [{minimum}, {maximum}]")
+    return canonical
+
+
+def _require_uint32(name: str, value: object) -> int:
+    return _require_int32(name, value, minimum=0, maximum=_UINT32_MAX)
+
+
+def _require_seed(value: object) -> int:
+    try:
+        return _require_int32("seed", value, minimum=0)
+    except ValueError as error:
+        raise ValueError("seeds must lie in [0, 2**31)") from error
+
+
+def _condition_working_nbytes(phase_steps: int) -> int:
+    """Exact bytes in the two phase-length float64 work vectors."""
+    return 2 * (3 * phase_steps) * np.dtype(np.float64).itemsize
+
+
+def _condition_result_array_nbytes(phase_steps: int) -> int:
+    """Exact retained NumPy payload for one completed condition."""
+    float64_nbytes = np.dtype(np.float64).itemsize
+    int64_nbytes = np.dtype(np.int64).itemsize
+    return (
+        3 * phase_steps * float64_nbytes
+        + 3 * float64_nbytes
+        + 3 * 2 * float64_nbytes
+        + 2 * int64_nbytes
+    )
+
+
+def _world_array_nbytes(nuisance_dim: int) -> tuple[int, int]:
+    """Exact persistent-state and one-observation array bytes for the world."""
+    state_nbytes = 36 + 2 * nuisance_dim * np.dtype(np.float32).itemsize
+    observation_nbytes = 2 * (6 + nuisance_dim) * np.dtype(np.float32).itemsize
+    return state_nbytes, observation_nbytes
+
+
+def _bootstrap_working_nbytes(resamples: int, sample_size: int) -> int:
+    """Peak owned NumPy payload for indices, sampled values, and means."""
+    itemsize = np.dtype(np.float64).itemsize
+    return 2 * resamples * sample_size * itemsize + resamples * itemsize
+
+
+def _require_resource_limit(name: str, nbytes: int) -> None:
+    if nbytes > _MAX_CONFIGURED_ARRAY_NBYTES:
+        raise ValueError(
+            f"{name} requires {nbytes} bytes; limit is {_MAX_CONFIGURED_ARRAY_NBYTES}"
+        )
 
 
 @dataclass(frozen=True)
@@ -91,30 +168,74 @@ class ContinualMultiAgentConfig:
     bootstrap_seed: int = 2_026_073_000
 
     def __post_init__(self) -> None:
-        if self.phase_steps < 2:
-            raise ValueError("phase_steps must be at least 2")
-        if self.nuisance_dim < 0:
-            raise ValueError("nuisance_dim must be non-negative")
-        if not 0.0 < self.learning_rate <= 1.0:
-            raise ValueError("learning_rate must lie in (0, 1]")
-        if not 0.0 <= self.exploration_rate <= 1.0:
-            raise ValueError("exploration_rate must lie in [0, 1]")
-        if not 1 <= self.probe_tail_steps <= self.probe_horizon:
-            raise ValueError("probe_tail_steps must lie in [1, probe_horizon]")
-        if self.probe_horizon > self.phase_steps:
-            raise ValueError("probe_horizon cannot cross a phase boundary")
-        if not 0.0 <= self.recovery_reward_threshold <= 1.0:
-            raise ValueError("recovery_reward_threshold must lie in [0, 1]")
-        if not 1 <= self.recovery_window <= self.phase_steps:
-            raise ValueError("recovery_window must lie in [1, phase_steps]")
-        if not 0.0 <= self.stability_reference_reward <= 1.0:
-            raise ValueError("stability_reference_reward must lie in [0, 1]")
-        if self.bootstrap_resamples < 1_000:
-            raise ValueError("bootstrap_resamples must be at least 1000")
-        if not 0.0 < self.confidence_level < 1.0:
-            raise ValueError("confidence_level must lie in (0, 1)")
-        if not 0 <= self.bootstrap_seed < 2**32:
-            raise ValueError("bootstrap_seed must lie in [0, 2**32)")
+        phase_steps = _require_int32("phase_steps", self.phase_steps, minimum=2)
+        nuisance_dim = _require_int32("nuisance_dim", self.nuisance_dim, minimum=0)
+        probe_horizon = _require_int32(
+            "probe_horizon", self.probe_horizon, minimum=1, maximum=phase_steps
+        )
+        probe_tail_steps = _require_int32(
+            "probe_tail_steps", self.probe_tail_steps, minimum=1, maximum=probe_horizon
+        )
+        recovery_window = _require_int32(
+            "recovery_window", self.recovery_window, minimum=1, maximum=phase_steps
+        )
+        bootstrap_resamples = _require_int32(
+            "bootstrap_resamples",
+            self.bootstrap_resamples,
+            minimum=1000,
+            maximum=_MAX_CONFIGURED_ARRAY_NBYTES // (3 * np.dtype(np.float64).itemsize),
+        )
+        bootstrap_seed = _require_uint32("bootstrap_seed", self.bootstrap_seed)
+
+        _require_resource_limit(
+            "per-condition phase work arrays",
+            _condition_working_nbytes(phase_steps),
+        )
+        world_state_nbytes, observation_nbytes = _world_array_nbytes(nuisance_dim)
+        _require_resource_limit("recurring world state", world_state_nbytes)
+        _require_resource_limit("recurring world observation", observation_nbytes)
+
+        object.__setattr__(self, "phase_steps", phase_steps)
+        object.__setattr__(self, "nuisance_dim", nuisance_dim)
+        object.__setattr__(self, "probe_horizon", probe_horizon)
+        object.__setattr__(self, "probe_tail_steps", probe_tail_steps)
+        object.__setattr__(self, "recovery_window", recovery_window)
+        object.__setattr__(self, "bootstrap_resamples", bootstrap_resamples)
+        object.__setattr__(self, "bootstrap_seed", bootstrap_seed)
+
+        object.__setattr__(
+            self,
+            "learning_rate",
+            validated_float32_scalar(
+                "learning_rate", self.learning_rate, positive=True, upper=1.0
+            ),
+        )
+        for name in (
+            "exploration_rate",
+            "recovery_reward_threshold",
+            "stability_reference_reward",
+        ):
+            object.__setattr__(
+                self,
+                name,
+                validated_float32_scalar(
+                    name,
+                    getattr(self, name),
+                    lower=0.0,
+                    upper=1.0,
+                ),
+            )
+        object.__setattr__(
+            self,
+            "confidence_level",
+            validated_float32_scalar(
+                "confidence_level",
+                self.confidence_level,
+                positive=True,
+                upper=1.0,
+                upper_inclusive=False,
+            ),
+        )
 
 
 @dataclass(frozen=True)
@@ -141,6 +262,44 @@ class AcceptanceThresholds:
     maximum_mean_recurrence_recovery_steps: float = 16.0
     maximum_mean_stability_gap: float = 0.20
     maximum_update_latency_ms: float = 5.0
+
+    def __post_init__(self) -> None:
+        minimum_seed_count = _require_int32(
+            "minimum_seed_count", self.minimum_seed_count, minimum=1
+        )
+        evidence_seed_start = _require_int32(
+            "evidence_seed_start", self.evidence_seed_start, minimum=0
+        )
+        if evidence_seed_start + minimum_seed_count > _INT32_MAX + 1:
+            raise ValueError(
+                "evidence_seed_start + minimum_seed_count must not exceed 2147483648"
+            )
+        object.__setattr__(
+            self,
+            "minimum_seed_count",
+            minimum_seed_count,
+        )
+        object.__setattr__(
+            self,
+            "evidence_seed_start",
+            evidence_seed_start,
+        )
+        for name in (
+            "minimum_reward_uplift_over_frozen",
+            "minimum_partner_uplift",
+            "minimum_recurrent_a_probe_reward",
+            "maximum_mean_forgetting",
+            "maximum_interference_forgetting",
+            "minimum_recurrence_recovery_fraction",
+            "maximum_mean_recurrence_recovery_steps",
+            "maximum_mean_stability_gap",
+            "maximum_update_latency_ms",
+        ):
+            object.__setattr__(
+                self,
+                name,
+                validated_float32_scalar(name, getattr(self, name)),
+            )
 
 
 @dataclass(frozen=True)
@@ -519,10 +678,17 @@ def paired_bootstrap_mean_interval(
         raise ValueError("paired_differences must contain only finite values")
     if not 0.0 < confidence_level < 1.0:
         raise ValueError("confidence_level must lie in (0, 1)")
-    if resamples < 1:
-        raise ValueError("resamples must be positive")
-    if not 0 <= seed < 2**32:
-        raise ValueError("seed must lie in [0, 2**32)")
+    resamples = _require_int32(
+        "resamples",
+        resamples,
+        minimum=1,
+        maximum=_MAX_CONFIGURED_ARRAY_NBYTES // (3 * np.dtype(np.float64).itemsize),
+    )
+    seed = _require_uint32("seed", seed)
+    _require_resource_limit(
+        "paired bootstrap working arrays",
+        _bootstrap_working_nbytes(resamples, int(values.size)),
+    )
 
     generator = np.random.default_rng(seed)
     indices = generator.integers(
@@ -719,11 +885,9 @@ def evaluate_acceptance(
     """
 
     limits = AcceptanceThresholds() if thresholds is None else thresholds
-    expected_evidence_seeds = tuple(
-        range(
-            limits.evidence_seed_start,
-            limits.evidence_seed_start + limits.minimum_seed_count,
-        )
+    seed_schedule_matches = len(aggregate.seeds) == limits.minimum_seed_count and all(
+        seed == limits.evidence_seed_start + offset
+        for offset, seed in enumerate(aggregate.seeds)
     )
     checks = (
         _minimum_check(
@@ -734,7 +898,7 @@ def evaluate_acceptance(
         ),
         _minimum_check(
             "evidence_seed_schedule",
-            float(aggregate.seeds == expected_evidence_seeds),
+            float(seed_schedule_matches),
             1.0,
             "Promoted evidence must use the frozen held-out consecutive seed schedule.",
         ),
@@ -823,13 +987,20 @@ def run_continual_multiagent_benchmark(
 
     benchmark_config = ContinualMultiAgentConfig() if config is None else config
     acceptance_thresholds = AcceptanceThresholds() if thresholds is None else thresholds
-    seed_tuple = tuple(int(seed) for seed in seeds)
-    if not seed_tuple:
+    if type(seeds) not in (list, tuple, range):
+        raise ValueError("seeds must be an actual list, tuple, or range")
+    seed_count = len(seeds)
+    if seed_count == 0:
         raise ValueError("seeds must be non-empty")
+    _require_resource_limit(
+        "retained condition-result arrays",
+        seed_count
+        * len(CONDITION_MASKS)
+        * _condition_result_array_nbytes(benchmark_config.phase_steps),
+    )
+    seed_tuple = tuple(_require_seed(seed) for seed in seeds)
     if len(set(seed_tuple)) != len(seed_tuple):
         raise ValueError("seeds must be unique")
-    if any(seed < 0 or seed >= 2**31 for seed in seed_tuple):
-        raise ValueError("seeds must lie in [0, 2**31)")
 
     # Immediate dynamics make the causal effect of each bounded action visible
     # while preserving an uninterrupted physical state across phase switches.
