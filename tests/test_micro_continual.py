@@ -1272,6 +1272,24 @@ class TestCLI:
         assert main(argv) == 0  # idempotent skip, not an overwrite
         assert path.read_bytes() == first
 
+    def test_run_refuses_to_skip_a_shard_from_a_different_network_size(self, tmp_path: Path):
+        """The idempotent skip must bind hidden1/hidden2, not only the stream config."""
+        base = [
+            "run", "--family", "input_permutation", "--arm", "sgd_raw",
+            "--seed", "0", "--out", str(tmp_path), *self.ARGS[:-4],
+        ]
+        assert main([*base, "--hidden1", "8", "--hidden2", "6"]) == 0
+        path = micro_shard_path(tmp_path, "input_permutation", "sgd_raw", 0)
+        first = path.read_bytes()
+        with pytest.raises(
+            ValueError,
+            match=r"existing shard was produced by a different network size "
+            r"\(hidden1=8, hidden2=6\); requested hidden1=16, hidden2=6; "
+            r"use a fresh --out directory",
+        ):
+            main([*base, "--hidden1", "16", "--hidden2", "6"])
+        assert path.read_bytes() == first
+
     def test_ladder_partial_arms_writes_summary_only(self, tmp_path: Path):
         argv = [
             "ladder", "--family", "input_permutation", "--seeds", "0",

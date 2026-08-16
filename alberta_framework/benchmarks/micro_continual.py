@@ -1445,7 +1445,11 @@ def _run_or_skip_shard(
     hidden1: int,
     hidden2: int,
 ) -> Path:
-    """Idempotent shard execution: existing shards are validated and kept."""
+    """Idempotent shard execution: existing shards are validated and kept.
+
+    A shard is only reused when it was produced by the same stream config
+    and the same network size; anything else must go to a fresh directory.
+    """
     path = micro_shard_path(out_dir, config.family, arm_name, seed)
     if path.exists():
         payload = load_micro_shard(path)
@@ -1453,6 +1457,13 @@ def _run_or_skip_shard(
             raise ValueError(
                 f"{path}: existing shard was produced by a different stream "
                 "config; use a fresh --out directory"
+            )
+        if (payload["hidden1"], payload["hidden2"]) != (hidden1, hidden2):
+            raise ValueError(
+                f"{path}: existing shard was produced by a different network size "
+                f"(hidden1={payload['hidden1']}, hidden2={payload['hidden2']}); "
+                f"requested hidden1={hidden1}, hidden2={hidden2}; "
+                "use a fresh --out directory"
             )
         logger.info("shard exists, skipping: %s", path)
         return path
