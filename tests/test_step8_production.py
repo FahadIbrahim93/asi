@@ -42,6 +42,8 @@ _INVALID_WORLD_MODEL_FIELDS: tuple[tuple[str, Any], ...] = (
     ("n_actions", "2"),
     ("action_dim", True),
     ("action_dim", False),
+    ("action_dim", 0),
+    ("action_dim", -1),
     ("action_dim", 1.5),
     ("action_dim", "1"),
     ("hidden_sizes", (True,)),

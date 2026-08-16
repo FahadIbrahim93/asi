@@ -134,11 +134,7 @@ def _validate_world_model_config(config: Step8WorldModelConfig) -> None:
     n_actions = (
         None if config.n_actions is None else _require_int("n_actions", config.n_actions, minimum=1)
     )
-    action_dim = _require_int(
-        "action_dim",
-        config.action_dim,
-        minimum=1 if n_actions is None else None,
-    )
+    action_dim = _require_int("action_dim", config.action_dim, minimum=1)
     if not isinstance(config.hidden_sizes, tuple):
         raise ValueError(f"hidden_sizes must be a tuple of integers, got {config.hidden_sizes!r}")
     hidden_sizes = tuple(
