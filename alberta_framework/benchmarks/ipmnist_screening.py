@@ -8168,22 +8168,24 @@ def load_shard(path: Path) -> dict[str, Any]:
             payload["dataset_provenance"], config, context=str(path)
         )
     for fieldname in ("per_task_accuracy", "per_task_loss", "per_task_plasticity"):
-        if is_v2:
-            raw_values = payload[fieldname]
-            if (
-                not isinstance(raw_values, list)
-                or len(raw_values) != config.n_tasks
-                or any(not _is_finite_json_number(value) for value in raw_values)
-            ):
-                raise ValueError(
-                    f"{path}: {fieldname} must be a list of finite JSON numbers "
-                    f"with length {config.n_tasks}"
-                )
-        values = np.asarray(payload[fieldname], dtype=np.float64)
+        # Curve typing and metric-domain checks apply to every schema: the
+        # legacy v1 shards are the campaign's live format, and a numeric
+        # string, boolean, or out-of-domain value would otherwise rank.
+        raw_values = payload.get(fieldname)
+        if (
+            not isinstance(raw_values, list)
+            or len(raw_values) != config.n_tasks
+            or any(not _is_finite_json_number(value) for value in raw_values)
+        ):
+            raise ValueError(
+                f"{path}: {fieldname} must be a list of finite JSON numbers "
+                f"with length {config.n_tasks}"
+            )
+        values = np.asarray(raw_values, dtype=np.float64)
         if values.shape != (config.n_tasks,) or not np.all(np.isfinite(values)):
             raise ValueError(f"{path}: {fieldname} must be finite with shape ({config.n_tasks},)")
-        if is_v2:
-            _require_screening_curve_domain(values, fieldname, context=str(path))
+        _require_screening_curve_domain(values, fieldname, context=str(path))
+        payload[fieldname] = [float(value) for value in values]
     payload["wall_clock_seconds"] = _validated_wall_clock_seconds(
         payload.get("wall_clock_seconds"), path
     )

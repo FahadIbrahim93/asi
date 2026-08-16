@@ -1134,6 +1134,59 @@ class TestShardsAndMerge:
         path.write_text(json.dumps(payload), encoding="utf-8")
         return path
 
+    @pytest.mark.parametrize(
+        ("fieldname", "mutate", "message"),
+        [
+            ("per_task_accuracy", lambda curve: [5.0] * len(curve), r"must be in \[0, 1\]"),
+            ("per_task_accuracy", lambda curve: [-0.5] * len(curve), r"must be in \[0, 1\]"),
+            ("per_task_plasticity", lambda curve: [1.5] * len(curve), r"must be in \[0, 1\]"),
+            ("per_task_loss", lambda curve: [-1.0] * len(curve), "must be non-negative"),
+            (
+                "per_task_accuracy",
+                lambda curve: [str(v) for v in curve],
+                "must be a list of finite JSON numbers",
+            ),
+            (
+                "per_task_accuracy",
+                lambda curve: [True] * len(curve),
+                "must be a list of finite JSON numbers",
+            ),
+            (
+                "per_task_loss",
+                lambda curve: [str(v) for v in curve],
+                "must be a list of finite JSON numbers",
+            ),
+        ],
+    )
+    def test_load_shard_applies_curve_typing_and_domain_to_legacy_v1(
+        self, tmp_path, fieldname, mutate, message
+    ):
+        """v1 is the campaign's live shard format; its curves get the same domain checks as v2."""
+        path = self._write_inband_shard(tmp_path, "upgd_w_control", 0, 0.5)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload[fieldname] = mutate(list(payload[fieldname]))
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        with pytest.raises(ValueError, match=message):
+            load_shard(path)
+
+    def test_load_shard_canonicalizes_legacy_v1_integer_curve_entries(self, tmp_path):
+        path = self._write_inband_shard(tmp_path, "upgd_w_control", 0, 0.5)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["per_task_accuracy"] = [1] + payload["per_task_accuracy"][1:]
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        loaded = load_shard(path)
+        assert loaded["per_task_accuracy"][0] == 1.0
+        assert type(loaded["per_task_accuracy"][0]) is float
+
+    def test_out_of_domain_legacy_shard_cannot_top_a_merge(self, tmp_path):
+        control = self._write_inband_shard(tmp_path, "upgd_w_control", 0, 0.5)
+        winner = self._write_inband_shard(tmp_path, "upgd_l2init", 0, 0.6)
+        payload = json.loads(winner.read_text(encoding="utf-8"))
+        payload["per_task_accuracy"] = [5.0] * SMALL.n_tasks
+        winner.write_text(json.dumps(payload), encoding="utf-8")
+        with pytest.raises(ValueError, match=r"must be in \[0, 1\]"):
+            merge_shards([control, winner], control_name="upgd_w_control", slope_window=2)
+
     def test_load_shard_rejects_invalid_wall_clock_types_and_values(self, tmp_path):
         path = self._write_inband_shard(tmp_path, "upgd_w_control", 0, 0.5)
         payload = json.loads(path.read_text(encoding="utf-8"))
