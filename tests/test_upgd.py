@@ -23,6 +23,7 @@ so noise effects are unmistakable) and ``sparsity=0.5`` round-trips.
 import chex
 import jax.numpy as jnp
 import jax.random as jr
+import pytest
 
 from alberta_framework.core.optimizers import ObGDBounding
 from alberta_framework.core.upgd import (
@@ -329,6 +330,17 @@ class TestInitShapes:
 
 class TestValidation:
     """Invalid deployment configurations should fail before JIT compilation."""
+
+    @pytest.mark.parametrize("shape", [(1,), (), (4, 1), (5,)])
+    def test_update_rejects_targets_that_are_not_one_per_head(self, shape):
+        """A broadcastable target must not train every head while n_active counts 1."""
+        learner = UPGDLearner(
+            n_heads=4, hidden_sizes=(8,), sparsity=0.0, step_size=0.01, perturbation_sigma=0.0
+        )
+        state = learner.init(feature_dim=3, key=jr.key(0))
+        obs = jnp.array([1.0, -0.5, 0.25])
+        with pytest.raises(ValueError, match=r"targets must have shape \(4,\)"):
+            learner.update(state, obs, jnp.full(shape, 2.0, dtype=jnp.float32))
 
     def test_rejects_invalid_core_dimensions(self):
         invalid_kwargs = [

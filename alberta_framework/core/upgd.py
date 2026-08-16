@@ -1900,7 +1900,18 @@ class UPGDLearner:
         Returns:
             :class:`UPGDUpdateResult` with the updated state, predictions,
             errors, and 1D metrics array.
+
+        Raises:
+            ValueError: If ``targets`` is not one value per head; a
+                broadcastable scalar or length-1 target would train every head
+                while the active-head count normalizing the loss and step
+                sizes counted one.
         """
+        targets = jnp.asarray(targets, dtype=jnp.float32)
+        if targets.shape != (self._n_heads,):
+            raise ValueError(
+                f"targets must have shape ({self._n_heads},), got {targets.shape}"
+            )
         slope = self._leaky_relu_slope
         ln = self._use_layer_norm
         sigma = jnp.array(self._perturbation_sigma, dtype=jnp.float32)
