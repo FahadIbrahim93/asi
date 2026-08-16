@@ -108,7 +108,16 @@ def _preflight_actor_state(
         for fan_in, fan_out in zip(layer_sizes, layer_sizes[1:], strict=False)
     )
     critic_parameters = trunk_parameters + actor_dim + 1
-    critic_scalar_count = 2 * critic_parameters + sum(hidden_sizes) + 5
+    # The critic's default MultiHead learner owns one scalar LMS state for
+    # every trunk and head weight/bias array, in addition to parameters,
+    # traces, utilities, counters, and its average-reward vector.
+    critic_lms_state_scalars = 2 * len(hidden_sizes) + 2
+    critic_scalar_count = (
+        2 * critic_parameters
+        + sum(hidden_sizes)
+        + critic_lms_state_scalars
+        + 5
+    )
     scalar_count = actor_scalar_count + critic_scalar_count
     _require_state_resources(
         "average-reward actor-critic",

@@ -927,8 +927,10 @@ def test_average_reward_configs_canonicalize_float32_sink_values() -> None:
 
 
 def test_average_reward_actor_preflights_state_before_allocation() -> None:
-    # Includes both actor leaves and the nested one-head critic state.
-    last_legal_n_actions = (2**29 - 1 - 28) // 10
+    # For observation_dim=1 and hidden_sizes=(1,), the aggregate owns 10
+    # scalars per action plus 32 fixed scalars. The latter includes all four
+    # scalar LMS states for the critic's trunk/head weight and bias arrays.
+    last_legal_n_actions = (2**29 - 1 - 32) // 10
     AverageRewardHordeActorCriticConfig(
         n_actions=last_legal_n_actions,
         hidden_sizes=(1,),
