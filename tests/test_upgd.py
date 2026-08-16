@@ -1544,6 +1544,46 @@ class TestUtilityTracking:
         assert float(result_always.state.unit_replacement_accumulators[0]) > 0.0
         assert float(result_gated.state.unit_replacement_accumulators[0]) == 0.0
 
+    def test_recycling_budget_does_not_accrue_while_every_unit_is_immature(self):
+        """Warm-up debt must not be discharged as a replacement burst at maturity."""
+        learner = UPGDLearner(
+            n_heads=1,
+            hidden_sizes=(32,),
+            sparsity=0.0,
+            step_size=0.0,
+            perturbation_sigma=0.0,
+            unit_replacement_rate=0.02,
+            unit_maturity_threshold=50,
+        )
+        state = learner.init(feature_dim=3, key=jr.key(31))
+        for _ in range(49):
+            state = learner.update(state, jnp.zeros(3), jnp.zeros(1)).state
+        assert int(jnp.max(state.unit_ages[0])) == 49
+        assert float(state.unit_replacement_accumulators[0]) == 0.0
+        assert float(state.unit_replacement_counts[0]) == 0.0
+        for _ in range(11):
+            state = learner.update(state, jnp.zeros(3), jnp.zeros(1)).state
+        # rate * 32 mature units = 0.64 per step -> at most one replacement per step,
+        # and no more than ceil(7.04) in eleven steps; the old debt would fire every step.
+        assert float(state.unit_replacement_counts[0]) <= 8.0
+        assert float(state.unit_replacement_accumulators[0]) <= 1.0
+
+    def test_recycling_budget_never_carries_more_than_one_pending_unit(self):
+        learner = UPGDLearner(
+            n_heads=1,
+            hidden_sizes=(8,),
+            sparsity=0.0,
+            step_size=0.0,
+            perturbation_sigma=0.0,
+            unit_replacement_rate=0.5,
+            unit_maturity_threshold=0,
+        )
+        state = learner.init(feature_dim=3, key=jr.key(32))
+        for _ in range(20):
+            state = learner.update(state, jnp.zeros(3), jnp.zeros(1)).state
+        assert float(state.unit_replacement_counts[0]) == 20.0
+        assert float(state.unit_replacement_accumulators[0]) <= 1.0
+
     def test_loss_pressure_recycling_budget_scales_with_loss_spike(self):
         learner = UPGDLearner(
             n_heads=1,
