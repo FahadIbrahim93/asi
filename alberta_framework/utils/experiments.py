@@ -58,7 +58,71 @@ _NUMPY_COORDINATE_TYPES = frozenset(
         "U",
     )
 )
-_PYTHON_NUMERIC_COORDINATE_TYPES = (bool, int, float, complex, Decimal, Fraction)
+
+
+class _CanonicalFractionCoordinate(tuple[int, int]):
+    """An intrinsically immutable rational key with Fraction hash semantics."""
+
+    __slots__ = ()
+
+    def __new__(
+        cls,
+        numerator: int,
+        denominator: int,
+    ) -> "_CanonicalFractionCoordinate":
+        if type(numerator) is not int or type(denominator) is not int or denominator <= 0:
+            raise ValueError("canonical Fraction coordinates require builtin integer components")
+        normalized = Fraction(numerator, denominator)
+        return tuple.__new__(cls, (normalized.numerator, normalized.denominator))
+
+    @property
+    def numerator(self) -> int:
+        return self[0]
+
+    @property
+    def denominator(self) -> int:
+        return self[1]
+
+    def _as_fraction(self) -> Fraction:
+        return Fraction(self.numerator, self.denominator)
+
+    def __hash__(self) -> int:
+        return hash(self._as_fraction())
+
+    def __eq__(self, other: object) -> bool:
+        other_type = type(other)
+        if other_type is _CanonicalFractionCoordinate:
+            coordinate = cast(_CanonicalFractionCoordinate, other)
+            return (
+                self.numerator == coordinate.numerator
+                and self.denominator == coordinate.denominator
+            )
+        if other_type in (bool, int, float, complex, Decimal, Fraction):
+            return bool(self._as_fraction() == other)
+        return False
+
+    def __ne__(self, other: object) -> bool:
+        return not self == other
+
+    def __repr__(self) -> str:
+        return repr(self._as_fraction())
+
+    def __str__(self) -> str:
+        return str(self._as_fraction())
+
+    def __getnewargs__(self) -> tuple[int, int]:
+        return (self.numerator, self.denominator)
+
+
+_PYTHON_NUMERIC_COORDINATE_TYPES = (
+    bool,
+    int,
+    float,
+    complex,
+    Decimal,
+    Fraction,
+    _CanonicalFractionCoordinate,
+)
 _STRING_COORDINATE_TYPES = (str, np.str_)
 _BYTES_COORDINATE_TYPES = (bytes, np.bytes_)
 _MAX_HYPERPARAMETER_COORDINATE_NESTING = 32
@@ -452,17 +516,21 @@ def extract_hyperparameter_results(
             from a config name. Accepted scalar coordinates are exact ``None``,
             ``bool``, ``int``, finite ``float`` or ``complex``, finite ``Decimal``,
             ``Fraction``, ``str``, ``bytes``, and the corresponding supported exact
-            NumPy scalar types. Exact tuples and frozensets may compose them to at
-            most 32 nested container levels. Across configurations, Python numeric
-            types form one coherent family, while a NumPy numeric scalar is
-            compatible only with the same exact NumPy scalar type. Coordinate pairs
-            are certified recursively; incompatible container or scalar families
-            fail closed before dictionary equality is invoked. Enums, UUIDs,
-            datetimes, named-tuple subclasses, and other user-defined or noncanonical
-            immutable keys are not accepted.
+            NumPy scalar types. Fraction leaves are normalized into private immutable
+            rational keys with the same Python-numeric equality, hash, representation,
+            and lookup behavior; their input object identity is not retained. Exact
+            tuples and frozensets may compose scalar coordinates to at most 32 nested
+            container levels. Across configurations, Python numeric types form one
+            coherent family, while a NumPy numeric scalar is compatible only with the
+            same exact NumPy scalar type. Coordinate pairs are certified recursively;
+            incompatible container or scalar families fail closed before dictionary
+            equality is invoked. Enums, UUIDs, datetimes, named-tuple subclasses, and
+            other user-defined or noncanonical immutable keys are not accepted.
 
     Returns:
-        Dictionary mapping param value to (mean, std) tuple
+        Dictionary mapping each canonical parameter value to its (mean, std) tuple.
+        Non-Fraction coordinates retain their original key objects; Fraction leaves
+        use immutable, numerically equivalent snapshots.
 
     Raises:
         ValueError: If ``param_extractor`` returns a coordinate outside the
@@ -550,15 +618,40 @@ def _require_hyperparameter_coordinate(
                 f"{_MAX_HYPERPARAMETER_COORDINATE_NESTING} nested "
                 "tuple/frozenset levels"
             )
-        for component in cast(tuple[object, ...] | frozenset[object], value):
+        components = cast(tuple[object, ...] | frozenset[object], value)
+        canonical_components = tuple(
             _require_hyperparameter_coordinate(
                 component,
                 name=name,
                 nesting_depth=nesting_depth + 1,
             )
-        return value
+            for component in components
+        )
+        if all(
+            canonical is original
+            for canonical, original in zip(canonical_components, components, strict=True)
+        ):
+            return value
+        if value_type is tuple:
+            return canonical_components
+        canonical_set = frozenset(canonical_components)
+        if len(canonical_set) != len(components):
+            reject()
+        return canonical_set
 
-    if value is None or value_type in (bool, int, str, bytes, Fraction):
+    if value_type is Fraction:
+        fraction = cast(Fraction, value)
+        numerator = fraction.numerator
+        denominator = fraction.denominator
+        if (
+            type(numerator) is not int
+            or type(denominator) is not int
+            or denominator <= 0
+        ):
+            reject()
+        return _CanonicalFractionCoordinate(numerator, denominator)
+
+    if value is None or value_type in (bool, int, str, bytes):
         return value
 
     if value_type is float:

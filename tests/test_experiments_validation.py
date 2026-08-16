@@ -475,7 +475,14 @@ def test_extract_hyperparameter_results_keeps_canonical_coordinate_families(
     )
 
     assert len(extracted) == 1
-    assert next(iter(extracted)) is coordinate
+    returned_coordinate = next(iter(extracted))
+    if type(coordinate) is Fraction:
+        assert returned_coordinate is not coordinate
+        assert returned_coordinate == coordinate
+        assert hash(returned_coordinate) == hash(coordinate)
+        assert repr(returned_coordinate) == repr(coordinate)
+    else:
+        assert returned_coordinate is coordinate
 
 
 class _NonfiniteFloatThatConvertsFinite(float):
@@ -515,7 +522,145 @@ def test_extract_hyperparameter_results_keeps_wide_finite_numeric_coordinates(
     )
 
     assert len(extracted) == 1
-    assert next(iter(extracted)) is coordinate
+    returned_coordinate = next(iter(extracted))
+    if type(coordinate) is Fraction:
+        assert returned_coordinate is not coordinate
+        assert returned_coordinate == coordinate
+        assert hash(returned_coordinate) == hash(coordinate)
+    else:
+        assert returned_coordinate is coordinate
+
+
+def _nested_fraction_coordinate(value: object, nesting: str) -> object:
+    if nesting == "scalar":
+        return value
+    if nesting == "tuple":
+        return ("fraction", value)
+    assert nesting == "frozenset"
+    return frozenset(("fraction", value))
+
+
+@pytest.mark.parametrize("nesting", ["scalar", "tuple", "frozenset"])
+@pytest.mark.parametrize("poisoned_first", [True, False], ids=("poisoned-first", "poisoned-last"))
+def test_extract_hyperparameter_results_rejects_hidden_fraction_integer_hooks(
+    nesting: str,
+    poisoned_first: bool,
+) -> None:
+    calls: list[str] = []
+    hooks_armed = False
+
+    def record_hook(name: str) -> None:
+        calls.append(name)
+        if hooks_armed:
+            raise RuntimeError(f"unsafe Fraction component hook: {name}")
+
+    class HookedInt(int):
+        def __hash__(self) -> int:
+            record_hook("hash")
+            return int.__hash__(self)
+
+        def __eq__(self, other: object) -> bool:
+            record_hook("eq")
+            result = int.__eq__(self, other)
+            return False if result is NotImplemented else result
+
+        def __int__(self) -> int:
+            record_hook("int")
+            return int.__int__(self)
+
+        def __index__(self) -> int:
+            record_hook("index")
+            return int.__index__(self)
+
+    class Carrier(Fraction):
+        @property
+        def numerator(self) -> int:
+            return HookedInt(1)
+
+        @property
+        def denominator(self) -> int:
+            return HookedInt(2)
+
+    poisoned = Fraction(Carrier(1, 2))
+    assert type(poisoned) is Fraction
+    assert type(poisoned.numerator) is HookedInt
+    poisoned_coordinate = _nested_fraction_coordinate(poisoned, nesting)
+    safe_coordinate = _nested_fraction_coordinate(Fraction(3, 4), nesting)
+    calls.clear()
+    hooks_armed = True
+    coordinates = (
+        (poisoned_coordinate, safe_coordinate)
+        if poisoned_first
+        else (safe_coordinate, poisoned_coordinate)
+    )
+    coordinate_iterator = iter(coordinates)
+    results = {
+        "candidate_0": _flat_trace("candidate_0", 1.0),
+        "candidate_1": _flat_trace("candidate_1", 2.0),
+    }
+
+    with pytest.raises(ValueError, match=r"noncanonical coordinate"):
+        extract_hyperparameter_results(
+            results,
+            param_extractor=lambda _: next(coordinate_iterator),
+        )
+
+    assert calls == []
+
+
+@pytest.mark.parametrize("nesting", ["scalar", "tuple", "frozenset"])
+@pytest.mark.parametrize("reverse", [False, True], ids=("forward", "reverse"))
+def test_extract_hyperparameter_results_snapshots_fraction_before_private_mutation(
+    nesting: str,
+    reverse: bool,
+) -> None:
+    fractions = [Fraction(1, 3), Fraction(2, 3)]
+    if reverse:
+        fractions.reverse()
+    expected_coordinates = tuple(
+        _nested_fraction_coordinate(Fraction(value.numerator, value.denominator), nesting)
+        for value in fractions
+    )
+    calls = 0
+
+    def extract_and_mutate(_: str) -> object:
+        nonlocal calls
+        if calls == 0:
+            calls += 1
+            return _nested_fraction_coordinate(fractions[0], nesting)
+        object.__setattr__(fractions[0], "_numerator", fractions[1].numerator)
+        object.__setattr__(fractions[0], "_denominator", fractions[1].denominator)
+        calls += 1
+        return _nested_fraction_coordinate(fractions[1], nesting)
+
+    extracted = extract_hyperparameter_results(
+        {
+            "candidate_0": _flat_trace("candidate_0", 1.0),
+            "candidate_1": _flat_trace("candidate_1", 2.0),
+        },
+        param_extractor=extract_and_mutate,
+    )
+
+    assert tuple(extracted) == expected_coordinates
+    assert extracted[expected_coordinates[0]] == (1.0, 0.0)
+    assert extracted[expected_coordinates[1]] == (2.0, 0.0)
+
+    returned_coordinate = next(iter(extracted))
+    if nesting == "scalar":
+        returned_fraction = returned_coordinate
+    elif nesting == "tuple":
+        returned_fraction = returned_coordinate[1]
+    else:
+        returned_fraction = next(
+            component for component in returned_coordinate if component != "fraction"
+        )
+    with pytest.raises((AttributeError, TypeError)):
+        object.__setattr__(returned_fraction, "_numerator", 99)
+
+    object.__setattr__(fractions[0], "_numerator", 7)
+    object.__setattr__(fractions[1], "_numerator", 11)
+    assert extracted[expected_coordinates[0]] == (1.0, 0.0)
+    assert extracted[expected_coordinates[1]] == (2.0, 0.0)
 
 
 @pytest.mark.parametrize(
@@ -605,7 +750,43 @@ def test_extract_hyperparameter_results_keeps_coherent_python_numeric_families()
     )
 
     assert tuple(extracted) == coordinates
-    assert all(actual is expected for actual, expected in zip(extracted, coordinates, strict=True))
+    assert all(
+        actual is not expected if type(expected) is Fraction else actual is expected
+        for actual, expected in zip(extracted, coordinates, strict=True)
+    )
+
+
+@pytest.mark.parametrize(
+    "coordinates",
+    [
+        (Fraction(1, 2), 0.5),
+        (0.5, Fraction(1, 2)),
+        (("value", Fraction(1, 2)), ("value", Decimal("0.5"))),
+        (("value", Decimal("0.5")), ("value", Fraction(1, 2))),
+        (
+            frozenset(("value", Fraction(1, 2))),
+            frozenset(("value", Decimal("0.5"))),
+        ),
+        (
+            frozenset(("value", Decimal("0.5"))),
+            frozenset(("value", Fraction(1, 2))),
+        ),
+    ],
+)
+def test_extract_hyperparameter_results_preserves_fraction_numeric_collisions(
+    coordinates: tuple[object, object],
+) -> None:
+    coordinate_iterator = iter(coordinates)
+    results = {
+        "candidate_0": _flat_trace("candidate_0", 1.0),
+        "candidate_1": _flat_trace("candidate_1", 2.0),
+    }
+
+    with pytest.raises(ValueError, match=r"maps several configurations to one value"):
+        extract_hyperparameter_results(
+            results,
+            param_extractor=lambda _: next(coordinate_iterator),
+        )
 
 
 class _DelayedHashDrift:
