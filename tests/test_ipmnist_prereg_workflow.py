@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import runpy
+import zipfile
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, cast
@@ -982,6 +984,17 @@ def test_issue184_prerequisite_requires_committed_result_live_success_and_closur
         "runner_receipt_sha256": hashlib.sha256(runner_path.read_bytes()).hexdigest(),
     }
     _write_json(namespace / "completion.v1.json", completion)
+    archive_stream = io.BytesIO()
+    with zipfile.ZipFile(archive_stream, "w") as archive:
+        archive.writestr(
+            "outputs/ipmnist_screening/replication_r1/completion.v1.json",
+            (namespace / "completion.v1.json").read_bytes(),
+        )
+        archive.writestr(
+            "outputs/ipmnist_screening/replication_r1/runner.v2.json",
+            runner_path.read_bytes(),
+        )
+    archive_bytes = archive_stream.getvalue()
     monkeypatch.setitem(
         _PREREQUISITE_GLOBALS,
         "validate_result_bundle",
@@ -1005,10 +1018,27 @@ def test_issue184_prerequisite_requires_committed_result_live_success_and_closur
             }
         if path.endswith("/issues/51"):
             return {"state": "closed", "closed_at": "2026-08-16T09:00:00Z"}
+        if path.endswith("/actions/runs/123/artifacts?per_page=100"):
+            return {
+                "total_count": 1,
+                "artifacts": [
+                    {
+                        "id": 456,
+                        "name": f"ipmnist-issue51-{'1' * 40}-123",
+                        "expired": False,
+                        "workflow_run": {"id": 123, "head_sha": "1" * 40},
+                    }
+                ],
+            }
         assert "/compare/" in path
         return {"status": "ahead"}
 
     monkeypatch.setitem(_PREREQUISITE_GLOBALS, "_github_json", fake_github_json)
+    monkeypatch.setitem(
+        _PREREQUISITE_GLOBALS,
+        "_github_bytes",
+        lambda path, *, token: archive_bytes,
+    )
     receipt = _verify_prerequisite_completion(
         _PROTOCOLS["issue184"],
         repository="elizaOS/asi",
@@ -1019,6 +1049,32 @@ def test_issue184_prerequisite_requires_committed_result_live_success_and_closur
     assert receipt["protocol"] == "issue51"
     assert receipt["issue_closed_at"] == "2026-08-16T09:00:00Z"
     assert receipt["outcome"] == "replicated"
+    assert receipt["artifact_id"] == 456
+    assert receipt["artifact_archive_sha256"] == hashlib.sha256(archive_bytes).hexdigest()
+
+    tampered_stream = io.BytesIO()
+    with zipfile.ZipFile(tampered_stream, "w") as archive:
+        archive.writestr(
+            "outputs/ipmnist_screening/replication_r1/completion.v1.json",
+            b"{}\n",
+        )
+        archive.writestr(
+            "outputs/ipmnist_screening/replication_r1/runner.v2.json",
+            runner_path.read_bytes(),
+        )
+    monkeypatch.setitem(
+        _PREREQUISITE_GLOBALS,
+        "_github_bytes",
+        lambda path, *, token: tampered_stream.getvalue(),
+    )
+    with pytest.raises(RuntimeError, match="differ"):
+        _verify_prerequisite_completion(
+            _PROTOCOLS["issue184"],
+            repository="elizaOS/asi",
+            launch_source="5" * 40,
+            root=tmp_path,
+            token="token",
+        )
 
 
 def _source_provenance() -> dict[str, object]:

@@ -6,12 +6,14 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import hashlib
+import io
 import json
 import math
 import os
 import urllib.error
 import urllib.parse
 import urllib.request
+import zipfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Final, cast
@@ -304,6 +306,22 @@ def _github_json(path: str, *, token: str) -> Any:
         with urllib.request.urlopen(request, timeout=30) as response:
             return json.loads(response.read().decode("utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError, urllib.error.HTTPError) as exc:
+        raise RuntimeError(f"GitHub API request failed for {path}: {exc}") from exc
+
+
+def _github_bytes(path: str, *, token: str) -> bytes:
+    request = urllib.request.Request(
+        f"https://api.github.com{path}",
+        headers={
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {token}",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return cast(bytes, response.read())
+    except (OSError, urllib.error.HTTPError) as exc:
         raise RuntimeError(f"GitHub API request failed for {path}: {exc}") from exc
 
 
@@ -1024,6 +1042,85 @@ def seal_completion_bundle(
     return completion_path
 
 
+def _verify_prerequisite_run_artifact(
+    *,
+    repository: str,
+    protocol: Protocol,
+    source: str,
+    run_id: int,
+    completion_raw: bytes,
+    runner_raw: bytes,
+    token: str,
+) -> dict[str, Any]:
+    """Bind committed completion bytes to the one artifact uploaded by the live run."""
+
+    payload = _github_json(
+        f"/repos/{repository}/actions/runs/{run_id}/artifacts?per_page=100",
+        token=token,
+    )
+    if not isinstance(payload, dict):
+        raise RuntimeError("prerequisite workflow artifact listing is malformed")
+    artifacts = payload.get("artifacts")
+    total_count = payload.get("total_count")
+    if type(total_count) is not int or total_count != 1 or not isinstance(artifacts, list):
+        raise RuntimeError("prerequisite workflow must retain exactly one result artifact")
+    if len(artifacts) != 1 or not isinstance(artifacts[0], dict):
+        raise RuntimeError("prerequisite workflow artifact listing is incomplete")
+    artifact = artifacts[0]
+    artifact_id = artifact.get("id")
+    expected_name = f"ipmnist-{protocol.key}-{source}-{run_id}"
+    workflow_run = artifact.get("workflow_run")
+    if (
+        type(artifact_id) is not int
+        or artifact_id <= 0
+        or artifact.get("name") != expected_name
+        or artifact.get("expired") is not False
+        or not isinstance(workflow_run, dict)
+        or workflow_run.get("id") != run_id
+        or workflow_run.get("head_sha") != source
+    ):
+        raise RuntimeError("prerequisite workflow result artifact is not canonical")
+    archive = _github_bytes(
+        f"/repos/{repository}/actions/artifacts/{artifact_id}/zip",
+        token=token,
+    )
+    try:
+        with zipfile.ZipFile(io.BytesIO(archive)) as bundle:
+            members = bundle.infolist()
+            names = [member.filename for member in members]
+            if len(names) != len(set(names)):
+                raise RuntimeError("prerequisite workflow artifact repeats a path")
+            namespace = f"outputs/ipmnist_screening/{protocol.namespace}/"
+
+            def exact_member(filename: str) -> zipfile.ZipInfo:
+                matches = [
+                    member
+                    for member in members
+                    if member.filename == namespace + filename
+                    or member.filename.endswith("/" + namespace + filename)
+                ]
+                if len(matches) != 1 or matches[0].is_dir():
+                    raise RuntimeError(
+                        f"prerequisite workflow artifact lacks one exact {filename}"
+                    )
+                mode = matches[0].external_attr >> 16
+                if mode & 0o170000 == 0o120000:
+                    raise RuntimeError("prerequisite workflow artifact contains a symlink")
+                return matches[0]
+
+            artifact_completion = bundle.read(exact_member("completion.v1.json"))
+            artifact_runner = bundle.read(exact_member("runner.v2.json"))
+    except (ValueError, zipfile.BadZipFile, KeyError, OSError) as exc:
+        raise RuntimeError("prerequisite workflow result artifact is unreadable") from exc
+    if artifact_completion != completion_raw or artifact_runner != runner_raw:
+        raise RuntimeError("committed prerequisite receipts differ from the live run artifact")
+    return {
+        "artifact_id": artifact_id,
+        "artifact_name": expected_name,
+        "artifact_archive_sha256": hashlib.sha256(archive).hexdigest(),
+    }
+
+
 def _verify_prerequisite_completion(
     protocol: Protocol,
     *,
@@ -1138,6 +1235,15 @@ def _verify_prerequisite_completion(
         issue_closed_at
     ):
         raise RuntimeError("prerequisite issue must close after the successful workflow run")
+    artifact = _verify_prerequisite_run_artifact(
+        repository=repository,
+        protocol=prerequisite,
+        source=cast(str, source),
+        run_id=run_id,
+        completion_raw=completion_raw,
+        runner_raw=runner_raw,
+        token=token,
+    )
     comparison = _github_json(
         f"/repos/{repository}/compare/{source}...{launch_source}", token=token
     )
@@ -1155,6 +1261,7 @@ def _verify_prerequisite_completion(
         "issue_closed_at": issue_closed_at,
         "outcome": recomputed["outcome"],
         "summary_sha256": recomputed["summary_sha256"],
+        **artifact,
     }
 
 
