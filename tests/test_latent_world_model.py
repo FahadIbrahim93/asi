@@ -651,14 +651,24 @@ def test_latent_config_requires_complete_schema_except_legacy_encoder_defaults()
         LatentWorldModelConfig.from_config(wrong_type)
 
 
-def test_latent_config_preflights_combined_persistent_state_without_allocation() -> None:
-    with pytest.raises(ValueError, match="total_persistent_state_bytes"):
+def test_latent_config_preflights_combined_direct_state_without_allocation() -> None:
+    with pytest.raises(ValueError, match="combined_direct_state_bytes"):
         LatentWorldModelConfig(
             observation_dim=1,
             n_actions=1,
             latent_dim=8,
             hidden_sizes=(16_384, 16_384),
         )
+
+
+def test_latent_config_mapping_gate_does_not_consult_spoofed_class() -> None:
+    class SpoofedMapping:
+        @property
+        def __class__(self) -> type:
+            raise AssertionError("__class__ hook must not run")
+
+    with pytest.raises(ValueError, match="actual mapping"):
+        LatentWorldModelConfig.from_config(SpoofedMapping())  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize(

@@ -270,10 +270,10 @@ class LatentWorldModelConfig:
         outer_state_scalars = (
             self.observation_dim * self.latent_dim + 3 * self.latent_dim + 4
         )
-        total_state_scalars = learner_direct_scalars + outer_state_scalars
+        combined_direct_state_scalars = learner_direct_scalars + outer_state_scalars
         for name, value in (
-            ("total_persistent_state_scalars", total_state_scalars),
-            ("total_persistent_state_bytes", 4 * total_state_scalars),
+            ("combined_direct_state_scalars", combined_direct_state_scalars),
+            ("combined_direct_state_bytes", 4 * combined_direct_state_scalars),
         ):
             if value > _INT32_MAX:
                 raise ValueError(f"derived {name} must fit in signed int32")
