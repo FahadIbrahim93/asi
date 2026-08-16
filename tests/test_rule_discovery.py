@@ -18,6 +18,7 @@ Search executions happen through the CLI, never inside pytest.
 """
 
 import dataclasses
+import re
 
 import jax.numpy as jnp
 import jax.random as jr
@@ -374,6 +375,41 @@ def test_evaluate_population_rejects_noncanonical_seed_schedules_before_material
             jnp.zeros((1, GENOME_SIZE), dtype=jnp.float32),
             MICRO_SUITE["M1"],
             seeds=seeds,  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [(2, 16), (2, GENOME_SIZE + 1), (GENOME_SIZE,), (1, 2, GENOME_SIZE)],
+)
+def test_evaluate_population_rejects_malformed_genome_shapes_before_materialization(
+    monkeypatch: pytest.MonkeyPatch, shape: tuple[int, ...]
+) -> None:
+    def unexpected_materialization(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise AssertionError("malformed genomes reached stream materialization")
+
+    monkeypatch.setattr(rule_discovery, "_materialize_eval", unexpected_materialization)
+    expected = f"genomes must have shape (n_genomes, {GENOME_SIZE}), got {shape}"
+    with pytest.raises(ValueError, match=rf"^{re.escape(expected)}$"):
+        evaluate_population(jnp.zeros(shape, dtype=jnp.float32), MICRO_SUITE["M1"], seeds=(0,))
+
+
+@pytest.mark.parametrize("batch_size", [0, -4, True])
+def test_evaluate_population_rejects_non_positive_batch_size_before_materialization(
+    monkeypatch: pytest.MonkeyPatch, batch_size: object
+) -> None:
+    def unexpected_materialization(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise AssertionError("invalid batch_size reached stream materialization")
+
+    monkeypatch.setattr(rule_discovery, "_materialize_eval", unexpected_materialization)
+    with pytest.raises(ValueError, match="batch_size must be a positive built-in int"):
+        evaluate_population(
+            jnp.zeros((2, GENOME_SIZE), dtype=jnp.float32),
+            MICRO_SUITE["M1"],
+            seeds=(0,),
+            batch_size=batch_size,  # type: ignore[arg-type]
         )
 
 
