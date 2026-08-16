@@ -35,35 +35,37 @@ import dataclasses
 import functools
 import math
 from numbers import Real
-from typing import Any
+from typing import Any, cast
 
 import chex
 import jax
 import jax.numpy as jnp
 import jax.random as jr
-import numpy as np
 from jax import Array
 from jaxtyping import Float, Int
 
-_FLOAT32_TINY = float(np.finfo(np.float32).tiny)
+from alberta_framework._float32 import round_real_to_float32
+
+_FLOAT32_TINY = 2.0**-126
 
 
 def _finite_positive_normal_float32(name: str, value: object) -> float:
     """Return a concrete real after validation in the model's execution dtype."""
     message = f"{name} must be a finite positive normal float32"
+    preserve_builtin_payload = type(value) is int or type(value) is float
     if isinstance(value, bool) or not isinstance(value, Real):
         raise ValueError(message)
     try:
-        concrete = float(value)
+        narrowed = round_real_to_float32(value)
     except (TypeError, ValueError, OverflowError) as exc:
         raise ValueError(message) from exc
-    if not math.isfinite(concrete) or concrete <= 0.0:
-        raise ValueError(message)
-    with np.errstate(over="ignore", under="ignore", invalid="ignore"):
-        narrowed = float(np.float32(concrete))
     if not math.isfinite(narrowed) or narrowed < _FLOAT32_TINY:
         raise ValueError(message)
-    return concrete
+    if preserve_builtin_payload:
+        concrete = float(value)
+        if round_real_to_float32(cast(Real, concrete)) == narrowed:
+            return concrete
+    return narrowed
 
 
 @dataclasses.dataclass(frozen=True)
