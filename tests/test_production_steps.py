@@ -513,6 +513,39 @@ def test_step2_kernel_fields_reject_invalid_inputs(field: str, value: object) ->
         Step2KernelConfig(**{field: value})
 
 
+class _SpoofedInt:
+    """Mimics ``int`` via ``__class__`` to defeat ``isinstance`` checks."""
+
+    @property
+    def __class__(self) -> type:  # type: ignore[override]
+        return int
+
+    def __int__(self) -> int:
+        return 3
+
+    def __index__(self) -> int:
+        return 3
+
+
+@pytest.mark.parametrize(
+    ("config_cls", "field"),
+    [
+        (Step2KernelConfig, "feature_dim"),
+        (Step2KernelConfig, "n_heads"),
+        (Step2KernelConfig, "context_length"),
+        (Step2StrictDigitReadoutConfig, "n_heads"),
+        (Step2MemoryConfig, "feature_dim"),
+        (Step2MemoryConfig, "n_classes"),
+        (Step2MemoryConfig, "slots_per_class"),
+    ],
+)
+def test_step2_configs_reject_class_spoofed_integer_fields(
+    config_cls: type, field: str
+) -> None:
+    with pytest.raises(ValueError, match=field):
+        config_cls(**{field: _SpoofedInt()})
+
+
 _INVALID_STEP2_MEMORY_FIELDS: tuple[tuple[str, Any], ...] = (
     ("feature_dim", 0),
     ("feature_dim", -1),
