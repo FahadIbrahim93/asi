@@ -520,17 +520,39 @@ class IndependentDemonHorde:
             old_wt = demon_state.traces[2 * i]
             grad_w = weight_grads[i]
             if replacing:
-                new_wt = jnp.where(grad_w != 0.0, grad_w, gamma_lamda * old_wt)
+                new_wt = jnp.where(
+                    grad_w != 0.0,
+                    grad_w,
+                    jnp.where(
+                        gamma_lamda == 0.0,
+                        jnp.zeros_like(old_wt),
+                        gamma_lamda * old_wt,
+                    ),
+                )
             else:
-                new_wt = gamma_lamda * old_wt + grad_w
+                carried = jnp.where(
+                    gamma_lamda == 0.0, jnp.zeros_like(old_wt), gamma_lamda * old_wt
+                )
+                new_wt = carried + grad_w
             new_traces.append(new_wt)
 
             old_bt = demon_state.traces[2 * i + 1]
             grad_b = bias_grads[i]
             if replacing:
-                new_bt = jnp.where(grad_b != 0.0, grad_b, gamma_lamda * old_bt)
+                new_bt = jnp.where(
+                    grad_b != 0.0,
+                    grad_b,
+                    jnp.where(
+                        gamma_lamda == 0.0,
+                        jnp.zeros_like(old_bt),
+                        gamma_lamda * old_bt,
+                    ),
+                )
             else:
-                new_bt = gamma_lamda * old_bt + grad_b
+                carried_b = jnp.where(
+                    gamma_lamda == 0.0, jnp.zeros_like(old_bt), gamma_lamda * old_bt
+                )
+                new_bt = carried_b + grad_b
             new_traces.append(new_bt)
 
         # 4. Per-parameter optimizer step from traces
@@ -747,8 +769,9 @@ class IndependentDemonHorde:
             ]
         )
 
-        # 2. TD targets: r + gamma * V(s')
-        targets = cumulants + gammas * next_preds  # NaN propagates as desired
+        # 2. TD targets: r + gamma * V(s'). gamma=0 must not multiply inf V(s').
+        bootstrap = jnp.where(gammas == 0.0, 0.0, gammas * next_preds)
+        targets = cumulants + bootstrap
 
         # 3. NaN means inactive; other non-finite values are rejected heads.
         requested_mask = ~jnp.isnan(cumulants)

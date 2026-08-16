@@ -227,6 +227,37 @@ class TestObgdApplyFinite:
         assert bool(jnp.all(recovered.head_updates_applied))
 
 
+class TestZeroGammaBootstrap:
+    def test_zero_gamma_does_not_multiply_inf_next_prediction(self) -> None:
+        """gamma=0 * inf V(s') is 0*inf = NaN and would freeze a nexting demon."""
+        spec = create_horde_spec(_make_all_gamma0_spec(1))
+        horde = IndependentDemonHorde(
+            horde_spec=spec,
+            hidden_sizes=(),
+            sparsity=0.0,
+        )
+        huge = jnp.float32(1e38)
+        state = horde.init(2, jr.key(0))
+        ds = state.demon_states[0]
+        ds = ds.replace(
+            params=ds.params.replace(
+                weights=(jnp.asarray([[huge, 0.0]], dtype=jnp.float32),)
+            )
+        )
+        state = state.replace(demon_states=(ds,))
+        obs = jnp.asarray([0.0, 1.0], dtype=jnp.float32)
+        next_obs = jnp.asarray([huge, 0.0], dtype=jnp.float32)
+        raw = jnp.asarray(0.0, dtype=jnp.float32) * (huge * huge)
+        assert not bool(jnp.isfinite(raw))
+
+        result = horde.update(state, obs, jnp.asarray([3.0], dtype=jnp.float32), next_obs)
+        assert bool(result.update_applied)
+        chex.assert_trees_all_equal(result.head_updates_applied, jnp.array([True]))
+        chex.assert_trees_all_close(result.td_errors, jnp.array([3.0], dtype=jnp.float32))
+        for w in result.state.demon_states[0].params.weights:  # type: ignore[attr-defined]
+            assert bool(jnp.all(jnp.isfinite(w)))
+
+
 # =============================================================================
 # gamma*lamda > 0 with hidden layers must NOT raise (the point of this class)
 # =============================================================================
