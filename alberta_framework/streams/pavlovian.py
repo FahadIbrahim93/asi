@@ -50,6 +50,7 @@ import numpy as np
 from jax import Array
 from jaxtyping import Int, PRNGKeyArray
 
+from alberta_framework._float32 import round_real_to_float32
 from alberta_framework.core.types import TimeStep
 from alberta_framework.streams.base import ScanStream  # noqa: F401  (re-exported)
 
@@ -88,9 +89,8 @@ def _require_nonnegative_float32(value: object, *, name: str) -> float:
     if value < 0:
         raise ValueError(f"{name} must be a non-negative finite real, got {value!r}")
     try:
-        with np.errstate(over="ignore", under="ignore", invalid="ignore"):
-            narrowed = np.asarray(value, dtype=np.float32).reshape(())
-    except (OverflowError, TypeError, ValueError) as error:
+        narrowed = round_real_to_float32(value)
+    except (FloatingPointError, OverflowError, TypeError, ValueError) as error:
         raise ValueError(
             f"{name} must remain finite when rounded to float32, got {value!r}"
         ) from error
@@ -98,7 +98,7 @@ def _require_nonnegative_float32(value: object, *, name: str) -> float:
         raise ValueError(
             f"{name} must remain finite when rounded to float32, got {value!r}"
         )
-    return float(narrowed)
+    return narrowed
 
 
 def _require_unit_interval(value: object, *, name: str) -> float:

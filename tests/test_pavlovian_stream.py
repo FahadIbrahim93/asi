@@ -11,6 +11,8 @@ Covers:
 
 from __future__ import annotations
 
+from fractions import Fraction
+
 import chex
 import jax
 import jax.numpy as jnp
@@ -505,6 +507,32 @@ def test_construct_rejects_negative_real_that_rounds_to_zero() -> None:
     assert float(below_zero) == 0.0
     with pytest.raises(ValueError, match="noise_std"):
         ClassicalConditioningStream(phases=(_valid_phase(),), noise_std=below_zero)
+
+
+@pytest.mark.parametrize(
+    ("noise_std", "expected"),
+    [
+        (
+            Fraction(1, 1) + Fraction(1, 2**24) - Fraction(1, 2**60),
+            1.0,
+        ),
+        (Fraction(1, 1) + Fraction(1, 2**24), 1.0),
+        (
+            Fraction(1, 1) + Fraction(1, 2**24) + Fraction(1, 2**60),
+            float(np.nextafter(np.float32(1.0), np.float32(2.0))),
+        ),
+    ],
+    ids=("below", "tie-to-even", "above"),
+)
+def test_construct_rounds_fraction_noise_midpoints_once(
+    noise_std: Fraction,
+    expected: float,
+) -> None:
+    stream = ClassicalConditioningStream(
+        phases=(_valid_phase(),),
+        noise_std=noise_std,
+    )
+    assert stream._noise_std == expected  # noqa: SLF001
 
 
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), -0.1, 1.1, True])

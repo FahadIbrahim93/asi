@@ -7,6 +7,8 @@ shape correctness, JIT compatibility via ``jax.lax.scan``, and the
 out-of-class structural properties that motivate each stream.
 """
 
+from fractions import Fraction
+
 import chex
 import jax
 import jax.numpy as jnp
@@ -305,6 +307,34 @@ class TestFrequencyMismatchStream:
 
         stream = FrequencyMismatchStream(omega_min=1.0, omega_max=midpoint_plus)
         assert stream._omega_max == float(np.float32(midpoint_plus))  # noqa: SLF001
+
+    @pytest.mark.parametrize(
+        ("omega_max", "expected"),
+        [
+            (
+                Fraction(1, 1) + Fraction(1, 2**24) - Fraction(1, 2**60),
+                None,
+            ),
+            (Fraction(1, 1) + Fraction(1, 2**24), None),
+            (
+                Fraction(1, 1) + Fraction(1, 2**24) + Fraction(1, 2**60),
+                float(np.nextafter(np.float32(1.0), np.float32(2.0))),
+            ),
+        ],
+        ids=("below", "tie-to-even", "above"),
+    )
+    def test_frequency_bounds_round_fraction_midpoints_once(
+        self,
+        omega_max: Fraction,
+        expected: float | None,
+    ) -> None:
+        if expected is None:
+            with pytest.raises(ValueError, match="omega_max must exceed"):
+                FrequencyMismatchStream(omega_min=1.0, omega_max=omega_max)
+            return
+
+        stream = FrequencyMismatchStream(omega_min=1.0, omega_max=omega_max)
+        assert stream._omega_max == expected  # noqa: SLF001
 
     def test_step_shapes(self):
         stream = FrequencyMismatchStream(
