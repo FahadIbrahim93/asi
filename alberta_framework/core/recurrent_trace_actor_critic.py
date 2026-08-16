@@ -1863,7 +1863,13 @@ class RecurrentTraceActorCriticAgent:
             (),
         )
         continuing = 1.0 - boundary.astype(reward.dtype)
-        discounted_return = reward + self._config.gamma * statistics.discounted_return * continuing
+        gamma = jnp.asarray(self._config.gamma, dtype=reward.dtype)
+        bootstrap_return = jnp.where(
+            (continuing == 0.0) | (gamma == 0.0),
+            jnp.zeros_like(statistics.discounted_return),
+            gamma * statistics.discounted_return,
+        )
+        discounted_return = reward + bootstrap_return
         sample_count, can_increment = _saturating_int32_increment(
             statistics.sample_count,
         )
@@ -1885,7 +1891,11 @@ class RecurrentTraceActorCriticAgent:
             sample_count=sample_count,
             mean=mean,
             m2=m2,
-            discounted_return=discounted_return * continuing,
+            discounted_return=jnp.where(
+                continuing == 0.0,
+                jnp.zeros_like(discounted_return),
+                discounted_return,
+            ),
         )
         return normalized, next_statistics
 
@@ -2470,9 +2480,12 @@ class RecurrentTraceActorCriticAgent:
             )[0],
             (),
         )
-        td_error = (
-            normalized_reward + transition_discount * jax.lax.stop_gradient(next_value) - value
+        bootstrap = jnp.where(
+            transition_discount == 0.0,
+            jnp.zeros_like(next_value),
+            transition_discount * jax.lax.stop_gradient(next_value),
         )
+        td_error = normalized_reward + bootstrap - value
         _, actor_gradient = self._actor_gradient(state, td_error)
 
         # The terminating reward must still credit traces accumulated within
@@ -2488,7 +2501,12 @@ class RecurrentTraceActorCriticAgent:
         actor_traces = cast(
             RTUNetworkParameters,
             jax.tree_util.tree_map(
-                lambda trace, gradient: actor_decay * trace + gradient,
+                lambda trace, gradient: (
+                    jnp.where(
+                        actor_decay == 0.0, jnp.zeros_like(trace), actor_decay * trace
+                    )
+                    + gradient
+                ),
                 state.actor_traces,
                 actor_gradient,
             ),
@@ -2496,7 +2514,12 @@ class RecurrentTraceActorCriticAgent:
         critic_traces = cast(
             RTUNetworkParameters,
             jax.tree_util.tree_map(
-                lambda trace, gradient: critic_decay * trace + gradient,
+                lambda trace, gradient: (
+                    jnp.where(
+                        critic_decay == 0.0, jnp.zeros_like(trace), critic_decay * trace
+                    )
+                    + gradient
+                ),
                 state.critic_traces,
                 critic_gradient,
             ),
@@ -2682,7 +2705,17 @@ class RecurrentTraceActorCriticAgent:
         candidate_applied = (
             actor_update_applied
             & critic_update_applied
-            & _floating_tree_is_finite(state)
+            & _floating_tree_is_finite(
+                state.replace(
+                    reward_statistics=state.reward_statistics._replace(
+                        discounted_return=jnp.where(
+                            boundary,
+                            jnp.zeros_like(state.reward_statistics.discounted_return),
+                            state.reward_statistics.discounted_return,
+                        )
+                    )
+                )
+            )
             & _floating_tree_is_finite(proposed_state)
             & state.started
             & (state.last_action >= 0)
@@ -2720,7 +2753,9 @@ class RecurrentTraceActorCriticAgent:
             ),
             policy=jnp.where(update_applied, next_policy, jnp.zeros_like(next_policy)),
             value=jnp.where(update_applied, value, zero),
-            next_value=jnp.where(update_applied, next_value, zero),
+            next_value=jnp.where(
+                update_applied & jnp.isfinite(next_value), next_value, zero
+            ),
             td_error=jnp.where(update_applied, td_error, zero),
             entropy=jnp.where(update_applied, current_entropy, zero),
             normalized_reward=jnp.where(update_applied, normalized_reward, zero),

@@ -633,6 +633,38 @@ def test_obgd_infinite_signal_zeros_bounded_update() -> None:
     assert not bool(unbounded.update_applied)
 
 
+def test_terminated_does_not_multiply_inf_discounted_return() -> None:
+    """A terminal 0 * inf return tracker is NaN and would freeze reward stats."""
+    config = _small_config(
+        actor_alpha=0.0,
+        critic_alpha=0.0,
+        normalize_rewards=False,
+    )
+    agent = RecurrentTraceActorCriticAgent(config)
+    state = agent.init(2, jr.key(0))
+    state, _, _ = agent.start(
+        state,
+        jnp.asarray((0.5, -0.25), dtype=jnp.float32),
+    )
+    state = state.replace(
+        reward_statistics=state.reward_statistics._replace(
+            discounted_return=jnp.asarray(jnp.inf, dtype=jnp.float32)
+        )
+    )
+    raw = jnp.asarray(0.0, dtype=jnp.float32) * jnp.asarray(jnp.inf, dtype=jnp.float32)
+    assert not bool(jnp.isfinite(raw))
+
+    result = agent.update(
+        state,
+        jnp.asarray(1.0, dtype=jnp.float32),
+        jnp.asarray((-0.3, 0.7), dtype=jnp.float32),
+        terminated=jnp.asarray(True),
+    )
+    assert bool(result.update_applied)
+    assert bool(jnp.isfinite(result.state.reward_statistics.discounted_return))
+    assert float(result.state.reward_statistics.discounted_return) == 0.0
+
+
 def test_adaptive_obgd_infinite_signal_keeps_finite_updates() -> None:
     traces = {
         "first": jnp.asarray((2.0, -1.0), dtype=jnp.float32),
