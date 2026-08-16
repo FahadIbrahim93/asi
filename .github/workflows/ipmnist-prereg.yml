@@ -21,7 +21,9 @@ run-name: ipmnist-${{ inputs.protocol }}-${{ inputs.launch_sha }}
         type: string
 
 concurrency:
-  group: ipmnist-prereg-${{ inputs.protocol }}-${{ inputs.launch_sha }}
+  # One protocol consumes one frozen seed schedule and one append-only namespace.
+  # Serialize different reviewed source objects too, not merely duplicate SHAs.
+  group: ipmnist-prereg-${{ inputs.protocol }}
   cancel-in-progress: false
 
 permissions:
@@ -165,34 +167,6 @@ jobs:
           fi
           echo "path=$python_path" >> "$GITHUB_OUTPUT"
 
-      - name: Require one pre-data project-owner authorization and one dispatch
-        shell: bash
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PROTOCOL: ${{ inputs.protocol }}
-          SOURCE: ${{ inputs.launch_sha }}
-          TREE: ${{ steps.identity.outputs.tree }}
-          UV_LOCK_SHA256: ${{ steps.identity.outputs.uv_lock_sha256 }}
-          WORKFLOW_BLOB_SHA1: ${{ steps.identity.outputs.workflow_blob_sha1 }}
-          DRIVER_BLOB_SHA1: ${{ steps.identity.outputs.driver_blob_sha1 }}
-          PYTHON_PATH: ${{ steps.python.outputs.path }}
-        run: |
-          set -euo pipefail
-          metadata="$RUNNER_TEMP/prereg-metadata/launch-preflight.json"
-          "$PYTHON_PATH" .github/scripts/ipmnist_prereg.py preflight \
-            --protocol "$PROTOCOL" \
-            --repository "$GITHUB_REPOSITORY" \
-            --source "$SOURCE" \
-            --tree "$TREE" \
-            --uv-lock-sha256 "$UV_LOCK_SHA256" \
-            --workflow-blob-sha1 "$WORKFLOW_BLOB_SHA1" \
-            --driver-blob-sha1 "$DRIVER_BLOB_SHA1" \
-            --ref-name "$GITHUB_REF_NAME" \
-            --run-id "$GITHUB_RUN_ID" \
-            --run-attempt "$GITHUB_RUN_ATTEMPT" \
-            --root "$GITHUB_WORKSPACE" \
-            --output "$metadata"
-
       - name: Synchronize the committed environment
         shell: bash
         env:
@@ -322,6 +296,33 @@ jobs:
           with destination.open("x", encoding="utf-8") as stream:
               stream.write(encoded)
           PY
+
+      - name: Require one pre-data project-owner authorization and one dispatch
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PROTOCOL: ${{ inputs.protocol }}
+          SOURCE: ${{ inputs.launch_sha }}
+          TREE: ${{ steps.identity.outputs.tree }}
+          UV_LOCK_SHA256: ${{ steps.identity.outputs.uv_lock_sha256 }}
+          WORKFLOW_BLOB_SHA1: ${{ steps.identity.outputs.workflow_blob_sha1 }}
+          DRIVER_BLOB_SHA1: ${{ steps.identity.outputs.driver_blob_sha1 }}
+        run: |
+          set -euo pipefail
+          metadata="$RUNNER_TEMP/prereg-metadata/launch-preflight.json"
+          uv run --no-sync python .github/scripts/ipmnist_prereg.py preflight \
+            --protocol "$PROTOCOL" \
+            --repository "$GITHUB_REPOSITORY" \
+            --source "$SOURCE" \
+            --tree "$TREE" \
+            --uv-lock-sha256 "$UV_LOCK_SHA256" \
+            --workflow-blob-sha1 "$WORKFLOW_BLOB_SHA1" \
+            --driver-blob-sha1 "$DRIVER_BLOB_SHA1" \
+            --ref-name "$GITHUB_REF_NAME" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --root "$GITHUB_WORKSPACE" \
+            --output "$metadata"
 
       - name: Run code-only preregistration preflight tests
         shell: bash
