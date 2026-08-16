@@ -98,6 +98,13 @@ _RAW_GLOBAL_PROFILES = frozenset(
 )
 
 
+def _static_zero_scale(scale: float, value: Array) -> Array:
+    """Skip a statically disabled EMA without changing enabled JAX graphs."""
+    if scale == 0.0:
+        return jnp.zeros_like(value)
+    return scale * value
+
+
 @dataclass(frozen=True)
 class CanonicalUPGDConfig:
     """Configuration for canonical first-order UPGD.
@@ -425,7 +432,8 @@ class CanonicalUPGD:
             instantaneous = -clean_gradient * param
             next_utility = jnp.where(
                 active,
-                beta * utility + (1.0 - beta) * instantaneous,
+                _static_zero_scale(beta, utility)
+                + (1.0 - beta) * instantaneous,
                 utility,
             )
             if self._config.uses_global_clock:
@@ -1078,6 +1086,34 @@ class AlbertaAdaUPGD:
         proposed_next_key = split_keys[0]
         noise_keys = split_keys[1:]
         state_is_valid = self.state_valid(state, params)
+        if self._config.utility_decay == 0.0 or self._config.second_moment_decay == 0.0:
+            checked_utility = (
+                jax.tree.map(
+                    lambda value: jnp.where(
+                        jnp.isfinite(value), value, jnp.zeros_like(value)
+                    ),
+                    state.utility_ema,
+                )
+                if self._config.utility_decay == 0.0
+                else state.utility_ema
+            )
+            checked_moment = (
+                jax.tree.map(
+                    lambda value: jnp.where(
+                        jnp.isfinite(value), value, jnp.zeros_like(value)
+                    ),
+                    state.gradient_second_moment,
+                )
+                if self._config.second_moment_decay == 0.0
+                else state.gradient_second_moment
+            )
+            state_is_valid = self.state_valid(
+                state.replace(  # type: ignore[attr-defined]
+                    utility_ema=checked_utility,
+                    gradient_second_moment=checked_moment,
+                ),
+                params,
+            )
         capacity_available = state.step < jnp.asarray(_INT32_MAX, dtype=jnp.int32)
         proposed_step = jnp.where(capacity_available, state.step + 1, state.step)
         input_is_valid = jnp.asarray(True, dtype=jnp.bool_)
@@ -1159,7 +1195,7 @@ class AlbertaAdaUPGD:
             instantaneous_utility = -gradient * param
             proposed_utility = jnp.where(
                 eligible,
-                beta_utility * utility
+                _static_zero_scale(beta_utility, utility)
                 + (1.0 - beta_utility) * instantaneous_utility,
                 utility,
             )
@@ -1176,9 +1212,9 @@ class AlbertaAdaUPGD:
                 0.0,
             )
 
-            proposed_moment = (
-                beta_second * moment + (1.0 - beta_second) * jnp.square(gradient)
-            )
+            proposed_moment = _static_zero_scale(beta_second, moment) + (
+                1.0 - beta_second
+            ) * jnp.square(gradient)
             moment_clock = jnp.maximum(proposed_step, 1).astype(param.dtype)
             moment_correction = 1.0 - jnp.power(beta_second, moment_clock)
             corrected_moment = proposed_moment / jnp.maximum(
@@ -1787,15 +1823,15 @@ class OfficialAdaUPGD:
             strict=True,
         ):
             proposed_utility_leaves.append(
-                self._config.utility_decay * utility
+                _static_zero_scale(self._config.utility_decay, utility)
                 + (1.0 - self._config.utility_decay) * (-gradient * param)
             )
             proposed_first_leaves.append(
-                self._config.beta1 * first
+                _static_zero_scale(self._config.beta1, first)
                 + (1.0 - self._config.beta1) * gradient
             )
             proposed_second_leaves.append(
-                self._config.beta2 * second
+                _static_zero_scale(self._config.beta2, second)
                 + (1.0 - self._config.beta2) * jnp.square(gradient)
             )
 

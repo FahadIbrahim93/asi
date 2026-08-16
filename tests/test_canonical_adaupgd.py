@@ -35,6 +35,63 @@ def _assert_key_equal(left, right) -> None:
     chex.assert_trees_all_equal(jr.key_data(left), jr.key_data(right))
 
 
+def test_alberta_zero_decays_recover_unused_inf_trackers() -> None:
+    params = {"w": jnp.ones(2, dtype=jnp.float32)}
+    optimizer = AlbertaAdaUPGD(
+        AlbertaAdaUPGDConfig(
+            utility_decay=0.0,
+            second_moment_decay=0.0,
+            noise_std=0.0,
+        )
+    )
+    state = optimizer.init(params).replace(  # type: ignore[attr-defined]
+        utility_ema={"w": jnp.full(2, jnp.inf, dtype=jnp.float32)},
+        gradient_second_moment={
+            "w": jnp.full(2, jnp.inf, dtype=jnp.float32)
+        },
+    )
+
+    result = optimizer.update(
+        state,
+        params,
+        {"w": jnp.asarray([-1.0, -0.5], dtype=jnp.float32)},
+        jr.key(101),
+        noise=_zero_noise(params),
+    )
+
+    assert bool(result.accepted)
+    chex.assert_tree_all_finite(result.state)
+    chex.assert_tree_all_finite(result.params)
+
+
+def test_official_zero_decays_do_not_multiply_inf_trackers() -> None:
+    params = {"w": jnp.ones(2, dtype=jnp.float32)}
+    optimizer = OfficialAdaUPGD(
+        OfficialAdaUPGDConfig(
+            utility_decay=0.0,
+            beta1=0.0,
+            beta2=0.0,
+            noise_std=0.0,
+        )
+    )
+    state = optimizer.init(params).replace(  # type: ignore[attr-defined]
+        utility_ema={"w": jnp.full(2, jnp.inf, dtype=jnp.float32)},
+        first_moment={"w": jnp.full(2, jnp.inf, dtype=jnp.float32)},
+        second_moment={"w": jnp.full(2, jnp.inf, dtype=jnp.float32)},
+    )
+
+    result = optimizer.update(
+        state,
+        params,
+        {"w": jnp.asarray([-1.0, -0.5], dtype=jnp.float32)},
+        jr.key(102),
+        noise=_zero_noise(params),
+    )
+
+    chex.assert_tree_all_finite(result.state)
+    chex.assert_tree_all_finite(result.params)
+
+
 def test_config_is_explicitly_derived_strict_and_roundtrips() -> None:
     config = AlbertaAdaUPGDConfig(
         step_size=0.02,

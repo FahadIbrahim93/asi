@@ -11,6 +11,7 @@ import pytest
 from alberta_framework.core.canonical_upgd import (
     CanonicalUPGD,
     CanonicalUPGDConfig,
+    _static_zero_scale,
 )
 from alberta_framework.core.checkpoints import load_checkpoint, save_checkpoint
 
@@ -367,6 +368,42 @@ def test_global_normalization_spans_all_pytree_leaves() -> None:
         },
     )
     assert float(result.metrics["global_maximum_utility"]) == pytest.approx(2.0)
+
+
+def test_zero_utility_decay_does_not_multiply_inf_ema() -> None:
+    """utility_decay=0 times an infinite EMA is NaN and would be committed."""
+    params = {"w": jnp.ones(2, dtype=jnp.float32)}
+    gradients = {"w": jnp.array([-1.0, -0.5], dtype=jnp.float32)}
+    optimizer = CanonicalUPGD(CanonicalUPGDConfig(utility_decay=0.0, noise_std=0.0))
+    state = optimizer.init(params).replace(
+        utility_ema={"w": jnp.full(2, jnp.inf, dtype=jnp.float32)}
+    )
+    raw = jnp.asarray(0.0, dtype=jnp.float32) * jnp.asarray(jnp.inf, dtype=jnp.float32)
+    assert not bool(jnp.isfinite(raw))
+
+    result = optimizer.update(state, params, gradients, jr.key(0))
+    chex.assert_tree_all_finite(result.state.utility_ema)
+    chex.assert_tree_all_finite(result.params)
+
+
+def test_nonzero_static_decay_preserves_legacy_hlo() -> None:
+    value = jnp.ones((4,), dtype=jnp.float32)
+    decay = 0.999
+
+    legacy_hlo = (
+        jax.jit(lambda leaf: decay * leaf)
+        .lower(value)
+        .compiler_ir(dialect="hlo")
+        .as_hlo_text()
+    )
+    guarded_hlo = (
+        jax.jit(lambda leaf: _static_zero_scale(decay, leaf))
+        .lower(value)
+        .compiler_ir(dialect="hlo")
+        .as_hlo_text()
+    )
+
+    assert legacy_hlo.splitlines()[1:] == guarded_hlo.splitlines()[1:]
 
 
 def test_paper_global_all_negative_uses_signed_maximum_and_reverses_order() -> None:
