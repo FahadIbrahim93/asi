@@ -17,6 +17,7 @@ from alberta_framework.utils.experiments import (
     ExperimentConfig,
     SingleRunResult,
     aggregate_metrics,
+    extract_hyperparameter_results,
     get_final_performance,
     get_metric_timeseries,
     run_multi_seed_experiment,
@@ -349,6 +350,43 @@ def test_aggregate_metrics_rejects_duplicate_seed_identities() -> None:
         aggregate_metrics(
             [_single_run(0, [1.0, 1.0]), _single_run(1, [2.0, 2.0]), _single_run(0, [3.0, 3.0])]
         )
+
+
+def _flat_trace(name: str, value: float) -> AggregatedResults:
+    return AggregatedResults(
+        config_name=name,
+        seeds=[0, 1],
+        metric_arrays={"squared_error": np.full((2, 3), value, dtype=np.float64)},
+        summary={},
+    )
+
+
+def test_extract_hyperparameter_results_rejects_colliding_parameter_values() -> None:
+    """A non-injective extractor must not silently keep the dict-last configuration."""
+    results = {
+        "lr_0.01_decay_0.0": _flat_trace("lr_0.01_decay_0.0", 1.0),
+        "lr_0.01_decay_0.1": _flat_trace("lr_0.01_decay_0.1", 9.0),
+        "lr_0.10_decay_0.0": _flat_trace("lr_0.10_decay_0.0", 3.0),
+    }
+    with pytest.raises(
+        ValueError,
+        match=r"^param_extractor maps several configurations to one value: "
+        r"0\.01 <- \['lr_0\.01_decay_0\.0', 'lr_0\.01_decay_0\.1'\]$",
+    ):
+        extract_hyperparameter_results(
+            results, param_extractor=lambda name: float(name.split("_")[1])
+        )
+
+
+def test_extract_hyperparameter_results_keeps_injective_extractors() -> None:
+    results = {
+        "lr_0.01": _flat_trace("lr_0.01", 1.0),
+        "lr_0.10": _flat_trace("lr_0.10", 3.0),
+    }
+    extracted = extract_hyperparameter_results(
+        results, param_extractor=lambda name: float(name.split("_")[1])
+    )
+    assert extracted == {0.01: (1.0, 0.0), 0.1: (3.0, 0.0)}
 
 
 def test_get_metric_timeseries_rejects_nonfinite_samples() -> None:
