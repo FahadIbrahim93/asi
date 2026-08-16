@@ -307,6 +307,34 @@ def test_associative_memory_respects_fixed_budget() -> None:
     assert int(result.state.replacements) > 0
 
 
+@pytest.mark.parametrize("label", [-1, 4, 9999, 1.9, float("nan"), float("inf")])
+def test_update_rejects_labels_outside_the_vocabulary_instead_of_clipping(label: float) -> None:
+    """An out-of-domain label must be a rejected transaction, not a substituted class."""
+    learner = AssociativeMemoryLearner(
+        AssociativeMemoryConfig(vocab_size=4, block_size=3, suffix_length=2, max_features=8)
+    )
+    state = learner.init()
+    result = learner.update(
+        state, jnp.asarray([1, 2, 3], dtype=jnp.int32), jnp.asarray(label, dtype=jnp.float32)
+    )
+    assert not bool(result.update_applied)
+    chex.assert_trees_all_equal(result.state, state)
+    chex.assert_trees_all_equal(result.metrics, jnp.zeros_like(result.metrics))
+
+
+def test_update_accepts_every_in_vocabulary_label() -> None:
+    learner = AssociativeMemoryLearner(
+        AssociativeMemoryConfig(vocab_size=4, block_size=3, suffix_length=2, max_features=8)
+    )
+    state = learner.init()
+    for label in range(4):
+        result = learner.update(
+            state, jnp.asarray([1, 2, 3], dtype=jnp.int32), jnp.asarray(label, dtype=jnp.int32)
+        )
+        assert bool(result.update_applied)
+        assert float(result.state.prior[label]) > float(state.prior[label])
+
+
 def test_evicted_row_is_reset_before_a_new_key_writes_into_it() -> None:
     """A slot reused by eviction must not carry the evicted key's values, utility, or counts."""
     learner = AssociativeMemoryLearner(

@@ -26,6 +26,7 @@ from jaxtyping import Bool, Float, Int
 from alberta_framework.core.update_safety import (
     floating_tree_is_finite,
     neutralize_array,
+    safe_discrete_action,
     select_transaction,
 )
 
@@ -667,7 +668,10 @@ class AssociativeMemoryLearner:
     ) -> AssociativeMemoryUpdateResult:
         """Predict, then update active associative rows."""
         prediction = self.predict(state, context)
-        label = jnp.clip(label.astype(jnp.int32), 0, self._config.vocab_size - 1)
+        # An out-of-vocabulary, fractional, or non-finite label is a rejected
+        # transaction, never a substituted class: clipping would train and
+        # score a class the stream did not observe with update_applied=True.
+        label, label_valid = safe_discrete_action(label, self._config.vocab_size)
         loss = _cross_entropy_from_logits(prediction.logits, label)
         accuracy = (jnp.argmax(prediction.logits) == label).astype(jnp.float32)
         next_state = state.replace(  # type: ignore[attr-defined]
@@ -781,7 +785,8 @@ class AssociativeMemoryLearner:
             dtype=jnp.float32,
         )
         update_applied = (
-            floating_tree_is_finite(state)
+            label_valid
+            & floating_tree_is_finite(state)
             & floating_tree_is_finite(prediction)
             & jnp.isfinite(loss)
             & floating_tree_is_finite(next_state)
