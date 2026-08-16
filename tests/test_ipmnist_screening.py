@@ -725,6 +725,32 @@ class TestL2Init:
 
 
 class TestEMANorm:
+    def test_decay_one_preserves_initial_moment_pseudo_sample(self):
+        """The scan restatement includes the initialized moments as one sample."""
+        state = EMANormState(
+            mean=jnp.zeros(1),
+            var=jnp.ones(1),
+            count=jnp.array(0.0),
+        )
+
+        _, state = ema_normalize(
+            state,
+            jnp.asarray([5.0], dtype=jnp.float32),
+            1.0,
+            1e-8,
+        )
+        np.testing.assert_array_equal(np.asarray(state.mean), np.asarray([2.5]))
+        np.testing.assert_array_equal(np.asarray(state.var), np.asarray([6.75]))
+
+        _, state = ema_normalize(
+            state,
+            jnp.asarray([7.0], dtype=jnp.float32),
+            1.0,
+            1e-8,
+        )
+        np.testing.assert_array_equal(np.asarray(state.mean), np.asarray([4.0]))
+        np.testing.assert_array_equal(np.asarray(state.var), np.asarray([9.0]))
+
     def test_parity_with_core_ema_normalizer(self):
         normalizer = EMANormalizer(epsilon=1e-8, decay=0.999)
         core_state = normalizer.init(6)

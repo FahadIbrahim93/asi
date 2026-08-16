@@ -956,7 +956,7 @@ class EMANormState:
 def ema_normalize(
     state: EMANormState, observation: Array, decay: float, epsilon: float
 ) -> tuple[Array, EMANormState]:
-    """Equation-parity restatement of ``EMANormalizer.normalize`` (scan-friendly)."""
+    """Scan-friendly EMA with the core's zero-mean, unit-variance prior sample."""
     new_count = state.count + 1.0
     effective_decay = jnp.minimum(decay, 1.0 - 1.0 / (new_count + 1.0))
     delta = observation - state.mean
