@@ -418,6 +418,37 @@ class TestPrototypeAgentScan:
         assert int(result.state.step_count) == n_steps
         chex.assert_tree_all_finite(result.oak_td_errors)
 
+    @pytest.mark.parametrize(
+        ("field", "shape"),
+        [
+            ("rewards", (8, 1)),
+            ("rewards", (2, 4)),
+            ("next_observations", (OBS_DIM, 8)),
+            ("next_observations", (2, 4 * OBS_DIM)),
+            ("discounts", (2, 4)),
+        ],
+    )
+    def test_scan_rejects_wrong_shaped_arrays_instead_of_reshaping(
+        self, field: str, shape: tuple[int, ...]
+    ) -> None:
+        """A transposed or wrongly stacked buffer must not be silently reinterpreted row-major."""
+        agent = PrototypeAgent(_minimal_config())
+        state = agent.start(agent.init(jr.key(0)), jnp.zeros(OBS_DIM))
+        n_steps = 8
+        arrays: dict[str, object] = {
+            "rewards": jr.normal(jr.key(42), (n_steps,)),
+            "next_observations": jr.normal(jr.key(43), (n_steps, OBS_DIM)),
+            "discounts": jnp.full((n_steps,), 0.9, dtype=jnp.float32),
+        }
+        arrays[field] = jnp.reshape(arrays[field], shape)
+        with pytest.raises(ValueError, match=f"{field} must have shape"):
+            agent.scan(
+                state,
+                arrays["rewards"],
+                arrays["next_observations"],
+                discounts=arrays["discounts"],
+            )
+
     def test_scan_matches_sequential(self) -> None:
         agent = PrototypeAgent(_minimal_config())
         init_state = agent.start(agent.init(jr.key(0)), jnp.zeros(OBS_DIM))

@@ -2021,6 +2021,14 @@ def _unavailable_state_builder_learning_diagnostics() -> StateBuilderLearningDia
     )
 
 
+def _shaped_float_array(value: Any, shape: tuple[int, ...], *, name: str) -> Array:
+    """Coerce to float32 without ever reshaping: static shape drift is a caller error."""
+    array = jnp.asarray(value, dtype=jnp.float32)
+    if array.shape != shape:
+        raise ValueError(f"{name} must have shape {shape}, got {array.shape}")
+    return array
+
+
 def _checked_finite_array(
     value: Any,
     shape: tuple[int, ...],
@@ -2029,7 +2037,7 @@ def _checked_finite_array(
     allow_nan: bool = False,
 ) -> Array:
     """Validate shape/finiteness eagerly and poison invalid traced values."""
-    array = jnp.asarray(value, dtype=jnp.float32).reshape(shape)
+    array = _shaped_float_array(value, shape, name=name)
     element_valid = ~jnp.isinf(array) if allow_nan else jnp.isfinite(array)
     valid = jnp.all(element_valid)
     if not _contains_tracer(array) and not bool(valid):
@@ -2040,7 +2048,7 @@ def _checked_finite_array(
 
 def _checked_unit_discount(value: Any, shape: tuple[int, ...], *, name: str) -> Array:
     """Validate finite ``[0, 1]`` discounts at eager and traced boundaries."""
-    array = jnp.asarray(value, dtype=jnp.float32).reshape(shape)
+    array = _shaped_float_array(value, shape, name=name)
     valid = jnp.all(
         jnp.isfinite(array) & (array >= 0.0) & (array <= 1.0)
     )
