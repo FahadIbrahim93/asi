@@ -220,11 +220,14 @@ def cohens_d(
         variance have a signed-infinite standardized difference.
 
     Raises:
-        ValueError: If either group is empty or the pooled degrees of freedom
+        ValueError: If either group is not a finite one-dimensional sample
+            vector, is empty, or the pooled degrees of freedom
             ``n_a + n_b - 2`` are not positive.
     """
     a = _require_sample_vector(values_a, name="values_a")
     b = _require_sample_vector(values_b, name="values_b")
+    _require_finite_values(a, name="values_a")
+    _require_finite_values(b, name="values_b")
 
     n_a = len(a)
     n_b = len(b)
@@ -288,6 +291,8 @@ def ttest_comparison(
     """
     a = _require_sample_vector(values_a, name="values_a")
     b = _require_sample_vector(values_b, name="values_b")
+    _require_finite_values(a, name="values_a")
+    _require_finite_values(b, name="values_b")
 
     if paired:
         if len(a) != len(b):
@@ -364,6 +369,8 @@ def mann_whitney_comparison(
     """
     a = _require_sample_vector(values_a, name="values_a")
     b = _require_sample_vector(values_b, name="values_b")
+    _require_finite_values(a, name="values_a")
+    _require_finite_values(b, name="values_b")
 
     if len(a) == 0 or len(b) == 0:
         raise ValueError(
@@ -432,6 +439,8 @@ def wilcoxon_comparison(
     """
     a = _require_sample_vector(values_a, name="values_a")
     b = _require_sample_vector(values_b, name="values_b")
+    _require_finite_values(a, name="values_a")
+    _require_finite_values(b, name="values_b")
 
     if len(a) != len(b):
         raise ValueError(
