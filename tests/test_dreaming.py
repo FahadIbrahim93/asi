@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import dataclasses
 from typing import Any
 
 import chex
+import jax
 import jax.numpy as jnp
 import jax.random as jr
+import pytest
 
 from alberta_framework.core.dreaming import (
     DreamBehaviorModelPrediction,
@@ -206,6 +209,59 @@ def test_model_confidence_gating_marks_invalid_and_stops_rollout() -> None:
     )
     gvf_items = imagined_rollout_to_gvf_items(rollout)
     chex.assert_trees_all_close(gvf_items.weights, jnp.zeros((3,), dtype=jnp.float32))
+
+
+def test_nonfinite_world_prediction_marks_the_dream_step_invalid_and_stops() -> None:
+    """A NaN/inf model prediction must not become a valid, weight-1.0 imagined transition."""
+    world = MockWorldModel()
+    behavior = DeterministicBehaviorModel()
+    world_state = MockWorldState(
+        drift=jnp.array([jnp.nan, 0.0], dtype=jnp.float32),
+        reward_bias=jnp.array(0.25, dtype=jnp.float32),
+        confidence=jnp.array(1.0, dtype=jnp.float32),
+        model_error=jnp.array(0.0, dtype=jnp.float32),
+    )
+    behavior_state = DeterministicBehaviorState(action=jnp.array(0, dtype=jnp.int32))
+    config = DreamRolloutConfig(rollout_horizon=3, confidence_threshold=0.5, max_model_error=1.0)
+    anchor = jnp.array([1.0, 1.0], dtype=jnp.float32)
+    initial = init_dream_rollout_state(anchor, jr.key(11))
+
+    rollout = dream_rollout(world, world_state, behavior, behavior_state, initial, config)
+
+    assert not bool(jnp.any(rollout.transitions.valid))
+    assert not bool(rollout.state.active)
+    chex.assert_trees_all_close(rollout.state.observation, anchor)
+    gvf_items = imagined_rollout_to_gvf_items(rollout)
+    chex.assert_trees_all_close(gvf_items.weights, jnp.zeros((3,), dtype=jnp.float32))
+    sarsa_items = imagined_rollout_to_sarsa_items(rollout)
+    chex.assert_trees_all_close(sarsa_items.weights, jnp.zeros((3,), dtype=jnp.float32))
+    transition = jax.tree.map(lambda leaf: leaf[0], rollout.transitions)
+    item = imagined_transition_to_supervised_item(transition)
+    gvf_item = imagined_transition_to_gvf_item(transition)
+    assert float(item.weights) == 0.0
+    for converted in (item, gvf_item, gvf_items, sarsa_items):
+        for leaf in jax.tree.leaves(converted):
+            assert bool(jnp.all(jnp.isfinite(leaf)))
+
+
+@pytest.mark.parametrize("field", ["reward", "discount", "confidence", "model_error"])
+def test_nonfinite_scalar_channels_mark_the_dream_step_invalid(field: str) -> None:
+    class ScalarNaNWorldModel(MockWorldModel):
+        def predict(self, state, observation, action, key):  # type: ignore[no-untyped-def]
+            prediction = super().predict(state, observation, action, key)
+            return dataclasses.replace(prediction, **{field: jnp.array(jnp.nan, dtype=jnp.float32)})
+
+    initial = init_dream_rollout_state(jnp.array([1.0, 1.0], dtype=jnp.float32), jr.key(3))
+    config = DreamRolloutConfig(rollout_horizon=2, confidence_threshold=0.5, max_model_error=1.0)
+    rollout = dream_rollout(
+        ScalarNaNWorldModel(),
+        _world_state(),
+        DeterministicBehaviorModel(),
+        DeterministicBehaviorState(action=jnp.array(1, dtype=jnp.int32)),
+        initial,
+        config,
+    )
+    assert not bool(jnp.any(rollout.transitions.valid))
 
 
 def test_training_item_conversions_have_expected_targets() -> None:
