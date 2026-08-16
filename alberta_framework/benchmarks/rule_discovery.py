@@ -778,9 +778,20 @@ def evaluate_population(
 
     Paired evaluation: every genome sees the identical stream and identical
     network init per seed (the screening convention).
+
+    Raises:
+        ValueError: If ``seeds`` are not unique valid seeds, ``genomes`` is not
+            a ``(n_genomes, GENOME_SIZE)`` matrix, or ``batch_size`` is not a
+            positive built-in ``int``.
     """
     seeds = require_unique_jax_seeds(seeds, name="seeds")
+    if type(batch_size) is not int or batch_size < 1:
+        raise ValueError(f"batch_size must be a positive built-in int, got {batch_size!r}")
     genomes = jnp.asarray(genomes, dtype=jnp.float32)
+    if genomes.ndim != 2 or genomes.shape[1] != GENOME_SIZE:
+        raise ValueError(
+            f"genomes must have shape (n_genomes, {GENOME_SIZE}), got {tuple(genomes.shape)}"
+        )
     n_genomes = int(genomes.shape[0])
     total = np.zeros((n_genomes,), dtype=np.float64)
     for seed in seeds:
