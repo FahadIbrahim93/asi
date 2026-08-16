@@ -24,6 +24,7 @@ import jax.random as jr
 import numpy as np
 from jax import Array
 
+from alberta_framework._float32 import round_real_to_float32
 from alberta_framework.core.baseline_optimizers import NADALINE, AdaGain, Adam, RMSprop
 from alberta_framework.core.learners import LinearLearner, run_learning_loop
 from alberta_framework.core.normalizers import (
@@ -65,16 +66,16 @@ _VALID_STREAMS: frozenset[str] = frozenset({"alberta", "xdist_shift"})
 
 def _require_real(name: str, value: object) -> tuple[float, float]:
     """Return a JSON scalar and the value consumed by float32 JAX sinks."""
-
     if isinstance(value, bool) or not isinstance(value, Real):
         raise ValueError(f"{name} must be a real number, got {value!r}")
     try:
-        with np.errstate(invalid="ignore", over="ignore", under="ignore"):
-            narrowed = np.asarray(value, dtype=np.float32)
+        narrowed = round_real_to_float32(value)
     except (FloatingPointError, OverflowError, TypeError, ValueError):
         raise ValueError(f"{name} must narrow to a finite float32, got {value!r}") from None
-    if narrowed.shape != () or not bool(np.isfinite(narrowed)):
+    if not math.isfinite(narrowed):
         raise ValueError(f"{name} must narrow to a finite float32, got {value!r}")
+    if not isinstance(value, (int, float, np.floating)):
+        return narrowed, narrowed
     try:
         number = float(value)
     except (OverflowError, TypeError, ValueError):

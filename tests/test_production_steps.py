@@ -344,6 +344,37 @@ def test_step1_field_uses_direct_float32_narrowing_at_overflow_boundary() -> Non
     assert optimizer.to_config()["step_size"] == config.step_size
 
 
+@pytest.mark.parametrize(
+    ("offset", "expected"),
+    [
+        (-Fraction(1, 2**80), 1.0),
+        (Fraction(0), 1.0),
+        (
+            Fraction(1, 2**80),
+            float(np.nextafter(np.float32(1.0), np.float32(np.inf))),
+        ),
+    ],
+)
+def test_step1_fraction_midpoint_rounds_once_to_nearest_even(
+    offset: Fraction,
+    expected: float,
+) -> None:
+    midpoint = Fraction(1) + Fraction(1, 2**24)
+    config = Step1KernelConfig(optimizer="lms", step_size=midpoint + offset)
+
+    assert config.step_size == expected
+
+
+def test_step1_fraction_float32_overflow_midpoint_is_exact() -> None:
+    maximum = Fraction((2**24 - 1) * 2**104)
+    overflow_midpoint = maximum + 2**103
+
+    just_below = Step1KernelConfig(optimizer="lms", step_size=overflow_midpoint - 1)
+    assert just_below.step_size == float(np.finfo(np.float32).max)
+    with pytest.raises(ValueError, match="step_size"):
+        Step1KernelConfig(optimizer="lms", step_size=overflow_midpoint)
+
+
 def test_step2_kernel_factory_and_smoke_are_finite() -> None:
     config = Step2KernelConfig(feature_dim=4, n_heads=2, hidden_sizes=(8,))
     learner = make_step2_learner(config)
