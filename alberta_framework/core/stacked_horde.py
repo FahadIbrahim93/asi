@@ -61,7 +61,7 @@ __all__ = [
 
 _FLOAT32_MIN_NORMAL = float.fromhex("0x1.0p-126")
 _STEP_SIZE_ERROR = "step_size must be positive"
-_NUMPY_STEP_SIZE_TYPES = frozenset(
+_NUMPY_STEP_SIZE_TYPES = tuple(
     np.dtype(dtype_code).type
     for dtype_code in (
         "b",
@@ -80,12 +80,16 @@ _NUMPY_STEP_SIZE_TYPES = frozenset(
         "g",
     )
 )
+_TRUSTED_STEP_SIZE_TYPES = (int, float, Fraction, *_NUMPY_STEP_SIZE_TYPES)
 
 
 def _snapshot_exact_fraction(value: Fraction) -> Fraction:
     """Copy a structurally canonical exact Fraction without conversion hooks."""
-    numerator = value.numerator
-    denominator = value.denominator
+    try:
+        numerator = value.numerator
+        denominator = value.denominator
+    except AttributeError:
+        raise ValueError(_STEP_SIZE_ERROR) from None
     if (
         type(numerator) is not int
         or type(denominator) is not int
@@ -110,7 +114,7 @@ def _require_positive_normal_float32_step_size(value: object) -> float:
     """
     value_type = type(value)
     preserve_builtin_float = value_type is float
-    if value_type not in (int, float, Fraction) and value_type not in _NUMPY_STEP_SIZE_TYPES:
+    if not any(value_type is trusted_type for trusted_type in _TRUSTED_STEP_SIZE_TYPES):
         raise ValueError(_STEP_SIZE_ERROR)
     real = (
         _snapshot_exact_fraction(cast(Fraction, value))

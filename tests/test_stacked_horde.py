@@ -198,6 +198,92 @@ class TestConfig:
 
         assert calls == []
 
+    @pytest.mark.parametrize("serialized", [False, True], ids=("direct", "from-config"))
+    @pytest.mark.parametrize(
+        "attack",
+        ["equality-spoof", "raising-equality", "raising-hash"],
+    )
+    def test_step_size_rejects_hostile_metaclasses_without_hooks(
+        self, serialized: bool, attack: str
+    ) -> None:
+        calls: list[str] = []
+
+        class EqualitySpoofMeta(type):
+            def __eq__(cls, other: object) -> bool:
+                del cls, other
+                calls.append("equality")
+                return True
+
+            def __hash__(cls) -> int:
+                calls.append("hash")
+                return type.__hash__(cls)
+
+        class RaisingEqualityMeta(type):
+            def __eq__(cls, other: object) -> bool:
+                del cls, other
+                calls.append("raising-equality")
+                raise RuntimeError("metaclass equality hook must not run")
+
+            def __hash__(cls) -> int:
+                calls.append("hash")
+                return type.__hash__(cls)
+
+        class RaisingHashMeta(type):
+            def __hash__(cls) -> int:
+                del cls
+                calls.append("raising-hash")
+                raise RuntimeError("metaclass hash hook must not run")
+
+        class EqualitySpoof(float, metaclass=EqualitySpoofMeta):
+            def as_integer_ratio(self) -> tuple[int, int]:
+                calls.append("ratio")
+                return (1, 2)
+
+        class RaisingEquality(float, metaclass=RaisingEqualityMeta):
+            pass
+
+        class RaisingHash(float, metaclass=RaisingHashMeta):
+            pass
+
+        step_sizes = {
+            "equality-spoof": EqualitySpoof(-1.0),
+            "raising-equality": RaisingEquality(0.5),
+            "raising-hash": RaisingHash(0.5),
+        }
+
+        with pytest.raises(ValueError, match="step_size"):
+            if serialized:
+                payload = _simple_config().to_config()
+                payload["step_size"] = step_sizes[attack]
+                StackedLinearHorde.from_config(
+                    {"type": "StackedLinearHorde", "config": payload}
+                )
+            else:
+                _simple_config(step_size=step_sizes[attack])
+
+        assert calls == []
+
+    @pytest.mark.parametrize("serialized", [False, True], ids=("direct", "from-config"))
+    @pytest.mark.parametrize("missing_slot", ["numerator", "denominator"])
+    def test_step_size_rejects_exact_fraction_with_missing_slot(
+        self, serialized: bool, missing_slot: str
+    ) -> None:
+        step_size = object.__new__(Fraction)
+        if missing_slot == "numerator":
+            object.__setattr__(step_size, "_denominator", 2)
+        else:
+            object.__setattr__(step_size, "_numerator", 1)
+
+        with pytest.raises(ValueError, match="step_size"):
+            if serialized:
+                payload = _simple_config().to_config()
+                payload["step_size"] = step_size
+                StackedLinearHorde.from_config(
+                    {"type": "StackedLinearHorde", "config": payload}
+                )
+            else:
+                _simple_config(step_size=step_size)
+
     @pytest.mark.parametrize("component", ["numerator", "denominator"])
     @pytest.mark.parametrize("serialized", [False, True], ids=("direct", "from-config"))
     def test_step_size_rejects_hooks_laundered_through_an_exact_fraction(
