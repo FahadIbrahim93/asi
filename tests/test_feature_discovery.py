@@ -37,6 +37,7 @@ from alberta_framework.core.interaction_features import (
     load_interaction_feature_checkpoint,
     save_interaction_feature_checkpoint,
 )
+from alberta_framework.core.update_safety import floating_tree_is_finite
 
 
 def test_one_step_output_loss_reduction_is_causal_lms_counterfactual() -> None:
@@ -361,6 +362,116 @@ class TestFixedBudgetFeatureLearner:
         assert bool(result.update_applied)
         assert bool(jnp.all(jnp.isfinite(result.state.utilities)))
         assert bool(jnp.all(jnp.isfinite(result.state.candidate_utilities)))
+
+    def test_zero_decays_recover_poisoned_forgotten_trackers(self) -> None:
+        learner = FixedBudgetFeatureLearner(
+            n_features=3,
+            n_tasks=2,
+            candidate_count=2,
+            replacement_interval=0,
+            utility_decay=0.0,
+            task_activity_decay=0.0,
+            learn_feature_resources=True,
+            resource_discount=0.0,
+        )
+        state = learner.init(feature_dim=3, key=jr.key(40)).replace(
+            utilities=jnp.full((3,), jnp.inf, dtype=jnp.float32),
+            candidate_utilities=jnp.full((2,), -jnp.inf, dtype=jnp.float32),
+            task_activity_ema=jnp.array([jnp.inf, jnp.nan], dtype=jnp.float32),
+            generator_log_weights=jnp.array(
+                [jnp.inf, jnp.nan, -jnp.inf], dtype=jnp.float32
+            ),
+            generator_utility_ema=jnp.array(
+                [jnp.inf, jnp.nan, -jnp.inf], dtype=jnp.float32
+            ),
+            plasticity_log_weights=jnp.array(
+                [jnp.nan, jnp.inf, -jnp.inf], dtype=jnp.float32
+            ),
+            plasticity_signal_ema=jnp.array(
+                [jnp.nan, jnp.inf, -jnp.inf], dtype=jnp.float32
+            ),
+            birth_timestamp=0.0,
+        )
+        recovered_weights = learner._resource_weights(state.generator_log_weights)
+
+        chex.assert_tree_all_finite(recovered_weights)
+        assert float(jnp.sum(recovered_weights)) == pytest.approx(1.0)
+
+        result = jax.jit(learner.update)(
+            state,
+            jnp.array([0.1, -0.2, 0.3], dtype=jnp.float32),
+            jnp.array([1.0, -1.0], dtype=jnp.float32),
+        )
+
+        assert bool(result.update_applied)
+        assert bool(floating_tree_is_finite(result.state))
+        chex.assert_tree_all_finite(result.metrics)
+        chex.assert_trees_all_equal(
+            result.state.generator_utility_ema[1:],
+            jnp.zeros((2,), dtype=jnp.float32),
+        )
+
+    def test_zero_utility_decay_rejects_poison_consumed_by_retention(self) -> None:
+        learner = FixedBudgetFeatureLearner(
+            n_features=1,
+            n_tasks=1,
+            replacement_interval=1,
+            min_feature_age=0,
+            utility_decay=0.0,
+            utility_retention_decay=0.9,
+        )
+        state = learner.init(feature_dim=2, key=jr.key(41)).replace(
+            utilities=jnp.array([jnp.inf], dtype=jnp.float32),
+            birth_timestamp=0.0,
+        )
+
+        result = jax.jit(learner.update)(
+            state,
+            jnp.ones((2,), dtype=jnp.float32),
+            jnp.ones((1,), dtype=jnp.float32),
+        )
+
+        assert not bool(result.update_applied)
+        chex.assert_trees_all_equal(result.state, state)
+        chex.assert_trees_all_equal(result.predictions, jnp.zeros((1,), jnp.float32))
+        chex.assert_trees_all_equal(result.errors, jnp.zeros((1,), jnp.float32))
+        chex.assert_trees_all_equal(result.metrics, jnp.zeros((7,), jnp.float32))
+        assert int(result.replaced_slot) == -1
+
+    def test_zero_resource_discount_preserves_finite_resource_state_semantics(
+        self,
+    ) -> None:
+        learner = FixedBudgetFeatureLearner(
+            n_features=2,
+            n_tasks=1,
+            replacement_interval=0,
+            learn_feature_resources=True,
+            resource_discount=0.0,
+            resource_exploration=0.0,
+        )
+        logits = jnp.array([2.0, -1.0, 0.5], dtype=jnp.float32)
+        state = learner.init(feature_dim=2, key=jr.key(42)).replace(
+            generator_log_weights=logits,
+            generator_utility_ema=jnp.array([1.0, 2.0, 3.0], dtype=jnp.float32),
+        )
+
+        chex.assert_trees_all_equal(
+            learner._resource_weights(logits),
+            jax.nn.softmax(logits),
+        )
+        result = learner.update(
+            state,
+            jnp.ones((2,), dtype=jnp.float32),
+            jnp.ones((1,), dtype=jnp.float32),
+        )
+
+        assert bool(result.update_applied)
+        # Only generator zero has members; unavailable finite EMA slots retain
+        # their previous values even though the configured discount is zero.
+        chex.assert_trees_all_equal(
+            result.state.generator_utility_ema[1:],
+            state.generator_utility_ema[1:],
+        )
 
     def test_constructed_and_augmented_feature_shapes(self) -> None:
         learner = FixedBudgetFeatureLearner(n_features=6, n_tasks=2)
