@@ -3228,6 +3228,28 @@ class TestFeatureDiscoveryStreamsValidation:
         with pytest.raises(TypeError, match="include_squares must be a boolean"):
             InteractionFeatureDiscoveryStream(feature_dim=6, include_squares=1)  # type: ignore[arg-type]
 
+    def test_interaction_rejects_spoofed_bool_include_squares(self) -> None:
+        class SpoofedBool:
+            @property
+            def __class__(self) -> type[bool]:
+                return bool
+
+            def __bool__(self) -> bool:
+                return True
+
+        with pytest.raises(TypeError, match="include_squares must be a boolean"):
+            InteractionFeatureDiscoveryStream(
+                feature_dim=6,
+                include_squares=SpoofedBool(),  # type: ignore[arg-type]
+            )
+
+    def test_interaction_accepts_numpy_bool_include_squares(self) -> None:
+        stream = InteractionFeatureDiscoveryStream(
+            feature_dim=6,
+            include_squares=np.True_,  # type: ignore[arg-type]
+        )
+        assert stream.include_squares is True
+
     def test_interaction_rejects_adversarial_ratio(self) -> None:
         class HiddenBoundaryFloat(float):
             def as_integer_ratio(self) -> tuple[int, int]:

@@ -13,6 +13,7 @@ import chex
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 import pytest
 
 from alberta_framework.core.types import TimeStep
@@ -460,6 +461,39 @@ class TestStep1StreamsValidation:
     def test_xdist_shift_stream_rejects_non_bool_noise_in_target(self) -> None:
         with pytest.raises(TypeError, match="noise_in_target must be a boolean"):
             XDistShiftStream(feature_dim=10, num_relevant=3, noise_in_target=1)  # type: ignore[arg-type]
+
+    def test_xdist_shift_rejects_spoofed_bool_noise_in_target(self) -> None:
+        class SpoofedBool:
+            @property
+            def __class__(self) -> type[bool]:
+                return bool
+
+            def __bool__(self) -> bool:
+                return True
+
+        with pytest.raises(TypeError, match="noise_in_target must be a boolean"):
+            XDistShiftStream(
+                feature_dim=10,
+                num_relevant=3,
+                noise_in_target=SpoofedBool(),  # type: ignore[arg-type]
+            )
+
+    def test_xdist_shift_accepts_numpy_bool_noise_in_target(self) -> None:
+        stream = XDistShiftStream(
+            feature_dim=10,
+            num_relevant=3,
+            noise_in_target=np.False_,  # type: ignore[arg-type]
+        )
+        assert stream.noise_in_target is False
+
+    def test_xdist_shift_rejects_scale_interval_collapsing_under_float32(self) -> None:
+        with pytest.raises(ValueError, match="float32 narrowing"):
+            XDistShiftStream(
+                feature_dim=10,
+                num_relevant=3,
+                scale_min=1.00000001,
+                scale_max=1.00000002,
+            )
 
     def test_xdist_shift_rejects_adversarial_ratio(self) -> None:
         class HiddenBoundaryFloat(float):

@@ -390,7 +390,15 @@ class XDistShiftStream:
             raise ValueError(
                 f"scale_min ({scale_min_val}) must be less than scale_max ({scale_max_val})"
             )
-        if isinstance(noise_in_target, (bool, np.bool_)):
+        narrowed_scale_min = float(np.float32(scale_min_val))
+        narrowed_scale_max = float(np.float32(scale_max_val))
+        if narrowed_scale_min >= narrowed_scale_max:
+            raise ValueError(
+                f"scale_min ({scale_min_val}) must remain less than "
+                f"scale_max ({scale_max_val}) after float32 narrowing; both narrow "
+                f"to [{narrowed_scale_min}, {narrowed_scale_max}]"
+            )
+        if type(noise_in_target) is bool or type(noise_in_target) is np.bool_:
             noise_in_target_val = bool(noise_in_target)
         else:
             raise TypeError(
