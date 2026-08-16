@@ -459,6 +459,19 @@ class TestAutostepGTDLambda:
             chex.assert_tree_all_finite(result.new_state)
             state = result.new_state
 
+    def test_zero_trace_decay_does_not_multiply_inf_eligibility(self) -> None:
+        """Default trace_decay is 0; 0 * inf eligibility is NaN and would freeze."""
+        optimizer = AutostepGTDLambda()
+        state = optimizer.init(feature_dim=2)
+        state = state.replace(
+            eligibility_traces=jnp.full(2, jnp.inf, dtype=jnp.float32),
+            bias_eligibility_trace=jnp.asarray(jnp.inf, dtype=jnp.float32),
+        )
+        observation = jnp.asarray([0.5, -0.25], dtype=jnp.float32)
+        result = optimizer.update(state, jnp.asarray(1.0, dtype=jnp.float32), observation)
+        assert bool(result.update_applied)
+        chex.assert_trees_all_close(result.new_state.eligibility_traces, observation)
+
     def test_jit_compiles(self):
         """update should compile under jax.jit."""
         import jax
@@ -680,6 +693,23 @@ class TestObGD:
 
         chex.assert_tree_all_finite(result.weight_delta)
         chex.assert_tree_all_finite(result.bias_delta)
+
+    def test_zero_trace_decay_does_not_multiply_inf_traces(self) -> None:
+        """Default gamma*lamda is 0; 0 * inf traces is NaN and would freeze."""
+        optimizer = ObGD(step_size=0.1, kappa=2.0)
+        state = optimizer.init(2)
+        state = state.replace(
+            traces=jnp.full(2, jnp.inf, dtype=jnp.float32),
+            bias_trace=jnp.asarray(jnp.inf, dtype=jnp.float32),
+        )
+        raw = jnp.asarray(0.0, dtype=jnp.float32) * jnp.asarray(jnp.inf, dtype=jnp.float32)
+        assert not bool(jnp.isfinite(raw))
+
+        observation = jnp.asarray([0.5, -0.25], dtype=jnp.float32)
+        result = optimizer.update(state, jnp.asarray(1.0, dtype=jnp.float32), observation)
+        assert bool(result.update_applied)
+        chex.assert_trees_all_close(result.new_state.traces, observation)
+        assert bool(jnp.isfinite(result.new_state.bias_trace))
 
 
 class TestAdaptiveObGDBounding:
