@@ -1969,7 +1969,7 @@ class UPGDLearner:
             trunk_biases: tuple[Array, ...],
             head_weights: tuple[Array, ...],
             head_biases: tuple[Array, ...],
-        ) -> tuple[Array, tuple[Array, Array]]:
+        ) -> tuple[Array, tuple[Array, Array, Array]]:
             logits_for_loss, hidden_for_loss = self._forward_with_readout_input(
                 trunk_weights,
                 trunk_biases,
