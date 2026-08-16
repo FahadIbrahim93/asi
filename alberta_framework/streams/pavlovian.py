@@ -52,6 +52,8 @@ from jaxtyping import Int, PRNGKeyArray
 from alberta_framework.core.types import TimeStep
 from alberta_framework.streams.base import ScanStream  # noqa: F401  (re-exported)
 
+_INT32_MAX = 2**31 - 1
+
 
 def _require_finite_real(
     value: object,
@@ -80,12 +82,20 @@ def _require_unit_interval(value: object, *, name: str) -> float:
     return number
 
 
-def _require_builtin_int(value: object, *, name: str, minimum: int) -> int:
+def _require_builtin_int(
+    value: object,
+    *,
+    name: str,
+    minimum: int,
+    maximum: int = _INT32_MAX,
+) -> int:
     """Return a built-in int at or above ``minimum``; reject bool and numpy ints."""
     if type(value) is not int:
         raise ValueError(f"{name} must be a built-in integer, got {value!r}")
     if value < minimum:
         raise ValueError(f"{name} must be >= {minimum}, got {value!r}")
+    if value > maximum:
+        raise ValueError(f"{name} must be <= {maximum}, got {value!r}")
     return value
 
 # =============================================================================
@@ -253,8 +263,18 @@ class ClassicalConditioningStream:
         )
         cs_us_delay = _require_builtin_int(cs_us_delay, name="cs_us_delay", minimum=1)
         cs_duration = _require_builtin_int(cs_duration, name="cs_duration", minimum=1)
-        iti_min = _require_builtin_int(iti_min, name="iti_min", minimum=0)
-        iti_max = _require_builtin_int(iti_max, name="iti_max", minimum=0)
+        iti_min = _require_builtin_int(
+            iti_min,
+            name="iti_min",
+            minimum=0,
+            maximum=_INT32_MAX - 1,
+        )
+        iti_max = _require_builtin_int(
+            iti_max,
+            name="iti_max",
+            minimum=0,
+            maximum=_INT32_MAX - 1,
+        )
         if iti_max < iti_min:
             raise ValueError(f"need 0 <= iti_min <= iti_max, got {iti_min}, {iti_max}")
         noise_std = _require_finite_real(noise_std, name="noise_std", nonnegative=True)

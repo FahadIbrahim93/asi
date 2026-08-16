@@ -556,6 +556,47 @@ def test_phase_compound_index_requires_builtin_int(value: object) -> None:
         )
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("n_distractors", 2**31),
+        ("cs_us_delay", 2**31),
+        ("cs_duration", 2**31),
+        ("iti_max", 2**31 - 1),
+    ],
+)
+def test_schedule_fields_reject_values_outside_jax_int32(
+    field: str,
+    value: int,
+) -> None:
+    """Accepted configuration must remain representable in JAX state."""
+    kwargs: dict[str, object] = {field: value}
+    with pytest.raises(ValueError, match=field):
+        ClassicalConditioningStream(
+            phases=(_valid_phase(),),
+            **kwargs,  # type: ignore[arg-type]
+        )
+
+
+def test_phase_n_steps_rejects_values_outside_jax_int32() -> None:
+    """Phase validation must run before materializing the int32 phase array."""
+    with pytest.raises(ValueError, match="n_steps"):
+        ClassicalConditioningStream(phases=(_valid_phase(n_steps=2**31),))
+
+
+def test_schedule_fields_accept_jax_int32_upper_endpoints() -> None:
+    stream = ClassicalConditioningStream(
+        phases=(_valid_phase(n_steps=2**31 - 1),),
+        cs_us_delay=2**31 - 1,
+        cs_duration=2**31 - 1,
+        iti_min=2**31 - 2,
+        iti_max=2**31 - 2,
+    )
+    state = stream.init(jr.key(99))
+    stream.step(state, jnp.array(0))
+    assert int(state.iti_steps_remaining) == 2**31 - 2
+
+
 def test_reacquisition_runs_three_phases():
     """Reacquisition scenario has three distinct contingency periods."""
     n_acq = 200
