@@ -1,10 +1,20 @@
-"""Tests for the Step 7 Dyna planning production facade."""
+"""Production-facing Step 7 Dyna planning facade tests.
+
+Covers the bounded planning facade on real constructors. Invalid dimension
+and scientific-scalar cases are written to fail on current main (bool,
+non-real, non-integral, non-finite, and out-of-domain values accepted) and
+pass after the facade rejects them. Legal endpoints stay constructible.
+"""
 
 from __future__ import annotations
+
+import json
+from typing import Any
 
 import chex
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 import pytest
 
 from alberta_framework.steps.step6 import Step6DifferentialSARSAConfig
@@ -29,6 +39,61 @@ from alberta_framework.steps.step8 import Step8WorldModelConfig
 
 OBS_DIM = 4
 N_ACTIONS = 2
+
+_INVALID_STEP7_FIELDS: tuple[tuple[str, Any], ...] = (
+    ("planning_steps", True),
+    ("planning_steps", False),
+    ("planning_steps", -1),
+    ("planning_steps", 1.5),
+    ("planning_steps", "1"),
+    ("planning_steps", None),
+    ("planning_rollout_depth", True),
+    ("planning_rollout_depth", False),
+    ("planning_rollout_depth", 0),
+    ("planning_rollout_depth", -1),
+    ("planning_rollout_depth", 1.5),
+    ("planning_rollout_depth", "1"),
+    ("planning_rollout_depth", None),
+    ("planning_warmup_steps", True),
+    ("planning_warmup_steps", False),
+    ("planning_warmup_steps", -1),
+    ("planning_warmup_steps", 1.5),
+    ("planning_warmup_steps", "1"),
+    ("planning_warmup_steps", None),
+    ("planning_memory_size", True),
+    ("planning_memory_size", False),
+    ("planning_memory_size", 0),
+    ("planning_memory_size", -1),
+    ("planning_memory_size", 1.5),
+    ("planning_memory_size", "1"),
+    ("planning_memory_size", None),
+    ("planning_importance_ratio_clip", float("nan")),
+    ("planning_importance_ratio_clip", float("inf")),
+    ("planning_importance_ratio_clip", float("-inf")),
+    ("planning_importance_ratio_clip", True),
+    ("planning_importance_ratio_clip", False),
+    ("planning_importance_ratio_clip", 0.0),
+    ("planning_importance_ratio_clip", -1.0),
+    ("planning_importance_ratio_clip", "10"),
+    ("planning_importance_ratio_clip", None),
+    ("planning_priority_propagation", float("nan")),
+    ("planning_priority_propagation", float("inf")),
+    ("planning_priority_propagation", float("-inf")),
+    ("planning_priority_propagation", True),
+    ("planning_priority_propagation", False),
+    ("planning_priority_propagation", -0.1),
+    ("planning_priority_propagation", "1"),
+    ("planning_priority_propagation", None),
+    ("planning_utility_step_size", float("nan")),
+    ("planning_utility_step_size", float("inf")),
+    ("planning_utility_step_size", float("-inf")),
+    ("planning_utility_step_size", True),
+    ("planning_utility_step_size", False),
+    ("planning_utility_step_size", -0.1),
+    ("planning_utility_step_size", 1.1),
+    ("planning_utility_step_size", "0.2"),
+    ("planning_utility_step_size", None),
+)
 
 
 def _cfg(
@@ -101,6 +166,101 @@ class TestStep7ConfigValidation:
                 world_model=Step8WorldModelConfig(observation_dim=OBS_DIM, n_actions=N_ACTIONS),
                 planning_strategy="bogus",  # type: ignore[arg-type]
             )
+
+
+def _config_with(**overrides: Any) -> Step7DynaConfig:
+    payload: dict[str, Any] = {
+        "control": Step6DifferentialSARSAConfig(n_actions=N_ACTIONS),
+        "world_model": Step8WorldModelConfig(observation_dim=OBS_DIM, n_actions=N_ACTIONS),
+    }
+    payload.update(overrides)
+    return Step7DynaConfig(**payload)
+
+
+@pytest.mark.parametrize(("field", "value"), _INVALID_STEP7_FIELDS)
+def test_step7_planning_fields_reject_invalid_inputs(field: str, value: object) -> None:
+    with pytest.raises(ValueError, match=field):
+        _config_with(**{field: value})
+
+
+def test_step7_planning_fields_preserve_legal_endpoints() -> None:
+    config = Step7DynaConfig(
+        control=Step6DifferentialSARSAConfig(n_actions=N_ACTIONS),
+        world_model=Step8WorldModelConfig(observation_dim=OBS_DIM, n_actions=N_ACTIONS),
+        planning_steps=0,
+        planning_rollout_depth=1,
+        planning_warmup_steps=0,
+        planning_memory_size=1,
+        planning_importance_ratio_clip=1e-6,
+        planning_priority_propagation=0.0,
+        planning_utility_step_size=0.0,
+    )
+    payload = config.to_dict()
+    json.dumps(payload, allow_nan=False)
+    restored = Step7DynaConfig.from_dict(payload)
+    assert restored.planning_steps == 0
+    assert restored.planning_rollout_depth == 1
+    assert restored.planning_warmup_steps == 0
+    assert restored.planning_memory_size == 1
+    assert restored.planning_importance_ratio_clip == 1e-6
+    assert restored.planning_priority_propagation == 0.0
+    assert restored.planning_utility_step_size == 0.0
+    assert payload["planning_priority_propagation"] == 0.0
+    assert payload["planning_utility_step_size"] == 0.0
+
+    upper = Step7DynaConfig(
+        control=Step6DifferentialSARSAConfig(n_actions=N_ACTIONS),
+        world_model=Step8WorldModelConfig(observation_dim=OBS_DIM, n_actions=N_ACTIONS),
+        planning_steps=3,
+        planning_rollout_depth=2,
+        planning_warmup_steps=4,
+        planning_memory_size=8,
+        planning_importance_ratio_clip=10.0,
+        planning_priority_propagation=1.0,
+        planning_utility_step_size=1.0,
+    )
+    make_step7_components(upper)
+    assert upper.planning_importance_ratio_clip == 10.0
+    assert upper.planning_priority_propagation == 1.0
+    assert upper.planning_utility_step_size == 1.0
+
+    smoke = run_step7_smoke(config, steps=4, seed=0)
+    assert smoke.finite
+    assert smoke.planning_td_errors_shape == (4, 0)
+
+
+def test_step7_planning_fields_canonicalize_nonbuiltin_numbers() -> None:
+    value = np.float64(0.5)
+    config = Step7DynaConfig(
+        control=Step6DifferentialSARSAConfig(n_actions=N_ACTIONS),
+        world_model=Step8WorldModelConfig(observation_dim=OBS_DIM, n_actions=N_ACTIONS),
+        planning_steps=np.int64(2),
+        planning_rollout_depth=np.int64(3),
+        planning_warmup_steps=np.int64(4),
+        planning_memory_size=np.int64(8),
+        planning_importance_ratio_clip=np.float64(5.0),
+        planning_priority_propagation=value,
+        planning_utility_step_size=value,
+    )
+    payload = config.to_dict()
+    json.dumps(payload, allow_nan=False)
+    assert config.planning_steps == 2
+    assert config.planning_rollout_depth == 3
+    assert config.planning_warmup_steps == 4
+    assert config.planning_memory_size == 8
+    assert config.planning_importance_ratio_clip == 5.0
+    assert config.planning_priority_propagation == 0.5
+    assert config.planning_utility_step_size == 0.5
+    assert type(payload["planning_steps"]) is int
+    assert type(payload["planning_rollout_depth"]) is int
+    assert type(payload["planning_warmup_steps"]) is int
+    assert type(payload["planning_memory_size"]) is int
+    assert type(payload["planning_importance_ratio_clip"]) is float
+    assert type(payload["planning_priority_propagation"]) is float
+    assert type(payload["planning_utility_step_size"]) is float
+    restored = Step7DynaConfig.from_dict(payload)
+    assert restored.planning_steps == 2
+    assert restored.planning_utility_step_size == 0.5
 
 
 # ---------------------------------------------------------------------------
