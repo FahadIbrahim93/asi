@@ -7,6 +7,9 @@ shape correctness, JIT compatibility via ``jax.lax.scan``, and the
 out-of-class structural properties that motivate each stream.
 """
 
+import json
+import math
+from decimal import Decimal
 from fractions import Fraction
 
 import chex
@@ -21,6 +24,13 @@ from alberta_framework.streams.out_of_class import (
     FrequencyMismatchStream,
     OutOfClassPolynomialStream,
 )
+
+
+class _FloatCoercible:
+    """Non-real object that would be accepted by ``math.isfinite``."""
+
+    def __float__(self) -> float:
+        return 0.5
 
 
 def _scan_collect(stream, num_steps: int, key) -> tuple[jnp.ndarray, jnp.ndarray]:
@@ -462,6 +472,159 @@ class TestFrequencyMismatchStream:
 
 class TestCompositionalStream:
     """Tests for the 2-hidden-layer compositional out-of-class stream."""
+
+    @pytest.mark.parametrize("weight_scale", [float("nan"), float("inf"), float("-inf")])
+    def test_weight_scale_must_be_finite(self, weight_scale: float) -> None:
+        with pytest.raises(ValueError, match="weight_scale must be finite"):
+            CompositionalStream(weight_scale=weight_scale)
+
+    @pytest.mark.parametrize(
+        "weight_scale",
+        [
+            True,
+            False,
+            np.bool_(True),
+            "0.5",
+            Decimal("0.5"),
+            _FloatCoercible(),
+            object(),
+        ],
+    )
+    def test_weight_scale_rejects_bool_non_real_and_coercive_inputs(
+        self, weight_scale: object
+    ) -> None:
+        with pytest.raises(ValueError, match="weight_scale must be finite in float32"):
+            CompositionalStream(weight_scale=weight_scale)  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize(
+        "weight_scale",
+        [Fraction(1, 2), np.float32(0.5), np.float64(0.5), np.int64(2)],
+    )
+    def test_weight_scale_is_stored_as_a_json_safe_canonical_float32_float(
+        self, weight_scale: object
+    ) -> None:
+        stream = CompositionalStream(weight_scale=weight_scale)  # type: ignore[arg-type]
+        expected = float(np.float32(float(weight_scale)))
+
+        assert type(stream._weight_scale) is float
+        assert stream._weight_scale == expected
+        encoded = json.dumps({"weight_scale": stream._weight_scale}, allow_nan=False)
+        assert json.loads(encoded) == {"weight_scale": expected}
+        state = stream.init(jr.key(93))
+        assert state.inner_w.dtype == jnp.float32
+        assert state.outer_w.dtype == jnp.float32
+
+    @pytest.mark.parametrize("weight_scale", [1e39, -1e39, 2e38, -2e38])
+    def test_weight_scale_rejects_float32_conversion_or_initialization_overflow(
+        self, weight_scale: float
+    ) -> None:
+        with pytest.raises(ValueError, match="weight_scale must be finite in float32"):
+            CompositionalStream(weight_scale=weight_scale)
+
+    def test_weight_scale_safe_float32_boundary(self) -> None:
+        safe = np.sqrt(np.finfo(np.float32).max, dtype=np.float32)
+        unsafe = np.nextafter(safe, np.float32(np.inf), dtype=np.float32)
+
+        stream = CompositionalStream(weight_scale=float(safe))
+        assert stream._weight_scale == float(safe)
+        with pytest.raises(ValueError, match="weight_scale must be finite in float32"):
+            CompositionalStream(weight_scale=float(unsafe))
+
+    @pytest.mark.parametrize("weight_scale", [0.0, -0.0, -2.5])
+    def test_weight_scale_preserves_valid_zero_and_negative_semantics(
+        self, weight_scale: float
+    ) -> None:
+        stream = CompositionalStream(weight_scale=weight_scale)
+
+        assert stream._weight_scale == weight_scale
+        assert math.copysign(1.0, stream._weight_scale) == math.copysign(
+            1.0, weight_scale
+        )
+        eager_state = stream.init(jr.key(94))
+        eager_timestep, _ = stream.step(eager_state, jnp.array(0, dtype=jnp.int32))
+        jit_state = jax.jit(stream.init)(jr.key(94))
+        jit_timestep, _ = jax.jit(stream.step)(jit_state, jnp.array(0, dtype=jnp.int32))
+        chex.assert_tree_all_finite(
+            (
+                eager_state.inner_w,
+                eager_state.outer_w,
+                eager_timestep.observation,
+                eager_timestep.target,
+                jit_state.inner_w,
+                jit_state.outer_w,
+                jit_timestep.observation,
+                jit_timestep.target,
+            )
+        )
+
+    @pytest.mark.parametrize("weight_scale", [1e-50, -1e-50])
+    def test_weight_scale_float32_underflow_is_canonical_signed_zero(
+        self, weight_scale: float
+    ) -> None:
+        stream = CompositionalStream(weight_scale=weight_scale)
+        zero_stream = CompositionalStream(weight_scale=math.copysign(0.0, weight_scale))
+
+        assert stream._weight_scale == 0.0
+        assert math.copysign(1.0, stream._weight_scale) == math.copysign(
+            1.0, weight_scale
+        )
+        chex.assert_trees_all_equal(
+            stream.init(jr.key(95)), zero_stream.init(jr.key(95))
+        )
+
+    def test_weight_scale_boundary_stays_finite_eager_and_jit_across_seeds(
+        self,
+    ) -> None:
+        safe = float(np.sqrt(np.finfo(np.float32).max, dtype=np.float32))
+        stream = CompositionalStream(weight_scale=safe)
+        jit_init = jax.jit(stream.init)
+        jit_step = jax.jit(stream.step)
+
+        for seed in range(16):
+            key = jr.key(seed)
+            eager_state = stream.init(key)
+            eager_timestep, _ = stream.step(
+                eager_state, jnp.array(0, dtype=jnp.int32)
+            )
+            jit_state = jit_init(key)
+            jit_timestep, _ = jit_step(jit_state, jnp.array(0, dtype=jnp.int32))
+            chex.assert_tree_all_finite(
+                (
+                    eager_state.inner_w,
+                    eager_state.outer_w,
+                    eager_timestep.target,
+                    jit_state.inner_w,
+                    jit_state.outer_w,
+                    jit_timestep.target,
+                )
+            )
+            np.testing.assert_allclose(
+                np.asarray(eager_timestep.target),
+                np.asarray(jit_timestep.target),
+                rtol=1e-5,
+                atol=1e-6,
+            )
+
+    @pytest.mark.parametrize("use_jit", [False, True])
+    def test_numpy_weight_scale_is_x64_invariant(self, use_jit: bool) -> None:
+        def run(x64_enabled: bool):
+            with jax.enable_x64(x64_enabled):
+                stream = CompositionalStream(weight_scale=np.float64(0.7))
+                init = jax.jit(stream.init) if use_jit else stream.init
+                step = jax.jit(stream.step) if use_jit else stream.step
+                state = init(jr.key(96))
+                timestep, _ = step(state, jnp.array(0, dtype=jnp.int32))
+                return stream, state, timestep
+
+        stream32, state32, timestep32 = run(False)
+        stream64, state64, timestep64 = run(True)
+
+        assert type(stream32._weight_scale) is float
+        assert type(stream64._weight_scale) is float
+        assert state32.inner_w.dtype == jnp.float32
+        assert state64.inner_w.dtype == jnp.float32
+        chex.assert_trees_all_equal(state32, state64)
+        chex.assert_trees_all_equal(timestep32, timestep64)
 
     def test_step_shapes(self):
         stream = CompositionalStream(

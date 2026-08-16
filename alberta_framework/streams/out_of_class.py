@@ -470,6 +470,33 @@ class FrequencyMismatchStream:
 # =============================================================================
 
 
+def _require_compositional_weight_scale_float32(value: object) -> float:
+    """Return a signed scale in the stream's safe float32 execution domain.
+
+    The scale is canonicalized to a built-in float carrying the exact rounded
+    float32 value.  Values below the float32 subnormal range become signed
+    zero.  A finite float32 square is required because the scale controls
+    initialization variance and is multiplied before fan-in normalization;
+    that conservative headroom prevents eager/XLA reassociation from turning
+    an accepted scale into non-finite oracle weights.
+    """
+    message = "weight_scale must be finite in float32 with finite float32 squared magnitude"
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError(message)
+    try:
+        number = float(value)
+    except (OverflowError, TypeError, ValueError) as error:
+        raise ValueError(message) from error
+    if not math.isfinite(number):
+        raise ValueError(message)
+    with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+        narrowed = np.float32(number)
+        squared = np.float32(narrowed * narrowed)
+    if not np.isfinite(narrowed) or not np.isfinite(squared):
+        raise ValueError(message)
+    return float(narrowed)
+
+
 @chex.dataclass(frozen=True)
 class CompositionalState:
     """State for ``CompositionalStream``.
@@ -541,7 +568,11 @@ class CompositionalStream:
             context_length: Steps before switching context.
             feature_std: Standard deviation of raw observations.
             weight_scale: Scale of per-layer weights (divided by sqrt(fan-in)
-                for unit-variance pre-activations).
+                for unit-variance pre-activations). Real values are rounded to
+                float32 at construction. Values below the float32 subnormal
+                range become signed zero; zero and negative scales remain
+                valid. Values whose float32 square overflows are rejected so
+                eager and compiled initialization stay finite.
             amplitude_scale: Scale of per-component output amplitudes.
             noise_std: Standard deviation of target noise.
         """
@@ -557,6 +588,7 @@ class CompositionalStream:
             raise ValueError("n_contexts must be positive")
         if context_length < 1:
             raise ValueError("context_length must be positive")
+        weight_scale_float32 = _require_compositional_weight_scale_float32(weight_scale)
 
         self._feature_dim = feature_dim
         self._n_tasks = n_tasks
@@ -565,7 +597,7 @@ class CompositionalStream:
         self._n_contexts = n_contexts
         self._context_length = context_length
         self._feature_std = feature_std
-        self._weight_scale = weight_scale
+        self._weight_scale = weight_scale_float32
         self._amplitude_scale = amplitude_scale
         self._noise_std = noise_std
 
