@@ -327,9 +327,10 @@ class UPGDLearner:
             when no gradient-alignment meta-rule is active. Disable for lean
             non-meta UPGD benchmarks to reduce carry traffic.
         adaptive_kappa_mode: Optional online control law for ObGD ``kappa``.
-            ``"none"`` uses the configured bounder unchanged; every other mode
-            bounds with plain ObGD at ``adaptive_kappa_base`` (scaled by the
-            law), so a configured ``bounder`` must be ``None`` or an
+            ``"none"`` uses the configured bounder unchanged, and
+            ``bounder=None`` disables bounding in every mode. When a bounder is
+            configured, every other mode uses plain ObGD at
+            ``adaptive_kappa_base`` (scaled by the law), so it must be an
             :class:`ObGDBounding` with that same kappa. ``"loss_ratio"``
             computes an effective kappa from the learner's fast/slow loss EMAs,
             lowering kappa when fast loss exceeds slow loss and raising it when
