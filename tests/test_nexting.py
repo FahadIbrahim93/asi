@@ -184,6 +184,44 @@ class TestRMSE:
         np.testing.assert_allclose(np.asarray(eager), expected, rtol=2e-6, atol=0.0)
         np.testing.assert_allclose(np.asarray(compiled), expected, rtol=2e-6, atol=0.0)
 
+    @pytest.mark.parametrize("magnitude", [2.0e20, 1.0e38, 3.0e38])
+    def test_large_finite_rmse_has_stable_eager_and_jit_gradients(
+        self,
+        magnitude: float,
+    ) -> None:
+        predictions = jnp.full((2, 1), magnitude, dtype=jnp.float32)
+        returns = jnp.zeros_like(predictions)
+
+        def loss(values: jax.Array) -> jax.Array:
+            return jnp.sum(per_horizon_rmse(values, returns))
+
+        expected = jnp.full_like(predictions, 0.5)
+        eager = jax.grad(loss)(predictions)
+        compiled = jax.jit(jax.grad(loss))(predictions)
+
+        chex.assert_trees_all_close(eager, expected, rtol=5e-6, atol=0.0)
+        chex.assert_trees_all_close(compiled, expected, rtol=5e-6, atol=0.0)
+
+    def test_zero_rmse_uses_zero_eager_jit_and_forward_gradient_convention(self) -> None:
+        predictions = jnp.zeros((3, 2), dtype=jnp.float32)
+        returns = jnp.zeros_like(predictions)
+
+        def loss(values: jax.Array) -> jax.Array:
+            return jnp.sum(per_horizon_rmse(values, returns))
+
+        expected = jnp.zeros_like(predictions)
+        eager = jax.grad(loss)(predictions)
+        compiled = jax.jit(jax.grad(loss))(predictions)
+        _primal, tangent = jax.jvp(
+            lambda values: per_horizon_rmse(values, returns),
+            (predictions,),
+            (jnp.ones_like(predictions),),
+        )
+
+        chex.assert_trees_all_equal(eager, expected)
+        chex.assert_trees_all_equal(compiled, expected)
+        chex.assert_trees_all_equal(tangent, jnp.zeros((2,), dtype=jnp.float32))
+
     def test_zero_error_when_predictions_match(self) -> None:
         t, h = 50, 4
         truths = jnp.ones((t, h))
