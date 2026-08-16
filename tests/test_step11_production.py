@@ -376,7 +376,7 @@ def test_step11_oak_fields_preserve_legal_endpoints() -> None:
     assert restored.utility_ema_decay == 0.0
     assert restored.curation_threshold == 0.0
     assert restored.subtask_specs[0].feature_index == 0
-    assert restored.subtask_specs[0].threshold == 1e-12
+    assert restored.subtask_specs[0].threshold == float(np.float32(1e-12))
     assert restored.subtask_specs[0].pseudo_reward_scale == 0.0
     assert restored.subtask_specs[0].max_option_steps == 1
     assert agent.config.stomp.option_gamma == 0.0
@@ -405,6 +405,70 @@ def test_step11_oak_fields_preserve_legal_endpoints() -> None:
     assert upper.utility_ema_decay == 1.0
     assert upper.curation_threshold == 10.0
     assert upper.option_planning_backups_per_step == 2**31 - 2
+
+
+def test_step11_oak_rejects_float32_underflow_for_positive_fields() -> None:
+    with pytest.raises(ValueError, match="threshold"):
+        Step11OaKConfig(
+            subtask_specs=(SubtaskSpec(feature_index=0, threshold=1e-50),),
+            observation_dim=4,
+        )
+    with pytest.raises(ValueError, match="threshold"):
+        Step11OaKConfig(
+            subtask_specs=(SubtaskSpec(feature_index=0, threshold=1e-46),),
+            observation_dim=4,
+        )
+
+
+def test_step11_oak_rejects_float32_overflow() -> None:
+    with pytest.raises(ValueError, match="threshold"):
+        Step11OaKConfig(
+            subtask_specs=(SubtaskSpec(feature_index=0, threshold=1e100),),
+            observation_dim=4,
+        )
+    with pytest.raises(ValueError, match="pseudo_reward_scale"):
+        Step11OaKConfig(
+            subtask_specs=(
+                SubtaskSpec(feature_index=0, pseudo_reward_scale=1e100),
+            ),
+            observation_dim=4,
+        )
+    with pytest.raises(ValueError, match="pseudo_reward_scale"):
+        Step11OaKConfig(
+            subtask_specs=(
+                SubtaskSpec(feature_index=0, pseudo_reward_scale=-1e100),
+            ),
+            observation_dim=4,
+        )
+    with pytest.raises(ValueError, match="base_step_size"):
+        Step11OaKConfig(base_step_size=1e100)
+    with pytest.raises(ValueError, match="curation_threshold"):
+        Step11OaKConfig(curation_threshold=1e100)
+    with pytest.raises(ValueError, match="option_model_step_size"):
+        Step11OaKConfig(option_model_step_size=1e100)
+
+
+def test_step11_oak_preserves_float32_boundaries() -> None:
+    f32_max = float(np.finfo(np.float32).max)
+    f32_min = float(np.finfo(np.float32).min)
+    config = Step11OaKConfig(
+        subtask_specs=(
+            SubtaskSpec(
+                feature_index=0,
+                threshold=f32_max,
+                pseudo_reward_scale=f32_min,
+                max_option_steps=10,
+            ),
+        ),
+        observation_dim=2,
+        curation_threshold=f32_max,
+        base_step_size=f32_max,
+    )
+    agent = make_step11_oak_agent(config)
+    assert agent.config.stomp.subtask_specs[0].threshold == f32_max
+    assert agent.config.stomp.subtask_specs[0].pseudo_reward_scale == f32_min
+    assert config.curation_threshold == f32_max
+    assert config.base_step_size == f32_max
 
 
 def test_step11_oak_fields_canonicalize_nonbuiltin_numbers() -> None:

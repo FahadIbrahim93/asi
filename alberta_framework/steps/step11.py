@@ -35,6 +35,7 @@ from typing import Any
 
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 from jax import Array
 
 from alberta_framework.core.oak import (
@@ -163,6 +164,8 @@ class Step11OaKConfig:
 
 
 _INT32_MAX = 2**31 - 1
+_FLOAT32_MAX = float(np.finfo(np.float32).max)
+_FLOAT32_MIN = -_FLOAT32_MAX
 
 
 def _require_real(name: str, value: object) -> float:
@@ -171,7 +174,9 @@ def _require_real(name: str, value: object) -> float:
     number = float(value)
     if not math.isfinite(number):
         raise ValueError(f"{name} must be finite, got {value!r}")
-    return number
+    if not _FLOAT32_MIN <= number <= _FLOAT32_MAX:
+        raise ValueError(f"{name} overflows float32 execution sink, got {value!r}")
+    return float(np.float32(number))
 
 
 def _require_unit_interval(name: str, value: object) -> float:
@@ -191,7 +196,9 @@ def _require_nonnegative_real(name: str, value: object) -> float:
 def _require_positive_real(name: str, value: object) -> float:
     number = _require_real(name, value)
     if number <= 0.0:
-        raise ValueError(f"{name} must be positive, got {value!r}")
+        raise ValueError(
+            f"{name} must be positive in float32 execution sink, got {value!r}"
+        )
     return number
 
 
