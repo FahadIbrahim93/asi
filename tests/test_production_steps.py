@@ -72,6 +72,25 @@ def test_step1_smoke_rejects_non_integer_counts(field: str, value: object) -> No
         run_step1_smoke(**kwargs)  # type: ignore[arg-type]
 
 
+@pytest.mark.parametrize("field", ["steps", "final_window"])
+def test_step1_smoke_rejects_objects_that_only_spoof_integer_class(field: str) -> None:
+    class IntegerClassSpoof:
+        @property
+        def __class__(self) -> type[int]:
+            return int
+
+        def __int__(self) -> int:
+            return 2
+
+    value = IntegerClassSpoof()
+    assert isinstance(value, int)
+    assert not issubclass(type(value), int)
+    kwargs: dict[str, object] = {"steps": 4, "final_window": 2, field: value}
+
+    with pytest.raises(ValueError, match=field):
+        run_step1_smoke(**kwargs)  # type: ignore[arg-type]
+
+
 @pytest.mark.parametrize(
     "optimizer",
     [
