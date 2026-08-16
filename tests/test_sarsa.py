@@ -1236,40 +1236,241 @@ def test_sarsa_config_accepts_and_canonicalizes_numpy_integers() -> None:
     assert cfg.epsilon_decay_steps == 100
 
 
-def test_sarsa_config_rejects_hostile_scalars_and_nonexact_schema() -> None:
-    class HostileFloat(float):
-        def __float__(self) -> float:
-            raise AssertionError("float hook must not run")
+@pytest.mark.parametrize(
+    "integer_type",
+    [
+        np.int8,
+        np.int16,
+        np.int32,
+        np.int64,
+        np.uint8,
+        np.uint16,
+        np.uint32,
+        np.uint64,
+        np.longlong,
+        np.ulonglong,
+    ],
+)
+def test_sarsa_config_accepts_full_numpy_integer_family(integer_type) -> None:
+    config = SARSAConfig(
+        n_actions=integer_type(2),
+        epsilon_decay_steps=integer_type(3),
+    )
+    assert type(config.n_actions) is int
+    assert type(config.epsilon_decay_steps) is int
+
+
+def test_sarsa_config_rejects_hostile_integer_hook_without_calling_it() -> None:
+    class HostileIndex:
+        def __index__(self) -> int:
+            raise AssertionError("untrusted __index__ must not run")
 
         def __repr__(self) -> str:
-            raise AssertionError("repr hook must not run")
+            raise AssertionError("untrusted __repr__ must not run")
 
-    class DictSubclass(dict[str, object]):
+    with pytest.raises(ValueError, match="n_actions"):
+        SARSAConfig(n_actions=HostileIndex())  # type: ignore[arg-type]
+
+
+def test_sarsa_config_from_config_requires_exact_compatibility_schema() -> None:
+    class DictSubclass(dict):
         pass
 
-    with pytest.raises(ValueError, match="gamma"):
-        SARSAConfig(n_actions=2, gamma=HostileFloat(0.9))
     payload = SARSAConfig(n_actions=2).to_config()
-    with pytest.raises(ValueError, match="exact built-in dict"):
+    assert SARSAConfig.from_config(payload).to_config() == payload
+    with pytest.raises(ValueError, match="actual dict"):
         SARSAConfig.from_config(DictSubclass(payload))
     with pytest.raises(ValueError, match="fields"):
-        SARSAConfig.from_config({**payload, "unknown": 1})
+        SARSAConfig.from_config({**payload, "extra": 1})
 
 
-def test_sarsa_config_preflights_wrapper_resource_endpoint() -> None:
-    assert SARSAConfig(n_actions=2**31 - 7).n_actions == 2**31 - 7
-    with pytest.raises(ValueError, match="wrapper resources"):
-        SARSAConfig(n_actions=2**31 - 6)
+def test_sarsa_agent_rejects_hostile_lambda_before_horde_construction() -> None:
+    class HostileFloat:
+        def __float__(self) -> float:
+            raise AssertionError("untrusted __float__ must not run")
+
+        def __repr__(self) -> str:
+            raise AssertionError("untrusted __repr__ must not run")
+
+    with pytest.raises(ValueError, match="lamda"):
+        SARSAAgent(SARSAConfig(n_actions=2), lamda=HostileFloat())  # type: ignore[arg-type]
 
 
-def test_sarsa_agent_from_config_rejects_nonexact_outer_containers() -> None:
-    class DictSubclass(dict[str, object]):
+def test_sarsa_agent_roundtrip_and_exact_schema() -> None:
+    class DictSubclass(dict):
         pass
 
-    payload = _make_agent(n_actions=2).to_config()
-    with pytest.raises(ValueError, match="exact built-in dict"):
+    agent = SARSAAgent(SARSAConfig(n_actions=2), hidden_sizes=())
+    payload = agent.to_config()
+    restored = SARSAAgent.from_config(payload)
+    assert restored.to_config() == payload
+    with pytest.raises(ValueError, match="fields"):
+        SARSAAgent.from_config({**payload, "extra": None})
+    with pytest.raises(ValueError, match="actual dict"):
         SARSAAgent.from_config(DictSubclass(payload))
-    hostile = dict(payload)
-    hostile["hidden_sizes"] = tuple(hostile["hidden_sizes"])
-    with pytest.raises(ValueError, match="hidden_sizes"):
-        SARSAAgent.from_config(hostile)
+
+
+def test_sarsa_init_rejects_aggregate_state_overflow_before_jax_allocation() -> None:
+    agent = SARSAAgent(SARSAConfig(n_actions=2), hidden_sizes=())
+    # Linear two-head state uses (5 * feature_dim + 12) direct scalars.
+    first_overflow = ((2**31 - 1) // 4 - 12) // 5 + 1
+    with pytest.raises(ValueError, match="aggregate_direct_state_bytes"):
+        agent.init(feature_dim=first_overflow, key=jr.key(0))
+
+
+def test_sarsa_constructor_rejects_impossible_hidden_state_before_demon_list() -> None:
+    with pytest.raises(ValueError, match="aggregate_direct_state"):
+        SARSAAgent(
+            SARSAConfig(n_actions=1),
+            hidden_sizes=(2**31 - 1,),
+        )
+
+
+def test_sarsa_step_count_saturates_without_wrapping_under_jit() -> None:
+    agent = _make_agent(n_actions=2, hidden_sizes=(), epsilon_start=0.0)
+    state = agent.init(feature_dim=2, key=jr.key(0)).replace(
+        last_action=jnp.array(0, dtype=jnp.int32),
+        last_observation=jnp.ones(2, dtype=jnp.float32),
+        step_count=jnp.array(2**31 - 1, dtype=jnp.int32),
+    )
+    result = agent.update(
+        state,
+        reward=jnp.array(0.0, dtype=jnp.float32),
+        observation=jnp.ones(2, dtype=jnp.float32),
+        terminated=jnp.array(0.0, dtype=jnp.float32),
+        next_action=jnp.array(0, dtype=jnp.int32),
+    )
+    assert int(result.state.step_count) == 2**31 - 1
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("step_size", float("inf")),
+        ("sparsity", 1.1),
+        ("leaky_relu_slope", -0.1),
+        ("utility_decay", 1.0),
+        ("use_layer_norm", np.bool_(True)),
+    ],
+)
+def test_sarsa_agent_validates_all_direct_scalar_fields(field, value) -> None:
+    with pytest.raises(ValueError, match=field):
+        SARSAAgent(SARSAConfig(n_actions=2), **{field: value})
+
+
+def test_sarsa_agent_rejects_spoofed_static_types_and_prediction_entries() -> None:
+    class TraceModeSubclass(str):
+        pass
+
+    with pytest.raises(ValueError, match="trace_mode"):
+        SARSAAgent(
+            SARSAConfig(n_actions=2),
+            trace_mode=TraceModeSubclass("accumulating"),  # type: ignore[arg-type]
+        )
+    with pytest.raises(ValueError, match="GVFSpec"):
+        SARSAAgent(SARSAConfig(n_actions=2), prediction_demons=[object()])  # type: ignore[list-item]
+
+
+def test_sarsa_serialized_discriminators_reject_string_subclasses() -> None:
+    class StringSubclass(str):
+        pass
+
+    payload = SARSAAgent(SARSAConfig(n_actions=2), hidden_sizes=()).to_config()
+    payload["type"] = StringSubclass("SARSAAgent")
+    with pytest.raises(ValueError, match="type"):
+        SARSAAgent.from_config(payload)
+    payload = SARSAAgent(SARSAConfig(n_actions=2), hidden_sizes=()).to_config()
+    payload["state_schema"] = StringSubclass(payload["state_schema"])
+    with pytest.raises(ValueError, match="state schema"):
+        SARSAAgent.from_config(payload)
+    payload = SARSAAgent(SARSAConfig(n_actions=2), hidden_sizes=()).to_config()
+    payload["trace_mode"] = StringSubclass(payload["trace_mode"])
+    with pytest.raises(ValueError, match="trace_mode"):
+        SARSAAgent.from_config(payload)
+
+
+def _assert_sarsa_state_exact_ignoring_host_time(actual, expected) -> None:
+    actual_learner = actual.learner_state.replace(birth_timestamp=0.0, uptime_s=0.0)
+    expected_learner = expected.learner_state.replace(birth_timestamp=0.0, uptime_s=0.0)
+    chex.assert_trees_all_equal(
+        actual.replace(learner_state=actual_learner),
+        expected.replace(learner_state=expected_learner),
+    )
+
+
+@pytest.mark.parametrize("next_action", [-1, 2])
+def test_sarsa_invalid_next_action_is_an_exact_noop(next_action: int) -> None:
+    agent = _make_agent(n_actions=2, hidden_sizes=(), epsilon_start=0.0)
+    observation = jnp.ones(3, dtype=jnp.float32)
+    action, key = agent.select_action(agent.init(3, jr.key(0)), observation)
+    state = agent.init(3, jr.key(1)).replace(
+        last_action=action,
+        last_observation=observation,
+        rng_key=key,
+    )
+    result = agent.update(
+        state,
+        jnp.asarray(1.0, dtype=jnp.float32),
+        observation,
+        jnp.asarray(0.0, dtype=jnp.float32),
+        jnp.asarray(next_action, dtype=jnp.int32),
+    )
+    _assert_sarsa_state_exact_ignoring_host_time(result.state, state)
+    assert int(result.action) == -1
+    assert float(result.td_error) == 0.0
+    assert bool(jnp.all(result.q_values == 0.0))
+
+
+@pytest.mark.parametrize(
+    ("reward", "terminated"),
+    [
+        (float("nan"), 0.0),
+        (float("inf"), 0.0),
+        (1.0, float("nan")),
+        (1.0, 0.5),
+    ],
+)
+def test_sarsa_invalid_dynamic_transition_is_an_exact_noop(reward, terminated) -> None:
+    agent = _make_agent(n_actions=2, hidden_sizes=(), epsilon_start=0.0)
+    observation = jnp.ones(3, dtype=jnp.float32)
+    state = agent.init(3, jr.key(0)).replace(
+        last_action=jnp.asarray(0, dtype=jnp.int32),
+        last_observation=observation,
+    )
+    result = agent.update(
+        state,
+        jnp.asarray(reward, dtype=jnp.float32),
+        observation,
+        jnp.asarray(terminated, dtype=jnp.float32),
+        jnp.asarray(0, dtype=jnp.int32),
+    )
+    _assert_sarsa_state_exact_ignoring_host_time(result.state, state)
+    assert int(result.action) == -1
+
+
+def test_sarsa_public_array_shapes_and_dtypes_fail_before_transaction() -> None:
+    agent = _make_agent(n_actions=2, hidden_sizes=(), epsilon_start=0.0)
+    state = agent.init(3, jr.key(0))
+    with pytest.raises(ValueError, match="observation must have shape"):
+        agent.select_action(state, jnp.ones(4, dtype=jnp.float32))
+    with pytest.raises(TypeError, match="observation must have dtype float32"):
+        agent.select_action(state, jnp.ones(3, dtype=jnp.int32))
+    with pytest.raises(TypeError, match="next_action must have dtype int32"):
+        agent.update(
+            state,
+            jnp.asarray(0.0, dtype=jnp.float32),
+            jnp.ones(3, dtype=jnp.float32),
+            jnp.asarray(False),
+            jnp.asarray(0.0, dtype=jnp.float32),
+        )
+
+
+def test_sarsa_select_action_rejects_nonfinite_without_consuming_rng() -> None:
+    agent = _make_agent(n_actions=2, hidden_sizes=(), epsilon_start=0.0)
+    state = agent.init(3, jr.key(0))
+    action, key = agent.select_action(
+        state,
+        jnp.asarray([0.0, float("nan"), 1.0], dtype=jnp.float32),
+    )
+    assert int(action) == -1
+    chex.assert_trees_all_equal(key, state.rng_key)
