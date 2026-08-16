@@ -38,13 +38,16 @@ the NaN-masking convention of the loop-based hordes.
 
 import math
 from dataclasses import dataclass
-from typing import Any
+from numbers import Real
+from typing import Any, cast
 
 import chex
 import jax
 import jax.numpy as jnp
 from jax import Array
 from jaxtyping import Bool, Float
+
+from alberta_framework._float32 import round_real_to_float32_with_ratio
 
 __all__ = [
     "StackedHordeConfig",
@@ -53,6 +56,34 @@ __all__ = [
     "StackedLinearHorde",
     "nexting_spec",
 ]
+
+_FLOAT32_MIN_NORMAL = float.fromhex("0x1.0p-126")
+_STEP_SIZE_ERROR = "step_size must be positive"
+
+
+def _require_positive_normal_float32_step_size(value: object) -> float:
+    """Return a JSON-safe scalar whose float32 execution value is usable.
+
+    JAX CPU execution flushes float32 subnormals to zero, so accepting a
+    positive host value whose binary32 sink is zero or subnormal can create a
+    Horde that reports applied updates while its weights never move.  The
+    exact-ratio conversion also prevents overloaded host comparisons from
+    hiding a negative value and avoids double-rounding third-party reals.
+    """
+    actual_type = type(value)
+    preserve_builtin_float = actual_type is float
+    if issubclass(actual_type, bool) or not issubclass(actual_type, Real):
+        raise ValueError(_STEP_SIZE_ERROR)
+    real = cast(Real, value)
+    try:
+        numerator, _, narrowed = round_real_to_float32_with_ratio(real)
+    except (FloatingPointError, OverflowError, TypeError, ValueError):
+        raise ValueError(_STEP_SIZE_ERROR) from None
+    if numerator <= 0 or not math.isfinite(narrowed) or narrowed < _FLOAT32_MIN_NORMAL:
+        raise ValueError(_STEP_SIZE_ERROR)
+    # Preserve an already JSON-safe builtin float for payload compatibility.
+    # Every other accepted Real is stored as the validated binary32 value.
+    return cast(float, value) if preserve_builtin_float else narrowed
 
 
 @dataclass(frozen=True)
@@ -66,7 +97,9 @@ class StackedHordeConfig:
         lamdas: Per-demon trace decays, length ``n_demons``.
         cumulant_indices: Per-demon index into the cumulant-source vector
             handed to :meth:`StackedLinearHorde.update`.
-        step_size: Shared TD step-size alpha.
+        step_size: Shared TD step-size alpha. Its float32 execution value must
+            be finite, positive, and normal; accepted non-builtin reals are
+            canonicalized to a JSON-safe builtin float.
     """
 
     n_demons: int
@@ -93,8 +126,11 @@ class StackedHordeConfig:
             raise ValueError("every gamma must be in [0, 1]")
         if any(not 0.0 <= la <= 1.0 for la in self.lamdas):
             raise ValueError("every lamda must be in [0, 1]")
-        if not math.isfinite(self.step_size) or self.step_size <= 0.0:
-            raise ValueError("step_size must be positive")
+        object.__setattr__(
+            self,
+            "step_size",
+            _require_positive_normal_float32_step_size(self.step_size),
+        )
 
     def to_config(self) -> dict[str, Any]:
         """Serialize this config to a dictionary."""

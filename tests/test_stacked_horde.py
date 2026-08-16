@@ -11,10 +11,14 @@ the same workload, with a ~144 s compile; see the scaling notes in
 docs/evidence/methodology.md).
 """
 
+import json
 import math
 import time
+from decimal import Decimal
+from fractions import Fraction
 
 import chex
+import jax
 import jax.numpy as jnp
 import jax.random as jr
 import numpy as np
@@ -56,6 +60,121 @@ class TestConfig:
     def test_step_size_must_be_finite_and_positive(self, step_size: float) -> None:
         with pytest.raises(ValueError, match="step_size"):
             _simple_config(step_size=step_size)
+
+    @pytest.mark.parametrize(
+        "step_size",
+        [
+            1,
+            np.float32(0.5),
+            np.float64(0.5),
+            np.int64(1),
+            Fraction(1, 2),
+        ],
+    )
+    def test_step_size_supported_reals_canonicalize_for_json(
+        self, step_size: object
+    ) -> None:
+        cfg = _simple_config(step_size=step_size)
+        payload = cfg.to_config()
+
+        assert type(cfg.step_size) is float
+        json.dumps(payload, allow_nan=False)
+        assert StackedHordeConfig.from_config(payload) == cfg
+
+    def test_builtin_float_step_size_preserves_compatible_payload(self) -> None:
+        cfg = _simple_config(step_size=0.1)
+
+        assert type(cfg.step_size) is float
+        assert cfg.step_size == 0.1
+
+    def test_fraction_step_size_rounds_directly_to_float32(self) -> None:
+        above_half_midpoint = (
+            Fraction(1, 2) + Fraction(1, 2**25) + Fraction(1, 2**70)
+        )
+        expected = float(np.nextafter(np.float32(0.5), np.float32(1.0)))
+
+        cfg = _simple_config(step_size=above_half_midpoint)
+
+        assert cfg.step_size == expected
+
+    @pytest.mark.parametrize(
+        "step_size",
+        [
+            True,
+            np.bool_(True),
+            Decimal("0.1"),
+            jnp.asarray(0.1),
+            jnp.asarray(1),
+        ],
+    )
+    def test_step_size_rejects_non_real_or_array_scalars(self, step_size: object) -> None:
+        with pytest.raises(ValueError, match="step_size"):
+            _simple_config(step_size=step_size)
+
+    @pytest.mark.parametrize(
+        "step_size",
+        [
+            1.0e100,
+            Fraction(1, 2**150),
+            Fraction(1, 2**149),
+            float(np.nextafter(np.finfo(np.float32).tiny, np.float32(0.0))),
+        ],
+    )
+    def test_step_size_rejects_nonfinite_or_subnormal_float32_sink(
+        self, step_size: object
+    ) -> None:
+        with pytest.raises(ValueError, match="step_size"):
+            _simple_config(step_size=step_size)
+
+    def test_step_size_accepts_float32_normal_boundaries(self) -> None:
+        minimum = float(np.finfo(np.float32).tiny)
+        maximum = float(np.finfo(np.float32).max)
+
+        assert _simple_config(step_size=minimum).step_size == minimum
+        assert _simple_config(step_size=maximum).step_size == maximum
+
+    def test_step_size_comparison_spoof_cannot_hide_negative_value(self) -> None:
+        class NegativeSpoof(float):
+            def __new__(cls) -> "NegativeSpoof":
+                return super().__new__(cls, -0.25)
+
+            def __le__(self, other: object) -> bool:
+                return False
+
+        with pytest.raises(ValueError, match="step_size"):
+            _simple_config(step_size=NegativeSpoof())
+
+    @pytest.mark.parametrize(
+        "step_size",
+        [1.0e100, Fraction(1, 2**149), Decimal("0.1"), jnp.asarray(0.1)],
+    )
+    def test_invalid_serialized_step_size_is_refused_before_runtime(
+        self, step_size: object
+    ) -> None:
+        payload = _simple_config().to_config()
+        payload["step_size"] = step_size
+
+        with pytest.raises(ValueError, match="step_size"):
+            StackedLinearHorde.from_config(
+                {"type": "StackedLinearHorde", "config": payload}
+            )
+
+    def test_minimum_normal_step_size_survives_jit_execution(self) -> None:
+        minimum = float(np.finfo(np.float32).tiny)
+        horde = StackedLinearHorde(_simple_config(n_demons=1, step_size=minimum))
+        state = horde.init()
+        update = jax.jit(horde.update)
+
+        result = update(
+            state,
+            jnp.array([1.0, 0.0, 0.0]),
+            jnp.zeros((3,)),
+            jnp.array([1.0]),
+        )
+
+        assert bool(result.update_applied)
+        assert int(result.state.step_count) == 1
+        assert float(result.state.weights[0, 0]) == minimum
 
     def test_roundtrip(self):
         cfg = _simple_config()
