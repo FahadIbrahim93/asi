@@ -6,6 +6,7 @@ from __future__ import annotations
 import chex
 import jax
 import jax.numpy as jnp
+import pytest
 
 from alberta_framework.core.working_memory import (
     WorkingMemoryConfig,
@@ -375,3 +376,78 @@ def test_working_memory_delayed_action_positive_control() -> None:
 
     chex.assert_trees_all_close(memory_mse, 0.0)
     assert float(memory_mse) < float(raw_mse)
+
+
+def _minimal_config(**overrides: object) -> WorkingMemoryConfig:
+    payload: dict[str, object] = {
+        "observation_dim": 2,
+        "action_dim": 0,
+        "reward_dim": 0,
+        "observation_decay_rates": (0.5,),
+        "action_decay_rates": (),
+        "reward_decay_rates": (),
+        "include_current_action": False,
+        "include_current_reward": False,
+    }
+    payload.update(overrides)
+    return WorkingMemoryConfig(**payload)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("field", [
+    "observation_decay_rates",
+    "action_decay_rates",
+    "reward_decay_rates",
+])
+@pytest.mark.parametrize(
+    "rates",
+    [
+        (float("nan"),),
+        (0.5, float("nan")),
+        (float("inf"),),
+        (float("-inf"),),
+        (1.0,),
+        (-0.1,),
+    ],
+)
+def test_decay_rates_must_be_finite_and_in_unit_half_open_interval(
+    field: str, rates: tuple[float, ...]
+) -> None:
+    extras: dict[str, object] = {field: rates}
+    if field != "observation_decay_rates":
+        extras["observation_decay_rates"] = (0.5,)
+    with pytest.raises(ValueError, match=field):
+        WorkingMemoryFeaturizer(_minimal_config(**extras))
+
+
+@pytest.mark.parametrize("temperature", [float("nan"), float("inf"), float("-inf"), 0.0, -1.0])
+def test_gate_temperature_must_be_finite_and_positive(temperature: float) -> None:
+    with pytest.raises(ValueError, match="gate_temperature"):
+        WorkingMemoryFeaturizer(
+            _minimal_config(gated_update=True, gate_temperature=temperature)
+        )
+
+
+@pytest.mark.parametrize("threshold", [float("nan"), float("inf"), float("-inf"), -1.0])
+def test_gate_threshold_must_be_finite_and_nonnegative(threshold: float) -> None:
+    with pytest.raises(ValueError, match="gate_threshold"):
+        WorkingMemoryFeaturizer(
+            _minimal_config(gated_update=True, gate_threshold=threshold)
+        )
+
+
+def test_legal_finite_decay_endpoints_still_construct_and_update() -> None:
+    memory = WorkingMemoryFeaturizer(
+        _minimal_config(
+            observation_decay_rates=(0.0, 0.5, 0.99),
+            gate_temperature=1.0,
+            gate_threshold=0.0,
+        )
+    )
+    checked = memory.update_checked(
+        memory.init(),
+        jnp.asarray([1.0, 2.0], dtype=jnp.float32),
+        memory.zero_action(),
+        memory.zero_reward(),
+    )
+    assert bool(checked.update_applied)
+    chex.assert_tree_all_finite(checked.state)

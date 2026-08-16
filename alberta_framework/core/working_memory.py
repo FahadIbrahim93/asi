@@ -11,6 +11,7 @@ updates.
 from __future__ import annotations
 
 import functools
+import math
 from collections.abc import Iterator
 from dataclasses import asdict, dataclass
 from typing import Any, cast
@@ -181,8 +182,8 @@ class WorkingMemoryArrayResult:
 
 
 def _validate_decay_rates(name: str, rates: tuple[float, ...]) -> None:
-    if any(rate < 0.0 or rate >= 1.0 for rate in rates):
-        raise ValueError(f"{name} must lie in [0, 1); got {rates}")
+    if any(not math.isfinite(rate) or rate < 0.0 or rate >= 1.0 for rate in rates):
+        raise ValueError(f"{name} must contain finite values in [0, 1); got {rates}")
 
 
 def _validate_config(config: WorkingMemoryConfig) -> None:
@@ -195,10 +196,10 @@ def _validate_config(config: WorkingMemoryConfig) -> None:
     _validate_decay_rates("observation_decay_rates", config.observation_decay_rates)
     _validate_decay_rates("action_decay_rates", config.action_decay_rates)
     _validate_decay_rates("reward_decay_rates", config.reward_decay_rates)
-    if config.gate_temperature <= 0.0:
-        raise ValueError("gate_temperature must be positive")
-    if config.gate_threshold < 0.0:
-        raise ValueError("gate_threshold must be non-negative")
+    if not math.isfinite(config.gate_temperature) or config.gate_temperature <= 0.0:
+        raise ValueError("gate_temperature must be finite and positive")
+    if not math.isfinite(config.gate_threshold) or config.gate_threshold < 0.0:
+        raise ValueError("gate_threshold must be finite and non-negative")
     if config.feature_dim() < 1:
         raise ValueError("configuration must produce at least one feature")
 
