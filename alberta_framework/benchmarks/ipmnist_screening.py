@@ -5120,6 +5120,21 @@ def _hidden_rms_frozen_probe_input(
     )
 
 
+def _discovered_rule_frozen_probe_input(
+    hyperparameters: Mapping[str, float],
+) -> FrozenProbeInputFn:
+    """Select the sentinel probe for a discovered-rule arm from its flags.
+
+    ``flag_hidden_rms`` switches the discovered-rule forward pass to the same
+    hidden-layer RMS normalization as ``sigma0_hidden_norm``, so those arms
+    must fail closed exactly like it; the remaining discovered rules deploy
+    the plain MLP behind an EMA input normalizer.
+    """
+    if float(hyperparameters.get("flag_hidden_rms", 0.0)) != 0.0:
+        return _hidden_rms_frozen_probe_input
+    return _ema_frozen_probe_input
+
+
 def _rff_frozen_probe_input(
     state: Any, observation: Array, hyperparameters: Mapping[str, float]
 ) -> Array:
@@ -5896,7 +5911,7 @@ def _build_registry() -> dict[str, ScreeningSpec]:
                 mechanism="discovered_rule",
                 hyperparameters=_discovered_rule_hp(**disc_hp),
                 factory=_make_discovered_rule_learner,
-                frozen_probe_input=_ema_frozen_probe_input,
+                frozen_probe_input=_discovered_rule_frozen_probe_input(disc_hp),
                 description=disc_description,
             )
         )
@@ -5925,7 +5940,9 @@ def _build_registry() -> dict[str, ScreeningSpec]:
                     surprise_slow=0.9996305719081341,
                 ),
                 factory=_make_discovered_rule_learner,
-                frozen_probe_input=_ema_frozen_probe_input,
+                frozen_probe_input=_discovered_rule_frozen_probe_input(
+                    {"flag_hidden_rms": diag_rms}
+                ),
                 description=(
                     "disc_r1 structure at champion-scale constants "
                     f"({diag_axis}): shift-adaptive norm + surprise-gated "
