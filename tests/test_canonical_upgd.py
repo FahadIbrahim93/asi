@@ -532,6 +532,78 @@ def test_safe_profile_exhausted_active_clock_rejects_available_peer_atomically(
 
 
 @pytest.mark.parametrize("profile", ["paper_global", "safe_extended"])
+@pytest.mark.parametrize("mode", ["protecting", "non_protecting"])
+@pytest.mark.parametrize("compiled", [False, True])
+def test_lifetime_refusal_is_reverse_mode_atomic_when_proposal_is_nonfinite(
+    profile: str,
+    mode: str,
+    compiled: bool,
+) -> None:
+    with jax.enable_x64():
+        maximum = jnp.iinfo(jnp.int32).max
+        if profile == "paper_global":
+            param = jnp.array([0.0], dtype=jnp.float64)
+            gradient = jnp.array([0.0], dtype=jnp.float64)
+            utility = jnp.array([0.0], dtype=jnp.float64)
+        else:
+            param = jnp.array([2.0], dtype=jnp.float64)
+            gradient = jnp.array([-0.5], dtype=jnp.float64)
+            utility = jnp.array([jnp.finfo(jnp.float64).max], dtype=jnp.float64)
+        params = {"w": param}
+        optimizer = CanonicalUPGD(
+            CanonicalUPGDConfig(
+                step_size=0.1,
+                utility_decay=0.999999999,
+                noise_std=0.0,
+                mode=mode,  # type: ignore[arg-type]
+                profile=profile,  # type: ignore[arg-type]
+                normalization="global",
+            )
+        )
+        state = optimizer.init(params).replace(
+            utility_ema={"w": utility},
+            utility_age={"w": jnp.array([maximum], dtype=jnp.int32)},
+            step=jnp.array(maximum, dtype=jnp.int32),
+        )
+        key = jr.key(31)
+        noise = {"w": jnp.zeros(1, dtype=jnp.float64)}
+        result = optimizer.update(
+            state,
+            params,
+            {"w": gradient},
+            key,
+            noise=noise,
+        )
+
+        assert not bool(result.metrics["update_applied"])
+        chex.assert_trees_all_equal(result.params, params)
+        chex.assert_trees_all_equal(result.state, state)
+        chex.assert_trees_all_equal(result.next_key, key)
+        zero_tree = jax.tree.map(jnp.zeros_like, params)
+        chex.assert_trees_all_equal(result.scaled_utility, zero_tree)
+        chex.assert_trees_all_equal(result.corrected_utility, zero_tree)
+        chex.assert_trees_all_equal(result.perturbation, zero_tree)
+
+        def rejected_identity_loss(param_leaf, utility_leaf):
+            local_state = state.replace(utility_ema={"w": utility_leaf})
+            update = optimizer.update(
+                local_state,
+                {"w": param_leaf},
+                {"w": gradient},
+                key,
+                noise=noise,
+            )
+            return jnp.sum(update.params["w"]) + jnp.sum(update.state.utility_ema["w"])
+
+        gradient_fn = jax.grad(rejected_identity_loss, argnums=(0, 1))
+        if compiled:
+            gradient_fn = jax.jit(gradient_fn)
+        param_gradient, utility_gradient = gradient_fn(param, utility)
+        chex.assert_trees_all_equal(param_gradient, jnp.ones_like(param))
+        chex.assert_trees_all_equal(utility_gradient, jnp.ones_like(utility))
+
+
+@pytest.mark.parametrize("profile", ["paper_global", "safe_extended"])
 def test_corrupt_negative_counters_do_not_overflow_to_the_lifetime_limit(
     profile: str,
 ) -> None:
