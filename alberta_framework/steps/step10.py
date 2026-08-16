@@ -210,6 +210,7 @@ def _require_int(
     value: object,
     *,
     minimum: int | None = None,
+    maximum: int | None = None,
     exclusive_maximum: int | None = None,
 ) -> int:
     if isinstance(value, bool) or not isinstance(value, Integral):
@@ -221,17 +222,27 @@ def _require_int(
         if minimum == 0:
             raise ValueError(f"{name} must be non-negative, got {value!r}")
         raise ValueError(f"{name} must be >= {minimum}, got {value!r}")
+    if maximum is not None and number > maximum:
+        raise ValueError(f"{name} must be <= {maximum}, got {value!r}")
     if exclusive_maximum is not None and number >= exclusive_maximum:
         raise ValueError(f"{name} must be smaller than int32 max, got {value!r}")
     return number
 
 
 def _validate_stomp_facade_config(config: Step10STOMPConfig) -> None:
-    observation_dim = _require_int("observation_dim", config.observation_dim, minimum=1)
+    # Observation dimensions and action indices flow into int32 JAX sinks;
+    # bounding both keeps every feature_index (< observation_dim) in range.
+    observation_dim = _require_int(
+        "observation_dim",
+        config.observation_dim,
+        minimum=1,
+        maximum=_INT32_MAX,
+    )
     n_primitive_actions = _require_int(
         "n_primitive_actions",
         config.n_primitive_actions,
         minimum=1,
+        maximum=_INT32_MAX,
     )
     option_planning_backups_per_step = _require_int(
         "option_planning_backups_per_step",
