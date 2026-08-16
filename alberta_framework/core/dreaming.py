@@ -711,7 +711,20 @@ def dream_one_step(
         dtype=jnp.float32,
     )
     terminated = jnp.logical_or(world_prediction.terminated, discount_terminal)
-    valid = jnp.logical_and(rollout_state.active, jnp.logical_and(confidence_ok, error_ok))
+    # A non-finite model prediction can never be a valid imagined step: it would
+    # otherwise ship to the control learner with full weight and poison every
+    # later step of the rollout through the carried observation.
+    finite = (
+        jnp.all(jnp.isfinite(world_prediction.next_observation))
+        & jnp.all(jnp.isfinite(world_prediction.reward))
+        & jnp.all(jnp.isfinite(world_prediction.discount))
+        & jnp.all(jnp.isfinite(world_prediction.confidence))
+        & jnp.all(jnp.isfinite(world_prediction.model_error))
+    )
+    valid = jnp.logical_and(
+        rollout_state.active,
+        jnp.logical_and(finite, jnp.logical_and(confidence_ok, error_ok)),
+    )
     next_active = jnp.logical_and(valid, jnp.logical_not(terminated))
     if not cfg.stop_on_terminal:
         next_active = valid
