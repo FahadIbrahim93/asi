@@ -21,6 +21,7 @@ from alberta_framework.steps import (
     Step2StrictDigitReadoutConfig,
     Step2TemporalContextConfig,
     make_step1_learner,
+    make_step1_optimizer,
     make_step1_stream,
     make_step2_hybrid_learner,
     make_step2_learner,
@@ -82,19 +83,296 @@ def test_step1_kernel_all_public_optimizers_smoke(optimizer: str) -> None:
 
 
 def test_step1_kernel_rejects_unpublished_auto_alias() -> None:
-    config = Step1KernelConfig(optimizer="auto")  # type: ignore[arg-type]
-    try:
-        make_step1_learner(config)
-    except ValueError as exc:
-        assert "unknown Step 1 optimizer" in str(exc)
-    else:
-        raise AssertionError("expected unpublished Auto alias to be rejected")
+    with pytest.raises(ValueError, match="optimizer"):
+        Step1KernelConfig(optimizer="auto")  # type: ignore[arg-type]
 
 
 def test_step1_kernel_rejects_misspelled_adagain_alias() -> None:
-    config = Step1KernelConfig(optimizer="adagiven")  # type: ignore[arg-type]
-    with pytest.raises(ValueError, match="unknown Step 1 optimizer"):
-        make_step1_learner(config)
+    with pytest.raises(ValueError, match="optimizer"):
+        Step1KernelConfig(optimizer="adagiven")  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "expected"),
+    [
+        ("optimizer", "LMS", "lms"),
+        ("normalizer", "EMA", "ema"),
+        ("stream", "ALBERTA", "alberta"),
+    ],
+)
+def test_step1_kernel_canonicalizes_supported_enum_spellings(
+    field: str,
+    value: object,
+    expected: str,
+) -> None:
+    config = Step1KernelConfig(**{field: value})
+
+    assert getattr(config, field) == expected
+    make_step1_learner(config)
+    make_step1_stream(config)
+
+
+_INVALID_STEP1_FIELDS: tuple[tuple[str, Any], ...] = (
+    ("feature_dim", 0),
+    ("feature_dim", -1),
+    ("feature_dim", True),
+    ("feature_dim", False),
+    ("feature_dim", "20"),
+    ("feature_dim", 20.5),
+    ("feature_dim", float("nan")),
+    ("feature_dim", float("inf")),
+    ("feature_dim", None),
+    ("num_relevant", 0),
+    ("num_relevant", -1),
+    ("num_relevant", True),
+    ("num_relevant", False),
+    ("num_relevant", "5"),
+    ("num_relevant", 5.5),
+    ("num_relevant", float("nan")),
+    ("num_relevant", float("inf")),
+    ("num_relevant", None),
+    ("optimizer", "unknown_opt"),
+    ("optimizer", 123),
+    ("optimizer", None),
+    ("normalizer", "unknown_norm"),
+    ("normalizer", 123),
+    ("normalizer", None),
+    ("stream", "unknown_stream"),
+    ("stream", 123),
+    ("stream", None),
+    ("step_size", float("nan")),
+    ("step_size", float("inf")),
+    ("step_size", float("-inf")),
+    ("step_size", True),
+    ("step_size", False),
+    ("step_size", -1.0),
+    ("step_size", "0.01"),
+    ("step_size", None),
+    ("meta_step_size", float("nan")),
+    ("meta_step_size", float("inf")),
+    ("meta_step_size", True),
+    ("meta_step_size", False),
+    ("meta_step_size", -0.01),
+    ("drift_rate_w", float("nan")),
+    ("drift_rate_w", float("inf")),
+    ("drift_rate_w", True),
+    ("drift_rate_w", False),
+    ("drift_rate_w", -0.001),
+    ("drift_rate_b", float("nan")),
+    ("drift_rate_b", float("inf")),
+    ("drift_rate_b", True),
+    ("drift_rate_b", False),
+    ("drift_rate_b", -0.001),
+    ("noise_std", float("nan")),
+    ("noise_std", float("inf")),
+    ("noise_std", True),
+    ("noise_std", False),
+    ("noise_std", -1.0),
+    ("feature_std", float("nan")),
+    ("feature_std", float("inf")),
+    ("feature_std", True),
+    ("feature_std", False),
+    ("feature_std", 0.0),
+    ("feature_std", -1.0),
+    ("feature_std", "1.0"),
+    ("feature_std", None),
+    ("ema_decay", float("nan")),
+    ("ema_decay", float("inf")),
+    ("ema_decay", True),
+    ("ema_decay", False),
+    ("ema_decay", -0.1),
+    ("ema_decay", 1.1),
+    ("ema_decay", "0.99"),
+    ("streaming_batch_momentum", float("nan")),
+    ("streaming_batch_momentum", float("inf")),
+    ("streaming_batch_momentum", True),
+    ("streaming_batch_momentum", False),
+    ("streaming_batch_momentum", -0.1),
+    ("streaming_batch_momentum", 1.1),
+    ("streaming_batch_momentum", "0.99"),
+)
+
+
+@pytest.mark.parametrize(("field", "value"), _INVALID_STEP1_FIELDS)
+def test_step1_fields_reject_invalid_inputs(field: str, value: object) -> None:
+    with pytest.raises(ValueError, match=field):
+        Step1KernelConfig(**{field: value})
+
+
+def test_step1_num_relevant_exceeding_feature_dim_raises() -> None:
+    with pytest.raises(ValueError, match="num_relevant"):
+        Step1KernelConfig(feature_dim=4, num_relevant=5)
+
+
+def test_step1_fields_preserve_legal_endpoints() -> None:
+    config = Step1KernelConfig(
+        feature_dim=1,
+        num_relevant=1,
+        optimizer="lms",
+        normalizer="none",
+        stream="alberta",
+        step_size=0.0,
+        meta_step_size=0.0,
+        drift_rate_w=0.0,
+        drift_rate_b=0.0,
+        noise_std=0.0,
+        feature_std=1e-12,
+        ema_decay=0.0,
+        streaming_batch_momentum=0.0,
+    )
+    make_step1_learner(config)
+    stream = make_step1_stream(config)
+    payload = config.to_dict()
+    json.dumps(payload, allow_nan=False)
+    restored = Step1KernelConfig.from_dict(payload)
+    assert restored.feature_dim == 1
+    assert restored.num_relevant == 1
+    assert restored.step_size == 0.0
+    assert restored.feature_std == 1e-12
+    assert restored.ema_decay == 0.0
+    assert restored.streaming_batch_momentum == 0.0
+    assert stream.feature_dim == 1
+
+    upper = Step1KernelConfig(
+        feature_dim=10,
+        num_relevant=10,
+        ema_decay=1.0,
+        streaming_batch_momentum=1.0,
+    )
+    make_step1_learner(upper)
+    assert upper.ema_decay == 1.0
+    assert upper.streaming_batch_momentum == 1.0
+
+
+def test_step1_fields_canonicalize_nonbuiltin_numbers() -> None:
+    value = np.float64(0.05)
+    config = Step1KernelConfig(
+        feature_dim=np.int64(10),
+        num_relevant=np.int64(3),
+        step_size=value,
+        meta_step_size=value,
+        drift_rate_w=value,
+        drift_rate_b=value,
+        noise_std=value,
+        feature_std=np.float64(1.0),
+        ema_decay=value,
+        streaming_batch_momentum=value,
+    )
+    payload = config.to_dict()
+    json.dumps(payload, allow_nan=False)
+    assert config.feature_dim == 10
+    assert config.num_relevant == 3
+    assert config.step_size == 0.05
+    assert type(payload["feature_dim"]) is int
+    assert type(payload["num_relevant"]) is int
+    assert type(payload["step_size"]) is float
+    assert type(payload["meta_step_size"]) is float
+    assert type(payload["drift_rate_w"]) is float
+    assert type(payload["drift_rate_b"]) is float
+    assert type(payload["noise_std"]) is float
+    assert type(payload["feature_std"]) is float
+    assert type(payload["ema_decay"]) is float
+    assert type(payload["streaming_batch_momentum"]) is float
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "step_size",
+        "meta_step_size",
+        "drift_rate_w",
+        "drift_rate_b",
+        "noise_std",
+        "feature_std",
+    ],
+)
+def test_step1_float32_consumed_fields_reject_finite_wide_overflow(field: str) -> None:
+    with pytest.raises(ValueError, match=field):
+        Step1KernelConfig(**{field: 1e100})
+
+
+def test_step1_positive_float32_field_rejects_positive_to_zero_collapse() -> None:
+    with pytest.raises(ValueError, match="feature_std"):
+        Step1KernelConfig(feature_std=1e-50)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("step_size", Fraction(-1, 10**1000)),
+        ("meta_step_size", Fraction(-1, 10**1000)),
+        ("drift_rate_w", Fraction(-1, 10**1000)),
+        ("drift_rate_b", Fraction(-1, 10**1000)),
+        ("noise_std", Fraction(-1, 10**1000)),
+        ("feature_std", Fraction(1, 10**1000)),
+        ("ema_decay", Fraction(-1, 10**1000)),
+        ("ema_decay", Fraction(10**1000 + 1, 10**1000)),
+        ("streaming_batch_momentum", Fraction(-1, 10**1000)),
+        (
+            "streaming_batch_momentum",
+            Fraction(10**1000 + 1, 10**1000),
+        ),
+    ],
+)
+def test_step1_fields_check_exact_domains_before_float_conversion(
+    field: str,
+    value: object,
+) -> None:
+    with pytest.raises(ValueError, match=field):
+        Step1KernelConfig(**{field: value})
+
+
+def test_step1_fields_wrap_real_conversion_overflow_as_config_error() -> None:
+    with pytest.raises(ValueError, match="step_size"):
+        Step1KernelConfig(step_size=Fraction(10**1000, 1))
+
+
+def test_step1_field_uses_direct_float32_narrowing_at_overflow_boundary() -> None:
+    overflow_midpoint = np.ldexp(
+        np.longdouble(2) - np.ldexp(np.longdouble(1), -24),
+        127,
+    )
+    largest_finite_input = np.nextafter(
+        overflow_midpoint,
+        np.longdouble("-inf"),
+    )
+
+    config = Step1KernelConfig(optimizer="lms", step_size=largest_finite_input)
+    optimizer = make_step1_optimizer(config)
+
+    assert bool(np.isfinite(np.asarray(config.step_size, dtype=np.float32)))
+    assert optimizer.to_config()["step_size"] == config.step_size
+
+
+@pytest.mark.parametrize(
+    ("offset", "expected"),
+    [
+        (-Fraction(1, 2**80), 1.0),
+        (Fraction(0), 1.0),
+        (
+            Fraction(1, 2**80),
+            float(np.nextafter(np.float32(1.0), np.float32(np.inf))),
+        ),
+    ],
+)
+def test_step1_fraction_midpoint_rounds_once_to_nearest_even(
+    offset: Fraction,
+    expected: float,
+) -> None:
+    midpoint = Fraction(1) + Fraction(1, 2**24)
+    config = Step1KernelConfig(optimizer="lms", step_size=midpoint + offset)
+
+    assert config.step_size == expected
+
+
+def test_step1_fraction_float32_overflow_midpoint_is_exact() -> None:
+    maximum = Fraction((2**24 - 1) * 2**104)
+    overflow_midpoint = maximum + 2**103
+
+    just_below = Step1KernelConfig(optimizer="lms", step_size=overflow_midpoint - 1)
+    assert just_below.step_size == float(np.finfo(np.float32).max)
+    with pytest.raises(ValueError, match="step_size"):
+        Step1KernelConfig(optimizer="lms", step_size=overflow_midpoint)
 
 
 def test_step2_kernel_factory_and_smoke_are_finite() -> None:
