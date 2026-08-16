@@ -130,9 +130,10 @@ def _require_int(
     minimum: int | None = None,
     exclusive_maximum: int | None = None,
 ) -> int:
-    if isinstance(value, bool) or not isinstance(value, Integral):
+    actual_type = type(value)
+    if issubclass(actual_type, bool) or not issubclass(actual_type, Integral):
         raise ValueError(f"{name} must be an integer, got {value!r}")
-    number = int(value)
+    number: int = int(cast(Any, value))
     if minimum is not None and number < minimum:
         if minimum == 1:
             raise ValueError(f"{name} must be positive, got {value!r}")
@@ -355,9 +356,9 @@ def run_step1_smoke(
     the production kernel can initialize, compile, update online, and return
     finite metrics.
     """
-    if steps < 1:
-        raise ValueError(f"steps must be positive, got {steps}")
-    if final_window < 1 or final_window > steps:
+    steps = _require_int("steps", steps, minimum=1)
+    final_window = _require_int("final_window", final_window, minimum=1)
+    if final_window > steps:
         raise ValueError(
             f"final_window must be in [1, steps], got {final_window}"
         )
