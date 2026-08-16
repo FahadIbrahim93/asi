@@ -20,9 +20,13 @@ These tests verify that:
 - The scan-based learning loop returns correctly shaped arrays.
 """
 
+from types import MappingProxyType
+
 import chex
+import jax
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 import pytest
 
 from alberta_framework import (
@@ -37,6 +41,8 @@ from alberta_framework.core.independent_demon_horde import (
     IndependentDemonHorde,
     IndependentDemonHordeLearningResult,
     IndependentDemonHordeState,
+    _require_direct_state_resources,
+    _require_loop_output_resources,
     run_independent_horde_learning_loop,
     run_independent_horde_learning_loop_batched,
 )
@@ -140,13 +146,9 @@ class TestIndependence:
         # Demon 1's parameters and traces must be byte-identical to before.
         d1_old = state.demon_states[1]
         d1_new = result.state.demon_states[1]  # type: ignore[attr-defined]
-        for w_old, w_new in zip(
-            d1_old.params.weights, d1_new.params.weights, strict=True
-        ):
+        for w_old, w_new in zip(d1_old.params.weights, d1_new.params.weights, strict=True):
             chex.assert_trees_all_close(w_old, w_new)
-        for b_old, b_new in zip(
-            d1_old.params.biases, d1_new.params.biases, strict=True
-        ):
+        for b_old, b_new in zip(d1_old.params.biases, d1_new.params.biases, strict=True):
             chex.assert_trees_all_close(b_old, b_new)
         for t_old, t_new in zip(d1_old.traces, d1_new.traces, strict=True):
             chex.assert_trees_all_close(t_old, t_new)
@@ -156,9 +158,7 @@ class TestIndependence:
         d0_new = result.state.demon_states[0]  # type: ignore[attr-defined]
         # At least one weight matrix should be different.
         any_changed = False
-        for w_old, w_new in zip(
-            d0_old.params.weights, d0_new.params.weights, strict=True
-        ):
+        for w_old, w_new in zip(d0_old.params.weights, d0_new.params.weights, strict=True):
             if not jnp.allclose(w_old, w_new):
                 any_changed = True
                 break
@@ -185,23 +185,17 @@ class TestObgdApplyFinite:
         obs = jnp.ones(3, dtype=jnp.float32)
         next_obs = jnp.zeros(3, dtype=jnp.float32)
 
-        poisoned = horde.update(
-            state, obs, jnp.array([jnp.inf, 1.0], dtype=jnp.float32), next_obs
-        )
+        poisoned = horde.update(state, obs, jnp.array([jnp.inf, 1.0], dtype=jnp.float32), next_obs)
         d0_old = state.demon_states[0]
         d0_new = poisoned.state.demon_states[0]  # type: ignore[attr-defined]
-        for w_old, w_new in zip(
-            d0_old.params.weights, d0_new.params.weights, strict=True
-        ):
+        for w_old, w_new in zip(d0_old.params.weights, d0_new.params.weights, strict=True):
             assert bool(jnp.all(jnp.isfinite(w_new)))
             chex.assert_trees_all_close(w_old, w_new)
 
         d1_old = state.demon_states[1]
         d1_new = poisoned.state.demon_states[1]  # type: ignore[attr-defined]
         any_changed = False
-        for w_old, w_new in zip(
-            d1_old.params.weights, d1_new.params.weights, strict=True
-        ):
+        for w_old, w_new in zip(d1_old.params.weights, d1_new.params.weights, strict=True):
             assert bool(jnp.all(jnp.isfinite(w_new)))
             if not jnp.allclose(w_old, w_new):
                 any_changed = True
@@ -240,9 +234,7 @@ class TestZeroGammaBootstrap:
         state = horde.init(2, jr.key(0))
         ds = state.demon_states[0]
         ds = ds.replace(
-            params=ds.params.replace(
-                weights=(jnp.asarray([[huge, 0.0]], dtype=jnp.float32),)
-            )
+            params=ds.params.replace(weights=(jnp.asarray([[huge, 0.0]], dtype=jnp.float32),))
         )
         state = state.replace(demon_states=(ds,))
         obs = jnp.asarray([0.0, 1.0], dtype=jnp.float32)
@@ -386,9 +378,7 @@ class TestMatchesHordeLearnerWithGammaZero:
 
         observations = jr.normal(k2, (num_steps, feature_dim))
         cumulants = jr.normal(k3, (num_steps, n_demons))
-        next_observations = jnp.concatenate(
-            [observations[1:], observations[:1]], axis=0
-        )
+        next_observations = jnp.concatenate([observations[1:], observations[:1]], axis=0)
 
         ind_result = run_independent_horde_learning_loop(
             independent, ind_state, observations, cumulants, next_observations
@@ -401,9 +391,7 @@ class TestMatchesHordeLearnerWithGammaZero:
 
         # Final mean squared error over the last 20 steps for each demon.
         ind_final_se = jnp.nanmean(ind_result.per_demon_metrics[-20:, :, 0])
-        shared_final_se = jnp.nanmean(
-            shared_result.per_demon_metrics[-20:, :, 0]
-        )
+        shared_final_se = jnp.nanmean(shared_result.per_demon_metrics[-20:, :, 0])
 
         # Sanity check: same order of magnitude. We accept up to a 3x gap
         # because the architectures genuinely differ; the test catches
@@ -461,9 +449,7 @@ class TestTemporalDemonsFinite:
 
         observations = jr.normal(k2, (50, 5))
         cumulants = jr.normal(k3, (50, 2))
-        next_observations = jnp.concatenate(
-            [observations[1:], observations[:1]], axis=0
-        )
+        next_observations = jnp.concatenate([observations[1:], observations[:1]], axis=0)
 
         result = run_independent_horde_learning_loop(
             horde, state, observations, cumulants, next_observations
@@ -594,9 +580,7 @@ class TestScanLoopCorrectShape:
         )
 
         assert isinstance(result, IndependentDemonHordeLearningResult)
-        chex.assert_shape(
-            result.per_demon_metrics, (num_steps, n_demons, 3)
-        )
+        chex.assert_shape(result.per_demon_metrics, (num_steps, n_demons, 3))
         chex.assert_shape(result.td_errors, (num_steps, n_demons))
 
     def test_batched_loop_correct_shape(self) -> None:
@@ -623,9 +607,154 @@ class TestScanLoopCorrectShape:
             horde, observations, cumulants, next_observations, keys
         )
         assert isinstance(result, BatchedIndependentDemonHordeResult)
-        chex.assert_shape(
-            result.per_demon_metrics, (n_seeds, num_steps, n_demons, 3)
+        chex.assert_shape(result.per_demon_metrics, (n_seeds, num_steps, n_demons, 3))
+        chex.assert_shape(result.td_errors, (n_seeds, num_steps, n_demons))
+
+
+def test_independent_demon_horde_integer_validation() -> None:
+    spec = create_horde_spec(_make_all_gamma0_spec(1))
+
+    with pytest.raises(ValueError, match="hidden_sizes"):
+        IndependentDemonHorde(horde_spec=spec, hidden_sizes=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="hidden_sizes"):
+        IndependentDemonHorde(horde_spec=spec, hidden_sizes=(True, 32))  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="hidden_sizes"):
+        IndependentDemonHorde(horde_spec=spec, hidden_sizes=(32, 0))
+
+    horde = IndependentDemonHorde(horde_spec=spec, hidden_sizes=(np.int32(16), np.int64(8)))
+    assert horde._hidden_sizes == (16, 8)
+    assert type(horde._hidden_sizes[0]) is int
+    assert type(horde._hidden_sizes[1]) is int
+
+    key = jax.random.PRNGKey(0)
+    with pytest.raises(ValueError, match="feature_dim"):
+        horde.init(feature_dim=True, key=key)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="feature_dim"):
+        horde.init(feature_dim=4.5, key=key)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="feature_dim"):
+        horde.init(feature_dim=0, key=key)
+
+    state = horde.init(feature_dim=np.int32(4), key=key)
+    assert len(state.demon_states) == 1
+
+
+class _HostileFloat(float):
+    def as_integer_ratio(self) -> tuple[int, int]:
+        raise RuntimeError("hostile hook executed")
+
+
+class _SequenceSpoof:
+    @property
+    def __class__(self) -> type[list[object]]:
+        return list
+
+    def __iter__(self) -> object:
+        raise RuntimeError("hostile iterator executed")
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("sparsity", True),
+        ("sparsity", _HostileFloat(0.5)),
+        ("sparsity", np.float64(1.0 + 1e-10)),
+        ("leaky_relu_slope", 1e100),
+        ("leaky_relu_slope", -1.0),
+        ("use_layer_norm", np.bool_(True)),
+    ],
+)
+def test_independent_horde_rejects_invalid_static_config(field: str, value: object) -> None:
+    spec = create_horde_spec(_make_all_gamma0_spec(1))
+    with pytest.raises(ValueError, match=field):
+        IndependentDemonHorde(horde_spec=spec, **{field: value})  # type: ignore[arg-type]
+
+
+def test_independent_horde_config_accepts_mapping_and_exact_list_or_tuple() -> None:
+    spec = create_horde_spec(_make_all_gamma0_spec(1))
+    horde = IndependentDemonHorde(
+        horde_spec=spec,
+        hidden_sizes=(np.int32(4),),
+        sparsity=np.float64(0.5),
+        leaky_relu_slope=np.float32(0.125),
+    )
+    config = horde.to_config()
+    clone = IndependentDemonHorde.from_config(MappingProxyType(config))
+    assert clone.to_config() == config
+    assert type(clone._sparsity) is float
+    assert type(clone._leaky_relu_slope) is float
+    config["hidden_sizes"] = _SequenceSpoof()
+    with pytest.raises(ValueError, match="hidden_sizes"):
+        IndependentDemonHorde.from_config(config)
+
+
+def test_independent_horde_preflights_direct_state_before_allocation() -> None:
+    _require_direct_state_resources(1, (), 268_435_452)
+    with pytest.raises(ValueError, match="direct_state_bytes"):
+        _require_direct_state_resources(1, (), 268_435_453)
+
+    spec = create_horde_spec(_make_all_gamma0_spec(1))
+    horde = IndependentDemonHorde(horde_spec=spec, hidden_sizes=())
+    with pytest.raises(ValueError, match="direct_state_bytes"):
+        horde.init(268_435_453, jr.key(0))
+
+
+@pytest.mark.parametrize("shape", [(), (1,), (1, 3), (3, 1), (4,)])
+def test_independent_horde_rejects_wrong_observation_shapes(shape: tuple[int, ...]) -> None:
+    spec = create_horde_spec(_make_all_gamma0_spec(1))
+    horde = IndependentDemonHorde(horde_spec=spec, hidden_sizes=())
+    state = horde.init(3, jr.key(0))
+    malformed = jnp.zeros(shape, dtype=jnp.float32)
+    with pytest.raises(ValueError, match="observation"):
+        horde.predict(state, malformed)
+    with pytest.raises(ValueError, match="observation"):
+        horde.update(state, malformed, jnp.zeros((1,)), jnp.zeros((3,)))
+
+
+def test_independent_horde_state_contract_and_counters_saturate() -> None:
+    spec = create_horde_spec(_make_all_gamma0_spec(1))
+    horde = IndependentDemonHorde(horde_spec=spec, hidden_sizes=())
+    state = horde.init(3, jr.key(0))
+    demon = state.demon_states[0]
+    malformed = state.replace(
+        demon_states=(
+            demon.replace(
+                params=demon.params.replace(
+                    weights=(jnp.zeros((1, 2), dtype=jnp.float32),)
+                )
+            ),
         )
-        chex.assert_shape(
-            result.td_errors, (n_seeds, num_steps, n_demons)
+    )
+    with pytest.raises(ValueError, match="demon traces"):
+        horde.predict(malformed, jnp.zeros((3,), dtype=jnp.float32))
+
+    saturated_demon = demon.replace(step_count=jnp.asarray(2**31 - 1, dtype=jnp.int32))
+    saturated = state.replace(
+        demon_states=(saturated_demon,),
+        step_count=jnp.asarray(2**31 - 1, dtype=jnp.int32),
+    )
+    result = horde.update(
+        saturated,
+        jnp.zeros((3,), dtype=jnp.float32),
+        jnp.ones((1,), dtype=jnp.float32),
+        jnp.zeros((3,), dtype=jnp.float32),
+    )
+    assert bool(result.update_applied)
+    assert int(result.state.step_count) == 2**31 - 1
+    assert int(result.state.demon_states[0].step_count) == 2**31 - 1
+
+
+def test_independent_horde_loop_preflights_shapes_and_output_budget() -> None:
+    spec = create_horde_spec(_make_all_gamma0_spec(1))
+    horde = IndependentDemonHorde(horde_spec=spec, hidden_sizes=())
+    state = horde.init(3, jr.key(0))
+    with pytest.raises(ValueError, match="observations"):
+        run_independent_horde_learning_loop(
+            horde,
+            state,
+            jnp.zeros((3,), dtype=jnp.float32),
+            jnp.zeros((1, 1), dtype=jnp.float32),
+            jnp.zeros((1, 3), dtype=jnp.float32),
         )
+    _require_loop_output_resources(119_304_647, 1)
+    with pytest.raises(ValueError, match="learning-loop outputs"):
+        _require_loop_output_resources(119_304_648, 1)
