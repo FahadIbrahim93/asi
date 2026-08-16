@@ -196,6 +196,20 @@ def test_config_canonicalizes_numpy_scalars_for_strict_json_roundtrip() -> None:
     assert type(restored.prediction_clip) is float
 
 
+def test_config_preserves_existing_ordinary_serialization_payloads() -> None:
+    config = SparseFTLWorldModelConfig(
+        observation_dim=2,
+        action_dim=1,
+        ridge=0.01,
+        prediction_clip=10.1,
+    )
+
+    assert config.ridge == 0.01
+    assert config.prediction_clip == 10.1
+    assert config.to_config()["ridge"] == 0.01
+    assert config.to_config()["prediction_clip"] == 10.1
+
+
 def test_underflowing_ridge_is_rejected_before_update_poisoning() -> None:
     ridge = float(np.nextafter(np.float32(0.0), np.float32(1.0)))
 
