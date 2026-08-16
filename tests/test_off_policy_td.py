@@ -629,3 +629,86 @@ class TestInfiniteRewardDoesNotPoisonWeights:
         chex.assert_tree_all_finite(recovered.state.weights)
         chex.assert_tree_all_finite(recovered.state.secondary_weights)
         assert bool(recovered.update_applied)
+
+
+class TestZeroGammaDoesNotMultiplyInfBootstrap:
+    def test_off_policy_td(self) -> None:
+        learner = OffPolicyTDLinearLearner(step_size=0.1, trace_decay=0.0)
+        huge = jnp.float32(1e38)
+        state = learner.init(2).replace(  # type: ignore[attr-defined]
+            weights=jnp.array([huge, 0.0], dtype=jnp.float32)
+        )
+        obs = jnp.array([0.0, 1.0], dtype=jnp.float32)
+        nxt = jnp.array([huge, 0.0], dtype=jnp.float32)
+        raw = jnp.asarray(0.0, dtype=jnp.float32) * (huge * huge)
+        assert not bool(jnp.isfinite(raw))
+
+        result = learner.update(
+            state,
+            obs,
+            jnp.array(3.0, dtype=jnp.float32),
+            nxt,
+            jnp.array(0.0, dtype=jnp.float32),
+            jnp.array(1.0, dtype=jnp.float32),
+        )
+        assert bool(result.update_applied)
+        chex.assert_trees_all_close(result.td_error, jnp.array(3.0, dtype=jnp.float32))
+        chex.assert_tree_all_finite(result.state.weights)
+
+    def test_gradient_td_zero_gamma_branches_before_overflowing_correction(self) -> None:
+        learner = GradientTDLinearLearner(step_size=0.1, secondary_step_size=0.01)
+        state = learner.init(4).replace(  # type: ignore[attr-defined]
+            secondary_weights=jnp.ones((5,), dtype=jnp.float32)
+        )
+        observation = jnp.ones((4,), dtype=jnp.float32)
+        rho = jnp.array(1e38, dtype=jnp.float32)
+        traces = rho * jnp.ones((5,), dtype=jnp.float32)
+        assert not bool(jnp.isfinite(jnp.dot(state.secondary_weights, traces)))
+
+        result = learner.update(
+            state,
+            observation,
+            jnp.array(1.0, dtype=jnp.float32),
+            jnp.zeros((4,), dtype=jnp.float32),
+            jnp.array(0.0, dtype=jnp.float32),
+            rho,
+        )
+
+        assert bool(result.update_applied)
+        chex.assert_tree_all_finite(result.state)
+
+    def test_etd(self) -> None:
+        learner = ETDLinearLearner(step_size=0.1, trace_decay=0.0)
+        huge = jnp.float32(1e38)
+        state = learner.init(2).replace(  # type: ignore[attr-defined]
+            weights=jnp.array([huge, 0.0], dtype=jnp.float32)
+        )
+        result = learner.update(
+            state,
+            jnp.array([0.0, 1.0], dtype=jnp.float32),
+            jnp.array(3.0, dtype=jnp.float32),
+            jnp.array([huge, 0.0], dtype=jnp.float32),
+            jnp.array(0.0, dtype=jnp.float32),
+            jnp.array(1.0, dtype=jnp.float32),
+        )
+        assert bool(result.update_applied)
+        chex.assert_trees_all_close(result.td_error, jnp.array(3.0, dtype=jnp.float32))
+        chex.assert_tree_all_finite(result.state.weights)
+
+    def test_gradient_td(self) -> None:
+        learner = GradientTDLinearLearner(step_size=0.1, secondary_step_size=0.01)
+        huge = jnp.float32(1e38)
+        state = learner.init(2).replace(  # type: ignore[attr-defined]
+            weights=jnp.array([huge, 0.0, 0.0], dtype=jnp.float32)
+        )
+        result = learner.update(
+            state,
+            jnp.array([0.0, 1.0], dtype=jnp.float32),
+            jnp.array(3.0, dtype=jnp.float32),
+            jnp.array([huge, 0.0], dtype=jnp.float32),
+            jnp.array(0.0, dtype=jnp.float32),
+            jnp.array(1.0, dtype=jnp.float32),
+        )
+        assert bool(result.update_applied)
+        chex.assert_trees_all_close(result.td_error, jnp.array(3.0, dtype=jnp.float32))
+        chex.assert_tree_all_finite(result.state.weights)
