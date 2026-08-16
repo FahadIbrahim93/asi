@@ -272,6 +272,10 @@ def _validate_config(config: ExperientialMemoryConfig) -> None:
         raise ValueError("max_age must be an integer")
     if config.max_age < 0:
         raise ValueError("max_age must be non-negative")
+    if config.max_age > _INT32_MAX:
+        raise ValueError(
+            "max_age must be <= int32 max; ages saturate there, so larger values cannot be met"
+        )
 
     for name in (
         "distance_scale",
