@@ -47,11 +47,6 @@ from alberta_framework.core.update_safety import (
     select_transaction,
 )
 
-
-def _skip_zero_scale(scale: Array, value: Array) -> Array:
-    """Return 0 when ``scale`` is 0 so IEEE ``0 * inf`` does not become NaN."""
-    return jnp.where(scale == 0.0, jnp.zeros_like(value), scale * value)
-
 OP_RAW = 0
 OP_PRODUCT = 1
 OP_SUM = 2
@@ -2035,9 +2030,7 @@ class CompositionalFeatureLearner:
         if self._retention_slow_utility_decay == 0.0:
             return previous_slow_utility
         decay = jnp.asarray(self._retention_slow_utility_decay, dtype=jnp.float32)
-        return _skip_zero_scale(decay, previous_slow_utility) + (
-            1.0 - decay
-        ) * utility_signal
+        return decay * previous_slow_utility + (1.0 - decay) * utility_signal
 
     def _retention_score(
         self,
@@ -2057,17 +2050,17 @@ class CompositionalFeatureLearner:
         energy_trace: Array,
     ) -> tuple[Array, Array, Array]:
         """Return online matching-pursuit residual scores."""
-        trace_decay = jnp.asarray(
-            self._candidate_score_trace_decay, dtype=jnp.float32
-        )
-        new_residual_trace = (
-            _skip_zero_scale(trace_decay, residual_trace)
-            + errors[:, None] * feature_values[None, :]
-        )
-        new_energy_trace = (
-            _skip_zero_scale(trace_decay, energy_trace)
-            + feature_values * feature_values
-        )
+        residual_increment = errors[:, None] * feature_values[None, :]
+        energy_increment = feature_values * feature_values
+        if self._candidate_score_trace_decay == 0.0:
+            new_residual_trace = residual_increment
+            new_energy_trace = energy_increment
+        else:
+            trace_decay = jnp.asarray(
+                self._candidate_score_trace_decay, dtype=jnp.float32
+            )
+            new_residual_trace = trace_decay * residual_trace + residual_increment
+            new_energy_trace = trace_decay * energy_trace + energy_increment
         score = jnp.mean(jnp.abs(new_residual_trace), axis=0) / jnp.sqrt(
             new_energy_trace + self._candidate_score_energy_epsilon
         )
@@ -2082,13 +2075,19 @@ class CompositionalFeatureLearner:
         candidate_active_correlation_trace: Array,
     ) -> tuple[Array, Array]:
         """Return correlation novelty gates for candidate utility scores."""
-        trace_decay = jnp.asarray(
-            self._candidate_score_trace_decay, dtype=jnp.float32
+        correlation_increment = (
+            candidate_feature_values[:, None] * active_feature_values[None, :]
         )
-        new_correlation_trace = (
-            _skip_zero_scale(trace_decay, candidate_active_correlation_trace)
-            + candidate_feature_values[:, None] * active_feature_values[None, :]
-        )
+        if self._candidate_score_trace_decay == 0.0:
+            new_correlation_trace = correlation_increment
+        else:
+            trace_decay = jnp.asarray(
+                self._candidate_score_trace_decay, dtype=jnp.float32
+            )
+            new_correlation_trace = (
+                trace_decay * candidate_active_correlation_trace
+                + correlation_increment
+            )
         denom = jnp.sqrt(
             candidate_energy_trace[:, None] * active_energy_trace[None, :]
             + self._candidate_score_energy_epsilon
@@ -2563,12 +2562,14 @@ class CompositionalFeatureLearner:
         active_mask = ~jnp.isnan(targets)
         safe_targets = jnp.where(active_mask, targets, 0.0)
         active_count = jnp.maximum(jnp.sum(active_mask.astype(jnp.float32)), 1.0)
-        activity_decay = jnp.asarray(
-            self._future_utility_task_activity_decay, dtype=jnp.float32
-        )
-        task_activity_ema = _skip_zero_scale(
-            activity_decay, state.task_activity_ema
-        ) + (1.0 - activity_decay) * active_mask.astype(jnp.float32)
+        if self._future_utility_task_activity_decay == 0.0:
+            task_activity_ema = active_mask.astype(jnp.float32)
+        else:
+            task_activity_ema = (
+                self._future_utility_task_activity_decay * state.task_activity_ema
+                + (1.0 - self._future_utility_task_activity_decay)
+                * active_mask.astype(jnp.float32)
+            )
 
         feature_values = _compute_feature_values(
             state.ops,
@@ -2661,10 +2662,13 @@ class CompositionalFeatureLearner:
                 state.feature_score_residual_trace,
                 state.feature_score_energy_trace,
             )
-        utility_decay = jnp.asarray(self._utility_decay, dtype=jnp.float32)
-        new_utilities = _skip_zero_scale(utility_decay, state.utilities) + (
-            1.0 - utility_decay
-        ) * utility_signal
+        if self._utility_decay == 0.0:
+            new_utilities = utility_signal
+        else:
+            new_utilities = (
+                self._utility_decay * state.utilities
+                + (1.0 - self._utility_decay) * utility_signal
+            )
         retention_slow_utilities = self._retention_slow_utility(
             state.retention_slow_utilities,
             utility_signal,
@@ -2781,9 +2785,13 @@ class CompositionalFeatureLearner:
                     )
                 )
                 candidate_signal = candidate_signal * novelty_gate
-            new_candidate_utilities = _skip_zero_scale(
-                utility_decay, state.candidate_utilities
-            ) + (1.0 - utility_decay) * candidate_signal
+            if self._utility_decay == 0.0:
+                new_candidate_utilities = candidate_signal
+            else:
+                new_candidate_utilities = (
+                    self._utility_decay * state.candidate_utilities
+                    + (1.0 - self._utility_decay) * candidate_signal
+                )
         candidate_retention_slow_utilities = self._retention_slow_utility(
             state.candidate_retention_slow_utilities,
             candidate_signal if self._candidate_count > 0 else new_candidate_utilities,
