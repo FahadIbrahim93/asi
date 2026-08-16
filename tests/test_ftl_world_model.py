@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from fractions import Fraction
 
 import chex
 import jax
@@ -134,6 +135,48 @@ def test_config_rejects_values_outside_normal_float32_execution_domain(
 
     with pytest.raises(ValueError, match=rf"{field} must be a finite positive normal float32"):
         SparseFTLWorldModelConfig(**kwargs)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("field", ["ridge", "prediction_clip"])
+def test_config_rounds_exact_normal_boundary_before_validation(field: str) -> None:
+    minimum_normal = Fraction(1, 2**126)
+    normal_midpoint = minimum_normal - Fraction(1, 2**150)
+    below_midpoint = normal_midpoint - Fraction(1, 2**210)
+    kwargs: dict[str, object] = {
+        "observation_dim": 2,
+        "action_dim": 1,
+        field: below_midpoint,
+    }
+
+    with pytest.raises(ValueError, match=rf"{field} must be a finite positive normal float32"):
+        SparseFTLWorldModelConfig(**kwargs)  # type: ignore[arg-type]
+
+    for accepted in (normal_midpoint, normal_midpoint + Fraction(1, 2**210)):
+        kwargs[field] = accepted
+        config = SparseFTLWorldModelConfig(**kwargs)  # type: ignore[arg-type]
+        assert getattr(config, field) == float(np.finfo(np.float32).tiny)
+
+
+@pytest.mark.parametrize("field", ["ridge", "prediction_clip"])
+def test_config_rounds_exact_overflow_midpoint_before_validation(field: str) -> None:
+    float32_max = (2**24 - 1) * 2**104
+    overflow_midpoint = Fraction(float32_max + 2**103)
+    kwargs: dict[str, object] = {
+        "observation_dim": 2,
+        "action_dim": 1,
+        field: overflow_midpoint - 1,
+    }
+
+    config = SparseFTLWorldModelConfig(**kwargs)  # type: ignore[arg-type]
+    assert getattr(config, field) == float(np.finfo(np.float32).max)
+
+    for rejected in (overflow_midpoint, overflow_midpoint + 1):
+        kwargs[field] = rejected
+        with pytest.raises(
+            ValueError,
+            match=rf"{field} must be a finite positive normal float32",
+        ):
+            SparseFTLWorldModelConfig(**kwargs)  # type: ignore[arg-type]
 
 
 def test_config_canonicalizes_numpy_scalars_for_strict_json_roundtrip() -> None:

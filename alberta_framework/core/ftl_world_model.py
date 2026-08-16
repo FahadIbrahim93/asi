@@ -41,11 +41,12 @@ import chex
 import jax
 import jax.numpy as jnp
 import jax.random as jr
-import numpy as np
 from jax import Array
 from jaxtyping import Float, Int
 
-_FLOAT32_TINY = float(np.finfo(np.float32).tiny)
+from alberta_framework._float32 import round_real_to_float32
+
+_FLOAT32_TINY = 2.0**-126
 
 
 def _finite_positive_normal_float32(name: str, value: object) -> float:
@@ -54,16 +55,12 @@ def _finite_positive_normal_float32(name: str, value: object) -> float:
     if isinstance(value, bool) or not isinstance(value, Real):
         raise ValueError(message)
     try:
-        concrete = float(value)
+        narrowed = round_real_to_float32(value)
     except (TypeError, ValueError, OverflowError) as exc:
         raise ValueError(message) from exc
-    if not math.isfinite(concrete) or concrete <= 0.0:
-        raise ValueError(message)
-    with np.errstate(over="ignore", under="ignore", invalid="ignore"):
-        narrowed = float(np.float32(concrete))
     if not math.isfinite(narrowed) or narrowed < _FLOAT32_TINY:
         raise ValueError(message)
-    return concrete
+    return narrowed
 
 
 @dataclasses.dataclass(frozen=True)
