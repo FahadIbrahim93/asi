@@ -13,6 +13,7 @@ from typing import Any
 import chex
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 from jax import Array
 from jaxtyping import Float, Int, PRNGKeyArray
 
@@ -20,6 +21,8 @@ from alberta_framework.core.types import TimeStep
 from alberta_framework.streams.base import ScanStream
 
 _INT32_MAX = 2**31 - 1
+_FLOAT32_TINY = float(np.finfo(np.float32).tiny)
+_FLOAT32_MAX = float(np.finfo(np.float32).max)
 
 
 def _require_positive_int(name: str, value: object) -> int:
@@ -34,6 +37,25 @@ def _require_positive_int(name: str, value: object) -> int:
             f"{name} must be a positive integer in [1, {_INT32_MAX}], got {value!r}"
         )
     return value
+
+
+def _require_normal_float32_scale(name: str, value: float) -> float:
+    """Return a positive bound with stable JAX float32 logarithm semantics."""
+    message = f"{name} must be finite, positive, and representable as a normal float32 value"
+    try:
+        normalized = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(message) from exc
+    if (
+        not math.isfinite(normalized)
+        or normalized < _FLOAT32_TINY
+        or normalized > _FLOAT32_MAX
+    ):
+        raise ValueError(message)
+    narrowed = float(np.float32(normalized))
+    if not math.isfinite(narrowed) or narrowed < _FLOAT32_TINY or narrowed > _FLOAT32_MAX:
+        raise ValueError(message)
+    return narrowed
 
 
 @chex.dataclass(frozen=True)
@@ -852,19 +874,36 @@ def make_scale_range(
     ```
     """
     if log_spaced:
-        if (
-            not math.isfinite(min_scale)
-            or not math.isfinite(max_scale)
-            or min_scale <= 0.0
-            or max_scale <= 0.0
-        ):
-            raise ValueError("log-spaced scale bounds must be finite and positive")
-        return jnp.logspace(
-            jnp.log10(min_scale),
-            jnp.log10(max_scale),
-            feature_dim,
-            dtype=jnp.float32,
-        )
+        min_bound = _require_normal_float32_scale("min_scale", min_scale)
+        max_bound = _require_normal_float32_scale("max_scale", max_scale)
+        with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+            values = np.geomspace(
+                np.float32(min_bound),
+                np.float32(max_bound),
+                feature_dim,
+                dtype=np.float32,
+            )
+        if values.size:
+            lower_bound = min(min_bound, max_bound)
+            upper_bound = max(min_bound, max_bound)
+            ordered = (
+                np.all(values[:-1] <= values[1:])
+                if min_bound <= max_bound
+                else np.all(values[:-1] >= values[1:])
+            )
+            valid = (
+                np.all(np.isfinite(values))
+                and np.all(values > 0.0)
+                and ordered
+                and np.all(values >= lower_bound)
+                and np.all(values <= upper_bound)
+            )
+            if not valid:
+                raise ValueError(
+                    "generated log-spaced scales must be finite, positive, ordered, "
+                    "and within the canonical float32 bounds"
+                )
+        return jnp.asarray(values, dtype=jnp.float32)
     else:
         return jnp.linspace(min_scale, max_scale, feature_dim, dtype=jnp.float32)
 
