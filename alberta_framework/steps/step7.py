@@ -33,6 +33,10 @@ deltas are scaled by a clipped target/behavior probability ratio.  Planning
 output is discarded until the world model has absorbed
 ``planning_warmup_steps`` real transitions.
 
+The facade rejects illegal planning dimensions and scientific scalars
+before constructing the Step 6/8 components. Accepted numbers are
+canonicalized to builtin ints and floats; legal endpoints stay valid.
+
 References:
     Sutton (1990). "Integrated Architectures for Learning, Planning, and
         Reacting Based on Approximating Dynamic Programming."  (Dyna)
@@ -43,7 +47,9 @@ References:
 
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass, field
+from numbers import Integral, Real
 from typing import Any, Literal, cast
 
 import chex
@@ -104,35 +110,8 @@ class Step7DynaConfig:
     planning_utility_step_size: float = 0.2
 
     def __post_init__(self) -> None:
-        """Validate planning hyperparameters and component compatibility."""
-        if self.planning_steps < 0:
-            raise ValueError("planning_steps must be non-negative")
-        if self.planning_rollout_depth < 1:
-            raise ValueError("planning_rollout_depth must be positive")
-        if self.planning_warmup_steps < 0:
-            raise ValueError("planning_warmup_steps must be non-negative")
-        if self.planning_memory_size < 1:
-            raise ValueError("planning_memory_size must be positive")
-        if self.planning_importance_ratio_clip <= 0.0:
-            raise ValueError("planning_importance_ratio_clip must be positive")
-        if self.planning_priority_propagation < 0.0:
-            raise ValueError("planning_priority_propagation must be non-negative")
-        if not 0.0 <= self.planning_utility_step_size <= 1.0:
-            raise ValueError("planning_utility_step_size must be in [0, 1]")
-        if self.planning_strategy not in (
-            "random",
-            "reward",
-            "surprise",
-            "predecessor",
-            "prioritized",
-            "learned",
-        ):
-            raise ValueError(
-                "planning_strategy must be random, reward, surprise, predecessor, "
-                "prioritized, or learned"
-            )
-        if self.world_model.n_actions != self.control.n_actions:
-            raise ValueError("world_model.n_actions must equal control.n_actions")
+        """Reject illegal planning dimensions and scalars, then canonicalize."""
+        _validate_planning_config(self)
 
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-serializable representation."""
@@ -152,6 +131,95 @@ class Step7DynaConfig:
             cast(dict[str, object], data["world_model"])
         )
         return cls(**cast(Any, data))
+
+
+def _require_real(name: str, value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError(f"{name} must be a real number, got {value!r}")
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(f"{name} must be finite, got {value!r}")
+    return number
+
+
+def _require_int(name: str, value: object, *, minimum: int | None = None) -> int:
+    if isinstance(value, bool) or not isinstance(value, Integral):
+        raise ValueError(f"{name} must be an integer, got {value!r}")
+    number = int(value)
+    if minimum is not None and number < minimum:
+        if minimum == 1:
+            raise ValueError(f"{name} must be positive, got {value!r}")
+        if minimum == 0:
+            raise ValueError(f"{name} must be non-negative, got {value!r}")
+        raise ValueError(f"{name} must be >= {minimum}, got {value!r}")
+    return number
+
+
+def _validate_planning_config(config: Step7DynaConfig) -> None:
+    planning_steps = _require_int("planning_steps", config.planning_steps, minimum=0)
+    planning_rollout_depth = _require_int(
+        "planning_rollout_depth",
+        config.planning_rollout_depth,
+        minimum=1,
+    )
+    planning_warmup_steps = _require_int(
+        "planning_warmup_steps",
+        config.planning_warmup_steps,
+        minimum=0,
+    )
+    planning_memory_size = _require_int(
+        "planning_memory_size",
+        config.planning_memory_size,
+        minimum=1,
+    )
+    importance_clip = _require_real(
+        "planning_importance_ratio_clip",
+        config.planning_importance_ratio_clip,
+    )
+    if importance_clip <= 0.0:
+        raise ValueError(
+            f"planning_importance_ratio_clip must be positive, got "
+            f"{config.planning_importance_ratio_clip!r}"
+        )
+    propagation = _require_real(
+        "planning_priority_propagation",
+        config.planning_priority_propagation,
+    )
+    if propagation < 0.0:
+        raise ValueError(
+            f"planning_priority_propagation must be non-negative, got "
+            f"{config.planning_priority_propagation!r}"
+        )
+    utility_step = _require_real(
+        "planning_utility_step_size",
+        config.planning_utility_step_size,
+    )
+    if not 0.0 <= utility_step <= 1.0:
+        raise ValueError(
+            f"planning_utility_step_size must be in [0, 1], got "
+            f"{config.planning_utility_step_size!r}"
+        )
+    if config.planning_strategy not in (
+        "random",
+        "reward",
+        "surprise",
+        "predecessor",
+        "prioritized",
+        "learned",
+    ):
+        raise ValueError(
+            "planning_strategy must be random, reward, surprise, predecessor, "
+            "prioritized, or learned"
+        )
+    if config.world_model.n_actions != config.control.n_actions:
+        raise ValueError("world_model.n_actions must equal control.n_actions")
+    object.__setattr__(config, "planning_steps", planning_steps)
+    object.__setattr__(config, "planning_rollout_depth", planning_rollout_depth)
+    object.__setattr__(config, "planning_warmup_steps", planning_warmup_steps)
+    object.__setattr__(config, "planning_memory_size", planning_memory_size)
+    object.__setattr__(config, "planning_importance_ratio_clip", importance_clip)
+    object.__setattr__(config, "planning_priority_propagation", propagation)
+    object.__setattr__(config, "planning_utility_step_size", utility_step)
 
 
 @chex.dataclass(frozen=True)
