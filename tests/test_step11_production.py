@@ -9,6 +9,7 @@ constructible and accepted numbers canonicalize to builtin ints and floats.
 from __future__ import annotations
 
 import json
+from fractions import Fraction
 from typing import Any
 
 import chex
@@ -446,6 +447,40 @@ def test_step11_oak_rejects_float32_overflow() -> None:
         Step11OaKConfig(curation_threshold=1e100)
     with pytest.raises(ValueError, match="option_model_step_size"):
         Step11OaKConfig(option_model_step_size=1e100)
+
+
+def test_step11_oak_validates_original_real_domain_before_narrowing() -> None:
+    above_one = np.longdouble(1.0) + np.finfo(np.longdouble).eps
+    below_zero = -np.nextafter(np.longdouble(0.0), np.longdouble(1.0))
+    assert float(above_one) == 1.0
+    assert float(below_zero) == 0.0
+
+    with pytest.raises(ValueError, match="epsilon_base"):
+        Step11OaKConfig(epsilon_base=above_one)
+    with pytest.raises(ValueError, match="base_step_size"):
+        Step11OaKConfig(base_step_size=below_zero)
+
+
+def test_step11_oak_wraps_real_conversion_overflow() -> None:
+    with pytest.raises(ValueError, match="base_step_size"):
+        Step11OaKConfig(base_step_size=Fraction(10**400, 1))
+
+
+def test_step11_oak_narrows_the_original_real_once() -> None:
+    midpoint_plus = (
+        np.longdouble(1.0)
+        + np.longdouble(2.0) ** -24
+        + np.longdouble(2.0) ** -60
+    )
+    assert np.float32(midpoint_plus) != np.float32(float(midpoint_plus))
+    config = Step11OaKConfig(
+        subtask_specs=(
+            SubtaskSpec(feature_index=0, pseudo_reward_scale=midpoint_plus),
+        ),
+    )
+    assert config.subtask_specs[0].pseudo_reward_scale == float(
+        np.float32(midpoint_plus)
+    )
 
 
 def test_step11_oak_preserves_float32_boundaries() -> None:

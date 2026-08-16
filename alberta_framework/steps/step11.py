@@ -28,7 +28,6 @@ References:
 
 from __future__ import annotations
 
-import math
 from dataclasses import asdict, dataclass
 from numbers import Integral, Real
 from typing import Any
@@ -164,22 +163,29 @@ class Step11OaKConfig:
 
 
 _INT32_MAX = 2**31 - 1
-_FLOAT32_MAX = float(np.finfo(np.float32).max)
-_FLOAT32_MIN = -_FLOAT32_MAX
 
 
 def _require_real(name: str, value: object) -> float:
     if isinstance(value, bool) or not isinstance(value, Real):
         raise ValueError(f"{name} must be a real number, got {value!r}")
-    number = float(value)
-    if not math.isfinite(number):
+    try:
+        with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+            execution_value = np.asarray(value, dtype=np.float32).reshape(())
+    except (OverflowError, TypeError, ValueError) as error:
+        raise ValueError(f"{name} must be finite in float32, got {value!r}") from error
+    if not bool(np.isfinite(execution_value)):
         raise ValueError(f"{name} must be finite, got {value!r}")
-    if not _FLOAT32_MIN <= number <= _FLOAT32_MAX:
-        raise ValueError(f"{name} overflows float32 execution sink, got {value!r}")
-    return float(np.float32(number))
+    return float(execution_value)
 
 
 def _require_unit_interval(name: str, value: object) -> float:
+    original_value: Any = value
+    if (
+        not isinstance(value, bool)
+        and isinstance(value, Real)
+        and (original_value < 0 or original_value > 1)
+    ):
+        raise ValueError(f"{name} must be in [0, 1], got {value!r}")
     number = _require_real(name, value)
     if not 0.0 <= number <= 1.0:
         raise ValueError(f"{name} must be in [0, 1], got {value!r}")
@@ -187,6 +193,8 @@ def _require_unit_interval(name: str, value: object) -> float:
 
 
 def _require_nonnegative_real(name: str, value: object) -> float:
+    if not isinstance(value, bool) and isinstance(value, Real) and value < 0:
+        raise ValueError(f"{name} must be non-negative, got {value!r}")
     number = _require_real(name, value)
     if number < 0.0:
         raise ValueError(f"{name} must be non-negative, got {value!r}")
@@ -194,6 +202,8 @@ def _require_nonnegative_real(name: str, value: object) -> float:
 
 
 def _require_positive_real(name: str, value: object) -> float:
+    if not isinstance(value, bool) and isinstance(value, Real) and value <= 0:
+        raise ValueError(f"{name} must be positive, got {value!r}")
     number = _require_real(name, value)
     if number <= 0.0:
         raise ValueError(
