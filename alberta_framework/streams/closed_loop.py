@@ -423,6 +423,21 @@ class RiverSwimMDP:
             raise ValueError(
                 f"initial_state must lie in [0, {config.n_states}), got {config.initial_state}"
             )
+        if isinstance(config.initial_state, bool) or not isinstance(
+            config.initial_state, Integral
+        ):
+            raise ValueError(
+                "initial_state must be an integer, got "
+                f"{config.initial_state!r}"
+            )
+        if not np.isfinite(config.reward_left):
+            raise ValueError(
+                f"reward_left must be finite, got {config.reward_left}"
+            )
+        if not np.isfinite(config.reward_right):
+            raise ValueError(
+                f"reward_right must be finite, got {config.reward_right}"
+            )
         config = config.replace(  # type: ignore[attr-defined]
             p_right_up=p_right_up,
             p_right_down=p_right_down,
