@@ -426,6 +426,12 @@ def validated_ipmnist_data(
         raise ValueError(f"data_x must have shape (n_train, {input_dim})")
     if raw_y.shape != (raw_x.shape[0],):
         raise ValueError("data_y must be (n_train,) aligned with data_x")
+    if (
+        np.issubdtype(raw_x.dtype, np.bool_)
+        or np.issubdtype(raw_x.dtype, np.complexfloating)
+        or not np.issubdtype(raw_x.dtype, np.number)
+    ):
+        raise ValueError("data_x must use a real numeric, non-boolean dtype")
     if raw_y.dtype.kind not in {"i", "u"}:
         raise ValueError("data_y must contain integer class labels")
     if np.any(raw_y < 0) or np.any(raw_y > np.iinfo(np.int32).max):

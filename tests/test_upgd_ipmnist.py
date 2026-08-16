@@ -147,6 +147,10 @@ class TestInputDomain:
             (lambda x, y: (x, y.astype(np.float32) + 0.9), "integer class labels"),
             (lambda x, y: (x.at[0, 0].set(np.inf), y), "finite"),
             (lambda x, y: (x.at[3, 1].set(np.nan), y), "finite"),
+            (
+                lambda x, y: (x.astype(jnp.complex64) + jnp.complex64(1j), y),
+                "real numeric",
+            ),
         ],
     )
     def test_run_rejects_out_of_domain_inputs_before_setup(

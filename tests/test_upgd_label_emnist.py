@@ -324,9 +324,16 @@ class TestEMNISTArrayCache:
         (lambda x, y: (x.at[0, 0].set(np.nan), y), "finite"),
     ],
 )
-def test_run_label_emnist_rejects_out_of_domain_inputs(mutate, message: str) -> None:
+def test_run_label_emnist_rejects_out_of_domain_inputs(
+    monkeypatch: pytest.MonkeyPatch, mutate, message: str
+) -> None:
+    def unexpected_setup(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise AssertionError("out-of-domain data reached learner setup")
+
     x, y = _tiny_data()
     x, y = mutate(jnp.asarray(x), jnp.asarray(y))
+    monkeypatch.setattr(upgd_label_emnist, "resolve_hyperparameters", unexpected_setup)
     with pytest.raises(ValueError, match=message):
         run_label_emnist(x, y, "adamw", seeds=[0], config=TINY)
 

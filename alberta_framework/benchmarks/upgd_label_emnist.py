@@ -481,12 +481,12 @@ def run_label_emnist(
     seed_tuple = require_unique_jax_seeds(seeds, name="seeds")
     if config is None:
         config = LabelEMNISTConfig()
-    hp = resolve_hyperparameters(learner, hyperparameters)
-    init_fn, step_fn = _FULL_STEP_FACTORIES[learner](hp)
-
     resolved_x, resolved_y = validated_ipmnist_data(
         data_x, data_y, input_dim=config.input_dim, n_classes=config.n_classes
     )
+    hp = resolve_hyperparameters(learner, hyperparameters)
+    init_fn, step_fn = _FULL_STEP_FACTORIES[learner](hp)
+
     data_x = jnp.asarray(resolved_x, dtype=jnp.float32)
     data_y = jnp.asarray(resolved_y, dtype=jnp.int32)
     n_train = int(data_x.shape[0])
