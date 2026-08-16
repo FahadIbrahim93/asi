@@ -575,6 +575,28 @@ def test_digest_bound_checkpoint_roundtrip_preserves_exact_future_stream(tmp_pat
     _assert_tree_equal(original_next, restored_next)
 
 
+def test_checkpoint_restore_does_not_depend_on_an_unrelated_template_draw(
+    tmp_path: Path,
+) -> None:
+    """A valid persisted draw must restore even when the default template draw is invalid."""
+    model = RecurrentLatentWorldModelEnsemble(
+        _config(initialization_scale=5.0, max_parameter_magnitude=8.0)
+    )
+    state = model.init(jr.key(3))
+    assert bool(model.state_valid(state))
+    with pytest.raises(ValueError, match="initialized parameters exceed"):
+        model.init(jr.key(0))
+
+    checkpoint = tmp_path / "seed-dependent-init.ckpt"
+    save_recurrent_latent_world_model_ensemble_checkpoint(model, state, checkpoint)
+
+    restored_model, restored_state = load_recurrent_latent_world_model_ensemble_checkpoint(
+        checkpoint
+    )
+    assert restored_model.to_config() == model.to_config()
+    _assert_tree_equal(restored_state, state)
+
+
 def test_checkpoint_rejects_metadata_config_and_resource_tampering(tmp_path: Path) -> None:
     model = RecurrentLatentWorldModelEnsemble(_config())
     state = model.init(jr.key(91))

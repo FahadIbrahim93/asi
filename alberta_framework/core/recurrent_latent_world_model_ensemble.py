@@ -1552,18 +1552,20 @@ def load_recurrent_latent_world_model_ensemble_checkpoint(
     if metadata.get("scientific_promotion_allowed") is not False:
         raise ValueError("checkpoint cannot claim scientific promotion")
     key = jr.key(0) if template_key is None else template_key
-    template = model.init(key)
-    expected_budget = model.resource_budget(template).to_config()
-    if metadata.get("resource_budget") != expected_budget:
-        raise ValueError("checkpoint resource budget does not match config")
+    # The template supplies only the checkpoint's static PyTree contract.  It
+    # must not make restoration depend on whether this unrelated random draw
+    # happens to fit the configured parameter bound; the persisted state is
+    # validated immediately after it is reconstructed.
+    template = model._initial_state(key)
     restored, second_metadata = load_checkpoint(template, path)
     if second_metadata != metadata:
         raise ValueError("checkpoint metadata changed between reads")
     state = cast(RecurrentLatentWorldModelEnsembleState, restored)
     if not bool(jax.device_get(model.state_valid(state))):
         raise ValueError("restored recurrent latent ensemble state is invalid")
-    if model.resource_budget(state).to_config() != expected_budget:
-        raise ValueError("restored recurrent latent ensemble resource budget is invalid")
+    expected_budget = model.resource_budget(state).to_config()
+    if metadata.get("resource_budget") != expected_budget:
+        raise ValueError("checkpoint resource budget does not match config and state")
     return model, state
 
 
