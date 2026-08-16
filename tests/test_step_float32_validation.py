@@ -287,6 +287,37 @@ def test_gvf_probabilities_accept_minimum_normal_and_reach_core() -> None:
     make_step4_sarsa_agent(step4)
 
 
+@pytest.mark.parametrize(
+    "build_config",
+    [
+        pytest.param(
+            lambda value: Step3HordeConfig(gammas=(value,), lamdas=(0.0,)),
+            id="step3-gamma",
+        ),
+        pytest.param(
+            lambda value: Step3HordeConfig(gammas=(0.0,), lamdas=(value,)),
+            id="step3-lamda",
+        ),
+        pytest.param(
+            lambda value: Step4SARSAConfig(gamma=value),
+            id="step4-gamma",
+        ),
+        pytest.param(
+            lambda value: Step4SARSAConfig(lamda=value),
+            id="step4-lamda",
+        ),
+    ],
+)
+def test_gvf_probabilities_reject_exact_subnormal_that_rounds_to_normal(
+    build_config: Callable[[Any], object],
+) -> None:
+    value = Fraction(1, 2**126) - Fraction(1, 2**200)
+    assert float(np.float32(value)) == float.fromhex("0x1.0p-126")
+
+    with pytest.raises(ValueError, match="zero or a normal float32"):
+        build_config(value)
+
+
 def test_zero_host_with_subnormal_ratio_is_rejected_before_core() -> None:
     class SubnormalRatioFloat(float):
         def as_integer_ratio(self) -> tuple[int, int]:

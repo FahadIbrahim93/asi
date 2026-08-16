@@ -149,7 +149,9 @@ def _require_gvf_probability(name: str, value: object) -> float:
     real, narrowed = finite_real_and_float32(name, value)
     if real < 0.0 or not real <= 1.0 or narrowed < 0.0 or not narrowed <= 1.0:
         raise ValueError(f"{name} must be in [0, 1], got {value!r}")
-    if narrowed < _FLOAT32_MIN_NORMAL and (real != 0.0 or narrowed != 0.0):
+    if (real != 0.0 and real < _FLOAT32_MIN_NORMAL) or (
+        narrowed != 0.0 and narrowed < _FLOAT32_MIN_NORMAL
+    ):
         raise ValueError(f"{name} must be zero or a normal float32 value in [0, 1]")
     return canonical_float32_storage(real, narrowed)
 
