@@ -19,12 +19,15 @@ References:
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from numbers import Integral, Real
 from typing import Any, cast
 
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 from jax import Array
 
+from alberta_framework._float32 import round_real_to_float32
 from alberta_framework.core.average_reward import (
     DifferentialSARSAAgent,
     DifferentialSARSAArrayResult,
@@ -33,6 +36,92 @@ from alberta_framework.core.average_reward import (
     DifferentialSARSAUpdateResult,
     run_differential_sarsa_from_arrays,
 )
+
+_INT32_MAX = 2**31 - 1
+
+
+def _require_real(name: str, value: object) -> Any:
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError(f"{name} must be a real number, got {value!r}")
+    return value
+
+
+def _narrow_float32(name: str, value: Any) -> float:
+    """Narrow exactly as the JAX core does, without an intermediate float64."""
+    try:
+        narrowed = round_real_to_float32(value)
+    except (FloatingPointError, OverflowError, TypeError, ValueError):
+        raise ValueError(f"{name} must narrow to a finite float32, got {value!r}") from None
+    if not bool(np.isfinite(narrowed)):
+        raise ValueError(f"{name} must narrow to a finite float32, got {value!r}")
+    if type(value) in (int, float) and (bool(narrowed != 0.0) or value == 0):
+        return float(value)
+    return narrowed
+
+
+def _require_unit_interval(name: str, value: object) -> float:
+    original = _require_real(name, value)
+    if not 0.0 <= original <= 1.0:
+        raise ValueError(f"{name} must be in [0, 1], got {value!r}")
+    return _narrow_float32(name, original)
+
+
+def _require_nonnegative_real(name: str, value: object) -> float:
+    original = _require_real(name, value)
+    if original < 0.0:
+        raise ValueError(f"{name} must be non-negative, got {value!r}")
+    return _narrow_float32(name, original)
+
+
+def _require_int(
+    name: str,
+    value: object,
+    *,
+    minimum: int | None = None,
+    maximum: int | None = None,
+) -> int:
+    if isinstance(value, bool) or not isinstance(value, Integral):
+        raise ValueError(f"{name} must be an integer, got {value!r}")
+    number = int(value)
+    if minimum is not None and number < minimum:
+        if minimum == 1:
+            raise ValueError(f"{name} must be positive, got {value!r}")
+        if minimum == 0:
+            raise ValueError(f"{name} must be non-negative, got {value!r}")
+        raise ValueError(f"{name} must be >= {minimum}, got {value!r}")
+    if maximum is not None and number > maximum:
+        raise ValueError(f"{name} must be at most int32 max, got {value!r}")
+    return number
+
+
+def _validate_step6_config(config: Step6DifferentialSARSAConfig) -> None:
+    n_actions = _require_int(
+        "n_actions",
+        config.n_actions,
+        minimum=1,
+        maximum=_INT32_MAX,
+    )
+    q_step_size = _require_nonnegative_real("q_step_size", config.q_step_size)
+    average_reward_step_size = _require_nonnegative_real(
+        "average_reward_step_size",
+        config.average_reward_step_size,
+    )
+    trace_decay = _require_unit_interval("trace_decay", config.trace_decay)
+    epsilon_start = _require_unit_interval("epsilon_start", config.epsilon_start)
+    epsilon_end = _require_unit_interval("epsilon_end", config.epsilon_end)
+    epsilon_decay_steps = _require_int(
+        "epsilon_decay_steps",
+        config.epsilon_decay_steps,
+        minimum=0,
+        maximum=_INT32_MAX,
+    )
+    object.__setattr__(config, "n_actions", n_actions)
+    object.__setattr__(config, "q_step_size", q_step_size)
+    object.__setattr__(config, "average_reward_step_size", average_reward_step_size)
+    object.__setattr__(config, "trace_decay", trace_decay)
+    object.__setattr__(config, "epsilon_start", epsilon_start)
+    object.__setattr__(config, "epsilon_end", epsilon_end)
+    object.__setattr__(config, "epsilon_decay_steps", epsilon_decay_steps)
 
 
 @dataclass(frozen=True)
@@ -46,6 +135,10 @@ class Step6DifferentialSARSAConfig:
     epsilon_start: float = 0.1
     epsilon_end: float = 0.01
     epsilon_decay_steps: int = 0
+
+    def __post_init__(self) -> None:
+        """Reject illegal parameters and canonicalize scalars."""
+        _validate_step6_config(self)
 
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-serializable representation."""
@@ -172,6 +265,7 @@ def run_step6_smoke(
         & jnp.all(jnp.isfinite(result.average_rewards))
         & jnp.all(result.actions >= 0)
         & jnp.all(result.actions < cfg.n_actions)
+        & jnp.all(result.updates_applied)
     )
     return Step6SmokeResult(
         config=cfg,
