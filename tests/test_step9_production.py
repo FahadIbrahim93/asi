@@ -397,6 +397,34 @@ def test_step9_dreaming_fields_canonicalize_nonbuiltin_numbers() -> None:
     assert restored.model_error_decay == 0.5
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("dreaming_warmup_steps", 2**31),
+        ("dream_candidate_count", 2**31),
+        ("buffer_capacity", 2**31 - 1),
+    ],
+)
+def test_step9_count_fields_reject_values_outside_int32_contract(
+    field: str,
+    value: int,
+) -> None:
+    with pytest.raises(ValueError, match=field):
+        _config_with(**{field: value})
+
+
+def test_step9_count_fields_preserve_int32_upper_endpoints() -> None:
+    config = _config_with(
+        dreaming_warmup_steps=2**31 - 1,
+        dream_candidate_count=2**31 - 1,
+        buffer_capacity=2**31 - 2,
+    )
+    assert config.dreaming_warmup_steps == 2**31 - 1
+    assert config.dream_candidate_count == 2**31 - 1
+    assert config.buffer_capacity == 2**31 - 2
+    json.dumps(config.to_dict(), allow_nan=False)
+
+
 # ---------------------------------------------------------------------------
 # Factory and init tests
 # ---------------------------------------------------------------------------

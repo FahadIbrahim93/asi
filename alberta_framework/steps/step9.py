@@ -63,6 +63,8 @@ from alberta_framework.steps.step6 import (
     make_step6_differential_sarsa_agent,
 )
 
+_INT32_MAX = 2**31 - 1
+
 
 @dataclass(frozen=True)
 class Step9DreamingConfig:
@@ -204,7 +206,13 @@ def _require_half_open_unit_interval(name: str, value: object) -> float:
     return number
 
 
-def _require_int(name: str, value: object, *, minimum: int | None = None) -> int:
+def _require_int(
+    name: str,
+    value: object,
+    *,
+    minimum: int | None = None,
+    maximum: int | None = None,
+) -> int:
     if isinstance(value, bool) or not isinstance(value, Integral):
         raise ValueError(f"{name} must be an integer, got {value!r}")
     number = int(value)
@@ -214,6 +222,8 @@ def _require_int(name: str, value: object, *, minimum: int | None = None) -> int
         if minimum == 0:
             raise ValueError(f"{name} must be non-negative, got {value!r}")
         raise ValueError(f"{name} must be >= {minimum}, got {value!r}")
+    if maximum is not None and number > maximum:
+        raise ValueError(f"{name} must be <= {maximum}, got {value!r}")
     return number
 
 
@@ -251,10 +261,12 @@ def _validate_dreaming_config(config: Step9DreamingConfig) -> None:
         config.model_use_layer_norm,
     )
     model_gamma = _require_unit_interval("model_gamma", config.model_gamma)
+    # The world-model warmup clock is stored as a signed int32 scalar.
     dreaming_warmup_steps = _require_int(
         "dreaming_warmup_steps",
         config.dreaming_warmup_steps,
         minimum=0,
+        maximum=_INT32_MAX,
     )
     dreaming_max_model_error = _require_nonneg_real(
         "dreaming_max_model_error",
@@ -274,10 +286,12 @@ def _validate_dreaming_config(config: Step9DreamingConfig) -> None:
         config.dream_rollout_horizon,
         minimum=1,
     )
+    # Candidate selection publishes selected indices as signed int32 values.
     dream_candidate_count = _require_int(
         "dream_candidate_count",
         config.dream_candidate_count,
         minimum=1,
+        maximum=_INT32_MAX,
     )
     dream_surprise_weight = _require_real(
         "dream_surprise_weight",
@@ -287,7 +301,14 @@ def _validate_dreaming_config(config: Step9DreamingConfig) -> None:
         "dream_utility_weight",
         config.dream_utility_weight,
     )
-    buffer_capacity = _require_int("buffer_capacity", config.buffer_capacity, minimum=1)
+    # Buffer ``size`` and ``index`` are int32. Leaving one count below the
+    # maximum keeps repeated full-buffer increments and modulo updates in range.
+    buffer_capacity = _require_int(
+        "buffer_capacity",
+        config.buffer_capacity,
+        minimum=1,
+        maximum=_INT32_MAX - 1,
+    )
     dreams_update_average_reward = _require_bool(
         "dreams_update_average_reward",
         config.dreams_update_average_reward,
