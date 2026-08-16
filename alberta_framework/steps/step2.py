@@ -168,10 +168,11 @@ def _require_int(
     minimum: int | None = None,
     maximum: int | None = None,
 ) -> int:
-    if isinstance(value, bool) or not isinstance(value, Integral):
+    actual_type = type(value)
+    if issubclass(actual_type, bool) or not issubclass(actual_type, Integral):
         raise ValueError(f"{name} must be an integer, got {value!r}")
     try:
-        number = int(value)
+        number = int(cast(Integral, value))
     except (OverflowError, TypeError, ValueError):
         raise ValueError(f"{name} must be an integer, got {value!r}") from None
     if minimum is not None and number < minimum:
