@@ -1567,12 +1567,13 @@ def import_official_foragax_npz(
     final_window: int = 100_000,
 ) -> ForagerRunResult:
     """Convert one official ``data/<seed>.npz`` archive to Alberta's schema."""
-    if (
-        isinstance(ewm_decay, bool)
-        or not isinstance(ewm_decay, (int, float))
-        or not math.isfinite(ewm_decay)
-        or not 0.0 <= ewm_decay < 1.0
-    ):
+    if type(ewm_decay) not in (int, float):
+        raise ValueError("ewm_decay must be a finite number in [0, 1)")
+    try:
+        ewm_decay_as_float = float(ewm_decay)
+    except OverflowError as exc:
+        raise ValueError("ewm_decay must be a finite number in [0, 1)") from exc
+    if not math.isfinite(ewm_decay_as_float) or not 0.0 <= ewm_decay_as_float < 1.0:
         raise ValueError("ewm_decay must be a finite number in [0, 1)")
     if type(record_every) is not int or record_every < 1:
         raise ValueError("record_every must be a positive integer")
