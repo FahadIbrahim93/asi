@@ -8,6 +8,7 @@ All streams use JAX-compatible pure functions that work with jax.lax.scan.
 """
 
 import math
+from numbers import Real
 from typing import Any
 
 import chex
@@ -58,6 +59,20 @@ def _require_normal_float32_scale(name: str, value: float) -> float:
     return narrowed
 
 
+def _require_finite_nonnegative_float32(name: str, value: object) -> float:
+    """Require a finite non-negative float32 execution value."""
+    message = f"{name} must be a finite non-negative float32 value"
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError(message)
+    try:
+        narrowed = float(np.float32(value))
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(message) from exc
+    if not math.isfinite(narrowed) or narrowed < 0.0:
+        raise ValueError(message)
+    return narrowed
+
+
 @chex.dataclass(frozen=True)
 class RandomWalkState:
     """State for RandomWalkStream.
@@ -101,10 +116,10 @@ class RandomWalkStream:
             noise_std: Std dev of target noise
             feature_std: Std dev of feature values
         """
-        self._feature_dim = feature_dim
-        self._drift_rate = drift_rate
-        self._noise_std = noise_std
-        self._feature_std = feature_std
+        self._feature_dim = _require_positive_int("feature_dim", feature_dim)
+        self._drift_rate = _require_finite_nonnegative_float32("drift_rate", drift_rate)
+        self._noise_std = _require_finite_nonnegative_float32("noise_std", noise_std)
+        self._feature_std = _require_finite_nonnegative_float32("feature_std", feature_std)
 
     @property
     def feature_dim(self) -> int:
