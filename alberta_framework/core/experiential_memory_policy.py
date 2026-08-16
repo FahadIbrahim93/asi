@@ -37,6 +37,7 @@ EXPERIENTIAL_MEMORY_POLICY_SCHEMA = "alberta.experiential-memory-policy.v1"
 _POLICY_TYPE = "ExperientialMemoryPolicy"
 _ACTION_SEMANTICS = "categorical-score-mass-not-action-identifiers"
 _SELECTION_SEMANTICS = "lowest-index-argmax-over-safe-positive-mass"
+_FLOAT32_MAX = 3.4028234663852886e38
 
 
 def _require_array(
@@ -240,17 +241,32 @@ class ExperientialMemoryPolicy:
         finite = jnp.all(jnp.isfinite(action_mass))
         nonnegative = jnp.all(action_mass >= 0.0)
         safe_finite_mass = jnp.where(jnp.isfinite(action_mass), action_mass, 0.0)
-        total_action_mass = jnp.sum(safe_finite_mass)
+        mass_scale = jnp.max(safe_finite_mass)
+        scale_mantissa, scale_exponent = jnp.frexp(mass_scale)
+        safe_mantissa = jnp.where(mass_scale > 0.0, scale_mantissa, 1.0)
+        scaled_mass = jnp.ldexp(safe_finite_mass, -scale_exponent) / safe_mantissa
+        scaled_total = jnp.sum(scaled_mass)
         action_mass_valid = (
             finite
             & nonnegative
-            & jnp.isfinite(total_action_mass)
-            & (total_action_mass > 0.0)
+            & jnp.isfinite(scaled_total)
+            & (scaled_total > 0.0)
         )
-        denominator = jnp.where(action_mass_valid, total_action_mass, 1.0)
+        safe_scaled_total = jnp.where(action_mass_valid, scaled_total, 1.0)
+        total_overflows = mass_scale > _FLOAT32_MAX / safe_scaled_total
+        safe_scale_for_total = jnp.where(
+            total_overflows,
+            _FLOAT32_MAX / safe_scaled_total,
+            mass_scale,
+        )
+        total_action_mass = jnp.where(
+            action_mass_valid,
+            safe_scale_for_total * safe_scaled_total,
+            jnp.sum(safe_finite_mass),
+        )
         normalized = jnp.where(
             action_mass_valid,
-            safe_finite_mass / denominator,
+            scaled_mass / safe_scaled_total,
             jnp.zeros_like(action_mass),
         )
         eligible = hard_safety_mask & (safe_finite_mass > 0.0)
