@@ -254,7 +254,7 @@ class OutOfClassPolynomialStream:
             names="linear_scale and feature_std",
         )
         if type(include_squares) is not bool:
-            raise ValueError(f"include_squares must be a bool, got {include_squares!r}")
+            raise ValueError("include_squares must be a built-in bool")
 
         self._feature_dim = feature_dim
         self._n_tasks = n_tasks

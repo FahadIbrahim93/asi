@@ -402,6 +402,20 @@ class TestOutOfClassPolynomialStream:
         with pytest.raises(ValueError, match="include_squares"):
             OutOfClassPolynomialStream(include_squares=value)  # type: ignore[arg-type]
 
+    def test_include_squares_rejects_invalid_type_without_calling_repr(self) -> None:
+        repr_calls = 0
+
+        class ExplodingRepr:
+            def __repr__(self) -> str:
+                nonlocal repr_calls
+                repr_calls += 1
+                raise RuntimeError("untrusted repr hook executed")
+
+        with pytest.raises(ValueError, match="include_squares"):
+            OutOfClassPolynomialStream(include_squares=ExplodingRepr())  # type: ignore[arg-type]
+
+        assert repr_calls == 0
+
     def test_legal_scalar_endpoints_remain_supported(self) -> None:
         stream = OutOfClassPolynomialStream(
             feature_dim=3,
