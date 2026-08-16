@@ -27,20 +27,58 @@ from __future__ import annotations
 
 import dataclasses
 import functools
-import math
 import time
+from numbers import Real
 from typing import Any
 
 import chex
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import Array
 from jaxtyping import Bool, Float, Int
+
+from alberta_framework._float32 import round_real_to_float32
 
 REWARD_HEAD = 0
 DURATION_HEAD = 1
 N_HEADS = 2
 _INT32_MAX = 2_147_483_647
+
+
+def _require_float32_real(
+    name: str,
+    value: object,
+    *,
+    strictly_positive: bool,
+) -> float:
+    """Validate one host scalar in its exact domain and float32 sink."""
+    domain = "positive" if strictly_positive else "non-negative"
+    preserve_builtin_payload = type(value) is int or type(value) is float
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, Real):
+        raise ValueError(f"{name} must be finite and {domain}")
+    try:
+        if strictly_positive:
+            if value <= 0:
+                raise ValueError
+        elif value < 0:
+            raise ValueError
+        narrowed = round_real_to_float32(value)
+    except (FloatingPointError, OverflowError, TypeError, ValueError) as error:
+        raise ValueError(f"{name} must be finite and {domain}") from error
+    if not bool(np.isfinite(narrowed)):
+        raise ValueError(f"{name} must narrow to a finite float32")
+    if value != 0 and narrowed == 0.0:
+        raise ValueError(f"{name} must not underflow to zero in float32")
+
+    # Preserve already-valid built-in payloads for serialization compatibility.
+    # Non-built-in Real scalars are canonicalized to the exact execution value.
+    if not preserve_builtin_payload:
+        return narrowed
+    number = float(value)
+    with np.errstate(invalid="ignore", over="ignore", under="ignore"):
+        renarrowed = float(np.float32(number))
+    return number if narrowed == renarrowed else narrowed
 
 
 def _saturating_increment(value: Array) -> Array:
@@ -65,13 +103,34 @@ class OptionValueDurationConfig:
     duration_floor: float = 1e-6
 
     def __post_init__(self) -> None:
-        """Validate scalar hyperparameters."""
-        if not math.isfinite(self.reward_step_size) or self.reward_step_size < 0.0:
-            raise ValueError("reward_step_size must be finite and non-negative")
-        if not math.isfinite(self.duration_step_size) or self.duration_step_size < 0.0:
-            raise ValueError("duration_step_size must be finite and non-negative")
-        if not math.isfinite(self.duration_floor) or self.duration_floor <= 0.0:
-            raise ValueError("duration_floor must be finite and positive")
+        """Validate float32 execution values and canonicalize host scalars."""
+        object.__setattr__(
+            self,
+            "reward_step_size",
+            _require_float32_real(
+                "reward_step_size",
+                self.reward_step_size,
+                strictly_positive=False,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "duration_step_size",
+            _require_float32_real(
+                "duration_step_size",
+                self.duration_step_size,
+                strictly_positive=False,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "duration_floor",
+            _require_float32_real(
+                "duration_floor",
+                self.duration_floor,
+                strictly_positive=True,
+            ),
+        )
 
     def to_config(self) -> dict[str, Any]:
         """Return a JSON-serializable configuration."""
