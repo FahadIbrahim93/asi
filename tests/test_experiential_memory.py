@@ -135,6 +135,31 @@ def test_config_json_roundtrip_and_memory_roundtrip() -> None:
     assert reconstructed.persistent_bytes == memory.persistent_bytes
 
 
+def test_single_tiny_positive_neighbor_score_still_has_unit_weight() -> None:
+    memory = ExperientialMemory(
+        _config(
+            distance_scale=1.0,
+            min_similarity=0.0,
+            min_effective_reliability=1.0e-6,
+        )
+    )
+    entry = _entry(8, key=(6.0, 6.0), action=(2.0, 4.0))
+    state = _write(memory, memory.init(), entry)
+
+    retrieval = memory.query(
+        state,
+        jnp.zeros((2,), dtype=jnp.float32),
+        jnp.asarray(1, dtype=jnp.int32),
+        jnp.asarray(0.0, dtype=jnp.float32),
+        jnp.asarray(True, dtype=jnp.bool_),
+    )
+
+    assert bool(retrieval.accepted)
+    np.testing.assert_array_equal(retrieval.neighbor_mask, [True, False])
+    np.testing.assert_allclose(retrieval.neighbor_weights, [1.0, 0.0])
+    np.testing.assert_allclose(retrieval.action, entry.action)
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
