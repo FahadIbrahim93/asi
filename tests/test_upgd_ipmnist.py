@@ -4,7 +4,9 @@ CI-cheap: everything runs on tiny synthetic data. Real-MNIST benchmark runs
 happen only through ``python -m alberta_framework.benchmarks.upgd_ipmnist``.
 """
 
+import hashlib
 import json
+from pathlib import Path
 
 import jax.numpy as jnp
 import jax.random as jr
@@ -659,6 +661,39 @@ class TestNoisePoolMode:
 
 
 class TestPartialMerge:
+    def test_v2_partial_manifest_binds_identity_and_digest_to_one_read(
+        self, tmp_path, monkeypatch
+    ):
+        path = tmp_path / "partial.json"
+        original = json.dumps(
+            {"schema": PARTIAL_SCHEMA, "learner": "adamw", "seed_id": 7}
+        ).encode("utf-8")
+        replacement = json.dumps(
+            {"schema": PARTIAL_SCHEMA, "learner": "upgd_w", "seed_id": 11}
+        )
+        path.write_bytes(original)
+
+        original_read_bytes = Path.read_bytes
+
+        def replace_after_read(target: Path) -> bytes:
+            snapshot = original_read_bytes(target)
+            target.write_text(replacement, encoding="utf-8")
+            return snapshot
+
+        monkeypatch.setattr(Path, "read_bytes", replace_after_read)
+
+        manifest = upgd_ipmnist._v2_partial_manifest([path])
+
+        assert manifest == [
+            {
+                "learner": "adamw",
+                "seed_id": 7,
+                "path": path.as_posix(),
+                "size_bytes": len(original),
+                "sha256": hashlib.sha256(original).hexdigest(),
+            }
+        ]
+
     def test_partial_roundtrip_and_merge(self, tmp_path):
         data_x, data_y = _synthetic_dataset(6, N_TRAIN, TINY.input_dim, TINY.n_classes)
         shard_a = run_ipmnist(data_x, data_y, "upgd_w", seeds=(1,), config=TINY)
