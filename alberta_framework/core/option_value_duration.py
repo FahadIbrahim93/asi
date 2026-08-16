@@ -40,6 +40,13 @@ from jaxtyping import Bool, Float, Int
 REWARD_HEAD = 0
 DURATION_HEAD = 1
 N_HEADS = 2
+_INT32_MAX = 2_147_483_647
+
+
+def _saturating_increment(value: Array) -> Array:
+    """Increment an int32 counter without wrapping at its lifetime limit."""
+    maximum = jnp.asarray(_INT32_MAX, dtype=jnp.int32)
+    return jnp.where(value < maximum, value + jnp.asarray(1, dtype=jnp.int32), maximum)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -322,8 +329,10 @@ class OptionValueDurationLearner:
         update_applied = jnp.any(head_updates_applied)
         proposed_state = state.replace(
             weights=state.weights.at[safe_option_index].set(updated_option_weights),
-            option_update_counts=state.option_update_counts.at[safe_option_index].add(1),
-            step_count=state.step_count + 1,
+            option_update_counts=state.option_update_counts.at[safe_option_index].set(
+                _saturating_increment(state.option_update_counts[safe_option_index])
+            ),
+            step_count=_saturating_increment(state.step_count),
         )
         new_state = jax.lax.cond(
             update_applied,

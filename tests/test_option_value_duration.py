@@ -107,6 +107,29 @@ def test_two_head_td_targets_and_updates_match_exact_analytic_values() -> None:
     assert int(result.state.step_count) == 1
 
 
+def test_applied_update_saturates_lifetime_counters_without_wrapping() -> None:
+    learner = OptionValueDurationLearner(1)
+    int32_max = jnp.iinfo(jnp.int32).max
+    state = learner.init(1).replace(  # type: ignore[attr-defined]
+        option_update_counts=jnp.array([int32_max], dtype=jnp.int32),
+        step_count=jnp.array(int32_max, dtype=jnp.int32),
+    )
+
+    result = learner.update(
+        state,
+        jnp.array([1.0], dtype=jnp.float32),
+        jnp.array(0, dtype=jnp.int32),
+        jnp.array(1.0, dtype=jnp.float32),
+        jnp.array([1.0], dtype=jnp.float32),
+        jnp.array(0.0, dtype=jnp.float32),
+    )
+
+    assert bool(result.update_applied)
+    assert not bool(jnp.array_equal(result.state.weights, state.weights))
+    assert int(result.state.option_update_counts[0]) == int32_max
+    assert int(result.state.step_count) == int32_max
+
+
 def test_termination_discount_zeros_bootstrap_and_no_average_reward_is_subtracted() -> None:
     learner = OptionValueDurationLearner(
         1,
