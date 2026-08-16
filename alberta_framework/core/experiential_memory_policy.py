@@ -253,16 +253,24 @@ class ExperientialMemoryPolicy:
             & (scaled_total > 0.0)
         )
         safe_scaled_total = jnp.where(action_mass_valid, scaled_total, 1.0)
-        total_overflows = mass_scale > _FLOAT32_MAX / safe_scaled_total
-        safe_scale_for_total = jnp.where(
-            total_overflows,
-            _FLOAT32_MAX / safe_scaled_total,
-            mass_scale,
+        # Preserve the legacy direct sum bit-for-bit whenever it is already
+        # finite; only fall back to the scale-reconstructed total when the
+        # direct sum overflows. `jnp.minimum(..., _FLOAT32_MAX)` is a hard
+        # post-hoc clamp: `mass_scale * safe_scaled_total` may itself
+        # overflow to `inf` in float32 (e.g. exactly at the reported bug),
+        # but `minimum` against a finite bound is provably finite regardless
+        # of how the multiplication rounds, unlike reconstructing via
+        # division (`_FLOAT32_MAX / safe_scaled_total`) which can itself
+        # round upward and overflow back past `_FLOAT32_MAX` on
+        # multiplication.
+        direct_total = jnp.sum(safe_finite_mass)
+        saturated_total = jnp.minimum(
+            mass_scale * safe_scaled_total, _FLOAT32_MAX
         )
         total_action_mass = jnp.where(
             action_mass_valid,
-            safe_scale_for_total * safe_scaled_total,
-            jnp.sum(safe_finite_mass),
+            jnp.where(jnp.isfinite(direct_total), direct_total, saturated_total),
+            direct_total,
         )
         normalized = jnp.where(
             action_mass_valid,

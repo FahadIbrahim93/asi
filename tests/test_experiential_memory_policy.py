@@ -265,6 +265,35 @@ def test_finite_action_mass_sum_cannot_overflow_into_false_abstention() -> None:
     )
 
 
+def test_large_finite_action_mass_total_never_overflows_on_rounding() -> None:
+    """Regression for a reviewer-found rounding edge: reconstructing the
+    saturated total via `_FLOAT32_MAX / scaled_total * scaled_total` can
+    itself round upward past `_FLOAT32_MAX` on the multiply, so the fix must
+    be provably finite (a hard `jnp.minimum` clamp) rather than relying on
+    the division alone."""
+    memory = ExperientialMemory(_memory_config())
+    policy = ExperientialMemoryPolicy(memory)
+    rng = np.random.default_rng(1234)
+    float32_max = np.finfo(np.float32).max
+
+    for _ in range(200):
+        action_mass = tuple(
+            float(v)
+            for v in (rng.uniform(0.0, 1.0, size=3).astype(np.float32) * float32_max)
+        )
+        state = _write(
+            memory,
+            memory.init(),
+            _entry(11, action_mass=action_mass),
+        )
+        proposal = _propose(policy, state)
+
+        assert bool(jnp.isfinite(proposal.total_action_mass)), action_mass
+        direct_sum = float(np.sum(np.asarray(action_mass, dtype=np.float32)))
+        if np.isfinite(direct_sum):
+            assert float(proposal.total_action_mass) == direct_sum, action_mass
+
+
 def test_hard_safety_mask_and_lowest_index_tie_break_are_exact() -> None:
     memory = ExperientialMemory(_memory_config())
     policy = ExperientialMemoryPolicy(memory)
