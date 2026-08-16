@@ -54,6 +54,21 @@ class TestRandomWalkStream:
             with pytest.raises(ValueError, match=name):
                 RandomWalkStream(feature_dim=4, **{name: value})
 
+    def test_rejects_class_spoofed_float_params(self):
+        """A __class__-spoofed non-float must not bypass the Real check."""
+
+        class _SpoofedFloat:
+            @property
+            def __class__(self) -> type:  # type: ignore[override]
+                return float
+
+            def __float__(self) -> float:
+                return 0.1
+
+        for name in ("drift_rate", "noise_std", "feature_std"):
+            with pytest.raises(ValueError, match=name):
+                RandomWalkStream(feature_dim=4, **{name: _SpoofedFloat()})
+
     def test_step_produces_valid_timestep(self, rng_key):
         """Step should produce valid observation and target."""
         stream = RandomWalkStream(feature_dim=10)
