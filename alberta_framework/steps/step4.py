@@ -21,7 +21,9 @@ References:
 
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass
+from numbers import Integral, Real
 from typing import Any, Literal, cast
 
 import chex
@@ -71,10 +73,8 @@ class Step4SARSAConfig:
     trace_mode: Literal["accumulating", "replacing"] = "accumulating"
 
     def __post_init__(self) -> None:
-        """Validate action count."""
-        if self.n_actions < 1:
-            msg = f"n_actions must be positive, got {self.n_actions}"
-            raise ValueError(msg)
+        """Reject illegal SARSA scientific scalars and canonicalize reals."""
+        _validate_sarsa_config(self)
 
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-serializable representation."""
@@ -132,6 +132,73 @@ class Step4OneStepResult:
     q_values: Array
     td_error: Array
     reward: Array
+
+
+def _require_real(name: str, value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError(f"{name} must be a real number, got {value!r}")
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(f"{name} must be finite, got {value!r}")
+    return number
+
+
+def _require_unit_interval(name: str, value: object) -> float:
+    number = _require_real(name, value)
+    if not 0.0 <= number <= 1.0:
+        raise ValueError(f"{name} must be in [0, 1], got {value!r}")
+    return number
+
+
+def _require_positive_int(name: str, value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, Integral):
+        raise ValueError(f"{name} must be a positive integer, got {value!r}")
+    number = int(value)
+    if number < 1:
+        raise ValueError(f"{name} must be positive, got {value!r}")
+    return number
+
+
+def _require_nonneg_int(name: str, value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, Integral):
+        raise ValueError(f"{name} must be a non-negative integer, got {value!r}")
+    number = int(value)
+    if number < 0:
+        raise ValueError(f"{name} must be a non-negative integer, got {value!r}")
+    return number
+
+
+def _validate_sarsa_config(config: Step4SARSAConfig) -> None:
+    n_actions = _require_positive_int("n_actions", config.n_actions)
+    hidden_sizes = tuple(
+        _require_positive_int("hidden_sizes", size) for size in config.hidden_sizes
+    )
+    gamma = _require_unit_interval("gamma", config.gamma)
+    epsilon_start = _require_unit_interval("epsilon_start", config.epsilon_start)
+    epsilon_end = _require_unit_interval("epsilon_end", config.epsilon_end)
+    epsilon_decay_steps = _require_nonneg_int("epsilon_decay_steps", config.epsilon_decay_steps)
+    lamda = _require_unit_interval("lamda", config.lamda)
+    step_size = _require_real("step_size", config.step_size)
+    if step_size < 0.0:
+        raise ValueError(f"step_size must be non-negative, got {config.step_size!r}")
+    meta_step_size = _require_real("meta_step_size", config.meta_step_size)
+    if meta_step_size < 0.0:
+        raise ValueError(f"meta_step_size must be non-negative, got {config.meta_step_size!r}")
+    bounder_kappa = _require_real("bounder_kappa", config.bounder_kappa)
+    if bounder_kappa <= 0.0:
+        raise ValueError(f"bounder_kappa must be positive, got {config.bounder_kappa!r}")
+    sparsity = _require_unit_interval("sparsity", config.sparsity)
+    object.__setattr__(config, "n_actions", n_actions)
+    object.__setattr__(config, "hidden_sizes", hidden_sizes)
+    object.__setattr__(config, "gamma", gamma)
+    object.__setattr__(config, "epsilon_start", epsilon_start)
+    object.__setattr__(config, "epsilon_end", epsilon_end)
+    object.__setattr__(config, "epsilon_decay_steps", epsilon_decay_steps)
+    object.__setattr__(config, "lamda", lamda)
+    object.__setattr__(config, "step_size", step_size)
+    object.__setattr__(config, "meta_step_size", meta_step_size)
+    object.__setattr__(config, "bounder_kappa", bounder_kappa)
+    object.__setattr__(config, "sparsity", sparsity)
 
 
 def make_step4_optimizer(config: Step4SARSAConfig) -> Any:
