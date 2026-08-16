@@ -602,6 +602,8 @@ def run_scale_robust_feature_evaluation(
             stream while being recorded as different identities.
     """
 
+    if type(seeds) not in (list, tuple):
+        raise ValueError("seeds must be an actual list or tuple")
     seed_schedule = require_unique_jax_seeds(seeds, name="seeds")
 
     stream = GauntletStream(frozen_stream_config())

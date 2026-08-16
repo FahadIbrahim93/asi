@@ -77,6 +77,32 @@ def test_rejects_duplicate_seeds() -> None:
         run_scale_robust_feature_evaluation(seeds=(5, 5))
 
 
+def test_rejects_noncanonical_seed_container_before_hooks() -> None:
+    class ListSubclass(list[int]):
+        pass
+
+    class TupleSubclass(tuple[int, ...]):
+        pass
+
+    class SequenceSpoof:
+        @property  # type: ignore[misc]
+        def __class__(self) -> type:
+            return tuple
+
+        def __iter__(self) -> object:
+            raise AssertionError("iteration hook executed")
+
+        def __len__(self) -> int:
+            raise AssertionError("length hook executed")
+
+        def __repr__(self) -> str:
+            raise AssertionError("repr hook executed")
+
+    for bad_seeds in (ListSubclass([1]), TupleSubclass((1,)), SequenceSpoof()):
+        with pytest.raises(ValueError, match="actual list or tuple"):
+            run_scale_robust_feature_evaluation(seeds=bad_seeds)  # type: ignore[arg-type]
+
+
 def test_out_of_range_seed_would_alias_an_in_range_seed() -> None:
     """Document the exact corruption the domain bound prevents.
 
