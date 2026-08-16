@@ -483,6 +483,46 @@ def test_step11_oak_narrows_the_original_real_once() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("pseudo_reward_scale", "expected"),
+    [
+        (
+            Fraction(1, 1) + Fraction(1, 2**24) - Fraction(1, 2**60),
+            1.0,
+        ),
+        (Fraction(1, 1) + Fraction(1, 2**24), 1.0),
+        (
+            Fraction(1, 1) + Fraction(1, 2**24) + Fraction(1, 2**60),
+            float(np.nextafter(np.float32(1.0), np.float32(2.0))),
+        ),
+    ],
+    ids=("below", "tie-to-even", "above"),
+)
+def test_step11_oak_rounds_fraction_midpoints_once(
+    pseudo_reward_scale: Fraction,
+    expected: float,
+) -> None:
+    config = Step11OaKConfig(
+        subtask_specs=(
+            SubtaskSpec(
+                feature_index=0,
+                pseudo_reward_scale=pseudo_reward_scale,
+            ),
+        ),
+    )
+    assert config.subtask_specs[0].pseudo_reward_scale == expected
+
+
+def test_step11_fraction_float32_overflow_midpoint_is_exact() -> None:
+    maximum = Fraction((2**24 - 1) * 2**104)
+    overflow_midpoint = maximum + 2**103
+
+    just_below = Step11OaKConfig(base_step_size=overflow_midpoint - 1)
+    assert just_below.base_step_size == float(np.finfo(np.float32).max)
+    with pytest.raises(ValueError, match="base_step_size"):
+        Step11OaKConfig(base_step_size=overflow_midpoint)
+
+
 def test_step11_oak_preserves_float32_boundaries() -> None:
     f32_max = float(np.finfo(np.float32).max)
     f32_min = float(np.finfo(np.float32).min)

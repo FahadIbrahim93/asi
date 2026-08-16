@@ -37,6 +37,7 @@ import jax.random as jr
 import numpy as np
 from jax import Array
 
+from alberta_framework._float32 import round_real_to_float32
 from alberta_framework.core.oak import (
     KeyboardChordLearnerConfig,
     KeyboardChordLearnerState,
@@ -169,13 +170,12 @@ def _require_real(name: str, value: object) -> float:
     if isinstance(value, bool) or not isinstance(value, Real):
         raise ValueError(f"{name} must be a real number, got {value!r}")
     try:
-        with np.errstate(over="ignore", under="ignore", invalid="ignore"):
-            execution_value = np.asarray(value, dtype=np.float32).reshape(())
-    except (OverflowError, TypeError, ValueError) as error:
+        execution_value = round_real_to_float32(value)
+    except (FloatingPointError, OverflowError, TypeError, ValueError) as error:
         raise ValueError(f"{name} must be finite in float32, got {value!r}") from error
     if not bool(np.isfinite(execution_value)):
         raise ValueError(f"{name} must be finite, got {value!r}")
-    return float(execution_value)
+    return execution_value
 
 
 def _require_unit_interval(name: str, value: object) -> float:
