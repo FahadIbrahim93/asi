@@ -17,8 +17,8 @@ from alberta_framework.steps.step3 import Step3HordeConfig
 from alberta_framework.steps.step4 import Step4SARSAConfig
 from alberta_framework.steps.step5 import Step5AverageRewardTDConfig
 from alberta_framework.steps.step7 import Step7DynaConfig
-from alberta_framework.steps.step8 import Step8WorldModelConfig
-from alberta_framework.steps.step9 import Step9DreamingConfig
+from alberta_framework.steps.step8 import Step8WorldModelConfig, make_step8_world_model
+from alberta_framework.steps.step9 import Step9DreamingConfig, make_step9_components
 from alberta_framework.steps.step10 import Step10STOMPConfig
 
 _FacadeValues = Callable[[object], tuple[float, ...]]
@@ -257,6 +257,43 @@ def test_nonnegative_field_rejects_negative_value_that_underflows() -> None:
 def test_unit_interval_rejects_exact_value_above_endpoint() -> None:
     with pytest.raises(ValueError, match=r"gamma must be in \[0, 1\]"):
         Step4SARSAConfig(gamma=Fraction(1, 1) + Fraction(1, 2**200))
+
+
+@pytest.mark.parametrize(
+    ("config_type", "field"),
+    [
+        pytest.param(Step8WorldModelConfig, "utility_decay", id="step8"),
+        pytest.param(Step9DreamingConfig, "model_error_decay", id="step9"),
+    ],
+)
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param(Fraction(1, 1) - Fraction(1, 2**25), id="exact-tie"),
+        pytest.param(Fraction(1, 1) - Fraction(1, 2**200), id="exact-rational"),
+        pytest.param(math.nextafter(1.0, 0.0), id="builtin-float"),
+    ],
+)
+def test_half_open_interval_rejects_value_that_rounds_to_one(
+    config_type: type[Step8WorldModelConfig] | type[Step9DreamingConfig],
+    field: str,
+    value: object,
+) -> None:
+    with pytest.raises(ValueError, match=rf"{field} must be in \[0, 1\)"):
+        config_type(**{field: cast(Any, value)})
+
+
+def test_half_open_interval_accepts_value_that_rounds_below_one() -> None:
+    value = Fraction(1, 1) - Fraction(1, 2**25) - Fraction(1, 2**200)
+    expected = float(np.nextafter(np.float32(1.0), np.float32(0.0)))
+
+    step8 = Step8WorldModelConfig(utility_decay=value)
+    step9 = Step9DreamingConfig(model_error_decay=value)
+
+    assert step8.utility_decay == expected
+    assert step9.model_error_decay == expected
+    make_step8_world_model(step8)
+    make_step9_components(step9)
 
 
 def test_finite_overflow_boundary_accepts_below_and_rejects_tie() -> None:
