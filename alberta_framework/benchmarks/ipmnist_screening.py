@@ -5068,6 +5068,137 @@ def _make_l2init_ema_norm_learner(
     return init_fn, full_step
 
 
+@chex.dataclass(frozen=True)
+class UPGDGatedL2InitNormState:
+    """Lean-UPGD utility EMA/clock, a frozen copy of the initial parameters,
+    and the EMA input-normalizer state (see
+    :func:`_make_sigma0_gated_l2init_learner`)."""
+
+    utility: dict[str, Array]
+    step: Array
+    init_params: dict[str, Array]
+    norm: EMANormState
+
+
+def _make_sigma0_gated_l2init_learner(
+    hp: Mapping[str, float],
+) -> tuple[LearnerInitFn, ScreeningStepFn]:
+    """``sigma0_ndecay099`` baseline plus an additive, utility-gated pull
+    toward the initial weights.
+
+    Ported idea: continuous utility-scaled soft resets (CCBP,
+    OpenReview:UJqXhFFzKu; Calibrated Partial Resets, arXiv:2607.24996)
+    report that a *continuous*, per-unit-utility-scaled partial pull of
+    every hidden parameter toward its initial value dominates both
+    decay-based (L2/Shrink-and-Perturb) and hard-reset (CBP/ReDO) methods at
+    long horizons. This arm tests that mechanism's isolated marginal
+    contribution on top of that historical baseline, reusing the baseline's own
+    UPGD utility gate as the per-unit "graded reset" weight: ``1 - gate`` is
+    large for low-utility (unprotected) units and near zero for high-utility
+    (protected) ones, so the pull toward init is concentrated exactly where
+    the source papers' utility-scaled reset is meant to act. ``sigma0_ndecay099``
+    exposes no separate hidden-unit-firing utility signal of its own (unlike
+    CBP-family arms), so the UPGD gate is the closest available substitute
+    -- a documented deviation from the source papers' own utility statistic.
+
+    Deviation from the source papers: they replace their baseline's
+    decay/reset term outright; here the pull is an ADDITIVE new term next to
+    the baseline's existing uniform decoupled weight decay (rather than a
+    replacement), so this measures the isolated contribution of graded,
+    utility-gated pull-toward-init rather than a full swap of the
+    regularizer family.
+
+    ``l2init_pull_scale = 0`` (the default) is inert: the new term is
+    multiplied by exactly zero and the step routes through the identical
+    ``lean_upgd_w_update`` call the baseline factory's own inert path uses,
+    so the trajectory is bit-exact against ``sigma0_ndecay099`` (pinned by a
+    unit test) rather than relying on floating-point cancellation of a zero
+    term.
+    """
+    noise_std = hp["noise_std"]
+    norm_decay = hp["norm_decay"]
+    norm_epsilon = hp["norm_epsilon"]
+    pull_scale = hp.get("l2init_pull_scale", 0.0)
+    lean_hp = {
+        name: hp[name] for name in ("step_size", "utility_decay", "noise_std", "weight_decay")
+    }
+
+    def init_fn(params: dict[str, Array]) -> UPGDGatedL2InitNormState:
+        return UPGDGatedL2InitNormState(  # type: ignore[call-arg]
+            utility={name: jnp.zeros_like(value) for name, value in params.items()},
+            step=jnp.array(0, dtype=jnp.int32),
+            init_params={name: value for name, value in params.items()},
+            norm=_init_input_norm_state(params),
+        )
+
+    def full_step(
+        params: dict[str, Array],
+        state: UPGDGatedL2InitNormState,
+        x: Array,
+        y: Array,
+        key: Array,
+    ) -> tuple[dict[str, Array], UPGDGatedL2InitNormState, StepMetrics]:
+        x_norm, new_norm = ema_normalize(state.norm, x, norm_decay, norm_epsilon)
+        (loss, logits), grads = jax.value_and_grad(cross_entropy_loss, has_aux=True)(
+            params, x_norm, y
+        )
+        noise = _sorted_flat_noise(key, params, noise_std)
+        if pull_scale == 0.0:
+            # Exact champion path: call the identical function the champion
+            # factory's own inert path calls, rather than relying on
+            # floating-point cancellation of a zero-scaled extra term.
+            lean_state = LeanUPGDState(  # type: ignore[call-arg]
+                utility=state.utility, step=state.step
+            )
+            inert_new_params, new_lean = lean_upgd_w_update(
+                params, lean_state, grads, noise, lean_hp
+            )
+            metrics = _step_metrics(inert_new_params, x_norm, y, loss, logits)
+            return (
+                inert_new_params,
+                UPGDGatedL2InitNormState(  # type: ignore[call-arg]
+                    utility=new_lean.utility,
+                    step=new_lean.step,
+                    init_params=state.init_params,
+                    norm=new_norm,
+                ),
+                metrics,
+            )
+        beta = hp["utility_decay"]
+        step_size = hp["step_size"]
+        decay_factor = 1.0 - step_size * hp["weight_decay"]
+        count = state.step + jnp.array(1, dtype=jnp.int32)
+        utility = {
+            name: beta * state.utility[name] + (1.0 - beta) * (-grads[name] * params[name])
+            for name in params
+        }
+        global_max = jnp.max(
+            jnp.stack([jnp.max(utility[name]) for name in sorted(params)])
+        )
+        bias_correction = 1.0 - jnp.power(
+            jnp.asarray(beta, dtype=jnp.float32), count.astype(jnp.float32)
+        )
+        new_params: dict[str, Array] = {}
+        for name in params:
+            gate = jax.nn.sigmoid((utility[name] / bias_correction) / global_max)
+            pull = pull_scale * (1.0 - gate) * (params[name] - state.init_params[name])
+            new_params[name] = (
+                params[name] * decay_factor
+                - step_size * pull
+                - step_size * ((grads[name] + noise[name]) * (1.0 - gate))
+            )
+        metrics = _step_metrics(new_params, x_norm, y, loss, logits)
+        return (
+            new_params,
+            UPGDGatedL2InitNormState(  # type: ignore[call-arg]
+                utility=utility, step=count, init_params=state.init_params, norm=new_norm
+            ),
+            metrics,
+        )
+
+    return init_fn, full_step
+
+
 # =============================================================================
 # Config registry
 # =============================================================================
@@ -5675,6 +5806,23 @@ def _build_registry() -> dict[str, ScreeningSpec]:
                 ),
             )
         )
+    specs.append(
+        ScreeningSpec(
+            name="sigma0_ndecay099_gated_l2init",
+            base_learner="upgd_w",
+            mechanism="gated_l2_init",
+            hyperparameters=_sigma0_ext_hp(norm_decay=0.99, l2init_pull_scale=0.01),
+            factory=_make_sigma0_gated_l2init_learner,
+            frozen_probe_input=_ema_frozen_probe_input,
+            description=(
+                "sigma0_ndecay099 historical baseline plus an additive utility-gated pull "
+                "toward init (CCBP/Calibrated-Partial-Resets-style graded reset; "
+                "l2init_pull_scale=0.01, matching the repo's established L2-Init "
+                "regularization strength); l2init_pull_scale=0 reduces bit-exactly "
+                "to the baseline."
+            ),
+        )
+    )
     # --- Wave 8: update-rule family swaps under the sigma0_ndecay099 champion's
     # conditioning (EMA input normalizer decay 0.99 + the exact UPGD utility
     # gate, no perturbation).  Only the descent direction changes per arm.
