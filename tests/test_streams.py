@@ -398,9 +398,20 @@ class TestMakeScaleRange:
 
     @pytest.mark.parametrize(
         ("min_scale", "max_scale"),
-        [(-1.0, 100.0), (0.01, -100.0)],
+        [
+            pytest.param(-1.0, 100.0, id="min-negative"),
+            pytest.param(0.01, -100.0, id="max-negative"),
+            pytest.param(0.0, 100.0, id="min-zero"),
+            pytest.param(0.01, 0.0, id="max-zero"),
+            pytest.param(float("nan"), 100.0, id="min-nan"),
+            pytest.param(0.01, float("nan"), id="max-nan"),
+            pytest.param(float("inf"), 100.0, id="min-positive-infinity"),
+            pytest.param(0.01, float("inf"), id="max-positive-infinity"),
+            pytest.param(float("-inf"), 100.0, id="min-negative-infinity"),
+            pytest.param(0.01, float("-inf"), id="max-negative-infinity"),
+        ],
     )
-    def test_log_spaced_range_rejects_nonpositive_bounds(
+    def test_log_spaced_range_rejects_invalid_bounds(
         self,
         min_scale,
         max_scale,
