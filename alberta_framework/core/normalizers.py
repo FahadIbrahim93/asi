@@ -36,6 +36,12 @@ from alberta_framework.core.update_safety import (
     floating_tree_is_finite as _floating_tree_is_finite,
 )
 
+
+def _skip_zero_scale(scale: Array, value: Array) -> Array:
+    """Skip ``0 * inf`` so a disabled decay does not poison the next moment."""
+    return jnp.where(scale == 0.0, jnp.zeros_like(value), scale * value)
+
+
 NORMALIZER_STATE_SCHEMA = "alberta.normalizer-state.v2"
 WELFORD_ESTIMATOR_SCHEMA = "alberta.welford-cumulative-float32-fail-stop-at-2p24.v2"
 BOUNDED_RECENCY_ESTIMATOR_SEMANTICS = "bounded-recency"
@@ -485,7 +491,15 @@ class EMANormalizer(Normalizer[EMANormalizerState]):
         """
         status = self.counter_status(state)
         observation_valid = jnp.all(jnp.isfinite(observation))
-        source_state_finite = _floating_tree_is_finite(state)
+        checked_state = (
+            state.replace(
+                mean=jnp.zeros_like(state.mean),
+                var=jnp.ones_like(state.var),
+            )
+            if self._decay == 0.0
+            else state
+        )
+        source_state_finite = _floating_tree_is_finite(checked_state)
         update_available = (
             status.update_available & observation_valid & source_state_finite
         )
@@ -501,9 +515,17 @@ class EMANormalizer(Normalizer[EMANormalizerState]):
                 1.0 - 1.0 / (new_count_float + 1.0),
             )
             delta = observation - state.mean
-            new_mean = state.mean + (1.0 - effective_decay) * delta
+            new_mean = jnp.where(
+                effective_decay == 0.0,
+                observation,
+                state.mean + (1.0 - effective_decay) * delta,
+            )
             delta2 = observation - new_mean
-            new_var = effective_decay * state.var + (1.0 - effective_decay) * delta * delta2
+            new_var = jnp.where(
+                effective_decay == 0.0,
+                delta2 * delta2,
+                effective_decay * state.var + (1.0 - effective_decay) * delta * delta2,
+            )
             new_var = jnp.maximum(new_var, self._epsilon)
             normalized = (observation - new_mean) / (jnp.sqrt(new_var) + self._epsilon)
             return normalized, EMANormalizerState(
@@ -737,7 +759,15 @@ class StreamingBatchNormalizer(Normalizer[StreamingBatchNormalizerState]):
         """Normalize and conditionally commit BatchNorm-style moments."""
         status = self.counter_status(state)
         observation_valid = jnp.all(jnp.isfinite(observation))
-        source_state_finite = _floating_tree_is_finite(state)
+        checked_state = (
+            state.replace(
+                mean=jnp.zeros_like(state.mean),
+                var=jnp.ones_like(state.var),
+            )
+            if self._momentum == 0.0
+            else state
+        )
+        source_state_finite = _floating_tree_is_finite(checked_state)
         update_available = (
             status.update_available & observation_valid & source_state_finite
         )
@@ -749,10 +779,19 @@ class StreamingBatchNormalizer(Normalizer[StreamingBatchNormalizerState]):
             del ignored_capacity
             is_first = _lifetime_words_are_zero(state.sample_count_words)
             one_minus_m = 1.0 - state.momentum
-            candidate_mean = state.momentum * state.mean + one_minus_m * observation
+            candidate_mean = (
+                _skip_zero_scale(state.momentum, state.mean) + one_minus_m * observation
+            )
             new_mean = jnp.where(is_first, observation, candidate_mean)
-            centered = observation - state.mean
-            candidate_var = state.momentum * state.var + one_minus_m * (centered * centered)
+            centered = jnp.where(
+                state.momentum == 0.0,
+                observation - new_mean,
+                observation - state.mean,
+            )
+            candidate_var = (
+                _skip_zero_scale(state.momentum, state.var)
+                + one_minus_m * (centered * centered)
+            )
             new_var = jnp.where(
                 is_first,
                 jnp.ones_like(state.var),

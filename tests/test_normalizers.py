@@ -91,6 +91,25 @@ class TestEMANormalizer:
         # (not exact due to decay and numerical issues)
         chex.assert_trees_all_close(state.mean, sample_observation, atol=0.5)
 
+    def test_zero_decay_does_not_multiply_inf_moments(self):
+        """decay=0 times an infinite mean or variance is NaN."""
+        normalizer = EMANormalizer(decay=0.0)
+        obs = jnp.array([1.0, -2.0], dtype=jnp.float32)
+        state = normalizer.normalize(normalizer.init(2), obs)[1]
+        state = state.replace(
+            mean=jnp.full(2, jnp.inf, dtype=jnp.float32),
+            var=jnp.full(2, jnp.inf, dtype=jnp.float32),
+        )
+        raw = jnp.asarray(0.0, dtype=jnp.float32) * jnp.asarray(jnp.inf, dtype=jnp.float32)
+        assert not bool(jnp.isfinite(raw))
+
+        result = normalizer.normalize_with_diagnostics(state, obs)
+        assert bool(result.update_applied)
+        chex.assert_trees_all_close(result.state.mean, obs)
+        chex.assert_tree_all_finite(result.state.var)
+        chex.assert_tree_all_finite(result.normalized)
+
+
 class TestWelfordNormalizer:
     """Tests for the WelfordNormalizer class."""
 
@@ -214,6 +233,25 @@ class TestStreamingBatchNormalizer:
         assert isinstance(restored, StreamingBatchNormalizer)
         assert restored._momentum == 0.75
         assert restored._epsilon == 1e-4
+
+
+    def test_zero_momentum_does_not_multiply_inf_moments(self):
+        """momentum=0 times an infinite mean or variance is NaN."""
+        normalizer = StreamingBatchNormalizer(momentum=0.0)
+        obs = jnp.array([1.0, -2.0], dtype=jnp.float32)
+        state = normalizer.normalize(normalizer.init(2), obs)[1]
+        state = state.replace(
+            mean=jnp.full(2, jnp.inf, dtype=jnp.float32),
+            var=jnp.full(2, jnp.inf, dtype=jnp.float32),
+        )
+        raw = jnp.asarray(0.0, dtype=jnp.float32) * jnp.asarray(jnp.inf, dtype=jnp.float32)
+        assert not bool(jnp.isfinite(raw))
+
+        result = normalizer.normalize_with_diagnostics(state, obs)
+        assert bool(result.update_applied)
+        chex.assert_trees_all_close(result.state.mean, obs)
+        chex.assert_tree_all_finite(result.state.var)
+        chex.assert_tree_all_finite(result.normalized)
 
 
 class TestNormalizerABC:
