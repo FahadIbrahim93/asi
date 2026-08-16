@@ -71,6 +71,9 @@ class WorkingMemoryConfig:
     gate_threshold: float = 0.0
     gate_temperature: float = 1.0
 
+    def __post_init__(self) -> None:
+        _validate_config(self)
+
     def feature_dim(self) -> int:
         """Return the working-memory feature dimensionality."""
         dim = 0
@@ -182,30 +185,62 @@ class WorkingMemoryArrayResult:
 
 
 def _validate_decay_rates(name: str, rates: tuple[float, ...]) -> None:
-    if any(not math.isfinite(rate) or rate < 0.0 or rate >= 1.0 for rate in rates):
-        raise ValueError(f"{name} must contain finite values in [0, 1); got {rates}")
+    if not isinstance(rates, tuple):
+        raise ValueError(f"{name} must be a tuple")
+    for v in rates:
+        if isinstance(v, bool) or not isinstance(v, int | float):
+            raise ValueError(f"{name} must contain finite values in [0, 1); got {rates!r}")
+        if not math.isfinite(float(v)) or v < 0.0 or v >= 1.0:
+            raise ValueError(f"{name} must contain finite values in [0, 1); got {rates!r}")
 
 
 def _validate_config(config: WorkingMemoryConfig) -> None:
+    if isinstance(config.observation_dim, bool) or not isinstance(config.observation_dim, int):
+        raise ValueError("observation_dim must be an int")
     if config.observation_dim < 1:
         raise ValueError("observation_dim must be positive")
+    if isinstance(config.action_dim, bool) or not isinstance(config.action_dim, int):
+        raise ValueError("action_dim must be an int")
     if config.action_dim < 0:
         raise ValueError("action_dim must be non-negative")
+    if isinstance(config.reward_dim, bool) or not isinstance(config.reward_dim, int):
+        raise ValueError("reward_dim must be an int")
     if config.reward_dim < 0:
         raise ValueError("reward_dim must be non-negative")
     _validate_decay_rates("observation_decay_rates", config.observation_decay_rates)
     _validate_decay_rates("action_decay_rates", config.action_decay_rates)
     _validate_decay_rates("reward_decay_rates", config.reward_decay_rates)
-    if not math.isfinite(config.gate_temperature) or config.gate_temperature <= 0.0:
-        raise ValueError("gate_temperature must be finite and positive")
-    if not math.isfinite(config.gate_threshold) or config.gate_threshold < 0.0:
+    if isinstance(config.gate_threshold, bool) or not isinstance(
+        config.gate_threshold, int | float
+    ):
+        raise ValueError("gate_threshold must be finite")
+    if not math.isfinite(float(config.gate_threshold)) or config.gate_threshold < 0.0:
         raise ValueError("gate_threshold must be finite and non-negative")
+    if isinstance(config.gate_temperature, bool) or not isinstance(
+        config.gate_temperature, int | float
+    ):
+        raise ValueError("gate_temperature must be finite")
+    if not math.isfinite(float(config.gate_temperature)) or config.gate_temperature <= 0.0:
+        raise ValueError("gate_temperature must be finite and positive")
+    for name in (
+        "include_current_observation",
+        "include_current_action",
+        "include_current_reward",
+        "include_traces",
+        "include_innovations",
+        "gated_update",
+    ):
+        if not isinstance(getattr(config, name), bool):
+            raise ValueError(f"{name} must be a bool")
     if config.feature_dim() < 1:
         raise ValueError("configuration must produce at least one feature")
 
 
 def _empty_or_vector(value: Array, dim: int) -> Array:
-    return jnp.asarray(value, dtype=jnp.float32).reshape((dim,))
+    arr = jnp.asarray(value, dtype=jnp.float32)
+    if arr.shape != (dim,):
+        raise ValueError(f"vector must have shape ({dim},) (got {arr.shape})")
+    return arr
 
 
 def _trace_bank(decay_count: int, dim: int) -> Array:
@@ -523,13 +558,37 @@ def transform_working_memory_arrays(
     external_gates: Float[Array, " steps"] | None = None,
 ) -> WorkingMemoryArrayResult:
     """Transform arrays and expose one checked transaction mask per event."""
+    _obs = jnp.asarray(observations)
+    _act = jnp.asarray(actions)
+    _rew = jnp.asarray(rewards)
+    cfg = featurizer.config
+    if _obs.ndim != 2 or _obs.shape[1] != cfg.observation_dim:
+        raise ValueError(
+            f"observations must have shape (steps, {cfg.observation_dim}) (got {_obs.shape})"
+        )
+    if _act.ndim != 2 or _act.shape[1] != cfg.action_dim:
+        raise ValueError(
+            f"actions must have shape (steps, {cfg.action_dim}) (got {_act.shape})"
+        )
+    if _rew.ndim != 2 or _rew.shape[1] != cfg.reward_dim:
+        raise ValueError(
+            f"rewards must have shape (steps, {cfg.reward_dim}) (got {_rew.shape})"
+        )
+    steps = _obs.shape[0]
+    if _act.shape[0] != steps or _rew.shape[0] != steps:
+        raise ValueError(
+            "observations/actions/rewards leading dims must match "
+            f"(got {_obs.shape[0]}, {_act.shape[0]}, {_rew.shape[0]})"
+        )
     if state is None:
         state = featurizer.init()
     gates = (
-        jnp.ones((observations.shape[0],), dtype=jnp.float32)
+        jnp.ones((steps,), dtype=jnp.float32)
         if external_gates is None
         else jnp.asarray(external_gates, dtype=jnp.float32)
     )
+    if gates.shape != (steps,):
+        raise ValueError(f"external_gates must have shape ({steps},) (got {gates.shape})")
 
     def step_fn(
         carry: WorkingMemoryState,
@@ -542,7 +601,7 @@ def transform_working_memory_arrays(
     final_state, (features, updates_applied) = jax.lax.scan(
         step_fn,
         state,
-        (observations, actions, rewards, gates),
+        (_obs, _act, _rew, gates),
     )
     return WorkingMemoryArrayResult(
         state=final_state,
