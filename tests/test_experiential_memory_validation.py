@@ -343,31 +343,10 @@ def test_experiential_memory_exact_serialized_boundaries() -> None:
 
 
 @pytest.mark.parametrize("field", ["staleness_scale", "recency_scale"])
-def test_age_scale_rejects_float32_division_overflow(field: str) -> None:
-    with pytest.raises(ValueError, match=field):
-        ExperientialMemoryConfig(
-            capacity=4,
-            observation_dim=2,
-            key_dim=2,
-            action_dim=1,
-            outcome_dim=1,
-            **{field: np.nextafter(np.float32(0.0), np.float32(1.0))},
-        )
-
-
-@pytest.mark.parametrize("field", ["staleness_scale", "recency_scale"])
-def test_age_scale_accepts_first_float32_value_with_finite_saturated_division(
+def test_age_scale_accepts_smallest_positive_float32_without_operation_overflow(
     field: str,
 ) -> None:
-    maximum = np.float32(np.iinfo(np.int32).max)
-    rounded_boundary = np.float32(
-        np.iinfo(np.int32).max / float(np.finfo(np.float32).max)
-    )
-    safe = np.nextafter(rounded_boundary, np.float32(np.inf), dtype=np.float32)
-    unsafe = np.nextafter(safe, np.float32(0.0), dtype=np.float32)
-    with np.errstate(over="ignore"):
-        assert not np.isfinite(maximum / unsafe)
-        assert np.isfinite(maximum / safe)
+    smallest = np.nextafter(np.float32(0.0), np.float32(1.0))
     common = {
         "capacity": 4,
         "observation_dim": 2,
@@ -375,10 +354,8 @@ def test_age_scale_accepts_first_float32_value_with_finite_saturated_division(
         "action_dim": 1,
         "outcome_dim": 1,
     }
-    with pytest.raises(ValueError, match=field):
-        ExperientialMemoryConfig(**common, **{field: unsafe})
-    config = ExperientialMemoryConfig(**common, **{field: safe})
-    assert getattr(config, field) == float(safe)
+    config = ExperientialMemoryConfig(**common, **{field: smallest})
+    assert getattr(config, field) == float(smallest)
 
 
 def test_aggregate_query_working_set_is_bounded_before_jax_allocation() -> None:
