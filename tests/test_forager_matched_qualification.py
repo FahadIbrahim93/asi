@@ -1913,6 +1913,9 @@ def test_probe_result_accepts_only_reward_blind_unendorsed_payload(tmp_path: Pat
         (None, "qualification_seed", 0.0),
         ("seed_resolution", "requested_seed", False),
         ("reward_blind_boundary", "environment_resets", True),
+        ("configuration", "round_trip_accepted", 1),
+        ("authority", "content_only", 1),
+        ("authority", "promotion_authorized", 0),
     ],
 )
 def test_persisted_probe_rejects_wrong_type_numeric_aliases(

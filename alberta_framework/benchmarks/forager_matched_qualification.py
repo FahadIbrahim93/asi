@@ -4580,12 +4580,15 @@ def _verify_probe_payload(
         "upstream_drqn": "PyExpUtils.ExperimentModel+problem.registry",
         "upstream_search_oracle": "PyExpUtils.ExperimentModel+problem.registry",
     }[invocation.implementation_kind]
-    if configuration != {
-        "path": _CONTAINER_WORK_CONFIG,
-        "sha256": invocation.configuration_sha256,
-        "parser_identity": parser_identity,
-        "round_trip_accepted": True,
-    }:
+    if not _json_exact_equal(
+        configuration,
+        {
+            "path": _CONTAINER_WORK_CONFIG,
+            "sha256": invocation.configuration_sha256,
+            "parser_identity": parser_identity,
+            "round_trip_accepted": True,
+        },
+    ):
         raise ForagerMatchedQualificationError("persisted probe configuration drifted")
 
     required_literals = {
@@ -4747,16 +4750,18 @@ def _verify_probe_payload(
                 "benchmark_seeds_used": [],
             },
         )
-        or authority
-        != {
-            "identity": MATCHED_CURRENT_AUTHORITY_IDENTITY,
-            "content_only": True,
-            "externally_endorsed": False,
-            "external_signature_created": False,
-            "trust_profile_created": False,
-            "promotion_authorized": False,
-            "performance_claim": False,
-        }
+        or not _json_exact_equal(
+            authority,
+            {
+                "identity": MATCHED_CURRENT_AUTHORITY_IDENTITY,
+                "content_only": True,
+                "externally_endorsed": False,
+                "external_signature_created": False,
+                "trust_profile_created": False,
+                "promotion_authorized": False,
+                "performance_claim": False,
+            },
+        )
     ):
         raise ForagerMatchedQualificationError(
             "persisted probe crossed its reward-blind authority boundary"
