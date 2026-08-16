@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import math
 from typing import Any
 
 import chex
@@ -788,6 +789,16 @@ class ContinuousActorCriticAgent:
             raise ValueError("action_dim must be positive")
         if config.log_sigma_min > config.log_sigma_max:
             raise ValueError("log_sigma_min must be <= log_sigma_max")
+        for name in ("action_low", "action_high"):
+            bound = getattr(config, name)
+            if bound is not None and not math.isfinite(bound):
+                raise ValueError(f"{name} must be finite when set")
+        if (
+            config.action_low is not None
+            and config.action_high is not None
+            and config.action_low > config.action_high
+        ):
+            raise ValueError("action_low must be <= action_high")
         self._config = config
         self._bounder = bounder
 
