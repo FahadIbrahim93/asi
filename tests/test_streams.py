@@ -3,6 +3,7 @@
 import chex
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 
 from alberta_framework import (
@@ -395,6 +396,123 @@ class TestMakeScaleRange:
         chex.assert_trees_all_close(scales[-1], jnp.array(100.0), rtol=1e-5)
         # Middle value should be geometric mean ≈ 1.0
         chex.assert_trees_all_close(scales[2], jnp.array(1.0), rtol=0.1)
+
+    @pytest.mark.parametrize(
+        ("min_scale", "max_scale"),
+        [
+            pytest.param(-1.0, 100.0, id="min-negative"),
+            pytest.param(0.01, -100.0, id="max-negative"),
+            pytest.param(0.0, 100.0, id="min-zero"),
+            pytest.param(0.01, 0.0, id="max-zero"),
+            pytest.param(float("nan"), 100.0, id="min-nan"),
+            pytest.param(0.01, float("nan"), id="max-nan"),
+            pytest.param(float("inf"), 100.0, id="min-positive-infinity"),
+            pytest.param(0.01, float("inf"), id="max-positive-infinity"),
+            pytest.param(float("-inf"), 100.0, id="min-negative-infinity"),
+            pytest.param(0.01, float("-inf"), id="max-negative-infinity"),
+            pytest.param(1e-50, 1.0, id="min-below-float32-range"),
+            pytest.param(1.0, 1e-50, id="max-below-float32-range"),
+            pytest.param(1e100, 1.0, id="min-above-float32-range"),
+            pytest.param(1.0, 1e100, id="max-above-float32-range"),
+        ],
+    )
+    def test_log_spaced_range_rejects_invalid_bounds(
+        self,
+        min_scale,
+        max_scale,
+    ):
+        """Log-spaced scales require bounds in JAX's normal float32 domain."""
+        with pytest.raises(ValueError, match="normal float32"):
+            make_scale_range(
+                5,
+                min_scale=min_scale,
+                max_scale=max_scale,
+                log_spaced=True,
+            )
+
+    @pytest.mark.parametrize(
+        ("min_scale", "max_scale"),
+        [
+            pytest.param(0.01, 100.0, id="ascending"),
+            pytest.param(100.0, 0.01, id="descending"),
+            pytest.param(np.float32(0.123), np.float32(0.123), id="equal"),
+            pytest.param(
+                np.float32(3.0),
+                np.nextafter(np.float32(3.0), np.float32("inf")),
+                id="adjacent-ascending",
+            ),
+            pytest.param(
+                np.nextafter(np.float32(3.0), np.float32("inf")),
+                np.float32(3.0),
+                id="adjacent-descending",
+            ),
+            pytest.param(
+                float(np.finfo(np.float32).tiny),
+                float(np.finfo(np.float32).max),
+                id="float32-boundaries",
+            ),
+            pytest.param(
+                float(np.finfo(np.float32).tiny),
+                float(np.finfo(np.float32).tiny),
+                id="equal-float32-tiny",
+            ),
+            pytest.param(
+                float(np.finfo(np.float32).max),
+                float(np.finfo(np.float32).max),
+                id="equal-float32-max",
+            ),
+        ],
+    )
+    def test_log_spaced_range_has_valid_float32_postconditions(
+        self,
+        min_scale,
+        max_scale,
+    ):
+        """Generated ranges preserve canonical endpoints and ordering."""
+        scales = make_scale_range(
+            5,
+            min_scale=min_scale,
+            max_scale=max_scale,
+            log_spaced=True,
+        )
+        values = np.asarray(scales)
+        lower_bound = np.float32(min(min_scale, max_scale))
+        upper_bound = np.float32(max(min_scale, max_scale))
+
+        assert values.dtype == np.dtype(np.float32)
+        assert values[0] == np.float32(min_scale)
+        assert values[-1] == np.float32(max_scale)
+        assert np.all(np.isfinite(values))
+        assert np.all(values > 0.0)
+        assert np.all(values >= lower_bound)
+        assert np.all(values <= upper_bound)
+        if min_scale <= max_scale:
+            assert np.all(values[:-1] <= values[1:])
+        else:
+            assert np.all(values[:-1] >= values[1:])
+
+    @pytest.mark.parametrize(
+        "generated",
+        [
+            pytest.param(jnp.array([1.0, jnp.nan, 10.0]), id="non-finite"),
+            pytest.param(jnp.array([1.0, 0.0, 10.0]), id="non-positive"),
+            pytest.param(jnp.array([1.0, 9.0, 8.0, 10.0]), id="unordered"),
+        ],
+    )
+    def test_log_spaced_range_rejects_invalid_generated_values(self, monkeypatch, generated):
+        """Backend numerical failures must fail closed before scales escape."""
+        monkeypatch.setattr(
+            "alberta_framework.streams.synthetic.np.geomspace",
+            lambda *args, **kwargs: generated,
+        )
+
+        with pytest.raises(ValueError, match="generated log-spaced scales"):
+            make_scale_range(
+                generated.size,
+                min_scale=1.0,
+                max_scale=10.0,
+                log_spaced=True,
+            )
 
     def test_linear_spaced_range(self):
         """Linear-spaced scales should span min to max linearly."""
