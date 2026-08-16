@@ -14,9 +14,8 @@ Research-scale evidence and open boundaries for Step 3 are tracked in
 
 from __future__ import annotations
 
-import math
 from dataclasses import asdict, dataclass
-from numbers import Integral, Real
+from numbers import Integral
 from typing import Any, Literal, cast
 
 import chex
@@ -40,9 +39,14 @@ from alberta_framework.core.multi_head_learner import MultiHeadMLPState
 from alberta_framework.core.normalizers import EMANormalizer, Normalizer
 from alberta_framework.core.optimizers import ObGDBounding
 from alberta_framework.core.types import DemonType, GVFSpec, TraceMode, create_horde_spec
+from alberta_framework.steps._float32_validation import (
+    canonical_float32_storage,
+    finite_real_and_float32,
+)
 
 Step3NormalizerName = Literal["none", "ema"]
 Step3TraceModeName = Literal["accumulating", "replacing"]
+_FLOAT32_MIN_NORMAL = float.fromhex("0x1.0p-126")
 Step3RoutingName = Literal["shared", "independent", "mixed"]
 
 
@@ -170,20 +174,36 @@ class Step3OneStepResult:
     per_demon_metrics: Array
 
 
-def _require_real(name: str, value: object) -> float:
-    if isinstance(value, bool) or not isinstance(value, Real):
-        raise ValueError(f"{name} must be a real number, got {value!r}")
-    number = float(value)
-    if not math.isfinite(number):
-        raise ValueError(f"{name} must be finite, got {value!r}")
-    return number
-
-
 def _require_unit_interval(name: str, value: object) -> float:
-    number = _require_real(name, value)
-    if not 0.0 <= number <= 1.0:
+    real, narrowed = finite_real_and_float32(name, value)
+    if real < 0.0 or not real <= 1.0 or narrowed < 0.0 or not narrowed <= 1.0:
         raise ValueError(f"{name} must be in [0, 1], got {value!r}")
-    return number
+    return canonical_float32_storage(real, narrowed)
+
+
+def _require_gvf_probability(name: str, value: object) -> float:
+    real, narrowed = finite_real_and_float32(name, value)
+    if real < 0.0 or not real <= 1.0 or narrowed < 0.0 or not narrowed <= 1.0:
+        raise ValueError(f"{name} must be in [0, 1], got {value!r}")
+    if (real != 0.0 and real < _FLOAT32_MIN_NORMAL) or (
+        narrowed != 0.0 and narrowed < _FLOAT32_MIN_NORMAL
+    ):
+        raise ValueError(f"{name} must be zero or a normal float32 value in [0, 1]")
+    return canonical_float32_storage(real, narrowed)
+
+
+def _require_nonnegative_real(name: str, value: object) -> float:
+    real, narrowed = finite_real_and_float32(name, value)
+    if real < 0.0 or narrowed < 0.0:
+        raise ValueError(f"{name} must be non-negative, got {value!r}")
+    return canonical_float32_storage(real, narrowed)
+
+
+def _require_positive_real(name: str, value: object) -> float:
+    real, narrowed = finite_real_and_float32(name, value)
+    if real <= 0.0 or narrowed <= 0.0:
+        raise ValueError(f"{name} must be positive, got {value!r}")
+    return canonical_float32_storage(real, narrowed)
 
 
 def _require_positive_int(name: str, value: object) -> int:
@@ -204,15 +224,11 @@ def _validate_horde_config(config: Step3HordeConfig) -> None:
             f"got {len(config.gammas)} and {len(config.lamdas)}"
         )
         raise ValueError(msg)
-    gammas = tuple(_require_unit_interval("gammas", value) for value in config.gammas)
-    lamdas = tuple(_require_unit_interval("lamdas", value) for value in config.lamdas)
-    step_size = _require_real("step_size", config.step_size)
-    if step_size < 0.0:
-        raise ValueError(f"step_size must be non-negative, got {config.step_size!r}")
+    gammas = tuple(_require_gvf_probability("gammas", value) for value in config.gammas)
+    lamdas = tuple(_require_gvf_probability("lamdas", value) for value in config.lamdas)
+    step_size = _require_nonnegative_real("step_size", config.step_size)
     sparsity = _require_unit_interval("sparsity", config.sparsity)
-    obgd_kappa = _require_real("obgd_kappa", config.obgd_kappa)
-    if obgd_kappa <= 0.0:
-        raise ValueError(f"obgd_kappa must be positive, got {config.obgd_kappa!r}")
+    obgd_kappa = _require_positive_real("obgd_kappa", config.obgd_kappa)
     hidden_sizes = tuple(
         _require_positive_int("hidden_sizes", size) for size in config.hidden_sizes
     )

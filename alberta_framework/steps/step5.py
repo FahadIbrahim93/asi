@@ -24,12 +24,10 @@ References:
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from numbers import Real
 from typing import Any, cast
 
 import jax.numpy as jnp
 import jax.random as jr
-import numpy as np
 
 from alberta_framework.core.average_reward import (
     DifferentialTDArrayResult,
@@ -37,6 +35,7 @@ from alberta_framework.core.average_reward import (
     DifferentialTDLearner,
     run_differential_td_from_arrays,
 )
+from alberta_framework.steps._float32_validation import finite_real_and_float32
 
 _STEP5_CONFIG_KEYS = frozenset(
     {"step_size", "average_reward_step_size", "trace_decay"}
@@ -49,16 +48,17 @@ _STEP5_CONFIG_KEYS_ERROR = (
 
 def _finite_float32_scalar(name: str, value: object) -> float:
     """Validate a real scalar before the core narrows it to float32."""
-    if isinstance(value, bool) or not isinstance(value, Real):
-        raise ValueError(f"{name} must be a real scalar")
-    try:
-        with np.errstate(invalid="ignore", over="ignore"):
-            narrowed = np.asarray(value, dtype=np.float32)
-    except (FloatingPointError, OverflowError, TypeError, ValueError):
-        raise ValueError(f"{name} must narrow to a finite float32") from None
-    if narrowed.shape != () or not bool(np.isfinite(narrowed)):
-        raise ValueError(f"{name} must narrow to a finite float32")
-    return float(narrowed)
+    _, narrowed = finite_real_and_float32(name, value)
+    return narrowed
+
+
+def _compatible_float32_storage(value: object, narrowed: float) -> float:
+    """Preserve a builtin payload only when its eventual sink is proved equal."""
+    if type(value) is float:
+        return value
+    if type(value) is int and value == narrowed:
+        return value
+    return narrowed
 
 
 @dataclass(frozen=True)
@@ -76,26 +76,32 @@ class Step5AverageRewardTDConfig:
             "average_reward_step_size", self.average_reward_step_size
         )
         trace_decay = _finite_float32_scalar("trace_decay", self.trace_decay)
-        if self.step_size < 0.0:
+        if self.step_size < 0.0 or step_size < 0.0:
             raise ValueError("step_size must be non-negative")
-        if self.average_reward_step_size < 0.0:
+        if self.average_reward_step_size < 0.0 or average_reward_step_size < 0.0:
             raise ValueError("average_reward_step_size must be non-negative")
-        if not 0.0 <= self.trace_decay <= 1.0:
+        if not 0.0 <= self.trace_decay <= 1.0 or not 0.0 <= trace_decay <= 1.0:
             raise ValueError("trace_decay must be in [0, 1]")
-        # Preserve the exact built-in JSON scalar values accepted by the
-        # existing facade. Non-built-in Real scalars need canonicalization so
-        # persistence remains JSON-safe and the stored value exactly matches
-        # the float32 value validated above.
-        if type(self.step_size) not in (int, float):
-            object.__setattr__(self, "step_size", step_size)
-        if type(self.average_reward_step_size) not in (int, float):
-            object.__setattr__(
-                self,
-                "average_reward_step_size",
+        # Preserve builtin floats and sink-exact builtin integers. Other Reals
+        # need the already-rounded value so the JAX sink cannot double-round.
+        object.__setattr__(
+            self,
+            "step_size",
+            _compatible_float32_storage(self.step_size, step_size),
+        )
+        object.__setattr__(
+            self,
+            "average_reward_step_size",
+            _compatible_float32_storage(
+                self.average_reward_step_size,
                 average_reward_step_size,
-            )
-        if type(self.trace_decay) not in (int, float):
-            object.__setattr__(self, "trace_decay", trace_decay)
+            ),
+        )
+        object.__setattr__(
+            self,
+            "trace_decay",
+            _compatible_float32_storage(self.trace_decay, trace_decay),
+        )
 
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-serializable representation."""

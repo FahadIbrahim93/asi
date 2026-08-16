@@ -25,10 +25,9 @@ via Disagreement."
 
 from __future__ import annotations
 
-import math
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass
-from numbers import Integral, Real
+from numbers import Integral
 from typing import Any, cast
 
 import jax.numpy as jnp
@@ -42,6 +41,10 @@ from alberta_framework.core.world_model import (
     WorldModelState,
     WorldModelUpdateResult,
     run_world_model_learning_loop,
+)
+from alberta_framework.steps._float32_validation import (
+    canonical_float32_storage,
+    finite_real_and_float32,
 )
 
 
@@ -95,27 +98,25 @@ class Step8WorldModelConfig:
         )
 
 
-def _require_real(name: str, value: object) -> float:
-    if isinstance(value, bool) or not isinstance(value, Real):
-        raise ValueError(f"{name} must be a real number, got {value!r}")
-    number = float(value)
-    if not math.isfinite(number):
-        raise ValueError(f"{name} must be finite, got {value!r}")
-    return number
-
-
 def _require_unit_interval(name: str, value: object) -> float:
-    number = _require_real(name, value)
-    if not 0.0 <= number <= 1.0:
+    real, narrowed = finite_real_and_float32(name, value)
+    if real < 0.0 or not real <= 1.0 or narrowed < 0.0 or not narrowed <= 1.0:
         raise ValueError(f"{name} must be in [0, 1], got {value!r}")
-    return number
+    return canonical_float32_storage(real, narrowed)
 
 
 def _require_half_open_unit_interval(name: str, value: object) -> float:
-    number = _require_real(name, value)
-    if not 0.0 <= number < 1.0:
+    real, narrowed = finite_real_and_float32(name, value)
+    if real < 0.0 or not real < 1.0 or narrowed < 0.0 or not narrowed < 1.0:
         raise ValueError(f"{name} must be in [0, 1), got {value!r}")
-    return number
+    return canonical_float32_storage(real, narrowed)
+
+
+def _require_nonnegative_real(name: str, value: object) -> float:
+    real, narrowed = finite_real_and_float32(name, value)
+    if real < 0.0 or narrowed < 0.0:
+        raise ValueError(f"{name} must be non-negative, got {value!r}")
+    return canonical_float32_storage(real, narrowed)
 
 
 def _require_int(name: str, value: object, *, minimum: int | None = None) -> int:
@@ -140,13 +141,12 @@ def _validate_world_model_config(config: Step8WorldModelConfig) -> None:
     hidden_sizes = tuple(
         _require_int("hidden_sizes", size, minimum=1) for size in config.hidden_sizes
     )
-    step_size = _require_real("step_size", config.step_size)
-    if step_size < 0.0:
-        raise ValueError(f"step_size must be non-negative, got {config.step_size!r}")
+    step_size = _require_nonnegative_real("step_size", config.step_size)
     sparsity = _require_unit_interval("sparsity", config.sparsity)
-    leaky_relu_slope = _require_real("leaky_relu_slope", config.leaky_relu_slope)
-    if leaky_relu_slope < 0.0:
-        raise ValueError(f"leaky_relu_slope must be non-negative, got {config.leaky_relu_slope!r}")
+    leaky_relu_slope = _require_nonnegative_real(
+        "leaky_relu_slope",
+        config.leaky_relu_slope,
+    )
     utility_decay = _require_half_open_unit_interval("utility_decay", config.utility_decay)
     object.__setattr__(config, "observation_dim", observation_dim)
     object.__setattr__(config, "n_actions", n_actions)
