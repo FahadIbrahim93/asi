@@ -48,6 +48,9 @@ _ACTUAL_INT_TYPES = frozenset(
         *(np.dtype(code).type for code in ("b", "B", "h", "H", "i", "I", "l", "L", "q", "Q")),
     }
 )
+_ACTUAL_FLOAT_TYPES = frozenset(
+    {float, *(np.dtype(code).type for code in ("e", "f", "d", "g"))}
+)
 
 
 def _require_int32(name: str, value: object, *, minimum: int, maximum: int = _INT32_MAX) -> int:
@@ -66,6 +69,9 @@ def _strict_float32_scalar(
     allow_zero: bool,
 ) -> float:
     """Validate a finite nonnegative scalar with a stable float32 encoding."""
+
+    if type(value) not in (_ACTUAL_INT_TYPES | _ACTUAL_FLOAT_TYPES):
+        raise ValueError(f"{label} must be a finite real scalar")
 
     normalized, numerator, denominator = validated_float32_scalar_with_ratio(
         label,
@@ -206,12 +212,9 @@ class RepresentationGradientMixerConfig:
     ) -> RepresentationGradientMixerConfig:
         """Strictly reconstruct only an exact :meth:`to_config` payload."""
 
-        if not issubclass(type(config), Mapping):
-            raise ValueError("config must be a mapping")
-        try:
-            payload = dict(config)
-        except Exception as error:
-            raise ValueError("config mapping could not be read") from error
+        if type(config) is not dict:
+            raise ValueError("config must be an exact built-in dict")
+        payload = dict(config)
         expected = {
             "schema",
             "type",
@@ -226,7 +229,7 @@ class RepresentationGradientMixerConfig:
             "grounded_world_clip_norm",
             "final_clip_norm",
         }
-        if set(payload) != expected:
+        if any(type(key) is not str for key in payload) or set(payload) != expected:
             raise ValueError("config fields do not match the serialized schema")
         schema = payload.pop("schema")
         if (

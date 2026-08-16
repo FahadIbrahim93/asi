@@ -606,7 +606,6 @@ def test_gradient_mixer_float32_scalar_endpoints_and_canonicalization(
         tiny,
         maximum,
         *(np.dtype(code).type(0.5) for code in ("e", "f", "d", "g")),
-        Fraction(1, 4),
     ]
     if allow_zero:
         valid_values.extend((0, -0.0))
@@ -651,7 +650,7 @@ def test_gradient_mixer_float32_scalar_endpoints_and_canonicalization(
         "final_clip_norm",
     ],
 )
-def test_gradient_mixer_rejects_hostile_real_subclasses_as_value_errors(
+def test_gradient_mixer_rejects_hostile_real_subclasses_without_running_hooks(
     field: str,
 ) -> None:
     class HostileFraction(Fraction):
@@ -661,20 +660,37 @@ def test_gradient_mixer_rejects_hostile_real_subclasses_as_value_errors(
         def __repr__(self) -> str:
             raise AssertionError("hostile repr must not run")
 
-    with pytest.raises(ValueError, match=field):
-        RepresentationGradientMixerConfig(
-            representation_dim=1,
-            **{field: HostileFraction(1, 2)},  # type: ignore[arg-type]
-        )
+    class HostileFloat(float):
+        def as_integer_ratio(self) -> tuple[int, int]:
+            raise AssertionError("hostile ratio must not run")
+
+        def __repr__(self) -> str:
+            raise AssertionError("hostile repr must not run")
+
+    for value in (HostileFraction(1, 2), HostileFloat(0.5)):
+        with pytest.raises(ValueError, match=field):
+            RepresentationGradientMixerConfig(
+                representation_dim=1,
+                **{field: value},  # type: ignore[arg-type]
+            )
 
 
-def test_gradient_mixer_from_config_accepts_mappings_and_rejects_token_subclasses() -> None:
+def test_gradient_mixer_from_config_requires_exact_dict_and_tokens() -> None:
     config = RepresentationGradientMixerConfig(representation_dim=3)
     payload = config.to_config()
-    for mapping in (MappingProxyType(payload), UserDict(payload)):
-        assert RepresentationGradientMixerConfig.from_config(mapping) == config
 
-    with pytest.raises(ValueError, match="mapping"):
+    class HostileDict(dict[str, object]):
+        def __iter__(self):
+            raise AssertionError("hostile dict iteration must not run")
+
+        def __repr__(self) -> str:
+            raise AssertionError("hostile dict repr must not run")
+
+    for mapping in (MappingProxyType(payload), UserDict(payload), HostileDict(payload)):
+        with pytest.raises(ValueError, match="exact built-in dict"):
+            RepresentationGradientMixerConfig.from_config(mapping)
+
+    with pytest.raises(ValueError, match="exact built-in dict"):
         RepresentationGradientMixerConfig.from_config(  # type: ignore[arg-type]
             list(payload.items())
         )
@@ -687,7 +703,7 @@ def test_gradient_mixer_from_config_accepts_mappings_and_rejects_token_subclasse
         def __repr__(self) -> str:
             raise AssertionError("mapping repr must not run")
 
-    with pytest.raises(ValueError, match="mapping"):
+    with pytest.raises(ValueError, match="exact built-in dict"):
         RepresentationGradientMixerConfig.from_config(  # type: ignore[arg-type]
             MappingSpoof()
         )
