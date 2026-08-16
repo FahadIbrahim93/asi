@@ -289,7 +289,8 @@ def test_large_finite_action_mass_total_never_overflows_on_rounding() -> None:
         proposal = _propose(policy, state)
 
         assert bool(jnp.isfinite(proposal.total_action_mass)), action_mass
-        direct_sum = float(np.sum(np.asarray(action_mass, dtype=np.float32)))
+        with np.errstate(over="ignore"):
+            direct_sum = float(np.sum(np.asarray(action_mass, dtype=np.float32)))
         if np.isfinite(direct_sum):
             assert float(proposal.total_action_mass) == direct_sum, action_mass
 
