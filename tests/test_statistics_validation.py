@@ -88,6 +88,14 @@ class TestComputeStatistics:
             with pytest.raises(ValueError, match=r"^values must be non-empty$"):
                 compute_statistics(np.array([], dtype=np.float64))
 
+    @pytest.mark.parametrize("poison", [float("nan"), float("inf"), float("-inf")])
+    def test_nonfinite_values_rejected_without_warnings(self, poison: float) -> None:
+        """A NaN or inf seed must not become a NaN mean/CI that looks published."""
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with pytest.raises(ValueError, match=r"^values must be finite$"):
+                compute_statistics([1.0, poison, 2.0])
+
     def test_empirical_ci_coverage(self) -> None:
         """95% t-CI covers the true mean ~95% of the time.
 
@@ -143,6 +151,13 @@ class TestTimeseriesStatistics:
                 ValueError, match=r"^metric_array must contain at least one seed row$"
             ):
                 compute_timeseries_statistics(np.empty((0, 3)))
+
+    def test_nonfinite_seed_rejected_without_warnings(self) -> None:
+        arr = np.array([[1.0, 2.0], [np.nan, 3.0]], dtype=np.float64)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with pytest.raises(ValueError, match=r"^metric_array must be finite$"):
+                compute_timeseries_statistics(arr)
 
     def test_single_seed_returns_finite_point_interval(self) -> None:
         """One seed yields the point trajectory, finite, without any warning."""
