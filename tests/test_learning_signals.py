@@ -103,7 +103,7 @@ def test_config_roundtrip_validation_and_exact_resource_budget() -> None:
             target_dim=1,
             change_calibration_steps=1,
         )
-    with pytest.raises(ValueError, match="fit in int32"):
+    with pytest.raises(ValueError, match="change_calibration_steps"):
         LearningSignalEstimatorConfig(
             ensemble_size=2,
             target_dim=1,
@@ -456,3 +456,103 @@ def test_zero_ema_decay_does_not_multiply_inf_trackers() -> None:
     )
     next_calibrated, _ = _observe_scalar(estimator, calibrated)
     assert bool(jnp.isfinite(next_calibrated.sustained_change_probability))
+
+
+def test_learning_signals_config_rejects_booleans_and_non_integers() -> None:
+    with pytest.raises(ValueError, match="ensemble_size"):
+        LearningSignalEstimatorConfig(ensemble_size=True, target_dim=1)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="target_dim"):
+        LearningSignalEstimatorConfig(ensemble_size=2, target_dim=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="progress_warmup_steps"):
+        LearningSignalEstimatorConfig(ensemble_size=2, target_dim=1, progress_warmup_steps=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="change_calibration_steps"):
+        LearningSignalEstimatorConfig(ensemble_size=2, target_dim=1, change_calibration_steps=True)  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="ensemble_size"):
+        LearningSignalEstimatorConfig(ensemble_size=2.5, target_dim=1)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="target_dim"):
+        LearningSignalEstimatorConfig(ensemble_size=2, target_dim=1.5)  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="fast_loss_decay"):
+        LearningSignalEstimatorConfig(ensemble_size=2, target_dim=1, fast_loss_decay=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="fast_loss_decay"):
+        LearningSignalEstimatorConfig(ensemble_size=2, target_dim=1, fast_loss_decay=1.0 - 1e-10)
+    with pytest.raises(ValueError, match="change_decay"):
+        LearningSignalEstimatorConfig(ensemble_size=2, target_dim=1, change_decay=True)  # type: ignore[arg-type]
+
+
+def test_learning_signals_config_accepts_and_canonicalizes_numpy_integers() -> None:
+    config = LearningSignalEstimatorConfig(
+        ensemble_size=np.int32(4),
+        target_dim=np.int64(2),
+        progress_warmup_steps=np.uint16(3),
+        change_calibration_steps=np.int8(8),
+    )
+    assert type(config.ensemble_size) is int
+    assert type(config.target_dim) is int
+    assert type(config.progress_warmup_steps) is int
+    assert type(config.change_calibration_steps) is int
+    assert config.ensemble_size == 4
+    assert config.target_dim == 2
+    assert config.progress_warmup_steps == 3
+    assert config.change_calibration_steps == 8
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    (
+        "variance_floor",
+        "change_z_threshold",
+        "change_temperature",
+        "calibration_scale_floor",
+        "max_normalized_residual",
+        "max_input_magnitude",
+        "max_predicted_variance",
+        "max_observed_loss",
+    ),
+)
+@pytest.mark.parametrize("invalid", (True, float("inf"), 1.0e40, 0.0))
+def test_learning_signals_positive_float32_fields_fail_closed(
+    field_name: str, invalid: object
+) -> None:
+    with pytest.raises(ValueError, match=field_name):
+        LearningSignalEstimatorConfig(
+            ensemble_size=2,
+            target_dim=1,
+            **{field_name: invalid},
+        )
+
+
+def test_learning_signals_config_rejects_spoofed_scalar_and_schema_types() -> None:
+    class HostileInt(int):
+        @property
+        def __class__(self) -> type:
+            return int
+
+        def __repr__(self) -> str:
+            raise AssertionError("repr executed")
+
+    class SpoofedStr(str):
+        @property
+        def __class__(self) -> type:
+            return str
+
+
+    with pytest.raises(ValueError, match="ensemble_size"):
+        LearningSignalEstimatorConfig(ensemble_size=HostileInt(2), target_dim=1)
+    with pytest.raises(ValueError, match="type"):
+        LearningSignalEstimatorConfig.from_config(
+            {
+                "type": SpoofedStr("LearningSignalEstimatorConfig"),
+                "ensemble_size": 2,
+                "target_dim": 1,
+            }
+        )
+    with pytest.raises(ValueError, match="actual dict"):
+        LearningSignalEstimatorConfig.from_config(  # type: ignore[arg-type]
+            _DictSubclass(ensemble_size=2, target_dim=1)
+        )
+
+
+class _DictSubclass(dict[str, object]):
+    """A mapping subtype that must not reach deserialization hooks."""
