@@ -19,12 +19,28 @@ reproducible results. See `VENDORING.md` for the exact scope.
 
 #### Reference-agent protocol
 
-- Added the first versioned, host-facing reference-agent records and structural
-  protocol: canonical configuration digests, discrete/box space declarations,
-  lifecycle-scoped decisions, explicit dispatch settlement, transition
-  boundaries, and atomic step results. This is the ADR's initial L0 contract
-  surface; no concrete adapter, whole-life runner, exact-resume gate, or
-  `reference-dev` selection is implied.
+- Added the host-facing `preview1` reference-agent transaction contract. Its
+  preview schemas are versioned but not frozen v1: canonical configuration and
+  manifest identities, exact-dtype immutable payloads, distinct
+  authorization/settlement/receipt/outcome records, explicit bootstrap/reset
+  observation IDs, and a process-local single-writer ledger are covered at L0.
+  The live ledger uses lock-protected current-object identity compare-and-swap,
+  rejects stale snapshots and repeated initialization, and deliberately cannot
+  be pickled. Rejection leaves the event unconsumed and the ledger halted with
+  recovery required; the final uint64-indexed event is consumed before the state
+  becomes exhausted. Preview restrictions include scalar reward/discount, no
+  sidecars or wire decoder, adapter-asserted rather than adapter-proven
+  rebinding, and executor acknowledgements rather than physical-dispatch proof.
+  No durable replay/restore, aggregate life state or runner, whole-life
+  checkpoint, exact-resume gate, or `reference-dev` is implied.
+- Added a development-only, manifest-bound Prototype L0 agent transaction
+  bridge and retained tests. It supports only primitive actions, exact dispatch,
+  and continuing-task outcomes; foreign-configuration state, replacement/veto,
+  boundary transactions, stale or relabelled decisions, and premature disarming
+  fail closed without committing the functional candidate. This is not an
+  environment/executor adapter, closed-loop runner, whole-life checkpoint or
+  exact-resume result, options/rebinding/boundary conformance, `reference-dev`,
+  or evidence.
 
 #### Continual-learning benchmarks
 

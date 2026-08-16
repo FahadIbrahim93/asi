@@ -8,12 +8,16 @@ robotics readiness, exact whole-life resume, or scientific evidence.
 from __future__ import annotations
 
 import math
-from dataclasses import FrozenInstanceError, replace
+import pickle
+from dataclasses import FrozenInstanceError, fields, replace
 
+import jax.numpy as jnp
 import numpy as np
 import pytest
 
+import alberta_framework.reference_agent as reference_agent
 from alberta_framework.reference_agent import (
+    MAX_DECISION_INDEX,
     REFERENCE_AGENT_API_VERSION,
     REFERENCE_AGENT_MANIFEST_SCHEMA,
     REFERENCE_TRANSACTION_STATE_SCHEMA,
@@ -28,6 +32,7 @@ from alberta_framework.reference_agent import (
     DispatchReceipt,
     DispatchStatus,
     ReferenceTransactionLedger,
+    ReferenceTransactionState,
     SpaceSpec,
     StepResult,
     Transaction,
@@ -95,7 +100,7 @@ def _decision(
 def _armed_ledger(
     *,
     dispatch_rebinding: bool = False,
-) -> tuple[ReferenceTransactionLedger, object, Decision]:
+) -> tuple[ReferenceTransactionLedger, ReferenceTransactionState, Decision]:
     ledger = ReferenceTransactionLedger(_manifest(dispatch_rebinding=dispatch_rebinding))
     state = ledger.init()
     decision = _decision(ledger.manifest)
@@ -108,7 +113,7 @@ def _authorized(
     effective_action: object | None = None,
 ) -> tuple[
     ReferenceTransactionLedger,
-    object,
+    ReferenceTransactionState,
     Decision,
     DispatchAuthorization,
 ]:
@@ -130,7 +135,7 @@ def _settled(
     effective_action: object | None = None,
 ) -> tuple[
     ReferenceTransactionLedger,
-    object,
+    ReferenceTransactionState,
     Decision,
     DispatchAuthorization,
     DispatchAck,
@@ -155,7 +160,7 @@ def _dispatched(
     effective_action: object | None = None,
 ) -> tuple[
     ReferenceTransactionLedger,
-    object,
+    ReferenceTransactionState,
     Decision,
     DispatchAuthorization,
     DispatchAck,
@@ -183,7 +188,7 @@ def _outcome(
     bootstrap_observation_id: str = "life-a:observation:1",
     next_decision_observation: object | None = (0.1, 0.2, 0.3),
     next_decision_observation_id: str | None = "life-a:observation:1",
-) -> tuple[ReferenceTransactionLedger, object, Transaction]:
+) -> tuple[ReferenceTransactionLedger, ReferenceTransactionState, Transaction]:
     ledger, state, _decision_value, _authorization, _dispatch, receipt = _dispatched()
     state, transaction = ledger.record_outcome(
         state,
@@ -202,9 +207,11 @@ def _outcome(
 
 
 def test_versioned_manifest_binds_canonical_config_and_state_schema() -> None:
-    assert REFERENCE_AGENT_API_VERSION == "asi.reference_agent.v1"
-    assert REFERENCE_AGENT_MANIFEST_SCHEMA == "asi.reference_agent_manifest.v1"
-    assert REFERENCE_TRANSACTION_STATE_SCHEMA == "asi.reference_transaction_state.v1"
+    assert REFERENCE_AGENT_API_VERSION == "asi.reference_agent.preview1"
+    assert REFERENCE_AGENT_MANIFEST_SCHEMA == "asi.reference_agent_manifest.preview1"
+    assert REFERENCE_TRANSACTION_STATE_SCHEMA == "asi.reference_transaction_state.preview1"
+    assert MAX_DECISION_INDEX == (1 << 64) - 1
+    assert [field.name for field in fields(AgentCapabilities)] == ["dispatch_rebinding"]
 
     first = {"seed": 7, "nested": {"beta": 2, "alpha": 1}}
     reordered = {"nested": {"alpha": 1, "beta": 2}, "seed": 7}
@@ -243,6 +250,8 @@ def test_space_encoding_is_exact_dtype_bounded_and_deeply_immutable() -> None:
 
     with pytest.raises(ValueError, match="dtype|float32"):
         _action_spec().encode(np.array([0.25, -0.5], dtype=np.float64))
+    with pytest.raises(ValueError, match="dtype|float32"):
+        _action_spec().encode(jnp.array([0.25, -0.5], dtype=jnp.float16))
     with pytest.raises(ValueError, match="shape"):
         _action_spec().encode((0.25,))
     with pytest.raises(ValueError, match="finite"):
@@ -256,6 +265,8 @@ def test_space_encoding_is_exact_dtype_bounded_and_deeply_immutable() -> None:
         semantic_id="tests.discrete_action.v1",
     )
     assert discrete.encode(3).to_python() == 3
+    with pytest.raises((TypeError, ValueError), match="integer"):
+        discrete.encode(1.0)
     with pytest.raises((TypeError, ValueError), match="integer|bool"):
         discrete.encode(True)
     with pytest.raises(ValueError, match="cardinality|range"):
@@ -283,6 +294,12 @@ def test_manifest_factory_binds_codec_manifest_identity_and_armed_state() -> Non
         manifest.validate_decision(replace(decision, manifest_id="0" * 64))
     with pytest.raises(ValueError, match="canonical|decision_id"):
         replace(decision, decision_id="life-a:reused")
+    with pytest.raises(ValueError, match="lifecycle_id|derived|length|long"):
+        _decision(
+            manifest,
+            lifecycle_id="l" * 243,
+            observation_id="tests.observation:0",
+        )
     disarmed = _decision(manifest, armed=False)
     assert disarmed.proposed_action is None and not disarmed.armed
 
@@ -302,8 +319,8 @@ def test_authorization_settlement_and_receipt_are_distinct_owned_records() -> No
     )
     assert state.phase is TransactionPhase.SETTLED
     assert dispatch is not None and dispatch.status is DispatchStatus.EXACT
-    assert dispatch.authorized and dispatch.transition_expected
     assert not hasattr(dispatch, "dispatched")
+    assert not hasattr(dispatch, "transition_expected")
 
     state, receipt = ledger.record_dispatch(
         state,
@@ -350,7 +367,6 @@ def test_replacement_requires_declared_and_applied_credit_rebinding() -> None:
             authorization,
             rebinding_applied=False,
             settlement_id="life-a:0:settlement",
-            halt_on_unsupported=False,
         )
     state, dispatch = ledger.settle_dispatch(
         state,
@@ -385,11 +401,19 @@ def test_veto_halts_before_settlement_dispatch_or_learning() -> None:
 
 def test_outcome_binds_exact_receipt_and_explicit_boundary_reset_identity() -> None:
     ledger, state, _decision_value, _authorization, _dispatch, receipt = _dispatched()
-    wrong_receipt = replace(receipt, receipt_id="life-a:0:other-receipt")
+    with pytest.raises(ValueError, match="receipt_id|canonical"):
+        replace(receipt, receipt_id="life-a:0:other-receipt")
+
+    alternate_authorization = replace(
+        receipt.dispatch.authorization,
+        authority_id="tests.other_safety_authority.v1",
+    )
+    alternate_dispatch = replace(receipt.dispatch, authorization=alternate_authorization)
+    alternate_receipt = replace(receipt, dispatch=alternate_dispatch)
     with pytest.raises(DecisionOwnershipError, match="receipt"):
         ledger.record_outcome(
             state,
-            wrong_receipt,
+            alternate_receipt,
             reward=1.0,
             discount=0.9,
             terminated=False,
@@ -441,17 +465,54 @@ def test_outcome_rejects_invalid_discount_without_advancing(discount: float) -> 
     assert state == before
 
 
+def test_continuing_outcome_cannot_use_terminal_zero_discount() -> None:
+    ledger, state, _decision_value, _authorization, _dispatch, receipt = _dispatched()
+    with pytest.raises(ValueError, match="discount|terminated"):
+        ledger.record_outcome(
+            state,
+            receipt,
+            reward=1.0,
+            discount=0.0,
+            terminated=False,
+            truncated=False,
+            autoreset=False,
+            bootstrap_observation_id="life-a:observation:1",
+            bootstrap_observation=(0.1, 0.2, 0.3),
+            next_decision_observation_id="life-a:observation:1",
+            next_decision_observation=(0.1, 0.2, 0.3),
+        )
+
+
+def test_outcome_rejects_scalar_that_overflows_during_protocol_conversion() -> None:
+    ledger, state, _decision_value, _authorization, _dispatch, receipt = _dispatched()
+    huge = np.longdouble("1e4000")
+    assert np.isfinite(huge)
+    with pytest.raises(ValueError, match="reward|finite|representable"):
+        ledger.record_outcome(
+            state,
+            receipt,
+            reward=huge,
+            discount=0.9,
+            terminated=False,
+            truncated=False,
+            autoreset=False,
+            bootstrap_observation_id="life-a:observation:1",
+            bootstrap_observation=(0.1, 0.2, 0.3),
+            next_decision_observation_id="life-a:observation:1",
+            next_decision_observation=(0.1, 0.2, 0.3),
+        )
+
+
 def test_ledger_enforces_one_lifecycle_monotonic_decisions_and_exactly_once_phases() -> None:
     ledger, armed, decision = _armed_ledger()
     with pytest.raises(DecisionOwnershipError, match="phase|armed"):
         ledger.arm(armed, decision)
-    with pytest.raises(DecisionOwnershipError, match="decision index|expected"):
-        ledger.arm(
-            ledger.init(),
-            _decision(ledger.manifest, decision_index=1),
-        )
+    with pytest.raises(DecisionOwnershipError, match="initialized|current|replay"):
+        ledger.init()
 
     ledger, state, transaction = _outcome()
+    assert transaction.next_decision_observation_id is not None
+    assert transaction.next_decision_observation is not None
     next_decision = _decision(
         ledger.manifest,
         decision_index=1,
@@ -469,15 +530,88 @@ def test_ledger_enforces_one_lifecycle_monotonic_decisions_and_exactly_once_phas
 
     with pytest.raises(DecisionOwnershipError, match="phase|outcome"):
         ledger.accept(state, next_decision=None, parameters_changed=False)
-    with pytest.raises(DecisionOwnershipError, match="lifecycle"):
+    with pytest.raises(DecisionOwnershipError, match="current|replay|stale"):
         ledger.arm(
             replace(state, phase=TransactionPhase.READY, decision=None),
             _decision(ledger.manifest, lifecycle_id="life-b", decision_index=1),
         )
 
 
+def test_ledger_rejects_old_state_replay_and_phase_or_chain_forgery() -> None:
+    ledger, settled, decision, _authorization, dispatch = _settled()
+    dispatched, _receipt = ledger.record_dispatch(
+        settled,
+        dispatch,
+        receipt_id="life-a:0:receipt",
+        executor_id="tests.environment_executor.v1",
+    )
+    with pytest.raises(DecisionOwnershipError, match="current|replay|stale"):
+        ledger.record_dispatch(
+            settled,
+            dispatch,
+            receipt_id="life-a:0:second-receipt",
+            executor_id="tests.environment_executor.v1",
+        )
+    with pytest.raises(DecisionOwnershipError, match="current|replay|stale"):
+        ledger.record_outcome(
+            replace(dispatched),
+            _receipt,
+            reward=1.0,
+            discount=0.9,
+            terminated=False,
+            truncated=False,
+            autoreset=False,
+            bootstrap_observation_id="life-a:observation:1",
+            bootstrap_observation=(0.1, 0.2, 0.3),
+            next_decision_observation_id="life-a:observation:1",
+            next_decision_observation=(0.1, 0.2, 0.3),
+        )
+
+    with pytest.raises(ValueError, match="phase|fields|records"):
+        replace(dispatched, phase=TransactionPhase.READY)
+
+    rolled_back = replace(
+        settled,
+        phase=TransactionPhase.READY,
+        lifecycle_id=decision.lifecycle_id,
+        decision=None,
+        authorization=None,
+        dispatch=None,
+    )
+    with pytest.raises(DecisionOwnershipError, match="current|replay|stale"):
+        ledger.arm(rolled_back, decision)
+
+    other = _manifest()
+    foreign_decision = _decision(other, lifecycle_id="life-foreign")
+    with pytest.raises(ValueError, match="manifest|lifecycle|ownership"):
+        replace(settled, decision=foreign_decision)
+
+    disarmed = _decision(
+        ledger.manifest,
+        lifecycle_id=decision.lifecycle_id,
+        decision_index=decision.decision_index,
+        armed=False,
+    )
+    with pytest.raises(ValueError, match="armed|disarmed"):
+        replace(
+            settled,
+            phase=TransactionPhase.ARMED,
+            decision=disarmed,
+            authorization=None,
+            dispatch=None,
+        )
+
+
+def test_live_ledger_owner_cannot_be_pickled_as_an_undeclared_resume_surface() -> None:
+    ledger, state, _decision_value = _armed_ledger()
+    with pytest.raises(TypeError, match="ledger|serialize|checkpoint|resume"):
+        pickle.dumps((ledger, state))
+
+
 def test_rejected_transaction_cannot_consume_event_or_arm_next_decision() -> None:
     ledger, state, transaction = _outcome()
+    assert transaction.next_decision_observation_id is not None
+    assert transaction.next_decision_observation is not None
     next_decision = _decision(
         ledger.manifest,
         decision_index=1,
@@ -491,7 +625,8 @@ def test_rejected_transaction_cannot_consume_event_or_arm_next_decision() -> Non
     assert halted.transaction == transaction
     assert not result.transaction_accepted
     assert not result.parameters_changed
-    assert result.retry_required
+    assert not result.event_consumed
+    assert result.recovery_required
     assert result.next_decision is None
 
     with pytest.raises(ValueError, match="rejected|next decision|next_decision"):
@@ -500,13 +635,14 @@ def test_rejected_transaction_cannot_consume_event_or_arm_next_decision() -> Non
             next_decision=next_decision,
             transaction_accepted=False,
             parameters_changed=False,
-            retry_required=True,
             rejection_reason="atomic learner update rejected",
         )
 
 
 def test_step_result_rejects_disarmed_or_cross_manifest_next_decision() -> None:
     ledger, state, transaction = _outcome()
+    assert transaction.next_decision_observation_id is not None
+    assert transaction.next_decision_observation is not None
     disarmed = _decision(
         ledger.manifest,
         decision_index=1,
@@ -520,7 +656,6 @@ def test_step_result_rejects_disarmed_or_cross_manifest_next_decision() -> None:
             next_decision=disarmed,
             transaction_accepted=True,
             parameters_changed=False,
-            retry_required=False,
             rejection_reason=None,
         )
 
@@ -545,9 +680,29 @@ def test_step_result_rejects_disarmed_or_cross_manifest_next_decision() -> None:
             next_decision=foreign,
             transaction_accepted=True,
             parameters_changed=False,
-            retry_required=False,
             rejection_reason=None,
         )
+
+
+def test_counter_is_bounded_and_final_event_is_consumed_before_disarm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest = _manifest()
+    with pytest.raises(ValueError, match="decision_index|uint64|maximum"):
+        _decision(manifest, decision_index=MAX_DECISION_INDEX + 1)
+
+    monkeypatch.setattr(reference_agent, "MAX_DECISION_INDEX", 0)
+    ledger, state, transaction = _outcome()
+    state, result = ledger.accept(
+        state,
+        next_decision=None,
+        parameters_changed=True,
+    )
+    assert result.transaction_accepted
+    assert result.event_consumed
+    assert result.life_exhausted
+    assert state.phase is TransactionPhase.EXHAUSTED
+    assert state.next_decision_index == 0
 
 
 def test_boundary_without_autoreset_waits_for_explicit_next_arm() -> None:
