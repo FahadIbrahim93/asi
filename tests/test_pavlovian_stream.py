@@ -442,11 +442,47 @@ def _valid_phase(**overrides: object) -> PavlovianPhase:
     return PavlovianPhase(**payload)  # type: ignore[arg-type]
 
 
-@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf"), True, -1.0])
+@pytest.mark.parametrize(
+    "value",
+    [
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+        True,
+        -1.0,
+        1e100,
+        10**400,
+    ],
+)
 def test_construct_rejects_illegal_noise_std(value: object) -> None:
-    """Observation noise is a non-negative finite real, not a bool or NaN."""
+    """Noise must remain non-negative and finite in float32 execution."""
     with pytest.raises(ValueError, match="noise_std"):
         ClassicalConditioningStream(phases=(_valid_phase(),), noise_std=value)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        float(np.finfo(np.float32).max),
+        float(np.nextafter(np.float32(0.0), np.float32(1.0))),
+    ],
+)
+def test_construct_accepts_float32_noise_std_boundaries(value: float) -> None:
+    """Finite float32 endpoints survive constructor canonicalization."""
+    stream = ClassicalConditioningStream(phases=(_valid_phase(),), noise_std=value)
+    assert stream._noise_std == value  # noqa: SLF001 - normalization is under test
+
+
+def test_construct_canonicalizes_underflowing_noise_std_to_zero() -> None:
+    """A positive host float below float32 range has exact zero-noise semantics."""
+    stream = ClassicalConditioningStream(phases=(_valid_phase(),), noise_std=1e-50)
+    assert stream._noise_std == 0.0  # noqa: SLF001 - normalization is under test
+
+
+def test_construct_canonicalizes_noise_std_to_float32() -> None:
+    """Stored noise matches the scalar used by the float32 trajectory."""
+    stream = ClassicalConditioningStream(phases=(_valid_phase(),), noise_std=0.1)
+    assert stream._noise_std == float(np.float32(0.1))  # noqa: SLF001
 
 
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), -0.1, 1.1, True])
