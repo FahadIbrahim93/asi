@@ -76,6 +76,22 @@ def _require_finite_values(values: NDArray[np.floating], *, name: str) -> None:
         raise ValueError(f"{name} must be finite")
 
 
+def _require_sample_vector(values: object, *, name: str) -> NDArray[np.float64]:
+    """Return ``values`` as a rank-1 array: exactly one sample per seed.
+
+    A ``(n_seeds, n_steps)`` matrix would otherwise be flattened by the
+    spread estimators while ``n_seeds`` still reported the row count.
+    """
+    arr = np.asarray(values)
+    if arr.ndim != 1:
+        raise ValueError(
+            f"{name} must be a one-dimensional sample vector (one value per seed), "
+            f"got shape {arr.shape}; reduce per seed first or use "
+            "compute_timeseries_statistics"
+        )
+    return arr
+
+
 def compute_statistics(
     values: NDArray[np.float64] | list[float],
     confidence_level: float = 0.95,
@@ -93,7 +109,7 @@ def compute_statistics(
         ValueError: If values is empty, any sample is non-finite, or
             ``confidence_level`` is not strictly between 0 and 1.
     """
-    arr = np.asarray(values)
+    arr = _require_sample_vector(values, name="values")
     n = len(arr)
     if n == 0:
         raise ValueError("values must be non-empty")
@@ -207,8 +223,8 @@ def cohens_d(
         ValueError: If either group is empty or the pooled degrees of freedom
             ``n_a + n_b - 2`` are not positive.
     """
-    a = np.asarray(values_a)
-    b = np.asarray(values_b)
+    a = _require_sample_vector(values_a, name="values_a")
+    b = _require_sample_vector(values_b, name="values_b")
 
     n_a = len(a)
     n_b = len(b)
@@ -270,8 +286,8 @@ def ttest_comparison(
             empty or the two unpaired groups have no positive pooled degrees
             of freedom.
     """
-    a = np.asarray(values_a)
-    b = np.asarray(values_b)
+    a = _require_sample_vector(values_a, name="values_a")
+    b = _require_sample_vector(values_b, name="values_b")
 
     if paired:
         if len(a) != len(b):
@@ -346,8 +362,8 @@ def mann_whitney_comparison(
     Raises:
         ValueError: If either sample is empty.
     """
-    a = np.asarray(values_a)
-    b = np.asarray(values_b)
+    a = _require_sample_vector(values_a, name="values_a")
+    b = _require_sample_vector(values_b, name="values_b")
 
     if len(a) == 0 or len(b) == 0:
         raise ValueError(
@@ -414,8 +430,8 @@ def wilcoxon_comparison(
             pairs, or are identical, for which the Wilcoxon signed-rank
             statistic is undefined.
     """
-    a = np.asarray(values_a)
-    b = np.asarray(values_b)
+    a = _require_sample_vector(values_a, name="values_a")
+    b = _require_sample_vector(values_b, name="values_b")
 
     if len(a) != len(b):
         raise ValueError(
@@ -713,7 +729,7 @@ def bootstrap_ci(
             ``statistic`` is not ``"mean"`` or ``"median"``, ``confidence_level``
             is not strictly between 0 and 1, or ``n_bootstrap`` is not positive.
     """
-    arr = np.asarray(values)
+    arr = _require_sample_vector(values, name="values")
     if len(arr) == 0:
         raise ValueError(
             "bootstrap_ci requires at least one value; got an empty array "
