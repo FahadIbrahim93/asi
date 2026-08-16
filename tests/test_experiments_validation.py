@@ -9,11 +9,14 @@ import numpy as np
 import pytest
 
 from alberta_framework.core.learners import LinearLearner
+from alberta_framework.core.optimizers import LMS
 from alberta_framework.streams.base import ScanStream
 from alberta_framework.streams.synthetic import RandomWalkStream
 from alberta_framework.utils.experiments import (
     AggregatedResults,
     ExperimentConfig,
+    SingleRunResult,
+    aggregate_metrics,
     get_final_performance,
     get_metric_timeseries,
     run_multi_seed_experiment,
@@ -243,3 +246,38 @@ def test_get_final_performance_positive_window_is_a_suffix() -> None:
     expected_values = np.asarray([2.5, 25.0], dtype=np.float64)
     assert result["candidate"][0] == pytest.approx(float(np.mean(expected_values)))
     assert result["candidate"][1] == pytest.approx(float(np.std(expected_values, ddof=1)))
+
+
+def _single_run(seed: int, values: list[float]) -> SingleRunResult:
+    learner = LinearLearner(optimizer=LMS(step_size=0.05))
+    return SingleRunResult(
+        config_name="candidate",
+        seed=seed,
+        metrics_history=[{"squared_error": value} for value in values],
+        final_state=learner.init(2),
+    )
+
+
+def test_aggregate_metrics_rejects_nonfinite_samples() -> None:
+    """A NaN seed mean would be published as the method's final performance."""
+    with pytest.raises(ValueError, match="non-finite samples"):
+        aggregate_metrics(
+            [
+                _single_run(0, [1.0, 2.0]),
+                _single_run(1, [3.0, float("nan")]),
+            ]
+        )
+
+
+def test_get_metric_timeseries_rejects_nonfinite_samples() -> None:
+    poisoned = _two_seed_trace()
+    poisoned.metric_arrays["squared_error"][0, 1] = np.inf
+    with pytest.raises(ValueError, match="non-finite samples"):
+        get_metric_timeseries(poisoned)
+
+
+def test_get_final_performance_rejects_nonfinite_samples() -> None:
+    poisoned = _two_seed_trace()
+    poisoned.metric_arrays["squared_error"][1, -1] = np.nan
+    with pytest.raises(ValueError, match="non-finite samples"):
+        get_final_performance({"candidate": poisoned}, window=1)
