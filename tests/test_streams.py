@@ -396,6 +396,24 @@ class TestMakeScaleRange:
         # Middle value should be geometric mean ≈ 1.0
         chex.assert_trees_all_close(scales[2], jnp.array(1.0), rtol=0.1)
 
+    @pytest.mark.parametrize(
+        ("min_scale", "max_scale"),
+        [(-1.0, 100.0), (0.01, -100.0)],
+    )
+    def test_log_spaced_range_rejects_nonpositive_bounds(
+        self,
+        min_scale,
+        max_scale,
+    ):
+        """Log-spaced scales require endpoints in the real logarithm domain."""
+        with pytest.raises(ValueError, match="finite and positive"):
+            make_scale_range(
+                5,
+                min_scale=min_scale,
+                max_scale=max_scale,
+                log_spaced=True,
+            )
+
     def test_linear_spaced_range(self):
         """Linear-spaced scales should span min to max linearly."""
         scales = make_scale_range(5, min_scale=0.0, max_scale=100.0, log_spaced=False)

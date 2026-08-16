@@ -7,6 +7,7 @@ track and adapt.
 All streams use JAX-compatible pure functions that work with jax.lax.scan.
 """
 
+import math
 from typing import Any
 
 import chex
@@ -851,6 +852,13 @@ def make_scale_range(
     ```
     """
     if log_spaced:
+        if (
+            not math.isfinite(min_scale)
+            or not math.isfinite(max_scale)
+            or min_scale <= 0.0
+            or max_scale <= 0.0
+        ):
+            raise ValueError("log-spaced scale bounds must be finite and positive")
         return jnp.logspace(
             jnp.log10(min_scale),
             jnp.log10(max_scale),
