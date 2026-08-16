@@ -614,6 +614,35 @@ def _open_verified_namespace(
     return descriptor
 
 
+def _directory_identity(directory: Path, *, label: str) -> tuple[int, int]:
+    try:
+        current = os.stat(directory, follow_symlinks=False)
+    except OSError as exc:
+        raise ValueError(f"{label} changed after structural preflight") from exc
+    if not stat.S_ISDIR(current.st_mode):
+        raise ValueError(f"{label} changed after structural preflight")
+    return current.st_dev, current.st_ino
+
+
+def _open_verified_directory(
+    directory: Path, *, expected_identity: tuple[int, int], label: str
+) -> int:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(directory, flags)
+    current = os.fstat(descriptor)
+    if (
+        not stat.S_ISDIR(current.st_mode)
+        or (current.st_dev, current.st_ino) != expected_identity
+    ):
+        os.close(descriptor)
+        raise ValueError(f"{label} changed after structural preflight")
+    return descriptor
+
+
 def _require_namespace_identity(
     namespace: Path, *, expected_identity: tuple[int, int]
 ) -> None:
@@ -1550,9 +1579,13 @@ def _preflight_stage_structure(
         )
     for name in expected_shards:
         _require_regular_file(shards / name, label=f"stage {stage.key} shard")
-    expected_bindings = {
+    expected_executions = {
         f"{Path(name).stem}.execution.v1.json" for name in expected_shards
     }
+    expected_attempts = {
+        f"{Path(name).stem}.attempt.v1.json" for name in expected_shards
+    }
+    expected_bindings = expected_attempts | expected_executions
     observed_bindings = {path.name for path in bindings.iterdir()}
     if observed_bindings != expected_bindings:
         raise ValueError(
@@ -1693,6 +1726,59 @@ def _execution_binding_path(shard_path: Path) -> Path:
     )
 
 
+def _execution_attempt_path(shard_path: Path) -> Path:
+    return (
+        shard_path.parent.parent
+        / "bindings"
+        / f"{shard_path.stem}.attempt.v1.json"
+    )
+
+
+def _execution_attempt_payload(
+    *,
+    root: Path,
+    protocol: LocalProtocol,
+    stage: LocalStage,
+    config_name: str,
+    seed: int,
+    shard_path: Path,
+    runner: Mapping[str, Any],
+    runner_raw: bytes,
+    launch: Mapping[str, Any],
+    launch_raw: bytes,
+    cache: Mapping[str, Any],
+    cache_raw: bytes,
+    started_unix: float,
+) -> dict[str, Any]:
+    return {
+        "schema": "asi.ipmnist_local_prereg.shard_attempt.v1",
+        "protocol_key": protocol.key,
+        "stage_key": stage.key,
+        "config_name": config_name,
+        "seed": seed,
+        "repository": launch["repository"],
+        "runner_context": runner,
+        "runner_receipt_sha256": hashlib.sha256(runner_raw).hexdigest(),
+        "launch_receipt_sha256": hashlib.sha256(launch_raw).hexdigest(),
+        "cache_context": cache,
+        "cache_receipt_sha256": hashlib.sha256(cache_raw).hexdigest(),
+        "data_home": launch["data_home"],
+        "data_home_sha256": launch["data_home_sha256"],
+        "cache_contract": launch["cache_contract"],
+        "shard_path": shard_path.relative_to(root).as_posix(),
+        "started_unix": started_unix,
+        "benchmark_argv": _benchmark_run_argv(
+            root=root,
+            protocol=protocol,
+            stage=stage,
+            config_name=config_name,
+            seed=seed,
+            data_home=cast(str, launch["data_home"]),
+        ),
+        "rerun_allowed": False,
+    }
+
+
 def _execution_binding_payload(
     *,
     root: Path,
@@ -1708,11 +1794,13 @@ def _execution_binding_payload(
     launch_raw: bytes,
     cache: Mapping[str, Any],
     cache_raw: bytes,
+    attempt_raw: bytes,
     started_unix: float,
     finished_unix: float,
     bound_unix: float,
 ) -> dict[str, Any]:
     shard_raw = shard_path.read_bytes()
+    attempt_path = _execution_attempt_path(shard_path)
     return {
         "schema": "asi.ipmnist_local_prereg.shard_execution.v1",
         "protocol_key": protocol.key,
@@ -1725,6 +1813,11 @@ def _execution_binding_payload(
         "launch_receipt_sha256": hashlib.sha256(launch_raw).hexdigest(),
         "cache_context": cache,
         "cache_receipt_sha256": hashlib.sha256(cache_raw).hexdigest(),
+        "attempt_receipt": {
+            "path": attempt_path.relative_to(root).as_posix(),
+            "size_bytes": len(attempt_raw),
+            "sha256": hashlib.sha256(attempt_raw).hexdigest(),
+        },
         "data_home": launch["data_home"],
         "data_home_sha256": launch["data_home_sha256"],
         "cache_contract": launch["cache_contract"],
@@ -1749,6 +1842,100 @@ def _execution_binding_payload(
     }
 
 
+def _validate_execution_attempt(
+    *,
+    root: Path,
+    protocol: LocalProtocol,
+    stage: LocalStage,
+    shard_path: Path,
+    shard: Mapping[str, Any],
+    runner: Mapping[str, Any],
+    runner_raw: bytes,
+    launch: Mapping[str, Any],
+    launch_raw: bytes,
+    cache: Mapping[str, Any],
+    cache_raw: bytes,
+) -> tuple[dict[str, Any], bytes]:
+    attempt_path = _execution_attempt_path(shard_path)
+    attempt, attempt_raw = _strict_json_bytes(attempt_path)
+    _require_exact_keys(
+        attempt,
+        {
+            "schema",
+            "protocol_key",
+            "stage_key",
+            "config_name",
+            "seed",
+            "repository",
+            "runner_context",
+            "runner_receipt_sha256",
+            "launch_receipt_sha256",
+            "cache_context",
+            "cache_receipt_sha256",
+            "data_home",
+            "data_home_sha256",
+            "cache_contract",
+            "shard_path",
+            "started_unix",
+            "benchmark_argv",
+            "rerun_allowed",
+        },
+        context=f"execution attempt {attempt_path}",
+    )
+    config_name = cast(str, shard["config_name"])
+    seed = cast(int, shard["seed"])
+    if (
+        attempt["schema"] != "asi.ipmnist_local_prereg.shard_attempt.v1"
+        or attempt["protocol_key"] != protocol.key
+        or attempt["stage_key"] != stage.key
+        or attempt["config_name"] != config_name
+        or type(attempt["seed"]) is not int
+        or attempt["seed"] != seed
+        or attempt["rerun_allowed"] is not False
+        or _canonical_json(attempt["repository"])
+        != _canonical_json(launch["repository"])
+        or _canonical_json(attempt["runner_context"]) != _canonical_json(runner)
+        or attempt["runner_receipt_sha256"]
+        != hashlib.sha256(runner_raw).hexdigest()
+        or attempt["launch_receipt_sha256"]
+        != hashlib.sha256(launch_raw).hexdigest()
+        or _canonical_json(attempt["cache_context"]) != _canonical_json(cache)
+        or attempt["cache_receipt_sha256"] != hashlib.sha256(cache_raw).hexdigest()
+        or attempt["data_home"] != launch["data_home"]
+        or attempt["data_home_sha256"] != launch["data_home_sha256"]
+        or _canonical_json(attempt["cache_contract"])
+        != _canonical_json(launch["cache_contract"])
+        or attempt["shard_path"] != shard_path.relative_to(root).as_posix()
+        or _canonical_json(attempt["benchmark_argv"])
+        != _canonical_json(
+            _benchmark_run_argv(
+                root=root,
+                protocol=protocol,
+                stage=stage,
+                config_name=config_name,
+                seed=seed,
+                data_home=cast(str, launch["data_home"]),
+            )
+        )
+    ):
+        raise ValueError(
+            "execution attempt differs from the authorized runner, cache, source, or shard"
+        )
+    launch_unix = _parse_utc(launch["launch_created_at"], label="launch").timestamp()
+    cache_unix = _parse_utc(cache["checked_at"], label="cache receipt").timestamp()
+    started_unix = _finite_float(
+        attempt["started_unix"], name="execution attempt started_unix"
+    )
+    shard_created_unix = _finite_float(
+        shard.get("created_unix"), name="execution attempt shard created_unix"
+    )
+    if not launch_unix < cache_unix < started_unix < shard_created_unix:
+        raise ValueError(
+            "execution attempt chronology must be launch < cache < start < shard"
+        )
+    return attempt, attempt_raw
+
+
 def _validate_execution_binding(
     *,
     root: Path,
@@ -1764,6 +1951,19 @@ def _validate_execution_binding(
     cache_raw: bytes,
     summary_created_unix: float,
 ) -> dict[str, Any]:
+    attempt, attempt_raw = _validate_execution_attempt(
+        root=root,
+        protocol=protocol,
+        stage=stage,
+        shard_path=shard_path,
+        shard=shard,
+        runner=runner,
+        runner_raw=runner_raw,
+        launch=launch,
+        launch_raw=launch_raw,
+        cache=cache,
+        cache_raw=cache_raw,
+    )
     binding_path = _execution_binding_path(shard_path)
     binding, binding_raw = _strict_json_bytes(binding_path)
     _require_exact_keys(
@@ -1780,6 +1980,7 @@ def _validate_execution_binding(
             "launch_receipt_sha256",
             "cache_context",
             "cache_receipt_sha256",
+            "attempt_receipt",
             "data_home",
             "data_home_sha256",
             "cache_contract",
@@ -1804,6 +2005,12 @@ def _validate_execution_binding(
         "sha256": hashlib.sha256(shard_raw).hexdigest(),
         "created_unix": shard_created_unix,
     }
+    attempt_path = _execution_attempt_path(shard_path)
+    expected_attempt = {
+        "path": attempt_path.relative_to(root).as_posix(),
+        "size_bytes": len(attempt_raw),
+        "sha256": hashlib.sha256(attempt_raw).hexdigest(),
+    }
     if (
         binding["schema"] != "asi.ipmnist_local_prereg.shard_execution.v1"
         or binding["protocol_key"] != protocol.key
@@ -1821,6 +2028,8 @@ def _validate_execution_binding(
         != hashlib.sha256(launch_raw).hexdigest()
         or _canonical_json(binding["cache_context"]) != _canonical_json(cache)
         or binding["cache_receipt_sha256"] != hashlib.sha256(cache_raw).hexdigest()
+        or _canonical_json(binding["attempt_receipt"])
+        != _canonical_json(expected_attempt)
         or binding["data_home"] != launch["data_home"]
         or binding["data_home_sha256"] != launch["data_home_sha256"]
         or _canonical_json(binding["cache_contract"])
@@ -1846,6 +2055,9 @@ def _validate_execution_binding(
     started_unix = _finite_float(
         binding["started_unix"], name="execution binding started_unix"
     )
+    attempt_started_unix = _finite_float(
+        attempt["started_unix"], name="execution attempt started_unix"
+    )
     finished_unix = _finite_float(
         binding["finished_unix"], name="execution binding finished_unix"
     )
@@ -1860,7 +2072,7 @@ def _validate_execution_binding(
         < finished_unix
         < bound_unix
         < summary_created_unix
-    ):
+    ) or started_unix != attempt_started_unix:
         raise ValueError(
             "execution binding chronology must be launch < cache < start < shard < "
             "finish < binding < summary"
@@ -1871,6 +2083,7 @@ def _validate_execution_binding(
         "sha256": hashlib.sha256(binding_raw).hexdigest(),
         "config_name": config_name,
         "seed": seed,
+        "attempt_receipt": expected_attempt,
     }
 
 
@@ -1972,7 +2185,7 @@ def _validate_collection(
         )
         if shard_created_unix <= launch_unix or shard_created_unix <= cache_unix:
             raise ValueError(
-                "every shard must be created strictly after the bound launch and cache"
+                "every shard must be created strictly after the cache receipt and bound launch"
             )
         shard_created_times.append(shard_created_unix)
         if (
@@ -2154,11 +2367,17 @@ def _validate_stage(
     if not bindings_dir.is_dir() or bindings_dir.is_symlink():
         raise ValueError(f"stage {stage.key} execution binding directory is invalid")
     paths = sorted(shards_dir.iterdir())
-    expected_bindings = {
+    expected_executions = {
         f"{arm}_seed{seed}.execution.v1.json"
         for arm in (protocol.control, protocol.candidate)
         for seed in stage.seeds
     }
+    expected_attempts = {
+        f"{arm}_seed{seed}.attempt.v1.json"
+        for arm in (protocol.control, protocol.candidate)
+        for seed in stage.seeds
+    }
+    expected_bindings = expected_attempts | expected_executions
     observed_bindings = {path.name for path in bindings_dir.iterdir()}
     if observed_bindings != expected_bindings:
         raise ValueError(
@@ -2314,11 +2533,42 @@ def _preflight_partial_stage_structure(
         )
     for name in observed_shards:
         _require_regular_file(shards / name, label=f"stage {stage.key} shard")
-    expected_bindings = {
-        f"{Path(name).stem}.execution.v1.json" for name in observed_shards
-    }
     observed_bindings = {path.name for path in bindings.iterdir()}
-    if observed_bindings != expected_bindings:
+    authorized_attempts = {
+        f"{Path(name).stem}.attempt.v1.json" for name in expected_shards
+    }
+    authorized_executions = {
+        f"{Path(name).stem}.execution.v1.json" for name in expected_shards
+    }
+    if not observed_bindings.issubset(authorized_attempts | authorized_executions):
+        raise ValueError(
+            f"in-progress stage {stage.key} contains an unauthorized binding path"
+        )
+    for shard_name in observed_shards:
+        stem = Path(shard_name).stem
+        if not {
+            f"{stem}.attempt.v1.json",
+            f"{stem}.execution.v1.json",
+        }.issubset(observed_bindings):
+            raise ValueError(
+                f"in-progress stage {stage.key} has an orphan shard or execution binding"
+            )
+    for execution_name in observed_bindings & authorized_executions:
+        stem = execution_name.removesuffix(".execution.v1.json")
+        if (
+            f"{stem}.json" not in observed_shards
+            or f"{stem}.attempt.v1.json" not in observed_bindings
+        ):
+            raise ValueError(
+                f"in-progress stage {stage.key} has an orphan shard or execution binding"
+            )
+    if any(
+        name.endswith(".attempt.v1.json")
+        and f"{name.removesuffix('.attempt.v1.json')}.json" in observed_shards
+        and f"{name.removesuffix('.attempt.v1.json')}.execution.v1.json"
+        not in observed_bindings
+        for name in observed_bindings
+    ):
         raise ValueError(
             f"in-progress stage {stage.key} has an orphan shard or execution binding"
         )
@@ -2512,8 +2762,13 @@ def run_local_shard(
             stage_root=stage_root,
         )
     shard_path = shards / f"{config_name}_seed{seed}.json"
+    attempt_path = _execution_attempt_path(shard_path)
     binding_path = bindings / f"{config_name}_seed{seed}.execution.v1.json"
-    if os.path.lexists(shard_path) or os.path.lexists(binding_path):
+    if (
+        os.path.lexists(shard_path)
+        or os.path.lexists(attempt_path)
+        or os.path.lexists(binding_path)
+    ):
         raise FileExistsError(
             f"shard attempt is already consumed and may not be rerun: {shard_path}"
         )
@@ -2576,69 +2831,120 @@ def run_local_shard(
         data_home=cast(str, context.launch["data_home"]),
     )
     handler = screening.main if benchmark_main is None else benchmark_main
-    previous_cwd = Path.cwd()
-    try:
-        os.chdir(resolved_root)
-        returncode = handler(argv)
-    finally:
-        os.chdir(previous_cwd)
-    if type(returncode) is not int or returncode != 0:
-        raise RuntimeError(f"authorized benchmark shard failed with exit code {returncode!r}")
-    finished_unix = _finite_float(clock(), name="shard execution finished_unix")
-    if finished_unix <= started_unix:
-        raise ValueError("shard execution finish must be strictly after its start")
-    _require_namespace_identity(namespace, expected_identity=namespace_identity)
-    _require_real_directory(shards, label=f"stage {stage.key} shards")
-    _require_real_directory(bindings, label=f"stage {stage.key} execution bindings")
-    _require_regular_file(shard_path, label="executed shard")
-    if os.path.lexists(binding_path):
-        raise FileExistsError(f"execution binding path is already occupied: {binding_path}")
-    after = _load_authorized_context(
-        protocol=protocol,
-        root=resolved_root,
-        namespace=namespace,
-        repository_identity=repository_identity,
-        runner_receipt=runner_receipt,
-        verify_cache_file=verify_cache_file,
-    )
-    if not _authorized_context_unchanged(context, after):
-        raise ValueError("authorized source, runner, launch, or cache changed during execution")
-    shard = screening.load_shard(shard_path)
-    shard_created_unix = _validate_run_shard_payload(
-        screening=screening,
-        path=shard_path,
-        payload=shard,
-        protocol=protocol,
-        stage=stage,
-        config_name=config_name,
-        seed=seed,
-        context=after,
-    )
-    if not started_unix < shard_created_unix < finished_unix:
-        raise ValueError("executed shard must be created strictly between start and finish")
-    bound_unix = _finite_float(clock(), name="shard execution bound_unix")
-    if bound_unix <= finished_unix:
-        raise ValueError("execution binding must be created strictly after the shard finishes")
-    receipt = _execution_binding_payload(
+    attempt = _execution_attempt_payload(
         root=resolved_root,
         protocol=protocol,
         stage=stage,
         config_name=config_name,
         seed=seed,
         shard_path=shard_path,
-        shard=shard,
-        runner=after.runner,
-        runner_raw=after.runner_raw,
-        launch=after.launch,
-        launch_raw=after.launch_raw,
-        cache=after.cache,
-        cache_raw=after.cache_raw,
+        runner=context.runner,
+        runner_raw=context.runner_raw,
+        launch=context.launch,
+        launch_raw=context.launch_raw,
+        cache=context.cache,
+        cache_raw=context.cache_raw,
         started_unix=started_unix,
-        finished_unix=finished_unix,
-        bound_unix=bound_unix,
     )
-    _write_json_exclusive(binding_path, receipt)
-    return receipt
+    attempt_raw = _receipt_bytes(attempt)
+    bindings_identity = _directory_identity(
+        bindings, label=f"stage {stage.key} execution bindings"
+    )
+    bindings_fd = _open_verified_directory(
+        bindings,
+        expected_identity=bindings_identity,
+        label=f"stage {stage.key} execution bindings",
+    )
+    try:
+        try:
+            _write_json_exclusive_at(bindings_fd, attempt_path.name, attempt)
+        except FileExistsError as exc:
+            raise FileExistsError(
+                f"shard attempt is already consumed and may not be rerun: {shard_path}"
+            ) from exc
+        previous_cwd = Path.cwd()
+        try:
+            os.chdir(resolved_root)
+            returncode = handler(argv)
+        finally:
+            os.chdir(previous_cwd)
+        if type(returncode) is not int or returncode != 0:
+            raise RuntimeError(
+                f"authorized benchmark shard failed with exit code {returncode!r}"
+            )
+        finished_unix = _finite_float(clock(), name="shard execution finished_unix")
+        if finished_unix <= started_unix:
+            raise ValueError("shard execution finish must be strictly after its start")
+        _require_namespace_identity(namespace, expected_identity=namespace_identity)
+        _require_real_directory(shards, label=f"stage {stage.key} shards")
+        _require_real_directory(bindings, label=f"stage {stage.key} execution bindings")
+        if (
+            _directory_identity(
+                bindings, label=f"stage {stage.key} execution bindings"
+            )
+            != bindings_identity
+        ):
+            raise ValueError(
+                f"stage {stage.key} execution bindings changed during execution"
+            )
+        _require_regular_file(shard_path, label="executed shard")
+        if os.path.lexists(binding_path):
+            raise FileExistsError(
+                f"execution binding path is already occupied: {binding_path}"
+            )
+        after = _load_authorized_context(
+            protocol=protocol,
+            root=resolved_root,
+            namespace=namespace,
+            repository_identity=repository_identity,
+            runner_receipt=runner_receipt,
+            verify_cache_file=verify_cache_file,
+        )
+        if not _authorized_context_unchanged(context, after):
+            raise ValueError(
+                "authorized source, runner, launch, or cache changed during execution"
+            )
+        shard = screening.load_shard(shard_path)
+        shard_created_unix = _validate_run_shard_payload(
+            screening=screening,
+            path=shard_path,
+            payload=shard,
+            protocol=protocol,
+            stage=stage,
+            config_name=config_name,
+            seed=seed,
+            context=after,
+        )
+        if not started_unix < shard_created_unix < finished_unix:
+            raise ValueError("executed shard must be created strictly between start and finish")
+        bound_unix = _finite_float(clock(), name="shard execution bound_unix")
+        if bound_unix <= finished_unix:
+            raise ValueError(
+                "execution binding must be created strictly after the shard finishes"
+            )
+        receipt = _execution_binding_payload(
+            root=resolved_root,
+            protocol=protocol,
+            stage=stage,
+            config_name=config_name,
+            seed=seed,
+            shard_path=shard_path,
+            shard=shard,
+            runner=after.runner,
+            runner_raw=after.runner_raw,
+            launch=after.launch,
+            launch_raw=after.launch_raw,
+            cache=after.cache,
+            cache_raw=after.cache_raw,
+            attempt_raw=attempt_raw,
+            started_unix=started_unix,
+            finished_unix=finished_unix,
+            bound_unix=bound_unix,
+        )
+        _write_json_exclusive_at(bindings_fd, binding_path.name, receipt)
+        return receipt
+    finally:
+        os.close(bindings_fd)
 
 
 def _finalize_result_bundle(

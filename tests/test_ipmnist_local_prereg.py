@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import runpy
+import threading
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, cast
@@ -24,6 +25,7 @@ _canonical_sha256 = cast(Any, _DRIVER["_canonical_sha256"])
 _claim_namespace = cast(Any, _DRIVER["_claim_namespace"])
 _classify_issue184 = cast(Any, _DRIVER["classify_issue184"])
 _claim_local_launch = cast(Any, _DRIVER["claim_local_launch"])
+_execution_attempt_payload = cast(Any, _DRIVER["_execution_attempt_payload"])
 _l2init_gate_passes = cast(Any, _DRIVER["l2init_gate_passes"])
 _parse_cpuset = cast(Any, _DRIVER["_parse_cpuset"])
 _receipt_sha256 = cast(Any, _DRIVER["_receipt_sha256"])
@@ -748,6 +750,24 @@ def _write_execution_bindings(
         bound_unix = (finished_unix + summary_created_unix) / 2.0
         config_name = cast(str, shard["config_name"])
         seed = cast(int, shard["seed"])
+        attempt = _execution_attempt_payload(
+            root=root,
+            protocol=protocol,
+            stage=stage,
+            config_name=config_name,
+            seed=seed,
+            shard_path=shard_path,
+            runner=runner,
+            runner_raw=runner_raw,
+            launch=launch,
+            launch_raw=launch_raw,
+            cache=cache,
+            cache_raw=cache_raw,
+            started_unix=started_unix,
+        )
+        attempt_path = bindings / f"{config_name}_seed{seed}.attempt.v1.json"
+        _write_json_exclusive(attempt_path, attempt)
+        attempt_raw = attempt_path.read_bytes()
         receipt = {
             "schema": "asi.ipmnist_local_prereg.shard_execution.v1",
             "protocol_key": protocol.key,
@@ -760,6 +780,11 @@ def _write_execution_bindings(
             "launch_receipt_sha256": hashlib.sha256(launch_raw).hexdigest(),
             "cache_context": cache,
             "cache_receipt_sha256": hashlib.sha256(cache_raw).hexdigest(),
+            "attempt_receipt": {
+                "path": attempt_path.relative_to(root).as_posix(),
+                "size_bytes": len(attempt_raw),
+                "sha256": hashlib.sha256(attempt_raw).hexdigest(),
+            },
             "data_home": launch["data_home"],
             "data_home_sha256": launch["data_home_sha256"],
             "cache_contract": launch["cache_contract"],
@@ -961,6 +986,106 @@ def test_run_shard_wrapper_binds_one_exact_in_process_execution(tmp_path: Path) 
             benchmark_main=fake_benchmark,
         )
     assert len(calls) == 1
+
+
+def test_failed_shard_attempt_is_consumed_before_the_benchmark_can_be_retried(
+    tmp_path: Path,
+) -> None:
+    namespace = _write_protocol_receipts(tmp_path, "issue184")
+    protocol = _PROTOCOLS["issue184"]
+    arm = cast(str, protocol.control)
+    calls: list[list[str]] = []
+
+    def failing_benchmark(argv: Any) -> int:
+        calls.append(list(argv))
+        return 1
+
+    kwargs = {
+        "protocol_key": "issue184",
+        "root": tmp_path,
+        "stage_key": "screen_60",
+        "config_name": arm,
+        "seed": 0,
+        "repository_identity": _repository_identity(),
+        "runner_receipt": _runner_receipt(),
+        "verify_cache_file": False,
+        "benchmark_main": failing_benchmark,
+        "clock": lambda: 1_786_880_000.0,
+    }
+    with pytest.raises(RuntimeError, match="exit code 1"):
+        _run_local_shard(**kwargs)
+    attempt = namespace / f"screen_60/bindings/{arm}_seed0.attempt.v1.json"
+    assert attempt.is_file()
+    assert not (namespace / f"screen_60/shards/{arm}_seed0.json").exists()
+    assert not (
+        namespace / f"screen_60/bindings/{arm}_seed0.execution.v1.json"
+    ).exists()
+
+    with pytest.raises(FileExistsError, match="already consumed"):
+        _run_local_shard(**kwargs)
+    assert len(calls) == 1
+
+
+def test_concurrent_shard_attempts_claim_once_before_entering_the_benchmark(
+    tmp_path: Path,
+) -> None:
+    namespace = _write_protocol_receipts(tmp_path, "issue184")
+    protocol = _PROTOCOLS["issue184"]
+    arm = cast(str, protocol.control)
+    entered = threading.Event()
+    release = threading.Event()
+    calls: list[list[str]] = []
+    errors: list[BaseException] = []
+
+    def blocked_benchmark(argv: Any) -> int:
+        calls.append(list(argv))
+        entered.set()
+        assert release.wait(timeout=5.0)
+        return 1
+
+    kwargs = {
+        "protocol_key": "issue184",
+        "root": tmp_path,
+        "stage_key": "screen_60",
+        "config_name": arm,
+        "seed": 0,
+        "repository_identity": _repository_identity(),
+        "runner_receipt": _runner_receipt(),
+        "verify_cache_file": False,
+        "benchmark_main": blocked_benchmark,
+        "clock": lambda: 1_786_880_000.0,
+    }
+
+    def invoke() -> None:
+        try:
+            _run_local_shard(**kwargs)
+        except BaseException as exc:
+            errors.append(exc)
+
+    original_cwd = Path.cwd()
+    first = threading.Thread(target=invoke)
+    second = threading.Thread(target=invoke)
+    try:
+        first.start()
+        assert entered.wait(timeout=5.0)
+        second.start()
+        second.join(timeout=1.0)
+        release.set()
+        first.join(timeout=5.0)
+        second.join(timeout=5.0)
+    finally:
+        release.set()
+        first.join(timeout=5.0)
+        second.join(timeout=5.0)
+        os.chdir(original_cwd)
+
+    assert not first.is_alive() and not second.is_alive()
+    assert len(calls) == 1
+    assert sum(isinstance(exc, FileExistsError) for exc in errors) == 1
+    assert sum(isinstance(exc, RuntimeError) for exc in errors) == 1
+    assert (
+        namespace / f"screen_60/bindings/{arm}_seed0.attempt.v1.json"
+    ).is_file()
 
 
 def _write_combined_summary(root: Path) -> Path:
@@ -1253,10 +1378,25 @@ def _first_execution_binding(namespace: Path) -> Path:
     )
 
 
-def test_every_shard_requires_one_full_execution_binding(tmp_path: Path) -> None:
+def _first_execution_attempt(namespace: Path) -> Path:
+    return (
+        namespace
+        / "screen_60/bindings/rls_head_resid_l1_noreset_seed0.attempt.v1.json"
+    )
+
+
+@pytest.mark.parametrize("receipt", ["attempt", "execution"])
+def test_every_shard_requires_one_attempt_and_execution_binding(
+    tmp_path: Path, receipt: str
+) -> None:
     namespace = _write_protocol_receipts(tmp_path, "issue184")
     _write_stage(tmp_path, "issue184", "screen_60", differences=(0.003,) * 3)
-    _first_execution_binding(namespace).unlink()
+    path = (
+        _first_execution_attempt(namespace)
+        if receipt == "attempt"
+        else _first_execution_binding(namespace)
+    )
+    path.unlink()
     with pytest.raises(ValueError, match="execution binding"):
         _validate(tmp_path, "issue184")
 
@@ -1274,6 +1414,7 @@ def test_every_shard_requires_one_full_execution_binding(tmp_path: Path) -> None
         "runner-digest",
         "launch-digest",
         "cache-digest",
+        "attempt-digest",
         "shard-digest",
     ],
 )
@@ -1306,6 +1447,8 @@ def test_execution_binding_rejects_resigned_runner_cache_or_shard_drift(
         binding["launch_receipt_sha256"] = "a" * 64
     elif tamper == "cache-digest":
         binding["cache_receipt_sha256"] = "a" * 64
+    elif tamper == "attempt-digest":
+        binding["attempt_receipt"]["sha256"] = "a" * 64
     else:
         binding["shard"]["sha256"] = "a" * 64
     binding_path.write_text(
