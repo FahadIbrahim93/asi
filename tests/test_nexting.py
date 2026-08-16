@@ -356,6 +356,19 @@ class TestRMSE:
 
 
 class TestRunningRMSE:
+    def test_large_finite_errors_do_not_overflow(self) -> None:
+        predictions = jnp.asarray([[2.0e20], [2.0e20]], dtype=jnp.float32)
+        returns = jnp.zeros_like(predictions)
+
+        with jax.debug_infs(True):
+            running = per_horizon_running_rmse(predictions, returns, window_size=2)
+
+        assert bool(jnp.all(jnp.isfinite(running)))
+        np.testing.assert_allclose(
+            np.asarray(running),
+            np.full((2, 1), 2.0e20, dtype=np.float32),
+        )
+
     def test_shape(self) -> None:
         t, h = 50, 3
         preds = jnp.zeros((t, h))

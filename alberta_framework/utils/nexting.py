@@ -262,9 +262,16 @@ def per_horizon_running_rmse(
             f"window_size must satisfy 1 <= window_size <= n_steps "
             f"(got window_size={window_size}, n_steps={n_steps})"
         )
-    sq_err = (predictions - forward_returns) ** 2  # (T, H)
-    cumsum = jnp.cumsum(jnp.concatenate([jnp.zeros((1, sq_err.shape[1])), sq_err]), axis=0)
+    errors = predictions - forward_returns
+    scale = jnp.max(jnp.abs(errors), axis=0)
+    _, exponent = jnp.frexp(scale)
+    scaled_errors = jnp.ldexp(errors, -exponent)
+    sq_err = scaled_errors**2  # (T, H)
+    cumsum = jnp.cumsum(
+        jnp.concatenate([jnp.zeros((1, sq_err.shape[1]), dtype=sq_err.dtype), sq_err]),
+        axis=0,
+    )
     window = cumsum[window_size:] - cumsum[:-window_size]
-    running = jnp.sqrt(window / window_size)
+    running = jnp.ldexp(jnp.sqrt(window / window_size), exponent)
     pad = jnp.broadcast_to(running[0], (window_size - 1, sq_err.shape[1]))
     return jnp.concatenate([pad, running], axis=0)
