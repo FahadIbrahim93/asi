@@ -235,10 +235,13 @@ def test_nonfinite_world_prediction_marks_the_dream_step_invalid_and_stops() -> 
     chex.assert_trees_all_close(gvf_items.weights, jnp.zeros((3,), dtype=jnp.float32))
     sarsa_items = imagined_rollout_to_sarsa_items(rollout)
     chex.assert_trees_all_close(sarsa_items.weights, jnp.zeros((3,), dtype=jnp.float32))
-    item = imagined_transition_to_supervised_item(
-        jax.tree.map(lambda leaf: leaf[0], rollout.transitions)
-    )
+    transition = jax.tree.map(lambda leaf: leaf[0], rollout.transitions)
+    item = imagined_transition_to_supervised_item(transition)
+    gvf_item = imagined_transition_to_gvf_item(transition)
     assert float(item.weights) == 0.0
+    for converted in (item, gvf_item, gvf_items, sarsa_items):
+        for leaf in jax.tree.leaves(converted):
+            assert bool(jnp.all(jnp.isfinite(leaf)))
 
 
 @pytest.mark.parametrize("field", ["reward", "discount", "confidence", "model_error"])
