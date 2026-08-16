@@ -289,13 +289,14 @@ def test_experiential_dimensions_preflight_without_allocation() -> None:
 def test_experiential_state_preflight_bytes_without_allocation() -> None:
     # Minimal vector=4 (1,1,1,1) -> slot=64, persistent=capacity*64+32.
     last_legal = (2**31 - 1 - 32) // 64
-    ExperientialMemoryConfig(
-        capacity=last_legal,
-        observation_dim=1,
-        key_dim=1,
-        action_dim=1,
-        outcome_dim=1,
-    )
+    with pytest.raises(ValueError, match="aggregate query working-set bytes"):
+        ExperientialMemoryConfig(
+            capacity=last_legal,
+            observation_dim=1,
+            key_dim=1,
+            action_dim=1,
+            outcome_dim=1,
+        )
     with pytest.raises(ValueError, match="byte count"):
         ExperientialMemoryConfig(
             capacity=last_legal + 1,
@@ -339,3 +340,69 @@ def test_experiential_memory_exact_serialized_boundaries() -> None:
     outer = ExperientialMemory(config).to_config()
     with pytest.raises(ValueError, match="nested config"):
         ExperientialMemory.from_config({**outer, "config": HostileDict(payload)})
+
+
+@pytest.mark.parametrize("field", ["staleness_scale", "recency_scale"])
+def test_age_scale_rejects_float32_division_overflow(field: str) -> None:
+    with pytest.raises(ValueError, match=field):
+        ExperientialMemoryConfig(
+            capacity=4,
+            observation_dim=2,
+            key_dim=2,
+            action_dim=1,
+            outcome_dim=1,
+            **{field: np.nextafter(np.float32(0.0), np.float32(1.0))},
+        )
+
+
+@pytest.mark.parametrize("field", ["staleness_scale", "recency_scale"])
+def test_age_scale_accepts_first_float32_value_with_finite_saturated_division(
+    field: str,
+) -> None:
+    maximum = np.float32(np.iinfo(np.int32).max)
+    rounded_boundary = np.float32(
+        np.iinfo(np.int32).max / float(np.finfo(np.float32).max)
+    )
+    safe = np.nextafter(rounded_boundary, np.float32(np.inf), dtype=np.float32)
+    unsafe = np.nextafter(safe, np.float32(0.0), dtype=np.float32)
+    with np.errstate(over="ignore"):
+        assert not np.isfinite(maximum / unsafe)
+        assert np.isfinite(maximum / safe)
+    common = {
+        "capacity": 4,
+        "observation_dim": 2,
+        "key_dim": 2,
+        "action_dim": 1,
+        "outcome_dim": 1,
+    }
+    with pytest.raises(ValueError, match=field):
+        ExperientialMemoryConfig(**common, **{field: unsafe})
+    config = ExperientialMemoryConfig(**common, **{field: safe})
+    assert getattr(config, field) == float(safe)
+
+
+def test_aggregate_query_working_set_is_bounded_before_jax_allocation() -> None:
+    common = {
+        "observation_dim": 1,
+        "key_dim": 1,
+        "action_dim": 1,
+        "outcome_dim": 1,
+        "top_k": 1,
+    }
+    ExperientialMemoryConfig(capacity=11_000_000, **common)
+    with pytest.raises(ValueError, match="aggregate query working-set bytes"):
+        ExperientialMemoryConfig(capacity=12_000_000, **common)
+
+
+def test_eviction_weight_sum_must_be_positive_at_the_float32_sink() -> None:
+    tiny = float(np.nextafter(np.float32(0.0), np.float32(1.0))) / 2.0
+    with pytest.raises(ValueError, match="retention weight"):
+        ExperientialMemoryConfig(
+            capacity=4,
+            observation_dim=2,
+            key_dim=2,
+            action_dim=1,
+            outcome_dim=1,
+            eviction_utility_weight=tiny,
+            eviction_recency_weight=tiny,
+        )
