@@ -330,6 +330,27 @@ def test_aggregate_metrics_rejects_metric_schema_drift_in_later_seed() -> None:
         )
 
 
+def test_aggregate_metrics_rejects_runs_from_different_configs() -> None:
+    """Two arms must not be averaged into one AggregatedResults under the first arm's name."""
+    treatment = _single_run(0, [9.0, 9.0])._replace(config_name="treatment")
+    with pytest.raises(
+        ValueError,
+        match=r"^aggregate_metrics requires runs from one configuration; "
+        r"got \['candidate', 'treatment'\]$",
+    ):
+        aggregate_metrics([_single_run(0, [1.0, 1.0]), treatment])
+
+
+def test_aggregate_metrics_rejects_duplicate_seed_identities() -> None:
+    with pytest.raises(
+        ValueError,
+        match=r"^aggregate_metrics requires unique seed identities; got \[0, 1, 0\]$",
+    ):
+        aggregate_metrics(
+            [_single_run(0, [1.0, 1.0]), _single_run(1, [2.0, 2.0]), _single_run(0, [3.0, 3.0])]
+        )
+
+
 def test_get_metric_timeseries_rejects_nonfinite_samples() -> None:
     poisoned = _two_seed_trace()
     poisoned.metric_arrays["squared_error"][0, 1] = np.inf
