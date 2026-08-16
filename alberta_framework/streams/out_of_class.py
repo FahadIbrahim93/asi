@@ -222,12 +222,19 @@ class OutOfClassPolynomialStream:
         n_tasks = require_positive_builtin_int(n_tasks, name="n_tasks")
         n_contexts = require_positive_builtin_int(n_contexts, name="n_contexts")
         context_length = require_positive_builtin_int(context_length, name="context_length")
-        if context_length > _INT32_MAX:
-            raise ValueError("context_length must be at most int32 max")
         active_triples_per_context = require_positive_builtin_int(
             active_triples_per_context,
             name="active_triples_per_context",
         )
+        for name, value in (
+            ("feature_dim", feature_dim),
+            ("n_tasks", n_tasks),
+            ("n_contexts", n_contexts),
+            ("context_length", context_length),
+            ("active_triples_per_context", active_triples_per_context),
+        ):
+            if value > _INT32_MAX:
+                raise ValueError(f"{name} must be at most int32 max")
         feature_std = _require_finite_float32_multiplier(
             feature_std,
             name="feature_std",

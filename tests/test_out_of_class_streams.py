@@ -117,9 +117,19 @@ class TestOutOfClassPolynomialStream:
         with pytest.raises(ValueError, match=field):
             OutOfClassPolynomialStream(**{field: value})  # type: ignore[arg-type]
 
-    def test_context_length_rejects_values_above_the_step_int32_domain(self) -> None:
-        with pytest.raises(ValueError, match="context_length.*int32 max"):
-            OutOfClassPolynomialStream(context_length=2**31)
+    @pytest.mark.parametrize(
+        "field",
+        [
+            "feature_dim",
+            "n_tasks",
+            "n_contexts",
+            "context_length",
+            "active_triples_per_context",
+        ],
+    )
+    def test_dimensions_reject_values_above_the_int32_domain(self, field: str) -> None:
+        with pytest.raises(ValueError, match=rf"{field}.*int32 max"):
+            OutOfClassPolynomialStream(**{field: 2**31})  # type: ignore[arg-type]
 
     def test_context_length_accepts_int32_max_and_runs_eager_and_jit_step(self) -> None:
         maximum = int(np.iinfo(np.int32).max)
