@@ -173,8 +173,18 @@ def per_horizon_rmse(
     if burn_in:
         predictions = predictions[burn_in:]
         forward_returns = forward_returns[burn_in:]
-    sq_err = (predictions - forward_returns) ** 2
-    return jnp.sqrt(jnp.mean(sq_err, axis=0))
+    errors = predictions - forward_returns
+    sq_err = errors**2
+    raw_rmse = jnp.sqrt(jnp.mean(sq_err, axis=0))
+
+    # Scale before squaring so large, finite float32 errors do not overflow.
+    # Keep the direct result for non-finite inputs so NaN/Inf diagnostics remain
+    # visible to callers instead of being hidden by the stable path.
+    scale = jnp.max(jnp.abs(errors), axis=0)
+    normalized = jnp.where(scale > 0.0, errors / scale, jnp.zeros_like(errors))
+    stable_rmse = scale * jnp.sqrt(jnp.mean(normalized**2, axis=0))
+    finite_columns = jnp.all(jnp.isfinite(errors), axis=0)
+    return jnp.where(finite_columns, stable_rmse, raw_rmse)
 
 
 def per_horizon_running_rmse(

@@ -120,6 +120,15 @@ class TestMultiChannel:
 
 
 class TestRMSE:
+    def test_large_finite_errors_do_not_overflow(self) -> None:
+        predictions = jnp.asarray([[2.0e20], [2.0e20]], dtype=jnp.float32)
+        returns = jnp.zeros_like(predictions)
+
+        rmse = per_horizon_rmse(predictions, returns)
+
+        assert bool(jnp.isfinite(rmse[0]))
+        np.testing.assert_allclose(np.asarray(rmse), np.asarray([2.0e20], dtype=np.float32))
+
     def test_zero_error_when_predictions_match(self) -> None:
         t, h = 50, 4
         truths = jnp.ones((t, h))
