@@ -96,6 +96,7 @@ _RAW_GLOBAL_PROFILES = frozenset(
         "official_experiment_global",
     }
 )
+_INT32_MAX = 2_147_483_647
 
 
 def _static_zero_scale(scale: float, value: Array) -> Array:
@@ -103,6 +104,14 @@ def _static_zero_scale(scale: float, value: Array) -> Array:
     if scale == 0.0:
         return jnp.zeros_like(value)
     return scale * value
+
+
+def _saturating_increment(value: Array, increment: Array | int = 1) -> Array:
+    """Increment a non-negative int32 counter without lifetime wraparound."""
+
+    maximum = jnp.asarray(_INT32_MAX, dtype=jnp.int32)
+    increment_array = jnp.asarray(increment, dtype=jnp.int32)
+    return value + jnp.minimum(increment_array, maximum - value)
 
 
 @dataclass(frozen=True)
@@ -367,6 +376,13 @@ class CanonicalUPGD:
         ``noise`` may supply the already-scaled perturbation PyTree ``xi`` for
         equation-level parity tests.  Normal operation omits it and samples
         ``N(0, noise_std**2)`` from ``key``.
+
+        The final representable int32 clock event is applied.  Once the clock
+        reaches ``INT32_MAX``, later calls reject atomically: parameters,
+        optimizer state, and the key remain exact; computed payloads are
+        neutral; and ``metrics["update_applied"]`` is false.  This avoids both
+        counter wraparound and silently continuing an EMA with a frozen bias-
+        correction clock.
         """
 
         param_leaves, structure = _flatten_with_none(params)
@@ -399,7 +415,9 @@ class CanonicalUPGD:
         next_key = split_keys[0]
         noise_keys = split_keys[1:]
         beta = self._config.utility_decay
-        next_step = state.step + jnp.array(1, dtype=jnp.int32)
+        maximum_step = jnp.asarray(_INT32_MAX, dtype=jnp.int32)
+        capacity_available = state.step < maximum_step
+        next_step = _saturating_increment(state.step)
 
         corrected_leaves: list[Array] = []
         new_utility_leaves: list[Array] = []
@@ -440,7 +458,7 @@ class CanonicalUPGD:
                 next_age = jnp.full_like(age, next_step)
                 correction_clock = next_step.astype(param.dtype)
             else:
-                next_age = age + active.astype(jnp.int32)
+                next_age = _saturating_increment(age, active.astype(jnp.int32))
                 correction_clock = next_age.astype(param.dtype)
             bias_correction = 1.0 - jnp.power(beta, correction_clock)
             corrected = jnp.where(
@@ -593,28 +611,70 @@ class CanonicalUPGD:
             perturbation_leaves.append(perturbation)
 
         count_floor = jnp.maximum(eligible_count, 1.0)
-        next_state = CanonicalUPGDState(  # type: ignore[call-arg]
+        proposed_params = jax.tree_util.tree_unflatten(structure, new_param_leaves)
+        proposed_state = CanonicalUPGDState(  # type: ignore[call-arg]
             utility_ema=jax.tree_util.tree_unflatten(structure, new_utility_leaves),
             utility_age=jax.tree_util.tree_unflatten(structure, new_age_leaves),
             step=next_step,
         )
+        committed_params = jax.tree.map(
+            lambda proposed, current: jnp.where(
+                capacity_available,
+                proposed,
+                current,
+            ),
+            proposed_params,
+            params,
+        )
+        committed_state = jax.tree.map(
+            lambda proposed, current: jnp.where(
+                capacity_available,
+                proposed,
+                current,
+            ),
+            proposed_state,
+            state,
+        )
+        committed_key = jax.lax.cond(
+            capacity_available,
+            lambda _: next_key,
+            lambda _: key,
+            operand=None,
+        )
+        zero_tree = jax.tree.map(jnp.zeros_like, params)
+        scaled_utility = jax.tree.map(
+            lambda proposed, zero: jnp.where(capacity_available, proposed, zero),
+            jax.tree_util.tree_unflatten(structure, gate_leaves),
+            zero_tree,
+        )
+        corrected_utility = jax.tree.map(
+            lambda proposed, zero: jnp.where(capacity_available, proposed, zero),
+            jax.tree_util.tree_unflatten(structure, corrected_leaves),
+            zero_tree,
+        )
+        perturbation = jax.tree.map(
+            lambda proposed, zero: jnp.where(capacity_available, proposed, zero),
+            jax.tree_util.tree_unflatten(structure, perturbation_leaves),
+            zero_tree,
+        )
         return CanonicalUPGDUpdate(  # type: ignore[call-arg]
-            params=jax.tree_util.tree_unflatten(structure, new_param_leaves),
-            state=next_state,
-            next_key=next_key,
-            scaled_utility=jax.tree_util.tree_unflatten(structure, gate_leaves),
-            corrected_utility=jax.tree_util.tree_unflatten(
-                structure,
-                corrected_leaves,
-            ),
-            perturbation=jax.tree_util.tree_unflatten(
-                structure,
-                perturbation_leaves,
-            ),
+            params=committed_params,
+            state=committed_state,
+            next_key=committed_key,
+            scaled_utility=scaled_utility,
+            corrected_utility=corrected_utility,
+            perturbation=perturbation,
             metrics={
-                "mean_scaled_utility": gate_sum / count_floor,
-                "mean_absolute_utility": utility_sum / count_floor,
-                "global_maximum_utility": global_maximum,
+                "update_applied": capacity_available,
+                "mean_scaled_utility": jnp.where(
+                    capacity_available, gate_sum / count_floor, 0.0
+                ),
+                "mean_absolute_utility": jnp.where(
+                    capacity_available, utility_sum / count_floor, 0.0
+                ),
+                "global_maximum_utility": jnp.where(
+                    capacity_available, global_maximum, 0.0
+                ),
                 "eligible_parameter_count": eligible_count,
                 "nonfinite_or_missing_count": nonfinite_count,
             },
@@ -633,9 +693,6 @@ AlbertaAdaUPGDProfile = Literal["alberta_derived_first_order_adaptive_v1"]
 ALBERTA_ADAUPGD_PROFILE: AlbertaAdaUPGDProfile = (
     "alberta_derived_first_order_adaptive_v1"
 )
-
-_INT32_MAX = 2**31 - 1
-
 
 @dataclass(frozen=True)
 class AlbertaAdaUPGDConfig:
