@@ -40,13 +40,13 @@ References
 from __future__ import annotations
 
 import math
-import struct
 from numbers import Real
 
 import chex
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 from jax import Array
 from jaxtyping import Int, PRNGKeyArray
 
@@ -83,18 +83,22 @@ def _require_nonnegative_float32(value: object, *, name: str) -> float:
     below the float32 subnormal range are accepted as exact zero, matching the
     noise-free trajectory they produce in the stream's float32 arithmetic.
     """
-    number = _require_finite_real(value, name=name, nonnegative=True)
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError(f"{name} must be a non-negative finite real, got {value!r}")
+    if value < 0:
+        raise ValueError(f"{name} must be a non-negative finite real, got {value!r}")
     try:
-        narrowed = float(struct.unpack("!f", struct.pack("!f", number))[0])
-    except OverflowError as error:
+        with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+            narrowed = np.asarray(value, dtype=np.float32).reshape(())
+    except (OverflowError, TypeError, ValueError) as error:
         raise ValueError(
             f"{name} must remain finite when rounded to float32, got {value!r}"
         ) from error
-    if not math.isfinite(narrowed):
+    if not bool(np.isfinite(narrowed)):
         raise ValueError(
             f"{name} must remain finite when rounded to float32, got {value!r}"
         )
-    return narrowed
+    return float(narrowed)
 
 
 def _require_unit_interval(value: object, *, name: str) -> float:

@@ -26,7 +26,6 @@ or tanh feature bank:
   compositional DAG that builds features-of-features can.
 """
 
-import math
 from numbers import Real
 
 import chex
@@ -47,11 +46,13 @@ def _require_positive_float32(value: object, name: str) -> float:
     """Return a positive finite value representable in the stream execution dtype."""
     if isinstance(value, bool) or not isinstance(value, Real):
         raise ValueError(f"{name} must be a positive finite float32 value")
-    number = float(value)
-    if not math.isfinite(number) or number <= 0.0:
-        raise ValueError(f"{name} must be a positive finite float32 value")
-    with np.errstate(over="ignore", under="ignore"):
-        converted = np.float32(number)
+    try:
+        with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+            converted = np.asarray(value, dtype=np.float32).reshape(())
+    except (OverflowError, TypeError, ValueError) as error:
+        raise ValueError(
+            f"{name} must be a positive finite float32 value"
+        ) from error
     if not np.isfinite(converted) or converted <= np.float32(0.0):
         raise ValueError(f"{name} must be a positive finite float32 value")
     return float(converted)

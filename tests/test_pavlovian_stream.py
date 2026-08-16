@@ -485,6 +485,28 @@ def test_construct_canonicalizes_noise_std_to_float32() -> None:
     assert stream._noise_std == float(np.float32(0.1))  # noqa: SLF001
 
 
+def test_construct_narrows_original_noise_real_once() -> None:
+    midpoint_plus = (
+        np.longdouble(1.0)
+        + np.longdouble(2.0) ** -24
+        + np.longdouble(2.0) ** -60
+    )
+    assert np.float32(midpoint_plus) != np.float32(float(midpoint_plus))
+
+    stream = ClassicalConditioningStream(
+        phases=(_valid_phase(),),
+        noise_std=midpoint_plus,
+    )
+    assert stream._noise_std == float(np.float32(midpoint_plus))  # noqa: SLF001
+
+
+def test_construct_rejects_negative_real_that_rounds_to_zero() -> None:
+    below_zero = -np.nextafter(np.longdouble(0.0), np.longdouble(1.0))
+    assert float(below_zero) == 0.0
+    with pytest.raises(ValueError, match="noise_std"):
+        ClassicalConditioningStream(phases=(_valid_phase(),), noise_std=below_zero)
+
+
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), -0.1, 1.1, True])
 def test_construct_rejects_illegal_distractor_prob(value: object) -> None:
     """Distractor probability must be a finite real in ``[0, 1]``."""

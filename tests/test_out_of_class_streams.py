@@ -295,6 +295,17 @@ class TestFrequencyMismatchStream:
         assert bool(jnp.all(state.omegas >= expected_min))
         assert bool(jnp.all(state.omegas < expected_max))
 
+    def test_frequency_bounds_narrow_the_original_real_once(self) -> None:
+        midpoint_plus = (
+            np.longdouble(1.0)
+            + np.longdouble(2.0) ** -24
+            + np.longdouble(2.0) ** -60
+        )
+        assert np.float32(midpoint_plus) != np.float32(float(midpoint_plus))
+
+        stream = FrequencyMismatchStream(omega_min=1.0, omega_max=midpoint_plus)
+        assert stream._omega_max == float(np.float32(midpoint_plus))  # noqa: SLF001
+
     def test_step_shapes(self):
         stream = FrequencyMismatchStream(
             feature_dim=4,
