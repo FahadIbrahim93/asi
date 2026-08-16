@@ -527,3 +527,9 @@ def test_malformed_shapes_and_dtypes_fail_before_mutation() -> None:
         np.asarray(source.step_words),
         np.zeros((2,), dtype=np.uint32),
     )
+
+
+@pytest.mark.parametrize("step_size", [float("nan"), float("inf"), float("-inf")])
+def test_cerebellum_config_rejects_nonfinite_step_size(step_size: float) -> None:
+    with pytest.raises(ValueError, match="step_size"):
+        ExoCerebellumConfig(step_size=step_size)

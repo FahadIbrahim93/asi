@@ -37,6 +37,7 @@ References:
 from __future__ import annotations
 
 import dataclasses
+import math
 from collections.abc import Mapping
 from typing import Any, cast
 
@@ -111,7 +112,7 @@ class ExoCerebellumConfig:
             raise ValueError("n_demons must be positive")
         if self.obs_dim <= 0:
             raise ValueError("obs_dim must be positive")
-        if self.step_size <= 0.0:
+        if not math.isfinite(self.step_size) or self.step_size <= 0.0:
             raise ValueError("step_size must be positive")
 
     def to_config(self) -> dict[str, Any]:
