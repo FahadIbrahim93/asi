@@ -16,12 +16,18 @@ anchored multi-step dreaming.  Key additions over Step 7:
 
 The control learner is the same :class:`DifferentialSARSAAgent` from Step 6,
 preserving the continuing / average-reward formulation.
+
+The facade rejects illegal dimensions and scientific scalars before any core
+object is constructed. Accepted numbers are canonicalized to builtin ints and
+floats; legal endpoints stay valid.
 """
 
 from __future__ import annotations
 
 import functools
+import math
 from dataclasses import asdict, dataclass, field
+from numbers import Integral, Real
 from typing import Any, cast
 
 import chex
@@ -131,26 +137,8 @@ class Step9DreamingConfig:
     dreams_update_average_reward: bool = False
 
     def __post_init__(self) -> None:
-        """Validate hyperparameters."""
-        if self.control.n_actions != self.n_actions:
-            raise ValueError(
-                f"control.n_actions ({self.control.n_actions}) must equal "
-                f"n_actions ({self.n_actions})"
-            )
-        if self.planning_budget < 0:
-            raise ValueError("planning_budget must be non-negative")
-        if self.dreaming_warmup_steps < 0:
-            raise ValueError("dreaming_warmup_steps must be non-negative")
-        if self.dreaming_max_model_error < 0.0:
-            raise ValueError("dreaming_max_model_error must be non-negative")
-        if self.buffer_capacity < 1:
-            raise ValueError("buffer_capacity must be positive")
-        if self.behavior_model_step_size < 0.0:
-            raise ValueError("behavior_model_step_size must be non-negative")
-        if self.dream_rollout_horizon < 1:
-            raise ValueError("dream_rollout_horizon must be positive")
-        if self.dream_candidate_count < 1:
-            raise ValueError("dream_candidate_count must be positive")
+        """Reject illegal dimensions and scientific scalars, then canonicalize."""
+        _validate_dreaming_config(self)
 
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-serializable representation."""
@@ -168,7 +156,7 @@ class Step9DreamingConfig:
         )
         hs = data.get("model_hidden_sizes", (64,))
         if isinstance(hs, list):
-            data["model_hidden_sizes"] = tuple(int(v) for v in hs)
+            data["model_hidden_sizes"] = tuple(hs)
         return cls(**cast(Any, data))
 
     def to_world_model_config(self) -> ActionConditionedWorldModelConfig:
@@ -184,6 +172,149 @@ class Step9DreamingConfig:
             error_decay=self.model_error_decay,
             include_action_interactions=self.model_include_action_interactions,
         )
+
+
+def _require_real(name: str, value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError(f"{name} must be a real number, got {value!r}")
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(f"{name} must be finite, got {value!r}")
+    return number
+
+
+def _require_nonneg_real(name: str, value: object) -> float:
+    number = _require_real(name, value)
+    if number < 0.0:
+        raise ValueError(f"{name} must be non-negative, got {value!r}")
+    return number
+
+
+def _require_unit_interval(name: str, value: object) -> float:
+    number = _require_real(name, value)
+    if not 0.0 <= number <= 1.0:
+        raise ValueError(f"{name} must be in [0, 1], got {value!r}")
+    return number
+
+
+def _require_half_open_unit_interval(name: str, value: object) -> float:
+    number = _require_real(name, value)
+    if not 0.0 <= number < 1.0:
+        raise ValueError(f"{name} must be in [0, 1), got {value!r}")
+    return number
+
+
+def _require_int(name: str, value: object, *, minimum: int | None = None) -> int:
+    if isinstance(value, bool) or not isinstance(value, Integral):
+        raise ValueError(f"{name} must be an integer, got {value!r}")
+    number = int(value)
+    if minimum is not None and number < minimum:
+        if minimum == 1:
+            raise ValueError(f"{name} must be positive, got {value!r}")
+        if minimum == 0:
+            raise ValueError(f"{name} must be non-negative, got {value!r}")
+        raise ValueError(f"{name} must be >= {minimum}, got {value!r}")
+    return number
+
+
+def _require_bool(name: str, value: object) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError(f"{name} must be a bool, got {value!r}")
+    return value
+
+
+def _validate_dreaming_config(config: Step9DreamingConfig) -> None:
+    observation_dim = _require_int("observation_dim", config.observation_dim, minimum=1)
+    n_actions = _require_int("n_actions", config.n_actions, minimum=1)
+    if config.control.n_actions != n_actions:
+        raise ValueError(
+            f"control.n_actions ({config.control.n_actions}) must equal "
+            f"n_actions ({n_actions})"
+        )
+    if not isinstance(config.model_hidden_sizes, tuple):
+        raise ValueError(
+            f"model_hidden_sizes must be a tuple of integers, got "
+            f"{config.model_hidden_sizes!r}"
+        )
+    model_hidden_sizes = tuple(
+        _require_int("model_hidden_sizes", size, minimum=1)
+        for size in config.model_hidden_sizes
+    )
+    model_step_size = _require_nonneg_real("model_step_size", config.model_step_size)
+    model_sparsity = _require_unit_interval("model_sparsity", config.model_sparsity)
+    model_include_action_interactions = _require_bool(
+        "model_include_action_interactions",
+        config.model_include_action_interactions,
+    )
+    model_use_layer_norm = _require_bool(
+        "model_use_layer_norm",
+        config.model_use_layer_norm,
+    )
+    model_gamma = _require_unit_interval("model_gamma", config.model_gamma)
+    dreaming_warmup_steps = _require_int(
+        "dreaming_warmup_steps",
+        config.dreaming_warmup_steps,
+        minimum=0,
+    )
+    dreaming_max_model_error = _require_nonneg_real(
+        "dreaming_max_model_error",
+        config.dreaming_max_model_error,
+    )
+    model_error_decay = _require_half_open_unit_interval(
+        "model_error_decay",
+        config.model_error_decay,
+    )
+    behavior_model_step_size = _require_nonneg_real(
+        "behavior_model_step_size",
+        config.behavior_model_step_size,
+    )
+    planning_budget = _require_int("planning_budget", config.planning_budget, minimum=0)
+    dream_rollout_horizon = _require_int(
+        "dream_rollout_horizon",
+        config.dream_rollout_horizon,
+        minimum=1,
+    )
+    dream_candidate_count = _require_int(
+        "dream_candidate_count",
+        config.dream_candidate_count,
+        minimum=1,
+    )
+    dream_surprise_weight = _require_real(
+        "dream_surprise_weight",
+        config.dream_surprise_weight,
+    )
+    dream_utility_weight = _require_real(
+        "dream_utility_weight",
+        config.dream_utility_weight,
+    )
+    buffer_capacity = _require_int("buffer_capacity", config.buffer_capacity, minimum=1)
+    dreams_update_average_reward = _require_bool(
+        "dreams_update_average_reward",
+        config.dreams_update_average_reward,
+    )
+    object.__setattr__(config, "observation_dim", observation_dim)
+    object.__setattr__(config, "n_actions", n_actions)
+    object.__setattr__(config, "model_hidden_sizes", model_hidden_sizes)
+    object.__setattr__(config, "model_step_size", model_step_size)
+    object.__setattr__(config, "model_sparsity", model_sparsity)
+    object.__setattr__(
+        config,
+        "model_include_action_interactions",
+        model_include_action_interactions,
+    )
+    object.__setattr__(config, "model_use_layer_norm", model_use_layer_norm)
+    object.__setattr__(config, "model_gamma", model_gamma)
+    object.__setattr__(config, "dreaming_warmup_steps", dreaming_warmup_steps)
+    object.__setattr__(config, "dreaming_max_model_error", dreaming_max_model_error)
+    object.__setattr__(config, "model_error_decay", model_error_decay)
+    object.__setattr__(config, "behavior_model_step_size", behavior_model_step_size)
+    object.__setattr__(config, "planning_budget", planning_budget)
+    object.__setattr__(config, "dream_rollout_horizon", dream_rollout_horizon)
+    object.__setattr__(config, "dream_candidate_count", dream_candidate_count)
+    object.__setattr__(config, "dream_surprise_weight", dream_surprise_weight)
+    object.__setattr__(config, "dream_utility_weight", dream_utility_weight)
+    object.__setattr__(config, "buffer_capacity", buffer_capacity)
+    object.__setattr__(config, "dreams_update_average_reward", dreams_update_average_reward)
 
 
 @chex.dataclass(frozen=True)

@@ -1,10 +1,20 @@
-"""Tests for the Step 9 guarded-dreaming facade."""
+"""Tests for the Step 9 guarded-dreaming facade.
+
+Invalid dimension and scientific-scalar cases are written to fail on current
+main (bool, non-real, non-integral, non-finite, and out-of-domain values
+accepted) and pass after the facade rejects them. Legal endpoints stay
+constructible.
+"""
 
 from __future__ import annotations
+
+import json
+from typing import Any
 
 import chex
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 import pytest
 
 from alberta_framework.steps.step6 import Step6DifferentialSARSAConfig
@@ -16,6 +26,141 @@ from alberta_framework.steps.step9 import (
     run_step9_scan,
     run_step9_smoke,
     step9_update,
+)
+
+_INVALID_STEP9_FIELDS: tuple[tuple[str, Any], ...] = (
+    ("observation_dim", True),
+    ("observation_dim", False),
+    ("observation_dim", 0),
+    ("observation_dim", -1),
+    ("observation_dim", 1.5),
+    ("observation_dim", "4"),
+    ("observation_dim", None),
+    ("n_actions", True),
+    ("n_actions", False),
+    ("n_actions", 0),
+    ("n_actions", -1),
+    ("n_actions", 1.5),
+    ("n_actions", "2"),
+    ("n_actions", None),
+    ("model_hidden_sizes", (True,)),
+    ("model_hidden_sizes", (False,)),
+    ("model_hidden_sizes", (0,)),
+    ("model_hidden_sizes", (-1,)),
+    ("model_hidden_sizes", (1.5,)),
+    ("model_hidden_sizes", ("64",)),
+    ("model_hidden_sizes", [64]),
+    ("model_hidden_sizes", 64),
+    ("model_step_size", float("nan")),
+    ("model_step_size", float("inf")),
+    ("model_step_size", float("-inf")),
+    ("model_step_size", True),
+    ("model_step_size", False),
+    ("model_step_size", -1.0),
+    ("model_step_size", "0.03"),
+    ("model_step_size", None),
+    ("model_sparsity", float("nan")),
+    ("model_sparsity", float("inf")),
+    ("model_sparsity", float("-inf")),
+    ("model_sparsity", True),
+    ("model_sparsity", False),
+    ("model_sparsity", -0.1),
+    ("model_sparsity", 1.1),
+    ("model_sparsity", "0.9"),
+    ("model_sparsity", None),
+    ("model_gamma", float("nan")),
+    ("model_gamma", float("inf")),
+    ("model_gamma", float("-inf")),
+    ("model_gamma", True),
+    ("model_gamma", False),
+    ("model_gamma", -0.1),
+    ("model_gamma", 1.1),
+    ("model_gamma", "0.99"),
+    ("model_gamma", None),
+    ("model_error_decay", float("nan")),
+    ("model_error_decay", float("inf")),
+    ("model_error_decay", float("-inf")),
+    ("model_error_decay", True),
+    ("model_error_decay", False),
+    ("model_error_decay", -0.1),
+    ("model_error_decay", 1.0),
+    ("model_error_decay", "0.99"),
+    ("model_error_decay", None),
+    ("dreaming_warmup_steps", True),
+    ("dreaming_warmup_steps", False),
+    ("dreaming_warmup_steps", -1),
+    ("dreaming_warmup_steps", 1.5),
+    ("dreaming_warmup_steps", "100"),
+    ("dreaming_warmup_steps", None),
+    ("dreaming_max_model_error", float("nan")),
+    ("dreaming_max_model_error", float("inf")),
+    ("dreaming_max_model_error", float("-inf")),
+    ("dreaming_max_model_error", True),
+    ("dreaming_max_model_error", False),
+    ("dreaming_max_model_error", -0.1),
+    ("dreaming_max_model_error", "1.0"),
+    ("dreaming_max_model_error", None),
+    ("behavior_model_step_size", float("nan")),
+    ("behavior_model_step_size", float("inf")),
+    ("behavior_model_step_size", float("-inf")),
+    ("behavior_model_step_size", True),
+    ("behavior_model_step_size", False),
+    ("behavior_model_step_size", -0.1),
+    ("behavior_model_step_size", "0.05"),
+    ("behavior_model_step_size", None),
+    ("planning_budget", True),
+    ("planning_budget", False),
+    ("planning_budget", -1),
+    ("planning_budget", 1.5),
+    ("planning_budget", "1"),
+    ("planning_budget", None),
+    ("buffer_capacity", True),
+    ("buffer_capacity", False),
+    ("buffer_capacity", 0),
+    ("buffer_capacity", -1),
+    ("buffer_capacity", 1.5),
+    ("buffer_capacity", "64"),
+    ("buffer_capacity", None),
+    ("dream_rollout_horizon", True),
+    ("dream_rollout_horizon", False),
+    ("dream_rollout_horizon", 0),
+    ("dream_rollout_horizon", -1),
+    ("dream_rollout_horizon", 1.5),
+    ("dream_rollout_horizon", "1"),
+    ("dream_rollout_horizon", None),
+    ("dream_candidate_count", True),
+    ("dream_candidate_count", False),
+    ("dream_candidate_count", 0),
+    ("dream_candidate_count", -1),
+    ("dream_candidate_count", 1.5),
+    ("dream_candidate_count", "1"),
+    ("dream_candidate_count", None),
+    ("dream_surprise_weight", float("nan")),
+    ("dream_surprise_weight", float("inf")),
+    ("dream_surprise_weight", float("-inf")),
+    ("dream_surprise_weight", True),
+    ("dream_surprise_weight", False),
+    ("dream_surprise_weight", "1.0"),
+    ("dream_surprise_weight", None),
+    ("dream_utility_weight", float("nan")),
+    ("dream_utility_weight", float("inf")),
+    ("dream_utility_weight", float("-inf")),
+    ("dream_utility_weight", True),
+    ("dream_utility_weight", False),
+    ("dream_utility_weight", "1.0"),
+    ("dream_utility_weight", None),
+    ("model_include_action_interactions", 0),
+    ("model_include_action_interactions", 1),
+    ("model_include_action_interactions", "true"),
+    ("model_include_action_interactions", None),
+    ("model_use_layer_norm", 0),
+    ("model_use_layer_norm", 1),
+    ("model_use_layer_norm", "true"),
+    ("model_use_layer_norm", None),
+    ("dreams_update_average_reward", 0),
+    ("dreams_update_average_reward", 1),
+    ("dreams_update_average_reward", "true"),
+    ("dreams_update_average_reward", None),
 )
 
 # ---------------------------------------------------------------------------
@@ -83,6 +228,173 @@ def test_step9_config_zero_dream_rollout_horizon_raises() -> None:
 def test_step9_config_zero_dream_candidate_count_raises() -> None:
     with pytest.raises(ValueError, match="dream_candidate_count"):
         Step9DreamingConfig(dream_candidate_count=0)
+
+
+def _config_with(**overrides: Any) -> Step9DreamingConfig:
+    n_actions = overrides.get("n_actions", 2)
+    payload: dict[str, Any] = {
+        "control": Step6DifferentialSARSAConfig(n_actions=n_actions),
+        "observation_dim": 2,
+        "n_actions": 2,
+        "model_hidden_sizes": (),
+    }
+    payload.update(overrides)
+    if "n_actions" in overrides and "control" not in overrides:
+        payload["control"] = Step6DifferentialSARSAConfig(n_actions=n_actions)
+    return Step9DreamingConfig(**payload)
+
+
+@pytest.mark.parametrize(("field", "value"), _INVALID_STEP9_FIELDS)
+def test_step9_dreaming_fields_reject_invalid_inputs(field: str, value: object) -> None:
+    with pytest.raises(ValueError, match=field):
+        _config_with(**{field: value})
+
+
+def test_step9_dreaming_fields_preserve_legal_endpoints() -> None:
+    config = Step9DreamingConfig(
+        control=Step6DifferentialSARSAConfig(n_actions=1),
+        observation_dim=1,
+        n_actions=1,
+        model_hidden_sizes=(),
+        model_step_size=0.0,
+        model_sparsity=0.0,
+        model_include_action_interactions=False,
+        model_use_layer_norm=False,
+        model_gamma=0.0,
+        dreaming_warmup_steps=0,
+        dreaming_max_model_error=0.0,
+        model_error_decay=0.0,
+        behavior_model_step_size=0.0,
+        planning_budget=0,
+        dream_rollout_horizon=1,
+        dream_candidate_count=1,
+        dream_surprise_weight=-2.5,
+        dream_utility_weight=0.0,
+        buffer_capacity=1,
+        dreams_update_average_reward=False,
+    )
+    make_step9_components(config)
+    payload = config.to_dict()
+    json.dumps(payload, allow_nan=False)
+    restored = Step9DreamingConfig.from_dict(payload)
+    assert restored.observation_dim == 1
+    assert restored.n_actions == 1
+    assert restored.model_hidden_sizes == ()
+    assert restored.model_step_size == 0.0
+    assert restored.model_sparsity == 0.0
+    assert restored.model_include_action_interactions is False
+    assert restored.model_use_layer_norm is False
+    assert restored.model_gamma == 0.0
+    assert restored.dreaming_warmup_steps == 0
+    assert restored.dreaming_max_model_error == 0.0
+    assert restored.model_error_decay == 0.0
+    assert restored.behavior_model_step_size == 0.0
+    assert restored.planning_budget == 0
+    assert restored.dream_rollout_horizon == 1
+    assert restored.dream_candidate_count == 1
+    assert restored.dream_surprise_weight == -2.5
+    assert restored.dream_utility_weight == 0.0
+    assert restored.buffer_capacity == 1
+    assert restored.dreams_update_average_reward is False
+    assert payload["model_sparsity"] == 0.0
+    assert payload["model_error_decay"] == 0.0
+    assert payload["dream_surprise_weight"] == -2.5
+
+    upper = Step9DreamingConfig(
+        control=Step6DifferentialSARSAConfig(n_actions=2),
+        observation_dim=1,
+        n_actions=2,
+        model_hidden_sizes=(),
+        model_sparsity=1.0,
+        model_include_action_interactions=True,
+        model_use_layer_norm=True,
+        model_gamma=1.0,
+        dreaming_max_model_error=1e30,
+        model_error_decay=0.999,
+        dream_surprise_weight=2.0,
+        dream_utility_weight=-0.5,
+        dreams_update_average_reward=True,
+    )
+    make_step9_components(upper)
+    json.dumps(upper.to_dict(), allow_nan=False)
+    assert upper.model_sparsity == 1.0
+    assert upper.model_gamma == 1.0
+    assert upper.dreaming_max_model_error == 1e30
+    assert upper.model_include_action_interactions is True
+    assert upper.dreams_update_average_reward is True
+
+    defaults = Step9DreamingConfig()
+    make_step9_components(defaults)
+    assert defaults.observation_dim == 4
+    assert defaults.n_actions == 2
+    assert defaults.model_hidden_sizes == (64,)
+    assert defaults.model_step_size == 0.03
+    assert defaults.model_sparsity == 0.9
+    assert defaults.model_gamma == 0.99
+    assert defaults.model_error_decay == 0.99
+
+
+def test_step9_dreaming_fields_canonicalize_nonbuiltin_numbers() -> None:
+    value = np.float64(0.5)
+    config = Step9DreamingConfig(
+        control=Step6DifferentialSARSAConfig(n_actions=2),
+        observation_dim=np.int64(3),
+        n_actions=np.int64(2),
+        model_hidden_sizes=(np.int64(4),),
+        model_step_size=value,
+        model_sparsity=value,
+        model_gamma=value,
+        dreaming_warmup_steps=np.int64(0),
+        dreaming_max_model_error=value,
+        model_error_decay=value,
+        behavior_model_step_size=value,
+        planning_budget=np.int64(2),
+        dream_rollout_horizon=np.int64(3),
+        dream_candidate_count=np.int64(4),
+        dream_surprise_weight=np.float64(-1.5),
+        dream_utility_weight=value,
+        buffer_capacity=np.int64(8),
+    )
+    make_step9_components(config)
+    payload = config.to_dict()
+    json.dumps(payload, allow_nan=False)
+    assert config.observation_dim == 3
+    assert config.n_actions == 2
+    assert config.model_hidden_sizes == (4,)
+    assert config.model_step_size == 0.5
+    assert config.model_sparsity == 0.5
+    assert config.model_gamma == 0.5
+    assert config.dreaming_warmup_steps == 0
+    assert config.dreaming_max_model_error == 0.5
+    assert config.model_error_decay == 0.5
+    assert config.behavior_model_step_size == 0.5
+    assert config.planning_budget == 2
+    assert config.dream_rollout_horizon == 3
+    assert config.dream_candidate_count == 4
+    assert config.dream_surprise_weight == -1.5
+    assert config.dream_utility_weight == 0.5
+    assert config.buffer_capacity == 8
+    assert type(payload["observation_dim"]) is int
+    assert type(payload["n_actions"]) is int
+    assert type(payload["model_hidden_sizes"][0]) is int
+    assert type(payload["model_step_size"]) is float
+    assert type(payload["model_sparsity"]) is float
+    assert type(payload["model_gamma"]) is float
+    assert type(payload["dreaming_warmup_steps"]) is int
+    assert type(payload["dreaming_max_model_error"]) is float
+    assert type(payload["model_error_decay"]) is float
+    assert type(payload["behavior_model_step_size"]) is float
+    assert type(payload["planning_budget"]) is int
+    assert type(payload["dream_rollout_horizon"]) is int
+    assert type(payload["dream_candidate_count"]) is int
+    assert type(payload["dream_surprise_weight"]) is float
+    assert type(payload["dream_utility_weight"]) is float
+    assert type(payload["buffer_capacity"]) is int
+    restored = Step9DreamingConfig.from_dict(payload)
+    assert restored.observation_dim == 3
+    assert restored.model_hidden_sizes == (4,)
+    assert restored.dream_surprise_weight == -1.5
+    assert restored.model_error_decay == 0.5
 
 
 # ---------------------------------------------------------------------------
