@@ -139,7 +139,12 @@ class ActorCriticArrayResult:
     Attributes:
         state: Final agent state.
         actions: Per-step actions, shape ``(num_steps,)``.
-        policies: Per-step policy probabilities, shape ``(num_steps, n_actions)``.
+        policies: Per-step pre-update agent policy probabilities at
+            ``observations[t]``, shape ``(num_steps, n_actions)``. When actions
+            are sampled by this runner, this is the distribution that produced
+            ``actions[t]``. When fixed actions are supplied, this is the current
+            agent policy evaluated at that state, not provenance for the
+            external behavior policy.
         values: Per-step previous-state value estimates, shape ``(num_steps,)``.
         td_errors: Per-step TD errors, shape ``(num_steps,)``.
     """
@@ -531,7 +536,9 @@ def run_actor_critic_from_arrays(
         terminated: Terminal flags, shape ``(num_steps,)``. Required unless
             ``discounts`` is provided.
         next_observations: Next observations, shape ``(num_steps, feature_dim)``.
-        actions: Optional fixed current actions, shape ``(num_steps,)``.
+        actions: Optional fixed current actions, shape ``(num_steps,)``. Their
+            behavior-policy probabilities are not known; returned ``policies``
+            are the current agent policy evaluated before each update.
         discounts: Optional transition discounts, shape ``(num_steps,)``.
 
     Returns:
@@ -560,8 +567,9 @@ def run_actor_critic_from_arrays(
                 last_action=fixed_action.astype(jnp.int32),
             )
             current_action = fixed_action.astype(jnp.int32)
+            current_policy = agent.policy(started_state, obs)
         else:
-            started_state, current_action, _policy = agent.start(carry, obs)
+            started_state, current_action, current_policy = agent.start(carry, obs)
         result = agent.update(
             started_state,
             reward,
@@ -579,7 +587,7 @@ def run_actor_critic_from_arrays(
                 current_action,
                 jnp.asarray(0, dtype=jnp.int32),
             ),
-            result.policy,
+            jnp.where(result.update_applied, current_policy, jnp.zeros_like(current_policy)),
             result.value,
             result.td_error,
             result.update_applied,
