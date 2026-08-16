@@ -218,6 +218,36 @@ def test_plot_final_performance_bars(results) -> None:
     assert [label.get_text() for label in ax.get_xticklabels()] == ["lms", "idbd"]
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("mean", float("nan")), ("std", float("inf"))],
+)
+def test_plot_final_performance_bars_rejects_nonfinite_statistic_without_figure(
+    results, field: str, value: float
+) -> None:
+    """np.argmin treats NaN as the best bar, so a failed run would be crowned."""
+    poisoned = dict(results)
+    summary = results["lms"].summary["squared_error"]
+    poisoned["lms"] = results["lms"]._replace(
+        summary={
+            "squared_error": summary._replace(**{field: value}),
+        }
+    )
+    before = tuple(plt.get_fignums())
+
+    with pytest.raises(ValueError, match="finite metric means and stds"):
+        plot_final_performance_bars(poisoned)
+    assert tuple(plt.get_fignums()) == before
+
+
+def test_plot_final_performance_bars_rejects_empty_results_without_figure() -> None:
+    before = tuple(plt.get_fignums())
+
+    with pytest.raises(ValueError, match="at least one result"):
+        plot_final_performance_bars({})
+    assert tuple(plt.get_fignums()) == before
+
+
 def test_plot_step_size_evolution(results) -> None:
     fig, ax = plot_step_size_evolution(results)
     assert isinstance(fig, plt.Figure)
