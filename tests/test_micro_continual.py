@@ -26,6 +26,7 @@ import jax.random as jr
 import numpy as np
 import pytest
 
+from alberta_framework._seed_validation import JAX_KEY_SEED_MAX
 from alberta_framework.benchmarks.ipmnist_screening import (
     SCREENING_REGISTRY,
     screening_spec,
@@ -183,6 +184,71 @@ class TestConfig:
     def test_to_config_roundtrip(self):
         rebuilt = MicroStreamConfig(**TINY.to_config())
         assert rebuilt == TINY
+        assert MicroStreamConfig.from_mapping(TINY.to_config()) == TINY
+
+    def test_from_mapping_rejects_missing_and_empty_keys(self):
+        complete = TINY.to_config()
+        missing = dict(complete)
+        del missing["mean_separation"]
+        with pytest.raises(ValueError, match="mean_separation"):
+            MicroStreamConfig.from_mapping(missing)
+        missing_dim = dict(complete)
+        del missing_dim["dim"]
+        with pytest.raises(ValueError, match="dim"):
+            MicroStreamConfig.from_mapping(missing_dim)
+        with pytest.raises(ValueError, match="stream_config"):
+            MicroStreamConfig.from_mapping({})
+
+    def test_from_mapping_rejects_extra_keys_and_non_objects(self):
+        extra = dict(TINY.to_config())
+        extra["unknown_field"] = 1
+        with pytest.raises(ValueError, match="unknown_field"):
+            MicroStreamConfig.from_mapping(extra)
+        with pytest.raises(ValueError, match="stream_config"):
+            MicroStreamConfig.from_mapping(["not", "an", "object"])
+
+    @pytest.mark.parametrize(
+        "field",
+        [
+            "class_sparsity",
+            "mean_separation",
+            "noise_scale",
+            "spectrum_decades",
+            "component_scale",
+            "offset_scale",
+            "scale_shift_min",
+            "scale_shift_max",
+        ],
+    )
+    def test_bool_is_not_a_valid_float(self, field: str):
+        with pytest.raises(ValueError, match=field):
+            tiny("input_permutation", **{field: True})
+
+    @pytest.mark.parametrize(
+        "field",
+        [
+            "class_sparsity",
+            "mean_separation",
+            "noise_scale",
+            "spectrum_decades",
+            "component_scale",
+            "offset_scale",
+            "scale_shift_min",
+            "scale_shift_max",
+        ],
+    )
+    @pytest.mark.parametrize("value", [math.nan, math.inf, -math.inf])
+    def test_nonfinite_floats_rejected(self, field: str, value: float):
+        with pytest.raises(ValueError, match=field):
+            tiny("input_permutation", **{field: value})
+
+    def test_legal_float_reals_and_range_edges_preserved(self):
+        tiny("input_permutation", class_sparsity=1)
+        tiny("input_permutation", class_sparsity=1.0)
+        tiny("input_permutation", spectrum_decades=0.0)
+        tiny("input_permutation", offset_scale=0.0)
+        tiny("input_permutation", component_scale=0.0)
+        tiny("input_permutation", mean_separation=0.4, noise_scale=1)
 
 
 # =============================================================================
@@ -693,6 +759,45 @@ class TestShards:
             atol=1e-8,
         )
 
+    def _write_payload(self, tmp_path: Path, payload: dict, name: str = "shard.json"):
+        path = tmp_path / name
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        return path
+
+    def test_load_rejects_incomplete_and_empty_stream_config(self, tmp_path: Path):
+        payload = micro_shard_payload(self._result())
+        missing = dict(payload["stream_config"])
+        del missing["mean_separation"]
+        payload["stream_config"] = missing
+        with pytest.raises(ValueError, match="mean_separation"):
+            load_micro_shard(self._write_payload(tmp_path, payload, "missing.json"))
+
+        payload["stream_config"] = {}
+        with pytest.raises(ValueError, match="stream_config"):
+            load_micro_shard(self._write_payload(tmp_path, payload, "empty.json"))
+
+    def test_load_rejects_seed_outside_jax_domain(self, tmp_path: Path):
+        payload = micro_shard_payload(self._result())
+        payload["seed"] = JAX_KEY_SEED_MAX + 1
+        with pytest.raises(ValueError, match="seed"):
+            load_micro_shard(self._write_payload(tmp_path, payload, "seed-hi.json"))
+
+    @pytest.mark.parametrize("seed", [0, JAX_KEY_SEED_MAX])
+    def test_load_accepts_jax_seed_domain_edges(self, tmp_path: Path, seed: int):
+        payload = micro_shard_payload(self._result())
+        payload["seed"] = seed
+        loaded = load_micro_shard(self._write_payload(tmp_path, payload, f"seed-{seed}.json"))
+        assert loaded["seed"] == seed
+
+    def test_run_rejects_seed_outside_jax_domain(self):
+        with pytest.raises(ValueError, match="seed"):
+            run_micro_arm(TINY, "naive_bayes", seed=JAX_KEY_SEED_MAX + 1, hidden1=8, hidden2=6)
+
+    @pytest.mark.parametrize("seed", [0, JAX_KEY_SEED_MAX])
+    def test_run_accepts_jax_seed_domain_edges(self, seed: int):
+        result = run_micro_arm(TINY, "naive_bayes", seed=seed, hidden1=8, hidden2=6)
+        assert result.seed == seed
+
     @pytest.mark.parametrize("location", ["top-level", "nested"])
     def test_load_rejects_duplicate_top_level_and_nested_keys(
         self, tmp_path: Path, location: str
@@ -1145,6 +1250,22 @@ class TestCLI:
         assert report["schema"] == MICRO_VALIDATION_SCHEMA
         # exit code mirrors the verdict: 0 = ordering reproduced, 2 = not
         assert code == (0 if report["transfer_valid"] else 2)
+
+    def test_run_rejects_seed_outside_jax_domain(self, tmp_path: Path):
+        argv = [
+            "run", "--family", "input_permutation", "--arm", "sgd_raw",
+            "--seed", str(JAX_KEY_SEED_MAX + 1), "--out", str(tmp_path), *self.ARGS,
+        ]
+        with pytest.raises(ValueError, match="seed"):
+            main(argv)
+
+    def test_ladder_rejects_seed_outside_jax_domain(self, tmp_path: Path):
+        argv = [
+            "ladder", "--family", "input_permutation", "--seeds", str(JAX_KEY_SEED_MAX + 1),
+            "--arms", "sgd_raw", "--out", str(tmp_path), *self.ARGS,
+        ]
+        with pytest.raises(ValueError, match="seeds"):
+            main(argv)
 
 
 # =============================================================================
