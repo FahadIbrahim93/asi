@@ -1093,21 +1093,20 @@ class TestShardsAndMerge:
         ):
             merge_shards(paths, control_name="upgd_w_control", slope_window=2)
 
-    def test_merge_pairs_on_partial_seed_overlap(self, tmp_path, small_data):
-        """Partial overlap keeps merging and pairs on the intersection, which
-        the block records visibly — the zero-overlap refusal must not
-        over-reach into this legitimate case."""
+    def test_merge_rejects_partial_seed_overlap(self, tmp_path):
+        """A ranked summary must compare every arm on exactly paired seeds."""
         paths = [
-            self._make_shard(tmp_path, small_data, "upgd_w_control", 0),
-            self._make_shard(tmp_path, small_data, "upgd_w_control", 1),
-            self._make_shard(tmp_path, small_data, "upgd_l2init", 1),
-            self._make_shard(tmp_path, small_data, "upgd_l2init", 2),
+            self._write_inband_shard(tmp_path, "upgd_w_control", 0, 0.40),
+            self._write_inband_shard(tmp_path, "upgd_w_control", 1, 0.60),
+            self._write_inband_shard(tmp_path, "upgd_l2init", 1, 0.55),
+            self._write_inband_shard(tmp_path, "upgd_l2init", 2, 0.90),
         ]
-        summary = merge_shards(paths, control_name="upgd_w_control", slope_window=2)
-        l2 = next(e for e in summary["results"] if e["config_name"] == "upgd_l2init")
-        assert l2["seeds"] == [1, 2]
-        assert l2["paired_vs_control"]["seeds"] == [1]
-        assert len(l2["paired_vs_control"]["per_seed_diff"]) == 1
+
+        with pytest.raises(
+            ValueError,
+            match=r"seed sets differ across configs.*ranks configs on paired seeds only",
+        ):
+            merge_shards(paths, control_name="upgd_w_control", slope_window=2)
 
     def _write_inband_shard(self, tmp_path, config_name, seed, accuracy):
         """Write a structurally valid shard with controlled accuracy."""
@@ -1439,12 +1438,10 @@ class TestShardsAndMerge:
             merge_shards(paths, control_name="upgd_w_control", slope_window=2)
 
     def test_confirmation_candidate_requires_two_paired_seeds(self, tmp_path):
-        """One lucky shared seed cannot authorize a confirmation wave."""
+        """One paired seed cannot authorize a confirmation wave."""
         paths = [
             self._write_inband_shard(tmp_path, "upgd_w_control", 0, 0.50),
             self._write_inband_shard(tmp_path, "upgd_l2init", 0, 0.56),
-            self._write_inband_shard(tmp_path, "upgd_l2init", 1, 0.56),
-            self._write_inband_shard(tmp_path, "upgd_l2init", 2, 0.56),
         ]
         summary = merge_shards(paths, control_name="upgd_w_control", slope_window=2)
         result = next(
