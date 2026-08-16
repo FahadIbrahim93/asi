@@ -33,6 +33,97 @@ def test_sigreg_config_roundtrip_and_direction_shapes() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "integer_type",
+    sorted(
+        {np.dtype(code).type for code in ("b", "B", "h", "H", "i", "I", "l", "L", "q", "Q")},
+        key=lambda value: value.__name__,
+    ),
+)
+def test_sigreg_accepts_every_numpy_integer_family(integer_type) -> None:
+    config = SIGRegConfig(n_projections=integer_type(2))
+    assert type(config.n_projections) is int
+    directions = sample_sigreg_directions(jr.key(0), integer_type(3), config)
+    assert directions.shape == (2, 3)
+
+
+def test_sigreg_rejects_integer_spoofs_without_hooks_or_repr() -> None:
+    class HostileInt(int):
+        def __index__(self):
+            raise AssertionError("subclass hook executed")
+
+        def __repr__(self):
+            raise AssertionError("repr executed")
+
+    with pytest.raises(ValueError, match="n_projections"):
+        SIGRegConfig(n_projections=HostileInt(2))
+    with pytest.raises(ValueError, match="latent_dim"):
+        sample_sigreg_directions(jr.key(0), HostileInt(2))
+
+
+def test_sigreg_config_schema_is_exact() -> None:
+    config = SIGRegConfig(n_projections=np.int32(3))
+    payload = config.to_config()
+    assert SIGRegConfig.from_config(payload) == config
+    with pytest.raises(ValueError, match="actual dict"):
+        SIGRegConfig.from_config(type("DictSubclass", (dict,), {})(payload))
+    with pytest.raises(ValueError, match="schema"):
+        SIGRegConfig.from_config({**payload, "unknown": 1})
+    with pytest.raises(ValueError, match="type"):
+        SIGRegConfig.from_config({**payload, "type": "wrong"})
+
+
+def test_sigreg_config_float_hooks_are_not_run() -> None:
+    class HostileFloat(float):
+        calls = 0
+
+        def as_integer_ratio(self):
+            type(self).calls += 1
+            raise RuntimeError("hostile ratio")
+
+        def __repr__(self):
+            raise AssertionError("repr executed")
+
+    with pytest.raises(ValueError, match="kernel_width"):
+        SIGRegConfig(kernel_width=HostileFloat(1.0))
+    assert HostileFloat.calls == 0
+
+
+def test_sigreg_preflights_direction_and_pairwise_resources_without_allocating() -> None:
+    with pytest.raises(ValueError, match="directions"):
+        SIGRegConfig(n_projections=(2**31 - 1) // 4 + 1)
+    config = SIGRegConfig(n_projections=2)
+    with pytest.raises(ValueError, match="directions"):
+        sample_sigreg_directions(jr.key(0), (2**31 - 1) // 4, config)
+
+    samples = jnp.zeros((23_171,), dtype=jnp.float32)
+    with pytest.raises(ValueError, match="pairwise workspace"):
+        epps_pulley_gaussian_statistic(samples)
+
+    embeddings = jnp.zeros((1_000, 1), dtype=jnp.float32)
+    directions = jnp.ones((600, 1), dtype=jnp.float32)
+    with pytest.raises(ValueError, match="projected pairwise workspace"):
+        sliced_sigreg_loss(embeddings, directions)
+
+
+def test_sigreg_rejects_mismatched_or_empty_representation_shapes() -> None:
+    with pytest.raises(ValueError, match="directions must have shape"):
+        sliced_sigreg_loss(jnp.ones((2, 3)), jnp.ones((2, 2)))
+    with pytest.raises(ValueError, match="at least one sample"):
+        sliced_sigreg_loss(jnp.ones((0, 3)), jnp.ones((2, 3)))
+    with pytest.raises(ValueError, match="non-empty"):
+        epps_pulley_gaussian_statistic(jnp.asarray([], dtype=jnp.float32))
+
+
+def test_sigreg_diagnostics_std_is_finite_at_float32_extremes() -> None:
+    maximum = np.finfo(np.float32).max
+    embeddings = jnp.asarray([[maximum], [-maximum]], dtype=jnp.float32)
+    directions = jnp.ones((1, 1), dtype=jnp.float32)
+    assert not bool(jnp.isfinite(jnp.std(embeddings, axis=0)[0]))
+    diagnostics = sigreg_diagnostics(embeddings, directions, SIGRegConfig(n_projections=1))
+    chex.assert_tree_all_finite(diagnostics)
+
+
 def test_epps_pulley_statistic_penalizes_collapsed_samples() -> None:
     gaussian = jr.normal(jr.key(1), (128,), dtype=jnp.float32)
     collapsed = jnp.zeros((128,), dtype=jnp.float32)
@@ -178,7 +269,7 @@ def test_sigreg_config_rejects_invalid_static_numeric_contracts() -> None:
     ):
         with pytest.raises(ValueError):
             SIGRegConfig(eps=bad_eps)  # type: ignore[arg-type]
-    for bad_count in (0, -1, True, 1.0, np.int64(1)):
+    for bad_count in (0, -1, True, 1.0):
         with pytest.raises(ValueError):
             SIGRegConfig(n_projections=bad_count)  # type: ignore[arg-type]
 
