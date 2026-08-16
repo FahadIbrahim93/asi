@@ -378,6 +378,23 @@ def test_csv_preflight_requires_requested_metric_in_every_aggregate(
     assert not absent.parent.exists()
 
 
+@pytest.mark.parametrize("mode", ["json", "csv"])
+def test_preflight_rejects_metric_surface_mismatch(mode: str, tmp_path: Path) -> None:
+    valid = _constant_result("mismatch")
+    mismatched = valid._replace(
+        metric_arrays={**valid.metric_arrays, "extra": valid.metric_arrays[_METRIC]}
+    )
+    destination = tmp_path / f"mismatch.{mode}"
+
+    with pytest.raises(ValueError, match="same metric names"):
+        if mode == "json":
+            export_to_json({"mismatch": mismatched}, destination, include_timeseries=True)
+        else:
+            export_to_csv({"mismatch": mismatched}, destination, metric=_METRIC)
+
+    assert not destination.exists()
+
+
 @pytest.mark.parametrize("case", ["empty_results", "zero_step_axis", "missing_metric"])
 def test_report_preflight_rejects_before_output_directory_mutation(
     case: str,
