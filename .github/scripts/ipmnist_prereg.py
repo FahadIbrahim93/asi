@@ -132,7 +132,13 @@ def classify_outcome(
 
 
 def _parse_utc(value: str) -> dt.datetime:
-    return dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise RuntimeError("authorization timestamp is not valid ISO-8601") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() != dt.timedelta(0):
+        raise RuntimeError("authorization timestamp must identify UTC")
+    return parsed
 
 
 def _github_json(path: str, *, token: str) -> Any:
@@ -301,10 +307,11 @@ def verify_launch_authorization(
     run_created_at = current.get("created_at")
     comment_created_at = comment.get("created_at")
     comment_updated_at = comment.get("updated_at")
-    if not all(
-        isinstance(value, str) and value
-        for value in (run_created_at, comment_created_at, comment_updated_at)
-    ):
+    if not isinstance(run_created_at, str) or not run_created_at:
+        raise RuntimeError("authorization timestamps are missing or invalid")
+    if not isinstance(comment_created_at, str) or not comment_created_at:
+        raise RuntimeError("authorization timestamps are missing or invalid")
+    if not isinstance(comment_updated_at, str) or not comment_updated_at:
         raise RuntimeError("authorization timestamps are missing or invalid")
     if comment_updated_at != comment_created_at:
         raise RuntimeError("authorization comment must be exact and never edited")
@@ -625,11 +632,10 @@ def validate_result_bundle(
     results = recomputed["results"]
     if not isinstance(results, list) or len(results) != 2:
         raise ValueError("summary must contain exactly the control and candidate")
-    by_name = {
-        result.get("config_name"): result
-        for result in results
-        if isinstance(result, dict) and isinstance(result.get("config_name"), str)
-    }
+    by_name: dict[str, dict[str, Any]] = {}
+    for result in results:
+        if isinstance(result, dict) and isinstance(result.get("config_name"), str):
+            by_name[cast(str, result["config_name"])] = result
     if set(by_name) != {protocol.control, protocol.candidate}:
         raise ValueError(f"summary arm set mismatch: {sorted(by_name)}")
     for name, result in by_name.items():

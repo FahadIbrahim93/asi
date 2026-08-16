@@ -207,6 +207,21 @@ def test_launch_authorization_requires_strictly_pre_dispatch_timestamp(
         )
 
 
+@pytest.mark.parametrize(
+    "timestamp",
+    ["not-a-timestamp", "2026-08-16T09:00:00", "2026-08-16T10:00:00+01:00"],
+)
+def test_launch_authorization_requires_valid_utc_timestamps(
+    monkeypatch: pytest.MonkeyPatch,
+    timestamp: str,
+) -> None:
+    with pytest.raises(RuntimeError, match="timestamp"):
+        _verify_with_comment(
+            monkeypatch,
+            _authorization_comment(created_at=timestamp, updated_at=timestamp),
+        )
+
+
 def _searched_workflow_run(run_id: int) -> dict[str, Any]:
     return {
         "id": run_id,
