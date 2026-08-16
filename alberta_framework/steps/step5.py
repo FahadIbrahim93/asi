@@ -71,17 +71,24 @@ class Step5AverageRewardTDConfig:
 
     def __post_init__(self) -> None:
         """Reject malformed scientific scalars before JAX execution."""
-        _finite_float32_scalar("step_size", self.step_size)
-        _finite_float32_scalar(
+        step_size = _finite_float32_scalar("step_size", self.step_size)
+        average_reward_step_size = _finite_float32_scalar(
             "average_reward_step_size", self.average_reward_step_size
         )
-        _finite_float32_scalar("trace_decay", self.trace_decay)
+        trace_decay = _finite_float32_scalar("trace_decay", self.trace_decay)
         if self.step_size < 0.0:
             raise ValueError("step_size must be non-negative")
         if self.average_reward_step_size < 0.0:
             raise ValueError("average_reward_step_size must be non-negative")
         if not 0.0 <= self.trace_decay <= 1.0:
             raise ValueError("trace_decay must be in [0, 1]")
+        object.__setattr__(self, "step_size", step_size)
+        object.__setattr__(
+            self,
+            "average_reward_step_size",
+            average_reward_step_size,
+        )
+        object.__setattr__(self, "trace_decay", trace_decay)
 
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-serializable representation."""

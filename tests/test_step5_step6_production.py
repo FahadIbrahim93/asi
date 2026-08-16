@@ -1,5 +1,6 @@
 """Production facade tests for Alberta Plan Steps 5, 6, and 7."""
 
+import json
 from fractions import Fraction
 from typing import Any
 
@@ -49,9 +50,9 @@ def test_step5_facade_config_roundtrip_and_smoke() -> None:
 
     assert restored == config
     assert config.to_dict() == {
-        "step_size": 0.03,
-        "average_reward_step_size": 0.02,
-        "trace_decay": 0.25,
+        "step_size": float(np.float32(0.03)),
+        "average_reward_step_size": float(np.float32(0.02)),
+        "trace_decay": float(np.float32(0.25)),
     }
     assert learner.config.trace_decay == 0.25
     assert result.finite
@@ -152,6 +153,29 @@ def test_step5_config_uses_direct_float32_narrowing_at_overflow_boundary() -> No
 
     assert bool(np.isfinite(np.asarray(config.step_size, dtype=np.float32)))
     assert learner.config.step_size == config.step_size
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        Fraction(1, 4),
+        np.float32(0.25),
+        np.longdouble("0.25"),
+        np.int64(1),
+    ],
+)
+def test_step5_config_canonicalizes_accepted_real_scalars_for_json(value: object) -> None:
+    config = Step5AverageRewardTDConfig(
+        step_size=value,  # type: ignore[arg-type]
+        average_reward_step_size=value,  # type: ignore[arg-type]
+        trace_decay=value,  # type: ignore[arg-type]
+    )
+
+    payload = config.to_dict()
+    assert all(type(payload[field]) is float for field in payload)
+    encoded = json.dumps(payload, allow_nan=False, sort_keys=True)
+    restored = Step5AverageRewardTDConfig.from_dict(json.loads(encoded))
+    assert restored == config
 
 
 @pytest.mark.parametrize(
