@@ -137,22 +137,29 @@ class Step7DynaConfig:
 
 
 def _require_nonnegative_real(name: str, value: object) -> float:
-    real, narrowed = finite_real_and_float32(name, value)
-    if real < 0.0 or narrowed < 0.0:
+    real, numerator, _, narrowed = finite_real_and_float32(name, value)
+    if real < 0.0 or numerator < 0 or narrowed < 0.0:
         raise ValueError(f"{name} must be non-negative, got {value!r}")
     return canonical_float32_storage(real, narrowed)
 
 
 def _require_positive_real(name: str, value: object) -> float:
-    real, narrowed = finite_real_and_float32(name, value)
-    if real <= 0.0 or narrowed <= 0.0:
+    real, numerator, _, narrowed = finite_real_and_float32(name, value)
+    if real <= 0.0 or numerator <= 0 or narrowed <= 0.0:
         raise ValueError(f"{name} must be positive, got {value!r}")
     return canonical_float32_storage(real, narrowed)
 
 
 def _require_unit_interval(name: str, value: object) -> float:
-    real, narrowed = finite_real_and_float32(name, value)
-    if real < 0.0 or not real <= 1.0 or narrowed < 0.0 or not narrowed <= 1.0:
+    real, numerator, denominator, narrowed = finite_real_and_float32(name, value)
+    if (
+        real < 0.0
+        or not real <= 1.0
+        or numerator < 0
+        or numerator > denominator
+        or narrowed < 0.0
+        or not narrowed <= 1.0
+    ):
         raise ValueError(f"{name} must be in [0, 1], got {value!r}")
     return canonical_float32_storage(real, narrowed)
 

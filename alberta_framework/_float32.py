@@ -77,14 +77,8 @@ def _float32_from_ratio(
     return float(struct.unpack("!f", bits.to_bytes(4, byteorder="big"))[0])
 
 
-def round_real_to_float32(value: Real) -> float:
-    """Round a standard exact-ratio real directly to IEEE binary32.
-
-    Integer and ``as_integer_ratio`` inputs are rounded with IEEE
-    round-to-nearest, ties-to-even semantics without an intermediate binary64
-    conversion. Real implementations that cannot expose an exact ratio are
-    rejected instead of being silently double-rounded.
-    """
+def _real_ratio(value: Real) -> tuple[int, int, bool]:
+    """Return one normalized exact ratio and its zero-sign metadata."""
     if isinstance(value, bool):
         raise TypeError("real value must not be a bool")
     if isinstance(value, Integral):
@@ -106,14 +100,41 @@ def round_real_to_float32(value: Real) -> float:
         raise TypeError("as_integer_ratio must return an integer pair")
     numerator = int(numerator_raw)
     denominator = int(denominator_raw)
-    negative_zero = (
-        numerator == 0 and math.copysign(1.0, float(value)) < 0.0
-    )
-    return _float32_from_ratio(
+    if denominator < 0:
+        numerator = -numerator
+        denominator = -denominator
+    if denominator == 0:
+        raise ValueError("ratio denominator must be nonzero")
+    negative_zero = numerator == 0 and math.copysign(1.0, float(value)) < 0.0
+    return numerator, denominator, negative_zero
+
+
+def round_real_to_float32_with_ratio(value: Real) -> tuple[int, int, float]:
+    """Read one exact ratio and return it with its binary32 rounding.
+
+    Returning the same ratio used for rounding lets domain validators retain
+    facts that disappear at binary32 endpoints, such as a negative value that
+    rounds to ``-0.0`` or a value above one that rounds to ``1.0``.
+    """
+    numerator, denominator, negative_zero = _real_ratio(value)
+    rounded = _float32_from_ratio(
         numerator,
         denominator,
         negative_zero=negative_zero,
     )
+    return numerator, denominator, rounded
 
 
-__all__ = ["round_real_to_float32"]
+def round_real_to_float32(value: Real) -> float:
+    """Round a standard exact-ratio real directly to IEEE binary32.
+
+    Integer and ``as_integer_ratio`` inputs are rounded with IEEE
+    round-to-nearest, ties-to-even semantics without an intermediate binary64
+    conversion. Real implementations that cannot expose an exact ratio are
+    rejected instead of being silently double-rounded.
+    """
+    _, _, rounded = round_real_to_float32_with_ratio(value)
+    return rounded
+
+
+__all__ = ["round_real_to_float32", "round_real_to_float32_with_ratio"]

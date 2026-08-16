@@ -356,6 +356,137 @@ def test_host_comparisons_cannot_hide_invalid_narrowed_domains() -> None:
 
 
 @pytest.mark.parametrize(
+    "build_config",
+    [
+        pytest.param(lambda value: Step3HordeConfig(sparsity=value), id="step3"),
+        pytest.param(lambda value: Step4SARSAConfig(epsilon_start=value), id="step4"),
+        pytest.param(
+            lambda value: Step5AverageRewardTDConfig(trace_decay=value),
+            id="step5",
+        ),
+        pytest.param(
+            lambda value: Step7DynaConfig(planning_utility_step_size=value),
+            id="step7",
+        ),
+        pytest.param(lambda value: Step8WorldModelConfig(sparsity=value), id="step8"),
+        pytest.param(lambda value: Step9DreamingConfig(model_gamma=value), id="step9"),
+        pytest.param(lambda value: Step10STOMPConfig(epsilon_base=value), id="step10"),
+    ],
+)
+@pytest.mark.parametrize(
+    "ratio",
+    [
+        pytest.param((-1, 2**200), id="negative-rounds-to-negative-zero"),
+        pytest.param((2**200 + 1, 2**200), id="above-one-rounds-to-one"),
+    ],
+)
+def test_exact_ratio_cannot_hide_outside_closed_unit_domain(
+    build_config: Callable[[Any], object],
+    ratio: tuple[int, int],
+) -> None:
+    class HiddenBoundaryFloat(float):
+        def as_integer_ratio(self) -> tuple[int, int]:
+            return ratio
+
+    with pytest.raises(ValueError, match=r"must be in \[0, 1\]"):
+        build_config(HiddenBoundaryFloat(0.5))
+
+
+@pytest.mark.parametrize(
+    "build_config",
+    [
+        pytest.param(lambda value: Step3HordeConfig(step_size=value), id="step3"),
+        pytest.param(lambda value: Step4SARSAConfig(step_size=value), id="step4"),
+        pytest.param(
+            lambda value: Step5AverageRewardTDConfig(step_size=value),
+            id="step5",
+        ),
+        pytest.param(
+            lambda value: Step7DynaConfig(planning_priority_propagation=value),
+            id="step7",
+        ),
+        pytest.param(lambda value: Step8WorldModelConfig(step_size=value), id="step8"),
+        pytest.param(
+            lambda value: Step9DreamingConfig(dreaming_max_model_error=value),
+            id="step9",
+        ),
+        pytest.param(lambda value: Step10STOMPConfig(base_step_size=value), id="step10"),
+    ],
+)
+def test_exact_ratio_cannot_hide_negative_underflow_from_nonnegative_domain(
+    build_config: Callable[[Any], object],
+) -> None:
+    class HiddenNegativeFloat(float):
+        def as_integer_ratio(self) -> tuple[int, int]:
+            return (-1, 2**200)
+
+    with pytest.raises(ValueError, match="must be non-negative"):
+        build_config(HiddenNegativeFloat(0.5))
+
+
+@pytest.mark.parametrize(
+    "build_config",
+    [
+        pytest.param(
+            lambda value: Step3HordeConfig(gammas=(value,), lamdas=(0.0,)),
+            id="step3-gamma",
+        ),
+        pytest.param(
+            lambda value: Step3HordeConfig(gammas=(0.0,), lamdas=(value,)),
+            id="step3-lamda",
+        ),
+        pytest.param(lambda value: Step4SARSAConfig(gamma=value), id="step4-gamma"),
+        pytest.param(lambda value: Step4SARSAConfig(lamda=value), id="step4-lamda"),
+    ],
+)
+def test_exact_ratio_cannot_hide_nonzero_gvf_underflow(
+    build_config: Callable[[Any], object],
+) -> None:
+    class HiddenTinyFloat(float):
+        def as_integer_ratio(self) -> tuple[int, int]:
+            return (1, 2**150)
+
+    with pytest.raises(ValueError, match="zero or a normal float32"):
+        build_config(HiddenTinyFloat(0.5))
+
+
+@pytest.mark.parametrize(
+    ("config_type", "field"),
+    [
+        pytest.param(Step8WorldModelConfig, "utility_decay", id="step8"),
+        pytest.param(Step9DreamingConfig, "model_error_decay", id="step9"),
+    ],
+)
+def test_exact_ratio_cannot_hide_negative_underflow_from_half_open_domain(
+    config_type: type[Step8WorldModelConfig] | type[Step9DreamingConfig],
+    field: str,
+) -> None:
+    class HiddenNegativeFloat(float):
+        def as_integer_ratio(self) -> tuple[int, int]:
+            return (-1, 2**200)
+
+    with pytest.raises(ValueError, match=rf"{field} must be in \[0, 1\)"):
+        config_type(**{field: cast(Any, HiddenNegativeFloat(0.5))})
+
+
+def test_exact_ratio_is_read_once_during_validation() -> None:
+    class StatefulRatioFloat(float):
+        calls = 0
+
+        def as_integer_ratio(self) -> tuple[int, int]:
+            type(self).calls += 1
+            if type(self).calls == 1:
+                return (1, 2)
+            return (2, 1)
+
+    value = StatefulRatioFloat(0.5)
+    config = Step8WorldModelConfig(step_size=value)
+
+    assert StatefulRatioFloat.calls == 1
+    assert config.step_size == 0.5
+
+
+@pytest.mark.parametrize(
     ("config_type", "field"),
     [
         pytest.param(Step8WorldModelConfig, "utility_decay", id="step8"),

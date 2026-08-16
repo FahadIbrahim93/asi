@@ -6,20 +6,20 @@ import math
 from numbers import Real
 from typing import cast
 
-from alberta_framework._float32 import round_real_to_float32
+from alberta_framework._float32 import round_real_to_float32_with_ratio
 
 
-def finite_real_and_float32(name: str, value: object) -> tuple[Real, float]:
-    """Return the original real and its exact finite binary32 rounding."""
+def finite_real_and_float32(name: str, value: object) -> tuple[Real, int, int, float]:
+    """Return the original real, exact ratio, and finite binary32 rounding."""
     if isinstance(value, bool) or not isinstance(value, Real):
         raise ValueError(f"{name} must be a real number, got {value!r}")
     try:
-        narrowed = round_real_to_float32(value)
+        numerator, denominator, narrowed = round_real_to_float32_with_ratio(value)
     except (FloatingPointError, OverflowError, TypeError, ValueError):
         raise ValueError(f"{name} must be finite, got {value!r}") from None
     if not math.isfinite(narrowed):
         raise ValueError(f"{name} must be finite, got {value!r}")
-    return value, narrowed
+    return value, numerator, denominator, narrowed
 
 
 def canonical_float32_storage(value: Real, narrowed: float) -> float:
