@@ -53,6 +53,17 @@ from alberta_framework.core.update_safety import (
     select_transaction,
 )
 
+
+def _skip_zero_scale(scale: Array, value: Array) -> Array:
+    """Skip ``0 * inf`` so a disabled EMA decay does not poison the next moment."""
+    return jnp.where(scale == 0.0, jnp.zeros_like(value), scale * value)
+
+
+def _zero_if_disabled(scale: Array, value: Array) -> Array:
+    """Treat a zero-decay tracker as skippable in the finite-state check."""
+    return jnp.where(scale == 0.0, jnp.zeros_like(value), value)
+
+
 # =============================================================================
 # State dataclasses
 # =============================================================================
@@ -496,8 +507,8 @@ class Adam(Optimizer[Any]):
             g = gradient
 
         new_t = state.t + 1.0
-        new_m = state.beta1 * state.m + (1.0 - state.beta1) * g
-        new_v = state.beta2 * state.v + (1.0 - state.beta2) * g**2
+        new_m = _skip_zero_scale(state.beta1, state.m) + (1.0 - state.beta1) * g
+        new_v = _skip_zero_scale(state.beta2, state.v) + (1.0 - state.beta2) * g**2
 
         m_hat = new_m / (1.0 - state.beta1**new_t)
         v_hat = new_v / (1.0 - state.beta2**new_t)
@@ -525,8 +536,12 @@ class Adam(Optimizer[Any]):
             if param is None
             else jnp.all(jnp.isfinite(param))
         )
+        checked_state = state.replace(
+            m=_zero_if_disabled(state.beta1, state.m),
+            v=_zero_if_disabled(state.beta2, state.v),
+        )
         update_applied = (
-            floating_tree_is_finite(state)
+            floating_tree_is_finite(checked_state)
             & jnp.all(jnp.isfinite(gradient))
             & error_is_finite
             & param_is_finite
@@ -568,10 +583,14 @@ class Adam(Optimizer[Any]):
         g_b = -error_scalar
 
         new_t = state.t + 1.0
-        new_m = state.beta1 * state.m + (1.0 - state.beta1) * g
-        new_v = state.beta2 * state.v + (1.0 - state.beta2) * g**2
-        new_bias_m = state.beta1 * state.bias_m + (1.0 - state.beta1) * g_b
-        new_bias_v = state.beta2 * state.bias_v + (1.0 - state.beta2) * g_b**2
+        new_m = _skip_zero_scale(state.beta1, state.m) + (1.0 - state.beta1) * g
+        new_v = _skip_zero_scale(state.beta2, state.v) + (1.0 - state.beta2) * g**2
+        new_bias_m = (
+            _skip_zero_scale(state.beta1, state.bias_m) + (1.0 - state.beta1) * g_b
+        )
+        new_bias_v = (
+            _skip_zero_scale(state.beta2, state.bias_v) + (1.0 - state.beta2) * g_b**2
+        )
 
         m_hat = new_m / (1.0 - state.beta1**new_t)
         v_hat = new_v / (1.0 - state.beta2**new_t)
@@ -602,8 +621,14 @@ class Adam(Optimizer[Any]):
             "t": new_t,
         }
 
+        checked_state = state.replace(
+            m=_zero_if_disabled(state.beta1, state.m),
+            v=_zero_if_disabled(state.beta2, state.v),
+            bias_m=_zero_if_disabled(state.beta1, state.bias_m),
+            bias_v=_zero_if_disabled(state.beta2, state.bias_v),
+        )
         update_applied = (
-            floating_tree_is_finite(state)
+            floating_tree_is_finite(checked_state)
             & jnp.isfinite(error_scalar)
             & jnp.all(jnp.isfinite(observation))
             & jnp.all(jnp.isfinite(weight_delta))
@@ -740,7 +765,7 @@ class RMSprop(Optimizer[Any]):
         else:
             g = gradient
 
-        new_v = state.decay * state.v + (1.0 - state.decay) * g**2
+        new_v = _skip_zero_scale(state.decay, state.v) + (1.0 - state.decay) * g**2
         step = state.step_size * g / (jnp.sqrt(new_v) + state.eps)
 
         candidate_state = RMSpropParamState(
@@ -754,8 +779,9 @@ class RMSprop(Optimizer[Any]):
             if error is None
             else jnp.all(jnp.isfinite(error))
         )
+        checked_state = state.replace(v=_zero_if_disabled(state.decay, state.v))
         update_applied = (
-            floating_tree_is_finite(state)
+            floating_tree_is_finite(checked_state)
             & jnp.all(jnp.isfinite(gradient))
             & error_is_finite
             & jnp.all(jnp.isfinite(step))
@@ -793,8 +819,10 @@ class RMSprop(Optimizer[Any]):
         g = -error_scalar * observation
         g_b = -error_scalar
 
-        new_v = state.decay * state.v + (1.0 - state.decay) * g**2
-        new_bias_v = state.decay * state.bias_v + (1.0 - state.decay) * g_b**2
+        new_v = _skip_zero_scale(state.decay, state.v) + (1.0 - state.decay) * g**2
+        new_bias_v = (
+            _skip_zero_scale(state.decay, state.bias_v) + (1.0 - state.decay) * g_b**2
+        )
 
         weight_delta = -state.step_size * g / (jnp.sqrt(new_v) + state.eps)
         bias_delta = -state.step_size * g_b / (jnp.sqrt(new_bias_v) + state.eps)
@@ -811,8 +839,12 @@ class RMSprop(Optimizer[Any]):
             "mean_v": jnp.mean(new_v),
         }
 
+        checked_state = state.replace(
+            v=_zero_if_disabled(state.decay, state.v),
+            bias_v=_zero_if_disabled(state.decay, state.bias_v),
+        )
         update_applied = (
-            floating_tree_is_finite(state)
+            floating_tree_is_finite(checked_state)
             & jnp.isfinite(error_scalar)
             & jnp.all(jnp.isfinite(observation))
             & jnp.all(jnp.isfinite(weight_delta))
@@ -920,7 +952,7 @@ class NADALINE(Optimizer[Any]):
         """
         error_scalar = jnp.squeeze(error)
         new_second_moment = (
-            state.decay * state.feature_second_moment
+            _skip_zero_scale(state.decay, state.feature_second_moment)
             + (1.0 - state.decay) * observation**2
         )
 
@@ -942,8 +974,13 @@ class NADALINE(Optimizer[Any]):
             "mean_denom": jnp.mean(denom),
         }
 
+        checked_state = state.replace(
+            feature_second_moment=_zero_if_disabled(
+                state.decay, state.feature_second_moment
+            ),
+        )
         update_applied = (
-            floating_tree_is_finite(state)
+            floating_tree_is_finite(checked_state)
             & jnp.isfinite(error_scalar)
             & jnp.all(jnp.isfinite(observation))
             & jnp.all(jnp.isfinite(weight_delta))
