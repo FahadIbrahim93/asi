@@ -145,9 +145,7 @@ def test_infinite_cumulant_with_obgd_does_not_poison_head() -> None:
     assert bool(jnp.all(jnp.isfinite(poisoned.state.head_params.weights[0])))
     chex.assert_trees_all_close(poisoned.state.head_params.weights[0], before_w0)
     assert bool(jnp.all(jnp.isfinite(poisoned.state.head_params.weights[1])))
-    assert float(
-        jnp.linalg.norm(poisoned.state.head_params.weights[1] - before_w1)
-    ) > 0.0
+    assert float(jnp.linalg.norm(poisoned.state.head_params.weights[1] - before_w1)) > 0.0
     assert int(poisoned.state.step_count) == int(state.step_count) + 1
     assert bool(poisoned.update_applied)
     chex.assert_trees_all_equal(
@@ -197,9 +195,10 @@ def test_zero_discount_ignores_nonfinite_next_observation_under_jit() -> None:
     chex.assert_trees_all_close(result.next_predictions, jnp.zeros(1))
     chex.assert_tree_all_finite(result.state)
     assert int(result.state.step_count) == int(state.step_count) + 1
-    assert float(
-        jnp.linalg.norm(result.state.head_params.weights[0] - state.head_params.weights[0])
-    ) > 0.0
+    assert (
+        float(jnp.linalg.norm(result.state.head_params.weights[0] - state.head_params.weights[0]))
+        > 0.0
+    )
 
 
 def test_nonzero_discount_rejects_nonfinite_next_then_recovers_under_jit() -> None:
@@ -272,9 +271,10 @@ def test_mixed_discounts_isolate_nonfinite_next_to_consuming_head() -> None:
     )
     chex.assert_trees_all_close(result.td_targets, jnp.array([1.25, 0.0]))
     chex.assert_trees_all_close(result.next_predictions, jnp.zeros(2))
-    assert float(
-        jnp.linalg.norm(result.state.head_params.weights[0] - state.head_params.weights[0])
-    ) > 0.0
+    assert (
+        float(jnp.linalg.norm(result.state.head_params.weights[0] - state.head_params.weights[0]))
+        > 0.0
+    )
     chex.assert_trees_all_close(
         result.state.head_params.weights[1],
         state.head_params.weights[1],
@@ -304,9 +304,7 @@ def test_terminal_lifetime_counter_rejects_entire_update_under_jit() -> None:
     )
     state = learner.init(2, jax.random.key(17)).replace(
         step_count=jnp.asarray(jnp.iinfo(jnp.int32).max, dtype=jnp.int32),
-        step_words=jnp.full(
-            (2,), jnp.iinfo(jnp.uint32).max, dtype=jnp.uint32
-        ),
+        step_words=jnp.full((2,), jnp.iinfo(jnp.uint32).max, dtype=jnp.uint32),
     )
 
     rejected = learner.update_with_ratios(
@@ -319,9 +317,7 @@ def test_terminal_lifetime_counter_rejects_entire_update_under_jit() -> None:
 
     assert not bool(rejected.update_applied)
     chex.assert_trees_all_close(rejected.state, state)
-    chex.assert_trees_all_equal(
-        rejected.head_updates_applied, jnp.array([False])
-    )
+    chex.assert_trees_all_equal(rejected.head_updates_applied, jnp.array([False]))
     chex.assert_trees_all_close(rejected.predictions, jnp.zeros(1))
     chex.assert_trees_all_close(rejected.td_errors, jnp.zeros(1))
     chex.assert_trees_all_close(rejected.per_demon_metrics, jnp.zeros((1, 6)))
@@ -355,9 +351,7 @@ def test_invalid_lifetime_counter_rejects_then_repaired_state_recovers() -> None
     recovered = learner.update_with_ratios(initial, *inputs)
     assert bool(recovered.update_applied)
     assert int(recovered.state.step_count) == 1
-    chex.assert_trees_all_equal(
-        recovered.state.step_words, jnp.array([0, 1], dtype=jnp.uint32)
-    )
+    chex.assert_trees_all_equal(recovered.state.step_words, jnp.array([0, 1], dtype=jnp.uint32))
 
 
 def test_probability_api_matches_explicit_ratios() -> None:
@@ -437,9 +431,7 @@ def test_off_policy_positive_control_learns_target_action_value() -> None:
     observations = jnp.ones((240, 1), dtype=jnp.float32)
     next_observations = jnp.ones((240, 1), dtype=jnp.float32)
     cumulants = jnp.asarray((actions == 1).astype(np.float32)).reshape(-1, 1)
-    target_rhos = jnp.asarray(
-        np.where(actions == 1, 2.0, 0.0).astype(np.float32)
-    ).reshape(-1, 1)
+    target_rhos = jnp.asarray(np.where(actions == 1, 2.0, 0.0).astype(np.float32)).reshape(-1, 1)
     no_is_rhos = jnp.ones((240, 1), dtype=jnp.float32)
 
     learner = OffPolicyHordeLearner(
@@ -537,9 +529,7 @@ def test_nonlinear_shared_gtd_horde_two_state_positive_control() -> None:
 
     def step(carry, xs):  # type: ignore[no-untyped-def]
         obs, cums, next_obs, rho, discount = xs
-        update = learner.update_with_ratios_and_discounts(
-            carry, obs, cums, next_obs, rho, discount
-        )
+        update = learner.update_with_ratios_and_discounts(carry, obs, cums, next_obs, rho, discount)
         return update.state, update
 
     initial = learner.init(2, jax.random.key(9))
@@ -548,9 +538,7 @@ def test_nonlinear_shared_gtd_horde_two_state_positive_control() -> None:
         initial,
         (observations, cumulants, next_observations, rhos_jnp, discounts),
     )
-    predictions = jax.vmap(lambda x: learner.predict(final_state, x))(
-        jnp.eye(2, dtype=jnp.float32)
-    )
+    predictions = jax.vmap(lambda x: learner.predict(final_state, x))(jnp.eye(2, dtype=jnp.float32))
     target = jnp.array([[5.0, 4.0], [4.0, 5.0]], dtype=jnp.float32)
 
     assert float(jnp.mean(jnp.abs(predictions - target))) < 0.8
@@ -641,3 +629,29 @@ def test_replacing_zero_grad_does_not_multiply_inf_trunk_trace() -> None:
     assert bool(result.update_applied)
     for trace in result.state.trunk_traces:
         chex.assert_tree_all_finite(trace)
+
+
+def test_nonlinear_shared_gtd_horde_integer_validation() -> None:
+    spec = _spec()
+
+    with pytest.raises(ValueError, match="hidden_size"):
+        NonlinearSharedGTDHordeLearner(horde_spec=spec, hidden_size=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="hidden_size"):
+        NonlinearSharedGTDHordeLearner(horde_spec=spec, hidden_size=16.5)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="hidden_size"):
+        NonlinearSharedGTDHordeLearner(horde_spec=spec, hidden_size=0)
+
+    learner = NonlinearSharedGTDHordeLearner(horde_spec=spec, hidden_size=np.int32(16))
+    assert learner._hidden_size == 16
+    assert type(learner._hidden_size) is int
+
+    key = jax.random.PRNGKey(0)
+    with pytest.raises(ValueError, match="feature_dim"):
+        learner.init(feature_dim=True, key=key)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="feature_dim"):
+        learner.init(feature_dim=4.5, key=key)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="feature_dim"):
+        learner.init(feature_dim=0, key=key)
+
+    state = learner.init(feature_dim=np.int32(4), key=key)
+    assert state.trunk_w.shape == (16, 4)

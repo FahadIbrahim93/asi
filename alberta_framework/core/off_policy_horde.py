@@ -11,12 +11,14 @@ correction terms that are still separate from this shared-trunk backend.
 from __future__ import annotations
 
 import functools
+import operator
 import time
-from typing import Any, cast
+from typing import Any, SupportsIndex, cast
 
 import chex
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import Array
 from jaxtyping import Bool, Float
 
@@ -37,6 +39,32 @@ from alberta_framework.core.types import HordeSpec, MLPParams, TraceMode
 from alberta_framework.core.update_safety import (
     floating_tree_is_finite as _floating_tree_is_finite,
 )
+
+_INT32_MAX = 2**31 - 1
+_ACTUAL_INT_TYPES = frozenset(
+    {
+        int,
+        np.int8,
+        np.int16,
+        np.int32,
+        np.int64,
+        np.uint8,
+        np.uint16,
+        np.uint32,
+        np.uint64,
+        np.longlong,
+        np.ulonglong,
+    }
+)
+
+
+def _require_int32(name: str, value: object, *, minimum: int, maximum: int = _INT32_MAX) -> int:
+    if type(value) not in _ACTUAL_INT_TYPES:
+        raise ValueError(f"{name} must be an integer in [{minimum}, {maximum}]")
+    canonical = operator.index(cast(SupportsIndex, value))
+    if not minimum <= canonical <= maximum:
+        raise ValueError(f"{name} must be an integer in [{minimum}, {maximum}]")
+    return canonical
 
 
 def _skip_zero_scale(scale: Array, value: Array) -> Array:
@@ -242,13 +270,10 @@ class OffPolicyHordeLearner:
         if ratio_clip <= 0.0:
             raise ValueError(f"ratio_clip must be positive; got {ratio_clip}")
         if trace_ratio_clip <= 0.0:
-            raise ValueError(
-                f"trace_ratio_clip must be positive; got {trace_ratio_clip}"
-            )
+            raise ValueError(f"trace_ratio_clip must be positive; got {trace_ratio_clip}")
         if min_behavior_probability <= 0.0:
             raise ValueError(
-                "min_behavior_probability must be positive; "
-                f"got {min_behavior_probability}"
+                f"min_behavior_probability must be positive; got {min_behavior_probability}"
             )
 
         self._horde_spec = horde_spec
@@ -320,7 +345,6 @@ class OffPolicyHordeLearner:
     def predict(self, state: MultiHeadMLPState, observation: Array) -> Array:
         """Predict all demon values for one observation."""
         return self._learner.predict(state, observation)  # type: ignore[no-any-return]
-
 
     def update(
         self,
@@ -452,10 +476,7 @@ class OffPolicyHordeLearner:
             & jnp.isfinite(discounts)
             & (discounts >= 0.0)
             & (discounts <= 1.0)
-            & (
-                zero_discount_mask
-                | (next_observation_valid & jnp.isfinite(next_predictions))
-            )
+            & (zero_discount_mask | (next_observation_valid & jnp.isfinite(next_predictions)))
             & jnp.isfinite(td_targets)
         )
         active_mask = head_inputs_valid & global_inputs_valid & source_state_finite
@@ -521,13 +542,9 @@ class OffPolicyHordeLearner:
             effective_error_i = safe_clipped_rhos[i] * masked_td_error_i
 
             predictions_list.append(pred_i)
-            td_errors_list.append(
-                jnp.where(active_mask[i], td_error_i, jnp.nan)
-            )
+            td_errors_list.append(jnp.where(active_mask[i], td_error_i, jnp.nan))
             masked_td_errors_list.append(masked_td_error_i)
-            cotangent = cotangent + effective_error_i * jnp.squeeze(
-                state.head_params.weights[i]
-            )
+            cotangent = cotangent + effective_error_i * jnp.squeeze(state.head_params.weights[i])
 
         predictions = jnp.stack(predictions_list)
         td_errors = jnp.stack(td_errors_list)
@@ -563,13 +580,11 @@ class OffPolicyHordeLearner:
             else:
                 new_w_trace = w_grad_i
             new_trunk_traces.append(new_w_trace)
-            w_step, new_w_opt, w_update_applied = (
-                _update_from_gradient_with_diagnostics(
-                    self._optimizer,
-                    state.trunk_optimizer_states[2 * i],
-                    new_w_trace,
-                    error=None,
-                )
+            w_step, new_w_opt, w_update_applied = _update_from_gradient_with_diagnostics(
+                self._optimizer,
+                state.trunk_optimizer_states[2 * i],
+                new_w_trace,
+                error=None,
             )
             trunk_steps.append(w_step)
             new_trunk_opt_states.append(new_w_opt)
@@ -582,13 +597,11 @@ class OffPolicyHordeLearner:
             else:
                 new_b_trace = b_grad_i
             new_trunk_traces.append(new_b_trace)
-            b_step, new_b_opt, b_update_applied = (
-                _update_from_gradient_with_diagnostics(
-                    self._optimizer,
-                    state.trunk_optimizer_states[2 * i + 1],
-                    new_b_trace,
-                    error=None,
-                )
+            b_step, new_b_opt, b_update_applied = _update_from_gradient_with_diagnostics(
+                self._optimizer,
+                state.trunk_optimizer_states[2 * i + 1],
+                new_b_trace,
+                error=None,
             )
             trunk_steps.append(b_step)
             new_trunk_opt_states.append(new_b_opt)
@@ -611,12 +624,8 @@ class OffPolicyHordeLearner:
         new_trunk_weights: list[Array] = []
         new_trunk_biases: list[Array] = []
         for i in range(n_trunk_layers):
-            new_trunk_weights.append(
-                state.trunk_params.weights[i] + trunk_steps[2 * i]
-            )
-            new_trunk_biases.append(
-                state.trunk_params.biases[i] + trunk_steps[2 * i + 1]
-            )
+            new_trunk_weights.append(state.trunk_params.weights[i] + trunk_steps[2 * i])
+            new_trunk_biases.append(state.trunk_params.biases[i] + trunk_steps[2 * i + 1])
 
         new_trunk_params = MLPParams(
             weights=tuple(new_trunk_weights),
@@ -664,21 +673,17 @@ class OffPolicyHordeLearner:
                 new_b_trace = _skip_zero_scale(head_gl, old_b_trace) + b_grad
 
             error_i = masked_td_errors[i]
-            w_step, new_w_opt, w_update_applied = (
-                _update_from_gradient_with_diagnostics(
-                    head_optimizer,
-                    old_w_opt,
-                    new_w_trace,
-                    error=error_i,
-                )
+            w_step, new_w_opt, w_update_applied = _update_from_gradient_with_diagnostics(
+                head_optimizer,
+                old_w_opt,
+                new_w_trace,
+                error=error_i,
             )
-            b_step, new_b_opt, b_update_applied = (
-                _update_from_gradient_with_diagnostics(
-                    head_optimizer,
-                    old_b_opt,
-                    new_b_trace,
-                    error=error_i,
-                )
+            b_step, new_b_opt, b_update_applied = _update_from_gradient_with_diagnostics(
+                head_optimizer,
+                old_b_opt,
+                new_b_trace,
+                error=error_i,
             )
             optimizer_updates_applied.extend((w_update_applied, b_update_applied))
 
@@ -803,9 +808,7 @@ class OffPolicyHordeLearner:
             jnp.zeros_like(predictions),
         )
         sanitized_next_predictions = jnp.where(
-            head_updates_applied
-            & zero_discount_mask
-            & ~jnp.isfinite(next_predictions),
+            head_updates_applied & zero_discount_mask & ~jnp.isfinite(next_predictions),
             jnp.zeros_like(next_predictions),
             next_predictions,
         )
@@ -823,16 +826,10 @@ class OffPolicyHordeLearner:
             state=committed_state,
             predictions=reported_predictions,
             next_predictions=reported_next_predictions,
-            td_targets=_report_demon_values(
-                td_targets, requested_mask, head_updates_applied
-            ),
-            td_errors=_report_demon_values(
-                td_errors, requested_mask, head_updates_applied
-            ),
+            td_targets=_report_demon_values(td_targets, requested_mask, head_updates_applied),
+            td_errors=_report_demon_values(td_errors, requested_mask, head_updates_applied),
             rhos=jnp.where(head_updates_applied, rhos, jnp.zeros_like(rhos)),
-            clipped_rhos=_report_demon_values(
-                clipped_rhos, requested_mask, head_updates_applied
-            ),
+            clipped_rhos=_report_demon_values(clipped_rhos, requested_mask, head_updates_applied),
             trace_coefficients=_report_demon_values(
                 trace_coefficients, requested_mask, head_updates_applied
             ),
@@ -860,9 +857,7 @@ class OffPolicyHordeLearner:
             "sparsity": self._sparsity,
             "leaky_relu_slope": self._leaky_relu_slope,
             "use_layer_norm": self._use_layer_norm,
-            "head_optimizer": (
-                self._head_optimizer.to_config() if self._head_optimizer else None
-            ),
+            "head_optimizer": (self._head_optimizer.to_config() if self._head_optimizer else None),
             "trace_mode": self._trace_mode.value,
             "utility_decay": self._utility_decay,
             "ratio_clip": self._ratio_clip,
@@ -888,11 +883,7 @@ class OffPolicyHordeLearner:
         normalizer_cfg = config.pop("normalizer", None)
         normalizer = normalizer_from_config(normalizer_cfg) if normalizer_cfg else None
         head_optimizer_cfg = config.pop("head_optimizer", None)
-        head_optimizer = (
-            optimizer_from_config(head_optimizer_cfg)
-            if head_optimizer_cfg
-            else None
-        )
+        head_optimizer = optimizer_from_config(head_optimizer_cfg) if head_optimizer_cfg else None
         trace_mode = TraceMode(config.pop("trace_mode", TraceMode.ACCUMULATING.value))
 
         return cls(
@@ -925,8 +916,7 @@ class NonlinearSharedGTDHordeLearner:
         ratio_clip: float = 10.0,
         init_scale: float = 0.25,
     ) -> None:
-        if hidden_size <= 0:
-            raise ValueError("hidden_size must be positive")
+        hidden_size = _require_int32("hidden_size", hidden_size, minimum=1)
         if primary_step_size <= 0.0:
             raise ValueError("primary_step_size must be positive")
         if secondary_step_size <= 0.0:
@@ -954,6 +944,7 @@ class NonlinearSharedGTDHordeLearner:
 
     def init(self, feature_dim: int, key: Array) -> NonlinearSharedGTDHordeState:
         """Initialize primary and secondary weights."""
+        feature_dim = _require_int32("feature_dim", feature_dim, minimum=1)
         trunk_key, head_key = jax.random.split(key)
         trunk_w = self._init_scale * jax.random.normal(
             trunk_key,
@@ -1025,9 +1016,7 @@ class NonlinearSharedGTDHordeLearner:
             & jnp.isfinite(discounts)
             & jnp.isfinite(td_targets)
         )
-        inputs_valid = jnp.all(jnp.isfinite(observation)) & jnp.all(
-            jnp.isfinite(next_observation)
-        )
+        inputs_valid = jnp.all(jnp.isfinite(observation)) & jnp.all(jnp.isfinite(next_observation))
         source_state_finite = _floating_tree_is_finite(state)
         effective_mask = active_mask & inputs_valid & source_state_finite
         safe_td_errors = jnp.where(active_mask, td_errors, 0.0)
@@ -1228,12 +1217,15 @@ def run_off_policy_horde_learning_loop(
         )
 
     t0 = time.time()
-    final_state, (
-        per_demon_metrics,
-        td_errors,
-        clipped_rhos,
-        head_updates_applied,
-        updates_applied,
+    (
+        final_state,
+        (
+            per_demon_metrics,
+            td_errors,
+            clipped_rhos,
+            head_updates_applied,
+            updates_applied,
+        ),
     ) = jax.lax.scan(
         step_fn,
         state,
