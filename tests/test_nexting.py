@@ -165,6 +165,25 @@ class TestRMSE:
             error.throw()
             chex.assert_tree_all_finite(rmse)
 
+    def test_huge_finite_error_gradient_is_correct_eager_and_jit(self) -> None:
+        predictions = jnp.asarray([[3.0e38], [-1.0e38]], dtype=jnp.float32)
+        returns = jnp.zeros_like(predictions)
+
+        def scalar_rmse(values: jax.Array) -> jax.Array:
+            return per_horizon_rmse(values, returns)[0]
+
+        reference_values = np.asarray(predictions, dtype=np.float64)
+        reference_rmse = np.sqrt(np.mean(reference_values**2, axis=0))[0]
+        expected = reference_values / (predictions.shape[0] * reference_rmse)
+
+        eager = jax.grad(scalar_rmse)(predictions)
+        compiled = jax.jit(jax.grad(scalar_rmse))(predictions)
+
+        assert bool(jnp.all(jnp.isfinite(eager)))
+        assert bool(jnp.all(jnp.isfinite(compiled)))
+        np.testing.assert_allclose(np.asarray(eager), expected, rtol=2e-6, atol=0.0)
+        np.testing.assert_allclose(np.asarray(compiled), expected, rtol=2e-6, atol=0.0)
+
     def test_zero_error_when_predictions_match(self) -> None:
         t, h = 50, 4
         truths = jnp.ones((t, h))
