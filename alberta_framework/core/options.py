@@ -1427,6 +1427,26 @@ class STOMPConfig:
                 )
             if spec.max_option_steps > _INT32_MAX:
                 raise ValueError("SubtaskSpec.max_option_steps must fit int32 telemetry")
+        for step_size_name in (
+            "base_step_size",
+            "base_avg_reward_step_size",
+            "option_step_size",
+            "option_avg_reward_step_size",
+            "option_model_step_size",
+        ):
+            step_size_value: float = getattr(self, step_size_name)
+            if not math.isfinite(step_size_value) or step_size_value < 0.0:
+                raise ValueError(f"{step_size_name} must be finite and non-negative")
+        for unit_interval_name in (
+            "base_trace_decay",
+            "option_trace_decay",
+            "option_model_decay",
+            "epsilon_base",
+            "epsilon_option",
+        ):
+            unit_interval_value: float = getattr(self, unit_interval_name)
+            if not math.isfinite(unit_interval_value) or not 0.0 <= unit_interval_value <= 1.0:
+                raise ValueError(f"{unit_interval_name} must be finite and in [0, 1]")
         if not math.isfinite(self.option_gamma) or not 0.0 <= self.option_gamma <= 1.0:
             raise ValueError("option_gamma must be finite and in [0, 1]")
         if self.option_target_epsilon is not None and not (
