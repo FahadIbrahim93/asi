@@ -34,6 +34,24 @@ class TestRandomWalkStream:
         assert state.key is not None
         chex.assert_shape(state.true_weights, (10,))
 
+    def test_rejects_invalid_feature_dim(self):
+        """Should reject non-positive, bool, or non-integer feature_dim."""
+        for feature_dim in (0, -1, True, 2.5):
+            with pytest.raises(ValueError, match="feature_dim"):
+                RandomWalkStream(feature_dim=feature_dim)
+
+    def test_rejects_non_finite_or_negative_float_params(self):
+        """Should reject NaN/inf/negative drift_rate, noise_std, feature_std."""
+        for name, value in (
+            ("drift_rate", float("nan")),
+            ("drift_rate", float("inf")),
+            ("drift_rate", -1.0),
+            ("noise_std", float("nan")),
+            ("feature_std", -0.5),
+        ):
+            with pytest.raises(ValueError, match=name):
+                RandomWalkStream(feature_dim=4, **{name: value})
+
     def test_step_produces_valid_timestep(self, rng_key):
         """Step should produce valid observation and target."""
         stream = RandomWalkStream(feature_dim=10)

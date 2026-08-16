@@ -116,10 +116,10 @@ class RandomWalkStream:
             noise_std: Std dev of target noise
             feature_std: Std dev of feature values
         """
-        self._feature_dim = feature_dim
-        self._drift_rate = drift_rate
-        self._noise_std = noise_std
-        self._feature_std = feature_std
+        self._feature_dim = _require_positive_int("feature_dim", feature_dim)
+        self._drift_rate = _require_finite_nonnegative_float32("drift_rate", drift_rate)
+        self._noise_std = _require_finite_nonnegative_float32("noise_std", noise_std)
+        self._feature_std = _require_finite_nonnegative_float32("feature_std", feature_std)
 
     @property
     def feature_dim(self) -> int:
