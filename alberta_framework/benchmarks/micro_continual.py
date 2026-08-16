@@ -1026,7 +1026,16 @@ def merge_micro_shards(
     paths: Sequence[Path | str], bayes_samples: int = 200_000
 ) -> dict[str, Any]:
     """Merge shards of one (family, config) into a ranked summary with the
-    analytic Bayes reference attached."""
+    analytic Bayes reference attached.
+
+    Every arm must carry the same seed set: the ranking and the Bayes
+    reference are only meaningful as paired comparisons on shared streams.
+
+    Raises:
+        ValueError: If shards duplicate an ``(arm, seed)`` pair, span more
+            than one stream config or environment, drift within an arm, or
+            cover different seed sets across arms.
+    """
     shards = [load_micro_shard(path) for path in paths]
     config, reference_environment = _micro_shard_batch_contract(shards)
     quarter = max(1, config.n_regimes // 4)
@@ -1039,6 +1048,12 @@ def merge_micro_shards(
                 f"duplicate shard for arm={shard['arm_name']} seed={shard['seed']}"
             )
         per_seed[shard["seed"]] = shard
+    seed_sets = {arm: tuple(sorted(per_seed)) for arm, per_seed in sorted(by_arm.items())}
+    if len(set(seed_sets.values())) != 1:
+        raise ValueError(
+            f"seed sets differ across arms: {seed_sets}; "
+            "merge_micro_shards ranks arms on paired seeds only"
+        )
 
     entries: list[dict[str, Any]] = []
     all_seeds: set[int] = set()

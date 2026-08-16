@@ -1028,6 +1028,34 @@ class TestShards:
         assert 0.0 < summary["bayes_reference"]["bayes_accuracy_mean"] <= 1.0
         assert summary["bayes_reference"]["chance"] == pytest.approx(1.0 / 3.0)
 
+    def test_merge_rejects_arms_with_different_seed_sets(self, tmp_path: Path):
+        """A ranked summary must compare arms on the same paired seeds."""
+        paths = []
+        for arm, seeds in (("sgd_raw", (0, 1, 2)), ("naive_bayes", (1, 2, 3))):
+            for seed in seeds:
+                result = run_micro_arm(TINY, arm, seed=seed, hidden1=8, hidden2=6)
+                path = micro_shard_path(tmp_path, TINY.family, arm, seed)
+                write_micro_shard(path, micro_shard_payload(result))
+                paths.append(path)
+        with pytest.raises(
+            ValueError,
+            match=r"^seed sets differ across arms: "
+            r"\{'naive_bayes': \(1, 2, 3\), 'sgd_raw': \(0, 1, 2\)\}; "
+            r"merge_micro_shards ranks arms on paired seeds only$",
+        ):
+            merge_micro_shards(paths, bayes_samples=1_000)
+
+    def test_merge_rejects_arm_missing_one_seed(self, tmp_path: Path):
+        paths = []
+        for arm, seeds in (("sgd_raw", (0, 1)), ("naive_bayes", (0,))):
+            for seed in seeds:
+                result = run_micro_arm(TINY, arm, seed=seed, hidden1=8, hidden2=6)
+                path = micro_shard_path(tmp_path, TINY.family, arm, seed)
+                write_micro_shard(path, micro_shard_payload(result))
+                paths.append(path)
+        with pytest.raises(ValueError, match="seed sets differ across arms"):
+            merge_micro_shards(paths, bayes_samples=1_000)
+
     def test_merge_rejects_mixed_configs(self, tmp_path: Path):
         result_a = run_micro_arm(TINY, "sgd_raw", seed=0, hidden1=8, hidden2=6)
         other = tiny("input_permutation", n_regimes=3)
