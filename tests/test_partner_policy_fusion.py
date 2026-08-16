@@ -35,6 +35,16 @@ from alberta_framework.core.partner_policy_fusion import (
 pytestmark = pytest.mark.unit
 
 
+class _HostileFloat(float):
+    def __float__(self) -> float:
+        raise AssertionError("float hook must not run")
+
+
+class _HostileDict(dict[str, Any]):
+    def __iter__(self):
+        raise AssertionError("mapping hook must not run")
+
+
 def _replace[T](value: T, **changes: object) -> T:
     """Use chex's immutable replacement method while retaining the type."""
 
@@ -922,3 +932,46 @@ def test_partner_policy_fusion_config_accepts_and_canonicalizes_numpy_integers()
     assert config.max_partners == 2
     assert config.context_dim == 4
     assert config.n_actions == 2
+
+
+def test_partner_policy_fusion_rejects_float_subclass_without_hooks() -> None:
+    with pytest.raises(ValueError, match="learning_rate"):
+        PartnerPolicyFusionConfig(
+            max_partners=2,
+            context_dim=2,
+            n_actions=3,
+            learning_rate=_HostileFloat(0.5),
+        )
+
+
+def test_partner_policy_fusion_requires_exact_outer_dicts_and_markers() -> None:
+    fusion = _fusion()
+    with pytest.raises(ValueError, match="actual dict"):
+        PartnerPolicyFusion.from_config(_HostileDict(fusion.to_config()))
+
+    nested_subclass = fusion.to_config()
+    nested = nested_subclass["config"]
+    assert isinstance(nested, dict)
+    nested_subclass["config"] = _HostileDict(nested)
+    with pytest.raises(ValueError, match="actual dict"):
+        PartnerPolicyFusion.from_config(nested_subclass)
+
+    wrong_marker = fusion.to_config()
+    nested_wrong = wrong_marker["config"]
+    assert isinstance(nested_wrong, dict)
+    nested_wrong["schema"] = _HostileFloat(0.0)
+    with pytest.raises(ValueError, match="schema"):
+        PartnerPolicyFusion.from_config(wrong_marker)
+
+
+def test_maximum_fusion_config_keeps_derived_resources_in_int32_domain() -> None:
+    budget = PartnerPolicyFusion(
+        PartnerPolicyFusionConfig(
+            max_partners=1024,
+            context_dim=65_536,
+            n_actions=65_536,
+        )
+    ).resource_budget
+    for value in budget.to_config().values():
+        if type(value) is int:
+            assert 0 <= value <= 2**31 - 1

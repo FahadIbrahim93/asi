@@ -40,6 +40,19 @@ _ACTUAL_INT_TYPES = frozenset(
         np.ulonglong,
     }
 )
+_ACTUAL_FLOAT_TYPES = frozenset((float, np.float16, np.float32, np.float64, np.longdouble))
+_CONFIG_FIELDS = frozenset(
+    {
+        "n_actions",
+        "step_size",
+        "temperature",
+        "l2_penalty",
+        "max_gradient_norm",
+        "min_probability",
+        "ratio_clip",
+        "diagnostic_decay",
+    }
+)
 
 
 def _require_int32(name: str, value: object, *, minimum: int, maximum: int = _INT32_MAX) -> int:
@@ -49,6 +62,24 @@ def _require_int32(name: str, value: object, *, minimum: int, maximum: int = _IN
     if not minimum <= canonical <= maximum:
         raise ValueError(f"{name} must be an integer in [{minimum}, {maximum}]")
     return canonical
+
+
+def _validated_config_float(name: str, value: object, **bounds: Any) -> float:
+    """Validate only trusted concrete host scalar types at the float32 sink."""
+    if type(value) not in (_ACTUAL_INT_TYPES | _ACTUAL_FLOAT_TYPES):
+        raise ValueError(f"{name} must be a finite real scalar")
+    return validated_float32_scalar(name, value, **bounds)
+
+
+def _resource_counts(n_actions: int, feature_dim: int) -> tuple[int, int]:
+    """Return exact trainable scalars and bytes, rejecting unsafe derived counts."""
+    trainable = n_actions * feature_dim + n_actions
+    state_nbytes = 4 * (trainable + 3 + 1 + 2)
+    if trainable > _INT32_MAX:
+        raise ValueError(f"derived trainable scalars must be at most {_INT32_MAX}")
+    if state_nbytes > _INT32_MAX:
+        raise ValueError(f"derived state_nbytes must be at most {_INT32_MAX}")
+    return trainable, state_nbytes
 
 
 def _saturating_int32_increment(value: Array) -> Array:
@@ -206,11 +237,11 @@ class BehaviorModelConfig:
             "n_actions",
             _require_int32("n_actions", self.n_actions, minimum=1),
         )
-        step_size = validated_float32_scalar("step_size", self.step_size, lower=0.0)
-        temperature = validated_float32_scalar("temperature", self.temperature, positive=True)
-        l2_penalty = validated_float32_scalar("l2_penalty", self.l2_penalty, lower=0.0)
+        step_size = _validated_config_float("step_size", self.step_size, lower=0.0)
+        temperature = _validated_config_float("temperature", self.temperature, positive=True)
+        l2_penalty = _validated_config_float("l2_penalty", self.l2_penalty, lower=0.0)
         max_gradient_norm = (
-            validated_float32_scalar(
+            _validated_config_float(
                 "max_gradient_norm",
                 self.max_gradient_norm,
                 positive=True,
@@ -218,15 +249,15 @@ class BehaviorModelConfig:
             if self.max_gradient_norm is not None
             else None
         )
-        min_probability = validated_float32_scalar(
+        min_probability = _validated_config_float(
             "min_probability",
             self.min_probability,
             positive=True,
             upper=1.0,
             upper_inclusive=False,
         )
-        ratio_clip = validated_float32_scalar("ratio_clip", self.ratio_clip, positive=True)
-        diagnostic_decay = validated_float32_scalar(
+        ratio_clip = _validated_config_float("ratio_clip", self.ratio_clip, positive=True)
+        diagnostic_decay = _validated_config_float(
             "diagnostic_decay",
             self.diagnostic_decay,
             lower=0.0,
@@ -248,6 +279,10 @@ class BehaviorModelConfig:
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> BehaviorModelConfig:
         """Reconstruct from :meth:`to_config` output."""
+        if type(config) is not dict:
+            raise ValueError("BehaviorModelConfig payload must be an actual dict")
+        if not all(type(key) is str for key in config) or set(config) != _CONFIG_FIELDS:
+            raise ValueError("BehaviorModelConfig fields do not match the schema")
         return cls(**config)
 
 
@@ -381,13 +416,21 @@ class BehaviorModel:
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> BehaviorModel:
         """Reconstruct a behavior model from :meth:`to_config` output."""
-        config = dict(config)
-        config.pop("type", None)
-        return cls(BehaviorModelConfig.from_config(config["config"]))
+        if type(config) is not dict:
+            raise ValueError("BehaviorModel construction must be an actual dict")
+        if not all(type(key) is str for key in config) or set(config) != {"type", "config"}:
+            raise ValueError("BehaviorModel construction fields do not match the schema")
+        if type(config["type"]) is not str or config["type"] != "BehaviorModel":
+            raise ValueError("unexpected BehaviorModel construction type")
+        nested = config["config"]
+        if type(nested) is not dict:
+            raise ValueError("BehaviorModel nested config must be an actual dict")
+        return cls(BehaviorModelConfig.from_config(nested))
 
     def init(self, feature_dim: int, key: Array) -> BehaviorModelState:
         """Initialize parameters and diagnostics."""
         feature_dim = _require_int32("feature_dim", feature_dim, minimum=1)
+        _resource_counts(self._config.n_actions, feature_dim)
         return BehaviorModelState(
             weights=jnp.zeros(
                 (self._config.n_actions, feature_dim),
@@ -409,11 +452,10 @@ class BehaviorModel:
         and stores a default JAX typed key backed by two uint32 words.
         """
         feature_dim = _require_int32("feature_dim", feature_dim, minimum=1)
-        trainable = self._config.n_actions * feature_dim + self._config.n_actions
+        trainable, state_nbytes = _resource_counts(self._config.n_actions, feature_dim)
         diagnostics = 3
         administrative = 1
         rng_words = 2
-        state_nbytes = 4 * (trainable + diagnostics + administrative + rng_words)
         return BehaviorModelResourceBudget(
             feature_dim=feature_dim,
             n_actions=self._config.n_actions,
