@@ -312,6 +312,23 @@ def test_continuous_actor_critic_canonicalizes_real_bounds_to_float() -> None:
     assert float(action[0]) <= 0.25 and float(action[0]) >= -0.25
 
 
+def test_continuous_actor_critic_normalizes_conversion_hook_failures() -> None:
+    from fractions import Fraction
+
+    class BrokenFraction(Fraction):
+        def as_integer_ratio(self) -> tuple[int, int]:
+            raise RuntimeError("conversion hook failed")
+
+    with pytest.raises(ValueError, match="action_low must be finite"):
+        ContinuousActorCriticAgent(
+            ContinuousActorCriticConfig(
+                action_dim=1,
+                action_low=BrokenFraction(-1, 1),
+                action_high=1.0,
+            )
+        )
+
+
 def test_continuous_actor_critic_action_clipping() -> None:
     """Sampled actions respect the configured action bounds."""
     config = ContinuousActorCriticConfig(
