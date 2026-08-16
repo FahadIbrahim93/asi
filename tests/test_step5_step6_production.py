@@ -1,9 +1,15 @@
 """Production facade tests for Alberta Plan Steps 5, 6, and 7."""
 
+import json
+from fractions import Fraction
+from typing import Any
+
 import chex
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
+import pytest
 
 from alberta_framework.steps import (
     Step5AverageRewardTDConfig,
@@ -22,6 +28,7 @@ from alberta_framework.steps import (
     step6_update,
     step7_update,
 )
+from alberta_framework.steps import step5 as step5_module
 from alberta_framework.steps.step7 import (
     _apply_planning_importance_correction,
     _pop_prioritized_planning_anchor,
@@ -42,12 +49,179 @@ def test_step5_facade_config_roundtrip_and_smoke() -> None:
     result = run_step5_smoke(config, steps=12, feature_dim=3)
 
     assert restored == config
+    assert config.to_dict() == {
+        "step_size": 0.03,
+        "average_reward_step_size": 0.02,
+        "trace_decay": 0.25,
+    }
     assert learner.config.trace_decay == 0.25
     assert result.finite
     assert result.predictions_shape == (12,)
     assert result.td_errors_shape == (12,)
     assert result.average_rewards_shape == (12,)
     assert result.learner_config["type"] == "DifferentialTDLearner"
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["step_size", "average_reward_step_size", "trace_decay"],
+)
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        True,
+        False,
+        "0.1",
+        None,
+        0.1 + 0.0j,
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+        3.5e38,
+        -3.5e38,
+    ],
+)
+def test_step5_config_rejects_malformed_scientific_scalars(
+    field: str,
+    malformed: object,
+) -> None:
+    payload: dict[str, object] = {
+        "step_size": 0.05,
+        "average_reward_step_size": 0.01,
+        "trace_decay": 0.0,
+    }
+    payload[field] = malformed
+
+    with pytest.raises(ValueError, match=field):
+        Step5AverageRewardTDConfig(**payload)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match=field):
+        Step5AverageRewardTDConfig.from_dict(payload)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("step_size", -0.01),
+        ("average_reward_step_size", -0.01),
+        ("trace_decay", -0.01),
+        ("trace_decay", 1.01),
+        ("step_size", Fraction(-1, 10**400)),
+        ("average_reward_step_size", Fraction(-1, 10**400)),
+        ("trace_decay", Fraction(-1, 10**400)),
+        ("trace_decay", Fraction(10**400 + 1, 10**400)),
+    ],
+)
+def test_step5_config_enforces_scientific_scalar_domains(field: str, value: object) -> None:
+    payload: dict[str, object] = {
+        "step_size": 0.05,
+        "average_reward_step_size": 0.01,
+        "trace_decay": 0.0,
+    }
+    payload[field] = value
+
+    with pytest.raises(ValueError, match=field):
+        Step5AverageRewardTDConfig(**payload)  # type: ignore[arg-type]
+
+
+def test_step5_config_accepts_finite_float32_boundary_and_domain_endpoints() -> None:
+    float32_max = 3.4028234663852886e38
+    config = Step5AverageRewardTDConfig(
+        step_size=float32_max,
+        average_reward_step_size=0,
+        trace_decay=1,
+    )
+
+    assert config.to_dict() == {
+        "step_size": float32_max,
+        "average_reward_step_size": 0,
+        "trace_decay": 1,
+    }
+
+
+def test_step5_config_uses_direct_float32_narrowing_at_overflow_boundary() -> None:
+    overflow_midpoint = np.ldexp(
+        np.longdouble(2) - np.ldexp(np.longdouble(1), -24),
+        127,
+    )
+    largest_finite_input = np.nextafter(
+        overflow_midpoint,
+        np.longdouble("-inf"),
+    )
+
+    config = Step5AverageRewardTDConfig(step_size=largest_finite_input)
+    learner = make_step5_td_learner(config)
+
+    assert bool(np.isfinite(np.asarray(config.step_size, dtype=np.float32)))
+    assert learner.config.step_size == config.step_size
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        Fraction(1, 4),
+        np.float32(0.25),
+        np.longdouble("0.25"),
+        np.int64(1),
+    ],
+)
+def test_step5_config_canonicalizes_accepted_real_scalars_for_json(value: object) -> None:
+    config = Step5AverageRewardTDConfig(
+        step_size=value,  # type: ignore[arg-type]
+        average_reward_step_size=value,  # type: ignore[arg-type]
+        trace_decay=value,  # type: ignore[arg-type]
+    )
+
+    payload = config.to_dict()
+    assert all(type(payload[field]) is float for field in payload)
+    encoded = json.dumps(payload, allow_nan=False, sort_keys=True)
+    restored = Step5AverageRewardTDConfig.from_dict(json.loads(encoded))
+    assert restored == config
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"step_size": 0.05, "average_reward_step_size": 0.01},
+        {
+            "step_size": 0.05,
+            "average_reward_step_size": 0.01,
+            "trace_decay": 0.0,
+            "unexpected": 1,
+        },
+    ],
+)
+def test_step5_config_from_dict_requires_exact_keys(payload: dict[str, object]) -> None:
+    expected = (
+        "Step5AverageRewardTDConfig payload keys must be exactly "
+        "['average_reward_step_size', 'step_size', 'trace_decay']"
+    )
+
+    with pytest.raises(ValueError) as exc_info:
+        Step5AverageRewardTDConfig.from_dict(payload)
+
+    assert str(exc_info.value) == expected
+
+
+def test_step5_smoke_health_gate_reports_any_refused_update(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_run = step5_module.run_differential_td_from_arrays
+
+    def _refuse_updates(*args: Any, **kwargs: Any) -> Any:
+        result = original_run(*args, **kwargs)
+        return result.replace(  # type: ignore[attr-defined]
+            updates_applied=result.updates_applied.at[0].set(False)
+        )
+
+    monkeypatch.setattr(
+        step5_module,
+        "run_differential_td_from_arrays",
+        _refuse_updates,
+    )
+
+    result = run_step5_smoke(steps=3, feature_dim=2)
+
+    assert not result.finite
 
 
 def test_step6_facade_config_roundtrip_one_step_and_smoke() -> None:
