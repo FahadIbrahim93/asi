@@ -644,6 +644,23 @@ class TestFrequencyMismatchStream:
     """Tests for the trigonometric out-of-class stream."""
 
     @pytest.mark.parametrize(
+        ("name", "value"),
+        [
+            ("amplitude_scale", float("nan")),
+            ("amplitude_scale", float("inf")),
+            ("amplitude_scale", -1.0),
+            ("noise_std", float("nan")),
+            ("noise_std", float("inf")),
+            ("noise_std", -0.5),
+        ],
+    )
+    def test_rejects_non_finite_or_negative_scale_params(
+        self, name: str, value: float
+    ) -> None:
+        with pytest.raises(ValueError, match="float32"):
+            FrequencyMismatchStream(**{name: value})  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize(
         ("omega_min", "omega_max"),
         [(float("nan"), 3.0), (0.5, float("inf")), (float("inf"), float("inf"))],
     )

@@ -489,8 +489,12 @@ class FrequencyMismatchStream:
         self._context_length = context_length
         self._omega_min = omega_min_float32
         self._omega_max = omega_max_float32
-        self._amplitude_scale = amplitude_scale
-        self._noise_std = noise_std
+        self._amplitude_scale = _require_finite_float32_multiplier(
+            amplitude_scale, name="amplitude_scale", nonnegative=True
+        )
+        self._noise_std = _require_finite_float32_multiplier(
+            noise_std, name="noise_std", nonnegative=True
+        )
 
     @property
     def feature_dim(self) -> int:
