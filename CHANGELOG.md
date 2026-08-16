@@ -52,6 +52,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Required persisted micro-stream scalar fields to be concrete real values and
+  canonicalized them to built-in floats, preventing numeric strings or custom
+  conversion objects from crossing the strict development-artifact boundary.
+- Validated frequency-mismatch bounds and Pavlovian noise in their actual
+  float32 execution domain, rejecting overflowed or collapsed frequency
+  intervals and overflowed noise scales before stream state can become invalid.
 - Rejected SIGReg samples, embeddings, directions, and derived projections that are
   non-finite in float32 arithmetic before they can become silent NaN losses, including
   under compiled and vectorized JAX calls.
