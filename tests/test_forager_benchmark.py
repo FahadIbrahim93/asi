@@ -790,6 +790,17 @@ def test_official_npz_import_matches_adjusted_ewm(tmp_path: Path) -> None:
         )
 
 
+def test_official_npz_import_rejects_nonfinite_ewm_decay(tmp_path: Path) -> None:
+    path = tmp_path / "0.npz"
+    np.savez_compressed(path, rewards=np.ones((4,), dtype=np.float32))
+
+    with pytest.raises(ValueError, match="ewm_decay must be a finite number"):
+        import_official_foragax_npz(
+            OfficialForagaxRunSpec(agent="DQN", seed=0, path=path),
+            ewm_decay=math.nan,
+        )
+
+
 def test_protocol_attestation_cannot_be_minted_by_constructing_evidence(
     tmp_path: Path,
 ) -> None:

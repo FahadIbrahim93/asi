@@ -1567,6 +1567,17 @@ def import_official_foragax_npz(
     final_window: int = 100_000,
 ) -> ForagerRunResult:
     """Convert one official ``data/<seed>.npz`` archive to Alberta's schema."""
+    if (
+        isinstance(ewm_decay, bool)
+        or not isinstance(ewm_decay, (int, float))
+        or not math.isfinite(ewm_decay)
+        or not 0.0 <= ewm_decay < 1.0
+    ):
+        raise ValueError("ewm_decay must be a finite number in [0, 1)")
+    if type(record_every) is not int or record_every < 1:
+        raise ValueError("record_every must be a positive integer")
+    if type(final_window) is not int or final_window < 1:
+        raise ValueError("final_window must be a positive integer")
     protocol_attested = spec.attestation_evidence is not None
     runtime_profile_id: str | None = None
     environment_runtime_profile_sha256: str | None = None
