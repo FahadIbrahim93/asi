@@ -747,6 +747,26 @@ class _FloatSpoof:
     __hash__ = None  # type: ignore[assignment]
 
 
+class _HostileFloat(float):
+    """An actual Real whose untrusted exact-ratio hook raises."""
+
+    def as_integer_ratio(self) -> tuple[int, int]:
+        raise RuntimeError("untrusted ratio hook")
+
+    def __repr__(self) -> str:
+        raise AssertionError("repr hook executed")
+
+
+class _HostileNonzeroFloat(float):
+    """A Real whose ratio is readable but whose nonzero hook raises."""
+
+    def __ne__(self, other: object) -> bool:
+        raise RuntimeError("untrusted nonzero hook")
+
+    def __repr__(self) -> str:
+        raise AssertionError("repr hook executed")
+
+
 @pytest.mark.parametrize(
     ("field", "ratio"),
     [
@@ -780,6 +800,15 @@ def test_config_accepts_honest_float_subclasses_as_canonical_floats() -> None:
     payload = memory.to_config()
     json.dumps(payload, allow_nan=False)
     assert DualReplayMemory.from_config(payload).config == memory.config
+
+
+@pytest.mark.parametrize("field", _FLOAT32_SCALARS)
+def test_config_normalizes_hostile_float_hook_failures_without_repr(field: str) -> None:
+    with pytest.raises(ValueError, match=field):
+        _strict_memory(**{field: _HostileFloat(0.5)})
+
+    with pytest.raises(ValueError, match=field):
+        _strict_memory(**{field: _HostileNonzeroFloat(0.5)})
 
 
 def test_config_rejects_calibration_weights_whose_float32_sum_overflows_without_warnings() -> None:
