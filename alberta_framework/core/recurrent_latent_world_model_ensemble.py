@@ -304,6 +304,12 @@ class RecurrentLatentWorldModelEnsembleConfig:
             raise ValueError("gradient_clip_norm cannot exceed max_raw_gradient_norm")
         if self.learning_rate * self.gradient_clip_norm > self.max_parameter_magnitude:
             raise ValueError("one clipped update exceeds max_parameter_magnitude")
+        initial_variance_bias = abs(self.initial_variance_logit)
+        if initial_variance_bias > self.max_parameter_magnitude:
+            raise ValueError(
+                f"initial variance bias magnitude {initial_variance_bias} exceeds "
+                f"max_parameter_magnitude={self.max_parameter_magnitude}"
+            )
         if self.state_nbytes > _MAX_STATE_NBYTES:
             raise ValueError(
                 f"configured persistent state needs {self.state_nbytes} bytes; "
@@ -333,6 +339,15 @@ class RecurrentLatentWorldModelEnsembleConfig:
         recurrent += self.latent_dim * joined + self.latent_dim
         heads = 2 * (self.target_dim * self.latent_dim + self.target_dim)
         return recurrent + heads
+
+    @property
+    def initial_variance_logit(self) -> float:
+        """Variance-head bias that starts every member at sqrt(floor * max) variance."""
+        desired_variance = math.sqrt(self.variance_floor * self.max_variance)
+        variance_ratio = (desired_variance - self.variance_floor) / (
+            self.max_variance - self.variance_floor
+        )
+        return math.log(variance_ratio / (1.0 - variance_ratio))
 
     @property
     def state_nbytes(self) -> int:
@@ -605,7 +620,7 @@ class RecurrentLatentWorldModelEnsemble:
 
     def __init__(self, config: RecurrentLatentWorldModelEnsembleConfig):
         self._config = config
-        template = self.init(jr.key(0))
+        template = self._initial_state(jr.key(0))
         self._member_signature = _static_signature(template.member_parameters[0])
         self._state_signature = _static_signature(template)
         self._start_signature = _static_signature(self._zero_start_cache())
@@ -648,11 +663,7 @@ class RecurrentLatentWorldModelEnsemble:
             fan_in = jnp.asarray(shape[1], dtype=jnp.float32)
             return jr.normal(current_key, shape, dtype=jnp.float32) * scale / jnp.sqrt(fan_in)
 
-        desired_variance = math.sqrt(cfg.variance_floor * cfg.max_variance)
-        variance_ratio = (desired_variance - cfg.variance_floor) / (
-            cfg.max_variance - cfg.variance_floor
-        )
-        variance_logit = math.log(variance_ratio / (1.0 - variance_ratio))
+        variance_logit = cfg.initial_variance_logit
         return RecurrentLatentMemberParameters(
             gate_kernel=kernel(keys[0], (2 * cfg.latent_dim, joined)),
             gate_bias=jnp.zeros((2 * cfg.latent_dim,), dtype=jnp.float32),
@@ -669,7 +680,25 @@ class RecurrentLatentWorldModelEnsemble:
         )
 
     def init(self, key: Array) -> RecurrentLatentWorldModelEnsembleState:
-        """Initialize distinct member parameters and an isolated bootstrap key."""
+        """Initialize distinct member parameters and an isolated bootstrap key.
+
+        Raises:
+            ValueError: If ``key`` is not one JAX PRNG key, or the drawn
+                initial parameters would already fail the configured
+                ``max_parameter_magnitude`` bound (an initialized state that
+                the module itself rejects would make every later event a
+                silent no-op).
+        """
+        state = self._initial_state(key)
+        if not bool(self._state_valid(state)):
+            raise ValueError(
+                "initialized parameters exceed max_parameter_magnitude="
+                f"{self._config.max_parameter_magnitude}; lower initialization_scale "
+                "or raise the bound"
+            )
+        return state
+
+    def _initial_state(self, key: Array) -> RecurrentLatentWorldModelEnsembleState:
         key_data = jr.key_data(key)
         if key_data.shape != (2,) or key_data.dtype != jnp.uint32:
             raise ValueError("key must be one JAX PRNG key")

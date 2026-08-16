@@ -158,6 +158,34 @@ def test_initialization_is_distinct_fixed_width_and_exactly_accounted() -> None:
     assert budget.replay_capacity == 0
 
 
+def test_config_rejects_an_initial_variance_bias_outside_the_parameter_bound() -> None:
+    """The deterministic variance-head initializer must fit inside max_parameter_magnitude."""
+    expected = (
+        r"^initial variance bias magnitude 5\.75646[0-9]* exceeds max_parameter_magnitude=1\.0$"
+    )
+    with pytest.raises(ValueError, match=expected):
+        _config(max_parameter_magnitude=1.0)
+
+
+def test_init_refuses_to_return_a_state_it_would_reject() -> None:
+    """A bound that admits the deterministic bias can still be breached by drawn kernels."""
+    model = RecurrentLatentWorldModelEnsemble(
+        _config(initialization_scale=50.0, max_parameter_magnitude=6.0)
+    )
+    with pytest.raises(
+        ValueError,
+        match=r"^initialized parameters exceed max_parameter_magnitude=6\.0; "
+        r"lower initialization_scale or raise the bound$",
+    ):
+        model.init(jr.key(0))
+
+
+def test_init_state_is_valid_for_every_accepted_default_scale() -> None:
+    model = RecurrentLatentWorldModelEnsemble(_config())
+    for seed in range(4):
+        assert bool(model.state_valid(model.init(jr.key(seed))))
+
+
 def test_start_and_decide_are_read_only_predict_before_update_caches() -> None:
     model = RecurrentLatentWorldModelEnsemble(_config())
     state = model.init(jr.key(0))
