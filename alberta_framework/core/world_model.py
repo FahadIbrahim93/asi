@@ -18,6 +18,7 @@ import dataclasses
 import functools
 import operator
 from collections.abc import Mapping
+from fractions import Fraction
 from typing import Any, SupportsIndex, cast
 
 import chex
@@ -64,6 +65,9 @@ _ACTUAL_INT_TYPES = frozenset(
         np.ulonglong,
     }
 )
+_ACTUAL_FLOAT_TYPES = frozenset(
+    {float, Fraction, *(np.dtype(code).type for code in ("e", "f", "d", "g"))}
+)
 
 
 def _require_int32(name: str, value: object, *, minimum: int) -> int:
@@ -79,6 +83,12 @@ def _require_bool(name: str, value: object) -> bool:
     if type(value) is not bool:
         raise ValueError(f"{name} must be a bool")
     return value
+
+
+def _validated_config_float(name: str, value: object, **bounds: Any) -> float:
+    if type(value) not in (_ACTUAL_INT_TYPES | _ACTUAL_FLOAT_TYPES):
+        raise ValueError(f"{name} must be a finite real scalar")
+    return validated_float32_scalar(name, value, **bounds)
 
 
 def _validate_hidden_sizes(value: object) -> tuple[int, ...]:
@@ -260,7 +270,7 @@ class ActionConditionedWorldModelConfig:
             if len(observation_scale) != observation_dim:
                 raise ValueError("observation_scale length must equal observation_dim")
             observation_scale = tuple(
-                validated_float32_scalar(
+                _validated_config_float(
                     f"observation_scale[{index}]", scale, positive=True
                 )
                 for index, scale in enumerate(observation_scale)
@@ -285,7 +295,7 @@ class ActionConditionedWorldModelConfig:
             object.__setattr__(
                 self,
                 name,
-                validated_float32_scalar(name, getattr(self, name), **bounds),
+                _validated_config_float(name, getattr(self, name), **bounds),
             )
         if (
             observation_scale is not None
@@ -331,7 +341,13 @@ class ActionConditionedWorldModelConfig:
             payload = dict(config)
         except Exception as error:
             raise ValueError("config must be a readable mapping") from error
-        payload.pop("type", None)
+        if any(type(key) is not str for key in payload):
+            raise ValueError("config keys must be exact strings")
+        type_name = payload.pop("type", None)
+        if type_name is not None and (
+            type(type_name) is not str or type_name != cls.__name__
+        ):
+            raise ValueError("config type differs")
         if "hidden_sizes" in payload:
             payload["hidden_sizes"] = _serialized_sequence(
                 "hidden_sizes", payload["hidden_sizes"]
@@ -1101,7 +1117,7 @@ class WorldModelConfig:
             object.__setattr__(
                 self,
                 name,
-                validated_float32_scalar(name, getattr(self, name), **bounds),
+                _validated_config_float(name, getattr(self, name), **bounds),
             )
         if observation_dim == _INT32_MAX:
             raise ValueError("derived n_heads must fit in signed int32")
@@ -1129,7 +1145,13 @@ class WorldModelConfig:
             payload = dict(config)
         except Exception as error:
             raise ValueError("config must be a readable mapping") from error
-        payload.pop("type", None)
+        if any(type(key) is not str for key in payload):
+            raise ValueError("config keys must be exact strings")
+        type_name = payload.pop("type", None)
+        if type_name is not None and (
+            type(type_name) is not str or type_name != cls.__name__
+        ):
+            raise ValueError("config type differs")
         if "hidden_sizes" in payload:
             payload["hidden_sizes"] = _serialized_sequence(
                 "hidden_sizes", payload["hidden_sizes"]

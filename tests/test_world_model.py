@@ -421,3 +421,17 @@ def test_world_model_outer_step_count_saturates() -> None:
     )
     assert bool(result.update_applied)
     assert int(result.state.step_count) == 2**31 - 1
+
+
+def test_world_model_config_rejects_hostile_float_subclass_without_hooks() -> None:
+    hook_ran = False
+
+    class HostileFloat(float):
+        def as_integer_ratio(self) -> tuple[int, int]:
+            nonlocal hook_ran
+            hook_ran = True
+            raise AssertionError("untrusted ratio hook ran")
+
+    with pytest.raises(ValueError, match="finite real scalar"):
+        WorldModelConfig(observation_dim=2, step_size=HostileFloat(0.1))
+    assert not hook_ran
