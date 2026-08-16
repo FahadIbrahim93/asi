@@ -172,9 +172,10 @@ class AssociativeMemoryLearningResult:
 
 
 def _finite_real(name: str, value: object) -> float:
-    if isinstance(value, bool) or not isinstance(value, Real):
+    actual_type = type(value)
+    if issubclass(actual_type, bool) or not issubclass(actual_type, Real):
         raise ValueError(f"{name} must be a real number")
-    number = float(value)
+    number = float(cast(Real, value))
     if not math.isfinite(number):
         raise ValueError(f"{name} must be finite")
     return number
@@ -230,12 +231,13 @@ def _validate_config(config: AssociativeMemoryConfig) -> None:
     )
     if not 0.0 < initial_budget_fraction <= 1.0:
         raise ValueError("initial_budget_fraction must be in (0, 1]")
-    if isinstance(config.min_effective_budget, bool) or not isinstance(
-        config.min_effective_budget,
+    min_effective_budget_type = type(config.min_effective_budget)
+    if issubclass(min_effective_budget_type, bool) or not issubclass(
+        min_effective_budget_type,
         Integral,
     ):
         raise ValueError("min_effective_budget must be an integer")
-    min_effective_budget = int(config.min_effective_budget)
+    min_effective_budget = int(cast(Integral, config.min_effective_budget))
     if min_effective_budget < 1:
         raise ValueError("min_effective_budget must be positive")
     if min_effective_budget > config.max_features:
