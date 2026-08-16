@@ -1,8 +1,18 @@
-"""Production-facing Step 3 Horde helper tests."""
+"""Production-facing Step 3 Horde helper tests.
+
+Covers the given-feature Horde facade on real constructors. Invalid
+scientific-scalar cases are written to fail on current main (bool,
+non-real, non-finite, and out-of-domain values accepted) and pass after
+the facade rejects them. Legal endpoints stay constructible.
+"""
+
+import json
+from typing import Any
 
 import chex
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 import pytest
 
 from alberta_framework.core.horde import run_horde_learning_loop
@@ -11,6 +21,40 @@ from alberta_framework.steps import (
     build_step2_to_step3_arrays,
     make_step3_horde,
     run_step3_smoke,
+)
+
+_INVALID_HORDE_SCALARS: tuple[tuple[str, Any], ...] = (
+    ("gammas", (float("nan"),)),
+    ("gammas", (float("inf"),)),
+    ("gammas", (float("-inf"),)),
+    ("gammas", (True,)),
+    ("gammas", (False,)),
+    ("gammas", ("0.5",)),
+    ("gammas", (-0.1,)),
+    ("gammas", (1.1,)),
+    ("lamdas", (float("nan"),)),
+    ("lamdas", (True,)),
+    ("lamdas", (1.1,)),
+    ("step_size", float("nan")),
+    ("step_size", float("inf")),
+    ("step_size", True),
+    ("step_size", False),
+    ("step_size", -1.0),
+    ("sparsity", float("nan")),
+    ("sparsity", True),
+    ("sparsity", -0.1),
+    ("sparsity", 1.1),
+    ("obgd_kappa", float("nan")),
+    ("obgd_kappa", float("inf")),
+    ("obgd_kappa", True),
+    ("obgd_kappa", 0.0),
+    ("obgd_kappa", -1.0),
+    ("hidden_sizes", (True,)),
+    ("hidden_sizes", (False,)),
+    ("hidden_sizes", (0,)),
+    ("hidden_sizes", (-1,)),
+    ("hidden_sizes", (1.5,)),
+    ("hidden_sizes", ("64",)),
 )
 
 
@@ -130,3 +174,67 @@ def test_step3_config_validation() -> None:
 
     with pytest.raises(ValueError, match="final_window"):
         run_step3_smoke(steps=4, final_window=8)
+
+
+def _config_with(**overrides: Any) -> Step3HordeConfig:
+    payload: dict[str, Any] = {
+        "gammas": (0.0,),
+        "lamdas": (0.0,),
+    }
+    payload.update(overrides)
+    return Step3HordeConfig(**payload)
+
+
+@pytest.mark.parametrize(("field", "value"), _INVALID_HORDE_SCALARS)
+def test_step3_horde_scalars_reject_invalid_inputs(field: str, value: object) -> None:
+    with pytest.raises(ValueError, match=field):
+        make_step3_horde(_config_with(**{field: value}))
+
+
+def test_step3_horde_scalars_preserve_legal_boundaries() -> None:
+    config = Step3HordeConfig(
+        gammas=(0.0, 1.0),
+        lamdas=(0.0, 1.0),
+        step_size=0.0,
+        sparsity=1.0,
+        obgd_kappa=2.0,
+        use_obgd=False,
+    )
+    horde = make_step3_horde(config)
+    assert horde.horde_spec.demons[0].gamma == 0.0
+    assert horde.horde_spec.demons[1].gamma == 1.0
+    assert horde.horde_spec.demons[0].lamda == 0.0
+    assert horde.horde_spec.demons[1].lamda == 1.0
+    payload = config.to_dict()
+    json.dumps(payload, allow_nan=False)
+    restored = Step3HordeConfig.from_dict(payload)
+    assert restored.gammas == (0.0, 1.0)
+    assert restored.lamdas == (0.0, 1.0)
+    assert restored.step_size == 0.0
+    assert restored.sparsity == 1.0
+    assert restored.obgd_kappa == 2.0
+
+
+def test_step3_horde_scalars_canonicalize_nonbuiltin_reals() -> None:
+    value = np.float64(0.5)
+    config = Step3HordeConfig(
+        gammas=(value,),
+        lamdas=(value,),
+        hidden_sizes=(np.int64(4),),
+        step_size=value,
+        sparsity=value,
+        obgd_kappa=np.float64(2.0),
+    )
+    horde = make_step3_horde(config)
+    payload = config.to_dict()
+    json.dumps(payload, allow_nan=False)
+    assert config.gammas == (0.5,)
+    assert config.lamdas == (0.5,)
+    assert config.hidden_sizes == (4,)
+    assert type(payload["gammas"][0]) is float
+    assert type(payload["lamdas"][0]) is float
+    assert type(payload["hidden_sizes"][0]) is int
+    assert type(payload["step_size"]) is float
+    assert type(payload["sparsity"]) is float
+    assert type(payload["obgd_kappa"]) is float
+    assert horde.horde_spec.demons[0].gamma == 0.5
