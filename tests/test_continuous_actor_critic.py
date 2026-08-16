@@ -236,6 +236,54 @@ def test_continuous_actor_critic_rejects_inverted_or_nonfinite_action_bounds(
             ContinuousActorCriticAgent(config)
 
 
+class _FloatSpoof:
+    """Not a Real: reports float through __class__ and never compares as out of range."""
+
+    @property
+    def __class__(self) -> type[float]:  # type: ignore[override]
+        return float
+
+    def as_integer_ratio(self) -> tuple[int, int]:
+        return (0, 1)
+
+    def __float__(self) -> float:
+        return 0.0
+
+    def __lt__(self, other: object) -> bool:
+        return False
+
+    def __le__(self, other: object) -> bool:
+        return False
+
+    def __gt__(self, other: object) -> bool:
+        return False
+
+    def __ge__(self, other: object) -> bool:
+        return False
+
+
+@pytest.mark.parametrize("field", ["action_low", "action_high"])
+def test_continuous_actor_critic_rejects_bounds_that_only_spoof_float(field: str) -> None:
+    config = ContinuousActorCriticConfig(action_dim=1, **{field: _FloatSpoof()})  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match=f"{field} must be a finite real number"):
+        ContinuousActorCriticAgent(config)
+
+
+def test_continuous_actor_critic_canonicalizes_real_bounds_to_float() -> None:
+    from fractions import Fraction
+
+    agent = ContinuousActorCriticAgent(
+        ContinuousActorCriticConfig(
+            action_dim=1, action_low=Fraction(-1, 4), action_high=np.float64(0.25)
+        )
+    )
+    assert type(agent.config.action_low) is float and agent.config.action_low == -0.25
+    assert type(agent.config.action_high) is float and agent.config.action_high == 0.25
+    state = agent.init(feature_dim=1, key=jr.key(1))
+    _state, action, _mean, _sigma = agent.start(state, jnp.array([1.0], dtype=jnp.float32))
+    assert float(action[0]) <= 0.25 and float(action[0]) >= -0.25
+
+
 def test_continuous_actor_critic_action_clipping() -> None:
     """Sampled actions respect the configured action bounds."""
     config = ContinuousActorCriticConfig(

@@ -799,11 +799,14 @@ class ContinuousActorCriticAgent:
             raise ValueError("action_dim must be positive")
         if config.log_sigma_min > config.log_sigma_max:
             raise ValueError("log_sigma_min must be <= log_sigma_max")
+        canonical_bounds: dict[str, float | None] = {}
         for name in ("action_low", "action_high"):
             bound = getattr(config, name)
             if bound is None:
+                canonical_bounds[name] = None
                 continue
-            if isinstance(bound, bool) or not isinstance(bound, Real):
+            actual_type = type(bound)
+            if issubclass(actual_type, bool) or not issubclass(actual_type, Real):
                 raise ValueError(f"{name} must be a finite real number when set")
             if not math.isfinite(bound):
                 raise ValueError(f"{name} must be finite when set")
@@ -813,12 +816,18 @@ class ContinuousActorCriticAgent:
                 raise ValueError(f"{name} must be finite when set") from exc
             if not math.isfinite(narrowed):
                 raise ValueError(f"{name} must remain finite once narrowed to float32")
-        if (
-            config.action_low is not None
-            and config.action_high is not None
-            and config.action_low > config.action_high
-        ):
+            preserve_builtin = actual_type is int or actual_type is float
+            canonical_bounds[name] = float(bound) if preserve_builtin else narrowed
+        low = canonical_bounds["action_low"]
+        high = canonical_bounds["action_high"]
+        if low is not None and high is not None and low > high:
             raise ValueError("action_low must be <= action_high")
+        if (low, high) != (config.action_low, config.action_high) or any(
+            type(value) is not float
+            for value in (config.action_low, config.action_high)
+            if value is not None
+        ):
+            config = dataclasses.replace(config, action_low=low, action_high=high)
         self._config = config
         self._bounder = bounder
 
