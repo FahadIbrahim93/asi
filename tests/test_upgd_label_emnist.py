@@ -316,6 +316,21 @@ class TestEMNISTArrayCache:
             upgd_label_emnist.load_emnist_balanced_train(tmp_path)
 
 
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (lambda x, y: (x, y + 100), "must be smaller than"),
+        (lambda x, y: (x, y.astype(np.float32)), "integer class labels"),
+        (lambda x, y: (x.at[0, 0].set(np.nan), y), "finite"),
+    ],
+)
+def test_run_label_emnist_rejects_out_of_domain_inputs(mutate, message: str) -> None:
+    x, y = _tiny_data()
+    x, y = mutate(jnp.asarray(x), jnp.asarray(y))
+    with pytest.raises(ValueError, match=message):
+        run_label_emnist(x, y, "adamw", seeds=[0], config=TINY)
+
+
 @pytest.fixture(scope="class")
 def debug_run():
     """Run the shared tiny diagnostic once for this test module."""
