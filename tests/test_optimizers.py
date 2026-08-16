@@ -2,6 +2,7 @@
 
 import chex
 import jax.numpy as jnp
+import numpy as np
 import pytest
 
 from alberta_framework import (
@@ -121,15 +122,11 @@ class TestIDBD:
         state = optimizer.init(feature_dim=2)
         observation = jnp.ones(2, dtype=jnp.float32)
 
-        poisoned = optimizer.update(
-            state, jnp.array(jnp.inf, dtype=jnp.float32), observation
-        )
+        poisoned = optimizer.update(state, jnp.array(jnp.inf, dtype=jnp.float32), observation)
         assert bool(jnp.all(jnp.isfinite(poisoned.new_state.log_step_sizes)))
         assert bool(jnp.isfinite(poisoned.new_state.bias_step_size))
         # Skipped adaptation keeps the previous (clipped) log step-sizes.
-        chex.assert_trees_all_close(
-            poisoned.new_state.log_step_sizes, state.log_step_sizes
-        )
+        chex.assert_trees_all_close(poisoned.new_state.log_step_sizes, state.log_step_sizes)
 
         recovered = optimizer.update(
             poisoned.new_state, jnp.array(1.0, dtype=jnp.float32), observation
@@ -163,13 +160,9 @@ class TestIDBD:
         state = optimizer.init(feature_dim=2)
         observation = jnp.array([1e20, 1.0], dtype=jnp.float32)
 
-        result = optimizer.update(
-            state, jnp.array(1e20, dtype=jnp.float32), observation
-        )
+        result = optimizer.update(state, jnp.array(1e20, dtype=jnp.float32), observation)
         assert bool(jnp.all(jnp.isfinite(result.new_state.log_step_sizes)))
-        chex.assert_trees_all_close(
-            result.new_state.log_step_sizes, state.log_step_sizes
-        )
+        chex.assert_trees_all_close(result.new_state.log_step_sizes, state.log_step_sizes)
 
     def test_finite_gradients_still_adapt_after_guard(self):
         """The non-finite guard must not change ordinary adaptation."""
@@ -180,11 +173,7 @@ class TestIDBD:
         first = optimizer.update(state, jnp.array(1.0), observation)
         second = optimizer.update(first.new_state, jnp.array(1.0), observation)
         # Correlated errors on the same feature raise the log step-sizes.
-        assert bool(
-            jnp.all(
-                second.new_state.log_step_sizes > state.log_step_sizes
-            )
-        )
+        assert bool(jnp.all(second.new_state.log_step_sizes > state.log_step_sizes))
 
 
 class TestAutostep:
@@ -289,9 +278,10 @@ class TestAutostep:
         result = optimizer.update(state, error, large_observation)
 
         # After M normalization: sum(alpha_i * x_i^2) + alpha_bias <= 1.0
-        effective = jnp.sum(
-            result.new_state.step_sizes * large_observation**2
-        ) + result.new_state.bias_step_size
+        effective = (
+            jnp.sum(result.new_state.step_sizes * large_observation**2)
+            + result.new_state.bias_step_size
+        )
         assert float(effective) <= 1.0 + 1e-6
 
     def test_normalizer_tracks_meta_gradient_not_primary(self):
@@ -486,9 +476,7 @@ class TestAutostepGTDLambda:
             result = optimizer.update(state, jnp.array(1.0), sample_observation)
             chex.assert_shape(result.weight_delta, sample_observation.shape)
             chex.assert_shape(result.new_state.step_sizes, sample_observation.shape)
-            chex.assert_shape(
-                result.new_state.eligibility_traces, sample_observation.shape
-            )
+            chex.assert_shape(result.new_state.eligibility_traces, sample_observation.shape)
             chex.assert_tree_all_finite(result.weight_delta)
             chex.assert_tree_all_finite(result.bias_delta)
             chex.assert_tree_all_finite(result.new_state)
@@ -563,9 +551,7 @@ class TestAutostepGTDLambda:
             chex.assert_trees_all_close(
                 res_g.weight_delta, res_a.weight_delta, atol=1e-5, rtol=1e-5
             )
-            chex.assert_trees_all_close(
-                res_g.bias_delta, res_a.bias_delta, atol=1e-5
-            )
+            chex.assert_trees_all_close(res_g.bias_delta, res_a.bias_delta, atol=1e-5)
             chex.assert_trees_all_close(
                 res_g.new_state.step_sizes,
                 res_a.new_state.step_sizes,
@@ -603,22 +589,16 @@ class TestAutostepGTDLambda:
 
     def test_eligibility_trace_accumulates_with_lambda(self):
         """With trace_decay > 0 the eligibility trace should accumulate."""
-        optimizer = AutostepGTDLambda(
-            initial_step_size=0.01, meta_step_size=0.01, trace_decay=0.5
-        )
+        optimizer = AutostepGTDLambda(initial_step_size=0.01, meta_step_size=0.01, trace_decay=0.5)
         state = optimizer.init(feature_dim=3)
         observation = jnp.array([1.0, 0.5, -0.25], dtype=jnp.float32)
 
         result1 = optimizer.update(state, jnp.array(1.0), observation)
-        chex.assert_trees_all_close(
-            result1.new_state.eligibility_traces, observation, atol=1e-6
-        )
+        chex.assert_trees_all_close(result1.new_state.eligibility_traces, observation, atol=1e-6)
 
         result2 = optimizer.update(result1.new_state, jnp.array(1.0), observation)
         expected = 0.5 * observation + observation
-        chex.assert_trees_all_close(
-            result2.new_state.eligibility_traces, expected, atol=1e-6
-        )
+        chex.assert_trees_all_close(result2.new_state.eligibility_traces, expected, atol=1e-6)
 
 
 class TestObGD:
@@ -815,9 +795,7 @@ class TestIDBDParamState:
 
         chex.assert_shape(state.log_step_sizes, (32, 10))
         chex.assert_shape(state.traces, (32, 10))
-        chex.assert_trees_all_close(
-            jnp.exp(state.log_step_sizes), jnp.full((32, 10), 0.01)
-        )
+        chex.assert_trees_all_close(jnp.exp(state.log_step_sizes), jnp.full((32, 10), 0.01))
         chex.assert_trees_all_close(state.traces, jnp.zeros((32, 10)))
         assert state.meta_step_size == pytest.approx(0.001)
 
@@ -828,9 +806,7 @@ class TestIDBDParamState:
 
         chex.assert_shape(state.log_step_sizes, (16,))
         chex.assert_shape(state.traces, (16,))
-        chex.assert_trees_all_close(
-            jnp.exp(state.log_step_sizes), jnp.full(16, 0.05)
-        )
+        chex.assert_trees_all_close(jnp.exp(state.log_step_sizes), jnp.full(16, 0.05))
 
     def test_update_from_gradient_shapes(self):
         """update_from_gradient should return correct shapes and finite values."""
@@ -859,9 +835,7 @@ class TestIDBDParamState:
         state = optimizer.init_for_shape((4, 3))
 
         gradient = jnp.full((4, 3), jnp.inf, dtype=jnp.float32)
-        step, poisoned = optimizer.update_from_gradient(
-            state, gradient, error=jnp.array(1.0)
-        )
+        step, poisoned = optimizer.update_from_gradient(state, gradient, error=jnp.array(1.0))
         del step
         assert bool(jnp.all(jnp.isfinite(poisoned.log_step_sizes)))
         chex.assert_trees_all_close(poisoned.log_step_sizes, state.log_step_sizes)
@@ -921,9 +895,7 @@ class TestIDBDParamState:
 
     def test_loss_grads_mode(self):
         """loss_grads h_decay_mode should produce finite results."""
-        optimizer = IDBD(
-            initial_step_size=0.01, meta_step_size=0.01, h_decay_mode="loss_grads"
-        )
+        optimizer = IDBD(initial_step_size=0.01, meta_step_size=0.01, h_decay_mode="loss_grads")
         state = optimizer.init_for_shape((8, 4))
 
         gradient = jnp.ones((8, 4)) * 0.1
@@ -954,9 +926,7 @@ class TestIDBDParamState:
         def single_update(s, g, e):
             return optimizer.update_from_gradient(s, g, error=e)
 
-        batched_step, batched_new_state = jax.vmap(single_update)(
-            batched_state, gradient, error
-        )
+        batched_step, batched_new_state = jax.vmap(single_update)(batched_state, gradient, error)
 
         chex.assert_shape(batched_step, (3, 8, 4))
         chex.assert_tree_all_finite(batched_step)
@@ -1036,3 +1006,37 @@ class TestSupportedForMLP:
             step, _ = optimizer.update_from_gradient(state, jnp.ones((2, 3)))
             assert optimizer.supported_for_mlp()
             assert step.shape == (2, 3)
+
+
+def test_optimizers_init_integer_and_shape_validation() -> None:
+    lms = LMS(step_size=0.01)
+    idbd = IDBD(initial_step_size=0.01)
+    autostep = Autostep(initial_step_size=0.01)
+
+    with pytest.raises(ValueError, match="feature_dim"):
+        lms.init(feature_dim=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="feature_dim"):
+        idbd.init(feature_dim=4.5)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="feature_dim"):
+        autostep.init(feature_dim=0)
+
+    with pytest.raises(ValueError, match="shape"):
+        lms.init_for_shape(shape=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="shape"):
+        idbd.init_for_shape(shape=(True, 4))  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="shape"):
+        autostep.init_for_shape(shape=(4, 0))
+
+    s_lms = lms.init(feature_dim=np.int32(4))
+    s_idbd = idbd.init(feature_dim=np.int64(4))
+    s_auto = autostep.init(feature_dim=np.int32(4))
+    assert float(s_lms.step_size) == pytest.approx(0.01)
+    assert s_idbd.traces.shape == (4,)
+    assert s_auto.traces.shape == (4,)
+
+    s_lms_p = lms.init_for_shape(shape=(np.int32(4), np.int64(8)))
+    s_idbd_p = idbd.init_for_shape(shape=(np.int32(4), np.int64(8)))
+    s_auto_p = autostep.init_for_shape(shape=(np.int32(4), np.int64(8)))
+    assert float(s_lms_p.step_size) == pytest.approx(0.01)
+    assert s_idbd_p.traces.shape == (4, 8)
+    assert s_auto_p.traces.shape == (4, 8)
