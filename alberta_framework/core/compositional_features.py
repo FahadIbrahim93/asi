@@ -2526,16 +2526,16 @@ class CompositionalFeatureLearner:
         """Perform one temporally-uniform compositional-feature update."""
         previous_checked = state
         if self._utility_decay == 0.0:
-            previous_checked = previous_checked.replace(
+            previous_checked = previous_checked.replace(  # type: ignore[attr-defined]
                 utilities=jnp.zeros_like(state.utilities),
                 candidate_utilities=jnp.zeros_like(state.candidate_utilities),
             )
         if self._future_utility_task_activity_decay == 0.0:
-            previous_checked = previous_checked.replace(
+            previous_checked = previous_checked.replace(  # type: ignore[attr-defined]
                 task_activity_ema=jnp.zeros_like(state.task_activity_ema),
             )
         if self._candidate_score_trace_decay == 0.0:
-            previous_checked = previous_checked.replace(
+            previous_checked = previous_checked.replace(  # type: ignore[attr-defined]
                 feature_score_residual_trace=jnp.zeros_like(
                     state.feature_score_residual_trace
                 ),

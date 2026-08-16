@@ -302,6 +302,66 @@ class TestCompositionalFeatureLearner:
         assert bool(jnp.all(jnp.isfinite(result.state.utilities)))
         assert bool(jnp.all(jnp.isfinite(result.state.candidate_utilities)))
 
+    def test_zero_task_activity_decay_recovers_inf_activity(self) -> None:
+        learner = CompositionalFeatureLearner(
+            n_features=2,
+            n_tasks=2,
+            candidate_count=0,
+            future_utility_task_activity_decay=0.0,
+            replacement_interval=0,
+            use_obgd=False,
+        )
+        state = learner.init(feature_dim=2, key=jr.key(18)).replace(  # type: ignore[attr-defined]
+            task_activity_ema=jnp.full((2,), jnp.inf, dtype=jnp.float32)
+        )
+
+        result = learner.update(
+            state,
+            jnp.array([1.0, -0.5], dtype=jnp.float32),
+            jnp.array([0.25, jnp.nan], dtype=jnp.float32),
+        )
+
+        assert bool(result.update_applied)
+        chex.assert_trees_all_equal(
+            result.state.task_activity_ema,
+            jnp.array([1.0, 0.0], dtype=jnp.float32),
+        )
+
+    def test_zero_score_decay_recovers_every_inf_score_trace(self) -> None:
+        learner = CompositionalFeatureLearner(
+            n_features=2,
+            n_tasks=1,
+            candidate_count=1,
+            utility_decay=0.0,
+            replacement_interval=0,
+            candidate_scoring_mode="energy_novelty",
+            candidate_score_trace_decay=0.0,
+            use_obgd=False,
+        )
+        state = learner.init(feature_dim=2, key=jr.key(19)).replace(  # type: ignore[attr-defined]
+            feature_score_residual_trace=jnp.full((1, 2), jnp.inf),
+            feature_score_energy_trace=jnp.full((2,), jnp.inf),
+            candidate_score_residual_trace=jnp.full((1, 1), jnp.inf),
+            candidate_score_energy_trace=jnp.full((1,), jnp.inf),
+            candidate_active_correlation_trace=jnp.full((1, 2), jnp.inf),
+        )
+
+        result = learner.update(
+            state,
+            jnp.array([1.0, -0.5], dtype=jnp.float32),
+            jnp.array([0.25], dtype=jnp.float32),
+        )
+
+        assert bool(result.update_applied)
+        for trace in (
+            result.state.feature_score_residual_trace,
+            result.state.feature_score_energy_trace,
+            result.state.candidate_score_residual_trace,
+            result.state.candidate_score_energy_trace,
+            result.state.candidate_active_correlation_trace,
+        ):
+            assert bool(jnp.all(jnp.isfinite(trace)))
+
     def test_energy_novelty_scoring_normalizes_candidate_scale(self) -> None:
         learner = CompositionalFeatureLearner(
             n_features=2,
