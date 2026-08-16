@@ -267,6 +267,34 @@ class TestFrequencyMismatchStream:
         with pytest.raises(ValueError):
             FrequencyMismatchStream(omega_min=omega_min, omega_max=omega_max)
 
+    @pytest.mark.parametrize(
+        ("omega_min", "omega_max"),
+        [(1e-50, 1.0), (1.0, 1e100), (1.0, 1.0 + 1e-12)],
+    )
+    def test_frequency_bounds_must_define_a_positive_float32_interval(
+        self, omega_min: float, omega_max: float
+    ) -> None:
+        with pytest.raises(ValueError, match="float32"):
+            FrequencyMismatchStream(omega_min=omega_min, omega_max=omega_max)
+
+    @pytest.mark.parametrize("value", [True, "0.5", object()])
+    def test_frequency_bounds_reject_non_real_values(self, value: object) -> None:
+        with pytest.raises(ValueError, match="float32"):
+            FrequencyMismatchStream(omega_min=value)  # type: ignore[arg-type]
+
+        with pytest.raises(ValueError, match="float32"):
+            FrequencyMismatchStream(omega_max=value)  # type: ignore[arg-type]
+
+    def test_frequency_bounds_are_canonicalized_to_float32(self) -> None:
+        stream = FrequencyMismatchStream(omega_min=0.7, omega_max=2.3)
+        state = stream.init(jr.key(23))
+
+        expected_min = jnp.asarray(0.7, dtype=jnp.float32)
+        expected_max = jnp.asarray(2.3, dtype=jnp.float32)
+        assert bool(jnp.all(jnp.isfinite(state.omegas)))
+        assert bool(jnp.all(state.omegas >= expected_min))
+        assert bool(jnp.all(state.omegas < expected_max))
+
     def test_step_shapes(self):
         stream = FrequencyMismatchStream(
             feature_dim=4,
