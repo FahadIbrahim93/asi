@@ -27,6 +27,7 @@ Calibration (measured on this machine, scripts in the session scratchpad):
 """
 
 import warnings
+from typing import Any
 
 import numpy as np
 import pytest
@@ -129,6 +130,64 @@ class TestComputeStatistics:
             warnings.simplefilter("error")
             with pytest.raises(ValueError, match="confidence_level.*strictly between 0 and 1"):
                 compute_statistics([4.2], confidence_level=confidence_level)
+
+
+class TestSampleVectorContract:
+    """Every per-seed sample surface takes exactly one value per seed."""
+
+    _MATRIX = np.tile(np.arange(1.0, 6.0), (3, 1))  # (n_seeds=3, n_steps=5), rows identical
+
+    def test_compute_statistics_rejects_a_seed_by_step_matrix(self) -> None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with pytest.raises(
+                ValueError,
+                match=r"^values must be a one-dimensional sample vector \(one value per seed\), "
+                r"got shape \(3, 5\); reduce per seed first or use "
+                r"compute_timeseries_statistics$",
+            ):
+                compute_statistics(self._MATRIX)
+
+    def test_bootstrap_ci_rejects_a_seed_by_step_matrix(self) -> None:
+        with pytest.raises(ValueError, match="values must be a one-dimensional sample vector"):
+            bootstrap_ci(self._MATRIX, n_bootstrap=10)
+
+    def test_cohens_d_rejects_seed_by_step_matrices(self) -> None:
+        with pytest.raises(
+            ValueError, match="values_a must be a one-dimensional sample vector"
+        ):
+            cohens_d(self._MATRIX, np.arange(1.0, 6.0))
+        with pytest.raises(
+            ValueError, match="values_b must be a one-dimensional sample vector"
+        ):
+            cohens_d(np.arange(1.0, 6.0), self._MATRIX)
+
+    @pytest.mark.parametrize(
+        "comparison",
+        [
+            lambda a, b: ttest_comparison(a, b),
+            lambda a, b: ttest_comparison(a, b, paired=True),
+            mann_whitney_comparison,
+            wilcoxon_comparison,
+        ],
+        ids=["ttest", "paired-ttest", "mann_whitney", "wilcoxon"],
+    )
+    def test_comparisons_reject_seed_by_step_matrices(self, comparison: Any) -> None:
+        vector = np.arange(1.0, 6.0) + 0.5
+        with pytest.raises(
+            ValueError, match="values_a must be a one-dimensional sample vector"
+        ):
+            comparison(self._MATRIX, vector)
+        with pytest.raises(
+            ValueError, match="values_b must be a one-dimensional sample vector"
+        ):
+            comparison(vector, self._MATRIX)
+
+    def test_scalar_and_zero_dimensional_inputs_are_rejected(self) -> None:
+        with pytest.raises(ValueError, match="values must be a one-dimensional sample vector"):
+            compute_statistics(np.asarray(4.2))
+        with pytest.raises(ValueError, match="values must be a one-dimensional sample vector"):
+            bootstrap_ci(np.asarray(4.2), n_bootstrap=10)
 
 
 class TestTimeseriesStatistics:
