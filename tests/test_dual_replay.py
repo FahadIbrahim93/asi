@@ -6,7 +6,9 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import warnings
 from dataclasses import fields, replace
+from fractions import Fraction
 from typing import Any
 
 import jax
@@ -497,34 +499,123 @@ def test_calibrated_priority_stays_within_unit_range_for_unequal_weights() -> No
     assert int(second.state.accepted_transition_count) == 2
 
 
+_FLOAT32_SCALARS = (
+    "surprise_scale",
+    "coverage_scale",
+    "progress_scale",
+    "surprise_weight",
+    "coverage_weight",
+    "progress_weight",
+    "aleatoric_downweight_scale",
+    "calibrated_priority_threshold",
+    "calibrated_replacement_margin",
+    "max_aleatoric_uncertainty",
+)
+_ZERO_ALLOWED = (
+    "calibrated_priority_threshold",
+    "calibrated_replacement_margin",
+    "max_aleatoric_uncertainty",
+)
+
+
+def _strict_memory(**overrides: Any) -> DualReplayMemory:
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        return DualReplayMemory(_config(long_term_policy="calibrated", **overrides))
+
+
+@pytest.mark.parametrize("field", _FLOAT32_SCALARS)
 @pytest.mark.parametrize(
-    ("field", "value"),
+    "value",
     [
-        ("surprise_scale", 1e-46),
-        ("coverage_scale", 1e-46),
-        ("progress_scale", 1e-46),
-        ("aleatoric_downweight_scale", 1e-46),
-        ("surprise_weight", 1e-46),
-        ("coverage_weight", 6e38),
+        1e-46,
+        6e38,
+        Fraction(1, 10**400),
+        Fraction(1, 2**150),
+        2**128,
+        float("inf"),
+        np.float64("nan"),
     ],
 )
-def test_config_rejects_calibration_scalars_that_degenerate_in_float32(
-    field: str, value: float
+def test_config_rejects_scalars_that_underflow_or_overflow_float32_without_warnings(
+    field: str, value: object
 ) -> None:
     with pytest.raises(ValueError, match=field):
-        DualReplayMemory(replace(_config(long_term_policy="calibrated"), **{field: value}))
+        _strict_memory(**{field: value})
 
 
-def test_config_rejects_calibration_weights_whose_float32_sum_overflows() -> None:
+@pytest.mark.parametrize("field", _FLOAT32_SCALARS)
+def test_config_enforces_exact_float32_underflow_and_overflow_midpoints(field: str) -> None:
+    minimum_subnormal = float(np.nextafter(np.float32(0.0), np.float32(1.0)))
+    underflow_midpoint = Fraction(1, 2**150)
+    overflow_midpoint = Fraction(((2**24 - 1) * 2**104) + 2**103)
+    upper_bounded = field == "calibrated_priority_threshold"
+
+    with pytest.raises(ValueError, match=field):
+        _strict_memory(**{field: underflow_midpoint})
+    above = _strict_memory(**{field: underflow_midpoint + Fraction(1, 2**200)})
+    assert getattr(above.config, field) == minimum_subnormal
+    if upper_bounded:
+        with pytest.raises(ValueError, match=field):
+            _strict_memory(**{field: Fraction(1, 1) + Fraction(1, 2**60)})
+        return
+    below_overflow = _strict_memory(**{field: overflow_midpoint - 1})
+    assert getattr(below_overflow.config, field) == float(np.finfo(np.float32).max)
+    with pytest.raises(ValueError, match=field):
+        _strict_memory(**{field: overflow_midpoint})
+
+
+@pytest.mark.parametrize("field", _ZERO_ALLOWED)
+def test_config_keeps_explicit_zero_where_the_domain_allows_it(field: str) -> None:
+    memory = _strict_memory(**{field: 0.0})
+    assert getattr(memory.config, field) == 0.0
+    memory = _strict_memory(**{field: 0})
+    assert getattr(memory.config, field) == 0
+
+
+@pytest.mark.parametrize("field", _FLOAT32_SCALARS)
+def test_config_rounds_exact_rationals_and_large_integers_directly_to_float32(
+    field: str,
+) -> None:
+    upper_bounded = field == "calibrated_priority_threshold"
+    scale = Fraction(1, 2**4) if upper_bounded else Fraction(1, 1)
+    midpoint = (Fraction(1, 1) + Fraction(1, 2**24)) * scale
+    offset = Fraction(1, 2**60) * scale
+    next_float32 = float(np.nextafter(np.float32(scale), np.float32(2.0 * float(scale))))
+    assert getattr(_strict_memory(**{field: midpoint - offset}).config, field) == float(scale)
+    assert getattr(_strict_memory(**{field: midpoint}).config, field) == float(scale)
+    assert getattr(_strict_memory(**{field: midpoint + offset}).config, field) == next_float32
+    if not upper_bounded:
+        # Above the float32 tie at 2**54 + 2**30, but float64 first rounds it onto the tie
+        # and ties-to-even would then land on 2**54: the exact ratio must round up.
+        big = 2**54 + 2**30 + 1
+        assert getattr(_strict_memory(**{field: big}).config, field) == float(2**54 + 2**31)
+
+
+def test_config_canonicalizes_real_scalars_and_preserves_builtin_payload() -> None:
+    builtin = _strict_memory(surprise_weight=0.1, coverage_weight=0.2, progress_weight=0.4)
+    assert builtin.config.surprise_weight == 0.1
+    assert builtin.config.coverage_weight == 0.2
+    assert builtin.config.progress_weight == 0.4
+    canonical = _strict_memory(
+        surprise_weight=np.float64(0.25),
+        coverage_weight=np.int64(1),
+        progress_weight=Fraction(1, 4),
+    )
+    for value in (
+        canonical.config.surprise_weight,
+        canonical.config.coverage_weight,
+        canonical.config.progress_weight,
+    ):
+        assert type(value) is float
+    payload = canonical.to_config()
+    json.dumps(payload, allow_nan=False)
+    assert DualReplayMemory.from_config(payload).config == canonical.config
+
+
+def test_config_rejects_calibration_weights_whose_float32_sum_overflows_without_warnings() -> None:
     with pytest.raises(ValueError, match="finite float32 sum"):
-        DualReplayMemory(
-            _config(
-                long_term_policy="calibrated",
-                surprise_weight=2e38,
-                coverage_weight=2e38,
-                progress_weight=2e38,
-            )
-        )
+        _strict_memory(surprise_weight=2e38, coverage_weight=2e38, progress_weight=2e38)
 
 
 def test_calibrated_coverage_and_long_term_eviction_provenance_are_explicit() -> None:

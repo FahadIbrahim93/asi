@@ -38,6 +38,7 @@ import json
 import math
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
+from numbers import Real
 from typing import Any, Literal, cast
 
 import chex
@@ -47,6 +48,8 @@ import jax.random as jr
 import numpy as np
 import numpy.typing as npt
 from jax import Array
+
+from alberta_framework._float32 import round_real_to_float32
 
 DUAL_REPLAY_CONFIG_SCHEMA = "alberta.dual-replay.config.v1"
 DUAL_REPLAY_CHECKPOINT_SCHEMA = "alberta.dual-replay.checkpoint.v1"
@@ -103,6 +106,31 @@ class DualReplayConfig:
     max_aleatoric_uncertainty: float = 1.0
     aleatoric_downweight_scale: float = 1.0
     max_persistent_bytes: int | None = None
+
+    def __post_init__(self) -> None:
+        """Validate float32-consumed scalars in their sink domain and canonicalize them."""
+        for name in _POSITIVE_FLOAT32_FIELDS:
+            object.__setattr__(
+                self,
+                name,
+                _require_float32_real(name, getattr(self, name), strictly_positive=True),
+            )
+        object.__setattr__(
+            self,
+            "calibrated_priority_threshold",
+            _require_float32_real(
+                "calibrated_priority_threshold",
+                self.calibrated_priority_threshold,
+                strictly_positive=False,
+                maximum=1,
+            ),
+        )
+        for name in ("calibrated_replacement_margin", "max_aleatoric_uncertainty"):
+            object.__setattr__(
+                self,
+                name,
+                _require_float32_real(name, getattr(self, name), strictly_positive=False),
+            )
 
     @property
     def long_term_capacity(self) -> int:
@@ -385,13 +413,59 @@ class DualReplayResourceAccounting:
     samples: Array
 
 
-def _validate_real(name: str, value: object) -> float:
-    if isinstance(value, bool) or not isinstance(value, int | float):
-        raise ValueError(f"{name} must be a real number")
-    result = float(value)
-    if not math.isfinite(result):
-        raise ValueError(f"{name} must be finite")
-    return result
+_POSITIVE_FLOAT32_FIELDS = (
+    "surprise_scale",
+    "coverage_scale",
+    "progress_scale",
+    "surprise_weight",
+    "coverage_weight",
+    "progress_weight",
+    "aleatoric_downweight_scale",
+)
+
+
+def _require_float32_real(
+    name: str,
+    value: object,
+    *,
+    strictly_positive: bool,
+    maximum: int | None = None,
+) -> float:
+    """Validate one host scalar in its exact domain and its float32 sink.
+
+    Zero is only admitted where the exact domain allows it; a nonzero value
+    that narrows to zero, or a finite value that narrows to infinity, is
+    rejected because the compiled sink would silently run a different rule.
+    Built-in payloads that already narrow exactly are preserved for
+    serialization; other reals are canonicalized to the exact sink value.
+    """
+    domain = "positive" if strictly_positive else "non-negative"
+    if maximum is not None:
+        domain = f"{domain} and at most {maximum}"
+    preserve_builtin_payload = type(value) is int or type(value) is float
+    if isinstance(value, bool | np.bool_) or not isinstance(value, Real):
+        raise ValueError(f"{name} must be finite and {domain}")
+    try:
+        if strictly_positive:
+            if value <= 0:
+                raise ValueError
+        elif value < 0:
+            raise ValueError
+        if maximum is not None and value > cast(Real, maximum):
+            raise ValueError
+        narrowed = round_real_to_float32(value)
+    except (FloatingPointError, OverflowError, TypeError, ValueError) as error:
+        raise ValueError(f"{name} must be finite and {domain}") from error
+    if not math.isfinite(narrowed):
+        raise ValueError(f"{name} must narrow to a finite float32")
+    if value != 0 and narrowed == 0.0:
+        raise ValueError(f"{name} must not underflow to zero in float32")
+    if not preserve_builtin_payload:
+        return narrowed
+    number = float(value)
+    with np.errstate(invalid="ignore", over="ignore", under="ignore"):
+        renarrowed = float(np.float32(number))
+    return number if narrowed == renarrowed else narrowed
 
 
 def _validate_positive_int(name: str, value: object) -> int:
@@ -431,47 +505,17 @@ def _validate_config(config: DualReplayConfig) -> None:
     if config.max_representation_lag < 0:
         raise ValueError("max_representation_lag must be non-negative")
 
-    positive = (
-        "surprise_scale",
-        "coverage_scale",
-        "progress_scale",
-        "surprise_weight",
-        "coverage_weight",
-        "progress_weight",
-        "aleatoric_downweight_scale",
-    )
-    narrowed: dict[str, float] = {}
-    for name in positive:
-        if _validate_real(name, getattr(config, name)) <= 0.0:
-            raise ValueError(f"{name} must be positive")
-        narrowed[name] = float(np.float32(getattr(config, name)))
-        if not math.isfinite(narrowed[name]) or narrowed[name] <= 0.0:
-            raise ValueError(f"{name} must remain positive and finite in float32 arithmetic")
-    weight_sum = float(
-        np.float32(narrowed["surprise_weight"])
-        + np.float32(narrowed["coverage_weight"])
-        + np.float32(narrowed["progress_weight"])
-    )
+    with np.errstate(over="ignore"):
+        weight_sum = float(
+            np.float32(config.surprise_weight)
+            + np.float32(config.coverage_weight)
+            + np.float32(config.progress_weight)
+        )
     if not math.isfinite(weight_sum):
         raise ValueError(
             "surprise_weight, coverage_weight, and progress_weight must have a "
             "finite float32 sum"
         )
-    threshold = _validate_real(
-        "calibrated_priority_threshold", config.calibrated_priority_threshold
-    )
-    if not 0.0 <= threshold <= 1.0:
-        raise ValueError("calibrated_priority_threshold must be in [0, 1]")
-    margin = _validate_real(
-        "calibrated_replacement_margin", config.calibrated_replacement_margin
-    )
-    if margin < 0.0:
-        raise ValueError("calibrated_replacement_margin must be non-negative")
-    maximum = _validate_real(
-        "max_aleatoric_uncertainty", config.max_aleatoric_uncertainty
-    )
-    if maximum < 0.0:
-        raise ValueError("max_aleatoric_uncertainty must be non-negative")
     if config.max_persistent_bytes is not None:
         _validate_positive_int("max_persistent_bytes", config.max_persistent_bytes)
         if config.max_persistent_bytes > _UINT32_MAX:
