@@ -399,6 +399,52 @@ def init_mlp_params(key: Array, config: IPMNISTConfig) -> dict[str, Array]:
     return params
 
 
+def validated_ipmnist_data(
+    data_x: np.ndarray | Array,
+    data_y: np.ndarray | Array,
+    *,
+    input_dim: int | None,
+    n_classes: int | None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return ``(data_x, data_y)`` as finite float32 / int32 arrays inside the protocol domain.
+
+    JAX gathers clamp out-of-range indices instead of raising, so a label at
+    or above ``n_classes`` would silently be scored and trained as the last
+    class, and a non-finite input would still yield an in-range accuracy.
+    Every runner that indexes the softmax by label must go through here.
+
+    Raises:
+        ValueError: If ``data_x`` is not a finite ``(n_train, input_dim)``
+            matrix or ``data_y`` is not an aligned vector of integer labels in
+            ``[0, n_classes)``.
+    """
+    raw_x = np.asarray(jax.device_get(data_x))
+    raw_y = np.asarray(jax.device_get(data_y))
+    if raw_x.ndim != 2:
+        raise ValueError("data_x must be a two-dimensional example matrix")
+    if input_dim is not None and raw_x.shape[1] != input_dim:
+        raise ValueError(f"data_x must have shape (n_train, {input_dim})")
+    if raw_y.shape != (raw_x.shape[0],):
+        raise ValueError("data_y must be (n_train,) aligned with data_x")
+    if (
+        np.issubdtype(raw_x.dtype, np.bool_)
+        or np.issubdtype(raw_x.dtype, np.complexfloating)
+        or not np.issubdtype(raw_x.dtype, np.number)
+    ):
+        raise ValueError("data_x must use a real numeric, non-boolean dtype")
+    if raw_y.dtype.kind not in {"i", "u"}:
+        raise ValueError("data_y must contain integer class labels")
+    if np.any(raw_y < 0) or np.any(raw_y > np.iinfo(np.int32).max):
+        raise ValueError("data_y class labels must fit non-negative int32")
+    resolved_x = np.asarray(raw_x, dtype=np.float32)
+    resolved_y = np.asarray(raw_y, dtype=np.int32)
+    if not np.all(np.isfinite(resolved_x)):
+        raise ValueError("data_x must contain only finite values")
+    if n_classes is not None and np.any(resolved_y >= n_classes):
+        raise ValueError(f"data_y class labels must be smaller than {n_classes}")
+    return resolved_x, resolved_y
+
+
 def mlp_logits(params: dict[str, Array], x: Array) -> Array:
     """Forward pass of the protocol MLP for a single flattened example."""
     hidden = jax.nn.relu(x @ params["w1"] + params["b1"])
@@ -734,19 +780,16 @@ def run_ipmnist(
         raise ValueError(f"noise_mode must be 'step' or 'pool', got {noise_mode!r}")
     if noise_mode == "pool" and noise_pool_steps < 2:
         raise ValueError(f"noise_pool_steps must be >= 2, got {noise_pool_steps}")
+    resolved_x, resolved_y = validated_ipmnist_data(
+        data_x, data_y, input_dim=config.input_dim, n_classes=config.n_classes
+    )
     hp = resolve_hyperparameters(learner, hyperparameters)
     init_fn, step_fn = _LEARNER_FACTORIES[learner](hp)
     shapes = _sorted_param_shapes(config)
     n_flat = int(sum(np.prod(shape) for shape in shapes.values()))
 
-    data_x = jnp.asarray(data_x, dtype=jnp.float32)
-    data_y = jnp.asarray(data_y, dtype=jnp.int32)
-    if data_x.ndim != 2 or data_x.shape[1] != config.input_dim:
-        raise ValueError(
-            f"data_x must have shape (n_train, {config.input_dim}), got {data_x.shape}"
-        )
-    if data_y.shape != (data_x.shape[0],):
-        raise ValueError("data_y must be (n_train,) aligned with data_x")
+    data_x = jnp.asarray(resolved_x, dtype=jnp.float32)
+    data_y = jnp.asarray(resolved_y, dtype=jnp.int32)
     n_train = int(data_x.shape[0])
     if n_train < config.task_length:
         raise ValueError("dataset smaller than task_length; cannot sample without replacement")

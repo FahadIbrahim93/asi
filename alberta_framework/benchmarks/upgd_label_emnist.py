@@ -121,6 +121,7 @@ from alberta_framework.benchmarks.upgd_ipmnist import (
     atomic_write_new_json,
     init_mlp_params,
     task_index_for_step,
+    validated_ipmnist_data,
 )
 
 logger = logging.getLogger(__name__)
@@ -480,17 +481,14 @@ def run_label_emnist(
     seed_tuple = require_unique_jax_seeds(seeds, name="seeds")
     if config is None:
         config = LabelEMNISTConfig()
+    resolved_x, resolved_y = validated_ipmnist_data(
+        data_x, data_y, input_dim=config.input_dim, n_classes=config.n_classes
+    )
     hp = resolve_hyperparameters(learner, hyperparameters)
     init_fn, step_fn = _FULL_STEP_FACTORIES[learner](hp)
 
-    data_x = jnp.asarray(data_x, dtype=jnp.float32)
-    data_y = jnp.asarray(data_y, dtype=jnp.int32)
-    if data_x.ndim != 2 or data_x.shape[1] != config.input_dim:
-        raise ValueError(
-            f"data_x must have shape (n_train, {config.input_dim}), got {data_x.shape}"
-        )
-    if data_y.shape != (data_x.shape[0],):
-        raise ValueError("data_y must be (n_train,) aligned with data_x")
+    data_x = jnp.asarray(resolved_x, dtype=jnp.float32)
+    data_y = jnp.asarray(resolved_y, dtype=jnp.int32)
     n_train = int(data_x.shape[0])
     if n_train < config.task_length:
         raise ValueError("dataset smaller than task_length; cannot sample without replacement")

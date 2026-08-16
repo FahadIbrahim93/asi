@@ -173,6 +173,7 @@ from alberta_framework.benchmarks.upgd_ipmnist import (
     lean_upgd_w_update,
     load_mnist_train,
     mlp_logits,
+    validated_ipmnist_data,
 )
 from alberta_framework.evaluation.recurring_ipmnist_retention import (
     RecurringIPMNISTPhase,
@@ -7113,25 +7114,7 @@ def _validated_ipmnist_data(
     input_dim: int | None,
     n_classes: int | None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    raw_x = np.asarray(jax.device_get(data_x))
-    raw_y = np.asarray(jax.device_get(data_y))
-    if raw_x.ndim != 2:
-        raise ValueError("data_x must be a two-dimensional example matrix")
-    if input_dim is not None and raw_x.shape[1] != input_dim:
-        raise ValueError(f"data_x must have shape (n_train, {input_dim})")
-    if raw_y.shape != (raw_x.shape[0],):
-        raise ValueError("data_y must be (n_train,) aligned with data_x")
-    if raw_y.dtype.kind not in {"i", "u"}:
-        raise ValueError("data_y must contain integer class labels")
-    if np.any(raw_y < 0) or np.any(raw_y > np.iinfo(np.int32).max):
-        raise ValueError("data_y class labels must fit non-negative int32")
-    resolved_x = np.asarray(raw_x, dtype=np.float32)
-    resolved_y = np.asarray(raw_y, dtype=np.int32)
-    if not np.all(np.isfinite(resolved_x)):
-        raise ValueError("data_x must contain only finite values")
-    if n_classes is not None and np.any(resolved_y >= n_classes):
-        raise ValueError(f"data_y class labels must be smaller than {n_classes}")
-    return resolved_x, resolved_y
+    return validated_ipmnist_data(data_x, data_y, input_dim=input_dim, n_classes=n_classes)
 
 
 def ipmnist_permutation_sha256(permutation: np.ndarray | Array) -> str:
