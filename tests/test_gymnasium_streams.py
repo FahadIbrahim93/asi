@@ -1,6 +1,7 @@
 """Tests for Gymnasium experience streams."""
 
 import jax.numpy as jnp
+import numpy as np
 import pytest
 
 # Skip all tests if gymnasium is not installed
@@ -11,6 +12,9 @@ from alberta_framework.streams.gymnasium import (  # noqa: E402
     GymnasiumStream,
     PredictionMode,
     TDStream,
+    _flatten_action,
+    _flatten_observation,
+    _flatten_space,
     collect_trajectory,
     make_epsilon_greedy_policy,
     make_gymnasium_stream,
@@ -68,6 +72,112 @@ def test_probability_entry_points_normalize_hostile_real_failures_without_repr()
             )
     finally:
         env.close()
+
+
+@pytest.mark.parametrize(
+    "integer_type",
+    tuple(
+        dict.fromkeys(
+            (
+                np.int8,
+                np.int16,
+                np.int32,
+                np.int64,
+                np.uint8,
+                np.uint16,
+                np.uint32,
+                np.uint64,
+                np.longlong,
+                np.ulonglong,
+            )
+        )
+    ),
+)
+def test_num_steps_accepts_all_numpy_integer_families(integer_type: type[np.integer]) -> None:
+    env = gymnasium.make("CartPole-v1")
+    try:
+        observations, targets = collect_trajectory(env, None, integer_type(1))
+        assert observations.shape == (1, 5)
+        assert targets.shape == (1, 1)
+    finally:
+        env.close()
+
+
+def test_schedule_and_shape_contracts_fail_before_environment_execution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env = gymnasium.make("CartPole-v1")
+
+    def forbidden(*args: object, **kwargs: object) -> None:
+        raise AssertionError("environment executed before trajectory preflight")
+
+    monkeypatch.setattr(env, "reset", forbidden)
+    try:
+        for num_steps in (0, -1, True, 1.5, "1"):
+            with pytest.raises(ValueError, match="num_steps"):
+                collect_trajectory(env, None, num_steps)  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="trajectory output"):
+            collect_trajectory(env, None, 2**31 - 1)
+        with pytest.raises(ValueError, match="exact bool"):
+            collect_trajectory(env, None, 1, include_action_in_features=1)  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="PredictionMode"):
+            collect_trajectory(env, None, 1, mode="reward")  # type: ignore[arg-type]
+    finally:
+        env.close()
+
+
+def test_seed_contracts_reject_aliases_spoofs_and_epsilon_subkey_overflow() -> None:
+    class Spoof:
+        @property
+        def __class__(self) -> type[int]:  # type: ignore[override,misc]
+            return int
+
+        def __index__(self) -> int:
+            raise AssertionError("unapproved index hook executed")
+
+        def __repr__(self) -> str:
+            raise AssertionError("error path invoked repr")
+
+    env = gymnasium.make("CartPole-v1")
+    try:
+        for seed in (True, np.uint32(1), -1, 2**32, Spoof()):
+            with pytest.raises(ValueError, match="seed"):
+                make_random_policy(env, seed=seed)  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="leave room"):
+            make_epsilon_greedy_policy(lambda _observation: 0, env, seed=2**32 - 1)
+    finally:
+        env.close()
+
+
+def test_random_policy_respects_nonzero_and_multiaxis_discrete_starts() -> None:
+    class StubEnv:
+        def __init__(self, action_space: object):
+            self.action_space = action_space
+
+    discrete = gymnasium.spaces.Discrete(3, start=5)
+    discrete_policy = make_random_policy(StubEnv(discrete), seed=1)  # type: ignore[arg-type]
+    assert {discrete_policy(jnp.zeros(1)) for _ in range(20)} <= {5, 6, 7}
+
+    multi = gymnasium.spaces.MultiDiscrete(
+        np.asarray(((2, 3), (4, 5))),
+        start=np.asarray(((10, 20), (30, 40))),
+    )
+    multi_policy = make_random_policy(StubEnv(multi), seed=2)  # type: ignore[arg-type]
+    action = multi_policy(jnp.zeros(1))
+    assert action.shape == (2, 2)
+    assert np.all(action >= multi.start)
+    assert np.all(action < multi.start + multi.nvec)
+    assert _flatten_space(multi) == 4
+    assert _flatten_observation(multi.start, multi).shape == (4,)
+    assert _flatten_action(action, multi).shape == (4,)
+
+
+def test_random_box_policy_rejects_nonfinite_bounds() -> None:
+    class StubEnv:
+        action_space = gymnasium.spaces.Box(-np.inf, np.inf, shape=(1,), dtype=np.float32)
+
+    with pytest.raises(ValueError, match="finite ordered"):
+        make_random_policy(StubEnv(), seed=0)  # type: ignore[arg-type]
 
 
 class TestGymnasiumStreamRewardMode:
