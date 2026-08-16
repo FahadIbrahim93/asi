@@ -46,6 +46,7 @@ from alberta_framework.steps._float32_validation import (
 
 Step3NormalizerName = Literal["none", "ema"]
 Step3TraceModeName = Literal["accumulating", "replacing"]
+_INT32_MAX = 2**31 - 1
 _FLOAT32_MIN_NORMAL = float.fromhex("0x1.0p-126")
 Step3RoutingName = Literal["shared", "independent", "mixed"]
 
@@ -212,6 +213,8 @@ def _require_positive_int(name: str, value: object) -> int:
     number = int(value)
     if number < 1:
         raise ValueError(f"{name} must be positive, got {value!r}")
+    if number > _INT32_MAX:
+        raise ValueError(f"{name} must be at most int32 max, got {value!r}")
     return number
 
 
@@ -531,6 +534,8 @@ def run_step3_smoke(
     finite = bool(
         jnp.all(jnp.isfinite(result.per_demon_metrics))
         & jnp.all(jnp.isfinite(result.td_errors))
+        & jnp.all(result.updates_applied)
+        & jnp.all(result.head_updates_applied)
     )
     return Step3SmokeResult(
         config=cfg,
