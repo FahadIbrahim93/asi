@@ -24,10 +24,8 @@ runners.
 
 from __future__ import annotations
 
-import math
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
-from numbers import Integral, Real
 from typing import Any, Literal, cast
 
 import chex
@@ -37,7 +35,6 @@ import jax.random as jr
 import numpy as np
 from jax import Array
 
-from alberta_framework._float32 import round_real_to_float32_with_ratio
 from alberta_framework.core.associative_memory import (
     AssociativeFeatureFamily,
     AssociativeMemoryConfig,
@@ -59,6 +56,10 @@ from alberta_framework.core.temporal_context import (
     TemporalContextState,
 )
 from alberta_framework.core.upgd import UPGDLearner, UPGDState
+from alberta_framework.steps._float32_validation import (
+    canonical_float32_storage,
+    finite_real_and_float32,
+)
 from alberta_framework.steps.step3 import (
     Step3HordeConfig,
     init_step3_state,
@@ -93,36 +94,31 @@ Signature: ``(observation, reward, terminated) -> Array(n_demons,)``.
 
 _INT32_MAX: int = 2**31 - 1
 
-
-def finite_real_and_float32(name: str, value: object) -> tuple[Real, int, int, float]:
-    """Return the original real, exact ratio, and finite binary32 rounding."""
-    actual_type = type(value)
-    if issubclass(actual_type, bool) or not issubclass(actual_type, Real):
-        raise ValueError(f"{name} must be a real number, got {value!r}")
-    real = cast(Real, value)
-    try:
-        numerator, denominator, narrowed = round_real_to_float32_with_ratio(real)
-    except (FloatingPointError, OverflowError, TypeError, ValueError):
-        raise ValueError(f"{name} must narrow to a finite float32, got {value!r}") from None
-    if not math.isfinite(narrowed):
-        raise ValueError(f"{name} must narrow to a finite float32, got {value!r}")
-    return real, numerator, denominator, narrowed
+_ACTUAL_INT_TYPES: tuple[type, ...] = (
+    int,
+    np.int8,
+    np.int16,
+    np.int32,
+    np.int64,
+    np.uint8,
+    np.uint16,
+    np.uint32,
+    np.uint64,
+)
 
 
-def canonical_float32_storage(value: Real, narrowed: float) -> float:
-    if not isinstance(value, (int, float, np.floating)):
-        return narrowed
-    try:
-        number = float(value)
-    except (OverflowError, TypeError, ValueError):
-        return narrowed
-    if not math.isfinite(number):
-        raise ValueError("scalar must be finite")
-    with np.errstate(invalid="ignore", over="ignore", under="ignore"):
-        renarrowed = np.asarray(number, dtype=np.float32)
-    if not bool(np.array_equal(narrowed, renarrowed)):
-        number = float(narrowed)
-    return number
+def _require_bool(name: str, value: object) -> bool:
+    """Require an actual builtin bool (``__class__`` spoofing is ignored)."""
+    if type(value) is not bool:
+        raise ValueError(f"{name} must be a bool, got {value!r}")
+    return value
+
+
+def _require_str_choice(name: str, value: object, choices: tuple[str, ...]) -> str:
+    """Require an actual builtin str drawn from ``choices``."""
+    if type(value) is not str or value not in choices:
+        raise ValueError(f"unknown {name} {value!r}")
+    return value
 
 
 def _require_real(name: str, value: object) -> float:
@@ -193,10 +189,9 @@ def _require_int(
     minimum: int | None = None,
     maximum: int | None = None,
 ) -> int:
-    actual_type = type(value)
-    if issubclass(actual_type, bool) or not issubclass(actual_type, Integral):
+    if type(value) not in _ACTUAL_INT_TYPES:
         raise ValueError(f"{name} must be an integer, got {value!r}")
-    number = int(cast(Integral, value))
+    number = int(cast(int, value))
     if minimum is not None and number < minimum:
         if minimum == 1:
             raise ValueError(f"{name} must be positive, got {value!r}")
@@ -230,7 +225,11 @@ class Step2FeatureConfig:
         observation_dim = _require_int(
             "observation_dim", self.observation_dim, minimum=1, maximum=_INT32_MAX
         )
-        if not (self.include_raw or self.include_ema or self.include_delta):
+        include_raw = _require_bool("include_raw", self.include_raw)
+        include_ema = _require_bool("include_ema", self.include_ema)
+        include_delta = _require_bool("include_delta", self.include_delta)
+        _require_bool("include_phase_products", self.include_phase_products)
+        if not (include_raw or include_ema or include_delta):
             msg = "at least one of include_raw/include_ema/include_delta is required"
             raise ValueError(msg)
         ema_decay = _require_half_open_zero_one_interval("ema_decay", self.ema_decay)
@@ -312,7 +311,7 @@ class Step2UPGDConfig:
             "observation_dim", self.observation_dim, minimum=1, maximum=_INT32_MAX
         )
         n_heads = _require_int("n_heads", self.n_heads, minimum=1, maximum=_INT32_MAX)
-        if not isinstance(self.hidden_sizes, tuple) or not self.hidden_sizes:
+        if type(self.hidden_sizes) is not tuple or not self.hidden_sizes:
             msg = (
                 "hidden_sizes must contain at least one positive size, "
                 f"got {self.hidden_sizes!r}"
@@ -324,28 +323,32 @@ class Step2UPGDConfig:
         )
         step_size = _require_nonnegative_real("step_size", self.step_size)
         sparsity = _require_unit_interval("sparsity", self.sparsity)
-        if not isinstance(self.use_layer_norm, bool):
-            raise ValueError(f"use_layer_norm must be a bool, got {self.use_layer_norm!r}")
-        if self.learner_preset not in ("default", "strict_digit_readout"):
-            msg = f"unknown learner_preset {self.learner_preset!r}"
-            raise ValueError(msg)
-        if self.loss_normalization not in ("target_structure", "target_density"):
-            msg = f"unknown loss_normalization {self.loss_normalization!r}"
-            raise ValueError(msg)
-        valid_readouts = (
-            "linear_mse",
-            "softmax_ce",
-            "adaptive_simplex",
-            "factorized_simplex",
-            "adaptive_factorized_simplex",
-            "two_timescale_simplex",
+        use_layer_norm = _require_bool("use_layer_norm", self.use_layer_norm)
+        learner_preset = _require_str_choice(
+            "learner_preset",
+            self.learner_preset,
+            ("default", "strict_digit_readout"),
         )
-        if self.readout_mode not in valid_readouts:
-            msg = f"unknown readout_mode {self.readout_mode!r}"
-            raise ValueError(msg)
-        if self.learner_preset == "strict_digit_readout" and (
-            self.loss_normalization != "target_structure"
-            or self.readout_mode != "two_timescale_simplex"
+        loss_normalization = _require_str_choice(
+            "loss_normalization",
+            self.loss_normalization,
+            ("target_structure", "target_density"),
+        )
+        readout_mode = _require_str_choice(
+            "readout_mode",
+            self.readout_mode,
+            (
+                "linear_mse",
+                "softmax_ce",
+                "adaptive_simplex",
+                "factorized_simplex",
+                "adaptive_factorized_simplex",
+                "two_timescale_simplex",
+            ),
+        )
+        if learner_preset == "strict_digit_readout" and (
+            loss_normalization != "target_structure"
+            or readout_mode != "two_timescale_simplex"
         ):
             msg = (
                 "strict_digit_readout preset requires "
@@ -353,8 +356,8 @@ class Step2UPGDConfig:
                 "readout_mode='two_timescale_simplex'"
             )
             raise ValueError(msg)
-        if self.learner_preset == "strict_digit_readout" and (
-            self.sparsity != 0.5 or not self.use_layer_norm
+        if learner_preset == "strict_digit_readout" and (
+            sparsity != 0.5 or not use_layer_norm
         ):
             msg = (
                 "strict_digit_readout preset owns sparsity/use_layer_norm; "
@@ -366,6 +369,9 @@ class Step2UPGDConfig:
         object.__setattr__(self, "hidden_sizes", canonical_hidden)
         object.__setattr__(self, "step_size", step_size)
         object.__setattr__(self, "sparsity", sparsity)
+        object.__setattr__(self, "learner_preset", learner_preset)
+        object.__setattr__(self, "loss_normalization", loss_normalization)
+        object.__setattr__(self, "readout_mode", readout_mode)
 
     @classmethod
     def strict_digit_readout(
@@ -447,18 +453,15 @@ class Step2AssociativePipelineConfig:
         min_weight = _require_nonnegative_real("min_weight", self.min_weight)
         max_weight = _require_positive_real("max_weight", self.max_weight)
         logit_scale = _require_positive_real("logit_scale", self.logit_scale)
-        if not isinstance(self.normalize_by_weight, bool):
-            raise ValueError(
-                f"normalize_by_weight must be a bool, got {self.normalize_by_weight!r}"
-            )
-        if not isinstance(self.adaptive_feature_family, bool):
-            raise ValueError(
-                f"adaptive_feature_family must be a bool, got {self.adaptive_feature_family!r}"
-            )
-        if not isinstance(self.adaptive_window, bool):
-            raise ValueError(f"adaptive_window must be a bool, got {self.adaptive_window!r}")
-        if not isinstance(self.adaptive_budget, bool):
-            raise ValueError(f"adaptive_budget must be a bool, got {self.adaptive_budget!r}")
+        feature_family = _require_str_choice(
+            "feature_family",
+            self.feature_family,
+            ("position_token", "suffix_pair", "token_suffix_pair"),
+        )
+        _require_bool("normalize_by_weight", self.normalize_by_weight)
+        _require_bool("adaptive_feature_family", self.adaptive_feature_family)
+        _require_bool("adaptive_window", self.adaptive_window)
+        _require_bool("adaptive_budget", self.adaptive_budget)
         scope_lr = _require_nonnegative_real("scope_lr", self.scope_lr)
         budget_lr = _require_nonnegative_real("budget_lr", self.budget_lr)
         initial_budget_fraction = _require_half_open_unit_interval(
@@ -479,6 +482,7 @@ class Step2AssociativePipelineConfig:
         object.__setattr__(self, "min_weight", min_weight)
         object.__setattr__(self, "max_weight", max_weight)
         object.__setattr__(self, "logit_scale", logit_scale)
+        object.__setattr__(self, "feature_family", feature_family)
         object.__setattr__(self, "scope_lr", scope_lr)
         object.__setattr__(self, "budget_lr", budget_lr)
         object.__setattr__(self, "initial_budget_fraction", initial_budget_fraction)
@@ -602,12 +606,12 @@ class AlbertaPipelineConfig:
 
     def __post_init__(self) -> None:
         """Validate combinations of step2/control and required sub-configs."""
-        if self.step2 not in ("temporal_context", "upgd", "associative", "identity"):
-            msg = f"unknown step2 mode {self.step2!r}"
-            raise ValueError(msg)
-        if self.control_mode not in ("sarsa", "horde_ac"):
-            msg = f"unknown control_mode {self.control_mode!r}"
-            raise ValueError(msg)
+        _require_str_choice(
+            "step2 mode",
+            self.step2,
+            ("temporal_context", "upgd", "associative", "identity"),
+        )
+        _require_str_choice("control_mode", self.control_mode, ("sarsa", "horde_ac"))
         if self.step2 == "upgd" and self.upgd is None:
             msg = "upgd config is required when step2='upgd'"
             raise ValueError(msg)

@@ -7,6 +7,7 @@ import chex
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 import pytest
 
 import alberta_framework as af
@@ -788,6 +789,110 @@ def test_pipeline_rejects_class_property_spoofing_float() -> None:
     value = ClassSpoof()
     with pytest.raises(ValueError, match="must be a real number"):
         Step2UPGDConfig(step_size=value)  # type: ignore[arg-type]
+
+
+def test_pipeline_require_int_rejects_lying_int_subclass() -> None:
+    """int subclasses are rejected before their __int__/__index__ hooks run."""
+
+    class LieInt(int):
+        def __int__(self) -> int:
+            return 4
+
+        def __index__(self) -> int:
+            return 4
+
+    with pytest.raises(ValueError, match="observation_dim must be an integer"):
+        Step2UPGDConfig(observation_dim=LieInt(-1))
+
+
+def test_pipeline_accepts_numpy_integers_and_stores_builtin_int() -> None:
+    config = Step2UPGDConfig(observation_dim=np.int32(3), n_heads=np.int64(2))
+    assert config.observation_dim == 3
+    assert type(config.observation_dim) is int
+    assert type(config.n_heads) is int
+    json.dumps(config.to_dict())
+
+
+class _SpoofedBool:
+    @property
+    def __class__(self) -> type[bool]:  # type: ignore[override]
+        return bool
+
+    def __bool__(self) -> bool:
+        return True
+
+    def __repr__(self) -> str:
+        return "SpoofedBool()"
+
+
+def test_pipeline_bool_flags_reject_class_spoofing() -> None:
+    with pytest.raises(ValueError, match="use_layer_norm must be a bool"):
+        Step2UPGDConfig(use_layer_norm=_SpoofedBool())  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="normalize_by_weight must be a bool"):
+        Step2AssociativePipelineConfig(
+            normalize_by_weight=_SpoofedBool()  # type: ignore[arg-type]
+        )
+    with pytest.raises(ValueError, match="include_raw must be a bool"):
+        Step2FeatureConfig(include_raw=_SpoofedBool())  # type: ignore[arg-type]
+
+
+class _EqualsString:
+    """Non-str object that compares equal to one target string."""
+
+    def __init__(self, target: str) -> None:
+        self._target = target
+
+    def __eq__(self, other: object) -> bool:
+        return other == self._target
+
+    def __hash__(self) -> int:
+        return hash(self._target)
+
+
+def test_pipeline_string_discriminators_require_actual_str() -> None:
+    with pytest.raises(ValueError, match="unknown learner_preset"):
+        Step2UPGDConfig(
+            learner_preset=_EqualsString("default")  # type: ignore[arg-type]
+        )
+    with pytest.raises(ValueError, match="unknown loss_normalization"):
+        Step2UPGDConfig(
+            loss_normalization=_EqualsString("target_structure")  # type: ignore[arg-type]
+        )
+    with pytest.raises(ValueError, match="unknown readout_mode"):
+        Step2UPGDConfig(
+            readout_mode=_EqualsString("linear_mse")  # type: ignore[arg-type]
+        )
+    with pytest.raises(ValueError, match="unknown feature_family"):
+        Step2AssociativePipelineConfig(
+            feature_family=_EqualsString("token_suffix_pair")  # type: ignore[arg-type]
+        )
+    with pytest.raises(ValueError, match="unknown step2 mode"):
+        AlbertaPipelineConfig(
+            step2=_EqualsString("temporal_context")  # type: ignore[arg-type]
+        )
+    with pytest.raises(ValueError, match="unknown control_mode"):
+        AlbertaPipelineConfig(
+            control_mode=_EqualsString("sarsa")  # type: ignore[arg-type]
+        )
+
+
+def test_pipeline_associative_rejects_unknown_feature_family() -> None:
+    with pytest.raises(ValueError, match="unknown feature_family"):
+        Step2AssociativePipelineConfig(
+            feature_family="unknown_family"  # type: ignore[arg-type]
+        )
+
+
+def test_pipeline_full_config_json_roundtrip() -> None:
+    config = AlbertaPipelineConfig(
+        upgd=Step2UPGDConfig(),
+        associative=Step2AssociativePipelineConfig(),
+        horde_ac=HordeActorCriticPipelineConfig(),
+        step2="upgd",
+        control_mode="horde_ac",
+    )
+    payload = json.loads(json.dumps(config.to_dict()))
+    assert AlbertaPipelineConfig.from_dict(payload) == config
 
 
 # silence the import lint warnings used in the test runner
