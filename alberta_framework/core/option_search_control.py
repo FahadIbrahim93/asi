@@ -22,12 +22,14 @@ a universal learning-value score or a learned search controller.
 from __future__ import annotations
 
 import dataclasses
+import operator
 from collections.abc import Mapping
-from typing import Any, cast
+from typing import Any, SupportsIndex, cast
 
 import chex
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import Array
 from jaxtyping import Bool, Float, Int
 
@@ -48,6 +50,30 @@ _CONFIG_TYPE = "OptionSearchControlConfig"
 _MAX_BACKUP_BUDGET = 4_096
 _MAX_CANDIDATE_DIAGNOSTIC_SLOTS = 262_144
 _INT32_MAX = 2_147_483_647
+_ACTUAL_INT_TYPES = frozenset(
+    {
+        int,
+        np.int8,
+        np.int16,
+        np.int32,
+        np.int64,
+        np.uint8,
+        np.uint16,
+        np.uint32,
+        np.uint64,
+        np.longlong,
+        np.ulonglong,
+    }
+)
+
+
+def _require_int32(name: str, value: object, *, minimum: int = 1, maximum: int = _INT32_MAX) -> int:
+    if type(value) not in _ACTUAL_INT_TYPES:
+        raise ValueError(f"{name} must be an integer in [{minimum}, {maximum}]")
+    canonical = operator.index(cast(SupportsIndex, value))
+    if not minimum <= canonical <= maximum:
+        raise ValueError(f"{name} must be an integer in [{minimum}, {maximum}]")
+    return canonical
 
 
 @dataclasses.dataclass(frozen=True)
@@ -58,20 +84,26 @@ class OptionSearchControlConfig:
     min_model_completions: int = 1
 
     def __post_init__(self) -> None:
-        if (
-            type(self.backup_budget) is not int
-            or not 1 <= self.backup_budget <= _MAX_BACKUP_BUDGET
-        ):
-            raise ValueError(
-                f"backup_budget must be a strict integer in [1, {_MAX_BACKUP_BUDGET}]"
-            )
-        if (
-            type(self.min_model_completions) is not int
-            or not 1 <= self.min_model_completions <= 2_147_483_647
-        ):
-            raise ValueError(
-                "min_model_completions must be a strict positive int32-compatible integer"
-            )
+        object.__setattr__(
+            self,
+            "backup_budget",
+            _require_int32(
+                "backup_budget",
+                self.backup_budget,
+                minimum=1,
+                maximum=_MAX_BACKUP_BUDGET,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "min_model_completions",
+            _require_int32(
+                "min_model_completions",
+                self.min_model_completions,
+                minimum=1,
+                maximum=_INT32_MAX,
+            ),
+        )
 
     def to_config(self) -> dict[str, object]:
         """Return the exact JSON-compatible L0 configuration."""
@@ -80,9 +112,7 @@ class OptionSearchControlConfig:
             "schema": OPTION_SEARCH_CONTROL_CONFIG_SCHEMA,
             "type": _CONFIG_TYPE,
             "mechanism_status": OPTION_SEARCH_CONTROL_MECHANISM_STATUS,
-            "scientific_promotion_allowed": (
-                OPTION_SEARCH_CONTROL_SCIENTIFIC_PROMOTION_ALLOWED
-            ),
+            "scientific_promotion_allowed": (OPTION_SEARCH_CONTROL_SCIENTIFIC_PROMOTION_ALLOWED),
             "backup_budget": self.backup_budget,
             "min_model_completions": self.min_model_completions,
         }
@@ -109,19 +139,14 @@ class OptionSearchControlConfig:
             raise ValueError("unexpected option search control config schema")
         if payload.pop("type") != _CONFIG_TYPE:
             raise ValueError("unexpected option search control config type")
-        if (
-            payload.pop("mechanism_status")
-            != OPTION_SEARCH_CONTROL_MECHANISM_STATUS
-        ):
+        if payload.pop("mechanism_status") != OPTION_SEARCH_CONTROL_MECHANISM_STATUS:
             raise ValueError("option search control must remain mechanism-only")
         if payload.pop("scientific_promotion_allowed") is not False:
             raise ValueError("option search control config cannot claim promotion")
         if type(payload["backup_budget"]) is not int:
             raise ValueError("serialized backup_budget must be a JSON integer")
         if type(payload["min_model_completions"]) is not int:
-            raise ValueError(
-                "serialized min_model_completions must be a JSON integer"
-            )
+            raise ValueError("serialized min_model_completions must be a JSON integer")
         return cls(**cast(dict[str, Any], payload))
 
 
@@ -267,9 +292,7 @@ class OptionSearchControl:
     ) -> None:
         self._agent = stomp_agent
         self._config = config or OptionSearchControlConfig()
-        candidate_slots = (
-            self._agent.config.n_options * self._config.backup_budget
-        )
+        candidate_slots = self._agent.config.n_options * self._config.backup_budget
         if candidate_slots > _MAX_CANDIDATE_DIAGNOSTIC_SLOTS:
             raise ValueError(
                 "backup_budget * n_options exceeds the option-search "
@@ -324,10 +347,7 @@ class OptionSearchControl:
     def _lms_state_static_contract_valid(state: Any) -> bool:
         """Return whether one STOMP optimizer leaf is scalar float32 LMS."""
 
-        return (
-            isinstance(state, LMSState)
-            and _array_has_contract(state.step_size, (), jnp.float32)
-        )
+        return isinstance(state, LMSState) and _array_has_contract(state.step_size, (), jnp.float32)
 
     def _base_state_static_contract_valid(self, state: STOMPState) -> bool:
         """Validate every base-learner collection before prediction/update."""
@@ -490,18 +510,15 @@ class OptionSearchControl:
                 dtype=jnp.float32,
             )
         )
-        values_finite = (
-            jnp.asarray(static_valid, dtype=jnp.bool_)
-            & jnp.all(jnp.isfinite(observation))
+        values_finite = jnp.asarray(static_valid, dtype=jnp.bool_) & jnp.all(
+            jnp.isfinite(observation)
         )
         budget = self._config.backup_budget
         n_options = self._agent.config.n_options
         matrix_shape = (budget, n_options)
         return OptionSearchControlDiagnostics(
             decision_observation=jnp.where(values_finite, observation, 0.0),
-            decision_observation_static_contract_valid=jnp.asarray(
-                static_valid, dtype=jnp.bool_
-            ),
+            decision_observation_static_contract_valid=jnp.asarray(static_valid, dtype=jnp.bool_),
             decision_observation_values_finite=values_finite,
             option_model_static_contract_valid=jnp.asarray(
                 option_model_static_contract_valid, dtype=jnp.bool_
@@ -511,31 +528,21 @@ class OptionSearchControl:
             ),
             base_state_values_finite=jnp.asarray(False, dtype=jnp.bool_),
             option_model_values_finite=jnp.asarray(False, dtype=jnp.bool_),
-            state_counters_valid=jnp.asarray(
-                state_counters_valid, dtype=jnp.bool_
-            ),
+            state_counters_valid=jnp.asarray(state_counters_valid, dtype=jnp.bool_),
             base_update_capacity_available=jnp.asarray(
                 base_update_capacity_available, dtype=jnp.bool_
             ),
             stomp_state_static_contract_valid=jnp.asarray(
                 stomp_state_static_contract_valid, dtype=jnp.bool_
             ),
-            stomp_state_values_finite=jnp.asarray(
-                stomp_state_values_finite, dtype=jnp.bool_
-            ),
-            stomp_rng_key_valid=jnp.asarray(
-                stomp_rng_key_valid, dtype=jnp.bool_
-            ),
-            stomp_action_ownership_valid=jnp.asarray(
-                stomp_action_ownership_valid, dtype=jnp.bool_
-            ),
+            stomp_state_values_finite=jnp.asarray(stomp_state_values_finite, dtype=jnp.bool_),
+            stomp_rng_key_valid=jnp.asarray(stomp_rng_key_valid, dtype=jnp.bool_),
+            stomp_action_ownership_valid=jnp.asarray(stomp_action_ownership_valid, dtype=jnp.bool_),
             stomp_state_valid=jnp.asarray(stomp_state_valid, dtype=jnp.bool_),
             decision_observation_matches_state=jnp.asarray(
                 decision_observation_matches_state, dtype=jnp.bool_
             ),
-            cached_decision_action_refreshed=jnp.asarray(
-                False, dtype=jnp.bool_
-            ),
+            cached_decision_action_refreshed=jnp.asarray(False, dtype=jnp.bool_),
             value_effect_deferred_to_next_extended_action_selection=(
                 jnp.asarray(False, dtype=jnp.bool_)
             ),
@@ -546,23 +553,15 @@ class OptionSearchControl:
             candidate_semantics_valid=jnp.zeros(matrix_shape, dtype=jnp.bool_),
             candidate_predictions_finite=jnp.zeros(matrix_shape, dtype=jnp.bool_),
             candidate_targets=jnp.zeros(matrix_shape, dtype=jnp.float32),
-            candidate_bellman_residuals=jnp.zeros(
-                matrix_shape, dtype=jnp.float32
-            ),
+            candidate_bellman_residuals=jnp.zeros(matrix_shape, dtype=jnp.float32),
             candidate_priorities=jnp.zeros(matrix_shape, dtype=jnp.float32),
             candidate_valid=jnp.zeros(matrix_shape, dtype=jnp.bool_),
-            selected_option_indices=jnp.full(
-                (budget,), -1, dtype=jnp.int32
-            ),
-            selected_extended_action_indices=jnp.full(
-                (budget,), -1, dtype=jnp.int32
-            ),
+            selected_option_indices=jnp.full((budget,), -1, dtype=jnp.int32),
+            selected_extended_action_indices=jnp.full((budget,), -1, dtype=jnp.int32),
             selected_priorities=jnp.zeros((budget,), dtype=jnp.float32),
             td_errors=jnp.zeros((budget,), dtype=jnp.float32),
             candidate_update_finite=jnp.zeros((budget,), dtype=jnp.bool_),
-            trace_isolation_preserved=jnp.zeros(
-                (budget,), dtype=jnp.bool_
-            ),
+            trace_isolation_preserved=jnp.zeros((budget,), dtype=jnp.bool_),
             applied=jnp.zeros((budget,), dtype=jnp.bool_),
             applied_count=jnp.asarray(0, dtype=jnp.int32),
         )
@@ -582,15 +581,10 @@ class OptionSearchControl:
             learner_state,
             observation,
         )
-        option_values = base_values[
-            self._agent.config.n_primitive_actions :
-        ]
-        completion_supported = (
-            models.n_completions
-            >= jnp.asarray(
-                self._config.min_model_completions,
-                dtype=jnp.int32,
-            )
+        option_values = base_values[self._agent.config.n_primitive_actions :]
+        completion_supported = models.n_completions >= jnp.asarray(
+            self._config.min_model_completions,
+            dtype=jnp.int32,
         )
         candidate_semantics_valid = (
             (models.n_completions >= 0)
@@ -638,11 +632,7 @@ class OptionSearchControl:
                 & jnp.isfinite(target)
                 & jnp.isfinite(residual)
             )
-            valid = (
-                planner_inputs_valid
-                & safe_model
-                & prediction_finite
-            )
+            valid = planner_inputs_valid & safe_model & prediction_finite
             return (
                 jnp.where(valid, target, jnp.float32(0.0)),
                 jnp.where(valid, residual, jnp.float32(0.0)),
@@ -650,9 +640,7 @@ class OptionSearchControl:
                 valid,
             )
 
-        targets, residuals, predictions_finite, candidate_valid = jax.vmap(
-            evaluate_one
-        )(indices)
+        targets, residuals, predictions_finite, candidate_valid = jax.vmap(evaluate_one)(indices)
         priorities = jnp.where(candidate_valid, jnp.abs(residuals), 0.0)
         return (
             completion_supported,
@@ -687,11 +675,7 @@ class OptionSearchControl:
         )
         model_static_valid = self._option_model_static_contract_valid(state)
         base_static_valid = self._base_state_static_contract_valid(state)
-        if (
-            not observation_static_valid
-            or not model_static_valid
-            or not base_static_valid
-        ):
+        if not observation_static_valid or not model_static_valid or not base_static_valid:
             return OptionSearchControlResult(
                 state=state,
                 diagnostics=self.unavailable_diagnostics(
@@ -722,15 +706,10 @@ class OptionSearchControl:
                 ),
             )
         observation_values_finite = jnp.all(jnp.isfinite(observation))
-        base_state_values_finite = _floating_tree_is_finite(
+        base_state_values_finite = _floating_tree_is_finite(state.base_learner_state)
+        option_model_values_finite = _floating_tree_is_finite(state.option_models)
+        state_counters_valid = stomp_audit.state_counters_valid & _all_integer_leaves_nonnegative(
             state.base_learner_state
-        )
-        option_model_values_finite = _floating_tree_is_finite(
-            state.option_models
-        )
-        state_counters_valid = (
-            stomp_audit.state_counters_valid
-            & _all_integer_leaves_nonnegative(state.base_learner_state)
         )
         max_step_count_before_call = jnp.asarray(
             _INT32_MAX - self._config.backup_budget,
@@ -767,9 +746,7 @@ class OptionSearchControl:
         priorities_log = jnp.zeros(matrix_shape, dtype=jnp.float32)
         candidate_valid_log = jnp.zeros(matrix_shape, dtype=jnp.bool_)
         selected_options = jnp.full((budget,), -1, dtype=jnp.int32)
-        selected_extended_actions = jnp.full(
-            (budget,), -1, dtype=jnp.int32
-        )
+        selected_extended_actions = jnp.full((budget,), -1, dtype=jnp.int32)
         selected_priorities = jnp.zeros((budget,), dtype=jnp.float32)
         td_errors = jnp.zeros((budget,), dtype=jnp.float32)
         update_finite_log = jnp.zeros((budget,), dtype=jnp.bool_)
@@ -839,12 +816,9 @@ class OptionSearchControl:
                 jnp.int32(-1),
             )
             safe_option = jnp.maximum(selected_option, jnp.int32(0))
-            selected_extended = (
-                safe_option
-                + jnp.asarray(
-                    self._agent.config.n_primitive_actions,
-                    dtype=jnp.int32,
-                )
+            selected_extended = safe_option + jnp.asarray(
+                self._agent.config.n_primitive_actions,
+                dtype=jnp.int32,
             )
             selected_target = candidate_targets[safe_option]
             selected_priority = candidate_priorities[safe_option]
@@ -857,8 +831,7 @@ class OptionSearchControl:
                 MultiHeadMLPState,
                 learner_state.replace(
                     trunk_traces=tuple(
-                        jnp.zeros_like(trace)
-                        for trace in learner_state.trunk_traces
+                        jnp.zeros_like(trace) for trace in learner_state.trunk_traces
                     ),
                     head_traces=tuple(
                         (
@@ -869,11 +842,15 @@ class OptionSearchControl:
                     ),
                 ),
             )
-            targets = jnp.full(
-                (self._agent.config.n_total_actions,),
-                jnp.nan,
-                dtype=jnp.float32,
-            ).at[selected_extended].set(selected_target)
+            targets = (
+                jnp.full(
+                    (self._agent.config.n_total_actions,),
+                    jnp.nan,
+                    dtype=jnp.float32,
+                )
+                .at[selected_extended]
+                .set(selected_target)
+            )
 
             def propose_update(_: None) -> tuple[MultiHeadMLPState, Array]:
                 update = self._agent.base_learner.update(
@@ -980,32 +957,20 @@ class OptionSearchControl:
                 observation_static_valid, dtype=jnp.bool_
             ),
             decision_observation_values_finite=observation_values_finite,
-            option_model_static_contract_valid=jnp.asarray(
-                model_static_valid, dtype=jnp.bool_
-            ),
-            base_state_static_contract_valid=jnp.asarray(
-                base_static_valid, dtype=jnp.bool_
-            ),
+            option_model_static_contract_valid=jnp.asarray(model_static_valid, dtype=jnp.bool_),
+            base_state_static_contract_valid=jnp.asarray(base_static_valid, dtype=jnp.bool_),
             base_state_values_finite=base_state_values_finite,
             option_model_values_finite=option_model_values_finite,
             state_counters_valid=state_counters_valid,
             base_update_capacity_available=base_update_capacity_available,
-            stomp_state_static_contract_valid=(
-                stomp_audit.state_static_contract_valid
-            ),
+            stomp_state_static_contract_valid=(stomp_audit.state_static_contract_valid),
             stomp_state_values_finite=stomp_audit.state_values_finite,
             stomp_rng_key_valid=stomp_audit.rng_key_valid,
             stomp_action_ownership_valid=stomp_audit.ownership_valid,
             stomp_state_valid=stomp_audit.state_valid,
-            decision_observation_matches_state=(
-                stomp_audit.observation_matches
-            ),
-            cached_decision_action_refreshed=jnp.asarray(
-                False, dtype=jnp.bool_
-            ),
-            value_effect_deferred_to_next_extended_action_selection=(
-                jnp.any(applied_log)
-            ),
+            decision_observation_matches_state=(stomp_audit.observation_matches),
+            cached_decision_action_refreshed=jnp.asarray(False, dtype=jnp.bool_),
+            value_effect_deferred_to_next_extended_action_selection=(jnp.any(applied_log)),
             average_reward_valid=average_reward_valid,
             planner_inputs_valid=planner_inputs_valid,
             completion_counts=jnp.where(

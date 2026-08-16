@@ -78,12 +78,10 @@ def _supported_state(
     learner = state.base_learner_state.replace(
         head_params=state.base_learner_state.head_params.replace(
             weights=tuple(
-                jnp.zeros_like(weight)
-                for weight in state.base_learner_state.head_params.weights
+                jnp.zeros_like(weight) for weight in state.base_learner_state.head_params.weights
             ),
             biases=tuple(
-                jnp.zeros_like(bias)
-                for bias in state.base_learner_state.head_params.biases
+                jnp.zeros_like(bias) for bias in state.base_learner_state.head_params.biases
             ),
         )
     )
@@ -93,9 +91,7 @@ def _supported_state(
         duration_ema=jnp.ones((n_options,), dtype=jnp.float32),
         baseline_mass_ema=jnp.ones((n_options,), dtype=jnp.float32),
         discount_ema=jnp.zeros((n_options,), dtype=jnp.float32),
-        next_state_weights=jnp.zeros(
-            (n_options, 2, 2), dtype=jnp.float32
-        ),
+        next_state_weights=jnp.zeros((n_options, 2, 2), dtype=jnp.float32),
         n_completions=jnp.ones((n_options,), dtype=jnp.int32),
     )
     return cast(
@@ -190,10 +186,7 @@ def test_zero_discount_does_not_multiply_overflowed_next_values() -> None:
     agent = STOMPAgent(_stomp_config())
     state = _supported_state(agent, targets=(1.0, 4.0))
     huge = jnp.finfo(jnp.float32).max
-    ones = tuple(
-        jnp.ones_like(weight)
-        for weight in state.base_learner_state.head_params.weights
-    )
+    ones = tuple(jnp.ones_like(weight) for weight in state.base_learner_state.head_params.weights)
     learner = state.base_learner_state.replace(
         head_params=state.base_learner_state.head_params.replace(weights=ones)
     )
@@ -239,10 +232,14 @@ def test_partial_completion_support_excludes_the_unsupported_candidate() -> None
             n_completions=jnp.array([2, 1], dtype=jnp.int32),
         )
     )
-    diagnostics = OptionSearchControl(
-        agent,
-        OptionSearchControlConfig(min_model_completions=2),
-    ).apply(state, ANCHOR).diagnostics
+    diagnostics = (
+        OptionSearchControl(
+            agent,
+            OptionSearchControlConfig(min_model_completions=2),
+        )
+        .apply(state, ANCHOR)
+        .diagnostics
+    )
 
     np.testing.assert_array_equal(
         np.asarray(diagnostics.completion_supported[0]),
@@ -307,9 +304,8 @@ def test_residuals_are_recomputed_after_each_backup() -> None:
         np.array([0, 1], dtype=np.int32),
     )
     assert bool(jnp.all(result.diagnostics.applied))
-    assert (
-        float(result.diagnostics.candidate_priorities[1, 0])
-        < float(result.diagnostics.candidate_priorities[0, 0])
+    assert float(result.diagnostics.candidate_priorities[1, 0]) < float(
+        result.diagnostics.candidate_priorities[0, 0]
     )
 
 
@@ -328,9 +324,7 @@ def test_unsupported_or_invalid_models_are_exact_planner_noops(
 ) -> None:
     agent = STOMPAgent(_stomp_config())
     state = _supported_state(agent)
-    state = state.replace(
-        option_models=state.option_models.replace(**{field: replacement})
-    )
+    state = state.replace(option_models=state.option_models.replace(**{field: replacement}))
     result = OptionSearchControl(
         agent,
         OptionSearchControlConfig(backup_budget=2),
@@ -356,12 +350,8 @@ def test_malformed_base_state_contracts_fail_closed_without_indexing() -> None:
         )
     )
     malformed_states = (
-        state.replace(
-            base_average_reward=jnp.zeros((1,), dtype=jnp.float32)
-        ),
-        state.replace(
-            base_average_reward=jnp.asarray(0, dtype=jnp.int32)
-        ),
+        state.replace(base_average_reward=jnp.zeros((1,), dtype=jnp.float32)),
+        state.replace(base_average_reward=jnp.asarray(0, dtype=jnp.int32)),
         state.replace(base_average_reward=0.0),
         state.replace(step_count=0),
         state.replace(base_learner_state=shortened_heads),
@@ -380,11 +370,7 @@ def test_malformed_nested_model_and_outer_leaves_fail_closed() -> None:
     agent = STOMPAgent(_stomp_config())
     state = _supported_state(agent)
     malformed_states = (
-        state.replace(
-            option_models=state.option_models.replace(
-                cumreward_ema=[100.0, 101.0]
-            )
-        ),
+        state.replace(option_models=state.option_models.replace(cumreward_ema=[100.0, 101.0])),
         state.replace(base_last_obs=[1.0, 0.0]),
         state.replace(base_last_action=0),
         state.replace(
@@ -496,8 +482,7 @@ def test_planning_preserves_real_traces_normalizer_caches_rng_and_option_state()
     state = _supported_state(agent)
     learner = state.base_learner_state.replace(
         trunk_traces=tuple(
-            jnp.full_like(trace, 0.25)
-            for trace in state.base_learner_state.trunk_traces
+            jnp.full_like(trace, 0.25) for trace in state.base_learner_state.trunk_traces
         ),
         head_traces=tuple(
             (jnp.full_like(weight_trace, 0.5), jnp.full_like(bias_trace, -0.5))
@@ -626,9 +611,7 @@ def test_prototype_applies_search_at_next_decision_observation() -> None:
         option_search_control=option_search,
     )
     search_agent = PrototypeAgent(config)
-    baseline_agent = PrototypeAgent(
-        PrototypeAgentConfig(oak=config.oak)
-    )
+    baseline_agent = PrototypeAgent(PrototypeAgentConfig(oak=config.oak))
     state = search_agent.start(search_agent.init(jr.key(21)), ANCHOR)
     supported_stomp = _supported_state(search_agent.oak_agent.stomp_agent)
     state = state.replace(
@@ -663,9 +646,7 @@ def test_prototype_applies_search_at_next_decision_observation() -> None:
     )
     assert int(diagnostics.applied_count) == 1
     assert not bool(diagnostics.cached_decision_action_refreshed)
-    assert bool(
-        diagnostics.value_effect_deferred_to_next_extended_action_selection
-    )
+    assert bool(diagnostics.value_effect_deferred_to_next_extended_action_selection)
     searched_q = search_agent.oak_agent.base_q_values(
         searched.state.oak_state,
         next_decision,
@@ -722,3 +703,25 @@ def test_rejected_prototype_transition_returns_fixed_neutral_search_diagnostics(
     assert not bool(jnp.any(diagnostics.applied))
     assert int(diagnostics.applied_count) == 0
     chex.assert_trees_all_equal(rejected.state, state)
+
+
+def test_option_search_control_config_rejects_booleans_and_non_integers() -> None:
+    with pytest.raises(ValueError, match="backup_budget"):
+        OptionSearchControlConfig(backup_budget=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="backup_budget"):
+        OptionSearchControlConfig(backup_budget=2.5)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="min_model_completions"):
+        OptionSearchControlConfig(min_model_completions=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="min_model_completions"):
+        OptionSearchControlConfig(min_model_completions=1.5)  # type: ignore[arg-type]
+
+
+def test_option_search_control_config_accepts_and_canonicalizes_numpy_integers() -> None:
+    cfg = OptionSearchControlConfig(
+        backup_budget=np.int32(4),
+        min_model_completions=np.int64(2),
+    )
+    assert type(cfg.backup_budget) is int
+    assert type(cfg.min_model_completions) is int
+    assert cfg.backup_budget == 4
+    assert cfg.min_model_completions == 2
