@@ -175,6 +175,34 @@ class TestExactSemantics:
         assert int(recovered.state.step_count) == 1
         assert bool(recovered.update_applied)
 
+    def test_zero_gamma_does_not_multiply_inf_bootstrap(self):
+        """gamma=0 * inf V(s') is 0*inf = NaN and would freeze a nexting demon."""
+        cfg = StackedHordeConfig(
+            n_demons=1,
+            feature_dim=2,
+            gammas=(0.0,),
+            lamdas=(0.0,),
+            cumulant_indices=(0,),
+            step_size=0.1,
+        )
+        horde = StackedLinearHorde(cfg)
+        huge = jnp.float32(1e38)
+        state = horde.init().replace(
+            weights=jnp.asarray([[huge, 0.0]], dtype=jnp.float32),
+            traces=jnp.asarray([[jnp.inf, jnp.inf]], dtype=jnp.float32),
+        )
+        x = jnp.asarray([0.0, 1.0], dtype=jnp.float32)
+        x_next = jnp.asarray([huge, 0.0], dtype=jnp.float32)
+        c = jnp.asarray([2.0], dtype=jnp.float32)
+        raw = jnp.asarray(0.0, dtype=jnp.float32) * (huge * huge)
+        assert not bool(jnp.isfinite(raw))
+
+        result = horde.update(state, x, x_next, c, rho=1.0)
+        chex.assert_tree_all_finite(result.state.traces)
+        chex.assert_tree_all_finite(result.td_errors)
+        assert bool(result.update_applied)
+        assert float(result.td_errors[0]) == pytest.approx(2.0)
+
 
 class TestConvergence:
     def test_three_state_cycle_analytic_fixed_point(self):
