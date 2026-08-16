@@ -95,6 +95,16 @@ class TestRandomWalkStream:
 class TestAbruptChangeStream:
     """Tests for the AbruptChangeStream class."""
 
+    def test_rejects_non_finite_or_negative_float_params(self):
+        """Should reject NaN/inf/negative noise_std and feature_std."""
+        for name, value in (
+            ("noise_std", float("nan")),
+            ("noise_std", float("inf")),
+            ("feature_std", -1.0),
+        ):
+            with pytest.raises(ValueError, match=name):
+                AbruptChangeStream(feature_dim=4, **{name: value})
+
     @pytest.mark.parametrize("compiled", [False, True], ids=["eager", "jit"])
     def test_initial_weights_last_for_first_full_segment(self, rng_key, compiled):
         """Initialized weights govern exactly one complete change interval."""
@@ -173,6 +183,16 @@ class TestSuttonExperiment1Stream:
 class TestCyclicStream:
     """Tests for the CyclicStream class."""
 
+    def test_rejects_non_finite_or_negative_float_params(self):
+        """Should reject NaN/inf/negative noise_std and feature_std."""
+        for name, value in (
+            ("noise_std", float("nan")),
+            ("noise_std", float("inf")),
+            ("feature_std", -1.0),
+        ):
+            with pytest.raises(ValueError, match=name):
+                CyclicStream(feature_dim=4, **{name: value})
+
     def test_cycles_through_configurations(self, rng_key):
         """Should cycle through configurations."""
         stream = CyclicStream(
@@ -228,6 +248,17 @@ class TestCyclicStream:
 
 class TestPeriodicChangeStream:
     """Tests for the PeriodicChangeStream class."""
+
+    def test_rejects_non_finite_or_negative_float_params(self):
+        """Should reject NaN/inf/negative amplitude, noise_std, feature_std."""
+        for name, value in (
+            ("amplitude", float("nan")),
+            ("amplitude", float("inf")),
+            ("noise_std", -0.5),
+            ("feature_std", float("nan")),
+        ):
+            with pytest.raises(ValueError, match=name):
+                PeriodicChangeStream(feature_dim=4, **{name: value})
 
     def test_init_creates_valid_state(self, rng_key):
         """Stream init should create valid state with correct shapes."""
