@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Iterator, Mapping
+from types import MappingProxyType
 from typing import Any
 
 import jax.numpy as jnp
@@ -158,3 +159,38 @@ def test_all_pairs_resources_and_feature_dim_are_checked_before_construction(
         learner.init(last_legal_dim + 1, jr.key(0))
     with pytest.raises(ValueError, match="feature_dim"):
         learner.init(True, jr.key(0))
+
+
+def test_config_accepts_mapping_and_requires_exact_serialized_schema() -> None:
+    payload = _construct().to_config()
+    restored = FixedBudgetInteractionLearner.from_config(MappingProxyType(payload))
+    assert restored.to_config() == payload
+
+    for mutation, match in (
+        ({"type": "OtherLearner"}, "type"),
+        ({"n_features": np.int32(4)}, "n_features"),
+        ({"step_size_output": np.float32(0.03)}, "step_size_output"),
+        ({"refresh_candidates": np.bool_(True)}, "refresh_candidates"),
+        ({"generator_mix": [1.0, 0, 0.0]}, "generator_mix"),
+        ({"task_utility_weights": [1]}, "task_utility_weights"),
+        ({"extra": 1}, "fields"),
+    ):
+        invalid = dict(payload)
+        invalid.update(mutation)
+        with pytest.raises((TypeError, ValueError), match=match):
+            FixedBudgetInteractionLearner.from_config(invalid)
+
+
+def test_config_normalizes_hostile_mapping_failure() -> None:
+    class HostileMapping(Mapping[str, Any]):
+        def __getitem__(self, key: str) -> Any:
+            raise RuntimeError("hook executed")
+
+        def __iter__(self) -> Iterator[str]:
+            raise RuntimeError("hook executed")
+
+        def __len__(self) -> int:
+            return 1
+
+    with pytest.raises(ValueError, match="could not be read"):
+        FixedBudgetInteractionLearner.from_config(HostileMapping())

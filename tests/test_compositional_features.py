@@ -1,6 +1,9 @@
 """Tests for the compositional DAG feature learner (Step 2)."""
 
+from types import MappingProxyType
+
 import chex
+import jax
 import jax.numpy as jnp
 import jax.random as jr
 import numpy as np
@@ -21,6 +24,8 @@ from alberta_framework.core.compositional_features import (
     _imprint_candidate_output_weights,
     run_compositional_arrays,
 )
+
+_INT32_MAX = 2**31 - 1
 
 
 def _assert_valid_active_dag(
@@ -1502,3 +1507,64 @@ def test_compositional_feature_learner_integer_validation() -> None:
     assert learner._n_tasks == 2
     assert learner._candidate_count == 2
     assert learner._max_depth == 3
+
+
+def test_compositional_resource_formulas_and_boundaries() -> None:
+    learner = CompositionalFeatureLearner(
+        n_features=4,
+        n_tasks=3,
+        candidate_count=2,
+    )
+    state = learner.init(feature_dim=1, key=jr.key(0))
+    measured = sum(int(getattr(leaf, "nbytes", 0)) for leaf in jax.tree.leaves(state))
+    assert measured == 20 + 48 + 56 * 4 + 12 * 3 + 68 * 2 + 12 * 4 * 3 + 12 * 3 * 2 + 4 * 4 * 2
+
+    last_selector = (_INT32_MAX - 4) // 12
+    FiniteCandidateSelector(last_selector)
+    with pytest.raises(ValueError, match="selector state bytes"):
+        FiniteCandidateSelector(last_selector + 1)
+
+    last_learner = (_INT32_MAX - 80) // 68
+    CompositionalFeatureLearner(last_learner, 1)
+    with pytest.raises(ValueError, match="persistent state bytes"):
+        CompositionalFeatureLearner(last_learner + 1, 1)
+
+
+def test_compositional_serialized_schema_and_hostile_integer_contract() -> None:
+    class HostileInt(int):
+        def __index__(self) -> int:
+            raise AssertionError("index hook executed")
+
+    with pytest.raises(ValueError, match="n_features"):
+        CompositionalFeatureLearner(HostileInt(4), 1)
+
+    learner = CompositionalFeatureLearner(4, 1)
+    payload = learner.to_config()
+    assert CompositionalFeatureLearner.from_config(MappingProxyType(payload)).to_config() == payload
+    for mutation, match in (
+        ({"type": "OtherLearner"}, "type"),
+        ({"n_features": np.int32(4)}, "n_features"),
+        ({"extra": 1}, "fields"),
+    ):
+        invalid = dict(payload)
+        invalid.update(mutation)
+        with pytest.raises(ValueError, match=match):
+            CompositionalFeatureLearner.from_config(invalid)
+
+
+def test_compositional_init_rejects_hostile_and_derived_parent_resources() -> None:
+    class HostileInt(int):
+        def __index__(self) -> int:
+            raise AssertionError("index hook executed")
+
+    learner = CompositionalFeatureLearner(4, 1)
+    with pytest.raises(ValueError, match="feature_dim"):
+        learner.init(HostileInt(2), jr.key(0))
+
+    recursive = CompositionalFeatureLearner(
+        30_000,
+        1,
+        generation_strategy="recursive_product",
+    )
+    with pytest.raises(ValueError, match="recursive parent construction byte count"):
+        recursive.init(30_000, jr.key(0))

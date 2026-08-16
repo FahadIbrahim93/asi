@@ -21,10 +21,12 @@ under JIT compilation.
 """
 
 import functools
+import inspect
 import math
 import operator
 import time
-from typing import Any, SupportsIndex, cast
+from collections.abc import Mapping
+from typing import Any, SupportsIndex, cast, get_args, get_type_hints
 
 import chex
 import jax
@@ -76,6 +78,58 @@ def _require_int32(name: str, value: object, *, minimum: int, maximum: int = _IN
     if not minimum <= canonical <= maximum:
         raise ValueError(f"{name} must be an integer in [{minimum}, {maximum}]")
     return canonical
+
+
+def _selector_state_nbytes(n_candidates: int) -> int:
+    return 12 * n_candidates + 4
+
+
+def _require_resource(name: str, *, scalars: int, nbytes: int) -> None:
+    if scalars > _INT32_MAX:
+        raise ValueError(f"{name} scalar count must fit signed int32")
+    if nbytes > _INT32_MAX:
+        raise ValueError(f"{name} byte count must fit signed int32")
+
+
+def _compositional_state_nbytes(
+    n_features: int,
+    n_tasks: int,
+    candidate_count: int,
+    generator_resource_contexts: int,
+) -> int:
+    """Return exact initialized persistent JAX-array bytes without allocation."""
+    return (
+        20
+        + 48 * generator_resource_contexts
+        + 56 * n_features
+        + 12 * n_tasks
+        + 68 * candidate_count
+        + 12 * n_features * n_tasks
+        + 12 * n_tasks * candidate_count
+        + 4 * n_features * candidate_count
+    )
+
+
+def _require_serialized_scalars(payload: Mapping[str, Any], owner: type[Any]) -> None:
+    annotations = get_type_hints(owner.__init__)
+    for name, parameter in inspect.signature(owner).parameters.items():
+        if name not in payload or payload[name] is None:
+            continue
+        annotation = annotations.get(name, parameter.annotation)
+        union_args = get_args(annotation)
+        if type(None) in union_args:
+            annotation = next(item for item in union_args if item is not type(None))
+        expected: type | None = None
+        if annotation is int:
+            expected = int
+        elif annotation is float:
+            expected = float
+        elif annotation is bool:
+            expected = bool
+        elif annotation is str:
+            expected = str
+        if expected is not None and type(payload[name]) is not expected:
+            raise ValueError(f"serialized {name} must be a JSON {expected.__name__}")
 
 
 OP_RAW = 0
@@ -460,6 +514,8 @@ class FiniteCandidateSelector:
                 ``"exp3"`` for selected-action importance-weighted updates.
         """
         n_candidates = _require_int32("n_candidates", n_candidates, minimum=1)
+        if _selector_state_nbytes(n_candidates) > _INT32_MAX:
+            raise ValueError("finite candidate selector state bytes must fit signed int32")
         if learning_rate <= 0.0:
             raise ValueError("learning_rate must be positive")
         if not 0.0 <= exploration < 1.0:
@@ -501,11 +557,20 @@ class FiniteCandidateSelector:
         }
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> "FiniteCandidateSelector":
+    def from_config(cls, config: Mapping[str, Any]) -> "FiniteCandidateSelector":
         """Reconstruct a selector from :meth:`to_config` output."""
-        config = dict(config)
-        config.pop("type", None)
-        return cls(**config)
+        if not issubclass(type(config), Mapping):
+            raise ValueError("finite candidate selector config must be a mapping")
+        try:
+            payload = dict(config)
+        except Exception as error:
+            raise ValueError("finite candidate selector config could not be read") from error
+        if payload.pop("type", None) != "FiniteCandidateSelector":
+            raise ValueError("finite candidate selector config type is invalid")
+        if set(payload) != set(inspect.signature(cls).parameters):
+            raise ValueError("finite candidate selector fields do not match its schema")
+        _require_serialized_scalars(payload, cls)
+        return cls(**payload)
 
     def init(self) -> FiniteCandidateSelectorState:
         """Create a uniform selector state."""
@@ -1077,6 +1142,21 @@ class CompositionalFeatureLearner:
         generator_resource_contexts = _require_int32(
             "generator_resource_contexts", generator_resource_contexts, minimum=1
         )
+        persistent_nbytes = _compositional_state_nbytes(
+            n_features,
+            n_tasks,
+            candidate_count,
+            generator_resource_contexts,
+        )
+        if persistent_nbytes > _INT32_MAX:
+            raise ValueError("compositional feature persistent state bytes must fit signed int32")
+        for name, value in (
+            ("use_obgd", use_obgd),
+            ("train_candidate_theta", train_candidate_theta),
+            ("learn_generator_resources", learn_generator_resources),
+        ):
+            if type(value) is not bool:
+                raise ValueError(f"{name} must be an actual bool")
         utility_decay_config = utility_decay
         utility_decay = canonical_float32_ema_decay(
             "utility_decay",
@@ -1370,11 +1450,26 @@ class CompositionalFeatureLearner:
         }
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> "CompositionalFeatureLearner":
+    def from_config(cls, config: Mapping[str, Any]) -> "CompositionalFeatureLearner":
         """Reconstruct learner from ``to_config`` output."""
-        config = dict(config)
-        config.pop("type", None)
-        return cls(**config)
+        if not issubclass(type(config), Mapping):
+            raise ValueError("compositional feature config must be a mapping")
+        try:
+            payload = dict(config)
+        except Exception as error:
+            raise ValueError("compositional feature config could not be read") from error
+        if payload.pop("type", None) != "CompositionalFeatureLearner":
+            raise ValueError("compositional feature config type is invalid")
+        if set(payload) != set(inspect.signature(cls).parameters):
+            raise ValueError("compositional feature config fields do not match its schema")
+        _require_serialized_scalars(payload, cls)
+        for name in ("operation_prior", "generator_resource_initial_preferences"):
+            raw = payload[name]
+            if raw is not None:
+                if type(raw) is not list or any(type(value) is not float for value in raw):
+                    raise ValueError(f"serialized {name} must be null or an exact JSON number list")
+                payload[name] = tuple(raw)
+        return cls(**payload)
 
     def init(self, feature_dim: int, key: Array) -> CompositionalFeatureState:
         """Initialize the active and candidate banks.
@@ -1384,10 +1479,20 @@ class CompositionalFeatureLearner:
         compositions of earlier slots; candidates are similarly random
         compositions of the active raw-input slots.
         """
-        if feature_dim < 1:
-            raise ValueError("feature_dim must be positive")
+        feature_dim = _require_int32("feature_dim", feature_dim, minimum=1)
         if self._n_features < feature_dim:
             raise ValueError("n_features must be at least feature_dim so raw-input slots fit")
+        if self._generation_strategy in {
+            GENERATION_RECURSIVE_PRODUCT,
+            GENERATION_ROBUST_RECURSIVE,
+        }:
+            diagonal = 1 if self._generation_strategy == GENERATION_ROBUST_RECURSIVE else -1
+            pair_count = feature_dim * (feature_dim + diagonal) // 2
+            _require_resource(
+                "recursive parent construction",
+                scalars=2 * pair_count,
+                nbytes=8 * pair_count,
+            )
 
         n_features = self._n_features
 

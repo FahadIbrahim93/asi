@@ -18,6 +18,7 @@ References:
 
 import dataclasses
 import functools
+import inspect
 import math
 import operator
 import struct
@@ -25,7 +26,7 @@ import time
 from collections.abc import Mapping
 from numbers import Real
 from pathlib import Path
-from typing import Any, SupportsIndex, cast
+from typing import Any, SupportsIndex, cast, get_args, get_type_hints
 
 import chex
 import jax
@@ -116,6 +117,29 @@ def _require_state_resources(
         + 32
     )
     _require_resource("interaction-feature state", scalars=scalars, nbytes=nbytes)
+
+
+def _require_serialized_scalars(payload: Mapping[str, Any], owner: type[Any]) -> None:
+    """Require the canonical JSON scalar types emitted by ``to_config``."""
+    annotations = get_type_hints(owner.__init__)
+    for name, parameter in inspect.signature(owner).parameters.items():
+        if name not in payload or payload[name] is None:
+            continue
+        annotation = annotations.get(name, parameter.annotation)
+        union_args = get_args(annotation)
+        if type(None) in union_args:
+            annotation = next(item for item in union_args if item is not type(None))
+        expected: type | None = None
+        if annotation is int:
+            expected = int
+        elif annotation is float:
+            expected = float
+        elif annotation is bool:
+            expected = bool
+        elif annotation is str:
+            expected = str
+        if expected is not None and type(payload[name]) is not expected:
+            raise ValueError(f"serialized {name} must be a JSON {expected.__name__}")
 
 CURATION_ACTIVE_INELIGIBLE_RANK = float.fromhex("0x1.fffffep+127")
 CURATION_CANDIDATE_INELIGIBLE_RANK = -CURATION_ACTIVE_INELIGIBLE_RANK
@@ -1186,7 +1210,7 @@ class FixedBudgetInteractionLearner:
         }
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> "FixedBudgetInteractionLearner":
+    def from_config(cls, config: Mapping[str, Any]) -> "FixedBudgetInteractionLearner":
         """Reconstruct an explicit, versioned :meth:`to_config` payload.
 
         Probe-enabled payloads written before ``relevance_probe_mode`` existed
@@ -1196,31 +1220,49 @@ class FixedBudgetInteractionLearner:
         to ``conditional_v1`` because the dormant fixed-shape probe has no
         behavioral effect.
         """
-        config = dict(config)
-        config.pop("type", None)
-        if config.pop("state_schema", None) != INTERACTION_FEATURE_STATE_SCHEMA:
+        if not isinstance(config, Mapping):
+            raise ValueError("interaction-feature config must be a mapping")
+        try:
+            payload = dict(config)
+        except Exception as error:
+            raise ValueError("interaction-feature config mapping could not be read") from error
+        if payload.pop("type", None) != "FixedBudgetInteractionLearner":
+            raise ValueError("interaction-feature config type is invalid")
+        if payload.pop("state_schema", None) != INTERACTION_FEATURE_STATE_SCHEMA:
             raise ValueError("interaction-feature state schema is unsupported")
-        if "relevance_probe_mode" not in config:
-            if config.get("independent_relevance_probe", False):
+        if "relevance_probe_mode" not in payload:
+            if payload.get("independent_relevance_probe", False):
                 raise ValueError(
                     "probe-enabled legacy config is ambiguous; set "
                     "relevance_probe_mode explicitly"
                 )
-            config["relevance_probe_mode"] = RELEVANCE_PROBE_MODE_CONDITIONAL_V1
-        generator_mix = config.pop("generator_mix", (1.0, 0.0, 0.0))
-        raw_task_utility_weights = config.pop("task_utility_weights", None)
+            payload["relevance_probe_mode"] = RELEVANCE_PROBE_MODE_CONDITIONAL_V1
+        payload.setdefault("task_utility_weights", None)
+        payload.setdefault("stale_retirement_interval", None)
+        expected = set(inspect.signature(cls).parameters)
+        if set(payload) != expected:
+            raise ValueError("interaction-feature config fields do not match its schema")
+        _require_serialized_scalars(payload, cls)
+        generator_mix = payload.pop("generator_mix")
+        if type(generator_mix) is not list or len(generator_mix) != 3 or any(
+            type(value) is not float for value in generator_mix
+        ):
+            raise ValueError("serialized generator_mix must be an exact three-float JSON list")
+        raw_task_utility_weights = payload.pop("task_utility_weights")
         if raw_task_utility_weights is None:
             task_utility_weights = None
         else:
-            if type(raw_task_utility_weights) is not list:
+            if type(raw_task_utility_weights) is not list or any(
+                type(value) is not float for value in raw_task_utility_weights
+            ):
                 raise TypeError(
-                    "serialized task_utility_weights must be None or an exact JSON list"
+                    "serialized task_utility_weights must be None or an exact float JSON list"
                 )
             task_utility_weights = tuple(raw_task_utility_weights)
         return cls(
             generator_mix=tuple(generator_mix),
             task_utility_weights=task_utility_weights,
-            **config,
+            **payload,
         )
 
     def init(self, feature_dim: int, key: Array) -> InteractionFeatureState:
