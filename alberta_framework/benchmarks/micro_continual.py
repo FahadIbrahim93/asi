@@ -910,6 +910,34 @@ def write_micro_shard(path: Path | str, payload: dict[str, Any]) -> None:
     atomic_write_new(Path(path), encoded)
 
 
+_MICRO_CURVE_DOMAINS: dict[str, tuple[float, float | None]] = {
+    "per_regime_accuracy": (0.0, 1.0),
+    "per_regime_loss": (0.0, None),
+    "per_regime_plasticity": (0.0, 1.0),
+}
+
+
+def _validated_curve(
+    value: object,
+    *,
+    n_regimes: int,
+    lower: float,
+    upper: float | None,
+    context: str,
+) -> list[float]:
+    """Return one per-regime curve as exact finite floats inside its metric domain."""
+    if not isinstance(value, list) or len(value) != n_regimes:
+        raise ValueError(f"{context} must be a list of {n_regimes} finite real numbers")
+    curve: list[float] = []
+    for index, entry in enumerate(value):
+        number = _require_finite_real(entry, f"{context}[{index}]")
+        if number < lower or (upper is not None and number > upper):
+            domain = f"[{lower}, {upper}]" if upper is not None else f">= {lower}"
+            raise ValueError(f"{context}[{index}] must lie in {domain}, got {number!r}")
+        curve.append(number)
+    return curve
+
+
 def load_micro_shard(path: Path | str) -> dict[str, Any]:
     """Load and structurally validate one micro shard."""
     path = Path(path)
@@ -944,12 +972,14 @@ def load_micro_shard(path: Path | str) -> dict[str, Any]:
             f"{path}: family {payload.get('family')!r} does not match "
             f"stream_config family {config.family!r}"
         )
-    for fieldname in ("per_regime_accuracy", "per_regime_loss", "per_regime_plasticity"):
-        values = np.asarray(payload.get(fieldname, []), dtype=np.float64)
-        if values.shape != (config.n_regimes,) or not np.all(np.isfinite(values)):
-            raise ValueError(
-                f"{path}: {fieldname} must be finite with shape ({config.n_regimes},)"
-            )
+    for fieldname, (lower, upper) in _MICRO_CURVE_DOMAINS.items():
+        payload[fieldname] = _validated_curve(
+            payload.get(fieldname),
+            n_regimes=config.n_regimes,
+            lower=lower,
+            upper=upper,
+            context=f"{path}: {fieldname}",
+        )
     payload["wall_clock_seconds"] = _validated_wall_clock_seconds(
         payload.get("wall_clock_seconds"), path
     )
