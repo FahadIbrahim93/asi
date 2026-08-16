@@ -234,6 +234,12 @@ def _require_positive_int(name: str, value: object) -> int:
     return number
 
 
+def _require_bool(name: str, value: object) -> bool:
+    if type(value) is not bool:
+        raise ValueError(f"{name} must be a boolean, got {value!r}")
+    return value
+
+
 def _validate_horde_config(config: Step3HordeConfig) -> None:
     if len(config.gammas) == 0:
         raise ValueError("Step 3 Horde must have at least one demon")
@@ -251,12 +257,16 @@ def _validate_horde_config(config: Step3HordeConfig) -> None:
     hidden_sizes = tuple(
         _require_positive_int("hidden_sizes", size) for size in config.hidden_sizes
     )
+    use_obgd = _require_bool("use_obgd", config.use_obgd)
+    use_layer_norm = _require_bool("use_layer_norm", config.use_layer_norm)
     object.__setattr__(config, "gammas", gammas)
     object.__setattr__(config, "lamdas", lamdas)
     object.__setattr__(config, "hidden_sizes", hidden_sizes)
     object.__setattr__(config, "step_size", step_size)
     object.__setattr__(config, "sparsity", sparsity)
     object.__setattr__(config, "obgd_kappa", obgd_kappa)
+    object.__setattr__(config, "use_obgd", use_obgd)
+    object.__setattr__(config, "use_layer_norm", use_layer_norm)
 
 
 def make_step3_normalizer(
