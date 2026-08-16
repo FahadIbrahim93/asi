@@ -365,27 +365,34 @@ def compute_running_mean(
     values: NDArray[np.float64] | list[float],
     window_size: int = 100,
 ) -> NDArray[np.float64]:
-    """Compute running mean of values.
+    """Compute the trailing (causal) running mean of values.
 
-    The output has the same length as the input: the first ``window_size - 1``
-    entries are padded with the first fully-windowed mean (they are not
-    partial-window means). If the input is shorter than ``window_size``, the
-    input is returned unchanged.
+    The output has the same length as the input. Position ``i`` holds the
+    mean of ``values[i - window_size + 1 : i + 1]`` -- the window ending at
+    and including step ``i`` -- so no returned value is ever computed from
+    observations that had not yet occurred at that step. The first
+    ``window_size - 1`` entries therefore have no complete trailing window
+    and are ``NaN`` (not yet computable; see the module docstring's
+    NaN-for-"not evaluated" convention), rather than being backdated with a
+    later window's mean. If the input is shorter than ``window_size``, no
+    window is ever complete and the input is returned unchanged.
 
     Args:
         values: Array of values
         window_size: Size of the moving average window
 
     Returns:
-        Array of running mean values (same length as input, padded at start)
+        Array of running mean values (same length as input), with ``NaN``
+        wherever a complete trailing window is not yet available.
     """
     values_arr = np.asarray(values)
     cumsum = np.cumsum(np.insert(values_arr, 0, 0))
     running_mean = (cumsum[window_size:] - cumsum[:-window_size]) / window_size
 
-    # Pad the beginning with the first computed mean
+    # The first `window_size - 1` steps have no complete trailing window yet;
+    # mark them NaN instead of backdating the first complete window's mean.
     if len(running_mean) > 0:
-        padding = np.full(window_size - 1, running_mean[0])
+        padding = np.full(window_size - 1, np.nan)
         return np.concatenate([padding, running_mean])
     return values_arr
 
@@ -394,10 +401,13 @@ def compute_tracking_error(
     metrics_history: list[dict[str, float]],
     window_size: int = 100,
 ) -> NDArray[np.float64]:
-    """Compute tracking error (running mean of squared error).
+    """Compute tracking error (trailing running mean of squared error).
 
     This is the key metric for evaluating continual learners:
-    how well can the learner track the non-stationary target?
+    how well can the learner track the non-stationary target? See
+    ``compute_running_mean`` for the causal windowing contract: the first
+    ``window_size - 1`` entries are ``NaN`` (no complete trailing window
+    yet), not a value borrowed from later time steps.
 
     Args:
         metrics_history: List of metric dictionaries from learning loop

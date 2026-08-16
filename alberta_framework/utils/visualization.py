@@ -153,9 +153,9 @@ def plot_learning_curves(
             ]
         )
 
-        # ``compute_running_mean`` preserves length by padding the leading
-        # positions with the first complete trailing-window mean. Do not plot
-        # those future-informed padding values at earlier time steps.
+        # ``compute_running_mean`` preserves length by marking the leading
+        # positions NaN until a full trailing window exists. Drop that prefix
+        # rather than plotting or feeding NaN into the CI statistics below.
         first_complete_window = (
             window_size - 1 if metric_array.shape[1] >= window_size else 0
         )
