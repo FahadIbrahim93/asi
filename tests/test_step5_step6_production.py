@@ -7,6 +7,7 @@ import chex
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 import pytest
 
 from alberta_framework.steps import (
@@ -134,6 +135,23 @@ def test_step5_config_accepts_finite_float32_boundary_and_domain_endpoints() -> 
         "average_reward_step_size": 0,
         "trace_decay": 1,
     }
+
+
+def test_step5_config_uses_direct_float32_narrowing_at_overflow_boundary() -> None:
+    overflow_midpoint = np.ldexp(
+        np.longdouble(2) - np.ldexp(np.longdouble(1), -24),
+        127,
+    )
+    largest_finite_input = np.nextafter(
+        overflow_midpoint,
+        np.longdouble("-inf"),
+    )
+
+    config = Step5AverageRewardTDConfig(step_size=largest_finite_input)
+    learner = make_step5_td_learner(config)
+
+    assert bool(np.isfinite(np.asarray(config.step_size, dtype=np.float32)))
+    assert learner.config.step_size == config.step_size
 
 
 @pytest.mark.parametrize(

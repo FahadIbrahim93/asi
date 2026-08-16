@@ -23,14 +23,13 @@ References:
 
 from __future__ import annotations
 
-import math
-import struct
 from dataclasses import asdict, dataclass
 from numbers import Real
 from typing import Any, cast
 
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 
 from alberta_framework.core.average_reward import (
     DifferentialTDArrayResult,
@@ -53,13 +52,13 @@ def _finite_float32_scalar(name: str, value: object) -> float:
     if isinstance(value, bool) or not isinstance(value, Real):
         raise ValueError(f"{name} must be a real scalar")
     try:
-        scalar = float(value)
-        narrowed = struct.unpack("!f", struct.pack("!f", scalar))[0]
-    except (OverflowError, TypeError, ValueError, struct.error):
+        with np.errstate(invalid="ignore", over="ignore"):
+            narrowed = np.asarray(value, dtype=np.float32)
+    except (FloatingPointError, OverflowError, TypeError, ValueError):
         raise ValueError(f"{name} must narrow to a finite float32") from None
-    if not math.isfinite(scalar) or not math.isfinite(narrowed):
+    if narrowed.shape != () or not bool(np.isfinite(narrowed)):
         raise ValueError(f"{name} must narrow to a finite float32")
-    return scalar
+    return float(narrowed)
 
 
 @dataclass(frozen=True)
