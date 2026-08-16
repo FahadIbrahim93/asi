@@ -693,6 +693,51 @@ class TestFeatureToSubtaskSpecs:
         for spec in specs:
             assert 0 <= spec.feature_index < OBS_DIM
 
+    def test_ranks_by_max_across_sources_not_sum(self) -> None:
+        """Pins the documented contract (issue #412): ranking is the maximum
+        absolute Q-weight across all base and option policies, i.e.
+        ``jnp.maximum(feature_importance, opt_importance)`` per feature — not
+        the sum of the two per-source maxima. A feature that is mid-weight in
+        both sources must not outrank a feature holding the single largest
+        weight anywhere.
+
+        Reproduction values from the issue: per-feature base max
+        ``[1.0, 0.6, 0.1]``, per-feature option max ``[0.0, 0.6, 0.1]``.
+        Documented (max) ranking is ``[0, 1, 2]``; the pre-fix summed
+        ranking was ``[1, 0, 2]``.
+        """
+        obs_dim = 3
+        config = PrototypeAgentConfig(oak=_oak_cfg(obs_dim=obs_dim, n_prim=N_PRIM))
+        agent = PrototypeAgent(config)
+        state = agent.init(jr.key(0))
+        oak_state = state.oak_state
+        stomp_state = oak_state.stomp_state
+
+        base_row = jnp.array([1.0, 0.6, 0.1], dtype=jnp.float32)
+        head_params = stomp_state.base_learner_state.head_params
+        new_head_params = head_params.replace(
+            weights=tuple(base_row[None, :] for _ in head_params.weights)
+        )
+        new_base_learner_state = stomp_state.base_learner_state.replace(
+            head_params=new_head_params
+        )
+
+        opt_row = jnp.array([0.0, 0.6, 0.1], dtype=jnp.float32)
+        new_option_policies = stomp_state.option_policies.replace(
+            q_weights=jnp.broadcast_to(opt_row, stomp_state.option_policies.q_weights.shape)
+        )
+
+        patched_oak_state = oak_state.replace(
+            stomp_state=stomp_state.replace(
+                base_learner_state=new_base_learner_state,
+                option_policies=new_option_policies,
+            )
+        )
+
+        specs = feature_to_subtask_specs(patched_oak_state, n_subtasks=3)
+
+        assert [s.feature_index for s in specs] == [0, 1, 2]
+
 
 # ---------------------------------------------------------------------------
 # Config serialization agent roundtrip
