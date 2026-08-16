@@ -366,6 +366,117 @@ def test_step2_configs_use_direct_float32_narrowing_without_double_rounding() ->
 
 
 @pytest.mark.parametrize(
+    ("config_type", "field"),
+    [
+        (Step2KernelConfig, "step_size"),
+        (Step2KernelConfig, "noise_std"),
+        (Step2StrictDigitReadoutConfig, "step_size"),
+        (Step2MemoryConfig, "update_rate"),
+        (Step2MemoryConfig, "novelty_threshold"),
+        (Step2MemoryConfig, "bandwidth"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("offset", "expected"),
+    [
+        (-Fraction(1, 2**61), 0.5),
+        (Fraction(0), 0.5),
+        (
+            Fraction(1, 2**61),
+            float(np.nextafter(np.float32(0.5), np.float32(1.0))),
+        ),
+    ],
+    ids=("below", "tie-to-even", "above"),
+)
+def test_step2_configs_round_fraction_midpoints_once(
+    config_type: type[Any],
+    field: str,
+    offset: Fraction,
+    expected: float,
+) -> None:
+    midpoint = Fraction(1, 2) + Fraction(1, 2**25)
+    config = config_type(**{field: midpoint + offset})
+    assert getattr(config, field) == expected
+
+
+@pytest.mark.parametrize(
+    ("config_type", "field"),
+    [
+        (Step2KernelConfig, "step_size"),
+        (Step2KernelConfig, "noise_std"),
+        (Step2StrictDigitReadoutConfig, "step_size"),
+        (Step2MemoryConfig, "novelty_threshold"),
+        (Step2MemoryConfig, "bandwidth"),
+    ],
+)
+def test_step2_configs_apply_exact_float32_overflow_midpoint(
+    config_type: type[Any],
+    field: str,
+) -> None:
+    float32_max = (2**24 - 1) * 2**104
+    overflow_midpoint = Fraction(float32_max + 2**103)
+
+    config = config_type(**{field: overflow_midpoint - 1})
+    assert getattr(config, field) == float(np.finfo(np.float32).max)
+    with pytest.raises(ValueError, match=field):
+        config_type(**{field: overflow_midpoint})
+
+
+@pytest.mark.parametrize(
+    ("config_type", "field", "allows_zero"),
+    [
+        (Step2KernelConfig, "step_size", True),
+        (Step2KernelConfig, "noise_std", True),
+        (Step2StrictDigitReadoutConfig, "step_size", True),
+        (Step2MemoryConfig, "update_rate", False),
+        (Step2MemoryConfig, "novelty_threshold", True),
+        (Step2MemoryConfig, "bandwidth", False),
+    ],
+)
+def test_step2_configs_apply_exact_subnormal_midpoint(
+    config_type: type[Any],
+    field: str,
+    allows_zero: bool,
+) -> None:
+    subnormal_midpoint = Fraction(1, 2**150)
+    if allows_zero:
+        config = config_type(**{field: subnormal_midpoint})
+        assert getattr(config, field) == 0.0
+    else:
+        with pytest.raises(ValueError, match=field):
+            config_type(**{field: subnormal_midpoint})
+
+    above = config_type(**{field: subnormal_midpoint + Fraction(1, 2**200)})
+    assert getattr(above, field) == float(
+        np.nextafter(np.float32(0.0), np.float32(1.0))
+    )
+
+
+@pytest.mark.parametrize(
+    ("config_type", "field", "allows_zero"),
+    [
+        (Step2KernelConfig, "step_size", True),
+        (Step2KernelConfig, "noise_std", True),
+        (Step2StrictDigitReadoutConfig, "step_size", True),
+        (Step2MemoryConfig, "update_rate", False),
+        (Step2MemoryConfig, "novelty_threshold", True),
+        (Step2MemoryConfig, "bandwidth", False),
+    ],
+)
+def test_step2_configs_preserve_signed_zero_domain_policy(
+    config_type: type[Any],
+    field: str,
+    allows_zero: bool,
+) -> None:
+    if allows_zero:
+        config = config_type(**{field: -0.0})
+        assert np.signbit(getattr(config, field))
+    else:
+        with pytest.raises(ValueError, match=field):
+            config_type(**{field: -0.0})
+
+
+@pytest.mark.parametrize(
     ("field", "value"),
     [
         ("n_heads", 0),
