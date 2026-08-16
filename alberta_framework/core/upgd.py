@@ -2076,7 +2076,12 @@ class UPGDLearner:
                         adaptive_simplex_gate * ce_loss
                         + (1.0 - adaptive_simplex_gate) * mse_loss
                     )
-                return loss, (logits_for_loss, hidden_for_loss)
+                # The gradient-budget scale shapes the differentiated objective only;
+                # the reported loss stays the unscaled prediction loss.
+                reported_loss = (
+                    mse_loss if self._readout_loss_mode == "two_timescale_simplex" else loss
+                )
+                return loss, (logits_for_loss, hidden_for_loss, reported_loss)
             preds = logits_for_loss
             sq = (preds - safe_targets) ** 2
             target_loss_weights = jnp.where(
@@ -2099,10 +2104,10 @@ class UPGDLearner:
                 ),
             )
             loss = 0.5 * jnp.sum(sq_masked) / denom
-            return loss, (logits_for_loss, hidden_for_loss)
+            return loss, (logits_for_loss, hidden_for_loss, loss)
 
         if not use_direct_mse_loss:
-            (loss_value, (logits, hidden_for_readout)), grads = jax.value_and_grad(
+            (_, (logits, hidden_for_readout, loss_value)), grads = jax.value_and_grad(
                 loss_and_aux_fn,
                 argnums=(0, 1, 2, 3),
                 has_aux=True,
@@ -2151,7 +2156,7 @@ class UPGDLearner:
                     ),
                 ),
             )
-            loss_value = slow_simplex_gradient_scale * 0.5 * jnp.sum(sq_masked) / denom
+            loss_value = 0.5 * jnp.sum(sq_masked) / denom
             logit_grads = jnp.where(
                 active_mask,
                 slow_simplex_gradient_scale
