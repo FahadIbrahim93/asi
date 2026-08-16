@@ -808,8 +808,9 @@ class ContinuousActorCriticAgent:
                 raise ValueError(f"{name} must be finite when set") from exc
             if not math.isfinite(narrowed):
                 raise ValueError(f"{name} must remain finite once narrowed to float32")
-            preserve_builtin = type(bound) is int or type(bound) is float
-            canonical_bounds[name] = float(bound) if preserve_builtin else narrowed
+            # Only an actual built-in float is already the binary64 payload JAX will
+            # narrow exactly; ints and other reals store the validated binary32 value.
+            canonical_bounds[name] = bound if type(bound) is float else narrowed
         low = canonical_bounds["action_low"]
         high = canonical_bounds["action_high"]
         if low is not None and high is not None and low > high:

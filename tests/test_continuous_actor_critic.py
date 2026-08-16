@@ -269,6 +269,34 @@ def test_continuous_actor_critic_rejects_bounds_that_only_spoof_float(field: str
         ContinuousActorCriticAgent(config)
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("action_low", (2**25 - 1) * 2**103 - 1),
+        ("action_high", -((2**25 - 1) * 2**103 - 1)),
+        ("action_low", 2**64 + 2**40 + 1),
+    ],
+)
+def test_continuous_actor_critic_stores_exact_float32_for_integer_bounds(
+    field: str, value: int
+) -> None:
+    """A built-in int must not be stored as float(value): that payload double-rounds in JAX."""
+    from alberta_framework._float32 import round_real_to_float32
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        agent = ContinuousActorCriticAgent(
+            ContinuousActorCriticConfig(action_dim=1, **{field: value})  # type: ignore[arg-type]
+        )
+        stored = getattr(agent.config, field)
+        assert type(stored) is float
+        assert stored == round_real_to_float32(value)
+        assert float(np.float32(stored)) == stored
+        state = agent.init(feature_dim=1, key=jr.key(3))
+        _state, action, _mean, _sigma = agent.start(state, jnp.array([1.0], dtype=jnp.float32))
+        assert bool(jnp.all(jnp.isfinite(action)))
+
+
 def test_continuous_actor_critic_canonicalizes_real_bounds_to_float() -> None:
     from fractions import Fraction
 
