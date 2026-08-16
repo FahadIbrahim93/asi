@@ -28,6 +28,7 @@ from alberta_framework.core.learners import (
 )
 from alberta_framework.core.types import LearnerState
 from alberta_framework.streams.base import ScanStream
+from alberta_framework.utils.statistics import common_final_window
 
 
 class ExperimentConfig(NamedTuple):
@@ -360,14 +361,16 @@ def get_final_performance(
 
         Raises:
         ValueError: If ``window`` is not positive, a metric array has no
-            time steps, or any metric sample is non-finite. ``window=0`` is
-            not "the last step": ``arr[:, -0:]`` is the full trace, so the
-            helper refuses rather than silently reporting a full-horizon mean.
+            time steps, any metric sample is non-finite, or ``window`` exceeds
+            the shortest trace while trace lengths differ between methods.
+            ``window=0`` is not "the last step": ``arr[:, -0:]`` is the full
+            trace, so the helper refuses rather than silently reporting a
+            full-horizon mean.
     """
     if window <= 0:
         raise ValueError(f"window must be positive (got {window})")
 
-    performance: dict[str, tuple[float, float]] = {}
+    metric_arrays: dict[str, NDArray[np.float64]] = {}
     for name, agg in results.items():
         arr = agg.metric_arrays[metric]
         if arr.shape[1] == 0:
@@ -376,7 +379,15 @@ def get_final_performance(
                 f"for {metric!r}"
             )
         _require_finite_metric_array(arr, metric)
-        final_window = min(window, arr.shape[1])
+        metric_arrays[name] = arr
+    if not metric_arrays:
+        return {}
+    final_window = common_final_window(
+        {name: arr.shape[1] for name, arr in metric_arrays.items()}, window, metric
+    )
+
+    performance: dict[str, tuple[float, float]] = {}
+    for name, arr in metric_arrays.items():
         final_means = np.mean(arr[:, -final_window:], axis=1)
         std = float(np.std(final_means, ddof=1)) if len(final_means) > 1 else 0.0
         performance[name] = (float(np.mean(final_means)), std)

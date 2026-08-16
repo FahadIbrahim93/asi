@@ -4,6 +4,7 @@ Provides functions for computing confidence intervals, significance tests,
 effect sizes, and multiple comparison corrections.
 """
 
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, NamedTuple
 
 import numpy as np
@@ -516,6 +517,33 @@ def holm_correction(
     return significant
 
 
+def common_final_window(step_counts: Mapping[str, int], window: int, metric: str) -> int:
+    """Return the number of final steps every method averages, or fail closed.
+
+    The documented ``min(window, n_steps)`` convention only holds when it
+    yields the same window for every method. When ``window`` exceeds the
+    shortest trace and the traces differ in length, a per-method minimum
+    would silently compare methods over different horizons.
+
+    Raises:
+        ValueError: If ``step_counts`` is empty or the per-method
+            ``min(window, n_steps)`` values disagree.
+    """
+    if not step_counts:
+        raise ValueError("at least one method is required to derive a final window")
+    final_windows = {min(window, n_steps) for n_steps in step_counts.values()}
+    if len(final_windows) != 1:
+        described = ", ".join(
+            f"{name}: {n_steps} steps" for name, n_steps in sorted(step_counts.items())
+        )
+        raise ValueError(
+            f"window={window} exceeds the shortest {metric!r} trace and the traces differ "
+            f"in length ({described}); every method must average the same number of "
+            "final steps"
+        )
+    return final_windows.pop()
+
+
 def pairwise_comparisons(
     results: "dict[str, AggregatedResults]",  # noqa: F821
     metric: str = "squared_error",
@@ -539,9 +567,10 @@ def pairwise_comparisons(
 
     Raises:
         ValueError: If ``window`` is not positive, a metric has no steps, seed identities are
-            duplicated, seeds do not match metric rows, or seeds differ between methods used
-            by a paired test. Paired rows are aligned by seed identity; Mann-Whitney samples
-            remain unpaired.
+            duplicated, seeds do not match metric rows, seeds differ between methods used
+            by a paired test, or ``window`` exceeds the shortest trace while trace lengths
+            differ between methods. Paired rows are aligned by seed identity; Mann-Whitney
+            samples remain unpaired.
     """
     from alberta_framework.utils.experiments import AggregatedResults
 
@@ -552,7 +581,7 @@ def pairwise_comparisons(
     n = len(names)
 
     # Extract final values for each method
-    final_values: dict[str, NDArray[np.float64]] = {}
+    metric_arrays: dict[str, NDArray[np.float64]] = {}
     seeds_by_name: dict[str, list[int]] = {}
     for name, agg in results.items():
         if not isinstance(agg, AggregatedResults):
@@ -570,12 +599,18 @@ def pairwise_comparisons(
                 f"AggregatedResults {name!r} must contain at least one metric step "
                 f"for {metric!r}"
             )
-        final_window = min(window, arr.shape[1])
-        final_values[name] = np.mean(arr[:, -final_window:], axis=1)
+        metric_arrays[name] = arr
         seeds_by_name[name] = agg.seeds
 
     if n < 2:
         return {}
+
+    final_window = common_final_window(
+        {name: arr.shape[1] for name, arr in metric_arrays.items()}, window, metric
+    )
+    final_values: dict[str, NDArray[np.float64]] = {
+        name: np.mean(arr[:, -final_window:], axis=1) for name, arr in metric_arrays.items()
+    }
 
     if test not in ("ttest", "mann_whitney", "wilcoxon"):
         raise ValueError(f"Unknown test: {test}")

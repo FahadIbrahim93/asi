@@ -233,6 +233,48 @@ def test_get_final_performance_rejects_empty_time_axis() -> None:
         get_final_performance({"empty": empty}, window=1)
 
 
+def test_get_final_performance_rejects_unequal_final_windows() -> None:
+    """Two methods must not be averaged over different numbers of final steps."""
+    short = AggregatedResults(
+        config_name="short",
+        seeds=[0, 1],
+        metric_arrays={"squared_error": np.full((2, 3), 2.0, dtype=np.float64)},
+        summary={},
+    )
+    long = AggregatedResults(
+        config_name="long",
+        seeds=[0, 1],
+        metric_arrays={"squared_error": np.full((2, 8), 2.0, dtype=np.float64)},
+        summary={},
+    )
+    with pytest.raises(
+        ValueError,
+        match=r"^window=5 exceeds the shortest 'squared_error' trace and the traces differ "
+        r"in length \(long: 8 steps, short: 3 steps\); every method must average the same "
+        r"number of final steps$",
+    ):
+        get_final_performance({"short": short, "long": long}, window=5)
+
+
+def test_get_final_performance_accepts_unequal_trace_lengths_when_window_fits() -> None:
+    short = AggregatedResults(
+        config_name="short",
+        seeds=[0, 1],
+        metric_arrays={"squared_error": np.asarray([[9.0, 1.0, 1.0], [9.0, 3.0, 3.0]])},
+        summary={},
+    )
+    long = AggregatedResults(
+        config_name="long",
+        seeds=[0, 1],
+        metric_arrays={
+            "squared_error": np.asarray([[9.0] * 6 + [1.0, 1.0], [9.0] * 6 + [3.0, 3.0]])
+        },
+        summary={},
+    )
+    performance = get_final_performance({"short": short, "long": long}, window=2)
+    assert performance["short"] == performance["long"] == (2.0, pytest.approx(np.sqrt(2.0)))
+
+
 def test_get_final_performance_window_longer_than_trace_uses_full_trace() -> None:
     """The documented min(window, n_steps) convention is unchanged for window > 0."""
     result = get_final_performance({"candidate": _two_seed_trace()}, window=100)

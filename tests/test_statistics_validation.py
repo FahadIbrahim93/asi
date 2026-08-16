@@ -852,3 +852,40 @@ class TestPairwiseComparisons:
         result = pairwise_comparisons({"a": a, "b": b}, test="mann_whitney", window=1)
 
         assert result[("a", "b")].statistic == pytest.approx(0.0)
+
+    @staticmethod
+    def _settled_trace(name: str, n_steps: int, transient: float) -> AggregatedResults:
+        """Three seeds that start at ``transient`` and settle at exactly 1.0 after step 9."""
+        arr = np.ones((3, n_steps), dtype=np.float64)
+        arr[:, : min(10, n_steps)] = transient
+        return AggregatedResults(
+            config_name=name,
+            seeds=[0, 1, 2],
+            metric_arrays={"squared_error": arr},
+            summary={},
+        )
+
+    @pytest.mark.parametrize("test", ["ttest", "wilcoxon", "mann_whitney"])
+    def test_unequal_final_windows_rejected(self, test: str) -> None:
+        """A window longer than the shortest trace must not silently shrink per method."""
+        short = self._settled_trace("short", n_steps=20, transient=5.0)
+        long = self._settled_trace("long", n_steps=400, transient=5.0)
+
+        with pytest.raises(
+            ValueError,
+            match=r"^window=100 exceeds the shortest 'squared_error' trace and the traces "
+            r"differ in length \(long: 400 steps, short: 20 steps\); every method must "
+            r"average the same number of final steps$",
+        ):
+            pairwise_comparisons({"short": short, "long": long}, test=test, window=100)
+
+    def test_unequal_trace_lengths_accepted_when_window_fits_every_trace(self) -> None:
+        short = self._settled_trace("short", n_steps=20, transient=5.0)
+        long = self._settled_trace("long", n_steps=400, transient=7.0)
+
+        result = pairwise_comparisons(
+            {"short": short, "long": long}, test="mann_whitney", window=10
+        )
+
+        assert result[("short", "long")].effect_size == pytest.approx(0.0)
+        assert not result[("short", "long")].significant
