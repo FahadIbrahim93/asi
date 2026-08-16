@@ -2,6 +2,7 @@
 
 import chex
 import jax.numpy as jnp
+import numpy as np
 import pytest
 
 from alberta_framework import (
@@ -691,3 +692,59 @@ class TestNormalizerScalarSpoofRejection:
         """A real (non-spoofed) int must remain accepted and coerced to float."""
         normalizer = StreamingBatchNormalizer(momentum=1)
         assert normalizer._momentum == 1.0
+
+
+class TestNormalizerFeatureDimValidation:
+    @pytest.mark.parametrize(
+        "normalizer",
+        [EMANormalizer(), WelfordNormalizer(), StreamingBatchNormalizer()],
+        ids=["ema", "welford", "streaming-batch"],
+    )
+    @pytest.mark.parametrize(
+        "feature_dim",
+        [
+            pytest.param(True, id="bool"),
+            pytest.param(np.bool_(True), id="numpy-bool"),
+            pytest.param(1.5, id="float"),
+            pytest.param(np.float32(4), id="numpy-float"),
+            pytest.param(0, id="zero"),
+            pytest.param(-1, id="negative"),
+            pytest.param(2**31, id="int32-overflow"),
+            pytest.param("4", id="string"),
+            pytest.param([4], id="list"),
+        ],
+    )
+    def test_init_rejects_invalid_feature_dim(self, normalizer, feature_dim: object) -> None:
+        with pytest.raises(ValueError, match="feature_dim"):
+            normalizer.init(feature_dim)  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize(
+        "integer_type",
+        [int, np.int32, np.longlong, np.ulonglong],
+        ids=["builtin", "numpy-int32", "numpy-longlong", "numpy-ulonglong"],
+    )
+    def test_init_accepts_and_canonicalizes_supported_integer_families(
+        self,
+        integer_type: type,
+    ) -> None:
+        for normalizer in (
+            EMANormalizer(),
+            WelfordNormalizer(),
+            StreamingBatchNormalizer(),
+        ):
+            state = normalizer.init(integer_type(4))
+            chex.assert_shape(state.mean, (4,))
+            chex.assert_shape(state.var, (4,))
+
+    def test_init_rejects_hostile_integer_subclasses(self) -> None:
+        class LyingInt(int):
+            def __index__(self) -> int:
+                return 4
+
+        for normalizer in (
+            EMANormalizer(),
+            WelfordNormalizer(),
+            StreamingBatchNormalizer(),
+        ):
+            with pytest.raises(ValueError, match="feature_dim"):
+                normalizer.init(LyingInt(-1))

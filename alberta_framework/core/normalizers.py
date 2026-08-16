@@ -21,10 +21,11 @@ Three normalizer variants are provided:
 
 import dataclasses
 import math
+import operator
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from numbers import Real
-from typing import Any, cast
+from typing import Any, SupportsIndex, cast
 
 import chex
 import jax
@@ -57,14 +58,7 @@ _FLOAT32_CONSECUTIVE_INTEGER_LIMIT = 2**24
 
 _ACTUAL_INT_TYPES: tuple[type, ...] = (
     int,
-    np.int8,
-    np.int16,
-    np.int32,
-    np.int64,
-    np.uint8,
-    np.uint16,
-    np.uint32,
-    np.uint64,
+    *(np.dtype(code).type for code in ("b", "B", "h", "H", "i", "I", "l", "L", "q", "Q")),
 )
 
 
@@ -77,7 +71,7 @@ def _require_int(
 ) -> int:
     if type(value) not in _ACTUAL_INT_TYPES:
         raise ValueError(f"{name} must be an integer, got {value!r}")
-    number = int(cast(int, value))
+    number = operator.index(cast(SupportsIndex, value))
     if minimum is not None and number < minimum:
         if minimum == 1:
             raise ValueError(f"{name} must be positive, got {value!r}")
