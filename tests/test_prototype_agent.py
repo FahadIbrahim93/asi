@@ -14,6 +14,7 @@ import numpy as np
 import pytest
 
 from alberta_framework.core.dreaming import DreamingConfig
+from alberta_framework.core.experiential_memory import ExperientialMemoryConfig
 from alberta_framework.core.intelligence_amplification import IAConfig
 from alberta_framework.core.oak import OaKConfig
 from alberta_framework.core.options import STOMPConfig, SubtaskSpec
@@ -23,7 +24,10 @@ from alberta_framework.core.prototype_agent import (
     PrototypeAgentConfig,
     PrototypeAgentState,
     PrototypeArrayResult,
+    PrototypeExperientialMemoryInput,
+    PrototypeTransition,
     PrototypeUpdateResult,
+    _increment_decision_id,
     feature_to_subtask_specs,
     load_prototype_checkpoint,
     save_prototype_checkpoint,
@@ -395,6 +399,75 @@ class TestPrototypeAgentUpdateFull:
         chex.assert_shape(result.ia_recommendation, ())
         assert int(result.state.buffer_state.size) == 1
         assert int(result.state.world_model_state.step_count) == 1
+
+
+def test_experiential_memory_uses_one_accounted_policy_step() -> None:
+    """Prototype proposal and write must share one recorded pre-state query."""
+    memory_config = ExperientialMemoryConfig(
+        capacity=3,
+        observation_dim=OBS_DIM,
+        key_dim=OBS_DIM,
+        action_dim=N_PRIM,
+        outcome_dim=OBS_DIM + 1,
+        top_k=1,
+        min_neighbors=1,
+    )
+    agent = PrototypeAgent(
+        PrototypeAgentConfig(
+            oak=_oak_cfg(),
+            experiential_memory=memory_config,
+        )
+    )
+    resources = agent.experiential_memory_resource_declaration
+    assert resources is not None
+    assert resources.categorical_policy_queries == 1
+    assert resources.causal_step_queries == 0
+    assert resources.total_deterministic_prestate_queries == 1
+
+    state = agent.start(agent.init(jr.key(31)), jnp.zeros(OBS_DIM, dtype=jnp.float32))
+    transition = PrototypeTransition(
+        observation=state.current_raw_observation,
+        action=state.current_action,
+        decision_id=state.current_decision_id,
+        reward=jnp.asarray(1.0, dtype=jnp.float32),
+        discount=jnp.asarray(1.0, dtype=jnp.float32),
+        terminated=jnp.asarray(False),
+        truncated=jnp.asarray(False),
+        next_observation=jnp.ones(OBS_DIM, dtype=jnp.float32),
+        next_decision_observation=jnp.ones(OBS_DIM, dtype=jnp.float32),
+    )
+    memory_input = PrototypeExperientialMemoryInput(
+        available=jnp.asarray(True),
+        current_prototype_decision_id=state.current_decision_id,
+        next_prototype_decision_id=_increment_decision_id(state.current_decision_id),
+        query_representation_version=jnp.asarray(0, dtype=jnp.int32),
+        entry_representation_version=jnp.asarray(0, dtype=jnp.int32),
+        query_uncertainty=jnp.asarray(0.0, dtype=jnp.float32),
+        query_uncertainty_available=jnp.asarray(True),
+        entry_uncertainty=jnp.asarray(0.0, dtype=jnp.float32),
+        entry_uncertainty_available=jnp.asarray(True),
+        safety_cost=jnp.asarray(0.0, dtype=jnp.float32),
+        safety_cost_available=jnp.asarray(True),
+        reliability=jnp.asarray(1.0, dtype=jnp.float32),
+        utility=jnp.asarray(1.0, dtype=jnp.float32),
+        utility_available=jnp.asarray(True),
+        provenance_id=jnp.asarray(1, dtype=jnp.int32),
+        source_id=jnp.asarray(1, dtype=jnp.int32),
+        next_action_safety_mask=jnp.ones(N_PRIM, dtype=jnp.bool_),
+    )
+
+    result = agent.update_transition(
+        state,
+        transition,
+        experiential_memory_input=memory_input,
+    )
+    diagnostics = result.experiential_memory_diagnostics
+    memory_state = agent._experiential_memory_component_state(result.state.ia_state)
+
+    assert bool(diagnostics.transaction_applied)
+    assert int(diagnostics.deterministic_prestate_query_count) == 1
+    assert int(memory_state.query_count) == 1
+    assert int(memory_state.write_count) == 1
 
 
 # ---------------------------------------------------------------------------
