@@ -69,9 +69,12 @@ _INVALID_STEP4_SCALARS: tuple[tuple[str, Any], ...] = (
     ("epsilon_decay_steps", False),
     ("epsilon_decay_steps", -1),
     ("epsilon_decay_steps", 1.5),
+    ("epsilon_decay_steps", 2**31),
     ("n_actions", True),
+    ("n_actions", 2**31),
     ("hidden_sizes", (0,)),
     ("hidden_sizes", (True,)),
+    ("hidden_sizes", (2**31,)),
 )
 
 
@@ -284,3 +287,18 @@ def test_step4_sarsa_scalars_canonicalize_nonbuiltin_reals() -> None:
     assert type(payload["epsilon_decay_steps"]) is int
     assert type(payload["hidden_sizes"][0]) is int
     assert agent.to_config()["type"] == "SARSAAgent"
+
+
+def test_step4_sarsa_dimensions_preserve_int32_maximum() -> None:
+    config = Step4SARSAConfig(
+        n_actions=np.int64(2**31 - 1),
+        epsilon_decay_steps=np.int64(2**31 - 1),
+        hidden_sizes=(np.int64(2**31 - 1),),
+    )
+
+    assert config.n_actions == 2**31 - 1
+    assert config.epsilon_decay_steps == 2**31 - 1
+    assert config.hidden_sizes == (2**31 - 1,)
+    assert type(config.n_actions) is int
+    assert type(config.epsilon_decay_steps) is int
+    assert type(config.hidden_sizes[0]) is int
