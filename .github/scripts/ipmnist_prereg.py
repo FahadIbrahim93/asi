@@ -68,6 +68,7 @@ class Protocol:
     summary_filename: str
     requires_amendment: bool
     prerequisite: str | None
+    prerequisite_artifact_condition: str | None
 
 
 PROTOCOLS: Final = {
@@ -81,6 +82,7 @@ PROTOCOLS: Final = {
         summary_filename="summary.json",
         requires_amendment=False,
         prerequisite=None,
+        prerequisite_artifact_condition=None,
     ),
     "issue184": Protocol(
         key="issue184",
@@ -92,6 +94,7 @@ PROTOCOLS: Final = {
         summary_filename="summary.json",
         requires_amendment=True,
         prerequisite="issue51",
+        prerequisite_artifact_condition="unexpired-90-day-github-actions-artifact",
     ),
     "issue188": Protocol(
         key="issue188",
@@ -103,6 +106,7 @@ PROTOCOLS: Final = {
         summary_filename="summary_resid_gate_ablation_r3.json",
         requires_amendment=True,
         prerequisite=None,
+        prerequisite_artifact_condition=None,
     ),
 }
 
@@ -142,11 +146,17 @@ def _launch_binding(
     ):
         raise ValueError("ref_name must be a non-empty tag name without whitespace")
     seeds = ",".join(str(seed) for seed in protocol.seeds)
+    prerequisite_artifact = (
+        f" prerequisite_artifact={protocol.prerequisite_artifact_condition}"
+        if protocol.prerequisite_artifact_condition is not None
+        else ""
+    )
     return (
         f"issue={protocol.issue} protocol={protocol.key} "
         f"source={source} tree={tree} uv_lock_sha256={uv_lock_sha256} "
         f"workflow_blob_sha1={workflow_blob_sha1} driver_blob_sha1={driver_blob_sha1} "
-        f"ref={ref_name} runner={RUNNER_IDENTITY} seeds={seeds} n={len(protocol.seeds)}"
+        f"ref={ref_name} runner={RUNNER_IDENTITY}{prerequisite_artifact} "
+        f"seeds={seeds} n={len(protocol.seeds)}"
     )
 
 
@@ -392,7 +402,7 @@ def _workflow_runs(repository: str, *, source: str, token: str) -> list[dict[str
     raise RuntimeError("GitHub Actions run search did not complete within the 1,000-result cap")
 
 
-def verify_launch_authorization(
+def verify_owner_authorization(
     *,
     protocol_key: str,
     repository: str,
@@ -405,7 +415,6 @@ def verify_launch_authorization(
     run_id: int,
     run_attempt: int,
     token: str,
-    root: Path | None = None,
 ) -> dict[str, Any]:
     if repository != AUTHORIZED_REPOSITORY:
         raise RuntimeError(f"repository must be exactly {AUTHORIZED_REPOSITORY}")
@@ -415,17 +424,6 @@ def verify_launch_authorization(
         raise RuntimeError("rerun attempts are forbidden; dispatch a new reviewed source instead")
     protocol = protocol_for(protocol_key)
     source = _lower_hex(source, 40, name="source")
-    prerequisite = (
-        _verify_prerequisite_completion(
-            protocol,
-            repository=repository,
-            launch_source=source,
-            root=root,
-            token=token,
-        )
-        if protocol.prerequisite is not None
-        else None
-    )
     expected_line = authorization_line(
         protocol,
         source=source,
@@ -540,15 +538,8 @@ def verify_launch_authorization(
             raise RuntimeError(
                 "registration amendment must be durable before final authorization"
             )
-        if (
-            prerequisite is not None
-            and _parse_utc(prerequisite["issue_closed_at"]) >= amendment_time
-        ):
-            raise RuntimeError(
-                "prerequisite issue must be closed before the registration amendment"
-            )
     return {
-        "schema": "asi.ipmnist_prereg.launch_preflight.v2",
+        "schema": "asi.ipmnist_prereg.owner_authorization.v1",
         "protocol": asdict(protocol),
         "source": source,
         "tree": tree,
@@ -576,6 +567,73 @@ def verify_launch_authorization(
             if expected_amendment is not None
             else None
         ),
+    }
+
+
+def verify_launch_authorization(
+    *,
+    protocol_key: str,
+    repository: str,
+    source: str,
+    tree: str,
+    uv_lock_sha256: str,
+    workflow_blob_sha1: str,
+    driver_blob_sha1: str,
+    ref_name: str,
+    run_id: int,
+    run_attempt: int,
+    token: str,
+    root: Path | None = None,
+    owner_authorization: Path | None = None,
+) -> dict[str, Any]:
+    """Recheck the early owner gate, then reconstruct dependency-backed prerequisites."""
+
+    owner = verify_owner_authorization(
+        protocol_key=protocol_key,
+        repository=repository,
+        source=source,
+        tree=tree,
+        uv_lock_sha256=uv_lock_sha256,
+        workflow_blob_sha1=workflow_blob_sha1,
+        driver_blob_sha1=driver_blob_sha1,
+        ref_name=ref_name,
+        run_id=run_id,
+        run_attempt=run_attempt,
+        token=token,
+    )
+    owner_receipt_sha256: str | None = None
+    if owner_authorization is not None:
+        stored_owner, stored_owner_raw = _strict_json_bytes(owner_authorization)
+        if _canonical_json(stored_owner) != _canonical_json(owner):
+            raise RuntimeError(
+                "early owner authorization receipt differs from the synchronized recheck"
+            )
+        owner_receipt_sha256 = hashlib.sha256(stored_owner_raw).hexdigest()
+    protocol = protocol_for(protocol_key)
+    prerequisite = (
+        _verify_prerequisite_completion(
+            protocol,
+            repository=repository,
+            launch_source=cast(str, owner["source"]),
+            root=root,
+            token=token,
+        )
+        if protocol.prerequisite is not None
+        else None
+    )
+    amendment_created_at = owner["registration_amendment_created_at"]
+    if prerequisite is not None:
+        if not isinstance(amendment_created_at, str):
+            raise RuntimeError("prerequisite protocol requires a registration amendment")
+        if _parse_utc(prerequisite["issue_closed_at"]) >= _parse_utc(amendment_created_at):
+            raise RuntimeError(
+                "prerequisite issue must be closed before the registration amendment"
+            )
+    return {
+        **owner,
+        "schema": "asi.ipmnist_prereg.launch_preflight.v3",
+        "early_owner_authorization_schema": owner["schema"],
+        "early_owner_authorization_sha256": owner_receipt_sha256,
         "prerequisite_completion": prerequisite,
     }
 
@@ -998,7 +1056,7 @@ def seal_completion_bundle(
     launch = _strict_json(launch_preflight)
     result = _strict_json(result_validation)
     runner, runner_raw = _strict_json_bytes(runner_receipt)
-    if launch.get("schema") != "asi.ipmnist_prereg.launch_preflight.v2":
+    if launch.get("schema") != "asi.ipmnist_prereg.launch_preflight.v3":
         raise ValueError("launch preflight has the wrong schema")
     if result.get("schema") != "asi.ipmnist_prereg.result_validation.v1":
         raise ValueError("result validation has the wrong schema")
@@ -1070,6 +1128,8 @@ def _verify_prerequisite_run_artifact(
     artifact_id = artifact.get("id")
     expected_name = f"ipmnist-{protocol.key}-{source}-{run_id}"
     workflow_run = artifact.get("workflow_run")
+    created_at = artifact.get("created_at")
+    expires_at = artifact.get("expires_at")
     if (
         type(artifact_id) is not int
         or artifact_id <= 0
@@ -1078,8 +1138,14 @@ def _verify_prerequisite_run_artifact(
         or not isinstance(workflow_run, dict)
         or workflow_run.get("id") != run_id
         or workflow_run.get("head_sha") != source
+        or not isinstance(created_at, str)
+        or not isinstance(expires_at, str)
     ):
         raise RuntimeError("prerequisite workflow result artifact is not canonical")
+    if _parse_utc(expires_at) - _parse_utc(created_at) != dt.timedelta(days=90):
+        raise RuntimeError(
+            "prerequisite workflow artifact must have the registered 90-day availability window"
+        )
     archive = _github_bytes(
         f"/repos/{repository}/actions/artifacts/{artifact_id}/zip",
         token=token,
@@ -1117,6 +1183,9 @@ def _verify_prerequisite_run_artifact(
     return {
         "artifact_id": artifact_id,
         "artifact_name": expected_name,
+        "artifact_created_at": created_at,
+        "artifact_expires_at": expires_at,
+        "artifact_retention_days": 90,
         "artifact_archive_sha256": hashlib.sha256(archive).hexdigest(),
     }
 
@@ -1292,6 +1361,29 @@ def _preflight_command(args: argparse.Namespace) -> int:
         run_attempt=args.run_attempt,
         token=token,
         root=args.root,
+        owner_authorization=args.owner_authorization,
+    )
+    _write_json(args.output, payload)
+    print(json.dumps(payload, allow_nan=False, sort_keys=True))
+    return 0
+
+
+def _authorize_command(args: argparse.Namespace) -> int:
+    token = os.environ.get("GITHUB_TOKEN")
+    if not token:
+        raise RuntimeError("GITHUB_TOKEN is required")
+    payload = verify_owner_authorization(
+        protocol_key=args.protocol,
+        repository=args.repository,
+        source=args.source,
+        tree=args.tree,
+        uv_lock_sha256=args.uv_lock_sha256,
+        workflow_blob_sha1=args.workflow_blob_sha1,
+        driver_blob_sha1=args.driver_blob_sha1,
+        ref_name=args.ref_name,
+        run_id=args.run_id,
+        run_attempt=args.run_attempt,
+        token=token,
     )
     _write_json(args.output, payload)
     print(json.dumps(payload, allow_nan=False, sort_keys=True))
@@ -1327,19 +1419,26 @@ def _seal_command(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
+    def add_launch_arguments(command: argparse.ArgumentParser) -> None:
+        command.add_argument("--protocol", choices=sorted(PROTOCOLS), required=True)
+        command.add_argument("--repository", required=True)
+        command.add_argument("--source", required=True)
+        command.add_argument("--tree", required=True)
+        command.add_argument("--uv-lock-sha256", required=True)
+        command.add_argument("--workflow-blob-sha1", required=True)
+        command.add_argument("--driver-blob-sha1", required=True)
+        command.add_argument("--ref-name", required=True)
+        command.add_argument("--run-id", type=int, required=True)
+        command.add_argument("--run-attempt", type=int, required=True)
+        command.add_argument("--output", type=Path, required=True)
+
+    authorize = subparsers.add_parser("authorize")
+    add_launch_arguments(authorize)
+    authorize.set_defaults(handler=_authorize_command)
     preflight = subparsers.add_parser("preflight")
-    preflight.add_argument("--protocol", choices=sorted(PROTOCOLS), required=True)
-    preflight.add_argument("--repository", required=True)
-    preflight.add_argument("--source", required=True)
-    preflight.add_argument("--tree", required=True)
-    preflight.add_argument("--uv-lock-sha256", required=True)
-    preflight.add_argument("--workflow-blob-sha1", required=True)
-    preflight.add_argument("--driver-blob-sha1", required=True)
-    preflight.add_argument("--ref-name", required=True)
-    preflight.add_argument("--run-id", type=int, required=True)
-    preflight.add_argument("--run-attempt", type=int, required=True)
+    add_launch_arguments(preflight)
     preflight.add_argument("--root", type=Path, required=True)
-    preflight.add_argument("--output", type=Path, required=True)
+    preflight.add_argument("--owner-authorization", type=Path, required=True)
     preflight.set_defaults(handler=_preflight_command)
 
     validate = subparsers.add_parser("validate")

@@ -66,13 +66,6 @@ jobs:
           persist-credentials: false
           ref: ${{ inputs.launch_sha }}
 
-      - name: Set up exact uv 0.9.24
-        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e
-        with:
-          version: 0.9.24
-          enable-cache: true
-          cache-dependency-glob: uv.lock
-
       - name: Bind source, tag, workflow, and lock identities
         id: identity
         shell: bash
@@ -117,6 +110,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Refuse occupied output namespaces
+        id: protocol
         shell: bash
         env:
           PROTOCOL: ${{ inputs.protocol }}
@@ -139,6 +133,39 @@ jobs:
             echo "append-only namespace is already occupied: $target" >&2
             exit 1
           fi
+          echo "output_root=$target" >> "$GITHUB_OUTPUT"
+
+      - name: Require exact owner authorization and sole dispatch before setup
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PROTOCOL: ${{ inputs.protocol }}
+          SOURCE: ${{ inputs.launch_sha }}
+          TREE: ${{ steps.identity.outputs.tree }}
+          UV_LOCK_SHA256: ${{ steps.identity.outputs.uv_lock_sha256 }}
+          WORKFLOW_BLOB_SHA1: ${{ steps.identity.outputs.workflow_blob_sha1 }}
+          DRIVER_BLOB_SHA1: ${{ steps.identity.outputs.driver_blob_sha1 }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/ipmnist_prereg.py authorize \
+            --protocol "$PROTOCOL" \
+            --repository "$GITHUB_REPOSITORY" \
+            --source "$SOURCE" \
+            --tree "$TREE" \
+            --uv-lock-sha256 "$UV_LOCK_SHA256" \
+            --workflow-blob-sha1 "$WORKFLOW_BLOB_SHA1" \
+            --driver-blob-sha1 "$DRIVER_BLOB_SHA1" \
+            --ref-name "$GITHUB_REF_NAME" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --output "$RUNNER_TEMP/prereg-metadata/owner-authorization.json"
+
+      - name: Set up exact uv 0.9.24
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e
+        with:
+          version: 0.9.24
+          enable-cache: true
+          cache-dependency-glob: uv.lock
 
       - name: Install exact uv-managed CPython 3.12.12
         id: python
@@ -297,7 +324,7 @@ jobs:
               stream.write(encoded)
           PY
 
-      - name: Require one pre-data project-owner authorization and one dispatch
+      - name: Recheck authorization and reconstruct prerequisites after sync
         shell: bash
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -322,6 +349,8 @@ jobs:
             --run-id "$GITHUB_RUN_ID" \
             --run-attempt "$GITHUB_RUN_ATTEMPT" \
             --root "$GITHUB_WORKSPACE" \
+            --owner-authorization \
+              "$RUNNER_TEMP/prereg-metadata/owner-authorization.json" \
             --output "$metadata"
 
       - name: Run code-only preregistration preflight tests
@@ -481,9 +510,7 @@ jobs:
         with:
           name: ipmnist-${{ inputs.protocol }}-${{ inputs.launch_sha }}-${{ github.run_id }}
           path: |
-            outputs/ipmnist_screening/replication_r1
-            outputs/ipmnist_screening/rls_preset_ablation_r1
-            outputs/ipmnist_screening/gate_ablation_r3
+            ${{ steps.protocol.outputs.output_root }}
             ${{ runner.temp }}/prereg-metadata
           if-no-files-found: warn
           retention-days: 90
