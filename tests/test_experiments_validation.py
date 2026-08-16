@@ -389,6 +389,55 @@ def test_extract_hyperparameter_results_keeps_injective_extractors() -> None:
     assert extracted == {0.01: (1.0, 0.0), 0.1: (3.0, 0.0)}
 
 
+@pytest.mark.parametrize(
+    "coordinate",
+    [
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+        complex(float("nan"), 0.0),
+        ("nested", float("nan")),
+    ],
+)
+def test_extract_hyperparameter_results_rejects_nonfinite_coordinates(
+    coordinate: object,
+) -> None:
+    results = {"lr_0.01": _flat_trace("lr_0.01", 1.0)}
+    with pytest.raises(
+        ValueError,
+        match=r"^param_extractor returned a noncanonical coordinate for "
+        r"configuration 'lr_0\.01'",
+    ):
+        extract_hyperparameter_results(results, param_extractor=lambda _: coordinate)
+
+
+@pytest.mark.parametrize("coordinate", [[], {}, np.asarray([0.01])])
+def test_extract_hyperparameter_results_rejects_unhashable_coordinates(
+    coordinate: object,
+) -> None:
+    results = {"lr_0.01": _flat_trace("lr_0.01", 1.0)}
+    with pytest.raises(
+        ValueError,
+        match=r"^param_extractor returned a noncanonical coordinate for "
+        r"configuration 'lr_0\.01'",
+    ):
+        extract_hyperparameter_results(results, param_extractor=lambda _: coordinate)
+
+
+def test_extract_hyperparameter_results_keeps_canonical_categorical_coordinates() -> None:
+    results = {
+        "sgd": _flat_trace("sgd", 1.0),
+        "adam": _flat_trace("adam", 3.0),
+    }
+    extracted = extract_hyperparameter_results(
+        results, param_extractor=lambda name: ("optimizer", name)
+    )
+    assert extracted == {
+        ("optimizer", "sgd"): (1.0, 0.0),
+        ("optimizer", "adam"): (3.0, 0.0),
+    }
+
+
 def test_get_metric_timeseries_rejects_nonfinite_samples() -> None:
     poisoned = _two_seed_trace()
     poisoned.metric_arrays["squared_error"][0, 1] = np.inf

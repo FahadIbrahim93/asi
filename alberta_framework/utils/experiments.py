@@ -14,8 +14,10 @@ Two conventions matter for downstream analysis:
   :func:`aggregate_metrics`.
 """
 
-from collections.abc import Callable, Sequence
-from typing import Any, NamedTuple, cast
+import math
+from collections.abc import Callable, Iterable, Sequence
+from numbers import Complex, Number
+from typing import Any, NamedTuple, NoReturn, cast
 
 import jax.random as jr
 import numpy as np
@@ -421,9 +423,10 @@ def extract_hyperparameter_results(
         Dictionary mapping param value to (mean, std) tuple
 
     Raises:
-        ValueError: If ``param_extractor`` maps more than one configuration to
-            the same value; a sensitivity curve built from a silently
-            truncated, insertion-order-dependent subset is not a measurement.
+        ValueError: If ``param_extractor`` returns a noncanonical dictionary
+            coordinate or maps more than one configuration to the same value;
+            a sensitivity curve built from a silently truncated,
+            insertion-order-dependent subset is not a measurement.
     """
     performance = get_final_performance(results, metric)
 
@@ -432,7 +435,8 @@ def extract_hyperparameter_results(
 
     names_by_value: dict[Any, list[str]] = {}
     for name in performance:
-        names_by_value.setdefault(param_extractor(name), []).append(name)
+        coordinate = _require_hyperparameter_coordinate(param_extractor(name), name=name)
+        names_by_value.setdefault(coordinate, []).append(name)
     collisions = {value: names for value, names in names_by_value.items() if len(names) > 1}
     if collisions:
         described = "; ".join(f"{value!r} <- {names}" for value, names in collisions.items())
@@ -440,3 +444,48 @@ def extract_hyperparameter_results(
             f"param_extractor maps several configurations to one value: {described}"
         )
     return {value: performance[names[0]] for value, names in names_by_value.items()}
+
+
+def _require_hyperparameter_coordinate(value: object, *, name: str) -> Any:
+    """Require one stable dictionary coordinate without narrowing valid key types."""
+
+    def reject() -> NoReturn:
+        raise ValueError(
+            "param_extractor returned a noncanonical coordinate for "
+            f"configuration {name!r}; coordinates must be hashable, reflexive, "
+            "and finite when numeric"
+        )
+
+    value_type = type(value)
+    if issubclass(value_type, (tuple, frozenset)):
+        try:
+            for component in cast(Iterable[object], value):
+                _require_hyperparameter_coordinate(component, name=name)
+        except Exception:
+            reject()
+
+    if issubclass(value_type, Complex):
+        try:
+            number = complex(cast(Complex, value))
+        except Exception:
+            reject()
+        if not math.isfinite(number.real) or not math.isfinite(number.imag):
+            reject()
+    elif issubclass(value_type, Number):
+        try:
+            number_real = float(cast(Any, value))
+        except Exception:
+            reject()
+        if not math.isfinite(number_real):
+            reject()
+
+    try:
+        first_hash = hash(value)
+        if hash(value) != first_hash:
+            reject()
+        reflexive = value == value
+        if type(reflexive) not in (bool, np.bool_) or not bool(reflexive):
+            reject()
+    except Exception:
+        reject()
+    return value
