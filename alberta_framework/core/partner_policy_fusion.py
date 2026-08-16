@@ -312,26 +312,27 @@ class PartnerPolicyFusionConfig:
             raise ValueError("blend_net_value_threshold must be below accept threshold")
 
         feature_width = self.model_feature_dim
+        partners = self.max_partners
+        persistent_f32 = partners * feature_width + feature_width + 1
+        persistent_i32 = 2 * partners + 9
+        decision_f32 = self.context_dim + 2 + 2 * partners
+        decision_i32 = 6 + 9 * partners
+        decision_bool = self.n_actions + 1 + partners
         derived_resources = {
-            "reliability_weight_scalars": self.max_partners * feature_width,
-            "persistent_state_scalars": (
-                self.max_partners * feature_width
-                + feature_width
-                + 1
-                + 2 * self.max_partners
-                + 9
-                + 2
-            ),
-            "persistent_state_bytes": 4
-            * (
-                self.max_partners * feature_width
-                + feature_width
-                + 1
-                + 2 * self.max_partners
-                + 9
-            )
-            + 2,
-            "pairwise_comparisons": self.max_partners * self.max_partners,
+            "model_feature_dim": feature_width,
+            "reliability_weight_scalars": partners * feature_width,
+            "reliability_weight_nbytes": 4 * partners * feature_width,
+            "persistent_state_scalars": persistent_f32 + persistent_i32 + 2,
+            "persistent_state_nbytes": 4 * (persistent_f32 + persistent_i32) + 2,
+            "partner_message_scalars": 12 * partners,
+            "partner_message_nbytes": 45 * partners,
+            "pairwise_comparisons": partners * partners,
+            "context_input_nbytes": 4 * self.context_dim,
+            "action_mask_nbytes": self.n_actions,
+            "decision_input_float32_scalars": decision_f32,
+            "decision_input_int32_scalars": decision_i32,
+            "decision_input_bool_scalars": decision_bool,
+            "decision_input_nbytes": 4 * (decision_f32 + decision_i32) + decision_bool,
         }
         for name, value in derived_resources.items():
             if value > _INT32_MAX:

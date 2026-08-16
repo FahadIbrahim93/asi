@@ -237,6 +237,7 @@ class BehaviorModelConfig:
             "n_actions",
             _require_int32("n_actions", self.n_actions, minimum=1),
         )
+        _resource_counts(self.n_actions, 1)
         step_size = _validated_config_float("step_size", self.step_size, lower=0.0)
         temperature = _validated_config_float("temperature", self.temperature, positive=True)
         l2_penalty = _validated_config_float("l2_penalty", self.l2_penalty, lower=0.0)
