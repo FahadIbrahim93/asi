@@ -326,6 +326,7 @@ def make_step1_stream(
         return XDistShiftStream(
             feature_dim=config.feature_dim,
             num_relevant=config.num_relevant,
+            noise_std=config.noise_std,
             noise_in_target=config.noise_std > 0.0,
         )
     msg = f"unknown Step 1 stream {config.stream!r}"
