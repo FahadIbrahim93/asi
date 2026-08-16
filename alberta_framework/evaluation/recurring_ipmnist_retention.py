@@ -637,6 +637,15 @@ def _validate_sentinel_snapshots(
         )
         if prior_state != snapshot.learner_state_sha256_before:
             raise ValueError("all sentinel probes at one checkpoint must use one frozen state")
+    states_by_digest: dict[str, list[int]] = {}
+    for checkpoint_step, digest in checkpoint_states.items():
+        states_by_digest.setdefault(digest, []).append(checkpoint_step)
+    for shared_steps in states_by_digest.values():
+        if len(shared_steps) > 1:
+            raise ValueError(
+                "sentinel probes at different checkpoints must use distinct frozen states; "
+                f"checkpoint steps {sorted(shared_steps)} all declare one learner state"
+            )
     return resolved
 
 

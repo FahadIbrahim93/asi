@@ -243,6 +243,44 @@ def test_missing_reordered_or_malformed_sentinel_snapshots_fail_closed() -> None
         dataclasses.replace(snapshots[0], learner_state_sha256_after=_sha("f"))
 
 
+def test_sentinel_probes_at_one_checkpoint_must_share_one_frozen_state() -> None:
+    protocol = _protocol()
+    snapshots = _snapshots(protocol, retaining=True)
+    drifted = dataclasses.replace(
+        snapshots[2], learner_state_sha256_before=_sha("9"), learner_state_sha256_after=_sha("9")
+    )
+    with pytest.raises(ValueError, match="one frozen state"):
+        build_recurring_ipmnist_retention_report(
+            protocol=protocol,
+            trace=_trace(retaining=True),
+            sentinel_snapshots=(*snapshots[:2], drifted, *snapshots[3:]),
+        )
+
+
+def test_sentinel_probes_at_different_checkpoints_must_use_distinct_frozen_states() -> None:
+    """Re-scoring one learner state at every boundary would report zero forgetting."""
+    protocol = _protocol()
+    one_state = _sha("7")
+    snapshots = tuple(
+        dataclasses.replace(
+            snapshot,
+            learner_state_sha256_before=one_state,
+            learner_state_sha256_after=one_state,
+        )
+        for snapshot in _snapshots(protocol, retaining=True)
+    )
+    with pytest.raises(
+        ValueError,
+        match=r"^sentinel probes at different checkpoints must use distinct frozen states; "
+        r"checkpoint steps \[4, 8, 12\] all declare one learner state$",
+    ):
+        build_recurring_ipmnist_retention_report(
+            protocol=protocol,
+            trace=_trace(retaining=True),
+            sentinel_snapshots=snapshots,
+        )
+
+
 def test_report_is_explicitly_threshold_free_development_only_and_nonpromoting() -> None:
     protocol = _protocol()
     report = build_recurring_ipmnist_retention_report(
