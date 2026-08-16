@@ -33,7 +33,6 @@ References:
 from __future__ import annotations
 
 import dataclasses
-import math
 import operator
 from collections.abc import Mapping
 from typing import Any, SupportsIndex, cast
@@ -46,6 +45,7 @@ import numpy as np
 from jax import Array
 from jaxtyping import Bool, Float, Int, UInt
 
+from alberta_framework.core._float32_scalars import validated_float32_scalar
 from alberta_framework.core.normalizers import (
     _checked_lifetime_words_increment,
     _lifetime_counter_valid,
@@ -62,6 +62,7 @@ from alberta_framework.core.options import (
     SubtaskSpec,
     _checked_lifetime_words_advance,
     _lifetime_words_at_least,
+    _stomp_direct_array_scalars,
     load_stomp_state_with_migration,
     measure_stomp_state_nbytes,
     replace_dispatched_primitive_action,
@@ -161,10 +162,25 @@ class OaKConfig:
         )
         object.__setattr__(self, "min_steps_before_curation", min_steps)
 
-        if not math.isfinite(self.utility_ema_decay) or not 0.0 <= self.utility_ema_decay <= 1.0:
-            raise ValueError("utility_ema_decay must be finite and in [0, 1]")
-        if not math.isfinite(self.curation_threshold) or self.curation_threshold < 0.0:
-            raise ValueError("curation_threshold must be finite and non-negative")
+        if type(self.stomp) is not STOMPConfig:
+            raise ValueError("stomp must be an actual STOMPConfig")
+        object.__setattr__(
+            self,
+            "utility_ema_decay",
+            validated_float32_scalar(
+                "utility_ema_decay", self.utility_ema_decay, lower=0.0, upper=1.0
+            ),
+        )
+        object.__setattr__(
+            self,
+            "curation_threshold",
+            validated_float32_scalar(
+                "curation_threshold", self.curation_threshold, lower=0.0
+            ),
+        )
+        combined_scalars = _stomp_direct_array_scalars(self.stomp) + 3 * self.n_options + 3
+        if combined_scalars > _INT32_MAX or 4 * combined_scalars > _INT32_MAX:
+            raise ValueError("derived OaK direct array bytes must fit signed int32")
 
     @property
     def n_options(self) -> int:
@@ -191,9 +207,24 @@ class OaKConfig:
     @classmethod
     def from_config(cls, payload: dict[str, Any]) -> OaKConfig:
         """Reconstruct from :meth:`to_config` output."""
+        if type(payload) is not dict:
+            raise ValueError("OaK config must be an actual dict")
         data = dict(payload)
-        data.pop("type", None)
+        if data.pop("type", None) != "OaKConfig":
+            raise ValueError("OaK config type is invalid")
+        expected = {field.name for field in dataclasses.fields(cls)}
+        if set(data) not in (expected, expected - {"min_steps_before_curation"}):
+            raise ValueError("OaK config fields do not match its schema")
         stomp_raw = data.pop("stomp")
+        if type(stomp_raw) is not dict:
+            raise ValueError("serialized stomp config must be an actual dict")
+        if "min_steps_before_curation" in data and type(
+            data["min_steps_before_curation"]
+        ) is not int:
+            raise ValueError("serialized min_steps_before_curation must be a JSON integer")
+        for name in ("utility_ema_decay", "curation_threshold"):
+            if type(data[name]) is not float:
+                raise ValueError(f"serialized {name} must be a JSON number")
         stomp = STOMPConfig.from_config(stomp_raw)
         return cls(stomp=stomp, **data)
 
@@ -886,14 +917,26 @@ class KeyboardChordLearnerConfig:
         n_options = _require_int32("n_options", self.n_options, minimum=1)
         object.__setattr__(self, "n_options", n_options)
 
-        if not math.isfinite(self.step_size) or self.step_size < 0.0:
-            raise ValueError("step_size must be finite and non-negative")
-        if not math.isfinite(self.baseline_decay) or not 0.0 <= self.baseline_decay < 1.0:
-            raise ValueError("baseline_decay must be finite and in [0, 1)")
-        if not math.isfinite(self.l2_penalty) or self.l2_penalty < 0.0:
-            raise ValueError("l2_penalty must be finite and non-negative")
-        if not math.isfinite(self.max_norm) or self.max_norm <= 0.0:
-            raise ValueError("max_norm must be finite and positive")
+        object.__setattr__(
+            self, "step_size", validated_float32_scalar("step_size", self.step_size, lower=0.0)
+        )
+        object.__setattr__(
+            self,
+            "baseline_decay",
+            validated_float32_scalar(
+                "baseline_decay", self.baseline_decay, lower=0.0, upper=1.0, upper_inclusive=False
+            ),
+        )
+        object.__setattr__(
+            self,
+            "l2_penalty",
+            validated_float32_scalar("l2_penalty", self.l2_penalty, lower=0.0),
+        )
+        object.__setattr__(
+            self, "max_norm", validated_float32_scalar("max_norm", self.max_norm, positive=True)
+        )
+        if 4 * (self.n_options + 2) > _INT32_MAX:
+            raise ValueError("derived keyboard state bytes must fit signed int32")
 
     def to_config(self) -> dict[str, Any]:
         """Serialize to a JSON-compatible dictionary."""
@@ -904,8 +947,18 @@ class KeyboardChordLearnerConfig:
     @classmethod
     def from_config(cls, payload: dict[str, Any]) -> KeyboardChordLearnerConfig:
         """Reconstruct from :meth:`to_config` output."""
+        if type(payload) is not dict:
+            raise ValueError("keyboard chord config must be an actual dict")
         data = dict(payload)
-        data.pop("type", None)
+        if data.pop("type", None) != "KeyboardChordLearnerConfig":
+            raise ValueError("keyboard chord config type is invalid")
+        if set(data) != {field.name for field in dataclasses.fields(cls)}:
+            raise ValueError("keyboard chord config fields do not match its schema")
+        if type(data["n_options"]) is not int:
+            raise ValueError("serialized n_options must be a JSON integer")
+        for name in ("step_size", "baseline_decay", "l2_penalty", "max_norm"):
+            if type(data[name]) is not float:
+                raise ValueError(f"serialized {name} must be a JSON number")
         return cls(**data)
 
 

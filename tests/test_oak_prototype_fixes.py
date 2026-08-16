@@ -343,3 +343,42 @@ def test_keyboard_chord_learner_config_integer_and_scalar_validation() -> None:
     cfg = KeyboardChordLearnerConfig(n_options=np.int32(4))
     assert type(cfg.n_options) is int
     assert cfg.n_options == 4
+
+
+def test_oak_and_keyboard_close_schema_float32_and_resource_boundaries() -> None:
+    class DictSubclass(dict[str, object]):
+        pass
+
+    oak = OaKConfig(
+        utility_ema_decay=np.float64(0.5),
+        curation_threshold=np.float32(0.25),
+    )
+    assert type(oak.utility_ema_decay) is float
+    assert type(oak.curation_threshold) is float
+    payload = oak.to_config()
+    with pytest.raises(ValueError, match="actual dict"):
+        OaKConfig.from_config(DictSubclass(payload))  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="fields"):
+        OaKConfig.from_config({**payload, "extra": 1})
+    with pytest.raises(ValueError, match="stomp config"):
+        OaKConfig.from_config(
+            {**payload, "stomp": DictSubclass(payload["stomp"])}  # type: ignore[arg-type]
+        )
+
+    keyboard_payload = KeyboardChordLearnerConfig(n_options=2).to_config()
+    with pytest.raises(ValueError, match="actual dict"):
+        KeyboardChordLearnerConfig.from_config(DictSubclass(keyboard_payload))  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="n_options"):
+        KeyboardChordLearnerConfig.from_config(
+            {**keyboard_payload, "n_options": np.int32(2)}
+        )
+
+    stomp_only_limit = (2**29 - 1 - 22) // 4
+    stomp = STOMPConfig(observation_dim=stomp_only_limit, n_primitive_actions=1)
+    with pytest.raises(ValueError, match="OaK direct array bytes"):
+        OaKConfig(stomp=stomp)
+
+    last_legal_keyboard_options = (2**31 - 1) // 4 - 2
+    KeyboardChordLearnerConfig(n_options=last_legal_keyboard_options)
+    with pytest.raises(ValueError, match="keyboard state bytes"):
+        KeyboardChordLearnerConfig(n_options=last_legal_keyboard_options + 1)
