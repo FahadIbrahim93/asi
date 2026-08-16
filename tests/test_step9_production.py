@@ -808,6 +808,12 @@ def test_step9_smoke_zero_steps_raises() -> None:
         run_step9_smoke(steps=0)
 
 
+@pytest.mark.parametrize("steps", [True, 1.5])
+def test_step9_smoke_rejects_non_integer_steps(steps: object) -> None:
+    with pytest.raises(ValueError, match="steps must be an integer"):
+        run_step9_smoke(steps=steps)  # type: ignore[arg-type]
+
+
 def test_step9_smoke_linear_model() -> None:
     """Linear (hidden_sizes=()) world model should work identically."""
     cfg = Step9DreamingConfig(

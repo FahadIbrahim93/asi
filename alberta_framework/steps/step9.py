@@ -795,8 +795,7 @@ def run_step9_smoke(
     seed: int = 0,
 ) -> Step9SmokeResult:
     """Run a tiny deterministic Step 9 dreaming integration probe."""
-    if steps < 1:
-        raise ValueError("steps must be positive")
+    steps = _require_int("steps", steps, minimum=1)
 
     cfg = config or Step9DreamingConfig()
     agent, model, buffer = make_step9_components(cfg)
