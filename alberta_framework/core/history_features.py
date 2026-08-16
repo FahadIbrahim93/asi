@@ -30,6 +30,7 @@ nexting work.
 from __future__ import annotations
 
 import functools
+import math
 from typing import Any
 
 import chex
@@ -115,9 +116,9 @@ class HistoryFeatureExtractor:
             include_raw: If True (default), the raw observation is
                 concatenated to the front of the augmented observation.
         """
-        if any((b < 0.0) or (b >= 1.0) for b in decay_rates):
+        if any(not math.isfinite(b) or (b < 0.0) or (b >= 1.0) for b in decay_rates):
             raise ValueError(
-                f"decay_rates must lie in [0, 1); got {decay_rates}"
+                f"decay_rates must be finite and lie in [0, 1); got {decay_rates}"
             )
         if channels is None:
             channels = tuple(range(raw_dim))
@@ -195,8 +196,13 @@ class HistoryFeatureExtractor:
 
         # EMA decay per trace row
         decay = jnp.asarray(self._decay_rates, dtype=jnp.float32)[:, None]
-        proposed_traces = decay * state.traces + (1.0 - decay) * obs_tracked[None, :]
-        new_traces = jnp.where(observation_valid, proposed_traces, state.traces)
+        # decay=0 times an inf stored trace is 0*inf = NaN. Skip that product.
+        carried = jnp.where(decay == 0.0, jnp.zeros_like(state.traces), decay * state.traces)
+        proposed_traces = carried + (1.0 - decay) * obs_tracked[None, :]
+        traces_finite = jnp.all(jnp.isfinite(proposed_traces))
+        new_traces = jnp.where(
+            observation_valid & traces_finite, proposed_traces, state.traces
+        )
 
         # Flatten and concatenate
         flat_traces = new_traces.reshape(-1)

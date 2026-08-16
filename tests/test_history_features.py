@@ -52,6 +52,10 @@ class TestValidation:
         with pytest.raises(ValueError, match="decay_rates"):
             HistoryFeatureExtractor(raw_dim=4, decay_rates=(0.5, 1.0))
 
+    def test_invalid_decay_rate_nan(self) -> None:
+        with pytest.raises(ValueError, match="decay_rates"):
+            HistoryFeatureExtractor(raw_dim=4, decay_rates=(float("nan"), 0.9))
+
     def test_invalid_channel_index(self) -> None:
         with pytest.raises(ValueError, match="channels"):
             HistoryFeatureExtractor(raw_dim=4, channels=(0, 5))
@@ -181,6 +185,21 @@ class TestJitAndScan:
             recovered_state.traces,
             jnp.asarray([[2.5, 2.5], [0.58, 0.74]], dtype=jnp.float32),
         )
+
+    def test_zero_decay_does_not_multiply_inf_traces(self) -> None:
+        """decay=0 keeps only the current obs; 0 * inf stored traces is NaN."""
+        ex = HistoryFeatureExtractor(raw_dim=1, decay_rates=(0.0,), include_raw=False)
+        poisoned = HistoryFeatureState(
+            traces=jnp.asarray([[jnp.inf]], dtype=jnp.float32)
+        )  # type: ignore[call-arg]
+        observation = jnp.asarray([3.0], dtype=jnp.float32)
+        raw = jnp.asarray(0.0, dtype=jnp.float32) * poisoned.traces
+        assert not bool(jnp.all(jnp.isfinite(raw)))
+
+        augmented, next_state = ex.step(poisoned, observation)
+        chex.assert_tree_all_finite((augmented, next_state))
+        chex.assert_trees_all_close(next_state.traces[0], observation)
+        chex.assert_trees_all_close(augmented, observation)
 
     def test_untracked_nonfinite_coordinate_holds_raw_disabled_traces(self) -> None:
         ex = HistoryFeatureExtractor(
