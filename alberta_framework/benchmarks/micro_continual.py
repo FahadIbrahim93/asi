@@ -105,6 +105,7 @@ from alberta_framework.benchmarks.upgd_ipmnist import (
     atomic_write_new,
     init_mlp_params,
 )
+from alberta_framework.core._float32_scalars import validated_float32_scalar
 
 logger = logging.getLogger(__name__)
 
@@ -239,18 +240,15 @@ def _require_float32_resource(name: str, scalars: int) -> None:
         raise ValueError(f"{name} byte count must fit signed int32")
 
 
-def _validate_stream_resources(
+def _materialized_stream_scalars(
     *, n_regimes: int, regime_length: int, dim: int, n_classes: int, n_components: int
-) -> None:
-    """Preflight the materialized stream and its worst-case generation work."""
+) -> int:
+    """Return the exact scalar count of all retained GaussianMicroStream leaves."""
     n_steps = n_regimes * regime_length
-    class_dim = n_classes * dim
     component_dim = n_classes * n_components * dim
     regime_dim = n_regimes * dim
     regime_class = n_regimes * n_classes
-
-    # Every returned GaussianMicroStream leaf is four bytes (float32/int32).
-    persistent_scalars = (
+    return (
         2 * n_steps * dim
         + 3 * n_steps
         + component_dim
@@ -258,23 +256,6 @@ def _validate_stream_resources(
         + regime_dim
         + regime_class
         + 2 * n_regimes
-    )
-    _require_float32_resource("GaussianMicroStream outputs", persistent_scalars)
-
-    # Conservative simultaneous-generation allowance: base component IDs,
-    # noise, per-step gathers/scales, regime work, and all geometry workspaces.
-    work_scalars = (
-        2 * n_steps * dim
-        + 2 * n_steps
-        + n_regimes
-        + regime_dim
-        + 2 * dim
-        + 2 * class_dim
-        + 3 * component_dim
-    )
-    _require_float32_resource(
-        "GaussianMicroStream outputs and generation work",
-        persistent_scalars + work_scalars,
     )
 
 
@@ -355,41 +336,30 @@ class MicroStreamConfig:
             raise ValueError(
                 f"component_sparsity ({sparsity}) must not exceed dim ({self.dim})"
             )
-        real_fields = (
-            "spectrum_decades",
-            "mean_separation",
-            "component_scale",
-            "class_sparsity",
-            "noise_scale",
-            "offset_scale",
-            "scale_shift_min",
-            "scale_shift_max",
-        )
-        normalized_reals = {
-            name: _require_finite_real(getattr(self, name), name) for name in real_fields
+        float_domains: dict[str, dict[str, object]] = {
+            "spectrum_decades": {"lower": 0.0},
+            "mean_separation": {"positive": True},
+            "component_scale": {"lower": 0.0},
+            "class_sparsity": {"positive": True, "upper": 1.0},
+            "noise_scale": {"positive": True},
+            "offset_scale": {"lower": 0.0},
+            "scale_shift_min": {"positive": True},
+            "scale_shift_max": {"positive": True},
         }
-        for name, number in normalized_reals.items():
-            object.__setattr__(self, name, number)
-
-        class_sparsity = normalized_reals["class_sparsity"]
-        if not 0.0 < class_sparsity <= 1.0:
-            raise ValueError(
-                f"class_sparsity must be in (0, 1], got {self.class_sparsity!r}"
+        for name, domain in float_domains.items():
+            canonical = validated_float32_scalar(
+                name,
+                getattr(self, name),
+                **cast(dict[str, Any], domain),
             )
-        for name in ("mean_separation", "noise_scale"):
-            if not normalized_reals[name] > 0.0:
-                raise ValueError(f"{name} must be positive, got {getattr(self, name)!r}")
-        for name in ("offset_scale", "spectrum_decades", "component_scale"):
-            if normalized_reals[name] < 0.0:
-                raise ValueError(
-                    f"{name} must be non-negative, got {getattr(self, name)!r}"
-                )
-        scale_min = normalized_reals["scale_shift_min"]
-        scale_max = normalized_reals["scale_shift_max"]
-        if not 0.0 < scale_min < scale_max:
+            object.__setattr__(self, name, canonical)
+
+        scale_min_sink = float(np.float32(self.scale_shift_min))
+        scale_max_sink = float(np.float32(self.scale_shift_max))
+        if not scale_min_sink < scale_max_sink:
             raise ValueError(
                 "scale_shift bounds must satisfy 0 < scale_shift_min < "
-                f"scale_shift_max, got [{self.scale_shift_min}, {self.scale_shift_max}]"
+                "scale_shift_max after float32 narrowing"
             )
         if self.family == "recurrence":
             if pool > self.n_regimes:
@@ -397,7 +367,24 @@ class MicroStreamConfig:
                     f"recurrence_pool ({pool}) must not exceed n_regimes "
                     f"({self.n_regimes})"
                 )
-        _validate_stream_resources(
+        _require_float32_resource(
+            "GaussianMicroStream outputs", self.materialized_stream_scalars
+        )
+
+    @property
+    def n_steps(self) -> int:
+        """Total online steps in one run."""
+        return self.n_regimes * self.regime_length
+
+    @property
+    def materialized_stream_scalars(self) -> int:
+        """Exact retained scalar count of the materialized stream.
+
+        Every named generation-work array is bounded by one of these returned
+        shapes. Compiler-internal and transient allocator buffers are not part
+        of this persistent-output contract.
+        """
+        return _materialized_stream_scalars(
             n_regimes=self.n_regimes,
             regime_length=self.regime_length,
             dim=self.dim,
@@ -406,9 +393,9 @@ class MicroStreamConfig:
         )
 
     @property
-    def n_steps(self) -> int:
-        """Total online steps in one run."""
-        return self.n_regimes * self.regime_length
+    def materialized_stream_bytes(self) -> int:
+        """Exact retained bytes; every returned leaf is float32 or int32."""
+        return 4 * self.materialized_stream_scalars
 
     def to_config(self) -> dict[str, Any]:
         """JSON-serializable configuration (roundtrips through the constructor)."""
@@ -444,9 +431,17 @@ class MicroStreamConfig:
         if not _is_registered_subclass(type(mapping), Mapping):
             raise ValueError(f"{source} must be an object")
         try:
-            payload = dict(cast(Mapping[str, Any], mapping))
+            items = list(cast(Mapping[object, object], mapping).items())
         except Exception as exc:
-            raise ValueError(f"{source} must be an object") from exc
+            raise ValueError(f"{source} must be a readable object") from exc
+        try:
+            if any(type(key) is not str for key, _ in items):
+                raise ValueError(f"{source} keys must be exact strings")
+            payload = dict(cast(list[tuple[str, Any]], items))
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError(f"{source} must be a readable object") from exc
         expected = {field.name for field in fields(cls)}
         actual = set(payload)
         if actual != expected:
@@ -725,13 +720,27 @@ def bayes_reference(
     """
     n_samples = _require_positive_int32(n_samples, name="n_samples")
     seed = require_jax_seed(seed, name="seed")
+    chunk_size = min(20_000, n_samples)
+    class_components = config.n_classes * config.n_components
+    # Exact named host-visible arrays retained at the peak of bayes_predict:
+    # geometry + whitened geometry, y/z/eps/x, whitened x, cross/d2,
+    # their norms, scores, and predictions. Expression/compiler temporaries
+    # are intentionally outside this explicitly named work contract.
+    bayes_work_scalars = (
+        2 * class_components * config.dim
+        + config.dim
+        + 3 * chunk_size * config.dim
+        + 2 * chunk_size * class_components
+        + chunk_size * config.n_classes
+        + class_components
+        + 4 * chunk_size
+    )
+    _require_float32_resource(
+        "Bayes-reference named array work",
+        bayes_work_scalars,
+    )
     component_means, dim_sigma = class_geometry(config, seed)
     key = jr.fold_in(jr.key(seed), _BAYES_DOMAIN)
-    chunk_size = 20_000
-    _require_float32_resource(
-        "Bayes-reference chunk work",
-        min(chunk_size, n_samples) * (config.dim + 3),
-    )
     n_correct = 0
     drawn = 0
     chunk_index = 0

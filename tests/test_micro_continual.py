@@ -210,6 +210,12 @@ class TestConfig:
             tiny("scale_shift", scale_shift_min=0.0)
         with pytest.raises(ValueError, match="scale_shift"):
             tiny("scale_shift", scale_shift_min=2.0, scale_shift_max=2.0)
+        with pytest.raises(ValueError, match="float32"):
+            tiny(
+                "scale_shift",
+                scale_shift_min=1.0,
+                scale_shift_max=np.nextafter(1.0, 2.0),
+            )
 
     @pytest.mark.parametrize(
         ("field", "value"),
@@ -232,9 +238,9 @@ class TestConfig:
             raise AssertionError("JAX allocation ran during config preflight")
 
         monkeypatch.setattr(jnp, "arange", forbidden)
-        # For R=C=K=D=1 the conservative output+work aggregate is 9*n + 15
-        # four-byte scalars. Pin the exact last accepted signed-int32 byte edge.
-        last_legal = ((2**31 - 1) // 4 - 15) // 9
+        # For R=C=K=D=1 the exact returned aggregate is 5*n + 6 four-byte
+        # scalars. Pin its last accepted signed-int32 byte edge without allocating.
+        last_legal = ((2**31 - 1) - 24) // 20
         config = MicroStreamConfig(
             family="input_permutation",
             n_regimes=1,
@@ -245,7 +251,8 @@ class TestConfig:
             component_sparsity=1,
         )
         assert config.n_steps == last_legal
-        with pytest.raises(ValueError, match="outputs and generation work.*byte count"):
+        assert config.materialized_stream_bytes == 20 * last_legal + 24
+        with pytest.raises(ValueError, match="GaussianMicroStream outputs.*byte count"):
             MicroStreamConfig(
                 family="input_permutation",
                 n_regimes=1,
@@ -255,6 +262,16 @@ class TestConfig:
                 n_components=1,
                 component_sparsity=1,
             )
+
+    def test_materialized_stream_accounting_is_exact(self):
+        stream = generate_stream(TINY, seed=0)
+        exact_bytes = sum(
+            int(leaf.size) * int(leaf.dtype.itemsize)
+            for leaf in (
+                getattr(stream, field.name) for field in dataclasses.fields(stream)
+            )
+        )
+        assert exact_bytes == TINY.materialized_stream_bytes
 
     @pytest.mark.parametrize(
         "integer_type",
@@ -321,6 +338,26 @@ class TestConfig:
             with pytest.raises(ValueError, match="n_regimes"):
                 tiny("input_permutation", n_regimes=value)
 
+    def test_float_and_family_hooks_normalize_without_repr(self):
+        class HostileFloat(float):
+            def as_integer_ratio(self) -> tuple[int, int]:
+                raise RuntimeError("ratio hook")
+
+            def __repr__(self) -> str:
+                raise AssertionError("repr hook executed")
+
+        class HostileFamily(str):
+            def __eq__(self, other: object) -> bool:
+                raise AssertionError("equality hook executed")
+
+            def __repr__(self) -> str:
+                raise AssertionError("repr hook executed")
+
+        with pytest.raises(ValueError, match="class_sparsity"):
+            tiny("input_permutation", class_sparsity=HostileFloat(0.5))
+        with pytest.raises(ValueError, match="family"):
+            tiny(HostileFamily("input_permutation"))
+
     def test_public_seed_boundaries_are_exact(self):
         for seed in (True, np.uint32(1), -1, 2**32):
             with pytest.raises(ValueError, match="seed"):
@@ -330,6 +367,27 @@ class TestConfig:
         for value in (True, 1.0, "1", 0, -1, 2**31):
             with pytest.raises(ValueError, match="n_samples"):
                 bayes_reference(TINY, seed=0, n_samples=value)
+
+    def test_bayes_named_work_preflights_before_geometry_allocation(self, monkeypatch):
+        config = MicroStreamConfig(
+            family="input_permutation",
+            n_regimes=1,
+            regime_length=1,
+            dim=1,
+            n_classes=20_000,
+            n_components=1,
+            component_sparsity=1,
+        )
+
+        def forbidden(*args, **kwargs):
+            raise AssertionError("geometry allocated before Bayes work preflight")
+
+        monkeypatch.setattr(
+            "alberta_framework.benchmarks.micro_continual.class_geometry",
+            forbidden,
+        )
+        with pytest.raises(ValueError, match="Bayes-reference named array work"):
+            bayes_reference(config, seed=0, n_samples=20_000)
 
     def test_to_config_roundtrip(self):
         rebuilt = MicroStreamConfig(**TINY.to_config())
@@ -400,6 +458,26 @@ class TestConfig:
             MicroStreamConfig.from_mapping(extra)
         with pytest.raises(ValueError, match="stream_config"):
             MicroStreamConfig.from_mapping(["not", "an", "object"])
+
+    def test_from_mapping_normalizes_hostile_hooks_and_requires_exact_keys(self):
+        class HostileMapping(dict[object, object]):
+            def items(self):  # type: ignore[no-untyped-def]
+                raise RuntimeError("items hook")
+
+            def __repr__(self) -> str:
+                raise AssertionError("repr hook executed")
+
+        class StringSubclass(str):
+            pass
+
+        with pytest.raises(ValueError, match="readable object"):
+            MicroStreamConfig.from_mapping(HostileMapping(TINY.to_config()))
+
+        payload: dict[object, object] = dict(TINY.to_config())
+        family = payload.pop("family")
+        payload[StringSubclass("family")] = family
+        with pytest.raises(ValueError, match="exact strings"):
+            MicroStreamConfig.from_mapping(payload)
 
     @pytest.mark.parametrize(
         "field",
