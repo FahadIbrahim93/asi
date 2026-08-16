@@ -174,17 +174,29 @@ def per_horizon_rmse(
         predictions = predictions[burn_in:]
         forward_returns = forward_returns[burn_in:]
     errors = predictions - forward_returns
-    sq_err = errors**2
-    raw_rmse = jnp.sqrt(jnp.mean(sq_err, axis=0))
 
     # Scale before squaring so large, finite float32 errors do not overflow.
-    # Keep the direct result for non-finite inputs so NaN/Inf diagnostics remain
-    # visible to callers instead of being hidden by the stable path.
-    scale = jnp.max(jnp.abs(errors), axis=0)
-    normalized = jnp.where(scale > 0.0, errors / scale, jnp.zeros_like(errors))
-    stable_rmse = scale * jnp.sqrt(jnp.mean(normalized**2, axis=0))
+    # Mask non-finite columns before every arithmetic operation, and divide by
+    # one for all-zero columns.  This keeps debug/checkify modes free of
+    # discarded overflow and 0/0 operations while retaining NaN/Inf diagnostics
+    # in the final result.
     finite_columns = jnp.all(jnp.isfinite(errors), axis=0)
-    return jnp.where(finite_columns, stable_rmse, raw_rmse)
+    safe_errors = jnp.where(finite_columns[None, :], errors, jnp.zeros_like(errors))
+    scale = jnp.max(jnp.abs(safe_errors), axis=0)
+    _mantissa, exponent = jnp.frexp(scale)
+    # Arbitrary division by a near-max float32 scale can lower to a reciprocal
+    # that underflows to zero.  ldexp performs exact power-of-two scaling and
+    # keeps the normalized magnitudes in range without that reciprocal.
+    normalized = jnp.ldexp(safe_errors, -exponent[None, :])
+    stable_rmse = jnp.ldexp(
+        jnp.sqrt(jnp.mean(normalized**2, axis=0)),
+        exponent,
+    )
+    # A maximum absolute error carries the desired diagnostic: NaN if any
+    # error is NaN, otherwise Inf if any error is infinite.  Deriving it from
+    # the input avoids constructing discarded NaN/Inf literals on finite calls.
+    nonfinite_rmse = jnp.max(jnp.abs(errors), axis=0)
+    return jnp.where(finite_columns, stable_rmse, nonfinite_rmse)
 
 
 def per_horizon_running_rmse(
