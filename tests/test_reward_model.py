@@ -92,3 +92,21 @@ def test_rls_infinite_reward_on_zero_feature_does_not_poison_weights() -> None:
     chex.assert_tree_all_finite(recovered.state.weights)
     chex.assert_tree_all_finite(recovered.state.covariance)
     assert bool(recovered.update_applied)
+
+
+def test_zero_error_decay_does_not_multiply_inf_ema() -> None:
+    """error_decay=0 times an infinite abs-error EMA is NaN."""
+    model = RLSRewardModel(
+        RLSRewardModelConfig(feature_dim=2, forgetting=1.0, ridge=1.0, error_decay=0.0)
+    )
+    features = jnp.array([0.0, 1.0], dtype=jnp.float32)
+    state = model.update(
+        model.init(), features, jnp.array(1.0, dtype=jnp.float32)
+    ).state
+    state = state.replace(abs_error_ema=jnp.asarray(jnp.inf, dtype=jnp.float32))
+    raw = jnp.asarray(0.0, dtype=jnp.float32) * jnp.asarray(jnp.inf, dtype=jnp.float32)
+    assert not bool(jnp.isfinite(raw))
+
+    result = model.update(state, features, jnp.array(0.5, dtype=jnp.float32))
+    assert bool(result.update_applied)
+    assert bool(jnp.isfinite(result.state.abs_error_ema))
