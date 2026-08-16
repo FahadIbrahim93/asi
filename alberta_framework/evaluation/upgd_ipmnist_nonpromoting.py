@@ -909,7 +909,7 @@ def validate_upgd_ipmnist_v2_artifact(
         for path_value in partial_paths:
             path = Path(path_value)
             raw = path.read_bytes()
-            shard_payload = _strict_json_object(path)
+            shard_payload = _decode_strict_json_object(raw)
             expected_manifest.append(
                 {
                     "learner": shard_payload["learner"],
