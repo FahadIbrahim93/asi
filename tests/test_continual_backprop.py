@@ -331,6 +331,45 @@ class TestReplacement:
         )
 
 
+    def _replacement_trace(
+        self, *, n_units: int, rate: float, maturity: int, steps: int
+    ) -> tuple[list[int], float]:
+        """Drive maybe_replace_units with ages advancing one per step; count replacements."""
+        learner = MultiHeadMLPLearner(n_heads=1, hidden_sizes=(n_units,), sparsity=0.0)
+        mlp_state = learner.init(feature_dim=3, key=jr.key(1))
+        cbp_state = init_cbp_state(mlp_state, (n_units,), key=jr.key(2))
+        config = ContinualBackpropConfig(
+            decay_rate=0.99, replacement_rate=rate, maturity_threshold=maturity, enabled=True
+        )
+        replaced_per_step: list[int] = []
+        for step in range(steps):
+            cbp_state = cbp_state.replace(  # type: ignore[attr-defined]
+                ages=(jnp.full((n_units,), step, dtype=jnp.int32),),
+                utilities=(jnp.linspace(0.001, 1.0, n_units, dtype=jnp.float32),),
+            )
+            before = float(cbp_state.replacement_accumulators[0])
+            mlp_state, cbp_state = maybe_replace_units(mlp_state, cbp_state, config, sparsity=0.0)
+            after = float(cbp_state.replacement_accumulators[0])
+            replaced_per_step.append(int(before + rate * n_units + 0.5 - after >= 1.0))
+        return replaced_per_step, float(cbp_state.replacement_accumulators[0])
+
+    def test_replacement_budget_does_not_accrue_while_every_unit_is_immature(self):
+        """No warm-up debt: rate 1e-3 on 32 units is ~1 per 31 steps, not 32 in a row."""
+        replaced, _ = self._replacement_trace(n_units=32, rate=1e-3, maturity=1000, steps=1100)
+        assert sum(replaced[:1000]) == 0
+        burst = sum(replaced[1000:1040])
+        assert burst <= 2, f"warm-up debt discharged as a burst of {burst} replacements"
+        assert 1 <= sum(replaced) <= 4
+
+    def test_replacement_budget_never_carries_more_than_one_pending_unit(self):
+        """rate * n_units > 1 saturates at one replacement per step without unbounded debt."""
+        replaced, final_accumulator = self._replacement_trace(
+            n_units=8, rate=0.5, maturity=0, steps=20
+        )
+        assert sum(replaced) == 20
+        assert final_accumulator <= 1.0
+
+
 # =============================================================================
 # enabled=False returns unchanged state
 # =============================================================================

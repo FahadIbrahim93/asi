@@ -46,10 +46,10 @@ original Dohare implementation uses in practice.
 
 Replacement
 -----------
-On every step, ``replacement_rate * num_hidden_units`` units (rounded
-up) per layer are *eligible* for replacement. Of those, only units that
-are at least ``maturity_threshold`` updates old AND have the lowest
-utility in the layer are actually replaced. Replaced units have their
+On every step, ``replacement_rate * num_mature_units`` fractional
+replacements accrue per layer (units younger than ``maturity_threshold``
+earn no budget), and at most one accumulated replacement is delivered per
+step: the mature unit with the lowest utility in the layer is replaced. Replaced units have their
 incoming weights re-drawn via :func:`sparse_init` and their outgoing
 weights zeroed (so a freshly initialized unit does not destabilize the
 prediction immediately). The unit's age and utility are reset to 0.
@@ -480,10 +480,12 @@ def maybe_replace_units(
     new_cbp_state = cbp_state
     rng_key = cbp_state.rng_key
     for layer_idx in range(n_layers):
-        layer_size = cbp_state.utilities[layer_idx].shape[0]
-        layer_size_f = jnp.asarray(layer_size, dtype=jnp.float32)
-        # Add this step's fractional replacements to the accumulator.
-        accum = accum_arr[layer_idx] + rate * layer_size_f
+        # Add this step's fractional replacements to the accumulator, accrued
+        # against the units that are actually eligible (mature) right now, as in
+        # the reference GnT implementation; immature units earn no budget.
+        eligible = new_cbp_state.ages[layer_idx] >= config.maturity_threshold
+        n_eligible = jnp.sum(eligible).astype(jnp.float32)
+        accum = accum_arr[layer_idx] + rate * n_eligible
         # Will we replace one unit this step?
         do_replace = accum >= 1.0
         # Pick lowest-utility mature unit from the *current* CBP state.
@@ -504,8 +506,9 @@ def maybe_replace_units(
             new_cbp_state,
             subkey,
         )
-        # Decrement accumulator only if we actually replaced.
-        accum_after = jnp.where(gated, accum - 1.0, accum)
+        # Decrement accumulator only if we actually replaced, and never carry
+        # more than the one replacement a step can deliver.
+        accum_after = jnp.minimum(jnp.where(gated, accum - 1.0, accum), 1.0)
         new_accum_list.append(accum_after)
 
     new_cbp_state = new_cbp_state.replace(  # type: ignore[attr-defined]
