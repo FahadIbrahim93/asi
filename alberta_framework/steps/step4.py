@@ -223,6 +223,10 @@ def _validate_sarsa_config(config: Step4SARSAConfig) -> None:
     meta_step_size = _require_nonnegative_real("meta_step_size", config.meta_step_size)
     bounder_kappa = _require_positive_real("bounder_kappa", config.bounder_kappa)
     sparsity = _require_unit_interval("sparsity", config.sparsity)
+    if type(config.use_layer_norm) is not bool:
+        raise ValueError(
+            f"use_layer_norm must be a boolean, got {config.use_layer_norm!r}"
+        )
     object.__setattr__(config, "n_actions", n_actions)
     object.__setattr__(config, "hidden_sizes", hidden_sizes)
     object.__setattr__(config, "gamma", gamma)
