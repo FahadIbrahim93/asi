@@ -1,5 +1,6 @@
 """Production facade tests for Alberta Plan Steps 5, 6, and 7."""
 
+from fractions import Fraction
 from typing import Any
 
 import chex
@@ -102,9 +103,13 @@ def test_step5_config_rejects_malformed_scientific_scalars(
         ("average_reward_step_size", -0.01),
         ("trace_decay", -0.01),
         ("trace_decay", 1.01),
+        ("step_size", Fraction(-1, 10**400)),
+        ("average_reward_step_size", Fraction(-1, 10**400)),
+        ("trace_decay", Fraction(-1, 10**400)),
+        ("trace_decay", Fraction(10**400 + 1, 10**400)),
     ],
 )
-def test_step5_config_enforces_scientific_scalar_domains(field: str, value: float) -> None:
+def test_step5_config_enforces_scientific_scalar_domains(field: str, value: object) -> None:
     payload: dict[str, object] = {
         "step_size": 0.05,
         "average_reward_step_size": 0.01,
