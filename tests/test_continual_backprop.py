@@ -7,6 +7,7 @@ import chex
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import pytest
 
 from alberta_framework.core.continual_backprop import (
     CBPLearningResult,
@@ -72,6 +73,18 @@ class TestInitCbpStateShapes:
         except ValueError:
             return
         raise AssertionError("expected ValueError on mismatched hidden_sizes")
+
+    def test_init_cbp_state_width_mismatch_raises(self):
+        """The count can match while a width does not; that must not silently reshape."""
+        learner = MultiHeadMLPLearner(n_heads=2, hidden_sizes=(8, 4), sparsity=0.0)
+        mlp_state = learner.init(feature_dim=4, key=jr.key(0))
+        with pytest.raises(
+            ValueError,
+            match=r"^hidden_sizes\[1\]=1 does not match trunk layer 1 width \(4\)$",
+        ):
+            init_cbp_state(mlp_state, (8, 1), key=jr.key(1))
+        with pytest.raises(ValueError, match=r"^hidden_sizes\[0\]=1 does not match"):
+            init_cbp_state(mlp_state, (1, 4), key=jr.key(1))
 
 
 # =============================================================================
