@@ -57,6 +57,8 @@ jobs:
       contents: write
       pull-requests: write
       issues: write
+      id-token: write  # claude-code-action exchanges OIDC for its app token
+      actions: read
     env:
       GH_TOKEN: ${{ github.token }}
       REPO: ${{ github.repository }}
