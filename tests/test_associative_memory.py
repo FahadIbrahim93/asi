@@ -307,6 +307,38 @@ def test_associative_memory_respects_fixed_budget() -> None:
     assert int(result.state.replacements) > 0
 
 
+def test_evicted_row_is_reset_before_a_new_key_writes_into_it() -> None:
+    """A slot reused by eviction must not carry the evicted key's values, utility, or counts."""
+    learner = AssociativeMemoryLearner(
+        AssociativeMemoryConfig(
+            vocab_size=4,
+            block_size=2,
+            suffix_length=2,
+            feature_family="position_token",
+            max_features=2,
+        )
+    )
+    state = learner.init()
+    context_a = jnp.asarray([0, 1], dtype=jnp.int32)
+    context_b = jnp.asarray([2, 3], dtype=jnp.int32)
+    for _ in range(30):
+        state = learner.update(state, context_a, jnp.asarray(3, dtype=jnp.int32)).state
+    assert int(state.replacements) == 0
+
+    state = learner.update(state, context_b, jnp.asarray(1, dtype=jnp.int32)).state
+    assert int(state.replacements) > 0
+    prediction = learner.predict(state, context_b)
+    found = prediction.found > 0
+    assert int(jnp.sum(found)) >= 1
+    slots = prediction.indices[found]
+    rows = state.values[slots]
+    # B was written exactly once with label 1: no mass at A's label 3, one write's worth at 1
+    chex.assert_trees_all_close(rows[:, 3], jnp.zeros((rows.shape[0],), dtype=jnp.float32))
+    assert bool(jnp.all(rows[:, 1] > 0.0))
+    assert int(jnp.argmax(prediction.logits)) == 1
+    chex.assert_trees_all_close(state.counts[slots], jnp.ones((rows.shape[0],), dtype=jnp.float32))
+
+
 def test_associative_adaptive_family_scope_prefers_useful_pairs() -> None:
     learner = AssociativeMemoryLearner(
         AssociativeMemoryConfig(
