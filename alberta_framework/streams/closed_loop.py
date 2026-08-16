@@ -39,7 +39,7 @@ from __future__ import annotations
 import itertools
 import operator
 from fractions import Fraction
-from numbers import Integral, Real
+from numbers import Real
 from typing import Any, SupportsIndex, cast
 
 import chex
@@ -51,6 +51,7 @@ from jax import Array
 from jaxtyping import Float, Int
 
 from alberta_framework._float32 import round_real_to_float32
+from alberta_framework.core._float32_scalars import validated_float32_scalar_with_ratio
 
 # Reward phases for the switching payoff schedule.
 PHASE_A = 0
@@ -159,44 +160,24 @@ def _normalized_finite_float32_reward(name: str, value: object) -> float:
     return narrowed
 
 
-def _exact_real_ratio(name: str, value: object) -> tuple[int, int]:
-    """Return the exact ratio of a supported concrete real scalar."""
+def _normalized_positive_float32_probability(
+    name: str, value: object
+) -> tuple[float, int, int]:
+    """Validate one probability with exactly one guarded exact-ratio read."""
     message = f"{name} must be finite, positive, and a normal float32 probability"
-    actual_type = type(value)
-    if issubclass(actual_type, (bool, np.bool_)) or not issubclass(actual_type, Real):
-        raise ValueError(message)
     try:
-        if issubclass(actual_type, Integral):
-            ratio = (int(cast(Any, value)), 1)
-        else:
-            ratio = cast(Any, value).as_integer_ratio()
-        numerator, denominator = ratio
-    except (AttributeError, TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(message) from exc
-    if type(numerator) is not int or type(denominator) is not int or denominator <= 0:
-        raise ValueError(message)
-    return numerator, denominator
-
-
-def _normalized_positive_float32_probability(name: str, value: object) -> float:
-    """Return a concrete positive probability with stable float32 semantics."""
-    message = f"{name} must be finite, positive, and a normal float32 probability"
-    numerator, denominator = _exact_real_ratio(name, value)
+        normalized, numerator, denominator = validated_float32_scalar_with_ratio(
+            name,
+            value,
+            positive=True,
+            upper=1.0,
+        )
+    except Exception as error:
+        raise ValueError(message) from error
     tiny_numerator, tiny_denominator = _FLOAT32_TINY_RATIO
-    if numerator <= 0 or numerator > denominator:
-        raise ValueError(message)
     if numerator * tiny_denominator < tiny_numerator * denominator:
         raise ValueError(message)
-    try:
-        normalized = float(cast(Any, value))
-        narrowed = float(np.float32(normalized))
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(message) from exc
-    if not np.isfinite(normalized) or not np.isfinite(narrowed):
-        raise ValueError(message)
-    if not 0.0 < narrowed <= 1.0 or narrowed < _FLOAT32_TINY:
-        raise ValueError(message)
-    return narrowed
+    return float(np.float32(normalized)), numerator, denominator
 
 
 def _stationary_average_reward(
@@ -284,22 +265,51 @@ class SwitchingTwoStateMDP:
 
     def __init__(self, config: SwitchingTwoStateConfig | None = None) -> None:
         config = SwitchingTwoStateConfig() if config is None else config
+        if type(config) is not SwitchingTwoStateConfig:
+            raise ValueError("config must be an actual SwitchingTwoStateConfig")
         try:
             phase_length = _require_int32("phase_length", config.phase_length, minimum=1)
         except ValueError:
             raise ValueError(
                 f"phase_length must be a positive integer in [1, {_INT32_MAX}]"
             ) from None
-        phase_payoffs = []
+        phase_payoffs: list[np.ndarray] = []
+        canonical_payoffs: list[tuple[tuple[float, float], tuple[float, float]]] = []
         for name in ("payoffs_a", "payoffs_b"):
-            payoff = np.asarray(getattr(config, name), dtype=np.float32)
-            if payoff.shape != (_TWO_STATE_N, _TWO_STATE_ACTIONS):
-                raise ValueError(f"{name} must be 2x2 (state x action), got shape {payoff.shape}")
-            if not np.all(np.isfinite(payoff)):
-                raise ValueError(f"{name} must contain only finite values, got {payoff.tolist()}")
+            raw_payoff = getattr(config, name)
+            try:
+                payoff_shape = tuple(np.shape(cast(Any, raw_payoff)))
+            except Exception as error:
+                raise ValueError(f"{name} shape must be readable") from error
+            if payoff_shape != (_TWO_STATE_N, _TWO_STATE_ACTIONS):
+                raise ValueError(f"{name} must be 2x2 (state x action)")
+            try:
+                object_payoff = np.asarray(raw_payoff, dtype=object)
+            except Exception as error:
+                raise ValueError(f"{name} must be readable") from error
+            normalized = tuple(
+                _normalized_finite_float32_reward(
+                    f"{name}[{index // _TWO_STATE_ACTIONS}][{index % _TWO_STATE_ACTIONS}]",
+                    value,
+                )
+                for index, value in enumerate(object_payoff.flat)
+            )
+            canonical = (
+                (normalized[0], normalized[1]),
+                (normalized[2], normalized[3]),
+            )
+            payoff = np.asarray(canonical, dtype=np.float32)
             phase_payoffs.append(payoff)
+            canonical_payoffs.append(canonical)
         payoffs = np.stack(phase_payoffs)
-        config = cast(SwitchingTwoStateConfig, config.replace(phase_length=phase_length))
+        config = cast(
+            SwitchingTwoStateConfig,
+            config.replace(
+                phase_length=phase_length,
+                payoffs_a=canonical_payoffs[0],
+                payoffs_b=canonical_payoffs[1],
+            ),
+        )
         self._config = config
         self._phase_length = phase_length
         self._payoffs_np = payoffs
@@ -490,16 +500,22 @@ class RiverSwimMDP:
 
     def __init__(self, config: RiverSwimConfig | None = None) -> None:
         config = RiverSwimConfig() if config is None else config
+        if type(config) is not RiverSwimConfig:
+            raise ValueError("config must be an actual RiverSwimConfig")
         n_states = _require_int32("n_states", config.n_states, minimum=2)
         initial_state = _require_int32(
             "initial_state", config.initial_state, minimum=0, maximum=n_states - 1
         )
         _riverswim_persistent_resources(n_states)
-        up_numerator, up_denominator = _exact_real_ratio(
+        p_right_up, up_numerator, up_denominator = _normalized_positive_float32_probability(
             "p_right_up",
             config.p_right_up,
         )
-        down_numerator, down_denominator = _exact_real_ratio(
+        (
+            p_right_down,
+            down_numerator,
+            down_denominator,
+        ) = _normalized_positive_float32_probability(
             "p_right_down",
             config.p_right_down,
         )
@@ -507,18 +523,7 @@ class RiverSwimMDP:
             up_numerator * down_denominator + down_numerator * up_denominator
             > up_denominator * down_denominator
         ):
-            raise ValueError(
-                "p_right_up + p_right_down must not exceed 1, got "
-                f"{config.p_right_up} + {config.p_right_down}"
-            )
-        p_right_up = _normalized_positive_float32_probability(
-            "p_right_up",
-            config.p_right_up,
-        )
-        p_right_down = _normalized_positive_float32_probability(
-            "p_right_down",
-            config.p_right_down,
-        )
+            raise ValueError("p_right_up + p_right_down must not exceed 1")
         reward_left = _normalized_finite_float32_reward(
             "reward_left",
             config.reward_left,
@@ -528,10 +533,7 @@ class RiverSwimMDP:
             config.reward_right,
         )
         if p_right_up + p_right_down > 1.0:
-            raise ValueError(
-                "p_right_up + p_right_down must not exceed 1, got "
-                f"{config.p_right_up} + {config.p_right_down}"
-            )
+            raise ValueError("p_right_up + p_right_down must not exceed 1")
         config = cast(
             RiverSwimConfig,
             config.replace(

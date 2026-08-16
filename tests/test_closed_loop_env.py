@@ -707,3 +707,89 @@ def test_riverswim_rejects_invalid_static_state_contract(state: RiverSwimState) 
     env = RiverSwimMDP()
     with pytest.raises((TypeError, ValueError), match="state.state_index"):
         env.step(state, jnp.asarray(0), jr.key(0))
+
+
+def test_closed_loop_configs_require_exact_record_types() -> None:
+    class SwitchingSubclass(SwitchingTwoStateConfig):
+        pass
+
+    class RiverSubclass(RiverSwimConfig):
+        pass
+
+    with pytest.raises(ValueError, match="actual SwitchingTwoStateConfig"):
+        SwitchingTwoStateMDP(SwitchingSubclass())
+    with pytest.raises(ValueError, match="actual RiverSwimConfig"):
+        RiverSwimMDP(RiverSubclass())
+
+
+@pytest.mark.parametrize("value", [True, np.bool_(False), "0.5", object()])
+def test_switching_payoffs_reject_non_concrete_real_scalars(value: object) -> None:
+    with pytest.raises(ValueError, match=r"payoffs_a\[0\]\[0\]"):
+        SwitchingTwoStateMDP(
+            SwitchingTwoStateConfig(payoffs_a=((value, 0.0), (0.0, 1.0)))  # type: ignore[arg-type]
+        )
+
+
+def test_switching_payoffs_are_canonical_tuple_float32_values() -> None:
+    env = SwitchingTwoStateMDP(
+        SwitchingTwoStateConfig(
+            payoffs_a=np.asarray(
+                [[Fraction(1, 10), np.float64(0.2)], [np.int16(1), 0.0]],
+                dtype=object,
+            )  # type: ignore[arg-type]
+        )
+    )
+
+    assert type(env.config.payoffs_a) is tuple
+    assert all(type(row) is tuple for row in env.config.payoffs_a)
+    assert all(type(value) is float for row in env.config.payoffs_a for value in row)
+    assert env.config.payoffs_a[0][0] == float(np.float32(0.1))
+
+
+def test_hostile_payoff_container_failure_never_formats_repr() -> None:
+    class HostileContainer:
+        def __len__(self) -> int:
+            raise RuntimeError("hostile length")
+
+        def __repr__(self) -> str:
+            raise AssertionError("untrusted repr hook executed")
+
+    with pytest.raises(ValueError, match="payoffs_a"):
+        SwitchingTwoStateMDP(
+            SwitchingTwoStateConfig(payoffs_a=HostileContainer())  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.parametrize("field", ["p_right_up", "p_right_down"])
+def test_riverswim_probability_ratio_hook_runs_once(field: str) -> None:
+    class CountingReal(float):
+        def __new__(cls):
+            instance = super().__new__(cls, 0.2)
+            instance.calls = 0
+            return instance
+
+        def as_integer_ratio(self) -> tuple[int, int]:
+            self.calls += 1
+            return (1, 5)
+
+    value = CountingReal()
+    env = RiverSwimMDP(RiverSwimConfig(**{field: value}))  # type: ignore[arg-type]
+
+    assert value.calls == 1
+    assert getattr(env.config, field) == float(np.float32(0.2))
+
+
+@pytest.mark.parametrize("field", ["p_right_up", "p_right_down"])
+def test_riverswim_probability_exception_is_normalized_without_repr(field: str) -> None:
+    class ExplodingReal(float):
+        def __new__(cls):
+            return super().__new__(cls, 0.2)
+
+        def as_integer_ratio(self) -> tuple[int, int]:
+            raise RuntimeError("hostile ratio")
+
+        def __repr__(self) -> str:
+            raise AssertionError("untrusted repr hook executed")
+
+    with pytest.raises(ValueError, match=field):
+        RiverSwimMDP(RiverSwimConfig(**{field: ExplodingReal()}))  # type: ignore[arg-type]
