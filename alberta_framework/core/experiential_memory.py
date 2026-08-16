@@ -840,7 +840,8 @@ class ExperientialMemory:
         neighbor_mask = jnp.isfinite(top_scores) & (top_scores > 0.0)
         positive_scores = jnp.where(neighbor_mask, top_scores, 0.0)
         score_sum = jnp.sum(positive_scores)
-        neighbor_weights = positive_scores / jnp.maximum(score_sum, 1.0e-12)
+        weight_denominator = jnp.where(score_sum > 0.0, score_sum, 1.0)
+        neighbor_weights = positive_scores / weight_denominator
 
         neighbor_similarities = similarities[indices]
         neighbor_reliabilities = effective_reliabilities[indices]
