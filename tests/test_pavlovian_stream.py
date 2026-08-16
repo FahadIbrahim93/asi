@@ -15,6 +15,7 @@ import chex
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 import pytest
 
 from alberta_framework.streams.pavlovian import (
@@ -428,6 +429,131 @@ def test_partial_reinforcement_rejects_invalid_p():
         except ValueError:
             continue
         raise AssertionError(f"expected ValueError for p={bad_p}")
+
+
+def _valid_phase(**overrides: object) -> PavlovianPhase:
+    payload = {
+        "name": "acq",
+        "n_steps": 10,
+        "cs_us_contingency": 1.0,
+        "cs_active": (0,),
+    }
+    payload.update(overrides)
+    return PavlovianPhase(**payload)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf"), True, -1.0])
+def test_construct_rejects_illegal_noise_std(value: object) -> None:
+    """Observation noise is a non-negative finite real, not a bool or NaN."""
+    with pytest.raises(ValueError, match="noise_std"):
+        ClassicalConditioningStream(phases=(_valid_phase(),), noise_std=value)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -0.1, 1.1, True])
+def test_construct_rejects_illegal_distractor_prob(value: object) -> None:
+    """Distractor probability must be a finite real in ``[0, 1]``."""
+    with pytest.raises(ValueError, match="distractor_prob"):
+        ClassicalConditioningStream(
+            phases=(_valid_phase(),),
+            distractor_prob=value,  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.parametrize("value", [True, False])
+def test_construct_rejects_bool_phase_contingency(value: bool) -> None:
+    """A bool is not a scientific contingency, even though ``True == 1``."""
+    with pytest.raises(ValueError, match="cs_us_contingency"):
+        ClassicalConditioningStream(phases=(_valid_phase(cs_us_contingency=value),))
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), True])
+def test_partial_reinforcement_rejects_illegal_p(value: object) -> None:
+    """Scenario ``p`` must be a finite real in ``[0, 1]``, not a bool or NaN."""
+    with pytest.raises(ValueError, match=r"\bp\b"):
+        partial_reinforcement_scenario(p=value)  # type: ignore[arg-type]
+
+
+def test_construct_accepts_zero_noise_and_zero_distractor_prob() -> None:
+    stream = ClassicalConditioningStream(
+        phases=(_valid_phase(),),
+        noise_std=0.0,
+        distractor_prob=0.0,
+    )
+    assert stream.feature_dim == 1
+
+
+@pytest.mark.parametrize(
+    "value",
+    [True, False, 1.0, 1.5, np.int64(5), -1, float("nan"), "5", None],
+)
+def test_iti_min_rejects_bool_nonintegral_and_out_of_domain(value: object) -> None:
+    """``iti_min`` is a built-in int in ``[0, iti_max]``."""
+    with pytest.raises(ValueError, match="iti_min"):
+        ClassicalConditioningStream(
+            phases=(_valid_phase(),),
+            iti_min=value,  # type: ignore[arg-type]
+            iti_max=20,
+        )
+
+
+@pytest.mark.parametrize("value", [True, False, 20.0, np.int64(20), -1])
+def test_iti_max_rejects_bool_nonintegral_and_out_of_domain(value: object) -> None:
+    with pytest.raises(ValueError, match="iti_max"):
+        ClassicalConditioningStream(
+            phases=(_valid_phase(),),
+            iti_min=0,
+            iti_max=value,  # type: ignore[arg-type]
+        )
+
+
+def test_iti_min_accepts_zero_and_equal_max_endpoints() -> None:
+    zero = ClassicalConditioningStream(phases=(_valid_phase(),), iti_min=0, iti_max=20)
+    equal = ClassicalConditioningStream(phases=(_valid_phase(),), iti_min=0, iti_max=0)
+    matched = ClassicalConditioningStream(phases=(_valid_phase(),), iti_min=5, iti_max=5)
+    assert zero.feature_dim == 1
+    assert equal.feature_dim == 1
+    assert matched.feature_dim == 1
+
+
+def test_iti_min_rejects_greater_than_iti_max() -> None:
+    with pytest.raises(ValueError, match="iti_min <= iti_max"):
+        ClassicalConditioningStream(phases=(_valid_phase(),), iti_min=6, iti_max=5)
+
+
+@pytest.mark.parametrize(
+    ("field", "minimum"),
+    [
+        ("n_cs", 1),
+        ("n_distractors", 0),
+        ("cs_us_delay", 1),
+        ("cs_duration", 1),
+    ],
+)
+@pytest.mark.parametrize("value", [True, False, 1.0, np.int64(1)])
+def test_pavlovian_integer_fields_reject_bool_and_nonintegral(
+    field: str, minimum: int, value: object
+) -> None:
+    del minimum
+    with pytest.raises(ValueError, match=field):
+        ClassicalConditioningStream(
+            phases=(_valid_phase(),),
+            **{field: value},  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.parametrize("value", [True, False, 1.0, np.int64(10), 0])
+def test_phase_n_steps_requires_positive_builtin_int(value: object) -> None:
+    with pytest.raises(ValueError, match="n_steps"):
+        ClassicalConditioningStream(phases=(_valid_phase(n_steps=value),))
+
+
+@pytest.mark.parametrize("value", [True, False, 1.0, np.int64(-1)])
+def test_phase_compound_index_requires_builtin_int(value: object) -> None:
+    with pytest.raises(ValueError, match="compound_index"):
+        ClassicalConditioningStream(
+            phases=(_valid_phase(compound_index=value),),
+            n_cs=2,
+        )
 
 
 def test_reacquisition_runs_three_phases():

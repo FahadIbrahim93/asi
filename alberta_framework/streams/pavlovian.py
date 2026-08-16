@@ -39,6 +39,9 @@ References
 
 from __future__ import annotations
 
+import math
+from numbers import Real
+
 import chex
 import jax
 import jax.numpy as jnp
@@ -48,6 +51,42 @@ from jaxtyping import Int, PRNGKeyArray
 
 from alberta_framework.core.types import TimeStep
 from alberta_framework.streams.base import ScanStream  # noqa: F401  (re-exported)
+
+
+def _require_finite_real(
+    value: object,
+    *,
+    name: str,
+    nonnegative: bool = False,
+) -> float:
+    """Return a finite real, rejecting bools, NaN, and infinities."""
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError(f"{name} must be a finite real, got {value!r}")
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(f"{name} must be a finite real, got {value!r}")
+    if nonnegative and number < 0.0:
+        raise ValueError(f"{name} must be a non-negative finite real, got {value!r}")
+    return number
+
+
+def _require_unit_interval(value: object, *, name: str) -> float:
+    """Return a finite real in ``[0, 1]``, rejecting bool aliases."""
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError(f"{name} must be in [0, 1], got {value!r}")
+    number = float(value)
+    if not math.isfinite(number) or not 0.0 <= number <= 1.0:
+        raise ValueError(f"{name} must be in [0, 1], got {value!r}")
+    return number
+
+
+def _require_builtin_int(value: object, *, name: str, minimum: int) -> int:
+    """Return a built-in int at or above ``minimum``; reject bool and numpy ints."""
+    if type(value) is not int:
+        raise ValueError(f"{name} must be a built-in integer, got {value!r}")
+    if value < minimum:
+        raise ValueError(f"{name} must be >= {minimum}, got {value!r}")
+    return value
 
 # =============================================================================
 # State and phase descriptors
@@ -199,42 +238,60 @@ class ClassicalConditioningStream:
                 distractor turns on.
 
         Raises:
-            ValueError: if ``phases`` is empty, ``n_cs <= 0``, the
-                ITI range is malformed, or any phase references a CS
-                index that does not exist.
+            ValueError: if ``phases`` is empty, an integer knob is not a
+                built-in int in its domain, the ITI range is malformed,
+                any phase references a CS index that does not exist, a
+                phase contingency is not a finite real in ``[0, 1]``, or
+                ``noise_std`` / ``distractor_prob`` is not a legal
+                scientific scalar.
         """
         if not phases:
             raise ValueError("phases must be non-empty")
-        if n_cs <= 0:
-            raise ValueError(f"n_cs must be positive, got {n_cs}")
-        if n_distractors < 0:
-            raise ValueError(f"n_distractors must be >= 0, got {n_distractors}")
-        if cs_us_delay <= 0:
-            raise ValueError(f"cs_us_delay must be positive, got {cs_us_delay}")
-        if cs_duration <= 0:
-            raise ValueError(f"cs_duration must be positive, got {cs_duration}")
-        if iti_min < 0 or iti_max < iti_min:
+        n_cs = _require_builtin_int(n_cs, name="n_cs", minimum=1)
+        n_distractors = _require_builtin_int(
+            n_distractors, name="n_distractors", minimum=0
+        )
+        cs_us_delay = _require_builtin_int(cs_us_delay, name="cs_us_delay", minimum=1)
+        cs_duration = _require_builtin_int(cs_duration, name="cs_duration", minimum=1)
+        iti_min = _require_builtin_int(iti_min, name="iti_min", minimum=0)
+        iti_max = _require_builtin_int(iti_max, name="iti_max", minimum=0)
+        if iti_max < iti_min:
             raise ValueError(f"need 0 <= iti_min <= iti_max, got {iti_min}, {iti_max}")
+        noise_std = _require_finite_real(noise_std, name="noise_std", nonnegative=True)
+        distractor_prob = _require_unit_interval(
+            distractor_prob, name="distractor_prob"
+        )
 
         for phase in phases:
-            if not 0.0 <= phase.cs_us_contingency <= 1.0:
+            try:
+                _require_unit_interval(
+                    phase.cs_us_contingency, name="cs_us_contingency"
+                )
+            except ValueError as error:
                 raise ValueError(
                     f"phase {phase.name!r} cs_us_contingency must be in [0, 1], "
                     f"got {phase.cs_us_contingency}"
-                )
+                ) from error
+            _require_builtin_int(phase.n_steps, name="n_steps", minimum=1)
+            compound_index = _require_builtin_int(
+                phase.compound_index, name="compound_index", minimum=-1
+            )
             for cs_idx in phase.cs_active:
+                if type(cs_idx) is not int:
+                    raise ValueError(
+                        f"phase {phase.name!r} cs_active index must be a "
+                        f"built-in integer, got {cs_idx!r}"
+                    )
                 if not (0 <= cs_idx < n_cs):
                     raise ValueError(
                         f"phase {phase.name!r} references cs_active index {cs_idx}, "
                         f"but n_cs={n_cs}"
                     )
-            if phase.compound_index >= n_cs:
+            if compound_index >= n_cs:
                 raise ValueError(
                     f"phase {phase.name!r} has compound_index={phase.compound_index} "
                     f"but n_cs={n_cs}"
                 )
-            if phase.n_steps <= 0:
-                raise ValueError(f"phase {phase.name!r} must have n_steps > 0")
 
         self._phases = tuple(phases)
         self._n_cs = int(n_cs)
@@ -732,10 +789,12 @@ def partial_reinforcement_scenario(
         ``ClassicalConditioningStream`` with one phase.
 
     Raises:
-        ValueError: if ``p`` is outside ``[0, 1]``.
+        ValueError: if ``p`` is not a finite real in ``[0, 1]``.
     """
-    if not (0.0 <= p <= 1.0):
-        raise ValueError(f"p must be in [0, 1], got {p}")
+    try:
+        p = _require_unit_interval(p, name="p")
+    except ValueError as error:
+        raise ValueError(f"p must be in [0, 1], got {p}") from error
     phases = (
         PavlovianPhase(
             name="partial_reinforcement",
