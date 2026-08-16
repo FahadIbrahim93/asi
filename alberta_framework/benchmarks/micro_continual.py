@@ -74,7 +74,7 @@ from functools import lru_cache
 from numbers import Real
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any
+from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
@@ -148,12 +148,39 @@ _BAYES_DOMAIN = 404
 
 def _require_finite_real(value: object, name: str) -> float:
     """Return one canonical float after rejecting non-real and non-finite values."""
-    if isinstance(value, bool) or not isinstance(value, Real):
+    if type(value) is bool or not issubclass(type(value), Real):
         raise ValueError(f"{name} must be a finite real number, got {value!r}")
-    number = float(value)
+    try:
+        number = float(cast(Any, value))
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a finite real number, got {value!r}") from exc
     if not math.isfinite(number):
         raise ValueError(f"{name} must be a finite real number, got {value!r}")
     return number
+
+
+def _freeze_micro_hyperparameters(value: object, *, context: str) -> Mapping[str, float]:
+    """Copy one primitive-only hyperparameter mapping behind an immutable view."""
+    if not issubclass(type(value), Mapping):
+        raise ValueError(f"{context} must be an object with non-empty string keys")
+    try:
+        items = list(cast(Mapping[object, object], value).items())
+    except Exception as exc:
+        raise ValueError(
+            f"{context} must be an object with non-empty string keys"
+        ) from exc
+    frozen: dict[str, float] = {}
+    for key, raw_value in items:
+        if type(key) is not str or not key:
+            raise ValueError(f"{context} keys must be non-empty strings")
+        frozen[key] = _require_finite_real(raw_value, f"{context}[{key!r}]")
+    return MappingProxyType(frozen)
+
+
+def _require_nonempty_string(value: object, *, context: str) -> str:
+    if type(value) is not str or not value:
+        raise ValueError(f"{context} must be a non-empty string")
+    return value
 
 
 # =============================================================================
@@ -642,7 +669,15 @@ class MicroArmSpec:
     description: str
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "hyperparameters", MappingProxyType(dict(self.hyperparameters)))
+        _require_nonempty_string(self.name, context="MicroArmSpec.name")
+        _require_nonempty_string(self.mechanism, context="MicroArmSpec.mechanism")
+        object.__setattr__(
+            self,
+            "hyperparameters",
+            _freeze_micro_hyperparameters(
+                self.hyperparameters, context="MicroArmSpec.hyperparameters"
+            ),
+        )
 
 
 def _make_sgd_raw_learner(
@@ -789,6 +824,17 @@ class MicroRunResult:
     overall_accuracy: float
     wall_clock_seconds: float
 
+    def __post_init__(self) -> None:
+        _require_nonempty_string(self.arm_name, context="MicroRunResult.arm_name")
+        _require_nonempty_string(self.mechanism, context="MicroRunResult.mechanism")
+        object.__setattr__(
+            self,
+            "hyperparameters",
+            _freeze_micro_hyperparameters(
+                self.hyperparameters, context="MicroRunResult.hyperparameters"
+            ),
+        )
+
 
 def run_micro_arm(
     config: MicroStreamConfig,
@@ -881,6 +927,11 @@ def micro_shard_path(out_dir: Path | str, family: str, arm_name: str, seed: int)
 
 def micro_shard_payload(result: MicroRunResult) -> dict[str, Any]:
     """Serialize one run to a mergeable shard, recording the spec that actually ran."""
+    if result.arm_name not in MICRO_ARM_REGISTRY:
+        raise ValueError(
+            f"arm_name {result.arm_name!r} is not a registered micro arm; "
+            "unregistered results cannot be serialized into the registered-arm shard schema"
+        )
     return {
         "schema": MICRO_SHARD_SCHEMA,
         "suite_version": MICRO_GAUSS_SUITE_VERSION,
@@ -961,6 +1012,11 @@ def load_micro_shard(path: Path | str) -> dict[str, Any]:
         raise ValueError(f"{path}: mechanism must be a non-empty string")
     if not isinstance(payload.get("hyperparameters"), dict):
         raise ValueError(f"{path}: hyperparameters must be an object")
+    payload["hyperparameters"] = dict(
+        _freeze_micro_hyperparameters(
+            payload["hyperparameters"], context=f"{path}: hyperparameters"
+        )
+    )
     environment = payload.get("environment")
     required_environment_fields = ("jax", "numpy", "python", "platform")
     if not isinstance(environment, dict) or any(

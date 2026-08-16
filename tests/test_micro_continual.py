@@ -78,6 +78,16 @@ from alberta_framework.benchmarks.upgd_ipmnist import (
 
 pytestmark = pytest.mark.unit
 
+
+class _FloatClassSpoof:
+    @property
+    def __class__(self) -> type[float]:
+        return float
+
+    def __float__(self) -> float:
+        return 0.1
+
+
 TINY = MicroStreamConfig(
     family="input_permutation",
     n_regimes=4,
@@ -819,6 +829,60 @@ class TestShards:
         with pytest.raises(TypeError):
             spec.hyperparameters["step_size"] = 123.0  # type: ignore[index]
         assert micro_arm_spec("sgd_raw").hyperparameters["step_size"] != 123.0
+
+    def test_direct_run_result_construction_copies_and_freezes_hyperparameters(self):
+        external = {"step_size": 0.5, "weight_decay": 0.3}
+        result = dataclasses.replace(self._result(), hyperparameters=external)
+        external["step_size"] = 0.9
+
+        assert result.hyperparameters == {"step_size": 0.5, "weight_decay": 0.3}
+        with pytest.raises(TypeError):
+            result.hyperparameters["step_size"] = 0.7  # type: ignore[index]
+
+    @pytest.mark.parametrize(
+        "hyperparameters",
+        [
+            {1: 0.1},
+            {"": 0.1},
+            {"step_size": float("nan")},
+            {"step_size": float("inf")},
+            {"step_size": True},
+            {"step_size": [0.1]},
+            {"step_size": _FloatClassSpoof()},
+        ],
+    )
+    def test_arm_specs_reject_noncanonical_hyperparameters(
+        self, hyperparameters: object
+    ) -> None:
+        with pytest.raises(ValueError, match="hyperparameters"):
+            dataclasses.replace(
+                micro_arm_spec("sgd_raw"),
+                hyperparameters=hyperparameters,  # type: ignore[arg-type]
+            )
+
+    def test_payload_rejects_an_unregistered_result_name(self):
+        result = dataclasses.replace(self._result(), arm_name="unregistered_candidate")
+        with pytest.raises(ValueError, match="unregistered_candidate.*registered"):
+            micro_shard_payload(result)
+
+    @pytest.mark.parametrize(
+        "hyperparameters",
+        [
+            {"step_size": "0.01"},
+            {"step_size": True},
+            {"step_size": None},
+            {"step_size": [0.01]},
+            {"": 0.01},
+        ],
+    )
+    def test_load_rejects_noncanonical_hyperparameters(
+        self, tmp_path: Path, hyperparameters: object
+    ) -> None:
+        payload = micro_shard_payload(self._result())
+        payload["hyperparameters"] = hyperparameters
+        path = self._write_payload(tmp_path, payload)
+        with pytest.raises(ValueError, match="hyperparameters"):
+            load_micro_shard(path)
 
     def test_payload_roundtrip(self, tmp_path: Path):
         result = self._result()
