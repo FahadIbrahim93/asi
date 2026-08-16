@@ -11,6 +11,8 @@ Covers:
 
 from __future__ import annotations
 
+from fractions import Fraction
+
 import chex
 import jax
 import jax.numpy as jnp
@@ -483,6 +485,92 @@ def test_construct_canonicalizes_noise_std_to_float32() -> None:
     """Stored noise matches the scalar used by the float32 trajectory."""
     stream = ClassicalConditioningStream(phases=(_valid_phase(),), noise_std=0.1)
     assert stream._noise_std == float(np.float32(0.1))  # noqa: SLF001
+
+
+def test_construct_narrows_original_noise_real_once() -> None:
+    midpoint_plus = (
+        np.longdouble(1.0)
+        + np.longdouble(2.0) ** -24
+        + np.longdouble(2.0) ** -60
+    )
+    assert np.float32(midpoint_plus) != np.float32(float(midpoint_plus))
+
+    stream = ClassicalConditioningStream(
+        phases=(_valid_phase(),),
+        noise_std=midpoint_plus,
+    )
+    assert stream._noise_std == float(np.float32(midpoint_plus))  # noqa: SLF001
+
+
+def test_construct_rejects_negative_real_that_rounds_to_zero() -> None:
+    below_zero = -np.nextafter(np.longdouble(0.0), np.longdouble(1.0))
+    assert float(below_zero) == 0.0
+    with pytest.raises(ValueError, match="noise_std"):
+        ClassicalConditioningStream(phases=(_valid_phase(),), noise_std=below_zero)
+
+
+@pytest.mark.parametrize(
+    ("noise_std", "expected"),
+    [
+        (
+            Fraction(1, 1) + Fraction(1, 2**24) - Fraction(1, 2**60),
+            1.0,
+        ),
+        (Fraction(1, 1) + Fraction(1, 2**24), 1.0),
+        (
+            Fraction(1, 1) + Fraction(1, 2**24) + Fraction(1, 2**60),
+            float(np.nextafter(np.float32(1.0), np.float32(2.0))),
+        ),
+    ],
+    ids=("below", "tie-to-even", "above"),
+)
+def test_construct_rounds_fraction_noise_midpoints_once(
+    noise_std: Fraction,
+    expected: float,
+) -> None:
+    stream = ClassicalConditioningStream(
+        phases=(_valid_phase(),),
+        noise_std=noise_std,
+    )
+    assert stream._noise_std == expected  # noqa: SLF001
+
+
+def test_construct_applies_exact_float32_overflow_midpoint() -> None:
+    float32_max = (2**24 - 1) * 2**104
+    overflow_midpoint = float32_max + 2**103
+
+    stream = ClassicalConditioningStream(
+        phases=(_valid_phase(),),
+        noise_std=Fraction(overflow_midpoint - 1),
+    )
+    assert stream._noise_std == float(np.finfo(np.float32).max)  # noqa: SLF001
+    with pytest.raises(ValueError, match="noise_std"):
+        ClassicalConditioningStream(
+            phases=(_valid_phase(),),
+            noise_std=Fraction(overflow_midpoint),
+        )
+
+
+def test_construct_applies_exact_subnormal_midpoint_and_signed_zero() -> None:
+    subnormal_midpoint = Fraction(1, 2**150)
+    tie = ClassicalConditioningStream(
+        phases=(_valid_phase(),),
+        noise_std=subnormal_midpoint,
+    )
+    above = ClassicalConditioningStream(
+        phases=(_valid_phase(),),
+        noise_std=subnormal_midpoint + Fraction(1, 2**200),
+    )
+    negative_zero = ClassicalConditioningStream(
+        phases=(_valid_phase(),),
+        noise_std=-0.0,
+    )
+
+    assert tie._noise_std == 0.0  # noqa: SLF001
+    assert above._noise_std == float(  # noqa: SLF001
+        np.nextafter(np.float32(0.0), np.float32(1.0))
+    )
+    assert np.signbit(negative_zero._noise_std)  # noqa: SLF001
 
 
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), -0.1, 1.1, True])

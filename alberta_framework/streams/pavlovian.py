@@ -40,16 +40,17 @@ References
 from __future__ import annotations
 
 import math
-import struct
 from numbers import Real
 
 import chex
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 from jax import Array
 from jaxtyping import Int, PRNGKeyArray
 
+from alberta_framework._float32 import round_real_to_float32
 from alberta_framework.core.types import TimeStep
 from alberta_framework.streams.base import ScanStream  # noqa: F401  (re-exported)
 
@@ -83,14 +84,17 @@ def _require_nonnegative_float32(value: object, *, name: str) -> float:
     below the float32 subnormal range are accepted as exact zero, matching the
     noise-free trajectory they produce in the stream's float32 arithmetic.
     """
-    number = _require_finite_real(value, name=name, nonnegative=True)
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError(f"{name} must be a non-negative finite real, got {value!r}")
+    if value < 0:
+        raise ValueError(f"{name} must be a non-negative finite real, got {value!r}")
     try:
-        narrowed = float(struct.unpack("!f", struct.pack("!f", number))[0])
-    except OverflowError as error:
+        narrowed = round_real_to_float32(value)
+    except (FloatingPointError, OverflowError, TypeError, ValueError) as error:
         raise ValueError(
             f"{name} must remain finite when rounded to float32, got {value!r}"
         ) from error
-    if not math.isfinite(narrowed):
+    if not bool(np.isfinite(narrowed)):
         raise ValueError(
             f"{name} must remain finite when rounded to float32, got {value!r}"
         )

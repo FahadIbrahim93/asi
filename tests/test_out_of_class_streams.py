@@ -7,6 +7,8 @@ shape correctness, JIT compatibility via ``jax.lax.scan``, and the
 out-of-class structural properties that motivate each stream.
 """
 
+from fractions import Fraction
+
 import chex
 import jax
 import jax.numpy as jnp
@@ -294,6 +296,77 @@ class TestFrequencyMismatchStream:
         assert bool(jnp.all(jnp.isfinite(state.omegas)))
         assert bool(jnp.all(state.omegas >= expected_min))
         assert bool(jnp.all(state.omegas < expected_max))
+
+    def test_frequency_bounds_narrow_the_original_real_once(self) -> None:
+        midpoint_plus = (
+            np.longdouble(1.0)
+            + np.longdouble(2.0) ** -24
+            + np.longdouble(2.0) ** -60
+        )
+        assert np.float32(midpoint_plus) != np.float32(float(midpoint_plus))
+
+        stream = FrequencyMismatchStream(omega_min=1.0, omega_max=midpoint_plus)
+        assert stream._omega_max == float(np.float32(midpoint_plus))  # noqa: SLF001
+
+    @pytest.mark.parametrize(
+        ("omega_max", "expected"),
+        [
+            (
+                Fraction(1, 1) + Fraction(1, 2**24) - Fraction(1, 2**60),
+                None,
+            ),
+            (Fraction(1, 1) + Fraction(1, 2**24), None),
+            (
+                Fraction(1, 1) + Fraction(1, 2**24) + Fraction(1, 2**60),
+                float(np.nextafter(np.float32(1.0), np.float32(2.0))),
+            ),
+        ],
+        ids=("below", "tie-to-even", "above"),
+    )
+    def test_frequency_bounds_round_fraction_midpoints_once(
+        self,
+        omega_max: Fraction,
+        expected: float | None,
+    ) -> None:
+        if expected is None:
+            with pytest.raises(ValueError, match="omega_max must exceed"):
+                FrequencyMismatchStream(omega_min=1.0, omega_max=omega_max)
+            return
+
+        stream = FrequencyMismatchStream(omega_min=1.0, omega_max=omega_max)
+        assert stream._omega_max == expected  # noqa: SLF001
+
+    def test_frequency_bounds_apply_exact_float32_overflow_midpoint(self) -> None:
+        float32_max = (2**24 - 1) * 2**104
+        overflow_midpoint = float32_max + 2**103
+
+        stream = FrequencyMismatchStream(
+            omega_min=1.0,
+            omega_max=Fraction(overflow_midpoint - 1),
+        )
+        assert stream._omega_max == float(np.finfo(np.float32).max)  # noqa: SLF001
+        with pytest.raises(ValueError, match="omega_max"):
+            FrequencyMismatchStream(
+                omega_min=1.0,
+                omega_max=Fraction(overflow_midpoint),
+            )
+
+    def test_frequency_bounds_apply_exact_subnormal_midpoint(self) -> None:
+        subnormal_midpoint = Fraction(1, 2**150)
+
+        with pytest.raises(ValueError, match="omega_min"):
+            FrequencyMismatchStream(omega_min=subnormal_midpoint, omega_max=1.0)
+        stream = FrequencyMismatchStream(
+            omega_min=subnormal_midpoint + Fraction(1, 2**200),
+            omega_max=1.0,
+        )
+        assert stream._omega_min == float(  # noqa: SLF001
+            np.nextafter(np.float32(0.0), np.float32(1.0))
+        )
+
+    def test_frequency_bounds_reject_negative_zero(self) -> None:
+        with pytest.raises(ValueError, match="omega_min"):
+            FrequencyMismatchStream(omega_min=-0.0, omega_max=1.0)
 
     def test_step_shapes(self):
         stream = FrequencyMismatchStream(
