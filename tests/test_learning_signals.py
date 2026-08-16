@@ -435,3 +435,24 @@ def test_checkpoint_resume_matches_uninterrupted_scan(tmp_path) -> None:
         jax.tree_util.tree_structure(expected_state),
         jax.tree_util.tree_structure(actual_state),
     )
+
+
+def test_zero_ema_decay_does_not_multiply_inf_trackers() -> None:
+    """A disabled EMA decay times an infinite tracker is NaN."""
+    estimator = _estimator(fast_loss_decay=0.0, change_decay=0.0)
+    state, _ = _observe_scalar(estimator, estimator.init())
+    state = state.replace(fast_loss_ema=jnp.asarray(jnp.inf, dtype=jnp.float32))
+    raw = jnp.asarray(0.0, dtype=jnp.float32) * jnp.asarray(jnp.inf, dtype=jnp.float32)
+    assert not bool(jnp.isfinite(raw))
+
+    next_state, _ = _observe_scalar(estimator, state, loss=0.25)
+    chex.assert_trees_all_close(
+        next_state.fast_loss_ema,
+        jnp.asarray(0.25, dtype=jnp.float32),
+    )
+
+    calibrated = _calibrated_state(estimator).replace(
+        sustained_change_probability=jnp.asarray(jnp.inf, dtype=jnp.float32),
+    )
+    next_calibrated, _ = _observe_scalar(estimator, calibrated)
+    assert bool(jnp.isfinite(next_calibrated.sustained_change_probability))

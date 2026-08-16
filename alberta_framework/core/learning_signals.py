@@ -53,6 +53,11 @@ from jaxtyping import Bool, Float, Int
 _INT32_MAX = 2_147_483_647
 
 
+def _skip_zero_scale(scale: Array, value: Array) -> Array:
+    """Skip ``0 * inf`` so a disabled EMA decay does not poison the next value."""
+    return jnp.where(scale == 0.0, jnp.zeros_like(value), scale * value)
+
+
 def _saturating_increment(value: Array) -> Array:
     """Increment a non-negative int32 counter without lifetime wraparound."""
     maximum = jnp.asarray(_INT32_MAX, dtype=jnp.int32)
@@ -357,6 +362,21 @@ class LearningSignalEstimator:
         )
         loss = self._floating_array(jnp.asarray(observed_loss), (), name="observed_loss")
 
+        checked_fast_loss = (
+            jnp.zeros_like(state.fast_loss_ema)
+            if self._config.fast_loss_decay == 0.0
+            else state.fast_loss_ema
+        )
+        checked_slow_loss = (
+            jnp.zeros_like(state.slow_loss_ema)
+            if self._config.slow_loss_decay == 0.0
+            else state.slow_loss_ema
+        )
+        checked_change = (
+            jnp.zeros_like(state.sustained_change_probability)
+            if self._config.change_decay == 0.0
+            else state.sustained_change_probability
+        )
         state_valid = (
             (state.step_count >= 0)
             & (state.valid_count >= 0)
@@ -376,15 +396,15 @@ class LearningSignalEstimator:
             & (state.calibration_mean <= self._config.max_normalized_residual)
             & jnp.isfinite(state.calibration_m2)
             & (state.calibration_m2 >= 0.0)
-            & jnp.isfinite(state.fast_loss_ema)
-            & (state.fast_loss_ema >= 0.0)
-            & (state.fast_loss_ema <= self._config.max_observed_loss)
-            & jnp.isfinite(state.slow_loss_ema)
-            & (state.slow_loss_ema >= 0.0)
-            & (state.slow_loss_ema <= self._config.max_observed_loss)
-            & jnp.isfinite(state.sustained_change_probability)
-            & (state.sustained_change_probability >= 0.0)
-            & (state.sustained_change_probability <= 1.0)
+            & jnp.isfinite(checked_fast_loss)
+            & (checked_fast_loss >= 0.0)
+            & (checked_fast_loss <= self._config.max_observed_loss)
+            & jnp.isfinite(checked_slow_loss)
+            & (checked_slow_loss >= 0.0)
+            & (checked_slow_loss <= self._config.max_observed_loss)
+            & jnp.isfinite(checked_change)
+            & (checked_change >= 0.0)
+            & (checked_change <= 1.0)
         )
         input_valid = (
             jnp.all(jnp.isfinite(means))
@@ -470,17 +490,20 @@ class LearningSignalEstimator:
         )
 
         first_valid_event = state.valid_count == 0
+        fast_decay = jnp.asarray(self._config.fast_loss_decay, dtype=jnp.float32)
+        slow_decay = jnp.asarray(self._config.slow_loss_decay, dtype=jnp.float32)
+        change_decay = jnp.asarray(self._config.change_decay, dtype=jnp.float32)
         fast_loss = jnp.where(
             first_valid_event,
             safe_loss,
-            self._config.fast_loss_decay * state.fast_loss_ema
-            + (1.0 - self._config.fast_loss_decay) * safe_loss,
+            _skip_zero_scale(fast_decay, state.fast_loss_ema)
+            + (1.0 - fast_decay) * safe_loss,
         )
         slow_loss = jnp.where(
             first_valid_event,
             safe_loss,
-            self._config.slow_loss_decay * state.slow_loss_ema
-            + (1.0 - self._config.slow_loss_decay) * safe_loss,
+            _skip_zero_scale(slow_decay, state.slow_loss_ema)
+            + (1.0 - slow_decay) * safe_loss,
         )
         learning_progress = slow_loss - fast_loss
         next_valid_count = _saturating_increment(state.valid_count)
@@ -519,8 +542,8 @@ class LearningSignalEstimator:
             / self._config.change_temperature
         )
         sustained_change_probability = (
-            self._config.change_decay * state.sustained_change_probability
-            + (1.0 - self._config.change_decay) * instantaneous_change_probability
+            _skip_zero_scale(change_decay, state.sustained_change_probability)
+            + (1.0 - change_decay) * instantaneous_change_probability
         )
         change_available = event_valid & calibration_ready
 
