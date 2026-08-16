@@ -27,6 +27,7 @@ from jaxtyping import Bool, Float, Int
 from alberta_framework.core.update_safety import (
     floating_tree_is_finite,
     neutralize_array,
+    safe_discrete_action,
     select_transaction,
 )
 
@@ -677,8 +678,11 @@ class AssociativeMemoryLearner:
         actual_type = type(label)
         if issubclass(actual_type, jax.core.Tracer):
             array = jnp.asarray(label)
-            valid_type = jnp.issubdtype(array.dtype, jnp.integer) and array.shape == ()
-            return array, jnp.asarray(valid_type, dtype=jnp.bool_)
+            if not (jnp.issubdtype(array.dtype, jnp.integer) and array.shape == ()):
+                return jnp.asarray(0, dtype=jnp.int32), jnp.asarray(False)
+            # Static checks cannot see traced values, so the vocabulary-domain
+            # verdict must be a runtime predicate folded into update_applied.
+            return safe_discrete_action(array, self._config.vocab_size)
 
         allowed = (
             actual_type is int

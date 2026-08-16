@@ -343,6 +343,64 @@ def test_update_rejects_labels_outside_the_vocabulary_instead_of_clipping(
     chex.assert_trees_all_equal(result.metrics, jnp.zeros_like(result.metrics))
 
 
+@pytest.mark.parametrize("label", [-1, 4, 9999])
+def test_scan_update_rejects_out_of_vocabulary_traced_labels(label: int) -> None:
+    """A traced out-of-vocabulary label is a rejected transaction, not a substituted class."""
+    learner = AssociativeMemoryLearner(
+        AssociativeMemoryConfig(vocab_size=4, block_size=3, suffix_length=2, max_features=8)
+    )
+    state = learner.init()
+    contexts = jnp.asarray([[1, 2, 3], [2, 3, 0]], dtype=jnp.int32)
+    labels = jnp.full((2,), label, dtype=jnp.int32)
+
+    result = run_associative_memory_arrays(learner, state, contexts, labels)
+
+    chex.assert_trees_all_equal(
+        result.updates_applied,
+        jnp.zeros((contexts.shape[0],), dtype=jnp.bool_),
+    )
+    chex.assert_trees_all_equal(result.state, state)
+    chex.assert_trees_all_equal(result.predictions, jnp.zeros_like(result.predictions))
+    chex.assert_trees_all_equal(result.metrics, jnp.zeros_like(result.metrics))
+
+
+def test_scan_update_applies_only_the_valid_labels_of_a_mixed_stream() -> None:
+    """Valid labels in a mixed stream keep training while invalid steps are neutralized."""
+    learner = AssociativeMemoryLearner(
+        AssociativeMemoryConfig(vocab_size=4, block_size=3, suffix_length=2, max_features=8)
+    )
+    state = learner.init()
+    contexts = jnp.asarray([[1, 2, 3], [1, 2, 3], [1, 2, 3]], dtype=jnp.int32)
+    labels = jnp.asarray([1, 4, 1], dtype=jnp.int32)
+
+    result = run_associative_memory_arrays(learner, state, contexts, labels)
+
+    chex.assert_trees_all_equal(
+        result.updates_applied,
+        jnp.asarray([True, False, True], dtype=jnp.bool_),
+    )
+    assert float(result.state.prior[1]) > 0.0
+    chex.assert_trees_all_equal(result.metrics[1], jnp.zeros_like(result.metrics[1]))
+
+
+def test_all_invalid_label_stream_does_not_report_perfect_accuracy() -> None:
+    """A stream whose every label is out of range must not publish trained-looking metrics."""
+    learner = AssociativeMemoryLearner(
+        AssociativeMemoryConfig(vocab_size=4, block_size=3, suffix_length=2, max_features=8)
+    )
+    state = learner.init()
+    steps = 20
+    contexts = jnp.tile(jnp.asarray([[1, 2, 3]], dtype=jnp.int32), (steps, 1))
+    labels = jnp.full((steps,), 4, dtype=jnp.int32)
+
+    result = run_associative_memory_arrays(learner, state, contexts, labels)
+
+    assert not bool(result.updates_applied.any())
+    chex.assert_trees_all_equal(result.state, state)
+    assert float(result.metrics[-10:, 1].mean()) == 0.0
+    assert float(result.metrics[-10:, 0].mean()) == 0.0
+
+
 def test_update_accepts_every_in_vocabulary_label() -> None:
     learner = AssociativeMemoryLearner(
         AssociativeMemoryConfig(vocab_size=4, block_size=3, suffix_length=2, max_features=8)
