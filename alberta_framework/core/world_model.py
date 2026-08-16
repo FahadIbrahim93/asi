@@ -370,15 +370,44 @@ class ActionConditionedWorldModel:
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def input_features(self, observation: Array, action: Array) -> Array:
-        """Return ``concat(observation, one_hot(action))``."""
+        """Return features, leaving any invalid public operand visible as NaN."""
+        features, features_valid, _ = self._safe_input_features(observation, action)
+        return jnp.where(
+            features_valid,
+            features,
+            jnp.full_like(features, jnp.nan),
+        )
+
+    def _safe_input_features(
+        self,
+        observation: Array,
+        action: Array,
+    ) -> tuple[Array, Bool[Array, ""], Array]:
+        """Build finite internal operands and return their traced validity.
+
+        The safe observation is returned separately because prediction decoding
+        must not form arithmetic with a non-finite public observation before
+        publishing the fail-visible result.
+        """
         obs = jnp.asarray(observation, dtype=jnp.float32).reshape(
             (self._config.observation_dim,)
         )
         action_one_hot = self.encode_action(action)
+        features_valid = jnp.all(jnp.isfinite(obs)) & jnp.all(
+            jnp.isfinite(action_one_hot)
+        )
+        # Inf observation times a silent one-hot is 0*inf = NaN. Zero both
+        # factors before the product so that product is never formed.
+        safe_obs = jnp.where(features_valid, obs, jnp.zeros_like(obs))
+        safe_action = jnp.where(
+            features_valid, action_one_hot, jnp.zeros_like(action_one_hot)
+        )
         if self._config.include_action_interactions:
-            interactions = (obs[:, None] * action_one_hot[None, :]).reshape((-1,))
-            return jnp.concatenate([obs, action_one_hot, interactions], axis=0)
-        return jnp.concatenate([obs, action_one_hot], axis=0)
+            interactions = (safe_obs[:, None] * safe_action[None, :]).reshape((-1,))
+            features = jnp.concatenate([safe_obs, safe_action, interactions], axis=0)
+        else:
+            features = jnp.concatenate([safe_obs, safe_action], axis=0)
+        return features, features_valid, safe_obs
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def encode_action(self, action: Array) -> Array:
@@ -435,10 +464,10 @@ class ActionConditionedWorldModel:
         action: Array,
     ) -> WorldModelPrediction:
         """Predict the next observation, reward, and discount."""
-        obs = jnp.asarray(observation, dtype=jnp.float32).reshape(
-            (self._config.observation_dim,)
+        inputs, inputs_valid, safe_obs = self._safe_input_features(
+            observation,
+            action,
         )
-        inputs = self.input_features(obs, action)
         raw_predictions = self._learner.predict(state.learner_state, inputs)
 
         obs_scale = jnp.asarray(self._observation_scale, dtype=jnp.float32)
@@ -449,7 +478,7 @@ class ActionConditionedWorldModel:
         )
         next_observation = jnp.where(
             self._config.predict_delta,
-            obs + normalized_delta * obs_scale,
+            safe_obs + normalized_delta * obs_scale,
             normalized_delta * obs_scale,
         )
 
@@ -469,6 +498,22 @@ class ActionConditionedWorldModel:
             raw_predictions[self._config.observation_dim + 1],
             0.0,
             self._config.gamma,
+        )
+
+        invalid_observation = jnp.full_like(next_observation, jnp.nan)
+        invalid_scalar = jnp.asarray(jnp.nan, dtype=jnp.float32)
+        invalid_raw = jnp.full_like(raw_predictions, jnp.nan)
+        next_observation = jnp.where(
+            inputs_valid,
+            next_observation,
+            invalid_observation,
+        )
+        reward = jnp.where(inputs_valid, reward, invalid_scalar)
+        discount = jnp.where(inputs_valid, discount, invalid_scalar)
+        raw_predictions = jnp.where(
+            inputs_valid,
+            raw_predictions,
+            invalid_raw,
         )
 
         return WorldModelPrediction(
