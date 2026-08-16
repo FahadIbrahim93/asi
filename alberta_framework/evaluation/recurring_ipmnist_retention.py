@@ -299,6 +299,12 @@ class RecurringIPMNISTProtocol:
         )
         if len(set(permutation_digests)) != len(permutation_digests):
             raise ValueError("A and B must bind distinct pixel permutation digests")
+        sentinel_digests = tuple(binding.sentinel_set_sha256 for binding in self.sentinel_bindings)
+        if len(set(sentinel_digests)) != len(sentinel_digests):
+            raise ValueError("A and B must bind distinct sentinel set digests")
+        sentinel_ids = tuple(binding.sentinel_set_id for binding in self.sentinel_bindings)
+        if len(set(sentinel_ids)) != len(sentinel_ids):
+            raise ValueError("A and B must bind distinct sentinel set identities")
 
         _positive_int(self.relearning_window, name="relearning_window")
         if self.relearning_window > self.phases[0].length:
