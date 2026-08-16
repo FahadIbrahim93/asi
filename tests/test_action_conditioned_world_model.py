@@ -221,6 +221,42 @@ def test_action_conditioned_world_model_scan_loop_shapes() -> None:
     chex.assert_tree_all_finite(result.prediction_errors)
 
 
+def test_default_discounts_do_not_inherit_the_reward_dtype() -> None:
+    """An integer or bool reward array must not truncate gamma into the default discounts."""
+    config = ActionConditionedWorldModelConfig(
+        observation_dim=2,
+        n_actions=2,
+        hidden_sizes=(),
+        step_size=0.05,
+        sparsity=0.0,
+    )
+    model = ActionConditionedWorldModel(config)
+    state = model.init(jr.key(8))
+    observations = jnp.array([[0.0, 0.0], [0.1, 0.0], [0.1, 0.2]], dtype=jnp.float32)
+    next_observations = jnp.array([[0.1, 0.0], [0.1, 0.2], [0.2, 0.2]], dtype=jnp.float32)
+    actions = jnp.array([0, 1, 0], dtype=jnp.int32)
+    integer_rewards = jnp.array([1, 0, 1], dtype=jnp.int32)
+    float_rewards = integer_rewards.astype(jnp.float32)
+    explicit = run_action_conditioned_world_model_learning_loop(
+        model,
+        state,
+        observations,
+        actions,
+        float_rewards,
+        next_observations,
+        jnp.full((3,), config.gamma, dtype=jnp.float32),
+    )
+    for rewards in (float_rewards, integer_rewards, integer_rewards.astype(jnp.bool_)):
+        defaulted = run_action_conditioned_world_model_learning_loop(
+            model, state, observations, actions, rewards, next_observations
+        )
+        chex.assert_trees_all_close(defaulted.discount_errors, explicit.discount_errors)
+        chex.assert_trees_all_close(
+            defaulted.discount_predictions, explicit.discount_predictions
+        )
+        assert bool(jnp.all(defaulted.updates_applied))
+
+
 def test_guarded_dreamer_rejects_warmup_and_accepts_after_real_updates() -> None:
     config = ActionConditionedWorldModelConfig(
         observation_dim=2,
