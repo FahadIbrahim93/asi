@@ -27,6 +27,7 @@ import jax.random as jr
 import numpy as np
 from jax import Array
 
+from alberta_framework._float32 import round_real_to_float32
 from alberta_framework.core.average_reward import (
     DifferentialSARSAAgent,
     DifferentialSARSAArrayResult,
@@ -48,15 +49,14 @@ def _require_real(name: str, value: object) -> Any:
 def _narrow_float32(name: str, value: Any) -> float:
     """Narrow exactly as the JAX core does, without an intermediate float64."""
     try:
-        with np.errstate(invalid="ignore", over="ignore"):
-            narrowed = np.asarray(value, dtype=np.float32)
+        narrowed = round_real_to_float32(value)
     except (FloatingPointError, OverflowError, TypeError, ValueError):
         raise ValueError(f"{name} must narrow to a finite float32, got {value!r}") from None
-    if narrowed.shape != () or not bool(np.isfinite(narrowed)):
+    if not bool(np.isfinite(narrowed)):
         raise ValueError(f"{name} must narrow to a finite float32, got {value!r}")
     if type(value) in (int, float) and (bool(narrowed != 0.0) or value == 0):
         return float(value)
-    return float(narrowed)
+    return narrowed
 
 
 def _require_unit_interval(name: str, value: object) -> float:

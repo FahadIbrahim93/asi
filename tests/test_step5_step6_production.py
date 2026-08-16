@@ -434,6 +434,37 @@ def test_step6_float32_narrowing_avoids_longdouble_double_rounding() -> None:
     assert agent.config.q_step_size == config.q_step_size
 
 
+@pytest.mark.parametrize(
+    ("offset", "expected"),
+    [
+        (-Fraction(1, 2**80), 1.0),
+        (Fraction(0), 1.0),
+        (
+            Fraction(1, 2**80),
+            float(np.nextafter(np.float32(1.0), np.float32(np.inf))),
+        ),
+    ],
+)
+def test_step6_fraction_midpoint_rounds_once_to_nearest_even(
+    offset: Fraction,
+    expected: float,
+) -> None:
+    midpoint = Fraction(1) + Fraction(1, 2**24)
+    config = Step6DifferentialSARSAConfig(q_step_size=midpoint + offset)
+
+    assert config.q_step_size == expected
+
+
+def test_step6_fraction_float32_overflow_midpoint_is_exact() -> None:
+    maximum = Fraction((2**24 - 1) * 2**104)
+    overflow_midpoint = maximum + 2**103
+
+    just_below = Step6DifferentialSARSAConfig(q_step_size=overflow_midpoint - 1)
+    assert just_below.q_step_size == float(np.finfo(np.float32).max)
+    with pytest.raises(ValueError, match="q_step_size"):
+        Step6DifferentialSARSAConfig(q_step_size=overflow_midpoint)
+
+
 def test_step6_float32_underflow_canonicalizes_to_legal_zero_endpoint() -> None:
     config = Step6DifferentialSARSAConfig(
         q_step_size=1e-50,
