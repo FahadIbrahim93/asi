@@ -514,6 +514,47 @@ class TestCompositionalStream:
         assert state.inner_w.dtype == jnp.float32
         assert state.outer_w.dtype == jnp.float32
 
+    def test_weight_scale_narrows_the_original_real_once(self) -> None:
+        midpoint_plus = (
+            np.longdouble(1.0)
+            + np.longdouble(2.0) ** -24
+            + np.longdouble(2.0) ** -60
+        )
+        assert np.float32(midpoint_plus) != np.float32(float(midpoint_plus))
+
+        stream = CompositionalStream(weight_scale=midpoint_plus)
+        assert stream._weight_scale == float(np.float32(midpoint_plus))
+
+    @pytest.mark.parametrize(
+        ("offset", "expected"),
+        [
+            (Fraction(-1, 1 << 60), 1.0),
+            (Fraction(0), 1.0),
+            (
+                Fraction(1, 1 << 60),
+                float(np.nextafter(np.float32(1.0), np.float32(2.0))),
+            ),
+        ],
+        ids=["below", "tie", "above"],
+    )
+    def test_weight_scale_rounds_exact_fraction_midpoints_once(
+        self, offset: Fraction, expected: float
+    ) -> None:
+        midpoint = Fraction(1) + Fraction(1, 1 << 24)
+        stream = CompositionalStream(weight_scale=midpoint + offset)
+
+        assert stream._weight_scale == expected
+
+    def test_weight_scale_fraction_midpoint_uses_ties_to_even(self) -> None:
+        lower = np.nextafter(np.float32(1.0), np.float32(2.0))
+        upper = np.nextafter(lower, np.float32(2.0))
+        lower_ratio = Fraction(*lower.as_integer_ratio())
+        upper_ratio = Fraction(*upper.as_integer_ratio())
+        midpoint = (lower_ratio + upper_ratio) / 2
+
+        stream = CompositionalStream(weight_scale=midpoint)
+        assert stream._weight_scale == float(upper)
+
     @pytest.mark.parametrize("weight_scale", [1e39, -1e39, 2e38, -2e38])
     def test_weight_scale_rejects_float32_conversion_or_initialization_overflow(
         self, weight_scale: float
@@ -571,6 +612,27 @@ class TestCompositionalStream:
         chex.assert_trees_all_equal(
             stream.init(jr.key(95)), zero_stream.init(jr.key(95))
         )
+
+    @pytest.mark.parametrize("sign", [1, -1])
+    @pytest.mark.parametrize(
+        ("offset", "expected_magnitude"),
+        [
+            (Fraction(-1, 1 << 200), 0.0),
+            (Fraction(0), 0.0),
+            (Fraction(1, 1 << 200), float(np.nextafter(np.float32(0.0), 1.0))),
+        ],
+        ids=["below", "tie", "above"],
+    )
+    def test_weight_scale_rounds_half_minimum_subnormal_to_even_signed_zero(
+        self, sign: int, offset: Fraction, expected_magnitude: float
+    ) -> None:
+        half_minimum_subnormal = Fraction(1, 1 << 150)
+        weight_scale = sign * (half_minimum_subnormal + offset)
+
+        stream = CompositionalStream(weight_scale=weight_scale)
+
+        assert abs(stream._weight_scale) == expected_magnitude
+        assert math.copysign(1.0, stream._weight_scale) == float(sign)
 
     def test_weight_scale_boundary_stays_finite_eager_and_jit_across_seeds(
         self,
