@@ -49,6 +49,41 @@ def _make_agent(
 # =============================================================================
 
 
+class TestSARSAConfigValidation:
+    """``SARSAConfig`` must reject invalid hyperparameters at construction."""
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"n_actions": 0},
+            {"n_actions": -2},
+            {"gamma": 1.1},
+            {"gamma": -0.1},
+            {"gamma": float("nan")},
+            {"gamma": float("inf")},
+            {"gamma": True},
+            {"epsilon_start": 1.5},
+            {"epsilon_start": float("nan")},
+            {"epsilon_end": -0.1},
+            {"epsilon_end": 2.0},
+            {"epsilon_decay_steps": -1},
+            {"epsilon_start": 0.3, "epsilon_end": 0.5, "epsilon_decay_steps": 10},
+        ],
+    )
+    def test_rejects_invalid_config(self, kwargs):
+        with pytest.raises(ValueError):
+            SARSAConfig(n_actions=kwargs.pop("n_actions", 2), **kwargs)
+
+    def test_accepts_valid_config(self):
+        config = SARSAConfig(n_actions=2, gamma=0.99, epsilon_start=0.1, epsilon_end=0.01)
+        assert config.n_actions == 2
+
+    def test_accepts_undiscounted_gamma(self):
+        # Step4's facade accepts gamma in [0, 1] inclusive; gamma=1.0 is the
+        # standard undiscounted episodic setting and must stay constructible.
+        assert SARSAConfig(n_actions=2, gamma=1.0).gamma == 1.0
+
+
 class TestSARSAInit:
     """Tests for SARSAAgent initialization."""
 
