@@ -88,6 +88,66 @@ class TestInitCbpStateShapes:
         with pytest.raises(ValueError, match=r"^hidden_sizes\[0\]=1 does not match"):
             init_cbp_state(mlp_state, (1, 4), key=jr.key(1))
 
+    def test_wrapper_reuses_canonical_multi_head_dimensions(self):
+        learner = CBPMultiHeadMLPLearner(
+            n_heads=np.int32(2),  # type: ignore[arg-type]
+            hidden_sizes=(np.uint16(3),),  # type: ignore[arg-type]
+        )
+        assert type(learner.n_heads) is int
+        assert learner.n_heads == 2
+        assert learner.hidden_sizes == (3,)
+        assert type(learner.hidden_sizes[0]) is int
+
+    def test_wrapper_delegates_direct_tuple_and_feature_dimension_validation(self):
+        with pytest.raises(ValueError, match="hidden_sizes.*tuple"):
+            CBPMultiHeadMLPLearner(n_heads=1, hidden_sizes=[2])  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="per_head_gamma_lamda.*tuple"):
+            CBPMultiHeadMLPLearner(
+                n_heads=1,
+                hidden_sizes=(),
+                per_head_gamma_lamda=[0.5],  # type: ignore[arg-type]
+            )
+
+        learner = CBPMultiHeadMLPLearner(n_heads=1, hidden_sizes=())
+        with pytest.raises(ValueError, match="feature_dim"):
+            learner.init(True, jr.key(0))  # type: ignore[arg-type]
+
+    def test_wrapper_from_config_requires_json_lists(self):
+        learner = CBPMultiHeadMLPLearner(
+            n_heads=1,
+            hidden_sizes=(),
+            per_head_gamma_lamda=(0.5,),
+        )
+        hidden_tuple = learner.to_config()
+        hidden_tuple["hidden_sizes"] = ()
+        with pytest.raises(ValueError, match="hidden_sizes.*list"):
+            CBPMultiHeadMLPLearner.from_config(hidden_tuple)
+
+        per_head_tuple = learner.to_config()
+        per_head_tuple["per_head_gamma_lamda"] = (0.5,)
+        with pytest.raises(ValueError, match="per_head_gamma_lamda.*list"):
+            CBPMultiHeadMLPLearner.from_config(per_head_tuple)
+
+    def test_wrapper_from_config_requires_exact_outer_schema(self):
+        config = CBPMultiHeadMLPLearner(n_heads=1, hidden_sizes=()).to_config()
+        for field, value in (
+            ("type", "WrongLearner"),
+            ("state_schema", "wrong-schema"),
+        ):
+            invalid = dict(config)
+            invalid[field] = value
+            with pytest.raises(ValueError):
+                CBPMultiHeadMLPLearner.from_config(invalid)
+
+        missing = dict(config)
+        missing.pop("optimizer")
+        with pytest.raises(ValueError, match="fields"):
+            CBPMultiHeadMLPLearner.from_config(missing)
+        unknown = dict(config)
+        unknown["unknown"] = 1
+        with pytest.raises(ValueError, match="fields"):
+            CBPMultiHeadMLPLearner.from_config(unknown)
+
 
 # =============================================================================
 # Utility update behaviour

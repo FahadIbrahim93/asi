@@ -65,6 +65,26 @@ MULTI_HEAD_LIFETIME_COUNTER_NBYTES = 12
 MULTI_HEAD_LIFETIME_COUNTER_DELTA_NBYTES = 8
 
 _INT32_MAX = 2**31 - 1
+_CONFIG_FIELDS = frozenset(
+    {
+        "type",
+        "state_schema",
+        "n_heads",
+        "hidden_sizes",
+        "optimizer",
+        "bounder",
+        "normalizer",
+        "head_optimizer",
+        "sparsity",
+        "leaky_relu_slope",
+        "use_layer_norm",
+        "gamma",
+        "lamda",
+        "per_head_gamma_lamda",
+        "trace_mode",
+        "utility_decay",
+    }
+)
 
 _ACTUAL_INT_TYPES: tuple[type, ...] = (
     int,
@@ -89,17 +109,24 @@ def _require_int(
     maximum: int | None = None,
 ) -> int:
     if type(value) not in _ACTUAL_INT_TYPES:
-        raise ValueError(f"{name} must be an integer, got {value!r}")
+        raise ValueError(f"{name} must be an integer")
     number = operator.index(cast(SupportsIndex, value))
     if minimum is not None and number < minimum:
         if minimum == 1:
-            raise ValueError(f"{name} must be positive, got {value!r}")
+            raise ValueError(f"{name} must be positive, got {number}")
         if minimum == 0:
-            raise ValueError(f"{name} must be non-negative, got {value!r}")
-        raise ValueError(f"{name} must be >= {minimum}, got {value!r}")
+            raise ValueError(f"{name} must be non-negative, got {number}")
+        raise ValueError(f"{name} must be >= {minimum}, got {number}")
     if maximum is not None and number > maximum:
-        raise ValueError(f"{name} must be <= {maximum}, got {value!r}")
+        raise ValueError(f"{name} must be <= {maximum}, got {number}")
     return number
+
+
+def _require_int32_product(name: str, left: int, right: int) -> int:
+    """Return a derived allocation count or reject it before array construction."""
+    if left > _INT32_MAX // right:
+        raise ValueError(f"derived {name} must be at most {_INT32_MAX}")
+    return left * right
 
 
 def _skip_zero_scale(scale: Array, value: Array) -> Array:
@@ -404,6 +431,21 @@ class MultiHeadMLPLearner:
             _require_int(f"hidden_sizes[{i}]", v, minimum=1, maximum=_INT32_MAX)
             for i, v in enumerate(hidden_sizes)
         )
+        for layer_index, (fan_in, fan_out) in enumerate(
+            zip(hidden_sizes, hidden_sizes[1:], strict=False)
+        ):
+            _require_int32_product(
+                f"hidden_layer[{layer_index}]_scalars",
+                fan_in,
+                fan_out,
+            )
+        _require_int32_product("per_head_metrics_scalars", n_heads, 3)
+        if hidden_sizes:
+            _require_int32_product("head_weight_scalars", n_heads, hidden_sizes[-1])
+        if per_head_gamma_lamda is not None and type(per_head_gamma_lamda) is not tuple:
+            raise ValueError(
+                "per_head_gamma_lamda must be an actual tuple when constructed directly"
+            )
         if not 0.0 <= utility_decay < 1.0:
             raise ValueError("utility_decay must be in [0, 1)")
 
@@ -468,6 +510,11 @@ class MultiHeadMLPLearner:
         return self._n_heads
 
     @property
+    def hidden_sizes(self) -> tuple[int, ...]:
+        """Canonical hidden-layer widths."""
+        return self._hidden_sizes
+
+    @property
     def normalizer(self) -> Normalizer[Any] | None:
         """The feature normalizer, or None if normalization is disabled."""
         return self._normalizer
@@ -523,13 +570,27 @@ class MultiHeadMLPLearner:
             optimizer_from_config,
         )
 
-        config = dict(config)
-        config.pop("type", None)
-        state_schema = config.pop("state_schema", MULTI_HEAD_MLP_STATE_SCHEMA)
-        if state_schema != MULTI_HEAD_MLP_STATE_SCHEMA:
-            raise ValueError(
-                f"Unsupported MultiHeadMLP state schema: {state_schema!r}"
-            )
+        if type(config) is not dict:
+            raise ValueError("MultiHeadMLPLearner config must be an actual dict")
+        if not all(type(key) is str for key in config) or set(config) != _CONFIG_FIELDS:
+            raise ValueError("MultiHeadMLPLearner config fields do not match the schema")
+        if type(config["type"]) is not str or config["type"] != "MultiHeadMLPLearner":
+            raise ValueError("unexpected MultiHeadMLPLearner config type")
+        if (
+            type(config["state_schema"]) is not str
+            or config["state_schema"] != MULTI_HEAD_MLP_STATE_SCHEMA
+        ):
+            raise ValueError("unsupported MultiHeadMLP state schema")
+        if type(config["hidden_sizes"]) is not list:
+            raise ValueError("hidden_sizes must be a list")
+        if (
+            config["per_head_gamma_lamda"] is not None
+            and type(config["per_head_gamma_lamda"]) is not list
+        ):
+            raise ValueError("per_head_gamma_lamda must be a list")
+        config = config.copy()
+        config.pop("type")
+        config.pop("state_schema")
 
         optimizer = optimizer_from_config(config.pop("optimizer"))
         bounder_cfg = config.pop("bounder", None)
@@ -543,29 +604,16 @@ class MultiHeadMLPLearner:
             optimizer_from_config(head_opt_cfg) if head_opt_cfg is not None else None
         )
 
-        per_head_gl = config.pop("per_head_gamma_lamda", None)
+        per_head_gl = config.pop("per_head_gamma_lamda")
         if per_head_gl is not None:
-            if type(per_head_gl) is not list:
-                raise ValueError(
-                    f"per_head_gamma_lamda must be a list, got {type(per_head_gl).__name__}"
-                )
-            per_head_gl = tuple(
-                validated_float32_scalar(
-                    f"per_head_gamma_lamda[{i}]", v, lower=0.0, upper=1.0
-                )
-                for i, v in enumerate(per_head_gl)
-            )
+            per_head_gl = tuple(per_head_gl)
 
-        trace_mode_str = config.pop("trace_mode", None)
-        trace_mode = (
-            TraceMode(trace_mode_str) if trace_mode_str is not None else TraceMode.ACCUMULATING
-        )
+        trace_mode_str = config.pop("trace_mode")
+        if type(trace_mode_str) is not str:
+            raise ValueError("trace_mode must be a string")
+        trace_mode = TraceMode(trace_mode_str)
 
         raw_hidden = config.pop("hidden_sizes")
-        if type(raw_hidden) is not list:
-            raise ValueError(
-                f"hidden_sizes must be a list, got {type(raw_hidden).__name__}"
-            )
 
         return cls(
             n_heads=config.pop("n_heads"),
@@ -593,6 +641,12 @@ class MultiHeadMLPLearner:
         feature_dim = _require_int(
             "feature_dim", feature_dim, minimum=1, maximum=_INT32_MAX
         )
+        if self._hidden_sizes:
+            _require_int32_product(
+                "input_layer_scalars", feature_dim, self._hidden_sizes[0]
+            )
+        else:
+            _require_int32_product("linear_head_weight_scalars", self._n_heads, feature_dim)
         # Trunk: [feature_dim, *hidden_sizes] — all hidden layers
         trunk_layer_sizes = [feature_dim, *self._hidden_sizes]
 
