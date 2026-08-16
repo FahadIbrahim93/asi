@@ -272,10 +272,14 @@ def _validated_config_float(name: str, value: object, **bounds: Any) -> float:
         raise ValueError(f"{name} must be numeric, not bool")
     if type(value) not in (_ACTUAL_INT_TYPES | _ACTUAL_FLOAT_TYPES):
         raise ValueError(f"{name} must be a finite real scalar")
-    host_value = float(cast(Any, value))
-    magnitude = abs(host_value)
+    try:
+        magnitude = abs(float(cast(Any, value)))
+    except (OverflowError, ValueError) as error:
+        raise ValueError(
+            f"{name} must be exactly zero or representable as a finite normal float32"
+        ) from error
     if (
-        not math.isfinite(host_value)
+        not math.isfinite(magnitude)
         or magnitude > _FLOAT32_MAX
         or (magnitude != 0.0 and magnitude < _FLOAT32_TINY)
     ):
@@ -344,7 +348,10 @@ def _preflight_state_resources(
         + 4 * width
         + 3
     )
-    logical_scalars = float32_scalars + 7
+    # Two statistics counters, last action, typed key, step counter, and the
+    # started flag are six logical array elements. The typed key occupies two
+    # uint32 words physically, which is reflected separately in state_nbytes.
+    logical_scalars = float32_scalars + 6
     state_nbytes = 4 * (float32_scalars + 6) + 1
     resources = {
         "parameter_scalars": parameters,

@@ -2065,6 +2065,8 @@ def test_config_rejects_hostile_numeric_and_serialized_container_hooks() -> None
 
     with pytest.raises(ValueError, match="gamma"):
         _small_config(gamma=HostileFloat(0.9))
+    with pytest.raises(ValueError, match="finite normal float32"):
+        _small_config(gamma=10**1000)
     payload = _small_config().to_config()
     with pytest.raises(ValueError, match="exact built-in dict"):
         RecurrentTraceActorCriticConfig.from_config(DictSubclass(payload))
@@ -2079,13 +2081,18 @@ def test_state_resource_budget_is_exact_and_init_preflights_before_rng(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config = _small_config()
-    assert config.state_resource_budget(2) == {
+    budget = config.state_resource_budget(2)
+    assert budget == {
         "parameter_scalars": 124,
         "sensitivity_scalars_per_network": 36,
         "float32_state_scalars": 343,
-        "state_scalars": 350,
+        "state_scalars": 349,
         "state_nbytes": 1397,
     }
+    state = RecurrentTraceActorCriticAgent(config).init(2, jr.key(2))
+    leaves = jax.tree.leaves(state)
+    assert budget["state_scalars"] == sum(int(leaf.size) for leaf in leaves)
+    assert budget["state_nbytes"] == sum(int(leaf.nbytes) for leaf in leaves)
 
     def forbidden_split(*args: Any, **kwargs: Any) -> Any:
         raise AssertionError("RNG split must not run before resource validation")
