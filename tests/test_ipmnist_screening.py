@@ -4034,9 +4034,13 @@ class TestOptimizerFloorHybrids:
 
 class TestGatedL2Init:
     """``sigma0_ndecay099_gated_l2init``: an additive, utility-gated pull
-    toward the initial weights on top of the campaign champion (ported CCBP /
+    toward the initial weights on top of a historical comparison baseline (ported CCBP /
     Calibrated-Partial-Resets-style graded reset; see
     :func:`alberta_framework.benchmarks.ipmnist_screening._make_sigma0_gated_l2init_learner`)."""
+
+    def test_registry_binds_ema_frozen_probe_input(self):
+        spec = screening_spec("sigma0_ndecay099_gated_l2init")
+        assert spec.frozen_probe_input is _ema_frozen_probe_input
 
     def test_pull_scale_zero_reduces_to_sigma0_ndecay099_bitwise(self):
         """``l2init_pull_scale=0`` collapses the additive pull term to

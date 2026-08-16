@@ -5082,7 +5082,7 @@ class UPGDGatedL2InitNormState:
 def _make_sigma0_gated_l2init_learner(
     hp: Mapping[str, float],
 ) -> tuple[LearnerInitFn, ScreeningStepFn]:
-    """``sigma0_ndecay099`` champion plus an additive, utility-GATED pull
+    """``sigma0_ndecay099`` baseline plus an additive, utility-gated pull
     toward the initial weights.
 
     Ported idea: continuous utility-scaled soft resets (CCBP,
@@ -5091,7 +5091,7 @@ def _make_sigma0_gated_l2init_learner(
     every hidden parameter toward its initial value dominates both
     decay-based (L2/Shrink-and-Perturb) and hard-reset (CBP/ReDO) methods at
     long horizons. This arm tests that mechanism's isolated marginal
-    contribution on top of the campaign champion, reusing the champion's own
+    contribution on top of that historical baseline, reusing the baseline's own
     UPGD utility gate as the per-unit "graded reset" weight: ``1 - gate`` is
     large for low-utility (unprotected) units and near zero for high-utility
     (protected) ones, so the pull toward init is concentrated exactly where
@@ -5102,14 +5102,14 @@ def _make_sigma0_gated_l2init_learner(
 
     Deviation from the source papers: they replace their baseline's
     decay/reset term outright; here the pull is an ADDITIVE new term next to
-    the champion's existing uniform decoupled weight decay (rather than a
+    the baseline's existing uniform decoupled weight decay (rather than a
     replacement), so this measures the isolated contribution of graded,
     utility-gated pull-toward-init rather than a full swap of the
     regularizer family.
 
     ``l2init_pull_scale = 0`` (the default) is inert: the new term is
     multiplied by exactly zero and the step routes through the identical
-    ``lean_upgd_w_update`` call the champion factory's own inert path uses,
+    ``lean_upgd_w_update`` call the baseline factory's own inert path uses,
     so the trajectory is bit-exact against ``sigma0_ndecay099`` (pinned by a
     unit test) rather than relying on floating-point cancellation of a zero
     term.
@@ -5812,12 +5812,13 @@ def _build_registry() -> dict[str, ScreeningSpec]:
             mechanism="gated_l2_init",
             hyperparameters=_sigma0_ext_hp(norm_decay=0.99, l2init_pull_scale=0.01),
             factory=_make_sigma0_gated_l2init_learner,
+            frozen_probe_input=_ema_frozen_probe_input,
             description=(
-                "sigma0_ndecay099 champion plus an additive utility-gated pull "
+                "sigma0_ndecay099 historical baseline plus an additive utility-gated pull "
                 "toward init (CCBP/Calibrated-Partial-Resets-style graded reset; "
                 "l2init_pull_scale=0.01, matching the repo's established L2-Init "
                 "regularization strength); l2init_pull_scale=0 reduces bit-exactly "
-                "to the champion."
+                "to the baseline."
             ),
         )
     )
