@@ -485,7 +485,15 @@ class EMANormalizer(Normalizer[EMANormalizerState]):
         """
         status = self.counter_status(state)
         observation_valid = jnp.all(jnp.isfinite(observation))
-        source_state_finite = _floating_tree_is_finite(state)
+        zero_decay = state.decay == jnp.asarray(0.0, dtype=jnp.float32)
+        checked_state = EMANormalizerState(
+            mean=jnp.where(zero_decay, jnp.zeros_like(state.mean), state.mean),
+            var=jnp.where(zero_decay, jnp.ones_like(state.var), state.var),
+            sample_count=state.sample_count,
+            sample_count_words=state.sample_count_words,
+            decay=state.decay,
+        )
+        source_state_finite = _floating_tree_is_finite(checked_state)
         update_available = (
             status.update_available & observation_valid & source_state_finite
         )
@@ -500,10 +508,23 @@ class EMANormalizer(Normalizer[EMANormalizerState]):
                 state.decay,
                 1.0 - 1.0 / (new_count_float + 1.0),
             )
-            delta = observation - state.mean
-            new_mean = state.mean + (1.0 - effective_decay) * delta
+            mean_for_update = jnp.where(
+                zero_decay & ~jnp.isfinite(state.mean),
+                observation,
+                state.mean,
+            )
+            delta = observation - mean_for_update
+            new_mean = mean_for_update + (1.0 - effective_decay) * delta
             delta2 = observation - new_mean
-            new_var = effective_decay * state.var + (1.0 - effective_decay) * delta * delta2
+            var_for_update = jnp.where(
+                zero_decay & ~jnp.isfinite(state.var),
+                jnp.zeros_like(state.var),
+                state.var,
+            )
+            new_var = (
+                effective_decay * var_for_update
+                + (1.0 - effective_decay) * delta * delta2
+            )
             new_var = jnp.maximum(new_var, self._epsilon)
             normalized = (observation - new_mean) / (jnp.sqrt(new_var) + self._epsilon)
             return normalized, EMANormalizerState(
@@ -737,7 +758,15 @@ class StreamingBatchNormalizer(Normalizer[StreamingBatchNormalizerState]):
         """Normalize and conditionally commit BatchNorm-style moments."""
         status = self.counter_status(state)
         observation_valid = jnp.all(jnp.isfinite(observation))
-        source_state_finite = _floating_tree_is_finite(state)
+        zero_momentum = state.momentum == jnp.asarray(0.0, dtype=jnp.float32)
+        checked_state = StreamingBatchNormalizerState(
+            mean=state.mean,
+            var=jnp.where(zero_momentum, jnp.ones_like(state.var), state.var),
+            sample_count=state.sample_count,
+            sample_count_words=state.sample_count_words,
+            momentum=state.momentum,
+        )
+        source_state_finite = _floating_tree_is_finite(checked_state)
         update_available = (
             status.update_available & observation_valid & source_state_finite
         )
@@ -752,7 +781,15 @@ class StreamingBatchNormalizer(Normalizer[StreamingBatchNormalizerState]):
             candidate_mean = state.momentum * state.mean + one_minus_m * observation
             new_mean = jnp.where(is_first, observation, candidate_mean)
             centered = observation - state.mean
-            candidate_var = state.momentum * state.var + one_minus_m * (centered * centered)
+            var_for_update = jnp.where(
+                zero_momentum & ~jnp.isfinite(state.var),
+                jnp.zeros_like(state.var),
+                state.var,
+            )
+            candidate_var = (
+                state.momentum * var_for_update
+                + one_minus_m * (centered * centered)
+            )
             new_var = jnp.where(
                 is_first,
                 jnp.ones_like(state.var),

@@ -91,6 +91,73 @@ class TestEMANormalizer:
         # (not exact due to decay and numerical issues)
         chex.assert_trees_all_close(state.mean, sample_observation, atol=0.5)
 
+    def test_zero_decay_recovers_from_nonfinite_unused_moments(self) -> None:
+        """A zero-decay update does not consume either previous moment."""
+        normalizer = EMANormalizer(decay=0.0)
+        obs = jnp.array([1.0, -2.0], dtype=jnp.float32)
+        state = normalizer.normalize(normalizer.init(2), obs)[1]
+        state = state.replace(
+            mean=jnp.full(2, jnp.inf, dtype=jnp.float32),
+            var=jnp.full(2, jnp.inf, dtype=jnp.float32),
+        )
+        result = normalizer.normalize_with_diagnostics(state, obs)
+        assert isinstance(result.state, EMANormalizerState)
+        assert bool(result.update_applied)
+        chex.assert_trees_all_close(result.state.mean, obs)
+        chex.assert_trees_all_close(
+            result.state.var,
+            jnp.full_like(obs, normalizer._epsilon),
+        )
+        chex.assert_trees_all_close(result.normalized, jnp.zeros_like(obs))
+
+    def test_zero_decay_preserves_finite_update_arithmetic(self) -> None:
+        """Finite zero-decay updates retain the established rounding path."""
+        normalizer = EMANormalizer(decay=0.0)
+        state = normalizer.normalize(
+            normalizer.init(1),
+            jnp.array([0.0], dtype=jnp.float32),
+        )[1]
+        state = state.replace(
+            mean=jnp.array([1.0e20], dtype=jnp.float32),
+            var=jnp.array([7.0], dtype=jnp.float32),
+        )
+        obs = jnp.array([1.0], dtype=jnp.float32)
+        delta = obs - state.mean
+        expected_mean = state.mean + delta
+        delta2 = obs - expected_mean
+        expected_var = jnp.maximum(
+            jnp.asarray(0.0, dtype=jnp.float32) * state.var + delta * delta2,
+            normalizer._epsilon,
+        )
+
+        result = normalizer.normalize_with_diagnostics(state, obs)
+        assert isinstance(result.state, EMANormalizerState)
+        assert bool(result.update_applied)
+        chex.assert_trees_all_equal(result.state.mean, expected_mean)
+        chex.assert_trees_all_equal(result.state.var, expected_var)
+        assert not bool(jnp.array_equal(result.state.mean, obs))
+
+    def test_zero_decay_config_does_not_relax_nonzero_persisted_decay(self) -> None:
+        """A host/state decay mismatch remains fail-closed with poisoned moments."""
+        normalizer = EMANormalizer(decay=0.0)
+        state = normalizer.init(1).replace(
+            mean=jnp.array([jnp.inf], dtype=jnp.float32),
+            var=jnp.array([jnp.inf], dtype=jnp.float32),
+            decay=jnp.asarray(0.5, dtype=jnp.float32),
+        )
+
+        result = normalizer.normalize_with_diagnostics(
+            state,
+            jnp.array([2.0], dtype=jnp.float32),
+        )
+        assert isinstance(result.state, EMANormalizerState)
+        assert not bool(result.counter_valid)
+        assert not bool(result.update_applied)
+        assert bool(jnp.all(jnp.isfinite(result.normalized)))
+        chex.assert_trees_all_equal(result.normalized, jnp.zeros(1, dtype=jnp.float32))
+        chex.assert_trees_all_equal(result.state.sample_count_words, state.sample_count_words)
+
+
 class TestWelfordNormalizer:
     """Tests for the WelfordNormalizer class."""
 
@@ -214,6 +281,96 @@ class TestStreamingBatchNormalizer:
         assert isinstance(restored, StreamingBatchNormalizer)
         assert restored._momentum == 0.75
         assert restored._epsilon == 1e-4
+
+    def test_zero_momentum_preserves_finite_variance_update(self) -> None:
+        """The previous mean still defines variance when momentum is zero."""
+        normalizer = StreamingBatchNormalizer(momentum=0.0)
+        state = normalizer.normalize(
+            normalizer.init(2),
+            jnp.array([0.0, 0.0], dtype=jnp.float32),
+        )[1]
+        state = state.replace(
+            mean=jnp.array([4.0, -5.0], dtype=jnp.float32),
+            var=jnp.array([2.0, 3.0], dtype=jnp.float32),
+        )
+        obs = jnp.array([1.0, -2.0], dtype=jnp.float32)
+        expected_mean = state.momentum * state.mean + (1.0 - state.momentum) * obs
+        centered = obs - state.mean
+        expected_var = jnp.maximum(
+            state.momentum * state.var
+            + (1.0 - state.momentum) * (centered * centered),
+            normalizer._epsilon,
+        )
+
+        result = normalizer.normalize_with_diagnostics(state, obs)
+        assert isinstance(result.state, StreamingBatchNormalizerState)
+        assert bool(result.update_applied)
+        chex.assert_trees_all_equal(result.state.mean, expected_mean)
+        chex.assert_trees_all_equal(result.state.var, expected_var)
+        assert bool(jnp.all(result.state.var > normalizer._epsilon))
+
+    def test_zero_momentum_recovers_from_nonfinite_unused_variance(self) -> None:
+        """Only the zero-scaled previous variance may be nonfinite."""
+        normalizer = StreamingBatchNormalizer(momentum=0.0)
+        state = normalizer.normalize(
+            normalizer.init(2),
+            jnp.array([0.0, 0.0], dtype=jnp.float32),
+        )[1]
+        state = state.replace(
+            mean=jnp.array([4.0, -5.0], dtype=jnp.float32),
+            var=jnp.full(2, jnp.inf, dtype=jnp.float32),
+        )
+        obs = jnp.array([1.0, -2.0], dtype=jnp.float32)
+
+        result = normalizer.normalize_with_diagnostics(state, obs)
+        assert isinstance(result.state, StreamingBatchNormalizerState)
+        assert bool(result.update_applied)
+        chex.assert_trees_all_equal(result.state.mean, obs)
+        chex.assert_trees_all_equal(result.state.var, (obs - state.mean) ** 2)
+        chex.assert_tree_all_finite(result.normalized)
+
+    def test_zero_momentum_rejects_nonfinite_consumed_mean(self) -> None:
+        """The previous mean cannot be ignored because variance consumes it."""
+        normalizer = StreamingBatchNormalizer(momentum=0.0)
+        state = normalizer.normalize(
+            normalizer.init(1),
+            jnp.array([0.0], dtype=jnp.float32),
+        )[1]
+        state = state.replace(
+            mean=jnp.array([jnp.inf], dtype=jnp.float32),
+            var=jnp.array([jnp.inf], dtype=jnp.float32),
+        )
+
+        result = normalizer.normalize_with_diagnostics(
+            state,
+            jnp.array([2.0], dtype=jnp.float32),
+        )
+        assert isinstance(result.state, StreamingBatchNormalizerState)
+        assert bool(result.counter_valid)
+        assert not bool(result.update_applied)
+        assert bool(jnp.all(jnp.isfinite(result.normalized)))
+        chex.assert_trees_all_equal(result.normalized, jnp.zeros(1, dtype=jnp.float32))
+        chex.assert_trees_all_equal(result.state.sample_count_words, state.sample_count_words)
+
+    def test_zero_momentum_config_does_not_relax_nonzero_persisted_value(self) -> None:
+        """A host/state momentum mismatch remains fail-closed with poisoned moments."""
+        normalizer = StreamingBatchNormalizer(momentum=0.0)
+        state = normalizer.init(1).replace(
+            mean=jnp.array([jnp.inf], dtype=jnp.float32),
+            var=jnp.array([jnp.inf], dtype=jnp.float32),
+            momentum=jnp.asarray(0.5, dtype=jnp.float32),
+        )
+
+        result = normalizer.normalize_with_diagnostics(
+            state,
+            jnp.array([2.0], dtype=jnp.float32),
+        )
+        assert isinstance(result.state, StreamingBatchNormalizerState)
+        assert not bool(result.counter_valid)
+        assert not bool(result.update_applied)
+        assert bool(jnp.all(jnp.isfinite(result.normalized)))
+        chex.assert_trees_all_equal(result.normalized, jnp.zeros(1, dtype=jnp.float32))
+        chex.assert_trees_all_equal(result.state.sample_count_words, state.sample_count_words)
 
 
 class TestNormalizerABC:
