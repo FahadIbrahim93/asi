@@ -20,14 +20,15 @@ Reference: Sutton & Barto 2018, Section 10.1 (Episodic Semi-gradient SARSA)
 
 import dataclasses
 import functools
+import operator
 import time
-from numbers import Integral
-from typing import Any
+from typing import Any, SupportsIndex, cast
 
 import chex
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 from jax import Array
 from jaxtyping import Float, Int
 
@@ -56,6 +57,52 @@ from alberta_framework.core.types import (
 # =============================================================================
 
 
+_INT32_MAX = 2**31 - 1
+_ACTUAL_INT_TYPES = frozenset(
+    {
+        int,
+        np.int8,
+        np.int16,
+        np.int32,
+        np.int64,
+        np.uint8,
+        np.uint16,
+        np.uint32,
+        np.uint64,
+        np.longlong,
+        np.ulonglong,
+    }
+)
+_ACTUAL_FLOAT_TYPES = frozenset(
+    {float, *(np.dtype(code).type for code in ("e", "f", "d", "g"))}
+)
+
+
+def _require_int32(name: str, value: object, *, minimum: int, maximum: int = _INT32_MAX) -> int:
+    if type(value) not in _ACTUAL_INT_TYPES:
+        raise ValueError(f"{name} must be an integer in [{minimum}, {maximum}]")
+    canonical = operator.index(cast(SupportsIndex, value))
+    if not minimum <= canonical <= maximum:
+        raise ValueError(f"{name} must be an integer in [{minimum}, {maximum}]")
+    return canonical
+
+
+def _validated_config_float(name: str, value: object, **bounds: Any) -> float:
+    if type(value) not in (_ACTUAL_INT_TYPES | _ACTUAL_FLOAT_TYPES):
+        raise ValueError(f"{name} must be a finite real scalar")
+    return validated_float32_scalar(name, value, **bounds)
+
+
+def _preflight_sarsa_resources(n_actions: int, feature_dim: object) -> None:
+    width = _require_int32("feature_dim", feature_dim, minimum=1)
+    # The wrapper retains one observation and scalar lifecycle leaves while
+    # exposing one float32 policy/Q vector. The nested Horde owns its budget.
+    logical_scalars = n_actions + width + 5
+    state_nbytes = 4 * (width + 5)
+    if logical_scalars > _INT32_MAX or state_nbytes > _INT32_MAX:
+        raise ValueError("derived SARSA wrapper resources must fit signed int32")
+
+
 @chex.dataclass(frozen=True)
 class SARSAConfig:
     """Configuration for SARSA agent.
@@ -77,32 +124,25 @@ class SARSAConfig:
 
     def __post_init__(self) -> None:
         """Validate and canonicalize host configuration before JAX use."""
-        actual_actions_type = type(self.n_actions)
-        if (
-            issubclass(actual_actions_type, bool)
-            or not issubclass(actual_actions_type, Integral)
-            or self.n_actions < 1
-        ):
-            raise ValueError("n_actions must be a positive integer")
-        actual_decay_type = type(self.epsilon_decay_steps)
-        if (
-            issubclass(actual_decay_type, bool)
-            or not issubclass(actual_decay_type, Integral)
-            or self.epsilon_decay_steps < 0
-        ):
-            raise ValueError("epsilon_decay_steps must be a non-negative integer")
-        gamma = validated_float32_scalar("gamma", self.gamma, lower=0.0, upper=1.0)
-        epsilon_start = validated_float32_scalar(
+        n_actions = _require_int32("n_actions", self.n_actions, minimum=1)
+        epsilon_decay_steps = _require_int32(
+            "epsilon_decay_steps", self.epsilon_decay_steps, minimum=0
+        )
+        gamma = _validated_config_float("gamma", self.gamma, lower=0.0, upper=1.0)
+        epsilon_start = _validated_config_float(
             "epsilon_start", self.epsilon_start, lower=0.0, upper=1.0
         )
-        epsilon_end = validated_float32_scalar(
+        epsilon_end = _validated_config_float(
             "epsilon_end", self.epsilon_end, lower=0.0, upper=1.0
         )
-        if self.epsilon_decay_steps > 0 and epsilon_end > epsilon_start:
+        if epsilon_decay_steps > 0 and epsilon_end > epsilon_start:
             raise ValueError("epsilon_end must not exceed epsilon_start when decaying")
+        object.__setattr__(self, "n_actions", n_actions)
+        object.__setattr__(self, "epsilon_decay_steps", epsilon_decay_steps)
         object.__setattr__(self, "gamma", gamma)
         object.__setattr__(self, "epsilon_start", epsilon_start)
         object.__setattr__(self, "epsilon_end", epsilon_end)
+        _preflight_sarsa_resources(n_actions, 1)
 
     def to_config(self) -> dict[str, Any]:
         """Serialize to dict."""
@@ -117,6 +157,11 @@ class SARSAConfig:
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "SARSAConfig":
         """Reconstruct from config dict."""
+        if type(config) is not dict:
+            raise ValueError("config must be an exact built-in dict")
+        expected = {"n_actions", "gamma", "epsilon_start", "epsilon_end", "epsilon_decay_steps"}
+        if any(type(key) is not str for key in config) or set(config) != expected:
+            raise ValueError("config fields do not match the serialized schema")
         return cls(**config)
 
 
@@ -323,6 +368,13 @@ class SARSAAgent:
             trace_mode: Eligibility trace mode (ACCUMULATING or REPLACING)
             utility_decay: EMA decay for hidden-unit utility diagnostics.
         """
+        if type(sarsa_config) is not SARSAConfig:
+            raise ValueError("sarsa_config must be an exact SARSAConfig")
+        if prediction_demons is not None:
+            if type(prediction_demons) is not list:
+                raise ValueError("prediction_demons must be an exact list or None")
+            if any(type(demon) is not GVFSpec for demon in prediction_demons):
+                raise ValueError("prediction_demons entries must be exact GVFSpec values")
         self._sarsa_config = sarsa_config
         self._hidden_sizes = hidden_sizes
         self._lamda = lamda
@@ -398,11 +450,43 @@ class SARSAAgent:
             optimizer_from_config,
         )
 
+        if type(config) is not dict:
+            raise ValueError("serialized SARSA agent must be an exact built-in dict")
+        expected = {
+            "type",
+            "sarsa_config",
+            "lamda",
+            "prediction_demons",
+            "state_schema",
+            "hidden_sizes",
+            "optimizer",
+            "bounder",
+            "normalizer",
+            "head_optimizer",
+            "sparsity",
+            "leaky_relu_slope",
+            "use_layer_norm",
+            "trace_mode",
+            "utility_decay",
+        }
+        if any(type(key) is not str for key in config) or set(config) != expected:
+            raise ValueError("serialized SARSA agent fields do not match the schema")
+        if type(config["type"]) is not str or config["type"] != "SARSAAgent":
+            raise ValueError("unsupported SARSA agent type")
+        state_schema = config["state_schema"]
+        if type(state_schema) is not str or state_schema != MULTI_HEAD_MLP_STATE_SCHEMA:
+            raise ValueError("unsupported SARSA Horde state schema")
+        if type(config["sarsa_config"]) is not dict:
+            raise ValueError("serialized sarsa_config must be an exact built-in dict")
+        if type(config["hidden_sizes"]) is not list:
+            raise ValueError("serialized hidden_sizes must be an exact list")
+        raw_prediction_demons = config["prediction_demons"]
+        if raw_prediction_demons is not None and type(raw_prediction_demons) is not list:
+            raise ValueError("serialized prediction_demons must be an exact list or None")
+
         config = dict(config)
-        config.pop("type", None)
-        state_schema = config.pop("state_schema", MULTI_HEAD_MLP_STATE_SCHEMA)
-        if state_schema != MULTI_HEAD_MLP_STATE_SCHEMA:
-            raise ValueError(f"unsupported SARSA Horde state schema: {state_schema!r}")
+        config.pop("type")
+        config.pop("state_schema")
 
         sarsa_config = SARSAConfig.from_config(config.pop("sarsa_config"))
         optimizer = optimizer_from_config(config.pop("optimizer"))
@@ -412,15 +496,17 @@ class SARSAAgent:
         normalizer = normalizer_from_config(normalizer_cfg) if normalizer_cfg is not None else None
         head_opt_cfg = config.pop("head_optimizer", None)
         head_optimizer = optimizer_from_config(head_opt_cfg) if head_opt_cfg is not None else None
-        pred_demons_cfg = config.pop("prediction_demons", None)
+        pred_demons_cfg = config.pop("prediction_demons")
         prediction_demons = None
         if pred_demons_cfg is not None:
+            if any(type(demon) is not dict for demon in pred_demons_cfg):
+                raise ValueError("serialized prediction demon must be an exact built-in dict")
             prediction_demons = [GVFSpec.from_config(d) for d in pred_demons_cfg]
 
-        trace_mode_str = config.pop("trace_mode", None)
-        trace_mode = (
-            TraceMode(trace_mode_str) if trace_mode_str is not None else TraceMode.ACCUMULATING
-        )
+        trace_mode_str = config.pop("trace_mode")
+        if type(trace_mode_str) is not str:
+            raise ValueError("serialized trace_mode must be an exact string")
+        trace_mode = TraceMode(trace_mode_str)
 
         return cls(
             sarsa_config=sarsa_config,
@@ -444,6 +530,7 @@ class SARSAAgent:
         Returns:
             Initial SARSAState with zeroed last_action/observation
         """
+        _preflight_sarsa_resources(self.n_actions, feature_dim)
         key, subkey = jr.split(key)
         learner_state = self._horde.init(feature_dim, subkey)
 
@@ -598,12 +685,8 @@ class SARSAAgent:
             for i in range(n_actions):
                 w_trace, b_trace = head_traces[i]
                 decay = jnp.where(state.last_action == i, 1.0, gl)
-                skipped_w = jnp.where(
-                    decay == 0.0, jnp.zeros_like(w_trace), decay * w_trace
-                )
-                skipped_b = jnp.where(
-                    decay == 0.0, jnp.zeros_like(b_trace), decay * b_trace
-                )
+                skipped_w = jnp.where(decay == 0.0, jnp.zeros_like(w_trace), decay * w_trace)
+                skipped_b = jnp.where(decay == 0.0, jnp.zeros_like(b_trace), decay * b_trace)
                 new_w = jnp.where(terminated, jnp.zeros_like(w_trace), skipped_w)
                 new_b = jnp.where(terminated, jnp.zeros_like(b_trace), skipped_b)
                 head_traces[i] = (new_w, new_b)

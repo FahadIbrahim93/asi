@@ -75,9 +75,7 @@ class TestConfig:
             Fraction(1, 2),
         ],
     )
-    def test_step_size_supported_reals_canonicalize_for_json(
-        self, step_size: object
-    ) -> None:
+    def test_step_size_supported_reals_canonicalize_for_json(self, step_size: object) -> None:
         cfg = _simple_config(step_size=step_size)
         payload = cfg.to_config()
 
@@ -92,9 +90,7 @@ class TestConfig:
         assert cfg.step_size == 0.1
 
     def test_fraction_step_size_rounds_directly_to_float32(self) -> None:
-        above_half_midpoint = (
-            Fraction(1, 2) + Fraction(1, 2**25) + Fraction(1, 2**70)
-        )
+        above_half_midpoint = Fraction(1, 2) + Fraction(1, 2**25) + Fraction(1, 2**70)
         expected = float(np.nextafter(np.float32(0.5), np.float32(1.0)))
 
         cfg = _simple_config(step_size=above_half_midpoint)
@@ -124,9 +120,7 @@ class TestConfig:
             float(np.nextafter(np.finfo(np.float32).tiny, np.float32(0.0))),
         ],
     )
-    def test_step_size_rejects_nonfinite_or_subnormal_float32_sink(
-        self, step_size: object
-    ) -> None:
+    def test_step_size_rejects_nonfinite_or_subnormal_float32_sink(self, step_size: object) -> None:
         with pytest.raises(ValueError, match="step_size"):
             _simple_config(step_size=step_size)
 
@@ -255,9 +249,7 @@ class TestConfig:
             if serialized:
                 payload = _simple_config().to_config()
                 payload["step_size"] = step_sizes[attack]
-                StackedLinearHorde.from_config(
-                    {"type": "StackedLinearHorde", "config": payload}
-                )
+                StackedLinearHorde.from_config({"type": "StackedLinearHorde", "config": payload})
             else:
                 _simple_config(step_size=step_sizes[attack])
 
@@ -278,9 +270,7 @@ class TestConfig:
             if serialized:
                 payload = _simple_config().to_config()
                 payload["step_size"] = step_size
-                StackedLinearHorde.from_config(
-                    {"type": "StackedLinearHorde", "config": payload}
-                )
+                StackedLinearHorde.from_config({"type": "StackedLinearHorde", "config": payload})
             else:
                 _simple_config(step_size=step_size)
 
@@ -313,18 +303,14 @@ class TestConfig:
             if serialized:
                 payload = _simple_config().to_config()
                 payload["step_size"] = step_size
-                StackedLinearHorde.from_config(
-                    {"type": "StackedLinearHorde", "config": payload}
-                )
+                StackedLinearHorde.from_config({"type": "StackedLinearHorde", "config": payload})
             else:
                 _simple_config(step_size=step_size)
 
         assert calls == []
 
     @pytest.mark.parametrize("serialized", [False, True], ids=("direct", "from-config"))
-    def test_step_size_rejects_exact_fraction_with_zero_denominator(
-        self, serialized: bool
-    ) -> None:
+    def test_step_size_rejects_exact_fraction_with_zero_denominator(self, serialized: bool) -> None:
         property_calls: list[str] = []
 
         class Carrier(Fraction):
@@ -347,9 +333,7 @@ class TestConfig:
             if serialized:
                 payload = _simple_config().to_config()
                 payload["step_size"] = step_size
-                StackedLinearHorde.from_config(
-                    {"type": "StackedLinearHorde", "config": payload}
-                )
+                StackedLinearHorde.from_config({"type": "StackedLinearHorde", "config": payload})
             else:
                 _simple_config(step_size=step_size)
 
@@ -366,9 +350,7 @@ class TestConfig:
         payload["step_size"] = step_size
 
         with pytest.raises(ValueError, match="step_size"):
-            StackedLinearHorde.from_config(
-                {"type": "StackedLinearHorde", "config": payload}
-            )
+            StackedLinearHorde.from_config({"type": "StackedLinearHorde", "config": payload})
 
     def test_minimum_normal_step_size_survives_jit_execution(self) -> None:
         minimum = float(np.finfo(np.float32).tiny)
@@ -419,8 +401,8 @@ class TestCumulantSourceDomain:
 
     @pytest.mark.parametrize(
         "bad_index",
-        [-1, True, False, np.int32(1), 1.0, "1"],
-        ids=("negative", "true", "false", "numpy-int", "float", "str"),
+        [-1, True, False, 1.5, 1.0, "1"],
+        ids=("negative", "true", "false", "float-fraction", "float-int", "str"),
     )
     def test_config_rejects_non_builtin_or_negative_indices(self, bad_index: object) -> None:
         with pytest.raises(ValueError, match="cumulant_indices"):
@@ -523,9 +505,7 @@ class TestExactSemantics:
         # w += 0.1*2.18*[0.45,1] = [0.2981, 0.218].
         r2 = horde.update(r1.state, x1, x0, c)
         np.testing.assert_allclose(np.asarray(r2.td_errors), [2.18], rtol=1e-6)
-        np.testing.assert_allclose(
-            np.asarray(r2.state.weights), [[0.2 + 0.0981, 0.218]], rtol=1e-5
-        )
+        np.testing.assert_allclose(np.asarray(r2.state.weights), [[0.2 + 0.0981, 0.218]], rtol=1e-5)
 
     def test_nan_cumulant_freezes_weights_decays_trace(self):
         cfg = _simple_config()
@@ -550,9 +530,7 @@ class TestExactSemantics:
             rtol=1e-6,
         )
         # Demon 1 weights moved.
-        assert not np.array_equal(
-            np.asarray(r2.state.weights[1]), np.asarray(r.state.weights[1])
-        )
+        assert not np.array_equal(np.asarray(r2.state.weights[1]), np.asarray(r.state.weights[1]))
 
     def test_rho_composes_into_trace(self):
         """z = rho * (decay * z + x): rho=0 zeroes the trace and the update."""
@@ -738,17 +716,13 @@ class TestDemonAxisScaling:
         sources = jr.normal(rng[1], (num_steps, feature_dim), dtype=jnp.float32)
 
         t0 = time.time()
-        final_state, td_errors = run_stacked_horde_scan(
-            horde, state, features, sources
-        )
+        final_state, td_errors = run_stacked_horde_scan(horde, state, features, sources)
         td_errors.block_until_ready()
         first_call = time.time() - t0
         assert first_call < 30.0, f"compile+run took {first_call:.1f}s"
 
         t1 = time.time()
-        final_state, td_errors = run_stacked_horde_scan(
-            horde, state, features, sources
-        )
+        final_state, td_errors = run_stacked_horde_scan(horde, state, features, sources)
         td_errors.block_until_ready()
         steady = time.time() - t1
         assert steady < 5.0, f"steady-state run took {steady:.1f}s"
@@ -783,3 +757,133 @@ class TestDemonAxisScaling:
         assert bool(jnp.all(late < early))
         # And the late TD error is near zero for all timescales.
         assert float(jnp.max(late)) < 0.01
+
+
+def test_stacked_horde_config_rejects_booleans_and_non_integers() -> None:
+    with pytest.raises(ValueError, match="n_demons"):
+        StackedHordeConfig(
+            n_demons=True,  # type: ignore[arg-type]
+            feature_dim=4,
+            gammas=(0.9,),
+            lamdas=(0.8,),
+            cumulant_indices=(0,),
+        )
+    with pytest.raises(ValueError, match="feature_dim"):
+        StackedHordeConfig(
+            n_demons=1,
+            feature_dim=4.5,  # type: ignore[arg-type]
+            gammas=(0.9,),
+            lamdas=(0.8,),
+            cumulant_indices=(0,),
+        )
+    with pytest.raises(ValueError, match="cumulant_indices"):
+        StackedHordeConfig(
+            n_demons=1,
+            feature_dim=4,
+            gammas=(0.9,),
+            lamdas=(0.8,),
+            cumulant_indices=(True,),  # type: ignore[arg-type]
+        )
+
+
+def test_stacked_horde_config_accepts_and_canonicalizes_numpy_integers() -> None:
+    cfg = StackedHordeConfig(
+        n_demons=np.int32(2),
+        feature_dim=np.int64(4),
+        gammas=(0.9, 0.5),
+        lamdas=(0.8, 0.7),
+        cumulant_indices=(np.int32(0), np.int64(1)),
+    )
+    assert type(cfg.n_demons) is int
+    assert type(cfg.feature_dim) is int
+    assert type(cfg.cumulant_indices[0]) is int
+    assert type(cfg.cumulant_indices[1]) is int
+    assert cfg.n_demons == 2
+    assert cfg.feature_dim == 4
+    assert cfg.cumulant_indices == (0, 1)
+
+
+_NUMPY_INTEGER_TYPES = tuple(dict.fromkeys(np.dtype(code).type for code in "bhilqBHILQpP"))
+
+
+@pytest.mark.parametrize("integer_type", _NUMPY_INTEGER_TYPES)
+def test_stacked_horde_config_canonicalizes_every_numpy_integer_family(
+    integer_type: type,
+) -> None:
+    config = StackedHordeConfig(
+        n_demons=integer_type(1),
+        feature_dim=integer_type(2),
+        gammas=(0.9,),
+        lamdas=(0.8,),
+        cumulant_indices=(integer_type(0),),
+    )
+
+    assert type(config.n_demons) is int
+    assert type(config.feature_dim) is int
+    assert type(config.cumulant_indices[0]) is int
+
+
+def test_stacked_horde_rejects_hostile_containers_and_float_values() -> None:
+    class TupleSubclass(tuple):
+        pass
+
+    class ClassSpoof:
+        @property
+        def __class__(self) -> type:
+            return float
+
+        def __repr__(self) -> str:
+            raise AssertionError("repr must not run")
+
+    with pytest.raises(ValueError, match="gammas"):
+        StackedHordeConfig(
+            n_demons=1,
+            feature_dim=2,
+            gammas=TupleSubclass((0.9,)),
+            lamdas=(0.8,),
+            cumulant_indices=(0,),
+        )
+    with pytest.raises(ValueError, match=r"gammas\[0\]"):
+        _simple_config(n_demons=1, gammas=(ClassSpoof(),))  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match=r"lamdas\[0\]"):
+        _simple_config(n_demons=1, lamdas=(True,))  # type: ignore[arg-type]
+
+
+def test_stacked_horde_from_config_accepts_only_exact_list_or_tuple_sequences() -> None:
+    payload = _simple_config().to_config()
+    payload["gammas"] = tuple(payload["gammas"])
+    assert StackedHordeConfig.from_config(payload).gammas == (0.9, 0.9)
+
+    payload = _simple_config().to_config()
+    payload["gammas"] = "0.9"
+    with pytest.raises(ValueError, match="gammas"):
+        StackedHordeConfig.from_config(payload)
+
+
+def test_stacked_horde_preflights_aggregate_resources_before_allocation() -> None:
+    last_feature_dim = (2**31 - 1 - 26) // 8
+    StackedHordeConfig(
+        n_demons=1,
+        feature_dim=last_feature_dim,
+        gammas=(0.9,),
+        lamdas=(0.8,),
+        cumulant_indices=(0,),
+    )
+    with pytest.raises(ValueError, match="aggregate bytes"):
+        StackedHordeConfig(
+            n_demons=1,
+            feature_dim=last_feature_dim + 1,
+            gammas=(0.9,),
+            lamdas=(0.8,),
+            cumulant_indices=(0,),
+        )
+
+
+def test_nexting_spec_preflights_before_materializing_derived_demons() -> None:
+    last_feature_dim = (2**31 - 1 - 26) // 8
+    with pytest.raises(ValueError, match="aggregate bytes"):
+        nexting_spec(
+            feature_dim=last_feature_dim + 1,
+            cumulant_indices=(0,),
+            gammas=(0.9,),
+        )
