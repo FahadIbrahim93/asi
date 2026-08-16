@@ -11,16 +11,19 @@ call so matched evaluator arms keep the same input and diagnostic surface.
 from __future__ import annotations
 
 import dataclasses
-import math
+import operator
 from collections.abc import Mapping
-from numbers import Real
-from typing import Any, Literal, cast
+from typing import Any, Literal, SupportsIndex, cast
 
 import chex
 import jax.numpy as jnp
 import numpy as np
 from jax import Array
 from jaxtyping import Bool, Float
+
+from alberta_framework.core._float32_scalars import (
+    validated_float32_scalar_with_ratio,
+)
 
 GradientMixMode = Literal["full", "behavior_only", "world_only", "discard"]
 GradientNormalization = Literal["none", "unit_l2"]
@@ -34,6 +37,29 @@ _VALID_MODES = frozenset({"full", "behavior_only", "world_only", "discard"})
 _VALID_NORMALIZATIONS = frozenset({"none", "unit_l2"})
 _FLOAT32_MAX = float(np.finfo(np.float32).max)
 _FLOAT32_TINY = float(np.finfo(np.float32).tiny)
+_INT32_MAX = 2**31 - 1
+_DIAGNOSTIC_FLOAT32_SCALARS = 12
+_OUTPUT_BOOL_SCALARS = 12
+_FIXED_OUTPUT_BYTES = 4 * _DIAGNOSTIC_FLOAT32_SCALARS + _OUTPUT_BOOL_SCALARS
+_MAX_REPRESENTATION_DIM = (_INT32_MAX - _FIXED_OUTPUT_BYTES) // 4
+_ACTUAL_INT_TYPES = frozenset(
+    {
+        int,
+        *(np.dtype(code).type for code in ("b", "B", "h", "H", "i", "I", "l", "L", "q", "Q")),
+    }
+)
+_ACTUAL_FLOAT_TYPES = frozenset(
+    {float, *(np.dtype(code).type for code in ("e", "f", "d", "g"))}
+)
+
+
+def _require_int32(name: str, value: object, *, minimum: int, maximum: int = _INT32_MAX) -> int:
+    if type(value) not in _ACTUAL_INT_TYPES:
+        raise ValueError(f"{name} must be an integer in [{minimum}, {maximum}]")
+    canonical = operator.index(cast(SupportsIndex, value))
+    if not minimum <= canonical <= maximum:
+        raise ValueError(f"{name} must be an integer in [{minimum}, {maximum}]")
+    return canonical
 
 
 def _strict_float32_scalar(
@@ -44,19 +70,24 @@ def _strict_float32_scalar(
 ) -> float:
     """Validate a finite nonnegative scalar with a stable float32 encoding."""
 
-    actual_type = type(value)
-    if issubclass(actual_type, bool) or not issubclass(actual_type, Real):
-        raise ValueError(f"{label} must be a real scalar")
-    normalized = float(cast(Real, value))
-    if not math.isfinite(normalized) or normalized < 0.0:
-        raise ValueError(f"{label} must be finite and non-negative")
-    if not allow_zero and normalized == 0.0:
-        raise ValueError(f"{label} must be positive")
-    if normalized > _FLOAT32_MAX:
-        raise ValueError(f"{label} exceeds the finite float32 range")
-    if normalized != 0.0 and normalized < _FLOAT32_TINY:
+    if type(value) not in (_ACTUAL_INT_TYPES | _ACTUAL_FLOAT_TYPES):
+        raise ValueError(f"{label} must be a finite real scalar")
+
+    normalized, numerator, denominator = validated_float32_scalar_with_ratio(
+        label,
+        value,
+        positive=not allow_zero,
+        lower=0.0 if allow_zero else None,
+        upper=_FLOAT32_MAX,
+    )
+    tiny_numerator, tiny_denominator = _FLOAT32_TINY.as_integer_ratio()
+    exact_is_subnormal = (
+        numerator != 0
+        and numerator * tiny_denominator < tiny_numerator * denominator
+    )
+    if exact_is_subnormal or (normalized != 0.0 and normalized < _FLOAT32_TINY):
         raise ValueError(f"{label} is below the normal float32 range")
-    return normalized
+    return 0.0 if numerator == 0 else normalized
 
 
 @dataclasses.dataclass(frozen=True)
@@ -83,8 +114,16 @@ class RepresentationGradientMixerConfig:
     def __post_init__(self) -> None:
         """Reject ambiguous, dynamic, or non-float32-representable rules."""
 
-        if type(self.representation_dim) is not int or self.representation_dim <= 0:
-            raise ValueError("representation_dim must be a positive strict integer")
+        object.__setattr__(
+            self,
+            "representation_dim",
+            _require_int32(
+                "representation_dim",
+                self.representation_dim,
+                minimum=1,
+                maximum=_MAX_REPRESENTATION_DIM,
+            ),
+        )
         if type(self.mode) is not str or self.mode not in _VALID_MODES:
             raise ValueError(
                 "mode must be full, behavior_only, world_only, or discard"
@@ -99,20 +138,32 @@ class RepresentationGradientMixerConfig:
             or self.grounded_world_normalization not in _VALID_NORMALIZATIONS
         ):
             raise ValueError("grounded_world_normalization must be none or unit_l2")
-        _strict_float32_scalar(
-            self.behavior_weight,
+        object.__setattr__(
+            self,
             "behavior_weight",
-            allow_zero=True,
+            _strict_float32_scalar(
+                self.behavior_weight,
+                "behavior_weight",
+                allow_zero=True,
+            ),
         )
-        _strict_float32_scalar(
-            self.grounded_world_weight,
+        object.__setattr__(
+            self,
             "grounded_world_weight",
-            allow_zero=True,
+            _strict_float32_scalar(
+                self.grounded_world_weight,
+                "grounded_world_weight",
+                allow_zero=True,
+            ),
         )
-        _strict_float32_scalar(
-            self.normalization_epsilon,
+        object.__setattr__(
+            self,
             "normalization_epsilon",
-            allow_zero=False,
+            _strict_float32_scalar(
+                self.normalization_epsilon,
+                "normalization_epsilon",
+                allow_zero=False,
+            ),
         )
         for label, value in (
             ("behavior_clip_norm", self.behavior_clip_norm),
@@ -120,7 +171,11 @@ class RepresentationGradientMixerConfig:
             ("final_clip_norm", self.final_clip_norm),
         ):
             if value is not None:
-                _strict_float32_scalar(value, label, allow_zero=False)
+                object.__setattr__(
+                    self,
+                    label,
+                    _strict_float32_scalar(value, label, allow_zero=False),
+                )
 
     def to_config(self) -> dict[str, object]:
         """Return the complete JSON-compatible mixing rule."""
@@ -157,6 +212,8 @@ class RepresentationGradientMixerConfig:
     ) -> RepresentationGradientMixerConfig:
         """Strictly reconstruct only an exact :meth:`to_config` payload."""
 
+        if type(config) is not dict:
+            raise ValueError("config must be an exact built-in dict")
         payload = dict(config)
         expected = {
             "schema",
@@ -172,13 +229,64 @@ class RepresentationGradientMixerConfig:
             "grounded_world_clip_norm",
             "final_clip_norm",
         }
-        if set(payload) != expected:
+        if any(type(key) is not str for key in payload) or set(payload) != expected:
             raise ValueError("config fields do not match the serialized schema")
-        if payload.pop("schema") != REPRESENTATION_GRADIENT_MIXER_CONFIG_SCHEMA:
+        schema = payload.pop("schema")
+        if (
+            type(schema) is not str
+            or schema != REPRESENTATION_GRADIENT_MIXER_CONFIG_SCHEMA
+        ):
             raise ValueError("config schema differs")
-        if payload.pop("type") != _CONFIG_TYPE:
+        config_type = payload.pop("type")
+        if type(config_type) is not str or config_type != _CONFIG_TYPE:
             raise ValueError("config type differs")
         return cls(**cast(dict[str, Any], payload))
+
+    @property
+    def resource_budget(self) -> RepresentationGradientMixerResourceBudget:
+        """Return the allocation contract for this stateless mixer."""
+
+        return RepresentationGradientMixerResourceBudget(
+            representation_dim=self.representation_dim,
+            persistent_state_scalars=0,
+            persistent_state_bytes=0,
+            output_float32_scalars=(
+                self.representation_dim + _DIAGNOSTIC_FLOAT32_SCALARS
+            ),
+            output_bool_scalars=_OUTPUT_BOOL_SCALARS,
+            output_scalars=(
+                self.representation_dim
+                + _DIAGNOSTIC_FLOAT32_SCALARS
+                + _OUTPUT_BOOL_SCALARS
+            ),
+            output_nbytes=(
+                4 * (self.representation_dim + _DIAGNOSTIC_FLOAT32_SCALARS)
+                + _OUTPUT_BOOL_SCALARS
+            ),
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class RepresentationGradientMixerResourceBudget:
+    """Exact persistent state and logical public-result payload accounting.
+
+    Output counts include the mixed gradient, diagnostics, and repeated
+    top-level decision fields. They intentionally exclude compiler-dependent
+    temporaries and do not assume that repeated result leaves alias buffers.
+    """
+
+    representation_dim: int
+    persistent_state_scalars: int
+    persistent_state_bytes: int
+    output_float32_scalars: int
+    output_bool_scalars: int
+    output_scalars: int
+    output_nbytes: int
+
+    def to_dict(self) -> dict[str, int]:
+        """Return a JSON-compatible resource record."""
+
+        return dataclasses.asdict(self)
 
 
 @chex.dataclass(frozen=True)
@@ -568,5 +676,6 @@ __all__ = [
     "RepresentationGradientMixDiagnostics",
     "RepresentationGradientMixResult",
     "RepresentationGradientMixerConfig",
+    "RepresentationGradientMixerResourceBudget",
     "mix_representation_gradients",
 ]
