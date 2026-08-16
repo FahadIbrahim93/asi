@@ -58,6 +58,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Validated frequency-mismatch bounds and Pavlovian noise in their actual
   float32 execution domain, rejecting overflowed or collapsed frequency
   intervals and overflowed noise scales before stream state can become invalid.
+- Preserved non-finite sentinels on rejected recurring-multiagent transition
+  payloads because the compatibility `step()` surface does not return the
+  separate transaction-validity bit; invalid events cannot masquerade as
+  ordinary finite zero-reward samples.
 - Rejected SIGReg samples, embeddings, directions, and derived projections that are
   non-finite in float32 arithmetic before they can become silent NaN losses, including
   under compiled and vectorized JAX calls.

@@ -405,21 +405,30 @@ def test_state_is_an_immutable_chex_pytree() -> None:
     chex.assert_trees_all_equal(rebuilt, state)
 
 
-def test_rejected_nonfinite_action_returns_finite_terminal_transition() -> None:
+def test_public_step_keeps_rejected_nonfinite_action_unaggregatable() -> None:
     world = RecurringTwoAgentWorld(nuisance_dim=0)
     state = world.init(jr.key(13)).replace(
         velocities=jnp.array([0.2, -0.1], dtype=jnp.float32),
     )
 
-    result = world.step_result(
+    transition, next_state = world.step(
         state,
         jnp.array([jnp.nan, 0.0], dtype=jnp.float32),
     )
 
-    assert bool(result.update_rejected)
-    assert bool(result.transition.terminated)
-    chex.assert_tree_all_finite(result.transition)
-    chex.assert_trees_all_equal(result.state, state)
+    assert bool(transition.terminated)
+    assert float(transition.discount) == 0.0
+    for payload in (
+        transition.observation,
+        transition.action,
+        transition.reward,
+        transition.next_observation,
+    ):
+        assert bool(jnp.all(jnp.isnan(payload)))
+    for leaf in jax.tree.leaves(transition.oracle):
+        if jnp.issubdtype(leaf.dtype, jnp.floating):
+            assert bool(jnp.all(jnp.isnan(leaf)))
+    chex.assert_trees_all_equal(next_state, state)
 
 
 def test_jitted_scan_runs_continually_and_remains_bounded() -> None:
