@@ -57,6 +57,21 @@ def _require_positive_float32(value: object, name: str) -> float:
         raise ValueError(f"{name} must be a positive finite float32 value")
     return converted
 
+
+def _require_nonnegative_float32(value: object, name: str) -> float:
+    """Return a finite non-negative value representable in the stream execution dtype."""
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError(f"{name} must be a finite non-negative float32 value")
+    try:
+        converted = round_real_to_float32(value)
+    except (FloatingPointError, OverflowError, TypeError, ValueError) as error:
+        raise ValueError(
+            f"{name} must be a finite non-negative float32 value"
+        ) from error
+    if not np.isfinite(converted) or converted < np.float32(0.0):
+        raise ValueError(f"{name} must be a finite non-negative float32 value")
+    return converted
+
 # =============================================================================
 # OutOfClassPolynomialStream -- degree-3 polynomial targets
 # =============================================================================
@@ -596,10 +611,10 @@ class CompositionalStream:
         self._outer_components = outer_components
         self._n_contexts = n_contexts
         self._context_length = context_length
-        self._feature_std = feature_std
+        self._feature_std = _require_nonnegative_float32(feature_std, "feature_std")
         self._weight_scale = weight_scale_float32
-        self._amplitude_scale = amplitude_scale
-        self._noise_std = noise_std
+        self._amplitude_scale = _require_nonnegative_float32(amplitude_scale, "amplitude_scale")
+        self._noise_std = _require_nonnegative_float32(noise_std, "noise_std")
 
     @property
     def feature_dim(self) -> int:
