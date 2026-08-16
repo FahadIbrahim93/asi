@@ -43,18 +43,20 @@ from __future__ import annotations
 import functools
 import hashlib
 import json
-import math
+import operator
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import Any, Protocol, TypeVar, cast, runtime_checkable
+from typing import Any, Protocol, SupportsIndex, TypeVar, cast, runtime_checkable
 
 import chex
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 from jax import Array
 from jaxtyping import Bool, Float, Int, UInt
 
+from alberta_framework.core._float32_scalars import validated_float32_scalar
 from alberta_framework.core.checkpoints import (
     load_checkpoint,
     load_checkpoint_metadata,
@@ -68,6 +70,59 @@ from alberta_framework.core.working_memory import (
 )
 
 _INT32_MAX = 2**31 - 1
+_ACTUAL_INT_TYPES = frozenset(
+    {
+        int,
+        np.int8,
+        np.int16,
+        np.int32,
+        np.int64,
+        np.uint8,
+        np.uint16,
+        np.uint32,
+        np.uint64,
+        np.longlong,
+        np.ulonglong,
+    }
+)
+
+
+def _require_integer(
+    name: str,
+    value: object,
+    *,
+    minimum: int,
+    maximum: int | None = None,
+) -> int:
+    if type(value) not in _ACTUAL_INT_TYPES:
+        raise ValueError(f"{name} must be an integer")
+    canonical = operator.index(cast(SupportsIndex, value))
+    if canonical < minimum or (maximum is not None and canonical > maximum):
+        domain = f"[{minimum}, {maximum}]" if maximum is not None else f">= {minimum}"
+        raise ValueError(f"{name} must be an integer in {domain}")
+    return canonical
+
+
+def _require_int32(name: str, value: object, *, minimum: int) -> int:
+    return _require_integer(name, value, minimum=minimum, maximum=_INT32_MAX)
+
+
+def _require_decay_rates(name: str, value: object) -> tuple[float, ...]:
+    if type(value) is not tuple:
+        raise ValueError(f"{name} must be an actual tuple")
+    rates = cast(tuple[object, ...], value)
+    return tuple(
+        validated_float32_scalar(
+            f"{name}[{index}]",
+            rate,
+            lower=0.0,
+            upper=1.0,
+            upper_inclusive=False,
+        )
+        for index, rate in enumerate(rates)
+    )
+
+
 _FLOAT32_MAX = 3.4028234663852886e38
 
 
@@ -75,6 +130,7 @@ def _saturating_int32_increment(value: Array) -> Array:
     maximum = jnp.asarray(_INT32_MAX, dtype=jnp.int32)
     counter = jnp.asarray(value, dtype=jnp.int32)
     return jnp.minimum(jnp.maximum(counter, 0), maximum - 1) + 1
+
 
 StateT = TypeVar("StateT")
 
@@ -95,6 +151,28 @@ class StateBuilderBudget:
     trainable_scalars: int
     state_scalars: int
     state_bytes: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "output_scalars",
+            _require_integer("output_scalars", self.output_scalars, minimum=0),
+        )
+        object.__setattr__(
+            self,
+            "trainable_scalars",
+            _require_integer("trainable_scalars", self.trainable_scalars, minimum=0),
+        )
+        object.__setattr__(
+            self,
+            "state_scalars",
+            _require_integer("state_scalars", self.state_scalars, minimum=0),
+        )
+        object.__setattr__(
+            self,
+            "state_bytes",
+            _require_integer("state_bytes", self.state_bytes, minimum=0),
+        )
 
     def to_config(self) -> dict[str, int]:
         """Return a JSON-compatible budget description."""
@@ -274,9 +352,7 @@ def _zero_learning_diagnostics(
     zero = jnp.asarray(0.0, dtype=jnp.float32)
     valid_array = jnp.asarray(valid, dtype=jnp.bool_)
     proposal_valid_array = (
-        valid_array
-        if proposal_valid is None
-        else jnp.asarray(proposal_valid, dtype=jnp.bool_)
+        valid_array if proposal_valid is None else jnp.asarray(proposal_valid, dtype=jnp.bool_)
     )
     return StateBuilderLearningDiagnostics(
         gradient_norm=zero,
@@ -478,8 +554,7 @@ def replace_state_builder_learning_proposal_update(
     source_shape = tuple(proposal.source_parameters.shape)
     if len(source_shape) != 1:
         raise ValueError(
-            "proposal.source_parameters must be a rank-one parameter vector; "
-            f"got {source_shape}"
+            f"proposal.source_parameters must be a rank-one parameter vector; got {source_shape}"
         )
     parameter_count = source_shape[0]
     _validate_learning_proposal_static_contract(proposal, parameter_count)
@@ -523,11 +598,6 @@ def replace_state_builder_learning_proposal_update(
             rejected=~valid,
         ),
     )
-
-
-def _validate_observation_dim(observation_dim: int) -> None:
-    if observation_dim < 1:
-        raise ValueError("observation_dim must be positive")
 
 
 def _action_features(action: Array | int, n_actions: int) -> Array:
@@ -630,7 +700,11 @@ class IdentityStateBuilderConfig:
     observation_dim: int
 
     def __post_init__(self) -> None:
-        _validate_observation_dim(self.observation_dim)
+        object.__setattr__(
+            self,
+            "observation_dim",
+            _require_int32("observation_dim", self.observation_dim, minimum=1),
+        )
 
     def to_config(self) -> dict[str, Any]:
         """Serialize to a JSON-compatible dictionary."""
@@ -644,7 +718,7 @@ class IdentityStateBuilderConfig:
         """Reconstruct from :meth:`to_config` output."""
         data = dict(payload)
         data.pop("type", None)
-        return cls(observation_dim=int(data["observation_dim"]))
+        return cls(observation_dim=data["observation_dim"])
 
 
 @chex.dataclass(frozen=True)
@@ -847,16 +921,33 @@ class FixedTraceStateBuilderConfig:
     include_raw_observation: bool = True
 
     def __post_init__(self) -> None:
-        _validate_observation_dim(self.observation_dim)
-        if self.n_actions < 0:
-            raise ValueError("n_actions must be non-negative")
-        for name, rates in (
-            ("observation_decay_rates", self.observation_decay_rates),
-            ("action_decay_rates", self.action_decay_rates),
-            ("outcome_decay_rates", self.outcome_decay_rates),
-        ):
-            if any(not math.isfinite(rate) or rate < 0.0 or rate >= 1.0 for rate in rates):
-                raise ValueError(f"{name} must contain finite values in [0, 1)")
+        object.__setattr__(
+            self,
+            "observation_dim",
+            _require_int32("observation_dim", self.observation_dim, minimum=1),
+        )
+        object.__setattr__(
+            self,
+            "n_actions",
+            _require_int32("n_actions", self.n_actions, minimum=0),
+        )
+        if type(self.include_raw_observation) is not bool:
+            raise ValueError("include_raw_observation must be a bool")
+        object.__setattr__(
+            self,
+            "observation_decay_rates",
+            _require_decay_rates("observation_decay_rates", self.observation_decay_rates),
+        )
+        object.__setattr__(
+            self,
+            "action_decay_rates",
+            _require_decay_rates("action_decay_rates", self.action_decay_rates),
+        )
+        object.__setattr__(
+            self,
+            "outcome_decay_rates",
+            _require_decay_rates("outcome_decay_rates", self.outcome_decay_rates),
+        )
         if (
             not self.include_raw_observation
             and not self.observation_decay_rates
@@ -883,12 +974,12 @@ class FixedTraceStateBuilderConfig:
         data = dict(payload)
         data.pop("type", None)
         return cls(
-            observation_dim=int(data["observation_dim"]),
-            n_actions=int(data.get("n_actions", 0)),
+            observation_dim=data["observation_dim"],
+            n_actions=data.get("n_actions", 0),
             observation_decay_rates=tuple(data.get("observation_decay_rates", ())),
             action_decay_rates=tuple(data.get("action_decay_rates", ())),
             outcome_decay_rates=tuple(data.get("outcome_decay_rates", ())),
-            include_raw_observation=bool(data.get("include_raw_observation", True)),
+            include_raw_observation=data.get("include_raw_observation", True),
         )
 
 
@@ -1176,19 +1267,45 @@ class OnlineGatedStateBuilderConfig:
     include_raw_observation: bool = True
 
     def __post_init__(self) -> None:
-        _validate_observation_dim(self.observation_dim)
-        if self.n_actions < 0:
-            raise ValueError("n_actions must be non-negative")
-        if self.hidden_dim < 1:
-            raise ValueError("hidden_dim must be positive")
-        if not math.isfinite(self.step_size) or self.step_size <= 0.0:
-            raise ValueError("step_size must be finite and positive")
-        if not math.isfinite(self.gradient_clip) or self.gradient_clip <= 0.0:
-            raise ValueError("gradient_clip must be finite and positive")
-        if not math.isfinite(self.initial_gate_bias):
-            raise ValueError("initial_gate_bias must be finite")
-        if not math.isfinite(self.initialization_scale) or self.initialization_scale <= 0.0:
-            raise ValueError("initialization_scale must be finite and positive")
+        object.__setattr__(
+            self,
+            "observation_dim",
+            _require_int32("observation_dim", self.observation_dim, minimum=1),
+        )
+        object.__setattr__(
+            self,
+            "n_actions",
+            _require_int32("n_actions", self.n_actions, minimum=0),
+        )
+        object.__setattr__(
+            self,
+            "hidden_dim",
+            _require_int32("hidden_dim", self.hidden_dim, minimum=1),
+        )
+        if type(self.include_raw_observation) is not bool:
+            raise ValueError("include_raw_observation must be a bool")
+        object.__setattr__(
+            self,
+            "step_size",
+            validated_float32_scalar("step_size", self.step_size, positive=True),
+        )
+        object.__setattr__(
+            self,
+            "gradient_clip",
+            validated_float32_scalar("gradient_clip", self.gradient_clip, positive=True),
+        )
+        object.__setattr__(
+            self,
+            "initial_gate_bias",
+            validated_float32_scalar("initial_gate_bias", self.initial_gate_bias),
+        )
+        object.__setattr__(
+            self,
+            "initialization_scale",
+            validated_float32_scalar(
+                "initialization_scale", self.initialization_scale, positive=True
+            ),
+        )
 
     def event_dim(self) -> int:
         """Return observation + one-hot action + reward + discount width."""
@@ -1432,9 +1549,7 @@ class OnlineGatedStateBuilder:
             last_gradient_norm=state.last_gradient_norm,
         )
         update_applied = (
-            event_valid
-            & self._state_is_valid(state)
-            & self._state_is_valid(candidate_state)
+            event_valid & self._state_is_valid(state) & self._state_is_valid(candidate_state)
         )
         next_state = select_transaction(update_applied, candidate_state, state)
         representation = self.encode(next_state, raw_observation)
@@ -1589,21 +1704,15 @@ class OnlineGatedStateBuilder:
             safe_gradient_norm,
             jnp.asarray(_FLOAT32_MAX, dtype=jnp.float32),
         )
-        clipped_parameter_gradient_valid = jnp.all(
-            jnp.isfinite(clipped_parameter_gradient)
-        )
+        clipped_parameter_gradient_valid = jnp.all(jnp.isfinite(clipped_parameter_gradient))
         candidate_parameter_update = (
-            -jnp.asarray(self._config.step_size, dtype=jnp.float32)
-            * clipped_parameter_gradient
+            -jnp.asarray(self._config.step_size, dtype=jnp.float32) * clipped_parameter_gradient
         )
-        candidate_parameter_update_valid = jnp.all(
-            jnp.isfinite(candidate_parameter_update)
-        )
+        candidate_parameter_update_valid = jnp.all(jnp.isfinite(candidate_parameter_update))
         candidate_parameters = source_state.parameters + candidate_parameter_update
         candidate_parameters_valid = jnp.all(jnp.isfinite(candidate_parameters))
-        capacity_available = (
-            (source_state.update_count >= 0)
-            & (source_state.update_count < _INT32_MAX)
+        capacity_available = (source_state.update_count >= 0) & (
+            source_state.update_count < _INT32_MAX
         )
         valid = (
             source_state_valid
@@ -1673,13 +1782,10 @@ class OnlineGatedStateBuilder:
             )
         )
         update_valid = jnp.all(jnp.isfinite(proposal.candidate_parameter_update))
-        candidate_parameters = (
-            proposal.source_parameters + proposal.candidate_parameter_update
-        )
+        candidate_parameters = proposal.source_parameters + proposal.candidate_parameter_update
         candidate_parameters_valid = jnp.all(jnp.isfinite(candidate_parameters))
-        capacity_available = (
-            (proposal.source_update_count >= 0)
-            & (proposal.source_update_count < _INT32_MAX)
+        capacity_available = (proposal.source_update_count >= 0) & (
+            proposal.source_update_count < _INT32_MAX
         )
         expected_valid = (
             proposal.source_state_valid
@@ -1760,9 +1866,7 @@ class OnlineGatedStateBuilder:
             & (destination_state.update_count < _INT32_MAX)
             & proposal.capacity_available
         )
-        candidate_parameters = (
-            destination_state.parameters + proposal.candidate_parameter_update
-        )
+        candidate_parameters = destination_state.parameters + proposal.candidate_parameter_update
         candidate_parameters_valid = jnp.all(jnp.isfinite(candidate_parameters))
         proposal_valid = proposal_integrity & proposal.valid
         applied = (
@@ -1833,9 +1937,7 @@ class OnlineGatedStateBuilder:
 
 
 StateBuilderConfig = (
-    IdentityStateBuilderConfig
-    | FixedTraceStateBuilderConfig
-    | OnlineGatedStateBuilderConfig
+    IdentityStateBuilderConfig | FixedTraceStateBuilderConfig | OnlineGatedStateBuilderConfig
 )
 
 
