@@ -3,6 +3,7 @@
 
 import json
 import tomllib
+from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
@@ -245,6 +246,7 @@ def test_step2_fields_preserve_legal_endpoints() -> None:
         feature_dim=1,
         n_heads=1,
         hidden_sizes=(),
+        stream="frequency",
         step_size=0.0,
         context_length=1,
         noise_std=0.0,
@@ -311,6 +313,130 @@ def test_step2_fields_canonicalize_nonbuiltin_numbers() -> None:
     assert type(payload["step_size"]) is float
     assert type(payload["context_length"]) is int
     assert type(payload["noise_std"]) is float
+
+
+@pytest.mark.parametrize(
+    ("config_type", "field", "value"),
+    [
+        (Step2KernelConfig, "step_size", Fraction(-1, 10**400)),
+        (Step2KernelConfig, "noise_std", Fraction(-1, 10**400)),
+        (Step2StrictDigitReadoutConfig, "step_size", Fraction(-1, 10**400)),
+        (Step2MemoryConfig, "update_rate", Fraction(1, 10**400)),
+        (Step2MemoryConfig, "update_rate", Fraction(10**400 + 1, 10**400)),
+        (Step2MemoryConfig, "novelty_threshold", Fraction(-1, 10**400)),
+        (Step2MemoryConfig, "bandwidth", Fraction(1, 10**400)),
+    ],
+)
+def test_step2_configs_enforce_exact_scientific_domains(
+    config_type: type[Any],
+    field: str,
+    value: object,
+) -> None:
+    with pytest.raises(ValueError, match=field):
+        config_type(**{field: value})
+
+
+def test_step2_configs_use_direct_float32_narrowing_without_double_rounding() -> None:
+    overflow_midpoint = np.ldexp(
+        np.longdouble(2) - np.ldexp(np.longdouble(1), -24),
+        127,
+    )
+    largest_finite_input = np.nextafter(
+        overflow_midpoint,
+        np.longdouble("-inf"),
+    )
+
+    kernel = Step2KernelConfig(step_size=largest_finite_input)
+    strict = Step2StrictDigitReadoutConfig(step_size=largest_finite_input)
+    memory = Step2MemoryConfig(novelty_threshold=largest_finite_input)
+
+    for value in (kernel.step_size, strict.step_size, memory.novelty_threshold):
+        assert type(value) is float
+        assert bool(np.isfinite(np.asarray(value, dtype=np.float32)))
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("n_heads", 0),
+        ("n_heads", True),
+        ("hidden_sizes", [8]),
+        ("hidden_sizes", (0,)),
+        ("hidden_sizes", (False,)),
+        ("step_size", float("nan")),
+        ("step_size", 3.5e38),
+        ("step_size", jnp.asarray(0.25)),
+    ],
+)
+def test_step2_strict_digit_config_rejects_malformed_fields(
+    field: str,
+    value: object,
+) -> None:
+    with pytest.raises(ValueError, match=field):
+        Step2StrictDigitReadoutConfig(**{field: value})
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("stream", "POLYNOMIAL"),
+        ("readout_mode", "LINEAR_MSE"),
+        ("loss_normalization", "TARGET_STRUCTURE"),
+    ],
+)
+def test_step2_kernel_rejects_case_mismatched_names(
+    field: str,
+    value: object,
+) -> None:
+    with pytest.raises(ValueError, match=field):
+        Step2KernelConfig(**{field: value})
+
+
+def test_step2_kernel_rejects_polynomial_dimensions_without_a_triple() -> None:
+    with pytest.raises(ValueError, match="feature_dim"):
+        Step2KernelConfig(feature_dim=2, stream="polynomial")
+
+
+def test_step2_builtin_float_defaults_remain_serialization_compatible() -> None:
+    assert Step2KernelConfig().to_dict() == {
+        "feature_dim": 8,
+        "n_heads": 3,
+        "hidden_sizes": [32],
+        "stream": "polynomial",
+        "readout_mode": "linear_mse",
+        "step_size": 0.03,
+        "loss_normalization": "target_structure",
+        "context_length": 128,
+        "noise_std": 0.05,
+    }
+    assert Step2StrictDigitReadoutConfig().to_dict()["step_size"] == 0.018
+    assert Step2MemoryConfig().to_dict() == {
+        "feature_dim": 784,
+        "n_classes": 10,
+        "slots_per_class": 20,
+        "update_rate": 0.3,
+        "novelty_threshold": 0.08,
+        "bandwidth": 0.01,
+    }
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        Step2KernelConfig(),
+        Step2StrictDigitReadoutConfig(),
+        Step2MemoryConfig(),
+    ],
+)
+def test_step2_config_from_dict_requires_exact_keys(config: Any) -> None:
+    payload = config.to_dict()
+    missing = dict(payload)
+    missing.pop(next(iter(missing)))
+    extra = {**payload, "unexpected": 1}
+
+    for malformed in (missing, extra):
+        with pytest.raises(ValueError, match=type(config).__name__):
+            type(config).from_dict(malformed)
 
 
 def test_step2_hybrid_factory_updates_upgd_and_memory() -> None:
