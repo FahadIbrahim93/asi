@@ -518,6 +518,96 @@ def test_extract_hyperparameter_results_keeps_wide_finite_numeric_coordinates(
     assert next(iter(extracted)) is coordinate
 
 
+@pytest.mark.parametrize(
+    "coordinates",
+    [
+        (Decimal(0), np.int64(0)),
+        (np.int64(0), Decimal(0)),
+        (5e-324, np.float16(0.0)),
+        (np.float16(0.0), 5e-324),
+    ],
+)
+def test_extract_hyperparameter_results_rejects_incompatible_numeric_families(
+    coordinates: tuple[object, object],
+) -> None:
+    """Cross-family aliases must fail before dict equality or hashing can narrow."""
+    coordinate_iterator = iter(coordinates)
+    results = {
+        "candidate_0": _flat_trace("candidate_0", 1.0),
+        "candidate_1": _flat_trace("candidate_1", 2.0),
+    }
+
+    with pytest.raises(ValueError, match=r"mutually compatible canonical coordinate families"):
+        extract_hyperparameter_results(
+            results,
+            param_extractor=lambda _: next(coordinate_iterator),
+        )
+
+
+@pytest.mark.parametrize(
+    "coordinates",
+    [
+        (("value", Decimal(0)), ("value", np.int64(0))),
+        (
+            frozenset(("value", Decimal(0))),
+            frozenset(("value", np.int64(0))),
+        ),
+    ],
+)
+def test_extract_hyperparameter_results_rejects_nested_incompatible_families(
+    coordinates: tuple[object, object],
+) -> None:
+    coordinate_iterator = iter(coordinates)
+    results = {
+        "candidate_0": _flat_trace("candidate_0", 1.0),
+        "candidate_1": _flat_trace("candidate_1", 2.0),
+    }
+
+    with pytest.raises(ValueError, match=r"mutually compatible canonical coordinate families"):
+        extract_hyperparameter_results(
+            results,
+            param_extractor=lambda _: next(coordinate_iterator),
+        )
+
+
+def test_extract_hyperparameter_results_bounds_coordinate_nesting() -> None:
+    within_limit: object = 0
+    beyond_limit: object = 0
+    for _ in range(32):
+        within_limit = (within_limit,)
+    for _ in range(33):
+        beyond_limit = (beyond_limit,)
+
+    extracted = extract_hyperparameter_results(
+        {"candidate": _flat_trace("candidate", 1.0)},
+        param_extractor=lambda _: within_limit,
+    )
+    assert next(iter(extracted)) is within_limit
+
+    with pytest.raises(ValueError, match=r"at most 32 nested tuple/frozenset levels"):
+        extract_hyperparameter_results(
+            {"candidate": _flat_trace("candidate", 1.0)},
+            param_extractor=lambda _: beyond_limit,
+        )
+
+
+def test_extract_hyperparameter_results_keeps_coherent_python_numeric_families() -> None:
+    coordinates = (1, 2.0, Decimal(3), Fraction(4, 1), complex(5, 0))
+    coordinate_iterator = iter(coordinates)
+    results = {
+        f"candidate_{index}": _flat_trace(f"candidate_{index}", float(index))
+        for index in range(len(coordinates))
+    }
+
+    extracted = extract_hyperparameter_results(
+        results,
+        param_extractor=lambda _: next(coordinate_iterator),
+    )
+
+    assert tuple(extracted) == coordinates
+    assert all(actual is expected for actual, expected in zip(extracted, coordinates, strict=True))
+
+
 class _DelayedHashDrift:
     def __init__(self) -> None:
         self.hash_calls = 0
