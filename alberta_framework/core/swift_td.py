@@ -56,6 +56,11 @@ from alberta_framework.core.update_safety import (
     select_transaction,
 )
 
+
+def _skip_zero_scale(scale: Array, value: Array) -> Array:
+    """Return 0 when ``scale`` is 0 so IEEE ``0 * inf`` does not become NaN."""
+    return jnp.where(scale == 0.0, jnp.zeros_like(value), scale * value)
+
 # Paper default for the step-size floor: eta_min = e^-15.
 _DEFAULT_ETA_MIN = math.exp(-15.0)
 
@@ -336,10 +341,14 @@ class SwiftTD:
         new_h_temp = new_h
 
         # Decay eligibility-side traces for the next transition.
-        decay_factor = gamma_scalar * state.trace_decay
-        new_z = decay_factor * z_ext
-        new_p = decay_factor * p_ext
-        new_z_bar = decay_factor * z_bar_ext
+        decay_factor = jnp.where(
+            (gamma_scalar == 0.0) | (state.trace_decay == 0.0),
+            jnp.zeros_like(gamma_scalar),
+            gamma_scalar * state.trace_decay,
+        )
+        new_z = _skip_zero_scale(decay_factor, z_ext)
+        new_p = _skip_zero_scale(decay_factor, p_ext)
+        new_z_bar = _skip_zero_scale(decay_factor, z_bar_ext)
 
         candidate_state = SwiftTDState(
             log_step_sizes=new_log_step_sizes,
@@ -369,7 +378,7 @@ class SwiftTD:
         inputs_valid = (
             jnp.all(jnp.isfinite(td_error))
             & jnp.all(jnp.isfinite(observation))
-            & next_observation_finite
+            & (next_observation_finite | (gamma_scalar == 0.0))
             & jnp.isfinite(gamma_scalar)
         )
         update_applied = (
