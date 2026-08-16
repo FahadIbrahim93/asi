@@ -338,6 +338,22 @@ def test_recurring_ipmnist_dataclasses_reject_booleans_and_non_integers() -> Non
             sentinel_case_count=2.5,  # type: ignore[arg-type]
         )
 
+    class HostileInt(int):
+        def __index__(self) -> int:
+            raise AssertionError("subclass hook must not run")
+
+        def __repr__(self) -> str:
+            raise AssertionError("repr must not run")
+
+    with pytest.raises(ValueError, match="phase_index"):
+        RecurringIPMNISTPhase(
+            phase_index=HostileInt(0),
+            start_step=0,
+            length=1,
+            permutation_id="permutation-a.v1",
+            exposure_index=0,
+        )
+
 
 def test_recurring_ipmnist_dataclasses_accept_and_canonicalize_numpy_integers() -> None:
     binding = SentinelProbeBinding(
@@ -399,3 +415,27 @@ def test_recurring_ipmnist_phase_preflights_derived_stop_step() -> None:
             permutation_id="permutation-a.v1",
             exposure_index=0,
         )
+
+
+def test_protocol_rejects_derived_trace_and_probe_workload_overflow() -> None:
+    protocol = _protocol()
+    too_many = (2**31 - 1) // 3 + 1
+    oversized_bindings = (
+        dataclasses.replace(protocol.sentinel_bindings[0], sentinel_case_count=too_many),
+        protocol.sentinel_bindings[1],
+    )
+    with pytest.raises(ValueError, match="sentinel probe evaluations"):
+        dataclasses.replace(protocol, sentinel_bindings=oversized_bindings)
+
+    phase_length = 400_000_000
+    oversized_phases = (
+        dataclasses.replace(protocol.phases[0], start_step=0, length=phase_length),
+        dataclasses.replace(
+            protocol.phases[1], start_step=phase_length, length=phase_length
+        ),
+        dataclasses.replace(
+            protocol.phases[2], start_step=2 * phase_length, length=phase_length
+        ),
+    )
+    with pytest.raises(ValueError, match="trace scalar count"):
+        dataclasses.replace(protocol, phases=oversized_phases)
