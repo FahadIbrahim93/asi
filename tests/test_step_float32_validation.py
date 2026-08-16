@@ -450,6 +450,68 @@ def test_large_integral_midpoint_uses_binary32_ties_to_even() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "field",
+    ["step_size", "average_reward_step_size"],
+)
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        pytest.param(
+            2**64 + 2**40 + 1,
+            float.fromhex("0x1.000002p+64"),
+            id="above-large-midpoint",
+        ),
+        pytest.param(
+            (2**25 - 1) * 2**103 - 1,
+            float.fromhex("0x1.fffffep+127"),
+            id="below-overflow-midpoint",
+        ),
+    ],
+)
+def test_step5_builtin_int_storage_matches_validated_float32_sink(
+    field: str,
+    value: int,
+    expected: float,
+) -> None:
+    config = Step5AverageRewardTDConfig(**{field: cast(Any, value)})
+    stored = cast(float, getattr(config, field))
+
+    assert float(jnp.asarray(stored, dtype=jnp.float32)) == expected
+    assert type(stored) is float
+    assert stored == expected
+
+
+def test_step5_preserves_only_sink_exact_builtin_int_payloads() -> None:
+    exact = 2**64
+    config = Step5AverageRewardTDConfig(
+        step_size=cast(Any, exact),
+        average_reward_step_size=cast(Any, 0),
+        trace_decay=cast(Any, 1),
+    )
+    payload = config.to_dict()
+
+    assert type(config.step_size) is int
+    assert config.step_size == exact
+    assert type(config.average_reward_step_size) is int
+    assert type(config.trace_decay) is int
+    assert float(jnp.asarray(config.step_size, dtype=jnp.float32)) == float(exact)
+    json.dumps(payload, allow_nan=False)
+
+
+def test_step5_builtin_signed_zero_storage_is_preserved() -> None:
+    config = Step5AverageRewardTDConfig(
+        step_size=-0.0,
+        average_reward_step_size=-0.0,
+        trace_decay=-0.0,
+    )
+    payload = config.to_dict()
+
+    for field in ("step_size", "average_reward_step_size", "trace_decay"):
+        assert math.copysign(1.0, cast(float, getattr(config, field))) == -1.0
+        assert math.copysign(1.0, cast(float, payload[field])) == -1.0
+
+
 def test_numpy_integral_midpoint_uses_exact_integer_ratio() -> None:
     lower = 2**62
     tie = np.int64(lower + 2**38)
