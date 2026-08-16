@@ -6,6 +6,7 @@ import chex
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import pytest
 
 from alberta_framework import ContinuousActorCriticAgent as TopLevelContinuousActorCriticAgent
 from alberta_framework.core import (
@@ -200,6 +201,27 @@ def test_continuous_actor_critic_log_sigma_clipping() -> None:
     )
     assert float(result.state.log_sigma[0]) <= 1.0
     assert float(result.state.log_sigma[0]) >= -2.0
+
+
+@pytest.mark.parametrize(
+    ("low", "high", "message"),
+    [
+        (1.0, -1.0, "action_low must be <= action_high"),
+        (float("nan"), 1.0, "action_low must be finite"),
+        (-1.0, float("inf"), "action_high must be finite"),
+        (0.5, 0.5, None),
+    ],
+)
+def test_continuous_actor_critic_rejects_inverted_or_nonfinite_action_bounds(
+    low: float, high: float, message: str | None
+) -> None:
+    """low > high makes jnp.clip return high for every input: a constant-action policy."""
+    config = ContinuousActorCriticConfig(action_dim=2, action_low=low, action_high=high)
+    if message is None:
+        ContinuousActorCriticAgent(config)
+        return
+    with pytest.raises(ValueError, match=message):
+        ContinuousActorCriticAgent(config)
 
 
 def test_continuous_actor_critic_action_clipping() -> None:
