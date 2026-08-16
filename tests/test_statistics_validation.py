@@ -229,6 +229,10 @@ class TestComparisonsRejectNonFiniteSamples:
 class _FloatClassSpoof:
     """Plain object whose reported ``__class__`` fools ``isinstance``."""
 
+    def __repr__(self) -> str:
+        """Keep parametrized node IDs stable across xdist worker processes."""
+        return "_FloatClassSpoof()"
+
     @property
     def __class__(self) -> type[float]:
         return float
