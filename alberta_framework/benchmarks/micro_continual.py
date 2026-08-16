@@ -69,7 +69,7 @@ import platform
 import tempfile
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from functools import lru_cache
 from pathlib import Path
 from types import MappingProxyType
@@ -82,6 +82,7 @@ import numpy as np
 from jax import Array
 
 from alberta_framework._fixed_count_selection import stable_smallest_mask
+from alberta_framework._seed_validation import require_jax_seed, require_unique_jax_seeds
 from alberta_framework._strict_json import load_strict_json_object
 from alberta_framework.benchmarks.ipmnist_screening import (
     ScreeningStepFn,
@@ -142,6 +143,21 @@ _STREAM_DOMAIN = 101
 _INIT_DOMAIN = 202
 _STEP_DOMAIN = 303
 _BAYES_DOMAIN = 404
+
+
+def _require_finite_real(value: object, name: str) -> float:
+    """Reject bools and non-finite values while accepting every other real."""
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a finite real number, got {value!r}")
+    try:
+        number = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"{name} must be a finite real number, got {value!r}"
+        ) from exc
+    if not math.isfinite(number):
+        raise ValueError(f"{name} must be a finite real number, got {value!r}")
+    return number
 
 
 # =============================================================================
@@ -223,19 +239,22 @@ class MicroStreamConfig:
             raise ValueError(
                 f"component_sparsity ({sparsity}) must not exceed dim ({self.dim})"
             )
-        if not 0.0 < float(self.class_sparsity) <= 1.0:
+        class_sparsity = _require_finite_real(self.class_sparsity, "class_sparsity")
+        if not 0.0 < class_sparsity <= 1.0:
             raise ValueError(
                 f"class_sparsity must be in (0, 1], got {self.class_sparsity!r}"
             )
         for name in ("mean_separation", "noise_scale"):
-            if not float(getattr(self, name)) > 0.0:
+            if not _require_finite_real(getattr(self, name), name) > 0.0:
                 raise ValueError(f"{name} must be positive, got {getattr(self, name)!r}")
         for name in ("offset_scale", "spectrum_decades", "component_scale"):
-            if float(getattr(self, name)) < 0.0:
+            if _require_finite_real(getattr(self, name), name) < 0.0:
                 raise ValueError(
                     f"{name} must be non-negative, got {getattr(self, name)!r}"
                 )
-        if not 0.0 < self.scale_shift_min < self.scale_shift_max:
+        scale_min = _require_finite_real(self.scale_shift_min, "scale_shift_min")
+        scale_max = _require_finite_real(self.scale_shift_max, "scale_shift_max")
+        if not 0.0 < scale_min < scale_max:
             raise ValueError(
                 "scale_shift bounds must satisfy 0 < scale_shift_min < "
                 f"scale_shift_max, got [{self.scale_shift_min}, {self.scale_shift_max}]"
@@ -275,6 +294,34 @@ class MicroStreamConfig:
             "scale_shift_max": self.scale_shift_max,
             "recurrence_pool": self.recurrence_pool,
         }
+
+    @classmethod
+    def from_mapping(
+        cls, mapping: object, *, source: str = "stream_config"
+    ) -> MicroStreamConfig:
+        """Reconstruct a stream config from a serialized object.
+
+        The mapping must contain exactly the :meth:`to_config` key set.
+        Omitted fields must not be filled from dataclass defaults: a truncated
+        shard would otherwise reconstruct a different stream identity.
+        """
+        if not isinstance(mapping, Mapping):
+            raise ValueError(f"{source} must be an object")
+        expected = {field.name for field in fields(cls)}
+        actual = set(mapping)
+        if actual != expected:
+            missing = sorted(expected - actual)
+            extra = sorted(actual - expected)
+            details: list[str] = []
+            if missing:
+                details.append(f"missing {missing}")
+            if extra:
+                details.append(f"unexpected {extra}")
+            raise ValueError(
+                f"{source} must contain exactly the serialized key set; "
+                + "; ".join(details)
+            )
+        return cls(**dict(mapping))
 
 
 # =============================================================================
@@ -741,6 +788,7 @@ def run_micro_arm(
     per-regime value is the mean over the regime's steps.
     """
     spec = arm if isinstance(arm, MicroArmSpec) else micro_arm_spec(arm)
+    seed = require_jax_seed(seed, name="seed")
     stream = generate_stream(config, seed)
     net = IPMNISTConfig(
         n_tasks=config.n_regimes,
@@ -876,7 +924,9 @@ def load_micro_shard(path: Path | str) -> dict[str, Any]:
         raise ValueError(
             f"{path}: environment must record non-empty jax, numpy, python, and platform strings"
         )
-    config = MicroStreamConfig(**payload["stream_config"])
+    config = MicroStreamConfig.from_mapping(
+        payload.get("stream_config"), source=f"{path}: stream_config"
+    )
     if payload.get("family") != config.family:
         raise ValueError(
             f"{path}: family {payload.get('family')!r} does not match "
@@ -891,8 +941,7 @@ def load_micro_shard(path: Path | str) -> dict[str, Any]:
     payload["wall_clock_seconds"] = _validated_wall_clock_seconds(
         payload.get("wall_clock_seconds"), path
     )
-    if type(payload.get("seed")) is not int or payload["seed"] < 0:
-        raise ValueError(f"{path}: seed must be a non-negative integer")
+    payload["seed"] = require_jax_seed(payload.get("seed"), name=f"{path}: seed")
     for fieldname in ("hidden1", "hidden2"):
         value = payload.get(fieldname)
         if type(value) is not int or value <= 0:
@@ -935,7 +984,9 @@ def _micro_shard_batch_contract(
             f"separately (mismatched: {environment_mismatches})"
         )
     return (
-        MicroStreamConfig(**shards[0]["stream_config"]),
+        MicroStreamConfig.from_mapping(
+            shards[0]["stream_config"], source="stream_config"
+        ),
         dict(reference_environment),
     )
 
@@ -1443,15 +1494,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     config = _config_from_args(args)
 
     if args.command == "run":
+        seed = require_jax_seed(args.seed, name="seed")
         _run_or_skip_shard(
-            config, args.arm, args.seed, args.out, args.hidden1, args.hidden2
+            config, args.arm, seed, args.out, args.hidden1, args.hidden2
         )
         return 0
 
     # ladder
+    seeds = require_unique_jax_seeds(args.seeds, name="seeds")
     paths: list[Path] = []
     for arm_name in args.arms:
-        for seed in args.seeds:
+        for seed in seeds:
             paths.append(
                 _run_or_skip_shard(
                     config, arm_name, seed, args.out, args.hidden1, args.hidden2
