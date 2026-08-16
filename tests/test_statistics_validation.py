@@ -190,6 +190,42 @@ class TestSampleVectorContract:
             bootstrap_ci(np.asarray(4.2), n_bootstrap=10)
 
 
+class TestComparisonsRejectNonFiniteSamples:
+    """A poisoned seed must raise, not become p=nan / significant=False."""
+
+    @pytest.mark.parametrize("poison", [float("nan"), float("inf"), float("-inf")])
+    @pytest.mark.parametrize(
+        "comparison",
+        [
+            lambda a, b: ttest_comparison(a, b, paired=False),
+            lambda a, b: ttest_comparison(a, b, paired=True),
+            mann_whitney_comparison,
+            wilcoxon_comparison,
+            cohens_d,
+        ],
+        ids=["ttest", "paired-ttest", "mann_whitney", "wilcoxon", "cohens_d"],
+    )
+    def test_nonfinite_sample_rejected_without_warnings(
+        self, comparison: Any, poison: float
+    ) -> None:
+        clean = np.asarray([1.0, 2.0, 3.0, 4.5])
+        poisoned = np.asarray([2.0, poison, 3.0, 5.0])
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with pytest.raises(ValueError, match=r"^values_b must be finite$"):
+                comparison(clean, poisoned)
+            with pytest.raises(ValueError, match=r"^values_a must be finite$"):
+                comparison(poisoned, clean)
+
+    def test_pairwise_comparisons_rejects_a_poisoned_seed(self) -> None:
+        a = _make_seeded_aggregated("a", [0, 1, 2], [0.0, 1.0, 2.0])
+        b = _make_seeded_aggregated("b", [0, 1, 2], [1.0, float("nan"), 3.0])
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with pytest.raises(ValueError, match="must be finite"):
+                pairwise_comparisons({"a": a, "b": b}, test="ttest", window=1)
+
+
 class TestTimeseriesStatistics:
     def test_matches_per_column_compute_statistics(self) -> None:
         """Vectorised timeseries CI agrees with per-step scalar CI."""
