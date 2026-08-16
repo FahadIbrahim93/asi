@@ -1385,10 +1385,16 @@ class FixedBudgetInteractionLearner:
                 return jnp.mean(jnp.sort(weighted_activity, axis=0)[-k:, :], axis=0)
             scores = jnp.where(active_mask[:, None], weighted_activity, -jnp.inf)
             selected, _ = jax.lax.top_k(jnp.swapaxes(scores, 0, 1), k)
-            selected_mask = jnp.isfinite(selected)
-            selected_count = jnp.sum(selected_mask, axis=1)
-            selected_sum = jnp.sum(jnp.where(selected_mask, selected, 0.0), axis=1)
-            safe_count = jnp.maximum(selected_count, 1.0)
+            selected_count = jnp.minimum(
+                jnp.sum(active_mask.astype(jnp.int32)),
+                k,
+            )
+            selected_mask = jnp.arange(k) < selected_count
+            selected_sum = jnp.sum(
+                jnp.where(selected_mask[None, :], selected, 0.0),
+                axis=1,
+            )
+            safe_count = jnp.maximum(selected_count, 1)
             return jnp.where(selected_count > 0, selected_sum / safe_count, 0.0)
 
         if self._utility_task_balancing == "active":
@@ -1480,10 +1486,16 @@ class FixedBudgetInteractionLearner:
                 return jnp.mean(jnp.sort(weighted_signal, axis=0)[-k:, :], axis=0)
             scores = jnp.where(active_mask[:, None], weighted_signal, -jnp.inf)
             selected, _ = jax.lax.top_k(jnp.swapaxes(scores, 0, 1), k)
-            selected_mask = jnp.isfinite(selected)
-            selected_count = jnp.sum(selected_mask, axis=1)
-            selected_sum = jnp.sum(jnp.where(selected_mask, selected, 0.0), axis=1)
-            safe_count = jnp.maximum(selected_count, 1.0)
+            selected_count = jnp.minimum(
+                jnp.sum(active_mask.astype(jnp.int32)),
+                k,
+            )
+            selected_mask = jnp.arange(k) < selected_count
+            selected_sum = jnp.sum(
+                jnp.where(selected_mask[None, :], selected, 0.0),
+                axis=1,
+            )
+            safe_count = jnp.maximum(selected_count, 1)
             return jnp.where(selected_count > 0, selected_sum / safe_count, 0.0)
         if self._utility_task_balancing in {"active", "active_inverse_frequency"}:
             active_count = jnp.maximum(jnp.sum(active_mask.astype(jnp.float32)), 1.0)

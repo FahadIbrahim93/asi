@@ -323,6 +323,22 @@ def test_unweighted_active_topk_all_inactive_avoids_zero_division(
     np.testing.assert_array_equal(checkified_result, expected)
 
 
+@pytest.mark.parametrize("invalid", [jnp.nan, jnp.inf, -jnp.inf])
+def test_unweighted_active_topk_does_not_hide_invalid_active_signal(invalid: float) -> None:
+    learner = _learner(
+        utility_aggregation="topk",
+        utility_top_k=2,
+        utility_task_balancing="active",
+    )
+    active_mask = jnp.asarray((True, False, False, False, False), dtype=jnp.bool_)
+    activity = jnp.ones((5,), dtype=jnp.float32)
+    signal = jnp.asarray(((invalid,), (0.0,), (0.0,), (0.0,), (0.0,)), dtype=jnp.float32)
+
+    value = learner._aggregate_task_feature_signal(signal, active_mask, activity)
+
+    assert not bool(jnp.all(jnp.isfinite(value)))
+
+
 def test_weighted_update_is_eager_jit_and_scan_compatible() -> None:
     learner = _learner(
         task_utility_weights=_GROUP_WEIGHTS,
