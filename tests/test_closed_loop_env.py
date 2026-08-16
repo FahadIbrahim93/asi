@@ -273,6 +273,24 @@ class TestSwitchingScanRollout:
 class TestRiverSwim:
     """Dynamics, rewards, and analytic helpers of the stochastic variant."""
 
+    @pytest.mark.parametrize("reward_left", [float("nan"), float("inf"), float("-inf")])
+    def test_non_finite_reward_left_raises(self, reward_left):
+        """reward_left must be finite."""
+        with pytest.raises(ValueError, match="reward_left must be finite"):
+            RiverSwimMDP(RiverSwimConfig(reward_left=reward_left))
+
+    @pytest.mark.parametrize("reward_right", [float("nan"), float("inf")])
+    def test_non_finite_reward_right_raises(self, reward_right):
+        """reward_right must be finite."""
+        with pytest.raises(ValueError, match="reward_right must be finite"):
+            RiverSwimMDP(RiverSwimConfig(reward_right=reward_right))
+
+    @pytest.mark.parametrize("initial_state", [1.5, True, 2.0])
+    def test_non_integer_initial_state_raises(self, initial_state):
+        """initial_state must be a canonical integer in range."""
+        with pytest.raises(ValueError, match="initial_state must be an integer"):
+            RiverSwimMDP(RiverSwimConfig(initial_state=initial_state))  # type: ignore[arg-type]
+
     def test_transition_tensor_structure(self):
         """Kernels are row-stochastic with drift folded at the boundaries."""
         config = RiverSwimConfig(n_states=4, p_right_up=0.3, p_right_down=0.1)
