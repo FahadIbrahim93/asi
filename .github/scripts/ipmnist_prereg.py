@@ -166,20 +166,58 @@ def _github_pages(path: str, *, token: str) -> list[Any]:
     raise RuntimeError(f"GitHub API pagination exceeded 10,000 records for {path}")
 
 
-def _workflow_runs(repository: str, *, token: str) -> list[dict[str, Any]]:
+def _workflow_runs(repository: str, *, source: str, token: str) -> list[dict[str, Any]]:
+    source = _lower_hex(source, 40, name="source")
     encoded = urllib.parse.quote(Path(WORKFLOW_PATH).name, safe="")
-    path = f"/repos/{repository}/actions/workflows/{encoded}/runs?event=workflow_dispatch"
+    query = urllib.parse.urlencode(
+        {"event": "workflow_dispatch", "head_sha": source, "per_page": 100}
+    )
+    path = f"/repos/{repository}/actions/workflows/{encoded}/runs?{query}"
     runs: list[dict[str, Any]] = []
-    for page in range(1, 101):
-        payload = _github_json(f"{path}&per_page=100&page={page}", token=token)
-        if isinstance(payload, dict) and isinstance(payload.get("workflow_runs"), list):
-            page_runs = [cast(dict[str, Any], value) for value in payload["workflow_runs"]]
-            runs.extend(page_runs)
-            if len(page_runs) < 100:
-                return runs
-            continue
-        raise RuntimeError("GitHub Actions API returned an invalid workflow-runs payload")
-    raise RuntimeError("GitHub Actions pagination exceeded 10,000 workflow runs")
+    seen_ids: set[int] = set()
+    expected_total: int | None = None
+    for page in range(1, 11):
+        payload = _github_json(f"{path}&page={page}", token=token)
+        if not isinstance(payload, dict):
+            raise RuntimeError("GitHub Actions run search returned a non-object payload")
+        total_count = payload.get("total_count")
+        raw_runs = payload.get("workflow_runs")
+        if type(total_count) is not int or total_count < 0 or not isinstance(raw_runs, list):
+            raise RuntimeError("GitHub Actions run search returned malformed pagination data")
+        if total_count > 1_000:
+            raise RuntimeError(
+                "source-filtered workflow run search exceeds GitHub's 1,000-result API cap"
+            )
+        if expected_total is None:
+            expected_total = total_count
+        elif total_count != expected_total:
+            raise RuntimeError("GitHub Actions run total changed during pagination")
+        if len(raw_runs) > 100 or any(not isinstance(value, dict) for value in raw_runs):
+            raise RuntimeError("GitHub Actions run search returned a malformed result page")
+        page_runs = cast(list[dict[str, Any]], raw_runs)
+        for run in page_runs:
+            run_id = run.get("id")
+            if (
+                type(run_id) is not int
+                or run_id <= 0
+                or run.get("event") != "workflow_dispatch"
+                or run.get("head_sha") != source
+                or run.get("path") != WORKFLOW_PATH
+                or not isinstance(run.get("display_title"), str)
+                or not run["display_title"]
+            ):
+                raise RuntimeError("GitHub Actions run search returned a malformed result page")
+            if run_id in seen_ids:
+                raise RuntimeError("GitHub Actions run search repeated a workflow run ID")
+            seen_ids.add(run_id)
+        runs.extend(page_runs)
+        if len(runs) > total_count:
+            raise RuntimeError("GitHub Actions run search returned more runs than total_count")
+        if len(runs) == total_count:
+            return runs
+        if len(raw_runs) < 100:
+            raise RuntimeError("GitHub Actions run search ended before total_count")
+    raise RuntimeError("GitHub Actions run search did not complete within the 1,000-result cap")
 
 
 def verify_launch_authorization(
@@ -231,7 +269,7 @@ def verify_launch_authorization(
 
     matching_runs = [
         run
-        for run in _workflow_runs(repository, token=token)
+        for run in _workflow_runs(repository, source=source, token=token)
         if run.get("event") == "workflow_dispatch"
         and run.get("head_sha") == source
         and run.get("display_title") == expected_title
@@ -358,12 +396,10 @@ def _validate_summary_reconstruction(
         raise ValueError("summary created_unix must be a finite non-negative float")
     if _canonical_json(summary.get("shard_manifest")) != _canonical_json(expected_manifest):
         raise ValueError("summary shard manifest does not bind the exact shard bytes and paths")
-    operational_fields = {"created_unix", "shard_manifest"}
-    stored_derivation = {
-        key: value for key, value in summary.items() if key not in operational_fields
-    }
+    normalized_recomputed = {**recomputed, "shard_manifest": expected_manifest}
+    stored_derivation = {key: value for key, value in summary.items() if key != "created_unix"}
     fresh_derivation = {
-        key: value for key, value in recomputed.items() if key not in operational_fields
+        key: value for key, value in normalized_recomputed.items() if key != "created_unix"
     }
     if _canonical_json(stored_derivation) != _canonical_json(fresh_derivation):
         raise ValueError("summary derivation does not match an exact reconstruction from shards")
@@ -491,6 +527,13 @@ def validate_result_bundle(
         )
     sorted_paths = sorted(expected_paths)
     shards = [load_shard(path) for path in sorted_paths]
+    for path, shard in zip(sorted_paths, shards, strict=True):
+        expected_name = f"{shard['config_name']}_seed{shard['seed']}.json"
+        if path.name != expected_name:
+            raise ValueError(
+                "shard filename/payload identity mismatch; "
+                f"{path.name!r} contains {expected_name!r}"
+            )
     observed_pairs = {(shard["config_name"], shard["seed"]) for shard in shards}
     if observed_pairs != expected_pairs or len(shards) != len(expected_pairs):
         raise ValueError("shard payload arm/seed coverage is not exact")

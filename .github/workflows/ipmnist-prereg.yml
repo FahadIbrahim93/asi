@@ -51,10 +51,12 @@ jobs:
           persist-credentials: false
           ref: ${{ inputs.launch_sha }}
 
-      - name: Set up exact Python 3.12.12
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+      - name: Set up exact uv 0.9.24
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e
         with:
-          python-version: 3.12.12
+          version: 0.9.24
+          enable-cache: true
+          cache-dependency-glob: uv.lock
 
       - name: Bind source, tag, workflow, and lock identities
         id: identity
@@ -116,6 +118,25 @@ jobs:
             exit 1
           fi
 
+      - name: Install exact uv-managed CPython 3.12.12
+        id: python
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$(uv --version)" != "uv 0.9.24" ]]; then
+            echo "setup-uv did not install exact uv 0.9.24" >&2
+            exit 1
+          fi
+          uv python install --managed-python 3.12.12
+          python_path="$(uv python find --managed-python --no-project 3.12.12)"
+          identity="$("$python_path" -c \
+            'import platform; print(platform.python_implementation(), platform.python_version(), platform.machine())')"
+          if [[ "$identity" != "CPython 3.12.12 arm64" ]]; then
+            echo "uv-managed Python identity mismatch: $identity" >&2
+            exit 1
+          fi
+          echo "path=$python_path" >> "$GITHUB_OUTPUT"
+
       - name: Require one pre-data project-owner authorization and one dispatch
         shell: bash
         env:
@@ -126,10 +147,11 @@ jobs:
           UV_LOCK_SHA256: ${{ steps.identity.outputs.uv_lock_sha256 }}
           WORKFLOW_BLOB_SHA1: ${{ steps.identity.outputs.workflow_blob_sha1 }}
           DRIVER_BLOB_SHA1: ${{ steps.identity.outputs.driver_blob_sha1 }}
+          PYTHON_PATH: ${{ steps.python.outputs.path }}
         run: |
           set -euo pipefail
           metadata="$RUNNER_TEMP/prereg-metadata/launch-preflight.json"
-          python .github/scripts/ipmnist_prereg.py preflight \
+          "$PYTHON_PATH" .github/scripts/ipmnist_prereg.py preflight \
             --protocol "$PROTOCOL" \
             --repository "$GITHUB_REPOSITORY" \
             --source "$SOURCE" \
@@ -142,15 +164,10 @@ jobs:
             --run-attempt "$GITHUB_RUN_ATTEMPT" \
             --output "$metadata"
 
-      - name: Set up exact uv 0.9.24
-        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e
-        with:
-          version: 0.9.24
-          enable-cache: true
-          cache-dependency-glob: uv.lock
-
       - name: Synchronize the committed environment
         shell: bash
+        env:
+          PYTHON_PATH: ${{ steps.python.outputs.path }}
         run: |
           set -euo pipefail
           cpu_brand="$(sysctl -n machdep.cpu.brand_string)"
@@ -160,7 +177,7 @@ jobs:
           fi
           uv sync \
             --locked \
-            --python "$(command -v python)" \
+            --python "$PYTHON_PATH" \
             --extra research
           uv run --no-sync python - "$cpu_brand" "$RUNNER_TEMP/prereg-metadata/runner.json" <<'PY'
           import importlib.metadata
@@ -341,7 +358,7 @@ jobs:
             echo
             echo "- Protocol: $PROTOCOL"
             echo "- Source: $SOURCE"
-            echo "- Outcome: $(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["outcome"])' "$result")"
+            echo "- Outcome: $(uv run --no-sync python -c 'import json,sys; print(json.load(open(sys.argv[1]))["outcome"])' "$result")"
             echo "- Validation metadata: result-validation.json"
           } >> "$GITHUB_STEP_SUMMARY"
 

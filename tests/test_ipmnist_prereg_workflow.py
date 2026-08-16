@@ -17,8 +17,10 @@ _strict_json = cast(Any, _DRIVER["_strict_json"])
 _validate_summary_reconstruction = cast(Any, _DRIVER["_validate_summary_reconstruction"])
 _validate_result_bundle = cast(Any, _DRIVER["validate_result_bundle"])
 _verify_launch_authorization = cast(Any, _DRIVER["verify_launch_authorization"])
+_workflow_runs = cast(Any, _DRIVER["_workflow_runs"])
 _write_json = cast(Any, _DRIVER["_write_json"])
 _DRIVER_GLOBALS = cast(dict[str, Any], _verify_launch_authorization.__globals__)
+_WORKFLOW_RUN_GLOBALS = cast(dict[str, Any], _workflow_runs.__globals__)
 
 
 def test_prereg_protocols_pin_exact_arms_and_seeds() -> None:
@@ -190,6 +192,138 @@ def test_launch_authorization_rejects_wrong_identity_or_edited_comment(
 ) -> None:
     with pytest.raises(RuntimeError, match="authorization"):
         _verify_with_comment(monkeypatch, _authorization_comment(**overrides))
+
+
+def test_launch_authorization_requires_strictly_pre_dispatch_timestamp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with pytest.raises(RuntimeError, match="before workflow dispatch"):
+        _verify_with_comment(
+            monkeypatch,
+            _authorization_comment(
+                created_at="2026-08-16T10:00:00Z",
+                updated_at="2026-08-16T10:00:00Z",
+            ),
+        )
+
+
+def _searched_workflow_run(run_id: int) -> dict[str, Any]:
+    return {
+        "id": run_id,
+        "event": "workflow_dispatch",
+        "head_sha": "1" * 40,
+        "display_title": f"unrelated-run-{run_id}",
+        "path": ".github/workflows/ipmnist-prereg.yml",
+    }
+
+
+def test_workflow_run_search_binds_source_and_paginates_exact_total(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+    responses = [
+        {
+            "total_count": 101,
+            "workflow_runs": [_searched_workflow_run(value) for value in range(1, 101)],
+        },
+        {"total_count": 101, "workflow_runs": [_searched_workflow_run(101)]},
+    ]
+
+    def fake_github_json(path: str, *, token: str) -> dict[str, Any]:
+        assert token == "token"
+        calls.append(path)
+        return responses.pop(0)
+
+    monkeypatch.setitem(_WORKFLOW_RUN_GLOBALS, "_github_json", fake_github_json)
+    runs = _workflow_runs("elizaOS/asi", source="1" * 40, token="token")
+
+    assert [run["id"] for run in runs] == list(range(1, 102))
+    assert len(calls) == 2
+    assert all("event=workflow_dispatch" in path for path in calls)
+    assert all(f"head_sha={'1' * 40}" in path for path in calls)
+
+
+def test_workflow_run_search_rejects_unsearchable_or_changing_total(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(
+        _WORKFLOW_RUN_GLOBALS,
+        "_github_json",
+        lambda *_args, **_kwargs: {"total_count": 1001, "workflow_runs": []},
+    )
+    with pytest.raises(RuntimeError, match="1,000"):
+        _workflow_runs("elizaOS/asi", source="1" * 40, token="token")
+
+    responses = [
+        {
+            "total_count": 101,
+            "workflow_runs": [_searched_workflow_run(value) for value in range(1, 101)],
+        },
+        {"total_count": 100, "workflow_runs": []},
+    ]
+    monkeypatch.setitem(
+        _WORKFLOW_RUN_GLOBALS,
+        "_github_json",
+        lambda *_args, **_kwargs: responses.pop(0),
+    )
+    with pytest.raises(RuntimeError, match="changed during pagination"):
+        _workflow_runs("elizaOS/asi", source="1" * 40, token="token")
+
+
+def test_workflow_run_search_never_skips_a_malformed_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+    responses = [
+        {
+            "total_count": 101,
+            "workflow_runs": [_searched_workflow_run(value) for value in range(1, 101)],
+        },
+        {"total_count": 101, "workflow_runs": ["not-a-workflow-run"]},
+        {"total_count": 101, "workflow_runs": [_searched_workflow_run(101)]},
+    ]
+
+    def fake_github_json(path: str, *, token: str) -> dict[str, Any]:
+        assert token == "token"
+        calls.append(path)
+        return responses.pop(0)
+
+    monkeypatch.setitem(_WORKFLOW_RUN_GLOBALS, "_github_json", fake_github_json)
+    with pytest.raises(RuntimeError, match="malformed result page"):
+        _workflow_runs("elizaOS/asi", source="1" * 40, token="token")
+
+    assert len(calls) == 2
+    assert calls[-1].endswith("page=2")
+
+
+def test_workflow_run_search_rejects_duplicate_ids_across_pages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    responses = [
+        {
+            "total_count": 101,
+            "workflow_runs": [_searched_workflow_run(value) for value in range(1, 101)],
+        },
+        {"total_count": 101, "workflow_runs": [_searched_workflow_run(100)]},
+    ]
+    monkeypatch.setitem(
+        _WORKFLOW_RUN_GLOBALS,
+        "_github_json",
+        lambda *_args, **_kwargs: responses.pop(0),
+    )
+    with pytest.raises(RuntimeError, match="repeated a workflow run ID"):
+        _workflow_runs("elizaOS/asi", source="1" * 40, token="token")
+
+
+def test_workflow_installs_exact_uv_managed_python() -> None:
+    workflow = (_ROOT / ".github" / "workflows" / "ipmnist-prereg.yml").read_text(
+        encoding="utf-8"
+    )
+    assert "actions/setup-python@" not in workflow
+    assert "uv python install --managed-python 3.12.12" in workflow
+    assert 'uv python find --managed-python --no-project 3.12.12' in workflow
+    assert "CPython 3.12.12 arm64" in workflow
+    assert '--python "$PYTHON_PATH"' in workflow
 
 
 def test_summary_reconstruction_rejects_resigned_derived_metrics_and_manifest() -> None:
@@ -437,6 +571,71 @@ def test_result_bundle_rejects_resigned_summary_metric(
     candidate["paired_vs_control"]["mean_diff"] = 0.5
     summary_path.write_text(json.dumps(summary, allow_nan=False), encoding="utf-8")
     with pytest.raises(ValueError, match="reconstruction"):
+        _validate_result_bundle(
+            protocol_key="issue51",
+            root=tmp_path,
+            runner_receipt=runner_receipt,
+            source="1" * 40,
+            tree="2" * 40,
+            uv_lock_sha256="4" * 64,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("path", "outputs/ipmnist_screening/replication_r1/shards/forged.json"),
+        ("size_bytes", 1),
+        ("sha256", "f" * 64),
+    ],
+)
+def test_result_bundle_rejects_summary_manifest_tamper(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: object,
+) -> None:
+    summary_path = _write_issue51_bundle(tmp_path, monkeypatch)
+    runner_receipt = _write_runner_receipt(tmp_path)
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary["shard_manifest"][0][field] = value
+    summary_path.write_text(json.dumps(summary, allow_nan=False), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="manifest"):
+        _validate_result_bundle(
+            protocol_key="issue51",
+            root=tmp_path,
+            runner_receipt=runner_receipt,
+            source="1" * 40,
+            tree="2" * 40,
+            uv_lock_sha256="4" * 64,
+        )
+
+
+def test_result_bundle_rejects_shard_filename_payload_swap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from alberta_framework.benchmarks.ipmnist_screening import merge_shards
+
+    summary_path = _write_issue51_bundle(tmp_path, monkeypatch)
+    runner_receipt = _write_runner_receipt(tmp_path)
+    shards_dir = summary_path.parent / "shards"
+    control = shards_dir / "sigma0_shiftnorm_d099_seed0.json"
+    candidate = shards_dir / "rls_head_resid_l1_preset005_seed1.json"
+    control_raw = control.read_bytes()
+    candidate_raw = candidate.read_bytes()
+    control.write_bytes(candidate_raw)
+    candidate.write_bytes(control_raw)
+    paths = sorted(path.relative_to(tmp_path) for path in shards_dir.glob("*.json"))
+    summary_path.write_text(
+        json.dumps(
+            merge_shards(paths, control_name="sigma0_shiftnorm_d099", slope_window=15),
+            allow_nan=False,
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="filename/payload"):
         _validate_result_bundle(
             protocol_key="issue51",
             root=tmp_path,
