@@ -73,6 +73,15 @@ def test_issue184_workflow_pins_every_shell_mapping() -> None:
     assert 'seeds=(0 1 2)' in workflow
     assert "outputs/ipmnist_screening/rls_preset_ablation_r1" in workflow
     assert ".github/scripts/ipmnist_prereg.py seal" in workflow
+    assert "group: ipmnist-prereg-${{ inputs.protocol }}\n" in workflow
+    sync_index = workflow.index("- name: Synchronize the committed environment")
+    authorization_index = workflow.index(
+        "- name: Require one pre-data project-owner authorization and one dispatch"
+    )
+    test_index = workflow.index("- name: Run code-only preregistration preflight tests")
+    measurement_index = workflow.index("- name: Run the frozen arms sequentially and merge once")
+    assert sync_index < authorization_index < test_index < measurement_index
+    assert "uv run --no-sync python .github/scripts/ipmnist_prereg.py preflight" in workflow
 
 
 def test_issue184_github_and_local_protocols_cannot_drift() -> None:
@@ -952,8 +961,9 @@ def test_completion_seal_copies_runner_and_binds_fresh_reconstruction(
         )
 
 
-def test_issue184_prerequisite_requires_committed_result_live_success_and_closure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("outcome", ["replicated", "directionally_replicated"])
+def test_issue184_prerequisite_requires_eligible_committed_result_live_success_and_closure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: str
 ) -> None:
     issue51 = _PROTOCOLS["issue51"]
     namespace = tmp_path / "outputs" / "ipmnist_screening" / issue51.namespace
@@ -966,7 +976,7 @@ def test_issue184_prerequisite_requires_committed_result_live_success_and_closur
         "source": "1" * 40,
         "tree": "2" * 40,
         "uv_lock_sha256": "3" * 64,
-        "outcome": "replicated",
+        "outcome": outcome,
         "summary_sha256": "4" * 64,
     }
     completion = {
@@ -1048,7 +1058,7 @@ def test_issue184_prerequisite_requires_committed_result_live_success_and_closur
     )
     assert receipt["protocol"] == "issue51"
     assert receipt["issue_closed_at"] == "2026-08-16T09:00:00Z"
-    assert receipt["outcome"] == "replicated"
+    assert receipt["outcome"] == outcome
     assert receipt["artifact_id"] == 456
     assert receipt["artifact_archive_sha256"] == hashlib.sha256(archive_bytes).hexdigest()
 
@@ -1068,6 +1078,55 @@ def test_issue184_prerequisite_requires_committed_result_live_success_and_closur
         lambda path, *, token: tampered_stream.getvalue(),
     )
     with pytest.raises(RuntimeError, match="differ"):
+        _verify_prerequisite_completion(
+            _PROTOCOLS["issue184"],
+            repository="elizaOS/asi",
+            launch_source="5" * 40,
+            root=tmp_path,
+            token="token",
+        )
+
+
+@pytest.mark.parametrize("outcome", ["not_replicated", "inconclusive"])
+def test_issue184_prerequisite_rejects_ineligible_incumbent_outcome(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: str
+) -> None:
+    issue51 = _PROTOCOLS["issue51"]
+    namespace = tmp_path / "outputs" / "ipmnist_screening" / issue51.namespace
+    namespace.mkdir(parents=True)
+    runner_path = namespace / "runner.v2.json"
+    _write_json(runner_path, {"runner": "exact"})
+    result = {
+        "schema": "asi.ipmnist_prereg.result_validation.v1",
+        "protocol": asdict(issue51),
+        "source": "1" * 40,
+        "tree": "2" * 40,
+        "uv_lock_sha256": "3" * 64,
+        "outcome": outcome,
+        "summary_sha256": "4" * 64,
+    }
+    completion = {
+        "schema": "asi.ipmnist_prereg.completion.v1",
+        "launch_preflight": {
+            "protocol": asdict(issue51),
+            "source": "1" * 40,
+            "tree": "2" * 40,
+            "uv_lock_sha256": "3" * 64,
+            "run_id": 123,
+            "run_url": "https://github.com/elizaOS/asi/actions/runs/123",
+        },
+        "result_validation": result,
+        "runner_receipt": "outputs/ipmnist_screening/replication_r1/runner.v2.json",
+        "runner_receipt_sha256": hashlib.sha256(runner_path.read_bytes()).hexdigest(),
+    }
+    _write_json(namespace / "completion.v1.json", completion)
+    monkeypatch.setitem(
+        _PREREQUISITE_GLOBALS,
+        "validate_result_bundle",
+        lambda **_kwargs: result,
+    )
+
+    with pytest.raises(RuntimeError, match="all-positive live incumbent"):
         _verify_prerequisite_completion(
             _PROTOCOLS["issue184"],
             repository="elizaOS/asi",

@@ -1193,6 +1193,10 @@ def _verify_prerequisite_completion(
     )
     if _canonical_json(stored_result) != _canonical_json(recomputed):
         raise RuntimeError("prerequisite result does not match a fresh reconstruction")
+    if recomputed.get("outcome") not in {"replicated", "directionally_replicated"}:
+        raise RuntimeError(
+            "prerequisite result did not establish an all-positive live incumbent"
+        )
     run_id = launch.get("run_id")
     run_url = launch.get("run_url")
     if type(run_id) is not int or run_id <= 0:
