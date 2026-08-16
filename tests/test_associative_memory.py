@@ -1,3 +1,4 @@
+# mypy: disable-error-code="attr-defined"
 """Tests for the Step 2 fixed-budget associative memory."""
 
 import math
@@ -35,6 +36,179 @@ def test_associative_config_roundtrip() -> None:
     chex.assert_shape(learner.init().keys, (31, 5))
 
 
+def test_config_rejects_infinite_write_lr() -> None:
+    with pytest.raises(ValueError, match="write_lr"):
+        AssociativeMemoryLearner(
+            AssociativeMemoryConfig(
+                vocab_size=4,
+                block_size=3,
+                suffix_length=2,
+                write_lr=float("inf"),
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid_values"),
+    [
+        (
+            "scope_lr",
+            (float("nan"), float("inf"), float("-inf"), -0.01, True, "0.1"),
+        ),
+        (
+            "budget_lr",
+            (float("nan"), float("inf"), float("-inf"), -0.01, True, "0.1"),
+        ),
+        (
+            "initial_budget_fraction",
+            (float("nan"), float("inf"), float("-inf"), 0.0, 1.01, True, "0.5"),
+        ),
+        (
+            "scope_logit_clip",
+            (float("nan"), float("inf"), float("-inf"), 0.0, True, "8.0"),
+        ),
+        ("min_effective_budget", (float("nan"), 1.5, True, "1")),
+        ("adaptive_feature_family", (0, 1, "yes")),
+        ("adaptive_window", (0, 1, "yes")),
+        ("adaptive_budget", (0, 1, "yes")),
+    ],
+)
+def test_config_rejects_invalid_adaptive_scalars(
+    field: str,
+    invalid_values: tuple[object, ...],
+) -> None:
+    base = AssociativeMemoryConfig(vocab_size=4, block_size=3, suffix_length=2)
+
+    for invalid in invalid_values:
+        payload = base.to_config()
+        payload[field] = invalid
+        with pytest.raises(ValueError, match=field):
+            AssociativeMemoryLearner(AssociativeMemoryConfig.from_config(payload))
+
+
+def test_silent_feature_does_not_turn_inf_value_into_nan() -> None:
+    """Weight 0 times an inf stored row is 0*inf = NaN in the evidence sum."""
+    learner = AssociativeMemoryLearner(
+        AssociativeMemoryConfig(vocab_size=4, block_size=3, suffix_length=2, max_features=8)
+    )
+    state = learner.init()
+    poisoned = state.replace(
+        values=state.values.at[0].set(jnp.full((4,), jnp.inf, dtype=jnp.float32))
+    )
+    context = jnp.asarray([1, 2, 3], dtype=jnp.int32)
+    raw = jnp.array([0.0], dtype=jnp.float32)[:, None] * poisoned.values[0][None, :]
+    assert not bool(jnp.all(jnp.isfinite(raw)))
+
+    prediction = learner.predict(poisoned, context)
+    chex.assert_tree_all_finite(prediction.logits)
+    chex.assert_tree_all_finite(prediction.probabilities)
+    assert float(jnp.sum(prediction.probabilities)) == pytest.approx(1.0)
+
+    result = learner.update(poisoned, context, jnp.asarray(1, dtype=jnp.int32))
+    assert not bool(result.update_applied)
+    chex.assert_trees_all_equal(result.state, poisoned)
+    chex.assert_trees_all_equal(result.predictions, jnp.zeros_like(result.predictions))
+    chex.assert_trees_all_equal(result.logits, jnp.zeros_like(result.logits))
+    chex.assert_trees_all_equal(result.metrics, jnp.zeros_like(result.metrics))
+
+
+def test_corrupted_active_family_logits_remain_fail_visible() -> None:
+    """An invalid active gate must not masquerade as a uniform valid gate."""
+    learner = AssociativeMemoryLearner(
+        AssociativeMemoryConfig(
+            vocab_size=4,
+            block_size=3,
+            suffix_length=2,
+            max_features=8,
+            adaptive_feature_family=True,
+        )
+    )
+    state = learner.init().replace(family_logits=jnp.full((2,), jnp.inf, dtype=jnp.float32))
+    context = jnp.asarray([1, 2, 3], dtype=jnp.int32)
+    prediction = learner.predict(state, context)
+
+    assert not bool(jnp.all(jnp.isfinite(prediction.family_probs)))
+    result = learner.update(state, context, jnp.asarray(1, dtype=jnp.int32))
+    assert not bool(result.update_applied)
+    chex.assert_trees_all_equal(result.state, state)
+
+
+@pytest.mark.parametrize(
+    "leaf",
+    [
+        "values",
+        "utility",
+        "counts",
+        "prior",
+        "family_logits",
+        "window_logits",
+        "budget_logit",
+    ],
+)
+def test_update_rejects_nonfinite_source_state_leaf(leaf: str) -> None:
+    learner = AssociativeMemoryLearner(
+        AssociativeMemoryConfig(
+            vocab_size=4,
+            block_size=3,
+            suffix_length=2,
+            max_features=8,
+            adaptive_feature_family=True,
+            adaptive_window=True,
+            adaptive_budget=True,
+        )
+    )
+    state = learner.init()
+    poison = jnp.asarray(jnp.nan, dtype=jnp.float32)
+    if leaf == "values":
+        state = state.replace(values=state.values.at[0, 0].set(poison))
+    elif leaf == "utility":
+        state = state.replace(utility=state.utility.at[0].set(poison))
+    elif leaf == "counts":
+        state = state.replace(counts=state.counts.at[0].set(poison))
+    elif leaf == "prior":
+        state = state.replace(prior=state.prior.at[0].set(poison))
+    elif leaf == "family_logits":
+        state = state.replace(family_logits=state.family_logits.at[0].set(poison))
+    elif leaf == "window_logits":
+        state = state.replace(window_logits=state.window_logits.at[0].set(poison))
+    else:
+        state = state.replace(budget_logit=poison)
+
+    result = learner.update(
+        state,
+        jnp.asarray([1, 2, 3], dtype=jnp.int32),
+        jnp.asarray(1, dtype=jnp.int32),
+    )
+
+    assert not bool(result.update_applied)
+    chex.assert_trees_all_equal(result.state, state)
+    chex.assert_tree_all_finite((result.predictions, result.logits, result.metrics))
+    chex.assert_trees_all_equal(result.predictions, jnp.zeros_like(result.predictions))
+    chex.assert_trees_all_equal(result.logits, jnp.zeros_like(result.logits))
+    chex.assert_trees_all_equal(result.metrics, jnp.zeros_like(result.metrics))
+
+
+def test_array_runner_exposes_rejected_update_mask() -> None:
+    learner = AssociativeMemoryLearner(
+        AssociativeMemoryConfig(vocab_size=4, block_size=3, suffix_length=2, max_features=8)
+    )
+    state = learner.init().replace(
+        counts=learner.init().counts.at[0].set(jnp.asarray(jnp.inf, dtype=jnp.float32))
+    )
+    contexts = jnp.asarray([[1, 2, 3], [2, 3, 0]], dtype=jnp.int32)
+    labels = jnp.asarray([1, 2], dtype=jnp.int32)
+
+    result = run_associative_memory_arrays(learner, state, contexts, labels)
+
+    chex.assert_trees_all_equal(
+        result.updates_applied,
+        jnp.zeros((contexts.shape[0],), dtype=jnp.bool_),
+    )
+    chex.assert_trees_all_equal(result.state, state)
+    chex.assert_trees_all_equal(result.predictions, jnp.zeros_like(result.predictions))
+    chex.assert_trees_all_equal(result.metrics, jnp.zeros_like(result.metrics))
+
+
 def test_associative_prediction_is_before_write() -> None:
     learner = AssociativeMemoryLearner(
         AssociativeMemoryConfig(vocab_size=5, block_size=4, suffix_length=3)
@@ -45,6 +219,7 @@ def test_associative_prediction_is_before_write() -> None:
     before = learner.predict(state, context)
     result = learner.update(state, context, jnp.asarray(2, dtype=jnp.int32))
 
+    assert bool(result.update_applied)
     chex.assert_trees_all_close(before.probabilities, jnp.full((5,), 0.2))
     chex.assert_trees_all_close(result.predictions, before.probabilities)
     assert int(result.state.step_count) == 1
@@ -93,6 +268,10 @@ def test_associative_memory_learns_repeated_binding() -> None:
 
     result = run_associative_memory_arrays(learner, learner.init(), contexts, labels)
     chex.assert_tree_all_finite((result.predictions, result.metrics))
+    chex.assert_trees_all_equal(
+        result.updates_applied,
+        jnp.ones((contexts.shape[0],), dtype=jnp.bool_),
+    )
 
     initial_nll = float(jnp.mean(result.metrics[:4, 0]))
     final_nll = float(jnp.mean(result.metrics[-4:, 0]))
