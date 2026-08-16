@@ -30,12 +30,15 @@ References:
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from numbers import Integral, Real
 from typing import Any
 
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 from jax import Array
 
+from alberta_framework._float32 import round_real_to_float32
 from alberta_framework.core.intelligence_amplification import (
     ExoCerebellumConfig,
     IAAgent,
@@ -85,6 +88,10 @@ class Step12IAConfig:
     option_planning_backups_per_step: int = 0
     epsilon_base: float = 0.1
     utility_ema_decay: float = 0.99
+
+    def __post_init__(self) -> None:
+        """Reject illegal dimensions and scientific scalars, then canonicalize."""
+        _validate_ia_facade_config(self)
 
     def to_config(self) -> dict[str, Any]:
         """Return a JSON-serializable representation."""
@@ -136,6 +143,157 @@ class Step12IAConfig:
             step_size=self.cerebellum_step_size,
         )
         return IAConfig(cerebellum=cerebellum, cortex=cortex)
+
+
+_INT32_MAX = 2**31 - 1
+
+
+def _require_real(name: str, value: object) -> float:
+    """Return a concrete real scalar after direct float32 sink validation."""
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, Real):
+        raise ValueError(f"{name} must be a real number, got {value!r}")
+    try:
+        narrowed = round_real_to_float32(value)
+    except (FloatingPointError, OverflowError, TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be finite in float32, got {value!r}") from exc
+    if not bool(np.isfinite(narrowed)):
+        raise ValueError(f"{name} must be finite in float32, got {value!r}")
+    return narrowed
+
+
+def _require_unit_interval(name: str, value: object) -> float:
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, Real):
+        raise ValueError(f"{name} must be a real number, got {value!r}")
+    original: Any = value
+    if original < 0.0 or original > 1.0:
+        raise ValueError(f"{name} must be in [0, 1], got {value!r}")
+    return _require_real(name, value)
+
+
+def _require_nonnegative_real(name: str, value: object) -> float:
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, Real):
+        raise ValueError(f"{name} must be a real number, got {value!r}")
+    original: Any = value
+    if original < 0.0:
+        raise ValueError(f"{name} must be non-negative, got {value!r}")
+    return _require_real(name, value)
+
+
+def _require_positive_real(name: str, value: object) -> float:
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, Real):
+        raise ValueError(f"{name} must be a real number, got {value!r}")
+    original: Any = value
+    if original <= 0.0:
+        raise ValueError(f"{name} must be positive, got {value!r}")
+    narrowed = _require_real(name, value)
+    if narrowed <= 0.0:
+        raise ValueError(f"{name} must remain positive in float32, got {value!r}")
+    return narrowed
+
+
+def _require_int(
+    name: str,
+    value: object,
+    *,
+    minimum: int | None = None,
+    exclusive_maximum: int | None = None,
+) -> int:
+    if isinstance(value, bool) or not isinstance(value, Integral):
+        raise ValueError(f"{name} must be an integer, got {value!r}")
+    number = int(value)
+    if minimum is not None and number < minimum:
+        if minimum == 1:
+            raise ValueError(f"{name} must be positive, got {value!r}")
+        if minimum == 0:
+            raise ValueError(f"{name} must be non-negative, got {value!r}")
+        raise ValueError(f"{name} must be >= {minimum}, got {value!r}")
+    if exclusive_maximum is not None and number >= exclusive_maximum:
+        raise ValueError(f"{name} must be smaller than int32 max, got {value!r}")
+    return number
+
+
+def _validate_ia_facade_config(config: Step12IAConfig) -> None:
+    n_demons = _require_int("n_demons", config.n_demons, minimum=1)
+    observation_dim = _require_int("observation_dim", config.observation_dim, minimum=1)
+    n_primitive_actions = _require_int(
+        "n_primitive_actions",
+        config.n_primitive_actions,
+        minimum=1,
+    )
+    option_planning_backups_per_step = _require_int(
+        "option_planning_backups_per_step",
+        config.option_planning_backups_per_step,
+        minimum=0,
+        exclusive_maximum=_INT32_MAX,
+    )
+    if not isinstance(config.subtask_specs, tuple):
+        raise ValueError(
+            f"subtask_specs must be a tuple of SubtaskSpec, got {config.subtask_specs!r}"
+        )
+    canonical_specs: list[SubtaskSpec] = []
+    for spec in config.subtask_specs:
+        if not isinstance(spec, SubtaskSpec):
+            raise ValueError(f"subtask_specs must contain SubtaskSpec values, got {spec!r}")
+        feature_index = _require_int("feature_index", spec.feature_index, minimum=0)
+        if feature_index >= observation_dim:
+            raise ValueError(
+                f"feature_index must be < observation_dim, got {spec.feature_index!r}"
+            )
+        threshold = _require_positive_real("threshold", spec.threshold)
+        pseudo_reward_scale = _require_real(
+            "pseudo_reward_scale",
+            spec.pseudo_reward_scale,
+        )
+        max_option_steps = _require_int(
+            "max_option_steps",
+            spec.max_option_steps,
+            minimum=1,
+        )
+        if max_option_steps > _INT32_MAX:
+            raise ValueError("max_option_steps must fit int32 telemetry")
+        canonical_specs.append(
+            SubtaskSpec(
+                feature_index=feature_index,
+                threshold=threshold,
+                pseudo_reward_scale=pseudo_reward_scale,
+                max_option_steps=max_option_steps,
+            )
+        )
+    cerebellum_step_size = _require_positive_real(
+        "cerebellum_step_size",
+        config.cerebellum_step_size,
+    )
+    base_step_size = _require_nonnegative_real("base_step_size", config.base_step_size)
+    base_avg_reward_step_size = _require_nonnegative_real(
+        "base_avg_reward_step_size",
+        config.base_avg_reward_step_size,
+    )
+    option_step_size = _require_nonnegative_real(
+        "option_step_size",
+        config.option_step_size,
+    )
+    option_gamma = _require_unit_interval("option_gamma", config.option_gamma)
+    epsilon_base = _require_unit_interval("epsilon_base", config.epsilon_base)
+    utility_ema_decay = _require_unit_interval(
+        "utility_ema_decay",
+        config.utility_ema_decay,
+    )
+    object.__setattr__(config, "n_demons", n_demons)
+    object.__setattr__(config, "subtask_specs", tuple(canonical_specs))
+    object.__setattr__(config, "observation_dim", observation_dim)
+    object.__setattr__(config, "n_primitive_actions", n_primitive_actions)
+    object.__setattr__(config, "cerebellum_step_size", cerebellum_step_size)
+    object.__setattr__(config, "base_step_size", base_step_size)
+    object.__setattr__(config, "base_avg_reward_step_size", base_avg_reward_step_size)
+    object.__setattr__(config, "option_step_size", option_step_size)
+    object.__setattr__(config, "option_gamma", option_gamma)
+    object.__setattr__(
+        config,
+        "option_planning_backups_per_step",
+        option_planning_backups_per_step,
+    )
+    object.__setattr__(config, "epsilon_base", epsilon_base)
+    object.__setattr__(config, "utility_ema_decay", utility_ema_decay)
 
 
 @dataclass(frozen=True)
@@ -296,6 +454,7 @@ def run_step12_smoke(
         & jnp.all(jnp.isfinite(result.augmented_obs))
         & jnp.all(result.recommendations >= 0)
         & jnp.all(result.recommendations < cfg.n_primitive_actions)
+        & jnp.all(result.updates_applied)
     )
 
     return Step12SmokeResult(
