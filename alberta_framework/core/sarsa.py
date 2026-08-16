@@ -505,9 +505,16 @@ class SARSAAgent:
         )[:n_actions]
 
         # SARSA target: r + gamma * Q(s', a') with terminal handling.
-        # A terminal transition must not multiply Q(s', a'); 0 * inf is NaN.
+        # A terminal or zero-gamma transition must not multiply Q(s', a');
+        # jnp.where still evaluates 0 * inf, which is NaN.
         q_sa_next = q_next[next_action]
-        bootstrap = jnp.where(terminated, 0.0, gamma * q_sa_next)
+        gamma_arr = jnp.asarray(gamma, dtype=q_sa_next.dtype)
+        skip_bootstrap = (terminated != 0) | (gamma_arr == 0.0)
+        bootstrap = jnp.where(
+            skip_bootstrap,
+            jnp.zeros_like(q_sa_next),
+            gamma_arr * q_sa_next,
+        )
         sarsa_target = reward + bootstrap
 
         # Build cumulants: NaN for all except last_action gets sarsa_target
@@ -544,8 +551,14 @@ class SARSAAgent:
             for i in range(n_actions):
                 w_trace, b_trace = head_traces[i]
                 decay = jnp.where(state.last_action == i, 1.0, gl)
-                new_w = jnp.where(terminated, jnp.zeros_like(w_trace), decay * w_trace)
-                new_b = jnp.where(terminated, jnp.zeros_like(b_trace), decay * b_trace)
+                skipped_w = jnp.where(
+                    decay == 0.0, jnp.zeros_like(w_trace), decay * w_trace
+                )
+                skipped_b = jnp.where(
+                    decay == 0.0, jnp.zeros_like(b_trace), decay * b_trace
+                )
+                new_w = jnp.where(terminated, jnp.zeros_like(w_trace), skipped_w)
+                new_b = jnp.where(terminated, jnp.zeros_like(b_trace), skipped_b)
                 head_traces[i] = (new_w, new_b)
             new_learner_state = new_learner_state.replace(head_traces=tuple(head_traces))
 
