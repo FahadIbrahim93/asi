@@ -33,14 +33,37 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import math
+from numbers import Real
 from typing import Any
 
 import chex
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 from jax import Array
 from jaxtyping import Float, Int
+
+_FLOAT32_TINY = float(np.finfo(np.float32).tiny)
+
+
+def _finite_positive_normal_float32(name: str, value: object) -> float:
+    """Return a concrete real after validation in the model's execution dtype."""
+    message = f"{name} must be a finite positive normal float32"
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError(message)
+    try:
+        concrete = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(message) from exc
+    if not math.isfinite(concrete) or concrete <= 0.0:
+        raise ValueError(message)
+    with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+        narrowed = float(np.float32(concrete))
+    if not math.isfinite(narrowed) or narrowed < _FLOAT32_TINY:
+        raise ValueError(message)
+    return concrete
 
 
 @dataclasses.dataclass(frozen=True)
@@ -80,14 +103,17 @@ class SparseFTLWorldModelConfig:
             raise ValueError("projection_dim must be positive")
         if self.bins < 2:
             raise ValueError("bins must be at least 2")
-        if self.ridge <= 0.0:
-            raise ValueError("ridge must be positive")
+        ridge = _finite_positive_normal_float32("ridge", self.ridge)
         if not 0.0 < self.statistics_decay <= 1.0:
             raise ValueError("statistics_decay must be in (0, 1]")
-        if self.prediction_clip <= 0.0:
-            raise ValueError("prediction_clip must be positive")
+        prediction_clip = _finite_positive_normal_float32(
+            "prediction_clip",
+            self.prediction_clip,
+        )
         if not 0.0 <= self.error_decay < 1.0:
             raise ValueError("error_decay must be in [0, 1)")
+        object.__setattr__(self, "ridge", ridge)
+        object.__setattr__(self, "prediction_clip", prediction_clip)
 
     @property
     def input_dim(self) -> int:
