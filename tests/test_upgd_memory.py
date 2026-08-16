@@ -180,3 +180,34 @@ def test_upgd_memory_novelty_threshold_adapts() -> None:
         ).state
 
     assert float(jnp.exp(state.novelty_log_threshold)) > config.initial_novelty_threshold
+
+
+def test_zero_reliability_decay_does_not_multiply_inf_ema() -> None:
+    """reliability_decay=0 times an infinite EMA is NaN and would be held."""
+    config = UPGDMemoryConfig(
+        feature_dim=2,
+        n_heads=2,
+        hidden_sizes=(4,),
+        slots_per_class=2,
+        reliability_decay=0.0,
+    )
+    learner = UPGDMemoryLearner(config)
+    state = learner.init(jr.key(0)).replace(  # type: ignore[attr-defined]
+        allocation_ema=jnp.asarray(jnp.inf, dtype=jnp.float32),
+        upgd_loss_ema=jnp.asarray(jnp.inf, dtype=jnp.float32),
+        memory_loss_ema=jnp.asarray(jnp.inf, dtype=jnp.float32),
+        blended_loss_ema=jnp.asarray(jnp.inf, dtype=jnp.float32),
+    )
+    raw = jnp.asarray(0.0, dtype=jnp.float32) * jnp.asarray(jnp.inf, dtype=jnp.float32)
+    assert not bool(jnp.isfinite(raw))
+
+    result = learner.update(
+        state,
+        jnp.asarray([1.0, 0.0], dtype=jnp.float32),
+        jnp.asarray([1.0, 0.0], dtype=jnp.float32),
+    )
+    assert bool(result.update_applied)
+    assert bool(jnp.isfinite(result.state.allocation_ema))
+    assert bool(jnp.isfinite(result.state.upgd_loss_ema))
+    assert bool(jnp.isfinite(result.state.memory_loss_ema))
+    assert bool(jnp.isfinite(result.state.blended_loss_ema))

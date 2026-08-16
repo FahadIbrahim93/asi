@@ -37,6 +37,12 @@ from alberta_framework.core.update_safety import (
 )
 from alberta_framework.core.upgd import UPGDLearner, UPGDState
 
+
+def _skip_zero_scale(scale: Array, value: Array) -> Array:
+    """Skip ``0 * inf`` so a disabled reliability EMA does not poison trackers."""
+    return jnp.where(scale == 0.0, jnp.zeros_like(value), scale * value)
+
+
 UPGDMemoryReadoutMode = Literal["linear_mse", "softmax_ce"]
 
 
@@ -363,7 +369,17 @@ class UPGDMemoryLearner:
     ) -> Array:
         active_memory = (jnp.sum(state.memory_state.counts > 0.0) > 0).astype(jnp.float32)
         confidence_delta = jnp.max(memory_prediction) - jnp.max(upgd_prediction)
-        reliability_delta = state.upgd_loss_ema - state.memory_loss_ema
+        upgd_loss_ema = (
+            jnp.zeros_like(state.upgd_loss_ema)
+            if self._config.reliability_decay == 0.0
+            else state.upgd_loss_ema
+        )
+        memory_loss_ema = (
+            jnp.zeros_like(state.memory_loss_ema)
+            if self._config.reliability_decay == 0.0
+            else state.memory_loss_ema
+        )
+        reliability_delta = upgd_loss_ema - memory_loss_ema
         logit = (
             state.memory_logit
             + self._config.confidence_logit_scale * confidence_delta
@@ -483,7 +499,9 @@ class UPGDMemoryLearner:
         allocated = memory_result.metrics[5]
         decay = jnp.asarray(self._config.reliability_decay, dtype=jnp.float32)
         one_minus_decay = 1.0 - decay
-        next_allocation_ema = decay * state.allocation_ema + one_minus_decay * allocated
+        next_allocation_ema = (
+            _skip_zero_scale(decay, state.allocation_ema) + one_minus_decay * allocated
+        )
         allocation_error = next_allocation_ema - jnp.asarray(
             self._config.target_allocation_rate,
             dtype=jnp.float32,
@@ -502,9 +520,14 @@ class UPGDMemoryLearner:
             memory_state=memory_result.state,
             memory_logit=next_memory_logit,
             novelty_log_threshold=next_log_threshold,
-            upgd_loss_ema=decay * state.upgd_loss_ema + one_minus_decay * upgd_loss,
-            memory_loss_ema=decay * state.memory_loss_ema + one_minus_decay * memory_loss,
-            blended_loss_ema=(decay * state.blended_loss_ema + one_minus_decay * blended_loss),
+            upgd_loss_ema=_skip_zero_scale(decay, state.upgd_loss_ema)
+            + one_minus_decay * upgd_loss,
+            memory_loss_ema=_skip_zero_scale(decay, state.memory_loss_ema)
+            + one_minus_decay * memory_loss,
+            blended_loss_ema=(
+                _skip_zero_scale(decay, state.blended_loss_ema)
+                + one_minus_decay * blended_loss
+            ),
             allocation_ema=next_allocation_ema,
             step_count=state.step_count + 1,
         )
@@ -523,11 +546,21 @@ class UPGDMemoryLearner:
             ],
             dtype=jnp.float32,
         )
+        checked_state = (
+            state.replace(  # type: ignore[attr-defined]
+                allocation_ema=jnp.zeros_like(state.allocation_ema),
+                upgd_loss_ema=jnp.zeros_like(state.upgd_loss_ema),
+                memory_loss_ema=jnp.zeros_like(state.memory_loss_ema),
+                blended_loss_ema=jnp.zeros_like(state.blended_loss_ema),
+            )
+            if self._config.reliability_decay == 0.0
+            else state
+        )
         update_applied = (
             observation_valid
             & target_valid
             & memory_result.update_applied
-            & floating_tree_is_finite(state)
+            & floating_tree_is_finite(checked_state)
             & floating_tree_is_finite(candidate_state)
             & jnp.all(jnp.isfinite(prediction))
             & jnp.all(jnp.isfinite(errors))
