@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import struct
 from numbers import Integral, Real
+from typing import cast
 
 
 def _round_quotient_ties_to_even(numerator: int, denominator: int) -> int:
@@ -82,21 +83,23 @@ def _real_ratio(value: Real) -> tuple[int, int, bool]:
     actual_type = type(value)
     if issubclass(actual_type, bool) or not issubclass(actual_type, Real):
         raise TypeError("value must be an actual non-bool real")
-    if isinstance(value, Integral):
-        ratio: object = (int(value), 1)
+    if issubclass(actual_type, Integral):
+        ratio: object = (int(cast(Integral, value)), 1)
     else:
-        ratio_method = getattr(value, "as_integer_ratio", None)
+        ratio_method = getattr(actual_type, "as_integer_ratio", None)
         if not callable(ratio_method):
             raise TypeError("real value must expose as_integer_ratio")
-        ratio = ratio_method()
-    if not isinstance(ratio, tuple) or len(ratio) != 2:
+        ratio = ratio_method(value)
+    if type(ratio) is not tuple or len(ratio) != 2:
         raise TypeError("as_integer_ratio must return an integer pair")
     numerator_raw, denominator_raw = ratio
+    num_type = type(numerator_raw)
+    den_type = type(denominator_raw)
     if (
-        isinstance(numerator_raw, bool)
-        or not isinstance(numerator_raw, Integral)
-        or isinstance(denominator_raw, bool)
-        or not isinstance(denominator_raw, Integral)
+        issubclass(num_type, bool)
+        or not issubclass(num_type, Integral)
+        or issubclass(den_type, bool)
+        or not issubclass(den_type, Integral)
     ):
         raise TypeError("as_integer_ratio must return an integer pair")
     numerator = int(numerator_raw)
