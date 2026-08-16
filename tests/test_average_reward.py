@@ -845,6 +845,49 @@ def test_average_reward_configs_reject_hostile_integer_and_container_types() -> 
         AverageRewardHordeActorCriticConfig.from_config(payload)
 
 
+def test_average_reward_decoders_reject_schema_and_container_ambiguity() -> None:
+    class DictSubclass(dict[str, object]):
+        pass
+
+    actor_config = AverageRewardHordeActorCriticConfig(n_actions=2).to_config()
+    with pytest.raises(ValueError, match="actual dict"):
+        AverageRewardHordeActorCriticConfig.from_config(DictSubclass(actor_config))  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="fields"):
+        AverageRewardHordeActorCriticConfig.from_config({**actor_config, "extra": 1})
+    with pytest.raises(ValueError, match="type"):
+        AverageRewardHordeActorCriticConfig.from_config({**actor_config, "type": "wrong"})
+    with pytest.raises(ValueError, match="serialized hidden_sizes"):
+        AverageRewardHordeActorCriticConfig.from_config(
+            {**actor_config, "hidden_sizes": tuple(actor_config["hidden_sizes"])}
+        )
+
+    actor_agent = AverageRewardHordeActorCriticAgent(
+        AverageRewardHordeActorCriticConfig(n_actions=2)
+    ).to_config()
+    with pytest.raises(ValueError, match="actual dict"):
+        AverageRewardHordeActorCriticAgent.from_config(DictSubclass(actor_agent))  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="nested configs"):
+        AverageRewardHordeActorCriticAgent.from_config(
+            {**actor_agent, "config": DictSubclass(actor_agent["config"])}  # type: ignore[arg-type]
+        )
+
+    sarsa_config = DifferentialSARSAConfig(n_actions=2).to_config()
+    with pytest.raises(ValueError, match="actual dict"):
+        DifferentialSARSAConfig.from_config(DictSubclass(sarsa_config))  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="fields"):
+        DifferentialSARSAConfig.from_config({**sarsa_config, "extra": 1})
+    with pytest.raises(ValueError, match="type"):
+        DifferentialSARSAConfig.from_config({**sarsa_config, "type": "wrong"})
+
+    sarsa_agent = DifferentialSARSAAgent(DifferentialSARSAConfig(n_actions=2)).to_config()
+    with pytest.raises(ValueError, match="actual dict"):
+        DifferentialSARSAAgent.from_config(DictSubclass(sarsa_agent))
+    with pytest.raises(ValueError, match="nested config"):
+        DifferentialSARSAAgent.from_config(
+            {**sarsa_agent, "config": DictSubclass(sarsa_agent["config"])}  # type: ignore[arg-type]
+        )
+
+
 @pytest.mark.parametrize(
     ("config_type", "field", "value"),
     (

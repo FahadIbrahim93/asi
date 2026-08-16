@@ -725,3 +725,12 @@ def test_option_search_control_config_accepts_and_canonicalizes_numpy_integers()
     assert type(cfg.min_model_completions) is int
     assert cfg.backup_budget == 4
     assert cfg.min_model_completions == 2
+
+
+def test_option_search_control_config_rejects_noncanonical_serialized_containers() -> None:
+    class DictSubclass(dict[str, object]):
+        pass
+
+    payload = OptionSearchControlConfig().to_config()
+    with pytest.raises(ValueError, match="actual dict"):
+        OptionSearchControlConfig.from_config(DictSubclass(payload))

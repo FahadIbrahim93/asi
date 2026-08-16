@@ -362,3 +362,40 @@ def test_recurring_ipmnist_dataclasses_accept_and_canonicalize_numpy_integers() 
     assert type(phase.length) is int
     assert type(phase.exposure_index) is int
     assert phase.length == 4
+
+    snapshot = SentinelProbeSnapshot(
+        phase_index=np.int8(0),
+        checkpoint_step=np.uint16(4),
+        permutation_id="permutation-a.v1",
+        permutation_sha256=_sha("a"),
+        exposure_index=np.int64(0),
+        sentinel_set_id="sentinel-a.v1",
+        sentinel_set_sha256=_sha("2"),
+        learner_state_sha256_before=_sha("3"),
+        learner_state_sha256_after=_sha("3"),
+        correctness=(True,),
+    )
+    assert type(snapshot.phase_index) is int
+    assert type(snapshot.checkpoint_step) is int
+    assert type(snapshot.exposure_index) is int
+    assert type(snapshot.to_config()["checkpoint_step"]) is int
+
+
+def test_recurring_ipmnist_phase_preflights_derived_stop_step() -> None:
+    legal = RecurringIPMNISTPhase(
+        phase_index=0,
+        start_step=2**31 - 2,
+        length=1,
+        permutation_id="permutation-a.v1",
+        exposure_index=0,
+    )
+    assert legal.stop_step == 2**31 - 1
+
+    with pytest.raises(ValueError, match="stop_step"):
+        RecurringIPMNISTPhase(
+            phase_index=0,
+            start_step=2**31 - 1,
+            length=1,
+            permutation_id="permutation-a.v1",
+            exposure_index=0,
+        )

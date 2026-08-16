@@ -124,6 +124,8 @@ class OptionSearchControlConfig:
     ) -> OptionSearchControlConfig:
         """Strictly reconstruct only the exact v1 configuration schema."""
 
+        if type(config) is not dict:
+            raise ValueError("option search control config must be an actual dict")
         payload = dict(config)
         expected = {
             "schema",

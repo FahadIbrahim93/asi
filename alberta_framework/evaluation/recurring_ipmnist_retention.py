@@ -228,6 +228,8 @@ class RecurringIPMNISTPhase:
             "length",
             _positive_int(self.length, name="length"),
         )
+        if self.start_step > _INT32_MAX - self.length:
+            raise ValueError("stop_step must fit signed int32")
         _identifier(self.permutation_id, name="permutation_id", versioned=True)
         object.__setattr__(
             self,
@@ -469,11 +471,23 @@ class SentinelProbeSnapshot:
     correctness: tuple[bool, ...]
 
     def __post_init__(self) -> None:
-        _nonnegative_int(self.phase_index, name="phase_index")
-        _positive_int(self.checkpoint_step, name="checkpoint_step")
+        object.__setattr__(
+            self,
+            "phase_index",
+            _nonnegative_int(self.phase_index, name="phase_index"),
+        )
+        object.__setattr__(
+            self,
+            "checkpoint_step",
+            _positive_int(self.checkpoint_step, name="checkpoint_step"),
+        )
         _identifier(self.permutation_id, name="permutation_id", versioned=True)
         _sha256(self.permutation_sha256, name="permutation_sha256")
-        _nonnegative_int(self.exposure_index, name="exposure_index")
+        object.__setattr__(
+            self,
+            "exposure_index",
+            _nonnegative_int(self.exposure_index, name="exposure_index"),
+        )
         _identifier(self.sentinel_set_id, name="sentinel_set_id", versioned=True)
         _sha256(self.sentinel_set_sha256, name="sentinel_set_sha256")
         before = _sha256(

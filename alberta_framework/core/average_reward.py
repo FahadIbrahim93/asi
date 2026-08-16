@@ -80,9 +80,9 @@ def _validate_hidden_sizes(hidden_sizes: object) -> tuple[int, ...]:
 
 
 def _decode_hidden_sizes(hidden_sizes: object) -> tuple[int, ...]:
-    if type(hidden_sizes) not in (list, tuple):
-        raise ValueError("hidden_sizes must be an actual list or tuple")
-    sequence = cast(list[object] | tuple[object, ...], hidden_sizes)
+    if type(hidden_sizes) is not list:
+        raise ValueError("serialized hidden_sizes must be an actual list")
+    sequence = cast(list[object], hidden_sizes)
     return _validate_hidden_sizes(tuple(sequence))
 
 
@@ -456,10 +456,16 @@ class AverageRewardHordeActorCriticConfig:
         config: dict[str, Any],
     ) -> AverageRewardHordeActorCriticConfig:
         """Reconstruct a config from :meth:`to_config` output."""
-        config = dict(config)
-        config.pop("type", None)
-        config["hidden_sizes"] = _decode_hidden_sizes(config["hidden_sizes"])
-        return cls(**config)
+        if type(config) is not dict:
+            raise ValueError("actor-critic config must be an actual dict")
+        payload = dict(config)
+        expected = {field.name for field in dataclasses.fields(cls)} | {"type"}
+        if set(payload) != expected:
+            raise ValueError("actor-critic config fields do not match its schema")
+        if payload.pop("type") != "AverageRewardHordeActorCriticConfig":
+            raise ValueError("actor-critic config type is invalid")
+        payload["hidden_sizes"] = _decode_hidden_sizes(payload["hidden_sizes"])
+        return cls(**payload)
 
 
 @chex.dataclass(frozen=True)
@@ -607,12 +613,18 @@ class AverageRewardHordeActorCriticAgent:
         config: dict[str, Any],
     ) -> AverageRewardHordeActorCriticAgent:
         """Reconstruct an agent from :meth:`to_config` output."""
-        config = dict(config)
-        config.pop("type", None)
-        cfg = AverageRewardHordeActorCriticConfig.from_config(config["config"])
-        actor_opt: Autostep | None = None
-        if config.get("actor_optimizer"):
-            actor_opt = cast(Autostep, optimizer_from_config(config["actor_optimizer"]))
+        if type(config) is not dict:
+            raise ValueError("actor-critic agent config must be an actual dict")
+        if set(config) != {"type", "config", "actor_optimizer"}:
+            raise ValueError("actor-critic agent config fields do not match its schema")
+        if config["type"] != "AverageRewardHordeActorCriticAgent":
+            raise ValueError("actor-critic agent config type is invalid")
+        nested = config["config"]
+        optimizer_config = config["actor_optimizer"]
+        if type(nested) is not dict or type(optimizer_config) is not dict:
+            raise ValueError("actor-critic nested configs must be actual dicts")
+        cfg = AverageRewardHordeActorCriticConfig.from_config(nested)
+        actor_opt = cast(Autostep, optimizer_from_config(optimizer_config))
         return cls(cfg, actor_optimizer=actor_opt)
 
     def init(self, observation_dim: int, key: Array) -> AverageRewardHordeActorCriticState:
@@ -1704,10 +1716,19 @@ class DifferentialSARSAConfig:
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> DifferentialSARSAConfig:
         """Reconstruct a config from :meth:`to_config` output."""
-        config = dict(config)
-        config.pop("type", None)
-        config.setdefault("use_bias", True)
-        return cls(**config)
+        if type(config) is not dict:
+            raise ValueError("differential SARSA config must be an actual dict")
+        payload = dict(config)
+        expected = {field.name for field in dataclasses.fields(cls)} | {"type"}
+        # Historical configs predate the use_bias field and retain the documented
+        # compatibility default. No other schema omission is accepted.
+        if set(payload) == expected - {"use_bias"}:
+            payload["use_bias"] = True
+        elif set(payload) != expected:
+            raise ValueError("differential SARSA config fields do not match its schema")
+        if payload.pop("type") != "DifferentialSARSAConfig":
+            raise ValueError("differential SARSA config type is invalid")
+        return cls(**payload)
 
 
 @chex.dataclass(frozen=True)
@@ -1793,6 +1814,8 @@ class DifferentialSARSAAgent:
     @classmethod
     def from_config(cls, config: Mapping[str, Any]) -> DifferentialSARSAAgent:
         """Reconstruct an agent from :meth:`to_config` output."""
+        if type(config) is not dict:
+            raise ValueError("differential SARSA agent config must be an actual dict")
         payload = dict(config)
         if set(payload) != {"type", "state_schema", "config"}:
             raise ValueError(
@@ -1804,9 +1827,9 @@ class DifferentialSARSAAgent:
         if payload["state_schema"] != DIFFERENTIAL_SARSA_STATE_SCHEMA:
             raise ValueError("differential SARSA state schema is unsupported")
         nested = payload["config"]
-        if not isinstance(nested, Mapping):
-            raise ValueError("differential SARSA nested config must be a mapping")
-        return cls(DifferentialSARSAConfig.from_config(dict(nested)))
+        if type(nested) is not dict:
+            raise ValueError("differential SARSA nested config must be an actual dict")
+        return cls(DifferentialSARSAConfig.from_config(nested))
 
     def init(
         self,
