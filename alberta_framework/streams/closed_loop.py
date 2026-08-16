@@ -439,20 +439,23 @@ class RiverSwimMDP:
             raise ValueError(
                 f"reward_right must be finite, got {config.reward_right}"
             )
-        config = config.replace(  # type: ignore[attr-defined]
-            p_right_up=p_right_up,
-            p_right_down=p_right_down,
+        config = cast(
+            RiverSwimConfig,
+            config.replace(
+                p_right_up=p_right_up,
+                p_right_down=p_right_down,
+            ),
         )
-        self._config = config
-        self._n_states = int(config.n_states)
-        self._transitions_np = self._build_transitions(config)
-        self._rewards_np = self._build_rewards(config)
-        self._transition_logits = jnp.where(
+        self._config: RiverSwimConfig = config
+        self._n_states: int = int(config.n_states)
+        self._transitions_np: np.ndarray = self._build_transitions(config)
+        self._rewards_np: np.ndarray = self._build_rewards(config)
+        self._transition_logits: Array = jnp.where(
             jnp.asarray(self._transitions_np) > 0.0,
             jnp.log(jnp.clip(jnp.asarray(self._transitions_np), 1e-30, 1.0)),
             -jnp.inf,
         )
-        self._rewards = jnp.asarray(self._rewards_np)
+        self._rewards: Array = jnp.asarray(self._rewards_np)
 
     @staticmethod
     def _build_transitions(config: RiverSwimConfig) -> np.ndarray:

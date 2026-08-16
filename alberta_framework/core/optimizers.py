@@ -830,7 +830,7 @@ class IDBD(Optimizer[IDBDState]):
             else jnp.all(jnp.isfinite(error))
         )
         unused_traces = (beta == 0.0) & (decay == 0.0)
-        previous_checked = state.replace(
+        previous_checked = state.replace(  # type: ignore[attr-defined]
             traces=jnp.where(unused_traces, jnp.zeros_like(state.traces), state.traces),
         )
         update_applied = (
@@ -938,7 +938,7 @@ class IDBD(Optimizer[IDBDState]):
 
         unused_traces = (beta == 0.0) & (decay == 0.0)
         unused_bias_trace = (beta == 0.0) & (bias_decay == 0.0)
-        previous_checked = state.replace(
+        previous_checked = state.replace(  # type: ignore[attr-defined]
             traces=jnp.where(unused_traces, jnp.zeros_like(state.traces), state.traces),
             bias_trace=jnp.where(
                 unused_bias_trace, jnp.zeros_like(state.bias_trace), state.bias_trace
@@ -1177,7 +1177,7 @@ class Autostep(Optimizer[AutostepState]):
             else jnp.all(jnp.isfinite(error))
         )
         unused_traces = (mu == 0.0) & (trace_decay == 0.0)
-        previous_checked = state.replace(
+        previous_checked = state.replace(  # type: ignore[attr-defined]
             traces=jnp.where(unused_traces, jnp.zeros_like(state.traces), state.traces),
         )
         meta_ok = jnp.logical_or(mu == 0.0, jnp.all(valid_meta_update))
@@ -1347,7 +1347,7 @@ class Autostep(Optimizer[AutostepState]):
 
         unused_traces = (mu == 0.0) & (trace_decay == 0.0)
         unused_bias_trace = (mu == 0.0) & (bias_trace_decay == 0.0)
-        previous_checked = state.replace(
+        previous_checked = state.replace(  # type: ignore[attr-defined]
             traces=jnp.where(unused_traces, jnp.zeros_like(state.traces), state.traces),
             bias_trace=jnp.where(
                 unused_bias_trace, jnp.zeros_like(state.bias_trace), state.bias_trace

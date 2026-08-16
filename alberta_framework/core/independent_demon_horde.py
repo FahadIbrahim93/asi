@@ -614,7 +614,7 @@ class IndependentDemonHorde:
         # Inf error zeros the ObGD step, then error * step is 0*inf=NaN.
         # Treat that the same as an inactive demon: keep previous finite
         # params, traces, and optimizer states.
-        previous_checked = demon_state.replace(
+        previous_checked = demon_state.replace(  # type: ignore[attr-defined]
             traces=tuple(
                 jnp.where(gamma_lamda == 0.0, jnp.zeros_like(trace), trace)
                 for trace in demon_state.traces
@@ -782,7 +782,7 @@ class IndependentDemonHorde:
         # 3. NaN means inactive; other non-finite values are rejected heads.
         requested_mask = ~jnp.isnan(cumulants)
         checked_demon_states = tuple(
-            demon_state.replace(
+            demon_state.replace(  # type: ignore[attr-defined]
                 traces=tuple(
                     jnp.where(
                         (gammas[i] == 0.0) | (lamdas[i] == 0.0),
@@ -797,7 +797,11 @@ class IndependentDemonHorde:
         global_inputs_valid = (
             jnp.all(jnp.isfinite(observation))
             & jnp.all(jnp.isfinite(next_observation))
-            & _floating_tree_is_finite(state.replace(demon_states=checked_demon_states))
+            & _floating_tree_is_finite(
+                state.replace(  # type: ignore[attr-defined]
+                    demon_states=checked_demon_states
+                )
+            )
         )
         active_mask = (
             requested_mask
