@@ -151,6 +151,24 @@ class TestUtilityUpdate:
         assert bool(has)
         assert int(idx) == 1
 
+    def test_zero_decay_does_not_multiply_inf_utility(self) -> None:
+        """decay=0 times an infinite utility EMA is NaN and would be committed."""
+        cbp_state = ContinualBackpropState(  # type: ignore[call-arg]
+            utilities=(jnp.array([jnp.inf, jnp.inf], dtype=jnp.float32),),
+            ages=(jnp.array([5, 5], dtype=jnp.int32),),
+            replacement_accumulators=jnp.zeros(1, dtype=jnp.float32),
+            rng_key=jr.key(0),
+        )
+        activations = (jnp.array([1.0, 0.5], dtype=jnp.float32),)
+        grads = (jnp.array([0.2, -0.4], dtype=jnp.float32),)
+        raw = jnp.asarray(0.0, dtype=jnp.float32) * jnp.asarray(jnp.inf, dtype=jnp.float32)
+        assert not bool(jnp.isfinite(raw))
+
+        new = update_utility(cbp_state, activations, grads, 0.0)
+        assert bool(jnp.all(jnp.isfinite(new.utilities[0])))
+        expected = jnp.abs(activations[0] * grads[0])
+        chex.assert_trees_all_close(new.utilities[0], expected)
+
 
 class TestWrapperUtilityGradients:
     """The CBP wrapper should track utility in every hidden layer."""
