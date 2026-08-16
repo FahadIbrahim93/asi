@@ -285,6 +285,40 @@ class TestAdam:
         chex.assert_tree_all_finite(result.weight_delta)
         chex.assert_tree_all_finite(result.bias_delta)
 
+    def test_zero_beta_recovers_poisoned_per_parameter_moments(self):
+        """The checked MLP path has the same zero-decay recovery contract."""
+        optimizer = Adam(step_size=0.01, beta1=0.0, beta2=0.0)
+        state = optimizer.init_for_shape((2, 3)).replace(
+            m=jnp.full((2, 3), jnp.inf, dtype=jnp.float32),
+            v=jnp.full((2, 3), jnp.inf, dtype=jnp.float32),
+        )
+
+        result = optimizer.update_from_gradient_checked(
+            state,
+            jnp.full((2, 3), 0.25, dtype=jnp.float32),
+        )
+
+        assert bool(result.update_applied)
+        chex.assert_tree_all_finite(result.step)
+        chex.assert_tree_all_finite(result.new_state)
+
+    def test_zero_config_does_not_relax_a_nonzero_persisted_beta(self):
+        """Recovery requires the persisted tracker decay itself to be disabled."""
+        optimizer = Adam(step_size=0.01, beta1=0.0, beta2=0.0)
+        state = optimizer.init_for_shape((3,)).replace(
+            beta1=jnp.asarray(0.5, dtype=jnp.float32),
+            m=jnp.full(3, jnp.inf, dtype=jnp.float32),
+        )
+
+        result = optimizer.update_from_gradient_checked(
+            state,
+            jnp.ones(3, dtype=jnp.float32),
+        )
+
+        assert not bool(result.update_applied)
+        chex.assert_trees_all_equal(result.new_state, state)
+        chex.assert_trees_all_equal(result.step, jnp.zeros(3, dtype=jnp.float32))
+
 
 # =============================================================================
 # RMSprop
@@ -372,6 +406,39 @@ class TestRMSprop:
         chex.assert_tree_all_finite(result.new_state)
         chex.assert_tree_all_finite(result.weight_delta)
         chex.assert_tree_all_finite(result.bias_delta)
+
+    def test_zero_decay_recovers_poisoned_per_parameter_moment(self):
+        """The checked MLP path skips a disabled poisoned second moment."""
+        optimizer = RMSprop(step_size=0.01, decay=0.0)
+        state = optimizer.init_for_shape((2, 3)).replace(
+            v=jnp.full((2, 3), jnp.inf, dtype=jnp.float32)
+        )
+
+        result = optimizer.update_from_gradient_checked(
+            state,
+            jnp.full((2, 3), 0.25, dtype=jnp.float32),
+        )
+
+        assert bool(result.update_applied)
+        chex.assert_tree_all_finite(result.step)
+        chex.assert_tree_all_finite(result.new_state)
+
+    def test_zero_config_does_not_relax_a_nonzero_persisted_decay(self):
+        """A nonzero persisted decay still consumes and validates its history."""
+        optimizer = RMSprop(step_size=0.01, decay=0.0)
+        state = optimizer.init_for_shape((3,)).replace(
+            decay=jnp.asarray(0.5, dtype=jnp.float32),
+            v=jnp.full(3, jnp.inf, dtype=jnp.float32),
+        )
+
+        result = optimizer.update_from_gradient_checked(
+            state,
+            jnp.ones(3, dtype=jnp.float32),
+        )
+
+        assert not bool(result.update_applied)
+        chex.assert_trees_all_equal(result.new_state, state)
+        chex.assert_trees_all_equal(result.step, jnp.zeros(3, dtype=jnp.float32))
 
 
 # =============================================================================
