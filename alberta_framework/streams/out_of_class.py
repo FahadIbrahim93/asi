@@ -27,10 +27,12 @@ or tanh feature bank:
 """
 
 import math
+from numbers import Real
 
 import chex
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 from jax import Array
 from jaxtyping import Float, Int, PRNGKeyArray
 
@@ -39,6 +41,20 @@ from alberta_framework._fixed_count_selection import (
     stable_smallest_mask,
 )
 from alberta_framework.core.types import TimeStep
+
+
+def _require_positive_float32(value: object, name: str) -> float:
+    """Return a positive finite value representable in the stream execution dtype."""
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError(f"{name} must be a positive finite float32 value")
+    number = float(value)
+    if not math.isfinite(number) or number <= 0.0:
+        raise ValueError(f"{name} must be a positive finite float32 value")
+    with np.errstate(over="ignore", under="ignore"):
+        converted = np.float32(number)
+    if not np.isfinite(converted) or converted <= np.float32(0.0):
+        raise ValueError(f"{name} must be a positive finite float32 value")
+    return float(converted)
 
 # =============================================================================
 # OutOfClassPolynomialStream -- degree-3 polynomial targets
@@ -342,18 +358,18 @@ class FrequencyMismatchStream:
             raise ValueError("n_contexts must be positive")
         if context_length < 1:
             raise ValueError("context_length must be positive")
-        if not math.isfinite(omega_min) or omega_min <= 0:
-            raise ValueError("omega_min must be finite and positive")
-        if not math.isfinite(omega_max) or omega_max <= omega_min:
-            raise ValueError("omega_max must exceed omega_min")
+        omega_min_float32 = _require_positive_float32(omega_min, "omega_min")
+        omega_max_float32 = _require_positive_float32(omega_max, "omega_max")
+        if omega_max_float32 <= omega_min_float32:
+            raise ValueError("omega_max must exceed omega_min in float32")
 
         self._feature_dim = feature_dim
         self._n_tasks = n_tasks
         self._n_components_per_task = n_components_per_task
         self._n_contexts = n_contexts
         self._context_length = context_length
-        self._omega_min = omega_min
-        self._omega_max = omega_max
+        self._omega_min = omega_min_float32
+        self._omega_max = omega_max_float32
         self._amplitude_scale = amplitude_scale
         self._noise_std = noise_std
 

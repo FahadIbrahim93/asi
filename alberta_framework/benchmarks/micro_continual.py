@@ -71,6 +71,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, fields
 from functools import lru_cache
+from numbers import Real
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
@@ -146,15 +147,10 @@ _BAYES_DOMAIN = 404
 
 
 def _require_finite_real(value: object, name: str) -> float:
-    """Reject bools and non-finite values while accepting every other real."""
-    if isinstance(value, bool):
+    """Return one canonical float after rejecting non-real and non-finite values."""
+    if isinstance(value, bool) or not isinstance(value, Real):
         raise ValueError(f"{name} must be a finite real number, got {value!r}")
-    try:
-        number = float(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError) as exc:
-        raise ValueError(
-            f"{name} must be a finite real number, got {value!r}"
-        ) from exc
+    number = float(value)
     if not math.isfinite(number):
         raise ValueError(f"{name} must be a finite real number, got {value!r}")
     return number
@@ -239,21 +235,37 @@ class MicroStreamConfig:
             raise ValueError(
                 f"component_sparsity ({sparsity}) must not exceed dim ({self.dim})"
             )
-        class_sparsity = _require_finite_real(self.class_sparsity, "class_sparsity")
+        real_fields = (
+            "spectrum_decades",
+            "mean_separation",
+            "component_scale",
+            "class_sparsity",
+            "noise_scale",
+            "offset_scale",
+            "scale_shift_min",
+            "scale_shift_max",
+        )
+        normalized_reals = {
+            name: _require_finite_real(getattr(self, name), name) for name in real_fields
+        }
+        for name, number in normalized_reals.items():
+            object.__setattr__(self, name, number)
+
+        class_sparsity = normalized_reals["class_sparsity"]
         if not 0.0 < class_sparsity <= 1.0:
             raise ValueError(
                 f"class_sparsity must be in (0, 1], got {self.class_sparsity!r}"
             )
         for name in ("mean_separation", "noise_scale"):
-            if not _require_finite_real(getattr(self, name), name) > 0.0:
+            if not normalized_reals[name] > 0.0:
                 raise ValueError(f"{name} must be positive, got {getattr(self, name)!r}")
         for name in ("offset_scale", "spectrum_decades", "component_scale"):
-            if _require_finite_real(getattr(self, name), name) < 0.0:
+            if normalized_reals[name] < 0.0:
                 raise ValueError(
                     f"{name} must be non-negative, got {getattr(self, name)!r}"
                 )
-        scale_min = _require_finite_real(self.scale_shift_min, "scale_shift_min")
-        scale_max = _require_finite_real(self.scale_shift_max, "scale_shift_max")
+        scale_min = normalized_reals["scale_shift_min"]
+        scale_max = normalized_reals["scale_shift_max"]
         if not 0.0 < scale_min < scale_max:
             raise ValueError(
                 "scale_shift bounds must satisfy 0 < scale_shift_min < "

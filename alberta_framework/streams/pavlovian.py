@@ -40,6 +40,7 @@ References
 from __future__ import annotations
 
 import math
+import struct
 from numbers import Real
 
 import chex
@@ -64,12 +65,36 @@ def _require_finite_real(
     """Return a finite real, rejecting bools, NaN, and infinities."""
     if isinstance(value, bool) or not isinstance(value, Real):
         raise ValueError(f"{name} must be a finite real, got {value!r}")
-    number = float(value)
+    try:
+        number = float(value)
+    except (OverflowError, ValueError) as error:
+        raise ValueError(f"{name} must be a finite real, got {value!r}") from error
     if not math.isfinite(number):
         raise ValueError(f"{name} must be a finite real, got {value!r}")
     if nonnegative and number < 0.0:
         raise ValueError(f"{name} must be a non-negative finite real, got {value!r}")
     return number
+
+
+def _require_nonnegative_float32(value: object, *, name: str) -> float:
+    """Return the value rounded to the stream's non-negative float32 domain.
+
+    Host-finite values that overflow float32 are rejected. Positive values
+    below the float32 subnormal range are accepted as exact zero, matching the
+    noise-free trajectory they produce in the stream's float32 arithmetic.
+    """
+    number = _require_finite_real(value, name=name, nonnegative=True)
+    try:
+        narrowed = float(struct.unpack("!f", struct.pack("!f", number))[0])
+    except OverflowError as error:
+        raise ValueError(
+            f"{name} must remain finite when rounded to float32, got {value!r}"
+        ) from error
+    if not math.isfinite(narrowed):
+        raise ValueError(
+            f"{name} must remain finite when rounded to float32, got {value!r}"
+        )
+    return narrowed
 
 
 def _require_unit_interval(value: object, *, name: str) -> float:
@@ -208,7 +233,9 @@ class ClassicalConditioningStream:
         cs_duration: How many steps a CS stays active.
         iti_min: Minimum ITI (steps).
         iti_max: Maximum ITI (steps, inclusive).
-        noise_std: Std of Gaussian observation noise.
+        noise_std: Std of Gaussian observation noise, canonicalized to
+            float32. Positive values below the float32 subnormal range
+            become exact zero.
         distractor_prob: Per-step probability that an idle distractor
             fires.
         phases: Tuple of ``PavlovianPhase``.
@@ -244,6 +271,8 @@ class ClassicalConditioningStream:
             iti_min: Minimum inter-trial interval (steps).
             iti_max: Maximum inter-trial interval (steps, inclusive).
             noise_std: Gaussian noise added to the observation features.
+                Accepted values are rounded to float32; positive values below
+                its subnormal range become exact zero.
             distractor_prob: Per-step probability that an idle
                 distractor turns on.
 
@@ -253,7 +282,8 @@ class ClassicalConditioningStream:
                 any phase references a CS index that does not exist, a
                 phase contingency is not a finite real in ``[0, 1]``, or
                 ``noise_std`` / ``distractor_prob`` is not a legal
-                scientific scalar.
+                scientific scalar, or ``noise_std`` becomes non-finite when
+                rounded to the stream's float32 execution dtype.
         """
         if not phases:
             raise ValueError("phases must be non-empty")
@@ -277,7 +307,7 @@ class ClassicalConditioningStream:
         )
         if iti_max < iti_min:
             raise ValueError(f"need 0 <= iti_min <= iti_max, got {iti_min}, {iti_max}")
-        noise_std = _require_finite_real(noise_std, name="noise_std", nonnegative=True)
+        noise_std = _require_nonnegative_float32(noise_std, name="noise_std")
         distractor_prob = _require_unit_interval(
             distractor_prob, name="distractor_prob"
         )

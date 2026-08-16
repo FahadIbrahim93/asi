@@ -186,6 +186,50 @@ class TestConfig:
         assert rebuilt == TINY
         assert MicroStreamConfig.from_mapping(TINY.to_config()) == TINY
 
+    def test_real_fields_roundtrip_as_canonical_floats(self):
+        fields = (
+            "spectrum_decades",
+            "mean_separation",
+            "component_scale",
+            "class_sparsity",
+            "noise_scale",
+            "offset_scale",
+            "scale_shift_min",
+            "scale_shift_max",
+        )
+        config = MicroStreamConfig.from_mapping(TINY.to_config())
+
+        assert all(type(getattr(config, name)) is float for name in fields)
+        assert all(type(config.to_config()[name]) is float for name in fields)
+
+    @pytest.mark.parametrize(
+        "field",
+        [
+            "spectrum_decades",
+            "mean_separation",
+            "component_scale",
+            "class_sparsity",
+            "noise_scale",
+            "offset_scale",
+            "scale_shift_min",
+            "scale_shift_max",
+        ],
+    )
+    def test_from_mapping_rejects_numeric_strings(self, field: str):
+        payload = TINY.to_config()
+        payload[field] = str(payload[field])
+
+        with pytest.raises(ValueError, match=field):
+            MicroStreamConfig.from_mapping(payload)
+
+    def test_constructor_rejects_arbitrary_float_protocol_objects(self):
+        class FloatLike:
+            def __float__(self) -> float:
+                return 0.2
+
+        with pytest.raises(ValueError, match="class_sparsity"):
+            tiny("input_permutation", class_sparsity=FloatLike())
+
     def test_from_mapping_rejects_missing_and_empty_keys(self):
         complete = TINY.to_config()
         missing = dict(complete)
