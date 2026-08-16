@@ -37,6 +37,7 @@ EXPERIENTIAL_MEMORY_POLICY_SCHEMA = "alberta.experiential-memory-policy.v1"
 _POLICY_TYPE = "ExperientialMemoryPolicy"
 _ACTION_SEMANTICS = "categorical-score-mass-not-action-identifiers"
 _SELECTION_SEMANTICS = "lowest-index-argmax-over-safe-positive-mass"
+_FLOAT32_MAX = 3.4028234663852886e38
 
 
 def _require_array(
@@ -240,17 +241,40 @@ class ExperientialMemoryPolicy:
         finite = jnp.all(jnp.isfinite(action_mass))
         nonnegative = jnp.all(action_mass >= 0.0)
         safe_finite_mass = jnp.where(jnp.isfinite(action_mass), action_mass, 0.0)
-        total_action_mass = jnp.sum(safe_finite_mass)
+        mass_scale = jnp.max(safe_finite_mass)
+        scale_mantissa, scale_exponent = jnp.frexp(mass_scale)
+        safe_mantissa = jnp.where(mass_scale > 0.0, scale_mantissa, 1.0)
+        scaled_mass = jnp.ldexp(safe_finite_mass, -scale_exponent) / safe_mantissa
+        scaled_total = jnp.sum(scaled_mass)
         action_mass_valid = (
             finite
             & nonnegative
-            & jnp.isfinite(total_action_mass)
-            & (total_action_mass > 0.0)
+            & jnp.isfinite(scaled_total)
+            & (scaled_total > 0.0)
         )
-        denominator = jnp.where(action_mass_valid, total_action_mass, 1.0)
+        safe_scaled_total = jnp.where(action_mass_valid, scaled_total, 1.0)
+        # Preserve the legacy direct sum bit-for-bit whenever it is already
+        # finite; only fall back to the scale-reconstructed total when the
+        # direct sum overflows. `jnp.minimum(..., _FLOAT32_MAX)` is a hard
+        # post-hoc clamp: `mass_scale * safe_scaled_total` may itself
+        # overflow to `inf` in float32 (e.g. exactly at the reported bug),
+        # but `minimum` against a finite bound is provably finite regardless
+        # of how the multiplication rounds, unlike reconstructing via
+        # division (`_FLOAT32_MAX / safe_scaled_total`) which can itself
+        # round upward and overflow back past `_FLOAT32_MAX` on
+        # multiplication.
+        direct_total = jnp.sum(safe_finite_mass)
+        saturated_total = jnp.minimum(
+            mass_scale * safe_scaled_total, _FLOAT32_MAX
+        )
+        total_action_mass = jnp.where(
+            action_mass_valid,
+            jnp.where(jnp.isfinite(direct_total), direct_total, saturated_total),
+            direct_total,
+        )
         normalized = jnp.where(
             action_mass_valid,
-            safe_finite_mass / denominator,
+            scaled_mass / safe_scaled_total,
             jnp.zeros_like(action_mass),
         )
         eligible = hard_safety_mask & (safe_finite_mass > 0.0)

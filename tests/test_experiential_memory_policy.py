@@ -241,6 +241,60 @@ def test_valid_retrieval_is_categorical_mass_with_separate_diagnostics() -> None
     _assert_trees_equal(state, before)
 
 
+def test_finite_action_mass_sum_cannot_overflow_into_false_abstention() -> None:
+    memory = ExperientialMemory(_memory_config())
+    policy = ExperientialMemoryPolicy(memory)
+    maximum = np.finfo(np.float32).max
+    state = _write(
+        memory,
+        memory.init(),
+        _entry(11, action_mass=(maximum, maximum, maximum)),
+    )
+
+    proposal = _propose(policy, state)
+
+    assert bool(proposal.retrieval.accepted)
+    assert bool(proposal.action_mass_valid)
+    assert bool(proposal.available)
+    assert int(proposal.action) == 0
+    assert float(proposal.total_action_mass) == maximum
+    np.testing.assert_allclose(
+        proposal.normalized_action_mass,
+        jnp.full((3,), 1.0 / 3.0, dtype=jnp.float32),
+        rtol=1e-6,
+    )
+
+
+def test_large_finite_action_mass_total_never_overflows_on_rounding() -> None:
+    """Regression for a reviewer-found rounding edge: reconstructing the
+    saturated total via `_FLOAT32_MAX / scaled_total * scaled_total` can
+    itself round upward past `_FLOAT32_MAX` on the multiply, so the fix must
+    be provably finite (a hard `jnp.minimum` clamp) rather than relying on
+    the division alone."""
+    memory = ExperientialMemory(_memory_config())
+    policy = ExperientialMemoryPolicy(memory)
+    rng = np.random.default_rng(1234)
+    float32_max = np.finfo(np.float32).max
+
+    for _ in range(200):
+        action_mass = tuple(
+            float(v)
+            for v in (rng.uniform(0.0, 1.0, size=3).astype(np.float32) * float32_max)
+        )
+        state = _write(
+            memory,
+            memory.init(),
+            _entry(11, action_mass=action_mass),
+        )
+        proposal = _propose(policy, state)
+
+        assert bool(jnp.isfinite(proposal.total_action_mass)), action_mass
+        with np.errstate(over="ignore"):
+            direct_sum = float(np.sum(np.asarray(action_mass, dtype=np.float32)))
+        if np.isfinite(direct_sum):
+            assert float(proposal.total_action_mass) == direct_sum, action_mass
+
+
 def test_hard_safety_mask_and_lowest_index_tie_break_are_exact() -> None:
     memory = ExperientialMemory(_memory_config())
     policy = ExperientialMemoryPolicy(memory)
@@ -330,7 +384,7 @@ def test_memory_version_staleness_uncertainty_and_safety_gates_are_inherited(
 
 @pytest.mark.parametrize(
     "action_mass",
-    [(-1.0, 2.0, 1.0), (0.0, 0.0, 0.0), (3.0e38, 3.0e38, 3.0e38)],
+    [(-1.0, 2.0, 1.0), (0.0, 0.0, 0.0)],
 )
 def test_invalid_or_zero_retrieved_action_mass_fails_closed(
     action_mass: tuple[float, float, float],
