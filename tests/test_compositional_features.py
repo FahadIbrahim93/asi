@@ -4,6 +4,7 @@ import chex
 import jax.numpy as jnp
 import jax.random as jr
 import numpy as np
+import pytest
 
 from alberta_framework.core.compositional_features import (
     CANDIDATE_SELECTOR_HEDGE,
@@ -148,9 +149,7 @@ class TestCompositionalFeatureLearner:
         observation = jnp.array([2.0, 2.0, 2.0], dtype=jnp.float32)
         active_values = learner.constructed_features(state, observation)
 
-        candidate_values = learner._candidate_features(
-            state, active_values, observation
-        )
+        candidate_values = learner._candidate_features(state, active_values, observation)
 
         np.testing.assert_allclose(np.asarray(active_values[3]), 4.0)
         np.testing.assert_allclose(np.asarray(candidate_values), [8.0])
@@ -429,9 +428,7 @@ class TestCompositionalFeatureLearner:
             )
             state = learner.update(state, observation, target).state
 
-        assert float(state.candidate_utilities[1]) > float(
-            state.candidate_utilities[0]
-        )
+        assert float(state.candidate_utilities[1]) > float(state.candidate_utilities[0])
         assert float(state.candidate_utilities[0]) > 0.0
 
     def test_slow_retention_blocks_fast_only_deletion(self) -> None:
@@ -532,9 +529,7 @@ class TestCompositionalFeatureLearner:
             ops=jnp.array([OP_RAW, OP_RAW, OP_TANH], dtype=jnp.int32),
             parent_a=jnp.array([0, 1, 0], dtype=jnp.int32),
             parent_b=jnp.array([-1, -1, 1], dtype=jnp.int32),
-            theta=jnp.array(
-                [[0.0, 0.0], [0.0, 0.0], [1.0, -1.0]], dtype=jnp.float32
-            ),
+            theta=jnp.array([[0.0, 0.0], [0.0, 0.0], [1.0, -1.0]], dtype=jnp.float32),
             depth=jnp.array([0, 0, 1], dtype=jnp.int32),
             utilities=jnp.array([0.0, 0.0, 0.0], dtype=jnp.float32),
             candidate_ops=jnp.array([OP_PRODUCT], dtype=jnp.int32),
@@ -594,9 +589,8 @@ class TestCompositionalFeatureLearner:
         assert int(second.state.candidate_depth[0]) == 2
         assert int(second.state.candidate_parent_a[0]) == 3
         assert float(second.state.candidate_utilities[0]) > 0.0
-        assert (
-            float(second.state.candidate_utilities[0])
-            > float(first.state.candidate_utilities[0])
+        assert float(second.state.candidate_utilities[0]) > float(
+            first.state.candidate_utilities[0]
         )
 
     def test_config_roundtrip_keeps_future_utility_mix(self) -> None:
@@ -769,16 +763,10 @@ class TestCompositionalFeatureLearner:
 
         assert int(result.replaced_slot) == -1
         assert int(result.promoted_candidate) == -1
-        np.testing.assert_array_equal(
-            np.asarray(result.state.parent_a), np.asarray(parent_a)
-        )
-        np.testing.assert_array_equal(
-            np.asarray(result.state.parent_b), np.asarray(parent_b)
-        )
+        np.testing.assert_array_equal(np.asarray(result.state.parent_a), np.asarray(parent_a))
+        np.testing.assert_array_equal(np.asarray(result.state.parent_b), np.asarray(parent_b))
         np.testing.assert_array_equal(np.asarray(result.state.ops), np.asarray(ops))
-        np.testing.assert_allclose(
-            np.asarray(result.state.theta[4]), np.asarray(theta[4])
-        )
+        np.testing.assert_allclose(np.asarray(result.state.theta[4]), np.asarray(theta[4]))
         _assert_valid_active_dag(result.state, feature_dim, learner.max_depth)
 
     def test_candidate_promotion_uses_compatible_later_slot(self) -> None:
@@ -797,9 +785,7 @@ class TestCompositionalFeatureLearner:
         feature_dim = 3
         state = learner.init(feature_dim=feature_dim, key=jr.key(18))
         state = state.replace(  # type: ignore[attr-defined]
-            ops=state.ops.at[3].set(OP_PRODUCT).at[4].set(OP_PRODUCT).at[5].set(
-                OP_PRODUCT
-            ),
+            ops=state.ops.at[3].set(OP_PRODUCT).at[4].set(OP_PRODUCT).at[5].set(OP_PRODUCT),
             parent_a=state.parent_a.at[3].set(0).at[4].set(3).at[5].set(0),
             parent_b=state.parent_b.at[3].set(1).at[4].set(2).at[5].set(2),
             depth=state.depth.at[3].set(1).at[4].set(2).at[5].set(1),
@@ -1081,9 +1067,8 @@ class TestCompositionalFeatureLearner:
             jnp.array([0.0], dtype=jnp.float32),
         )
 
-        assert (
-            float(aggressive_result.state.replacement_accumulator)
-            > float(conservative_result.state.replacement_accumulator)
+        assert float(aggressive_result.state.replacement_accumulator) > float(
+            conservative_result.state.replacement_accumulator
         )
 
     def test_recursive_product_generation_initializes_depth2_candidates(self) -> None:
@@ -1097,18 +1082,12 @@ class TestCompositionalFeatureLearner:
         )
         state = learner.init(feature_dim=4, key=jr.key(16))
 
-        np.testing.assert_array_equal(
-            np.asarray(state.ops[4:]), np.full(6, OP_PRODUCT)
-        )
+        np.testing.assert_array_equal(np.asarray(state.ops[4:]), np.full(6, OP_PRODUCT))
         np.testing.assert_array_equal(np.asarray(state.depth[4:]), np.ones(6))
-        np.testing.assert_array_equal(
-            np.asarray(state.candidate_ops), np.full(4, OP_PRODUCT)
-        )
+        np.testing.assert_array_equal(np.asarray(state.candidate_ops), np.full(4, OP_PRODUCT))
         assert (np.asarray(state.candidate_parent_a) >= 4).all()
         assert (np.asarray(state.candidate_parent_b) < 4).all()
-        np.testing.assert_array_equal(
-            np.asarray(state.candidate_depth), np.full(4, 2)
-        )
+        np.testing.assert_array_equal(np.asarray(state.candidate_depth), np.full(4, 2))
 
     def test_robust_recursive_generation_uses_recursive_scaffold_priors(self) -> None:
         """The single-mechanism path starts with reusable recursive candidates."""
@@ -1124,12 +1103,8 @@ class TestCompositionalFeatureLearner:
         )
         state = learner.init(feature_dim=4, key=jr.key(17))
 
-        np.testing.assert_array_equal(
-            np.asarray(state.ops[4:]), np.full(6, OP_PRODUCT)
-        )
-        np.testing.assert_array_equal(
-            np.asarray(state.candidate_ops), np.full(4, OP_PRODUCT)
-        )
+        np.testing.assert_array_equal(np.asarray(state.ops[4:]), np.full(6, OP_PRODUCT))
+        np.testing.assert_array_equal(np.asarray(state.candidate_ops), np.full(4, OP_PRODUCT))
         assert (np.asarray(state.candidate_parent_a) >= 4).all()
         assert (np.asarray(state.candidate_parent_b) < 4).all()
         assert learner.to_config()["parent_novelty_weight"] == 0.1
@@ -1148,12 +1123,8 @@ class TestCompositionalFeatureLearner:
         )
         state = learner.init(feature_dim=3, key=jr.key(20))
 
-        np.testing.assert_array_equal(
-            np.asarray(state.ops[3:9]), np.full(6, OP_PRODUCT)
-        )
-        np.testing.assert_array_equal(
-            np.asarray(state.ops[9:12]), np.full(3, OP_TANH)
-        )
+        np.testing.assert_array_equal(np.asarray(state.ops[3:9]), np.full(6, OP_PRODUCT))
+        np.testing.assert_array_equal(np.asarray(state.ops[9:12]), np.full(3, OP_TANH))
         np.testing.assert_allclose(
             np.asarray(state.theta[9:12]),
             np.asarray([[1.0, -1.0], [-1.0, 1.0], [1.0, 1.0]], dtype=np.float32),
@@ -1311,9 +1282,7 @@ class TestCompositionalFeatureLearner:
         num_steps = 600
         feature_dim = 3
         observations = rng.standard_normal((num_steps, feature_dim)).astype(np.float32)
-        target_signal = (
-            observations[:, 0] * observations[:, 1] * observations[:, 2]
-        )
+        target_signal = observations[:, 0] * observations[:, 1] * observations[:, 2]
         noise = 0.05 * rng.standard_normal(num_steps).astype(np.float32)
         targets = (target_signal + noise)[:, None]
 
@@ -1422,9 +1391,7 @@ class TestCompositionalFeatureLearner:
 
         # The first feature_dim entries of `features` should equal the
         # observation because slots [0, feature_dim) are raw passthroughs.
-        np.testing.assert_allclose(
-            np.asarray(features[:3]), np.asarray(observation)
-        )
+        np.testing.assert_allclose(np.asarray(features[:3]), np.asarray(observation))
 
     def test_scan_loop_runs(self) -> None:
         learner = CompositionalFeatureLearner(
@@ -1439,9 +1406,7 @@ class TestCompositionalFeatureLearner:
         observations = jnp.asarray(
             np.random.RandomState(0).standard_normal((50, 3)).astype(np.float32)
         )
-        targets = jnp.asarray(
-            np.random.RandomState(1).standard_normal((50, 2)).astype(np.float32)
-        )
+        targets = jnp.asarray(np.random.RandomState(1).standard_normal((50, 2)).astype(np.float32))
         result = run_compositional_arrays(learner, state, observations, targets)
 
         chex.assert_shape(result.metrics, (50, 7))
@@ -1459,9 +1424,7 @@ class TestImprintConsolidation:
         candidate_value = jnp.array(0.5, dtype=jnp.float32)
         active_count = jnp.array(1.0, dtype=jnp.float32)
 
-        weights = _imprint_candidate_output_weights(
-            errors, candidate_value, active_count, 0.3
-        )
+        weights = _imprint_candidate_output_weights(errors, candidate_value, active_count, 0.3)
 
         np.testing.assert_allclose(
             np.asarray(weights),
@@ -1502,6 +1465,40 @@ class TestImprintConsolidation:
             jnp.asarray(0.3, dtype=jnp.float32),
         )
 
-        np.testing.assert_allclose(
-            np.asarray(learner_weights), np.asarray(expected), rtol=1e-6
-        )
+        np.testing.assert_allclose(np.asarray(learner_weights), np.asarray(expected), rtol=1e-6)
+
+
+def test_finite_candidate_selector_integer_validation() -> None:
+    with pytest.raises(ValueError, match="n_candidates"):
+        FiniteCandidateSelector(n_candidates=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="n_candidates"):
+        FiniteCandidateSelector(n_candidates=3.5)  # type: ignore[arg-type]
+
+    sel = FiniteCandidateSelector(n_candidates=np.int32(4))
+    assert sel._n_candidates == 4
+    assert type(sel._n_candidates) is int
+
+
+def test_compositional_feature_learner_integer_validation() -> None:
+    with pytest.raises(ValueError, match="n_features"):
+        CompositionalFeatureLearner(n_features=True, n_tasks=1)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="n_features"):
+        CompositionalFeatureLearner(n_features=5.5, n_tasks=1)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="n_tasks"):
+        CompositionalFeatureLearner(n_features=5, n_tasks=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="candidate_count"):
+        CompositionalFeatureLearner(n_features=5, n_tasks=1, candidate_count=True)  # type: ignore[arg-type]
+
+    learner = CompositionalFeatureLearner(
+        n_features=np.int32(6),
+        n_tasks=np.int64(2),
+        candidate_count=np.int32(2),
+        replacement_interval=np.int32(100),
+        min_feature_age=np.int64(50),
+        candidate_min_age=np.int32(25),
+        max_depth=np.int32(3),
+    )
+    assert learner._n_features == 6
+    assert learner._n_tasks == 2
+    assert learner._candidate_count == 2
+    assert learner._max_depth == 3
