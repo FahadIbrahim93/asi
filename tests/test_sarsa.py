@@ -57,7 +57,7 @@ class TestSARSAConfigValidation:
         [
             {"n_actions": 0},
             {"n_actions": -2},
-            {"gamma": 1.0},
+            {"gamma": 1.1},
             {"gamma": -0.1},
             {"gamma": float("nan")},
             {"gamma": float("inf")},
@@ -77,6 +77,11 @@ class TestSARSAConfigValidation:
     def test_accepts_valid_config(self):
         config = SARSAConfig(n_actions=2, gamma=0.99, epsilon_start=0.1, epsilon_end=0.01)
         assert config.n_actions == 2
+
+    def test_accepts_undiscounted_gamma(self):
+        # Step4's facade accepts gamma in [0, 1] inclusive; gamma=1.0 is the
+        # standard undiscounted episodic setting and must stay constructible.
+        assert SARSAConfig(n_actions=2, gamma=1.0).gamma == 1.0
 
 
 class TestSARSAInit:

@@ -81,8 +81,8 @@ class SARSAConfig:
             raise ValueError("n_actions must be at least 1")
         if not isinstance(self.gamma, Real) or isinstance(self.gamma, bool):
             raise ValueError("gamma must be a real number")
-        if not math.isfinite(self.gamma) or not 0.0 <= self.gamma < 1.0:
-            raise ValueError("gamma must be a finite value in [0, 1)")
+        if not math.isfinite(self.gamma) or not 0.0 <= self.gamma <= 1.0:
+            raise ValueError("gamma must be a finite value in [0, 1]")
         for name, value in (
             ("epsilon_start", self.epsilon_start),
             ("epsilon_end", self.epsilon_end),
