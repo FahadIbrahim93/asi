@@ -290,7 +290,6 @@ _INVALID_UPGD_MEMORY_CONFIGS: tuple[dict[str, object], ...] = (
     {"feature_dim": 2, "n_heads": -1},
     {"feature_dim": 2, "n_heads": 2**31},
     {"feature_dim": 2, "n_heads": True},
-    {"feature_dim": 2, "n_heads": 2, "hidden_sizes": ()},
     {"feature_dim": 2, "n_heads": 2, "hidden_sizes": (0,)},
     {"feature_dim": 2, "n_heads": 2, "hidden_sizes": (2**31,)},
     {"feature_dim": 2, "n_heads": 2, "hidden_sizes": (True,)},
@@ -401,6 +400,22 @@ def test_upgd_memory_config_rejects_invalid_inputs(kwargs: dict[str, object]) ->
 
 
 @pytest.mark.parametrize(
+    "overrides",
+    [
+        {"hidden_sizes": ()},
+        {"target_allocation_rate": 1.0},
+        {"min_novelty_threshold": 0.25, "max_novelty_threshold": 0.25},
+    ],
+)
+def test_upgd_memory_preserves_legal_boundary_configs(
+    overrides: dict[str, object],
+) -> None:
+    config = UPGDMemoryConfig(feature_dim=2, n_heads=2, **overrides)
+    assert config.target_allocation_rate <= 1.0
+    assert config.min_novelty_threshold <= config.max_novelty_threshold
+
+
+@pytest.mark.parametrize(
     "ratio",
     [
         pytest.param((-1, 1), id="negative-ratio"),
@@ -416,7 +431,7 @@ def test_upgd_memory_rejects_adversarial_ratio_floats(
         def as_integer_ratio(self) -> tuple[int, int]:
             return ratio
 
-    with pytest.raises(ValueError, match=r"memory_update_rate must be in \(0, 1\]"):
+    with pytest.raises(ValueError, match="memory_update_rate"):
         UPGDMemoryConfig(
             feature_dim=2,
             n_heads=2,
@@ -434,7 +449,7 @@ def test_upgd_memory_rejects_class_property_spoofing_float() -> None:
             return (1, 2)
 
     value = ClassSpoof()
-    with pytest.raises(ValueError, match="must be a real number"):
+    with pytest.raises(ValueError, match="finite real"):
         UPGDMemoryConfig(
             feature_dim=2,
             n_heads=2,
@@ -514,3 +529,38 @@ def test_upgd_memory_json_roundtrip() -> None:
     assert restored == config
     assert restored.hidden_sizes == (16, 8)
     assert restored.readout_mode == "softmax_ce"
+
+
+def test_upgd_memory_rejects_hostile_integral_subclasses() -> None:
+    class LieInt(int):
+        def __int__(self) -> int:
+            return 4
+
+    defaults: dict[str, object] = {"feature_dim": 2, "n_heads": 2}
+    for field in (
+        "feature_dim",
+        "n_heads",
+        "upgd_head_loss_pressure_warmup_steps",
+        "upgd_head_repetition_warmup_steps",
+        "slots_per_class",
+    ):
+        with pytest.raises(ValueError, match=field):
+            UPGDMemoryConfig(**{**defaults, field: LieInt(-1)})  # type: ignore[arg-type]
+
+
+def test_upgd_memory_preserves_legal_closed_endpoints() -> None:
+    allocation_endpoint = UPGDMemoryConfig(
+        feature_dim=2,
+        n_heads=2,
+        target_allocation_rate=1.0,
+    )
+    fixed_threshold = UPGDMemoryConfig(
+        feature_dim=2,
+        n_heads=2,
+        min_novelty_threshold=0.5,
+        max_novelty_threshold=0.5,
+    )
+
+    assert allocation_endpoint.target_allocation_rate == 1.0
+    assert fixed_threshold.min_novelty_threshold == 0.5
+    assert fixed_threshold.max_novelty_threshold == 0.5
