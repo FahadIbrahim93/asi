@@ -1,8 +1,12 @@
 """Tests for STOMP checkpoint payloads and state migration (core/options.py)."""
 
+import dataclasses
+
 import chex
+import jax
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 import pytest
 
 from alberta_framework.core.options import (
@@ -17,6 +21,7 @@ from alberta_framework.core.options import (
     SubtaskSpec,
     _differential_q_update,
     _differential_semidp_q_update,
+    _stomp_direct_array_scalars,
     load_stomp_state_with_migration,
     replace_dispatched_primitive_action,
     stomp_state_to_checkpoint_payload,
@@ -41,9 +46,7 @@ class TestSubtaskSpecValidation:
         with pytest.raises(ValueError, match="threshold"):
             SubtaskSpec(feature_index=0, threshold=threshold)
 
-    @pytest.mark.parametrize(
-        "scale", [float("nan"), float("inf"), float("-inf"), 0.0, -1.0]
-    )
+    @pytest.mark.parametrize("scale", [float("nan"), float("inf"), float("-inf"), 0.0, -1.0])
     def test_rejects_bad_pseudo_reward_scale(self, scale: float) -> None:
         with pytest.raises(ValueError, match="pseudo_reward_scale"):
             SubtaskSpec(feature_index=0, pseudo_reward_scale=scale)
@@ -86,9 +89,7 @@ class TestStompCheckpointRoundTrip:
     def test_new_format_round_trips(self) -> None:
         state = _state()
 
-        restored = load_stomp_state_with_migration(
-            stomp_state_to_checkpoint_payload(state)
-        )
+        restored = load_stomp_state_with_migration(stomp_state_to_checkpoint_payload(state))
 
         chex.assert_trees_all_equal(restored, state)
 
@@ -96,9 +97,7 @@ class TestStompCheckpointRoundTrip:
         state = _state()
         migrated = load_stomp_state_with_migration(_old_format_payload(state))
 
-        restored = load_stomp_state_with_migration(
-            stomp_state_to_checkpoint_payload(migrated)
-        )
+        restored = load_stomp_state_with_migration(stomp_state_to_checkpoint_payload(migrated))
 
         chex.assert_trees_all_equal(restored, migrated)
 
@@ -133,9 +132,7 @@ class TestStompStateMigration:
 
         migrated = load_stomp_state_with_migration(_old_format_payload(state))
 
-        chex.assert_trees_all_equal(
-            migrated.base_learner_state, state.base_learner_state
-        )
+        chex.assert_trees_all_equal(migrated.base_learner_state, state.base_learner_state)
         chex.assert_trees_all_equal(migrated.option_policies, state.option_policies)
         chex.assert_trees_all_equal(
             migrated.option_models.cumreward_ema, state.option_models.cumreward_ema
@@ -185,9 +182,7 @@ class TestStompMigrationFailsClosed:
 
     def test_unknown_option_model_field_raises(self) -> None:
         payload = stomp_state_to_checkpoint_payload(_state())
-        payload["option_models"]["not_a_field"] = jnp.zeros(
-            N_OPTIONS, dtype=jnp.float32
-        )
+        payload["option_models"]["not_a_field"] = jnp.zeros(N_OPTIONS, dtype=jnp.float32)
 
         with pytest.raises(ValueError, match="not_a_field"):
             load_stomp_state_with_migration(payload)
@@ -246,9 +241,7 @@ def test_primitive_only_stomp_has_typed_empty_option_state_and_base_only_updates
     chex.assert_trees_all_equal(masked_start.state, started)
     chex.assert_trees_all_equal(masked_start.primitive_action, started.last_primitive_action)
 
-    restored = load_stomp_state_with_migration(
-        stomp_state_to_checkpoint_payload(started)
-    )
+    restored = load_stomp_state_with_migration(stomp_state_to_checkpoint_payload(started))
     chex.assert_trees_all_equal(restored, started)
 
     result = agent.update(
@@ -330,10 +323,8 @@ def test_semidp_q_infinite_reward_does_not_poison_weights() -> None:
         discount=jnp.array(1.0, dtype=jnp.float32),
     )
 
-    new_q, new_z, new_rbar, td_error, update_applied = (
-        _differential_semidp_q_update(
+    new_q, new_z, new_rbar, td_error, update_applied = _differential_semidp_q_update(
         q, z, rbar, obs, action, jnp.array(jnp.inf, dtype=jnp.float32), nxt, **kw
-        )
     )
     chex.assert_trees_all_close(new_q, q)
     chex.assert_trees_all_close(new_z, z)
@@ -371,19 +362,15 @@ class TestStompConfigScalarValidation:
         )
 
     @pytest.mark.parametrize("name", _STEP_SIZE_FIELDS)
-    @pytest.mark.parametrize(
-        "value", [float("nan"), float("inf"), float("-inf"), -0.05]
-    )
+    @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf"), -0.05])
     def test_rejects_invalid_step_sizes(self, name: str, value: float) -> None:
-        with pytest.raises(ValueError, match=f"{name} must be finite and non-negative"):
+        with pytest.raises(ValueError, match=name):
             self._build(**{name: value})
 
     @pytest.mark.parametrize("name", _UNIT_INTERVAL_FIELDS)
-    @pytest.mark.parametrize(
-        "value", [float("nan"), float("inf"), float("-inf"), -0.1, 1.5, 2.0]
-    )
+    @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf"), -0.1, 1.5, 2.0])
     def test_rejects_invalid_unit_interval_scalars(self, name: str, value: float) -> None:
-        with pytest.raises(ValueError, match=rf"{name} must be finite and in \[0, 1\]"):
+        with pytest.raises(ValueError, match=name):
             self._build(**{name: value})
 
     @pytest.mark.parametrize("name", _STEP_SIZE_FIELDS)
@@ -402,5 +389,101 @@ class TestStompConfigScalarValidation:
     def test_from_config_enforces_scalar_validation(self) -> None:
         payload = self._build().to_config()
         payload["base_step_size"] = float("nan")
-        with pytest.raises(ValueError, match="base_step_size must be finite and non-negative"):
+        with pytest.raises(ValueError, match="base_step_size"):
             STOMPConfig.from_config(payload)
+
+
+def test_subtask_spec_scalar_validation() -> None:
+    with pytest.raises(ValueError, match="feature_index"):
+        SubtaskSpec(feature_index=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="feature_index"):
+        SubtaskSpec(feature_index=2.5)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="max_option_steps"):
+        SubtaskSpec(feature_index=0, max_option_steps=True)  # type: ignore[arg-type]
+
+    spec = SubtaskSpec(
+        feature_index=np.int32(1),
+        max_option_steps=np.int64(10),
+    )
+    assert type(spec.feature_index) is int
+    assert type(spec.max_option_steps) is int
+    assert spec.feature_index == 1
+    assert spec.max_option_steps == 10
+
+
+def test_stomp_config_integer_validation() -> None:
+    with pytest.raises(ValueError, match="observation_dim"):
+        STOMPConfig(observation_dim=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="n_primitive_actions"):
+        STOMPConfig(n_primitive_actions=2.5)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="base_hidden_sizes"):
+        STOMPConfig(base_hidden_sizes=(True,))  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="option_planning_backups_per_step"):
+        STOMPConfig(option_planning_backups_per_step=True)  # type: ignore[arg-type]
+
+    cfg = STOMPConfig(
+        subtask_specs=(SubtaskSpec(feature_index=0),),
+        observation_dim=np.int32(4),
+        n_primitive_actions=np.int64(2),
+        base_hidden_sizes=(np.int32(16), np.int64(8)),
+        option_planning_backups_per_step=np.uint16(2),
+    )
+    assert type(cfg.observation_dim) is int
+    assert type(cfg.n_primitive_actions) is int
+    assert type(cfg.base_hidden_sizes[0]) is int
+    assert type(cfg.base_hidden_sizes[1]) is int
+    assert type(cfg.option_planning_backups_per_step) is int
+    assert cfg.observation_dim == 4
+    assert cfg.n_primitive_actions == 2
+    assert cfg.base_hidden_sizes == (16, 8)
+    assert cfg.option_planning_backups_per_step == 2
+
+
+def test_stomp_closes_float32_schema_and_direct_resource_boundaries() -> None:
+    class DictSubclass(dict[str, object]):
+        pass
+
+    spec = SubtaskSpec(
+        feature_index=0,
+        threshold=np.float64(0.5),
+        pseudo_reward_scale=np.float32(1.0),
+    )
+    assert type(spec.threshold) is float
+    assert type(spec.pseudo_reward_scale) is float
+    with pytest.raises(ValueError, match="threshold"):
+        SubtaskSpec(feature_index=0, threshold=1.0e100)
+
+    payload = STOMPConfig().to_config()
+    with pytest.raises(ValueError, match="actual dict"):
+        STOMPConfig.from_config(DictSubclass(payload))  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="fields"):
+        STOMPConfig.from_config({**payload, "extra": 1})
+    with pytest.raises(ValueError, match="base_hidden_sizes"):
+        STOMPConfig.from_config({**payload, "base_hidden_sizes": ()})
+    with pytest.raises(ValueError, match="observation_dim"):
+        STOMPConfig.from_config({**payload, "observation_dim": np.int32(4)})
+
+    last_legal_observation_dim = (2**29 - 1 - 22) // 4
+    STOMPConfig(observation_dim=last_legal_observation_dim, n_primitive_actions=1)
+    with pytest.raises(ValueError, match="direct array bytes"):
+        STOMPConfig(observation_dim=last_legal_observation_dim + 1, n_primitive_actions=1)
+
+    measured_config = STOMPConfig(
+        subtask_specs=(SubtaskSpec(feature_index=0), SubtaskSpec(feature_index=1)),
+        observation_dim=3,
+        n_primitive_actions=2,
+        base_hidden_sizes=(4,),
+    )
+    measured_agent = STOMPAgent(measured_config)
+    array_bytes = sum(
+        int(leaf.nbytes)
+        for leaf in jax.tree_util.tree_leaves(
+            (measured_agent.init(jr.key(0)), measured_agent.spec_arrays)
+        )
+        if hasattr(leaf, "nbytes")
+    )
+    array_bytes += sum(
+        int(getattr(measured_agent.spec_arrays, field.name).nbytes)
+        for field in dataclasses.fields(STOMPSpecArrays)
+    )
+    assert 4 * _stomp_direct_array_scalars(measured_config) == array_bytes

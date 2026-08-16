@@ -18,9 +18,10 @@ from __future__ import annotations
 import chex
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 import pytest
 
-from alberta_framework.core.oak import OaKAgent, OaKConfig
+from alberta_framework.core.oak import KeyboardChordLearnerConfig, OaKAgent, OaKConfig
 from alberta_framework.core.options import STOMPConfig, SubtaskSpec
 from alberta_framework.core.prototype_agent import (
     GRUPerceptionConfig,
@@ -174,9 +175,7 @@ def test_useless_option_evicted_after_guard_and_reward_preserved() -> None:
     # targets feature 1 (always 0.0 → pseudo-reward 0.0, deliberately useless).
     cfg = _oak_cfg(min_steps_before_curation=100)
     agent, state = _primed(cfg)
-    obs = jnp.tile(
-        jnp.array([1.0, 0.0, 0.5, -0.5], dtype=jnp.float32), (300, 1)
-    )
+    obs = jnp.tile(jnp.array([1.0, 0.0, 0.5, -0.5], dtype=jnp.float32), (300, 1))
     result = agent.scan(state, jnp.ones(300), obs)
     state = result.state
     assert float(state.utility_ema[0]) > float(state.utility_ema[1])
@@ -274,14 +273,10 @@ GRU_AUG_DIM = GRU_OBS_DIM + GRU_HIDDEN
 
 
 def _gru_proto_cfg() -> PrototypeAgentConfig:
-    stomp = STOMPConfig(
-        subtask_specs=(_SPEC0, _SPEC1), observation_dim=GRU_AUG_DIM
-    )
+    stomp = STOMPConfig(subtask_specs=(_SPEC0, _SPEC1), observation_dim=GRU_AUG_DIM)
     return PrototypeAgentConfig(
         oak=OaKConfig(stomp=stomp),
-        gru_perception=GRUPerceptionConfig(
-            observation_dim=GRU_OBS_DIM, hidden_dim=GRU_HIDDEN
-        ),
+        gru_perception=GRUPerceptionConfig(observation_dim=GRU_OBS_DIM, hidden_dim=GRU_HIDDEN),
     )
 
 
@@ -309,9 +304,7 @@ def test_greedy_action_with_gru_is_pure_and_act_returns_cached_dispatch() -> Non
     n_prim = agent.config.oak.n_primitive_actions
     expected = int(jnp.argmax(q[:n_prim]))
     assert int(agent.greedy_action(state, query)) == expected
-    assert int(agent.act(state, state.current_raw_observation)) == int(
-        state.current_action
-    )
+    assert int(agent.act(state, state.current_raw_observation)) == int(state.current_action)
 
 
 def test_act_without_gru_unchanged() -> None:
@@ -320,3 +313,72 @@ def test_act_without_gru_unchanged() -> None:
     action = agent.act(state, state.current_raw_observation)
     assert action.shape == ()
     assert 0 <= int(action) < agent.config.oak.n_primitive_actions
+
+
+def test_oak_config_integer_and_scalar_validation() -> None:
+    with pytest.raises(ValueError, match="min_steps_before_curation"):
+        OaKConfig(min_steps_before_curation=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="min_steps_before_curation"):
+        OaKConfig(min_steps_before_curation=10.5)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="utility_ema_decay"):
+        OaKConfig(utility_ema_decay=float("nan"))
+    with pytest.raises(ValueError, match="curation_threshold"):
+        OaKConfig(curation_threshold=float("inf"))
+
+    cfg = OaKConfig(min_steps_before_curation=np.int64(100))
+    assert type(cfg.min_steps_before_curation) is int
+    assert cfg.min_steps_before_curation == 100
+
+
+def test_keyboard_chord_learner_config_integer_and_scalar_validation() -> None:
+    with pytest.raises(ValueError, match="n_options"):
+        KeyboardChordLearnerConfig(n_options=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="n_options"):
+        KeyboardChordLearnerConfig(n_options=2.5)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="step_size"):
+        KeyboardChordLearnerConfig(n_options=2, step_size=float("nan"))
+    with pytest.raises(ValueError, match="baseline_decay"):
+        KeyboardChordLearnerConfig(n_options=2, baseline_decay=float("inf"))
+
+    cfg = KeyboardChordLearnerConfig(n_options=np.int32(4))
+    assert type(cfg.n_options) is int
+    assert cfg.n_options == 4
+
+
+def test_oak_and_keyboard_close_schema_float32_and_resource_boundaries() -> None:
+    class DictSubclass(dict[str, object]):
+        pass
+
+    oak = OaKConfig(
+        utility_ema_decay=np.float64(0.5),
+        curation_threshold=np.float32(0.25),
+    )
+    assert type(oak.utility_ema_decay) is float
+    assert type(oak.curation_threshold) is float
+    payload = oak.to_config()
+    with pytest.raises(ValueError, match="actual dict"):
+        OaKConfig.from_config(DictSubclass(payload))  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="fields"):
+        OaKConfig.from_config({**payload, "extra": 1})
+    with pytest.raises(ValueError, match="stomp config"):
+        OaKConfig.from_config(
+            {**payload, "stomp": DictSubclass(payload["stomp"])}  # type: ignore[arg-type]
+        )
+
+    keyboard_payload = KeyboardChordLearnerConfig(n_options=2).to_config()
+    with pytest.raises(ValueError, match="actual dict"):
+        KeyboardChordLearnerConfig.from_config(DictSubclass(keyboard_payload))  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="n_options"):
+        KeyboardChordLearnerConfig.from_config(
+            {**keyboard_payload, "n_options": np.int32(2)}
+        )
+
+    stomp_only_limit = (2**29 - 1 - 22) // 4
+    stomp = STOMPConfig(observation_dim=stomp_only_limit, n_primitive_actions=1)
+    with pytest.raises(ValueError, match="OaK direct array bytes"):
+        OaKConfig(stomp=stomp)
+
+    last_legal_keyboard_options = (2**31 - 1) // 4 - 2
+    KeyboardChordLearnerConfig(n_options=last_legal_keyboard_options)
+    with pytest.raises(ValueError, match="keyboard state bytes"):
+        KeyboardChordLearnerConfig(n_options=last_legal_keyboard_options + 1)

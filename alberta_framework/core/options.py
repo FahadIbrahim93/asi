@@ -24,16 +24,18 @@ from __future__ import annotations
 
 import dataclasses
 import functools
-import math
-from typing import Any, cast
+import operator
+from typing import Any, SupportsIndex, cast
 
 import chex
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 from jax import Array
 from jaxtyping import Bool, Float, Int, UInt
 
+from alberta_framework.core._float32_scalars import validated_float32_scalar
 from alberta_framework.core.multi_head_learner import (
     MultiHeadMLPLearner,
     MultiHeadMLPState,
@@ -52,6 +54,68 @@ STOMP_LIFETIME_COUNTER_DELTA_NBYTES = 8
 
 _INT32_MAX = 2**31 - 1
 _UINT32_MAX = 2**32 - 1
+_ACTUAL_INT_TYPES = frozenset(
+    {
+        int,
+        np.int8,
+        np.int16,
+        np.int32,
+        np.int64,
+        np.uint8,
+        np.uint16,
+        np.uint32,
+        np.uint64,
+        np.longlong,
+        np.ulonglong,
+    }
+)
+
+
+def _require_int32(name: str, value: object, *, minimum: int, maximum: int = _INT32_MAX) -> int:
+    if type(value) not in _ACTUAL_INT_TYPES:
+        raise ValueError(f"{name} must be an integer in [{minimum}, {maximum}]")
+    canonical = operator.index(cast(SupportsIndex, value))
+    if not minimum <= canonical <= maximum:
+        raise ValueError(f"{name} must be an integer in [{minimum}, {maximum}]")
+    return canonical
+
+
+def _validate_hidden_sizes(sizes: object) -> tuple[int, ...]:
+    if type(sizes) is not tuple:
+        raise ValueError("base_hidden_sizes must be an actual tuple")
+    return tuple(_require_int32("base_hidden_sizes element", s, minimum=1) for s in sizes)
+
+
+def _stomp_direct_array_scalars(config: STOMPConfig) -> int:
+    """Return exact directly allocated agent/config and state array scalars."""
+
+    n_options = config.n_options
+    n_actions = config.n_primitive_actions
+    observation_dim = config.observation_dim
+    n_heads = config.n_total_actions
+    layer_sizes = (observation_dim, *config.base_hidden_sizes)
+    trunk_parameters = sum(
+        fan_out * (fan_in + 1)
+        for fan_in, fan_out in zip(layer_sizes, layer_sizes[1:], strict=False)
+    )
+    final_width = config.base_hidden_sizes[-1] if config.base_hidden_sizes else observation_dim
+    head_parameters = n_heads * (final_width + 1)
+    base_learner_scalars = (
+        2 * (trunk_parameters + head_parameters)
+        + sum(config.base_hidden_sizes)
+        + 2 * len(config.base_hidden_sizes)
+        + 2 * n_heads
+        + 3
+    )
+    return (
+        base_learner_scalars
+        + 2 * n_options * n_actions * observation_dim
+        + n_options * observation_dim * observation_dim
+        + 11 * n_options
+        + 2 * observation_dim
+        + 15
+    )
+
 
 # ---------------------------------------------------------------------------
 # Subtask specification (Python-level; JAX arrays extracted for scan use)
@@ -83,14 +147,28 @@ class SubtaskSpec:
 
     def __post_init__(self) -> None:
         """Validate subtask specification."""
-        if self.feature_index < 0:
-            raise ValueError("feature_index must be non-negative")
-        if not math.isfinite(self.threshold) or self.threshold <= 0.0:
-            raise ValueError("threshold must be finite and positive")
-        if not math.isfinite(self.pseudo_reward_scale) or self.pseudo_reward_scale <= 0.0:
-            raise ValueError("pseudo_reward_scale must be finite and positive")
-        if self.max_option_steps < 1:
-            raise ValueError("max_option_steps must be at least 1")
+        object.__setattr__(
+            self,
+            "feature_index",
+            _require_int32("feature_index", self.feature_index, minimum=0),
+        )
+        object.__setattr__(
+            self,
+            "max_option_steps",
+            _require_int32("max_option_steps", self.max_option_steps, minimum=1),
+        )
+        object.__setattr__(
+            self,
+            "threshold",
+            validated_float32_scalar("threshold", self.threshold, positive=True),
+        )
+        object.__setattr__(
+            self,
+            "pseudo_reward_scale",
+            validated_float32_scalar(
+                "pseudo_reward_scale", self.pseudo_reward_scale, positive=True
+            ),
+        )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -314,9 +392,7 @@ def _all_floating_leaves_finite(tree: Any) -> Array:
     """Bounded full-tree finiteness check, excluding typed PRNG keys."""
     valid = jnp.asarray(True, dtype=jnp.bool_)
     for leaf in jax.tree_util.tree_leaves(tree):
-        if hasattr(leaf, "dtype") and jax.dtypes.issubdtype(
-            leaf.dtype, jax.dtypes.prng_key
-        ):
+        if hasattr(leaf, "dtype") and jax.dtypes.issubdtype(leaf.dtype, jax.dtypes.prng_key):
             continue
         array = jnp.asarray(leaf)
         if jnp.issubdtype(array.dtype, jnp.inexact):
@@ -328,9 +404,7 @@ def _all_integer_leaves_nonnegative(tree: Any) -> Array:
     """Check learner/model counter leaves without constraining float values."""
     valid = jnp.asarray(True, dtype=jnp.bool_)
     for leaf in jax.tree_util.tree_leaves(tree):
-        if hasattr(leaf, "dtype") and jax.dtypes.issubdtype(
-            leaf.dtype, jax.dtypes.prng_key
-        ):
+        if hasattr(leaf, "dtype") and jax.dtypes.issubdtype(leaf.dtype, jax.dtypes.prng_key):
             continue
         array = jnp.asarray(leaf)
         if jnp.issubdtype(array.dtype, jnp.integer):
@@ -408,10 +482,7 @@ def _stomp_action_ownership_valid(
     )
     active_valid = (
         active
-        & (
-            state.base_last_action
-            == n_primitive_actions + state.executing_option
-        )
+        & (state.base_last_action == n_primitive_actions + state.executing_option)
         & (state.option_last_intra_action == state.last_primitive_action)
     )
     return primitive_valid & (idle_valid | active_valid)
@@ -459,8 +530,7 @@ def _stomp_static_dispatch_contract(
         state.base_learner_state.step_count,
     )
     static_valid = all(
-        value.shape == expected and value.dtype == jnp.float32
-        for value, expected in float32_shapes
+        value.shape == expected and value.dtype == jnp.float32 for value, expected in float32_shapes
     )
     static_valid = static_valid and all(
         value.shape == () and value.dtype == jnp.float32 for value in scalar_float32
@@ -559,9 +629,8 @@ def _stomp_static_dispatch_contract(
                     and optimizer_state.step_size.shape == ()
                     and optimizer_state.step_size.dtype == jnp.float32
                 )
-    rng_key_valid = (
-        state.rng_key.shape == ()
-        and jax.dtypes.issubdtype(state.rng_key.dtype, jax.dtypes.prng_key)
+    rng_key_valid = state.rng_key.shape == () and jax.dtypes.issubdtype(
+        state.rng_key.dtype, jax.dtypes.prng_key
     )
     return static_valid, rng_key_valid
 
@@ -595,8 +664,7 @@ def replace_dispatched_primitive_action(
 
     raw_observation = jnp.asarray(decision_observation)
     observation_static_contract_valid = (
-        raw_observation.shape == (observation_dim,)
-        and raw_observation.dtype == jnp.float32
+        raw_observation.shape == (observation_dim,) and raw_observation.dtype == jnp.float32
     )
     obs = (
         raw_observation
@@ -608,9 +676,7 @@ def replace_dispatched_primitive_action(
         raw_proposal.shape == () and raw_proposal.dtype == jnp.int32
     )
     proposal = (
-        raw_proposal
-        if proposed_action_static_contract_valid
-        else jnp.asarray(-1, dtype=jnp.int32)
+        raw_proposal if proposed_action_static_contract_valid else jnp.asarray(-1, dtype=jnp.int32)
     )
     if safety_action_mask is None:
         safety = jnp.ones((n_primitive_actions,), dtype=jnp.bool_)
@@ -618,8 +684,7 @@ def replace_dispatched_primitive_action(
     else:
         raw_safety = jnp.asarray(safety_action_mask)
         safety_action_mask_static_contract_valid = (
-            raw_safety.shape == (n_primitive_actions,)
-            and raw_safety.dtype == jnp.bool_
+            raw_safety.shape == (n_primitive_actions,) and raw_safety.dtype == jnp.bool_
         )
         safety = (
             raw_safety
@@ -628,9 +693,7 @@ def replace_dispatched_primitive_action(
         )
 
     no_option = state.executing_option == -1
-    option_index_valid = (state.executing_option >= 0) & (
-        state.executing_option < n_options
-    )
+    option_index_valid = (state.executing_option >= 0) & (state.executing_option < n_options)
     owner = jnp.where(
         no_option,
         jnp.asarray(DISPATCH_OWNER_BASE_PRIMITIVE, dtype=jnp.int32),
@@ -641,9 +704,7 @@ def replace_dispatched_primitive_action(
         ),
     )
     counterfactual = state.last_primitive_action
-    counterfactual_valid = (counterfactual >= 0) & (
-        counterfactual < n_primitive_actions
-    )
+    counterfactual_valid = (counterfactual >= 0) & (counterfactual < n_primitive_actions)
     base_owner_valid = (
         no_option
         & (state.base_last_action >= 0)
@@ -655,10 +716,7 @@ def replace_dispatched_primitive_action(
         & (state.base_last_action == n_primitive_actions + state.executing_option)
         & (state.option_last_intra_action == counterfactual)
     )
-    ownership_valid = (
-        counterfactual_valid
-        & (base_owner_valid | option_owner_valid)
-    )
+    ownership_valid = counterfactual_valid & (base_owner_valid | option_owner_valid)
     static_contract_valid, typed_rng_key_valid = _stomp_static_dispatch_contract(
         state,
         n_options=n_options,
@@ -753,9 +811,7 @@ def replace_dispatched_primitive_action(
             owner,
             jnp.asarray(DISPATCH_OWNER_INVALID, dtype=jnp.int32),
         ),
-        state_static_contract_valid=jnp.asarray(
-            static_contract_valid, dtype=jnp.bool_
-        ),
+        state_static_contract_valid=jnp.asarray(static_contract_valid, dtype=jnp.bool_),
         state_values_finite=state_values_finite,
         state_counters_valid=state_counters_valid,
         rng_key_valid=jnp.asarray(typed_rng_key_valid, dtype=jnp.bool_),
@@ -904,9 +960,7 @@ def _select_action_epsilon_greedy(
     """ε-greedy action selection with Gumbel tie-breaking."""
     key, explore_key, noise_key = jr.split(key, 3)
     q_vals = _q_values_for_obs(q_weights, observation)
-    greedy = jnp.argmax(q_vals + 1e-6 * jr.gumbel(noise_key, (n_actions,))).astype(
-        jnp.int32
-    )
+    greedy = jnp.argmax(q_vals + 1e-6 * jr.gumbel(noise_key, (n_actions,))).astype(jnp.int32)
     random_action = jr.randint(explore_key, (), 0, n_actions).astype(jnp.int32)
     explore = jr.uniform(key) < jnp.asarray(epsilon, dtype=jnp.float32)
     action = jnp.where(explore, random_action, greedy)
@@ -921,9 +975,7 @@ def _select_action_epsilon_greedy_from_q(
 ) -> tuple[Array, Array]:
     """ε-greedy action selection from pre-computed Q values."""
     key, explore_key, noise_key = jr.split(key, 3)
-    greedy = jnp.argmax(q_vals + 1e-6 * jr.gumbel(noise_key, (n_actions,))).astype(
-        jnp.int32
-    )
+    greedy = jnp.argmax(q_vals + 1e-6 * jr.gumbel(noise_key, (n_actions,))).astype(jnp.int32)
     random_action = jr.randint(explore_key, (), 0, n_actions).astype(jnp.int32)
     explore = jr.uniform(key) < jnp.asarray(epsilon, dtype=jnp.float32)
     action = jnp.where(explore, random_action, greedy)
@@ -1110,12 +1162,7 @@ def _differential_semidp_q_update(
     q_prev = q_weights[last_action] @ last_obs
     q_next = jnp.max(_q_values_for_obs(q_weights, next_obs))
     # The discounted reward and baseline must use the same γ powers.
-    td_error = (
-        reward
-        - average_reward * baseline_coefficient
-        + gamma_o * q_next
-        - q_prev
-    )
+    td_error = reward - average_reward * baseline_coefficient + gamma_o * q_next - q_prev
 
     action_mask = jax.nn.one_hot(last_action, n_actions, dtype=jnp.float32)
     new_traces = lam * traces + action_mask[:, None] * last_obs[None, :]
@@ -1175,9 +1222,7 @@ def _update_option_model(
     new_cumreward = decay * models.cumreward_ema + (1.0 - decay) * pseudo_return
     new_env_return = decay * models.env_return_ema + (1.0 - decay) * env_return
     new_duration = decay * models.duration_ema + (1.0 - decay) * duration
-    new_baseline_mass = (
-        decay * models.baseline_mass_ema + (1.0 - decay) * baseline_mass
-    )
+    new_baseline_mass = decay * models.baseline_mass_ema + (1.0 - decay) * baseline_mass
     new_discount = decay * models.discount_ema + (1.0 - decay) * discount
 
     predicted_delta = models.next_state_weights[option_idx] @ start_obs
@@ -1189,9 +1234,7 @@ def _update_option_model(
         jnp.float32
     )
     new_ns_weights = models.next_state_weights + mask[:, None, None] * ns_update[None, :, :]
-    incremented_completions = _saturating_int32_counter_increment(
-        models.n_completions
-    )
+    incremented_completions = _saturating_int32_counter_increment(models.n_completions)
     new_completions = jnp.where(
         mask.astype(jnp.bool_),
         incremented_completions,
@@ -1202,9 +1245,7 @@ def _update_option_model(
         cumreward_ema=jnp.where(mask, new_cumreward, models.cumreward_ema),
         env_return_ema=jnp.where(mask, new_env_return, models.env_return_ema),
         duration_ema=jnp.where(mask, new_duration, models.duration_ema),
-        baseline_mass_ema=jnp.where(
-            mask, new_baseline_mass, models.baseline_mass_ema
-        ),
+        baseline_mass_ema=jnp.where(mask, new_baseline_mass, models.baseline_mass_ema),
         discount_ema=jnp.where(mask, new_discount, models.discount_ema),
         next_state_weights=new_ns_weights,
         n_completions=new_completions,
@@ -1307,9 +1348,7 @@ def _update_intra_option_policy(
     traces_i = option_policies.traces[option_idx]
     avg_r_i = option_policies.average_rewards[option_idx]
     transition_discount = jnp.asarray(discount, dtype=jnp.float32)
-    bootstrap_discount = jnp.where(terminated, 0.0, transition_discount).astype(
-        jnp.float32
-    )
+    bootstrap_discount = jnp.where(terminated, 0.0, transition_discount).astype(jnp.float32)
 
     q_prev = q_i[last_intra_action] @ last_obs
     q_next = jnp.max(_q_values_for_obs(q_i, next_obs)) * bootstrap_discount
@@ -1419,15 +1458,34 @@ class STOMPConfig:
 
     def __post_init__(self) -> None:
         """Validate configuration."""
-        if self.observation_dim <= 0:
-            raise ValueError("observation_dim must be positive")
-        if self.n_primitive_actions <= 0:
-            raise ValueError("n_primitive_actions must be positive")
+        if type(self.subtask_specs) is not tuple or any(
+            type(spec) is not SubtaskSpec for spec in self.subtask_specs
+        ):
+            raise ValueError("subtask_specs must be an actual tuple of SubtaskSpec values")
+        observation_dim = _require_int32("observation_dim", self.observation_dim, minimum=1)
+        n_primitive_actions = _require_int32(
+            "n_primitive_actions", self.n_primitive_actions, minimum=1
+        )
+        base_hidden_sizes = _validate_hidden_sizes(self.base_hidden_sizes)
+        backups = _require_int32(
+            "option_planning_backups_per_step",
+            self.option_planning_backups_per_step,
+            minimum=0,
+            maximum=_INT32_MAX - 1,
+        )
+
+        object.__setattr__(self, "observation_dim", observation_dim)
+        object.__setattr__(self, "n_primitive_actions", n_primitive_actions)
+        object.__setattr__(self, "base_hidden_sizes", base_hidden_sizes)
+        object.__setattr__(self, "option_planning_backups_per_step", backups)
+        if len(self.subtask_specs) > _INT32_MAX - n_primitive_actions:
+            raise ValueError("derived n_total_actions must fit signed int32")
+
         for spec in self.subtask_specs:
-            if spec.feature_index >= self.observation_dim:
+            if spec.feature_index >= observation_dim:
                 raise ValueError(
                     f"SubtaskSpec.feature_index={spec.feature_index} >= "
-                    f"observation_dim={self.observation_dim}"
+                    f"observation_dim={observation_dim}"
                 )
             if spec.max_option_steps > _INT32_MAX:
                 raise ValueError("SubtaskSpec.max_option_steps must fit int32 telemetry")
@@ -1438,9 +1496,13 @@ class STOMPConfig:
             "option_avg_reward_step_size",
             "option_model_step_size",
         ):
-            step_size_value: float = getattr(self, step_size_name)
-            if not math.isfinite(step_size_value) or step_size_value < 0.0:
-                raise ValueError(f"{step_size_name} must be finite and non-negative")
+            object.__setattr__(
+                self,
+                step_size_name,
+                validated_float32_scalar(
+                    step_size_name, getattr(self, step_size_name), lower=0.0
+                ),
+            )
         for unit_interval_name in (
             "base_trace_decay",
             "option_trace_decay",
@@ -1448,31 +1510,44 @@ class STOMPConfig:
             "epsilon_base",
             "epsilon_option",
         ):
-            unit_interval_value: float = getattr(self, unit_interval_name)
-            if not math.isfinite(unit_interval_value) or not 0.0 <= unit_interval_value <= 1.0:
-                raise ValueError(f"{unit_interval_name} must be finite and in [0, 1]")
-        if not math.isfinite(self.option_gamma) or not 0.0 <= self.option_gamma <= 1.0:
-            raise ValueError("option_gamma must be finite and in [0, 1]")
-        if self.option_target_epsilon is not None and not (
-            0.0 <= self.option_target_epsilon <= 1.0
-        ):
-            raise ValueError("option_target_epsilon must be in [0, 1] when provided")
-        if self.option_importance_clip <= 0.0:
-            raise ValueError("option_importance_clip must be positive")
-        if (
-            isinstance(self.option_planning_backups_per_step, bool)
-            or not isinstance(self.option_planning_backups_per_step, int)
-            or self.option_planning_backups_per_step < 0
-        ):
-            raise ValueError("option_planning_backups_per_step must be a nonnegative integer")
-        if self.option_planning_backups_per_step >= _INT32_MAX:
-            raise ValueError(
-                "option_planning_backups_per_step must be smaller than int32 max"
+            object.__setattr__(
+                self,
+                unit_interval_name,
+                validated_float32_scalar(
+                    unit_interval_name,
+                    getattr(self, unit_interval_name),
+                    lower=0.0,
+                    upper=1.0,
+                ),
             )
+        object.__setattr__(
+            self,
+            "option_gamma",
+            validated_float32_scalar("option_gamma", self.option_gamma, lower=0.0, upper=1.0),
+        )
+        if self.option_target_epsilon is not None:
+            object.__setattr__(
+                self,
+                "option_target_epsilon",
+                validated_float32_scalar(
+                    "option_target_epsilon",
+                    self.option_target_epsilon,
+                    lower=0.0,
+                    upper=1.0,
+                ),
+            )
+        object.__setattr__(
+            self,
+            "option_importance_clip",
+            validated_float32_scalar(
+                "option_importance_clip", self.option_importance_clip, positive=True
+            ),
+        )
         if not self.subtask_specs and self.option_planning_backups_per_step != 0:
-            raise ValueError(
-                "primitive-only STOMP requires option_planning_backups_per_step == 0"
-            )
+            raise ValueError("primitive-only STOMP requires option_planning_backups_per_step == 0")
+        direct_scalars = _stomp_direct_array_scalars(self)
+        if direct_scalars > _INT32_MAX or 4 * direct_scalars > _INT32_MAX:
+            raise ValueError("derived STOMP direct array bytes must fit signed int32")
 
     @property
     def n_options(self) -> int:
@@ -1488,9 +1563,7 @@ class STOMPConfig:
         """Serialize to a JSON-compatible dictionary."""
         return {
             "type": "STOMPConfig",
-            "subtask_specs": [
-                dataclasses.asdict(s) for s in self.subtask_specs
-            ],
+            "subtask_specs": [dataclasses.asdict(s) for s in self.subtask_specs],
             "observation_dim": self.observation_dim,
             "n_primitive_actions": self.n_primitive_actions,
             "base_step_size": self.base_step_size,
@@ -1513,12 +1586,49 @@ class STOMPConfig:
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> STOMPConfig:
         """Reconstruct from :meth:`to_config` output."""
+        if type(config) is not dict:
+            raise ValueError("STOMP config must be an actual dict")
         payload = dict(config)
-        payload.pop("type", None)
+        if payload.pop("type", None) != "STOMPConfig":
+            raise ValueError("STOMP config type is invalid")
+        expected = {field.name for field in dataclasses.fields(cls)}
+        legacy_optional = {"subtask_specs", "base_hidden_sizes", "option_planning_backups_per_step"}
+        if set(payload) - expected or (expected - legacy_optional) - set(payload):
+            raise ValueError("STOMP config fields do not match its schema")
         specs_raw = payload.pop("subtask_specs", [])
+        if type(specs_raw) is not list or any(type(spec) is not dict for spec in specs_raw):
+            raise ValueError("serialized subtask_specs must be an actual list of actual dicts")
+        spec_fields = {field.name for field in dataclasses.fields(SubtaskSpec)}
+        if any(set(spec) != spec_fields for spec in specs_raw):
+            raise ValueError("serialized SubtaskSpec fields do not match its schema")
+        if any(
+            type(spec["feature_index"]) is not int
+            or type(spec["max_option_steps"]) is not int
+            or type(spec["threshold"]) is not float
+            or type(spec["pseudo_reward_scale"]) is not float
+            for spec in specs_raw
+        ):
+            raise ValueError("serialized SubtaskSpec scalars must be canonical JSON scalars")
         specs = tuple(SubtaskSpec(**s) for s in specs_raw)
-        if "base_hidden_sizes" in payload:
-            payload["base_hidden_sizes"] = tuple(payload["base_hidden_sizes"])
+        hidden_raw = payload.pop("base_hidden_sizes", [])
+        if type(hidden_raw) is not list or any(type(size) is not int for size in hidden_raw):
+            raise ValueError("serialized base_hidden_sizes must be an actual list of JSON integers")
+        payload["base_hidden_sizes"] = tuple(hidden_raw)
+        for name in ("observation_dim", "n_primitive_actions", "option_planning_backups_per_step"):
+            if name in payload and type(payload[name]) is not int:
+                raise ValueError(f"serialized {name} must be a JSON integer")
+        for name in (
+            "base_step_size", "base_avg_reward_step_size", "base_trace_decay",
+            "option_step_size", "option_avg_reward_step_size", "option_trace_decay",
+            "option_gamma", "option_model_decay", "option_model_step_size",
+            "epsilon_base", "epsilon_option", "option_importance_clip",
+        ):
+            if type(payload[name]) is not float:
+                raise ValueError(f"serialized {name} must be a JSON number")
+        if payload["option_target_epsilon"] is not None and type(
+            payload["option_target_epsilon"]
+        ) is not float:
+            raise ValueError("serialized option_target_epsilon must be null or a JSON number")
         return cls(subtask_specs=specs, **payload)
 
 
@@ -1681,9 +1791,7 @@ class STOMPAgent:
         explicitly. The state also records it in ``last_primitive_action``.
         """
         cfg = self._config
-        obs = jnp.asarray(initial_observation, dtype=jnp.float32).reshape(
-            (cfg.observation_dim,)
-        )
+        obs = jnp.asarray(initial_observation, dtype=jnp.float32).reshape((cfg.observation_dim,))
         key = state.rng_key
         q_vals = self._base_learner.predict(state.base_learner_state, obs)
         extended_action, key = _select_action_epsilon_greedy_from_q(
@@ -1791,13 +1899,8 @@ class STOMPAgent:
                 f"({cfg.n_total_actions},), got {raw_mask.shape}"
             )
         if raw_mask.dtype != jnp.bool_:
-            raise TypeError(
-                "extended_action_mask must have dtype bool, "
-                f"got {raw_mask.dtype}"
-            )
-        obs = jnp.asarray(initial_observation, dtype=jnp.float32).reshape(
-            (cfg.observation_dim,)
-        )
+            raise TypeError(f"extended_action_mask must have dtype bool, got {raw_mask.dtype}")
+        obs = jnp.asarray(initial_observation, dtype=jnp.float32).reshape((cfg.observation_dim,))
         mask_valid = jnp.all(raw_mask[: cfg.n_primitive_actions]) & jnp.any(raw_mask)
         values_valid = jnp.all(jnp.isfinite(obs))
         key = state.rng_key
@@ -1952,9 +2055,7 @@ class STOMPAgent:
 
                 predicted_delta = models.next_state_weights[model_idx] @ anchor_observation
                 predicted_next = anchor_observation + predicted_delta
-                next_q = self._base_learner.predict(
-                    current_learner_state, predicted_next
-                )
+                next_q = self._base_learner.predict(current_learner_state, predicted_next)
                 eligible_next_q = jnp.where(
                     extended_action_mask,
                     next_q,
@@ -1965,9 +2066,11 @@ class STOMPAgent:
                     - average_reward * models.baseline_mass_ema[model_idx]
                     + models.discount_ema[model_idx] * jnp.max(eligible_next_q)
                 )
-                targets = jnp.full(
-                    cfg.n_total_actions, jnp.nan, dtype=jnp.float32
-                ).at[option_action].set(target)
+                targets = (
+                    jnp.full(cfg.n_total_actions, jnp.nan, dtype=jnp.float32)
+                    .at[option_action]
+                    .set(target)
+                )
                 update_result = self._base_learner.update(
                     current_learner_state,
                     anchor_observation,
@@ -2025,9 +2128,7 @@ class STOMPAgent:
             reset_mask = jnp.zeros((cfg.observation_dim,), dtype=jnp.bool_)
         else:
             if cfg.base_hidden_sizes:
-                raise ValueError(
-                    "preselection feature reset requires a linear STOMP base learner"
-                )
+                raise ValueError("preselection feature reset requires a linear STOMP base learner")
             raw_reset_mask = jnp.asarray(preselection_feature_reset_mask)
             if raw_reset_mask.shape != (cfg.observation_dim,):
                 raise ValueError(
@@ -2053,8 +2154,7 @@ class STOMPAgent:
                 )
             if raw_action_mask.dtype != jnp.bool_:
                 raise TypeError(
-                    "extended_action_mask must have dtype bool, "
-                    f"got {raw_action_mask.dtype}"
+                    f"extended_action_mask must have dtype bool, got {raw_action_mask.dtype}"
                 )
             action_mask = raw_action_mask
             action_mask_valid = jnp.all(action_mask) & jnp.any(action_mask)
@@ -2093,9 +2193,7 @@ class STOMPAgent:
             )
             input_values_valid = input_values_valid & valid_discount
 
-        outer_words, outer_capacity = _checked_lifetime_words_increment(
-            state.step_words
-        )
+        outer_words, outer_capacity = _checked_lifetime_words_increment(state.step_words)
         outer_counter_valid = _lifetime_counter_valid(
             state.step_words,
             state.step_count,
@@ -2124,15 +2222,17 @@ class STOMPAgent:
         )
         eligible_next_q = jnp.where(action_mask, next_q_values, -jnp.inf)
         td_target = (
-            reward
-            - state.base_average_reward
-            + primitive_discount * jnp.max(eligible_next_q)
+            reward - state.base_average_reward + primitive_discount * jnp.max(eligible_next_q)
         )
-        targets = jnp.full(
-            cfg.n_primitive_actions,
-            jnp.nan,
-            dtype=jnp.float32,
-        ).at[state.base_last_action].set(td_target)
+        targets = (
+            jnp.full(
+                cfg.n_primitive_actions,
+                jnp.nan,
+                dtype=jnp.float32,
+            )
+            .at[state.base_last_action]
+            .set(td_target)
+        )
         trace_adjusted_state = cast(
             MultiHeadMLPState,
             state.base_learner_state.replace(
@@ -2334,9 +2434,7 @@ class STOMPAgent:
             reset_mask = jnp.zeros((cfg.observation_dim,), dtype=jnp.bool_)
         else:
             if cfg.base_hidden_sizes:
-                raise ValueError(
-                    "preselection feature reset requires a linear STOMP base learner"
-                )
+                raise ValueError("preselection feature reset requires a linear STOMP base learner")
             raw_reset_mask = jnp.asarray(preselection_feature_reset_mask)
             if raw_reset_mask.shape != (cfg.observation_dim,):
                 raise ValueError(
@@ -2361,13 +2459,12 @@ class STOMPAgent:
                 )
             if raw_action_mask.dtype != jnp.bool_:
                 raise TypeError(
-                    "extended_action_mask must have dtype bool, "
-                    f"got {raw_action_mask.dtype}"
+                    f"extended_action_mask must have dtype bool, got {raw_action_mask.dtype}"
                 )
             action_mask = raw_action_mask
-            action_mask_valid = jnp.all(
-                action_mask[: cfg.n_primitive_actions]
-            ) & jnp.any(action_mask)
+            action_mask_valid = jnp.all(action_mask[: cfg.n_primitive_actions]) & jnp.any(
+                action_mask
+            )
         bootstrap_obs = jnp.asarray(next_observation, dtype=jnp.float32).reshape(
             (cfg.observation_dim,)
         )
@@ -2412,9 +2509,7 @@ class STOMPAgent:
             environmental_termination = supplied_discount <= 0.0
             input_values_valid = input_values_valid & valid_discount
 
-        outer_words, outer_capacity = _checked_lifetime_words_increment(
-            state.step_words
-        )
+        outer_words, outer_capacity = _checked_lifetime_words_increment(state.step_words)
         outer_counter_valid = _lifetime_counter_valid(
             state.step_words,
             state.step_count,
@@ -2435,9 +2530,7 @@ class STOMPAgent:
         # Compute pseudo-reward for the currently-executing (or notional) option
         pseudo_r = compute_pseudo_reward(spec, option_idx, bootstrap_obs)
         target_epsilon = (
-            cfg.epsilon_option
-            if cfg.option_target_epsilon is None
-            else cfg.option_target_epsilon
+            cfg.epsilon_option if cfg.option_target_epsilon is None else cfg.option_target_epsilon
         )
         option_importance_ratio = _clipped_epsilon_greedy_importance_ratio(
             state.option_policies.q_weights[option_idx],
@@ -2474,9 +2567,7 @@ class STOMPAgent:
             )
         else:
             planning_updates_required = jnp.asarray(0, dtype=jnp.int32)
-        nested_updates_required = (
-            should_update_base.astype(jnp.int32) + planning_updates_required
-        )
+        nested_updates_required = should_update_base.astype(jnp.int32) + planning_updates_required
         expected_nested_words, nested_capacity = _checked_lifetime_words_advance(
             state.base_learner_state.step_words,
             nested_updates_required,
@@ -2629,19 +2720,15 @@ class STOMPAgent:
         def do_base_update(
             _: None,
         ) -> tuple[MultiHeadMLPState, Array, Array, Array]:
-            next_q_vals = self._base_learner.predict(
-                state.base_learner_state, bootstrap_obs
-            )
+            next_q_vals = self._base_learner.predict(state.base_learner_state, bootstrap_obs)
             eligible_next_q = jnp.where(action_mask, next_q_vals, -jnp.inf)
             max_next_q = base_discount * jnp.max(eligible_next_q)
-            td_target = (
-                base_reward
-                - state.base_average_reward * base_baseline_mass
-                + max_next_q
+            td_target = base_reward - state.base_average_reward * base_baseline_mass + max_next_q
+            targets = (
+                jnp.full(n_total, jnp.nan, dtype=jnp.float32)
+                .at[state.base_last_action]
+                .set(td_target)
             )
-            targets = jnp.full(n_total, jnp.nan, dtype=jnp.float32).at[
-                state.base_last_action
-            ].set(td_target)
             trace_adjusted_state = cast(
                 MultiHeadMLPState,
                 state.base_learner_state.replace(
@@ -2651,9 +2738,7 @@ class STOMPAgent:
                     )
                 ),
             )
-            result = self._base_learner.update(
-                trace_adjusted_state, base_update_obs, targets
-            )
+            result = self._base_learner.update(trace_adjusted_state, base_update_obs, targets)
             td_err = result.errors[state.base_last_action]
             new_avg_reward = state.base_average_reward + beta * td_err
             return result.state, new_avg_reward, td_err, result.update_applied
@@ -2661,17 +2746,10 @@ class STOMPAgent:
         def skip_base_update(
             _: None,
         ) -> tuple[MultiHeadMLPState, Array, Array, Array]:
-            prev_q = self._base_learner.predict(
-                state.base_learner_state, state.base_last_obs
-            )
-            next_q = self._base_learner.predict(
-                state.base_learner_state, bootstrap_obs
-            )
+            prev_q = self._base_learner.predict(state.base_learner_state, state.base_last_obs)
+            next_q = self._base_learner.predict(state.base_learner_state, bootstrap_obs)
             eligible_next_q = jnp.where(action_mask, next_q, -jnp.inf)
-            td = (
-                primitive_discount * jnp.max(eligible_next_q)
-                - prev_q[state.base_last_action]
-            )
+            td = primitive_discount * jnp.max(eligible_next_q) - prev_q[state.base_last_action]
             return (
                 state.base_learner_state,
                 state.base_average_reward,
@@ -2684,9 +2762,7 @@ class STOMPAgent:
             new_avg_r,
             base_td,
             real_base_update_applied,
-        ) = jax.lax.cond(
-            should_update_base, do_base_update, skip_base_update, None
-        )
+        ) = jax.lax.cond(should_update_base, do_base_update, skip_base_update, None)
 
         # --- Fixed-budget option-model planning ---
         # The zero-backup default is a Python-level static branch: it consumes
@@ -2733,9 +2809,7 @@ class STOMPAgent:
             cfg.epsilon_base,
             action_mask,
         )
-        next_select_extended = (~is_executing) | (
-            is_executing & option_lifecycle_ends
-        )
+        next_select_extended = (~is_executing) | (is_executing & option_lifecycle_ends)
         selected_option = jnp.clip(
             extended_action - cfg.n_primitive_actions,
             0,
@@ -2770,9 +2844,8 @@ class STOMPAgent:
                 jnp.array(-1, dtype=jnp.int32),
             ),
         )
-        is_starting_option = (
-            next_select_extended
-            & (extended_action >= jnp.asarray(cfg.n_primitive_actions, jnp.int32))
+        is_starting_option = next_select_extended & (
+            extended_action >= jnp.asarray(cfg.n_primitive_actions, jnp.int32)
         )
 
         # Primitive action sent to environment
@@ -2787,9 +2860,7 @@ class STOMPAgent:
         )
 
         # Reset option tracking on termination or new option start
-        new_option_start_obs = jnp.where(
-            is_starting_option, decision_obs, state.option_start_obs
-        )
+        new_option_start_obs = jnp.where(is_starting_option, decision_obs, state.option_start_obs)
         new_option_cumreward = jnp.where(
             (is_executing & option_lifecycle_ends) | is_starting_option,
             jnp.array(0.0, dtype=jnp.float32),
@@ -2891,9 +2962,7 @@ class STOMPAgent:
                 new_executing_option,
                 state.executing_option,
             ),
-            option_terminated=transaction_applied
-            & is_executing
-            & option_lifecycle_ends,
+            option_terminated=transaction_applied & is_executing & option_lifecycle_ends,
             pseudo_reward=jnp.where(
                 transaction_applied & is_executing,
                 pseudo_r,
@@ -2964,9 +3033,7 @@ class STOMPAgent:
                 decision_observation=decision_obs,
                 execution_boundary=execution_boundary,
                 extended_action_mask=(
-                    extended_action_mask
-                    if extended_action_masks is not None
-                    else None
+                    extended_action_mask if extended_action_masks is not None else None
                 ),
             )
             return result.state, (
@@ -3025,27 +3092,30 @@ class STOMPAgent:
         if scan_extended_action_masks.dtype != jnp.bool_:
             raise TypeError("extended_action_masks must have dtype bool")
 
-        final_state, (
-            td_errors,
-            average_rewards,
-            primitive_actions,
-            executing_options,
-            option_terminations,
-            pseudo_rewards,
-            option_importance_ratios,
-            planning_backups,
-            planning_td_errors,
-            pre_step_words,
-            post_step_words,
-            inputs_valid,
-            lifetime_counter_valid,
-            lifetime_capacity_available,
-            nested_lifetime_counter_valid,
-            nested_lifetime_capacity_available,
-            nested_updates_required,
-            nested_updates_applied,
-            proposed_state_valid,
-            update_applied,
+        (
+            final_state,
+            (
+                td_errors,
+                average_rewards,
+                primitive_actions,
+                executing_options,
+                option_terminations,
+                pseudo_rewards,
+                option_importance_ratios,
+                planning_backups,
+                planning_td_errors,
+                pre_step_words,
+                post_step_words,
+                inputs_valid,
+                lifetime_counter_valid,
+                lifetime_capacity_available,
+                nested_lifetime_counter_valid,
+                nested_lifetime_capacity_available,
+                nested_updates_required,
+                nested_updates_applied,
+                proposed_state_valid,
+                update_applied,
+            ),
         ) = jax.lax.scan(
             step_fn,
             state,
@@ -3231,15 +3301,11 @@ def stomp_state_to_checkpoint_payload(state: STOMPState) -> dict[str, Any]:
 def _sub_payload_as_dict(value: Any, name: str, cls: type) -> dict[str, Any]:
     """Normalize a nested payload entry to a plain field-keyed dict."""
     if isinstance(value, cls):
-        return {
-            field.name: getattr(value, field.name)
-            for field in dataclasses.fields(cls)
-        }
+        return {field.name: getattr(value, field.name) for field in dataclasses.fields(cls)}
     if isinstance(value, dict):
         return dict(value)
     raise ValueError(
-        f"'{name}' must be a field-keyed dict or {cls.__name__}, "
-        f"got {type(value).__name__}"
+        f"'{name}' must be a field-keyed dict or {cls.__name__}, got {type(value).__name__}"
     )
 
 
@@ -3300,18 +3366,14 @@ def load_stomp_state_with_migration(payload: dict[str, Any]) -> STOMPState:
             f"missing={sorted(missing_state_fields)}"
         )
 
-    models = _sub_payload_as_dict(
-        data.pop("option_models"), "option_models", OptionModelsState
-    )
+    models = _sub_payload_as_dict(data.pop("option_models"), "option_models", OptionModelsState)
     model_field_names = {
         field.name
         for field in dataclasses.fields(OptionModelsState)  # type: ignore[arg-type]
     }
     unknown_models = sorted(set(models) - model_field_names)
     if unknown_models:
-        raise ValueError(
-            f"Unknown OptionModelsState checkpoint fields: {unknown_models}"
-        )
+        raise ValueError(f"Unknown OptionModelsState checkpoint fields: {unknown_models}")
     missing_model_fields = model_field_names - set(models)
     expected_missing_model_fields = (
         set(STOMP_OPTION_MODEL_EXPANSION_FIELDS)
@@ -3340,8 +3402,7 @@ def load_stomp_state_with_migration(payload: dict[str, Any]) -> STOMPState:
     }
     if set(policies) != policy_field_names:
         raise ValueError(
-            "STOMP option-policy payload fields "
-            f"{sorted(policies)} != {sorted(policy_field_names)}"
+            f"STOMP option-policy payload fields {sorted(policies)} != {sorted(policy_field_names)}"
         )
     option_policies = IntraOptionPoliciesState(**policies)
 
