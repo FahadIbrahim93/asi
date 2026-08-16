@@ -252,8 +252,10 @@ def test_config_is_strict_versioned_mechanism_only_and_round_trips() -> None:
             for field in dataclasses.fields(exact_stomp)
         }
     )
-    with pytest.raises(TypeError, match="exact STOMPConfig"):
-        lifecycle.require_compatible_oak_config(OaKConfig(stomp=stomp_subclass))
+    # OaKConfig is now the authoritative first boundary: it must reject an
+    # unvalidated STOMP subclass before derived OaK resource accounting runs.
+    with pytest.raises(ValueError, match="actual STOMPConfig"):
+        OaKConfig(stomp=stomp_subclass)
 
     payload = config.to_config()
     payload["scientific_promotion_allowed"] = True
@@ -298,22 +300,11 @@ def test_config_is_strict_versioned_mechanism_only_and_round_trips() -> None:
     with pytest.raises(ValueError, match="subtask attestation"):
         lifecycle.require_compatible_oak_config(mismatched_oak)
     for malformed_index in (True, 1.0):
-        malformed_specs = (
-            SubtaskSpec(feature_index=0),
-            SubtaskSpec(feature_index=cast(int, malformed_index)),
-        )
-        malformed_oak = OaKConfig(
-            stomp=STOMPConfig(
-                subtask_specs=malformed_specs,
-                observation_dim=config.total_feature_dim,
-                n_primitive_actions=config.n_primitive_actions,
-            )
-        )
-        with pytest.raises(ValueError, match="subtask attestation"):
-            lifecycle.require_compatible_oak_config(malformed_oak)
+        with pytest.raises(ValueError, match="feature_index"):
+            SubtaskSpec(feature_index=cast(int, malformed_index))
     for malformed_dimension in (float(config.total_feature_dim),):
-        malformed_oak = OaKConfig(
-            stomp=STOMPConfig(
+        with pytest.raises(ValueError, match="observation_dim"):
+            STOMPConfig(
                 subtask_specs=(
                     SubtaskSpec(feature_index=0),
                     SubtaskSpec(feature_index=1),
@@ -321,11 +312,8 @@ def test_config_is_strict_versioned_mechanism_only_and_round_trips() -> None:
                 observation_dim=cast(int, malformed_dimension),
                 n_primitive_actions=config.n_primitive_actions,
             )
-        )
-        with pytest.raises(ValueError, match="subtask attestation"):
-            lifecycle.require_compatible_oak_config(malformed_oak)
-    malformed_actions = OaKConfig(
-        stomp=STOMPConfig(
+    with pytest.raises(ValueError, match="n_primitive_actions"):
+        STOMPConfig(
             subtask_specs=(
                 SubtaskSpec(feature_index=0),
                 SubtaskSpec(feature_index=1),
@@ -333,13 +321,10 @@ def test_config_is_strict_versioned_mechanism_only_and_round_trips() -> None:
             observation_dim=config.total_feature_dim,
             n_primitive_actions=cast(int, float(config.n_primitive_actions)),
         )
-    )
-    with pytest.raises(ValueError, match="subtask attestation"):
-        lifecycle.require_compatible_oak_config(malformed_actions)
     single_action_config = dataclasses.replace(config, n_primitive_actions=1)
-    single_action_lifecycle = PrototypeFeatureLifecycle(single_action_config)
-    boolean_actions = OaKConfig(
-        stomp=STOMPConfig(
+    PrototypeFeatureLifecycle(single_action_config)
+    with pytest.raises(ValueError, match="n_primitive_actions"):
+        STOMPConfig(
             subtask_specs=(
                 SubtaskSpec(feature_index=0),
                 SubtaskSpec(feature_index=1),
@@ -347,9 +332,6 @@ def test_config_is_strict_versioned_mechanism_only_and_round_trips() -> None:
             observation_dim=single_action_config.total_feature_dim,
             n_primitive_actions=cast(int, True),
         )
-    )
-    with pytest.raises(ValueError, match="subtask attestation"):
-        single_action_lifecycle.require_compatible_oak_config(boolean_actions)
 
 
 def test_allocation_and_python_collection_ceilings_fail_before_construction() -> None:
