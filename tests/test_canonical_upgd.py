@@ -477,6 +477,60 @@ def test_safe_profile_global_saturation_does_not_consume_inactive_clock() -> Non
         assert not jnp.array_equal(jr.key_data(result.next_key), jr.key_data(key))
 
 
+@pytest.mark.parametrize("mode", ["protecting", "non_protecting"])
+def test_safe_profile_exhausted_active_clock_rejects_available_peer_atomically(
+    mode: str,
+) -> None:
+    with jax.enable_x64():
+        maximum = jnp.iinfo(jnp.int32).max
+        params = {
+            "available": jnp.array([2.0], dtype=jnp.float64),
+            "exhausted": jnp.array([3.0], dtype=jnp.float64),
+        }
+        gradients = {
+            "available": jnp.array([-0.25], dtype=jnp.float64),
+            "exhausted": jnp.array([-0.5], dtype=jnp.float64),
+        }
+        optimizer = CanonicalUPGD(
+            CanonicalUPGDConfig(
+                step_size=0.1,
+                utility_decay=0.999999999,
+                noise_std=0.0,
+                mode=mode,  # type: ignore[arg-type]
+                profile="safe_extended",
+                normalization="global",
+            )
+        )
+        state = optimizer.init(params).replace(
+            utility_ema=jax.tree.map(jnp.ones_like, params),
+            utility_age={
+                "available": jnp.array([maximum - 1], dtype=jnp.int32),
+                "exhausted": jnp.array([maximum], dtype=jnp.int32),
+            },
+            step=jnp.array(maximum, dtype=jnp.int32),
+        )
+        key = jr.key(29)
+        result = jax.jit(optimizer.update)(
+            state,
+            params,
+            gradients,
+            key,
+            noise=jax.tree.map(jnp.zeros_like, params),
+        )
+
+        assert not bool(result.metrics["update_applied"])
+        chex.assert_trees_all_equal(result.params, params)
+        chex.assert_trees_all_equal(result.state, state)
+        chex.assert_trees_all_equal(
+            jr.key_data(result.next_key),
+            jr.key_data(key),
+        )
+        zero_tree = jax.tree.map(jnp.zeros_like, params)
+        chex.assert_trees_all_equal(result.scaled_utility, zero_tree)
+        chex.assert_trees_all_equal(result.corrected_utility, zero_tree)
+        chex.assert_trees_all_equal(result.perturbation, zero_tree)
+
+
 @pytest.mark.parametrize("profile", ["paper_global", "safe_extended"])
 def test_corrupt_negative_counters_do_not_overflow_to_the_lifetime_limit(
     profile: str,

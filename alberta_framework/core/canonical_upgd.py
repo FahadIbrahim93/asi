@@ -111,7 +111,11 @@ def _saturating_increment(value: Array, increment: Array | int = 1) -> Array:
 
     maximum = jnp.asarray(_INT32_MAX, dtype=jnp.int32)
     increment_array = jnp.asarray(increment, dtype=jnp.int32)
-    return value + jnp.minimum(increment_array, maximum - value)
+    return jnp.where(
+        value <= maximum - increment_array,
+        value + increment_array,
+        maximum,
+    )
 
 
 @dataclass(frozen=True)
@@ -377,12 +381,12 @@ class CanonicalUPGD:
         equation-level parity tests.  Normal operation omits it and samples
         ``N(0, noise_std**2)`` from ``key``.
 
-        The final representable int32 clock event is applied.  Once the clock
-        reaches ``INT32_MAX``, later calls reject atomically: parameters,
+        The final representable int32 clock event is applied.  A saturated
+        clock may continue only after its active leaf-dtype bias-correction
+        denominator is exactly one.  If an active saturated clock still needs
+        to advance that denominator, the update rejects atomically: parameters,
         optimizer state, and the key remain exact; computed payloads are
-        neutral; and ``metrics["update_applied"]`` is false.  This avoids both
-        counter wraparound and silently continuing an EMA with a frozen bias-
-        correction clock.
+        neutral; and ``metrics["update_applied"]`` is false.
         """
 
         param_leaves, structure = _flatten_with_none(params)
@@ -415,8 +419,7 @@ class CanonicalUPGD:
         next_key = split_keys[0]
         noise_keys = split_keys[1:]
         beta = self._config.utility_decay
-        maximum_step = jnp.asarray(_INT32_MAX, dtype=jnp.int32)
-        capacity_available = state.step < maximum_step
+        maximum_counter = jnp.asarray(_INT32_MAX, dtype=jnp.int32)
         next_step = _saturating_increment(state.step)
 
         corrected_leaves: list[Array] = []
@@ -426,6 +429,7 @@ class CanonicalUPGD:
         eligible_masks: list[Array] = []
         active_masks: list[Array] = []
         clean_gradients: list[Array] = []
+        capacity_available = jnp.asarray(True, dtype=jnp.bool_)
 
         for param, gradient, utility, age, mask_leaf in zip(
             param_leaves,
@@ -461,14 +465,29 @@ class CanonicalUPGD:
                 next_age = _saturating_increment(age, active.astype(jnp.int32))
                 correction_clock = next_age.astype(param.dtype)
             bias_correction = 1.0 - jnp.power(beta, correction_clock)
+            correction_denominator = (
+                jnp.maximum(bias_correction, self._config.epsilon)
+                if self._config.profile == "safe_extended"
+                else bias_correction
+            )
+            denominator_converged = correction_denominator == jnp.asarray(
+                1.0, dtype=bias_correction.dtype
+            )
+            if self._config.uses_global_clock:
+                saturated_active = (state.step >= maximum_counter) & jnp.any(active)
+                leaf_capacity_available = (~saturated_active) | jnp.all(
+                    denominator_converged
+                )
+            else:
+                leaf_capacity_available = ~jnp.any(
+                    active
+                    & (age >= maximum_counter)
+                    & ~denominator_converged
+                )
+            capacity_available = capacity_available & leaf_capacity_available
             corrected = jnp.where(
                 next_age > 0,
-                next_utility
-                / (
-                    jnp.maximum(bias_correction, self._config.epsilon)
-                    if self._config.profile == "safe_extended"
-                    else bias_correction
-                ),
+                next_utility / correction_denominator,
                 0.0,
             )
 
