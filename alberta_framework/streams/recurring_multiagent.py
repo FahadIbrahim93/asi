@@ -824,8 +824,8 @@ class RecurringTwoAgentWorld:
                     update_applied,
                     value,
                     (
-                        jnp.full_like(value, jnp.nan)
-                        if jnp.issubdtype(value.dtype, jnp.floating)
+                        jnp.zeros_like(value)
+                        if jnp.issubdtype(value.dtype, jnp.inexact)
                         else (
                             jnp.zeros_like(value)
                             if jnp.issubdtype(value.dtype, jnp.bool_)
