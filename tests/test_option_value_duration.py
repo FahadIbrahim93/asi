@@ -4,9 +4,15 @@ These are analytic and deterministic development tests, not held-out evidence
 that Alberta Plan Step 5 is complete.
 """
 
+import json
+import math
+from decimal import Decimal
+from fractions import Fraction
+
 import chex
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 
 from alberta_framework.core.option_value_duration import (
@@ -48,6 +54,152 @@ def test_config_roundtrip_validation_and_fixed_parameter_count() -> None:
             OptionValueDurationConfig(duration_step_size=invalid)
         with pytest.raises(ValueError, match="duration_floor"):
             OptionValueDurationConfig(duration_floor=invalid)
+
+
+@pytest.mark.parametrize(
+    "field",
+    ("reward_step_size", "duration_step_size", "duration_floor"),
+)
+@pytest.mark.parametrize(
+    "invalid",
+    (
+        True,
+        np.bool_(True),
+        "0.1",
+        1.0 + 0.0j,
+        Decimal("0.1"),
+        jnp.asarray(0.1, dtype=jnp.float32),
+    ),
+)
+def test_config_rejects_boolean_and_non_real_scalar_inputs(
+    field: str,
+    invalid: object,
+) -> None:
+    with pytest.raises(ValueError, match=field):
+        OptionValueDurationConfig(**{field: invalid})
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid"),
+    (
+        ("reward_step_size", Fraction(-1, 10**400)),
+        ("duration_step_size", Fraction(-1, 10**400)),
+        ("duration_floor", Fraction(-1, 10**400)),
+        ("reward_step_size", Fraction(1, 10**400)),
+        ("duration_step_size", Fraction(1, 10**400)),
+        ("duration_floor", Fraction(1, 10**400)),
+        ("reward_step_size", 3.5e38),
+        ("duration_step_size", 3.5e38),
+        ("duration_floor", 3.5e38),
+    ),
+)
+def test_config_enforces_exact_domain_and_float32_sink_bounds(
+    field: str,
+    invalid: object,
+) -> None:
+    with pytest.raises(ValueError, match=field):
+        OptionValueDurationConfig(**{field: invalid})
+
+
+def test_config_uses_direct_float32_narrowing_without_double_rounding() -> None:
+    overflow_midpoint = np.ldexp(
+        np.longdouble(2) - np.ldexp(np.longdouble(1), -24),
+        127,
+    )
+    largest_finite_input = np.nextafter(
+        overflow_midpoint,
+        np.longdouble("-inf"),
+    )
+
+    reward = OptionValueDurationConfig(reward_step_size=largest_finite_input)
+    duration = OptionValueDurationConfig(duration_step_size=largest_finite_input)
+    floor = OptionValueDurationConfig(duration_floor=largest_finite_input)
+
+    for value in (
+        reward.reward_step_size,
+        duration.duration_step_size,
+        floor.duration_floor,
+    ):
+        assert type(value) is float
+        assert bool(np.isfinite(np.asarray(value, dtype=np.float32)))
+
+
+@pytest.mark.parametrize(
+    "field",
+    ("reward_step_size", "duration_step_size", "duration_floor"),
+)
+def test_config_rounds_exact_rationals_to_float32_with_ties_to_even(field: str) -> None:
+    midpoint = Fraction(1, 1) + Fraction(1, 2**24)
+    offset = Fraction(1, 2**60)
+    next_float32 = np.nextafter(
+        np.float32(1.0),
+        np.float32(2.0),
+        dtype=np.float32,
+    )
+
+    below = OptionValueDurationConfig(**{field: midpoint - offset})
+    tie = OptionValueDurationConfig(**{field: midpoint})
+    above = OptionValueDurationConfig(**{field: midpoint + offset})
+
+    assert getattr(below, field) == 1.0
+    assert getattr(tie, field) == 1.0
+    assert getattr(above, field) == float(next_float32)
+
+
+@pytest.mark.parametrize(
+    "field",
+    ("reward_step_size", "duration_step_size", "duration_floor"),
+)
+def test_config_enforces_exact_float32_underflow_and_overflow_midpoints(field: str) -> None:
+    minimum_subnormal = float(np.nextafter(np.float32(0.0), np.float32(1.0)))
+    underflow_midpoint = Fraction(1, 2**150)
+    overflow_midpoint = Fraction(((2**24 - 1) * 2**104) + 2**103)
+
+    with pytest.raises(ValueError, match=field):
+        OptionValueDurationConfig(**{field: underflow_midpoint})
+    above_underflow = OptionValueDurationConfig(
+        **{field: underflow_midpoint + Fraction(1, 2**200)}
+    )
+    assert getattr(above_underflow, field) == minimum_subnormal
+
+    below_overflow = OptionValueDurationConfig(**{field: overflow_midpoint - 1})
+    assert getattr(below_overflow, field) == float(np.finfo(np.float32).max)
+    with pytest.raises(ValueError, match=field):
+        OptionValueDurationConfig(**{field: overflow_midpoint})
+
+
+def test_config_canonicalizes_real_scalars_and_preserves_builtin_float_payload() -> None:
+    builtin = OptionValueDurationConfig(
+        reward_step_size=0.1,
+        duration_step_size=0.2,
+        duration_floor=1.0e-4,
+    )
+    assert builtin.to_config() == {
+        "type": "OptionValueDurationConfig",
+        "reward_step_size": 0.1,
+        "duration_step_size": 0.2,
+        "duration_floor": 1.0e-4,
+    }
+
+    config = OptionValueDurationConfig(
+        reward_step_size=np.float64(0.25),
+        duration_step_size=np.int64(1),
+        duration_floor=Fraction(1, 4),
+    )
+    payload = config.to_config()
+
+    assert type(config.reward_step_size) is float
+    assert type(config.duration_step_size) is float
+    assert type(config.duration_floor) is float
+    json.dumps(payload, allow_nan=False)
+    assert OptionValueDurationConfig.from_config(payload) == config
+
+    signed_zero = OptionValueDurationConfig(
+        reward_step_size=-0.0,
+        duration_step_size=-0.0,
+    )
+    assert math.copysign(1.0, signed_zero.reward_step_size) < 0.0
+    assert math.copysign(1.0, signed_zero.duration_step_size) < 0.0
 
 
 def test_two_head_td_targets_and_updates_match_exact_analytic_values() -> None:
