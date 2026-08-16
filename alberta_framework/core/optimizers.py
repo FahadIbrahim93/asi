@@ -1449,7 +1449,7 @@ class AutostepGTDLambda(Optimizer[AutostepGTDLambdaState]):
         )
         previous_checked = state
         if self._trace_decay == 0.0:
-            previous_checked = state.replace(
+            previous_checked = state.replace(  # type: ignore[attr-defined]
                 eligibility_traces=jnp.zeros_like(state.eligibility_traces),
                 bias_eligibility_trace=jnp.zeros_like(state.bias_eligibility_trace),
             )
@@ -1627,7 +1627,7 @@ class ObGD(Optimizer[ObGDState]):
 
         previous_checked = state
         if self._gamma == 0.0 or self._lamda == 0.0:
-            previous_checked = state.replace(
+            previous_checked = state.replace(  # type: ignore[attr-defined]
                 traces=jnp.zeros_like(state.traces),
                 bias_trace=jnp.zeros_like(state.bias_trace),
             )
@@ -1902,7 +1902,7 @@ class TDIDBD(TDOptimizer[TDIDBDState]):
             & (jnp.all(jnp.isfinite(next_observation)) | (gamma_scalar == 0.0))
             & jnp.isfinite(gamma_scalar)
         )
-        previous_checked = state.replace(
+        previous_checked = state.replace(  # type: ignore[attr-defined]
             eligibility_traces=jnp.where(
                 (gamma_scalar == 0.0) | (lam == 0.0),
                 jnp.zeros_like(state.eligibility_traces),
@@ -2137,7 +2137,7 @@ class AutoTDIDBD(TDOptimizer[AutoTDIDBDState]):
             & (jnp.all(jnp.isfinite(next_observation)) | (gamma_scalar == 0.0))
             & jnp.isfinite(gamma_scalar)
         )
-        previous_checked = state.replace(
+        previous_checked = state.replace(  # type: ignore[attr-defined]
             eligibility_traces=jnp.where(
                 (gamma_scalar == 0.0) | (lam == 0.0),
                 jnp.zeros_like(state.eligibility_traces),
