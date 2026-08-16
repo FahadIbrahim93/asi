@@ -535,6 +535,44 @@ def test_construct_rounds_fraction_noise_midpoints_once(
     assert stream._noise_std == expected  # noqa: SLF001
 
 
+def test_construct_applies_exact_float32_overflow_midpoint() -> None:
+    float32_max = (2**24 - 1) * 2**104
+    overflow_midpoint = float32_max + 2**103
+
+    stream = ClassicalConditioningStream(
+        phases=(_valid_phase(),),
+        noise_std=Fraction(overflow_midpoint - 1),
+    )
+    assert stream._noise_std == float(np.finfo(np.float32).max)  # noqa: SLF001
+    with pytest.raises(ValueError, match="noise_std"):
+        ClassicalConditioningStream(
+            phases=(_valid_phase(),),
+            noise_std=Fraction(overflow_midpoint),
+        )
+
+
+def test_construct_applies_exact_subnormal_midpoint_and_signed_zero() -> None:
+    subnormal_midpoint = Fraction(1, 2**150)
+    tie = ClassicalConditioningStream(
+        phases=(_valid_phase(),),
+        noise_std=subnormal_midpoint,
+    )
+    above = ClassicalConditioningStream(
+        phases=(_valid_phase(),),
+        noise_std=subnormal_midpoint + Fraction(1, 2**200),
+    )
+    negative_zero = ClassicalConditioningStream(
+        phases=(_valid_phase(),),
+        noise_std=-0.0,
+    )
+
+    assert tie._noise_std == 0.0  # noqa: SLF001
+    assert above._noise_std == float(  # noqa: SLF001
+        np.nextafter(np.float32(0.0), np.float32(1.0))
+    )
+    assert np.signbit(negative_zero._noise_std)  # noqa: SLF001
+
+
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), -0.1, 1.1, True])
 def test_construct_rejects_illegal_distractor_prob(value: object) -> None:
     """Distractor probability must be a finite real in ``[0, 1]``."""

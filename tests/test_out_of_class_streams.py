@@ -336,6 +336,38 @@ class TestFrequencyMismatchStream:
         stream = FrequencyMismatchStream(omega_min=1.0, omega_max=omega_max)
         assert stream._omega_max == expected  # noqa: SLF001
 
+    def test_frequency_bounds_apply_exact_float32_overflow_midpoint(self) -> None:
+        float32_max = (2**24 - 1) * 2**104
+        overflow_midpoint = float32_max + 2**103
+
+        stream = FrequencyMismatchStream(
+            omega_min=1.0,
+            omega_max=Fraction(overflow_midpoint - 1),
+        )
+        assert stream._omega_max == float(np.finfo(np.float32).max)  # noqa: SLF001
+        with pytest.raises(ValueError, match="omega_max"):
+            FrequencyMismatchStream(
+                omega_min=1.0,
+                omega_max=Fraction(overflow_midpoint),
+            )
+
+    def test_frequency_bounds_apply_exact_subnormal_midpoint(self) -> None:
+        subnormal_midpoint = Fraction(1, 2**150)
+
+        with pytest.raises(ValueError, match="omega_min"):
+            FrequencyMismatchStream(omega_min=subnormal_midpoint, omega_max=1.0)
+        stream = FrequencyMismatchStream(
+            omega_min=subnormal_midpoint + Fraction(1, 2**200),
+            omega_max=1.0,
+        )
+        assert stream._omega_min == float(  # noqa: SLF001
+            np.nextafter(np.float32(0.0), np.float32(1.0))
+        )
+
+    def test_frequency_bounds_reject_negative_zero(self) -> None:
+        with pytest.raises(ValueError, match="omega_min"):
+            FrequencyMismatchStream(omega_min=-0.0, omega_max=1.0)
+
     def test_step_shapes(self):
         stream = FrequencyMismatchStream(
             feature_dim=4,

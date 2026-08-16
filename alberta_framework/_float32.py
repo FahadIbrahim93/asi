@@ -85,6 +85,8 @@ def round_real_to_float32(value: Real) -> float:
     conversion. Real implementations that cannot expose an exact ratio are
     rejected instead of being silently double-rounded.
     """
+    if isinstance(value, bool):
+        raise TypeError("real value must not be a bool")
     if isinstance(value, Integral):
         ratio: object = (int(value), 1)
     else:
