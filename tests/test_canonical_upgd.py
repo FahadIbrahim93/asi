@@ -294,11 +294,21 @@ def test_ema_bias_correction_recovers_constant_signed_utility() -> None:
 
 
 @pytest.mark.parametrize(
-    "profile",
-    ["paper_global", "safe_extended"],
+    ("profile", "normalization"),
+    [
+        ("paper_global", "global"),
+        ("official_readme_global", "global"),
+        ("official_experiment_global", "global"),
+        ("official_experiment_local", "local"),
+        ("paper_local_literal", "local"),
+        ("safe_extended", "global"),
+    ],
 )
-def test_lifetime_counters_saturate_without_disabling_utility_correction(
+@pytest.mark.parametrize("compiled", [False, True])
+def test_lifetime_counter_capacity_rejects_the_complete_update(
     profile: str,
+    normalization: str,
+    compiled: bool,
 ) -> None:
     params = {"w": jnp.array([2.0], dtype=jnp.float32)}
     gradients = {"w": jnp.array([-0.5], dtype=jnp.float32)}
@@ -308,7 +318,7 @@ def test_lifetime_counters_saturate_without_disabling_utility_correction(
             utility_decay=0.9,
             noise_std=0.0,
             profile=profile,  # type: ignore[arg-type]
-            normalization="global",
+            normalization=normalization,  # type: ignore[arg-type]
         )
     )
     maximum = jnp.iinfo(jnp.int32).max
@@ -318,20 +328,76 @@ def test_lifetime_counters_saturate_without_disabling_utility_correction(
         step=jnp.array(maximum, dtype=jnp.int32),
     )
 
-    result = optimizer.update(
+    def apply_update(state, params, gradients, key, noise):
+        return optimizer.update(state, params, gradients, key, noise=noise)
+
+    update = jax.jit(apply_update) if compiled else apply_update
+    result = update(
         state,
         params,
         gradients,
         jr.key(0),
-        noise={"w": jnp.zeros(1, dtype=jnp.float32)},
+        {"w": jnp.zeros(1, dtype=jnp.float32)},
     )
 
     assert int(result.state.step) == maximum
     assert int(result.state.utility_age["w"][0]) == maximum
-    assert float(result.corrected_utility["w"][0]) == pytest.approx(1.0)
-    assert float(result.scaled_utility["w"][0]) == pytest.approx(
-        float(jax.nn.sigmoid(jnp.float32(1.0)))
+    chex.assert_trees_all_equal(result.params, params)
+    chex.assert_trees_all_equal(result.state, state)
+    chex.assert_trees_all_equal(result.next_key, jr.key(0))
+    chex.assert_trees_all_equal(
+        result.corrected_utility,
+        jax.tree.map(jnp.zeros_like, params),
     )
+    chex.assert_trees_all_equal(
+        result.scaled_utility,
+        jax.tree.map(jnp.zeros_like, params),
+    )
+    assert not bool(result.metrics["update_applied"])
+
+
+@pytest.mark.parametrize("profile", ["paper_global", "safe_extended"])
+def test_final_representable_lifetime_update_is_consumed_before_capacity(
+    profile: str,
+) -> None:
+    previous_x64 = jax.config.x64_enabled
+    jax.config.update("jax_enable_x64", True)
+    try:
+        params = {"w": jnp.array([2.0], dtype=jnp.float64)}
+        gradients = {"w": jnp.array([-0.5], dtype=jnp.float64)}
+        decay = 0.999999999
+        optimizer = CanonicalUPGD(
+            CanonicalUPGDConfig(
+                step_size=0.1,
+                utility_decay=decay,
+                noise_std=0.0,
+                profile=profile,  # type: ignore[arg-type]
+                normalization="global",
+            )
+        )
+        maximum = jnp.iinfo(jnp.int32).max
+        prior_step = int(maximum) - 1
+        correction = 1.0 - decay**prior_step
+        state = optimizer.init(params).replace(
+            utility_ema={"w": jnp.array([correction], dtype=jnp.float64)},
+            utility_age={"w": jnp.array([prior_step], dtype=jnp.int32)},
+            step=jnp.array(prior_step, dtype=jnp.int32),
+        )
+
+        result = optimizer.update(
+            state,
+            params,
+            gradients,
+            jr.key(1),
+            noise={"w": jnp.zeros(1, dtype=jnp.float64)},
+        )
+
+        assert int(result.state.step) == maximum
+        assert int(result.state.utility_age["w"][0]) == maximum
+        assert float(result.corrected_utility["w"][0]) == pytest.approx(1.0)
+        assert bool(result.metrics["update_applied"])
+    finally:
+        jax.config.update("jax_enable_x64", previous_x64)
 
 
 @pytest.mark.parametrize(
