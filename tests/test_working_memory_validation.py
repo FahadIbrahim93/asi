@@ -2,10 +2,20 @@
 
 from __future__ import annotations
 
+import dataclasses
+from collections.abc import Iterator, Mapping
+from types import MappingProxyType
+
+import jax
+import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from alberta_framework.core.working_memory import WorkingMemoryConfig
+from alberta_framework.core.working_memory import (
+    WorkingMemoryConfig,
+    WorkingMemoryFeaturizer,
+    transform_working_memory_arrays,
+)
 
 _INT32_MAX = 2**31 - 1
 
@@ -250,3 +260,143 @@ def test_working_state_preflight_feature_dim_boundary() -> None:
         match="configuration feature_dim|byte count|scalar count|dimensions",
     ):
         _base_cfg(observation_dim=600_000_000, action_dim=600_000_000, reward_dim=600_000_000)
+
+
+def test_working_serialized_schema_preserves_only_exact_list_tuple_compatibility() -> None:
+    config = _base_cfg()
+    payload = config.to_config()
+    payload["observation_decay_rates"] = tuple(payload["observation_decay_rates"])
+    assert WorkingMemoryConfig.from_config(MappingProxyType(payload)) == config
+
+    for mutation, match in (
+        ({"type": "OtherConfig"}, "type"),
+        ({"observation_dim": np.int32(2)}, "observation_dim"),
+        ({"gate_threshold": np.float32(0.0)}, "gate_threshold"),
+        ({"include_traces": 1}, "include_traces"),
+        ({"observation_decay_rates": [np.float32(0.5)]}, "JSON numbers"),
+        ({"extra": 1}, "fields"),
+    ):
+        invalid = config.to_config()
+        invalid.update(mutation)
+        with pytest.raises(ValueError, match=match):
+            WorkingMemoryConfig.from_config(invalid)
+    missing = config.to_config()
+    missing.pop("gate_temperature")
+    with pytest.raises(ValueError, match="fields"):
+        WorkingMemoryConfig.from_config(missing)
+
+
+def test_working_mapping_hooks_are_normalized_without_class_spoofing() -> None:
+    class HostileMapping(Mapping[str, object]):
+        def __getitem__(self, key: str) -> object:
+            raise RuntimeError("getitem hook")
+
+        def __iter__(self) -> Iterator[str]:
+            raise RuntimeError("iteration hook")
+
+        def __len__(self) -> int:
+            return 1
+
+    class MappingSpoof:
+        @property
+        def __class__(self) -> type:
+            return dict
+
+        def __iter__(self) -> object:
+            raise AssertionError("iteration hook executed")
+
+    for loader in (WorkingMemoryConfig.from_config, WorkingMemoryFeaturizer.from_config):
+        with pytest.raises(ValueError, match="mapping"):
+            loader(HostileMapping())
+        with pytest.raises(ValueError, match="mapping"):
+            loader(MappingSpoof())  # type: ignore[arg-type]
+
+
+def test_working_featurizer_serialized_envelope_is_exact() -> None:
+    memory = WorkingMemoryFeaturizer(_base_cfg())
+    payload = memory.to_config()
+    assert WorkingMemoryFeaturizer.from_config(MappingProxyType(payload)).config == memory.config
+    with pytest.raises(ValueError, match="type"):
+        WorkingMemoryFeaturizer.from_config({**payload, "type": "OtherFeaturizer"})
+    with pytest.raises(ValueError, match="fields"):
+        WorkingMemoryFeaturizer.from_config({**payload, "extra": 1})
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement", "match"),
+    [
+        ("observation_traces", jnp.zeros((3, 1), dtype=jnp.float32), "observation_traces"),
+        ("action_traces", jnp.zeros((2, 1), dtype=jnp.float16), "action_traces"),
+        ("reward_traces", jnp.zeros((2,), dtype=jnp.float32), "reward_traces"),
+        ("step_count", jnp.zeros((1,), dtype=jnp.int32), "step_count"),
+        ("last_gate", jnp.zeros((1, 3), dtype=jnp.float32), "last_gate"),
+    ],
+)
+def test_working_public_methods_reject_malformed_state_static_contract(
+    field: str, replacement: jax.Array, match: str
+) -> None:
+    memory = WorkingMemoryFeaturizer(_base_cfg())
+    state = dataclasses.replace(memory.init(), **{field: replacement})
+    args = (state, jnp.zeros((2,)), jnp.zeros((1,)), jnp.zeros((1,)))
+    for call in (
+        lambda: memory.features(*args),
+        lambda: memory.update_checked(*args),
+        lambda: memory.step(*args),
+        lambda: jax.jit(memory.update_checked)(*args),
+    ):
+        with pytest.raises((TypeError, ValueError), match=match):
+            call()
+
+
+def test_working_invalid_state_rolls_back_and_lifetime_counter_saturates() -> None:
+    memory = WorkingMemoryFeaturizer(_base_cfg())
+    args = (jnp.zeros((2,)), jnp.zeros((1,)), jnp.zeros((1,)))
+    invalid = dataclasses.replace(
+        memory.init(),
+        step_count=jnp.asarray(-1, dtype=jnp.int32),
+    )
+    rejected = memory.update_checked(invalid, *args)
+    assert not bool(rejected.update_applied)
+    assert int(rejected.state.step_count) == -1
+
+    maximum = dataclasses.replace(
+        memory.init(),
+        step_count=jnp.asarray(_INT32_MAX, dtype=jnp.int32),
+    )
+    accepted = memory.update_checked(maximum, *args)
+    assert bool(accepted.update_applied)
+    assert int(accepted.state.step_count) == _INT32_MAX
+    with pytest.raises(ValueError, match="external_gate"):
+        memory.update_checked(memory.init(), *args, external_gate=jnp.ones((1,)))
+
+
+def test_working_transform_preflights_output_bytes_without_allocation() -> None:
+    memory = WorkingMemoryFeaturizer(
+        WorkingMemoryConfig(
+            observation_dim=1,
+            action_dim=0,
+            reward_dim=0,
+            observation_decay_rates=(),
+            action_decay_rates=(),
+            reward_decay_rates=(),
+            include_current_action=False,
+            include_current_reward=False,
+            include_traces=False,
+        )
+    )
+    first_overflow = _INT32_MAX // 5 + 1
+    observations = jax.ShapeDtypeStruct((first_overflow, 1), jnp.float32)
+    empty = jax.ShapeDtypeStruct((first_overflow, 0), jnp.float32)
+    with pytest.raises(ValueError, match="byte count"):
+        jax.eval_shape(
+            lambda obs, zero: transform_working_memory_arrays(memory, obs, zero, zero),
+            observations,
+            empty,
+        )
+
+
+def test_working_gate_temperature_must_be_positive_normal_float32() -> None:
+    minimum_normal = float.fromhex("0x1.0p-126")
+    assert _base_cfg(gate_temperature=minimum_normal).gate_temperature == minimum_normal
+    with pytest.raises(ValueError, match="gate_temperature"):
+        _base_cfg(gate_temperature=float.fromhex("0x1.0p-149"))

@@ -11,8 +11,8 @@ updates.
 from __future__ import annotations
 
 import functools
-from collections.abc import Iterator
-from dataclasses import asdict, dataclass
+from collections.abc import Iterator, Mapping
+from dataclasses import asdict, dataclass, fields
 from typing import Any, cast
 
 import chex
@@ -104,10 +104,18 @@ class WorkingMemoryConfig:
         return payload
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> WorkingMemoryConfig:
+    def from_config(cls, config: Mapping[str, Any]) -> WorkingMemoryConfig:
         """Reconstruct from :meth:`to_config` output."""
-        payload = dict(config)
-        payload.pop("type", None)
+        if not issubclass(type(config), Mapping):
+            raise ValueError("WorkingMemoryConfig payload must be a mapping")
+        try:
+            payload = dict(config)
+        except Exception as error:
+            raise ValueError("WorkingMemoryConfig mapping could not be read") from error
+        if payload.pop("type", None) != "WorkingMemoryConfig":
+            raise ValueError("WorkingMemoryConfig type is invalid")
+        if set(payload) != {field.name for field in fields(cls)}:
+            raise ValueError("WorkingMemoryConfig fields do not match its schema")
         for key in (
             "observation_decay_rates",
             "action_decay_rates",
@@ -119,6 +127,24 @@ class WorkingMemoryConfig:
                     payload[key] = tuple(value)
                 elif type(value) is not tuple:
                     raise ValueError(f"{key} must be an actual list or tuple")
+                if any(type(item) is not float for item in payload[key]):
+                    raise ValueError(f"serialized {key} values must be JSON numbers")
+        for key in ("observation_dim", "action_dim", "reward_dim"):
+            if type(payload[key]) is not int:
+                raise ValueError(f"serialized {key} must be a JSON integer")
+        for key in (
+            "include_current_observation",
+            "include_current_action",
+            "include_current_reward",
+            "include_traces",
+            "include_innovations",
+            "gated_update",
+        ):
+            if type(payload[key]) is not bool:
+                raise ValueError(f"serialized {key} must be a JSON boolean")
+        for key in ("gate_threshold", "gate_temperature"):
+            if type(payload[key]) is not float:
+                raise ValueError(f"serialized {key} must be a JSON number")
         return cls(**payload)
 
 
@@ -190,6 +216,7 @@ class WorkingMemoryArrayResult:
 
 
 _INT32_MAX = 2**31 - 1
+_FLOAT32_MIN_NORMAL = float.fromhex("0x1.0p-126")
 _ACTUAL_INT_TYPES: tuple[type, ...] = (
     int,
     np.int8,
@@ -230,6 +257,13 @@ def _require_float32_resource(
         raise ValueError(f"{name} byte count must fit signed int32")
 
 
+def _require_sequence_resource(name: str, *, float32_scalars: int, bool_scalars: int) -> None:
+    if float32_scalars + bool_scalars > _INT32_MAX:
+        raise ValueError(f"{name} scalar count must fit signed int32")
+    if 4 * float32_scalars + bool_scalars > _INT32_MAX:
+        raise ValueError(f"{name} byte count must fit signed int32")
+
+
 def _validate_decay_rates(name: str, rates: object) -> tuple[float, ...]:
     if type(rates) is not tuple:
         raise ValueError(f"{name} must be an actual tuple")
@@ -262,7 +296,7 @@ def _validate_config(config: WorkingMemoryConfig) -> None:
         "gate_threshold", config.gate_threshold, lower=0.0
     )
     gate_temperature = validated_float32_scalar(
-        "gate_temperature", config.gate_temperature, positive=True
+        "gate_temperature", config.gate_temperature, lower=_FLOAT32_MIN_NORMAL
     )
     for name in (
         "include_current_observation",
@@ -378,9 +412,66 @@ class WorkingMemoryFeaturizer:
         }
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> WorkingMemoryFeaturizer:
+    def from_config(cls, config: Mapping[str, Any]) -> WorkingMemoryFeaturizer:
         """Reconstruct a featurizer from :meth:`to_config` output."""
-        return cls(WorkingMemoryConfig.from_config(dict(config["config"])))
+        if not issubclass(type(config), Mapping):
+            raise ValueError("WorkingMemoryFeaturizer payload must be a mapping")
+        try:
+            payload = dict(config)
+        except Exception as error:
+            raise ValueError("WorkingMemoryFeaturizer mapping could not be read") from error
+        if set(payload) != {"type", "config"}:
+            raise ValueError("WorkingMemoryFeaturizer fields do not match its schema")
+        if payload["type"] != "WorkingMemoryFeaturizer":
+            raise ValueError("WorkingMemoryFeaturizer type is invalid")
+        inner = payload["config"]
+        if not issubclass(type(inner), Mapping):
+            raise ValueError("WorkingMemoryFeaturizer config must be a mapping")
+        return cls(WorkingMemoryConfig.from_config(cast(Mapping[str, Any], inner)))
+
+    def _validate_state_static_contract(self, state: WorkingMemoryState) -> None:
+        """Reject malformed adopted state before traced computation."""
+        if type(state) is not WorkingMemoryState:
+            raise TypeError("state must be a WorkingMemoryState")
+        cfg = self._config
+        expected = (
+            (
+                "state.observation_traces",
+                state.observation_traces,
+                (len(cfg.observation_decay_rates), cfg.observation_dim),
+                jnp.float32,
+            ),
+            (
+                "state.action_traces",
+                state.action_traces,
+                (len(cfg.action_decay_rates), cfg.action_dim),
+                jnp.float32,
+            ),
+            (
+                "state.reward_traces",
+                state.reward_traces,
+                (len(cfg.reward_decay_rates), cfg.reward_dim),
+                jnp.float32,
+            ),
+            ("state.step_count", state.step_count, (), jnp.int32),
+            ("state.last_gate", state.last_gate, (3,), jnp.float32),
+        )
+        for name, value, shape, dtype in expected:
+            if not hasattr(value, "shape") or not hasattr(value, "dtype"):
+                raise TypeError(f"{name} must expose array shape and dtype metadata")
+            if tuple(value.shape) != shape:
+                raise ValueError(f"{name} must have shape {shape}; got {tuple(value.shape)}")
+            if jnp.dtype(value.dtype) != jnp.dtype(dtype):
+                raise TypeError(f"{name} must have dtype {jnp.dtype(dtype)}")
+
+    @staticmethod
+    def _state_is_valid(state: WorkingMemoryState) -> Bool[Array, ""]:
+        return (
+            floating_tree_is_finite(state)
+            & (state.step_count >= 0)
+            & jnp.all(state.last_gate >= 0.0)
+            & jnp.all(state.last_gate <= 1.0)
+        )
 
     def init(self) -> WorkingMemoryState:
         """Return an all-zero memory state."""
@@ -443,6 +534,7 @@ class WorkingMemoryFeaturizer:
         reward: Float[Array, " reward_dim"],
     ) -> Float[Array, " feature_dim"]:
         """Return current working-memory features without advancing state."""
+        self._validate_state_static_contract(state)
         cfg = self._config
         obs = _empty_or_vector(observation, cfg.observation_dim)
         act = _empty_or_vector(action, cfg.action_dim)
@@ -482,11 +574,16 @@ class WorkingMemoryFeaturizer:
         external_gate: Float[Array, ""] | float = 1.0,
     ) -> WorkingMemoryUpdateResult:
         """Advance one event and report whether the transaction committed."""
+        self._validate_state_static_contract(state)
         cfg = self._config
         obs = _empty_or_vector(observation, cfg.observation_dim)
         act = _empty_or_vector(action, cfg.action_dim)
         rew = _empty_or_vector(reward, cfg.reward_dim)
         raw_outer_gate = jnp.asarray(external_gate, dtype=jnp.float32)
+        if raw_outer_gate.shape != ():
+            raise ValueError(
+                f"external_gate must have scalar shape (); got {raw_outer_gate.shape}"
+            )
         inputs_valid = (
             jnp.all(jnp.isfinite(obs))
             & jnp.all(jnp.isfinite(act))
@@ -538,7 +635,11 @@ class WorkingMemoryFeaturizer:
                 cfg.reward_decay_rates,
                 reward_gate,
             ),
-            step_count=state.step_count + 1,
+            step_count=jnp.minimum(
+                state.step_count,
+                jnp.asarray(_INT32_MAX - 1, dtype=jnp.int32),
+            )
+            + jnp.asarray(1, dtype=jnp.int32),
             last_gate=jnp.stack([observation_gate, action_gate, reward_gate]),
         )
         previous_checked = state
@@ -556,8 +657,8 @@ class WorkingMemoryFeaturizer:
             )
         update_applied = (
             inputs_valid
-            & floating_tree_is_finite(previous_checked)
-            & floating_tree_is_finite(candidate)
+            & self._state_is_valid(previous_checked)
+            & self._state_is_valid(candidate)
         )
         return WorkingMemoryUpdateResult(
             state=select_transaction(update_applied, candidate, state),
@@ -609,6 +710,7 @@ class WorkingMemoryFeaturizer:
     @functools.partial(jax.jit, static_argnums=(0,))
     def diagnostics(self, state: WorkingMemoryState) -> WorkingMemoryDiagnostics:
         """Return memory energy, participation-ratio dimension, and gates."""
+        self._validate_state_static_contract(state)
         flat = _flatten_traces(state)
         return WorkingMemoryDiagnostics(
             step_count=state.step_count,
@@ -653,8 +755,14 @@ def transform_working_memory_arrays(
             "observations/actions/rewards leading dims must match "
             f"(got {_obs.shape[0]}, {_act.shape[0]}, {_rew.shape[0]})"
         )
+    _require_sequence_resource(
+        "working memory transform outputs",
+        float32_scalars=int(steps) * cfg.feature_dim(),
+        bool_scalars=int(steps),
+    )
     if state is None:
         state = featurizer.init()
+    featurizer._validate_state_static_contract(state)
     gates = (
         jnp.ones((steps,), dtype=jnp.float32)
         if external_gates is None
