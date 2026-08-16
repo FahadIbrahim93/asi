@@ -419,10 +419,24 @@ def extract_hyperparameter_results(
 
     Returns:
         Dictionary mapping param value to (mean, std) tuple
+
+    Raises:
+        ValueError: If ``param_extractor`` maps more than one configuration to
+            the same value; a sensitivity curve built from a silently
+            truncated, insertion-order-dependent subset is not a measurement.
     """
     performance = get_final_performance(results, metric)
 
     if param_extractor is None:
         return {k: v for k, v in performance.items()}
 
-    return {param_extractor(name): perf for name, perf in performance.items()}
+    names_by_value: dict[Any, list[str]] = {}
+    for name in performance:
+        names_by_value.setdefault(param_extractor(name), []).append(name)
+    collisions = {value: names for value, names in names_by_value.items() if len(names) > 1}
+    if collisions:
+        described = "; ".join(f"{value!r} <- {names}" for value, names in collisions.items())
+        raise ValueError(
+            f"param_extractor maps several configurations to one value: {described}"
+        )
+    return {value: performance[names[0]] for value, names in names_by_value.items()}
