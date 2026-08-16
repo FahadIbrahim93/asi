@@ -14,13 +14,20 @@ from __future__ import annotations
 import functools
 import math
 from dataclasses import asdict, dataclass
+from numbers import Integral, Real
 from typing import Any, Literal, cast
 
 import chex
 import jax
 import jax.numpy as jnp
 from jax import Array
-from jaxtyping import Float, Int
+from jaxtyping import Bool, Float, Int
+
+from alberta_framework.core.update_safety import (
+    floating_tree_is_finite,
+    neutralize_array,
+    select_transaction,
+)
 
 AssociativeFeatureFamily = Literal[
     "position_token",
@@ -149,6 +156,7 @@ class AssociativeMemoryUpdateResult:
     predictions: Float[Array, " vocab_size"]
     logits: Float[Array, " vocab_size"]
     metrics: Float[Array, " 8"]
+    update_applied: Bool[Array, ""]
 
 
 @chex.dataclass(frozen=True)
@@ -158,6 +166,16 @@ class AssociativeMemoryLearningResult:
     state: AssociativeMemoryState
     predictions: Float[Array, "steps vocab_size"]
     metrics: Float[Array, "steps 8"]
+    updates_applied: Bool[Array, " steps"]
+
+
+def _finite_real(name: str, value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError(f"{name} must be a real number")
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(f"{name} must be finite")
+    return number
 
 
 def _validate_config(config: AssociativeMemoryConfig) -> None:
@@ -191,40 +209,52 @@ def _validate_config(config: AssociativeMemoryConfig) -> None:
         raise ValueError("max_weight must be >= min_weight")
     if not math.isfinite(config.logit_scale) or config.logit_scale <= 0.0:
         raise ValueError("logit_scale must be positive")
-    if config.scope_lr < 0.0:
+    for name in (
+        "adaptive_feature_family",
+        "adaptive_window",
+        "adaptive_budget",
+    ):
+        if not isinstance(getattr(config, name), bool):
+            raise ValueError(f"{name} must be a boolean")
+    scope_lr = _finite_real("scope_lr", config.scope_lr)
+    if scope_lr < 0.0:
         raise ValueError("scope_lr must be non-negative")
-    if config.budget_lr < 0.0:
+    budget_lr = _finite_real("budget_lr", config.budget_lr)
+    if budget_lr < 0.0:
         raise ValueError("budget_lr must be non-negative")
-    if not 0.0 < config.initial_budget_fraction <= 1.0:
+    initial_budget_fraction = _finite_real(
+        "initial_budget_fraction",
+        config.initial_budget_fraction,
+    )
+    if not 0.0 < initial_budget_fraction <= 1.0:
         raise ValueError("initial_budget_fraction must be in (0, 1]")
-    if config.min_effective_budget < 1:
+    if isinstance(config.min_effective_budget, bool) or not isinstance(
+        config.min_effective_budget,
+        Integral,
+    ):
+        raise ValueError("min_effective_budget must be an integer")
+    min_effective_budget = int(config.min_effective_budget)
+    if min_effective_budget < 1:
         raise ValueError("min_effective_budget must be positive")
-    if config.min_effective_budget > config.max_features:
+    if min_effective_budget > config.max_features:
         raise ValueError("min_effective_budget must be <= max_features")
-    if config.scope_logit_clip <= 0.0:
+    scope_logit_clip = _finite_real("scope_logit_clip", config.scope_logit_clip)
+    if scope_logit_clip <= 0.0:
         raise ValueError("scope_logit_clip must be positive")
 
 
 def _softmax(logits: Array) -> Array:
-    finite = jnp.all(jnp.isfinite(logits))
     shifted = logits - jnp.max(logits)
     exp = jnp.exp(shifted)
-    probabilities = exp / jnp.maximum(jnp.sum(exp), 1e-12)
-    uniform = jnp.full_like(probabilities, 1.0 / probabilities.shape[0])
-    return jnp.where(finite, probabilities, uniform)
+    return exp / jnp.maximum(jnp.sum(exp), 1e-12)
 
 
 def _masked_softmax(logits: Array, mask: Array) -> Array:
     active = mask > 0
-    n_active = jnp.maximum(jnp.sum(active.astype(jnp.float32)), 1.0)
-    uniform = jnp.where(active, 1.0 / n_active, 0.0)
-    uniform = jnp.where(jnp.any(active), uniform, jnp.full_like(logits, 1.0 / logits.shape[0]))
-    finite_active = jnp.all(jnp.where(active, jnp.isfinite(logits), True))
     masked = jnp.where(active, logits, -1.0e9)
     shifted = masked - jnp.max(masked)
     exp = jnp.where(active, jnp.exp(shifted), 0.0)
-    probabilities = exp / jnp.maximum(jnp.sum(exp), 1e-12)
-    return jnp.where(finite_active, probabilities, uniform)
+    return exp / jnp.maximum(jnp.sum(exp), 1e-12)
 
 
 def _cross_entropy_from_logits(logits: Array, label: Array) -> Array:
@@ -745,25 +775,19 @@ class AssociativeMemoryLearner:
             ],
             dtype=jnp.float32,
         )
-        accepted = (
-            jnp.all(jnp.isfinite(prediction.logits))
-            & jnp.all(jnp.isfinite(prediction.probabilities))
+        update_applied = (
+            floating_tree_is_finite(state)
+            & floating_tree_is_finite(prediction)
             & jnp.isfinite(loss)
-            & jnp.all(jnp.isfinite(next_state.values))
-            & jnp.all(jnp.isfinite(next_state.prior))
-            & jnp.all(jnp.isfinite(next_state.utility))
-            & jnp.isfinite(next_state.budget_logit)
+            & floating_tree_is_finite(next_state)
             & jnp.all(jnp.isfinite(metrics))
         )
-        committed = jax.lax.cond(accepted, lambda: next_state, lambda: state)
-        zero_metrics = jnp.zeros_like(metrics)
         return AssociativeMemoryUpdateResult(
-            state=committed,
-            predictions=jnp.where(
-                accepted, prediction.probabilities, jnp.zeros_like(prediction.probabilities)
-            ),
-            logits=jnp.where(accepted, prediction.logits, jnp.zeros_like(prediction.logits)),
-            metrics=jnp.where(accepted, metrics, zero_metrics),
+            state=select_transaction(update_applied, next_state, state),
+            predictions=neutralize_array(update_applied, prediction.probabilities),
+            logits=neutralize_array(update_applied, prediction.logits),
+            metrics=neutralize_array(update_applied, metrics),
+            update_applied=update_applied,
         )
 
 
@@ -778,12 +802,16 @@ def run_associative_memory_arrays(
     def step_fn(
         carry: AssociativeMemoryState,
         inputs: tuple[Array, Array],
-    ) -> tuple[AssociativeMemoryState, tuple[Array, Array]]:
+    ) -> tuple[AssociativeMemoryState, tuple[Array, Array, Array]]:
         context_t, label_t = inputs
         result = learner.update(carry, context_t, label_t)
-        return result.state, (result.predictions, result.metrics)
+        return result.state, (
+            result.predictions,
+            result.metrics,
+            result.update_applied,
+        )
 
-    final_state, (predictions, metrics) = jax.lax.scan(
+    final_state, (predictions, metrics, updates_applied) = jax.lax.scan(
         step_fn,
         state,
         (contexts, labels),
@@ -792,4 +820,5 @@ def run_associative_memory_arrays(
         state=final_state,
         predictions=predictions,
         metrics=metrics,
+        updates_applied=updates_applied,
     )
