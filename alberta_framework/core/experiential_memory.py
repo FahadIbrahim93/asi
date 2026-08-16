@@ -333,6 +333,29 @@ def _validate_config(config: ExperientialMemoryConfig) -> None:
         ("query neighbor diagnostics", 7 * config.top_k),
     ):
         _require_float32_allocation(f"ExperientialMemoryConfig {name}", scalars)
+    payload_values = config.observation_dim + config.action_dim + config.outcome_dim
+    # Conservative simultaneous query envelope, expressed as four-byte scalar
+    # equivalents.  It includes the persistent state plus every full-width
+    # logical temporary in _query_jit: row-finiteness predicates; safe keys,
+    # key differences and squares; safe payload matrices; nineteen capacity
+    # vectors; gathered values and their weighted products; top-k diagnostics;
+    # and reduced payload outputs.  Booleans can be smaller, but are charged at
+    # four bytes so this remains an upper bound across JAX backends.
+    query_temporary_scalars = (
+        config.capacity * vector_values
+        + 3 * config.capacity * config.key_dim
+        + config.capacity * payload_values
+        + 19 * config.capacity
+        + 2 * config.top_k * (payload_values + 4)
+        + 9 * config.top_k
+        + payload_values
+        + 4
+    )
+    if persistent_bytes + 4 * query_temporary_scalars > _INT32_MAX:
+        raise ValueError(
+            "ExperientialMemoryConfig aggregate query working-set bytes "
+            "must fit signed int32"
+        )
 
     object.__setattr__(
         config,
@@ -394,7 +417,10 @@ def _validate_config(config: ExperientialMemoryConfig) -> None:
         "recency_scale",
         _validated_config_float("recency_scale", config.recency_scale, positive=True),
     )
-    minimum_safe_scale = _INT32_MAX / float(np.finfo(np.float32).max)
+    rounded_boundary = np.float32(_INT32_MAX / float(np.finfo(np.float32).max))
+    minimum_safe_scale = float(
+        np.nextafter(rounded_boundary, np.float32(np.inf), dtype=np.float32)
+    )
     if config.staleness_scale < minimum_safe_scale:
         raise ValueError("staleness_scale must keep saturated age division finite in float32")
     if config.recency_scale < minimum_safe_scale:
