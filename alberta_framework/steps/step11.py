@@ -34,6 +34,7 @@ from typing import Any, cast
 
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 from jax import Array
 
 from alberta_framework.core.oak import (
@@ -166,6 +167,9 @@ class Step11OaKConfig:
 
 
 _INT32_MAX = 2**31 - 1
+_NUMPY_INTEGER_TYPES = frozenset(
+    np.dtype(code).type for code in ("b", "B", "h", "H", "i", "I", "l", "L", "q", "Q")
+)
 
 
 def _require_real(name: str, value: object) -> float:
@@ -209,9 +213,12 @@ def _require_int(
     maximum: int | None = None,
 ) -> int:
     actual_type = type(value)
-    if issubclass(actual_type, bool) or not issubclass(actual_type, Integral):
+    if actual_type is int:
+        number = cast(int, value)
+    elif actual_type in _NUMPY_INTEGER_TYPES:
+        number = int(cast(Integral, value))
+    else:
         raise ValueError(f"{name} must be an integer, got {value!r}")
-    number = int(cast(Integral, value))
     if minimum is not None and number < minimum:
         if minimum == 1:
             raise ValueError(f"{name} must be positive, got {value!r}")
@@ -240,7 +247,7 @@ def _validate_oak_facade_config(config: Step11OaKConfig) -> None:
         "option_planning_backups_per_step",
         config.option_planning_backups_per_step,
         minimum=0,
-        maximum=_INT32_MAX,
+        maximum=_INT32_MAX - 1,
     )
     if type(config.subtask_specs) is not tuple:
         raise ValueError(
@@ -248,7 +255,7 @@ def _validate_oak_facade_config(config: Step11OaKConfig) -> None:
         )
     canonical_specs: list[SubtaskSpec] = []
     for spec in config.subtask_specs:
-        if not isinstance(spec, SubtaskSpec):
+        if type(spec) is not SubtaskSpec:
             raise ValueError(f"subtask_specs must contain SubtaskSpec values, got {spec!r}")
         feature_index = _require_int(
             "feature_index",
