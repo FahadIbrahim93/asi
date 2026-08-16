@@ -24,18 +24,20 @@ from __future__ import annotations
 
 import dataclasses
 import functools
-import math
+import operator
 import time
 from collections.abc import Mapping
-from typing import Any, cast
+from typing import Any, SupportsIndex, cast
 
 import chex
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 from jax import Array
 from jaxtyping import Bool, Float, Int, UInt
 
+from alberta_framework.core._float32_scalars import validated_float32_scalar
 from alberta_framework.core.learners import _update_from_gradient_with_diagnostics
 from alberta_framework.core.multi_head_learner import MultiHeadMLPLearner, MultiHeadMLPState
 from alberta_framework.core.optimizers import Autostep, AutostepParamState, optimizer_from_config
@@ -45,6 +47,75 @@ from alberta_framework.core.update_safety import (
 
 _INT32_MAX = 2**31 - 1
 _UINT32_MAX = 2**32 - 1
+_ACTUAL_INT_TYPES = frozenset(
+    {
+        int,
+        np.int8,
+        np.int16,
+        np.int32,
+        np.int64,
+        np.uint8,
+        np.uint16,
+        np.uint32,
+        np.uint64,
+        np.longlong,
+        np.ulonglong,
+    }
+)
+
+
+def _require_int32(name: str, value: object, *, minimum: int, maximum: int = _INT32_MAX) -> int:
+    if type(value) not in _ACTUAL_INT_TYPES:
+        raise ValueError(f"{name} must be an integer in [{minimum}, {maximum}]")
+    canonical = operator.index(cast(SupportsIndex, value))
+    if not minimum <= canonical <= maximum:
+        raise ValueError(f"{name} must be an integer in [{minimum}, {maximum}]")
+    return canonical
+
+
+def _validate_hidden_sizes(hidden_sizes: object) -> tuple[int, ...]:
+    if type(hidden_sizes) is not tuple:
+        raise ValueError("hidden_sizes must be an actual tuple")
+    return tuple(_require_int32("hidden_sizes element", size, minimum=1) for size in hidden_sizes)
+
+
+def _decode_hidden_sizes(hidden_sizes: object) -> tuple[int, ...]:
+    if type(hidden_sizes) is not list:
+        raise ValueError("serialized hidden_sizes must be an actual list")
+    sequence = cast(list[object], hidden_sizes)
+    return _validate_hidden_sizes(tuple(sequence))
+
+
+def _require_state_resources(name: str, *, scalars: int, nbytes: int) -> None:
+    if scalars > _INT32_MAX:
+        raise ValueError(f"{name} state scalars must fit signed int32")
+    if nbytes > _INT32_MAX:
+        raise ValueError(f"{name} state bytes must fit signed int32")
+
+
+def _preflight_actor_state(n_actions: int, observation_dim: int, actor_dim: int) -> None:
+    actor_parameters = n_actions * actor_dim
+    float32_scalars = 4 * actor_parameters + 6 * n_actions + observation_dim + 8
+    scalar_count = float32_scalars + 5
+    _require_state_resources(
+        "average-reward actor-critic",
+        scalars=scalar_count,
+        nbytes=4 * scalar_count,
+    )
+
+
+def _preflight_differential_sarsa_state(n_actions: int, feature_dim: int) -> None:
+    parameters = n_actions * feature_dim
+    float32_scalars = 2 * parameters + 2 * n_actions + feature_dim + 2
+    # Two int32 leaves, a two-word RNG key, and a two-word lifetime counter.
+    scalar_count = float32_scalars + 6
+    _require_state_resources(
+        "differential SARSA",
+        scalars=scalar_count,
+        nbytes=4 * scalar_count,
+    )
+
+
 DIFFERENTIAL_SARSA_STATE_SCHEMA = "alberta.differential-sarsa-state.v2"
 DIFFERENTIAL_SARSA_LIFETIME_COUNTER_NBYTES = 12
 DIFFERENTIAL_SARSA_LIFETIME_COUNTER_DELTA_NBYTES = 8
@@ -335,20 +406,35 @@ class AverageRewardHordeActorCriticConfig:
 
     def __post_init__(self) -> None:
         """Validate scalar hyperparameters."""
-        if self.n_actions < 1:
-            raise ValueError("n_actions must be positive")
-        if self.critic_step_size < 0.0:
-            raise ValueError("critic_step_size must be non-negative")
-        if self.average_reward_step_size < 0.0:
-            raise ValueError("average_reward_step_size must be non-negative")
-        if self.temperature <= 0.0:
-            raise ValueError("temperature must be positive")
-        if not 0.0 <= self.epsilon <= 1.0:
-            raise ValueError("epsilon must be in [0, 1]")
-        if self.actor_update_clip <= 0.0:
-            raise ValueError("actor_update_clip must be positive")
-        if self.logit_clip <= 0.0:
-            raise ValueError("logit_clip must be positive")
+        object.__setattr__(
+            self,
+            "n_actions",
+            _require_int32("n_actions", self.n_actions, minimum=1),
+        )
+        object.__setattr__(
+            self,
+            "hidden_sizes",
+            _validate_hidden_sizes(self.hidden_sizes),
+        )
+        for name in ("critic_step_size", "average_reward_step_size"):
+            object.__setattr__(
+                self,
+                name,
+                validated_float32_scalar(name, getattr(self, name), lower=0.0),
+            )
+        for name in ("temperature", "actor_update_clip", "logit_clip"):
+            object.__setattr__(
+                self,
+                name,
+                validated_float32_scalar(name, getattr(self, name), positive=True),
+            )
+        object.__setattr__(
+            self,
+            "epsilon",
+            validated_float32_scalar("epsilon", self.epsilon, lower=0.0, upper=1.0),
+        )
+        if self.hidden_sizes:
+            _preflight_actor_state(self.n_actions, 1, self.hidden_sizes[-1])
 
     def to_config(self) -> dict[str, Any]:
         """Serialize this config to a dictionary."""
@@ -370,10 +456,16 @@ class AverageRewardHordeActorCriticConfig:
         config: dict[str, Any],
     ) -> AverageRewardHordeActorCriticConfig:
         """Reconstruct a config from :meth:`to_config` output."""
-        config = dict(config)
-        config.pop("type", None)
-        config["hidden_sizes"] = tuple(config["hidden_sizes"])
-        return cls(**config)
+        if type(config) is not dict:
+            raise ValueError("actor-critic config must be an actual dict")
+        payload = dict(config)
+        expected = {field.name for field in dataclasses.fields(cls)} | {"type"}
+        if set(payload) != expected:
+            raise ValueError("actor-critic config fields do not match its schema")
+        if payload.pop("type") != "AverageRewardHordeActorCriticConfig":
+            raise ValueError("actor-critic config type is invalid")
+        payload["hidden_sizes"] = _decode_hidden_sizes(payload["hidden_sizes"])
+        return cls(**payload)
 
 
 @chex.dataclass(frozen=True)
@@ -521,21 +613,27 @@ class AverageRewardHordeActorCriticAgent:
         config: dict[str, Any],
     ) -> AverageRewardHordeActorCriticAgent:
         """Reconstruct an agent from :meth:`to_config` output."""
-        config = dict(config)
-        config.pop("type", None)
-        cfg = AverageRewardHordeActorCriticConfig.from_config(config["config"])
-        actor_opt: Autostep | None = None
-        if config.get("actor_optimizer"):
-            actor_opt = cast(Autostep, optimizer_from_config(config["actor_optimizer"]))
+        if type(config) is not dict:
+            raise ValueError("actor-critic agent config must be an actual dict")
+        if set(config) != {"type", "config", "actor_optimizer"}:
+            raise ValueError("actor-critic agent config fields do not match its schema")
+        if config["type"] != "AverageRewardHordeActorCriticAgent":
+            raise ValueError("actor-critic agent config type is invalid")
+        nested = config["config"]
+        optimizer_config = config["actor_optimizer"]
+        if type(nested) is not dict or type(optimizer_config) is not dict:
+            raise ValueError("actor-critic nested configs must be actual dicts")
+        cfg = AverageRewardHordeActorCriticConfig.from_config(nested)
+        actor_opt = cast(Autostep, optimizer_from_config(optimizer_config))
         return cls(cfg, actor_optimizer=actor_opt)
 
     def init(self, observation_dim: int, key: Array) -> AverageRewardHordeActorCriticState:
         """Initialize critic and actor state."""
-        if observation_dim < 1:
-            raise ValueError("observation_dim must be positive")
+        observation_dim = _require_int32("observation_dim", observation_dim, minimum=1)
+        actor_dim = self._config.hidden_sizes[-1] if self._config.hidden_sizes else observation_dim
+        _preflight_actor_state(self._config.n_actions, observation_dim, actor_dim)
         key, critic_key = jr.split(key)
         critic_state = self._critic.init(observation_dim, critic_key)
-        actor_dim = self._config.hidden_sizes[-1] if self._config.hidden_sizes else observation_dim
         actor_opt_w = self._actor_optimizer.init_for_shape((self._config.n_actions, actor_dim))
         actor_opt_b = self._actor_optimizer.init_for_shape((self._config.n_actions,))
         initial_policy = jnp.full(
@@ -672,10 +770,7 @@ class AverageRewardHordeActorCriticAgent:
         next_observation: Array,
     ) -> AverageRewardHordeActorCriticUpdateResult:
         """Apply one average-reward actor-critic update."""
-        action_valid = (
-            (state.last_action >= 0)
-            & (state.last_action < self._config.n_actions)
-        )
+        action_valid = (state.last_action >= 0) & (state.last_action < self._config.n_actions)
         safe_last_action = jnp.clip(
             state.last_action,
             0,
@@ -710,21 +805,17 @@ class AverageRewardHordeActorCriticAgent:
         )
         grad_log_policy = score[:, None] * old_features[None, :]
         bias_grad = score
-        raw_w, new_opt_w, weight_update_applied = (
-            _update_from_gradient_with_diagnostics(
-                self._actor_optimizer,
-                state.actor_opt_w,
-                grad_log_policy,
-                error=actor_td_error,
-            )
+        raw_w, new_opt_w, weight_update_applied = _update_from_gradient_with_diagnostics(
+            self._actor_optimizer,
+            state.actor_opt_w,
+            grad_log_policy,
+            error=actor_td_error,
         )
-        raw_b, new_opt_b, bias_update_applied = (
-            _update_from_gradient_with_diagnostics(
-                self._actor_optimizer,
-                state.actor_opt_b,
-                bias_grad,
-                error=actor_td_error,
-            )
+        raw_b, new_opt_b, bias_update_applied = _update_from_gradient_with_diagnostics(
+            self._actor_optimizer,
+            state.actor_opt_b,
+            bias_grad,
+            error=actor_td_error,
         )
         weight_step = jnp.clip(
             actor_td_error * raw_w,
@@ -802,12 +893,8 @@ class AverageRewardHordeActorCriticAgent:
             ),
             actor_score_scale=jnp.where(update_applied, actor_score_scale, 0.0),
             td_error=jnp.where(update_applied, td_error, 0.0),
-            average_reward=jnp.where(
-                update_applied, critic_result.average_rewards[0], 0.0
-            ),
-            critic_prediction=jnp.where(
-                update_applied, critic_result.predictions[0], 0.0
-            ),
+            average_reward=jnp.where(update_applied, critic_result.average_rewards[0], 0.0),
+            critic_prediction=jnp.where(update_applied, critic_result.predictions[0], 0.0),
             update_applied=update_applied,
         )
 
@@ -922,9 +1009,7 @@ class AverageRewardHordeLearner:
         cumulants = jnp.asarray(cumulants)
         expected_shape = (self._n_demons,)
         if cumulants.shape != expected_shape:
-            raise ValueError(
-                f"cumulants must have shape {expected_shape}, got {cumulants.shape}"
-            )
+            raise ValueError(f"cumulants must have shape {expected_shape}, got {cumulants.shape}")
         next_predictions = self._learner.predict(state.learner_state, next_observation)
         # NaN remains the inactive-head sentinel. Other non-finite cumulants
         # are rejected per head and reported separately from inactivity.
@@ -1343,12 +1428,10 @@ def run_differential_td_from_arrays(
             result.update_applied,
         )
 
-    final_state, (predictions, td_errors, average_rewards, metrics, updates_applied) = (
-        jax.lax.scan(
-            _scan_fn,
-            state,
-            (observations, rewards, next_observations),
-        )
+    final_state, (predictions, td_errors, average_rewards, metrics, updates_applied) = jax.lax.scan(
+        _scan_fn,
+        state,
+        (observations, rewards, next_observations),
     )
     elapsed = time.time() - start
     final_state = final_state.replace(uptime_s=final_state.uptime_s + elapsed)
@@ -1585,30 +1668,36 @@ class DifferentialSARSAConfig:
 
     def __post_init__(self) -> None:
         """Validate scalar hyperparameters."""
-        if (
-            isinstance(self.n_actions, bool)
-            or not isinstance(self.n_actions, int)
-            or self.n_actions < 1
-        ):
-            raise ValueError("n_actions must be positive")
-        if not math.isfinite(self.q_step_size) or self.q_step_size < 0.0:
-            raise ValueError("q_step_size must be finite and non-negative")
-        if not math.isfinite(self.average_reward_step_size) or self.average_reward_step_size < 0.0:
-            raise ValueError("average_reward_step_size must be finite and non-negative")
-        if not math.isfinite(self.trace_decay) or not 0.0 <= self.trace_decay <= 1.0:
-            raise ValueError("trace_decay must be finite and lie in [0, 1]")
-        if not math.isfinite(self.epsilon_start) or not 0.0 <= self.epsilon_start <= 1.0:
-            raise ValueError("epsilon_start must be finite and lie in [0, 1]")
-        if not math.isfinite(self.epsilon_end) or not 0.0 <= self.epsilon_end <= 1.0:
-            raise ValueError("epsilon_end must be finite and lie in [0, 1]")
-        if (
-            isinstance(self.epsilon_decay_steps, bool)
-            or not isinstance(self.epsilon_decay_steps, int)
-            or self.epsilon_decay_steps < 0
-        ):
-            raise ValueError("epsilon_decay_steps must be non-negative")
-        if not isinstance(self.use_bias, bool):
+        object.__setattr__(
+            self,
+            "n_actions",
+            _require_int32("n_actions", self.n_actions, minimum=1),
+        )
+        object.__setattr__(
+            self,
+            "epsilon_decay_steps",
+            _require_int32("epsilon_decay_steps", self.epsilon_decay_steps, minimum=0),
+        )
+        for name in ("q_step_size", "average_reward_step_size"):
+            object.__setattr__(
+                self,
+                name,
+                validated_float32_scalar(name, getattr(self, name), lower=0.0),
+            )
+        for name in ("trace_decay", "epsilon_start", "epsilon_end"):
+            object.__setattr__(
+                self,
+                name,
+                validated_float32_scalar(
+                    name,
+                    getattr(self, name),
+                    lower=0.0,
+                    upper=1.0,
+                ),
+            )
+        if type(self.use_bias) is not bool:
             raise ValueError("use_bias must be boolean")
+        object.__setattr__(self, "use_bias", bool(self.use_bias))
 
     def to_config(self) -> dict[str, Any]:
         """Serialize this config to a dictionary."""
@@ -1627,10 +1716,19 @@ class DifferentialSARSAConfig:
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> DifferentialSARSAConfig:
         """Reconstruct a config from :meth:`to_config` output."""
-        config = dict(config)
-        config.pop("type", None)
-        config.setdefault("use_bias", True)
-        return cls(**config)
+        if type(config) is not dict:
+            raise ValueError("differential SARSA config must be an actual dict")
+        payload = dict(config)
+        expected = {field.name for field in dataclasses.fields(cls)} | {"type"}
+        # Historical configs predate the use_bias field and retain the documented
+        # compatibility default. No other schema omission is accepted.
+        if set(payload) == expected - {"use_bias"}:
+            payload["use_bias"] = True
+        elif set(payload) != expected:
+            raise ValueError("differential SARSA config fields do not match its schema")
+        if payload.pop("type") != "DifferentialSARSAConfig":
+            raise ValueError("differential SARSA config type is invalid")
+        return cls(**payload)
 
 
 @chex.dataclass(frozen=True)
@@ -1716,6 +1814,8 @@ class DifferentialSARSAAgent:
     @classmethod
     def from_config(cls, config: Mapping[str, Any]) -> DifferentialSARSAAgent:
         """Reconstruct an agent from :meth:`to_config` output."""
+        if type(config) is not dict:
+            raise ValueError("differential SARSA agent config must be an actual dict")
         payload = dict(config)
         if set(payload) != {"type", "state_schema", "config"}:
             raise ValueError(
@@ -1727,9 +1827,9 @@ class DifferentialSARSAAgent:
         if payload["state_schema"] != DIFFERENTIAL_SARSA_STATE_SCHEMA:
             raise ValueError("differential SARSA state schema is unsupported")
         nested = payload["config"]
-        if not isinstance(nested, Mapping):
-            raise ValueError("differential SARSA nested config must be a mapping")
-        return cls(DifferentialSARSAConfig.from_config(dict(nested)))
+        if type(nested) is not dict:
+            raise ValueError("differential SARSA nested config must be an actual dict")
+        return cls(DifferentialSARSAConfig.from_config(nested))
 
     def init(
         self,
@@ -1739,8 +1839,9 @@ class DifferentialSARSAAgent:
         average_reward: float = 0.0,
     ) -> DifferentialSARSAState:
         """Initialize Q weights, traces, reward-rate estimate, and RNG."""
-        if feature_dim < 1:
-            raise ValueError("feature_dim must be positive")
+        feature_dim = _require_int32("feature_dim", feature_dim, minimum=1)
+        _preflight_differential_sarsa_state(self._config.n_actions, feature_dim)
+        average_reward = validated_float32_scalar("average_reward", average_reward)
         cfg = self._config
         zeros_q = jnp.zeros((cfg.n_actions, feature_dim), dtype=jnp.float32)
         zeros_bias = jnp.zeros((cfg.n_actions,), dtype=jnp.float32)
@@ -1766,8 +1867,7 @@ class DifferentialSARSAAgent:
         q_weights = jnp.asarray(state.q_weights)
         if q_weights.ndim != 2 or q_weights.shape[0] != self._config.n_actions:
             raise ValueError(
-                "differential SARSA q_weights must have shape "
-                "(n_actions, feature_dim)"
+                "differential SARSA q_weights must have shape (n_actions, feature_dim)"
             )
         feature_dim = q_weights.shape[1]
         if feature_dim < 1:
@@ -1835,11 +1935,7 @@ class DifferentialSARSAAgent:
             value = jnp.asarray(leaf)
             if jnp.issubdtype(value.dtype, jnp.inexact):
                 checks.append(jnp.all(jnp.isfinite(value)))
-        return (
-            jnp.all(jnp.stack(checks))
-            if checks
-            else jnp.asarray(True, dtype=jnp.bool_)
-        )
+        return jnp.all(jnp.stack(checks)) if checks else jnp.asarray(True, dtype=jnp.bool_)
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def q_values(
@@ -1953,8 +2049,7 @@ class DifferentialSARSAAgent:
         raw_next_observation = jnp.asarray(next_observation)
         if raw_next_observation.shape != (feature_dim,):
             raise ValueError(
-                "differential SARSA next_observation must have shape "
-                f"({feature_dim},)"
+                f"differential SARSA next_observation must have shape ({feature_dim},)"
             )
         if not (
             jnp.issubdtype(raw_next_observation.dtype, jnp.floating)
@@ -1980,8 +2075,8 @@ class DifferentialSARSAAgent:
         ):
             raise TypeError("differential SARSA discount must be real numeric")
         discount_s = raw_discount.astype(jnp.float32)
-        proposed_step_words, lifetime_capacity_available = (
-            _checked_lifetime_words_increment(state.step_words)
+        proposed_step_words, lifetime_capacity_available = _checked_lifetime_words_increment(
+            state.step_words
         )
         lifetime_counter_valid = _lifetime_counter_valid(
             state.step_words,
@@ -2060,10 +2155,7 @@ class DifferentialSARSAAgent:
         )
         candidate_state_finite = self._candidate_finite(proposed_state)
         update_available = (
-            state_valid
-            & input_valid
-            & lifetime_capacity_available
-            & candidate_state_finite
+            state_valid & input_valid & lifetime_capacity_available & candidate_state_finite
         )
         new_state = jax.lax.cond(
             update_available,
@@ -2135,12 +2227,15 @@ def run_differential_sarsa_from_arrays(
             result.update_applied,
         )
 
-    final_state, (
-        q_values,
-        td_errors,
-        average_rewards,
-        actions,
-        updates_applied,
+    (
+        final_state,
+        (
+            q_values,
+            td_errors,
+            average_rewards,
+            actions,
+            updates_applied,
+        ),
     ) = jax.lax.scan(
         _scan_fn,
         state,

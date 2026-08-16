@@ -4,6 +4,7 @@ import chex
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 import pytest
 
 from alberta_framework import (
@@ -34,9 +35,7 @@ def test_differential_td_config_and_top_level_exports() -> None:
         average_reward_step_size=0.02,
         trace_decay=0.5,
     )
-    learner = DifferentialTDLearner.from_config(
-        DifferentialTDLearner(config).to_config()
-    )
+    learner = DifferentialTDLearner.from_config(DifferentialTDLearner(config).to_config())
 
     assert learner.config == config
     assert CoreDifferentialTDLearner is DifferentialTDLearner
@@ -109,9 +108,7 @@ def test_differential_td_infinite_reward_does_not_poison_weights() -> None:
     assert float(poisoned.td_error) == 0.0
     chex.assert_trees_all_close(poisoned.metrics, jnp.zeros_like(poisoned.metrics))
 
-    recovered = learner.update(
-        poisoned.state, obs, jnp.array(1.0, dtype=jnp.float32), nxt
-    )
+    recovered = learner.update(poisoned.state, obs, jnp.array(1.0, dtype=jnp.float32), nxt)
     chex.assert_tree_all_finite(recovered.state.weights)
     chex.assert_tree_all_finite(recovered.state.average_reward)
     assert int(recovered.state.step_count) == int(state.step_count) + 1
@@ -136,9 +133,7 @@ def test_differential_gtd_infinite_reward_does_not_poison_weights() -> None:
     assert float(poisoned.td_error) == 0.0
     chex.assert_trees_all_close(poisoned.metrics, jnp.zeros_like(poisoned.metrics))
 
-    recovered = learner.update(
-        poisoned.state, obs, jnp.array(1.0, dtype=jnp.float32), nxt, rho
-    )
+    recovered = learner.update(poisoned.state, obs, jnp.array(1.0, dtype=jnp.float32), nxt, rho)
     chex.assert_tree_all_finite(recovered.state.weights)
     chex.assert_tree_all_finite(recovered.state.secondary_weights)
     assert bool(recovered.update_applied)
@@ -162,12 +157,8 @@ def test_average_reward_horde_infinite_cumulant_does_not_poison_rbar() -> None:
     obs = jnp.ones(3, dtype=jnp.float32)
     nxt = jnp.ones(3, dtype=jnp.float32)
 
-    poisoned = learner.update(
-        state, obs, jnp.array([jnp.inf, 1.0], dtype=jnp.float32), nxt
-    )
-    chex.assert_trees_all_close(
-        poisoned.average_rewards[0], state.average_rewards[0]
-    )
+    poisoned = learner.update(state, obs, jnp.array([jnp.inf, 1.0], dtype=jnp.float32), nxt)
+    chex.assert_trees_all_close(poisoned.average_rewards[0], state.average_rewards[0])
     assert bool(jnp.isfinite(poisoned.average_rewards[1]))
     assert int(poisoned.state.step_count) == 1
     assert bool(poisoned.update_applied)
@@ -177,9 +168,7 @@ def test_average_reward_horde_infinite_cumulant_does_not_poison_rbar() -> None:
     )
     assert float(poisoned.td_errors[0]) == 0.0
 
-    recovered = learner.update(
-        poisoned.state, obs, jnp.array([0.5, 1.0], dtype=jnp.float32), nxt
-    )
+    recovered = learner.update(poisoned.state, obs, jnp.array([0.5, 1.0], dtype=jnp.float32), nxt)
     chex.assert_tree_all_finite(recovered.average_rewards)
     assert int(recovered.state.step_count) == 2
     assert bool(recovered.update_applied)
@@ -244,9 +233,7 @@ def test_differential_gtd_config_roundtrip_and_ratio_clipping() -> None:
         trace_decay=0.3,
         ratio_clip=1.5,
     )
-    learner = DifferentialGTDLearner.from_config(
-        DifferentialGTDLearner(config).to_config()
-    )
+    learner = DifferentialGTDLearner.from_config(DifferentialGTDLearner(config).to_config())
     state = learner.init(1)
 
     result = learner.update(
@@ -435,9 +422,7 @@ def test_average_reward_horde_actor_critic_rejects_nonfinite_reward() -> None:
     )
 
     assert not bool(result.update_applied)
-    chex.assert_trees_all_equal(
-        jr.key_data(result.state.rng_key), jr.key_data(state.rng_key)
-    )
+    chex.assert_trees_all_equal(jr.key_data(result.state.rng_key), jr.key_data(state.rng_key))
     chex.assert_trees_all_close(
         result.state.replace(rng_key=jr.key_data(result.state.rng_key)),
         state.replace(rng_key=jr.key_data(state.rng_key)),
@@ -499,9 +484,7 @@ def test_average_reward_actor_critic_score_matches_mixture_derivative(
         temperature=0.7,
     )
     agent = AverageRewardHordeActorCriticAgent(config)
-    initial = agent.init(2, jr.key(4)).replace(
-        actor_bias=jnp.array([1.0, -1.0], dtype=jnp.float32)
-    )
+    initial = agent.init(2, jr.key(4)).replace(actor_bias=jnp.array([1.0, -1.0], dtype=jnp.float32))
     observation = jnp.array([1.0, -0.5], dtype=jnp.float32)
     state, _ = agent.start(initial, observation)
     stored = state.last_policy_sample
@@ -511,11 +494,7 @@ def test_average_reward_actor_critic_score_matches_mixture_derivative(
         jnp.array(1.0, dtype=jnp.float32),
         jnp.array([-0.25, 0.75], dtype=jnp.float32),
     )
-    expected_scale = (
-        (1.0 - epsilon)
-        * stored.target_probability
-        / stored.behavior_probability
-    )
+    expected_scale = (1.0 - epsilon) * stored.target_probability / stored.behavior_probability
     chex.assert_trees_all_close(result.actor_score_scale, expected_scale)
 
     # Finite-difference d log(mu_a) / d target-logit_a agrees with the
@@ -530,9 +509,7 @@ def test_average_reward_actor_critic_score_matches_mixture_derivative(
         return jnp.log(behavior[action])
 
     finite_difference = jax.grad(selected_log_behavior)(bias[action])
-    expected_component = expected_scale * (
-        1.0 - stored.target_policy[action]
-    ) / config.temperature
+    expected_component = expected_scale * (1.0 - stored.target_policy[action]) / config.temperature
     chex.assert_trees_all_close(
         finite_difference,
         expected_component,
@@ -760,9 +737,7 @@ def test_differential_sarsa_update_and_scan_are_finite() -> None:
     chex.assert_shape(result.average_rewards, (4,))
     chex.assert_shape(result.actions, (4,))
     assert int(result.state.step_count) == 4
-    chex.assert_tree_all_finite(
-        (result.q_values, result.td_errors, result.average_rewards)
-    )
+    chex.assert_tree_all_finite((result.q_values, result.td_errors, result.average_rewards))
     assert bool(jnp.all(result.actions >= 0))
     assert bool(jnp.all(result.actions < 3))
 
@@ -791,3 +766,184 @@ def test_differential_sarsa_learns_better_action_on_continuing_bandit() -> None:
     q_values = agent.q_values(state, obs)
     assert float(q_values[1]) > float(q_values[0]) + 0.25
     assert float(state.average_reward) > 0.75
+
+
+def test_average_reward_horde_actor_critic_config_scalar_validation() -> None:
+    with pytest.raises(ValueError, match="n_actions"):
+        AverageRewardHordeActorCriticConfig(n_actions=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="n_actions"):
+        AverageRewardHordeActorCriticConfig(n_actions=2.5)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="hidden_sizes"):
+        AverageRewardHordeActorCriticConfig(n_actions=2, hidden_sizes=(True,))  # type: ignore[arg-type]
+
+    cfg = AverageRewardHordeActorCriticConfig(
+        n_actions=np.int32(4),
+        hidden_sizes=(np.int32(32), np.int64(16)),
+    )
+    assert type(cfg.n_actions) is int
+    assert type(cfg.hidden_sizes[0]) is int
+    assert type(cfg.hidden_sizes[1]) is int
+    assert cfg.n_actions == 4
+    assert cfg.hidden_sizes == (32, 16)
+
+
+def test_differential_sarsa_config_scalar_validation() -> None:
+    with pytest.raises(ValueError, match="n_actions"):
+        DifferentialSARSAConfig(n_actions=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="n_actions"):
+        DifferentialSARSAConfig(n_actions=2.5)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="epsilon_decay_steps"):
+        DifferentialSARSAConfig(n_actions=2, epsilon_decay_steps=True)  # type: ignore[arg-type]
+
+    cfg = DifferentialSARSAConfig(
+        n_actions=np.int32(3),
+        epsilon_decay_steps=np.int64(100),
+    )
+    assert type(cfg.n_actions) is int
+    assert type(cfg.epsilon_decay_steps) is int
+    assert cfg.n_actions == 3
+    assert cfg.epsilon_decay_steps == 100
+
+
+_NUMPY_INTEGER_TYPES = tuple(dict.fromkeys(np.dtype(code).type for code in "bhilqBHILQpP"))
+
+
+@pytest.mark.parametrize("integer_type", _NUMPY_INTEGER_TYPES)
+def test_average_reward_configs_canonicalize_all_numpy_integer_families(
+    integer_type: type[np.integer],
+) -> None:
+    actor = AverageRewardHordeActorCriticConfig(
+        n_actions=integer_type(2),
+        hidden_sizes=(integer_type(3),),
+    )
+    sarsa = DifferentialSARSAConfig(
+        n_actions=integer_type(2),
+        epsilon_decay_steps=integer_type(3),
+    )
+
+    assert type(actor.n_actions) is int
+    assert type(actor.hidden_sizes[0]) is int
+    assert type(sarsa.n_actions) is int
+    assert type(sarsa.epsilon_decay_steps) is int
+
+
+def test_average_reward_configs_reject_hostile_integer_and_container_types() -> None:
+    class HostileInt(int):
+        def __repr__(self) -> str:
+            raise AssertionError("repr must not run")
+
+    class TupleSubclass(tuple):
+        pass
+
+    with pytest.raises(ValueError, match="n_actions"):
+        AverageRewardHordeActorCriticConfig(n_actions=HostileInt(2))
+    with pytest.raises(ValueError, match="hidden_sizes"):
+        AverageRewardHordeActorCriticConfig(n_actions=2, hidden_sizes=TupleSubclass((3,)))
+    payload = AverageRewardHordeActorCriticConfig(n_actions=2).to_config()
+    payload["hidden_sizes"] = "16"
+    with pytest.raises(ValueError, match="hidden_sizes"):
+        AverageRewardHordeActorCriticConfig.from_config(payload)
+
+
+def test_average_reward_decoders_reject_schema_and_container_ambiguity() -> None:
+    class DictSubclass(dict[str, object]):
+        pass
+
+    actor_config = AverageRewardHordeActorCriticConfig(n_actions=2).to_config()
+    with pytest.raises(ValueError, match="actual dict"):
+        AverageRewardHordeActorCriticConfig.from_config(DictSubclass(actor_config))  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="fields"):
+        AverageRewardHordeActorCriticConfig.from_config({**actor_config, "extra": 1})
+    with pytest.raises(ValueError, match="type"):
+        AverageRewardHordeActorCriticConfig.from_config({**actor_config, "type": "wrong"})
+    with pytest.raises(ValueError, match="serialized hidden_sizes"):
+        AverageRewardHordeActorCriticConfig.from_config(
+            {**actor_config, "hidden_sizes": tuple(actor_config["hidden_sizes"])}
+        )
+
+    actor_agent = AverageRewardHordeActorCriticAgent(
+        AverageRewardHordeActorCriticConfig(n_actions=2)
+    ).to_config()
+    with pytest.raises(ValueError, match="actual dict"):
+        AverageRewardHordeActorCriticAgent.from_config(DictSubclass(actor_agent))  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="nested configs"):
+        AverageRewardHordeActorCriticAgent.from_config(
+            {**actor_agent, "config": DictSubclass(actor_agent["config"])}  # type: ignore[arg-type]
+        )
+
+    sarsa_config = DifferentialSARSAConfig(n_actions=2).to_config()
+    with pytest.raises(ValueError, match="actual dict"):
+        DifferentialSARSAConfig.from_config(DictSubclass(sarsa_config))  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="fields"):
+        DifferentialSARSAConfig.from_config({**sarsa_config, "extra": 1})
+    with pytest.raises(ValueError, match="type"):
+        DifferentialSARSAConfig.from_config({**sarsa_config, "type": "wrong"})
+
+    sarsa_agent = DifferentialSARSAAgent(DifferentialSARSAConfig(n_actions=2)).to_config()
+    with pytest.raises(ValueError, match="actual dict"):
+        DifferentialSARSAAgent.from_config(DictSubclass(sarsa_agent))
+    with pytest.raises(ValueError, match="nested config"):
+        DifferentialSARSAAgent.from_config(
+            {**sarsa_agent, "config": DictSubclass(sarsa_agent["config"])}  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.parametrize(
+    ("config_type", "field", "value"),
+    (
+        (AverageRewardHordeActorCriticConfig, "temperature", 0.0),
+        (AverageRewardHordeActorCriticConfig, "epsilon", 1.0 + 1.0e-10),
+        (AverageRewardHordeActorCriticConfig, "critic_step_size", 1.0e100),
+        (DifferentialSARSAConfig, "q_step_size", -1.0),
+        (DifferentialSARSAConfig, "trace_decay", 1.0 + 1.0e-10),
+        (DifferentialSARSAConfig, "epsilon_start", 1.0e100),
+        (DifferentialSARSAConfig, "use_bias", np.bool_(True)),
+    ),
+)
+def test_average_reward_configs_reject_invalid_float32_sink_values(
+    config_type: type,
+    field: str,
+    value: object,
+) -> None:
+    kwargs = {"n_actions": 2, field: value}
+    with pytest.raises(ValueError, match=field):
+        config_type(**kwargs)
+
+
+def test_average_reward_configs_canonicalize_float32_sink_values() -> None:
+    actor = AverageRewardHordeActorCriticConfig(
+        n_actions=2,
+        critic_step_size=np.float64(0.2),
+    )
+    sarsa = DifferentialSARSAConfig(
+        n_actions=2,
+        epsilon_start=np.float64(0.2),
+    )
+
+    assert type(actor.critic_step_size) is float
+    assert actor.critic_step_size == float(np.float32(0.2))
+    assert type(sarsa.epsilon_start) is float
+    assert sarsa.epsilon_start == float(np.float32(0.2))
+
+
+def test_average_reward_actor_preflights_state_before_allocation() -> None:
+    last_legal_n_actions = (2**29 - 1 - 14) // 10
+    AverageRewardHordeActorCriticConfig(
+        n_actions=last_legal_n_actions,
+        hidden_sizes=(1,),
+    )
+    with pytest.raises(ValueError, match="state bytes"):
+        AverageRewardHordeActorCriticConfig(
+            n_actions=last_legal_n_actions + 1,
+            hidden_sizes=(1,),
+        )
+
+
+def test_differential_sarsa_preflights_state_before_allocation() -> None:
+    agent = DifferentialSARSAAgent(DifferentialSARSAConfig(n_actions=1))
+    last_legal_feature_dim = (2**29 - 1 - 10) // 3
+
+    with pytest.raises(ValueError, match="state bytes"):
+        agent.init(last_legal_feature_dim + 1, jr.key(0))
+    with pytest.raises(ValueError, match="feature_dim"):
+        agent.init(True, jr.key(0))  # type: ignore[arg-type]
