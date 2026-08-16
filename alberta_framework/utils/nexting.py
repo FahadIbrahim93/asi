@@ -32,6 +32,8 @@ References:
 
 from __future__ import annotations
 
+from functools import partial
+
 import jax
 import jax.numpy as jnp
 from jax import Array
@@ -174,6 +176,67 @@ def _finite_rmse_jvp(
     return rmse, rmse_dot
 
 
+def _sliding_sum(values: Array, window_size: int) -> Array:
+    prefix = jnp.cumsum(
+        jnp.concatenate(
+            [jnp.zeros((1, values.shape[1]), dtype=values.dtype), values],
+            axis=0,
+        ),
+        axis=0,
+    )
+    return prefix[window_size:] - prefix[:-window_size]
+
+
+def _pad_running_window(values: Array, window_size: int) -> Array:
+    pad = jnp.broadcast_to(values[0], (window_size - 1, values.shape[1]))
+    return jnp.concatenate([pad, values], axis=0)
+
+
+def _scaled_running_rmse_terms(
+    errors: Array, window_size: int
+) -> tuple[Array, Array, Array]:
+    """Return one global power-of-two scale and stable sliding RMS terms."""
+    scale = jnp.max(jnp.abs(errors), axis=0)
+    _, exponent = jnp.frexp(scale)
+    scaled_errors = jnp.ldexp(errors, -exponent)
+    scaled_window = _sliding_sum(scaled_errors**2, window_size)
+    scaled_running = jnp.sqrt(scaled_window / window_size)
+    return exponent, scaled_errors, scaled_running
+
+
+@partial(jax.custom_jvp, nondiff_argnums=(1,))
+def _finite_running_rmse(errors: Array, window_size: int) -> Array:
+    """Compute a finite sliding RMSE with a scale-free derivative."""
+    exponent, _, scaled_running = _scaled_running_rmse_terms(errors, window_size)
+    return _pad_running_window(jnp.ldexp(scaled_running, exponent), window_size)
+
+
+@_finite_running_rmse.defjvp
+def _finite_running_rmse_jvp(
+    window_size: int,
+    primals: tuple[Array],
+    tangents: tuple[Array],
+) -> tuple[Array, Array]:
+    (errors,), (errors_dot,) = primals, tangents
+    exponent, scaled_errors, scaled_running = _scaled_running_rmse_terms(
+        errors, window_size
+    )
+    running = _pad_running_window(
+        jnp.ldexp(scaled_running, exponent), window_size
+    )
+    safe_scaled_running = jnp.where(
+        scaled_running > 0.0,
+        scaled_running,
+        jnp.ones_like(scaled_running),
+    )
+    numerator = _sliding_sum(scaled_errors * errors_dot, window_size) / window_size
+    running_dot = _pad_running_window(
+        numerator / safe_scaled_running,
+        window_size,
+    )
+    return running, running_dot
+
+
 def per_horizon_rmse(
     predictions: Float[Array, "T H"],
     forward_returns: Float[Array, "T H"],
@@ -263,15 +326,11 @@ def per_horizon_running_rmse(
             f"(got window_size={window_size}, n_steps={n_steps})"
         )
     errors = predictions - forward_returns
-    scale = jnp.max(jnp.abs(errors), axis=0)
-    _, exponent = jnp.frexp(scale)
-    scaled_errors = jnp.ldexp(errors, -exponent)
-    sq_err = scaled_errors**2  # (T, H)
-    cumsum = jnp.cumsum(
-        jnp.concatenate([jnp.zeros((1, sq_err.shape[1]), dtype=sq_err.dtype), sq_err]),
-        axis=0,
+    finite_columns = jnp.all(jnp.isfinite(errors), axis=0)
+    safe_errors = jnp.where(finite_columns[None, :], errors, jnp.zeros_like(errors))
+    stable_running = _finite_running_rmse(safe_errors, window_size)
+    nonfinite = jnp.broadcast_to(
+        jnp.max(jnp.abs(errors), axis=0),
+        stable_running.shape,
     )
-    window = cumsum[window_size:] - cumsum[:-window_size]
-    running = jnp.ldexp(jnp.sqrt(window / window_size), exponent)
-    pad = jnp.broadcast_to(running[0], (window_size - 1, sq_err.shape[1]))
-    return jnp.concatenate([pad, running], axis=0)
+    return jnp.where(finite_columns[None, :], stable_running, nonfinite)
