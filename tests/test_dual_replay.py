@@ -597,6 +597,16 @@ def test_config_canonicalizes_real_scalars_and_preserves_builtin_payload() -> No
     assert builtin.config.surprise_weight == 0.1
     assert builtin.config.coverage_weight == 0.2
     assert builtin.config.progress_weight == 0.4
+    integer = _strict_memory(
+        surprise_weight=2**54 + 1,
+        calibrated_priority_threshold=0,
+    )
+    assert type(integer.config.surprise_weight) is int
+    assert integer.config.surprise_weight == 2**54 + 1
+    assert type(integer.config.calibrated_priority_threshold) is int
+    assert integer.config.calibrated_priority_threshold == 0
+    assert integer.to_config()["config"]["surprise_weight"] == 2**54 + 1
+    assert integer.to_config()["config"]["calibrated_priority_threshold"] == 0
     canonical = _strict_memory(
         surprise_weight=np.float64(0.25),
         coverage_weight=np.int64(1),

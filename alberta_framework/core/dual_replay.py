@@ -465,7 +465,7 @@ def _require_float32_real(
     number = float(value)
     with np.errstate(invalid="ignore", over="ignore", under="ignore"):
         renarrowed = float(np.float32(number))
-    return number if narrowed == renarrowed else narrowed
+    return cast(float, value) if narrowed == renarrowed else narrowed
 
 
 def _validate_positive_int(name: str, value: object) -> int:
