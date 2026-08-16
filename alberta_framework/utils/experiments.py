@@ -15,7 +15,7 @@ Two conventions matter for downstream analysis:
 """
 
 import math
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from decimal import Decimal
 from fractions import Fraction
 from typing import Any, NamedTuple, NoReturn, cast
@@ -60,6 +60,14 @@ _NUMPY_COORDINATE_TYPES = frozenset(
 )
 
 
+def _type_identity_in(
+    value_type: type[object],
+    candidates: Iterable[type[object]],
+) -> bool:
+    """Match an untrusted runtime type without metaclass equality or hashing."""
+    return any(value_type is candidate for candidate in candidates)
+
+
 class _CanonicalFractionCoordinate(tuple[int, int]):
     """An intrinsically immutable rational key with Fraction hash semantics."""
 
@@ -97,7 +105,7 @@ class _CanonicalFractionCoordinate(tuple[int, int]):
                 self.numerator == coordinate.numerator
                 and self.denominator == coordinate.denominator
             )
-        if other_type in (bool, int, float, complex, Decimal, Fraction):
+        if _type_identity_in(other_type, (bool, int, float, complex, Decimal, Fraction)):
             return bool(self._as_fraction() == other)
         return False
 
@@ -597,8 +605,9 @@ def _require_hyperparameter_coordinate(
     Accepted coordinates are exact immutable Python scalar types, ``Decimal``,
     ``Fraction``, supported exact NumPy scalar types, and exact ``tuple`` or
     ``frozenset`` compositions of those types. User-defined subclasses and keys
-    are deliberately excluded because calling their conversion, equality, or hash
-    methods cannot establish a durable dictionary-key contract.
+    are deliberately excluded with identity-only type matching because calling
+    their metaclass, conversion, equality, or hash hooks cannot establish a durable
+    dictionary-key contract.
     """
 
     def reject() -> NoReturn:
@@ -610,7 +619,7 @@ def _require_hyperparameter_coordinate(
         )
 
     value_type = type(value)
-    if value_type in (tuple, frozenset):
+    if _type_identity_in(value_type, (tuple, frozenset)):
         if nesting_depth >= _MAX_HYPERPARAMETER_COORDINATE_NESTING:
             raise ValueError(
                 "param_extractor returned an over-nested coordinate for "
@@ -641,8 +650,11 @@ def _require_hyperparameter_coordinate(
 
     if value_type is Fraction:
         fraction = cast(Fraction, value)
-        numerator = fraction.numerator
-        denominator = fraction.denominator
+        try:
+            numerator = fraction.numerator
+            denominator = fraction.denominator
+        except AttributeError:
+            reject()
         if (
             type(numerator) is not int
             or type(denominator) is not int
@@ -651,7 +663,7 @@ def _require_hyperparameter_coordinate(
             reject()
         return _CanonicalFractionCoordinate(numerator, denominator)
 
-    if value is None or value_type in (bool, int, str, bytes):
+    if value is None or _type_identity_in(value_type, (bool, int, str, bytes)):
         return value
 
     if value_type is float:
@@ -670,7 +682,7 @@ def _require_hyperparameter_coordinate(
             reject()
         return value
 
-    if value_type in _NUMPY_COORDINATE_TYPES:
+    if _type_identity_in(value_type, _NUMPY_COORDINATE_TYPES):
         if np.dtype(value_type).kind in ("f", "c") and not bool(
             np.isfinite(cast(Any, value))
         ):
@@ -692,11 +704,13 @@ def _require_coordinate_hash(value: object, *, name: str) -> int:
 
 
 def _is_python_numeric_coordinate_type(value_type: type[object]) -> bool:
-    return value_type in _PYTHON_NUMERIC_COORDINATE_TYPES
+    return _type_identity_in(value_type, _PYTHON_NUMERIC_COORDINATE_TYPES)
 
 
 def _is_numpy_numeric_coordinate_type(value_type: type[object]) -> bool:
-    return value_type in _NUMPY_COORDINATE_TYPES and np.dtype(value_type).kind in (
+    return _type_identity_in(value_type, _NUMPY_COORDINATE_TYPES) and np.dtype(
+        value_type
+    ).kind in (
         "b",
         "i",
         "u",
@@ -727,7 +741,9 @@ def _coordinate_pair_is_compatible(left: object, right: object) -> bool:
             for right_item in right_set
         )
 
-    if left_type in (tuple, frozenset) or right_type in (tuple, frozenset):
+    if _type_identity_in(left_type, (tuple, frozenset)) or _type_identity_in(
+        right_type, (tuple, frozenset)
+    ):
         return False
 
     if left_type is right_type:
@@ -778,9 +794,13 @@ def _coordinate_values_equal(left: object, right: object) -> bool:
                 return False
         return True
 
-    if left_type in _STRING_COORDINATE_TYPES and right_type in _STRING_COORDINATE_TYPES:
+    if _type_identity_in(left_type, _STRING_COORDINATE_TYPES) and _type_identity_in(
+        right_type, _STRING_COORDINATE_TYPES
+    ):
         return bool(left == right)
-    if left_type in _BYTES_COORDINATE_TYPES and right_type in _BYTES_COORDINATE_TYPES:
+    if _type_identity_in(left_type, _BYTES_COORDINATE_TYPES) and _type_identity_in(
+        right_type, _BYTES_COORDINATE_TYPES
+    ):
         return bool(left == right)
     if left_type is right_type or (
         _is_python_numeric_coordinate_type(left_type)

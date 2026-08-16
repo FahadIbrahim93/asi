@@ -663,6 +663,113 @@ def test_extract_hyperparameter_results_snapshots_fraction_before_private_mutati
     assert extracted[expected_coordinates[1]] == (2.0, 0.0)
 
 
+def test_extract_hyperparameter_results_rejects_delayed_hash_metaclass_spoof() -> None:
+    metaclass_calls: list[str] = []
+
+    class NumpyIntegerSpoof(type):
+        def __hash__(cls) -> int:
+            metaclass_calls.append("hash")
+            return hash(np.int64)
+
+        def __eq__(cls, other: object) -> bool:
+            metaclass_calls.append("eq")
+            return other is np.int64
+
+    class DelayedHash(metaclass=NumpyIntegerSpoof):
+        def __init__(self) -> None:
+            self.hash_calls = 0
+
+        def __hash__(self) -> int:
+            self.hash_calls += 1
+            return 100 + self.hash_calls
+
+        def __eq__(self, other: object) -> bool:
+            return self is other
+
+    coordinate = DelayedHash()
+
+    with pytest.raises(ValueError, match=r"noncanonical coordinate"):
+        extract_hyperparameter_results(
+            {"candidate": _flat_trace("candidate", 1.0)},
+            param_extractor=lambda _: coordinate,
+        )
+
+    assert metaclass_calls == []
+    assert coordinate.hash_calls == 0
+
+
+@pytest.mark.parametrize("nesting", ["scalar", "tuple", "frozenset"])
+def test_extract_hyperparameter_results_rejects_raising_metaclass_without_hooks(
+    nesting: str,
+) -> None:
+    metaclass_calls: list[str] = []
+
+    class RaisingMetaclass(type):
+        def __hash__(cls) -> int:
+            metaclass_calls.append("hash")
+            raise RuntimeError("metaclass hash must not run")
+
+        def __eq__(cls, other: object) -> bool:
+            metaclass_calls.append("eq")
+            raise RuntimeError("metaclass equality must not run")
+
+    class Coordinate(metaclass=RaisingMetaclass):
+        pass
+
+    coordinate = _nested_fraction_coordinate(Coordinate(), nesting)
+    metaclass_calls.clear()
+
+    with pytest.raises(ValueError, match=r"noncanonical coordinate"):
+        extract_hyperparameter_results(
+            {"candidate": _flat_trace("candidate", 1.0)},
+            param_extractor=lambda _: coordinate,
+        )
+
+    assert metaclass_calls == []
+
+
+def test_canonical_fraction_comparison_does_not_run_hostile_metaclass_equality() -> None:
+    metaclass_calls: list[str] = []
+
+    class RaisingMetaclass(type):
+        def __eq__(cls, other: object) -> bool:
+            metaclass_calls.append("eq")
+            raise RuntimeError("metaclass equality must not run")
+
+    class Coordinate(metaclass=RaisingMetaclass):
+        pass
+
+    extracted = extract_hyperparameter_results(
+        {"candidate": _flat_trace("candidate", 1.0)},
+        param_extractor=lambda _: Fraction(1, 2),
+    )
+    canonical_fraction = next(iter(extracted))
+    hostile = Coordinate()
+
+    assert (canonical_fraction == hostile) is False
+    assert (hostile == canonical_fraction) is False
+    assert (canonical_fraction != hostile) is True
+    assert (hostile != canonical_fraction) is True
+    assert metaclass_calls == []
+
+
+@pytest.mark.parametrize("nesting", ["scalar", "tuple", "frozenset"])
+@pytest.mark.parametrize("component", ["numerator", "denominator"])
+def test_extract_hyperparameter_results_normalizes_missing_fraction_slots(
+    nesting: str,
+    component: str,
+) -> None:
+    fraction = Fraction(1, 2)
+    coordinate = _nested_fraction_coordinate(fraction, nesting)
+    object.__delattr__(fraction, f"_{component}")
+
+    with pytest.raises(ValueError, match=r"noncanonical coordinate"):
+        extract_hyperparameter_results(
+            {"candidate": _flat_trace("candidate", 1.0)},
+            param_extractor=lambda _: coordinate,
+        )
+
+
 @pytest.mark.parametrize(
     "coordinates",
     [
