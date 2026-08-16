@@ -6,6 +6,7 @@ import chex
 import jax.numpy as jnp
 import numpy as np
 import pytest
+
 from alberta_framework.core.reward_model import RLSRewardModel, RLSRewardModelConfig
 
 
@@ -80,6 +81,17 @@ def test_rls_reward_model_rejects_non_builtin_feature_dim(value: object) -> None
         RLSRewardModel(RLSRewardModelConfig.from_config(payload))
 
 
+class _FloatSpoof:
+    """Non-real object that spoofs ``float`` through ``__class__``."""
+
+    @property
+    def __class__(self) -> type[float]:  # type: ignore[override]
+        return float
+
+    def __float__(self) -> float:
+        return 0.5
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
@@ -98,6 +110,9 @@ def test_rls_reward_model_rejects_non_builtin_feature_dim(value: object) -> None
         ("error_decay", float("nan")),
         ("error_decay", float("inf")),
         ("error_decay", float("-inf")),
+        ("forgetting", _FloatSpoof()),
+        ("ridge", _FloatSpoof()),
+        ("error_decay", _FloatSpoof()),
     ],
 )
 def test_rls_reward_model_rejects_non_real_or_non_finite_scalars(

@@ -17,7 +17,7 @@ import functools
 import math
 from dataclasses import dataclass
 from numbers import Real
-from typing import Any
+from typing import Any, cast
 
 import chex
 import jax
@@ -28,9 +28,10 @@ from jaxtyping import Bool, Float
 
 def _finite_real(name: str, value: object) -> float:
     """Return a finite real configuration value without accepting booleans."""
-    if isinstance(value, bool) or not isinstance(value, Real):
+    actual_type = type(value)
+    if issubclass(actual_type, bool) or not issubclass(actual_type, Real):
         raise ValueError(f"{name} must be a real number")
-    concrete = float(value)
+    concrete = float(cast(Real, value))
     if not math.isfinite(concrete):
         raise ValueError(f"{name} must be finite")
     return concrete
