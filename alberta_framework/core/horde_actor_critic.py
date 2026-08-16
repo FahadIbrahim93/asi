@@ -76,6 +76,9 @@ _ACTUAL_INT_TYPES = frozenset(
         np.ulonglong,
     }
 )
+_ACTUAL_FLOAT_TYPES = frozenset(
+    {float, *(np.dtype(code).type for code in ("e", "f", "d", "g"))}
+)
 
 
 def _require_int32(name: str, value: object, *, minimum: int, maximum: int = _INT32_MAX) -> int:
@@ -93,6 +96,73 @@ def _validate_hidden_sizes(sizes: object) -> tuple[int, ...]:
     return tuple(
         _require_int32(f"hidden_sizes[{index}]", size, minimum=1)
         for index, size in enumerate(sizes)
+    )
+
+
+def _validated_actor_float(name: str, value: object, **bounds: Any) -> float:
+    if type(value) not in (_ACTUAL_INT_TYPES | _ACTUAL_FLOAT_TYPES):
+        raise ValueError(f"{name} must be a finite real scalar")
+    return validated_float32_scalar(name, value, **bounds)
+
+
+def _exact_config_payload(config: object, expected: frozenset[str]) -> dict[str, Any]:
+    if type(config) is not dict:
+        raise ValueError("config must be an exact built-in dict")
+    payload = cast(dict[object, Any], config)
+    if any(type(key) is not str for key in payload) or set(payload) != expected:
+        raise ValueError("config fields do not match the serialized schema")
+    return cast(dict[str, Any], dict(payload))
+
+
+def _check_actor_resources(resources: dict[str, int]) -> dict[str, int]:
+    for name, value in resources.items():
+        if value > _INT32_MAX:
+            raise ValueError(f"derived actor {name} must be at most {_INT32_MAX}")
+    return resources
+
+
+def _linear_actor_resources(n_actions: int, feature_dim: object) -> dict[str, int]:
+    width = _require_int32("feature_dim", feature_dim, minimum=1)
+    parameters = n_actions * (width + 1)
+    float32_state = 2 * parameters + width
+    logical_state = float32_state + 4
+    return _check_actor_resources(
+        {
+            "parameter_scalars": parameters,
+            "float32_state_scalars": float32_state,
+            "state_scalars": logical_state,
+            "state_nbytes": 4 * logical_state,
+        }
+    )
+
+
+def _nonlinear_actor_resources(
+    n_actions: int,
+    hidden_sizes: tuple[int, ...],
+    feature_dim: object,
+) -> dict[str, int]:
+    width = _require_int32("feature_dim", feature_dim, minimum=1)
+    parameters = 0
+    previous = width
+    for index, hidden in enumerate(hidden_sizes):
+        product = hidden * previous
+        _check_actor_resources({f"hidden_product[{index}]": product})
+        parameters += product + hidden
+        previous = hidden
+    head_product = n_actions * previous
+    _check_actor_resources({"head_product": head_product})
+    parameters += head_product + n_actions
+    tensor_count = 2 * (len(hidden_sizes) + 1)
+    float32_state = 5 * parameters + 2 * tensor_count + 1 + width
+    logical_state = float32_state + 4
+    return _check_actor_resources(
+        {
+            "parameter_scalars": parameters,
+            "optimizer_tensor_count": tensor_count,
+            "float32_state_scalars": float32_state,
+            "state_scalars": logical_state,
+            "state_nbytes": 4 * logical_state,
+        }
     )
 
 
@@ -201,15 +271,15 @@ class HordeActorCriticConfig:
             "value_head_index",
             _require_int32("value_head_index", self.value_head_index, minimum=0),
         )
-        actor_step_size = validated_float32_scalar(
+        actor_step_size = _validated_actor_float(
             "actor_step_size", self.actor_step_size, positive=True
         )
-        actor_lamda = validated_float32_scalar(
+        actor_lamda = _validated_actor_float(
             "actor_lamda", self.actor_lamda, lower=0.0, upper=1.0
         )
-        temperature = validated_float32_scalar("temperature", self.temperature, positive=True)
+        temperature = _validated_actor_float("temperature", self.temperature, positive=True)
         actor_td_error_clip = (
-            validated_float32_scalar(
+            _validated_actor_float(
                 "actor_td_error_clip",
                 self.actor_td_error_clip,
                 positive=True,
@@ -221,6 +291,11 @@ class HordeActorCriticConfig:
         object.__setattr__(self, "actor_lamda", actor_lamda)
         object.__setattr__(self, "temperature", temperature)
         object.__setattr__(self, "actor_td_error_clip", actor_td_error_clip)
+        _linear_actor_resources(self.n_actions, 1)
+
+    def actor_resource_budget(self, feature_dim: object) -> dict[str, int]:
+        """Return the exact actor-only state budget for an input width."""
+        return _linear_actor_resources(self.n_actions, feature_dim)
 
     def to_config(self) -> dict[str, Any]:
         """Serialize this configuration to a dictionary."""
@@ -229,7 +304,8 @@ class HordeActorCriticConfig:
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> HordeActorCriticConfig:
         """Reconstruct a ``HordeActorCriticConfig`` from a dictionary."""
-        return cls(**config)
+        fields = frozenset(field.name for field in dataclasses.fields(cls))
+        return cls(**_exact_config_payload(config, fields))
 
 
 @chex.dataclass(frozen=True)
@@ -312,16 +388,16 @@ class QHordeActorCriticConfig:
             "n_actions",
             _require_int32("n_actions", self.n_actions, minimum=1),
         )
-        gamma = validated_float32_scalar("gamma", self.gamma, lower=0.0, upper=1.0)
-        actor_step_size = validated_float32_scalar(
+        gamma = _validated_actor_float("gamma", self.gamma, lower=0.0, upper=1.0)
+        actor_step_size = _validated_actor_float(
             "actor_step_size", self.actor_step_size, positive=True
         )
-        actor_lamda = validated_float32_scalar(
+        actor_lamda = _validated_actor_float(
             "actor_lamda", self.actor_lamda, lower=0.0, upper=1.0
         )
-        temperature = validated_float32_scalar("temperature", self.temperature, positive=True)
+        temperature = _validated_actor_float("temperature", self.temperature, positive=True)
         actor_td_error_clip = (
-            validated_float32_scalar(
+            _validated_actor_float(
                 "actor_td_error_clip",
                 self.actor_td_error_clip,
                 positive=True,
@@ -329,15 +405,26 @@ class QHordeActorCriticConfig:
             if self.actor_td_error_clip is not None
             else None
         )
-        if self.critic_target not in {"expected_sarsa", "sampled_sarsa"}:
+        if type(self.critic_target) is not str or self.critic_target not in {
+            "expected_sarsa",
+            "sampled_sarsa",
+        }:
             raise ValueError("critic_target must be 'expected_sarsa' or 'sampled_sarsa'")
-        if self.actor_update not in {"td_error", "expected_advantage"}:
+        if type(self.actor_update) is not str or self.actor_update not in {
+            "td_error",
+            "expected_advantage",
+        }:
             raise ValueError("actor_update must be 'td_error' or 'expected_advantage'")
         object.__setattr__(self, "gamma", gamma)
         object.__setattr__(self, "actor_step_size", actor_step_size)
         object.__setattr__(self, "actor_lamda", actor_lamda)
         object.__setattr__(self, "temperature", temperature)
         object.__setattr__(self, "actor_td_error_clip", actor_td_error_clip)
+        _linear_actor_resources(self.n_actions, 1)
+
+    def actor_resource_budget(self, feature_dim: object) -> dict[str, int]:
+        """Return the exact actor-only state budget for an input width."""
+        return _linear_actor_resources(self.n_actions, feature_dim)
 
     def to_config(self) -> dict[str, Any]:
         """Serialize this configuration to a dictionary."""
@@ -346,7 +433,8 @@ class QHordeActorCriticConfig:
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> QHordeActorCriticConfig:
         """Reconstruct a ``QHordeActorCriticConfig`` from a dictionary."""
-        return cls(**config)
+        fields = frozenset(field.name for field in dataclasses.fields(cls))
+        return cls(**_exact_config_payload(config, fields))
 
 
 @chex.dataclass(frozen=True)
@@ -462,6 +550,7 @@ class QHordeActorCriticAgent:
 
     def init(self, feature_dim: int, key: Array) -> QHordeActorCriticState:
         """Initialize actor and Horde critic state."""
+        self._config.actor_resource_budget(feature_dim)
         actor_key, critic_key = jr.split(key)
         zeros_actor = jnp.zeros((self._config.n_actions, feature_dim), dtype=jnp.float32)
         zeros_bias = jnp.zeros((self._config.n_actions,), dtype=jnp.float32)
@@ -753,6 +842,7 @@ class HordeActorCriticAgent:
 
     def init(self, feature_dim: int, key: Array) -> HordeActorCriticState:
         """Initialize actor and Horde critic state."""
+        self._config.actor_resource_budget(feature_dim)
         actor_key, critic_key = jr.split(key)
         zeros_actor = jnp.zeros((self._config.n_actions, feature_dim), dtype=jnp.float32)
         zeros_bias = jnp.zeros((self._config.n_actions,), dtype=jnp.float32)
@@ -1227,21 +1317,23 @@ class NonlinearHordeActorCriticConfig:
             "hidden_sizes",
             _validate_hidden_sizes(self.hidden_sizes),
         )
-        actor_lamda = validated_float32_scalar(
+        if type(self.use_layer_norm) is not bool:
+            raise ValueError("use_layer_norm must be an exact bool")
+        actor_lamda = _validated_actor_float(
             "actor_lamda", self.actor_lamda, lower=0.0, upper=1.0
         )
-        temperature = validated_float32_scalar("temperature", self.temperature, positive=True)
-        actor_sparsity = validated_float32_scalar(
+        temperature = _validated_actor_float("temperature", self.temperature, positive=True)
+        actor_sparsity = _validated_actor_float(
             "actor_sparsity", self.actor_sparsity, lower=0.0, upper=1.0
         )
-        leaky_relu_slope = validated_float32_scalar(
+        leaky_relu_slope = _validated_actor_float(
             "leaky_relu_slope", self.leaky_relu_slope, lower=0.0
         )
-        actor_epsilon = validated_float32_scalar(
+        actor_epsilon = _validated_actor_float(
             "actor_epsilon", self.actor_epsilon, lower=0.0, upper=1.0, upper_inclusive=False
         )
         actor_td_error_normalizer_decay = (
-            validated_float32_scalar(
+            _validated_actor_float(
                 "actor_td_error_normalizer_decay",
                 self.actor_td_error_normalizer_decay,
                 lower=0.0,
@@ -1252,7 +1344,7 @@ class NonlinearHordeActorCriticConfig:
             else None
         )
         actor_td_error_clip = (
-            validated_float32_scalar(
+            _validated_actor_float(
                 "actor_td_error_clip",
                 self.actor_td_error_clip,
                 positive=True,
@@ -1261,7 +1353,7 @@ class NonlinearHordeActorCriticConfig:
             else None
         )
         actor_gradient_clip_norm = (
-            validated_float32_scalar(
+            _validated_actor_float(
                 "actor_gradient_clip_norm",
                 self.actor_gradient_clip_norm,
                 positive=True,
@@ -1277,6 +1369,11 @@ class NonlinearHordeActorCriticConfig:
         object.__setattr__(self, "actor_td_error_normalizer_decay", actor_td_error_normalizer_decay)
         object.__setattr__(self, "actor_td_error_clip", actor_td_error_clip)
         object.__setattr__(self, "actor_gradient_clip_norm", actor_gradient_clip_norm)
+        _nonlinear_actor_resources(self.n_actions, self.hidden_sizes, 1)
+
+    def actor_resource_budget(self, feature_dim: object) -> dict[str, int]:
+        """Return the exact actor-only state budget for an input width."""
+        return _nonlinear_actor_resources(self.n_actions, self.hidden_sizes, feature_dim)
 
     def to_config(self) -> dict[str, Any]:
         """Serialize to a JSON-compatible dictionary."""
@@ -1287,7 +1384,12 @@ class NonlinearHordeActorCriticConfig:
     @classmethod
     def from_config(cls, cfg: dict[str, Any]) -> NonlinearHordeActorCriticConfig:
         """Reconstruct from :meth:`to_config` output."""
-        c = dict(cfg)
+        c = _exact_config_payload(
+            cfg,
+            frozenset(field.name for field in dataclasses.fields(cls)),
+        )
+        if type(c["hidden_sizes"]) is not list:
+            raise ValueError("serialized hidden_sizes must be an exact built-in list")
         c["hidden_sizes"] = tuple(c["hidden_sizes"])
         return cls(**c)
 
@@ -1476,6 +1578,7 @@ class NonlinearHordeActorCriticAgent:
         Returns:
             Zeroed initial state with sparse-initialized actor weights.
         """
+        self._config.actor_resource_budget(feature_dim)
         actor_key, critic_key = jr.split(key)
         cfg = self._config
         trunk_weights: list[Array] = []
@@ -1953,19 +2056,21 @@ class NonlinearQHordeActorCriticConfig:
             "hidden_sizes",
             _validate_hidden_sizes(self.hidden_sizes),
         )
-        gamma = validated_float32_scalar("gamma", self.gamma, lower=0.0, upper=1.0)
-        actor_lamda = validated_float32_scalar(
+        if type(self.use_layer_norm) is not bool:
+            raise ValueError("use_layer_norm must be an exact bool")
+        gamma = _validated_actor_float("gamma", self.gamma, lower=0.0, upper=1.0)
+        actor_lamda = _validated_actor_float(
             "actor_lamda", self.actor_lamda, lower=0.0, upper=1.0
         )
-        temperature = validated_float32_scalar("temperature", self.temperature, positive=True)
-        actor_sparsity = validated_float32_scalar(
+        temperature = _validated_actor_float("temperature", self.temperature, positive=True)
+        actor_sparsity = _validated_actor_float(
             "actor_sparsity", self.actor_sparsity, lower=0.0, upper=1.0
         )
-        leaky_relu_slope = validated_float32_scalar(
+        leaky_relu_slope = _validated_actor_float(
             "leaky_relu_slope", self.leaky_relu_slope, lower=0.0
         )
         actor_td_error_clip = (
-            validated_float32_scalar(
+            _validated_actor_float(
                 "actor_td_error_clip",
                 self.actor_td_error_clip,
                 positive=True,
@@ -1974,7 +2079,7 @@ class NonlinearQHordeActorCriticConfig:
             else None
         )
         actor_gradient_clip_norm = (
-            validated_float32_scalar(
+            _validated_actor_float(
                 "actor_gradient_clip_norm",
                 self.actor_gradient_clip_norm,
                 positive=True,
@@ -1982,9 +2087,15 @@ class NonlinearQHordeActorCriticConfig:
             if self.actor_gradient_clip_norm is not None
             else None
         )
-        if self.critic_target not in {"expected_sarsa", "sampled_sarsa"}:
+        if type(self.critic_target) is not str or self.critic_target not in {
+            "expected_sarsa",
+            "sampled_sarsa",
+        }:
             raise ValueError("critic_target must be 'expected_sarsa' or 'sampled_sarsa'")
-        if self.actor_update not in {"td_error", "expected_advantage"}:
+        if type(self.actor_update) is not str or self.actor_update not in {
+            "td_error",
+            "expected_advantage",
+        }:
             raise ValueError("actor_update must be 'td_error' or 'expected_advantage'")
         object.__setattr__(self, "gamma", gamma)
         object.__setattr__(self, "actor_lamda", actor_lamda)
@@ -1993,6 +2104,11 @@ class NonlinearQHordeActorCriticConfig:
         object.__setattr__(self, "leaky_relu_slope", leaky_relu_slope)
         object.__setattr__(self, "actor_td_error_clip", actor_td_error_clip)
         object.__setattr__(self, "actor_gradient_clip_norm", actor_gradient_clip_norm)
+        _nonlinear_actor_resources(self.n_actions, self.hidden_sizes, 1)
+
+    def actor_resource_budget(self, feature_dim: object) -> dict[str, int]:
+        """Return the exact actor-only state budget for an input width."""
+        return _nonlinear_actor_resources(self.n_actions, self.hidden_sizes, feature_dim)
 
     def to_config(self) -> dict[str, Any]:
         """Serialize to a JSON-compatible dictionary."""
@@ -2003,7 +2119,12 @@ class NonlinearQHordeActorCriticConfig:
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> NonlinearQHordeActorCriticConfig:
         """Reconstruct from :meth:`to_config` output."""
-        payload = dict(config)
+        payload = _exact_config_payload(
+            config,
+            frozenset(field.name for field in dataclasses.fields(cls)),
+        )
+        if type(payload["hidden_sizes"]) is not list:
+            raise ValueError("serialized hidden_sizes must be an exact built-in list")
         payload["hidden_sizes"] = tuple(payload["hidden_sizes"])
         return cls(**payload)
 
@@ -2116,6 +2237,7 @@ class NonlinearQHordeActorCriticAgent:
 
     def init(self, feature_dim: int, key: Array) -> NonlinearHordeActorCriticState:
         """Initialize MLP actor and action-value Horde critic state."""
+        self._config.actor_resource_budget(feature_dim)
         actor_key, critic_key = jr.split(key)
         cfg = self._config
         trunk_weights: list[Array] = []

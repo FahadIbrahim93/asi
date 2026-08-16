@@ -1548,3 +1548,99 @@ def test_nonlinear_horde_actor_critic_configs_accept_and_canonicalizes_numpy_int
     assert type(q_cfg.n_actions) is int
     assert type(q_cfg.hidden_sizes[0]) is int
     assert q_cfg.hidden_sizes == (64,)
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        HordeActorCriticConfig(n_actions=2),
+        QHordeActorCriticConfig(n_actions=2),
+        NonlinearHordeActorCriticConfig(n_actions=2, hidden_sizes=()),
+        NonlinearQHordeActorCriticConfig(n_actions=2, hidden_sizes=()),
+    ],
+)
+def test_actor_configs_require_exact_complete_serialized_dicts(config: object) -> None:
+    payload = config.to_config()  # type: ignore[union-attr]
+    config_type = type(config)
+    assert config_type.from_config(payload) == config
+
+    class HostileDict(dict[str, object]):
+        def __iter__(self):
+            raise AssertionError("hostile iteration must not run")
+
+        def __repr__(self) -> str:
+            raise AssertionError("hostile repr must not run")
+
+    with pytest.raises(ValueError, match="exact built-in dict"):
+        config_type.from_config(HostileDict(payload))
+    with pytest.raises(ValueError, match="serialized schema"):
+        first_key = next(iter(payload))
+        config_type.from_config(
+            {key: value for key, value in payload.items() if key != first_key}
+        )
+    with pytest.raises(ValueError, match="serialized schema"):
+        config_type.from_config({**payload, "unknown": 1})
+
+
+@pytest.mark.parametrize(
+    "config_type",
+    [NonlinearHordeActorCriticConfig, NonlinearQHordeActorCriticConfig],
+)
+def test_nonlinear_actor_configs_require_exact_bool_and_json_list(config_type: type) -> None:
+    for value in (0, 1, np.bool_(True), object()):
+        with pytest.raises(ValueError, match="use_layer_norm"):
+            config_type(n_actions=2, hidden_sizes=(), use_layer_norm=value)
+    payload = config_type(n_actions=2, hidden_sizes=()).to_config()
+    with pytest.raises(ValueError, match="serialized hidden_sizes"):
+        config_type.from_config({**payload, "hidden_sizes": ()})
+
+
+@pytest.mark.parametrize("config_type", [QHordeActorCriticConfig, NonlinearQHordeActorCriticConfig])
+def test_q_actor_configs_reject_enum_spoofs_without_hooks(config_type: type) -> None:
+    class EqualSpoof:
+        def __hash__(self) -> int:
+            raise AssertionError("hash must not run")
+
+        def __eq__(self, other: object) -> bool:
+            raise AssertionError("equality must not run")
+
+        def __repr__(self) -> str:
+            raise AssertionError("repr must not run")
+
+    for field in ("critic_target", "actor_update"):
+        with pytest.raises(ValueError, match=field):
+            config_type(n_actions=2, hidden_sizes=(), **{field: EqualSpoof()}) if (
+                config_type is NonlinearQHordeActorCriticConfig
+            ) else config_type(n_actions=2, **{field: EqualSpoof()})
+
+
+def test_actor_resource_budgets_preflight_before_allocation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    linear = HordeActorCriticConfig(n_actions=2)
+    assert linear.actor_resource_budget(3) == {
+        "parameter_scalars": 8,
+        "float32_state_scalars": 19,
+        "state_scalars": 23,
+        "state_nbytes": 92,
+    }
+    nonlinear = NonlinearHordeActorCriticConfig(n_actions=2, hidden_sizes=(3,))
+    budget = nonlinear.actor_resource_budget(4)
+    assert budget["parameter_scalars"] == 23
+    assert budget["optimizer_tensor_count"] == 4
+    assert budget["float32_state_scalars"] == 128
+    assert budget["state_nbytes"] == 528
+
+    with pytest.raises(ValueError, match="derived actor"):
+        HordeActorCriticConfig(n_actions=2**31 - 1)
+    with pytest.raises(ValueError, match="hidden_product"):
+        NonlinearHordeActorCriticConfig(n_actions=2, hidden_sizes=(50_000, 50_000))
+
+    agent = _make_agent()
+    monkeypatch.setattr(
+        "alberta_framework.core.horde_actor_critic.jnp.zeros",
+        lambda *args, **kwargs: pytest.fail("allocation must not run"),
+    )
+    for feature_dim in (True, 2**31 - 1):
+        with pytest.raises(ValueError):
+            agent.init(feature_dim, jr.key(0))  # type: ignore[arg-type]
