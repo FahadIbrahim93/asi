@@ -1,5 +1,7 @@
 """Production facade tests for Alberta Plan Steps 5, 6, and 7."""
 
+from __future__ import annotations
+
 import json
 from fractions import Fraction
 from typing import Any
@@ -255,6 +257,140 @@ def test_step6_facade_config_roundtrip_one_step_and_smoke() -> None:
     assert smoke.average_rewards_shape == (12,)
     assert smoke.actions_shape == (12,)
     assert smoke.agent_config["type"] == "DifferentialSARSAAgent"
+
+
+_INVALID_STEP6_FIELDS: tuple[tuple[str, Any], ...] = (
+    ("n_actions", 0),
+    ("n_actions", -1),
+    ("n_actions", True),
+    ("n_actions", False),
+    ("n_actions", "2"),
+    ("n_actions", 2.5),
+    ("n_actions", float("nan")),
+    ("n_actions", float("inf")),
+    ("n_actions", None),
+    ("q_step_size", float("nan")),
+    ("q_step_size", float("inf")),
+    ("q_step_size", float("-inf")),
+    ("q_step_size", True),
+    ("q_step_size", False),
+    ("q_step_size", -1.0),
+    ("q_step_size", "0.05"),
+    ("q_step_size", None),
+    ("average_reward_step_size", float("nan")),
+    ("average_reward_step_size", float("inf")),
+    ("average_reward_step_size", True),
+    ("average_reward_step_size", False),
+    ("average_reward_step_size", -0.01),
+    ("average_reward_step_size", "0.01"),
+    ("average_reward_step_size", None),
+    ("trace_decay", float("nan")),
+    ("trace_decay", float("inf")),
+    ("trace_decay", True),
+    ("trace_decay", False),
+    ("trace_decay", -0.1),
+    ("trace_decay", 1.1),
+    ("trace_decay", "0.0"),
+    ("trace_decay", None),
+    ("epsilon_start", float("nan")),
+    ("epsilon_start", float("inf")),
+    ("epsilon_start", True),
+    ("epsilon_start", False),
+    ("epsilon_start", -0.1),
+    ("epsilon_start", 1.1),
+    ("epsilon_start", "0.1"),
+    ("epsilon_start", None),
+    ("epsilon_end", float("nan")),
+    ("epsilon_end", float("inf")),
+    ("epsilon_end", True),
+    ("epsilon_end", False),
+    ("epsilon_end", -0.1),
+    ("epsilon_end", 1.1),
+    ("epsilon_end", "0.01"),
+    ("epsilon_end", None),
+    ("epsilon_decay_steps", -1),
+    ("epsilon_decay_steps", 2**31 - 1),
+    ("epsilon_decay_steps", 2**31),
+    ("epsilon_decay_steps", True),
+    ("epsilon_decay_steps", False),
+    ("epsilon_decay_steps", "0"),
+    ("epsilon_decay_steps", 1.5),
+    ("epsilon_decay_steps", float("nan")),
+    ("epsilon_decay_steps", float("inf")),
+    ("epsilon_decay_steps", None),
+)
+
+
+@pytest.mark.parametrize(("field", "value"), _INVALID_STEP6_FIELDS)
+def test_step6_fields_reject_invalid_inputs(field: str, value: object) -> None:
+    with pytest.raises(ValueError, match=field):
+        Step6DifferentialSARSAConfig(**{field: value})
+
+
+def test_step6_fields_preserve_legal_endpoints() -> None:
+    config = Step6DifferentialSARSAConfig(
+        n_actions=1,
+        q_step_size=0.0,
+        average_reward_step_size=0.0,
+        trace_decay=0.0,
+        epsilon_start=0.0,
+        epsilon_end=0.0,
+        epsilon_decay_steps=0,
+    )
+    agent = make_step6_differential_sarsa_agent(config)
+    payload = config.to_dict()
+    json.dumps(payload, allow_nan=False)
+    restored = Step6DifferentialSARSAConfig.from_dict(payload)
+    assert restored.n_actions == 1
+    assert restored.q_step_size == 0.0
+    assert restored.average_reward_step_size == 0.0
+    assert restored.trace_decay == 0.0
+    assert restored.epsilon_start == 0.0
+    assert restored.epsilon_end == 0.0
+    assert restored.epsilon_decay_steps == 0
+    assert agent.config.n_actions == 1
+
+    upper = Step6DifferentialSARSAConfig(
+        n_actions=10,
+        q_step_size=1.0,
+        average_reward_step_size=1.0,
+        trace_decay=1.0,
+        epsilon_start=1.0,
+        epsilon_end=1.0,
+        epsilon_decay_steps=2**31 - 2,
+    )
+    make_step6_differential_sarsa_agent(upper)
+    assert upper.trace_decay == 1.0
+    assert upper.epsilon_start == 1.0
+    assert upper.epsilon_end == 1.0
+    assert upper.epsilon_decay_steps == 2**31 - 2
+
+
+def test_step6_fields_canonicalize_nonbuiltin_numbers() -> None:
+    value = np.float64(0.05)
+    config = Step6DifferentialSARSAConfig(
+        n_actions=np.int64(3),
+        q_step_size=value,
+        average_reward_step_size=value,
+        trace_decay=value,
+        epsilon_start=value,
+        epsilon_end=value,
+        epsilon_decay_steps=np.int64(100),
+    )
+    agent = make_step6_differential_sarsa_agent(config)
+    payload = config.to_dict()
+    json.dumps(payload, allow_nan=False)
+    assert config.n_actions == 3
+    assert config.q_step_size == 0.05
+    assert config.epsilon_decay_steps == 100
+    assert type(payload["n_actions"]) is int
+    assert type(payload["epsilon_decay_steps"]) is int
+    assert type(payload["q_step_size"]) is float
+    assert type(payload["average_reward_step_size"]) is float
+    assert type(payload["trace_decay"]) is float
+    assert type(payload["epsilon_start"]) is float
+    assert type(payload["epsilon_end"]) is float
+    assert agent.config.n_actions == 3
 
 
 def test_step7_dyna_facade_roundtrip_one_step_and_smoke() -> None:
