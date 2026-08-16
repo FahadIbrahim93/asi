@@ -353,7 +353,7 @@ def test_step10_stomp_fields_preserve_legal_endpoints() -> None:
             SubtaskSpec(
                 feature_index=0,
                 threshold=1e-12,
-                pseudo_reward_scale=0.0,
+                pseudo_reward_scale=1e-12,
                 max_option_steps=1,
             ),
         ),
@@ -396,7 +396,7 @@ def test_step10_stomp_fields_preserve_legal_endpoints() -> None:
     assert restored.option_importance_clip == 1e-12
     assert restored.subtask_specs[0].feature_index == 0
     assert restored.subtask_specs[0].threshold == 1e-12
-    assert restored.subtask_specs[0].pseudo_reward_scale == 0.0
+    assert restored.subtask_specs[0].pseudo_reward_scale == 1e-12
     assert restored.subtask_specs[0].max_option_steps == 1
     assert agent.config.option_gamma == 0.0
 
