@@ -11,6 +11,7 @@ the same workload, with a ~144 s compile; see the scaling notes in
 docs/evidence/methodology.md).
 """
 
+import math
 import time
 
 import chex
@@ -50,6 +51,11 @@ class TestConfig:
             _simple_config(gammas=(1.5, 0.9))
         with pytest.raises(ValueError, match="step_size"):
             _simple_config(step_size=0.0)
+
+    @pytest.mark.parametrize("step_size", [math.nan, math.inf, -math.inf])
+    def test_step_size_must_be_finite_and_positive(self, step_size: float) -> None:
+        with pytest.raises(ValueError, match="step_size"):
+            _simple_config(step_size=step_size)
 
     def test_roundtrip(self):
         cfg = _simple_config()

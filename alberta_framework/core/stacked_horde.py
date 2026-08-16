@@ -36,6 +36,7 @@ inactive for that step (its trace still decays; its weights freeze), matching
 the NaN-masking convention of the loop-based hordes.
 """
 
+import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -92,7 +93,7 @@ class StackedHordeConfig:
             raise ValueError("every gamma must be in [0, 1]")
         if any(not 0.0 <= la <= 1.0 for la in self.lamdas):
             raise ValueError("every lamda must be in [0, 1]")
-        if self.step_size <= 0.0:
+        if not math.isfinite(self.step_size) or self.step_size <= 0.0:
             raise ValueError("step_size must be positive")
 
     def to_config(self) -> dict[str, Any]:
