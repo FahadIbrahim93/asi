@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Fail-closed local launch and result checks for frozen IPMNIST protocols.
+"""Fail-closed local execution and result checks for frozen IPMNIST protocols.
 
-This driver never downloads MNIST and never runs a learner.  Its mutating
-commands only claim a previously absent append-only namespace and publish
-exclusive JSON receipts.  Dataset materialization and benchmark execution are
-separate, explicitly authorized operator steps.
+The launch and validation commands never download MNIST or run a learner.  The
+``run-shard`` command is the sole execution path: after the immutable launch
+and cache receipts exist, it invokes one exact benchmark shard in-process and
+binds that shard to the complete authorized runner and cache context.
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import hashlib
+import importlib
 import importlib.metadata
 import json
 import math
@@ -21,10 +22,11 @@ import re
 import stat
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
 from types import ModuleType
@@ -104,6 +106,19 @@ class LocalProtocol:
     candidate: str
     stages: tuple[LocalStage, ...]
     max_shards: int
+
+
+@dataclass(frozen=True)
+class _AuthorizedContext:
+    root: Path
+    namespace: Path
+    identity: dict[str, Any]
+    runner: dict[str, Any]
+    runner_raw: bytes
+    launch: dict[str, Any]
+    launch_raw: bytes
+    cache: dict[str, Any]
+    cache_raw: bytes
 
 
 LOCAL_PROTOCOLS: Final = {
@@ -560,6 +575,57 @@ def _write_json_exclusive(path: Path, payload: Mapping[str, Any]) -> None:
         os.fsync(directory)
     finally:
         os.close(directory)
+
+
+def _write_json_exclusive_at(
+    directory_fd: int, filename: str, payload: Mapping[str, Any]
+) -> None:
+    if not filename or "/" in filename or filename in {".", ".."}:
+        raise ValueError("exclusive receipt filename must be one basename")
+    encoded = _receipt_bytes(payload)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(filename, flags, 0o644, dir_fd=directory_fd)
+    try:
+        with os.fdopen(descriptor, "wb", closefd=False) as stream:
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+    finally:
+        os.close(descriptor)
+    os.fsync(directory_fd)
+
+
+def _open_verified_namespace(
+    namespace: Path, *, expected_identity: tuple[int, int]
+) -> int:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(namespace, flags)
+    current = os.fstat(descriptor)
+    identity = (current.st_dev, current.st_ino)
+    if not stat.S_ISDIR(current.st_mode) or identity != expected_identity:
+        os.close(descriptor)
+        raise ValueError("protocol namespace changed after structural preflight")
+    return descriptor
+
+
+def _require_namespace_identity(
+    namespace: Path, *, expected_identity: tuple[int, int]
+) -> None:
+    try:
+        current = os.stat(namespace, follow_symlinks=False)
+    except OSError as exc:
+        raise ValueError("protocol namespace changed during result validation") from exc
+    if (
+        not stat.S_ISDIR(current.st_mode)
+        or (current.st_dev, current.st_ino) != expected_identity
+    ):
+        raise ValueError("protocol namespace changed during result validation")
 
 
 def _git(root: Path, *args: str) -> str:
@@ -1432,6 +1498,135 @@ def _require_real_directory(path: Path, *, label: str) -> None:
         raise ValueError(f"{label} is unavailable") from exc
 
 
+def _require_regular_file(path: Path, *, label: str) -> None:
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"{label} must be one existing non-symlink regular file")
+
+
+def _requested_repository_root(root: Path) -> Path:
+    requested = Path(os.path.abspath(os.fspath(root)))
+    if requested.is_symlink():
+        raise ValueError("repository root must not be a symlink")
+    try:
+        resolved = requested.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError("repository root is unavailable") from exc
+    if resolved != requested:
+        raise ValueError("repository root must not traverse a symlink")
+    _require_real_directory(resolved, label="repository root")
+    return resolved
+
+
+def _preflight_stage_structure(
+    *, protocol: LocalProtocol, stage: LocalStage, stage_root: Path
+) -> None:
+    _require_real_directory(stage_root, label=f"stage {stage.key}")
+    observed = {path.name for path in stage_root.iterdir()}
+    expected = {"shards", "bindings", "summary.json"}
+    if observed != expected:
+        raise ValueError(
+            f"stage {stage.key} path structure mismatch; "
+            f"missing={sorted(expected - observed)}, "
+            f"unexpected={sorted(observed - expected)}"
+        )
+    shards = stage_root / "shards"
+    bindings = stage_root / "bindings"
+    _require_real_directory(shards, label=f"stage {stage.key} shards")
+    _require_real_directory(bindings, label=f"stage {stage.key} execution bindings")
+    _require_regular_file(
+        stage_root / "summary.json", label=f"stage {stage.key} summary"
+    )
+    expected_shards = {
+        f"{arm}_seed{seed}.json"
+        for arm in (protocol.control, protocol.candidate)
+        for seed in stage.seeds
+    }
+    observed_shards = {path.name for path in shards.iterdir()}
+    if observed_shards != expected_shards:
+        raise ValueError(
+            f"stage {stage.key} shard path coverage mismatch; "
+            f"missing={sorted(expected_shards - observed_shards)}, "
+            f"unexpected={sorted(observed_shards - expected_shards)}"
+        )
+    for name in expected_shards:
+        _require_regular_file(shards / name, label=f"stage {stage.key} shard")
+    expected_bindings = {
+        f"{Path(name).stem}.execution.v1.json" for name in expected_shards
+    }
+    observed_bindings = {path.name for path in bindings.iterdir()}
+    if observed_bindings != expected_bindings:
+        raise ValueError(
+            f"stage {stage.key} execution binding path coverage mismatch; "
+            f"missing={sorted(expected_bindings - observed_bindings)}, "
+            f"unexpected={sorted(observed_bindings - expected_bindings)}"
+        )
+    for name in expected_bindings:
+        _require_regular_file(
+            bindings / name, label=f"stage {stage.key} execution binding"
+        )
+
+
+def _preflight_result_structure(
+    *, protocol: LocalProtocol, root: Path
+) -> tuple[Path, Path, tuple[int, int]]:
+    resolved_root = _requested_repository_root(root)
+    outputs = resolved_root / "outputs"
+    screening = resolved_root / OUTPUT_ROOT
+    namespace = screening / protocol.namespace
+    for directory, label in (
+        (outputs, "outputs root"),
+        (screening, "IPMNIST output root"),
+        (namespace, "protocol namespace"),
+    ):
+        _require_real_directory(directory, label=label)
+    _namespace_file_manifest(namespace)
+    required_receipts = {"runner.v1.json", "launch.v1.json", "cache.v1.json"}
+    allowed = {
+        *required_receipts,
+        *(stage.key for stage in protocol.stages),
+        "result-claim.v1.json",
+        "result.v1.json",
+    }
+    if protocol.key == "issue14-v2":
+        allowed.add("confirm_200_all")
+    observed = {path.name for path in namespace.iterdir()}
+    if not required_receipts.issubset(observed) or not observed.issubset(allowed):
+        raise ValueError(
+            "protocol namespace path structure mismatch; "
+            f"missing={sorted(required_receipts - observed)}, "
+            f"unexpected={sorted(observed - allowed)}"
+        )
+    if "result.v1.json" in observed and "result-claim.v1.json" not in observed:
+        raise ValueError("published result exists without its result claim")
+    for name in required_receipts:
+        _require_regular_file(namespace / name, label=name)
+    for optional_receipt in ("result-claim.v1.json", "result.v1.json"):
+        if optional_receipt in observed:
+            _require_regular_file(namespace / optional_receipt, label=optional_receipt)
+    first_stage = protocol.stages[0]
+    if first_stage.key not in observed:
+        raise ValueError(f"required stage {first_stage.key} path is missing")
+    for stage in protocol.stages:
+        if stage.key in observed:
+            _preflight_stage_structure(
+                protocol=protocol,
+                stage=stage,
+                stage_root=namespace / stage.key,
+            )
+    if "confirm_200_all" in observed:
+        combined = namespace / "confirm_200_all"
+        _require_real_directory(combined, label="confirm_200_all")
+        if {path.name for path in combined.iterdir()} != {"summary.json"}:
+            raise ValueError("confirm_200_all path structure mismatch")
+        _require_regular_file(
+            combined / "summary.json", label="confirm_200_all summary"
+        )
+    namespace_stat = os.stat(namespace, follow_symlinks=False)
+    if not stat.S_ISDIR(namespace_stat.st_mode):
+        raise ValueError("protocol namespace must remain a real directory")
+    return resolved_root, namespace, (namespace_stat.st_dev, namespace_stat.st_ino)
+
+
 def _expected_config(n_tasks: int) -> dict[str, int]:
     return {
         "n_tasks": n_tasks,
@@ -1440,6 +1635,242 @@ def _expected_config(n_tasks: int) -> dict[str, int]:
         "hidden1": 300,
         "hidden2": 150,
         "n_classes": 10,
+    }
+
+
+def _benchmark_run_argv(
+    *,
+    root: Path,
+    protocol: LocalProtocol,
+    stage: LocalStage,
+    config_name: str,
+    seed: int,
+    data_home: str,
+) -> list[str]:
+    output = (
+        root
+        / OUTPUT_ROOT
+        / protocol.namespace
+        / stage.key
+        / "shards"
+        / f"{config_name}_seed{seed}.json"
+    ).relative_to(root)
+    return [
+        "run",
+        "--config-name",
+        config_name,
+        "--seed",
+        str(seed),
+        "--n-tasks",
+        str(stage.n_tasks),
+        "--task-length",
+        "5000",
+        "--data-home",
+        data_home,
+        "--out",
+        output.as_posix(),
+        "--progress-every",
+        "10",
+        "--noise-mode",
+        "step",
+    ]
+
+
+def _stage_for_key(protocol: LocalProtocol, stage_key: str) -> LocalStage:
+    for stage in protocol.stages:
+        if stage.key == stage_key:
+            return stage
+    raise ValueError(
+        f"stage {stage_key!r} is not part of frozen protocol {protocol.key!r}"
+    )
+
+
+def _execution_binding_path(shard_path: Path) -> Path:
+    return (
+        shard_path.parent.parent
+        / "bindings"
+        / f"{shard_path.stem}.execution.v1.json"
+    )
+
+
+def _execution_binding_payload(
+    *,
+    root: Path,
+    protocol: LocalProtocol,
+    stage: LocalStage,
+    config_name: str,
+    seed: int,
+    shard_path: Path,
+    shard: Mapping[str, Any],
+    runner: Mapping[str, Any],
+    runner_raw: bytes,
+    launch: Mapping[str, Any],
+    launch_raw: bytes,
+    cache: Mapping[str, Any],
+    cache_raw: bytes,
+    started_unix: float,
+    finished_unix: float,
+    bound_unix: float,
+) -> dict[str, Any]:
+    shard_raw = shard_path.read_bytes()
+    return {
+        "schema": "asi.ipmnist_local_prereg.shard_execution.v1",
+        "protocol_key": protocol.key,
+        "stage_key": stage.key,
+        "config_name": config_name,
+        "seed": seed,
+        "repository": launch["repository"],
+        "runner_context": runner,
+        "runner_receipt_sha256": hashlib.sha256(runner_raw).hexdigest(),
+        "launch_receipt_sha256": hashlib.sha256(launch_raw).hexdigest(),
+        "cache_context": cache,
+        "cache_receipt_sha256": hashlib.sha256(cache_raw).hexdigest(),
+        "data_home": launch["data_home"],
+        "data_home_sha256": launch["data_home_sha256"],
+        "cache_contract": launch["cache_contract"],
+        "shard": {
+            "path": shard_path.relative_to(root).as_posix(),
+            "size_bytes": len(shard_raw),
+            "sha256": hashlib.sha256(shard_raw).hexdigest(),
+            "created_unix": shard["created_unix"],
+        },
+        "started_unix": started_unix,
+        "finished_unix": finished_unix,
+        "bound_unix": bound_unix,
+        "benchmark_argv": _benchmark_run_argv(
+            root=root,
+            protocol=protocol,
+            stage=stage,
+            config_name=config_name,
+            seed=seed,
+            data_home=cast(str, launch["data_home"]),
+        ),
+        "rerun_allowed": False,
+    }
+
+
+def _validate_execution_binding(
+    *,
+    root: Path,
+    protocol: LocalProtocol,
+    stage: LocalStage,
+    shard_path: Path,
+    shard: Mapping[str, Any],
+    runner: Mapping[str, Any],
+    runner_raw: bytes,
+    launch: Mapping[str, Any],
+    launch_raw: bytes,
+    cache: Mapping[str, Any],
+    cache_raw: bytes,
+    summary_created_unix: float,
+) -> dict[str, Any]:
+    binding_path = _execution_binding_path(shard_path)
+    binding, binding_raw = _strict_json_bytes(binding_path)
+    _require_exact_keys(
+        binding,
+        {
+            "schema",
+            "protocol_key",
+            "stage_key",
+            "config_name",
+            "seed",
+            "repository",
+            "runner_context",
+            "runner_receipt_sha256",
+            "launch_receipt_sha256",
+            "cache_context",
+            "cache_receipt_sha256",
+            "data_home",
+            "data_home_sha256",
+            "cache_contract",
+            "shard",
+            "started_unix",
+            "finished_unix",
+            "bound_unix",
+            "benchmark_argv",
+            "rerun_allowed",
+        },
+        context=f"execution binding {binding_path}",
+    )
+    config_name = cast(str, shard["config_name"])
+    seed = cast(int, shard["seed"])
+    shard_raw = shard_path.read_bytes()
+    shard_created_unix = _finite_float(
+        shard.get("created_unix"), name="execution binding shard created_unix"
+    )
+    expected_shard = {
+        "path": shard_path.relative_to(root).as_posix(),
+        "size_bytes": len(shard_raw),
+        "sha256": hashlib.sha256(shard_raw).hexdigest(),
+        "created_unix": shard_created_unix,
+    }
+    if (
+        binding["schema"] != "asi.ipmnist_local_prereg.shard_execution.v1"
+        or binding["protocol_key"] != protocol.key
+        or binding["stage_key"] != stage.key
+        or binding["config_name"] != config_name
+        or type(binding["seed"]) is not int
+        or binding["seed"] != seed
+        or binding["rerun_allowed"] is not False
+        or _canonical_json(binding["repository"])
+        != _canonical_json(launch["repository"])
+        or _canonical_json(binding["runner_context"]) != _canonical_json(runner)
+        or binding["runner_receipt_sha256"]
+        != hashlib.sha256(runner_raw).hexdigest()
+        or binding["launch_receipt_sha256"]
+        != hashlib.sha256(launch_raw).hexdigest()
+        or _canonical_json(binding["cache_context"]) != _canonical_json(cache)
+        or binding["cache_receipt_sha256"] != hashlib.sha256(cache_raw).hexdigest()
+        or binding["data_home"] != launch["data_home"]
+        or binding["data_home_sha256"] != launch["data_home_sha256"]
+        or _canonical_json(binding["cache_contract"])
+        != _canonical_json(launch["cache_contract"])
+        or _canonical_json(binding["shard"]) != _canonical_json(expected_shard)
+        or _canonical_json(binding["benchmark_argv"])
+        != _canonical_json(
+            _benchmark_run_argv(
+                root=root,
+                protocol=protocol,
+                stage=stage,
+                config_name=config_name,
+                seed=seed,
+                data_home=cast(str, launch["data_home"]),
+            )
+        )
+    ):
+        raise ValueError(
+            "execution binding differs from the authorized runner, cache, source, or shard"
+        )
+    launch_unix = _parse_utc(launch["launch_created_at"], label="launch").timestamp()
+    cache_unix = _parse_utc(cache["checked_at"], label="cache receipt").timestamp()
+    started_unix = _finite_float(
+        binding["started_unix"], name="execution binding started_unix"
+    )
+    finished_unix = _finite_float(
+        binding["finished_unix"], name="execution binding finished_unix"
+    )
+    bound_unix = _finite_float(
+        binding["bound_unix"], name="execution binding bound_unix"
+    )
+    if not (
+        launch_unix
+        < cache_unix
+        < started_unix
+        < shard_created_unix
+        < finished_unix
+        < bound_unix
+        < summary_created_unix
+    ):
+        raise ValueError(
+            "execution binding chronology must be launch < cache < start < shard < "
+            "finish < binding < summary"
+        )
+    return {
+        "path": binding_path.relative_to(root).as_posix(),
+        "size_bytes": len(binding_raw),
+        "sha256": hashlib.sha256(binding_raw).hexdigest(),
+        "config_name": config_name,
+        "seed": seed,
     }
 
 
@@ -1494,12 +1925,18 @@ def _validate_collection(
     *,
     root: Path,
     protocol: LocalProtocol,
+    stage: LocalStage | None,
     seeds: tuple[int, ...],
     n_tasks: int,
     paths: Sequence[Path],
     summary_path: Path,
     identity: Mapping[str, Any],
     runner: Mapping[str, Any],
+    runner_raw: bytes,
+    launch: Mapping[str, Any],
+    launch_raw: bytes,
+    cache: Mapping[str, Any],
+    cache_raw: bytes,
 ) -> dict[str, Any]:
     import alberta_framework.benchmarks.ipmnist_screening as screening
 
@@ -1518,6 +1955,8 @@ def _validate_collection(
     observed_pairs: set[tuple[str, int]] = set()
     first_dataset: Mapping[str, Any] | None = None
     shard_created_times: list[float] = []
+    launch_unix = _parse_utc(launch["launch_created_at"], label="launch").timestamp()
+    cache_unix = _parse_utc(cache["checked_at"], label="cache receipt").timestamp()
     for path, shard in zip(paths, shards, strict=True):
         expected_name = f"{shard['config_name']}_seed{shard['seed']}.json"
         if path.name != expected_name:
@@ -1528,9 +1967,14 @@ def _validate_collection(
         if pair in observed_pairs:
             raise ValueError("duplicate shard payload arm/seed identity")
         observed_pairs.add(pair)
-        shard_created_times.append(
-            _finite_float(shard.get("created_unix"), name="shard created_unix")
+        shard_created_unix = _finite_float(
+            shard.get("created_unix"), name="shard created_unix"
         )
+        if shard_created_unix <= launch_unix or shard_created_unix <= cache_unix:
+            raise ValueError(
+                "every shard must be created strictly after the bound launch and cache"
+            )
+        shard_created_times.append(shard_created_unix)
         if (
             shard["schema"] != screening.SHARD_SCHEMA
             or shard["evidence_policy"] != EXPECTED_POLICY
@@ -1597,6 +2041,33 @@ def _validate_collection(
     )
     if max(shard_created_times) >= summary_created_unix:
         raise ValueError("stage summary must be created strictly after every input shard")
+    execution_receipts = sorted(
+        (
+            _validate_execution_binding(
+                root=root,
+                protocol=protocol,
+                stage=(
+                    _stage_for_key(protocol, path.parent.parent.name)
+                    if stage is None
+                    else stage
+                ),
+                shard_path=path,
+                shard=shard,
+                runner=runner,
+                runner_raw=runner_raw,
+                launch=launch,
+                launch_raw=launch_raw,
+                cache=cache,
+                cache_raw=cache_raw,
+                summary_created_unix=summary_created_unix,
+            )
+            for path, shard in zip(paths, shards, strict=True)
+        ),
+        key=lambda receipt: (
+            cast(str, receipt["config_name"]),
+            cast(int, receipt["seed"]),
+        ),
+    )
     if (
         summary["schema"] != screening.SUMMARY_SCHEMA
         or summary["evidence_policy"] != EXPECTED_POLICY
@@ -1649,6 +2120,7 @@ def _validate_collection(
         "first_shard_created_unix": min(shard_created_times),
         "last_shard_created_unix": max(shard_created_times),
         "summary_created_unix": summary_created_unix,
+        "execution_receipts": execution_receipts,
     }
 
 
@@ -1660,25 +2132,55 @@ def _validate_stage(
     stage: LocalStage,
     identity: Mapping[str, Any],
     runner: Mapping[str, Any],
+    runner_raw: bytes,
+    launch: Mapping[str, Any],
+    launch_raw: bytes,
+    cache: Mapping[str, Any],
+    cache_raw: bytes,
 ) -> dict[str, Any]:
     stage_root = namespace / stage.key
     if not stage_root.is_dir() or stage_root.is_symlink():
         raise ValueError(f"required stage {stage.key} is missing or invalid")
-    if {path.name for path in stage_root.iterdir()} != {"shards", "summary.json"}:
+    if {path.name for path in stage_root.iterdir()} != {
+        "shards",
+        "bindings",
+        "summary.json",
+    }:
         raise ValueError(f"stage {stage.key} contains missing or unexpected entries")
     shards_dir = stage_root / "shards"
     if not shards_dir.is_dir() or shards_dir.is_symlink():
         raise ValueError(f"stage {stage.key} shard directory is missing or invalid")
+    bindings_dir = stage_root / "bindings"
+    if not bindings_dir.is_dir() or bindings_dir.is_symlink():
+        raise ValueError(f"stage {stage.key} execution binding directory is invalid")
     paths = sorted(shards_dir.iterdir())
+    expected_bindings = {
+        f"{arm}_seed{seed}.execution.v1.json"
+        for arm in (protocol.control, protocol.candidate)
+        for seed in stage.seeds
+    }
+    observed_bindings = {path.name for path in bindings_dir.iterdir()}
+    if observed_bindings != expected_bindings:
+        raise ValueError(
+            "execution binding coverage is not exact; "
+            f"missing={sorted(expected_bindings - observed_bindings)}, "
+            f"unexpected={sorted(observed_bindings - expected_bindings)}"
+        )
     return _validate_collection(
         root=root,
         protocol=protocol,
+        stage=stage,
         seeds=stage.seeds,
         n_tasks=stage.n_tasks,
         paths=paths,
         summary_path=stage_root / "summary.json",
         identity=identity,
         runner=runner,
+        runner_raw=runner_raw,
+        launch=launch,
+        launch_raw=launch_raw,
+        cache=cache,
+        cache_raw=cache_raw,
     )
 
 
@@ -1727,6 +2229,416 @@ def _require_root_entries(
             f"{context} has missing or unexpected namespace entries; "
             f"missing={sorted(expected - observed)}, unexpected={sorted(observed - expected)}"
         )
+
+
+def _load_authorized_context(
+    *,
+    protocol: LocalProtocol,
+    root: Path,
+    namespace: Path,
+    repository_identity: Mapping[str, Any] | None,
+    runner_receipt: Mapping[str, Any] | None,
+    verify_cache_file: bool,
+) -> _AuthorizedContext:
+    stored_runner, runner_raw = _strict_json_bytes(namespace / "runner.v1.json")
+    cpu = cast(dict[str, Any], stored_runner.get("cpu"))
+    cpuset = cpu.get("requested_cpuset") if isinstance(cpu, dict) else None
+    if not isinstance(cpuset, str):
+        raise ValueError("stored runner receipt has no canonical requested cpuset")
+    stored_runner = _validate_runner_receipt(stored_runner, expected_cpuset=cpuset)
+    current_runner = _validate_runner_receipt(
+        capture_runner_receipt(cpuset) if runner_receipt is None else runner_receipt,
+        expected_cpuset=cpuset,
+    )
+    if _canonical_json(current_runner) != _canonical_json(stored_runner):
+        raise ValueError("current operation runner differs from the authorized launch runner")
+    stored_launch, launch_raw = _strict_json_bytes(namespace / "launch.v1.json")
+    current_identity = _validate_repository_identity(
+        capture_repository_identity(root)
+        if repository_identity is None
+        else repository_identity
+    )
+    launch = _validate_launch_receipt(
+        stored_launch,
+        protocol=protocol,
+        identity=current_identity,
+        runner=stored_runner,
+        runner_raw=runner_raw,
+    )
+    stored_cache, cache_raw = _strict_json_bytes(namespace / "cache.v1.json")
+    cache = _validate_cache_receipt(
+        stored_cache,
+        protocol=protocol,
+        launch=launch,
+        launch_raw=launch_raw,
+        verify_file=verify_cache_file,
+    )
+    return _AuthorizedContext(
+        root=root,
+        namespace=namespace,
+        identity=current_identity,
+        runner=stored_runner,
+        runner_raw=runner_raw,
+        launch=launch,
+        launch_raw=launch_raw,
+        cache=cache,
+        cache_raw=cache_raw,
+    )
+
+
+def _preflight_partial_stage_structure(
+    *, protocol: LocalProtocol, stage: LocalStage, stage_root: Path
+) -> tuple[Path, Path]:
+    _require_real_directory(stage_root, label=f"in-progress stage {stage.key}")
+    observed = {path.name for path in stage_root.iterdir()}
+    expected = {"shards", "bindings"}
+    if observed != expected:
+        raise ValueError(
+            f"in-progress stage {stage.key} path structure mismatch; "
+            f"missing={sorted(expected - observed)}, "
+            f"unexpected={sorted(observed - expected)}"
+        )
+    shards = stage_root / "shards"
+    bindings = stage_root / "bindings"
+    _require_real_directory(shards, label=f"stage {stage.key} shards")
+    _require_real_directory(bindings, label=f"stage {stage.key} execution bindings")
+    expected_shards = {
+        f"{arm}_seed{seed}.json"
+        for arm in (protocol.control, protocol.candidate)
+        for seed in stage.seeds
+    }
+    observed_shards = {path.name for path in shards.iterdir()}
+    if not observed_shards.issubset(expected_shards):
+        raise ValueError(
+            f"in-progress stage {stage.key} contains an unauthorized shard path"
+        )
+    for name in observed_shards:
+        _require_regular_file(shards / name, label=f"stage {stage.key} shard")
+    expected_bindings = {
+        f"{Path(name).stem}.execution.v1.json" for name in observed_shards
+    }
+    observed_bindings = {path.name for path in bindings.iterdir()}
+    if observed_bindings != expected_bindings:
+        raise ValueError(
+            f"in-progress stage {stage.key} has an orphan shard or execution binding"
+        )
+    for name in observed_bindings:
+        _require_regular_file(
+            bindings / name, label=f"stage {stage.key} execution binding"
+        )
+    return shards, bindings
+
+
+def _preflight_shard_run_structure(
+    *, protocol: LocalProtocol, stage: LocalStage, root: Path
+) -> tuple[Path, Path, tuple[int, int], Path | None, Path | None]:
+    resolved_root = _requested_repository_root(root)
+    outputs = resolved_root / "outputs"
+    screening = resolved_root / OUTPUT_ROOT
+    namespace = screening / protocol.namespace
+    for directory, label in (
+        (outputs, "outputs root"),
+        (screening, "IPMNIST output root"),
+        (namespace, "protocol namespace"),
+    ):
+        _require_real_directory(directory, label=label)
+    _namespace_file_manifest(namespace)
+    stage_index = protocol.stages.index(stage)
+    required = {"runner.v1.json", "launch.v1.json", "cache.v1.json"}
+    prior_names = {candidate.key for candidate in protocol.stages[:stage_index]}
+    allowed = {*required, *prior_names, stage.key}
+    observed = {path.name for path in namespace.iterdir()}
+    missing = required | prior_names
+    if not missing.issubset(observed) or not observed.issubset(allowed):
+        raise ValueError(
+            "shard launch namespace path structure mismatch; "
+            f"missing={sorted(missing - observed)}, "
+            f"unexpected={sorted(observed - allowed)}"
+        )
+    for name in required:
+        _require_regular_file(namespace / name, label=name)
+    for prior in protocol.stages[:stage_index]:
+        _preflight_stage_structure(
+            protocol=protocol,
+            stage=prior,
+            stage_root=namespace / prior.key,
+        )
+    shards: Path | None = None
+    bindings: Path | None = None
+    if stage.key in observed:
+        shards, bindings = _preflight_partial_stage_structure(
+            protocol=protocol,
+            stage=stage,
+            stage_root=namespace / stage.key,
+        )
+    namespace_stat = os.stat(namespace, follow_symlinks=False)
+    if not stat.S_ISDIR(namespace_stat.st_mode):
+        raise ValueError("protocol namespace must remain a real directory")
+    return (
+        resolved_root,
+        namespace,
+        (namespace_stat.st_dev, namespace_stat.st_ino),
+        shards,
+        bindings,
+    )
+
+
+def _validate_prior_run_stages(
+    *, protocol: LocalProtocol, stage: LocalStage, context: _AuthorizedContext
+) -> list[dict[str, Any]]:
+    stage_index = protocol.stages.index(stage)
+    validated: list[dict[str, Any]] = []
+    for prior in protocol.stages[:stage_index]:
+        current = _validate_stage(
+            root=context.root,
+            namespace=context.namespace,
+            protocol=protocol,
+            stage=prior,
+            identity=context.identity,
+            runner=context.runner,
+            runner_raw=context.runner_raw,
+            launch=context.launch,
+            launch_raw=context.launch_raw,
+            cache=context.cache,
+            cache_raw=context.cache_raw,
+        )
+        if validated:
+            previous = validated[-1]
+            _require_stage_after(current, previous, stage=prior.key)
+            _require_same_stage_dataset(current, previous, stage=prior.key)
+        validated.append(current)
+        if not l2init_gate_passes(current["mean_diff"], current["per_seed_diff"]):
+            raise ValueError(
+                f"stage {stage.key} is forbidden because prior gate {prior.key} rejected"
+            )
+    return validated
+
+
+def _validate_run_shard_payload(
+    *,
+    screening: ModuleType,
+    path: Path,
+    payload: Mapping[str, Any],
+    protocol: LocalProtocol,
+    stage: LocalStage,
+    config_name: str,
+    seed: int,
+    context: _AuthorizedContext,
+) -> float:
+    if (
+        config_name not in {protocol.control, protocol.candidate}
+        or seed not in stage.seeds
+        or path.name != f"{config_name}_seed{seed}.json"
+        or payload.get("schema") != screening.SHARD_SCHEMA
+        or payload.get("config_name") != config_name
+        or type(payload.get("seed")) is not int
+        or payload.get("seed") != seed
+        or payload.get("evidence_policy") != EXPECTED_POLICY
+        or payload.get("config") != _expected_config(stage.n_tasks)
+        or payload.get("noise_mode") != "step"
+        or payload.get("noise_pool_steps") is not None
+    ):
+        raise ValueError(f"executed shard protocol contract mismatch: {path}")
+    if payload.get("source_provenance") != context.identity["source_provenance"]:
+        raise ValueError(f"executed shard source provenance mismatch: {path}")
+    if payload.get("environment") != context.runner["screening_environment"]:
+        raise ValueError(f"executed shard runtime environment mismatch: {path}")
+    return _finite_float(payload.get("created_unix"), name="executed shard created_unix")
+
+
+def _authorized_context_unchanged(
+    before: _AuthorizedContext, after: _AuthorizedContext
+) -> bool:
+    return (
+        before.root == after.root
+        and before.namespace == after.namespace
+        and before.runner_raw == after.runner_raw
+        and before.launch_raw == after.launch_raw
+        and before.cache_raw == after.cache_raw
+        and _canonical_json(before.identity) == _canonical_json(after.identity)
+        and _canonical_json(before.runner) == _canonical_json(after.runner)
+        and _canonical_json(before.launch) == _canonical_json(after.launch)
+        and _canonical_json(before.cache) == _canonical_json(after.cache)
+    )
+
+
+def run_local_shard(
+    *,
+    protocol_key: str,
+    root: Path,
+    stage_key: str,
+    config_name: str,
+    seed: int,
+    repository_identity: Mapping[str, Any] | None = None,
+    runner_receipt: Mapping[str, Any] | None = None,
+    verify_cache_file: bool = True,
+    benchmark_main: Callable[[Sequence[str]], int] | None = None,
+    clock: Callable[[], float] = time.time,
+) -> dict[str, Any]:
+    """Run and bind one authorized shard; any occupied output forbids a rerun."""
+    protocol = protocol_for(protocol_key)
+    stage = _stage_for_key(protocol, stage_key)
+    if config_name not in {protocol.control, protocol.candidate}:
+        raise ValueError("config_name is not an authorized arm for this protocol")
+    if type(seed) is not int or seed not in stage.seeds:
+        raise ValueError("seed is not an authorized built-in integer for this stage")
+    (
+        resolved_root,
+        namespace,
+        namespace_identity,
+        shards,
+        bindings,
+    ) = _preflight_shard_run_structure(protocol=protocol, stage=stage, root=root)
+    context = _load_authorized_context(
+        protocol=protocol,
+        root=resolved_root,
+        namespace=namespace,
+        repository_identity=repository_identity,
+        runner_receipt=runner_receipt,
+        verify_cache_file=verify_cache_file,
+    )
+    prior_stages = _validate_prior_run_stages(
+        protocol=protocol, stage=stage, context=context
+    )
+    _require_namespace_identity(namespace, expected_identity=namespace_identity)
+    if shards is None or bindings is None:
+        stage_root = namespace / stage.key
+        os.mkdir(stage_root)
+        os.mkdir(stage_root / "shards")
+        os.mkdir(stage_root / "bindings")
+        shards, bindings = _preflight_partial_stage_structure(
+            protocol=protocol,
+            stage=stage,
+            stage_root=stage_root,
+        )
+    shard_path = shards / f"{config_name}_seed{seed}.json"
+    binding_path = bindings / f"{config_name}_seed{seed}.execution.v1.json"
+    if os.path.lexists(shard_path) or os.path.lexists(binding_path):
+        raise FileExistsError(
+            f"shard attempt is already consumed and may not be rerun: {shard_path}"
+        )
+    screening = (
+        _screening_module(resolved_root)
+        if benchmark_main is None
+        else importlib.import_module("alberta_framework.benchmarks.ipmnist_screening")
+    )
+    for existing_path in sorted(shards.iterdir()):
+        existing = screening.load_shard(existing_path)
+        _validate_run_shard_payload(
+            screening=screening,
+            path=existing_path,
+            payload=existing,
+            protocol=protocol,
+            stage=stage,
+            config_name=cast(str, existing["config_name"]),
+            seed=cast(int, existing["seed"]),
+            context=context,
+        )
+        _validate_execution_binding(
+            root=resolved_root,
+            protocol=protocol,
+            stage=stage,
+            shard_path=existing_path,
+            shard=existing,
+            runner=context.runner,
+            runner_raw=context.runner_raw,
+            launch=context.launch,
+            launch_raw=context.launch_raw,
+            cache=context.cache,
+            cache_raw=context.cache_raw,
+            summary_created_unix=time.time(),
+        )
+    started_unix = _finite_float(clock(), name="shard execution started_unix")
+    launch_unix = _parse_utc(
+        context.launch["launch_created_at"], label="launch"
+    ).timestamp()
+    cache_unix = _parse_utc(
+        context.cache["checked_at"], label="cache receipt"
+    ).timestamp()
+    prior_summary_unix = (
+        _finite_float(
+            prior_stages[-1]["summary_created_unix"],
+            name="prior summary created_unix",
+        )
+        if prior_stages
+        else -math.inf
+    )
+    if started_unix <= max(launch_unix, cache_unix, prior_summary_unix):
+        raise ValueError(
+            "shard execution must start strictly after launch, cache, and prior gate"
+        )
+    argv = _benchmark_run_argv(
+        root=resolved_root,
+        protocol=protocol,
+        stage=stage,
+        config_name=config_name,
+        seed=seed,
+        data_home=cast(str, context.launch["data_home"]),
+    )
+    handler = screening.main if benchmark_main is None else benchmark_main
+    previous_cwd = Path.cwd()
+    try:
+        os.chdir(resolved_root)
+        returncode = handler(argv)
+    finally:
+        os.chdir(previous_cwd)
+    if type(returncode) is not int or returncode != 0:
+        raise RuntimeError(f"authorized benchmark shard failed with exit code {returncode!r}")
+    finished_unix = _finite_float(clock(), name="shard execution finished_unix")
+    if finished_unix <= started_unix:
+        raise ValueError("shard execution finish must be strictly after its start")
+    _require_namespace_identity(namespace, expected_identity=namespace_identity)
+    _require_real_directory(shards, label=f"stage {stage.key} shards")
+    _require_real_directory(bindings, label=f"stage {stage.key} execution bindings")
+    _require_regular_file(shard_path, label="executed shard")
+    if os.path.lexists(binding_path):
+        raise FileExistsError(f"execution binding path is already occupied: {binding_path}")
+    after = _load_authorized_context(
+        protocol=protocol,
+        root=resolved_root,
+        namespace=namespace,
+        repository_identity=repository_identity,
+        runner_receipt=runner_receipt,
+        verify_cache_file=verify_cache_file,
+    )
+    if not _authorized_context_unchanged(context, after):
+        raise ValueError("authorized source, runner, launch, or cache changed during execution")
+    shard = screening.load_shard(shard_path)
+    shard_created_unix = _validate_run_shard_payload(
+        screening=screening,
+        path=shard_path,
+        payload=shard,
+        protocol=protocol,
+        stage=stage,
+        config_name=config_name,
+        seed=seed,
+        context=after,
+    )
+    if not started_unix < shard_created_unix < finished_unix:
+        raise ValueError("executed shard must be created strictly between start and finish")
+    bound_unix = _finite_float(clock(), name="shard execution bound_unix")
+    if bound_unix <= finished_unix:
+        raise ValueError("execution binding must be created strictly after the shard finishes")
+    receipt = _execution_binding_payload(
+        root=resolved_root,
+        protocol=protocol,
+        stage=stage,
+        config_name=config_name,
+        seed=seed,
+        shard_path=shard_path,
+        shard=shard,
+        runner=after.runner,
+        runner_raw=after.runner_raw,
+        launch=after.launch,
+        launch_raw=after.launch_raw,
+        cache=after.cache,
+        cache_raw=after.cache_raw,
+        started_unix=started_unix,
+        finished_unix=finished_unix,
+        bound_unix=bound_unix,
+    )
+    _write_json_exclusive(binding_path, receipt)
+    return receipt
 
 
 def _finalize_result_bundle(
@@ -1788,53 +2700,26 @@ def validate_result_bundle(
     verify_cache_file: bool = True,
 ) -> dict[str, Any]:
     protocol = protocol_for(protocol_key)
-    if Path(root).is_symlink():
-        raise ValueError("repository root must not be a symlink")
-    resolved_root = Path(root).resolve(strict=True)
-    namespace = resolved_root / OUTPUT_ROOT / protocol.namespace
-    for directory, label in (
-        (resolved_root, "repository root"),
-        (resolved_root / "outputs", "outputs root"),
-        (resolved_root / OUTPUT_ROOT, "IPMNIST output root"),
-        (namespace, "protocol namespace"),
-    ):
-        _require_real_directory(directory, label=label)
-    _reject_symlinks(namespace)
+    resolved_root, namespace, _namespace_identity = _preflight_result_structure(
+        protocol=protocol, root=root
+    )
     initial_namespace_manifest = _namespace_file_manifest(namespace)
-    stored_runner, runner_raw = _strict_json_bytes(namespace / "runner.v1.json")
-    cpu = cast(dict[str, Any], stored_runner.get("cpu"))
-    cpuset = cpu.get("requested_cpuset") if isinstance(cpu, dict) else None
-    if not isinstance(cpuset, str):
-        raise ValueError("stored runner receipt has no canonical requested cpuset")
-    stored_runner = _validate_runner_receipt(stored_runner, expected_cpuset=cpuset)
-    current_runner = _validate_runner_receipt(
-        capture_runner_receipt(cpuset) if runner_receipt is None else runner_receipt,
-        expected_cpuset=cpuset,
-    )
-    if current_runner != stored_runner:
-        raise ValueError("current result-validation runner differs from launch runner")
-    stored_launch, launch_raw = _strict_json_bytes(namespace / "launch.v1.json")
-    current_identity = _validate_repository_identity(
-        capture_repository_identity(resolved_root)
-        if repository_identity is None
-        else repository_identity
-    )
-    launch = _validate_launch_receipt(
-        stored_launch,
+    context = _load_authorized_context(
         protocol=protocol,
-        identity=current_identity,
-        runner=stored_runner,
-        runner_raw=runner_raw,
+        root=resolved_root,
+        namespace=namespace,
+        repository_identity=repository_identity,
+        runner_receipt=runner_receipt,
+        verify_cache_file=verify_cache_file,
     )
-    stored_cache, cache_raw = _strict_json_bytes(namespace / "cache.v1.json")
-    cache = _validate_cache_receipt(
-        stored_cache,
-        protocol=protocol,
-        launch=launch,
-        launch_raw=launch_raw,
-        verify_file=verify_cache_file,
-    )
-    cache_receipt_sha256 = hashlib.sha256(cache_raw).hexdigest()
+    current_identity = context.identity
+    stored_runner = context.runner
+    runner_raw = context.runner_raw
+    launch = context.launch
+    launch_raw = context.launch_raw
+    cache = context.cache
+    cache_raw = context.cache_raw
+    cache_receipt_sha256 = hashlib.sha256(context.cache_raw).hexdigest()
     receipt_bindings = {
         "runner_receipt_sha256": hashlib.sha256(runner_raw).hexdigest(),
         "launch_receipt_sha256": hashlib.sha256(launch_raw).hexdigest(),
@@ -1850,6 +2735,11 @@ def validate_result_bundle(
         stage=protocol.stages[0],
         identity=current_identity,
         runner=stored_runner,
+        runner_raw=runner_raw,
+        launch=launch,
+        launch_raw=launch_raw,
+        cache=cache,
+        cache_raw=cache_raw,
     )
     cache_checked_at = _parse_utc(cache["checked_at"], label="cache receipt")
     if _finite_float(
@@ -1894,6 +2784,11 @@ def validate_result_bundle(
             stage=protocol.stages[1],
             identity=current_identity,
             runner=stored_runner,
+            runner_raw=runner_raw,
+            launch=launch,
+            launch_raw=launch_raw,
+            cache=cache,
+            cache_raw=cache_raw,
         )
         _require_stage_after(second, first, stage="confirm_200_tuning")
         _require_same_stage_dataset(second, first, stage="confirm_200_tuning")
@@ -1933,6 +2828,11 @@ def validate_result_bundle(
             stage=protocol.stages[2],
             identity=current_identity,
             runner=stored_runner,
+            runner_raw=runner_raw,
+            launch=launch,
+            launch_raw=launch_raw,
+            cache=cache,
+            cache_raw=cache_raw,
         )
         _require_stage_after(
             evaluation, second, stage="confirm_200_evaluation"
@@ -1979,12 +2879,18 @@ def validate_result_bundle(
     combined = _validate_collection(
         root=resolved_root,
         protocol=protocol,
+        stage=None,
         seeds=tuple(range(20, 40)),
         n_tasks=200,
         paths=(*tuning_paths, *evaluation_paths),
         summary_path=combined_root / "summary.json",
         identity=current_identity,
         runner=stored_runner,
+        runner_raw=runner_raw,
+        launch=launch,
+        launch_raw=launch_raw,
+        cache=cache,
+        cache_raw=cache_raw,
     )
     if _finite_float(
         combined.get("summary_created_unix"), name="combined summary created_unix"
@@ -2039,37 +2945,48 @@ def validate_and_publish_result(
     verify_cache_file: bool = True,
 ) -> dict[str, Any]:
     protocol = protocol_for(protocol_key)
-    resolved_root = Path(root).resolve(strict=True)
-    namespace = resolved_root / OUTPUT_ROOT / protocol.namespace
-    claim_path = namespace / "result-claim.v1.json"
+    resolved_root, namespace, namespace_identity = _preflight_result_structure(
+        protocol=protocol, root=root
+    )
     claim = {
         "schema": "asi.ipmnist_local_prereg.result_claim.v1",
         "protocol_key": protocol.key,
         "claimed_at": dt.datetime.now(dt.UTC).isoformat().replace("+00:00", "Z"),
         "rerun_allowed": False,
     }
-    _write_json_exclusive(claim_path, claim)
-    result = validate_result_bundle(
-        protocol_key=protocol_key,
-        root=resolved_root,
-        repository_identity=repository_identity,
-        runner_receipt=runner_receipt,
-        verify_cache_file=verify_cache_file,
+    namespace_fd = _open_verified_namespace(
+        namespace, expected_identity=namespace_identity
     )
-    expected_claim_sha256 = _receipt_sha256(claim)
-    if result.get("result_claim_sha256") != expected_claim_sha256:
-        raise RuntimeError("result reconstruction did not bind the exact result claim")
-    _write_json_exclusive(namespace / "result.v1.json", result)
-    reloaded = validate_result_bundle(
-        protocol_key=protocol_key,
-        root=resolved_root,
-        repository_identity=repository_identity,
-        runner_receipt=runner_receipt,
-        verify_cache_file=verify_cache_file,
-    )
-    if _canonical_json(reloaded) != _canonical_json(result):
-        raise RuntimeError("published result did not survive strict on-disk reconstruction")
-    return reloaded
+    try:
+        _write_json_exclusive_at(namespace_fd, "result-claim.v1.json", claim)
+        result = validate_result_bundle(
+            protocol_key=protocol_key,
+            root=resolved_root,
+            repository_identity=repository_identity,
+            runner_receipt=runner_receipt,
+            verify_cache_file=verify_cache_file,
+        )
+        expected_claim_sha256 = _receipt_sha256(claim)
+        if result.get("result_claim_sha256") != expected_claim_sha256:
+            raise RuntimeError("result reconstruction did not bind the exact result claim")
+        _require_namespace_identity(
+            namespace, expected_identity=namespace_identity
+        )
+        _write_json_exclusive_at(namespace_fd, "result.v1.json", result)
+        reloaded = validate_result_bundle(
+            protocol_key=protocol_key,
+            root=resolved_root,
+            repository_identity=repository_identity,
+            runner_receipt=runner_receipt,
+            verify_cache_file=verify_cache_file,
+        )
+        if _canonical_json(reloaded) != _canonical_json(result):
+            raise RuntimeError(
+                "published result did not survive strict on-disk reconstruction"
+            )
+        return reloaded
+    finally:
+        os.close(namespace_fd)
 
 
 def _github_token() -> str:
@@ -2238,6 +3155,18 @@ def _record_cache_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_shard_command(args: argparse.Namespace) -> int:
+    payload = run_local_shard(
+        protocol_key=cast(str, args.protocol),
+        root=Path(args.root),
+        stage_key=cast(str, args.stage),
+        config_name=cast(str, args.config_name),
+        seed=cast(int, args.seed),
+    )
+    print(_canonical_json(payload))
+    return 0
+
+
 def _validate_command(args: argparse.Namespace) -> int:
     payload = validate_and_publish_result(
         protocol_key=cast(str, args.protocol),
@@ -2289,6 +3218,16 @@ def build_parser() -> argparse.ArgumentParser:
     _add_protocol_root_arguments(cache)
     cache.add_argument("--data-home", type=Path, required=True)
     cache.set_defaults(handler=_record_cache_command)
+
+    run_shard = subparsers.add_parser(
+        "run-shard",
+        help="run and causally bind one exact authorized benchmark shard",
+    )
+    _add_protocol_root_arguments(run_shard)
+    run_shard.add_argument("--stage", required=True)
+    run_shard.add_argument("--config-name", required=True)
+    run_shard.add_argument("--seed", type=int, required=True)
+    run_shard.set_defaults(handler=_run_shard_command)
 
     validate = subparsers.add_parser(
         "validate",

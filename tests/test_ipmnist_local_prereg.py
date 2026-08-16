@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import json
 import os
 import runpy
@@ -27,7 +28,9 @@ _l2init_gate_passes = cast(Any, _DRIVER["l2init_gate_passes"])
 _parse_cpuset = cast(Any, _DRIVER["_parse_cpuset"])
 _receipt_sha256 = cast(Any, _DRIVER["_receipt_sha256"])
 _record_cache_receipt = cast(Any, _DRIVER["record_cache_receipt"])
+_run_local_shard = cast(Any, _DRIVER["run_local_shard"])
 _strict_json = cast(Any, _DRIVER["_strict_json"])
+_strict_json_bytes = cast(Any, _DRIVER["_strict_json_bytes"])
 _validate_and_publish_result = cast(Any, _DRIVER["validate_and_publish_result"])
 _validate_result_bundle = cast(Any, _DRIVER["validate_result_bundle"])
 _validate_runner_receipt = cast(Any, _DRIVER["_validate_runner_receipt"])
@@ -682,6 +685,108 @@ def _write_protocol_receipts(root: Path, protocol_key: str) -> Path:
     return namespace
 
 
+def _benchmark_argv(
+    *,
+    root: Path,
+    protocol: Any,
+    stage: Any,
+    config_name: str,
+    seed: int,
+    data_home: str,
+) -> list[str]:
+    output = (
+        root
+        / "outputs/ipmnist_screening"
+        / cast(str, protocol.namespace)
+        / cast(str, stage.key)
+        / "shards"
+        / f"{config_name}_seed{seed}.json"
+    ).relative_to(root)
+    return [
+        "run",
+        "--config-name",
+        config_name,
+        "--seed",
+        str(seed),
+        "--n-tasks",
+        str(stage.n_tasks),
+        "--task-length",
+        "5000",
+        "--data-home",
+        data_home,
+        "--out",
+        output.as_posix(),
+        "--progress-every",
+        "10",
+        "--noise-mode",
+        "step",
+    ]
+
+
+def _write_execution_bindings(
+    root: Path,
+    protocol: Any,
+    stage: Any,
+    paths: list[Path],
+    *,
+    summary_created_unix: float,
+) -> None:
+    namespace = root / "outputs/ipmnist_screening" / cast(str, protocol.namespace)
+    runner, runner_raw = _strict_json_bytes(namespace / "runner.v1.json")
+    launch, launch_raw = _strict_json_bytes(namespace / "launch.v1.json")
+    cache, cache_raw = _strict_json_bytes(namespace / "cache.v1.json")
+    bindings = namespace / cast(str, stage.key) / "bindings"
+    bindings.mkdir()
+    cache_unix = dt.datetime.fromisoformat(
+        cast(str, cache["checked_at"]).replace("Z", "+00:00")
+    ).timestamp()
+    for shard_path in paths:
+        shard, shard_raw = _strict_json_bytes(shard_path)
+        created_unix = cast(float, shard["created_unix"])
+        started_unix = (cache_unix + created_unix) / 2.0
+        finished_unix = (created_unix + summary_created_unix) / 2.0
+        bound_unix = (finished_unix + summary_created_unix) / 2.0
+        config_name = cast(str, shard["config_name"])
+        seed = cast(int, shard["seed"])
+        receipt = {
+            "schema": "asi.ipmnist_local_prereg.shard_execution.v1",
+            "protocol_key": protocol.key,
+            "stage_key": stage.key,
+            "config_name": config_name,
+            "seed": seed,
+            "repository": launch["repository"],
+            "runner_context": runner,
+            "runner_receipt_sha256": hashlib.sha256(runner_raw).hexdigest(),
+            "launch_receipt_sha256": hashlib.sha256(launch_raw).hexdigest(),
+            "cache_context": cache,
+            "cache_receipt_sha256": hashlib.sha256(cache_raw).hexdigest(),
+            "data_home": launch["data_home"],
+            "data_home_sha256": launch["data_home_sha256"],
+            "cache_contract": launch["cache_contract"],
+            "shard": {
+                "path": shard_path.relative_to(root).as_posix(),
+                "size_bytes": len(shard_raw),
+                "sha256": hashlib.sha256(shard_raw).hexdigest(),
+                "created_unix": created_unix,
+            },
+            "started_unix": started_unix,
+            "finished_unix": finished_unix,
+            "bound_unix": bound_unix,
+            "benchmark_argv": _benchmark_argv(
+                root=root,
+                protocol=protocol,
+                stage=stage,
+                config_name=config_name,
+                seed=seed,
+                data_home=cast(str, launch["data_home"]),
+            ),
+            "rerun_allowed": False,
+        }
+        _write_json_exclusive(
+            bindings / f"{config_name}_seed{seed}.execution.v1.json", receipt
+        )
+
+
 def _write_stage(
     root: Path,
     protocol_key: str,
@@ -689,6 +794,7 @@ def _write_stage(
     *,
     differences: tuple[float, ...],
     dataset_provenance: dict[str, Any] | None = None,
+    created_unix: float | None = None,
 ) -> Path:
     from alberta_framework.benchmarks.ipmnist_screening import (
         ScreeningRunResult,
@@ -733,18 +839,16 @@ def _write_stage(
                 wall_clock_seconds=1.0,
             )
             path = shards_dir / f"{arm}_seed{seed}.json"
+            payload = shard_payload(
+                result,
+                source_provenance=_repository_identity()["source_provenance"],
+                dataset_provenance=dataset,
+                environment=_screening_environment(),
+            )
+            if created_unix is not None:
+                payload["created_unix"] = created_unix
             path.write_text(
-                json.dumps(
-                    shard_payload(
-                        result,
-                        source_provenance=_repository_identity()["source_provenance"],
-                        dataset_provenance=dataset,
-                        environment=_screening_environment(),
-                    ),
-                    allow_nan=False,
-                    sort_keys=True,
-                ),
-                encoding="utf-8",
+                json.dumps(payload, allow_nan=False, sort_keys=True), encoding="utf-8"
             )
             paths.append(path)
     prior = Path.cwd()
@@ -761,7 +865,102 @@ def _write_stage(
     summary_path.write_text(
         json.dumps(summary, allow_nan=False, sort_keys=True), encoding="utf-8"
     )
+    _write_execution_bindings(
+        root,
+        protocol,
+        stage,
+        paths,
+        summary_created_unix=cast(float, summary["created_unix"]),
+    )
     return summary_path
+
+
+def test_run_shard_wrapper_binds_one_exact_in_process_execution(tmp_path: Path) -> None:
+    from alberta_framework.benchmarks.ipmnist_screening import (
+        ScreeningRunResult,
+        screening_spec,
+        shard_payload,
+    )
+    from alberta_framework.benchmarks.upgd_ipmnist import IPMNISTConfig
+
+    namespace = _write_protocol_receipts(tmp_path, "issue184")
+    protocol = _PROTOCOLS["issue184"]
+    stage = protocol.stages[0]
+    arm = cast(str, protocol.control)
+    seed = 0
+    calls: list[list[str]] = []
+
+    def fake_benchmark(argv: Any) -> int:
+        arguments = list(argv)
+        calls.append(arguments)
+        assert arguments == _benchmark_argv(
+            root=tmp_path,
+            protocol=protocol,
+            stage=stage,
+            config_name=arm,
+            seed=seed,
+            data_home=str((tmp_path / "openml-cache").absolute()),
+        )
+        config = IPMNISTConfig(n_tasks=60, task_length=5_000)
+        spec = screening_spec(arm)
+        result = ScreeningRunResult(
+            config_name=arm,
+            base_learner=spec.base_learner,
+            hyperparameters=dict(spec.hyperparameters),
+            seed=seed,
+            config=config,
+            per_task_accuracy=np.full(60, 0.5, dtype=np.float64),
+            per_task_loss=np.full(60, 0.5, dtype=np.float64),
+            per_task_plasticity=np.full(60, 0.5, dtype=np.float64),
+            wall_clock_seconds=1.0,
+        )
+        payload = shard_payload(
+            result,
+            source_provenance=_repository_identity()["source_provenance"],
+            dataset_provenance=_dataset_provenance(),
+            environment=_screening_environment(),
+        )
+        payload["created_unix"] = 1_786_880_002.0
+        output = tmp_path / arguments[arguments.index("--out") + 1]
+        output.write_text(
+            json.dumps(payload, allow_nan=False, sort_keys=True), encoding="utf-8"
+        )
+        return 0
+
+    times = iter((1_786_880_000.0, 1_786_880_004.0, 1_786_880_005.0))
+    receipt = _run_local_shard(
+        protocol_key="issue184",
+        root=tmp_path,
+        stage_key="screen_60",
+        config_name=arm,
+        seed=seed,
+        repository_identity=_repository_identity(),
+        runner_receipt=_runner_receipt(),
+        verify_cache_file=False,
+        benchmark_main=fake_benchmark,
+        clock=lambda: next(times),
+    )
+
+    assert len(calls) == 1
+    assert receipt["runner_context"] == _runner_receipt()
+    assert receipt["cache_context"] == _strict_json(namespace / "cache.v1.json")
+    assert receipt["data_home"] == str((tmp_path / "openml-cache").absolute())
+    assert receipt["shard"]["sha256"] == hashlib.sha256(
+        (namespace / f"screen_60/shards/{arm}_seed0.json").read_bytes()
+    ).hexdigest()
+    with pytest.raises(FileExistsError, match="already consumed"):
+        _run_local_shard(
+            protocol_key="issue184",
+            root=tmp_path,
+            stage_key="screen_60",
+            config_name=arm,
+            seed=seed,
+            repository_identity=_repository_identity(),
+            runner_receipt=_runner_receipt(),
+            verify_cache_file=False,
+            benchmark_main=fake_benchmark,
+        )
+    assert len(calls) == 1
 
 
 def _write_combined_summary(root: Path) -> Path:
@@ -1047,6 +1246,175 @@ def test_result_validation_rejects_shards_created_before_cache_receipt(
         _validate(tmp_path, "issue184")
 
 
+def _first_execution_binding(namespace: Path) -> Path:
+    return (
+        namespace
+        / "screen_60/bindings/rls_head_resid_l1_noreset_seed0.execution.v1.json"
+    )
+
+
+def test_every_shard_requires_one_full_execution_binding(tmp_path: Path) -> None:
+    namespace = _write_protocol_receipts(tmp_path, "issue184")
+    _write_stage(tmp_path, "issue184", "screen_60", differences=(0.003,) * 3)
+    _first_execution_binding(namespace).unlink()
+    with pytest.raises(ValueError, match="execution binding"):
+        _validate(tmp_path, "issue184")
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        "cpu-model",
+        "cpuset",
+        "pythonhashseed",
+        "pythonoptimize",
+        "xla-preallocate",
+        "cache",
+        "data-home",
+        "runner-digest",
+        "launch-digest",
+        "cache-digest",
+        "shard-digest",
+    ],
+)
+def test_execution_binding_rejects_resigned_runner_cache_or_shard_drift(
+    tmp_path: Path, tamper: str
+) -> None:
+    namespace = _write_protocol_receipts(tmp_path, "issue184")
+    _write_stage(tmp_path, "issue184", "screen_60", differences=(0.003,) * 3)
+    binding_path = _first_execution_binding(namespace)
+    binding = json.loads(binding_path.read_text(encoding="utf-8"))
+    if tamper == "cpu-model":
+        binding["runner_context"]["cpu"]["model"] = "Different CPU"
+    elif tamper == "cpuset":
+        binding["runner_context"]["cpu"]["effective_cpuset"] = [0, 1]
+    elif tamper == "pythonhashseed":
+        binding["runner_context"]["process_environment"]["PYTHONHASHSEED"] = "1"
+    elif tamper == "pythonoptimize":
+        binding["runner_context"]["process_environment"]["PYTHONOPTIMIZE"] = "1"
+    elif tamper == "xla-preallocate":
+        binding["runner_context"]["process_environment"][
+            "XLA_PYTHON_CLIENT_PREALLOCATE"
+        ] = "true"
+    elif tamper == "cache":
+        binding["cache_context"]["sha256"] = "a" * 64
+    elif tamper == "data-home":
+        binding["data_home"] = "/tmp/different-cache"
+    elif tamper == "runner-digest":
+        binding["runner_receipt_sha256"] = "a" * 64
+    elif tamper == "launch-digest":
+        binding["launch_receipt_sha256"] = "a" * 64
+    elif tamper == "cache-digest":
+        binding["cache_receipt_sha256"] = "a" * 64
+    else:
+        binding["shard"]["sha256"] = "a" * 64
+    binding_path.write_text(
+        json.dumps(binding, allow_nan=False, sort_keys=True), encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="execution binding"):
+        _validate(tmp_path, "issue184")
+
+
+@pytest.mark.parametrize(
+    "created_unix",
+    [
+        dt.datetime(2026, 8, 16, 9, 1, tzinfo=dt.UTC).timestamp(),
+        dt.datetime(2026, 8, 16, 9, 2, tzinfo=dt.UTC).timestamp(),
+        dt.datetime(2026, 8, 16, 9, 2, 30, tzinfo=dt.UTC).timestamp(),
+        dt.datetime(2026, 8, 16, 9, 3, tzinfo=dt.UTC).timestamp(),
+    ],
+)
+def test_every_shard_must_be_strictly_after_launch_and_cache(
+    tmp_path: Path, created_unix: float
+) -> None:
+    _write_protocol_receipts(tmp_path, "issue184")
+    _write_stage(
+        tmp_path,
+        "issue184",
+        "screen_60",
+        differences=(0.003,) * 3,
+        created_unix=created_unix,
+    )
+    with pytest.raises(ValueError, match="after.*launch.*cache|after the cache receipt"):
+        _validate(tmp_path, "issue184")
+
+
+@pytest.mark.parametrize("offset", [0.0, -1.0])
+def test_every_shard_must_be_strictly_before_its_summary(
+    tmp_path: Path, offset: float
+) -> None:
+    namespace = _write_protocol_receipts(tmp_path, "issue184")
+    summary_path = _write_stage(
+        tmp_path, "issue184", "screen_60", differences=(0.003,) * 3
+    )
+    shard_created = max(
+        cast(float, _strict_json(path)["created_unix"])
+        for path in (namespace / "screen_60/shards").iterdir()
+    )
+    summary = _strict_json(summary_path)
+    summary["created_unix"] = shard_created + offset
+    summary_path.write_text(
+        json.dumps(summary, allow_nan=False, sort_keys=True), encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="summary.*strictly after.*shard"):
+        _validate(tmp_path, "issue184")
+
+
+def _publication_kwargs(root: Path, protocol_key: str = "issue184") -> dict[str, Any]:
+    return {
+        "protocol_key": protocol_key,
+        "root": root,
+        "repository_identity": _repository_identity(),
+        "runner_receipt": _runner_receipt(),
+        "verify_cache_file": False,
+    }
+
+
+def test_result_preflight_never_claims_through_a_root_symlink(tmp_path: Path) -> None:
+    actual = tmp_path / "actual"
+    namespace = _write_protocol_receipts(actual, "issue184")
+    _write_stage(actual, "issue184", "screen_60", differences=(0.003,) * 3)
+    alias = tmp_path / "alias"
+    alias.symlink_to(actual, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="root.*symlink"):
+        _validate_and_publish_result(**_publication_kwargs(alias))
+    assert not (namespace / "result-claim.v1.json").exists()
+
+
+def test_result_preflight_never_claims_through_a_namespace_symlink(
+    tmp_path: Path,
+) -> None:
+    external = tmp_path / "external"
+    external_namespace = _write_protocol_receipts(external, "issue184")
+    _write_stage(external, "issue184", "screen_60", differences=(0.003,) * 3)
+    safe = tmp_path / "safe"
+    output_root = safe / "outputs/ipmnist_screening"
+    output_root.mkdir(parents=True)
+    (output_root / "rls_preset_ablation_r1").symlink_to(
+        external_namespace, target_is_directory=True
+    )
+
+    with pytest.raises(ValueError, match="namespace.*symlink"):
+        _validate_and_publish_result(**_publication_kwargs(safe))
+    assert not (external_namespace / "result-claim.v1.json").exists()
+
+
+def test_result_preflight_rejects_shard_symlink_before_claim(tmp_path: Path) -> None:
+    namespace = _write_protocol_receipts(tmp_path, "issue184")
+    _write_stage(tmp_path, "issue184", "screen_60", differences=(0.003,) * 3)
+    shard = namespace / "screen_60/shards/rls_head_resid_l1_noreset_seed0.json"
+    external = tmp_path / "external-shard.json"
+    external.write_bytes(shard.read_bytes())
+    shard.unlink()
+    shard.symlink_to(external)
+
+    with pytest.raises(ValueError, match="symlink"):
+        _validate_and_publish_result(**_publication_kwargs(tmp_path))
+    assert not (namespace / "result-claim.v1.json").exists()
+
+
 @pytest.mark.parametrize(
     "claim",
     [
@@ -1223,6 +1591,17 @@ def test_result_validation_rejects_external_hard_link_alias(tmp_path: Path) -> N
             ],
         ),
         ("record-cache", ["--data-home", "/tmp/mnist-cache"]),
+        (
+            "run-shard",
+            [
+                "--stage",
+                "screen_60",
+                "--config-name",
+                "rls_head_resid_l1_preset005",
+                "--seed",
+                "0",
+            ],
+        ),
         ("validate", []),
     ],
 )
