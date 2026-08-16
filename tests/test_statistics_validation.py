@@ -244,6 +244,14 @@ class TestBootstrapCI:
             with pytest.raises(ValueError, match="empty"):
                 bootstrap_ci(empty)
 
+    @pytest.mark.parametrize("poison", [float("nan"), float("inf"), float("-inf")])
+    def test_nonfinite_values_rejected_without_warnings(self, poison: float) -> None:
+        """A poisoned seed must not become a non-finite bootstrap estimate or CI."""
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with pytest.raises(ValueError, match=r"^values must be finite$"):
+                bootstrap_ci([1.0, poison, 2.0], n_bootstrap=20, seed=0)
+
     @pytest.mark.parametrize("statistic", ["typo", "Mean", ""])
     def test_unknown_statistic_rejected_without_warnings(self, statistic: str) -> None:
         with warnings.catch_warnings():

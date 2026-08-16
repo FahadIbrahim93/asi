@@ -674,9 +674,9 @@ def bootstrap_ci(
         Tuple of (point_estimate, ci_lower, ci_upper)
 
     Raises:
-        ValueError: If ``values`` is empty, ``statistic`` is not ``"mean"`` or
-            ``"median"``, ``confidence_level`` is not strictly between 0 and 1,
-            or ``n_bootstrap`` is not positive.
+        ValueError: If ``values`` is empty or contains a non-finite sample,
+            ``statistic`` is not ``"mean"`` or ``"median"``, ``confidence_level``
+            is not strictly between 0 and 1, or ``n_bootstrap`` is not positive.
     """
     arr = np.asarray(values)
     if len(arr) == 0:
@@ -684,6 +684,7 @@ def bootstrap_ci(
             "bootstrap_ci requires at least one value; got an empty array "
             "(a NaN interval would be indistinguishable from a real CI)"
         )
+    _require_finite_values(arr, name="values")
     if statistic not in ("mean", "median"):
         raise ValueError(
             f"statistic must be either 'mean' or 'median' (got {statistic!r})"
