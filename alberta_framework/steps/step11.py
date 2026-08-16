@@ -463,8 +463,7 @@ def run_step11_smoke(
     Returns:
         :class:`Step11SmokeResult` with shape/fineness summary.
     """
-    if steps < 1:
-        raise ValueError("steps must be positive")
+    steps = _require_int("steps", steps, minimum=1)
 
     cfg = config
     if cfg is None:
