@@ -43,15 +43,16 @@ def format_duration(seconds: float) -> str:
     format_duration(3665)  # Returns: '1h 1m 5.00s'
     ```
     """
-    if seconds < 60:
-        return f"{seconds:.2f}s"
-    elif seconds < 3600:
-        minutes = int(seconds // 60)
-        secs = seconds % 60
+    rounded_seconds = round(seconds, 2)
+    if rounded_seconds < 60:
+        return f"{rounded_seconds:.2f}s"
+    elif rounded_seconds < 3600:
+        minutes = int(rounded_seconds // 60)
+        secs = rounded_seconds % 60
         return f"{minutes}m {secs:.2f}s"
     else:
-        hours = int(seconds // 3600)
-        remaining = seconds % 3600
+        hours = int(rounded_seconds // 3600)
+        remaining = rounded_seconds % 3600
         minutes = int(remaining // 60)
         secs = remaining % 60
         return f"{hours}h {minutes}m {secs:.2f}s"

@@ -41,6 +41,8 @@ def test_format_duration_branches() -> None:
     assert format_duration(0.5) == "0.50s"
     assert format_duration(90.5) == "1m 30.50s"
     assert format_duration(3665) == "1h 1m 5.00s"
+    assert format_duration(59.999) == "1m 0.00s"
+    assert format_duration(3599.999) == "1h 0m 0.00s"
 
 
 def test_timer_monotonic_accumulation() -> None:
