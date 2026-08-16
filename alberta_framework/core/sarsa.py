@@ -22,7 +22,7 @@ import dataclasses
 import functools
 import math
 import time
-from numbers import Real
+from numbers import Integral, Real
 from typing import Any
 
 import chex
@@ -32,6 +32,7 @@ import jax.random as jr
 from jax import Array
 from jaxtyping import Float, Int
 
+from alberta_framework._float32 import round_real_to_float32_with_ratio
 from alberta_framework.core.horde import HordeLearner
 from alberta_framework.core.multi_head_learner import (
     MULTI_HEAD_MLP_STATE_SCHEMA,
@@ -76,30 +77,41 @@ class SARSAConfig:
     epsilon_decay_steps: int = 0
 
     def __post_init__(self) -> None:
-        """Validate SARSA hyperparameters at construction time."""
-        if self.n_actions < 1:
-            raise ValueError("n_actions must be at least 1")
-        if not isinstance(self.gamma, Real) or isinstance(self.gamma, bool):
-            raise ValueError("gamma must be a real number")
-        if not math.isfinite(self.gamma) or not 0.0 <= self.gamma <= 1.0:
-            raise ValueError("gamma must be a finite value in [0, 1]")
+        """Reject invalid host configuration before it reaches JAX indexing."""
+        actual_actions_type = type(self.n_actions)
+        if (
+            issubclass(actual_actions_type, bool)
+            or not issubclass(actual_actions_type, Integral)
+            or self.n_actions < 1
+        ):
+            raise ValueError("n_actions must be a positive integer")
+        actual_decay_type = type(self.epsilon_decay_steps)
+        if (
+            issubclass(actual_decay_type, bool)
+            or not issubclass(actual_decay_type, Integral)
+            or self.epsilon_decay_steps < 0
+        ):
+            raise ValueError("epsilon_decay_steps must be a non-negative integer")
         for name, value in (
+            ("gamma", self.gamma),
             ("epsilon_start", self.epsilon_start),
             ("epsilon_end", self.epsilon_end),
         ):
-            if not isinstance(value, Real) or isinstance(value, bool):
-                raise ValueError(f"{name} must be a real number")
-            if not math.isfinite(value) or not 0.0 <= value <= 1.0:
-                raise ValueError(f"{name} must be a finite value in [0, 1]")
-        if self.epsilon_decay_steps < 0:
-            raise ValueError("epsilon_decay_steps must be non-negative")
-        if (
-            self.epsilon_decay_steps > 0
-            and self.epsilon_end > self.epsilon_start
-        ):
-            raise ValueError(
-                "epsilon_end must not exceed epsilon_start when decaying"
-            )
+            actual_type = type(value)
+            if issubclass(actual_type, bool) or not issubclass(actual_type, Real):
+                raise ValueError(f"{name} must be a finite real in [0, 1]")
+            try:
+                numerator, denominator, narrowed = round_real_to_float32_with_ratio(value)
+            except (FloatingPointError, OverflowError, TypeError, ValueError) as exc:
+                raise ValueError(f"{name} must be a finite real in [0, 1]") from exc
+            if (
+                not math.isfinite(narrowed)
+                or numerator < 0
+                or numerator > denominator
+                or narrowed < 0.0
+                or narrowed > 1.0
+            ):
+                raise ValueError(f"{name} must be a finite real in [0, 1]")
 
     def to_config(self) -> dict[str, Any]:
         """Serialize to dict."""
