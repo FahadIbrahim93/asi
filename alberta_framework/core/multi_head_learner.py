@@ -64,6 +64,11 @@ MULTI_HEAD_LIFETIME_COUNTER_DELTA_NBYTES = 8
 _INT32_MAX = 2**31 - 1
 
 
+def _skip_zero_scale(scale: Array, value: Array) -> Array:
+    """Return 0 when ``scale`` is 0 so IEEE ``0 * inf`` does not become NaN."""
+    return jnp.where(scale == 0.0, jnp.zeros_like(value), scale * value)
+
+
 def _extract_mean_step_size(
     opt_state: LMSState | AutostepParamState | IDBDParamState,
 ) -> Array:
@@ -777,12 +782,41 @@ class MultiHeadMLPLearner:
         """
         n_heads = self._n_heads
         counter_status = self._counter_status(state)
-        source_state_finite = _floating_tree_is_finite(state)
         inputs_valid = jnp.all(jnp.isfinite(observation)) & jnp.all(
             jnp.isfinite(targets) | jnp.isnan(targets)
         )
         gamma_lamda = jnp.array(self._gamma * self._lamda, dtype=jnp.float32)
         replacing = self._trace_mode == TraceMode.REPLACING
+        previous_checked = state
+        if self._gamma * self._lamda == 0.0:
+            previous_checked = previous_checked.replace(  # type: ignore[attr-defined]
+                trunk_traces=tuple(
+                    jnp.zeros_like(trace) for trace in state.trunk_traces
+                ),
+            )
+        checked_head_traces = []
+        for i, (old_w_trace, old_b_trace) in enumerate(state.head_traces):
+            head_decay_value = (
+                self._per_head_gl[i]
+                if self._per_head_gl is not None
+                else self._gamma * self._lamda
+            )
+            if head_decay_value == 0.0:
+                checked_head_traces.append(
+                    (jnp.zeros_like(old_w_trace), jnp.zeros_like(old_b_trace))
+                )
+            else:
+                checked_head_traces.append((old_w_trace, old_b_trace))
+        previous_checked = previous_checked.replace(  # type: ignore[attr-defined]
+            head_traces=tuple(checked_head_traces),
+        )
+        if self._utility_decay == 0.0:
+            previous_checked = previous_checked.replace(
+                hidden_unit_utilities=tuple(
+                    jnp.zeros_like(utility) for utility in state.hidden_unit_utilities
+                ),
+            )
+        source_state_finite = _floating_tree_is_finite(previous_checked)
 
         # 1. Handle NaN targets
         active_mask = ~jnp.isnan(targets)  # (n_heads,)
@@ -884,7 +918,8 @@ class MultiHeadMLPLearner:
             )
             utility_signal = jnp.abs(activations[i] * trunk_bias_grads[i])
             new_hidden_unit_utilities.append(
-                utility_decay * old_utility + (1.0 - utility_decay) * utility_signal
+                _skip_zero_scale(utility_decay, old_utility)
+                + (1.0 - utility_decay) * utility_signal
             )
 
         # 6. Update trunk traces and optimizer
@@ -900,9 +935,11 @@ class MultiHeadMLPLearner:
             old_wt = state.trunk_traces[2 * i]
             if replacing:
                 # Replacing: use grad where nonzero, else decay old trace
-                new_wt = jnp.where(w_grad_i != 0.0, w_grad_i, gamma_lamda * old_wt)
+                new_wt = jnp.where(
+                    w_grad_i != 0.0, w_grad_i, _skip_zero_scale(gamma_lamda, old_wt)
+                )
             else:
-                new_wt = gamma_lamda * old_wt + w_grad_i
+                new_wt = _skip_zero_scale(gamma_lamda, old_wt) + w_grad_i
             new_trunk_traces.append(new_wt)
             w_step, new_w_opt, w_update_applied = _update_from_gradient_with_diagnostics(
                 self._optimizer,
@@ -916,9 +953,11 @@ class MultiHeadMLPLearner:
             b_grad_i = trunk_bias_grads[i]
             old_bt = state.trunk_traces[2 * i + 1]
             if replacing:
-                new_bt = jnp.where(b_grad_i != 0.0, b_grad_i, gamma_lamda * old_bt)
+                new_bt = jnp.where(
+                    b_grad_i != 0.0, b_grad_i, _skip_zero_scale(gamma_lamda, old_bt)
+                )
             else:
-                new_bt = gamma_lamda * old_bt + b_grad_i
+                new_bt = _skip_zero_scale(gamma_lamda, old_bt) + b_grad_i
             new_trunk_traces.append(new_bt)
             b_step, new_b_opt, b_update_applied = _update_from_gradient_with_diagnostics(
                 self._optimizer,
@@ -982,11 +1021,15 @@ class MultiHeadMLPLearner:
                 else gamma_lamda
             )
             if replacing:
-                new_w_trace = jnp.where(w_grad != 0.0, w_grad, head_gl * old_w_trace)
-                new_b_trace = jnp.where(b_grad != 0.0, b_grad, head_gl * old_b_trace)
+                new_w_trace = jnp.where(
+                    w_grad != 0.0, w_grad, _skip_zero_scale(head_gl, old_w_trace)
+                )
+                new_b_trace = jnp.where(
+                    b_grad != 0.0, b_grad, _skip_zero_scale(head_gl, old_b_trace)
+                )
             else:
-                new_w_trace = head_gl * old_w_trace + w_grad
-                new_b_trace = head_gl * old_b_trace + b_grad
+                new_w_trace = _skip_zero_scale(head_gl, old_w_trace) + w_grad
+                new_b_trace = _skip_zero_scale(head_gl, old_b_trace) + b_grad
 
             # Error for this head (masked to 0 for inactive)
             error_i = jnp.where(
