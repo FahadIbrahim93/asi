@@ -9,6 +9,7 @@ import jax.numpy as jnp
 import jax.random as jr
 import numpy as np
 import pytest
+from jax.experimental import checkify
 
 from alberta_framework import (
     FixedBudgetFeatureLearner,
@@ -300,6 +301,83 @@ class TestInteractionFeatureDiscoveryStream:
 
 class TestFixedBudgetFeatureLearner:
     """Tests for explicit feature construction, utility, and replacement."""
+
+    def test_active_topk_excludes_inactive_zero_placeholders(self) -> None:
+        """Mirror of the #275 fix for the interaction learner: inactive heads are not zeros."""
+        learner = FixedBudgetFeatureLearner(
+            n_features=1,
+            n_tasks=4,
+            candidate_count=0,
+            utility_aggregation="topk",
+            utility_top_k=2,
+            utility_task_balancing="active",
+        )
+        active_mask = jnp.asarray((True, False, False, False), dtype=jnp.bool_)
+        activity = jnp.ones((4,), dtype=jnp.float32)
+        signed_signal = jnp.asarray(((-4.0,), (99.0,), (99.0,), (99.0,)), dtype=jnp.float32)
+        utility = learner._aggregate_task_feature_signal(signed_signal, active_mask, activity)
+        np.testing.assert_array_equal(utility, np.asarray((-4.0,), dtype=np.float32))
+
+        output_weights = jnp.asarray(((6.0,), (5.0,), (5.0,), (5.0,)), dtype=jnp.float32)
+        features = jnp.ones((1,), dtype=jnp.float32)
+        for top_k in (1, 2, 4):
+            probe = FixedBudgetFeatureLearner(
+                n_features=1,
+                n_tasks=4,
+                candidate_count=0,
+                utility_aggregation="topk",
+                utility_top_k=top_k,
+                utility_task_balancing="active",
+            )
+            utility = probe._output_utility_signal(output_weights, features, active_mask, activity)
+            np.testing.assert_array_equal(utility, np.asarray((6.0,), dtype=np.float32))
+
+    @pytest.mark.parametrize(
+        "reducer_name", ["_aggregate_task_feature_signal", "_output_utility_signal"]
+    )
+    def test_active_topk_all_inactive_avoids_zero_division(self, reducer_name: str) -> None:
+        learner = FixedBudgetFeatureLearner(
+            n_features=1,
+            n_tasks=4,
+            candidate_count=0,
+            utility_aggregation="topk",
+            utility_top_k=2,
+            utility_task_balancing="active",
+        )
+        active_mask = jnp.zeros((4,), dtype=jnp.bool_)
+        activity = jnp.ones((4,), dtype=jnp.float32)
+        if reducer_name == "_aggregate_task_feature_signal":
+            args: tuple[Any, ...] = (
+                jnp.asarray(((1.0,), (2.0,), (3.0,), (4.0,)), dtype=jnp.float32),
+                active_mask,
+                activity,
+            )
+        else:
+            args = (
+                jnp.ones((4, 1), dtype=jnp.float32),
+                jnp.ones((1,), dtype=jnp.float32),
+                active_mask,
+                activity,
+            )
+        checked = checkify.checkify(getattr(learner, reducer_name), errors=checkify.float_checks)
+        error, utility = checked(*args)
+        error.throw()
+        np.testing.assert_array_equal(utility, np.zeros((1,), dtype=np.float32))
+
+    def test_unbalanced_topk_still_averages_largest_heads(self) -> None:
+        learner = FixedBudgetFeatureLearner(
+            n_features=1,
+            n_tasks=4,
+            candidate_count=0,
+            utility_aggregation="topk",
+            utility_top_k=2,
+            utility_task_balancing="none",
+        )
+        signal = jnp.asarray(((4.0,), (2.0,), (0.5,), (0.0,)), dtype=jnp.float32)
+        utility = learner._aggregate_task_feature_signal(
+            signal, jnp.ones((4,), dtype=jnp.bool_), jnp.ones((4,), dtype=jnp.float32)
+        )
+        np.testing.assert_array_equal(utility, np.asarray((3.0,), dtype=np.float32))
 
     def test_init_shapes(self) -> None:
         learner = FixedBudgetFeatureLearner(
