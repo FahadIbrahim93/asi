@@ -49,6 +49,12 @@ _INVALID_HORDE_SCALARS: tuple[tuple[str, Any], ...] = (
     ("obgd_kappa", True),
     ("obgd_kappa", 0.0),
     ("obgd_kappa", -1.0),
+    ("hidden_sizes", (True,)),
+    ("hidden_sizes", (False,)),
+    ("hidden_sizes", (0,)),
+    ("hidden_sizes", (-1,)),
+    ("hidden_sizes", (1.5,)),
+    ("hidden_sizes", ("64",)),
 )
 
 
@@ -214,6 +220,7 @@ def test_step3_horde_scalars_canonicalize_nonbuiltin_reals() -> None:
     config = Step3HordeConfig(
         gammas=(value,),
         lamdas=(value,),
+        hidden_sizes=(np.int64(4),),
         step_size=value,
         sparsity=value,
         obgd_kappa=np.float64(2.0),
@@ -223,8 +230,10 @@ def test_step3_horde_scalars_canonicalize_nonbuiltin_reals() -> None:
     json.dumps(payload, allow_nan=False)
     assert config.gammas == (0.5,)
     assert config.lamdas == (0.5,)
+    assert config.hidden_sizes == (4,)
     assert type(payload["gammas"][0]) is float
     assert type(payload["lamdas"][0]) is float
+    assert type(payload["hidden_sizes"][0]) is int
     assert type(payload["step_size"]) is float
     assert type(payload["sparsity"]) is float
     assert type(payload["obgd_kappa"]) is float

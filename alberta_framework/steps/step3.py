@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import asdict, dataclass
-from numbers import Real
+from numbers import Integral, Real
 from typing import Any, Literal, cast
 
 import chex
@@ -186,6 +186,15 @@ def _require_unit_interval(name: str, value: object) -> float:
     return number
 
 
+def _require_positive_int(name: str, value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, Integral):
+        raise ValueError(f"{name} must be a positive integer, got {value!r}")
+    number = int(value)
+    if number < 1:
+        raise ValueError(f"{name} must be positive, got {value!r}")
+    return number
+
+
 def _validate_horde_config(config: Step3HordeConfig) -> None:
     if len(config.gammas) == 0:
         raise ValueError("Step 3 Horde must have at least one demon")
@@ -204,11 +213,12 @@ def _validate_horde_config(config: Step3HordeConfig) -> None:
     obgd_kappa = _require_real("obgd_kappa", config.obgd_kappa)
     if obgd_kappa <= 0.0:
         raise ValueError(f"obgd_kappa must be positive, got {config.obgd_kappa!r}")
-    if any(size < 1 for size in config.hidden_sizes):
-        msg = f"hidden_sizes must contain positive sizes, got {config.hidden_sizes!r}"
-        raise ValueError(msg)
+    hidden_sizes = tuple(
+        _require_positive_int("hidden_sizes", size) for size in config.hidden_sizes
+    )
     object.__setattr__(config, "gammas", gammas)
     object.__setattr__(config, "lamdas", lamdas)
+    object.__setattr__(config, "hidden_sizes", hidden_sizes)
     object.__setattr__(config, "step_size", step_size)
     object.__setattr__(config, "sparsity", sparsity)
     object.__setattr__(config, "obgd_kappa", obgd_kappa)
