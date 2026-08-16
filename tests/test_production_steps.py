@@ -4,9 +4,11 @@
 import json
 import tomllib
 from pathlib import Path
+from typing import Any
 
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 import pytest
 
 from alberta_framework.cli import step1_smoke_main, step2_smoke_main
@@ -136,6 +138,179 @@ def test_step2_memory_factory_updates_fixed_budget_memory() -> None:
     assert int(jnp.sum(result.state.counts > 0.0)) == 1
     assert learner.config.to_config()["slots_per_class"] == 2
     assert config.to_dict()["n_classes"] == 3
+
+
+_INVALID_STEP2_KERNEL_FIELDS: tuple[tuple[str, Any], ...] = (
+    ("feature_dim", 0),
+    ("feature_dim", -1),
+    ("feature_dim", True),
+    ("feature_dim", False),
+    ("feature_dim", "8"),
+    ("feature_dim", 8.5),
+    ("feature_dim", float("nan")),
+    ("feature_dim", float("inf")),
+    ("feature_dim", None),
+    ("n_heads", 0),
+    ("n_heads", -1),
+    ("n_heads", True),
+    ("n_heads", False),
+    ("n_heads", "3"),
+    ("n_heads", None),
+    ("hidden_sizes", [32]),
+    ("hidden_sizes", (0,)),
+    ("hidden_sizes", (-1,)),
+    ("hidden_sizes", (True,)),
+    ("hidden_sizes", (32.5,)),
+    ("stream", "unknown_stream"),
+    ("readout_mode", "unknown_mode"),
+    ("step_size", float("nan")),
+    ("step_size", float("inf")),
+    ("step_size", float("-inf")),
+    ("step_size", True),
+    ("step_size", False),
+    ("step_size", -1.0),
+    ("step_size", "0.03"),
+    ("step_size", None),
+    ("loss_normalization", "invalid_norm"),
+    ("context_length", 0),
+    ("context_length", -1),
+    ("context_length", True),
+    ("context_length", False),
+    ("context_length", "128"),
+    ("context_length", None),
+    ("noise_std", float("nan")),
+    ("noise_std", float("inf")),
+    ("noise_std", True),
+    ("noise_std", False),
+    ("noise_std", -1.0),
+)
+
+
+@pytest.mark.parametrize(("field", "value"), _INVALID_STEP2_KERNEL_FIELDS)
+def test_step2_kernel_fields_reject_invalid_inputs(field: str, value: object) -> None:
+    with pytest.raises(ValueError, match=field):
+        Step2KernelConfig(**{field: value})
+
+
+_INVALID_STEP2_MEMORY_FIELDS: tuple[tuple[str, Any], ...] = (
+    ("feature_dim", 0),
+    ("feature_dim", -1),
+    ("feature_dim", True),
+    ("feature_dim", False),
+    ("feature_dim", "784"),
+    ("feature_dim", None),
+    ("n_classes", 1),
+    ("n_classes", 0),
+    ("n_classes", -1),
+    ("n_classes", True),
+    ("n_classes", False),
+    ("n_classes", "10"),
+    ("n_classes", None),
+    ("slots_per_class", 0),
+    ("slots_per_class", -1),
+    ("slots_per_class", True),
+    ("slots_per_class", False),
+    ("slots_per_class", "20"),
+    ("slots_per_class", None),
+    ("update_rate", float("nan")),
+    ("update_rate", float("inf")),
+    ("update_rate", True),
+    ("update_rate", False),
+    ("update_rate", 0.0),
+    ("update_rate", -0.1),
+    ("update_rate", 1.1),
+    ("novelty_threshold", float("nan")),
+    ("novelty_threshold", float("inf")),
+    ("novelty_threshold", True),
+    ("novelty_threshold", False),
+    ("novelty_threshold", -0.01),
+    ("bandwidth", float("nan")),
+    ("bandwidth", float("inf")),
+    ("bandwidth", True),
+    ("bandwidth", False),
+    ("bandwidth", 0.0),
+    ("bandwidth", -0.01),
+    ("bandwidth", None),
+)
+
+
+@pytest.mark.parametrize(("field", "value"), _INVALID_STEP2_MEMORY_FIELDS)
+def test_step2_memory_fields_reject_invalid_inputs(field: str, value: object) -> None:
+    with pytest.raises(ValueError, match=field):
+        Step2MemoryConfig(**{field: value})
+
+
+def test_step2_fields_preserve_legal_endpoints() -> None:
+    k_cfg = Step2KernelConfig(
+        feature_dim=1,
+        n_heads=1,
+        hidden_sizes=(),
+        step_size=0.0,
+        context_length=1,
+        noise_std=0.0,
+    )
+    make_step2_learner(k_cfg)
+    payload = k_cfg.to_dict()
+    json.dumps(payload, allow_nan=False)
+    restored = Step2KernelConfig.from_dict(payload)
+    assert restored.feature_dim == 1
+    assert restored.n_heads == 1
+    assert restored.step_size == 0.0
+    assert restored.noise_std == 0.0
+
+    m_cfg = Step2MemoryConfig(
+        feature_dim=1,
+        n_classes=2,
+        slots_per_class=1,
+        update_rate=float(np.float32(1e-6)),
+        novelty_threshold=0.0,
+        bandwidth=float(np.float32(1e-12)),
+    )
+    make_step2_memory_learner(m_cfg)
+    m_payload = m_cfg.to_dict()
+    json.dumps(m_payload, allow_nan=False)
+    m_restored = Step2MemoryConfig.from_dict(m_payload)
+    assert m_restored.update_rate == float(np.float32(1e-6))
+    assert m_restored.novelty_threshold == 0.0
+    assert m_restored.bandwidth == float(np.float32(1e-12))
+
+    m_upper = Step2MemoryConfig(
+        update_rate=1.0,
+    )
+    assert m_upper.update_rate == 1.0
+
+
+def test_step2_rejects_float32_overflow_and_underflow() -> None:
+    with pytest.raises(ValueError, match="step_size"):
+        Step2KernelConfig(step_size=1e100)
+    with pytest.raises(ValueError, match="bandwidth"):
+        Step2MemoryConfig(bandwidth=1e100)
+    with pytest.raises(ValueError, match="bandwidth"):
+        Step2MemoryConfig(bandwidth=1e-50)
+
+
+def test_step2_fields_canonicalize_nonbuiltin_numbers() -> None:
+    value = np.float64(0.03)
+    k_cfg = Step2KernelConfig(
+        feature_dim=np.int64(8),
+        n_heads=np.int64(3),
+        hidden_sizes=(np.int64(16),),
+        step_size=value,
+        context_length=np.int64(64),
+        noise_std=value,
+    )
+    payload = k_cfg.to_dict()
+    json.dumps(payload, allow_nan=False)
+    assert k_cfg.feature_dim == 8
+    assert k_cfg.n_heads == 3
+    assert k_cfg.hidden_sizes == (16,)
+    assert k_cfg.step_size == float(np.float32(0.03))
+    assert type(payload["feature_dim"]) is int
+    assert type(payload["n_heads"]) is int
+    assert type(payload["hidden_sizes"][0]) is int
+    assert type(payload["step_size"]) is float
+    assert type(payload["context_length"]) is int
+    assert type(payload["noise_std"]) is float
 
 
 def test_step2_hybrid_factory_updates_upgd_and_memory() -> None:
