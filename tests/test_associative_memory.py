@@ -5,6 +5,7 @@ import math
 
 import chex
 import jax.numpy as jnp
+import numpy as np
 import pytest
 
 from alberta_framework.core.associative_memory import (
@@ -307,15 +308,35 @@ def test_associative_memory_respects_fixed_budget() -> None:
     assert int(result.state.replacements) > 0
 
 
-@pytest.mark.parametrize("label", [-1, 4, 9999, 1.9, float("nan"), float("inf")])
-def test_update_rejects_labels_outside_the_vocabulary_instead_of_clipping(label: float) -> None:
+@pytest.mark.parametrize(
+    "label",
+    [
+        -1,
+        4,
+        9999,
+        1.9,
+        float("nan"),
+        float("inf"),
+        1 + 2j,
+        True,
+        np.uint64(2**32),
+        np.float64(1.00000001),
+        np.asarray([1], dtype=np.int32),
+        2**100,
+    ],
+)
+def test_update_rejects_labels_outside_the_vocabulary_instead_of_clipping(
+    label: object,
+) -> None:
     """An out-of-domain label must be a rejected transaction, not a substituted class."""
     learner = AssociativeMemoryLearner(
         AssociativeMemoryConfig(vocab_size=4, block_size=3, suffix_length=2, max_features=8)
     )
     state = learner.init()
     result = learner.update(
-        state, jnp.asarray([1, 2, 3], dtype=jnp.int32), jnp.asarray(label, dtype=jnp.float32)
+        state,
+        jnp.asarray([1, 2, 3], dtype=jnp.int32),
+        label,  # type: ignore[arg-type]
     )
     assert not bool(result.update_applied)
     chex.assert_trees_all_equal(result.state, state)
