@@ -75,6 +75,11 @@ def _commit_scan_safe_actor_state(
     return state, update_applied
 
 
+def _skip_zero_scale(scale: Array, value: Array) -> Array:
+    """Return 0 when ``scale`` is 0 so a 0*inf product cannot form."""
+    return jnp.where(scale == 0.0, jnp.zeros_like(value), scale * value)
+
+
 def _rollback_critic_result(
     result: HordeUpdateResult,
     previous_state: MultiHeadMLPState,
@@ -446,7 +451,9 @@ class QHordeActorCriticAgent:
             if cfg.critic_target == "sampled_sarsa"
             else jnp.dot(next_policy, q_next)
         )
-        target = jnp.asarray(reward, dtype=jnp.float32) + effective_gamma * next_value
+        target = jnp.asarray(reward, dtype=jnp.float32) + _skip_zero_scale(
+            effective_gamma, next_value
+        )
         q_old = q_previous[safe_last_action]
         td_error = target - q_old
 
@@ -477,8 +484,12 @@ class QHordeActorCriticAgent:
         )
         actor_grad_weights = actor_grad_bias[:, None] * prev_obs[None, :]
         actor_decay = effective_gamma * cfg.actor_lamda
-        actor_trace_weights = actor_decay * state.actor_trace_weights + actor_grad_weights
-        actor_trace_bias = actor_decay * state.actor_trace_bias + actor_grad_bias
+        actor_trace_weights = (
+            _skip_zero_scale(actor_decay, state.actor_trace_weights) + actor_grad_weights
+        )
+        actor_trace_bias = (
+            _skip_zero_scale(actor_decay, state.actor_trace_bias) + actor_grad_bias
+        )
         actor_scale = (
             jnp.array(1.0, dtype=jnp.float32)
             if cfg.actor_update == "expected_advantage"
@@ -526,7 +537,7 @@ class QHordeActorCriticAgent:
             & jnp.all(jnp.isfinite(old_policy))
             & jnp.all(jnp.isfinite(next_policy))
             & jnp.all(jnp.isfinite(q_previous))
-            & jnp.all(jnp.isfinite(q_next))
+            & ((effective_gamma == 0.0) | jnp.all(jnp.isfinite(q_next)))
             & jnp.isfinite(target)
             & jnp.isfinite(td_error)
             & jnp.isfinite(bound_metric)
@@ -557,7 +568,9 @@ class QHordeActorCriticAgent:
                 update_applied, q_previous, jnp.zeros_like(q_previous)
             ),
             next_q_values=jnp.where(
-                update_applied, q_next, jnp.zeros_like(q_next)
+                update_applied & (effective_gamma != 0.0),
+                q_next,
+                jnp.zeros_like(q_next),
             ),
             target=jnp.where(update_applied, target, 0.0),
             td_error=jnp.where(update_applied, td_error, 0.0),
@@ -808,8 +821,12 @@ class HordeActorCriticAgent:
         actor_grad_bias = (one_hot - old_policy) / cfg.temperature
         actor_grad_weights = actor_grad_bias[:, None] * prev_obs[None, :]
         actor_decay = value_discount * cfg.actor_lamda
-        actor_trace_weights = actor_decay * state.actor_trace_weights + actor_grad_weights
-        actor_trace_bias = actor_decay * state.actor_trace_bias + actor_grad_bias
+        actor_trace_weights = (
+            _skip_zero_scale(actor_decay, state.actor_trace_weights) + actor_grad_weights
+        )
+        actor_trace_bias = (
+            _skip_zero_scale(actor_decay, state.actor_trace_bias) + actor_grad_bias
+        )
         actor_steps: tuple[Array, ...] = (
             cfg.actor_step_size * actor_trace_weights,
             cfg.actor_step_size * actor_trace_bias,
@@ -851,7 +868,7 @@ class HordeActorCriticAgent:
             & (value_discount <= 1.0)
             & jnp.all(jnp.isfinite(old_policy))
             & jnp.isfinite(value)
-            & jnp.isfinite(next_value)
+            & ((value_discount == 0.0) | jnp.isfinite(next_value))
             & jnp.isfinite(td_error)
             & jnp.isfinite(bound_metric)
             & jnp.all(jnp.isfinite(next_policy))
@@ -880,7 +897,9 @@ class HordeActorCriticAgent:
                 update_applied, next_policy, jnp.zeros_like(next_policy)
             ),
             value=jnp.where(update_applied, value, 0.0),
-            next_value=jnp.where(update_applied, next_value, 0.0),
+            next_value=jnp.where(
+                update_applied & (value_discount != 0.0), next_value, 0.0
+            ),
             td_error=jnp.where(update_applied, td_error, 0.0),
             bound_metric=jnp.where(update_applied, bound_metric, 0.0),
             critic_result=committed_critic_result,
@@ -1540,13 +1559,17 @@ class NonlinearHordeActorCriticAgent:
 
         new_trunk_traces: list[Array] = []
         for i in range(n_hidden):
-            new_trunk_traces.append(actor_decay * state.actor_trunk_traces[2 * i] + grad_trunk_w[i])
             new_trunk_traces.append(
-                actor_decay * state.actor_trunk_traces[2 * i + 1] + grad_trunk_b[i]
+                _skip_zero_scale(actor_decay, state.actor_trunk_traces[2 * i])
+                + grad_trunk_w[i]
+            )
+            new_trunk_traces.append(
+                _skip_zero_scale(actor_decay, state.actor_trunk_traces[2 * i + 1])
+                + grad_trunk_b[i]
             )
 
-        new_head_trace_w = actor_decay * state.actor_head_trace_w + grad_head_w
-        new_head_trace_b = actor_decay * state.actor_head_trace_b + grad_head_b
+        new_head_trace_w = _skip_zero_scale(actor_decay, state.actor_head_trace_w) + grad_head_w
+        new_head_trace_b = _skip_zero_scale(actor_decay, state.actor_head_trace_b) + grad_head_b
 
         # Per-weight Autostep updates: step = alpha_i * z_i; caller applies error * step
         new_trunk_opt_states: list[AutostepParamState] = []
@@ -1673,7 +1696,7 @@ class NonlinearHordeActorCriticAgent:
             & (value_discount >= 0.0)
             & (value_discount <= 1.0)
             & jnp.isfinite(value)
-            & jnp.isfinite(next_value)
+            & ((value_discount == 0.0) | jnp.isfinite(next_value))
             & jnp.isfinite(td_error)
             & jnp.isfinite(bound_metric)
             & jnp.all(jnp.isfinite(next_policy))
@@ -1703,7 +1726,9 @@ class NonlinearHordeActorCriticAgent:
                 update_applied, next_policy, jnp.zeros_like(next_policy)
             ),
             value=jnp.where(update_applied, value, 0.0),
-            next_value=jnp.where(update_applied, next_value, 0.0),
+            next_value=jnp.where(
+                update_applied & (value_discount != 0.0), next_value, 0.0
+            ),
             td_error=jnp.where(update_applied, td_error, 0.0),
             bound_metric=jnp.where(update_applied, bound_metric, 0.0),
             critic_result=committed_critic_result,
@@ -2077,7 +2102,9 @@ class NonlinearQHordeActorCriticAgent:
             if cfg.critic_target == "sampled_sarsa"
             else jnp.dot(next_policy, q_next)
         )
-        target = jnp.asarray(reward, dtype=jnp.float32) + effective_gamma * next_value
+        target = jnp.asarray(reward, dtype=jnp.float32) + _skip_zero_scale(
+            effective_gamma, next_value
+        )
         td_error = target - q_previous[safe_last_action]
 
         cumulants = jnp.full(self._critic.n_demons, jnp.nan, dtype=jnp.float32)
@@ -2142,13 +2169,15 @@ class NonlinearQHordeActorCriticAgent:
         new_trunk_traces: list[Array] = []
         for i in range(n_hidden):
             new_trunk_traces.append(
-                actor_decay * state.actor_trunk_traces[2 * i] + grad_trunk_w[i]
+                _skip_zero_scale(actor_decay, state.actor_trunk_traces[2 * i])
+                + grad_trunk_w[i]
             )
             new_trunk_traces.append(
-                actor_decay * state.actor_trunk_traces[2 * i + 1] + grad_trunk_b[i]
+                _skip_zero_scale(actor_decay, state.actor_trunk_traces[2 * i + 1])
+                + grad_trunk_b[i]
             )
-        new_head_trace_w = actor_decay * state.actor_head_trace_w + grad_head_w
-        new_head_trace_b = actor_decay * state.actor_head_trace_b + grad_head_b
+        new_head_trace_w = _skip_zero_scale(actor_decay, state.actor_head_trace_w) + grad_head_w
+        new_head_trace_b = _skip_zero_scale(actor_decay, state.actor_head_trace_b) + grad_head_b
 
         new_trunk_opt_states: list[AutostepParamState] = []
         trunk_w_steps: list[Array] = []
@@ -2267,7 +2296,7 @@ class NonlinearQHordeActorCriticAgent:
             & jnp.all(jnp.isfinite(observation))
             & jnp.all(jnp.isfinite(next_policy))
             & jnp.all(jnp.isfinite(q_previous))
-            & jnp.all(jnp.isfinite(q_next))
+            & ((effective_gamma == 0.0) | jnp.all(jnp.isfinite(q_next)))
             & jnp.isfinite(target)
             & jnp.isfinite(td_error)
             & jnp.isfinite(bound_metric)
@@ -2299,7 +2328,9 @@ class NonlinearQHordeActorCriticAgent:
                 update_applied, q_previous, jnp.zeros_like(q_previous)
             ),
             next_q_values=jnp.where(
-                update_applied, q_next, jnp.zeros_like(q_next)
+                update_applied & (effective_gamma != 0.0),
+                q_next,
+                jnp.zeros_like(q_next),
             ),
             target=jnp.where(update_applied, target, 0.0),
             td_error=jnp.where(update_applied, td_error, 0.0),
