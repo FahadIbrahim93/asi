@@ -21,21 +21,50 @@ from __future__ import annotations
 import dataclasses
 import functools
 import math
+import operator
 from numbers import Real
-from typing import Any
+from typing import Any, SupportsIndex, cast
 
 import chex
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 from jax import Array
 from jaxtyping import Bool, Float, Int
 
 from alberta_framework._float32 import round_real_to_float32
+from alberta_framework.core._float32_scalars import validated_float32_scalar
 from alberta_framework.core.optimizers import Bounder, bounder_from_config
 from alberta_framework.core.update_safety import (
     floating_tree_is_finite as _floating_tree_is_finite,
 )
+
+_INT32_MAX = 2**31 - 1
+_ACTUAL_INT_TYPES = frozenset(
+    {
+        int,
+        np.int8,
+        np.int16,
+        np.int32,
+        np.int64,
+        np.uint8,
+        np.uint16,
+        np.uint32,
+        np.uint64,
+        np.longlong,
+        np.ulonglong,
+    }
+)
+
+
+def _require_int32(name: str, value: object, *, minimum: int, maximum: int = _INT32_MAX) -> int:
+    if type(value) not in _ACTUAL_INT_TYPES:
+        raise ValueError(f"{name} must be an integer in [{minimum}, {maximum}]")
+    canonical = operator.index(cast(SupportsIndex, value))
+    if not minimum <= canonical <= maximum:
+        raise ValueError(f"{name} must be an integer in [{minimum}, {maximum}]")
+    return canonical
 
 
 @dataclasses.dataclass(frozen=True)
@@ -59,6 +88,43 @@ class ActorCriticConfig:
     actor_lamda: float = 0.9
     critic_lamda: float = 0.9
     temperature: float = 1.0
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "n_actions",
+            _require_int32("n_actions", self.n_actions, minimum=2),
+        )
+        object.__setattr__(
+            self,
+            "gamma",
+            validated_float32_scalar("gamma", self.gamma, lower=0.0, upper=1.0),
+        )
+        object.__setattr__(
+            self,
+            "actor_step_size",
+            validated_float32_scalar("actor_step_size", self.actor_step_size, lower=0.0),
+        )
+        object.__setattr__(
+            self,
+            "critic_step_size",
+            validated_float32_scalar("critic_step_size", self.critic_step_size, lower=0.0),
+        )
+        object.__setattr__(
+            self,
+            "actor_lamda",
+            validated_float32_scalar("actor_lamda", self.actor_lamda, lower=0.0, upper=1.0),
+        )
+        object.__setattr__(
+            self,
+            "critic_lamda",
+            validated_float32_scalar("critic_lamda", self.critic_lamda, lower=0.0, upper=1.0),
+        )
+        object.__setattr__(
+            self,
+            "temperature",
+            validated_float32_scalar("temperature", self.temperature, positive=True),
+        )
 
     def to_config(self) -> dict[str, Any]:
         """Serialize this configuration to a dictionary."""
@@ -237,6 +303,7 @@ class ActorCriticAgent:
         Returns:
             Initial immutable actor-critic state.
         """
+        feature_dim = _require_int32("feature_dim", feature_dim, minimum=1)
         zeros_actor = jnp.zeros((self._config.n_actions, feature_dim), dtype=jnp.float32)
         zeros_policy_bias = jnp.zeros((self._config.n_actions,), dtype=jnp.float32)
         zeros_critic = jnp.zeros((feature_dim,), dtype=jnp.float32)
@@ -287,9 +354,7 @@ class ActorCriticAgent:
         """
         key, sample_key = jr.split(state.rng_key)
         probs = self.policy(state, observation)
-        action = jr.categorical(sample_key, jnp.log(jnp.maximum(probs, 1e-8))).astype(
-            jnp.int32
-        )
+        action = jr.categorical(sample_key, jnp.log(jnp.maximum(probs, 1e-8))).astype(jnp.int32)
         return action, key, probs
 
     @functools.partial(jax.jit, static_argnums=(0,))
@@ -351,9 +416,7 @@ class ActorCriticAgent:
                 discount = jnp.where(terminated, 0.0, cfg.gamma)
         discount = jnp.asarray(discount, dtype=jnp.float32)
         # Terminal 0 * inf V(s') is NaN and would freeze the critic.
-        bootstrap = jnp.where(
-            discount == 0.0, jnp.zeros_like(next_value), discount * next_value
-        )
+        bootstrap = jnp.where(discount == 0.0, jnp.zeros_like(next_value), discount * next_value)
         td_error = reward + bootstrap - value
 
         one_hot = jax.nn.one_hot(action, cfg.n_actions, dtype=jnp.float32)
@@ -461,9 +524,7 @@ class ActorCriticAgent:
             & jnp.isfinite(critic_metric)
         )
         candidate_ok = (
-            inputs_valid
-            & _floating_tree_is_finite(state)
-            & _floating_tree_is_finite(updated)
+            inputs_valid & _floating_tree_is_finite(state) & _floating_tree_is_finite(updated)
         )
         held = jax.lax.cond(
             candidate_ok,
@@ -500,13 +561,9 @@ class ActorCriticAgent:
             ),
             policy=jnp.where(params_ok, next_policy, jnp.zeros_like(next_policy)),
             value=jnp.where(params_ok, value, zero),
-            next_value=jnp.where(
-                params_ok & jnp.isfinite(next_value), next_value, zero
-            ),
+            next_value=jnp.where(params_ok & jnp.isfinite(next_value), next_value, zero),
             td_error=jnp.where(params_ok, td_error, zero),
-            bound_metric=jnp.where(
-                params_ok, (actor_metric + critic_metric) / 2.0, zero
-            ),
+            bound_metric=jnp.where(params_ok, (actor_metric + critic_metric) / 2.0, zero),
             update_applied=params_ok,
         )
 
@@ -653,6 +710,55 @@ class ContinuousActorCriticConfig:
     log_sigma_max: float = 2.0
     action_low: float | None = None
     action_high: float | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "action_dim",
+            _require_int32("action_dim", self.action_dim, minimum=1),
+        )
+        object.__setattr__(
+            self,
+            "gamma",
+            validated_float32_scalar("gamma", self.gamma, lower=0.0, upper=1.0),
+        )
+        object.__setattr__(
+            self,
+            "actor_step_size",
+            validated_float32_scalar("actor_step_size", self.actor_step_size, lower=0.0),
+        )
+        object.__setattr__(
+            self,
+            "critic_step_size",
+            validated_float32_scalar("critic_step_size", self.critic_step_size, lower=0.0),
+        )
+        object.__setattr__(
+            self,
+            "actor_lamda",
+            validated_float32_scalar("actor_lamda", self.actor_lamda, lower=0.0, upper=1.0),
+        )
+        object.__setattr__(
+            self,
+            "critic_lamda",
+            validated_float32_scalar("critic_lamda", self.critic_lamda, lower=0.0, upper=1.0),
+        )
+        object.__setattr__(
+            self,
+            "log_sigma_init",
+            validated_float32_scalar("log_sigma_init", self.log_sigma_init),
+        )
+        object.__setattr__(
+            self,
+            "log_sigma_min",
+            validated_float32_scalar("log_sigma_min", self.log_sigma_min),
+        )
+        object.__setattr__(
+            self,
+            "log_sigma_max",
+            validated_float32_scalar("log_sigma_max", self.log_sigma_max),
+        )
+        if self.log_sigma_min > self.log_sigma_max:
+            raise ValueError("log_sigma_min must be <= log_sigma_max")
 
     def to_config(self) -> dict[str, Any]:
         """Serialize this configuration to a dictionary."""
@@ -870,6 +976,7 @@ class ContinuousActorCriticAgent:
         Returns:
             Initial immutable continuous actor-critic state.
         """
+        feature_dim = _require_int32("feature_dim", feature_dim, minimum=1)
         cfg = self._config
         zeros_mean = jnp.zeros((cfg.action_dim, feature_dim), dtype=jnp.float32)
         zeros_mean_bias = jnp.zeros((cfg.action_dim,), dtype=jnp.float32)
@@ -1014,9 +1121,7 @@ class ContinuousActorCriticAgent:
                 discount = jnp.where(terminated, 0.0, cfg.gamma)
         discount = jnp.asarray(discount, dtype=jnp.float32)
         # Terminal 0 * inf V(s') is NaN and would freeze the critic.
-        bootstrap = jnp.where(
-            discount == 0.0, jnp.zeros_like(next_value), discount * next_value
-        )
+        bootstrap = jnp.where(discount == 0.0, jnp.zeros_like(next_value), discount * next_value)
         td_error = reward + bootstrap - value
 
         sigma_sq = prev_sigma * prev_sigma + 1e-8
@@ -1145,9 +1250,7 @@ class ContinuousActorCriticAgent:
             & jnp.isfinite(critic_metric)
         )
         candidate_ok = (
-            inputs_valid
-            & _floating_tree_is_finite(state)
-            & _floating_tree_is_finite(updated)
+            inputs_valid & _floating_tree_is_finite(state) & _floating_tree_is_finite(updated)
         )
         held = jax.lax.cond(
             candidate_ok,
@@ -1155,9 +1258,7 @@ class ContinuousActorCriticAgent:
             lambda: state,
         )
         safe_observation = jnp.where(candidate_ok, observation, state.last_observation)
-        next_action, key, next_mean, next_sigma = self.select_action(
-            held, safe_observation
-        )
+        next_action, key, next_mean, next_sigma = self.select_action(held, safe_observation)
         proposed_final_state = held.replace(
             last_observation=observation,
             last_action=next_action,
@@ -1183,13 +1284,9 @@ class ContinuousActorCriticAgent:
             mean=jnp.where(params_ok, next_mean, jnp.zeros_like(next_mean)),
             sigma=jnp.where(params_ok, next_sigma, jnp.zeros_like(next_sigma)),
             value=jnp.where(params_ok, value, zero),
-            next_value=jnp.where(
-                params_ok & jnp.isfinite(next_value), next_value, zero
-            ),
+            next_value=jnp.where(params_ok & jnp.isfinite(next_value), next_value, zero),
             td_error=jnp.where(params_ok, td_error, zero),
-            bound_metric=jnp.where(
-                params_ok, (actor_metric + critic_metric) / 2.0, zero
-            ),
+            bound_metric=jnp.where(params_ok, (actor_metric + critic_metric) / 2.0, zero),
             update_applied=params_ok,
         )
 
@@ -1253,9 +1350,7 @@ def run_continuous_actor_critic_from_arrays(
             current_action = fixed_action.astype(jnp.float32)
             current_mean, current_sigma = agent.policy_params(started_state, obs)
         else:
-            started_state, current_action, current_mean, current_sigma = agent.start(
-                carry, obs
-            )
+            started_state, current_action, current_mean, current_sigma = agent.start(carry, obs)
         result = agent.update(
             started_state,
             reward,
@@ -1268,15 +1363,9 @@ def run_continuous_actor_critic_from_arrays(
             lambda: carry,
         )
         return next_carry, (
-            jnp.where(
-                result.update_applied, current_action, jnp.zeros_like(current_action)
-            ),
-            jnp.where(
-                result.update_applied, current_mean, jnp.zeros_like(current_mean)
-            ),
-            jnp.where(
-                result.update_applied, current_sigma, jnp.zeros_like(current_sigma)
-            ),
+            jnp.where(result.update_applied, current_action, jnp.zeros_like(current_action)),
+            jnp.where(result.update_applied, current_mean, jnp.zeros_like(current_mean)),
+            jnp.where(result.update_applied, current_sigma, jnp.zeros_like(current_sigma)),
             result.value,
             result.td_error,
             result.update_applied,

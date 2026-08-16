@@ -353,9 +353,7 @@ def test_continuous_actor_critic_action_clipping() -> None:
 def test_continuous_actor_critic_update_is_jittable() -> None:
     agent = ContinuousActorCriticAgent(ContinuousActorCriticConfig(action_dim=2))
     state = agent.init(feature_dim=2, key=jr.key(6))
-    state, _action, _mean, _sigma = agent.start(
-        state, jnp.array([1.0, 0.0], dtype=jnp.float32)
-    )
+    state, _action, _mean, _sigma = agent.start(state, jnp.array([1.0, 0.0], dtype=jnp.float32))
     update = jax.jit(agent.update)
     result = update(
         state,
@@ -370,12 +368,8 @@ def test_continuous_actor_critic_update_is_jittable() -> None:
 def test_continuous_actor_critic_run_from_arrays_scan() -> None:
     agent = ContinuousActorCriticAgent(ContinuousActorCriticConfig(action_dim=2))
     state = agent.init(feature_dim=2, key=jr.key(7))
-    observations = jnp.array(
-        [[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]], dtype=jnp.float32
-    )
-    next_observations = jnp.array(
-        [[0.0, 1.0], [1.0, 1.0], [0.5, -0.5]], dtype=jnp.float32
-    )
+    observations = jnp.array([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]], dtype=jnp.float32)
+    next_observations = jnp.array([[0.0, 1.0], [1.0, 1.0], [0.5, -0.5]], dtype=jnp.float32)
     rewards = jnp.array([1.0, 0.0, -1.0], dtype=jnp.float32)
     terminated = jnp.array([False, False, True])
 
@@ -459,9 +453,7 @@ def test_continuous_actor_critic_infinite_reward_with_obgd_does_not_poison() -> 
         bounder=ObGDBounding(kappa=2.0),
     )
     state = agent.init(feature_dim=3, key=jr.key(8))
-    state, _, _, _ = agent.start(
-        state, jnp.array([1.0, 0.0, -1.0], dtype=jnp.float32)
-    )
+    state, _, _, _ = agent.start(state, jnp.array([1.0, 0.0, -1.0], dtype=jnp.float32))
     poisoned = agent.update(
         state,
         reward=jnp.array(jnp.inf, dtype=jnp.float32),
@@ -472,9 +464,7 @@ def test_continuous_actor_critic_infinite_reward_with_obgd_does_not_poison() -> 
     assert bool(jnp.all(jnp.isfinite(poisoned.state.critic_weights)))
     chex.assert_trees_all_close(poisoned.state.mean_weights, state.mean_weights)
     chex.assert_trees_all_close(poisoned.state.critic_weights, state.critic_weights)
-    chex.assert_trees_all_equal(
-        jr.key_data(poisoned.state.rng_key), jr.key_data(state.rng_key)
-    )
+    chex.assert_trees_all_equal(jr.key_data(poisoned.state.rng_key), jr.key_data(state.rng_key))
     chex.assert_trees_all_close(
         poisoned.state.replace(rng_key=jr.key_data(poisoned.state.rng_key)),
         state.replace(rng_key=jr.key_data(state.rng_key)),
@@ -523,3 +513,30 @@ def test_continuous_actor_critic_terminal_does_not_multiply_inf_next_value() -> 
     assert bool(result.update_applied)
     chex.assert_trees_all_close(result.td_error, jnp.array(3.0, dtype=jnp.float32))
     _assert_continuous_actor_critic_state_finite(result.state)
+
+
+def test_continuous_actor_critic_integer_and_scalar_validation() -> None:
+    with pytest.raises(ValueError, match="action_dim"):
+        ContinuousActorCriticConfig(action_dim=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="action_dim"):
+        ContinuousActorCriticConfig(action_dim=0)
+    with pytest.raises(ValueError, match="action_dim"):
+        ContinuousActorCriticConfig(action_dim=2.5)  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="gamma"):
+        ContinuousActorCriticConfig(action_dim=2, gamma=1.5)
+    with pytest.raises(ValueError, match="actor_step_size"):
+        ContinuousActorCriticConfig(action_dim=2, actor_step_size=-0.1)
+
+    cfg = ContinuousActorCriticConfig(action_dim=np.int32(3))
+    assert cfg.action_dim == 3
+    assert type(cfg.action_dim) is int
+
+    agent = ContinuousActorCriticAgent(cfg)
+    with pytest.raises(ValueError, match="feature_dim"):
+        agent.init(feature_dim=True, key=jr.key(0))  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="feature_dim"):
+        agent.init(feature_dim=0, key=jr.key(0))
+
+    state = agent.init(feature_dim=np.int32(5), key=jr.key(0))
+    assert state.mean_weights.shape == (3, 5)

@@ -4,6 +4,8 @@ import chex
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
+import pytest
 
 from alberta_framework import ActorCriticAgent as TopLevelActorCriticAgent
 from alberta_framework.core import ActorCriticAgent as CoreActorCriticAgent
@@ -60,9 +62,7 @@ def test_actor_critic_update_changes_actor_and_critic() -> None:
     )
     agent = ActorCriticAgent(config)
     state = agent.init(feature_dim=3, key=jr.key(1))
-    state, _action, _policy = agent.start(
-        state, jnp.array([1.0, 0.0, -1.0], dtype=jnp.float32)
-    )
+    state, _action, _policy = agent.start(state, jnp.array([1.0, 0.0, -1.0], dtype=jnp.float32))
 
     result = agent.update(
         state,
@@ -76,9 +76,7 @@ def test_actor_critic_update_changes_actor_and_critic() -> None:
     assert not jnp.allclose(result.state.actor_weights, state.actor_weights)
     assert not jnp.allclose(result.state.critic_weights, state.critic_weights)
     _assert_actor_critic_numeric_state_finite(result.state)
-    chex.assert_tree_all_finite(
-        (result.policy, result.value, result.next_value, result.td_error)
-    )
+    chex.assert_tree_all_finite((result.policy, result.value, result.next_value, result.td_error))
 
 
 def test_actor_critic_temperature_scales_actor_gradient() -> None:
@@ -217,9 +215,7 @@ def test_actor_critic_explicit_discount_semantics() -> None:
 def test_actor_critic_update_is_jittable() -> None:
     agent = ActorCriticAgent(ActorCriticConfig(n_actions=2))
     state = agent.init(feature_dim=2, key=jr.key(2))
-    state, _action, _policy = agent.start(
-        state, jnp.array([1.0, 0.0], dtype=jnp.float32)
-    )
+    state, _action, _policy = agent.start(state, jnp.array([1.0, 0.0], dtype=jnp.float32))
 
     update = jax.jit(agent.update)
     result = update(
@@ -236,12 +232,8 @@ def test_actor_critic_update_is_jittable() -> None:
 def test_run_actor_critic_from_arrays_scan() -> None:
     agent = ActorCriticAgent(ActorCriticConfig(n_actions=2))
     state = agent.init(feature_dim=2, key=jr.key(3))
-    observations = jnp.array(
-        [[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]], dtype=jnp.float32
-    )
-    next_observations = jnp.array(
-        [[0.0, 1.0], [1.0, 1.0], [0.5, -0.5]], dtype=jnp.float32
-    )
+    observations = jnp.array([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]], dtype=jnp.float32)
+    next_observations = jnp.array([[0.0, 1.0], [1.0, 1.0], [0.5, -0.5]], dtype=jnp.float32)
     rewards = jnp.array([1.0, 0.0, -1.0], dtype=jnp.float32)
     terminated = jnp.array([False, False, True])
 
@@ -302,12 +294,8 @@ def test_run_actor_critic_from_arrays_fixed_actions_matches_loop() -> None:
     state = state.replace(  # type: ignore[attr-defined]
         actor_weights=jnp.array([[0.0, 3.0], [3.0, 0.0]], dtype=jnp.float32)
     )
-    observations = jnp.array(
-        [[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]], dtype=jnp.float32
-    )
-    next_observations = jnp.array(
-        [[0.0, 1.0], [1.0, 1.0], [0.5, -0.5]], dtype=jnp.float32
-    )
+    observations = jnp.array([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]], dtype=jnp.float32)
+    next_observations = jnp.array([[0.0, 1.0], [1.0, 1.0], [0.5, -0.5]], dtype=jnp.float32)
     rewards = jnp.array([1.0, 0.0, -1.0], dtype=jnp.float32)
     actions = jnp.array([0, 1, 0], dtype=jnp.int32)
     discounts = jnp.array([0.9, 0.9, 0.0], dtype=jnp.float32)
@@ -350,9 +338,7 @@ def test_run_actor_critic_from_arrays_fixed_actions_matches_loop() -> None:
     assert float(scan_result.policies[0, scan_result.actions[0]]) < 0.1
     chex.assert_trees_all_close(scan_result.td_errors, jnp.stack(loop_td_errors))
     chex.assert_trees_all_close(scan_result.state.actor_weights, loop_state.actor_weights)
-    chex.assert_trees_all_close(
-        scan_result.state.critic_weights, loop_state.critic_weights
-    )
+    chex.assert_trees_all_close(scan_result.state.critic_weights, loop_state.critic_weights)
 
 
 def test_actor_critic_config_round_trip_with_bounder() -> None:
@@ -378,9 +364,7 @@ def test_actor_critic_bounder_hook_runs() -> None:
         bounder=ObGDBounding(kappa=2.0),
     )
     state = agent.init(feature_dim=2, key=jr.key(4))
-    state, _action, _policy = agent.start(
-        state, jnp.array([1.0, 1.0], dtype=jnp.float32)
-    )
+    state, _action, _policy = agent.start(state, jnp.array([1.0, 1.0], dtype=jnp.float32))
 
     result = agent.update(
         state,
@@ -391,9 +375,7 @@ def test_actor_critic_bounder_hook_runs() -> None:
 
     assert float(result.bound_metric) < 1.0
     _assert_actor_critic_numeric_state_finite(result.state)
-    chex.assert_tree_all_finite(
-        (result.policy, result.value, result.next_value, result.td_error)
-    )
+    chex.assert_tree_all_finite((result.policy, result.value, result.next_value, result.td_error))
 
 
 def test_actor_critic_infinite_reward_with_obgd_does_not_poison_weights() -> None:
@@ -415,9 +397,7 @@ def test_actor_critic_infinite_reward_with_obgd_does_not_poison_weights() -> Non
     assert bool(jnp.all(jnp.isfinite(poisoned.state.critic_weights)))
     chex.assert_trees_all_close(poisoned.state.actor_weights, state.actor_weights)
     chex.assert_trees_all_close(poisoned.state.critic_weights, state.critic_weights)
-    chex.assert_trees_all_equal(
-        jr.key_data(poisoned.state.rng_key), jr.key_data(state.rng_key)
-    )
+    chex.assert_trees_all_equal(jr.key_data(poisoned.state.rng_key), jr.key_data(state.rng_key))
     chex.assert_trees_all_close(
         poisoned.state.replace(rng_key=jr.key_data(poisoned.state.rng_key)),
         state.replace(rng_key=jr.key_data(state.rng_key)),
@@ -467,3 +447,30 @@ def test_actor_critic_terminal_does_not_multiply_inf_next_value() -> None:
 def test_actor_critic_exports() -> None:
     assert TopLevelActorCriticAgent is ActorCriticAgent
     assert CoreActorCriticAgent is ActorCriticAgent
+
+
+def test_actor_critic_integer_and_scalar_validation() -> None:
+    with pytest.raises(ValueError, match="n_actions"):
+        ActorCriticConfig(n_actions=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="n_actions"):
+        ActorCriticConfig(n_actions=1)
+    with pytest.raises(ValueError, match="n_actions"):
+        ActorCriticConfig(n_actions=2.5)  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="gamma"):
+        ActorCriticConfig(n_actions=2, gamma=1.5)
+    with pytest.raises(ValueError, match="actor_step_size"):
+        ActorCriticConfig(n_actions=2, actor_step_size=-0.1)
+
+    cfg = ActorCriticConfig(n_actions=np.int32(4))
+    assert cfg.n_actions == 4
+    assert type(cfg.n_actions) is int
+
+    agent = ActorCriticAgent(cfg)
+    with pytest.raises(ValueError, match="feature_dim"):
+        agent.init(feature_dim=True, key=jr.key(0))  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="feature_dim"):
+        agent.init(feature_dim=0, key=jr.key(0))
+
+    state = agent.init(feature_dim=np.int32(5), key=jr.key(0))
+    assert state.actor_weights.shape == (4, 5)
