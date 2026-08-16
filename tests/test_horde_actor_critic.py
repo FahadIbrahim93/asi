@@ -421,7 +421,44 @@ def test_qhorde_terminal_does_not_multiply_inf_next_value() -> None:
     )
     assert bool(result.update_applied)
     chex.assert_trees_all_close(result.td_error, jnp.array(3.0, dtype=jnp.float32))
+    chex.assert_trees_all_equal(result.next_q_values, jnp.zeros((2,), jnp.float32))
+    chex.assert_tree_all_finite(
+        result.state.replace(rng_key=jr.key_data(result.state.rng_key))
+    )
+    chex.assert_tree_all_finite(
+        (result.policy, result.q_values, result.next_q_values, result.td_error)
+    )
     assert bool(jnp.all(jnp.isfinite(result.state.actor_weights)))
+
+
+def test_horde_zero_discount_neutralizes_inf_next_value_diagnostic() -> None:
+    agent = _make_agent()
+    huge = jnp.float32(1e38)
+    state = agent.init(feature_dim=2, key=jr.key(19)).replace(  # type: ignore[attr-defined]
+        last_observation=jnp.array([0.0, 1.0], dtype=jnp.float32),
+        last_action=jnp.array(0, dtype=jnp.int32),
+    )
+    poisoned_w = jnp.asarray([[huge, 0.0]], dtype=jnp.float32)
+    head_params = state.critic_state.head_params.replace(weights=(poisoned_w,))
+    state = state.replace(  # type: ignore[attr-defined]
+        critic_state=state.critic_state.replace(head_params=head_params)
+    )
+
+    result = agent.update(
+        state,
+        reward=jnp.array(3.0, dtype=jnp.float32),
+        observation=jnp.array([huge, 0.0], dtype=jnp.float32),
+        discount=jnp.array(0.0, dtype=jnp.float32),
+    )
+
+    assert bool(result.update_applied)
+    chex.assert_trees_all_equal(result.next_value, jnp.array(0.0, jnp.float32))
+    chex.assert_tree_all_finite(
+        result.state.replace(rng_key=jr.key_data(result.state.rng_key))
+    )
+    chex.assert_tree_all_finite(
+        (result.policy, result.value, result.next_value, result.td_error)
+    )
 
 
 def test_qhorde_actor_critic_auxiliary_prediction_and_terminal_trace_reset() -> None:
@@ -647,6 +684,58 @@ def _init_nlhac(
     state = agent.init(feature_dim=OBS_DIM, key=jr.key(0))
     state, _, _ = agent.start(state, jnp.zeros(OBS_DIM))
     return state
+
+
+def test_nonlinear_horde_zero_discount_neutralizes_inf_next_value() -> None:
+    spec = create_horde_spec(
+        [
+            GVFSpec(  # type: ignore[call-arg]
+                name="value",
+                demon_type=DemonType.PREDICTION,
+                gamma=0.9,
+                lamda=0.0,
+                cumulant_index=-1,
+            )
+        ]
+    )
+    critic = HordeLearner(
+        spec,
+        hidden_sizes=(),
+        step_size=0.1,
+        use_layer_norm=False,
+    )
+    agent = NonlinearHordeActorCriticAgent(
+        NonlinearHordeActorCriticConfig(
+            n_actions=2,
+            hidden_sizes=(),
+            actor_sparsity=0.0,
+        ),
+        critic,
+    )
+    huge = jnp.float32(1e38)
+    state = agent.init(2, jr.key(20))
+    state, _, _ = agent.start(state, jnp.array([0.0, 1.0], jnp.float32))
+    poisoned_w = jnp.asarray([[huge, 0.0]], dtype=jnp.float32)
+    head_params = state.critic_state.head_params.replace(weights=(poisoned_w,))
+    state = state.replace(  # type: ignore[attr-defined]
+        critic_state=state.critic_state.replace(head_params=head_params)
+    )
+
+    result = agent.update(
+        state,
+        jnp.array(3.0, jnp.float32),
+        jnp.array([huge, 0.0], jnp.float32),
+        discount=jnp.array(0.0, jnp.float32),
+    )
+
+    assert bool(result.update_applied)
+    chex.assert_trees_all_equal(result.next_value, jnp.array(0.0, jnp.float32))
+    chex.assert_tree_all_finite(
+        result.state.replace(rng_key=jr.key_data(result.state.rng_key))
+    )
+    chex.assert_tree_all_finite(
+        (result.policy, result.value, result.next_value, result.td_error)
+    )
 
 
 class TestNonlinearHordeActorCriticConfig:
@@ -1139,6 +1228,60 @@ class TestNonlinearQHordeActorCritic:
         chex.assert_shape(result.q_values, (N_ACTIONS,))
         chex.assert_tree_all_finite(result.q_values)
         assert int(result.state.step_count) == 1
+
+    def test_terminal_neutralizes_inf_next_q_diagnostic(self) -> None:
+        demons = [
+            GVFSpec(  # type: ignore[call-arg]
+                name=f"q_{action}",
+                demon_type=DemonType.CONTROL,
+                gamma=0.0,
+                lamda=0.0,
+                cumulant_index=-1,
+            )
+            for action in range(2)
+        ]
+        critic = HordeLearner(
+            create_horde_spec(demons),
+            hidden_sizes=(),
+            step_size=0.1,
+            use_layer_norm=False,
+        )
+        agent = NonlinearQHordeActorCriticAgent(
+            NonlinearQHordeActorCriticConfig(
+                n_actions=2,
+                hidden_sizes=(),
+                actor_sparsity=0.0,
+            ),
+            critic,
+        )
+        huge = jnp.float32(1e38)
+        state = agent.init(2, jr.key(21))
+        state, _, _ = agent.start(state, jnp.array([0.0, 1.0], jnp.float32))
+        poisoned_w = jnp.asarray([[huge, 0.0]], dtype=jnp.float32)
+        head_params = state.critic_state.head_params.replace(
+            weights=(poisoned_w, poisoned_w)
+        )
+        state = state.replace(  # type: ignore[attr-defined]
+            critic_state=state.critic_state.replace(head_params=head_params)
+        )
+
+        result = agent.update(
+            state,
+            jnp.array(3.0, jnp.float32),
+            jnp.array([huge, 0.0], jnp.float32),
+            jnp.array(1.0, jnp.float32),
+        )
+
+        assert bool(result.update_applied)
+        chex.assert_trees_all_equal(
+            result.next_q_values, jnp.zeros((2,), jnp.float32)
+        )
+        chex.assert_tree_all_finite(
+            result.state.replace(rng_key=jr.key_data(result.state.rng_key))
+        )
+        chex.assert_tree_all_finite(
+            (result.policy, result.q_values, result.next_q_values, result.td_error)
+        )
 
     def test_infinite_reward_with_obgd_does_not_poison_actor(self) -> None:
         """Inf TD error zeros the ObGD step, then actor_signal*step is 0*inf=NaN."""

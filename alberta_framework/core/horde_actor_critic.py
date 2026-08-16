@@ -568,7 +568,9 @@ class QHordeActorCriticAgent:
                 update_applied, q_previous, jnp.zeros_like(q_previous)
             ),
             next_q_values=jnp.where(
-                update_applied, q_next, jnp.zeros_like(q_next)
+                update_applied & (effective_gamma != 0.0),
+                q_next,
+                jnp.zeros_like(q_next),
             ),
             target=jnp.where(update_applied, target, 0.0),
             td_error=jnp.where(update_applied, td_error, 0.0),
@@ -895,7 +897,9 @@ class HordeActorCriticAgent:
                 update_applied, next_policy, jnp.zeros_like(next_policy)
             ),
             value=jnp.where(update_applied, value, 0.0),
-            next_value=jnp.where(update_applied, next_value, 0.0),
+            next_value=jnp.where(
+                update_applied & (value_discount != 0.0), next_value, 0.0
+            ),
             td_error=jnp.where(update_applied, td_error, 0.0),
             bound_metric=jnp.where(update_applied, bound_metric, 0.0),
             critic_result=committed_critic_result,
@@ -1722,7 +1726,9 @@ class NonlinearHordeActorCriticAgent:
                 update_applied, next_policy, jnp.zeros_like(next_policy)
             ),
             value=jnp.where(update_applied, value, 0.0),
-            next_value=jnp.where(update_applied, next_value, 0.0),
+            next_value=jnp.where(
+                update_applied & (value_discount != 0.0), next_value, 0.0
+            ),
             td_error=jnp.where(update_applied, td_error, 0.0),
             bound_metric=jnp.where(update_applied, bound_metric, 0.0),
             critic_result=committed_critic_result,
@@ -2322,7 +2328,9 @@ class NonlinearQHordeActorCriticAgent:
                 update_applied, q_previous, jnp.zeros_like(q_previous)
             ),
             next_q_values=jnp.where(
-                update_applied, q_next, jnp.zeros_like(q_next)
+                update_applied & (effective_gamma != 0.0),
+                q_next,
+                jnp.zeros_like(q_next),
             ),
             target=jnp.where(update_applied, target, 0.0),
             td_error=jnp.where(update_applied, td_error, 0.0),
