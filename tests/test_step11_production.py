@@ -391,8 +391,8 @@ def test_step11_oak_fields_preserve_legal_endpoints() -> None:
     assert restored.utility_ema_decay == 0.0
     assert restored.curation_threshold == 0.0
     assert restored.subtask_specs[0].feature_index == 0
-    assert restored.subtask_specs[0].threshold == float(np.float32(1e-12))
-    assert restored.subtask_specs[0].pseudo_reward_scale == float(np.float32(1e-12))
+    assert restored.subtask_specs[0].threshold == 1e-12
+    assert restored.subtask_specs[0].pseudo_reward_scale == 1e-12
     assert restored.subtask_specs[0].max_option_steps == 1
     assert agent.config.stomp.option_gamma == 0.0
 
