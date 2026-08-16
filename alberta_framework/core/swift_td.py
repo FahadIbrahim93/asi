@@ -381,30 +381,8 @@ class SwiftTD:
             & (next_observation_finite | (gamma_scalar == 0.0))
             & jnp.isfinite(gamma_scalar)
         )
-        previous_checked = state.replace(
-            eligibility_traces=jnp.where(
-                (gamma_scalar == 0.0) | (state.trace_decay == 0.0),
-                jnp.zeros_like(state.eligibility_traces),
-                state.eligibility_traces,
-            ),
-            z_bar_traces=jnp.where(
-                (gamma_scalar == 0.0) | (state.trace_decay == 0.0),
-                jnp.zeros_like(state.z_bar_traces),
-                state.z_bar_traces,
-            ),
-            p_traces=jnp.where(
-                (gamma_scalar == 0.0) | (state.trace_decay == 0.0),
-                jnp.zeros_like(state.p_traces),
-                state.p_traces,
-            ),
-            trace_decay=jnp.where(
-                gamma_scalar == 0.0,
-                jnp.zeros_like(state.trace_decay),
-                state.trace_decay,
-            ),
-        )
         update_applied = (
-            floating_tree_is_finite(previous_checked)
+            floating_tree_is_finite(state)
             & inputs_valid
             & jnp.all(jnp.isfinite(meta_delta))
             & jnp.all(jnp.isfinite(delta_w))

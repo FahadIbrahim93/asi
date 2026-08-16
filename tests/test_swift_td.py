@@ -379,6 +379,23 @@ class TestSwiftTDBehavior:
             result.new_state.eligibility_traces, jnp.zeros(3), atol=1e-7
         )
 
+    def test_zero_gamma_does_not_disguise_consumed_inf_trace_state(self) -> None:
+        optimizer = SwiftTD(initial_step_size=0.01, trace_decay=0.0)
+        state = optimizer.init(2).replace(  # type: ignore[attr-defined]
+            eligibility_traces=jnp.full((3,), jnp.inf, dtype=jnp.float32)
+        )
+
+        result = optimizer.update(
+            state,
+            jnp.asarray(1.0, dtype=jnp.float32),
+            jnp.asarray([0.5, -0.25], dtype=jnp.float32),
+            jnp.asarray([jnp.inf, 0.0], dtype=jnp.float32),
+            jnp.asarray(0.0, dtype=jnp.float32),
+        )
+
+        assert not bool(result.update_applied)
+        chex.assert_trees_all_equal(result.new_state, state)
+
     def test_integrates_with_td_linear_learner(self):
         """SwiftTD follows the TDOptimizer interface and drives TDLinearLearner."""
         learner = TDLinearLearner(optimizer=SwiftTD(initial_step_size=0.01))
