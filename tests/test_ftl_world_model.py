@@ -58,9 +58,11 @@ def _shared_dynamics_mse(
         ("projection_dim", 0),
         ("bins", 1),
         ("ridge", 0.0),
+        ("ridge", float("nan")),
         ("statistics_decay", 0.0),
         ("statistics_decay", 1.01),
         ("prediction_clip", 0.0),
+        ("prediction_clip", float("nan")),
         ("error_decay", 1.0),
     ],
 )

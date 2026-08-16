@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import math
 from typing import Any
 
 import chex
@@ -80,12 +81,12 @@ class SparseFTLWorldModelConfig:
             raise ValueError("projection_dim must be positive")
         if self.bins < 2:
             raise ValueError("bins must be at least 2")
-        if self.ridge <= 0.0:
-            raise ValueError("ridge must be positive")
+        if not math.isfinite(self.ridge) or self.ridge <= 0.0:
+            raise ValueError("ridge must be finite and positive")
         if not 0.0 < self.statistics_decay <= 1.0:
             raise ValueError("statistics_decay must be in (0, 1]")
-        if self.prediction_clip <= 0.0:
-            raise ValueError("prediction_clip must be positive")
+        if not math.isfinite(self.prediction_clip) or self.prediction_clip <= 0.0:
+            raise ValueError("prediction_clip must be finite and positive")
         if not 0.0 <= self.error_decay < 1.0:
             raise ValueError("error_decay must be in [0, 1)")
 
