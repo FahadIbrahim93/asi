@@ -8,6 +8,7 @@ import chex
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 import pytest
 
 from alberta_framework.core.ftl_world_model import (
@@ -81,6 +82,127 @@ def test_config_rejects_invalid_parameters(field: str, value: int | float) -> No
 
     with pytest.raises(ValueError):
         SparseFTLWorldModelConfig(**kwargs)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("field", ["ridge", "prediction_clip"])
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param(True, id="bool"),
+        pytest.param(np.bool_(True), id="numpy-bool"),
+        pytest.param("0.01", id="string"),
+        pytest.param(1.0 + 0.0j, id="complex"),
+        pytest.param(object(), id="object"),
+    ],
+)
+def test_config_rejects_non_real_or_boolean_execution_scalars(
+    field: str,
+    value: object,
+) -> None:
+    kwargs: dict[str, object] = {
+        "observation_dim": 2,
+        "action_dim": 1,
+        field: value,
+    }
+
+    with pytest.raises(ValueError, match=rf"{field} must be a finite positive normal float32"):
+        SparseFTLWorldModelConfig(**kwargs)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("field", ["ridge", "prediction_clip"])
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param(
+            float(np.nextafter(np.float32(0.0), np.float32(1.0))),
+            id="float32-subnormal",
+        ),
+        pytest.param(np.nextafter(0.0, 1.0), id="underflows-to-zero"),
+        pytest.param(float(np.finfo(np.float32).max) * 2.0, id="overflows-to-infinity"),
+    ],
+)
+def test_config_rejects_values_outside_normal_float32_execution_domain(
+    field: str,
+    value: float,
+) -> None:
+    assert np.isfinite(value) and value > 0.0
+    kwargs: dict[str, object] = {
+        "observation_dim": 2,
+        "action_dim": 1,
+        field: value,
+    }
+
+    with pytest.raises(ValueError, match=rf"{field} must be a finite positive normal float32"):
+        SparseFTLWorldModelConfig(**kwargs)  # type: ignore[arg-type]
+
+
+def test_config_canonicalizes_numpy_scalars_for_strict_json_roundtrip() -> None:
+    config = SparseFTLWorldModelConfig(
+        observation_dim=2,
+        action_dim=1,
+        ridge=np.float32(0.125),  # type: ignore[arg-type]
+        prediction_clip=np.int64(4),  # type: ignore[arg-type]
+    )
+
+    assert type(config.ridge) is float
+    assert type(config.prediction_clip) is float
+    encoded = json.dumps(config.to_config(), allow_nan=False)
+    restored = SparseFTLWorldModelConfig.from_config(json.loads(encoded))
+    assert restored == config
+    assert type(restored.ridge) is float
+    assert type(restored.prediction_clip) is float
+
+
+def test_underflowing_ridge_is_rejected_before_update_poisoning() -> None:
+    ridge = float(np.nextafter(np.float32(0.0), np.float32(1.0)))
+
+    with pytest.raises(ValueError, match="ridge must be a finite positive normal float32"):
+        config = SparseFTLWorldModelConfig(
+            observation_dim=1,
+            action_dim=1,
+            projection_dim=2,
+            bins=3,
+            ridge=ridge,
+        )
+        model = SparseFTLWorldModel(config)
+        state = model.init(jr.key(100))
+        result = model.update(
+            state,
+            jnp.array([0.0], dtype=jnp.float32),
+            jnp.array([0.0], dtype=jnp.float32),
+            jnp.array([1.0], dtype=jnp.float32),
+        )
+        assert not bool(jnp.all(jnp.isfinite(result.state.weights)))
+
+
+def test_overflowing_prediction_clip_is_rejected_before_prediction_poisoning() -> None:
+    prediction_clip = float(np.finfo(np.float32).max) * 2.0
+
+    with pytest.raises(
+        ValueError,
+        match="prediction_clip must be a finite positive normal float32",
+    ):
+        config = SparseFTLWorldModelConfig(
+            observation_dim=1,
+            action_dim=1,
+            projection_dim=2,
+            bins=3,
+            prediction_clip=prediction_clip,
+        )
+        model = SparseFTLWorldModel(config)
+        state = model.init(jr.key(101)).replace(  # type: ignore[attr-defined]
+            weights=jnp.full(
+                (config.feature_dim, config.observation_dim),
+                jnp.finfo(jnp.float32).max,
+                dtype=jnp.float32,
+            )
+        )
+        prediction = model.predict(
+            state,
+            jnp.array([0.0], dtype=jnp.float32),
+            jnp.array([0.0], dtype=jnp.float32),
+        )
+        assert not bool(jnp.all(jnp.isfinite(prediction.delta)))
 
 
 def test_soft_bin_features_are_bounded_local_and_boundary_safe() -> None:
