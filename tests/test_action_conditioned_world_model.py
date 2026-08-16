@@ -27,6 +27,7 @@ from alberta_framework.core.dreaming import (
 from alberta_framework.core.world_model import (
     ActionConditionedWorldModel,
     ActionConditionedWorldModelConfig,
+    ActionConditionedWorldModelState,
     WorldModelPrediction,
     run_action_conditioned_world_model_learning_loop,
 )
