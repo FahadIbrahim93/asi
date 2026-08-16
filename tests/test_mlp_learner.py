@@ -135,6 +135,54 @@ class TestMLPLearner:
             assert bool(jnp.all(jnp.isfinite(new_w)))
         assert bool(recovered.update_applied)
 
+    def test_zero_trace_decay_does_not_multiply_inf_traces(self) -> None:
+        """Default gamma*lamda is 0; 0 * inf traces is NaN and would freeze."""
+        learner = MLPLearner(hidden_sizes=(4,), sparsity=0.0, optimizer=LMS(0.1))
+        state = learner.init(feature_dim=3, key=jr.key(1))
+        poisoned_traces = tuple(
+            jnp.full_like(trace, jnp.inf) for trace in state.traces
+        )
+        state = state.replace(traces=poisoned_traces)
+        raw = jnp.asarray(0.0, dtype=jnp.float32) * jnp.asarray(jnp.inf, dtype=jnp.float32)
+        assert not bool(jnp.isfinite(raw))
+
+        observation = jnp.ones(3, dtype=jnp.float32)
+        result = learner.update(
+            state, observation, jnp.array(1.0, dtype=jnp.float32)
+        )
+        assert bool(result.update_applied)
+        for trace in result.state.traces:
+            assert bool(jnp.all(jnp.isfinite(trace)))
+        for new_w in result.state.params.weights:
+            assert bool(jnp.all(jnp.isfinite(new_w)))
+
+    def test_zero_utility_decay_recovers_poisoned_utility(self) -> None:
+        learner = MLPLearner(
+            hidden_sizes=(4,),
+            sparsity=0.0,
+            optimizer=LMS(0.1),
+            track_neuron_utility=True,
+            neuron_utility_decay=0.0,
+        )
+        state = learner.init(feature_dim=3, key=jr.key(2))
+        assert state.neuron_utility is not None
+        state = state.replace(
+            neuron_utility=tuple(
+                jnp.full_like(utility, jnp.inf) for utility in state.neuron_utility
+            )
+        )
+
+        result = learner.update(
+            state,
+            jnp.ones(3, dtype=jnp.float32),
+            jnp.array(1.0, dtype=jnp.float32),
+        )
+
+        assert bool(result.update_applied)
+        assert result.state.neuron_utility is not None
+        for utility in result.state.neuron_utility:
+            assert bool(jnp.all(jnp.isfinite(utility)))
+
     def test_update_reduces_error(self):
         """Multiple updates on a fixed target should reduce error."""
         learner = MLPLearner(
