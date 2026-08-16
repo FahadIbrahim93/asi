@@ -177,6 +177,12 @@ def _require_int(name: str, value: object, *, minimum: int | None = None) -> int
     return number
 
 
+def _require_bool(name: str, value: object) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError(f"{name} must be a bool, got {value!r}")
+    return value
+
+
 def _validate_planning_config(config: Step7DynaConfig) -> None:
     planning_steps = _require_int("planning_steps", config.planning_steps, minimum=0)
     planning_rollout_depth = _require_int(
@@ -205,6 +211,10 @@ def _validate_planning_config(config: Step7DynaConfig) -> None:
     utility_step = _require_unit_interval(
         "planning_utility_step_size",
         config.planning_utility_step_size,
+    )
+    _require_bool(
+        "planning_apply_importance_correction",
+        config.planning_apply_importance_correction,
     )
     if config.planning_strategy not in (
         "random",
