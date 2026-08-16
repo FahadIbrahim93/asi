@@ -20,6 +20,7 @@ from alberta_framework.benchmarks.upgd_ipmnist import (
     merge_legacy_v1_partial_results,
     merge_partial_results,
 )
+from alberta_framework.evaluation import upgd_ipmnist_nonpromoting as nonpromoting
 from alberta_framework.evaluation.upgd_ipmnist_nonpromoting import (
     EXPECTED_CONFIG,
     EXPECTED_HYPERPARAMETERS,
@@ -385,6 +386,64 @@ def test_v2_artifact_manifest_binds_exact_shard_bytes(tmp_path: Path) -> None:
 
     assert not validation.valid
     assert any("does not bind exact shard bytes" in error for error in validation.errors)
+
+
+@pytest.mark.unit
+def test_v2_expected_manifest_does_not_mix_digest_and_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A second-read identity swap cannot bind snapshot B to digest A.
+
+    The public validator already one-reads shards before reconstructing the
+    expected manifest, so a first-read file replacement would be consumed by
+    that earlier guard. The remaining hole is the loop's second
+    ``_strict_json_object(path)`` after ``path.read_bytes()``; swapping that
+    helper is the same split-read as replacing the path between the two calls.
+    """
+    paths = _write_v2_shards(tmp_path, seeds=(0,))
+    artifact = _write_v2_artifact(tmp_path, paths)
+    target = next(path for path in paths if path.name.startswith("upgd_w_"))
+    swapped_identity = _v2_partial_payload("adamw", 1)
+    original = nonpromoting._strict_json_object
+
+    def split_read_identity(path: Path) -> dict[str, object]:
+        if Path(path).resolve() == target.resolve():
+            return dict(swapped_identity)
+        return original(path)
+
+    monkeypatch.setattr(nonpromoting, "_strict_json_object", split_read_identity)
+
+    validation = validate_upgd_ipmnist_v2_artifact(artifact, paths)
+
+    assert validation.valid, validation.errors
+    payload = json.loads(artifact.read_text(encoding="utf-8"))
+    target_entry = next(
+        entry for entry in payload["partial_manifest"] if entry["path"] == target.as_posix()
+    )
+    raw = target.read_bytes()
+    assert target_entry["learner"] == "upgd_w"
+    assert target_entry["seed_id"] == 0
+    assert target_entry["sha256"] == hashlib.sha256(raw).hexdigest()
+    assert target_entry["size_bytes"] == len(raw)
+    assert (target_entry["learner"], target_entry["seed_id"]) != ("adamw", 1)
+
+
+@pytest.mark.unit
+def test_v2_expected_manifest_stable_shards_match_file_digest(tmp_path: Path) -> None:
+    paths = _write_v2_shards(tmp_path, seeds=(0, 1))
+    artifact = _write_v2_artifact(tmp_path, paths)
+    payload = json.loads(artifact.read_text(encoding="utf-8"))
+    identities = [(entry["learner"], entry["seed_id"]) for entry in payload["partial_manifest"]]
+    assert identities == [("adamw", 0), ("adamw", 1), ("upgd_w", 0), ("upgd_w", 1)]
+    by_path = {entry["path"]: entry for entry in payload["partial_manifest"]}
+    for path in paths:
+        raw = path.read_bytes()
+        entry = by_path[path.as_posix()]
+        assert entry["size_bytes"] == len(raw)
+        assert entry["sha256"] == hashlib.sha256(raw).hexdigest()
+
+    validation = validate_upgd_ipmnist_v2_artifact(artifact, paths)
+    assert validation.valid, validation.errors
 
 
 @pytest.mark.unit
