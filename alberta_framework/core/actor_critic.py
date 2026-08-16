@@ -139,9 +139,12 @@ class ActorCriticArrayResult:
     Attributes:
         state: Final agent state.
         actions: Per-step actions, shape ``(num_steps,)``.
-        policies: Per-step policy probabilities at ``observations[t]`` — the
-            distribution that produced ``actions[t]`` — shape
-            ``(num_steps, n_actions)``.
+        policies: Per-step pre-update agent policy probabilities at
+            ``observations[t]``, shape ``(num_steps, n_actions)``. When actions
+            are sampled by this runner, this is the distribution that produced
+            ``actions[t]``. When fixed actions are supplied, this is the current
+            agent policy evaluated at that state, not provenance for the
+            external behavior policy.
         values: Per-step previous-state value estimates, shape ``(num_steps,)``.
         td_errors: Per-step TD errors, shape ``(num_steps,)``.
     """
@@ -533,7 +536,9 @@ def run_actor_critic_from_arrays(
         terminated: Terminal flags, shape ``(num_steps,)``. Required unless
             ``discounts`` is provided.
         next_observations: Next observations, shape ``(num_steps, feature_dim)``.
-        actions: Optional fixed current actions, shape ``(num_steps,)``.
+        actions: Optional fixed current actions, shape ``(num_steps,)``. Their
+            behavior-policy probabilities are not known; returned ``policies``
+            are the current agent policy evaluated before each update.
         discounts: Optional transition discounts, shape ``(num_steps,)``.
 
     Returns:
