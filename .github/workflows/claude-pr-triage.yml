@@ -95,6 +95,7 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          show_full_output: true
           prompt: |
             Read the instructions in .github/claude/triage-prompt.md and follow
             them exactly. The PR under review is number ${{ env.PR_NUMBER }};
@@ -178,6 +179,7 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          show_full_output: true
           prompt: |
             Read the instructions in .github/claude/research-prompt.md and
             follow them exactly. The PR under review is number
