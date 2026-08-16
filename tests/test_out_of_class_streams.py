@@ -847,6 +847,26 @@ class TestFrequencyMismatchStream:
 class TestCompositionalStream:
     """Tests for the 2-hidden-layer compositional out-of-class stream."""
 
+    @pytest.mark.parametrize(
+        ("name", "value"),
+        [
+            ("feature_std", float("nan")),
+            ("feature_std", float("inf")),
+            ("feature_std", -1.0),
+            ("amplitude_scale", float("nan")),
+            ("amplitude_scale", float("inf")),
+            ("amplitude_scale", -0.5),
+            ("noise_std", float("nan")),
+            ("noise_std", float("inf")),
+            ("noise_std", -1.0),
+        ],
+    )
+    def test_rejects_non_finite_or_negative_scale_params(
+        self, name: str, value: float
+    ) -> None:
+        with pytest.raises(ValueError, match="float32"):
+            CompositionalStream(**{name: value})  # type: ignore[arg-type]
+
     @pytest.mark.parametrize("weight_scale", [float("nan"), float("inf"), float("-inf")])
     def test_weight_scale_must_be_finite(self, weight_scale: float) -> None:
         with pytest.raises(ValueError, match="weight_scale must be finite"):
