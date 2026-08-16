@@ -236,10 +236,8 @@ def run_step6_smoke(
     seed: int = 0,
 ) -> Step6SmokeResult:
     """Run a tiny deterministic Step 6 integration probe."""
-    if steps < 1:
-        raise ValueError("steps must be positive")
-    if feature_dim < 1:
-        raise ValueError("feature_dim must be positive")
+    steps = _require_int("steps", steps, minimum=1)
+    feature_dim = _require_int("feature_dim", feature_dim, minimum=1)
 
     cfg = config or Step6DifferentialSARSAConfig()
     agent = make_step6_differential_sarsa_agent(cfg)

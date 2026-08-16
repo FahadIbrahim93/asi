@@ -260,6 +260,15 @@ def test_step6_facade_config_roundtrip_one_step_and_smoke() -> None:
     assert smoke.agent_config["type"] == "DifferentialSARSAAgent"
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (("steps", True), ("steps", 1.5), ("feature_dim", False), ("feature_dim", 1.5)),
+)
+def test_step6_smoke_rejects_non_integral_dimensions(field: str, value: Any) -> None:
+    with pytest.raises(ValueError, match=field):
+        run_step6_smoke(**{field: value})
+
+
 _INVALID_STEP6_FIELDS: tuple[tuple[str, Any], ...] = (
     ("n_actions", 0),
     ("n_actions", -1),
