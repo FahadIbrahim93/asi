@@ -500,3 +500,66 @@ def test_consumer_layout_and_descriptor_static_contracts_are_strict() -> None:
             _NEW.astype(jnp.float32),
             feature_axes=_feature_axes(),
         )
+
+
+@pytest.mark.unit
+def test_router_config_rejects_booleans_and_non_integers() -> None:
+    with pytest.raises(ValueError, match="base_dim"):
+        FeatureBankRouterConfig(base_dim=True, active_slots=4)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="active_slots"):
+        FeatureBankRouterConfig(base_dim=4, active_slots=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="base_dim"):
+        FeatureBankRouterConfig(base_dim=4.5, active_slots=4)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="active_slots"):
+        FeatureBankRouterConfig(base_dim=4, active_slots=4.5)  # type: ignore[arg-type]
+
+
+@pytest.mark.unit
+def test_router_config_accepts_and_canonicalizes_numpy_integers() -> None:
+    integer_types = {
+        np.dtype(code).type for code in "bBhHiIlLqQpP" if np.dtype(code).kind in "iu"
+    }
+    for integer_type in integer_types:
+        config = FeatureBankRouterConfig(
+            base_dim=integer_type(4),
+            active_slots=integer_type(4),
+        )
+        assert type(config.base_dim) is int
+        assert type(config.active_slots) is int
+        assert config.base_dim == 4
+        assert config.active_slots == 4
+
+
+@pytest.mark.unit
+def test_router_config_rejects_spoofs_and_float32_sink_overflow() -> None:
+    class HostileInt(int):
+        def __repr__(self) -> str:
+            raise AssertionError("invalid subclass repr must not run")
+
+    class ClassSpoof:
+        @property
+        def __class__(self) -> type[int]:
+            return int
+
+    for value in (HostileInt(4), ClassSpoof(), np.bool_(True), np.float32(4.0)):
+        with pytest.raises(ValueError, match="base_dim"):
+            FeatureBankRouterConfig(base_dim=value, active_slots=1)  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="active_slots"):
+            FeatureBankRouterConfig(base_dim=4, active_slots=value)  # type: ignore[arg-type]
+
+    maximum = 2**31 - 1
+    config = FeatureBankRouterConfig(base_dim=maximum - 1, active_slots=1)
+    assert config.total_feature_dim == maximum
+    with pytest.raises(ValueError, match="active_slots"):
+        FeatureBankRouterConfig(base_dim=maximum, active_slots=1)
+    with pytest.raises(ValueError, match="active_slots"):
+        FeatureBankRouterConfig(base_dim=maximum - 1, active_slots=2)
+
+
+@pytest.mark.unit
+def test_router_config_roundtrip_preserves_canonical_int32_dimensions() -> None:
+    config = FeatureBankRouterConfig(base_dim=np.longlong(4), active_slots=np.ulonglong(3))
+    payload = config.to_config()
+    assert type(payload["base_dim"]) is int
+    assert type(payload["active_slots"]) is int
+    assert FeatureBankRouterConfig.from_config(payload) == config

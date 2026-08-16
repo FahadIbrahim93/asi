@@ -27,17 +27,43 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import operator
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, SupportsIndex, cast
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import Array
 from jaxtyping import Bool, Int
 
 CONFIG_SCHEMA_VERSION = "alberta.feature_bank_router.config.v1"
 INACTIVE_DESCRIPTOR = (-1, -1)
 _INT32_MAX = 2**31 - 1
+_ACTUAL_INT_TYPES = frozenset(
+    {
+        int,
+        np.int8,
+        np.int16,
+        np.int32,
+        np.int64,
+        np.uint8,
+        np.uint16,
+        np.uint32,
+        np.uint64,
+        np.longlong,
+        np.ulonglong,
+    }
+)
+
+
+def _require_int32(name: str, value: object, *, minimum: int, maximum: int = _INT32_MAX) -> int:
+    if type(value) not in _ACTUAL_INT_TYPES:
+        raise ValueError(f"{name} must be an integer in [{minimum}, {maximum}]")
+    canonical = operator.index(cast(SupportsIndex, value))
+    if not minimum <= canonical <= maximum:
+        raise ValueError(f"{name} must be an integer in [{minimum}, {maximum}]")
+    return canonical
 
 
 @dataclasses.dataclass(frozen=True)
@@ -53,18 +79,23 @@ class FeatureBankRouterConfig:
     active_slots: int
 
     def __post_init__(self) -> None:
-        if (
-            isinstance(self.base_dim, bool)
-            or not isinstance(self.base_dim, int)
-            or self.base_dim < 2
-        ):
-            raise ValueError("base_dim must be an integer of at least 2")
-        if (
-            isinstance(self.active_slots, bool)
-            or not isinstance(self.active_slots, int)
-            or self.active_slots <= 0
-        ):
-            raise ValueError("active_slots must be a positive integer")
+        base_dim = _require_int32("base_dim", self.base_dim, minimum=2)
+        active_slots = _require_int32(
+            "active_slots",
+            self.active_slots,
+            minimum=1,
+            maximum=_INT32_MAX - base_dim,
+        )
+        object.__setattr__(
+            self,
+            "base_dim",
+            base_dim,
+        )
+        object.__setattr__(
+            self,
+            "active_slots",
+            active_slots,
+        )
 
     @property
     def total_feature_dim(self) -> int:
