@@ -158,6 +158,58 @@ def test_initialization_is_distinct_fixed_width_and_exactly_accounted() -> None:
     assert budget.replay_capacity == 0
 
 
+def test_config_rejects_an_initial_variance_bias_outside_the_parameter_bound() -> None:
+    """The deterministic variance-head initializer must fit inside max_parameter_magnitude."""
+    expected = (
+        r"^initial variance bias magnitude 5\.75646[0-9]* exceeds max_parameter_magnitude=1\.0$"
+    )
+    with pytest.raises(ValueError, match=expected):
+        _config(max_parameter_magnitude=1.0)
+
+
+def test_init_refuses_to_return_a_state_it_would_reject() -> None:
+    """A bound that admits the deterministic bias can still be breached by drawn kernels."""
+    model = RecurrentLatentWorldModelEnsemble(
+        _config(initialization_scale=50.0, max_parameter_magnitude=6.0)
+    )
+    with pytest.raises(
+        ValueError,
+        match=r"^initialized parameters exceed max_parameter_magnitude=6\.0; "
+        r"lower initialization_scale or raise the bound$",
+    ):
+        model.init(jr.key(0))
+
+
+def test_init_state_is_valid_for_every_accepted_default_scale() -> None:
+    model = RecurrentLatentWorldModelEnsemble(_config())
+    for seed in range(4):
+        assert bool(model.state_valid(model.init(jr.key(seed))))
+
+
+def test_initial_variance_bias_bound_is_exact_at_its_float32_endpoint() -> None:
+    """The bound is compared against the stored float32 bias, not its binary64 origin."""
+    default = _config()
+    sink = float(np.float32(abs(default.initial_variance_logit)))
+    assert default.initial_variance_bias_magnitude == sink
+    assert sink != abs(default.initial_variance_logit)
+
+    endpoint = RecurrentLatentWorldModelEnsemble(_config(max_parameter_magnitude=sink))
+    state = endpoint.init(jr.key(0))
+    assert bool(endpoint.state_valid(state))
+    stored = float(jnp.max(jnp.abs(state.member_parameters[0].variance_bias)))
+    assert stored == sink
+
+    below = float(np.nextafter(np.float32(sink), np.float32(0.0)))
+    with pytest.raises(ValueError, match="initial variance bias magnitude"):
+        _config(max_parameter_magnitude=below)
+
+
+def test_init_is_a_host_side_entry_point() -> None:
+    model = RecurrentLatentWorldModelEnsemble(_config())
+    with pytest.raises(jax.errors.TracerBoolConversionError):
+        jax.jit(model.init)(jr.key(0))
+
+
 def test_start_and_decide_are_read_only_predict_before_update_caches() -> None:
     model = RecurrentLatentWorldModelEnsemble(_config())
     state = model.init(jr.key(0))
@@ -521,6 +573,28 @@ def test_digest_bound_checkpoint_roundtrip_preserves_exact_future_stream(tmp_pat
         next_record,
     )
     _assert_tree_equal(original_next, restored_next)
+
+
+def test_checkpoint_restore_does_not_depend_on_an_unrelated_template_draw(
+    tmp_path: Path,
+) -> None:
+    """A valid persisted draw must restore even when the default template draw is invalid."""
+    model = RecurrentLatentWorldModelEnsemble(
+        _config(initialization_scale=5.0, max_parameter_magnitude=8.0)
+    )
+    state = model.init(jr.key(3))
+    assert bool(model.state_valid(state))
+    with pytest.raises(ValueError, match="initialized parameters exceed"):
+        model.init(jr.key(0))
+
+    checkpoint = tmp_path / "seed-dependent-init.ckpt"
+    save_recurrent_latent_world_model_ensemble_checkpoint(model, state, checkpoint)
+
+    restored_model, restored_state = load_recurrent_latent_world_model_ensemble_checkpoint(
+        checkpoint
+    )
+    assert restored_model.to_config() == model.to_config()
+    _assert_tree_equal(restored_state, state)
 
 
 def test_checkpoint_rejects_metadata_config_and_resource_tampering(tmp_path: Path) -> None:
