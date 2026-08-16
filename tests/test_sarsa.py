@@ -61,9 +61,7 @@ class TestSARSAConfigValidation:
             SARSAConfig(n_actions=2, epsilon_decay_steps=epsilon_decay_steps)  # type: ignore[arg-type]
 
     @pytest.mark.parametrize("name", ["gamma", "epsilon_start", "epsilon_end"])
-    @pytest.mark.parametrize(
-        "value", [float("nan"), float("inf"), -0.1, 1.1, True, "0.5"]
-    )
+    @pytest.mark.parametrize("value", [float("nan"), float("inf"), -0.1, 1.1, True, "0.5"])
     def test_rejects_invalid_probability(self, name, value):
         with pytest.raises(ValueError, match=name):
             SARSAConfig(n_actions=2, **{name: value})
@@ -233,9 +231,7 @@ class TestSARSAActionSelection:
         expected = n_samples / 4
         chi_sq = np.sum((counts - expected) ** 2 / expected)
         # With df=3, chi_sq < 16.27 at p=0.001 (very conservative)
-        assert chi_sq < 16.27, (
-            f"Action distribution not uniform: {counts}, chi_sq={chi_sq}"
-        )
+        assert chi_sq < 16.27, f"Action distribution not uniform: {counts}, chi_sq={chi_sq}"
 
     def test_action_in_valid_range(self):
         """Selected actions are always in [0, n_actions)."""
@@ -354,9 +350,7 @@ class TestSARSAUpdate:
         actual = result.state.replace(
             learner_state=result.state.learner_state.replace(birth_timestamp=0.0)
         )
-        expected = state.replace(
-            learner_state=state.learner_state.replace(birth_timestamp=0.0)
-        )
+        expected = state.replace(learner_state=state.learner_state.replace(birth_timestamp=0.0))
         chex.assert_trees_all_equal(actual, expected)
         assert float(result.td_error) == 0.0
 
@@ -482,7 +476,6 @@ class TestSARSAUpdate:
         chex.assert_trees_all_close(w_trace, jnp.zeros_like(w_trace))
         chex.assert_trees_all_close(b_trace, jnp.zeros_like(b_trace))
 
-
     def test_nan_masking(self):
         """Only the taken action's head receives a weight update."""
         agent = _make_agent(n_actions=3, gamma=0.9, epsilon_start=0.0)
@@ -499,10 +492,7 @@ class TestSARSAUpdate:
         next_action = jnp.array(0, dtype=jnp.int32)
 
         # Save head params before update
-        old_head_weights = [
-            state.learner_state.head_params.weights[i]
-            for i in range(3)
-        ]
+        old_head_weights = [state.learner_state.head_params.weights[i] for i in range(3)]
 
         result = agent.update(
             state,
@@ -512,10 +502,7 @@ class TestSARSAUpdate:
             next_action=next_action,
         )
 
-        new_head_weights = [
-            result.state.learner_state.head_params.weights[i]
-            for i in range(3)
-        ]
+        new_head_weights = [result.state.learner_state.head_params.weights[i] for i in range(3)]
 
         # Head 1 should have changed (it was the taken action)
         head1_changed = not jnp.allclose(old_head_weights[1], new_head_weights[1])
@@ -950,9 +937,7 @@ class TestSARSAScan:
             rng_key=new_key,
         )
 
-        result = run_sarsa_from_arrays(
-            agent, state, obs, rewards, terminated, next_obs
-        )
+        result = run_sarsa_from_arrays(agent, state, obs, rewards, terminated, next_obs)
 
         assert isinstance(result, SARSAArrayResult)
         chex.assert_shape(result.q_values, (n_steps, 2))
@@ -979,9 +964,7 @@ class TestSARSAScan:
             rng_key=new_key,
         )
 
-        result = run_sarsa_from_arrays(
-            agent, state, obs, rewards, terminated, next_obs
-        )
+        result = run_sarsa_from_arrays(agent, state, obs, rewards, terminated, next_obs)
 
         # Should run without error and produce finite results
         assert jnp.all(jnp.isfinite(result.td_errors))
@@ -1082,12 +1065,8 @@ class TestSARSALambdaTraces:
         # after two visits e_2 = (gamma * lamda) * s_1 + s_2.
         gl = gamma * lamda
         w_trace, b_trace = result.state.learner_state.head_traces[0]
-        chex.assert_trees_all_close(
-            w_trace, (gl * obs1 + obs2).reshape(1, -1), rtol=1e-5
-        )
-        chex.assert_trees_all_close(
-            b_trace, jnp.array([gl + 1.0], dtype=jnp.float32), rtol=1e-5
-        )
+        chex.assert_trees_all_close(w_trace, (gl * obs1 + obs2).reshape(1, -1), rtol=1e-5)
+        chex.assert_trees_all_close(b_trace, jnp.array([gl + 1.0], dtype=jnp.float32), rtol=1e-5)
 
     def test_lambda_changes_multistep_updates(self):
         """lamda in {0.0, 0.9} produce different weights on a 3-step corridor."""
@@ -1110,9 +1089,7 @@ class TestSARSALambdaTraces:
                 last_action=jnp.array(0, dtype=jnp.int32),
                 last_observation=obs[0],
             )
-            result = run_sarsa_from_arrays(
-                agent, state, obs, rewards, terminated, next_obs
-            )
+            result = run_sarsa_from_arrays(agent, state, obs, rewards, terminated, next_obs)
             return result.state.learner_state.head_params.weights[0]
 
         w_one_step = run(0.0)
@@ -1150,9 +1127,7 @@ class TestSARSALambdaTraces:
         gl = gamma * lamda
         w_trace, b_trace = result.state.learner_state.head_traces[0]
         chex.assert_trees_all_close(w_trace, (gl * obs1).reshape(1, -1), rtol=1e-5)
-        chex.assert_trees_all_close(
-            b_trace, jnp.array([gl], dtype=jnp.float32), rtol=1e-5
-        )
+        chex.assert_trees_all_close(b_trace, jnp.array([gl], dtype=jnp.float32), rtol=1e-5)
 
     def test_traces_reset_at_episode_boundary(self):
         """Control-head traces are cleared after a terminated transition."""
@@ -1185,9 +1160,7 @@ class TestSARSALambdaTraces:
     def test_external_target_semantics_intact(self):
         """With lamda>0, the TD target is still r + gamma*Q(s',a') (no
         double-counted internal bootstrap)."""
-        agent = _make_agent(
-            n_actions=2, hidden_sizes=(), gamma=0.9, epsilon_start=0.0, lamda=0.8
-        )
+        agent = _make_agent(n_actions=2, hidden_sizes=(), gamma=0.9, epsilon_start=0.0, lamda=0.8)
         state = agent.init(feature_dim=3, key=jr.key(5))
         obs1 = jnp.array([1.0, -1.0, 0.5], dtype=jnp.float32)
         obs2 = jnp.array([0.5, 2.0, -0.3], dtype=jnp.float32)
@@ -1230,16 +1203,34 @@ class TestSARSAContinuingPseudoBoundary:
         reward = jnp.array(5.0)
 
         # Terminal update: target = r only
-        result_term = agent.update(
-            state, reward, next_obs, jnp.array(1.0), next_action
-        )
+        result_term = agent.update(state, reward, next_obs, jnp.array(1.0), next_action)
 
         # Non-terminal update: target = r + gamma * Q(s', a')
-        result_cont = agent.update(
-            state, reward, next_obs, jnp.array(0.0), next_action
-        )
+        result_cont = agent.update(state, reward, next_obs, jnp.array(0.0), next_action)
 
         # TD errors should differ (terminal strips bootstrap)
         # Both should be finite
         assert jnp.isfinite(result_term.td_error)
         assert jnp.isfinite(result_cont.td_error)
+
+
+def test_sarsa_config_rejects_booleans_and_non_integers() -> None:
+    with pytest.raises(ValueError, match="n_actions"):
+        SARSAConfig(n_actions=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="n_actions"):
+        SARSAConfig(n_actions=2.5)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="epsilon_decay_steps"):
+        SARSAConfig(n_actions=2, epsilon_decay_steps=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="epsilon_decay_steps"):
+        SARSAConfig(n_actions=2, epsilon_decay_steps=100.5)  # type: ignore[arg-type]
+
+
+def test_sarsa_config_accepts_and_canonicalizes_numpy_integers() -> None:
+    cfg = SARSAConfig(
+        n_actions=np.int32(4),
+        epsilon_decay_steps=np.int64(100),
+    )
+    assert type(cfg.n_actions) is int
+    assert type(cfg.epsilon_decay_steps) is int
+    assert cfg.n_actions == 4
+    assert cfg.epsilon_decay_steps == 100
