@@ -180,6 +180,8 @@ def test_single_tiny_positive_neighbor_score_still_has_unit_weight() -> None:
         ("max_uncertainty", -0.1),
         ("max_safety_cost", float("nan")),
         ("max_age", -1),
+        ("max_age", 2**31),
+        ("max_age", 10**10),
         ("max_age", 1.5),
         ("staleness_scale", float("inf")),
         ("utility_decay", 1.1),
