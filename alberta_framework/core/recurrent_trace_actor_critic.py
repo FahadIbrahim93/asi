@@ -46,6 +46,7 @@ import numpy as np
 from jax import Array
 from jax.nn.initializers import lecun_normal
 
+from alberta_framework.core._float32_scalars import validated_float32_scalar
 from alberta_framework.core.initializers import sparse_init
 from alberta_framework.core.update_safety import (
     floating_tree_is_finite as _floating_tree_is_finite,
@@ -252,6 +253,9 @@ _ACTUAL_INT_TYPES = frozenset(
         np.ulonglong,
     }
 )
+_ACTUAL_FLOAT_TYPES = frozenset(
+    {float, *(np.dtype(code).type for code in ("e", "f", "d", "g"))}
+)
 
 
 def _require_int32(name: str, value: object, *, minimum: int, maximum: int = _INT32_MAX) -> int:
@@ -261,6 +265,88 @@ def _require_int32(name: str, value: object, *, minimum: int, maximum: int = _IN
     if not minimum <= canonical <= maximum:
         raise ValueError(f"{name} must be an integer in [{minimum}, {maximum}]")
     return canonical
+
+
+def _validated_config_float(name: str, value: object) -> float:
+    if type(value) is bool or type(value) is np.bool_:
+        raise ValueError(f"{name} must be numeric, not bool")
+    if type(value) not in (_ACTUAL_INT_TYPES | _ACTUAL_FLOAT_TYPES):
+        raise ValueError(f"{name} must be a finite real scalar")
+    normalized = validated_float32_scalar(name, value)
+    _validate_normal_float32_config_value(name, normalized)
+    return normalized
+
+
+def _network_parameter_scalars(
+    *,
+    feature_dim: int,
+    output_dim: int,
+    hidden_size: int,
+    encoder_width: int,
+    output_width: int,
+) -> int:
+    products = {
+        "encoder matrix": encoder_width * feature_dim,
+        "RTU input matrices": 2 * hidden_size * encoder_width,
+        "output matrix": 2 * output_width * hidden_size,
+        "head matrix": output_dim * output_width,
+    }
+    for name, value in products.items():
+        if value > _INT32_MAX:
+            raise ValueError(f"derived {name} scalars must fit signed int32")
+    return (
+        products["encoder matrix"]
+        + encoder_width
+        + 2 * hidden_size
+        + products["RTU input matrices"]
+        + products["output matrix"]
+        + output_width
+        + products["head matrix"]
+        + output_dim
+    )
+
+
+def _preflight_state_resources(
+    config: RecurrentTraceActorCriticConfig,
+    feature_dim: object,
+) -> dict[str, int]:
+    width = _require_int32("feature_dim", feature_dim, minimum=1)
+    actor_parameters = _network_parameter_scalars(
+        feature_dim=width,
+        output_dim=config.n_actions,
+        hidden_size=config.hidden_size,
+        encoder_width=config.encoder_width,
+        output_width=config.output_width,
+    )
+    critic_parameters = _network_parameter_scalars(
+        feature_dim=width,
+        output_dim=1,
+        hidden_size=config.hidden_size,
+        encoder_width=config.encoder_width,
+        output_width=config.output_width,
+    )
+    parameters = actor_parameters + critic_parameters
+    sensitivity_scalars = 4 * config.hidden_size * (config.encoder_width + 1)
+    float32_scalars = (
+        parameters * (3 if config.adaptive_obgd else 2)
+        + 2 * sensitivity_scalars * (2 if config.rtrl_taylor_correction else 1)
+        + 4 * config.hidden_size
+        + 4 * width
+        + 3
+    )
+    logical_scalars = float32_scalars + 7
+    state_nbytes = 4 * (float32_scalars + 6) + 1
+    resources = {
+        "parameter_scalars": parameters,
+        "sensitivity_scalars_per_network": sensitivity_scalars,
+        "float32_state_scalars": float32_scalars,
+        "state_scalars": logical_scalars,
+        "state_nbytes": state_nbytes,
+    }
+    for name, value in resources.items():
+        if value > _INT32_MAX:
+            raise ValueError(f"derived {name} must fit signed int32")
+    return resources
 
 
 @dataclasses.dataclass(frozen=True)
@@ -340,7 +426,7 @@ class RecurrentTraceActorCriticConfig:
         object.__setattr__(self, "encoder_width", encoder_width)
         object.__setattr__(self, "output_width", output_width)
 
-        for numeric_name, numeric_value in (
+        numeric_values = (
             ("gamma", self.gamma),
             ("actor_lamda", self.actor_lamda),
             ("critic_lamda", self.critic_lamda),
@@ -360,10 +446,13 @@ class RecurrentTraceActorCriticConfig:
             ("normalization_epsilon", self.normalization_epsilon),
             ("beta2", self.beta2),
             ("epsilon", self.epsilon),
-        ):
-            if isinstance(numeric_value, bool):
-                raise ValueError(f"{numeric_name} must be numeric, not bool")
-            _validate_normal_float32_config_value(numeric_name, numeric_value)
+        )
+        for numeric_name, numeric_value in numeric_values:
+            object.__setattr__(
+                self,
+                numeric_name,
+                _validated_config_float(numeric_name, numeric_value),
+            )
 
         for interval_name, interval_value in (
             ("gamma", self.gamma),
@@ -431,8 +520,13 @@ class RecurrentTraceActorCriticConfig:
             ("rtrl_taylor_correction", self.rtrl_taylor_correction),
             ("adaptive_obgd", self.adaptive_obgd),
         ):
-            if not isinstance(value, bool):
-                raise ValueError(f"{name} must be a bool")
+            if type(value) is not bool:
+                raise ValueError(f"{name} must be an exact bool")
+        _preflight_state_resources(self, 1)
+
+    def state_resource_budget(self, feature_dim: object) -> dict[str, int]:
+        """Return exact persistent-state counts for an observation width."""
+        return _preflight_state_resources(self, feature_dim)
 
     def to_config(self) -> dict[str, Any]:
         """Return a JSON-compatible configuration mapping.
@@ -455,6 +549,20 @@ class RecurrentTraceActorCriticConfig:
         config: dict[str, Any],
     ) -> RecurrentTraceActorCriticConfig:
         """Reconstruct and validate a configuration mapping."""
+        if type(config) is not dict:
+            raise ValueError("config must be an exact built-in dict")
+        required = {
+            field.name
+            for field in dataclasses.fields(cls)
+            if field.name not in {"adaptive_obgd", "beta2", "epsilon"}
+        }
+        optional = {"adaptive_obgd", "beta2", "epsilon"}
+        if (
+            any(type(key) is not str for key in config)
+            or not required <= set(config)
+            or not set(config) <= required | optional
+        ):
+            raise ValueError("config fields do not match the serialized schema")
         return cls(**dict(config))
 
 
@@ -1705,25 +1813,28 @@ class RecurrentTraceActorCriticAgent:
         config: dict[str, Any],
     ) -> RecurrentTraceActorCriticAgent:
         """Reconstruct an agent from :meth:`to_config` output."""
-        payload = dict(config)
-        agent_type = payload.pop("type", cls.__name__)
-        if agent_type != cls.__name__:
-            raise ValueError(f"unsupported agent type {agent_type!r}")
-        if "config" in payload:
-            raw_config = payload.pop("config")
-            if payload:
-                unknown = ", ".join(sorted(payload))
-                raise ValueError(f"unknown serialized agent fields: {unknown}")
-        else:
-            raw_config = payload
-        if not isinstance(raw_config, dict):
-            raise ValueError("serialized config must be a dictionary")
+        if type(config) is not dict:
+            raise ValueError("serialized agent must be an exact built-in dict")
+        if any(type(key) is not str for key in config):
+            raise ValueError("serialized agent fields do not match the schema")
+        # Preserve the historical convenience form while keeping both accepted
+        # schemas exact: a caller may provide either the agent envelope or the
+        # configuration payload emitted by ``RecurrentTraceActorCriticConfig``.
+        if "type" not in config:
+            return cls(RecurrentTraceActorCriticConfig.from_config(config))
+        if set(config) != {"type", "config"}:
+            raise ValueError("serialized agent fields do not match the schema")
+        agent_type = config["type"]
+        if type(agent_type) is not str or agent_type != cls.__name__:
+            raise ValueError("unsupported agent type")
+        raw_config = config["config"]
+        if type(raw_config) is not dict:
+            raise ValueError("serialized config must be an exact built-in dict")
         return cls(RecurrentTraceActorCriticConfig.from_config(raw_config))
 
     def init(self, feature_dim: int, key: Array) -> RecurrentTraceActorCriticState:
         """Initialize independent actor/critic parameters and streaming state."""
-        if isinstance(feature_dim, bool) or not isinstance(feature_dim, int) or feature_dim <= 0:
-            raise ValueError("feature_dim must be a positive integer")
+        self._config.state_resource_budget(feature_dim)
         actor_key, critic_key, policy_key = jr.split(key, 3)
         actor_params = initialize_rtu_network_parameters(
             actor_key,

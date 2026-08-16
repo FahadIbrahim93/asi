@@ -16,6 +16,7 @@ import numpy as np
 import pytest
 from jax import Array
 
+import alberta_framework.core.recurrent_trace_actor_critic as recurrent_trace_module
 from alberta_framework.core import (
     RecurrentTraceActorCriticAgent as ExportedRecurrentTraceActorCriticAgent,
 )
@@ -2049,6 +2050,49 @@ def test_config_and_agent_serialization_round_trip() -> None:
     assert adaptive_payload["beta2"] == 0.95
     assert adaptive_payload["epsilon"] == 1e-6
     assert RecurrentTraceActorCriticConfig.from_config(adaptive_payload) == adaptive
+
+
+def test_config_rejects_hostile_numeric_and_serialized_container_hooks() -> None:
+    class HostileFloat(float):
+        def __float__(self) -> float:
+            raise AssertionError("float hook must not run")
+
+        def __repr__(self) -> str:
+            raise AssertionError("repr hook must not run")
+
+    class DictSubclass(dict[str, Any]):
+        pass
+
+    with pytest.raises(ValueError, match="gamma"):
+        _small_config(gamma=HostileFloat(0.9))
+    payload = _small_config().to_config()
+    with pytest.raises(ValueError, match="exact built-in dict"):
+        RecurrentTraceActorCriticConfig.from_config(DictSubclass(payload))
+    envelope = RecurrentTraceActorCriticAgent(_small_config()).to_config()
+    with pytest.raises(ValueError, match="exact built-in dict"):
+        RecurrentTraceActorCriticAgent.from_config(DictSubclass(envelope))
+    with pytest.raises(ValueError, match="fields"):
+        RecurrentTraceActorCriticConfig.from_config({**payload, "unknown": 1})
+
+
+def test_state_resource_budget_is_exact_and_init_preflights_before_rng(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _small_config()
+    assert config.state_resource_budget(2) == {
+        "parameter_scalars": 124,
+        "sensitivity_scalars_per_network": 36,
+        "float32_state_scalars": 343,
+        "state_scalars": 350,
+        "state_nbytes": 1397,
+    }
+
+    def forbidden_split(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("RNG split must not run before resource validation")
+
+    monkeypatch.setattr(recurrent_trace_module.jr, "split", forbidden_split)
+    with pytest.raises(ValueError, match="derived"):
+        RecurrentTraceActorCriticAgent(config).init(2**31 - 1, jr.key(0))
 
 
 def test_canonical_discrete_architecture_defaults_and_core_export() -> None:

@@ -146,6 +146,9 @@ _ACTUAL_INT_TYPES = frozenset(
         np.ulonglong,
     }
 )
+_ACTUAL_FLOAT_TYPES = frozenset(
+    {float, *(np.dtype(code).type for code in ("e", "f", "d", "g"))}
+)
 
 
 def _require_int32(name: str, value: object, *, minimum: int, maximum: int = _INT32_MAX) -> int:
@@ -164,9 +167,17 @@ def _require_sequence(name: str, value: object) -> tuple[object, ...]:
 
 
 def _decode_sequence(name: str, value: object) -> tuple[object, ...]:
-    if type(value) not in (list, tuple):
-        raise ValueError(f"{name} must be an actual list or tuple")
-    return tuple(cast(list[object] | tuple[object, ...], value))
+    if type(value) is list:
+        return tuple(cast(list[object], value))
+    if type(value) is tuple:
+        return cast(tuple[object, ...], value)
+    raise ValueError(f"serialized {name} must be an actual list or tuple")
+
+
+def _validated_config_float(name: str, value: object, **bounds: Any) -> float:
+    if type(value) not in (_ACTUAL_INT_TYPES | _ACTUAL_FLOAT_TYPES):
+        raise ValueError(f"{name} must be a finite real scalar")
+    return validated_float32_scalar(name, value, **bounds)
 
 
 def _preflight_horde_resources(n_demons: int, feature_dim: int) -> None:
@@ -221,13 +232,13 @@ class StackedHordeConfig:
                 raise ValueError(f"{name} must have length n_demons={n_demons}")
 
         gammas = tuple(
-            validated_float32_scalar(
+            _validated_config_float(
                 f"gammas[{i}]", value, lower=0.0, upper=1.0
             )
             for i, value in enumerate(raw_sequences["gammas"])
         )
         lamdas = tuple(
-            validated_float32_scalar(
+            _validated_config_float(
                 f"lamdas[{i}]", value, lower=0.0, upper=1.0
             )
             for i, value in enumerate(raw_sequences["lamdas"])
@@ -266,8 +277,23 @@ class StackedHordeConfig:
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "StackedHordeConfig":
         """Reconstruct a config from :meth:`to_config` output."""
+        if type(config) is not dict:
+            raise ValueError("config must be an exact built-in dict")
+        expected = {
+            "type",
+            "n_demons",
+            "feature_dim",
+            "gammas",
+            "lamdas",
+            "cumulant_indices",
+            "step_size",
+        }
+        if any(type(key) is not str for key in config) or set(config) != expected:
+            raise ValueError("config fields do not match the serialized schema")
+        if type(config["type"]) is not str or config["type"] != "StackedHordeConfig":
+            raise ValueError("config type differs")
         config = dict(config)
-        config.pop("type", None)
+        config.pop("type")
         for key in ("gammas", "lamdas", "cumulant_indices"):
             config[key] = _decode_sequence(key, config[key])
         return cls(**config)
@@ -302,10 +328,10 @@ def nexting_spec(
         for i, value in enumerate(raw_indices)
     )
     canonical_gammas = tuple(
-        validated_float32_scalar(f"gammas[{i}]", value, lower=0.0, upper=1.0)
+        _validated_config_float(f"gammas[{i}]", value, lower=0.0, upper=1.0)
         for i, value in enumerate(raw_gammas)
     )
-    canonical_lamda = validated_float32_scalar("lamda", lamda, lower=0.0, upper=1.0)
+    canonical_lamda = _validated_config_float("lamda", lamda, lower=0.0, upper=1.0)
     n_demons = len(canonical_indices) * len(canonical_gammas)
     if n_demons < 1 or n_demons > _INT32_MAX:
         raise ValueError("derived n_demons must be in the signed int32 domain")
@@ -382,7 +408,15 @@ class StackedLinearHorde:
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "StackedLinearHorde":
         """Reconstruct a horde from :meth:`to_config` output."""
-        return cls(StackedHordeConfig.from_config(dict(config)["config"]))
+        if type(config) is not dict:
+            raise ValueError("config must be an exact built-in dict")
+        if any(type(key) is not str for key in config) or set(config) != {"type", "config"}:
+            raise ValueError("config fields do not match the serialized schema")
+        if type(config["type"]) is not str or config["type"] != "StackedLinearHorde":
+            raise ValueError("config type differs")
+        if type(config["config"]) is not dict:
+            raise ValueError("nested config must be an exact built-in dict")
+        return cls(StackedHordeConfig.from_config(config["config"]))
 
     def init(self) -> StackedHordeState:
         """Initialize zero weights and traces."""

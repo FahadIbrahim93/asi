@@ -1234,3 +1234,42 @@ def test_sarsa_config_accepts_and_canonicalizes_numpy_integers() -> None:
     assert type(cfg.epsilon_decay_steps) is int
     assert cfg.n_actions == 4
     assert cfg.epsilon_decay_steps == 100
+
+
+def test_sarsa_config_rejects_hostile_scalars_and_nonexact_schema() -> None:
+    class HostileFloat(float):
+        def __float__(self) -> float:
+            raise AssertionError("float hook must not run")
+
+        def __repr__(self) -> str:
+            raise AssertionError("repr hook must not run")
+
+    class DictSubclass(dict[str, object]):
+        pass
+
+    with pytest.raises(ValueError, match="gamma"):
+        SARSAConfig(n_actions=2, gamma=HostileFloat(0.9))
+    payload = SARSAConfig(n_actions=2).to_config()
+    with pytest.raises(ValueError, match="exact built-in dict"):
+        SARSAConfig.from_config(DictSubclass(payload))
+    with pytest.raises(ValueError, match="fields"):
+        SARSAConfig.from_config({**payload, "unknown": 1})
+
+
+def test_sarsa_config_preflights_wrapper_resource_endpoint() -> None:
+    assert SARSAConfig(n_actions=2**31 - 7).n_actions == 2**31 - 7
+    with pytest.raises(ValueError, match="wrapper resources"):
+        SARSAConfig(n_actions=2**31 - 6)
+
+
+def test_sarsa_agent_from_config_rejects_nonexact_outer_containers() -> None:
+    class DictSubclass(dict[str, object]):
+        pass
+
+    payload = _make_agent(n_actions=2).to_config()
+    with pytest.raises(ValueError, match="exact built-in dict"):
+        SARSAAgent.from_config(DictSubclass(payload))
+    hostile = dict(payload)
+    hostile["hidden_sizes"] = tuple(hostile["hidden_sizes"])
+    with pytest.raises(ValueError, match="hidden_sizes"):
+        SARSAAgent.from_config(hostile)
