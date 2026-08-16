@@ -172,11 +172,6 @@ class Step10STOMPConfig:
 _INT32_MAX = 2**31 - 1
 
 
-def _require_real(name: str, value: object) -> float:
-    real, _, _, narrowed = finite_real_and_float32(name, value)
-    return canonical_float32_storage(real, narrowed)
-
-
 def _require_unit_interval(name: str, value: object) -> float:
     real, numerator, denominator, narrowed = finite_real_and_float32(name, value)
     if (
@@ -264,7 +259,7 @@ def _validate_stomp_facade_config(config: Step10STOMPConfig) -> None:
                 f"feature_index must be < observation_dim, got {spec.feature_index!r}"
             )
         threshold = _require_positive_real("threshold", spec.threshold)
-        pseudo_reward_scale = _require_real(
+        pseudo_reward_scale = _require_positive_real(
             "pseudo_reward_scale",
             spec.pseudo_reward_scale,
         )

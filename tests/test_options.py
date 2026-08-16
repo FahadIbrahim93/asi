@@ -27,6 +27,28 @@ N_PRIMITIVE = 2
 N_OPTIONS = 2
 
 
+@pytest.mark.unit
+class TestSubtaskSpecValidation:
+    """SubtaskSpec must reject non-finite thresholds and degenerate scales."""
+
+    def test_valid_spec_accepted(self) -> None:
+        spec = SubtaskSpec(feature_index=0, threshold=0.5, pseudo_reward_scale=2.0)
+        assert spec.threshold == 0.5
+        assert spec.pseudo_reward_scale == 2.0
+
+    @pytest.mark.parametrize("threshold", [float("nan"), float("inf"), 0.0, -1.0])
+    def test_rejects_bad_threshold(self, threshold: float) -> None:
+        with pytest.raises(ValueError, match="threshold"):
+            SubtaskSpec(feature_index=0, threshold=threshold)
+
+    @pytest.mark.parametrize(
+        "scale", [float("nan"), float("inf"), float("-inf"), 0.0, -1.0]
+    )
+    def test_rejects_bad_pseudo_reward_scale(self, scale: float) -> None:
+        with pytest.raises(ValueError, match="pseudo_reward_scale"):
+            SubtaskSpec(feature_index=0, pseudo_reward_scale=scale)
+
+
 def _agent() -> STOMPAgent:
     return STOMPAgent(
         STOMPConfig(
