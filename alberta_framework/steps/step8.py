@@ -144,6 +144,12 @@ def _require_int(name: str, value: object, *, minimum: int | None = None) -> int
     return number
 
 
+def _require_bool(name: str, value: object) -> bool:
+    if type(value) is not bool:
+        raise ValueError(f"{name} must be a built-in bool")
+    return value
+
+
 def _validate_world_model_config(config: Step8WorldModelConfig) -> None:
     observation_dim = _require_int("observation_dim", config.observation_dim, minimum=1)
     n_actions = (
@@ -162,6 +168,8 @@ def _validate_world_model_config(config: Step8WorldModelConfig) -> None:
         config.leaky_relu_slope,
     )
     utility_decay = _require_half_open_unit_interval("utility_decay", config.utility_decay)
+    use_layer_norm = _require_bool("use_layer_norm", config.use_layer_norm)
+    predict_delta = _require_bool("predict_delta", config.predict_delta)
     object.__setattr__(config, "observation_dim", observation_dim)
     object.__setattr__(config, "n_actions", n_actions)
     object.__setattr__(config, "action_dim", action_dim)
@@ -169,6 +177,8 @@ def _validate_world_model_config(config: Step8WorldModelConfig) -> None:
     object.__setattr__(config, "step_size", step_size)
     object.__setattr__(config, "sparsity", sparsity)
     object.__setattr__(config, "leaky_relu_slope", leaky_relu_slope)
+    object.__setattr__(config, "use_layer_norm", use_layer_norm)
+    object.__setattr__(config, "predict_delta", predict_delta)
     object.__setattr__(config, "utility_decay", utility_decay)
 
 
