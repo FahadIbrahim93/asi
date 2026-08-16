@@ -15,7 +15,7 @@ run-name: ipmnist-${{ inputs.protocol }}-${{ inputs.launch_sha }}
           - issue51
           - issue188
       launch_sha:
-        description: Full 40-character commit SHA of the immutable launch tag
+        description: Full 40-character commit SHA of the reviewed launch tag
         required: true
         type: string
 
@@ -69,7 +69,7 @@ jobs:
             exit 1
           fi
           if [[ "$GITHUB_REF_TYPE" != "tag" ]]; then
-            echo "dispatch ref must be an immutable reviewed tag" >&2
+            echo "dispatch ref must be a reviewed tag" >&2
             exit 1
           fi
           if [[ "$GITHUB_SHA" != "$LAUNCH_SHA" || "$WORKFLOW_SHA" != "$LAUNCH_SHA" ]]; then
@@ -116,7 +116,7 @@ jobs:
             exit 1
           fi
 
-      - name: Require one pre-data owner authorization and one dispatch
+      - name: Require one pre-data project-owner authorization and one dispatch
         shell: bash
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -188,7 +188,7 @@ jobs:
           assert devices[0].platform == "cpu"
           destination = Path(sys.argv[2])
           destination.parent.mkdir(parents=True, exist_ok=True)
-          destination.write_text(
+          encoded = (
               json.dumps(
                   {
                       "schema": "asi.ipmnist_prereg.runner.v1",
@@ -213,9 +213,10 @@ jobs:
                   indent=2,
                   sort_keys=True,
               )
-              + "\n",
-              encoding="utf-8",
+              + "\n"
           )
+          with destination.open("x", encoding="utf-8") as stream:
+              stream.write(encoded)
           PY
 
       - name: Run code-only preregistration preflight tests
@@ -330,6 +331,7 @@ jobs:
           uv run --no-sync python .github/scripts/ipmnist_prereg.py validate \
             --protocol "$PROTOCOL" \
             --root "$GITHUB_WORKSPACE" \
+            --runner-receipt "$RUNNER_TEMP/prereg-metadata/runner.json" \
             --source "$SOURCE" \
             --tree "$TREE" \
             --uv-lock-sha256 "$UV_LOCK_SHA256" \
@@ -343,7 +345,7 @@ jobs:
             echo "- Validation metadata: result-validation.json"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload immutable result or partial recovery bundle
+      - name: Upload 90-day result or partial recovery bundle
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:

@@ -9,7 +9,6 @@ import hashlib
 import json
 import math
 import os
-import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -19,7 +18,9 @@ from typing import Any, Final, cast
 
 WORKFLOW_PATH: Final = ".github/workflows/ipmnist-prereg.yml"
 DRIVER_PATH: Final = ".github/scripts/ipmnist_prereg.py"
-OWNER_LOGIN: Final = "lalalune"
+AUTHORIZED_LOGIN: Final = "lalalune"
+AUTHORIZED_USER_ID: Final = 18_633_264
+AUTHORIZED_ASSOCIATION: Final = "MEMBER"
 EXPECTED_CONFIG: Final = {
     "n_tasks": 60,
     "task_length": 5000,
@@ -101,6 +102,7 @@ def authorization_line(
         f"source={source} tree={tree} uv_lock_sha256={uv_lock_sha256} "
         f"workflow_blob_sha1={workflow_blob_sha1} driver_blob_sha1={driver_blob_sha1} "
         f"ref={ref_name} runner=macos-14-arm64 seeds={seeds} "
+        "registration_amendment=source-and-runner-as-bound "
         "protocol_approval=approved seed_budget=approved "
         "compute=authorized-uncompensated"
     )
@@ -176,7 +178,7 @@ def _workflow_runs(repository: str, *, token: str) -> list[dict[str, Any]]:
             if len(page_runs) < 100:
                 return runs
             continue
-        time.sleep(2.0)
+        raise RuntimeError("GitHub Actions API returned an invalid workflow-runs payload")
     raise RuntimeError("GitHub Actions pagination exceeded 10,000 workflow runs")
 
 
@@ -248,17 +250,28 @@ def verify_launch_authorization(
         if isinstance(comment, dict)
         and comment.get("body") == expected_line
         and isinstance(comment.get("user"), dict)
-        and comment["user"].get("login") == OWNER_LOGIN
-        and comment.get("author_association") == "OWNER"
+        and comment["user"].get("login") == AUTHORIZED_LOGIN
+        and comment["user"].get("id") == AUTHORIZED_USER_ID
+        and comment.get("author_association") == AUTHORIZED_ASSOCIATION
     ]
     if len(matches) != 1:
         raise RuntimeError(
-            f"expected exactly one standalone owner authorization comment; found {len(matches)}"
+            "expected exactly one standalone project-owner authorization comment; "
+            f"found {len(matches)}"
         )
     comment = matches[0]
-    created_at = cast(str, current.get("created_at"))
-    if _parse_utc(cast(str, comment["created_at"])) >= _parse_utc(created_at):
-        raise RuntimeError("owner authorization must be durable before workflow dispatch")
+    run_created_at = current.get("created_at")
+    comment_created_at = comment.get("created_at")
+    comment_updated_at = comment.get("updated_at")
+    if not all(
+        isinstance(value, str) and value
+        for value in (run_created_at, comment_created_at, comment_updated_at)
+    ):
+        raise RuntimeError("authorization timestamps are missing or invalid")
+    if comment_updated_at != comment_created_at:
+        raise RuntimeError("authorization comment must be exact and never edited")
+    if _parse_utc(comment_updated_at) >= _parse_utc(run_created_at):
+        raise RuntimeError("project-owner authorization must be durable before workflow dispatch")
     return {
         "schema": "asi.ipmnist_prereg.launch_preflight.v1",
         "protocol": asdict(protocol),
@@ -275,12 +288,13 @@ def verify_launch_authorization(
         "authorization_comment_id": comment.get("id"),
         "authorization_comment_url": comment.get("html_url"),
         "authorization_created_at": comment.get("created_at"),
+        "authorization_updated_at": comment.get("updated_at"),
         "authorization_line": expected_line,
         "authorization_sha256": hashlib.sha256(expected_line.encode()).hexdigest(),
     }
 
 
-def _strict_json(path: Path) -> dict[str, Any]:
+def _strict_json_bytes(path: Path) -> tuple[dict[str, Any], bytes]:
     def pairs_hook(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
         value: dict[str, Any] = {}
         for key, item in pairs:
@@ -292,14 +306,67 @@ def _strict_json(path: Path) -> dict[str, Any]:
     def reject_constant(value: str) -> Any:
         raise ValueError(f"{path}: non-finite JSON constant {value!r}")
 
+    def finite_float(value: str) -> float:
+        parsed = float(value)
+        if not math.isfinite(parsed):
+            raise ValueError(f"{path}: non-finite JSON number {value!r}")
+        return parsed
+
+    try:
+        raw = path.read_bytes()
+        text = raw.decode("utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise ValueError(f"{path}: could not read one UTF-8 JSON artifact") from exc
     payload = json.loads(
-        path.read_text(encoding="utf-8"),
+        text,
         object_pairs_hook=pairs_hook,
         parse_constant=reject_constant,
+        parse_float=finite_float,
     )
     if not isinstance(payload, dict):
         raise ValueError(f"{path}: expected one JSON object")
+    return payload, raw
+
+
+def _strict_json(path: Path) -> dict[str, Any]:
+    payload, _raw = _strict_json_bytes(path)
     return payload
+
+
+def _canonical_json(value: Any) -> str:
+    try:
+        return json.dumps(
+            value,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("artifact contains a noncanonical JSON value") from exc
+
+
+def _validate_summary_reconstruction(
+    *,
+    summary: dict[str, Any],
+    recomputed: dict[str, Any],
+    expected_manifest: list[dict[str, Any]],
+) -> None:
+    """Require stored derived fields and input bindings to match a fresh merge exactly."""
+
+    created_unix = summary.get("created_unix")
+    if type(created_unix) is not float or not math.isfinite(created_unix) or created_unix < 0.0:
+        raise ValueError("summary created_unix must be a finite non-negative float")
+    if _canonical_json(summary.get("shard_manifest")) != _canonical_json(expected_manifest):
+        raise ValueError("summary shard manifest does not bind the exact shard bytes and paths")
+    operational_fields = {"created_unix", "shard_manifest"}
+    stored_derivation = {
+        key: value for key, value in summary.items() if key not in operational_fields
+    }
+    fresh_derivation = {
+        key: value for key, value in recomputed.items() if key not in operational_fields
+    }
+    if _canonical_json(stored_derivation) != _canonical_json(fresh_derivation):
+        raise ValueError("summary derivation does not match an exact reconstruction from shards")
 
 
 def _require_exact_keys(value: dict[str, Any], expected: set[str], *, context: str) -> None:
@@ -347,13 +414,62 @@ def _validate_runtime(environment: dict[str, Any]) -> None:
         raise ValueError(f"unexpected process-environment receipt: {process}")
 
 
+def _validate_runner_receipt(
+    payload: dict[str, Any], *, environment: dict[str, Any]
+) -> None:
+    _require_exact_keys(
+        payload,
+        {
+            "schema",
+            "runner_label",
+            "cpu_brand",
+            "platform",
+            "machine",
+            "python",
+            "packages",
+            "jax_backend",
+            "jax_devices",
+        },
+        context="runner receipt",
+    )
+    cpu_brand = payload["cpu_brand"]
+    if (
+        payload["schema"] != "asi.ipmnist_prereg.runner.v1"
+        or payload["runner_label"] != "macos-14"
+        or not isinstance(cpu_brand, str)
+        or "Apple M1" not in cpu_brand
+        or not isinstance(payload["platform"], str)
+        or not payload["platform"]
+        or payload["machine"] != "arm64"
+        or payload["python"] != "3.12.12"
+        or payload["jax_backend"] != "cpu"
+    ):
+        raise ValueError(f"unexpected macos-14 arm64 runner receipt: {payload}")
+    packages = cast(dict[str, Any], environment["packages"])
+    expected_packages = {
+        name: packages[name] for name in ("jax", "jaxlib", "numpy", "scikit-learn")
+    }
+    if payload["packages"] != expected_packages:
+        raise ValueError("runner receipt package versions differ from shard provenance")
+    jax_binding = cast(dict[str, Any], environment["jax"])
+    if payload["jax_devices"] != jax_binding["devices"]:
+        raise ValueError("runner receipt JAX devices differ from shard provenance")
+
+
 def validate_result_bundle(
-    *, protocol_key: str, root: Path, source: str, tree: str, uv_lock_sha256: str
+    *,
+    protocol_key: str,
+    root: Path,
+    runner_receipt: Path,
+    source: str,
+    tree: str,
+    uv_lock_sha256: str,
 ) -> dict[str, Any]:
     from alberta_framework.benchmarks.ipmnist_screening import (
         SHARD_SCHEMA,
         SUMMARY_SCHEMA,
         load_shard,
+        merge_shards,
     )
 
     protocol = protocol_for(protocol_key)
@@ -373,7 +489,8 @@ def validate_result_bundle(
             f"missing={sorted(str(path) for path in expected_paths - observed_paths)}, "
             f"unexpected={sorted(str(path) for path in observed_paths - expected_paths)}"
         )
-    shards = [load_shard(path) for path in sorted(expected_paths)]
+    sorted_paths = sorted(expected_paths)
+    shards = [load_shard(path) for path in sorted_paths]
     observed_pairs = {(shard["config_name"], shard["seed"]) for shard in shards}
     if observed_pairs != expected_pairs or len(shards) != len(expected_pairs):
         raise ValueError("shard payload arm/seed coverage is not exact")
@@ -399,12 +516,15 @@ def validate_result_bundle(
             raise ValueError("shards do not share exact dataset provenance")
         if shard["environment"] != first["environment"]:
             raise ValueError("shards do not share exact runtime provenance")
-    _validate_runtime(cast(dict[str, Any], first["environment"]))
+    environment = cast(dict[str, Any], first["environment"])
+    _validate_runtime(environment)
+    runner, runner_raw = _strict_json_bytes(runner_receipt)
+    _validate_runner_receipt(runner, environment=environment)
 
     summary_path = namespace / (
         "summary.json" if protocol.key == "issue51" else "summary_resid_gate_ablation_r3.json"
     )
-    summary = _strict_json(summary_path)
+    summary, summary_raw = _strict_json_bytes(summary_path)
     expected_summary_keys = {
         "schema",
         "evidence_policy",
@@ -423,6 +543,29 @@ def validate_result_bundle(
         "shard_manifest",
     }
     _require_exact_keys(summary, expected_summary_keys, context=str(summary_path))
+    recomputed = merge_shards(sorted_paths, control_name=protocol.control, slope_window=15)
+    recomputed_manifest = recomputed.get("shard_manifest")
+    if not isinstance(recomputed_manifest, list):
+        raise ValueError("fresh strict-v2 merge did not produce a shard manifest")
+    expected_manifest: list[dict[str, Any]] = []
+    for raw_entry in recomputed_manifest:
+        if not isinstance(raw_entry, dict):
+            raise ValueError("fresh strict-v2 merge produced an invalid shard manifest")
+        entry = dict(raw_entry)
+        raw_path = entry.get("path")
+        if not isinstance(raw_path, str) or not raw_path:
+            raise ValueError("fresh strict-v2 merge produced an invalid shard path")
+        try:
+            canonical_path = Path(raw_path).resolve(strict=True)
+            entry["path"] = canonical_path.relative_to(root).as_posix()
+        except (OSError, ValueError) as exc:
+            raise ValueError("fresh strict-v2 merge input escaped the repository root") from exc
+        expected_manifest.append(entry)
+    _validate_summary_reconstruction(
+        summary=summary,
+        recomputed=recomputed,
+        expected_manifest=expected_manifest,
+    )
     if summary["schema"] != SUMMARY_SCHEMA or summary["evidence_policy"] != EXPECTED_POLICY:
         raise ValueError("summary must be a strict-v2 permanently nonpromoting artifact")
     if (
@@ -436,7 +579,7 @@ def validate_result_bundle(
         or summary["environment"] != first["environment"]
     ):
         raise ValueError("summary protocol or provenance binding mismatch")
-    results = summary["results"]
+    results = recomputed["results"]
     if not isinstance(results, list) or len(results) != 2:
         raise ValueError("summary must contain exactly the control and candidate")
     by_name = {
@@ -482,22 +625,22 @@ def validate_result_bundle(
         "tree": tree,
         "uv_lock_sha256": uv_lock_sha256,
         "summary": summary_path.relative_to(root).as_posix(),
-        "summary_sha256": hashlib.sha256(summary_path.read_bytes()).hexdigest(),
+        "summary_sha256": hashlib.sha256(summary_raw).hexdigest(),
         "mean_diff": mean_diff,
         "stderr_diff": stderr_diff,
         "per_seed_diff": list(diffs),
         "outcome": outcome,
-        "runtime": first["environment"],
+        "runtime": environment,
+        "runner": runner,
+        "runner_receipt_sha256": hashlib.sha256(runner_raw).hexdigest(),
         "dataset_provenance": first["dataset_provenance"],
     }
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(payload, allow_nan=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    with path.open("x", encoding="utf-8") as stream:
+        stream.write(json.dumps(payload, allow_nan=False, indent=2, sort_keys=True) + "\n")
 
 
 def _preflight_command(args: argparse.Namespace) -> int:
@@ -526,6 +669,7 @@ def _validate_command(args: argparse.Namespace) -> int:
     payload = validate_result_bundle(
         protocol_key=args.protocol,
         root=args.root.resolve(strict=True),
+        runner_receipt=args.runner_receipt.resolve(strict=True),
         source=args.source,
         tree=args.tree,
         uv_lock_sha256=args.uv_lock_sha256,
@@ -555,6 +699,7 @@ def build_parser() -> argparse.ArgumentParser:
     validate = subparsers.add_parser("validate")
     validate.add_argument("--protocol", choices=sorted(PROTOCOLS), required=True)
     validate.add_argument("--root", type=Path, required=True)
+    validate.add_argument("--runner-receipt", type=Path, required=True)
     validate.add_argument("--source", required=True)
     validate.add_argument("--tree", required=True)
     validate.add_argument("--uv-lock-sha256", required=True)
