@@ -711,8 +711,12 @@ class GradientTDLinearLearner:
         secondary_dot_trace = jnp.dot(state.secondary_weights, traces)
         secondary_dot_phi = jnp.dot(state.secondary_weights, phi)
 
+        correction_coefficient = gamma_s * (1.0 - lam)
+        scaled_secondary_trace = _skip_zero_scale(
+            correction_coefficient, secondary_dot_trace
+        )
         bootstrap_correction = _skip_zero_scale(
-            gamma_s * (1.0 - lam) * secondary_dot_trace, next_phi
+            scaled_secondary_trace, next_phi
         )
         primary_step = alpha * (td_error * traces - bootstrap_correction)
         secondary_step = beta * (td_error * traces - secondary_dot_phi * phi)

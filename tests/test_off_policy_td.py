@@ -655,6 +655,28 @@ class TestZeroGammaDoesNotMultiplyInfBootstrap:
         chex.assert_trees_all_close(result.td_error, jnp.array(3.0, dtype=jnp.float32))
         chex.assert_tree_all_finite(result.state.weights)
 
+    def test_gradient_td_zero_gamma_branches_before_overflowing_correction(self) -> None:
+        learner = GradientTDLinearLearner(step_size=0.1, secondary_step_size=0.01)
+        state = learner.init(4).replace(  # type: ignore[attr-defined]
+            secondary_weights=jnp.ones((5,), dtype=jnp.float32)
+        )
+        observation = jnp.ones((4,), dtype=jnp.float32)
+        rho = jnp.array(1e38, dtype=jnp.float32)
+        traces = rho * jnp.ones((5,), dtype=jnp.float32)
+        assert not bool(jnp.isfinite(jnp.dot(state.secondary_weights, traces)))
+
+        result = learner.update(
+            state,
+            observation,
+            jnp.array(1.0, dtype=jnp.float32),
+            jnp.zeros((4,), dtype=jnp.float32),
+            jnp.array(0.0, dtype=jnp.float32),
+            rho,
+        )
+
+        assert bool(result.update_applied)
+        chex.assert_tree_all_finite(result.state)
+
     def test_etd(self) -> None:
         learner = ETDLinearLearner(step_size=0.1, trace_decay=0.0)
         huge = jnp.float32(1e38)
