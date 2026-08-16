@@ -258,6 +258,35 @@ def test_run_actor_critic_from_arrays_scan() -> None:
     chex.assert_tree_all_finite((result.policies, result.values, result.td_errors))
 
 
+def test_run_actor_critic_from_arrays_policies_align_with_actions() -> None:
+    """policies[t] must be the distribution that produced actions[t], at observations[t]."""
+    agent = ActorCriticAgent(ActorCriticConfig(n_actions=3, actor_step_size=0.5, gamma=0.9))
+    state = agent.init(feature_dim=2, key=jr.key(5))
+    state = state.replace(  # type: ignore[attr-defined]
+        actor_weights=jnp.array([[3.0, 0.0], [0.0, 3.0], [0.0, 0.0]], dtype=jnp.float32)
+    )
+    observations = jnp.array([[1.0, 0.0], [0.0, 1.0], [1.0, 0.0]], dtype=jnp.float32)
+    next_observations = jnp.array([[0.0, 1.0], [1.0, 0.0], [0.0, 1.0]], dtype=jnp.float32)
+    rewards = jnp.array([1.0, 1.0, 1.0], dtype=jnp.float32)
+    terminated = jnp.array([False, False, False])
+
+    result = run_actor_critic_from_arrays(
+        agent, state, observations, rewards, terminated, next_observations
+    )
+
+    loop_state = state
+    for step in range(3):
+        expected_policy = agent.policy(loop_state, observations[step])
+        chex.assert_trees_all_close(result.policies[step], expected_policy)
+        started, _action, _probs = agent.start(loop_state, observations[step])
+        started = started.replace(last_action=result.actions[step])  # type: ignore[attr-defined]
+        loop_state = agent.update(
+            started, rewards[step], next_observations[step], discount=0.9
+        ).state
+    for step in range(3):
+        assert float(result.policies[step][result.actions[step]]) > 0.5
+
+
 def test_run_actor_critic_from_arrays_fixed_actions_matches_loop() -> None:
     agent = ActorCriticAgent(
         ActorCriticConfig(

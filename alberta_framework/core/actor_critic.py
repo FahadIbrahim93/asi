@@ -139,7 +139,9 @@ class ActorCriticArrayResult:
     Attributes:
         state: Final agent state.
         actions: Per-step actions, shape ``(num_steps,)``.
-        policies: Per-step policy probabilities, shape ``(num_steps, n_actions)``.
+        policies: Per-step policy probabilities at ``observations[t]`` — the
+            distribution that produced ``actions[t]`` — shape
+            ``(num_steps, n_actions)``.
         values: Per-step previous-state value estimates, shape ``(num_steps,)``.
         td_errors: Per-step TD errors, shape ``(num_steps,)``.
     """
@@ -560,8 +562,9 @@ def run_actor_critic_from_arrays(
                 last_action=fixed_action.astype(jnp.int32),
             )
             current_action = fixed_action.astype(jnp.int32)
+            current_policy = agent.policy(started_state, obs)
         else:
-            started_state, current_action, _policy = agent.start(carry, obs)
+            started_state, current_action, current_policy = agent.start(carry, obs)
         result = agent.update(
             started_state,
             reward,
@@ -579,7 +582,7 @@ def run_actor_critic_from_arrays(
                 current_action,
                 jnp.asarray(0, dtype=jnp.int32),
             ),
-            result.policy,
+            jnp.where(result.update_applied, current_policy, jnp.zeros_like(current_policy)),
             result.value,
             result.td_error,
             result.update_applied,
