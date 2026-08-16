@@ -356,6 +356,64 @@ class TestRMSE:
 
 
 class TestRunningRMSE:
+    def test_large_finite_errors_do_not_overflow(self) -> None:
+        predictions = jnp.asarray([[2.0e20], [2.0e20]], dtype=jnp.float32)
+        returns = jnp.zeros_like(predictions)
+
+        with jax.debug_infs(True):
+            running = per_horizon_running_rmse(predictions, returns, window_size=2)
+
+        assert bool(jnp.all(jnp.isfinite(running)))
+        np.testing.assert_allclose(
+            np.asarray(running),
+            np.full((2, 1), 2.0e20, dtype=np.float32),
+        )
+
+    @pytest.mark.parametrize("magnitude", [2.0e20, 1.0e38, 3.0e38])
+    def test_large_finite_running_rmse_has_stable_eager_jit_and_jvp_gradients(
+        self, magnitude: float
+    ) -> None:
+        predictions = jnp.full((2, 1), magnitude, dtype=jnp.float32)
+        returns = jnp.zeros_like(predictions)
+
+        def loss(values: jax.Array) -> jax.Array:
+            return per_horizon_running_rmse(values, returns, window_size=2)[1, 0]
+
+        expected = jnp.full_like(predictions, 0.5)
+        eager = jax.grad(loss)(predictions)
+        compiled = jax.jit(jax.grad(loss))(predictions)
+        _primal, tangent = jax.jvp(
+            lambda values: per_horizon_running_rmse(values, returns, window_size=2),
+            (predictions,),
+            (jnp.ones_like(predictions),),
+        )
+
+        chex.assert_trees_all_close(eager, expected, rtol=5e-6, atol=0.0)
+        chex.assert_trees_all_close(compiled, expected, rtol=5e-6, atol=0.0)
+        chex.assert_trees_all_close(tangent, jnp.ones_like(tangent), rtol=5e-6, atol=0.0)
+
+    def test_zero_running_rmse_uses_zero_eager_jit_and_jvp_gradient_convention(
+        self,
+    ) -> None:
+        predictions = jnp.zeros((3, 2), dtype=jnp.float32)
+        returns = jnp.zeros_like(predictions)
+
+        def loss(values: jax.Array) -> jax.Array:
+            return jnp.sum(per_horizon_running_rmse(values, returns, window_size=2))
+
+        expected = jnp.zeros_like(predictions)
+        eager = jax.grad(loss)(predictions)
+        compiled = jax.jit(jax.grad(loss))(predictions)
+        _primal, tangent = jax.jvp(
+            lambda values: per_horizon_running_rmse(values, returns, window_size=2),
+            (predictions,),
+            (jnp.ones_like(predictions),),
+        )
+
+        chex.assert_trees_all_equal(eager, expected)
+        chex.assert_trees_all_equal(compiled, expected)
+        chex.assert_trees_all_equal(tangent, jnp.zeros_like(tangent))
+
     def test_shape(self) -> None:
         t, h = 50, 3
         preds = jnp.zeros((t, h))
