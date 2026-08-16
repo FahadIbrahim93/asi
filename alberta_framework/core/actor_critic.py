@@ -21,6 +21,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 import math
+from numbers import Real
 from typing import Any
 
 import chex
@@ -30,6 +31,7 @@ import jax.random as jr
 from jax import Array
 from jaxtyping import Bool, Float, Int
 
+from alberta_framework._float32 import round_real_to_float32
 from alberta_framework.core.optimizers import Bounder, bounder_from_config
 from alberta_framework.core.update_safety import (
     floating_tree_is_finite as _floating_tree_is_finite,
@@ -791,8 +793,18 @@ class ContinuousActorCriticAgent:
             raise ValueError("log_sigma_min must be <= log_sigma_max")
         for name in ("action_low", "action_high"):
             bound = getattr(config, name)
-            if bound is not None and not math.isfinite(bound):
+            if bound is None:
+                continue
+            if isinstance(bound, bool) or not isinstance(bound, Real):
+                raise ValueError(f"{name} must be a finite real number when set")
+            if not math.isfinite(bound):
                 raise ValueError(f"{name} must be finite when set")
+            try:
+                narrowed = round_real_to_float32(bound)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(f"{name} must be finite when set") from exc
+            if not math.isfinite(narrowed):
+                raise ValueError(f"{name} must remain finite once narrowed to float32")
         if (
             config.action_low is not None
             and config.action_high is not None
