@@ -43,6 +43,11 @@ def _skip_zero_scale(scale: Array, value: Array) -> Array:
     return jnp.where(scale == 0.0, jnp.zeros_like(value), scale * value)
 
 
+def _finite_or_zero(value: Array) -> Array:
+    """Replace only poisoned disabled-EMA history, retaining finite history exactly."""
+    return jnp.where(jnp.isfinite(value), value, jnp.zeros_like(value))
+
+
 UPGDMemoryReadoutMode = Literal["linear_mse", "softmax_ce"]
 
 
@@ -369,16 +374,15 @@ class UPGDMemoryLearner:
     ) -> Array:
         active_memory = (jnp.sum(state.memory_state.counts > 0.0) > 0).astype(jnp.float32)
         confidence_delta = jnp.max(memory_prediction) - jnp.max(upgd_prediction)
-        upgd_loss_ema = (
-            jnp.zeros_like(state.upgd_loss_ema)
-            if self._config.reliability_decay == 0.0
-            else state.upgd_loss_ema
-        )
-        memory_loss_ema = (
-            jnp.zeros_like(state.memory_loss_ema)
-            if self._config.reliability_decay == 0.0
-            else state.memory_loss_ema
-        )
+        if self._config.reliability_decay == 0.0:
+            # These prior losses still determine the prediction gate before
+            # the zero-decay EMAs are overwritten.  Preserve every finite
+            # value; only a poisoned historical value is recoverable here.
+            upgd_loss_ema = _finite_or_zero(state.upgd_loss_ema)
+            memory_loss_ema = _finite_or_zero(state.memory_loss_ema)
+        else:
+            upgd_loss_ema = state.upgd_loss_ema
+            memory_loss_ema = state.memory_loss_ema
         reliability_delta = upgd_loss_ema - memory_loss_ema
         logit = (
             state.memory_logit
@@ -548,10 +552,10 @@ class UPGDMemoryLearner:
         )
         checked_state = (
             state.replace(  # type: ignore[attr-defined]
-                allocation_ema=jnp.zeros_like(state.allocation_ema),
-                upgd_loss_ema=jnp.zeros_like(state.upgd_loss_ema),
-                memory_loss_ema=jnp.zeros_like(state.memory_loss_ema),
-                blended_loss_ema=jnp.zeros_like(state.blended_loss_ema),
+                allocation_ema=_finite_or_zero(state.allocation_ema),
+                upgd_loss_ema=_finite_or_zero(state.upgd_loss_ema),
+                memory_loss_ema=_finite_or_zero(state.memory_loss_ema),
+                blended_loss_ema=_finite_or_zero(state.blended_loss_ema),
             )
             if self._config.reliability_decay == 0.0
             else state

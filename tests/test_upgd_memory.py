@@ -211,3 +211,68 @@ def test_zero_reliability_decay_does_not_multiply_inf_ema() -> None:
     assert bool(jnp.isfinite(result.state.upgd_loss_ema))
     assert bool(jnp.isfinite(result.state.memory_loss_ema))
     assert bool(jnp.isfinite(result.state.blended_loss_ema))
+
+
+def test_zero_reliability_decay_retains_finite_loss_history_in_gate() -> None:
+    """A zero EMA decay must not discard finite losses used by the current gate."""
+    config = UPGDMemoryConfig(
+        feature_dim=2,
+        n_heads=2,
+        hidden_sizes=(4,),
+        slots_per_class=2,
+        reliability_decay=0.0,
+        confidence_logit_scale=0.0,
+        reliability_logit_scale=2.0,
+    )
+    learner = UPGDMemoryLearner(config)
+    initial = learner.init(jr.key(4))
+    active_memory = initial.memory_state.replace(  # type: ignore[attr-defined]
+        counts=jnp.ones_like(initial.memory_state.counts)
+    )
+    state = initial.replace(  # type: ignore[attr-defined]
+        memory_state=active_memory,
+        memory_logit=jnp.asarray(0.25, dtype=jnp.float32),
+        upgd_loss_ema=jnp.asarray(1.5, dtype=jnp.float32),
+        memory_loss_ema=jnp.asarray(0.5, dtype=jnp.float32),
+    )
+
+    gate = learner._blend_gate(
+        state,
+        jnp.asarray([0.0, 0.0], dtype=jnp.float32),
+        jnp.asarray([0.0, 0.0], dtype=jnp.float32),
+    )
+
+    expected = jax.nn.sigmoid(jnp.asarray(2.25, dtype=jnp.float32))
+    chex.assert_trees_all_close(gate, expected)
+
+
+def test_zero_reliability_decay_does_not_relax_consumed_non_ema_state() -> None:
+    """Only disabled EMA history is recoverable; a poisoned gate logit remains fatal."""
+    config = UPGDMemoryConfig(
+        feature_dim=2,
+        n_heads=2,
+        hidden_sizes=(4,),
+        slots_per_class=2,
+        reliability_decay=0.0,
+    )
+    learner = UPGDMemoryLearner(config)
+    state = learner.init(jr.key(5)).replace(  # type: ignore[attr-defined]
+        memory_logit=jnp.asarray(jnp.inf, dtype=jnp.float32)
+    )
+
+    result = learner.update(
+        state,
+        jnp.asarray([1.0, 0.0], dtype=jnp.float32),
+        jnp.asarray([1.0, 0.0], dtype=jnp.float32),
+    )
+
+    assert not bool(result.update_applied)
+    # The wall-clock diagnostic is materialized through JIT at float32
+    # precision; normalize it before asserting transactional rollback.
+    expected = state.replace(  # type: ignore[attr-defined]
+        upgd_state=state.upgd_state.replace(  # type: ignore[attr-defined]
+            birth_timestamp=result.state.upgd_state.birth_timestamp
+        )
+    )
+    chex.assert_trees_all_equal(result.state, expected)
+    chex.assert_trees_all_equal(result.predictions, jnp.zeros((2,), dtype=jnp.float32))
