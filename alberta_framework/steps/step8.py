@@ -6,7 +6,9 @@ learn a one-step model — expected reward and next observation (or observation
 delta, with ``predict_delta=True``) given the current observation and action —
 online, from the same stream the control learner sees.  Step 7's Dyna backups
 and Step 9's guarded dreaming both consume this model.  The implementation
-lives in :mod:`alberta_framework.core.world_model`.
+lives in :mod:`alberta_framework.core.world_model`. The facade rejects illegal
+dimensions and decay/step-size/sparsity/leaky-ReLU scalars before constructing
+that core model; accepted numbers are canonicalized to builtin ints and floats.
 
 Network defaults follow the streaming stability recipe used across the
 package (Elsayed et al. 2024, "Streaming Deep Reinforcement Learning Finally
@@ -23,8 +25,10 @@ via Disagreement."
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass
+from numbers import Integral, Real
 from typing import Any, cast
 
 import jax.numpy as jnp
@@ -56,6 +60,10 @@ class Step8WorldModelConfig:
     predict_delta: bool = False
     utility_decay: float = 0.99
 
+    def __post_init__(self) -> None:
+        """Reject illegal dimensions and scientific scalars, then canonicalize."""
+        _validate_world_model_config(self)
+
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-serializable representation."""
         payload = asdict(self)
@@ -68,7 +76,7 @@ class Step8WorldModelConfig:
         data = dict(payload)
         hidden_sizes = data.get("hidden_sizes", (64,))
         if isinstance(hidden_sizes, list):
-            data["hidden_sizes"] = tuple(int(v) for v in hidden_sizes)
+            data["hidden_sizes"] = tuple(hidden_sizes)
         return cls(**cast(Any, data))
 
     def to_core_config(self) -> WorldModelConfig:
@@ -85,6 +93,73 @@ class Step8WorldModelConfig:
             predict_delta=self.predict_delta,
             utility_decay=self.utility_decay,
         )
+
+
+def _require_real(name: str, value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError(f"{name} must be a real number, got {value!r}")
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(f"{name} must be finite, got {value!r}")
+    return number
+
+
+def _require_unit_interval(name: str, value: object) -> float:
+    number = _require_real(name, value)
+    if not 0.0 <= number <= 1.0:
+        raise ValueError(f"{name} must be in [0, 1], got {value!r}")
+    return number
+
+
+def _require_half_open_unit_interval(name: str, value: object) -> float:
+    number = _require_real(name, value)
+    if not 0.0 <= number < 1.0:
+        raise ValueError(f"{name} must be in [0, 1), got {value!r}")
+    return number
+
+
+def _require_int(name: str, value: object, *, minimum: int | None = None) -> int:
+    if isinstance(value, bool) or not isinstance(value, Integral):
+        raise ValueError(f"{name} must be an integer, got {value!r}")
+    number = int(value)
+    if minimum is not None and number < minimum:
+        if minimum == 1:
+            raise ValueError(f"{name} must be positive, got {value!r}")
+        raise ValueError(f"{name} must be >= {minimum}, got {value!r}")
+    return number
+
+
+def _validate_world_model_config(config: Step8WorldModelConfig) -> None:
+    observation_dim = _require_int("observation_dim", config.observation_dim, minimum=1)
+    n_actions = (
+        None if config.n_actions is None else _require_int("n_actions", config.n_actions, minimum=1)
+    )
+    action_dim = _require_int(
+        "action_dim",
+        config.action_dim,
+        minimum=1 if n_actions is None else None,
+    )
+    if not isinstance(config.hidden_sizes, tuple):
+        raise ValueError(f"hidden_sizes must be a tuple of integers, got {config.hidden_sizes!r}")
+    hidden_sizes = tuple(
+        _require_int("hidden_sizes", size, minimum=1) for size in config.hidden_sizes
+    )
+    step_size = _require_real("step_size", config.step_size)
+    if step_size < 0.0:
+        raise ValueError(f"step_size must be non-negative, got {config.step_size!r}")
+    sparsity = _require_unit_interval("sparsity", config.sparsity)
+    leaky_relu_slope = _require_real("leaky_relu_slope", config.leaky_relu_slope)
+    if leaky_relu_slope < 0.0:
+        raise ValueError(f"leaky_relu_slope must be non-negative, got {config.leaky_relu_slope!r}")
+    utility_decay = _require_half_open_unit_interval("utility_decay", config.utility_decay)
+    object.__setattr__(config, "observation_dim", observation_dim)
+    object.__setattr__(config, "n_actions", n_actions)
+    object.__setattr__(config, "action_dim", action_dim)
+    object.__setattr__(config, "hidden_sizes", hidden_sizes)
+    object.__setattr__(config, "step_size", step_size)
+    object.__setattr__(config, "sparsity", sparsity)
+    object.__setattr__(config, "leaky_relu_slope", leaky_relu_slope)
+    object.__setattr__(config, "utility_decay", utility_decay)
 
 
 @dataclass(frozen=True)
@@ -178,9 +253,7 @@ def step8_ensemble_predict(
     mean_reward = jnp.mean(reward_predictions, axis=0)
     mean_next_observation = jnp.mean(next_observation_predictions, axis=0)
     reward_disagreement = jnp.var(reward_predictions, axis=0)
-    next_observation_disagreement = jnp.mean(
-        jnp.var(next_observation_predictions, axis=0)
-    )
+    next_observation_disagreement = jnp.mean(jnp.var(next_observation_predictions, axis=0))
     total_disagreement = reward_disagreement + next_observation_disagreement
     return Step8EnsemblePrediction(
         reward_predictions=reward_predictions,
