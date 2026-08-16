@@ -790,9 +790,12 @@ class ScaledStreamWrapper:
         self._inner_stream: ScanStream[Any] = inner_stream
         self._feature_scales = jnp.asarray(feature_scales, dtype=jnp.float32)
 
-        if self._feature_scales.shape[0] != inner_stream.feature_dim:
+        if (
+            self._feature_scales.ndim != 1
+            or self._feature_scales.shape[0] != inner_stream.feature_dim
+        ):
             raise ValueError(
-                f"feature_scales length ({self._feature_scales.shape[0]}) "
+                f"feature_scales shape ({self._feature_scales.shape}) "
                 f"must match inner stream's feature_dim ({inner_stream.feature_dim})"
             )
 
