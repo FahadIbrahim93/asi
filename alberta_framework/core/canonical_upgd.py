@@ -96,6 +96,7 @@ _RAW_GLOBAL_PROFILES = frozenset(
         "official_experiment_global",
     }
 )
+_INT32_MAX = 2_147_483_647
 
 
 def _static_zero_scale(scale: float, value: Array) -> Array:
@@ -103,6 +104,14 @@ def _static_zero_scale(scale: float, value: Array) -> Array:
     if scale == 0.0:
         return jnp.zeros_like(value)
     return scale * value
+
+
+def _saturating_increment(value: Array, increment: Array | int = 1) -> Array:
+    """Increment a non-negative int32 counter without lifetime wraparound."""
+
+    maximum = jnp.asarray(_INT32_MAX, dtype=jnp.int32)
+    increment_array = jnp.asarray(increment, dtype=jnp.int32)
+    return value + jnp.minimum(increment_array, maximum - value)
 
 
 @dataclass(frozen=True)
@@ -399,7 +408,7 @@ class CanonicalUPGD:
         next_key = split_keys[0]
         noise_keys = split_keys[1:]
         beta = self._config.utility_decay
-        next_step = state.step + jnp.array(1, dtype=jnp.int32)
+        next_step = _saturating_increment(state.step)
 
         corrected_leaves: list[Array] = []
         new_utility_leaves: list[Array] = []
@@ -440,7 +449,7 @@ class CanonicalUPGD:
                 next_age = jnp.full_like(age, next_step)
                 correction_clock = next_step.astype(param.dtype)
             else:
-                next_age = age + active.astype(jnp.int32)
+                next_age = _saturating_increment(age, active.astype(jnp.int32))
                 correction_clock = next_age.astype(param.dtype)
             bias_correction = 1.0 - jnp.power(beta, correction_clock)
             corrected = jnp.where(

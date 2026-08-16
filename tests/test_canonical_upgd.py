@@ -294,6 +294,47 @@ def test_ema_bias_correction_recovers_constant_signed_utility() -> None:
 
 
 @pytest.mark.parametrize(
+    "profile",
+    ["paper_global", "safe_extended"],
+)
+def test_lifetime_counters_saturate_without_disabling_utility_correction(
+    profile: str,
+) -> None:
+    params = {"w": jnp.array([2.0], dtype=jnp.float32)}
+    gradients = {"w": jnp.array([-0.5], dtype=jnp.float32)}
+    optimizer = CanonicalUPGD(
+        CanonicalUPGDConfig(
+            step_size=0.1,
+            utility_decay=0.9,
+            noise_std=0.0,
+            profile=profile,  # type: ignore[arg-type]
+            normalization="global",
+        )
+    )
+    maximum = jnp.iinfo(jnp.int32).max
+    state = optimizer.init(params).replace(
+        utility_ema={"w": jnp.array([1.0], dtype=jnp.float32)},
+        utility_age={"w": jnp.array([maximum], dtype=jnp.int32)},
+        step=jnp.array(maximum, dtype=jnp.int32),
+    )
+
+    result = optimizer.update(
+        state,
+        params,
+        gradients,
+        jr.key(0),
+        noise={"w": jnp.zeros(1, dtype=jnp.float32)},
+    )
+
+    assert int(result.state.step) == maximum
+    assert int(result.state.utility_age["w"][0]) == maximum
+    assert float(result.corrected_utility["w"][0]) == pytest.approx(1.0)
+    assert float(result.scaled_utility["w"][0]) == pytest.approx(
+        float(jax.nn.sigmoid(jnp.float32(1.0)))
+    )
+
+
+@pytest.mark.parametrize(
     ("profile", "normalized"),
     [
         (
