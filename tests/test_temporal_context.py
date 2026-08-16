@@ -44,6 +44,22 @@ def test_temporal_context_step_is_causal() -> None:
     assert int(next_state.step_count) == 1
 
 
+def test_zero_ema_decay_does_not_multiply_inf_ema() -> None:
+    """ema_decay=0 times an infinite tracker is NaN and would be committed."""
+    config = TemporalContextConfig(input_dim=2, ema_decay=0.0, periods=())
+    featurizer = TemporalContextFeaturizer(config)
+    state = featurizer.init().replace(
+        observation_ema=jnp.asarray([jnp.inf, jnp.inf], dtype=jnp.float32)
+    )
+    raw = jnp.asarray(0.0, dtype=jnp.float32) * jnp.asarray(jnp.inf, dtype=jnp.float32)
+    assert not bool(jnp.isfinite(raw))
+
+    observation = jnp.asarray([2.0, -1.0], dtype=jnp.float32)
+    next_state = featurizer.update(state, observation)
+    chex.assert_trees_all_close(next_state.observation_ema, observation)
+    assert int(next_state.step_count) == 1
+
+
 def test_temporal_context_phase_products_expand_with_input() -> None:
     config = TemporalContextConfig(
         input_dim=2,
