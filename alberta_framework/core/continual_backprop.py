@@ -144,9 +144,11 @@ class ContinualBackpropState:
             ``utilities``.
         replacement_accumulators: One scalar per hidden layer that
             accumulates the (fractional) number of replacements
-            scheduled by ``replacement_rate * num_units`` each step.
-            Whenever an accumulator exceeds 1.0 a single unit in that
-            layer is replaced and the accumulator is decremented by 1.
+            scheduled by ``replacement_rate * num_mature_units`` each
+            step. Whenever an accumulator reaches 1.0 and a mature unit
+            exists, a single unit in that layer is replaced and the
+            accumulator is decremented by 1; it never carries more than
+            one pending replacement.
             This makes ``replacement_rate << 1`` behave as expected in
             the JIT-compiled scan loop without integer arithmetic.
         rng_key: PRNG key used to draw fresh weights for replaced
@@ -465,16 +467,34 @@ def maybe_replace_units(
     Returns:
         Updated ``(mlp_state, cbp_state)``.
     """
-    if not config.enabled:
-        return mlp_state, cbp_state
+    new_mlp_state, new_cbp_state, _replaced = replace_units_with_flags(
+        mlp_state, cbp_state, config, sparsity
+    )
+    return new_mlp_state, new_cbp_state
 
+
+def replace_units_with_flags(
+    mlp_state: MultiHeadMLPState,
+    cbp_state: ContinualBackpropState,
+    config: ContinualBackpropConfig,
+    sparsity: float,
+) -> tuple[MultiHeadMLPState, ContinualBackpropState, Array]:
+    """Run :func:`maybe_replace_units` and also return the per-layer replacement flags.
+
+    Returns:
+        ``(mlp_state, cbp_state, replaced)`` where ``replaced`` is a boolean
+        array with one entry per hidden layer that is ``True`` exactly when
+        that layer's gated replacement fired this step.
+    """
     n_layers = len(cbp_state.utilities)
-    if n_layers == 0:
-        return mlp_state, cbp_state
+    no_replacements = jnp.zeros((n_layers,), dtype=jnp.bool_)
+    if not config.enabled or n_layers == 0:
+        return mlp_state, cbp_state, no_replacements
 
     rate = jnp.asarray(config.replacement_rate, dtype=jnp.float32)
     accum_arr = cbp_state.replacement_accumulators
     new_accum_list: list[Array] = []
+    replaced_flags: list[Array] = []
 
     new_mlp_state = mlp_state
     new_cbp_state = cbp_state
@@ -510,12 +530,13 @@ def maybe_replace_units(
         # more than the one replacement a step can deliver.
         accum_after = jnp.minimum(jnp.where(gated, accum - 1.0, accum), 1.0)
         new_accum_list.append(accum_after)
+        replaced_flags.append(gated)
 
     new_cbp_state = new_cbp_state.replace(  # type: ignore[attr-defined]
         replacement_accumulators=jnp.stack(new_accum_list),
         rng_key=rng_key,
     )
-    return new_mlp_state, new_cbp_state
+    return new_mlp_state, new_cbp_state, jnp.stack(replaced_flags)
 
 
 # =============================================================================
@@ -922,22 +943,14 @@ class CBPMultiHeadMLPLearner:
             self._cbp_config.decay_rate,
         )
 
-        # 4. Possibly replace low-utility mature units.
-        # Track which layers actually replaced for diagnostics. We
-        # detect by checking whether the accumulator decremented.
-        old_accum = new_cbp_state.replacement_accumulators
-        new_post_state, new_cbp_state = maybe_replace_units(
+        # 4. Possibly replace low-utility mature units, reporting the exact
+        #    gated decision per layer as the diagnostic.
+        new_post_state, new_cbp_state, replacements_made = replace_units_with_flags(
             post_state,
             new_cbp_state,
             self._cbp_config,
             self._sparsity,
         )
-        new_accum = new_cbp_state.replacement_accumulators
-        replacements_made = (old_accum + jnp.float32(
-            self._cbp_config.replacement_rate
-        ) * jnp.array(
-            [s for s in self._hidden_sizes], dtype=jnp.float32
-        )) - new_accum >= 0.5
 
         new_state = CBPMultiHeadMLPState(  # type: ignore[call-arg]
             mlp_state=new_post_state,
