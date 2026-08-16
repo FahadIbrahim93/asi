@@ -18,6 +18,7 @@ import dataclasses
 import json
 import math
 from pathlib import Path
+from typing import Any
 
 import chex
 import jax
@@ -966,6 +967,41 @@ class TestShards:
         path.write_text(json.dumps(payload), encoding="utf-8")
         with pytest.raises(ValueError, match="per_regime_accuracy"):
             load_micro_shard(path)
+
+    @pytest.mark.parametrize(
+        ("fieldname", "mutate", "reason"),
+        [
+            ("per_regime_accuracy", lambda curve: [str(v) for v in curve], "numeric strings"),
+            ("per_regime_accuracy", lambda curve: [True] + curve[1:], "booleans"),
+            ("per_regime_accuracy", lambda curve: [5.0] + curve[1:], "accuracy above 1"),
+            ("per_regime_accuracy", lambda curve: [-0.5] + curve[1:], "negative accuracy"),
+            ("per_regime_loss", lambda curve: [-1.0] + curve[1:], "negative loss"),
+            ("per_regime_loss", lambda curve: [str(v) for v in curve], "numeric strings"),
+            ("per_regime_plasticity", lambda curve: [1.5] + curve[1:], "plasticity above 1"),
+            ("per_regime_plasticity", lambda curve: [False] + curve[1:], "booleans"),
+        ],
+    )
+    def test_load_rejects_curves_outside_their_measured_domain(
+        self, tmp_path: Path, fieldname: str, mutate: Any, reason: str
+    ):
+        """Every per-regime curve is a list of exact reals inside its metric's domain."""
+        payload = micro_shard_payload(self._result())
+        payload[fieldname] = mutate(list(payload[fieldname]))
+        path = tmp_path / "bad.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        with pytest.raises(ValueError, match=fieldname):
+            load_micro_shard(path)
+
+    def test_load_canonicalizes_integer_curve_entries_to_floats(self, tmp_path: Path):
+        payload = micro_shard_payload(self._result())
+        payload["per_regime_accuracy"] = [0] + list(payload["per_regime_accuracy"][1:])
+        payload["per_regime_plasticity"] = [1] + list(payload["per_regime_plasticity"][1:])
+        path = tmp_path / "ok.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        loaded = load_micro_shard(path)
+        assert loaded["per_regime_accuracy"][0] == 0.0
+        assert type(loaded["per_regime_accuracy"][0]) is float
+        assert loaded["per_regime_plasticity"][0] == 1.0
 
     @pytest.mark.parametrize(
         ("fieldname", "bad_value"),
