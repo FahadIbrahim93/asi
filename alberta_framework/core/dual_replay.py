@@ -443,26 +443,34 @@ def _require_float32_real(
     if maximum is not None:
         domain = f"{domain} and at most {maximum}"
     preserve_builtin_payload = type(value) is int or type(value) is float
-    if isinstance(value, bool | np.bool_) or not isinstance(value, Real):
+    actual_type = type(value)
+    if issubclass(actual_type, bool | np.bool_) or not issubclass(actual_type, Real):
         raise ValueError(f"{name} must be finite and {domain}")
-    try:
+    real_value = cast(Any, value)
+
+    def in_domain(candidate: Any) -> bool:
         if strictly_positive:
-            if value <= 0:
-                raise ValueError
-        elif value < 0:
+            if not candidate > 0:
+                return False
+        elif not candidate >= 0:
+            return False
+        return maximum is None or bool(candidate <= maximum)
+
+    try:
+        if not in_domain(real_value):
             raise ValueError
-        if maximum is not None and value > cast(Real, maximum):
-            raise ValueError
-        narrowed = round_real_to_float32(value)
+        narrowed = round_real_to_float32(real_value)
     except (FloatingPointError, OverflowError, TypeError, ValueError) as error:
         raise ValueError(f"{name} must be finite and {domain}") from error
     if not math.isfinite(narrowed):
         raise ValueError(f"{name} must narrow to a finite float32")
-    if value != 0 and narrowed == 0.0:
+    if real_value != 0 and narrowed == 0.0:
         raise ValueError(f"{name} must not underflow to zero in float32")
+    if not in_domain(narrowed):
+        raise ValueError(f"{name} must remain {domain} once narrowed to float32")
     if not preserve_builtin_payload:
         return narrowed
-    number = float(value)
+    number = float(real_value)
     with np.errstate(invalid="ignore", over="ignore", under="ignore"):
         renarrowed = float(np.float32(number))
     return cast(float, value) if narrowed == renarrowed else narrowed

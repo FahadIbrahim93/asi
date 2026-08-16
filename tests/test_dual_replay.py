@@ -623,6 +623,87 @@ def test_config_canonicalizes_real_scalars_and_preserves_builtin_payload() -> No
     assert DualReplayMemory.from_config(payload).config == canonical.config
 
 
+class _LyingFloat(float):
+    """A real float subclass whose exact ratio disagrees with its host value."""
+
+    def __new__(cls, value: float, ratio: tuple[int, int]) -> _LyingFloat:
+        instance = super().__new__(cls, value)
+        instance._ratio = ratio  # type: ignore[attr-defined]
+        return instance
+
+    def as_integer_ratio(self) -> tuple[int, int]:
+        return self._ratio  # type: ignore[attr-defined,no-any-return]
+
+
+class _FloatSpoof:
+    """Not a Real at all, but reports ``float`` through ``__class__``."""
+
+    @property
+    def __class__(self) -> type[float]:  # type: ignore[override]
+        return float
+
+    def as_integer_ratio(self) -> tuple[int, int]:
+        return (1, 2)
+
+    def __float__(self) -> float:
+        return 0.5
+
+    def __le__(self, other: Any) -> bool:
+        return bool(0.5 <= other)
+
+    def __lt__(self, other: Any) -> bool:
+        return bool(0.5 < other)
+
+    def __gt__(self, other: Any) -> bool:
+        return bool(0.5 > other)
+
+    def __ge__(self, other: Any) -> bool:
+        return bool(0.5 >= other)
+
+    def __ne__(self, other: object) -> bool:
+        return other != 0.5
+
+    def __eq__(self, other: object) -> bool:
+        return other == 0.5
+
+    __hash__ = None  # type: ignore[assignment]
+
+
+@pytest.mark.parametrize(
+    ("field", "ratio"),
+    [
+        ("surprise_scale", (-1, 1)),
+        ("surprise_weight", (-1, 1)),
+        ("aleatoric_downweight_scale", (0, 1)),
+        ("calibrated_priority_threshold", (-1, 1)),
+        ("calibrated_priority_threshold", (2, 1)),
+        ("calibrated_replacement_margin", (-1, 1)),
+        ("max_aleatoric_uncertainty", (-1, 1)),
+    ],
+)
+def test_config_rejects_reals_whose_exact_ratio_leaves_the_domain(
+    field: str, ratio: tuple[int, int]
+) -> None:
+    """Host value 0.5 is in every domain; the narrowed sink value must be too."""
+    with pytest.raises(ValueError, match=field):
+        _strict_memory(**{field: _LyingFloat(0.5, ratio)})
+
+
+@pytest.mark.parametrize("field", _FLOAT32_SCALARS)
+def test_config_rejects_objects_that_only_spoof_float_through_class(field: str) -> None:
+    with pytest.raises(ValueError, match=field):
+        _strict_memory(**{field: _FloatSpoof()})
+
+
+def test_config_accepts_honest_float_subclasses_as_canonical_floats() -> None:
+    memory = _strict_memory(surprise_weight=_LyingFloat(0.5, (1, 2)))
+    assert type(memory.config.surprise_weight) is float
+    assert memory.config.surprise_weight == 0.5
+    payload = memory.to_config()
+    json.dumps(payload, allow_nan=False)
+    assert DualReplayMemory.from_config(payload).config == memory.config
+
+
 def test_config_rejects_calibration_weights_whose_float32_sum_overflows_without_warnings() -> None:
     with pytest.raises(ValueError, match="finite float32 sum"):
         _strict_memory(surprise_weight=2e38, coverage_weight=2e38, progress_weight=2e38)
