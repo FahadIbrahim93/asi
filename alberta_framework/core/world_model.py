@@ -690,9 +690,10 @@ def run_action_conditioned_world_model_learning_loop(
 ) -> ActionConditionedWorldModelLearningResult:
     """Run online one-step model learning over transition arrays."""
     if discounts is None:
-        discounts = jnp.full_like(
-            rewards,
+        discounts = jnp.full(
+            jnp.shape(rewards),
             jnp.asarray(model.config.gamma, dtype=jnp.float32),
+            dtype=jnp.float32,
         )
 
     def _scan_fn(

@@ -96,6 +96,35 @@ def test_latent_world_model_update_and_prediction_shapes() -> None:
     chex.assert_tree_all_finite(result.latent_std_mean)
 
 
+def test_latent_default_discounts_do_not_inherit_the_reward_dtype() -> None:
+    config = LatentWorldModelConfig(
+        observation_dim=2,
+        n_actions=2,
+        latent_dim=4,
+        hidden_sizes=(8,),
+    )
+    model = LatentWorldModel(config)
+    state = model.init(jr.key(3))
+    observations = jnp.array([[0.0, 0.0], [0.1, 0.0], [0.1, 0.2]], dtype=jnp.float32)
+    next_observations = jnp.array([[0.1, 0.0], [0.1, 0.2], [0.2, 0.2]], dtype=jnp.float32)
+    actions = jnp.array([0, 1, 0], dtype=jnp.int32)
+    integer_rewards = jnp.array([1, 0, 1], dtype=jnp.int32)
+    explicit = run_latent_world_model_learning_loop(
+        model,
+        state,
+        observations,
+        actions,
+        integer_rewards.astype(jnp.float32),
+        next_observations,
+        jnp.full((3,), config.gamma, dtype=jnp.float32),
+    )
+    defaulted = run_latent_world_model_learning_loop(
+        model, state, observations, actions, integer_rewards, next_observations
+    )
+    chex.assert_trees_all_close(defaulted.discount_errors, explicit.discount_errors)
+    chex.assert_trees_all_close(defaulted.discount_predictions, explicit.discount_predictions)
+
+
 def test_latent_world_model_scan_loop_and_config_roundtrip() -> None:
     config = LatentWorldModelConfig(
         observation_dim=2,
