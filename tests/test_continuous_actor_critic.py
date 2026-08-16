@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import warnings
+
 import chex
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 import pytest
 
 from alberta_framework import ContinuousActorCriticAgent as TopLevelContinuousActorCriticAgent
@@ -209,19 +212,28 @@ def test_continuous_actor_critic_log_sigma_clipping() -> None:
         (1.0, -1.0, "action_low must be <= action_high"),
         (float("nan"), 1.0, "action_low must be finite"),
         (-1.0, float("inf"), "action_high must be finite"),
+        (1e100, None, "action_low must remain finite once narrowed to float32"),
+        (None, -1e100, "action_high must remain finite once narrowed to float32"),
+        (-3.5e38, 3.5e38, "action_low must remain finite once narrowed to float32"),
         (0.5, 0.5, None),
+        (-float(np.finfo(np.float32).max), float(np.finfo(np.float32).max), None),
     ],
 )
 def test_continuous_actor_critic_rejects_inverted_or_nonfinite_action_bounds(
-    low: float, high: float, message: str | None
+    low: float | None, high: float | None, message: str | None
 ) -> None:
     """low > high makes jnp.clip return high for every input: a constant-action policy."""
     config = ContinuousActorCriticConfig(action_dim=2, action_low=low, action_high=high)
     if message is None:
-        ContinuousActorCriticAgent(config)
+        agent = ContinuousActorCriticAgent(config)
+        state = agent.init(feature_dim=1, key=jr.key(2))
+        _state, action, _mean, _sigma = agent.start(state, jnp.array([1.0], dtype=jnp.float32))
+        assert bool(jnp.all(jnp.isfinite(action)))
         return
-    with pytest.raises(ValueError, match=message):
-        ContinuousActorCriticAgent(config)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        with pytest.raises(ValueError, match=message):
+            ContinuousActorCriticAgent(config)
 
 
 def test_continuous_actor_critic_action_clipping() -> None:
