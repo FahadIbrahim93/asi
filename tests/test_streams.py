@@ -435,10 +435,31 @@ class TestMakeScaleRange:
         [
             pytest.param(0.01, 100.0, id="ascending"),
             pytest.param(100.0, 0.01, id="descending"),
+            pytest.param(np.float32(0.123), np.float32(0.123), id="equal"),
+            pytest.param(
+                np.float32(3.0),
+                np.nextafter(np.float32(3.0), np.float32("inf")),
+                id="adjacent-ascending",
+            ),
+            pytest.param(
+                np.nextafter(np.float32(3.0), np.float32("inf")),
+                np.float32(3.0),
+                id="adjacent-descending",
+            ),
             pytest.param(
                 float(np.finfo(np.float32).tiny),
                 float(np.finfo(np.float32).max),
                 id="float32-boundaries",
+            ),
+            pytest.param(
+                float(np.finfo(np.float32).tiny),
+                float(np.finfo(np.float32).tiny),
+                id="equal-float32-tiny",
+            ),
+            pytest.param(
+                float(np.finfo(np.float32).max),
+                float(np.finfo(np.float32).max),
+                id="equal-float32-max",
             ),
         ],
     )

@@ -878,8 +878,8 @@ def make_scale_range(
         max_bound = _require_normal_float32_scale("max_scale", max_scale)
         with np.errstate(over="ignore", under="ignore", invalid="ignore"):
             values = np.geomspace(
-                np.float32(min_bound),
-                np.float32(max_bound),
+                min_bound,
+                max_bound,
                 feature_dim,
                 dtype=np.float32,
             )
