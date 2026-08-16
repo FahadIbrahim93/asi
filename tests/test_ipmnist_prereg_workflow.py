@@ -1,0 +1,447 @@
+from __future__ import annotations
+
+import json
+import runpy
+from pathlib import Path
+from typing import Any, cast
+
+import numpy as np
+import pytest
+
+_ROOT = Path(__file__).resolve().parents[1]
+_DRIVER = runpy.run_path(_ROOT / ".github" / "scripts" / "ipmnist_prereg.py")
+_PROTOCOLS = cast(dict[str, Any], _DRIVER["PROTOCOLS"])
+_authorization_line = cast(Any, _DRIVER["authorization_line"])
+_classify_outcome = cast(Any, _DRIVER["classify_outcome"])
+_strict_json = cast(Any, _DRIVER["_strict_json"])
+_validate_summary_reconstruction = cast(Any, _DRIVER["_validate_summary_reconstruction"])
+_validate_result_bundle = cast(Any, _DRIVER["validate_result_bundle"])
+_verify_launch_authorization = cast(Any, _DRIVER["verify_launch_authorization"])
+_write_json = cast(Any, _DRIVER["_write_json"])
+_DRIVER_GLOBALS = cast(dict[str, Any], _verify_launch_authorization.__globals__)
+
+
+def test_prereg_protocols_pin_exact_arms_and_seeds() -> None:
+    issue51 = _PROTOCOLS["issue51"]
+    assert issue51.issue == 51
+    assert issue51.namespace == "replication_r1"
+    assert issue51.control == "sigma0_shiftnorm_d099"
+    assert issue51.candidate == "rls_head_resid_l1_preset005"
+    assert issue51.seeds == (0, 1, 2)
+
+    issue188 = _PROTOCOLS["issue188"]
+    assert issue188.issue == 188
+    assert issue188.namespace == "gate_ablation_r3"
+    assert issue188.control == "rls_head_resid_l1_preset005"
+    assert issue188.candidate == "rls_head_resid_l1_preset005_nogate"
+    assert issue188.seeds == tuple(range(3, 13))
+
+
+def test_authorization_line_binds_every_launch_identity() -> None:
+    line = _authorization_line(
+        _PROTOCOLS["issue51"],
+        source="1" * 40,
+        tree="2" * 40,
+        uv_lock_sha256="3" * 64,
+        workflow_blob_sha1="4" * 40,
+        driver_blob_sha1="5" * 40,
+        ref_name="ipmnist-prereg-example",
+    )
+    assert line == (
+        "ASI_PREREG_LAUNCH_V1 issue=51 protocol=issue51 "
+        f"source={'1' * 40} tree={'2' * 40} uv_lock_sha256={'3' * 64} "
+        f"workflow_blob_sha1={'4' * 40} driver_blob_sha1={'5' * 40} "
+        "ref=ipmnist-prereg-example runner=macos-14-arm64 seeds=0,1,2 "
+        "registration_amendment=source-and-runner-as-bound "
+        "protocol_approval=approved seed_budget=approved compute=authorized-uncompensated"
+    )
+
+
+@pytest.mark.parametrize(
+    ("mean_diff", "diffs", "expected"),
+    [
+        (0.004882, (0.004, 0.005, 0.006), "replicated"),
+        (0.005950, (0.004, 0.005, 0.006), "replicated"),
+        (0.006, (0.004, 0.005, 0.006), "directionally_replicated"),
+        (0.005, (0.004, 0.0, 0.006), "not_replicated"),
+    ],
+)
+def test_issue51_outcomes_are_frozen(
+    mean_diff: float, diffs: tuple[float, ...], expected: str
+) -> None:
+    assert (
+        _classify_outcome("issue51", mean_diff=mean_diff, stderr_diff=0.0001, per_seed_diff=diffs)
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("mean_diff", "stderr_diff", "expected"),
+    [
+        (-0.001, 0.0001, "not_load_bearing"),
+        (-0.002, 0.0001, "load_bearing"),
+        (-0.0015, 0.0001, "inconclusive"),
+        (-0.0013, 0.0001, "inconclusive"),
+    ],
+)
+def test_issue188_outcomes_are_frozen(mean_diff: float, stderr_diff: float, expected: str) -> None:
+    assert (
+        _classify_outcome(
+            "issue188",
+            mean_diff=mean_diff,
+            stderr_diff=stderr_diff,
+            per_seed_diff=(mean_diff,) * 10,
+        )
+        == expected
+    )
+
+
+def test_outcome_validation_rejects_nonfinite_values() -> None:
+    with pytest.raises(ValueError, match="finite"):
+        _classify_outcome(
+            "issue188",
+            mean_diff=float("nan"),
+            stderr_diff=0.0,
+            per_seed_diff=(0.0,) * 10,
+        )
+
+
+def _launch_api_payloads(comment: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    current = {
+        "id": 123,
+        "event": "workflow_dispatch",
+        "head_sha": "1" * 40,
+        "display_title": f"ipmnist-issue51-{'1' * 40}",
+        "run_attempt": 1,
+        "path": ".github/workflows/ipmnist-prereg.yml",
+        "created_at": "2026-08-16T10:00:00Z",
+        "html_url": "https://example.invalid/run/123",
+    }
+    return current, [comment]
+
+
+def _verify_with_comment(
+    monkeypatch: pytest.MonkeyPatch, comment: dict[str, Any]
+) -> dict[str, Any]:
+    current, comments = _launch_api_payloads(comment)
+    monkeypatch.setitem(_DRIVER_GLOBALS, "_github_json", lambda *_args, **_kwargs: current)
+    monkeypatch.setitem(_DRIVER_GLOBALS, "_workflow_runs", lambda *_args, **_kwargs: [current])
+    monkeypatch.setitem(_DRIVER_GLOBALS, "_github_pages", lambda *_args, **_kwargs: comments)
+    return cast(
+        dict[str, Any],
+        _verify_launch_authorization(
+            protocol_key="issue51",
+            repository="elizaOS/asi",
+            source="1" * 40,
+            tree="2" * 40,
+            uv_lock_sha256="3" * 64,
+            workflow_blob_sha1="4" * 40,
+            driver_blob_sha1="5" * 40,
+            ref_name="ipmnist-prereg-example",
+            run_id=123,
+            run_attempt=1,
+            token="token",
+        ),
+    )
+
+
+def _authorization_comment(**overrides: Any) -> dict[str, Any]:
+    body = _authorization_line(
+        _PROTOCOLS["issue51"],
+        source="1" * 40,
+        tree="2" * 40,
+        uv_lock_sha256="3" * 64,
+        workflow_blob_sha1="4" * 40,
+        driver_blob_sha1="5" * 40,
+        ref_name="ipmnist-prereg-example",
+    )
+    comment: dict[str, Any] = {
+        "id": 456,
+        "body": body,
+        "user": {"id": 18_633_264, "login": "lalalune"},
+        "author_association": "MEMBER",
+        "created_at": "2026-08-16T09:00:00Z",
+        "updated_at": "2026-08-16T09:00:00Z",
+        "html_url": "https://example.invalid/comment/456",
+    }
+    comment.update(overrides)
+    return comment
+
+
+def test_launch_authorization_accepts_exact_unedited_project_owner_comment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = _verify_with_comment(monkeypatch, _authorization_comment())
+    assert payload["authorization_comment_id"] == 456
+    assert payload["authorization_created_at"] == "2026-08-16T09:00:00Z"
+    assert payload["authorization_updated_at"] == "2026-08-16T09:00:00Z"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"author_association": "OWNER"},
+        {"user": {"id": 1, "login": "lalalune"}},
+        {"updated_at": "2026-08-16T09:30:00Z"},
+    ],
+)
+def test_launch_authorization_rejects_wrong_identity_or_edited_comment(
+    monkeypatch: pytest.MonkeyPatch, overrides: dict[str, Any]
+) -> None:
+    with pytest.raises(RuntimeError, match="authorization"):
+        _verify_with_comment(monkeypatch, _authorization_comment(**overrides))
+
+
+def test_summary_reconstruction_rejects_resigned_derived_metrics_and_manifest() -> None:
+    expected_manifest = [
+        {
+            "path": "outputs/ipmnist_screening/example/shards/control_seed0.json",
+            "size_bytes": 10,
+            "sha256": "a" * 64,
+            "config_name": "control",
+            "seed": 0,
+        }
+    ]
+    summary = {
+        "schema": "summary.v2",
+        "created_unix": 1.0,
+        "results": [{"config_name": "candidate", "mean_diff": 0.25}],
+        "shard_manifest": expected_manifest,
+    }
+    recomputed = {
+        **summary,
+        "created_unix": 2.0,
+        "shard_manifest": [{**expected_manifest[0], "path": "/absolute/input.json"}],
+    }
+    _validate_summary_reconstruction(
+        summary=summary,
+        recomputed=recomputed,
+        expected_manifest=expected_manifest,
+    )
+
+    forged = {**summary, "results": [{"config_name": "candidate", "mean_diff": 0.5}]}
+    with pytest.raises(ValueError, match="reconstruction"):
+        _validate_summary_reconstruction(
+            summary=forged,
+            recomputed=recomputed,
+            expected_manifest=expected_manifest,
+        )
+
+    forged_manifest = [{**expected_manifest[0], "sha256": "b" * 64}]
+    with pytest.raises(ValueError, match="manifest"):
+        _validate_summary_reconstruction(
+            summary={**summary, "shard_manifest": forged_manifest},
+            recomputed=recomputed,
+            expected_manifest=expected_manifest,
+        )
+
+
+def test_strict_json_rejects_exponent_overflow(tmp_path: Path) -> None:
+    path = tmp_path / "payload.json"
+    path.write_text('{"value": 1e999}\n', encoding="utf-8")
+    with pytest.raises(ValueError, match="finite"):
+        _strict_json(path)
+
+
+def test_metadata_writer_refuses_overwrite(tmp_path: Path) -> None:
+    path = tmp_path / "metadata.json"
+    _write_json(path, {"value": 1})
+    with pytest.raises(FileExistsError):
+        _write_json(path, {"value": 2})
+    assert json.loads(path.read_text(encoding="utf-8")) == {"value": 1}
+
+
+def _source_provenance() -> dict[str, object]:
+    return {
+        "schema": "alberta.ipmnist_screening.source_provenance.v1",
+        "git_commit": "1" * 40,
+        "git_tree": "2" * 40,
+        "git_object_format": "sha1",
+        "relevant_source_scope": "tracked:alberta_framework/**,pyproject.toml,uv.lock",
+        "relevant_source_file_count": 3,
+        "relevant_source_sha256": "3" * 64,
+        "uv_lock_sha256": "4" * 64,
+        "worktree_clean": True,
+    }
+
+
+def _dataset_provenance() -> dict[str, object]:
+    return {
+        "schema": "alberta.ipmnist_screening.dataset_provenance.v1",
+        "source": {
+            "provider": "openml",
+            "name": "mnist_784",
+            "version": 1,
+            "row_start": 0,
+            "row_stop_exclusive": 60_000,
+        },
+        "materialization": "alberta.ipmnist.float32-neg1-pos1-int32-labels.v1",
+        "x": {"dtype": "<f4", "shape": [60_000, 784], "sha256": "5" * 64},
+        "y": {"dtype": "<i4", "shape": [60_000], "sha256": "6" * 64},
+    }
+
+
+def _runtime_environment() -> dict[str, object]:
+    return {
+        "schema": "alberta.ipmnist_screening.runtime.v1",
+        "python": {"implementation": "CPython", "version": "3.12.12"},
+        "platform": {"system": "Darwin", "release": "24.0", "machine": "arm64"},
+        "packages": {
+            "chex": "0.1.91",
+            "jax": "0.11.0",
+            "jaxlib": "0.11.0",
+            "numpy": "2.5.1",
+            "scikit-learn": "1.9.0",
+        },
+        "jax": {
+            "backend": "cpu",
+            "devices": [
+                {"id": 0, "platform": "cpu", "device_kind": "Apple M1", "process_index": 0}
+            ],
+            "config": {
+                "jax_enable_x64": False,
+                "jax_default_matmul_precision": None,
+                "jax_disable_jit": False,
+                "jax_numpy_dtype_promotion": "standard",
+                "jax_numpy_rank_promotion": "allow",
+                "jax_random_seed_offset": 0,
+                "jax_threefry_partitionable": True,
+                "jax_default_prng_impl": "threefry2x32",
+            },
+        },
+        "process_environment": {
+            "CUDA_VISIBLE_DEVICES": "",
+            "JAX_DEFAULT_MATMUL_PRECISION": None,
+            "JAX_ENABLE_X64": "false",
+            "JAX_PLATFORM_NAME": "cpu",
+            "JAX_PLATFORMS": "cpu",
+            "OMP_NUM_THREADS": "1",
+            "XLA_FLAGS": "--xla_force_host_platform_device_count=1",
+        },
+    }
+
+
+def _write_issue51_bundle(root: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    from alberta_framework.benchmarks.ipmnist_screening import (
+        ScreeningRunResult,
+        merge_shards,
+        screening_spec,
+        shard_payload,
+    )
+    from alberta_framework.benchmarks.upgd_ipmnist import IPMNISTConfig
+
+    namespace = root / "outputs" / "ipmnist_screening" / "replication_r1"
+    shards_dir = namespace / "shards"
+    shards_dir.mkdir(parents=True)
+    config = IPMNISTConfig(
+        n_tasks=60,
+        task_length=5_000,
+        input_dim=784,
+        hidden1=300,
+        hidden2=150,
+        n_classes=10,
+    )
+    relative_paths: list[Path] = []
+    for seed in (0, 1, 2):
+        for arm, accuracy in (
+            ("sigma0_shiftnorm_d099", 0.5),
+            ("rls_head_resid_l1_preset005", 0.505),
+        ):
+            spec = screening_spec(arm)
+            result = ScreeningRunResult(
+                config_name=arm,
+                base_learner=spec.base_learner,
+                hyperparameters=dict(spec.hyperparameters),
+                seed=seed,
+                config=config,
+                per_task_accuracy=np.full(60, accuracy, dtype=np.float64),
+                per_task_loss=np.full(60, 0.5, dtype=np.float64),
+                per_task_plasticity=np.full(60, 0.5, dtype=np.float64),
+                wall_clock_seconds=1.0,
+            )
+            path = shards_dir / f"{arm}_seed{seed}.json"
+            path.write_text(
+                json.dumps(
+                    shard_payload(
+                        result,
+                        source_provenance=_source_provenance(),
+                        dataset_provenance=_dataset_provenance(),
+                        environment=_runtime_environment(),
+                    ),
+                    allow_nan=False,
+                ),
+                encoding="utf-8",
+            )
+            relative_paths.append(path.relative_to(root))
+    monkeypatch.chdir(root)
+    summary = merge_shards(
+        relative_paths,
+        control_name="sigma0_shiftnorm_d099",
+        slope_window=15,
+    )
+    summary_path = namespace / "summary.json"
+    summary_path.write_text(json.dumps(summary, allow_nan=False), encoding="utf-8")
+    return summary_path
+
+
+def _write_runner_receipt(root: Path) -> Path:
+    environment = _runtime_environment()
+    jax_binding = cast(dict[str, Any], environment["jax"])
+    receipt = {
+        "schema": "asi.ipmnist_prereg.runner.v1",
+        "runner_label": "macos-14",
+        "cpu_brand": "Apple M1 (Virtual)",
+        "platform": "macOS-14-arm64",
+        "machine": "arm64",
+        "python": "3.12.12",
+        "packages": {
+            name: cast(dict[str, Any], environment["packages"])[name]
+            for name in ("jax", "jaxlib", "numpy", "scikit-learn")
+        },
+        "jax_backend": "cpu",
+        "jax_devices": jax_binding["devices"],
+    }
+    path = root / "runner.json"
+    path.write_text(json.dumps(receipt, allow_nan=False), encoding="utf-8")
+    return path
+
+
+def test_result_bundle_recomputes_summary_from_exact_shards(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_issue51_bundle(tmp_path, monkeypatch)
+    runner_receipt = _write_runner_receipt(tmp_path)
+    result = _validate_result_bundle(
+        protocol_key="issue51",
+        root=tmp_path,
+        runner_receipt=runner_receipt,
+        source="1" * 40,
+        tree="2" * 40,
+        uv_lock_sha256="4" * 64,
+    )
+    assert result["outcome"] == "replicated"
+    assert result["mean_diff"] == pytest.approx(0.005)
+
+
+def test_result_bundle_rejects_resigned_summary_metric(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    summary_path = _write_issue51_bundle(tmp_path, monkeypatch)
+    runner_receipt = _write_runner_receipt(tmp_path)
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    candidate = next(
+        entry
+        for entry in summary["results"]
+        if entry["config_name"] == "rls_head_resid_l1_preset005"
+    )
+    candidate["paired_vs_control"]["mean_diff"] = 0.5
+    summary_path.write_text(json.dumps(summary, allow_nan=False), encoding="utf-8")
+    with pytest.raises(ValueError, match="reconstruction"):
+        _validate_result_bundle(
+            protocol_key="issue51",
+            root=tmp_path,
+            runner_receipt=runner_receipt,
+            source="1" * 40,
+            tree="2" * 40,
+            uv_lock_sha256="4" * 64,
+        )
