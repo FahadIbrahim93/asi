@@ -44,6 +44,26 @@ from alberta_framework.core.update_safety import (
     select_transaction,
 )
 
+
+def _skip_zero_scale(scale: float, value: Array) -> Array:
+    """Keep finite multiplication exact while repairing zero-scaled poison."""
+    product = scale * value
+    if scale != 0.0:
+        return product
+    return jnp.where(jnp.isfinite(value), product, jnp.zeros_like(value))
+
+
+def _recover_nonfinite_at_zero_scale(scale: float, value: Array) -> Array:
+    """Repair only non-finite history that a zero scale is configured to forget."""
+    if scale != 0.0:
+        return value
+    return jnp.where(
+        ~jnp.isfinite(value),
+        jnp.zeros_like(value),
+        value,
+    )
+
+
 GENERATOR_RANDOM = 0
 GENERATOR_MUTATE_PARENT = 1
 GENERATOR_IMPRINT = 2
@@ -554,7 +574,7 @@ class FixedBudgetFeatureLearner:
     ) -> Array:
         """Track active target heads for opt-in task-balanced utility."""
         return (
-            self._task_activity_decay * old_activity
+            _skip_zero_scale(self._task_activity_decay, old_activity)
             + (1.0 - self._task_activity_decay) * active_mask.astype(jnp.float32)
         )
 
@@ -748,16 +768,20 @@ class FixedBudgetFeatureLearner:
     def _utility_update(self, old_utilities: Array, utility_signal: Array) -> Array:
         """Update utility, optionally retaining recurrent-context peaks longer."""
         ema = (
-            self._utility_decay * old_utilities
+            _skip_zero_scale(self._utility_decay, old_utilities)
             + (1.0 - self._utility_decay) * utility_signal
         )
         if self._utility_retention_decay is None:
             return ema
-        retained = self._utility_retention_decay * old_utilities
+        retained = _skip_zero_scale(self._utility_retention_decay, old_utilities)
         return jnp.maximum(ema, retained)
 
     def _resource_weights(self, log_weights: Array) -> Array:
         """Return a soft resource allocation with optional exploration."""
+        log_weights = _recover_nonfinite_at_zero_scale(
+            self._resource_discount,
+            log_weights,
+        )
         weights = jax.nn.softmax(log_weights)
         if self._resource_exploration > 0.0:
             uniform = jnp.full_like(weights, 1.0 / weights.shape[0])
@@ -785,7 +809,7 @@ class FixedBudgetFeatureLearner:
             self._resource_advantage_clip,
         )
         new_log_weights = (
-            self._resource_discount * log_weights
+            _skip_zero_scale(self._resource_discount, log_weights)
             + self._resource_learning_rate * advantages
         )
         return new_log_weights - jnp.mean(new_log_weights)
@@ -920,7 +944,28 @@ class FixedBudgetFeatureLearner:
         targets: Array,
     ) -> FeatureDiscoveryUpdateResult:
         """Perform one temporally-uniform feature-discovery update."""
-        source_state_finite = floating_tree_is_finite(state)
+        previous_checked = state
+        utility_history_discarded = self._utility_decay == 0.0 and (
+            self._utility_retention_decay is None
+            or self._utility_retention_decay == 0.0
+        )
+        if utility_history_discarded:
+            previous_checked = previous_checked.replace(  # type: ignore[attr-defined]
+                utilities=jnp.zeros_like(state.utilities),
+                candidate_utilities=jnp.zeros_like(state.candidate_utilities),
+            )
+        if self._task_activity_decay == 0.0:
+            previous_checked = previous_checked.replace(  # type: ignore[attr-defined]
+                task_activity_ema=jnp.zeros_like(state.task_activity_ema),
+            )
+        if self._learn_feature_resources and self._resource_discount == 0.0:
+            previous_checked = previous_checked.replace(  # type: ignore[attr-defined]
+                generator_log_weights=jnp.zeros_like(state.generator_log_weights),
+                generator_utility_ema=jnp.zeros_like(state.generator_utility_ema),
+                plasticity_log_weights=jnp.zeros_like(state.plasticity_log_weights),
+                plasticity_signal_ema=jnp.zeros_like(state.plasticity_signal_ema),
+            )
+        source_state_finite = floating_tree_is_finite(previous_checked)
         inputs_valid = (
             jnp.all(jnp.isfinite(observation))
             & jnp.all(jnp.isfinite(targets) | jnp.isnan(targets))
@@ -1482,9 +1527,13 @@ class FixedBudgetFeatureLearner:
                 new_candidate_utilities,
                 candidate_generator,
             )
+            generator_utility_ema = _recover_nonfinite_at_zero_scale(
+                self._resource_discount,
+                generator_utility_ema,
+            )
             generator_utility_ema = jnp.where(
                 generator_finite,
-                self._resource_discount * generator_utility_ema
+                _skip_zero_scale(self._resource_discount, generator_utility_ema)
                 + (1.0 - self._resource_discount) * generator_scores,
                 generator_utility_ema,
             )
@@ -1529,7 +1578,7 @@ class FixedBudgetFeatureLearner:
                 [-pressure, jnp.array(0.0, dtype=jnp.float32), pressure]
             )
             plasticity_signal_ema = (
-                self._resource_discount * plasticity_signal_ema
+                _skip_zero_scale(self._resource_discount, plasticity_signal_ema)
                 + (1.0 - self._resource_discount) * plasticity_scores
             )
             plasticity_log_weights = self._resource_log_weight_update(
