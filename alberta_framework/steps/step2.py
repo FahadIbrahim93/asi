@@ -18,12 +18,15 @@ contracts are exercised in ``tests/test_prototype_memory.py`` and
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from numbers import Integral, Real
 from typing import Any, Literal, cast
 
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 from jax import Array
 
+from alberta_framework._float32 import round_real_to_float32
 from alberta_framework.core.associative_memory import (
     AssociativeFeatureFamily,
     AssociativeMemoryConfig,
@@ -57,6 +60,247 @@ Step2ReadoutMode = Literal[
 ]
 Step2HybridReadoutMode = Literal["linear_mse", "softmax_ce"]
 
+_VALID_STEP2_STREAMS: frozenset[str] = frozenset(
+    {"polynomial", "frequency", "compositional"}
+)
+_VALID_STEP2_READOUT_MODES: frozenset[str] = frozenset(
+    {
+        "linear_mse",
+        "softmax_ce",
+        "adaptive_simplex",
+        "factorized_simplex",
+        "adaptive_factorized_simplex",
+        "two_timescale_simplex",
+    }
+)
+_VALID_STEP2_LOSS_NORMALIZATIONS: frozenset[str] = frozenset(
+    {"target_structure", "target_density"}
+)
+_STEP2_KERNEL_CONFIG_KEYS = frozenset(
+    {
+        "feature_dim",
+        "n_heads",
+        "hidden_sizes",
+        "stream",
+        "readout_mode",
+        "step_size",
+        "loss_normalization",
+        "context_length",
+        "noise_std",
+    }
+)
+_STEP2_STRICT_DIGIT_CONFIG_KEYS = frozenset(
+    {"n_heads", "hidden_sizes", "step_size"}
+)
+_STEP2_MEMORY_CONFIG_KEYS = frozenset(
+    {
+        "feature_dim",
+        "n_classes",
+        "slots_per_class",
+        "update_rate",
+        "novelty_threshold",
+        "bandwidth",
+    }
+)
+_INT32_MAX = int(np.iinfo(np.int32).max)
+
+
+def _require_exact_keys(
+    config_name: str,
+    payload: dict[str, object],
+    expected: frozenset[str],
+) -> None:
+    if set(payload) != expected:
+        raise ValueError(
+            f"{config_name} payload keys must be exactly {sorted(expected)!r}"
+        )
+
+
+def _require_real(name: str, value: object) -> Any:
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError(f"{name} must be a real number, got {value!r}")
+    return value
+
+
+def _narrow_float32(name: str, value: Any) -> float:
+    """Narrow exactly as the downstream JAX kernels do."""
+    try:
+        narrowed = round_real_to_float32(value)
+    except (FloatingPointError, OverflowError, TypeError, ValueError):
+        raise ValueError(f"{name} must narrow to a finite float32, got {value!r}") from None
+    if not bool(np.isfinite(narrowed)):
+        raise ValueError(f"{name} must narrow to a finite float32, got {value!r}")
+    if type(value) in (int, float) and (bool(narrowed != 0.0) or value == 0):
+        return float(value)
+    return float(narrowed)
+
+
+def _require_unit_interval(name: str, value: object) -> float:
+    original = _require_real(name, value)
+    if not 0.0 <= original <= 1.0:
+        raise ValueError(f"{name} must be in [0, 1], got {value!r}")
+    return _narrow_float32(name, original)
+
+
+def _require_nonnegative_real(name: str, value: object) -> float:
+    original = _require_real(name, value)
+    if original < 0.0:
+        raise ValueError(f"{name} must be non-negative, got {value!r}")
+    return _narrow_float32(name, original)
+
+
+def _require_positive_real(name: str, value: object) -> float:
+    original = _require_real(name, value)
+    if original <= 0.0:
+        raise ValueError(f"{name} must be positive, got {value!r}")
+    number = _narrow_float32(name, original)
+    if number <= 0.0:
+        raise ValueError(
+            f"{name} must be positive in float32 execution sink, got {value!r}"
+        )
+    return number
+
+
+def _require_int(
+    name: str,
+    value: object,
+    *,
+    minimum: int | None = None,
+    maximum: int | None = None,
+) -> int:
+    if isinstance(value, bool) or not isinstance(value, Integral):
+        raise ValueError(f"{name} must be an integer, got {value!r}")
+    try:
+        number = int(value)
+    except (OverflowError, TypeError, ValueError):
+        raise ValueError(f"{name} must be an integer, got {value!r}") from None
+    if minimum is not None and number < minimum:
+        if minimum == 1:
+            raise ValueError(f"{name} must be positive, got {value!r}")
+        if minimum == 0:
+            raise ValueError(f"{name} must be non-negative, got {value!r}")
+        raise ValueError(f"{name} must be >= {minimum}, got {value!r}")
+    if maximum is not None and number > maximum:
+        raise ValueError(f"{name} must be <= {maximum}, got {value!r}")
+    return number
+
+
+def _validate_step2_kernel_config(config: Step2KernelConfig) -> None:
+    feature_dim = _require_int(
+        "feature_dim", config.feature_dim, minimum=1, maximum=_INT32_MAX
+    )
+    n_heads = _require_int(
+        "n_heads", config.n_heads, minimum=1, maximum=_INT32_MAX
+    )
+    if not isinstance(config.hidden_sizes, tuple):
+        raise ValueError(
+            f"hidden_sizes must be a tuple of integers, got {config.hidden_sizes!r}"
+        )
+    canonical_hidden: list[int] = []
+    for h in config.hidden_sizes:
+        canonical_hidden.append(
+            _require_int(
+                "hidden_sizes element", h, minimum=1, maximum=_INT32_MAX
+            )
+        )
+    if not isinstance(config.stream, str) or config.stream not in _VALID_STEP2_STREAMS:
+        raise ValueError(
+            f"unknown Step 2 stream field {config.stream!r}; "
+            f"expected one of {sorted(_VALID_STEP2_STREAMS)}"
+        )
+    if config.stream == "polynomial" and feature_dim < 3:
+        raise ValueError("feature_dim must be at least 3 for the polynomial stream")
+    if (
+        not isinstance(config.readout_mode, str)
+        or config.readout_mode not in _VALID_STEP2_READOUT_MODES
+    ):
+        raise ValueError(
+            f"unknown Step 2 readout_mode field {config.readout_mode!r}; "
+            f"expected one of {sorted(_VALID_STEP2_READOUT_MODES)}"
+        )
+    if (
+        not isinstance(config.loss_normalization, str)
+        or config.loss_normalization not in _VALID_STEP2_LOSS_NORMALIZATIONS
+    ):
+        raise ValueError(
+            f"unknown Step 2 loss_normalization field {config.loss_normalization!r}; "
+            f"expected one of {sorted(_VALID_STEP2_LOSS_NORMALIZATIONS)}"
+        )
+    step_size = _require_nonnegative_real("step_size", config.step_size)
+    context_length = _require_int(
+        "context_length",
+        config.context_length,
+        minimum=1,
+        maximum=_INT32_MAX,
+    )
+    noise_std = _require_nonnegative_real("noise_std", config.noise_std)
+    object.__setattr__(config, "feature_dim", feature_dim)
+    object.__setattr__(config, "n_heads", n_heads)
+    object.__setattr__(config, "hidden_sizes", tuple(canonical_hidden))
+    object.__setattr__(config, "step_size", step_size)
+    object.__setattr__(config, "context_length", context_length)
+    object.__setattr__(config, "noise_std", noise_std)
+
+
+def _validate_step2_strict_digit_config(config: Step2StrictDigitReadoutConfig) -> None:
+    n_heads = _require_int(
+        "n_heads", config.n_heads, minimum=1, maximum=_INT32_MAX
+    )
+    if not isinstance(config.hidden_sizes, tuple):
+        raise ValueError(
+            f"hidden_sizes must be a tuple of integers, got {config.hidden_sizes!r}"
+        )
+    canonical_hidden: list[int] = []
+    for h in config.hidden_sizes:
+        canonical_hidden.append(
+            _require_int(
+                "hidden_sizes element", h, minimum=1, maximum=_INT32_MAX
+            )
+        )
+    step_size = _require_nonnegative_real("step_size", config.step_size)
+    object.__setattr__(config, "n_heads", n_heads)
+    object.__setattr__(config, "hidden_sizes", tuple(canonical_hidden))
+    object.__setattr__(config, "step_size", step_size)
+
+
+def _require_half_open_unit_interval(name: str, value: object) -> float:
+    original = _require_real(name, value)
+    if not 0.0 < original <= 1.0:
+        raise ValueError(f"{name} must be in (0, 1], got {value!r}")
+    number = _narrow_float32(name, original)
+    if number <= 0.0:
+        raise ValueError(
+            f"{name} must remain positive in float32 execution sink, got {value!r}"
+        )
+    return number
+
+
+def _validate_step2_memory_config(config: Step2MemoryConfig) -> None:
+    feature_dim = _require_int(
+        "feature_dim", config.feature_dim, minimum=1, maximum=_INT32_MAX
+    )
+    n_classes = _require_int(
+        "n_classes", config.n_classes, minimum=2, maximum=_INT32_MAX
+    )
+    slots_per_class = _require_int(
+        "slots_per_class",
+        config.slots_per_class,
+        minimum=1,
+        maximum=_INT32_MAX,
+    )
+    update_rate = _require_half_open_unit_interval("update_rate", config.update_rate)
+    novelty_threshold = _require_nonnegative_real(
+        "novelty_threshold",
+        config.novelty_threshold,
+    )
+    bandwidth = _require_positive_real("bandwidth", config.bandwidth)
+    object.__setattr__(config, "feature_dim", feature_dim)
+    object.__setattr__(config, "n_classes", n_classes)
+    object.__setattr__(config, "slots_per_class", slots_per_class)
+    object.__setattr__(config, "update_rate", update_rate)
+    object.__setattr__(config, "novelty_threshold", novelty_threshold)
+    object.__setattr__(config, "bandwidth", bandwidth)
+
 
 @dataclass(frozen=True)
 class Step2KernelConfig:
@@ -74,6 +318,10 @@ class Step2KernelConfig:
     context_length: int = 128
     noise_std: float = 0.05
 
+    def __post_init__(self) -> None:
+        """Reject invalid parameters and canonicalize scalars."""
+        _validate_step2_kernel_config(self)
+
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-serializable representation."""
         payload = asdict(self)
@@ -83,8 +331,10 @@ class Step2KernelConfig:
     @classmethod
     def from_dict(cls, payload: dict[str, object]) -> Step2KernelConfig:
         """Reconstruct from :meth:`to_dict` output."""
+        _require_exact_keys(cls.__name__, payload, _STEP2_KERNEL_CONFIG_KEYS)
         config = dict(payload)
-        config["hidden_sizes"] = tuple(cast(list[int], config["hidden_sizes"]))
+        if isinstance(config["hidden_sizes"], list):
+            config["hidden_sizes"] = tuple(cast(list[int], config["hidden_sizes"]))
         return cls(**cast(Any, config))
 
 
@@ -102,6 +352,10 @@ class Step2StrictDigitReadoutConfig:
     hidden_sizes: tuple[int, ...] = (64, 64)
     step_size: float = 0.018
 
+    def __post_init__(self) -> None:
+        """Reject invalid parameters and canonicalize scalars."""
+        _validate_step2_strict_digit_config(self)
+
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-serializable representation."""
         payload = asdict(self)
@@ -114,8 +368,10 @@ class Step2StrictDigitReadoutConfig:
         payload: dict[str, object],
     ) -> Step2StrictDigitReadoutConfig:
         """Reconstruct from :meth:`to_dict` output."""
+        _require_exact_keys(cls.__name__, payload, _STEP2_STRICT_DIGIT_CONFIG_KEYS)
         config = dict(payload)
-        config["hidden_sizes"] = tuple(cast(list[int], config["hidden_sizes"]))
+        if isinstance(config["hidden_sizes"], list):
+            config["hidden_sizes"] = tuple(cast(list[int], config["hidden_sizes"]))
         return cls(**cast(Any, config))
 
 
@@ -130,6 +386,10 @@ class Step2MemoryConfig:
     novelty_threshold: float = 0.08
     bandwidth: float = 0.01
 
+    def __post_init__(self) -> None:
+        """Reject invalid parameters and canonicalize scalars."""
+        _validate_step2_memory_config(self)
+
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-serializable representation."""
         return asdict(self)
@@ -137,6 +397,7 @@ class Step2MemoryConfig:
     @classmethod
     def from_dict(cls, payload: dict[str, object]) -> Step2MemoryConfig:
         """Reconstruct from :meth:`to_dict` output."""
+        _require_exact_keys(cls.__name__, payload, _STEP2_MEMORY_CONFIG_KEYS)
         return cls(**cast(Any, payload))
 
 
