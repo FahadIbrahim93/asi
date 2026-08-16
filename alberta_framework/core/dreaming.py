@@ -711,11 +711,16 @@ def dream_one_step(
         dtype=jnp.float32,
     )
     terminated = jnp.logical_or(world_prediction.terminated, discount_terminal)
-    # A non-finite model prediction can never be a valid imagined step: it would
-    # otherwise ship to the control learner with full weight and poison every
-    # later step of the rollout through the carried observation.
+    # A non-finite imagined step can never be valid: it would otherwise ship to
+    # the control learner with full weight and poison every later step of the
+    # rollout through the carried observation. The anchor observation and the
+    # sampled action are gated alongside the model prediction because both are
+    # copied verbatim into the emitted transition (mirroring the one-step
+    # guard's REJECT_NONFINITE, which also requires a finite anchor).
     finite = (
-        jnp.all(jnp.isfinite(world_prediction.next_observation))
+        jnp.all(jnp.isfinite(jnp.asarray(rollout_state.observation, dtype=jnp.float32)))
+        & jnp.all(jnp.isfinite(jnp.asarray(behavior_prediction.action, dtype=jnp.float32)))
+        & jnp.all(jnp.isfinite(world_prediction.next_observation))
         & jnp.all(jnp.isfinite(world_prediction.reward))
         & jnp.all(jnp.isfinite(world_prediction.discount))
         & jnp.all(jnp.isfinite(world_prediction.confidence))

@@ -244,6 +244,91 @@ def test_nonfinite_world_prediction_marks_the_dream_step_invalid_and_stops() -> 
             assert bool(jnp.all(jnp.isfinite(leaf)))
 
 
+class FiniteWorldModel:
+    """World model that returns finite predictions regardless of the anchor."""
+
+    def predict(
+        self,
+        state: Any,
+        observation: jnp.ndarray,
+        action: jnp.ndarray,
+        key: Any,
+    ) -> DreamWorldModelPrediction:
+        del state, action, key
+        return DreamWorldModelPrediction(
+            next_observation=jnp.zeros_like(observation),
+            reward=jnp.array(1.0, dtype=jnp.float32),
+            discount=jnp.array(0.9, dtype=jnp.float32),
+            terminated=jnp.array(False),
+            confidence=jnp.array(1.0, dtype=jnp.float32),
+            model_error=jnp.array(0.0, dtype=jnp.float32),
+        )
+
+
+@pytest.mark.unit
+def test_nonfinite_anchor_observation_marks_the_dream_step_invalid_and_stops() -> None:
+    """A non-finite anchor observation must not ship as a valid, weight-1.0 item.
+
+    ``GuardedDreamer.propose`` rejects a non-finite anchor observation with
+    ``REJECT_NONFINITE``; the rollout path must mirror that gate even when the
+    world model itself returns finite predictions, because the anchor is copied
+    verbatim into ``ImaginedTransition.observation``.
+    """
+    behavior = DeterministicBehaviorModel()
+    behavior_state = DeterministicBehaviorState(action=jnp.array(0, dtype=jnp.int32))
+    config = DreamRolloutConfig(rollout_horizon=3, confidence_threshold=0.5, max_model_error=1.0)
+    anchor = jnp.array([jnp.nan, 1.0], dtype=jnp.float32)
+    initial = init_dream_rollout_state(anchor, jr.key(5))
+
+    rollout = dream_rollout(FiniteWorldModel(), None, behavior, behavior_state, initial, config)
+
+    assert not bool(jnp.any(rollout.transitions.valid))
+    assert not bool(rollout.state.active)
+    gvf_items = imagined_rollout_to_gvf_items(rollout)
+    chex.assert_trees_all_close(gvf_items.weights, jnp.zeros((3,), dtype=jnp.float32))
+    sarsa_items = imagined_rollout_to_sarsa_items(rollout)
+    chex.assert_trees_all_close(sarsa_items.weights, jnp.zeros((3,), dtype=jnp.float32))
+    transition = jax.tree.map(lambda leaf: leaf[0], rollout.transitions)
+    item = imagined_transition_to_supervised_item(transition)
+    gvf_item = imagined_transition_to_gvf_item(transition)
+    assert float(item.weights) == 0.0
+    for converted in (item, gvf_item, gvf_items, sarsa_items):
+        for leaf in jax.tree.leaves(converted):
+            assert bool(jnp.all(jnp.isfinite(leaf)))
+
+
+@pytest.mark.unit
+def test_nonfinite_imagined_action_marks_the_dream_step_invalid() -> None:
+    """A non-finite sampled action must not ship as a valid training input."""
+
+    class NaNActionBehaviorModel:
+        def sample_action(
+            self,
+            state: Any,
+            observation: jnp.ndarray,
+            key: Any,
+        ) -> DreamBehaviorModelPrediction:
+            del state, observation, key
+            return DreamBehaviorModelPrediction(
+                action=jnp.array([jnp.nan], dtype=jnp.float32),
+                action_probability=jnp.array(1.0, dtype=jnp.float32),
+                log_probability=jnp.array(0.0, dtype=jnp.float32),
+            )
+
+    config = DreamRolloutConfig(rollout_horizon=2, confidence_threshold=0.5, max_model_error=1.0)
+    initial = init_dream_rollout_state(jnp.array([1.0, 1.0], dtype=jnp.float32), jr.key(9))
+
+    rollout = dream_rollout(
+        FiniteWorldModel(), None, NaNActionBehaviorModel(), None, initial, config
+    )
+
+    assert not bool(jnp.any(rollout.transitions.valid))
+    sarsa_items = imagined_rollout_to_sarsa_items(rollout)
+    chex.assert_trees_all_close(sarsa_items.weights, jnp.zeros((2,), dtype=jnp.float32))
+    for leaf in jax.tree.leaves(sarsa_items):
+        assert bool(jnp.all(jnp.isfinite(leaf)))
+
+
 @pytest.mark.parametrize("field", ["reward", "discount", "confidence", "model_error"])
 def test_nonfinite_scalar_channels_mark_the_dream_step_invalid(field: str) -> None:
     class ScalarNaNWorldModel(MockWorldModel):
