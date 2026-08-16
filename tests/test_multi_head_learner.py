@@ -21,6 +21,7 @@ from alberta_framework import (
     MultiHeadMLPUpdateResult,
     ObGD,
     ObGDBounding,
+    TraceMode,
     WelfordNormalizer,
     multi_head_metrics_to_dicts,
     run_multi_head_learning_loop,
@@ -1202,3 +1203,115 @@ class TestMultiHeadLinearBaseline:
         for w_trace, b_trace in result.state.head_traces:
             assert bool(jnp.all(jnp.isfinite(w_trace)))
             assert bool(jnp.all(jnp.isfinite(b_trace)))
+
+    def test_zero_trace_decay_recovers_inf_trunk_traces(self) -> None:
+        learner = MultiHeadMLPLearner(
+            n_heads=2,
+            hidden_sizes=(4,),
+            sparsity=0.0,
+            optimizer=LMS(0.1),
+        )
+        state = learner.init(feature_dim=3, key=jr.key(3))
+        state = state.replace(
+            trunk_traces=tuple(
+                jnp.full_like(trace, jnp.inf) for trace in state.trunk_traces
+            )
+        )
+
+        result = learner.update(
+            state,
+            jnp.ones(3, dtype=jnp.float32),
+            jnp.array([1.0, 0.5], dtype=jnp.float32),
+        )
+
+        assert bool(result.update_applied)
+        for trace in result.state.trunk_traces:
+            assert bool(jnp.all(jnp.isfinite(trace)))
+
+    def test_replacing_zero_decay_skips_inf_trace_at_zero_gradient(self) -> None:
+        learner = MultiHeadMLPLearner(
+            n_heads=1,
+            hidden_sizes=(),
+            sparsity=0.0,
+            optimizer=LMS(0.1),
+            trace_mode=TraceMode.REPLACING,
+        )
+        state = learner.init(feature_dim=3, key=jr.key(4))
+        old_w, old_b = state.head_traces[0]
+        state = state.replace(
+            head_traces=((jnp.full_like(old_w, jnp.inf), old_b),)
+        )
+
+        result = learner.update(
+            state,
+            jnp.zeros(3, dtype=jnp.float32),
+            jnp.array([1.0], dtype=jnp.float32),
+        )
+
+        assert bool(result.update_applied)
+        assert bool(jnp.all(jnp.isfinite(result.state.head_traces[0][0])))
+
+    def test_per_head_zero_decay_only_skips_disabled_head_trace(self) -> None:
+        learner = MultiHeadMLPLearner(
+            n_heads=2,
+            hidden_sizes=(),
+            sparsity=0.0,
+            optimizer=LMS(0.1),
+            per_head_gamma_lamda=(0.0, 0.5),
+        )
+        state = learner.init(feature_dim=3, key=jr.key(5))
+        first_w, first_b = state.head_traces[0]
+        second_w, second_b = state.head_traces[1]
+        state = state.replace(
+            head_traces=(
+                (jnp.full_like(first_w, jnp.inf), jnp.full_like(first_b, jnp.inf)),
+                (jnp.ones_like(second_w), jnp.ones_like(second_b)),
+            )
+        )
+        observation = jnp.ones(3, dtype=jnp.float32)
+
+        result = learner.update(
+            state,
+            observation,
+            jnp.array([1.0, 0.5], dtype=jnp.float32),
+        )
+
+        assert bool(result.update_applied)
+        first_result_w, first_result_b = result.state.head_traces[0]
+        second_result_w, second_result_b = result.state.head_traces[1]
+        chex.assert_trees_all_close(first_result_w, observation.reshape(1, -1))
+        chex.assert_trees_all_close(first_result_b, jnp.ones_like(first_result_b))
+        chex.assert_trees_all_close(
+            second_result_w,
+            0.5 * jnp.ones_like(second_w) + observation.reshape(1, -1),
+        )
+        chex.assert_trees_all_close(
+            second_result_b,
+            0.5 * jnp.ones_like(second_b) + jnp.ones_like(second_b),
+        )
+
+    def test_zero_utility_decay_recovers_inf_hidden_utilities(self) -> None:
+        learner = MultiHeadMLPLearner(
+            n_heads=2,
+            hidden_sizes=(4,),
+            sparsity=0.0,
+            optimizer=LMS(0.1),
+            utility_decay=0.0,
+        )
+        state = learner.init(feature_dim=3, key=jr.key(6))
+        state = state.replace(
+            hidden_unit_utilities=tuple(
+                jnp.full_like(utility, jnp.inf)
+                for utility in state.hidden_unit_utilities
+            )
+        )
+
+        result = learner.update(
+            state,
+            jnp.ones(3, dtype=jnp.float32),
+            jnp.array([1.0, 0.5], dtype=jnp.float32),
+        )
+
+        assert bool(result.update_applied)
+        for utility in result.state.hidden_unit_utilities:
+            assert bool(jnp.all(jnp.isfinite(utility)))

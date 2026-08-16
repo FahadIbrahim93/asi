@@ -789,25 +789,25 @@ class MultiHeadMLPLearner:
         replacing = self._trace_mode == TraceMode.REPLACING
         previous_checked = state
         if self._gamma * self._lamda == 0.0:
-            previous_checked = previous_checked.replace(
+            previous_checked = previous_checked.replace(  # type: ignore[attr-defined]
                 trunk_traces=tuple(
                     jnp.zeros_like(trace) for trace in state.trunk_traces
                 ),
             )
         checked_head_traces = []
         for i, (old_w_trace, old_b_trace) in enumerate(state.head_traces):
-            head_gl = (
+            head_decay_value = (
                 self._per_head_gl[i]
                 if self._per_head_gl is not None
                 else self._gamma * self._lamda
             )
-            if head_gl == 0.0:
+            if head_decay_value == 0.0:
                 checked_head_traces.append(
                     (jnp.zeros_like(old_w_trace), jnp.zeros_like(old_b_trace))
                 )
             else:
                 checked_head_traces.append((old_w_trace, old_b_trace))
-        previous_checked = previous_checked.replace(
+        previous_checked = previous_checked.replace(  # type: ignore[attr-defined]
             head_traces=tuple(checked_head_traces),
         )
         if self._utility_decay == 0.0:
