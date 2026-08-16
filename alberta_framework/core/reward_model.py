@@ -24,6 +24,11 @@ from jax import Array
 from jaxtyping import Bool, Float
 
 
+def _skip_zero_scale(scale: Array, value: Array) -> Array:
+    """Skip ``0 * inf`` so a disabled error EMA does not poison the diagnostic."""
+    return jnp.where(scale == 0.0, jnp.zeros_like(value), scale * value)
+
+
 @dataclass(frozen=True)
 class RLSRewardModelConfig:
     """Configuration for a linear recursive-least-squares reward model.
@@ -176,7 +181,8 @@ class RLSRewardModel:
         next_abs_error_ema = jnp.where(
             state.step_count == 0,
             abs_error,
-            error_decay * state.abs_error_ema + (1.0 - error_decay) * abs_error,
+            _skip_zero_scale(error_decay, state.abs_error_ema)
+            + (1.0 - error_decay) * abs_error,
         )
         next_state = RLSRewardModelState(
             weights=next_weights,
@@ -186,10 +192,15 @@ class RLSRewardModel:
         )
         # Inf reward * a silent feature's zero gain is 0*inf = NaN, and
         # that channel stays poisoned. Hold the previous finite state.
+        checked_error_ema = (
+            jnp.zeros_like(state.abs_error_ema)
+            if self._config.error_decay == 0.0
+            else state.abs_error_ema
+        )
         source_finite = (
             jnp.all(jnp.isfinite(state.weights))
             & jnp.all(jnp.isfinite(state.covariance))
-            & jnp.isfinite(state.abs_error_ema)
+            & jnp.isfinite(checked_error_ema)
         )
         inputs_valid = jnp.all(jnp.isfinite(x)) & jnp.isfinite(jnp.squeeze(target))
         proposed_finite = (
