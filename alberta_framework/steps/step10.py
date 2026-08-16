@@ -237,8 +237,6 @@ def _validate_stomp_facade_config(config: Step10STOMPConfig) -> None:
         raise ValueError(
             f"subtask_specs must be a tuple of SubtaskSpec, got {config.subtask_specs!r}"
         )
-    if not config.subtask_specs:
-        raise ValueError("subtask_specs must contain at least one SubtaskSpec")
     canonical_specs: list[SubtaskSpec] = []
     for spec in config.subtask_specs:
         if not isinstance(spec, SubtaskSpec):

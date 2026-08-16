@@ -148,9 +148,13 @@ def test_config_feature_index_out_of_bounds_raises() -> None:
         Step10STOMPConfig(subtask_specs=(bad_spec,), observation_dim=4)
 
 
-def test_config_no_subtasks_raises() -> None:
-    with pytest.raises(ValueError, match="subtask_specs"):
-        Step10STOMPConfig(subtask_specs=())
+def test_config_without_subtasks_remains_a_serializable_template() -> None:
+    """The public default config stays constructible; execution rejects it."""
+    config = Step10STOMPConfig()
+    assert config.subtask_specs == ()
+    assert Step10STOMPConfig.from_config(config.to_config()) == config
+    with pytest.raises(ValueError, match="subtask"):
+        make_step10_stomp_agent(config)
 
 
 def test_config_invalid_option_target_epsilon_raises() -> None:
