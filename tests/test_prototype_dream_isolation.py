@@ -11,6 +11,7 @@ import jax.numpy as jnp
 import jax.random as jr
 import pytest
 
+from alberta_framework.core import multi_head_learner
 from alberta_framework.core.dreaming import DreamingConfig
 from alberta_framework.core.oak import OaKConfig
 from alberta_framework.core.options import STOMPConfig, SubtaskSpec
@@ -230,7 +231,18 @@ def test_zero_mass_sampled_prediction_cannot_update_base_learner() -> None:
     )
 
 
-def test_sample_mode_does_not_shift_legacy_anchor_or_action_streams() -> None:
+def test_sample_mode_does_not_shift_legacy_anchor_or_action_streams(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # ``PrototypeAgent.init`` casts this host-only timestamp to float32. At
+    # current epoch values, adjacent representable timestamps are 128 seconds
+    # apart, so two otherwise identical initial states can occasionally land
+    # on opposite sides of a rounding boundary.
+    monkeypatch.setattr(
+        multi_head_learner,
+        "time",
+        SimpleNamespace(time=lambda: 0.0),
+    )
     legacy_agent = PrototypeAgent(_dream_config())
     sampled_agent = PrototypeAgent(_dream_config(mode="sample_one_hot"))
     legacy_state = legacy_agent.start(
