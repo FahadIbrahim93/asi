@@ -440,9 +440,23 @@ def _validate_config(config: DualReplayConfig) -> None:
         "progress_weight",
         "aleatoric_downweight_scale",
     )
+    narrowed: dict[str, float] = {}
     for name in positive:
         if _validate_real(name, getattr(config, name)) <= 0.0:
             raise ValueError(f"{name} must be positive")
+        narrowed[name] = float(np.float32(getattr(config, name)))
+        if not math.isfinite(narrowed[name]) or narrowed[name] <= 0.0:
+            raise ValueError(f"{name} must remain positive and finite in float32 arithmetic")
+    weight_sum = float(
+        np.float32(narrowed["surprise_weight"])
+        + np.float32(narrowed["coverage_weight"])
+        + np.float32(narrowed["progress_weight"])
+    )
+    if not math.isfinite(weight_sum):
+        raise ValueError(
+            "surprise_weight, coverage_weight, and progress_weight must have a "
+            "finite float32 sum"
+        )
     threshold = _validate_real(
         "calibrated_priority_threshold", config.calibrated_priority_threshold
     )
@@ -1354,15 +1368,16 @@ class DualReplayMemory:
             jnp.clip(nearest / jnp.asarray(cfg.coverage_scale, dtype=jnp.float32), 0.0, 1.0),
             jnp.asarray(1.0, dtype=jnp.float32),
         )
-        weight_sum = jnp.asarray(
-            cfg.surprise_weight + cfg.coverage_weight + cfg.progress_weight,
-            dtype=jnp.float32,
+        surprise_weight = jnp.asarray(cfg.surprise_weight, dtype=jnp.float32)
+        coverage_weight = jnp.asarray(cfg.coverage_weight, dtype=jnp.float32)
+        progress_weight = jnp.asarray(cfg.progress_weight, dtype=jnp.float32)
+        weight_sum = surprise_weight + coverage_weight + progress_weight
+        raw_priority = jnp.clip(
+            (surprise_weight * surprise + coverage_weight * coverage + progress_weight * progress)
+            / weight_sum,
+            0.0,
+            1.0,
         )
-        raw_priority = (
-            jnp.asarray(cfg.surprise_weight, dtype=jnp.float32) * surprise
-            + jnp.asarray(cfg.coverage_weight, dtype=jnp.float32) * coverage
-            + jnp.asarray(cfg.progress_weight, dtype=jnp.float32) * progress
-        ) / weight_sum
         components_available = (
             transition.epistemic_surprise_available
             & transition.learning_progress_available

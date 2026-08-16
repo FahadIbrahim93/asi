@@ -461,6 +461,72 @@ def test_calibrated_priority_uses_surprise_coverage_and_progress_exactly() -> No
     assert bool(result.wrote_long_term)
 
 
+def test_calibrated_priority_stays_within_unit_range_for_unequal_weights() -> None:
+    memory = DualReplayMemory(
+        _config(
+            long_term_policy="calibrated",
+            surprise_scale=1.0,
+            coverage_scale=1.0,
+            progress_scale=1.0,
+            surprise_weight=0.1,
+            coverage_weight=0.2,
+            progress_weight=0.4,
+        )
+    )
+    first = memory.record(
+        memory.init(jr.key(3)),
+        _prediction(1, epistemic=1.0, aleatoric=0.1),
+        _outcome(1, progress=1.0),
+    )
+
+    assert float(first.surprise_component) == 1.0
+    assert float(first.coverage_component) == 1.0
+    assert float(first.progress_component) == 1.0
+    assert bool(first.wrote_long_term)
+    assert float(first.long_term_priority) == 1.0
+    assert bool(memory.state_valid(first.state))
+    memory.validate_state(first.state)
+
+    second = memory.record(
+        first.state,
+        _prediction(2, epistemic=0.1, aleatoric=0.1),
+        _outcome(2, progress=0.1),
+    )
+    assert bool(second.state_valid)
+    assert bool(second.wrote_short_term)
+    assert int(second.state.accepted_transition_count) == 2
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("surprise_scale", 1e-46),
+        ("coverage_scale", 1e-46),
+        ("progress_scale", 1e-46),
+        ("aleatoric_downweight_scale", 1e-46),
+        ("surprise_weight", 1e-46),
+        ("coverage_weight", 6e38),
+    ],
+)
+def test_config_rejects_calibration_scalars_that_degenerate_in_float32(
+    field: str, value: float
+) -> None:
+    with pytest.raises(ValueError, match=field):
+        DualReplayMemory(replace(_config(long_term_policy="calibrated"), **{field: value}))
+
+
+def test_config_rejects_calibration_weights_whose_float32_sum_overflows() -> None:
+    with pytest.raises(ValueError, match="finite float32 sum"):
+        DualReplayMemory(
+            _config(
+                long_term_policy="calibrated",
+                surprise_weight=2e38,
+                coverage_weight=2e38,
+                progress_weight=2e38,
+            )
+        )
+
+
 def test_calibrated_coverage_and_long_term_eviction_provenance_are_explicit() -> None:
     memory = DualReplayMemory(
         _config(
