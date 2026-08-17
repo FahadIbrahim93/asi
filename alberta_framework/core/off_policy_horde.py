@@ -323,14 +323,13 @@ class OffPolicyHordeLearner:
             trace_ratio_clip: Clip for the eligibility-trace ratio.
             min_behavior_probability: Denominator floor for probability API.
         """
-        if ratio_clip <= 0.0:
-            raise ValueError(f"ratio_clip must be positive; got {ratio_clip}")
-        if trace_ratio_clip <= 0.0:
-            raise ValueError(f"trace_ratio_clip must be positive; got {trace_ratio_clip}")
-        if min_behavior_probability <= 0.0:
-            raise ValueError(
-                f"min_behavior_probability must be positive; got {min_behavior_probability}"
-            )
+        ratio_clip = _require_float32("ratio_clip", ratio_clip, positive=True)
+        trace_ratio_clip = _require_float32(
+            "trace_ratio_clip", trace_ratio_clip, positive=True
+        )
+        min_behavior_probability = _require_float32(
+            "min_behavior_probability", min_behavior_probability, positive=True
+        )
 
         self._horde_spec = horde_spec
         self._hidden_sizes = hidden_sizes

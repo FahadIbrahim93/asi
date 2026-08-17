@@ -65,6 +65,42 @@ def test_invalid_clips_raise() -> None:
         OffPolicyHordeLearner(_spec(), min_behavior_probability=0.0)
 
 
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"ratio_clip": True}, "ratio_clip"),
+        ({"ratio_clip": False}, "ratio_clip"),
+        ({"ratio_clip": float("nan")}, "ratio_clip"),
+        ({"ratio_clip": float("inf")}, "ratio_clip"),
+        ({"trace_ratio_clip": True}, "trace_ratio_clip"),
+        ({"trace_ratio_clip": float("nan")}, "trace_ratio_clip"),
+        ({"min_behavior_probability": True}, "min_behavior_probability"),
+        ({"min_behavior_probability": float("nan")}, "min_behavior_probability"),
+    ],
+)
+def test_ratio_identities_reject_bool_and_nonfinite(
+    kwargs: dict[str, object], match: str
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        OffPolicyHordeLearner(_spec(), **kwargs)
+
+
+def test_legal_ratio_identities_stay_builtin_floats() -> None:
+    learner = OffPolicyHordeLearner(
+        _spec(),
+        hidden_sizes=(),
+        ratio_clip=2,
+        trace_ratio_clip=1.0,
+        min_behavior_probability=1e-6,
+    )
+    assert type(learner.ratio_clip) is float and learner.ratio_clip == 2.0
+    assert type(learner.trace_ratio_clip) is float and learner.trace_ratio_clip == 1.0
+    assert (
+        type(learner._min_behavior_probability) is float
+        and learner._min_behavior_probability == 1e-6
+    )
+
+
 def test_update_finite_and_shapes() -> None:
     learner = OffPolicyHordeLearner(
         _spec(),
