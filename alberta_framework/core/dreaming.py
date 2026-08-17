@@ -1046,7 +1046,10 @@ def action_features(action: Array, n_actions: int | None = None) -> Array:
     if n_actions is None:
         return jnp.ravel(jnp.asarray(action, dtype=jnp.float32))
     n_actions = _require_int("n_actions", n_actions, minimum=1)
-    action_index = jnp.squeeze(jnp.asarray(action, dtype=jnp.int32))
+    action_array = jnp.asarray(action)
+    if action_array.shape != () or not jnp.issubdtype(action_array.dtype, jnp.integer):
+        raise ValueError("discrete action must be a scalar integer array")
+    action_index = action_array.astype(jnp.int32)
     return jax.nn.one_hot(action_index, n_actions, dtype=jnp.float32)
 
 
