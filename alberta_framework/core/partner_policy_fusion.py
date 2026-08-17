@@ -482,11 +482,13 @@ class PartnerPolicyFusionResourceBudget:
     dynamic_partner_capacity: int
 
     def __post_init__(self) -> None:
+        for name in ("max_partners", "context_dim", "n_actions", "model_feature_dim"):
+            object.__setattr__(
+                self,
+                name,
+                _require_int32(name, getattr(self, name), minimum=1),
+            )
         for name in (
-            "max_partners",
-            "context_dim",
-            "n_actions",
-            "model_feature_dim",
             "trainable_float32_scalars",
             "persistent_float32_scalars",
             "persistent_int32_scalars",
@@ -513,6 +515,37 @@ class PartnerPolicyFusionResourceBudget:
                 name,
                 _require_int32(name, getattr(self, name), minimum=0),
             )
+        partners = self.max_partners
+        features = self.context_dim + 2
+        persistent_f32 = partners * features + features + 1
+        persistent_i32 = 2 * partners + 9
+        persistent_bool = 2
+        expected = {
+            "model_feature_dim": features,
+            "trainable_float32_scalars": partners * features,
+            "persistent_float32_scalars": persistent_f32,
+            "persistent_int32_scalars": persistent_i32,
+            "persistent_bool_scalars": persistent_bool,
+            "persistent_state_scalars": persistent_f32 + persistent_i32 + persistent_bool,
+            "persistent_state_bytes": 4 * (persistent_f32 + persistent_i32) + persistent_bool,
+            "max_messages_per_decision": partners,
+            "max_model_scores_per_decision": partners,
+            "partner_id_pairwise_equality_comparisons_per_decision": partners * partners,
+            "max_trainable_scalars_touched_per_feedback": features,
+            "decision_input_float32_scalars": self.context_dim + 2 + 2 * partners,
+            "decision_input_int32_scalars": 6 + 9 * partners,
+            "decision_input_bool_scalars": self.n_actions + 1 + partners,
+            "feedback_input_float32_scalars": 1,
+            "feedback_input_int32_scalars": 4,
+            "feedback_input_bool_scalars": 4,
+            "max_parameter_updates_per_feedback": 1,
+            "rng_state_bytes": 0,
+            "replay_capacity": 0,
+            "dynamic_partner_capacity": 0,
+        }
+        for name, expected_value in expected.items():
+            if getattr(self, name) != expected_value:
+                raise ValueError(f"{name} does not match the partner-fusion implementation")
 
     def to_config(self) -> dict[str, int]:
         """Return the fixed JSON-compatible resource record."""
