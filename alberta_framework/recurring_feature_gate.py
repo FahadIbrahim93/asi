@@ -165,22 +165,14 @@ class RecurringFeatureProtocol:
             total_steps=self.total_steps,
             heldout_samples=self.heldout_samples,
         )
-        object.__setattr__(
-            self,
-            "target_amplitude",
-            validated_float32_scalar("target_amplitude", self.target_amplitude, positive=True),
+        target_amplitude = validated_float32_scalar(
+            "target_amplitude", self.target_amplitude, positive=True
         )
-        object.__setattr__(
-            self,
-            "recovery_nmse_threshold",
-            validated_float32_scalar(
-                "recovery_nmse_threshold", self.recovery_nmse_threshold, positive=True
-            ),
+        recovery_nmse_threshold = validated_float32_scalar(
+            "recovery_nmse_threshold", self.recovery_nmse_threshold, positive=True
         )
-        object.__setattr__(
-            self,
-            "step_size_output",
-            validated_float32_scalar("step_size_output", self.step_size_output, lower=0.0),
+        step_size_output = validated_float32_scalar(
+            "step_size_output", self.step_size_output, lower=0.0
         )
         utility_decay = validated_float32_scalar(
             "utility_decay",
@@ -189,53 +181,31 @@ class RecurringFeatureProtocol:
             upper=1.0,
             upper_inclusive=False,
         )
-        object.__setattr__(self, "utility_decay", utility_decay)
-        object.__setattr__(
-            self,
+        retained_utility_decay = validated_float32_scalar(
             "retained_utility_decay",
-            validated_float32_scalar(
-                "retained_utility_decay",
-                self.retained_utility_decay,
+            self.retained_utility_decay,
+            lower=utility_decay,
+            upper=1.0,
+            upper_inclusive=False,
+        )
+        promotion_margin = validated_float32_scalar(
+            "promotion_margin", self.promotion_margin, positive=True
+        )
+        promotion_blend = validated_float32_scalar(
+            "promotion_blend", self.promotion_blend, lower=0.0, upper=1.0
+        )
+        future_utility_mix = validated_float32_scalar(
+            "future_utility_mix", self.future_utility_mix, lower=0.0, upper=1.0
+        )
+        obgd_kappa = validated_float32_scalar("obgd_kappa", self.obgd_kappa, positive=True)
+        candidate_utility_retention_decay = None
+        if self.candidate_utility_retention_decay is not None:
+            candidate_utility_retention_decay = validated_float32_scalar(
+                "candidate_utility_retention_decay",
+                self.candidate_utility_retention_decay,
                 lower=utility_decay,
                 upper=1.0,
                 upper_inclusive=False,
-            ),
-        )
-        object.__setattr__(
-            self,
-            "promotion_margin",
-            validated_float32_scalar("promotion_margin", self.promotion_margin, positive=True),
-        )
-        object.__setattr__(
-            self,
-            "promotion_blend",
-            validated_float32_scalar(
-                "promotion_blend", self.promotion_blend, lower=0.0, upper=1.0
-            ),
-        )
-        object.__setattr__(
-            self,
-            "future_utility_mix",
-            validated_float32_scalar(
-                "future_utility_mix", self.future_utility_mix, lower=0.0, upper=1.0
-            ),
-        )
-        object.__setattr__(
-            self,
-            "obgd_kappa",
-            validated_float32_scalar("obgd_kappa", self.obgd_kappa, positive=True),
-        )
-        if self.candidate_utility_retention_decay is not None:
-            object.__setattr__(
-                self,
-                "candidate_utility_retention_decay",
-                validated_float32_scalar(
-                    "candidate_utility_retention_decay",
-                    self.candidate_utility_retention_decay,
-                    lower=utility_decay,
-                    upper=1.0,
-                    upper_inclusive=False,
-                ),
             )
         if self.candidate_strategy != "all_pairs":
             raise ValueError("candidate_strategy must be 'all_pairs'")
@@ -246,6 +216,20 @@ class RecurringFeatureProtocol:
         _require_exact_bool("refresh_candidates", self.refresh_candidates)
         _require_exact_bool("refresh_promoted_candidate", self.refresh_promoted_candidate)
         _require_exact_bool("use_obgd", self.use_obgd)
+        canonical = {
+            "target_amplitude": target_amplitude,
+            "recovery_nmse_threshold": recovery_nmse_threshold,
+            "step_size_output": step_size_output,
+            "utility_decay": utility_decay,
+            "retained_utility_decay": retained_utility_decay,
+            "promotion_margin": promotion_margin,
+            "promotion_blend": promotion_blend,
+            "future_utility_mix": future_utility_mix,
+            "obgd_kappa": obgd_kappa,
+            "candidate_utility_retention_decay": candidate_utility_retention_decay,
+        }
+        for field, value in canonical.items():
+            object.__setattr__(self, field, value)
 
 
 @dataclass(frozen=True, slots=True)
@@ -423,70 +407,64 @@ class RecurringFeatureGateCriteria:
     minimum_critical_nmse_gain_over_baseline: float = 0.5
     require_recurrence_faster_than_acquisition: bool = True
 
+    def __post_init__(self) -> None:
+        """Validate and canonicalize the immutable criteria at construction."""
+        self.validate()
+
     def validate(self) -> None:
         """Reject boolean or non-finite criteria before comparing evidence."""
         _require_builtin_int("minimum_seeds", self.minimum_seeds, minimum=1)
         _require_builtin_int(
             "minimum_heldout_samples", self.minimum_heldout_samples, minimum=1
         )
-        object.__setattr__(
-            self,
+        minimum_retained_all_critical_rate = validated_float32_scalar(
             "minimum_retained_all_critical_rate",
-            validated_float32_scalar(
-                "minimum_retained_all_critical_rate",
-                self.minimum_retained_all_critical_rate,
-                lower=0.0,
-                upper=1.0,
-            ),
+            self.minimum_retained_all_critical_rate,
+            lower=0.0,
+            upper=1.0,
         )
-        object.__setattr__(
-            self,
+        minimum_obsolete_eviction_rate = validated_float32_scalar(
             "minimum_obsolete_eviction_rate",
-            validated_float32_scalar(
-                "minimum_obsolete_eviction_rate",
-                self.minimum_obsolete_eviction_rate,
-                lower=0.0,
-                upper=1.0,
-            ),
+            self.minimum_obsolete_eviction_rate,
+            lower=0.0,
+            upper=1.0,
         )
-        object.__setattr__(
-            self,
+        maximum_median_critical_nmse = validated_float32_scalar(
             "maximum_median_critical_nmse",
-            validated_float32_scalar(
-                "maximum_median_critical_nmse",
-                self.maximum_median_critical_nmse,
-                lower=0.0,
-            ),
+            self.maximum_median_critical_nmse,
+            lower=0.0,
         )
-        object.__setattr__(
-            self,
+        minimum_median_obsolete_nmse = validated_float32_scalar(
             "minimum_median_obsolete_nmse",
-            validated_float32_scalar(
-                "minimum_median_obsolete_nmse",
-                self.minimum_median_obsolete_nmse,
-                lower=0.0,
-            ),
+            self.minimum_median_obsolete_nmse,
+            lower=0.0,
         )
-        object.__setattr__(
-            self,
+        minimum_retention_rate_gain_over_baseline = validated_float32_scalar(
             "minimum_retention_rate_gain_over_baseline",
-            validated_float32_scalar(
-                "minimum_retention_rate_gain_over_baseline",
-                self.minimum_retention_rate_gain_over_baseline,
-            ),
+            self.minimum_retention_rate_gain_over_baseline,
         )
-        object.__setattr__(
-            self,
+        minimum_critical_nmse_gain_over_baseline = validated_float32_scalar(
             "minimum_critical_nmse_gain_over_baseline",
-            validated_float32_scalar(
-                "minimum_critical_nmse_gain_over_baseline",
-                self.minimum_critical_nmse_gain_over_baseline,
-            ),
+            self.minimum_critical_nmse_gain_over_baseline,
         )
         _require_exact_bool(
             "require_recurrence_faster_than_acquisition",
             self.require_recurrence_faster_than_acquisition,
         )
+        canonical = {
+            "minimum_retained_all_critical_rate": minimum_retained_all_critical_rate,
+            "minimum_obsolete_eviction_rate": minimum_obsolete_eviction_rate,
+            "maximum_median_critical_nmse": maximum_median_critical_nmse,
+            "minimum_median_obsolete_nmse": minimum_median_obsolete_nmse,
+            "minimum_retention_rate_gain_over_baseline": (
+                minimum_retention_rate_gain_over_baseline
+            ),
+            "minimum_critical_nmse_gain_over_baseline": (
+                minimum_critical_nmse_gain_over_baseline
+            ),
+        }
+        for field, value in canonical.items():
+            object.__setattr__(self, field, value)
 
 
 class RecurringFeatureGateError(AssertionError):

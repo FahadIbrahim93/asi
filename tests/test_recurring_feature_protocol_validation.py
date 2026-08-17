@@ -33,6 +33,29 @@ def test_canonical_protocol_and_criteria_remain_legal() -> None:
     protocol.validate()
 
 
+def test_failed_protocol_validation_does_not_partially_mutate_frozen_config() -> None:
+    protocol = replace(
+        RecurringFeatureProtocol(),
+        target_amplitude=np.float64(1.0),
+        candidate_strategy="unsupported",
+    )
+
+    with pytest.raises(ValueError, match="candidate_strategy"):
+        protocol.validate()
+
+    assert type(protocol.target_amplitude) is np.float64
+
+
+def test_criteria_validate_and_canonicalize_at_construction() -> None:
+    with pytest.raises(ValueError, match="minimum_seeds"):
+        RecurringFeatureGateCriteria(minimum_seeds=False)
+
+    criteria = RecurringFeatureGateCriteria(
+        minimum_retained_all_critical_rate=np.float64(0.5)
+    )
+    assert type(criteria.minimum_retained_all_critical_rate) is float
+
+
 @pytest.mark.parametrize(
     "field",
     [
