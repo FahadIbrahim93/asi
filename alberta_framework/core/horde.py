@@ -271,8 +271,13 @@ class HordeLearner:
         self._utility_decay = utility_decay
 
         # Compute per-head gamma*lambda products
+        # The per-demon product of two legal float32 probabilities can
+        # underflow the float32 sink; flush it through float32 here so the
+        # learner's exact-nonzero guard sees the value that will actually
+        # be used (0.0 trace decay), not an unrepresentable exact product.
         per_head_gl = tuple(
-            float(d.gamma * d.lamda) for d in horde_spec.demons
+            float(np.float32(d.gamma) * np.float32(d.lamda))
+            for d in horde_spec.demons
         )
 
         self._learner = MultiHeadMLPLearner(

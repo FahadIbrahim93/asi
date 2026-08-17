@@ -108,7 +108,6 @@ def _validated_nonnegative_float32_scalar(
     *,
     upper: float | None = None,
     upper_inclusive: bool = True,
-    allow_underflow_to_zero: bool = False,
 ) -> float:
     """Validate a nonnegative float32 sink without erasing a nonzero."""
     stored, numerator, denominator = validated_float32_scalar_with_ratio(
@@ -119,8 +118,7 @@ def _validated_nonnegative_float32_scalar(
         upper_inclusive=upper_inclusive,
     )
     if (
-        not allow_underflow_to_zero
-        and numerator != 0
+        numerator != 0
         and numerator * _FLOAT32_HALF_MIN_SUBNORMAL_DENOMINATOR <= denominator
     ):
         raise ValueError(f"{name} must remain nonzero once narrowed to float32")
@@ -572,10 +570,6 @@ class MultiHeadMLPLearner:
                     f"per_head_gamma_lamda[{head_index}]",
                     gl,
                     upper=1.0,
-                    # A product of two legal minimum-normal probabilities
-                    # underflows to 0.0 in float32; zero trace decay is a
-                    # valid configuration, not an erased value.
-                    allow_underflow_to_zero=True,
                 )
                 for head_index, gl in enumerate(per_head_gamma_lamda)
             )
