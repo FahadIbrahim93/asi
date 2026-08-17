@@ -480,3 +480,31 @@ def test_external_adoption_resource_budget_is_zero_recompute_and_zero_growth() -
     assert budget.source_result_integrity_checked is True
     assert budget.caller_authority_required is True
     assert budget.caller_authenticated is False
+
+
+@pytest.mark.parametrize("alias", [1, 0, np.bool_(True), "true"])
+def test_update_rejects_non_bool_enable_option_planning(alias: object) -> None:
+    """Planning is a host-boundary switch; numeric aliases must not enable it."""
+    agent = OaKAgent(_config(planning_backups=1))
+    observation = jnp.asarray([0.2, -0.4], dtype=jnp.float32)
+    state = agent.start(agent.init(jr.key(7)), observation)
+    reward = jnp.asarray(0.3, dtype=jnp.float32)
+    next_observation = jnp.asarray([-0.1, 0.8], dtype=jnp.float32)
+    discount = jnp.asarray(0.9, dtype=jnp.float32)
+
+    with pytest.raises(ValueError, match="enable_option_planning must be an actual bool"):
+        agent.update(
+            state,
+            reward,
+            next_observation,
+            discount,
+            enable_option_planning=alias,  # type: ignore[arg-type]
+        )
+    with pytest.raises(ValueError, match="enable_option_planning must be an actual bool"):
+        agent.update_with_stomp_trace(
+            state,
+            reward,
+            next_observation,
+            discount,
+            enable_option_planning=alias,  # type: ignore[arg-type]
+        )

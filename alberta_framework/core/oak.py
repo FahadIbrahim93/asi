@@ -115,6 +115,12 @@ def _require_uint64(
     return canonical
 
 
+def _require_exact_bool(name: str, value: object) -> bool:
+    if type(value) is not bool:
+        raise ValueError(f"{name} must be an actual bool")
+    return value
+
+
 # ---------------------------------------------------------------------------
 # Default config helper
 # ---------------------------------------------------------------------------
@@ -1676,6 +1682,9 @@ class OaKAgent:
     ) -> OaKTracedUpdateResult:
         """Evaluate STOMP exactly once and return its transient adoption trace."""
 
+        enable_option_planning = _require_exact_bool(
+            "enable_option_planning", enable_option_planning
+        )
         stomp_result: STOMPUpdateResult = self._stomp.update(
             state.stomp_state,
             env_reward,
