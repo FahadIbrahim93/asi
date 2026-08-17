@@ -853,6 +853,8 @@ def run_ipmnist(
         Host-side result arrays; see :class:`IPMNISTRunResult`.
     """
     seed_tuple = require_unique_jax_seeds(seeds, name="seeds")
+    if progress_every is not None:
+        progress_every = _require_int32("progress_every", progress_every)
     if config is None:
         config = IPMNISTConfig()
     if noise_mode not in ("step", "pool"):

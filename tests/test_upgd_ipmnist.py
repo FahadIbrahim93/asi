@@ -356,6 +356,26 @@ class TestInputDomain:
         with pytest.raises(ValueError, match=message):
             run_ipmnist(x, y, "adamw", seeds=[0], config=TINY)
 
+    @pytest.mark.parametrize("progress_every", [0, -1, True, 1.5])
+    def test_run_rejects_invalid_progress_interval_before_setup(
+        self, monkeypatch: pytest.MonkeyPatch, progress_every: object
+    ) -> None:
+        def unexpected_setup(*args: object, **kwargs: object) -> None:
+            del args, kwargs
+            raise AssertionError("invalid progress interval reached learner setup")
+
+        x, y = _synthetic_dataset(0, N_TRAIN, TINY.input_dim, TINY.n_classes)
+        monkeypatch.setattr(upgd_ipmnist, "resolve_hyperparameters", unexpected_setup)
+        with pytest.raises(ValueError, match="progress_every"):
+            run_ipmnist(
+                x,
+                y,
+                "adamw",
+                seeds=[0],
+                config=TINY,
+                progress_every=progress_every,  # type: ignore[arg-type]
+            )
+
 
 @pytest.mark.unit
 class TestInputDomainBoundary:
