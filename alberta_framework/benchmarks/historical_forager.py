@@ -872,6 +872,24 @@ class HistoricalForagerRunResult:
     runtime: Mapping[str, Any]
     kernel: Mapping[str, Any]
 
+    def __post_init__(self) -> None:
+        if isinstance(self.seed, bool) or not isinstance(self.seed, int):
+            raise HistoricalForagerContractError("seed must be an integer")
+        if not 0 <= self.seed <= _MAX_SEED:
+            raise HistoricalForagerContractError(f"seed must lie in [0, {_MAX_SEED}]")
+        if isinstance(self.steps, bool) or not isinstance(self.steps, int):
+            raise HistoricalForagerContractError("steps must be an integer")
+        if not 1 <= self.steps <= _MAX_STEPS:
+            raise HistoricalForagerContractError(f"steps must lie in [1, {_MAX_STEPS}]")
+        if (
+            isinstance(self.aperture_size, bool)
+            or not isinstance(self.aperture_size, int)
+            or self.aperture_size not in range(1, 16, 2)
+        ):
+            raise HistoricalForagerContractError(
+                "aperture_size must be one of 1, 3, 5, 7, 9, 11, 13, 15"
+            )
+
     def to_dict(self) -> dict[str, Any]:
         """Return the canonical manifest payload."""
         provenance = historical_forager_provenance()
