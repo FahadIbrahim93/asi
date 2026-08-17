@@ -326,6 +326,25 @@ def test_lifetime_counters_saturate_without_wraparound() -> None:
     assert int(still_saturated.invalid_count) == 1
 
 
+@pytest.mark.parametrize(
+    ("field", "value", "expected_dtype"),
+    [
+        ("step_count", jnp.asarray(0, dtype=jnp.int16), "int32"),
+        ("calibration_mean", jnp.asarray(0.0, dtype=jnp.float16), "float32"),
+    ],
+)
+def test_learning_signal_state_rejects_noncanonical_dtypes(
+    field: str,
+    value: jax.Array,
+    expected_dtype: str,
+) -> None:
+    estimator = _estimator()
+    state = replace(estimator.init(), **{field: value})
+
+    with pytest.raises(ValueError, match=rf"state\.{field} must have dtype {expected_dtype}"):
+        _observe_scalar(estimator, state)
+
+
 def test_shape_and_dtype_validation_is_strict() -> None:
     estimator = _estimator()
     state = estimator.init()
