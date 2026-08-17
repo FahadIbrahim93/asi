@@ -93,6 +93,7 @@ from alberta_framework.benchmarks.ipmnist_screening import (
     warm_restart_normalize,
 )
 from alberta_framework.benchmarks.upgd_ipmnist import (
+    ADAMW_PROTOCOL_HYPERPARAMETERS,
     UPGD_W_PROTOCOL_HYPERPARAMETERS,
     IPMNISTConfig,
     LeanUPGDState,
@@ -1927,7 +1928,10 @@ class TestShardsAndMerge:
         tamper_cases = [
             (
                 "learner",
-                lambda payload: payload.update(learner="adamw"),
+                lambda payload: payload.update(
+                    learner="adamw",
+                    hyperparameters=dict(ADAMW_PROTOCOL_HYPERPARAMETERS),
+                ),
                 "does not match expected learner",
             ),
             (
