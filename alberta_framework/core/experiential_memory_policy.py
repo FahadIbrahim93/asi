@@ -19,12 +19,14 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import operator
 from collections.abc import Mapping
-from typing import Any, cast
+from typing import Any, SupportsIndex, cast
 
 import chex
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import Array
 from jaxtyping import Bool, Float, Int
 
@@ -41,6 +43,44 @@ _POLICY_TYPE = "ExperientialMemoryPolicy"
 _ACTION_SEMANTICS = "categorical-score-mass-not-action-identifiers"
 _SELECTION_SEMANTICS = "lowest-index-argmax-over-safe-positive-mass"
 _FLOAT32_MAX = 3.4028234663852886e38
+_INT32_MAX = 2_147_483_647
+_UINT32_MAX = 4_294_967_295
+_ACTUAL_INT_TYPES: tuple[type, ...] = (
+    int,
+    np.int8,
+    np.int16,
+    np.int32,
+    np.int64,
+    np.uint8,
+    np.uint16,
+    np.uint32,
+    np.uint64,
+    np.longlong,
+    np.ulonglong,
+)
+
+
+def _copy_mapping(payload: object, *, name: str) -> dict[str, Any]:
+    if not issubclass(type(payload), Mapping):
+        raise ValueError(f"{name} must be a mapping")
+    try:
+        values = dict(cast(Mapping[str, Any], payload))
+    except Exception as error:
+        raise ValueError(f"{name} must be a readable mapping") from error
+    if any(type(key) is not str for key in values):
+        raise ValueError(f"{name} keys must be exact strings")
+    return values
+
+
+def _require_int(name: str, value: object, *, minimum: int, maximum: int = _INT32_MAX) -> int:
+    if type(value) not in _ACTUAL_INT_TYPES:
+        raise ValueError(f"{name} must be an integer")
+    number = operator.index(cast(SupportsIndex, value))
+    if number < minimum:
+        raise ValueError(f"{name} must be >= {minimum}")
+    if number > maximum:
+        raise ValueError(f"{name} must be <= {maximum}")
+    return number
 
 
 def _require_array(
@@ -108,8 +148,8 @@ class ExperientialMemoryPolicy:
     """Stateless categorical proposal boundary over a real bounded memory."""
 
     def __init__(self, memory: ExperientialMemory):
-        if not isinstance(memory, ExperientialMemory):
-            raise TypeError("memory must be ExperientialMemory")
+        if type(memory) is not ExperientialMemory:
+            raise TypeError("memory must be an exact ExperientialMemory")
         self._memory = memory
 
     @property
@@ -132,8 +172,9 @@ class ExperientialMemoryPolicy:
         }
 
     @classmethod
-    def from_config(cls, config: Mapping[str, object]) -> ExperientialMemoryPolicy:
+    def from_config(cls, payload: object) -> ExperientialMemoryPolicy:
         """Strictly reconstruct the policy and reject semantic drift."""
+        config = _copy_mapping(payload, name="experiential memory policy config")
         expected = {
             "schema",
             "type",
@@ -165,13 +206,8 @@ class ExperientialMemoryPolicy:
                     raise ValueError("experiential-memory policy cannot claim confidence")
                 raise ValueError(f"experiential-memory policy {name} is invalid")
         memory_payload = config.get("memory")
-        if not isinstance(memory_payload, Mapping) or any(
-            type(key) is not str for key in memory_payload
-        ):
-            raise ValueError("experiential-memory policy memory must be an object")
-        memory = ExperientialMemory.from_config(
-            cast(dict[str, Any], dict(memory_payload))
-        )
+        memory_values = _copy_mapping(memory_payload, name="experiential memory config")
+        memory = ExperientialMemory.from_config(memory_values)
         result = cls(memory)
         if result.to_config() != dict(config):
             raise ValueError("experiential-memory policy config is noncanonical")
@@ -179,7 +215,12 @@ class ExperientialMemoryPolicy:
 
     def resource_declaration(self) -> ExperientialMemoryPolicyResourceDeclaration:
         """Declare exact owned state and maximum logical work per proposal."""
-        n_actions = self._memory.config.action_dim
+        n_actions = _require_int(
+            "memory.config.action_dim",
+            self._memory.config.action_dim,
+            minimum=1,
+            maximum=_INT32_MAX,
+        )
         return ExperientialMemoryPolicyResourceDeclaration(
             n_actions=n_actions,
             owned_trainable_float32_scalars=0,
