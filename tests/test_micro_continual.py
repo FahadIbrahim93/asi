@@ -1142,6 +1142,26 @@ class TestShards:
         with pytest.raises(ValueError, match="hyperparameters"):
             load_micro_shard(path)
 
+    @pytest.mark.parametrize(
+        ("fieldname", "value"),
+        [
+            ("mechanism", "forged-mechanism"),
+            ("hyperparameters", {"step_size": 999.0, "weight_decay": 0.0}),
+        ],
+    )
+    def test_load_rejects_registered_arm_contract_mismatch(
+        self, tmp_path: Path, fieldname: str, value: object
+    ) -> None:
+        payload = micro_shard_payload(self._result())
+        payload[fieldname] = value
+        path = self._write_payload(tmp_path, payload)
+
+        verb = "does" if fieldname == "mechanism" else "do"
+        with pytest.raises(
+            ValueError, match=rf"{fieldname} {verb} not match registered arm"
+        ):
+            load_micro_shard(path)
+
     def test_payload_roundtrip(self, tmp_path: Path):
         result = self._result()
         payload = micro_shard_payload(result)
@@ -1499,7 +1519,7 @@ class TestShards:
 
         with pytest.raises(
             ValueError,
-            match=rf"arm 'sgd_raw' has inconsistent {fieldname} across seeds",
+            match=rf"{fieldname} (does|do) not match registered arm 'sgd_raw'",
         ):
             merge_micro_shards([path_a, path_b], bayes_samples=1_000)
 
@@ -1677,7 +1697,7 @@ class TestTransferValidation:
 
         with pytest.raises(
             ValueError,
-            match="arm 'sgd_raw' has inconsistent mechanism across seeds",
+            match="mechanism does not match registered arm 'sgd_raw'",
         ):
             transfer_validation_from_shards([*paths, drifted_path])
 
