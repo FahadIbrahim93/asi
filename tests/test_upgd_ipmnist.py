@@ -1046,6 +1046,16 @@ class TestPartialMerge:
         with pytest.raises(ValueError, match="invalid hyperparameters"):
             merge_partial_results([path])
 
+    def test_merge_rejects_integer_alias_of_float_hyperparameter(self, tmp_path) -> None:
+        data_x, data_y = _synthetic_dataset(6, N_TRAIN, TINY.input_dim, TINY.n_classes)
+        shard = run_ipmnist(data_x, data_y, "adamw", seeds=(0,), config=TINY)
+        payload = partial_payload(shard)
+        payload["hyperparameters"]["beta1"] = 0
+        path = tmp_path / "integer-beta1.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        with pytest.raises(ValueError, match="complete learner configuration"):
+            merge_partial_results([path])
+
     def test_v2_partial_is_single_seed_and_recursively_omits_legacy_marker(
         self, tmp_path, debug_run
     ):

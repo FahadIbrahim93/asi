@@ -1436,7 +1436,13 @@ def _validated_partial_payload(
         )
     except ValueError as exc:
         raise ValueError(f"{path}: invalid hyperparameters: {exc}") from exc
-    if dict(hyperparameters) != resolved_hyperparameters:
+    serialized_hyperparameters = json.dumps(
+        dict(hyperparameters), allow_nan=False, separators=(",", ":"), sort_keys=True
+    )
+    serialized_resolved = json.dumps(
+        resolved_hyperparameters, allow_nan=False, separators=(",", ":"), sort_keys=True
+    )
+    if serialized_hyperparameters != serialized_resolved:
         raise ValueError(
             f"{path}: hyperparameters must contain the complete learner configuration"
         )

@@ -18,6 +18,7 @@ References:
 import math
 from dataclasses import dataclass
 from numbers import Real
+from typing import cast
 
 import numpy as np
 from numpy.typing import NDArray
@@ -38,9 +39,13 @@ def _require_positive_builtin_int(name: str, value: object) -> int:
 
 
 def _require_finite_real(name: str, value: object) -> float:
-    if _is_bool(value) or not isinstance(value, Real):
+    actual_type = type(value)
+    if issubclass(actual_type, bool) or not issubclass(actual_type, Real):
         raise ValueError(f"{name} must be a finite real number")
-    number = float(value)
+    try:
+        number = float(cast(Real, value))
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a finite real number") from exc
     if not math.isfinite(number):
         raise ValueError(f"{name} must be a finite real number")
     return number
@@ -336,7 +341,7 @@ def compute_recovery_lengths(
     values = np.asarray(online_performance, dtype=np.float64)
     points = _require_index_vector(change_points, name="change_points")
     window_size = _require_positive_builtin_int("window_size", window_size)
-    _require_finite_real("threshold", threshold)
+    threshold_value = _require_finite_real("threshold", threshold)
     if values.ndim != 1 or values.size == 0:
         raise ValueError("online_performance must be a non-empty one-dimensional trace")
     if points.ndim != 1 or points.size == 0:
@@ -352,7 +357,9 @@ def compute_recovery_lengths(
         for window_start in range(int(start), int(stop) - window_size + 1):
             window = values[window_start : window_start + window_size]
             meets = np.all(np.isfinite(window)) and (
-                np.all(window >= threshold) if higher_is_better else np.all(window <= threshold)
+                np.all(window >= threshold_value)
+                if higher_is_better
+                else np.all(window <= threshold_value)
             )
             if meets:
                 recoveries[point_index] = (

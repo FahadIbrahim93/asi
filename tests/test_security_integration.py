@@ -3,6 +3,7 @@
 import json
 import math
 
+import numpy as np
 import pytest
 
 from alberta_framework import (
@@ -49,6 +50,19 @@ def test_coerce_security_action_rejects_noncanonical_actions(action: object) -> 
         coerce_security_action(action)  # type: ignore[arg-type]
 
 
+def test_coerce_security_action_rejects_class_spoof() -> None:
+    class ActionSpoof:
+        @property
+        def __class__(self) -> type:  # type: ignore[override]
+            return SecurityAction
+
+        def __int__(self) -> int:
+            return int(SecurityAction.ALERT)
+
+    with pytest.raises(ValueError, match="security action"):
+        coerce_security_action(ActionSpoof())  # type: ignore[arg-type]
+
+
 def test_to_security_gym_action_rejects_boolean_and_nonfinite_risk() -> None:
     with pytest.raises(ValueError, match="risk_score"):
         to_security_gym_action("pass", risk_score=True)
@@ -56,6 +70,8 @@ def test_to_security_gym_action_rejects_boolean_and_nonfinite_risk() -> None:
         to_security_gym_action("pass", risk_score=float("nan"))
     with pytest.raises(ValueError, match="risk_score"):
         to_security_gym_action("pass", risk_score=float("inf"))
+    with pytest.raises(ValueError, match="risk_score"):
+        to_security_gym_action("pass", risk_score="5.5")  # type: ignore[arg-type]
 
 
 def test_security_gym_action_adapter_matches_sibling_contract() -> None:
@@ -68,6 +84,10 @@ def test_security_gym_action_adapter_matches_sibling_contract() -> None:
         "isolate",
     )
     assert security_gym_action_name(SecurityAction.BLOCK) == "block_source"
+    assert to_security_gym_action("alert", risk_score=np.float64(5.5)) == {
+        "action": 1,
+        "risk_score": (5.5,),
+    }
     assert to_security_gym_action("block_source", risk_score=11.0) == {
         "action": 3,
         "risk_score": (10.0,),

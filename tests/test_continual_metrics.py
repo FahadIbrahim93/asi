@@ -329,7 +329,7 @@ def test_nested_numpy_boolean_trace_is_rejected() -> None:
         compute_prequential_performance([np.array(True), np.array(False)])
 
 
-@pytest.mark.parametrize("threshold", [True, False, float("nan"), float("inf")])
+@pytest.mark.parametrize("threshold", [True, False, float("nan"), float("inf"), "0.8"])
 def test_recovery_rejects_boolean_or_nonfinite_threshold(threshold: object) -> None:
     with pytest.raises(ValueError, match="threshold"):
         compute_recovery_lengths(
