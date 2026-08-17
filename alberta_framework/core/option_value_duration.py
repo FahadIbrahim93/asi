@@ -29,6 +29,7 @@ import dataclasses
 import functools
 import operator
 import time
+from collections.abc import Mapping
 from typing import Any, SupportsIndex, cast
 
 import chex
@@ -48,8 +49,6 @@ _MAX_PERSISTENT_STATE_BYTES = 256 * 1024 * 1024
 _ACTUAL_INT_TYPES = frozenset(
     {int, *(np.dtype(code).type for code in ("b", "B", "h", "H", "i", "I", "l", "L", "q", "Q"))}
 )
-
-
 def _require_int32(name: str, value: object, *, minimum: int = 1) -> int:
     """Canonicalize one concrete Python/NumPy integer without invoking hooks."""
     if type(value) not in _ACTUAL_INT_TYPES:
@@ -160,28 +159,21 @@ class OptionValueDurationConfig:
         }
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> OptionValueDurationConfig:
+    def from_config(cls, config: Mapping[str, Any]) -> OptionValueDurationConfig:
         """Reconstruct a config from :meth:`to_config` output."""
-        if type(config) is not dict:
-            raise ValueError("option-duration config must be an exact dictionary")
-        payload = dict(config)
+        if not issubclass(type(config), Mapping):
+            raise ValueError("config must be a mapping")
+        try:
+            payload = dict(config)
+        except Exception as error:
+            raise ValueError("config must be a readable mapping") from error
         if any(type(key) is not str for key in payload):
-            raise ValueError("option-duration config keys must be exact strings")
-        expected = {
-            "type",
-            "reward_step_size",
-            "duration_step_size",
-            "duration_floor",
-        }
-        if set(payload) != expected:
-            raise ValueError("option-duration config keys are not the exact schema")
-        marker = payload.pop("type")
-        if type(marker) is not str or marker != "OptionValueDurationConfig":
-            raise ValueError("option-duration config type is unsupported")
-        for name, value in payload.items():
-            if type(value) is not float:
-                raise ValueError(f"serialized {name} must be an exact JSON float")
-        return cls(**payload)
+            raise ValueError("config keys must be strings")
+        payload.pop("type", None)
+        try:
+            return cls(**payload)
+        except TypeError as error:
+            raise ValueError("config has unsupported fields") from error
 
 
 @chex.dataclass(frozen=True)
@@ -289,26 +281,24 @@ class OptionValueDurationLearner:
         }
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> OptionValueDurationLearner:
+    def from_config(cls, config: Mapping[str, Any]) -> OptionValueDurationLearner:
         """Reconstruct a learner from :meth:`to_config` output."""
-        if type(config) is not dict:
-            raise ValueError("option-duration learner config must be an exact dictionary")
-        payload = dict(config)
+        if not issubclass(type(config), Mapping):
+            raise ValueError("config must be a mapping")
+        try:
+            payload = dict(config)
+        except Exception as error:
+            raise ValueError("config must be a readable mapping") from error
         if any(type(key) is not str for key in payload):
-            raise ValueError("option-duration learner config keys must be exact strings")
-        if set(payload) != {"type", "n_options", "config"}:
-            raise ValueError("option-duration learner config keys are not the exact schema")
-        marker = payload.pop("type")
-        if type(marker) is not str or marker != "OptionValueDurationLearner":
-            raise ValueError("option-duration learner config type is unsupported")
-        if type(payload["n_options"]) is not int:
-            raise ValueError("serialized n_options must be an exact JSON integer")
-        if type(payload["config"]) is not dict:
-            raise ValueError("serialized config must be an exact JSON object")
-        return cls(
-            n_options=payload["n_options"],
-            config=OptionValueDurationConfig.from_config(payload["config"]),
-        )
+            raise ValueError("config keys must be strings")
+        payload.pop("type", None)
+        try:
+            return cls(
+                n_options=payload["n_options"],
+                config=OptionValueDurationConfig.from_config(payload["config"]),
+            )
+        except (KeyError, TypeError) as error:
+            raise ValueError("config has missing or unsupported fields") from error
 
     def trainable_parameter_count(self, feature_dim: int) -> int:
         """Return the exact history-independent trainable parameter count."""
