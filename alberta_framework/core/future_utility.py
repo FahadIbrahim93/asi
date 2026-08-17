@@ -8,14 +8,25 @@ current residual.
 """
 
 import math
+from fractions import Fraction
 from numbers import Real
-from typing import NamedTuple
+from typing import NamedTuple, cast
 
 import jax.numpy as jnp
+import numpy as np
 from jax import Array
 from jaxtyping import Bool, Float
 
 from alberta_framework._float32 import round_real_to_float32
+
+_ACTUAL_DECAY_TYPES = frozenset(
+    {
+        int,
+        float,
+        Fraction,
+        *(np.dtype(code).type for code in "bBhHiIlLqQpefdg"),
+    }
+)
 
 
 def _skip_zero_scale(scale: Array, value: Array) -> Array:
@@ -26,10 +37,10 @@ def _skip_zero_scale(scale: Array, value: Array) -> Array:
 def canonical_float32_ema_decay(name: str, value: object) -> float:
     """Validate and canonicalize an EMA decay at its float32 execution sink."""
     message = f"{name} must narrow to a finite float32 in [0, 1)"
-    if isinstance(value, bool) or not isinstance(value, Real):
+    if type(value) not in _ACTUAL_DECAY_TYPES:
         raise ValueError(message)
     try:
-        narrowed = round_real_to_float32(value)
+        narrowed = round_real_to_float32(cast(Real, value))
     except (OverflowError, TypeError, ValueError) as error:
         raise ValueError(message) from error
     if not math.isfinite(narrowed) or not 0.0 <= narrowed < 1.0:

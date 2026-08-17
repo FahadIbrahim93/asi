@@ -283,6 +283,67 @@ def test_compositional_ema_and_age_correction_share_float32_decay() -> None:
     assert near_one.to_config()["utility_decay"] == 0.9999999
 
 
+def test_utility_decay_serialization_preserves_builtin_and_canonicalizes_numpy() -> None:
+    fixed = FixedBudgetFeatureLearner(
+        n_features=2,
+        n_tasks=1,
+        utility_decay=0.9,
+        utility_retention_decay=0.95,
+    )
+    compositional = CompositionalFeatureLearner(
+        n_features=3,
+        n_tasks=1,
+        utility_decay=0.9,
+        retention_slow_utility_decay=0.95,
+    )
+    assert fixed.to_config()["utility_decay"] == 0.9
+    assert fixed.to_config()["utility_retention_decay"] == 0.95
+    assert compositional.to_config()["utility_decay"] == 0.9
+    assert compositional.to_config()["retention_slow_utility_decay"] == 0.95
+
+    numpy_fixed = FixedBudgetFeatureLearner(
+        n_features=2,
+        n_tasks=1,
+        utility_decay=np.float64(0.9),
+        utility_retention_decay=np.float64(0.95),
+    )
+    numpy_compositional = CompositionalFeatureLearner(
+        n_features=3,
+        n_tasks=1,
+        utility_decay=np.float64(0.9),
+        retention_slow_utility_decay=np.float64(0.95),
+    )
+    assert numpy_fixed.to_config()["utility_decay"] == float(np.float32(0.9))
+    assert numpy_fixed.to_config()["utility_retention_decay"] == float(np.float32(0.95))
+    assert numpy_compositional.to_config()["utility_decay"] == float(np.float32(0.9))
+    assert numpy_compositional.to_config()["retention_slow_utility_decay"] == float(
+        np.float32(0.95)
+    )
+
+
+def test_utility_decay_rejects_hostile_float_subclasses_before_ratio_hook() -> None:
+    class HostileFloat(float):
+        calls = 0
+
+        def as_integer_ratio(self) -> tuple[int, int]:  # pragma: no cover
+            type(self).calls += 1
+            raise RuntimeError("hostile ratio hook")
+
+    with pytest.raises(ValueError, match="utility_decay"):
+        FixedBudgetFeatureLearner(
+            n_features=2,
+            n_tasks=1,
+            utility_decay=HostileFloat(0.9),
+        )
+    with pytest.raises(ValueError, match="retention_slow_utility_decay"):
+        CompositionalFeatureLearner(
+            n_features=3,
+            n_tasks=1,
+            retention_slow_utility_decay=HostileFloat(0.95),
+        )
+    assert HostileFloat.calls == 0
+
+
 @pytest.mark.parametrize(
     "factory",
     [
