@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import warnings
+from types import MappingProxyType
 
 import chex
 import jax
@@ -18,6 +19,7 @@ from alberta_framework.core import (
 from alberta_framework.core.actor_critic import (
     ContinuousActorCriticAgent,
     ContinuousActorCriticConfig,
+    _require_continuous_state_resources,
     run_continuous_actor_critic_from_arrays,
 )
 from alberta_framework.core.optimizers import ObGDBounding
@@ -319,7 +321,7 @@ def test_continuous_actor_critic_normalizes_conversion_hook_failures() -> None:
         def as_integer_ratio(self) -> tuple[int, int]:
             raise RuntimeError("conversion hook failed")
 
-    with pytest.raises(ValueError, match="action_low must be finite"):
+    with pytest.raises(ValueError, match="action_low must be"):
         ContinuousActorCriticAgent(
             ContinuousActorCriticConfig(
                 action_dim=1,
@@ -540,3 +542,67 @@ def test_continuous_actor_critic_integer_and_scalar_validation() -> None:
 
     state = agent.init(feature_dim=np.int32(5), key=jr.key(0))
     assert state.mean_weights.shape == (3, 5)
+
+
+class _HostileFloat(float):
+    def as_integer_ratio(self) -> tuple[int, int]:
+        raise RuntimeError("hostile hook executed")
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("gamma", _HostileFloat(0.5)),
+        ("actor_step_size", np.float64(1e-100)),
+        ("log_sigma_init", 1e100),
+        ("log_sigma_min", True),
+        ("action_low", _HostileFloat(-1.0)),
+        ("action_high", np.float64(1e100)),
+    ],
+)
+def test_continuous_actor_critic_rejects_invalid_float32_config(
+    field: str, value: object
+) -> None:
+    with pytest.raises(ValueError, match=field):
+        config = ContinuousActorCriticConfig(action_dim=2, **{field: value})  # type: ignore[arg-type]
+        ContinuousActorCriticAgent(config)
+
+
+def test_continuous_actor_critic_mapping_config_and_resource_boundary() -> None:
+    config = ContinuousActorCriticConfig(
+        action_dim=np.uint16(2), action_low=np.float32(-1), action_high=np.float64(1)
+    ).to_config()
+    clone = ContinuousActorCriticConfig.from_config(MappingProxyType(config))
+    assert clone.to_config() == config
+    _require_continuous_state_resources(1, 107_374_180)
+    with pytest.raises(ValueError, match="state exceeds"):
+        _require_continuous_state_resources(1, 107_374_181)
+
+
+@pytest.mark.parametrize("shape", [(), (1,), (1, 2), (2, 1), (3,)])
+def test_continuous_actor_critic_rejects_wrong_observation_shapes(
+    shape: tuple[int, ...]
+) -> None:
+    agent = ContinuousActorCriticAgent(ContinuousActorCriticConfig(action_dim=2))
+    state = agent.init(2, jr.key(0))
+    malformed = jnp.zeros(shape, dtype=jnp.float32)
+    with pytest.raises(ValueError, match="observation"):
+        agent.policy_params(state, malformed)
+    with pytest.raises(ValueError, match="observation"):
+        agent.update(state, jnp.asarray(0.0), malformed)
+
+
+def test_continuous_actor_critic_state_contract_and_counter_saturation() -> None:
+    agent = ContinuousActorCriticAgent(ContinuousActorCriticConfig(action_dim=2))
+    state = agent.init(2, jr.key(0))
+    malformed = state.replace(mean_weights=jnp.zeros((2,), dtype=jnp.float32))
+    with pytest.raises(ValueError, match="mean_weights"):
+        agent.policy_params(malformed, jnp.zeros((2,), dtype=jnp.float32))
+    saturated = state.replace(step_count=jnp.asarray(2**31 - 1, dtype=jnp.int32))
+    result = agent.update(
+        saturated,
+        jnp.asarray(0.0),
+        jnp.zeros((2,), dtype=jnp.float32),
+    )
+    assert bool(result.update_applied)
+    assert int(result.state.step_count) == 2**31 - 1

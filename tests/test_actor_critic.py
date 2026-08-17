@@ -1,5 +1,7 @@
 """Tests for Step 4b actor-critic core."""
 
+from types import MappingProxyType
+
 import chex
 import jax
 import jax.numpy as jnp
@@ -12,6 +14,7 @@ from alberta_framework.core import ActorCriticAgent as CoreActorCriticAgent
 from alberta_framework.core.actor_critic import (
     ActorCriticAgent,
     ActorCriticConfig,
+    _require_discrete_state_resources,
     run_actor_critic_from_arrays,
 )
 from alberta_framework.core.optimizers import ObGDBounding
@@ -452,8 +455,7 @@ def test_actor_critic_exports() -> None:
 def test_actor_critic_integer_and_scalar_validation() -> None:
     with pytest.raises(ValueError, match="n_actions"):
         ActorCriticConfig(n_actions=True)  # type: ignore[arg-type]
-    with pytest.raises(ValueError, match="n_actions"):
-        ActorCriticConfig(n_actions=1)
+    assert ActorCriticConfig(n_actions=1).n_actions == 1
     with pytest.raises(ValueError, match="n_actions"):
         ActorCriticConfig(n_actions=2.5)  # type: ignore[arg-type]
 
@@ -474,3 +476,62 @@ def test_actor_critic_integer_and_scalar_validation() -> None:
 
     state = agent.init(feature_dim=np.int32(5), key=jr.key(0))
     assert state.actor_weights.shape == (4, 5)
+
+
+class _HostileFloat(float):
+    def as_integer_ratio(self) -> tuple[int, int]:
+        raise RuntimeError("hostile hook executed")
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("gamma", _HostileFloat(0.5)),
+        ("gamma", np.float64(1e-100)),
+        ("actor_step_size", np.float64(1e-100)),
+        ("critic_lamda", 1e100),
+        ("temperature", True),
+    ],
+)
+def test_actor_critic_rejects_invalid_float32_config(field: str, value: object) -> None:
+    with pytest.raises(ValueError, match=field):
+        ActorCriticConfig(n_actions=2, **{field: value})  # type: ignore[arg-type]
+
+
+def test_actor_critic_mapping_config_and_resource_boundary() -> None:
+    config = ActorCriticConfig(n_actions=np.uint16(2), gamma=np.float32(0.5)).to_config()
+    clone = ActorCriticConfig.from_config(MappingProxyType(config))
+    assert clone.to_config() == config
+    _require_discrete_state_resources(1, 107_374_180)
+    with pytest.raises(ValueError, match="state exceeds"):
+        _require_discrete_state_resources(1, 107_374_181)
+
+
+@pytest.mark.parametrize("shape", [(), (1,), (1, 2), (2, 1), (3,)])
+def test_actor_critic_rejects_wrong_observation_shapes(shape: tuple[int, ...]) -> None:
+    agent = ActorCriticAgent(ActorCriticConfig(n_actions=2))
+    state = agent.init(2, jr.key(0))
+    malformed = jnp.zeros(shape, dtype=jnp.float32)
+    with pytest.raises(ValueError, match="observation"):
+        agent.policy(state, malformed)
+    with pytest.raises(ValueError, match="observation"):
+        agent.update(state, jnp.asarray(0.0), malformed)
+
+
+def test_actor_critic_state_contract_and_counter_saturation() -> None:
+    agent = ActorCriticAgent(ActorCriticConfig(n_actions=2))
+    state = agent.init(2, jr.key(0))
+    malformed = state.replace(actor_weights=jnp.zeros((2,), dtype=jnp.float32))
+    with pytest.raises(ValueError, match="actor_weights"):
+        agent.policy(malformed, jnp.zeros((2,), dtype=jnp.float32))
+    saturated = state.replace(
+        last_action=jnp.asarray(0, dtype=jnp.int32),
+        step_count=jnp.asarray(2**31 - 1, dtype=jnp.int32),
+    )
+    result = agent.update(
+        saturated,
+        jnp.asarray(0.0),
+        jnp.zeros((2,), dtype=jnp.float32),
+    )
+    assert bool(result.update_applied)
+    assert int(result.state.step_count) == 2**31 - 1
