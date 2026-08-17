@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 from alberta_framework import forager_cli
@@ -93,6 +95,25 @@ def test_final_window_zero_is_not_replaced_by_protocol_default() -> None:
     assert (args.final_window or 100_000) == 100_000
     resolved = forager_cli._explicit_int_or_default(args.final_window, 100_000)
     assert resolved == 0
+
+
+def test_json_safe_rejects_nonfinite_protocol_identities() -> None:
+    """Protocol/baseline dumps must not coerce NaN/Inf into JSON null."""
+    finite = forager_cli._json_safe({"preset": "toy", "scale": 1.0})
+    assert finite == {"preset": "toy", "scale": 1.0}
+    encoded = json.dumps(finite, indent=2, sort_keys=True, allow_nan=False)
+    assert '"scale": 1.0' in encoded
+
+    for bad in (float("nan"), float("inf"), float("-inf"), np.float64("nan")):
+        with pytest.raises(ValueError, match="forager CLI payload is not finite JSON"):
+            forager_cli._json_safe({"scale": bad})
+
+
+def test_protocol_and_baseline_dumps_refuse_nonfinite_json() -> None:
+    source = __import__("inspect").getsource(forager_cli.main)
+    assert "allow_nan=False" in source
+    assert "json.dumps(_json_safe(baseline_payload), indent=2, sort_keys=True)" not in source
+    assert "json.dumps(_json_safe(protocol.to_dict()), indent=2, sort_keys=True)" not in source
 
 
 def test_main_passes_explicit_final_window_to_config() -> None:

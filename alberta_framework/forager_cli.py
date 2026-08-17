@@ -149,7 +149,7 @@ def _json_safe(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_json_safe(item) for item in value]
     if isinstance(value, float) and not math.isfinite(value):
-        return None
+        raise ValueError("forager CLI payload is not finite JSON")
     if isinstance(value, Path):
         return str(value)
     return value
@@ -578,10 +578,24 @@ def main(argv: Sequence[str] | None = None) -> int:
                 target.to_dict() for target in paper_reference_targets(preset)
             ],
         }
-        LOGGER.info(json.dumps(_json_safe(baseline_payload), indent=2, sort_keys=True))
+        LOGGER.info(
+            json.dumps(
+                _json_safe(baseline_payload),
+                indent=2,
+                sort_keys=True,
+                allow_nan=False,
+            )
+        )
         return 0
     if args.protocol_only:
-        LOGGER.info(json.dumps(_json_safe(protocol.to_dict()), indent=2, sort_keys=True))
+        LOGGER.info(
+            json.dumps(
+                _json_safe(protocol.to_dict()),
+                indent=2,
+                sort_keys=True,
+                allow_nan=False,
+            )
+        )
         return 0
 
     reference_names = {name for name, _seed, _path in args.reference_npz}
