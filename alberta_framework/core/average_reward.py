@@ -112,12 +112,7 @@ def _preflight_actor_state(
     # every trunk and head weight/bias array, in addition to parameters,
     # traces, utilities, counters, and its average-reward vector.
     critic_lms_state_scalars = 2 * len(hidden_sizes) + 2
-    critic_scalar_count = (
-        2 * critic_parameters
-        + sum(hidden_sizes)
-        + critic_lms_state_scalars
-        + 5
-    )
+    critic_scalar_count = 2 * critic_parameters + sum(hidden_sizes) + critic_lms_state_scalars + 5
     scalar_count = actor_scalar_count + critic_scalar_count
     _require_state_resources(
         "average-reward actor-critic",
@@ -678,9 +673,7 @@ class AverageRewardHordeActorCriticAgent:
         """Initialize critic and actor state."""
         observation_dim = _require_int32("observation_dim", observation_dim, minimum=1)
         actor_dim = self._config.hidden_sizes[-1] if self._config.hidden_sizes else observation_dim
-        _preflight_actor_state(
-            self._config.n_actions, observation_dim, self._config.hidden_sizes
-        )
+        _preflight_actor_state(self._config.n_actions, observation_dim, self._config.hidden_sizes)
         key, critic_key = jr.split(key)
         critic_state = self._critic.init(observation_dim, critic_key)
         actor_opt_w = self._actor_optimizer.init_for_shape((self._config.n_actions, actor_dim))
@@ -1038,8 +1031,7 @@ class AverageRewardHordeLearner:
 
     def init(self, feature_dim: int, key: Array) -> AverageRewardHordeState:
         """Initialize shared-trunk and per-demon reward-rate state."""
-        if feature_dim < 1:
-            raise ValueError("feature_dim must be positive")
+        feature_dim = _require_int32("feature_dim", feature_dim, minimum=1)
         return AverageRewardHordeState(
             learner_state=self._learner.init(feature_dim, key),
             average_rewards=jnp.zeros(self._n_demons, dtype=jnp.float32),
@@ -1191,8 +1183,8 @@ class DifferentialGTDLearner:
         average_reward: float = 0.0,
     ) -> DifferentialGTDState:
         """Initialize primary weights, secondary weights, and traces."""
-        if feature_dim < 1:
-            raise ValueError("feature_dim must be positive")
+        feature_dim = _require_int32("feature_dim", feature_dim, minimum=1)
+        average_reward = validated_float32_scalar("average_reward", average_reward)
         return DifferentialGTDState(
             weights=jnp.zeros(feature_dim, dtype=jnp.float32),
             bias=jnp.array(0.0, dtype=jnp.float32),
@@ -1353,8 +1345,8 @@ class DifferentialTDLearner:
         average_reward: float = 0.0,
     ) -> DifferentialTDState:
         """Initialize value weights, traces, and reward-rate estimate."""
-        if feature_dim < 1:
-            raise ValueError("feature_dim must be positive")
+        feature_dim = _require_int32("feature_dim", feature_dim, minimum=1)
+        average_reward = validated_float32_scalar("average_reward", average_reward)
         return DifferentialTDState(
             weights=jnp.zeros(feature_dim, dtype=jnp.float32),
             bias=jnp.array(0.0, dtype=jnp.float32),
