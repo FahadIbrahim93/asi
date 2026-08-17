@@ -2115,7 +2115,11 @@ class DifferentialSARSAAgent:
         in their own fail-closed diagnostics.
         """
         observation_f = jnp.asarray(observation, dtype=jnp.float32)
-        action_i = jnp.asarray(action, dtype=jnp.int32)
+        action_i = jnp.asarray(action)
+        if action_i.shape != ():
+            raise ValueError("differential SARSA action must be scalar")
+        if action_i.dtype != jnp.dtype(jnp.int32):
+            raise TypeError("differential SARSA action must have dtype int32")
         return (
             state.replace(
                 last_observation=observation_f,
