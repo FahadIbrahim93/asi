@@ -643,6 +643,39 @@ class TestOutOfClassPolynomialStream:
 class TestFrequencyMismatchStream:
     """Tests for the trigonometric out-of-class stream."""
 
+    @pytest.mark.parametrize(
+        "field",
+        [
+            "feature_dim",
+            "n_tasks",
+            "n_components_per_task",
+            "n_contexts",
+            "context_length",
+        ],
+    )
+    @pytest.mark.parametrize("value", [True, False, 1.0, np.int64(3), "3", None])
+    def test_dimensions_require_positive_builtin_ints(
+        self,
+        field: str,
+        value: object,
+    ) -> None:
+        with pytest.raises(ValueError, match=field):
+            FrequencyMismatchStream(**{field: value})  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize(
+        "field",
+        [
+            "feature_dim",
+            "n_tasks",
+            "n_components_per_task",
+            "n_contexts",
+            "context_length",
+        ],
+    )
+    def test_dimensions_reject_values_above_the_int32_domain(self, field: str) -> None:
+        with pytest.raises(ValueError, match=rf"{field}.*int32 max"):
+            FrequencyMismatchStream(**{field: 2**31})  # type: ignore[arg-type]
+
     @pytest.mark.parametrize("field", ["amplitude_scale", "noise_std"])
     @pytest.mark.parametrize(
         "value",
@@ -876,6 +909,41 @@ class TestFrequencyMismatchStream:
 
 class TestCompositionalStream:
     """Tests for the 2-hidden-layer compositional out-of-class stream."""
+
+    @pytest.mark.parametrize(
+        "field",
+        [
+            "feature_dim",
+            "n_tasks",
+            "inner_hidden",
+            "outer_components",
+            "n_contexts",
+            "context_length",
+        ],
+    )
+    @pytest.mark.parametrize("value", [True, False, 1.0, np.int64(3), "3", None])
+    def test_dimensions_require_positive_builtin_ints(
+        self,
+        field: str,
+        value: object,
+    ) -> None:
+        with pytest.raises(ValueError, match=field):
+            CompositionalStream(**{field: value})  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize(
+        "field",
+        [
+            "feature_dim",
+            "n_tasks",
+            "inner_hidden",
+            "outer_components",
+            "n_contexts",
+            "context_length",
+        ],
+    )
+    def test_dimensions_reject_values_above_the_int32_domain(self, field: str) -> None:
+        with pytest.raises(ValueError, match=rf"{field}.*int32 max"):
+            CompositionalStream(**{field: 2**31})  # type: ignore[arg-type]
 
     @pytest.mark.parametrize("field", ["feature_std", "amplitude_scale", "noise_std"])
     @pytest.mark.parametrize(
