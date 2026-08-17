@@ -432,14 +432,14 @@ class LearningSignalEstimator:
             array = jnp.asarray(value)
             if array.shape != ():
                 raise ValueError(f"state.{name} must be scalar")
-            if not jnp.issubdtype(array.dtype, jnp.integer):
-                raise ValueError(f"state.{name} must have an integer dtype")
+            if array.dtype != jnp.dtype(jnp.int32):
+                raise ValueError(f"state.{name} must have dtype int32")
         for name, value in float_values.items():
             array = jnp.asarray(value)
             if array.shape != ():
                 raise ValueError(f"state.{name} must be scalar")
-            if not jnp.issubdtype(array.dtype, jnp.inexact):
-                raise ValueError(f"state.{name} must have a floating dtype")
+            if array.dtype != jnp.dtype(jnp.float32):
+                raise ValueError(f"state.{name} must have dtype float32")
 
     def observe(
         self,
