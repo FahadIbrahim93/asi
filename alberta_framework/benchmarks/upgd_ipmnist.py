@@ -1430,7 +1430,22 @@ def _validated_partial_payload(
             raise ValueError(f"{path}: hyperparameters must be finite named numbers")
         if not math.isfinite(float(value)):
             raise ValueError(f"{path}: hyperparameters must be finite named numbers")
-
+    try:
+        resolved_hyperparameters = resolve_hyperparameters(
+            learner, dict(hyperparameters)
+        )
+    except ValueError as exc:
+        raise ValueError(f"{path}: invalid hyperparameters: {exc}") from exc
+    serialized_hyperparameters = json.dumps(
+        dict(hyperparameters), allow_nan=False, separators=(",", ":"), sort_keys=True
+    )
+    serialized_resolved = json.dumps(
+        resolved_hyperparameters, allow_nan=False, separators=(",", ":"), sort_keys=True
+    )
+    if serialized_hyperparameters != serialized_resolved:
+        raise ValueError(
+            f"{path}: hyperparameters must contain the complete learner configuration"
+        )
     config_payload = payload.get("config")
     if not isinstance(config_payload, Mapping) or set(config_payload) != set(
         IPMNISTConfig().to_config()

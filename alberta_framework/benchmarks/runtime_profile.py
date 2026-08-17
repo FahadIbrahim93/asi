@@ -15,27 +15,13 @@ from collections.abc import Mapping
 from pathlib import PurePosixPath
 from typing import Any, Literal, cast
 
-ENVIRONMENT_RUNTIME_PROFILE_SCHEMA_VERSION = (
-    "alberta.environment_runtime_profile.v1"
-)
-ENVIRONMENT_RNG_SCHEDULE_SCHEMA_VERSION = (
-    "alberta.environment_rng_schedule.v1"
-)
-CUDA_WHEEL_LIBRARY_PROFILE_SCHEMA_VERSION = (
-    "alberta.cuda_wheel_library_profile.v1"
-)
-DRIVER_LIBRARY_TREE_HASH_SCHEME = (
-    "canonical-entry-json+mode+size+bytes-v1"
-)
-GPU_USER_LIBRARY_BUNDLE_SCHEMA_VERSION = (
-    "alberta.gpu_user_library_bundle.v1"
-)
-NATIVE_RUNTIME_INVENTORY_HASH_SCHEME = (
-    DRIVER_LIBRARY_TREE_HASH_SCHEME
-)
-DETERMINISM_QUALIFICATION_SCHEMA_VERSION = (
-    "alberta.oci_determinism_qualification.v2"
-)
+ENVIRONMENT_RUNTIME_PROFILE_SCHEMA_VERSION = "alberta.environment_runtime_profile.v1"
+ENVIRONMENT_RNG_SCHEDULE_SCHEMA_VERSION = "alberta.environment_rng_schedule.v1"
+CUDA_WHEEL_LIBRARY_PROFILE_SCHEMA_VERSION = "alberta.cuda_wheel_library_profile.v1"
+DRIVER_LIBRARY_TREE_HASH_SCHEME = "canonical-entry-json+mode+size+bytes-v1"
+GPU_USER_LIBRARY_BUNDLE_SCHEMA_VERSION = "alberta.gpu_user_library_bundle.v1"
+NATIVE_RUNTIME_INVENTORY_HASH_SCHEME = DRIVER_LIBRARY_TREE_HASH_SCHEME
+DETERMINISM_QUALIFICATION_SCHEMA_VERSION = "alberta.oci_determinism_qualification.v2"
 # The two environment-key derivations a run may declare.
 # ``dedicated_environment_split_chain_v1``: environment keys come from their
 # own split chain, isolated from agent RNG -- the matched-protocol default and
@@ -78,9 +64,7 @@ _REQUIRED_DISTRIBUTION_VERSIONS = {
     "pyfixedreps": "0.1.2",
     "replaytables": "0.1.2",
 }
-_REQUIRED_DISTRIBUTION_RECORDS = frozenset(
-    _REQUIRED_DISTRIBUTION_VERSIONS
-)
+_REQUIRED_DISTRIBUTION_RECORDS = frozenset(_REQUIRED_DISTRIBUTION_VERSIONS)
 _REQUIRED_SCIENTIFIC_PACKAGES = tuple(
     sorted(
         f"{name}=={_REQUIRED_DISTRIBUTION_VERSIONS[name]}"
@@ -298,10 +282,7 @@ def validate_environment_runtime_profile(
         or re.fullmatch(r"3\.12\.[0-9]+", cast(str, python["version"])) is None
         or not cast(str, python["soabi"]).startswith("cpython-312")
     ):
-        raise ValueError(
-            "runtime profile must use exact CPython 3.12 ABI with "
-            "PYTHONHASHSEED=0"
-        )
+        raise ValueError("runtime profile must use exact CPython 3.12 ABI with PYTHONHASHSEED=0")
 
     packages = _array(
         profile["scientific_packages"],
@@ -314,18 +295,14 @@ def validate_environment_runtime_profile(
     ):
         raise ValueError("runtime profile scientific package inventory is invalid")
     if packages != list(_REQUIRED_SCIENTIFIC_PACKAGES):
-        raise ValueError(
-            "runtime profile scientific packages differ from the canonical lock"
-        )
+        raise ValueError("runtime profile scientific packages differ from the canonical lock")
 
     records = _object(
         profile["scientific_package_records"],
         label="runtime profile scientific_package_records",
     )
     if set(records) != _REQUIRED_DISTRIBUTION_RECORDS:
-        raise ValueError(
-            "runtime profile distribution RECORD set differs from the canonical lock"
-        )
+        raise ValueError("runtime profile distribution RECORD set differs from the canonical lock")
     for name, raw_record in records.items():
         record = _object(
             raw_record,
@@ -338,10 +315,7 @@ def validate_environment_runtime_profile(
         )
         _sha256(
             record["record_sha256"],
-            label=(
-                "runtime profile scientific_package_records."
-                f"{name}.record_sha256"
-            ),
+            label=(f"runtime profile scientific_package_records.{name}.record_sha256"),
         )
         _string(
             record["version"],
@@ -395,6 +369,7 @@ def validate_environment_runtime_profile(
         ffmpeg["distribution"] != "imageio-ffmpeg"
         or ffmpeg["version"] != ffmpeg_record["version"]
         or ffmpeg["record_sha256"] != ffmpeg_record["record_sha256"]
+        or type(ffmpeg["mode"]) is not int
         or ffmpeg["mode"] != 0o555
         or PurePosixPath(ffmpeg_relative_path).is_absolute()
         or ".." in PurePosixPath(ffmpeg_relative_path).parts
@@ -423,8 +398,7 @@ def validate_environment_runtime_profile(
     if (
         foragax["distribution"] != "continual-foragax"
         or foragax["version"] != "0.55.0"
-        or foragax["install_tree_hash_scheme"]
-        != "relative-path+size+bytes-v1"
+        or foragax["install_tree_hash_scheme"] != "relative-path+size+bytes-v1"
     ):
         raise ValueError("runtime profile Foragax identity is invalid")
     _sha256(
@@ -439,9 +413,7 @@ def validate_environment_runtime_profile(
         label="runtime profile jax",
     )
     if jax["version"] != "0.9.0.1" or jax["backend"] != "gpu":
-        raise ValueError(
-            "GPU-qualified runtime profile must use the canonical JAX GPU backend"
-        )
+        raise ValueError("GPU-qualified runtime profile must use the canonical JAX GPU backend")
     jax_config = _object(jax["config"], label="runtime profile jax.config")
     _exact_keys(
         jax_config,
@@ -550,13 +522,8 @@ def validate_environment_runtime_profile(
     )
     if dependency["executor_kind"] != "oci":
         raise ValueError("runtime profile must identify an immutable OCI executor")
-    if (
-        dependency["scientific_runtime_class"]
-        != "matched_current_foragax_0_55_cuda12"
-    ):
-        raise ValueError(
-            "runtime profile is not the matched-current comparator class"
-        )
+    if dependency["scientific_runtime_class"] != "matched_current_foragax_0_55_cuda12":
+        raise ValueError("runtime profile is not the matched-current comparator class")
     for key in (
         "cuda_wheel_library_profile_sha256",
         "dependency_lock_sha256",
@@ -582,15 +549,9 @@ def validate_environment_runtime_profile(
     )
     if dependency["runtime_binary_sha256"] != python["executable_sha256"]:
         raise ValueError("runtime profile interpreter hashes disagree")
-    if (
-        dependency["driver_user_library_hash_scheme"]
-        != DRIVER_LIBRARY_TREE_HASH_SCHEME
-    ):
+    if dependency["driver_user_library_hash_scheme"] != DRIVER_LIBRARY_TREE_HASH_SCHEME:
         raise ValueError("runtime profile driver library hash scheme is invalid")
-    if (
-        dependency["native_runtime_inventory_hash_scheme"]
-        != NATIVE_RUNTIME_INVENTORY_HASH_SCHEME
-    ):
+    if dependency["native_runtime_inventory_hash_scheme"] != NATIVE_RUNTIME_INVENTORY_HASH_SCHEME:
         raise ValueError("runtime profile native inventory hash scheme is invalid")
     native_runtime_inventory_root = _string(
         dependency["native_runtime_inventory_root"],
@@ -634,8 +595,7 @@ def validate_environment_runtime_profile(
         label="runtime profile determinism qualification",
     )
     if (
-        determinism["schema_version"]
-        != DETERMINISM_QUALIFICATION_SCHEMA_VERSION
+        determinism["schema_version"] != DETERMINISM_QUALIFICATION_SCHEMA_VERSION
         or determinism["state"] != "sealed_oci_two_run_exact"
         or determinism["executor_kind"] != "oci"
         or determinism["backend"] not in {"cpu", "gpu"}
@@ -667,13 +627,8 @@ def validate_environment_runtime_profile(
             determinism[key],
             label=f"runtime profile determinism qualification {key}",
         )
-    if (
-        dependency["determinism_qualification_sha256"]
-        != _canonical_json_sha256(determinism)
-    ):
-        raise ValueError(
-            "runtime profile determinism qualification digest does not verify"
-        )
+    if dependency["determinism_qualification_sha256"] != _canonical_json_sha256(determinism):
+        raise ValueError("runtime profile determinism qualification digest does not verify")
     cuda_wheel_library_paths = _absolute_paths(
         dependency["cuda_wheel_library_paths"],
         label="runtime profile CUDA wheel library paths",
@@ -694,27 +649,17 @@ def validate_environment_runtime_profile(
             "schema_version": CUDA_WHEEL_LIBRARY_PROFILE_SCHEMA_VERSION,
         }
     )
-    if (
-        dependency["cuda_wheel_library_profile_sha256"]
-        != expected_wheel_profile_sha256
-    ):
+    if dependency["cuda_wheel_library_profile_sha256"] != expected_wheel_profile_sha256:
         raise ValueError("runtime profile CUDA wheel path digest does not verify")
     expected_library_bundle_sha256 = _canonical_json_sha256(
         {
-            "cuda_wheel_library_profile_sha256": (
-                expected_wheel_profile_sha256
-            ),
-            "driver_user_library_tree_sha256": dependency[
-                "driver_user_library_tree_sha256"
-            ],
+            "cuda_wheel_library_profile_sha256": (expected_wheel_profile_sha256),
+            "driver_user_library_tree_sha256": dependency["driver_user_library_tree_sha256"],
             "libcuda_sha256": dependency["libcuda_sha256"],
             "schema_version": GPU_USER_LIBRARY_BUNDLE_SCHEMA_VERSION,
         }
     )
-    if (
-        dependency["gpu_user_library_bundle_sha256"]
-        != expected_library_bundle_sha256
-    ):
+    if dependency["gpu_user_library_bundle_sha256"] != expected_library_bundle_sha256:
         raise ValueError("runtime profile GPU library bundle digest does not verify")
 
     shadow = _object(
@@ -799,9 +744,7 @@ def validate_environment_runtime_profile(
         )
         resolved_path = _string(
             entry["resolved_path"],
-            label=(
-                f"runtime profile base sys.path entry {position} resolved path"
-            ),
+            label=(f"runtime profile base sys.path entry {position} resolved path"),
         )
         if (
             type(entry["exists"]) is not bool
@@ -820,9 +763,7 @@ def validate_environment_runtime_profile(
                 or type(entry["inode"]) is not int
                 or entry["inode"] < 1
             ):
-                raise ValueError(
-                    "runtime profile base sys.path identity is invalid"
-                )
+                raise ValueError("runtime profile base sys.path identity is invalid")
             base_identity = (
                 entry["device"],
                 entry["inode"],
@@ -838,9 +779,7 @@ def validate_environment_runtime_profile(
             or entry["inode"] is not None
             or entry["is_dir"] is not False
         ):
-            raise ValueError(
-                "runtime profile nonexistent sys.path identity is invalid"
-            )
+            raise ValueError("runtime profile nonexistent sys.path identity is invalid")
     expected_workload_sys_path_contract = {
         "cwd_append_path": cwd,
         "launcher_mode": "isolated-runpy-prepend-v1",
@@ -910,19 +849,18 @@ def validate_environment_runtime_profile(
         or shadow["cwd_writable"] is not False
         or shadow["pythonhome"] != ""
         or shadow["pythonpath"] != ""
-        or shadow["scratch_directories"]
-        != expected_scratch_directories
+        or shadow["scratch_directories"] != expected_scratch_directories
         or shadow["tmp_root_writable"] is not False
         or shadow["tmp_src_entries"] != []
         or shadow["tmp_src_exists"] is not True
         or shadow["tmp_src_is_mount"] is not True
+        or type(shadow["tmp_src_mode"]) is not int
         or shadow["tmp_src_mode"] != 0o555
         or shadow["tmp_src_writable"] is not False
         or shadow["trusted_source_path_in_base_sys_path"] is not False
         or shadow["trusted_source_path_is_dir"] is not True
         or shadow["trusted_source_path_writable"] is not False
-        or shadow["workload_sys_path_contract"]
-        != expected_workload_sys_path_contract
+        or shadow["workload_sys_path_contract"] != expected_workload_sys_path_contract
         or flags
         != {
             "dont_write_bytecode": 1,
@@ -1023,30 +961,20 @@ def validate_environment_runtime_profile(
     if host_device_indices != sorted(host_device_indices):
         raise ValueError("runtime profile GPU device indices are not ordered")
     if jax_device_ids != list(range(len(host_device_indices))):
-        raise ValueError(
-            "runtime profile JAX devices do not match visible GPU identities"
-        )
-    expected_cuda_visible_devices = ",".join(
-        str(index) for index in host_device_indices
-    )
+        raise ValueError("runtime profile JAX devices do not match visible GPU identities")
+    expected_cuda_visible_devices = ",".join(str(index) for index in host_device_indices)
 
     container_environment = _array(
         profile["container_environment"],
         label="runtime profile container_environment",
     )
-    if (
-        not all(type(item) is str and "=" in item for item in container_environment)
-        or container_environment
-        != sorted(set(cast(list[str], container_environment)))
-    ):
+    if not all(
+        type(item) is str and "=" in item for item in container_environment
+    ) or container_environment != sorted(set(cast(list[str], container_environment))):
         raise ValueError("runtime profile container environment is invalid")
-    environment_names = [
-        cast(str, item).partition("=")[0] for item in container_environment
-    ]
+    environment_names = [cast(str, item).partition("=")[0] for item in container_environment]
     if len(environment_names) != len(set(environment_names)):
-        raise ValueError(
-            "runtime profile container environment defines a variable twice"
-        )
+        raise ValueError("runtime profile container environment defines a variable twice")
     required_environment = {
         "CUDA_CACHE_DISABLE=1",
         "CUDA_CACHE_MAXSIZE=268435456",
@@ -1072,17 +1000,12 @@ def validate_environment_runtime_profile(
         "CUBLAS_WORKSPACE_CONFIG=:4096:8",
         f"CUDA_VISIBLE_DEVICES={expected_cuda_visible_devices}",
         "LD_LIBRARY_PATH=" + ":".join(ordered_gpu_library_paths),
-        (
-            "XLA_FLAGS=--xla_gpu_enable_triton_gemm=false "
-            "--xla_gpu_deterministic_ops=true"
-        ),
+        ("XLA_FLAGS=--xla_gpu_enable_triton_gemm=false --xla_gpu_deterministic_ops=true"),
         "XLA_PYTHON_CLIENT_PREALLOCATE=false",
     }
     environment_set = set(cast(list[str], container_environment))
     if environment_set != expected_environment:
-        raise ValueError(
-            "runtime profile container environment differs from the GPU lock"
-        )
+        raise ValueError("runtime profile container environment differs from the GPU lock")
     return profile
 
 
@@ -1126,9 +1049,7 @@ def validate_environment_runtime_identity(
     )
     normalized_profile = _normalize_environment_runtime_profile(runtime_profile)
     actual_profile_sha256 = _canonical_json_sha256(normalized_profile)
-    actual_schedule_sha256 = environment_rng_schedule_sha256(
-        environment_rng_schedule
-    )
+    actual_schedule_sha256 = environment_rng_schedule_sha256(environment_rng_schedule)
     if environment_runtime_profile_sha256 != actual_profile_sha256:
         raise ValueError("environment runtime profile digest does not verify")
     if environment_rng_schedule_digest != actual_schedule_sha256:
@@ -1142,9 +1063,7 @@ def validate_environment_runtime_identity(
         dependency["determinism_qualification"],
     )
     if profile_id != determinism["runtime_profile_id"]:
-        raise ValueError(
-            "runtime_profile_id does not match the determinism qualification"
-        )
+        raise ValueError("runtime_profile_id does not match the determinism qualification")
     return EnvironmentRuntimeIdentity(
         runtime_profile_id=profile_id,
         environment_runtime_profile_sha256=actual_profile_sha256,

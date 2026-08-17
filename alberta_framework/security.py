@@ -14,6 +14,7 @@ import math
 import time
 from collections.abc import Mapping, Sequence
 from enum import IntEnum
+from numbers import Real
 from typing import Any
 
 
@@ -280,13 +281,15 @@ def validate_security_oracle_experience(
 
 def coerce_security_action(action: SecurityAction | int | str) -> SecurityAction:
     """Coerce an integer or name to ``SecurityAction``."""
-    if isinstance(action, SecurityAction):
+    if isinstance(action, bool):
+        raise ValueError(f"security action must not be a boolean: {action!r}")
+    if type(action) is SecurityAction:
         return action
     if type(action) is int:
         try:
             return SecurityAction(action)
         except ValueError as exc:
-            raise ValueError("unknown security action") from exc
+            raise ValueError(f"unknown security action: {action!r}") from exc
     if type(action) is str:
         normalized = action.strip().lower()
         if normalized in _ACTION_ALIASES:
@@ -313,12 +316,16 @@ def to_security_gym_action(
     ``action`` id and a one-element ``risk_score`` array. A one-element tuple is
     accepted by the environment and keeps this module dependency-free.
     """
-    if type(risk_score) is bool or type(risk_score) not in (int, float):
+    actual_type = type(risk_score)
+    if issubclass(actual_type, bool) or not issubclass(actual_type, Real):
         raise ValueError("risk_score must be a finite real number")
-    score = float(risk_score)
-    if not math.isfinite(score):
-        raise ValueError("risk_score must be a finite real number")
-    clipped_risk = min(10.0, max(0.0, score))
+    try:
+        val = float(risk_score)
+        if not math.isfinite(val):
+            raise ValueError(f"risk_score must be finite, got {risk_score!r}")
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise ValueError(f"risk_score must be a finite real number, got {risk_score!r}") from exc
+    clipped_risk = min(10.0, max(0.0, val))
     return {
         "action": int(coerce_security_action(action)),
         "risk_score": (clipped_risk,),

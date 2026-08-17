@@ -1009,3 +1009,23 @@ def test_get_final_performance_rejects_nonfinite_samples() -> None:
     poisoned.metric_arrays["squared_error"][1, -1] = np.nan
     with pytest.raises(ValueError, match="non-finite samples"):
         get_final_performance({"candidate": poisoned}, window=1)
+
+
+@pytest.mark.parametrize("seeds", [True, False, 0, -1, np.bool_(True)])
+def test_run_multi_seed_experiment_rejects_invalid_seed_counts(seeds: object) -> None:
+    with pytest.raises(ValueError, match="seeds"):
+        run_multi_seed_experiment([], seeds=seeds)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("seeds", [[True], [-1], [2**32], [0, 0]])
+def test_run_multi_seed_experiment_rejects_invalid_seed_sequences(
+    seeds: list[object],
+) -> None:
+    with pytest.raises(ValueError, match="seeds"):
+        run_multi_seed_experiment([], seeds=seeds)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("window", [True, False, 0, -1, 1.0, np.int64(1)])
+def test_get_final_performance_rejects_non_builtin_positive_window(window: object) -> None:
+    with pytest.raises(ValueError, match="window"):
+        get_final_performance({"candidate": _two_seed_trace()}, window=window)  # type: ignore[arg-type]

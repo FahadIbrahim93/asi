@@ -12,6 +12,7 @@ import matplotlib
 
 matplotlib.use("Agg", force=True)
 
+import matplotlib.colors as mcolors  # noqa: E402
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 import pytest  # noqa: E402
@@ -27,6 +28,7 @@ from alberta_framework.utils.visualization import (  # noqa: E402
     plot_hyperparameter_heatmap,
     plot_learning_curves,
     plot_step_size_evolution,
+    set_publication_style,
 )
 
 pytestmark = pytest.mark.unit
@@ -282,3 +284,114 @@ def test_create_comparison_figure_has_four_panels(results) -> None:
     titles = {ax.get_title() for ax in fig.axes}
     assert "Learning Curves" in titles
     assert "Final Performance" in titles
+
+
+def _bars_with_means(low: float, high: float) -> dict[str, AggregatedResults]:
+    return {
+        "low": _aggregated_from_error("low", np.full((2, 4), low)),
+        "high": _aggregated_from_error("high", np.full((2, 4), high)),
+    }
+
+
+def _gold_index(ax: plt.Axes) -> int:
+    gold = mcolors.to_rgba("gold")
+    for index, patch in enumerate(ax.patches):
+        if patch.get_linewidth() >= 2 and np.allclose(patch.get_edgecolor(), gold, atol=1e-3):
+            return index
+    raise AssertionError("no gold-marked bar")
+
+
+def test_plot_final_performance_bars_rejects_string_false_without_crowning_loser() -> None:
+    """A non-empty string is truthy, so 'false' used to mark the lowest mean gold."""
+    results = _bars_with_means(1.0, 2.0)
+    before = tuple(plt.get_fignums())
+
+    with pytest.raises(ValueError, match="exact bool"):
+        plot_final_performance_bars(results, lower_is_better="false")
+    assert tuple(plt.get_fignums()) == before
+
+
+@pytest.mark.parametrize("value", [1, 0, "true", np.bool_(True)])
+def test_plot_final_performance_bars_rejects_non_bool_identities_without_figure(
+    value: object,
+) -> None:
+    results = _bars_with_means(1.0, 2.0)
+    before = tuple(plt.get_fignums())
+
+    with pytest.raises(ValueError, match="exact bool"):
+        plot_final_performance_bars(results, lower_is_better=value)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="exact bool"):
+        plot_final_performance_bars(results, show_significance=value)  # type: ignore[arg-type]
+    assert tuple(plt.get_fignums()) == before
+
+
+def test_plot_final_performance_bars_marks_highest_when_lower_is_better_is_false() -> None:
+    results = _bars_with_means(1.0, 2.0)
+    _, ax = plot_final_performance_bars(results, lower_is_better=False, show_significance=False)
+    assert _gold_index(ax) == 1
+
+
+def test_plot_final_performance_bars_marks_lowest_when_lower_is_better_is_true() -> None:
+    results = _bars_with_means(1.0, 2.0)
+    _, ax = plot_final_performance_bars(results, lower_is_better=True, show_significance=False)
+    assert _gold_index(ax) == 0
+
+
+def test_plot_learning_curves_rejects_string_false_ci_without_drawing_band(results) -> None:
+    before = tuple(plt.get_fignums())
+
+    with pytest.raises(ValueError, match="exact bool"):
+        plot_learning_curves(results, show_ci="false", window_size=5)
+    assert tuple(plt.get_fignums()) == before
+
+
+def test_plot_learning_curves_omits_band_when_show_ci_is_false(results) -> None:
+    _, ax = plot_learning_curves(results, show_ci=False, log_scale=False, window_size=5)
+    assert len(ax.collections) == 0
+
+
+def test_plot_step_size_evolution_rejects_non_bool_show_ci_without_figure(results) -> None:
+    before = tuple(plt.get_fignums())
+
+    with pytest.raises(ValueError, match="exact bool"):
+        plot_step_size_evolution(results, show_ci="false")
+    assert tuple(plt.get_fignums()) == before
+
+
+def test_plot_hyperparameter_heatmap_rejects_non_bool_lower_is_better(results) -> None:
+    before = tuple(plt.get_fignums())
+
+    with pytest.raises(ValueError, match="exact bool"):
+        plot_hyperparameter_heatmap(
+            results,
+            param1_name="optimizer",
+            param1_values=["lms", "idbd"],
+            param2_name="suffix",
+            param2_values=[""],
+            name_pattern="{p1}{p2}",
+            lower_is_better="false",
+        )
+    assert tuple(plt.get_fignums()) == before
+
+
+def test_set_publication_style_rejects_non_bool_and_nonfinite_hosts() -> None:
+    before = dict(plt.rcParams)
+    try:
+        with pytest.raises(ValueError, match="exact bool"):
+            set_publication_style(use_latex=1)
+        with pytest.raises(ValueError, match="real number"):
+            set_publication_style(font_size=True)
+        with pytest.raises(ValueError, match="finite positive"):
+            set_publication_style(figure_width=float("nan"))
+    finally:
+        plt.rcParams.update(before)
+
+
+def test_set_publication_style_keeps_legal_hosts() -> None:
+    before = dict(plt.rcParams)
+    try:
+        set_publication_style(font_size=10, use_latex=False, figure_width=3.5)
+        assert plt.rcParams["font.size"] == 10
+        assert plt.rcParams["text.usetex"] is False
+    finally:
+        plt.rcParams.update(before)

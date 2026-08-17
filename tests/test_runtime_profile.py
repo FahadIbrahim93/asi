@@ -36,9 +36,7 @@ def _matched_gpu_profile() -> dict[str, object]:
             "record_sha256": f"{position + 2:x}" * 64,
             "version": version,
         }
-        for position, (name, version) in enumerate(
-            distribution_versions.items()
-        )
+        for position, (name, version) in enumerate(distribution_versions.items())
     }
     cuda_wheel_library_paths = ["/opt/cuda-wheels"]
     cuda_wheel_library_profile_sha256 = hashlib.sha256(
@@ -56,9 +54,7 @@ def _matched_gpu_profile() -> dict[str, object]:
     gpu_user_library_bundle_sha256 = hashlib.sha256(
         json.dumps(
             {
-                "cuda_wheel_library_profile_sha256": (
-                    cuda_wheel_library_profile_sha256
-                ),
+                "cuda_wheel_library_profile_sha256": (cuda_wheel_library_profile_sha256),
                 "driver_user_library_tree_sha256": driver_tree_sha256,
                 "libcuda_sha256": libcuda_sha256,
                 "schema_version": "alberta.gpu_user_library_bundle.v1",
@@ -101,12 +97,8 @@ def _matched_gpu_profile() -> dict[str, object]:
             "imageio-ffmpeg": {
                 "distribution": "imageio-ffmpeg",
                 "mode": 0o555,
-                "record_sha256": scientific_package_records[
-                    "imageio-ffmpeg"
-                ]["record_sha256"],
-                "relative_path": (
-                    "imageio_ffmpeg/binaries/ffmpeg-linux-x86_64-v7.0.2"
-                ),
+                "record_sha256": scientific_package_records["imageio-ffmpeg"]["record_sha256"],
+                "relative_path": ("imageio_ffmpeg/binaries/ffmpeg-linux-x86_64-v7.0.2"),
                 "sha256": "f" * 64,
                 "version": "0.6.0",
             }
@@ -164,37 +156,25 @@ def _matched_gpu_profile() -> dict[str, object]:
             "version": "0.9.0.1",
         },
         "dependency_contract": {
-            "cuda_wheel_library_profile_sha256": (
-                cuda_wheel_library_profile_sha256
-            ),
+            "cuda_wheel_library_profile_sha256": (cuda_wheel_library_profile_sha256),
             "cuda_wheel_library_paths": cuda_wheel_library_paths,
             "dependency_lock_sha256": "c" * 64,
             "determinism_qualification": determinism_qualification,
-            "determinism_qualification_sha256": (
-                determinism_qualification_sha256
-            ),
-            "driver_user_library_hash_scheme": (
-                "canonical-entry-json+mode+size+bytes-v1"
-            ),
+            "determinism_qualification_sha256": (determinism_qualification_sha256),
+            "driver_user_library_hash_scheme": ("canonical-entry-json+mode+size+bytes-v1"),
             "driver_user_library_paths": ["/opt/nvidia-driver"],
             "driver_user_library_tree_sha256": driver_tree_sha256,
             "executor_kind": "oci",
-            "gpu_user_library_bundle_sha256": (
-                gpu_user_library_bundle_sha256
-            ),
+            "gpu_user_library_bundle_sha256": (gpu_user_library_bundle_sha256),
             "image_id": image_id,
             "image_reference_digest": "sha256:" + "f" * 64,
             "libcuda_sha256": libcuda_sha256,
             "native_runtime_inventory_sha256": "3" * 64,
-            "native_runtime_inventory_hash_scheme": (
-                "canonical-entry-json+mode+size+bytes-v1"
-            ),
+            "native_runtime_inventory_hash_scheme": ("canonical-entry-json+mode+size+bytes-v1"),
             "native_runtime_inventory_root": "/opt/venv",
             "runtime_binary_sha256": "1" * 64,
             "sbom_sha256": "4" * 64,
-            "scientific_runtime_class": (
-                "matched_current_foragax_0_55_cuda12"
-            ),
+            "scientific_runtime_class": ("matched_current_foragax_0_55_cuda12"),
         },
         "import_shadow_contract": {
             "base_sys_path_contract": [
@@ -290,9 +270,7 @@ def _matched_gpu_profile() -> dict[str, object]:
                         "writable": False,
                     },
                 ],
-                (
-                    "trusted_source_preceded_only_by_empty_read_only_tmp_src"
-                ): True,
+                ("trusted_source_preceded_only_by_empty_read_only_tmp_src"): True,
             },
         },
         "gpu_host_runtime": {
@@ -336,10 +314,7 @@ def _matched_gpu_profile() -> dict[str, object]:
                 "TMPDIR=/run/alberta/tmp",
                 "TZ=UTC",
                 "XDG_CACHE_HOME=/run/alberta/cache",
-                (
-                    "XLA_FLAGS=--xla_gpu_enable_triton_gemm=false "
-                    "--xla_gpu_deterministic_ops=true"
-                ),
+                ("XLA_FLAGS=--xla_gpu_enable_triton_gemm=false --xla_gpu_deterministic_ops=true"),
                 "XLA_PYTHON_CLIENT_PREALLOCATE=false",
             ]
         ),
@@ -368,10 +343,7 @@ def test_runtime_profile_hash_and_identity_are_structurally_verified() -> None:
         environment_rng_schedule=schedule,
         environment_rng_schedule_sha256=schedule_sha256,
     )
-    assert (
-        ENVIRONMENT_RNG_SCHEDULE_SCHEMA_VERSION
-        == "alberta.environment_rng_schedule.v1"
-    )
+    assert ENVIRONMENT_RNG_SCHEDULE_SCHEMA_VERSION == "alberta.environment_rng_schedule.v1"
 
 
 @pytest.mark.parametrize(
@@ -441,9 +413,7 @@ def test_runtime_identity_rejects_unverified_hashes_and_schedule() -> None:
             runtime_profile=profile,
             environment_runtime_profile_sha256="0" * 64,
             environment_rng_schedule=schedule,
-            environment_rng_schedule_digest=environment_rng_schedule_sha256(
-                schedule
-            ),
+            environment_rng_schedule_digest=environment_rng_schedule_sha256(schedule),
         )
     with pytest.raises(ValueError, match="unsupported"):
         environment_rng_schedule_sha256("unknown_schedule")
@@ -456,13 +426,9 @@ def test_runtime_identity_rejects_profile_id_relabeling() -> None:
         validate_environment_runtime_identity(
             runtime_profile_id="unrelated-runtime-profile",
             runtime_profile=profile,
-            environment_runtime_profile_sha256=(
-                environment_runtime_profile_sha256(profile)
-            ),
+            environment_runtime_profile_sha256=(environment_runtime_profile_sha256(profile)),
             environment_rng_schedule=schedule,
-            environment_rng_schedule_digest=environment_rng_schedule_sha256(
-                schedule
-            ),
+            environment_rng_schedule_digest=environment_rng_schedule_sha256(schedule),
         )
 
 
@@ -569,3 +535,27 @@ def test_runtime_profile_rejects_non_jax_record_version_drift(
     record["version"] = "999.0"
     with pytest.raises(ValueError, match="RECORD version differs"):
         validate_environment_runtime_profile(profile)
+
+
+def test_runtime_profile_rejects_float_and_boolean_executable_mode() -> None:
+    profile = _matched_gpu_profile()
+    ffmpeg = profile["bundled_executables"]["imageio-ffmpeg"]
+    assert isinstance(ffmpeg, dict)
+
+    # Float mode alias (365.0 == 0o555)
+    float_profile = _matched_gpu_profile()
+    float_profile["bundled_executables"]["imageio-ffmpeg"]["mode"] = 365.0
+    with pytest.raises(ValueError, match="imageio-ffmpeg identity is invalid"):
+        validate_environment_runtime_profile(float_profile)
+
+    # Boolean mode
+    bool_profile = _matched_gpu_profile()
+    bool_profile["bundled_executables"]["imageio-ffmpeg"]["mode"] = True
+    with pytest.raises(ValueError, match="imageio-ffmpeg identity is invalid"):
+        validate_environment_runtime_profile(bool_profile)
+
+    # Float tmp_src_mode
+    shadow_profile = _matched_gpu_profile()
+    shadow_profile["import_shadow_contract"]["tmp_src_mode"] = 365.0
+    with pytest.raises(ValueError, match="import-shadow isolation is invalid"):
+        validate_environment_runtime_profile(shadow_profile)
