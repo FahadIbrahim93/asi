@@ -114,6 +114,8 @@ def _require_bool(name: str, value: object) -> bool:
 
 
 def _validate_step6_config(config: Step6DifferentialSARSAConfig) -> None:
+    if type(config) is not Step6DifferentialSARSAConfig:
+        raise TypeError("config must be an exact Step6DifferentialSARSAConfig")
     n_actions = _require_int(
         "n_actions",
         config.n_actions,
@@ -141,6 +143,7 @@ def _validate_step6_config(config: Step6DifferentialSARSAConfig) -> None:
     object.__setattr__(config, "epsilon_start", epsilon_start)
     object.__setattr__(config, "epsilon_end", epsilon_end)
     object.__setattr__(config, "epsilon_decay_steps", epsilon_decay_steps)
+    config.to_core_config()
 
 
 @dataclass(frozen=True)
@@ -174,7 +177,14 @@ class Step6DifferentialSARSAConfig:
     @classmethod
     def from_dict(cls, payload: dict[str, object]) -> Step6DifferentialSARSAConfig:
         """Reconstruct from :meth:`to_dict` output."""
-        return cls(**cast(Any, payload))
+        if type(payload) is not dict:
+            raise ValueError("Step6DifferentialSARSAConfig payload must be an exact dictionary")
+        raw = cast(dict[object, object], payload)
+        if any(type(key) is not str for key in raw):
+            raise ValueError("Step6DifferentialSARSAConfig payload keys must be exact strings")
+        if cast(set[str], set(raw)) != frozenset(cls.__dataclass_fields__):
+            raise ValueError("Step6DifferentialSARSAConfig payload fields do not match the schema")
+        return cls(**cast(Any, dict(raw)))
 
     def to_core_config(self) -> DifferentialSARSAConfig:
         """Return the core differential SARSA config."""
@@ -204,6 +214,10 @@ class Step6SmokeResult:
     agent_config: dict[str, Any]
 
     def __post_init__(self) -> None:
+        if type(self.config) is not Step6DifferentialSARSAConfig:
+            raise TypeError("config must be an exact Step6DifferentialSARSAConfig")
+        if type(self.agent_config) is not dict:
+            raise TypeError("agent_config must be an exact dictionary")
         object.__setattr__(
             self, "steps", _require_int("steps", self.steps, minimum=1, maximum=_INT32_MAX)
         )
@@ -236,8 +250,53 @@ def make_step6_differential_sarsa_agent(
     config: Step6DifferentialSARSAConfig | None = None,
 ) -> DifferentialSARSAAgent:
     """Create the production Step 6 differential SARSA agent."""
-    cfg = config or Step6DifferentialSARSAConfig()
+    if config is None:
+        cfg = Step6DifferentialSARSAConfig()
+    elif type(config) is Step6DifferentialSARSAConfig:
+        cfg = config
+    else:
+        raise TypeError("config must be an exact Step6DifferentialSARSAConfig")
     return DifferentialSARSAAgent(cfg.to_core_config())
+
+
+def _checked_product(name: str, *factors: int) -> int:
+    product = 1
+    for factor in factors:
+        if factor < 0 or (factor != 0 and product > _INT32_MAX // factor):
+            raise ValueError(f"derived {name} must fit signed int32")
+        product *= factor
+    return product
+
+
+def _checked_sum(name: str, *terms: int) -> int:
+    total = 0
+    for term in terms:
+        if term < 0 or term > _INT32_MAX - total:
+            raise ValueError(f"derived {name} must fit signed int32")
+        total += term
+    return total
+
+
+def _preflight_step6_smoke_resources(
+    config: Step6DifferentialSARSAConfig,
+    *,
+    steps: int,
+    feature_dim: int,
+) -> None:
+    state_parameters = _checked_product(
+        "Step 6 state parameter count", config.n_actions, feature_dim
+    )
+    _checked_product("Step 6 state parameter bytes", 8, state_parameters)
+    rows = _checked_sum("Step 6 observation row count", steps, 1)
+    observations = _checked_product("Step 6 observation count", rows, feature_dim)
+    q_values = _checked_product("Step 6 q-value count", steps, config.n_actions)
+    _checked_sum(
+        "Step 6 smoke array bytes",
+        _checked_product("Step 6 observation bytes", 4, observations),
+        _checked_product("Step 6 q-value bytes", 4, q_values),
+        # rewards, TD errors, average rewards, actions, and validity flags.
+        _checked_product("Step 6 scalar output bytes", 17, steps),
+    )
 
 
 def init_step6_state(
@@ -251,6 +310,9 @@ def init_step6_state(
     feature_dim = _require_int(
         "feature_dim", feature_dim, minimum=1, maximum=_INT32_MAX
     )
+    if type(agent) is not DifferentialSARSAAgent:
+        raise TypeError("agent must be an exact DifferentialSARSAAgent")
+    _checked_product("Step 6 state parameter bytes", 8, agent.config.n_actions, feature_dim)
     state = agent.init(feature_dim, key)
     state, _action = agent.start(state, initial_features)
     return cast(DifferentialSARSAState, state)
@@ -290,7 +352,13 @@ def run_step6_smoke(
     )
     seed = require_jax_seed(seed, name="seed")
 
-    cfg = config or Step6DifferentialSARSAConfig()
+    if config is None:
+        cfg = Step6DifferentialSARSAConfig()
+    elif type(config) is Step6DifferentialSARSAConfig:
+        cfg = config
+    else:
+        raise TypeError("config must be an exact Step6DifferentialSARSAConfig")
+    _preflight_step6_smoke_resources(cfg, steps=steps, feature_dim=feature_dim)
     agent = make_step6_differential_sarsa_agent(cfg)
     data_key, state_key = jr.split(jr.key(seed))
     observations = jr.normal(data_key, (steps + 1, feature_dim), dtype=jnp.float32)
