@@ -24,6 +24,7 @@ import numpy as np
 from jax import Array
 from jaxtyping import Bool, Float
 
+from alberta_framework.core._float32_scalars import validated_float32_scalar
 from alberta_framework.core.types import (
     AutostepGTDLambdaState,
     AutostepParamState,
@@ -703,15 +704,22 @@ class IDBD(Optimizer[IDBDState]):
                 the linear ``update()`` method always uses x^2.
 
         Raises:
-            ValueError: If ``h_decay_mode`` is not one of the valid modes
+            ValueError: If ``h_decay_mode`` is not one of the valid modes,
+                or if a step-size is not a finite non-bool real in the
+                declared domain (``initial_step_size`` positive;
+                ``meta_step_size`` nonnegative).
         """
         if h_decay_mode not in ("prediction_grads", "loss_grads"):
             raise ValueError(
                 f"Invalid h_decay_mode: {h_decay_mode!r}. "
                 "Must be 'prediction_grads' or 'loss_grads'."
             )
-        self._initial_step_size = initial_step_size
-        self._meta_step_size = meta_step_size
+        self._initial_step_size = validated_float32_scalar(
+            "initial_step_size", initial_step_size, positive=True
+        )
+        self._meta_step_size = validated_float32_scalar(
+            "meta_step_size", meta_step_size, lower=0.0
+        )
         self._h_decay_mode = h_decay_mode
 
     def to_config(self) -> dict[str, Any]:
