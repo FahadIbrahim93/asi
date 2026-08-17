@@ -18,9 +18,11 @@ contracts are exercised in ``tests/test_prototype_memory.py`` and
 from __future__ import annotations
 
 import math
+import operator
 from dataclasses import asdict, dataclass
-from numbers import Integral, Real
-from typing import Any, Literal, cast
+from fractions import Fraction
+from numbers import Real
+from typing import Any, Literal, SupportsIndex, cast
 
 import jax.numpy as jnp
 import jax.random as jr
@@ -131,19 +133,32 @@ _STEP2_ASSOCIATIVE_CONFIG_KEYS = frozenset(
     }
 )
 _INT32_MAX = 2**31 - 1
-_ACTUAL_INT_TYPES: tuple[type, ...] = (
-    int,
-    np.int8,
-    np.int16,
-    np.int32,
-    np.int64,
-    np.longlong,
-    np.uint8,
-    np.uint16,
-    np.uint32,
-    np.uint64,
-    np.ulonglong,
+_ACTUAL_INT_TYPES = frozenset(
+    {
+        int,
+        np.int8,
+        np.int16,
+        np.int32,
+        np.int64,
+        np.uint8,
+        np.uint16,
+        np.uint32,
+        np.uint64,
+        np.longlong,
+        np.ulonglong,
+    }
 )
+_ACTUAL_FLOAT_TYPES = frozenset(
+    {
+        float,
+        Fraction,
+        np.dtype("e").type,
+        np.dtype("f").type,
+        np.dtype("d").type,
+        np.dtype("g").type,
+    }
+)
+_ALLOWED_REAL_TYPES = _ACTUAL_INT_TYPES | _ACTUAL_FLOAT_TYPES
 
 
 def _require_exact_keys(
@@ -152,23 +167,26 @@ def _require_exact_keys(
     expected: frozenset[str],
 ) -> None:
     if set(payload) != expected:
-        raise ValueError(
-            f"{config_name} payload keys must be exactly {sorted(expected)!r}"
-        )
+        raise ValueError(f"{config_name} payload keys must be exactly {sorted(expected)!r}")
 
 
 def finite_real_and_float32(name: str, value: object) -> tuple[Real, int, int, float]:
     """Return the original real, exact ratio, and finite binary32 rounding."""
     actual_type = type(value)
-    if issubclass(actual_type, bool) or not issubclass(actual_type, Real):
-        raise ValueError(f"{name} must be a real number, got {value!r}")
+    if actual_type not in _ALLOWED_REAL_TYPES:
+        mro = type.__getattribute__(actual_type, "__mro__")
+        has_real_lineage = actual_type is not bool and any(
+            base is int or base is float or base is Fraction for base in mro
+        )
+        requirement = "finite" if has_real_lineage else "a real number"
+        raise ValueError(f"{name} must be {requirement}")
     real = cast(Real, value)
     try:
         numerator, denominator, narrowed = round_real_to_float32_with_ratio(real)
     except (FloatingPointError, OverflowError, TypeError, ValueError):
-        raise ValueError(f"{name} must narrow to a finite float32, got {value!r}") from None
+        raise ValueError(f"{name} must narrow to a finite float32") from None
     if not math.isfinite(narrowed):
-        raise ValueError(f"{name} must narrow to a finite float32, got {value!r}")
+        raise ValueError(f"{name} must narrow to a finite float32")
     return real, numerator, denominator, narrowed
 
 
@@ -196,7 +214,7 @@ def _require_unit_interval(name: str, value: object) -> float:
         or narrowed < 0.0
         or not narrowed <= 1.0
     ):
-        raise ValueError(f"{name} must be in [0, 1], got {value!r}")
+        raise ValueError(f"{name} must be in [0, 1]")
     return canonical_float32_storage(real, narrowed)
 
 
@@ -210,23 +228,21 @@ def _require_half_open_unit_interval(name: str, value: object) -> float:
         or narrowed <= 0.0
         or not narrowed <= 1.0
     ):
-        raise ValueError(f"{name} must be in (0, 1], got {value!r}")
+        raise ValueError(f"{name} must be in (0, 1]")
     return canonical_float32_storage(real, narrowed)
 
 
 def _require_nonnegative_real(name: str, value: object) -> float:
     real, numerator, _, narrowed = finite_real_and_float32(name, value)
     if real < 0.0 or numerator < 0 or narrowed < 0.0:
-        raise ValueError(f"{name} must be non-negative, got {value!r}")
+        raise ValueError(f"{name} must be non-negative")
     return canonical_float32_storage(real, narrowed)
 
 
 def _require_positive_real(name: str, value: object) -> float:
     real, numerator, _, narrowed = finite_real_and_float32(name, value)
     if real <= 0.0 or numerator <= 0 or narrowed <= 0.0:
-        raise ValueError(
-            f"{name} must be positive in float32 execution sink, got {value!r}"
-        )
+        raise ValueError(f"{name} must be positive in float32 execution sink")
     return canonical_float32_storage(real, narrowed)
 
 
@@ -237,27 +253,25 @@ def _require_int(
     minimum: int | None = None,
     maximum: int | None = None,
 ) -> int:
-    if type(value) not in _ACTUAL_INT_TYPES:
-        raise ValueError(f"{name} must be an integer, got {value!r}")
-    try:
-        number = int(cast(Integral, value))
-    except (OverflowError, TypeError, ValueError):
-        raise ValueError(f"{name} must be an integer, got {value!r}") from None
+    actual_type = type(value)
+    if actual_type not in _ACTUAL_INT_TYPES:
+        raise ValueError(f"{name} must be an integer")
+    number = operator.index(cast(SupportsIndex, value))
     if minimum is not None and number < minimum:
         if minimum == 1:
-            raise ValueError(f"{name} must be positive, got {value!r}")
+            raise ValueError(f"{name} must be positive")
         if minimum == 0:
-            raise ValueError(f"{name} must be non-negative, got {value!r}")
-        raise ValueError(f"{name} must be >= {minimum}, got {value!r}")
+            raise ValueError(f"{name} must be non-negative")
+        raise ValueError(f"{name} must be >= {minimum}")
     if maximum is not None and number > maximum:
-        raise ValueError(f"{name} must be <= {maximum}, got {value!r}")
+        raise ValueError(f"{name} must be <= {maximum}")
     return number
 
 
 def _require_bool(name: str, value: object) -> bool:
     """Require an actual builtin bool (``__class__`` spoofing is ignored)."""
     if type(value) is not bool:
-        raise ValueError(f"{name} must be a bool, got {value!r}")
+        raise ValueError(f"{name} must be a built-in bool")
     return value
 
 
@@ -270,7 +284,7 @@ def _validate_step2_kernel_config(config: Step2KernelConfig) -> None:
     )
     if type(config.hidden_sizes) is not tuple:
         raise ValueError(
-            f"hidden_sizes must be a tuple of integers, got {config.hidden_sizes!r}"
+            "hidden_sizes must be a tuple of integers"
         )
     canonical_hidden: list[int] = []
     for h in config.hidden_sizes:
@@ -281,7 +295,7 @@ def _validate_step2_kernel_config(config: Step2KernelConfig) -> None:
         )
     if type(config.stream) is not str or config.stream not in _VALID_STEP2_STREAMS:
         raise ValueError(
-            f"unknown Step 2 stream field {config.stream!r}; "
+            "unknown Step 2 stream field; "
             f"expected one of {sorted(_VALID_STEP2_STREAMS)}"
         )
     if config.stream == "polynomial" and feature_dim < 3:
@@ -291,7 +305,7 @@ def _validate_step2_kernel_config(config: Step2KernelConfig) -> None:
         or config.readout_mode not in _VALID_STEP2_READOUT_MODES
     ):
         raise ValueError(
-            f"unknown Step 2 readout_mode field {config.readout_mode!r}; "
+            "unknown Step 2 readout_mode field; "
             f"expected one of {sorted(_VALID_STEP2_READOUT_MODES)}"
         )
     if (
@@ -299,7 +313,7 @@ def _validate_step2_kernel_config(config: Step2KernelConfig) -> None:
         or config.loss_normalization not in _VALID_STEP2_LOSS_NORMALIZATIONS
     ):
         raise ValueError(
-            f"unknown Step 2 loss_normalization field {config.loss_normalization!r}; "
+            "unknown Step 2 loss_normalization field; "
             f"expected one of {sorted(_VALID_STEP2_LOSS_NORMALIZATIONS)}"
         )
     step_size = _require_nonnegative_real("step_size", config.step_size)
@@ -324,7 +338,7 @@ def _validate_step2_strict_digit_config(config: Step2StrictDigitReadoutConfig) -
     )
     if type(config.hidden_sizes) is not tuple:
         raise ValueError(
-            f"hidden_sizes must be a tuple of integers, got {config.hidden_sizes!r}"
+            "hidden_sizes must be a tuple of integers"
         )
     canonical_hidden: list[int] = []
     for h in config.hidden_sizes:
@@ -896,7 +910,7 @@ def make_step2_stream(
             context_length=cfg.context_length,
             noise_std=cfg.noise_std,
         )
-    msg = f"unknown Step 2 stream {cfg.stream!r}"
+    msg = "unknown Step 2 stream"
     raise ValueError(msg)
 
 
