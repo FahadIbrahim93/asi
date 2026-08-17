@@ -6,7 +6,11 @@ from typing import Any, cast
 import numpy as np
 import pytest
 
-from alberta_framework.steps.step6 import Step6DifferentialSARSAConfig
+from alberta_framework.steps.step6 import (
+    Step6DifferentialSARSAConfig,
+    make_step6_differential_sarsa_agent,
+    run_step6_smoke,
+)
 
 
 class _EvilStr(str):
@@ -172,3 +176,45 @@ def test_float_subclass_with_lying_ratio_is_rejected() -> None:
     with pytest.raises(ValueError, match="must be finite"):
         Step6DifferentialSARSAConfig(q_step_size=RatioFloat(0.05))
     assert RatioFloat.calls == 0
+
+
+def test_from_dict_requires_exact_complete_schema_without_mapping_hooks() -> None:
+    class HostileDict(dict[object, object]):
+        calls = 0
+
+        def __iter__(self):  # pragma: no cover - must not run
+            type(self).calls += 1
+            raise AssertionError("mapping hook must not run")
+
+    with pytest.raises(ValueError, match="exact dictionary"):
+        Step6DifferentialSARSAConfig.from_dict(cast(Any, HostileDict()))
+    assert HostileDict.calls == 0
+    payload = Step6DifferentialSARSAConfig().to_dict()
+    payload["extra"] = 1
+    with pytest.raises(ValueError, match="schema"):
+        Step6DifferentialSARSAConfig.from_dict(payload)
+
+
+def test_runtime_entry_points_require_exact_config_without_truthiness_hooks() -> None:
+    calls = 0
+
+    class HostileConfig:
+        def __bool__(self) -> bool:  # pragma: no cover - must not run
+            nonlocal calls
+            calls += 1
+            raise AssertionError("truthiness hook must not run")
+
+    value = HostileConfig()
+    with pytest.raises(TypeError, match="exact Step6DifferentialSARSAConfig"):
+        make_step6_differential_sarsa_agent(cast(Any, value))
+    with pytest.raises(TypeError, match="exact Step6DifferentialSARSAConfig"):
+        run_step6_smoke(cast(Any, value), steps=1)
+    assert calls == 0
+
+
+def test_smoke_preflights_state_and_output_resources_before_allocation() -> None:
+    huge_actions = Step6DifferentialSARSAConfig(n_actions=536_870_912)
+    with pytest.raises(ValueError, match="state parameter bytes"):
+        run_step6_smoke(huge_actions, steps=1, feature_dim=1)
+    with pytest.raises(ValueError, match="observation row count"):
+        run_step6_smoke(steps=2**31 - 1, feature_dim=1)
