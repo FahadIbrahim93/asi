@@ -123,8 +123,8 @@ def sparse_init(
         fan_out_raw, fan_in_raw = shape
     except Exception as error:
         raise ValueError("shape must be a two-element tuple or list (fan_out, fan_in)") from error
-    fan_out = _require_int("fan_out", fan_out_raw, minimum=1)
-    fan_in = _require_int("fan_in", fan_in_raw, minimum=1)
+    fan_out = _require_int("shape fan_out", fan_out_raw, minimum=1)
+    fan_in = _require_int("shape fan_in", fan_in_raw, minimum=1)
     if fan_out > _INT32_MAX or fan_in > _INT32_MAX:
         raise ValueError("shape dimensions must fit signed int32")
     # Allocation-free preflight: fan_out * fan_in * 4 bytes must fit int32
