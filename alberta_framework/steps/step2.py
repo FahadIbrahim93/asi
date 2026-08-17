@@ -104,6 +104,31 @@ _STEP2_MEMORY_CONFIG_KEYS = frozenset(
         "bandwidth",
     }
 )
+_STEP2_ASSOCIATIVE_CONFIG_KEYS = frozenset(
+    {
+        "vocab_size",
+        "block_size",
+        "suffix_length",
+        "feature_family",
+        "max_features",
+        "write_lr",
+        "retention",
+        "utility_lr",
+        "utility_decay",
+        "min_weight",
+        "max_weight",
+        "logit_scale",
+        "normalize_by_weight",
+        "adaptive_feature_family",
+        "adaptive_window",
+        "adaptive_budget",
+        "scope_lr",
+        "budget_lr",
+        "initial_budget_fraction",
+        "min_effective_budget",
+        "scope_logit_clip",
+    }
+)
 _INT32_MAX = 2**31 - 1
 _ACTUAL_INT_TYPES: tuple[type, ...] = (
     int,
@@ -458,6 +483,12 @@ class Step2AssociativeConfig:
     min_effective_budget: int = 1
     scope_logit_clip: float = 8.0
 
+    def __post_init__(self) -> None:
+        """Reject invalid parameters and canonicalize via the core config."""
+        core = self.to_core_config()
+        for name in _STEP2_ASSOCIATIVE_CONFIG_KEYS:
+            object.__setattr__(self, name, getattr(core, name))
+
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-serializable representation."""
         return asdict(self)
@@ -465,6 +496,7 @@ class Step2AssociativeConfig:
     @classmethod
     def from_dict(cls, payload: dict[str, object]) -> Step2AssociativeConfig:
         """Reconstruct from :meth:`to_dict` output."""
+        _require_exact_keys(cls.__name__, payload, _STEP2_ASSOCIATIVE_CONFIG_KEYS)
         return cls(**cast(Any, payload))
 
     def to_core_config(self) -> AssociativeMemoryConfig:
