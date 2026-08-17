@@ -553,6 +553,21 @@ class TestSpectrum:
 
 
 class TestGenerator:
+    def test_geometry_overflow_fails_before_materializing_nonfinite_stream(self):
+        config = tiny(
+            "input_permutation",
+            dim=8,
+            n_classes=2,
+            n_components=1,
+            component_sparsity=1,
+            offset_scale=float(np.finfo(np.float32).max),
+        )
+
+        with pytest.raises(ValueError, match="geometry must remain finite"):
+            generate_stream(config, seed=2)
+        with pytest.raises(ValueError, match="geometry must remain finite"):
+            bayes_reference(config, seed=2, n_samples=1)
+
     def test_deterministic_per_seed(self):
         a = generate_stream(TINY, seed=0)
         b = generate_stream(TINY, seed=0)

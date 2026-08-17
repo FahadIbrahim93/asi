@@ -530,6 +530,14 @@ def class_geometry(config: MicroStreamConfig, seed: int) -> tuple[Array, Array]:
     return component_means.astype(jnp.float32), dim_sigma
 
 
+def _require_finite_geometry(component_means: Array, dim_sigma: Array) -> None:
+    if not bool(
+        jnp.all(jnp.isfinite(component_means))
+        & jnp.all(jnp.isfinite(dim_sigma))
+    ):
+        raise ValueError("micro stream geometry must remain finite in float32")
+
+
 @dataclass(frozen=True)
 class GaussianMicroStream:
     """A materialized micro stream plus its generating ground truth.
@@ -591,6 +599,7 @@ def generate_stream(config: MicroStreamConfig, seed: int) -> GaussianMicroStream
         key_regime, 5
     )
     component_means, dim_sigma = class_geometry(config, seed)
+    _require_finite_geometry(component_means, dim_sigma)
 
     n_steps = config.n_steps
     base_y = jr.randint(key_labels, (n_steps,), 0, config.n_classes).astype(jnp.int32)
@@ -740,6 +749,7 @@ def bayes_reference(
         bayes_work_scalars,
     )
     component_means, dim_sigma = class_geometry(config, seed)
+    _require_finite_geometry(component_means, dim_sigma)
     key = jr.fold_in(jr.key(seed), _BAYES_DOMAIN)
     n_correct = 0
     drawn = 0
