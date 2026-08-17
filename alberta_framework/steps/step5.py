@@ -49,55 +49,65 @@ _STEP5_CONFIG_KEYS_ERROR = (
     "['average_reward_step_size', 'step_size', 'trace_decay']"
 )
 _INT32_MAX = 2**31 - 1
-_NUMPY_INTEGER_TYPES = (
-    np.byte,
-    np.short,
-    np.intc,
-    np.int_,
-    np.longlong,
-    np.ubyte,
-    np.ushort,
-    np.uintc,
-    np.uint,
-    np.ulonglong,
+_ACTUAL_INT_TYPES = frozenset(
+    {
+        int,
+        np.int8,
+        np.int16,
+        np.int32,
+        np.int64,
+        np.uint8,
+        np.uint16,
+        np.uint32,
+        np.uint64,
+        np.longlong,
+        np.ulonglong,
+    }
 )
+_NUMPY_INTEGER_TYPES = _ACTUAL_INT_TYPES
+
+
+def _require_exact_str(name: str, value: object) -> str:
+    if type(value) is not str:
+        raise ValueError(f"{name} must be an exact string")
+    return value
 
 
 def _require_int(
-    name: str,
+    name: object,
     value: object,
     *,
     minimum: int | None = None,
     maximum: int | None = None,
 ) -> int:
     """Reject non-integers (including bool and class-spoofed actual types)."""
+    host_name = _require_exact_str("name", name)
     actual_type = type(value)
-    if actual_type is int:
-        number = cast(int, value)
-    elif actual_type in _NUMPY_INTEGER_TYPES:
-        number = int(cast(Integral, value))
-    else:
-        raise ValueError(f"{name} must be an integer, got {value!r}")
+    if actual_type not in _ACTUAL_INT_TYPES:
+        raise ValueError(f"{host_name} must be an integer")
+    number = int(cast(Integral, value))
     if minimum is not None and number < minimum:
         if minimum == 1:
-            raise ValueError(f"{name} must be positive, got {value!r}")
+            raise ValueError(f"{host_name} must be positive")
         if minimum == 0:
-            raise ValueError(f"{name} must be non-negative, got {value!r}")
-        raise ValueError(f"{name} must be >= {minimum}, got {value!r}")
+            raise ValueError(f"{host_name} must be non-negative")
+        raise ValueError(f"{host_name} must be >= {minimum}")
     if maximum is not None and number > maximum:
-        raise ValueError(f"{name} must be <= {maximum}, got {value!r}")
+        raise ValueError(f"{host_name} must be <= {maximum}")
     return number
 
 
-def _require_bool(name: str, value: object) -> bool:
+def _require_bool(name: object, value: object) -> bool:
+    host_name = _require_exact_str("name", name)
     if type(value) is not bool:
-        raise ValueError(f"{name} must be a boolean, got {value!r}")
+        raise ValueError(f"{host_name} must be a built-in bool")
     return value
 
 
-def _finite_float32_scalar(name: str, value: object) -> tuple[int, int, float]:
+def _finite_float32_scalar(name: object, value: object) -> tuple[int, int, float]:
     """Validate a real scalar and retain the exact ratio used for rounding."""
-    _, numerator, denominator, narrowed = finite_real_and_float32(name, value)
+    host_name = _require_exact_str("name", name)
+    _, numerator, denominator, narrowed = finite_real_and_float32(host_name, value)
     return numerator, denominator, narrowed
 
 
