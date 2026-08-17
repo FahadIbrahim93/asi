@@ -50,15 +50,44 @@ def test_oak_stomp_adoption_resource_budget_rejects_leftover_identities() -> Non
     assert '"caller_authenticated": 1' not in dumped
 
 
-def test_oak_stomp_adoption_resource_budget_binds_growth_formula() -> None:
-    with pytest.raises(ValueError, match="growth_bytes must equal after minus before"):
+def test_oak_stomp_adoption_resource_budget_binds_zero_growth_formula() -> None:
+    with pytest.raises(ValueError, match="preserve persistent state bytes"):
         replace(_legal_budget(), persistent_state_nbytes_after=65)
-    with pytest.raises(ValueError, match="growth_bytes must equal after minus before"):
+    with pytest.raises(ValueError, match="growth must be zero"):
         replace(_legal_budget(), persistent_state_growth_bytes=1)
 
-    grown = replace(
-        _legal_budget(),
-        persistent_state_nbytes_after=65,
-        persistent_state_growth_bytes=1,
-    )
-    assert grown.persistent_state_growth_bytes == 1
+
+@pytest.mark.parametrize(
+    ("field", "value", "match"),
+    (
+        ("persistent_state_nbytes_before", 0, "positive"),
+        ("persistent_state_nbytes_before", 65, "aligned"),
+        ("stomp_update_evaluations_per_adopt", 1, "zero STOMP updates"),
+        ("stomp_update_evaluations_per_delegated_update", 0, "exactly once"),
+        ("derivation_recomputed_on_adopt", True, "must not recompute"),
+        ("source_result_integrity_checked", False, "must check"),
+        ("caller_authority_required", False, "must require"),
+        ("caller_authenticated", True, "does not authenticate"),
+    ),
+)
+def test_oak_stomp_adoption_resource_budget_rejects_impossible_records(
+    field: str, value: object, match: str
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        replace(_legal_budget(), **{field: value})
+
+
+def test_oak_stomp_adoption_resource_budget_rejects_subclass_before_hooks() -> None:
+    class HostileBudget(OaKExternalSTOMPAdoptionResourceBudget):
+        calls = 0
+
+        def __getattribute__(self, name: str) -> object:
+            if name != "__class__":
+                type(self).calls += 1
+                raise AssertionError("attribute hook must not run")
+            return super().__getattribute__(name)
+
+    hostile = object.__new__(HostileBudget)
+    with pytest.raises(ValueError, match="actual OaKExternal"):
+        OaKExternalSTOMPAdoptionResourceBudget.__post_init__(hostile)
+    assert HostileBudget.calls == 0
