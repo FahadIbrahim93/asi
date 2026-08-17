@@ -495,6 +495,17 @@ class TestBootstrapCI:
             with pytest.raises(ValueError, match="n_bootstrap.*positive integer"):
                 bootstrap_ci([1.0, 2.0, 3.0], n_bootstrap=n_bootstrap, seed=0)  # type: ignore[arg-type]
 
+    def test_hostile_bootstrap_count_is_rejected_without_hooks(self) -> None:
+        class HostileInt(int):
+            def __index__(self) -> int:  # pragma: no cover
+                raise AssertionError("index hook executed")
+
+            def __repr__(self) -> str:  # pragma: no cover
+                raise AssertionError("repr hook executed")
+
+        with pytest.raises(ValueError, match="n_bootstrap.*positive integer"):
+            bootstrap_ci([1.0, 2.0, 3.0], n_bootstrap=HostileInt(10))
+
     @pytest.mark.parametrize("confidence_level", [0.0, 1.0, -0.1, 1.1, float("nan")])
     def test_invalid_confidence_level_rejected_without_warnings(
         self,

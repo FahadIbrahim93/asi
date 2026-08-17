@@ -5,15 +5,21 @@ effect sizes, and multiple comparison corrections.
 """
 
 import math
+import operator
 from collections.abc import Mapping
 from numbers import Real
-from typing import TYPE_CHECKING, NamedTuple, cast
+from typing import TYPE_CHECKING, NamedTuple, SupportsIndex, cast
 
 import numpy as np
 from numpy.typing import NDArray
 
 if TYPE_CHECKING:
     from alberta_framework.utils.experiments import AggregatedResults
+
+
+_ACTUAL_INT_TYPES = frozenset(
+    {int, *(np.dtype(code).type for code in "bBhHiIlLqQpP")}
+)
 
 
 class StatisticalSummary(NamedTuple):
@@ -116,11 +122,11 @@ def _require_alpha(alpha: object) -> float:
 
 def _require_positive_int(name: str, value: object) -> int:
     """Reject bool/float aliases that ordered comparisons treat as legal counts."""
-    if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
-        raise ValueError(f"{name} must be a positive integer (got {value!r})")
-    count = int(value)
+    if type(value) not in _ACTUAL_INT_TYPES:
+        raise ValueError(f"{name} must be a positive integer")
+    count = operator.index(cast(SupportsIndex, value))
     if count <= 0:
-        raise ValueError(f"{name} must be a positive integer (got {value})")
+        raise ValueError(f"{name} must be a positive integer")
     return count
 
 
