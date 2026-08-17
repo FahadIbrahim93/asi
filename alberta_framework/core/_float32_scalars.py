@@ -19,7 +19,7 @@ from alberta_framework._float32 import round_real_to_float32_with_ratio
 
 
 class _Bound(NamedTuple):
-    display: float
+    display: str
     numerator: int
     denominator: int
 
@@ -29,11 +29,18 @@ def _optional_bound(name: str, value: object) -> _Bound | None:
         return None
     try:
         numerator, denominator, _ = round_real_to_float32_with_ratio(value)
-        display = float(cast(Any, value))
     except Exception as error:
         raise ValueError(f"{name} must be None or a finite canonical real") from error
-    if not math.isfinite(display):
-        raise ValueError(f"{name} must be None or a finite canonical real")
+    try:
+        display_number = float(cast(Any, value))
+    except (OverflowError, TypeError, ValueError):
+        display = "<finite exact bound>"
+    else:
+        display = (
+            repr(display_number)
+            if math.isfinite(display_number)
+            else "<finite exact bound>"
+        )
     return _Bound(display, numerator, denominator)
 
 

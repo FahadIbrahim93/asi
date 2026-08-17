@@ -247,9 +247,10 @@ def test_shared_helper_rejects_bound_class_spoof_without_class_hook() -> None:
         pytest.param(Fraction(10**10_000, 3), id="fraction"),
     ],
 )
-def test_shared_helper_normalizes_huge_bound_conversion(bound: object) -> None:
-    with pytest.raises(ValueError, match="upper must be"):
-        validated_float32_scalar("value", 0.5, upper=bound)
+def test_shared_helper_accepts_huge_finite_bounds_with_bounded_errors(bound: object) -> None:
+    assert validated_float32_scalar("value", 0.5, upper=bound) == 0.5
+    with pytest.raises(ValueError, match="finite exact bound"):
+        validated_float32_scalar("value", 0.5, lower=bound)
 
 
 def test_shared_helper_accepts_exact_canonical_bound_families() -> None:
@@ -258,6 +259,12 @@ def test_shared_helper_accepts_exact_canonical_bound_families() -> None:
         np.float32(one_third)
     )
     assert validated_float32_scalar("value", 1, lower=np.int32(1), upper=np.float64(1.0)) == 1.0
+
+
+def test_exact_fraction_bound_survives_binary64_and_float32_narrowing() -> None:
+    just_above_one = Fraction(2**54 + 1, 2**54)
+    with pytest.raises(ValueError, match="must remain"):
+        validated_float32_scalar("value", just_above_one, lower=just_above_one)
 
 
 def test_shared_helper_rejects_empty_or_impossible_policy_domains() -> None:
