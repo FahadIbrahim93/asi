@@ -80,6 +80,16 @@ def test_delight_config_roundtrip_and_fail_closed_guards() -> None:
         DelightfulPolicyGradientConfig(diagnostics_epsilon=True)  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="Kondo compute gating is unavailable"):
         DelightfulPolicyGradientConfig(kondo_enabled=True)
+    with pytest.raises(ValueError, match="kondo_enabled must be an actual bool"):
+        DelightfulPolicyGradientConfig(kondo_enabled=0)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="kondo_enabled must be an actual bool"):
+        DelightfulPolicyGradientConfig(kondo_enabled=0.0)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="kondo_enabled must be an actual bool"):
+        DelightfulPolicyGradientConfig(kondo_enabled=None)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="kondo_enabled must be an actual bool"):
+        DelightfulPolicyGradientConfig(kondo_enabled="")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="kondo_enabled must be an actual bool"):
+        DelightfulPolicyGradientConfig.from_config({"kondo_enabled": 0})
 
 
 def test_learning_value_is_a_jax_pytree_without_an_implicit_sum() -> None:
