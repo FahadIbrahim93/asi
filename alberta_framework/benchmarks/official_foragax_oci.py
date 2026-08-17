@@ -1979,7 +1979,7 @@ def _verify_native_inventory(
     for path, expected in native_entries.items():
         actual = dict(observed[path])
         actual["path"] = path
-        if actual != expected:
+        if _canonical_json_bytes(actual) != _canonical_json_bytes(expected):
             raise OfficialForagaxOciError(
                 f"native inventory entry differs from rootfs: {path}"
             )
