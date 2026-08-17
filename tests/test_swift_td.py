@@ -30,6 +30,7 @@ from alberta_framework.core import (
     optimizer_from_config,
 )
 from alberta_framework.core.optimizers import LMS
+from alberta_framework.core.swift_td import _require_float32_resource
 from alberta_framework.streams.alberta_plan_step1 import XDistShiftStream
 
 # =============================================================================
@@ -576,3 +577,150 @@ class TestSwiftTDLearningQuality:
         swift_mean = float(jnp.mean(finals))
         assert swift_mean < _best_fixed_lms_mean()
         assert swift_mean < 0.05
+
+
+def test_swift_td_integer_validation() -> None:
+    swift = SwiftTD(initial_step_size=0.01)
+
+    with pytest.raises(ValueError, match="feature_dim"):
+        swift.init(feature_dim=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="feature_dim"):
+        swift.init(feature_dim=4.5)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="feature_dim"):
+        swift.init(feature_dim=0)
+
+    state = swift.init(feature_dim=np.int32(4))
+    assert state.log_step_sizes.shape == (5,)
+
+
+@pytest.mark.parametrize(
+    "integer_type",
+    [
+        np.int8,
+        np.int16,
+        np.int32,
+        np.int64,
+        np.uint8,
+        np.uint16,
+        np.uint32,
+        np.uint64,
+        np.longlong,
+        np.ulonglong,
+    ],
+)
+def test_swift_td_accepts_full_numpy_integer_family(integer_type: type) -> None:
+    assert SwiftTD().init(integer_type(2)).log_step_sizes.shape == (3,)
+
+
+def test_swift_td_rejects_hostile_integer_subclasses_without_hooks() -> None:
+    class HostileInt(int):
+        def __index__(self) -> int:  # pragma: no cover
+            raise AssertionError("conversion hook executed")
+
+        def __repr__(self) -> str:  # pragma: no cover
+            raise AssertionError("repr hook executed")
+
+    with pytest.raises(ValueError, match="feature_dim"):
+        SwiftTD().init(HostileInt(2))
+
+
+def test_swift_td_state_resource_endpoint_and_adjacent_are_allocation_free() -> None:
+    scalar_budget = (2**31 - 1) // 4
+    _require_float32_resource("endpoint", float32_scalars=scalar_budget)
+    with pytest.raises(ValueError, match="byte count"):
+        _require_float32_resource("endpoint", float32_scalars=scalar_budget + 1)
+
+    last_feature_dim = ((scalar_budget - 5) // 8) - 1
+    with pytest.raises(ValueError, match="SwiftTD state byte count"):
+        SwiftTD().init(last_feature_dim + 1)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("initial_step_size", 1e100),
+        ("initial_step_size", 1e-100),
+        ("eta", 1e100),
+        ("eta_min", 1e-100),
+        ("step_size_decay", 1e-100),
+    ],
+)
+def test_swift_td_rejects_float32_overflow_and_underflow(
+    field: str, value: float
+) -> None:
+    with pytest.raises(ValueError, match=field):
+        SwiftTD(**{field: value})
+
+
+def test_swift_td_rejects_inverted_eta_interval() -> None:
+    with pytest.raises(ValueError, match="eta_min must be <= eta"):
+        SwiftTD(eta=0.01, eta_min=0.02)
+
+
+def test_swift_td_validates_adopted_state_static_contract() -> None:
+    optimizer = SwiftTD(initial_step_size=0.01)
+    state = optimizer.init(3)
+    obs = jnp.ones((3,), dtype=jnp.float32)
+    scalar = jnp.asarray(0.5, dtype=jnp.float32)
+
+    with pytest.raises(ValueError, match="eligibility_traces must have shape"):
+        optimizer.update(
+            state.replace(eligibility_traces=jnp.zeros((3,), dtype=jnp.float32)),
+            scalar,
+            obs,
+            obs,
+            scalar,
+        )
+    with pytest.raises(TypeError, match="log_step_sizes must have dtype float32"):
+        optimizer.update(
+            state.replace(log_step_sizes=jnp.zeros((4,), dtype=jnp.int32)),
+            scalar,
+            obs,
+            obs,
+            scalar,
+        )
+
+
+@pytest.mark.parametrize(
+    ("name", "replacement", "match"),
+    [
+        ("td_error", jnp.ones((1,), dtype=jnp.float32), "td_error must have shape"),
+        ("observation", jnp.ones((2,), dtype=jnp.float32), "observation must have shape"),
+        (
+            "next_observation",
+            jnp.ones((2,), dtype=jnp.float32),
+            "next_observation must have shape",
+        ),
+        ("gamma", jnp.ones((1,), dtype=jnp.float32), "gamma must have shape"),
+        ("observation", jnp.ones((3,), dtype=jnp.int32), "observation must have dtype"),
+    ],
+)
+def test_swift_td_public_input_metadata_fails_before_tracing(
+    name: str, replacement: jax.Array, match: str
+) -> None:
+    optimizer = SwiftTD(initial_step_size=0.01)
+    state = optimizer.init(3)
+    values = {
+        "td_error": jnp.asarray(1.0, dtype=jnp.float32),
+        "observation": jnp.ones((3,), dtype=jnp.float32),
+        "next_observation": jnp.ones((3,), dtype=jnp.float32),
+        "gamma": jnp.asarray(0.9, dtype=jnp.float32),
+    }
+    values[name] = replacement
+    with pytest.raises((TypeError, ValueError), match=match):
+        jax.jit(optimizer.update)(state, **values)
+
+
+def test_swift_td_invalid_adopted_scalar_domain_rolls_back() -> None:
+    optimizer = SwiftTD(initial_step_size=0.01)
+    state = optimizer.init(3).replace(eta_min=jnp.asarray(0.2, dtype=jnp.float32))
+    obs = jnp.ones((3,), dtype=jnp.float32)
+    result = optimizer.update(
+        state,
+        jnp.asarray(1.0, dtype=jnp.float32),
+        obs,
+        obs,
+        jnp.asarray(0.9, dtype=jnp.float32),
+    )
+    assert not bool(result.update_applied)
+    chex.assert_trees_all_equal(result.new_state, state)
