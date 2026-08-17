@@ -261,6 +261,34 @@ def test_scan_validates_all_host_metadata_before_any_jax_conversion(
         )
 
 
+@pytest.mark.parametrize(
+    "actions, message",
+    [
+        (jnp.asarray([0.75], dtype=jnp.float32), "integer dtype"),
+        (jnp.asarray([-1], dtype=jnp.int32), r"\[0, n_actions\)"),
+        (jnp.asarray([2], dtype=jnp.int32), r"\[0, n_actions\)"),
+        (np.asarray([2**32], dtype=np.uint64), r"\[0, n_actions\)"),
+    ],
+)
+def test_discrete_scan_rejects_actions_that_cannot_name_policy_entries(
+    actions: Array,
+    message: str,
+) -> None:
+    agent = ActorCriticAgent(ActorCriticConfig(n_actions=2))
+    state = agent.init(2, jr.key(0))
+
+    with pytest.raises(ValueError, match=message):
+        run_actor_critic_from_arrays(
+            agent,
+            state,
+            jnp.asarray([[1.0, 0.0]], dtype=jnp.float32),
+            jnp.asarray([1.0], dtype=jnp.float32),
+            jnp.asarray([False]),
+            jnp.asarray([[0.0, 1.0]], dtype=jnp.float32),
+            actions=actions,
+        )
+
+
 @pytest.mark.parametrize("continuous", [False, True])
 def test_scan_requires_transition_semantics_before_jax_conversion(
     continuous: bool,
