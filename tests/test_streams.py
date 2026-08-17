@@ -611,6 +611,21 @@ class TestMakeScaleRange:
         chex.assert_trees_all_close(scales[0], jnp.array(0.001), rtol=1e-5)
         chex.assert_trees_all_close(scales[-1], jnp.array(1000.0), rtol=1e-5)
 
+    @pytest.mark.parametrize(
+        "log_spaced",
+        [
+            pytest.param(1, id="int-one"),
+            pytest.param(0, id="int-zero"),
+            pytest.param("yes", id="string-yes"),
+            pytest.param(np.bool_(True), id="numpy-bool-true"),
+            pytest.param(np.bool_(False), id="numpy-bool-false"),
+        ],
+    )
+    def test_log_spaced_rejects_non_bool_identities(self, log_spaced):
+        """Spacing must be an exact bool; 1/'yes' must not pick geomspace."""
+        with pytest.raises(ValueError, match="log_spaced"):
+            make_scale_range(5, min_scale=0.01, max_scale=100.0, log_spaced=log_spaced)
+
 
 class TestDynamicScaleShiftStream:
     """Tests for the DynamicScaleShiftStream class."""
