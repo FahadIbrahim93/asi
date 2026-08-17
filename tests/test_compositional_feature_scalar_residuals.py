@@ -253,13 +253,30 @@ def test_selector_rejects_semantically_corrupt_state_atomically() -> None:
     losses = jnp.asarray([0.25, 0.75], dtype=jnp.float32)
     corruptions = (
         state.replace(cumulative_loss=state.cumulative_loss.at[0].set(-1.0)),
-        state.replace(action_counts=state.action_counts.at[0].set(-1.0)),
-        state.replace(action_counts=state.action_counts.at[0].set(1.0)),
+        state.replace(action_counts=state.action_counts.at[0].set(-1)),
+        state.replace(action_counts=state.action_counts.at[0].set(1)),
         state.replace(cumulative_loss=state.cumulative_loss.at[0].set(1.0)),
     )
     for corrupt in corruptions:
         result = selector.update(corrupt, losses)
         chex.assert_trees_all_equal(result.state, corrupt)
+
+
+def test_selector_action_counts_advance_past_float32_exact_integer_limit() -> None:
+    selector = FiniteCandidateSelector(2)
+    exact_integer_limit = 2**24
+    initial_state = selector.init()
+    state = initial_state.replace(
+        action_counts=jnp.full(2, exact_integer_limit, dtype=initial_state.action_counts.dtype),
+        step_count=jnp.asarray(exact_integer_limit, dtype=jnp.int32),
+    )
+
+    result = selector.update(state, jnp.asarray([0.0, 0.0], dtype=jnp.float32))
+
+    np.testing.assert_array_equal(
+        np.asarray(result.state.action_counts),
+        np.asarray([exact_integer_limit + 1, exact_integer_limit + 1]),
+    )
 
 
 @pytest.mark.parametrize("horizon", [True, 1.5, np.float32(1.0), 0, 2**31])

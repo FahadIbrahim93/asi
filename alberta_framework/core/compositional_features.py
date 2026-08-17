@@ -382,7 +382,7 @@ class CompositionalFeatureState:
     candidate_ages: Int[Array, " n_candidates"]
     candidate_selector_log_weights: Float[Array, " n_candidates"]
     candidate_selector_cumulative_loss: Float[Array, " n_candidates"]
-    candidate_selector_action_counts: Float[Array, " n_candidates"]
+    candidate_selector_action_counts: Int[Array, " n_candidates"]
     feature_generator_policy: Int[Array, " n_features"]
     candidate_generator_policy: Int[Array, " n_candidates"]
     generator_resource_state: GeneratorMetaResourceManagerState
@@ -509,7 +509,7 @@ class FiniteCandidateSelectorState:
 
     log_weights: Float[Array, " n_candidates"]
     cumulative_loss: Float[Array, " n_candidates"]
-    action_counts: Float[Array, " n_candidates"]
+    action_counts: Int[Array, " n_candidates"]
     step_count: Int[Array, ""]
 
 
@@ -642,7 +642,7 @@ class FiniteCandidateSelector:
         return FiniteCandidateSelectorState(
             log_weights=jnp.zeros(self._n_candidates, dtype=jnp.float32),
             cumulative_loss=jnp.zeros(self._n_candidates, dtype=jnp.float32),
-            action_counts=jnp.zeros(self._n_candidates, dtype=jnp.float32),
+            action_counts=jnp.zeros(self._n_candidates, dtype=jnp.int32),
             step_count=jnp.array(0, dtype=jnp.int32),
         )
 
@@ -739,7 +739,7 @@ class FiniteCandidateSelector:
             jnp.nan_to_num(bounded_losses, nan=0.0),
             0.0,
         )
-        action_counts = state.action_counts + update_finite.astype(jnp.float32)
+        action_counts = state.action_counts + update_finite.astype(jnp.int32)
         next_state = FiniteCandidateSelectorState(
             log_weights=log_weights,
             cumulative_loss=cumulative_loss,
@@ -752,7 +752,7 @@ class FiniteCandidateSelector:
             & jnp.all(state.cumulative_loss >= 0.0)
             & jnp.all(state.action_counts >= 0.0)
             & jnp.all(state.cumulative_loss <= state.action_counts)
-            & jnp.all(state.action_counts <= state.step_count.astype(jnp.float32))
+            & jnp.all(state.action_counts <= state.step_count)
         )
         update_available = (
             source_state_valid
@@ -773,7 +773,7 @@ class FiniteCandidateSelector:
         expected = (
             (state.log_weights, (self._n_candidates,), jnp.float32),
             (state.cumulative_loss, (self._n_candidates,), jnp.float32),
-            (state.action_counts, (self._n_candidates,), jnp.float32),
+            (state.action_counts, (self._n_candidates,), jnp.int32),
             (state.step_count, (), jnp.int32),
         )
         for value, shape, dtype in expected:
@@ -2021,7 +2021,7 @@ class CompositionalFeatureLearner:
             candidate_ages=jnp.zeros(cand_count, dtype=jnp.int32),
             candidate_selector_log_weights=jnp.zeros(cand_count, dtype=jnp.float32),
             candidate_selector_cumulative_loss=jnp.zeros(cand_count, dtype=jnp.float32),
-            candidate_selector_action_counts=jnp.zeros(cand_count, dtype=jnp.float32),
+            candidate_selector_action_counts=jnp.zeros(cand_count, dtype=jnp.int32),
             feature_generator_policy=jnp.zeros(n_features, dtype=jnp.int32),
             candidate_generator_policy=jnp.zeros(cand_count, dtype=jnp.int32),
             generator_resource_state=self._generator_resource_manager.init(),
@@ -4420,7 +4420,7 @@ class CompositionalFeatureLearner:
             reset_candidate_traces, 0.0, candidate_selector_cumulative_loss
         )
         candidate_selector_action_counts = jnp.where(
-            reset_candidate_traces, 0.0, candidate_selector_action_counts
+            reset_candidate_traces, 0, candidate_selector_action_counts
         )
 
         ranking_utilities = self._ranking_utility(
