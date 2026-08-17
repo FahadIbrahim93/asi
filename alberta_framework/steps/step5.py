@@ -39,7 +39,7 @@ from alberta_framework.core.average_reward import (
 
 @dataclass(frozen=True)
 class Step5AverageRewardTDConfig:
-    """Config for the production Step 5 differential TD facade."""
+    """Config for the public Step 5 differential TD facade."""
 
     step_size: float = 0.05
     average_reward_step_size: float = 0.01
@@ -89,7 +89,7 @@ class Step5SmokeResult:
 def make_step5_td_learner(
     config: Step5AverageRewardTDConfig | None = None,
 ) -> DifferentialTDLearner:
-    """Create the production Step 5 differential TD learner."""
+    """Create the public Step 5 differential TD learner."""
     cfg = config or Step5AverageRewardTDConfig()
     return DifferentialTDLearner(cfg.to_core_config())
 

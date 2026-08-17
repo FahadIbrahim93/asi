@@ -438,11 +438,14 @@ The proposal advances only in this order:
 3. **Quiescent exact resume — implemented at L0.** The current-schema bundle,
    strict restored-state adoption, and exact barrier-fork continuation gate pass
    for both supported constructions, including keyed stochastic RiverSwim.
-4. **Matched development scorecard — next and permanently nonpromoting.** Run
-   SwitchingTwoState and RiverSwim with frozen/no-learning, random,
-   analytic-oracle, and strong SARSA-family controls under explicit resource
-   accounting. This does not select `reference-dev` or create performance or
-   scientific evidence.
+4. **Matched development scorecard — implemented at L0 and permanently
+   nonpromoting.** The scorecard module freezes 12 consumed development seeds,
+   two environments, six fresh-process arms, explicit Threefry roots, an
+   environment-bound finite-horizon privileged dynamic-programming control,
+   fixed reward-lattice checks, and canonical numeric-payload accounting. Its
+   validator is a consistency gate, not authenticated execution attestation.
+   Issuing or validating the plan does not select `reference-dev` or create a
+   completed performance or scientific result.
 5. **Broader conformance — open.** Exercise active-option ownership,
    replacement/rebinding, real veto authority, boundaries, extension/wire
    policy, numerical stability, and resource ceilings.

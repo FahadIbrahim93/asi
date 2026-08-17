@@ -356,7 +356,7 @@ class RiverSwimMDP:
         self._rewards_np = self._build_rewards(config)
         self._transition_logits = jnp.where(
             jnp.asarray(self._transitions_np) > 0.0,
-            jnp.log(jnp.clip(jnp.asarray(self._transitions_np), 1e-30, 1.0)),
+            jnp.log(jnp.asarray(self._transitions_np)),
             -jnp.inf,
         )
         self._rewards = jnp.asarray(self._rewards_np)

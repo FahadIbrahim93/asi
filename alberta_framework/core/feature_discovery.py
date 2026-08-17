@@ -422,8 +422,7 @@ class FixedBudgetFeatureLearner:
         """Reconstruct learner from ``to_config`` output."""
         config = dict(config)
         config.pop("type", None)
-        # replace_fraction was serialized by older versions but never read by
-        # the update path; drop it so old configs keep loading.
+        # Accepted only as an inert compatibility field.
         config.pop("replace_fraction", None)
         generator_mix = config.pop("generator_mix", (1.0, 0.0, 0.0))
         replacement_multipliers = config.pop(

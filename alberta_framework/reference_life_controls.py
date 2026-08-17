@@ -10,9 +10,11 @@ and bound to one process-local adapter owner.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 import math
 import re
+from numbers import Real
 from typing import Any, Literal, cast
 
 import jax
@@ -27,6 +29,7 @@ from alberta_framework.core.average_reward import (
     DifferentialSARSAState,
 )
 from alberta_framework.core.sarsa import SARSAAgent, SARSAConfig, SARSAState
+from alberta_framework.core.types import LMSState
 from alberta_framework.reference_agent import (
     MAX_DECISION_INDEX,
     REFERENCE_AGENT_MANIFEST_SCHEMA,
@@ -43,6 +46,7 @@ from alberta_framework.reference_agent import (
     Transaction,
     canonical_config_sha256,
 )
+from alberta_framework.reference_life import REFERENCE_LIFE_PRNG_IMPLEMENTATION
 from alberta_framework.streams.closed_loop import (
     RiverSwimConfig,
     RiverSwimMDP,
@@ -72,6 +76,13 @@ DISCOUNTED_SARSA_IMPLEMENTATION_ID = "asi.discounted_sarsa_exact_control.preview
 DISCOUNTED_SARSA_STATE_SCHEMA = "asi.discounted_sarsa_exact_control_state.preview1"
 
 _RIVERSWIM_REFERENCE_MAX_STATES = 12
+_INT32_MAX = int(np.iinfo(np.int32).max)
+_FLOAT32_MAX = float(np.finfo(np.float32).max)
+_MAX_HIDDEN_LAYERS = 32
+_MAX_HIDDEN_WIDTH = 4096
+_MAX_NETWORK_PARAMETERS = 1 << 20
+_MAX_ORACLE_HORIZON = 100_000
+_THREEFRY_IMPLEMENTATION = REFERENCE_LIFE_PRNG_IMPLEMENTATION
 _SAFE_ID = re.compile(r"^[a-z0-9][a-z0-9._:-]*$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _MAX_ID_LENGTH = 256
@@ -104,36 +115,104 @@ def _require_environment_shape(
         raise ValueError("selected reference controls require exactly two actions")
 
 
-def _finite_float(value: Any, *, name: str, minimum: float, maximum: float) -> float:
-    if isinstance(value, bool):
-        raise ValueError(f"{name} must be a finite number")
-    try:
-        converted = float(value)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(f"{name} must be a finite number") from exc
-    if not math.isfinite(converted) or converted < minimum or converted > maximum:
-        raise ValueError(f"{name} must be finite and lie in [{minimum}, {maximum}]")
-    return converted
-
-
-def _nonnegative_int(value: Any, *, name: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        raise ValueError(f"{name} must be a nonnegative integer")
+def _nonnegative_int(value: Any, *, name: str, maximum: int = _INT32_MAX) -> int:
+    if type(value) is not int or value < 0 or value > maximum:
+        raise ValueError(f"{name} must be a nonnegative integer within int32 capacity")
     return value
 
 
-def _canonical_float32(value: Any, *, name: str) -> float:
-    if isinstance(value, bool):
-        raise ValueError(f"{name} must be a finite float32 value")
+def _canonical_float32(
+    value: Any,
+    *,
+    name: str,
+    minimum: float = -_FLOAT32_MAX,
+    maximum: float = _FLOAT32_MAX,
+    minimum_inclusive: bool = True,
+    maximum_inclusive: bool = True,
+) -> float:
+    """Return the actual executed float32 value after checking both domains."""
+
+    if not isinstance(value, Real) or isinstance(value, (bool, np.bool_)):
+        raise ValueError(f"{name} must be a real non-boolean float32 scalar")
     try:
         raw = float(value)
         with np.errstate(over="ignore", invalid="ignore", under="ignore"):
-            converted = float(np.asarray(raw, dtype=np.float32))
+            converted = float(np.float32(raw))
     except (TypeError, ValueError, OverflowError) as exc:
         raise ValueError(f"{name} must be a finite float32 value") from exc
     if not math.isfinite(raw) or not math.isfinite(converted):
         raise ValueError(f"{name} must be a finite float32 value")
-    return converted
+
+    def in_bounds(candidate: float) -> bool:
+        lower_ok = candidate >= minimum if minimum_inclusive else candidate > minimum
+        upper_ok = candidate <= maximum if maximum_inclusive else candidate < maximum
+        return lower_ok and upper_ok
+
+    if not in_bounds(raw):
+        left = "[" if minimum_inclusive else "("
+        right = "]" if maximum_inclusive else ")"
+        raise ValueError(
+            f"{name} must remain in {left}{minimum}, {maximum}{right} as float32"
+        )
+    if not minimum_inclusive and raw > minimum and converted == minimum:
+        raise ValueError(f"{name} must not collapse to its strict float32 lower bound")
+    if not maximum_inclusive and raw < maximum and converted == maximum:
+        raise ValueError(f"{name} must not round to its strict float32 upper bound")
+    if not in_bounds(converted):
+        left = "[" if minimum_inclusive else "("
+        right = "]" if maximum_inclusive else ")"
+        raise ValueError(
+            f"{name} must remain in {left}{minimum}, {maximum}{right} as float32"
+        )
+    # Canonicalize both spellings of zero to the same manifest/config value.
+    return 0.0 if converted == 0.0 else converted
+
+
+def _canonical_payoff_matrix(value: Any, *, name: str) -> np.ndarray[Any, Any]:
+    try:
+        source = np.asarray(value, dtype=object)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("switching payoffs must be numeric 2x2 matrices") from exc
+    if source.shape != (2, 2):
+        raise ValueError("switching payoffs must be 2x2 matrices")
+    result = np.empty((2, 2), dtype=np.float32)
+    for index in np.ndindex(source.shape):
+        result[index] = _canonical_float32(source[index], name=f"{name}{index}")
+    return result
+
+
+def _canonical_hidden_sizes(
+    value: Any,
+    *,
+    observation_dim: int,
+    n_actions: int,
+) -> tuple[int, ...]:
+    if not isinstance(value, (tuple, list)):
+        raise ValueError("hidden_sizes must be a bounded tuple or list")
+    if len(value) > _MAX_HIDDEN_LAYERS:
+        raise ValueError(f"hidden_sizes must contain at most {_MAX_HIDDEN_LAYERS} layers")
+    hidden_sizes = tuple(value)
+    if any(
+        type(size) is not int or size <= 0 or size > min(_INT32_MAX, _MAX_HIDDEN_WIDTH)
+        for size in hidden_sizes
+    ):
+        raise ValueError(
+            "hidden_sizes must contain positive int32 widths no greater than "
+            f"{_MAX_HIDDEN_WIDTH}"
+        )
+    layer_inputs = (observation_dim, *hidden_sizes[:-1]) if hidden_sizes else ()
+    parameter_count = sum(
+        fan_in * fan_out + fan_out
+        for fan_in, fan_out in zip(layer_inputs, hidden_sizes, strict=True)
+    )
+    final_width = hidden_sizes[-1] if hidden_sizes else observation_dim
+    parameter_count += n_actions * (final_width + 1)
+    if parameter_count > _MAX_NETWORK_PARAMETERS:
+        raise ValueError(
+            "discounted-SARSA network parameter resource bound exceeded: "
+            f"{parameter_count} > {_MAX_NETWORK_PARAMETERS}"
+        )
+    return hidden_sizes
 
 
 def _canonical_json(value: dict[str, Any]) -> str:
@@ -146,22 +225,9 @@ def _canonical_json(value: dict[str, Any]) -> str:
     )
 
 
-def _switching_policy(payoff: np.ndarray[Any, Any]) -> tuple[int, int]:
-    gains = (
-        float(payoff[0, 0]),
-        0.5 * (float(payoff[0, 1]) + float(payoff[1, 0])),
-        float(payoff[1, 1]),
-    )
-    if not all(math.isfinite(gain) for gain in gains):
-        raise ValueError("switching oracle cycle gains must be finite")
-    winner = max(range(3), key=gains.__getitem__)
-    # Direct every state into the selected optimal recurrent cycle.
-    return ((0, 0), (1, 0), (1, 1))[winner]
-
-
 def _canonical_switching_environment(
     config: SwitchingTwoStateConfig,
-) -> tuple[dict[str, Any], int, tuple[tuple[int, ...], ...]]:
+) -> tuple[dict[str, Any], int]:
     if not isinstance(config, SwitchingTwoStateConfig):
         raise ValueError("switching environment config has the wrong type")
     phase_length = config.phase_length
@@ -172,16 +238,8 @@ def _canonical_switching_environment(
         or phase_length > REFERENCE_CONTROL_MAX_ACCEPTED_EVENTS
     ):
         raise ValueError("phase_length must lie within signed-int32 capacity")
-    try:
-        with np.errstate(over="ignore", invalid="ignore", under="ignore"):
-            payoffs_a = np.asarray(config.payoffs_a, dtype=np.float32)
-            payoffs_b = np.asarray(config.payoffs_b, dtype=np.float32)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError("switching payoffs must be numeric 2x2 matrices") from exc
-    if payoffs_a.shape != (2, 2) or payoffs_b.shape != (2, 2):
-        raise ValueError("switching payoffs must be 2x2 matrices")
-    if not np.all(np.isfinite(payoffs_a)) or not np.all(np.isfinite(payoffs_b)):
-        raise ValueError("switching payoffs must be finite float32 values")
+    payoffs_a = _canonical_payoff_matrix(config.payoffs_a, name="payoffs_a")
+    payoffs_b = _canonical_payoff_matrix(config.payoffs_b, name="payoffs_b")
     canonical = SwitchingTwoStateConfig(  # type: ignore[call-arg]
         phase_length=phase_length,
         payoffs_a=tuple(tuple(float(value) for value in row) for row in payoffs_a),
@@ -194,13 +252,12 @@ def _canonical_switching_environment(
         "payoffs_a": [list(row) for row in canonical.payoffs_a],
         "payoffs_b": [list(row) for row in canonical.payoffs_b],
     }
-    policies = (_switching_policy(payoffs_a), _switching_policy(payoffs_b))
-    return payload, phase_length, policies
+    return payload, phase_length
 
 
 def _canonical_riverswim_environment(
     config: RiverSwimConfig,
-) -> tuple[dict[str, Any], tuple[tuple[int, ...], ...]]:
+) -> dict[str, Any]:
     if not isinstance(config, RiverSwimConfig):
         raise ValueError("RiverSwim environment config has the wrong type")
     n_states = config.n_states
@@ -222,12 +279,22 @@ def _canonical_riverswim_environment(
         or initial_state >= n_states
     ):
         raise ValueError("RiverSwim initial_state is outside the configured chain")
-    p_right_up = _canonical_float32(config.p_right_up, name="p_right_up")
-    p_right_down = _canonical_float32(config.p_right_down, name="p_right_down")
+    p_right_up = _canonical_float32(
+        config.p_right_up,
+        name="p_right_up",
+        minimum=0.0,
+        maximum=1.0,
+        minimum_inclusive=False,
+    )
+    p_right_down = _canonical_float32(
+        config.p_right_down,
+        name="p_right_down",
+        minimum=0.0,
+        maximum=1.0,
+        minimum_inclusive=False,
+    )
     reward_left = _canonical_float32(config.reward_left, name="reward_left")
     reward_right = _canonical_float32(config.reward_right, name="reward_right")
-    if p_right_up <= 0.0 or p_right_down <= 0.0:
-        raise ValueError("RiverSwim right-transition probabilities must be positive")
     if p_right_up + p_right_down > 1.0:
         raise ValueError("RiverSwim right-transition probabilities must sum to at most one")
     canonical = RiverSwimConfig(  # type: ignore[call-arg]
@@ -238,8 +305,7 @@ def _canonical_riverswim_environment(
         reward_right=reward_right,
         initial_state=initial_state,
     )
-    kernel = RiverSwimMDP(canonical)
-    policy = kernel.optimal_policy()
+    RiverSwimMDP(canonical)
     payload = {
         "n_states": n_states,
         "p_right_up": p_right_up,
@@ -248,7 +314,80 @@ def _canonical_riverswim_environment(
         "reward_right": reward_right,
         "initial_state": initial_state,
     }
-    return payload, (policy,)
+    return payload
+
+
+def _canonical_oracle_horizon(value: Any) -> int:
+    if type(value) is not int or not 1 <= value <= _MAX_ORACLE_HORIZON:
+        raise ValueError(
+            f"analytic-oracle horizon must lie in [1, {_MAX_ORACLE_HORIZON}]"
+        )
+    return value
+
+
+def _finite_horizon_oracle_policy(
+    *,
+    environment_kind: EnvironmentKind,
+    environment_config: dict[str, Any],
+    horizon: int,
+) -> np.ndarray[Any, np.dtype[np.int32]]:
+    """Solve the exact selected finite-horizon control problem backwards.
+
+    Values are accumulated in float64 from the simulator's canonical float32
+    rewards and transition tensor. ``np.argmax`` supplies the declared
+    lowest-action tie break.  The resulting policy is indexed by accepted
+    decision index and observed state.
+    """
+
+    horizon = _canonical_oracle_horizon(horizon)
+    if environment_kind == "switching_two_state":
+        phase_length = cast(int, environment_config["phase_length"])
+        payoffs = np.asarray(
+            (
+                environment_config["payoffs_a"],
+                environment_config["payoffs_b"],
+            ),
+            dtype=np.float32,
+        ).astype(np.float64)
+        value = np.zeros(2, dtype=np.float64)
+        policy = np.zeros((horizon + 1, 2), dtype=np.int32)
+        for index in range(horizon - 1, -1, -1):
+            phase = (index // phase_length) % 2
+            action_values = payoffs[phase] + value[np.newaxis, :]
+            actions = np.argmax(action_values, axis=1).astype(np.int32)
+            policy[index] = actions
+            value = action_values[np.arange(2), actions]
+    elif environment_kind == "riverswim":
+        canonical = RiverSwimConfig(  # type: ignore[call-arg]
+            n_states=environment_config["n_states"],
+            p_right_up=environment_config["p_right_up"],
+            p_right_down=environment_config["p_right_down"],
+            reward_left=environment_config["reward_left"],
+            reward_right=environment_config["reward_right"],
+            initial_state=environment_config["initial_state"],
+        )
+        kernel = RiverSwimMDP(canonical)
+        transitions = kernel.transition_tensor.astype(np.float64)
+        rewards = kernel.reward_tensor.astype(np.float64)
+        value = np.zeros(kernel.n_states, dtype=np.float64)
+        policy = np.zeros((horizon + 1, kernel.n_states), dtype=np.int32)
+        for index in range(horizon - 1, -1, -1):
+            continuation = np.einsum("asn,n->sa", transitions, value)
+            action_values = rewards + continuation
+            actions = np.argmax(action_values, axis=1).astype(np.int32)
+            policy[index] = actions
+            value = action_values[np.arange(kernel.n_states), actions]
+    else:
+        raise ValueError("unsupported analytic-oracle environment")
+    if not bool(np.all(np.isfinite(value))):
+        raise ValueError("analytic-oracle dynamic program became non-finite")
+    return policy
+
+
+def _oracle_policy_sha256(policy: np.ndarray[Any, Any]) -> str:
+    canonical = np.asarray(policy, dtype="<i4", order="C")
+    header = f"int32le:{canonical.shape[0]}:{canonical.shape[1]}:".encode("ascii")
+    return hashlib.sha256(header + canonical.tobytes(order="C")).hexdigest()
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -282,7 +421,7 @@ class UniformRandomReferenceConfig:
         cls,
         environment_config: RiverSwimConfig,
     ) -> UniformRandomReferenceConfig:
-        payload, _ = _canonical_riverswim_environment(environment_config)
+        payload = _canonical_riverswim_environment(environment_config)
         return cls(
             environment_kind="riverswim",
             observation_dim=cast(int, payload["n_states"]),
@@ -297,6 +436,8 @@ class UniformRandomReferenceConfig:
             "n_actions": self.n_actions,
             "action_distribution": "uniform",
             "rng_schedule": "jax_fold_in_uint64_decision_index.preview1",
+            "rng_implementation": _THREEFRY_IMPLEMENTATION,
+            "initial_key_contract": "scalar_threefry2x32_typed_or_legacy.preview1",
             "boundary_mode": "continuing_unit_discount_only",
         }
 
@@ -325,28 +466,28 @@ class DifferentialSARSAReferenceConfig:
         object.__setattr__(
             self,
             "q_step_size",
-            _finite_float(
+            _canonical_float32(
                 self.q_step_size,
                 name="q_step_size",
                 minimum=0.0,
-                maximum=float("inf"),
+                maximum=_FLOAT32_MAX,
             ),
         )
         object.__setattr__(
             self,
             "average_reward_step_size",
-            _finite_float(
+            _canonical_float32(
                 self.average_reward_step_size,
                 name="average_reward_step_size",
                 minimum=0.0,
-                maximum=float("inf"),
+                maximum=_FLOAT32_MAX,
             ),
         )
         for name in ("trace_decay", "epsilon_start", "epsilon_end"):
             object.__setattr__(
                 self,
                 name,
-                _finite_float(
+                _canonical_float32(
                     getattr(self, name),
                     name=name,
                     minimum=0.0,
@@ -358,6 +499,8 @@ class DifferentialSARSAReferenceConfig:
             "epsilon_decay_steps",
             _nonnegative_int(self.epsilon_decay_steps, name="epsilon_decay_steps"),
         )
+        if self.epsilon_end > self.epsilon_start:
+            raise ValueError("epsilon_end must not exceed epsilon_start")
         if not isinstance(self.use_bias, bool):
             raise ValueError("use_bias must be boolean")
 
@@ -380,7 +523,7 @@ class DifferentialSARSAReferenceConfig:
         environment_config: RiverSwimConfig,
         **overrides: Any,
     ) -> DifferentialSARSAReferenceConfig:
-        payload, _ = _canonical_riverswim_environment(environment_config)
+        payload = _canonical_riverswim_environment(environment_config)
         return cls(
             environment_kind="riverswim",
             observation_dim=cast(int, payload["n_states"]),
@@ -414,6 +557,8 @@ class DifferentialSARSAReferenceConfig:
             "epsilon_decay_steps": self.epsilon_decay_steps,
             "use_bias": self.use_bias,
             "rng_schedule": "owned_differential_sarsa_key.preview1",
+            "rng_implementation": _THREEFRY_IMPLEMENTATION,
+            "initial_key_contract": "scalar_threefry2x32_typed_or_legacy.preview1",
             "boundary_mode": "continuing_unit_discount_only",
         }
 
@@ -442,46 +587,54 @@ class DiscountedSARSAReferenceConfig:
             self.observation_dim,
             self.n_actions,
         )
-        gamma = _finite_float(
+        gamma = _canonical_float32(
             self.gamma,
             name="gamma",
             minimum=0.0,
             maximum=1.0,
+            maximum_inclusive=False,
         )
-        if gamma >= 1.0:
-            raise ValueError("discounted SARSA gamma must be strictly less than one")
         object.__setattr__(self, "gamma", gamma)
-        for name in ("epsilon_start", "epsilon_end", "sparsity", "lamda"):
+        for name in ("epsilon_start", "epsilon_end", "lamda"):
             object.__setattr__(
                 self,
                 name,
-                _finite_float(
+                _canonical_float32(
                     getattr(self, name),
                     name=name,
                     minimum=0.0,
                     maximum=1.0,
                 ),
             )
-        if self.sparsity >= 1.0:
-            raise ValueError("sparsity must be strictly less than one")
+        object.__setattr__(
+            self,
+            "sparsity",
+            _canonical_float32(
+                self.sparsity,
+                name="sparsity",
+                minimum=0.0,
+                maximum=1.0,
+                maximum_inclusive=False,
+            ),
+        )
         object.__setattr__(
             self,
             "step_size",
-            _finite_float(
+            _canonical_float32(
                 self.step_size,
                 name="step_size",
                 minimum=0.0,
-                maximum=float("inf"),
+                maximum=_FLOAT32_MAX,
             ),
         )
         object.__setattr__(
             self,
             "leaky_relu_slope",
-            _finite_float(
+            _canonical_float32(
                 self.leaky_relu_slope,
                 name="leaky_relu_slope",
                 minimum=0.0,
-                maximum=float("inf"),
+                maximum=_FLOAT32_MAX,
             ),
         )
         object.__setattr__(
@@ -489,13 +642,17 @@ class DiscountedSARSAReferenceConfig:
             "epsilon_decay_steps",
             _nonnegative_int(self.epsilon_decay_steps, name="epsilon_decay_steps"),
         )
-        hidden_sizes = tuple(self.hidden_sizes)
-        if any(
-            isinstance(size, bool) or not isinstance(size, int) or size <= 0
-            for size in hidden_sizes
-        ):
-            raise ValueError("hidden_sizes must contain only positive integers")
-        object.__setattr__(self, "hidden_sizes", hidden_sizes)
+        if self.epsilon_end > self.epsilon_start:
+            raise ValueError("epsilon_end must not exceed epsilon_start")
+        object.__setattr__(
+            self,
+            "hidden_sizes",
+            _canonical_hidden_sizes(
+                self.hidden_sizes,
+                observation_dim=self.observation_dim,
+                n_actions=self.n_actions,
+            ),
+        )
         if not isinstance(self.use_layer_norm, bool):
             raise ValueError("use_layer_norm must be boolean")
 
@@ -518,7 +675,7 @@ class DiscountedSARSAReferenceConfig:
         environment_config: RiverSwimConfig,
         **overrides: Any,
     ) -> DiscountedSARSAReferenceConfig:
-        payload, _ = _canonical_riverswim_environment(environment_config)
+        payload = _canonical_riverswim_environment(environment_config)
         return cls(
             environment_kind="riverswim",
             observation_dim=cast(int, payload["n_states"]),
@@ -552,19 +709,21 @@ class DiscountedSARSAReferenceConfig:
             "use_layer_norm": self.use_layer_norm,
             "lamda": self.lamda,
             "rng_schedule": "owned_sarsa_key.preview1",
+            "rng_implementation": _THREEFRY_IMPLEMENTATION,
+            "initial_key_contract": "scalar_threefry2x32_typed_or_legacy.preview1",
             "boundary_mode": "continuing_unit_discount_only",
         }
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class AnalyticOracleReferenceConfig:
-    """Exact environment-bound privileged analytic policy configuration."""
+    """Exact environment-bound finite-horizon privileged control."""
 
     environment_kind: EnvironmentKind
     observation_dim: int
     n_actions: int
-    phase_length: int | None
-    policies: tuple[tuple[int, ...], ...]
+    horizon: int
+    policy_sha256: str
     environment_config_json: str = dataclasses.field(repr=False)
 
     def __post_init__(self) -> None:
@@ -573,6 +732,11 @@ class AnalyticOracleReferenceConfig:
             self.observation_dim,
             self.n_actions,
         )
+        horizon = _canonical_oracle_horizon(self.horizon)
+        if not isinstance(self.policy_sha256, str) or _SHA256.fullmatch(
+            self.policy_sha256
+        ) is None:
+            raise ValueError("oracle policy_sha256 must be a lowercase SHA-256 digest")
         try:
             decoded = json.loads(self.environment_config_json)
         except (TypeError, json.JSONDecodeError) as exc:
@@ -591,12 +755,12 @@ class AnalyticOracleReferenceConfig:
                 )
             except (KeyError, TypeError, ValueError) as exc:
                 raise ValueError("oracle switching config is malformed") from exc
-            expected, phase_length, policies = _canonical_switching_environment(
+            expected, _ = _canonical_switching_environment(
                 switching_source
             )
             if set(decoded) != {"phase_length", "payoffs_a", "payoffs_b"}:
                 raise ValueError("oracle switching config has unknown fields")
-            if decoded != expected or self.phase_length != phase_length:
+            if decoded != expected:
                 raise ValueError("oracle switching config is not canonical")
         else:
             try:
@@ -610,7 +774,7 @@ class AnalyticOracleReferenceConfig:
                 )
             except (KeyError, TypeError, ValueError) as exc:
                 raise ValueError("oracle RiverSwim config is malformed") from exc
-            expected, policies = _canonical_riverswim_environment(river_source)
+            expected = _canonical_riverswim_environment(river_source)
             if set(decoded) != {
                 "n_states",
                 "p_right_up",
@@ -620,31 +784,38 @@ class AnalyticOracleReferenceConfig:
                 "initial_state",
             }:
                 raise ValueError("oracle RiverSwim config has unknown fields")
-            if decoded != expected or self.phase_length is not None:
+            if decoded != expected:
                 raise ValueError("oracle RiverSwim config is not canonical")
-        if self.policies != policies:
-            raise ValueError("oracle policies do not match the exact environment config")
-        if any(
-            len(policy) != self.observation_dim
-            or any(action < 0 or action >= self.n_actions for action in policy)
-            for policy in self.policies
-        ):
-            raise ValueError("oracle policy has an invalid shape or action")
+        policy = _finite_horizon_oracle_policy(
+            environment_kind=self.environment_kind,
+            environment_config=expected,
+            horizon=horizon,
+        )
+        if policy.shape != (horizon + 1, self.observation_dim):
+            raise ValueError("oracle policy has an invalid shape")
+        if _oracle_policy_sha256(policy) != self.policy_sha256:
+            raise ValueError("oracle policy digest does not match the exact dynamic program")
 
     @classmethod
     def for_switching(
         cls,
         environment_config: SwitchingTwoStateConfig,
+        *,
+        horizon: int,
     ) -> AnalyticOracleReferenceConfig:
-        payload, phase_length, policies = _canonical_switching_environment(
-            environment_config
+        payload, _ = _canonical_switching_environment(environment_config)
+        canonical_horizon = _canonical_oracle_horizon(horizon)
+        policy = _finite_horizon_oracle_policy(
+            environment_kind="switching_two_state",
+            environment_config=payload,
+            horizon=canonical_horizon,
         )
         return cls(
             environment_kind="switching_two_state",
             observation_dim=2,
             n_actions=2,
-            phase_length=phase_length,
-            policies=policies,
+            horizon=canonical_horizon,
+            policy_sha256=_oracle_policy_sha256(policy),
             environment_config_json=_canonical_json(payload),
         )
 
@@ -652,14 +823,22 @@ class AnalyticOracleReferenceConfig:
     def for_riverswim(
         cls,
         environment_config: RiverSwimConfig,
+        *,
+        horizon: int,
     ) -> AnalyticOracleReferenceConfig:
-        payload, policies = _canonical_riverswim_environment(environment_config)
+        payload = _canonical_riverswim_environment(environment_config)
+        canonical_horizon = _canonical_oracle_horizon(horizon)
+        policy = _finite_horizon_oracle_policy(
+            environment_kind="riverswim",
+            environment_config=payload,
+            horizon=canonical_horizon,
+        )
         return cls(
             environment_kind="riverswim",
             observation_dim=cast(int, payload["n_states"]),
             n_actions=2,
-            phase_length=None,
-            policies=policies,
+            horizon=canonical_horizon,
+            policy_sha256=_oracle_policy_sha256(policy),
             environment_config_json=_canonical_json(payload),
         )
 
@@ -680,8 +859,11 @@ class AnalyticOracleReferenceConfig:
             "environment_kind": self.environment_kind,
             "observation_dim": self.observation_dim,
             "n_actions": self.n_actions,
-            "phase_length": self.phase_length,
-            "policies": [list(policy) for policy in self.policies],
+            "horizon": self.horizon,
+            "policy_shape": [self.horizon + 1, self.observation_dim],
+            "post_horizon_decision": "unused_lowest_action_sentinel_for_final_accept",
+            "policy_sha256": self.policy_sha256,
+            "solver": "finite_horizon_backward_dynamic_program.float64.tie_low.preview1",
             "environment_config": self.environment_config,
             "environment_config_sha256": self.environment_config_sha256,
             "privileged": True,
@@ -693,6 +875,8 @@ class AnalyticOracleReferenceConfig:
             ),
             "tie_break": "lowest_action_index",
             "rng_schedule": "none_deterministic",
+            "rng_implementation": None,
+            "initial_key_contract": "scalar_jax_key_ignored.preview1",
             "boundary_mode": "continuing_unit_discount_only",
         }
 
@@ -800,9 +984,15 @@ def control_state_resource_usage(
         for leaf in jax.tree.leaves(root):
             try:
                 dtype = getattr(leaf, "dtype", None)
+                typed_key = dtype is not None and bool(
+                    jax.dtypes.issubdtype(  # type: ignore[attr-defined]
+                        dtype,
+                        jax.dtypes.prng_key,
+                    )
+                )
                 value = (
                     np.asarray(jr.key_data(leaf))
-                    if dtype is not None and str(dtype).startswith("key<")
+                    if typed_key
                     else np.asarray(leaf)
                 )
             except (TypeError, ValueError):
@@ -835,13 +1025,47 @@ def _action_spec(n_actions: int) -> SpaceSpec:
     )
 
 
-def _require_prng_key(key: Any, *, name: str) -> None:
+def _require_prng_key(
+    key: Any,
+    *,
+    name: str,
+    implementation: str | None = None,
+) -> str:
+    """Validate one scalar typed or legacy key and return its named PRNG impl."""
+
     try:
+        key_shape = tuple(key.shape)
         words = np.asarray(jr.key_data(key))
-    except (TypeError, ValueError) as exc:
+        key_implementation = str(jr.key_impl(key))
+        dtype = key.dtype
+        typed = bool(
+            jax.dtypes.issubdtype(  # type: ignore[attr-defined]
+                dtype,
+                jax.dtypes.prng_key,
+            )
+        )
+    except (AttributeError, TypeError, ValueError) as exc:
         raise DecisionOwnershipError(f"{name} must be a scalar JAX PRNG key") from exc
-    if words.shape != (2,) or words.dtype != np.dtype(np.uint32):
+    if (
+        words.ndim != 1
+        or words.dtype != np.dtype(np.uint32)
+        or (typed and key_shape != ())
+        or (not typed and key_shape != words.shape)
+    ):
         raise DecisionOwnershipError(f"{name} must be a scalar JAX PRNG key")
+    if implementation is not None and key_implementation != implementation:
+        raise DecisionOwnershipError(
+            f"{name} must use explicit {implementation}, got {key_implementation}"
+        )
+    if implementation == _THREEFRY_IMPLEMENTATION and words.shape != (2,):
+        raise DecisionOwnershipError(f"{name} must use a scalar threefry2x32 key")
+    return key_implementation
+
+
+def _explicit_threefry_key(key: Any, *, name: str) -> Array:
+    _require_prng_key(key, name=name, implementation=_THREEFRY_IMPLEMENTATION)
+    words = jnp.asarray(jr.key_data(key), dtype=jnp.uint32)
+    return cast(Array, jr.wrap_key_data(words, impl=_THREEFRY_IMPLEMENTATION))
 
 
 def _float32_scalar(value: Any, *, name: str) -> np.float32:
@@ -881,6 +1105,63 @@ def _tree_finite(tree: Any) -> bool:
     return True
 
 
+def _require_float32_array(value: Any, *, name: str, shape: tuple[int, ...]) -> None:
+    try:
+        array = np.asarray(value)
+    except (TypeError, ValueError) as exc:
+        raise DecisionOwnershipError(f"{name} violates its float32 array contract") from exc
+    if array.shape != shape or array.dtype != np.dtype(np.float32):
+        raise DecisionOwnershipError(
+            f"{name} must have shape {shape} and dtype float32"
+        )
+    if not bool(np.all(np.isfinite(array))):
+        raise DecisionOwnershipError(f"{name} must contain only finite float32 values")
+
+
+def _require_float32_tree(
+    value: Any,
+    *,
+    name: str,
+    expected_shapes: tuple[tuple[int, ...], ...],
+) -> None:
+    leaves = jax.tree.leaves(value)
+    if len(leaves) != len(expected_shapes):
+        raise DecisionOwnershipError(f"{name} violates its array-tree structure contract")
+    for index, (leaf, shape) in enumerate(zip(leaves, expected_shapes, strict=True)):
+        _require_float32_array(leaf, name=f"{name}[{index}]", shape=shape)
+
+
+def _require_lms_optimizer_tree(
+    value: Any,
+    *,
+    name: str,
+    group_count: int,
+    step_size: float,
+) -> None:
+    if type(value) is not tuple or len(value) != group_count:
+        raise DecisionOwnershipError(f"{name} violates its LMS group structure")
+    expected_step = np.asarray(step_size, dtype=np.float32)
+    for group_index, group in enumerate(value):
+        if type(group) is not tuple or len(group) != 2:
+            raise DecisionOwnershipError(
+                f"{name}[{group_index}] must contain weight and bias LMS states"
+            )
+        for state_index, optimizer_state in enumerate(group):
+            if not isinstance(optimizer_state, LMSState):
+                raise DecisionOwnershipError(
+                    f"{name}[{group_index}][{state_index}] must be an LMSState"
+                )
+            observed = np.asarray(optimizer_state.step_size)
+            if (
+                observed.shape != ()
+                or observed.dtype != np.dtype(np.float32)
+                or not np.array_equal(observed, expected_step)
+            ):
+                raise DecisionOwnershipError(
+                    f"{name}[{group_index}][{state_index}] step size differs from config"
+                )
+
+
 def _counter_words(index: int) -> np.ndarray[Any, np.dtype[np.uint32]]:
     return np.asarray(((index >> 32) & 0xFFFFFFFF, index & 0xFFFFFFFF), dtype=np.uint32)
 
@@ -889,6 +1170,7 @@ class _BaseReferenceControlAdapter:
     """Shared exact-dispatch ownership and continuing-outcome machinery."""
 
     _agent: DifferentialSARSAAgent | SARSAAgent | None
+    _agent_config_json: str | None
     _config: ControlConfig
     _frozen: bool
     _manifest: AgentManifest
@@ -897,6 +1179,7 @@ class _BaseReferenceControlAdapter:
 
     __slots__ = (
         "_agent",
+        "_agent_config_json",
         "_config",
         "_frozen",
         "_manifest",
@@ -916,6 +1199,11 @@ class _BaseReferenceControlAdapter:
         object.__setattr__(self, "_config", config)
         object.__setattr__(self, "_state_schema", state_schema)
         object.__setattr__(self, "_agent", agent)
+        object.__setattr__(
+            self,
+            "_agent_config_json",
+            None if agent is None else _canonical_json(agent.to_config()),
+        )
         object.__setattr__(self, "_owner_token", object())
         object.__setattr__(
             self,
@@ -956,6 +1244,10 @@ class _BaseReferenceControlAdapter:
     @property
     def max_accepted_events(self) -> int:
         return REFERENCE_CONTROL_MAX_ACCEPTED_EVENTS
+
+    @property
+    def static_numeric_bytes(self) -> int:
+        return 0
 
     def _base_state(
         self,
@@ -1249,7 +1541,11 @@ class UniformRandomReferenceAdapter(_BaseReferenceControlAdapter):
         return cast(UniformRandomReferenceConfig, super().config)
 
     def _random_action(self, key: Array, decision_index: int) -> int:
-        _require_prng_key(key, name="uniform-random root key")
+        _require_prng_key(
+            key,
+            name="uniform-random root key",
+            implementation=_THREEFRY_IMPLEMENTATION,
+        )
         scheduled = jr.fold_in(key, _RANDOM_DOMAIN)
         scheduled = jr.fold_in(scheduled, (decision_index >> 32) & 0xFFFFFFFF)
         scheduled = jr.fold_in(scheduled, decision_index & 0xFFFFFFFF)
@@ -1259,7 +1555,7 @@ class UniformRandomReferenceAdapter(_BaseReferenceControlAdapter):
         self,
         key: Array,
     ) -> tuple[Array | None, ControlAgentState]:
-        return key, None
+        return _explicit_threefry_key(key, name="uniform-random initial key"), None
 
     def _start_payload(
         self,
@@ -1299,13 +1595,24 @@ class UniformRandomReferenceAdapter(_BaseReferenceControlAdapter):
 
 
 class AnalyticOracleReferenceAdapter(_BaseReferenceControlAdapter):
-    """Privileged phase-aware/stationary exact analytic control."""
+    """Privileged finite-horizon dynamic-programming control."""
 
-    __slots__ = ()
+    _oracle_policy_bytes: bytes
+    __slots__ = ("_oracle_policy_bytes",)
 
     def __init__(self, config: AnalyticOracleReferenceConfig) -> None:
         if not isinstance(config, AnalyticOracleReferenceConfig):
             raise ValueError("analytic-oracle adapter config has the wrong type")
+        policy = _finite_horizon_oracle_policy(
+            environment_kind=config.environment_kind,
+            environment_config=config.environment_config,
+            horizon=config.horizon,
+        )
+        object.__setattr__(
+            self,
+            "_oracle_policy_bytes",
+            np.asarray(policy, dtype="<i4", order="C").tobytes(order="C"),
+        )
         super().__init__(
             config,
             implementation_id=ANALYTIC_ORACLE_IMPLEMENTATION_ID,
@@ -1317,20 +1624,27 @@ class AnalyticOracleReferenceAdapter(_BaseReferenceControlAdapter):
     def config(self) -> AnalyticOracleReferenceConfig:
         return cast(AnalyticOracleReferenceConfig, super().config)
 
+    @property
+    def max_accepted_events(self) -> int:
+        return self.config.horizon
+
+    @property
+    def static_numeric_bytes(self) -> int:
+        return len(self._oracle_policy_bytes)
+
     def _oracle_action(
         self,
         observation: np.ndarray[Any, np.dtype[np.float32]],
         decision_index: int,
     ) -> int:
+        if decision_index < 0 or decision_index > self.config.horizon:
+            raise DecisionOwnershipError("analytic-oracle decision exceeds its horizon")
         state_index = int(np.argmax(observation))
-        if self.config.environment_kind == "switching_two_state":
-            assert self.config.phase_length is not None
-            phase = (decision_index // self.config.phase_length) % len(
-                self.config.policies
-            )
-        else:
-            phase = 0
-        return self.config.policies[phase][state_index]
+        policy = np.frombuffer(self._oracle_policy_bytes, dtype="<i4").reshape(
+            self.config.horizon + 1,
+            self.config.observation_dim,
+        )
+        return int(policy[decision_index, state_index])
 
     def _initial_payload(
         self,
@@ -1380,11 +1694,12 @@ class DifferentialSARSAReferenceAdapter(_BaseReferenceControlAdapter):
     def __init__(self, config: DifferentialSARSAReferenceConfig) -> None:
         if not isinstance(config, DifferentialSARSAReferenceConfig):
             raise ValueError("differential-SARSA adapter config has the wrong type")
+        agent = DifferentialSARSAAgent(config.core_config())
         super().__init__(
             config,
             implementation_id=DIFFERENTIAL_SARSA_IMPLEMENTATION_ID,
             state_schema=DIFFERENTIAL_SARSA_STATE_SCHEMA,
-            agent=DifferentialSARSAAgent(config.core_config()),
+            agent=agent,
         )
 
     @property
@@ -1393,14 +1708,26 @@ class DifferentialSARSAReferenceAdapter(_BaseReferenceControlAdapter):
 
     @property
     def _differential_agent(self) -> DifferentialSARSAAgent:
-        assert isinstance(self._agent, DifferentialSARSAAgent)
-        return self._agent
+        agent = self._agent
+        if (
+            not isinstance(agent, DifferentialSARSAAgent)
+            or self._agent_config_json is None
+            or _canonical_json(agent.to_config()) != self._agent_config_json
+        ):
+            raise DecisionOwnershipError(
+                "differential-SARSA core configuration was mutated"
+            )
+        return agent
 
     def _initial_payload(
         self,
         key: Array,
     ) -> tuple[Array | None, ControlAgentState]:
-        return None, self._differential_agent.init(self.config.observation_dim, key)
+        explicit_key = _explicit_threefry_key(
+            key,
+            name="differential-SARSA initial key",
+        )
+        return None, self._differential_agent.init(self.config.observation_dim, explicit_key)
 
     def _start_payload(
         self,
@@ -1455,12 +1782,21 @@ class DifferentialSARSAReferenceAdapter(_BaseReferenceControlAdapter):
                 raise DecisionOwnershipError(
                     f"differential-SARSA {name} must be scalar int32"
                 )
-        _require_prng_key(learner.rng_key, name="differential-SARSA key")
+        step_words = np.asarray(learner.step_words)
+        if step_words.shape != (2,) or step_words.dtype != np.dtype(np.uint32):
+            raise DecisionOwnershipError(
+                "differential-SARSA step_words must have shape (2,) and dtype uint32"
+            )
+        _require_prng_key(
+            learner.rng_key,
+            name="differential-SARSA key",
+            implementation=_THREEFRY_IMPLEMENTATION,
+        )
         if not _tree_finite(learner):
             raise DecisionOwnershipError("differential-SARSA state must be finite")
         if int(learner.step_count) != state.decision_index:
             raise DecisionOwnershipError("differential-SARSA counter does not match decision")
-        if not np.array_equal(np.asarray(learner.step_words), _counter_words(state.decision_index)):
+        if not np.array_equal(step_words, _counter_words(state.decision_index)):
             raise DecisionOwnershipError("differential-SARSA exact counter is inconsistent")
         if not np.array_equal(np.asarray(learner.last_observation), observation):
             raise DecisionOwnershipError("differential-SARSA observation cache is inconsistent")
@@ -1534,14 +1870,24 @@ class DiscountedSARSAReferenceAdapter(_BaseReferenceControlAdapter):
 
     @property
     def _sarsa_agent(self) -> SARSAAgent:
-        assert isinstance(self._agent, SARSAAgent)
-        return self._agent
+        agent = self._agent
+        if (
+            not isinstance(agent, SARSAAgent)
+            or self._agent_config_json is None
+            or _canonical_json(agent.to_config()) != self._agent_config_json
+        ):
+            raise DecisionOwnershipError("discounted-SARSA core configuration was mutated")
+        return agent
 
     def _initial_payload(
         self,
         key: Array,
     ) -> tuple[Array | None, ControlAgentState]:
-        return None, self._sarsa_agent.init(self.config.observation_dim, key)
+        explicit_key = _explicit_threefry_key(
+            key,
+            name="discounted-SARSA initial key",
+        )
+        return None, self._sarsa_agent.init(self.config.observation_dim, explicit_key)
 
     def _start_payload(
         self,
@@ -1562,6 +1908,101 @@ class DiscountedSARSAReferenceAdapter(_BaseReferenceControlAdapter):
         )
         return None, started, int(action)
 
+    def _validate_inner_learner_contract(self, learner: SARSAState) -> None:
+        inner = learner.learner_state
+        hidden_sizes = self.config.hidden_sizes
+        input_widths = (
+            (self.config.observation_dim, *hidden_sizes[:-1]) if hidden_sizes else ()
+        )
+        trunk_weights = inner.trunk_params.weights
+        trunk_biases = inner.trunk_params.biases
+        if (
+            type(trunk_weights) is not tuple
+            or type(trunk_biases) is not tuple
+            or len(trunk_weights) != len(hidden_sizes)
+            or len(trunk_biases) != len(hidden_sizes)
+        ):
+            raise DecisionOwnershipError(
+                "discounted-SARSA trunk parameter structure violates its contract"
+            )
+        trunk_shapes: list[tuple[int, ...]] = []
+        for index, (fan_in, fan_out) in enumerate(
+            zip(input_widths, hidden_sizes, strict=True)
+        ):
+            weight_shape = (fan_out, fan_in)
+            bias_shape = (fan_out,)
+            _require_float32_array(
+                trunk_weights[index],
+                name=f"discounted-SARSA trunk weight {index}",
+                shape=weight_shape,
+            )
+            _require_float32_array(
+                trunk_biases[index],
+                name=f"discounted-SARSA trunk bias {index}",
+                shape=bias_shape,
+            )
+            trunk_shapes.extend((weight_shape, bias_shape))
+
+        final_width = hidden_sizes[-1] if hidden_sizes else self.config.observation_dim
+        head_weights = inner.head_params.weights
+        head_biases = inner.head_params.biases
+        if (
+            type(head_weights) is not tuple
+            or type(head_biases) is not tuple
+            or len(head_weights) != self.config.n_actions
+            or len(head_biases) != self.config.n_actions
+        ):
+            raise DecisionOwnershipError(
+                "discounted-SARSA head parameter structure violates its contract"
+            )
+        for index in range(self.config.n_actions):
+            _require_float32_array(
+                head_weights[index],
+                name=f"discounted-SARSA head weight {index}",
+                shape=(1, final_width),
+            )
+            _require_float32_array(
+                head_biases[index],
+                name=f"discounted-SARSA head bias {index}",
+                shape=(1,),
+            )
+
+        _require_lms_optimizer_tree(
+            inner.trunk_optimizer_states,
+            name="discounted-SARSA trunk optimizer state",
+            group_count=len(hidden_sizes),
+            step_size=self.config.step_size,
+        )
+        _require_lms_optimizer_tree(
+            inner.head_optimizer_states,
+            name="discounted-SARSA head optimizer state",
+            group_count=self.config.n_actions,
+            step_size=self.config.step_size,
+        )
+        _require_float32_tree(
+            inner.trunk_traces,
+            name="discounted-SARSA trunk traces",
+            expected_shapes=tuple(trunk_shapes),
+        )
+        _require_float32_tree(
+            inner.head_traces,
+            name="discounted-SARSA head traces",
+            expected_shapes=tuple(
+                shape
+                for _ in range(self.config.n_actions)
+                for shape in ((1, final_width), (1,))
+            ),
+        )
+        _require_float32_tree(
+            inner.hidden_unit_utilities,
+            name="discounted-SARSA hidden-unit utilities",
+            expected_shapes=tuple((width,) for width in hidden_sizes),
+        )
+        if inner.normalizer_state is not None:
+            raise DecisionOwnershipError(
+                "discounted-SARSA state must not contain an undeclared normalizer"
+            )
+
     def _validate_payload(
         self,
         state: ReferenceLifeControlState,
@@ -1571,6 +2012,7 @@ class DiscountedSARSAReferenceAdapter(_BaseReferenceControlAdapter):
         learner = state.agent_state
         if not isinstance(learner, SARSAState) or state.random_key is not None:
             raise DecisionOwnershipError("discounted-SARSA state payload is inconsistent")
+        self._validate_inner_learner_contract(learner)
         last_observation = np.asarray(learner.last_observation)
         last_action = np.asarray(learner.last_action)
         step_count = np.asarray(learner.step_count)
@@ -1586,13 +2028,21 @@ class DiscountedSARSAReferenceAdapter(_BaseReferenceControlAdapter):
             raise DecisionOwnershipError("discounted-SARSA step_count must be scalar int32")
         if epsilon.shape != () or epsilon.dtype != np.dtype(np.float32):
             raise DecisionOwnershipError("discounted-SARSA epsilon must be scalar float32")
-        _require_prng_key(learner.rng_key, name="discounted-SARSA key")
+        _require_prng_key(
+            learner.rng_key,
+            name="discounted-SARSA key",
+            implementation=_THREEFRY_IMPLEMENTATION,
+        )
         if not _tree_finite(learner):
             raise DecisionOwnershipError("discounted-SARSA state must be finite")
         if int(step_count) != state.decision_index:
             raise DecisionOwnershipError("discounted-SARSA counter does not match decision")
         inner_count = np.asarray(learner.learner_state.step_count)
         inner_words = np.asarray(learner.learner_state.step_words)
+        if inner_words.shape != (2,) or inner_words.dtype != np.dtype(np.uint32):
+            raise DecisionOwnershipError(
+                "discounted-SARSA step_words must have shape (2,) and dtype uint32"
+            )
         if (
             inner_count.shape != ()
             or inner_count.dtype != np.dtype(np.int32)
@@ -1617,7 +2067,11 @@ class DiscountedSARSAReferenceAdapter(_BaseReferenceControlAdapter):
             raise DecisionOwnershipError(
                 "discounted-SARSA learner structure is invalid"
             ) from exc
-        if q_values.shape != (self.config.n_actions,) or not np.all(np.isfinite(q_values)):
+        if (
+            q_values.shape != (self.config.n_actions,)
+            or q_values.dtype != np.dtype(np.float32)
+            or not np.all(np.isfinite(q_values))
+        ):
             raise DecisionOwnershipError("discounted-SARSA action values are invalid")
 
     def _advance_payload(

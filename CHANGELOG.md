@@ -82,10 +82,15 @@ reproducible results. See `VENDORING.md` for the exact scope.
   distinct environment discriminator and produces exact original/restored keyed
   stochastic continuation from the same persisted barrier. It supplies no
   safety/options/boundary/Forager/robot conformance or broader environment
-  support. The next hillclimb is a permanently nonpromoting matched
-  SwitchingTwoState + RiverSwim development scorecard with frozen/no-learning,
-  random, analytic-oracle, and strong SARSA-family controls plus resource
-  accounting.
+  support.
+- Added permanently nonpromoting matched reference-life scorecard machinery:
+  environment-bound control adapters, explicit Threefry roots, finite-horizon
+  privileged dynamic-programming normalization, 144 fresh-process shards over
+  12 consumed development seeds, strict reward/counter/config validation, and
+  canonical numeric-payload accounting. The `asi-reference-life-scorecard` CLI
+  writes new immutable plan/shard/summary paths. This is L0 development
+  infrastructure, not a completed scorecard, authenticated execution receipt,
+  `reference-dev` selection, performance claim, or scientific evidence.
 
 #### Continual-learning benchmarks
 

@@ -49,7 +49,7 @@ from alberta_framework.core.options import STOMPConfig, SubtaskSpec
 
 @dataclass(frozen=True)
 class Step11OaKConfig:
-    """Configuration for the production Step 11 OaK facade.
+    """Configuration for the public Step 11 OaK facade.
 
     Thin wrapper around :class:`~alberta_framework.core.oak.OaKConfig` with
     standard dict serialization consistent with Steps 1–10.

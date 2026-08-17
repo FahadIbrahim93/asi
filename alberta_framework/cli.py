@@ -1,7 +1,7 @@
 """Console entry points for the Step 1 and Step 2 smoke kernels.
 
 ``alberta-step1-smoke`` and ``alberta-step2-smoke`` run the seeded Step 1
-(optimizer/normalizer) and Step 2 (UPGD) production kernels for a short
+(optimizer/normalizer) and Step 2 (UPGD) public kernels for a short
 horizon and exit nonzero unless every reported metric is finite; they are
 integration probes, not scientific evidence.
 """

@@ -554,6 +554,28 @@ def test_differential_sarsa_config_roundtrip_and_exact_td_error() -> None:
     chex.assert_trees_all_close(result.average_reward, state.average_reward)
 
 
+def test_differential_sarsa_greedy_noise_never_overturns_unique_near_tie() -> None:
+    agent = DifferentialSARSAAgent(
+        DifferentialSARSAConfig(
+            n_actions=2,
+            q_step_size=0.0,
+            average_reward_step_size=0.0,
+            epsilon_start=0.0,
+            epsilon_end=0.0,
+        )
+    )
+    state = agent.init(2, jr.key(9)).replace(  # type: ignore[attr-defined]
+        q_weights=jnp.zeros((2, 2), dtype=jnp.float32),
+        q_bias=jnp.asarray((0.0, 5e-7), dtype=jnp.float32),
+        epsilon=jnp.asarray(0.0, dtype=jnp.float32),
+    )
+    observation = jnp.zeros(2, dtype=jnp.float32)
+    for _ in range(200):
+        action, key = agent.select_action(state, observation)
+        assert int(action) == 1
+        state = state.replace(rng_key=key)  # type: ignore[attr-defined]
+
+
 def test_differential_sarsa_update_and_scan_are_finite() -> None:
     agent = DifferentialSARSAAgent(
         DifferentialSARSAConfig(

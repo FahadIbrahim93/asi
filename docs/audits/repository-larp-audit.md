@@ -1,30 +1,35 @@
 # Repository anti-LARP audit
 
+> **Historical snapshot.** This audit is bound to the revision and cleanup worktree named
+> below. It is not the authority for the current checkout's file counts, implementation state,
+> evidence validity, or remaining work. Use [`../status.md`](../status.md), the live
+> `alberta-evidence-status` command, and current campaign summaries for those facts.
+
 **Audit date:** 2026-08-14–15 (America/Los_Angeles)
-**Audited revision:** `22739da0b5d8a06a621b6743297f1c46d8d87903` plus the current pruning
-worktree
+**Audited base revision:** `22739da0b5d8a06a621b6743297f1c46d8d87903`
+**Cleanup state:** an uncommitted worktree observed during the audit; it is not reconstructable
+from the base revision alone
 **Scope:** implementation, tests, package metadata, documentation, registered evidence, and
 the active IPMNIST and Forager development records
 
 ## Bottom line
 
-The pre-cleanup repository had a very large research-theatre surface. The cleanup removes
-about **74% of package-and-test Python lines**, and the audit judges roughly **70–80%** of the
-old surface to have been unsupported, redundant, unissued, self-certifying, or superseded.
-Those are related but different statements: 74% is an exactly reproducible pruning ratio,
-while calling the removed surface “LARP” is a documented audit judgment. It is not a measured
-percentage of false mathematical statements, fabricated experimental values, or known LLM
-authorship.
+The pre-cleanup repository had a very large research-theatre surface. The audit-time worktree
+removed many unsupported, redundant, unissued, self-certifying, or superseded paths. Because
+that cleanup state was not recorded as an immutable commit, its line-count reduction is a
+historical observation rather than an independently reproducible repository metric. Calling
+the removed surface “LARP” is a documented audit judgment, not a measured percentage of false
+mathematical statements, fabricated experimental values, or known LLM authorship.
 
 The strongest measurements are:
 
 | Measure | Result | Meaning |
 |---|---:|---|
-| Package and test Python before cleanup | 1,264,156 lines in 1,192 files | Audited baseline at `HEAD` |
-| Package and test Python retained during cleanup | 326,768 lines in 356 files | Final audited working-tree inventory |
-| Python surface removed | **74.15% by physical lines; 70.13% by files** | Exact pruning ratio; LARP classification is the audit judgment |
+| Package and test Python before cleanup | 1,264,156 lines in 1,192 files | Audited base revision |
+| Package and test Python retained in the audit-time worktree | 326,768 lines in 356 files | Contemporaneous count; not the current tree and not reconstructable from the base commit alone |
+| Python surface reported removed | **74.15% by physical lines; 70.13% by files** | Contemporaneous calculation, not a live or independently reproducible metric |
 | Single `3d195c3` “updates” commit | 758,229 insertions in 849 files | Largest concentrated expansion |
-| Current-cleanup deletions born in that commit | 680,481 pre-cleanup lines across 643 files | Exact provenance cohort, not every deleted file |
+| Audit-cleanup deletions born in that commit | 680,481 pre-cleanup lines across 643 files | Recorded provenance cohort, not every deleted file |
 | Alberta Plan steps complete | **0/12** | Mechanism presence is not Step completion |
 | Live registered claims valid | **0/5** | Registry exits 2; frozen outcomes are historical records only |
 | IPMNIST promotion-grade claims | **0** | The campaign explicitly forbids promotion |
@@ -57,10 +62,10 @@ Normal library functions are not dead merely because this repository has no inte
 public extension surfaces were retained when their contracts and tests made an external use
 credible. Likewise, a negative result is not LARP when it is clearly labeled and preserved.
 
-## How the percentage was derived
+## Historical size record
 
-The physical pruning ratio is computed from the pre-cleanup `HEAD` tree and the retained
-working tree:
+The audit recorded the following comparison between the base revision and its uncommitted
+cleanup worktree:
 
 ```text
 HEAD package Python:       833,938 lines / 492 files
@@ -72,12 +77,12 @@ retained test Python:      116,438 lines / 196 files
 combined:                  326,768 lines / 356 files
 ```
 
-That is 937,388 lines (74.15%) and 836 files (70.13%) removed. Physical removal is not
-independently a semantic classification: the audit reached its 70–80% judgment by reviewing
-callers, tests, execution records, evidence authority, and narrative claims while deciding
-what to remove or retain. The range is a sensitivity judgment, not a statistical confidence
-interval. A per-file classification manifest would be required to turn it into a separately
-recomputable semantic percentage.
+Those recorded counts imply 937,388 lines (74.15%) and 836 files (70.13%) removed. The cleanup
+worktree was not preserved as a commit or per-file classification manifest, so the calculation
+cannot be rerun from the named base revision and must not be presented as a current statistic.
+Physical removal is also not a semantic classification. The 70–80% LARP estimate was a review
+judgment based on callers, tests, execution records, evidence authority, and narrative claims;
+it is not a statistical confidence interval.
 
 Git history supplies a separate provenance check. Commit `3d195c3` (2026-08-12), whose entire
 subject was `updates`, added 758,229 lines: about 510,000 under `alberta_framework/` and
@@ -88,9 +93,9 @@ consistent with LLM-amplified code generation. They cannot prove who or what aut
 text, so this audit does not assign an “LLM-written” percentage and does not call that cohort
 an objective lower bound on LARP.
 
-The 74% figure also does **not** mean the retained 26% is scientifically validated. Scientific
-completeness is measured separately: 0/12 complete Plan steps and 0/5 live-valid registered
-claims.
+The recorded 74% figure also does **not** mean the retained surface was scientifically
+validated. Scientific completeness is measured separately: 0/12 complete Plan steps and 0/5
+live-valid registered claims.
 
 ## Confirmed LARP removed or retired
 
@@ -129,9 +134,9 @@ documents, and other concluded lanes were retired. Their immutable or append-onl
 records remain in place, and reusable negative conclusions remain in
 `docs/evidence/negative-results.md`.
 
-## Current scientific truth
+## Scientific truth at audit time
 
-### The live registry supports zero current claims
+### The audit-time registry supported zero current claims
 
 `.venv/bin/alberta-evidence-status` exits 2 with all five registered claims invalid:
 
@@ -162,7 +167,7 @@ the v1 closure in place would not repair an already-invalid historical artifact.
 The repository has mechanisms related to Steps 1–12. Only Steps 1 and 2 have console smoke
 commands, and those are L0 integration probes. The narrow historical L2 records do not close
 the required retention, resource-matching, control-benefit, and uninterrupted L3 integration
-gates. Current completion is therefore 0/12, not “twelve implemented steps.”
+gates. Completion at audit time was therefore 0/12, not “twelve implemented steps.”
 
 ## IPMNIST: real numbers, weak identity
 
@@ -262,7 +267,7 @@ agent guide calls it immutable. The CLI now returns exit 2 for invalid input, ma
 refuse every pre-existing target, and the continual-IA and multiagent public artifact writers
 use exclusive creation with overwrite- and concurrent-writer tests.
 
-Final sharded verification also caught ordinary cleanup regressions before handoff. The public
+Cleanup verification also caught ordinary regressions before handoff. The public
 Step 10 facade now rejects an empty subtask set while the lower-level primitive-only STOMP
 configuration remains valid; forced-option and near-counter-capacity fixtures now preserve the
 exact ownership clocks required by the fail-closed transition checks; and SARSA config loading
@@ -292,7 +297,7 @@ The following parts survived because they do substantive work:
 “Credible” here means implemented and appropriately classified. It does not mean every retained
 mechanism has an empirical benefit result.
 
-## Residual software risk after cleanup
+## Residual software risk assessed at audit time
 
 The post-cleanup static pass found no remaining high-confidence private duplicate, stub-only
 module, permanently skipped lane, orphan package module, or active `NotImplementedError` path.
@@ -339,26 +344,17 @@ closed by adding classes, schemas, or tests:
 Calling those items “implemented” before the runs exist would recreate the problem this audit
 removes.
 
-## Reproduction commands
+## Live follow-up commands
 
 ```bash
-# Current registered evidence; expected to exit 2 until new evidence is issued.
+# Interpret evidence status from the current checkout.
 .venv/bin/alberta-evidence-status
 
-# Code and test inventory.
+# Current inventory; these commands do not reproduce the audit-time counts.
 find alberta_framework -name '*.py' -type f -print0 | xargs -0 wc -l
 find tests -name '*.py' -type f -print0 | xargs -0 wc -l
-git ls-tree -r --name-only HEAD -- alberta_framework tests
-git diff --numstat -- '*.py'
 
-# Exact current-cleanup cohort that was introduced by 3d195c3 and existed at HEAD.
-comm -12 \
-  <(git diff --name-only --diff-filter=D -- '*.py' | sort) \
-  <(git diff-tree --no-commit-id --name-only --diff-filter=A -r 3d195c3 -- '*.py' | sort) |
-while IFS= read -r path; do git show "HEAD:$path" | wc -l; done |
-awk '{lines += $1; files += 1} END {print lines, files}'
-
-# Static and executable verification.
+# Current static and executable verification.
 .venv/bin/python -m ruff check .
 .venv/bin/python -m mypy
 .venv/bin/python -m pytest --collect-only -q

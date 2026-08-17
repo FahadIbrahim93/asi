@@ -5,6 +5,7 @@ from __future__ import annotations
 import chex
 import jax.numpy as jnp
 import numpy as np
+import pytest
 
 from alberta_framework.utils.nexting import (
     forward_view_returns,
@@ -126,6 +127,12 @@ class TestRMSE:
         assert float(rmse_no_burn[0]) > 0.0
         chex.assert_trees_all_close(rmse_burn, jnp.zeros(h), atol=1e-6)
 
+    @pytest.mark.parametrize("burn_in", [-1, 4])
+    def test_burn_in_must_leave_evaluation_data(self, burn_in: int) -> None:
+        values = jnp.zeros((4, 1))
+        with pytest.raises(ValueError, match="burn_in"):
+            per_horizon_rmse(values, values, burn_in=burn_in)
+
 
 class TestRunningRMSE:
     def test_shape(self) -> None:
@@ -155,3 +162,9 @@ class TestRunningRMSE:
         assert float(running[-1, 0]) < 0.01
         # Mid-series transition: some error
         assert float(running[19, 0]) > 0.5
+
+    @pytest.mark.parametrize("window_size", [0, 5])
+    def test_window_must_fit_trace(self, window_size: int) -> None:
+        values = jnp.zeros((4, 1))
+        with pytest.raises(ValueError, match="window_size"):
+            per_horizon_running_rmse(values, values, window_size=window_size)

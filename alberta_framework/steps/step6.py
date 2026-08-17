@@ -37,7 +37,7 @@ from alberta_framework.core.average_reward import (
 
 @dataclass(frozen=True)
 class Step6DifferentialSARSAConfig:
-    """Config for the production Step 6 differential SARSA facade."""
+    """Config for the public Step 6 differential SARSA facade."""
 
     n_actions: int = 2
     q_step_size: float = 0.05
@@ -97,7 +97,7 @@ class Step6SmokeResult:
 def make_step6_differential_sarsa_agent(
     config: Step6DifferentialSARSAConfig | None = None,
 ) -> DifferentialSARSAAgent:
-    """Create the production Step 6 differential SARSA agent."""
+    """Create the public Step 6 differential SARSA agent."""
     cfg = config or Step6DifferentialSARSAConfig()
     return DifferentialSARSAAgent(cfg.to_core_config())
 

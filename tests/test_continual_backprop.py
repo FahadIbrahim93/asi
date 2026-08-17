@@ -7,6 +7,7 @@ import chex
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import pytest
 
 from alberta_framework.core.continual_backprop import (
     CBPLearningResult,
@@ -578,3 +579,39 @@ class TestConfigRoundtrip:
         rebuilt = CBPMultiHeadMLPLearner.from_config(cfg)
         cfg2 = rebuilt.to_config()
         assert cfg2 == cfg
+
+    @pytest.mark.parametrize(
+        "hidden_sizes",
+        ([8], (True,), (1.5,), (0,), (2**31,)),
+    )
+    def test_constructor_rejects_noncanonical_hidden_sizes(self, hidden_sizes: object):
+        with pytest.raises(ValueError, match="hidden_sizes"):
+            CBPMultiHeadMLPLearner(
+                n_heads=1,
+                hidden_sizes=hidden_sizes,  # type: ignore[arg-type]
+                sparsity=0.0,
+            )
+
+    @pytest.mark.parametrize("hidden_sizes", ["8", (8,), [True], [1.5], [0], [2**31]])
+    def test_from_config_rejects_noncanonical_hidden_sizes(self, hidden_sizes: object):
+        config = CBPMultiHeadMLPLearner(
+            n_heads=1,
+            hidden_sizes=(8,),
+            sparsity=0.0,
+        ).to_config()
+        config["hidden_sizes"] = hidden_sizes
+
+        with pytest.raises(ValueError, match="hidden_sizes"):
+            CBPMultiHeadMLPLearner.from_config(config)
+
+    @pytest.mark.parametrize("decay", [True, float("nan"), float("inf"), -0.1, 1.1])
+    def test_from_config_rejects_invalid_per_head_trace_decay(self, decay: object):
+        config = CBPMultiHeadMLPLearner(
+            n_heads=1,
+            hidden_sizes=(8,),
+            sparsity=0.0,
+        ).to_config()
+        config["per_head_gamma_lamda"] = [decay]
+
+        with pytest.raises(ValueError, match=r"per_head_gamma_lamda\[0\]"):
+            CBPMultiHeadMLPLearner.from_config(config)

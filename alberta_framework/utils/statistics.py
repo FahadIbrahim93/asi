@@ -1,4 +1,4 @@
-"""Statistical analysis utilities for publication-quality experiments.
+"""Statistical analysis utilities for multi-seed experiments.
 
 Provides functions for computing confidence intervals, significance tests,
 effect sizes, and multiple comparison corrections.
@@ -61,6 +61,22 @@ class SignificanceResult(NamedTuple):
     method_b: str
 
 
+def _validated_values(
+    values: NDArray[np.float64] | list[float], *, name: str
+) -> NDArray[np.float64]:
+    arr = np.asarray(values, dtype=np.float64)
+    if arr.ndim != 1 or arr.size == 0:
+        raise ValueError(f"{name} must be a non-empty one-dimensional sample")
+    if not np.all(np.isfinite(arr)):
+        raise ValueError(f"{name} must contain only finite values")
+    return arr
+
+
+def _validate_probability(value: float, *, name: str) -> None:
+    if not np.isfinite(value) or not 0.0 < value < 1.0:
+        raise ValueError(f"{name} must be strictly between zero and one")
+
+
 def compute_statistics(
     values: NDArray[np.float64] | list[float],
     confidence_level: float = 0.95,
@@ -74,7 +90,8 @@ def compute_statistics(
     Returns:
         StatisticalSummary with all statistics
     """
-    arr = np.asarray(values)
+    _validate_probability(confidence_level, name="confidence_level")
+    arr = _validated_values(values, name="values")
     n = len(arr)
 
     mean = float(np.mean(arr))
@@ -84,26 +101,15 @@ def compute_statistics(
     q75, q25 = np.percentile(arr, [75, 25])
     iqr = float(q75 - q25)
 
-    # Compute confidence interval
-    try:
+    if n > 1:
         from scipy import stats
 
-        if n > 1:
-            t_value = float(stats.t.ppf((1 + confidence_level) / 2, n - 1))
-            margin = t_value * sem
-            ci_lower = mean - margin
-            ci_upper = mean + margin
-        else:
-            ci_lower = ci_upper = mean
-    except ImportError:
-        # Fallback without scipy: normal approximation.  Only two quantiles
-        # are wired in — 0.95 -> z=1.96; every other confidence level silently
-        # gets the 99% quantile z=2.576.  The normal approximation also
-        # understates the t-based interval width at small n.
-        z_value = 1.96 if confidence_level == 0.95 else 2.576  # 95% or 99%
-        margin = z_value * sem
+        t_value = float(stats.t.ppf((1 + confidence_level) / 2, n - 1))
+        margin = t_value * sem
         ci_lower = mean - margin
         ci_upper = mean + margin
+    else:
+        ci_lower = ci_upper = mean
 
     return StatisticalSummary(
         mean=mean,
@@ -130,19 +136,23 @@ def compute_timeseries_statistics(
     Returns:
         Tuple of (mean, ci_lower, ci_upper) arrays of shape (n_steps,)
     """
+    _validate_probability(confidence_level, name="confidence_level")
+    metric_array = np.asarray(metric_array, dtype=np.float64)
+    if metric_array.ndim != 2 or 0 in metric_array.shape:
+        raise ValueError("metric_array must have shape (n_seeds, n_steps) with nonzero axes")
+    if not np.all(np.isfinite(metric_array)):
+        raise ValueError("metric_array must contain only finite values")
     n_seeds = metric_array.shape[0]
     mean = np.mean(metric_array, axis=0)
-    std = np.std(metric_array, axis=0, ddof=1)
+    std = np.std(metric_array, axis=0, ddof=1) if n_seeds > 1 else np.zeros_like(mean)
     sem = std / np.sqrt(n_seeds)
 
-    try:
+    if n_seeds > 1:
         from scipy import stats
 
         t_value = stats.t.ppf((1 + confidence_level) / 2, n_seeds - 1)
-    except ImportError:
-        # Same limitation as compute_statistics: 0.95 -> z=1.96, any other
-        # level silently gets the 99% quantile z=2.576.
-        t_value = 1.96 if confidence_level == 0.95 else 2.576
+    else:
+        t_value = 0.0
 
     margin = t_value * sem
     ci_lower = mean - margin
@@ -164,8 +174,8 @@ def cohens_d(
     Returns:
         Cohen's d (positive means a > b)
     """
-    a = np.asarray(values_a)
-    b = np.asarray(values_b)
+    a = _validated_values(values_a, name="values_a")
+    b = _validated_values(values_b, name="values_b")
 
     mean_a = np.mean(a)
     mean_b = np.mean(b)
@@ -177,10 +187,17 @@ def cohens_d(
     var_a = np.var(a, ddof=1) if n_a > 1 else 0.0
     var_b = np.var(b, ddof=1) if n_b > 1 else 0.0
 
-    pooled_std = np.sqrt(((n_a - 1) * var_a + (n_b - 1) * var_b) / (n_a + n_b - 2))
+    degrees_of_freedom = n_a + n_b - 2
+    if degrees_of_freedom <= 0:
+        raise ValueError("Cohen's d requires at least three values across both samples")
+    pooled_std = np.sqrt(
+        ((n_a - 1) * var_a + (n_b - 1) * var_b) / degrees_of_freedom
+    )
 
     if pooled_std == 0:
-        return 0.0
+        if mean_a == mean_b:
+            return 0.0
+        raise ValueError("Cohen's d is undefined when pooled variance is zero")
 
     return float((mean_a - mean_b) / pooled_std)
 
@@ -206,8 +223,11 @@ def ttest_comparison(
     Returns:
         SignificanceResult with test results
     """
-    a = np.asarray(values_a)
-    b = np.asarray(values_b)
+    _validate_probability(alpha, name="alpha")
+    a = _validated_values(values_a, name="values_a")
+    b = _validated_values(values_b, name="values_b")
+    if paired and a.shape != b.shape:
+        raise ValueError("paired samples must have the same length")
 
     try:
         from scipy import stats
@@ -257,8 +277,9 @@ def mann_whitney_comparison(
     Returns:
         SignificanceResult with test results
     """
-    a = np.asarray(values_a)
-    b = np.asarray(values_b)
+    _validate_probability(alpha, name="alpha")
+    a = _validated_values(values_a, name="values_a")
+    b = _validated_values(values_b, name="values_b")
 
     try:
         from scipy import stats
@@ -315,8 +336,11 @@ def wilcoxon_comparison(
     Returns:
         SignificanceResult with test results
     """
-    a = np.asarray(values_a)
-    b = np.asarray(values_b)
+    _validate_probability(alpha, name="alpha")
+    a = _validated_values(values_a, name="values_a")
+    b = _validated_values(values_b, name="values_b")
+    if a.shape != b.shape:
+        raise ValueError("paired samples must have the same length")
 
     try:
         from scipy import stats
@@ -355,6 +379,11 @@ def bonferroni_correction(
     Returns:
         Tuple of (list of significant booleans, corrected alpha)
     """
+    _validate_probability(alpha, name="alpha")
+    if not p_values:
+        raise ValueError("p_values must not be empty")
+    if any(not np.isfinite(p) or not 0.0 <= p <= 1.0 for p in p_values):
+        raise ValueError("p_values must contain probabilities in [0, 1]")
     n_tests = len(p_values)
     corrected_alpha = alpha / n_tests
     significant = [p < corrected_alpha for p in p_values]
@@ -376,6 +405,11 @@ def holm_correction(
     Returns:
         List of significant booleans
     """
+    _validate_probability(alpha, name="alpha")
+    if not p_values:
+        raise ValueError("p_values must not be empty")
+    if any(not np.isfinite(p) or not 0.0 <= p <= 1.0 for p in p_values):
+        raise ValueError("p_values must contain probabilities in [0, 1]")
     n_tests = len(p_values)
 
     # Sort p-values and track original indices
@@ -430,12 +464,25 @@ def pairwise_comparisons(
     if n < 2:
         return {}
 
-    # Extract final values for each method
+    _validate_probability(alpha, name="alpha")
+    if window < 1:
+        raise ValueError("window must be positive")
+
+    # Paired tests below assume that row i denotes the same seed in every arm.
+    reference_seeds: list[int] | None = None
     final_values: dict[str, NDArray[np.float64]] = {}
     for name, agg in results.items():
         if not isinstance(agg, AggregatedResults):
             raise TypeError(f"Expected AggregatedResults, got {type(agg)}")
-        arr = agg.metric_arrays[metric]
+        if reference_seeds is None:
+            reference_seeds = agg.seeds
+        elif agg.seeds != reference_seeds:
+            raise ValueError("paired comparisons require identical seed ordering")
+        arr = np.asarray(agg.metric_arrays[metric], dtype=np.float64)
+        if arr.ndim != 2 or arr.shape[0] != len(agg.seeds) or arr.shape[1] == 0:
+            raise ValueError(f"{name}.{metric} does not align with its seed list")
+        if not np.all(np.isfinite(arr)):
+            raise ValueError(f"{name}.{metric} must contain only finite values")
         final_window = min(window, arr.shape[1])
         final_values[name] = np.mean(arr[:, -final_window:], axis=1)
 
@@ -525,7 +572,12 @@ def bootstrap_ci(
     Returns:
         Tuple of (point_estimate, ci_lower, ci_upper)
     """
-    arr = np.asarray(values)
+    _validate_probability(confidence_level, name="confidence_level")
+    if statistic not in {"mean", "median"}:
+        raise ValueError("statistic must be 'mean' or 'median'")
+    if n_bootstrap < 1:
+        raise ValueError("n_bootstrap must be positive")
+    arr = _validated_values(values, name="values")
     rng = np.random.default_rng(seed)
 
     stat_func = np.mean if statistic == "mean" else np.median

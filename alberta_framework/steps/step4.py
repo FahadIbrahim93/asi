@@ -52,7 +52,7 @@ Step4BounderName = Literal["none", "obgd"]
 
 @dataclass(frozen=True)
 class Step4SARSAConfig:
-    """Config for the production Step 4 SARSA facade."""
+    """Config for the public Step 4 SARSA facade."""
 
     n_actions: int = 2
     hidden_sizes: tuple[int, ...] = (16,)
@@ -125,7 +125,7 @@ class Step4SmokeResult:
 
 @chex.dataclass(frozen=True)
 class Step4OneStepResult:
-    """Result from one production Step 4 transition."""
+    """Result from one Step 4 transition."""
 
     state: SARSAState
     action: Array
@@ -167,7 +167,7 @@ def make_step4_sarsa_agent(
     *,
     prediction_demons: tuple[GVFSpec, ...] | None = None,
 ) -> SARSAAgent:
-    """Create the production Step 4 SARSA agent."""
+    """Create the public Step 4 SARSA agent."""
     cfg = config or Step4SARSAConfig()
     return SARSAAgent(
         sarsa_config=cfg.to_sarsa_config(),

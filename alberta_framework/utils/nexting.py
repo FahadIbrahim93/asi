@@ -134,6 +134,8 @@ def per_horizon_rmse(
     Returns:
         Array of shape ``(H,)`` with RMSE per horizon.
     """
+    if burn_in < 0 or burn_in >= predictions.shape[0]:
+        raise ValueError("burn_in must leave at least one evaluation step")
     if burn_in:
         predictions = predictions[burn_in:]
         forward_returns = forward_returns[burn_in:]
@@ -160,6 +162,8 @@ def per_horizon_running_rmse(
         Array of shape ``(T, H)``. The first ``window_size - 1`` rows are
         equal to ``running_rmse[window_size - 1]``.
     """
+    if window_size < 1 or window_size > predictions.shape[0]:
+        raise ValueError("window_size must be between one and the trace length")
     sq_err = (predictions - forward_returns) ** 2  # (T, H)
     cumsum = jnp.cumsum(jnp.concatenate([jnp.zeros((1, sq_err.shape[1])), sq_err]), axis=0)
     window = cumsum[window_size:] - cumsum[:-window_size]

@@ -26,9 +26,25 @@ existing import surface intact.
 
 **Current program hillclimb:** run a permanently nonpromoting matched
 development scorecard across `SwitchingTwoStateMDP` and `RiverSwimMDP` with
-frozen/no-learning, random, analytic-oracle, and strong SARSA-family controls
-plus explicit resource accounting. This is development selection only; it does
-not populate `reference-dev` or create performance or scientific evidence.
+frozen/no-learning, random, finite-horizon privileged dynamic-programming, and
+strong SARSA-family controls plus explicit resource accounting. This is
+development selection only; it does not populate `reference-dev` or create
+performance or scientific evidence.
+
+The scorecard implementation is in
+`alberta_framework/{reference_life_controls.py,benchmarks/reference_life_scorecard.py}`
+and runs through `asi-reference-life-scorecard`. Its literal-frozen plan has
+12 consumed development seeds, 2 environments, and 6 arms (144 fresh-process
+shards); every shard binds its current source identity, and aggregation requires
+one matching current identity. The privileged normalization arm is an
+environment-bound finite-horizon dynamic-programming control and is excluded
+from candidate Pareto comparisons.
+All agent RNG roots use explicit Threefry keys. Records enforce the fixed reward
+lattice, complete counters, canonical initial/final numeric payload accounting
+(including static oracle policy bytes), and permanently nonpromoting policy.
+Timing remains telemetry-only until a separately qualified timing protocol
+exists. The implementation and validators do not constitute a completed run or
+performance result; consistency hashes are not authenticated execution proof.
 
 The unfrozen `preview1` transaction protocol, pure reducer/CAS ledger,
 primitive-only exact-dispatch Prototype bridge, and aggregate runner are in
@@ -140,15 +156,20 @@ Key documents:
 - Mission and hillclimb ladder: `docs/research/asi-roadmap.md`
 - Proposed reference-agent protocol: `docs/design/asi-reference-agent-protocol.md`
 - Implemented `preview1` transaction ledger, primitive Prototype bridge,
-  aggregate Switching/RiverSwim life runner, and quiescent exact-resume gates:
+  aggregate Switching/RiverSwim life runner, quiescent exact-resume gates, and
+  matched development-scorecard machinery:
   `alberta_framework/reference_agent.py` ·
   `alberta_framework/prototype_reference_adapter.py` ·
   `alberta_framework/reference_life.py` ·
   `alberta_framework/reference_life_checkpoint.py` ·
+  `alberta_framework/reference_life_controls.py` ·
+  `alberta_framework/benchmarks/reference_life_scorecard.py` ·
   `tests/test_reference_life.py` ·
   `tests/test_reference_life_checkpoint.py` ·
   `tests/test_reference_life_riverswim.py` ·
-  `tests/test_reference_life_riverswim_checkpoint.py`
+  `tests/test_reference_life_riverswim_checkpoint.py` ·
+  `tests/test_reference_life_controls.py` ·
+  `tests/test_reference_life_scorecard.py`
 - Status & evidence: `docs/status.md` (levels L0–L3, completion gates) ·
   `docs/evidence/methodology.md` (property-by-property map)
 - Active campaign: `docs/research/ipmnist-theory.md` ·
@@ -176,7 +197,8 @@ Always use the project venv:
 ```
 
 See `[project.scripts]` in `pyproject.toml` for the current console-script
-inventory. The ones you'll reach for are `alberta-evidence-status`,
+inventory. The ones you'll reach for are `asi-reference-life-scorecard`,
+`alberta-evidence-status`,
 `alberta-forager-benchmark`, `alberta-foragax-open-screen`, and the
 `alberta-forager-matched-*` family. Benchmark executions happen through
 scripts/CLIs, never inside pytest — tests must stay CI-cheap unless
@@ -266,4 +288,3 @@ and honest.
   compatibility package/CLI surface, or historical evidence identifiers.
 - `CLAUDE.md` and `AGENTS.md` are identical: author `CLAUDE.md`, copy to
   `AGENTS.md`.
-- No git commits unless explicitly asked.

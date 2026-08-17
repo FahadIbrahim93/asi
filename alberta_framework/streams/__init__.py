@@ -1,5 +1,8 @@
 """Experience streams for continual learning."""
 
+from importlib import import_module
+from typing import Any
+
 from alberta_framework.streams.base import ScanStream
 from alberta_framework.streams.closed_loop import (
     LEFT_ACTION,
@@ -138,31 +141,26 @@ __all__ = [
     "make_scale_range",
 ]
 
-# Gymnasium streams are optional - only export if gymnasium is installed
-try:
-    from alberta_framework.streams.gymnasium import (
-        GymnasiumStream,
-        PredictionMode,
-        TDStream,
-        collect_trajectory,
-        learn_from_trajectory,
-        learn_from_trajectory_normalized,
-        make_epsilon_greedy_policy,
-        make_gymnasium_stream,
-        make_random_policy,
-    )
+_GYMNASIUM_EXPORTS = (
+    "GymnasiumStream",
+    "PredictionMode",
+    "TDStream",
+    "collect_trajectory",
+    "learn_from_trajectory",
+    "learn_from_trajectory_normalized",
+    "make_epsilon_greedy_policy",
+    "make_gymnasium_stream",
+    "make_random_policy",
+)
 
-    __all__ += [
-        "GymnasiumStream",
-        "PredictionMode",
-        "TDStream",
-        "collect_trajectory",
-        "learn_from_trajectory",
-        "learn_from_trajectory_normalized",
-        "make_epsilon_greedy_policy",
-        "make_gymnasium_stream",
-        "make_random_policy",
-    ]
-except ImportError:
-    # gymnasium not installed
-    pass
+__all__ += list(_GYMNASIUM_EXPORTS)
+
+
+def __getattr__(name: str) -> Any:
+    """Load the optional Gymnasium adapter without coupling core imports to it."""
+    if name not in _GYMNASIUM_EXPORTS:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module = import_module("alberta_framework.streams.gymnasium")
+    value = getattr(module, name)
+    globals()[name] = value
+    return value

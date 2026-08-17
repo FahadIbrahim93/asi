@@ -51,7 +51,7 @@ from alberta_framework.core.options import (
 
 @dataclass(frozen=True)
 class Step10STOMPConfig:
-    """Configuration for the production Step 10 STOMP facade.
+    """Configuration for the public Step 10 STOMP facade.
 
     This thin wrapper around :class:`STOMPConfig` adds standard
     dict serialization consistent with the Step 1–9 facades.

@@ -147,10 +147,25 @@ def aggregate_metrics(results: list[SingleRunResult]) -> AggregatedResults:
         raise ValueError("Cannot aggregate empty results list")
 
     config_name = results[0].config_name
+    if any(result.config_name != config_name for result in results):
+        raise ValueError("all runs must belong to the same configuration")
+    if any(not result.metrics_history for result in results):
+        raise ValueError("every run must contain at least one metric step")
+    expected_keys = set(results[0].metrics_history[0])
+    expected_steps = len(results[0].metrics_history)
+    if not expected_keys:
+        raise ValueError("metric histories must contain at least one metric")
+    for result in results:
+        if len(result.metrics_history) != expected_steps:
+            raise ValueError("all runs must contain the same number of metric steps")
+        if any(set(step) != expected_keys for step in result.metrics_history):
+            raise ValueError("metric keys must be identical at every step and seed")
     seeds = [r.seed for r in results]
+    if len(set(seeds)) != len(seeds):
+        raise ValueError("each run must use a distinct seed")
 
     # Get all metric keys from first result
-    metric_keys = list(results[0].metrics_history[0].keys())
+    metric_keys = list(results[0].metrics_history[0])
 
     # Build metric arrays: (n_seeds, n_steps)
     metric_arrays: dict[str, NDArray[np.float64]] = {}
@@ -206,9 +221,20 @@ def run_multi_seed_experiment(
     """
     # Convert seeds to list
     if isinstance(seeds, int):
+        if seeds < 1:
+            raise ValueError("seeds must be positive")
         seed_list = list(range(seeds))
     else:
         seed_list = list(seeds)
+        if not seed_list:
+            raise ValueError("seeds must not be empty")
+        if len(set(seed_list)) != len(seed_list):
+            raise ValueError("seeds must be unique")
+    if not configs:
+        raise ValueError("configs must not be empty")
+    names = [config.name for config in configs]
+    if len(set(names)) != len(names):
+        raise ValueError("configuration names must be unique")
 
     # Build list of (config, seed) pairs
     tasks: list[tuple[ExperimentConfig, int]] = []
@@ -307,6 +333,8 @@ def get_final_performance(
     Returns:
         Dictionary mapping config name to (mean, std) tuple
     """
+    if window < 1:
+        raise ValueError("window must be positive")
     performance: dict[str, tuple[float, float]] = {}
     for name, agg in results.items():
         arr = agg.metric_arrays[metric]

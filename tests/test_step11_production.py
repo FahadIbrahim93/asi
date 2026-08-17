@@ -1,4 +1,4 @@
-"""Tests for the Step 11 OaK production facade."""
+"""Tests for the public Step 11 OaK facade."""
 
 from __future__ import annotations
 
@@ -205,24 +205,6 @@ def test_step11_update_utility_ema_updates_during_execution() -> None:
     assert float(result.utility_ema[0]) != 0.0
 
 
-def test_step11_update_execution_count_increments_on_start() -> None:
-    spec = SubtaskSpec(feature_index=0, threshold=99.0, max_option_steps=100)
-    cfg = Step11OaKConfig(
-        subtask_specs=(spec,),
-        observation_dim=2,
-        n_primitive_actions=2,
-        epsilon_base=1.0,  # force random to potentially select option
-    )
-    agent, state = _setup(cfg)
-    # Run many steps; option must start at least once
-    n_steps = 50
-    rewards = jnp.zeros(n_steps)
-    obs = jr.normal(jr.key(77), (n_steps, 2)) * 0.1
-    result = run_step11_scan(agent, state, rewards, obs)
-    # At least 0 executions (option might not get selected, but count is >= 0)
-    assert bool(jnp.all(result.state.execution_counts >= 0))
-
-
 # ---------------------------------------------------------------------------
 # Scan
 # ---------------------------------------------------------------------------
@@ -334,8 +316,7 @@ def test_curate_resets_option_weights() -> None:
     state_after = run_step11_scan(
         agent, state, jnp.zeros(n_steps), jr.normal(jr.key(1), (n_steps, 4))
     ).state
-    # Curate at a coherent primitive boundary. If the scan ends inside the
-    # sole option, production curation correctly defers replacement.
+    # Curate at a coherent primitive boundary. An active option defers replacement.
     state_after = state_after.replace(
         stomp_state=state_after.stomp_state.replace(
             executing_option=jnp.array(-1, dtype=jnp.int32),

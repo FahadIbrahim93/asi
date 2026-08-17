@@ -1,5 +1,5 @@
 # mypy: disable-error-code="untyped-decorator,unused-ignore"
-"""Production-facing Step 1/2 kernel tests."""
+"""Public Step 1/2 kernel contract tests."""
 
 import json
 import tomllib

@@ -1,11 +1,12 @@
 # mypy: disable-error-code="attr-defined,call-arg,no-any-return,unused-ignore"
-"""End-to-end Alberta Plan Step 1-4 pipeline glue.
+"""Integrated Step 2 featurization, Step 3 prediction, and Step 4 control.
 
-The production pipeline composes the existing packaged pieces conservatively:
+The pipeline composes the existing packaged pieces conservatively:
 
-1. Step 1 enters through the adaptive optimizers used by later learners.
+1. Step 1 optimizer components are reused by later learners; this pipeline
+   does not run the Step 1 prediction benchmark.
 2. Step 2 supplies feature augmentation in one of four modes: the lightweight
-   temporal-context featurizer, the promoted nonlinear UPGD learner (whose
+   temporal-context featurizer, the nonlinear UPGD learner (whose
    penultimate hidden activations become the feature vector for downstream
    Step 3 and Step 4 learners), the associative-memory learner (whose
    next-token probability vector becomes the features), or raw identity
@@ -93,8 +94,8 @@ class Step2FeatureConfig:
     """Config for the lightweight temporal-context Step 2 layer.
 
     This is the historical "raw + EMA + delta + phase products" featurizer
-    retained for back-compatibility. New deployments should consider
-    :class:`Step2UPGDConfig` for the promoted nonlinear Step 2 path.
+    retained for compatibility. :class:`Step2UPGDConfig` selects the nonlinear
+    Step 2 path.
     """
 
     observation_dim: int = 4
@@ -163,7 +164,7 @@ class Step2FeatureConfig:
 
 @dataclass(frozen=True)
 class Step2UPGDConfig:
-    """Config for the promoted UPGD-backed Step 2 featurizer.
+    """Config for the UPGD-backed Step 2 featurizer.
 
     The UPGD learner's penultimate hidden activations are exposed as the
     feature vector for downstream Step 3 and Step 4 learners. The number of
@@ -250,7 +251,7 @@ class Step2UPGDConfig:
         hidden_sizes: tuple[int, ...] = (64, 64),
         step_size: float = 0.018,
     ) -> Step2UPGDConfig:
-        """Return the promoted strict digit/readout Step 2 config."""
+        """Return the strict digit/readout Step 2 config."""
         return cls(
             observation_dim=observation_dim,
             n_heads=n_heads,
@@ -280,7 +281,7 @@ class Step2UPGDConfig:
 
 @dataclass(frozen=True)
 class Step2AssociativePipelineConfig:
-    """Config for associative Step 2 features in the end-to-end pipeline."""
+    """Config for associative Step 2 features in the integrated pipeline."""
 
     vocab_size: int = 16
     block_size: int = 8
@@ -424,7 +425,7 @@ class HordeActorCriticPipelineConfig:
 
 @dataclass(frozen=True)
 class AlbertaPipelineConfig:
-    """Config for the Step 1-4 production pipeline.
+    """Config for the integrated Step 2-4 pipeline.
 
     The ``step2`` and ``control`` fields select which Step 2 featurizer and
     Step 4 control mode the pipeline runs. Defaults preserve the legacy
@@ -532,7 +533,7 @@ class AlbertaPipelineConfig:
 
 @chex.dataclass(frozen=True)
 class AlbertaPipelineState:
-    """Checkpoint-friendly immutable state for the Step 1-4 pipeline.
+    """Checkpoint-friendly immutable state for the Step 2-4 pipeline.
 
     ``feature_state`` stores the temporal-context state when ``step2`` is
     ``"temporal_context"``; otherwise it is None. ``upgd_state`` stores the
@@ -553,7 +554,7 @@ class AlbertaPipelineState:
 
 @chex.dataclass(frozen=True)
 class AlbertaPipelineStepResult:
-    """Result from one end-to-end transition update.
+    """Result from one integrated transition update.
 
     ``q_values`` carries Q-values when ``control_mode == "sarsa"`` and the
     softmax policy when ``control_mode == "horde_ac"``. The ``action`` field
@@ -573,7 +574,7 @@ class AlbertaPipelineStepResult:
 
 @chex.dataclass(frozen=True)
 class AlbertaPipelineArrayResult:
-    """Result from scanning the end-to-end pipeline over arrays."""
+    """Result from scanning the integrated pipeline over arrays."""
 
     state: AlbertaPipelineState
     features: Array
@@ -1164,7 +1165,7 @@ def make_alberta_pipeline(
     *,
     cumulant_fn: CumulantFn | None = None,
 ) -> AlbertaPipeline:
-    """Create an end-to-end Alberta production pipeline."""
+    """Create the integrated Step 2-4 pipeline."""
     return AlbertaPipeline(config, cumulant_fn=cumulant_fn)
 
 
@@ -1174,7 +1175,7 @@ def run_pipeline_smoke(
     steps: int = 24,
     seed: int = 0,
 ) -> AlbertaPipelineSmokeResult:
-    """Run a deterministic Step 1-4 pipeline smoke probe."""
+    """Run a deterministic Step 2-4 pipeline smoke probe."""
     if steps < 1:
         msg = f"steps must be positive, got {steps}"
         raise ValueError(msg)

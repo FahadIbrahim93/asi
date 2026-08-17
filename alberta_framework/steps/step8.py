@@ -130,7 +130,7 @@ class Step8EnsemblePrediction:
 def make_step8_world_model(
     config: Step8WorldModelConfig | None = None,
 ) -> OneStepWorldModel:
-    """Create the production Step 8 one-step world model."""
+    """Create the public Step 8 one-step world model."""
     cfg = config or Step8WorldModelConfig()
     return OneStepWorldModel(cfg.to_core_config())
 

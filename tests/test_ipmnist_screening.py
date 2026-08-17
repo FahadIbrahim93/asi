@@ -3008,13 +3008,6 @@ class TestComparisonArms:
     shared normalized-SGD base when its constant is inert."""
 
     BASE = {"step_size": 0.01, "norm_decay": 0.99, "norm_epsilon": 1e-8}
-    ARMS = (
-        "sgd_ema_norm_d099",
-        "wclip_ema_norm",
-        "fade_head_ema_norm",
-        "snr_ema_norm",
-        "l2init_ema_norm",
-    )
 
     def test_registry_configs(self):
         expected = {

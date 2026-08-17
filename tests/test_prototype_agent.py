@@ -56,6 +56,13 @@ OBS_DIM = 4
 N_PRIM = 2
 
 
+def test_authoritative_transition_is_compiled_as_one_reusable_jax_boundary() -> None:
+    """Validation stays eager while normalized transitions reuse one compiled core."""
+
+    assert not hasattr(PrototypeAgent.update_transition, "lower")
+    assert hasattr(PrototypeAgent._update_transition_impl, "lower")
+
+
 def _oak_cfg(
     specs: tuple[SubtaskSpec, ...] = (_SPEC0,),
     obs_dim: int = OBS_DIM,

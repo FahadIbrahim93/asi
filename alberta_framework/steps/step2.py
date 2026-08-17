@@ -1,12 +1,10 @@
 # mypy: disable-error-code="call-arg"
-"""Production Step 2 kernel.
+"""Public Step 2 kernel.
 
-The Step 2 production surface exposes the current promoted learner:
-target-structure UPGD.  It is a single learner with online hidden-feature
+The Step 2 surface exposes target-structure UPGD: a learner with online hidden-feature
 utility, low-utility perturbation, ObGD-bounded updates, and vector-output
 heads.  It is not a theorem of universal representation learning; it is the
-current empirically promoted kernel for the supervised Step 2 acceptance
-matrix.
+configuration used by the supervised Step 2 smoke and development checks.
 
 For retained class-view memory, Step 2 also exposes a JAX fixed-budget
 prototype memory and a packaged UPGD-memory learner that updates both the
@@ -60,7 +58,7 @@ Step2HybridReadoutMode = Literal["linear_mse", "softmax_ce"]
 
 @dataclass(frozen=True)
 class Step2KernelConfig:
-    """Config for the production Step 2 UPGD kernel."""
+    """Config for the public Step 2 UPGD kernel."""
 
     feature_dim: int = 8
     n_heads: int = 3
@@ -121,7 +119,7 @@ class Step2StrictDigitReadoutConfig:
 
 @dataclass(frozen=True)
 class Step2MemoryConfig:
-    """Config for the production Step 2 retained-view memory."""
+    """Config for the public Step 2 retained-view memory."""
 
     feature_dim: int = 784
     n_classes: int = 10
@@ -204,7 +202,7 @@ class Step2AssociativeConfig:
 
 @dataclass(frozen=True)
 class Step2HybridConfig:
-    """Config for the production Step 2 UPGD plus memory learner.
+    """Config for the public Step 2 UPGD plus memory learner.
 
     Fields mirror
     :class:`~alberta_framework.core.upgd_memory.UPGDMemoryConfig`
@@ -271,7 +269,7 @@ class Step2HybridConfig:
 
 @dataclass(frozen=True)
 class Step2TemporalContextConfig:
-    """Config for the promoted phase-context UPGD stressor kernel.
+    """Config for the phase-context UPGD stressor kernel.
 
     ``periods`` drives the sin/cos clock features of
     :class:`~alberta_framework.core.temporal_context.TemporalContextConfig`:
@@ -361,7 +359,7 @@ class Step2AssociativeSmokeResult:
 
 
 def make_step2_learner(config: Step2KernelConfig | None = None) -> UPGDLearner:
-    """Create the promoted Step 2 target-structure UPGD learner."""
+    """Create the Step 2 target-structure UPGD learner."""
     cfg = config or Step2KernelConfig()
     return UPGDLearner.step2_default(
         n_heads=cfg.n_heads,
@@ -377,7 +375,7 @@ def make_step2_strict_digit_readout_learner(
 ) -> UPGDLearner:
     """Create the strict online-MSE digit/readout Step 2 learner.
 
-    This is the heavier two-timescale simplex branch promoted for
+    This is the heavier two-timescale simplex branch configured for
     sklearn-digits-style one-hot online classification streams.  The broad
     supervised default remains :func:`make_step2_learner`.
     """
@@ -392,7 +390,7 @@ def make_step2_strict_digit_readout_learner(
 def make_step2_memory_learner(
     config: Step2MemoryConfig | None = None,
 ) -> PrototypeMemoryLearner:
-    """Create the promoted Step 2 retained-view memory learner."""
+    """Create the Step 2 retained-view memory learner."""
     cfg = config or Step2MemoryConfig()
     return PrototypeMemoryLearner(
         PrototypeMemoryConfig(
@@ -472,7 +470,7 @@ def make_step2_hybrid_learner(
 def make_step2_temporal_context(
     config: Step2TemporalContextConfig | None = None,
 ) -> TemporalContextFeaturizer:
-    """Create the promoted causal phase-product context featurizer."""
+    """Create the causal phase-product context featurizer."""
     cfg = config or Step2TemporalContextConfig()
     return TemporalContextFeaturizer(
         TemporalContextConfig(

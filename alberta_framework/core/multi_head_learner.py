@@ -20,14 +20,16 @@ import functools
 import math
 import time
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, cast
 
 import chex
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import Array
 from jaxtyping import Bool, Float, UInt
 
+from alberta_framework.core._float32_scalars import validated_float32_scalar
 from alberta_framework.core.initializers import sparse_init
 from alberta_framework.core.normalizers import (
     AnyNormalizerState,
@@ -58,6 +60,29 @@ MULTI_HEAD_LIFETIME_COUNTER_NBYTES = 12
 MULTI_HEAD_LIFETIME_COUNTER_DELTA_NBYTES = 8
 
 _INT32_MAX = 2**31 - 1
+_ACTUAL_INT_TYPES: tuple[type, ...] = (
+    int,
+    np.int8,
+    np.int16,
+    np.int32,
+    np.int64,
+    np.longlong,
+    np.uint8,
+    np.uint16,
+    np.uint32,
+    np.uint64,
+    np.ulonglong,
+)
+
+
+def _require_hidden_width(name: str, value: object) -> int:
+    actual_type = type(value)
+    if issubclass(actual_type, bool) or actual_type not in _ACTUAL_INT_TYPES:
+        raise ValueError(f"{name} must be an integer in [1, {_INT32_MAX}]")
+    number = int(cast(int, value))
+    if not 1 <= number <= _INT32_MAX:
+        raise ValueError(f"{name} must be an integer in [1, {_INT32_MAX}], got {value!r}")
+    return number
 
 
 def _extract_mean_step_size(
@@ -362,6 +387,33 @@ class MultiHeadMLPLearner:
         if not 0.0 <= utility_decay < 1.0:
             raise ValueError("utility_decay must be in [0, 1)")
 
+        n_heads = _require_hidden_width("n_heads", n_heads)
+        if type(hidden_sizes) is not tuple:
+            raise ValueError(
+                f"hidden_sizes must be an actual tuple, got {type(hidden_sizes).__name__}"
+            )
+        hidden_sizes = tuple(
+            _require_hidden_width(f"hidden_sizes[{i}]", value)
+            for i, value in enumerate(hidden_sizes)
+        )
+        if per_head_gamma_lamda is not None:
+            if type(per_head_gamma_lamda) is not tuple:
+                raise ValueError(
+                    "per_head_gamma_lamda must be an actual tuple, "
+                    f"got {type(per_head_gamma_lamda).__name__}"
+                )
+            if len(per_head_gamma_lamda) != n_heads:
+                raise ValueError(
+                    f"per_head_gamma_lamda must have length n_heads ({n_heads}), "
+                    f"got {len(per_head_gamma_lamda)}"
+                )
+            per_head_gamma_lamda = tuple(
+                validated_float32_scalar(
+                    f"per_head_gamma_lamda[{i}]", value, lower=0.0, upper=1.0
+                )
+                for i, value in enumerate(per_head_gamma_lamda)
+            )
+
         self._n_heads = n_heads
         self._hidden_sizes = hidden_sizes
         self._optimizer: AnyOptimizer = optimizer or LMS(step_size=step_size)
@@ -485,6 +537,10 @@ class MultiHeadMLPLearner:
 
         per_head_gl = config.pop("per_head_gamma_lamda", None)
         if per_head_gl is not None:
+            if type(per_head_gl) is not list:
+                raise ValueError(
+                    f"per_head_gamma_lamda must be a list, got {type(per_head_gl).__name__}"
+                )
             per_head_gl = tuple(per_head_gl)
 
         trace_mode_str = config.pop("trace_mode", None)
@@ -492,9 +548,13 @@ class MultiHeadMLPLearner:
             TraceMode(trace_mode_str) if trace_mode_str is not None else TraceMode.ACCUMULATING
         )
 
+        raw_hidden = config.pop("hidden_sizes")
+        if type(raw_hidden) is not list:
+            raise ValueError(f"hidden_sizes must be a list, got {type(raw_hidden).__name__}")
+
         return cls(
             n_heads=config.pop("n_heads"),
-            hidden_sizes=tuple(config.pop("hidden_sizes")),
+            hidden_sizes=tuple(raw_hidden),
             optimizer=optimizer,
             bounder=bounder,
             normalizer=normalizer,

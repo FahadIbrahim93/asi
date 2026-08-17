@@ -49,6 +49,7 @@ from alberta_framework.reference_agent import (
 )
 from alberta_framework.reference_life import (
     REFERENCE_LIFE_CONFIG_SCHEMA,
+    REFERENCE_LIFE_RNG_SCHEDULE,
     REFERENCE_LIFE_STATE_SCHEMA,
     RIVERSWIM_ENVIRONMENT_IMPLEMENTATION_ID,
     RIVERSWIM_ENVIRONMENT_STATE_SCHEMA,
@@ -140,10 +141,6 @@ def _require_float(value: Any, *, path: str) -> float:
     if not np.isfinite(result):
         _fail(f"{path} must be finite")
     return result
-
-
-def _require_optional_float(value: Any, *, path: str) -> float | None:
-    return None if value is None else _require_float(value, path=path)
 
 
 def _require_digest(value: Any, *, path: str) -> str:
@@ -980,7 +977,7 @@ def _build_runner(config_value: Any) -> tuple[ReferenceLifeRunner, dict[str, Any
     ):
         _fail("manifest.life_config.schema is unsupported")
     schedules = {
-        "rng_schedule": "jax_fold_in_environment_cursor.preview1",
+        "rng_schedule": REFERENCE_LIFE_RNG_SCHEDULE,
         "observation_id_schedule": "lifecycle_observation_index.preview1",
         "checkpoint_policy": "atomic_quiescent_bundle.preview1",
     }

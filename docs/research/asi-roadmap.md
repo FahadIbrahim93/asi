@@ -246,12 +246,19 @@ dimensions. Post-hoc tradeoff weights cannot turn a regression into a win.
 
 ## Current program priorities
 
-1. **Run the matched Switching + RiverSwim development scorecard.** Compare the
-   primitive reference life across both environments against frozen/no-learning,
-   random, analytic-oracle, and strong SARSA-family controls with explicit
-   compute, memory, and latency accounting. Freeze the development protocol
-   before the run and keep every result permanently nonpromoting. This scorecard
-   does not populate `reference-dev` or constitute performance or scientific
+1. **Execute the implemented Switching + RiverSwim development scorecard.** The
+   literal-frozen L0 plan defines 144 fresh-process shards over 12 consumed
+   development seeds, two environments, and Prototype, frozen/no-learning,
+   random, finite-horizon privileged dynamic-programming, differential-SARSA,
+   and discounted-SARSA arms. Each shard binds its current source identity, and
+   aggregation requires one matching current identity. It binds explicit Threefry roots, complete
+   counters, reward lattices, and canonical numeric-payload accounting. The
+   frozen acceptance rule requires a qualifying SARSA-family control on each
+   environment, candidate improvement over frozen on both, candidate
+   noninferiority to the best qualifying SARSA control on both, and no post-hoc
+   scalar. Timing is telemetry-only, so resource Pareto selection remains open
+   until separately qualified. Every result is permanently nonpromoting; the
+   scorecard does not populate `reference-dev` or constitute scientific
    evidence.
 2. **Turn plasticity gains into agent gains.** Use the development-only IPMNIST
    campaign to generate mechanisms, then remeasure controls and test survivors

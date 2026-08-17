@@ -124,10 +124,23 @@ additional/general environments, Forager, and robot adapters remain open. The ro
 paths do not currently consume `PrototypeAgent`, and Forager still records an unresolved
 extended-action dispatch edge.
 
-The next reference-life hillclimb is a permanently nonpromoting matched development scorecard
-across SwitchingTwoState and RiverSwim with frozen/no-learning, random, analytic-oracle, and strong
-SARSA-family controls plus explicit resource accounting. It does not select `reference-dev` or
-constitute performance or scientific evidence.
+The current reference-life hillclimb is implemented as a permanently nonpromoting matched
+development scorecard in
+[`reference_life_controls.py`](alberta_framework/reference_life_controls.py) and
+[`reference_life_scorecard.py`](alberta_framework/benchmarks/reference_life_scorecard.py), with
+retained [control](tests/test_reference_life_controls.py) and
+[artifact/CLI](tests/test_reference_life_scorecard.py) tests. The literal-frozen plan uses 12
+consumed development seeds across SwitchingTwoState and RiverSwim and compares Prototype,
+frozen/no-learning Prototype, uniform random, an environment-bound finite-horizon privileged
+dynamic-programming control, differential SARSA, and discounted SARSA in 144 fresh-process
+shards. Every shard binds its current source identity, and aggregation requires one matching
+current identity. Agent RNG roots use explicit Threefry keys. Records validate fixed reward
+lattices, complete counters, and canonical initial/final numeric payload accounting including
+static oracle policy bytes; timing is telemetry-only. Run it through
+`asi-reference-life-scorecard`. This
+machinery is L0 and permanently nonpromoting: implementation, a valid plan, or passing validators
+does not select `reference-dev`, attest execution, or constitute a completed run, performance
+result, or scientific evidence.
 
 The package also contains inherited surfaces related to all twelve steps of the Alberta Plan.
 That crosswalk is useful for finding gaps, but completing a checklist of Plan mechanisms would
@@ -355,7 +368,6 @@ consumed seeds, or modify immutable `outputs/` records. See
 - [Research status and completion gates](docs/status.md)
 - [Evidence methodology and property map](docs/evidence/methodology.md)
 - [Negative and bounded results](docs/evidence/negative-results.md)
-- [Repository anti-LARP audit](docs/audits/repository-larp-audit.md)
 
 ### Runbooks
 
@@ -366,6 +378,7 @@ consumed seeds, or modify immutable `outputs/` records. See
 - [IPMNIST theory](docs/research/ipmnist-theory.md)
 - [Current IPMNIST campaign index](docs/research/ipmnist-campaign-index.md)
 - [RTU Taylor-correction derivation](docs/design/rtu-taylor-correction.md)
+- [Dated repository anti-LARP audit](docs/audits/repository-larp-audit.md)
 - [Forager comparator audit](docs/archive/forager-comparator-audit.md)
 - [Historical Forager reconstruction](docs/archive/historical-forager-reconstruction.md)
 - [OPMNIST closure provenance](outputs/step2_canonical/step2_opmnist_solution_800task_3seed_PROVENANCE.md)

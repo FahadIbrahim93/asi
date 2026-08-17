@@ -3,13 +3,18 @@
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Callable
+import itertools
+import math
 
+import jax
+import jax.numpy as jnp
+import jax.random as jr
 import numpy as np
 import pytest
 
 from alberta_framework.core.average_reward import DifferentialSARSAState
 from alberta_framework.core.sarsa import SARSAState
+from alberta_framework.core.types import LMSState
 from alberta_framework.reference_agent import (
     AuthorizationStatus,
     DecisionOwnershipError,
@@ -105,13 +110,6 @@ def _uniform_switching() -> UniformRandomReferenceAdapter:
     )
 
 
-def _oracle_river() -> AnalyticOracleReferenceAdapter:
-    environment = RiverSwimConfig(n_states=3)  # type: ignore[call-arg]
-    return AnalyticOracleReferenceAdapter(
-        AnalyticOracleReferenceConfig.for_riverswim(environment)
-    )
-
-
 def _differential_switching() -> DifferentialSARSAReferenceAdapter:
     environment = SwitchingTwoStateConfig(phase_length=2)  # type: ignore[call-arg]
     return DifferentialSARSAReferenceAdapter(
@@ -139,33 +137,101 @@ def _discounted_switching() -> DiscountedSARSAReferenceAdapter:
     )
 
 
+def _control_for_environment(
+    algorithm: str,
+    environment_kind: str,
+) -> tuple[object, SwitchingTwoStateConfig | RiverSwimConfig]:
+    if environment_kind == "switching_two_state":
+        switching_environment = SwitchingTwoStateConfig(  # type: ignore[call-arg]
+            phase_length=2
+        )
+        if algorithm == "uniform_random":
+            config = UniformRandomReferenceConfig.for_switching(switching_environment)
+            return UniformRandomReferenceAdapter(config), switching_environment
+        if algorithm == "analytic_oracle":
+            oracle_config = AnalyticOracleReferenceConfig.for_switching(
+                switching_environment,
+                horizon=4,
+            )
+            return AnalyticOracleReferenceAdapter(oracle_config), switching_environment
+        if algorithm == "differential_sarsa":
+            differential_config = DifferentialSARSAReferenceConfig.for_switching(
+                switching_environment,
+                epsilon_start=0.25,
+                epsilon_end=0.25,
+            )
+            return (
+                DifferentialSARSAReferenceAdapter(differential_config),
+                switching_environment,
+            )
+        if algorithm == "discounted_sarsa":
+            discounted_config = DiscountedSARSAReferenceConfig.for_switching(
+                switching_environment,
+                epsilon_start=0.25,
+                epsilon_end=0.25,
+                hidden_sizes=(),
+            )
+            return (
+                DiscountedSARSAReferenceAdapter(discounted_config),
+                switching_environment,
+            )
+    elif environment_kind == "riverswim":
+        river_environment = RiverSwimConfig(n_states=3)  # type: ignore[call-arg]
+        if algorithm == "uniform_random":
+            config = UniformRandomReferenceConfig.for_riverswim(river_environment)
+            return UniformRandomReferenceAdapter(config), river_environment
+        if algorithm == "analytic_oracle":
+            oracle_config = AnalyticOracleReferenceConfig.for_riverswim(
+                river_environment,
+                horizon=4,
+            )
+            return AnalyticOracleReferenceAdapter(oracle_config), river_environment
+        if algorithm == "differential_sarsa":
+            differential_config = DifferentialSARSAReferenceConfig.for_riverswim(
+                river_environment,
+                epsilon_start=0.25,
+                epsilon_end=0.25,
+            )
+            return DifferentialSARSAReferenceAdapter(differential_config), river_environment
+        if algorithm == "discounted_sarsa":
+            discounted_config = DiscountedSARSAReferenceConfig.for_riverswim(
+                river_environment,
+                epsilon_start=0.25,
+                epsilon_end=0.25,
+                hidden_sizes=(),
+            )
+            return DiscountedSARSAReferenceAdapter(discounted_config), river_environment
+    raise AssertionError(f"unsupported test control {algorithm}/{environment_kind}")
+
+
 @pytest.mark.integration
 @pytest.mark.parametrize(
-    ("adapter_factory", "environment_kind"),
+    "algorithm",
     (
-        (_uniform_switching, "switching"),
-        (_oracle_river, "river"),
-        (_differential_switching, "switching"),
-        (_discounted_switching, "switching"),
+        "uniform_random",
+        "analytic_oracle",
+        "differential_sarsa",
+        "discounted_sarsa",
     ),
 )
-def test_every_control_adapter_runs_one_complete_reference_life(
-    adapter_factory: Callable[[], object],
+@pytest.mark.parametrize("environment_kind", ("switching_two_state", "riverswim"))
+def test_every_control_runs_one_complete_life_in_each_environment(
+    algorithm: str,
     environment_kind: str,
 ) -> None:
-    adapter = adapter_factory()
-    if environment_kind == "river":
+    adapter, environment = _control_for_environment(algorithm, environment_kind)
+    if isinstance(environment, RiverSwimConfig):
         runner = _river_runner(
             adapter,
-            RiverSwimConfig(n_states=3),  # type: ignore[call-arg]
-            lifecycle_id=f"control.{adapter.manifest.implementation_id}.life",  # type: ignore[attr-defined]
+            environment,
+            lifecycle_id=f"control.{algorithm}.riverswim.life",
             horizon=3,
         )
     else:
         runner = _switching_runner(
             adapter,
-            SwitchingTwoStateConfig(phase_length=2),  # type: ignore[call-arg]
-            lifecycle_id=f"control.{adapter.manifest.implementation_id}.life",  # type: ignore[attr-defined]
+            environment,
+            lifecycle_id=f"control.{algorithm}.switching.life",
             horizon=3,
         )
 
@@ -176,6 +242,226 @@ def test_every_control_adapter_runs_one_complete_reference_life(
     assert len(run.events) == 3
     assert all(event.step_result.transaction_accepted for event in run.events)
     assert all(event.transaction.decision.proposed_action is not None for event in run.events)
+
+
+def test_executed_control_scalars_are_canonical_actual_float32_values() -> None:
+    environment = SwitchingTwoStateConfig(phase_length=2)  # type: ignore[call-arg]
+    differential_values = {
+        "q_step_size": 0.123456789,
+        "average_reward_step_size": 0.234567891,
+        "trace_decay": 0.345678912,
+        "epsilon_start": 0.456789123,
+        "epsilon_end": 0.123456789,
+    }
+    differential = DifferentialSARSAReferenceConfig.for_switching(
+        environment,
+        **differential_values,
+    )
+    discounted_values = {
+        "gamma": 0.912345678,
+        "epsilon_start": 0.456789123,
+        "epsilon_end": 0.123456789,
+        "step_size": 0.234567891,
+        "sparsity": 0.345678912,
+        "leaky_relu_slope": 0.0123456789,
+        "lamda": 0.567891234,
+    }
+    discounted = DiscountedSARSAReferenceConfig.for_switching(
+        environment,
+        hidden_sizes=(),
+        **discounted_values,
+    )
+
+    for name, raw in differential_values.items():
+        assert getattr(differential, name) == float(np.float32(raw))
+    for name, raw in discounted_values.items():
+        assert getattr(discounted, name) == float(np.float32(raw))
+    assert differential.core_config().q_step_size == differential.q_step_size
+    assert discounted.core_config().gamma == discounted.gamma
+
+
+def test_oracle_environment_scalars_bind_the_executed_float32_values() -> None:
+    switching_raw = 0.123456789
+    switching = AnalyticOracleReferenceConfig.for_switching(
+        SwitchingTwoStateConfig(  # type: ignore[call-arg]
+            phase_length=2,
+            payoffs_a=((switching_raw, 0.0), (0.0, switching_raw)),
+        ),
+        horizon=4,
+    )
+    assert switching.environment_config["payoffs_a"] == [
+        [float(np.float32(switching_raw)), 0.0],
+        [0.0, float(np.float32(switching_raw))],
+    ]
+
+    river_values = {
+        "p_right_up": 0.345678912,
+        "p_right_down": 0.123456789,
+        "reward_left": 0.0123456789,
+        "reward_right": 0.987654321,
+    }
+    river = AnalyticOracleReferenceConfig.for_riverswim(
+        RiverSwimConfig(  # type: ignore[call-arg]
+            n_states=3,
+            **river_values,
+        ),
+        horizon=4,
+    )
+    for name, raw in river_values.items():
+        assert river.environment_config[name] == float(np.float32(raw))
+
+
+def test_control_scalar_validation_uses_post_narrowing_float32_bounds() -> None:
+    environment = SwitchingTwoStateConfig(phase_length=2)  # type: ignore[call-arg]
+    overflow = float(np.finfo(np.float32).max) * 2.0
+    for field in ("q_step_size", "average_reward_step_size"):
+        with pytest.raises(ValueError, match="float32"):
+            DifferentialSARSAReferenceConfig.for_switching(
+                environment,
+                **{field: overflow},
+            )
+    for field in ("step_size", "leaky_relu_slope"):
+        with pytest.raises(ValueError, match="float32"):
+            DiscountedSARSAReferenceConfig.for_switching(
+                environment,
+                hidden_sizes=(),
+                **{field: overflow},
+            )
+
+    rounds_to_one = math.nextafter(1.0, 0.0)
+    with pytest.raises(ValueError, match="gamma|less than one|float32"):
+        DiscountedSARSAReferenceConfig.for_switching(
+            environment,
+            gamma=rounds_to_one,
+            hidden_sizes=(),
+        )
+    with pytest.raises(ValueError, match="sparsity|less than one|float32"):
+        DiscountedSARSAReferenceConfig.for_switching(
+            environment,
+            sparsity=rounds_to_one,
+            hidden_sizes=(),
+        )
+
+
+def test_environment_scalar_gate_rejects_non_real_overflow_and_positive_collapse() -> None:
+    overflow = float(np.finfo(np.float32).max) * 2.0
+    with pytest.raises(ValueError, match="float32|numeric"):
+        UniformRandomReferenceConfig.for_switching(
+            SwitchingTwoStateConfig(  # type: ignore[call-arg]
+                phase_length=2,
+                payoffs_a=((overflow, 0.0), (0.0, 0.0)),
+            )
+        )
+    with pytest.raises(ValueError, match="real|float32|numeric"):
+        UniformRandomReferenceConfig.for_switching(
+            SwitchingTwoStateConfig(  # type: ignore[call-arg]
+                phase_length=2,
+                payoffs_a=(("0.5", 0.0), (0.0, 0.0)),
+            )
+        )
+    with pytest.raises(ValueError, match="positive|float32"):
+        UniformRandomReferenceConfig.for_riverswim(
+            RiverSwimConfig(  # type: ignore[call-arg]
+                n_states=3,
+                p_right_up=math.nextafter(0.0, 1.0),
+            )
+        )
+
+
+def test_decay_counts_and_discounted_network_shapes_are_resource_bounded() -> None:
+    environment = SwitchingTwoStateConfig(phase_length=2)  # type: ignore[call-arg]
+    int32_max = int(np.iinfo(np.int32).max)
+    DifferentialSARSAReferenceConfig.for_switching(
+        environment,
+        epsilon_decay_steps=int32_max,
+    )
+    DiscountedSARSAReferenceConfig.for_switching(
+        environment,
+        epsilon_decay_steps=int32_max,
+        hidden_sizes=(),
+    )
+    for config_type in (
+        DifferentialSARSAReferenceConfig,
+        DiscountedSARSAReferenceConfig,
+    ):
+        with pytest.raises(ValueError, match="epsilon_decay_steps|int32|capacity"):
+            config_type(
+                environment_kind="switching_two_state",
+                observation_dim=2,
+                epsilon_decay_steps=int32_max + 1,
+            )
+
+    with pytest.raises(ValueError, match="hidden|layer|resource"):
+        DiscountedSARSAReferenceConfig.for_switching(
+            environment,
+            hidden_sizes=(1,) * 33,
+        )
+    with pytest.raises(ValueError, match="hidden|int32|resource"):
+        DiscountedSARSAReferenceConfig.for_switching(
+            environment,
+            hidden_sizes=(int32_max + 1,),
+        )
+    with pytest.raises(ValueError, match="network|parameter|resource"):
+        DiscountedSARSAReferenceConfig.for_switching(
+            environment,
+            hidden_sizes=(4096, 4096),
+        )
+
+
+def test_stochastic_controls_bind_explicit_threefry_roots_across_global_defaults() -> None:
+    environment = SwitchingTwoStateConfig(phase_length=2)  # type: ignore[call-arg]
+    adapter = UniformRandomReferenceAdapter(
+        UniformRandomReferenceConfig.for_switching(environment)
+    )
+    assert adapter.manifest.config["rng_implementation"] == "threefry2x32"
+
+    explicit_key = jr.key(91, impl="threefry2x32")
+    baseline_state = adapter.init(explicit_key, lifecycle_id="control.rng.baseline")
+    baseline_started, baseline_decision = adapter.start(
+        baseline_state,
+        observation_id="observation.0",
+        observation=np.asarray((1.0, 0.0), dtype=np.float32),
+    )
+    assert baseline_decision.proposed_action is not None
+    assert baseline_started.random_key is not None
+    assert str(jr.key_impl(baseline_started.random_key)) == "threefry2x32"
+
+    with jax.default_prng_impl("rbg"):
+        alternate_state = adapter.init(
+            explicit_key,
+            lifecycle_id="control.rng.alternate_global",
+        )
+        _, alternate_decision = adapter.start(
+            alternate_state,
+            observation_id="observation.0",
+            observation=np.asarray((1.0, 0.0), dtype=np.float32),
+        )
+        assert alternate_decision.proposed_action == baseline_decision.proposed_action
+        with pytest.raises(DecisionOwnershipError, match="threefry2x32"):
+            adapter.init(
+                jr.key(91),
+                lifecycle_id="control.rng.rbg_root",
+            )
+
+
+def test_control_resource_usage_includes_both_array_value_caches() -> None:
+    adapter = _uniform_switching()
+    fresh = adapter.init(
+        jr.key(7, impl="threefry2x32"),
+        lifecycle_id="control.resources.cache",
+    )
+    fresh_usage = control_state_resource_usage(fresh)
+    started, _ = adapter.start(
+        fresh,
+        observation_id="observation.0",
+        observation=np.asarray((1.0, 0.0), dtype=np.float32),
+    )
+    armed_usage = control_state_resource_usage(started)
+
+    assert armed_usage.array_leaves == fresh_usage.array_leaves + 2
+    assert armed_usage.array_elements == fresh_usage.array_elements + 3
+    assert armed_usage.persistent_bytes == fresh_usage.persistent_bytes + 12
+    assert armed_usage.floating_array_leaves == fresh_usage.floating_array_leaves + 1
 
 
 def test_uniform_random_schedule_is_seed_deterministic_and_owner_bound() -> None:
@@ -215,42 +501,69 @@ def test_uniform_random_schedule_is_seed_deterministic_and_owner_bound() -> None
         second.validate_state(first_run.state.agent_state)
 
 
-def test_oracle_uses_privileged_switching_phase_and_stationary_river_policy() -> None:
+def test_oracle_uses_exact_finite_horizon_dynamic_program() -> None:
     switching = SwitchingTwoStateConfig(phase_length=2)  # type: ignore[call-arg]
-    switching_config = AnalyticOracleReferenceConfig.for_switching(switching)
+    switching_horizon = 6
+    switching_config = AnalyticOracleReferenceConfig.for_switching(
+        switching,
+        horizon=switching_horizon,
+    )
     switching_runner = _switching_runner(
         AnalyticOracleReferenceAdapter(switching_config),
         switching,
         lifecycle_id="control.oracle.switching.valid",
-        horizon=6,
+        horizon=switching_horizon,
     )
     valid_switching_run = switching_runner.run_to_completion(switching_runner.init())
-    expected_policies = switching_config.policies
+    switching_payoffs = np.asarray(
+        (switching.payoffs_a, switching.payoffs_b), dtype=np.float64
+    )
+    switching_values = np.zeros(2, dtype=np.float64)
+    expected_switching = np.empty((switching_horizon, 2), dtype=np.int32)
+    for index in range(switching_horizon - 1, -1, -1):
+        phase = (index // switching.phase_length) % 2
+        q_values = switching_payoffs[phase] + switching_values[np.newaxis, :]
+        expected_switching[index] = np.argmax(q_values, axis=1)
+        switching_values = q_values[np.arange(2), expected_switching[index]]
     for event in valid_switching_run.events:
         decision = event.transaction.decision
         observation = np.asarray(decision.observation.to_python())
         state_index = int(np.argmax(observation))
-        phase = (decision.decision_index // switching.phase_length) % 2
         assert decision.proposed_action is not None
-        assert decision.proposed_action.to_python() == expected_policies[phase][state_index]
+        assert decision.proposed_action.to_python() == int(
+            expected_switching[decision.decision_index, state_index]
+        )
 
     river = RiverSwimConfig(n_states=4)  # type: ignore[call-arg]
     river_kernel = RiverSwimMDP(river)
-    river_config = AnalyticOracleReferenceConfig.for_riverswim(river)
+    river_horizon = 8
+    river_config = AnalyticOracleReferenceConfig.for_riverswim(
+        river,
+        horizon=river_horizon,
+    )
     river_adapter = AnalyticOracleReferenceAdapter(river_config)
     river_runner = _river_runner(
         river_adapter,
         river,
         lifecycle_id="control.oracle.river",
-        horizon=8,
+        horizon=river_horizon,
     )
     river_run = river_runner.run_to_completion(river_runner.init())
-    policy = river_kernel.optimal_policy()
+    transitions = river_kernel.transition_tensor.astype(np.float64)
+    rewards = river_kernel.reward_tensor.astype(np.float64)
+    river_values = np.zeros(river.n_states, dtype=np.float64)
+    expected_river = np.empty((river_horizon, river.n_states), dtype=np.int32)
+    for index in range(river_horizon - 1, -1, -1):
+        q_values = rewards + np.einsum("asn,n->sa", transitions, river_values)
+        expected_river[index] = np.argmax(q_values, axis=1)
+        river_values = q_values[np.arange(river.n_states), expected_river[index]]
     for event in river_run.events:
         decision = event.transaction.decision
         state_index = int(np.argmax(np.asarray(decision.observation.to_python())))
         assert decision.proposed_action is not None
-        assert decision.proposed_action.to_python() == policy[state_index]
+        assert decision.proposed_action.to_python() == int(
+            expected_river[decision.decision_index, state_index]
+        )
 
     manifest_config = river_adapter.manifest.config
     assert manifest_config["privileged"] is True
@@ -414,21 +727,89 @@ def test_discounted_sarsa_updates_on_continuing_unit_discount_outcome() -> None:
     assert resources.floating_array_leaves > 0
 
 
+def test_learning_control_state_validation_requires_exact_persistent_dtypes() -> None:
+    differential = _differential_switching()
+    differential_runner = _switching_runner(
+        differential,
+        SwitchingTwoStateConfig(phase_length=2),  # type: ignore[call-arg]
+        lifecycle_id="control.differential.dtype",
+        horizon=1,
+    )
+    differential_state = differential_runner.init().agent_state
+    assert isinstance(differential_state, ReferenceLifeControlState)
+    differential_learner = differential_state.agent_state
+    assert isinstance(differential_learner, DifferentialSARSAState)
+    bad_differential_words = differential_learner.replace(  # type: ignore[attr-defined]
+        step_words=jnp.asarray((0, 0), dtype=jnp.int32)
+    )
+    with pytest.raises(DecisionOwnershipError, match="step_words|uint32|dtype"):
+        differential.validate_state(
+            dataclasses.replace(
+                differential_state,
+                agent_state=bad_differential_words,
+            )
+        )
+
+    discounted = _discounted_switching()
+    discounted_runner = _switching_runner(
+        discounted,
+        SwitchingTwoStateConfig(phase_length=2),  # type: ignore[call-arg]
+        lifecycle_id="control.discounted.dtype",
+        horizon=1,
+    )
+    discounted_state = discounted_runner.init().agent_state
+    assert isinstance(discounted_state, ReferenceLifeControlState)
+    discounted_learner = discounted_state.agent_state
+    assert isinstance(discounted_learner, SARSAState)
+    inner = discounted_learner.learner_state
+    bad_inner_words = inner.replace(  # type: ignore[attr-defined]
+        step_words=jnp.asarray((0, 0), dtype=jnp.int32)
+    )
+    with pytest.raises(DecisionOwnershipError, match="step_words|uint32|dtype"):
+        discounted.validate_state(
+            dataclasses.replace(
+                discounted_state,
+                agent_state=discounted_learner.replace(  # type: ignore[attr-defined]
+                    learner_state=bad_inner_words
+                ),
+            )
+        )
+
+    head_weights = inner.head_params.weights
+    bad_head_params = inner.head_params.replace(  # type: ignore[attr-defined]
+        weights=(head_weights[0].astype(jnp.float16), *head_weights[1:])
+    )
+    bad_float_tree = inner.replace(  # type: ignore[attr-defined]
+        head_params=bad_head_params
+    )
+    with pytest.raises(DecisionOwnershipError, match="float32|dtype|contract"):
+        discounted.validate_state(
+            dataclasses.replace(
+                discounted_state,
+                agent_state=discounted_learner.replace(  # type: ignore[attr-defined]
+                    learner_state=bad_float_tree
+                ),
+            )
+        )
+
+
 def test_all_control_adapters_declare_the_exact_signed_int32_capacity() -> None:
     adapters = (
         _uniform_switching(),
         AnalyticOracleReferenceAdapter(
             AnalyticOracleReferenceConfig.for_switching(
-                SwitchingTwoStateConfig(phase_length=2)  # type: ignore[call-arg]
+                SwitchingTwoStateConfig(phase_length=2),  # type: ignore[call-arg]
+                horizon=2,
             )
         ),
         _differential_switching(),
         _discounted_switching(),
     )
     assert REFERENCE_CONTROL_MAX_ACCEPTED_EVENTS == int(np.iinfo(np.int32).max)
+    assert adapters[1].max_accepted_events == 2
     assert all(
         adapter.max_accepted_events == REFERENCE_CONTROL_MAX_ACCEPTED_EVENTS
-        for adapter in adapters
+        for adapter in (adapters[0], adapters[2], adapters[3])
     )
 
 
@@ -450,3 +831,183 @@ def test_control_configs_and_states_are_immutable() -> None:
     assert isinstance(state, ReferenceLifeControlState)
     with pytest.raises(dataclasses.FrozenInstanceError):
         state.decision_index = 3  # type: ignore[misc]
+
+
+def test_runner_binds_control_environment_kind_and_oracle_model() -> None:
+    switching = SwitchingTwoStateConfig(phase_length=2)  # type: ignore[call-arg]
+    uniform = UniformRandomReferenceAdapter(
+        UniformRandomReferenceConfig.for_switching(switching)
+    )
+    with pytest.raises(ValueError, match="kinds differ"):
+        _river_runner(
+            uniform,
+            RiverSwimConfig(n_states=2),  # type: ignore[call-arg]
+            lifecycle_id="control.cross-kind",
+            horizon=2,
+        )
+
+    oracle = AnalyticOracleReferenceAdapter(
+        AnalyticOracleReferenceConfig.for_switching(switching, horizon=3)
+    )
+    mismatched = SwitchingTwoStateConfig(phase_length=3)  # type: ignore[call-arg]
+    with pytest.raises(ValueError, match="bound environment differs"):
+        _switching_runner(
+            oracle,
+            mismatched,
+            lifecycle_id="control.oracle.cross-environment",
+            horizon=3,
+        )
+
+
+def test_runner_uses_explicit_threefry_under_an_rbg_global_default() -> None:
+    environment = SwitchingTwoStateConfig(phase_length=2)  # type: ignore[call-arg]
+
+    def action_trace() -> tuple[tuple[int, ...], str]:
+        adapter = UniformRandomReferenceAdapter(
+            UniformRandomReferenceConfig.for_switching(environment)
+        )
+        runner = _switching_runner(
+            adapter,
+            environment,
+            lifecycle_id="control.explicit-threefry",
+            seed=123,
+            horizon=12,
+        )
+        result = runner.run_to_completion(runner.init())
+        actions = tuple(
+            int(event.transaction.decision.proposed_action.to_python())
+            for event in result.events
+            if event.transaction.decision.proposed_action is not None
+        )
+        return actions, result.state.transcript_sha256
+
+    expected = action_trace()
+    with jax.default_prng_impl("rbg"):
+        observed = action_trace()
+    assert observed == expected
+
+
+def test_nested_core_agent_has_stable_jit_identity_and_mutation_fails_closed() -> None:
+    environment = SwitchingTwoStateConfig(  # type: ignore[call-arg]
+        phase_length=4,
+        payoffs_a=((1.0, 1.0), (1.0, 1.0)),
+        payoffs_b=((1.0, 1.0), (1.0, 1.0)),
+    )
+    config = DifferentialSARSAReferenceConfig.for_switching(
+        environment,
+        q_step_size=0.5,
+        average_reward_step_size=0.25,
+        epsilon_start=0.0,
+        epsilon_end=0.0,
+    )
+    adapter = DifferentialSARSAReferenceAdapter(config)
+    stable = adapter._differential_agent
+    assert adapter._differential_agent is stable
+    stable._config = dataclasses.replace(  # type: ignore[attr-defined]
+        stable.config,
+        q_step_size=0.0,
+        average_reward_step_size=0.0,
+    )
+    with pytest.raises(DecisionOwnershipError, match="configuration|mutat"):
+        _ = adapter._differential_agent
+
+
+def test_switching_oracle_is_finite_horizon_optimal_across_phase_boundaries() -> None:
+    environment = SwitchingTwoStateConfig(  # type: ignore[call-arg]
+        phase_length=1,
+        payoffs_a=((10.0, 0.0), (0.0, 9.0)),
+        payoffs_b=((9.0, 0.0), (0.0, 10.0)),
+    )
+    horizon = 6
+    adapter = AnalyticOracleReferenceAdapter(
+        AnalyticOracleReferenceConfig.for_switching(environment, horizon=horizon)
+    )
+    runner = _switching_runner(
+        adapter,
+        environment,
+        lifecycle_id="control.oracle.periodic-optimal",
+        seed=11,
+        horizon=horizon,
+    )
+    result = runner.run_to_completion(runner.init())
+    first_observation = result.events[0].transaction.decision.observation.to_numpy()
+    initial_state = int(np.argmax(first_observation))
+
+    def sequence_return(actions: tuple[int, ...]) -> float:
+        state = initial_state
+        total = 0.0
+        for index, action in enumerate(actions):
+            payoffs = environment.payoffs_a if index % 2 == 0 else environment.payoffs_b
+            total += float(payoffs[state][action])
+            state = action
+        return total
+
+    best = max(sequence_return(actions) for actions in itertools.product((0, 1), repeat=horizon))
+    assert result.state.metrics.reward_sum == best
+
+
+def test_riverswim_oracle_uses_stable_finite_horizon_expectations() -> None:
+    environment = RiverSwimConfig(  # type: ignore[call-arg]
+        n_states=2,
+        p_right_up=1e-20,
+        p_right_down=0.1,
+        reward_left=1.0,
+        reward_right=1e22,
+        initial_state=0,
+    )
+    adapter = AnalyticOracleReferenceAdapter(
+        AnalyticOracleReferenceConfig.for_riverswim(environment, horizon=2)
+    )
+    runner = _river_runner(
+        adapter,
+        environment,
+        lifecycle_id="control.oracle.conditioned-river",
+        seed=5,
+        horizon=2,
+    )
+    initial = runner.init()
+    decision = adapter.current_decision(initial.agent_state)
+    assert decision.proposed_action is not None
+    assert decision.proposed_action.to_python() == 1
+
+
+def test_discounted_sarsa_rejects_relabeled_lms_optimizer_state() -> None:
+    adapter = _discounted_switching()
+    runner = _switching_runner(
+        adapter,
+        SwitchingTwoStateConfig(phase_length=2),  # type: ignore[call-arg]
+        lifecycle_id="control.discounted.optimizer-binding",
+        horizon=1,
+    )
+    state = runner.init().agent_state
+    assert isinstance(state, ReferenceLifeControlState)
+    learner = state.agent_state
+    assert isinstance(learner, SARSAState)
+    inner = learner.learner_state
+    first_group = inner.head_optimizer_states[0]
+    altered_group = (
+        LMSState(step_size=jnp.asarray(0.0, dtype=jnp.float32)),
+        first_group[1],
+    )
+    altered_inner = inner.replace(  # type: ignore[attr-defined]
+        head_optimizer_states=(altered_group, *inner.head_optimizer_states[1:])
+    )
+    altered = dataclasses.replace(
+        state,
+        agent_state=learner.replace(learner_state=altered_inner),  # type: ignore[attr-defined]
+    )
+    with pytest.raises(DecisionOwnershipError, match="step size differs"):
+        adapter.validate_state(altered)
+
+
+@pytest.mark.parametrize(
+    "factory",
+    (DifferentialSARSAReferenceConfig.for_switching, DiscountedSARSAReferenceConfig.for_switching),
+)
+def test_learning_controls_reject_increasing_epsilon_schedules(factory: object) -> None:
+    with pytest.raises(ValueError, match="epsilon_end must not exceed"):
+        factory(  # type: ignore[operator]
+            SwitchingTwoStateConfig(phase_length=2),  # type: ignore[call-arg]
+            epsilon_start=0.1,
+            epsilon_end=0.2,
+        )

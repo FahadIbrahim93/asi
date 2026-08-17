@@ -73,6 +73,8 @@ RIVERSWIM_ENVIRONMENT_STATE_SCHEMA = "asi.riverswim_state.preview1"
 EXACT_DISPATCH_SCHEMA = "asi.exact_dispatch.preview1"
 EXACT_DISPATCH_STATE_SCHEMA = "asi.exact_dispatch_state.preview1"
 REFERENCE_METRICS_CONFIG_SCHEMA = "asi.reference_life_metrics_config.preview1"
+REFERENCE_LIFE_PRNG_IMPLEMENTATION = "threefry2x32"
+REFERENCE_LIFE_RNG_SCHEDULE = "jax_threefry2x32_fold_in_environment_cursor.preview1"
 
 _SAFE_ID = re.compile(r"^[a-z0-9][a-z0-9._:-]*$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -1491,7 +1493,7 @@ class ReferenceLifeConfig:
             "lifecycle_id": lifecycle_id,
             "seed": seed,
             "max_accepted_events": max_accepted_events,
-            "rng_schedule": "jax_fold_in_environment_cursor.preview1",
+            "rng_schedule": REFERENCE_LIFE_RNG_SCHEDULE,
             "observation_id_schedule": "lifecycle_observation_index.preview1",
             "checkpoint_policy": "atomic_quiescent_bundle.preview1",
             "agent": _agent_descriptor(
@@ -1791,12 +1793,41 @@ class ReferenceLifeRunner:
         if config.metrics_config_sha256 != metrics_adapter.config.config_sha256:
             raise ValueError("life config metrics mismatch")
         environment_config = environment_adapter.manifest.config
+        agent_config = agent_adapter.manifest.config
         if environment_config.get("executor_id") != dispatch_adapter.config.executor_id:
             raise ValueError("dispatch and environment executor IDs differ")
         if environment_config.get("executor_epoch") != dispatch_adapter.config.executor_epoch:
             raise ValueError("dispatch and environment executor epochs differ")
         if environment_config.get("metrics_mode") != metrics_adapter.config.mode:
             raise ValueError("metrics and environment modes differ")
+        agent_environment_kind = agent_config.get("environment_kind")
+        if (
+            agent_environment_kind is not None
+            and agent_environment_kind != environment_config.get("environment_kind")
+        ):
+            raise ValueError("agent and environment kinds differ")
+        bound_environment = agent_config.get("environment_config")
+        if bound_environment is not None:
+            environment_kind = environment_config.get("environment_kind")
+            if environment_kind == "switching_two_state":
+                expected_bound_environment = {
+                    "phase_length": environment_config.get("phase_length"),
+                    "payoffs_a": environment_config.get("payoffs_a"),
+                    "payoffs_b": environment_config.get("payoffs_b"),
+                }
+            elif environment_kind == "riverswim":
+                expected_bound_environment = {
+                    "n_states": environment_config.get("n_states"),
+                    "p_right_up": environment_config.get("p_right_up"),
+                    "p_right_down": environment_config.get("p_right_down"),
+                    "reward_left": environment_config.get("reward_left"),
+                    "reward_right": environment_config.get("reward_right"),
+                    "initial_state": environment_config.get("initial_state"),
+                }
+            else:
+                raise ValueError("environment-bound agent selected an unsupported environment")
+            if bound_environment != expected_bound_environment:
+                raise ValueError("agent's bound environment differs from the live environment")
         if agent_adapter.manifest.observation_spec != environment_adapter.manifest.observation_spec:
             raise ValueError("agent and environment observation codecs must match exactly")
         if agent_adapter.manifest.action_spec != environment_adapter.manifest.action_spec:
@@ -2200,7 +2231,10 @@ class ReferenceLifeRunner:
             return state
 
     def _environment_key(self, cursor: int) -> Array:
-        root = jr.fold_in(jr.key(self.config.seed), 0x415349)
+        root = jr.fold_in(
+            jr.key(self.config.seed, impl=REFERENCE_LIFE_PRNG_IMPLEMENTATION),
+            0x415349,
+        )
         return jr.fold_in(root, cursor)
 
     def _validate_accepted_agent_update(
@@ -2243,7 +2277,11 @@ class ReferenceLifeRunner:
         with self._lock:
             if self._current_state is not None:
                 raise DecisionOwnershipError("life runner is already initialized")
-            agent_key, environment_key = jr.split(jr.key(self.config.seed), 2)
+            root_key = jr.key(
+                self.config.seed,
+                impl=REFERENCE_LIFE_PRNG_IMPLEMENTATION,
+            )
+            agent_key, environment_key = jr.split(root_key, 2)
             environment_start = self.environment_adapter.init(environment_key)
             initial_observation_id = f"{self.config.lifecycle_id}:observation:0"
             agent_state = self.agent_adapter.init(

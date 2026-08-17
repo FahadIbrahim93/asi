@@ -3,7 +3,8 @@
 This module provides immutable records and an in-process, single-writer
 ownership ledger. It is an L0 interoperability preview only: it does not select
 reference-dev, prove learning benefit, certify safety or robotics readiness, or
-establish exact whole-life checkpoint resume.
+provide standalone checkpointing. The separate reference-life checkpoint codec
+supports its documented quiescent aggregate configurations.
 """
 
 from __future__ import annotations
@@ -1707,7 +1708,8 @@ class ReferenceTransactionLedger:
     def __reduce__(self) -> Any:
         raise TypeError(
             "live reference transaction ledger cannot be serialized; "
-            "whole-life checkpoint/resume is not implemented"
+            "checkpoint the supported quiescent aggregate through "
+            "reference_life_checkpoint"
         )
 
     def _require_current(self, state: ReferenceTransactionState) -> None:

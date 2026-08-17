@@ -98,6 +98,16 @@ class TestComputeStatistics:
         s99 = compute_statistics(values, confidence_level=0.99)
         assert (s99.ci_upper - s99.ci_lower) > (s95.ci_upper - s95.ci_lower)
 
+    @pytest.mark.parametrize("values", [[], [1.0, np.nan], [1.0, np.inf]])
+    def test_rejects_empty_or_nonfinite_samples(self, values) -> None:
+        with pytest.raises(ValueError):
+            compute_statistics(values)
+
+    @pytest.mark.parametrize("level", [0.0, 1.0, -0.1, 1.1])
+    def test_rejects_invalid_confidence_levels(self, level: float) -> None:
+        with pytest.raises(ValueError, match="confidence_level"):
+            compute_statistics([1.0, 2.0], confidence_level=level)
+
 
 class TestTimeseriesStatistics:
     def test_matches_per_column_compute_statistics(self) -> None:
@@ -111,6 +121,13 @@ class TestTimeseriesStatistics:
             assert mean[step] == pytest.approx(s.mean)
             assert lo[step] == pytest.approx(s.ci_lower)
             assert hi[step] == pytest.approx(s.ci_upper)
+
+    def test_single_seed_has_degenerate_finite_interval(self) -> None:
+        arr = np.array([[1.0, 2.0, 3.0]])
+        mean, lo, hi = compute_timeseries_statistics(arr)
+        np.testing.assert_array_equal(mean, arr[0])
+        np.testing.assert_array_equal(lo, mean)
+        np.testing.assert_array_equal(hi, mean)
 
 
 class TestBootstrapCI:
@@ -128,6 +145,12 @@ class TestBootstrapCI:
         point, lo, hi = bootstrap_ci(values, statistic="median", n_bootstrap=300, seed=0)
         assert point == pytest.approx(3.0)
         assert lo <= point <= hi
+
+    def test_rejects_unknown_statistic_and_empty_resampling(self) -> None:
+        with pytest.raises(ValueError, match="statistic"):
+            bootstrap_ci([1.0, 2.0], statistic="mode")
+        with pytest.raises(ValueError, match="n_bootstrap"):
+            bootstrap_ci([1.0, 2.0], n_bootstrap=0)
 
     def test_empirical_coverage(self) -> None:
         """Percentile-bootstrap 95% CI coverage stays near nominal.
@@ -287,6 +310,13 @@ class TestCorrections:
         assert holm_correction(huge, alpha=0.05) == [False, False, False]
         assert bonferroni_correction(huge, alpha=0.05)[0] == [False, False, False]
 
+    def test_corrections_reject_empty_or_invalid_probabilities(self) -> None:
+        for correction in (bonferroni_correction, holm_correction):
+            with pytest.raises(ValueError, match="must not be empty"):
+                correction([])
+            with pytest.raises(ValueError, match="probabilities"):
+                correction([0.1, 1.1])
+
 
 # ---------------------------------------------------------------------------
 # 4. Effect sizes: hand-computed fixtures
@@ -305,6 +335,10 @@ class TestEffectSizes:
 
     def test_cohens_d_zero_variance_returns_zero(self) -> None:
         assert cohens_d([3.0, 3.0, 3.0], [3.0, 3.0, 3.0]) == 0.0
+
+    def test_cohens_d_rejects_distinct_constant_samples(self) -> None:
+        with pytest.raises(ValueError, match="undefined"):
+            cohens_d([3.0, 3.0, 3.0], [2.0, 2.0, 2.0])
 
     def test_cohens_d_positive_means_a_greater(self) -> None:
         rng = np.random.default_rng(7)
@@ -404,3 +438,10 @@ class TestPairwiseComparisons:
     def test_non_aggregated_results_raises_type_error(self) -> None:
         with pytest.raises(TypeError):
             pairwise_comparisons({"a": object(), "b": object()})  # type: ignore[dict-item]
+
+    def test_paired_comparison_rejects_misaligned_seeds(self) -> None:
+        results = self._results()
+        bad = results["bad"]
+        results["bad"] = bad._replace(seeds=list(reversed(bad.seeds)))
+        with pytest.raises(ValueError, match="seed ordering"):
+            pairwise_comparisons(results)

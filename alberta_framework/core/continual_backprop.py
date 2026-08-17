@@ -74,6 +74,7 @@ import jax.random as jr
 from jax import Array
 from jaxtyping import Float, Int
 
+from alberta_framework.core._float32_scalars import validated_float32_scalar
 from alberta_framework.core.initializers import sparse_init
 from alberta_framework.core.multi_head_learner import (
     MULTI_HEAD_MLP_STATE_SCHEMA,
@@ -81,6 +82,7 @@ from alberta_framework.core.multi_head_learner import (
     MultiHeadMLPLearner,
     MultiHeadMLPState,
     MultiHeadMLPUpdateResult,
+    _require_hidden_width,
 )
 from alberta_framework.core.normalizers import Normalizer
 from alberta_framework.core.optimizers import Bounder
@@ -657,6 +659,13 @@ class CBPMultiHeadMLPLearner:
                 hidden-unit utility diagnostics.
         """
         self._n_heads = n_heads
+        if type(hidden_sizes) is not tuple:
+            raise ValueError(
+                f"hidden_sizes must be an actual tuple, got {type(hidden_sizes).__name__}"
+            )
+        hidden_sizes = tuple(
+            _require_hidden_width(f"hidden_sizes[{i}]", v) for i, v in enumerate(hidden_sizes)
+        )
         self._hidden_sizes = hidden_sizes
         self._cbp_config = cbp_config or ContinualBackpropConfig()
         self._sparsity = sparsity
@@ -744,7 +753,16 @@ class CBPMultiHeadMLPLearner:
 
         per_head_gl = config.pop("per_head_gamma_lamda", None)
         if per_head_gl is not None:
-            per_head_gl = tuple(per_head_gl)
+            if type(per_head_gl) is not list:
+                raise ValueError(
+                    f"per_head_gamma_lamda must be a list, got {type(per_head_gl).__name__}"
+                )
+            per_head_gl = tuple(
+                validated_float32_scalar(
+                    f"per_head_gamma_lamda[{i}]", v, lower=0.0, upper=1.0
+                )
+                for i, v in enumerate(per_head_gl)
+            )
 
         trace_mode_str = config.pop("trace_mode", None)
         trace_mode = (
@@ -753,9 +771,16 @@ class CBPMultiHeadMLPLearner:
             else TraceMode.ACCUMULATING
         )
 
+        raw_hidden = config.pop("hidden_sizes")
+        if type(raw_hidden) is not list:
+            raise ValueError(f"hidden_sizes must be a list, got {type(raw_hidden).__name__}")
+        hidden_sizes = tuple(
+            _require_hidden_width(f"hidden_sizes[{i}]", v) for i, v in enumerate(raw_hidden)
+        )
+
         return cls(
             n_heads=config.pop("n_heads"),
-            hidden_sizes=tuple(config.pop("hidden_sizes")),
+            hidden_sizes=hidden_sizes,
             cbp_config=cbp_config,
             optimizer=optimizer,
             bounder=bounder,

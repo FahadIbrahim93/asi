@@ -1894,14 +1894,6 @@ def _decode_canonical_artifact(
     return payload
 
 
-def _load_canonical_artifact(path: Path, *, description: str) -> Mapping[str, Any]:
-    try:
-        raw = _read_regular_file_bytes(path)
-    except ForagerMatrixStateError as exc:
-        raise ForagerMatrixStateError(f"could not read {description}: {exc}") from exc
-    return _decode_canonical_artifact(raw, description=description)
-
-
 @dataclass
 class _BoundPathComponent:
     parent_descriptor: int

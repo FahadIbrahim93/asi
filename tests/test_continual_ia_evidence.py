@@ -1,4 +1,4 @@
-"""Held-out, fail-closed evidence tests for the narrow Step-12 IA prototype."""
+"""Strict IA artifact tests plus a nonpromoting consumed-seed source replay."""
 
 from __future__ import annotations
 
@@ -29,14 +29,15 @@ from alberta_framework.evaluation.continual_ia import (
     run_continual_ia_benchmark,
 )
 from alberta_framework.evaluation.continual_ia_artifact import (
+    NONPROMOTING_REPLAY_POLICY,
     PROTOCOL_VERSION,
-    SCHEMA_VERSION,
-    build_ia_evidence_artifact,
+    REPLAY_SCHEMA_VERSION,
+    build_ia_consumed_seed_replay,
     ia_artifact_json,
     load_ia_evidence_artifact,
     scientific_content_sha256,
     validate_ia_evidence_artifact,
-    write_ia_evidence_artifact,
+    write_ia_consumed_seed_replay,
 )
 from alberta_framework.evaluation.continual_ia_cli import (
     main as continual_ia_cli_main,
@@ -113,78 +114,78 @@ def _valid_rejected_report(report: ContinualIAReport) -> ContinualIAReport:
 
 
 @pytest.fixture(scope="module")
-def heldout_report() -> ContinualIAReport:
-    """Execute the exact promoted schedule once; no development seed is rerun."""
+def consumed_seed_replay() -> ContinualIAReport:
+    """Replay the consumed evidence schedule under current source, without promotion."""
 
     return run_continual_ia_benchmark()
 
 
 @pytest.fixture(scope="module")
-def heldout_artifact(
-    heldout_report: ContinualIAReport,
+def replay_artifact(
+    consumed_seed_replay: ContinualIAReport,
 ) -> dict[str, object]:
-    return build_ia_evidence_artifact(heldout_report)
+    return build_ia_consumed_seed_replay(consumed_seed_replay)
 
 
 def test_frozen_seed_roles_configuration_and_primitive_shapes(
-    heldout_report: ContinualIAReport,
+    consumed_seed_replay: ContinualIAReport,
 ) -> None:
     assert DEVELOPMENT_SEEDS == tuple(range(12))
     assert PROMOTED_EVIDENCE_SEEDS == tuple(range(30, 60))
     assert set(DEVELOPMENT_SEEDS).isdisjoint(PROMOTED_EVIDENCE_SEEDS)
-    assert heldout_report.config == ContinualIAConfig()
-    assert heldout_report.thresholds == IAAcceptanceThresholds()
-    assert heldout_report.aggregate.seeds == PROMOTED_EVIDENCE_SEEDS
-    assert len(heldout_report.condition_results) == 30 * len(CONDITION_NAMES)
+    assert consumed_seed_replay.config == ContinualIAConfig()
+    assert consumed_seed_replay.thresholds == IAAcceptanceThresholds()
+    assert consumed_seed_replay.aggregate.seeds == PROMOTED_EVIDENCE_SEEDS
+    assert len(consumed_seed_replay.condition_results) == 30 * len(CONDITION_NAMES)
 
-    for result in heldout_report.condition_results:
-        assert result.rewards.shape == (heldout_report.config.num_steps,)
+    for result in consumed_seed_replay.condition_results:
+        assert result.rewards.shape == (consumed_seed_replay.config.num_steps,)
         assert result.executed_actions.shape == result.rewards.shape
         assert result.credited_actions.shape == result.rewards.shape
         assert result.recommendations.shape == result.rewards.shape
         assert result.partner_proposals.shape == result.rewards.shape
         assert result.accepted_recommendations.shape == result.rewards.shape
-        assert result.phase_mean_rewards.shape == (heldout_report.config.n_phases,)
-        assert result.recovery_lengths.shape == (heldout_report.config.n_phases - 1,)
+        assert result.phase_mean_rewards.shape == (consumed_seed_replay.config.n_phases,)
+        assert result.recovery_lengths.shape == (consumed_seed_replay.config.n_phases - 1,)
         assert np.all(np.isfinite(result.rewards))
 
 
-def test_frozen_primary_result_is_a_valid_intervention_rate_rejection(
-    heldout_report: ContinualIAReport,
+def test_current_consumed_seed_replay_remains_a_valid_intervention_rate_rejection(
+    consumed_seed_replay: ContinualIAReport,
 ) -> None:
-    aggregate = heldout_report.aggregate
+    """Check current-code semantics without equating the replay to historical evidence."""
+
+    aggregate = consumed_seed_replay.aggregate
     interval = aggregate.primary_uplift_interval
 
     assert interval.method == "paired-percentile-bootstrap"
     assert interval.sample_size == 30
-    assert interval.resamples == heldout_report.config.bootstrap_resamples
-    assert interval.confidence_level == heldout_report.config.confidence_level
-    assert interval.estimate == pytest.approx(0.26702777777777775)
-    assert interval.lower == pytest.approx(0.2550548611111111)
-    assert interval.upper == pytest.approx(0.2783888888888889)
-    assert aggregate.mean_changed_action_intervention_rate == pytest.approx(
-        0.08727777777777779
-    )
-    assert aggregate.total_action_changing_interventions == 3_142
+    assert interval.resamples == consumed_seed_replay.config.bootstrap_resamples
+    assert interval.confidence_level == consumed_seed_replay.config.confidence_level
+    assert np.all(np.isfinite([interval.lower, interval.estimate, interval.upper]))
+    assert interval.lower <= interval.estimate <= interval.upper
+    assert np.isfinite(aggregate.mean_changed_action_intervention_rate)
+    assert 0.0 <= aggregate.mean_changed_action_intervention_rate <= 1.0
+    assert aggregate.total_action_changing_interventions > 0
     assert aggregate.primary_state_budget_matched
     assert aggregate.primary_interaction_budget_matched
     assert aggregate.executed_action_credit_mismatches == 0
     assert aggregate.all_values_finite
-    assert not heldout_report.acceptance.primary_passed
-    assert not heldout_report.acceptance.passed
-    assert tuple(check.name for check in heldout_report.acceptance.failures) == (
+    assert not consumed_seed_replay.acceptance.primary_passed
+    assert not consumed_seed_replay.acceptance.passed
+    assert tuple(check.name for check in consumed_seed_replay.acceptance.failures) == (
         "changed_action_intervention_rate",
     )
 
 
 def test_observe_only_is_bitwise_identical_to_partner_alone(
-    heldout_report: ContinualIAReport,
+    consumed_seed_replay: ContinualIAReport,
 ) -> None:
-    alone = _results(heldout_report, "partner_alone")
-    observe = _results(heldout_report, "observe_only")
+    alone = _results(consumed_seed_replay, "partner_alone")
+    observe = _results(consumed_seed_replay, "observe_only")
 
-    assert heldout_report.aggregate.observe_only_exact_reward_identity
-    assert heldout_report.aggregate.observe_only_exact_action_identity
+    assert consumed_seed_replay.aggregate.observe_only_exact_reward_identity
+    assert consumed_seed_replay.aggregate.observe_only_exact_action_identity
     for control, attached in zip(alone, observe, strict=True):
         assert control.seed == attached.seed
         assert np.array_equal(control.rewards, attached.rewards)
@@ -197,11 +198,11 @@ def test_observe_only_is_bitwise_identical_to_partner_alone(
 
 
 def test_primitive_interventions_and_executed_action_credit_are_recomputed(
-    heldout_report: ContinualIAReport,
+    consumed_seed_replay: ContinualIAReport,
 ) -> None:
     treatment_changed = 0
     for condition in RECOMMENDATION_CONDITIONS:
-        for result in _results(heldout_report, condition):
+        for result in _results(consumed_seed_replay, condition):
             accepted = result.accepted_recommendations
             recommendations = result.recommendations
             proposals = result.partner_proposals
@@ -229,31 +230,31 @@ def test_primitive_interventions_and_executed_action_credit_are_recomputed(
             if condition == "recommendation_p05":
                 treatment_changed += int(np.count_nonzero(changed))
 
-    assert treatment_changed == heldout_report.aggregate.total_action_changing_interventions
+    assert treatment_changed == consumed_seed_replay.aggregate.total_action_changing_interventions
 
 
 def test_accept_always_is_a_finite_negative_diagnostic_not_an_uplift_gate(
-    heldout_report: ContinualIAReport,
+    consumed_seed_replay: ContinualIAReport,
 ) -> None:
-    accept_always = _results(heldout_report, "accept_always")
+    accept_always = _results(consumed_seed_replay, "accept_always")
 
     assert all(np.all(np.isfinite(result.rewards)) for result in accept_always)
     assert all(
-        result.nominal_accepted_recommendations == heldout_report.config.num_steps
+        result.nominal_accepted_recommendations == consumed_seed_replay.config.num_steps
         for result in accept_always
     )
     assert all(
-        result.executed_accepted_recommendations == heldout_report.config.num_steps - 1
+        result.executed_accepted_recommendations == consumed_seed_replay.config.num_steps - 1
         for result in accept_always
     )
-    check_names = {check.name for check in heldout_report.acceptance.checks}
+    check_names = {check.name for check in consumed_seed_replay.acceptance.checks}
     assert "accept_always_uplift" not in check_names
 
 
 def test_augmentation_controls_pass_paired_effect_and_budget_gates(
-    heldout_report: ContinualIAReport,
+    consumed_seed_replay: ContinualIAReport,
 ) -> None:
-    aggregate = heldout_report.aggregate
+    aggregate = consumed_seed_replay.aggregate
     prediction_budget = aggregate.condition_budgets["augmented_predictions"]
     noise_budget = aggregate.condition_budgets["augmented_noise"]
     alone_budget = aggregate.condition_budgets["partner_alone"]
@@ -264,8 +265,8 @@ def test_augmentation_controls_pass_paired_effect_and_budget_gates(
     assert aggregate.augmentation_state_bytes_above_alone > 0
     assert aggregate.augmentation_vs_alone_interval.lower >= 0.05
     assert aggregate.augmentation_vs_noise_interval.lower >= 0.05
-    assert heldout_report.acceptance.secondary_passed
-    assert not heldout_report.acceptance.passed
+    assert consumed_seed_replay.acceptance.secondary_passed
+    assert not consumed_seed_replay.acceptance.passed
 
 
 def test_paired_bootstrap_is_deterministic_and_resamples_pairs() -> None:
@@ -290,22 +291,29 @@ def test_paired_bootstrap_is_deterministic_and_resamples_pairs() -> None:
 
 
 def test_artifact_is_valid_bound_deterministic_and_explicitly_narrow(
-    heldout_report: ContinualIAReport,
-    heldout_artifact: dict[str, object],
+    consumed_seed_replay: ContinualIAReport,
+    replay_artifact: dict[str, object],
 ) -> None:
-    validation = validate_ia_evidence_artifact(heldout_artifact)
+    validation = validate_ia_evidence_artifact(replay_artifact)
 
     assert validation.valid
     assert not validation.accepted
     assert validation.errors == ()
-    assert heldout_artifact["schema_version"] == SCHEMA_VERSION
-    content = _content(heldout_artifact)
+    assert replay_artifact["schema_version"] == REPLAY_SCHEMA_VERSION
+    assert replay_artifact["evidence_policy"] == NONPROMOTING_REPLAY_POLICY
+    content = _content(replay_artifact)
     protocol = _as_dict(content["protocol"])
     assert protocol["protocol_version"] == PROTOCOL_VERSION
     limitations = _as_list(protocol["limitations"])
     assert "no autonomous feature discovery" in limitations
     assert "not completion of the Alberta Plan" in limitations
     assert any("not origin authentication" in str(item) for item in limitations)
+
+    unclassified = copy.deepcopy(replay_artifact)
+    del unclassified["evidence_policy"]
+    unclassified_validation = validate_ia_evidence_artifact(unclassified)
+    assert not unclassified_validation.valid
+    assert not unclassified_validation.accepted
 
     changed_timings = tuple(
         replace(
@@ -315,25 +323,27 @@ def test_artifact_is_valid_bound_deterministic_and_explicitly_narrow(
                 mean_step_latency_ms=result.timing.mean_step_latency_ms + 1.0,
             ),
         )
-        for result in heldout_report.condition_results
+        for result in consumed_seed_replay.condition_results
     )
-    later = build_ia_evidence_artifact(replace(heldout_report, condition_results=changed_timings))
+    later = build_ia_consumed_seed_replay(
+        replace(consumed_seed_replay, condition_results=changed_timings)
+    )
     assert _content(later) == content
-    assert later["content_digest"] == heldout_artifact["content_digest"]
-    assert later["operational_diagnostics"] != (heldout_artifact["operational_diagnostics"])
+    assert later["content_digest"] == replay_artifact["content_digest"]
+    assert later["operational_diagnostics"] != (replay_artifact["operational_diagnostics"])
     later_validation = validate_ia_evidence_artifact(later)
     assert later_validation.valid
     assert not later_validation.accepted
 
 
 def test_strict_json_round_trip_rejects_nonstandard_numbers(
-    heldout_artifact: dict[str, object],
+    replay_artifact: dict[str, object],
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "ia-evidence.json"
-    path.write_text(ia_artifact_json(heldout_artifact), encoding="utf-8")
+    path.write_text(ia_artifact_json(replay_artifact), encoding="utf-8")
     loaded = load_ia_evidence_artifact(path)
-    assert loaded == heldout_artifact
+    assert loaded == replay_artifact
     loaded_validation = validate_ia_evidence_artifact(loaded)
     assert loaded_validation.valid
     assert not loaded_validation.accepted
@@ -345,9 +355,9 @@ def test_strict_json_round_trip_rejects_nonstandard_numbers(
 
 
 def test_unrehashed_primitive_tampering_fails_digest(
-    heldout_artifact: dict[str, object],
+    replay_artifact: dict[str, object],
 ) -> None:
-    tampered = copy.deepcopy(heldout_artifact)
+    tampered = copy.deepcopy(replay_artifact)
     first = _as_dict(_as_list(_content(tampered)["seed_summaries"])[0])
     treatment = _as_dict(_as_dict(first["conditions"])["recommendation_p05"])
     primitive = _as_dict(treatment["primitive_records"])
@@ -361,9 +371,9 @@ def test_unrehashed_primitive_tampering_fails_digest(
 
 
 def test_rehashed_credit_and_intervention_fabrication_fails_primitives(
-    heldout_artifact: dict[str, object],
+    replay_artifact: dict[str, object],
 ) -> None:
-    fabricated = copy.deepcopy(heldout_artifact)
+    fabricated = copy.deepcopy(replay_artifact)
     first = _as_dict(_as_list(_content(fabricated)["seed_summaries"])[0])
     treatment = _as_dict(_as_dict(first["conditions"])["recommendation_p05"])
     primitive = _as_dict(treatment["primitive_records"])
@@ -382,9 +392,9 @@ def test_rehashed_credit_and_intervention_fabrication_fails_primitives(
 
 
 def test_rehashed_budget_nominal_count_and_threshold_tampering_fail_closed(
-    heldout_artifact: dict[str, object],
+    replay_artifact: dict[str, object],
 ) -> None:
-    fabricated = copy.deepcopy(heldout_artifact)
+    fabricated = copy.deepcopy(replay_artifact)
     summaries = _as_list(_content(fabricated)["seed_summaries"])
     second = _as_dict(summaries[1])
     treatment = _as_dict(_as_dict(second["conditions"])["recommendation_p05"])
@@ -406,9 +416,9 @@ def test_rehashed_budget_nominal_count_and_threshold_tampering_fail_closed(
 
 
 def test_rehashed_protocol_provenance_seed_and_aggregate_tampering_fail_closed(
-    heldout_artifact: dict[str, object],
+    replay_artifact: dict[str, object],
 ) -> None:
-    fabricated = copy.deepcopy(heldout_artifact)
+    fabricated = copy.deepcopy(replay_artifact)
     content = _content(fabricated)
     _as_dict(content["protocol"])["supported_claim"] = "general"
     provenance = _as_dict(content["source_provenance"])
@@ -430,9 +440,9 @@ def test_rehashed_protocol_provenance_seed_and_aggregate_tampering_fail_closed(
 
 
 def test_unknown_operational_timing_and_digest_keys_fail_closed(
-    heldout_artifact: dict[str, object],
+    replay_artifact: dict[str, object],
 ) -> None:
-    fabricated = copy.deepcopy(heldout_artifact)
+    fabricated = copy.deepcopy(replay_artifact)
     operational = _as_dict(fabricated["operational_diagnostics"])
     operational["unknown"] = True
     first_timing = _as_dict(_as_list(operational["condition_timings"])[0])
@@ -449,20 +459,20 @@ def test_unknown_operational_timing_and_digest_keys_fail_closed(
 
 
 def test_writer_refuses_to_overwrite_an_existing_artifact(
-    heldout_report: ContinualIAReport,
+    consumed_seed_replay: ContinualIAReport,
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "existing.json"
     path.write_text("sentinel\n", encoding="utf-8")
 
     with pytest.raises(FileExistsError):
-        write_ia_evidence_artifact(path, heldout_report)
+        write_ia_consumed_seed_replay(path, consumed_seed_replay)
 
     assert path.read_text(encoding="utf-8") == "sentinel\n"
 
 
 def test_writer_allows_only_one_simultaneous_creator(
-    heldout_report: ContinualIAReport,
+    consumed_seed_replay: ContinualIAReport,
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "raced.json"
@@ -470,7 +480,7 @@ def test_writer_allows_only_one_simultaneous_creator(
 
     def attempt() -> dict[str, object]:
         barrier.wait()
-        return write_ia_evidence_artifact(path, heldout_report)
+        return write_ia_consumed_seed_replay(path, consumed_seed_replay)
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         futures = [executor.submit(attempt) for _ in range(2)]
@@ -489,16 +499,17 @@ def test_writer_allows_only_one_simultaneous_creator(
 
 
 def test_cli_writes_verifies_and_returns_two_for_invalid_artifacts(
-    heldout_report: ContinualIAReport,
+    consumed_seed_replay: ContinualIAReport,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     path = tmp_path / "rejected.json"
-    status = continual_ia_cli_main(["--output", str(path)], report=heldout_report)
+    status = continual_ia_cli_main(["--output", str(path)], report=consumed_seed_replay)
     emitted = json.loads(capsys.readouterr().out)
     assert status == 1
     assert emitted["valid"] is True
     assert emitted["accepted"] is False
+    assert emitted["evidence_policy"] == NONPROMOTING_REPLAY_POLICY
     assert emitted["seed_count"] == 30
     assert path.exists()
 
@@ -518,12 +529,12 @@ def test_cli_writes_verifies_and_returns_two_for_invalid_artifacts(
     assert invalid["accepted"] is False
 
 
-def test_cli_writes_valid_scientific_rejection_with_status_one(
-    heldout_report: ContinualIAReport,
+def test_cli_writes_validator_valid_nonpromoting_replay_with_status_one(
+    consumed_seed_replay: ContinualIAReport,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    rejected_report = _valid_rejected_report(heldout_report)
+    rejected_report = _valid_rejected_report(consumed_seed_replay)
     path = tmp_path / "rejected.json"
     status = continual_ia_cli_main(["--output", str(path)], report=rejected_report)
     emitted = json.loads(capsys.readouterr().out)
@@ -549,33 +560,33 @@ def test_cli_writes_valid_scientific_rejection_with_status_one(
     ),
 )
 def test_cli_exposes_no_seed_or_threshold_retuning_options(
-    heldout_report: ContinualIAReport,
+    consumed_seed_replay: ContinualIAReport,
     flag: str,
     value: str,
 ) -> None:
     with pytest.raises(SystemExit) as exit_info:
-        continual_ia_cli_main([flag, value], report=heldout_report)
+        continual_ia_cli_main([flag, value], report=consumed_seed_replay)
     assert exit_info.value.code == 2
 
 
-def test_cli_rejects_an_injected_non_promoted_schedule_without_writing(
-    heldout_report: ContinualIAReport,
+def test_cli_rejects_an_incomplete_consumed_seed_schedule_without_writing(
+    consumed_seed_replay: ContinualIAReport,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     selected = tuple(
         result
-        for result in heldout_report.condition_results
+        for result in consumed_seed_replay.condition_results
         if result.seed in PROMOTED_EVIDENCE_SEEDS[:3]
     )
-    aggregate = aggregate_ia_evidence(selected, config=heldout_report.config)
+    aggregate = aggregate_ia_evidence(selected, config=consumed_seed_replay.config)
     underpowered = replace(
-        heldout_report,
+        consumed_seed_replay,
         condition_results=selected,
         aggregate=aggregate,
         acceptance=evaluate_ia_acceptance(
             aggregate,
-            heldout_report.thresholds,
+            consumed_seed_replay.thresholds,
         ),
     )
     path = tmp_path / "must-not-exist.json"

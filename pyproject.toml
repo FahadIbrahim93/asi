@@ -9,14 +9,12 @@ version = "0.28.0"
 description = "ASI: evidence-driven JAX research for end-to-end continual learning"
 readme = "README.md"
 license = "Apache-2.0"
-# Vendored into elizaOS at packages/research/alberta (see VENDORING.md). Relaxed from
-# upstream ">=3.13" to ">=3.12": the continual-RL subset only uses PEP 695
-# syntax (3.12+), and eliza-robot imports it in-process on Python 3.12. JAX
-# 0.7.1 is the tested floor that remains compatible with the declared NumPy
-# 1.26 lower bound; the robot track currently permits NumPy 2.x as well.
+# Python 3.12 supports the package's PEP 695 syntax and the robot track's
+# in-process continual-RL imports. JAX 0.7.1 is the tested floor compatible
+# with the NumPy 1.26 minimum.
 requires-python = ">=3.12"
-# Retain the legacy distribution-author label. CITATION.cff carries the
-# project's citation attribution; maintainers below identify current stewardship.
+# Distribution authorship records package provenance. CITATION.cff provides
+# research attribution; maintainers identify current stewardship.
 authors = [
     { name = "J. Klawson", email = "j-klawson@users.noreply.github.com" }
 ]
@@ -88,6 +86,7 @@ Issues = "https://github.com/elizaOS/asi/issues"
 Upstream = "https://github.com/lalalune/alberta"
 
 [project.scripts]
+asi-reference-life-scorecard = "alberta_framework.benchmarks.reference_life_scorecard:main"
 alberta-step1-smoke = "alberta_framework.cli:step1_smoke_main"
 alberta-step2-smoke = "alberta_framework.cli:step2_smoke_main"
 alberta-evidence-status = "alberta_framework.evaluation.evidence_manifest_cli:main"

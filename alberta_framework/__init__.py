@@ -661,6 +661,42 @@ from alberta_framework.core.temporal_context import (
     TemporalContextState,
     transform_temporal_context_arrays,
 )
+from alberta_framework.core.types import (
+    AutostepGTDLambdaState,
+    AutostepParamState,
+    AutostepState,
+    AutoTDIDBDState,
+    BatchedLearningResult,
+    BatchedMLPResult,
+    DemonType,
+    GVFSpec,
+    HordeSpec,
+    IDBDParamState,
+    IDBDState,
+    LearnerState,
+    LMSState,
+    MLPLearnerState,
+    MLPParams,
+    NormalizerHistory,
+    NormalizerTrackingConfig,
+    ObGDState,
+    Observation,
+    Prediction,
+    StepSizeHistory,
+    StepSizeTrackingConfig,
+    Target,
+    TDIDBDState,
+    TDLearnerState,
+    TDTimeStep,
+    TimeStep,
+    TraceMode,
+    agent_age_s,
+    agent_uptime_s,
+    create_autotdidbd_state,
+    create_horde_spec,
+    create_obgd_state,
+    create_tdidbd_state,
+)
 from alberta_framework.core.upgd import (
     UPGDLearner,
     UPGDLearningResult,
@@ -711,6 +747,26 @@ from alberta_framework.core.world_model_ensemble import (
     WorldModelEnsembleUpdateResult,
     load_world_model_ensemble_checkpoint,
     save_world_model_ensemble_checkpoint,
+)
+from alberta_framework.pipeline import (
+    AlbertaPipeline,
+    AlbertaPipelineArrayResult,
+    AlbertaPipelineConfig,
+    AlbertaPipelineSmokeResult,
+    AlbertaPipelineState,
+    AlbertaPipelineStepResult,
+    ControlMode,
+    CumulantFn,
+    HordeActorCriticPipelineConfig,
+    Step2AssociativePipelineConfig,
+    Step2FeatureConfig,
+    Step2Mode,
+    Step2UPGDConfig,
+    Step2UPGDPreset,
+    Step2UPGDReadoutMode,
+    make_alberta_pipeline,
+    observation_channel_cumulant_fn,
+    run_pipeline_smoke,
 )
 from alberta_framework.security import (
     N_SECURITY_ACTIONS,
@@ -783,70 +839,6 @@ from alberta_framework.steps.step8 import (
     step8_update,
 )
 
-# Production Step 1-4 pipeline. Keep this optional at package-import time so
-# core Step 1/2 learners and research scripts remain usable while pipeline
-# dependencies are under active development.
-try:
-    from alberta_framework.pipeline import (
-        AlbertaPipeline,
-        AlbertaPipelineArrayResult,
-        AlbertaPipelineConfig,
-        AlbertaPipelineSmokeResult,
-        AlbertaPipelineState,
-        AlbertaPipelineStepResult,
-        ControlMode,
-        CumulantFn,
-        HordeActorCriticPipelineConfig,
-        Step2AssociativePipelineConfig,
-        Step2FeatureConfig,
-        Step2Mode,
-        Step2UPGDConfig,
-        Step2UPGDPreset,
-        Step2UPGDReadoutMode,
-        make_alberta_pipeline,
-        observation_channel_cumulant_fn,
-        run_pipeline_smoke,
-    )
-    _pipeline_available = True
-except ImportError:
-    _pipeline_available = False
-from alberta_framework.core.types import (
-    AutostepGTDLambdaState,
-    AutostepParamState,
-    AutostepState,
-    AutoTDIDBDState,
-    BatchedLearningResult,
-    BatchedMLPResult,
-    DemonType,
-    GVFSpec,
-    HordeSpec,
-    IDBDParamState,
-    IDBDState,
-    LearnerState,
-    LMSState,
-    MLPLearnerState,
-    MLPParams,
-    NormalizerHistory,
-    NormalizerTrackingConfig,
-    ObGDState,
-    Observation,
-    Prediction,
-    StepSizeHistory,
-    StepSizeTrackingConfig,
-    Target,
-    TDIDBDState,
-    TDLearnerState,
-    TDTimeStep,
-    TimeStep,
-    TraceMode,
-    agent_age_s,
-    agent_uptime_s,
-    create_autotdidbd_state,
-    create_horde_spec,
-    create_obgd_state,
-    create_tdidbd_state,
-)
-
 # Streams - base
 from alberta_framework.streams.base import ScanStream
 
@@ -857,6 +849,17 @@ from alberta_framework.streams.feature_discovery import (
     NonlinearFeatureDiscoveryState,
     NonlinearFeatureDiscoveryStream,
     collect_feature_discovery_stream,
+)
+from alberta_framework.streams.gymnasium import (
+    GymnasiumStream,
+    PredictionMode,
+    TDStream,
+    collect_trajectory,
+    learn_from_trajectory,
+    learn_from_trajectory_normalized,
+    make_epsilon_greedy_policy,
+    make_gymnasium_stream,
+    make_random_policy,
 )
 from alberta_framework.streams.out_of_class import (
     CompositionalState,
@@ -915,22 +918,6 @@ from alberta_framework.utils.metrics import (
 from alberta_framework.utils.nexting import multi_channel_horizon_returns
 from alberta_framework.utils.timing import Timer, format_duration
 
-# Gymnasium streams (optional)
-try:
-    from alberta_framework.streams.gymnasium import (
-        GymnasiumStream,
-        PredictionMode,
-        TDStream,
-        collect_trajectory,
-        learn_from_trajectory,
-        learn_from_trajectory_normalized,
-        make_epsilon_greedy_policy,
-        make_gymnasium_stream,
-        make_random_policy,
-    )
-    _gymnasium_available = True
-except ImportError:
-    _gymnasium_available = False
 __all__ = [
     # Version
     "__version__",
@@ -1683,37 +1670,32 @@ __all__ = [
     "Timer",
     "format_duration",
 ]
-# Add Gymnasium exports if available
-if _gymnasium_available:
-    __all__ += [
-        "GymnasiumStream",
-        "PredictionMode",
-        "TDStream",
-        "collect_trajectory",
-        "learn_from_trajectory",
-        "learn_from_trajectory_normalized",
-        "make_epsilon_greedy_policy",
-        "make_gymnasium_stream",
-        "make_random_policy",
-    ]
-if _pipeline_available:
-    __all__ += [
-        "AlbertaPipeline",
-        "AlbertaPipelineArrayResult",
-        "AlbertaPipelineConfig",
-        "AlbertaPipelineSmokeResult",
-        "AlbertaPipelineState",
-        "AlbertaPipelineStepResult",
-        "ControlMode",
-        "CumulantFn",
-        "HordeActorCriticPipelineConfig",
-        "Step2AssociativePipelineConfig",
-        "Step2FeatureConfig",
-        "Step2Mode",
-        "Step2UPGDConfig",
-        "Step2UPGDPreset",
-        "Step2UPGDReadoutMode",
-        "make_alberta_pipeline",
-        "observation_channel_cumulant_fn",
-        "run_pipeline_smoke",
-    ]
+__all__ += [
+    "GymnasiumStream",
+    "PredictionMode",
+    "TDStream",
+    "collect_trajectory",
+    "learn_from_trajectory",
+    "learn_from_trajectory_normalized",
+    "make_epsilon_greedy_policy",
+    "make_gymnasium_stream",
+    "make_random_policy",
+    "AlbertaPipeline",
+    "AlbertaPipelineArrayResult",
+    "AlbertaPipelineConfig",
+    "AlbertaPipelineSmokeResult",
+    "AlbertaPipelineState",
+    "AlbertaPipelineStepResult",
+    "ControlMode",
+    "CumulantFn",
+    "HordeActorCriticPipelineConfig",
+    "Step2AssociativePipelineConfig",
+    "Step2FeatureConfig",
+    "Step2Mode",
+    "Step2UPGDConfig",
+    "Step2UPGDPreset",
+    "Step2UPGDReadoutMode",
+    "make_alberta_pipeline",
+    "observation_channel_cumulant_fn",
+    "run_pipeline_smoke",
+]

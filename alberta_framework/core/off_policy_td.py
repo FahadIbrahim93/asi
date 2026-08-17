@@ -1,7 +1,7 @@
-"""Off-policy TD learner with importance sampling (Step 3 Phase E).
+"""Off-policy TD learners with importance sampling.
 
-Implements per-decision importance sampling with optional Retrace-style
-ratio clipping for stable off-policy linear value function learning.
+Implements per-decision importance sampling with optional ratio clipping for
+off-policy linear value-function learning.
 
 Theoretical background:
     TD with linear function approximation is **not** guaranteed to
@@ -12,9 +12,9 @@ Theoretical background:
        multiply each step's update by rho_t = pi(a_t|s_t) / b(a_t|s_t)
        so that on average we are simulating the on-policy distribution.
        Variance can be very large.
-    2. Retrace ratio clipping (Munos et al. 2016): use
-       rho_clipped = min(c, rho_t). Convergent for c <= 1; for c > 1 it
-       trades bias for variance reduction.
+    2. Importance-ratio clipping: use ``min(c, rho_t)`` to bound individual
+       updates at the cost of bias. This is not the multi-step Retrace
+       operator of Munos et al. (2016).
     3. Gradient-TD (TDC, GQ-lambda) (Sutton, Maei, et al. 2009-2010):
        gradient descent on the projected Bellman error.
     4. Emphatic TD (Sutton, Mahmood, White 2016): emphasis traces F_t
@@ -36,7 +36,7 @@ The learner has a simple interface::
 
 Setting ``rho_t = 1.0`` reduces this to standard semi-gradient TD(0).
 
-Use cases (Step 3 DoD-5):
+Use cases:
     - Counterfactual prediction: "what would value be under target policy?"
     - Auxiliary Horde demons learning about hand-specified target policies.
     - Baird counterexample / divergence-prevention demonstrations.
@@ -205,20 +205,20 @@ class GradientTDArrayResult:
 
 
 class OffPolicyTDLinearLearner:
-    """Off-policy linear TD(lambda) with per-decision IS and Retrace clipping.
+    """Off-policy linear TD(lambda) with clipped per-decision IS.
 
     The update rule is::
 
         rho_t = pi(a_t|s_t) / b(a_t|s_t)               (provided externally)
-        rho_clipped = min(c, rho_t)                     (Retrace clipping)
+        rho_clipped = min(c, rho_t)                     (ratio clipping)
         delta_t = R_{t+1} + gamma_t * V(s_{t+1}) - V(s_t)
         e_t = gamma_t * lambda_t * rho_clipped * e_{t-1} + phi_t
         w_{t+1} = w_t + alpha * delta_t * rho_clipped * e_t
 
-    Setting ``retrace_clip = inf`` recovers naive per-decision IS.
-    Setting ``retrace_clip = 1.0`` gives the Retrace-c=1 update which is
-    convergent under standard conditions. Setting ``rho_t = 1`` always
-    recovers on-policy semi-gradient TD(lambda).
+    Setting the historically named ``retrace_clip`` to infinity recovers
+    naive per-decision IS. Setting ``rho_t = 1`` recovers on-policy
+    semi-gradient TD(lambda). This update is not the Retrace operator and
+    does not inherit its convergence guarantees.
 
     Attributes:
         step_size: Learning rate alpha
@@ -237,9 +237,9 @@ class OffPolicyTDLinearLearner:
         Args:
             step_size: Learning rate alpha (scalar)
             trace_decay: Eligibility trace decay lambda in [0, 1]
-            retrace_clip: Maximum allowed importance ratio (default 1.0
-                is the safe Retrace-c=1 choice; pass float("inf") to
-                disable clipping).
+            retrace_clip: Maximum allowed importance ratio. The name is kept
+                for configuration compatibility; pass ``float("inf")`` to
+                disable clipping.
         """
         if step_size <= 0:
             raise ValueError(f"step_size must be positive; got {step_size}")
@@ -263,7 +263,7 @@ class OffPolicyTDLinearLearner:
 
     @property
     def retrace_clip(self) -> float:
-        """IS-ratio clip (Retrace c)."""
+        """Maximum per-decision importance ratio (compatibility name)."""
         return self._retrace_clip
 
     def init(self, feature_dim: int) -> OffPolicyTDState:
@@ -378,7 +378,7 @@ class OffPolicyTDLinearLearner:
 class ETDLinearLearner:
     """Off-policy linear emphatic TD(lambda).
 
-    ETD(lambda) replaces Retrace's clipped per-decision trace with a
+    Unlike the clipped per-decision learner above, ETD(lambda) uses a
     follow-on trace and scalar emphasis:
 
     ``F_t = rho_t * gamma_t * F_{t-1} + i_t``

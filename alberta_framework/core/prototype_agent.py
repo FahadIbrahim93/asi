@@ -5115,8 +5115,7 @@ class PrototypeAgent:
             carry: tuple[OaKState, Array], dream_index: Array
         ) -> tuple[tuple[OaKState, Array], Float[Array, ""]]:
             oak_s, k = carry
-            # Keep this legacy split unchanged so raw and sampled-one-hot
-            # ablations share identical anchor/action key streams.
+            # Both observation ablations use identical anchor/action key streams.
             k, sample_key, action_key = jr.split(k, 3)
             anchor_obs, _ = self._buffer.sample(buf_state, sample_key)
             action = jr.randint(action_key, (), 0, n_prim, dtype=jnp.int32)
@@ -5779,6 +5778,7 @@ class PrototypeAgent:
             transition_diagnostics=diagnostics,
         )
 
+    @functools.partial(jax.jit, static_argnums=(0,))
     def _update_transition_impl(
         self,
         state: PrototypeAgentState,
@@ -5798,7 +5798,7 @@ class PrototypeAgent:
         ),
         partner_policy_fusion_feedback_supplied: Array,
     ) -> PrototypeUpdateResult:
-        """Atomically apply a valid transition or return an exact no-op."""
+        """Atomically apply one normalized transition at a reusable JAX boundary."""
 
         def valid_branch(_: None) -> PrototypeUpdateResult:
             result = self._apply_valid_transition_impl(

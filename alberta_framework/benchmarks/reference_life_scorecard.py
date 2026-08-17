@@ -14,12 +14,16 @@ gate.
 from __future__ import annotations
 
 import argparse
+import ctypes
 import dataclasses
+import errno
+import functools
 import hashlib
 import json
 import math
 import os
-import tempfile
+import stat
+import struct
 import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -36,11 +40,13 @@ from alberta_framework.reference_agent import (
     REFERENCE_AGENT_API_VERSION,
     AgentCapabilities,
     AgentManifest,
+    ArrayValue,
     ReferenceAgentUpdate,
     SpaceSpec,
     canonical_config_sha256,
 )
 from alberta_framework.reference_life import (
+    REFERENCE_LIFE_RNG_SCHEDULE,
     ExactDispatchConfig,
     LifePhase,
     ReferenceEnvironmentManifest,
@@ -60,7 +66,12 @@ from alberta_framework.reference_life_checkpoint import (
 from alberta_framework.reference_life_checkpoint import (
     _source_identity as _checkpoint_source_identity,
 )
-from alberta_framework.streams.closed_loop import RiverSwimConfig, SwitchingTwoStateConfig
+from alberta_framework.streams.closed_loop import (
+    RiverSwimConfig,
+    RiverSwimMDP,
+    SwitchingTwoStateConfig,
+    SwitchingTwoStateMDP,
+)
 
 # Importing ReferenceAgentUpdate above is deliberate: the runner/control seam is
 # the state-agnostic update contract, not PrototypeAdapterUpdate.
@@ -90,6 +101,26 @@ RIVERSWIM_HORIZON = 20_000
 RIVERSWIM_N_STATES = 6
 RIVERSWIM_EARLY_WINDOW = 2_000
 RIVERSWIM_LATE_WINDOW = 2_000
+
+SWITCHING_PAYOFFS_A = ((0.0, 1.0), (1.0, 0.0))
+SWITCHING_PAYOFFS_B = ((1.0, 0.0), (0.0, 1.0))
+RIVERSWIM_P_RIGHT_UP = 0.35
+RIVERSWIM_P_RIGHT_DOWN = 0.05
+RIVERSWIM_REWARD_LEFT = 0.005
+RIVERSWIM_REWARD_RIGHT = 1.0
+RIVERSWIM_INITIAL_STATE = 0
+
+# Plan v1 pins its explicit literals and every shard records the fully resolved
+# live component configs plus source identity.  It does not claim that the plan
+# digest alone freezes defaults which are not explicit in this payload.
+REFERENCE_LIFE_SCORECARD_PLAN_V1_SHA256 = (
+    "4c4396848da3abebc53fb61c7b241866566ad2b44fa83ee3395a5a389a869b86"
+)
+
+# A complete 144-shard aggregate is comfortably below this limit.  Keeping
+# the cap explicit prevents validation inputs from becoming an unbounded read.
+MAX_SCORECARD_JSON_INPUT_BYTES = 64 * 1024 * 1024
+MAX_SCORECARD_AGGREGATE_INPUT_BYTES = 256 * 1024 * 1024
 
 CONTROL_GATE_T_CRITICAL = 2.201
 CONTROL_GATE_LCB_THRESHOLD = 0.10
@@ -158,6 +189,24 @@ def _sha256_json(value: Any) -> str:
     return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
 
 
+def _json_exact_equal(left: Any, right: Any) -> bool:
+    """Compare canonical JSON values without Python's bool/int coercions."""
+
+    if type(left) is not type(right):
+        return False
+    if type(left) is dict:
+        return set(left) == set(right) and all(
+            _json_exact_equal(left[key], right[key]) for key in left
+        )
+    if type(left) is list:
+        return len(left) == len(right) and all(
+            _json_exact_equal(a, b) for a, b in zip(left, right, strict=True)
+        )
+    if type(left) is float:
+        return struct.pack(">d", left) == struct.pack(">d", right)
+    return bool(left == right)
+
+
 def _digest_excluding(payload: Mapping[str, Any], field: str) -> str:
     return _sha256_json({key: value for key, value in payload.items() if key != field})
 
@@ -211,6 +260,10 @@ def _arm_definitions() -> list[dict[str, Any]]:
             "role": "privileged_upper_control",
             "learning_expectation": "zero_parameter_changes",
             "config": {
+                "finite_horizon_solver": (
+                    "finite_horizon_backward_dynamic_program.float64.tie_low.preview1"
+                ),
+                "horizon_binding": "environment_protocol_horizon",
                 "privileged_environment_model": True,
                 "tie_break": "lowest_action_index",
             },
@@ -257,8 +310,6 @@ def _rotated_arms(seed_index: int) -> tuple[str, ...]:
 
 
 def _fixed_plan_payload_without_digest() -> dict[str, Any]:
-    switching = SwitchingTwoStateConfig(phase_length=SWITCHING_PHASE_LENGTH)  # type: ignore[call-arg]
-    river = RiverSwimConfig(n_states=RIVERSWIM_N_STATES)  # type: ignore[call-arg]
     return {
         "schema": REFERENCE_LIFE_SCORECARD_PLAN_SCHEMA,
         "schema_version": 1,
@@ -302,19 +353,19 @@ def _fixed_plan_payload_without_digest() -> dict[str, Any]:
                     "return_a": [500, 550],
                     "interval_semantics": "zero_based_half_open_accepted_event_indices",
                 },
-                "payoffs_a": [list(row) for row in switching.payoffs_a],
-                "payoffs_b": [list(row) for row in switching.payoffs_b],
+                "payoffs_a": [list(row) for row in SWITCHING_PAYOFFS_A],
+                "payoffs_b": [list(row) for row in SWITCHING_PAYOFFS_B],
                 "initial_state": "uniform_random_from_environment_root_key",
                 "continuing": True,
             },
             "riverswim": {
                 "horizon": RIVERSWIM_HORIZON,
                 "n_states": RIVERSWIM_N_STATES,
-                "p_right_up": float(river.p_right_up),
-                "p_right_down": float(river.p_right_down),
-                "reward_left": float(river.reward_left),
-                "reward_right": float(river.reward_right),
-                "initial_state": int(river.initial_state),
+                "p_right_up": RIVERSWIM_P_RIGHT_UP,
+                "p_right_down": RIVERSWIM_P_RIGHT_DOWN,
+                "reward_left": RIVERSWIM_REWARD_LEFT,
+                "reward_right": RIVERSWIM_REWARD_RIGHT,
+                "initial_state": RIVERSWIM_INITIAL_STATE,
                 "early_window": RIVERSWIM_EARLY_WINDOW,
                 "late_window": RIVERSWIM_LATE_WINDOW,
                 "high_end_visit_definition": (
@@ -356,6 +407,9 @@ def _fixed_plan_payload_without_digest() -> dict[str, Any]:
         "timing_policy": dict(TELEMETRY_POLICY),
         "resource_policy": {
             "persistent_state": "numeric_jax_and_numpy_pytree_leaf_bytes",
+            "static_adapter_numeric_state": (
+                "finite_horizon_oracle_policy_bytes_else_zero"
+            ),
             "trainable_scalars": (
                 "adapter_parameter_tree_when_available_else_floating_leaf_upper_bound"
             ),
@@ -366,7 +420,12 @@ def _fixed_plan_payload_without_digest() -> dict[str, Any]:
 
 def _fixed_plan_payload() -> dict[str, Any]:
     payload = _fixed_plan_payload_without_digest()
-    payload["plan_sha256"] = _sha256_json(payload)
+    observed_digest = _sha256_json(payload)
+    if observed_digest != REFERENCE_LIFE_SCORECARD_PLAN_V1_SHA256:
+        raise RuntimeError(
+            "reference-life scorecard plan v1 literals no longer match the pinned digest"
+        )
+    payload["plan_sha256"] = REFERENCE_LIFE_SCORECARD_PLAN_V1_SHA256
     return payload
 
 
@@ -389,7 +448,7 @@ class ReferenceLifeDevelopmentPlan:
             raise ValueError("development plan is not canonical JSON") from exc
         if canonical_json_bytes(payload).decode("utf-8") != self._canonical_json:
             raise ValueError("development plan JSON is not canonical")
-        if payload != _fixed_plan_payload():
+        if not _json_exact_equal(payload, _fixed_plan_payload()):
             raise ValueError("payload is not the canonical fixed development plan")
         if payload["plan_sha256"] != self.plan_sha256:
             raise ValueError("development plan digest is inconsistent")
@@ -400,7 +459,7 @@ class ReferenceLifeDevelopmentPlan:
             copied = json.loads(canonical_json_bytes(payload).decode("utf-8"))
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
             raise ValueError("payload is not the canonical fixed development plan") from exc
-        if copied != _fixed_plan_payload():
+        if not _json_exact_equal(copied, _fixed_plan_payload()):
             raise ValueError("payload is not the canonical fixed development plan")
         return cls(
             schema=REFERENCE_LIFE_SCORECARD_PLAN_SCHEMA,
@@ -722,6 +781,13 @@ class StreamingRunSummary:
 
 
 def _iter_array_leaves(value: Any) -> Any:
+    if isinstance(value, ArrayValue):
+        # ArrayValue is a dataclass whose numeric storage is intentionally an
+        # immutable bytes payload.  Treat that payload as the numeric leaf it
+        # represents instead of losing cached observations/actions while
+        # recursively walking only Python containers.
+        yield value.to_numpy()
+        return
     if isinstance(value, (jax.Array, np.ndarray)):
         yield value
         return
@@ -813,6 +879,13 @@ def _known_control_parameter_tree(state: Any) -> Any | None:
 
 def _agent_resource_payload(adapter: Any, state: Any) -> dict[str, Any]:
     resource = estimate_jax_resources(state)
+    static_bytes = getattr(adapter, "static_numeric_bytes", 0)
+    if type(static_bytes) is not int or static_bytes < 0:
+        raise ValueError("adapter static_numeric_bytes must be a nonnegative integer")
+    resource["persistent_static_numeric_bytes"] = static_bytes
+    resource["persistent_numeric_bytes_total"] = (
+        resource["persistent_jax_array_bytes"] + static_bytes
+    )
     parameter_tree: Any | None = None
     method = "floating_jax_pytree_leaves_upper_bound"
     adapter_tree = getattr(adapter, "trainable_parameter_tree", None)
@@ -833,6 +906,26 @@ def _agent_resource_payload(adapter: Any, state: Any) -> dict[str, Any]:
         resource["trainable_parameter_tree_scalar_count"] = parameter_elements
         resource["trainable_scalar_count_method"] = method
     return resource
+
+
+@functools.lru_cache(maxsize=len(ENVIRONMENT_ROSTER) * len(ARM_ROSTER))
+def _canonical_initial_resource_payload(
+    environment_kind: str,
+    arm: str,
+) -> dict[str, Any]:
+    """Measure the fixed-shape canonical initial state once per arm/environment."""
+
+    plan = build_development_plan()
+    spec = next(
+        item
+        for item in iter_run_specs(plan)
+        if item.environment_kind == environment_kind
+        and item.arm == arm
+        and item.seed == SEED_ROSTER[0]
+    )
+    runner = build_scorecard_runner(plan, spec)
+    state = runner.init()
+    return _agent_resource_payload(runner.agent_adapter, state.agent_state)
 
 
 def parameter_change_check(arm: str, parameter_change_events: int) -> dict[str, Any]:
@@ -904,11 +997,11 @@ def _reward_sum(record: Mapping[str, Any]) -> float:
     return result
 
 
-def summarize_run_records(
+def _summarize_validated_run_records(
     plan: ReferenceLifeDevelopmentPlan,
     records: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any]:
-    """Recompute deterministic matched summaries without environment pooling."""
+    """Reduce a complete set after every record passed strict validation."""
 
     if not isinstance(plan, ReferenceLifeDevelopmentPlan):
         raise TypeError("plan must be a ReferenceLifeDevelopmentPlan")
@@ -939,9 +1032,43 @@ def summarize_run_records(
             f"extra={extra[:3]}"
         )
 
+    failures = []
+    parameter_failures = []
+    for identity in sorted(
+        indexed,
+        key=lambda item: (
+            ENVIRONMENT_ROSTER.index(item[0]),
+            ARM_ROSTER.index(item[1]),
+            SEED_ROSTER.index(item[2]),
+        ),
+    ):
+        record = indexed[identity]
+        if record["status"] == "failed":
+            failures.append(
+                {
+                    "environment_kind": identity[0],
+                    "arm": identity[1],
+                    "seed": identity[2],
+                    "failure": record.get("failure"),
+                }
+            )
+        outcome = record.get("outcome")
+        if isinstance(outcome, Mapping):
+            check = outcome.get("parameter_change_check")
+            if isinstance(check, Mapping) and check.get("passed") is not True:
+                parameter_failures.append(
+                    {
+                        "environment_kind": identity[0],
+                        "arm": identity[1],
+                        "seed": identity[2],
+                        "parameter_change_check": dict(check),
+                    }
+                )
+    execution_or_learning_failed = bool(failures or parameter_failures)
+
     environment_summaries: dict[str, Any] = {}
-    environments_qualified = True
-    candidate_utility_qualified = True
+    environments_qualified = not execution_or_learning_failed
+    candidate_utility_qualified = not execution_or_learning_failed
     for environment in ENVIRONMENT_ROSTER:
         returns: dict[str, dict[int, float]] = {}
         for arm in ARM_ROSTER:
@@ -1013,14 +1140,19 @@ def summarize_run_records(
                 ),
             }
 
-        qualified_arms = [
+        statistically_qualified_arms = [
             arm
             for arm in ("differential_sarsa", "sarsa")
             if arm_summaries[arm]["paired_seed_count"] == len(SEED_ROSTER)
             and arm_summaries[arm]["paired_t_lcb_95"] is not None
             and arm_summaries[arm]["paired_t_lcb_95"] > CONTROL_GATE_LCB_THRESHOLD
         ]
-        environment_qualified = scale_valid and bool(qualified_arms)
+        qualified_arms = (
+            [] if execution_or_learning_failed else statistically_qualified_arms
+        )
+        environment_qualified = (
+            not execution_or_learning_failed and scale_valid and bool(qualified_arms)
+        )
         environments_qualified = environments_qualified and environment_qualified
 
         prototype_frozen_samples: list[float] | None = None
@@ -1042,7 +1174,7 @@ def summarize_run_records(
             if prototype_frozen_samples is None
             else _paired_lcb(prototype_frozen_samples)
         )
-        beats_frozen = (
+        beats_frozen = not execution_or_learning_failed and (
             prototype_frozen_lcb is not None and prototype_frozen_lcb >= 0.05
         )
 
@@ -1074,7 +1206,7 @@ def summarize_run_records(
             if prototype_sarsa_samples is None
             else _paired_lcb(prototype_sarsa_samples)
         )
-        sarsa_noninferior = (
+        sarsa_noninferior = not execution_or_learning_failed and (
             prototype_sarsa_lcb is not None and prototype_sarsa_lcb >= -0.05
         )
         environment_candidate_qualified = (
@@ -1115,39 +1247,6 @@ def summarize_run_records(
             },
         }
 
-    failures = []
-    parameter_failures = []
-    for identity in sorted(
-        indexed,
-        key=lambda item: (
-            ENVIRONMENT_ROSTER.index(item[0]),
-            ARM_ROSTER.index(item[1]),
-            SEED_ROSTER.index(item[2]),
-        ),
-    ):
-        record = indexed[identity]
-        if record["status"] == "failed":
-            failures.append(
-                {
-                    "environment_kind": identity[0],
-                    "arm": identity[1],
-                    "seed": identity[2],
-                    "failure": record.get("failure"),
-                }
-            )
-        outcome = record.get("outcome")
-        if isinstance(outcome, Mapping):
-            check = outcome.get("parameter_change_check")
-            if isinstance(check, Mapping) and check.get("passed") is not True:
-                parameter_failures.append(
-                    {
-                        "environment_kind": identity[0],
-                        "arm": identity[1],
-                        "seed": identity[2],
-                        "parameter_change_check": dict(check),
-                    }
-                )
-
     if failures:
         status = "valid_execution_failure"
     elif parameter_failures:
@@ -1156,7 +1255,11 @@ def summarize_run_records(
         status = "valid_baseline_failure"
     else:
         status = "development_scorecard_complete"
-    if not environments_qualified:
+    if failures:
+        candidate_selection_status = "not_evaluated_execution_failure"
+    elif parameter_failures:
+        candidate_selection_status = "not_evaluated_parameter_change_failure"
+    elif not environments_qualified:
         candidate_selection_status = "not_evaluated_baseline_failure"
     elif not candidate_utility_qualified:
         candidate_selection_status = "rejected_development_utility_gate"
@@ -1184,8 +1287,8 @@ def summarize_run_records(
             "reason": (
                 "cold/warmed latency is telemetry-only and cannot be used in selection"
             ),
-            "future_gate_if_latency_is_promoted_into_a_new_protocol": {
-                "no_qualifying_sarsa_utility_noninferior_on_both_environments": True,
+            "future_gate_if_latency_is_qualified_under_a_new_protocol": {
+                "requires_no_qualifying_sarsa_utility_noninferior_on_both_environments": True,
                 "candidate_utility_advantage": 0.05,
                 "candidate_resource_advantage_fraction": 0.20,
                 "requires_no_more_persistent_bytes": True,
@@ -1193,6 +1296,43 @@ def summarize_run_records(
             },
         },
     }
+
+
+def summarize_run_records(
+    plan: ReferenceLifeDevelopmentPlan,
+    records: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Strictly validate a complete matrix, then recompute its development gates."""
+
+    if not isinstance(plan, ReferenceLifeDevelopmentPlan):
+        raise TypeError("plan must be a ReferenceLifeDevelopmentPlan")
+    specs = iter_run_specs(plan)
+    if len(records) != len(specs):
+        raise ValueError("run records must contain exactly the fixed 144-shard matrix")
+    by_identity: dict[tuple[str, str, int], Mapping[str, Any]] = {}
+    for record in records:
+        if not isinstance(record, Mapping):
+            raise ValueError("every run record must be an object")
+        identity = _record_identity(record)
+        if identity in by_identity:
+            raise ValueError(f"duplicate run identity {identity!r}")
+        by_identity[identity] = record
+    identities = _current_consistency_identities()
+    ordered: list[Mapping[str, Any]] = []
+    for spec in specs:
+        identity = (spec.environment_kind, spec.arm, spec.seed)
+        scheduled_record = by_identity.get(identity)
+        if scheduled_record is None:
+            raise ValueError(f"run records are missing scheduled identity {identity!r}")
+        _validate_run_record(
+            plan,
+            scheduled_record,
+            spec,
+            path=f"$.runs[{spec.schedule_index}]",
+            consistency_identities=identities,
+        )
+        ordered.append(scheduled_record)
+    return _summarize_validated_run_records(plan, ordered)
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -1231,17 +1371,70 @@ def iter_run_specs(plan: ReferenceLifeDevelopmentPlan) -> tuple[ScorecardRunSpec
 def preflight_new_output(path: Path) -> Path:
     """Reject an occupied output before any expensive scorecard execution."""
 
-    destination = Path(path)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    if destination.exists() or destination.is_symlink():
+    destination, parent_fd = _open_output_parent(Path(path), create=True)
+    try:
+        try:
+            os.stat(destination.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return destination
         raise FileExistsError(f"refusing to overwrite immutable output: {destination}")
-    return destination
+    finally:
+        os.close(parent_fd)
+
+
+def _open_output_parent(path: Path, *, create: bool) -> tuple[Path, int]:
+    """Open an absolute parent through no-follow directory descriptors."""
+
+    destination = Path(os.path.abspath(os.fspath(path)))
+    parent = destination.parent
+    descriptor = os.open(
+        os.path.sep,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
+    )
+    try:
+        for component in parent.parts[1:]:
+            if component in ("", ".", ".."):
+                raise ValueError("output path contains an unsafe directory component")
+            if create:
+                try:
+                    os.mkdir(component, mode=0o755, dir_fd=descriptor)
+                except FileExistsError:
+                    pass
+            next_descriptor = os.open(
+                component,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=descriptor,
+            )
+            os.close(descriptor)
+            descriptor = next_descriptor
+        return destination, descriptor
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _link_unnamed_file(file_fd: int, parent_fd: int, name: str) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    linkat = libc.linkat
+    linkat.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+    )
+    linkat.restype = ctypes.c_int
+    if linkat(file_fd, b"", parent_fd, os.fsencode(name), 0x1000) != 0:
+        error = ctypes.get_errno()
+        if error == errno.EEXIST:
+            raise FileExistsError(error, os.strerror(error), name)
+        raise OSError(error, os.strerror(error), name)
 
 
 def write_new_json(path: Path, value: Any) -> Path:
     """Atomically publish deterministic JSON without replacing existing bytes."""
 
-    destination = preflight_new_output(path)
+    destination, parent_fd = _open_output_parent(Path(path), create=True)
     _validate_json_value(value)
     encoded = json.dumps(
         value,
@@ -1250,33 +1443,52 @@ def write_new_json(path: Path, value: Any) -> Path:
         indent=2,
         sort_keys=True,
     ).encode("utf-8") + b"\n"
-    temporary_path: Path | None = None
+    file_fd: int | None = None
     try:
-        with tempfile.NamedTemporaryFile(
-            dir=destination.parent,
-            prefix=f".{destination.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as temporary:
-            temporary_path = Path(temporary.name)
-            temporary.write(encoded)
-            temporary.flush()
-            os.fsync(temporary.fileno())
-        temporary_path.chmod(0o444)
         try:
-            os.link(temporary_path, destination)
+            os.stat(destination.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise FileExistsError(
+                f"refusing to overwrite immutable output: {destination}"
+            )
+        if not hasattr(os, "O_TMPFILE"):
+            raise OSError("immutable publication requires Linux O_TMPFILE support")
+        file_fd = os.open(
+            ".",
+            os.O_WRONLY | os.O_CLOEXEC | os.O_TMPFILE,
+            0o600,
+            dir_fd=parent_fd,
+        )
+        view = memoryview(encoded)
+        written = 0
+        while written < len(view):
+            written += os.write(file_fd, view[written:])
+        os.fsync(file_fd)
+        os.fchmod(file_fd, 0o444)
+        try:
+            _link_unnamed_file(file_fd, parent_fd, destination.name)
         except FileExistsError as exc:
             raise FileExistsError(
                 f"refusing to overwrite immutable output: {destination}"
             ) from exc
         return destination
     finally:
-        if temporary_path is not None:
-            temporary_path.unlink(missing_ok=True)
+        if file_fd is not None:
+            os.close(file_fd)
+        os.close(parent_fd)
 
 
-def load_json_strict(path: Path) -> dict[str, Any]:
-    """Load one finite JSON object while rejecting duplicate keys."""
+def _load_json_strict_with_metadata(
+    path: Path,
+    *,
+    max_bytes: int = MAX_SCORECARD_JSON_INPUT_BYTES,
+) -> tuple[dict[str, Any], os.stat_result]:
+    """Load JSON and return metadata from the descriptor that supplied its bytes."""
+
+    if type(max_bytes) is not int or not 0 <= max_bytes <= MAX_SCORECARD_JSON_INPUT_BYTES:
+        raise ValueError("strict JSON byte limit is invalid")
 
     def pairs_hook(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
         result: dict[str, Any] = {}
@@ -1289,17 +1501,67 @@ def load_json_strict(path: Path) -> dict[str, Any]:
     def reject_constant(value: str) -> NoReturn:
         raise ValueError(f"non-finite JSON constant is forbidden: {value}")
 
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise ValueError("strict JSON loading requires no-follow file support")
+    descriptor: int | None = None
     try:
+        descriptor = os.open(
+            Path(path),
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+        )
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ValueError(f"{path}: strict JSON input must be a regular file")
+        if metadata.st_size > max_bytes:
+            raise ValueError(
+                f"{path}: strict JSON input exceeds {max_bytes} bytes"
+            )
+        chunks: list[bytes] = []
+        remaining = max_bytes + 1
+        while remaining > 0:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        encoded = b"".join(chunks)
+        if len(encoded) > max_bytes:
+            raise ValueError(
+                f"{path}: strict JSON input exceeds {max_bytes} bytes"
+            )
+        final_metadata = os.fstat(descriptor)
+        stable_fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+        if len(encoded) != metadata.st_size or any(
+            getattr(metadata, field) != getattr(final_metadata, field)
+            for field in stable_fields
+        ):
+            raise ValueError(f"{path}: strict JSON input changed while being read")
+        try:
+            source = encoded.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"{path}: strict JSON input is not UTF-8") from exc
         payload = json.loads(
-            Path(path).read_text(encoding="utf-8"),
+            source,
             object_pairs_hook=pairs_hook,
             parse_constant=reject_constant,
         )
+    except ValueError:
+        raise
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError(f"cannot load strict JSON from {path}: {exc}") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
     if not isinstance(payload, dict):
         raise ValueError(f"{path}: top-level JSON value must be an object")
     _validate_json_value(payload)
+    return payload, final_metadata
+
+
+def load_json_strict(path: Path) -> dict[str, Any]:
+    """Load one bounded regular-file JSON object without following a symlink."""
+
+    payload, _ = _load_json_strict_with_metadata(path)
     return payload
 
 
@@ -1368,6 +1630,25 @@ def _require_finite_nonnegative(value: Any, *, path: str) -> float:
     if not math.isfinite(result) or result < 0.0:
         raise ValueError(f"{path} must be a finite nonnegative number")
     return result
+
+
+def _require_nonnegative_int(value: Any, *, path: str) -> int:
+    if type(value) is not int or value < 0:
+        raise ValueError(f"{path} must be a nonnegative integer")
+    return value
+
+
+def _require_finite_number(value: Any, *, path: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{path} must be a finite number")
+    result = float(value)
+    if not math.isfinite(result):
+        raise ValueError(f"{path} must be a finite number")
+    return result
+
+
+def _numerically_equal(left: float, right: float) -> bool:
+    return math.isclose(left, right, rel_tol=1e-12, abs_tol=1e-12)
 
 
 def _validate_agent_manifest_descriptor(value: Any, *, path: str) -> None:
@@ -1529,7 +1810,7 @@ def _validate_resolved_components(
         "lifecycle_id": spec.lifecycle_id,
         "seed": spec.seed,
         "max_accepted_events": protocol["horizon"],
-        "rng_schedule": "jax_fold_in_environment_cursor.preview1",
+        "rng_schedule": REFERENCE_LIFE_RNG_SCHEDULE,
     }
     for field, expected in expected_scalars.items():
         if life_config.get(field) != expected:
@@ -1543,6 +1824,178 @@ def _validate_resolved_components(
     if life_environment.get("manifest_id") != environment_manifest["manifest_id"]:
         raise ValueError(f"{path}.life_config binds another environment manifest")
 
+    canonical_runner = build_scorecard_runner(plan, spec)
+    canonical_resolved = _resolved_components(plan, spec, canonical_runner)
+    if not _json_exact_equal(dict(resolved), canonical_resolved):
+        raise ValueError(
+            f"{path} does not match the canonical resolved components for the "
+            "scheduled arm and exact environment definition"
+        )
+
+
+def _validate_resource_payload(resource: Any, *, arm: str, path: str) -> None:
+    if not isinstance(resource, Mapping):
+        raise ValueError(f"{path} must be an object")
+    expected_method = (
+        "prototype_control_parameter_tree"
+        if arm in ("prototype", "prototype_frozen")
+        else (
+            "known_sarsa_parameter_fields"
+            if arm in ("differential_sarsa", "sarsa")
+            else "floating_jax_pytree_leaves_upper_bound"
+        )
+    )
+    required = {
+        "persistent_jax_array_leaves",
+        "persistent_jax_array_scalar_count",
+        "persistent_jax_array_bytes",
+        "persistent_static_numeric_bytes",
+        "persistent_numeric_bytes_total",
+        "persistent_state_measurement",
+        "trainable_scalar_count_estimate",
+        "trainable_scalar_count_method",
+        "hardware_peak_memory_measured",
+    }
+    if expected_method != "floating_jax_pytree_leaves_upper_bound":
+        required.add("trainable_parameter_tree_scalar_count")
+    if set(resource) != required:
+        raise ValueError(f"{path} fields do not match the resource contract")
+    if resource["persistent_state_measurement"] != (
+        "numeric_jax_and_numpy_pytree_leaves"
+    ):
+        raise ValueError(f"{path}.persistent_state_measurement is unsupported")
+    if resource["trainable_scalar_count_method"] != expected_method:
+        raise ValueError(f"{path}.trainable_scalar_count_method differs from the arm")
+    if resource["hardware_peak_memory_measured"] is not False:
+        raise ValueError(f"{path} must not claim a hardware peak measurement")
+    leaves = _require_nonnegative_int(
+        resource["persistent_jax_array_leaves"],
+        path=f"{path}.persistent_jax_array_leaves",
+    )
+    elements = _require_nonnegative_int(
+        resource["persistent_jax_array_scalar_count"],
+        path=f"{path}.persistent_jax_array_scalar_count",
+    )
+    byte_count = _require_nonnegative_int(
+        resource["persistent_jax_array_bytes"],
+        path=f"{path}.persistent_jax_array_bytes",
+    )
+    static_bytes = _require_nonnegative_int(
+        resource["persistent_static_numeric_bytes"],
+        path=f"{path}.persistent_static_numeric_bytes",
+    )
+    total_bytes = _require_nonnegative_int(
+        resource["persistent_numeric_bytes_total"],
+        path=f"{path}.persistent_numeric_bytes_total",
+    )
+    if total_bytes != byte_count + static_bytes:
+        raise ValueError(f"{path} persistent numeric byte total is inconsistent")
+    trainable = _require_nonnegative_int(
+        resource["trainable_scalar_count_estimate"],
+        path=f"{path}.trainable_scalar_count_estimate",
+    )
+    if leaves == 0 and (elements != 0 or byte_count != 0):
+        raise ValueError(f"{path} reports numeric storage without an array leaf")
+    if (elements == 0) != (byte_count == 0):
+        raise ValueError(f"{path} scalar and byte counts disagree about empty storage")
+    if elements > 0 and byte_count < elements:
+        raise ValueError(f"{path} byte count is smaller than its numeric scalar count")
+    if trainable > elements:
+        raise ValueError(f"{path} trainable estimate exceeds persistent numeric state")
+    if expected_method != "floating_jax_pytree_leaves_upper_bound":
+        parameter_elements = _require_nonnegative_int(
+            resource["trainable_parameter_tree_scalar_count"],
+            path=f"{path}.trainable_parameter_tree_scalar_count",
+        )
+        if parameter_elements > elements or trainable > parameter_elements:
+            raise ValueError(f"{path} parameter-tree counts exceed persistent state")
+
+
+def _reward_lattice_matches(
+    total: float,
+    *,
+    event_count: int,
+    reward_values: Sequence[float],
+) -> bool:
+    """Return whether a total is reachable from the selected discrete rewards."""
+
+    values = sorted({float(np.float32(value)) for value in reward_values})
+    if any(not math.isfinite(value) or value < 0.0 for value in values):
+        return False
+    positive = [value for value in values if value > 0.0]
+    tolerance = float(
+        max(1e-12, event_count * float(np.spacing(max(1.0, abs(total)))) * 4.0)
+    )
+    if not positive:
+        return abs(total) <= tolerance
+    if len(positive) == 1:
+        count = round(total / positive[0])
+        return 0 <= count <= event_count and math.isclose(
+            total,
+            count * positive[0],
+            rel_tol=0.0,
+            abs_tol=tolerance,
+        )
+    if len(positive) == 2:
+        low, high = positive
+        maximum_high = min(event_count, max(0, int(math.floor(total / high)) + 1))
+        for high_count in range(maximum_high + 1):
+            residual = total - high_count * high
+            low_count = round(residual / low)
+            if (
+                0 <= low_count <= event_count - high_count
+                and math.isclose(
+                    total,
+                    high_count * high + low_count * low,
+                    rel_tol=0.0,
+                    abs_tol=tolerance,
+                )
+            ):
+                return True
+    return False
+
+
+def _validate_metric_window(
+    window: Any,
+    *,
+    event_count: int,
+    oracle_reward: float,
+    minimum_reward: float,
+    maximum_reward: float,
+    reward_values: Sequence[float],
+    path: str,
+) -> float:
+    required = {"event_count", "reward_sum", "mean_reward", "mean_oracle_regret"}
+    if not isinstance(window, Mapping) or set(window) != required:
+        raise ValueError(f"{path} fields do not match the metric-window contract")
+    if window["event_count"] != event_count or type(window["event_count"]) is not int:
+        raise ValueError(f"{path}.event_count differs from the fixed window")
+    reward_sum = _require_finite_number(window["reward_sum"], path=f"{path}.reward_sum")
+    mean_reward = _require_finite_number(
+        window["mean_reward"], path=f"{path}.mean_reward"
+    )
+    mean_regret = _require_finite_number(
+        window["mean_oracle_regret"], path=f"{path}.mean_oracle_regret"
+    )
+    if not _numerically_equal(mean_reward, reward_sum / event_count):
+        raise ValueError(f"{path}.mean_reward is inconsistent")
+    if not _numerically_equal(mean_regret, oracle_reward - mean_reward):
+        raise ValueError(f"{path}.mean_oracle_regret is inconsistent")
+    tolerance = 1e-9 * max(1.0, abs(reward_sum))
+    if not (
+        minimum_reward * event_count - tolerance
+        <= reward_sum
+        <= maximum_reward * event_count + tolerance
+    ):
+        raise ValueError(f"{path}.reward_sum is outside the exact environment range")
+    if not _reward_lattice_matches(
+        reward_sum,
+        event_count=event_count,
+        reward_values=reward_values,
+    ):
+        raise ValueError(f"{path}.reward_sum is outside the exact reward lattice")
+    return reward_sum
+
 
 def _validate_completed_outcome(
     outcome: Any,
@@ -1550,6 +2003,7 @@ def _validate_completed_outcome(
     environment: str,
     arm: str,
     protocol: Mapping[str, Any],
+    expected_initial_resource: Mapping[str, Any],
     path: str,
 ) -> None:
     if not isinstance(outcome, Mapping):
@@ -1576,23 +2030,35 @@ def _validate_completed_outcome(
     if set(outcome) != required:
         raise ValueError(f"{path} fields do not match the completed-outcome contract")
     horizon = protocol["horizon"]
-    if outcome["configured_horizon"] != horizon or outcome["accepted_events"] != horizon:
+    if (
+        type(outcome["configured_horizon"]) is not int
+        or type(outcome["accepted_events"]) is not int
+        or outcome["configured_horizon"] != horizon
+        or outcome["accepted_events"] != horizon
+    ):
         raise ValueError(f"{path} does not reach the fixed horizon")
-    if outcome["environment_rng_cursor"] != horizon:
+    if (
+        type(outcome["environment_rng_cursor"]) is not int
+        or outcome["environment_rng_cursor"] != horizon
+    ):
         raise ValueError(f"{path} environment RNG cursor is not matched to the horizon")
     if outcome["summary_mode"] != "streaming_o1_no_retained_events":
         raise ValueError(f"{path} did not use the streaming summary")
-    for field in ("reward_sum", "oracle_reward_sum"):
-        value = outcome[field]
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            raise ValueError(f"{path}.{field} must be finite")
-        if not math.isfinite(float(value)):
-            raise ValueError(f"{path}.{field} must be finite")
-    reward_sum = float(outcome["reward_sum"])
-    oracle_reward_sum = float(outcome["oracle_reward_sum"])
-    if outcome["mean_reward"] != reward_sum / horizon:
+    reward_sum = _require_finite_number(
+        outcome["reward_sum"], path=f"{path}.reward_sum"
+    )
+    oracle_reward_sum = _require_finite_number(
+        outcome["oracle_reward_sum"], path=f"{path}.oracle_reward_sum"
+    )
+    mean_reward = _require_finite_number(
+        outcome["mean_reward"], path=f"{path}.mean_reward"
+    )
+    regret_sum = _require_finite_number(
+        outcome["regret_sum"], path=f"{path}.regret_sum"
+    )
+    if not _numerically_equal(mean_reward, reward_sum / horizon):
         raise ValueError(f"{path}.mean_reward is inconsistent")
-    if outcome["regret_sum"] != oracle_reward_sum - reward_sum:
+    if not _numerically_equal(regret_sum, oracle_reward_sum - reward_sum):
         raise ValueError(f"{path}.regret_sum is inconsistent")
     changes = outcome["parameter_change_events"]
     if type(changes) is not int or not 0 <= changes <= horizon:
@@ -1605,30 +2071,17 @@ def _validate_completed_outcome(
     if not isinstance(resources, Mapping) or set(resources) != {"initial", "final"}:
         raise ValueError(f"{path}.resources must bind initial and final state")
     for label in ("initial", "final"):
-        resource = resources[label]
-        if not isinstance(resource, Mapping):
-            raise ValueError(f"{path}.resources.{label} must be an object")
-        for field in (
-            "persistent_jax_array_bytes",
-            "persistent_jax_array_scalar_count",
-            "persistent_jax_array_leaves",
-            "trainable_scalar_count_estimate",
-        ):
-            _require_finite_nonnegative(
-                resource.get(field),
-                path=f"{path}.resources.{label}.{field}",
-            )
+        _validate_resource_payload(
+            resources[label], arm=arm, path=f"{path}.resources.{label}"
+        )
+    if not _json_exact_equal(dict(resources["initial"]), dict(expected_initial_resource)):
+        raise ValueError(f"{path}.resources.initial differs from the canonical agent state")
+    if not _json_exact_equal(dict(resources["final"]), dict(resources["initial"])):
+        raise ValueError(f"{path}.resources reports persistent-state growth or shrinkage")
+
     windows = outcome["windows"]
     if not isinstance(windows, Mapping):
         raise ValueError(f"{path}.windows must be an object")
-    if environment == "switching_two_state" and set(windows) != {
-        "initial_a",
-        "first_b",
-        "return_a",
-    }:
-        raise ValueError(f"{path} lacks the fixed A/B/A windows")
-    if environment == "riverswim" and set(windows) != {"early", "late"}:
-        raise ValueError(f"{path} lacks the fixed RiverSwim windows")
     phase_counts = outcome["phase_event_counts"]
     phase_rewards = outcome["phase_reward_sums"]
     if (
@@ -1638,24 +2091,24 @@ def _validate_completed_outcome(
         or sum(phase_counts) != horizon
     ):
         raise ValueError(f"{path}.phase_event_counts is inconsistent")
-    if (
-        not isinstance(phase_rewards, list)
-        or len(phase_rewards) != 2
-        or any(
-            isinstance(value, bool)
-            or not isinstance(value, (int, float))
-            or not math.isfinite(float(value))
-            for value in phase_rewards
-        )
-        or not math.isclose(
-            math.fsum(float(value) for value in phase_rewards),
-            reward_sum,
-            rel_tol=0.0,
-            abs_tol=1e-9,
-        )
+    if not isinstance(phase_rewards, list) or len(phase_rewards) != 2:
+        raise ValueError(f"{path}.phase_reward_sums is inconsistent")
+    phase_reward_values = [
+        _require_finite_number(value, path=f"{path}.phase_reward_sums[{index}]")
+        for index, value in enumerate(phase_rewards)
+    ]
+    if not math.isclose(
+        math.fsum(phase_reward_values),
+        reward_sum,
+        rel_tol=0.0,
+        abs_tol=1e-9,
     ):
         raise ValueError(f"{path}.phase_reward_sums is inconsistent")
+
+    window_reward_sums: list[float] = []
     if environment == "switching_two_state":
+        if set(windows) != {"initial_a", "first_b", "return_a"}:
+            raise ValueError(f"{path} lacks the fixed A/B/A windows")
         phase_length = protocol["phase_length"]
         expected_phase_counts = [
             sum(
@@ -1667,32 +2120,331 @@ def _validate_completed_outcome(
         ]
         if phase_counts != expected_phase_counts:
             raise ValueError(f"{path}.phase_event_counts violates the switching schedule")
-        for name in ("initial_a", "first_b", "return_a"):
-            window = windows[name]
-            if not isinstance(window, Mapping) or window.get("event_count") != protocol[
-                "post_switch_window"
-            ]:
-                raise ValueError(f"{path}.windows.{name} has the wrong event count")
+        switching_config = SwitchingTwoStateConfig(  # type: ignore[call-arg]
+            phase_length=phase_length,
+            payoffs_a=tuple(tuple(row) for row in protocol["payoffs_a"]),
+            payoffs_b=tuple(tuple(row) for row in protocol["payoffs_b"]),
+        )
+        switching = SwitchingTwoStateMDP(switching_config)
+        oracle_rewards = [switching.optimal_average_reward(phase) for phase in (0, 1)]
+        phase_payoffs = (protocol["payoffs_a"], protocol["payoffs_b"])
+        for phase in (0, 1):
+            flattened = [float(value) for row in phase_payoffs[phase] for value in row]
+            tolerance = 1e-9 * max(1.0, abs(phase_reward_values[phase]))
+            if not (
+                min(flattened) * phase_counts[phase] - tolerance
+                <= phase_reward_values[phase]
+                <= max(flattened) * phase_counts[phase] + tolerance
+            ):
+                raise ValueError(
+                    f"{path}.phase_reward_sums[{phase}] is outside the payoff range"
+                )
+            if not _reward_lattice_matches(
+                phase_reward_values[phase],
+                event_count=phase_counts[phase],
+                reward_values=flattened,
+            ):
+                raise ValueError(
+                    f"{path}.phase_reward_sums[{phase}] is outside the reward lattice"
+                )
+        for name, phase in (("initial_a", 0), ("first_b", 1), ("return_a", 0)):
+            flattened = [float(value) for row in phase_payoffs[phase] for value in row]
+            window_reward_sums.append(
+                _validate_metric_window(
+                    windows[name],
+                    event_count=protocol["post_switch_window"],
+                    oracle_reward=oracle_rewards[phase],
+                    minimum_reward=min(flattened),
+                    maximum_reward=max(flattened),
+                    reward_values=flattened,
+                    path=f"{path}.windows.{name}",
+                )
+            )
+        if (
+            window_reward_sums[0] + window_reward_sums[2]
+            > phase_reward_values[0] + 1e-9
+            or window_reward_sums[1] > phase_reward_values[1] + 1e-9
+        ):
+            raise ValueError(f"{path}.windows exceed their switching-phase rewards")
         if outcome["high_end_visit_count"] is not None or outcome[
             "high_end_visit_rate"
         ] is not None:
             raise ValueError(f"{path} switching run must not claim RiverSwim visits")
-    else:
+    elif environment == "riverswim":
+        if set(windows) != {"early", "late"}:
+            raise ValueError(f"{path} lacks the fixed RiverSwim windows")
         if phase_counts != [horizon, 0]:
             raise ValueError(f"{path}.phase_event_counts violates stationary semantics")
+        river_config = RiverSwimConfig(  # type: ignore[call-arg]
+            n_states=protocol["n_states"],
+            p_right_up=protocol["p_right_up"],
+            p_right_down=protocol["p_right_down"],
+            reward_left=protocol["reward_left"],
+            reward_right=protocol["reward_right"],
+            initial_state=protocol["initial_state"],
+        )
+        river = RiverSwimMDP(river_config)
+        oracle_rewards = [river.optimal_average_reward(), 0.0]
+        possible_rewards = (0.0, protocol["reward_left"], protocol["reward_right"])
+        minimum_reward = min(possible_rewards)
+        maximum_reward = max(possible_rewards)
+        tolerance = 1e-9 * max(1.0, abs(phase_reward_values[0]))
+        if not (
+            minimum_reward * horizon - tolerance
+            <= phase_reward_values[0]
+            <= maximum_reward * horizon + tolerance
+        ) or phase_reward_values[1] != 0.0:
+            raise ValueError(f"{path}.phase_reward_sums violates stationary rewards")
+        if not _reward_lattice_matches(
+            phase_reward_values[0],
+            event_count=horizon,
+            reward_values=possible_rewards,
+        ):
+            raise ValueError(f"{path}.phase_reward_sums violates the reward lattice")
         for name, expected_count in (
             ("early", protocol["early_window"]),
             ("late", protocol["late_window"]),
         ):
-            window = windows[name]
-            if not isinstance(window, Mapping) or window.get("event_count") != expected_count:
-                raise ValueError(f"{path}.windows.{name} has the wrong event count")
+            window_reward_sums.append(
+                _validate_metric_window(
+                    windows[name],
+                    event_count=expected_count,
+                    oracle_reward=oracle_rewards[0],
+                    minimum_reward=minimum_reward,
+                    maximum_reward=maximum_reward,
+                    reward_values=possible_rewards,
+                    path=f"{path}.windows.{name}",
+                )
+            )
+        if math.fsum(window_reward_sums) > phase_reward_values[0] + 1e-9:
+            raise ValueError(f"{path}.windows exceed the stationary reward sum")
         visits = outcome["high_end_visit_count"]
-        rate = outcome["high_end_visit_rate"]
         if type(visits) is not int or not 0 <= visits <= horizon:
             raise ValueError(f"{path}.high_end_visit_count is invalid")
-        if rate != visits / horizon:
+        rate = _require_finite_number(
+            outcome["high_end_visit_rate"], path=f"{path}.high_end_visit_rate"
+        )
+        if not _numerically_equal(rate, visits / horizon):
             raise ValueError(f"{path}.high_end_visit_rate is inconsistent")
+    else:
+        raise ValueError(f"{path} has an unsupported environment")
+
+    expected_oracle_sum = math.fsum(
+        count * oracle for count, oracle in zip(phase_counts, oracle_rewards, strict=True)
+    )
+    if not _numerically_equal(oracle_reward_sum, expected_oracle_sum):
+        raise ValueError(f"{path}.oracle_reward_sum differs from the exact environment")
+    all_reward_values = (
+        [
+            float(value)
+            for matrix in (protocol["payoffs_a"], protocol["payoffs_b"])
+            for row in matrix
+            for value in row
+        ]
+        if environment == "switching_two_state"
+        else [0.0, protocol["reward_left"], protocol["reward_right"]]
+    )
+    if not _reward_lattice_matches(
+        reward_sum,
+        event_count=horizon,
+        reward_values=all_reward_values,
+    ):
+        raise ValueError(f"{path}.reward_sum is outside the exact reward lattice")
+
+
+def _partial_window_count(start: int, stop: int, accepted: int) -> int:
+    return max(0, min(stop, accepted) - start)
+
+
+def _validate_partial_outcome(
+    partial: Any,
+    *,
+    accepted: int,
+    environment: str,
+    protocol: Mapping[str, Any],
+    path: str,
+) -> None:
+    required = {
+        "summary_mode",
+        "configured_horizon",
+        "accepted_events",
+        "reward_sum",
+        "mean_reward",
+        "oracle_reward_sum",
+        "regret_sum",
+        "parameter_change_events",
+        "phase_event_counts",
+        "phase_reward_sums",
+        "windows",
+        "high_end_visit_count",
+        "high_end_visit_rate",
+    }
+    if not isinstance(partial, Mapping) or set(partial) != required:
+        raise ValueError(f"{path} fields do not match the partial-outcome contract")
+    horizon = protocol["horizon"]
+    if (
+        partial["summary_mode"] != "streaming_o1_no_retained_events"
+        or type(partial["configured_horizon"]) is not int
+        or partial["configured_horizon"] != horizon
+        or type(partial["accepted_events"]) is not int
+        or partial["accepted_events"] != accepted
+    ):
+        raise ValueError(f"{path} counters do not match the failed shard")
+    reward_sum = _require_finite_number(partial["reward_sum"], path=f"{path}.reward_sum")
+    oracle_sum = _require_finite_number(
+        partial["oracle_reward_sum"], path=f"{path}.oracle_reward_sum"
+    )
+    regret_sum = _require_finite_number(
+        partial["regret_sum"], path=f"{path}.regret_sum"
+    )
+    mean = partial["mean_reward"]
+    if accepted == 0:
+        if mean is not None or any(value != 0.0 for value in (reward_sum, oracle_sum, regret_sum)):
+            raise ValueError(f"{path} zero-event arithmetic is inconsistent")
+    else:
+        mean_value = _require_finite_number(mean, path=f"{path}.mean_reward")
+        if not _numerically_equal(mean_value, reward_sum / accepted):
+            raise ValueError(f"{path}.mean_reward is inconsistent")
+    if not _numerically_equal(regret_sum, oracle_sum - reward_sum):
+        raise ValueError(f"{path}.regret_sum is inconsistent")
+    changes = partial["parameter_change_events"]
+    if type(changes) is not int or not 0 <= changes <= accepted:
+        raise ValueError(f"{path}.parameter_change_events is invalid")
+
+    phase_counts = partial["phase_event_counts"]
+    phase_rewards = partial["phase_reward_sums"]
+    if (
+        not isinstance(phase_counts, list)
+        or len(phase_counts) != 2
+        or any(type(value) is not int or value < 0 for value in phase_counts)
+        or sum(phase_counts) != accepted
+        or not isinstance(phase_rewards, list)
+        or len(phase_rewards) != 2
+    ):
+        raise ValueError(f"{path} phase summaries are malformed")
+    phase_reward_values = [
+        _require_finite_number(value, path=f"{path}.phase_reward_sums[{index}]")
+        for index, value in enumerate(phase_rewards)
+    ]
+    if not _numerically_equal(math.fsum(phase_reward_values), reward_sum):
+        raise ValueError(f"{path}.phase_reward_sums do not sum to reward_sum")
+    windows = partial["windows"]
+    if not isinstance(windows, Mapping):
+        raise ValueError(f"{path}.windows must be an object")
+
+    if environment == "switching_two_state":
+        phase_length = protocol["phase_length"]
+        cycles, remainder = divmod(accepted, 2 * phase_length)
+        expected_counts = [
+            cycles * phase_length + min(remainder, phase_length),
+            cycles * phase_length + max(0, remainder - phase_length),
+        ]
+        if phase_counts != expected_counts:
+            raise ValueError(f"{path}.phase_event_counts violates the switching schedule")
+        kernel = SwitchingTwoStateMDP(
+            SwitchingTwoStateConfig(  # type: ignore[call-arg]
+                phase_length=phase_length,
+                payoffs_a=tuple(tuple(row) for row in protocol["payoffs_a"]),
+                payoffs_b=tuple(tuple(row) for row in protocol["payoffs_b"]),
+            )
+        )
+        payoffs = (protocol["payoffs_a"], protocol["payoffs_b"])
+        oracle_rewards = [kernel.optimal_average_reward(phase) for phase in (0, 1)]
+        for phase in (0, 1):
+            rewards = [float(value) for row in payoffs[phase] for value in row]
+            if not _reward_lattice_matches(
+                phase_reward_values[phase],
+                event_count=phase_counts[phase],
+                reward_values=rewards,
+            ):
+                raise ValueError(f"{path}.phase_reward_sums[{phase}] violates rewards")
+        if set(windows) != {"initial_a", "first_b", "return_a"}:
+            raise ValueError(f"{path}.windows does not match the A/B/A contract")
+        window = protocol["post_switch_window"]
+        for name, start, phase in (
+            ("initial_a", 0, 0),
+            ("first_b", phase_length, 1),
+            ("return_a", 2 * phase_length, 0),
+        ):
+            expected_count = _partial_window_count(start, start + window, accepted)
+            value = windows[name]
+            if expected_count == 0:
+                if value is not None:
+                    raise ValueError(f"{path}.windows.{name} must be empty")
+            else:
+                rewards = [float(item) for row in payoffs[phase] for item in row]
+                _validate_metric_window(
+                    value,
+                    event_count=expected_count,
+                    oracle_reward=oracle_rewards[phase],
+                    minimum_reward=min(rewards),
+                    maximum_reward=max(rewards),
+                    reward_values=rewards,
+                    path=f"{path}.windows.{name}",
+                )
+        if partial["high_end_visit_count"] is not None or partial[
+            "high_end_visit_rate"
+        ] is not None:
+            raise ValueError(f"{path} switching partial cannot claim RiverSwim visits")
+    elif environment == "riverswim":
+        if phase_counts != [accepted, 0] or phase_reward_values[1] != 0.0:
+            raise ValueError(f"{path} violates stationary RiverSwim semantics")
+        river = RiverSwimMDP(
+            RiverSwimConfig(  # type: ignore[call-arg]
+                n_states=protocol["n_states"],
+                p_right_up=protocol["p_right_up"],
+                p_right_down=protocol["p_right_down"],
+                reward_left=protocol["reward_left"],
+                reward_right=protocol["reward_right"],
+                initial_state=protocol["initial_state"],
+            )
+        )
+        oracle_rewards = [river.optimal_average_reward(), 0.0]
+        river_rewards = (0.0, protocol["reward_left"], protocol["reward_right"])
+        if not _reward_lattice_matches(
+            phase_reward_values[0], event_count=accepted, reward_values=river_rewards
+        ):
+            raise ValueError(f"{path}.phase_reward_sums violates RiverSwim rewards")
+        if set(windows) != {"early", "late"}:
+            raise ValueError(f"{path}.windows does not match the RiverSwim contract")
+        for name, start, stop in (
+            ("early", 0, protocol["early_window"]),
+            ("late", horizon - protocol["late_window"], horizon),
+        ):
+            expected_count = _partial_window_count(start, stop, accepted)
+            value = windows[name]
+            if expected_count == 0:
+                if value is not None:
+                    raise ValueError(f"{path}.windows.{name} must be empty")
+            else:
+                _validate_metric_window(
+                    value,
+                    event_count=expected_count,
+                    oracle_reward=oracle_rewards[0],
+                    minimum_reward=min(river_rewards),
+                    maximum_reward=max(river_rewards),
+                    reward_values=river_rewards,
+                    path=f"{path}.windows.{name}",
+                )
+        visits = partial["high_end_visit_count"]
+        if type(visits) is not int or not 0 <= visits <= accepted:
+            raise ValueError(f"{path}.high_end_visit_count is invalid")
+        rate = partial["high_end_visit_rate"]
+        if accepted == 0:
+            if rate is not None:
+                raise ValueError(f"{path}.high_end_visit_rate must be empty")
+        else:
+            rate_value = _require_finite_number(rate, path=f"{path}.high_end_visit_rate")
+            if not _numerically_equal(rate_value, visits / accepted):
+                raise ValueError(f"{path}.high_end_visit_rate is inconsistent")
+    else:
+        raise ValueError(f"{path} has an unsupported environment")
+    expected_oracle = math.fsum(
+        count * oracle
+        for count, oracle in zip(phase_counts, oracle_rewards, strict=True)
+    )
+    if not _numerically_equal(oracle_sum, expected_oracle):
+        raise ValueError(f"{path}.oracle_reward_sum is inconsistent")
 
 
 def _validate_run_record(
@@ -1741,40 +2493,80 @@ def _validate_run_record(
         record["seed"],
         record["lifecycle_id"],
     )
-    if observed_identity != expected_identity:
+    if (
+        type(record["schedule_index"]) is not int
+        or type(record["seed"]) is not int
+        or type(record["environment_kind"]) is not str
+        or type(record["arm"]) is not str
+        or type(record["lifecycle_id"]) is not str
+        or observed_identity != expected_identity
+    ):
         raise ValueError(f"{path} is outside the canonical cyclic schedule")
     if record["schema"] != REFERENCE_LIFE_SCORECARD_RUN_SCHEMA:
         raise ValueError(f"{path} has an unsupported schema")
     if record["plan_sha256"] != plan.plan_sha256:
         raise ValueError(f"{path} belongs to another plan")
-    if record["evidence_policy"] != NONPROMOTING_POLICY:
+    if not _json_exact_equal(record["evidence_policy"], NONPROMOTING_POLICY):
         raise ValueError(f"{path} must remain permanently nonpromoting")
     source_identity, runtime_identity, dependency_identity = consistency_identities
-    if record["source_identity"] != source_identity:
+    if not _json_exact_equal(record["source_identity"], source_identity):
         raise ValueError(f"{path} source identity differs from the current source tree")
-    if record["runtime_identity"] != runtime_identity:
+    if not _json_exact_equal(record["runtime_identity"], runtime_identity):
         raise ValueError(f"{path} runtime identity differs from the current runtime")
-    if record["dependency_identity"] != dependency_identity:
+    if not _json_exact_equal(record["dependency_identity"], dependency_identity):
         raise ValueError(f"{path} dependency identity differs from current dependencies")
     if record["record_sha256"] != _digest_excluding(record, "record_sha256"):
         raise ValueError(f"{path} content digest mismatch")
 
     telemetry = record["telemetry"]
-    if not isinstance(telemetry, Mapping) or telemetry.get("policy") != TELEMETRY_POLICY:
-        raise ValueError(f"{path}.telemetry is not clearly telemetry-only")
-    for field in (
+    telemetry_fields = {
+        "policy",
         "setup_seconds",
         "cold_step_seconds",
         "warmed_step_seconds_total",
+        "warmed_step_count",
         "warmed_step_seconds_mean",
         "total_seconds",
-    ):
-        value = telemetry.get(field)
-        if value is not None:
-            _require_finite_nonnegative(value, path=f"{path}.telemetry.{field}")
-    warmed_count = telemetry.get("warmed_step_count")
-    if type(warmed_count) is not int or warmed_count < 0:
-        raise ValueError(f"{path}.telemetry.warmed_step_count is invalid")
+    }
+    if not isinstance(telemetry, Mapping) or set(telemetry) != telemetry_fields:
+        raise ValueError(f"{path}.telemetry fields do not match the telemetry contract")
+    if not _json_exact_equal(telemetry["policy"], TELEMETRY_POLICY):
+        raise ValueError(f"{path}.telemetry is not clearly telemetry-only")
+    optional_durations: dict[str, float | None] = {}
+    for field in ("setup_seconds", "cold_step_seconds"):
+        value = telemetry[field]
+        optional_durations[field] = (
+            None
+            if value is None
+            else _require_finite_nonnegative(
+                value, path=f"{path}.telemetry.{field}"
+            )
+        )
+    warmed_total = _require_finite_nonnegative(
+        telemetry["warmed_step_seconds_total"],
+        path=f"{path}.telemetry.warmed_step_seconds_total",
+    )
+    total_seconds = _require_finite_nonnegative(
+        telemetry["total_seconds"], path=f"{path}.telemetry.total_seconds"
+    )
+    warmed_count = _require_nonnegative_int(
+        telemetry["warmed_step_count"], path=f"{path}.telemetry.warmed_step_count"
+    )
+    warmed_mean_value = telemetry["warmed_step_seconds_mean"]
+    if warmed_count == 0:
+        if warmed_total != 0.0 or warmed_mean_value is not None:
+            raise ValueError(f"{path}.telemetry warmed timing is inconsistent")
+    else:
+        warmed_mean = _require_finite_nonnegative(
+            warmed_mean_value, path=f"{path}.telemetry.warmed_step_seconds_mean"
+        )
+        if not _numerically_equal(warmed_mean, warmed_total / warmed_count):
+            raise ValueError(f"{path}.telemetry warmed timing is inconsistent")
+    timed_components = warmed_total + math.fsum(
+        value for value in optional_durations.values() if value is not None
+    )
+    if total_seconds + 1e-12 < timed_components:
+        raise ValueError(f"{path}.telemetry.total_seconds is smaller than timed work")
 
     resolved = record["resolved"]
     if not isinstance(resolved, Mapping):
@@ -1788,13 +2580,22 @@ def _validate_run_record(
     }
     if set(resolved) != expected_resolved_fields:
         raise ValueError(f"{path}.resolved fields are incomplete")
-    if resolved["arm_definition"] != plan.arm_definition(expected_spec.arm):
+    if not _json_exact_equal(
+        resolved["arm_definition"], plan.arm_definition(expected_spec.arm)
+    ):
         raise ValueError(f"{path} arm definition differs from the plan")
 
     status = record["status"]
     if status == "completed":
         if record["failure"] is not None or record["partial_outcome"] is not None:
             raise ValueError(f"{path} completed record carries failure data")
+        horizon = plan.protocol(expected_spec.environment_kind)["horizon"]
+        if (
+            optional_durations["setup_seconds"] is None
+            or optional_durations["cold_step_seconds"] is None
+            or warmed_count != horizon - 1
+        ):
+            raise ValueError(f"{path}.telemetry does not cover every completed step")
         _validate_resolved_components(
             resolved,
             plan=plan,
@@ -1806,6 +2607,10 @@ def _validate_run_record(
             environment=expected_spec.environment_kind,
             arm=expected_spec.arm,
             protocol=plan.protocol(expected_spec.environment_kind),
+            expected_initial_resource=_canonical_initial_resource_payload(
+                expected_spec.environment_kind,
+                expected_spec.arm,
+            ),
             path=f"{path}.outcome",
         )
     elif status == "failed":
@@ -1819,8 +2624,8 @@ def _validate_run_record(
             "accepted_events",
         }:
             raise ValueError(f"{path} failure record is incomplete")
-        if not isinstance(failure["stage"], str) or not failure["stage"]:
-            raise ValueError(f"{path} failure stage must be nonempty")
+        if failure["stage"] not in {"build", "init", "step"}:
+            raise ValueError(f"{path} failure stage is unsupported")
         if not isinstance(failure["type"], str) or not failure["type"]:
             raise ValueError(f"{path} failure type must be nonempty")
         if not isinstance(failure["message"], str) or not failure["message"]:
@@ -1831,12 +2636,15 @@ def _validate_run_record(
         if failure["accepted_events"] > horizon:
             raise ValueError(f"{path} failure accepted-event count exceeds the horizon")
         partial = record["partial_outcome"]
-        if (
-            not isinstance(partial, Mapping)
-            or partial.get("summary_mode") != "streaming_o1_no_retained_events"
-            or partial.get("accepted_events") != failure["accepted_events"]
-        ):
-            raise ValueError(f"{path} failure partial summary is inconsistent")
+        _validate_partial_outcome(
+            partial,
+            accepted=failure["accepted_events"],
+            environment=expected_spec.environment_kind,
+            protocol=plan.protocol(expected_spec.environment_kind),
+            path=f"{path}.partial_outcome",
+        )
+        if failure["stage"] in {"build", "init"} and failure["accepted_events"] != 0:
+            raise ValueError(f"{path} pre-step failure cannot claim accepted events")
         if failure["stage"] == "build":
             if any(
                 resolved[field] is not None
@@ -1882,19 +2690,20 @@ def validate_scorecard_artifact(payload: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("artifact fields do not match the scorecard schema")
     if (
         payload["schema"] != REFERENCE_LIFE_SCORECARD_ARTIFACT_SCHEMA
+        or type(payload["schema_version"]) is not int
         or payload["schema_version"] != 1
         or payload["benchmark"] != "reference_life_matched_development_scorecard"
     ):
         raise ValueError("artifact schema identity is unsupported")
-    if payload["evidence_policy"] != NONPROMOTING_POLICY:
+    if not _json_exact_equal(payload["evidence_policy"], NONPROMOTING_POLICY):
         raise ValueError("artifact must remain permanently nonpromoting")
     consistency_identities = _current_consistency_identities()
     source_identity, runtime_identity, dependency_identity = consistency_identities
-    if payload["source_identity"] != source_identity:
+    if not _json_exact_equal(payload["source_identity"], source_identity):
         raise ValueError("artifact source identity differs from the current source tree")
-    if payload["runtime_identity"] != runtime_identity:
+    if not _json_exact_equal(payload["runtime_identity"], runtime_identity):
         raise ValueError("artifact runtime identity differs from the current runtime")
-    if payload["dependency_identity"] != dependency_identity:
+    if not _json_exact_equal(payload["dependency_identity"], dependency_identity):
         raise ValueError("artifact dependency identity differs from current dependencies")
     if payload["identity_scope_note"] != (
         "consistency binding only; not authenticated execution attestation"
@@ -1917,7 +2726,7 @@ def validate_scorecard_artifact(payload: Mapping[str, Any]) -> dict[str, Any]:
         }
         for spec in specs
     ]
-    if payload["run_order"] != expected_order:
+    if not _json_exact_equal(payload["run_order"], expected_order):
         raise ValueError("artifact run order is not the fixed cyclic schedule")
     runs = payload["runs"]
     if not isinstance(runs, list) or len(runs) != len(specs):
@@ -1930,8 +2739,11 @@ def validate_scorecard_artifact(payload: Mapping[str, Any]) -> dict[str, Any]:
             path=f"$.runs[{index}]",
             consistency_identities=consistency_identities,
         )
-    recomputed_summary = summarize_run_records(plan, cast(list[Mapping[str, Any]], runs))
-    if payload["summary"] != recomputed_summary:
+    recomputed_summary = _summarize_validated_run_records(
+        plan,
+        cast(list[Mapping[str, Any]], runs),
+    )
+    if not _json_exact_equal(payload["summary"], recomputed_summary):
         raise ValueError("artifact summary does not recompute from retained run records")
     if payload["artifact_sha256"] != _digest_excluding(payload, "artifact_sha256"):
         raise ValueError("artifact content digest mismatch")
@@ -2002,7 +2814,11 @@ def _prototype_agent_config(
 ) -> PrototypeAgentConfig:
     definition = plan.arm_definition(arm)
     config = definition["config"]
-    observation_dim = 2 if environment_kind == "switching_two_state" else RIVERSWIM_N_STATES
+    observation_dim = (
+        2
+        if environment_kind == "switching_two_state"
+        else cast(int, plan.protocol("riverswim")["n_states"])
+    )
     return PrototypeAgentConfig(
         oak=OaKConfig(
             stomp=STOMPConfig(
@@ -2021,9 +2837,11 @@ def _prototype_agent_config(
 def _control_adapter(
     *,
     arm: str,
+    arm_definition: Mapping[str, Any],
     environment_kind: str,
     switching_config: SwitchingTwoStateConfig | None,
     river_config: RiverSwimConfig | None,
+    horizon: int,
 ) -> Any:
     # Lazy import keeps plan/validation tooling usable while the optional run
     # surface is being installed, while still using the exact named adapters.
@@ -2049,32 +2867,73 @@ def _control_adapter(
     else:
         raise ValueError(f"unsupported environment {environment_kind!r}")
 
+    if arm_definition != build_development_plan().arm_definition(arm):
+        raise ValueError("control arm definition is not the pinned plan-v1 definition")
+    definition_config = arm_definition.get("config")
+    if not isinstance(definition_config, Mapping):
+        raise ValueError("control arm definition lacks its exact config")
+    config = dict(definition_config)
+
     if arm == "random":
+        if config != {"action_distribution": "uniform", "n_actions": 2}:
+            raise ValueError("random control config is outside the pinned plan")
         random_config = (
             UniformRandomReferenceConfig.for_switching(factory_argument)
             if isinstance(factory_argument, SwitchingTwoStateConfig)
             else UniformRandomReferenceConfig.for_riverswim(factory_argument)
         )
+        random_payload = random_config.to_config()
+        if (
+            random_payload["n_actions"] != config["n_actions"]
+            or random_payload["action_distribution"] != config["action_distribution"]
+        ):
+            raise ValueError("random control did not resolve the planned semantics")
         return UniformRandomReferenceAdapter(random_config)
     if arm == "privileged_oracle":
+        if not _json_exact_equal(config, {
+            "finite_horizon_solver": (
+                "finite_horizon_backward_dynamic_program.float64.tie_low.preview1"
+            ),
+            "horizon_binding": "environment_protocol_horizon",
+            "privileged_environment_model": True,
+            "tie_break": "lowest_action_index",
+        }):
+            raise ValueError("oracle control config is outside the pinned plan")
         oracle_config = (
-            AnalyticOracleReferenceConfig.for_switching(factory_argument)
+            AnalyticOracleReferenceConfig.for_switching(
+                factory_argument,
+                horizon=horizon,
+            )
             if isinstance(factory_argument, SwitchingTwoStateConfig)
-            else AnalyticOracleReferenceConfig.for_riverswim(factory_argument)
+            else AnalyticOracleReferenceConfig.for_riverswim(
+                factory_argument,
+                horizon=horizon,
+            )
         )
+        oracle_payload = oracle_config.to_config()
+        if (
+            oracle_payload["privileged_environment_model"]
+            != config["privileged_environment_model"]
+            or oracle_payload["tie_break"] != config["tie_break"]
+        ):
+            raise ValueError("oracle control did not resolve the planned semantics")
         return AnalyticOracleReferenceAdapter(oracle_config)
     if arm == "differential_sarsa":
         differential_config = (
-            DifferentialSARSAReferenceConfig.for_switching(factory_argument)
+            DifferentialSARSAReferenceConfig.for_switching(factory_argument, **config)
             if isinstance(factory_argument, SwitchingTwoStateConfig)
-            else DifferentialSARSAReferenceConfig.for_riverswim(factory_argument)
+            else DifferentialSARSAReferenceConfig.for_riverswim(
+                factory_argument, **config
+            )
         )
         return DifferentialSARSAReferenceAdapter(differential_config)
     if arm == "sarsa":
         discounted_config = (
-            DiscountedSARSAReferenceConfig.for_switching(factory_argument)
+            DiscountedSARSAReferenceConfig.for_switching(factory_argument, **config)
             if isinstance(factory_argument, SwitchingTwoStateConfig)
-            else DiscountedSARSAReferenceConfig.for_riverswim(factory_argument)
+            else DiscountedSARSAReferenceConfig.for_riverswim(
+                factory_argument, **config
+            )
         )
         return DiscountedSARSAReferenceAdapter(discounted_config)
     raise ValueError(f"arm {arm!r} is not a control adapter")
@@ -2125,9 +2984,11 @@ def build_scorecard_runner(
 
     adapter = _control_adapter(
         arm=spec.arm,
+        arm_definition=plan.arm_definition(spec.arm),
         environment_kind=spec.environment_kind,
         switching_config=switching_config,
         river_config=river_config,
+        horizon=horizon,
     )
     environment: Any
     if switching_config is not None:
@@ -2461,10 +3322,24 @@ def summarize_shard_files(
     """Strictly load all 144 fresh-process shards and build the aggregate."""
 
     effective_plan = build_development_plan() if plan is None else plan
+    expected_count = len(iter_run_specs(effective_plan))
+    if len(paths) != expected_count:
+        raise ValueError(f"aggregate requires exactly {expected_count} shard paths")
     records: list[dict[str, Any]] = []
+    seen_files: set[tuple[int, int]] = set()
+    total_bytes = 0
     consistency_identities = _current_consistency_identities()
     for path in paths:
-        payload = load_json_strict(Path(path))
+        remaining_budget = MAX_SCORECARD_AGGREGATE_INPUT_BYTES - total_bytes
+        payload, metadata = _load_json_strict_with_metadata(
+            Path(path),
+            max_bytes=min(MAX_SCORECARD_JSON_INPUT_BYTES, remaining_budget),
+        )
+        identity = (metadata.st_dev, metadata.st_ino)
+        if identity in seen_files:
+            raise ValueError("aggregate shard paths must name unique regular files")
+        seen_files.add(identity)
+        total_bytes += metadata.st_size
         validate_scorecard_run_record(
             payload,
             plan=effective_plan,
@@ -2530,7 +3405,7 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """CLI entrypoint; intentionally not registered in ``pyproject.toml`` yet."""
+    """CLI entrypoint for the immutable nonpromoting development workflow."""
 
     args = _parser().parse_args(argv)
     if args.command == "plan":
@@ -2548,6 +3423,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             seed=args.seed,
         )
         record = run_scorecard_shard(plan, spec)
+        validate_scorecard_run_record(record, plan=plan)
         write_new_json(args.output, record)
         return 0 if record["status"] == "completed" else 1
     if args.command == "summarize":
@@ -2558,12 +3434,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     if args.command == "validate":
         payload = load_json_strict(args.input)
-        if payload.get("schema") == REFERENCE_LIFE_SCORECARD_RUN_SCHEMA:
+        if payload.get("schema") == REFERENCE_LIFE_SCORECARD_PLAN_SCHEMA:
+            plan = ReferenceLifeDevelopmentPlan.from_payload(payload)
+            result = {
+                "valid": True,
+                "schema": REFERENCE_LIFE_SCORECARD_PLAN_SCHEMA,
+                "plan_sha256": plan.plan_sha256,
+                "evidence_policy": NONPROMOTING_POLICY,
+            }
+        elif payload.get("schema") == REFERENCE_LIFE_SCORECARD_RUN_SCHEMA:
             result = validate_scorecard_run_record(payload)
         elif payload.get("schema") == REFERENCE_LIFE_SCORECARD_ARTIFACT_SCHEMA:
             result = validate_scorecard_artifact(payload)
         else:
-            raise ValueError("input is neither a scorecard shard nor aggregate")
+            raise ValueError("input is neither a scorecard plan, shard, nor aggregate")
         _print_json(result)
         return 0
     raise AssertionError("argparse returned an unknown command")

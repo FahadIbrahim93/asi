@@ -55,7 +55,7 @@ from alberta_framework.core.options import STOMPConfig, SubtaskSpec
 
 @dataclass(frozen=True)
 class Step12IAConfig:
-    """Configuration for the production Step 12 IA facade.
+    """Configuration for the public Step 12 IA facade.
 
     Args:
         n_demons: Number of exo-cerebellum prediction heads.

@@ -1,4 +1,4 @@
-"""Tests for the Step 10 STOMP production facade."""
+"""Tests for the public Step 10 STOMP facade."""
 
 from __future__ import annotations
 
@@ -256,7 +256,7 @@ def test_step10_update_executing_option_in_range() -> None:
     agent, state = _setup()
     result = step10_update(agent, state, jnp.array(0.0), jnp.zeros(4))
     exec_opt = int(result.executing_option)
-    assert exec_opt >= -1
+    assert -1 <= exec_opt < agent.config.n_options
 
 
 def test_step10_off_policy_intra_option_importance_ratio_is_clipped() -> None:
@@ -477,12 +477,6 @@ def test_run_step10_smoke_to_dict_roundtrip() -> None:
 def test_run_step10_smoke_zero_steps_raises() -> None:
     with pytest.raises(ValueError, match="steps"):
         run_step10_smoke(steps=0)
-
-
-def test_run_step10_smoke_different_seeds_differ() -> None:
-    r0 = run_step10_smoke(steps=16, seed=0)
-    r1 = run_step10_smoke(steps=16, seed=99)
-    assert r0.seed != r1.seed
 
 
 # ---------------------------------------------------------------------------
