@@ -235,8 +235,7 @@ class Step5SmokeResult:
         for name in ("predictions_shape", "td_errors_shape", "average_rewards_shape"):
             if getattr(self, name) != (self.steps,):
                 raise ValueError(f"{name} must be exactly (steps,)")
-        if type(self.learner_config) is not dict:
-            raise ValueError("learner_config must be an actual dict")
+        _require_closed_json_object("learner_config", self.learner_config)
 
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-serializable representation."""
@@ -279,11 +278,57 @@ def _preflight_smoke_resources(steps: int, feature_dim: int) -> None:
     # addition to the learner's two D-vectors and four scalar leaves.
     learner_scalars = 2 * feature_dim + 4
     input_scalars = (steps + 1) * feature_dim + steps
-    if any(
-        count > _INT32_MAX or 4 * count > _INT32_MAX
-        for count in (learner_scalars, input_scalars, learner_scalars + input_scalars)
+    output_float_scalars = 7 * steps
+    output_bool_bytes = steps
+    total_bytes = 4 * (learner_scalars + input_scalars + output_float_scalars)
+    total_bytes += output_bool_bytes
+    if (
+        any(
+            count > _INT32_MAX or 4 * count > _INT32_MAX
+            for count in (learner_scalars, input_scalars, output_float_scalars)
+        )
+        or output_bool_bytes > _INT32_MAX
+        or total_bytes > _INT32_MAX
     ):
         raise ValueError("derived Step 5 smoke float32 resources exceed signed-int32 bounds")
+
+
+def _require_closed_json_object(name: str, value: object) -> dict[str, Any]:
+    """Require an acyclic tree of exact built-in JSON identities."""
+    if type(value) is not dict:
+        raise ValueError(f"{name} must be an actual dict")
+    active_containers: set[int] = set()
+    stack: list[tuple[bool, object]] = [(True, value)]
+    while stack:
+        entering, item = stack.pop()
+        if not entering:
+            active_containers.remove(id(item))
+            continue
+        if type(item) is dict:
+            identity = id(item)
+            if identity in active_containers:
+                raise ValueError(f"{name} must be an acyclic JSON object")
+            active_containers.add(identity)
+            mapping = cast(dict[object, object], item)
+            if any(type(key) is not str for key in mapping):
+                raise ValueError(f"{name} keys must be exact strings")
+            stack.append((False, item))
+            stack.extend((True, child) for child in mapping.values())
+        elif type(item) is list:
+            identity = id(item)
+            if identity in active_containers:
+                raise ValueError(f"{name} must be an acyclic JSON object")
+            active_containers.add(identity)
+            stack.append((False, item))
+            stack.extend((True, child) for child in cast(list[object], item))
+        elif item is None or type(item) in (str, bool, int):
+            continue
+        elif type(item) is float:
+            if not math.isfinite(item):
+                raise ValueError(f"{name} floats must be finite")
+        else:
+            raise ValueError(f"{name} must contain only exact JSON identities")
+    return cast(dict[str, Any], value)
 
 
 def _state_feature_dim(state: DifferentialTDState) -> int:

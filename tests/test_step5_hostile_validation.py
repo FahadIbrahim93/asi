@@ -214,6 +214,18 @@ class _HostileArray:
         raise AssertionError("shape hook must not run")
 
 
+class _HostileJsonLeaf:
+    calls = 0
+
+    def __deepcopy__(self, memo: object) -> object:
+        type(self).calls += 1
+        raise AssertionError("HostileJsonLeaf.__deepcopy__ must not be called")
+
+    def __repr__(self) -> str:
+        type(self).calls += 1
+        raise AssertionError("HostileJsonLeaf.__repr__ must not be called")
+
+
 def test_scan_rejects_hostile_arrays_without_hooks() -> None:
     learner = make_step5_td_learner()
     state = learner.init(2)
@@ -253,3 +265,32 @@ def test_scan_requires_exact_float32_shapes() -> None:
 def test_smoke_rejects_derived_allocation_before_jax() -> None:
     with pytest.raises(ValueError, match="derived Step 5 smoke"):
         run_step5_smoke(steps=2**20, feature_dim=2**20)
+
+
+def test_smoke_preflight_accounts_for_scan_outputs() -> None:
+    with pytest.raises(ValueError, match="derived Step 5 smoke"):
+        run_step5_smoke(steps=100_000_000, feature_dim=1)
+
+
+def test_smoke_result_requires_closed_json_learner_config_without_hooks() -> None:
+    payload = {
+        "config": Step5AverageRewardTDConfig(),
+        "steps": 1,
+        "seed": 0,
+        "predictions_shape": (1,),
+        "td_errors_shape": (1,),
+        "average_rewards_shape": (1,),
+        "finite": True,
+    }
+    _HostileJsonLeaf.calls = 0
+    with pytest.raises(ValueError, match="exact JSON identities"):
+        Step5SmokeResult(**payload, learner_config={"bad": _HostileJsonLeaf()})
+    assert _HostileJsonLeaf.calls == 0
+
+    cyclic: dict[str, object] = {}
+    cyclic["self"] = cyclic
+    with pytest.raises(ValueError, match="acyclic JSON object"):
+        Step5SmokeResult(**payload, learner_config=cyclic)
+
+    with pytest.raises(ValueError, match="floats must be finite"):
+        Step5SmokeResult(**payload, learner_config={"bad": float("nan")})
