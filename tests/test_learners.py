@@ -5,6 +5,7 @@ import time
 import chex
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 import pytest
 
 from alberta_framework import (
@@ -26,6 +27,7 @@ from alberta_framework import (
     run_learning_loop,
     run_learning_loop_batched,
 )
+from alberta_framework.core.learners import TDLinearLearner, TrueOnlineTDLearner
 
 
 class TestLinearLearnerNormalizerVeto:
@@ -944,3 +946,19 @@ class TestLifecycleUtilities:
 
         state, _ = run_learning_loop(learner, stream, num_steps=100, key=rng_key)
         assert agent_uptime_s(state) > 0.0
+
+
+@pytest.mark.parametrize(
+    "learner",
+    [LinearLearner(), TDLinearLearner(), TrueOnlineTDLearner()],
+)
+def test_linear_family_feature_dimensions_are_exact_and_preflighted(learner) -> None:
+    for invalid in (True, 0, 4.5, 2**31, np.uint64(2**63)):
+        with pytest.raises(ValueError, match="feature_dim"):
+            learner.init(invalid)
+
+    state = learner.init(np.longlong(4))
+    assert state.weights.shape == (4,)
+
+    with pytest.raises(ValueError, match="resource"):
+        learner.init(2**26)

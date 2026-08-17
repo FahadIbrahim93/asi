@@ -7,6 +7,7 @@ import chex
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 import pytest
 
 from alberta_framework import (
@@ -1393,3 +1394,18 @@ class TestResetDormantOptimizerState:
         mse_first = sum(sq_errors[:100]) / 100.0
         mse_last = sum(sq_errors[-100:]) / 100.0
         assert mse_last < mse_first
+
+
+def test_mlp_dimensions_are_exact_canonical_and_preflighted() -> None:
+    for invalid in ([8], (True,), (0,), (2**31,)):
+        with pytest.raises(ValueError, match="hidden_sizes"):
+            MLPLearner(hidden_sizes=invalid)  # type: ignore[arg-type]
+
+    learner = MLPLearner(hidden_sizes=(np.longlong(8),))
+    assert learner._hidden_sizes == (8,)
+    assert type(learner._hidden_sizes[0]) is int
+
+    with pytest.raises(ValueError, match="feature_dim"):
+        learner.init(True, jr.key(0))
+    with pytest.raises(ValueError, match="resource"):
+        MLPLearner(hidden_sizes=(2**26,)).init(2, jr.key(0))

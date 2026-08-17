@@ -21,12 +21,14 @@ same loop over seeds for multi-seed experiments.
 """
 
 import functools
+import operator
 import time
-from typing import Any, Protocol, TypeVar, cast
+from typing import Any, Protocol, SupportsIndex, TypeVar, cast
 
 import chex
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import Array
 from jaxtyping import Bool, Float
 
@@ -75,6 +77,50 @@ from alberta_framework.core.update_safety import (
     select_transaction,
 )
 from alberta_framework.streams.base import ScanStream
+
+_INT32_MAX = 2**31 - 1
+_MAX_RESOURCE_BYTES = 256 * 1024 * 1024
+_ACTUAL_INT_TYPES = frozenset(
+    {
+        int,
+        np.int8,
+        np.int16,
+        np.int32,
+        np.int64,
+        np.uint8,
+        np.uint16,
+        np.uint32,
+        np.uint64,
+        np.longlong,
+        np.ulonglong,
+    }
+)
+
+
+def _require_int32(name: str, value: object, *, minimum: int) -> int:
+    if type(value) not in _ACTUAL_INT_TYPES:
+        raise ValueError(f"{name} must be an integer in [{minimum}, {_INT32_MAX}]")
+    canonical = operator.index(cast(SupportsIndex, value))
+    if not minimum <= canonical <= _INT32_MAX:
+        raise ValueError(f"{name} must be an integer in [{minimum}, {_INT32_MAX}]")
+    return canonical
+
+
+def _require_hidden_sizes(hidden_sizes: object) -> tuple[int, ...]:
+    if type(hidden_sizes) is not tuple:
+        raise ValueError("hidden_sizes must be an actual tuple")
+    return tuple(
+        _require_int32(f"hidden_sizes[{index}]", width, minimum=1)
+        for index, width in enumerate(hidden_sizes)
+    )
+
+
+def _preflight_float32_resources(name: str, scalar_count: int) -> None:
+    byte_count = 4 * scalar_count
+    if scalar_count > _INT32_MAX or byte_count > _INT32_MAX:
+        raise ValueError(f"{name} resource must fit signed-int32 scalar and byte bounds")
+    if byte_count > _MAX_RESOURCE_BYTES:
+        raise ValueError(f"{name} resource must not exceed the 256 MiB budget")
 
 
 def _skip_zero_scale(scale: Array, value: Array) -> Array:
@@ -194,6 +240,8 @@ class LinearLearner:
         Returns:
             Initial learner state with zero weights and bias
         """
+        feature_dim = _require_int32("feature_dim", feature_dim, minimum=1)
+        _preflight_float32_resources("linear learner state", feature_dim + 2)
         optimizer_state = self._optimizer.init(feature_dim)
 
         normalizer_state = None
@@ -927,7 +975,7 @@ class MLPLearner:
             neuron_utility_decay: EMA decay for neuron utility (default 0.99).
                 Higher values track slower, smoother utility signals.
         """
-        self._hidden_sizes = hidden_sizes
+        self._hidden_sizes = _require_hidden_sizes(hidden_sizes)
         self._optimizer: AnyOptimizer = optimizer or LMS(step_size=step_size)
         self._head_optimizer: AnyOptimizer | None = head_optimizer
         if not self._optimizer.supported_for_mlp():
@@ -1140,8 +1188,20 @@ class MLPLearner:
         Returns:
             Initial MLP learner state with sparse weights and zero biases
         """
-        # Build layer sizes: [feature_dim, hidden1, hidden2, ..., 1]
+        feature_dim = _require_int32("feature_dim", feature_dim, minimum=1)
         layer_sizes = [feature_dim, *self._hidden_sizes, 1]
+        parameter_count = sum(
+            fan_out * (fan_in + 1)
+            for fan_in, fan_out in zip(layer_sizes, layer_sizes[1:])
+        )
+        utility_count = sum(self._hidden_sizes) if self._track_neuron_utility else 0
+        # Parameters, traces, optimizer working/state copies, and optional utility.
+        _preflight_float32_resources(
+            "MLP learner state and initialization work",
+            8 * parameter_count + utility_count + 3,
+        )
+
+        # Build layer sizes: [feature_dim, hidden1, hidden2, ..., 1]
 
         weights_list = []
         biases_list = []
@@ -1749,6 +1809,8 @@ class TDLinearLearner:
         Returns:
             Initial TD learner state with zero weights and bias
         """
+        feature_dim = _require_int32("feature_dim", feature_dim, minimum=1)
+        _preflight_float32_resources("TD learner state", feature_dim + 2)
         optimizer_state = self._optimizer.init(feature_dim)
 
         return TDLearnerState(
@@ -1922,6 +1984,8 @@ class TrueOnlineTDLearner:
 
     def init(self, feature_dim: int) -> TrueOnlineTDState:
         """Initialize learner state."""
+        feature_dim = _require_int32("feature_dim", feature_dim, minimum=1)
+        _preflight_float32_resources("true-online TD state", 2 * feature_dim + 5)
         return TrueOnlineTDState(
             weights=jnp.zeros(feature_dim, dtype=jnp.float32),
             bias=jnp.array(0.0, dtype=jnp.float32),
