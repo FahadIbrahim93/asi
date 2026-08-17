@@ -725,13 +725,21 @@ def load_emnist_balanced_train(
 
 def _stderr(values: np.ndarray) -> float:
     if values.shape[0] < 2:
-        return 0.0
+        raise ValueError(
+            "stderr is undefined for fewer than two observations; "
+            "refusing to report a look-alike zero"
+        )
     return float(values.std(ddof=1) / math.sqrt(values.shape[0]))
 
 
 def summarize_result(result: LabelEMNISTRunResult) -> dict[str, Any]:
     """Reduce one learner's run to JSON-serializable summary statistics."""
     accuracy = result.average_online_accuracy
+    if accuracy.shape[0] < 2:
+        raise ValueError(
+            "stderr is undefined for fewer than two observations; "
+            "refusing to report a look-alike zero"
+        )
     quarter = max(1, result.config.n_tasks // 4)
     per_seed_first = result.per_task_accuracy[:, :quarter].mean(axis=1)
     per_seed_last = result.per_task_accuracy[:, -quarter:].mean(axis=1)

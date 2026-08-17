@@ -22,6 +22,7 @@ from alberta_framework.benchmarks.upgd_label_emnist import (
     UPGD_EMA_NORM_SIGMA0_HYPERPARAMETERS,
     UPGD_W_PROTOCOL_HYPERPARAMETERS,
     LabelEMNISTConfig,
+    LabelEMNISTRunResult,
     build_artifact,
     build_comparison,
     build_plan_payload,
@@ -702,9 +703,39 @@ class TestPlanShardMergeAccounting:
         with pytest.raises(ValueError, match="not planned"):
             merge_partials(plan, [path], allow_incomplete=True)
 
+    def _synthetic_result(self, accuracies: np.ndarray) -> LabelEMNISTRunResult:
+        n_seeds = int(accuracies.shape[0])
+        return LabelEMNISTRunResult(
+            learner="adamw",
+            hyperparameters=dict(ADAMW_PROTOCOL_HYPERPARAMETERS),
+            seeds=tuple(range(n_seeds)),
+            config=TINY,
+            per_task_accuracy=np.broadcast_to(
+                accuracies[:, None], (n_seeds, TINY.n_tasks)
+            ).copy(),
+            per_task_loss=np.zeros((n_seeds, TINY.n_tasks)),
+            per_task_plasticity=np.zeros((n_seeds, TINY.n_tasks)),
+            average_online_accuracy=np.asarray(accuracies, dtype=np.float64),
+            wall_clock_seconds=0.0,
+        )
+
+    def test_summarize_result_refuses_vacuous_single_seed_stderr(self):
+        with pytest.raises(ValueError, match="fewer than two observations"):
+            summarize_result(self._synthetic_result(np.asarray([0.5])))
+        with pytest.raises(ValueError, match="fewer than two observations"):
+            summarize_result(self._synthetic_result(np.asarray([], dtype=np.float64)))
+
+    def test_summarize_result_two_seed_stderr_is_sample_se(self):
+        values = np.asarray([0.25, 0.75], dtype=np.float64)
+        summary = summarize_result(self._synthetic_result(values))
+        expected = float(values.std(ddof=1) / np.sqrt(values.shape[0]))
+        assert summary["n_seeds"] == 2
+        assert summary["average_online_accuracy_stderr"] == expected
+
     def test_summary_and_comparison_flag_logic(self):
-        upgd = self._result("upgd_w", 0)
-        adam = self._result("adamw", 0)
+        x, y = _tiny_data()
+        upgd = run_label_emnist(x, y, "upgd_w", seeds=[0, 1], config=TINY)
+        adam = run_label_emnist(x, y, "adamw", seeds=[0, 1], config=TINY)
         summaries = {"upgd_w": summarize_result(upgd), "adamw": summarize_result(adam)}
         comparison = build_comparison(summaries)
         assert set(comparison["learners"]) == {"upgd_w", "adamw"}
