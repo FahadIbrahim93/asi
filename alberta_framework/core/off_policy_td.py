@@ -51,9 +51,10 @@ Reference:
 from __future__ import annotations
 
 import functools
+import math
 import operator
 import time
-from collections.abc import Mapping
+from numbers import Real
 from typing import Any, SupportsIndex, cast
 
 import chex
@@ -85,64 +86,39 @@ _ACTUAL_INT_TYPES = frozenset(
         np.ulonglong,
     }
 )
-_TRUSTED_REAL_TYPES = (
-    _ACTUAL_INT_TYPES | frozenset(np.dtype(code).type for code in ("e", "f", "d", "g")) | {float}
-)
+_ACTUAL_FLOAT_TYPES = frozenset({float, np.float16, np.float32, np.float64, np.longdouble})
 
 
-def _require_int32(name: str, value: object, *, minimum: int, maximum: int = _INT32_MAX) -> int:
+def _require_feature_dim(
+    value: object, *, vectors: int, fixed_scalars: int, augmented: bool = False
+) -> int:
+    maximum = _INT32_MAX - 1 if augmented else _INT32_MAX
     if type(value) not in _ACTUAL_INT_TYPES:
-        raise ValueError(f"{name} must be an integer in [{minimum}, {maximum}]")
-    canonical = operator.index(cast(SupportsIndex, value))
-    if not minimum <= canonical <= maximum:
-        raise ValueError(f"{name} must be an integer in [{minimum}, {maximum}]")
-    return canonical
+        raise ValueError(f"feature_dim must be an integer in [1, {maximum}]")
+    feature_dim = operator.index(cast(SupportsIndex, value))
+    if not 1 <= feature_dim <= maximum:
+        raise ValueError(f"feature_dim must be an integer in [1, {maximum}]")
+    width = feature_dim + 1 if augmented else feature_dim
+    scalar_count = vectors * width + fixed_scalars
+    if 4 * scalar_count > _INT32_MAX:
+        raise ValueError("derived state_nbytes must fit in signed int32")
+    return feature_dim
 
 
-def _require_float32(name: str, value: object, **bounds: Any) -> float:
-    if type(value) not in _TRUSTED_REAL_TYPES:
-        raise ValueError(f"{name} must be a finite real scalar")
-    return validated_float32_scalar(name, value, **bounds)
-
-
-def _require_positive_clip(name: str, value: object) -> float:
-    if type(value) not in _TRUSTED_REAL_TYPES:
-        raise ValueError(f"{name} must be a positive real scalar")
-    concrete = float(cast(Any, value))
-    if concrete == float("inf"):
-        return concrete
-    return validated_float32_scalar(name, value, positive=True)
-
-
-def _require_state_resources(name: str, *, scalars: int, bytes_: int) -> None:
-    if scalars > _INT32_MAX:
-        raise ValueError(f"derived {name} state scalars must fit signed int32")
-    if bytes_ > _INT32_MAX:
-        raise ValueError(f"derived {name} state bytes must fit signed int32")
-
-
-def _serialized_payload(
-    config: Mapping[str, Any], *, type_name: str, fields: frozenset[str]
-) -> dict[str, Any]:
-    if not issubclass(type(config), Mapping):
-        raise ValueError("config must be an actual mapping")
+def _positive_float32_or_infinity(name: str, value: object) -> float:
+    """Preserve the documented infinity sentinel but reject finite overflow."""
+    actual_type = type(value)
+    if issubclass(actual_type, bool) or not issubclass(actual_type, Real):
+        raise ValueError(f"{name} must be positive or infinity")
     try:
-        payload = dict(config)
+        numeric_value = cast(Any, value)
+        if actual_type in _ACTUAL_FLOAT_TYPES and bool(np.isinf(numeric_value)):
+            if bool(np.signbit(numeric_value)):
+                raise ValueError(f"{name} must be positive or infinity")
+            return math.inf
     except Exception as error:
-        raise ValueError("config must be a readable mapping") from error
-    if any(type(key) is not str for key in payload) or set(payload) != fields | {"type"}:
-        raise ValueError("config fields do not match the serialized schema")
-    marker = payload.pop("type")
-    if type(marker) is not str or marker != type_name:
-        raise ValueError("config type differs")
-    if any(type(value) not in (int, float) for value in payload.values()):
-        raise ValueError("serialized scalar fields must be exact JSON numbers")
-    return payload
-
-
-def _saturating_increment(value: Array) -> Array:
-    maximum = jnp.asarray(_INT32_MAX, dtype=jnp.int32)
-    return jnp.minimum(jnp.maximum(value, 0), maximum - 1) + 1
+        raise ValueError(f"{name} must be positive or infinity") from error
+    return validated_float32_scalar(name, value, positive=True)
 
 
 def _skip_zero_scale(scale: Array, value: Array) -> Array:
@@ -153,6 +129,44 @@ def _skip_zero_scale(scale: Array, value: Array) -> Array:
 def _zero_if_unused(scale: Array, value: Array) -> Array:
     """Sanitize leftover inf only in the finite-state check when unused."""
     return jnp.where(scale == 0.0, jnp.zeros_like(value), value)
+
+
+def _array_metadata(name: str, value: object, shape: tuple[int, ...]) -> Array:
+    """Require exact float32 host metadata before a value reaches JAX."""
+    try:
+        actual_shape = tuple(value.shape)  # type: ignore[attr-defined]
+        actual_dtype = np.dtype(value.dtype)  # type: ignore[attr-defined]
+    except Exception as error:
+        raise ValueError(f"{name} must expose array shape and dtype metadata") from error
+    if actual_shape != shape or actual_dtype != np.dtype(np.float32):
+        raise ValueError(f"{name} must have shape {shape} and dtype float32")
+    return cast(Array, value)
+
+
+def _scalar_operand(name: str, value: object) -> Array:
+    if type(value) in _ACTUAL_INT_TYPES | _ACTUAL_FLOAT_TYPES:
+        canonical = validated_float32_scalar(name, value)
+        return jnp.asarray(canonical, dtype=jnp.float32)
+    return _array_metadata(name, value, ())
+
+
+def _stable_rms(values: Array) -> Array:
+    scale = jnp.max(jnp.abs(values), initial=0.0)
+    absolute = jnp.abs(values)
+    normalized = jnp.where(
+        absolute == scale,
+        jnp.sign(values),
+        jnp.where(scale > 0.0, values / scale, 0.0),
+    )
+    return scale * jnp.sqrt(jnp.mean(jnp.square(normalized)))
+
+
+def _require_scan_resources(num_steps: int, feature_dim: int) -> None:
+    # Five inputs plus five outputs (four scalar vectors and six-column metrics),
+    # with observation-width inputs and the complete three-vector carry/work set.
+    logical_scalars = num_steps * (2 * feature_dim + 15) + 12 * feature_dim + 32
+    if logical_scalars > _INT32_MAX or 4 * logical_scalars > _INT32_MAX:
+        raise ValueError("learning-loop aggregate resources exceed signed-int32 bounds")
 
 
 # =============================================================================
@@ -296,6 +310,73 @@ class GradientTDArrayResult:
     updates_applied: Bool[Array, " num_steps"]
 
 
+def _off_policy_state_contract(state: object) -> tuple[OffPolicyTDState, int]:
+    if type(state) is not OffPolicyTDState:
+        raise ValueError("state must be an OffPolicyTDState")
+    checked = state
+    try:
+        feature_dim = tuple(checked.weights.shape)[0]
+    except Exception as error:
+        raise ValueError("state.weights must expose array metadata") from error
+    _array_metadata("state.weights", checked.weights, (feature_dim,))
+    _array_metadata("state.bias", checked.bias, ())
+    _array_metadata("state.eligibility_traces", checked.eligibility_traces, (feature_dim,))
+    _array_metadata("state.bias_eligibility_trace", checked.bias_eligibility_trace, ())
+    try:
+        step_shape = tuple(checked.step_count.shape)
+        step_dtype = np.dtype(checked.step_count.dtype)
+    except Exception as error:
+        raise ValueError("state.step_count must expose array metadata") from error
+    if step_shape != () or step_dtype != np.dtype(np.int32):
+        raise ValueError("state.step_count must be a scalar int32")
+    return checked, feature_dim
+
+
+def _etd_state_contract(state: object) -> tuple[ETDState, int]:
+    if type(state) is not ETDState:
+        raise ValueError("state must be an ETDState")
+    checked = state
+    try:
+        feature_dim = tuple(checked.weights.shape)[0]
+    except Exception as error:
+        raise ValueError("state.weights must expose array metadata") from error
+    _array_metadata("state.weights", checked.weights, (feature_dim,))
+    _array_metadata("state.bias", checked.bias, ())
+    _array_metadata("state.eligibility_traces", checked.eligibility_traces, (feature_dim,))
+    for name in ("bias_eligibility_trace", "follow_on_trace", "emphasis"):
+        _array_metadata(f"state.{name}", getattr(checked, name), ())
+    try:
+        step_shape = tuple(checked.step_count.shape)
+        step_dtype = np.dtype(checked.step_count.dtype)
+    except Exception as error:
+        raise ValueError("state.step_count must expose array metadata") from error
+    if step_shape != () or step_dtype != np.dtype(np.int32):
+        raise ValueError("state.step_count must be a scalar int32")
+    return checked, feature_dim
+
+
+def _gradient_state_contract(state: object) -> tuple[GradientTDState, int]:
+    if type(state) is not GradientTDState:
+        raise ValueError("state must be a GradientTDState")
+    checked = state
+    try:
+        augmented_dim = tuple(checked.weights.shape)[0]
+    except Exception as error:
+        raise ValueError("state.weights must expose array metadata") from error
+    if augmented_dim < 2:
+        raise ValueError("state augmented feature dimension must be at least two")
+    for name in ("weights", "secondary_weights", "eligibility_traces"):
+        _array_metadata(f"state.{name}", getattr(checked, name), (augmented_dim,))
+    try:
+        step_shape = tuple(checked.step_count.shape)
+        step_dtype = np.dtype(checked.step_count.dtype)
+    except Exception as error:
+        raise ValueError("state.step_count must expose array metadata") from error
+    if step_shape != () or step_dtype != np.dtype(np.int32):
+        raise ValueError("state.step_count must be a scalar int32")
+    return checked, augmented_dim - 1
+
+
 # =============================================================================
 # Learner
 # =============================================================================
@@ -337,9 +418,11 @@ class OffPolicyTDLinearLearner:
             retrace_clip: Maximum allowed importance ratio (default 1.0;
                 pass float("inf") to disable clipping).
         """
-        self._step_size = _require_float32("step_size", step_size, positive=True)
-        self._trace_decay = _require_float32("trace_decay", trace_decay, lower=0.0, upper=1.0)
-        self._retrace_clip = _require_positive_clip("retrace_clip", retrace_clip)
+        self._step_size = validated_float32_scalar("step_size", step_size, positive=True)
+        self._trace_decay = validated_float32_scalar(
+            "trace_decay", trace_decay, lower=0.0, upper=1.0
+        )
+        self._retrace_clip = _positive_float32_or_infinity("retrace_clip", retrace_clip)
 
     @property
     def step_size(self) -> float:
@@ -358,10 +441,7 @@ class OffPolicyTDLinearLearner:
 
     def init(self, feature_dim: int) -> OffPolicyTDState:
         """Initialize learner state with zero weights and zero traces."""
-        feature_dim = _require_int32("feature_dim", feature_dim, minimum=1)
-        _require_state_resources(
-            "OffPolicyTD", scalars=2 * feature_dim + 5, bytes_=8 * feature_dim + 20
-        )
+        feature_dim = _require_feature_dim(feature_dim, vectors=2, fixed_scalars=3)
         return OffPolicyTDState(  # type: ignore[call-arg]
             weights=jnp.zeros(feature_dim, dtype=jnp.float32),
             bias=jnp.array(0.0, dtype=jnp.float32),
@@ -372,12 +452,16 @@ class OffPolicyTDLinearLearner:
             uptime_s=0.0,
         )
 
-    @functools.partial(jax.jit, static_argnums=(0,))
     def predict(self, state: OffPolicyTDState, observation: Observation) -> Float[Array, " 1"]:
         """Compute V(s) = w . phi(s) + b."""
-        return jnp.atleast_1d(jnp.dot(state.weights, observation) + state.bias)
+        state, feature_dim = _off_policy_state_contract(state)
+        observation = _array_metadata("observation", observation, (feature_dim,))
+        return cast(Array, self._predict_jit(state, observation))
 
     @functools.partial(jax.jit, static_argnums=(0,))
+    def _predict_jit(self, state: OffPolicyTDState, observation: Observation) -> Float[Array, " 1"]:
+        return jnp.atleast_1d(jnp.dot(state.weights, observation) + state.bias)
+
     def update(
         self,
         state: OffPolicyTDState,
@@ -402,6 +486,33 @@ class OffPolicyTDLinearLearner:
             ``OffPolicyTDUpdateResult`` with updated state, prediction,
             TD error, clipped IS ratio, and a metrics array of shape (5,).
         """
+        state, feature_dim = _off_policy_state_contract(state)
+        observation = _array_metadata("observation", observation, (feature_dim,))
+        next_observation = _array_metadata("next_observation", next_observation, (feature_dim,))
+        reward = _scalar_operand("reward", reward)
+        gamma = _scalar_operand("gamma", gamma)
+        rho = _scalar_operand("rho", rho)
+        result = self._update_jit(state, observation, reward, next_observation, gamma, rho)
+        return cast(
+            OffPolicyTDUpdateResult,
+            result.replace(
+                state=result.state.replace(
+                    birth_timestamp=state.birth_timestamp,
+                    uptime_s=state.uptime_s,
+                )
+            ),
+        )
+
+    @functools.partial(jax.jit, static_argnums=(0,))
+    def _update_jit(
+        self,
+        state: OffPolicyTDState,
+        observation: Observation,
+        reward: Array,
+        next_observation: Observation,
+        gamma: Array,
+        rho: Array,
+    ) -> OffPolicyTDUpdateResult:
         alpha = jnp.asarray(self._step_size, dtype=jnp.float32)
         lam = jnp.asarray(self._trace_decay, dtype=jnp.float32)
         clip = jnp.asarray(self._retrace_clip, dtype=jnp.float32)
@@ -432,7 +543,7 @@ class OffPolicyTDLinearLearner:
             bias=state.bias + scaled_update * new_e_b,
             eligibility_traces=new_e,
             bias_eligibility_trace=new_e_b,
-            step_count=_saturating_increment(state.step_count),
+            step_count=jnp.minimum(state.step_count, _INT32_MAX - 1) + 1,
             birth_timestamp=state.birth_timestamp,
             uptime_s=state.uptime_s,
         )
@@ -448,22 +559,21 @@ class OffPolicyTDLinearLearner:
             eligibility_traces=_zero_if_unused(decay, state.eligibility_traces),
             bias_eligibility_trace=_zero_if_unused(decay, state.bias_eligibility_trace),
         )
+        squared_td = td_error**2
+        mean_e = jnp.mean(jnp.abs(proposed_state.eligibility_traces))
+        candidate_metrics = jnp.array(
+            [squared_td, td_error, rho_clipped, alpha, mean_e], dtype=jnp.float32
+        )
         update_applied = (
             inputs_valid
             & _floating_tree_is_finite(previous_checked)
             & _floating_tree_is_finite(proposed_state)
+            & jnp.all(jnp.isfinite(candidate_metrics))
         )
         new_state = jax.lax.cond(
             update_applied,
             lambda: proposed_state,
             lambda: state,
-        )
-
-        squared_td = td_error**2
-        mean_e = jnp.mean(jnp.abs(new_state.eligibility_traces))
-        metrics = jnp.array(
-            [squared_td, td_error, rho_clipped, alpha, mean_e],
-            dtype=jnp.float32,
         )
 
         return OffPolicyTDUpdateResult(  # type: ignore[call-arg]
@@ -473,7 +583,7 @@ class OffPolicyTDLinearLearner:
             ),
             td_error=jnp.where(update_applied, td_error, jnp.zeros_like(td_error)),
             rho_clipped=jnp.where(update_applied, rho_clipped, jnp.zeros_like(rho_clipped)),
-            metrics=jnp.where(update_applied, metrics, jnp.zeros_like(metrics)),
+            metrics=jnp.where(update_applied, candidate_metrics, jnp.zeros_like(candidate_metrics)),
             update_applied=update_applied,
         )
 
@@ -487,15 +597,11 @@ class OffPolicyTDLinearLearner:
         }
 
     @classmethod
-    def from_config(cls, config: Mapping[str, Any]) -> OffPolicyTDLinearLearner:
+    def from_config(cls, config: dict[str, Any]) -> OffPolicyTDLinearLearner:
         """Reconstruct from dict."""
-        return cls(
-            **_serialized_payload(
-                config,
-                type_name=cls.__name__,
-                fields=frozenset({"step_size", "trace_decay", "retrace_clip"}),
-            )
-        )
+        config = dict(config)
+        config.pop("type", None)
+        return cls(**config)
 
 
 class ETDLinearLearner:
@@ -529,8 +635,10 @@ class ETDLinearLearner:
             step_size: Learning rate alpha (scalar)
             trace_decay: Eligibility trace decay lambda in [0, 1]
         """
-        self._step_size = _require_float32("step_size", step_size, positive=True)
-        self._trace_decay = _require_float32("trace_decay", trace_decay, lower=0.0, upper=1.0)
+        self._step_size = validated_float32_scalar("step_size", step_size, positive=True)
+        self._trace_decay = validated_float32_scalar(
+            "trace_decay", trace_decay, lower=0.0, upper=1.0
+        )
 
     @property
     def step_size(self) -> float:
@@ -544,8 +652,7 @@ class ETDLinearLearner:
 
     def init(self, feature_dim: int) -> ETDState:
         """Initialize learner state with zero weights and zero traces."""
-        feature_dim = _require_int32("feature_dim", feature_dim, minimum=1)
-        _require_state_resources("ETD", scalars=2 * feature_dim + 7, bytes_=8 * feature_dim + 28)
+        feature_dim = _require_feature_dim(feature_dim, vectors=2, fixed_scalars=5)
         return ETDState(  # type: ignore[call-arg]
             weights=jnp.zeros(feature_dim, dtype=jnp.float32),
             bias=jnp.array(0.0, dtype=jnp.float32),
@@ -558,12 +665,16 @@ class ETDLinearLearner:
             uptime_s=0.0,
         )
 
-    @functools.partial(jax.jit, static_argnums=(0,))
     def predict(self, state: ETDState, observation: Observation) -> Float[Array, " 1"]:
         """Compute V(s) = w . phi(s) + b."""
-        return jnp.atleast_1d(jnp.dot(state.weights, observation) + state.bias)
+        state, feature_dim = _etd_state_contract(state)
+        observation = _array_metadata("observation", observation, (feature_dim,))
+        return cast(Array, self._predict_jit(state, observation))
 
     @functools.partial(jax.jit, static_argnums=(0,))
+    def _predict_jit(self, state: ETDState, observation: Observation) -> Float[Array, " 1"]:
+        return jnp.atleast_1d(jnp.dot(state.weights, observation) + state.bias)
+
     def update(
         self,
         state: ETDState,
@@ -589,6 +700,37 @@ class ETDLinearLearner:
             ``ETDUpdateResult`` with updated state, prediction, TD error,
             follow-on trace, emphasis, and a metrics array of shape (7,).
         """
+        state, feature_dim = _etd_state_contract(state)
+        observation = _array_metadata("observation", observation, (feature_dim,))
+        next_observation = _array_metadata("next_observation", next_observation, (feature_dim,))
+        reward = _scalar_operand("reward", reward)
+        gamma = _scalar_operand("gamma", gamma)
+        rho = _scalar_operand("rho", rho)
+        interest = _scalar_operand("interest", interest)
+        result = self._update_jit(
+            state, observation, reward, next_observation, gamma, rho, interest
+        )
+        return cast(
+            ETDUpdateResult,
+            result.replace(
+                state=result.state.replace(
+                    birth_timestamp=state.birth_timestamp,
+                    uptime_s=state.uptime_s,
+                )
+            ),
+        )
+
+    @functools.partial(jax.jit, static_argnums=(0,))
+    def _update_jit(
+        self,
+        state: ETDState,
+        observation: Observation,
+        reward: Array,
+        next_observation: Observation,
+        gamma: Array,
+        rho: Array,
+        interest: Array,
+    ) -> ETDUpdateResult:
         alpha = jnp.asarray(self._step_size, dtype=jnp.float32)
         lam = jnp.asarray(self._trace_decay, dtype=jnp.float32)
         gamma_s = jnp.squeeze(gamma).astype(jnp.float32)
@@ -616,7 +758,7 @@ class ETDLinearLearner:
             bias_eligibility_trace=new_e_b,
             follow_on_trace=follow_on,
             emphasis=emphasis,
-            step_count=_saturating_increment(state.step_count),
+            step_count=jnp.minimum(state.step_count, _INT32_MAX - 1) + 1,
             birth_timestamp=state.birth_timestamp,
             uptime_s=state.uptime_s,
         )
@@ -633,22 +775,22 @@ class ETDLinearLearner:
             bias_eligibility_trace=_zero_if_unused(trace_decay, state.bias_eligibility_trace),
             follow_on_trace=_zero_if_unused(gamma_s, state.follow_on_trace),
         )
+        squared_td = td_error**2
+        mean_e = jnp.mean(jnp.abs(proposed_state.eligibility_traces))
+        candidate_metrics = jnp.array(
+            [squared_td, td_error, rho_s, alpha, mean_e, follow_on, emphasis],
+            dtype=jnp.float32,
+        )
         update_applied = (
             inputs_valid
             & _floating_tree_is_finite(previous_checked)
             & _floating_tree_is_finite(proposed_state)
+            & jnp.all(jnp.isfinite(candidate_metrics))
         )
         new_state = jax.lax.cond(
             update_applied,
             lambda: proposed_state,
             lambda: state,
-        )
-
-        squared_td = td_error**2
-        mean_e = jnp.mean(jnp.abs(new_state.eligibility_traces))
-        metrics = jnp.array(
-            [squared_td, td_error, rho_s, alpha, mean_e, follow_on, emphasis],
-            dtype=jnp.float32,
         )
 
         return ETDUpdateResult(  # type: ignore[call-arg]
@@ -659,7 +801,7 @@ class ETDLinearLearner:
             td_error=jnp.where(update_applied, td_error, jnp.zeros_like(td_error)),
             follow_on_trace=jnp.where(update_applied, follow_on, jnp.zeros_like(follow_on)),
             emphasis=jnp.where(update_applied, emphasis, jnp.zeros_like(emphasis)),
-            metrics=jnp.where(update_applied, metrics, jnp.zeros_like(metrics)),
+            metrics=jnp.where(update_applied, candidate_metrics, jnp.zeros_like(candidate_metrics)),
             update_applied=update_applied,
         )
 
@@ -672,15 +814,11 @@ class ETDLinearLearner:
         }
 
     @classmethod
-    def from_config(cls, config: Mapping[str, Any]) -> ETDLinearLearner:
+    def from_config(cls, config: dict[str, Any]) -> ETDLinearLearner:
         """Reconstruct from dict."""
-        return cls(
-            **_serialized_payload(
-                config,
-                type_name=cls.__name__,
-                fields=frozenset({"step_size", "trace_decay"}),
-            )
-        )
+        config = dict(config)
+        config.pop("type", None)
+        return cls(**config)
 
 
 class GradientTDLinearLearner:
@@ -708,12 +846,14 @@ class GradientTDLinearLearner:
         ratio_clip: float = 10.0,
     ):
         """Initialize the learner."""
-        self._step_size = _require_float32("step_size", step_size, positive=True)
-        self._secondary_step_size = _require_float32(
+        self._step_size = validated_float32_scalar("step_size", step_size, positive=True)
+        self._secondary_step_size = validated_float32_scalar(
             "secondary_step_size", secondary_step_size, lower=0.0
         )
-        self._trace_decay = _require_float32("trace_decay", trace_decay, lower=0.0, upper=1.0)
-        self._ratio_clip = _require_positive_clip("ratio_clip", ratio_clip)
+        self._trace_decay = validated_float32_scalar(
+            "trace_decay", trace_decay, lower=0.0, upper=1.0
+        )
+        self._ratio_clip = _positive_float32_or_infinity("ratio_clip", ratio_clip)
 
     @property
     def step_size(self) -> float:
@@ -737,11 +877,8 @@ class GradientTDLinearLearner:
 
     def init(self, feature_dim: int) -> GradientTDState:
         """Initialize primary weights, secondary weights, and traces."""
-        feature_dim = _require_int32("feature_dim", feature_dim, minimum=1, maximum=_INT32_MAX - 1)
+        feature_dim = _require_feature_dim(feature_dim, vectors=3, fixed_scalars=1, augmented=True)
         augmented_dim = feature_dim + 1
-        _require_state_resources(
-            "GradientTD", scalars=3 * augmented_dim + 3, bytes_=12 * augmented_dim + 12
-        )
         return GradientTDState(  # type: ignore[call-arg]
             weights=jnp.zeros(augmented_dim, dtype=jnp.float32),
             secondary_weights=jnp.zeros(augmented_dim, dtype=jnp.float32),
@@ -761,12 +898,16 @@ class GradientTDLinearLearner:
             )
         )
 
-    @functools.partial(jax.jit, static_argnums=(0,))
     def predict(self, state: GradientTDState, observation: Observation) -> Float[Array, " 1"]:
         """Compute ``theta^T phi`` with an appended bias feature."""
-        return jnp.atleast_1d(jnp.dot(state.weights, self._augment(observation)))
+        state, feature_dim = _gradient_state_contract(state)
+        observation = _array_metadata("observation", observation, (feature_dim,))
+        return cast(Array, self._predict_jit(state, observation))
 
     @functools.partial(jax.jit, static_argnums=(0,))
+    def _predict_jit(self, state: GradientTDState, observation: Observation) -> Float[Array, " 1"]:
+        return jnp.atleast_1d(jnp.dot(state.weights, self._augment(observation)))
+
     def update(
         self,
         state: GradientTDState,
@@ -777,6 +918,33 @@ class GradientTDLinearLearner:
         rho: Array,
     ) -> GradientTDUpdateResult:
         """Apply one off-policy Gradient-TD/TDC update."""
+        state, feature_dim = _gradient_state_contract(state)
+        observation = _array_metadata("observation", observation, (feature_dim,))
+        next_observation = _array_metadata("next_observation", next_observation, (feature_dim,))
+        reward = _scalar_operand("reward", reward)
+        gamma = _scalar_operand("gamma", gamma)
+        rho = _scalar_operand("rho", rho)
+        result = self._update_jit(state, observation, reward, next_observation, gamma, rho)
+        return cast(
+            GradientTDUpdateResult,
+            result.replace(
+                state=result.state.replace(
+                    birth_timestamp=state.birth_timestamp,
+                    uptime_s=state.uptime_s,
+                )
+            ),
+        )
+
+    @functools.partial(jax.jit, static_argnums=(0,))
+    def _update_jit(
+        self,
+        state: GradientTDState,
+        observation: Observation,
+        reward: Array,
+        next_observation: Observation,
+        gamma: Array,
+        rho: Array,
+    ) -> GradientTDUpdateResult:
         alpha = jnp.asarray(self._step_size, dtype=jnp.float32)
         beta = jnp.asarray(self._secondary_step_size, dtype=jnp.float32)
         lam = jnp.asarray(self._trace_decay, dtype=jnp.float32)
@@ -806,7 +974,7 @@ class GradientTDLinearLearner:
             weights=state.weights + primary_step,
             secondary_weights=state.secondary_weights + secondary_step,
             eligibility_traces=traces,
-            step_count=_saturating_increment(state.step_count),
+            step_count=jnp.minimum(state.step_count, _INT32_MAX - 1) + 1,
             birth_timestamp=state.birth_timestamp,
             uptime_s=state.uptime_s,
         )
@@ -820,26 +988,27 @@ class GradientTDLinearLearner:
         previous_checked = state.replace(  # type: ignore[attr-defined]
             eligibility_traces=_zero_if_unused(gamma_s * lam, state.eligibility_traces),
         )
+        candidate_metrics = jnp.array(
+            [
+                td_error**2,
+                td_error,
+                rho_clipped,
+                _stable_rms(proposed_state.weights),
+                _stable_rms(proposed_state.secondary_weights),
+                jnp.mean(jnp.abs(proposed_state.eligibility_traces)),
+            ],
+            dtype=jnp.float32,
+        )
         update_applied = (
             inputs_valid
             & _floating_tree_is_finite(previous_checked)
             & _floating_tree_is_finite(proposed_state)
+            & jnp.all(jnp.isfinite(candidate_metrics))
         )
         new_state = jax.lax.cond(
             update_applied,
             lambda: proposed_state,
             lambda: state,
-        )
-        metrics = jnp.array(
-            [
-                td_error**2,
-                td_error,
-                rho_clipped,
-                jnp.sqrt(jnp.mean(new_state.weights**2)),
-                jnp.sqrt(jnp.mean(new_state.secondary_weights**2)),
-                jnp.mean(jnp.abs(new_state.eligibility_traces)),
-            ],
-            dtype=jnp.float32,
         )
         return GradientTDUpdateResult(  # type: ignore[call-arg]
             state=new_state,
@@ -850,7 +1019,7 @@ class GradientTDLinearLearner:
             ),
             td_error=jnp.where(update_applied, td_error, jnp.zeros_like(td_error)),
             rho_clipped=jnp.where(update_applied, rho_clipped, jnp.zeros_like(rho_clipped)),
-            metrics=jnp.where(update_applied, metrics, jnp.zeros_like(metrics)),
+            metrics=jnp.where(update_applied, candidate_metrics, jnp.zeros_like(candidate_metrics)),
             update_applied=update_applied,
         )
 
@@ -865,15 +1034,11 @@ class GradientTDLinearLearner:
         }
 
     @classmethod
-    def from_config(cls, config: Mapping[str, Any]) -> GradientTDLinearLearner:
+    def from_config(cls, config: dict[str, Any]) -> GradientTDLinearLearner:
         """Reconstruct from dict."""
-        return cls(
-            **_serialized_payload(
-                config,
-                type_name=cls.__name__,
-                fields=frozenset({"step_size", "secondary_step_size", "trace_decay", "ratio_clip"}),
-            )
-        )
+        config = dict(config)
+        config.pop("type", None)
+        return cls(**config)
 
 
 def run_gradient_td_learning_loop(
@@ -887,12 +1052,26 @@ def run_gradient_td_learning_loop(
 ) -> GradientTDArrayResult:
     """Run Gradient-TD/TDC over arrays using ``jax.lax.scan``."""
 
+    state, feature_dim = _gradient_state_contract(state)
+    try:
+        observations_shape = tuple(observations.shape)
+    except Exception as error:
+        raise ValueError("observations must expose array metadata") from error
+    if len(observations_shape) != 2 or observations_shape[0] < 1:
+        raise ValueError("observations must have shape (num_steps, feature_dim)")
+    num_steps = observations_shape[0]
+    _array_metadata("observations", observations, (num_steps, feature_dim))
+    _array_metadata("next_observations", next_observations, (num_steps, feature_dim))
+    for name, value in (("rewards", rewards), ("gammas", gammas), ("rhos", rhos)):
+        _array_metadata(name, value, (num_steps,))
+    _require_scan_resources(num_steps, feature_dim)
+
     def step_fn(
         carry: GradientTDState,
         inputs: tuple[Array, Array, Array, Array, Array],
     ) -> tuple[GradientTDState, tuple[Array, Array, Array, Array, Array]]:
         obs, reward, next_obs, gamma, rho = inputs
-        result = learner.update(carry, obs, reward, next_obs, gamma, rho)
+        result = learner._update_jit(carry, obs, reward, next_obs, gamma, rho)
         return (
             result.state,
             (

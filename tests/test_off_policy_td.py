@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from fractions import Fraction
+
 import chex
 import jax.numpy as jnp
 import numpy as np
@@ -795,6 +797,7 @@ class TestZeroGammaDoesNotMultiplyInfBootstrap:
         )
         assert bool(result.update_applied)
         chex.assert_tree_all_finite(result.state.eligibility_traces)
+
         assert bool(jnp.isfinite(result.state.bias_eligibility_trace))
 
     def test_etd_does_not_multiply_inf_follow_on(self) -> None:
@@ -841,66 +844,201 @@ class TestZeroGammaDoesNotMultiplyInfBootstrap:
         chex.assert_tree_all_finite(result.state.eligibility_traces)
 
 
-def test_off_policy_td_learners_integer_validation() -> None:
-    optd = OffPolicyTDLinearLearner()
-    etd = ETDLinearLearner()
-    gtd = GradientTDLinearLearner()
-
-    with pytest.raises(ValueError, match="feature_dim"):
-        optd.init(feature_dim=True)  # type: ignore[arg-type]
-    with pytest.raises(ValueError, match="feature_dim"):
-        etd.init(feature_dim=4.5)  # type: ignore[arg-type]
-    with pytest.raises(ValueError, match="feature_dim"):
-        gtd.init(feature_dim=0)
-
-    s_optd = optd.init(feature_dim=np.int32(4))
-    s_etd = etd.init(feature_dim=np.int64(4))
-    s_gtd = gtd.init(feature_dim=np.int32(4))
-
-    assert s_optd.weights.shape == (4,)
-    assert s_etd.weights.shape == (4,)
-    assert s_gtd.weights.shape == (5,)
-    assert s_gtd.secondary_weights.shape == (5,)
-
-
-@pytest.mark.parametrize(
-    "factory",
-    [OffPolicyTDLinearLearner, ETDLinearLearner, GradientTDLinearLearner],
-)
-def test_off_policy_td_configs_reject_hostile_scalars_without_hooks(factory: type) -> None:
-    calls = 0
-
-    class HostileFloat(float):
-        def as_integer_ratio(self) -> tuple[int, int]:
-            nonlocal calls
-            calls += 1
-            raise AssertionError("hostile hook ran")
-
-    with pytest.raises(ValueError, match="finite real scalar"):
-        factory(step_size=HostileFloat(0.1))
-    assert calls == 0
-
-
 @pytest.mark.parametrize(
     "learner",
     [OffPolicyTDLinearLearner(), ETDLinearLearner(), GradientTDLinearLearner()],
 )
-def test_off_policy_td_serialized_schema_is_exact(learner: object) -> None:
-    config = learner.to_config()  # type: ignore[attr-defined]
-    assert type(learner).from_config(config).to_config() == config
-    with pytest.raises(ValueError, match="schema"):
-        type(learner).from_config({**config, "unknown": 1})
-    with pytest.raises(ValueError, match="type"):
-        type(learner).from_config({**config, "type": "wrong"})
-    scalar = next(name for name in config if name != "type")
-    with pytest.raises(ValueError, match="exact JSON"):
-        type(learner).from_config({**config, scalar: np.float32(config[scalar])})
+@pytest.mark.parametrize("value", [True, np.bool_(True), 1.5, "4", object(), 0])
+def test_feature_dim_rejects_non_integer_families_without_repr(
+    learner: object, value: object
+) -> None:
+    with pytest.raises(ValueError, match="feature_dim"):
+        learner.init(value)  # type: ignore[attr-defined]
 
 
-def test_off_policy_td_preflights_complete_state_bytes_before_allocation() -> None:
-    with pytest.raises(ValueError, match="state bytes"):
-        OffPolicyTDLinearLearner().init((2**31 - 1) // 8)
-    with pytest.raises(ValueError, match="state bytes"):
-        ETDLinearLearner().init((2**31 - 1) // 8)
-    with pytest.raises(ValueError, match="state bytes"):
-        GradientTDLinearLearner().init((2**31 - 1) // 12)
+@pytest.mark.parametrize("code", ("b", "B", "h", "H", "i", "I", "l", "L", "q", "Q"))
+def test_feature_dim_accepts_and_canonicalizes_numpy_integer_families(code: str) -> None:
+    feature_dim = np.dtype(code).type(4)
+    assert OffPolicyTDLinearLearner().init(feature_dim).weights.shape == (4,)
+    assert ETDLinearLearner().init(feature_dim).weights.shape == (4,)
+    assert GradientTDLinearLearner().init(feature_dim).weights.shape == (5,)
+
+
+def test_init_preflights_state_bytes_and_augmented_width_before_allocation() -> None:
+    for learner in (
+        OffPolicyTDLinearLearner(),
+        ETDLinearLearner(),
+        GradientTDLinearLearner(),
+    ):
+        with pytest.raises(ValueError, match="state_nbytes"):
+            learner.init(300_000_000)
+    with pytest.raises(ValueError, match="feature_dim"):
+        GradientTDLinearLearner().init(2**31 - 1)
+
+
+@pytest.mark.parametrize(
+    ("factory", "field"),
+    [
+        (lambda value: OffPolicyTDLinearLearner(step_size=value), "step_size"),
+        (lambda value: ETDLinearLearner(trace_decay=value), "trace_decay"),
+        (
+            lambda value: GradientTDLinearLearner(secondary_step_size=value),
+            "secondary_step_size",
+        ),
+    ],
+)
+def test_config_scalars_reject_hostile_and_float32_invalid_values(
+    factory: object, field: str
+) -> None:
+    for value in (float("nan"), 1.0e100, object()):
+        with pytest.raises(ValueError, match=field):
+            factory(value)  # type: ignore[operator]
+
+
+def test_config_scalars_canonicalize_reals_and_preserve_infinity_clip_sentinel() -> None:
+    off_policy = OffPolicyTDLinearLearner(
+        step_size=Fraction(1, 4),
+        trace_decay=np.float64(0.5),
+        retrace_clip=float("inf"),
+    )
+    gradient = GradientTDLinearLearner(
+        step_size=np.float32(0.25),
+        secondary_step_size=Fraction(1, 2),
+        trace_decay=np.float64(0.5),
+        ratio_clip=np.float64(np.inf),
+    )
+    assert off_policy.step_size == 0.25
+    assert off_policy.trace_decay == 0.5
+    assert off_policy.retrace_clip == float("inf")
+    assert gradient.step_size == 0.25
+    assert gradient.secondary_step_size == 0.5
+    assert gradient.trace_decay == 0.5
+    assert gradient.ratio_clip == float("inf")
+    assert all(
+        type(value) is float
+        for value in (
+            off_policy.step_size,
+            off_policy.trace_decay,
+            gradient.step_size,
+            gradient.secondary_step_size,
+            gradient.trace_decay,
+        )
+    )
+    huge_finite = np.longdouble("1e400")
+    with pytest.raises(ValueError, match="retrace_clip"):
+        OffPolicyTDLinearLearner(retrace_clip=huge_finite)
+    with pytest.raises(ValueError, match="ratio_clip"):
+        GradientTDLinearLearner(ratio_clip=huge_finite)
+
+
+def test_public_boundaries_validate_host_metadata_before_jax_conversion() -> None:
+    class HostileVector:
+        shape = (2,)
+        dtype = np.dtype(np.float64)
+
+        def __jax_array__(self):  # type: ignore[no-untyped-def]
+            raise AssertionError("conversion must not run")
+
+    for learner in (OffPolicyTDLinearLearner(), ETDLinearLearner()):
+        state = learner.init(2)
+        with pytest.raises(ValueError, match="observation"):
+            learner.predict(state, HostileVector())  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="observation"):
+            learner.update(  # type: ignore[attr-defined]
+                state,
+                HostileVector(),
+                jnp.asarray(0.0, dtype=jnp.float32),
+                jnp.zeros(2, dtype=jnp.float32),
+                jnp.asarray(0.0, dtype=jnp.float32),
+                jnp.asarray(1.0, dtype=jnp.float32),
+            )
+    gradient = GradientTDLinearLearner()
+    with pytest.raises(ValueError, match="observation"):
+        gradient.predict(gradient.init(2), HostileVector())  # type: ignore[arg-type]
+
+
+def test_state_metadata_is_hostile_safe_and_counters_saturate() -> None:
+    class HostileLeaf:
+        @property
+        def shape(self):  # type: ignore[no-untyped-def]
+            raise RuntimeError("shape hook")
+
+        def __repr__(self) -> str:
+            raise AssertionError("repr must not run")
+
+    off_policy = OffPolicyTDLinearLearner()
+    malformed = off_policy.init(2).replace(weights=HostileLeaf())
+    with pytest.raises(ValueError, match="state.weights"):
+        off_policy.predict(malformed, jnp.zeros(2, dtype=jnp.float32))
+
+    maximum = jnp.asarray(2**31 - 1, dtype=jnp.int32)
+    for learner in (off_policy, ETDLinearLearner(), GradientTDLinearLearner()):
+        state = learner.init(2).replace(step_count=maximum)
+        result = learner.update(
+            state,
+            jnp.zeros(2, dtype=jnp.float32),
+            jnp.asarray(1.0, dtype=jnp.float32),
+            jnp.zeros(2, dtype=jnp.float32),
+            jnp.asarray(0.0, dtype=jnp.float32),
+            jnp.asarray(1.0, dtype=jnp.float32),
+        )
+        assert bool(result.update_applied)
+        assert int(result.state.step_count) == 2**31 - 1
+
+
+def test_diagnostics_are_finite_and_transactional_at_float32_extremes() -> None:
+    learner = GradientTDLinearLearner(step_size=0.01, secondary_step_size=0.0)
+    state = learner.init(2).replace(
+        weights=jnp.full(3, jnp.finfo(jnp.float32).max, dtype=jnp.float32),
+        secondary_weights=jnp.full(3, jnp.finfo(jnp.float32).max, dtype=jnp.float32),
+    )
+    accepted = learner.update(
+        state,
+        jnp.zeros(2, dtype=jnp.float32),
+        jnp.asarray(jnp.finfo(jnp.float32).max, dtype=jnp.float32),
+        jnp.zeros(2, dtype=jnp.float32),
+        jnp.asarray(0.0, dtype=jnp.float32),
+        jnp.asarray(1.0, dtype=jnp.float32),
+    )
+    assert bool(accepted.update_applied)
+    chex.assert_tree_all_finite(accepted.metrics)
+
+    off_policy = OffPolicyTDLinearLearner(step_size=1e-6)
+    initial = off_policy.init(2)
+    rejected = off_policy.update(
+        initial,
+        jnp.zeros(2, dtype=jnp.float32),
+        jnp.asarray(1e20, dtype=jnp.float32),
+        jnp.zeros(2, dtype=jnp.float32),
+        jnp.asarray(0.0, dtype=jnp.float32),
+        jnp.asarray(1.0, dtype=jnp.float32),
+    )
+    assert not bool(rejected.update_applied)
+    chex.assert_trees_all_equal(rejected.state, initial)
+    chex.assert_trees_all_equal(rejected.metrics, jnp.zeros(5, dtype=jnp.float32))
+
+
+def test_gradient_scan_preflights_host_shapes_and_aggregate_resources() -> None:
+    learner = GradientTDLinearLearner()
+    state = learner.init(2)
+
+    class Oversized:
+        dtype = np.dtype(np.float32)
+
+        def __init__(self, shape: tuple[int, ...]) -> None:
+            self.shape = shape
+
+        def __jax_array__(self):  # type: ignore[no-untyped-def]
+            raise AssertionError("conversion must not run")
+
+    steps = 100_000_000
+    with pytest.raises(ValueError, match="aggregate resources"):
+        run_gradient_td_learning_loop(
+            learner,
+            state,
+            Oversized((steps, 2)),  # type: ignore[arg-type]
+            Oversized((steps,)),  # type: ignore[arg-type]
+            Oversized((steps, 2)),  # type: ignore[arg-type]
+            Oversized((steps,)),  # type: ignore[arg-type]
+            Oversized((steps,)),  # type: ignore[arg-type]
+        )
