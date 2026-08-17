@@ -16,11 +16,14 @@ from __future__ import annotations
 
 import dataclasses
 import functools
-from typing import Any, cast
+import operator
+from collections.abc import Mapping
+from typing import Any, SupportsIndex, cast
 
 import chex
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import Array
 from jaxtyping import Bool, Float
 
@@ -44,6 +47,135 @@ from alberta_framework.core.update_safety import (
     safe_discrete_action,
     select_transaction,
 )
+
+_INT32_MAX = 2**31 - 1
+_ACTUAL_INT_TYPES = frozenset(
+    {
+        int,
+        np.int8,
+        np.int16,
+        np.int32,
+        np.int64,
+        np.uint8,
+        np.uint16,
+        np.uint32,
+        np.uint64,
+        np.longlong,
+        np.ulonglong,
+    }
+)
+
+
+def _require_int32(name: str, value: object, *, minimum: int) -> int:
+    if type(value) not in _ACTUAL_INT_TYPES:
+        raise ValueError(f"{name} must be an integer in [{minimum}, {_INT32_MAX}]")
+    canonical = operator.index(cast(SupportsIndex, value))
+    if not minimum <= canonical <= _INT32_MAX:
+        raise ValueError(f"{name} must be an integer in [{minimum}, {_INT32_MAX}]")
+    return canonical
+
+
+def _require_bool(name: str, value: object) -> bool:
+    if type(value) is not bool:
+        raise ValueError(f"{name} must be a bool")
+    return value
+
+
+def _validate_hidden_sizes(value: object) -> tuple[int, ...]:
+    if type(value) is not tuple:
+        raise ValueError("hidden_sizes must be an actual tuple")
+    return tuple(
+        _require_int32(f"hidden_sizes[{index}]", width, minimum=1)
+        for index, width in enumerate(value)
+    )
+
+
+def _checked_product(name: str, left: int, right: int) -> int:
+    if left > _INT32_MAX // right:
+        raise ValueError(f"derived {name} must fit in signed int32")
+    return left * right
+
+
+def _validate_world_model_resources(
+    *,
+    observation_dim: int,
+    action_feature_dim: int,
+    hidden_sizes: tuple[int, ...],
+    n_heads: int,
+    outer_state_scalars: int,
+) -> None:
+    if observation_dim > _INT32_MAX - action_feature_dim:
+        raise ValueError("derived input_dim must fit in signed int32")
+    input_dim = observation_dim + action_feature_dim
+    layer_sizes = (input_dim, *hidden_sizes)
+    for index, (fan_in, fan_out) in enumerate(
+        zip(layer_sizes, layer_sizes[1:], strict=False)
+    ):
+        _checked_product(f"hidden_layer[{index}]_scalars", fan_in, fan_out)
+    head_input = hidden_sizes[-1] if hidden_sizes else input_dim
+    _checked_product("head_weight_scalars", n_heads, head_input)
+    trunk_parameters = sum(
+        fan_out * (fan_in + 1)
+        for fan_in, fan_out in zip(layer_sizes, layer_sizes[1:], strict=False)
+    )
+    head_parameters = n_heads * (head_input + 1)
+    direct_scalars = (
+        2 * (trunk_parameters + head_parameters)
+        + sum(hidden_sizes)
+        + 3
+        + outer_state_scalars
+    )
+    for name, value in (
+        ("combined_direct_state_scalars", direct_scalars),
+        ("combined_direct_state_bytes", 4 * direct_scalars),
+    ):
+        if value > _INT32_MAX:
+            raise ValueError(f"derived {name} must fit in signed int32")
+
+
+def _serialized_sequence(name: str, value: object) -> tuple[Any, ...]:
+    if type(value) not in (list, tuple):
+        raise ValueError(f"serialized {name} must be an actual list or tuple")
+    return tuple(cast(list[Any] | tuple[Any, ...], value))
+
+
+def _require_scan_resource(name: str, *, float32_scalars: int, bool_scalars: int) -> None:
+    if float32_scalars + bool_scalars > _INT32_MAX:
+        raise ValueError(f"derived {name} scalar count must fit in signed int32")
+    if 4 * float32_scalars + bool_scalars > _INT32_MAX:
+        raise ValueError(f"derived {name} byte count must fit in signed int32")
+
+
+def _scan_array_metadata(name: str, value: object) -> tuple[int, ...]:
+    """Read shape and numeric dtype before any user-controlled array conversion."""
+    try:
+        raw_shape = object.__getattribute__(value, "shape")
+        raw_dtype = object.__getattribute__(value, "dtype")
+    except (AttributeError, TypeError):
+        raise ValueError(f"{name} must expose array shape and dtype metadata") from None
+    if type(raw_shape) is not tuple:
+        raise ValueError(f"{name} shape metadata must be an exact tuple")
+    shape = tuple(
+        _require_int32(f"{name} shape dimension", dimension, minimum=0)
+        for dimension in raw_shape
+    )
+    try:
+        dtype = np.dtype(raw_dtype)
+    except Exception:
+        raise ValueError(f"{name} dtype metadata must be readable") from None
+    if dtype.kind not in "biuf":
+        raise ValueError(f"{name} must have a real numeric dtype")
+    return shape
+
+
+def _require_scan_array(name: str, value: object, expected: tuple[int, ...]) -> None:
+    if _scan_array_metadata(name, value) != expected:
+        raise ValueError(f"{name} must have shape {expected}")
+
+
+def _saturating_increment(value: Array) -> Array:
+    one = jnp.asarray(1, dtype=jnp.int32)
+    return jnp.minimum(value, jnp.asarray(_INT32_MAX - 1, dtype=jnp.int32)) + one
 
 
 def _float32_operand(
@@ -111,6 +243,75 @@ class ActionConditionedWorldModelConfig:
     max_delta_scale: float = 5.0
     include_action_interactions: bool = False
 
+    def __post_init__(self) -> None:
+        """Validate and canonicalize the complete static construction."""
+        observation_dim = _require_int32("observation_dim", self.observation_dim, minimum=1)
+        n_actions = _require_int32("n_actions", self.n_actions, minimum=1)
+        hidden_sizes = _validate_hidden_sizes(self.hidden_sizes)
+        for name in ("predict_delta", "use_layer_norm", "include_action_interactions"):
+            object.__setattr__(self, name, _require_bool(name, getattr(self, name)))
+        if type(self.trace_mode) is not TraceMode:
+            raise ValueError("trace_mode must be a TraceMode")
+
+        observation_scale = self.observation_scale
+        if observation_scale is not None:
+            if type(observation_scale) is not tuple:
+                raise ValueError("observation_scale must be an actual tuple or None")
+            if len(observation_scale) != observation_dim:
+                raise ValueError("observation_scale length must equal observation_dim")
+            observation_scale = tuple(
+                validated_float32_scalar(
+                    f"observation_scale[{index}]", scale, positive=True
+                )
+                for index, scale in enumerate(observation_scale)
+            )
+
+        scalar_specs: tuple[tuple[str, dict[str, Any]], ...] = (
+            ("gamma", {"lower": 0.0, "upper": 1.0}),
+            ("reward_scale", {"positive": True}),
+            ("step_size", {"positive": True}),
+            ("sparsity", {"lower": 0.0, "upper": 1.0}),
+            ("leaky_relu_slope", {"lower": 0.0, "upper": 1.0}),
+            ("utility_decay", {"lower": 0.0, "upper": 1.0, "upper_inclusive": False}),
+            ("error_decay", {"lower": 0.0, "upper": 1.0, "upper_inclusive": False}),
+            ("observation_clip_margin", {"lower": 0.0}),
+            ("max_delta_scale", {"positive": True}),
+        )
+        object.__setattr__(self, "observation_dim", observation_dim)
+        object.__setattr__(self, "n_actions", n_actions)
+        object.__setattr__(self, "hidden_sizes", hidden_sizes)
+        object.__setattr__(self, "observation_scale", observation_scale)
+        for name, bounds in scalar_specs:
+            object.__setattr__(
+                self,
+                name,
+                validated_float32_scalar(name, getattr(self, name), **bounds),
+            )
+        if (
+            observation_scale is not None
+            and max(observation_scale) * self.max_delta_scale
+            > float(np.finfo(np.float32).max)
+        ):
+            raise ValueError("observation_scale * max_delta_scale must remain finite")
+
+        action_feature_dim = n_actions
+        if self.include_action_interactions:
+            interactions = _checked_product(
+                "action_interaction_scalars", observation_dim, n_actions
+            )
+            if action_feature_dim > _INT32_MAX - interactions:
+                raise ValueError("derived action_feature_dim must fit in signed int32")
+            action_feature_dim += interactions
+        if observation_dim > _INT32_MAX - 2:
+            raise ValueError("derived n_heads must fit in signed int32")
+        _validate_world_model_resources(
+            observation_dim=observation_dim,
+            action_feature_dim=action_feature_dim,
+            hidden_sizes=hidden_sizes,
+            n_heads=observation_dim + 2,
+            outer_state_scalars=2 * observation_dim + 4,
+        )
+
     def to_config(self) -> dict[str, Any]:
         """Serialize to a JSON-compatible dictionary."""
         payload = dataclasses.asdict(self)
@@ -122,15 +323,26 @@ class ActionConditionedWorldModelConfig:
         return payload
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> ActionConditionedWorldModelConfig:
+    def from_config(cls, config: Mapping[str, Any]) -> ActionConditionedWorldModelConfig:
         """Reconstruct from :meth:`to_config` output."""
-        payload = dict(config)
+        if not issubclass(type(config), Mapping):
+            raise ValueError("config must be an actual mapping")
+        try:
+            payload = dict(config)
+        except Exception as error:
+            raise ValueError("config must be a readable mapping") from error
         payload.pop("type", None)
         if "hidden_sizes" in payload:
-            payload["hidden_sizes"] = tuple(payload["hidden_sizes"])
+            payload["hidden_sizes"] = _serialized_sequence(
+                "hidden_sizes", payload["hidden_sizes"]
+            )
         if "observation_scale" in payload and payload["observation_scale"] is not None:
-            payload["observation_scale"] = tuple(payload["observation_scale"])
+            payload["observation_scale"] = _serialized_sequence(
+                "observation_scale", payload["observation_scale"]
+            )
         if "trace_mode" in payload:
+            if type(payload["trace_mode"]) is not str:
+                raise ValueError("serialized trace_mode must be an actual string")
             payload["trace_mode"] = TraceMode(payload["trace_mode"])
         return cls(**payload)
 
@@ -234,8 +446,23 @@ def _rollback_multi_head_result(
 
 def _action_world_model_state_is_valid(
     state: ActionConditionedWorldModelState,
+    observation_dim: int,
 ) -> Bool[Array, ""]:
     """Accept either the intentional empty-bound sentinels or finite learned bounds."""
+    direct_structure_valid = (
+        state.observation_min.shape == (observation_dim,)
+        and state.observation_max.shape == (observation_dim,)
+        and state.reward_min.shape == ()
+        and state.reward_max.shape == ()
+        and state.model_error_ema.shape == ()
+        and state.step_count.shape == ()
+        and state.observation_min.dtype == jnp.float32
+        and state.observation_max.dtype == jnp.float32
+        and state.reward_min.dtype == jnp.float32
+        and state.reward_max.dtype == jnp.float32
+        and state.model_error_ema.dtype == jnp.float32
+        and state.step_count.dtype == jnp.int32
+    )
     finite_bounds = (
         jnp.all(jnp.isfinite(state.observation_min))
         & jnp.all(jnp.isfinite(state.observation_max))
@@ -250,7 +477,8 @@ def _action_world_model_state_is_valid(
         & jnp.isneginf(state.reward_max)
     )
     return (
-        floating_tree_is_finite(state.learner_state)
+        direct_structure_valid
+        & floating_tree_is_finite(state.learner_state)
         & jnp.isfinite(state.model_error_ema)
         & (state.step_count >= 0)
         & (finite_bounds | empty_bounds)
@@ -646,7 +874,7 @@ class ActionConditionedWorldModel:
             reward_min=jnp.minimum(state.reward_min, safe_reward),
             reward_max=jnp.maximum(state.reward_max, safe_reward),
             model_error_ema=next_error_ema,
-            step_count=state.step_count + 1,
+            step_count=_saturating_increment(state.step_count),
         )
 
         diagnostics_finite = (
@@ -663,7 +891,7 @@ class ActionConditionedWorldModel:
         update_applied = (
             inputs_valid
             & learner_result.update_applied
-            & _action_world_model_state_is_valid(state)
+            & _action_world_model_state_is_valid(state, self._config.observation_dim)
             & floating_tree_is_finite(candidate_state)
             & diagnostics_finite
         )
@@ -703,40 +931,9 @@ class ActionConditionedWorldModel:
         self, config: ActionConditionedWorldModelConfig
     ) -> ActionConditionedWorldModelConfig:
         """Fail closed on malformed configuration and return its canonical float32 form."""
-        if config.observation_dim <= 0:
-            raise ValueError("observation_dim must be positive")
-        if config.n_actions <= 0:
-            raise ValueError("n_actions must be positive")
-        if any(size <= 0 for size in config.hidden_sizes):
-            raise ValueError("hidden_sizes must contain only positive widths")
-        observation_scale = config.observation_scale
-        if observation_scale is not None:
-            if len(observation_scale) != config.observation_dim:
-                raise ValueError("observation_scale length must equal observation_dim")
-            observation_scale = tuple(
-                validated_float32_scalar("observation_scale values", scale, positive=True)
-                for scale in observation_scale
-            )
-        return dataclasses.replace(
-            config,
-            gamma=validated_float32_scalar("gamma", config.gamma, lower=0.0, upper=1.0),
-            observation_scale=observation_scale,
-            reward_scale=validated_float32_scalar(
-                "reward_scale", config.reward_scale, positive=True
-            ),
-            utility_decay=validated_float32_scalar(
-                "utility_decay", config.utility_decay, lower=0.0, upper=1.0, upper_inclusive=False
-            ),
-            error_decay=validated_float32_scalar(
-                "error_decay", config.error_decay, lower=0.0, upper=1.0, upper_inclusive=False
-            ),
-            observation_clip_margin=validated_float32_scalar(
-                "observation_clip_margin", config.observation_clip_margin, lower=0.0
-            ),
-            max_delta_scale=validated_float32_scalar(
-                "max_delta_scale", config.max_delta_scale, positive=True
-            ),
-        )
+        if type(config) is not ActionConditionedWorldModelConfig:
+            raise ValueError("config must be an ActionConditionedWorldModelConfig")
+        return config
 
 
 def run_action_conditioned_world_model_learning_loop(
@@ -749,12 +946,38 @@ def run_action_conditioned_world_model_learning_loop(
     discounts: Float[Array, " num_steps"] | None = None,
 ) -> ActionConditionedWorldModelLearningResult:
     """Run online one-step model learning over transition arrays."""
+    observation_dim = model.config.observation_dim
+    n_heads = observation_dim + 2
+    observation_shape = _scan_array_metadata("observations", observations)
+    if len(observation_shape) != 2 or observation_shape[1] != observation_dim:
+        raise ValueError(f"observations must have shape (num_steps, {observation_dim})")
+    num_steps = observation_shape[0]
+    _require_scan_array("actions", actions, (num_steps,))
+    _require_scan_array("rewards", rewards, (num_steps,))
+    _require_scan_array(
+        "next_observations", next_observations, (num_steps, observation_dim)
+    )
+    if discounts is not None:
+        _require_scan_array("discounts", discounts, (num_steps,))
+    _require_scan_resource(
+        "action-conditioned world-model learning result",
+        float32_scalars=(
+            2 * num_steps * observation_dim + 6 * num_steps + 6 * num_steps * n_heads
+        ),
+        bool_scalars=num_steps,
+    )
+    observations = jnp.asarray(observations, dtype=jnp.float32)
+    actions = jnp.asarray(actions, dtype=jnp.float32)
+    rewards = jnp.asarray(rewards, dtype=jnp.float32)
+    next_observations = jnp.asarray(next_observations, dtype=jnp.float32)
     if discounts is None:
         discounts = jnp.full(
-            jnp.shape(rewards),
+            (num_steps,),
             jnp.asarray(model.config.gamma, dtype=jnp.float32),
             dtype=jnp.float32,
         )
+    else:
+        discounts = jnp.asarray(discounts, dtype=jnp.float32)
 
     def _scan_fn(
         carry: ActionConditionedWorldModelState,
@@ -852,6 +1075,44 @@ class WorldModelConfig:
     predict_delta: bool = False
     utility_decay: float = 0.99
 
+    def __post_init__(self) -> None:
+        """Validate and canonicalize the complete static construction."""
+        observation_dim = _require_int32("observation_dim", self.observation_dim, minimum=1)
+        n_actions = (
+            _require_int32("n_actions", self.n_actions, minimum=1)
+            if self.n_actions is not None
+            else None
+        )
+        action_dim = _require_int32("action_dim", self.action_dim, minimum=1)
+        hidden_sizes = _validate_hidden_sizes(self.hidden_sizes)
+        for name in ("use_layer_norm", "predict_delta"):
+            object.__setattr__(self, name, _require_bool(name, getattr(self, name)))
+        scalar_specs: tuple[tuple[str, dict[str, Any]], ...] = (
+            ("step_size", {"positive": True}),
+            ("sparsity", {"lower": 0.0, "upper": 1.0}),
+            ("leaky_relu_slope", {"lower": 0.0, "upper": 1.0}),
+            ("utility_decay", {"lower": 0.0, "upper": 1.0, "upper_inclusive": False}),
+        )
+        object.__setattr__(self, "observation_dim", observation_dim)
+        object.__setattr__(self, "n_actions", n_actions)
+        object.__setattr__(self, "action_dim", action_dim)
+        object.__setattr__(self, "hidden_sizes", hidden_sizes)
+        for name, bounds in scalar_specs:
+            object.__setattr__(
+                self,
+                name,
+                validated_float32_scalar(name, getattr(self, name), **bounds),
+            )
+        if observation_dim == _INT32_MAX:
+            raise ValueError("derived n_heads must fit in signed int32")
+        _validate_world_model_resources(
+            observation_dim=observation_dim,
+            action_feature_dim=n_actions if n_actions is not None else action_dim,
+            hidden_sizes=hidden_sizes,
+            n_heads=observation_dim + 1,
+            outer_state_scalars=1,
+        )
+
     def to_config(self) -> dict[str, Any]:
         """Serialize to a JSON-compatible dictionary."""
         payload = dataclasses.asdict(self)
@@ -860,12 +1121,19 @@ class WorldModelConfig:
         return payload
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> WorldModelConfig:
+    def from_config(cls, config: Mapping[str, Any]) -> WorldModelConfig:
         """Reconstruct from :meth:`to_config` output."""
-        payload = dict(config)
+        if not issubclass(type(config), Mapping):
+            raise ValueError("config must be an actual mapping")
+        try:
+            payload = dict(config)
+        except Exception as error:
+            raise ValueError("config must be a readable mapping") from error
         payload.pop("type", None)
         if "hidden_sizes" in payload:
-            payload["hidden_sizes"] = tuple(payload["hidden_sizes"])
+            payload["hidden_sizes"] = _serialized_sequence(
+                "hidden_sizes", payload["hidden_sizes"]
+            )
         return cls(**payload)
 
 
@@ -1115,13 +1383,29 @@ class OneStepWorldModel:
         prediction_error = jnp.nanmean(learner_result.errors**2)
         candidate_state = WorldModelState(
             learner_state=learner_result.state,
-            step_count=state.step_count + 1,
+            step_count=_saturating_increment(state.step_count),
+        )
+        diagnostics_valid = (
+            jnp.all(jnp.isfinite(prediction.next_observation))
+            & jnp.isfinite(prediction.reward)
+            & jnp.all(jnp.isfinite(prediction.raw_predictions))
+            & jnp.all(~jnp.isinf(targets))
+            & jnp.all(~jnp.isinf(learner_result.errors))
+            & jnp.all(~jnp.isinf(learner_result.per_head_metrics))
+            & jnp.all(~jnp.isinf(next_observation_errors))
+            & ~jnp.isinf(reward_error)
+            & ~jnp.isinf(observation_mse)
+            & ~jnp.isinf(prediction_error)
         )
         update_applied = (
             action_valid
             & learner_result.update_applied
             & floating_tree_is_finite(state)
+            & (state.step_count.shape == ())
+            & (state.step_count.dtype == jnp.int32)
+            & (state.step_count >= 0)
             & floating_tree_is_finite(candidate_state)
+            & diagnostics_valid
         )
         new_state = select_transaction(update_applied, candidate_state, state)
         reported_learner_result = _rollback_multi_head_result(
@@ -1163,16 +1447,8 @@ class OneStepWorldModel:
         )
 
     def _validate_config(self, config: WorldModelConfig) -> None:
-        if config.observation_dim <= 0:
-            raise ValueError("observation_dim must be positive")
-        if config.n_actions is not None and config.n_actions <= 0:
-            raise ValueError("n_actions must be positive when provided")
-        if config.n_actions is None and config.action_dim <= 0:
-            raise ValueError("action_dim must be positive for vector actions")
-        if any(size <= 0 for size in config.hidden_sizes):
-            raise ValueError("hidden_sizes must contain only positive widths")
-        if not 0.0 <= config.utility_decay < 1.0:
-            raise ValueError("utility_decay must be in [0, 1)")
+        if type(config) is not WorldModelConfig:
+            raise ValueError("config must be a WorldModelConfig")
 
 
 def run_world_model_learning_loop(
@@ -1184,6 +1460,33 @@ def run_world_model_learning_loop(
     next_observations: Array,
 ) -> WorldModelLearningResult:
     """Run one-step world-model learning with ``jax.lax.scan``."""
+    observation_dim = model.config.observation_dim
+    n_heads = observation_dim + 1
+    observation_shape = _scan_array_metadata("observations", observations)
+    if len(observation_shape) != 2 or observation_shape[1] != observation_dim:
+        raise ValueError(f"observations must have shape (num_steps, {observation_dim})")
+    num_steps = observation_shape[0]
+    action_shape = (
+        (num_steps,)
+        if model.config.n_actions is not None
+        else (num_steps, model.config.action_dim)
+    )
+    _require_scan_array("actions", actions, action_shape)
+    _require_scan_array("rewards", rewards, (num_steps,))
+    _require_scan_array(
+        "next_observations", next_observations, (num_steps, observation_dim)
+    )
+    _require_scan_resource(
+        "world-model learning result",
+        float32_scalars=(
+            2 * num_steps * observation_dim + 2 * num_steps + 3 * num_steps * n_heads
+        ),
+        bool_scalars=num_steps,
+    )
+    observations = jnp.asarray(observations, dtype=jnp.float32)
+    actions = jnp.asarray(actions, dtype=jnp.float32)
+    rewards = jnp.asarray(rewards, dtype=jnp.float32)
+    next_observations = jnp.asarray(next_observations, dtype=jnp.float32)
 
     def step_fn(
         carry: WorldModelState,
