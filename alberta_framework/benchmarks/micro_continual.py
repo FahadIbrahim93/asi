@@ -1129,6 +1129,7 @@ def load_micro_shard(path: Path | str) -> dict[str, Any]:
         )
     if payload.get("arm_name") not in MICRO_ARM_REGISTRY:
         raise ValueError(f"{path}: unknown arm {payload.get('arm_name')!r}")
+    arm_spec = MICRO_ARM_REGISTRY[payload["arm_name"]]
     if not isinstance(payload.get("mechanism"), str) or not payload["mechanism"]:
         raise ValueError(f"{path}: mechanism must be a non-empty string")
     if not isinstance(payload.get("hyperparameters"), dict):
@@ -1138,6 +1139,14 @@ def load_micro_shard(path: Path | str) -> dict[str, Any]:
             payload["hyperparameters"], context=f"{path}: hyperparameters"
         )
     )
+    if payload["mechanism"] != arm_spec.mechanism:
+        raise ValueError(
+            f"{path}: mechanism does not match registered arm {arm_spec.name!r}"
+        )
+    if payload["hyperparameters"] != dict(arm_spec.hyperparameters):
+        raise ValueError(
+            f"{path}: hyperparameters do not match registered arm {arm_spec.name!r}"
+        )
     environment = payload.get("environment")
     required_environment_fields = ("jax", "numpy", "python", "platform")
     if not isinstance(environment, dict) or any(
