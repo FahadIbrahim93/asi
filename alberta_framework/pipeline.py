@@ -771,6 +771,13 @@ class AlbertaPipelineSmokeResult:
     actions_shape: tuple[int, ...]
     finite: bool
 
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "steps", _require_int("steps", self.steps, minimum=1, maximum=_INT32_MAX)
+        )
+        object.__setattr__(self, "seed", require_jax_seed(self.seed, name="seed"))
+        object.__setattr__(self, "finite", _require_bool("finite", self.finite))
+
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-serializable representation."""
         payload = asdict(self)
