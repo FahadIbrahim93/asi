@@ -51,19 +51,98 @@ Reference:
 from __future__ import annotations
 
 import functools
+import operator
 import time
-from typing import Any
+from collections.abc import Mapping
+from typing import Any, SupportsIndex, cast
 
 import chex
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import Array
 from jaxtyping import Bool, Float, Int
 
+from alberta_framework.core._float32_scalars import validated_float32_scalar
 from alberta_framework.core.types import Observation
 from alberta_framework.core.update_safety import (
     floating_tree_is_finite as _floating_tree_is_finite,
 )
+
+_INT32_MAX = 2**31 - 1
+_ACTUAL_INT_TYPES = frozenset(
+    {
+        int,
+        np.int8,
+        np.int16,
+        np.int32,
+        np.int64,
+        np.uint8,
+        np.uint16,
+        np.uint32,
+        np.uint64,
+        np.longlong,
+        np.ulonglong,
+    }
+)
+_TRUSTED_REAL_TYPES = (
+    _ACTUAL_INT_TYPES | frozenset(np.dtype(code).type for code in ("e", "f", "d", "g")) | {float}
+)
+
+
+def _require_int32(name: str, value: object, *, minimum: int, maximum: int = _INT32_MAX) -> int:
+    if type(value) not in _ACTUAL_INT_TYPES:
+        raise ValueError(f"{name} must be an integer in [{minimum}, {maximum}]")
+    canonical = operator.index(cast(SupportsIndex, value))
+    if not minimum <= canonical <= maximum:
+        raise ValueError(f"{name} must be an integer in [{minimum}, {maximum}]")
+    return canonical
+
+
+def _require_float32(name: str, value: object, **bounds: Any) -> float:
+    if type(value) not in _TRUSTED_REAL_TYPES:
+        raise ValueError(f"{name} must be a finite real scalar")
+    return validated_float32_scalar(name, value, **bounds)
+
+
+def _require_positive_clip(name: str, value: object) -> float:
+    if type(value) not in _TRUSTED_REAL_TYPES:
+        raise ValueError(f"{name} must be a positive real scalar")
+    concrete = float(cast(Any, value))
+    if concrete == float("inf"):
+        return concrete
+    return validated_float32_scalar(name, value, positive=True)
+
+
+def _require_state_resources(name: str, *, scalars: int, bytes_: int) -> None:
+    if scalars > _INT32_MAX:
+        raise ValueError(f"derived {name} state scalars must fit signed int32")
+    if bytes_ > _INT32_MAX:
+        raise ValueError(f"derived {name} state bytes must fit signed int32")
+
+
+def _serialized_payload(
+    config: Mapping[str, Any], *, type_name: str, fields: frozenset[str]
+) -> dict[str, Any]:
+    if not issubclass(type(config), Mapping):
+        raise ValueError("config must be an actual mapping")
+    try:
+        payload = dict(config)
+    except Exception as error:
+        raise ValueError("config must be a readable mapping") from error
+    if any(type(key) is not str for key in payload) or set(payload) != fields | {"type"}:
+        raise ValueError("config fields do not match the serialized schema")
+    marker = payload.pop("type")
+    if type(marker) is not str or marker != type_name:
+        raise ValueError("config type differs")
+    if any(type(value) not in (int, float) for value in payload.values()):
+        raise ValueError("serialized scalar fields must be exact JSON numbers")
+    return payload
+
+
+def _saturating_increment(value: Array) -> Array:
+    maximum = jnp.asarray(_INT32_MAX, dtype=jnp.int32)
+    return jnp.minimum(jnp.maximum(value, 0), maximum - 1) + 1
 
 
 def _skip_zero_scale(scale: Array, value: Array) -> Array:
@@ -74,6 +153,7 @@ def _skip_zero_scale(scale: Array, value: Array) -> Array:
 def _zero_if_unused(scale: Array, value: Array) -> Array:
     """Sanitize leftover inf only in the finite-state check when unused."""
     return jnp.where(scale == 0.0, jnp.zeros_like(value), value)
+
 
 # =============================================================================
 # State / result types
@@ -257,15 +337,9 @@ class OffPolicyTDLinearLearner:
             retrace_clip: Maximum allowed importance ratio (default 1.0;
                 pass float("inf") to disable clipping).
         """
-        if step_size <= 0:
-            raise ValueError(f"step_size must be positive; got {step_size}")
-        if not 0.0 <= trace_decay <= 1.0:
-            raise ValueError(f"trace_decay must lie in [0, 1]; got {trace_decay}")
-        if retrace_clip <= 0:
-            raise ValueError(f"retrace_clip must be positive; got {retrace_clip}")
-        self._step_size = step_size
-        self._trace_decay = trace_decay
-        self._retrace_clip = retrace_clip
+        self._step_size = _require_float32("step_size", step_size, positive=True)
+        self._trace_decay = _require_float32("trace_decay", trace_decay, lower=0.0, upper=1.0)
+        self._retrace_clip = _require_positive_clip("retrace_clip", retrace_clip)
 
     @property
     def step_size(self) -> float:
@@ -284,6 +358,10 @@ class OffPolicyTDLinearLearner:
 
     def init(self, feature_dim: int) -> OffPolicyTDState:
         """Initialize learner state with zero weights and zero traces."""
+        feature_dim = _require_int32("feature_dim", feature_dim, minimum=1)
+        _require_state_resources(
+            "OffPolicyTD", scalars=2 * feature_dim + 5, bytes_=8 * feature_dim + 20
+        )
         return OffPolicyTDState(  # type: ignore[call-arg]
             weights=jnp.zeros(feature_dim, dtype=jnp.float32),
             bias=jnp.array(0.0, dtype=jnp.float32),
@@ -295,9 +373,7 @@ class OffPolicyTDLinearLearner:
         )
 
     @functools.partial(jax.jit, static_argnums=(0,))
-    def predict(
-        self, state: OffPolicyTDState, observation: Observation
-    ) -> Float[Array, " 1"]:
+    def predict(self, state: OffPolicyTDState, observation: Observation) -> Float[Array, " 1"]:
         """Compute V(s) = w . phi(s) + b."""
         return jnp.atleast_1d(jnp.dot(state.weights, observation) + state.bias)
 
@@ -343,12 +419,10 @@ class OffPolicyTDLinearLearner:
         # the prior ratios are already represented in the stored trace.
         decay = gamma_s * lam
         new_e = _skip_zero_scale(
-            rho_clipped,
-            _skip_zero_scale(decay, state.eligibility_traces) + observation
+            rho_clipped, _skip_zero_scale(decay, state.eligibility_traces) + observation
         )
         new_e_b = _skip_zero_scale(
-            rho_clipped,
-            _skip_zero_scale(decay, state.bias_eligibility_trace) + 1.0
+            rho_clipped, _skip_zero_scale(decay, state.bias_eligibility_trace) + 1.0
         )
 
         # rho_clipped is already represented in the trace.
@@ -358,7 +432,7 @@ class OffPolicyTDLinearLearner:
             bias=state.bias + scaled_update * new_e_b,
             eligibility_traces=new_e,
             bias_eligibility_trace=new_e_b,
-            step_count=state.step_count + 1,
+            step_count=_saturating_increment(state.step_count),
             birth_timestamp=state.birth_timestamp,
             uptime_s=state.uptime_s,
         )
@@ -398,9 +472,7 @@ class OffPolicyTDLinearLearner:
                 update_applied, jnp.atleast_1d(v_t), jnp.zeros_like(jnp.atleast_1d(v_t))
             ),
             td_error=jnp.where(update_applied, td_error, jnp.zeros_like(td_error)),
-            rho_clipped=jnp.where(
-                update_applied, rho_clipped, jnp.zeros_like(rho_clipped)
-            ),
+            rho_clipped=jnp.where(update_applied, rho_clipped, jnp.zeros_like(rho_clipped)),
             metrics=jnp.where(update_applied, metrics, jnp.zeros_like(metrics)),
             update_applied=update_applied,
         )
@@ -415,11 +487,15 @@ class OffPolicyTDLinearLearner:
         }
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> OffPolicyTDLinearLearner:
+    def from_config(cls, config: Mapping[str, Any]) -> OffPolicyTDLinearLearner:
         """Reconstruct from dict."""
-        config = dict(config)
-        config.pop("type", None)
-        return cls(**config)
+        return cls(
+            **_serialized_payload(
+                config,
+                type_name=cls.__name__,
+                fields=frozenset({"step_size", "trace_decay", "retrace_clip"}),
+            )
+        )
 
 
 class ETDLinearLearner:
@@ -453,12 +529,8 @@ class ETDLinearLearner:
             step_size: Learning rate alpha (scalar)
             trace_decay: Eligibility trace decay lambda in [0, 1]
         """
-        if step_size <= 0:
-            raise ValueError(f"step_size must be positive; got {step_size}")
-        if not 0.0 <= trace_decay <= 1.0:
-            raise ValueError(f"trace_decay must lie in [0, 1]; got {trace_decay}")
-        self._step_size = step_size
-        self._trace_decay = trace_decay
+        self._step_size = _require_float32("step_size", step_size, positive=True)
+        self._trace_decay = _require_float32("trace_decay", trace_decay, lower=0.0, upper=1.0)
 
     @property
     def step_size(self) -> float:
@@ -472,6 +544,8 @@ class ETDLinearLearner:
 
     def init(self, feature_dim: int) -> ETDState:
         """Initialize learner state with zero weights and zero traces."""
+        feature_dim = _require_int32("feature_dim", feature_dim, minimum=1)
+        _require_state_resources("ETD", scalars=2 * feature_dim + 7, bytes_=8 * feature_dim + 28)
         return ETDState(  # type: ignore[call-arg]
             weights=jnp.zeros(feature_dim, dtype=jnp.float32),
             bias=jnp.array(0.0, dtype=jnp.float32),
@@ -527,17 +601,13 @@ class ETDLinearLearner:
         td_error = reward_s + _skip_zero_scale(gamma_s, v_next) - v_t
 
         follow_on = rho_s * _skip_zero_scale(gamma_s, state.follow_on_trace) + interest_s
-        emphasis = _skip_zero_scale(lam, interest_s) + _skip_zero_scale(
-            1.0 - lam, follow_on
-        )
+        emphasis = _skip_zero_scale(lam, interest_s) + _skip_zero_scale(1.0 - lam, follow_on)
 
         trace_decay = gamma_s * lam
         new_e = rho_s * (
             _skip_zero_scale(trace_decay, state.eligibility_traces) + emphasis * observation
         )
-        new_e_b = rho_s * (
-            _skip_zero_scale(trace_decay, state.bias_eligibility_trace) + emphasis
-        )
+        new_e_b = rho_s * (_skip_zero_scale(trace_decay, state.bias_eligibility_trace) + emphasis)
 
         proposed_state = ETDState(  # type: ignore[call-arg]
             weights=state.weights + alpha * td_error * new_e,
@@ -546,7 +616,7 @@ class ETDLinearLearner:
             bias_eligibility_trace=new_e_b,
             follow_on_trace=follow_on,
             emphasis=emphasis,
-            step_count=state.step_count + 1,
+            step_count=_saturating_increment(state.step_count),
             birth_timestamp=state.birth_timestamp,
             uptime_s=state.uptime_s,
         )
@@ -560,9 +630,7 @@ class ETDLinearLearner:
         )
         previous_checked = state.replace(  # type: ignore[attr-defined]
             eligibility_traces=_zero_if_unused(trace_decay, state.eligibility_traces),
-            bias_eligibility_trace=_zero_if_unused(
-                trace_decay, state.bias_eligibility_trace
-            ),
+            bias_eligibility_trace=_zero_if_unused(trace_decay, state.bias_eligibility_trace),
             follow_on_trace=_zero_if_unused(gamma_s, state.follow_on_trace),
         )
         update_applied = (
@@ -589,9 +657,7 @@ class ETDLinearLearner:
                 update_applied, jnp.atleast_1d(v_t), jnp.zeros_like(jnp.atleast_1d(v_t))
             ),
             td_error=jnp.where(update_applied, td_error, jnp.zeros_like(td_error)),
-            follow_on_trace=jnp.where(
-                update_applied, follow_on, jnp.zeros_like(follow_on)
-            ),
+            follow_on_trace=jnp.where(update_applied, follow_on, jnp.zeros_like(follow_on)),
             emphasis=jnp.where(update_applied, emphasis, jnp.zeros_like(emphasis)),
             metrics=jnp.where(update_applied, metrics, jnp.zeros_like(metrics)),
             update_applied=update_applied,
@@ -606,11 +672,15 @@ class ETDLinearLearner:
         }
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> ETDLinearLearner:
+    def from_config(cls, config: Mapping[str, Any]) -> ETDLinearLearner:
         """Reconstruct from dict."""
-        config = dict(config)
-        config.pop("type", None)
-        return cls(**config)
+        return cls(
+            **_serialized_payload(
+                config,
+                type_name=cls.__name__,
+                fields=frozenset({"step_size", "trace_decay"}),
+            )
+        )
 
 
 class GradientTDLinearLearner:
@@ -638,21 +708,12 @@ class GradientTDLinearLearner:
         ratio_clip: float = 10.0,
     ):
         """Initialize the learner."""
-        if step_size <= 0.0:
-            raise ValueError(f"step_size must be positive; got {step_size}")
-        if secondary_step_size < 0.0:
-            raise ValueError(
-                "secondary_step_size must be non-negative; "
-                f"got {secondary_step_size}"
-            )
-        if not 0.0 <= trace_decay <= 1.0:
-            raise ValueError(f"trace_decay must lie in [0, 1]; got {trace_decay}")
-        if ratio_clip <= 0.0:
-            raise ValueError(f"ratio_clip must be positive; got {ratio_clip}")
-        self._step_size = step_size
-        self._secondary_step_size = secondary_step_size
-        self._trace_decay = trace_decay
-        self._ratio_clip = ratio_clip
+        self._step_size = _require_float32("step_size", step_size, positive=True)
+        self._secondary_step_size = _require_float32(
+            "secondary_step_size", secondary_step_size, lower=0.0
+        )
+        self._trace_decay = _require_float32("trace_decay", trace_decay, lower=0.0, upper=1.0)
+        self._ratio_clip = _require_positive_clip("ratio_clip", ratio_clip)
 
     @property
     def step_size(self) -> float:
@@ -676,7 +737,11 @@ class GradientTDLinearLearner:
 
     def init(self, feature_dim: int) -> GradientTDState:
         """Initialize primary weights, secondary weights, and traces."""
+        feature_dim = _require_int32("feature_dim", feature_dim, minimum=1, maximum=_INT32_MAX - 1)
         augmented_dim = feature_dim + 1
+        _require_state_resources(
+            "GradientTD", scalars=3 * augmented_dim + 3, bytes_=12 * augmented_dim + 12
+        )
         return GradientTDState(  # type: ignore[call-arg]
             weights=jnp.zeros(augmented_dim, dtype=jnp.float32),
             secondary_weights=jnp.zeros(augmented_dim, dtype=jnp.float32),
@@ -697,9 +762,7 @@ class GradientTDLinearLearner:
         )
 
     @functools.partial(jax.jit, static_argnums=(0,))
-    def predict(
-        self, state: GradientTDState, observation: Observation
-    ) -> Float[Array, " 1"]:
+    def predict(self, state: GradientTDState, observation: Observation) -> Float[Array, " 1"]:
         """Compute ``theta^T phi`` with an appended bias feature."""
         return jnp.atleast_1d(jnp.dot(state.weights, self._augment(observation)))
 
@@ -729,19 +792,13 @@ class GradientTDLinearLearner:
         next_prediction = jnp.dot(state.weights, next_phi)
         td_error = reward_s + _skip_zero_scale(gamma_s, next_prediction) - prediction
 
-        traces = rho_clipped * (
-            phi + _skip_zero_scale(gamma_s * lam, state.eligibility_traces)
-        )
+        traces = rho_clipped * (phi + _skip_zero_scale(gamma_s * lam, state.eligibility_traces))
         secondary_dot_trace = jnp.dot(state.secondary_weights, traces)
         secondary_dot_phi = jnp.dot(state.secondary_weights, phi)
 
         correction_coefficient = gamma_s * (1.0 - lam)
-        scaled_secondary_trace = _skip_zero_scale(
-            correction_coefficient, secondary_dot_trace
-        )
-        bootstrap_correction = _skip_zero_scale(
-            scaled_secondary_trace, next_phi
-        )
+        scaled_secondary_trace = _skip_zero_scale(correction_coefficient, secondary_dot_trace)
+        bootstrap_correction = _skip_zero_scale(scaled_secondary_trace, next_phi)
         primary_step = alpha * (td_error * traces - bootstrap_correction)
         secondary_step = beta * (td_error * traces - secondary_dot_phi * phi)
 
@@ -749,7 +806,7 @@ class GradientTDLinearLearner:
             weights=state.weights + primary_step,
             secondary_weights=state.secondary_weights + secondary_step,
             eligibility_traces=traces,
-            step_count=state.step_count + 1,
+            step_count=_saturating_increment(state.step_count),
             birth_timestamp=state.birth_timestamp,
             uptime_s=state.uptime_s,
         )
@@ -761,9 +818,7 @@ class GradientTDLinearLearner:
             & jnp.isfinite(rho_s)
         )
         previous_checked = state.replace(  # type: ignore[attr-defined]
-            eligibility_traces=_zero_if_unused(
-                gamma_s * lam, state.eligibility_traces
-            ),
+            eligibility_traces=_zero_if_unused(gamma_s * lam, state.eligibility_traces),
         )
         update_applied = (
             inputs_valid
@@ -794,9 +849,7 @@ class GradientTDLinearLearner:
                 jnp.zeros_like(jnp.atleast_1d(prediction)),
             ),
             td_error=jnp.where(update_applied, td_error, jnp.zeros_like(td_error)),
-            rho_clipped=jnp.where(
-                update_applied, rho_clipped, jnp.zeros_like(rho_clipped)
-            ),
+            rho_clipped=jnp.where(update_applied, rho_clipped, jnp.zeros_like(rho_clipped)),
             metrics=jnp.where(update_applied, metrics, jnp.zeros_like(metrics)),
             update_applied=update_applied,
         )
@@ -812,11 +865,15 @@ class GradientTDLinearLearner:
         }
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> GradientTDLinearLearner:
+    def from_config(cls, config: Mapping[str, Any]) -> GradientTDLinearLearner:
         """Reconstruct from dict."""
-        config = dict(config)
-        config.pop("type", None)
-        return cls(**config)
+        return cls(
+            **_serialized_payload(
+                config,
+                type_name=cls.__name__,
+                fields=frozenset({"step_size", "secondary_step_size", "trace_decay", "ratio_clip"}),
+            )
+        )
 
 
 def run_gradient_td_learning_loop(
@@ -848,12 +905,10 @@ def run_gradient_td_learning_loop(
         )
 
     t0 = time.time()
-    final_state, (predictions, td_errors, rho_clipped, metrics, updates_applied) = (
-        jax.lax.scan(
+    final_state, (predictions, td_errors, rho_clipped, metrics, updates_applied) = jax.lax.scan(
         step_fn,
         state,
         (observations, rewards, next_observations, gammas, rhos),
-        )
     )
     elapsed = time.time() - t0
     final_state = final_state.replace(  # type: ignore[attr-defined]
