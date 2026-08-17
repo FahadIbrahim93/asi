@@ -230,6 +230,10 @@ def _plain(value: Any) -> Any:
         return [_plain(item) for item in value]
     if isinstance(value, list):
         return [_plain(item) for item in value]
+    if type(value) is float and not math.isfinite(value):
+        raise ForagerMatchedCampaignError(
+            "canonical content contains a non-finite JSON number"
+        )
     return value
 
 

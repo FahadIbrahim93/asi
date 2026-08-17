@@ -1427,3 +1427,28 @@ def test_campaign_and_qualification_console_scripts_are_registered() -> None:
     assert scripts["alberta-forager-matched-qualification"] == (
         "alberta_framework.benchmarks.forager_matched_qualification:main"
     )
+
+
+@pytest.mark.parametrize("invalid", [float("nan"), float("inf"), float("-inf")])
+def test_plain_rejects_nonfinite_number_identities(invalid: float) -> None:
+    """Campaign canonicalization must not keep NaN/Inf as trusted JSON scalars."""
+
+    with pytest.raises(
+        campaign.ForagerMatchedCampaignError,
+        match="non-finite JSON number",
+    ):
+        campaign._plain(invalid)
+    with pytest.raises(
+        campaign.ForagerMatchedCampaignError,
+        match="non-finite JSON number",
+    ):
+        campaign._plain({"score": invalid})
+
+
+def test_plain_keeps_finite_canonical_scalars() -> None:
+    assert campaign._plain({"score": 1.25, "ok": True, "n": 2}) == {
+        "score": 1.25,
+        "ok": True,
+        "n": 2,
+    }
+    assert campaign.canonical_json_bytes({"score": 1.25}) == b'{"score":1.25}'
