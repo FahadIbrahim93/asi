@@ -5,6 +5,7 @@ import time
 import chex
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 import pytest
 
 from alberta_framework import (
@@ -26,6 +27,7 @@ from alberta_framework import (
     run_learning_loop,
     run_learning_loop_batched,
 )
+from alberta_framework.core.learners import TDLinearLearner, TrueOnlineTDLearner
 
 
 class TestLinearLearnerNormalizerVeto:
@@ -944,3 +946,34 @@ class TestLifecycleUtilities:
 
         state, _ = run_learning_loop(learner, stream, num_steps=100, key=rng_key)
         assert agent_uptime_s(state) > 0.0
+
+
+def test_learners_feature_dim_integer_validation() -> None:
+    linear = LinearLearner()
+    td_linear = TDLinearLearner()
+    true_online = TrueOnlineTDLearner()
+
+    with pytest.raises(ValueError, match="feature_dim"):
+        linear.init(feature_dim=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="feature_dim"):
+        linear.init(feature_dim=0)
+    with pytest.raises(ValueError, match="feature_dim"):
+        linear.init(feature_dim=4.5)  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="feature_dim"):
+        td_linear.init(feature_dim=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="feature_dim"):
+        td_linear.init(feature_dim=0)
+
+    with pytest.raises(ValueError, match="feature_dim"):
+        true_online.init(feature_dim=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="feature_dim"):
+        true_online.init(feature_dim=0)
+
+    s1 = linear.init(feature_dim=np.int32(4))
+    s2 = td_linear.init(feature_dim=np.int64(4))
+    s3 = true_online.init(feature_dim=np.int32(4))
+
+    assert s1.weights.shape == (4,)
+    assert s2.weights.shape == (4,)
+    assert s3.weights.shape == (4,)
