@@ -94,6 +94,10 @@ class StabilityGap:
     maximum: float
     per_step: NDArray[np.float64]
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "mean", _require_finite_real("mean", self.mean))
+        object.__setattr__(self, "maximum", _require_finite_real("maximum", self.maximum))
+
 
 @dataclass(frozen=True)
 class ContinualLearningSummary:
@@ -115,6 +119,18 @@ class ContinualLearningSummary:
     per_task_final_performance: NDArray[np.float64]
     per_task_forgetting: NDArray[np.float64]
     per_task_backward_transfer: NDArray[np.float64]
+
+    def __post_init__(self) -> None:
+        for name in (
+            "final_performance",
+            "prequential_performance",
+            "mean_forgetting",
+            "max_forgetting",
+            "backward_transfer",
+            "stability_gap_mean",
+            "stability_gap_max",
+        ):
+            object.__setattr__(self, name, _require_finite_real(name, getattr(self, name)))
 
 
 def _performance_matrix(
