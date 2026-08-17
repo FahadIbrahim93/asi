@@ -39,17 +39,21 @@ import dataclasses
 import functools
 import hashlib
 import json
-import math
+import operator
+from collections.abc import Mapping
+from fractions import Fraction
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, SupportsIndex, cast
 
 import chex
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 from jax import Array
 from jaxtyping import Bool, Float, Int
 
+from alberta_framework.core._float32_scalars import validated_float32_scalar
 from alberta_framework.core.checkpoints import (
     load_checkpoint,
     load_checkpoint_metadata,
@@ -71,6 +75,88 @@ from alberta_framework.core.world_model import (
 WORLD_MODEL_ENSEMBLE_CHECKPOINT_SCHEMA = "alberta.world_model_ensemble.v2"
 _WORLD_MODEL_ENSEMBLE_CHECKPOINT_SCHEMA_V1 = "alberta.world_model_ensemble.v1"
 _INT32_MAX = 2**31 - 1
+_ACTUAL_INT_TYPES: tuple[type, ...] = (
+    int,
+    np.int8,
+    np.int16,
+    np.int32,
+    np.int64,
+    np.uint8,
+    np.uint16,
+    np.uint32,
+    np.uint64,
+    np.longlong,
+    np.ulonglong,
+)
+_ACTUAL_FLOAT_TYPES = frozenset(
+    {float, Fraction, *(np.dtype(code).type for code in ("e", "f", "d", "g"))}
+)
+
+
+def _require_int(
+    name: str,
+    value: object,
+    *,
+    minimum: int | None = None,
+    maximum: int | None = None,
+) -> int:
+    if type(value) not in _ACTUAL_INT_TYPES:
+        raise ValueError(f"{name} must be an integer")
+    number = operator.index(cast(SupportsIndex, value))
+    if minimum is not None and number < minimum:
+        raise ValueError(f"{name} must be >= {minimum}")
+    if maximum is not None and number > maximum:
+        raise ValueError(f"{name} must be <= {maximum}")
+    return number
+
+
+def _validated_config_float(name: str, value: object, **bounds: Any) -> float:
+    if type(value) not in (frozenset(_ACTUAL_INT_TYPES) | _ACTUAL_FLOAT_TYPES):
+        raise ValueError(f"{name} must be a finite real scalar")
+    return validated_float32_scalar(name, value, **bounds)
+
+
+def _member_state_scalars(config: ActionConditionedWorldModelConfig) -> int:
+    """Return exact default-LMS member state scalars counted by the budget surface."""
+    input_dim = config.observation_dim + config.n_actions
+    if config.include_action_interactions:
+        input_dim += config.observation_dim * config.n_actions
+    layer_sizes = (input_dim, *config.hidden_sizes)
+    trunk_parameters = sum(
+        fan_out * (fan_in + 1)
+        for fan_in, fan_out in zip(layer_sizes, layer_sizes[1:], strict=False)
+    )
+    n_heads = config.observation_dim + 2
+    final_width = config.hidden_sizes[-1] if config.hidden_sizes else input_dim
+    parameters = trunk_parameters + n_heads * (final_width + 1)
+    tensor_count = 2 * len(config.hidden_sizes) + 2 * n_heads
+    return (
+        2 * parameters
+        + tensor_count
+        + sum(config.hidden_sizes)
+        + 2 * config.observation_dim
+        + 9
+    )
+
+
+def _preflight_ensemble_state_resources(
+    *, model: ActionConditionedWorldModelConfig, ensemble_size: int
+) -> None:
+    target_dim = model.observation_dim + 2
+    members = ensemble_size * _member_state_scalars(model)
+    residuals = ensemble_size * target_dim
+    logical_scalars = members + residuals + 4 * ensemble_size + 15
+    logical_bytes = 4 * members + 4 * residuals + 10 * ensemble_size + 60
+    for name, value in (
+        ("ensemble member state scalars", members),
+        ("ensemble residual scalars", residuals),
+        ("ensemble persistent state scalars", logical_scalars),
+        ("ensemble persistent state bytes", logical_bytes),
+    ):
+        if not 1 <= value <= _INT32_MAX:
+            raise ValueError(f"derived {name} must fit signed int32")
+
+
 _REPLAY_KEY_FOLD_IN = 0x5245504C
 _V1_REPLAY_KEY_FOLD_IN = 0x50525632
 
@@ -127,43 +213,56 @@ class WorldModelEnsembleConfig:
     residual_variance_floor: float = 1.0e-6
 
     def __post_init__(self) -> None:
-        if (
-            isinstance(self.ensemble_size, bool)
-            or not isinstance(self.ensemble_size, int)
-            or self.ensemble_size < 2
-        ):
-            raise ValueError("ensemble_size must be an integer >= 2")
-        if (
-            not math.isfinite(self.bootstrap_probability)
-            or not 0.0 < self.bootstrap_probability < 1.0
-        ):
-            raise ValueError("bootstrap_probability must be finite and in (0, 1)")
-        if (
-            not math.isfinite(self.residual_variance_decay)
-            or not 0.0 <= self.residual_variance_decay < 1.0
-        ):
-            raise ValueError("residual_variance_decay must be finite and in [0, 1)")
-        if (
-            isinstance(self.residual_variance_warmup_steps, bool)
-            or not isinstance(self.residual_variance_warmup_steps, int)
-            or not 1 <= self.residual_variance_warmup_steps <= _INT32_MAX
-        ):
-            raise ValueError("residual_variance_warmup_steps must be an integer in [1, int32 max]")
-        if not math.isfinite(self.residual_variance_floor) or self.residual_variance_floor <= 0.0:
-            raise ValueError("residual_variance_floor must be positive and finite")
-        if self.signal_estimator.ensemble_size != self.ensemble_size:
+        if type(self.model) is not ActionConditionedWorldModelConfig:
+            raise ValueError("model must be an exact ActionConditionedWorldModelConfig")
+        if type(self.signal_estimator) is not LearningSignalEstimatorConfig:
+            raise ValueError("signal_estimator must be an exact LearningSignalEstimatorConfig")
+        ensemble_size = _require_int(
+            "ensemble_size", self.ensemble_size, minimum=2, maximum=_INT32_MAX - 1
+        )
+        bootstrap_probability = _validated_config_float(
+            "bootstrap_probability",
+            self.bootstrap_probability,
+            lower=0.0,
+            upper=1.0,
+            upper_inclusive=False,
+            positive=True,
+        )
+        residual_variance_decay = _validated_config_float(
+            "residual_variance_decay",
+            self.residual_variance_decay,
+            lower=0.0,
+            upper=1.0,
+            upper_inclusive=False,
+        )
+        residual_variance_warmup_steps = _require_int(
+            "residual_variance_warmup_steps",
+            self.residual_variance_warmup_steps,
+            minimum=1,
+            maximum=_INT32_MAX,
+        )
+        residual_variance_floor = _validated_config_float(
+            "residual_variance_floor",
+            self.residual_variance_floor,
+            positive=True,
+        )
+        if residual_variance_floor < self.signal_estimator.variance_floor:
+            raise ValueError("residual_variance_floor must be >= signal_estimator.variance_floor")
+        if residual_variance_floor > self.signal_estimator.max_predicted_variance:
+            raise ValueError("residual_variance_floor exceeds the signal estimator variance bound")
+        if self.signal_estimator.ensemble_size != ensemble_size:
             raise ValueError("signal_estimator.ensemble_size must match ensemble_size")
         expected_target_dim = self.model.observation_dim + 2
         if self.signal_estimator.target_dim != expected_target_dim:
             raise ValueError("signal_estimator.target_dim must equal model.observation_dim + 2")
-        if self.residual_variance_floor < self.signal_estimator.variance_floor:
-            raise ValueError("residual_variance_floor must be >= signal_estimator.variance_floor")
-        if self.residual_variance_floor > self.signal_estimator.max_predicted_variance:
-            raise ValueError("residual_variance_floor exceeds the signal estimator variance bound")
-
-        # Reuse the model's complete constructor validation rather than
-        # maintaining a second, drifting copy here.
-        ActionConditionedWorldModel(self.model)
+        object.__setattr__(self, "ensemble_size", ensemble_size)
+        object.__setattr__(self, "bootstrap_probability", bootstrap_probability)
+        object.__setattr__(self, "residual_variance_decay", residual_variance_decay)
+        object.__setattr__(
+            self, "residual_variance_warmup_steps", residual_variance_warmup_steps
+        )
+        object.__setattr__(self, "residual_variance_floor", residual_variance_floor)
+        _preflight_ensemble_state_resources(model=self.model, ensemble_size=ensemble_size)
 
     @property
     def target_dim(self) -> int:
@@ -186,22 +285,39 @@ class WorldModelEnsembleConfig:
         }
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> WorldModelEnsembleConfig:
+    def from_config(cls, config: Mapping[str, Any]) -> WorldModelEnsembleConfig:
         """Reconstruct the exact development-only configuration."""
-        payload = dict(config)
-        type_name = payload.pop("type", "WorldModelEnsembleConfig")
-        if type_name != "WorldModelEnsembleConfig":
+        if not issubclass(type(config), Mapping):
+            raise ValueError("config must be an actual mapping")
+        try:
+            payload = dict(config)
+        except Exception as error:
+            raise ValueError("config must be a readable mapping") from error
+        if any(type(key) is not str for key in payload):
+            raise ValueError("config keys must be exact strings")
+        type_name = payload.pop("type", None)
+        if type_name is not None and (
+            type(type_name) is not str or type_name != "WorldModelEnsembleConfig"
+        ):
             raise ValueError("type must be WorldModelEnsembleConfig")
         if payload.pop("development_only", True) is not True:
             raise ValueError("world-model ensemble is development_only")
         if payload.pop("accepted_scientific_evidence", False) is not False:
             raise ValueError("world-model ensemble is not accepted scientific evidence")
-        model = ActionConditionedWorldModelConfig.from_config(
-            cast(dict[str, Any], payload.pop("model"))
-        )
-        signal_estimator = LearningSignalEstimatorConfig.from_config(
-            cast(dict[str, Any], payload.pop("signal_estimator"))
-        )
+        raw_model = payload.pop("model")
+        raw_signals = payload.pop("signal_estimator")
+        if not issubclass(type(raw_model), Mapping) or not issubclass(
+            type(raw_signals), Mapping
+        ):
+            raise ValueError("nested configs must be actual mappings")
+        model = ActionConditionedWorldModelConfig.from_config(raw_model)
+        try:
+            signal_payload = dict(raw_signals)
+        except Exception as error:
+            raise ValueError("signal_estimator must be a readable mapping") from error
+        if any(type(key) is not str for key in signal_payload):
+            raise ValueError("signal_estimator keys must be exact strings")
+        signal_estimator = LearningSignalEstimatorConfig.from_config(signal_payload)
         return cls(model=model, signal_estimator=signal_estimator, **payload)
 
 
@@ -551,6 +667,8 @@ class WorldModelEnsemble:
     """Fixed-size bootstrap ensemble with causal typed learning signals."""
 
     def __init__(self, config: WorldModelEnsembleConfig):
+        if type(config) is not WorldModelEnsembleConfig:
+            raise ValueError("config must be an exact WorldModelEnsembleConfig")
         self._config = config
         self._model = ActionConditionedWorldModel(config.model)
         self._signals = LearningSignalEstimator(config.signal_estimator)
@@ -580,15 +698,27 @@ class WorldModelEnsemble:
         }
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> WorldModelEnsemble:
+    def from_config(cls, config: Mapping[str, Any]) -> WorldModelEnsemble:
         """Reconstruct from :meth:`to_config` output."""
-        payload = dict(config)
-        type_name = payload.pop("type", "WorldModelEnsemble")
-        if type_name != "WorldModelEnsemble":
+        if not issubclass(type(config), Mapping):
+            raise ValueError("ensemble payload must be an actual mapping")
+        try:
+            payload = dict(config)
+        except Exception as error:
+            raise ValueError("ensemble payload must be a readable mapping") from error
+        if any(type(key) is not str for key in payload):
+            raise ValueError("ensemble payload keys must be exact strings")
+        type_name = payload.pop("type", None)
+        if type_name is not None and (
+            type(type_name) is not str or type_name != "WorldModelEnsemble"
+        ):
             raise ValueError("type must be WorldModelEnsemble")
         if set(payload) != {"config"}:
             raise ValueError("world-model ensemble config keys are invalid")
-        return cls(WorldModelEnsembleConfig.from_config(cast(dict[str, Any], payload["config"])))
+        nested = payload["config"]
+        if not issubclass(type(nested), Mapping):
+            raise ValueError("nested ensemble config must be an actual mapping")
+        return cls(WorldModelEnsembleConfig.from_config(nested))
 
     def init(self, key: Array) -> WorldModelEnsembleState:
         """Initialize distinct members and isolated real/replay mask streams."""
@@ -676,7 +806,10 @@ class WorldModelEnsemble:
             raise TypeError("bootstrap PRNG key storage must use uint32 words")
         bootstrap_words = int(bootstrap_key_data.size + replay_key_data.size)
         bootstrap_bytes = int(bootstrap_key_data.nbytes + replay_key_data.nbytes)
-        if persistent.uint32_scalars != bootstrap_words or bootstrap_bytes != 4 * bootstrap_words:
+        expected_uint32 = (
+            bootstrap_words + member_account.uint32_scalars * self._config.ensemble_size
+        )
+        if persistent.uint32_scalars != expected_uint32 or bootstrap_bytes != 4 * bootstrap_words:
             raise ValueError("bootstrap PRNG key accounting does not match state")
 
         prediction = _logical_tree_accounting(self._zero_prediction())

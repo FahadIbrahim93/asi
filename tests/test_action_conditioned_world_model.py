@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import warnings
 from fractions import Fraction
+from types import MappingProxyType
 
 import chex
 import jax
@@ -457,8 +458,8 @@ class _FloatSpoof:
 @pytest.mark.parametrize(
     ("overrides", "message"),
     [
-        ({"reward_scale": _FloatSpoof()}, "reward_scale must be a finite real number"),
-        ({"observation_clip_margin": _FloatSpoof()}, "must be a finite real number"),
+        ({"reward_scale": _FloatSpoof()}, "reward_scale must be a finite real scalar"),
+        ({"observation_clip_margin": _FloatSpoof()}, "must be a finite real scalar"),
         ({"reward_scale": 1e100}, "reward_scale must remain finite once narrowed"),
         ({"max_delta_scale": 1e100}, "max_delta_scale must remain finite once narrowed"),
         ({"reward_scale": 1e-100}, "reward_scale must remain positive once narrowed"),
@@ -506,9 +507,12 @@ def test_config_canonicalizes_real_scalars_and_preserves_builtin_floats() -> Non
     assert restored.config == model.config
 
 
-def test_config_normalizes_real_comparison_hooks_and_conversion_failures() -> None:
+def test_config_rejects_real_subclasses_without_running_hooks() -> None:
+    hooks_run: list[str] = []
+
     class LyingFraction(Fraction):
         def __gt__(self, other: object) -> bool:
+            hooks_run.append("comparison")
             return True
 
         def __ge__(self, other: object) -> bool:
@@ -519,9 +523,10 @@ def test_config_normalizes_real_comparison_hooks_and_conversion_failures() -> No
 
     class BrokenFraction(Fraction):
         def as_integer_ratio(self) -> tuple[int, int]:
+            hooks_run.append("ratio")
             raise RuntimeError("conversion hook failed")
 
-    with pytest.raises(ValueError, match="reward_scale must be positive"):
+    with pytest.raises(ValueError, match="reward_scale must be a finite real scalar"):
         ActionConditionedWorldModel(
             ActionConditionedWorldModelConfig(
                 observation_dim=2,
@@ -530,7 +535,7 @@ def test_config_normalizes_real_comparison_hooks_and_conversion_failures() -> No
                 reward_scale=LyingFraction(-1, 1),
             )
         )
-    with pytest.raises(ValueError, match="gamma must be a finite real number"):
+    with pytest.raises(ValueError, match="gamma must be a finite real scalar"):
         ActionConditionedWorldModel(
             ActionConditionedWorldModelConfig(
                 observation_dim=2,
@@ -539,6 +544,7 @@ def test_config_normalizes_real_comparison_hooks_and_conversion_failures() -> No
                 gamma=BrokenFraction(1, 2),
             )
         )
+    assert hooks_run == []
 
 
 @pytest.mark.parametrize("value", [True, 1.5, "2", object()])
@@ -618,6 +624,23 @@ def test_config_serialization_preserves_list_and_tuple_compatibility() -> None:
     payload["hidden_sizes"] = range(2)
     with pytest.raises(ValueError, match="actual list or tuple"):
         ActionConditionedWorldModelConfig.from_config(payload)
+
+
+def test_config_mapping_compatibility_retains_exact_keys_and_type_marker() -> None:
+    partial = MappingProxyType({"observation_dim": 2, "n_actions": 2, "hidden_sizes": []})
+    assert ActionConditionedWorldModelConfig.from_config(partial).hidden_sizes == ()
+    with pytest.raises(ValueError, match="type differs"):
+        ActionConditionedWorldModelConfig.from_config(
+            {"type": "wrong", "observation_dim": 2, "n_actions": 2}
+        )
+
+    class StringSubclass(str):
+        pass
+
+    with pytest.raises(ValueError, match="exact strings"):
+        ActionConditionedWorldModelConfig.from_config(
+            {StringSubclass("observation_dim"): 2, "n_actions": 2}
+        )
 
 
 @pytest.mark.parametrize("discount", [1.5, -0.5, 5.0])
