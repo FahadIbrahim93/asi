@@ -48,6 +48,7 @@ References:
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+from fractions import Fraction
 from numbers import Integral
 from typing import Any, Literal, cast
 
@@ -174,48 +175,58 @@ _STEP7_CONFIG_FIELDS = frozenset(
         "planning_utility_step_size",
     }
 )
-_ACTUAL_INT_TYPES = frozenset(
-    {
-        int,
-        np.int8,
-        np.int16,
-        np.int32,
-        np.int64,
-        np.uint8,
-        np.uint16,
-        np.uint32,
-        np.uint64,
-        np.longlong,
-        np.ulonglong,
-    }
+_ACTUAL_INT_TYPES = (
+    int,
+    np.int8,
+    np.int16,
+    np.int32,
+    np.int64,
+    np.uint8,
+    np.uint16,
+    np.uint32,
+    np.uint64,
+    np.longlong,
+    np.ulonglong,
+)
+_ACTUAL_REAL_TYPES = _ACTUAL_INT_TYPES + (
+    float,
+    Fraction,
+    np.dtype("e").type,
+    np.dtype("f").type,
+    np.dtype("d").type,
+    np.dtype("g").type,
 )
 
 
-def _require_exact_str(name: str, value: object) -> str:
-    if type(value) is not str:
-        raise ValueError(f"{name} must be an exact string")
-    return value
+def _finite_real_and_float32(name: str, value: object) -> tuple[Any, int, int, float]:
+    """Validate scalar identity without invoking hooks on its metaclass."""
+    actual_type = type(value)
+    if not any(actual_type is allowed_type for allowed_type in _ACTUAL_REAL_TYPES):
+        mro = type.__getattribute__(actual_type, "__mro__")
+        has_real_lineage = actual_type is not bool and any(
+            base is int or base is float or base is Fraction for base in mro
+        )
+        requirement = "finite" if has_real_lineage else "a real number"
+        raise ValueError(f"{name} must be {requirement}")
+    return finite_real_and_float32(name, value)
 
 
-def _require_nonnegative_real(name: object, value: object) -> float:
-    host_name = _require_exact_str("name", name)
-    real, numerator, _, narrowed = finite_real_and_float32(host_name, value)
+def _require_nonnegative_real(name: str, value: object) -> float:
+    real, numerator, _, narrowed = _finite_real_and_float32(name, value)
     if real < 0.0 or numerator < 0 or narrowed < 0.0:
-        raise ValueError(f"{host_name} must be non-negative")
+        raise ValueError(f"{name} must be non-negative")
     return canonical_float32_storage(real, narrowed)
 
 
-def _require_positive_real(name: object, value: object) -> float:
-    host_name = _require_exact_str("name", name)
-    real, numerator, _, narrowed = finite_real_and_float32(host_name, value)
+def _require_positive_real(name: str, value: object) -> float:
+    real, numerator, _, narrowed = _finite_real_and_float32(name, value)
     if real <= 0.0 or numerator <= 0 or narrowed <= 0.0:
-        raise ValueError(f"{host_name} must be positive")
+        raise ValueError(f"{name} must be positive")
     return canonical_float32_storage(real, narrowed)
 
 
-def _require_unit_interval(name: object, value: object) -> float:
-    host_name = _require_exact_str("name", name)
-    real, numerator, denominator, narrowed = finite_real_and_float32(host_name, value)
+def _require_unit_interval(name: str, value: object) -> float:
+    real, numerator, denominator, narrowed = _finite_real_and_float32(name, value)
     if (
         real < 0.0
         or not real <= 1.0
@@ -224,37 +235,35 @@ def _require_unit_interval(name: object, value: object) -> float:
         or narrowed < 0.0
         or not narrowed <= 1.0
     ):
-        raise ValueError(f"{host_name} must be in [0, 1]")
+        raise ValueError(f"{name} must be in [0, 1]")
     return canonical_float32_storage(real, narrowed)
 
 
 def _require_int(
-    name: object,
+    name: str,
     value: object,
     *,
     minimum: int | None = None,
     maximum: int | None = None,
 ) -> int:
-    host_name = _require_exact_str("name", name)
     actual_type = type(value)
-    if actual_type not in _ACTUAL_INT_TYPES:
-        raise ValueError(f"{host_name} must be an integer")
+    if not any(actual_type is allowed_type for allowed_type in _ACTUAL_INT_TYPES):
+        raise ValueError(f"{name} must be an integer")
     number = int(cast(Integral, value))
     if minimum is not None and number < minimum:
         if minimum == 1:
-            raise ValueError(f"{host_name} must be positive")
+            raise ValueError(f"{name} must be positive")
         if minimum == 0:
-            raise ValueError(f"{host_name} must be non-negative")
-        raise ValueError(f"{host_name} must be >= {minimum}")
+            raise ValueError(f"{name} must be non-negative")
+        raise ValueError(f"{name} must be >= {minimum}")
     if maximum is not None and number > maximum:
-        raise ValueError(f"{host_name} must be at most int32 max")
+        raise ValueError(f"{name} must be at most int32 max")
     return number
 
 
-def _require_bool(name: object, value: object) -> bool:
-    host_name = _require_exact_str("name", name)
+def _require_bool(name: str, value: object) -> bool:
     if type(value) is not bool:
-        raise ValueError(f"{host_name} must be a built-in bool")
+        raise ValueError(f"{name} must be a built-in bool")
     return value
 
 
@@ -325,6 +334,14 @@ def _validate_planning_config(config: Step7DynaConfig) -> None:
     planning_evaluations = planning_steps * planning_rollout_depth
     if planning_evaluations > _INT32_MAX:
         raise ValueError("derived planning evaluations per update must fit signed int32")
+    planning_result_bytes = 33 * planning_steps
+    rollout_result_bytes = 8 * planning_evaluations
+    if (
+        planning_result_bytes > _INT32_MAX
+        or rollout_result_bytes > _INT32_MAX
+        or planning_result_bytes + rollout_result_bytes > _INT32_MAX
+    ):
+        raise ValueError("derived Step 7 planning output bytes must fit signed int32")
     memory_scalars = (
         2 * planning_memory_size * config.world_model.observation_dim
         + 4 * planning_memory_size
@@ -1338,13 +1355,31 @@ def run_step7_smoke(
     cfg = Step7DynaConfig() if config is None else config
     if type(cfg) is not Step7DynaConfig:
         raise TypeError("config must be an actual Step7DynaConfig")
-    smoke_scalars = (steps + 1) * cfg.world_model.observation_dim + steps
-    planning_outputs = steps * cfg.planning_steps * 9
+    observation_dim = cfg.world_model.observation_dim
+    input_bytes = 4 * ((steps + 1) * observation_dim + steps)
+    # Six scalar numeric/bool outputs plus the vector model error are retained
+    # for every real transition. Six numeric arrays and one bool array are
+    # retained for every planning backup.
+    real_output_bytes = steps * (17 + 4 * observation_dim)
+    planning_output_bytes = steps * cfg.planning_steps * 25
+    memory_scalars = (
+        2 * cfg.planning_memory_size * observation_dim
+        + 4 * cfg.planning_memory_size
+        + 3
+    )
+    memory_bytes = 4 * memory_scalars
+    total_bytes = input_bytes + real_output_bytes + planning_output_bytes + memory_bytes
     if any(
-        count > _INT32_MAX or 4 * count > _INT32_MAX
-        for count in (smoke_scalars, planning_outputs, smoke_scalars + planning_outputs)
+        count > _INT32_MAX
+        for count in (
+            input_bytes,
+            real_output_bytes,
+            planning_output_bytes,
+            memory_bytes,
+            total_bytes,
+        )
     ):
-        raise ValueError("derived Step 7 smoke float32 resources exceed signed-int32 bounds")
+        raise ValueError("derived Step 7 smoke resources exceed signed-int32 bounds")
     agent, model = make_step7_components(cfg)
     data_key, state_key = jr.split(jr.key(seed))
     observations = jr.normal(

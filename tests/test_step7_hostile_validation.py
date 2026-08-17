@@ -14,6 +14,7 @@ from alberta_framework.steps.step7 import (
     init_step7_state,
     make_step7_components,
     run_step7_scan,
+    run_step7_smoke,
 )
 from alberta_framework.steps.step8 import Step8WorldModelConfig
 
@@ -39,6 +40,10 @@ class _StringSubclass(str):
 class _HostileInt(int):
     calls = 0
 
+    def __int__(self) -> int:
+        type(self).calls += 1
+        raise AssertionError("HostileInt.__int__ must not be called")
+
     def __index__(self) -> int:  # type: ignore[override]
         type(self).calls += 1
         raise AssertionError("HostileInt.__index__ must not be called")
@@ -62,6 +67,30 @@ class _HostileFloat(float):
     def __repr__(self) -> str:
         type(self).calls += 1
         raise AssertionError("HostileFloat.__repr__ must not be called")
+
+
+class _HostileIntMeta(type):
+    calls = 0
+
+    def __hash__(cls) -> int:
+        type(cls).calls += 1
+        raise AssertionError("HostileIntMeta.__hash__ must not be called")
+
+
+class _MetaclassHostileInt(int, metaclass=_HostileIntMeta):
+    pass
+
+
+class _HostileFloatMeta(type):
+    calls = 0
+
+    def __hash__(cls) -> int:
+        type(cls).calls += 1
+        raise AssertionError("HostileFloatMeta.__hash__ must not be called")
+
+
+class _MetaclassHostileFloat(float, metaclass=_HostileFloatMeta):
+    pass
 
 
 def _valid_config_kwargs() -> dict[str, Any]:
@@ -97,6 +126,13 @@ def test_rejects_bool_and_hostile_int() -> None:
     assert "HostileInt" not in str(exc.value)
 
 
+def test_rejects_hostile_int_metaclass_without_hooks() -> None:
+    _HostileIntMeta.calls = 0
+    with pytest.raises(ValueError, match="must be an integer"):
+        Step7DynaConfig(**{**_valid_config_kwargs(), "planning_steps": _MetaclassHostileInt(2)})
+    assert _HostileIntMeta.calls == 0
+
+
 def test_rejects_hostile_float_without_hook_and_repr_leak() -> None:
     _HostileFloat.calls = 0
     with pytest.raises(ValueError, match="must be") as exc:
@@ -106,14 +142,16 @@ def test_rejects_hostile_float_without_hook_and_repr_leak() -> None:
     assert "!r" not in str(exc.value)
 
 
-def test_does_not_invoke_hostile_value_when_name_is_evil_via_sink() -> None:
-    from alberta_framework.steps._float32_validation import finite_real_and_float32
-
-    evil = _EvilStr("x")
-    _HostileFloat.calls = 0
-    with pytest.raises(ValueError, match="must be an exact string"):
-        finite_real_and_float32(evil, _HostileFloat(1.0))  # type: ignore[arg-type]
-    assert _HostileFloat.calls == 0
+def test_rejects_hostile_float_metaclass_without_hooks() -> None:
+    _HostileFloatMeta.calls = 0
+    with pytest.raises(ValueError, match="must be finite"):
+        Step7DynaConfig(
+            **{
+                **_valid_config_kwargs(),
+                "planning_utility_step_size": _MetaclassHostileFloat(0.1),
+            }
+        )
+    assert _HostileFloatMeta.calls == 0
 
 
 def test_rejects_plain_string_for_utility_step() -> None:
@@ -244,3 +282,14 @@ def test_init_and_scan_reject_hostile_arrays_without_hooks() -> None:
             jnp.zeros(1, dtype=jnp.int32),
             jnp.zeros((1, 2), dtype=jnp.float32),
         )
+
+
+def test_smoke_preflights_all_live_arrays_before_allocation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unexpected_allocation(*args: object, **kwargs: object) -> None:
+        raise AssertionError("allocation must not start before resource preflight")
+
+    monkeypatch.setattr(jr, "normal", unexpected_allocation)
+    with pytest.raises(ValueError, match="smoke resources"):
+        run_step7_smoke(steps=50_000_000)
