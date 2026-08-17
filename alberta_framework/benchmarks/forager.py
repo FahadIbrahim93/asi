@@ -235,9 +235,16 @@ def _require_builtin_int(
 
 def _require_real(value: Any, *, name: str) -> float:
     """Validate a built-in finite real scalar while excluding booleans."""
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    actual_type = type(value)
+    # Preserve the historical acceptance of NumPy's concrete float64 scalar,
+    # which is a float subtype, without admitting arbitrary user-defined
+    # int/float subclasses with overloaded conversion or arithmetic hooks.
+    if actual_type not in (int, float, np.float64):
         raise ValueError(f"{name} must be a real number")
-    converted = float(value)
+    try:
+        converted = float(cast(Any, value))
+    except (OverflowError, TypeError, ValueError) as error:
+        raise ValueError(f"{name} must be finite") from error
     if not math.isfinite(converted):
         raise ValueError(f"{name} must be finite")
     return converted
@@ -1673,6 +1680,7 @@ class ForagerBenchmarkConfig:
         ewm_decay = _require_real(self.ewm_decay, name="ewm_decay")
         if not 0.0 <= ewm_decay < 1.0:
             raise ValueError("ewm_decay must lie in [0, 1)")
+        object.__setattr__(self, "ewm_decay", ewm_decay)
         _require_builtin_int(
             self.record_every,
             name="record_every",
