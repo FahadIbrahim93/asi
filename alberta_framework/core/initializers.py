@@ -5,12 +5,75 @@ Implements sparse initialization following Elsayed et al. 2024
 """
 
 import math
+import operator
+from fractions import Fraction
+from typing import SupportsIndex, cast
 
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 from jax import Array
 from jaxtyping import Float
+
+from alberta_framework.core._float32_scalars import (
+    validated_float32_scalar_with_ratio,
+)
+
+_INT32_MAX = 2_147_483_647
+_ACTUAL_INT_TYPES = frozenset(
+    {
+        int,
+        np.int8,
+        np.int16,
+        np.int32,
+        np.int64,
+        np.uint8,
+        np.uint16,
+        np.uint32,
+        np.uint64,
+        np.longlong,
+        np.ulonglong,
+    }
+)
+_ACTUAL_FLOAT_TYPES = frozenset(
+    {float, Fraction, *(np.dtype(c).type for c in ("e", "f", "d", "g"))}
+)
+_ALLOWED_REAL_TYPES = _ACTUAL_INT_TYPES | _ACTUAL_FLOAT_TYPES
+
+
+def _require_int(name: str, value: object, *, minimum: int, maximum: int = _INT32_MAX) -> int:
+    if type(value) not in _ACTUAL_INT_TYPES:
+        raise ValueError(f"{name} must be an integer")
+    number = operator.index(cast(SupportsIndex, value))
+    if number < minimum:
+        raise ValueError(f"{name} must be >= {minimum}")
+    if number > maximum:
+        raise ValueError(f"{name} must be <= {maximum}")
+    return number
+
+
+def _require_float32_in_unit(name: str, value: object) -> float:
+    if type(value) not in _ALLOWED_REAL_TYPES:
+        raise ValueError(f"{name} must be a real number")
+    stored, numerator, denominator = validated_float32_scalar_with_ratio(
+        name, value
+    )
+    if not math.isfinite(stored):
+        raise ValueError(f"{name} must be finite")
+    if stored < 0.0 or stored > 1.0:
+        raise ValueError(f"{name} must be in [0, 1]")
+    if numerator != 0 and abs(numerator) * (1 << 149) <= denominator:
+        raise ValueError(f"{name} is subnormal and would flush to zero")
+    return stored
+
+
+def _require_init_type(value: object) -> str:
+    if type(value) is not str:
+        raise ValueError("init_type must be 'uniform' or 'normal'")
+    if value not in ("uniform", "normal"):
+        raise ValueError("init_type must be 'uniform' or 'normal'")
+    return value
 
 
 def sparse_init(
@@ -53,45 +116,38 @@ def sparse_init(
     # weights has shape (128, 10), ~90% zeros per row
     ```
     """
-    if not isinstance(shape, (tuple, list)) or len(shape) != 2:
-        raise ValueError(
-            f"shape must be a two-element tuple or list (fan_out, fan_in), got {shape!r}"
-        )
-    fan_out, fan_in = shape
-    if (
-        isinstance(fan_out, bool)
-        or isinstance(fan_in, bool)
-        or not isinstance(fan_out, (int, jnp.integer))
-        or not isinstance(fan_in, (int, jnp.integer))
-        or fan_out <= 0
-        or fan_in <= 0
-    ):
-        raise ValueError(
-            f"shape dimensions must be positive integers, got fan_out={fan_out}, fan_in={fan_in}"
-        )
-    if (
-        isinstance(sparsity, bool)
-        or not isinstance(sparsity, (int, float, jnp.floating, jnp.integer))
-        or not (0.0 <= sparsity <= 1.0)
-        or not math.isfinite(sparsity)
-    ):
-        raise ValueError(
-            f"sparsity must be a finite real number in [0.0, 1.0], got {sparsity!r}"
-        )
-    num_zeros = int(sparsity * fan_in + 0.5)  # round to nearest int
+    if type(shape) not in (tuple, list) or len(shape) != 2:
+        raise ValueError("shape must be a two-element tuple or list (fan_out, fan_in)")
+    # Extract without invoking hostile __iter__ hooks beyond the exact tuple/list check
+    try:
+        fan_out_raw, fan_in_raw = shape
+    except Exception as error:
+        raise ValueError("shape must be a two-element tuple or list (fan_out, fan_in)") from error
+    fan_out = _require_int("fan_out", fan_out_raw, minimum=1)
+    fan_in = _require_int("fan_in", fan_in_raw, minimum=1)
+    if fan_out > _INT32_MAX or fan_in > _INT32_MAX:
+        raise ValueError("shape dimensions must fit signed int32")
+    # Allocation-free preflight: fan_out * fan_in * 4 bytes must fit int32
+    if fan_out > _INT32_MAX // max(1, fan_in) or 4 * fan_out * fan_in > _INT32_MAX:
+        raise ValueError("shape byte count must fit signed int32")
+    sparsity_validated = _require_float32_in_unit("sparsity", sparsity)
+    num_zeros = int(sparsity_validated * fan_in + 0.5)  # round to nearest int
 
     # Split key for init and sparsity mask
     init_key, mask_key = jr.split(key)
 
     # SparseInit Algorithm 1 uses this exact uniform bound; its variance is
     # deliberately not JAX's canonical ``lecun_uniform`` variance.
+    init_type_checked = _require_init_type(init_type)
     scale = 1.0 / fan_in**0.5
-    if init_type == "uniform":
-        weights = jr.uniform(init_key, shape, dtype=jnp.float32, minval=-scale, maxval=scale)
-    elif init_type == "normal":
-        weights = jr.normal(init_key, shape, dtype=jnp.float32) * scale
+    if init_type_checked == "uniform":
+        weights = jr.uniform(
+            init_key, (fan_out, fan_in), dtype=jnp.float32, minval=-scale, maxval=scale
+        )
+    elif init_type_checked == "normal":
+        weights = jr.normal(init_key, (fan_out, fan_in), dtype=jnp.float32) * scale
     else:
-        raise ValueError(f"init_type must be 'uniform' or 'normal', got '{init_type}'")
+        raise ValueError("init_type must be 'uniform' or 'normal'")
 
     if num_zeros <= 0:
         return weights
@@ -100,9 +156,9 @@ def sparse_init(
 
     # Exact per-row sparsity without per-row random permutations.  `jr.permutation`
     # lowers to a shuffle kernel that can be very slow to compile in large suites.
-    scores = jr.uniform(mask_key, shape, dtype=jnp.float32)
+    scores = jr.uniform(mask_key, (fan_out, fan_in), dtype=jnp.float32)
     zero_idx = jax.lax.top_k(scores, num_zeros)[1]
     row_idx = jnp.arange(fan_out)[:, None]
-    masks = jnp.ones(shape, dtype=jnp.float32).at[row_idx, zero_idx].set(0.0)
+    masks = jnp.ones((fan_out, fan_in), dtype=jnp.float32).at[row_idx, zero_idx].set(0.0)
 
     return weights * masks
