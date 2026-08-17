@@ -395,6 +395,7 @@ def validate_environment_runtime_profile(
         ffmpeg["distribution"] != "imageio-ffmpeg"
         or ffmpeg["version"] != ffmpeg_record["version"]
         or ffmpeg["record_sha256"] != ffmpeg_record["record_sha256"]
+        or type(ffmpeg["mode"]) is not int
         or ffmpeg["mode"] != 0o555
         or PurePosixPath(ffmpeg_relative_path).is_absolute()
         or ".." in PurePosixPath(ffmpeg_relative_path).parts

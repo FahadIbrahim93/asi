@@ -422,6 +422,15 @@ def test_runtime_profile_rejects_identity_drift(
         validate_environment_runtime_profile(profile)
 
 
+def test_runtime_profile_rejects_non_integer_executable_mode() -> None:
+    profile = _matched_gpu_profile()
+    executable = profile["bundled_executables"]["imageio-ffmpeg"]  # type: ignore[index]
+    executable["mode"] = 365.0  # type: ignore[index]
+
+    with pytest.raises(ValueError, match="imageio-ffmpeg identity"):
+        validate_environment_runtime_profile(profile)
+
+
 def test_runtime_profile_rejects_duplicate_environment_variable() -> None:
     profile = _matched_gpu_profile()
     environment = profile["container_environment"]
