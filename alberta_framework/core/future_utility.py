@@ -100,7 +100,7 @@ def trace_decay_from_half_life(half_life: float | Array) -> Float[Array, ""]:
     half-life ``1`` (decay ``0.5``) and non-finite values cannot become
     ``nan``/``1.0`` decays. JAX arrays and tracers keep the device formula.
     """
-    if not isinstance(half_life, Array) and not hasattr(half_life, "aval"):
+    if not isinstance(half_life, Array):
         half_life = validated_float32_scalar("half_life", half_life, lower=0.0)
     half_life_arr = jnp.asarray(half_life, dtype=jnp.float32)
     return jnp.where(

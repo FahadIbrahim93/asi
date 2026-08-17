@@ -682,9 +682,7 @@ class PrototypeAgentConfig:
         )
         # horde_hidden_sizes: hostile-safe per-element validation
         raw_hidden = self.horde_hidden_sizes
-        if isinstance(raw_hidden, (str, bytes)):
-            raise ValueError("horde_hidden_sizes must be a tuple of integers")
-        if not isinstance(raw_hidden, (tuple, list)):
+        if type(raw_hidden) is not tuple:
             raise ValueError("horde_hidden_sizes must be a tuple of integers")
         canonical_hidden: list[int] = []
         for idx, value in enumerate(raw_hidden):
@@ -1288,10 +1286,8 @@ class PrototypeAgentConfig:
 
         # Hostile-safe scalar canonicalization for serialized fields
         hidden_raw = data.pop("horde_hidden_sizes", [64, 64])
-        if isinstance(hidden_raw, (str, bytes)):
-            raise ValueError("horde_hidden_sizes must be a sequence of integers")
-        if not isinstance(hidden_raw, (list, tuple)):
-            raise ValueError("horde_hidden_sizes must be a sequence of integers")
+        if type(hidden_raw) is not list:
+            raise ValueError("serialized horde_hidden_sizes must be an actual list")
         hidden_list: list[int] = []
         for idx, value in enumerate(hidden_raw):
             hidden_list.append(

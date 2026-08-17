@@ -130,6 +130,8 @@ def test_prototype_float_validators_reject_spoof_and_nonfinite() -> None:
 
 def test_prototype_hidden_sizes_hostile_and_range() -> None:
     with pytest.raises(ValueError, match="horde_hidden_sizes"):
+        _cfg(horde_hidden_sizes=[32])  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="horde_hidden_sizes"):
         _cfg(horde_hidden_sizes=(_HostileInt(32),))  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="horde_hidden_sizes"):
         _cfg(horde_hidden_sizes=(_RaisingRepr(),))  # type: ignore[arg-type]
@@ -141,6 +143,13 @@ def test_prototype_hidden_sizes_hostile_and_range() -> None:
         _cfg(horde_hidden_sizes="64")  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="horde_hidden_sizes"):
         _cfg(horde_hidden_sizes=(True,))  # type: ignore[arg-type]
+
+
+def test_prototype_serialized_hidden_sizes_require_json_list() -> None:
+    payload = _cfg(horde_hidden_sizes=(32, 16)).to_config()
+    payload["horde_hidden_sizes"] = (32, 16)
+    with pytest.raises(ValueError, match="actual list"):
+        PrototypeAgentConfig.from_config(payload)
 
 
 def test_prototype_require_float32_resource_boundaries() -> None:
