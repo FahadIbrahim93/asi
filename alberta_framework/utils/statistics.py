@@ -4,22 +4,45 @@ Provides functions for computing confidence intervals, significance tests,
 effect sizes, and multiple comparison corrections.
 """
 
-import math
 import operator
 from collections.abc import Mapping
-from numbers import Real
+from fractions import Fraction
 from typing import TYPE_CHECKING, NamedTuple, SupportsIndex, cast
 
 import numpy as np
 from numpy.typing import NDArray
+
+from alberta_framework.core._float32_scalars import validated_float32_scalar
 
 if TYPE_CHECKING:
     from alberta_framework.utils.experiments import AggregatedResults
 
 
 _ACTUAL_INT_TYPES = frozenset(
-    {int, *(np.dtype(code).type for code in "bBhHiIlLqQpP")}
+    {
+        int,
+        np.int8,
+        np.int16,
+        np.int32,
+        np.int64,
+        np.uint8,
+        np.uint16,
+        np.uint32,
+        np.uint64,
+        np.longlong,
+        np.ulonglong,
+    }
 )
+_ACTUAL_FLOAT_TYPES = frozenset(
+    {float, Fraction, *(np.dtype(code).type for code in ("e", "f", "d", "g"))}
+)
+_ALLOWED_REAL_TYPES = _ACTUAL_INT_TYPES | _ACTUAL_FLOAT_TYPES
+
+
+def _require_exact_str(name: str, value: object) -> str:
+    if type(value) is not str:
+        raise ValueError(f"{name} must be an exact string")
+    return value
 
 
 class StatisticalSummary(NamedTuple):
@@ -70,12 +93,21 @@ class SignificanceResult(NamedTuple):
     method_b: str
 
 
-def _validate_confidence_level(confidence_level: float) -> None:
-    if not 0.0 < confidence_level < 1.0:
-        raise ValueError(
-            "confidence_level must be strictly between 0 and 1 "
-            f"(got {confidence_level!r})"
+def _validate_confidence_level(confidence_level: object) -> None:
+    if type(confidence_level) not in _ALLOWED_REAL_TYPES:
+        raise ValueError("confidence_level must be strictly between 0 and 1")
+    try:
+        validated = validated_float32_scalar(
+            "confidence_level",
+            confidence_level,
+            positive=True,
+            upper=1.0,
+            upper_inclusive=False,
         )
+    except ValueError:
+        raise ValueError("confidence_level must be strictly between 0 and 1") from None
+    # validated ensures (0,1); keep for mypy
+    _ = validated
 
 
 def _require_finite_values(values: NDArray[np.floating], *, name: str) -> None:
@@ -101,19 +133,20 @@ def _require_sample_vector(values: object, *, name: str) -> NDArray[np.float64]:
 
 
 def _require_probability(value: object, *, name: str, strict: bool) -> float:
-    """Return one canonical finite probability, rejecting booleans and coercions."""
-    if isinstance(value, bool) or not issubclass(type(value), Real):
+    if type(value) not in _ALLOWED_REAL_TYPES:
         domain = "strictly between 0 and 1" if strict else "in [0, 1]"
         raise ValueError(f"{name} must be a finite real {domain}")
     try:
-        probability = float(cast(Real, value))
-    except (OverflowError, TypeError, ValueError):
-        probability = math.nan
-    valid = 0.0 < probability < 1.0 if strict else 0.0 <= probability <= 1.0
-    if not math.isfinite(probability) or not valid:
+        if strict:
+            return validated_float32_scalar(
+                name, value, positive=True, upper=1.0, upper_inclusive=False
+            )
+        return validated_float32_scalar(
+            name, value, lower=0.0, upper=1.0, upper_inclusive=True
+        )
+    except ValueError:
         domain = "strictly between 0 and 1" if strict else "in [0, 1]"
-        raise ValueError(f"{name} must be a finite real {domain}")
-    return probability
+        raise ValueError(f"{name} must be a finite real {domain}") from None
 
 
 def _require_alpha(alpha: object) -> float:
@@ -345,9 +378,11 @@ def ttest_comparison(
             )
         if len(a) < 2:
             raise ValueError(f"paired t-test requires at least 2 pairs (got {len(a)})")
+        _require_exact_str("method_a", method_a)
+        _require_exact_str("method_b", method_b)
         if np.array_equal(a, b):
             raise ValueError(
-                f"Paired comparison {method_a!r} vs {method_b!r} has identical "
+                f"Paired comparison '{method_a}' vs '{method_b}' has identical "
                 "samples; the paired t statistic is undefined"
             )
     elif len(a) == 0 or len(b) == 0:
@@ -507,9 +542,11 @@ def wilcoxon_comparison(
             f"Wilcoxon signed-rank test requires equal-length samples "
             f"(got {len(a)} and {len(b)})"
         )
+    _require_exact_str("method_a", method_a)
+    _require_exact_str("method_b", method_b)
     if a.size > 0 and np.array_equal(a, b):
         raise ValueError(
-            f"Paired comparison {method_a!r} vs {method_b!r} has identical "
+            f"Paired comparison '{method_a}' vs '{method_b}' has identical "
             "samples; the Wilcoxon signed-rank statistic is undefined"
         )
     if len(a) < 2:
@@ -641,8 +678,9 @@ def common_final_window(step_counts: Mapping[str, int], window: int, metric: str
         described = ", ".join(
             f"{name}: {n_steps} steps" for name, n_steps in sorted(step_counts.items())
         )
+        _require_exact_str("metric", metric)
         raise ValueError(
-            f"window={window} exceeds the shortest {metric!r} trace and the traces differ "
+            f"window={window} exceeds the shortest '{metric}' trace and the traces differ "
             f"in length ({described}); every method must average the same number of "
             "final steps"
         )
@@ -694,17 +732,22 @@ def pairwise_comparisons(
         if not isinstance(agg, AggregatedResults):
             raise TypeError(f"Expected AggregatedResults, got {type(agg)}")
         arr = agg.metric_arrays[metric]
+        _require_exact_str("name", name)
         if len(set(agg.seeds)) != len(agg.seeds):
-            raise ValueError(f"AggregatedResults {name!r} contains duplicate seeds")
+            raise ValueError(f"AggregatedResults '{name}' contains duplicate seeds")
+        _require_exact_str("name", name)
+        _require_exact_str("metric", metric)
         if len(agg.seeds) != arr.shape[0]:
             raise ValueError(
-                f"AggregatedResults {name!r} seed count ({len(agg.seeds)}) does not match "
-                f"metric rows ({arr.shape[0]}) for {metric!r}"
+                f"AggregatedResults '{name}' seed count ({len(agg.seeds)}) does not match "
+                f"metric rows ({arr.shape[0]}) for '{metric}'"
             )
+        _require_exact_str("name", name)
+        _require_exact_str("metric", metric)
         if arr.shape[1] == 0:
             raise ValueError(
-                f"AggregatedResults {name!r} must contain at least one metric step "
-                f"for {metric!r}"
+                f"AggregatedResults '{name}' must contain at least one metric step "
+                f"for '{metric}'"
             )
         metric_arrays[name] = arr
         seeds_by_name[name] = agg.seeds
@@ -737,7 +780,7 @@ def pairwise_comparisons(
                 seeds_b = seeds_by_name[name_b]
                 if set(seeds_a) != set(seeds_b):
                     raise ValueError(
-                        f"Paired comparison {name_a!r} vs {name_b!r} requires equal seed sets"
+                        f"Paired comparison '{name_a}' vs '{name_b}' requires equal seed sets"
                     )
                 index_b_by_seed = {seed: index for index, seed in enumerate(seeds_b)}
                 values_b = values_b[[index_b_by_seed[seed] for seed in seeds_a]]
@@ -827,10 +870,8 @@ def bootstrap_ci(
             "(a NaN interval would be indistinguishable from a real CI)"
         )
     _require_finite_values(arr, name="values")
-    if statistic not in ("mean", "median"):
-        raise ValueError(
-            f"statistic must be either 'mean' or 'median' (got {statistic!r})"
-        )
+    if type(statistic) is not str or statistic not in ("mean", "median"):
+        raise ValueError("statistic must be either 'mean' or 'median'")
     _validate_confidence_level(confidence_level)
     n_bootstrap = _require_positive_int("n_bootstrap", n_bootstrap)
     rng = np.random.default_rng(seed)
