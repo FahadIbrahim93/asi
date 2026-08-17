@@ -21,6 +21,7 @@ from alberta_framework.steps.step6 import Step6DifferentialSARSAConfig
 from alberta_framework.steps.step9 import (
     Step9DreamingConfig,
     Step9DreamingState,
+    Step9SmokeResult,
     init_step9_state,
     make_step9_components,
     run_step9_scan,
@@ -960,3 +961,54 @@ def test_step9_state_stays_finite_over_many_steps() -> None:
     )
     result = run_step9_smoke(cfg, steps=128, seed=7)
     assert result.finite
+
+
+def _legal_step9_smoke_result(**overrides: object) -> Step9SmokeResult:
+    payload: dict[str, object] = {
+        "config": Step9DreamingConfig(),
+        "steps": 8,
+        "seed": 0,
+        "real_td_errors_shape": (8,),
+        "dream_td_errors_shape": (8,),
+        "actions_shape": (8,),
+        "finite": True,
+        "dream_acceptance_count": 1,
+        "control_config": {"ok": True},
+        "world_model_config": {"ok": True},
+    }
+    payload.update(overrides)
+    return Step9SmokeResult(**payload)  # type: ignore[arg-type]
+
+
+def test_step9_smoke_result_rejects_leftover_identities() -> None:
+    """Public Step 9 smoke records must not keep leftover bool/int identities."""
+
+    with pytest.raises(ValueError, match="steps"):
+        _legal_step9_smoke_result(steps=True)
+    with pytest.raises(ValueError, match="steps"):
+        _legal_step9_smoke_result(steps=float("nan"))
+    with pytest.raises(ValueError, match="seed"):
+        _legal_step9_smoke_result(seed=True)
+    with pytest.raises(ValueError, match="finite"):
+        _legal_step9_smoke_result(finite=1)
+    with pytest.raises(ValueError, match="dream_acceptance_count"):
+        _legal_step9_smoke_result(dream_acceptance_count=True)
+
+    legal = _legal_step9_smoke_result()
+    dumped = json.dumps(
+        {
+            "steps": legal.steps,
+            "seed": legal.seed,
+            "finite": legal.finite,
+            "dream_acceptance_count": legal.dream_acceptance_count,
+        },
+        allow_nan=False,
+    )
+    assert '"steps": 8' in dumped
+    assert '"seed": 0' in dumped
+    assert '"finite": true' in dumped
+    assert '"dream_acceptance_count": 1' in dumped
+    assert '"steps": true' not in dumped
+    assert '"seed": true' not in dumped
+    assert '"finite": 1' not in dumped
+    assert '"dream_acceptance_count": true' not in dumped
