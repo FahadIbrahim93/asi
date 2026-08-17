@@ -3,11 +3,18 @@
 from fractions import Fraction
 from typing import Any, cast
 
+import jax.numpy as jnp
+import jax.random as jr
 import numpy as np
 import pytest
 
 from alberta_framework.steps.step6 import Step6DifferentialSARSAConfig
-from alberta_framework.steps.step7 import Step7DynaConfig
+from alberta_framework.steps.step7 import (
+    Step7DynaConfig,
+    init_step7_state,
+    make_step7_components,
+    run_step7_scan,
+)
 from alberta_framework.steps.step8 import Step8WorldModelConfig
 
 
@@ -175,3 +182,65 @@ def test_float_subclass_with_lying_ratio_is_rejected() -> None:
     with pytest.raises(ValueError, match="must be"):
         Step7DynaConfig(**{**_valid_config_kwargs(), "planning_utility_step_size": RatioFloat(0.1)})
     assert RatioFloat.calls == 0
+
+
+def test_config_requires_exact_nested_records_and_closed_dict_schema() -> None:
+    class ControlSubclass(Step6DifferentialSARSAConfig):
+        pass
+
+    hostile_control = object.__new__(ControlSubclass)
+    with pytest.raises(ValueError, match="actual Step6"):
+        Step7DynaConfig(control=hostile_control)
+    payload = Step7DynaConfig().to_dict()
+    with pytest.raises(ValueError, match="exact Step7"):
+        Step7DynaConfig.from_dict({**payload, "extra": 1})
+
+    class DictSubclass(dict[str, object]):
+        pass
+
+    with pytest.raises(ValueError, match="actual dict"):
+        Step7DynaConfig.from_dict(DictSubclass(payload))
+
+
+class _HostileArray:
+    calls = 0
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        type(self).calls += 1
+        raise AssertionError("shape hook must not run")
+
+
+def test_init_and_scan_reject_hostile_arrays_without_hooks() -> None:
+    cfg = Step7DynaConfig(
+        control=Step6DifferentialSARSAConfig(n_actions=2),
+        world_model=Step8WorldModelConfig(observation_dim=2, n_actions=2),
+        planning_memory_size=2,
+    )
+    agent, model = make_step7_components(cfg)
+    _HostileArray.calls = 0
+    with pytest.raises(TypeError, match="trusted array"):
+        init_step7_state(
+            agent,
+            model,
+            key=jr.key(0),
+            initial_observation=cast(Any, _HostileArray()),
+            memory_size=2,
+        )
+    assert _HostileArray.calls == 0
+    state = init_step7_state(
+        agent,
+        model,
+        key=jr.key(0),
+        initial_observation=jnp.zeros(2, dtype=jnp.float32),
+        memory_size=2,
+    )
+    with pytest.raises(TypeError, match="rewards.*float32"):
+        run_step7_scan(
+            cfg,
+            agent,
+            model,
+            state,
+            jnp.zeros(1, dtype=jnp.int32),
+            jnp.zeros((1, 2), dtype=jnp.float32),
+        )
