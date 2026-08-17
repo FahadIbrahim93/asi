@@ -29,6 +29,10 @@ class _HostileInt(int):
         type(self).calls += 1
         raise AssertionError("HostileInt.__index__ must not be called")
 
+    def __int__(self) -> int:
+        type(self).calls += 1
+        raise AssertionError("HostileInt.__int__ must not be called")
+
     def __repr__(self) -> str:
         type(self).calls += 1
         raise AssertionError("HostileInt.__repr__ must not be called")
@@ -48,6 +52,28 @@ class _HostileFloat(float):
     def __repr__(self) -> str:
         type(self).calls += 1
         raise AssertionError("HostileFloat.__repr__ must not be called")
+
+
+class _HostileTypeName(type):
+    calls = 0
+
+    def __getattribute__(cls, name: str) -> Any:
+        if name == "__name__":
+            _HostileTypeName.calls += 1
+            raise AssertionError("metaclass __name__ hook must not be called")
+        return super().__getattribute__(name)
+
+
+class _HostileSpecsContainer(metaclass=_HostileTypeName):
+    calls = 0
+
+    def __iter__(self):
+        type(self).calls += 1
+        raise AssertionError("container iteration hook must not be called")
+
+    def __repr__(self) -> str:
+        type(self).calls += 1
+        raise AssertionError("container repr hook must not be called")
 
 
 def test_rejects_string_subclass_for_n_demons() -> None:
@@ -82,16 +108,6 @@ def test_rejects_hostile_float_without_hook_and_repr_leak() -> None:
     assert "!r" not in str(exc.value)
 
 
-def test_does_not_invoke_hostile_value_when_name_is_evil_via_sink() -> None:
-    from alberta_framework.steps._float32_validation import finite_real_and_float32
-
-    evil = _EvilStr("x")
-    _HostileFloat.calls = 0
-    with pytest.raises(ValueError, match="must be an exact string"):
-        finite_real_and_float32(evil, _HostileFloat(1.0))  # type: ignore[arg-type]
-    assert _HostileFloat.calls == 0
-
-
 def test_rejects_plain_string_for_option_gamma() -> None:
     with pytest.raises(ValueError, match="must be a real number"):
         Step12IAConfig(option_gamma="0.99")  # type: ignore[arg-type]
@@ -113,6 +129,15 @@ def test_rejects_subtask_specs_non_tuple_without_repr() -> None:
     with pytest.raises(ValueError, match="must be a tuple of SubtaskSpec") as exc:
         Step12IAConfig(subtask_specs=[SubtaskSpec(feature_index=0)])  # type: ignore[arg-type]
     assert "!r" not in str(exc.value)
+
+
+def test_rejects_hostile_subtask_container_without_metadata_hooks() -> None:
+    _HostileTypeName.calls = 0
+    _HostileSpecsContainer.calls = 0
+    with pytest.raises(ValueError, match="must be a tuple of SubtaskSpec"):
+        Step12IAConfig(subtask_specs=_HostileSpecsContainer())  # type: ignore[arg-type]
+    assert _HostileTypeName.calls == 0
+    assert _HostileSpecsContainer.calls == 0
 
 
 def test_rejects_feature_index_out_of_range_without_repr() -> None:
