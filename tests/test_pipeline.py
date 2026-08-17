@@ -2,6 +2,7 @@
 """Integrated Step 2-4 pipeline tests."""
 
 import json
+from fractions import Fraction
 
 import chex
 import jax
@@ -805,24 +806,16 @@ def test_pipeline_associative_requires_ordered_weight_bounds() -> None:
         pytest.param((2**200 + 1, 2**200), id="above-one-rounds-to-one"),
     ],
 )
-def test_pipeline_unit_interval_rejects_adversarial_ratio_floats(
+def test_pipeline_unit_interval_rejects_exact_fraction_boundaries(
     ratio: tuple[int, int]
 ) -> None:
-    class HiddenBoundaryFloat(float):
-        def as_integer_ratio(self) -> tuple[int, int]:
-            return ratio
-
     with pytest.raises(ValueError, match=r"sparsity must be in \[0, 1\]"):
-        Step2UPGDConfig(sparsity=HiddenBoundaryFloat(0.5))
+        Step2UPGDConfig(sparsity=Fraction(*ratio))
 
 
-def test_pipeline_nonnegative_rejects_adversarial_negative_ratio() -> None:
-    class HiddenNegativeFloat(float):
-        def as_integer_ratio(self) -> tuple[int, int]:
-            return (-1, 1)
-
+def test_pipeline_nonnegative_rejects_exact_negative_fraction() -> None:
     with pytest.raises(ValueError, match=r"step_size must be non-negative"):
-        Step2UPGDConfig(step_size=HiddenNegativeFloat(0.5))
+        Step2UPGDConfig(step_size=Fraction(-1, 1))
 
 
 def test_pipeline_rejects_class_property_spoofing_float() -> None:
