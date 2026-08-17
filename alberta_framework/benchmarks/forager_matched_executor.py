@@ -2229,7 +2229,15 @@ def _replay_configuration_transforms(candidate: MatchedCandidate, original: byte
     if not transforms:
         return original
     decoded = _object(decode_strict_json(original), "original candidate configuration")
-    expected_configuration = cast(dict[str, Any], json.loads(json.dumps(decoded)))
+    try:
+        expected_configuration = cast(
+            dict[str, Any],
+            json.loads(json.dumps(decoded, allow_nan=False)),
+        )
+    except (TypeError, ValueError) as exc:
+        raise ForagerMatchedExecutorError(
+            "original configuration is not finite canonical JSON"
+        ) from exc
     transformed = original
     for transform in transforms:
         if (
