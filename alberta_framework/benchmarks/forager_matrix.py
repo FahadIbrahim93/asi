@@ -1617,7 +1617,7 @@ def _json_safe(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_json_safe(item) for item in value]
     if isinstance(value, float) and not math.isfinite(value):
-        return None
+        raise ForagerMatrixError("matrix artifact identity is not finite JSON")
     if isinstance(value, Path):
         if value.is_absolute():
             raise ForagerMatrixError("absolute host paths are forbidden in matrix artifacts")

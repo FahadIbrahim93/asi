@@ -1213,6 +1213,23 @@ def test_strict_loader_rejects_duplicate_ids_nonfinite_and_unsafe_reference(
         matrix.parse_forager_matrix_manifest(unsafe)
 
 
+def test_json_safe_rejects_nonfinite_artifact_identities() -> None:
+    """Artifact identities must not coerce NaN/Inf into JSON null."""
+    finite = matrix._json_safe({"scale": 1.0})
+    assert finite == {"scale": 1.0}
+    assert matrix._canonical_json_bytes(finite) == b'{"scale":1.0}'
+
+    for bad in (float("nan"), float("inf"), float("-inf"), np.float64("nan")):
+        with pytest.raises(
+            matrix.ForagerMatrixError,
+            match="matrix artifact identity is not finite JSON",
+        ):
+            matrix._json_safe({"scale": bad})
+
+    with pytest.raises(matrix.ForagerMatrixError, match="not canonical JSON"):
+        matrix._canonical_json_bytes({"scale": float("nan")})
+
+
 def test_source_snapshot_is_reproducible_canonical_and_path_independent(
     _isolated_source_tree: Path,
 ) -> None:
