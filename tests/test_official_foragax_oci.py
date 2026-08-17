@@ -325,6 +325,48 @@ def test_inspected_config_digest_supports_legacy_and_containerd_stores() -> None
         oci._inspected_config_digest(inspected)
 
 
+def test_native_inventory_rejects_float_alias_for_integer_mode() -> None:
+    path = "opt/alberta-runtime/bin/tool"
+    rootfs = {
+        "entries": [
+            {
+                "mode": 0o555,
+                "path": path,
+                "sha256": "a" * 64,
+                "size": 1,
+                "type": "file",
+            }
+        ]
+    }
+    native_entries = [
+        {
+            "mode": 365.0,
+            "path": "bin/tool",
+            "sha256": "a" * 64,
+            "size": 1,
+            "type": "file",
+        }
+    ]
+    native = {
+        "entries": native_entries,
+        "hash_scheme": oci.TREE_HASH_SCHEME,
+        "root": oci.RUNTIME_ROOT.as_posix(),
+        "schema_version": oci.NATIVE_INVENTORY_SCHEMA,
+        "tree_sha256": oci._json_sha256(
+            {
+                "entries": native_entries,
+                "hash_scheme": oci.TREE_HASH_SCHEME,
+            }
+        ),
+    }
+
+    with pytest.raises(
+        oci.OfficialForagaxOciError,
+        match="native inventory entry differs from rootfs",
+    ):
+        oci._verify_native_inventory(rootfs, native)
+
+
 def test_saved_config_blob_is_extracted_exactly_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
