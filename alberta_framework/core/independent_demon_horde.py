@@ -339,6 +339,7 @@ class IndependentDemonHorde:
         hidden_sizes = tuple(
             _require_int32(f"hidden_sizes[{i}]", v, minimum=1) for i, v in enumerate(hidden_sizes)
         )
+        step_size = _require_float32("step_size", step_size, lower=0.0)
         sparsity = _require_float32("sparsity", sparsity, lower=0.0, upper=1.0)
         leaky_relu_slope = _require_float32(
             "leaky_relu_slope", leaky_relu_slope, lower=0.0
