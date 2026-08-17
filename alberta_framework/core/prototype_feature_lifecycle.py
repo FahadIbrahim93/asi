@@ -108,6 +108,12 @@ def _strict_int(
     return canonical
 
 
+def _require_exact_bool(name: str, value: object) -> bool:
+    if type(value) is not bool:
+        raise ValueError(f"{name} must be an actual bool")
+    return value
+
+
 def _strict_float(
     value: object,
     *,
@@ -583,6 +589,47 @@ class PrototypeFeatureLifecycleResourceBudget:
     max_active_pair_products_per_observe: int
     max_candidate_pair_products_per_observe: int
     max_observations: int
+
+    def __post_init__(self) -> None:
+        if type(self.mechanism_status) is not str:
+            raise ValueError("mechanism_status must be an actual str")
+        object.__setattr__(
+            self,
+            "scientific_promotion_allowed",
+            _require_exact_bool(
+                "scientific_promotion_allowed",
+                self.scientific_promotion_allowed,
+            ),
+        )
+        for name in (
+            "base_feature_slots",
+            "active_pair_slots",
+            "candidate_pair_slots",
+            "managed_oak_feature_width",
+            "learner_persistent_state_nbytes",
+            "router_persistent_state_nbytes",
+            "lifecycle_counter_nbytes",
+            "lifecycle_state_nbytes",
+            "consumer_binding_persistent_nbytes",
+            "internal_learner_template_nbytes",
+            "internal_oak_template_nbytes",
+            "internal_template_nbytes",
+            "owned_persistent_state_nbytes",
+            "managed_oak_consumer_nbytes",
+            "rebuilt_base_cache_nbytes",
+            "input_route_feature_groups",
+            "output_route_feature_groups",
+            "router_calls_per_observe",
+            "router_calls_per_committed_curation",
+            "max_active_pair_products_per_observe",
+            "max_candidate_pair_products_per_observe",
+            "max_observations",
+        ):
+            object.__setattr__(
+                self,
+                name,
+                _strict_int(getattr(self, name), name=name, minimum=0),
+            )
 
     def to_config(self) -> dict[str, str | int | bool]:
         """Return an exact JSON-compatible resource record."""
