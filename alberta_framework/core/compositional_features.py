@@ -70,6 +70,9 @@ _ACTUAL_INT_TYPES = frozenset(
         np.ulonglong,
     }
 )
+_ACTUAL_REAL_TYPES = frozenset(
+    (*_ACTUAL_INT_TYPES, float, np.float16, np.float32, np.float64, np.longdouble)
+)
 
 
 def _require_int32(name: str, value: object, *, minimum: int, maximum: int = _INT32_MAX) -> int:
@@ -97,6 +100,8 @@ def _validated_float32_scalar(
     upper_inclusive: bool = True,
 ) -> float:
     """Validate one float32 sink without silently erasing a nonzero value."""
+    if type(value) not in _ACTUAL_REAL_TYPES:
+        raise ValueError(f"{name} must be a finite real number")
     stored, numerator, denominator = validated_float32_scalar_with_ratio(
         name,
         value,
@@ -105,7 +110,7 @@ def _validated_float32_scalar(
         upper=upper,
         upper_inclusive=upper_inclusive,
     )
-    if numerator != 0 and float(np.float32(numerator / denominator)) == 0.0:
+    if numerator != 0 and abs(numerator) * (1 << 150) <= denominator:
         raise ValueError(f"{name} must remain nonzero once narrowed to float32")
     return stored
 
@@ -561,6 +566,9 @@ class FiniteCandidateSelector:
         loss_upper_bound = _validated_float32_scalar("loss_upper_bound", loss_upper_bound)
         if loss_lower_bound >= loss_upper_bound:
             raise ValueError("loss_lower_bound must be < loss_upper_bound")
+        loss_width = loss_upper_bound - loss_lower_bound
+        if loss_width > float(np.finfo(np.float32).max):
+            raise ValueError("loss bounds must have a finite float32 width")
         update_rule = _require_choice(
             "update_rule",
             update_rule,
@@ -568,6 +576,18 @@ class FiniteCandidateSelector:
         )
         if update_rule == CANDIDATE_SELECTOR_EXP3 and exploration <= 0.0:
             raise ValueError("exp3 selector requires positive exploration")
+        if update_rule == CANDIDATE_SELECTOR_EXP3:
+            minimum_probability = float(
+                np.float32(exploration) * np.float32(1.0 / n_candidates)
+            )
+            if minimum_probability == 0.0:
+                raise ValueError(
+                    "exp3 exploration must provide nonzero float32 mass to every candidate"
+                )
+            if learning_rate / minimum_probability > float(np.finfo(np.float32).max):
+                raise ValueError(
+                    "exp3 learning_rate / minimum probability must remain finite in float32"
+                )
 
         self._n_candidates = n_candidates
         self._learning_rate = learning_rate
@@ -638,7 +658,8 @@ class FiniteCandidateSelector:
 
     def validate_bounded_losses(self, losses: Array) -> None:
         """Raise if finite losses violate the selector's theorem range."""
-        losses = jnp.asarray(losses, dtype=jnp.float32)
+        self._validate_losses_static_contract(losses)
+        losses = jnp.asarray(losses)
         finite = jnp.isfinite(losses)
         outside = finite & ((losses < self._loss_lower_bound) | (losses > self._loss_upper_bound))
         if bool(jnp.any(outside)):
@@ -668,27 +689,44 @@ class FiniteCandidateSelector:
 
         ``NaN`` losses are ignored.  For ``update_rule="hedge"``, all finite
         losses are observed.  For ``update_rule="exp3"``, only
-        ``selected_action`` receives an importance-weighted update.
+        ``selected_action`` receives an importance-weighted update and the
+        caller must provide that action explicitly.
         """
         self._validate_state_static_contract(state)
+        self._validate_losses_static_contract(losses)
         bounded_losses = self._unit_losses(losses)
         finite = jnp.isfinite(bounded_losses)
         probabilities = self.probabilities(state)
         if self._update_rule == CANDIDATE_SELECTOR_EXP3:
-            action = (
-                jnp.argmax(probabilities).astype(jnp.int32)
-                if selected_action is None
-                else jnp.asarray(selected_action, dtype=jnp.int32)
-            )
-            probability = jnp.maximum(probabilities[action], 1e-6)
-            selected_finite = finite[action]
+            if selected_action is None:
+                raise ValueError("selected_action is required for update_rule='exp3'")
+            elif type(selected_action) in _ACTUAL_INT_TYPES:
+                host_action = operator.index(cast(SupportsIndex, selected_action))
+                # Do not narrow an untrusted wide integer before validating it:
+                # values such as uint64(2**32) otherwise wrap to action zero.
+                representable_action = (
+                    host_action if -(2**31) <= host_action <= _INT32_MAX else -1
+                )
+                action = jnp.asarray(representable_action, dtype=jnp.int32)
+            elif isinstance(selected_action, Array):
+                if selected_action.shape != () or selected_action.dtype != jnp.int32:
+                    raise TypeError("selected_action must be one scalar int32 action")
+                action = selected_action
+            else:
+                raise TypeError("selected_action must be one scalar integer action")
+            action_in_range = (action >= 0) & (action < self._n_candidates)
+            safe_action = jnp.clip(action, 0, self._n_candidates - 1)
+            raw_probability = probabilities[safe_action]
+            probability_valid = jnp.isfinite(raw_probability) & (raw_probability > 0.0)
+            probability = jnp.where(probability_valid, raw_probability, 1.0)
+            selected_finite = finite[safe_action] & action_in_range & probability_valid
             loss_hat = jnp.where(
                 selected_finite,
-                bounded_losses[action] / probability,
+                bounded_losses[safe_action] / probability,
                 jnp.array(0.0, dtype=jnp.float32),
             )
-            update_losses = jnp.zeros_like(bounded_losses).at[action].set(loss_hat)
-            update_finite = jnp.zeros_like(finite).at[action].set(selected_finite)
+            update_losses = jnp.zeros_like(bounded_losses).at[safe_action].set(loss_hat)
+            update_finite = jnp.zeros_like(finite).at[safe_action].set(selected_finite)
         else:
             action = jnp.argmin(jnp.where(finite, bounded_losses, jnp.inf)).astype(jnp.int32)
             update_losses = jnp.where(finite, bounded_losses, 0.0)
@@ -708,10 +746,18 @@ class FiniteCandidateSelector:
             action_counts=action_counts,
             step_count=_saturating_int32_increment(state.step_count),
         )
-        update_available = (
+        source_state_valid = (
             floating_tree_is_finite(state)
             & (state.step_count >= 0)
+            & jnp.all(state.cumulative_loss >= 0.0)
+            & jnp.all(state.action_counts >= 0.0)
+            & jnp.all(state.cumulative_loss <= state.action_counts)
+            & jnp.all(state.action_counts <= state.step_count.astype(jnp.float32))
+        )
+        update_available = (
+            source_state_valid
             & (state.step_count < _INT32_MAX)
+            & (action_in_range if self._update_rule == CANDIDATE_SELECTOR_EXP3 else True)
             & floating_tree_is_finite(next_state)
         )
         return FiniteCandidateSelectorUpdateResult(
@@ -722,6 +768,8 @@ class FiniteCandidateSelector:
         )
 
     def _validate_state_static_contract(self, state: FiniteCandidateSelectorState) -> None:
+        if type(state) is not FiniteCandidateSelectorState:
+            raise TypeError("state must be a FiniteCandidateSelectorState")
         expected = (
             (state.log_weights, (self._n_candidates,), jnp.float32),
             (state.cumulative_loss, (self._n_candidates,), jnp.float32),
@@ -729,28 +777,54 @@ class FiniteCandidateSelector:
             (state.step_count, (), jnp.int32),
         )
         for value, shape, dtype in expected:
-            if value.shape != shape or value.dtype != dtype:
+            try:
+                actual_shape = tuple(value.shape)
+                actual_dtype = jnp.dtype(value.dtype)
+            except Exception as error:
+                raise TypeError("finite candidate selector state metadata is invalid") from error
+            if actual_shape != shape or actual_dtype != jnp.dtype(dtype):
                 raise ValueError("finite candidate selector state shape or dtype is invalid")
+
+    def _validate_losses_static_contract(self, losses: object) -> None:
+        try:
+            shape = tuple(losses.shape)  # type: ignore[attr-defined]
+            dtype = jnp.dtype(losses.dtype)  # type: ignore[attr-defined]
+        except Exception as error:
+            raise TypeError("finite candidate selector losses metadata is invalid") from error
+        if shape != (self._n_candidates,):
+            raise ValueError("finite candidate selector losses shape is invalid")
+        if dtype != jnp.dtype(jnp.float32):
+            raise TypeError("finite candidate selector losses dtype must be float32")
 
     def regret_metadata(self, horizon: int) -> dict[str, Any]:
         """Return finite-candidate regret assumptions and bound metadata."""
-        if horizon < 1:
-            raise ValueError("horizon must be positive")
+        horizon = _require_int32("horizon", horizon, minimum=1)
         width = self._loss_upper_bound - self._loss_lower_bound
         log_k = math.log(self._n_candidates)
         if self._n_candidates == 1:
             regret_bound = 0.0
+            bound_kind = "exact"
         elif self._update_rule == CANDIDATE_SELECTOR_HEDGE:
             regret_bound = width * (
-                log_k / self._learning_rate + self._learning_rate * horizon / 8.0
+                log_k / self._learning_rate
+                + self._learning_rate * horizon / 8.0
+                + self._exploration * horizon
             )
+            bound_kind = "hedge_with_exploration_penalty"
         else:
-            regret_bound = width * 2.0 * math.sqrt(horizon * self._n_candidates * log_k)
+            # The usual O(sqrt(T K log K)) Exp3 claim requires coupled
+            # learning-rate/exploration tuning and actions sampled from the
+            # reported probabilities.  This abstraction accepts an external
+            # action and arbitrary valid tuning, so only the universal bounded-
+            # loss guarantee is truthful without additional execution proof.
+            regret_bound = width * horizon
+            bound_kind = "worst_case"
 
         return {
             "algorithm": self._update_rule,
             "candidate_count": self._n_candidates,
             "horizon": horizon,
+            "bound_kind": bound_kind,
             "assumptions": {
                 "finite_candidate_set": True,
                 "fixed_candidate_identities": True,
@@ -761,13 +835,17 @@ class FiniteCandidateSelector:
                 "exp3_requires_unbiased_importance_weighted_losses": (
                     self._update_rule == CANDIDATE_SELECTOR_EXP3
                 ),
+                "exp3_order_bound_requires_tuned_parameters_and_sampled_actions": (
+                    self._update_rule == CANDIDATE_SELECTOR_EXP3
+                ),
             },
             "regret_bound": regret_bound,
             "regret_statement": (
                 "Hedge full-information regret is bounded by "
-                "(b-a)(ln(K)/eta + eta*T/8) for losses in [a,b]. "
-                "The Exp3-style entry records the usual order bound and "
-                "requires positive exploration plus unbiased bandit losses."
+                "(b-a)(ln(K)/eta + eta*T/8 + exploration*T) for losses in [a,b]. "
+                "The Exp3-style entry reports the tuning-independent worst-case "
+                "(b-a)T bound; a sharper order bound additionally requires coupled "
+                "tuning, sampled actions, and unbiased importance-weighted losses."
             ),
         }
 
