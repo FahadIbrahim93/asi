@@ -75,8 +75,9 @@ PROTOTYPE_FEATURE_LIFECYCLE_SCIENTIFIC_PROMOTION_ALLOWED = False
 
 _CONFIG_TYPE = "PrototypeFeatureLifecycleConfig"
 _INT32_MAX = 2_147_483_647
-_ACTUAL_INT_TYPES = frozenset(
-    {int, *(np.dtype(code).type for code in ("b", "B", "h", "H", "i", "I", "l", "L", "q", "Q"))}
+_ACTUAL_INT_TYPES = (
+    int,
+    *(np.dtype(code).type for code in ("b", "B", "h", "H", "i", "I", "l", "L", "q", "Q")),
 )
 _MAX_TOTAL_FEATURE_DIM = 4_096
 _MAX_PAIR_SLOTS = 262_144
@@ -96,7 +97,8 @@ def _strict_int(
 ) -> int:
     """Validate and canonicalize a supported concrete host integer."""
 
-    if type(value) not in _ACTUAL_INT_TYPES:
+    actual_type = type(value)
+    if not any(actual_type is candidate for candidate in _ACTUAL_INT_TYPES):
         raise ValueError(
             f"{name} must be a strict integer in [{minimum}, {maximum}]"
         )
@@ -185,6 +187,8 @@ class PrototypeFeatureLifecycleConfig:
     max_observations: int = _INT32_MAX - 1
 
     def __post_init__(self) -> None:
+        if type(self) is not PrototypeFeatureLifecycleConfig:
+            raise TypeError("config must be an exact PrototypeFeatureLifecycleConfig")
         integer_fields = (
             ("base_feature_dim", 2, _MAX_TOTAL_FEATURE_DIM),
             ("active_pair_slots", 1, _MAX_PAIR_SLOTS),
@@ -443,6 +447,13 @@ class PrototypeFeatureLifecycleConfig:
     ) -> PrototypeFeatureLifecycleConfig:
         """Strictly reconstruct only the exact versioned mechanism schema."""
 
+        if cls is not PrototypeFeatureLifecycleConfig:
+            raise TypeError("config class must be PrototypeFeatureLifecycleConfig")
+        if type(config) is not dict:
+            raise ValueError("prototype feature lifecycle config must be an exact dictionary")
+        raw = cast(dict[object, object], config)
+        if any(type(key) is not str for key in raw):
+            raise ValueError("prototype feature lifecycle config keys must be exact strings")
         payload = dict(config)
         expected = {
             "schema",
@@ -469,6 +480,14 @@ class PrototypeFeatureLifecycleConfig:
         }
         if set(payload) != expected:
             raise ValueError("prototype feature lifecycle config fields do not match v1")
+        if type(payload["schema"]) is not str:
+            raise ValueError("serialized schema must be a JSON string")
+        if type(payload["type"]) is not str:
+            raise ValueError("serialized type must be a JSON string")
+        if type(payload["mechanism_status"]) is not str:
+            raise ValueError("serialized mechanism_status must be a JSON string")
+        if type(payload["scientific_promotion_allowed"]) is not bool:
+            raise ValueError("serialized scientific_promotion_allowed must be a JSON boolean")
         if payload.pop("schema") != PROTOTYPE_FEATURE_LIFECYCLE_CONFIG_SCHEMA:
             raise ValueError("unexpected prototype feature lifecycle config schema")
         if payload.pop("type") != _CONFIG_TYPE:
@@ -570,6 +589,9 @@ class PrototypeFeatureLifecycleResourceBudget:
     base_feature_slots: int
     active_pair_slots: int
     candidate_pair_slots: int
+    n_tasks: int
+    n_options: int
+    n_primitive_actions: int
     managed_oak_feature_width: int
     learner_persistent_state_nbytes: int
     router_persistent_state_nbytes: int
@@ -591,8 +613,15 @@ class PrototypeFeatureLifecycleResourceBudget:
     max_observations: int
 
     def __post_init__(self) -> None:
-        if type(self.mechanism_status) is not str:
-            raise ValueError("mechanism_status must be an actual str")
+        if type(self) is not PrototypeFeatureLifecycleResourceBudget:
+            raise TypeError(
+                "budget must be an exact PrototypeFeatureLifecycleResourceBudget"
+            )
+        if (
+            type(self.mechanism_status) is not str
+            or self.mechanism_status != PROTOTYPE_FEATURE_LIFECYCLE_MECHANISM_STATUS
+        ):
+            raise ValueError("mechanism_status must retain the fixed lifecycle identity")
         object.__setattr__(
             self,
             "scientific_promotion_allowed",
@@ -601,11 +630,29 @@ class PrototypeFeatureLifecycleResourceBudget:
                 self.scientific_promotion_allowed,
             ),
         )
+        if self.scientific_promotion_allowed:
+            raise ValueError("scientific_promotion_allowed must remain false")
+        identity_fields = (
+            ("base_feature_slots", 2, _MAX_TOTAL_FEATURE_DIM),
+            ("active_pair_slots", 1, _MAX_PAIR_SLOTS),
+            ("candidate_pair_slots", 0, _MAX_PAIR_SLOTS),
+            ("n_tasks", 1, _MAX_PYTHON_COLLECTION_LENGTH),
+            ("n_options", 1, _MAX_PYTHON_COLLECTION_LENGTH),
+            ("n_primitive_actions", 1, _MAX_PYTHON_COLLECTION_LENGTH),
+            ("managed_oak_feature_width", 3, _MAX_TOTAL_FEATURE_DIM),
+        )
+        for name, minimum, maximum in identity_fields:
+            object.__setattr__(
+                self,
+                name,
+                _strict_int(
+                    getattr(self, name),
+                    name=name,
+                    minimum=minimum,
+                    maximum=maximum,
+                ),
+            )
         for name in (
-            "base_feature_slots",
-            "active_pair_slots",
-            "candidate_pair_slots",
-            "managed_oak_feature_width",
             "learner_persistent_state_nbytes",
             "router_persistent_state_nbytes",
             "lifecycle_counter_nbytes",
@@ -623,13 +670,59 @@ class PrototypeFeatureLifecycleResourceBudget:
             "router_calls_per_committed_curation",
             "max_active_pair_products_per_observe",
             "max_candidate_pair_products_per_observe",
-            "max_observations",
         ):
             object.__setattr__(
                 self,
                 name,
                 _strict_int(getattr(self, name), name=name, minimum=0),
             )
+        object.__setattr__(
+            self,
+            "max_observations",
+            _strict_int(
+                self.max_observations,
+                name="max_observations",
+                minimum=1,
+                maximum=_INT32_MAX - 1,
+            ),
+        )
+
+        width = self.base_feature_slots + self.active_pair_slots
+        heads = self.n_primitive_actions + self.n_options
+        expected_input_groups = (
+            2 * heads
+            + 2 * self.n_options * self.n_primitive_actions
+            + self.n_options * width
+            + 1
+        )
+        expected_values = {
+            "managed_oak_feature_width": width,
+            "lifecycle_counter_nbytes": 16,
+            "lifecycle_state_nbytes": (
+                self.learner_persistent_state_nbytes
+                + self.router_persistent_state_nbytes
+                + self.lifecycle_counter_nbytes
+            ),
+            "consumer_binding_persistent_nbytes": 4 + 8 * self.active_pair_slots,
+            "internal_template_nbytes": (
+                self.internal_learner_template_nbytes
+                + self.internal_oak_template_nbytes
+            ),
+            "owned_persistent_state_nbytes": (
+                self.lifecycle_state_nbytes + self.internal_template_nbytes
+            ),
+            "input_route_feature_groups": expected_input_groups,
+            "output_route_feature_groups": self.n_options * width,
+            "managed_oak_consumer_nbytes": 4 * width * (expected_input_groups + 1),
+            "rebuilt_base_cache_nbytes": 4 * width,
+            "router_calls_per_observe": 2,
+            "router_calls_per_committed_curation": 2,
+            "max_active_pair_products_per_observe": 5 * self.active_pair_slots,
+            "max_candidate_pair_products_per_observe": self.candidate_pair_slots,
+        }
+        for name, expected in expected_values.items():
+            if getattr(self, name) != expected:
+                raise ValueError(f"{name} does not match its exact derived identity")
 
     def to_config(self) -> dict[str, str | int | bool]:
         """Return an exact JSON-compatible resource record."""
@@ -1429,6 +1522,9 @@ class PrototypeFeatureLifecycle:
             base_feature_slots=self._config.base_feature_dim,
             active_pair_slots=self._config.active_pair_slots,
             candidate_pair_slots=self._config.candidate_pair_slots,
+            n_tasks=self._config.n_tasks,
+            n_options=self._config.n_options,
+            n_primitive_actions=self._config.n_primitive_actions,
             managed_oak_feature_width=width,
             learner_persistent_state_nbytes=_tree_nbytes(measured.learner_state),
             router_persistent_state_nbytes=_tree_nbytes(measured.router_state),
