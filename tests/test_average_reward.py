@@ -898,6 +898,16 @@ def test_average_reward_decoders_reject_schema_and_container_ambiguity() -> None
         (DifferentialSARSAConfig, "trace_decay", 1.0 + 1.0e-10),
         (DifferentialSARSAConfig, "epsilon_start", 1.0e100),
         (DifferentialSARSAConfig, "use_bias", np.bool_(True)),
+        (DifferentialTDConfig, "step_size", float("nan")),
+        (DifferentialTDConfig, "step_size", float("inf")),
+        (DifferentialTDConfig, "average_reward_step_size", float("nan")),
+        (DifferentialTDConfig, "trace_decay", float("nan")),
+        (DifferentialGTDConfig, "value_step_size", float("nan")),
+        (DifferentialGTDConfig, "secondary_step_size", float("inf")),
+        (DifferentialGTDConfig, "average_reward_step_size", float("-inf")),
+        (DifferentialGTDConfig, "trace_decay", float("nan")),
+        (DifferentialGTDConfig, "ratio_clip", float("nan")),
+        (DifferentialGTDConfig, "ratio_clip", 0.0),
     ),
 )
 def test_average_reward_configs_reject_invalid_float32_sink_values(
@@ -905,9 +915,26 @@ def test_average_reward_configs_reject_invalid_float32_sink_values(
     field: str,
     value: object,
 ) -> None:
-    kwargs = {"n_actions": 2, field: value}
+    kwargs: dict[str, object] = {field: value}
+    if config_type in (AverageRewardHordeActorCriticConfig, DifferentialSARSAConfig):
+        kwargs["n_actions"] = 2
     with pytest.raises(ValueError, match=field):
         config_type(**kwargs)
+
+
+def test_average_reward_horde_rejects_nonfinite_reward_rate_scalars() -> None:
+    with pytest.raises(ValueError, match="average_reward_step_size"):
+        AverageRewardHordeLearner(n_demons=2, average_reward_step_size=float("nan"))
+    with pytest.raises(ValueError, match="average_reward_step_size"):
+        AverageRewardHordeLearner(n_demons=2, average_reward_step_size=float("inf"))
+    with pytest.raises(ValueError, match="trace_decay"):
+        AverageRewardHordeLearner(n_demons=2, trace_decay=float("nan"))
+    AverageRewardHordeLearner(
+        n_demons=2,
+        hidden_sizes=(4,),
+        average_reward_step_size=0.0,
+        trace_decay=0.0,
+    )
 
 
 def test_average_reward_configs_canonicalize_float32_sink_values() -> None:
@@ -919,11 +946,17 @@ def test_average_reward_configs_canonicalize_float32_sink_values() -> None:
         n_actions=2,
         epsilon_start=np.float64(0.2),
     )
+    td = DifferentialTDConfig(step_size=np.float64(0.2))
+    gtd = DifferentialGTDConfig(value_step_size=np.float64(0.2))
 
     assert type(actor.critic_step_size) is float
     assert actor.critic_step_size == float(np.float32(0.2))
     assert type(sarsa.epsilon_start) is float
     assert sarsa.epsilon_start == float(np.float32(0.2))
+    assert type(td.step_size) is float
+    assert td.step_size == float(np.float32(0.2))
+    assert type(gtd.value_step_size) is float
+    assert gtd.value_step_size == float(np.float32(0.2))
 
 
 def test_average_reward_actor_preflights_state_before_allocation() -> None:
