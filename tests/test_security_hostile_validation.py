@@ -12,8 +12,11 @@ from alberta_framework.security import (
     SecurityAction,
     SecurityFeatureSchema,
     SecurityRolloutStep,
+    ThroughputMeasurement,
     ThroughputMeter,
     coerce_security_action,
+    security_reward,
+    security_rollout_step_to_oracle_experience,
     to_security_gym_action,
 )
 
@@ -124,6 +127,11 @@ def test_schema_from_dict_rejects_hostile_mapping() -> None:
         SecurityFeatureSchema.from_dict(HostileMapping())  # type: ignore[arg-type]
 
 
+def test_schema_rejects_inconsistent_derived_dimension() -> None:
+    with pytest.raises(ValueError, match="feature_dim"):
+        SecurityFeatureSchema.from_dict({"names": ["a"], "feature_dim": 2})
+
+
 def test_rollout_from_dict_rejects_hostile_float() -> None:
     step = SecurityRolloutStep(
         state=(0.0, 1.0),
@@ -138,6 +146,79 @@ def test_rollout_from_dict_rejects_hostile_float() -> None:
     with pytest.raises(ValueError, match="reward"):
         SecurityRolloutStep.from_dict(payload)  # type: ignore[arg-type]
     assert _HostileFloat.calls == 0
+
+
+def test_rollout_from_dict_rejects_laundered_metadata_and_action_name() -> None:
+    payload = {
+        "state": [0.0],
+        "action": 0,
+        "reward": 0.0,
+        "next_state": [0.0],
+        "terminated": False,
+        "policy_metadata": None,
+    }
+    with pytest.raises(ValueError, match="policy_metadata"):
+        SecurityRolloutStep.from_dict(payload)
+    with pytest.raises(ValueError, match="action_name"):
+        SecurityRolloutStep.from_dict(
+            {**payload, "policy_metadata": {}, "action_name": "alert"}
+        )
+
+
+def test_policy_metadata_rejects_nested_hostile_values_without_hook() -> None:
+    class HostileList(list[object]):
+        def __iter__(self):  # type: ignore[no-untyped-def, override]
+            raise AssertionError("container hook executed")
+
+    step = SecurityRolloutStep(
+        state=(0.0,),
+        action=SecurityAction.PASS,
+        reward=0.0,
+        next_state=(0.0,),
+        terminated=False,
+        policy_metadata={"nested": HostileList()},
+    )
+    with pytest.raises(ValueError, match="exact JSON values"):
+        step.to_dict()
+
+
+def test_security_reward_rejects_hostile_inputs_without_numeric_hooks() -> None:
+    _HostileFloat.calls = 0
+    with pytest.raises(ValueError, match="component"):
+        security_reward({"threat_blocked": _HostileFloat(1.0)})
+    assert _HostileFloat.calls == 0
+
+    class HostileComponents(dict[str, float]):
+        def __iter__(self):  # type: ignore[no-untyped-def, override]
+            raise AssertionError("mapping hook executed")
+
+    with pytest.raises(ValueError, match="components"):
+        security_reward(HostileComponents())
+
+
+def test_oracle_conversion_requires_exact_malicious_label() -> None:
+    step = SecurityRolloutStep(
+        state=(0.0,),
+        action=SecurityAction.PASS,
+        reward=0.0,
+        next_state=(0.0,),
+        terminated=False,
+        policy_metadata={"is_malicious": 1},
+    )
+    with pytest.raises(ValueError, match="exact bool"):
+        security_rollout_step_to_oracle_experience(step)
+
+
+def test_throughput_canonicalizes_scalars_and_rejects_cumulative_overflow() -> None:
+    measurement = ThroughputMeasurement(n_events=np.int32(3), elapsed_s=np.float64(2.0))
+    assert type(measurement.n_events) is int
+    assert type(measurement.elapsed_s) is float
+    assert measurement.to_dict()["events_per_second"] == 1.5
+
+    meter = ThroughputMeter()
+    meter.tick(2**31 - 1)
+    with pytest.raises(ValueError, match="cumulative"):
+        meter.tick(1)
 
 
 def test_numpy_risk_canonicalizes() -> None:
