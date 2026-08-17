@@ -36,6 +36,7 @@ import numpy as np
 from jax import Array
 from jaxtyping import Bool, Float, Int, PRNGKeyArray, UInt
 
+from alberta_framework.core._float32_scalars import validated_float32_scalar
 from alberta_framework.core.checkpoints import (
     load_checkpoint,
     load_checkpoint_metadata,
@@ -560,8 +561,15 @@ class FixedBudgetInteractionLearner:
             candidate_count=candidate_count,
             scale_robust=scale_robust,
         )
-        if not 0.0 <= utility_decay < 1.0:
-            raise ValueError("utility_decay must be in [0, 1)")
+        step_size_output = validated_float32_scalar(
+            "step_size_output", step_size_output, lower=0.0
+        )
+        utility_decay = validated_float32_scalar(
+            "utility_decay", utility_decay, lower=0.0, upper=1.0, upper_inclusive=False
+        )
+        promotion_blend = validated_float32_scalar(
+            "promotion_blend", promotion_blend, lower=0.0, upper=1.0
+        )
         if (
             isinstance(promotion_margin, bool)
             or not isinstance(cast(object, promotion_margin), Real)
@@ -569,8 +577,6 @@ class FixedBudgetInteractionLearner:
             or promotion_margin <= 0.0
         ):
             raise ValueError("promotion_margin must be finite and positive")
-        if not 0.0 <= promotion_blend <= 1.0:
-            raise ValueError("promotion_blend must be in [0, 1]")
         if candidate_strategy not in {"random", "all_pairs"}:
             raise ValueError("candidate_strategy must be 'random' or 'all_pairs'")
         if utility_aggregation not in {"mean", "max", "topk"}:
@@ -621,14 +627,28 @@ class FixedBudgetInteractionLearner:
                 )
             if float32_total <= 0.0:
                 raise ValueError("task_utility_weights must contain positive mass")
-        if not 0.0 <= task_activity_decay < 1.0:
-            raise ValueError("task_activity_decay must be in [0, 1)")
-        if not 0.0 <= future_utility_mix <= 1.0:
-            raise ValueError("future_utility_mix must be in [0, 1]")
-        if utility_retention_decay is not None and not (
-            utility_decay <= utility_retention_decay < 1.0
-        ):
-            raise ValueError("utility_retention_decay must be in [utility_decay, 1) when set")
+        task_activity_decay = validated_float32_scalar(
+            "task_activity_decay",
+            task_activity_decay,
+            lower=0.0,
+            upper=1.0,
+            upper_inclusive=False,
+        )
+        future_utility_mix = validated_float32_scalar(
+            "future_utility_mix", future_utility_mix, lower=0.0, upper=1.0
+        )
+        if utility_retention_decay is not None:
+            utility_retention_decay = validated_float32_scalar(
+                "utility_retention_decay",
+                utility_retention_decay,
+                lower=0.0,
+                upper=1.0,
+                upper_inclusive=False,
+            )
+            if utility_retention_decay < utility_decay:
+                raise ValueError(
+                    "utility_retention_decay must be in [utility_decay, 1) when set"
+                )
         if utility_retention_grace_steps is not None and (
             isinstance(utility_retention_grace_steps, bool)
             or not isinstance(utility_retention_grace_steps, int)
@@ -745,16 +765,29 @@ class FixedBudgetInteractionLearner:
                 "candidate_reacquisition_confirmation_steps greater than one "
                 "requires independent_relevance_probe"
             )
-        if candidate_utility_retention_decay is not None and not (
-            utility_decay <= candidate_utility_retention_decay < 1.0
-        ):
-            raise ValueError(
-                "candidate_utility_retention_decay must be in [utility_decay, 1) when set"
+        if candidate_utility_retention_decay is not None:
+            candidate_utility_retention_decay = validated_float32_scalar(
+                "candidate_utility_retention_decay",
+                candidate_utility_retention_decay,
+                lower=0.0,
+                upper=1.0,
+                upper_inclusive=False,
             )
-        if not 0.0 <= scale_normalizer_decay < 1.0:
-            raise ValueError("scale_normalizer_decay must be in [0, 1)")
-        if scale_normalizer_epsilon <= 0.0:
-            raise ValueError("scale_normalizer_epsilon must be positive")
+            if candidate_utility_retention_decay < utility_decay:
+                raise ValueError(
+                    "candidate_utility_retention_decay must be in [utility_decay, 1) when set"
+                )
+        scale_normalizer_decay = validated_float32_scalar(
+            "scale_normalizer_decay",
+            scale_normalizer_decay,
+            lower=0.0,
+            upper=1.0,
+            upper_inclusive=False,
+        )
+        scale_normalizer_epsilon = validated_float32_scalar(
+            "scale_normalizer_epsilon", scale_normalizer_epsilon, positive=True
+        )
+        obgd_kappa = validated_float32_scalar("obgd_kappa", obgd_kappa, positive=True)
         if scale_robust and future_utility_mix != 0.0:
             raise ValueError(
                 "future_utility_mix must be 0 when scale_robust=True; "
