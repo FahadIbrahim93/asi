@@ -36,13 +36,16 @@ import hashlib
 import json
 import math
 import operator
+from collections.abc import Mapping
+from fractions import Fraction
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any, Literal, SupportsIndex, cast
 
 import chex
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 from jax import Array
 from jaxtyping import Bool, Float, Int, UInt
 
@@ -249,6 +252,83 @@ def feature_to_subtask_specs(
 
 
 # ---------------------------------------------------------------------------
+# Validation helpers (hostile-safe, evidence-grade)
+# ---------------------------------------------------------------------------
+
+
+_INT32_MAX = 2**31 - 1
+_UINT32_MAX = 4_294_967_295
+_ACTUAL_INT_TYPES: frozenset[type] = frozenset(
+    {
+        int,
+        np.int8,
+        np.int16,
+        np.int32,
+        np.int64,
+        np.uint8,
+        np.uint16,
+        np.uint32,
+        np.uint64,
+        np.longlong,
+        np.ulonglong,
+    }
+)
+_ACTUAL_FLOAT_TYPES: frozenset[type] = frozenset(
+    {float, Fraction, *(np.dtype(code).type for code in ("e", "f", "d", "g"))}
+)
+_ALLOWED_REAL_TYPES: frozenset[type] = _ACTUAL_INT_TYPES | _ACTUAL_FLOAT_TYPES
+
+
+def _require_int(
+    name: str,
+    value: object,
+    *,
+    minimum: int | None = None,
+    maximum: int | None = None,
+) -> int:
+    if type(value) not in _ACTUAL_INT_TYPES:
+        raise ValueError(f"{name} must be an integer")
+    number = operator.index(cast(SupportsIndex, value))
+    if minimum is not None and number < minimum:
+        raise ValueError(f"{name} must be >= {minimum}")
+    if maximum is not None and number > maximum:
+        raise ValueError(f"{name} must be <= {maximum}")
+    return number
+
+
+def _validated_config_float(name: str, value: object, **bounds: Any) -> float:
+    if type(value) not in _ALLOWED_REAL_TYPES:
+        raise ValueError(f"{name} must be a finite real scalar")
+    return validated_float32_scalar(name, value, **bounds)
+
+
+def _require_float32_resource(
+    name: str,
+    *,
+    vector_scalars: int,
+    fixed_scalars: int = 0,
+) -> None:
+    total = int(vector_scalars) + int(fixed_scalars)
+    if total > _INT32_MAX:
+        raise ValueError(f"{name} scalar count must fit signed int32")
+    if 4 * total > _INT32_MAX:
+        raise ValueError(f"{name} byte count must fit signed int32")
+
+
+def _copy_mapping(payload: object, *, name: str) -> dict[str, Any]:
+    if not isinstance(payload, Mapping):
+        raise ValueError(f"{name} payload must be a mapping")
+    try:
+        data = dict(payload)
+    except Exception as error:
+        raise ValueError(f"{name} payload could not be read") from error
+    for key in data:
+        if type(key) is not str:
+            raise ValueError(f"{name} payload has exact strings as keys")
+    return data
+
+
+# ---------------------------------------------------------------------------
 # GRU Perception (Step 8 sub-component a — recursive state update)
 # ---------------------------------------------------------------------------
 
@@ -277,6 +357,26 @@ class GRUPerceptionConfig:
     observation_dim: int
     hidden_dim: int = 32
 
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "observation_dim",
+            _require_int("observation_dim", self.observation_dim, minimum=1, maximum=_INT32_MAX),
+        )
+        object.__setattr__(
+            self,
+            "hidden_dim",
+            _require_int("hidden_dim", self.hidden_dim, minimum=1, maximum=_INT32_MAX),
+        )
+        # GRU weights: 3*(h*obs + h*h + h) + hidden state h
+        h = int(self.hidden_dim)
+        obs = int(self.observation_dim)
+        _require_float32_resource(
+            "GRUPerception state",
+            vector_scalars=3 * h * obs + 3 * h * h,
+            fixed_scalars=4 * h,
+        )
+
     def augmented_dim(self) -> int:
         """Return ``observation_dim + hidden_dim``."""
         return self.observation_dim + self.hidden_dim
@@ -292,9 +392,11 @@ class GRUPerceptionConfig:
     @classmethod
     def from_config(cls, payload: dict[str, Any]) -> GRUPerceptionConfig:
         """Reconstruct from :meth:`to_config` output."""
-        d = dict(payload)
-        d.pop("type", None)
-        return cls(**d)
+        data = _copy_mapping(payload, name="GRUPerceptionConfig")
+        data.pop("type", None)
+        if data.keys() - {"observation_dim", "hidden_dim"}:
+            raise ValueError("GRUPerceptionConfig payload has unknown fields")
+        return cls(**data)
 
 
 @chex.dataclass(frozen=True)
@@ -552,10 +654,8 @@ class PrototypeAgentConfig:
                     "option_search_control requires "
                     "oak.stomp.option_planning_backups_per_step == 0"
                 )
-        if self.buffer_capacity <= 0:
-            raise ValueError("buffer_capacity must be positive")
-        if self.n_dreams_per_step < 0:
-            raise ValueError("n_dreams_per_step must be non-negative")
+        if type(self.dream_next_observation_mode) is not str:
+            raise ValueError("dream_next_observation_mode must be a string")
         if self.dream_next_observation_mode not in {
             "model_prediction",
             "sample_one_hot",
@@ -564,14 +664,71 @@ class PrototypeAgentConfig:
                 "dream_next_observation_mode must be "
                 "'model_prediction' or 'sample_one_hot'"
             )
+        # Hostile-safe canonicalization (must precede any allocation)
+        object.__setattr__(
+            self,
+            "buffer_capacity",
+            _require_int("buffer_capacity", self.buffer_capacity, minimum=1, maximum=_INT32_MAX),
+        )
+        object.__setattr__(
+            self,
+            "n_dreams_per_step",
+            _require_int(
+                "n_dreams_per_step",
+                self.n_dreams_per_step,
+                minimum=0,
+                maximum=_INT32_MAX,
+            ),
+        )
+        # horde_hidden_sizes: hostile-safe per-element validation
+        raw_hidden = self.horde_hidden_sizes
+        if isinstance(raw_hidden, (str, bytes)):
+            raise ValueError("horde_hidden_sizes must be a tuple of integers")
+        if not isinstance(raw_hidden, (tuple, list)):
+            raise ValueError("horde_hidden_sizes must be a tuple of integers")
+        canonical_hidden: list[int] = []
+        for idx, value in enumerate(raw_hidden):
+            canonical_hidden.append(
+                _require_int(f"horde_hidden_sizes[{idx}]", value, minimum=1, maximum=_INT32_MAX)
+            )
+        object.__setattr__(self, "horde_hidden_sizes", tuple(canonical_hidden))
         object.__setattr__(
             self,
             "horde_step_size",
-            validated_float32_scalar("horde_step_size", self.horde_step_size, positive=True),
+            _validated_config_float("horde_step_size", self.horde_step_size, positive=True),
         )
-        if self.auto_curate_every < 0:
-            raise ValueError("auto_curate_every must be non-negative")
-        if not isinstance(self.learn_state_builder_from_world_model, bool):
+        object.__setattr__(
+            self,
+            "auto_curate_every",
+            _require_int(
+                "auto_curate_every",
+                self.auto_curate_every,
+                minimum=0,
+                maximum=_INT32_MAX,
+            ),
+        )
+        # Derived allocations must fit signed int32 without allocating JAX arrays
+        _require_float32_resource(
+            "PrototypeAgent buffer",
+            vector_scalars=int(self.buffer_capacity) * int(self.oak.observation_dim),
+            fixed_scalars=2,
+        )
+        # Horde trunk/head scalars: sum hidden + products with obs_dim
+        obs_dim = int(self.oak.observation_dim)
+        horde_vector = 0
+        prev = obs_dim
+        for hidden in self.horde_hidden_sizes:
+            horde_vector += prev * int(hidden) + int(hidden)
+            prev = int(hidden)
+        # Horde heads: n_options * prev * n_actions approximated as n_options*prev
+        # Use conservative bound including option policies from OaK
+        n_options = int(self.oak.n_options)
+        if self.horde_spec is not None and n_options > 0 and prev > 0:
+            horde_vector += n_options * prev
+        if horde_vector:
+            _require_float32_resource("PrototypeAgent horde", vector_scalars=horde_vector)
+        # GRU resource already validated via GRUPerceptionConfig.__post_init__
+        if type(self.learn_state_builder_from_world_model) is not bool:
             raise ValueError("learn_state_builder_from_world_model must be boolean")
         mixer = self.representation_gradient_mixer
         if mixer is not None and not isinstance(
@@ -995,9 +1152,9 @@ class PrototypeAgentConfig:
         """Reconstruct from :meth:`to_config` output."""
         from alberta_framework.core.types import HordeSpec as _HordeSpec
 
-        data = dict(payload)
+        data = _copy_mapping(payload, name="PrototypeAgentConfig")
         config_type = data.pop("type", None)
-        if config_type != "PrototypeAgentConfig":
+        if type(config_type) is not str or config_type != "PrototypeAgentConfig":
             raise ValueError(
                 "PrototypeAgentConfig payload type must be 'PrototypeAgentConfig'"
             )
@@ -1101,7 +1258,7 @@ class PrototypeAgentConfig:
             "learn_state_builder_from_world_model",
             False,
         )
-        if not isinstance(learn_state_builder_from_world_model, bool):
+        if type(learn_state_builder_from_world_model) is not bool:
             raise ValueError(
                 "learn_state_builder_from_world_model must be boolean"
             )
@@ -1129,17 +1286,42 @@ class PrototypeAgentConfig:
             else None
         )
 
-        hidden = tuple(int(x) for x in data.pop("horde_hidden_sizes", [64, 64]))
-        buffer_capacity = int(data.pop("buffer_capacity", 200))
-        n_dreams_per_step = int(data.pop("n_dreams_per_step", 0))
+        # Hostile-safe scalar canonicalization for serialized fields
+        hidden_raw = data.pop("horde_hidden_sizes", [64, 64])
+        if isinstance(hidden_raw, (str, bytes)):
+            raise ValueError("horde_hidden_sizes must be a sequence of integers")
+        if not isinstance(hidden_raw, (list, tuple)):
+            raise ValueError("horde_hidden_sizes must be a sequence of integers")
+        hidden_list: list[int] = []
+        for idx, value in enumerate(hidden_raw):
+            hidden_list.append(
+                _require_int(f"horde_hidden_sizes[{idx}]", value, minimum=1, maximum=_INT32_MAX)
+            )
+        hidden = tuple(hidden_list)
+        buffer_capacity = _require_int(
+            "buffer_capacity", data.pop("buffer_capacity", 200), minimum=1, maximum=_INT32_MAX
+        )
+        n_dreams_per_step = _require_int(
+            "n_dreams_per_step", data.pop("n_dreams_per_step", 0), minimum=0, maximum=_INT32_MAX
+        )
         dream_next_observation_mode = data.pop(
             "dream_next_observation_mode",
             "model_prediction",
         )
-        horde_step_size = float(data.pop("horde_step_size", 0.1))
-        auto_curate_every = int(data.pop("auto_curate_every", 0))
+        if type(dream_next_observation_mode) is not str:
+            raise ValueError("dream_next_observation_mode must be a string")
+        if dream_next_observation_mode not in {"model_prediction", "sample_one_hot"}:
+            raise ValueError(
+                "dream_next_observation_mode must be 'model_prediction' or 'sample_one_hot'"
+            )
+        horde_step_size = _validated_config_float(
+            "horde_step_size", data.pop("horde_step_size", 0.1), positive=True
+        )
+        auto_curate_every = _require_int(
+            "auto_curate_every", data.pop("auto_curate_every", 0), minimum=0, maximum=_INT32_MAX
+        )
         if data:
-            unknown = ", ".join(sorted(data))
+            unknown = ", ".join(sorted(str(k) for k in data))
             raise ValueError(f"PrototypeAgentConfig payload has unknown fields: {unknown}")
         return cls(
             oak=oak,
