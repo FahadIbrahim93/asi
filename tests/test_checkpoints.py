@@ -205,6 +205,54 @@ class TestMetadata:
 
         assert dict(restored.metadata) == {"_format_version": 2, "epoch": 7}
 
+    def test_rejects_nonfinite_metadata_without_writing(self, tmp_path):
+        """NaN metadata used to persist and reload as a real metric."""
+        learner = LinearLearner()
+        state = learner.init(feature_dim=5)
+        path = tmp_path / "nan_meta"
+
+        with pytest.raises(ValueError, match="JSON-safe and finite"):
+            save_checkpoint(state, path, metadata={"loss": float("nan"), "ok": True})
+        assert not path.exists()
+
+    def test_rejects_nested_infinite_metadata_without_writing(self, tmp_path):
+        learner = LinearLearner()
+        state = learner.init(feature_dim=5)
+        path = tmp_path / "inf_meta"
+
+        with pytest.raises(ValueError, match="JSON-safe and finite"):
+            save_checkpoint(state, path, metadata={"metrics": {"loss": float("inf")}})
+        assert not path.exists()
+
+    def test_keeps_legal_bool_and_finite_metadata(self, tmp_path):
+        learner = LinearLearner()
+        state = learner.init(feature_dim=5)
+        metadata = {"epoch": 42, "ok": True, "mae": 0.15, "tags": ["a", 1]}
+
+        save_checkpoint(state, tmp_path / "legal_meta", metadata=metadata)
+        _, loaded = load_checkpoint(state, tmp_path / "legal_meta")
+
+        assert loaded == metadata
+
+    def test_load_rejects_poisoned_nonfinite_metadata(self, tmp_path):
+        learner = LinearLearner()
+        state = learner.init(feature_dim=5)
+        path = tmp_path / "poisoned"
+
+        with ocp.Checkpointer(ocp.CompositeCheckpointHandler()) as ckptr:
+            ckptr.save(
+                str(path),
+                args=ocp.args.Composite(
+                    state=ocp.args.StandardSave(state),
+                    metadata=ocp.args.JsonSave({"loss": float("nan"), "_format_version": 2}),
+                ),
+            )
+
+        with pytest.raises(ValueError, match="JSON-safe and finite"):
+            load_checkpoint(state, path)
+        with pytest.raises(ValueError, match="JSON-safe and finite"):
+            load_checkpoint_metadata(path)
+
     def test_checkpoint_directory_created(self, tmp_path):
         """Checkpoint should be saved as a directory with state/ subdirectory."""
         learner = LinearLearner()
