@@ -105,20 +105,21 @@ _ACTUAL_INT_TYPES: tuple[type, ...] = (
     np.uint16,
     np.uint32,
     np.uint64,
+    np.longlong,
+    np.ulonglong,
 )
-
 
 def _require_bool(name: str, value: object) -> bool:
     """Require an actual builtin bool (``__class__`` spoofing is ignored)."""
     if type(value) is not bool:
-        raise ValueError(f"{name} must be a bool, got {value!r}")
+        raise ValueError(f"{name} must be a bool")
     return value
 
 
 def _require_str_choice(name: str, value: object, choices: tuple[str, ...]) -> str:
     """Require an actual builtin str drawn from ``choices``."""
     if type(value) is not str or value not in choices:
-        raise ValueError(f"unknown {name} {value!r}")
+        raise ValueError(f"unknown {name}")
     return value
 
 
@@ -137,7 +138,7 @@ def _require_unit_interval(name: str, value: object) -> float:
         or narrowed < 0.0
         or not narrowed <= 1.0
     ):
-        raise ValueError(f"{name} must be in [0, 1], got {value!r}")
+        raise ValueError(f"{name} must be in [0, 1]")
     return canonical_float32_storage(real, narrowed)
 
 
@@ -151,7 +152,7 @@ def _require_half_open_unit_interval(name: str, value: object) -> float:
         or narrowed <= 0.0
         or not narrowed <= 1.0
     ):
-        raise ValueError(f"{name} must be in (0, 1], got {value!r}")
+        raise ValueError(f"{name} must be in (0, 1]")
     return canonical_float32_storage(real, narrowed)
 
 
@@ -165,21 +166,21 @@ def _require_half_open_zero_one_interval(name: str, value: object) -> float:
         or narrowed < 0.0
         or not narrowed < 1.0
     ):
-        raise ValueError(f"{name} must be in [0, 1), got {value!r}")
+        raise ValueError(f"{name} must be in [0, 1)")
     return canonical_float32_storage(real, narrowed)
 
 
 def _require_nonnegative_real(name: str, value: object) -> float:
     real, numerator, _, narrowed = finite_real_and_float32(name, value)
     if real < 0.0 or numerator < 0 or narrowed < 0.0:
-        raise ValueError(f"{name} must be non-negative, got {value!r}")
+        raise ValueError(f"{name} must be non-negative")
     return canonical_float32_storage(real, narrowed)
 
 
 def _require_positive_real(name: str, value: object) -> float:
     real, numerator, _, narrowed = finite_real_and_float32(name, value)
     if real <= 0.0 or numerator <= 0 or narrowed <= 0.0:
-        raise ValueError(f"{name} must be positive, got {value!r}")
+        raise ValueError(f"{name} must be positive")
     return canonical_float32_storage(real, narrowed)
 
 
@@ -191,16 +192,16 @@ def _require_int(
     maximum: int | None = None,
 ) -> int:
     if type(value) not in _ACTUAL_INT_TYPES:
-        raise ValueError(f"{name} must be an integer, got {value!r}")
+        raise ValueError(f"{name} must be an integer")
     number = int(cast(int, value))
     if minimum is not None and number < minimum:
         if minimum == 1:
-            raise ValueError(f"{name} must be positive, got {value!r}")
+            raise ValueError(f"{name} must be positive")
         if minimum == 0:
-            raise ValueError(f"{name} must be non-negative, got {value!r}")
-        raise ValueError(f"{name} must be >= {minimum}, got {value!r}")
+            raise ValueError(f"{name} must be non-negative")
+        raise ValueError(f"{name} must be >= {minimum}")
     if maximum is not None and number > maximum:
-        raise ValueError(f"{name} must be <= {maximum}, got {value!r}")
+        raise ValueError(f"{name} must be <= {maximum}")
     return number
 
 
@@ -275,7 +276,7 @@ class Step2FeatureConfig:
             raise ValueError(msg)
         ema_decay = _require_half_open_zero_one_interval("ema_decay", self.ema_decay)
         if type(self.periods) is not tuple:
-            raise ValueError(f"periods must be a tuple, got {self.periods!r}")
+            raise ValueError("periods must be a tuple")
         canonical_periods = tuple(
             _require_positive_real("period", p) for p in self.periods
         )
@@ -359,11 +360,9 @@ class Step2UPGDConfig:
         )
         n_heads = _require_int("n_heads", self.n_heads, minimum=1, maximum=_INT32_MAX)
         if type(self.hidden_sizes) is not tuple or not self.hidden_sizes:
-            msg = (
-                "hidden_sizes must contain at least one positive size, "
-                f"got {self.hidden_sizes!r}"
+            raise ValueError(
+                "hidden_sizes must contain at least one positive size"
             )
-            raise ValueError(msg)
         canonical_hidden = tuple(
             _require_int("hidden_sizes element", size, minimum=1, maximum=_INT32_MAX)
             for size in self.hidden_sizes
