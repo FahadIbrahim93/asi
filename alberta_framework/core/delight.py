@@ -24,8 +24,10 @@ skipped backward work.
 from __future__ import annotations
 
 import dataclasses
-import math
-from typing import Any, Literal
+import operator
+from collections.abc import Mapping
+from fractions import Fraction
+from typing import Any, Literal, SupportsIndex, cast
 
 import chex
 import jax
@@ -34,28 +36,108 @@ import numpy as np
 from jax import Array
 from jaxtyping import Bool, Float, Int
 
+from alberta_framework.core._float32_scalars import validated_float32_scalar_with_ratio
+
 PolicyGradientMode = Literal["ordinary_pg", "delightful_pg"]
 GradientCandidateSemantics = Literal["gradient", "update"]
 _FLOAT32_MAX = float(np.finfo(np.float32).max)
 _FLOAT32_TINY = float(np.finfo(np.float32).tiny)
 _FLOAT32_EPSILON = float(np.finfo(np.float32).eps)
 _ALIGNMENT_ENDPOINT_TOLERANCE = 4.0 * _FLOAT32_EPSILON
+_INT32_MAX = 2**31 - 1
+_ACTUAL_INT_TYPES: frozenset[type] = frozenset(
+    {
+        int,
+        np.int8,
+        np.int16,
+        np.int32,
+        np.int64,
+        np.uint8,
+        np.uint16,
+        np.uint32,
+        np.uint64,
+        np.longlong,
+        np.ulonglong,
+    }
+)
+_ACTUAL_FLOAT_TYPES: frozenset[type] = frozenset(
+    {float, Fraction, *(np.dtype(c).type for c in ("e", "f", "d", "g"))}
+)
+_ALLOWED_REAL_TYPES: frozenset[type] = _ACTUAL_INT_TYPES | _ACTUAL_FLOAT_TYPES
+
+
+def _require_int(name: str, value: object, *, minimum: int, maximum: int = _INT32_MAX) -> int:
+    if type(value) not in _ACTUAL_INT_TYPES:
+        raise ValueError(f"{name} must be an integer")
+    canonical = operator.index(cast(SupportsIndex, value))
+    if not minimum <= canonical <= maximum:
+        raise ValueError(f"{name} must be an integer")
+    return canonical
+
+
+def _require_bool(name: str, value: object) -> bool:
+    if type(value) is not bool:
+        raise ValueError(f"{name} must be an actual bool")
+    return value
+
+
+def _require_choice(name: str, value: object, choices: tuple[str, ...]) -> str:
+    if type(value) is not str or value not in choices:
+        raise ValueError(f"{name} is unsupported")
+    return value
+
+
+def _validated_config_float(
+    name: str,
+    value: object,
+    *,
+    positive: bool = False,
+    lower: float | None = None,
+    upper: float | None = None,
+    upper_inclusive: bool = True,
+) -> float:
+    if type(value) not in _ALLOWED_REAL_TYPES:
+        raise ValueError(f"{name} must be a finite real number")
+    stored, numerator, denominator = validated_float32_scalar_with_ratio(
+        name,
+        value,
+        positive=positive,
+        lower=lower,
+        upper=upper,
+        upper_inclusive=upper_inclusive,
+    )
+    if numerator != 0 and abs(numerator) * (1 << 149) <= denominator:
+        raise ValueError(f"{name} must remain nonzero once narrowed to float32")
+    return stored
+
+
+def _copy_mapping(payload: object, *, name: str) -> dict[str, object]:
+    if not isinstance(payload, Mapping):
+        raise ValueError(f"{name} payload must be a mapping")
+    try:
+        data = dict(payload)
+    except Exception as exc:
+        raise ValueError(f"{name} payload could not be read") from exc
+    for key in data:
+        if type(key) is not str:
+            raise ValueError(f"{name} payload has exact strings as keys")
+    return data
+
+
+def _require_float32_resource(
+    name: str, *, vector_scalars: int, fixed_scalars: int = 0
+) -> None:
+    total = vector_scalars + fixed_scalars
+    if total > _INT32_MAX:
+        raise ValueError(f"{name} scalar count must fit signed int32")
+    if 4 * total > _INT32_MAX:
+        raise ValueError(f"{name} byte count must fit signed int32")
 
 
 def _validate_float32_config_value(name: str, value: float) -> None:
     """Reject values that become zero or non-finite in float32 computation."""
-    value_dtype = getattr(value, "dtype", None)
-    if isinstance(value, bool) or (
-        value_dtype is not None and jnp.issubdtype(value_dtype, jnp.bool_)
-    ):
-        raise ValueError(f"{name} must be numeric, not boolean")
-    if not math.isfinite(value):
-        raise ValueError(f"{name} must be finite")
-    magnitude = abs(value)
-    if magnitude > _FLOAT32_MAX or (magnitude != 0.0 and magnitude < _FLOAT32_TINY):
-        raise ValueError(
-            f"{name} must be exactly zero or representable as a finite normal float32"
-        )
+    # Hostile-safe gate: delegate to validated_float32_scalar_with_ratio
+    _validated_config_float(name, value)
 
 
 @chex.dataclass(frozen=True)
@@ -137,37 +219,47 @@ class GradientJoyConfig:
 
     def __post_init__(self) -> None:
         """Validate units, thresholds, and static candidate semantics."""
-        if self.candidate_semantics not in ("gradient", "update"):
-            raise ValueError("candidate_semantics must be 'gradient' or 'update'")
-        positive_finite = {
-            "gradient_step_size": self.gradient_step_size,
-            "max_update_norm": self.max_update_norm,
-            "alignment_temperature": self.alignment_temperature,
-            "norm_temperature": self.norm_temperature,
-            "diagnostics_epsilon": self.diagnostics_epsilon,
-        }
-        for name, value in positive_finite.items():
-            _validate_float32_config_value(name, value)
-            if value <= 0.0:
+        object.__setattr__(
+            self, "candidate_semantics", _require_choice(
+                "candidate_semantics", self.candidate_semantics, ("gradient", "update")
+            )
+        )
+        for name in (
+            "gradient_step_size",
+            "max_update_norm",
+            "alignment_temperature",
+            "norm_temperature",
+            "diagnostics_epsilon",
+        ):
+            object.__setattr__(
+                self,
+                name,
+                _validated_config_float(
+                    name, getattr(self, name), lower=0.0, upper=None
+                ),
+            )
+            if getattr(self, name) <= 0.0:
                 raise ValueError(f"{name} must be positive")
-        finite_thresholds = {
-            "min_objective_decrease": self.min_objective_decrease,
-            "max_retention_loss_increase": self.max_retention_loss_increase,
-            "max_safety_cost_increase": self.max_safety_cost_increase,
-        }
-        for name, value in finite_thresholds.items():
-            _validate_float32_config_value(name, value)
+        for name in (
+            "min_objective_decrease",
+            "max_retention_loss_increase",
+            "max_safety_cost_increase",
+        ):
+            object.__setattr__(
+                self, name, _validated_config_float(name, getattr(self, name))
+            )
         if self.min_objective_decrease < 0.0:
             raise ValueError("min_objective_decrease must be nonnegative")
-        alignments = {
-            "min_objective_descent_alignment": (self.min_objective_descent_alignment),
-            "min_retention_descent_alignment": (self.min_retention_descent_alignment),
-            "min_safety_descent_alignment": self.min_safety_descent_alignment,
-        }
-        for name, value in alignments.items():
-            _validate_float32_config_value(name, value)
-            if not -1.0 <= value <= 1.0:
-                raise ValueError(f"{name} must be in [-1, 1]")
+        for name in (
+            "min_objective_descent_alignment",
+            "min_retention_descent_alignment",
+            "min_safety_descent_alignment",
+        ):
+            object.__setattr__(
+                self,
+                name,
+                _validated_config_float(name, getattr(self, name), lower=-1.0, upper=1.0),
+            )
         if self.max_update_norm <= self.diagnostics_epsilon:
             raise ValueError(
                 "max_update_norm must be greater than diagnostics_epsilon "
@@ -181,11 +273,30 @@ class GradientJoyConfig:
         return payload
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> GradientJoyConfig:
+    def from_config(cls, config: object) -> GradientJoyConfig:
         """Reconstruct from :meth:`to_config` output."""
-        payload = dict(config)
-        payload.pop("type", None)
-        return cls(**payload)
+        payload = _copy_mapping(config, name="GradientJoyConfig")
+        type_value = payload.pop("type", None)
+        if type_value is not None and type_value != "GradientJoyConfig":
+            raise ValueError("GradientJoyConfig type is unsupported")
+        allowed = {
+            "candidate_semantics",
+            "gradient_step_size",
+            "max_update_norm",
+            "min_objective_decrease",
+            "max_retention_loss_increase",
+            "max_safety_cost_increase",
+            "min_objective_descent_alignment",
+            "min_retention_descent_alignment",
+            "min_safety_descent_alignment",
+            "alignment_temperature",
+            "norm_temperature",
+            "diagnostics_epsilon",
+        }
+        unknown = sorted(set(payload) - allowed)
+        if unknown:
+            raise ValueError(f"GradientJoyConfig has unsupported fields: {unknown}")
+        return cls(**payload)  # type: ignore[arg-type]
 
 
 @chex.dataclass(frozen=True)
@@ -1759,24 +1870,34 @@ class DelightfulPolicyGradientConfig:
 
     def __post_init__(self) -> None:
         """Validate the experimental contract."""
-        if self.mode not in ("ordinary_pg", "delightful_pg"):
-            raise ValueError("mode must be 'ordinary_pg' or 'delightful_pg'")
-        _validate_float32_config_value("temperature", self.temperature)
+        object.__setattr__(
+            self, "mode", _require_choice("mode", self.mode, ("ordinary_pg", "delightful_pg"))
+        )
+        object.__setattr__(
+            self, "temperature", _validated_config_float("temperature", self.temperature, lower=0.0)
+        )
         if self.temperature <= 0.0:
             raise ValueError("temperature must be positive")
-        _validate_float32_config_value("actor_trace_lambda", self.actor_trace_lambda)
+        object.__setattr__(
+            self,
+            "actor_trace_lambda",
+            _validated_config_float("actor_trace_lambda", self.actor_trace_lambda),
+        )
         if self.actor_trace_lambda != 0.0:
             raise ValueError(
                 "Delightful Policy Gradient requires actor_trace_lambda=0; "
                 "a current-sample gate cannot reweight historical score gradients"
             )
-        _validate_float32_config_value("diagnostics_epsilon", self.diagnostics_epsilon)
+        object.__setattr__(
+            self,
+            "diagnostics_epsilon",
+            _validated_config_float("diagnostics_epsilon", self.diagnostics_epsilon, lower=0.0),
+        )
         if self.diagnostics_epsilon <= 0.0:
             raise ValueError("diagnostics_epsilon must be positive")
-        if type(self.kondo_enabled) is not bool:
-            raise ValueError(
-                f"kondo_enabled must be an actual bool, got {self.kondo_enabled!r}"
-            )
+        object.__setattr__(
+            self, "kondo_enabled", _require_bool("kondo_enabled", self.kondo_enabled)
+        )
         if self.kondo_enabled:
             raise ValueError(
                 "Kondo compute gating is unavailable in this full-batch helper; "
@@ -1790,11 +1911,23 @@ class DelightfulPolicyGradientConfig:
         return payload
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> DelightfulPolicyGradientConfig:
+    def from_config(cls, config: object) -> DelightfulPolicyGradientConfig:
         """Reconstruct from :meth:`to_config` output."""
-        payload = dict(config)
-        payload.pop("type", None)
-        return cls(**payload)
+        payload = _copy_mapping(config, name="DelightfulPolicyGradientConfig")
+        type_value = payload.pop("type", None)
+        if type_value is not None and type_value != "DelightfulPolicyGradientConfig":
+            raise ValueError("DelightfulPolicyGradientConfig type is unsupported")
+        allowed = {
+            "mode",
+            "temperature",
+            "actor_trace_lambda",
+            "diagnostics_epsilon",
+            "kondo_enabled",
+        }
+        unknown = sorted(set(payload) - allowed)
+        if unknown:
+            raise ValueError(f"DelightfulPolicyGradientConfig has unsupported fields: {unknown}")
+        return cls(**payload)  # type: ignore[arg-type]
 
 
 @chex.dataclass(frozen=True)
