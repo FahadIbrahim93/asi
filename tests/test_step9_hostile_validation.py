@@ -6,7 +6,11 @@ from typing import Any, cast
 import numpy as np
 import pytest
 
-from alberta_framework.steps.step9 import Step9DreamingConfig
+from alberta_framework.steps.step9 import (
+    Step9DreamingConfig,
+    make_step9_components,
+    run_step9_smoke,
+)
 
 
 class _EvilStr(str):
@@ -175,3 +179,68 @@ def test_float_subclass_with_lying_ratio_is_rejected() -> None:
     with pytest.raises(ValueError, match="must be finite"):
         Step9DreamingConfig(model_step_size=RatioFloat(0.05))
     assert RatioFloat.calls == 0
+
+
+def test_from_dict_requires_exact_complete_and_nested_schema_without_hooks() -> None:
+    class HostileDict(dict[object, object]):
+        calls = 0
+
+        def __iter__(self):  # pragma: no cover - must not run
+            type(self).calls += 1
+            raise AssertionError("mapping hook must not run")
+
+    with pytest.raises(ValueError, match="exact dictionary"):
+        Step9DreamingConfig.from_dict(cast(Any, HostileDict()))
+    assert HostileDict.calls == 0
+
+    payload = Step9DreamingConfig().to_dict()
+    malformed = dict(payload)
+    malformed["extra"] = 1
+    with pytest.raises(ValueError, match="schema"):
+        Step9DreamingConfig.from_dict(malformed)
+    payload["control"] = HostileDict()
+    with pytest.raises(ValueError, match="exact dictionary"):
+        Step9DreamingConfig.from_dict(payload)
+    assert HostileDict.calls == 0
+
+
+def test_hidden_size_validation_is_bounded_before_iteration() -> None:
+    with pytest.raises(ValueError, match="at most 4096"):
+        Step9DreamingConfig(model_hidden_sizes=(1,) * 4_097)
+    payload = Step9DreamingConfig().to_dict()
+    payload["model_hidden_sizes"] = [1] * 4_097
+    with pytest.raises(ValueError, match="at most 4096"):
+        Step9DreamingConfig.from_dict(payload)
+
+
+def test_derived_allocation_and_runtime_work_fail_at_config_boundary() -> None:
+    with pytest.raises(ValueError, match="observation buffer bytes"):
+        Step9DreamingConfig(buffer_capacity=536_870_912, observation_dim=1)
+    with pytest.raises(ValueError, match="dream work per real step"):
+        Step9DreamingConfig(
+            planning_budget=65,
+            dream_candidate_count=64,
+            dream_rollout_horizon=1,
+        )
+
+
+def test_runtime_entry_points_require_exact_config_without_truthiness_hooks() -> None:
+    calls = 0
+
+    class HostileConfig:
+        def __bool__(self) -> bool:  # pragma: no cover - must not run
+            nonlocal calls
+            calls += 1
+            raise AssertionError("truthiness hook must not run")
+
+    value = HostileConfig()
+    with pytest.raises(TypeError, match="exact Step9DreamingConfig"):
+        make_step9_components(cast(Any, value))
+    with pytest.raises(TypeError, match="exact Step9DreamingConfig"):
+        run_step9_smoke(cast(Any, value), steps=1)
+    assert calls == 0
+
+
+def test_smoke_preflights_complete_output_shape_before_allocation() -> None:
+    with pytest.raises(ValueError, match="observation row count"):
+        run_step9_smoke(steps=2**31 - 1)

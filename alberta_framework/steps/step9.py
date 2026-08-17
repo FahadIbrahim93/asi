@@ -70,6 +70,8 @@ from alberta_framework.steps.step6 import (
 )
 
 _INT32_MAX = 2**31 - 1
+_MAX_CONFIG_SEQUENCE_LENGTH = 4_096
+_MAX_DREAM_WORK_PER_REAL_STEP = 4_096
 _ACTUAL_INT_TYPES = frozenset(
     {
         int,
@@ -173,13 +175,25 @@ class Step9DreamingConfig:
     @classmethod
     def from_dict(cls, payload: dict[str, object]) -> Step9DreamingConfig:
         """Reconstruct from :meth:`to_dict` output."""
-        data = dict(payload)
-        data["control"] = Step6DifferentialSARSAConfig.from_dict(
-            cast(dict[str, object], data["control"])
+        data = _require_exact_payload(
+            payload,
+            name="Step9DreamingConfig payload",
+            fields=frozenset(cls.__dataclass_fields__),
         )
-        hs = data.get("model_hidden_sizes", (64,))
-        if isinstance(hs, list):
-            data["model_hidden_sizes"] = tuple(hs)
+        control_raw = _require_exact_payload(
+            data["control"],
+            name="control payload",
+            fields=frozenset(Step6DifferentialSARSAConfig.__dataclass_fields__),
+        )
+        data["control"] = Step6DifferentialSARSAConfig.from_dict(
+            control_raw
+        )
+        hs = data["model_hidden_sizes"]
+        if type(hs) is not list:
+            raise ValueError("model_hidden_sizes payload must be an exact list")
+        hidden = cast(list[object], hs)
+        _require_sequence_length("model_hidden_sizes", len(hidden))
+        data["model_hidden_sizes"] = tuple(hidden)
         return cls(**cast(Any, data))
 
     def to_world_model_config(self) -> ActionConditionedWorldModelConfig:
@@ -265,7 +279,92 @@ def _require_bool(name: str, value: object) -> bool:
     return value
 
 
+def _require_exact_payload(
+    value: object,
+    *,
+    name: str,
+    fields: frozenset[str],
+) -> dict[str, object]:
+    if type(value) is not dict:
+        raise ValueError(f"{name} must be an exact dictionary")
+    raw = cast(dict[object, object], value)
+    if any(type(key) is not str for key in raw):
+        raise ValueError(f"{name} keys must be exact strings")
+    keys = cast(set[str], set(raw))
+    if keys != fields:
+        raise ValueError(f"{name} fields do not match the schema")
+    return cast(dict[str, object], dict(raw))
+
+
+def _require_sequence_length(name: str, count: int) -> None:
+    if count > _MAX_CONFIG_SEQUENCE_LENGTH:
+        raise ValueError(
+            f"{name} must contain at most {_MAX_CONFIG_SEQUENCE_LENGTH} values"
+        )
+
+
+def _checked_product(name: str, *factors: int) -> int:
+    product = 1
+    for factor in factors:
+        if factor < 0 or (factor != 0 and product > _INT32_MAX // factor):
+            raise ValueError(f"derived {name} must fit signed int32")
+        product *= factor
+    return product
+
+
+def _checked_sum(name: str, *terms: int) -> int:
+    total = 0
+    for term in terms:
+        if term < 0 or term > _INT32_MAX - total:
+            raise ValueError(f"derived {name} must fit signed int32")
+        total += term
+    return total
+
+
+def _preflight_step9_resources(config: Step9DreamingConfig) -> None:
+    buffer_cells = _checked_product(
+        "Step 9 observation buffer count",
+        config.buffer_capacity,
+        config.observation_dim,
+    )
+    _checked_product("Step 9 observation buffer bytes", 4, buffer_cells)
+    dream_work = _checked_product(
+        "Step 9 dream work per real step",
+        config.planning_budget,
+        _checked_sum(
+            "Step 9 candidate and rollout work",
+            config.dream_candidate_count,
+            config.dream_rollout_horizon,
+        ),
+    )
+    if dream_work > _MAX_DREAM_WORK_PER_REAL_STEP:
+        raise ValueError(
+            "derived Step 9 dream work per real step must be at most "
+            f"{_MAX_DREAM_WORK_PER_REAL_STEP}"
+        )
+
+
+def _preflight_step9_smoke_resources(config: Step9DreamingConfig, steps: int) -> None:
+    rows = _checked_sum("Step 9 observation row count", steps, 1)
+    observations = _checked_product(
+        "Step 9 observation count", rows, config.observation_dim
+    )
+    dream_outputs = _checked_product(
+        "Step 9 dream output count", steps, config.planning_budget
+    )
+    _checked_sum(
+        "Step 9 smoke array bytes",
+        _checked_product("Step 9 observation bytes", 4, observations),
+        _checked_product("Step 9 scalar output bytes", 21, steps),
+        _checked_product("Step 9 dream output bytes", 5, dream_outputs),
+    )
+
+
 def _validate_dreaming_config(config: Step9DreamingConfig) -> None:
+    if type(config) is not Step9DreamingConfig:
+        raise TypeError("config must be an exact Step9DreamingConfig")
+    if type(config.control) is not Step6DifferentialSARSAConfig:
+        raise TypeError("control must be an exact Step6DifferentialSARSAConfig")
     observation_dim = _require_int(
         "observation_dim", config.observation_dim, minimum=1, maximum=_INT32_MAX
     )
@@ -279,6 +378,7 @@ def _validate_dreaming_config(config: Step9DreamingConfig) -> None:
         )
     if type(config.model_hidden_sizes) is not tuple:
         raise ValueError("model_hidden_sizes must be a tuple of integers")
+    _require_sequence_length("model_hidden_sizes", len(config.model_hidden_sizes))
     model_hidden_sizes = tuple(
         _require_int("model_hidden_sizes", size, minimum=1, maximum=_INT32_MAX)
         for size in config.model_hidden_sizes
@@ -372,6 +472,9 @@ def _validate_dreaming_config(config: Step9DreamingConfig) -> None:
     object.__setattr__(config, "dream_utility_weight", dream_utility_weight)
     object.__setattr__(config, "buffer_capacity", buffer_capacity)
     object.__setattr__(config, "dreams_update_average_reward", dreams_update_average_reward)
+    _preflight_step9_resources(config)
+    config.to_world_model_config()
+    config.control.to_core_config()
 
 
 @chex.dataclass(frozen=True)
@@ -426,6 +529,12 @@ class Step9SmokeResult:
     world_model_config: dict[str, Any]
 
     def __post_init__(self) -> None:
+        if type(self.config) is not Step9DreamingConfig:
+            raise TypeError("config must be an exact Step9DreamingConfig")
+        if type(self.control_config) is not dict:
+            raise TypeError("control_config must be an exact dictionary")
+        if type(self.world_model_config) is not dict:
+            raise TypeError("world_model_config must be an exact dictionary")
         object.__setattr__(
             self, "steps", _require_int("steps", self.steps, minimum=1, maximum=_INT32_MAX)
         )
@@ -462,7 +571,13 @@ def make_step9_components(
     config: Step9DreamingConfig | None = None,
 ) -> tuple[DifferentialSARSAAgent, ActionConditionedWorldModel, RecentObservationBuffer]:
     """Create the Step 9 control agent, world model, and observation buffer."""
-    cfg = config or Step9DreamingConfig()
+    if config is None:
+        cfg = Step9DreamingConfig()
+    elif type(config) is Step9DreamingConfig:
+        cfg = config
+    else:
+        raise TypeError("config must be an exact Step9DreamingConfig")
+    _preflight_step9_resources(cfg)
     agent = make_step6_differential_sarsa_agent(cfg.control)
     model = ActionConditionedWorldModel(cfg.to_world_model_config())
     buffer = RecentObservationBuffer(cfg.buffer_capacity, cfg.observation_dim)
@@ -858,7 +973,14 @@ def run_step9_smoke(
     steps = _require_int("steps", steps, minimum=1, maximum=_INT32_MAX)
     seed = require_jax_seed(seed, name="seed")
 
-    cfg = config or Step9DreamingConfig()
+    if config is None:
+        cfg = Step9DreamingConfig()
+    elif type(config) is Step9DreamingConfig:
+        cfg = config
+    else:
+        raise TypeError("config must be an exact Step9DreamingConfig")
+    _preflight_step9_resources(cfg)
+    _preflight_step9_smoke_resources(cfg, steps)
     agent, model, buffer = make_step9_components(cfg)
     data_key, state_key = jr.split(jr.key(seed))
     observations = jr.normal(
