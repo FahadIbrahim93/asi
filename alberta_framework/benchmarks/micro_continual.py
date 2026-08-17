@@ -1077,9 +1077,14 @@ def micro_shard_payload(result: MicroRunResult) -> dict[str, Any]:
     }
 
 
+def _strict_json_text(payload: dict[str, Any]) -> str:
+    """Serialize one object as RFC-valid JSON (no NaN / Infinity tokens)."""
+    return json.dumps(payload, indent=1, sort_keys=True, allow_nan=False) + "\n"
+
+
 def write_micro_shard(path: Path | str, payload: dict[str, Any]) -> None:
     """Atomically publish one immutable shard (refuses an occupied path)."""
-    encoded = (json.dumps(payload, indent=1, sort_keys=True) + "\n").encode("utf-8")
+    encoded = _strict_json_text(payload).encode("utf-8")
     atomic_write_new(Path(path), encoded)
 
 
@@ -1590,7 +1595,7 @@ def _atomic_replace_json(path: Path, payload: dict[str, Any]) -> None:
     """Atomically (re)write one derived JSON artifact (summaries are
     regenerable from immutable shards, so replacement is allowed here)."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    encoded = json.dumps(payload, indent=1, sort_keys=True) + "\n"
+    encoded = _strict_json_text(payload)
     fd, temporary = tempfile.mkstemp(
         dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
     )
