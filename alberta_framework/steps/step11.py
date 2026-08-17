@@ -231,6 +231,12 @@ def _require_int(
     return number
 
 
+def _require_bool(name: str, value: object) -> bool:
+    if type(value) is not bool:
+        raise ValueError(f"{name} must be a boolean, got {value!r}")
+    return value
+
+
 def _validate_oak_facade_config(config: Step11OaKConfig) -> None:
     observation_dim = _require_int(
         "observation_dim",
@@ -361,6 +367,23 @@ class Step11SmokeResult:
     finite: bool
     option_termination_count: int
     agent_config: dict[str, Any]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "steps", _require_int("steps", self.steps, minimum=1, maximum=_INT32_MAX)
+        )
+        object.__setattr__(self, "seed", require_jax_seed(self.seed, name="seed"))
+        object.__setattr__(self, "finite", _require_bool("finite", self.finite))
+        object.__setattr__(
+            self,
+            "option_termination_count",
+            _require_int(
+                "option_termination_count",
+                self.option_termination_count,
+                minimum=0,
+                maximum=_INT32_MAX,
+            ),
+        )
 
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-serializable representation."""
