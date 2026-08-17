@@ -646,6 +646,41 @@ class RecurrentLatentWorldModelResourceBudget:
     max_member_update_count: int
     replay_capacity: int
 
+    def __post_init__(self) -> None:
+        for name in (
+            "ensemble_size",
+            "observation_dim",
+            "latent_dim",
+            "target_dim",
+            "trainable_scalars_per_member",
+            "total_trainable_scalars",
+            "persistent_float32_scalars",
+            "persistent_int32_scalars",
+            "persistent_uint32_scalars",
+            "persistent_bool_scalars",
+            "persistent_state_scalars",
+            "persistent_state_bytes",
+            "bootstrap_prng_keys",
+            "bootstrap_prng_uint32_scalars",
+            "start_cache_logical_scalars",
+            "start_cache_logical_bytes",
+            "decision_cache_logical_scalars",
+            "decision_cache_logical_bytes",
+            "update_result_logical_scalars",
+            "update_result_logical_bytes",
+            "member_gradient_candidates_per_event",
+            "max_member_parameter_updates_per_event",
+            "recurrent_advances_per_accepted_event",
+            "max_event_count",
+            "max_member_update_count",
+            "replay_capacity",
+        ):
+            object.__setattr__(
+                self,
+                name,
+                _nonnegative_int(getattr(self, name), name=name, maximum=_INT32_MAX),
+            )
+
     def to_config(self) -> dict[str, int]:
         """Return exact JSON-compatible accounting."""
         return dataclasses.asdict(self)
