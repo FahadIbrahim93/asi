@@ -868,6 +868,12 @@ def _require_unique_task_names(task_names: Sequence[str], *, name: str) -> tuple
     return names
 
 
+def _require_search_int(name: str, value: object, *, minimum: int) -> int:
+    if type(value) is not int or value < minimum:
+        raise ValueError(f"{name} must be an integer >= {minimum}, got {value!r}")
+    return value
+
+
 def evaluate_suite(
     genomes: Array,
     task_names: Sequence[str],
@@ -955,6 +961,10 @@ def _suite_geometry(config: EvalConfig) -> dict[str, Any]:
 def _resolved_suite(
     n_tasks: int | None, task_length: int | None, suite_kind: str = "digits"
 ) -> dict[str, EvalConfig]:
+    if n_tasks is not None:
+        n_tasks = _require_search_int("n_tasks", n_tasks, minimum=1)
+    if task_length is not None:
+        task_length = _require_search_int("task_length", task_length, minimum=1)
     suite: dict[str, EvalConfig]
     if suite_kind == "gauss":
         suite = dict(gauss_suite(n_tasks if n_tasks is not None else GAUSS_SEARCH_REGIMES))
@@ -1002,6 +1012,9 @@ def tune_champion_baseline(
     Returns ``(best_genome, best_accuracy, evaluated)`` where ``evaluated``
     holds every (genome, accuracy) pair for the archive.
     """
+    n_random = _require_search_int("n_random", n_random, minimum=0)
+    generations = _require_search_int("generations", generations, minimum=0)
+    children = _require_search_int("children", children, minimum=1)
     champion = champion_form_genome()
     flags = jnp.asarray(champion[:_N_FLAGS])
 
@@ -1066,6 +1079,12 @@ def run_search(
     :func:`tune_champion_baseline`). Never promotes anything by itself —
     promotion to the real protocol goes through ``ipmnist_screening`` arms.
     """
+    n_random = _require_search_int("n_random", n_random, minimum=0)
+    population = _require_search_int("population", population, minimum=1)
+    generations = _require_search_int("generations", generations, minimum=0)
+    elite = _require_search_int("elite", elite, minimum=1)
+    top_k = _require_search_int("top_k", top_k, minimum=1)
+    batch_size = _require_search_int("batch_size", batch_size, minimum=1)
     eval_seeds = require_unique_jax_seeds(eval_seeds, name="eval_seeds")
     holdout_seeds = require_unique_jax_seeds(holdout_seeds, name="holdout_seeds")
     search_seed = require_jax_seed(search_seed, name="search_seed")
