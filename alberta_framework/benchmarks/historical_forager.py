@@ -660,17 +660,16 @@ class HistoricalForagerRunConfig:
     allow_unverified_development_adapter: bool = False
 
     def __post_init__(self) -> None:
-        if isinstance(self.seed, bool) or not isinstance(self.seed, int):
+        if type(self.seed) is not int:
             raise HistoricalForagerContractError("seed must be an integer")
         if not 0 <= self.seed <= _MAX_SEED:
             raise HistoricalForagerContractError(f"seed must lie in [0, {_MAX_SEED}]")
-        if isinstance(self.steps, bool) or not isinstance(self.steps, int):
+        if type(self.steps) is not int:
             raise HistoricalForagerContractError("steps must be an integer")
         if not 1 <= self.steps <= _MAX_STEPS:
             raise HistoricalForagerContractError(f"steps must lie in [1, {_MAX_STEPS}]")
         if (
-            isinstance(self.aperture_size, bool)
-            or not isinstance(self.aperture_size, int)
+            type(self.aperture_size) is not int
             or self.aperture_size not in range(1, 16, 2)
         ):
             raise HistoricalForagerContractError(
@@ -873,17 +872,16 @@ class HistoricalForagerRunResult:
     kernel: Mapping[str, Any]
 
     def __post_init__(self) -> None:
-        if isinstance(self.seed, bool) or not isinstance(self.seed, int):
+        if type(self.seed) is not int:
             raise HistoricalForagerContractError("seed must be an integer")
         if not 0 <= self.seed <= _MAX_SEED:
             raise HistoricalForagerContractError(f"seed must lie in [0, {_MAX_SEED}]")
-        if isinstance(self.steps, bool) or not isinstance(self.steps, int):
+        if type(self.steps) is not int:
             raise HistoricalForagerContractError("steps must be an integer")
         if not 1 <= self.steps <= _MAX_STEPS:
             raise HistoricalForagerContractError(f"steps must lie in [1, {_MAX_STEPS}]")
         if (
-            isinstance(self.aperture_size, bool)
-            or not isinstance(self.aperture_size, int)
+            type(self.aperture_size) is not int
             or self.aperture_size not in range(1, 16, 2)
         ):
             raise HistoricalForagerContractError(

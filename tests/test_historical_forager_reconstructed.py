@@ -627,3 +627,16 @@ def test_run_result_rejects_leftover_identities() -> None:
     assert '"seed": true' not in dumped
     assert '"steps": 10' in dumped
     assert '"aperture_size": 9' in dumped
+
+
+def test_run_result_rejects_integer_subclasses_before_comparison_hooks() -> None:
+    class HostileInt(int):
+        def __le__(self, other: object) -> bool:
+            raise AssertionError("hostile comparison must not run")
+
+        def __ge__(self, other: object) -> bool:
+            raise AssertionError("hostile comparison must not run")
+
+    for field in ("seed", "steps", "aperture_size"):
+        with pytest.raises(HistoricalForagerContractError, match=field):
+            _legal_run_result(**{field: HostileInt(1)})

@@ -101,7 +101,6 @@ import tempfile
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
-from numbers import Real
 from pathlib import Path
 from typing import Any, Literal, SupportsIndex, cast
 
@@ -294,13 +293,9 @@ def _require_int32(name: str, value: object, *, minimum: int = 1) -> int:
 
 
 def _require_finite_real(name: str, value: object) -> float:
-    actual_type = type(value)
-    if issubclass(actual_type, bool) or not issubclass(actual_type, Real):
+    if type(value) not in (int, float):
         raise ValueError(f"{name} must be a finite real number")
-    try:
-        number = float(cast(Real, value))
-    except (OverflowError, TypeError, ValueError) as exc:
-        raise ValueError(f"{name} must be a finite real number") from exc
+    number = float(cast("int | float", value))
     if not math.isfinite(number):
         raise ValueError(f"{name} must be a finite real number")
     return number
@@ -313,18 +308,9 @@ def _require_nonempty_string(name: str, value: object) -> str:
 
 
 def _require_seed_identities(values: object, *, name: str) -> tuple[int, ...]:
-    if type(values) is bool:
-        raise ValueError(f"{name} must not be a boolean")
-    if isinstance(values, (str, bytes)):
-        raise ValueError(f"{name} must be a sequence of integer seeds")
-    try:
-        raw: tuple[object, ...] = tuple(values)  # type: ignore[arg-type]
-    except TypeError as exc:
-        raise ValueError(f"{name} must be a sequence of integer seeds") from exc
-    return tuple(
-        require_jax_seed(value, name=f"{name}[{index}]")
-        for index, value in enumerate(raw)
-    )
+    if type(values) is not tuple:
+        raise ValueError(f"{name} must be an exact tuple of unique integer seeds")
+    return require_unique_jax_seeds(values, name=name)
 
 
 @dataclass(frozen=True)

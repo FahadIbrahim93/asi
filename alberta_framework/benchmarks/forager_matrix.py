@@ -1612,17 +1612,32 @@ def load_forager_matrix_manifest(path: str | Path) -> ForagerMatrixManifest:
 def _json_safe(value: Any) -> Any:
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         return _json_safe(dataclasses.asdict(value))
-    if isinstance(value, Mapping):
-        return {str(key): _json_safe(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
+    if type(value) in (dict, MappingProxyType):
+        result: dict[str, Any] = {}
+        for key, item in value.items():
+            if type(key) is not str:
+                raise ForagerMatrixError("matrix artifact mappings require string keys")
+            result[key] = _json_safe(item)
+        return result
+    if type(value) in (list, tuple):
         return [_json_safe(item) for item in value]
-    if isinstance(value, float) and not math.isfinite(value):
-        raise ForagerMatrixError("matrix artifact identity is not finite JSON")
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise ForagerMatrixError("matrix artifact identity is not finite JSON")
+        return value
+    if type(value) in (np.float16, np.float32, np.float64, np.longdouble):
+        if not bool(np.isfinite(value)):
+            raise ForagerMatrixError("matrix artifact identity is not finite JSON")
+        return float(value)
     if isinstance(value, Path):
         if value.is_absolute():
             raise ForagerMatrixError("absolute host paths are forbidden in matrix artifacts")
         return value.as_posix()
-    return value
+    if value is None or type(value) in (str, bool, int):
+        return value
+    raise ForagerMatrixError(
+        f"matrix artifact contains unsupported {type(value).__name__} identity"
+    )
 
 
 def _assert_path_sanitized(value: Any, path: str = "artifact") -> None:

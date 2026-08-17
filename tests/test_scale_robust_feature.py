@@ -236,3 +236,50 @@ def test_scale_report_rejects_negative_wall_time() -> None:
             memory_by_condition={},
             wall_time_seconds_by_condition={CONDITION_PRIMARY: -0.001},
         )
+
+
+def test_seed_and_timing_maps_reject_aliases_before_container_hooks() -> None:
+    with pytest.raises(ValueError, match="uint32 JAX key domain"):
+        ConditionSeedRecord(
+            seed=2**32,
+            condition=CONDITION_PRIMARY,
+            phases=(),
+            end_segment_5_active_pairs=(),
+            end_segment_7_active_pairs=(),
+            final_active_pairs=(),
+        )
+    with pytest.raises(ValueError, match="unique"):
+        ScaleRobustFeatureReport(
+            seeds=(8, 8),
+            records=(),
+            memory_by_condition={},
+            wall_time_seconds_by_condition={},
+        )
+
+    class HostileTimingMap(dict[str, float]):
+        def items(self):  # type: ignore[no-untyped-def, override]
+            raise AssertionError("timing mapping hooks must not run")
+
+    with pytest.raises(TypeError, match="exact dictionary"):
+        ScaleRobustFeatureReport(
+            seeds=(8,),
+            records=(),
+            memory_by_condition={},
+            wall_time_seconds_by_condition=HostileTimingMap(),
+        )
+
+    class HostileResourceInt(int):
+        def __ge__(self, other: object) -> bool:
+            raise AssertionError("resource comparison hooks must not run")
+
+    with pytest.raises(ValueError, match="non-negative integer or boolean"):
+        ScaleRobustFeatureReport(
+            seeds=(8,),
+            records=(),
+            memory_by_condition={
+                CONDITION_PRIMARY: {
+                    "persistent_array_bytes": HostileResourceInt(1),
+                }
+            },
+            wall_time_seconds_by_condition={},
+        )

@@ -522,14 +522,14 @@ def _plain_json(value: Any, path: str = "value") -> Any:
         return value
     if value is None or type(value) in {str, bool, int}:
         return value
-    if isinstance(value, Mapping):
+    if type(value) in (dict, MappingProxyType):
         result: dict[str, Any] = {}
         for key, item in value.items():
             if type(key) is not str:
                 raise ForagerMatchedQualificationError(f"{path} has a non-string key")
             result[key] = _plain_json(item, f"{path}.{key}")
         return result
-    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+    if type(value) in (list, tuple):
         return [_plain_json(item, f"{path}[]") for item in value]
     raise ForagerMatchedQualificationError(f"{path} contains unsupported {type(value).__name__}")
 
