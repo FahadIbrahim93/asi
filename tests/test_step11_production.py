@@ -1164,15 +1164,15 @@ def test_step11_state_stays_finite_200_steps() -> None:
 def test_step11_config_preserves_float32_boundaries() -> None:
     f32_max = float(np.finfo(np.float32).max)
     spec = SubtaskSpec(
-        feature_index=2**31 - 2,
+        feature_index=3,
         threshold=f32_max,
         pseudo_reward_scale=f32_max,
         max_option_steps=2**31 - 1,
     )
     config = Step11OaKConfig(
         subtask_specs=(spec,),
-        observation_dim=2**31 - 1,
-        n_primitive_actions=2**31 - 1,
+        observation_dim=4,
+        n_primitive_actions=2,
         base_step_size=f32_max,
         base_avg_reward_step_size=f32_max,
         base_trace_decay=1.0,
@@ -1188,9 +1188,18 @@ def test_step11_config_preserves_float32_boundaries() -> None:
         utility_ema_decay=1.0,
         curation_threshold=f32_max,
     )
-    assert config.observation_dim == 2**31 - 1
+    assert config.observation_dim == 4
     assert config.option_planning_backups_per_step == 2**31 - 2
     assert config.base_step_size == f32_max
+
+
+def test_step11_config_rejects_derived_core_resource_overflow() -> None:
+    with pytest.raises(ValueError, match="derived n_total_actions"):
+        Step11OaKConfig(
+            subtask_specs=(SubtaskSpec(feature_index=0),),
+            observation_dim=1,
+            n_primitive_actions=2**31 - 1,
+        )
 
 
 def test_step11_oak_normalizes_conversion_hook_failures() -> None:
@@ -1270,7 +1279,7 @@ def _legal_step11_smoke_result(**overrides: object) -> Step11SmokeResult:
         "td_errors_shape": (8,),
         "average_rewards_shape": (8,),
         "primitive_actions_shape": (8,),
-        "utility_emas_shape": (8,),
+        "utility_emas_shape": (8, 1),
         "finite": True,
         "option_termination_count": 0,
         "agent_config": {"ok": True},

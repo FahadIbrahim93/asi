@@ -3,11 +3,19 @@
 from fractions import Fraction
 from typing import Any, cast
 
+import jax.numpy as jnp
+import jax.random as jr
 import numpy as np
 import pytest
 
 from alberta_framework.core.options import SubtaskSpec
-from alberta_framework.steps.step11 import Step11OaKConfig
+from alberta_framework.steps.step11 import (
+    Step11OaKConfig,
+    init_step11_state,
+    make_step11_oak_agent,
+    run_step11_scan,
+    step11_update,
+)
 
 
 class _EvilStr(str):
@@ -213,3 +221,100 @@ def test_float_subclass_with_lying_ratio_is_rejected() -> None:
     with pytest.raises(ValueError, match="must be finite"):
         Step11OaKConfig(base_step_size=RatioFloat(0.05))
     assert RatioFloat.calls == 0
+
+
+def test_config_subclass_is_rejected_before_attribute_hooks() -> None:
+    class HostileConfig(Step11OaKConfig):
+        calls = 0
+
+        def __getattribute__(self, name: str) -> object:
+            if name not in {"calls", "__class__"}:
+                type(self).calls += 1
+                raise AssertionError("attribute hook must not run")
+            return super().__getattribute__(name)
+
+    hostile = object.__new__(HostileConfig)
+    with pytest.raises(ValueError, match="actual Step11OaKConfig"):
+        Step11OaKConfig.__post_init__(hostile)
+    assert HostileConfig.calls == 0
+
+
+def test_from_config_requires_exact_closed_json_schema() -> None:
+    payload = Step11OaKConfig().to_config()
+    for altered in (
+        {key: value for key, value in payload.items() if key != "type"},
+        {**payload, "type": "Wrong"},
+        {**payload, "extra": 1},
+    ):
+        with pytest.raises(ValueError):
+            Step11OaKConfig.from_config(altered)
+
+    class DictSubclass(dict[str, Any]):
+        pass
+
+    with pytest.raises(ValueError, match="actual dict"):
+        Step11OaKConfig.from_config(DictSubclass(payload))
+
+
+def test_from_config_rejects_hostile_or_open_subtask_entries() -> None:
+    payload = Step11OaKConfig(
+        subtask_specs=(SubtaskSpec(feature_index=0),)
+    ).to_config()
+    payload["subtask_specs"] = [{**payload["subtask_specs"][0], "extra": 1}]
+    with pytest.raises(ValueError, match="exact fields"):
+        Step11OaKConfig.from_config(payload)
+
+
+class _HostileArray:
+    calls = 0
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        type(self).calls += 1
+        raise AssertionError("shape hook must not run")
+
+    @property
+    def dtype(self) -> np.dtype[Any]:
+        type(self).calls += 1
+        raise AssertionError("dtype hook must not run")
+
+
+def test_runtime_rejects_hostile_arrays_without_hooks() -> None:
+    agent = make_step11_oak_agent()
+    _HostileArray.calls = 0
+    with pytest.raises(TypeError, match="trusted array"):
+        init_step11_state(
+            agent,
+            key=jr.key(0),
+            initial_observation=cast(Any, _HostileArray()),
+        )
+    assert _HostileArray.calls == 0
+
+
+def test_runtime_requires_typed_key_and_exact_float32_arrays() -> None:
+    agent = make_step11_oak_agent()
+    with pytest.raises(TypeError, match="typed JAX PRNG key"):
+        init_step11_state(
+            agent,
+            key=cast(Any, jr.PRNGKey(0)),
+            initial_observation=jnp.zeros(4, dtype=jnp.float32),
+        )
+    state = init_step11_state(
+        agent,
+        key=jr.key(0),
+        initial_observation=jnp.zeros(4, dtype=jnp.float32),
+    )
+    with pytest.raises(TypeError, match="env_reward.*float32"):
+        step11_update(
+            agent,
+            state,
+            jnp.asarray(0, dtype=jnp.int32),
+            jnp.zeros(4, dtype=jnp.float32),
+        )
+    with pytest.raises(ValueError, match="next_observations must have shape"):
+        run_step11_scan(
+            agent,
+            state,
+            jnp.zeros(2, dtype=jnp.float32),
+            jnp.zeros((3, 4), dtype=jnp.float32),
+        )
