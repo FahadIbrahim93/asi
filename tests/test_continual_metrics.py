@@ -365,7 +365,7 @@ def test_stability_gap_rejects_leftover_identities() -> None:
     with pytest.raises(ValueError, match="maximum"):
         StabilityGap(mean=0.0, maximum=float("inf"), per_step=np.array([0.0]))
 
-    legal = StabilityGap(mean=0.1, maximum=0.2, per_step=np.array([0.1]))
+    legal = StabilityGap(mean=0.1, maximum=0.2, per_step=np.array([0.0, 0.2]))
     dumped = json.dumps({"mean": legal.mean, "maximum": legal.maximum}, allow_nan=False)
     assert '"mean": 0.1' in dumped
     assert '"mean": true' not in dumped
@@ -376,7 +376,7 @@ def _legal_continual_summary(**overrides: object) -> ContinualLearningSummary:
         "final_performance": 0.8,
         "prequential_performance": 0.7,
         "mean_forgetting": 0.1,
-        "max_forgetting": 0.2,
+        "max_forgetting": 0.1,
         "backward_transfer": 0.0,
         "stability_gap_mean": 0.05,
         "stability_gap_max": 0.1,
