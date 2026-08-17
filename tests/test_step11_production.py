@@ -13,6 +13,7 @@ from fractions import Fraction
 from typing import Any
 
 import chex
+import jax
 import jax.numpy as jnp
 import jax.random as jr
 import numpy as np
@@ -20,6 +21,7 @@ import pytest
 
 from alberta_framework.core.oak import (
     KeyboardChordLearnerConfig,
+    KeyboardChordLearnerState,
     OaKAgent,
     OaKArrayResult,
     OaKConfig,
@@ -974,6 +976,52 @@ def test_keyboard_chord_learner_positive_reward_moves_toward_chord() -> None:
     after = float(jnp.dot(updated.chord_vector, selected))
     assert after > before
     assert int(updated.step_count) == 1
+
+
+@pytest.mark.parametrize("use_jit", [False, True])
+def test_keyboard_chord_learner_step_count_saturates(use_jit: bool) -> None:
+    cfg = KeyboardChordLearnerConfig(n_options=2)
+    state = init_keyboard_chord_learner(cfg).replace(
+        step_count=jnp.asarray(jnp.iinfo(jnp.int32).max, dtype=jnp.int32)
+    )
+    update = update_keyboard_chord_learner
+    if use_jit:
+        update = jax.jit(update, static_argnums=0)
+
+    updated = update(
+        cfg,
+        state,
+        jnp.array([1.0, 0.0], dtype=jnp.float32),
+        jnp.array(1.0, dtype=jnp.float32),
+    )
+
+    assert int(updated.step_count) == jnp.iinfo(jnp.int32).max
+
+
+@pytest.mark.parametrize("use_jit", [False, True])
+def test_keyboard_chord_learner_step_count_stays_saturated_through_scan(
+    use_jit: bool,
+) -> None:
+    cfg = KeyboardChordLearnerConfig(n_options=2)
+    maximum = jnp.iinfo(jnp.int32).max
+    state = init_keyboard_chord_learner(cfg).replace(
+        step_count=jnp.asarray(maximum - 1, dtype=jnp.int32)
+    )
+    selected = jnp.array([1.0, 0.0], dtype=jnp.float32)
+    reward = jnp.array(1.0, dtype=jnp.float32)
+
+    def run_scan(initial: KeyboardChordLearnerState):
+        def body(carry: KeyboardChordLearnerState, _: None):
+            updated = update_keyboard_chord_learner(cfg, carry, selected, reward)
+            return updated, updated.step_count
+
+        return jax.lax.scan(body, initial, xs=None, length=3)
+
+    scan = jax.jit(run_scan) if use_jit else run_scan
+    final, counts = scan(state)
+
+    np.testing.assert_array_equal(np.asarray(counts), np.asarray([maximum] * 3, dtype=np.int32))
+    assert int(final.step_count) == maximum
 
 
 def test_keyboard_chord_learner_max_norm_bounds_vector() -> None:
