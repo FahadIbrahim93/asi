@@ -39,7 +39,7 @@ import jax.numpy as jnp
 import jax.random as jr
 import numpy as np
 from jax import Array
-from jaxtyping import Bool, Float
+from jaxtyping import Bool, Float, Int
 
 from alberta_framework.core._float32_scalars import validated_float32_scalar_with_ratio
 from alberta_framework.core.update_safety import (
@@ -297,7 +297,7 @@ class LearnedResourceManagerState:
 
     log_weights: Float[Array, " n_contexts n_actions"]
     loss_ema: Float[Array, " n_contexts n_actions"]
-    action_counts: Float[Array, " n_contexts n_actions"]
+    action_counts: Int[Array, " n_contexts n_actions"]
     step_count: Array
 
 
@@ -491,7 +491,7 @@ class LearnedResourceManager:
         return LearnedResourceManagerState(  # type: ignore[call-arg]
             log_weights=jnp.zeros(shape, dtype=jnp.float32),
             loss_ema=jnp.zeros(shape, dtype=jnp.float32),
-            action_counts=jnp.zeros(shape, dtype=jnp.float32),
+            action_counts=jnp.zeros(shape, dtype=jnp.int32),
             step_count=jnp.array(0, dtype=jnp.int32),
         )
 
@@ -499,9 +499,12 @@ class LearnedResourceManager:
         if type(state) is not LearnedResourceManagerState:
             raise ValueError("state must be a LearnedResourceManagerState")
         shape = (self._n_contexts, self._n_actions)
-        for name in ("log_weights", "loss_ema", "action_counts"):
+        for name in ("log_weights", "loss_ema"):
             leaf = getattr(state, name)
             _require_array_metadata(f"state.{name}", leaf, shape, jnp.float32)
+        _require_array_metadata(
+            "state.action_counts", state.action_counts, shape, jnp.int32
+        )
         _require_array_metadata("state.step_count", state.step_count, (), jnp.int32)
 
     def weights(
@@ -616,7 +619,7 @@ class LearnedResourceManager:
             old_ema,
         )
         new_loss_ema = state.loss_ema.at[context].set(new_ema)
-        new_counts = state.action_counts.at[context].add(valid_actions.astype(jnp.float32))
+        new_counts = state.action_counts.at[context].add(valid_actions.astype(jnp.int32))
 
         candidate_state = LearnedResourceManagerState(  # type: ignore[call-arg]
             log_weights=new_log_weights,
@@ -672,7 +675,7 @@ class GeneratorMetaResourceManagerState:
 
     log_weights: Float[Array, " n_contexts n_policies"]
     reward_ema: Float[Array, " n_contexts n_policies"]
-    action_counts: Float[Array, " n_contexts n_policies"]
+    action_counts: Int[Array, " n_contexts n_policies"]
     step_count: Array
 
 
@@ -995,7 +998,7 @@ class GeneratorMetaResourceManager:
         return GeneratorMetaResourceManagerState(  # type: ignore[call-arg]
             log_weights=log_weights,
             reward_ema=jnp.zeros(shape, dtype=jnp.float32),
-            action_counts=jnp.zeros(shape, dtype=jnp.float32),
+            action_counts=jnp.zeros(shape, dtype=jnp.int32),
             step_count=jnp.array(0, dtype=jnp.int32),
         )
 
@@ -1003,9 +1006,12 @@ class GeneratorMetaResourceManager:
         if type(state) is not GeneratorMetaResourceManagerState:
             raise ValueError("state must be a GeneratorMetaResourceManagerState")
         shape = (self._n_contexts, self.n_policies)
-        for name in ("log_weights", "reward_ema", "action_counts"):
+        for name in ("log_weights", "reward_ema"):
             leaf = getattr(state, name)
             _require_array_metadata(f"state.{name}", leaf, shape, jnp.float32)
+        _require_array_metadata(
+            "state.action_counts", state.action_counts, shape, jnp.int32
+        )
         _require_array_metadata("state.step_count", state.step_count, (), jnp.int32)
 
     def weights(
@@ -1238,7 +1244,7 @@ class GeneratorMetaResourceManager:
             old_ema,
         )
         new_reward_ema = state.reward_ema.at[context].set(new_ema)
-        new_counts = state.action_counts.at[context].add(finite.astype(jnp.float32))
+        new_counts = state.action_counts.at[context].add(finite.astype(jnp.int32))
 
         candidate_state = GeneratorMetaResourceManagerState(  # type: ignore[call-arg]
             log_weights=new_log_weights,
