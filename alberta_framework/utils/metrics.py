@@ -16,34 +16,73 @@ References:
 """
 
 import math
+import operator
 from dataclasses import dataclass
-from numbers import Real
-from typing import cast
+from fractions import Fraction
+from typing import SupportsIndex, cast
 
 import numpy as np
 from numpy.typing import NDArray
 
+_INT32_MAX: int = 2**31 - 1
+
+_ACTUAL_INT_TYPES = frozenset(
+    {
+        int,
+        np.int8,
+        np.int16,
+        np.int32,
+        np.int64,
+        np.uint8,
+        np.uint16,
+        np.uint32,
+        np.uint64,
+        np.longlong,
+        np.ulonglong,
+    }
+)
+_ACTUAL_FLOAT_TYPES = frozenset(
+    {float, Fraction, *(np.dtype(code).type for code in ("e", "f", "d", "g"))}
+)
+_ALLOWED_REAL_TYPES = _ACTUAL_INT_TYPES | _ACTUAL_FLOAT_TYPES
+
 
 def _is_bool(value: object) -> bool:
-    return type(value) is bool or type(value) is np.bool_
+    return type(value) in (bool, np.bool_)
 
 
 def _is_index_int(value: object) -> bool:
-    return (type(value) is int or isinstance(value, np.integer)) and not _is_bool(value)
+    return type(value) in _ACTUAL_INT_TYPES
 
 
-def _require_positive_builtin_int(name: str, value: object) -> int:
-    if type(value) is not int or value < 1:
-        raise ValueError(f"{name} must be a positive built-in integer")
+def _require_exact_bool(name: str, value: object) -> bool:
+    if type(value) is not bool:
+        raise ValueError(f"{name} must be an exact bool")
     return value
 
 
+def _require_exact_str(name: str, value: object) -> str:
+    if type(value) is not str:
+        raise ValueError(f"{name} must be an exact string")
+    return value
+
+
+def _require_positive_builtin_int(name: str, value: object) -> int:
+    if type(value) is not int:
+        raise ValueError(f"{name} must be a positive built-in integer")
+    number = operator.index(cast(SupportsIndex, value))
+    if not 1 <= number <= _INT32_MAX:
+        raise ValueError(f"{name} must be a positive built-in integer <= {_INT32_MAX}")
+    return number
+
+
 def _require_finite_real(name: str, value: object) -> float:
-    actual_type = type(value)
-    if issubclass(actual_type, bool) or not issubclass(actual_type, Real):
+    if _is_bool(value):
+        raise ValueError(f"{name} must be a finite real number")
+    if type(value) not in _ALLOWED_REAL_TYPES:
         raise ValueError(f"{name} must be a finite real number")
     try:
-        number = float(cast(Real, value))
+        number = float(cast(float, value))
     except (OverflowError, TypeError, ValueError) as exc:
         raise ValueError(f"{name} must be a finite real number") from exc
     if not math.isfinite(number):
@@ -54,29 +93,76 @@ def _require_finite_real(name: str, value: object) -> float:
 def _reject_boolean_numeric_trace(values: object, *, name: str) -> None:
     if _is_bool(values):
         raise ValueError(f"{name} must not be a boolean")
-    if isinstance(values, (list, tuple)):
-        for index, item in enumerate(values):
-            if _is_bool(item):
-                raise ValueError(f"{name}[{index}] must not be a boolean")
+    if type(values) in _ALLOWED_REAL_TYPES:
+        return
+    if type(values) in (list, tuple):
+        sequence = cast(list[object] | tuple[object, ...], values)
+        for index, item in enumerate(sequence):
             _reject_boolean_numeric_trace(item, name=f"{name}[{index}]")
-    elif isinstance(values, np.ndarray):
+        return
+    if type(values) is np.ndarray:
         if values.dtype.kind == "b":
             raise ValueError(f"{name} must not be a boolean array")
         if values.dtype.kind == "O":
             for index, item in enumerate(values.flat):
                 _reject_boolean_numeric_trace(item, name=f"{name}[{index}]")
+        elif values.dtype.kind not in "iuf":
+            raise ValueError(f"{name} must contain real numeric values")
+        return
+    raise ValueError(f"{name} must contain exact real numeric values")
+
+
+def _numeric_array(values: object, *, name: str) -> NDArray[np.float64]:
+    _reject_boolean_numeric_trace(values, name=name)
+    try:
+        return np.asarray(values, dtype=np.float64)
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must contain float64-compatible real values") from exc
+
+
+def _record_vector(
+    values: object,
+    *,
+    name: str,
+    allow_nan: bool,
+    nonnegative: bool = False,
+) -> NDArray[np.float64]:
+    if type(values) is not np.ndarray:
+        raise ValueError(f"{name} must be an exact NumPy array")
+    array = np.array(_numeric_array(values, name=name), dtype=np.float64, copy=True)
+    if array.ndim != 1 or array.size == 0:
+        raise ValueError(f"{name} must be a non-empty one-dimensional array")
+    if np.any(np.isinf(array)) or (not allow_nan and np.any(np.isnan(array))):
+        raise ValueError(f"{name} contains unsupported non-finite values")
+    if nonnegative and np.any(array[np.isfinite(array)] < 0.0):
+        raise ValueError(f"{name} must be non-negative")
+    array.setflags(write=False)
+    return array
+
+
+def _scale_safe_mean(values: NDArray[np.float64], *, name: str) -> float:
+    if values.size == 0 or np.any(~np.isfinite(values)):
+        raise ValueError(f"{name} must contain finite values")
+    scale = float(np.max(np.abs(values)))
+    if scale == 0.0:
+        return 0.0
+    result = float(np.mean(values / scale) * scale)
+    if not math.isfinite(result):
+        raise ValueError(f"{name} mean must remain finite")
+    return result
 
 
 def _require_index_vector(values: object, *, name: str) -> NDArray[np.int64]:
     if _is_bool(values):
         raise ValueError(f"{name} must be integer indices, not a boolean")
-    if isinstance(values, (list, tuple)):
-        for index, item in enumerate(values):
+    if type(values) in (list, tuple):
+        sequence = cast(list[object] | tuple[object, ...], values)
+        for index, item in enumerate(sequence):
             if not _is_index_int(item):
                 raise ValueError(f"{name}[{index}] must be an integer index, not a boolean")
         return np.asarray(values, dtype=np.int64)
-    else:
-        array = np.asarray(values)
+    elif type(values) is np.ndarray:
+        array = values
         if array.size == 0:
             return np.asarray(array, dtype=np.int64)
         if array.dtype.kind not in "iu":
@@ -84,6 +170,8 @@ def _require_index_vector(values: object, *, name: str) -> NDArray[np.int64]:
         if array.dtype.kind == "u" and bool(np.any(array > np.iinfo(np.int64).max)):
             raise ValueError(f"{name} contains an index outside the int64 domain")
         return np.asarray(array, dtype=np.int64)
+    else:
+        raise ValueError(f"{name} must be an exact list, tuple, or NumPy array")
 
 
 @dataclass(frozen=True)
@@ -95,8 +183,23 @@ class StabilityGap:
     per_step: NDArray[np.float64]
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "mean", _require_finite_real("mean", self.mean))
-        object.__setattr__(self, "maximum", _require_finite_real("maximum", self.maximum))
+        mean = _require_finite_real("mean", self.mean)
+        maximum = _require_finite_real("maximum", self.maximum)
+        per_step = _record_vector(
+            self.per_step, name="per_step", allow_nan=True, nonnegative=True
+        )
+        finite = per_step[np.isfinite(per_step)]
+        if finite.size == 0:
+            raise ValueError("per_step must contain a finite gap")
+        if mean < 0.0 or maximum < 0.0:
+            raise ValueError("stability gap summaries must be non-negative")
+        if mean != _scale_safe_mean(finite, name="per_step") or maximum != float(
+            np.max(finite)
+        ):
+            raise ValueError("stability gap summaries must match per_step")
+        object.__setattr__(self, "mean", mean)
+        object.__setattr__(self, "maximum", maximum)
+        object.__setattr__(self, "per_step", per_step)
 
 
 @dataclass(frozen=True)
@@ -131,13 +234,46 @@ class ContinualLearningSummary:
             "stability_gap_max",
         ):
             object.__setattr__(self, name, _require_finite_real(name, getattr(self, name)))
+        final = _record_vector(
+            self.per_task_final_performance,
+            name="per_task_final_performance",
+            allow_nan=False,
+        )
+        forgetting = _record_vector(
+            self.per_task_forgetting,
+            name="per_task_forgetting",
+            allow_nan=False,
+            nonnegative=True,
+        )
+        transfer = _record_vector(
+            self.per_task_backward_transfer,
+            name="per_task_backward_transfer",
+            allow_nan=False,
+        )
+        if not (final.shape == forgetting.shape == transfer.shape):
+            raise ValueError("per-task summary arrays must have matching shapes")
+        expected = {
+            "final_performance": _scale_safe_mean(final, name="per_task_final_performance"),
+            "mean_forgetting": _scale_safe_mean(forgetting, name="per_task_forgetting"),
+            "max_forgetting": float(np.max(forgetting)),
+            "backward_transfer": _scale_safe_mean(
+                transfer, name="per_task_backward_transfer"
+            ),
+        }
+        for name, value in expected.items():
+            if getattr(self, name) != value:
+                raise ValueError(f"{name} must match its per-task record")
+        if self.stability_gap_mean < 0.0 or self.stability_gap_max < self.stability_gap_mean:
+            raise ValueError("stability gap summaries must be ordered and non-negative")
+        object.__setattr__(self, "per_task_final_performance", final)
+        object.__setattr__(self, "per_task_forgetting", forgetting)
+        object.__setattr__(self, "per_task_backward_transfer", transfer)
 
 
 def _performance_matrix(
     performance_matrix: NDArray[np.floating] | list[list[float]],
 ) -> NDArray[np.float64]:
-    _reject_boolean_numeric_trace(performance_matrix, name="performance_matrix")
-    matrix = np.asarray(performance_matrix, dtype=np.float64)
+    matrix = _numeric_array(performance_matrix, name="performance_matrix")
     if matrix.ndim != 2:
         raise ValueError("performance_matrix must have shape (checkpoints, tasks)")
     if matrix.shape[0] < 1 or matrix.shape[1] < 1:
@@ -200,6 +336,7 @@ def compute_per_task_forgetting(
     ``higher_is_better=False``.
     """
 
+    higher_is_better = _require_exact_bool("higher_is_better", higher_is_better)
     _, _, trajectories = _task_trajectories(performance_matrix, first_exposure)
     forgetting = []
     for values in trajectories:
@@ -226,6 +363,7 @@ def compute_backward_transfer(
     experience improves an earlier task.
     """
 
+    higher_is_better = _require_exact_bool("higher_is_better", higher_is_better)
     _, _, trajectories = _task_trajectories(performance_matrix, first_exposure)
     transfer = []
     for values in trajectories:
@@ -253,15 +391,18 @@ def compute_forward_transfer(
     The sign is normalized so positive values always mean beneficial transfer.
     """
 
+    higher_is_better = _require_exact_bool("higher_is_better", higher_is_better)
     matrix = _performance_matrix(performance_matrix)
     rows = _first_exposure_rows(
         first_exposure,
         n_checkpoints=matrix.shape[0],
         n_tasks=matrix.shape[1],
     )
-    baseline = np.asarray(baseline_performance, dtype=np.float64)
+    baseline = _numeric_array(baseline_performance, name="baseline_performance")
     if baseline.shape != (matrix.shape[1],):
         raise ValueError("baseline_performance must contain one value per task")
+    if not np.all(np.isfinite(baseline)):
+        raise ValueError("baseline_performance must contain only finite values")
 
     transfer = np.full((matrix.shape[1],), np.nan, dtype=np.float64)
     for task, first_row in enumerate(rows):
@@ -283,14 +424,13 @@ def compute_prequential_performance(
 ) -> float:
     """Return mean predict-before-update performance over an online trace."""
 
-    _reject_boolean_numeric_trace(online_performance, name="online_performance")
-    values = np.asarray(online_performance, dtype=np.float64)
+    values = _numeric_array(online_performance, name="online_performance")
     if values.ndim != 1 or values.size == 0:
         raise ValueError("online_performance must be a non-empty one-dimensional trace")
     finite = values[np.isfinite(values)]
     if finite.size == 0:
         raise ValueError("online_performance must contain at least one finite value")
-    return float(np.mean(finite))
+    return _scale_safe_mean(finite, name="online_performance")
 
 
 def compute_stability_gap(
@@ -309,14 +449,15 @@ def compute_stability_gap(
     clipped at zero, so exceeding the reference is not treated as instability.
     """
 
+    higher_is_better = _require_exact_bool("higher_is_better", higher_is_better)
     _reject_boolean_numeric_trace(online_performance, name="online_performance")
     _reject_boolean_numeric_trace(reference_performance, name="reference_performance")
     if not isinstance(reference_performance, (list, tuple, np.ndarray)):
         _require_finite_real("reference_performance", reference_performance)
-    values = np.asarray(online_performance, dtype=np.float64)
+    values = _numeric_array(online_performance, name="online_performance")
     if values.ndim != 1 or values.size == 0:
         raise ValueError("online_performance must be a non-empty one-dimensional trace")
-    reference = np.asarray(reference_performance, dtype=np.float64)
+    reference = _numeric_array(reference_performance, name="reference_performance")
     try:
         broadcast_reference = np.broadcast_to(reference, values.shape)
     except ValueError as exc:
@@ -329,9 +470,10 @@ def compute_stability_gap(
         raise ValueError("stability-gap inputs must contain a finite aligned value")
     raw_gap = broadcast_reference - values if higher_is_better else values - broadcast_reference
     per_step = np.where(valid, np.maximum(raw_gap, 0.0), np.nan)
+    finite_gaps = per_step[np.isfinite(per_step)]
     return StabilityGap(
-        mean=float(np.nanmean(per_step)),
-        maximum=float(np.nanmax(per_step)),
+        mean=_scale_safe_mean(finite_gaps, name="stability gaps"),
+        maximum=float(np.max(finite_gaps)),
         per_step=np.asarray(per_step, dtype=np.float64),
     )
 
@@ -353,8 +495,8 @@ def compute_recovery_lengths(
     recovered before the next change point (or the end of the stream).
     """
 
-    _reject_boolean_numeric_trace(online_performance, name="online_performance")
-    values = np.asarray(online_performance, dtype=np.float64)
+    higher_is_better = _require_exact_bool("higher_is_better", higher_is_better)
+    values = _numeric_array(online_performance, name="online_performance")
     points = _require_index_vector(change_points, name="change_points")
     window_size = _require_positive_builtin_int("window_size", window_size)
     threshold_value = _require_finite_real("threshold", threshold)
@@ -395,6 +537,7 @@ def summarize_continual_learning(
 ) -> ContinualLearningSummary:
     """Compute retention, transfer, prequential, and stability metrics."""
 
+    higher_is_better = _require_exact_bool("higher_is_better", higher_is_better)
     matrix, _, trajectories = _task_trajectories(
         performance_matrix,
         first_exposure,
@@ -416,17 +559,39 @@ def summarize_continual_learning(
         higher_is_better=higher_is_better,
     )
     return ContinualLearningSummary(
-        final_performance=float(np.mean(final)),
+        final_performance=_scale_safe_mean(final, name="per-task final performance"),
         prequential_performance=compute_prequential_performance(online_performance),
-        mean_forgetting=float(np.mean(forgetting)),
+        mean_forgetting=_scale_safe_mean(forgetting, name="per-task forgetting"),
         max_forgetting=float(np.max(forgetting)),
-        backward_transfer=float(np.mean(backward_transfer)),
+        backward_transfer=_scale_safe_mean(
+            backward_transfer, name="per-task backward transfer"
+        ),
         stability_gap_mean=stability.mean,
         stability_gap_max=stability.maximum,
         per_task_final_performance=final,
         per_task_forgetting=forgetting,
         per_task_backward_transfer=backward_transfer,
     )
+
+
+def _metric_history_values(
+    metrics_history: object,
+    key: str,
+    *,
+    name: str,
+) -> NDArray[np.float64]:
+    if type(metrics_history) is not list:
+        raise ValueError(f"{name} must be an exact list")
+    values: list[float] = []
+    for index, record in enumerate(metrics_history):
+        if type(record) is not dict:
+            raise ValueError(f"{name}[{index}] must be an exact dictionary")
+        if any(type(record_key) is not str for record_key in record):
+            raise ValueError(f"{name}[{index}] keys must be exact strings")
+        if key not in record:
+            raise ValueError(f"{name}[{index}] is missing metric {key}")
+        values.append(_require_finite_real(f"{name}[{index}].{key}", record[key]))
+    return np.asarray(values, dtype=np.float64)
 
 
 def compute_cumulative_error(
@@ -447,8 +612,12 @@ def compute_cumulative_error(
     Returns:
         Array of cumulative errors at each time step
     """
-    errors = np.array([m[error_key] for m in metrics_history])
-    return np.cumsum(errors)
+    _require_exact_str("error_key", error_key)
+    errors = _metric_history_values(metrics_history, error_key, name="metrics_history")
+    cumulative = np.cumsum(errors, dtype=np.float64)
+    if np.any(~np.isfinite(cumulative)):
+        raise ValueError("cumulative error must remain finite")
+    return cumulative
 
 
 def compute_running_mean(
@@ -475,17 +644,30 @@ def compute_running_mean(
         Array of running mean values (same length as input), with ``NaN``
         wherever a complete trailing window is not yet available.
     """
-    if type(window_size) is not int:
-        raise ValueError("window_size must be a built-in int")
-    if window_size < 1:
-        raise ValueError("window_size must be positive")
+    window_size = _require_positive_builtin_int("window_size", window_size)
 
-    values_arr = np.asarray(values, dtype=np.float64)
+    values_arr = _numeric_array(values, name="values")
+    if values_arr.ndim != 1:
+        raise ValueError("values must be a one-dimensional trace")
+    if np.any(np.isinf(values_arr)):
+        raise ValueError("values must not contain infinity")
     if len(values_arr) < window_size:
         return np.full(values_arr.shape, np.nan, dtype=np.float64)
 
-    cumsum = np.cumsum(np.insert(values_arr, 0, 0))
-    running_mean = (cumsum[window_size:] - cumsum[:-window_size]) / window_size
+    finite_values = values_arr[np.isfinite(values_arr)]
+    scale = float(np.max(np.abs(finite_values))) if finite_values.size else 1.0
+    if scale == 0.0:
+        scale = 1.0
+    normalized = np.where(np.isfinite(values_arr), values_arr / scale, 0.0)
+    cumsum = np.cumsum(np.insert(normalized, 0, 0.0), dtype=np.float64)
+    valid = np.isfinite(values_arr).astype(np.int64)
+    valid_cumsum = np.cumsum(np.insert(valid, 0, 0), dtype=np.int64)
+    window_sums = cumsum[window_size:] - cumsum[:-window_size]
+    valid_counts = valid_cumsum[window_size:] - valid_cumsum[:-window_size]
+    running_mean = (window_sums / window_size) * scale
+    running_mean = np.where(valid_counts == window_size, running_mean, np.nan)
+    if np.any(np.isinf(running_mean)):
+        raise ValueError("running mean must remain finite")
 
     # The first `window_size - 1` steps have no complete trailing window yet;
     # mark them NaN instead of backdating the first complete window's mean.
@@ -514,7 +696,8 @@ def compute_tracking_error(
     Returns:
         Array of tracking errors at each time step
     """
-    errors = np.array([m["squared_error"] for m in metrics_history])
+    window_size = _require_positive_builtin_int("window_size", window_size)
+    errors = _metric_history_values(metrics_history, "squared_error", name="metrics_history")
     return compute_running_mean(errors, window_size)
 
 
@@ -531,7 +714,8 @@ def extract_metric(
     Returns:
         Array of values for that metric
     """
-    return np.array([m[key] for m in metrics_history])
+    _require_exact_str("key", key)
+    return _metric_history_values(metrics_history, key, name="metrics_history")
 
 
 def compare_learners(
@@ -552,15 +736,30 @@ def compare_learners(
     Returns:
         Dictionary with summary statistics for each learner
     """
+    _require_exact_str("metric", metric)
+    if type(results) is not dict:
+        raise ValueError("results must be an exact dictionary")
+    if not results:
+        raise ValueError("results must contain at least one learner")
     summary = {}
     for name, metrics_history in results.items():
+        _require_exact_str("learner name", name)
         values = extract_metric(metrics_history, metric)
+        if values.size == 0:
+            raise ValueError(f"learner {name} must contain at least one metric record")
+        scale = float(np.max(np.abs(values)))
+        normalized = values if scale == 0.0 else values / scale
+        mean = _scale_safe_mean(values, name=f"learner {name}")
+        std = float(np.std(normalized) * (1.0 if scale == 0.0 else scale))
+        cumulative = float(np.sum(values, dtype=np.float64))
+        tail = values[-100:] if len(values) >= 100 else values
+        final_100_mean = _scale_safe_mean(tail, name=f"learner {name} tail")
+        if not math.isfinite(std) or not math.isfinite(cumulative):
+            raise ValueError(f"learner {name} summaries must remain finite")
         summary[name] = {
-            "mean": float(np.mean(values)),
-            "std": float(np.std(values)),
-            "cumulative": float(np.sum(values)),
-            "final_100_mean": (
-                float(np.mean(values[-100:])) if len(values) >= 100 else float(np.mean(values))
-            ),
+            "mean": mean,
+            "std": std,
+            "cumulative": cumulative,
+            "final_100_mean": final_100_mean,
         }
     return summary
