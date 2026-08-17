@@ -87,6 +87,15 @@ def _read_mapping(name: str, value: object) -> dict[str, Any]:
         raise ValueError(f"{name} must be a readable mapping") from error
 
 
+def _serialized_mapping(
+    name: str, value: object, *, fields: frozenset[str]
+) -> dict[str, Any]:
+    payload = _read_mapping(name, value)
+    if any(type(key) is not str for key in payload) or set(payload) != fields:
+        raise ValueError(f"{name} fields do not match the serialized schema")
+    return payload
+
+
 def _require_discrete_state_resources(n_actions: int, feature_dim: int) -> None:
     state_scalars = 2 * n_actions * feature_dim + 3 * feature_dim + 2 * n_actions + 5
     state_bytes = 8 * n_actions * feature_dim + 12 * feature_dim + 8 * n_actions + 24
@@ -102,20 +111,30 @@ def _require_continuous_state_resources(action_dim: int, feature_dim: int) -> No
 
 
 def _array(name: str, value: object, shape: tuple[int, ...], dtype: Any) -> Array:
-    array = jnp.asarray(value, dtype=dtype)
+    if shape == () and dtype == jnp.bool_ and type(value) is bool:
+        return jnp.asarray(value, dtype=dtype)
+    if shape == () and dtype == jnp.float32 and type(value) in _ACTUAL_REAL_TYPES:
+        return jnp.asarray(_require_float32(name, value), dtype=dtype)
+    if not (type(value) is np.ndarray or isinstance(value, jax.Array)):
+        raise ValueError(f"{name} must expose trusted array metadata")
+    array = jnp.asarray(value)
     if array.shape != shape:
         raise ValueError(f"{name} must have shape {shape}")
+    if array.dtype != jnp.dtype(dtype):
+        raise ValueError(f"{name} must have dtype {jnp.dtype(dtype)}")
     return array
 
 
 def _require_key(key: object) -> Array:
+    if not isinstance(key, jax.Array):
+        raise ValueError("key must be a Threefry JAX key")
     try:
         data = jr.key_data(cast(Any, key))
     except Exception as error:
         raise ValueError("key must be a Threefry JAX key") from error
     if data.shape != (2,) or data.dtype != jnp.uint32:
         raise ValueError("key must be a Threefry JAX key")
-    return cast(Array, key)
+    return key
 
 
 def _require_action_bound(name: str, value: object) -> float:
@@ -217,7 +236,13 @@ class ActorCriticConfig:
     @classmethod
     def from_config(cls, config: Mapping[str, Any]) -> ActorCriticConfig:
         """Reconstruct an ``ActorCriticConfig`` from a dictionary."""
-        return cls(**_read_mapping("config", config))
+        fields = frozenset(field.name for field in dataclasses.fields(cls))
+        payload = _serialized_mapping("config", config, fields=fields)
+        if type(payload["n_actions"]) is not int or any(
+            type(payload[name]) is not float for name in fields - {"n_actions"}
+        ):
+            raise ValueError("serialized config scalars must be exact JSON numbers")
+        return cls(**payload)
 
 
 @chex.dataclass(frozen=True)
@@ -336,6 +361,8 @@ class ActorCriticAgent:
         """
         if type(config) is not ActorCriticConfig:
             raise ValueError("config must be an ActorCriticConfig")
+        if bounder is not None and not isinstance(bounder, Bounder):
+            raise ValueError("bounder must be a Bounder or None")
         self._config = config
         self._bounder = bounder
 
@@ -360,10 +387,15 @@ class ActorCriticAgent:
     @classmethod
     def from_config(cls, config: Mapping[str, Any]) -> ActorCriticAgent:
         """Reconstruct an ``ActorCriticAgent`` from a dictionary."""
-        config = _read_mapping("config", config)
-        config.pop("type", None)
-        ac_config = ActorCriticConfig.from_config(config.pop("config"))
-        bounder_config = config.pop("bounder", None)
+        payload = _serialized_mapping(
+            "config", config, fields=frozenset({"type", "config", "bounder"})
+        )
+        if type(payload["type"]) is not str or payload.pop("type") != cls.__name__:
+            raise ValueError("config type differs")
+        ac_config = ActorCriticConfig.from_config(payload.pop("config"))
+        bounder_config = payload.pop("bounder")
+        if bounder_config is not None and not issubclass(type(bounder_config), Mapping):
+            raise ValueError("serialized bounder must be a mapping or None")
         bounder = bounder_from_config(bounder_config) if bounder_config else None
         return cls(config=ac_config, bounder=bounder)
 
@@ -916,6 +948,20 @@ class ContinuousActorCriticConfig:
         )
         if self.log_sigma_min > self.log_sigma_max:
             raise ValueError("log_sigma_min must be <= log_sigma_max")
+        action_low = (
+            None
+            if self.action_low is None
+            else _require_action_bound("action_low", self.action_low)
+        )
+        action_high = (
+            None
+            if self.action_high is None
+            else _require_action_bound("action_high", self.action_high)
+        )
+        if action_low is not None and action_high is not None and action_low > action_high:
+            raise ValueError("action_low must be <= action_high")
+        object.__setattr__(self, "action_low", action_low)
+        object.__setattr__(self, "action_high", action_high)
 
     def to_config(self) -> dict[str, Any]:
         """Serialize this configuration to a dictionary."""
@@ -936,7 +982,14 @@ class ContinuousActorCriticConfig:
     @classmethod
     def from_config(cls, config: Mapping[str, Any]) -> ContinuousActorCriticConfig:
         """Reconstruct a ``ContinuousActorCriticConfig`` from a dictionary."""
-        return cls(**_read_mapping("config", config))
+        fields = frozenset(field.name for field in dataclasses.fields(cls))
+        payload = _serialized_mapping("config", config, fields=fields)
+        if type(payload["action_dim"]) is not int or any(
+            payload[name] is not None and type(payload[name]) is not float
+            for name in fields - {"action_dim"}
+        ):
+            raise ValueError("serialized config scalars must be exact JSON numbers or None")
+        return cls(**payload)
 
 
 @chex.dataclass(frozen=True)
@@ -1060,20 +1113,8 @@ class ContinuousActorCriticAgent:
         """
         if type(config) is not ContinuousActorCriticConfig:
             raise ValueError("config must be a ContinuousActorCriticConfig")
-        canonical_bounds: dict[str, float | None] = {}
-        for name in ("action_low", "action_high"):
-            bound = getattr(config, name)
-            canonical_bounds[name] = None if bound is None else _require_action_bound(name, bound)
-        low = canonical_bounds["action_low"]
-        high = canonical_bounds["action_high"]
-        if low is not None and high is not None and low > high:
-            raise ValueError("action_low must be <= action_high")
-        if (low, high) != (config.action_low, config.action_high) or any(
-            type(value) is not float
-            for value in (config.action_low, config.action_high)
-            if value is not None
-        ):
-            config = dataclasses.replace(config, action_low=low, action_high=high)
+        if bounder is not None and not isinstance(bounder, Bounder):
+            raise ValueError("bounder must be a Bounder or None")
         self._config = config
         self._bounder = bounder
 
@@ -1098,10 +1139,15 @@ class ContinuousActorCriticAgent:
     @classmethod
     def from_config(cls, config: Mapping[str, Any]) -> ContinuousActorCriticAgent:
         """Reconstruct a ``ContinuousActorCriticAgent`` from a dictionary."""
-        config = _read_mapping("config", config)
-        config.pop("type", None)
-        ac_config = ContinuousActorCriticConfig.from_config(config.pop("config"))
-        bounder_config = config.pop("bounder", None)
+        payload = _serialized_mapping(
+            "config", config, fields=frozenset({"type", "config", "bounder"})
+        )
+        if type(payload["type"]) is not str or payload.pop("type") != cls.__name__:
+            raise ValueError("config type differs")
+        ac_config = ContinuousActorCriticConfig.from_config(payload.pop("config"))
+        bounder_config = payload.pop("bounder")
+        if bounder_config is not None and not issubclass(type(bounder_config), Mapping):
+            raise ValueError("serialized bounder must be a mapping or None")
         bounder = bounder_from_config(bounder_config) if bounder_config else None
         return cls(config=ac_config, bounder=bounder)
 

@@ -507,6 +507,34 @@ def test_actor_critic_mapping_config_and_resource_boundary() -> None:
         _require_discrete_state_resources(1, 107_374_181)
 
 
+class _HostileArray:
+    def __jax_array__(self) -> jax.Array:
+        raise RuntimeError("hostile array hook executed")
+
+
+def test_actor_critic_serialized_schema_and_hostile_runtime_inputs_fail_closed() -> None:
+    config = ActorCriticConfig(n_actions=2).to_config()
+    with pytest.raises(ValueError, match="serialized schema"):
+        ActorCriticConfig.from_config({**config, "unknown": 1})
+    with pytest.raises(ValueError, match="exact JSON"):
+        ActorCriticConfig.from_config({**config, "n_actions": np.int32(2)})
+
+    payload = ActorCriticAgent(ActorCriticConfig(n_actions=2)).to_config()
+    with pytest.raises(ValueError, match="type differs"):
+        ActorCriticAgent.from_config({**payload, "type": "wrong"})
+    with pytest.raises(ValueError, match="serialized schema"):
+        ActorCriticAgent.from_config({**payload, "unknown": None})
+    with pytest.raises(ValueError, match="Bounder"):
+        ActorCriticAgent(ActorCriticConfig(n_actions=2), bounder=object())  # type: ignore[arg-type]
+
+    agent = ActorCriticAgent(ActorCriticConfig(n_actions=2))
+    with pytest.raises(ValueError, match="Threefry"):
+        agent.init(2, _HostileArray())  # type: ignore[arg-type]
+    state = agent.init(2, jr.key(0))
+    with pytest.raises(ValueError, match="trusted array metadata"):
+        agent.policy.__wrapped__(agent, state, _HostileArray())  # type: ignore[attr-defined,arg-type]
+
+
 @pytest.mark.parametrize("shape", [(), (1,), (1, 2), (2, 1), (3,)])
 def test_actor_critic_rejects_wrong_observation_shapes(shape: tuple[int, ...]) -> None:
     agent = ActorCriticAgent(ActorCriticConfig(n_actions=2))

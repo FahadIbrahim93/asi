@@ -225,8 +225,8 @@ def test_continuous_actor_critic_rejects_inverted_or_nonfinite_action_bounds(
     low: float | None, high: float | None, message: str | None
 ) -> None:
     """low > high makes jnp.clip return high for every input: a constant-action policy."""
-    config = ContinuousActorCriticConfig(action_dim=2, action_low=low, action_high=high)
     if message is None:
+        config = ContinuousActorCriticConfig(action_dim=2, action_low=low, action_high=high)
         agent = ContinuousActorCriticAgent(config)
         state = agent.init(feature_dim=1, key=jr.key(2))
         _state, action, _mean, _sigma = agent.start(state, jnp.array([1.0], dtype=jnp.float32))
@@ -235,7 +235,7 @@ def test_continuous_actor_critic_rejects_inverted_or_nonfinite_action_bounds(
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         with pytest.raises(ValueError, match=message):
-            ContinuousActorCriticAgent(config)
+            ContinuousActorCriticConfig(action_dim=2, action_low=low, action_high=high)
 
 
 class _FloatSpoof:
@@ -266,9 +266,10 @@ class _FloatSpoof:
 
 @pytest.mark.parametrize("field", ["action_low", "action_high"])
 def test_continuous_actor_critic_rejects_bounds_that_only_spoof_float(field: str) -> None:
-    config = ContinuousActorCriticConfig(action_dim=1, **{field: _FloatSpoof()})  # type: ignore[arg-type]
     with pytest.raises(ValueError, match=f"{field} must be a finite real number"):
-        ContinuousActorCriticAgent(config)
+        ContinuousActorCriticConfig(  # type: ignore[arg-type]
+            action_dim=1, **{field: _FloatSpoof()}
+        )
 
 
 @pytest.mark.parametrize(
@@ -577,6 +578,31 @@ def test_continuous_actor_critic_mapping_config_and_resource_boundary() -> None:
     _require_continuous_state_resources(1, 107_374_180)
     with pytest.raises(ValueError, match="state exceeds"):
         _require_continuous_state_resources(1, 107_374_181)
+
+
+class _HostileArray:
+    def __jax_array__(self) -> jax.Array:
+        raise RuntimeError("hostile array hook executed")
+
+
+def test_continuous_actor_critic_schema_and_hostile_inputs_fail_closed() -> None:
+    config = ContinuousActorCriticConfig(action_dim=2).to_config()
+    with pytest.raises(ValueError, match="serialized schema"):
+        ContinuousActorCriticConfig.from_config({**config, "unknown": 1})
+    with pytest.raises(ValueError, match="exact JSON"):
+        ContinuousActorCriticConfig.from_config({**config, "action_dim": np.int32(2)})
+
+    agent = ContinuousActorCriticAgent(ContinuousActorCriticConfig(action_dim=2))
+    payload = agent.to_config()
+    with pytest.raises(ValueError, match="type differs"):
+        ContinuousActorCriticAgent.from_config({**payload, "type": "wrong"})
+    with pytest.raises(ValueError, match="Bounder"):
+        ContinuousActorCriticAgent(agent.config, bounder=object())  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="Threefry"):
+        agent.init(2, _HostileArray())  # type: ignore[arg-type]
+    state = agent.init(2, jr.key(0))
+    with pytest.raises(ValueError, match="trusted array metadata"):
+        agent.policy_params.__wrapped__(agent, state, _HostileArray())  # type: ignore[attr-defined,arg-type]
 
 
 @pytest.mark.parametrize("shape", [(), (1,), (1, 2), (2, 1), (3,)])
