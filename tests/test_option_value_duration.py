@@ -8,6 +8,7 @@ import json
 import math
 from decimal import Decimal
 from fractions import Fraction
+from types import MappingProxyType
 
 import chex
 import jax
@@ -461,7 +462,7 @@ def test_option_duration_rejects_hostile_integer_subclasses(field: str) -> None:
             learner.init(HostileInt(3))
 
 
-def test_option_duration_float_hook_runs_once_and_normalizes_failures() -> None:
+def test_option_duration_float_subclasses_never_run_hooks() -> None:
     class CountingFloat(float):
         def __new__(cls):
             instance = super().__new__(cls, 0.25)
@@ -473,9 +474,9 @@ def test_option_duration_float_hook_runs_once_and_normalizes_failures() -> None:
             return (1, 4)
 
     value = CountingFloat()
-    config = OptionValueDurationConfig(reward_step_size=value)
-    assert value.calls == 1
-    assert type(config.reward_step_size) is float
+    with pytest.raises(ValueError, match="reward_step_size"):
+        OptionValueDurationConfig(reward_step_size=value)
+    assert value.calls == 0
 
     class ExplodingFloat(float):
         def as_integer_ratio(self) -> tuple[int, int]:
@@ -493,7 +494,7 @@ def test_option_duration_rejects_builtin_float32_underflow() -> None:
         OptionValueDurationConfig(reward_step_size=1.0e-50)
 
 
-def test_option_duration_config_schemas_and_record_type_are_exact() -> None:
+def test_option_duration_config_preserves_historical_loader_forms() -> None:
     class ConfigSubclass(OptionValueDurationConfig):
         pass
 
@@ -502,19 +503,12 @@ def test_option_duration_config_schemas_and_record_type_are_exact() -> None:
 
     learner_payload = OptionValueDurationLearner(2).to_config()
     learner_payload["n_options"] = np.int32(2)
-    with pytest.raises(ValueError, match="exact JSON integer"):
-        OptionValueDurationLearner.from_config(learner_payload)
+    restored = OptionValueDurationLearner.from_config(MappingProxyType(learner_payload))
+    assert restored.n_options == 2
 
-    config_payload = OptionValueDurationConfig().to_config()
-    config_payload["type"] = "AnotherConfig"
-    with pytest.raises(ValueError, match="type is unsupported"):
-        OptionValueDurationConfig.from_config(config_payload)
-
-    class PayloadSubclass(dict):
-        pass
-
-    with pytest.raises(ValueError, match="exact dictionary"):
-        OptionValueDurationLearner.from_config(PayloadSubclass())
+    config_payload = {"type": "historical-marker", "reward_step_size": np.float32(0.25)}
+    config = OptionValueDurationConfig.from_config(MappingProxyType(config_payload))
+    assert config.reward_step_size == 0.25
 
 
 def test_option_duration_resource_formula_matches_materialized_state() -> None:
