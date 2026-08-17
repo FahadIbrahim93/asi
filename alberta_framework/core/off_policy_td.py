@@ -1,7 +1,7 @@
-"""Off-policy TD learner with importance sampling (Step 3 Phase E).
+"""Off-policy TD learners with importance sampling.
 
-Implements per-decision importance sampling with optional Retrace-style
-ratio clipping for stable off-policy linear value function learning.
+Implements per-decision importance sampling with optional ratio clipping for
+off-policy linear value-function learning.
 
 Theoretical background:
     TD with linear function approximation is **not** guaranteed to
@@ -12,9 +12,9 @@ Theoretical background:
        include each rho_t = pi(a_t|s_t) / b(a_t|s_t) once in the
        eligibility-trace recursion so that on average we are simulating the
        on-policy distribution. Variance can be very large.
-    2. Retrace-style ratio clipping (Munos et al. 2016): use
-       rho_clipped = min(c, rho_t) to trade variance for bias. Clipping is
-       not by itself a convergence guarantee for linear off-policy TD.
+    2. Importance-ratio clipping: use ``min(c, rho_t)`` to bound individual
+       updates at the cost of bias. This is not the multi-step Retrace
+       operator of Munos et al. (2016).
     3. Gradient-TD (TDC, GQ-lambda) (Sutton, Maei, et al. 2009-2010):
        gradient descent on the projected Bellman error.
     4. Emphatic TD (Sutton, Mahmood, White 2016): emphasis traces F_t
@@ -144,14 +144,17 @@ def _zero_if_unused(scale: Array, value: Array) -> Array:
 
 def _array_metadata(name: str, value: object, shape: tuple[int, ...]) -> Array:
     """Require exact float32 host metadata before a value reaches JAX."""
+    actual_type = type(value)
     if not (
-        type(value) is np.ndarray
-        or isinstance(value, jax.Array)
-        or type(value) is jax.ShapeDtypeStruct
+        actual_type is np.ndarray
+        or issubclass(actual_type, jax.Array)
+        or issubclass(actual_type, jax.core.Tracer)
+        or actual_type is jax.ShapeDtypeStruct
     ):
         raise ValueError(f"{name} must expose trusted array metadata")
-    actual_shape = tuple(value.shape)
-    actual_dtype = np.dtype(value.dtype)
+    trusted_value = cast(Any, value)
+    actual_shape = tuple(trusted_value.shape)
+    actual_dtype = np.dtype(trusted_value.dtype)
     if actual_shape != shape or actual_dtype != np.dtype(np.float32):
         raise ValueError(f"{name} must have shape {shape} and dtype float32")
     return cast(Array, value)
@@ -162,6 +165,14 @@ def _scalar_operand(name: str, value: object) -> Array:
         canonical = validated_float32_scalar(name, value)
         return jnp.asarray(canonical, dtype=jnp.float32)
     return _array_metadata(name, value, ())
+
+
+def _discount_operand(value: object) -> Array:
+    """Validate a discount in its exact host and consumed float32 domains."""
+    if type(value) in _ACTUAL_INT_TYPES | _ACTUAL_FLOAT_TYPES:
+        canonical = validated_float32_scalar("gamma", value, lower=0.0, upper=1.0)
+        return jnp.asarray(canonical, dtype=jnp.float32)
+    return _array_metadata("gamma", value, ())
 
 
 def _stable_rms(values: Array) -> Array:
@@ -416,20 +427,20 @@ def _gradient_state_contract(state: object) -> tuple[GradientTDState, int]:
 
 
 class OffPolicyTDLinearLearner:
-    """Off-policy linear TD(lambda) with per-decision IS and Retrace clipping.
+    """Off-policy linear TD(lambda) with clipped per-decision IS.
 
     The update rule is::
 
         rho_t = pi(a_t|s_t) / b(a_t|s_t)               (provided externally)
-        rho_clipped = min(c, rho_t)                     (Retrace clipping)
+        rho_clipped = min(c, rho_t)                     (ratio clipping)
         delta_t = R_{t+1} + gamma_t * V(s_{t+1}) - V(s_t)
         z_t = rho_clipped * (gamma_t * lambda_t * z_{t-1} + phi_t)
         w_{t+1} = w_t + alpha * delta_t * z_t
 
-    Setting ``retrace_clip = inf`` recovers naive per-decision IS.
-    Setting ``retrace_clip = 1.0`` clips every ratio in the trace recursion
-    to one. Setting ``rho_t = 1`` always recovers on-policy semi-gradient
-    TD(lambda).
+    Setting the historically named ``retrace_clip`` to infinity recovers
+    naive per-decision IS. Setting ``rho_t = 1`` recovers on-policy
+    semi-gradient TD(lambda). This update is not the Retrace operator and
+    does not inherit its convergence guarantees.
 
     Attributes:
         step_size: Learning rate alpha
@@ -448,8 +459,9 @@ class OffPolicyTDLinearLearner:
         Args:
             step_size: Learning rate alpha (scalar)
             trace_decay: Eligibility trace decay lambda in [0, 1]
-            retrace_clip: Maximum allowed importance ratio (default 1.0;
-                pass float("inf") to disable clipping).
+            retrace_clip: Maximum allowed importance ratio. The name is kept
+                for configuration compatibility; pass ``float("inf")`` to
+                disable clipping.
         """
         self._step_size = _validated_config_float("step_size", step_size, positive=True)
         self._trace_decay = _validated_config_float(
@@ -469,7 +481,7 @@ class OffPolicyTDLinearLearner:
 
     @property
     def retrace_clip(self) -> float:
-        """IS-ratio clip (Retrace c)."""
+        """Maximum per-decision importance ratio (compatibility name)."""
         return self._retrace_clip
 
     def init(self, feature_dim: int) -> OffPolicyTDState:
@@ -523,7 +535,7 @@ class OffPolicyTDLinearLearner:
         observation = _array_metadata("observation", observation, (feature_dim,))
         next_observation = _array_metadata("next_observation", next_observation, (feature_dim,))
         reward = _scalar_operand("reward", reward)
-        gamma = _scalar_operand("gamma", gamma)
+        gamma = _discount_operand(gamma)
         rho = _scalar_operand("rho", rho)
         result = self._update_jit(state, observation, reward, next_observation, gamma, rho)
         return cast(
@@ -585,7 +597,8 @@ class OffPolicyTDLinearLearner:
             jnp.all(jnp.isfinite(observation))
             & jnp.isfinite(reward_s)
             & ((gamma_s == 0.0) | jnp.all(jnp.isfinite(next_observation)))
-            & jnp.isfinite(gamma_s)
+            & (gamma_s >= 0.0)
+            & (gamma_s <= 1.0)
             & jnp.isfinite(rho_s)
         )
         previous_checked = state.replace(  # type: ignore[attr-defined]
@@ -642,7 +655,7 @@ class OffPolicyTDLinearLearner:
 class ETDLinearLearner:
     """Off-policy linear emphatic TD(lambda).
 
-    ETD(lambda) replaces Retrace's clipped per-decision trace with a
+    Unlike the clipped per-decision learner above, ETD(lambda) uses a
     follow-on trace and scalar emphasis:
 
     ``F_t = rho_t * gamma_t * F_{t-1} + i_t``
@@ -739,7 +752,7 @@ class ETDLinearLearner:
         observation = _array_metadata("observation", observation, (feature_dim,))
         next_observation = _array_metadata("next_observation", next_observation, (feature_dim,))
         reward = _scalar_operand("reward", reward)
-        gamma = _scalar_operand("gamma", gamma)
+        gamma = _discount_operand(gamma)
         rho = _scalar_operand("rho", rho)
         interest = _scalar_operand("interest", interest)
         result = self._update_jit(
@@ -801,7 +814,8 @@ class ETDLinearLearner:
             jnp.all(jnp.isfinite(observation))
             & jnp.isfinite(reward_s)
             & ((gamma_s == 0.0) | jnp.all(jnp.isfinite(next_observation)))
-            & jnp.isfinite(gamma_s)
+            & (gamma_s >= 0.0)
+            & (gamma_s <= 1.0)
             & jnp.isfinite(rho_s)
             & jnp.isfinite(interest_s)
         )
@@ -959,7 +973,7 @@ class GradientTDLinearLearner:
         observation = _array_metadata("observation", observation, (feature_dim,))
         next_observation = _array_metadata("next_observation", next_observation, (feature_dim,))
         reward = _scalar_operand("reward", reward)
-        gamma = _scalar_operand("gamma", gamma)
+        gamma = _discount_operand(gamma)
         rho = _scalar_operand("rho", rho)
         result = self._update_jit(state, observation, reward, next_observation, gamma, rho)
         return cast(
@@ -1019,7 +1033,8 @@ class GradientTDLinearLearner:
             jnp.all(jnp.isfinite(observation))
             & jnp.isfinite(reward_s)
             & ((gamma_s == 0.0) | jnp.all(jnp.isfinite(next_observation)))
-            & jnp.isfinite(gamma_s)
+            & (gamma_s >= 0.0)
+            & (gamma_s <= 1.0)
             & jnp.isfinite(rho_s)
         )
         previous_checked = state.replace(  # type: ignore[attr-defined]

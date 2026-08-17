@@ -289,7 +289,10 @@ def test_concrete_life_rejects_invalid_prototype_lifecycle_before_init(
 
 
 def test_switching_phase_length_cannot_exceed_signed_int32_capacity() -> None:
-    with pytest.raises(ValueError, match="phase_length.*signed-int32|capacity"):
+    with pytest.raises(
+        ValueError,
+        match="phase_length.*(?:signed-int32|capacity|positive integer)",
+    ):
         build_prototype_switching_life(
             agent_config=_agent_config(),
             environment_config=SwitchingTwoStateConfig(  # type: ignore[call-arg]

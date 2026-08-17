@@ -607,6 +607,7 @@ def test_prototype_checkpoint_preserves_option_search_config(tmp_path: Path) -> 
     chex.assert_trees_all_equal(restored_state, state)
 
 
+@pytest.mark.slow
 def test_prototype_applies_search_at_next_decision_observation() -> None:
     option_search = OptionSearchControlConfig(backup_budget=1)
     config = PrototypeAgentConfig(

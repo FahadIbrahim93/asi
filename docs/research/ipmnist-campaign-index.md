@@ -45,13 +45,16 @@ superseded their status language.
 | [`FINAL_REPORT.md`](../../outputs/ipmnist_screening/FINAL_REPORT.md) | Historical accumulated report; its “final best” language predates RLS confirmation |
 | [`publication_runs/RESULTS.md`](../../outputs/ipmnist_screening/publication_runs/RESULTS.md) | Historical pre-RLS publication-run record, not the current campaign leaderboard |
 | [`CEILING_ANALYSIS.md`](../../outputs/ipmnist_screening/CEILING_ANALYSIS.md) | Pre-RLS diagnostic analysis; its “record” and “measured state of the art” language is historical |
-| [`SOTA_LANDSCAPE_2026.md`](../../outputs/ipmnist_screening/SOTA_LANDSCAPE_2026.md) | Bounded 2026-08-02 web survey, not a systematic or current external ranking |
+| [`SOTA_LANDSCAPE_2026.md`](../../outputs/ipmnist_screening/SOTA_LANDSCAPE_2026.md) | Bounded 2026-08-02 web survey, not a systematic or current external ranking; its BiMU sentence omits the higher MESU entry from the same paper table |
 | [`AUDIT.md`](../../outputs/ipmnist_screening/AUDIT.md) | Historical audit of the then-existing campaign records and cross-runner proxy discrepancy |
 
 Use “current development leader” for the latest arm and “local reproduced
 UPGD-W reference” for the stored published-configuration comparator. Historical
 `BEATS-SOTA` labels mean only that an arm cleared that local reference; they are
 not external SOTA findings.
+
+Use the mutable [protocol-aware comparison landscape](sota-landscape.md) for
+the current external review and the correction to the dated output survey.
 
 ## Artifact-schema boundary
 

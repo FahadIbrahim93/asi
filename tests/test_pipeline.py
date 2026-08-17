@@ -27,6 +27,8 @@ from alberta_framework.pipeline import (
 from alberta_framework.steps import (
     Step3HordeConfig,
     Step4SARSAConfig,
+    run_step3_smoke,
+    run_step4_smoke,
 )
 
 
@@ -183,6 +185,37 @@ def test_pipeline_config_roundtrip_with_associative_step2() -> None:
     assert roundtrip.associative.adaptive_feature_family
     assert roundtrip.associative.adaptive_window
     assert roundtrip.associative.adaptive_budget
+
+
+def test_step3_and_step4_facade_smokes_are_finite() -> None:
+    step3_config = Step3HordeConfig(
+        gammas=(0.0, 0.5),
+        lamdas=(0.0, 0.0),
+        hidden_sizes=(),
+        step_size=0.05,
+    )
+    step3_result = run_step3_smoke(
+        step3_config,
+        steps=8,
+        final_window=2,
+        raw_feature_dim=3,
+        constructed_feature_dim=2,
+    )
+    assert step3_result.finite
+    assert step3_result.per_demon_metrics_shape == (8, 2, 3)
+    assert step3_result.handoff.feature_dim == 5
+
+    step4_config = Step4SARSAConfig(
+        n_actions=2,
+        hidden_sizes=(),
+        epsilon_start=0.0,
+        epsilon_end=0.0,
+        step_size=0.05,
+    )
+    step4_result = run_step4_smoke(step4_config, steps=8, feature_dim=3)
+    assert step4_result.finite
+    assert step4_result.q_values_shape == (8, 2)
+    assert step4_result.actions_shape == (8,)
 
 
 def test_pipeline_init_predict_and_one_step_update_are_finite() -> None:

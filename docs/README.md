@@ -48,6 +48,8 @@ The package overview and development entry points are in
   the development-only IPMNIST campaign.
 - [`research/ipmnist-campaign-index.md`](research/ipmnist-campaign-index.md) — mutable pointer
   to the current IPMNIST summary and the supersession status of append-only records.
+- [`research/sota-landscape.md`](research/sota-landscape.md) — current protocol-aware external
+  comparison map for IPMNIST, Forager, and the other ASI lanes.
 - [`design/rtu-taylor-correction.md`](design/rtu-taylor-correction.md) — derivation and limits
   of the optional RTU approximation.
 

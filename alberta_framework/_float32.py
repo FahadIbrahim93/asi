@@ -2,16 +2,42 @@
 
 from __future__ import annotations
 
-import math
 import struct
-from numbers import Integral, Real
-from typing import cast
+from fractions import Fraction
+from typing import Any, cast
+
+import numpy as np
+
+_ACTUAL_INT_TYPES = frozenset(
+    {
+        int,
+        np.int8,
+        np.int16,
+        np.int32,
+        np.int64,
+        np.uint8,
+        np.uint16,
+        np.uint32,
+        np.uint64,
+        np.longlong,
+        np.ulonglong,
+    }
+)
+_ACTUAL_FLOAT_TYPES = frozenset(
+    {
+        float,
+        Fraction,
+        np.dtype("e").type,
+        np.dtype("f").type,
+        np.dtype("d").type,
+        np.dtype("g").type,
+    }
+)
+_ALLOWED_REAL_TYPES = _ACTUAL_INT_TYPES | _ACTUAL_FLOAT_TYPES
 
 
-def _is_actual_integral(value: object) -> bool:
-    """Return whether the runtime type is a non-bool Integral subtype."""
-    actual_type = type(value)
-    return not issubclass(actual_type, bool) and issubclass(actual_type, Integral)
+def _is_actual_int(value: object) -> bool:
+    return type(value) in _ACTUAL_INT_TYPES
 
 
 def _round_quotient_ties_to_even(numerator: int, denominator: int) -> int:
@@ -84,40 +110,48 @@ def _float32_from_ratio(
     return float(struct.unpack("!f", bits.to_bytes(4, byteorder="big"))[0])
 
 
-def _real_ratio(value: Real) -> tuple[int, int, bool]:
+def _real_ratio(value: object) -> tuple[int, int, bool]:
     """Return one normalized exact ratio and its zero-sign metadata."""
     actual_type = type(value)
-    if issubclass(actual_type, bool) or not issubclass(actual_type, Real):
+    if actual_type not in _ALLOWED_REAL_TYPES:
         raise TypeError("value must be an actual non-bool real")
-    if _is_actual_integral(value):
-        ratio: object = (int(cast(Integral, value)), 1)
+    if _is_actual_int(value):
+        ratio: object = (int(cast(Any, value)), 1)
+    elif actual_type is float:
+        ratio = float.as_integer_ratio(cast(float, value))
+    elif actual_type is Fraction:
+        fraction = cast(Fraction, value)
+        ratio = (fraction.numerator, fraction.denominator)
     else:
-        ratio_method = getattr(value, "as_integer_ratio", None)
-        if not callable(ratio_method):
-            raise TypeError("real value must expose as_integer_ratio")
-        ratio = ratio_method()
-    if not issubclass(type(ratio), tuple):
+        # NumPy's concrete floating scalar classes are in the allow-list.
+        # Dispatch through the concrete class after the exact-type gate so an
+        # instance cannot substitute an attribute hook.
+        ratio = cast(Any, actual_type).as_integer_ratio(value)
+    if type(ratio) is not tuple:
         raise TypeError("as_integer_ratio must return an integer pair")
     ratio_tuple = cast(tuple[object, ...], ratio)
     if len(ratio_tuple) != 2:
         raise TypeError("as_integer_ratio must return an integer pair")
     numerator_raw, denominator_raw = ratio_tuple
-    if not _is_actual_integral(numerator_raw) or not _is_actual_integral(
-        denominator_raw
-    ):
+    if not _is_actual_int(numerator_raw) or not _is_actual_int(denominator_raw):
         raise TypeError("as_integer_ratio must return an integer pair")
-    numerator = int(cast(Integral, numerator_raw))
-    denominator = int(cast(Integral, denominator_raw))
+    numerator = int(cast(Any, numerator_raw))
+    denominator = int(cast(Any, denominator_raw))
     if denominator < 0:
         numerator = -numerator
         denominator = -denominator
     if denominator == 0:
         raise ValueError("ratio denominator must be nonzero")
-    negative_zero = numerator == 0 and math.copysign(1.0, float(value)) < 0.0
+    negative_zero = (
+        numerator == 0
+        and actual_type in _ACTUAL_FLOAT_TYPES
+        and actual_type is not Fraction
+        and bool(np.signbit(cast(Any, value)))
+    )
     return numerator, denominator, negative_zero
 
 
-def round_real_to_float32_with_ratio(value: Real) -> tuple[int, int, float]:
+def round_real_to_float32_with_ratio(value: object) -> tuple[int, int, float]:
     """Read one exact ratio and return it with its binary32 rounding.
 
     Returning the same ratio used for rounding lets domain validators retain
@@ -133,7 +167,7 @@ def round_real_to_float32_with_ratio(value: Real) -> tuple[int, int, float]:
     return numerator, denominator, rounded
 
 
-def round_real_to_float32(value: Real) -> float:
+def round_real_to_float32(value: object) -> float:
     """Round a standard exact-ratio real directly to IEEE binary32.
 
     Integer and ``as_integer_ratio`` inputs are rounded with IEEE

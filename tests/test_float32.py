@@ -32,6 +32,10 @@ def test_rounds_fraction_midpoint_exactly(offset: Fraction, expected: np.float32
     )
 
 
+def test_rounds_fraction_zero_without_numpy_conversion() -> None:
+    assert _raw_float32(round_real_to_float32(Fraction(0))) == 0
+
+
 def test_rounds_overflow_midpoint_outward() -> None:
     float32_max = (2**24 - 1) * 2**104
     midpoint = Fraction(float32_max + 2**103)
@@ -80,7 +84,7 @@ def test_rejects_non_real_whose_class_property_spoofs_float() -> None:
         round_real_to_float32(value)  # type: ignore[arg-type]
 
 
-def test_float_subclass_cannot_spoof_integral_ratio_dispatch() -> None:
+def test_float_subclass_is_rejected_before_spoofed_ratio_dispatch() -> None:
     class IntegralSpoofFloat(float):
         calls = 0
 
@@ -94,11 +98,12 @@ def test_float_subclass_cannot_spoof_integral_ratio_dispatch() -> None:
 
     value = IntegralSpoofFloat(0.5)
 
-    assert _raw_float32(round_real_to_float32(value)) == 0x80000000
-    assert IntegralSpoofFloat.calls == 1
+    with pytest.raises(TypeError, match="actual non-bool real"):
+        round_real_to_float32(value)
+    assert IntegralSpoofFloat.calls == 0
 
 
-def test_rejects_ratio_component_whose_class_property_spoofs_int() -> None:
+def test_rejects_float_subclass_before_malformed_ratio_hook() -> None:
     class IntegerSpoof:
         @property
         def __class__(self) -> type[int]:
@@ -111,5 +116,5 @@ def test_rejects_ratio_component_whose_class_property_spoofs_int() -> None:
         def as_integer_ratio(self) -> tuple[object, int]:
             return (IntegerSpoof(), 2)
 
-    with pytest.raises(TypeError, match="integer pair"):
+    with pytest.raises(TypeError, match="actual non-bool real"):
         round_real_to_float32(MalformedRatioFloat(0.5))
