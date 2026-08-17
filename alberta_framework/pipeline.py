@@ -24,9 +24,10 @@ runners.
 
 from __future__ import annotations
 
+import operator
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
-from typing import Any, Literal, cast
+from typing import Any, Literal, SupportsIndex, cast
 
 import chex
 import jax
@@ -56,6 +57,7 @@ from alberta_framework.core.temporal_context import (
     TemporalContextFeaturizer,
     TemporalContextState,
 )
+from alberta_framework.core.update_safety import floating_tree_is_finite
 from alberta_framework.core.upgd import UPGDLearner, UPGDState
 from alberta_framework.steps._float32_validation import (
     canonical_float32_storage,
@@ -66,7 +68,6 @@ from alberta_framework.steps.step3 import (
     init_step3_state,
     make_step3_horde,
     step3_predict,
-    step3_update,
 )
 from alberta_framework.steps.step4 import (
     Step4SARSAConfig,
@@ -94,6 +95,7 @@ Signature: ``(observation, reward, terminated) -> Array(n_demons,)``.
 """
 
 _INT32_MAX: int = 2**31 - 1
+_MAX_CONFIG_SEQUENCE_LENGTH: int = 4096
 
 _ACTUAL_INT_TYPES: tuple[type, ...] = (
     int,
@@ -109,27 +111,130 @@ _ACTUAL_INT_TYPES: tuple[type, ...] = (
     np.ulonglong,
 )
 
-def _require_bool(name: str, value: object) -> bool:
+def _require_exact_str(name: str, value: object) -> str:
+    if type(value) is not str:
+        raise ValueError(f"{name} must be an exact string")
+    return value
+
+
+def _require_exact_record(value: object, expected: type, *, name: str) -> None:
+    if type(value) is not expected:
+        raise ValueError(f"{name} must be an exact {expected.__name__}")
+
+
+def _require_payload(
+    value: object,
+    *,
+    name: str,
+    allowed: frozenset[str],
+    required: frozenset[str] | None = None,
+) -> dict[str, object]:
+    """Copy one JSON object without invoking mapping-subclass hooks."""
+    if type(value) is not dict:
+        raise ValueError(f"{name} must be an exact dictionary")
+    payload = cast(dict[object, object], value)
+    if any(type(key) is not str for key in payload):
+        raise ValueError(f"{name} keys must be exact strings")
+    keys = cast(set[str], set(payload))
+    required_keys = allowed if required is None else required
+    if not required_keys <= keys or not keys <= allowed:
+        raise ValueError(f"{name} fields do not match the schema")
+    return cast(dict[str, object], dict(payload))
+
+
+def _require_bounded_tuple(name: str, value: object, *, nonempty: bool) -> tuple[object, ...]:
+    if type(value) is not tuple:
+        raise ValueError(f"{name} must be a tuple")
+    values = cast(tuple[object, ...], value)
+    if nonempty and not values:
+        raise ValueError(f"{name} must contain at least one element")
+    if len(values) > _MAX_CONFIG_SEQUENCE_LENGTH:
+        raise ValueError(f"{name} must contain at most {_MAX_CONFIG_SEQUENCE_LENGTH} elements")
+    return values
+
+
+def _require_float32_resource(name: str, scalar_count: int) -> None:
+    if scalar_count < 0 or scalar_count > _INT32_MAX or 4 * scalar_count > _INT32_MAX:
+        raise ValueError(f"derived {name} float32 resources exceed signed-int32 bounds")
+
+
+def _trusted_array_metadata(
+    name: str,
+    value: object,
+    *,
+    shape: tuple[int, ...],
+    dtype: Any,
+) -> Array:
+    """Require trusted static array metadata without touching hostile objects."""
+    actual_type = type(value)
+    if not (
+        actual_type is np.ndarray
+        or issubclass(actual_type, jax.Array)
+        or issubclass(actual_type, jax.core.Tracer)
+    ):
+        raise TypeError(f"{name} must be a trusted array")
+    try:
+        actual_shape = tuple(value.shape)  # type: ignore[attr-defined]
+        actual_dtype = jnp.dtype(value.dtype)  # type: ignore[attr-defined]
+    except (AttributeError, TypeError, ValueError) as error:
+        raise TypeError(f"{name} must expose trusted shape and dtype metadata") from error
+    if actual_shape != shape:
+        raise ValueError(f"{name} must have shape {shape}")
+    if actual_dtype != jnp.dtype(dtype):
+        raise TypeError(f"{name} must have dtype {jnp.dtype(dtype)}")
+    return cast(Array, value)
+
+
+def _require_typed_key(name: str, value: object) -> Array:
+    actual_type = type(value)
+    if not (issubclass(actual_type, jax.Array) or issubclass(actual_type, jax.core.Tracer)):
+        raise TypeError(f"{name} must be a scalar typed JAX PRNG key")
+    try:
+        shape = tuple(value.shape)  # type: ignore[attr-defined]
+        words = jr.key_data(cast(Array, value))
+        implementation = str(jr.key_impl(cast(Array, value)))
+    except (AttributeError, TypeError, ValueError) as error:
+        raise TypeError(f"{name} must be a scalar typed JAX PRNG key") from error
+    if shape != () or words.shape != (2,) or words.dtype != jnp.uint32:
+        raise TypeError(f"{name} must be a scalar typed JAX PRNG key")
+    if implementation != "threefry2x32":
+        raise ValueError(f"{name} must use Threefry2x32")
+    return cast(Array, value)
+
+
+def _require_bool(name: object, value: object) -> bool:
     """Require an actual builtin bool (``__class__`` spoofing is ignored)."""
+    _require_exact_str("name", name)
+    host_name = cast(str, name)
     if type(value) is not bool:
-        raise ValueError(f"{name} must be a bool")
-    return value
+        raise ValueError(f"{host_name} must be a bool")
+    return value  # type: ignore[return-value]
 
 
-def _require_str_choice(name: str, value: object, choices: tuple[str, ...]) -> str:
+def _require_str_choice(
+    name: object, value: object, choices: tuple[str, ...]
+) -> str:
     """Require an actual builtin str drawn from ``choices``."""
+    _require_exact_str("name", name)
+    host_name = cast(str, name)
     if type(value) is not str or value not in choices:
-        raise ValueError(f"unknown {name}")
-    return value
+        raise ValueError(f"unknown {host_name}")
+    return value  # type: ignore[return-value]
 
 
-def _require_real(name: str, value: object) -> float:
-    real, _, _, narrowed = finite_real_and_float32(name, value)
+def _require_real(name: object, value: object) -> float:
+    _require_exact_str("name", name)
+    host_name = cast(str, name)
+    real, _, _, narrowed = finite_real_and_float32(host_name, value)
     return canonical_float32_storage(real, narrowed)
 
 
-def _require_unit_interval(name: str, value: object) -> float:
-    real, numerator, denominator, narrowed = finite_real_and_float32(name, value)
+def _require_unit_interval(name: object, value: object) -> float:
+    _require_exact_str("name", name)
+    host_name = cast(str, name)
+    real, numerator, denominator, narrowed = finite_real_and_float32(
+        host_name, value
+    )
     if (
         real < 0.0
         or not real <= 1.0
@@ -138,12 +243,16 @@ def _require_unit_interval(name: str, value: object) -> float:
         or narrowed < 0.0
         or not narrowed <= 1.0
     ):
-        raise ValueError(f"{name} must be in [0, 1]")
+        raise ValueError(f"{host_name} must be in [0, 1]")
     return canonical_float32_storage(real, narrowed)
 
 
-def _require_half_open_unit_interval(name: str, value: object) -> float:
-    real, numerator, denominator, narrowed = finite_real_and_float32(name, value)
+def _require_half_open_unit_interval(name: object, value: object) -> float:
+    _require_exact_str("name", name)
+    host_name = cast(str, name)
+    real, numerator, denominator, narrowed = finite_real_and_float32(
+        host_name, value
+    )
     if (
         real <= 0.0
         or not real <= 1.0
@@ -152,12 +261,16 @@ def _require_half_open_unit_interval(name: str, value: object) -> float:
         or narrowed <= 0.0
         or not narrowed <= 1.0
     ):
-        raise ValueError(f"{name} must be in (0, 1]")
+        raise ValueError(f"{host_name} must be in (0, 1]")
     return canonical_float32_storage(real, narrowed)
 
 
-def _require_half_open_zero_one_interval(name: str, value: object) -> float:
-    real, numerator, denominator, narrowed = finite_real_and_float32(name, value)
+def _require_half_open_zero_one_interval(name: object, value: object) -> float:
+    _require_exact_str("name", name)
+    host_name = cast(str, name)
+    real, numerator, denominator, narrowed = finite_real_and_float32(
+        host_name, value
+    )
     if (
         real < 0.0
         or not real < 1.0
@@ -166,42 +279,48 @@ def _require_half_open_zero_one_interval(name: str, value: object) -> float:
         or narrowed < 0.0
         or not narrowed < 1.0
     ):
-        raise ValueError(f"{name} must be in [0, 1)")
+        raise ValueError(f"{host_name} must be in [0, 1)")
     return canonical_float32_storage(real, narrowed)
 
 
-def _require_nonnegative_real(name: str, value: object) -> float:
-    real, numerator, _, narrowed = finite_real_and_float32(name, value)
+def _require_nonnegative_real(name: object, value: object) -> float:
+    _require_exact_str("name", name)
+    host_name = cast(str, name)
+    real, numerator, _, narrowed = finite_real_and_float32(host_name, value)
     if real < 0.0 or numerator < 0 or narrowed < 0.0:
-        raise ValueError(f"{name} must be non-negative")
+        raise ValueError(f"{host_name} must be non-negative")
     return canonical_float32_storage(real, narrowed)
 
 
-def _require_positive_real(name: str, value: object) -> float:
-    real, numerator, _, narrowed = finite_real_and_float32(name, value)
+def _require_positive_real(name: object, value: object) -> float:
+    _require_exact_str("name", name)
+    host_name = cast(str, name)
+    real, numerator, _, narrowed = finite_real_and_float32(host_name, value)
     if real <= 0.0 or numerator <= 0 or narrowed <= 0.0:
-        raise ValueError(f"{name} must be positive")
+        raise ValueError(f"{host_name} must be positive")
     return canonical_float32_storage(real, narrowed)
 
 
 def _require_int(
-    name: str,
+    name: object,
     value: object,
     *,
     minimum: int | None = None,
     maximum: int | None = None,
 ) -> int:
+    _require_exact_str("name", name)
+    host_name = cast(str, name)
     if type(value) not in _ACTUAL_INT_TYPES:
-        raise ValueError(f"{name} must be an integer")
-    number = int(cast(int, value))
+        raise ValueError(f"{host_name} must be an integer")
+    number = operator.index(cast(SupportsIndex, value))
     if minimum is not None and number < minimum:
         if minimum == 1:
-            raise ValueError(f"{name} must be positive")
+            raise ValueError(f"{host_name} must be positive")
         if minimum == 0:
-            raise ValueError(f"{name} must be non-negative")
-        raise ValueError(f"{name} must be >= {minimum}")
+            raise ValueError(f"{host_name} must be non-negative")
+        raise ValueError(f"{host_name} must be >= {minimum}")
     if maximum is not None and number > maximum:
-        raise ValueError(f"{name} must be <= {maximum}")
+        raise ValueError(f"{host_name} must be <= {maximum}")
     return number
 
 
@@ -222,7 +341,7 @@ def _integer_associative_input(
     trusted = (
         issubclass(actual_type, jax.core.Tracer)
         or actual_type is np.ndarray
-        or isinstance(value, jax.Array)
+        or issubclass(actual_type, jax.Array)
     )
     if not trusted:
         raise TypeError(f"{name} must be a trusted array")
@@ -261,6 +380,7 @@ class Step2FeatureConfig:
 
     def __post_init__(self) -> None:
         """Validate observation and feature settings."""
+        _require_exact_record(self, Step2FeatureConfig, name="config")
         observation_dim = _require_int(
             "observation_dim", self.observation_dim, minimum=1, maximum=_INT32_MAX
         )
@@ -275,11 +395,17 @@ class Step2FeatureConfig:
             msg = "at least one of include_raw/include_ema/include_delta is required"
             raise ValueError(msg)
         ema_decay = _require_half_open_zero_one_interval("ema_decay", self.ema_decay)
-        if type(self.periods) is not tuple:
-            raise ValueError("periods must be a tuple")
+        periods = _require_bounded_tuple("periods", self.periods, nonempty=False)
         canonical_periods = tuple(
-            _require_positive_real("period", p) for p in self.periods
+            _require_positive_real("period", p) for p in periods
         )
+        copies = int(include_raw) + int(include_ema) + int(include_delta)
+        phase_dim = 2 * len(canonical_periods)
+        output_dim = copies * observation_dim + phase_dim
+        if include_phase_products:
+            output_dim += phase_dim * observation_dim
+        _require_float32_resource("temporal-context output", output_dim)
+        _require_float32_resource("temporal-context state", observation_dim + 1)
         object.__setattr__(self, "observation_dim", observation_dim)
         object.__setattr__(self, "include_raw", include_raw)
         object.__setattr__(self, "include_ema", include_ema)
@@ -324,8 +450,14 @@ class Step2FeatureConfig:
     @classmethod
     def from_dict(cls, payload: dict[str, object]) -> Step2FeatureConfig:
         """Reconstruct from :meth:`to_dict` output."""
-        config = dict(payload)
-        config["periods"] = tuple(cast(list[float], config.get("periods", [])))
+        fields = frozenset(cls.__dataclass_fields__)
+        config = _require_payload(payload, name=cls.__name__, allowed=fields)
+        raw_periods = config["periods"]
+        if type(raw_periods) is not list:
+            raise ValueError("periods must be an exact list")
+        if len(cast(list[object], raw_periods)) > _MAX_CONFIG_SEQUENCE_LENGTH:
+            raise ValueError(f"periods must contain at most {_MAX_CONFIG_SEQUENCE_LENGTH} elements")
+        config["periods"] = tuple(cast(list[object], raw_periods))
         return cls(**cast(Any, config))
 
 
@@ -355,18 +487,23 @@ class Step2UPGDConfig:
 
     def __post_init__(self) -> None:
         """Validate configuration."""
+        _require_exact_record(self, Step2UPGDConfig, name="config")
         observation_dim = _require_int(
             "observation_dim", self.observation_dim, minimum=1, maximum=_INT32_MAX
         )
         n_heads = _require_int("n_heads", self.n_heads, minimum=1, maximum=_INT32_MAX)
         if type(self.hidden_sizes) is not tuple or not self.hidden_sizes:
-            raise ValueError(
-                "hidden_sizes must contain at least one positive size"
-            )
+            raise ValueError("hidden_sizes must contain at least one positive size")
+        hidden_sizes = _require_bounded_tuple("hidden_sizes", self.hidden_sizes, nonempty=True)
         canonical_hidden = tuple(
             _require_int("hidden_sizes element", size, minimum=1, maximum=_INT32_MAX)
-            for size in self.hidden_sizes
+            for size in hidden_sizes
         )
+        layer_sizes = (observation_dim, *canonical_hidden)
+        parameter_scalars = sum(
+            left * right + right for left, right in zip(layer_sizes, layer_sizes[1:])
+        ) + n_heads * (canonical_hidden[-1] + 1)
+        _require_float32_resource("UPGD parameter", parameter_scalars)
         step_size = _require_nonnegative_real("step_size", self.step_size)
         sparsity = _require_unit_interval("sparsity", self.sparsity)
         use_layer_norm = _require_bool("use_layer_norm", self.use_layer_norm)
@@ -451,8 +588,16 @@ class Step2UPGDConfig:
     @classmethod
     def from_dict(cls, payload: dict[str, object]) -> Step2UPGDConfig:
         """Reconstruct from :meth:`to_dict` output."""
-        config = dict(payload)
-        config["hidden_sizes"] = tuple(cast(list[int], config["hidden_sizes"]))
+        fields = frozenset(cls.__dataclass_fields__)
+        config = _require_payload(payload, name=cls.__name__, allowed=fields)
+        raw_hidden = config["hidden_sizes"]
+        if type(raw_hidden) is not list:
+            raise ValueError("hidden_sizes must be an exact list")
+        if len(cast(list[object], raw_hidden)) > _MAX_CONFIG_SEQUENCE_LENGTH:
+            raise ValueError(
+                f"hidden_sizes must contain at most {_MAX_CONFIG_SEQUENCE_LENGTH} elements"
+            )
+        config["hidden_sizes"] = tuple(cast(list[object], raw_hidden))
         return cls(**cast(Any, config))
 
 
@@ -484,6 +629,7 @@ class Step2AssociativePipelineConfig:
 
     def __post_init__(self) -> None:
         """Validate integer context settings."""
+        _require_exact_record(self, Step2AssociativePipelineConfig, name="config")
         vocab_size = _require_int("vocab_size", self.vocab_size, minimum=2, maximum=_INT32_MAX)
         block_size = _require_int("block_size", self.block_size, minimum=1, maximum=_INT32_MAX)
         suffix_length = _require_int(
@@ -536,6 +682,8 @@ class Step2AssociativePipelineConfig:
         object.__setattr__(self, "initial_budget_fraction", initial_budget_fraction)
         object.__setattr__(self, "min_effective_budget", min_effective_budget)
         object.__setattr__(self, "scope_logit_clip", scope_logit_clip)
+        # The core record owns the complete retained/transient accounting.
+        self.to_core_config()
 
     def output_dim(self) -> int:
         """Return the associative probability-vector dimensionality."""
@@ -577,7 +725,9 @@ class Step2AssociativePipelineConfig:
         payload: dict[str, object],
     ) -> Step2AssociativePipelineConfig:
         """Reconstruct from :meth:`to_dict` output."""
-        return cls(**cast(Any, payload))
+        fields = frozenset(cls.__dataclass_fields__)
+        config = _require_payload(payload, name=cls.__name__, allowed=fields)
+        return cls(**cast(Any, config))
 
 
 @dataclass(frozen=True)
@@ -593,6 +743,7 @@ class HordeActorCriticPipelineConfig:
 
     def __post_init__(self) -> None:
         """Validate configuration."""
+        _require_exact_record(self, HordeActorCriticPipelineConfig, name="config")
         n_actions = _require_int("n_actions", self.n_actions, minimum=1, maximum=_INT32_MAX)
         actor_step_size = _require_nonnegative_real("actor_step_size", self.actor_step_size)
         actor_lamda = _require_unit_interval("actor_lamda", self.actor_lamda)
@@ -629,7 +780,9 @@ class HordeActorCriticPipelineConfig:
     @classmethod
     def from_dict(cls, payload: dict[str, object]) -> HordeActorCriticPipelineConfig:
         """Reconstruct from :meth:`to_dict` output."""
-        return cls(**cast(Any, payload))
+        fields = frozenset(cls.__dataclass_fields__)
+        config = _require_payload(payload, name=cls.__name__, allowed=fields)
+        return cls(**cast(Any, config))
 
 
 @dataclass(frozen=True)
@@ -654,6 +807,24 @@ class AlbertaPipelineConfig:
 
     def __post_init__(self) -> None:
         """Validate combinations of step2/control and required sub-configs."""
+        _require_exact_record(self, AlbertaPipelineConfig, name="config")
+        _require_exact_record(self.features, Step2FeatureConfig, name="features")
+        _require_exact_record(self.horde, Step3HordeConfig, name="horde")
+        _require_exact_record(self.control, Step4SARSAConfig, name="control")
+        if self.upgd is not None:
+            _require_exact_record(self.upgd, Step2UPGDConfig, name="upgd")
+        if self.associative is not None:
+            _require_exact_record(
+                self.associative,
+                Step2AssociativePipelineConfig,
+                name="associative",
+            )
+        if self.horde_ac is not None:
+            _require_exact_record(
+                self.horde_ac,
+                HordeActorCriticPipelineConfig,
+                name="horde_ac",
+            )
         _require_str_choice(
             "step2 mode",
             self.step2,
@@ -678,6 +849,7 @@ class AlbertaPipelineConfig:
                     f"{self.horde.n_demons})"
                 )
                 raise ValueError(msg)
+        _require_float32_resource("pipeline feature vector", self.feature_dim())
 
     def feature_dim(self) -> int:
         """Return the feature dimensionality passed to Step 3 and Step 4."""
@@ -709,12 +881,31 @@ class AlbertaPipelineConfig:
     @classmethod
     def from_dict(cls, payload: dict[str, object]) -> AlbertaPipelineConfig:
         """Reconstruct from :meth:`to_dict` output."""
-        upgd_payload = payload.get("upgd")
-        associative_payload = payload.get("associative")
-        horde_ac_payload = payload.get("horde_ac")
+        allowed = frozenset(
+            {
+                "features",
+                "upgd",
+                "associative",
+                "horde",
+                "control",
+                "horde_ac",
+                "step2",
+                "control_mode",
+            }
+        )
+        required = frozenset({"features", "horde", "control"})
+        config = _require_payload(
+            payload,
+            name=cls.__name__,
+            allowed=allowed,
+            required=required,
+        )
+        upgd_payload = config.get("upgd")
+        associative_payload = config.get("associative")
+        horde_ac_payload = config.get("horde_ac")
         return cls(
             features=Step2FeatureConfig.from_dict(
-                cast(dict[str, object], payload["features"])
+                cast(dict[str, object], config["features"])
             ),
             upgd=Step2UPGDConfig.from_dict(cast(dict[str, object], upgd_payload))
             if upgd_payload is not None
@@ -725,18 +916,18 @@ class AlbertaPipelineConfig:
             if associative_payload is not None
             else None,
             horde=Step3HordeConfig.from_dict(
-                cast(dict[str, object], payload["horde"])
+                cast(dict[str, object], config["horde"])
             ),
             control=Step4SARSAConfig.from_dict(
-                cast(dict[str, object], payload["control"])
+                cast(dict[str, object], config["control"])
             ),
             horde_ac=HordeActorCriticPipelineConfig.from_dict(
                 cast(dict[str, object], horde_ac_payload)
             )
             if horde_ac_payload is not None
             else None,
-            step2=cast(Step2Mode, payload.get("step2", "temporal_context")),
-            control_mode=cast(ControlMode, payload.get("control_mode", "sarsa")),
+            step2=cast(Step2Mode, config.get("step2", "temporal_context")),
+            control_mode=cast(ControlMode, config.get("control_mode", "sarsa")),
         )
 
 
@@ -808,11 +999,31 @@ class AlbertaPipelineSmokeResult:
     finite: bool
 
     def __post_init__(self) -> None:
+        _require_exact_record(self, AlbertaPipelineSmokeResult, name="result")
+        _require_exact_record(self.config, AlbertaPipelineConfig, name="config")
         object.__setattr__(
             self, "steps", _require_int("steps", self.steps, minimum=1, maximum=_INT32_MAX)
         )
         object.__setattr__(self, "seed", require_jax_seed(self.seed, name="seed"))
         object.__setattr__(self, "finite", _require_bool("finite", self.finite))
+        expected = {
+            "feature_shape": (self.steps, self.config.feature_dim()),
+            "horde_predictions_shape": (self.steps, self.config.horde.n_demons),
+            "q_values_shape": (
+                self.steps,
+                cast(HordeActorCriticPipelineConfig, self.config.horde_ac).n_actions
+                if self.config.control_mode == "horde_ac"
+                else self.config.control.n_actions,
+            ),
+            "actions_shape": (self.steps,),
+        }
+        for name, expected_shape in expected.items():
+            raw = getattr(self, name)
+            if type(raw) is not tuple or len(raw) != len(expected_shape):
+                raise ValueError(f"{name} must equal the derived pipeline shape")
+            shape = cast(tuple[object, ...], raw)
+            if any(type(dim) is not int for dim in shape) or shape != expected_shape:
+                raise ValueError(f"{name} must equal the derived pipeline shape")
 
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-serializable representation."""
@@ -863,7 +1074,13 @@ class AlbertaPipeline:
         cumulant_fn: CumulantFn | None = None,
     ):
         """Construct all pipeline components from ``config``."""
-        self._config = config or AlbertaPipelineConfig()
+        if config is None:
+            self._config = AlbertaPipelineConfig()
+        else:
+            _require_exact_record(config, AlbertaPipelineConfig, name="config")
+            self._config = config
+        if cumulant_fn is not None and not callable(cumulant_fn):
+            raise ValueError("cumulant_fn must be callable or None")
 
         if self._config.step2 == "temporal_context":
             self._featurizer: TemporalContextFeaturizer | None = (
@@ -943,8 +1160,10 @@ class AlbertaPipeline:
             )
 
         observation_dim = self._observation_dim()
-        self._cumulant_fn: CumulantFn = cumulant_fn or observation_channel_cumulant_fn(
-            self._config.horde.n_demons, observation_dim
+        self._cumulant_fn = (
+            observation_channel_cumulant_fn(self._config.horde.n_demons, observation_dim)
+            if cumulant_fn is None
+            else cumulant_fn
         )
 
     def _observation_dim(self) -> int:
@@ -953,6 +1172,66 @@ class AlbertaPipeline:
         if self._config.step2 == "associative":
             return cast(Step2AssociativePipelineConfig, self._config.associative).block_size
         return self._config.features.observation_dim
+
+    def _observation_operand(self, name: str, value: object, *, batched: bool = False) -> Array:
+        width = self._observation_dim()
+        shape = (-1, width) if batched else (width,)
+        if batched:
+            actual_type = type(value)
+            if not (
+                actual_type is np.ndarray
+                or issubclass(actual_type, jax.Array)
+                or issubclass(actual_type, jax.core.Tracer)
+            ):
+                raise TypeError(f"{name} must be a trusted array")
+            try:
+                actual_shape = tuple(value.shape)  # type: ignore[attr-defined]
+            except (AttributeError, TypeError) as error:
+                raise TypeError(f"{name} must expose trusted shape metadata") from error
+            if len(actual_shape) != 2 or actual_shape[1] != width:
+                raise ValueError(f"{name} must have shape (steps, {width})")
+            shape = actual_shape
+        if self._config.step2 == "associative":
+            return _integer_associative_input(name, value, expected_shape=shape)
+        return _trusted_array_metadata(name, value, shape=shape, dtype=jnp.float32)
+
+    def _state_contract(self, state: object) -> AlbertaPipelineState:
+        _require_exact_record(state, AlbertaPipelineState, name="state")
+        checked = cast(AlbertaPipelineState, state)
+        _trusted_array_metadata(
+            "state.last_features",
+            checked.last_features,
+            shape=(self.feature_dim,),
+            dtype=jnp.float32,
+        )
+        _trusted_array_metadata("state.step_count", checked.step_count, shape=(), dtype=jnp.int32)
+        if self._config.step2 == "temporal_context":
+            if (
+                checked.feature_state is None
+                or checked.upgd_state is not None
+                or checked.associative_state is not None
+            ):
+                raise ValueError("state Step 2 variants do not match pipeline config")
+        elif self._config.step2 == "upgd":
+            if (
+                checked.feature_state is not None
+                or checked.upgd_state is None
+                or checked.associative_state is not None
+            ):
+                raise ValueError("state Step 2 variants do not match pipeline config")
+        elif self._config.step2 == "associative":
+            if (
+                checked.feature_state is not None
+                or checked.upgd_state is not None
+                or checked.associative_state is None
+            ):
+                raise ValueError("state Step 2 variants do not match pipeline config")
+        elif any(
+            value is not None
+            for value in (checked.feature_state, checked.upgd_state, checked.associative_state)
+        ):
+            raise ValueError("state Step 2 variants do not match pipeline config")
+        return checked
 
     @property
     def config(self) -> AlbertaPipelineConfig:
@@ -1040,6 +1319,10 @@ class AlbertaPipeline:
 
     def init(self, key: Array, initial_observation: Array) -> AlbertaPipelineState:
         """Initialize learner state and prime control with the first observation."""
+        key = _require_typed_key("key", key)
+        initial_observation = self._observation_operand(
+            "initial_observation", initial_observation
+        )
         upgd_key, horde_key, control_key = jr.split(key, 3)
 
         feature_state: TemporalContextState | None = None
@@ -1115,6 +1398,7 @@ class AlbertaPipeline:
         vector. For HordeActorCritic control, it is the softmax action
         probability vector.
         """
+        state = self._state_contract(state)
         horde_predictions = step3_predict(
             self._horde,
             state.horde_state,
@@ -1164,6 +1448,31 @@ class AlbertaPipeline:
             associative_label: Optional integer next-token/class label that
                 drives associative-memory writes when ``step2='associative'``.
         """
+        state = self._state_contract(state)
+        observation = self._observation_operand("observation", observation)
+        reward = _trusted_array_metadata("reward", reward, shape=(), dtype=jnp.float32)
+        terminated = _trusted_array_metadata(
+            "terminated", terminated, shape=(), dtype=jnp.float32
+        )
+        if upgd_targets is not None and self._config.step2 != "upgd":
+            raise ValueError("upgd_targets require step2='upgd'")
+        if associative_label is not None and self._config.step2 != "associative":
+            raise ValueError("associative_label requires step2='associative'")
+        checked_upgd_targets: Array | None = None
+        if upgd_targets is not None:
+            upgd_cfg = cast(Step2UPGDConfig, self._config.upgd)
+            checked_upgd_targets = _trusted_array_metadata(
+                "upgd_targets",
+                upgd_targets,
+                shape=(upgd_cfg.n_heads,),
+                dtype=jnp.float32,
+            )
+        checked_associative_label: Array | None = None
+        if associative_label is not None:
+            checked_associative_label = _integer_associative_input(
+                "associative_label", associative_label, expected_shape=()
+            )
+        step2_update_applied = jnp.asarray(True, dtype=jnp.bool_)
         (
             new_feature_state,
             new_upgd_state,
@@ -1181,8 +1490,12 @@ class AlbertaPipeline:
             and new_upgd_state is not None
         ):
             upgd = cast(UPGDLearner, self._upgd)
-            upgd_result = upgd.update(new_upgd_state, observation, upgd_targets)
+            assert checked_upgd_targets is not None
+            upgd_result = upgd.update(
+                new_upgd_state, observation, checked_upgd_targets
+            )
             new_upgd_state = upgd_result.state
+            step2_update_applied = floating_tree_is_finite(new_upgd_state)
             features = upgd._trunk_forward(  # noqa: SLF001
                 new_upgd_state.trunk_params.weights,
                 new_upgd_state.trunk_params.biases,
@@ -1203,18 +1516,43 @@ class AlbertaPipeline:
                     observation,
                     expected_shape=(associative.config.block_size,),
                 ),
-                _integer_associative_input(
-                    "associative_label",
-                    associative_label,
-                    expected_shape=(),
-                ),
+                cast(Array, checked_associative_label),
             )
             new_associative_state = assoc_result.state
             features = assoc_result.predictions
+            step2_update_applied = assoc_result.update_applied
 
         if horde_cumulants is None:
             horde_cumulants = self._cumulant_fn(observation, reward, terminated)
-        horde_cumulants = jnp.asarray(horde_cumulants, dtype=jnp.float32)
+        horde_cumulants = _trusted_array_metadata(
+            "horde_cumulants",
+            horde_cumulants,
+            shape=(self._config.horde.n_demons,),
+            dtype=jnp.float32,
+        )
+
+        inputs_valid = (
+            jnp.all(jnp.isfinite(observation))
+            & jnp.isfinite(reward)
+            & ((terminated == 0.0) | (terminated == 1.0))
+            & jnp.all(jnp.isfinite(horde_cumulants) | jnp.isnan(horde_cumulants))
+        )
+        if checked_upgd_targets is not None:
+            inputs_valid = inputs_valid & jnp.all(
+                jnp.isfinite(checked_upgd_targets) | jnp.isnan(checked_upgd_targets)
+            )
+        if self._config.step2 == "associative":
+            associative_cfg = cast(
+                Step2AssociativePipelineConfig, self._config.associative
+            )
+            inputs_valid = inputs_valid & jnp.all(
+                (observation >= 0) & (observation < associative_cfg.vocab_size)
+            )
+            if checked_associative_label is not None:
+                inputs_valid = inputs_valid & (
+                    (checked_associative_label >= 0)
+                    & (checked_associative_label < associative_cfg.vocab_size)
+                )
 
         if self._config.control_mode == "horde_ac":
             ac = cast(HordeActorCriticAgent, self._control)
@@ -1246,9 +1584,9 @@ class AlbertaPipeline:
             horde_predictions = ac_result.critic_result.predictions
             horde_td_errors = ac_result.critic_result.td_errors
             horde_td_targets = ac_result.critic_result.td_targets
+            components_applied = ac_result.update_applied
         else:
-            horde_result = step3_update(
-                self._horde,
+            horde_result = self._horde.update(
                 state.horde_state,
                 state.last_features,
                 horde_cumulants,
@@ -1272,26 +1610,69 @@ class AlbertaPipeline:
             horde_predictions = horde_result.predictions
             horde_td_errors = horde_result.td_errors
             horde_td_targets = horde_result.td_targets
+            components_applied = horde_result.update_applied & (control_result.action >= 0)
 
-        next_state = AlbertaPipelineState(
+        proposed_state = AlbertaPipelineState(
             feature_state=new_feature_state,
             upgd_state=new_upgd_state,
             associative_state=new_associative_state,
             horde_state=new_horde_state,
             control_state=new_control_state,
             last_features=features,
-            step_count=state.step_count + 1,
+            step_count=(
+                jnp.minimum(state.step_count, jnp.asarray(_INT32_MAX - 1, dtype=jnp.int32))
+                + jnp.asarray(1, dtype=jnp.int32)
+            ),
+        )
+        transaction_applied = (
+            inputs_valid
+            & step2_update_applied
+            & components_applied
+            & floating_tree_is_finite(proposed_state)
+        )
+        next_state = jax.lax.cond(
+            transaction_applied,
+            lambda: proposed_state,
+            lambda: state,
         )
         return AlbertaPipelineStepResult(
             state=next_state,
-            features=features,
-            horde_predictions=horde_predictions,
-            horde_td_errors=horde_td_errors,
-            horde_td_targets=horde_td_targets,
-            q_values=q_values_or_policy,
-            action=action_out,
-            control_td_error=control_td_error,
-            reward=reward_out,
+            features=jnp.where(transaction_applied, features, jnp.zeros_like(features)),
+            horde_predictions=jnp.where(
+                transaction_applied,
+                horde_predictions,
+                jnp.zeros_like(horde_predictions),
+            ),
+            horde_td_errors=jnp.where(
+                transaction_applied,
+                horde_td_errors,
+                jnp.zeros_like(horde_td_errors),
+            ),
+            horde_td_targets=jnp.where(
+                transaction_applied,
+                horde_td_targets,
+                jnp.zeros_like(horde_td_targets),
+            ),
+            q_values=jnp.where(
+                transaction_applied,
+                q_values_or_policy,
+                jnp.zeros_like(q_values_or_policy),
+            ),
+            action=jnp.where(
+                transaction_applied,
+                action_out,
+                jnp.asarray(-1, dtype=jnp.int32),
+            ),
+            control_td_error=jnp.where(
+                transaction_applied,
+                control_td_error,
+                jnp.zeros_like(control_td_error),
+            ),
+            reward=jnp.where(
+                transaction_applied,
+                reward_out,
+                jnp.zeros_like(reward_out),
+            ),
         )
 
     def run_arrays(
@@ -1311,26 +1692,74 @@ class AlbertaPipeline:
         (the per-step callable variant is :meth:`update`); array runs use a
         fully resolved cumulant table for ``jax.lax.scan`` compatibility.
         """
+        state = self._state_contract(state)
+        observations = self._observation_operand("observations", observations, batched=True)
+        steps = int(observations.shape[0])
+        if not 1 <= steps <= _INT32_MAX:
+            raise ValueError("observations must contain between 1 and signed-int32 steps")
+        rewards = _trusted_array_metadata(
+            "rewards", rewards, shape=(steps,), dtype=jnp.float32
+        )
+        terminated = _trusted_array_metadata(
+            "terminated", terminated, shape=(steps,), dtype=jnp.float32
+        )
+        horde_cumulants = _trusted_array_metadata(
+            "horde_cumulants",
+            horde_cumulants,
+            shape=(steps, self._config.horde.n_demons),
+            dtype=jnp.float32,
+        )
+        if upgd_targets is not None and self._config.step2 != "upgd":
+            raise ValueError("upgd_targets require step2='upgd'")
+        if associative_labels is not None and self._config.step2 != "associative":
+            raise ValueError("associative_labels require step2='associative'")
         if upgd_targets is None:
-            steps = observations.shape[0]
             upgd_targets_array = jnp.full(
                 (steps, self._config.upgd.n_heads if self._config.upgd else 1),
                 jnp.nan,
                 dtype=jnp.float32,
             )
         else:
-            upgd_targets_array = jnp.asarray(upgd_targets, dtype=jnp.float32)
+            upgd_cfg = cast(Step2UPGDConfig, self._config.upgd)
+            upgd_targets_array = _trusted_array_metadata(
+                "upgd_targets",
+                upgd_targets,
+                shape=(steps, upgd_cfg.n_heads),
+                dtype=jnp.float32,
+            )
         associative_labels_array = (
             _integer_associative_input(
                 "associative_labels",
                 associative_labels,
-                expected_shape=(observations.shape[0],),
+                expected_shape=(steps,),
             )
             if associative_labels is not None
             else jnp.zeros((observations.shape[0],), dtype=jnp.int32)
         )
         use_associative_labels = (
             self._config.step2 == "associative" and associative_labels is not None
+        )
+        n_actions = (
+            cast(HordeActorCriticPipelineConfig, self._config.horde_ac).n_actions
+            if self._config.control_mode == "horde_ac"
+            else self._config.control.n_actions
+        )
+        input_scalars_per_step = (
+            self._observation_dim()
+            + 2
+            + self._config.horde.n_demons
+            + int(upgd_targets_array.shape[1])
+            + 1
+        )
+        output_scalars_per_step = (
+            self.feature_dim
+            + 2 * self._config.horde.n_demons
+            + n_actions
+            + 2
+        )
+        _require_float32_resource(
+            "pipeline array input/output",
+            steps * (input_scalars_per_step + output_scalars_per_step),
         )
 
         def step_fn(
@@ -1412,7 +1841,11 @@ def run_pipeline_smoke(
     """Run a deterministic Step 1-4 pipeline smoke probe."""
     steps = _require_int("steps", steps, minimum=1, maximum=_INT32_MAX)
     seed = require_jax_seed(seed, name="seed")
-    cfg = config or AlbertaPipelineConfig()
+    if config is None:
+        cfg = AlbertaPipelineConfig()
+    else:
+        _require_exact_record(config, AlbertaPipelineConfig, name="config")
+        cfg = config
     pipeline = make_alberta_pipeline(cfg)
 
     observation_dim = pipeline._observation_dim()  # noqa: SLF001
