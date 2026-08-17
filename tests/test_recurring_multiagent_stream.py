@@ -47,6 +47,9 @@ def _with_step_count(
         ({"time_delta": 0.0}, "time_delta"),
         ({"max_speed": 0.0}, "max_speed"),
         ({"initial_positions": (-2.0, 0.0)}, "initial_positions"),
+        ({"initial_positions": (True, False)}, "initial_positions"),
+        ({"initial_positions": (False, True)}, "initial_positions"),
+        ({"initial_positions": (1.0, False)}, "initial_positions"),
     ],
 )
 def test_invalid_configuration_is_rejected(
@@ -55,6 +58,16 @@ def test_invalid_configuration_is_rejected(
 ) -> None:
     with pytest.raises(ValueError, match=message):
         RecurringTwoAgentWorld(**kwargs)  # type: ignore[arg-type]
+
+
+def test_initial_positions_reject_boolean_identities() -> None:
+    import numpy as np
+
+    legal = RecurringTwoAgentWorld(initial_positions=(-0.5, 0.5))
+    assert legal._initial_positions_tuple == (-0.5, 0.5)
+    for positions in ((True, False), (np.True_, 0.0), (1.0, np.bool_(False))):
+        with pytest.raises(ValueError, match="initial_positions"):
+            RecurringTwoAgentWorld(initial_positions=positions)
 
 
 def test_visible_context_sequence_recurs_a_b_a() -> None:
