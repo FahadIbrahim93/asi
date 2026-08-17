@@ -2,12 +2,45 @@
 
 from __future__ import annotations
 
-from typing import cast
+import operator
+from typing import SupportsIndex, cast
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import Array
 from jaxtyping import Bool
+
+_ACTUAL_INT_TYPES = frozenset(
+    {
+        int,
+        np.int8,
+        np.int16,
+        np.int32,
+        np.int64,
+        np.uint8,
+        np.uint16,
+        np.uint32,
+        np.uint64,
+        np.longlong,
+        np.ulonglong,
+    }
+)
+
+
+def _require_exact_bool(name: str, value: object) -> bool:
+    if type(value) is not bool:
+        raise ValueError(f"{name} must be an exact bool")
+    return value
+
+
+def _require_non_negative_int(name: str, value: object) -> int:
+    if type(value) not in _ACTUAL_INT_TYPES:
+        raise ValueError(f"{name} must be a non-negative integer")
+    number = operator.index(cast(SupportsIndex, value))
+    if number < 0:
+        raise ValueError(f"{name} must be non-negative")
+    return number
 
 
 def safe_discrete_action(
@@ -25,8 +58,8 @@ def safe_discrete_action(
     conventional ``-1`` episode-start sentinel.
     """
 
-    if n_actions < 0:
-        raise ValueError("n_actions must be non-negative")
+    n_actions = _require_non_negative_int("n_actions", n_actions)
+    allow_unset = _require_exact_bool("allow_unset", allow_unset)
     if n_actions == 0:
         return (
             jnp.asarray(0, dtype=jnp.int32),
