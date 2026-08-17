@@ -45,6 +45,7 @@ from alberta_framework.benchmarks.micro_continual import (
     NONPROMOTING_POLICY,
     SEARCH_TASKS,
     BayesReference,
+    MicroRunResult,
     MicroStream,
     MicroStreamConfig,
     MicroTaskConfig,
@@ -1919,3 +1920,61 @@ def test_m3_applies_per_task_affine_transform() -> None:
     # two steps in the same task sharing an example agree exactly; across
     # tasks the transform differs.
     assert not np.array_equal(stream.xs[0], x_base[idx0])
+
+
+def _legal_micro_run_result(**overrides: object) -> MicroRunResult:
+    payload: dict[str, object] = {
+        "family": "input_permutation",
+        "arm_name": "sgd_raw",
+        "mechanism": "sgd",
+        "hyperparameters": {"step_size": 0.01, "weight_decay": 0.0},
+        "seed": 0,
+        "hidden1": 8,
+        "hidden2": 6,
+        "stream_config": TINY,
+        "per_regime_accuracy": np.zeros((TINY.n_regimes,)),
+        "per_regime_loss": np.zeros((TINY.n_regimes,)),
+        "per_regime_plasticity": np.zeros((TINY.n_regimes,)),
+        "overall_accuracy": 0.5,
+        "wall_clock_seconds": 1.0,
+    }
+    payload.update(overrides)
+    return MicroRunResult(**payload)  # type: ignore[arg-type]
+
+
+def test_micro_run_result_rejects_leftover_identities() -> None:
+    """Public micro result records must not keep leftover bool/NaN identities."""
+
+    with pytest.raises(ValueError, match="wall_clock_seconds"):
+        _legal_micro_run_result(wall_clock_seconds=True)
+    with pytest.raises(ValueError, match="wall_clock_seconds"):
+        _legal_micro_run_result(wall_clock_seconds=float("nan"))
+    with pytest.raises(ValueError, match="wall_clock_seconds"):
+        _legal_micro_run_result(wall_clock_seconds=float("inf"))
+    with pytest.raises(ValueError, match="overall_accuracy"):
+        _legal_micro_run_result(overall_accuracy=True)
+    with pytest.raises(ValueError, match="family"):
+        _legal_micro_run_result(family=True)
+    with pytest.raises(ValueError, match="seed"):
+        _legal_micro_run_result(seed=True)
+    with pytest.raises(ValueError, match="hidden1"):
+        _legal_micro_run_result(hidden1=True)
+
+    legal = _legal_micro_run_result()
+    dumped = json.dumps(
+        {
+            "family": legal.family,
+            "seed": legal.seed,
+            "hidden1": legal.hidden1,
+            "overall_accuracy": legal.overall_accuracy,
+            "wall_clock_seconds": legal.wall_clock_seconds,
+        },
+        allow_nan=False,
+    )
+    assert '"wall_clock_seconds": 1.0' in dumped
+    assert '"overall_accuracy": 0.5' in dumped
+    assert '"wall_clock_seconds": true' not in dumped
+    assert '"overall_accuracy": true' not in dumped
+    assert '"family": true' not in dumped
+    assert '"seed": true' not in dumped
+    assert '"hidden1": true' not in dumped
