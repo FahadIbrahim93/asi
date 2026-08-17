@@ -30,6 +30,8 @@ import numpy as np
 import numpy.typing as npt
 from jax import Array
 
+from alberta_framework._seed_validation import require_unique_jax_seeds
+from alberta_framework.core._float32_scalars import validated_float32_scalar
 from alberta_framework.core.interaction_features import (
     FixedBudgetInteractionLearner,
     InteractionFeatureState,
@@ -98,24 +100,59 @@ class RecurringFeatureProtocol:
 
     def validate(self) -> None:
         """Reject malformed protocols before allocating experiment arrays."""
-        if self.feature_dim < 6:
+        if type(self.feature_dim) is not int or self.feature_dim < 6:
             raise ValueError("feature_dim must be at least 6 for the declared task pairs")
-        if self.output_heads != len(TASK_NAMES):
+        if type(self.output_heads) is not int or self.output_heads != len(TASK_NAMES):
             raise ValueError(f"output_heads must be {len(TASK_NAMES)}")
-        if self.steps_per_phase < 1:
-            raise ValueError("steps_per_phase must be positive")
-        if self.target_amplitude <= 0.0:
-            raise ValueError("target_amplitude must be positive")
-        if self.active_pair_budget < 1:
-            raise ValueError("active_pair_budget must be positive")
-        if self.candidate_pair_budget < 1:
-            raise ValueError("candidate_pair_budget must be positive")
-        if self.heldout_samples < 1:
-            raise ValueError("heldout_samples must be positive")
-        if not 1 <= self.recovery_window <= self.steps_per_phase:
-            raise ValueError("recovery_window must be in [1, steps_per_phase]")
-        if self.recovery_nmse_threshold <= 0.0:
-            raise ValueError("recovery_nmse_threshold must be positive")
+        if type(self.steps_per_phase) is not int or self.steps_per_phase < 1:
+            raise ValueError("steps_per_phase must be a positive integer")
+        if type(self.active_pair_budget) is not int or self.active_pair_budget < 1:
+            raise ValueError("active_pair_budget must be a positive integer")
+        if type(self.candidate_pair_budget) is not int or self.candidate_pair_budget < 1:
+            raise ValueError("candidate_pair_budget must be a positive integer")
+        if type(self.replacement_interval) is not int or self.replacement_interval < 0:
+            raise ValueError("replacement_interval must be a non-negative integer")
+        if type(self.min_feature_age) is not int or self.min_feature_age < 0:
+            raise ValueError("min_feature_age must be a non-negative integer")
+        if type(self.candidate_min_age) is not int or self.candidate_min_age < 0:
+            raise ValueError("candidate_min_age must be a non-negative integer")
+        if type(self.heldout_samples) is not int or self.heldout_samples < 1:
+            raise ValueError("heldout_samples must be a positive integer")
+        if (
+            type(self.recovery_window) is not int
+            or not 1 <= self.recovery_window <= self.steps_per_phase
+        ):
+            raise ValueError("recovery_window must be an integer in [1, steps_per_phase]")
+
+        validated_float32_scalar("target_amplitude", self.target_amplitude, positive=True)
+        validated_float32_scalar("step_size_output", self.step_size_output, lower=0.0)
+        validated_float32_scalar("utility_decay", self.utility_decay, lower=0.0, upper=1.0)
+        validated_float32_scalar(
+            "retained_utility_decay", self.retained_utility_decay, lower=0.0, upper=1.0
+        )
+        validated_float32_scalar("promotion_margin", self.promotion_margin, lower=0.0)
+        validated_float32_scalar("promotion_blend", self.promotion_blend, lower=0.0, upper=1.0)
+        validated_float32_scalar(
+            "future_utility_mix", self.future_utility_mix, lower=0.0, upper=1.0
+        )
+        if self.candidate_utility_retention_decay is not None:
+            validated_float32_scalar(
+                "candidate_utility_retention_decay",
+                self.candidate_utility_retention_decay,
+                lower=0.0,
+                upper=1.0,
+            )
+        validated_float32_scalar("obgd_kappa", self.obgd_kappa, positive=True)
+        validated_float32_scalar(
+            "recovery_nmse_threshold", self.recovery_nmse_threshold, positive=True
+        )
+
+        if type(self.refresh_candidates) is not bool:
+            raise ValueError("refresh_candidates must be an actual bool")
+        if type(self.refresh_promoted_candidate) is not bool:
+            raise ValueError("refresh_promoted_candidate must be an actual bool")
+        if type(self.use_obgd) is not bool:
+            raise ValueError("use_obgd must be an actual bool")
 
 
 @dataclass(frozen=True, slots=True)
@@ -292,6 +329,39 @@ class RecurringFeatureGateCriteria:
     minimum_retention_rate_gain_over_baseline: float = 0.5
     minimum_critical_nmse_gain_over_baseline: float = 0.5
     require_recurrence_faster_than_acquisition: bool = True
+
+    def __post_init__(self) -> None:
+        """Validate criteria thresholds."""
+        if type(self.minimum_seeds) is not int or self.minimum_seeds < 1:
+            raise ValueError("minimum_seeds must be a positive integer")
+        if type(self.minimum_heldout_samples) is not int or self.minimum_heldout_samples < 1:
+            raise ValueError("minimum_heldout_samples must be a positive integer")
+        validated_float32_scalar(
+            "minimum_retained_all_critical_rate",
+            self.minimum_retained_all_critical_rate,
+            lower=0.0,
+            upper=1.0,
+        )
+        validated_float32_scalar(
+            "minimum_obsolete_eviction_rate",
+            self.minimum_obsolete_eviction_rate,
+            lower=0.0,
+            upper=1.0,
+        )
+        validated_float32_scalar(
+            "maximum_median_critical_nmse", self.maximum_median_critical_nmse, lower=0.0
+        )
+        validated_float32_scalar("minimum_median_obsolete_nmse", self.minimum_median_obsolete_nmse)
+        validated_float32_scalar(
+            "minimum_retention_rate_gain_over_baseline",
+            self.minimum_retention_rate_gain_over_baseline,
+        )
+        validated_float32_scalar(
+            "minimum_critical_nmse_gain_over_baseline",
+            self.minimum_critical_nmse_gain_over_baseline,
+        )
+        if type(self.require_recurrence_faster_than_acquisition) is not bool:
+            raise ValueError("require_recurrence_faster_than_acquisition must be an actual bool")
 
 
 class RecurringFeatureGateError(AssertionError):
@@ -612,13 +682,7 @@ def run_recurring_feature_gate(
     """
     chosen_protocol = protocol or RecurringFeatureProtocol()
     chosen_protocol.validate()
-    chosen_seeds = tuple(seeds)
-    if not chosen_seeds:
-        raise ValueError("seeds must contain at least one seed")
-    if len(set(chosen_seeds)) != len(chosen_seeds):
-        raise ValueError("seeds must be unique")
-    if any(seed < 0 or seed > np.iinfo(np.uint32).max for seed in chosen_seeds):
-        raise ValueError("seeds must be uint32-compatible non-negative integers")
+    chosen_seeds = tuple(require_unique_jax_seeds(tuple(seeds), name="seeds"))
 
     retained_learner = _make_learner(
         chosen_protocol,
