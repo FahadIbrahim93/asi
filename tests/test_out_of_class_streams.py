@@ -643,6 +643,39 @@ class TestOutOfClassPolynomialStream:
 class TestFrequencyMismatchStream:
     """Tests for the trigonometric out-of-class stream."""
 
+    @pytest.mark.parametrize(
+        "field",
+        [
+            "feature_dim",
+            "n_tasks",
+            "n_components_per_task",
+            "n_contexts",
+            "context_length",
+        ],
+    )
+    @pytest.mark.parametrize("value", [True, False, 1.0, np.int64(3), "3", None])
+    def test_dimensions_require_positive_builtin_ints(
+        self,
+        field: str,
+        value: object,
+    ) -> None:
+        with pytest.raises(ValueError, match=field):
+            FrequencyMismatchStream(**{field: value})  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize(
+        "field",
+        [
+            "feature_dim",
+            "n_tasks",
+            "n_components_per_task",
+            "n_contexts",
+            "context_length",
+        ],
+    )
+    def test_dimensions_reject_values_above_the_int32_domain(self, field: str) -> None:
+        with pytest.raises(ValueError, match=rf"{field}.*int32 max"):
+            FrequencyMismatchStream(**{field: 2**31})  # type: ignore[arg-type]
+
     @pytest.mark.parametrize("field", ["amplitude_scale", "noise_std"])
     @pytest.mark.parametrize(
         "value",
@@ -876,6 +909,41 @@ class TestFrequencyMismatchStream:
 
 class TestCompositionalStream:
     """Tests for the 2-hidden-layer compositional out-of-class stream."""
+
+    @pytest.mark.parametrize(
+        "field",
+        [
+            "feature_dim",
+            "n_tasks",
+            "inner_hidden",
+            "outer_components",
+            "n_contexts",
+            "context_length",
+        ],
+    )
+    @pytest.mark.parametrize("value", [True, False, 1.0, np.int64(3), "3", None])
+    def test_dimensions_require_positive_builtin_ints(
+        self,
+        field: str,
+        value: object,
+    ) -> None:
+        with pytest.raises(ValueError, match=field):
+            CompositionalStream(**{field: value})  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize(
+        "field",
+        [
+            "feature_dim",
+            "n_tasks",
+            "inner_hidden",
+            "outer_components",
+            "n_contexts",
+            "context_length",
+        ],
+    )
+    def test_dimensions_reject_values_above_the_int32_domain(self, field: str) -> None:
+        with pytest.raises(ValueError, match=rf"{field}.*int32 max"):
+            CompositionalStream(**{field: 2**31})  # type: ignore[arg-type]
 
     @pytest.mark.parametrize("field", ["feature_std", "amplitude_scale", "noise_std"])
     @pytest.mark.parametrize(
@@ -1222,3 +1290,59 @@ class TestCompositionalStream:
             f" small for a compositional oracle; target is out of class"
             f" only if a linear fit leaves substantial residual."
         )
+
+
+@pytest.mark.parametrize(
+    "stream",
+    [
+        FrequencyMismatchStream(
+            feature_dim=3,
+            n_tasks=2,
+            n_components_per_task=2,
+            n_contexts=2,
+        ),
+        CompositionalStream(
+            feature_dim=3,
+            n_tasks=2,
+            inner_hidden=2,
+            outer_components=2,
+            n_contexts=2,
+        ),
+    ],
+)
+def test_out_of_class_resource_budget_matches_resident_state(stream: object) -> None:
+    state = stream.init(jr.key(0))  # type: ignore[attr-defined]
+    actual_bytes = sum(int(leaf.nbytes) for leaf in jax.tree.leaves(state))
+    budget = stream.resource_budget  # type: ignore[attr-defined]
+    assert budget["state_bytes"] == actual_bytes
+    assert budget["state_scalars"] * 4 == actual_bytes
+
+
+def test_out_of_class_derived_state_budgets_fail_at_construction() -> None:
+    with pytest.raises(ValueError, match="frequency-mismatch.*64 MiB"):
+        FrequencyMismatchStream(
+            feature_dim=1,
+            n_tasks=1,
+            n_components_per_task=1,
+            n_contexts=4_194_304,
+        )
+    with pytest.raises(ValueError, match="compositional.*64 MiB"):
+        CompositionalStream(
+            feature_dim=1_000,
+            n_tasks=1,
+            inner_hidden=1_000,
+            outer_components=100,
+            n_contexts=1,
+        )
+
+
+@pytest.mark.parametrize(
+    "stream",
+    [FrequencyMismatchStream(), CompositionalStream()],
+)
+def test_out_of_class_step_clocks_saturate(stream: object) -> None:
+    state = stream.init(jr.key(1)).replace(  # type: ignore[attr-defined]
+        step_count=jnp.asarray(2**31 - 1, dtype=jnp.int32)
+    )
+    _, advanced = stream.step(state, jnp.asarray(0, dtype=jnp.int32))  # type: ignore[attr-defined]
+    assert int(advanced.step_count) == 2**31 - 1

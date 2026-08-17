@@ -49,6 +49,69 @@ from alberta_framework.core.types import TimeStep
 
 _FLOAT32_MULTIPLIER_MAX = float(np.sqrt(np.finfo(np.float32).max))
 _INT32_MAX = int(np.iinfo(np.int32).max)
+_MAX_OUT_OF_CLASS_STATE_BYTES = 64 * 1024 * 1024
+
+
+def _require_positive_dimension(name: str, value: object) -> int:
+    """Return a positive builtin int inside the int32 host-dimension domain."""
+    canonical = require_positive_builtin_int(value, name=name)
+    if canonical > _INT32_MAX:
+        raise ValueError(f"{name} must be at most int32 max")
+    return canonical
+
+
+def _require_state_budget(name: str, array_scalars: int) -> dict[str, int]:
+    """Preflight one resident float32/int32 state plus its typed PRNG key."""
+    state_scalars = array_scalars + 2
+    state_bytes = 4 * state_scalars
+    if state_scalars > _INT32_MAX:
+        raise ValueError(f"{name} state scalar count must fit signed int32")
+    if state_bytes > _INT32_MAX:
+        raise ValueError(f"{name} state byte count must fit signed int32")
+    if state_bytes > _MAX_OUT_OF_CLASS_STATE_BYTES:
+        raise ValueError(f"{name} state exceeds the 64 MiB budget")
+    return {
+        "array_scalars": array_scalars,
+        "key_words": 2,
+        "state_scalars": state_scalars,
+        "state_bytes": state_bytes,
+    }
+
+
+def _frequency_state_budget(
+    *, n_contexts: int, n_tasks: int, n_components_per_task: int
+) -> dict[str, int]:
+    tensor_scalars = n_contexts * n_tasks * n_components_per_task
+    budget = _require_state_budget("frequency-mismatch", 4 * tensor_scalars + 1)
+    return {"tensor_scalars": tensor_scalars, **budget}
+
+
+def _compositional_state_budget(
+    *,
+    feature_dim: int,
+    n_tasks: int,
+    inner_hidden: int,
+    outer_components: int,
+    n_contexts: int,
+) -> dict[str, int]:
+    component_scalars = n_contexts * n_tasks * outer_components
+    outer_scalars = component_scalars * inner_hidden
+    inner_weight_scalars = outer_scalars * feature_dim
+    state_scalars = inner_weight_scalars + 2 * outer_scalars + 2 * component_scalars + 1
+    budget = _require_state_budget("compositional", state_scalars)
+    return {
+        "inner_weight_scalars": inner_weight_scalars,
+        "outer_scalars": outer_scalars,
+        "component_scalars": component_scalars,
+        **budget,
+    }
+
+
+def _saturating_step_count(step_count: Array) -> Array:
+    maximum = jnp.asarray(_INT32_MAX, dtype=jnp.int32)
+    return jnp.minimum(jnp.maximum(step_count, 0), maximum - 1) + 1
+
+
 _SUPPORTED_NUMPY_REAL_SCALAR_TYPES: tuple[type[object], ...] = (
     np.int8,
     np.int16,
@@ -467,16 +530,19 @@ class FrequencyMismatchStream:
                 a centered Gaussian times this factor).
             noise_std: Standard deviation of target noise.
         """
-        if feature_dim < 1:
-            raise ValueError("feature_dim must be positive")
-        if n_tasks < 1:
-            raise ValueError("n_tasks must be positive")
-        if n_components_per_task < 1:
-            raise ValueError("n_components_per_task must be positive")
-        if n_contexts < 1:
-            raise ValueError("n_contexts must be positive")
-        if context_length < 1:
-            raise ValueError("context_length must be positive")
+        feature_dim = _require_positive_dimension("feature_dim", feature_dim)
+        n_tasks = _require_positive_dimension("n_tasks", n_tasks)
+        n_components_per_task = _require_positive_dimension(
+            "n_components_per_task",
+            n_components_per_task,
+        )
+        n_contexts = _require_positive_dimension("n_contexts", n_contexts)
+        context_length = _require_positive_dimension("context_length", context_length)
+        resource_budget = _frequency_state_budget(
+            n_contexts=n_contexts,
+            n_tasks=n_tasks,
+            n_components_per_task=n_components_per_task,
+        )
         omega_min_float32 = _require_positive_float32(omega_min, "omega_min")
         omega_max_float32 = _require_positive_float32(omega_max, "omega_max")
         if omega_max_float32 <= omega_min_float32:
@@ -499,6 +565,7 @@ class FrequencyMismatchStream:
             name="noise_std",
             nonnegative=True,
         )
+        self._resource_budget = resource_budget
 
     @property
     def feature_dim(self) -> int:
@@ -509,6 +576,11 @@ class FrequencyMismatchStream:
     def target_dim(self) -> int:
         """Return the number of supervised tasks."""
         return self._n_tasks
+
+    @property
+    def resource_budget(self) -> dict[str, int]:
+        """Complete resident state payload accounting."""
+        return dict(self._resource_budget)
 
     def init(self, key: Array) -> FrequencyMismatchState:
         """Initialize stream state.
@@ -586,7 +658,8 @@ class FrequencyMismatchStream:
 
         timestep = TimeStep(observation=x, target=target)
         new_state = state.replace(  # type: ignore[attr-defined]
-            key=key, step_count=state.step_count + 1
+            key=key,
+            step_count=_saturating_step_count(state.step_count),
         )
         return timestep, new_state
 
@@ -702,18 +775,22 @@ class CompositionalStream:
             amplitude_scale: Scale of per-component output amplitudes.
             noise_std: Standard deviation of target noise.
         """
-        if feature_dim < 1:
-            raise ValueError("feature_dim must be positive")
-        if n_tasks < 1:
-            raise ValueError("n_tasks must be positive")
-        if inner_hidden < 1:
-            raise ValueError("inner_hidden must be positive")
-        if outer_components < 1:
-            raise ValueError("outer_components must be positive")
-        if n_contexts < 1:
-            raise ValueError("n_contexts must be positive")
-        if context_length < 1:
-            raise ValueError("context_length must be positive")
+        feature_dim = _require_positive_dimension("feature_dim", feature_dim)
+        n_tasks = _require_positive_dimension("n_tasks", n_tasks)
+        inner_hidden = _require_positive_dimension("inner_hidden", inner_hidden)
+        outer_components = _require_positive_dimension(
+            "outer_components",
+            outer_components,
+        )
+        n_contexts = _require_positive_dimension("n_contexts", n_contexts)
+        context_length = _require_positive_dimension("context_length", context_length)
+        resource_budget = _compositional_state_budget(
+            feature_dim=feature_dim,
+            n_tasks=n_tasks,
+            inner_hidden=inner_hidden,
+            outer_components=outer_components,
+            n_contexts=n_contexts,
+        )
         feature_std_float32 = _require_finite_float32_multiplier(
             feature_std,
             name="feature_std",
@@ -746,6 +823,7 @@ class CompositionalStream:
         self._weight_scale = weight_scale_float32
         self._amplitude_scale = amplitude_scale_float32
         self._noise_std = noise_std_float32
+        self._resource_budget = resource_budget
 
     @property
     def feature_dim(self) -> int:
@@ -756,6 +834,11 @@ class CompositionalStream:
     def target_dim(self) -> int:
         """Return the number of supervised tasks."""
         return self._n_tasks
+
+    @property
+    def resource_budget(self) -> dict[str, int]:
+        """Complete resident state payload accounting."""
+        return dict(self._resource_budget)
 
     def init(self, key: Array) -> CompositionalState:
         """Initialize stream state.
@@ -856,6 +939,7 @@ class CompositionalStream:
 
         timestep = TimeStep(observation=x, target=target)
         new_state = state.replace(  # type: ignore[attr-defined]
-            key=key, step_count=state.step_count + 1
+            key=key,
+            step_count=_saturating_step_count(state.step_count),
         )
         return timestep, new_state
