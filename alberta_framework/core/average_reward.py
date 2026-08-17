@@ -112,12 +112,7 @@ def _preflight_actor_state(
     # every trunk and head weight/bias array, in addition to parameters,
     # traces, utilities, counters, and its average-reward vector.
     critic_lms_state_scalars = 2 * len(hidden_sizes) + 2
-    critic_scalar_count = (
-        2 * critic_parameters
-        + sum(hidden_sizes)
-        + critic_lms_state_scalars
-        + 5
-    )
+    critic_scalar_count = 2 * critic_parameters + sum(hidden_sizes) + critic_lms_state_scalars + 5
     scalar_count = actor_scalar_count + critic_scalar_count
     _require_state_resources(
         "average-reward actor-critic",
@@ -208,12 +203,23 @@ class DifferentialTDConfig:
 
     def __post_init__(self) -> None:
         """Validate scalar hyperparameters."""
-        if self.step_size < 0.0:
-            raise ValueError("step_size must be non-negative")
-        if self.average_reward_step_size < 0.0:
-            raise ValueError("average_reward_step_size must be non-negative")
-        if not 0.0 <= self.trace_decay <= 1.0:
-            raise ValueError("trace_decay must be in [0, 1]")
+        object.__setattr__(
+            self,
+            "step_size",
+            validated_float32_scalar("step_size", self.step_size, lower=0.0),
+        )
+        object.__setattr__(
+            self,
+            "average_reward_step_size",
+            validated_float32_scalar(
+                "average_reward_step_size", self.average_reward_step_size, lower=0.0
+            ),
+        )
+        object.__setattr__(
+            self,
+            "trace_decay",
+            validated_float32_scalar("trace_decay", self.trace_decay, lower=0.0, upper=1.0),
+        )
 
     def to_config(self) -> dict[str, Any]:
         """Serialize this config to a dictionary."""
@@ -302,16 +308,33 @@ class DifferentialGTDConfig:
 
     def __post_init__(self) -> None:
         """Validate scalar hyperparameters."""
-        if self.value_step_size < 0.0:
-            raise ValueError("value_step_size must be non-negative")
-        if self.secondary_step_size < 0.0:
-            raise ValueError("secondary_step_size must be non-negative")
-        if self.average_reward_step_size < 0.0:
-            raise ValueError("average_reward_step_size must be non-negative")
-        if not 0.0 <= self.trace_decay <= 1.0:
-            raise ValueError("trace_decay must be in [0, 1]")
-        if self.ratio_clip <= 0.0:
-            raise ValueError("ratio_clip must be positive")
+        object.__setattr__(
+            self,
+            "value_step_size",
+            validated_float32_scalar("value_step_size", self.value_step_size, lower=0.0),
+        )
+        object.__setattr__(
+            self,
+            "secondary_step_size",
+            validated_float32_scalar("secondary_step_size", self.secondary_step_size, lower=0.0),
+        )
+        object.__setattr__(
+            self,
+            "average_reward_step_size",
+            validated_float32_scalar(
+                "average_reward_step_size", self.average_reward_step_size, lower=0.0
+            ),
+        )
+        object.__setattr__(
+            self,
+            "trace_decay",
+            validated_float32_scalar("trace_decay", self.trace_decay, lower=0.0, upper=1.0),
+        )
+        object.__setattr__(
+            self,
+            "ratio_clip",
+            validated_float32_scalar("ratio_clip", self.ratio_clip, positive=True),
+        )
 
     def to_config(self) -> dict[str, Any]:
         """Serialize this config to a dictionary."""
@@ -653,9 +676,7 @@ class AverageRewardHordeActorCriticAgent:
         """Initialize critic and actor state."""
         observation_dim = _require_int32("observation_dim", observation_dim, minimum=1)
         actor_dim = self._config.hidden_sizes[-1] if self._config.hidden_sizes else observation_dim
-        _preflight_actor_state(
-            self._config.n_actions, observation_dim, self._config.hidden_sizes
-        )
+        _preflight_actor_state(self._config.n_actions, observation_dim, self._config.hidden_sizes)
         key, critic_key = jr.split(key)
         critic_state = self._critic.init(observation_dim, critic_key)
         actor_opt_w = self._actor_optimizer.init_for_shape((self._config.n_actions, actor_dim))
@@ -946,12 +967,17 @@ class AverageRewardHordeLearner:
         leaky_relu_slope: float = 0.01,
     ):
         """Initialize the average-reward Horde."""
-        if n_demons < 1:
-            raise ValueError("n_demons must be positive")
-        if average_reward_step_size < 0.0:
-            raise ValueError("average_reward_step_size must be non-negative")
-        if not 0.0 <= trace_decay <= 1.0:
-            raise ValueError("trace_decay must be in [0, 1]")
+        n_demons = _require_int32("n_demons", n_demons, minimum=1)
+        hidden_sizes = _validate_hidden_sizes(hidden_sizes)
+        step_size = validated_float32_scalar("step_size", step_size, lower=0.0)
+        average_reward_step_size = validated_float32_scalar(
+            "average_reward_step_size", average_reward_step_size, lower=0.0
+        )
+        trace_decay = validated_float32_scalar("trace_decay", trace_decay, lower=0.0, upper=1.0)
+        sparsity = validated_float32_scalar("sparsity", sparsity, lower=0.0, upper=1.0)
+        leaky_relu_slope = validated_float32_scalar("leaky_relu_slope", leaky_relu_slope, lower=0.0)
+        if type(use_layer_norm) is not bool:
+            raise ValueError("use_layer_norm must be an actual bool")
         self._n_demons = n_demons
         self._hidden_sizes = hidden_sizes
         self._step_size = step_size
