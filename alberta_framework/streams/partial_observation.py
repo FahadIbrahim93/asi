@@ -94,7 +94,9 @@ class PartialObservationWrapper[InnerStateT]:
             expectation.
         schedule: Tuple of boolean masks of shape ``(feature_dim,)``;
             cycled each step under PERIODIC mode.
-        sentinel: Value that replaces masked entries (default ``0.0``).
+        sentinel: Finite real that replaces masked entries (default ``0.0``).
+            Boolean and non-finite values are rejected so a hidden channel
+            cannot silently become ``1.0``, ``NaN``, or ``Inf``.
 
     Examples
     --------
@@ -122,7 +124,7 @@ class PartialObservationWrapper[InnerStateT]:
         self._inner = inner
         self._mode = mode
         self._mask_prob = mask_prob
-        self._sentinel = sentinel
+        self._sentinel = validated_float32_scalar("sentinel", sentinel)
 
         feature_dim = inner.feature_dim
 
