@@ -1748,6 +1748,23 @@ class PrototypeExperientialMemoryResourceDeclaration:
     score_mass_values_interpreted: int
     hard_safety_values_interpreted: int
 
+    def __post_init__(self) -> None:
+        for name in (
+            "persistent_state_bytes",
+            "categorical_policy_queries",
+            "causal_step_queries",
+            "total_deterministic_prestate_queries",
+            "writes_attempted",
+            "random_draws",
+            "score_mass_values_interpreted",
+            "hard_safety_values_interpreted",
+        ):
+            object.__setattr__(
+                self,
+                name,
+                _require_int(name, getattr(self, name), minimum=0),
+            )
+
     def to_config(self) -> dict[str, int]:
         """Return the exact JSON-compatible resource declaration."""
 
