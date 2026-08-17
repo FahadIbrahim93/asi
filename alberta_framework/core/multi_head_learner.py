@@ -471,8 +471,23 @@ class MultiHeadMLPLearner:
             raise ValueError(
                 "per_head_gamma_lamda must be an actual tuple when constructed directly"
             )
-        if not 0.0 <= utility_decay < 1.0:
-            raise ValueError("utility_decay must be in [0, 1)")
+        sparsity = validated_float32_scalar("sparsity", sparsity, lower=0.0, upper=1.0)
+        leaky_relu_slope = validated_float32_scalar(
+            "leaky_relu_slope", leaky_relu_slope, lower=0.0
+        )
+        gamma = validated_float32_scalar("gamma", gamma, lower=0.0, upper=1.0)
+        lamda = validated_float32_scalar("lamda", lamda, lower=0.0, upper=1.0)
+        if type(use_layer_norm) is not bool:
+            raise ValueError("use_layer_norm must be an exact bool")
+        if type(trace_mode) is not TraceMode:
+            raise ValueError("trace_mode must be a TraceMode")
+        utility_decay = validated_float32_scalar(
+            "utility_decay",
+            utility_decay,
+            lower=0.0,
+            upper=1.0,
+            upper_inclusive=False,
+        )
 
         self._n_heads = n_heads
         self._hidden_sizes = hidden_sizes

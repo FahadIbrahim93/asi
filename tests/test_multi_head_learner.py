@@ -463,7 +463,7 @@ class TestMultiHeadUpdateAllActive:
 
 
 class TestMultiHeadConstructorValidation:
-    """``per_head_gamma_lamda`` values must be finite and in [0, 1]."""
+    """Constructor scalars that reach init/to_config must be finite identities."""
 
     def test_rejects_wrong_length_per_head_gamma_lamda(self):
         """The tuple must have exactly one value per head."""
@@ -517,6 +517,104 @@ class TestMultiHeadConstructorValidation:
 
         values = learner.to_config()["per_head_gamma_lamda"]
         assert all(type(value) is float for value in values)
+
+    def test_legal_sparsity_and_slope_defaults_stay_bit_identical(self):
+        learner = MultiHeadMLPLearner(n_heads=1, hidden_sizes=())
+        assert learner._sparsity == 0.9
+        assert type(learner._sparsity) is float
+        assert learner._leaky_relu_slope == 0.01
+        assert type(learner._leaky_relu_slope) is float
+        assert learner._gamma == 0.0
+        assert learner._lamda == 0.0
+        assert learner._use_layer_norm is True
+        assert learner._utility_decay == 0.99
+        assert type(learner._utility_decay) is float
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("sparsity", float("nan")),
+            ("sparsity", float("inf")),
+            ("sparsity", True),
+            ("sparsity", -0.1),
+            ("sparsity", 1.5),
+            ("leaky_relu_slope", float("nan")),
+            ("leaky_relu_slope", True),
+            ("leaky_relu_slope", -0.01),
+            ("gamma", float("nan")),
+            ("gamma", True),
+            ("gamma", -0.1),
+            ("lamda", float("nan")),
+            ("lamda", True),
+            ("lamda", 1.5),
+            ("utility_decay", float("nan")),
+            ("utility_decay", True),
+            ("utility_decay", 1.0),
+        ],
+    )
+    def test_rejects_non_finite_bool_and_out_of_range_constructor_scalars(
+        self, field: str, value: object
+    ):
+        kwargs: dict[str, object] = {
+            "n_heads": 1,
+            "hidden_sizes": (),
+            "sparsity": 0.0,
+            "step_size": 0.01,
+        }
+        kwargs[field] = value
+        with pytest.raises(ValueError, match=field):
+            MultiHeadMLPLearner(**kwargs)  # type: ignore[arg-type]
+
+    def test_true_sparsity_does_not_serialize_as_full_mask(self):
+        with pytest.raises(ValueError, match="sparsity"):
+            MultiHeadMLPLearner(n_heads=1, hidden_sizes=(), sparsity=True)
+
+    def test_true_gamma_does_not_store_as_undiscounted_one(self):
+        with pytest.raises(ValueError, match="gamma"):
+            MultiHeadMLPLearner(n_heads=1, hidden_sizes=(), gamma=True, lamda=0.0)
+
+    def test_use_layer_norm_requires_exact_bool(self):
+        with pytest.raises(ValueError, match="use_layer_norm"):
+            MultiHeadMLPLearner(n_heads=1, hidden_sizes=(), use_layer_norm=1)  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="use_layer_norm"):
+            MultiHeadMLPLearner(
+                n_heads=1, hidden_sizes=(), use_layer_norm="true"  # type: ignore[arg-type]
+            )
+
+    def test_trace_mode_requires_the_enum(self):
+        with pytest.raises(ValueError, match="trace_mode"):
+            MultiHeadMLPLearner(
+                n_heads=1,
+                hidden_sizes=(),
+                trace_mode="accumulating",  # type: ignore[arg-type]
+            )
+
+    def test_from_config_rejects_nan_sparsity_and_bool_gamma(self):
+        config = MultiHeadMLPLearner(n_heads=1, hidden_sizes=(), sparsity=0.0).to_config()
+        poisoned = dict(config)
+        poisoned["sparsity"] = float("nan")
+        with pytest.raises(ValueError, match="sparsity"):
+            MultiHeadMLPLearner.from_config(poisoned)
+        poisoned = dict(config)
+        poisoned["gamma"] = True
+        with pytest.raises(ValueError, match="gamma"):
+            MultiHeadMLPLearner.from_config(poisoned)
+
+    def test_rejects_class_spoofed_sparsity_without_invoking_float(self):
+        class Spoof:
+            @property
+            def __class__(self) -> type[float]:  # type: ignore[override]
+                return float
+
+            def __float__(self) -> float:
+                raise RuntimeError("must not run")
+
+        with pytest.raises(ValueError, match="sparsity"):
+            MultiHeadMLPLearner(
+                n_heads=1,
+                hidden_sizes=(),
+                sparsity=Spoof(),  # type: ignore[arg-type]
+            )
 
 
 class TestMultiHeadUpdateValidation:
