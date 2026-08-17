@@ -706,6 +706,24 @@ def _require_gvf_cumulant_index(value: object) -> int:
     return number
 
 
+def _require_gvf_terminal_reward(value: object) -> float:
+    """Validate terminal_reward without executing hooks on untrusted subclasses.
+
+    Float subclasses are checked hook-free (``math.isfinite`` reads the
+    underlying binary64 directly) and kept as-is so downstream exact-schema
+    validators can reject their identity before any ``__float__``,
+    ``as_integer_ratio``, or ``__repr__`` override runs.  Exact builtins and
+    other reals take the full float32 validation path.
+    """
+    actual_type = type(value)
+    if actual_type is not float and issubclass(actual_type, float):
+        subclass_value = cast(float, value)
+        if not math.isfinite(subclass_value):
+            raise ValueError("terminal_reward must be a finite real number")
+        return subclass_value
+    return validated_float32_scalar("terminal_reward", value)
+
+
 @chex.dataclass(frozen=True)
 class GVFSpec:
     """One GVF demon's question functions (Sutton et al. 2011).
@@ -737,9 +755,7 @@ class GVFSpec:
         gamma = _normalized_gvf_probability("gamma", self.gamma)
         lamda = _normalized_gvf_probability("lamda", self.lamda)
         cumulant_index = _require_gvf_cumulant_index(self.cumulant_index)
-        terminal_reward = validated_float32_scalar(
-            "terminal_reward", self.terminal_reward
-        )
+        terminal_reward = _require_gvf_terminal_reward(self.terminal_reward)
         object.__setattr__(self, "name", name)
         object.__setattr__(self, "gamma", gamma)
         object.__setattr__(self, "lamda", lamda)
