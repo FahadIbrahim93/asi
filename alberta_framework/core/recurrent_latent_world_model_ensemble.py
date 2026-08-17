@@ -647,12 +647,27 @@ class RecurrentLatentWorldModelResourceBudget:
     replay_capacity: int
 
     def __post_init__(self) -> None:
+        if type(self) is not RecurrentLatentWorldModelResourceBudget:
+            raise ValueError(
+                "resource budget must be an exact RecurrentLatentWorldModelResourceBudget"
+            )
+        for name, minimum in (
+            ("ensemble_size", 2),
+            ("observation_dim", 1),
+            ("latent_dim", 1),
+            ("target_dim", 1),
+            ("trainable_scalars_per_member", 1),
+            ("max_event_count", 1),
+            ("max_member_update_count", 1),
+        ):
+            object.__setattr__(
+                self,
+                name,
+                _nonnegative_int(getattr(self, name), name=name, maximum=_INT32_MAX),
+            )
+            if getattr(self, name) < minimum:
+                raise ValueError(f"{name} must be at least {minimum}")
         for name in (
-            "ensemble_size",
-            "observation_dim",
-            "latent_dim",
-            "target_dim",
-            "trainable_scalars_per_member",
             "total_trainable_scalars",
             "persistent_float32_scalars",
             "persistent_int32_scalars",
@@ -671,8 +686,6 @@ class RecurrentLatentWorldModelResourceBudget:
             "member_gradient_candidates_per_event",
             "max_member_parameter_updates_per_event",
             "recurrent_advances_per_accepted_event",
-            "max_event_count",
-            "max_member_update_count",
             "replay_capacity",
         ):
             object.__setattr__(
@@ -680,6 +693,101 @@ class RecurrentLatentWorldModelResourceBudget:
                 name,
                 _nonnegative_int(getattr(self, name), name=name, maximum=_INT32_MAX),
             )
+        ensemble = self.ensemble_size
+        observation = self.observation_dim
+        latent = self.latent_dim
+        target = observation + 2
+        trainable = self.trainable_scalars_per_member
+
+        # The action count is not carried in this record, but the architecture
+        # formula is linear in that positive dimension.  Require the stored
+        # per-member count to identify one attainable configured architecture.
+        fixed_trainable = (
+            3 * latent * (observation + latent)
+            + 3 * latent
+            + 2 * target * (latent + 1)
+        )
+        action_contribution = trainable - fixed_trainable
+        if action_contribution < 3 * latent or action_contribution % (3 * latent) != 0:
+            raise ValueError(
+                "trainable_scalars_per_member does not identify a positive action dimension"
+            )
+
+        persistent_f32 = ensemble * (trainable + latent)
+        persistent_i32 = ensemble + 3
+        persistent_u32 = 2
+        persistent_bool = ensemble
+        persistent_scalars = persistent_f32 + persistent_i32 + persistent_u32 + persistent_bool
+
+        prediction_f32 = (
+            4 * ensemble * target
+            + 5 * target
+            + ensemble * observation
+            + observation
+            + 2 * ensemble
+            + 4
+            + ensemble * latent
+        )
+        prediction_bool = 5
+        start_f32 = ensemble * latent + observation
+        start_scalars = start_f32 + 2
+        start_bytes = 4 * (start_f32 + 1) + 1
+        decision_f32 = start_f32 + prediction_f32
+        decision_i32 = 2
+        decision_bool = prediction_bool + 1
+        decision_scalars = decision_f32 + decision_i32 + decision_bool
+        decision_bytes = 4 * (decision_f32 + decision_i32) + decision_bool
+
+        update_extra_f32 = target + ensemble + observation + 2
+        update_extra_bool = 1 + 2 * ensemble
+        diagnostics_bool = 15 + 2 * ensemble
+        update_scalars = (
+            persistent_scalars
+            + prediction_f32
+            + prediction_bool
+            + update_extra_f32
+            + update_extra_bool
+            + start_scalars
+            + diagnostics_bool
+        )
+        update_bytes = (
+            4 * (persistent_f32 + persistent_i32 + persistent_u32)
+            + persistent_bool
+            + 4 * prediction_f32
+            + prediction_bool
+            + 4 * update_extra_f32
+            + update_extra_bool
+            + start_bytes
+            + diagnostics_bool
+        )
+        expected = {
+            "target_dim": target,
+            "total_trainable_scalars": ensemble * trainable,
+            "persistent_float32_scalars": persistent_f32,
+            "persistent_int32_scalars": persistent_i32,
+            "persistent_uint32_scalars": persistent_u32,
+            "persistent_bool_scalars": persistent_bool,
+            "persistent_state_scalars": persistent_scalars,
+            "persistent_state_bytes": 4
+            * (persistent_f32 + persistent_i32 + persistent_u32)
+            + persistent_bool,
+            "bootstrap_prng_keys": 1,
+            "bootstrap_prng_uint32_scalars": 2,
+            "start_cache_logical_scalars": start_scalars,
+            "start_cache_logical_bytes": start_bytes,
+            "decision_cache_logical_scalars": decision_scalars,
+            "decision_cache_logical_bytes": decision_bytes,
+            "update_result_logical_scalars": update_scalars,
+            "update_result_logical_bytes": update_bytes,
+            "member_gradient_candidates_per_event": ensemble,
+            "max_member_parameter_updates_per_event": ensemble,
+            "recurrent_advances_per_accepted_event": 1,
+            "max_member_update_count": self.max_event_count,
+            "replay_capacity": 0,
+        }
+        for name, expected_value in expected.items():
+            if getattr(self, name) != expected_value:
+                raise ValueError(f"{name} does not match the recurrent-latent implementation")
 
     def to_config(self) -> dict[str, int]:
         """Return exact JSON-compatible accounting."""
