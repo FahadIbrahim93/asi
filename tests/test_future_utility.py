@@ -155,6 +155,16 @@ def test_contribution_trace_has_no_future_label_leakage() -> None:
 def test_trace_decay_from_half_life() -> None:
     assert float(trace_decay_from_half_life(0.0)) == 0.0
     assert abs(float(trace_decay_from_half_life(10.0) ** 10) - 0.5) < 1e-6
+    assert abs(float(trace_decay_from_half_life(np.float64(10.0)) ** 10) - 0.5) < 1e-6
+
+
+@pytest.mark.parametrize(
+    "value",
+    [True, False, float("nan"), float("inf"), -1.0],
+)
+def test_trace_decay_from_half_life_rejects_host_identities(value: object) -> None:
+    with pytest.raises(ValueError, match="half_life"):
+        trace_decay_from_half_life(value)  # type: ignore[arg-type]
 
 
 def test_future_utility_normalization_is_finite_and_causal() -> None:

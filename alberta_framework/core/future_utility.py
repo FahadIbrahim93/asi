@@ -18,6 +18,7 @@ from jax import Array
 from jaxtyping import Bool, Float
 
 from alberta_framework._float32 import round_real_to_float32_with_ratio
+from alberta_framework.core._float32_scalars import validated_float32_scalar
 
 _ACTUAL_DECAY_TYPES = frozenset(
     {
@@ -94,7 +95,13 @@ def trace_decay_from_half_life(half_life: float | Array) -> Float[Array, ""]:
     A half-life of ``0`` disables the trace.  Positive half-lives use
     ``0.5 ** (1 / half_life)`` so the trace contribution decays by half after
     that many time steps.
+
+    Host scalars are validated before JAX conversion so ``True`` cannot become
+    half-life ``1`` (decay ``0.5``) and non-finite values cannot become
+    ``nan``/``1.0`` decays. JAX arrays and tracers keep the device formula.
     """
+    if not isinstance(half_life, Array) and not hasattr(half_life, "aval"):
+        half_life = validated_float32_scalar("half_life", half_life, lower=0.0)
     half_life_arr = jnp.asarray(half_life, dtype=jnp.float32)
     return jnp.where(
         half_life_arr <= 0.0,
