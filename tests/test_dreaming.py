@@ -19,6 +19,7 @@ from alberta_framework.core.dreaming import (
     DreamWorldModelPrediction,
     GuardedDreamer,
     RecentObservationBuffer,
+    action_features,
     dream_one_step,
     dream_rollout,
     imagined_rollout_to_gvf_items,
@@ -594,3 +595,20 @@ def test_dream_rollout_config_rejects_invalid_rollout_horizon(bad: object) -> No
 def test_dream_rollout_config_rejects_non_bool_stop_on_terminal(bad: object) -> None:
     with pytest.raises(ValueError, match="stop_on_terminal"):
         DreamRolloutConfig(stop_on_terminal=bad)  # type: ignore[arg-type]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("bad", [True, False, 1.5, 0, -1, 2**31, float("nan"), "2"])
+def test_action_features_rejects_non_int_n_actions(bad: object) -> None:
+    action = jnp.asarray(0, dtype=jnp.int32)
+    with pytest.raises(ValueError, match="n_actions"):
+        action_features(action, bad)  # type: ignore[arg-type]
+
+
+@pytest.mark.unit
+def test_action_features_accepts_numpy_ints_and_omitted_width() -> None:
+    action = jnp.asarray(1, dtype=jnp.int32)
+    one_hot = action_features(action, np.int64(3))
+    chex.assert_trees_all_close(one_hot, jnp.array([0.0, 1.0, 0.0], dtype=jnp.float32))
+    raw = action_features(action)
+    chex.assert_trees_all_close(raw, jnp.array([1.0], dtype=jnp.float32))
