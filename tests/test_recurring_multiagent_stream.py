@@ -62,13 +62,37 @@ def test_invalid_configuration_is_rejected(
 
 
 def test_initial_positions_reject_boolean_identities() -> None:
-    import numpy as np
-
     legal = RecurringTwoAgentWorld(initial_positions=(-0.5, 0.5))
     assert legal._initial_positions_tuple == (-0.5, 0.5)
     for positions in ((True, False), (np.True_, 0.0), (1.0, np.bool_(False))):
         with pytest.raises(ValueError, match="initial_positions"):
             RecurringTwoAgentWorld(initial_positions=positions)
+
+
+def test_initial_positions_validate_container_and_numeric_hooks_before_allocation() -> None:
+    class HostileTuple(tuple):
+        def __len__(self) -> int:
+            raise AssertionError("hostile length hook executed")
+
+    class ExplodingFloat(float):
+        def as_integer_ratio(self) -> tuple[int, int]:
+            raise RuntimeError("hostile ratio hook")
+
+        def __repr__(self) -> str:
+            raise AssertionError("hostile repr hook executed")
+
+    with pytest.raises(ValueError, match="exact 2-tuple"):
+        RecurringTwoAgentWorld(initial_positions=HostileTuple((-0.5, 0.5)))
+    with pytest.raises(ValueError, match=r"initial_positions\[0\]"):
+        RecurringTwoAgentWorld(initial_positions=(ExplodingFloat(0.25), 0.5))
+
+
+def test_initial_positions_canonicalize_supported_numpy_scalars() -> None:
+    world = RecurringTwoAgentWorld(
+        initial_positions=(np.float64(-0.25), np.int16(0)),
+    )
+    assert world._initial_positions_tuple == (-0.25, 0.0)
+    assert all(type(value) is float for value in world._initial_positions_tuple)
 
 
 def test_visible_context_sequence_recurs_a_b_a() -> None:
