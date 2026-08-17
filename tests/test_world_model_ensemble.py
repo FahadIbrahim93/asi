@@ -208,6 +208,18 @@ def test_init_uses_distinct_member_keys_and_isolated_real_replay_mask_keys() -> 
     )
 
 
+def test_resource_budget_counts_member_lifetime_words_and_matches_state() -> None:
+    ensemble = WorldModelEnsemble(_config())
+    state = ensemble.init(jr.key(0))
+    budget = ensemble.resource_budget(state)
+    leaves = jax.tree.leaves(_materialize_keys(state))
+    expected_scalars = sum(int(jnp.asarray(leaf).size) for leaf in leaves)
+    expected_bytes = sum(int(jnp.asarray(leaf).nbytes) for leaf in leaves)
+    assert budget.persistent_state_scalars == expected_scalars
+    assert budget.persistent_state_bytes == expected_bytes
+    assert budget.persistent_uint32_scalars == 2 * budget.ensemble_size + 4
+
+
 def test_predict_is_read_only_and_fail_closed() -> None:
     ensemble = WorldModelEnsemble(_config())
     state = ensemble.init(jr.key(0))

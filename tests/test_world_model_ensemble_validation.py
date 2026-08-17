@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from types import MappingProxyType
+
 import numpy as np
 import pytest
 
 from alberta_framework.core.learning_signals import LearningSignalEstimatorConfig
 from alberta_framework.core.world_model import ActionConditionedWorldModelConfig
-from alberta_framework.core.world_model_ensemble import WorldModelEnsembleConfig
+from alberta_framework.core.world_model_ensemble import WorldModelEnsemble, WorldModelEnsembleConfig
 
 _INT32_MAX = 2**31 - 1
 
@@ -199,24 +201,24 @@ def test_wm_ensemble_float_validators_reject_hostile_ratio() -> None:
 
     with pytest.raises(ValueError, match="bootstrap_probability"):
         _base_cfg(bootstrap_probability=HostileFloat(0.5))  # type: ignore[arg-type]
-    assert HostileFloat.calls == 1
+    assert HostileFloat.calls == 0
 
 
 def test_wm_ensemble_dimensions_preflight_without_allocation() -> None:
-    with pytest.raises(ValueError, match="dimensions must fit signed|scalar count|byte count"):
+    with pytest.raises(ValueError, match="ensemble_size"):
         _base_cfg(ensemble_size=_INT32_MAX)
     # Large ensemble with observation_dim 2 => target_dim 4, product 4*ensemble
-    with pytest.raises(ValueError, match="dimensions must fit signed|scalar count|byte count"):
+    with pytest.raises(ValueError, match="fit signed int32"):
         _base_cfg(ensemble_size=600_000_000)
 
 
 def test_wm_ensemble_state_preflight_bytes_without_allocation() -> None:
-    # target_dim=4, total=ensemble*4, fixed=ensemble*2+10, persistent=4*(6*ensemble+10)
-    last_legal = (2**31 - 1 - 40) // 24
+    # This base has 61 scalars/member; total persistent bytes are 270*ensemble + 60.
+    last_legal = (2**31 - 1 - 60) // 270
     _base_cfg(ensemble_size=last_legal)
-    with pytest.raises(ValueError, match="scalar count|byte count"):
+    with pytest.raises(ValueError, match="persistent state bytes"):
         _base_cfg(ensemble_size=last_legal + 1)
-    with pytest.raises(ValueError, match="scalar count|byte count|dimensions"):
+    with pytest.raises(ValueError, match="fit signed int32"):
         _base_cfg(ensemble_size=500_000_000)
 
 
@@ -228,3 +230,36 @@ def test_wm_ensemble_float_validators_accept_valid_values() -> None:
     )
     assert cfg.bootstrap_probability == 0.5
     assert cfg.residual_variance_decay == 0.8
+
+
+def test_wm_ensemble_mapping_loaders_preserve_markers_and_exact_keys() -> None:
+    config = _base_cfg()
+    payload = config.to_config()
+    restored = WorldModelEnsembleConfig.from_config(MappingProxyType(payload))
+    assert restored == config
+    with pytest.raises(ValueError, match="type"):
+        WorldModelEnsembleConfig.from_config({**payload, "type": "wrong"})
+
+    outer = WorldModelEnsemble(config).to_config()
+    assert WorldModelEnsemble.from_config(MappingProxyType(outer)).config == config
+
+    class StringSubclass(str):
+        pass
+
+    with pytest.raises(ValueError, match="exact strings"):
+        WorldModelEnsemble.from_config(
+            {StringSubclass("type"): "WorldModelEnsemble", "config": payload}
+        )
+
+
+def test_wm_ensemble_rejects_nested_config_subclasses() -> None:
+    class ModelConfigSubclass(ActionConditionedWorldModelConfig):
+        pass
+
+    base = _base_cfg()
+    with pytest.raises(ValueError, match="exact ActionConditioned"):
+        WorldModelEnsembleConfig(
+            model=ModelConfigSubclass(observation_dim=2, n_actions=2, hidden_sizes=()),
+            signal_estimator=base.signal_estimator,
+            ensemble_size=2,
+        )
