@@ -1206,3 +1206,49 @@ def test_step12_rejects_spoofed_ratio_components() -> None:
 
     with pytest.raises(ValueError, match="must be finite"):
         Step12IAConfig(option_gamma=BadRatioFloat(0.5))
+
+
+def _legal_step12_smoke_result(**overrides: object) -> Step12SmokeResult:
+    payload: dict[str, object] = {
+        "config": Step12IAConfig(subtask_specs=(_SPEC0,)),
+        "steps": 8,
+        "seed": 0,
+        "predictions_shape": (8, 4),
+        "cerebellum_errors_shape": (8, 4),
+        "recommendations_shape": (8,),
+        "augmented_obs_shape": (8, 8),
+        "cortex_td_errors_shape": (8,),
+        "finite": True,
+        "agent_config": {"ok": True},
+    }
+    payload.update(overrides)
+    return Step12SmokeResult(**payload)  # type: ignore[arg-type]
+
+
+def test_step12_smoke_result_rejects_leftover_identities() -> None:
+    """Public Step 12 smoke records must not keep leftover bool/int identities."""
+
+    with pytest.raises(ValueError, match="steps"):
+        _legal_step12_smoke_result(steps=True)
+    with pytest.raises(ValueError, match="steps"):
+        _legal_step12_smoke_result(steps=float("nan"))
+    with pytest.raises(ValueError, match="seed"):
+        _legal_step12_smoke_result(seed=True)
+    with pytest.raises(ValueError, match="finite"):
+        _legal_step12_smoke_result(finite=1)
+
+    legal = _legal_step12_smoke_result()
+    dumped = json.dumps(
+        {
+            "steps": legal.steps,
+            "seed": legal.seed,
+            "finite": legal.finite,
+        },
+        allow_nan=False,
+    )
+    assert '"steps": 8' in dumped
+    assert '"seed": 0' in dumped
+    assert '"finite": true' in dumped
+    assert '"steps": true' not in dumped
+    assert '"seed": true' not in dumped
+    assert '"finite": 1' not in dumped
