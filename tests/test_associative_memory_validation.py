@@ -239,23 +239,33 @@ def test_associative_pair_descriptors_preflight_before_learner_construction() ->
         )
 
 
-def test_associative_serialization_preserves_historical_compatibility() -> None:
+def test_associative_serialized_schema_is_exact_and_mapping_compatible() -> None:
     config = _base_cfg()
     payload = config.to_config()
-    payload["type"] = "historical-marker"
-    payload["vocab_size"] = np.int32(config.vocab_size)
     restored = AssociativeMemoryConfig.from_config(MappingProxyType(payload))
     assert restored == config
-    partial = AssociativeMemoryConfig.from_config(
-        {"vocab_size": 4, "block_size": 8, "suffix_length": 2, "max_features": 4}
-    )
-    assert partial == config
     learner_payload = AssociativeMemoryLearner(config).to_config()
-    learner_payload["type"] = "historical-marker"
-    learner_payload["metadata"] = 1
     assert AssociativeMemoryLearner.from_config(learner_payload).config == config
-    with pytest.raises(ValueError, match="serialized AssociativeMemoryConfig"):
-        AssociativeMemoryConfig.from_config({**config.to_config(), "unknown": 1})
+
+    for mutation, match in (
+        ({"type": "historical-marker"}, "type"),
+        ({"vocab_size": np.int32(config.vocab_size)}, "vocab_size"),
+        ({"retention": np.float32(config.retention)}, "retention"),
+        ({"normalize_by_weight": np.bool_(True)}, "normalize_by_weight"),
+        ({"unknown": 1}, "fields"),
+    ):
+        invalid = dict(payload)
+        invalid.update(mutation)
+        with pytest.raises(ValueError, match=match):
+            AssociativeMemoryConfig.from_config(invalid)
+    partial = {"vocab_size": 4, "block_size": 8, "suffix_length": 2, "max_features": 4}
+    with pytest.raises(ValueError, match="type"):
+        AssociativeMemoryConfig.from_config(partial)
+
+    with pytest.raises(ValueError, match="type"):
+        AssociativeMemoryLearner.from_config({**learner_payload, "type": "historical-marker"})
+    with pytest.raises(ValueError, match="fields"):
+        AssociativeMemoryLearner.from_config({**learner_payload, "metadata": 1})
 
 
 def test_associative_public_contracts_and_counters() -> None:
