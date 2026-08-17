@@ -95,6 +95,15 @@ def _strict_positive_int(value: object, *, name: str, maximum: int = _INT32_MAX)
     return canonical
 
 
+def _require_int32(name: str, value: object, *, minimum: int, maximum: int = _INT32_MAX) -> int:
+    if type(value) not in _ACTUAL_INT_TYPES:
+        raise ValueError(f"{name} must be an integer in [{minimum}, {maximum}]")
+    canonical = operator.index(cast(SupportsIndex, value))
+    if not minimum <= canonical <= maximum:
+        raise ValueError(f"{name} must be an integer in [{minimum}, {maximum}]")
+    return canonical
+
+
 def _strict_float32(
     value: object,
     *,
@@ -471,6 +480,39 @@ class PartnerPolicyFusionResourceBudget:
     rng_state_bytes: int
     replay_capacity: int
     dynamic_partner_capacity: int
+
+    def __post_init__(self) -> None:
+        for name in (
+            "max_partners",
+            "context_dim",
+            "n_actions",
+            "model_feature_dim",
+            "trainable_float32_scalars",
+            "persistent_float32_scalars",
+            "persistent_int32_scalars",
+            "persistent_bool_scalars",
+            "persistent_state_scalars",
+            "persistent_state_bytes",
+            "max_messages_per_decision",
+            "max_model_scores_per_decision",
+            "partner_id_pairwise_equality_comparisons_per_decision",
+            "max_trainable_scalars_touched_per_feedback",
+            "decision_input_float32_scalars",
+            "decision_input_int32_scalars",
+            "decision_input_bool_scalars",
+            "feedback_input_float32_scalars",
+            "feedback_input_int32_scalars",
+            "feedback_input_bool_scalars",
+            "max_parameter_updates_per_feedback",
+            "rng_state_bytes",
+            "replay_capacity",
+            "dynamic_partner_capacity",
+        ):
+            object.__setattr__(
+                self,
+                name,
+                _require_int32(name, getattr(self, name), minimum=0),
+            )
 
     def to_config(self) -> dict[str, int]:
         """Return the fixed JSON-compatible resource record."""
