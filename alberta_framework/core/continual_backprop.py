@@ -64,8 +64,11 @@ References
 from __future__ import annotations
 
 import functools
+import operator
 import time
-from typing import Any
+from collections.abc import Mapping
+from fractions import Fraction
+from typing import Any, SupportsIndex, cast
 
 import chex
 import jax
@@ -75,7 +78,9 @@ import numpy as np
 from jax import Array
 from jaxtyping import Float, Int
 
-from alberta_framework.core._float32_scalars import validated_float32_scalar
+from alberta_framework.core._float32_scalars import (
+    validated_float32_scalar_with_ratio,
+)
 from alberta_framework.core.initializers import sparse_init
 from alberta_framework.core.multi_head_learner import (
     MULTI_HEAD_MLP_STATE_SCHEMA,
@@ -131,6 +136,76 @@ _CBP_SINGLE_CONFIG_FIELDS = _CBP_MULTI_CONFIG_FIELDS - {
     "n_heads",
     "per_head_gamma_lamda",
 }
+_INT32_MAX = 2**31 - 1
+_ACTUAL_INT_TYPES: frozenset[type] = frozenset(
+    {
+        int,
+        np.int8,
+        np.int16,
+        np.int32,
+        np.int64,
+        np.uint8,
+        np.uint16,
+        np.uint32,
+        np.uint64,
+        np.longlong,
+        np.ulonglong,
+    }
+)
+_ACTUAL_FLOAT_TYPES: frozenset[type] = frozenset(
+    {float, Fraction, *(np.dtype(c).type for c in ("e", "f", "d", "g"))}
+)
+_ALLOWED_REAL_TYPES: frozenset[type] = _ACTUAL_INT_TYPES | _ACTUAL_FLOAT_TYPES
+
+
+def _require_int(name: str, value: object, *, minimum: int, maximum: int = _INT32_MAX) -> int:
+    if type(value) not in _ACTUAL_INT_TYPES:
+        raise ValueError(f"{name} must be an integer")
+    canonical = operator.index(cast(SupportsIndex, value))
+    if not minimum <= canonical <= maximum:
+        raise ValueError(f"{name} must be an integer")
+    return canonical
+
+
+def _require_bool(name: str, value: object) -> bool:
+    if type(value) is not bool:
+        raise ValueError(f"{name} must be an actual bool")
+    return value
+
+
+def _validated_config_float(
+    name: str,
+    value: object,
+    *,
+    lower: float | None = None,
+    upper: float | None = None,
+    upper_inclusive: bool = True,
+) -> float:
+    if type(value) not in _ALLOWED_REAL_TYPES:
+        raise ValueError(f"{name} must be a finite real number")
+    stored, numerator, denominator = validated_float32_scalar_with_ratio(
+        name,
+        value,
+        lower=lower,
+        upper=upper,
+        upper_inclusive=upper_inclusive,
+    )
+    if numerator != 0 and abs(numerator) * (1 << 149) <= denominator:
+        raise ValueError(f"{name} must remain nonzero once narrowed to float32")
+    return stored
+
+
+def _copy_mapping(payload: object, *, name: str) -> dict[str, object]:
+    if not isinstance(payload, Mapping):
+        raise ValueError(f"{name} payload must be a mapping")
+    try:
+        data = dict(payload)  # type: ignore[arg-type]
+    except Exception as exc:
+        raise ValueError(f"{name} payload could not be read") from exc
+    for key in data:
+        if type(key) is not str:
+            raise ValueError(f"{name} payload has exact strings as keys")
+    return data
 
 # =============================================================================
 # Config / state
@@ -164,34 +239,33 @@ class ContinualBackpropConfig:
 
     def __post_init__(self) -> None:
         """Validate and canonicalize configuration at its execution boundaries."""
-        decay_rate = _validated_config_float(
+        object.__setattr__(
+            self,
             "decay_rate",
-            self.decay_rate,
-            lower=0.0,
-            upper=1.0,
-            upper_inclusive=False,
+            _validated_config_float(
+                "decay_rate",
+                self.decay_rate,
+                lower=0.0,
+                upper=1.0,
+                upper_inclusive=False,
+            ),
         )
-        replacement_rate = _validated_config_float(
+        object.__setattr__(
+            self,
             "replacement_rate",
-            self.replacement_rate,
-            lower=0.0,
-            upper=1.0,
+            _validated_config_float(
+                "replacement_rate",
+                self.replacement_rate,
+                lower=0.0,
+                upper=1.0,
+            ),
         )
-        maturity_type = type(self.maturity_threshold)
-        if maturity_type is int:
-            maturity_threshold = self.maturity_threshold
-        elif maturity_type in _NUMPY_INTEGER_SCALAR_TYPES:
-            maturity_threshold = int(self.maturity_threshold)
-        else:
-            raise ValueError("maturity_threshold must be an integer in the int32 domain")
-        if not 0 <= maturity_threshold <= np.iinfo(np.int32).max:
-            raise ValueError("maturity_threshold must be an integer in the int32 domain")
-        if type(self.enabled) is not bool:
-            raise ValueError("enabled must be an actual bool")
-        object.__setattr__(self, "decay_rate", decay_rate)
-        object.__setattr__(self, "replacement_rate", replacement_rate)
-        object.__setattr__(self, "maturity_threshold", maturity_threshold)
-        object.__setattr__(self, "enabled", bool(self.enabled))
+        object.__setattr__(
+            self,
+            "maturity_threshold",
+            _require_int("maturity_threshold", self.maturity_threshold, minimum=0),
+        )
+        object.__setattr__(self, "enabled", _require_bool("enabled", self.enabled))
 
     def to_config(self) -> dict[str, Any]:
         """Serialize to dict."""
@@ -203,36 +277,15 @@ class ContinualBackpropConfig:
         }
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> ContinualBackpropConfig:
+    def from_config(cls, config: object) -> ContinualBackpropConfig:
         """Reconstruct from dict."""
-        if type(config) is not dict:
-            raise ValueError("ContinualBackpropConfig payload must be an actual dict")
-        if not all(type(key) is str for key in config) or set(config) != _CBP_CONFIG_FIELDS:
+        payload = _copy_mapping(config, name="ContinualBackpropConfig")
+        if set(payload) != _CBP_CONFIG_FIELDS:
             raise ValueError("ContinualBackpropConfig fields do not match the schema")
-        return cls(**config)
+        return cls(**payload)  # type: ignore[arg-type]
 
 
-def _validated_config_float(
-    name: str,
-    value: object,
-    *,
-    lower: float,
-    upper: float,
-    upper_inclusive: bool = True,
-) -> float:
-    """Validate trusted built-in/NumPy numerics in both host and float32 domains."""
-    actual_type = type(value)
-    if actual_type not in (int, float) and actual_type not in (
-        _NUMPY_INTEGER_SCALAR_TYPES | _NUMPY_FLOAT_SCALAR_TYPES
-    ):
-        raise ValueError(f"{name} must be a finite real number")
-    return validated_float32_scalar(
-        name,
-        value,
-        lower=lower,
-        upper=upper,
-        upper_inclusive=upper_inclusive,
-    )
+
 
 
 @chex.dataclass(frozen=True)
@@ -825,7 +878,7 @@ class CBPMultiHeadMLPLearner:
             lower=0.0,
             upper=1.0,
         )
-        leaky_relu_slope = validated_float32_scalar(
+        leaky_relu_slope = _validated_config_float(
             "leaky_relu_slope",
             leaky_relu_slope,
             lower=0.0,
@@ -885,7 +938,7 @@ class CBPMultiHeadMLPLearner:
         }
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> CBPMultiHeadMLPLearner:
+    def from_config(cls, config: object) -> CBPMultiHeadMLPLearner:
         """Reconstruct from a config dict produced by :meth:`to_config`."""
         from alberta_framework.core.normalizers import normalizer_from_config
         from alberta_framework.core.optimizers import (
@@ -893,10 +946,10 @@ class CBPMultiHeadMLPLearner:
             optimizer_from_config,
         )
 
-        if type(config) is not dict:
-            raise ValueError("CBPMultiHeadMLPLearner config must be an actual dict")
-        if not all(type(key) is str for key in config) or set(config) != _CBP_MULTI_CONFIG_FIELDS:
+        payload = _copy_mapping(config, name="CBPMultiHeadMLPLearner")
+        if set(payload) != _CBP_MULTI_CONFIG_FIELDS:
             raise ValueError("CBPMultiHeadMLPLearner config fields do not match the schema")
+        config = payload
         if type(config["type"]) is not str or config["type"] != "CBPMultiHeadMLPLearner":
             raise ValueError("unexpected CBPMultiHeadMLPLearner config type")
         if (
@@ -1177,12 +1230,12 @@ class CBPMLPLearner:
         return cfg
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> CBPMLPLearner:
+    def from_config(cls, config: object) -> CBPMLPLearner:
         """Reconstruct from a config dict produced by :meth:`to_config`."""
-        if type(config) is not dict:
-            raise ValueError("CBPMLPLearner config must be an actual dict")
-        if not all(type(key) is str for key in config) or set(config) != _CBP_SINGLE_CONFIG_FIELDS:
+        payload = _copy_mapping(config, name="CBPMLPLearner")
+        if set(payload) != _CBP_SINGLE_CONFIG_FIELDS:
             raise ValueError("CBPMLPLearner config fields do not match the schema")
+        config = payload
         if type(config["type"]) is not str or config["type"] != "CBPMLPLearner":
             raise ValueError("unexpected CBPMLPLearner config type")
         config = config.copy()
