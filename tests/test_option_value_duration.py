@@ -6,6 +6,7 @@ that Alberta Plan Step 5 is complete.
 
 import json
 import math
+from collections.abc import Iterator, Mapping
 from decimal import Decimal
 from fractions import Fraction
 from types import MappingProxyType
@@ -462,7 +463,7 @@ def test_option_duration_rejects_hostile_integer_subclasses(field: str) -> None:
             learner.init(HostileInt(3))
 
 
-def test_option_duration_float_subclasses_never_run_hooks() -> None:
+def test_option_duration_float_hook_runs_once_and_normalizes_failures() -> None:
     class CountingFloat(float):
         def __new__(cls):
             instance = super().__new__(cls, 0.25)
@@ -474,9 +475,9 @@ def test_option_duration_float_subclasses_never_run_hooks() -> None:
             return (1, 4)
 
     value = CountingFloat()
-    with pytest.raises(ValueError, match="reward_step_size"):
-        OptionValueDurationConfig(reward_step_size=value)
-    assert value.calls == 0
+    config = OptionValueDurationConfig(reward_step_size=value)
+    assert value.calls == 1
+    assert type(config.reward_step_size) is float
 
     class ExplodingFloat(float):
         def as_integer_ratio(self) -> tuple[int, int]:
@@ -509,6 +510,30 @@ def test_option_duration_config_preserves_historical_loader_forms() -> None:
     config_payload = {"type": "historical-marker", "reward_step_size": np.float32(0.25)}
     config = OptionValueDurationConfig.from_config(MappingProxyType(config_payload))
     assert config.reward_step_size == 0.25
+    assert config.duration_step_size == 0.1
+
+    learner_payload["type"] = "historical-learner-marker"
+    assert OptionValueDurationLearner.from_config(learner_payload).n_options == 2
+
+
+def test_option_duration_loaders_normalize_hostile_mapping_failures_without_repr() -> None:
+    class HostileMapping(Mapping[str, object]):
+        def __getitem__(self, key: str) -> object:
+            raise RuntimeError("hostile mapping")
+
+        def __iter__(self) -> Iterator[str]:
+            raise RuntimeError("hostile mapping")
+
+        def __len__(self) -> int:
+            raise RuntimeError("hostile mapping")
+
+        def __repr__(self) -> str:
+            raise AssertionError("untrusted repr hook executed")
+
+    with pytest.raises(ValueError, match="readable mapping"):
+        OptionValueDurationConfig.from_config(HostileMapping())
+    with pytest.raises(ValueError, match="readable mapping"):
+        OptionValueDurationLearner.from_config(HostileMapping())
 
 
 def test_option_duration_resource_formula_matches_materialized_state() -> None:

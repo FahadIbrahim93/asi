@@ -30,7 +30,6 @@ import functools
 import operator
 import time
 from collections.abc import Mapping
-from fractions import Fraction
 from typing import Any, SupportsIndex, cast
 
 import chex
@@ -50,11 +49,6 @@ _MAX_PERSISTENT_STATE_BYTES = 256 * 1024 * 1024
 _ACTUAL_INT_TYPES = frozenset(
     {int, *(np.dtype(code).type for code in ("b", "B", "h", "H", "i", "I", "l", "L", "q", "Q"))}
 )
-_ACTUAL_REAL_TYPES = _ACTUAL_INT_TYPES | frozenset(
-    {float, Fraction, *(np.dtype(code).type for code in "efdg")}
-)
-
-
 def _require_int32(name: str, value: object, *, minimum: int = 1) -> int:
     """Canonicalize one concrete Python/NumPy integer without invoking hooks."""
     if type(value) not in _ACTUAL_INT_TYPES:
@@ -72,14 +66,16 @@ def _require_float32_real(
     strictly_positive: bool,
 ) -> float:
     """Validate one host scalar in its exact domain and float32 sink."""
-    if type(value) not in _ACTUAL_REAL_TYPES:
-        raise ValueError(f"{name} must be a finite real number")
-    stored, numerator, _ = validated_float32_scalar_with_ratio(
-        name,
-        value,
-        positive=strictly_positive,
-        lower=None if strictly_positive else 0.0,
-    )
+    domain = "positive" if strictly_positive else "non-negative"
+    try:
+        stored, numerator, _ = validated_float32_scalar_with_ratio(
+            name,
+            value,
+            positive=strictly_positive,
+            lower=None if strictly_positive else 0.0,
+        )
+    except Exception as error:
+        raise ValueError(f"{name} must be finite and {domain}") from error
     narrowed = float(np.float32(stored))
     if numerator != 0 and narrowed == 0.0:
         raise ValueError(f"{name} must not underflow to zero in float32")
