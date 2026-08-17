@@ -6,9 +6,16 @@ import jax.numpy as jnp
 from jax import Array
 
 
+def _require_exact_str(name: str, value: object) -> str:
+    if type(value) is not str:
+        raise ValueError(f"{name} must be an exact string")
+    return value
+
+
 def require_positive_builtin_int(value: object, *, name: str) -> int:
     """Return an exact built-in positive integer or fail before JAX tracing."""
 
+    _require_exact_str("name", name)
     if type(value) is not int or value < 1:
         raise ValueError(f"{name} must be a positive built-in integer")
     return value
