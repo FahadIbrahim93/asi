@@ -34,6 +34,7 @@ import jax.numpy as jnp
 import jax.random as jr
 from jax import Array
 
+from alberta_framework._seed_validation import require_jax_seed
 from alberta_framework.core.world_model import (
     OneStepWorldModel,
     WorldModelConfig,
@@ -227,6 +228,13 @@ class Step8SmokeResult:
     next_observation_errors_shape: tuple[int, ...]
     finite: bool
     model_config: dict[str, Any]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "steps", _require_int("steps", self.steps, minimum=1, maximum=_INT32_MAX)
+        )
+        object.__setattr__(self, "seed", require_jax_seed(self.seed, name="seed"))
+        object.__setattr__(self, "finite", _require_bool("finite", self.finite))
 
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-serializable representation."""
