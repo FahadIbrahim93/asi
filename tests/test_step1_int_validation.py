@@ -8,10 +8,12 @@ conversion runs, and the invalid-type error never interpolates the value.
 
 from __future__ import annotations
 
+import json
+
 import numpy as np
 import pytest
 
-from alberta_framework.steps import Step1KernelConfig, run_step1_smoke
+from alberta_framework.steps import Step1KernelConfig, Step1SmokeResult, run_step1_smoke
 
 pytestmark = pytest.mark.unit
 
@@ -131,3 +133,52 @@ def test_step1_config_still_rejects_non_integer_scalars(field: str, value: objec
 def test_step1_smoke_bounds_errors_still_name_the_field(field: str) -> None:
     with pytest.raises(ValueError, match=f"{field} must be positive"):
         run_step1_smoke(**_smoke_kwargs(field, 0))  # type: ignore[arg-type]
+
+
+def _legal_step1_smoke_result(**overrides: object) -> Step1SmokeResult:
+    payload: dict[str, object] = {
+        "config": Step1KernelConfig(),
+        "steps": 8,
+        "seed": 0,
+        "final_window_mse": 0.25,
+        "metrics_shape": (8, 2),
+        "finite": True,
+    }
+    payload.update(overrides)
+    return Step1SmokeResult(**payload)  # type: ignore[arg-type]
+
+
+def test_step1_smoke_result_rejects_leftover_identities() -> None:
+    """Public Step 1 smoke records must not keep leftover bool/NaN identities."""
+
+    with pytest.raises(ValueError, match="steps"):
+        _legal_step1_smoke_result(steps=True)
+    with pytest.raises(ValueError, match="steps"):
+        _legal_step1_smoke_result(steps=float("nan"))
+    with pytest.raises(ValueError, match="seed"):
+        _legal_step1_smoke_result(seed=True)
+    with pytest.raises(ValueError, match="finite"):
+        _legal_step1_smoke_result(finite=1)
+    with pytest.raises(ValueError, match="final_window_mse"):
+        _legal_step1_smoke_result(final_window_mse=True)
+    with pytest.raises(ValueError, match="final_window_mse"):
+        _legal_step1_smoke_result(final_window_mse=float("nan"))
+
+    legal = _legal_step1_smoke_result()
+    dumped = json.dumps(
+        {
+            "steps": legal.steps,
+            "seed": legal.seed,
+            "finite": legal.finite,
+            "final_window_mse": legal.final_window_mse,
+        },
+        allow_nan=False,
+    )
+    assert '"steps": 8' in dumped
+    assert '"seed": 0' in dumped
+    assert '"finite": true' in dumped
+    assert '"final_window_mse": 0.25' in dumped
+    assert '"steps": true' not in dumped
+    assert '"seed": true' not in dumped
+    assert '"finite": 1' not in dumped
+    assert '"final_window_mse": true' not in dumped
