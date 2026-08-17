@@ -25,7 +25,7 @@ import os
 import re
 import secrets
 import stat
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
@@ -117,14 +117,14 @@ class _OpenDirectory:
 
 
 def _plain(value: Any) -> Any:
-    if isinstance(value, Mapping):
+    if type(value) in (dict, MappingProxyType):
         result: dict[str, Any] = {}
         for key, item in value.items():
             if type(key) is not str:
                 raise ForagerMatchedSealError("canonical mappings require string keys")
             result[key] = _plain(item)
         return result
-    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+    if type(value) in (list, tuple):
         return [_plain(item) for item in value]
     if type(value) is float:
         if not math.isfinite(value):

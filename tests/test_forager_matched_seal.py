@@ -63,6 +63,20 @@ def test_plain_keeps_finite_canonical_scalars() -> None:
     assert seal.canonical_json_bytes({"score": 1.25}) == b'{"score":1.25}'
 
 
+def test_plain_rejects_hostile_container_subclasses_without_hooks() -> None:
+    class HostileMapping(dict[str, object]):
+        def items(self):  # type: ignore[no-untyped-def, override]
+            raise AssertionError("canonicalization must not invoke mapping hooks")
+
+    class HostileSequence(list[object]):
+        def __iter__(self):
+            raise AssertionError("canonicalization must not invoke sequence hooks")
+
+    for value in (HostileMapping(value=1), HostileSequence()):
+        with pytest.raises(seal.ForagerMatchedSealError, match="unsupported"):
+            seal._plain(value)  # noqa: SLF001
+
+
 def _canonical_sha(value: dict[str, Any]) -> str:
     return hashlib.sha256(executor.canonical_json_bytes(value)).hexdigest()
 

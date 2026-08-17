@@ -9,6 +9,7 @@ import jax.numpy as jnp
 import jax.random as jr
 import numpy as np
 import pytest
+from jax import Array
 
 import alberta_framework as af
 from alberta_framework.pipeline import (
@@ -984,6 +985,220 @@ def test_pipeline_smoke_result_rejects_leftover_identities() -> None:
     assert '"steps": true' not in dumped
     assert '"seed": true' not in dumped
     assert '"finite": 1' not in dumped
+
+
+@pytest.mark.parametrize(
+    "bad_context",
+    [
+        pytest.param(jnp.asarray([1.75, 2.25, 3.5, 4.5, 5.5], dtype=jnp.float32), id="float"),
+        pytest.param(jnp.asarray([True, False, True, False, True]), id="bool"),
+    ],
+)
+def test_associative_pipeline_rejects_non_integer_context(bad_context) -> None:
+    """Associative contexts must not be laundered into int32 by the pipeline.
+
+    ``AssociativeMemoryLearner`` documents ``Int[Array, " block_size"]`` and
+    rejects a non-integer context itself. The pipeline must not defeat that
+    validator by narrowing the caller's array first: a fractional or boolean
+    observation is an invalid input, not a truncated one.
+    """
+    pipeline = make_alberta_pipeline(_small_associative_config())
+    good_context = jnp.asarray([1, 2, 3, 4, 5], dtype=jnp.int32)
+
+    with pytest.raises(ValueError, match="integer dtype"):
+        pipeline.init(jr.key(0), bad_context)
+
+    state = pipeline.init(jr.key(0), good_context)
+    with pytest.raises(ValueError, match="integer dtype"):
+        pipeline.update(
+            state,
+            bad_context,
+            jnp.asarray(0.0, dtype=jnp.float32),
+            jnp.asarray(0.0, dtype=jnp.float32),
+            jnp.asarray([1.0], dtype=jnp.float32),
+            associative_label=jnp.asarray(6, dtype=jnp.int32),
+        )
+
+
+@pytest.mark.parametrize(
+    "bad_label",
+    [
+        pytest.param(jnp.asarray(6.9, dtype=jnp.float32), id="float"),
+        pytest.param(jnp.asarray(True), id="bool"),
+    ],
+)
+def test_associative_pipeline_rejects_non_integer_label(bad_label) -> None:
+    """A fractional or boolean associative label must raise, not truncate."""
+    pipeline = make_alberta_pipeline(_small_associative_config())
+    context = jnp.asarray([1, 2, 3, 4, 5], dtype=jnp.int32)
+    state = pipeline.init(jr.key(0), context)
+
+    with pytest.raises(ValueError, match="integer dtype"):
+        pipeline.update(
+            state,
+            context,
+            jnp.asarray(0.0, dtype=jnp.float32),
+            jnp.asarray(0.0, dtype=jnp.float32),
+            jnp.asarray([1.0], dtype=jnp.float32),
+            associative_label=bad_label,
+        )
+
+
+def test_associative_run_arrays_rejects_non_integer_observations_and_labels() -> None:
+    """The array runner must reject non-integer contexts and label tables."""
+    pipeline = make_alberta_pipeline(_small_associative_config())
+    state = pipeline.init(jr.key(0), jnp.asarray([1, 2, 3, 4, 5], dtype=jnp.int32))
+    observations = jnp.asarray([[1, 2, 3, 4, 5], [2, 3, 4, 5, 6]], dtype=jnp.int32)
+    steps = observations.shape[0]
+    zeros = jnp.zeros((steps,), dtype=jnp.float32)
+    cumulants = jnp.ones((steps, 1), dtype=jnp.float32)
+    labels = jnp.asarray([6, 7], dtype=jnp.int32)
+
+    with pytest.raises(ValueError, match="integer dtype"):
+        pipeline.run_arrays(
+            state,
+            observations.astype(jnp.float32) + 0.5,
+            zeros,
+            zeros,
+            cumulants,
+            associative_labels=labels,
+        )
+
+    for bad_labels in (
+        jnp.asarray([6.9, 7.1], dtype=jnp.float32),
+        jnp.asarray([True, False]),
+    ):
+        with pytest.raises(ValueError, match="integer dtype"):
+            pipeline.run_arrays(
+                state,
+                observations,
+                zeros,
+                zeros,
+                cumulants,
+                associative_labels=bad_labels,
+            )
+
+
+def test_associative_pipeline_accepts_documented_integer_contract() -> None:
+    """The guard must not reject the documented integer contract."""
+    pipeline = make_alberta_pipeline(_small_associative_config())
+    context = jnp.asarray([1, 2, 3, 4, 5], dtype=jnp.int32)
+    state = pipeline.init(jr.key(0), context)
+
+    result = pipeline.update(
+        state,
+        context,
+        jnp.asarray(0.0, dtype=jnp.float32),
+        jnp.asarray(0.0, dtype=jnp.float32),
+        jnp.asarray([1.0], dtype=jnp.float32),
+        associative_label=jnp.asarray(6, dtype=jnp.int32),
+    )
+    assert int(result.state.step_count) == 1
+
+
+class _HostileAssociativeArray:
+    @property
+    def shape(self) -> tuple[int, ...]:
+        raise AssertionError("untrusted shape hook executed")
+
+    @property
+    def dtype(self) -> np.dtype:
+        raise AssertionError("untrusted dtype hook executed")
+
+    def __jax_array__(self) -> Array:
+        raise AssertionError("untrusted conversion hook executed")
+
+
+def test_associative_pipeline_rejects_untrusted_array_before_metadata_hooks() -> None:
+    pipeline = make_alberta_pipeline(_small_associative_config())
+
+    with pytest.raises(TypeError, match="trusted array"):
+        pipeline.init(jr.key(0), _HostileAssociativeArray())  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "bad_context",
+    [
+        jnp.zeros((5, 1), dtype=jnp.int32),
+        jnp.zeros((4,), dtype=jnp.int32),
+    ],
+)
+def test_associative_pipeline_requires_exact_context_shape(bad_context: Array) -> None:
+    pipeline = make_alberta_pipeline(_small_associative_config())
+
+    with pytest.raises(ValueError, match="must have shape"):
+        pipeline.init(jr.key(0), bad_context)
+
+
+def test_associative_pipeline_requires_exact_label_shapes() -> None:
+    pipeline = make_alberta_pipeline(_small_associative_config())
+    context = jnp.asarray([1, 2, 3, 4, 5], dtype=jnp.int32)
+    state = pipeline.init(jr.key(0), context)
+    transition = (
+        jnp.asarray(0.0, dtype=jnp.float32),
+        jnp.asarray(0.0, dtype=jnp.float32),
+        jnp.asarray([1.0], dtype=jnp.float32),
+    )
+
+    with pytest.raises(ValueError, match="must have shape"):
+        pipeline.update(
+            state,
+            context,
+            *transition,
+            associative_label=jnp.asarray([1], dtype=jnp.int32),
+        )
+    with pytest.raises(ValueError, match="must have shape"):
+        pipeline.run_arrays(
+            state,
+            context[None, :],
+            jnp.zeros((1,), dtype=jnp.float32),
+            jnp.zeros((1,), dtype=jnp.float32),
+            jnp.zeros((1, 1), dtype=jnp.float32),
+            associative_labels=jnp.asarray([[1]], dtype=jnp.int32),
+        )
+
+
+def test_associative_pipeline_rejects_wide_integer_dtypes_eager_and_jit() -> None:
+    pipeline = make_alberta_pipeline(_small_associative_config())
+    with jax.enable_x64():
+        wide_context = jnp.asarray([1, 2, 3, 4, 2**32], dtype=jnp.uint64)
+        with pytest.raises(ValueError, match="representable as int32"):
+            pipeline.init(jr.key(0), wide_context)
+
+        compiled_init = jax.jit(lambda context: pipeline.init(jr.key(0), context))
+        with pytest.raises(ValueError, match="representable as int32"):
+            compiled_init(wide_context)
+
+        valid_context = jnp.asarray([1, 2, 3, 4, 5], dtype=jnp.int32)
+        state = pipeline.init(jr.key(0), valid_context)
+        compiled_update = jax.jit(
+            lambda label: pipeline.update(
+                state,
+                valid_context,
+                jnp.asarray(0.0, dtype=jnp.float32),
+                jnp.asarray(0.0, dtype=jnp.float32),
+                jnp.asarray([1.0], dtype=jnp.float32),
+                associative_label=label,
+            )
+        )
+        with pytest.raises(ValueError, match="representable as int32"):
+            compiled_update(jnp.asarray(2**32, dtype=jnp.uint64))
+
+
+def test_associative_pipeline_narrows_only_statically_safe_integer_dtypes() -> None:
+    pipeline = make_alberta_pipeline(_small_associative_config())
+    context = jnp.asarray([1, 2, 3, 4, 5], dtype=jnp.int16)
+    state = pipeline.init(jr.key(0), context)
+
+    result = pipeline.update(
+        state,
+        context,
+        jnp.asarray(0.0, dtype=jnp.float32),
+        jnp.asarray(0.0, dtype=jnp.float32),
+        jnp.asarray([1.0], dtype=jnp.float32),
+        associative_label=jnp.asarray(6, dtype=jnp.uint8),
+    )
+    assert int(result.state.step_count) == 1
 
 
 # silence the import lint warnings used in the test runner

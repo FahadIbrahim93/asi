@@ -1230,6 +1230,22 @@ def test_json_safe_rejects_nonfinite_artifact_identities() -> None:
         matrix._canonical_json_bytes({"scale": float("nan")})
 
 
+def test_json_safe_rejects_nonstring_keys_without_string_hooks() -> None:
+    class HostileKey:
+        def __str__(self) -> str:
+            raise AssertionError("artifact normalization must not stringify keys")
+
+    with pytest.raises(matrix.ForagerMatrixError, match="string keys"):
+        matrix._json_safe({HostileKey(): 1})
+
+    class HostileMapping(dict[str, object]):
+        def items(self):  # type: ignore[no-untyped-def, override]
+            raise AssertionError("artifact normalization must not invoke mapping hooks")
+
+    with pytest.raises(matrix.ForagerMatrixError, match="unsupported HostileMapping"):
+        matrix._json_safe(HostileMapping(value=1))
+
+
 def test_source_snapshot_is_reproducible_canonical_and_path_independent(
     _isolated_source_tree: Path,
 ) -> None:

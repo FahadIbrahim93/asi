@@ -214,8 +214,13 @@ def canonical_json_bytes(value: Mapping[str, Any]) -> bytes:
 
 
 def _freeze_json(value: Any) -> Any:
-    if isinstance(value, Mapping):
-        return MappingProxyType({str(key): _freeze_json(item) for key, item in value.items()})
+    if type(value) in (dict, MappingProxyType):
+        result: dict[str, Any] = {}
+        for key, item in value.items():
+            if type(key) is not str:
+                raise ForagerMatchedCampaignError("canonical mappings require string keys")
+            result[key] = _freeze_json(item)
+        return MappingProxyType(result)
     if type(value) is list:
         return tuple(_freeze_json(item) for item in value)
     if type(value) is tuple:
@@ -224,17 +229,28 @@ def _freeze_json(value: Any) -> Any:
 
 
 def _plain(value: Any) -> Any:
-    if isinstance(value, Mapping):
-        return {str(key): _plain(item) for key, item in value.items()}
-    if isinstance(value, tuple):
+    if type(value) in (dict, MappingProxyType):
+        result: dict[str, Any] = {}
+        for key, item in value.items():
+            if type(key) is not str:
+                raise ForagerMatchedCampaignError("canonical mappings require string keys")
+            result[key] = _plain(item)
+        return result
+    if type(value) is tuple:
         return [_plain(item) for item in value]
-    if isinstance(value, list):
+    if type(value) is list:
         return [_plain(item) for item in value]
-    if type(value) is float and not math.isfinite(value):
-        raise ForagerMatchedCampaignError(
-            "canonical content contains a non-finite JSON number"
-        )
-    return value
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise ForagerMatchedCampaignError(
+                "canonical content contains a non-finite JSON number"
+            )
+        return value
+    if value is None or type(value) in (str, bool, int):
+        return value
+    raise ForagerMatchedCampaignError(
+        f"canonical content contains unsupported {type(value).__name__}"
+    )
 
 
 def _canonical_sha256(value: Mapping[str, Any]) -> str:

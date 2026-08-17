@@ -620,7 +620,7 @@ def _require_sha256(value: Any, path: str) -> str:
 
 
 def _require_int(value: Any, path: str, *, minimum: int, maximum: int) -> int:
-    if isinstance(value, bool) or not isinstance(value, int):
+    if type(value) is not int:
         raise ForagerRngParityError(f"{path} must be an integer")
     if not minimum <= value <= maximum:
         raise ForagerRngParityError(f"{path} must lie in [{minimum}, {maximum}]")

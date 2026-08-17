@@ -24,7 +24,7 @@ import math
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -33,10 +33,11 @@ import numpy as np
 from jax import Array
 from numpy.typing import NDArray
 
-from alberta_framework._seed_validation import require_unique_jax_seeds
+from alberta_framework._seed_validation import require_jax_seed, require_unique_jax_seeds
 from alberta_framework.core.interaction_features import (
     FixedBudgetInteractionLearner,
 )
+from alberta_framework.evaluation._measurement_validation import nonnegative_finite_real
 from alberta_framework.streams.gauntlet import (
     SEGMENT_NAMES,
     GauntletConfig,
@@ -218,21 +219,11 @@ def _nonnegative_int(value: object, *, name: str) -> int:
 def _optional_finite_float(value: object, *, name: str) -> float | None:
     if value is None:
         return None
-    if type(value) is bool or type(value) not in (int, float):
-        raise ValueError(f"{name} must be a finite real number or None")
-    numeric = float(cast("int | float", value))
-    if not math.isfinite(numeric):
-        raise ValueError(f"{name} must be a finite real number or None")
-    return numeric
+    return nonnegative_finite_real(name, value)
 
 
 def _finite_float(value: object, *, name: str) -> float:
-    if type(value) is bool or type(value) not in (int, float):
-        raise ValueError(f"{name} must be a finite real number")
-    numeric = float(cast("int | float", value))
-    if not math.isfinite(numeric):
-        raise ValueError(f"{name} must be a finite real number")
-    return numeric
+    return nonnegative_finite_real(name, value)
 
 
 def _integer_pairs(
@@ -249,6 +240,32 @@ def _integer_pairs(
             raise ValueError(f"{name}[{index}] must contain integers")
         pairs.append((left, right))
     return tuple(pairs)
+
+
+def _resource_accounting_map(value: object) -> dict[str, dict[str, int | bool]]:
+    if type(value) is not dict:
+        raise TypeError("memory_by_condition must be an exact dictionary")
+    result: dict[str, dict[str, int | bool]] = {}
+    for condition, accounting in value.items():
+        if type(condition) is not str or not condition:
+            raise ValueError("memory_by_condition keys must be non-empty strings")
+        if type(accounting) is not dict:
+            raise TypeError(f"memory_by_condition[{condition}] must be an exact dictionary")
+        normalized: dict[str, int | bool] = {}
+        for name, count in accounting.items():
+            if type(name) is not str or not name:
+                raise ValueError("resource-accounting keys must be non-empty strings")
+            if type(count) is bool:
+                normalized[name] = count
+            elif type(count) is int and count >= 0:
+                normalized[name] = count
+            else:
+                raise ValueError(
+                    f"memory_by_condition[{condition}][{name}] must be a non-negative "
+                    "integer or boolean"
+                )
+        result[condition] = normalized
+    return result
 
 
 @dataclass(frozen=True)
@@ -346,9 +363,9 @@ class ConditionSeedRecord:
     final_active_pairs: tuple[tuple[int, int], ...]
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "seed", _nonnegative_int(self.seed, name="seed"))
-        if type(self.condition) is not str:
-            raise ValueError("condition must be a string")
+        object.__setattr__(self, "seed", require_jax_seed(self.seed, name="seed"))
+        if type(self.condition) is not str or not self.condition:
+            raise ValueError("condition must be a non-empty string")
         if type(self.phases) is not tuple:
             raise TypeError("phases must be an exact tuple")
         if any(type(phase) is not PhaseWindowRecord for phase in self.phases):
@@ -388,28 +405,26 @@ class ScaleRobustFeatureReport:
     def __post_init__(self) -> None:
         if type(self.seeds) is not tuple:
             raise TypeError("seeds must be an exact tuple")
-        object.__setattr__(
-            self,
-            "seeds",
-            tuple(
-                _nonnegative_int(seed, name=f"seeds[{index}]")
-                for index, seed in enumerate(self.seeds)
-            ),
-        )
+        object.__setattr__(self, "seeds", require_unique_jax_seeds(self.seeds, name="seeds"))
         if type(self.records) is not tuple:
             raise TypeError("records must be an exact tuple")
         if any(type(record) is not ConditionSeedRecord for record in self.records):
             raise TypeError("records must contain ConditionSeedRecord values")
-        if not isinstance(self.wall_time_seconds_by_condition, Mapping):
-            raise TypeError("wall_time_seconds_by_condition must be a mapping")
+        object.__setattr__(
+            self,
+            "memory_by_condition",
+            _resource_accounting_map(self.memory_by_condition),
+        )
+        if type(self.wall_time_seconds_by_condition) is not dict:
+            raise TypeError("wall_time_seconds_by_condition must be an exact dictionary")
+        for name in self.wall_time_seconds_by_condition:
+            if type(name) is not str or not name:
+                raise ValueError("wall_time_seconds_by_condition keys must be non-empty strings")
         object.__setattr__(
             self,
             "wall_time_seconds_by_condition",
             {
-                name: _finite_float(
-                    value,
-                    name=f"wall_time_seconds_by_condition[{name}]",
-                )
+                name: _finite_float(value, name=f"wall_time_seconds_by_condition[{name}]")
                 for name, value in self.wall_time_seconds_by_condition.items()
             },
         )

@@ -43,6 +43,24 @@ def test_non_foragax_pairing_identity_rejects_nonfinite_environment() -> None:
     finite = _environment_signature(_run(environment={"kind": "toy", "scale": 1.0}))
     assert '"scale": 1.0' in finite[0]
 
+
+def test_pairing_identity_rejects_unsupported_values_without_string_hooks() -> None:
+    class HostileStringFallback:
+        def __str__(self) -> str:
+            raise AssertionError("pairing identity must not invoke __str__")
+
+    with pytest.raises(ValueError, match="finite JSON"):
+        _environment_signature(
+            _run(environment={"kind": "toy", "hostile": HostileStringFallback()})
+        )
+
+    class HostileMapping(dict[str, object]):
+        def items(self):  # type: ignore[no-untyped-def, override]
+            raise AssertionError("pairing identity must not invoke mapping hooks")
+
+    with pytest.raises(ValueError, match="finite JSON"):
+        _environment_signature(_run(environment=HostileMapping(kind="toy")))
+
     with pytest.raises(ValueError, match="environment pairing identity"):
         _environment_signature(_run(environment={"kind": "toy", "scale": math.nan}))
     with pytest.raises(ValueError, match="environment pairing identity"):

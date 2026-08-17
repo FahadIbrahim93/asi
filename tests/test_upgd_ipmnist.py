@@ -1186,3 +1186,22 @@ def test_ipmnist_run_result_rejects_leftover_identities() -> None:
     assert '"learner": true' not in dumped
     assert '"seeds": [true]' not in dumped
     assert '"noise_mode": true' not in dumped
+
+
+def test_ipmnist_run_result_rejects_hostile_scalar_and_seed_containers() -> None:
+    class HostileFloat(float):
+        def __float__(self) -> float:
+            raise AssertionError("hostile float conversion must not run")
+
+    class HostileSeeds:
+        def __iter__(self):
+            raise AssertionError("hostile seed iteration must not run")
+
+    with pytest.raises(ValueError, match="wall_clock_seconds"):
+        _legal_ipmnist_run_result(wall_clock_seconds=HostileFloat(1.0))
+    with pytest.raises(ValueError, match="exact tuple"):
+        _legal_ipmnist_run_result(seeds=HostileSeeds())
+    with pytest.raises(ValueError, match="non-empty"):
+        _legal_ipmnist_run_result(seeds=())
+    with pytest.raises(ValueError, match="unique"):
+        _legal_ipmnist_run_result(seeds=(0, 0))

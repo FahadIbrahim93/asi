@@ -202,6 +202,16 @@ def _require_nonempty_string(value: object, *, context: str) -> str:
     return value
 
 
+def _require_builtin_finite_real(value: object, *, context: str) -> float:
+    """Canonicalize a result scalar without invoking numeric subclass hooks."""
+    if type(value) not in (int, float):
+        raise ValueError(f"{context} must be a finite built-in real number")
+    number = float(cast("int | float", value))
+    if not math.isfinite(number):
+        raise ValueError(f"{context} must be a finite built-in real number")
+    return number
+
+
 # =============================================================================
 # Configuration
 # =============================================================================
@@ -691,19 +701,24 @@ def bayes_predict(component_means: Array, dim_sigma: Array, x: Array) -> Array:
 
     Equal class priors, equal component weights, shared diagonal covariance:
     the Bayes rule is ``argmax_c logsumexp_k(-0.5 * mahalanobis²(x, mu_ck))``.
-    Distances are computed in expanded (GEMM) form so memory stays
-    ``O(n * n_classes * n_components)`` instead of materializing the
-    ``(n, C, K, dim)`` difference tensor.
+    Components are visited sequentially so memory stays
+    ``O(n * n_classes * n_components + n * dim)`` instead of materializing
+    the ``(n, C, K, dim)`` difference tensor.  Computing each coordinate
+    difference before squaring also avoids the catastrophic cancellation in
+    the expanded ``||x||² - 2 x·mu + ||mu||²`` identity.
     """
     c, k, d = component_means.shape
     whitened_means = (component_means / dim_sigma[None, None, :]).reshape(c * k, d)
-    origin = whitened_means[0]
-    whitened_x = x / dim_sigma[None, :] - origin
-    whitened_means = whitened_means - origin
-    cross = whitened_x @ whitened_means.T
-    x_norms = jnp.sum(whitened_x * whitened_x, axis=1)
-    mean_norms = jnp.sum(whitened_means * whitened_means, axis=1)
-    d2 = (x_norms[:, None] - 2.0 * cross + mean_norms[None, :]).reshape(-1, c, k)
+    whitened_x = x / dim_sigma[None, :]
+
+    def squared_distances(mean: Array) -> Array:
+        delta = whitened_x - mean[None, :]
+        return jnp.sum(delta * delta, axis=1)
+
+    # lax.map evaluates one component at a time.  Unlike vmap/broadcasting,
+    # this makes the bounded-memory contract explicit while retaining a
+    # vectorized reduction across samples and dimensions for each component.
+    d2 = jax.lax.map(squared_distances, whitened_means).T.reshape(-1, c, k)
     scores = jax.scipy.special.logsumexp(-0.5 * d2, axis=2)
     return jnp.argmax(scores, axis=1).astype(jnp.int32)
 
@@ -734,14 +749,14 @@ def bayes_reference(
     chunk_size = min(20_000, n_samples)
     class_components = config.n_classes * config.n_components
     # Exact named host-visible arrays retained at the peak of bayes_predict:
-    # geometry + whitened geometry, y/z/eps/x, whitened x, cross/d2,
-    # their norms, scores, and predictions. Expression/compiler temporaries
+    # geometry + whitened geometry, y/z/eps/x, whitened x, d2, scores, and
+    # predictions. The one-component delta and expression/compiler temporaries
     # are intentionally outside this explicitly named work contract.
     bayes_work_scalars = (
         2 * class_components * config.dim
         + config.dim
         + 3 * chunk_size * config.dim
-        + 2 * chunk_size * class_components
+        + chunk_size * class_components
         + chunk_size * config.n_classes
         + class_components
         + 4 * chunk_size
@@ -983,13 +998,17 @@ class MicroRunResult:
         object.__setattr__(
             self,
             "overall_accuracy",
-            _require_finite_real(self.overall_accuracy, "MicroRunResult.overall_accuracy"),
+            _require_builtin_finite_real(
+                self.overall_accuracy,
+                context="MicroRunResult.overall_accuracy",
+            ),
         )
         object.__setattr__(
             self,
             "wall_clock_seconds",
-            _require_finite_real(
-                self.wall_clock_seconds, "MicroRunResult.wall_clock_seconds"
+            _require_builtin_finite_real(
+                self.wall_clock_seconds,
+                context="MicroRunResult.wall_clock_seconds",
             ),
         )
 

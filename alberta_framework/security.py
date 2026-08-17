@@ -11,11 +11,16 @@ from __future__ import annotations
 import dataclasses
 import json
 import math
+import operator
 import time
 from collections.abc import Mapping, Sequence
 from enum import IntEnum
-from numbers import Real
-from typing import Any
+from fractions import Fraction
+from typing import Any, SupportsIndex, cast
+
+import numpy as np
+
+from alberta_framework.core._float32_scalars import validated_float32_scalar
 
 
 def _require_rfc_json_mapping(payload: Mapping[str, Any], *, name: str) -> None:
@@ -24,6 +29,75 @@ def _require_rfc_json_mapping(payload: Mapping[str, Any], *, name: str) -> None:
         json.dumps(payload, allow_nan=False)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"{name} must be RFC-compliant JSON") from exc
+
+
+_INT32_MAX: int = 2**31 - 1
+
+_ACTUAL_INT_TYPES = frozenset(
+    {
+        int,
+        np.int8,
+        np.int16,
+        np.int32,
+        np.int64,
+        np.uint8,
+        np.uint16,
+        np.uint32,
+        np.uint64,
+        np.longlong,
+        np.ulonglong,
+    }
+)
+_ACTUAL_FLOAT_TYPES = frozenset(
+    {float, Fraction, *(np.dtype(code).type for code in ("e", "f", "d", "g"))}
+)
+_ALLOWED_REAL_TYPES = _ACTUAL_INT_TYPES | _ACTUAL_FLOAT_TYPES
+
+
+def _copy_mapping(payload: object, *, name: str) -> dict[str, Any]:
+    if not issubclass(type(payload), Mapping):
+        raise ValueError(f"{name} must be a mapping")
+    try:
+        values = dict(cast(Mapping[str, Any], payload))
+    except Exception as error:
+        raise ValueError(f"{name} must be a readable mapping") from error
+    if any(type(key) is not str for key in values):
+        raise ValueError(f"{name} keys must be exact strings")
+    return values
+
+
+def _require_exact_str(name: str, value: object) -> str:
+    if type(value) is not str:
+        raise ValueError(f"{name} must be an exact string")
+    return value
+
+
+def _require_int(
+    name: str,
+    value: object,
+    *,
+    minimum: int | None = None,
+    maximum: int | None = None,
+) -> int:
+    if type(value) not in _ACTUAL_INT_TYPES:
+        raise ValueError(f"{name} must be an integer")
+    number = operator.index(cast(SupportsIndex, value))
+    if minimum is not None and number < minimum:
+        raise ValueError(f"{name} must be >= {minimum}")
+    if maximum is not None and number > maximum:
+        raise ValueError(f"{name} must be <= {maximum}")
+    return number
+
+
+def _require_finite_real(name: str, value: object) -> float:
+    if type(value) not in _ALLOWED_REAL_TYPES:
+        raise ValueError(f"{name} must be a real number")
+    # validated_float32_scalar ensures finite and canonical float32 domain;
+    # use permissive domain to allow any finite real then check isfinite via validator.
+    try:
+        return validated_float32_scalar(name, value)
+    except ValueError:
+        raise ValueError(f"{name} must be a finite real number") from None
 
 
 class SecurityAction(IntEnum):
@@ -128,10 +202,16 @@ class SecurityFeatureSchema:
     dtype: str = "float32"
 
     def __post_init__(self) -> None:
+        if type(self.names) is not tuple:
+            raise ValueError("feature schema names must be an exact tuple")
         if not self.names:
             raise ValueError("feature schema must contain at least one feature")
+        for idx, name in enumerate(self.names):
+            _require_exact_str(f"names[{idx}]", name)
         if len(set(self.names)) != len(self.names):
             raise ValueError("feature names must be unique")
+        _require_exact_str("version", self.version)
+        _require_exact_str("dtype", self.dtype)
 
     @property
     def feature_dim(self) -> int:
@@ -158,13 +238,21 @@ class SecurityFeatureSchema:
         return payload
 
     @classmethod
-    def from_dict(cls, data: Mapping[str, Any]) -> SecurityFeatureSchema:
+    def from_dict(cls, data: object) -> SecurityFeatureSchema:
         """Reconstruct a schema from ``to_dict`` output."""
-        return cls(
-            names=tuple(str(name) for name in data["names"]),
-            version=str(data.get("version", "security-gym-v1")),
-            dtype=str(data.get("dtype", "float32")),
+        payload = _copy_mapping(data, name="security feature schema")
+        raw_names = payload.get("names")
+        if type(raw_names) not in (list, tuple):
+            raise ValueError("security feature schema names must be a list or tuple")
+        names = tuple(
+            _require_exact_str(f"names[{i}]", n)
+            for i, n in enumerate(cast(Sequence[Any], raw_names))
         )
+        version = payload.get("version", "security-gym-v1")
+        dtype = payload.get("dtype", "float32")
+        _require_exact_str("version", version)
+        _require_exact_str("dtype", dtype)
+        return cls(names=names, version=version, dtype=dtype)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -195,16 +283,46 @@ class SecurityRolloutStep:
         return payload
 
     @classmethod
-    def from_dict(cls, data: Mapping[str, Any]) -> SecurityRolloutStep:
+    def from_dict(cls, data: object) -> SecurityRolloutStep:
         """Reconstruct a rollout step from ``to_dict`` output."""
+        payload = _copy_mapping(data, name="security rollout step")
+        raw_state = payload.get("state")
+        raw_next = payload.get("next_state")
+        if type(raw_state) not in (list, tuple) or type(raw_next) not in (list, tuple):
+            raise ValueError("security rollout step state must be a list or tuple")
+        state = tuple(
+            _require_finite_real(f"state[{i}]", v)
+            for i, v in enumerate(cast(Sequence[Any], raw_state))
+        )
+        next_state = tuple(
+            _require_finite_real(f"next_state[{i}]", v)
+            for i, v in enumerate(cast(Sequence[Any], raw_next))
+        )
+        action = coerce_security_action(payload.get("action"))
+        reward = _require_finite_real("reward", payload.get("reward"))
+        terminated = payload.get("terminated")
+        truncated = payload.get("truncated", False)
+        if type(terminated) is not bool:
+            raise ValueError("terminated must be an exact bool")
+        if type(truncated) is not bool:
+            raise ValueError("truncated must be an exact bool")
+        raw_meta = payload.get("policy_metadata", {})
+        if raw_meta is None:
+            raw_meta = {}
+        meta = (
+            _copy_mapping(raw_meta, name="policy_metadata")
+            if isinstance(raw_meta, Mapping)
+            else {}
+        )
+        # ensure policy_metadata values are JSON-safe via existing helper later; keep mapping
         return cls(
-            state=tuple(float(value) for value in data["state"]),
-            action=coerce_security_action(data["action"]),
-            reward=float(data["reward"]),
-            next_state=tuple(float(value) for value in data["next_state"]),
-            terminated=bool(data["terminated"]),
-            truncated=bool(data.get("truncated", False)),
-            policy_metadata=dict(data.get("policy_metadata", {})),
+            state=state,
+            action=action,
+            reward=reward,
+            next_state=next_state,
+            terminated=terminated,
+            truncated=truncated,
+            policy_metadata=meta,
         )
 
 
@@ -279,36 +397,37 @@ def validate_security_oracle_experience(
             raise ValueError(f"invalid oracle experience {idx}: missing outcome label")
 
 
-def coerce_security_action(action: SecurityAction | int | str) -> SecurityAction:
+def coerce_security_action(action: object) -> SecurityAction:
     """Coerce an integer or name to ``SecurityAction``."""
-    if isinstance(action, bool):
-        raise ValueError(f"security action must not be a boolean: {action!r}")
+    if type(action) is bool:
+        raise ValueError("security action must not be a boolean")
     if type(action) is SecurityAction:
         return action
     if type(action) is int:
         try:
             return SecurityAction(action)
         except ValueError as exc:
-            raise ValueError(f"unknown security action: {action!r}") from exc
+            raise ValueError("unknown security action") from exc
     if type(action) is str:
+        _require_exact_str("security action", action)
         normalized = action.strip().lower()
         if normalized in _ACTION_ALIASES:
             return _ACTION_ALIASES[normalized]
         for candidate in SecurityAction:
             if candidate.name.lower() == normalized:
                 return candidate
-        raise ValueError(f"unknown security action: {action!r}")
+        raise ValueError("unknown security action")
     raise ValueError("unknown security action")
 
 
-def security_gym_action_name(action: SecurityAction | int | str) -> str:
+def security_gym_action_name(action: object) -> str:
     """Return the action name expected by ``security-gym``."""
     return SECURITY_GYM_ACTION_NAMES[int(coerce_security_action(action))]
 
 
 def to_security_gym_action(
-    action: SecurityAction | int | str,
-    risk_score: float = 0.0,
+    action: object,
+    risk_score: object = 0.0,
 ) -> dict[str, int | tuple[float]]:
     """Convert a framework action into a ``security-gym`` action dict.
 
@@ -316,15 +435,14 @@ def to_security_gym_action(
     ``action`` id and a one-element ``risk_score`` array. A one-element tuple is
     accepted by the environment and keeps this module dependency-free.
     """
-    actual_type = type(risk_score)
-    if issubclass(actual_type, bool) or not issubclass(actual_type, Real):
+    if type(risk_score) not in _ALLOWED_REAL_TYPES:
         raise ValueError("risk_score must be a finite real number")
     try:
-        val = float(risk_score)
-        if not math.isfinite(val):
-            raise ValueError(f"risk_score must be finite, got {risk_score!r}")
-    except (OverflowError, TypeError, ValueError) as exc:
-        raise ValueError(f"risk_score must be a finite real number, got {risk_score!r}") from exc
+        val = validated_float32_scalar("risk_score", risk_score)
+    except ValueError as exc:
+        raise ValueError("risk_score must be a finite real number") from exc
+    if not math.isfinite(val):
+        raise ValueError("risk_score must be a finite real number")
     clipped_risk = min(10.0, max(0.0, val))
     return {
         "action": int(coerce_security_action(action)),
@@ -333,11 +451,13 @@ def to_security_gym_action(
 
 
 def security_gym_action_reward(
-    action: SecurityAction | int | str,
+    action: object,
     *,
-    is_malicious: bool,
+    is_malicious: object,
 ) -> float:
     """Return the immediate action reward from ``security-gym`` v0.4.x."""
+    if type(is_malicious) is not bool:
+        raise ValueError("is_malicious must be an exact bool")
     table = _SECURITY_GYM_ATTACK_REWARDS if is_malicious else _SECURITY_GYM_BENIGN_REWARDS
     return table[coerce_security_action(action)]
 
@@ -361,6 +481,12 @@ class ThroughputMeasurement:
 
     n_events: int
     elapsed_s: float
+
+    def __post_init__(self) -> None:
+        _require_int("n_events", self.n_events, minimum=0, maximum=_INT32_MAX)
+        if type(self.elapsed_s) not in _ALLOWED_REAL_TYPES:
+            raise ValueError("elapsed_s must be a real number")
+        # allow any finite float; validation for JSON happens in to_dict
 
     @property
     def events_per_second(self) -> float:
@@ -387,11 +513,10 @@ class ThroughputMeter:
         self._start = time.perf_counter()
         self._n_events = 0
 
-    def tick(self, n_events: int = 1) -> None:
+    def tick(self, n_events: object = 1) -> None:
         """Record completed events."""
-        if n_events < 0:
-            raise ValueError("n_events must be non-negative")
-        self._n_events += n_events
+        n_events_int = _require_int("n_events", n_events, minimum=0, maximum=_INT32_MAX)
+        self._n_events += n_events_int
 
     def measure(self) -> ThroughputMeasurement:
         """Return current throughput measurement."""

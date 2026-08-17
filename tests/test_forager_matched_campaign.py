@@ -43,6 +43,22 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 # canonical bytes with a self-consistent digest triple exercise the binding.
 _QUALIFICATION_MANIFEST = {"schema_version": "test.matched_current_qualification.v1"}
 _QUALIFICATION_MANIFEST_BYTES = campaign.canonical_json_bytes(_QUALIFICATION_MANIFEST)
+
+
+def test_canonical_json_rejects_nonstring_keys_without_string_hooks() -> None:
+    class HostileKey:
+        def __str__(self) -> str:
+            raise AssertionError("canonicalization must not stringify keys")
+
+    with pytest.raises(campaign.ForagerMatchedCampaignError, match="canonical JSON"):
+        campaign.canonical_json_bytes({HostileKey(): 1})  # type: ignore[dict-item]
+
+    class HostileMapping(dict[str, object]):
+        def items(self):  # type: ignore[no-untyped-def, override]
+            raise AssertionError("canonicalization must not invoke mapping hooks")
+
+    with pytest.raises(campaign.ForagerMatchedCampaignError, match="canonical JSON"):
+        campaign.canonical_json_bytes(HostileMapping(value=1))
 _QUALIFICATION_MANIFEST_SHA256 = hashlib.sha256(_QUALIFICATION_MANIFEST_BYTES).hexdigest()
 
 

@@ -29,6 +29,7 @@ import sqlite3
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 import numpy as np
@@ -133,13 +134,31 @@ def _canonical_json_sha256(value: Any) -> str:
 
 
 def _pairing_json(value: Any, *, name: str) -> str:
-    """Encode a pairing identity while rejecting non-finite JSON numbers."""
+    """Encode an exact pairing identity without invoking fallback hooks."""
+
+    def plain(item: Any) -> Any:
+        if type(item) in (dict, MappingProxyType):
+            result: dict[str, Any] = {}
+            for key, child in item.items():
+                if type(key) is not str:
+                    raise ValueError(f"{name} must have exact string keys")
+                result[key] = plain(child)
+            return result
+        if type(item) in (list, tuple):
+            return [plain(child) for child in item]
+        if type(item) is float:
+            if not math.isfinite(item):
+                raise ValueError(f"{name} must contain finite numbers")
+            return item
+        if item is None or type(item) in (str, bool, int):
+            return item
+        raise ValueError(f"{name} contains a non-JSON identity")
+
     try:
         return json.dumps(
-            value,
+            plain(value),
             allow_nan=False,
             sort_keys=True,
-            default=str,
         )
     except (TypeError, ValueError) as exc:
         raise ValueError(f"{name} must be finite JSON") from exc

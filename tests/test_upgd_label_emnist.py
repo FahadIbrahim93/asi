@@ -743,8 +743,8 @@ class TestPlanShardMergeAccounting:
     def test_summarize_result_refuses_vacuous_single_seed_stderr(self):
         with pytest.raises(ValueError, match="fewer than two observations"):
             summarize_result(self._synthetic_result(np.asarray([0.5])))
-        with pytest.raises(ValueError, match="fewer than two observations"):
-            summarize_result(self._synthetic_result(np.asarray([], dtype=np.float64)))
+        with pytest.raises(ValueError, match="seeds must be non-empty"):
+            self._synthetic_result(np.asarray([], dtype=np.float64))
 
     def test_summarize_result_two_seed_stderr_is_sample_se(self):
         values = np.asarray([0.25, 0.75], dtype=np.float64)
@@ -915,3 +915,22 @@ def test_label_emnist_run_result_rejects_leftover_identities() -> None:
     assert '"wall_clock_seconds": true' not in dumped
     assert '"learner": true' not in dumped
     assert '"seeds": [true]' not in dumped
+
+
+def test_label_emnist_result_rejects_hostile_scalar_and_seed_containers() -> None:
+    class HostileFloat(float):
+        def __float__(self) -> float:
+            raise AssertionError("hostile float conversion must not run")
+
+    class HostileSeeds:
+        def __iter__(self):
+            raise AssertionError("hostile seed iteration must not run")
+
+    with pytest.raises(ValueError, match="wall_clock_seconds"):
+        _legal_label_emnist_run_result(wall_clock_seconds=HostileFloat(1.0))
+    with pytest.raises(ValueError, match="exact tuple"):
+        _legal_label_emnist_run_result(seeds=HostileSeeds())
+    with pytest.raises(ValueError, match="non-empty"):
+        _legal_label_emnist_run_result(seeds=())
+    with pytest.raises(ValueError, match="unique"):
+        _legal_label_emnist_run_result(seeds=(0, 0))

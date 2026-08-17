@@ -791,6 +791,21 @@ class TestBayesReference:
 
         np.testing.assert_array_equal(predictions, np.asarray([1], dtype=np.int32))
 
+    def test_bayes_predict_avoids_cancellation_away_from_shared_origin(self):
+        component_means = jnp.asarray(
+            [[[0.0, 0.0]], [[10_000.0, 10_000.0]], [[10_001.0, 10_001.0]]],
+            dtype=jnp.float32,
+        )
+        observations = jnp.asarray([[10_001.0, 10_001.0]], dtype=jnp.float32)
+
+        predictions = bayes_predict(
+            component_means,
+            jnp.ones((2,), dtype=jnp.float32),
+            observations,
+        )
+
+        np.testing.assert_array_equal(predictions, np.asarray([2], dtype=np.int32))
+
     def test_stream_geometry_matches_reference_geometry(self):
         stream = generate_stream(TINY, seed=5)
         means, dim_sigma = class_geometry(TINY, seed=5)
@@ -1993,3 +2008,14 @@ def test_micro_run_result_rejects_leftover_identities() -> None:
     assert '"family": true' not in dumped
     assert '"seed": true' not in dumped
     assert '"hidden1": true' not in dumped
+
+
+def test_micro_run_result_rejects_numeric_subclasses_without_conversion_hooks() -> None:
+    class HostileFloat(float):
+        def __float__(self) -> float:
+            raise AssertionError("result validation must not invoke __float__")
+
+    with pytest.raises(ValueError, match="overall_accuracy"):
+        _legal_micro_run_result(overall_accuracy=HostileFloat(0.5))
+    with pytest.raises(ValueError, match="wall_clock_seconds"):
+        _legal_micro_run_result(wall_clock_seconds=HostileFloat(1.0))
