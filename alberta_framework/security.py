@@ -16,6 +16,7 @@ import time
 from collections.abc import Mapping, Sequence
 from enum import IntEnum
 from fractions import Fraction
+from types import MappingProxyType
 from typing import Any, SupportsIndex, cast
 
 import numpy as np
@@ -55,7 +56,7 @@ _ALLOWED_REAL_TYPES = _ACTUAL_INT_TYPES | _ACTUAL_FLOAT_TYPES
 
 
 def _copy_mapping(payload: object, *, name: str) -> dict[str, Any]:
-    if not issubclass(type(payload), Mapping):
+    if type(payload) not in (dict, MappingProxyType):
         raise ValueError(f"{name} must be a mapping")
     try:
         values = dict(cast(Mapping[str, Any], payload))
@@ -64,6 +65,26 @@ def _copy_mapping(payload: object, *, name: str) -> dict[str, Any]:
     if any(type(key) is not str for key in values):
         raise ValueError(f"{name} keys must be exact strings")
     return values
+
+
+def _copy_json_value(value: object, *, name: str) -> Any:
+    if value is None or type(value) in (bool, int, str):
+        return value
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise ValueError(f"{name} must be RFC-compliant JSON with finite numbers")
+        return value
+    if type(value) in (list, tuple):
+        return [_copy_json_value(item, name=name) for item in cast(Sequence[object], value)]
+    if type(value) in (dict, MappingProxyType):
+        payload = _copy_mapping(value, name=name)
+        return {key: _copy_json_value(item, name=name) for key, item in payload.items()}
+    raise ValueError(f"{name} must contain exact JSON values")
+
+
+def _copy_json_mapping(payload: object, *, name: str) -> dict[str, Any]:
+    copied = _copy_mapping(payload, name=name)
+    return {key: _copy_json_value(value, name=name) for key, value in copied.items()}
 
 
 def _require_exact_str(name: str, value: object) -> str:
@@ -185,12 +206,24 @@ def security_reward(
     Unknown component names are ignored so sibling environments can log richer
     diagnostics while keeping the learning reward contract stable.
     """
-    weight_map = weights.to_dict() if isinstance(weights, SecurityRewardWeights) else weights
-    if weight_map is None:
+    component_map = _copy_mapping(components, name="security reward components")
+    if weights is None:
         weight_map = SecurityRewardWeights().to_dict()
-    return float(
-        sum(float(components.get(name, 0.0)) * weight for name, weight in weight_map.items())
-    )
+    elif type(weights) is SecurityRewardWeights:
+        weight_map = weights.to_dict()
+    else:
+        weight_map = _copy_mapping(weights, name="security reward weights")
+    terms = []
+    for name, raw_weight in weight_map.items():
+        weight = _require_finite_real(f"security reward weight {name}", raw_weight)
+        component = _require_finite_real(
+            f"security reward component {name}", component_map.get(name, 0.0)
+        )
+        terms.append(component * weight)
+    reward = math.fsum(terms)
+    if not math.isfinite(reward):
+        raise ValueError("security reward must be finite")
+    return reward
 
 
 @dataclasses.dataclass(frozen=True)
@@ -252,6 +285,9 @@ class SecurityFeatureSchema:
         dtype = payload.get("dtype", "float32")
         _require_exact_str("version", version)
         _require_exact_str("dtype", dtype)
+        feature_dim = payload.get("feature_dim")
+        if feature_dim is not None and (type(feature_dim) is not int or feature_dim != len(names)):
+            raise ValueError("feature_dim must match the number of feature names")
         return cls(names=names, version=version, dtype=dtype)
 
 
@@ -277,7 +313,9 @@ class SecurityRolloutStep:
             "next_state": list(self.next_state),
             "terminated": self.terminated,
             "truncated": self.truncated,
-            "policy_metadata": dict(self.policy_metadata),
+            "policy_metadata": _copy_json_mapping(
+                self.policy_metadata, name="policy_metadata"
+            ),
         }
         _require_rfc_json_mapping(payload, name="security rollout step")
         return payload
@@ -299,6 +337,11 @@ class SecurityRolloutStep:
             for i, v in enumerate(cast(Sequence[Any], raw_next))
         )
         action = coerce_security_action(payload.get("action"))
+        action_name = payload.get("action_name")
+        if action_name is not None and (
+            type(action_name) is not str or action_name != action.name.lower()
+        ):
+            raise ValueError("action_name must match action")
         reward = _require_finite_real("reward", payload.get("reward"))
         terminated = payload.get("terminated")
         truncated = payload.get("truncated", False)
@@ -307,14 +350,7 @@ class SecurityRolloutStep:
         if type(truncated) is not bool:
             raise ValueError("truncated must be an exact bool")
         raw_meta = payload.get("policy_metadata", {})
-        if raw_meta is None:
-            raw_meta = {}
-        meta = (
-            _copy_mapping(raw_meta, name="policy_metadata")
-            if isinstance(raw_meta, Mapping)
-            else {}
-        )
-        # ensure policy_metadata values are JSON-safe via existing helper later; keep mapping
+        meta = _copy_json_mapping(raw_meta, name="policy_metadata")
         return cls(
             state=state,
             action=action,
@@ -345,8 +381,10 @@ class SecurityOracleExperience:
             "action": int(self.action),
             "action_name": security_gym_action_name(self.action),
             "reward": self.reward,
-            "outcome": dict(self.outcome),
-            "policy_metadata": dict(self.policy_metadata),
+            "outcome": _copy_json_mapping(self.outcome, name="security oracle outcome"),
+            "policy_metadata": _copy_json_mapping(
+                self.policy_metadata, name="policy_metadata"
+            ),
         }
         _require_rfc_json_mapping(payload, name="security oracle experience")
         return payload
@@ -356,7 +394,10 @@ def security_rollout_step_to_oracle_experience(
     step: SecurityRolloutStep,
 ) -> SecurityOracleExperience:
     """Convert a rollout transition to a compact oracle-review record."""
-    is_malicious = bool(step.policy_metadata.get("is_malicious", False))
+    policy_metadata = _copy_json_mapping(step.policy_metadata, name="policy_metadata")
+    is_malicious = policy_metadata.get("is_malicious", False)
+    if type(is_malicious) is not bool:
+        raise ValueError("policy_metadata is_malicious must be an exact bool")
     defensive_action = step.action in (
         SecurityAction.THROTTLE,
         SecurityAction.BLOCK,
@@ -379,7 +420,7 @@ def security_rollout_step_to_oracle_experience(
             "terminated": step.terminated,
             "truncated": step.truncated,
         },
-        policy_metadata=step.policy_metadata,
+        policy_metadata=policy_metadata,
     )
 
 
@@ -483,10 +524,17 @@ class ThroughputMeasurement:
     elapsed_s: float
 
     def __post_init__(self) -> None:
-        _require_int("n_events", self.n_events, minimum=0, maximum=_INT32_MAX)
+        n_events = _require_int("n_events", self.n_events, minimum=0, maximum=_INT32_MAX)
         if type(self.elapsed_s) not in _ALLOWED_REAL_TYPES:
             raise ValueError("elapsed_s must be a real number")
-        # allow any finite float; validation for JSON happens in to_dict
+        try:
+            elapsed_s = float(self.elapsed_s)
+        except (OverflowError, ValueError) as exc:
+            raise ValueError("elapsed_s must be representable as a float") from exc
+        object.__setattr__(self, "n_events", n_events)
+        object.__setattr__(self, "elapsed_s", elapsed_s)
+        # Non-finite and nonpositive telemetry remains constructible for compatibility;
+        # strict JSON publication rejects its derived non-finite rate in ``to_dict``.
 
     @property
     def events_per_second(self) -> float:
@@ -516,6 +564,8 @@ class ThroughputMeter:
     def tick(self, n_events: object = 1) -> None:
         """Record completed events."""
         n_events_int = _require_int("n_events", n_events, minimum=0, maximum=_INT32_MAX)
+        if n_events_int > _INT32_MAX - self._n_events:
+            raise ValueError("cumulative n_events must fit signed int32")
         self._n_events += n_events_int
 
     def measure(self) -> ThroughputMeasurement:
