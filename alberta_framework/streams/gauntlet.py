@@ -994,6 +994,18 @@ def load_lifetime_gauntlet_checkpoint(
     return stream, state
 
 
+def _require_positive_builtin_int(value: object, *, name: str) -> int:
+    if type(value) is not int or value < 1:
+        raise ValueError(f"{name} must be a positive built-in integer")
+    return value
+
+
+def _require_scorecard_window(window: object, *, maximum: int) -> int:
+    if type(window) is not int or not 1 <= window <= maximum:
+        raise ValueError(f"window must be a built-in integer in [1, {maximum}]")
+    return window
+
+
 def lifetime_scorecard(
     sq_errors: Array, config: GauntletConfig, n_cycles: int, window: int = 200
 ) -> dict[str, Array]:
@@ -1019,7 +1031,9 @@ def lifetime_scorecard(
           cycle-0 entry error divided by each later cycle's entry error.
         - ``nan_steps``: non-finite step count (must be 0 for life).
     """
+    n_cycles = _require_positive_builtin_int(n_cycles, name="n_cycles")
     length = config.segment_length
+    window = _require_scorecard_window(window, maximum=length)
     cycle_len = LifetimeGauntletStream.SUB_SEGMENTS * length
     trimmed = sq_errors[..., : n_cycles * cycle_len]
     per_cycle = trimmed.reshape(
@@ -1203,6 +1217,7 @@ def early_window_mse(
     retention: the learner re-enters the task near its old solution instead
     of relearning from scratch.
     """
+    window = _require_scorecard_window(window, maximum=segment_length)
     seg = segment_slice(sq_errors, segment, segment_length)
     return jnp.mean(seg[..., :window], axis=-1)
 
@@ -1223,6 +1238,7 @@ def savings_ratio(
     steps-to-criterion because it stays informative for learners whose
     asymptotic error sits near the criterion threshold.)
     """
+    window = _require_scorecard_window(window, maximum=segment_length)
     first = early_window_mse(sq_errors, first_segment, segment_length, window)
     revisit = early_window_mse(sq_errors, revisit_segment, segment_length, window)
     return first / jnp.maximum(revisit, 1e-8)
