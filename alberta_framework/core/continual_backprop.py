@@ -732,6 +732,19 @@ class ContinualBackpropTracker:
     config: ContinualBackpropConfig
     sparsity: float = 0.9
 
+    def __post_init__(self) -> None:
+        """Reject bool/non-finite sparsity identities used at replacement."""
+        object.__setattr__(
+            self,
+            "sparsity",
+            _validated_config_float(
+                "sparsity",
+                self.sparsity,
+                lower=0.0,
+                upper=1.0,
+            ),
+        )
+
 
 class CBPMultiHeadMLPLearner:
     """Multi-head MLP learner with Continual Backprop unit replacement.
@@ -804,6 +817,19 @@ class CBPMultiHeadMLPLearner:
                 hidden-unit utility diagnostics.
         """
         self._cbp_config = cbp_config or ContinualBackpropConfig()
+        if type(use_layer_norm) is not bool:
+            raise ValueError("use_layer_norm must be an actual bool")
+        sparsity = _validated_config_float(
+            "sparsity",
+            sparsity,
+            lower=0.0,
+            upper=1.0,
+        )
+        leaky_relu_slope = validated_float32_scalar(
+            "leaky_relu_slope",
+            leaky_relu_slope,
+            lower=0.0,
+        )
         self._sparsity = sparsity
         self._leaky_relu_slope = leaky_relu_slope
         self._use_layer_norm = use_layer_norm
