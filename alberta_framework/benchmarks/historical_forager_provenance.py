@@ -9,8 +9,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Mapping
-from typing import Any, Final
+import math
+from typing import Any, Final, cast
 
 __all__ = [
     "CURRENT_FORAGAX_055_FAMILY_ID",
@@ -27,6 +27,9 @@ __all__ = [
 HISTORICAL_FORAGER_FAMILY_ID: Final = "historical_numpy_forager_d140_reconstructed"
 CURRENT_FORAGAX_055_FAMILY_ID: Final = "current_foragax_0_55"
 HISTORICAL_FORAGER_PROVENANCE_SCHEMA: Final = "alberta.historical_numpy_forager.provenance.v1"
+_MAX_PROVENANCE_DEPTH: Final = 8
+_MAX_PROVENANCE_NODES: Final = 4096
+_MAX_PROVENANCE_STRING_BYTES: Final = 1024 * 1024
 
 _HISTORICAL_FORAGER_PROVENANCE: Final[dict[str, Any]] = {
     "schema_version": HISTORICAL_FORAGER_PROVENANCE_SCHEMA,
@@ -144,7 +147,58 @@ def _require_exact_str(name: object, value: object) -> str:
     return value
 
 
-def _canonical_json_bytes(value: Any) -> bytes:
+def _validate_json_tree(
+    value: object,
+    *,
+    depth: int = 0,
+    budget: list[int] | None = None,
+) -> None:
+    """Bound exact JSON identities before serialization can dispatch hooks."""
+    if budget is None:
+        budget = [0, 0]
+    budget[0] += 1
+    if budget[0] > _MAX_PROVENANCE_NODES or depth > _MAX_PROVENANCE_DEPTH:
+        raise HistoricalForagerProvenanceError("historical Forager provenance is too large")
+    actual_type = type(value)
+    if actual_type is str:
+        budget[1] += len(cast(str, value).encode("utf-8"))
+        if budget[1] > _MAX_PROVENANCE_STRING_BYTES:
+            raise HistoricalForagerProvenanceError("historical Forager provenance is too large")
+        return
+    if actual_type in {bool, int, type(None)}:
+        return
+    if actual_type is float:
+        if not math.isfinite(cast(float, value)):
+            raise HistoricalForagerProvenanceError(
+                "historical Forager provenance numbers must be finite"
+            )
+        return
+    if actual_type is list:
+        sequence = cast(list[object], value)
+        if len(sequence) > _MAX_PROVENANCE_NODES:
+            raise HistoricalForagerProvenanceError("historical Forager provenance is too large")
+        for item in sequence:
+            _validate_json_tree(item, depth=depth + 1, budget=budget)
+        return
+    if actual_type is dict:
+        mapping = cast(dict[object, object], value)
+        if len(mapping) > _MAX_PROVENANCE_NODES:
+            raise HistoricalForagerProvenanceError("historical Forager provenance is too large")
+        for key, item in mapping.items():
+            if type(key) is not str:
+                raise HistoricalForagerProvenanceError(
+                    "historical Forager provenance keys must be exact strings"
+                )
+            _validate_json_tree(key, depth=depth + 1, budget=budget)
+            _validate_json_tree(item, depth=depth + 1, budget=budget)
+        return
+    raise HistoricalForagerProvenanceError(
+        "historical Forager provenance must contain exact JSON values"
+    )
+
+
+def _canonical_json_bytes(value: object) -> bytes:
+    _validate_json_tree(value)
     try:
         return json.dumps(
             value,
@@ -153,7 +207,7 @@ def _canonical_json_bytes(value: Any) -> bytes:
             separators=(",", ":"),
             sort_keys=True,
         ).encode("utf-8")
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, RecursionError) as exc:
         raise HistoricalForagerProvenanceError(
             "historical Forager provenance must be finite canonical JSON"
         ) from exc
@@ -168,15 +222,17 @@ HISTORICAL_FORAGER_PROVENANCE_SHA256: Final = hashlib.sha256(
 def historical_forager_provenance() -> dict[str, Any]:
     """Return a detached copy of the exact reconstructed-family provenance."""
     value = json.loads(_CANONICAL_PROVENANCE_BYTES)
-    if not isinstance(value, dict):  # pragma: no cover - module constant invariant
+    if type(value) is not dict:  # pragma: no cover - module constant invariant
         raise RuntimeError("canonical historical Forager provenance is not an object")
     return value
 
 
-def validate_historical_forager_provenance(value: Mapping[str, Any]) -> None:
+def validate_historical_forager_provenance(value: object) -> None:
     """Require byte-equivalent canonical provenance, including explicit false claims."""
-    if not isinstance(value, Mapping):
-        raise HistoricalForagerProvenanceError("historical Forager provenance must be a mapping")
+    if type(value) is not dict:
+        raise HistoricalForagerProvenanceError(
+            "historical Forager provenance must be an actual dictionary"
+        )
     if _canonical_json_bytes(value) != _CANONICAL_PROVENANCE_BYTES:
         raise HistoricalForagerProvenanceError(
             "historical Forager provenance differs from the audited reconstruction"
@@ -190,6 +246,5 @@ def assert_historical_family_pairing(left_family_id: object, right_family_id: ob
     if host_left != HISTORICAL_FORAGER_FAMILY_ID or host_right != HISTORICAL_FORAGER_FAMILY_ID:
         raise HistoricalForagerFamilyMismatchError(
             "historical reconstructed results pair only with "
-            f"'{HISTORICAL_FORAGER_FAMILY_ID}'; received "
-            f"'{host_left}' and '{host_right}'"
+            f"'{HISTORICAL_FORAGER_FAMILY_ID}'"
         )

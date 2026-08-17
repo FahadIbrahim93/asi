@@ -7,6 +7,8 @@ from alberta_framework.benchmarks.historical_forager_provenance import (
     HistoricalForagerFamilyMismatchError,
     HistoricalForagerProvenanceError,
     assert_historical_family_pairing,
+    historical_forager_provenance,
+    validate_historical_forager_provenance,
 )
 
 
@@ -58,7 +60,8 @@ def test_mismatch_sanitized_without_repr() -> None:
     ) as exc:
         assert_historical_family_pairing("bad_left", "bad_right")
     assert "!r" not in str(exc.value)
-    assert "bad_left" in str(exc.value)
+    assert "bad_left" not in str(exc.value)
+    assert "bad_right" not in str(exc.value)
     msg = str(exc.value)
     assert "'" in msg
 
@@ -73,3 +76,34 @@ def test_mismatch_even_one_bad_rejected_sanitized() -> None:
     with pytest.raises(HistoricalForagerFamilyMismatchError) as exc:
         assert_historical_family_pairing(HISTORICAL_FORAGER_FAMILY_ID, "other")
     assert "!r" not in str(exc.value)
+
+
+class _HostileDict(dict[str, object]):
+    calls = 0
+
+    def items(self):
+        type(self).calls += 1
+        raise AssertionError("items hook must not run")
+
+
+def test_provenance_validator_rejects_dict_subclass_without_hooks() -> None:
+    _HostileDict.calls = 0
+    with pytest.raises(HistoricalForagerProvenanceError, match="actual dictionary"):
+        validate_historical_forager_provenance(_HostileDict())
+    assert _HostileDict.calls == 0
+
+
+def test_provenance_validator_rejects_nested_hostile_json_identity() -> None:
+    payload = historical_forager_provenance()
+    payload["agents"] = _HostileDict()
+    _HostileDict.calls = 0
+    with pytest.raises(HistoricalForagerProvenanceError, match="exact JSON values"):
+        validate_historical_forager_provenance(payload)
+    assert _HostileDict.calls == 0
+
+
+def test_provenance_validator_bounds_work_before_serialization() -> None:
+    payload = historical_forager_provenance()
+    payload["agents"] = {str(index): index for index in range(4097)}
+    with pytest.raises(HistoricalForagerProvenanceError, match="too large"):
+        validate_historical_forager_provenance(payload)
