@@ -275,9 +275,15 @@ def _require_environment(value: Any) -> HistoricalForagerEnvironment:
 
 
 def _finite_reward(value: Any) -> float:
-    if isinstance(value, bool) or not isinstance(value, Real):
+    actual_type = type(value)
+    if issubclass(actual_type, bool) or not issubclass(actual_type, Real):
         raise HistoricalForagerContractError("historical reward must be a real scalar")
-    result = float(value)
+    try:
+        result = float(cast(Real, value))
+    except Exception as error:
+        raise HistoricalForagerContractError(
+            "historical reward must be a finite real scalar"
+        ) from error
     if not math.isfinite(result):
         raise HistoricalForagerContractError("historical reward must be finite")
     return result
