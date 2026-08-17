@@ -54,6 +54,7 @@ import functools
 import math
 import operator
 import time
+from collections.abc import Mapping
 from numbers import Real
 from typing import Any, SupportsIndex, cast
 
@@ -167,6 +168,25 @@ def _require_scan_resources(num_steps: int, feature_dim: int) -> None:
     logical_scalars = num_steps * (2 * feature_dim + 15) + 12 * feature_dim + 32
     if logical_scalars > _INT32_MAX or 4 * logical_scalars > _INT32_MAX:
         raise ValueError("learning-loop aggregate resources exceed signed-int32 bounds")
+
+
+def _serialized_payload(
+    config: object, *, type_name: str, fields: frozenset[str]
+) -> dict[str, Any]:
+    if not issubclass(type(config), Mapping):
+        raise ValueError("config must be an actual mapping")
+    try:
+        payload = dict(cast(Mapping[str, Any], config))
+    except Exception as error:
+        raise ValueError("config must be a readable mapping") from error
+    if any(type(key) is not str for key in payload) or set(payload) != fields | {"type"}:
+        raise ValueError("config fields do not match the serialized schema")
+    marker = payload.pop("type")
+    if type(marker) is not str or marker != type_name:
+        raise ValueError("config type differs")
+    if any(type(value) not in (int, float) for value in payload.values()):
+        raise ValueError("serialized scalar fields must be exact JSON numbers")
+    return payload
 
 
 # =============================================================================
@@ -597,11 +617,13 @@ class OffPolicyTDLinearLearner:
         }
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> OffPolicyTDLinearLearner:
+    def from_config(cls, config: Mapping[str, Any]) -> OffPolicyTDLinearLearner:
         """Reconstruct from dict."""
-        config = dict(config)
-        config.pop("type", None)
-        return cls(**config)
+        return cls(**_serialized_payload(
+            config,
+            type_name=cls.__name__,
+            fields=frozenset({"step_size", "trace_decay", "retrace_clip"}),
+        ))
 
 
 class ETDLinearLearner:
@@ -814,11 +836,13 @@ class ETDLinearLearner:
         }
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> ETDLinearLearner:
+    def from_config(cls, config: Mapping[str, Any]) -> ETDLinearLearner:
         """Reconstruct from dict."""
-        config = dict(config)
-        config.pop("type", None)
-        return cls(**config)
+        return cls(**_serialized_payload(
+            config,
+            type_name=cls.__name__,
+            fields=frozenset({"step_size", "trace_decay"}),
+        ))
 
 
 class GradientTDLinearLearner:
@@ -1034,11 +1058,13 @@ class GradientTDLinearLearner:
         }
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> GradientTDLinearLearner:
+    def from_config(cls, config: Mapping[str, Any]) -> GradientTDLinearLearner:
         """Reconstruct from dict."""
-        config = dict(config)
-        config.pop("type", None)
-        return cls(**config)
+        return cls(**_serialized_payload(
+            config,
+            type_name=cls.__name__,
+            fields=frozenset({"step_size", "secondary_step_size", "trace_decay", "ratio_clip"}),
+        ))
 
 
 def run_gradient_td_learning_loop(
