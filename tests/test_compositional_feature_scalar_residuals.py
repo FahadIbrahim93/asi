@@ -52,6 +52,26 @@ def test_float32_sinks_contain_hostile_ratio_and_repr_hooks(field: str) -> None:
         _learner(**{field: _HostileFloat(0.5)})
 
 
+@pytest.mark.parametrize(
+    "field",
+    [
+        "step_size_output",
+        "promotion_margin",
+        "parent_novelty_weight",
+        "future_utility_mix",
+        "generator_resource_cost_weight",
+    ],
+)
+def test_nonzero_float32_sinks_reject_underflow_to_zero(field: str) -> None:
+    with pytest.raises(ValueError, match="remain nonzero"):
+        _learner(**{field: 1e-100})
+
+
+def test_selector_bounds_reject_nonzero_underflow() -> None:
+    with pytest.raises(ValueError, match="remain nonzero"):
+        FiniteCandidateSelector(2, loss_lower_bound=1e-100)
+
+
 def test_selector_float_and_string_sinks_are_exact_and_canonical() -> None:
     selector = FiniteCandidateSelector(
         2,
