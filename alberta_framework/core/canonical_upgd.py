@@ -53,15 +53,20 @@ Reference:
 from __future__ import annotations
 
 import math
+import operator
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Literal, SupportsIndex, cast
 
 import chex
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 from jax import Array
 from jaxtyping import Int
+
+from alberta_framework.core._float32_scalars import validated_float32_scalar_with_ratio
 
 UPGDMode = Literal["protecting", "non_protecting"]
 UPGDNormalization = Literal["global", "local"]
@@ -96,6 +101,221 @@ _RAW_GLOBAL_PROFILES = frozenset(
         "official_experiment_global",
     }
 )
+_INT32_MAX = 2_147_483_647
+_ACTUAL_INT_TYPES: tuple[type, ...] = (
+    int,
+    np.int8,
+    np.int16,
+    np.int32,
+    np.int64,
+    np.uint8,
+    np.uint16,
+    np.uint32,
+    np.uint64,
+    np.longlong,
+    np.ulonglong,
+)
+_ACTUAL_REAL_TYPES = frozenset(
+    (*_ACTUAL_INT_TYPES, float, np.float16, np.float32, np.float64, np.longdouble)
+)
+
+
+@dataclass(frozen=True)
+class _ParameterResources:
+    scalars: int
+    nbytes: int
+
+
+def _copy_config_mapping(name: str, config: object) -> dict[str, Any]:
+    """Copy a legacy-compatible mapping while normalizing hostile hooks."""
+    if not isinstance(config, Mapping):
+        raise ValueError(f"{name} must be a mapping")
+    try:
+        payload = dict(config)
+    except Exception as error:
+        raise ValueError(f"{name} must be a readable mapping") from error
+    if any(type(key) is not str for key in payload):
+        raise ValueError(f"{name} fields must be strings")
+    return cast(dict[str, Any], payload)
+
+
+def _array_metadata(name: str, value: object) -> tuple[tuple[int, ...], np.dtype[Any]]:
+    """Read bounded host shape/dtype metadata without invoking JAX conversion."""
+    if type(value) is float:
+        raw_shape: object = ()
+        raw_dtype: object = np.dtype(float)
+    else:
+        try:
+            raw_shape = getattr(value, "shape")
+            raw_dtype = getattr(value, "dtype")
+        except Exception as error:
+            raise ValueError(f"{name} must expose array shape and dtype metadata") from error
+    if type(raw_shape) is not tuple:
+        raise ValueError(f"{name} shape must be a tuple")
+    shape: list[int] = []
+    for dimension in raw_shape:
+        if type(dimension) not in _ACTUAL_INT_TYPES:
+            raise ValueError(f"{name} dimensions must be actual integers")
+        size = operator.index(cast(SupportsIndex, dimension))
+        if not 0 <= size <= _INT32_MAX:
+            raise ValueError(f"{name} dimensions must fit signed int32")
+        shape.append(size)
+    try:
+        dtype = np.dtype(
+            jax.dtypes.canonicalize_dtype(np.dtype(cast(Any, raw_dtype)))
+        )
+    except Exception as error:
+        raise ValueError(f"{name} must expose a supported array dtype") from error
+    return tuple(shape), dtype
+
+
+def _floating_parameter_metadata(
+    name: str, value: object
+) -> tuple[tuple[int, ...], np.dtype[Any]]:
+    shape, dtype = _array_metadata(name, value)
+    if not jnp.issubdtype(dtype, jnp.floating):
+        raise ValueError(f"{name} must have floating-point dtype")
+    return shape, dtype
+
+
+def _matching_array(
+    name: str,
+    value: object,
+    *,
+    shape: tuple[int, ...],
+    dtype: np.dtype[Any],
+) -> Array:
+    actual_shape, actual_dtype = _array_metadata(name, value)
+    if actual_shape != shape:
+        raise ValueError(f"{name} must match its parameter shape")
+    if actual_dtype != dtype:
+        raise TypeError(f"{name} dtype must match its parameter dtype")
+    try:
+        return jnp.asarray(value)
+    except Exception as error:
+        raise ValueError(f"{name} could not be converted to a JAX array") from error
+
+
+def _coerced_numeric_array(
+    name: str,
+    value: object,
+    *,
+    shape: tuple[int, ...],
+    dtype: Any,
+) -> Array:
+    actual_shape, actual_dtype = _array_metadata(name, value)
+    if actual_shape != shape:
+        raise ValueError(f"{name} must match its parameter shape")
+    if actual_dtype.kind not in {"i", "u", "f"}:
+        raise TypeError(f"{name} must have real numeric dtype")
+    try:
+        return jnp.asarray(value, dtype=dtype)
+    except Exception as error:
+        raise ValueError(f"{name} could not be converted to a JAX array") from error
+
+
+def _broadcast_bool_array(name: str, value: object, shape: tuple[int, ...]) -> Array:
+    actual_shape, actual_dtype = _array_metadata(name, value)
+    if actual_dtype != np.dtype(np.bool_):
+        raise TypeError(f"{name} must have boolean dtype")
+    try:
+        if np.broadcast_shapes(actual_shape, shape) != shape:
+            raise ValueError
+    except ValueError as error:
+        raise ValueError(f"{name} must broadcast to its parameter shape") from error
+    try:
+        return jnp.broadcast_to(jnp.asarray(value), shape)
+    except Exception as error:
+        raise ValueError(f"{name} could not be converted to a JAX array") from error
+
+
+def _parameter_arrays(
+    params: Any,
+    *,
+    owner: str,
+    persistent_nbytes: Callable[[int, int], int],
+    update_nbytes: Callable[[int, int], int],
+    working_scalars: Callable[[int], int],
+    working_nbytes: Callable[[int, int], int],
+) -> tuple[list[Array], jax.tree_util.PyTreeDef, _ParameterResources]:
+    leaves, structure = _flatten_with_none(params)
+    if not leaves or any(value is None for value in leaves):
+        raise ValueError("params must contain at least one array leaf")
+    metadata = [
+        _floating_parameter_metadata(f"{owner} parameter", value) for value in leaves
+    ]
+    scalars = sum(math.prod(shape) for shape, _ in metadata)
+    nbytes = sum(math.prod(shape) * dtype.itemsize for shape, dtype in metadata)
+    for resource_name, amount in (
+        ("parameter_count", scalars),
+        ("persistent_state_nbytes", persistent_nbytes(scalars, nbytes)),
+        ("update_result_nbytes", update_nbytes(scalars, nbytes)),
+        ("working_set_scalars", working_scalars(scalars)),
+        ("working_set_nbytes", working_nbytes(scalars, nbytes)),
+    ):
+        if amount > _INT32_MAX:
+            raise ValueError(f"derived {owner} {resource_name} must fit signed int32")
+    arrays: list[Array] = []
+    for value in leaves:
+        try:
+            arrays.append(jnp.asarray(value))
+        except Exception as error:
+            raise ValueError(f"{owner} parameter could not be converted to a JAX array") from error
+    return arrays, structure, _ParameterResources(scalars=scalars, nbytes=nbytes)
+
+
+def _validated_float32_scalar(
+    name: str,
+    value: object,
+    *,
+    positive: bool = False,
+    lower: float | None = None,
+    upper: float | None = None,
+    upper_inclusive: bool = True,
+) -> float:
+    """Validate an exact trusted scalar before any user-defined ratio hook."""
+    if type(value) not in _ACTUAL_REAL_TYPES:
+        raise ValueError(f"{name} must be a finite real number")
+    stored, numerator, denominator = validated_float32_scalar_with_ratio(
+        name,
+        value,
+        positive=positive,
+        lower=lower,
+        upper=upper,
+        upper_inclusive=upper_inclusive,
+    )
+    if numerator != 0 and abs(numerator) * (1 << 150) <= denominator:
+        raise ValueError(f"{name} must remain nonzero once narrowed to float32")
+    return stored
+
+
+def _static_zero_scale(scale: float, value: Array) -> Array:
+    """Skip a statically disabled EMA without changing enabled JAX graphs."""
+    if scale == 0.0:
+        return jnp.zeros_like(value)
+    return scale * value
+
+
+def _saturating_increment(value: Array, increment: Array | int = 1) -> Array:
+    """Increment a non-negative int32 counter without lifetime wraparound."""
+
+    maximum = jnp.asarray(_INT32_MAX, dtype=jnp.int32)
+    increment_array = jnp.asarray(increment, dtype=jnp.int32)
+    return jnp.where(
+        value <= maximum - increment_array,
+        value + increment_array,
+        maximum,
+    )
+
+
+def _floating_leaves_are_finite(*trees: Any) -> Array:
+    valid = jnp.asarray(True, dtype=jnp.bool_)
+    for tree in trees:
+        for leaf in jax.tree.leaves(tree):
+            array = jnp.asarray(leaf)
+            if jnp.issubdtype(array.dtype, jnp.floating):
+                valid = valid & jnp.all(jnp.isfinite(array))
+    return valid
 
 
 @dataclass(frozen=True)
@@ -128,40 +348,53 @@ class CanonicalUPGDConfig:
     epsilon: float = 1e-8
 
     def __post_init__(self) -> None:
-        for name in (
-            "step_size",
+        step_size = _validated_float32_scalar(
+            "step_size", self.step_size, lower=0.0, positive=True
+        )
+        utility_decay = _validated_float32_scalar(
             "utility_decay",
-            "noise_std",
-            "weight_decay",
-            "epsilon",
-        ):
-            if isinstance(getattr(self, name), bool):
-                raise ValueError(f"{name} must be numeric, not boolean")
-        if not math.isfinite(self.step_size) or self.step_size <= 0.0:
-            raise ValueError("step_size must be finite and positive")
-        if not math.isfinite(self.utility_decay) or not 0.0 <= self.utility_decay < 1.0:
-            raise ValueError("utility_decay must be finite and in [0, 1)")
-        if not math.isfinite(self.noise_std) or self.noise_std < 0.0:
-            raise ValueError("noise_std must be finite and non-negative")
-        if not math.isfinite(self.weight_decay) or self.weight_decay < 0.0:
-            raise ValueError("weight_decay must be finite and non-negative")
-        if self.mode not in {"protecting", "non_protecting"}:
-            raise ValueError("mode must be 'protecting' or 'non_protecting'")
-        if self.profile not in _SOURCE_PROFILES | {"safe_extended"}:
+            self.utility_decay,
+            lower=0.0,
+            upper=1.0,
+            upper_inclusive=False,
+        )
+        noise_std = _validated_float32_scalar("noise_std", self.noise_std, lower=0.0)
+        weight_decay = _validated_float32_scalar(
+            "weight_decay", self.weight_decay, lower=0.0
+        )
+        epsilon = _validated_float32_scalar(
+            "epsilon", self.epsilon, lower=0.0, positive=True
+        )
+        object.__setattr__(self, "step_size", step_size)
+        object.__setattr__(self, "utility_decay", utility_decay)
+        object.__setattr__(self, "noise_std", noise_std)
+        object.__setattr__(self, "weight_decay", weight_decay)
+        object.__setattr__(self, "epsilon", epsilon)
+        if type(self.mode) is not str or self.mode not in {"protecting", "non_protecting"}:
+            raise ValueError("mode must be protecting or non_protecting")
+        if type(self.profile) is not str or self.profile not in _SOURCE_PROFILES | {
+            "safe_extended"
+        }:
             raise ValueError(
                 "profile must name a paper, official implementation, or safe_extended profile"
             )
         if self.profile == "safe_extended":
-            if self.normalization not in {"global", "local"}:
-                raise ValueError("safe_extended requires normalization='global' or 'local'")
+            if type(self.normalization) is not str or self.normalization not in {
+                "global",
+                "local",
+            }:
+                raise ValueError("safe_extended requires normalization=global or local")
         else:
             fixed_normalization = "global" if self.profile in _GLOBAL_PROFILES else "local"
-            if self.normalization not in {None, fixed_normalization}:
-                raise ValueError(f"{self.profile} fixes normalization={fixed_normalization!r}")
+            if self.normalization is not None and (
+                type(self.normalization) is not str
+                or self.normalization != fixed_normalization
+            ):
+                raise ValueError(
+                    f"{self.profile} fixes normalization to {fixed_normalization}"
+                )
         if self.profile == "official_readme_global" and self.mode != "protecting":
             raise ValueError("official_readme_global only defines protecting UPGD")
-        if not math.isfinite(self.epsilon) or self.epsilon <= 0.0:
-            raise ValueError("epsilon must be finite and positive")
 
     @property
     def is_source_profile(self) -> bool:
@@ -209,10 +442,10 @@ class CanonicalUPGDConfig:
         }
 
     @classmethod
-    def from_config(cls, config: dict[str, object]) -> CanonicalUPGDConfig:
+    def from_config(cls, config: Mapping[str, object]) -> CanonicalUPGDConfig:
         """Strictly reconstruct from the complete serialized schema."""
 
-        payload = dict(config)
+        payload = _copy_config_mapping("CanonicalUPGD config", config)
         expected = {
             "type",
             "step_size",
@@ -227,9 +460,12 @@ class CanonicalUPGDConfig:
         if set(payload) != expected:
             raise ValueError("config fields do not match the CanonicalUPGD schema")
         type_name = payload.pop("type")
-        if type_name != "CanonicalUPGD":
-            raise ValueError(f"expected CanonicalUPGD config, got {type_name!r}")
-        return cls(**payload)  # type: ignore[arg-type]
+        if type(type_name) is not str or type_name != "CanonicalUPGD":
+            raise ValueError("expected CanonicalUPGD config, got invalid value")
+        try:
+            return cls(**payload)
+        except Exception as error:
+            raise ValueError("CanonicalUPGD config values are invalid") from error
 
 
 @chex.dataclass(frozen=True)
@@ -312,27 +548,78 @@ class CanonicalUPGD:
         return self._config.to_config()
 
     @classmethod
-    def from_config(cls, config: dict[str, object]) -> CanonicalUPGD:
+    def from_config(cls, config: Mapping[str, object]) -> CanonicalUPGD:
         """Reconstruct an optimizer from serialized configuration."""
 
         return cls(CanonicalUPGDConfig.from_config(config))
 
+    @staticmethod
+    def _parameter_contract(
+        params: Any,
+    ) -> tuple[list[Array], jax.tree_util.PyTreeDef, _ParameterResources]:
+        return _parameter_arrays(
+            params,
+            owner="CanonicalUPGD",
+            persistent_nbytes=lambda scalars, nbytes: nbytes + 4 * scalars + 4,
+            # params, state, three diagnostic trees, key, and six metrics.
+            update_nbytes=lambda scalars, nbytes: 5 * nbytes + 4 * scalars + 33,
+            working_scalars=lambda scalars: 22 * scalars + 32,
+            working_nbytes=lambda scalars, nbytes: 23 * nbytes + 4 * scalars + 128,
+        )
+
+    @staticmethod
+    def _state_contract(
+        state: CanonicalUPGDState,
+        params: Any,
+    ) -> tuple[list[Array], list[Array], list[Array], jax.tree_util.PyTreeDef]:
+        if not isinstance(state, CanonicalUPGDState):
+            raise TypeError("state must be a CanonicalUPGDState")
+        param_leaves, structure, _ = CanonicalUPGD._parameter_contract(params)
+        utility_leaves, utility_structure = _flatten_with_none(state.utility_ema)
+        age_leaves, age_structure = _flatten_with_none(state.utility_age)
+        if not structure == utility_structure == age_structure:
+            raise ValueError("params and CanonicalUPGD state must share a PyTree structure")
+        utilities: list[Array] = []
+        ages: list[Array] = []
+        for param, utility, age in zip(
+            param_leaves, utility_leaves, age_leaves, strict=True
+        ):
+            param_dtype = np.dtype(param.dtype)
+            utilities.append(
+                _matching_array(
+                    "utility state leaf",
+                    utility,
+                    shape=param.shape,
+                    dtype=param_dtype,
+                )
+            )
+            ages.append(
+                _matching_array(
+                    "utility-age state leaf",
+                    age,
+                    shape=param.shape,
+                    dtype=np.dtype(np.int32),
+                )
+            )
+        _matching_array(
+            "state.step",
+            state.step,
+            shape=(),
+            dtype=np.dtype(np.int32),
+        )
+        return param_leaves, utilities, ages, structure
+
     def init(self, params: Any) -> CanonicalUPGDState:
         """Initialize signed-utility traces matching ``params``."""
 
-        leaves = jax.tree_util.tree_leaves(params)
-        if not leaves:
-            raise ValueError("params must contain at least one array leaf")
-        for value in leaves:
-            array = jnp.asarray(value)
-            if not jnp.issubdtype(array.dtype, jnp.floating):
-                raise ValueError("UPGD parameters must have floating-point dtype")
+        leaves, structure, _ = self._parameter_contract(params)
+        array_params = jax.tree_util.tree_unflatten(structure, leaves)
 
         return CanonicalUPGDState(  # type: ignore[call-arg]
-            utility_ema=jax.tree.map(jnp.zeros_like, params),
+            utility_ema=jax.tree.map(jnp.zeros_like, array_params),
             utility_age=jax.tree.map(
                 lambda value: jnp.zeros(value.shape, dtype=jnp.int32),
-                params,
+                array_params,
             ),
             step=jnp.array(0, dtype=jnp.int32),
         )
@@ -360,13 +647,24 @@ class CanonicalUPGD:
         ``noise`` may supply the already-scaled perturbation PyTree ``xi`` for
         equation-level parity tests.  Normal operation omits it and samples
         ``N(0, noise_std**2)`` from ``key``.
+
+        The final representable int32 clock event is applied.  A saturated
+        clock may continue only after its active leaf-dtype bias-correction
+        denominator is exactly one.  If an active saturated clock still needs
+        to advance that denominator, the update rejects atomically: parameters,
+        optimizer state, and the key remain exact; computed payloads are
+        neutral; and ``metrics["update_applied"]`` is false.  The refusal
+        branch excludes the numerical proposal from reverse-mode
+        differentiation, preserving the same identity boundary there.
         """
 
-        param_leaves, structure = _flatten_with_none(params)
+        param_leaves, utility_leaves, age_leaves, structure = self._state_contract(
+            state, params
+        )
+        params = jax.tree_util.tree_unflatten(structure, param_leaves)
+        key = _adaupgd_typed_threefry_key(key, name="key")
         grad_leaves, grad_structure = _flatten_with_none(gradients)
-        utility_leaves, utility_structure = _flatten_with_none(state.utility_ema)
-        age_leaves, age_structure = _flatten_with_none(state.utility_age)
-        if not (structure == grad_structure == utility_structure == age_structure):
+        if structure != grad_structure:
             raise ValueError("params, gradients, and UPGD state must share a PyTree structure")
 
         if self._config.is_source_profile and mask is not None:
@@ -388,229 +686,312 @@ class CanonicalUPGD:
             if noise_structure != structure:
                 raise ValueError("noise must share the parameter PyTree structure")
 
-        split_keys = jr.split(key, len(param_leaves) + 1)
-        next_key = split_keys[0]
-        noise_keys = split_keys[1:]
         beta = self._config.utility_decay
-        next_step = state.step + jnp.array(1, dtype=jnp.int32)
+        maximum_counter = jnp.asarray(_INT32_MAX, dtype=jnp.int32)
+        next_step = _saturating_increment(state.step)
 
-        corrected_leaves: list[Array] = []
-        new_utility_leaves: list[Array] = []
-        new_age_leaves: list[Array] = []
         finite_masks: list[Array] = []
-        eligible_masks: list[Array] = []
         active_masks: list[Array] = []
         clean_gradients: list[Array] = []
+        new_age_leaves: list[Array] = []
+        correction_denominators: list[Array] = []
+        capacity_available = jnp.asarray(True, dtype=jnp.bool_)
+        eligible_count = jnp.array(0.0, dtype=jnp.float32)
+        nonfinite_count = jnp.array(0.0, dtype=jnp.float32)
 
-        for param, gradient, utility, age, mask_leaf in zip(
+        for param, gradient, age, mask_leaf in zip(
             param_leaves,
             grad_leaves,
-            utility_leaves,
             age_leaves,
             mask_leaves,
             strict=True,
         ):
-            eligible = jnp.broadcast_to(jnp.asarray(mask_leaf, dtype=jnp.bool_), param.shape)
+            eligible = _broadcast_bool_array("mask leaf", mask_leaf, param.shape)
             if gradient is None:
                 finite = jnp.zeros(param.shape, dtype=jnp.bool_)
                 clean_gradient = jnp.zeros_like(param)
             else:
-                gradient_array = jnp.asarray(gradient, dtype=param.dtype)
-                if gradient_array.shape != param.shape:
-                    raise ValueError("every gradient leaf must match its parameter shape")
+                gradient_array = _coerced_numeric_array(
+                    "gradient leaf", gradient, shape=param.shape, dtype=param.dtype
+                )
                 finite = jnp.isfinite(param) & jnp.isfinite(gradient_array)
                 clean_gradient = jnp.where(finite, gradient_array, 0.0)
 
             active = eligible & finite
-            instantaneous = -clean_gradient * param
-            next_utility = jnp.where(
-                active,
-                beta * utility + (1.0 - beta) * instantaneous,
-                utility,
-            )
             if self._config.uses_global_clock:
                 next_age = jnp.full_like(age, next_step)
                 correction_clock = next_step.astype(param.dtype)
             else:
-                next_age = age + active.astype(jnp.int32)
+                next_age = _saturating_increment(age, active.astype(jnp.int32))
                 correction_clock = next_age.astype(param.dtype)
             bias_correction = 1.0 - jnp.power(beta, correction_clock)
-            corrected = jnp.where(
-                next_age > 0,
-                next_utility
-                / (
-                    jnp.maximum(bias_correction, self._config.epsilon)
-                    if self._config.profile == "safe_extended"
-                    else bias_correction
-                ),
-                0.0,
+            correction_denominator = (
+                jnp.maximum(bias_correction, self._config.epsilon)
+                if self._config.profile == "safe_extended"
+                else bias_correction
             )
+            denominator_converged = correction_denominator == jnp.asarray(
+                1.0, dtype=bias_correction.dtype
+            )
+            if self._config.uses_global_clock:
+                saturated_active = (state.step >= maximum_counter) & jnp.any(active)
+                leaf_capacity_available = (~saturated_active) | jnp.all(
+                    denominator_converged
+                )
+            else:
+                leaf_capacity_available = ~jnp.any(
+                    active
+                    & (age >= maximum_counter)
+                    & ~denominator_converged
+                )
+            capacity_available = capacity_available & leaf_capacity_available
 
             clean_gradients.append(clean_gradient)
             finite_masks.append(finite)
-            eligible_masks.append(eligible)
             active_masks.append(active)
-            new_utility_leaves.append(next_utility)
             new_age_leaves.append(next_age)
-            corrected_leaves.append(corrected)
-
-        if self._config.resolved_normalization == "global":
-            maximum = jnp.array(-jnp.inf, dtype=jnp.float32)
-            has_active = jnp.array(False)
-            reference_leaves = (
-                new_utility_leaves
-                if self._config.profile in _RAW_GLOBAL_PROFILES
-                else corrected_leaves
-            )
-            for reference, active in zip(
-                reference_leaves,
-                active_masks,
-                strict=True,
-            ):
-                leaf_maximum = jnp.max(
-                    jnp.where(active, reference, -jnp.inf),
-                    initial=-jnp.inf,
-                )
-                maximum = jnp.maximum(maximum, leaf_maximum.astype(jnp.float32))
-                has_active = has_active | jnp.any(active)
-            global_maximum = jnp.where(has_active, maximum, 0.0)
-            denominator = (
-                _safe_signed_denominator(
-                    global_maximum,
-                    self._config.epsilon,
-                )
-                if self._config.profile == "safe_extended"
-                else global_maximum
-            )
-            normalized_leaves = [
-                jnp.where(
-                    active,
-                    corrected / denominator.astype(corrected.dtype),
-                    0.0,
-                )
-                for corrected, active in zip(
-                    corrected_leaves,
-                    active_masks,
-                    strict=True,
-                )
-            ]
-        else:
-            global_maximum = jnp.array(jnp.nan, dtype=jnp.float32)
-            if self._config.profile == "paper_local_literal":
-                denominator_leaves = new_utility_leaves
-                local_epsilon: float | None = None
-            elif self._config.profile == "official_experiment_local":
-                denominator_leaves = corrected_leaves
-                local_epsilon = 1e-12
-            else:
-                denominator_leaves = corrected_leaves
-                local_epsilon = self._config.epsilon
-            normalized_leaves = [
-                _local_normalize(
-                    corrected,
-                    denominator_utility,
-                    active,
-                    local_epsilon,
-                )
-                for corrected, denominator_utility, active in zip(
-                    corrected_leaves,
-                    denominator_leaves,
-                    active_masks,
-                    strict=True,
-                )
-            ]
-
-        new_param_leaves: list[Array] = []
-        gate_leaves: list[Array] = []
-        perturbation_leaves: list[Array] = []
-        gate_sum = jnp.array(0.0, dtype=jnp.float32)
-        utility_sum = jnp.array(0.0, dtype=jnp.float32)
-        eligible_count = jnp.array(0.0, dtype=jnp.float32)
-        nonfinite_count = jnp.array(0.0, dtype=jnp.float32)
-
-        for (
-            param,
-            gradient,
-            normalized,
-            corrected,
-            finite,
-            eligible,
-            active,
-            noise_key,
-            supplied_noise,
-        ) in zip(
-            param_leaves,
-            clean_gradients,
-            normalized_leaves,
-            corrected_leaves,
-            finite_masks,
-            eligible_masks,
-            active_masks,
-            noise_keys,
-            supplied_noise_leaves,
-            strict=True,
-        ):
-            gate = jnp.where(active, jax.nn.sigmoid(normalized), 0.0)
-            if supplied_noise is None:
-                sampled_noise = (
-                    jr.normal(noise_key, param.shape, dtype=param.dtype) * self._config.noise_std
-                )
-            else:
-                sampled_noise = jnp.asarray(supplied_noise, dtype=param.dtype)
-                if sampled_noise.shape != param.shape:
-                    raise ValueError("every noise leaf must match its parameter shape")
-            finite_noise = jnp.where(jnp.isfinite(sampled_noise), sampled_noise, 0.0)
-            perturbation = jnp.where(active, finite_noise, 0.0)
-
-            if self._config.mode == "protecting":
-                direction = (gradient + perturbation) * (1.0 - gate)
-            else:
-                direction = gradient + perturbation * (1.0 - gate)
-
-            decayed = param * (1.0 - self._config.step_size * self._config.weight_decay)
-            direction_step = self._config.step_size * self._config.direction_multiplier
-            candidate = decayed - direction_step * direction
-            updated = jnp.where(finite, candidate, param)
-
             count = jnp.sum(active.astype(jnp.float32))
-            gate_sum = gate_sum + jnp.sum(gate.astype(jnp.float32))
-            utility_sum = utility_sum + jnp.sum(
-                jnp.where(active, jnp.abs(corrected), 0.0).astype(jnp.float32)
-            )
             eligible_count = eligible_count + count
             nonfinite_count = nonfinite_count + jnp.sum((~finite).astype(jnp.float32))
+            correction_denominators.append(correction_denominator)
 
-            new_param_leaves.append(updated)
-            gate_leaves.append(gate)
-            perturbation_leaves.append(perturbation)
+        def apply_update(_: None) -> CanonicalUPGDUpdate:
+            split_keys = jr.split(key, len(param_leaves) + 1)
+            next_key = split_keys[0]
+            noise_keys = split_keys[1:]
 
-        count_floor = jnp.maximum(eligible_count, 1.0)
-        next_state = CanonicalUPGDState(  # type: ignore[call-arg]
-            utility_ema=jax.tree_util.tree_unflatten(structure, new_utility_leaves),
-            utility_age=jax.tree_util.tree_unflatten(structure, new_age_leaves),
-            step=next_step,
-        )
-        return CanonicalUPGDUpdate(  # type: ignore[call-arg]
-            params=jax.tree_util.tree_unflatten(structure, new_param_leaves),
-            state=next_state,
-            next_key=next_key,
-            scaled_utility=jax.tree_util.tree_unflatten(structure, gate_leaves),
-            corrected_utility=jax.tree_util.tree_unflatten(
-                structure,
+            corrected_leaves: list[Array] = []
+            new_utility_leaves: list[Array] = []
+            for param, gradient, utility, next_age, active, correction_denominator in zip(
+                param_leaves,
+                clean_gradients,
+                utility_leaves,
+                new_age_leaves,
+                active_masks,
+                correction_denominators,
+                strict=True,
+            ):
+                instantaneous = -gradient * param
+                next_utility = jnp.where(
+                    active,
+                    _static_zero_scale(beta, utility)
+                    + (1.0 - beta) * instantaneous,
+                    utility,
+                )
+                corrected = jnp.where(
+                    next_age > 0,
+                    next_utility / correction_denominator,
+                    0.0,
+                )
+                new_utility_leaves.append(next_utility)
+                corrected_leaves.append(corrected)
+
+            if self._config.resolved_normalization == "global":
+                maximum = jnp.array(-jnp.inf, dtype=jnp.float32)
+                has_active = jnp.array(False)
+                reference_leaves = (
+                    new_utility_leaves
+                    if self._config.profile in _RAW_GLOBAL_PROFILES
+                    else corrected_leaves
+                )
+                for reference, active in zip(
+                    reference_leaves,
+                    active_masks,
+                    strict=True,
+                ):
+                    leaf_maximum = jnp.max(
+                        jnp.where(active, reference, -jnp.inf),
+                        initial=-jnp.inf,
+                    )
+                    maximum = jnp.maximum(maximum, leaf_maximum.astype(jnp.float32))
+                    has_active = has_active | jnp.any(active)
+                global_maximum = jnp.where(has_active, maximum, 0.0)
+                denominator = (
+                    _safe_signed_denominator(
+                        global_maximum,
+                        self._config.epsilon,
+                    )
+                    if self._config.profile == "safe_extended"
+                    else global_maximum
+                )
+                normalized_leaves = [
+                    jnp.where(
+                        active,
+                        corrected / denominator.astype(corrected.dtype),
+                        0.0,
+                    )
+                    for corrected, active in zip(
+                        corrected_leaves,
+                        active_masks,
+                        strict=True,
+                    )
+                ]
+            else:
+                global_maximum = jnp.array(jnp.nan, dtype=jnp.float32)
+                if self._config.profile == "paper_local_literal":
+                    denominator_leaves = new_utility_leaves
+                    local_epsilon: float | None = None
+                elif self._config.profile == "official_experiment_local":
+                    denominator_leaves = corrected_leaves
+                    local_epsilon = 1e-12
+                else:
+                    denominator_leaves = corrected_leaves
+                    local_epsilon = self._config.epsilon
+                normalized_leaves = [
+                    _local_normalize(
+                        corrected,
+                        denominator_utility,
+                        active,
+                        local_epsilon,
+                    )
+                    for corrected, denominator_utility, active in zip(
+                        corrected_leaves,
+                        denominator_leaves,
+                        active_masks,
+                        strict=True,
+                    )
+                ]
+
+            new_param_leaves: list[Array] = []
+            gate_leaves: list[Array] = []
+            perturbation_leaves: list[Array] = []
+            mean_gate = jnp.array(0.0, dtype=jnp.float32)
+            mean_utility = jnp.array(0.0, dtype=jnp.float32)
+            count_floor = jnp.maximum(eligible_count, 1.0)
+
+            for (
+                param,
+                gradient,
+                normalized,
+                corrected,
+                finite,
+                active,
+                noise_key,
+                supplied_noise,
+            ) in zip(
+                param_leaves,
+                clean_gradients,
+                normalized_leaves,
                 corrected_leaves,
-            ),
-            perturbation=jax.tree_util.tree_unflatten(
-                structure,
-                perturbation_leaves,
-            ),
-            metrics={
-                "mean_scaled_utility": gate_sum / count_floor,
-                "mean_absolute_utility": utility_sum / count_floor,
-                "global_maximum_utility": global_maximum,
-                "eligible_parameter_count": eligible_count,
-                "nonfinite_or_missing_count": nonfinite_count,
-            },
+                finite_masks,
+                active_masks,
+                noise_keys,
+                supplied_noise_leaves,
+                strict=True,
+            ):
+                gate = jnp.where(active, jax.nn.sigmoid(normalized), 0.0)
+                if supplied_noise is None:
+                    sampled_noise = (
+                        jr.normal(noise_key, param.shape, dtype=param.dtype)
+                        * self._config.noise_std
+                    )
+                else:
+                    sampled_noise = _coerced_numeric_array(
+                        "noise leaf",
+                        supplied_noise,
+                        shape=param.shape,
+                        dtype=param.dtype,
+                    )
+                finite_noise = jnp.where(jnp.isfinite(sampled_noise), sampled_noise, 0.0)
+                perturbation = jnp.where(active, finite_noise, 0.0)
+
+                if self._config.mode == "protecting":
+                    direction = (gradient + perturbation) * (1.0 - gate)
+                else:
+                    direction = gradient + perturbation * (1.0 - gate)
+
+                decayed = param * (1.0 - self._config.step_size * self._config.weight_decay)
+                direction_step = self._config.step_size * self._config.direction_multiplier
+                candidate = decayed - direction_step * direction
+                updated = jnp.where(finite, candidate, param)
+
+                mean_gate = mean_gate + jnp.sum(
+                    gate.astype(jnp.float32) / count_floor
+                )
+                mean_utility = mean_utility + jnp.sum(
+                    jnp.where(active, jnp.abs(corrected), 0.0).astype(jnp.float32)
+                    / count_floor
+                )
+
+                new_param_leaves.append(updated)
+                gate_leaves.append(gate)
+                perturbation_leaves.append(perturbation)
+
+            proposed_state = CanonicalUPGDState(  # type: ignore[call-arg]
+                utility_ema=jax.tree_util.tree_unflatten(structure, new_utility_leaves),
+                utility_age=jax.tree_util.tree_unflatten(structure, new_age_leaves),
+                step=next_step,
+            )
+            proposed_result = CanonicalUPGDUpdate(  # type: ignore[call-arg]
+                params=jax.tree_util.tree_unflatten(structure, new_param_leaves),
+                state=proposed_state,
+                next_key=next_key,
+                scaled_utility=jax.tree_util.tree_unflatten(structure, gate_leaves),
+                corrected_utility=jax.tree_util.tree_unflatten(
+                    structure, corrected_leaves
+                ),
+                perturbation=jax.tree_util.tree_unflatten(
+                    structure, perturbation_leaves
+                ),
+                metrics={
+                    "update_applied": jnp.asarray(True, dtype=jnp.bool_),
+                    "mean_scaled_utility": mean_gate,
+                    "mean_absolute_utility": mean_utility,
+                    "global_maximum_utility": global_maximum,
+                    "eligible_parameter_count": eligible_count,
+                    "nonfinite_or_missing_count": nonfinite_count,
+                },
+            )
+            if self._config.profile != "safe_extended":
+                return proposed_result
+            finite_payload = _floating_leaves_are_finite(
+                proposed_result.params,
+                proposed_result.state,
+                proposed_result.scaled_utility,
+                proposed_result.corrected_utility,
+                proposed_result.perturbation,
+                mean_gate,
+                mean_utility,
+            )
+            if self._config.resolved_normalization == "global":
+                finite_payload = finite_payload & jnp.isfinite(global_maximum)
+            return cast(
+                CanonicalUPGDUpdate,
+                jax.lax.cond(
+                    finite_payload,
+                    lambda _: proposed_result,
+                    reject_update,
+                    operand=None,
+                ),
+            )
+
+        def reject_update(_: None) -> CanonicalUPGDUpdate:
+            zero_tree = jax.tree.map(jnp.zeros_like, params)
+            zero_metric = jnp.array(0.0, dtype=jnp.float32)
+            return CanonicalUPGDUpdate(  # type: ignore[call-arg]
+                params=params,
+                state=state,
+                next_key=key,
+                scaled_utility=zero_tree,
+                corrected_utility=zero_tree,
+                perturbation=zero_tree,
+                metrics={
+                    "update_applied": jnp.asarray(False, dtype=jnp.bool_),
+                    "mean_scaled_utility": zero_metric,
+                    "mean_absolute_utility": zero_metric,
+                    "global_maximum_utility": zero_metric,
+                    "eligible_parameter_count": eligible_count,
+                    "nonfinite_or_missing_count": nonfinite_count,
+                },
+            )
+
+        result: CanonicalUPGDUpdate = jax.lax.cond(
+            capacity_available,
+            apply_update,
+            reject_update,
+            operand=None,
         )
+        return result
 
 
 # This Alberta-derived transform was introduced separately from the official RL
@@ -625,9 +1006,6 @@ AlbertaAdaUPGDProfile = Literal["alberta_derived_first_order_adaptive_v1"]
 ALBERTA_ADAUPGD_PROFILE: AlbertaAdaUPGDProfile = (
     "alberta_derived_first_order_adaptive_v1"
 )
-
-_INT32_MAX = 2**31 - 1
-
 
 @dataclass(frozen=True)
 class AlbertaAdaUPGDConfig:
@@ -667,54 +1045,43 @@ class AlbertaAdaUPGDConfig:
     epsilon: float = 1e-8
 
     def __post_init__(self) -> None:
-        if self.profile != ALBERTA_ADAUPGD_PROFILE:
+        if type(self.profile) is not str or self.profile != ALBERTA_ADAUPGD_PROFILE:
             raise ValueError(
                 "profile must be the explicit Alberta-derived AdaUPGD profile"
             )
-        for name in (
-            "step_size",
-            "utility_decay",
+        step_size = _validated_float32_scalar(
+            "step_size", self.step_size, lower=0.0, positive=True
+        )
+        utility_decay = _validated_float32_scalar(
+            "utility_decay", self.utility_decay, lower=0.0, upper=1.0, upper_inclusive=False
+        )
+        second_moment_decay = _validated_float32_scalar(
             "second_moment_decay",
-            "noise_std",
-            "weight_decay",
-            "epsilon",
-        ):
-            value = getattr(self, name)
-            if isinstance(value, bool) or not isinstance(value, (int, float)):
-                raise TypeError(f"{name} must be a real number, not boolean")
-            if not math.isfinite(float(value)):
-                raise ValueError(f"{name} must be finite")
-        if self.step_size <= 0.0:
-            raise ValueError("step_size must be positive")
-        if not 0.0 <= self.utility_decay < 1.0:
-            raise ValueError("utility_decay must be in [0, 1)")
-        if not 0.0 <= self.second_moment_decay < 1.0:
-            raise ValueError("second_moment_decay must be in [0, 1)")
-        if self.noise_std < 0.0:
-            raise ValueError("noise_std must be non-negative")
-        if self.weight_decay < 0.0:
-            raise ValueError("weight_decay must be non-negative")
-        if self.mode not in {"protecting", "non_protecting"}:
-            raise ValueError("mode must be 'protecting' or 'non_protecting'")
-        if self.normalization not in {"global", "local"}:
-            raise ValueError("normalization must be 'global' or 'local'")
-        if self.epsilon <= 0.0:
-            raise ValueError("epsilon must be positive")
-        # Config constants participate in float32 arithmetic.  Reject silent
-        # overflow while preserving ordinary Python numeric spellings.
-        for name in (
-            "step_size",
-            "utility_decay",
-            "second_moment_decay",
-            "noise_std",
-            "weight_decay",
-            "epsilon",
-        ):
-            narrowed = jnp.asarray(getattr(self, name), dtype=jnp.float32)
-            if not bool(jnp.isfinite(narrowed)):
-                raise ValueError(f"{name} must be finite in float32")
-            if float(getattr(self, name)) != 0.0 and float(narrowed) == 0.0:
-                raise ValueError(f"{name} must not underflow in float32")
+            self.second_moment_decay,
+            lower=0.0,
+            upper=1.0,
+            upper_inclusive=False,
+        )
+        noise_std = _validated_float32_scalar("noise_std", self.noise_std, lower=0.0)
+        weight_decay = _validated_float32_scalar(
+            "weight_decay", self.weight_decay, lower=0.0
+        )
+        epsilon = _validated_float32_scalar(
+            "epsilon", self.epsilon, lower=0.0, positive=True
+        )
+        object.__setattr__(self, "step_size", step_size)
+        object.__setattr__(self, "utility_decay", utility_decay)
+        object.__setattr__(self, "second_moment_decay", second_moment_decay)
+        object.__setattr__(self, "noise_std", noise_std)
+        object.__setattr__(self, "weight_decay", weight_decay)
+        object.__setattr__(self, "epsilon", epsilon)
+        if type(self.mode) is not str or self.mode not in {"protecting", "non_protecting"}:
+            raise ValueError("mode must be protecting or non_protecting")
+        if type(self.normalization) is not str or self.normalization not in {
+            "global",
+            "local",
+        }:
+            raise ValueError("normalization must be global or local")
 
     @property
     def official_reference_parity(self) -> bool:
@@ -748,12 +1115,10 @@ class AlbertaAdaUPGDConfig:
         }
 
     @classmethod
-    def from_config(cls, config: dict[str, object]) -> AlbertaAdaUPGDConfig:
+    def from_config(cls, config: Mapping[str, object]) -> AlbertaAdaUPGDConfig:
         """Strictly reconstruct the adaptive extension configuration."""
 
-        if type(config) is not dict:
-            raise TypeError("AlbertaAdaUPGD config must be an exact dict")
-        payload = dict(config)
+        payload = _copy_config_mapping("AlbertaAdaUPGD config", config)
         expected = {
             "type",
             "profile",
@@ -769,9 +1134,12 @@ class AlbertaAdaUPGDConfig:
         if set(payload) != expected:
             raise ValueError("config fields do not match the AlbertaAdaUPGD schema")
         type_name = payload.pop("type")
-        if type_name != "AlbertaAdaUPGD":
-            raise ValueError(f"expected AlbertaAdaUPGD config, got {type_name!r}")
-        return cls(**payload)  # type: ignore[arg-type]
+        if type(type_name) is not str or type_name != "AlbertaAdaUPGD":
+            raise ValueError("expected AlbertaAdaUPGD config, got invalid value")
+        try:
+            return cls(**payload)
+        except Exception as error:
+            raise ValueError("AlbertaAdaUPGD config values are invalid") from error
 
 
 @chex.dataclass(frozen=True)
@@ -799,6 +1167,33 @@ class AlbertaAdaUPGDUpdate:
     metrics: dict[str, Array]
 
 
+def _require_exact_int(value: Any, path: str) -> int:
+    if type(value) is not int:
+        raise ValueError(f"{path} must be an integer")
+    if value < 0 or value > _INT32_MAX:
+        raise ValueError(f"{path} must lie in [0, {_INT32_MAX}]")
+    return value
+
+
+def _require_exact_bool(value: Any, path: str) -> bool:
+    if type(value) is not bool:
+        raise ValueError(f"{path} must be a boolean")
+    return value
+
+
+def _require_exact_identity(value: Any, path: str, expected: str) -> str:
+    if type(value) is not str or value != expected:
+        raise ValueError(f"{path} must equal the canonical identity {expected!r}")
+    return value
+
+
+def _require_exact_parity(value: Any, path: str, expected: bool) -> bool:
+    parity = _require_exact_bool(value, path)
+    if parity is not expected:
+        raise ValueError(f"{path} must be {expected}")
+    return parity
+
+
 @dataclass(frozen=True)
 class AlbertaAdaUPGDResources:
     """Exact persistent-array accounting for one adaptive optimizer state."""
@@ -808,6 +1203,37 @@ class AlbertaAdaUPGDResources:
     parameter_count: int
     persistent_array_count: int
     persistent_state_nbytes: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "profile",
+            _require_exact_identity(self.profile, "profile", ALBERTA_ADAUPGD_PROFILE),
+        )
+        object.__setattr__(
+            self,
+            "official_reference_parity",
+            _require_exact_parity(
+                self.official_reference_parity,
+                "official_reference_parity",
+                False,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "parameter_count",
+            _require_exact_int(self.parameter_count, "parameter_count"),
+        )
+        object.__setattr__(
+            self,
+            "persistent_array_count",
+            _require_exact_int(self.persistent_array_count, "persistent_array_count"),
+        )
+        object.__setattr__(
+            self,
+            "persistent_state_nbytes",
+            _require_exact_int(self.persistent_state_nbytes, "persistent_state_nbytes"),
+        )
 
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-compatible resource record."""
@@ -889,22 +1315,22 @@ class AlbertaAdaUPGD:
         return self._config.to_config()
 
     @classmethod
-    def from_config(cls, config: dict[str, object]) -> AlbertaAdaUPGD:
+    def from_config(cls, config: Mapping[str, object]) -> AlbertaAdaUPGD:
         """Reconstruct the optimizer from its strict configuration."""
 
         return cls(AlbertaAdaUPGDConfig.from_config(config))
 
     @staticmethod
     def _parameter_contract(params: Any) -> tuple[list[Array], jax.tree_util.PyTreeDef]:
-        leaves, structure = _flatten_with_none(params)
-        if not leaves or any(value is None for value in leaves):
-            raise ValueError("params must contain at least one array leaf")
-        arrays: list[Array] = []
-        for value in leaves:
-            array = jnp.asarray(value)
-            if not jnp.issubdtype(array.dtype, jnp.floating):
-                raise ValueError("AlbertaAdaUPGD parameters must have floating-point dtype")
-            arrays.append(array)
+        arrays, structure, _ = _parameter_arrays(
+            params,
+            owner="AlbertaAdaUPGD",
+            persistent_nbytes=lambda scalars, nbytes: 2 * nbytes + 4 * scalars + 4,
+            # params, state, four diagnostics, key/accepted, and ten metrics.
+            update_nbytes=lambda scalars, nbytes: 7 * nbytes + 4 * scalars + 50,
+            working_scalars=lambda scalars: 33 * scalars + 32,
+            working_nbytes=lambda scalars, nbytes: 34 * nbytes + 4 * scalars + 128,
+        )
         return arrays, structure
 
     @staticmethod
@@ -940,36 +1366,37 @@ class AlbertaAdaUPGD:
             moment_leaves,
             strict=True,
         ):
-            utility_array = jnp.asarray(utility)
-            age_array = jnp.asarray(age)
-            moment_array = jnp.asarray(moment)
-            if utility_array.shape != param.shape or moment_array.shape != param.shape:
-                raise ValueError("every adaptive state leaf must match its parameter shape")
-            if age_array.shape != param.shape:
-                raise ValueError("every utility-age leaf must match its parameter shape")
-            if utility_array.dtype != param.dtype or moment_array.dtype != param.dtype:
-                raise TypeError("utility and second-moment dtypes must match parameters")
-            if age_array.dtype != jnp.int32:
-                raise TypeError("utility-age leaves must have int32 dtype")
+            param_dtype = np.dtype(param.dtype)
+            utility_array = _matching_array(
+                "utility state leaf", utility, shape=param.shape, dtype=param_dtype
+            )
+            age_array = _matching_array(
+                "utility-age state leaf",
+                age,
+                shape=param.shape,
+                dtype=np.dtype(np.int32),
+            )
+            moment_array = _matching_array(
+                "second-moment state leaf", moment, shape=param.shape, dtype=param_dtype
+            )
             utilities.append(utility_array)
             ages.append(age_array)
             moments.append(moment_array)
-        step = jnp.asarray(state.step)
-        if step.shape != () or step.dtype != jnp.int32:
-            raise TypeError("state.step must be one scalar int32 array")
+        _matching_array("state.step", state.step, shape=(), dtype=np.dtype(np.int32))
         return param_leaves, utilities, ages, moments, structure
 
     def init(self, params: Any) -> AlbertaAdaUPGDState:
         """Initialize utility and adaptive second-moment traces."""
 
-        self._parameter_contract(params)
+        leaves, structure = self._parameter_contract(params)
+        array_params = jax.tree_util.tree_unflatten(structure, leaves)
         return AlbertaAdaUPGDState(  # type: ignore[call-arg]
-            utility_ema=jax.tree.map(jnp.zeros_like, params),
+            utility_ema=jax.tree.map(jnp.zeros_like, array_params),
             utility_age=jax.tree.map(
-                lambda value: jnp.zeros(jnp.asarray(value).shape, dtype=jnp.int32),
-                params,
+                lambda value: jnp.zeros(value.shape, dtype=jnp.int32),
+                array_params,
             ),
-            gradient_second_moment=jax.tree.map(jnp.zeros_like, params),
+            gradient_second_moment=jax.tree.map(jnp.zeros_like, array_params),
             step=jnp.asarray(0, dtype=jnp.int32),
         )
 
@@ -1036,7 +1463,6 @@ class AlbertaAdaUPGD:
         splitting/commit contract as sampled noise.
         """
 
-        checked_key = _adaupgd_typed_threefry_key(key, name="key")
         (
             param_leaves,
             utility_leaves,
@@ -1044,6 +1470,8 @@ class AlbertaAdaUPGD:
             moment_leaves,
             structure,
         ) = self._state_contract(state, params)
+        params = jax.tree_util.tree_unflatten(structure, param_leaves)
+        checked_key = _adaupgd_typed_threefry_key(key, name="key")
         grad_leaves, grad_structure = _flatten_with_none(gradients)
         if grad_structure != structure:
             raise ValueError("params, gradients, and state must share a PyTree structure")
@@ -1056,14 +1484,9 @@ class AlbertaAdaUPGD:
                 raise ValueError("mask must share the parameter PyTree structure")
         eligible_leaves: list[Array] = []
         for param, mask_leaf in zip(param_leaves, mask_leaves, strict=True):
-            mask_array = jnp.asarray(mask_leaf)
-            if mask_array.dtype != jnp.bool_:
-                raise TypeError("every mask leaf must have boolean dtype")
-            try:
-                eligible = jnp.broadcast_to(mask_array, param.shape)
-            except ValueError as exc:
-                raise ValueError("every mask leaf must broadcast to its parameter shape") from exc
-            eligible_leaves.append(eligible)
+            eligible_leaves.append(
+                _broadcast_bool_array("mask leaf", mask_leaf, param.shape)
+            )
 
         if noise is None:
             supplied_noise_leaves: list[Any] = [None] * len(param_leaves)
@@ -1078,6 +1501,34 @@ class AlbertaAdaUPGD:
         proposed_next_key = split_keys[0]
         noise_keys = split_keys[1:]
         state_is_valid = self.state_valid(state, params)
+        if self._config.utility_decay == 0.0 or self._config.second_moment_decay == 0.0:
+            checked_utility = (
+                jax.tree.map(
+                    lambda value: jnp.where(
+                        jnp.isfinite(value), value, jnp.zeros_like(value)
+                    ),
+                    state.utility_ema,
+                )
+                if self._config.utility_decay == 0.0
+                else state.utility_ema
+            )
+            checked_moment = (
+                jax.tree.map(
+                    lambda value: jnp.where(
+                        jnp.isfinite(value), value, jnp.zeros_like(value)
+                    ),
+                    state.gradient_second_moment,
+                )
+                if self._config.second_moment_decay == 0.0
+                else state.gradient_second_moment
+            )
+            state_is_valid = self.state_valid(
+                state.replace(  # type: ignore[attr-defined]
+                    utility_ema=checked_utility,
+                    gradient_second_moment=checked_moment,
+                ),
+                params,
+            )
         capacity_available = state.step < jnp.asarray(_INT32_MAX, dtype=jnp.int32)
         proposed_step = jnp.where(capacity_available, state.step + 1, state.step)
         input_is_valid = jnp.asarray(True, dtype=jnp.bool_)
@@ -1110,15 +1561,17 @@ class AlbertaAdaUPGD:
             if gradient is None:
                 clean_gradient = jnp.zeros_like(param)
                 gradient_finite = jnp.zeros(param.shape, dtype=jnp.bool_)
-                missing_gradient_leaf_count = missing_gradient_leaf_count + 1
+                missing_gradient_leaf_count = missing_gradient_leaf_count + jnp.asarray(
+                    1, dtype=jnp.int32
+                )
             else:
-                gradient_array = jnp.asarray(gradient, dtype=param.dtype)
-                if gradient_array.shape != param.shape:
-                    raise ValueError("every gradient leaf must match its parameter shape")
+                gradient_array = _coerced_numeric_array(
+                    "gradient leaf", gradient, shape=param.shape, dtype=param.dtype
+                )
                 gradient_finite = jnp.isfinite(gradient_array)
                 clean_gradient = jnp.where(gradient_finite, gradient_array, 0.0)
             nonfinite_gradient_count = nonfinite_gradient_count + jnp.sum(
-                (~gradient_finite).astype(jnp.int32)
+                (~gradient_finite).astype(jnp.int32), dtype=jnp.int32
             )
             input_is_valid = input_is_valid & jnp.all(gradient_finite)
             clean_gradients.append(clean_gradient)
@@ -1129,12 +1582,15 @@ class AlbertaAdaUPGD:
                     * self._config.noise_std
                 )
             else:
-                sampled_noise = jnp.asarray(supplied_noise, dtype=param.dtype)
-                if sampled_noise.shape != param.shape:
-                    raise ValueError("every noise leaf must match its parameter shape")
+                sampled_noise = _coerced_numeric_array(
+                    "noise leaf",
+                    supplied_noise,
+                    shape=param.shape,
+                    dtype=param.dtype,
+                )
             noise_finite = jnp.isfinite(sampled_noise)
             nonfinite_noise_count = nonfinite_noise_count + jnp.sum(
-                (~noise_finite).astype(jnp.int32)
+                (~noise_finite).astype(jnp.int32), dtype=jnp.int32
             )
             input_is_valid = input_is_valid & jnp.all(noise_finite)
             sampled_noise_leaves.append(jnp.where(noise_finite, sampled_noise, 0.0))
@@ -1159,7 +1615,7 @@ class AlbertaAdaUPGD:
             instantaneous_utility = -gradient * param
             proposed_utility = jnp.where(
                 eligible,
-                beta_utility * utility
+                _static_zero_scale(beta_utility, utility)
                 + (1.0 - beta_utility) * instantaneous_utility,
                 utility,
             )
@@ -1176,9 +1632,9 @@ class AlbertaAdaUPGD:
                 0.0,
             )
 
-            proposed_moment = (
-                beta_second * moment + (1.0 - beta_second) * jnp.square(gradient)
-            )
+            proposed_moment = _static_zero_scale(beta_second, moment) + (
+                1.0 - beta_second
+            ) * jnp.square(gradient)
             moment_clock = jnp.maximum(proposed_step, 1).astype(param.dtype)
             moment_correction = 1.0 - jnp.power(beta_second, moment_clock)
             corrected_moment = proposed_moment / jnp.maximum(
@@ -1276,12 +1732,50 @@ class AlbertaAdaUPGD:
             ),
             step=proposed_step,
         )
+        eligible_count = sum(
+            (
+                jnp.sum(eligible.astype(jnp.int32), dtype=jnp.int32)
+                for eligible in eligible_leaves
+            ),
+            start=jnp.asarray(0, dtype=jnp.int32),
+        )
+        count_floor = jnp.maximum(eligible_count.astype(jnp.float32), 1.0)
+        mean_gate = sum(
+            (
+                jnp.sum(gate.astype(jnp.float32) / count_floor)
+                for gate in gate_leaves
+            ),
+            start=jnp.asarray(0.0, dtype=jnp.float32),
+        )
+        mean_utility = sum(
+            (
+                jnp.sum(
+                    jnp.where(eligible, jnp.abs(corrected), 0.0).astype(jnp.float32)
+                    / count_floor
+                )
+                for corrected, eligible in zip(
+                    corrected_leaves, eligible_leaves, strict=True
+                )
+            ),
+            start=jnp.asarray(0.0, dtype=jnp.float32),
+        )
         candidate_is_valid = self.state_valid(proposed_state, proposed_params)
+        diagnostics_are_valid = _floating_leaves_are_finite(
+            corrected_leaves,
+            denominator_leaves,
+            gate_leaves,
+            perturbation_leaves,
+            mean_gate,
+            mean_utility,
+        )
+        if self._config.normalization == "global":
+            diagnostics_are_valid = diagnostics_are_valid & jnp.isfinite(global_maximum)
         accepted = (
             state_is_valid
             & capacity_available
             & input_is_valid
             & candidate_is_valid
+            & diagnostics_are_valid
         )
         committed_params = _adaupgd_select_tree(accepted, proposed_params, params)
         committed_state = _adaupgd_select_tree(accepted, proposed_state, state)
@@ -1312,27 +1806,7 @@ class AlbertaAdaUPGD:
             jax.tree_util.tree_unflatten(structure, perturbation_leaves),
             zero_tree,
         )
-        eligible_count = sum(
-            (jnp.sum(eligible.astype(jnp.int32)) for eligible in eligible_leaves),
-            start=jnp.asarray(0, dtype=jnp.int32),
-        )
         parameter_count = sum(param.size for param in param_leaves)
-        gate_sum = sum(
-            (jnp.sum(gate.astype(jnp.float32)) for gate in gate_leaves),
-            start=jnp.asarray(0.0, dtype=jnp.float32),
-        )
-        utility_sum = sum(
-            (
-                jnp.sum(jnp.where(eligible, jnp.abs(corrected), 0.0)).astype(
-                    jnp.float32
-                )
-                for corrected, eligible in zip(
-                    corrected_leaves, eligible_leaves, strict=True
-                )
-            ),
-            start=jnp.asarray(0.0, dtype=jnp.float32),
-        )
-        count_floor = jnp.maximum(eligible_count.astype(jnp.float32), 1.0)
         reported_global_maximum = jnp.where(
             accepted & (self._config.normalization == "global"),
             global_maximum,
@@ -1349,12 +1823,8 @@ class AlbertaAdaUPGD:
             perturbation=perturbation,
             metrics={
                 "accepted": accepted,
-                "mean_scaled_utility": jnp.where(
-                    accepted, gate_sum / count_floor, 0.0
-                ),
-                "mean_absolute_utility": jnp.where(
-                    accepted, utility_sum / count_floor, 0.0
-                ),
+                "mean_scaled_utility": jnp.where(accepted, mean_gate, 0.0),
+                "mean_absolute_utility": jnp.where(accepted, mean_utility, 0.0),
                 "global_maximum_utility": reported_global_maximum,
                 "eligible_parameter_count": eligible_count,
                 "parameter_count": jnp.asarray(parameter_count, dtype=jnp.int32),
@@ -1417,45 +1887,38 @@ class OfficialAdaUPGDConfig:
     epsilon: float = 1e-5
 
     def __post_init__(self) -> None:
-        if self.profile != OFFICIAL_ADAUPGD_PROFILE:
+        if type(self.profile) is not str or self.profile != OFFICIAL_ADAUPGD_PROFILE:
             raise ValueError("profile must name the pinned official RL AdaptiveUPGD")
-        if self.source_commit != OFFICIAL_ADAUPGD_COMMIT:
+        if type(self.source_commit) is not str or self.source_commit != OFFICIAL_ADAUPGD_COMMIT:
             raise ValueError("source_commit must match the pinned AdaptiveUPGD commit")
-        if self.source_path != OFFICIAL_ADAUPGD_PATH:
+        if type(self.source_path) is not str or self.source_path != OFFICIAL_ADAUPGD_PATH:
             raise ValueError("source_path must match the pinned AdaptiveUPGD path")
-        for name in (
-            "step_size",
-            "weight_decay",
-            "utility_decay",
-            "noise_std",
-            "beta1",
-            "beta2",
-            "epsilon",
-        ):
-            value = getattr(self, name)
-            if isinstance(value, bool) or not isinstance(value, (int, float)):
-                raise TypeError(f"{name} must be a real number, not boolean")
-            if not math.isfinite(float(value)):
-                raise ValueError(f"{name} must be finite")
-            narrowed = jnp.asarray(value, dtype=jnp.float32)
-            if not bool(jnp.isfinite(narrowed)):
-                raise ValueError(f"{name} must be finite in float32")
-            if float(value) != 0.0 and float(narrowed) == 0.0:
-                raise ValueError(f"{name} must not underflow in float32")
-        if self.step_size <= 0.0:
-            raise ValueError("step_size must be positive")
-        if self.weight_decay < 0.0:
-            raise ValueError("weight_decay must be non-negative")
-        if not 0.0 <= self.utility_decay < 1.0:
-            raise ValueError("utility_decay must be in [0, 1)")
-        if self.noise_std < 0.0:
-            raise ValueError("noise_std must be non-negative")
-        if not 0.0 <= self.beta1 < 1.0:
-            raise ValueError("beta1 must be in [0, 1)")
-        if not 0.0 <= self.beta2 < 1.0:
-            raise ValueError("beta2 must be in [0, 1)")
-        if self.epsilon <= 0.0:
-            raise ValueError("epsilon must be positive")
+        step_size = _validated_float32_scalar(
+            "step_size", self.step_size, lower=0.0, positive=True
+        )
+        weight_decay = _validated_float32_scalar(
+            "weight_decay", self.weight_decay, lower=0.0
+        )
+        utility_decay = _validated_float32_scalar(
+            "utility_decay", self.utility_decay, lower=0.0, upper=1.0, upper_inclusive=False
+        )
+        noise_std = _validated_float32_scalar("noise_std", self.noise_std, lower=0.0)
+        beta1 = _validated_float32_scalar(
+            "beta1", self.beta1, lower=0.0, upper=1.0, upper_inclusive=False
+        )
+        beta2 = _validated_float32_scalar(
+            "beta2", self.beta2, lower=0.0, upper=1.0, upper_inclusive=False
+        )
+        epsilon = _validated_float32_scalar(
+            "epsilon", self.epsilon, lower=0.0, positive=True
+        )
+        object.__setattr__(self, "step_size", step_size)
+        object.__setattr__(self, "weight_decay", weight_decay)
+        object.__setattr__(self, "utility_decay", utility_decay)
+        object.__setattr__(self, "noise_std", noise_std)
+        object.__setattr__(self, "beta1", beta1)
+        object.__setattr__(self, "beta2", beta2)
+        object.__setattr__(self, "epsilon", epsilon)
 
     @property
     def official_reference_parity(self) -> bool:
@@ -1487,12 +1950,10 @@ class OfficialAdaUPGDConfig:
         }
 
     @classmethod
-    def from_config(cls, config: dict[str, object]) -> OfficialAdaUPGDConfig:
+    def from_config(cls, config: Mapping[str, object]) -> OfficialAdaUPGDConfig:
         """Strictly reconstruct the pinned official profile."""
 
-        if type(config) is not dict:
-            raise TypeError("OfficialAdaUPGD config must be an exact dict")
-        payload = dict(config)
+        payload = _copy_config_mapping("OfficialAdaUPGD config", config)
         expected = {
             "type",
             "profile",
@@ -1509,9 +1970,12 @@ class OfficialAdaUPGDConfig:
         if set(payload) != expected:
             raise ValueError("config fields do not match the OfficialAdaUPGD schema")
         type_name = payload.pop("type")
-        if type_name != "OfficialAdaUPGD":
-            raise ValueError(f"expected OfficialAdaUPGD config, got {type_name!r}")
-        return cls(**payload)  # type: ignore[arg-type]
+        if type(type_name) is not str or type_name != "OfficialAdaUPGD":
+            raise ValueError("expected OfficialAdaUPGD config, got invalid value")
+        try:
+            return cls(**payload)
+        except Exception as error:
+            raise ValueError("OfficialAdaUPGD config values are invalid") from error
 
 
 @chex.dataclass(frozen=True)
@@ -1550,6 +2014,42 @@ class OfficialAdaUPGDResources:
     parameter_count: int
     persistent_array_count: int
     persistent_state_nbytes: int
+
+    def __post_init__(self) -> None:
+        for field_name, value, expected in (
+            ("profile", self.profile, OFFICIAL_ADAUPGD_PROFILE),
+            ("source_commit", self.source_commit, OFFICIAL_ADAUPGD_COMMIT),
+            ("source_path", self.source_path, OFFICIAL_ADAUPGD_PATH),
+        ):
+            object.__setattr__(
+                self,
+                field_name,
+                _require_exact_identity(value, field_name, expected),
+            )
+        object.__setattr__(
+            self,
+            "official_reference_parity",
+            _require_exact_parity(
+                self.official_reference_parity,
+                "official_reference_parity",
+                True,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "parameter_count",
+            _require_exact_int(self.parameter_count, "parameter_count"),
+        )
+        object.__setattr__(
+            self,
+            "persistent_array_count",
+            _require_exact_int(self.persistent_array_count, "persistent_array_count"),
+        )
+        object.__setattr__(
+            self,
+            "persistent_state_nbytes",
+            _require_exact_int(self.persistent_state_nbytes, "persistent_state_nbytes"),
+        )
 
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-compatible resource record."""
@@ -1596,22 +2096,22 @@ class OfficialAdaUPGD:
         return self._config.to_config()
 
     @classmethod
-    def from_config(cls, config: dict[str, object]) -> OfficialAdaUPGD:
+    def from_config(cls, config: Mapping[str, object]) -> OfficialAdaUPGD:
         """Reconstruct the transform from a strict source-bound config."""
 
         return cls(OfficialAdaUPGDConfig.from_config(config))
 
     @staticmethod
     def _parameter_contract(params: Any) -> tuple[list[Array], jax.tree_util.PyTreeDef]:
-        leaves, structure = _flatten_with_none(params)
-        if not leaves or any(value is None for value in leaves):
-            raise ValueError("params must contain at least one array leaf")
-        arrays: list[Array] = []
-        for value in leaves:
-            array = jnp.asarray(value)
-            if not jnp.issubdtype(array.dtype, jnp.floating):
-                raise ValueError("OfficialAdaUPGD parameters must have floating-point dtype")
-            arrays.append(array)
+        arrays, structure, _ = _parameter_arrays(
+            params,
+            owner="OfficialAdaUPGD",
+            persistent_nbytes=lambda _scalars, nbytes: 3 * nbytes + 4,
+            # params, state, five diagnostics, key, and three metrics.
+            update_nbytes=lambda _scalars, nbytes: 9 * nbytes + 24,
+            working_scalars=lambda scalars: 33 * scalars + 32,
+            working_nbytes=lambda scalars, nbytes: 34 * nbytes + 4 * scalars + 128,
+        )
         return arrays, structure
 
     @staticmethod
@@ -1645,37 +2145,31 @@ class OfficialAdaUPGD:
             second_leaves,
             strict=True,
         ):
-            utility_array = jnp.asarray(utility)
-            first_array = jnp.asarray(first)
-            second_array = jnp.asarray(second)
-            if (
-                utility_array.shape != param.shape
-                or first_array.shape != param.shape
-                or second_array.shape != param.shape
-            ):
-                raise ValueError("every official AdaUPGD state leaf must match its parameter shape")
-            if (
-                utility_array.dtype != param.dtype
-                or first_array.dtype != param.dtype
-                or second_array.dtype != param.dtype
-            ):
-                raise TypeError("official AdaUPGD state dtypes must match parameters")
+            param_dtype = np.dtype(param.dtype)
+            utility_array = _matching_array(
+                "utility state leaf", utility, shape=param.shape, dtype=param_dtype
+            )
+            first_array = _matching_array(
+                "first-moment state leaf", first, shape=param.shape, dtype=param_dtype
+            )
+            second_array = _matching_array(
+                "second-moment state leaf", second, shape=param.shape, dtype=param_dtype
+            )
             utilities.append(utility_array)
             first_moments.append(first_array)
             second_moments.append(second_array)
-        step = jnp.asarray(state.step)
-        if step.shape != () or step.dtype != jnp.int32:
-            raise TypeError("state.step must be one scalar int32 array")
+        _matching_array("state.step", state.step, shape=(), dtype=np.dtype(np.int32))
         return param_leaves, utilities, first_moments, second_moments, structure
 
     def init(self, params: Any) -> OfficialAdaUPGDState:
         """Initialize the three source-defined moment PyTrees."""
 
-        self._parameter_contract(params)
+        leaves, structure = self._parameter_contract(params)
+        array_params = jax.tree_util.tree_unflatten(structure, leaves)
         return OfficialAdaUPGDState(  # type: ignore[call-arg]
-            utility_ema=jax.tree.map(jnp.zeros_like, params),
-            first_moment=jax.tree.map(jnp.zeros_like, params),
-            second_moment=jax.tree.map(jnp.zeros_like, params),
+            utility_ema=jax.tree.map(jnp.zeros_like, array_params),
+            first_moment=jax.tree.map(jnp.zeros_like, array_params),
+            second_moment=jax.tree.map(jnp.zeros_like, array_params),
             step=jnp.asarray(0, dtype=jnp.int32),
         )
 
@@ -1740,7 +2234,6 @@ class OfficialAdaUPGD:
         JAX port of the source's implicit PyTorch generator.
         """
 
-        checked_key = _adaupgd_typed_threefry_key(key, name="key")
         if mask is not None:
             raise ValueError("the official AdaptiveUPGD profile does not accept masks")
         (
@@ -1750,6 +2243,8 @@ class OfficialAdaUPGD:
             second_leaves,
             structure,
         ) = self._state_contract(state, params)
+        params = jax.tree_util.tree_unflatten(structure, param_leaves)
+        checked_key = _adaupgd_typed_threefry_key(key, name="key")
         grad_leaves, grad_structure = _flatten_with_none(gradients)
         if grad_structure != structure:
             raise ValueError("params, gradients, and state must share a PyTree structure")
@@ -1766,15 +2261,15 @@ class OfficialAdaUPGD:
 
         gradient_arrays: list[Array] = []
         for param, gradient in zip(param_leaves, grad_leaves, strict=True):
-            gradient_array = jnp.asarray(gradient, dtype=param.dtype)
-            if gradient_array.shape != param.shape:
-                raise ValueError("every gradient leaf must match its parameter shape")
+            gradient_array = _coerced_numeric_array(
+                "gradient leaf", gradient, shape=param.shape, dtype=param.dtype
+            )
             gradient_arrays.append(gradient_array)
 
         split_keys = jr.split(checked_key, len(param_leaves) + 1)
         next_key = split_keys[0]
         noise_keys = split_keys[1:]
-        next_step = state.step + jnp.asarray(1, dtype=jnp.int32)
+        next_step = _saturating_increment(state.step)
         proposed_utility_leaves: list[Array] = []
         proposed_first_leaves: list[Array] = []
         proposed_second_leaves: list[Array] = []
@@ -1787,15 +2282,15 @@ class OfficialAdaUPGD:
             strict=True,
         ):
             proposed_utility_leaves.append(
-                self._config.utility_decay * utility
+                _static_zero_scale(self._config.utility_decay, utility)
                 + (1.0 - self._config.utility_decay) * (-gradient * param)
             )
             proposed_first_leaves.append(
-                self._config.beta1 * first
+                _static_zero_scale(self._config.beta1, first)
                 + (1.0 - self._config.beta1) * gradient
             )
             proposed_second_leaves.append(
-                self._config.beta2 * second
+                _static_zero_scale(self._config.beta2, second)
                 + (1.0 - self._config.beta2) * jnp.square(gradient)
             )
 
@@ -1846,9 +2341,12 @@ class OfficialAdaUPGD:
                     * self._config.noise_std
                 )
             else:
-                perturbation = jnp.asarray(supplied_noise, dtype=param.dtype)
-                if perturbation.shape != param.shape:
-                    raise ValueError("every noise leaf must match its parameter shape")
+                perturbation = _coerced_numeric_array(
+                    "noise leaf",
+                    supplied_noise,
+                    shape=param.shape,
+                    dtype=param.dtype,
+                )
             gate = jax.nn.sigmoid(
                 corrected_utility / raw_global_maximum.astype(param.dtype)
             )

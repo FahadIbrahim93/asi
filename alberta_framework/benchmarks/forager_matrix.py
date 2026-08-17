@@ -761,6 +761,15 @@ def _reject_nonfinite_json(token: str) -> Any:
     raise ForagerMatrixManifestError(f"non-finite JSON number {token!r} is not allowed")
 
 
+def _parse_finite_json_float(token: str) -> float:
+    parsed = float(token)
+    if not math.isfinite(parsed):
+        raise ForagerMatrixManifestError(
+            f"non-finite JSON number {token!r} is not allowed"
+        )
+    return parsed
+
+
 def _validate_json_complexity(value: Any, *, description: str) -> None:
     """Bound decoded JSON traversal before recursive canonicalization."""
     pending: list[tuple[Any, int]] = [(value, 0)]
@@ -788,6 +797,7 @@ def _decode_strict_json(data: str, *, description: str) -> Any:
             data,
             object_pairs_hook=_reject_duplicate_object_keys,
             parse_constant=_reject_nonfinite_json,
+            parse_float=_parse_finite_json_float,
         )
     except ForagerMatrixManifestError:
         raise
@@ -1602,17 +1612,32 @@ def load_forager_matrix_manifest(path: str | Path) -> ForagerMatrixManifest:
 def _json_safe(value: Any) -> Any:
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         return _json_safe(dataclasses.asdict(value))
-    if isinstance(value, Mapping):
-        return {str(key): _json_safe(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
+    if type(value) in (dict, MappingProxyType):
+        result: dict[str, Any] = {}
+        for key, item in value.items():
+            if type(key) is not str:
+                raise ForagerMatrixError("matrix artifact mappings require string keys")
+            result[key] = _json_safe(item)
+        return result
+    if type(value) in (list, tuple):
         return [_json_safe(item) for item in value]
-    if isinstance(value, float) and not math.isfinite(value):
-        return None
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise ForagerMatrixError("matrix artifact identity is not finite JSON")
+        return value
+    if type(value) in (np.float16, np.float32, np.float64, np.longdouble):
+        if not bool(np.isfinite(value)):
+            raise ForagerMatrixError("matrix artifact identity is not finite JSON")
+        return float(value)
     if isinstance(value, Path):
         if value.is_absolute():
             raise ForagerMatrixError("absolute host paths are forbidden in matrix artifacts")
         return value.as_posix()
-    return value
+    if value is None or type(value) in (str, bool, int):
+        return value
+    raise ForagerMatrixError(
+        f"matrix artifact contains unsupported {type(value).__name__} identity"
+    )
 
 
 def _assert_path_sanitized(value: Any, path: str = "artifact") -> None:
@@ -2485,84 +2510,6 @@ def _atomic_create_bound_json(
         relative_path,
         _canonical_json_bytes(payload) + b"\n",
     )
-
-
-def _atomic_create_bytes(path: Path, encoded: bytes) -> None:
-    """Atomically create bytes through a no-follow directory descriptor."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    flags = os.O_RDONLY | os.O_DIRECTORY
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    try:
-        directory_descriptor = os.open(path.parent, flags)
-    except OSError as exc:
-        raise ForagerMatrixStateError(
-            f"could not open artifact directory without following links: {path.parent}"
-        ) from exc
-    temporary_name: str | None = None
-    descriptor: int | None = None
-    try:
-        try:
-            os.stat(path.name, dir_fd=directory_descriptor, follow_symlinks=False)
-        except FileNotFoundError:
-            pass
-        else:
-            raise ForagerMatrixStateError(f"refusing to overwrite existing artifact {path}")
-
-        create_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-        if hasattr(os, "O_NOFOLLOW"):
-            create_flags |= os.O_NOFOLLOW
-        for attempt in range(100):
-            candidate = f".{path.name}.{os.getpid()}.{time.time_ns()}.{attempt}.tmp"
-            try:
-                descriptor = os.open(
-                    candidate,
-                    create_flags,
-                    0o600,
-                    dir_fd=directory_descriptor,
-                )
-            except FileExistsError:
-                continue
-            temporary_name = candidate
-            break
-        if descriptor is None or temporary_name is None:  # pragma: no cover
-            raise ForagerMatrixStateError(f"could not allocate a temporary artifact for {path}")
-        try:
-            view = memoryview(encoded)
-            while view:
-                written = os.write(descriptor, view)
-                if written <= 0:  # pragma: no cover - defensive OS contract check
-                    raise ForagerMatrixStateError(f"short write while creating artifact {path}")
-                view = view[written:]
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
-            descriptor = None
-        try:
-            os.link(
-                temporary_name,
-                path.name,
-                src_dir_fd=directory_descriptor,
-                dst_dir_fd=directory_descriptor,
-                follow_symlinks=False,
-            )
-        except FileExistsError as exc:
-            raise ForagerMatrixStateError(
-                f"refusing to overwrite concurrently created artifact {path}"
-            ) from exc
-        try:
-            os.fsync(directory_descriptor)
-        except OSError as exc:  # pragma: no cover - filesystem-specific
-            raise ForagerMatrixStateError(
-                f"could not synchronize artifact directory {path.parent}"
-            ) from exc
-    finally:
-        if descriptor is not None:
-            os.close(descriptor)
-        if temporary_name is not None:
-            with contextlib.suppress(FileNotFoundError):
-                os.unlink(temporary_name, dir_fd=directory_descriptor)
-        os.close(directory_descriptor)
 
 
 def _read_regular_file_bytes(
@@ -3920,13 +3867,6 @@ def _validate_tuning_reference(
     *,
     evaluation_context: Mapping[str, Any],
 ) -> dict[str, Any] | None:
-    """Validate host tuning inputs while keeping them ineligible for evaluation.
-
-    A future verifier-issued OCI adapter may return the documented reference
-    fields consumed by :func:`_protocol_conformance`: report and execution
-    digests, tuning seeds, selected variants, and the six conformance booleans.
-    This host/snapshot path always fails closed before producing that mapping.
-    """
     selection = manifest.tuning_selection
     if selection is None:
         return None
@@ -4013,7 +3953,7 @@ def _validate_tuning_reference(
             "evaluation selection rule does not match the referenced tuning report"
         )
     try:
-        tuning_variants, _tuning_execution, recomputed_protocol = (
+        tuning_variants, tuning_execution, recomputed_protocol = (
             _validate_tuning_artifact_chain(
                 report_path=report_path,
                 report=report,
@@ -4045,6 +3985,7 @@ def _validate_tuning_reference(
         selection_results.get("groups"),
         "referenced selection_results.groups",
     )
+    selected_details: dict[str, Any] = {}
     expected_groups = set(groups)
     evaluation_groups = {
         variant.selection_group for variant in manifest.variants.values()
@@ -4097,6 +4038,12 @@ def _validate_tuning_reference(
                 f"evaluation variant {evaluation_id!r} does not match selected "
                 f"tuning variant {tuning_id!r}"
             )
+        selected_details[evaluation_id] = {
+            "tuning_variant_id": tuning_id,
+            "selection_group": evaluation_variant.selection_group,
+            "kind": evaluation_variant.kind,
+            "config_sha256": evaluation_hash,
+        }
     tuning_seed_values = matrix_config.get("seeds")
     tuning_seeds = _require_seed_list(tuning_seed_values, "referenced matrix_config.seeds")
     if tuning_manifest.evaluation_seeds != manifest.evaluation_seeds:
@@ -4122,7 +4069,6 @@ def _validate_tuning_reference(
         "identity, and environment RNG schedule. Bare manifest declarations are "
         "never trusted."
     )
-
 
 def _protocol_conformance(
     manifest: ForagerMatrixManifest,

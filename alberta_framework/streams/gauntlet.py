@@ -83,6 +83,23 @@ LIFETIME_GAUNTLET_CLOCK_NBYTES = 12
 LIFETIME_GAUNTLET_CLOCK_DELTA_NBYTES = 8
 
 
+def _require_int(
+    name: str,
+    value: object,
+    *,
+    minimum: int = 0,
+    maximum: int = _INT32_MAX,
+) -> int:
+    # This is a JSON/checkpoint identity boundary. Reject by exact type before
+    # comparisons so hostile ``int`` subclasses cannot execute hooks and
+    # NumPy scalar identities cannot leak into persisted metadata.
+    if type(value) is not int:
+        raise ValueError(f"{name} must be an integer")
+    if value < minimum or value > maximum:
+        raise ValueError(f"{name} must lie in [{minimum}, {maximum}]")
+    return value
+
+
 def _require_array(
     value: Any,
     *,
@@ -140,9 +157,7 @@ def _divmod_lifetime_words(words: Array, divisor: int | Array) -> tuple[Array, A
         doubled = remainder + remainder + bit
         subtract = doubled >= divisor_array
         remainder = jnp.where(subtract, doubled - divisor_array, doubled)
-        mask = jnp.left_shift(
-            jnp.asarray(1, dtype=jnp.uint32), bit_index.astype(jnp.uint32)
-        )
+        mask = jnp.left_shift(jnp.asarray(1, dtype=jnp.uint32), bit_index.astype(jnp.uint32))
         quotient_high = jnp.where(
             in_high & subtract,
             jnp.bitwise_or(quotient_high, mask),
@@ -158,6 +173,7 @@ def _divmod_lifetime_words(words: Array, divisor: int | Array) -> tuple[Array, A
     zero = jnp.asarray(0, dtype=jnp.uint32)
     remainder, high, low = jax.lax.fori_loop(0, 64, body, (zero, zero, zero))
     return jnp.stack((high, low)).astype(jnp.uint32), remainder
+
 
 SEGMENT_NAMES = (
     "stationary_a",
@@ -560,6 +576,29 @@ class LifetimeGauntletResourceBudget:
     trainable_scalars: int = 0
     replay_capacity: int = 0
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "state_nbytes", _require_int("state_nbytes", self.state_nbytes))
+        object.__setattr__(
+            self,
+            "exact_clock_nbytes",
+            _require_int("exact_clock_nbytes", self.exact_clock_nbytes),
+        )
+        object.__setattr__(
+            self,
+            "exact_clock_delta_nbytes",
+            _require_int("exact_clock_delta_nbytes", self.exact_clock_delta_nbytes),
+        )
+        object.__setattr__(
+            self,
+            "trainable_scalars",
+            _require_int("trainable_scalars", self.trainable_scalars),
+        )
+        object.__setattr__(
+            self,
+            "replay_capacity",
+            _require_int("replay_capacity", self.replay_capacity),
+        )
+
     def to_dict(self) -> dict[str, int | str]:
         return {
             "type": type(self).__name__,
@@ -624,10 +663,7 @@ class LifetimeGauntletStream:
         cycle_length = self.SUB_SEGMENTS * self._config.segment_length
         if cycle_length > _INT32_MAX:
             raise ValueError("lifetime gauntlet cycle length must fit in int32")
-        if (
-            scale_cycle_period > 0
-            and cycle_length * scale_cycle_period > _INT32_MAX
-        ):
+        if scale_cycle_period > 0 and cycle_length * scale_cycle_period > _INT32_MAX:
             raise ValueError("scale stress schedule period must fit in int32")
         self._scale_period = scale_cycle_period
         # Reuse GauntletStream's task-drawing convention.
@@ -739,9 +775,7 @@ class LifetimeGauntletStream:
             & jnp.all(jnp.isfinite(state.w_d))
         )
 
-    def _schedule_position(
-        self, words: Array
-    ) -> tuple[Array, Array, Array, Array]:
+    def _schedule_position(self, words: Array) -> tuple[Array, Array, Array, Array]:
         """Derive exact cycle identity and bounded phases from exact time."""
         cycle_words, cycle_step = _divmod_lifetime_words(words, self.cycle_length)
         sub = jnp.floor_divide(
@@ -751,9 +785,7 @@ class LifetimeGauntletStream:
             cycle_step, jnp.asarray(self._config.segment_length, dtype=jnp.uint32)
         ).astype(jnp.int32)
         if self._scale_period > 0:
-            _scale_quotient, cycle_mod = _divmod_lifetime_words(
-                cycle_words, self._scale_period
-            )
+            _scale_quotient, cycle_mod = _divmod_lifetime_words(cycle_words, self._scale_period)
             scaled = (cycle_mod == self._scale_period - 1) & (sub == 0)
         else:
             scaled = jnp.asarray(False, dtype=jnp.bool_)
@@ -776,9 +808,7 @@ class LifetimeGauntletStream:
         step_array = jnp.asarray(step)
         if step_array.shape == (2,) and step_array.dtype == jnp.dtype(jnp.uint32):
             return self._schedule_position(step_array)[1]
-        return ((step_array // self._config.segment_length) % self.SUB_SEGMENTS).astype(
-            jnp.int32
-        )
+        return ((step_array // self._config.segment_length) % self.SUB_SEGMENTS).astype(jnp.int32)
 
     def cycle_of(self, step: Array) -> Array:
         """Cycle ordinal at *step*."""
@@ -1019,6 +1049,12 @@ def lifetime_scorecard(
           cycle-0 entry error divided by each later cycle's entry error.
         - ``nan_steps``: non-finite step count (must be 0 for life).
     """
+    if type(n_cycles) is not int or n_cycles < 1:
+        raise ValueError("n_cycles must be a positive integer")
+    if type(window) is not int or window < 1 or window > config.segment_length:
+        raise ValueError(
+            f"window must be an integer in [1, {config.segment_length}], got {window!r}"
+        )
     length = config.segment_length
     cycle_len = LifetimeGauntletStream.SUB_SEGMENTS * length
     trimmed = sq_errors[..., : n_cycles * cycle_len]
@@ -1146,13 +1182,14 @@ def run_gauntlet_batched(
 def ema_smooth(values: Array, halflife: float = 50.0) -> Array:
     """Exponential-moving-average smoothing along the last axis."""
     decay = 0.5 ** (1.0 / halflife)
+    time_major = jnp.moveaxis(values, -1, 0)
 
     def step(carry: Array, v: Array) -> tuple[Array, Array]:
         new = decay * carry + (1.0 - decay) * v
         return new, new
 
-    _, smoothed = jax.lax.scan(step, values[..., 0], values.T)
-    return smoothed.T
+    _, smoothed = jax.lax.scan(step, values[..., 0], time_major)
+    return jnp.moveaxis(smoothed, 0, -1)
 
 
 def steps_to_criterion(sq_segment: Array, threshold: float) -> Array:
@@ -1176,6 +1213,10 @@ def steps_to_criterion(sq_segment: Array, threshold: float) -> Array:
 
 def segment_slice(sq_errors: Array, segment: int, segment_length: int) -> Array:
     """Slice per-step squared errors down to one segment (last axis)."""
+    if type(segment) is not int or segment < 0:
+        raise ValueError("segment must be a non-negative integer")
+    if type(segment_length) is not int or segment_length < 1:
+        raise ValueError("segment_length must be a positive integer")
     start = segment * segment_length
     return sq_errors[..., start : start + segment_length]
 
@@ -1202,6 +1243,12 @@ def early_window_mse(
     retention: the learner re-enters the task near its old solution instead
     of relearning from scratch.
     """
+    if type(segment) is not int or segment < 0:
+        raise ValueError("segment must be a non-negative integer")
+    if type(segment_length) is not int or segment_length < 1:
+        raise ValueError("segment_length must be a positive integer")
+    if type(window) is not int or window < 1 or window > segment_length:
+        raise ValueError(f"window must be an integer in [1, {segment_length}], got {window!r}")
     seg = segment_slice(sq_errors, segment, segment_length)
     return jnp.mean(seg[..., :window], axis=-1)
 

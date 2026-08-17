@@ -227,6 +227,45 @@ def test_benchmark_config_rejects_lossy_numeric_coercion(
         ForagerBenchmarkConfig(**kwargs)
 
 
+class _SpoofedFloat:
+    """Mimics ``float`` via ``__class__`` to defeat ``isinstance`` checks."""
+
+    @property
+    def __class__(self) -> type:  # type: ignore[override]
+        return float
+
+    def __float__(self) -> float:
+        return 0.5
+
+
+def test_benchmark_config_rejects_class_spoofed_ewm_decay() -> None:
+    with pytest.raises(ValueError, match="ewm_decay"):
+        ForagerBenchmarkConfig(ewm_decay=_SpoofedFloat())
+
+
+def test_benchmark_config_accepts_numpy_float64_ewm_decay() -> None:
+    config = ForagerBenchmarkConfig(ewm_decay=np.float64(0.5))
+    assert config.ewm_decay == 0.5
+    assert type(config.ewm_decay) is float
+
+
+class _FloatSubclass(float):
+    """A real float subtype whose later arithmetic remains user-controlled."""
+
+    def __mul__(self, other: object) -> float:
+        raise AssertionError("custom arithmetic must never reach a benchmark")
+
+
+def test_benchmark_config_rejects_user_defined_float_subclass() -> None:
+    with pytest.raises(ValueError, match="ewm_decay"):
+        ForagerBenchmarkConfig(ewm_decay=_FloatSubclass(0.5))
+
+
+def test_benchmark_config_rejects_unrepresentable_builtin_integer() -> None:
+    with pytest.raises(ValueError, match="ewm_decay must be finite"):
+        ForagerBenchmarkConfig(ewm_decay=10**10000)
+
+
 def test_benchmark_chunk_is_bounded_by_requested_lifetime() -> None:
     config = ForagerBenchmarkConfig(steps=7, jax_chunk_size=10_000)
 
@@ -787,6 +826,111 @@ def test_official_npz_import_matches_adjusted_ewm(tmp_path: Path) -> None:
             config_path="paper/config/Search-Oracle.json",
             expected_steps=4,
             protocol_attested=True,
+        )
+
+
+def test_official_npz_import_rejects_nonfinite_ewm_decay(tmp_path: Path) -> None:
+    path = tmp_path / "0.npz"
+    np.savez_compressed(path, rewards=np.ones((4,), dtype=np.float32))
+
+    with pytest.raises(ValueError, match="ewm_decay must be a finite number"):
+        import_official_foragax_npz(
+            OfficialForagaxRunSpec(agent="DQN", seed=0, path=path),
+            ewm_decay=math.nan,
+        )
+
+
+class _SpoofedFloat:
+    """Mimics ``float`` via ``__class__`` to defeat ``isinstance`` checks."""
+
+    @property
+    def __class__(self) -> type:  # type: ignore[override]
+        return float
+
+    def __float__(self) -> float:
+        return 0.5
+
+    def __le__(self, other: float) -> bool:
+        return 0.5 <= other
+
+    def __lt__(self, other: float) -> bool:
+        return 0.5 < other
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"ewm_decay": True}, "ewm_decay must be a finite number"),
+        ({"ewm_decay": _SpoofedFloat()}, "ewm_decay must be a finite number"),
+        ({"ewm_decay": 10**10000}, "ewm_decay must be a finite number"),
+        ({"ewm_decay": 1.0}, "ewm_decay must be a finite number"),
+        ({"ewm_decay": -0.1}, "ewm_decay must be a finite number"),
+        ({"ewm_decay": "0.5"}, "ewm_decay must be a finite number"),
+        ({"record_every": True}, "record_every must be a positive integer"),
+        ({"record_every": 0}, "record_every must be a positive integer"),
+        ({"record_every": 1.5}, "record_every must be a positive integer"),
+        ({"record_every": "2"}, "record_every must be a positive integer"),
+        ({"final_window": True}, "final_window must be a positive integer"),
+        ({"final_window": 0}, "final_window must be a positive integer"),
+        ({"final_window": 1.5}, "final_window must be a positive integer"),
+        ({"final_window": "2"}, "final_window must be a positive integer"),
+    ],
+)
+def test_official_npz_import_rejects_spoofed_and_out_of_range_numeric_params(
+    tmp_path: Path, kwargs: dict[str, Any], match: str
+) -> None:
+    path = tmp_path / "0.npz"
+    np.savez_compressed(path, rewards=np.ones((4,), dtype=np.float32))
+
+    with pytest.raises(ValueError, match=match):
+        import_official_foragax_npz(
+            OfficialForagaxRunSpec(agent="DQN", seed=0, path=path),
+            **kwargs,
+        )
+
+
+def test_official_npz_import_accepts_finite_endpoint_values(tmp_path: Path) -> None:
+    path = tmp_path / "0.npz"
+    np.savez_compressed(path, rewards=np.ones((4,), dtype=np.float32))
+
+    result = import_official_foragax_npz(
+        OfficialForagaxRunSpec(agent="DQN", seed=0, path=path, expected_steps=4),
+        ewm_decay=0.0,
+        record_every=1,
+        final_window=1,
+    )
+
+    assert result.mean_reward == pytest.approx(1.0)
+
+
+def test_official_npz_import_accepts_numpy_float64_ewm_decay(tmp_path: Path) -> None:
+    path = tmp_path / "0.npz"
+    np.savez_compressed(path, rewards=np.ones((4,), dtype=np.float32))
+
+    result = import_official_foragax_npz(
+        OfficialForagaxRunSpec(agent="DQN", seed=0, path=path, expected_steps=4),
+        ewm_decay=np.float64(0.5),
+        record_every=1,
+        final_window=1,
+    )
+
+    assert result.mean_reward == pytest.approx(1.0)
+
+
+def test_official_npz_import_rejects_user_defined_float_subclass(tmp_path: Path) -> None:
+    class FloatSubclass(float):
+        def __float__(self) -> float:
+            raise AssertionError("custom conversion must not reach the importer")
+
+    path = tmp_path / "0.npz"
+    np.savez_compressed(path, rewards=np.ones((4,), dtype=np.float32))
+
+    with pytest.raises(ValueError, match="ewm_decay must be a finite number"):
+        import_official_foragax_npz(
+            OfficialForagaxRunSpec(agent="DQN", seed=0, path=path, expected_steps=4),
+            ewm_decay=FloatSubclass(0.5),
+            record_every=1,
+            final_window=1,
         )
 
 

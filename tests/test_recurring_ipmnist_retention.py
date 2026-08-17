@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 
+import numpy as np
 import pytest
 
 from alberta_framework.evaluation.recurring_ipmnist_retention import (
@@ -11,6 +12,7 @@ from alberta_framework.evaluation.recurring_ipmnist_retention import (
     RecurringIPMNISTProtocol,
     RecurringIPMNISTTrace,
     SentinelProbeBinding,
+    SentinelProbeRequirement,
     SentinelProbeSnapshot,
     build_recurring_ipmnist_retention_report,
 )
@@ -114,8 +116,7 @@ def _snapshots(
             requirement,
             learner_state_sha256_before=state_hash,
             learner_state_sha256_after=state_hash,
-            correctness=(True,) * count
-            + (False,) * (requirement.sentinel_case_count - count),
+            correctness=(True,) * count + (False,) * (requirement.sentinel_case_count - count),
         )
         for requirement, count, state_hash in zip(
             protocol.required_probe_snapshots,
@@ -167,9 +168,7 @@ def test_protocol_binds_aba_identity_exposures_and_keeps_trace_task_id_free() ->
         "pre_update_online_accuracy",
         "post_update_one_step_plasticity",
     )
-    assert tuple(
-        (phase.permutation_id, phase.exposure_index) for phase in protocol.phases
-    ) == (
+    assert tuple((phase.permutation_id, phase.exposure_index) for phase in protocol.phases) == (
         ("permutation-a.v1", 0),
         ("permutation-b.v1", 0),
         ("permutation-a.v1", 1),
@@ -243,6 +242,60 @@ def test_missing_reordered_or_malformed_sentinel_snapshots_fail_closed() -> None
         dataclasses.replace(snapshots[0], learner_state_sha256_after=_sha("f"))
 
 
+def test_sentinel_probes_at_one_checkpoint_must_share_one_frozen_state() -> None:
+    protocol = _protocol()
+    snapshots = _snapshots(protocol, retaining=True)
+    drifted = dataclasses.replace(
+        snapshots[2], learner_state_sha256_before=_sha("9"), learner_state_sha256_after=_sha("9")
+    )
+    with pytest.raises(ValueError, match="one frozen state"):
+        build_recurring_ipmnist_retention_report(
+            protocol=protocol,
+            trace=_trace(retaining=True),
+            sentinel_snapshots=(*snapshots[:2], drifted, *snapshots[3:]),
+        )
+
+
+def test_sentinel_probes_at_different_checkpoints_must_use_distinct_frozen_states() -> None:
+    """Re-scoring one learner state at every boundary would report zero forgetting."""
+    protocol = _protocol()
+    one_state = _sha("7")
+    snapshots = tuple(
+        dataclasses.replace(
+            snapshot,
+            learner_state_sha256_before=one_state,
+            learner_state_sha256_after=one_state,
+        )
+        for snapshot in _snapshots(protocol, retaining=True)
+    )
+    with pytest.raises(
+        ValueError,
+        match=r"^sentinel probes at different checkpoints must use distinct frozen states; "
+        r"checkpoint steps \[4, 8, 12\] all declare one learner state$",
+    ):
+        build_recurring_ipmnist_retention_report(
+            protocol=protocol,
+            trace=_trace(retaining=True),
+            sentinel_snapshots=snapshots,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "message"),
+    [
+        ("sentinel_set_sha256", "A and B must bind distinct sentinel set digests"),
+        ("sentinel_set_id", "A and B must bind distinct sentinel set identities"),
+    ],
+)
+def test_protocol_rejects_a_and_b_sharing_one_sentinel_set(field: str, message: str) -> None:
+    """Distinct permutations transform the sentinel inputs, so shared sets cannot be genuine."""
+    protocol = _protocol()
+    a_binding, b_binding = protocol.sentinel_bindings
+    shared = dataclasses.replace(b_binding, **{field: getattr(a_binding, field)})
+    with pytest.raises(ValueError, match=f"^{message}$"):
+        dataclasses.replace(protocol, sentinel_bindings=(a_binding, shared))
+
+
 def test_report_is_explicitly_threshold_free_development_only_and_nonpromoting() -> None:
     protocol = _protocol()
     report = build_recurring_ipmnist_retention_report(
@@ -266,3 +319,163 @@ def test_trace_requires_binary_pre_update_outcomes(bad_accuracy: float) -> None:
             pre_update_online_accuracy=(bad_accuracy,),
             post_update_one_step_plasticity=(0.2,),
         )
+
+
+def test_recurring_ipmnist_dataclasses_reject_booleans_and_non_integers() -> None:
+    with pytest.raises(ValueError, match="phase_index"):
+        RecurringIPMNISTPhase(
+            phase_index=True,  # type: ignore[arg-type]
+            start_step=0,
+            length=4,
+            permutation_id="permutation-a.v1",
+            exposure_index=0,
+        )
+    with pytest.raises(ValueError, match="sentinel_case_count"):
+        SentinelProbeBinding(
+            permutation_id="permutation-a.v1",
+            permutation_sha256=_sha("a"),
+            sentinel_set_id="sentinel-a.v1",
+            sentinel_set_sha256=_sha("2"),
+            sentinel_case_count=2.5,  # type: ignore[arg-type]
+        )
+    with pytest.raises(ValueError, match="phase_index"):
+        SentinelProbeRequirement(
+            phase_index=True,  # type: ignore[arg-type]
+            checkpoint_step=4,
+            permutation_id="permutation-a.v1",
+            permutation_sha256=_sha("a"),
+            exposure_index=0,
+            sentinel_set_id="sentinel-a.v1",
+            sentinel_set_sha256=_sha("2"),
+            sentinel_case_count=1,
+        )
+    with pytest.raises(ValueError, match="sentinel_case_count"):
+        SentinelProbeRequirement(
+            phase_index=0,
+            checkpoint_step=4,
+            permutation_id="permutation-a.v1",
+            permutation_sha256=_sha("a"),
+            exposure_index=0,
+            sentinel_set_id="sentinel-a.v1",
+            sentinel_set_sha256=_sha("2"),
+            sentinel_case_count=True,  # type: ignore[arg-type]
+        )
+
+    class HostileInt(int):
+        def __index__(self) -> int:
+            raise AssertionError("subclass hook must not run")
+
+        def __repr__(self) -> str:
+            raise AssertionError("repr must not run")
+
+    with pytest.raises(ValueError, match="phase_index"):
+        RecurringIPMNISTPhase(
+            phase_index=HostileInt(0),
+            start_step=0,
+            length=1,
+            permutation_id="permutation-a.v1",
+            exposure_index=0,
+        )
+
+
+def test_recurring_ipmnist_dataclasses_accept_and_canonicalize_numpy_integers() -> None:
+    binding = SentinelProbeBinding(
+        permutation_id="permutation-a.v1",
+        permutation_sha256=_sha("a"),
+        sentinel_set_id="sentinel-a.v1",
+        sentinel_set_sha256=_sha("2"),
+        sentinel_case_count=np.int32(4),
+    )
+    assert type(binding.sentinel_case_count) is int
+    assert binding.sentinel_case_count == 4
+
+    phase = RecurringIPMNISTPhase(
+        phase_index=np.int32(0),
+        start_step=np.int64(0),
+        length=np.uint16(4),
+        permutation_id="permutation-a.v1",
+        exposure_index=np.uint8(0),
+    )
+    assert type(phase.phase_index) is int
+    assert type(phase.start_step) is int
+    assert type(phase.length) is int
+    assert type(phase.exposure_index) is int
+    assert phase.length == 4
+
+    snapshot = SentinelProbeSnapshot(
+        phase_index=np.int8(0),
+        checkpoint_step=np.uint16(4),
+        permutation_id="permutation-a.v1",
+        permutation_sha256=_sha("a"),
+        exposure_index=np.int64(0),
+        sentinel_set_id="sentinel-a.v1",
+        sentinel_set_sha256=_sha("2"),
+        learner_state_sha256_before=_sha("3"),
+        learner_state_sha256_after=_sha("3"),
+        correctness=(True,),
+    )
+    assert type(snapshot.phase_index) is int
+    assert type(snapshot.checkpoint_step) is int
+    assert type(snapshot.exposure_index) is int
+    assert type(snapshot.to_config()["checkpoint_step"]) is int
+
+    requirement = SentinelProbeRequirement(
+        phase_index=np.int32(0),
+        checkpoint_step=np.uint16(4),
+        permutation_id="permutation-a.v1",
+        permutation_sha256=_sha("a"),
+        exposure_index=np.uint8(0),
+        sentinel_set_id="sentinel-a.v1",
+        sentinel_set_sha256=_sha("2"),
+        sentinel_case_count=np.int32(1),
+    )
+    assert type(requirement.phase_index) is int
+    assert type(requirement.checkpoint_step) is int
+    assert type(requirement.exposure_index) is int
+    assert type(requirement.sentinel_case_count) is int
+    assert type(requirement.to_config()["phase_index"]) is int
+    assert requirement.to_config()["phase_index"] is not True
+
+
+def test_recurring_ipmnist_phase_preflights_derived_stop_step() -> None:
+    legal = RecurringIPMNISTPhase(
+        phase_index=0,
+        start_step=2**31 - 2,
+        length=1,
+        permutation_id="permutation-a.v1",
+        exposure_index=0,
+    )
+    assert legal.stop_step == 2**31 - 1
+
+    with pytest.raises(ValueError, match="stop_step"):
+        RecurringIPMNISTPhase(
+            phase_index=0,
+            start_step=2**31 - 1,
+            length=1,
+            permutation_id="permutation-a.v1",
+            exposure_index=0,
+        )
+
+
+def test_protocol_rejects_derived_trace_and_probe_workload_overflow() -> None:
+    protocol = _protocol()
+    too_many = (2**31 - 1) // 3 + 1
+    oversized_bindings = (
+        dataclasses.replace(protocol.sentinel_bindings[0], sentinel_case_count=too_many),
+        protocol.sentinel_bindings[1],
+    )
+    with pytest.raises(ValueError, match="sentinel probe evaluations"):
+        dataclasses.replace(protocol, sentinel_bindings=oversized_bindings)
+
+    phase_length = 400_000_000
+    oversized_phases = (
+        dataclasses.replace(protocol.phases[0], start_step=0, length=phase_length),
+        dataclasses.replace(
+            protocol.phases[1], start_step=phase_length, length=phase_length
+        ),
+        dataclasses.replace(
+            protocol.phases[2], start_step=2 * phase_length, length=phase_length
+        ),
+    )
+    with pytest.raises(ValueError, match="trace scalar count"):
+        dataclasses.replace(protocol, phases=oversized_phases)

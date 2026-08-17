@@ -75,6 +75,7 @@ import jax.random as jr
 import numpy as np
 from jax import Array
 
+from alberta_framework._seed_validation import require_jax_seed, require_unique_jax_seeds
 from alberta_framework.benchmarks.ipmnist_screening import _atomic_write_json
 from alberta_framework.benchmarks.micro_continual import (
     _INIT_DOMAIN,
@@ -777,8 +778,22 @@ def evaluate_population(
 
     Paired evaluation: every genome sees the identical stream and identical
     network init per seed (the screening convention).
+
+    Raises:
+        ValueError: If ``seeds`` are not unique valid seeds, ``genomes`` is not
+            a ``(n_genomes, GENOME_SIZE)`` matrix, or ``batch_size`` is not a
+            positive built-in ``int``.
     """
+    seeds = require_unique_jax_seeds(seeds, name="seeds")
+    if type(batch_size) is not int or batch_size < 1:
+        raise ValueError(f"batch_size must be a positive built-in int, got {batch_size!r}")
     genomes = jnp.asarray(genomes, dtype=jnp.float32)
+    if genomes.ndim != 2 or genomes.shape[1] != GENOME_SIZE:
+        raise ValueError(
+            f"genomes must have shape (n_genomes, {GENOME_SIZE}), got {tuple(genomes.shape)}"
+        )
+    if not bool(jnp.all(jnp.isfinite(genomes))):
+        raise ValueError("genomes must contain only finite values")
     n_genomes = int(genomes.shape[0])
     total = np.zeros((n_genomes,), dtype=np.float64)
     for seed in seeds:
@@ -844,6 +859,21 @@ def crossover(key: Array, first: Array, second: Array) -> Array:
     return jnp.where(mask, first, second)
 
 
+def _require_unique_task_names(task_names: Sequence[str], *, name: str) -> tuple[str, ...]:
+    names = tuple(task_names)
+    if not names:
+        raise ValueError(f"{name} must be non-empty")
+    if len(set(names)) != len(names):
+        raise ValueError(f"{name} must contain unique task names; got {list(names)}")
+    return names
+
+
+def _require_search_int(name: str, value: object, *, minimum: int) -> int:
+    if type(value) is not int or value < minimum:
+        raise ValueError(f"{name} must be an integer >= {minimum}, got {value!r}")
+    return value
+
+
 def evaluate_suite(
     genomes: Array,
     task_names: Sequence[str],
@@ -852,7 +882,13 @@ def evaluate_suite(
     batch_size: int = 256,
     suite: Mapping[str, EvalConfig] | None = None,
 ) -> tuple[np.ndarray, dict[str, np.ndarray]]:
-    """Mean accuracy across the named micro tasks; also per-task vectors."""
+    """Mean accuracy across the named micro tasks; also per-task vectors.
+
+    Raises:
+        ValueError: If ``task_names`` is empty or repeats a task, which would
+            silently turn the equal-weight task mean into a weighted one.
+    """
+    task_names = _require_unique_task_names(task_names, name="task_names")
     registry = MICRO_SUITE if suite is None else suite
     per_task: dict[str, np.ndarray] = {}
     for name in task_names:
@@ -925,6 +961,10 @@ def _suite_geometry(config: EvalConfig) -> dict[str, Any]:
 def _resolved_suite(
     n_tasks: int | None, task_length: int | None, suite_kind: str = "digits"
 ) -> dict[str, EvalConfig]:
+    if n_tasks is not None:
+        n_tasks = _require_search_int("n_tasks", n_tasks, minimum=1)
+    if task_length is not None:
+        task_length = _require_search_int("task_length", task_length, minimum=1)
     suite: dict[str, EvalConfig]
     if suite_kind == "gauss":
         suite = dict(gauss_suite(n_tasks if n_tasks is not None else GAUSS_SEARCH_REGIMES))
@@ -972,6 +1012,9 @@ def tune_champion_baseline(
     Returns ``(best_genome, best_accuracy, evaluated)`` where ``evaluated``
     holds every (genome, accuracy) pair for the archive.
     """
+    n_random = _require_search_int("n_random", n_random, minimum=0)
+    generations = _require_search_int("generations", generations, minimum=0)
+    children = _require_search_int("children", children, minimum=1)
     champion = champion_form_genome()
     flags = jnp.asarray(champion[:_N_FLAGS])
 
@@ -1036,6 +1079,17 @@ def run_search(
     :func:`tune_champion_baseline`). Never promotes anything by itself —
     promotion to the real protocol goes through ``ipmnist_screening`` arms.
     """
+    n_random = _require_search_int("n_random", n_random, minimum=0)
+    population = _require_search_int("population", population, minimum=1)
+    generations = _require_search_int("generations", generations, minimum=0)
+    elite = _require_search_int("elite", elite, minimum=1)
+    top_k = _require_search_int("top_k", top_k, minimum=1)
+    batch_size = _require_search_int("batch_size", batch_size, minimum=1)
+    eval_seeds = require_unique_jax_seeds(eval_seeds, name="eval_seeds")
+    holdout_seeds = require_unique_jax_seeds(holdout_seeds, name="holdout_seeds")
+    search_seed = require_jax_seed(search_seed, name="search_seed")
+    task_names = _require_unique_task_names(task_names, name="task_names")
+    holdout_names = _require_unique_task_names(holdout_names, name="holdout_names")
     if set(task_names) & set(holdout_names):
         raise ValueError("search tasks and holdout tasks must be disjoint")
     if set(eval_seeds) & set(holdout_seeds):

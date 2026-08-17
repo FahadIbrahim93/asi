@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import chex
 import jax
 import jax.numpy as jnp
@@ -74,6 +76,71 @@ class TestRandom:
                 inner, mode=MaskMode.RANDOM, mask_prob=1.5
             )
 
+    def test_random_rejects_bool_mask_prob(self) -> None:
+        inner = RandomWalkStream(feature_dim=4, drift_rate=0.0)
+        with pytest.raises(ValueError, match="mask_prob"):
+            PartialObservationWrapper(inner, mode=MaskMode.RANDOM, mask_prob=True)
+
+    def test_random_rejects_non_real_mask_prob(self) -> None:
+        inner = RandomWalkStream(feature_dim=4, drift_rate=0.0)
+        with pytest.raises(ValueError, match="mask_prob"):
+            PartialObservationWrapper(
+                inner,
+                mode=MaskMode.RANDOM,
+                mask_prob="0.5",  # type: ignore[arg-type]
+            )
+
+    def test_random_rejects_nan_mask_prob(self) -> None:
+        inner = RandomWalkStream(feature_dim=4, drift_rate=0.0)
+        with pytest.raises(ValueError, match="mask_prob"):
+            PartialObservationWrapper(
+                inner, mode=MaskMode.RANDOM, mask_prob=float("nan")
+            )
+
+    def test_random_rejects_class_spoofed_non_real_mask_prob(self) -> None:
+        """A ``__class__``-spoofed object must not bypass validation.
+
+        ``isinstance(value, Real)`` consults the overridable ``__class__``
+        attribute, so an object that fakes ``__class__ == float`` would pass
+        an ``isinstance``-based gate. The gate must instead check
+        ``type(value)`` directly. A spoof whose comparison dunder hooks raise
+        must still surface a clean ``ValueError``, not the raw exception.
+        """
+
+        class Spoof:
+            @property
+            def __class__(self) -> type:  # type: ignore[override]
+                return float
+
+            def __le__(self, other: object) -> bool:
+                raise RuntimeError("untrusted __le__ hook executed")
+
+            def __ge__(self, other: object) -> bool:
+                raise RuntimeError("untrusted __ge__ hook executed")
+
+            def __float__(self) -> float:
+                raise RuntimeError("untrusted __float__ hook executed")
+
+        inner = RandomWalkStream(feature_dim=4, drift_rate=0.0)
+        with pytest.raises(ValueError, match="mask_prob"):
+            PartialObservationWrapper(inner, mode=MaskMode.RANDOM, mask_prob=Spoof())
+
+    def test_random_normalizes_hostile_real_failure_without_repr(self) -> None:
+        class HostileFloat(float):
+            def as_integer_ratio(self) -> tuple[int, int]:
+                raise RuntimeError("untrusted ratio hook")
+
+            def __repr__(self) -> str:
+                raise AssertionError("repr hook executed")
+
+        inner = RandomWalkStream(feature_dim=4, drift_rate=0.0)
+        with pytest.raises(ValueError, match="mask_prob"):
+            PartialObservationWrapper(
+                inner,
+                mode=MaskMode.RANDOM,
+                mask_prob=HostileFloat(0.5),
+            )
+
 
 class TestPeriodic:
     def test_periodic_cycles(self) -> None:
@@ -117,6 +184,14 @@ class TestPeriodic:
         inner = RandomWalkStream(feature_dim=3, drift_rate=0.0)
         with pytest.raises(ValueError, match="schedule"):
             PartialObservationWrapper(inner, mode=MaskMode.PERIODIC, schedule=())
+
+    def test_periodic_rejects_masks_with_extra_axis(self) -> None:
+        inner = RandomWalkStream(feature_dim=3, drift_rate=0.0)
+        schedule = (jnp.array([[True], [False], [True]]),)
+        with pytest.raises(ValueError, match="schedule masks"):
+            PartialObservationWrapper(
+                inner, mode=MaskMode.PERIODIC, schedule=schedule
+            )
 
 
 class TestScanCompatibility:
@@ -170,3 +245,37 @@ class TestDeterminism:
         out1 = run()
         out2 = run()
         chex.assert_trees_all_close(out1, out2)
+
+
+class TestSentinel:
+    def test_legal_nonzero_sentinel_fills_hidden_channels(self) -> None:
+        inner = RandomWalkStream(feature_dim=4, drift_rate=0.0, noise_std=0.0)
+        mask = jnp.array([True, False, True, False])
+        wrapper = PartialObservationWrapper(
+            inner, mode=MaskMode.FIXED, fixed_mask=mask, sentinel=-1.0
+        )
+        timestep, _ = wrapper.step(wrapper.init(jr.key(0)), jnp.array(0))
+        assert float(timestep.observation[1]) == -1.0
+        assert float(timestep.observation[3]) == -1.0
+        assert math.isfinite(float(timestep.observation[0]))
+        assert math.isfinite(float(timestep.observation[2]))
+
+    @pytest.mark.parametrize("sentinel", [float("nan"), float("inf"), float("-inf"), True])
+    def test_rejects_non_finite_or_bool_sentinel(self, sentinel: object) -> None:
+        inner = RandomWalkStream(feature_dim=4, drift_rate=0.0)
+        mask = jnp.array([True, False, True, False])
+        with pytest.raises(ValueError, match="sentinel"):
+            PartialObservationWrapper(
+                inner, mode=MaskMode.FIXED, fixed_mask=mask, sentinel=sentinel
+            )
+
+    def test_rejects_non_real_sentinel(self) -> None:
+        inner = RandomWalkStream(feature_dim=4, drift_rate=0.0)
+        mask = jnp.array([True, False, True, False])
+        with pytest.raises(ValueError, match="sentinel"):
+            PartialObservationWrapper(
+                inner,
+                mode=MaskMode.FIXED,
+                fixed_mask=mask,
+                sentinel="0.0",  # type: ignore[arg-type]
+            )

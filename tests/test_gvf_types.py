@@ -1,7 +1,11 @@
 """Tests for GVF types: DemonType, GVFSpec, HordeSpec, create_horde_spec."""
 
+from fractions import Fraction
+
 import chex
 import jax.numpy as jnp
+import numpy as np
+import pytest
 
 from alberta_framework import (
     DemonType,
@@ -86,6 +90,142 @@ class TestGVFSpec:
         assert config["demon_type"] == "control"
         assert config["name"] == "test"
         assert config["gamma"] == 0.99
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("gamma", -0.01),
+            ("gamma", 1.01),
+            ("gamma", float("nan")),
+            ("gamma", float("inf")),
+            ("gamma", float("-inf")),
+            ("lamda", -0.01),
+            ("lamda", 1.01),
+            ("lamda", float("nan")),
+            ("lamda", float("inf")),
+            ("lamda", float("-inf")),
+        ],
+    )
+    def test_invalid_discount_or_trace_decay_is_rejected(self, field, value):
+        kwargs = {
+            "name": "invalid",
+            "demon_type": DemonType.PREDICTION,
+            "gamma": 0.9,
+            "lamda": 0.8,
+            "cumulant_index": 0,
+        }
+        kwargs[field] = value
+
+        with pytest.raises(ValueError, match=field):
+            GVFSpec(**kwargs)
+
+        config = {
+            "name": "invalid",
+            "demon_type": "prediction",
+            "gamma": 0.9,
+            "lamda": 0.8,
+            "cumulant_index": 0,
+            "terminal_reward": 0.0,
+        }
+        config[field] = value
+        with pytest.raises(ValueError, match=field):
+            GVFSpec.from_config(config)
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            True,
+            False,
+            "0.5",
+            None,
+            10**400,
+            1.0e-50,
+            Fraction(1, 10**1000),
+            Fraction((2**100) + 1, 2**100),
+            np.nextafter(np.longdouble(1.0), np.longdouble(2.0)),
+            jnp.asarray(0.5),
+            jnp.asarray([0.5]),
+        ],
+    )
+    @pytest.mark.parametrize("field", ["gamma", "lamda"])
+    def test_discount_and_trace_decay_require_concrete_float32_reals(
+        self,
+        field,
+        value,
+    ):
+        kwargs = {
+            "name": "invalid",
+            "demon_type": DemonType.PREDICTION,
+            "gamma": 0.9,
+            "lamda": 0.8,
+            "cumulant_index": 0,
+        }
+        kwargs[field] = value
+
+        with pytest.raises(ValueError, match=field):
+            GVFSpec(**kwargs)
+
+        config = {
+            **kwargs,
+            "demon_type": "prediction",
+            "terminal_reward": 0.0,
+        }
+        with pytest.raises(ValueError, match=field):
+            GVFSpec.from_config(config)
+
+    @pytest.mark.parametrize("field", ["gamma", "lamda"])
+    def test_discount_and_trace_decay_reject_class_spoofed_float(self, field):
+        class _SpoofedFloat:
+            """Mimics ``float`` via ``__class__`` to defeat ``isinstance``."""
+
+            @property
+            def __class__(self) -> type:  # type: ignore[override]
+                return float
+
+            def __float__(self) -> float:
+                return 0.5
+
+            def __lt__(self, other: object) -> bool:
+                return 0.5 < other  # type: ignore[operator]
+
+            def __gt__(self, other: object) -> bool:
+                return 0.5 > other  # type: ignore[operator]
+
+            def __eq__(self, other: object) -> bool:
+                return 0.5 == other
+
+            def __ne__(self, other: object) -> bool:
+                return 0.5 != other
+
+            def __hash__(self) -> int:
+                return hash(0.5)
+
+        kwargs = {
+            "name": "invalid",
+            "demon_type": DemonType.PREDICTION,
+            "gamma": 0.9,
+            "lamda": 0.8,
+            "cumulant_index": 0,
+        }
+        kwargs[field] = _SpoofedFloat()
+
+        with pytest.raises(ValueError, match=field):
+            GVFSpec(**kwargs)
+
+    def test_discount_and_trace_decay_normalize_supported_real_scalars(self):
+        spec = GVFSpec(
+            name="boundary",
+            demon_type=DemonType.PREDICTION,
+            gamma=np.float64(0.0),
+            lamda=np.int64(1),
+            cumulant_index=0,
+        )
+
+        assert type(spec.gamma) is float
+        assert type(spec.lamda) is float
+        horde = create_horde_spec([spec])
+        chex.assert_trees_all_equal(horde.gammas, jnp.asarray([0.0], dtype=jnp.float32))
+        chex.assert_trees_all_equal(horde.lamdas, jnp.asarray([1.0], dtype=jnp.float32))
 
 
 class TestHordeSpec:
@@ -209,3 +349,169 @@ class TestHordeSpec:
         ]
         spec = create_horde_spec(demons)
         assert isinstance(spec.demons, tuple)
+
+
+class TestGVFSpecRemainingFields:
+    """Name, cumulant index, terminal reward, and empty hordes must fail closed."""
+
+    def test_legal_defaults_stay_bit_identical(self):
+        spec = GVFSpec(
+            name="d0",
+            demon_type=DemonType.PREDICTION,
+            gamma=0.0,
+            lamda=0.0,
+            cumulant_index=0,
+        )
+        assert spec.name == "d0"
+        assert spec.cumulant_index == 0
+        assert type(spec.cumulant_index) is int
+        assert spec.terminal_reward == 0.0
+        assert type(spec.terminal_reward) is float
+
+    def test_negative_terminal_reward_is_a_legal_pseudo_reward(self):
+        spec = GVFSpec(
+            name="z",
+            demon_type=DemonType.PREDICTION,
+            gamma=0.0,
+            lamda=0.0,
+            cumulant_index=-1,
+            terminal_reward=-1.0,
+        )
+        assert spec.cumulant_index == -1
+        assert spec.terminal_reward == -1.0
+        assert spec.to_config()["terminal_reward"] == -1.0
+
+    @pytest.mark.parametrize("value", [2.0**-150, -(2.0**-150), 5e-324, -5e-324])
+    def test_terminal_reward_rejects_nonzero_float32_underflow(self, value):
+        with pytest.raises(ValueError, match="terminal_reward must remain nonzero"):
+            GVFSpec(
+                name="d0",
+                demon_type=DemonType.PREDICTION,
+                gamma=0.0,
+                lamda=0.0,
+                cumulant_index=0,
+                terminal_reward=value,
+            )
+
+    @pytest.mark.parametrize("value", [0.0, 2.0**-149, -(2.0**-149)])
+    def test_terminal_reward_preserves_zero_and_float32_minsubnormal(self, value):
+        spec = GVFSpec(
+            name="d0",
+            demon_type=DemonType.PREDICTION,
+            gamma=0.0,
+            lamda=0.0,
+            cumulant_index=0,
+            terminal_reward=value,
+        )
+        assert spec.terminal_reward == value
+
+    @pytest.mark.parametrize(
+        "value",
+        [float("nan"), float("inf"), float("-inf"), True, False, "0.0", None],
+    )
+    def test_terminal_reward_rejects_non_finite_and_non_real_identities(self, value):
+        with pytest.raises(ValueError, match="terminal_reward"):
+            GVFSpec(
+                name="d0",
+                demon_type=DemonType.PREDICTION,
+                gamma=0.0,
+                lamda=0.0,
+                cumulant_index=0,
+                terminal_reward=value,
+            )
+        with pytest.raises(ValueError, match="terminal_reward"):
+            GVFSpec.from_config(
+                {
+                    "name": "d0",
+                    "demon_type": "prediction",
+                    "gamma": 0.0,
+                    "lamda": 0.0,
+                    "cumulant_index": 0,
+                    "terminal_reward": value,
+                }
+            )
+
+    def test_terminal_reward_rejects_class_spoofed_float(self):
+        class _SpoofedFloat:
+            @property
+            def __class__(self) -> type:  # type: ignore[override]
+                return float
+
+            def __float__(self) -> float:
+                raise RuntimeError("must not run")
+
+        with pytest.raises(ValueError, match="terminal_reward"):
+            GVFSpec(
+                name="d0",
+                demon_type=DemonType.PREDICTION,
+                gamma=0.0,
+                lamda=0.0,
+                cumulant_index=0,
+                terminal_reward=_SpoofedFloat(),
+            )
+
+    @pytest.mark.parametrize(
+        "value",
+        [True, False, 1.5, float("nan"), "0", None, 2**31],
+    )
+    def test_cumulant_index_rejects_bool_float_and_out_of_range(self, value):
+        with pytest.raises(ValueError, match="cumulant_index"):
+            GVFSpec(
+                name="d0",
+                demon_type=DemonType.PREDICTION,
+                gamma=0.0,
+                lamda=0.0,
+                cumulant_index=value,
+            )
+
+    def test_true_cumulant_index_does_not_silently_select_channel_one(self):
+        with pytest.raises(ValueError, match="cumulant_index"):
+            GVFSpec(
+                name="d0",
+                demon_type=DemonType.PREDICTION,
+                gamma=0.0,
+                lamda=0.0,
+                cumulant_index=True,
+            )
+
+    def test_numpy_cumulant_index_canonicalizes_to_int(self):
+        spec = GVFSpec(
+            name="d0",
+            demon_type=DemonType.PREDICTION,
+            gamma=0.0,
+            lamda=0.0,
+            cumulant_index=np.int64(2),
+        )
+        assert spec.cumulant_index == 2
+        assert type(spec.cumulant_index) is int
+
+    @pytest.mark.parametrize("value", ["", None, True, 0])
+    def test_name_must_be_a_nonempty_string(self, value):
+        with pytest.raises(ValueError, match="name"):
+            GVFSpec(
+                name=value,
+                demon_type=DemonType.PREDICTION,
+                gamma=0.0,
+                lamda=0.0,
+                cumulant_index=0,
+            )
+
+    def test_demon_type_must_be_the_enum(self):
+        with pytest.raises(ValueError, match="demon_type"):
+            GVFSpec(
+                name="d0",
+                demon_type="prediction",
+                gamma=0.0,
+                lamda=0.0,
+                cumulant_index=0,
+            )
+
+    def test_create_horde_spec_rejects_empty_and_non_gvf_items(self):
+        with pytest.raises(ValueError, match="nonempty"):
+            create_horde_spec([])
+        with pytest.raises(ValueError, match="GVFSpec"):
+            create_horde_spec(["d0"])  # type: ignore[list-item]
+
+    def test_from_config_rejects_empty_horde(self):
+        with pytest.raises(ValueError, match="nonempty"):
+            HordeSpec.from_config({"demons": []})

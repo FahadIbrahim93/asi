@@ -1,5 +1,9 @@
 """Tests for security-gym / rlsecd integration contracts."""
 
+import json
+import math
+
+import numpy as np
 import pytest
 
 from alberta_framework import (
@@ -17,6 +21,10 @@ from alberta_framework import (
     security_reward,
     to_security_gym_action,
     validate_security_rollout,
+)
+from alberta_framework.security import (
+    SecurityOracleExperience,
+    ThroughputMeasurement,
 )
 
 
@@ -36,6 +44,36 @@ def test_security_action_indices_are_stable() -> None:
     assert coerce_security_action(5) == SecurityAction.ISOLATE
 
 
+@pytest.mark.parametrize("action", [True, False, 1.0, 99])
+def test_coerce_security_action_rejects_noncanonical_actions(action: object) -> None:
+    with pytest.raises(ValueError, match="security action"):
+        coerce_security_action(action)  # type: ignore[arg-type]
+
+
+def test_coerce_security_action_rejects_class_spoof() -> None:
+    class ActionSpoof:
+        @property
+        def __class__(self) -> type:  # type: ignore[override]
+            return SecurityAction
+
+        def __int__(self) -> int:
+            return int(SecurityAction.ALERT)
+
+    with pytest.raises(ValueError, match="security action"):
+        coerce_security_action(ActionSpoof())  # type: ignore[arg-type]
+
+
+def test_to_security_gym_action_rejects_boolean_and_nonfinite_risk() -> None:
+    with pytest.raises(ValueError, match="risk_score"):
+        to_security_gym_action("pass", risk_score=True)
+    with pytest.raises(ValueError, match="risk_score"):
+        to_security_gym_action("pass", risk_score=float("nan"))
+    with pytest.raises(ValueError, match="risk_score"):
+        to_security_gym_action("pass", risk_score=float("inf"))
+    with pytest.raises(ValueError, match="risk_score"):
+        to_security_gym_action("pass", risk_score="5.5")  # type: ignore[arg-type]
+
+
 def test_security_gym_action_adapter_matches_sibling_contract() -> None:
     assert SECURITY_GYM_ACTION_NAMES == (
         "pass",
@@ -46,6 +84,10 @@ def test_security_gym_action_adapter_matches_sibling_contract() -> None:
         "isolate",
     )
     assert security_gym_action_name(SecurityAction.BLOCK) == "block_source"
+    assert to_security_gym_action("alert", risk_score=np.float64(5.5)) == {
+        "action": 1,
+        "risk_score": (5.5,),
+    }
     assert to_security_gym_action("block_source", risk_score=11.0) == {
         "action": 3,
         "risk_score": (10.0,),
@@ -127,3 +169,71 @@ def test_throughput_meter_records_events() -> None:
     assert measurement.elapsed_s >= 0.0
     assert measurement.events_per_second > 0.0
     assert measurement.to_dict()["n_events"] == 3
+
+
+@pytest.mark.parametrize("elapsed_s", [0.0, -1.0, float("-inf")])
+def test_throughput_measurement_to_dict_rejects_nonpositive_elapsed(
+    elapsed_s: float,
+) -> None:
+    measurement = ThroughputMeasurement(n_events=3, elapsed_s=elapsed_s)
+    assert measurement.events_per_second == float("inf")
+    leaked = json.dumps(
+        {
+            "n_events": measurement.n_events,
+            "elapsed_s": measurement.elapsed_s,
+            "events_per_second": measurement.events_per_second,
+        }
+    )
+    assert "Infinity" in leaked
+    with pytest.raises(ValueError, match="RFC-compliant JSON"):
+        measurement.to_dict()
+
+
+def test_throughput_measurement_to_dict_rejects_nan_elapsed() -> None:
+    measurement = ThroughputMeasurement(n_events=3, elapsed_s=float("nan"))
+    assert math.isnan(measurement.events_per_second)
+    leaked = json.dumps(
+        {
+            "n_events": measurement.n_events,
+            "elapsed_s": measurement.elapsed_s,
+            "events_per_second": measurement.events_per_second,
+        }
+    )
+    assert "NaN" in leaked
+    with pytest.raises(ValueError, match="RFC-compliant JSON"):
+        measurement.to_dict()
+
+
+def test_throughput_measurement_to_dict_is_strict_json() -> None:
+    payload = ThroughputMeasurement(n_events=4, elapsed_s=2.0).to_dict()
+    encoded = json.dumps(payload, allow_nan=False, sort_keys=True)
+    assert json.loads(encoded) == {
+        "elapsed_s": 2.0,
+        "events_per_second": 2.0,
+        "n_events": 4,
+    }
+    assert "Infinity" not in encoded
+    assert "NaN" not in encoded
+
+
+def test_security_to_dict_rejects_nonfinite_numbers() -> None:
+    weights = SecurityRewardWeights(threat_blocked=float("inf"))
+    step = SecurityRolloutStep(
+        state=(0.0, 1.0),
+        action=SecurityAction.PASS,
+        reward=float("nan"),
+        next_state=(0.0, 1.0),
+        terminated=False,
+    )
+    experience = SecurityOracleExperience(
+        state=(0.0, 1.0),
+        action=SecurityAction.PASS,
+        reward=0.0,
+        outcome={"label": "true_negative", "score": float("nan")},
+    )
+    with pytest.raises(ValueError, match="RFC-compliant JSON"):
+        weights.to_dict()
+    with pytest.raises(ValueError, match="RFC-compliant JSON"):
+        step.to_dict()
+    with pytest.raises(ValueError, match="RFC-compliant JSON"):
+        experience.to_dict()

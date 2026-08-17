@@ -6,9 +6,11 @@ import chex
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 import pytest
 
 from alberta_framework import (
+    LMS,
     AGCBounding,
     Autostep,
     AutostepGTDLambda,
@@ -20,11 +22,27 @@ from alberta_framework import (
     MultiHeadMLPUpdateResult,
     ObGD,
     ObGDBounding,
+    TraceMode,
     WelfordNormalizer,
     multi_head_metrics_to_dicts,
     run_multi_head_learning_loop,
     run_multi_head_learning_loop_batched,
 )
+
+
+class _HostileRepr:
+    def __repr__(self) -> str:
+        raise AssertionError("repr hook must not run")
+
+
+class _HostileTuple(tuple[object, ...]):
+    def __len__(self) -> int:
+        raise AssertionError("tuple subclass hook must not run")
+
+
+class _HostileDict(dict[str, object]):
+    def __iter__(self):
+        raise AssertionError("dict subclass hook must not run")
 
 # =============================================================================
 # Init tests
@@ -64,6 +82,171 @@ class TestMultiHeadInit:
 
         with pytest.raises(ValueError, match="head_optimizer.*MLP"):
             MultiHeadMLPLearner(n_heads=2, head_optimizer=AutostepGTDLambda())
+
+    @pytest.mark.parametrize(
+        "value",
+        [True, np.bool_(True), 1.5, "2", 0, -1, 2**31],
+    )
+    def test_rejects_invalid_head_count_before_allocation(self, value: object):
+        with pytest.raises(ValueError, match="n_heads"):
+            MultiHeadMLPLearner(n_heads=value)  # type: ignore[arg-type]
+
+    def test_rejected_integer_spoof_does_not_run_repr(self):
+        with pytest.raises(ValueError, match="n_heads"):
+            MultiHeadMLPLearner(n_heads=_HostileRepr())  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize(
+        "value",
+        [True, np.bool_(True), 1.5, "2", 0, -1, 2**31],
+    )
+    def test_rejects_invalid_hidden_width_before_allocation(self, value: object):
+        with pytest.raises(ValueError, match=r"hidden_sizes\[0\]"):
+            MultiHeadMLPLearner(n_heads=1, hidden_sizes=(value,))  # type: ignore[arg-type]
+
+    def test_direct_sequence_boundaries_require_actual_tuples(self):
+        with pytest.raises(ValueError, match="hidden_sizes.*tuple"):
+            MultiHeadMLPLearner(n_heads=1, hidden_sizes=[2])  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="per_head_gamma_lamda.*tuple"):
+            MultiHeadMLPLearner(
+                n_heads=1,
+                hidden_sizes=(),
+                per_head_gamma_lamda=[0.5],  # type: ignore[arg-type]
+            )
+        with pytest.raises(ValueError, match="per_head_gamma_lamda.*tuple"):
+            MultiHeadMLPLearner(
+                n_heads=1,
+                hidden_sizes=(),
+                per_head_gamma_lamda=_HostileTuple((0.5,)),  # type: ignore[arg-type]
+            )
+
+    @pytest.mark.parametrize(
+        "scalar_type",
+        [
+            np.int8,
+            np.int16,
+            np.int32,
+            np.int64,
+            np.uint8,
+            np.uint16,
+            np.uint32,
+            np.uint64,
+            np.longlong,
+            np.ulonglong,
+        ],
+    )
+    def test_numpy_integer_family_is_canonicalized(self, scalar_type: type):
+        learner = MultiHeadMLPLearner(
+            n_heads=scalar_type(2),  # type: ignore[call-arg,arg-type]
+            hidden_sizes=(scalar_type(3),),  # type: ignore[call-arg,arg-type]
+        )
+        config = learner.to_config()
+        assert type(learner.n_heads) is int
+        assert type(learner.hidden_sizes[0]) is int
+        assert type(config["n_heads"]) is int
+        assert type(config["hidden_sizes"][0]) is int
+
+    @pytest.mark.parametrize("feature_dim", [True, np.bool_(True), 1.5, "2", 0, -1, 2**31])
+    def test_init_rejects_invalid_feature_dimension_before_allocation(
+        self, feature_dim: object
+    ):
+        learner = MultiHeadMLPLearner(n_heads=1, hidden_sizes=())
+        with pytest.raises(ValueError, match="feature_dim"):
+            learner.init(feature_dim, jr.key(0))  # type: ignore[arg-type]
+
+    def test_from_config_requires_json_lists_and_delegates_element_validation(self):
+        learner = MultiHeadMLPLearner(
+            n_heads=2,
+            hidden_sizes=(),
+            per_head_gamma_lamda=(0.0, 0.5),
+        )
+        hidden_tuple = learner.to_config()
+        hidden_tuple["hidden_sizes"] = ()
+        with pytest.raises(ValueError, match="hidden_sizes.*list"):
+            MultiHeadMLPLearner.from_config(hidden_tuple)
+
+        per_head_tuple = learner.to_config()
+        per_head_tuple["per_head_gamma_lamda"] = (0.0, 0.5)
+        with pytest.raises(ValueError, match="per_head_gamma_lamda.*list"):
+            MultiHeadMLPLearner.from_config(per_head_tuple)
+
+        invalid_element = learner.to_config()
+        invalid_element["per_head_gamma_lamda"] = [0.0, True]
+        with pytest.raises(ValueError, match=r"per_head_gamma_lamda\[1\]"):
+            MultiHeadMLPLearner.from_config(invalid_element)
+
+    def test_from_config_requires_exact_outer_schema_before_dispatch(self):
+        config = MultiHeadMLPLearner(n_heads=1, hidden_sizes=()).to_config()
+        with pytest.raises(ValueError, match="actual dict"):
+            MultiHeadMLPLearner.from_config(_HostileDict(config))  # type: ignore[arg-type]
+
+        for field, value in (
+            ("type", "WrongLearner"),
+            ("type", _HostileRepr()),
+            ("state_schema", "wrong-schema"),
+            ("state_schema", _HostileRepr()),
+        ):
+            invalid = dict(config)
+            invalid[field] = value
+            with pytest.raises(ValueError):
+                MultiHeadMLPLearner.from_config(invalid)
+
+        missing = dict(config)
+        missing.pop("optimizer")
+        with pytest.raises(ValueError, match="fields"):
+            MultiHeadMLPLearner.from_config(missing)
+        unknown = dict(config)
+        unknown["unknown"] = 1
+        with pytest.raises(ValueError, match="fields"):
+            MultiHeadMLPLearner.from_config(unknown)
+
+    def test_constructor_rejects_derived_allocation_counts(self):
+        with pytest.raises(ValueError, match="hidden_layer"):
+            MultiHeadMLPLearner(n_heads=1, hidden_sizes=(46_341, 46_341))
+        with pytest.raises(ValueError, match="head_weight"):
+            MultiHeadMLPLearner(n_heads=46_341, hidden_sizes=(46_341,))
+        with pytest.raises(ValueError, match="per_head_metrics"):
+            MultiHeadMLPLearner(n_heads=(2**31 - 1) // 3 + 1, hidden_sizes=())
+
+        with pytest.raises(ValueError, match="parameter_count"):
+            MultiHeadMLPLearner(n_heads=1, hidden_sizes=(1, 2**31 - 1))
+
+        boundary = MultiHeadMLPLearner(n_heads=1, hidden_sizes=(1, 1_000))
+        assert boundary.hidden_sizes == (1, 1_000)
+
+    def test_init_preflights_derived_allocations_before_sparse_init(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        calls = 0
+
+        def forbidden_allocator(*_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            raise AssertionError("allocator reached")
+
+        monkeypatch.setattr(
+            "alberta_framework.core.multi_head_learner.sparse_init",
+            forbidden_allocator,
+        )
+        trunk = MultiHeadMLPLearner(n_heads=1, hidden_sizes=(2,))
+        with pytest.raises(ValueError, match="input_layer"):
+            trunk.init(2**30, jr.key(0))
+        linear = MultiHeadMLPLearner(n_heads=2, hidden_sizes=())
+        with pytest.raises(ValueError, match="linear_head"):
+            linear.init(2**30, jr.key(0))
+        assert calls == 0
+
+        boundary = MultiHeadMLPLearner(n_heads=1, hidden_sizes=(1,))
+        with pytest.raises(AssertionError, match="allocator reached"):
+            boundary.init(268_435_450, jr.key(0))
+        assert calls == 1
+
+    def test_aggregate_direct_state_resources_fail_before_allocation(self):
+        with pytest.raises(ValueError, match="direct_state_bytes"):
+            MultiHeadMLPLearner(n_heads=134_217_728, hidden_sizes=())
+
+        learner = MultiHeadMLPLearner(n_heads=1, hidden_sizes=())
+        with pytest.raises(ValueError, match="direct_state_bytes"):
+            learner.init(feature_dim=300_000_000, key=jr.key(0))
 
     def test_trunk_shapes_single_hidden(self):
         """Trunk with one hidden layer has correct shapes."""
@@ -296,6 +479,248 @@ class TestMultiHeadUpdateAllActive:
 
         result = learner.update(result.state, obs, targets)
         assert int(result.state.step_count) == 2
+
+
+# =============================================================================
+# Update tests — validation
+# =============================================================================
+
+
+class TestMultiHeadConstructorValidation:
+    """Constructor scalars that reach init/to_config must be finite identities."""
+
+    def test_rejects_wrong_length_per_head_gamma_lamda(self):
+        """The tuple must have exactly one value per head."""
+        with pytest.raises(ValueError, match="length n_heads"):
+            MultiHeadMLPLearner(
+                n_heads=2,
+                hidden_sizes=(),
+                sparsity=0.0,
+                step_size=0.01,
+                per_head_gamma_lamda=(0.5,),
+            )
+
+    @pytest.mark.parametrize("gl", [float("nan"), float("inf"), -0.1, 1.5, True, "0.5"])
+    def test_rejects_non_finite_or_out_of_range_values(self, gl):
+        """Each per-head trace decay must be a finite real in [0, 1]."""
+        with pytest.raises(ValueError, match=r"per_head_gamma_lamda\[1\]"):
+            MultiHeadMLPLearner(
+                n_heads=2,
+                hidden_sizes=(),
+                sparsity=0.0,
+                step_size=0.01,
+                per_head_gamma_lamda=(0.5, gl),  # type: ignore[arg-type]
+            )
+
+    def test_rejects_class_spoof_without_invoking_float_hook(self):
+        class Spoof:
+            @property
+            def __class__(self) -> type[float]:  # type: ignore[override]
+                return float
+
+            def __float__(self) -> float:
+                raise RuntimeError("must not run")
+
+        with pytest.raises(ValueError, match=r"per_head_gamma_lamda\[1\]"):
+            MultiHeadMLPLearner(
+                n_heads=2,
+                hidden_sizes=(),
+                sparsity=0.0,
+                step_size=0.01,
+                per_head_gamma_lamda=(0.5, Spoof()),  # type: ignore[arg-type]
+            )
+
+    def test_canonicalizes_numpy_per_head_values(self):
+        learner = MultiHeadMLPLearner(
+            n_heads=2,
+            hidden_sizes=(),
+            sparsity=0.0,
+            step_size=0.01,
+            per_head_gamma_lamda=(np.float32(0.25), np.float64(0.5)),
+        )
+
+        values = learner.to_config()["per_head_gamma_lamda"]
+        assert all(type(value) is float for value in values)
+
+    def test_legal_sparsity_and_slope_defaults_stay_bit_identical(self):
+        learner = MultiHeadMLPLearner(n_heads=1, hidden_sizes=())
+        assert learner._sparsity == 0.9
+        assert type(learner._sparsity) is float
+        assert learner._leaky_relu_slope == 0.01
+        assert type(learner._leaky_relu_slope) is float
+        assert learner._gamma == 0.0
+        assert learner._lamda == 0.0
+        assert learner._use_layer_norm is True
+        assert learner._utility_decay == 0.99
+        assert type(learner._utility_decay) is float
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("sparsity", float("nan")),
+            ("sparsity", float("inf")),
+            ("sparsity", True),
+            ("sparsity", -0.1),
+            ("sparsity", 1.5),
+            ("leaky_relu_slope", float("nan")),
+            ("leaky_relu_slope", True),
+            ("leaky_relu_slope", -0.01),
+            ("gamma", float("nan")),
+            ("gamma", True),
+            ("gamma", -0.1),
+            ("lamda", float("nan")),
+            ("lamda", True),
+            ("lamda", 1.5),
+            ("utility_decay", float("nan")),
+            ("utility_decay", True),
+            ("utility_decay", 1.0),
+        ],
+    )
+    def test_rejects_non_finite_bool_and_out_of_range_constructor_scalars(
+        self, field: str, value: object
+    ):
+        kwargs: dict[str, object] = {
+            "n_heads": 1,
+            "hidden_sizes": (),
+            "sparsity": 0.0,
+            "step_size": 0.01,
+        }
+        kwargs[field] = value
+        with pytest.raises(ValueError, match=field):
+            MultiHeadMLPLearner(**kwargs)  # type: ignore[arg-type]
+
+    def test_true_sparsity_does_not_serialize_as_full_mask(self):
+        with pytest.raises(ValueError, match="sparsity"):
+            MultiHeadMLPLearner(n_heads=1, hidden_sizes=(), sparsity=True)
+
+    def test_true_gamma_does_not_store_as_undiscounted_one(self):
+        with pytest.raises(ValueError, match="gamma"):
+            MultiHeadMLPLearner(n_heads=1, hidden_sizes=(), gamma=True, lamda=0.0)
+
+    def test_use_layer_norm_requires_exact_bool(self):
+        with pytest.raises(ValueError, match="use_layer_norm"):
+            MultiHeadMLPLearner(n_heads=1, hidden_sizes=(), use_layer_norm=1)  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="use_layer_norm"):
+            MultiHeadMLPLearner(
+                n_heads=1, hidden_sizes=(), use_layer_norm="true"  # type: ignore[arg-type]
+            )
+
+    def test_trace_mode_requires_the_enum(self):
+        with pytest.raises(ValueError, match="trace_mode"):
+            MultiHeadMLPLearner(
+                n_heads=1,
+                hidden_sizes=(),
+                trace_mode="accumulating",  # type: ignore[arg-type]
+            )
+
+    def test_from_config_rejects_nan_sparsity_and_bool_gamma(self):
+        config = MultiHeadMLPLearner(n_heads=1, hidden_sizes=(), sparsity=0.0).to_config()
+        poisoned = dict(config)
+        poisoned["sparsity"] = float("nan")
+        with pytest.raises(ValueError, match="sparsity"):
+            MultiHeadMLPLearner.from_config(poisoned)
+        poisoned = dict(config)
+        poisoned["gamma"] = True
+        with pytest.raises(ValueError, match="gamma"):
+            MultiHeadMLPLearner.from_config(poisoned)
+
+    def test_rejects_class_spoofed_sparsity_without_invoking_float(self):
+        class Spoof:
+            @property
+            def __class__(self) -> type[float]:  # type: ignore[override]
+                return float
+
+            def __float__(self) -> float:
+                raise RuntimeError("must not run")
+
+        with pytest.raises(ValueError, match="sparsity"):
+            MultiHeadMLPLearner(
+                n_heads=1,
+                hidden_sizes=(),
+                sparsity=Spoof(),  # type: ignore[arg-type]
+            )
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"sparsity": 2.0**-150},
+            {"leaky_relu_slope": 5e-324},
+            {"gamma": 2.0**-150},
+            {"lamda": 2.0**-150},
+            {"utility_decay": 5e-324},
+            {"per_head_gamma_lamda": (2.0**-150,)},
+        ],
+    )
+    def test_rejects_nonzero_float32_underflow(self, kwargs):
+        with pytest.raises(ValueError, match="must remain nonzero"):
+            MultiHeadMLPLearner(n_heads=1, hidden_sizes=(), **kwargs)
+
+    def test_rejects_trace_product_that_underflows_float32(self):
+        with pytest.raises(ValueError, match=r"gamma \* lamda must remain nonzero"):
+            MultiHeadMLPLearner(
+                n_heads=1,
+                hidden_sizes=(),
+                gamma=2.0**-100,
+                lamda=2.0**-100,
+            )
+
+    def test_nonnegative_float32_sinks_preserve_zero_and_minsubnormal(self):
+        smallest_float32 = 2.0**-149
+        learner = MultiHeadMLPLearner(
+            n_heads=1,
+            hidden_sizes=(),
+            sparsity=smallest_float32,
+            leaky_relu_slope=0.0,
+            gamma=0.0,
+            lamda=smallest_float32,
+            utility_decay=0.0,
+            per_head_gamma_lamda=(smallest_float32,),
+        )
+        config = learner.to_config()
+        assert config["sparsity"] == smallest_float32
+        assert config["leaky_relu_slope"] == 0.0
+        assert config["lamda"] == smallest_float32
+        assert config["utility_decay"] == 0.0
+        assert config["per_head_gamma_lamda"] == [smallest_float32]
+
+
+class TestMultiHeadUpdateValidation:
+    """``update`` must reject targets that are not one value per head.
+
+    JAX clamps static out-of-bounds indices instead of raising, so a
+    shorter-than-``n_heads`` targets array (a scalar or length-1 array is the
+    most common accident) silently reused its single value for every head:
+    every head reported a finite squared error and trained, instead of the
+    NaN/inactive behavior the caller intended for the heads it never supplied.
+    """
+
+    @pytest.mark.parametrize("shape", [(1,), (), (4, 1), (5,)])
+    def test_update_rejects_targets_that_are_not_one_per_head(self, shape):
+        learner = MultiHeadMLPLearner(
+            n_heads=4, hidden_sizes=(8,), sparsity=0.0, step_size=0.01,
+        )
+        state = learner.init(feature_dim=3, key=jr.key(0))
+        obs = jnp.array([1.0, -0.5, 0.25])
+        with pytest.raises(ValueError, match=r"targets must have shape \(4,\)"):
+            learner.update(state, obs, jnp.full(shape, 2.0, dtype=jnp.float32))
+
+    def test_length_one_targets_previously_silently_trained_every_head(self):
+        """Regression guard: shape (1,) must not longer look like all-active.
+
+        Before the shape check, a length-1 ``targets`` array silently
+        clamped-indexed the same value onto every head, producing a finite
+        (non-NaN) error for every head instead of raising. This test would
+        have failed to reject the mismatch on the pre-fix implementation
+        (the ``update`` call would have returned a result with no NaNs
+        instead of raising).
+        """
+        learner = MultiHeadMLPLearner(
+            n_heads=4, hidden_sizes=(8,), sparsity=0.0, step_size=0.01,
+        )
+        state = learner.init(feature_dim=3, key=jr.key(0))
+        obs = jnp.array([1.0, -0.5, 0.25])
+        with pytest.raises(ValueError, match=r"targets must have shape \(4,\)"):
+            learner.update(state, obs, jnp.array([2.0], dtype=jnp.float32))
 
 
 # =============================================================================
@@ -1201,3 +1626,139 @@ class TestMultiHeadLinearBaseline:
         result = learner.update(state, obs, targets)
         chex.assert_tree_all_finite(result.predictions)
         assert result.state.normalizer_state is not None
+
+    def test_zero_trace_decay_does_not_multiply_inf_head_traces(self) -> None:
+        """Default gamma*lamda is 0; 0 * inf head traces is NaN and would freeze."""
+        learner = MultiHeadMLPLearner(
+            n_heads=2, hidden_sizes=(), sparsity=0.0, optimizer=LMS(0.1)
+        )
+        state = learner.init(feature_dim=3, key=jr.key(2))
+        poisoned = [
+            (jnp.full_like(w, jnp.inf), jnp.full_like(b, jnp.inf))
+            for w, b in state.head_traces
+        ]
+        state = state.replace(head_traces=tuple(poisoned))
+        raw = jnp.asarray(0.0, dtype=jnp.float32) * jnp.asarray(jnp.inf, dtype=jnp.float32)
+        assert not bool(jnp.isfinite(raw))
+
+        result = learner.update(
+            state,
+            jnp.ones(3, dtype=jnp.float32),
+            jnp.array([1.0, 0.5], dtype=jnp.float32),
+        )
+        assert bool(result.update_applied)
+        for w_trace, b_trace in result.state.head_traces:
+            assert bool(jnp.all(jnp.isfinite(w_trace)))
+            assert bool(jnp.all(jnp.isfinite(b_trace)))
+
+    def test_zero_trace_decay_recovers_inf_trunk_traces(self) -> None:
+        learner = MultiHeadMLPLearner(
+            n_heads=2,
+            hidden_sizes=(4,),
+            sparsity=0.0,
+            optimizer=LMS(0.1),
+        )
+        state = learner.init(feature_dim=3, key=jr.key(3))
+        state = state.replace(
+            trunk_traces=tuple(
+                jnp.full_like(trace, jnp.inf) for trace in state.trunk_traces
+            )
+        )
+
+        result = learner.update(
+            state,
+            jnp.ones(3, dtype=jnp.float32),
+            jnp.array([1.0, 0.5], dtype=jnp.float32),
+        )
+
+        assert bool(result.update_applied)
+        for trace in result.state.trunk_traces:
+            assert bool(jnp.all(jnp.isfinite(trace)))
+
+    def test_replacing_zero_decay_skips_inf_trace_at_zero_gradient(self) -> None:
+        learner = MultiHeadMLPLearner(
+            n_heads=1,
+            hidden_sizes=(),
+            sparsity=0.0,
+            optimizer=LMS(0.1),
+            trace_mode=TraceMode.REPLACING,
+        )
+        state = learner.init(feature_dim=3, key=jr.key(4))
+        old_w, old_b = state.head_traces[0]
+        state = state.replace(
+            head_traces=((jnp.full_like(old_w, jnp.inf), old_b),)
+        )
+
+        result = learner.update(
+            state,
+            jnp.zeros(3, dtype=jnp.float32),
+            jnp.array([1.0], dtype=jnp.float32),
+        )
+
+        assert bool(result.update_applied)
+        assert bool(jnp.all(jnp.isfinite(result.state.head_traces[0][0])))
+
+    def test_per_head_zero_decay_only_skips_disabled_head_trace(self) -> None:
+        learner = MultiHeadMLPLearner(
+            n_heads=2,
+            hidden_sizes=(),
+            sparsity=0.0,
+            optimizer=LMS(0.1),
+            per_head_gamma_lamda=(0.0, 0.5),
+        )
+        state = learner.init(feature_dim=3, key=jr.key(5))
+        first_w, first_b = state.head_traces[0]
+        second_w, second_b = state.head_traces[1]
+        state = state.replace(
+            head_traces=(
+                (jnp.full_like(first_w, jnp.inf), jnp.full_like(first_b, jnp.inf)),
+                (jnp.ones_like(second_w), jnp.ones_like(second_b)),
+            )
+        )
+        observation = jnp.ones(3, dtype=jnp.float32)
+
+        result = learner.update(
+            state,
+            observation,
+            jnp.array([1.0, 0.5], dtype=jnp.float32),
+        )
+
+        assert bool(result.update_applied)
+        first_result_w, first_result_b = result.state.head_traces[0]
+        second_result_w, second_result_b = result.state.head_traces[1]
+        chex.assert_trees_all_close(first_result_w, observation.reshape(1, -1))
+        chex.assert_trees_all_close(first_result_b, jnp.ones_like(first_result_b))
+        chex.assert_trees_all_close(
+            second_result_w,
+            0.5 * jnp.ones_like(second_w) + observation.reshape(1, -1),
+        )
+        chex.assert_trees_all_close(
+            second_result_b,
+            0.5 * jnp.ones_like(second_b) + jnp.ones_like(second_b),
+        )
+
+    def test_zero_utility_decay_recovers_inf_hidden_utilities(self) -> None:
+        learner = MultiHeadMLPLearner(
+            n_heads=2,
+            hidden_sizes=(4,),
+            sparsity=0.0,
+            optimizer=LMS(0.1),
+            utility_decay=0.0,
+        )
+        state = learner.init(feature_dim=3, key=jr.key(6))
+        state = state.replace(
+            hidden_unit_utilities=tuple(
+                jnp.full_like(utility, jnp.inf)
+                for utility in state.hidden_unit_utilities
+            )
+        )
+
+        result = learner.update(
+            state,
+            jnp.ones(3, dtype=jnp.float32),
+            jnp.array([1.0, 0.5], dtype=jnp.float32),
+        )
+
+        assert bool(result.update_applied)
+        for utility in result.state.hidden_unit_utilities:
+            assert bool(jnp.all(jnp.isfinite(utility)))

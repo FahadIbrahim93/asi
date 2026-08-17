@@ -1,8 +1,12 @@
 """Tests for the HordeLearner, learning loops, and equivalence with MultiHeadMLPLearner."""
 
+import math
+
 import chex
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
+import pytest
 
 from alberta_framework import (
     Autostep,
@@ -13,6 +17,7 @@ from alberta_framework import (
     HordeLearner,
     HordeLearningResult,
     MultiHeadMLPLearner,
+    MultiHeadMLPState,
     ObGDBounding,
     create_horde_spec,
     run_horde_learning_loop,
@@ -29,6 +34,70 @@ def _make_all_gamma0_spec(n: int) -> list[GVFSpec]:
         )
         for i in range(n)
     ]
+
+
+def _shape_contract_horde() -> tuple[HordeLearner, MultiHeadMLPState]:
+    horde = HordeLearner(
+        horde_spec=create_horde_spec(_make_all_gamma0_spec(3)),
+        hidden_sizes=(4,),
+        sparsity=0.0,
+    )
+    return horde, horde.init(5, jr.key(0))
+
+
+@pytest.mark.parametrize(
+    "cumulants",
+    [
+        jnp.asarray(1.0, dtype=jnp.float32),
+        jnp.ones((1,), dtype=jnp.float32),
+        jnp.ones((3, 1), dtype=jnp.float32),
+    ],
+)
+def test_horde_update_rejects_wrong_cumulant_shape(cumulants: jnp.ndarray) -> None:
+    horde, state = _shape_contract_horde()
+    with pytest.raises(ValueError, match=r"cumulants must have shape \(3,\)"):
+        horde.update(
+            state,
+            jnp.ones((5,), dtype=jnp.float32),
+            cumulants,
+            jnp.zeros((5,), dtype=jnp.float32),
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "cumulants", "discounts"),
+    [
+        (
+            "cumulants",
+            jnp.ones((1,), dtype=jnp.float32),
+            jnp.ones((3,), dtype=jnp.float32),
+        ),
+        (
+            "discounts",
+            jnp.ones((3,), dtype=jnp.float32),
+            jnp.asarray(0.9, dtype=jnp.float32),
+        ),
+        (
+            "discounts",
+            jnp.ones((3,), dtype=jnp.float32),
+            jnp.ones((3, 1), dtype=jnp.float32),
+        ),
+    ],
+)
+def test_horde_update_with_discounts_rejects_wrong_head_vector_shape(
+    field: str,
+    cumulants: jnp.ndarray,
+    discounts: jnp.ndarray,
+) -> None:
+    horde, state = _shape_contract_horde()
+    with pytest.raises(ValueError, match=rf"{field} must have shape \(3,\)"):
+        horde.update_with_discounts(
+            state,
+            jnp.ones((5,), dtype=jnp.float32),
+            cumulants,
+            jnp.zeros((5,), dtype=jnp.float32),
+            discounts,
+        )
 
 
 # =============================================================================
@@ -796,3 +865,113 @@ class TestPerHeadGammaLamda:
         restored = MultiHeadMLPLearner.from_config(config)
         restored_config = restored.to_config()
         assert restored_config["per_head_gamma_lamda"] == [0.0, 0.5, 0.9]
+
+
+def test_gamma_zero_inf_next_pred_is_not_nan_target() -> None:
+    """gamma=0 * inf V(s') is 0*inf = NaN and inactivates a prediction demon.
+
+    Fail-closed: a zero discount does not multiply V(s'). The target is the
+    cumulant, matching the finite-path algebra.
+    """
+    spec = create_horde_spec(
+        [
+            GVFSpec(
+                name="p",
+                demon_type=DemonType.PREDICTION,
+                gamma=0.0,
+                lamda=0.0,
+                cumulant_index=0,
+            ),
+            GVFSpec(
+                name="v",
+                demon_type=DemonType.PREDICTION,
+                gamma=0.9,
+                lamda=0.0,
+                cumulant_index=1,
+            ),
+        ]
+    )
+    horde = HordeLearner(
+        horde_spec=spec,
+        hidden_sizes=(),
+        step_size=0.1,
+        sparsity=0.0,
+        bounder=ObGDBounding(kappa=2.0),
+    )
+    state = horde.init(2, jr.key(0))
+    result = horde.update(
+        state,
+        jnp.zeros(2, dtype=jnp.float32),
+        jnp.array([1.25, 0.5], dtype=jnp.float32),
+        jnp.array([jnp.inf, 0.0], dtype=jnp.float32),
+    )
+    assert bool(jnp.isfinite(result.td_targets[0]))
+    chex.assert_trees_all_close(result.td_targets[0], jnp.float32(1.25))
+    discounted = horde.update_with_discounts(
+        state,
+        jnp.zeros(2, dtype=jnp.float32),
+        jnp.array([1.25, 0.5], dtype=jnp.float32),
+        jnp.array([jnp.inf, 0.0], dtype=jnp.float32),
+        jnp.array([0.0, 0.9], dtype=jnp.float32),
+    )
+    assert bool(jnp.isfinite(discounted.td_targets[0]))
+    chex.assert_trees_all_close(discounted.td_targets[0], jnp.float32(1.25))
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("step_size", True),
+        ("step_size", False),
+        ("step_size", float("nan")),
+        ("step_size", float("inf")),
+        ("step_size", -0.1),
+        ("sparsity", True),
+        ("sparsity", 1.5),
+        ("leaky_relu_slope", True),
+        ("leaky_relu_slope", -0.01),
+        ("use_layer_norm", 1),
+        ("use_layer_norm", 0),
+        ("use_layer_norm", np.bool_(True)),
+    ],
+)
+def test_horde_learner_rejects_bool_and_nonfinite_constructor_identities(
+    field: str, value: object
+) -> None:
+    spec = create_horde_spec(_make_all_gamma0_spec(1))
+    with pytest.raises(ValueError, match=field):
+        HordeLearner(horde_spec=spec, hidden_sizes=(4,), **{field: value})  # type: ignore[arg-type]
+
+
+def test_horde_learner_keeps_legal_constructor_scalars() -> None:
+    spec = create_horde_spec(_make_all_gamma0_spec(1))
+    horde = HordeLearner(
+        horde_spec=spec,
+        hidden_sizes=(4,),
+        step_size=np.float64(0.0),
+        sparsity=0,
+        leaky_relu_slope=np.float32(0.01),
+        use_layer_norm=False,
+    )
+    assert horde._step_size == 0.0
+    assert horde._sparsity == 0.0
+    assert math.isfinite(horde._leaky_relu_slope)
+    assert horde._use_layer_norm is False
+
+
+def test_mixed_horde_rejects_bool_step_size_before_inner_construction() -> None:
+    from alberta_framework.core.horde import MixedHorde
+
+    spec = create_horde_spec(
+        [
+            GVFSpec(
+                name="d0",
+                demon_type=DemonType.PREDICTION,
+                gamma=0.9,
+                lamda=0.8,
+                cumulant_index=0,
+            )
+        ]
+    )
+    with pytest.raises(ValueError, match="step_size"):
+        MixedHorde(horde_spec=spec, hidden_sizes=(4,), step_size=True)  # type: ignore[arg-type]

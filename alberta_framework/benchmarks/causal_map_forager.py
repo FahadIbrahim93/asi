@@ -1135,64 +1135,6 @@ def _merge_channel_interval_bounds(
     return merged
 
 
-def _merge_channel_samples(
-    count: Array,
-    mean: Array,
-    m2: Array,
-    channels: Array,
-    samples: Array,
-    sample_mask: Array,
-) -> tuple[Array, Array, Array]:
-    """Stream visible scalar samples into stable per-channel Welford state."""
-    count = jnp.asarray(count, dtype=jnp.int32)
-    mean = jnp.asarray(mean, dtype=jnp.float32)
-    m2 = jnp.asarray(m2, dtype=jnp.float32)
-    channels = jnp.asarray(channels, dtype=jnp.int32)
-    samples = jnp.asarray(samples, dtype=jnp.float32)
-    sample_mask = jnp.asarray(sample_mask, dtype=jnp.bool_)
-    channel_count = count.shape[0]
-
-    def merge_one(
-        carry: tuple[Array, Array, Array],
-        sample_data: tuple[Array, Array, Array],
-    ) -> tuple[tuple[Array, Array, Array], None]:
-        current_count, current_mean, current_m2 = carry
-        channel, sample, enabled = sample_data
-        safe_channel = jnp.clip(channel, 0, channel_count - 1)
-        old_count = current_count[safe_channel]
-        accepted = (
-            enabled
-            & (channel >= 0)
-            & (channel < channel_count)
-            & (old_count < _INT32_MAX)
-        )
-        next_count = old_count + accepted.astype(jnp.int32)
-        denominator = jnp.maximum(next_count, 1).astype(jnp.float32)
-        delta = sample - current_mean[safe_channel]
-        next_mean = current_mean[safe_channel] + delta / denominator
-        delta2 = sample - next_mean
-        next_m2 = jnp.maximum(current_m2[safe_channel] + delta * delta2, 0.0)
-        return (
-            (
-                current_count.at[safe_channel].set(next_count),
-                current_mean.at[safe_channel].set(
-                    jnp.where(accepted, next_mean, current_mean[safe_channel])
-                ),
-                current_m2.at[safe_channel].set(
-                    jnp.where(accepted, next_m2, current_m2[safe_channel])
-                ),
-            ),
-            None,
-        )
-
-    merged, _ = jax.lax.scan(
-        merge_one,
-        (count, mean, m2),
-        (channels, samples, sample_mask),
-    )
-    return merged
-
-
 def _merge_exact_channel_samples(
     count: Array,
     floor: Array,
@@ -1462,63 +1404,6 @@ def _negative_channels(
     return (state.reward_count > 0) & (
         _channel_values(state, config) < config.negative_reward_threshold
     )
-
-
-def _safe_distance_grid(
-    source: Array,
-    negative_cells: Array,
-    config: CausalMapForagerConfig,
-) -> Array:
-    """Return exact toroidal shortest-path distances around learned negatives."""
-    infinity = jnp.asarray(config.height * config.width + 1, dtype=jnp.int32)
-    source_x, source_y = source[0], source[1]
-    passable = (~negative_cells).at[source_y, source_x].set(True)
-    distances = jnp.full(config.world_shape, infinity, dtype=jnp.int32)
-    distances = distances.at[source_y, source_x].set(0)
-
-    def relax(current: Array) -> Array:
-        neighbor_minimum = jnp.minimum(
-            jnp.minimum(
-                jnp.roll(current, 1, axis=0),
-                jnp.roll(current, -1, axis=0),
-            ),
-            jnp.minimum(
-                jnp.roll(current, 1, axis=1),
-                jnp.roll(current, -1, axis=1),
-            ),
-        )
-        candidate = jnp.minimum(current, neighbor_minimum + 1)
-        return jnp.where(passable, candidate, infinity)
-
-    # Synchronous relaxation discovers every cell at its exact graph distance:
-    # after iteration k, all paths of at most k edges have been considered.
-    # A shortest simple path visits at most V cells, so V - 1 iterations reach
-    # every reachable cell and one final iteration detects the fixed point.
-    # The V-iteration cap therefore yields the exact result even if the
-    # early-convergence exit never fires.
-    maximum_iterations = config.height * config.width
-
-    def not_fixed(carry: tuple[Array, Array, Array]) -> Array:
-        _, changed, iteration = carry
-        return changed & (iteration < maximum_iterations)
-
-    def relax_once(
-        carry: tuple[Array, Array, Array],
-    ) -> tuple[Array, Array, Array]:
-        current, _, iteration = carry
-        updated = relax(current)
-        return updated, jnp.any(updated != current), iteration + 1
-
-    fixed_distances, _, _ = jax.lax.while_loop(
-        not_fixed,
-        relax_once,
-        (
-            distances,
-            jnp.asarray(True),
-            jnp.asarray(0, dtype=jnp.int32),
-        ),
-    )
-    return fixed_distances
 
 
 def _cost_aware_route_grid(
@@ -1907,6 +1792,11 @@ def causal_map_step(
     safe_channel = jnp.maximum(state.last_target_channel, 0)
     reward_sum = state.reward_sum.at[safe_channel].add(
         jnp.where(observed_reward, reward, 0.0)
+    )
+    reward_sum = _runtime_require(
+        jnp.all(jnp.isfinite(reward_sum)),
+        reward_sum,
+        message="causal-map reward accumulation must remain finite",
     )
     next_reward_count = _saturating_add_int32(
         state.reward_count[safe_channel],

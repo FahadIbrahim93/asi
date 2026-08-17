@@ -11,20 +11,174 @@ softmax over nearest-prototype class logits.
 
 The budget is static, every step can update the memory, and the state is a
 JAX PyTree, so the learner runs under ``jax.lax.scan``.  It is the core of
-the Step 2 retained-view memory
+the packaged Step 2 retained-view memory
 (:func:`alberta_framework.steps.step2.make_step2_memory_learner`).
 """
 
 from __future__ import annotations
 
 import functools
-from typing import Any, cast
+import operator
+from collections.abc import Mapping
+from typing import Any, SupportsIndex, cast
 
 import chex
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import Array
-from jaxtyping import Float
+from jaxtyping import Bool, Float
+
+from alberta_framework.core._float32_scalars import validated_float32_scalar
+from alberta_framework.core.update_safety import (
+    floating_tree_is_finite,
+    neutralize_array,
+    select_transaction,
+)
+
+_INT32_MAX: int = 2**31 - 1
+_FLOAT32_MIN_NORMAL: float = float.fromhex("0x1.0p-126")
+_ACTUAL_INT_TYPES: tuple[type, ...] = (
+    int,
+    np.int8,
+    np.int16,
+    np.int32,
+    np.int64,
+    np.uint8,
+    np.uint16,
+    np.uint32,
+    np.uint64,
+    np.longlong,
+    np.ulonglong,
+)
+
+
+def _require_unit_interval(name: str, value: object) -> float:
+    return validated_float32_scalar(name, value, lower=0.0, upper=1.0)
+
+
+def _require_half_open_unit_interval(name: str, value: object) -> float:
+    return validated_float32_scalar(
+        name,
+        value,
+        positive=True,
+        upper=1.0,
+    )
+
+
+def _require_nonnegative_real(name: str, value: object) -> float:
+    return validated_float32_scalar(name, value, lower=0.0)
+
+
+def _require_positive_normal_real(name: str, value: object) -> float:
+    return validated_float32_scalar(name, value, lower=_FLOAT32_MIN_NORMAL)
+
+
+def _require_int(
+    name: str,
+    value: object,
+    *,
+    minimum: int | None = None,
+    maximum: int | None = None,
+) -> int:
+    if type(value) not in _ACTUAL_INT_TYPES:
+        raise ValueError(f"{name} must be an integer")
+    number = operator.index(cast(SupportsIndex, value))
+    if minimum is not None and number < minimum:
+        if minimum == 1:
+            raise ValueError(f"{name} must be positive")
+        if minimum == 0:
+            raise ValueError(f"{name} must be non-negative")
+        raise ValueError(f"{name} must be >= {minimum}")
+    if maximum is not None and number > maximum:
+        raise ValueError(f"{name} must be <= {maximum}")
+    return number
+
+
+def _require_float32_resource(
+    name: str,
+    *,
+    vector_scalars: int,
+    fixed_scalars: int = 0,
+) -> None:
+    total_scalars = vector_scalars + fixed_scalars
+    if total_scalars > _INT32_MAX:
+        raise ValueError(f"{name} scalar count must fit signed int32")
+    if 4 * total_scalars > _INT32_MAX:
+        raise ValueError(f"{name} byte count must fit signed int32")
+
+
+def _require_sequence_resource(
+    name: str,
+    *,
+    float32_scalars: int,
+    bool_scalars: int,
+) -> None:
+    if float32_scalars + bool_scalars > _INT32_MAX:
+        raise ValueError(f"{name} scalar count must fit signed int32")
+    if 4 * float32_scalars + bool_scalars > _INT32_MAX:
+        raise ValueError(f"{name} byte count must fit signed int32")
+
+
+def _prototype_resource_counts(
+    feature_dim: int,
+    n_classes: int,
+    slots_per_class: int,
+) -> tuple[int, int, int]:
+    """Return backend-independent logical state/query/update scalar bounds.
+
+    Operands and results are counted separately instead of relying on XLA
+    fusion or donation.  Every value is a four-byte float32/int32-equivalent.
+    """
+    slots = n_classes * slots_per_class
+    means = slots * feature_dim
+    state = means + 2 * slots + 1
+    query = state + feature_dim + 2 * means + 3 * slots + 6 * n_classes + 2
+    update = (
+        query
+        + 2 * state
+        + 3 * n_classes
+        + 2 * slots_per_class * feature_dim
+        + 6 * slots_per_class
+        + 3 * feature_dim
+        + 38
+    )
+    return state, query, update
+
+
+def _require_array(
+    value: Any,
+    *,
+    name: str,
+    shape: tuple[int, ...],
+    dtype: Any,
+) -> None:
+    try:
+        actual_shape = tuple(value.shape)
+        actual_dtype = jnp.dtype(value.dtype)
+    except Exception as error:
+        raise TypeError(f"{name} must be an array with shape and dtype metadata") from error
+
+    if actual_shape != shape:
+        raise ValueError(f"{name} has an invalid shape")
+    expected_dtype = jnp.dtype(dtype)
+    if actual_dtype != expected_dtype:
+        raise TypeError(f"{name} has an invalid dtype")
+
+
+def _read_mapping(name: str, value: object) -> dict[str, Any]:
+    """Read a genuine Mapping while normalizing hostile implementation hooks."""
+    if not issubclass(type(value), Mapping):
+        raise ValueError(f"{name} must be a mapping")
+    try:
+        return dict(cast(Mapping[str, Any], value))
+    except Exception as error:
+        raise ValueError(f"{name} mapping could not be read") from error
+
+
+def _saturating_increment(value: Array) -> Array:
+    one = jnp.asarray(1, dtype=jnp.int32)
+    return jnp.minimum(value, jnp.asarray(_INT32_MAX - 1, dtype=jnp.int32)) + one
 
 
 @chex.dataclass(frozen=True)
@@ -43,7 +197,7 @@ class PrototypeMemoryConfig:
     ``novelty_threshold`` and ``bandwidth`` are both in units of *mean
     per-dimension* squared distance, so they are insensitive to
     ``feature_dim`` but scale with the square of the input magnitude. The
-    defaults are the Step 2 MNIST-pixel development calibration
+    defaults are the development-selected Step 2 MNIST-pixel calibration
     (:class:`~alberta_framework.steps.step2.Step2MemoryConfig` uses the same
     values); retune them for features on a different scale.
     """
@@ -54,6 +208,10 @@ class PrototypeMemoryConfig:
     update_rate: float = 0.3
     novelty_threshold: float = 0.08
     bandwidth: float = 0.01
+
+    def __post_init__(self) -> None:
+        """Validate and canonicalize configuration."""
+        _validate_config(self)
 
     def to_config(self) -> dict[str, Any]:
         """Serialize to a plain dictionary."""
@@ -68,11 +226,16 @@ class PrototypeMemoryConfig:
         }
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> PrototypeMemoryConfig:
+    def from_config(cls, config: Mapping[str, Any]) -> PrototypeMemoryConfig:
         """Reconstruct from :meth:`to_config` output."""
-        config = dict(config)
-        config.pop("type", None)
-        return cls(**config)
+        payload = _read_mapping("PrototypeMemoryConfig payload", config)
+        payload.pop("type", None)
+        try:
+            return cls(**payload)
+        except ValueError:
+            raise
+        except Exception as error:
+            raise ValueError("serialized PrototypeMemoryConfig is invalid") from error
 
 
 @chex.dataclass(frozen=True)
@@ -93,6 +256,7 @@ class PrototypeMemoryUpdateResult:
     predictions: Float[Array, " n_classes"]
     errors: Float[Array, " n_classes"]
     metrics: Float[Array, " 6"]
+    update_applied: Bool[Array, ""]
 
 
 @chex.dataclass(frozen=True)
@@ -102,21 +266,40 @@ class PrototypeMemoryLearningResult:
     state: PrototypeMemoryState
     predictions: Float[Array, "steps n_classes"]
     metrics: Float[Array, "steps 6"]
+    updates_applied: Bool[Array, " steps"]
 
 
 def _validate_config(config: PrototypeMemoryConfig) -> None:
-    if config.feature_dim < 1:
-        raise ValueError("feature_dim must be positive")
-    if config.n_classes < 2:
-        raise ValueError("n_classes must be at least 2")
-    if config.slots_per_class < 1:
-        raise ValueError("slots_per_class must be positive")
-    if not 0.0 < config.update_rate <= 1.0:
-        raise ValueError("update_rate must be in (0, 1]")
-    if config.novelty_threshold < 0.0:
-        raise ValueError("novelty_threshold must be non-negative")
-    if config.bandwidth <= 0.0:
-        raise ValueError("bandwidth must be positive")
+    feature_dim = _require_int(
+        "feature_dim", config.feature_dim, minimum=1, maximum=_INT32_MAX
+    )
+    n_classes = _require_int(
+        "n_classes", config.n_classes, minimum=2, maximum=_INT32_MAX
+    )
+    slots_per_class = _require_int(
+        "slots_per_class", config.slots_per_class, minimum=1, maximum=_INT32_MAX
+    )
+    update_rate = _require_half_open_unit_interval("update_rate", config.update_rate)
+    novelty_threshold = _require_nonnegative_real(
+        "novelty_threshold", config.novelty_threshold
+    )
+    bandwidth = _require_positive_normal_real("bandwidth", config.bandwidth)
+    object.__setattr__(config, "feature_dim", feature_dim)
+    object.__setattr__(config, "n_classes", n_classes)
+    object.__setattr__(config, "slots_per_class", slots_per_class)
+    object.__setattr__(config, "update_rate", update_rate)
+    object.__setattr__(config, "novelty_threshold", novelty_threshold)
+    object.__setattr__(config, "bandwidth", bandwidth)
+    if n_classes * slots_per_class > _INT32_MAX:
+        raise ValueError("PrototypeMemoryConfig dimensions must fit signed int32")
+    if n_classes * slots_per_class * feature_dim > _INT32_MAX:
+        raise ValueError("PrototypeMemoryConfig dimensions must fit signed int32")
+    state_scalars, query_scalars, update_scalars = _prototype_resource_counts(
+        feature_dim, n_classes, slots_per_class
+    )
+    _require_float32_resource("PrototypeMemoryConfig state", vector_scalars=state_scalars)
+    _require_float32_resource("PrototypeMemoryConfig query", vector_scalars=query_scalars)
+    _require_float32_resource("PrototypeMemoryConfig update", vector_scalars=update_scalars)
 
 
 def _softmax(logits: Array) -> Array:
@@ -150,10 +333,54 @@ class PrototypeMemoryLearner:
         }
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> PrototypeMemoryLearner:
+    def from_config(cls, config: Mapping[str, Any]) -> PrototypeMemoryLearner:
         """Reconstruct a learner from :meth:`to_config` output."""
-        inner = dict(config["config"])
-        return cls(PrototypeMemoryConfig.from_config(inner))
+        payload = _read_mapping("PrototypeMemoryLearner payload", config)
+        inner = payload.get("config")
+        if not issubclass(type(inner), Mapping):
+            raise ValueError("PrototypeMemoryLearner config must be a mapping")
+        return cls(PrototypeMemoryConfig.from_config(cast(Mapping[str, Any], inner)))
+
+    def _validate_state_static_contract(self, state: PrototypeMemoryState) -> None:
+        """Reject malformed adopted state before any traced computation."""
+        if type(state) is not PrototypeMemoryState:
+            raise TypeError("state must be a PrototypeMemoryState")
+        cfg = self._config
+        slot_shape = (cfg.n_classes, cfg.slots_per_class)
+        _require_array(
+            state.means,
+            name="state.means",
+            shape=(*slot_shape, cfg.feature_dim),
+            dtype=jnp.float32,
+        )
+        _require_array(
+            state.counts,
+            name="state.counts",
+            shape=slot_shape,
+            dtype=jnp.float32,
+        )
+        _require_array(
+            state.last_update,
+            name="state.last_update",
+            shape=slot_shape,
+            dtype=jnp.int32,
+        )
+        _require_array(
+            state.step_count,
+            name="state.step_count",
+            shape=(),
+            dtype=jnp.int32,
+        )
+
+    @staticmethod
+    def _state_is_valid(state: PrototypeMemoryState) -> Bool[Array, ""]:
+        return (
+            floating_tree_is_finite(state)
+            & jnp.all(state.counts >= 0.0)
+            & jnp.all(state.last_update >= 0)
+            & (state.step_count >= 0)
+            & jnp.all(state.last_update <= state.step_count)
+        )
 
     def init(self) -> PrototypeMemoryState:
         """Create an empty fixed-budget memory."""
@@ -168,14 +395,28 @@ class PrototypeMemoryLearner:
             step_count=jnp.array(0, dtype=jnp.int32),
         )
 
-    @functools.partial(jax.jit, static_argnums=(0,))
     def class_logits(
         self,
         state: PrototypeMemoryState,
         observation: Float[Array, " feature_dim"],
     ) -> Float[Array, " n_classes"]:
         """Return class logits from nearest active prototype distances."""
-        x = jnp.asarray(observation, dtype=jnp.float32)
+        self._validate_state_static_contract(state)
+        _require_array(
+            observation,
+            name="observation",
+            shape=(self._config.feature_dim,),
+            dtype=jnp.float32,
+        )
+        return cast(Array, self._class_logits_jit(state, observation))
+
+    @functools.partial(jax.jit, static_argnums=(0,))
+    def _class_logits_jit(
+        self,
+        state: PrototypeMemoryState,
+        observation: Float[Array, " feature_dim"],
+    ) -> Float[Array, " n_classes"]:
+        x = jnp.asarray(observation)
         diffs = state.means - x[None, None, :]
         distances = jnp.mean(diffs * diffs, axis=2)
         slot_logits = -distances / jnp.asarray(self._config.bandwidth, dtype=jnp.float32)
@@ -184,16 +425,31 @@ class PrototypeMemoryLearner:
         any_active = jnp.any(state.counts > 0.0, axis=1)
         logits = jnp.where(any_active, logits, -1e9)
         logits = jnp.where(jnp.any(any_active), logits, jnp.zeros_like(logits))
-        return logits
+        inputs_valid = self._state_is_valid(state) & jnp.all(jnp.isfinite(x))
+        return jnp.where(inputs_valid, logits, jnp.full_like(logits, jnp.nan))
 
-    @functools.partial(jax.jit, static_argnums=(0,))
     def predict(
         self,
         state: PrototypeMemoryState,
         observation: Float[Array, " feature_dim"],
     ) -> Float[Array, " n_classes"]:
         """Return class probabilities for one observation."""
-        return _softmax(self.class_logits(state, observation))
+        self._validate_state_static_contract(state)
+        _require_array(
+            observation,
+            name="observation",
+            shape=(self._config.feature_dim,),
+            dtype=jnp.float32,
+        )
+        return cast(Array, self._predict_jit(state, observation))
+
+    @functools.partial(jax.jit, static_argnums=(0,))
+    def _predict_jit(
+        self,
+        state: PrototypeMemoryState,
+        observation: Float[Array, " feature_dim"],
+    ) -> Float[Array, " n_classes"]:
+        return _softmax(self._class_logits_jit(state, observation))
 
     @staticmethod
     def valid_one_hot_target(target: Array) -> Array:
@@ -219,7 +475,6 @@ class PrototypeMemoryLearner:
         )
         return jnp.argmin(oldest_among_tied)
 
-    @functools.partial(jax.jit, static_argnums=(0,))
     def update_with_novelty_threshold(
         self,
         state: PrototypeMemoryState,
@@ -228,9 +483,54 @@ class PrototypeMemoryLearner:
         novelty_threshold: Float[Array, ""],
     ) -> PrototypeMemoryUpdateResult:
         """Perform one causal update with a runtime novelty threshold."""
-        prediction = self.predict(state, observation)
-        valid_target = self.valid_one_hot_target(target)
-        safe_target = jnp.where(jnp.isfinite(target), target, 0.0)
+        self._validate_state_static_contract(state)
+        _require_array(
+            observation,
+            name="observation",
+            shape=(self._config.feature_dim,),
+            dtype=jnp.float32,
+        )
+        _require_array(
+            target,
+            name="target",
+            shape=(self._config.n_classes,),
+            dtype=jnp.float32,
+        )
+        _require_array(
+            novelty_threshold,
+            name="novelty_threshold",
+            shape=(),
+            dtype=jnp.float32,
+        )
+        return cast(
+            PrototypeMemoryUpdateResult,
+            self._update_with_novelty_threshold_jit(
+                state, observation, target, novelty_threshold
+            ),
+        )
+
+    @functools.partial(jax.jit, static_argnums=(0,))
+    def _update_with_novelty_threshold_jit(
+        self,
+        state: PrototypeMemoryState,
+        observation: Float[Array, " feature_dim"],
+        target: Float[Array, " n_classes"],
+        novelty_threshold: Float[Array, ""],
+    ) -> PrototypeMemoryUpdateResult:
+        observation_arr = jnp.asarray(observation)
+        target_arr = jnp.asarray(target)
+        threshold_arr = jnp.asarray(novelty_threshold)
+        inputs_valid = (
+            jnp.all(jnp.isfinite(observation_arr))
+            & jnp.isfinite(threshold_arr)
+            & (threshold_arr >= 0.0)
+        )
+        safe_observation = jnp.where(
+            inputs_valid, observation_arr, jnp.zeros_like(observation_arr)
+        )
+        prediction = self._predict_jit(state, safe_observation)
+        valid_target = self.valid_one_hot_target(target_arr)
+        safe_target = jnp.where(jnp.isfinite(target_arr), target_arr, 0.0)
         errors = prediction - safe_target
         mse = jnp.mean(errors * errors)
         confidence = jnp.max(prediction)
@@ -246,7 +546,7 @@ class PrototypeMemoryLearner:
             has_used = jnp.any(used)
             has_empty = jnp.any(~used)
             distances = jnp.mean(
-                (current.means[head] - observation[None, :]) ** 2,
+                (current.means[head] - safe_observation[None, :]) ** 2,
                 axis=1,
             )
             used_distances = jnp.where(used, distances, jnp.inf)
@@ -254,8 +554,7 @@ class PrototypeMemoryLearner:
             nearest_distance = used_distances[nearest_slot]
             empty_slot = jnp.argmax((~used).astype(jnp.int32))
             replacement_slot = self._replacement_slot(current, head)
-            threshold = jnp.asarray(novelty_threshold, dtype=jnp.float32)
-            novel = (~has_used) | (nearest_distance > threshold)
+            novel = (~has_used) | (nearest_distance > threshold_arr)
             slot = jnp.where(
                 ~has_used,
                 jnp.array(0, dtype=nearest_slot.dtype),
@@ -267,31 +566,37 @@ class PrototypeMemoryLearner:
             )
             old_mean = current.means[head, slot]
             eta = jnp.asarray(self._config.update_rate, dtype=jnp.float32)
-            new_mean = jnp.where(novel, observation, old_mean + eta * (observation - old_mean))
+            new_mean = jnp.where(
+                novel,
+                safe_observation,
+                old_mean + eta * (safe_observation - old_mean),
+            )
             new_count = jnp.where(novel, 1.0, current.counts[head, slot] + 1.0)
+            next_step = _saturating_increment(current.step_count)
             next_state = PrototypeMemoryState(
                 means=current.means.at[head, slot].set(new_mean),
                 counts=current.counts.at[head, slot].set(new_count),
-                last_update=current.last_update.at[head, slot].set(
-                    current.step_count + 1
-                ),
-                step_count=current.step_count + 1,
+                last_update=current.last_update.at[head, slot].set(next_step),
+                step_count=next_step,
             )
             return next_state, novel.astype(jnp.float32)
 
         def skip_update(current: PrototypeMemoryState) -> tuple[PrototypeMemoryState, Array]:
+            next_step = _saturating_increment(current.step_count)
             return (
                 PrototypeMemoryState(
                     means=current.means,
                     counts=current.counts,
                     last_update=current.last_update,
-                    step_count=current.step_count + 1,
+                    step_count=next_step,
                 ),
                 jnp.array(0.0, dtype=jnp.float32),
             )
 
-        new_state, allocated = jax.lax.cond(valid_target, do_update, skip_update, state)
-        active = jnp.sum(new_state.counts > 0.0).astype(jnp.float32)
+        candidate_state, allocated = jax.lax.cond(
+            valid_target, do_update, skip_update, state
+        )
+        active = jnp.sum(candidate_state.counts > 0.0).astype(jnp.float32)
         metrics = jnp.asarray(
             [
                 mse,
@@ -303,14 +608,22 @@ class PrototypeMemoryLearner:
             ],
             dtype=jnp.float32,
         )
+        update_applied = (
+            inputs_valid
+            & self._state_is_valid(state)
+            & self._state_is_valid(candidate_state)
+            & jnp.all(jnp.isfinite(prediction))
+            & jnp.all(jnp.isfinite(errors))
+            & jnp.all(jnp.isfinite(metrics))
+        )
         return PrototypeMemoryUpdateResult(
-            state=new_state,
-            predictions=prediction,
-            errors=errors,
-            metrics=metrics,
+            state=select_transaction(update_applied, candidate_state, state),
+            predictions=neutralize_array(update_applied, prediction),
+            errors=neutralize_array(update_applied, errors),
+            metrics=neutralize_array(update_applied, metrics),
+            update_applied=update_applied,
         )
 
-    @functools.partial(jax.jit, static_argnums=(0,))
     def update(
         self,
         state: PrototypeMemoryState,
@@ -318,9 +631,22 @@ class PrototypeMemoryLearner:
         target: Float[Array, " n_classes"],
     ) -> PrototypeMemoryUpdateResult:
         """Perform one causal online memory update."""
+        self._validate_state_static_contract(state)
+        _require_array(
+            observation,
+            name="observation",
+            shape=(self._config.feature_dim,),
+            dtype=jnp.float32,
+        )
+        _require_array(
+            target,
+            name="target",
+            shape=(self._config.n_classes,),
+            dtype=jnp.float32,
+        )
         return cast(
             PrototypeMemoryUpdateResult,
-            self.update_with_novelty_threshold(
+            self._update_with_novelty_threshold_jit(
                 state,
                 observation,
                 target,
@@ -341,24 +667,65 @@ def run_prototype_memory_arrays(
     Metric columns are ``mse, correct, confidence, active_prototypes,
     valid_update, allocated``.
     """
+    if type(learner) is not PrototypeMemoryLearner:
+        raise TypeError("learner must be a PrototypeMemoryLearner")
+    try:
+        observation_shape = tuple(observations.shape)
+        target_shape = tuple(targets.shape)
+    except Exception as error:
+        raise TypeError("observations and targets must expose array metadata") from error
+    if len(observation_shape) != 2 or observation_shape[1] != learner.config.feature_dim:
+        raise ValueError("observations have an invalid shape")
+    if len(target_shape) != 2 or target_shape[1] != learner.config.n_classes:
+        raise ValueError("targets have an invalid shape")
+    if observation_shape[0] != target_shape[0]:
+        raise ValueError("observations and targets must have the same step count")
+    steps = observation_shape[0]
+    if type(steps) is not int or steps < 0:
+        raise ValueError("prototype memory step count must be a non-negative integer")
+    _require_sequence_resource(
+        "prototype memory scan outputs",
+        float32_scalars=steps * (learner.config.n_classes + 6),
+        bool_scalars=steps,
+    )
+    _require_array(
+        observations,
+        name="observations",
+        shape=(steps, learner.config.feature_dim),
+        dtype=jnp.float32,
+    )
+    _require_array(
+        targets,
+        name="targets",
+        shape=(steps, learner.config.n_classes),
+        dtype=jnp.float32,
+    )
+    observation_array = jnp.asarray(observations)
+    target_array = jnp.asarray(targets)
     if state is None:
         state = learner.init()
+    learner._validate_state_static_contract(state)
 
     def step_fn(
         carry: PrototypeMemoryState,
         batch: tuple[Array, Array],
-    ) -> tuple[PrototypeMemoryState, tuple[Array, Array]]:
+    ) -> tuple[PrototypeMemoryState, tuple[Array, Array, Array]]:
         observation, target = batch
         result = learner.update(carry, observation, target)
-        return result.state, (result.predictions, result.metrics)
+        return result.state, (
+            result.predictions,
+            result.metrics,
+            result.update_applied,
+        )
 
-    final_state, (predictions, metrics) = jax.lax.scan(
+    final_state, (predictions, metrics, updates_applied) = jax.lax.scan(
         step_fn,
         state,
-        (observations, targets),
+        (observation_array, target_array),
     )
     return PrototypeMemoryLearningResult(
         state=final_state,
         predictions=predictions,
         metrics=metrics,
+        updates_applied=updates_applied,
     )

@@ -7,6 +7,7 @@ import chex
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 import pytest
 
 from alberta_framework.core.continual_backprop import (
@@ -18,8 +19,10 @@ from alberta_framework.core.continual_backprop import (
     ContinualBackpropConfig,
     ContinualBackpropState,
     ContinualBackpropTracker,
+    _select_replacement_index,
     init_cbp_state,
     maybe_replace_units,
+    replace_units_with_flags,
     run_cbp_learning_loop,
     update_utility,
 )
@@ -72,6 +75,78 @@ class TestInitCbpStateShapes:
         except ValueError:
             return
         raise AssertionError("expected ValueError on mismatched hidden_sizes")
+
+    def test_init_cbp_state_width_mismatch_raises(self):
+        """The count can match while a width does not; that must not silently reshape."""
+        learner = MultiHeadMLPLearner(n_heads=2, hidden_sizes=(8, 4), sparsity=0.0)
+        mlp_state = learner.init(feature_dim=4, key=jr.key(0))
+        with pytest.raises(
+            ValueError,
+            match=r"^hidden_sizes\[1\]=1 does not match trunk layer 1 width \(4\)$",
+        ):
+            init_cbp_state(mlp_state, (8, 1), key=jr.key(1))
+        with pytest.raises(ValueError, match=r"^hidden_sizes\[0\]=1 does not match"):
+            init_cbp_state(mlp_state, (1, 4), key=jr.key(1))
+
+    def test_wrapper_reuses_canonical_multi_head_dimensions(self):
+        learner = CBPMultiHeadMLPLearner(
+            n_heads=np.int32(2),  # type: ignore[arg-type]
+            hidden_sizes=(np.uint16(3),),  # type: ignore[arg-type]
+        )
+        assert type(learner.n_heads) is int
+        assert learner.n_heads == 2
+        assert learner.hidden_sizes == (3,)
+        assert type(learner.hidden_sizes[0]) is int
+
+    def test_wrapper_delegates_direct_tuple_and_feature_dimension_validation(self):
+        with pytest.raises(ValueError, match="hidden_sizes.*tuple"):
+            CBPMultiHeadMLPLearner(n_heads=1, hidden_sizes=[2])  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="per_head_gamma_lamda.*tuple"):
+            CBPMultiHeadMLPLearner(
+                n_heads=1,
+                hidden_sizes=(),
+                per_head_gamma_lamda=[0.5],  # type: ignore[arg-type]
+            )
+
+        learner = CBPMultiHeadMLPLearner(n_heads=1, hidden_sizes=())
+        with pytest.raises(ValueError, match="feature_dim"):
+            learner.init(True, jr.key(0))  # type: ignore[arg-type]
+
+    def test_wrapper_from_config_requires_json_lists(self):
+        learner = CBPMultiHeadMLPLearner(
+            n_heads=1,
+            hidden_sizes=(),
+            per_head_gamma_lamda=(0.5,),
+        )
+        hidden_tuple = learner.to_config()
+        hidden_tuple["hidden_sizes"] = ()
+        with pytest.raises(ValueError, match="hidden_sizes.*list"):
+            CBPMultiHeadMLPLearner.from_config(hidden_tuple)
+
+        per_head_tuple = learner.to_config()
+        per_head_tuple["per_head_gamma_lamda"] = (0.5,)
+        with pytest.raises(ValueError, match="per_head_gamma_lamda.*list"):
+            CBPMultiHeadMLPLearner.from_config(per_head_tuple)
+
+    def test_wrapper_from_config_requires_exact_outer_schema(self):
+        config = CBPMultiHeadMLPLearner(n_heads=1, hidden_sizes=()).to_config()
+        for field, value in (
+            ("type", "WrongLearner"),
+            ("state_schema", "wrong-schema"),
+        ):
+            invalid = dict(config)
+            invalid[field] = value
+            with pytest.raises(ValueError):
+                CBPMultiHeadMLPLearner.from_config(invalid)
+
+        missing = dict(config)
+        missing.pop("optimizer")
+        with pytest.raises(ValueError, match="fields"):
+            CBPMultiHeadMLPLearner.from_config(missing)
+        unknown = dict(config)
+        unknown["unknown"] = 1
+        with pytest.raises(ValueError, match="fields"):
+            CBPMultiHeadMLPLearner.from_config(unknown)
 
 
 # =============================================================================
@@ -129,6 +204,45 @@ class TestUtilityUpdate:
         assert int(state.ages[0][0]) == 10
         assert int(state.ages[0][1]) == 10
         assert int(state.ages[0][2]) == 10
+
+    def test_inf_activation_silent_grad_holds_finite_utility(self) -> None:
+        """Inf activation * a silent gradient is 0*inf = NaN utility.
+
+        Fail-closed: keep the previous finite EMA for that unit so
+        replacement does not treat NaN as the lowest-utility mature unit.
+        """
+        cbp_state = ContinualBackpropState(  # type: ignore[call-arg]
+            utilities=(jnp.array([0.9, 0.1], dtype=jnp.float32),),
+            ages=(jnp.array([100, 100], dtype=jnp.int32),),
+            replacement_accumulators=jnp.zeros(1, dtype=jnp.float32),
+            rng_key=jr.key(0),
+        )
+        activations = (jnp.array([jnp.inf, 1.0], dtype=jnp.float32),)
+        grads = (jnp.array([0.0, 0.2], dtype=jnp.float32),)
+        new = update_utility(cbp_state, activations, grads, 0.9)
+        assert bool(jnp.all(jnp.isfinite(new.utilities[0])))
+        chex.assert_trees_all_close(new.utilities[0][0], cbp_state.utilities[0][0])
+        idx, has = _select_replacement_index(new.utilities[0], new.ages[0], 10)
+        assert bool(has)
+        assert int(idx) == 1
+
+    def test_zero_decay_does_not_multiply_inf_utility(self) -> None:
+        """decay=0 times an infinite utility EMA is NaN and would be committed."""
+        cbp_state = ContinualBackpropState(  # type: ignore[call-arg]
+            utilities=(jnp.array([jnp.inf, jnp.inf], dtype=jnp.float32),),
+            ages=(jnp.array([5, 5], dtype=jnp.int32),),
+            replacement_accumulators=jnp.zeros(1, dtype=jnp.float32),
+            rng_key=jr.key(0),
+        )
+        activations = (jnp.array([1.0, 0.5], dtype=jnp.float32),)
+        grads = (jnp.array([0.2, -0.4], dtype=jnp.float32),)
+        raw = jnp.asarray(0.0, dtype=jnp.float32) * jnp.asarray(jnp.inf, dtype=jnp.float32)
+        assert not bool(jnp.isfinite(raw))
+
+        new = update_utility(cbp_state, activations, grads, 0.0)
+        assert bool(jnp.all(jnp.isfinite(new.utilities[0])))
+        expected = jnp.abs(activations[0] * grads[0])
+        chex.assert_trees_all_close(new.utilities[0], expected)
 
 
 class TestWrapperUtilityGradients:
@@ -290,6 +404,80 @@ class TestReplacement:
         chex.assert_trees_all_close(
             cbp_state.utilities[0], new_cbp.utilities[0]
         )
+
+
+    def _replacement_trace(
+        self, *, n_units: int, rate: float, maturity: int, steps: int
+    ) -> tuple[list[int], float]:
+        """Drive maybe_replace_units with ages advancing one per step; count replacements."""
+        learner = MultiHeadMLPLearner(n_heads=1, hidden_sizes=(n_units,), sparsity=0.0)
+        mlp_state = learner.init(feature_dim=3, key=jr.key(1))
+        cbp_state = init_cbp_state(mlp_state, (n_units,), key=jr.key(2))
+        config = ContinualBackpropConfig(
+            decay_rate=0.99, replacement_rate=rate, maturity_threshold=maturity, enabled=True
+        )
+        replaced_per_step: list[int] = []
+        for step in range(steps):
+            cbp_state = cbp_state.replace(  # type: ignore[attr-defined]
+                ages=(jnp.full((n_units,), step, dtype=jnp.int32),),
+                utilities=(jnp.linspace(0.001, 1.0, n_units, dtype=jnp.float32),),
+            )
+            mlp_state, cbp_state, replaced = replace_units_with_flags(
+                mlp_state, cbp_state, config, sparsity=0.0
+            )
+            replaced_per_step.append(int(bool(replaced[0])))
+        return replaced_per_step, float(cbp_state.replacement_accumulators[0])
+
+    def test_replacement_budget_does_not_accrue_while_every_unit_is_immature(self):
+        """No warm-up debt: rate 1e-3 on 32 units is ~1 per 31 steps, not 32 in a row."""
+        replaced, _ = self._replacement_trace(n_units=32, rate=1e-3, maturity=1000, steps=1100)
+        assert sum(replaced[:1000]) == 0
+        burst = sum(replaced[1000:1040])
+        assert burst <= 2, f"warm-up debt discharged as a burst of {burst} replacements"
+        assert 1 <= sum(replaced) <= 4
+
+    def test_replacement_budget_never_carries_more_than_one_pending_unit(self):
+        """rate * n_units > 1 saturates at one replacement per step without unbounded debt."""
+        replaced, final_accumulator = self._replacement_trace(
+            n_units=8, rate=0.5, maturity=0, steps=20
+        )
+        assert sum(replaced) == 20
+        assert final_accumulator <= 1.0
+
+
+    def test_wrapper_replacements_made_is_the_gated_decision(self):
+        """replacements_made must not be re-inferred from the old rate * hidden_size formula."""
+        learner = CBPMultiHeadMLPLearner(
+            n_heads=1,
+            hidden_sizes=(32,),
+            cbp_config=ContinualBackpropConfig(
+                decay_rate=0.99, replacement_rate=0.02, maturity_threshold=1000, enabled=True
+            ),
+            step_size=0.01,
+            sparsity=0.0,
+            use_layer_norm=False,
+        )
+        state = learner.init(feature_dim=4, key=jr.key(9))
+        obs = jnp.array([0.4, -0.2, 0.7, 1.0], dtype=jnp.float32)
+        result = learner.update(state, obs, jnp.array([1.5], dtype=jnp.float32))
+        assert int(jnp.max(result.state.cbp_state.ages[0])) == 1
+        assert float(result.state.cbp_state.replacement_accumulators[0]) == 0.0
+        assert not bool(result.replacements_made[0])
+
+        matured = result.state.replace(  # type: ignore[attr-defined]
+            cbp_state=result.state.cbp_state.replace(  # type: ignore[attr-defined]
+                ages=(jnp.full((32,), 5000, dtype=jnp.int32),),
+                replacement_accumulators=jnp.array([0.9], dtype=jnp.float32),
+            )
+        )
+        weights_before = matured.mlp_state.trunk_params.weights[0]
+        fired = learner.update(matured, obs, jnp.array([1.5], dtype=jnp.float32))
+        assert bool(fired.replacements_made[0])
+        changed_rows = jnp.any(
+            fired.state.mlp_state.trunk_params.weights[0] != weights_before, axis=1
+        )
+        assert int(jnp.sum(fired.state.cbp_state.ages[0] == 0)) == 1
+        assert int(jnp.sum(changed_rows)) >= 1
 
 
 # =============================================================================
@@ -554,8 +742,111 @@ class TestTrackerDataclass:
 
 
 # =============================================================================
-# Config roundtrip
+# Config validation and roundtrip
 # =============================================================================
+
+
+class TestContinualBackpropConfigValidation:
+    """Configuration rejects values that cannot be consumed safely by JAX."""
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("decay_rate", float("nan")),
+            ("decay_rate", float("inf")),
+            ("decay_rate", -0.1),
+            ("decay_rate", 1.0),
+            ("replacement_rate", float("nan")),
+            ("replacement_rate", float("inf")),
+            ("replacement_rate", -0.1),
+            ("replacement_rate", 1.1),
+            ("maturity_threshold", -1),
+            ("maturity_threshold", 1.5),
+            ("maturity_threshold", np.iinfo(np.int32).max + 1),
+            ("enabled", 1),
+        ],
+    )
+    def test_rejects_invalid_fields(self, field: str, value: object) -> None:
+        with pytest.raises(ValueError, match=field):
+            ContinualBackpropConfig(**{field: value})  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize(
+        "field",
+        ["decay_rate", "replacement_rate", "maturity_threshold", "enabled"],
+    )
+    def test_rejects_class_spoofed_values(self, field: str) -> None:
+        class SpoofedScalar:
+            @property
+            def __class__(self) -> type[int]:
+                return int
+
+            def __int__(self) -> int:
+                return 1
+
+            def __float__(self) -> float:
+                return 0.5
+
+        with pytest.raises(ValueError, match=field):
+            ContinualBackpropConfig(  # type: ignore[arg-type]
+                **{field: SpoofedScalar()}
+            )
+
+    def test_canonicalizes_supported_numpy_scalars_and_roundtrips(self) -> None:
+        config = ContinualBackpropConfig(
+            decay_rate=np.float64(0.9),
+            replacement_rate=np.float32(0.25),
+            maturity_threshold=np.int64(7),
+            enabled=False,
+        )
+        assert type(config.decay_rate) is float
+        assert type(config.replacement_rate) is float
+        assert type(config.maturity_threshold) is int
+        assert type(config.enabled) is bool
+        assert ContinualBackpropConfig.from_config(config.to_config()) == config
+
+    @pytest.mark.parametrize("base", [np.float32, np.float64])
+    def test_rejects_hostile_numpy_float_subclasses(self, base: type[np.floating]) -> None:
+        class LyingFloat(base):  # type: ignore[misc, valid-type]
+            def as_integer_ratio(self) -> tuple[int, int]:
+                return (1, 2)
+
+        class RaisingFloat(base):  # type: ignore[misc, valid-type]
+            def as_integer_ratio(self) -> tuple[int, int]:
+                raise RuntimeError("must not run")
+
+        for value in (LyingFloat(float("nan")), RaisingFloat(0.5)):
+            with pytest.raises(ValueError, match="decay_rate"):
+                ContinualBackpropConfig(decay_rate=value)  # type: ignore[arg-type]
+
+    def test_rejects_hostile_numpy_integer_subclasses(self) -> None:
+        class LyingInt(np.int64):
+            def __int__(self) -> int:
+                return 7
+
+        class RaisingInt(np.int64):
+            def __int__(self) -> int:
+                raise RuntimeError("must not run")
+
+        for value in (LyingInt(-1), RaisingInt(7)):
+            with pytest.raises(ValueError, match="maturity_threshold"):
+                ContinualBackpropConfig(maturity_threshold=value)  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            np.int8(7),
+            np.int16(7),
+            np.int32(7),
+            np.int64(7),
+            np.longlong(7),
+            np.uint64(7),
+            np.ulonglong(7),
+        ],
+    )
+    def test_canonicalizes_supported_numpy_integer_widths(self, value: np.integer) -> None:
+        config = ContinualBackpropConfig(maturity_threshold=value)  # type: ignore[arg-type]
+        assert config.maturity_threshold == 7
+        assert type(config.maturity_threshold) is int
 
 
 class TestConfigRoundtrip:
@@ -580,38 +871,61 @@ class TestConfigRoundtrip:
         cfg2 = rebuilt.to_config()
         assert cfg2 == cfg
 
+
+class TestCBPWrapperConstructorIdentities:
+    """CBP replacement/activation copies reject bool and non-finite identities."""
+
     @pytest.mark.parametrize(
-        "hidden_sizes",
-        ([8], (True,), (1.5,), (0,), (2**31,)),
+        ("kwargs", "match"),
+        [
+            ({"use_layer_norm": 1}, "use_layer_norm"),
+            ({"use_layer_norm": 0}, "use_layer_norm"),
+            ({"sparsity": True}, "sparsity"),
+            ({"sparsity": False}, "sparsity"),
+            ({"sparsity": float("nan")}, "sparsity"),
+            ({"sparsity": 1.1}, "sparsity"),
+            ({"leaky_relu_slope": True}, "leaky_relu_slope"),
+            ({"leaky_relu_slope": float("inf")}, "leaky_relu_slope"),
+            ({"leaky_relu_slope": -0.1}, "leaky_relu_slope"),
+        ],
     )
-    def test_constructor_rejects_noncanonical_hidden_sizes(self, hidden_sizes: object):
-        with pytest.raises(ValueError, match="hidden_sizes"):
-            CBPMultiHeadMLPLearner(
-                n_heads=1,
-                hidden_sizes=hidden_sizes,  # type: ignore[arg-type]
-                sparsity=0.0,
+    def test_multihead_rejects_identity_aliases(
+        self, kwargs: dict[str, object], match: str
+    ) -> None:
+        with pytest.raises(ValueError, match=match):
+            CBPMultiHeadMLPLearner(n_heads=1, hidden_sizes=(4,), **kwargs)  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize(
+        ("kwargs", "match"),
+        [
+            ({"use_layer_norm": 1}, "use_layer_norm"),
+            ({"sparsity": True}, "sparsity"),
+            ({"leaky_relu_slope": True}, "leaky_relu_slope"),
+        ],
+    )
+    def test_single_head_adapter_rejects_identity_aliases(
+        self, kwargs: dict[str, object], match: str
+    ) -> None:
+        with pytest.raises(ValueError, match=match):
+            CBPMLPLearner(hidden_sizes=(4,), **kwargs)  # type: ignore[arg-type]
+
+    def test_tracker_rejects_boolean_sparsity(self) -> None:
+        with pytest.raises(ValueError, match="sparsity"):
+            ContinualBackpropTracker(
+                config=ContinualBackpropConfig(),
+                sparsity=True,  # type: ignore[arg-type]
             )
 
-    @pytest.mark.parametrize("hidden_sizes", ["8", (8,), [True], [1.5], [0], [2**31]])
-    def test_from_config_rejects_noncanonical_hidden_sizes(self, hidden_sizes: object):
-        config = CBPMultiHeadMLPLearner(
+    def test_canonicalizes_numpy_sparsity_and_slope(self) -> None:
+        learner = CBPMultiHeadMLPLearner(
             n_heads=1,
-            hidden_sizes=(8,),
-            sparsity=0.0,
-        ).to_config()
-        config["hidden_sizes"] = hidden_sizes
-
-        with pytest.raises(ValueError, match="hidden_sizes"):
-            CBPMultiHeadMLPLearner.from_config(config)
-
-    @pytest.mark.parametrize("decay", [True, float("nan"), float("inf"), -0.1, 1.1])
-    def test_from_config_rejects_invalid_per_head_trace_decay(self, decay: object):
-        config = CBPMultiHeadMLPLearner(
-            n_heads=1,
-            hidden_sizes=(8,),
-            sparsity=0.0,
-        ).to_config()
-        config["per_head_gamma_lamda"] = [decay]
-
-        with pytest.raises(ValueError, match=r"per_head_gamma_lamda\[0\]"):
-            CBPMultiHeadMLPLearner.from_config(config)
+            hidden_sizes=(4,),
+            sparsity=np.float64(0.25),
+            leaky_relu_slope=np.float32(0.02),
+            use_layer_norm=False,
+        )
+        assert type(learner._sparsity) is float
+        assert type(learner._leaky_relu_slope) is float
+        assert learner._sparsity == pytest.approx(0.25)
+        assert learner._leaky_relu_slope == pytest.approx(0.02)
+        assert learner._use_layer_norm is False

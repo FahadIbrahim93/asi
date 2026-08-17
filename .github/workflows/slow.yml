@@ -1,0 +1,132 @@
+---
+name: slow tests
+
+"on":
+  workflow_dispatch:
+
+concurrency:
+  group: slow-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  SLOW_SHARD_COUNT: "4"
+  XLA_PYTHON_CLIENT_PREALLOCATE: "false"
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up locked Python 3.12
+        uses: ./.github/actions/setup-locked-python
+        with:
+          python-version: "3.12"
+          extras: --extra dev --extra gymnasium --extra forager
+
+      - name: Collect selected slow tests
+        run: |
+          uv run --no-sync python -m pytest tests \
+            --collect-only \
+            -q \
+            --disable-warnings \
+            -m "slow and not package" \
+            -o addopts="" \
+            --strict-config \
+            --strict-markers \
+            > "$RUNNER_TEMP/slow-nodeids.txt"
+
+      - name: Build a balanced nonempty slow matrix
+        id: plan
+        run: |
+          uv run --no-sync python .github/scripts/plan_pytest_shards.py \
+            --nodeids "$RUNNER_TEMP/slow-nodeids.txt" \
+            --shards "$SLOW_SHARD_COUNT" \
+            --python-version 3.12 \
+            --label "slow, non-package"
+
+  slow:
+    name: slow py${{ matrix.python }} shard ${{ matrix.shard }}
+    needs: discover
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.discover.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up locked Python ${{ matrix.python }}
+        uses: ./.github/actions/setup-locked-python
+        with:
+          python-version: ${{ matrix.python }}
+          extras: --extra dev --extra gymnasium --extra forager
+
+      - name: Run selected slow tests
+        env:
+          JUNIT_PATH: >-
+            ${{ runner.temp }}/junit-slow-py${{ matrix.python }}-shard-${{
+            matrix.shard }}.xml
+          TEST_FILES_JSON: ${{ matrix.files_json }}
+        run: |
+          uv run --no-sync python - <<'PY'
+          import json
+          import os
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          files = json.loads(os.environ["TEST_FILES_JSON"])
+          if not files:
+              raise SystemExit("the slow plan emitted an empty shard")
+          for value in files:
+              path = Path(value)
+              if path.parts[0] != "tests" or not path.is_file():
+                  raise SystemExit(f"invalid selected slow file: {value}")
+
+          command = [
+              sys.executable,
+              "-m",
+              "pytest",
+              *files,
+              "-q",
+              "-rs",
+              "-o",
+              "addopts=",
+              "--strict-config",
+              "--strict-markers",
+              "-m",
+              "slow and not package",
+              "-n",
+              "2",
+              "--dist",
+              "loadfile",
+              "--durations=50",
+              "--durations-min=1.0",
+              f"--junitxml={os.environ['JUNIT_PATH']}",
+          ]
+          print(
+              f"running {len(files)} files; planned selected nodes: "
+              "${{ matrix.node_count }}",
+              flush=True,
+          )
+          raise SystemExit(subprocess.run(command, check=False).returncode)
+          PY
+
+      - name: Upload slow timing evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: >-
+            junit-slow-py${{ matrix.python }}-shard-${{ matrix.shard }}
+          path: >-
+            ${{ runner.temp }}/junit-slow-py${{ matrix.python }}-shard-${{
+            matrix.shard }}.xml
+          if-no-files-found: warn
+          retention-days: 14

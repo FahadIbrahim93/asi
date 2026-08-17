@@ -18,12 +18,14 @@ Search executions happen through the CLI, never inside pytest.
 """
 
 import dataclasses
+import re
 
 import jax.numpy as jnp
 import jax.random as jr
 import numpy as np
 import pytest
 
+import alberta_framework.benchmarks.rule_discovery as rule_discovery
 from alberta_framework.benchmarks.ipmnist_screening import (
     _make_upgd_shiftnorm_learner,
     _sigma0_ext_hp,
@@ -40,14 +42,17 @@ from alberta_framework.benchmarks.rule_discovery import (
     decode_genome,
     describe_genome,
     evaluate_population,
+    evaluate_suite,
     genome_from_config,
     init_rule_state,
     mutate,
     penalized_fitness,
     random_genomes,
     rule_step,
+    run_search,
     run_stream,
     seed_genomes,
+    tune_champion_baseline,
 )
 from alberta_framework.benchmarks.upgd_ipmnist import IPMNISTConfig, init_mlp_params
 
@@ -344,6 +349,308 @@ def test_evaluate_population_is_paired_and_bounded() -> None:
     assert accuracy.shape == (2,)
     assert float(accuracy[0]) == pytest.approx(float(accuracy[1]), abs=1e-7)
     assert 0.0 <= float(accuracy[0]) <= 1.0
+
+
+@pytest.mark.parametrize(
+    "seeds",
+    [
+        (),
+        (0, 0),
+        (True,),
+        (np.int64(0),),
+        (0.0,),
+        (-1,),
+        (2**32,),
+        (0, 2**32),
+    ],
+)
+def test_evaluate_population_rejects_noncanonical_seed_schedules_before_materialization(
+    monkeypatch: pytest.MonkeyPatch,
+    seeds: tuple[object, ...],
+) -> None:
+    def unexpected_materialization(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise AssertionError("invalid seeds reached stream materialization")
+
+    monkeypatch.setattr(rule_discovery, "_materialize_eval", unexpected_materialization)
+    with pytest.raises(ValueError, match="seeds"):
+        evaluate_population(
+            jnp.zeros((1, GENOME_SIZE), dtype=jnp.float32),
+            MICRO_SUITE["M1"],
+            seeds=seeds,  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [(2, 16), (2, GENOME_SIZE + 1), (GENOME_SIZE,), (1, 2, GENOME_SIZE)],
+)
+def test_evaluate_population_rejects_malformed_genome_shapes_before_materialization(
+    monkeypatch: pytest.MonkeyPatch, shape: tuple[int, ...]
+) -> None:
+    def unexpected_materialization(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise AssertionError("malformed genomes reached stream materialization")
+
+    monkeypatch.setattr(rule_discovery, "_materialize_eval", unexpected_materialization)
+    expected = f"genomes must have shape (n_genomes, {GENOME_SIZE}), got {shape}"
+    with pytest.raises(ValueError, match=rf"^{re.escape(expected)}$"):
+        evaluate_population(jnp.zeros(shape, dtype=jnp.float32), MICRO_SUITE["M1"], seeds=(0,))
+
+
+@pytest.mark.parametrize("invalid", [float("nan"), float("inf"), float("-inf")])
+def test_evaluate_population_rejects_nonfinite_genomes_before_materialization(
+    monkeypatch: pytest.MonkeyPatch, invalid: float
+) -> None:
+    def unexpected_materialization(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise AssertionError("non-finite genomes reached stream materialization")
+
+    monkeypatch.setattr(rule_discovery, "_materialize_eval", unexpected_materialization)
+    genomes = jnp.zeros((2, GENOME_SIZE), dtype=jnp.float32).at[1, 0].set(invalid)
+    with pytest.raises(ValueError, match="genomes must contain only finite values"):
+        evaluate_population(genomes, MICRO_SUITE["M1"], seeds=(0,))
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"n_random": True}, "n_random"),
+        ({"n_random": -1}, "n_random"),
+        ({"population": True}, "population"),
+        ({"population": 0}, "population"),
+        ({"generations": True}, "generations"),
+        ({"generations": -1}, "generations"),
+        ({"elite": True}, "elite"),
+        ({"elite": 0}, "elite"),
+        ({"top_k": True}, "top_k"),
+        ({"top_k": 0}, "top_k"),
+        ({"batch_size": True}, "batch_size"),
+        ({"batch_size": 0}, "batch_size"),
+    ],
+)
+def test_run_search_rejects_invalid_search_identities_before_genome_generation(
+    monkeypatch: pytest.MonkeyPatch, kwargs: dict[str, object], match: str
+) -> None:
+    def unexpected_generation(*args: object, **kw: object) -> None:
+        del args, kw
+        raise AssertionError("invalid search identity reached genome generation")
+
+    monkeypatch.setattr(rule_discovery, "seed_genomes", unexpected_generation)
+    monkeypatch.setattr(rule_discovery, "random_genomes", unexpected_generation)
+    payload: dict[str, object] = {
+        "n_random": 2,
+        "population": 2,
+        "generations": 0,
+        "elite": 1,
+        "eval_seeds": (0,),
+        "holdout_seeds": (101,),
+        "top_k": 1,
+        "batch_size": 2,
+    }
+    payload.update(kwargs)
+    with pytest.raises(ValueError, match=match):
+        run_search(**payload)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("n_tasks", [True, 0, -1, 1.5])
+def test_resolved_suite_rejects_invalid_n_tasks_identities(n_tasks: object) -> None:
+    with pytest.raises(ValueError, match="n_tasks"):
+        rule_discovery._resolved_suite(n_tasks, None)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("task_length", [True, 0, -1, 1.5])
+def test_resolved_suite_rejects_invalid_task_length_identities(
+    task_length: object,
+) -> None:
+    with pytest.raises(ValueError, match="task_length"):
+        rule_discovery._resolved_suite(None, task_length)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"n_random": True}, "n_random"),
+        ({"generations": True}, "generations"),
+        ({"children": True}, "children"),
+        ({"children": 0}, "children"),
+    ],
+)
+def test_tune_champion_baseline_rejects_invalid_search_identities(
+    monkeypatch: pytest.MonkeyPatch, kwargs: dict[str, object], match: str
+) -> None:
+    def unexpected_generation(*args: object, **kw: object) -> None:
+        del args, kw
+        raise AssertionError("invalid search identity reached genome generation")
+
+    monkeypatch.setattr(rule_discovery, "random_genomes", unexpected_generation)
+    with pytest.raises(ValueError, match=match):
+        tune_champion_baseline(
+            jr.key(0),
+            task_names=("M1",),
+            eval_seeds=(0,),
+            batch_size=2,
+            suite=MICRO_SUITE,
+            **kwargs,  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.parametrize("batch_size", [0, -4, True])
+def test_evaluate_population_rejects_non_positive_batch_size_before_materialization(
+    monkeypatch: pytest.MonkeyPatch, batch_size: object
+) -> None:
+    def unexpected_materialization(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise AssertionError("invalid batch_size reached stream materialization")
+
+    monkeypatch.setattr(rule_discovery, "_materialize_eval", unexpected_materialization)
+    with pytest.raises(ValueError, match="batch_size must be a positive built-in int"):
+        evaluate_population(
+            jnp.zeros((2, GENOME_SIZE), dtype=jnp.float32),
+            MICRO_SUITE["M1"],
+            seeds=(0,),
+            batch_size=batch_size,  # type: ignore[arg-type]
+        )
+
+
+def test_evaluate_population_preserves_distinct_seed_order_and_mean(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: list[int] = []
+
+    def materialize(
+        config: object, seed: int
+    ) -> tuple[jnp.ndarray, jnp.ndarray, dict[str, jnp.ndarray], int]:
+        del config
+        observed.append(seed)
+        return (
+            jnp.zeros((1, 1), dtype=jnp.float32),
+            jnp.zeros((1,), dtype=jnp.int32),
+            {},
+            1,
+        )
+
+    def batched_run(
+        genomes: jnp.ndarray,
+        params: dict[str, jnp.ndarray],
+        xs: jnp.ndarray,
+        ys: jnp.ndarray,
+        task_length: int,
+    ) -> tuple[jnp.ndarray, jnp.ndarray]:
+        del params, xs, ys, task_length
+        return (
+            jnp.full((genomes.shape[0],), observed[-1], dtype=jnp.float32),
+            jnp.zeros((genomes.shape[0], 1), dtype=jnp.float32),
+        )
+
+    monkeypatch.setattr(rule_discovery, "_materialize_eval", materialize)
+    monkeypatch.setattr(rule_discovery, "_batched_run", batched_run)
+    result = evaluate_population(
+        jnp.zeros((2, GENOME_SIZE), dtype=jnp.float32),
+        MICRO_SUITE["M1"],
+        seeds=(7, 3),
+    )
+
+    assert observed == [7, 3]
+    np.testing.assert_array_equal(result, np.asarray([5.0, 5.0]))
+
+
+@pytest.mark.parametrize("task_names", [("M1", "M1", "M2"), ("M2", "M2")])
+def test_evaluate_suite_rejects_duplicate_task_names_before_evaluation(
+    monkeypatch: pytest.MonkeyPatch, task_names: tuple[str, ...]
+) -> None:
+    def unexpected_evaluation(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise AssertionError("duplicate task names reached population evaluation")
+
+    monkeypatch.setattr(rule_discovery, "evaluate_population", unexpected_evaluation)
+    with pytest.raises(ValueError, match="task_names must contain unique task names"):
+        evaluate_suite(
+            jnp.zeros((1, GENOME_SIZE), dtype=jnp.float32),
+            task_names,
+            seeds=(0,),
+        )
+
+
+def test_evaluate_suite_is_an_equal_weight_task_mean(monkeypatch: pytest.MonkeyPatch) -> None:
+    per_task_value = {"M1": 0.05, "M2": 0.175}
+
+    def evaluation(genomes: jnp.ndarray, config: object, **kwargs: object) -> np.ndarray:
+        del kwargs
+        name = next(key for key, value in MICRO_SUITE.items() if value is config)
+        return np.full((genomes.shape[0],), per_task_value[name])
+
+    monkeypatch.setattr(rule_discovery, "evaluate_population", evaluation)
+    mean, per_task = evaluate_suite(
+        jnp.zeros((2, GENOME_SIZE), dtype=jnp.float32), ("M1", "M2"), seeds=(0,)
+    )
+    np.testing.assert_allclose(mean, np.asarray([0.1125, 0.1125]))
+    assert set(per_task) == {"M1", "M2"}
+
+
+@pytest.mark.parametrize(
+    ("flag", "values", "name"),
+    [
+        ("--tasks", ("M1", "M1"), "task_names"),
+        ("--holdout-tasks", ("M1p", "M1p"), "holdout_names"),
+    ],
+)
+def test_cli_rejects_duplicate_task_names_before_search(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, flag: str, values: tuple[str, ...], name: str
+) -> None:
+    def unexpected_search(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise AssertionError("duplicate task names reached genome generation")
+
+    monkeypatch.setattr(rule_discovery, "random_genomes", unexpected_search)
+    output = tmp_path / "must-not-exist.json"
+    argv = [
+        "search", "--out", str(output), "--n-random", "2", "--population", "2",
+        "--generations", "0", "--elite", "1", "--eval-seeds", "0", "--holdout-seeds", "101",
+        "--tasks", "M1", "--holdout-tasks", "M1p",
+    ]
+    index = argv.index(flag)
+    argv[index + 1 : index + 2] = list(values)
+    with pytest.raises(ValueError, match=f"{name} must contain unique task names"):
+        rule_discovery.main(argv)
+    assert not output.exists()
+
+
+def test_cli_rejects_duplicate_evaluation_seeds_before_search(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def unexpected_search(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise AssertionError("invalid CLI seeds reached genome generation")
+
+    monkeypatch.setattr(rule_discovery, "random_genomes", unexpected_search)
+    output = tmp_path / "must-not-exist.json"
+    with pytest.raises(ValueError, match="eval_seeds.*unique"):
+        rule_discovery.main(
+            [
+                "search",
+                "--out",
+                str(output),
+                "--n-random",
+                "2",
+                "--population",
+                "2",
+                "--generations",
+                "0",
+                "--elite",
+                "1",
+                "--eval-seeds",
+                "0",
+                "0",
+                "--holdout-seeds",
+                "101",
+                "--tasks",
+                "M1",
+                "--holdout-tasks",
+                "M1p",
+            ]
+        )
+    assert not output.exists()
 
 
 @pytest.mark.integration

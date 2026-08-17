@@ -26,6 +26,9 @@ Calibration (measured on this machine, scripts in the session scratchpad):
   superset always and strictness on >= 50 draws.
 """
 
+import warnings
+from typing import Any
+
 import numpy as np
 import pytest
 
@@ -74,6 +77,26 @@ class TestComputeStatistics:
         assert s.ci_upper == pytest.approx(4.2)
         assert s.n_seeds == 1
 
+    def test_empty_values_rejected_without_warnings(self) -> None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with pytest.raises(ValueError, match=r"^values must be non-empty$"):
+                compute_statistics([])
+
+    def test_empty_array_rejected_without_warnings(self) -> None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with pytest.raises(ValueError, match=r"^values must be non-empty$"):
+                compute_statistics(np.array([], dtype=np.float64))
+
+    @pytest.mark.parametrize("poison", [float("nan"), float("inf"), float("-inf")])
+    def test_nonfinite_values_rejected_without_warnings(self, poison: float) -> None:
+        """A NaN or inf seed must not become a NaN mean/CI that looks published."""
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with pytest.raises(ValueError, match=r"^values must be finite$"):
+                compute_statistics([1.0, poison, 2.0])
+
     def test_empirical_ci_coverage(self) -> None:
         """95% t-CI covers the true mean ~95% of the time.
 
@@ -98,15 +121,230 @@ class TestComputeStatistics:
         s99 = compute_statistics(values, confidence_level=0.99)
         assert (s99.ci_upper - s99.ci_lower) > (s95.ci_upper - s95.ci_lower)
 
-    @pytest.mark.parametrize("values", [[], [1.0, np.nan], [1.0, np.inf]])
-    def test_rejects_empty_or_nonfinite_samples(self, values) -> None:
-        with pytest.raises(ValueError):
-            compute_statistics(values)
+    @pytest.mark.parametrize("confidence_level", [0.0, 1.0, -0.1, 1.1, float("nan")])
+    def test_invalid_confidence_level_rejected_without_warnings(
+        self,
+        confidence_level: float,
+    ) -> None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with pytest.raises(ValueError, match="confidence_level.*strictly between 0 and 1"):
+                compute_statistics([4.2], confidence_level=confidence_level)
 
-    @pytest.mark.parametrize("level", [0.0, 1.0, -0.1, 1.1])
-    def test_rejects_invalid_confidence_levels(self, level: float) -> None:
-        with pytest.raises(ValueError, match="confidence_level"):
-            compute_statistics([1.0, 2.0], confidence_level=level)
+
+class TestSampleVectorContract:
+    """Every per-seed sample surface takes exactly one value per seed."""
+
+    _MATRIX = np.tile(np.arange(1.0, 6.0), (3, 1))  # (n_seeds=3, n_steps=5), rows identical
+
+    def test_compute_statistics_rejects_a_seed_by_step_matrix(self) -> None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with pytest.raises(
+                ValueError,
+                match=r"^values must be a one-dimensional sample vector \(one value per seed\), "
+                r"got shape \(3, 5\); reduce per seed first or use "
+                r"compute_timeseries_statistics$",
+            ):
+                compute_statistics(self._MATRIX)
+
+    def test_bootstrap_ci_rejects_a_seed_by_step_matrix(self) -> None:
+        with pytest.raises(ValueError, match="values must be a one-dimensional sample vector"):
+            bootstrap_ci(self._MATRIX, n_bootstrap=10)
+
+    def test_cohens_d_rejects_seed_by_step_matrices(self) -> None:
+        with pytest.raises(
+            ValueError, match="values_a must be a one-dimensional sample vector"
+        ):
+            cohens_d(self._MATRIX, np.arange(1.0, 6.0))
+        with pytest.raises(
+            ValueError, match="values_b must be a one-dimensional sample vector"
+        ):
+            cohens_d(np.arange(1.0, 6.0), self._MATRIX)
+
+    @pytest.mark.parametrize(
+        "comparison",
+        [
+            lambda a, b: ttest_comparison(a, b),
+            lambda a, b: ttest_comparison(a, b, paired=True),
+            mann_whitney_comparison,
+            wilcoxon_comparison,
+        ],
+        ids=["ttest", "paired-ttest", "mann_whitney", "wilcoxon"],
+    )
+    def test_comparisons_reject_seed_by_step_matrices(self, comparison: Any) -> None:
+        vector = np.arange(1.0, 6.0) + 0.5
+        with pytest.raises(
+            ValueError, match="values_a must be a one-dimensional sample vector"
+        ):
+            comparison(self._MATRIX, vector)
+        with pytest.raises(
+            ValueError, match="values_b must be a one-dimensional sample vector"
+        ):
+            comparison(vector, self._MATRIX)
+
+    def test_scalar_and_zero_dimensional_inputs_are_rejected(self) -> None:
+        with pytest.raises(ValueError, match="values must be a one-dimensional sample vector"):
+            compute_statistics(np.asarray(4.2))
+        with pytest.raises(ValueError, match="values must be a one-dimensional sample vector"):
+            bootstrap_ci(np.asarray(4.2), n_bootstrap=10)
+
+
+class TestComparisonsRejectNonFiniteSamples:
+    """A poisoned seed must raise, not become p=nan / significant=False."""
+
+    @pytest.mark.parametrize("poison", [float("nan"), float("inf"), float("-inf")])
+    @pytest.mark.parametrize(
+        "comparison",
+        [
+            lambda a, b: ttest_comparison(a, b, paired=False),
+            lambda a, b: ttest_comparison(a, b, paired=True),
+            mann_whitney_comparison,
+            wilcoxon_comparison,
+            cohens_d,
+        ],
+        ids=["ttest", "paired-ttest", "mann_whitney", "wilcoxon", "cohens_d"],
+    )
+    def test_nonfinite_sample_rejected_without_warnings(
+        self, comparison: Any, poison: float
+    ) -> None:
+        clean = np.asarray([1.0, 2.0, 3.0, 4.5])
+        poisoned = np.asarray([2.0, poison, 3.0, 5.0])
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with pytest.raises(ValueError, match=r"^values_b must be finite$"):
+                comparison(clean, poisoned)
+            with pytest.raises(ValueError, match=r"^values_a must be finite$"):
+                comparison(poisoned, clean)
+
+    def test_pairwise_comparisons_rejects_a_poisoned_seed(self) -> None:
+        a = _make_seeded_aggregated("a", [0, 1, 2], [0.0, 1.0, 2.0])
+        b = _make_seeded_aggregated("b", [0, 1, 2], [1.0, float("nan"), 3.0])
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with pytest.raises(ValueError, match="must be finite"):
+                pairwise_comparisons({"a": a, "b": b}, test="ttest", window=1)
+
+
+class _FloatClassSpoof:
+    """Plain object whose reported ``__class__`` fools ``isinstance``."""
+
+    def __repr__(self) -> str:
+        """Keep parametrized node IDs stable across xdist worker processes."""
+        return "_FloatClassSpoof()"
+
+    @property
+    def __class__(self) -> type[float]:
+        return float
+
+    def __float__(self) -> float:
+        return 0.05
+
+
+class TestProbabilityContracts:
+    """Decision thresholds and published p-values must be real probabilities."""
+
+    _A = np.asarray([1.0, 2.0, 4.0, 8.0])
+    _B = np.asarray([1.5, 2.5, 3.5, 6.0])
+
+    @pytest.mark.parametrize(
+        "alpha",
+        [
+            float("nan"),
+            float("inf"),
+            float("-inf"),
+            0.0,
+            1.0,
+            -0.1,
+            1.1,
+            True,
+            "0.05",
+            None,
+            _FloatClassSpoof(),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "comparison",
+        [
+            lambda a, b, alpha: ttest_comparison(a, b, paired=False, alpha=alpha),
+            lambda a, b, alpha: ttest_comparison(a, b, paired=True, alpha=alpha),
+            lambda a, b, alpha: mann_whitney_comparison(a, b, alpha=alpha),
+            lambda a, b, alpha: wilcoxon_comparison(a, b, alpha=alpha),
+        ],
+        ids=["independent-ttest", "paired-ttest", "mann-whitney", "wilcoxon"],
+    )
+    def test_comparisons_reject_invalid_alpha(self, comparison: Any, alpha: Any) -> None:
+        with pytest.raises(
+            ValueError,
+            match=r"^alpha must be a finite real strictly between 0 and 1$",
+        ):
+            comparison(self._A, self._B, alpha)
+
+    @pytest.mark.parametrize("correction", [bonferroni_correction, holm_correction])
+    @pytest.mark.parametrize(
+        "alpha",
+        [
+            float("nan"),
+            float("inf"),
+            float("-inf"),
+            0.0,
+            1.0,
+            -0.1,
+            1.1,
+            True,
+            _FloatClassSpoof(),
+        ],
+    )
+    def test_corrections_reject_invalid_alpha_even_for_an_empty_family(
+        self, correction: Any, alpha: Any
+    ) -> None:
+        with pytest.raises(
+            ValueError,
+            match=r"^alpha must be a finite real strictly between 0 and 1$",
+        ):
+            correction([], alpha=alpha)
+
+    @pytest.mark.parametrize("correction", [bonferroni_correction, holm_correction])
+    @pytest.mark.parametrize(
+        "invalid_p",
+        [
+            float("nan"),
+            float("inf"),
+            float("-inf"),
+            -0.1,
+            1.1,
+            True,
+            "0.1",
+            None,
+            _FloatClassSpoof(),
+        ],
+    )
+    def test_corrections_reject_invalid_p_values(
+        self, correction: Any, invalid_p: Any
+    ) -> None:
+        with pytest.raises(
+            ValueError,
+            match=r"^p_values\[1\] must be a finite real in \[0, 1\]$",
+        ):
+            correction([0.01, invalid_p, 0.2], alpha=0.05)
+
+    @pytest.mark.parametrize("correction", [bonferroni_correction, holm_correction])
+    def test_corrections_accept_exact_probability_boundaries(self, correction: Any) -> None:
+        result = correction([0.0, 1.0], alpha=0.05)
+        significant = result[0] if isinstance(result, tuple) else result
+        assert significant == [True, False]
+
+    def test_comparison_rejects_a_nonfinite_scipy_p_value(self) -> None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            with pytest.raises(
+                ValueError,
+                match=(
+                    r"^p_value returned by independent t-test must be a finite real "
+                    r"in \[0, 1\]$"
+                ),
+            ):
+                ttest_comparison([1.0, 1.0], [1.0, 1.0], paired=False)
 
 
 class TestTimeseriesStatistics:
@@ -122,12 +360,56 @@ class TestTimeseriesStatistics:
             assert lo[step] == pytest.approx(s.ci_lower)
             assert hi[step] == pytest.approx(s.ci_upper)
 
-    def test_single_seed_has_degenerate_finite_interval(self) -> None:
-        arr = np.array([[1.0, 2.0, 3.0]])
-        mean, lo, hi = compute_timeseries_statistics(arr)
-        np.testing.assert_array_equal(mean, arr[0])
+    def test_zero_seed_matrix_rejected_without_warnings(self) -> None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with pytest.raises(
+                ValueError, match=r"^metric_array must contain at least one seed row$"
+            ):
+                compute_timeseries_statistics(np.empty((0, 3)))
+
+    def test_nonfinite_seed_rejected_without_warnings(self) -> None:
+        arr = np.array([[1.0, 2.0], [np.nan, 3.0]], dtype=np.float64)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with pytest.raises(ValueError, match=r"^metric_array must be finite$"):
+                compute_timeseries_statistics(arr)
+
+    def test_single_seed_returns_finite_point_interval(self) -> None:
+        """One seed yields the point trajectory, finite, without any warning."""
+        arr = np.asarray([[1.0, 2.0, 3.0]], dtype=np.float64)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            mean, lo, hi = compute_timeseries_statistics(arr, confidence_level=0.95)
+        assert mean.shape == lo.shape == hi.shape == (3,)
+        np.testing.assert_array_equal(mean, np.asarray([1.0, 2.0, 3.0]))
         np.testing.assert_array_equal(lo, mean)
         np.testing.assert_array_equal(hi, mean)
+        assert np.isfinite(mean).all()
+        assert np.isfinite(lo).all()
+        assert np.isfinite(hi).all()
+
+    def test_single_seed_matches_per_column_compute_statistics(self) -> None:
+        """The n_seeds == 1 contract agrees with the scalar degenerate case."""
+        rng = np.random.default_rng(8)
+        arr = rng.normal(0.0, 1.0, size=(1, 5))
+        mean, lo, hi = compute_timeseries_statistics(arr, confidence_level=0.95)
+        for step in range(5):
+            s = compute_statistics(arr[:, step], confidence_level=0.95)
+            assert mean[step] == pytest.approx(s.mean)
+            assert lo[step] == pytest.approx(s.ci_lower)
+            assert hi[step] == pytest.approx(s.ci_upper)
+
+    @pytest.mark.parametrize("confidence_level", [0.0, 1.0, -0.1, 1.1, float("nan")])
+    def test_invalid_confidence_level_rejected_without_warnings(
+        self,
+        confidence_level: float,
+    ) -> None:
+        arr = np.asarray([[1.0, 2.0, 3.0]], dtype=np.float64)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with pytest.raises(ValueError, match="confidence_level.*strictly between 0 and 1"):
+                compute_timeseries_statistics(arr, confidence_level=confidence_level)
 
 
 class TestBootstrapCI:
@@ -146,12 +428,6 @@ class TestBootstrapCI:
         assert point == pytest.approx(3.0)
         assert lo <= point <= hi
 
-    def test_rejects_unknown_statistic_and_empty_resampling(self) -> None:
-        with pytest.raises(ValueError, match="statistic"):
-            bootstrap_ci([1.0, 2.0], statistic="mode")
-        with pytest.raises(ValueError, match="n_bootstrap"):
-            bootstrap_ci([1.0, 2.0], n_bootstrap=0)
-
     def test_empirical_coverage(self) -> None:
         """Percentile-bootstrap 95% CI coverage stays near nominal.
 
@@ -169,6 +445,80 @@ class TestBootstrapCI:
             covered += int(lo <= true_mean <= hi)
         coverage = covered / n_reps
         assert 0.85 <= coverage <= 0.99, f"coverage {coverage} outside [0.85, 0.99]"
+
+    @pytest.mark.parametrize(
+        "empty", [[], np.array([], dtype=np.float64)], ids=["list", "ndarray"]
+    )
+    def test_empty_input_rejected(self, empty: list[float] | np.ndarray) -> None:
+        """Empty input raises a descriptive ValueError, with no RuntimeWarning.
+
+        Before the guard, ``np.mean([])`` warned and the helper returned
+        ``(nan, nan, nan)`` — a NaN interval indistinguishable from a real CI.
+        """
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with pytest.raises(ValueError, match="empty"):
+                bootstrap_ci(empty)
+
+    @pytest.mark.parametrize("poison", [float("nan"), float("inf"), float("-inf")])
+    def test_nonfinite_values_rejected_without_warnings(self, poison: float) -> None:
+        """A poisoned seed must not become a non-finite bootstrap estimate or CI."""
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with pytest.raises(ValueError, match=r"^values must be finite$"):
+                bootstrap_ci([1.0, poison, 2.0], n_bootstrap=20, seed=0)
+
+    @pytest.mark.parametrize("statistic", ["typo", "Mean", ""])
+    def test_unknown_statistic_rejected_without_warnings(self, statistic: str) -> None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with pytest.raises(ValueError, match="statistic.*mean.*median"):
+                bootstrap_ci([1.0, 2.0, 100.0], statistic=statistic, n_bootstrap=10)
+
+    @pytest.mark.parametrize("n_bootstrap", [0, -1])
+    def test_nonpositive_bootstrap_count_rejected_without_warnings(
+        self,
+        n_bootstrap: int,
+    ) -> None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with pytest.raises(ValueError, match="n_bootstrap.*positive"):
+                bootstrap_ci([1.0, 2.0, 3.0], n_bootstrap=n_bootstrap)
+
+    @pytest.mark.parametrize("n_bootstrap", [True, False, 1.0, float("nan"), float("inf")])
+    def test_bool_and_noninteger_bootstrap_count_rejected_without_warnings(
+        self,
+        n_bootstrap: object,
+    ) -> None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with pytest.raises(ValueError, match="n_bootstrap.*positive integer"):
+                bootstrap_ci([1.0, 2.0, 3.0], n_bootstrap=n_bootstrap, seed=0)  # type: ignore[arg-type]
+
+    def test_hostile_bootstrap_count_is_rejected_without_hooks(self) -> None:
+        class HostileInt(int):
+            def __index__(self) -> int:  # pragma: no cover
+                raise AssertionError("index hook executed")
+
+            def __repr__(self) -> str:  # pragma: no cover
+                raise AssertionError("repr hook executed")
+
+        with pytest.raises(ValueError, match="n_bootstrap.*positive integer"):
+            bootstrap_ci([1.0, 2.0, 3.0], n_bootstrap=HostileInt(10))
+
+    @pytest.mark.parametrize("confidence_level", [0.0, 1.0, -0.1, 1.1, float("nan")])
+    def test_invalid_confidence_level_rejected_without_warnings(
+        self,
+        confidence_level: float,
+    ) -> None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with pytest.raises(ValueError, match="confidence_level.*strictly between 0 and 1"):
+                bootstrap_ci(
+                    [4.2],
+                    confidence_level=confidence_level,
+                    n_bootstrap=10,
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -222,6 +572,27 @@ class TestPairedTests:
         # every a_i < b_i: effect size sign must reflect a < b
         assert res.effect_size < 0.0
 
+    def test_paired_ttest_rejects_identical_samples(self) -> None:
+        values = [0.91, 0.88, 0.95]
+        with pytest.raises(
+            ValueError,
+            match=r"^Paired comparison 'pin' vs 'base' has identical samples; "
+            r"the paired t statistic is undefined$",
+        ):
+            ttest_comparison(values, list(values), paired=True, method_a="pin", method_b="base")
+
+    def test_constant_nonzero_shift_stays_out_of_scope(self) -> None:
+        res = ttest_comparison([1.0, 2.0, 3.0], [0.5, 1.5, 2.5], paired=True)
+        assert np.isposinf(res.statistic)
+        assert res.p_value == 0.0
+
+    def test_unpaired_identical_samples_stay_out_of_scope(self) -> None:
+        values = [0.91, 0.88, 0.95]
+        res = ttest_comparison(values, list(values), paired=False)
+        assert res.test_name == "independent t-test"
+        assert res.p_value == pytest.approx(1.0)
+        assert not res.significant
+
     def test_unpaired_ttest_separated_groups(self) -> None:
         rng = np.random.default_rng(5)
         a = rng.normal(10.0, 0.5, size=15)
@@ -240,12 +611,164 @@ class TestPairedTests:
         assert res.significant
 
 
+class TestIdenticalWilcoxonRejection:
+    """All-zero paired differences fail closed before version-dependent SciPy behavior."""
+
+    @pytest.mark.parametrize("values", [[0.91], [0.91, 0.88, 0.95]])
+    def test_wilcoxon_rejects_identical_samples_without_warning(
+        self, values: list[float]
+    ) -> None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with pytest.raises(
+                ValueError,
+                match=r"^Paired comparison 'pin' vs 'base' has identical samples; "
+                r"the Wilcoxon signed-rank statistic is undefined$",
+            ):
+                wilcoxon_comparison(
+                    values,
+                    list(values),
+                    method_a="pin",
+                    method_b="base",
+                )
+
+    def test_constant_nonzero_shift_stays_defined(self) -> None:
+        result = wilcoxon_comparison([1.0, 2.0, 3.0], [0.5, 1.5, 2.5])
+
+        assert result.test_name == "Wilcoxon signed-rank"
+        assert result.statistic == pytest.approx(0.0)
+        assert result.p_value < 1.0
+        assert result.effect_size == cohens_d([1.0, 2.0, 3.0], [0.5, 1.5, 2.5])
+
+
+class TestOneSampleRejection:
+    """Undefined one-sample contracts reject without narrowing valid t-tests (#35).
+
+    A 1-vs-1 comparison has zero pooled degrees of freedom, so neither the
+    paired/independent t statistic nor Cohen's d is defined. The helpers must
+    reject before SciPy instead of emitting RuntimeWarning and crashing with
+    ZeroDivisionError. An equal-variance independent t-test with one singleton
+    group and one multi-value group has positive pooled degrees of freedom and
+    stays defined. Mann-Whitney keeps its defined length-1 behavior.
+    """
+
+    def test_cohens_d_length_one_both_groups_raises(self) -> None:
+        with pytest.raises(ValueError, match="positive pooled degrees of freedom"):
+            cohens_d([1.0], [2.0])
+
+    def test_cohens_d_singleton_group_with_positive_pooled_df_stays_defined(self) -> None:
+        expected = 3.0 / np.sqrt(2.0)
+        assert cohens_d([1.0], [2.0, 3.0]) == pytest.approx(-expected)
+        assert cohens_d([2.0, 3.0], [1.0]) == pytest.approx(expected)
+
+    @pytest.mark.parametrize("values_a, values_b", [([], [1.0, 2.0]), ([1.0, 2.0], [])])
+    def test_cohens_d_empty_group_raises_without_warning(
+        self,
+        values_a: list[float],
+        values_b: list[float],
+    ) -> None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with pytest.raises(ValueError, match="non-empty groups"):
+                cohens_d(values_a, values_b)
+
+    def test_paired_ttest_length_one_raises_without_runtime_warning(self) -> None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with pytest.raises(ValueError, match="at least 2"):
+                ttest_comparison([1.0], [2.0], paired=True)
+
+    def test_paired_ttest_mismatched_lengths_raise_before_scipy(self) -> None:
+        with pytest.raises(ValueError, match="equal-length"):
+            ttest_comparison([1.0, 2.0], [1.0, 2.0, 3.0], paired=True)
+
+    def test_wilcoxon_mismatched_lengths_raise_before_scipy(self) -> None:
+        with pytest.raises(ValueError, match="equal-length"):
+            wilcoxon_comparison([1.0, 2.0], [1.0, 2.0, 3.0])
+
+    @pytest.mark.parametrize("values_a, values_b", [([], []), ([1.0], [2.0])])
+    def test_wilcoxon_requires_two_pairs_without_warning(
+        self,
+        values_a: list[float],
+        values_b: list[float],
+    ) -> None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with pytest.raises(ValueError, match="at least 2 pairs"):
+                wilcoxon_comparison(values_a, values_b)
+
+    def test_unpaired_ttest_length_one_raises_without_runtime_warning(self) -> None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with pytest.raises(ValueError, match="positive pooled degrees of freedom"):
+                ttest_comparison([1.0], [2.0], paired=False)
+
+    def test_unpaired_ttest_singleton_with_positive_pooled_df_stays_defined(self) -> None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            forward = ttest_comparison([1.0], [2.0, 3.0], paired=False)
+            reverse = ttest_comparison([2.0, 3.0], [1.0], paired=False)
+        assert forward.statistic == pytest.approx(-np.sqrt(3.0))
+        assert forward.p_value == pytest.approx(1.0 / 3.0)
+        assert forward.effect_size == pytest.approx(-3.0 / np.sqrt(2.0))
+        assert reverse.statistic == pytest.approx(-forward.statistic)
+        assert reverse.p_value == pytest.approx(forward.p_value)
+        assert reverse.effect_size == pytest.approx(-forward.effect_size)
+
+    @pytest.mark.parametrize("values_a, values_b", [([], [1.0, 2.0]), ([1.0, 2.0], [])])
+    def test_unpaired_ttest_empty_group_raises_without_warning(
+        self,
+        values_a: list[float],
+        values_b: list[float],
+    ) -> None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with pytest.raises(ValueError, match="non-empty groups"):
+                ttest_comparison(values_a, values_b, paired=False)
+
+    @pytest.mark.parametrize(
+        ("values_a", "values_b"),
+        [
+            ([], [1.0, 2.0]),
+            ([1.0, 2.0], []),
+            ([], []),
+            (np.array([], dtype=np.float64), np.array([1.0, 2.0], dtype=np.float64)),
+            (np.array([1.0, 2.0], dtype=np.float64), np.array([], dtype=np.float64)),
+        ],
+    )
+    def test_mann_whitney_empty_group_raises_without_warning(
+        self, values_a: list[float] | np.ndarray, values_b: list[float] | np.ndarray
+    ) -> None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with pytest.raises(ValueError, match="non-empty groups"):
+                mann_whitney_comparison(values_a, values_b)
+
+    def test_mann_whitney_length_one_contract_unchanged(self) -> None:
+        res = mann_whitney_comparison([1.0], [2.0])
+        assert res.p_value == pytest.approx(1.0)
+        assert res.effect_size == pytest.approx(-1.0)
+
+    def test_mann_whitney_all_ties_have_the_exact_null_result(self) -> None:
+        """Zero asymptotic tie variance is an exact p=1 null, never p=nan."""
+        res = mann_whitney_comparison([1.0, 1.0], [1.0, 1.0, 1.0])
+        assert res.statistic == pytest.approx(3.0)
+        assert res.p_value == 1.0
+        assert res.effect_size == 0.0
+        assert not res.significant
+
+
 # ---------------------------------------------------------------------------
 # 3. Multiple-comparison corrections
 # ---------------------------------------------------------------------------
 
 
 class TestCorrections:
+    def test_bonferroni_empty_p_values(self) -> None:
+        significant, corrected_alpha = bonferroni_correction([], alpha=0.05)
+        assert significant == []
+        assert corrected_alpha == 0.05
+
     def test_bonferroni_hand_computed(self) -> None:
         significant, corrected_alpha = bonferroni_correction([0.01, 0.02, 0.04], alpha=0.05)
         assert corrected_alpha == pytest.approx(0.05 / 3)
@@ -310,13 +833,6 @@ class TestCorrections:
         assert holm_correction(huge, alpha=0.05) == [False, False, False]
         assert bonferroni_correction(huge, alpha=0.05)[0] == [False, False, False]
 
-    def test_corrections_reject_empty_or_invalid_probabilities(self) -> None:
-        for correction in (bonferroni_correction, holm_correction):
-            with pytest.raises(ValueError, match="must not be empty"):
-                correction([])
-            with pytest.raises(ValueError, match="probabilities"):
-                correction([0.1, 1.1])
-
 
 # ---------------------------------------------------------------------------
 # 4. Effect sizes: hand-computed fixtures
@@ -336,9 +852,24 @@ class TestEffectSizes:
     def test_cohens_d_zero_variance_returns_zero(self) -> None:
         assert cohens_d([3.0, 3.0, 3.0], [3.0, 3.0, 3.0]) == 0.0
 
-    def test_cohens_d_rejects_distinct_constant_samples(self) -> None:
-        with pytest.raises(ValueError, match="undefined"):
-            cohens_d([3.0, 3.0, 3.0], [2.0, 2.0, 2.0])
+    @pytest.mark.parametrize(
+        "values_a, values_b, expected_sign",
+        [
+            ([2.0, 2.0], [1.0, 1.0], 1.0),
+            ([1.0, 1.0], [2.0, 2.0], -1.0),
+            ([2.0], [1.0, 1.0], 1.0),
+            ([1.0, 1.0], [2.0], -1.0),
+        ],
+    )
+    def test_cohens_d_unequal_zero_variance_groups_returns_signed_infinity(
+        self,
+        values_a: list[float],
+        values_b: list[float],
+        expected_sign: float,
+    ) -> None:
+        effect = cohens_d(values_a, values_b)
+        assert np.isinf(effect)
+        assert np.sign(effect) == expected_sign
 
     def test_cohens_d_positive_means_a_greater(self) -> None:
         rng = np.random.default_rng(7)
@@ -383,6 +914,20 @@ def _make_aggregated(name: str, level: float, seed: int, n_seeds: int = 12) -> A
         config_name=name,
         seeds=list(range(n_seeds)),
         metric_arrays={"squared_error": arr},
+        summary={},
+    )
+
+
+def _make_seeded_aggregated(
+    name: str,
+    seeds: list[int],
+    values: list[float],
+) -> AggregatedResults:
+    """AggregatedResults with one metric value per explicitly identified seed."""
+    return AggregatedResults(
+        config_name=name,
+        seeds=seeds,
+        metric_arrays={"squared_error": np.asarray(values, dtype=np.float64)[:, None]},
         summary={},
     )
 
@@ -435,13 +980,167 @@ class TestPairwiseComparisons:
         with pytest.raises(ValueError, match="Unknown correction"):
             pairwise_comparisons(self._results(), correction="fdr")
 
+    @pytest.mark.parametrize("window", [0, -1])
+    def test_nonpositive_window_rejected_without_warnings(self, window: int) -> None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with pytest.raises(ValueError, match="window.*positive"):
+                pairwise_comparisons(self._results(), window=window)
+
+    @pytest.mark.parametrize("window", [True, False, 1.0, float("nan"), float("inf")])
+    def test_bool_and_noninteger_window_rejected_without_warnings(
+        self,
+        window: object,
+    ) -> None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with pytest.raises(ValueError, match="window.*positive integer"):
+                pairwise_comparisons(self._results(), window=window)  # type: ignore[arg-type]
+
+    def test_zero_step_metric_rejected_without_warnings(self) -> None:
+        empty_steps = AggregatedResults(
+            config_name="empty_steps",
+            seeds=[0, 1],
+            metric_arrays={"squared_error": np.empty((2, 0), dtype=np.float64)},
+            summary={},
+        )
+        valid = _make_seeded_aggregated("valid", [0, 1], [1.0, 2.0])
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with pytest.raises(ValueError, match="at least one metric step"):
+                pairwise_comparisons({"empty_steps": empty_steps, "valid": valid})
+
     def test_non_aggregated_results_raises_type_error(self) -> None:
         with pytest.raises(TypeError):
             pairwise_comparisons({"a": object(), "b": object()})  # type: ignore[dict-item]
 
-    def test_paired_comparison_rejects_misaligned_seeds(self) -> None:
-        results = self._results()
-        bad = results["bad"]
-        results["bad"] = bad._replace(seeds=list(reversed(bad.seeds)))
-        with pytest.raises(ValueError, match="seed ordering"):
-            pairwise_comparisons(results)
+    @pytest.mark.parametrize("test", ["ttest", "wilcoxon"])
+    @pytest.mark.parametrize("correction", ["bonferroni", "holm"])
+    def test_paired_tests_align_reordered_equal_seed_sets(
+        self,
+        test: str,
+        correction: str,
+    ) -> None:
+        a = _make_seeded_aggregated("a", [0, 1, 2, 3], [0.0, 10.0, 20.0, 30.0])
+        aligned_b = _make_seeded_aggregated("b", [0, 1, 2, 3], [2.0, 11.0, 24.0, 28.0])
+        aligned_c = _make_seeded_aggregated("c", [0, 1, 2, 3], [1.0, 14.0, 16.0, 35.0])
+        reordered_b = _make_seeded_aggregated("b", [2, 0, 3, 1], [24.0, 2.0, 28.0, 11.0])
+        reordered_c = _make_seeded_aggregated("c", [1, 3, 0, 2], [14.0, 35.0, 1.0, 16.0])
+
+        aligned = pairwise_comparisons(
+            {"a": a, "b": aligned_b, "c": aligned_c},
+            test=test,
+            correction=correction,
+            window=1,
+        )
+        reordered = pairwise_comparisons(
+            {"a": a, "b": reordered_b, "c": reordered_c},
+            test=test,
+            correction=correction,
+            window=1,
+        )
+
+        assert reordered == aligned
+
+    def test_paired_ttest_aligns_adversarial_seed_order(self) -> None:
+        a = _make_seeded_aggregated("a", [0, 1, 2], [0.0, 10.0, 20.0])
+        reversed_b = _make_seeded_aggregated("b", [2, 1, 0], [21.0, 11.0, 1.0])
+
+        result = pairwise_comparisons({"a": a, "b": reversed_b}, window=1)[("a", "b")]
+
+        assert np.isneginf(result.statistic)
+        assert result.p_value == 0.0
+
+    @pytest.mark.parametrize("test", ["ttest", "wilcoxon"])
+    def test_paired_tests_reject_different_seed_sets(self, test: str) -> None:
+        a = _make_seeded_aggregated("a", [0, 1, 2], [0.0, 1.0, 2.0])
+        b = _make_seeded_aggregated("b", [1, 2, 3], [1.0, 2.0, 3.0])
+
+        with pytest.raises(ValueError, match="equal seed sets"):
+            pairwise_comparisons({"a": a, "b": b}, test=test, window=1)
+
+    def test_reduction_pin_pair_rejected_for_paired_ttest(self) -> None:
+        rows = [0.10, 0.11, 0.09]
+        results = {
+            "base_arm": _make_seeded_aggregated("base_arm", [0, 1, 2], rows),
+            "pinned_inert": _make_seeded_aggregated("pinned_inert", [0, 1, 2], list(rows)),
+        }
+        with pytest.raises(
+            ValueError,
+            match=r"^Paired comparison 'base_arm' vs 'pinned_inert' has identical "
+            r"samples; the paired t statistic is undefined$",
+        ):
+            pairwise_comparisons(results, metric="squared_error", test="ttest")
+
+    def test_reduction_pin_pair_rejected_for_wilcoxon(self) -> None:
+        rows = [0.10, 0.11, 0.09]
+        results = {
+            "base_arm": _make_seeded_aggregated("base_arm", [0, 1, 2], rows),
+            "pinned_inert": _make_seeded_aggregated("pinned_inert", [0, 1, 2], list(rows)),
+        }
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with pytest.raises(
+                ValueError,
+                match=r"^Paired comparison 'base_arm' vs 'pinned_inert' has identical "
+                r"samples; the Wilcoxon signed-rank statistic is undefined$",
+            ):
+                pairwise_comparisons(results, metric="squared_error", test="wilcoxon")
+
+    def test_duplicate_seeds_rejected(self) -> None:
+        malformed = _make_seeded_aggregated("malformed", [0, 0, 1], [0.0, 1.0, 2.0])
+        valid = _make_seeded_aggregated("valid", [10, 11, 12], [3.0, 4.0, 5.0])
+
+        with pytest.raises(ValueError, match="duplicate seeds"):
+            pairwise_comparisons({"malformed": malformed, "valid": valid}, test="mann_whitney")
+
+    def test_seed_count_must_match_metric_rows(self) -> None:
+        malformed = _make_seeded_aggregated("malformed", [0, 1], [0.0, 1.0, 2.0])
+
+        with pytest.raises(ValueError, match="seed count.*metric rows"):
+            pairwise_comparisons({"malformed": malformed})
+
+    def test_mann_whitney_accepts_distinct_seed_sets(self) -> None:
+        a = _make_seeded_aggregated("a", [0, 1, 2], [0.0, 1.0, 2.0])
+        b = _make_seeded_aggregated("b", [10, 11, 12], [3.0, 4.0, 5.0])
+
+        result = pairwise_comparisons({"a": a, "b": b}, test="mann_whitney", window=1)
+
+        assert result[("a", "b")].statistic == pytest.approx(0.0)
+
+    @staticmethod
+    def _settled_trace(name: str, n_steps: int, transient: float) -> AggregatedResults:
+        """Three seeds that start at ``transient`` and settle at exactly 1.0 after step 9."""
+        arr = np.ones((3, n_steps), dtype=np.float64)
+        arr[:, : min(10, n_steps)] = transient
+        return AggregatedResults(
+            config_name=name,
+            seeds=[0, 1, 2],
+            metric_arrays={"squared_error": arr},
+            summary={},
+        )
+
+    @pytest.mark.parametrize("test", ["ttest", "wilcoxon", "mann_whitney"])
+    def test_unequal_final_windows_rejected(self, test: str) -> None:
+        """A window longer than the shortest trace must not silently shrink per method."""
+        short = self._settled_trace("short", n_steps=20, transient=5.0)
+        long = self._settled_trace("long", n_steps=400, transient=5.0)
+
+        with pytest.raises(
+            ValueError,
+            match=r"^window=100 exceeds the shortest 'squared_error' trace and the traces "
+            r"differ in length \(long: 400 steps, short: 20 steps\); every method must "
+            r"average the same number of final steps$",
+        ):
+            pairwise_comparisons({"short": short, "long": long}, test=test, window=100)
+
+    def test_unequal_trace_lengths_accepted_when_window_fits_every_trace(self) -> None:
+        short = self._settled_trace("short", n_steps=20, transient=5.0)
+        long = self._settled_trace("long", n_steps=400, transient=7.0)
+
+        result = pairwise_comparisons(
+            {"short": short, "long": long}, test="mann_whitney", window=10
+        )
+
+        assert result[("short", "long")].effect_size == pytest.approx(0.0)
+        assert not result[("short", "long")].significant

@@ -34,14 +34,42 @@ References:
   for AI Research" (arXiv: 2208.11173)
 """
 
-from typing import Any
+from typing import Any, cast
 
 import chex
 import jax.numpy as jnp
 from jax import Array
 from jaxtyping import Float
 
-from alberta_framework.core.optimizers import Optimizer, OptimizerUpdate
+from alberta_framework.core._float32_scalars import validated_float32_scalar
+from alberta_framework.core.optimizers import (
+    Optimizer,
+    OptimizerUpdate,
+    ParamOptimizerUpdate,
+)
+from alberta_framework.core.update_safety import (
+    floating_tree_is_finite,
+    neutralize_array,
+    neutralize_metrics,
+    select_transaction,
+)
+
+
+def _skip_zero_scale(configured_scale: float, scale: Array, value: Array) -> Array:
+    """Skip a disabled EMA without changing enabled optimizer graphs."""
+    if configured_scale == 0.0:
+        # Preserve the persisted-state contract if a caller supplies a
+        # nonzero state scale to a zero-configured optimizer.
+        return jnp.where(scale == 0.0, jnp.zeros_like(value), scale * value)
+    return scale * value
+
+
+def _zero_if_disabled(configured_scale: float, scale: Array, value: Array) -> Array:
+    """Relax only a statically enabled zero-decay recovery path."""
+    if configured_scale == 0.0:
+        return jnp.where(scale == 0.0, jnp.zeros_like(value), value)
+    return value
+
 
 # =============================================================================
 # State dataclasses
@@ -215,10 +243,22 @@ class AdaGain(Optimizer[Any]):
             initial_step_size: Initial per-feature gain
             meta_step_size: Multiplicative meta-update rate
             forgetting_rate: Interpolation rate for the gradient trace
+
+        Raises:
+            ValueError: If a scalar is not a finite non-bool real in the
+                declared domain (``initial_step_size`` positive;
+                ``meta_step_size`` nonnegative; ``forgetting_rate`` in
+                ``[0, 1]``).
         """
-        self._initial_step_size = initial_step_size
-        self._meta_step_size = meta_step_size
-        self._forgetting_rate = forgetting_rate
+        self._initial_step_size = validated_float32_scalar(
+            "initial_step_size", initial_step_size, positive=True
+        )
+        self._meta_step_size = validated_float32_scalar(
+            "meta_step_size", meta_step_size, lower=0.0
+        )
+        self._forgetting_rate = validated_float32_scalar(
+            "forgetting_rate", forgetting_rate, lower=0.0, upper=1.0
+        )
 
     def to_config(self) -> dict[str, Any]:
         """Serialize configuration to dict."""
@@ -256,12 +296,14 @@ class AdaGain(Optimizer[Any]):
         gain_correlation = gradient * state.gradient_trace
         bias_correlation = bias_gradient * state.bias_gradient_trace
 
-        new_step_sizes = state.step_sizes * jnp.exp(
-            state.meta_step_size * gain_correlation
+        meta_delta = _skip_zero_scale(
+            self._meta_step_size, state.meta_step_size, gain_correlation
         )
-        new_bias_step_size = state.bias_step_size * jnp.exp(
-            state.meta_step_size * bias_correlation
+        bias_meta_delta = _skip_zero_scale(
+            self._meta_step_size, state.meta_step_size, bias_correlation
         )
+        new_step_sizes = state.step_sizes * jnp.exp(meta_delta)
+        new_bias_step_size = state.bias_step_size * jnp.exp(bias_meta_delta)
         new_step_sizes = jnp.clip(new_step_sizes, 1e-8, 1.0)
         new_bias_step_size = jnp.clip(new_bias_step_size, 1e-8, 1.0)
 
@@ -269,15 +311,15 @@ class AdaGain(Optimizer[Any]):
         bias_delta = new_bias_step_size * bias_gradient
 
         trace_mix = state.forgetting_rate
-        new_gradient_trace = (
-            (1.0 - trace_mix) * state.gradient_trace + trace_mix * gradient
-        )
-        new_bias_gradient_trace = (
-            (1.0 - trace_mix) * state.bias_gradient_trace
-            + trace_mix * bias_gradient
-        )
+        retained_scale = 1.0 - trace_mix
+        new_gradient_trace = _skip_zero_scale(
+            1.0 - self._forgetting_rate, retained_scale, state.gradient_trace
+        ) + _skip_zero_scale(self._forgetting_rate, trace_mix, gradient)
+        new_bias_gradient_trace = _skip_zero_scale(
+            1.0 - self._forgetting_rate, retained_scale, state.bias_gradient_trace
+        ) + _skip_zero_scale(self._forgetting_rate, trace_mix, bias_gradient)
 
-        new_state = AdaGainState(
+        candidate_state = AdaGainState(
             step_sizes=new_step_sizes,
             gradient_trace=new_gradient_trace,
             bias_step_size=new_bias_step_size,
@@ -285,15 +327,34 @@ class AdaGain(Optimizer[Any]):
             meta_step_size=state.meta_step_size,
             forgetting_rate=state.forgetting_rate,
         )
+        candidate_metrics = {
+            "mean_step_size": jnp.mean(new_step_sizes),
+            "min_step_size": jnp.min(new_step_sizes),
+            "max_step_size": jnp.max(new_step_sizes),
+        }
+        previous_checked = state
+        if self._forgetting_rate == 1.0 and self._meta_step_size == 0.0:
+            previous_checked = state.replace(  # type: ignore[attr-defined]
+                gradient_trace=jnp.zeros_like(state.gradient_trace),
+                bias_gradient_trace=jnp.zeros_like(state.bias_gradient_trace),
+            )
+        update_applied = (
+            floating_tree_is_finite(previous_checked)
+            & jnp.isfinite(error_scalar)
+            & jnp.all(jnp.isfinite(observation))
+            & jnp.all(jnp.isfinite(weight_delta))
+            & jnp.isfinite(bias_delta)
+            & floating_tree_is_finite(candidate_state)
+            & floating_tree_is_finite(candidate_metrics)
+        )
+        new_state = select_transaction(update_applied, candidate_state, state)
+        metrics = neutralize_metrics(update_applied, candidate_metrics)
         return OptimizerUpdate(
-            weight_delta=weight_delta,
-            bias_delta=bias_delta,
+            weight_delta=neutralize_array(update_applied, weight_delta),
+            bias_delta=neutralize_array(update_applied, bias_delta),
             new_state=new_state,
-            metrics={
-                "mean_step_size": jnp.mean(new_step_sizes),
-                "min_step_size": jnp.min(new_step_sizes),
-                "max_step_size": jnp.max(new_step_sizes),
-            },
+            metrics=metrics,
+            update_applied=update_applied,
         )
 
 
@@ -357,12 +418,24 @@ class Adam(Optimizer[Any]):
             eps: Small constant added to the denominator
             weight_decay: Decoupled weight-decay coefficient (MLP path
                 only; requires passing ``param`` when nonzero)
+
+        Raises:
+            ValueError: If a scalar is not a finite non-bool real in the
+                declared domain (``step_size`` and ``eps`` positive;
+                ``beta1`` / ``beta2`` in ``[0, 1)``; ``weight_decay``
+                nonnegative).
         """
-        self._step_size = step_size
-        self._beta1 = beta1
-        self._beta2 = beta2
-        self._eps = eps
-        self._weight_decay = weight_decay
+        self._step_size = validated_float32_scalar("step_size", step_size, positive=True)
+        self._beta1 = validated_float32_scalar(
+            "beta1", beta1, lower=0.0, upper=1.0, upper_inclusive=False
+        )
+        self._beta2 = validated_float32_scalar(
+            "beta2", beta2, lower=0.0, upper=1.0, upper_inclusive=False
+        )
+        self._eps = validated_float32_scalar("eps", eps, positive=True)
+        self._weight_decay = validated_float32_scalar(
+            "weight_decay", weight_decay, lower=0.0
+        )
 
     def to_config(self) -> dict[str, Any]:
         """Serialize configuration to dict."""
@@ -422,6 +495,18 @@ class Adam(Optimizer[Any]):
         error: Array | None = None,
         param: Array | None = None,
     ) -> tuple[Array, AdamParamState]:
+        """Return the historical unchecked pair for compatibility."""
+
+        result = self.update_from_gradient_checked(state, gradient, error, param)
+        return result.step, cast(AdamParamState, result.new_state)
+
+    def update_from_gradient_checked(
+        self,
+        state: AdamParamState,
+        gradient: Array,
+        error: Array | None = None,
+        param: Array | None = None,
+    ) -> ParamOptimizerUpdate:
         """Compute Adam step from a pre-computed gradient (MLP path).
 
         The returned step has the SAME sign as the descent step, i.e.
@@ -461,8 +546,12 @@ class Adam(Optimizer[Any]):
             g = gradient
 
         new_t = state.t + 1.0
-        new_m = state.beta1 * state.m + (1.0 - state.beta1) * g
-        new_v = state.beta2 * state.v + (1.0 - state.beta2) * g**2
+        new_m = _skip_zero_scale(self._beta1, state.beta1, state.m) + (
+            1.0 - state.beta1
+        ) * g
+        new_v = _skip_zero_scale(self._beta2, state.beta2, state.v) + (
+            1.0 - state.beta2
+        ) * g**2
 
         m_hat = new_m / (1.0 - state.beta1**new_t)
         v_hat = new_v / (1.0 - state.beta2**new_t)
@@ -471,7 +560,7 @@ class Adam(Optimizer[Any]):
         if self._weight_decay != 0.0 and param is not None:
             step = step + state.step_size * self._weight_decay * param
 
-        new_state = AdamParamState(
+        candidate_state = AdamParamState(
             m=new_m,
             v=new_v,
             t=new_t,
@@ -480,7 +569,33 @@ class Adam(Optimizer[Any]):
             beta2=state.beta2,
             eps=state.eps,
         )
-        return step, new_state
+        error_is_finite = (
+            jnp.asarray(True, dtype=jnp.bool_)
+            if error is None
+            else jnp.all(jnp.isfinite(error))
+        )
+        param_is_finite = (
+            jnp.asarray(True, dtype=jnp.bool_)
+            if param is None
+            else jnp.all(jnp.isfinite(param))
+        )
+        checked_state = state.replace(  # type: ignore[attr-defined]
+            m=_zero_if_disabled(self._beta1, state.beta1, state.m),
+            v=_zero_if_disabled(self._beta2, state.beta2, state.v),
+        )
+        update_applied = (
+            floating_tree_is_finite(checked_state)
+            & jnp.all(jnp.isfinite(gradient))
+            & error_is_finite
+            & param_is_finite
+            & jnp.all(jnp.isfinite(step))
+            & floating_tree_is_finite(candidate_state)
+        )
+        return ParamOptimizerUpdate(
+            step=neutralize_array(update_applied, step),
+            new_state=select_transaction(update_applied, candidate_state, state),
+            update_applied=update_applied,
+        )
 
     def update(
         self,
@@ -511,10 +626,20 @@ class Adam(Optimizer[Any]):
         g_b = -error_scalar
 
         new_t = state.t + 1.0
-        new_m = state.beta1 * state.m + (1.0 - state.beta1) * g
-        new_v = state.beta2 * state.v + (1.0 - state.beta2) * g**2
-        new_bias_m = state.beta1 * state.bias_m + (1.0 - state.beta1) * g_b
-        new_bias_v = state.beta2 * state.bias_v + (1.0 - state.beta2) * g_b**2
+        new_m = _skip_zero_scale(self._beta1, state.beta1, state.m) + (
+            1.0 - state.beta1
+        ) * g
+        new_v = _skip_zero_scale(self._beta2, state.beta2, state.v) + (
+            1.0 - state.beta2
+        ) * g**2
+        new_bias_m = (
+            _skip_zero_scale(self._beta1, state.beta1, state.bias_m)
+            + (1.0 - state.beta1) * g_b
+        )
+        new_bias_v = (
+            _skip_zero_scale(self._beta2, state.beta2, state.bias_v)
+            + (1.0 - state.beta2) * g_b**2
+        )
 
         m_hat = new_m / (1.0 - state.beta1**new_t)
         v_hat = new_v / (1.0 - state.beta2**new_t)
@@ -527,7 +652,7 @@ class Adam(Optimizer[Any]):
         weight_delta = -state.step_size * m_hat / (jnp.sqrt(v_hat) + state.eps)
         bias_delta = -state.step_size * bias_m_hat / (jnp.sqrt(bias_v_hat) + state.eps)
 
-        new_state = AdamState(
+        candidate_state = AdamState(
             m=new_m,
             v=new_v,
             bias_m=new_bias_m,
@@ -538,17 +663,37 @@ class Adam(Optimizer[Any]):
             beta2=state.beta2,
             eps=state.eps,
         )
+        candidate_metrics = {
+            "step_size": state.step_size,
+            "mean_m": jnp.mean(new_m),
+            "mean_v": jnp.mean(new_v),
+            "t": new_t,
+        }
+
+        checked_state = state.replace(  # type: ignore[attr-defined]
+            m=_zero_if_disabled(self._beta1, state.beta1, state.m),
+            v=_zero_if_disabled(self._beta2, state.beta2, state.v),
+            bias_m=_zero_if_disabled(self._beta1, state.beta1, state.bias_m),
+            bias_v=_zero_if_disabled(self._beta2, state.beta2, state.bias_v),
+        )
+        update_applied = (
+            floating_tree_is_finite(checked_state)
+            & jnp.isfinite(error_scalar)
+            & jnp.all(jnp.isfinite(observation))
+            & jnp.all(jnp.isfinite(weight_delta))
+            & jnp.isfinite(bias_delta)
+            & floating_tree_is_finite(candidate_state)
+            & floating_tree_is_finite(candidate_metrics)
+        )
+        new_state = select_transaction(update_applied, candidate_state, state)
+        metrics = neutralize_metrics(update_applied, candidate_metrics)
 
         return OptimizerUpdate(
-            weight_delta=weight_delta,
-            bias_delta=bias_delta,
+            weight_delta=neutralize_array(update_applied, weight_delta),
+            bias_delta=neutralize_array(update_applied, bias_delta),
             new_state=new_state,
-            metrics={
-                "step_size": state.step_size,
-                "mean_m": jnp.mean(new_m),
-                "mean_v": jnp.mean(new_v),
-                "t": new_t,
-            },
+            metrics=metrics,
+            update_applied=update_applied,
         )
 
 
@@ -586,10 +731,15 @@ class RMSprop(Optimizer[Any]):
             step_size: Base learning rate alpha
             decay: Decay rate for the squared-gradient EMA
             eps: Small constant added to the denominator
+
+        Raises:
+            ValueError: If a scalar is not a finite non-bool real in the
+                declared domain (``step_size`` and ``eps`` positive;
+                ``decay`` in ``[0, 1]``).
         """
-        self._step_size = step_size
-        self._decay = decay
-        self._eps = eps
+        self._step_size = validated_float32_scalar("step_size", step_size, positive=True)
+        self._decay = validated_float32_scalar("decay", decay, lower=0.0, upper=1.0)
+        self._eps = validated_float32_scalar("eps", eps, positive=True)
 
     def to_config(self) -> dict[str, Any]:
         """Serialize configuration to dict."""
@@ -639,6 +789,17 @@ class RMSprop(Optimizer[Any]):
         gradient: Array,
         error: Array | None = None,
     ) -> tuple[Array, RMSpropParamState]:
+        """Return the historical unchecked pair for compatibility."""
+
+        result = self.update_from_gradient_checked(state, gradient, error)
+        return result.step, cast(RMSpropParamState, result.new_state)
+
+    def update_from_gradient_checked(
+        self,
+        state: RMSpropParamState,
+        gradient: Array,
+        error: Array | None = None,
+    ) -> ParamOptimizerUpdate:
         """Compute RMSprop step from a pre-computed gradient (MLP path).
 
         When ``error`` is supplied, the effective gradient is treated as
@@ -658,16 +819,37 @@ class RMSprop(Optimizer[Any]):
         else:
             g = gradient
 
-        new_v = state.decay * state.v + (1.0 - state.decay) * g**2
+        new_v = _skip_zero_scale(self._decay, state.decay, state.v) + (
+            1.0 - state.decay
+        ) * g**2
         step = state.step_size * g / (jnp.sqrt(new_v) + state.eps)
 
-        new_state = RMSpropParamState(
+        candidate_state = RMSpropParamState(
             v=new_v,
             step_size=state.step_size,
             decay=state.decay,
             eps=state.eps,
         )
-        return step, new_state
+        error_is_finite = (
+            jnp.asarray(True, dtype=jnp.bool_)
+            if error is None
+            else jnp.all(jnp.isfinite(error))
+        )
+        checked_state = state.replace(  # type: ignore[attr-defined]
+            v=_zero_if_disabled(self._decay, state.decay, state.v)
+        )
+        update_applied = (
+            floating_tree_is_finite(checked_state)
+            & jnp.all(jnp.isfinite(gradient))
+            & error_is_finite
+            & jnp.all(jnp.isfinite(step))
+            & floating_tree_is_finite(candidate_state)
+        )
+        return ParamOptimizerUpdate(
+            step=neutralize_array(update_applied, step),
+            new_state=select_transaction(update_applied, candidate_state, state),
+            update_applied=update_applied,
+        )
 
     def update(
         self,
@@ -695,28 +877,51 @@ class RMSprop(Optimizer[Any]):
         g = -error_scalar * observation
         g_b = -error_scalar
 
-        new_v = state.decay * state.v + (1.0 - state.decay) * g**2
-        new_bias_v = state.decay * state.bias_v + (1.0 - state.decay) * g_b**2
+        new_v = _skip_zero_scale(self._decay, state.decay, state.v) + (
+            1.0 - state.decay
+        ) * g**2
+        new_bias_v = (
+            _skip_zero_scale(self._decay, state.decay, state.bias_v)
+            + (1.0 - state.decay) * g_b**2
+        )
 
         weight_delta = -state.step_size * g / (jnp.sqrt(new_v) + state.eps)
         bias_delta = -state.step_size * g_b / (jnp.sqrt(new_bias_v) + state.eps)
 
-        new_state = RMSpropState(
+        candidate_state = RMSpropState(
             v=new_v,
             bias_v=new_bias_v,
             step_size=state.step_size,
             decay=state.decay,
             eps=state.eps,
         )
+        candidate_metrics = {
+            "step_size": state.step_size,
+            "mean_v": jnp.mean(new_v),
+        }
+
+        checked_state = state.replace(  # type: ignore[attr-defined]
+            v=_zero_if_disabled(self._decay, state.decay, state.v),
+            bias_v=_zero_if_disabled(self._decay, state.decay, state.bias_v),
+        )
+        update_applied = (
+            floating_tree_is_finite(checked_state)
+            & jnp.isfinite(error_scalar)
+            & jnp.all(jnp.isfinite(observation))
+            & jnp.all(jnp.isfinite(weight_delta))
+            & jnp.isfinite(bias_delta)
+            & floating_tree_is_finite(candidate_state)
+            & floating_tree_is_finite(candidate_metrics)
+        )
+        new_state = select_transaction(update_applied, candidate_state, state)
+        metrics = neutralize_metrics(update_applied, candidate_metrics)
 
         return OptimizerUpdate(
-            weight_delta=weight_delta,
-            bias_delta=bias_delta,
+            weight_delta=neutralize_array(update_applied, weight_delta),
+            bias_delta=neutralize_array(update_applied, bias_delta),
             new_state=new_state,
-            metrics={
-                "step_size": state.step_size,
-                "mean_v": jnp.mean(new_v),
-            },
+            metrics=metrics,
+            update_applied=update_applied,
         )
 
 
@@ -753,10 +958,15 @@ class NADALINE(Optimizer[Any]):
             step_size: Base learning rate alpha
             decay: EMA decay rate for the per-feature second moment
             eps: Floor on the denominator to avoid division by zero
+
+        Raises:
+            ValueError: If a scalar is not a finite non-bool real in the
+                declared domain (``step_size`` and ``eps`` positive;
+                ``decay`` in ``[0, 1]``).
         """
-        self._step_size = step_size
-        self._decay = decay
-        self._eps = eps
+        self._step_size = validated_float32_scalar("step_size", step_size, positive=True)
+        self._decay = validated_float32_scalar("decay", decay, lower=0.0, upper=1.0)
+        self._eps = validated_float32_scalar("eps", eps, positive=True)
 
     def to_config(self) -> dict[str, Any]:
         """Serialize configuration to dict."""
@@ -808,7 +1018,7 @@ class NADALINE(Optimizer[Any]):
         """
         error_scalar = jnp.squeeze(error)
         new_second_moment = (
-            state.decay * state.feature_second_moment
+            _skip_zero_scale(self._decay, state.decay, state.feature_second_moment)
             + (1.0 - state.decay) * observation**2
         )
 
@@ -818,20 +1028,39 @@ class NADALINE(Optimizer[Any]):
         # Bias uses plain LMS -- no normalization (x_b == 1).
         bias_delta = state.step_size * error_scalar
 
-        new_state = NadalineState(
+        candidate_state = NadalineState(
             feature_second_moment=new_second_moment,
             step_size=state.step_size,
             decay=state.decay,
             eps=state.eps,
         )
+        candidate_metrics = {
+            "step_size": state.step_size,
+            "mean_second_moment": jnp.mean(new_second_moment),
+            "mean_denom": jnp.mean(denom),
+        }
+
+        checked_state = state.replace(  # type: ignore[attr-defined]
+            feature_second_moment=_zero_if_disabled(
+                self._decay, state.decay, state.feature_second_moment
+            ),
+        )
+        update_applied = (
+            floating_tree_is_finite(checked_state)
+            & jnp.isfinite(error_scalar)
+            & jnp.all(jnp.isfinite(observation))
+            & jnp.all(jnp.isfinite(weight_delta))
+            & jnp.isfinite(bias_delta)
+            & floating_tree_is_finite(candidate_state)
+            & floating_tree_is_finite(candidate_metrics)
+        )
+        new_state = select_transaction(update_applied, candidate_state, state)
+        metrics = neutralize_metrics(update_applied, candidate_metrics)
 
         return OptimizerUpdate(
-            weight_delta=weight_delta,
-            bias_delta=bias_delta,
+            weight_delta=neutralize_array(update_applied, weight_delta),
+            bias_delta=neutralize_array(update_applied, bias_delta),
             new_state=new_state,
-            metrics={
-                "step_size": state.step_size,
-                "mean_second_moment": jnp.mean(new_second_moment),
-                "mean_denom": jnp.mean(denom),
-            },
+            metrics=metrics,
+            update_applied=update_applied,
         )

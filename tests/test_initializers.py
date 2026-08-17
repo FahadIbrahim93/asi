@@ -17,6 +17,11 @@ class TestSparseInit:
         weights = sparse_init(key, (128, 10))
         chex.assert_shape(weights, (128, 10))
 
+    def test_list_shape_preserves_legacy_sequence_input(self):
+        """A two-element list remains a valid static shape input."""
+        weights = sparse_init(jr.key(42), [8, 5])  # type: ignore[arg-type]
+        chex.assert_shape(weights, (8, 5))
+
     def test_correct_sparsity_fraction(self):
         """Each output neuron should have approximately the right sparsity."""
         key = jr.key(42)
@@ -31,8 +36,8 @@ class TestSparseInit:
         # Each row should have exactly expected_zeros zeros
         chex.assert_trees_all_close(zeros_per_row, jnp.full(fan_out, expected_zeros))
 
-    def test_nonzero_values_within_lecun_bounds(self):
-        """Non-zero values should be within LeCun uniform bounds."""
+    def test_nonzero_values_within_paper_sparse_init_bounds(self):
+        """Non-zero values should stay within SparseInit Algorithm 1 bounds."""
         key = jr.key(42)
         fan_out, fan_in = 64, 32
         weights = sparse_init(key, (fan_out, fan_in), sparsity=0.5)
@@ -90,3 +95,54 @@ class TestSparseInit:
         actual_sparsity = float(total_zeros) / total_elements
 
         assert actual_sparsity == pytest.approx(0.9, abs=0.01)
+
+    def test_one_sparsity(self):
+        """With sparsity=1.0, all weights should be zero."""
+        key = jr.key(42)
+        weights = sparse_init(key, (32, 16), sparsity=1.0)
+
+        chex.assert_shape(weights, (32, 16))
+        assert jnp.all(weights == 0)
+
+    @pytest.mark.parametrize(
+        "invalid_shape",
+        [
+            (0, 10),
+            (10, 0),
+            (-1, 10),
+            (10, -5),
+            (0, 0),
+            (10,),
+            (10, 10, 10),
+            (),
+            (True, 10),
+            (10, False),
+            (10.5, 5),
+            (10, 5.5),
+        ],
+    )
+    def test_invalid_shapes_raise(self, invalid_shape):
+        """Invalid shape tuples should raise ValueError."""
+        key = jr.key(42)
+        with pytest.raises(ValueError, match=r"shape|dimension"):
+            sparse_init(key, invalid_shape)
+
+    @pytest.mark.parametrize(
+        "invalid_sparsity",
+        [
+            -0.1,
+            1.1,
+            10**309,
+            float("nan"),
+            float("inf"),
+            float("-inf"),
+            True,
+            False,
+            "0.5",
+        ],
+    )
+    def test_invalid_sparsity_raises(self, invalid_sparsity):
+        """Out-of-bounds or non-finite sparsity should raise ValueError."""
+        key = jr.key(42)
+        with pytest.raises(ValueError, match="sparsity"):
+            sparse_init(key, (32, 16), sparsity=invalid_sparsity)

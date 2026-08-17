@@ -26,13 +26,183 @@ or tanh feature bank:
   compositional DAG that builds features-of-features can.
 """
 
+from fractions import Fraction
+from numbers import Real
+from typing import cast
+
 import chex
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 from jax import Array
 from jaxtyping import Float, Int, PRNGKeyArray
 
+from alberta_framework._fixed_count_selection import (
+    require_positive_builtin_int,
+    stable_smallest_mask,
+)
+from alberta_framework._float32 import (
+    round_real_to_float32,
+    round_real_to_float32_with_ratio,
+)
 from alberta_framework.core.types import TimeStep
+
+_FLOAT32_MULTIPLIER_MAX = float(np.sqrt(np.finfo(np.float32).max))
+_INT32_MAX = int(np.iinfo(np.int32).max)
+_MAX_OUT_OF_CLASS_STATE_BYTES = 64 * 1024 * 1024
+
+
+def _require_positive_dimension(name: str, value: object) -> int:
+    """Return a positive builtin int inside the int32 host-dimension domain."""
+    canonical = require_positive_builtin_int(value, name=name)
+    if canonical > _INT32_MAX:
+        raise ValueError(f"{name} must be at most int32 max")
+    return canonical
+
+
+def _require_state_budget(name: str, array_scalars: int) -> dict[str, int]:
+    """Preflight one resident float32/int32 state plus its typed PRNG key."""
+    state_scalars = array_scalars + 2
+    state_bytes = 4 * state_scalars
+    if state_scalars > _INT32_MAX:
+        raise ValueError(f"{name} state scalar count must fit signed int32")
+    if state_bytes > _INT32_MAX:
+        raise ValueError(f"{name} state byte count must fit signed int32")
+    if state_bytes > _MAX_OUT_OF_CLASS_STATE_BYTES:
+        raise ValueError(f"{name} state exceeds the 64 MiB budget")
+    return {
+        "array_scalars": array_scalars,
+        "key_words": 2,
+        "state_scalars": state_scalars,
+        "state_bytes": state_bytes,
+    }
+
+
+def _frequency_state_budget(
+    *, n_contexts: int, n_tasks: int, n_components_per_task: int
+) -> dict[str, int]:
+    tensor_scalars = n_contexts * n_tasks * n_components_per_task
+    budget = _require_state_budget("frequency-mismatch", 4 * tensor_scalars + 1)
+    return {"tensor_scalars": tensor_scalars, **budget}
+
+
+def _compositional_state_budget(
+    *,
+    feature_dim: int,
+    n_tasks: int,
+    inner_hidden: int,
+    outer_components: int,
+    n_contexts: int,
+) -> dict[str, int]:
+    component_scalars = n_contexts * n_tasks * outer_components
+    outer_scalars = component_scalars * inner_hidden
+    inner_weight_scalars = outer_scalars * feature_dim
+    state_scalars = inner_weight_scalars + 2 * outer_scalars + 2 * component_scalars + 1
+    budget = _require_state_budget("compositional", state_scalars)
+    return {
+        "inner_weight_scalars": inner_weight_scalars,
+        "outer_scalars": outer_scalars,
+        "component_scalars": component_scalars,
+        **budget,
+    }
+
+
+def _saturating_step_count(step_count: Array) -> Array:
+    maximum = jnp.asarray(_INT32_MAX, dtype=jnp.int32)
+    return jnp.minimum(jnp.maximum(step_count, 0), maximum - 1) + 1
+
+
+_SUPPORTED_NUMPY_REAL_SCALAR_TYPES: tuple[type[object], ...] = (
+    np.int8,
+    np.int16,
+    np.int32,
+    np.int64,
+    np.longlong,
+    np.uint8,
+    np.uint16,
+    np.uint32,
+    np.uint64,
+    np.ulonglong,
+    np.float16,
+    np.float32,
+    np.float64,
+    np.longdouble,
+)
+
+
+def _trusted_multiplier_real(value: object, message: str) -> Real:
+    """Return a hook-free concrete real for Polynomial stream multipliers."""
+    actual_type = type(value)
+    if actual_type is int or actual_type is float:
+        return cast(Real, value)
+    for supported_type in _SUPPORTED_NUMPY_REAL_SCALAR_TYPES:
+        if actual_type is supported_type:
+            return cast(Real, value)
+    if actual_type is not Fraction:
+        raise ValueError(message)
+
+    fraction = cast(Fraction, value)
+    try:
+        numerator: object = object.__getattribute__(fraction, "_numerator")
+        denominator: object = object.__getattribute__(fraction, "_denominator")
+    except Exception as error:
+        raise ValueError(message) from error
+    if type(numerator) is not int or type(denominator) is not int:
+        raise ValueError(message)
+    if denominator <= 0:
+        raise ValueError(message)
+    try:
+        return Fraction(numerator, denominator)
+    except Exception as error:
+        raise ValueError(message) from error
+
+
+def _require_positive_float32(value: object, name: str) -> float:
+    """Return a positive finite value representable in the stream execution dtype."""
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError(f"{name} must be a positive finite float32 value")
+    try:
+        converted = round_real_to_float32(value)
+    except (FloatingPointError, OverflowError, TypeError, ValueError) as error:
+        raise ValueError(
+            f"{name} must be a positive finite float32 value"
+        ) from error
+    if not np.isfinite(converted) or converted <= np.float32(0.0):
+        raise ValueError(f"{name} must be a positive finite float32 value")
+    return converted
+
+
+def _require_finite_float32_multiplier(
+    value: object,
+    *,
+    name: str,
+    nonnegative: bool = False,
+) -> float:
+    """Return a canonical finite multiplier with conservative float32 headroom."""
+    message = f"{name} must be a finite real in the safe float32 multiplier range"
+    try:
+        trusted_value = _trusted_multiplier_real(value, message)
+        numerator, _, narrowed = round_real_to_float32_with_ratio(trusted_value)
+    except Exception as error:
+        raise ValueError(message) from error
+    if nonnegative and numerator < 0:
+        raise ValueError(message)
+    if not np.isfinite(narrowed) or abs(narrowed) > _FLOAT32_MULTIPLIER_MAX:
+        raise ValueError(message)
+    return narrowed
+
+
+def _require_safe_float32_product(*values: float, names: str) -> None:
+    """Reject configured multiplier products that consume float32 headroom."""
+    product = np.float32(1.0)
+    with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+        for value in values:
+            product = np.float32(product * np.float32(value))
+    if not np.isfinite(product) or abs(product) > _FLOAT32_MULTIPLIER_MAX:
+        raise ValueError(
+            f"{names} must stay within the safe combined float32 multiplier range"
+        )
+
 
 # =============================================================================
 # OutOfClassPolynomialStream -- degree-3 polynomial targets
@@ -100,8 +270,8 @@ class OutOfClassPolynomialStream:
             n_tasks: Number of supervised output heads.
             n_contexts: Number of recurring relevance contexts.
             context_length: Steps before switching context.
-            active_triples_per_context: Expected active triple products per
-                task/context.
+            active_triples_per_context: Number of active triple products per
+                task/context, capped at the available triple count.
             feature_std: Standard deviation of raw observations.
             linear_scale: Scale of the small direct linear component.
             noise_std: Standard deviation of target noise.
@@ -109,16 +279,52 @@ class OutOfClassPolynomialStream:
                 indices (``x_i^2 * x_j``, ``x_i^3``).  Default False, so
                 the oracle uses strict ``i < j < l`` triples only.
         """
+        feature_dim = require_positive_builtin_int(feature_dim, name="feature_dim")
         if feature_dim < 3:
             raise ValueError("feature_dim must be at least 3")
-        if n_tasks < 1:
-            raise ValueError("n_tasks must be positive")
-        if n_contexts < 1:
-            raise ValueError("n_contexts must be positive")
-        if context_length < 1:
-            raise ValueError("context_length must be positive")
-        if active_triples_per_context < 1:
-            raise ValueError("active_triples_per_context must be positive")
+        n_tasks = require_positive_builtin_int(n_tasks, name="n_tasks")
+        n_contexts = require_positive_builtin_int(n_contexts, name="n_contexts")
+        context_length = require_positive_builtin_int(context_length, name="context_length")
+        active_triples_per_context = require_positive_builtin_int(
+            active_triples_per_context,
+            name="active_triples_per_context",
+        )
+        for name, value in (
+            ("feature_dim", feature_dim),
+            ("n_tasks", n_tasks),
+            ("n_contexts", n_contexts),
+            ("context_length", context_length),
+            ("active_triples_per_context", active_triples_per_context),
+        ):
+            if value > _INT32_MAX:
+                raise ValueError(f"{name} must be at most int32 max")
+        feature_std = _require_finite_float32_multiplier(
+            feature_std,
+            name="feature_std",
+            nonnegative=True,
+        )
+        linear_scale = _require_finite_float32_multiplier(
+            linear_scale,
+            name="linear_scale",
+        )
+        noise_std = _require_finite_float32_multiplier(
+            noise_std,
+            name="noise_std",
+            nonnegative=True,
+        )
+        _require_safe_float32_product(
+            feature_std,
+            feature_std,
+            feature_std,
+            names="feature_std cubed",
+        )
+        _require_safe_float32_product(
+            linear_scale,
+            feature_std,
+            names="linear_scale and feature_std",
+        )
+        if type(include_squares) is not bool:
+            raise ValueError("include_squares must be a built-in bool")
 
         self._feature_dim = feature_dim
         self._n_tasks = n_tasks
@@ -192,8 +398,7 @@ class OutOfClassPolynomialStream:
             (self._n_contexts, self._n_tasks, n_triples),
             dtype=jnp.float32,
         )
-        threshold = jnp.sort(mask_scores, axis=-1)[..., active_count - 1 : active_count]
-        mask = mask_scores <= threshold
+        mask = stable_smallest_mask(mask_scores, active_count)
         context_weights = dense_context_weights * mask.astype(jnp.float32)
         norm = jnp.sqrt(jnp.maximum(jnp.sum(mask, axis=-1, keepdims=True), 1.0))
         context_weights = context_weights / norm
@@ -325,30 +530,42 @@ class FrequencyMismatchStream:
                 a centered Gaussian times this factor).
             noise_std: Standard deviation of target noise.
         """
-        if feature_dim < 1:
-            raise ValueError("feature_dim must be positive")
-        if n_tasks < 1:
-            raise ValueError("n_tasks must be positive")
-        if n_components_per_task < 1:
-            raise ValueError("n_components_per_task must be positive")
-        if n_contexts < 1:
-            raise ValueError("n_contexts must be positive")
-        if context_length < 1:
-            raise ValueError("context_length must be positive")
-        if omega_min <= 0:
-            raise ValueError("omega_min must be positive")
-        if omega_max <= omega_min:
-            raise ValueError("omega_max must exceed omega_min")
+        feature_dim = _require_positive_dimension("feature_dim", feature_dim)
+        n_tasks = _require_positive_dimension("n_tasks", n_tasks)
+        n_components_per_task = _require_positive_dimension(
+            "n_components_per_task",
+            n_components_per_task,
+        )
+        n_contexts = _require_positive_dimension("n_contexts", n_contexts)
+        context_length = _require_positive_dimension("context_length", context_length)
+        resource_budget = _frequency_state_budget(
+            n_contexts=n_contexts,
+            n_tasks=n_tasks,
+            n_components_per_task=n_components_per_task,
+        )
+        omega_min_float32 = _require_positive_float32(omega_min, "omega_min")
+        omega_max_float32 = _require_positive_float32(omega_max, "omega_max")
+        if omega_max_float32 <= omega_min_float32:
+            raise ValueError("omega_max must exceed omega_min in float32")
 
         self._feature_dim = feature_dim
         self._n_tasks = n_tasks
         self._n_components_per_task = n_components_per_task
         self._n_contexts = n_contexts
         self._context_length = context_length
-        self._omega_min = omega_min
-        self._omega_max = omega_max
-        self._amplitude_scale = amplitude_scale
-        self._noise_std = noise_std
+        self._omega_min = omega_min_float32
+        self._omega_max = omega_max_float32
+        self._amplitude_scale = _require_finite_float32_multiplier(
+            amplitude_scale,
+            name="amplitude_scale",
+            nonnegative=True,
+        )
+        self._noise_std = _require_finite_float32_multiplier(
+            noise_std,
+            name="noise_std",
+            nonnegative=True,
+        )
+        self._resource_budget = resource_budget
 
     @property
     def feature_dim(self) -> int:
@@ -359,6 +576,11 @@ class FrequencyMismatchStream:
     def target_dim(self) -> int:
         """Return the number of supervised tasks."""
         return self._n_tasks
+
+    @property
+    def resource_budget(self) -> dict[str, int]:
+        """Complete resident state payload accounting."""
+        return dict(self._resource_budget)
 
     def init(self, key: Array) -> FrequencyMismatchState:
         """Initialize stream state.
@@ -436,7 +658,8 @@ class FrequencyMismatchStream:
 
         timestep = TimeStep(observation=x, target=target)
         new_state = state.replace(  # type: ignore[attr-defined]
-            key=key, step_count=state.step_count + 1
+            key=key,
+            step_count=_saturating_step_count(state.step_count),
         )
         return timestep, new_state
 
@@ -444,6 +667,32 @@ class FrequencyMismatchStream:
 # =============================================================================
 # CompositionalStream -- 2-hidden-layer tanh oracle
 # =============================================================================
+
+
+def _require_compositional_weight_scale_float32(value: object) -> float:
+    """Return a signed scale in the stream's safe float32 execution domain.
+
+    The scale is canonicalized from its exact integer ratio to a built-in float
+    carrying the nearest-even float32 value.  Magnitudes at or below half the
+    smallest float32 subnormal become signed zero.  A finite float32 square is
+    required because the scale controls initialization variance and is
+    multiplied before fan-in normalization; that conservative headroom
+    prevents eager/XLA reassociation from turning an accepted scale into
+    non-finite oracle weights.
+    """
+    message = "weight_scale must be finite in float32 with finite float32 squared magnitude"
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, Real):
+        raise ValueError(message)
+    try:
+        rounded = round_real_to_float32(value)
+    except (FloatingPointError, OverflowError, TypeError, ValueError) as error:
+        raise ValueError(message) from error
+    with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+        narrowed = np.float32(rounded)
+        squared = np.float32(narrowed * narrowed)
+    if not bool(np.isfinite(narrowed)) or not bool(np.isfinite(squared)):
+        raise ValueError(message)
+    return rounded
 
 
 @chex.dataclass(frozen=True)
@@ -517,22 +766,52 @@ class CompositionalStream:
             context_length: Steps before switching context.
             feature_std: Standard deviation of raw observations.
             weight_scale: Scale of per-layer weights (divided by sqrt(fan-in)
-                for unit-variance pre-activations).
+                for unit-variance pre-activations). Real values are rounded
+                once from their exact integer ratio to nearest-even float32 at
+                construction. Magnitudes at or below half the smallest
+                float32 subnormal become signed zero; zero and negative scales
+                remain valid. Values whose float32 square overflows are
+                rejected so eager and compiled initialization stay finite.
             amplitude_scale: Scale of per-component output amplitudes.
             noise_std: Standard deviation of target noise.
         """
-        if feature_dim < 1:
-            raise ValueError("feature_dim must be positive")
-        if n_tasks < 1:
-            raise ValueError("n_tasks must be positive")
-        if inner_hidden < 1:
-            raise ValueError("inner_hidden must be positive")
-        if outer_components < 1:
-            raise ValueError("outer_components must be positive")
-        if n_contexts < 1:
-            raise ValueError("n_contexts must be positive")
-        if context_length < 1:
-            raise ValueError("context_length must be positive")
+        feature_dim = _require_positive_dimension("feature_dim", feature_dim)
+        n_tasks = _require_positive_dimension("n_tasks", n_tasks)
+        inner_hidden = _require_positive_dimension("inner_hidden", inner_hidden)
+        outer_components = _require_positive_dimension(
+            "outer_components",
+            outer_components,
+        )
+        n_contexts = _require_positive_dimension("n_contexts", n_contexts)
+        context_length = _require_positive_dimension("context_length", context_length)
+        resource_budget = _compositional_state_budget(
+            feature_dim=feature_dim,
+            n_tasks=n_tasks,
+            inner_hidden=inner_hidden,
+            outer_components=outer_components,
+            n_contexts=n_contexts,
+        )
+        feature_std_float32 = _require_finite_float32_multiplier(
+            feature_std,
+            name="feature_std",
+            nonnegative=True,
+        )
+        weight_scale_float32 = _require_compositional_weight_scale_float32(weight_scale)
+        amplitude_scale_float32 = _require_finite_float32_multiplier(
+            amplitude_scale,
+            name="amplitude_scale",
+            nonnegative=True,
+        )
+        noise_std_float32 = _require_finite_float32_multiplier(
+            noise_std,
+            name="noise_std",
+            nonnegative=True,
+        )
+        _require_safe_float32_product(
+            feature_std_float32,
+            weight_scale_float32,
+            names="feature_std and weight_scale",
+        )
 
         self._feature_dim = feature_dim
         self._n_tasks = n_tasks
@@ -540,10 +819,11 @@ class CompositionalStream:
         self._outer_components = outer_components
         self._n_contexts = n_contexts
         self._context_length = context_length
-        self._feature_std = feature_std
-        self._weight_scale = weight_scale
-        self._amplitude_scale = amplitude_scale
-        self._noise_std = noise_std
+        self._feature_std = feature_std_float32
+        self._weight_scale = weight_scale_float32
+        self._amplitude_scale = amplitude_scale_float32
+        self._noise_std = noise_std_float32
+        self._resource_budget = resource_budget
 
     @property
     def feature_dim(self) -> int:
@@ -554,6 +834,11 @@ class CompositionalStream:
     def target_dim(self) -> int:
         """Return the number of supervised tasks."""
         return self._n_tasks
+
+    @property
+    def resource_budget(self) -> dict[str, int]:
+        """Complete resident state payload accounting."""
+        return dict(self._resource_budget)
 
     def init(self, key: Array) -> CompositionalState:
         """Initialize stream state.
@@ -654,6 +939,7 @@ class CompositionalStream:
 
         timestep = TimeStep(observation=x, target=target)
         new_state = state.replace(  # type: ignore[attr-defined]
-            key=key, step_count=state.step_count + 1
+            key=key,
+            step_count=_saturating_step_count(state.step_count),
         )
         return timestep, new_state

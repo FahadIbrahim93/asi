@@ -35,19 +35,120 @@ Catastrophic Forgetting in Continual Learning." ICLR 2024.
 """
 
 import functools
+import operator
 import time
-from typing import Any
+from collections.abc import Mapping
+from fractions import Fraction
+from typing import Any, SupportsIndex, cast
 
 import chex
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 from jax import Array
 from jaxtyping import Float
 
+from alberta_framework.core._float32_scalars import (
+    validated_float32_scalar_with_ratio,
+)
 from alberta_framework.core.initializers import sparse_init
 from alberta_framework.core.optimizers import Bounder, ObGDBounding
 from alberta_framework.core.types import MLPParams
+from alberta_framework.core.update_safety import zero_if_collapsed_infinity
+
+_INT32_MAX = 2**31 - 1
+_ACTUAL_INT_TYPES: frozenset[type] = frozenset(
+    {
+        int,
+        np.int8,
+        np.int16,
+        np.int32,
+        np.int64,
+        np.uint8,
+        np.uint16,
+        np.uint32,
+        np.uint64,
+        np.longlong,
+        np.ulonglong,
+    }
+)
+_ACTUAL_FLOAT_TYPES: frozenset[type] = frozenset(
+    {
+        float,
+        Fraction,
+        *(np.dtype(code).type for code in ("e", "f", "d", "g")),
+    }
+)
+_ALLOWED_REAL_TYPES: frozenset[type] = _ACTUAL_INT_TYPES | _ACTUAL_FLOAT_TYPES
+
+
+def _require_int(name: str, value: object, *, minimum: int, maximum: int = _INT32_MAX) -> int:
+    if type(value) not in _ACTUAL_INT_TYPES:
+        raise ValueError(f"{name} must be an integer")
+    canonical = operator.index(cast(SupportsIndex, value))
+    if not minimum <= canonical <= maximum:
+        raise ValueError(f"{name} must be an integer")
+    return canonical
+
+
+def _require_choice(name: str, value: object, choices: frozenset[str]) -> str:
+    if type(value) is not str or value not in choices:
+        raise ValueError(f"{name} is unsupported")
+    return value
+
+
+def _validated_config_float(
+    name: str,
+    value: object,
+    *,
+    positive: bool = False,
+    lower: float | None = None,
+    upper: float | None = None,
+    upper_inclusive: bool = True,
+) -> float:
+    if type(value) not in _ALLOWED_REAL_TYPES:
+        raise ValueError(f"{name} must be a finite real number")
+    stored, numerator, denominator = validated_float32_scalar_with_ratio(
+        name,
+        value,
+        positive=positive,
+        lower=lower,
+        upper=upper,
+        upper_inclusive=upper_inclusive,
+    )
+    if numerator != 0 and abs(numerator) * (1 << 149) <= denominator:
+        raise ValueError(f"{name} must remain nonzero once narrowed to float32")
+    return stored
+
+
+def _require_float32_resource(
+    name: str, *, vector_scalars: int, fixed_scalars: int = 0
+) -> None:
+    total = vector_scalars + fixed_scalars
+    if total > _INT32_MAX:
+        raise ValueError(f"{name} scalar count must fit signed int32")
+    if 4 * total > _INT32_MAX:
+        raise ValueError(f"{name} byte count must fit signed int32")
+
+
+def _copy_mapping(payload: object, *, name: str) -> dict[str, object]:
+    if not isinstance(payload, Mapping):
+        raise ValueError(f"{name} payload must be a mapping")
+    try:
+        data = dict(payload)
+    except Exception as error:
+        raise ValueError(f"{name} payload could not be read") from error
+    for key in data:
+        if type(key) is not str:
+            raise ValueError(f"{name} payload has exact strings as keys")
+    return data
+
+
+def _skip_zero_scale(scale: Array, value: Array) -> Array:
+    """Skip ``0 * inf`` so a disabled decay does not poison the next EMA."""
+    return jnp.where(scale == 0.0, jnp.zeros_like(value), scale * value)
+
 
 # =============================================================================
 # Types
@@ -285,8 +386,9 @@ class UPGDLearner:
         head_repetition_warmup_steps: Number of initial steps before the
             repeated-target boost can turn on.
         unit_replacement_rate: Optional hidden-unit recycling rate per step,
-            expressed as a fraction of units per layer. ``0`` disables
-            recycling while still tracking per-unit utility.
+            expressed as a fraction of the layer's mature units; at most one
+            unit per layer is recycled per step. ``0`` disables recycling
+            while still tracking per-unit utility.
         unit_maturity_threshold: Minimum age before a hidden unit can be
             recycled.
         unit_utility_decay: Optional EMA decay for hidden-unit utilities. When
@@ -320,7 +422,11 @@ class UPGDLearner:
             when no gradient-alignment meta-rule is active. Disable for lean
             non-meta UPGD benchmarks to reduce carry traffic.
         adaptive_kappa_mode: Optional online control law for ObGD ``kappa``.
-            ``"none"`` uses the configured bounder unchanged. ``"loss_ratio"``
+            ``"none"`` uses the configured bounder unchanged, and
+            ``bounder=None`` disables bounding in every mode. When a bounder is
+            configured, every other mode uses plain ObGD at
+            ``adaptive_kappa_base`` (scaled by the law), so it must be an
+            :class:`ObGDBounding` with that same kappa. ``"loss_ratio"``
             computes an effective kappa from the learner's fast/slow loss EMAs,
             lowering kappa when fast loss exceeds slow loss and raising it when
             the stream appears stable. ``"gradient_alignment"`` learns a
@@ -513,275 +619,201 @@ class UPGDLearner:
             ValueError: If ``perturbation_interval < 1`` or ``utility_decay``
                 is outside ``[0, 1)``.
         """
-        if n_heads < 1:
-            msg = f"n_heads must be >= 1, got {n_heads}"
-            raise ValueError(msg)
-        if any(size < 1 for size in hidden_sizes):
-            msg = f"hidden_sizes must contain only positive sizes, got {hidden_sizes!r}"
-            raise ValueError(msg)
-        if step_size < 0.0:
-            msg = f"step_size must be non-negative, got {step_size}"
-            raise ValueError(msg)
-        if perturbation_sigma < 0.0:
-            msg = f"perturbation_sigma must be non-negative, got {perturbation_sigma}"
-            raise ValueError(msg)
-        if perturbation_beta < 0.0:
-            msg = f"perturbation_beta must be non-negative, got {perturbation_beta}"
-            raise ValueError(msg)
-        if perturbation_interval < 1:
-            msg = f"perturbation_interval must be >= 1, got {perturbation_interval}"
-            raise ValueError(msg)
-        if perturbation_noise not in {"normal", "rademacher"}:
-            msg = (
-                "perturbation_noise must be 'normal' or 'rademacher', "
-                f"got {perturbation_noise!r}"
+        n_heads = _require_int("n_heads", n_heads, minimum=1)
+        if isinstance(hidden_sizes, (str, bytes)):
+            raise ValueError("hidden_sizes must be a tuple of integers")
+        if not isinstance(hidden_sizes, (tuple, list)):
+            raise ValueError("hidden_sizes must be a tuple of integers")
+        canonical_hidden: list[int] = []
+        for idx, size in enumerate(hidden_sizes):
+            canonical_hidden.append(
+                _require_int(f"hidden_sizes[{idx}]", size, minimum=1)
             )
-            raise ValueError(msg)
-        if perturbation_warmup_steps < 0:
-            msg = (
-                "perturbation_warmup_steps must be >= 0, "
-                f"got {perturbation_warmup_steps}"
+        hidden_sizes = tuple(canonical_hidden)
+        validated_step_size = _validated_config_float(
+            "step_size", step_size, lower=0.0
+        )
+        validated_perturbation_sigma = _validated_config_float(
+            "perturbation_sigma", perturbation_sigma, lower=0.0
+        )
+        validated_perturbation_beta = _validated_config_float(
+            "perturbation_beta", perturbation_beta, lower=0.0
+        )
+        perturbation_interval = _require_int(
+            "perturbation_interval", perturbation_interval, minimum=1
+        )
+        perturbation_noise = _require_choice(
+            "perturbation_noise", perturbation_noise, frozenset({"normal", "rademacher"})
+        )
+        perturbation_warmup_steps = _require_int(
+            "perturbation_warmup_steps", perturbation_warmup_steps, minimum=0
+        )
+        perturbation_ramp_steps = _require_int(
+            "perturbation_ramp_steps", perturbation_ramp_steps, minimum=0
+        )
+        validated_utility_decay = _validated_config_float(
+            "utility_decay", utility_decay, lower=0.0, upper=1.0, upper_inclusive=False
+        )
+        validated_sparsity = _validated_config_float("sparsity", sparsity, lower=0.0, upper=1.0)
+        validated_leaky_relu_slope = _validated_config_float(
+            "leaky_relu_slope", leaky_relu_slope, lower=0.0
+        )
+        loss_normalization = _require_choice(
+            "loss_normalization", loss_normalization,
+                frozenset({"mean", "sum", "target_density", "target_structure"})
+        )
+        validated_positive_target_loss_scale = _validated_config_float(
+            "positive_target_loss_scale", positive_target_loss_scale, lower=0.0
+        )
+        validated_negative_target_loss_scale = _validated_config_float(
+            "negative_target_loss_scale", negative_target_loss_scale, lower=0.0
+        )
+        head_gradient_scale = _require_choice(
+            "head_gradient_scale", head_gradient_scale, frozenset({"none", "active_count"})
+        )
+        validated_head_step_size_multiplier = _validated_config_float(
+            "head_step_size_multiplier", head_step_size_multiplier, positive=True
+        )
+        validated_head_bias_step_size_multiplier = _validated_config_float(
+            "head_bias_step_size_multiplier", head_bias_step_size_multiplier, lower=0.0
+        )
+        validated_head_loss_pressure_gate_ratio = _validated_config_float(
+            "head_loss_pressure_gate_ratio", head_loss_pressure_gate_ratio, lower=0.0
+        )
+        validated_head_loss_pressure_multiplier = _validated_config_float(
+            "head_loss_pressure_multiplier", head_loss_pressure_multiplier, lower=0.0
+        )
+        head_loss_pressure_warmup_steps = _require_int(
+            "head_loss_pressure_warmup_steps", head_loss_pressure_warmup_steps, minimum=0
+        )
+        validated_head_repetition_multiplier = _validated_config_float(
+            "head_repetition_multiplier", head_repetition_multiplier, lower=0.0
+        )
+        validated_head_repetition_decay = _validated_config_float(
+            "head_repetition_decay", head_repetition_decay,
+                lower=0.0, upper=1.0, upper_inclusive=False
+        )
+        validated_head_repetition_delta_threshold = _validated_config_float(
+            "head_repetition_delta_threshold", head_repetition_delta_threshold, lower=0.0
+        )
+        validated_head_repetition_pressure_threshold = _validated_config_float(
+            "head_repetition_pressure_threshold", head_repetition_pressure_threshold,
+                lower=0.0, upper=1.0, upper_inclusive=False
+        )
+        head_repetition_warmup_steps = _require_int(
+            "head_repetition_warmup_steps", head_repetition_warmup_steps, minimum=0
+        )
+        validated_unit_replacement_rate = _validated_config_float(
+            "unit_replacement_rate", unit_replacement_rate, lower=0.0, upper=1.0
+        )
+        unit_maturity_threshold = _require_int(
+            "unit_maturity_threshold", unit_maturity_threshold, minimum=0
+        )
+        validated_unit_utility_decay: float | None = None
+        if unit_utility_decay is not None:
+            validated_unit_utility_decay = _validated_config_float(
+                "unit_utility_decay",
+                unit_utility_decay,
+                lower=0.0,
+                upper=1.0,
+                upper_inclusive=False,
             )
-            raise ValueError(msg)
-        if perturbation_ramp_steps < 0:
-            msg = (
-                "perturbation_ramp_steps must be >= 0, "
-                f"got {perturbation_ramp_steps}"
-            )
-            raise ValueError(msg)
-        if not 0.0 <= utility_decay < 1.0:
-            msg = f"utility_decay must be in [0, 1), got {utility_decay}"
-            raise ValueError(msg)
-        if not 0.0 <= sparsity <= 1.0:
-            msg = f"sparsity must be in [0, 1], got {sparsity}"
-            raise ValueError(msg)
-        if leaky_relu_slope < 0.0:
-            msg = f"leaky_relu_slope must be non-negative, got {leaky_relu_slope}"
-            raise ValueError(msg)
-        if loss_normalization not in (
-            "mean",
-            "sum",
-            "target_density",
-            "target_structure",
-        ):
-            msg = (
-                "loss_normalization must be 'mean', 'sum', 'target_density', "
-                "or 'target_structure', "
-                f"got {loss_normalization!r}"
-            )
-            raise ValueError(msg)
-        if positive_target_loss_scale < 0.0:
-            msg = (
-                "positive_target_loss_scale must be non-negative, "
-                f"got {positive_target_loss_scale}"
-            )
-            raise ValueError(msg)
-        if negative_target_loss_scale < 0.0:
-            msg = (
-                "negative_target_loss_scale must be non-negative, "
-                f"got {negative_target_loss_scale}"
-            )
-            raise ValueError(msg)
-        if head_gradient_scale not in ("none", "active_count"):
-            msg = (
-                "head_gradient_scale must be 'none' or 'active_count', "
-                f"got {head_gradient_scale!r}"
-            )
-            raise ValueError(msg)
-        if head_step_size_multiplier <= 0.0:
-            msg = (
-                "head_step_size_multiplier must be positive, "
-                f"got {head_step_size_multiplier}"
-            )
-            raise ValueError(msg)
-        if head_bias_step_size_multiplier < 0.0:
-            msg = (
-                "head_bias_step_size_multiplier must be non-negative, "
-                f"got {head_bias_step_size_multiplier}"
-            )
-            raise ValueError(msg)
-        if head_loss_pressure_gate_ratio < 0.0:
-            msg = (
-                "head_loss_pressure_gate_ratio must be non-negative, "
-                f"got {head_loss_pressure_gate_ratio}"
-            )
-            raise ValueError(msg)
-        if head_loss_pressure_multiplier < 0.0:
-            msg = (
-                "head_loss_pressure_multiplier must be non-negative, "
-                f"got {head_loss_pressure_multiplier}"
-            )
-            raise ValueError(msg)
-        if head_loss_pressure_warmup_steps < 0:
-            msg = (
-                "head_loss_pressure_warmup_steps must be non-negative, "
-                f"got {head_loss_pressure_warmup_steps}"
-            )
-            raise ValueError(msg)
-        if head_repetition_multiplier < 0.0:
-            msg = (
-                "head_repetition_multiplier must be non-negative, "
-                f"got {head_repetition_multiplier}"
-            )
-            raise ValueError(msg)
-        if not 0.0 <= head_repetition_decay < 1.0:
-            msg = (
-                "head_repetition_decay must be in [0, 1), "
-                f"got {head_repetition_decay}"
-            )
-            raise ValueError(msg)
-        if head_repetition_delta_threshold < 0.0:
-            msg = (
-                "head_repetition_delta_threshold must be non-negative, "
-                f"got {head_repetition_delta_threshold}"
-            )
-            raise ValueError(msg)
-        if not 0.0 <= head_repetition_pressure_threshold < 1.0:
-            msg = (
-                "head_repetition_pressure_threshold must be in [0, 1), "
-                f"got {head_repetition_pressure_threshold}"
-            )
-            raise ValueError(msg)
-        if head_repetition_warmup_steps < 0:
-            msg = (
-                "head_repetition_warmup_steps must be non-negative, "
-                f"got {head_repetition_warmup_steps}"
-            )
-            raise ValueError(msg)
-        if not 0.0 <= unit_replacement_rate <= 1.0:
-            msg = (
-                "unit_replacement_rate must be in [0, 1], "
-                f"got {unit_replacement_rate}"
-            )
-            raise ValueError(msg)
-        if unit_maturity_threshold < 0:
-            msg = (
-                "unit_maturity_threshold must be non-negative, "
-                f"got {unit_maturity_threshold}"
-            )
-            raise ValueError(msg)
-        if unit_utility_decay is not None and not 0.0 <= unit_utility_decay < 1.0:
-            msg = (
-                "unit_utility_decay must be in [0, 1) when set, "
-                f"got {unit_utility_decay}"
-            )
-            raise ValueError(msg)
-        if not 0.0 <= unit_long_utility_decay < 1.0:
-            msg = (
-                "unit_long_utility_decay must be in [0, 1), "
-                f"got {unit_long_utility_decay}"
-            )
-            raise ValueError(msg)
-        if not 0.0 <= unit_gradient_decay < 1.0:
-            msg = (
-                "unit_gradient_decay must be in [0, 1), "
-                f"got {unit_gradient_decay}"
-            )
-            raise ValueError(msg)
-        if unit_replacement_criterion not in {
-            "low_utility",
-            "stale_gradient_ratio",
-            "low_long_and_gradient",
-        }:
-            msg = (
-                "unit_replacement_criterion must be one of "
-                "'low_utility', 'stale_gradient_ratio', "
-                f"or 'low_long_and_gradient', got {unit_replacement_criterion!r}"
-            )
-            raise ValueError(msg)
-        if unit_replacement_fanin not in {"random", "gradient_columns"}:
-            msg = (
-                "unit_replacement_fanin must be 'random' or 'gradient_columns', "
-                f"got {unit_replacement_fanin!r}"
-            )
-            raise ValueError(msg)
-        if unit_replacement_loss_gate_ratio < 0.0:
-            msg = (
-                "unit_replacement_loss_gate_ratio must be non-negative, "
-                f"got {unit_replacement_loss_gate_ratio}"
-            )
-            raise ValueError(msg)
-        if unit_replacement_budget_mode not in {"always", "gated", "loss_pressure"}:
-            msg = (
-                "unit_replacement_budget_mode must be one of "
-                "'always', 'gated', or 'loss_pressure', "
-                f"got {unit_replacement_budget_mode!r}"
-            )
-            raise ValueError(msg)
-        if unit_replacement_outgoing_scale < 0.0:
-            msg = (
-                "unit_replacement_outgoing_scale must be non-negative, "
-                f"got {unit_replacement_outgoing_scale}"
-            )
-            raise ValueError(msg)
-        if unit_replacement_partial_fanin < 0:
-            msg = (
-                "unit_replacement_partial_fanin must be non-negative, "
-                f"got {unit_replacement_partial_fanin}"
-            )
-            raise ValueError(msg)
-        if unit_replacement_score_threshold < 0.0:
-            msg = (
-                "unit_replacement_score_threshold must be non-negative, "
-                f"got {unit_replacement_score_threshold}"
-            )
-            raise ValueError(msg)
-        if unit_outgoing_utility_weight < 0.0:
-            msg = (
-                "unit_outgoing_utility_weight must be non-negative, "
-                f"got {unit_outgoing_utility_weight}"
-            )
-            raise ValueError(msg)
-        if not 0.0 <= loss_fast_decay < 1.0:
-            msg = f"loss_fast_decay must be in [0, 1), got {loss_fast_decay}"
-            raise ValueError(msg)
-        if not 0.0 <= loss_slow_decay < 1.0:
-            msg = f"loss_slow_decay must be in [0, 1), got {loss_slow_decay}"
-            raise ValueError(msg)
-        if adaptive_kappa_mode not in {"none", "loss_ratio", "gradient_alignment"}:
-            msg = (
-                "adaptive_kappa_mode must be 'none', 'loss_ratio', "
-                "or 'gradient_alignment', "
-                f"got {adaptive_kappa_mode!r}"
-            )
-            raise ValueError(msg)
-        if adaptive_kappa_base <= 0.0:
-            msg = f"adaptive_kappa_base must be positive, got {adaptive_kappa_base}"
-            raise ValueError(msg)
-        if adaptive_kappa_min <= 0.0:
-            msg = f"adaptive_kappa_min must be positive, got {adaptive_kappa_min}"
-            raise ValueError(msg)
-        if adaptive_kappa_max < adaptive_kappa_min:
+        validated_unit_long_utility_decay = _validated_config_float(
+            "unit_long_utility_decay", unit_long_utility_decay,
+                lower=0.0, upper=1.0, upper_inclusive=False
+        )
+        validated_unit_gradient_decay = _validated_config_float(
+            "unit_gradient_decay", unit_gradient_decay, lower=0.0, upper=1.0, upper_inclusive=False
+        )
+        unit_replacement_criterion = _require_choice(
+            "unit_replacement_criterion", unit_replacement_criterion,
+                frozenset({"low_utility", "stale_gradient_ratio", "low_long_and_gradient"})
+        )
+        unit_replacement_fanin = _require_choice(
+            "unit_replacement_fanin", unit_replacement_fanin,
+                frozenset({"random", "gradient_columns"})
+        )
+        validated_unit_replacement_loss_gate_ratio = _validated_config_float(
+            "unit_replacement_loss_gate_ratio", unit_replacement_loss_gate_ratio, lower=0.0
+        )
+        unit_replacement_budget_mode = _require_choice(
+            "unit_replacement_budget_mode", unit_replacement_budget_mode,
+                frozenset({"always", "gated", "loss_pressure"})
+        )
+        validated_unit_replacement_outgoing_scale = _validated_config_float(
+            "unit_replacement_outgoing_scale", unit_replacement_outgoing_scale, lower=0.0
+        )
+        unit_replacement_partial_fanin = _require_int(
+            "unit_replacement_partial_fanin", unit_replacement_partial_fanin, minimum=0
+        )
+        validated_unit_replacement_score_threshold = _validated_config_float(
+            "unit_replacement_score_threshold", unit_replacement_score_threshold, lower=0.0
+        )
+        validated_unit_outgoing_utility_weight = _validated_config_float(
+            "unit_outgoing_utility_weight", unit_outgoing_utility_weight, lower=0.0
+        )
+        validated_loss_fast_decay = _validated_config_float(
+            "loss_fast_decay", loss_fast_decay, lower=0.0, upper=1.0, upper_inclusive=False
+        )
+        validated_loss_slow_decay = _validated_config_float(
+            "loss_slow_decay", loss_slow_decay, lower=0.0, upper=1.0, upper_inclusive=False
+        )
+        adaptive_kappa_mode = _require_choice(
+            "adaptive_kappa_mode", adaptive_kappa_mode,
+                frozenset({"none", "loss_ratio", "gradient_alignment"})
+        )
+        validated_adaptive_kappa_base = _validated_config_float(
+            "adaptive_kappa_base", adaptive_kappa_base, positive=True
+        )
+        if adaptive_kappa_mode != "none" and bounder is not None:
+            configured = bounder.to_config()
+            if type(bounder) is not ObGDBounding:
+                msg = (
+                    "adaptive_kappa_mode bounds every update with plain ObGD at "
+                    "adaptive_kappa_base and would silently discard the configured "
+                    f"{configured.get('type', type(bounder).__name__)} bounder; pass "
+                    "bounder=None or an ObGDBounding whose kappa equals adaptive_kappa_base"
+                )
+                raise ValueError(msg)
+            if float(configured["kappa"]) != float(adaptive_kappa_base):
+                msg = (
+                    "adaptive_kappa_mode bounds every update at adaptive_kappa_base="
+                    f"{adaptive_kappa_base}, which disagrees with the configured "
+                    f"ObGDBounding kappa={configured['kappa']}; make them equal or use "
+                    "adaptive_kappa_mode='none'"
+                )
+                raise ValueError(msg)
+        validated_adaptive_kappa_min = _validated_config_float(
+            "adaptive_kappa_min", adaptive_kappa_min, positive=True
+        )
+        validated_adaptive_kappa_max = _validated_config_float(
+            "adaptive_kappa_max", adaptive_kappa_max, positive=True
+        )
+        if validated_adaptive_kappa_max < validated_adaptive_kappa_min:
             msg = (
                 "adaptive_kappa_max must be >= adaptive_kappa_min, "
                 f"got {adaptive_kappa_max} < {adaptive_kappa_min}"
             )
             raise ValueError(msg)
-        if adaptive_kappa_exponent < 0.0:
-            msg = (
-                "adaptive_kappa_exponent must be non-negative, "
-                f"got {adaptive_kappa_exponent}"
-            )
-            raise ValueError(msg)
-        if adaptive_kappa_warmup_steps < 0:
-            msg = (
-                "adaptive_kappa_warmup_steps must be non-negative, "
-                f"got {adaptive_kappa_warmup_steps}"
-            )
-            raise ValueError(msg)
-        if adaptive_kappa_meta_step_size < 0.0:
-            msg = (
-                "adaptive_kappa_meta_step_size must be non-negative, "
-                f"got {adaptive_kappa_meta_step_size}"
-            )
-            raise ValueError(msg)
-        if adaptive_kappa_meta_min_multiplier <= 0.0:
-            msg = (
-                "adaptive_kappa_meta_min_multiplier must be positive, "
-                f"got {adaptive_kappa_meta_min_multiplier}"
-            )
-            raise ValueError(msg)
-        if adaptive_kappa_meta_max_multiplier < adaptive_kappa_meta_min_multiplier:
+        validated_adaptive_kappa_exponent = _validated_config_float(
+            "adaptive_kappa_exponent", adaptive_kappa_exponent, lower=0.0
+        )
+        adaptive_kappa_warmup_steps = _require_int(
+            "adaptive_kappa_warmup_steps", adaptive_kappa_warmup_steps, minimum=0
+        )
+        validated_adaptive_kappa_meta_step_size = _validated_config_float(
+            "adaptive_kappa_meta_step_size", adaptive_kappa_meta_step_size, lower=0.0
+        )
+        validated_adaptive_kappa_meta_min_multiplier = _validated_config_float(
+            "adaptive_kappa_meta_min_multiplier", adaptive_kappa_meta_min_multiplier, positive=True
+        )
+        validated_adaptive_kappa_meta_max_multiplier = _validated_config_float(
+            "adaptive_kappa_meta_max_multiplier", adaptive_kappa_meta_max_multiplier, positive=True
+        )
+        if (
+            validated_adaptive_kappa_meta_max_multiplier
+            < validated_adaptive_kappa_meta_min_multiplier
+        ):
             msg = (
                 "adaptive_kappa_meta_max_multiplier must be >= "
                 "adaptive_kappa_meta_min_multiplier, "
@@ -789,31 +821,28 @@ class UPGDLearner:
                 f"{adaptive_kappa_meta_min_multiplier}"
             )
             raise ValueError(msg)
-        if adaptive_kappa_meta_warmup_steps < 0:
-            msg = (
-                "adaptive_kappa_meta_warmup_steps must be non-negative, "
-                f"got {adaptive_kappa_meta_warmup_steps}"
-            )
-            raise ValueError(msg)
-        if meta_plasticity_mode not in {"none", "gradient_alignment"}:
+        adaptive_kappa_meta_warmup_steps = _require_int(
+            "adaptive_kappa_meta_warmup_steps", adaptive_kappa_meta_warmup_steps, minimum=0
+        )
+        if (
+            type(meta_plasticity_mode) is not str
+            or meta_plasticity_mode not in {"none", "gradient_alignment"}
+        ):
             msg = (
                 "meta_plasticity_mode must be 'none' or 'gradient_alignment', "
                 f"got {meta_plasticity_mode!r}"
             )
             raise ValueError(msg)
-        if meta_plasticity_step_size < 0.0:
-            msg = (
-                "meta_plasticity_step_size must be non-negative, "
-                f"got {meta_plasticity_step_size}"
-            )
-            raise ValueError(msg)
-        if meta_plasticity_min_multiplier <= 0.0:
-            msg = (
-                "meta_plasticity_min_multiplier must be positive, "
-                f"got {meta_plasticity_min_multiplier}"
-            )
-            raise ValueError(msg)
-        if meta_plasticity_max_multiplier < meta_plasticity_min_multiplier:
+        validated_meta_plasticity_step_size = _validated_config_float(
+            "meta_plasticity_step_size", meta_plasticity_step_size, lower=0.0
+        )
+        validated_meta_plasticity_min_multiplier = _validated_config_float(
+            "meta_plasticity_min_multiplier", meta_plasticity_min_multiplier, positive=True
+        )
+        validated_meta_plasticity_max_multiplier = _validated_config_float(
+            "meta_plasticity_max_multiplier", meta_plasticity_max_multiplier, positive=True
+        )
+        if validated_meta_plasticity_max_multiplier < validated_meta_plasticity_min_multiplier:
             msg = (
                 "meta_plasticity_max_multiplier must be >= "
                 "meta_plasticity_min_multiplier, "
@@ -821,12 +850,9 @@ class UPGDLearner:
                 f"{meta_plasticity_min_multiplier}"
             )
             raise ValueError(msg)
-        if meta_plasticity_warmup_steps < 0:
-            msg = (
-                "meta_plasticity_warmup_steps must be non-negative, "
-                f"got {meta_plasticity_warmup_steps}"
-            )
-            raise ValueError(msg)
+        meta_plasticity_warmup_steps = _require_int(
+            "meta_plasticity_warmup_steps", meta_plasticity_warmup_steps, minimum=0
+        )
         readout_aliases = {
             "linear_mse": ("linear_mse", "identity"),
             "softmax_ce": ("softmax_ce", "softmax"),
@@ -842,7 +868,10 @@ class UPGDLearner:
                 "two_timescale_simplex",
             ),
         }
-        if readout_mode not in readout_aliases:
+        if (
+            type(readout_mode) is not str
+            or readout_mode not in readout_aliases
+        ):
             msg = (
                 "readout_mode must be 'linear_mse', 'softmax_ce', "
                 "'softmax_mse', "
@@ -856,11 +885,9 @@ class UPGDLearner:
             default_loss_mode if readout_loss_mode is None else readout_loss_mode
         )
         resolved_readout_prediction_mode = (
-            default_prediction_mode
-            if readout_prediction_mode is None
-            else readout_prediction_mode
+            default_prediction_mode if readout_prediction_mode is None else readout_prediction_mode
         )
-        if resolved_readout_loss_mode not in {
+        if type(resolved_readout_loss_mode) is not str or resolved_readout_loss_mode not in {
             "linear_mse",
             "softmax_ce",
             "softmax_mse",
@@ -878,15 +905,18 @@ class UPGDLearner:
                 f"got {resolved_readout_loss_mode!r}"
             )
             raise ValueError(msg)
-        if resolved_readout_prediction_mode not in {
-            "identity",
-            "softmax",
-            "adaptive_simplex",
-            "factorized_simplex",
-            "adaptive_factorized_simplex",
-            "two_timescale_simplex",
-            "unit_clip",
-        }:
+        if (
+            type(resolved_readout_prediction_mode) is not str
+            or resolved_readout_prediction_mode not in {
+                "identity",
+                "softmax",
+                "adaptive_simplex",
+                "factorized_simplex",
+                "adaptive_factorized_simplex",
+                "two_timescale_simplex",
+                "unit_clip",
+            }
+        ):
             msg = (
                 "readout_prediction_mode must be 'identity', 'softmax', "
                 "'adaptive_simplex', 'factorized_simplex', "
@@ -895,238 +925,220 @@ class UPGDLearner:
                 f"got {resolved_readout_prediction_mode!r}"
             )
             raise ValueError(msg)
-        if not 0.0 < readout_robust_q <= 1.0:
-            msg = f"readout_robust_q must be in (0, 1], got {readout_robust_q}"
-            raise ValueError(msg)
-        if not 0.0 <= readout_adaptive_gate_start <= 1.0:
-            msg = (
-                "readout_adaptive_gate_start must be in [0, 1], "
-                f"got {readout_adaptive_gate_start}"
+        validated_readout_robust_q = _validated_config_float(
+            "readout_robust_q", readout_robust_q, lower=0.0, upper=1.0, upper_inclusive=True
+        )
+        if not 0.0 < validated_readout_robust_q <= 1.0:
+            raise ValueError("readout_robust_q must be in (0, 1]")
+        validated_readout_adaptive_gate_start = _validated_config_float(
+            "readout_adaptive_gate_start", readout_adaptive_gate_start, lower=0.0, upper=1.0
+        )
+        validated_readout_adaptive_gate_width = _validated_config_float(
+            "readout_adaptive_gate_width", readout_adaptive_gate_width, positive=True
+        )
+        readout_input_mode = _require_choice(
+            "readout_input_mode", readout_input_mode, frozenset({"hidden", "hidden_plus_input"})
+        )
+        readout_head_normalization = _require_choice(
+            "readout_head_normalization", readout_head_normalization,
+                frozenset({"none", "hidden_norm"})
+        )
+        validated_readout_margin = _validated_config_float(
+            "readout_margin", readout_margin, lower=0.0
+        )
+        validated_readout_margin_step_size = _validated_config_float(
+            "readout_margin_step_size", readout_margin_step_size, lower=0.0
+        )
+        validated_readout_label_adapter_step_size = _validated_config_float(
+            "readout_label_adapter_step_size", readout_label_adapter_step_size, lower=0.0
+        )
+        validated_readout_label_adapter_identity_regularization = _validated_config_float(
+            "readout_label_adapter_identity_regularization", readout_label_adapter_identity_regularization,  # noqa: E501
+                lower=0.0
+        )
+        validated_readout_label_adapter_entropy_regularization = _validated_config_float(
+            "readout_label_adapter_entropy_regularization", readout_label_adapter_entropy_regularization,  # noqa: E501
+                lower=0.0
+        )
+        validated_readout_label_adapter_floor = _validated_config_float(
+            "readout_label_adapter_floor", readout_label_adapter_floor,
+                lower=0.0, upper=1.0, upper_inclusive=False
+        )
+        validated_readout_fast_head_step_size_multiplier = _validated_config_float(
+            "readout_fast_head_step_size_multiplier", readout_fast_head_step_size_multiplier,
+                lower=0.0
+        )
+        validated_readout_fast_head_bias_step_size_multiplier = _validated_config_float(
+            "readout_fast_head_bias_step_size_multiplier", readout_fast_head_bias_step_size_multiplier,  # noqa: E501
+                lower=0.0
+        )
+        validated_readout_fast_trunk_gradient_multiplier = _validated_config_float(
+            "readout_fast_trunk_gradient_multiplier", readout_fast_trunk_gradient_multiplier,
+                lower=0.0
+        )
+        readout_fast_head_bounder_mode = _require_choice(
+            "readout_fast_head_bounder_mode", readout_fast_head_bounder_mode,
+                frozenset({"shared", "separate"})
+        )
+        validated_readout_slow_simplex_gradient_multiplier = _validated_config_float(
+            "readout_slow_simplex_gradient_multiplier", readout_slow_simplex_gradient_multiplier,
+                lower=0.0
+        )
+        validated_readout_simplex_bias_decay = _validated_config_float(
+            "readout_simplex_bias_decay", readout_simplex_bias_decay, lower=0.0, upper=1.0
+        )
+        validated_readout_simplex_bias_centering_rate = _validated_config_float(
+            "readout_simplex_bias_centering_rate", readout_simplex_bias_centering_rate,
+                lower=0.0, upper=1.0
+        )
+
+        if type(use_layer_norm) is not bool:
+            raise ValueError("use_layer_norm must be a bool")
+        if type(track_unit_utilities) is not bool:
+            raise ValueError("track_unit_utilities must be a bool")
+        if type(track_gradient_history) is not bool:
+            raise ValueError("track_gradient_history must be a bool")
+        if type(meta_plasticity_trunk_enabled) is not bool:
+            raise ValueError("meta_plasticity_trunk_enabled must be a bool")
+        if type(meta_plasticity_head_weight_enabled) is not bool:
+            raise ValueError("meta_plasticity_head_weight_enabled must be a bool")
+        if type(meta_plasticity_head_bias_enabled) is not bool:
+            raise ValueError("meta_plasticity_head_bias_enabled must be a bool")
+        if type(meta_plasticity_repetition_enabled) is not bool:
+            raise ValueError("meta_plasticity_repetition_enabled must be a bool")
+        # Derived allocation preflight (allocation-free)
+        if hidden_sizes:
+            _require_float32_resource(
+                "hidden_sizes",
+                vector_scalars=sum(int(s) for s in hidden_sizes),
+                fixed_scalars=len(hidden_sizes),
             )
-            raise ValueError(msg)
-        if readout_adaptive_gate_width <= 0.0:
-            msg = (
-                "readout_adaptive_gate_width must be positive, "
-                f"got {readout_adaptive_gate_width}"
+            _require_float32_resource(
+                "heads",
+                vector_scalars=int(n_heads) * int(hidden_sizes[-1]),
+                fixed_scalars=int(n_heads),
             )
-            raise ValueError(msg)
-        if readout_input_mode not in {"hidden", "hidden_plus_input"}:
-            msg = (
-                "readout_input_mode must be 'hidden' or 'hidden_plus_input', "
-                f"got {readout_input_mode!r}"
+        else:
+            _require_float32_resource(
+                "heads", vector_scalars=int(n_heads), fixed_scalars=0
             )
-            raise ValueError(msg)
-        if readout_head_normalization not in {"none", "hidden_norm"}:
-            msg = (
-                "readout_head_normalization must be 'none' or 'hidden_norm', "
-                f"got {readout_head_normalization!r}"
-            )
-            raise ValueError(msg)
-        if readout_margin < 0.0:
-            msg = f"readout_margin must be non-negative, got {readout_margin}"
-            raise ValueError(msg)
-        if readout_margin_step_size < 0.0:
-            msg = (
-                "readout_margin_step_size must be non-negative, "
-                f"got {readout_margin_step_size}"
-            )
-            raise ValueError(msg)
-        if readout_label_adapter_step_size < 0.0:
-            msg = (
-                "readout_label_adapter_step_size must be non-negative, "
-                f"got {readout_label_adapter_step_size}"
-            )
-            raise ValueError(msg)
-        if readout_label_adapter_identity_regularization < 0.0:
-            msg = (
-                "readout_label_adapter_identity_regularization must be "
-                "non-negative, "
-                f"got {readout_label_adapter_identity_regularization}"
-            )
-            raise ValueError(msg)
-        if readout_label_adapter_entropy_regularization < 0.0:
-            msg = (
-                "readout_label_adapter_entropy_regularization must be "
-                "non-negative, "
-                f"got {readout_label_adapter_entropy_regularization}"
-            )
-            raise ValueError(msg)
-        if not 0.0 <= readout_label_adapter_floor < 1.0:
-            msg = (
-                "readout_label_adapter_floor must be in [0, 1), "
-                f"got {readout_label_adapter_floor}"
-            )
-            raise ValueError(msg)
-        if readout_fast_head_step_size_multiplier < 0.0:
-            msg = (
-                "readout_fast_head_step_size_multiplier must be non-negative, "
-                f"got {readout_fast_head_step_size_multiplier}"
-            )
-            raise ValueError(msg)
-        if readout_fast_head_bias_step_size_multiplier < 0.0:
-            msg = (
-                "readout_fast_head_bias_step_size_multiplier must be "
-                "non-negative, "
-                f"got {readout_fast_head_bias_step_size_multiplier}"
-            )
-            raise ValueError(msg)
-        if readout_fast_trunk_gradient_multiplier < 0.0:
-            msg = (
-                "readout_fast_trunk_gradient_multiplier must be non-negative, "
-                f"got {readout_fast_trunk_gradient_multiplier}"
-            )
-            raise ValueError(msg)
-        if readout_fast_head_bounder_mode not in {"shared", "separate"}:
-            msg = (
-                "readout_fast_head_bounder_mode must be 'shared' or 'separate', "
-                f"got {readout_fast_head_bounder_mode!r}"
-            )
-            raise ValueError(msg)
-        if readout_slow_simplex_gradient_multiplier < 0.0:
-            msg = (
-                "readout_slow_simplex_gradient_multiplier must be non-negative, "
-                f"got {readout_slow_simplex_gradient_multiplier}"
-            )
-            raise ValueError(msg)
-        if not 0.0 <= readout_simplex_bias_decay <= 1.0:
-            msg = (
-                "readout_simplex_bias_decay must be in [0, 1], "
-                f"got {readout_simplex_bias_decay}"
-            )
-            raise ValueError(msg)
-        if not 0.0 <= readout_simplex_bias_centering_rate <= 1.0:
-            msg = (
-                "readout_simplex_bias_centering_rate must be in [0, 1], "
-                f"got {readout_simplex_bias_centering_rate}"
-            )
-            raise ValueError(msg)
+        # Complete readout-related preflight for label adapter (n_heads^2)
+        _require_float32_resource(
+            "readout_label_adapter",
+            vector_scalars=int(n_heads) * int(n_heads),
+            fixed_scalars=0,
+        )
 
         self._n_heads = n_heads
         self._hidden_sizes = hidden_sizes
-        self._step_size = float(step_size)
+        self._step_size = validated_step_size
         self._bounder = bounder
-        self._utility_decay = float(utility_decay)
-        self._perturbation_sigma = float(perturbation_sigma)
-        self._perturbation_beta = float(perturbation_beta)
+        self._utility_decay = float(validated_utility_decay)
+        self._perturbation_sigma = float(validated_perturbation_sigma)
+        self._perturbation_beta = float(validated_perturbation_beta)
         self._perturbation_interval = int(perturbation_interval)
         self._perturbation_noise = perturbation_noise
         self._perturbation_warmup_steps = int(perturbation_warmup_steps)
         self._perturbation_ramp_steps = int(perturbation_ramp_steps)
-        self._sparsity = float(sparsity)
-        self._leaky_relu_slope = float(leaky_relu_slope)
+        self._sparsity = float(validated_sparsity)
+        self._leaky_relu_slope = float(validated_leaky_relu_slope)
         self._use_layer_norm = bool(use_layer_norm)
         self._loss_normalization = loss_normalization
-        self._positive_target_loss_scale = float(positive_target_loss_scale)
-        self._negative_target_loss_scale = float(negative_target_loss_scale)
+        self._positive_target_loss_scale = float(validated_positive_target_loss_scale)
+        self._negative_target_loss_scale = float(validated_negative_target_loss_scale)
         self._head_gradient_scale = head_gradient_scale
-        self._head_step_size_multiplier = float(head_step_size_multiplier)
-        self._head_bias_step_size_multiplier = float(head_bias_step_size_multiplier)
-        self._head_loss_pressure_gate_ratio = float(head_loss_pressure_gate_ratio)
-        self._head_loss_pressure_multiplier = float(head_loss_pressure_multiplier)
+        self._head_step_size_multiplier = float(validated_head_step_size_multiplier)
+        self._head_bias_step_size_multiplier = float(validated_head_bias_step_size_multiplier)
+        self._head_loss_pressure_gate_ratio = float(validated_head_loss_pressure_gate_ratio)
+        self._head_loss_pressure_multiplier = float(validated_head_loss_pressure_multiplier)
         self._head_loss_pressure_warmup_steps = int(head_loss_pressure_warmup_steps)
-        self._head_repetition_multiplier = float(head_repetition_multiplier)
-        self._head_repetition_decay = float(head_repetition_decay)
-        self._head_repetition_delta_threshold = float(
-            head_repetition_delta_threshold
-        )
+        self._head_repetition_multiplier = float(validated_head_repetition_multiplier)
+        self._head_repetition_decay = float(validated_head_repetition_decay)
+        self._head_repetition_delta_threshold = float(validated_head_repetition_delta_threshold)
         self._head_repetition_pressure_threshold = float(
-            head_repetition_pressure_threshold
+            validated_head_repetition_pressure_threshold
         )
         self._head_repetition_warmup_steps = int(head_repetition_warmup_steps)
-        self._unit_replacement_rate = float(unit_replacement_rate)
+        self._unit_replacement_rate = float(validated_unit_replacement_rate)
         self._unit_maturity_threshold = int(unit_maturity_threshold)
         self._unit_utility_decay = (
-            float(utility_decay)
-            if unit_utility_decay is None
-            else float(unit_utility_decay)
+            float(validated_utility_decay)
+            if validated_unit_utility_decay is None
+            else float(validated_unit_utility_decay)
         )
-        self._unit_long_utility_decay = float(unit_long_utility_decay)
-        self._unit_gradient_decay = float(unit_gradient_decay)
+        self._unit_long_utility_decay = float(validated_unit_long_utility_decay)
+        self._unit_gradient_decay = float(validated_unit_gradient_decay)
         self._unit_replacement_criterion = unit_replacement_criterion
         self._unit_replacement_fanin = unit_replacement_fanin
-        self._unit_replacement_loss_gate_ratio = float(unit_replacement_loss_gate_ratio)
+        self._unit_replacement_loss_gate_ratio = float(validated_unit_replacement_loss_gate_ratio)
         self._unit_replacement_budget_mode = unit_replacement_budget_mode
-        self._unit_replacement_outgoing_scale = float(unit_replacement_outgoing_scale)
+        self._unit_replacement_outgoing_scale = float(validated_unit_replacement_outgoing_scale)
         self._unit_replacement_partial_fanin = int(unit_replacement_partial_fanin)
-        self._unit_replacement_score_threshold = float(
-            unit_replacement_score_threshold
-        )
-        self._unit_outgoing_utility_weight = float(unit_outgoing_utility_weight)
+        self._unit_replacement_score_threshold = float(validated_unit_replacement_score_threshold)
+        self._unit_outgoing_utility_weight = float(validated_unit_outgoing_utility_weight)
         self._track_unit_utilities = bool(track_unit_utilities)
         self._track_gradient_history = bool(track_gradient_history)
-        self._loss_fast_decay = float(loss_fast_decay)
-        self._loss_slow_decay = float(loss_slow_decay)
+        self._loss_fast_decay = float(validated_loss_fast_decay)
+        self._loss_slow_decay = float(validated_loss_slow_decay)
         self._adaptive_kappa_mode = adaptive_kappa_mode
-        self._adaptive_kappa_base = float(adaptive_kappa_base)
-        self._adaptive_kappa_min = float(adaptive_kappa_min)
-        self._adaptive_kappa_max = float(adaptive_kappa_max)
-        self._adaptive_kappa_exponent = float(adaptive_kappa_exponent)
+        self._adaptive_kappa_base = float(validated_adaptive_kappa_base)
+        self._adaptive_kappa_min = float(validated_adaptive_kappa_min)
+        self._adaptive_kappa_max = float(validated_adaptive_kappa_max)
+        self._adaptive_kappa_exponent = float(validated_adaptive_kappa_exponent)
         self._adaptive_kappa_warmup_steps = int(adaptive_kappa_warmup_steps)
-        self._adaptive_kappa_meta_step_size = float(adaptive_kappa_meta_step_size)
+        self._adaptive_kappa_meta_step_size = float(validated_adaptive_kappa_meta_step_size)
         self._adaptive_kappa_meta_min_multiplier = float(
-            adaptive_kappa_meta_min_multiplier
+            validated_adaptive_kappa_meta_min_multiplier
         )
         self._adaptive_kappa_meta_max_multiplier = float(
-            adaptive_kappa_meta_max_multiplier
+            validated_adaptive_kappa_meta_max_multiplier
         )
         self._adaptive_kappa_meta_warmup_steps = int(
             adaptive_kappa_meta_warmup_steps
         )
         self._meta_plasticity_mode = meta_plasticity_mode
-        self._meta_plasticity_step_size = float(meta_plasticity_step_size)
-        self._meta_plasticity_min_multiplier = float(
-            meta_plasticity_min_multiplier
-        )
-        self._meta_plasticity_max_multiplier = float(
-            meta_plasticity_max_multiplier
-        )
+        self._meta_plasticity_step_size = float(validated_meta_plasticity_step_size)
+        self._meta_plasticity_min_multiplier = float(validated_meta_plasticity_min_multiplier)
+        self._meta_plasticity_max_multiplier = float(validated_meta_plasticity_max_multiplier)
         self._meta_plasticity_warmup_steps = int(meta_plasticity_warmup_steps)
         self._meta_plasticity_trunk_enabled = bool(meta_plasticity_trunk_enabled)
-        self._meta_plasticity_head_weight_enabled = bool(
-            meta_plasticity_head_weight_enabled
-        )
-        self._meta_plasticity_head_bias_enabled = bool(
-            meta_plasticity_head_bias_enabled
-        )
-        self._meta_plasticity_repetition_enabled = bool(
-            meta_plasticity_repetition_enabled
-        )
+        self._meta_plasticity_head_weight_enabled = bool(meta_plasticity_head_weight_enabled)
+        self._meta_plasticity_head_bias_enabled = bool(meta_plasticity_head_bias_enabled)
+        self._meta_plasticity_repetition_enabled = bool(meta_plasticity_repetition_enabled)
         self._readout_mode = readout_mode
         self._readout_loss_mode = resolved_readout_loss_mode
         self._readout_prediction_mode = resolved_readout_prediction_mode
-        self._readout_robust_q = float(readout_robust_q)
-        self._readout_adaptive_gate_start = float(readout_adaptive_gate_start)
-        self._readout_adaptive_gate_width = float(readout_adaptive_gate_width)
+        self._readout_robust_q = float(validated_readout_robust_q)
+        self._readout_adaptive_gate_start = float(validated_readout_adaptive_gate_start)
+        self._readout_adaptive_gate_width = float(validated_readout_adaptive_gate_width)
         self._readout_input_mode = readout_input_mode
         self._readout_head_normalization = readout_head_normalization
-        self._readout_margin = float(readout_margin)
-        self._readout_margin_step_size = float(readout_margin_step_size)
-        self._readout_label_adapter_step_size = float(
-            readout_label_adapter_step_size
-        )
+        self._readout_margin = float(validated_readout_margin)
+        self._readout_margin_step_size = float(validated_readout_margin_step_size)
+        self._readout_label_adapter_step_size = float(validated_readout_label_adapter_step_size)
         self._readout_label_adapter_identity_regularization = float(
-            readout_label_adapter_identity_regularization
+            validated_readout_label_adapter_identity_regularization
         )
         self._readout_label_adapter_entropy_regularization = float(
-            readout_label_adapter_entropy_regularization
+            validated_readout_label_adapter_entropy_regularization
         )
-        self._readout_label_adapter_floor = float(readout_label_adapter_floor)
+        self._readout_label_adapter_floor = float(validated_readout_label_adapter_floor)
         self._readout_fast_head_step_size_multiplier = float(
-            readout_fast_head_step_size_multiplier
+            validated_readout_fast_head_step_size_multiplier
         )
         self._readout_fast_head_bias_step_size_multiplier = float(
-            readout_fast_head_bias_step_size_multiplier
+            validated_readout_fast_head_bias_step_size_multiplier
         )
         self._readout_fast_trunk_gradient_multiplier = float(
-            readout_fast_trunk_gradient_multiplier
+            validated_readout_fast_trunk_gradient_multiplier
         )
         self._readout_fast_head_bounder_mode = readout_fast_head_bounder_mode
         self._readout_slow_simplex_gradient_multiplier = float(
-            readout_slow_simplex_gradient_multiplier
+            validated_readout_slow_simplex_gradient_multiplier
         )
-        self._readout_simplex_bias_decay = float(readout_simplex_bias_decay)
+        self._readout_simplex_bias_decay = float(validated_readout_simplex_bias_decay)
         self._readout_simplex_bias_centering_rate = float(
-            readout_simplex_bias_centering_rate
+            validated_readout_simplex_bias_centering_rate
         )
 
     @property
@@ -1254,19 +1266,13 @@ class UPGDLearner:
                 readout_label_adapter_entropy_regularization
             ),
             readout_label_adapter_floor=readout_label_adapter_floor,
-            readout_fast_head_step_size_multiplier=(
-                readout_fast_head_step_size_multiplier
-            ),
+            readout_fast_head_step_size_multiplier=(readout_fast_head_step_size_multiplier),
             readout_fast_head_bias_step_size_multiplier=(
                 readout_fast_head_bias_step_size_multiplier
             ),
-            readout_fast_trunk_gradient_multiplier=(
-                readout_fast_trunk_gradient_multiplier
-            ),
+            readout_fast_trunk_gradient_multiplier=(readout_fast_trunk_gradient_multiplier),
             readout_fast_head_bounder_mode=readout_fast_head_bounder_mode,
-            readout_slow_simplex_gradient_multiplier=(
-                readout_slow_simplex_gradient_multiplier
-            ),
+            readout_slow_simplex_gradient_multiplier=(readout_slow_simplex_gradient_multiplier),
             track_unit_utilities=False,
             track_gradient_history=False,
         )
@@ -1364,22 +1370,14 @@ class UPGDLearner:
             "negative_target_loss_scale": self._negative_target_loss_scale,
             "head_gradient_scale": self._head_gradient_scale,
             "head_step_size_multiplier": self._head_step_size_multiplier,
-            "head_bias_step_size_multiplier": (
-                self._head_bias_step_size_multiplier
-            ),
+            "head_bias_step_size_multiplier": (self._head_bias_step_size_multiplier),
             "head_loss_pressure_gate_ratio": self._head_loss_pressure_gate_ratio,
             "head_loss_pressure_multiplier": self._head_loss_pressure_multiplier,
-            "head_loss_pressure_warmup_steps": (
-                self._head_loss_pressure_warmup_steps
-            ),
+            "head_loss_pressure_warmup_steps": (self._head_loss_pressure_warmup_steps),
             "head_repetition_multiplier": self._head_repetition_multiplier,
             "head_repetition_decay": self._head_repetition_decay,
-            "head_repetition_delta_threshold": (
-                self._head_repetition_delta_threshold
-            ),
-            "head_repetition_pressure_threshold": (
-                self._head_repetition_pressure_threshold
-            ),
+            "head_repetition_delta_threshold": (self._head_repetition_delta_threshold),
+            "head_repetition_pressure_threshold": (self._head_repetition_pressure_threshold),
             "head_repetition_warmup_steps": self._head_repetition_warmup_steps,
             "unit_replacement_rate": self._unit_replacement_rate,
             "unit_maturity_threshold": self._unit_maturity_threshold,
@@ -1388,19 +1386,11 @@ class UPGDLearner:
             "unit_gradient_decay": self._unit_gradient_decay,
             "unit_replacement_criterion": self._unit_replacement_criterion,
             "unit_replacement_fanin": self._unit_replacement_fanin,
-            "unit_replacement_loss_gate_ratio": (
-                self._unit_replacement_loss_gate_ratio
-            ),
+            "unit_replacement_loss_gate_ratio": (self._unit_replacement_loss_gate_ratio),
             "unit_replacement_budget_mode": self._unit_replacement_budget_mode,
-            "unit_replacement_outgoing_scale": (
-                self._unit_replacement_outgoing_scale
-            ),
-            "unit_replacement_partial_fanin": (
-                self._unit_replacement_partial_fanin
-            ),
-            "unit_replacement_score_threshold": (
-                self._unit_replacement_score_threshold
-            ),
+            "unit_replacement_outgoing_scale": (self._unit_replacement_outgoing_scale),
+            "unit_replacement_partial_fanin": (self._unit_replacement_partial_fanin),
+            "unit_replacement_score_threshold": (self._unit_replacement_score_threshold),
             "unit_outgoing_utility_weight": self._unit_outgoing_utility_weight,
             "track_unit_utilities": self._track_unit_utilities,
             "track_gradient_history": self._track_gradient_history,
@@ -1412,41 +1402,19 @@ class UPGDLearner:
             "adaptive_kappa_max": self._adaptive_kappa_max,
             "adaptive_kappa_exponent": self._adaptive_kappa_exponent,
             "adaptive_kappa_warmup_steps": self._adaptive_kappa_warmup_steps,
-            "adaptive_kappa_meta_step_size": (
-                self._adaptive_kappa_meta_step_size
-            ),
-            "adaptive_kappa_meta_min_multiplier": (
-                self._adaptive_kappa_meta_min_multiplier
-            ),
-            "adaptive_kappa_meta_max_multiplier": (
-                self._adaptive_kappa_meta_max_multiplier
-            ),
-            "adaptive_kappa_meta_warmup_steps": (
-                self._adaptive_kappa_meta_warmup_steps
-            ),
+            "adaptive_kappa_meta_step_size": (self._adaptive_kappa_meta_step_size),
+            "adaptive_kappa_meta_min_multiplier": (self._adaptive_kappa_meta_min_multiplier),
+            "adaptive_kappa_meta_max_multiplier": (self._adaptive_kappa_meta_max_multiplier),
+            "adaptive_kappa_meta_warmup_steps": (self._adaptive_kappa_meta_warmup_steps),
             "meta_plasticity_mode": self._meta_plasticity_mode,
             "meta_plasticity_step_size": self._meta_plasticity_step_size,
-            "meta_plasticity_min_multiplier": (
-                self._meta_plasticity_min_multiplier
-            ),
-            "meta_plasticity_max_multiplier": (
-                self._meta_plasticity_max_multiplier
-            ),
-            "meta_plasticity_warmup_steps": (
-                self._meta_plasticity_warmup_steps
-            ),
-            "meta_plasticity_trunk_enabled": (
-                self._meta_plasticity_trunk_enabled
-            ),
-            "meta_plasticity_head_weight_enabled": (
-                self._meta_plasticity_head_weight_enabled
-            ),
-            "meta_plasticity_head_bias_enabled": (
-                self._meta_plasticity_head_bias_enabled
-            ),
-            "meta_plasticity_repetition_enabled": (
-                self._meta_plasticity_repetition_enabled
-            ),
+            "meta_plasticity_min_multiplier": (self._meta_plasticity_min_multiplier),
+            "meta_plasticity_max_multiplier": (self._meta_plasticity_max_multiplier),
+            "meta_plasticity_warmup_steps": (self._meta_plasticity_warmup_steps),
+            "meta_plasticity_trunk_enabled": (self._meta_plasticity_trunk_enabled),
+            "meta_plasticity_head_weight_enabled": (self._meta_plasticity_head_weight_enabled),
+            "meta_plasticity_head_bias_enabled": (self._meta_plasticity_head_bias_enabled),
+            "meta_plasticity_repetition_enabled": (self._meta_plasticity_repetition_enabled),
             "readout_mode": self._readout_mode,
             "readout_loss_mode": self._readout_loss_mode,
             "readout_prediction_mode": self._readout_prediction_mode,
@@ -1457,9 +1425,7 @@ class UPGDLearner:
             "readout_head_normalization": self._readout_head_normalization,
             "readout_margin": self._readout_margin,
             "readout_margin_step_size": self._readout_margin_step_size,
-            "readout_label_adapter_step_size": (
-                self._readout_label_adapter_step_size
-            ),
+            "readout_label_adapter_step_size": (self._readout_label_adapter_step_size),
             "readout_label_adapter_identity_regularization": (
                 self._readout_label_adapter_identity_regularization
             ),
@@ -1481,25 +1447,126 @@ class UPGDLearner:
                 self._readout_slow_simplex_gradient_multiplier
             ),
             "readout_simplex_bias_decay": self._readout_simplex_bias_decay,
-            "readout_simplex_bias_centering_rate": (
-                self._readout_simplex_bias_centering_rate
-            ),
+            "readout_simplex_bias_centering_rate": (self._readout_simplex_bias_centering_rate),
         }
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> "UPGDLearner":
+    def from_config(cls, config: object) -> "UPGDLearner":
         """Reconstruct a :class:`UPGDLearner` from a config dict."""
         from alberta_framework.core.optimizers import bounder_from_config
 
-        config = dict(config)
-        config.pop("type", None)
-        bounder_cfg = config.pop("bounder", None)
-        bounder = bounder_from_config(bounder_cfg) if bounder_cfg is not None else None
+        data = _copy_mapping(config, name="UPGDLearner")
+        config_type = data.pop("type", None)
+        if type(config_type) is not str or config_type != "UPGDLearner":
+            raise ValueError("UPGDLearner payload type must be UPGDLearner")
+        bounder_cfg = data.pop("bounder", None)
+        bounder = bounder_from_config(bounder_cfg) if bounder_cfg is not None else None  # type: ignore[arg-type]
+        raw_hidden = data.pop("hidden_sizes", None)
+        if raw_hidden is None:
+            raise ValueError("hidden_sizes is required")
+        if isinstance(raw_hidden, (str, bytes)):
+            raise ValueError("hidden_sizes must be a tuple of integers")
+        if not isinstance(raw_hidden, (tuple, list)):
+            raise ValueError("hidden_sizes must be a tuple of integers")
+        hidden_list: list[int] = []
+        for idx, value in enumerate(raw_hidden):
+            hidden_list.append(_require_int(f"hidden_sizes[{idx}]", value, minimum=1))
+        hidden_sizes = tuple(hidden_list)
+        raw_n_heads = data.pop("n_heads", None)
+        if raw_n_heads is None:
+            raise ValueError("n_heads is required")
+        n_heads = _require_int("n_heads", raw_n_heads, minimum=1)
+        # Validate no unknown fields remain will be checked by cls(...)
+        if data.keys() - {
+            "step_size",
+            "utility_decay",
+            "perturbation_sigma",
+            "perturbation_beta",
+            "perturbation_interval",
+            "perturbation_noise",
+            "perturbation_warmup_steps",
+            "perturbation_ramp_steps",
+            "sparsity",
+            "leaky_relu_slope",
+            "use_layer_norm",
+            "loss_normalization",
+            "positive_target_loss_scale",
+            "negative_target_loss_scale",
+            "head_gradient_scale",
+            "head_step_size_multiplier",
+            "head_bias_step_size_multiplier",
+            "head_loss_pressure_gate_ratio",
+            "head_loss_pressure_multiplier",
+            "head_loss_pressure_warmup_steps",
+            "head_repetition_multiplier",
+            "head_repetition_decay",
+            "head_repetition_delta_threshold",
+            "head_repetition_pressure_threshold",
+            "head_repetition_warmup_steps",
+            "unit_replacement_rate",
+            "unit_maturity_threshold",
+            "unit_utility_decay",
+            "unit_long_utility_decay",
+            "unit_gradient_decay",
+            "unit_replacement_criterion",
+            "unit_replacement_fanin",
+            "unit_replacement_loss_gate_ratio",
+            "unit_replacement_budget_mode",
+            "unit_replacement_outgoing_scale",
+            "unit_replacement_partial_fanin",
+            "unit_replacement_score_threshold",
+            "unit_outgoing_utility_weight",
+            "track_unit_utilities",
+            "track_gradient_history",
+            "loss_fast_decay",
+            "loss_slow_decay",
+            "adaptive_kappa_mode",
+            "adaptive_kappa_base",
+            "adaptive_kappa_min",
+            "adaptive_kappa_max",
+            "adaptive_kappa_exponent",
+            "adaptive_kappa_warmup_steps",
+            "adaptive_kappa_meta_step_size",
+            "adaptive_kappa_meta_min_multiplier",
+            "adaptive_kappa_meta_max_multiplier",
+            "adaptive_kappa_meta_warmup_steps",
+            "meta_plasticity_mode",
+            "meta_plasticity_step_size",
+            "meta_plasticity_min_multiplier",
+            "meta_plasticity_max_multiplier",
+            "meta_plasticity_warmup_steps",
+            "meta_plasticity_trunk_enabled",
+            "meta_plasticity_head_weight_enabled",
+            "meta_plasticity_head_bias_enabled",
+            "meta_plasticity_repetition_enabled",
+            "readout_mode",
+            "readout_loss_mode",
+            "readout_prediction_mode",
+            "readout_robust_q",
+            "readout_adaptive_gate_start",
+            "readout_adaptive_gate_width",
+            "readout_input_mode",
+            "readout_head_normalization",
+            "readout_margin",
+            "readout_margin_step_size",
+            "readout_label_adapter_step_size",
+            "readout_label_adapter_identity_regularization",
+            "readout_label_adapter_entropy_regularization",
+            "readout_label_adapter_floor",
+            "readout_fast_head_step_size_multiplier",
+            "readout_fast_head_bias_step_size_multiplier",
+            "readout_fast_trunk_gradient_multiplier",
+            "readout_fast_head_bounder_mode",
+            "readout_slow_simplex_gradient_multiplier",
+            "readout_simplex_bias_decay",
+            "readout_simplex_bias_centering_rate",
+        }:
+            raise ValueError("UPGDLearner payload has unknown fields")
         return cls(
-            n_heads=config.pop("n_heads"),
-            hidden_sizes=tuple(config.pop("hidden_sizes")),
+            n_heads=n_heads,
+            hidden_sizes=hidden_sizes,
             bounder=bounder,
-            **config,
+            **data,  # type: ignore
         )
 
     # -------------------------------------------------------------------------
@@ -1520,9 +1587,47 @@ class UPGDLearner:
         Returns:
             Initial :class:`UPGDState`
         """
-        if feature_dim < 1:
-            msg = f"feature_dim must be >= 1, got {feature_dim}"
-            raise ValueError(msg)
+        feature_dim = _require_int("feature_dim", feature_dim, minimum=1)
+        # Allocation preflight for init (allocation-free)
+        trunk_layer_sizes = [int(feature_dim), *map(int, self._hidden_sizes)]
+        total_trunk_params = 0
+        total_trunk_bias = 0
+        for i in range(len(trunk_layer_sizes) - 1):
+            fan_in = trunk_layer_sizes[i]
+            fan_out = trunk_layer_sizes[i + 1]
+            total_trunk_params += fan_in * fan_out
+            total_trunk_bias += fan_out
+        h_last = int(self._hidden_sizes[-1]) if self._hidden_sizes else int(feature_dim)
+        head_input_dim = h_last
+        if self._readout_input_mode == "hidden_plus_input" and self._hidden_sizes:
+            head_input_dim += int(feature_dim)
+        total_head_params = int(self._n_heads) * head_input_dim
+        total_head_bias = int(self._n_heads)
+        # utilities mirror trunk weights, unit arrays mirror fan_out per layer if enabled
+        store_unit = self._stores_unit_state()
+        store_grad = self._stores_gradient_history()
+        utility_scalars = total_trunk_params
+        unit_scalars = 0
+        grad_scalars = 0
+        if store_unit:
+            for fan_out in trunk_layer_sizes[1:]:
+                unit_scalars += 4 * fan_out  # unit_utilities, long, grad_ema, ages
+            unit_scalars += 2 * len(trunk_layer_sizes[1:])  # replacement counts/accumulators
+        if store_grad:
+            grad_scalars += total_trunk_params + total_trunk_bias + total_head_params + total_head_bias  # noqa: E501
+        total_scalars = (
+            total_trunk_params
+            + total_trunk_bias
+            + total_head_params
+            + total_head_bias
+            + utility_scalars
+            + unit_scalars
+            + grad_scalars
+            + int(self._n_heads) * int(self._n_heads)  # label adapter
+            + int(self._n_heads)  # previous_targets
+            + 8  # small fixed EMAs and scales
+        )
+        _require_float32_resource("UPGDState init", vector_scalars=total_scalars)
         # Trunk: feature_dim -> H1 -> H2 -> ... -> H_last
         trunk_layer_sizes = [feature_dim, *self._hidden_sizes]
         store_unit_state = self._stores_unit_state()
@@ -1610,24 +1715,16 @@ class UPGDLearner:
             meta_repetition_log_scale=jnp.array(0.0, dtype=jnp.float32),
             adaptive_kappa_log_scale=jnp.array(0.0, dtype=jnp.float32),
             previous_trunk_weight_grads=(
-                tuple(jnp.zeros_like(w) for w in trunk_weights)
-                if store_gradient_history
-                else ()
+                tuple(jnp.zeros_like(w) for w in trunk_weights) if store_gradient_history else ()
             ),
             previous_trunk_bias_grads=(
-                tuple(jnp.zeros_like(b) for b in trunk_biases)
-                if store_gradient_history
-                else ()
+                tuple(jnp.zeros_like(b) for b in trunk_biases) if store_gradient_history else ()
             ),
             previous_head_weight_grads=(
-                tuple(jnp.zeros_like(w) for w in head_weights)
-                if store_gradient_history
-                else ()
+                tuple(jnp.zeros_like(w) for w in head_weights) if store_gradient_history else ()
             ),
             previous_head_bias_grads=(
-                tuple(jnp.zeros_like(b) for b in head_biases)
-                if store_gradient_history
-                else ()
+                tuple(jnp.zeros_like(b) for b in head_biases) if store_gradient_history else ()
             ),
             key=key,
             step_count=jnp.array(0, dtype=jnp.int32),
@@ -1759,10 +1856,7 @@ class UPGDLearner:
             return adaptive_gate * adapted + (1.0 - adaptive_gate) * logits
         if self._readout_prediction_mode == "two_timescale_simplex":
             fast = logits if fast_logits is None else fast_logits
-            return (
-                adaptive_gate * self._softmax_predictions(fast)
-                + (1.0 - adaptive_gate) * logits
-            )
+            return adaptive_gate * self._softmax_predictions(fast) + (1.0 - adaptive_gate) * logits
         if self._readout_prediction_mode == "unit_clip":
             return jnp.clip(logits, 0.0, 1.0)
         return logits
@@ -1781,7 +1875,11 @@ class UPGDLearner:
         delta_bar = jnp.maximum(jnp.abs(error_scalar), 1.0)
         bound_magnitude = kappa * delta_bar * total_step
         scale = 1.0 / jnp.maximum(bound_magnitude, 1.0)
-        return tuple(scale * step for step in steps), scale
+        collapsed = scale == 0
+        return (
+            tuple(zero_if_collapsed_infinity(scale * step, step, collapsed) for step in steps),
+            scale,
+        )
 
     @staticmethod
     def _tuple_dot(xs: tuple[Array, ...], ys: tuple[Array, ...]) -> Array:
@@ -1809,8 +1907,7 @@ class UPGDLearner:
         current_norm = UPGDLearner._tuple_norm(current)
         return jnp.where(
             (previous_norm > 1e-6) & (current_norm > 1e-6),
-            UPGDLearner._tuple_dot(previous, current)
-            / (previous_norm * current_norm + 1e-12),
+            UPGDLearner._tuple_dot(previous, current) / (previous_norm * current_norm + 1e-12),
             jnp.array(0.0, dtype=jnp.float32),
         )
 
@@ -1886,7 +1983,16 @@ class UPGDLearner:
         Returns:
             :class:`UPGDUpdateResult` with the updated state, predictions,
             errors, and 1D metrics array.
+
+        Raises:
+            ValueError: If ``targets`` is not one value per head; a
+                broadcastable scalar or length-1 target would train every head
+                while the active-head count normalizing the loss and step
+                sizes counted one.
         """
+        targets = jnp.asarray(targets, dtype=jnp.float32)
+        if targets.shape != (self._n_heads,):
+            raise ValueError(f"targets must have shape ({self._n_heads},), got {targets.shape}")
         slope = self._leaky_relu_slope
         ln = self._use_layer_norm
         sigma = jnp.array(self._perturbation_sigma, dtype=jnp.float32)
@@ -1913,22 +2019,14 @@ class UPGDLearner:
         safe_targets = jnp.where(active_mask, targets, 0.0)
         n_active = jnp.maximum(jnp.sum(active_mask.astype(jnp.float32)), 1.0)
         n_nonzero_targets = jnp.maximum(
-            jnp.sum(
-                jnp.logical_and(active_mask, jnp.abs(safe_targets) > 1e-8).astype(
-                    jnp.float32
-                )
-            ),
+            jnp.sum(jnp.logical_and(active_mask, jnp.abs(safe_targets) > 1e-8).astype(jnp.float32)),
             1.0,
         )
         active_targets = jnp.where(active_mask, safe_targets, 0.0)
         target_mass = jnp.sum(jnp.where(active_mask, active_targets, 0.0))
-        has_negative_target = jnp.any(
-            jnp.logical_and(active_mask, active_targets < -1e-6)
-        )
+        has_negative_target = jnp.any(jnp.logical_and(active_mask, active_targets < -1e-6))
         simplex_like_target = (
-            (~has_negative_target)
-            & (target_mass > 1e-8)
-            & (jnp.abs(target_mass - 1.0) <= 1e-5)
+            (~has_negative_target) & (target_mass > 1e-8) & (jnp.abs(target_mass - 1.0) <= 1e-5)
         )
         adaptive_simplex_gate = jnp.where(
             simplex_like_target & (self._n_heads > 1),
@@ -1955,7 +2053,7 @@ class UPGDLearner:
             trunk_biases: tuple[Array, ...],
             head_weights: tuple[Array, ...],
             head_biases: tuple[Array, ...],
-        ) -> tuple[Array, tuple[Array, Array]]:
+        ) -> tuple[Array, tuple[Array, Array, Array]]:
             logits_for_loss, hidden_for_loss = self._forward_with_readout_input(
                 trunk_weights,
                 trunk_biases,
@@ -1986,8 +2084,7 @@ class UPGDLearner:
                 )
                 target_probs = jnp.where(
                     active_mask,
-                    jnp.maximum(safe_targets, 0.0)
-                    / jnp.maximum(active_target_mass, 1e-12),
+                    jnp.maximum(safe_targets, 0.0) / jnp.maximum(active_target_mass, 1e-12),
                     0.0,
                 )
                 ce = -jnp.sum(target_probs * jnp.log(probs + 1e-8))
@@ -1996,17 +2093,13 @@ class UPGDLearner:
                     ce,
                     jnp.array(0.0, dtype=ce.dtype),
                 )
-                brier = 0.5 * jnp.sum(
-                    jnp.where(active_mask, (probs - target_probs) ** 2, 0.0)
-                )
+                brier = 0.5 * jnp.sum(jnp.where(active_mask, (probs - target_probs) ** 2, 0.0))
                 brier_loss = jnp.where(
                     active_target_mass > 0.0,
                     brier,
                     jnp.array(0.0, dtype=brier.dtype),
                 )
-                target_confidence = jnp.sum(
-                    target_probs * (probs ** robust_q)
-                )
+                target_confidence = jnp.sum(target_probs * (probs**robust_q))
                 gce = (1.0 - target_confidence) / robust_q
                 gce_loss = jnp.where(
                     active_target_mass > 0.0,
@@ -2044,25 +2137,27 @@ class UPGDLearner:
                 elif self._readout_loss_mode == "adaptive_gce":
                     loss = jnp.where(
                         simplex_like_target,
-                        adaptive_simplex_gate * ce_loss
-                        + (1.0 - adaptive_simplex_gate) * gce_loss,
+                        adaptive_simplex_gate * ce_loss + (1.0 - adaptive_simplex_gate) * gce_loss,
                         mse_loss,
                     )
                 elif self._readout_loss_mode == "adaptive_factorized_simplex":
                     loss = jnp.where(
                         simplex_like_target,
-                        adaptive_simplex_gate * ce_loss
-                        + (1.0 - adaptive_simplex_gate) * mse_loss,
+                        adaptive_simplex_gate * ce_loss + (1.0 - adaptive_simplex_gate) * mse_loss,
                         mse_loss,
                     )
                 elif self._readout_loss_mode == "two_timescale_simplex":
                     loss = slow_simplex_gradient_scale * mse_loss
                 else:
                     loss = (
-                        adaptive_simplex_gate * ce_loss
-                        + (1.0 - adaptive_simplex_gate) * mse_loss
+                        adaptive_simplex_gate * ce_loss + (1.0 - adaptive_simplex_gate) * mse_loss
                     )
-                return loss, (logits_for_loss, hidden_for_loss)
+                # The gradient-budget scale shapes the differentiated objective only;
+                # the reported loss stays the unscaled prediction loss.
+                reported_loss = (
+                    mse_loss if self._readout_loss_mode == "two_timescale_simplex" else loss
+                )
+                return loss, (logits_for_loss, hidden_for_loss, reported_loss)
             preds = logits_for_loss
             sq = (preds - safe_targets) ** 2
             target_loss_weights = jnp.where(
@@ -2085,10 +2180,10 @@ class UPGDLearner:
                 ),
             )
             loss = 0.5 * jnp.sum(sq_masked) / denom
-            return loss, (logits_for_loss, hidden_for_loss)
+            return loss, (logits_for_loss, hidden_for_loss, loss)
 
         if not use_direct_mse_loss:
-            (loss_value, (logits, hidden_for_readout)), grads = jax.value_and_grad(
+            (_, (logits, hidden_for_readout, loss_value)), grads = jax.value_and_grad(
                 loss_and_aux_fn,
                 argnums=(0, 1, 2, 3),
                 has_aux=True,
@@ -2100,6 +2195,7 @@ class UPGDLearner:
             )
             trunk_w_grads, trunk_b_grads, head_w_grads, head_b_grads = grads
         else:
+
             def trunk_fn(
                 weights: tuple[Array, ...],
                 biases: tuple[Array, ...],
@@ -2137,22 +2233,15 @@ class UPGDLearner:
                     ),
                 ),
             )
-            loss_value = slow_simplex_gradient_scale * 0.5 * jnp.sum(sq_masked) / denom
+            loss_value = 0.5 * jnp.sum(sq_masked) / denom
             logit_grads = jnp.where(
                 active_mask,
-                slow_simplex_gradient_scale
-                * target_loss_weights
-                * (logits - safe_targets)
-                / denom,
+                slow_simplex_gradient_scale * target_loss_weights * (logits - safe_targets) / denom,
                 0.0,
             )
             head_w_grad_matrix = logit_grads[:, None] * hidden_for_readout[None, :]
-            head_w_grads = tuple(
-                head_w_grad_matrix[i : i + 1] for i in range(self._n_heads)
-            )
-            head_b_grads = tuple(
-                logit_grads[i : i + 1] for i in range(self._n_heads)
-            )
+            head_w_grads = tuple(head_w_grad_matrix[i : i + 1] for i in range(self._n_heads))
+            head_b_grads = tuple(logit_grads[i : i + 1] for i in range(self._n_heads))
             if self._readout_input_mode == "hidden_plus_input" and n_trunk > 0:
                 hidden_dim = raw_hidden.shape[0]
                 head_cotangent = head_matrix[:, :hidden_dim].T @ logit_grads
@@ -2160,12 +2249,8 @@ class UPGDLearner:
                 head_cotangent = head_matrix.T @ logit_grads
             trunk_w_grads, trunk_b_grads = trunk_vjp_fn(head_cotangent)
         fast_logits = logits
-        fast_head_w_grads = tuple(
-            jnp.zeros_like(w) for w in state.readout_fast_head_params.weights
-        )
-        fast_head_b_grads = tuple(
-            jnp.zeros_like(b) for b in state.readout_fast_head_params.biases
-        )
+        fast_head_w_grads = tuple(jnp.zeros_like(w) for w in state.readout_fast_head_params.weights)
+        fast_head_b_grads = tuple(jnp.zeros_like(b) for b in state.readout_fast_head_params.biases)
         if self._readout_prediction_mode == "two_timescale_simplex":
             fast_head_matrix = jnp.concatenate(
                 state.readout_fast_head_params.weights,
@@ -2183,8 +2268,7 @@ class UPGDLearner:
             )
             fast_target_probs = jnp.where(
                 active_mask,
-                jnp.maximum(safe_targets, 0.0)
-                / jnp.maximum(active_target_mass, 1e-12),
+                jnp.maximum(safe_targets, 0.0) / jnp.maximum(active_target_mass, 1e-12),
                 0.0,
             )
             fast_logit_grads = jnp.where(
@@ -2192,24 +2276,18 @@ class UPGDLearner:
                 fast_probs - fast_target_probs,
                 0.0,
             )
-            fast_head_w_grad_matrix = (
-                fast_logit_grads[:, None] * hidden_for_readout[None, :]
-            )
+            fast_head_w_grad_matrix = fast_logit_grads[:, None] * hidden_for_readout[None, :]
             fast_head_w_grads = tuple(
                 fast_head_w_grad_matrix[i : i + 1] for i in range(self._n_heads)
             )
-            fast_head_b_grads = tuple(
-                fast_logit_grads[i : i + 1] for i in range(self._n_heads)
-            )
+            fast_head_b_grads = tuple(fast_logit_grads[i : i + 1] for i in range(self._n_heads))
             if self._readout_fast_trunk_gradient_multiplier > 0.0:
                 fast_head_cotangent = (
                     fast_head_matrix[:, : raw_hidden.shape[0]].T @ fast_logit_grads
                     if self._readout_input_mode == "hidden_plus_input" and n_trunk > 0
                     else fast_head_matrix.T @ fast_logit_grads
                 )
-                fast_trunk_w_grads, fast_trunk_b_grads = trunk_vjp_fn(
-                    fast_head_cotangent
-                )
+                fast_trunk_w_grads, fast_trunk_b_grads = trunk_vjp_fn(fast_head_cotangent)
                 fast_trunk_scale = (
                     jnp.asarray(
                         self._readout_fast_trunk_gradient_multiplier,
@@ -2218,12 +2296,10 @@ class UPGDLearner:
                     * adaptive_simplex_gate
                 )
                 trunk_w_grads = tuple(
-                    g + fast_trunk_scale * fg
-                    for g, fg in zip(trunk_w_grads, fast_trunk_w_grads)
+                    g + fast_trunk_scale * fg for g, fg in zip(trunk_w_grads, fast_trunk_w_grads)
                 )
                 trunk_b_grads = tuple(
-                    g + fast_trunk_scale * fg
-                    for g, fg in zip(trunk_b_grads, fast_trunk_b_grads)
+                    g + fast_trunk_scale * fg for g, fg in zip(trunk_b_grads, fast_trunk_b_grads)
                 )
         predictions = self._prediction_from_logits(
             logits,
@@ -2234,13 +2310,13 @@ class UPGDLearner:
 
         sq_for_metric = (predictions - safe_targets) ** 2
         step_mse = jnp.sum(jnp.where(active_mask, sq_for_metric, 0.0)) / n_active
+        fast_decay = jnp.asarray(self._loss_fast_decay, dtype=jnp.float32)
+        slow_decay = jnp.asarray(self._loss_slow_decay, dtype=jnp.float32)
         new_loss_fast_ema = (
-            jnp.asarray(self._loss_fast_decay, dtype=jnp.float32) * state.loss_fast_ema
-            + (1.0 - jnp.asarray(self._loss_fast_decay, dtype=jnp.float32)) * step_mse
+            _skip_zero_scale(fast_decay, state.loss_fast_ema) + (1.0 - fast_decay) * step_mse
         )
         new_loss_slow_ema = (
-            jnp.asarray(self._loss_slow_decay, dtype=jnp.float32) * state.loss_slow_ema
-            + (1.0 - jnp.asarray(self._loss_slow_decay, dtype=jnp.float32)) * step_mse
+            _skip_zero_scale(slow_decay, state.loss_slow_ema) + (1.0 - slow_decay) * step_mse
         )
         loss_pressure = jnp.array(1.0, dtype=jnp.float32)
         if self._unit_replacement_loss_gate_ratio > 0.0:
@@ -2256,10 +2332,7 @@ class UPGDLearner:
                 1.0,
             )
         head_loss_pressure = jnp.array(0.0, dtype=jnp.float32)
-        if (
-            self._head_loss_pressure_gate_ratio > 0.0
-            and self._head_loss_pressure_multiplier > 0.0
-        ):
+        if self._head_loss_pressure_gate_ratio > 0.0 and self._head_loss_pressure_multiplier > 0.0:
             head_threshold = jnp.asarray(
                 self._head_loss_pressure_gate_ratio,
                 dtype=jnp.float32,
@@ -2284,24 +2357,13 @@ class UPGDLearner:
             self._head_repetition_delta_threshold,
             dtype=jnp.float32,
         )
-        new_target_repeat_ema = (
-            jnp.asarray(self._head_repetition_decay, dtype=jnp.float32)
-            * state.target_repeat_ema
-            + (
-                1.0
-                - jnp.asarray(self._head_repetition_decay, dtype=jnp.float32)
-            )
-            * repeat_now.astype(jnp.float32)
-        )
-        new_target_simplex_ema = (
-            jnp.asarray(self._head_repetition_decay, dtype=jnp.float32)
-            * state.target_simplex_ema
-            + (
-                1.0
-                - jnp.asarray(self._head_repetition_decay, dtype=jnp.float32)
-            )
-            * simplex_like_target.astype(jnp.float32)
-        )
+        repetition_decay = jnp.asarray(self._head_repetition_decay, dtype=jnp.float32)
+        new_target_repeat_ema = _skip_zero_scale(repetition_decay, state.target_repeat_ema) + (
+            1.0 - repetition_decay
+        ) * repeat_now.astype(jnp.float32)
+        new_target_simplex_ema = _skip_zero_scale(repetition_decay, state.target_simplex_ema) + (
+            1.0 - repetition_decay
+        ) * simplex_like_target.astype(jnp.float32)
         repetition_warm = state.step_count >= jnp.asarray(
             self._head_repetition_warmup_steps,
             dtype=jnp.int32,
@@ -2378,19 +2440,18 @@ class UPGDLearner:
             )
             * repetition_meta_scale
         )
-        head_scale = head_scale * (
-            1.0
-            + effective_repetition_multiplier * head_repetition_pressure
-        )
+        head_scale = head_scale * (1.0 + effective_repetition_multiplier * head_repetition_pressure)
         head_w_scale = head_scale * head_weight_meta_scale
-        head_b_scale = head_scale * head_bias_meta_scale * jnp.asarray(
-            self._head_bias_step_size_multiplier,
-            dtype=jnp.float32,
+        head_b_scale = (
+            head_scale
+            * head_bias_meta_scale
+            * jnp.asarray(
+                self._head_bias_step_size_multiplier,
+                dtype=jnp.float32,
+            )
         )
         if self._readout_head_normalization == "hidden_norm":
-            norm_scale = 1.0 / (
-                1.0 + jnp.sum(jnp.square(hidden_for_readout))
-            )
+            norm_scale = 1.0 / (1.0 + jnp.sum(jnp.square(hidden_for_readout)))
             head_w_scale = head_w_scale * norm_scale
             head_b_scale = head_b_scale * norm_scale
         head_w_steps = tuple(-step_size * head_w_scale * g for g in head_w_grads)
@@ -2406,12 +2467,8 @@ class UPGDLearner:
         if self._readout_head_normalization == "hidden_norm":
             fast_head_w_scale = fast_head_w_scale * norm_scale
             fast_head_b_scale = fast_head_b_scale * norm_scale
-        fast_head_w_steps = tuple(
-            -step_size * fast_head_w_scale * g for g in fast_head_w_grads
-        )
-        fast_head_b_steps = tuple(
-            -step_size * fast_head_b_scale * g for g in fast_head_b_grads
-        )
+        fast_head_w_steps = tuple(-step_size * fast_head_w_scale * g for g in fast_head_w_grads)
+        fast_head_b_steps = tuple(-step_size * fast_head_b_scale * g for g in fast_head_b_grads)
         bound_fast_readout = self._readout_prediction_mode == "two_timescale_simplex"
         bound_fast_readout_shared = (
             bound_fast_readout and self._readout_fast_head_bounder_mode == "shared"
@@ -2453,9 +2510,7 @@ class UPGDLearner:
                     dtype=jnp.float32,
                 )
                 if self._adaptive_kappa_mode == "loss_ratio":
-                    loss_ratio_for_kappa = new_loss_fast_ema / (
-                        new_loss_slow_ema + 1e-12
-                    )
+                    loss_ratio_for_kappa = new_loss_fast_ema / (new_loss_slow_ema + 1e-12)
                     raw_kappa = raw_kappa / (
                         jnp.maximum(loss_ratio_for_kappa, 1e-6)
                         ** jnp.asarray(
@@ -2493,17 +2548,11 @@ class UPGDLearner:
             trunk_w_steps = tuple(bounded_steps[idx + 2 * i] for i in range(n_trunk))
             trunk_b_steps = tuple(bounded_steps[idx + 2 * i + 1] for i in range(n_trunk))
             idx = 2 * n_trunk
-            head_w_steps = tuple(
-                bounded_steps[idx + 2 * i] for i in range(self._n_heads)
-            )
-            head_b_steps = tuple(
-                bounded_steps[idx + 2 * i + 1] for i in range(self._n_heads)
-            )
+            head_w_steps = tuple(bounded_steps[idx + 2 * i] for i in range(self._n_heads))
+            head_b_steps = tuple(bounded_steps[idx + 2 * i + 1] for i in range(self._n_heads))
             if bound_fast_readout_shared:
                 idx = idx + 2 * self._n_heads
-                fast_head_w_steps = tuple(
-                    bounded_steps[idx + 2 * i] for i in range(self._n_heads)
-                )
+                fast_head_w_steps = tuple(bounded_steps[idx + 2 * i] for i in range(self._n_heads))
                 fast_head_b_steps = tuple(
                     bounded_steps[idx + 2 * i + 1] for i in range(self._n_heads)
                 )
@@ -2521,9 +2570,7 @@ class UPGDLearner:
                         dtype=jnp.float32,
                     )
                     if self._adaptive_kappa_mode == "loss_ratio":
-                        loss_ratio_for_kappa = new_loss_fast_ema / (
-                            new_loss_slow_ema + 1e-12
-                        )
+                        loss_ratio_for_kappa = new_loss_fast_ema / (new_loss_slow_ema + 1e-12)
                         raw_kappa = raw_kappa / (
                             jnp.maximum(loss_ratio_for_kappa, 1e-6)
                             ** jnp.asarray(
@@ -2558,9 +2605,7 @@ class UPGDLearner:
                         mean_abs_err,
                         tuple(fast_params),
                     )
-                fast_head_w_steps = tuple(
-                    bounded_fast_steps[2 * i] for i in range(self._n_heads)
-                )
+                fast_head_w_steps = tuple(bounded_fast_steps[2 * i] for i in range(self._n_heads))
                 fast_head_b_steps = tuple(
                     bounded_fast_steps[2 * i + 1] for i in range(self._n_heads)
                 )
@@ -2573,12 +2618,10 @@ class UPGDLearner:
             state.trunk_params.biases[i] + trunk_b_steps[i] for i in range(n_trunk)
         )
         new_head_weights = tuple(
-            state.head_params.weights[i] + head_w_steps[i]
-            for i in range(self._n_heads)
+            state.head_params.weights[i] + head_w_steps[i] for i in range(self._n_heads)
         )
         new_head_biases = tuple(
-            state.head_params.biases[i] + head_b_steps[i]
-            for i in range(self._n_heads)
+            state.head_params.biases[i] + head_b_steps[i] for i in range(self._n_heads)
         )
         new_fast_head_weights = tuple(
             state.readout_fast_head_params.weights[i] + fast_head_w_steps[i]
@@ -2592,12 +2635,8 @@ class UPGDLearner:
         new_head_biases_list = list(new_head_biases)
 
         if self._readout_margin_step_size > 0.0 and self._n_heads > 1:
-            target_mass = jnp.sum(
-                jnp.where(active_mask, jnp.maximum(safe_targets, 0.0), 0.0)
-            )
-            true_idx = jnp.argmax(
-                jnp.where(active_mask, safe_targets, -jnp.inf)
-            ).astype(jnp.int32)
+            target_mass = jnp.sum(jnp.where(active_mask, jnp.maximum(safe_targets, 0.0), 0.0))
+            true_idx = jnp.argmax(jnp.where(active_mask, safe_targets, -jnp.inf)).astype(jnp.int32)
             head_indices = jnp.arange(self._n_heads, dtype=jnp.int32)
             wrong_logits = jnp.where(
                 jnp.logical_and(active_mask, head_indices != true_idx),
@@ -2610,9 +2649,8 @@ class UPGDLearner:
                 target_mass > 0.0,
                 margin < jnp.asarray(self._readout_margin, dtype=jnp.float32),
             )
-            margin_scale = (
-                jnp.asarray(self._readout_margin_step_size, dtype=jnp.float32)
-                / (1.0 + jnp.sum(jnp.square(hidden_for_readout)))
+            margin_scale = jnp.asarray(self._readout_margin_step_size, dtype=jnp.float32) / (
+                1.0 + jnp.sum(jnp.square(hidden_for_readout))
             )
             margin_delta = margin_scale * hidden_for_readout
             bias_delta = jnp.asarray(self._readout_margin_step_size, dtype=jnp.float32)
@@ -2623,12 +2661,8 @@ class UPGDLearner:
                     jnp.where(h == wrong_idx, jnp.float32(-1.0), jnp.float32(0.0)),
                 )
                 signed = jnp.where(do_margin, sign, jnp.float32(0.0))
-                new_head_weights_list[h] = (
-                    new_head_weights_list[h] + signed * margin_delta[None, :]
-                )
-                new_head_biases_list[h] = (
-                    new_head_biases_list[h] + signed * bias_delta
-                )
+                new_head_weights_list[h] = new_head_weights_list[h] + signed * margin_delta[None, :]
+                new_head_biases_list[h] = new_head_biases_list[h] + signed * bias_delta
 
         if (
             self._readout_simplex_bias_decay > 0.0
@@ -2645,9 +2679,7 @@ class UPGDLearner:
                 (1.0 - bias_decay) * bias_vector,
                 bias_vector,
             )
-            active_mean_bias = (
-                jnp.sum(active_bias_mask * decayed_bias_vector) / n_active
-            )
+            active_mean_bias = jnp.sum(active_bias_mask * decayed_bias_vector) / n_active
             centering_rate = jnp.asarray(
                 self._readout_simplex_bias_centering_rate,
                 dtype=jnp.float32,
@@ -2663,14 +2695,11 @@ class UPGDLearner:
                 centered_bias_vector,
                 bias_vector,
             )
-            new_head_biases_list = [
-                anti_drift_bias_vector[h : h + 1] for h in range(self._n_heads)
-            ]
+            new_head_biases_list = [anti_drift_bias_vector[h : h + 1] for h in range(self._n_heads)]
 
         new_readout_label_adapter = state.readout_label_adapter
         if (
-            self._readout_prediction_mode
-            in {"factorized_simplex", "adaptive_factorized_simplex"}
+            self._readout_prediction_mode in {"factorized_simplex", "adaptive_factorized_simplex"}
             and self._n_heads > 1
         ):
             adapter_eta = jnp.asarray(
@@ -2732,7 +2761,7 @@ class UPGDLearner:
         new_unit_ages: list[Array] = []
         for i in range(n_trunk):
             instantaneous = jnp.abs(state.trunk_params.weights[i] * trunk_w_grads[i])
-            u_new = decay * state.utilities[i] + (1.0 - decay) * instantaneous
+            u_new = _skip_zero_scale(decay, state.utilities[i]) + (1.0 - decay) * instantaneous
             new_utilities.append(u_new)
 
             if track_unit_utilities:
@@ -2743,10 +2772,7 @@ class UPGDLearner:
                 unit_signal = jnp.mean(instantaneous, axis=1)
                 if self._unit_outgoing_utility_weight > 0.0:
                     if i < n_trunk - 1:
-                        outgoing = jnp.abs(
-                            state.trunk_params.weights[i + 1]
-                            * trunk_w_grads[i + 1]
-                        )
+                        outgoing = jnp.abs(state.trunk_params.weights[i + 1] * trunk_w_grads[i + 1])
                         outgoing_signal = jnp.mean(outgoing, axis=0)
                     else:
                         layer_size = state.trunk_params.weights[i].shape[0]
@@ -2770,16 +2796,16 @@ class UPGDLearner:
                         * outgoing_signal
                     )
                 new_unit_utilities.append(
-                    unit_decay * state.unit_utilities[i]
+                    _skip_zero_scale(unit_decay, state.unit_utilities[i])
                     + (1.0 - unit_decay) * unit_signal
                 )
                 new_unit_long_utilities.append(
-                    unit_long_decay * state.unit_long_utilities[i]
+                    _skip_zero_scale(unit_long_decay, state.unit_long_utilities[i])
                     + (1.0 - unit_long_decay) * unit_signal
                 )
                 unit_gradient_signal = jnp.mean(jnp.abs(trunk_w_grads[i]), axis=1)
                 new_unit_gradient_emas.append(
-                    unit_gradient_decay * state.unit_gradient_emas[i]
+                    _skip_zero_scale(unit_gradient_decay, state.unit_gradient_emas[i])
                     + (1.0 - unit_gradient_decay) * unit_gradient_signal
                 )
                 new_unit_ages.append(state.unit_ages[i] + 1)
@@ -2907,9 +2933,6 @@ class UPGDLearner:
             new_accumulators = []
             new_replacement_counts = []
             for i in range(n_trunk):
-                layer_size = new_unit_utilities[i].shape[0]
-                layer_size_f = jnp.array(layer_size, dtype=jnp.float32)
-
                 mature = new_unit_ages[i] >= maturity
                 if self._unit_replacement_criterion == "stale_gradient_ratio":
                     util_norm = new_unit_long_utilities[i] / (
@@ -2968,10 +2991,11 @@ class UPGDLearner:
                     )
                 else:
                     rate_scale = jnp.array(1.0, dtype=jnp.float32)
-                accum = (
-                    state.unit_replacement_accumulators[i]
-                    + rate * layer_size_f * rate_scale
-                )
+                # Budget accrues against the units that are eligible (mature)
+                # right now, as in the reference GnT scheduler; immature units
+                # earn no budget, so warm-up cannot bank a replacement burst.
+                n_mature = jnp.sum(mature).astype(jnp.float32)
+                accum = state.unit_replacement_accumulators[i] + rate * n_mature * rate_scale
                 do_replace = accum >= 1.0
                 gated = jnp.logical_and(
                     jnp.logical_and(
@@ -2996,10 +3020,14 @@ class UPGDLearner:
                     )
                     utility_scores = new_utilities[i][unit_idx]
                     bottom_idx = jax.lax.top_k(-utility_scores, replace_count)[1]
-                    partial_mask = jnp.zeros(
-                        (layer_w.shape[1],),
-                        dtype=jnp.float32,
-                    ).at[bottom_idx].set(1.0)
+                    partial_mask = (
+                        jnp.zeros(
+                            (layer_w.shape[1],),
+                            dtype=jnp.float32,
+                        )
+                        .at[bottom_idx]
+                        .set(1.0)
+                    )
                     sampled = jnp.where(
                         partial_mask > 0.0,
                         sampled,
@@ -3070,7 +3098,8 @@ class UPGDLearner:
                 new_unit_ages[i] = unit_age.at[unit_idx].set(
                     jnp.where(gated, jnp.int32(0), unit_age[unit_idx])
                 )
-                new_accumulators.append(jnp.where(gated, accum - 1.0, accum))
+                # Never carry more than the one replacement a step can deliver.
+                new_accumulators.append(jnp.minimum(jnp.where(gated, accum - 1.0, accum), 1.0))
                 new_replacement_counts.append(
                     unit_replacement_counts[i] + gated.astype(jnp.float32)
                 )
@@ -3136,8 +3165,7 @@ class UPGDLearner:
                 trunk_w_grads + trunk_b_grads + head_w_grads + head_b_grads,
             )
             updated_kappa_log_scale = jnp.clip(
-                state.adaptive_kappa_log_scale
-                - kappa_meta_eta * global_alignment,
+                state.adaptive_kappa_log_scale - kappa_meta_eta * global_alignment,
                 kappa_min_log,
                 kappa_max_log,
             )
@@ -3253,9 +3281,7 @@ class UPGDLearner:
             uptime_s=state.uptime_s,
         )
 
-        metrics = jnp.stack(
-            [loss_value, mean_utility, min_utility, max_perturbation_magnitude]
-        )
+        metrics = jnp.stack([loss_value, mean_utility, min_utility, max_perturbation_magnitude])
 
         return UPGDUpdateResult(  # type: ignore[call-arg]
             state=new_state,
@@ -3290,9 +3316,7 @@ def run_upgd_arrays(
         4-column metrics array.
     """
 
-    def step_fn(
-        carry: UPGDState, inputs: tuple[Array, Array]
-    ) -> tuple[UPGDState, Array]:
+    def step_fn(carry: UPGDState, inputs: tuple[Array, Array]) -> tuple[UPGDState, Array]:
         obs, tgt = inputs
         result = learner.update(carry, obs, tgt)
         return result.state, result.metrics
@@ -3300,7 +3324,7 @@ def run_upgd_arrays(
     t0 = time.time()
     final_state, metrics = jax.lax.scan(step_fn, state, (observations, targets))
     elapsed = time.time() - t0
-    final_state = final_state.replace(uptime_s=final_state.uptime_s + elapsed)  # type: ignore[attr-defined]
+    final_state = final_state.replace(uptime_s=final_state.uptime_s + elapsed)  # type: ignore[attr-defined]  # noqa: E501
     return UPGDLearningResult(state=final_state, metrics=metrics)  # type: ignore[call-arg]
 
 
@@ -3337,9 +3361,7 @@ def run_upgd_loop[StreamStateT](
 
     n_heads = learner.n_heads
 
-    def step_fn(
-        carry: tuple[UPGDState, Any], idx: Array
-    ) -> tuple[tuple[UPGDState, Any], Array]:
+    def step_fn(carry: tuple[UPGDState, Any], idx: Array) -> tuple[tuple[UPGDState, Any], Array]:
         l_state, s_state = carry
         timestep, new_s_state = stream.step(s_state, idx)
         # Broadcast scalar/single-element target across heads.
@@ -3352,7 +3374,7 @@ def run_upgd_loop[StreamStateT](
         step_fn, (learner_state, stream_state), jnp.arange(num_steps)
     )
     elapsed = time.time() - t0
-    final_learner = final_learner.replace(uptime_s=final_learner.uptime_s + elapsed)  # type: ignore[attr-defined]
+    final_learner = final_learner.replace(uptime_s=final_learner.uptime_s + elapsed)  # type: ignore[attr-defined]  # noqa: E501
     return UPGDLearningResult(  # type: ignore[call-arg]
         state=final_learner, metrics=metrics
     )

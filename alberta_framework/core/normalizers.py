@@ -21,10 +21,11 @@ Three normalizer variants are provided:
 
 import dataclasses
 import math
+import operator
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from numbers import Real
-from typing import Any, cast
+from typing import Any, SupportsIndex, cast
 
 import chex
 import jax
@@ -33,10 +34,20 @@ import numpy as np
 from jax import Array
 from jaxtyping import Bool, Float, Int, UInt
 
+from alberta_framework.core.update_safety import (
+    floating_tree_is_finite as _floating_tree_is_finite,
+)
+
 NORMALIZER_STATE_SCHEMA = "alberta.normalizer-state.v2"
 WELFORD_ESTIMATOR_SCHEMA = "alberta.welford-cumulative-float32-fail-stop-at-2p24.v2"
 BOUNDED_RECENCY_ESTIMATOR_SEMANTICS = "bounded-recency"
 CUMULATIVE_FLOAT32_ESTIMATOR_SEMANTICS = "cumulative-float32-fail-stop-at-2p24"
+EMA_PRIOR_BOUNDED_RECENCY_ESTIMATOR_SEMANTICS = (
+    "ema-zero-mean-unit-variance-prior-bounded-recency"
+)
+EMA_PRIOR_CUMULATIVE_FLOAT32_ESTIMATOR_SEMANTICS = (
+    "ema-zero-mean-unit-variance-prior-cumulative-float32-fail-stop-at-2p24"
+)
 STATIC_AFTER_FIRST_ESTIMATOR_SEMANTICS = "static-after-first"
 NORMALIZER_LIFETIME_COUNTER_NBYTES = 12
 NORMALIZER_LIFETIME_COUNTER_DELTA_NBYTES = 8
@@ -47,14 +58,7 @@ _FLOAT32_CONSECUTIVE_INTEGER_LIMIT = 2**24
 
 _ACTUAL_INT_TYPES: tuple[type, ...] = (
     int,
-    np.int8,
-    np.int16,
-    np.int32,
-    np.int64,
-    np.uint8,
-    np.uint16,
-    np.uint32,
-    np.uint64,
+    *(np.dtype(code).type for code in ("b", "B", "h", "H", "i", "I", "l", "L", "q", "Q")),
 )
 
 
@@ -66,16 +70,16 @@ def _require_int(
     maximum: int | None = None,
 ) -> int:
     if type(value) not in _ACTUAL_INT_TYPES:
-        raise ValueError(f"{name} must be an integer, got {value!r}")
-    number = int(cast(int, value))
+        raise ValueError(f"{name} must be an integer")
+    number = operator.index(cast(SupportsIndex, value))
     if minimum is not None and number < minimum:
         if minimum == 1:
-            raise ValueError(f"{name} must be positive, got {value!r}")
+            raise ValueError(f"{name} must be positive")
         if minimum == 0:
-            raise ValueError(f"{name} must be non-negative, got {value!r}")
-        raise ValueError(f"{name} must be >= {minimum}, got {value!r}")
+            raise ValueError(f"{name} must be non-negative")
+        raise ValueError(f"{name} must be >= {minimum}")
     if maximum is not None and number > maximum:
-        raise ValueError(f"{name} must be <= {maximum}, got {value!r}")
+        raise ValueError(f"{name} must be <= {maximum}")
     return number
 
 
@@ -165,7 +169,9 @@ class EMANormalizerState:
         sample_count: Saturating int32 compatibility telemetry.
         sample_count_words: Exact big-endian ``[high, low]`` uint32 sample
             identity. The all-ones value is terminal.
-        decay: Exponential decay factor for estimates (1.0 = no decay, pure online)
+        decay: Exponential decay factor for estimates. ``1.0`` retains the
+            initial zero-mean, unit-variance pseudo-sample with cumulative
+            weight instead of exponentially forgetting it.
     """
 
     mean: Float[Array, " feature_dim"]
@@ -263,7 +269,8 @@ class Normalizer[
         Args:
             epsilon: Small constant added to std for numerical stability
         """
-        if isinstance(epsilon, bool) or not isinstance(epsilon, Real):
+        epsilon_type = type(epsilon)
+        if issubclass(epsilon_type, bool) or not issubclass(epsilon_type, Real):
             raise TypeError("epsilon must be a finite real number")
         if not math.isfinite(epsilon) or epsilon <= 0.0:
             raise ValueError("epsilon must be finite and positive")
@@ -400,7 +407,14 @@ class Normalizer[
             Normalized observation
         """
         std = jnp.sqrt(state.var)
-        return (observation - state.mean) / (std + self._epsilon)
+        normalized = (observation - state.mean) / (std + self._epsilon)
+        # Inf observation minus an inf mean is inf-inf = NaN. Zero only
+        # those coordinates. Finite-input overflow must stay visible.
+        return jnp.where(
+            jnp.isfinite(observation),
+            normalized,
+            jnp.zeros_like(normalized),
+        )
 
     def update_only(
         self,
@@ -426,11 +440,14 @@ class EMANormalizer(Normalizer[EMANormalizerState]):
     Estimates mean and variance via EMA, suitable for non-stationary
     environments where recent observations should be weighted more heavily.
 
-    The effective decay ramps up from 0 to the target decay over early steps
-    to prevent instability.  ``decay < 1`` is a bounded-recency estimator and
-    can run until the uint64 word clock is exhausted.  The legacy
-    ``decay == 1`` setting is cumulative in float32: it accepts the event that
-    reaches ``2**24`` and then explicitly fail-stops.
+    The initialized zero mean and unit variance are one explicit prior
+    pseudo-sample. The first effective decay is therefore
+    ``min(decay, 1/2)`` and then ramps toward the target decay over early
+    steps. ``decay < 1`` exponentially forgets that prior as a
+    bounded-recency estimator and can run until the uint64 word clock is
+    exhausted. ``decay == 1`` retains the prior with cumulative weight in
+    float32: it is not an ordinary sample mean or a Welford estimator, and it
+    accepts the event that reaches ``2**24`` before explicitly fail-stopping.
 
     Attributes:
         epsilon: Small constant for numerical stability
@@ -448,12 +465,13 @@ class EMANormalizer(Normalizer[EMANormalizerState]):
 
         Args:
             epsilon: Small constant added to std for numerical stability
-            decay: Exponential decay factor for running estimates.
-                   Lower values adapt faster to changes.
-                   1.0 means pure online average (no decay).
+            decay: Exponential decay factor for running estimates. Lower
+                values adapt faster to changes. ``1.0`` means cumulative
+                prior-regularized moments with no exponential forgetting.
         """
         super().__init__(epsilon=epsilon)
-        if isinstance(decay, bool) or not isinstance(decay, Real):
+        decay_type = type(decay)
+        if issubclass(decay_type, bool) or not issubclass(decay_type, Real):
             raise TypeError("decay must be a finite real number")
         if not math.isfinite(decay):
             raise ValueError("decay must be finite")
@@ -467,9 +485,9 @@ class EMANormalizer(Normalizer[EMANormalizerState]):
             "type": "EMANormalizer",
             "state_schema": NORMALIZER_STATE_SCHEMA,
             "estimator_semantics": (
-                CUMULATIVE_FLOAT32_ESTIMATOR_SEMANTICS
+                EMA_PRIOR_CUMULATIVE_FLOAT32_ESTIMATOR_SEMANTICS
                 if _stored_float32_equals_one(self._decay)
-                else BOUNDED_RECENCY_ESTIMATOR_SEMANTICS
+                else EMA_PRIOR_BOUNDED_RECENCY_ESTIMATOR_SEMANTICS
             ),
             "epsilon": self._epsilon,
             "decay": self._decay,
@@ -482,7 +500,8 @@ class EMANormalizer(Normalizer[EMANormalizerState]):
             feature_dim: Dimension of feature vectors
 
         Returns:
-            Initial normalizer state with zero mean and unit variance
+            Initial normalizer state whose zero mean and unit variance form
+            the estimator's one explicit prior pseudo-sample.
         """
         feature_dim = _require_int(
             "feature_dim", feature_dim, minimum=1, maximum=_INT32_MAX
@@ -510,6 +529,19 @@ class EMANormalizer(Normalizer[EMANormalizerState]):
             Tuple of (normalized_observation, new_state)
         """
         status = self.counter_status(state)
+        observation_valid = jnp.all(jnp.isfinite(observation))
+        zero_decay = state.decay == jnp.asarray(0.0, dtype=jnp.float32)
+        checked_state = EMANormalizerState(
+            mean=jnp.where(zero_decay, jnp.zeros_like(state.mean), state.mean),
+            var=jnp.where(zero_decay, jnp.ones_like(state.var), state.var),
+            sample_count=state.sample_count,
+            sample_count_words=state.sample_count_words,
+            decay=state.decay,
+        )
+        source_state_finite = _floating_tree_is_finite(checked_state)
+        update_available = (
+            status.update_available & observation_valid & source_state_finite
+        )
 
         def accepted(_: None) -> tuple[Array, EMANormalizerState]:
             new_words, ignored_capacity = _checked_lifetime_words_increment(
@@ -521,10 +553,23 @@ class EMANormalizer(Normalizer[EMANormalizerState]):
                 state.decay,
                 1.0 - 1.0 / (new_count_float + 1.0),
             )
-            delta = observation - state.mean
-            new_mean = state.mean + (1.0 - effective_decay) * delta
+            mean_for_update = jnp.where(
+                zero_decay & ~jnp.isfinite(state.mean),
+                observation,
+                state.mean,
+            )
+            delta = observation - mean_for_update
+            new_mean = mean_for_update + (1.0 - effective_decay) * delta
             delta2 = observation - new_mean
-            new_var = effective_decay * state.var + (1.0 - effective_decay) * delta * delta2
+            var_for_update = jnp.where(
+                zero_decay & ~jnp.isfinite(state.var),
+                jnp.zeros_like(state.var),
+                state.var,
+            )
+            new_var = (
+                effective_decay * var_for_update
+                + (1.0 - effective_decay) * delta * delta2
+            )
             new_var = jnp.maximum(new_var, self._epsilon)
             normalized = (observation - new_mean) / (jnp.sqrt(new_var) + self._epsilon)
             return normalized, EMANormalizerState(
@@ -538,11 +583,26 @@ class EMANormalizer(Normalizer[EMANormalizerState]):
         def refused(_: None) -> tuple[Array, EMANormalizerState]:
             return self.normalize_only(state, observation), state
 
-        normalized, new_state = jax.lax.cond(
-            status.update_available,
+        candidate_normalized, candidate_state = jax.lax.cond(
+            update_available,
             accepted,
             refused,
             operand=None,
+        )
+        update_applied = (
+            update_available
+            & jnp.all(jnp.isfinite(candidate_normalized))
+            & _floating_tree_is_finite(candidate_state)
+        )
+        new_state = jax.lax.cond(
+            update_applied,
+            lambda: candidate_state,
+            lambda: state,
+        )
+        normalized = jnp.where(
+            update_applied | (observation_valid & source_state_finite),
+            candidate_normalized,
+            jnp.zeros_like(candidate_normalized),
         )
         return NormalizerUpdateResult(
             normalized=normalized,
@@ -552,7 +612,7 @@ class EMANormalizer(Normalizer[EMANormalizerState]):
             counter_valid=status.counter_valid,
             lifetime_capacity_available=status.lifetime_capacity_available,
             estimator_capacity_available=status.estimator_capacity_available,
-            update_applied=status.update_available,
+            update_applied=update_applied,
         )
 
 
@@ -623,6 +683,11 @@ class WelfordNormalizer(Normalizer[WelfordNormalizerState]):
             Tuple of (normalized_observation, new_state)
         """
         status = self.counter_status(state)
+        observation_valid = jnp.all(jnp.isfinite(observation))
+        source_state_finite = _floating_tree_is_finite(state)
+        update_available = (
+            status.update_available & observation_valid & source_state_finite
+        )
 
         def accepted(_: None) -> tuple[Array, WelfordNormalizerState]:
             new_words, ignored_capacity = _checked_lifetime_words_increment(
@@ -651,11 +716,26 @@ class WelfordNormalizer(Normalizer[WelfordNormalizerState]):
         def refused(_: None) -> tuple[Array, WelfordNormalizerState]:
             return self.normalize_only(state, observation), state
 
-        normalized, new_state = jax.lax.cond(
-            status.update_available,
+        candidate_normalized, candidate_state = jax.lax.cond(
+            update_available,
             accepted,
             refused,
             operand=None,
+        )
+        update_applied = (
+            update_available
+            & jnp.all(jnp.isfinite(candidate_normalized))
+            & _floating_tree_is_finite(candidate_state)
+        )
+        new_state = jax.lax.cond(
+            update_applied,
+            lambda: candidate_state,
+            lambda: state,
+        )
+        normalized = jnp.where(
+            update_applied | (observation_valid & source_state_finite),
+            candidate_normalized,
+            jnp.zeros_like(candidate_normalized),
         )
         return NormalizerUpdateResult(
             normalized=normalized,
@@ -665,7 +745,7 @@ class WelfordNormalizer(Normalizer[WelfordNormalizerState]):
             counter_valid=status.counter_valid,
             lifetime_capacity_available=status.lifetime_capacity_available,
             estimator_capacity_available=status.estimator_capacity_available,
-            update_applied=status.update_available,
+            update_applied=update_applied,
         )
 
 
@@ -686,7 +766,8 @@ class StreamingBatchNormalizer(Normalizer[StreamingBatchNormalizerState]):
     def __init__(self, epsilon: float = 1e-5, momentum: float = 0.99):
         """Initialize the streaming BatchNorm-style normalizer."""
         super().__init__(epsilon=epsilon)
-        if isinstance(momentum, bool) or not isinstance(momentum, Real):
+        momentum_type = type(momentum)
+        if issubclass(momentum_type, bool) or not issubclass(momentum_type, Real):
             raise TypeError("momentum must be a finite real number")
         if not math.isfinite(momentum):
             raise ValueError("momentum must be finite")
@@ -728,6 +809,19 @@ class StreamingBatchNormalizer(Normalizer[StreamingBatchNormalizerState]):
     ) -> NormalizerUpdateResult:
         """Normalize and conditionally commit BatchNorm-style moments."""
         status = self.counter_status(state)
+        observation_valid = jnp.all(jnp.isfinite(observation))
+        zero_momentum = state.momentum == jnp.asarray(0.0, dtype=jnp.float32)
+        checked_state = StreamingBatchNormalizerState(
+            mean=state.mean,
+            var=jnp.where(zero_momentum, jnp.ones_like(state.var), state.var),
+            sample_count=state.sample_count,
+            sample_count_words=state.sample_count_words,
+            momentum=state.momentum,
+        )
+        source_state_finite = _floating_tree_is_finite(checked_state)
+        update_available = (
+            status.update_available & observation_valid & source_state_finite
+        )
 
         def accepted(_: None) -> tuple[Array, StreamingBatchNormalizerState]:
             new_words, ignored_capacity = _checked_lifetime_words_increment(
@@ -739,7 +833,15 @@ class StreamingBatchNormalizer(Normalizer[StreamingBatchNormalizerState]):
             candidate_mean = state.momentum * state.mean + one_minus_m * observation
             new_mean = jnp.where(is_first, observation, candidate_mean)
             centered = observation - state.mean
-            candidate_var = state.momentum * state.var + one_minus_m * (centered * centered)
+            var_for_update = jnp.where(
+                zero_momentum & ~jnp.isfinite(state.var),
+                jnp.zeros_like(state.var),
+                state.var,
+            )
+            candidate_var = (
+                state.momentum * var_for_update
+                + one_minus_m * (centered * centered)
+            )
             new_var = jnp.where(
                 is_first,
                 jnp.ones_like(state.var),
@@ -758,11 +860,26 @@ class StreamingBatchNormalizer(Normalizer[StreamingBatchNormalizerState]):
         def refused(_: None) -> tuple[Array, StreamingBatchNormalizerState]:
             return self.normalize_only(state, observation), state
 
-        normalized, new_state = jax.lax.cond(
-            status.update_available,
+        candidate_normalized, candidate_state = jax.lax.cond(
+            update_available,
             accepted,
             refused,
             operand=None,
+        )
+        update_applied = (
+            update_available
+            & jnp.all(jnp.isfinite(candidate_normalized))
+            & _floating_tree_is_finite(candidate_state)
+        )
+        new_state = jax.lax.cond(
+            update_applied,
+            lambda: candidate_state,
+            lambda: state,
+        )
+        normalized = jnp.where(
+            update_applied | (observation_valid & source_state_finite),
+            candidate_normalized,
+            jnp.zeros_like(candidate_normalized),
         )
         return NormalizerUpdateResult(
             normalized=normalized,
@@ -772,7 +889,7 @@ class StreamingBatchNormalizer(Normalizer[StreamingBatchNormalizerState]):
             counter_valid=status.counter_valid,
             lifetime_capacity_available=status.lifetime_capacity_available,
             estimator_capacity_available=status.estimator_capacity_available,
-            update_applied=status.update_available,
+            update_applied=update_applied,
         )
 
 
@@ -782,8 +899,9 @@ def normalizer_state_nbytes_formula(
 ) -> int:
     """Return exact persistent JAX-array bytes for a normalizer state."""
 
-    if type(feature_dim) is not int or feature_dim < 0:
-        raise ValueError("feature_dim must be a non-negative exact integer")
+    feature_dim = _require_int(
+        "feature_dim", feature_dim, minimum=1, maximum=_INT32_MAX
+    )
     if normalizer_type in {"EMANormalizer", "StreamingBatchNormalizer"}:
         return 8 * feature_dim + 16
     if normalizer_type == "WelfordNormalizer":
@@ -892,6 +1010,7 @@ def normalizer_from_config(config: dict[str, Any]) -> Normalizer[Any]:
         raise ValueError(f"Unsupported normalizer state schema: {state_schema!r}")
     estimator_schema = config.pop("estimator_schema", None)
     estimator_semantics = config.pop("estimator_semantics", None)
+    legacy_estimator_semantics: str | None = None
     if type_name == "WelfordNormalizer":
         if estimator_schema not in {None, WELFORD_ESTIMATOR_SCHEMA}:
             raise ValueError(f"Unsupported Welford estimator schema: {estimator_schema!r}")
@@ -899,11 +1018,12 @@ def normalizer_from_config(config: dict[str, Any]) -> Normalizer[Any]:
     elif estimator_schema is not None:
         raise ValueError(f"estimator_schema is not valid for normalizer type {type_name!r}")
     elif type_name == "EMANormalizer":
-        expected_semantics = (
-            CUMULATIVE_FLOAT32_ESTIMATOR_SEMANTICS
-            if _stored_float32_equals_one(config.get("decay", 0.99))
-            else BOUNDED_RECENCY_ESTIMATOR_SEMANTICS
-        )
+        if _stored_float32_equals_one(config.get("decay", 0.99)):
+            expected_semantics = EMA_PRIOR_CUMULATIVE_FLOAT32_ESTIMATOR_SEMANTICS
+            legacy_estimator_semantics = CUMULATIVE_FLOAT32_ESTIMATOR_SEMANTICS
+        else:
+            expected_semantics = EMA_PRIOR_BOUNDED_RECENCY_ESTIMATOR_SEMANTICS
+            legacy_estimator_semantics = BOUNDED_RECENCY_ESTIMATOR_SEMANTICS
     elif type_name == "StreamingBatchNormalizer":
         expected_semantics = (
             STATIC_AFTER_FIRST_ESTIMATOR_SEMANTICS
@@ -912,7 +1032,13 @@ def normalizer_from_config(config: dict[str, Any]) -> Normalizer[Any]:
         )
     else:
         expected_semantics = None
-    if estimator_semantics is not None and estimator_semantics != expected_semantics:
+    if estimator_semantics is not None and (
+        type(estimator_semantics) is not str
+        or (
+            estimator_semantics != expected_semantics
+            and estimator_semantics != legacy_estimator_semantics
+        )
+    ):
         raise ValueError(
             "normalizer estimator_semantics does not match its parameters: "
             f"expected {expected_semantics!r}, got {estimator_semantics!r}"
@@ -927,6 +1053,8 @@ def normalizer_from_config(config: dict[str, Any]) -> Normalizer[Any]:
 __all__ = [
     "BOUNDED_RECENCY_ESTIMATOR_SEMANTICS",
     "CUMULATIVE_FLOAT32_ESTIMATOR_SEMANTICS",
+    "EMA_PRIOR_BOUNDED_RECENCY_ESTIMATOR_SEMANTICS",
+    "EMA_PRIOR_CUMULATIVE_FLOAT32_ESTIMATOR_SEMANTICS",
     "NORMALIZER_LIFETIME_COUNTER_DELTA_NBYTES",
     "NORMALIZER_LIFETIME_COUNTER_NBYTES",
     "NORMALIZER_STATE_SCHEMA",

@@ -149,7 +149,7 @@ def _json_safe(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_json_safe(item) for item in value]
     if isinstance(value, float) and not math.isfinite(value):
-        return None
+        raise ValueError("forager CLI payload is not finite JSON")
     if isinstance(value, Path):
         return str(value)
     return value
@@ -265,6 +265,20 @@ def _environment(
         aperture_size=aperture_size,
         require_exact_version=not allow_nonstandard_version,
     )
+
+
+def _explicit_int_or_default(value: int | None, default: int) -> int:
+    """Keep an explicit ``0`` so fail-closed config checks can see it.
+
+    Argparse stores ``None`` when ``--final-window`` is omitted and ``0``
+    when the caller passes ``--final-window 0``.  ``value or default`` treats
+    that requested zero as missing and substitutes the protocol window, so
+    the publication metric never reaches ``ForagerBenchmarkConfig``'s
+    ``final_window >= 1`` check.
+    """
+    if value is None:
+        return default
+    return value
 
 
 def _protocol_evaluation_seeds(protocol: Any) -> tuple[int, ...]:
@@ -564,10 +578,24 @@ def main(argv: Sequence[str] | None = None) -> int:
                 target.to_dict() for target in paper_reference_targets(preset)
             ],
         }
-        LOGGER.info(json.dumps(_json_safe(baseline_payload), indent=2, sort_keys=True))
+        LOGGER.info(
+            json.dumps(
+                _json_safe(baseline_payload),
+                indent=2,
+                sort_keys=True,
+                allow_nan=False,
+            )
+        )
         return 0
     if args.protocol_only:
-        LOGGER.info(json.dumps(_json_safe(protocol.to_dict()), indent=2, sort_keys=True))
+        LOGGER.info(
+            json.dumps(
+                _json_safe(protocol.to_dict()),
+                indent=2,
+                sort_keys=True,
+                allow_nan=False,
+            )
+        )
         return 0
 
     reference_names = {name for name, _seed, _path in args.reference_npz}
@@ -634,7 +662,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         steps=steps,
         ewm_decay=protocol.ewm_decay,
         record_every=args.record_every,
-        final_window=args.final_window or protocol.final_window_steps,
+        final_window=_explicit_int_or_default(
+            args.final_window, protocol.final_window_steps
+        ),
         jax_chunk_size=args.jax_chunk_size,
     )
     features = ForagerFeatureConfig(

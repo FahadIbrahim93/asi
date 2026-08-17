@@ -1,11 +1,13 @@
 """Tests for the MLPLearner and run_mlp_learning_loop."""
 
+import math
 import time
 
 import chex
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 import pytest
 
 from alberta_framework import (
@@ -97,6 +99,91 @@ class TestMLPLearner:
 
         # State should have same structure
         assert len(result.state.params.weights) == len(state.params.weights)
+
+    def test_infinite_target_with_obgd_does_not_poison_weights(self):
+        """Inf target makes ObGD scale 0, then error*step is 0*inf=NaN.
+
+        MultiHead already refuses inf targets (NaN is the missing-head
+        sentinel). MLPLearner used to commit the NaN weights. Keep the
+        previous finite state so a later finite target can recover.
+        """
+        learner = MLPLearner(
+            hidden_sizes=(4,),
+            sparsity=0.0,
+            bounder=ObGDBounding(kappa=2.0),
+            optimizer=LMS(0.1),
+        )
+        state = learner.init(feature_dim=3, key=jr.key(0))
+        observation = jnp.ones(3, dtype=jnp.float32)
+
+        poisoned = learner.update(
+            state, observation, jnp.array(jnp.inf, dtype=jnp.float32)
+        )
+        for new_w, old_w in zip(
+            poisoned.state.params.weights, state.params.weights, strict=True
+        ):
+            assert bool(jnp.all(jnp.isfinite(new_w)))
+            chex.assert_trees_all_close(new_w, old_w)
+        assert int(poisoned.state.step_count) == int(state.step_count)
+        assert not bool(poisoned.update_applied)
+        chex.assert_trees_all_close(poisoned.prediction, jnp.zeros_like(poisoned.prediction))
+        chex.assert_trees_all_close(poisoned.error, jnp.zeros_like(poisoned.error))
+        chex.assert_trees_all_close(poisoned.metrics, jnp.zeros_like(poisoned.metrics))
+
+        recovered = learner.update(
+            poisoned.state, observation, jnp.array(1.0, dtype=jnp.float32)
+        )
+        for new_w in recovered.state.params.weights:
+            assert bool(jnp.all(jnp.isfinite(new_w)))
+        assert bool(recovered.update_applied)
+
+    def test_zero_trace_decay_does_not_multiply_inf_traces(self) -> None:
+        """Default gamma*lamda is 0; 0 * inf traces is NaN and would freeze."""
+        learner = MLPLearner(hidden_sizes=(4,), sparsity=0.0, optimizer=LMS(0.1))
+        state = learner.init(feature_dim=3, key=jr.key(1))
+        poisoned_traces = tuple(
+            jnp.full_like(trace, jnp.inf) for trace in state.traces
+        )
+        state = state.replace(traces=poisoned_traces)
+        raw = jnp.asarray(0.0, dtype=jnp.float32) * jnp.asarray(jnp.inf, dtype=jnp.float32)
+        assert not bool(jnp.isfinite(raw))
+
+        observation = jnp.ones(3, dtype=jnp.float32)
+        result = learner.update(
+            state, observation, jnp.array(1.0, dtype=jnp.float32)
+        )
+        assert bool(result.update_applied)
+        for trace in result.state.traces:
+            assert bool(jnp.all(jnp.isfinite(trace)))
+        for new_w in result.state.params.weights:
+            assert bool(jnp.all(jnp.isfinite(new_w)))
+
+    def test_zero_utility_decay_recovers_poisoned_utility(self) -> None:
+        learner = MLPLearner(
+            hidden_sizes=(4,),
+            sparsity=0.0,
+            optimizer=LMS(0.1),
+            track_neuron_utility=True,
+            neuron_utility_decay=0.0,
+        )
+        state = learner.init(feature_dim=3, key=jr.key(2))
+        assert state.neuron_utility is not None
+        state = state.replace(
+            neuron_utility=tuple(
+                jnp.full_like(utility, jnp.inf) for utility in state.neuron_utility
+            )
+        )
+
+        result = learner.update(
+            state,
+            jnp.ones(3, dtype=jnp.float32),
+            jnp.array(1.0, dtype=jnp.float32),
+        )
+
+        assert bool(result.update_applied)
+        assert result.state.neuron_utility is not None
+        for utility in result.state.neuron_utility:
+            assert bool(jnp.all(jnp.isfinite(utility)))
 
     def test_update_reduces_error(self):
         """Multiple updates on a fixed target should reduce error."""
@@ -629,9 +716,30 @@ class TestAGCBounding:
         bounder = AGCBounding(clip_factor=0.01, eps=1e-3)
         _, frac = bounder.bound(steps, error, params)
 
-        # 2D has 3 output units (all clipped), 1D has 3 elements (none clipped)
-        # Total units = 6, clipped = 3 -> frac = 0.5
-        assert float(frac) == pytest.approx(0.5, abs=0.01)
+        # 2D (fan_out=2, fan_in=3) has 2 output units (all clipped), 1D has 3
+        # elements (none clipped). Total units = 5, clipped = 2 -> frac = 0.4
+        assert float(frac) == pytest.approx(0.4, abs=0.01)
+
+    def test_clipping_is_per_output_unit_not_per_input_column(self):
+        """Rows of (fan_out, fan_in) are the units; a loud row must not shield a quiet one."""
+        bounder = AGCBounding(clip_factor=0.01, eps=1e-3)
+        error = jnp.array(1.0)
+        # Case 1: identical unit weights, unit 0 takes a huge step, unit 1 a tiny one.
+        params = (jnp.ones((2, 2)),)
+        steps = (jnp.array([[1e3, 0.0], [1e-3, 0.0]], dtype=jnp.float32),)
+        (clipped,), frac = bounder.bound(steps, error, params)
+        # unit 1's own budget is clip_factor * ||w_1|| = 0.01 * sqrt(2) > 1e-3: untouched
+        assert float(clipped[1, 0]) == pytest.approx(1e-3, rel=1e-5)
+        # unit 0 is clipped to its own budget
+        assert float(jnp.linalg.norm(clipped[0])) == pytest.approx(0.01 * math.sqrt(2.0), rel=1e-4)
+        assert float(frac) == pytest.approx(0.5)
+        # Case 2: unit 0 has huge weights, unit 1 tiny weights; only unit 1 moves.
+        params = (jnp.array([[1e3, 1e3], [1e-3, 1e-3]], dtype=jnp.float32),)
+        steps = (jnp.array([[0.0, 0.0], [0.5, 0.5]], dtype=jnp.float32),)
+        (clipped,), frac = bounder.bound(steps, error, params)
+        # unit 1's budget is 0.01 * ||[1e-3, 1e-3]|| = 1.41e-5; its step must be clipped there
+        assert float(jnp.linalg.norm(clipped[1])) == pytest.approx(0.01 * math.sqrt(2e-6), rel=1e-4)
+        assert float(frac) == pytest.approx(0.5)
 
     def test_mlp_with_agc_runs(self):
         """MLPLearner with AGCBounding should run without error in a scan loop."""
@@ -1286,3 +1394,18 @@ class TestResetDormantOptimizerState:
         mse_first = sum(sq_errors[:100]) / 100.0
         mse_last = sum(sq_errors[-100:]) / 100.0
         assert mse_last < mse_first
+
+
+def test_mlp_dimensions_are_exact_canonical_and_preflighted() -> None:
+    for invalid in ([8], (True,), (0,), (2**31,)):
+        with pytest.raises(ValueError, match="hidden_sizes"):
+            MLPLearner(hidden_sizes=invalid)  # type: ignore[arg-type]
+
+    learner = MLPLearner(hidden_sizes=(np.longlong(8),))
+    assert learner._hidden_sizes == (8,)
+    assert type(learner._hidden_sizes[0]) is int
+
+    with pytest.raises(ValueError, match="feature_dim"):
+        learner.init(True, jr.key(0))
+    with pytest.raises(ValueError, match="resource"):
+        MLPLearner(hidden_sizes=(2**26,)).init(2, jr.key(0))

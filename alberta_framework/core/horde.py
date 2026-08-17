@@ -27,9 +27,11 @@ from typing import Any, cast
 import chex
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import Array
-from jaxtyping import Float
+from jaxtyping import Bool, Float
 
+from alberta_framework.core._float32_scalars import validated_float32_scalar
 from alberta_framework.core.multi_head_learner import (
     MULTI_HEAD_MLP_STATE_SCHEMA,
     AnyOptimizer,
@@ -43,6 +45,44 @@ from alberta_framework.core.normalizers import (
 )
 from alberta_framework.core.optimizers import Bounder
 from alberta_framework.core.types import HordeSpec, TraceMode
+
+_ACTUAL_INT_TYPES = frozenset({int, *(np.dtype(code).type for code in "bBhHiIlLqQpP")})
+_ACTUAL_REAL_TYPES = _ACTUAL_INT_TYPES | frozenset(
+    {float, *(np.dtype(code).type for code in "efdg")}
+)
+
+
+def _require_float32(
+    name: str,
+    value: object,
+    *,
+    lower: float | None = None,
+    upper: float | None = None,
+) -> float:
+    if type(value) not in _ACTUAL_REAL_TYPES:
+        raise ValueError(f"{name} must be a finite real number")
+    return validated_float32_scalar(name, value, lower=lower, upper=upper)
+
+
+def _require_exact_bool(name: str, value: object) -> bool:
+    if type(value) is not bool:
+        raise ValueError(f"{name} must be an exact bool")
+    return value
+
+
+def _canonical_horde_host_scalars(
+    step_size: object,
+    sparsity: object,
+    leaky_relu_slope: object,
+    use_layer_norm: object,
+) -> tuple[float, float, float, bool]:
+    """Reject bool/non-real/non-finite host identities before they reach kernels."""
+    return (
+        _require_float32("step_size", step_size, lower=0.0),
+        _require_float32("sparsity", sparsity, lower=0.0, upper=1.0),
+        _require_float32("leaky_relu_slope", leaky_relu_slope, lower=0.0),
+        _require_exact_bool("use_layer_norm", use_layer_norm),
+    )
 
 # =============================================================================
 # Types
@@ -72,6 +112,8 @@ class HordeUpdateResult:
     td_targets: Float[Array, " n_demons"]
     per_demon_metrics: Float[Array, "n_demons 3"]
     trunk_bounding_metric: Float[Array, ""]
+    head_updates_applied: Bool[Array, " n_demons"]
+    update_applied: Bool[Array, ""]
 
 
 @chex.dataclass(frozen=True)
@@ -88,6 +130,28 @@ class HordeLearningResult:
     state: MultiHeadMLPState
     per_demon_metrics: Float[Array, "num_steps n_demons 3"]
     td_errors: Float[Array, "num_steps n_demons"]
+    head_updates_applied: Bool[Array, "num_steps n_demons"]
+    updates_applied: Bool[Array, " num_steps"]
+
+
+def _report_head_values(
+    values: Array,
+    requested: Array,
+    updates_applied: Array,
+) -> Array:
+    """Keep inactive NaN sentinels while neutralizing rejected heads."""
+    mask_shape = (requested.shape[0],) + (1,) * (values.ndim - 1)
+    requested_mask = jnp.reshape(requested, mask_shape)
+    applied_mask = jnp.reshape(updates_applied, mask_shape)
+    return jnp.where(
+        applied_mask,
+        values,
+        jnp.where(
+            requested_mask,
+            jnp.zeros_like(values),
+            jnp.full_like(values, jnp.nan),
+        ),
+    )
 
 
 @chex.dataclass(frozen=True)
@@ -104,6 +168,8 @@ class BatchedHordeResult:
     states: MultiHeadMLPState
     per_demon_metrics: Float[Array, "n_seeds num_steps n_demons 3"]
     td_errors: Float[Array, "n_seeds num_steps n_demons"]
+    head_updates_applied: Bool[Array, "n_seeds num_steps n_demons"]
+    updates_applied: Bool[Array, "n_seeds num_steps"]
 
 
 @chex.dataclass(frozen=True)
@@ -124,6 +190,8 @@ class MixedHordeLearningResult:
     state: MixedHordeState
     per_demon_metrics: Float[Array, "num_steps n_demons 3"]
     td_errors: Float[Array, "num_steps n_demons"]
+    head_updates_applied: Bool[Array, "num_steps n_demons"]
+    updates_applied: Bool[Array, " num_steps"]
 
 
 # =============================================================================
@@ -190,6 +258,9 @@ class HordeLearner:
             trace_mode: Eligibility trace mode (ACCUMULATING or REPLACING)
             utility_decay: EMA decay for hidden-unit utility diagnostics.
         """
+        step_size, sparsity, leaky_relu_slope, use_layer_norm = _canonical_horde_host_scalars(
+            step_size, sparsity, leaky_relu_slope, use_layer_norm
+        )
         self._horde_spec = horde_spec
         self._hidden_sizes = hidden_sizes
         self._step_size = step_size
@@ -200,8 +271,13 @@ class HordeLearner:
         self._utility_decay = utility_decay
 
         # Compute per-head gamma*lambda products
+        # The per-demon product of two legal float32 probabilities can
+        # underflow the float32 sink; flush it through float32 here so the
+        # learner's exact-nonzero guard sees the value that will actually
+        # be used (0.0 trace decay), not an unrepresentable exact product.
         per_head_gl = tuple(
-            float(d.gamma * d.lamda) for d in horde_spec.demons
+            float(np.float32(d.gamma) * np.float32(d.lamda))
+            for d in horde_spec.demons
         )
 
         self._learner = MultiHeadMLPLearner(
@@ -361,6 +437,13 @@ class HordeLearner:
             HordeUpdateResult with updated state, predictions, TD errors,
             TD targets, and per-demon metrics
         """
+        cumulants = jnp.asarray(cumulants)
+        expected_shape = (self.n_demons,)
+        if cumulants.shape != expected_shape:
+            raise ValueError(
+                f"cumulants must have shape {expected_shape}, got {cumulants.shape}"
+            )
+
         # 1. Compute V(s') for bootstrapping
         next_preds = self._learner.predict(state, next_observation)
 
@@ -368,18 +451,46 @@ class HordeLearner:
         # For gamma=0 demons: target = cumulant (single-step prediction)
         # NaN cumulants stay NaN (inactive demons)
         gammas = self._horde_spec.gammas
-        targets = cumulants + gammas * next_preds
+        bootstrap = jnp.where(gammas == 0.0, 0.0, gammas * next_preds)
+        targets = cumulants + bootstrap
+        requested = ~jnp.isnan(cumulants)
+        head_inputs_valid = requested & jnp.isfinite(cumulants) & jnp.isfinite(targets)
+        safe_targets = jnp.where(head_inputs_valid, targets, jnp.nan)
 
         # 3. Delegate to MultiHeadMLPLearner
-        result = self._learner.update(state, observation, targets)
+        result = self._learner.update(state, observation, safe_targets)
+        update_applied = (
+            jnp.all(jnp.isfinite(observation))
+            & result.update_applied
+            & (jnp.any(head_inputs_valid) | jnp.all(~requested))
+        )
+        head_updates_applied = head_inputs_valid & update_applied
 
         return HordeUpdateResult(  # type: ignore[call-arg]
-            state=result.state,
-            predictions=result.predictions,
-            td_errors=result.errors,
-            td_targets=targets,
-            per_demon_metrics=result.per_head_metrics,
-            trunk_bounding_metric=result.trunk_bounding_metric,
+            state=jax.lax.cond(update_applied, lambda: result.state, lambda: state),
+            predictions=jnp.where(
+                update_applied,
+                jnp.where(
+                    requested & ~head_updates_applied,
+                    jnp.zeros_like(result.predictions),
+                    result.predictions,
+                ),
+                jnp.zeros_like(result.predictions),
+            ),
+            td_errors=_report_head_values(
+                result.errors, requested, head_updates_applied
+            ),
+            td_targets=_report_head_values(targets, requested, head_updates_applied),
+            per_demon_metrics=_report_head_values(
+                result.per_head_metrics, requested, head_updates_applied
+            ),
+            trunk_bounding_metric=jnp.where(
+                update_applied,
+                result.trunk_bounding_metric,
+                jnp.asarray(0.0, dtype=jnp.float32),
+            ),
+            head_updates_applied=head_updates_applied,
+            update_applied=update_applied,
         )
 
     @functools.partial(jax.jit, static_argnums=(0,))
@@ -410,18 +521,67 @@ class HordeLearner:
         Returns:
             HordeUpdateResult with updated state and TD metrics.
         """
-        next_preds = self._learner.predict(state, next_observation)
+        cumulants = jnp.asarray(cumulants)
         discounts = jnp.asarray(discounts, dtype=jnp.float32)
-        targets = cumulants + discounts * next_preds
-        result = self._learner.update(state, observation, targets)
+        expected_shape = (self.n_demons,)
+        if cumulants.shape != expected_shape:
+            raise ValueError(
+                f"cumulants must have shape {expected_shape}, got {cumulants.shape}"
+            )
+        if discounts.shape != expected_shape:
+            raise ValueError(
+                f"discounts must have shape {expected_shape}, got {discounts.shape}"
+            )
+
+        next_preds = self._learner.predict(state, next_observation)
+        bootstrap = jnp.where(discounts == 0.0, 0.0, discounts * next_preds)
+        targets = cumulants + bootstrap
+        requested = ~jnp.isnan(cumulants)
+        head_inputs_valid = (
+            requested
+            & jnp.isfinite(cumulants)
+            & jnp.isfinite(discounts)
+            & (discounts >= 0.0)
+            & (discounts <= 1.0)
+            & jnp.isfinite(targets)
+        )
+        result = self._learner.update(
+            state,
+            observation,
+            jnp.where(head_inputs_valid, targets, jnp.nan),
+        )
+        update_applied = (
+            jnp.all(jnp.isfinite(observation))
+            & result.update_applied
+            & (jnp.any(head_inputs_valid) | jnp.all(~requested))
+        )
+        head_updates_applied = head_inputs_valid & update_applied
 
         return HordeUpdateResult(  # type: ignore[call-arg]
-            state=result.state,
-            predictions=result.predictions,
-            td_errors=result.errors,
-            td_targets=targets,
-            per_demon_metrics=result.per_head_metrics,
-            trunk_bounding_metric=result.trunk_bounding_metric,
+            state=jax.lax.cond(update_applied, lambda: result.state, lambda: state),
+            predictions=jnp.where(
+                update_applied,
+                jnp.where(
+                    requested & ~head_updates_applied,
+                    jnp.zeros_like(result.predictions),
+                    result.predictions,
+                ),
+                jnp.zeros_like(result.predictions),
+            ),
+            td_errors=_report_head_values(
+                result.errors, requested, head_updates_applied
+            ),
+            td_targets=_report_head_values(targets, requested, head_updates_applied),
+            per_demon_metrics=_report_head_values(
+                result.per_head_metrics, requested, head_updates_applied
+            ),
+            trunk_bounding_metric=jnp.where(
+                update_applied,
+                result.trunk_bounding_metric,
+                jnp.asarray(0.0, dtype=jnp.float32),
+            ),
+            head_updates_applied=head_updates_applied,
+            update_applied=update_applied,
         )
 
 
@@ -460,6 +620,9 @@ class MixedHorde:
             IndependentDemonHorde,
         )
 
+        step_size, sparsity, leaky_relu_slope, use_layer_norm = _canonical_horde_host_scalars(
+            step_size, sparsity, leaky_relu_slope, use_layer_norm
+        )
         self._horde_spec = horde_spec
         self._hidden_sizes = hidden_sizes
         self._optimizer = optimizer
@@ -665,9 +828,11 @@ class MixedHorde:
         td_errors = jnp.full((self.n_demons,), jnp.nan, dtype=jnp.float32)
         td_targets = jnp.full((self.n_demons,), jnp.nan, dtype=jnp.float32)
         per_demon_metrics = jnp.full((self.n_demons, 3), jnp.nan, dtype=jnp.float32)
+        head_updates_applied = jnp.zeros((self.n_demons,), dtype=jnp.bool_)
         trunk_bounding_metric = jnp.array(1.0, dtype=jnp.float32)
         new_shared_state = state.shared_state
         new_independent_state = state.independent_state
+        update_applied = jnp.asarray(False, dtype=jnp.bool_)
 
         if self._shared_horde is not None:
             idx = jnp.asarray(self._shared_indices, dtype=jnp.int32)
@@ -684,7 +849,11 @@ class MixedHorde:
             per_demon_metrics = per_demon_metrics.at[idx].set(
                 shared_result.per_demon_metrics
             )
+            head_updates_applied = head_updates_applied.at[idx].set(
+                shared_result.head_updates_applied
+            )
             trunk_bounding_metric = shared_result.trunk_bounding_metric
+            update_applied = update_applied | shared_result.update_applied
 
         if self._independent_horde is not None:
             idx = jnp.asarray(self._independent_indices, dtype=jnp.int32)
@@ -701,13 +870,22 @@ class MixedHorde:
             per_demon_metrics = per_demon_metrics.at[idx].set(
                 independent_result.per_demon_metrics
             )
+            head_updates_applied = head_updates_applied.at[idx].set(
+                independent_result.head_updates_applied
+            )
+            update_applied = update_applied | independent_result.update_applied
 
-        new_state = MixedHordeState(
+        proposed_state = MixedHordeState(
             shared_state=new_shared_state,
             independent_state=new_independent_state,
             step_count=state.step_count + 1,
             birth_timestamp=state.birth_timestamp,
             uptime_s=state.uptime_s,
+        )
+        new_state = jax.lax.cond(
+            update_applied,
+            lambda: proposed_state,
+            lambda: state,
         )
         return HordeUpdateResult(
             state=new_state,
@@ -715,7 +893,13 @@ class MixedHorde:
             td_errors=td_errors,
             td_targets=td_targets,
             per_demon_metrics=per_demon_metrics,
-            trunk_bounding_metric=trunk_bounding_metric,
+            trunk_bounding_metric=jnp.where(
+                update_applied,
+                trunk_bounding_metric,
+                jnp.asarray(0.0, dtype=jnp.float32),
+            ),
+            head_updates_applied=head_updates_applied,
+            update_applied=update_applied,
         )
 
 
@@ -750,16 +934,24 @@ def run_horde_learning_loop(
     def step_fn(
         carry: MultiHeadMLPState,
         inputs: tuple[Array, Array, Array],
-    ) -> tuple[MultiHeadMLPState, tuple[Array, Array]]:
+    ) -> tuple[MultiHeadMLPState, tuple[Array, Array, Array, Array]]:
         l_state = carry
         obs, cums, next_obs = inputs
         result = horde.update(l_state, obs, cums, next_obs)
-        return result.state, (result.per_demon_metrics, result.td_errors)
+        return result.state, (
+            result.per_demon_metrics,
+            result.td_errors,
+            result.head_updates_applied,
+            result.update_applied,
+        )
 
     t0 = time.time()
-    final_state, (per_demon_metrics, td_errors) = jax.lax.scan(
-        step_fn, state, (observations, cumulants, next_observations)
-    )
+    final_state, (
+        per_demon_metrics,
+        td_errors,
+        head_updates_applied,
+        updates_applied,
+    ) = jax.lax.scan(step_fn, state, (observations, cumulants, next_observations))
     elapsed = time.time() - t0
     final_state = final_state.replace(uptime_s=final_state.uptime_s + elapsed)  # type: ignore[attr-defined]
 
@@ -767,6 +959,8 @@ def run_horde_learning_loop(
         state=final_state,
         per_demon_metrics=per_demon_metrics,
         td_errors=td_errors,
+        head_updates_applied=head_updates_applied,
+        updates_applied=updates_applied,
     )
 
 
@@ -782,15 +976,23 @@ def run_mixed_horde_learning_loop(
     def step_fn(
         carry: MixedHordeState,
         inputs: tuple[Array, Array, Array],
-    ) -> tuple[MixedHordeState, tuple[Array, Array]]:
+    ) -> tuple[MixedHordeState, tuple[Array, Array, Array, Array]]:
         obs, cums, next_obs = inputs
         result = horde.update(carry, obs, cums, next_obs)
-        return result.state, (result.per_demon_metrics, result.td_errors)
+        return result.state, (
+            result.per_demon_metrics,
+            result.td_errors,
+            result.head_updates_applied,
+            result.update_applied,
+        )
 
     t0 = time.time()
-    final_state, (per_demon_metrics, td_errors) = jax.lax.scan(
-        step_fn, state, (observations, cumulants, next_observations)
-    )
+    final_state, (
+        per_demon_metrics,
+        td_errors,
+        head_updates_applied,
+        updates_applied,
+    ) = jax.lax.scan(step_fn, state, (observations, cumulants, next_observations))
     elapsed = time.time() - t0
     final_state = final_state.replace(  # type: ignore[attr-defined]
         uptime_s=final_state.uptime_s + elapsed
@@ -799,6 +1001,8 @@ def run_mixed_horde_learning_loop(
         state=final_state,
         per_demon_metrics=per_demon_metrics,
         td_errors=td_errors,
+        head_updates_applied=head_updates_applied,
+        updates_applied=updates_applied,
     )
 
 
@@ -861,15 +1065,27 @@ def run_horde_learning_loop_batched(
     """
     feature_dim = observations.shape[1]
 
-    def single_run(key: Array) -> tuple[MultiHeadMLPState, Array, Array]:
+    def single_run(key: Array) -> tuple[MultiHeadMLPState, Array, Array, Array, Array]:
         init_state = horde.init(feature_dim, key)
         result = run_horde_learning_loop(
             horde, init_state, observations, cumulants, next_observations
         )
-        return result.state, result.per_demon_metrics, result.td_errors
+        return (
+            result.state,
+            result.per_demon_metrics,
+            result.td_errors,
+            result.head_updates_applied,
+            result.updates_applied,
+        )
 
     t0 = time.time()
-    batched_states, batched_metrics, batched_td_errors = jax.vmap(single_run)(keys)
+    (
+        batched_states,
+        batched_metrics,
+        batched_td_errors,
+        batched_head_updates_applied,
+        batched_updates_applied,
+    ) = jax.vmap(single_run)(keys)
     elapsed = time.time() - t0
     batched_states = batched_states.replace(  # type: ignore[attr-defined]
         uptime_s=batched_states.uptime_s + elapsed
@@ -879,4 +1095,6 @@ def run_horde_learning_loop_batched(
         states=batched_states,
         per_demon_metrics=batched_metrics,
         td_errors=batched_td_errors,
+        head_updates_applied=batched_head_updates_applied,
+        updates_applied=batched_updates_applied,
     )

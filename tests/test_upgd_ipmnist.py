@@ -4,13 +4,16 @@ CI-cheap: everything runs on tiny synthetic data. Real-MNIST benchmark runs
 happen only through ``python -m alberta_framework.benchmarks.upgd_ipmnist``.
 """
 
+import hashlib
 import json
+from pathlib import Path
 
 import jax.numpy as jnp
 import jax.random as jr
 import numpy as np
 import pytest
 
+import alberta_framework.benchmarks.upgd_ipmnist as upgd_ipmnist
 from alberta_framework.benchmarks.upgd_ipmnist import (
     ADAMW_PROTOCOL_HYPERPARAMETERS,
     ARTIFACT_SCHEMA,
@@ -18,7 +21,10 @@ from alberta_framework.benchmarks.upgd_ipmnist import (
     PARTIAL_SCHEMA,
     UPGD_W_PROTOCOL_HYPERPARAMETERS,
     IPMNISTConfig,
+    IPMNISTRunResult,
     LeanUPGDState,
+    LearnerUpdateResult,
+    _make_adamw_learner,
     _split_flat_noise,
     build_artifact,
     build_comparison,
@@ -62,6 +68,126 @@ class TestProtocolConstants:
     def test_shrunk_config_does_not_match_selected_publication_shape(self):
         assert not TINY.matches_selected_publication_configuration
 
+    @pytest.mark.parametrize(
+        "integer_type",
+        sorted(
+            {
+                np.dtype(code).type
+                for code in ("b", "B", "h", "H", "i", "I", "l", "L", "q", "Q")
+            },
+            key=lambda value: value.__name__,
+        ),
+    )
+    def test_config_accepts_every_numpy_integer_dtype_family(self, integer_type):
+        config = IPMNISTConfig(
+            n_tasks=integer_type(2),
+            task_length=integer_type(3),
+            input_dim=integer_type(4),
+            hidden1=integer_type(5),
+            hidden2=integer_type(6),
+            n_classes=integer_type(2),
+        )
+        assert all(type(value) is int for value in config.to_config().values())
+
+    @pytest.mark.parametrize(
+        "value",
+        [True, np.bool_(True), 1.0, "1", 0, -1, 2**31],
+    )
+    def test_config_rejects_non_integer_and_out_of_range_dimensions(self, value):
+        with pytest.raises(ValueError, match="n_tasks"):
+            IPMNISTConfig(n_tasks=value)
+
+    def test_config_rejects_spoofs_and_subclasses_without_calling_hooks(self):
+        class HostileIndex:
+            def __index__(self):
+                raise AssertionError("must not call hostile __index__")
+
+            def __repr__(self):
+                raise AssertionError("must not call hostile __repr__")
+
+        class HostileInt(int):
+            def __index__(self):
+                raise AssertionError("must not call subclass __index__")
+
+            def __repr__(self):
+                raise AssertionError("must not call subclass __repr__")
+
+        class HostileNumpyInt(np.int64):
+            def __index__(self):
+                raise AssertionError("must not call NumPy subclass __index__")
+
+            def __repr__(self):
+                raise AssertionError("must not call NumPy subclass __repr__")
+
+        for value in (HostileIndex(), HostileInt(2), HostileNumpyInt(2)):
+            with pytest.raises(ValueError, match="n_tasks"):
+                IPMNISTConfig(n_tasks=value)
+
+    def test_config_derived_horizon_boundaries_are_allocation_free(self):
+        boundary = IPMNISTConfig(n_tasks=1, task_length=2**31 - 1, input_dim=1)
+        assert boundary.n_steps == 2**31 - 1
+        with pytest.raises(ValueError, match="run horizon"):
+            IPMNISTConfig(n_tasks=2, task_length=2**30, input_dim=1)
+
+    def test_config_permutation_schedule_boundaries_are_allocation_free(self):
+        boundary = IPMNISTConfig(n_tasks=2**31 - 1, task_length=1, input_dim=1)
+        assert boundary.n_tasks * boundary.input_dim == 2**31 - 1
+        with pytest.raises(ValueError, match="permutation schedule"):
+            IPMNISTConfig(n_tasks=2, task_length=1, input_dim=2**30)
+
+    @pytest.mark.parametrize(
+        ("field_values"),
+        [
+            {"input_dim": 46_341, "hidden1": 46_341, "hidden2": 1, "n_classes": 1},
+            {"input_dim": 1, "hidden1": 46_341, "hidden2": 46_341, "n_classes": 1},
+            {"input_dim": 1, "hidden1": 1, "hidden2": 46_341, "n_classes": 46_341},
+        ],
+    )
+    def test_config_rejects_each_oversized_parameter_matrix(self, field_values):
+        with pytest.raises(ValueError, match="parameter allocation"):
+            IPMNISTConfig(**field_values)
+
+    def test_config_total_parameter_allocation_boundary_is_exact_and_allocation_free(self):
+        boundary = IPMNISTConfig(
+            n_tasks=1,
+            task_length=1,
+            input_dim=(2**31 - 1) - 5,
+            hidden1=1,
+            hidden2=1,
+            n_classes=1,
+        )
+        assert (
+            boundary.input_dim * boundary.hidden1
+            + boundary.hidden1 * boundary.hidden2
+            + boundary.hidden2 * boundary.n_classes
+            + boundary.hidden1
+            + boundary.hidden2
+            + boundary.n_classes
+            == 2**31 - 1
+        )
+        assert boundary.parameter_count == 2**31 - 1
+        with pytest.raises(ValueError, match="parameter allocation"):
+            IPMNISTConfig(
+                n_tasks=1,
+                task_length=1,
+                input_dim=(2**31 - 1) - 4,
+                hidden1=1,
+                hidden2=1,
+                n_classes=1,
+            )
+
+    def test_config_roundtrip_canonicalizes_numpy_integer_scalars(self):
+        config = IPMNISTConfig(
+            n_tasks=np.int16(2),
+            task_length=np.uint16(3),
+            input_dim=np.int32(4),
+            hidden1=np.uint32(5),
+            hidden2=np.int64(6),
+            n_classes=np.uint64(2),
+        )
+        assert IPMNISTConfig(**config.to_config()) == config
+        assert all(type(value) is int for value in config.to_config().values())
+
     def test_published_hyperparameters(self):
         assert UPGD_W_PROTOCOL_HYPERPARAMETERS == {
             "step_size": 0.01,
@@ -82,6 +208,76 @@ class TestProtocolConstants:
             resolve_hyperparameters("upgd_w", {"lr": 0.1})
         with pytest.raises(ValueError, match="unknown learner"):
             resolve_hyperparameters("sgd", None)
+
+    @pytest.mark.parametrize("value", [True, float("nan"), float("inf"), "0.1"])
+    def test_resolve_hyperparameters_rejects_nonfinite_or_non_json_numbers(
+        self, value: object
+    ) -> None:
+        with pytest.raises(ValueError, match="hyperparameter 'step_size'"):
+            resolve_hyperparameters("upgd_w", {"step_size": value})  # type: ignore[dict-item]
+
+    def test_resolve_hyperparameters_rejects_class_spoofed_number(self) -> None:
+        class SpoofedNumber:
+            @property
+            def __class__(self) -> type[float]:
+                return float
+
+            def __float__(self) -> float:
+                return 0.1
+
+        with pytest.raises(ValueError, match="hyperparameter 'step_size'"):
+            resolve_hyperparameters(  # type: ignore[dict-item]
+                "upgd_w", {"step_size": SpoofedNumber()}
+            )
+
+    @pytest.mark.parametrize("value", [1e100, 10**400, 1e-50])
+    def test_resolve_hyperparameters_rejects_float32_unsafe_values(
+        self, value: int | float
+    ) -> None:
+        with pytest.raises(ValueError, match="hyperparameter 'step_size'"):
+            resolve_hyperparameters("upgd_w", {"step_size": value})
+
+    def test_resolve_hyperparameters_rejects_hostile_numeric_subclass(self) -> None:
+        class HostileFloat(float):
+            def as_integer_ratio(self) -> tuple[int, int]:
+                raise RuntimeError("must not run")
+
+        with pytest.raises(ValueError, match="hyperparameter 'step_size'"):
+            resolve_hyperparameters(  # type: ignore[dict-item]
+                "upgd_w", {"step_size": HostileFloat(0.1)}
+            )
+
+    @pytest.mark.parametrize(
+        ("learner", "name", "value"),
+        [
+            ("upgd_w", "step_size", 0.0),
+            ("upgd_w", "utility_decay", -0.1),
+            ("upgd_w", "utility_decay", 1.0),
+            ("upgd_w", "noise_std", -0.1),
+            ("upgd_w", "weight_decay", -0.1),
+            ("adamw", "step_size", 0.0),
+            ("adamw", "beta1", -0.1),
+            ("adamw", "beta1", 1.0),
+            ("adamw", "beta2", 1.0),
+            ("adamw", "eps", 0.0),
+            ("adamw", "weight_decay", -0.1),
+        ],
+    )
+    def test_resolve_hyperparameters_enforces_field_domains(
+        self, learner: str, name: str, value: float
+    ) -> None:
+        with pytest.raises(ValueError, match=f"hyperparameter {name!r}"):
+            resolve_hyperparameters(learner, {name: value})
+
+    def test_resolve_hyperparameters_accepts_endpoints_and_canonicalizes_ints(self) -> None:
+        resolved = resolve_hyperparameters(
+            "upgd_w",
+            {"utility_decay": 0, "noise_std": 0, "weight_decay": 1},
+        )
+        assert resolved["utility_decay"] == 0.0
+        assert resolved["noise_std"] == 0.0
+        assert resolved["weight_decay"] == 1.0
+        assert all(type(resolved[name]) is float for name in resolved)
 
 
 class TestSchedule:
@@ -129,6 +325,180 @@ class TestSchedule:
     def test_schedule_rejects_dataset_smaller_than_task(self):
         with pytest.raises(ValueError, match="without replacement"):
             build_schedule(jr.key(0), TINY, TINY.task_length - 1)
+
+
+class TestInputDomain:
+    """Labels index the softmax: JAX clamps out-of-range gathers, so the runner must refuse them."""
+
+    @pytest.mark.parametrize(
+        ("mutate", "message"),
+        [
+            (lambda x, y: (x, y + 100), "must be smaller than"),
+            (lambda x, y: (x, y - 1), "non-negative"),
+            (lambda x, y: (x, y.astype(np.float32) + 0.9), "integer class labels"),
+            (lambda x, y: (x.at[0, 0].set(np.inf), y), "finite"),
+            (lambda x, y: (x.at[3, 1].set(np.nan), y), "finite"),
+            (
+                lambda x, y: (x.astype(jnp.complex64) + jnp.complex64(1j), y),
+                "real numeric",
+            ),
+        ],
+    )
+    def test_run_rejects_out_of_domain_inputs_before_setup(
+        self, monkeypatch: pytest.MonkeyPatch, mutate, message: str
+    ) -> None:
+        def unexpected_setup(*args: object, **kwargs: object) -> None:
+            del args, kwargs
+            raise AssertionError("out-of-domain data reached learner setup")
+
+        x, y = _synthetic_dataset(0, N_TRAIN, TINY.input_dim, TINY.n_classes)
+        x, y = mutate(jnp.asarray(x), jnp.asarray(y))
+        monkeypatch.setattr(upgd_ipmnist, "resolve_hyperparameters", unexpected_setup)
+        with pytest.raises(ValueError, match=message):
+            run_ipmnist(x, y, "adamw", seeds=[0], config=TINY)
+
+    @pytest.mark.parametrize("progress_every", [0, -1, True, 1.5])
+    def test_run_rejects_invalid_progress_interval_before_setup(
+        self, monkeypatch: pytest.MonkeyPatch, progress_every: object
+    ) -> None:
+        def unexpected_setup(*args: object, **kwargs: object) -> None:
+            del args, kwargs
+            raise AssertionError("invalid progress interval reached learner setup")
+
+        x, y = _synthetic_dataset(0, N_TRAIN, TINY.input_dim, TINY.n_classes)
+        monkeypatch.setattr(upgd_ipmnist, "resolve_hyperparameters", unexpected_setup)
+        with pytest.raises(ValueError, match="progress_every"):
+            run_ipmnist(
+                x,
+                y,
+                "adamw",
+                seeds=[0],
+                config=TINY,
+                progress_every=progress_every,  # type: ignore[arg-type]
+            )
+
+
+@pytest.mark.unit
+class TestInputDomainBoundary:
+    """Issue #527: the shared validator is the single gate ahead of learner setup."""
+
+    @staticmethod
+    def _unexpected_setup(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise AssertionError("out-of-domain data reached learner setup")
+
+    def test_run_rejects_timedelta_inputs_before_setup(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        x = np.full((N_TRAIN, TINY.input_dim), np.timedelta64("NaT", "s"))
+        y = np.zeros(N_TRAIN, dtype=np.int32)
+        monkeypatch.setattr(upgd_ipmnist, "resolve_hyperparameters", self._unexpected_setup)
+        with pytest.raises(ValueError, match="real numeric"):
+            run_ipmnist(x, y, "adamw", seeds=[0], config=TINY)
+
+    def test_run_rejects_short_dataset_before_setup(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        x, y = _synthetic_dataset(0, TINY.task_length - 1, TINY.input_dim, TINY.n_classes)
+        monkeypatch.setattr(upgd_ipmnist, "resolve_hyperparameters", self._unexpected_setup)
+        with pytest.raises(ValueError, match="task_length"):
+            run_ipmnist(x, y, "adamw", seeds=[0], config=TINY)
+
+    @pytest.mark.parametrize("kind", ["timedelta64[s]", "datetime64[s]", "bool"])
+    def test_validator_rejects_non_real_dtype_kinds(self, kind: str) -> None:
+        x = np.zeros((4, TINY.input_dim), dtype=kind)
+        y = np.zeros(4, dtype=np.int32)
+        with pytest.raises(ValueError, match="real numeric"):
+            upgd_ipmnist.validated_ipmnist_data(
+                x, y, input_dim=TINY.input_dim, n_classes=TINY.n_classes
+            )
+
+    def test_validator_enforces_min_length(self) -> None:
+        x, y = _synthetic_dataset(0, 5, TINY.input_dim, TINY.n_classes)
+        with pytest.raises(ValueError, match="task_length"):
+            upgd_ipmnist.validated_ipmnist_data(
+                x, y, input_dim=TINY.input_dim, n_classes=TINY.n_classes, min_length=6
+            )
+        upgd_ipmnist.validated_ipmnist_data(
+            x, y, input_dim=TINY.input_dim, n_classes=TINY.n_classes, min_length=5
+        )
+
+
+class TestSeedBoundary:
+    @pytest.mark.parametrize(
+        "seeds",
+        [
+            (),
+            (0, 0),
+            (True,),
+            (np.int64(0),),
+            (0.0,),
+            (-1,),
+            (2**32,),
+            (0, 2**32),
+        ],
+    )
+    def test_run_rejects_noncanonical_seed_identities_before_setup(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        seeds: tuple[object, ...],
+    ) -> None:
+        def unexpected_setup(*args: object, **kwargs: object) -> None:
+            del args, kwargs
+            raise AssertionError("invalid seeds reached learner setup")
+
+        monkeypatch.setattr(upgd_ipmnist, "resolve_hyperparameters", unexpected_setup)
+        with pytest.raises(ValueError, match="seeds"):
+            run_ipmnist(
+                np.empty((1, 1), dtype=np.float32),
+                np.empty((1,), dtype=np.int32),
+                "adamw",
+                seeds=seeds,  # type: ignore[arg-type]
+            )
+
+    def test_run_preserves_full_uint32_seed_identities(self) -> None:
+        config = IPMNISTConfig(
+            n_tasks=1,
+            task_length=1,
+            input_dim=2,
+            hidden1=2,
+            hidden2=2,
+            n_classes=2,
+        )
+        data_x = np.asarray([[0.25, -0.5]], dtype=np.float32)
+        data_y = np.asarray([1], dtype=np.int32)
+        result = run_ipmnist(
+            data_x,
+            data_y,
+            "adamw",
+            seeds=(2**32 - 1, 0),
+            config=config,
+            return_per_step=True,
+        )
+
+        assert result.seeds == (2**32 - 1, 0)
+        assert result.initial_params is not None
+        assert not np.array_equal(result.initial_params["w1"][0], result.initial_params["w1"][1])
+
+    def test_cli_rejects_aliased_seed_before_loading_mnist(
+        self, tmp_path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def unexpected_load(*args: object, **kwargs: object) -> None:
+            del args, kwargs
+            raise AssertionError("invalid CLI seeds reached dataset loading")
+
+        monkeypatch.setattr(upgd_ipmnist, "load_mnist_train", unexpected_load)
+        with pytest.raises(ValueError, match=r"seeds\[1\].*uint32"):
+            upgd_ipmnist.main_v2_compat(
+                [
+                    "--learners",
+                    "adamw",
+                    "--seed-list",
+                    f"0,{2**32}",
+                    "--partial-out",
+                    str(tmp_path / "must-not-exist.json"),
+                ]
+            )
 
 
 @pytest.fixture(scope="module")
@@ -309,6 +679,141 @@ class TestLeanUPGDParity:
                 )
 
 
+class TestAdamWTransaction:
+    """AdamW's parameter leaves form one checked learner transaction."""
+
+    @staticmethod
+    def _params() -> dict[str, jnp.ndarray]:
+        return {
+            "bias": jnp.asarray([0.2, -0.1], dtype=jnp.float32),
+            "weight": jnp.asarray([[0.4, -0.3], [0.1, 0.5]], dtype=jnp.float32),
+        }
+
+    @staticmethod
+    def _assert_tree_equal(actual, expected) -> None:
+        import jax
+
+        actual_leaves, actual_structure = jax.tree.flatten(actual)
+        expected_leaves, expected_structure = jax.tree.flatten(expected)
+        assert actual_structure == expected_structure
+        for actual_leaf, expected_leaf in zip(
+            actual_leaves, expected_leaves, strict=True
+        ):
+            np.testing.assert_array_equal(
+                np.asarray(actual_leaf), np.asarray(expected_leaf)
+            )
+
+    def test_nonfinite_leaf_rejects_entire_params_and_optimizer_state(self):
+        import jax
+
+        hp = dict(ADAMW_PROTOCOL_HYPERPARAMETERS)
+        init_fn, step_fn = _make_adamw_learner(hp)
+        params = self._params()
+        state = init_fn(params)
+        grads = {
+            "bias": jnp.asarray([jnp.inf, 0.25], dtype=jnp.float32),
+            "weight": jnp.asarray([[0.3, -0.2], [0.4, 0.1]], dtype=jnp.float32),
+        }
+
+        compiled_step = jax.jit(step_fn)
+        result = compiled_step(params, state, grads, jr.key(0))
+
+        assert isinstance(result, LearnerUpdateResult)
+        assert not bool(result.update_applied)
+        self._assert_tree_equal(result.params, params)
+        self._assert_tree_equal(result.state, state)
+        # The established two-value caller surface remains available.
+        unpacked_params, unpacked_state = result
+        self._assert_tree_equal(unpacked_params, params)
+        self._assert_tree_equal(unpacked_state, state)
+
+        recovered = compiled_step(
+            result.params,
+            result.state,
+            {
+                "bias": jnp.asarray([0.1, 0.25], dtype=jnp.float32),
+                "weight": grads["weight"],
+            },
+            jr.key(1),
+        )
+        assert bool(recovered.update_applied)
+        assert not np.array_equal(
+            np.asarray(recovered.params["weight"]), np.asarray(params["weight"])
+        )
+
+    def test_finite_post_apply_overflow_rejects_entire_transaction(self):
+        import jax
+
+        hp = dict(ADAMW_PROTOCOL_HYPERPARAMETERS)
+        hp["step_size"] = 3e38
+        hp["weight_decay"] = 0.0
+        init_fn, step_fn = _make_adamw_learner(hp)
+        params = {
+            "bias": jnp.asarray([-3e38], dtype=jnp.float32),
+            "weight": self._params()["weight"],
+        }
+        state = init_fn(params)
+        grads = {
+            "bias": jnp.asarray([1.0], dtype=jnp.float32),
+            "weight": jnp.zeros_like(params["weight"]),
+        }
+
+        compiled_step = jax.jit(step_fn)
+        result = compiled_step(params, state, grads, jr.key(2))
+
+        assert not bool(result.update_applied)
+        self._assert_tree_equal(result.params, params)
+        self._assert_tree_equal(result.state, state)
+
+        recovered = compiled_step(
+            result.params,
+            result.state,
+            {name: jnp.zeros_like(value) for name, value in grads.items()},
+            jr.key(3),
+        )
+        assert bool(recovered.update_applied)
+        self._assert_tree_equal(recovered.params, params)
+
+    def test_finite_step_matches_leafwise_adamw_and_jit(self):
+        import jax
+
+        from alberta_framework.core.baseline_optimizers import Adam
+
+        hp = dict(ADAMW_PROTOCOL_HYPERPARAMETERS)
+        hp["weight_decay"] = 0.02
+        init_fn, step_fn = _make_adamw_learner(hp)
+        params = self._params()
+        state = init_fn(params)
+        grads = {
+            "bias": jnp.asarray([-0.3, 0.25], dtype=jnp.float32),
+            "weight": jnp.asarray([[0.3, -0.2], [0.4, 0.1]], dtype=jnp.float32),
+        }
+        optimizer = Adam(
+            step_size=hp["step_size"],
+            beta1=hp["beta1"],
+            beta2=hp["beta2"],
+            eps=hp["eps"],
+            weight_decay=hp["weight_decay"],
+        )
+        expected_params: dict[str, jnp.ndarray] = {}
+        expected_state = {}
+        for name, value in params.items():
+            step, leaf_state = optimizer.update_from_gradient(
+                state[name], grads[name], error=None, param=value
+            )
+            expected_params[name] = value - step
+            expected_state[name] = leaf_state
+
+        eager = step_fn(params, state, grads, jr.key(1))
+        compiled = jax.jit(step_fn)(params, state, grads, jr.key(1))
+
+        assert bool(eager.update_applied)
+        assert bool(compiled.update_applied)
+        self._assert_tree_equal(eager.params, expected_params)
+        self._assert_tree_equal(eager.state, expected_state)
+        self._assert_tree_equal(compiled, eager)
+
+
 class TestSplitFlatNoise:
     def test_slices_in_sorted_name_order_with_exact_values(self):
         shapes = {"b1": (5,), "b2": (3,), "w1": (7, 5), "w2": (5, 3)}
@@ -433,6 +938,32 @@ class TestNoisePoolMode:
                 noise_mode="pool", noise_pool_steps=1,
             )
 
+    def test_pool_mode_rejects_noninteger_pool_size_before_allocation(self):
+        data_x, data_y = _synthetic_dataset(3, N_TRAIN, TINY.input_dim, TINY.n_classes)
+        with pytest.raises(ValueError, match="noise_pool_steps"):
+            run_ipmnist(
+                data_x,
+                data_y,
+                "upgd_w",
+                seeds=(0,),
+                config=TINY,
+                noise_mode="pool",
+                noise_pool_steps=2.5,  # type: ignore[arg-type]
+            )
+
+    def test_pool_mode_rejects_derived_length_overflow_before_allocation(self):
+        data_x, data_y = _synthetic_dataset(3, N_TRAIN, TINY.input_dim, TINY.n_classes)
+        with pytest.raises(ValueError, match=r"noise_pool_steps \* parameter_count"):
+            run_ipmnist(
+                data_x,
+                data_y,
+                "upgd_w",
+                seeds=(0,),
+                config=TINY,
+                noise_mode="pool",
+                noise_pool_steps=2**31 - 1,
+            )
+
     def test_pool_mode_shard_serialization_fails_closed(self):
         data_x, data_y = _synthetic_dataset(3, N_TRAIN, TINY.input_dim, TINY.n_classes)
         pooled = run_ipmnist(
@@ -444,6 +975,39 @@ class TestNoisePoolMode:
 
 
 class TestPartialMerge:
+    def test_v2_partial_manifest_binds_identity_and_digest_to_one_read(
+        self, tmp_path, monkeypatch
+    ):
+        path = tmp_path / "partial.json"
+        original = json.dumps(
+            {"schema": PARTIAL_SCHEMA, "learner": "adamw", "seed_id": 7}
+        ).encode("utf-8")
+        replacement = json.dumps(
+            {"schema": PARTIAL_SCHEMA, "learner": "upgd_w", "seed_id": 11}
+        )
+        path.write_bytes(original)
+
+        original_read_bytes = Path.read_bytes
+
+        def replace_after_read(target: Path) -> bytes:
+            snapshot = original_read_bytes(target)
+            target.write_text(replacement, encoding="utf-8")
+            return snapshot
+
+        monkeypatch.setattr(Path, "read_bytes", replace_after_read)
+
+        manifest = upgd_ipmnist._v2_partial_manifest([path])
+
+        assert manifest == [
+            {
+                "learner": "adamw",
+                "seed_id": 7,
+                "path": path.as_posix(),
+                "size_bytes": len(original),
+                "sha256": hashlib.sha256(original).hexdigest(),
+            }
+        ]
+
     def test_partial_roundtrip_and_merge(self, tmp_path):
         data_x, data_y = _synthetic_dataset(6, N_TRAIN, TINY.input_dim, TINY.n_classes)
         shard_a = run_ipmnist(data_x, data_y, "upgd_w", seeds=(1,), config=TINY)
@@ -480,6 +1044,38 @@ class TestPartialMerge:
         path_b.write_text(json.dumps(partial_payload(other)))
         with pytest.raises(ValueError, match="disagree on config"):
             merge_partial_results([path_a, path_b])
+
+    def test_merge_rejects_seed_identity_outside_jax_key_domain(self, tmp_path) -> None:
+        data_x, data_y = _synthetic_dataset(6, N_TRAIN, TINY.input_dim, TINY.n_classes)
+        shard = run_ipmnist(data_x, data_y, "adamw", seeds=(0,), config=TINY)
+        payload = partial_payload(shard)
+        payload["seed_id"] = 2**32
+        path = tmp_path / "aliased-seed.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+        with pytest.raises(ValueError, match="uint32"):
+            merge_partial_results([path])
+
+    def test_merge_rejects_hyperparameters_outside_learner_domain(self, tmp_path) -> None:
+        data_x, data_y = _synthetic_dataset(6, N_TRAIN, TINY.input_dim, TINY.n_classes)
+        shard = run_ipmnist(data_x, data_y, "adamw", seeds=(0,), config=TINY)
+        payload = partial_payload(shard)
+        payload["hyperparameters"]["step_size"] = -1.0
+        path = tmp_path / "negative-step-size.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+        with pytest.raises(ValueError, match="invalid hyperparameters"):
+            merge_partial_results([path])
+
+    def test_merge_rejects_integer_alias_of_float_hyperparameter(self, tmp_path) -> None:
+        data_x, data_y = _synthetic_dataset(6, N_TRAIN, TINY.input_dim, TINY.n_classes)
+        shard = run_ipmnist(data_x, data_y, "adamw", seeds=(0,), config=TINY)
+        payload = partial_payload(shard)
+        payload["hyperparameters"]["beta1"] = 0
+        path = tmp_path / "integer-beta1.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        with pytest.raises(ValueError, match="complete learner configuration"):
+            merge_partial_results([path])
 
     def test_v2_partial_is_single_seed_and_recursively_omits_legacy_marker(
         self, tmp_path, debug_run
@@ -541,3 +1137,71 @@ class TestSummariesAndComparison:
         )
         assert not clean["learners"]["upgd_w"]["reproduction_gap_flagged"]
         assert clean["reference"] is PAPER_REFERENCE
+
+
+def _legal_ipmnist_run_result(**overrides: object) -> IPMNISTRunResult:
+    payload: dict[str, object] = {
+        "learner": "adamw",
+        "hyperparameters": dict(ADAMW_PROTOCOL_HYPERPARAMETERS),
+        "seeds": (0,),
+        "config": TINY,
+        "per_task_accuracy": np.zeros((1, TINY.n_tasks)),
+        "per_task_loss": np.zeros((1, TINY.n_tasks)),
+        "per_task_plasticity": np.zeros((1, TINY.n_tasks)),
+        "average_online_accuracy": np.zeros((1,)),
+        "wall_clock_seconds": 1.0,
+    }
+    payload.update(overrides)
+    return IPMNISTRunResult(**payload)  # type: ignore[arg-type]
+
+
+def test_ipmnist_run_result_rejects_leftover_identities() -> None:
+    """Public IPMNIST result records must not keep leftover bool/NaN identities."""
+
+    with pytest.raises(ValueError, match="wall_clock_seconds"):
+        _legal_ipmnist_run_result(wall_clock_seconds=True)
+    with pytest.raises(ValueError, match="wall_clock_seconds"):
+        _legal_ipmnist_run_result(wall_clock_seconds=float("nan"))
+    with pytest.raises(ValueError, match="wall_clock_seconds"):
+        _legal_ipmnist_run_result(wall_clock_seconds=float("inf"))
+    with pytest.raises(ValueError, match="learner"):
+        _legal_ipmnist_run_result(learner=True)
+    with pytest.raises(ValueError, match="seeds"):
+        _legal_ipmnist_run_result(seeds=(True,))
+    with pytest.raises(ValueError, match="noise_mode"):
+        _legal_ipmnist_run_result(noise_mode=True)
+
+    legal = _legal_ipmnist_run_result()
+    dumped = json.dumps(
+        {
+            "learner": legal.learner,
+            "seeds": list(legal.seeds),
+            "wall_clock_seconds": legal.wall_clock_seconds,
+            "noise_mode": legal.noise_mode,
+        },
+        allow_nan=False,
+    )
+    assert '"wall_clock_seconds": 1.0' in dumped
+    assert '"wall_clock_seconds": true' not in dumped
+    assert '"learner": true' not in dumped
+    assert '"seeds": [true]' not in dumped
+    assert '"noise_mode": true' not in dumped
+
+
+def test_ipmnist_run_result_rejects_hostile_scalar_and_seed_containers() -> None:
+    class HostileFloat(float):
+        def __float__(self) -> float:
+            raise AssertionError("hostile float conversion must not run")
+
+    class HostileSeeds:
+        def __iter__(self):
+            raise AssertionError("hostile seed iteration must not run")
+
+    with pytest.raises(ValueError, match="wall_clock_seconds"):
+        _legal_ipmnist_run_result(wall_clock_seconds=HostileFloat(1.0))
+    with pytest.raises(ValueError, match="exact tuple"):
+        _legal_ipmnist_run_result(seeds=HostileSeeds())
+    with pytest.raises(ValueError, match="non-empty"):
+        _legal_ipmnist_run_result(seeds=())
+    with pytest.raises(ValueError, match="unique"):
+        _legal_ipmnist_run_result(seeds=(0, 0))

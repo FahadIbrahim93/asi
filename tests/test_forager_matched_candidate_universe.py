@@ -21,6 +21,7 @@ import json
 import shutil
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -432,6 +433,77 @@ def test_external_screen_validator_rejects_duplicate_rank_rows() -> None:
 
 
 @pytest.mark.unit
+def test_rtu_source_validator_rejects_float_alias_for_integer_aperture() -> None:
+    binding = next(
+        item
+        for item in universe._LOCAL_CANDIDATE_GENERATION_BINDINGS
+        if item.screen_id == "rtu_schema23_screening_v1"
+    )
+    artifacts = {
+        artifact.role: json.loads((_REPOSITORY_ROOT / artifact.path).read_bytes())
+        for artifact in binding.artifacts
+    }
+    artifacts["protocol"]["task"]["aperture_size"] = 9.0
+
+    with pytest.raises(
+        universe.ForagerMatchedCandidateUniverseError,
+        match=r"task\.aperture_size must be an integer",
+    ):
+        universe._verify_rtu_candidate_generation(binding, artifacts)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("artifact_role", "path", "match"),
+    [
+        ("protocol", ("task", "steps"), r"task\.steps must be an integer"),
+        ("protocol", ("task", "seeds", 0), r"task\.seeds\[0\] must be an integer"),
+        ("matrix", ("steps",), r"matrix\.steps must be an integer"),
+        ("matrix", ("seeds", 0), r"matrix\.seeds\[0\] must be an integer"),
+        ("matrix", ("tuning_seeds", 0), r"matrix\.tuning_seeds\[0\] must be an integer"),
+        (
+            "matrix",
+            ("evaluation_seeds", 0),
+            r"matrix\.evaluation_seeds\[0\] must be an integer",
+        ),
+        (
+            "protocol",
+            ("future_evaluation", "seeds", 0),
+            r"future_evaluation\.seeds\[0\] must be an integer",
+        ),
+        (
+            "protocol",
+            ("selection_rule", "advance_count"),
+            r"selection_rule\.advance_count must be an integer",
+        ),
+    ],
+)
+def test_rtu_source_validator_rejects_float_aliases_across_full_integer_contract(
+    artifact_role: str, path: tuple[object, ...], match: str
+) -> None:
+    """Reviewer-found gap on PR #461: the exact-int policy applied to
+    aperture_size alone left every adjacent integer attestation (task/matrix
+    steps and seeds, future_evaluation seeds, selection_rule advance_count)
+    still fail-open to a numeric alias via bare equality."""
+    binding = next(
+        item
+        for item in universe._LOCAL_CANDIDATE_GENERATION_BINDINGS
+        if item.screen_id == "rtu_schema23_screening_v1"
+    )
+    artifacts = {
+        artifact.role: json.loads((_REPOSITORY_ROOT / artifact.path).read_bytes())
+        for artifact in binding.artifacts
+    }
+    target: Any = artifacts[artifact_role]
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] = float(target[path[-1]])
+
+    with pytest.raises(universe.ForagerMatchedCandidateUniverseError, match=match):
+        universe._verify_rtu_candidate_generation(binding, artifacts)
+
+
+@pytest.mark.unit
 def test_external_screen_validator_reconciles_snapshot_configuration_hashes() -> None:
     binding = universe._SCREEN_BINDINGS[0]
     protocol = json.loads((_REPOSITORY_ROOT / binding.protocol_path).read_bytes())
@@ -636,3 +708,189 @@ def test_internal_descriptor_validator_rejects_external_group_role_drift(
 
     with pytest.raises(AssertionError, match="selection group|role/pairing"):
         universe._validate_internal_descriptor(descriptor)
+
+
+def _legal_screening_binding(**overrides: object) -> universe.ScreeningArtifactBinding:
+    payload: dict[str, object] = {
+        "screen_id": "dqn_common_control_v3",
+        "family": "common_control_dqn",
+        "protocol_path": "p.json",
+        "protocol_sha256": "a" * 64,
+        "screen_plan_path": "s.json",
+        "screen_plan_sha256": "a" * 64,
+        "aggregate_path": "a.json",
+        "aggregate_sha256": "a" * 64,
+        "protocol_schema_version": "v1",
+        "horizon_per_seed": 100,
+        "candidate_count": 2,
+    }
+    payload.update(overrides)
+    return universe.ScreeningArtifactBinding(**payload)  # type: ignore[arg-type]
+
+
+def test_candidate_universe_records_reject_leftover_identities() -> None:
+    """Public candidate-universe records must not keep leftover bool/int identities."""
+
+    with pytest.raises(universe.ForagerMatchedCandidateUniverseError, match="horizon_per_seed"):
+        _legal_screening_binding(horizon_per_seed=True)
+    with pytest.raises(universe.ForagerMatchedCandidateUniverseError, match="candidate_count"):
+        _legal_screening_binding(candidate_count=True)
+    with pytest.raises(universe.ForagerMatchedCandidateUniverseError, match="seeds"):
+        universe.LocalCandidateGenerationBinding(
+            screen_id="horde_fov_tuning_v2",
+            family="alberta_horde_actor_critic",
+            seeds=(True,),
+            horizon_per_seed=10,
+            candidate_count=4,
+            normalized_matrix_sha256="a" * 64,
+            source_tree_sha256="a" * 64,
+            source_archive_sha256="a" * 64,
+            source_inventory_sha256="a" * 64,
+            artifacts=(universe.BoundJsonArtifact("role", "p.json", "a" * 64),),
+        )
+    with pytest.raises(
+        universe.ForagerMatchedCandidateUniverseError, match="open_development_rank"
+    ):
+        universe.ScreenedArmDecision(
+            screen_id="dqn_common_control_v3",
+            configuration="configs/x",
+            configuration_sha256="a" * 64,
+            open_development_rank=True,
+            open_development_aggregate_mean=0.5,
+            disposition="registered_horizon_transform",
+            registered_candidate_ids=("a",),
+            rationale="r",
+        )
+    with pytest.raises(
+        universe.ForagerMatchedCandidateUniverseError,
+        match="open_development_aggregate_mean",
+    ):
+        universe.ScreenedArmDecision(
+            screen_id="dqn_common_control_v3",
+            configuration="configs/x",
+            configuration_sha256="a" * 64,
+            open_development_rank=1,
+            open_development_aggregate_mean=True,
+            disposition="registered_horizon_transform",
+            registered_candidate_ids=("a",),
+            rationale="r",
+        )
+    with pytest.raises(universe.ForagerMatchedCandidateUniverseError, match="pairing_eligible"):
+        universe.RegisteredCandidateDecision(
+            candidate_id="c",
+            selection_group="alberta",
+            analysis_role="inferential",
+            pairing_eligible=1,
+            source_screen_id=None,
+            source_configuration=None,
+            implementation_relationship="independent_alberta_tuning_arm",
+            rng_relationship="isolated_agent_and_environment_streams",
+            observation_access="matched_partial_color_aperture_9",
+            rationale="r",
+        )
+
+    legal_screen = _legal_screening_binding()
+    legal_arm = universe.ScreenedArmDecision(
+        screen_id="dqn_common_control_v3",
+        configuration="configs/x",
+        configuration_sha256="a" * 64,
+        open_development_rank=1,
+        open_development_aggregate_mean=0.5,
+        disposition="registered_horizon_transform",
+        registered_candidate_ids=("a",),
+        rationale="r",
+    )
+    legal_reg = universe.RegisteredCandidateDecision(
+        candidate_id="c",
+        selection_group="alberta",
+        analysis_role="inferential",
+        pairing_eligible=True,
+        source_screen_id=None,
+        source_configuration=None,
+        implementation_relationship="independent_alberta_tuning_arm",
+        rng_relationship="isolated_agent_and_environment_streams",
+        observation_access="matched_partial_color_aperture_9",
+        rationale="r",
+    )
+    dumped = json.dumps(
+        {
+            "horizon_per_seed": legal_screen.horizon_per_seed,
+            "candidate_count": legal_screen.candidate_count,
+            "open_development_rank": legal_arm.open_development_rank,
+            "open_development_aggregate_mean": legal_arm.open_development_aggregate_mean,
+            "pairing_eligible": legal_reg.pairing_eligible,
+        },
+        allow_nan=False,
+    )
+    assert '"horizon_per_seed": 100' in dumped
+    assert '"candidate_count": 2' in dumped
+    assert '"open_development_rank": 1' in dumped
+    assert '"open_development_aggregate_mean": 0.5' in dumped
+    assert '"pairing_eligible": true' in dumped
+    assert '"horizon_per_seed": true' not in dumped
+    assert '"candidate_count": true' not in dumped
+    assert '"open_development_rank": true' not in dumped
+    assert '"open_development_aggregate_mean": true' not in dumped
+    assert '"pairing_eligible": 1' not in dumped
+
+
+def test_candidate_universe_records_reject_hostile_and_aliased_numbers() -> None:
+    class HostileInt(int):
+        def __lt__(self, other: object) -> bool:
+            raise AssertionError("hostile integer comparison must not run")
+
+    class HostileFloat(float):
+        def __float__(self) -> float:
+            raise AssertionError("hostile float conversion must not run")
+
+    class HostileSeeds:
+        def __iter__(self):
+            raise AssertionError("hostile seed iteration must not run")
+
+    for field, value in (
+        ("horizon_per_seed", 0),
+        ("candidate_count", 0),
+        ("horizon_per_seed", HostileInt(1)),
+    ):
+        with pytest.raises(universe.ForagerMatchedCandidateUniverseError, match=field):
+            _legal_screening_binding(**{field: value})
+
+    binding_arguments: dict[str, object] = {
+        "screen_id": "horde_fov_tuning_v2",
+        "family": "alberta_horde_actor_critic",
+        "horizon_per_seed": 10,
+        "candidate_count": 4,
+        "normalized_matrix_sha256": "a" * 64,
+        "source_tree_sha256": "a" * 64,
+        "source_archive_sha256": "a" * 64,
+        "source_inventory_sha256": "a" * 64,
+        "artifacts": (universe.BoundJsonArtifact("role", "p.json", "a" * 64),),
+    }
+    for seeds, message in (
+        (HostileSeeds(), "non-empty exact tuple"),
+        ((), "non-empty"),
+        ((0, 0), "unique"),
+        ((-1,), r"\[0, 4294967295\]"),
+        ((2**32,), r"\[0, 4294967295\]"),
+        ((HostileInt(0),), r"seeds\[0\]"),
+    ):
+        with pytest.raises(universe.ForagerMatchedCandidateUniverseError, match=message):
+            universe.LocalCandidateGenerationBinding(  # type: ignore[arg-type]
+                seeds=seeds,
+                **binding_arguments,
+            )
+
+    with pytest.raises(
+        universe.ForagerMatchedCandidateUniverseError,
+        match="open_development_aggregate_mean",
+    ):
+        universe.ScreenedArmDecision(
+            screen_id="dqn_common_control_v3",
+            configuration="configs/x",
+            configuration_sha256="a" * 64,
+            open_development_rank=1,
+            open_development_aggregate_mean=HostileFloat(0.5),
+            disposition="registered_horizon_transform",
+            registered_candidate_ids=("a",),
+            rationale="r",
+        )

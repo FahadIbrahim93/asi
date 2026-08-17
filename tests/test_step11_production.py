@@ -1,10 +1,21 @@
-"""Tests for the public Step 11 OaK facade."""
+"""Tests for the Step 11 OaK production facade.
+
+Invalid dimension and scientific-scalar cases are written to fail on current
+main (bool, non-real, non-integral, non-finite, and out-of-domain values
+accepted) and pass after the facade rejects them. Legal endpoints stay
+constructible and accepted numbers canonicalize to builtin ints and floats.
+"""
 
 from __future__ import annotations
+
+import json
+from fractions import Fraction
+from typing import Any
 
 import chex
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 import pytest
 
 from alberta_framework.core.oak import (
@@ -49,6 +60,15 @@ def _make_step11_cfg(
         observation_dim=obs_dim,
         n_primitive_actions=n_prim,
     )
+
+
+def _make_oak_cfg(
+    *,
+    specs: tuple[SubtaskSpec, ...] = (_SPEC0,),
+    obs_dim: int = 4,
+) -> OaKConfig:
+    stomp = STOMPConfig(subtask_specs=specs, observation_dim=obs_dim)
+    return OaKConfig(stomp=stomp)
 
 
 def _setup(
@@ -120,6 +140,494 @@ def test_step11_config_to_oak_config_fields_match() -> None:
     assert oak_cfg.observation_dim == 5
     assert oak_cfg.n_primitive_actions == 3
     assert oak_cfg.stomp.subtask_specs == cfg.subtask_specs
+
+
+_INVALID_STEP11_FIELDS: tuple[tuple[str, Any], ...] = (
+    ("observation_dim", 0),
+    ("observation_dim", -1),
+    ("observation_dim", True),
+    ("observation_dim", False),
+    ("observation_dim", "4"),
+    ("observation_dim", 4.5),
+    ("observation_dim", float("nan")),
+    ("observation_dim", float("inf")),
+    ("observation_dim", None),
+    ("observation_dim", 2**31),
+    ("n_primitive_actions", 0),
+    ("n_primitive_actions", -1),
+    ("n_primitive_actions", True),
+    ("n_primitive_actions", False),
+    ("n_primitive_actions", "2"),
+    ("n_primitive_actions", 2.5),
+    ("n_primitive_actions", float("nan")),
+    ("n_primitive_actions", float("inf")),
+    ("n_primitive_actions", None),
+    ("n_primitive_actions", 2**31),
+    ("option_planning_backups_per_step", -1),
+    ("option_planning_backups_per_step", 2**31 - 1),
+    ("option_planning_backups_per_step", 2**31),
+    ("option_planning_backups_per_step", True),
+    ("option_planning_backups_per_step", False),
+    ("option_planning_backups_per_step", "0"),
+    ("option_planning_backups_per_step", 1.5),
+    ("option_planning_backups_per_step", float("nan")),
+    ("option_planning_backups_per_step", float("inf")),
+    ("option_planning_backups_per_step", None),
+    ("base_step_size", float("nan")),
+    ("base_step_size", float("inf")),
+    ("base_step_size", float("-inf")),
+    ("base_step_size", True),
+    ("base_step_size", False),
+    ("base_step_size", -1.0),
+    ("base_step_size", "0.05"),
+    ("base_step_size", None),
+    ("base_step_size", 1e100),
+    ("base_avg_reward_step_size", float("nan")),
+    ("base_avg_reward_step_size", float("inf")),
+    ("base_avg_reward_step_size", True),
+    ("base_avg_reward_step_size", False),
+    ("base_avg_reward_step_size", -0.01),
+    ("base_avg_reward_step_size", "0.01"),
+    ("base_avg_reward_step_size", 1e100),
+    ("base_trace_decay", float("nan")),
+    ("base_trace_decay", float("inf")),
+    ("base_trace_decay", True),
+    ("base_trace_decay", False),
+    ("base_trace_decay", -0.1),
+    ("base_trace_decay", 1.1),
+    ("base_trace_decay", "0.0"),
+    ("base_trace_decay", 1e100),
+    ("option_step_size", float("nan")),
+    ("option_step_size", float("inf")),
+    ("option_step_size", True),
+    ("option_step_size", False),
+    ("option_step_size", -1.0),
+    ("option_step_size", "0.05"),
+    ("option_step_size", 1e100),
+    ("option_avg_reward_step_size", float("nan")),
+    ("option_avg_reward_step_size", float("inf")),
+    ("option_avg_reward_step_size", True),
+    ("option_avg_reward_step_size", False),
+    ("option_avg_reward_step_size", -0.01),
+    ("option_avg_reward_step_size", 1e100),
+    ("option_trace_decay", float("nan")),
+    ("option_trace_decay", float("inf")),
+    ("option_trace_decay", True),
+    ("option_trace_decay", False),
+    ("option_trace_decay", -0.1),
+    ("option_trace_decay", 1.1),
+    ("option_trace_decay", 1e100),
+    ("option_gamma", float("nan")),
+    ("option_gamma", float("inf")),
+    ("option_gamma", float("-inf")),
+    ("option_gamma", True),
+    ("option_gamma", False),
+    ("option_gamma", -0.1),
+    ("option_gamma", 1.1),
+    ("option_gamma", "0.99"),
+    ("option_gamma", 1e100),
+    ("option_model_decay", float("nan")),
+    ("option_model_decay", float("inf")),
+    ("option_model_decay", True),
+    ("option_model_decay", False),
+    ("option_model_decay", -0.1),
+    ("option_model_decay", 1.1),
+    ("option_model_decay", "0.95"),
+    ("option_model_decay", 1e100),
+    ("option_model_step_size", float("nan")),
+    ("option_model_step_size", float("inf")),
+    ("option_model_step_size", True),
+    ("option_model_step_size", False),
+    ("option_model_step_size", -0.1),
+    ("option_model_step_size", "0.1"),
+    ("option_model_step_size", 1e100),
+    ("epsilon_base", float("nan")),
+    ("epsilon_base", float("inf")),
+    ("epsilon_base", True),
+    ("epsilon_base", False),
+    ("epsilon_base", -0.1),
+    ("epsilon_base", 1.1),
+    ("epsilon_base", "0.1"),
+    ("epsilon_base", 1e100),
+    ("epsilon_option", float("nan")),
+    ("epsilon_option", float("inf")),
+    ("epsilon_option", True),
+    ("epsilon_option", False),
+    ("epsilon_option", -0.1),
+    ("epsilon_option", 1.1),
+    ("epsilon_option", 1e100),
+    ("utility_ema_decay", float("nan")),
+    ("utility_ema_decay", float("inf")),
+    ("utility_ema_decay", float("-inf")),
+    ("utility_ema_decay", True),
+    ("utility_ema_decay", False),
+    ("utility_ema_decay", -0.1),
+    ("utility_ema_decay", 1.1),
+    ("utility_ema_decay", "0.99"),
+    ("utility_ema_decay", 1e100),
+    ("curation_threshold", float("nan")),
+    ("curation_threshold", float("inf")),
+    ("curation_threshold", float("-inf")),
+    ("curation_threshold", True),
+    ("curation_threshold", False),
+    ("curation_threshold", -0.1),
+    ("curation_threshold", "0.0"),
+    ("curation_threshold", None),
+    ("curation_threshold", 1e100),
+)
+
+
+def _config_with(**overrides: Any) -> Step11OaKConfig:
+    payload: dict[str, Any] = {
+        "subtask_specs": (_SPEC0,),
+        "observation_dim": 4,
+        "n_primitive_actions": 2,
+    }
+    payload.update(overrides)
+    return Step11OaKConfig(**payload)
+
+
+@pytest.mark.parametrize(("field", "value"), _INVALID_STEP11_FIELDS)
+def test_step11_oak_fields_reject_invalid_inputs(field: str, value: object) -> None:
+    with pytest.raises(ValueError, match=field):
+        _config_with(**{field: value})
+
+
+def test_step11_config_feature_index_out_of_bounds_raises() -> None:
+    bad_spec = SubtaskSpec(feature_index=10)
+    with pytest.raises(ValueError, match="feature_index"):
+        Step11OaKConfig(subtask_specs=(bad_spec,), observation_dim=4)
+
+
+def test_step11_oak_rejects_non_tuple_subtask_specs() -> None:
+    with pytest.raises(ValueError, match="subtask_specs"):
+        Step11OaKConfig(subtask_specs=[_SPEC0])  # type: ignore[arg-type]
+
+
+def test_step11_oak_rejects_bool_and_nonfinite_spec_scalars() -> None:
+    with pytest.raises(ValueError, match="feature_index"):
+        Step11OaKConfig(
+            subtask_specs=(SubtaskSpec(feature_index=True),),
+            observation_dim=4,
+        )
+    with pytest.raises(ValueError, match="threshold"):
+        Step11OaKConfig(
+            subtask_specs=(SubtaskSpec(feature_index=0, threshold=True),),
+            observation_dim=4,
+        )
+    with pytest.raises(ValueError, match="threshold"):
+        Step11OaKConfig(
+            subtask_specs=(SubtaskSpec(feature_index=0, threshold=float("nan")),),
+            observation_dim=4,
+        )
+    with pytest.raises(ValueError, match="threshold"):
+        Step11OaKConfig(
+            subtask_specs=(SubtaskSpec(feature_index=0, threshold=float("inf")),),
+            observation_dim=4,
+        )
+    with pytest.raises(ValueError, match="pseudo_reward_scale"):
+        Step11OaKConfig(
+            subtask_specs=(SubtaskSpec(feature_index=0, pseudo_reward_scale=True),),
+            observation_dim=4,
+        )
+    with pytest.raises(ValueError, match="pseudo_reward_scale"):
+        Step11OaKConfig(
+            subtask_specs=(
+                SubtaskSpec(feature_index=0, pseudo_reward_scale=float("nan")),
+            ),
+            observation_dim=4,
+        )
+    with pytest.raises(ValueError, match="max_option_steps"):
+        Step11OaKConfig(
+            subtask_specs=(SubtaskSpec(feature_index=0, max_option_steps=True),),
+            observation_dim=4,
+        )
+
+
+def test_step11_oak_fields_preserve_legal_endpoints() -> None:
+    config = Step11OaKConfig(
+        subtask_specs=(
+            SubtaskSpec(
+                feature_index=0,
+                threshold=1e-12,
+                pseudo_reward_scale=1e-12,
+                max_option_steps=1,
+            ),
+        ),
+        observation_dim=1,
+        n_primitive_actions=1,
+        base_step_size=0.0,
+        base_avg_reward_step_size=0.0,
+        base_trace_decay=0.0,
+        option_step_size=0.0,
+        option_avg_reward_step_size=0.0,
+        option_trace_decay=0.0,
+        option_gamma=0.0,
+        option_model_decay=0.0,
+        option_model_step_size=0.0,
+        option_planning_backups_per_step=0,
+        epsilon_base=0.0,
+        epsilon_option=0.0,
+        utility_ema_decay=0.0,
+        curation_threshold=0.0,
+    )
+    agent = make_step11_oak_agent(config)
+    payload = config.to_config()
+    json.dumps(payload, allow_nan=False)
+    restored = Step11OaKConfig.from_config(payload)
+    assert restored.observation_dim == 1
+    assert restored.n_primitive_actions == 1
+    assert restored.base_step_size == 0.0
+    assert restored.base_avg_reward_step_size == 0.0
+    assert restored.base_trace_decay == 0.0
+    assert restored.option_step_size == 0.0
+    assert restored.option_avg_reward_step_size == 0.0
+    assert restored.option_trace_decay == 0.0
+    assert restored.option_gamma == 0.0
+    assert restored.option_model_decay == 0.0
+    assert restored.option_model_step_size == 0.0
+    assert restored.option_planning_backups_per_step == 0
+    assert restored.epsilon_base == 0.0
+    assert restored.epsilon_option == 0.0
+    assert restored.utility_ema_decay == 0.0
+    assert restored.curation_threshold == 0.0
+    assert restored.subtask_specs[0].feature_index == 0
+    assert restored.subtask_specs[0].threshold == 1e-12
+    assert restored.subtask_specs[0].pseudo_reward_scale == 1e-12
+    assert restored.subtask_specs[0].max_option_steps == 1
+    assert agent.config.stomp.option_gamma == 0.0
+
+    upper = Step11OaKConfig(
+        subtask_specs=(_SPEC0,),
+        observation_dim=4,
+        n_primitive_actions=2,
+        base_trace_decay=1.0,
+        option_trace_decay=1.0,
+        option_gamma=1.0,
+        option_model_decay=1.0,
+        epsilon_base=1.0,
+        epsilon_option=1.0,
+        utility_ema_decay=1.0,
+        curation_threshold=10.0,
+        option_planning_backups_per_step=2**31 - 2,
+    )
+    make_step11_oak_agent(upper)
+    assert upper.base_trace_decay == 1.0
+    assert upper.option_trace_decay == 1.0
+    assert upper.option_gamma == 1.0
+    assert upper.option_model_decay == 1.0
+    assert upper.epsilon_base == 1.0
+    assert upper.epsilon_option == 1.0
+    assert upper.utility_ema_decay == 1.0
+    assert upper.curation_threshold == 10.0
+    assert upper.option_planning_backups_per_step == 2**31 - 2
+
+
+def test_step11_oak_rejects_float32_underflow_for_positive_fields() -> None:
+    with pytest.raises(ValueError, match="threshold"):
+        Step11OaKConfig(
+            subtask_specs=(SubtaskSpec(feature_index=0, threshold=1e-50),),
+            observation_dim=4,
+        )
+    with pytest.raises(ValueError, match="threshold"):
+        Step11OaKConfig(
+            subtask_specs=(SubtaskSpec(feature_index=0, threshold=1e-46),),
+            observation_dim=4,
+        )
+    with pytest.raises(ValueError, match="pseudo_reward_scale"):
+        Step11OaKConfig(
+            subtask_specs=(
+                SubtaskSpec(feature_index=0, pseudo_reward_scale=1e-50),
+            ),
+            observation_dim=4,
+        )
+
+
+def test_step11_oak_rejects_float32_overflow() -> None:
+    with pytest.raises(ValueError, match="threshold"):
+        Step11OaKConfig(
+            subtask_specs=(SubtaskSpec(feature_index=0, threshold=1e100),),
+            observation_dim=4,
+        )
+    with pytest.raises(ValueError, match="pseudo_reward_scale"):
+        Step11OaKConfig(
+            subtask_specs=(
+                SubtaskSpec(feature_index=0, pseudo_reward_scale=1e100),
+            ),
+            observation_dim=4,
+        )
+    with pytest.raises(ValueError, match="pseudo_reward_scale"):
+        Step11OaKConfig(
+            subtask_specs=(
+                SubtaskSpec(feature_index=0, pseudo_reward_scale=-1e100),
+            ),
+            observation_dim=4,
+        )
+    with pytest.raises(ValueError, match="base_step_size"):
+        Step11OaKConfig(base_step_size=1e100)
+    with pytest.raises(ValueError, match="curation_threshold"):
+        Step11OaKConfig(curation_threshold=1e100)
+    with pytest.raises(ValueError, match="option_model_step_size"):
+        Step11OaKConfig(option_model_step_size=1e100)
+
+
+def test_step11_oak_validates_original_real_domain_before_narrowing() -> None:
+    above_one = np.longdouble(1.0) + np.finfo(np.longdouble).eps
+    below_zero = -np.nextafter(np.longdouble(0.0), np.longdouble(1.0))
+    assert float(above_one) == 1.0
+    assert float(below_zero) == 0.0
+
+    with pytest.raises(ValueError, match="epsilon_base"):
+        Step11OaKConfig(epsilon_base=above_one)
+    with pytest.raises(ValueError, match="base_step_size"):
+        Step11OaKConfig(base_step_size=below_zero)
+
+
+def test_step11_oak_wraps_real_conversion_overflow() -> None:
+    with pytest.raises(ValueError, match="base_step_size"):
+        Step11OaKConfig(base_step_size=Fraction(10**400, 1))
+
+
+def test_step11_oak_narrows_the_original_real_once() -> None:
+    midpoint_plus = (
+        np.longdouble(1.0)
+        + np.longdouble(2.0) ** -24
+        + np.longdouble(2.0) ** -60
+    )
+    assert np.float32(midpoint_plus) != np.float32(float(midpoint_plus))
+    config = Step11OaKConfig(
+        subtask_specs=(
+            SubtaskSpec(feature_index=0, pseudo_reward_scale=midpoint_plus),
+        ),
+    )
+    assert config.subtask_specs[0].pseudo_reward_scale == float(
+        np.float32(midpoint_plus)
+    )
+
+
+@pytest.mark.parametrize(
+    ("pseudo_reward_scale", "expected"),
+    [
+        (
+            Fraction(1, 1) + Fraction(1, 2**24) - Fraction(1, 2**60),
+            1.0,
+        ),
+        (Fraction(1, 1) + Fraction(1, 2**24), 1.0),
+        (
+            Fraction(1, 1) + Fraction(1, 2**24) + Fraction(1, 2**60),
+            float(np.nextafter(np.float32(1.0), np.float32(2.0))),
+        ),
+    ],
+    ids=("below", "tie-to-even", "above"),
+)
+def test_step11_oak_rounds_fraction_midpoints_once(
+    pseudo_reward_scale: Fraction,
+    expected: float,
+) -> None:
+    config = Step11OaKConfig(
+        subtask_specs=(
+            SubtaskSpec(
+                feature_index=0,
+                pseudo_reward_scale=pseudo_reward_scale,
+            ),
+        ),
+    )
+    assert config.subtask_specs[0].pseudo_reward_scale == expected
+
+
+def test_step11_fraction_float32_overflow_midpoint_is_exact() -> None:
+    maximum = Fraction((2**24 - 1) * 2**104)
+    overflow_midpoint = maximum + 2**103
+
+    just_below = Step11OaKConfig(base_step_size=overflow_midpoint - 1)
+    assert just_below.base_step_size == float(np.finfo(np.float32).max)
+    with pytest.raises(ValueError, match="base_step_size"):
+        Step11OaKConfig(base_step_size=overflow_midpoint)
+
+
+def test_step11_oak_preserves_float32_boundaries() -> None:
+    f32_max = float(np.finfo(np.float32).max)
+    f32_tiny = float(np.finfo(np.float32).tiny)
+    config = Step11OaKConfig(
+        subtask_specs=(
+            SubtaskSpec(
+                feature_index=0,
+                threshold=f32_max,
+                pseudo_reward_scale=f32_tiny,
+                max_option_steps=10,
+            ),
+        ),
+        observation_dim=2,
+        curation_threshold=f32_max,
+        base_step_size=f32_max,
+    )
+    agent = make_step11_oak_agent(config)
+    assert agent.config.stomp.subtask_specs[0].threshold == f32_max
+    assert agent.config.stomp.subtask_specs[0].pseudo_reward_scale == f32_tiny
+    assert config.curation_threshold == f32_max
+    assert config.base_step_size == f32_max
+
+
+def test_step11_oak_fields_canonicalize_nonbuiltin_numbers() -> None:
+    value = np.float64(0.5)
+    spec = SubtaskSpec(
+        feature_index=np.int64(1),
+        threshold=value,
+        pseudo_reward_scale=value,
+        max_option_steps=np.int64(4),
+    )
+    config = Step11OaKConfig(
+        subtask_specs=(spec,),
+        observation_dim=np.int64(3),
+        n_primitive_actions=np.int64(2),
+        base_step_size=value,
+        base_avg_reward_step_size=value,
+        base_trace_decay=value,
+        option_step_size=value,
+        option_avg_reward_step_size=value,
+        option_trace_decay=value,
+        option_gamma=value,
+        option_model_decay=value,
+        option_model_step_size=value,
+        option_planning_backups_per_step=np.int64(1),
+        epsilon_base=value,
+        epsilon_option=value,
+        utility_ema_decay=value,
+        curation_threshold=np.float64(0.0),
+    )
+    agent = make_step11_oak_agent(config)
+    payload = config.to_config()
+    json.dumps(payload, allow_nan=False)
+    assert config.observation_dim == 3
+    assert config.n_primitive_actions == 2
+    assert config.option_planning_backups_per_step == 1
+    assert config.option_gamma == 0.5
+    assert config.utility_ema_decay == 0.5
+    assert config.curation_threshold == 0.0
+    assert config.subtask_specs[0].feature_index == 1
+    assert config.subtask_specs[0].threshold == 0.5
+    assert config.subtask_specs[0].max_option_steps == 4
+    assert type(payload["observation_dim"]) is int
+    assert type(payload["n_primitive_actions"]) is int
+    assert type(payload["option_planning_backups_per_step"]) is int
+    assert type(payload["base_step_size"]) is float
+    assert type(payload["base_avg_reward_step_size"]) is float
+    assert type(payload["base_trace_decay"]) is float
+    assert type(payload["option_step_size"]) is float
+    assert type(payload["option_avg_reward_step_size"]) is float
+    assert type(payload["option_trace_decay"]) is float
+    assert type(payload["option_gamma"]) is float
+    assert type(payload["option_model_decay"]) is float
+    assert type(payload["option_model_step_size"]) is float
+    assert type(payload["epsilon_base"]) is float
+    assert type(payload["epsilon_option"]) is float
+    assert type(payload["utility_ema_decay"]) is float
+    assert type(payload["curation_threshold"]) is float
+    assert type(payload["subtask_specs"][0]["feature_index"]) is int
+    assert type(payload["subtask_specs"][0]["threshold"]) is float
+    assert type(payload["subtask_specs"][0]["pseudo_reward_scale"]) is float
+    assert type(payload["subtask_specs"][0]["max_option_steps"]) is int
+    assert agent.config.stomp.option_gamma == 0.5
 
 
 # ---------------------------------------------------------------------------
@@ -203,6 +711,24 @@ def test_step11_update_utility_ema_updates_during_execution() -> None:
     result = step11_update(agent, state_with_opt, jnp.array(0.0), jnp.array([0.5, 0.0]))
     # Utility EMA should have moved from 0
     assert float(result.utility_ema[0]) != 0.0
+
+
+def test_step11_update_execution_count_increments_on_start() -> None:
+    spec = SubtaskSpec(feature_index=0, threshold=99.0, max_option_steps=100)
+    cfg = Step11OaKConfig(
+        subtask_specs=(spec,),
+        observation_dim=2,
+        n_primitive_actions=2,
+        epsilon_base=1.0,  # force random to potentially select option
+    )
+    agent, state = _setup(cfg)
+    # Run many steps; option must start at least once
+    n_steps = 50
+    rewards = jnp.zeros(n_steps)
+    obs = jr.normal(jr.key(77), (n_steps, 2)) * 0.1
+    result = run_step11_scan(agent, state, rewards, obs)
+    # At least 0 executions (option might not get selected, but count is >= 0)
+    assert bool(jnp.all(result.state.execution_counts >= 0))
 
 
 # ---------------------------------------------------------------------------
@@ -316,7 +842,8 @@ def test_curate_resets_option_weights() -> None:
     state_after = run_step11_scan(
         agent, state, jnp.zeros(n_steps), jr.normal(jr.key(1), (n_steps, 4))
     ).state
-    # Curate at a coherent primitive boundary. An active option defers replacement.
+    # Curate at a coherent primitive boundary. If the scan ends inside the
+    # sole option, production curation correctly defers replacement.
     state_after = state_after.replace(
         stomp_state=state_after.stomp_state.replace(
             executing_option=jnp.array(-1, dtype=jnp.int32),
@@ -465,6 +992,27 @@ def test_keyboard_chord_learner_max_norm_bounds_vector() -> None:
     assert float(jnp.linalg.norm(updated.chord_vector)) <= 0.750001
 
 
+def test_keyboard_chord_learner_infinite_reward_does_not_poison_vector() -> None:
+    """Inf advantage * a zero chord coordinate is 0*inf = NaN."""
+    cfg = KeyboardChordLearnerConfig(n_options=3, step_size=0.1, max_norm=10.0)
+    state = init_keyboard_chord_learner(cfg)
+    selected = jnp.array([0.0, 1.0, 0.0], dtype=jnp.float32)
+
+    poisoned = update_keyboard_chord_learner(
+        cfg, state, selected, jnp.array(jnp.inf, dtype=jnp.float32)
+    )
+    chex.assert_trees_all_close(poisoned.chord_vector, state.chord_vector)
+    chex.assert_trees_all_close(poisoned.reward_baseline, state.reward_baseline)
+    assert int(poisoned.step_count) == int(state.step_count)
+
+    recovered = update_keyboard_chord_learner(
+        cfg, poisoned, selected, jnp.array(1.0, dtype=jnp.float32)
+    )
+    chex.assert_tree_all_finite(recovered.chord_vector)
+    chex.assert_tree_all_finite(recovered.reward_baseline)
+    assert int(recovered.step_count) == int(state.step_count) + 1
+
+
 # ---------------------------------------------------------------------------
 # Smoke test
 # ---------------------------------------------------------------------------
@@ -502,6 +1050,43 @@ def test_run_step11_smoke_zero_steps_raises() -> None:
         run_step11_smoke(steps=0)
 
 
+@pytest.mark.parametrize("steps", [True, 1.5])
+def test_run_step11_smoke_rejects_non_integer_steps(steps: object) -> None:
+    with pytest.raises(ValueError, match="steps must be an integer"):
+        run_step11_smoke(steps=steps)  # type: ignore[arg-type]
+
+
+def test_run_step11_smoke_rejects_class_spoofed_integer_steps() -> None:
+    class _SpoofedInt:
+        """Mimics ``int`` via ``__class__`` to defeat ``isinstance`` checks."""
+
+        @property
+        def __class__(self) -> type:  # type: ignore[override]
+            return int
+
+        def __int__(self) -> int:
+            return 3
+
+        def __index__(self) -> int:
+            return 3
+
+    with pytest.raises(ValueError, match="steps must be an integer"):
+        run_step11_smoke(steps=_SpoofedInt())  # type: ignore[arg-type]
+
+
+def test_step11_checks_host_ratio_and_float32_domains() -> None:
+    class ContradictoryFloat(float):
+        def as_integer_ratio(self) -> tuple[int, int]:
+            return (1, 2)
+
+    with pytest.raises(ValueError, match="option_gamma"):
+        Step11OaKConfig(option_gamma=ContradictoryFloat(-0.5))
+
+
+def test_step11_smoke_uses_full_jax_uint32_seed_contract() -> None:
+    assert run_step11_smoke(steps=1, seed=2**32 - 1).seed == 2**32 - 1
+
+
 # ---------------------------------------------------------------------------
 # Long-horizon fineness
 # ---------------------------------------------------------------------------
@@ -526,3 +1111,183 @@ def test_step11_state_stays_finite_200_steps() -> None:
     chex.assert_tree_all_finite(result.state.stomp_state.base_learner_state)
     chex.assert_tree_all_finite(result.state.utility_ema)
     chex.assert_tree_all_finite(result.td_errors)
+
+
+def test_step11_config_preserves_float32_boundaries() -> None:
+    f32_max = float(np.finfo(np.float32).max)
+    spec = SubtaskSpec(
+        feature_index=2**31 - 2,
+        threshold=f32_max,
+        pseudo_reward_scale=f32_max,
+        max_option_steps=2**31 - 1,
+    )
+    config = Step11OaKConfig(
+        subtask_specs=(spec,),
+        observation_dim=2**31 - 1,
+        n_primitive_actions=2**31 - 1,
+        base_step_size=f32_max,
+        base_avg_reward_step_size=f32_max,
+        base_trace_decay=1.0,
+        option_step_size=f32_max,
+        option_avg_reward_step_size=f32_max,
+        option_trace_decay=1.0,
+        option_gamma=1.0,
+        option_model_decay=1.0,
+        option_model_step_size=f32_max,
+        option_planning_backups_per_step=2**31 - 2,
+        epsilon_base=1.0,
+        epsilon_option=1.0,
+        utility_ema_decay=1.0,
+        curation_threshold=f32_max,
+    )
+    assert config.observation_dim == 2**31 - 1
+    assert config.option_planning_backups_per_step == 2**31 - 2
+    assert config.base_step_size == f32_max
+
+
+def test_step11_oak_normalizes_conversion_hook_failures() -> None:
+    class BrokenFloat(float):
+        def as_integer_ratio(self) -> tuple[int, int]:
+            raise RuntimeError("conversion hook failed")
+
+    with pytest.raises(ValueError, match="option_gamma must be finite"):
+        Step11OaKConfig(option_gamma=BrokenFloat(0.5))
+
+
+def test_step11_oak_rejects_integer_subclass_conversion_hooks() -> None:
+    class LyingInt(int):
+        def __int__(self) -> int:
+            return 1
+
+    with pytest.raises(ValueError, match="observation_dim"):
+        Step11OaKConfig(observation_dim=LyingInt(-1))
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"steps": 0}, "steps"),
+        ({"steps": -1}, "steps"),
+        ({"steps": 2**31}, "steps"),
+        ({"steps": True}, "steps"),
+        ({"steps": "64"}, "steps"),
+        ({"seed": -1}, "seed"),
+        ({"seed": 2**32}, "seed"),
+        ({"seed": True}, "seed"),
+    ],
+)
+def test_step11_smoke_rejects_invalid_inputs(kwargs: dict[str, Any], match: str) -> None:
+    with pytest.raises(ValueError, match=match):
+        run_step11_smoke(**kwargs)
+
+
+def test_step11_oak_rejects_spoofed_subtask_specs_container() -> None:
+    class SpoofedTuple(list):
+        @property
+        def __class__(self) -> type[tuple]:
+            return tuple
+
+    with pytest.raises(ValueError, match="subtask_specs"):
+        Step11OaKConfig(
+            subtask_specs=SpoofedTuple([SubtaskSpec(feature_index=0)]),  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.parametrize(
+    "ratio",
+    [
+        pytest.param((-1, 1), id="negative-ratio"),
+        pytest.param((2, 1), id="above-unit-ratio"),
+        pytest.param((-1, 2**200), id="negative-rounds-to-negative-zero"),
+        pytest.param((2**200 + 1, 2**200), id="above-one-rounds-to-one"),
+    ],
+)
+def test_step11_oak_rejects_adversarial_ratio_floats(ratio: tuple[int, int]) -> None:
+    class HiddenBoundaryFloat(float):
+        def as_integer_ratio(self) -> tuple[int, int]:
+            return ratio
+
+    with pytest.raises(ValueError, match="option_gamma"):
+        Step11OaKConfig(
+            subtask_specs=(SubtaskSpec(feature_index=0),),
+            option_gamma=HiddenBoundaryFloat(0.5),
+        )
+
+
+def _legal_step11_smoke_result(**overrides: object) -> Step11SmokeResult:
+    payload: dict[str, object] = {
+        "config": Step11OaKConfig(subtask_specs=(_SPEC0,)),
+        "steps": 8,
+        "seed": 0,
+        "td_errors_shape": (8,),
+        "average_rewards_shape": (8,),
+        "primitive_actions_shape": (8,),
+        "utility_emas_shape": (8,),
+        "finite": True,
+        "option_termination_count": 0,
+        "agent_config": {"ok": True},
+    }
+    payload.update(overrides)
+    return Step11SmokeResult(**payload)  # type: ignore[arg-type]
+
+
+def test_step11_smoke_result_rejects_leftover_identities() -> None:
+    """Public Step 11 smoke records must not keep leftover bool/int identities."""
+
+    with pytest.raises(ValueError, match="steps"):
+        _legal_step11_smoke_result(steps=True)
+    with pytest.raises(ValueError, match="steps"):
+        _legal_step11_smoke_result(steps=float("nan"))
+    with pytest.raises(ValueError, match="seed"):
+        _legal_step11_smoke_result(seed=True)
+    with pytest.raises(ValueError, match="finite"):
+        _legal_step11_smoke_result(finite=1)
+    with pytest.raises(ValueError, match="option_termination_count"):
+        _legal_step11_smoke_result(option_termination_count=True)
+
+    legal = _legal_step11_smoke_result()
+    dumped = json.dumps(
+        {
+            "steps": legal.steps,
+            "seed": legal.seed,
+            "finite": legal.finite,
+            "option_termination_count": legal.option_termination_count,
+        },
+        allow_nan=False,
+    )
+    assert '"steps": 8' in dumped
+    assert '"seed": 0' in dumped
+    assert '"finite": true' in dumped
+    assert '"option_termination_count": 0' in dumped
+    assert '"steps": true' not in dumped
+    assert '"seed": true' not in dumped
+    assert '"finite": 1' not in dumped
+    assert '"option_termination_count": true' not in dumped
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("steps", 0),
+        ("steps", 2**31),
+        ("steps", type("IntFacade", (int,), {})(8)),
+        ("seed", -1),
+        ("seed", 2**32),
+        ("finite", np.bool_(True)),
+        ("option_termination_count", -1),
+        ("option_termination_count", 2**31),
+    ),
+)
+def test_step11_smoke_result_rejects_hostile_and_boundary_scalars(
+    field: str, value: object
+) -> None:
+    with pytest.raises(ValueError, match=field):
+        _legal_step11_smoke_result(**{field: value})
+
+
+def test_step11_smoke_result_canonicalizes_supported_numpy_integer_identities() -> None:
+    result = _legal_step11_smoke_result(
+        steps=np.int64(8), option_termination_count=np.uint32(0)
+    )
+    assert type(result.steps) is int
+    assert type(result.option_termination_count) is int

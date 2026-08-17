@@ -380,6 +380,8 @@ def test_exact_six_by_thirty_manifest_and_initial_inventory(tmp_path: Path) -> N
         "noncooperative_same_uid_writers": "out_of_scope",
         "claim_authority": "independent_final_subject_authentication_required",
     }
+    # These source-derived identities close transitively over the qualified
+    # container helper through the executor manifest, plan, and live runtime.
     golden_payload_sha256 = {
         "sealed-protocol.json": (
             "cc7a06b9fdc006de5fb20c1fe2806ce45eaa5e068de9fcb9a302236ce0405b59"
@@ -394,13 +396,13 @@ def test_exact_six_by_thirty_manifest_and_initial_inventory(tmp_path: Path) -> N
             "6a9315cb996fe5698e4c1580d30da9b0524e9875ce085d1399bb975cc5b510a8"
         ),
         "execution-plan.json": (
-            "4992138daf31129a4f52753c7bc33533aca94164368b848d63c956c96c68d5d4"
+            "504104d2405b63a62affc3e0bcf216ea59642cbe69913cda6c4004cc0ba1c7e6"
         ),
         "source-manifest.json": (
             "a1d727703b24ef6f96dc93b4fc306b9426ad2cfd054ba371aa84ac4c14dd7a68"
         ),
         "executor-manifest.json": (
-            "5383b2edf66804248fd98db7a313d216139cc6958e86a27f80f4ffa37b9b6f00"
+            "5855358720e964e568374a5048f7efdb198f2fcffeeaa1d5a5090f015dd28283"
         ),
         "qualification-manifest.json": (
             "d54fb71f96641d8cbe1eb3b78a3ac9aef3e680b4ea4efba14181dd74a5c1332f"
@@ -409,10 +411,10 @@ def test_exact_six_by_thirty_manifest_and_initial_inventory(tmp_path: Path) -> N
             "2859d85fbc9d44960e1b37fedf26589e2f3c5155b9356083ba7b5a427443f58f"
         ),
         "live-runtime.json": (
-            "c7b5d70eb33569b3fbb28d38a3dab7533b34019196ae99ae62233e19f48ee6eb"
+            "fde9fccb66ca30c733e65249419af82a6169663c50c26b012fc5a2dcd8b1a9ee"
         ),
         "campaign.json": (
-            "9bce48b466f6b64af219c08f120ec2a7f11782f1461d0856259406a7f057a3f3"
+            "ac834c518773d95b9876aef24a9b4fef7d74d0fed00173b1245ea3e439bc100f"
         ),
     }
     _publish_context(context)
@@ -693,6 +695,7 @@ def test_run_recovers_bound_raw_then_repairs_missing_completion_pointer(
     assert len(auth_calls) == 3
 
 
+@pytest.mark.slow
 def test_full_evaluation_finalizes_stage_specific_unresolved_content(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -755,18 +758,20 @@ def test_full_evaluation_finalizes_stage_specific_unresolved_content(
     assert bundle.completion_summary["sealed_transition_sha256"] == (
         context.inputs.seal_content.sealed_transition_sha256
     )
+    # Per-cell bundles bind the same live-runtime identity, so this closure
+    # changes deterministically when the qualified helper bytes change.
     golden_final_sha256 = {
         "execution-receipt-index.json": (
-            "0961d66612d60887635308115deb8452173eaa5084b617cc59303af9002a8a16"
+            "39642af77c69525d6f669c94648d15d57d54b51f17ef0145e0efad672ea781fd"
         ),
         "score-evidence.json": (
-            "b173760d91eb42f524e6071d6e308688d4677e0b07a9c19e7daa21edcfa67908"
+            "41d0fbbdb00e63745d0dc1415529147f843b0dc04d81bf1e7ac956b3269613e3"
         ),
         "verification-request.json": (
-            "2d052795d175b86498e11a2c2dea069d040482fbb081a6d0fe4442db5f62107c"
+            "b7c092fba2bb4b5cbb6b74440f8a6e31860ed649e12365437a912e18f14dae9c"
         ),
         "completion-summary.json": (
-            "8d2047d9b607ea2153ebe0c6c32bdf6956c7c614f2b25f19c289dfb0552b4921"
+            "a3e52dfcef4982579b44444ed71934257cff7f94adf1f17d7669bae69e87237f"
         ),
     }
     for name, expected_sha256 in golden_final_sha256.items():
@@ -810,7 +815,7 @@ def test_false_authority_completion_summary_is_rejected_before_persistence(
     )
     assert summary["qualification_manifest_sha256"] == qualification_digest
     assert hashlib.sha256(campaign.canonical_json_bytes(summary)).hexdigest() == (
-        "26f4ddfbb2e2f67f1c8268e90f3b6b0fee8f6568f1e177d024cca9e614163d32"
+        "7c3ef02385117816269644c8872c544c7b40ec68f8da4ec404e0b6231fbeaecd"
     )
     legacy = dict(summary)
     legacy["schema_version"] = "alberta.forager_matched_sealed_evaluation_completion.v1"

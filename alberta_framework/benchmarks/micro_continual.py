@@ -64,16 +64,18 @@ import argparse
 import json
 import logging
 import math
+import operator
 import os
 import platform
 import tempfile
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from functools import lru_cache
+from numbers import Real
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any
+from typing import Any, SupportsIndex, cast
 
 import jax
 import jax.numpy as jnp
@@ -81,11 +83,16 @@ import jax.random as jr
 import numpy as np
 from jax import Array
 
+from alberta_framework._fixed_count_selection import stable_smallest_mask
+from alberta_framework._seed_validation import require_jax_seed, require_unique_jax_seeds
+from alberta_framework._strict_json import load_strict_json_object
 from alberta_framework.benchmarks.ipmnist_screening import (
     ScreeningStepFn,
+    _finite_wall_clock_total,
     _make_naive_bayes_learner,
     _make_sgd_ema_norm_learner,
     _make_upgd_shiftnorm_learner,
+    _validated_wall_clock_seconds,
     _wrap_grad_learner,
 )
 from alberta_framework.benchmarks.upgd_ipmnist import (
@@ -98,6 +105,7 @@ from alberta_framework.benchmarks.upgd_ipmnist import (
     atomic_write_new,
     init_mlp_params,
 )
+from alberta_framework.core._float32_scalars import validated_float32_scalar
 
 logger = logging.getLogger(__name__)
 
@@ -140,9 +148,125 @@ _STEP_DOMAIN = 303
 _BAYES_DOMAIN = 404
 
 
+def _is_registered_subclass(cls: type, abc: type) -> bool:
+    """Run one ABC subclass check, normalizing metaclass hook failures to False."""
+    try:
+        return issubclass(cls, abc)
+    except Exception:
+        # ``issubclass`` against an ABC hashes ``cls`` for its caches, so a
+        # metaclass whose ``__hash__`` raises would otherwise leak the hook's
+        # exception through the documented ValueError boundary.
+        return False
+
+
+def _require_finite_real(value: object, name: str) -> float:
+    """Return one canonical float after rejecting non-real and non-finite values.
+
+    The message never formats ``value``: repr hooks on untrusted objects must
+    not run, and ordinary conversion failures normalize to ``ValueError``
+    while ``BaseException`` (e.g. ``KeyboardInterrupt``) still propagates.
+    """
+    message = f"{name} must be a finite real number"
+    if type(value) is bool or not _is_registered_subclass(type(value), Real):
+        raise ValueError(message)
+    try:
+        number = float(cast(Any, value))
+    except Exception as exc:
+        raise ValueError(message) from exc
+    if not math.isfinite(number):
+        raise ValueError(message)
+    return number
+
+
+def _freeze_micro_hyperparameters(value: object, *, context: str) -> Mapping[str, float]:
+    """Copy one primitive-only hyperparameter mapping behind an immutable view."""
+    if not _is_registered_subclass(type(value), Mapping):
+        raise ValueError(f"{context} must be an object with non-empty string keys")
+    try:
+        items = list(cast(Mapping[object, object], value).items())
+    except Exception as exc:
+        raise ValueError(
+            f"{context} must be an object with non-empty string keys"
+        ) from exc
+    frozen: dict[str, float] = {}
+    for key, raw_value in items:
+        if type(key) is not str or not key:
+            raise ValueError(f"{context} keys must be non-empty strings")
+        frozen[key] = _require_finite_real(raw_value, f"{context}[{key!r}]")
+    return MappingProxyType(frozen)
+
+
+def _require_nonempty_string(value: object, *, context: str) -> str:
+    if type(value) is not str or not value:
+        raise ValueError(f"{context} must be a non-empty string")
+    return value
+
+
+def _require_builtin_finite_real(value: object, *, context: str) -> float:
+    """Canonicalize a result scalar without invoking numeric subclass hooks."""
+    if type(value) not in (int, float):
+        raise ValueError(f"{context} must be a finite built-in real number")
+    number = float(cast("int | float", value))
+    if not math.isfinite(number):
+        raise ValueError(f"{context} must be a finite built-in real number")
+    return number
+
+
 # =============================================================================
 # Configuration
 # =============================================================================
+
+_INT32_MAX: int = 2**31 - 1
+_ACTUAL_INT_TYPES: tuple[type, ...] = (
+    int,
+    np.int8,
+    np.int16,
+    np.int32,
+    np.int64,
+    np.uint8,
+    np.uint16,
+    np.uint32,
+    np.uint64,
+    np.longlong,
+    np.ulonglong,
+)
+
+
+def _require_positive_int32(value: object, *, name: str, minimum: int = 1) -> int:
+    """Canonicalize one trusted positive integer in JAX's shape/index domain."""
+    if type(value) not in _ACTUAL_INT_TYPES:
+        raise ValueError(f"{name} must be an integer in [{minimum}, {_INT32_MAX}]")
+    number = operator.index(cast(SupportsIndex, value))
+    if not minimum <= number <= _INT32_MAX:
+        raise ValueError(f"{name} must be an integer in [{minimum}, {_INT32_MAX}]")
+    return number
+
+
+def _require_float32_resource(name: str, scalars: int) -> None:
+    """Bound one aggregate of four-byte JAX leaves before any allocation."""
+    if scalars > _INT32_MAX:
+        raise ValueError(f"{name} scalar count must fit signed int32")
+    if 4 * scalars > _INT32_MAX:
+        raise ValueError(f"{name} byte count must fit signed int32")
+
+
+def _materialized_stream_scalars(
+    *, n_regimes: int, regime_length: int, dim: int, n_classes: int, n_components: int
+) -> int:
+    """Return the exact scalar count of all retained GaussianMicroStream leaves."""
+    n_steps = n_regimes * regime_length
+    component_dim = n_classes * n_components * dim
+    regime_dim = n_regimes * dim
+    regime_class = n_regimes * n_classes
+    return (
+        2 * n_steps * dim
+        + 3 * n_steps
+        + component_dim
+        + dim
+        + regime_dim
+        + regime_class
+        + 2 * n_regimes
+    )
 
 
 @dataclass(frozen=True)
@@ -202,54 +326,86 @@ class MicroStreamConfig:
     recurrence_pool: int = 5
 
     def __post_init__(self) -> None:
-        if self.family not in FAMILIES:
-            raise ValueError(
-                f"family must be one of {FAMILIES}, got {self.family!r}"
-            )
+        if type(self.family) is not str or self.family not in FAMILIES:
+            raise ValueError(f"family must be one of {FAMILIES}")
         for name in ("n_regimes", "regime_length", "dim", "n_classes", "n_components"):
-            value = getattr(self, name)
-            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
-                raise ValueError(f"{name} must be a positive integer, got {value!r}")
-        sparsity = self.component_sparsity
-        if not isinstance(sparsity, int) or isinstance(sparsity, bool) or sparsity <= 0:
-            raise ValueError(
-                f"component_sparsity must be a positive integer, got {sparsity!r}"
+            object.__setattr__(
+                self,
+                name,
+                _require_positive_int32(getattr(self, name), name=name),
             )
+        sparsity = _require_positive_int32(
+            self.component_sparsity, name="component_sparsity"
+        )
+        pool = _require_positive_int32(
+            self.recurrence_pool, name="recurrence_pool", minimum=2
+        )
+        object.__setattr__(self, "component_sparsity", sparsity)
+        object.__setattr__(self, "recurrence_pool", pool)
         if sparsity > self.dim:
             raise ValueError(
                 f"component_sparsity ({sparsity}) must not exceed dim ({self.dim})"
             )
-        if not 0.0 < float(self.class_sparsity) <= 1.0:
-            raise ValueError(
-                f"class_sparsity must be in (0, 1], got {self.class_sparsity!r}"
+        float_domains: dict[str, dict[str, object]] = {
+            "spectrum_decades": {"lower": 0.0},
+            "mean_separation": {"positive": True},
+            "component_scale": {"lower": 0.0},
+            "class_sparsity": {"positive": True, "upper": 1.0},
+            "noise_scale": {"positive": True},
+            "offset_scale": {"lower": 0.0},
+            "scale_shift_min": {"positive": True},
+            "scale_shift_max": {"positive": True},
+        }
+        for name, domain in float_domains.items():
+            canonical = validated_float32_scalar(
+                name,
+                getattr(self, name),
+                **cast(dict[str, Any], domain),
             )
-        for name in ("mean_separation", "noise_scale"):
-            if not float(getattr(self, name)) > 0.0:
-                raise ValueError(f"{name} must be positive, got {getattr(self, name)!r}")
-        for name in ("offset_scale", "spectrum_decades", "component_scale"):
-            if float(getattr(self, name)) < 0.0:
-                raise ValueError(
-                    f"{name} must be non-negative, got {getattr(self, name)!r}"
-                )
-        if not 0.0 < self.scale_shift_min < self.scale_shift_max:
+            object.__setattr__(self, name, canonical)
+
+        scale_min_sink = float(np.float32(self.scale_shift_min))
+        scale_max_sink = float(np.float32(self.scale_shift_max))
+        if not scale_min_sink < scale_max_sink:
             raise ValueError(
                 "scale_shift bounds must satisfy 0 < scale_shift_min < "
-                f"scale_shift_max, got [{self.scale_shift_min}, {self.scale_shift_max}]"
+                "scale_shift_max after float32 narrowing"
             )
         if self.family == "recurrence":
-            pool = self.recurrence_pool
-            if not isinstance(pool, int) or isinstance(pool, bool) or pool < 2:
-                raise ValueError(f"recurrence_pool must be an integer >= 2, got {pool!r}")
             if pool > self.n_regimes:
                 raise ValueError(
                     f"recurrence_pool ({pool}) must not exceed n_regimes "
                     f"({self.n_regimes})"
                 )
+        _require_float32_resource(
+            "GaussianMicroStream outputs", self.materialized_stream_scalars
+        )
 
     @property
     def n_steps(self) -> int:
         """Total online steps in one run."""
         return self.n_regimes * self.regime_length
+
+    @property
+    def materialized_stream_scalars(self) -> int:
+        """Exact retained scalar count of the materialized stream.
+
+        Every named generation-work array is bounded by one of these returned
+        shapes. Compiler-internal and transient allocator buffers are not part
+        of this persistent-output contract.
+        """
+        return _materialized_stream_scalars(
+            n_regimes=self.n_regimes,
+            regime_length=self.regime_length,
+            dim=self.dim,
+            n_classes=self.n_classes,
+            n_components=self.n_components,
+        )
+
+    @property
+    def materialized_stream_bytes(self) -> int:
+        """Exact retained bytes; every returned leaf is float32 or int32."""
+        return 4 * self.materialized_stream_scalars
 
     def to_config(self) -> dict[str, Any]:
         """JSON-serializable configuration (roundtrips through the constructor)."""
@@ -272,6 +428,46 @@ class MicroStreamConfig:
             "recurrence_pool": self.recurrence_pool,
         }
 
+    @classmethod
+    def from_mapping(
+        cls, mapping: object, *, source: str = "stream_config"
+    ) -> MicroStreamConfig:
+        """Reconstruct a stream config from a serialized object.
+
+        The mapping must contain exactly the :meth:`to_config` key set.
+        Omitted fields must not be filled from dataclass defaults: a truncated
+        shard would otherwise reconstruct a different stream identity.
+        """
+        if not _is_registered_subclass(type(mapping), Mapping):
+            raise ValueError(f"{source} must be an object")
+        try:
+            items = list(cast(Mapping[object, object], mapping).items())
+        except Exception as exc:
+            raise ValueError(f"{source} must be a readable object") from exc
+        try:
+            if any(type(key) is not str for key, _ in items):
+                raise ValueError(f"{source} keys must be exact strings")
+            payload = dict(cast(list[tuple[str, Any]], items))
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError(f"{source} must be a readable object") from exc
+        expected = {field.name for field in fields(cls)}
+        actual = set(payload)
+        if actual != expected:
+            missing = sorted(expected - actual)
+            extra = sorted(actual - expected)
+            details: list[str] = []
+            if missing:
+                details.append(f"missing {missing}")
+            if extra:
+                details.append(f"unexpected {extra}")
+            raise ValueError(
+                f"{source} must contain exactly the serialized key set; "
+                + "; ".join(details)
+            )
+        return cls(**payload)
+
 
 # =============================================================================
 # Stream generation
@@ -293,8 +489,10 @@ def dim_scale_spectrum(config: MicroStreamConfig) -> Array:
 def _stream_keys(
     config: MicroStreamConfig, seed: int
 ) -> tuple[Array, Array, Array, Array, Array]:
-    del config  # derivation depends only on the seed; config shapes the draws
-    root = jr.fold_in(jr.key(jnp.uint32(seed)), _STREAM_DOMAIN)
+    if type(config) is not MicroStreamConfig:
+        raise TypeError("config must be a MicroStreamConfig")
+    seed = require_jax_seed(seed, name="seed")
+    root = jr.fold_in(jr.key(seed), _STREAM_DOMAIN)
     key_geometry, key_labels, key_components, key_noise, key_regime = jr.split(root, 5)
     return key_geometry, key_labels, key_components, key_noise, key_regime
 
@@ -331,14 +529,23 @@ def class_geometry(config: MicroStreamConfig, seed: int) -> tuple[Array, Array]:
         component_mask = jnp.ones((c, k, d), dtype=jnp.float32)
     else:
         scores = jr.uniform(key_component_mask, (c, k, d))
-        threshold = jnp.sort(scores, axis=-1)[:, :, config.component_sparsity][:, :, None]
-        component_mask = (scores < threshold).astype(jnp.float32)
+        component_mask = stable_smallest_mask(scores, config.component_sparsity).astype(
+            jnp.float32
+        )
     displacements = config.component_scale * scales * jr.normal(
         key_displacement, (c, k, d), jnp.float32
     ) * component_mask
     component_means = class_means[:, None, :] + displacements
     dim_sigma = (config.noise_scale * scales).astype(jnp.float32)
     return component_means.astype(jnp.float32), dim_sigma
+
+
+def _require_finite_geometry(component_means: Array, dim_sigma: Array) -> None:
+    if not bool(
+        jnp.all(jnp.isfinite(component_means))
+        & jnp.all(jnp.isfinite(dim_sigma))
+    ):
+        raise ValueError("micro stream geometry must remain finite in float32")
 
 
 @dataclass(frozen=True)
@@ -402,6 +609,7 @@ def generate_stream(config: MicroStreamConfig, seed: int) -> GaussianMicroStream
         key_regime, 5
     )
     component_means, dim_sigma = class_geometry(config, seed)
+    _require_finite_geometry(component_means, dim_sigma)
 
     n_steps = config.n_steps
     base_y = jr.randint(key_labels, (n_steps,), 0, config.n_classes).astype(jnp.int32)
@@ -493,17 +701,24 @@ def bayes_predict(component_means: Array, dim_sigma: Array, x: Array) -> Array:
 
     Equal class priors, equal component weights, shared diagonal covariance:
     the Bayes rule is ``argmax_c logsumexp_k(-0.5 * mahalanobis²(x, mu_ck))``.
-    Distances are computed in expanded (GEMM) form so memory stays
-    ``O(n * n_classes * n_components)`` instead of materializing the
-    ``(n, C, K, dim)`` difference tensor.
+    Components are visited sequentially so memory stays
+    ``O(n * n_classes * n_components + n * dim)`` instead of materializing
+    the ``(n, C, K, dim)`` difference tensor.  Computing each coordinate
+    difference before squaring also avoids the catastrophic cancellation in
+    the expanded ``||x||² - 2 x·mu + ||mu||²`` identity.
     """
     c, k, d = component_means.shape
-    whitened_x = x / dim_sigma[None, :]
     whitened_means = (component_means / dim_sigma[None, None, :]).reshape(c * k, d)
-    cross = whitened_x @ whitened_means.T
-    x_norms = jnp.sum(whitened_x * whitened_x, axis=1)
-    mean_norms = jnp.sum(whitened_means * whitened_means, axis=1)
-    d2 = (x_norms[:, None] - 2.0 * cross + mean_norms[None, :]).reshape(-1, c, k)
+    whitened_x = x / dim_sigma[None, :]
+
+    def squared_distances(mean: Array) -> Array:
+        delta = whitened_x - mean[None, :]
+        return jnp.sum(delta * delta, axis=1)
+
+    # lax.map evaluates one component at a time.  Unlike vmap/broadcasting,
+    # this makes the bounded-memory contract explicit while retaining a
+    # vectorized reduction across samples and dimensions for each component.
+    d2 = jax.lax.map(squared_distances, whitened_means).T.reshape(-1, c, k)
     scores = jax.scipy.special.logsumexp(-0.5 * d2, axis=2)
     return jnp.argmax(scores, axis=1).astype(jnp.int32)
 
@@ -529,11 +744,30 @@ def bayes_reference(
     closed-form Bayes rule, and a binomial standard error. Applies to every
     regime of all four families (transform invariance).
     """
-    if n_samples <= 0:
-        raise ValueError(f"n_samples must be positive, got {n_samples}")
+    n_samples = _require_positive_int32(n_samples, name="n_samples")
+    seed = require_jax_seed(seed, name="seed")
+    chunk_size = min(20_000, n_samples)
+    class_components = config.n_classes * config.n_components
+    # Exact named host-visible arrays retained at the peak of bayes_predict:
+    # geometry + whitened geometry, y/z/eps/x, whitened x, d2, scores, and
+    # predictions. The one-component delta and expression/compiler temporaries
+    # are intentionally outside this explicitly named work contract.
+    bayes_work_scalars = (
+        2 * class_components * config.dim
+        + config.dim
+        + 3 * chunk_size * config.dim
+        + chunk_size * class_components
+        + chunk_size * config.n_classes
+        + class_components
+        + 4 * chunk_size
+    )
+    _require_float32_resource(
+        "Bayes-reference named array work",
+        bayes_work_scalars,
+    )
     component_means, dim_sigma = class_geometry(config, seed)
-    key = jr.fold_in(jr.key(jnp.uint32(seed)), _BAYES_DOMAIN)
-    chunk_size = 20_000
+    _require_finite_geometry(component_means, dim_sigma)
+    key = jr.fold_in(jr.key(seed), _BAYES_DOMAIN)
     n_correct = 0
     drawn = 0
     chunk_index = 0
@@ -573,9 +807,20 @@ class MicroArmSpec:
 
     name: str
     mechanism: str
-    hyperparameters: dict[str, float]
+    hyperparameters: Mapping[str, float]
     factory: MicroArmFactory
     description: str
+
+    def __post_init__(self) -> None:
+        _require_nonempty_string(self.name, context="MicroArmSpec.name")
+        _require_nonempty_string(self.mechanism, context="MicroArmSpec.mechanism")
+        object.__setattr__(
+            self,
+            "hyperparameters",
+            _freeze_micro_hyperparameters(
+                self.hyperparameters, context="MicroArmSpec.hyperparameters"
+            ),
+        )
 
 
 def _make_sgd_raw_learner(
@@ -634,7 +879,7 @@ def _build_arm_registry() -> dict[str, MicroArmSpec]:
             mechanism="utility_gated_perturbation",
             hyperparameters=dict(UPGD_W_PROTOCOL_HYPERPARAMETERS),
             factory=_upgd_raw_factory,
-            description="Published UPGD-W reference configuration on raw inputs.",
+            description="Published UPGD-W on raw inputs (the ICLR-2024 SOTA form).",
         ),
         MicroArmSpec(
             name="sgd_norm",
@@ -710,6 +955,8 @@ class MicroRunResult:
 
     family: str
     arm_name: str
+    mechanism: str
+    hyperparameters: Mapping[str, float]
     seed: int
     hidden1: int
     hidden2: int
@@ -719,6 +966,51 @@ class MicroRunResult:
     per_regime_plasticity: np.ndarray
     overall_accuracy: float
     wall_clock_seconds: float
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "family",
+            _require_nonempty_string(self.family, context="MicroRunResult.family"),
+        )
+        _require_nonempty_string(self.arm_name, context="MicroRunResult.arm_name")
+        _require_nonempty_string(self.mechanism, context="MicroRunResult.mechanism")
+        object.__setattr__(
+            self,
+            "hyperparameters",
+            _freeze_micro_hyperparameters(
+                self.hyperparameters, context="MicroRunResult.hyperparameters"
+            ),
+        )
+        object.__setattr__(
+            self, "seed", require_jax_seed(self.seed, name="MicroRunResult.seed")
+        )
+        object.__setattr__(
+            self,
+            "hidden1",
+            _require_positive_int32(self.hidden1, name="MicroRunResult.hidden1"),
+        )
+        object.__setattr__(
+            self,
+            "hidden2",
+            _require_positive_int32(self.hidden2, name="MicroRunResult.hidden2"),
+        )
+        object.__setattr__(
+            self,
+            "overall_accuracy",
+            _require_builtin_finite_real(
+                self.overall_accuracy,
+                context="MicroRunResult.overall_accuracy",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "wall_clock_seconds",
+            _require_builtin_finite_real(
+                self.wall_clock_seconds,
+                context="MicroRunResult.wall_clock_seconds",
+            ),
+        )
 
 
 def run_micro_arm(
@@ -736,6 +1028,7 @@ def run_micro_arm(
     per-regime value is the mean over the regime's steps.
     """
     spec = arm if isinstance(arm, MicroArmSpec) else micro_arm_spec(arm)
+    seed = require_jax_seed(seed, name="seed")
     stream = generate_stream(config, seed)
     net = IPMNISTConfig(
         n_tasks=config.n_regimes,
@@ -785,6 +1078,8 @@ def run_micro_arm(
     return MicroRunResult(
         family=config.family,
         arm_name=spec.name,
+        mechanism=spec.mechanism,
+        hyperparameters=MappingProxyType(dict(spec.hyperparameters)),
         seed=int(seed),
         hidden1=hidden1,
         hidden2=hidden2,
@@ -808,16 +1103,20 @@ def micro_shard_path(out_dir: Path | str, family: str, arm_name: str, seed: int)
 
 
 def micro_shard_payload(result: MicroRunResult) -> dict[str, Any]:
-    """Serialize one run to a mergeable shard."""
-    spec = micro_arm_spec(result.arm_name)
+    """Serialize one run to a mergeable shard, recording the spec that actually ran."""
+    if result.arm_name not in MICRO_ARM_REGISTRY:
+        raise ValueError(
+            f"arm_name {result.arm_name!r} is not a registered micro arm; "
+            "unregistered results cannot be serialized into the registered-arm shard schema"
+        )
     return {
         "schema": MICRO_SHARD_SCHEMA,
         "suite_version": MICRO_GAUSS_SUITE_VERSION,
         "evidence_policy": dict(NONPROMOTING_POLICY),
         "family": result.family,
         "arm_name": result.arm_name,
-        "mechanism": spec.mechanism,
-        "hyperparameters": dict(spec.hyperparameters),
+        "mechanism": result.mechanism,
+        "hyperparameters": dict(result.hyperparameters),
         "seed": result.seed,
         "hidden1": result.hidden1,
         "hidden2": result.hidden2,
@@ -839,29 +1138,105 @@ def micro_shard_payload(result: MicroRunResult) -> dict[str, Any]:
     }
 
 
+def _strict_json_text(payload: dict[str, Any]) -> str:
+    """Serialize one object as RFC-valid JSON (no NaN / Infinity tokens)."""
+    return json.dumps(payload, indent=1, sort_keys=True, allow_nan=False) + "\n"
+
+
 def write_micro_shard(path: Path | str, payload: dict[str, Any]) -> None:
     """Atomically publish one immutable shard (refuses an occupied path)."""
-    encoded = (json.dumps(payload, indent=1, sort_keys=True) + "\n").encode("utf-8")
+    encoded = _strict_json_text(payload).encode("utf-8")
     atomic_write_new(Path(path), encoded)
+
+
+_MICRO_CURVE_DOMAINS: dict[str, tuple[float, float | None]] = {
+    "per_regime_accuracy": (0.0, 1.0),
+    "per_regime_loss": (0.0, None),
+    "per_regime_plasticity": (0.0, 1.0),
+}
+
+
+def _validated_curve(
+    value: object,
+    *,
+    n_regimes: int,
+    lower: float,
+    upper: float | None,
+    context: str,
+) -> list[float]:
+    """Return one per-regime curve as exact finite floats inside its metric domain."""
+    if not isinstance(value, list) or len(value) != n_regimes:
+        raise ValueError(f"{context} must be a list of {n_regimes} finite real numbers")
+    curve: list[float] = []
+    for index, entry in enumerate(value):
+        number = _require_finite_real(entry, f"{context}[{index}]")
+        if number < lower or (upper is not None and number > upper):
+            domain = f"[{lower}, {upper}]" if upper is not None else f">= {lower}"
+            raise ValueError(f"{context}[{index}] must lie in {domain}, got {number!r}")
+        curve.append(number)
+    return curve
 
 
 def load_micro_shard(path: Path | str) -> dict[str, Any]:
     """Load and structurally validate one micro shard."""
     path = Path(path)
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(payload, dict) or payload.get("schema") != MICRO_SHARD_SCHEMA:
+    payload = load_strict_json_object(path)
+    if payload.get("schema") != MICRO_SHARD_SCHEMA:
         raise ValueError(f"{path}: schema mismatch (expected {MICRO_SHARD_SCHEMA})")
+    if payload.get("suite_version") != MICRO_GAUSS_SUITE_VERSION:
+        raise ValueError(
+            f"{path}: suite_version mismatch (expected {MICRO_GAUSS_SUITE_VERSION!r}, "
+            f"got {payload.get('suite_version')!r})"
+        )
     if payload.get("arm_name") not in MICRO_ARM_REGISTRY:
         raise ValueError(f"{path}: unknown arm {payload.get('arm_name')!r}")
-    config = MicroStreamConfig(**payload["stream_config"])
-    for fieldname in ("per_regime_accuracy", "per_regime_loss", "per_regime_plasticity"):
-        values = np.asarray(payload.get(fieldname, []), dtype=np.float64)
-        if values.shape != (config.n_regimes,) or not np.all(np.isfinite(values)):
-            raise ValueError(
-                f"{path}: {fieldname} must be finite with shape ({config.n_regimes},)"
-            )
-    if type(payload.get("seed")) is not int or payload["seed"] < 0:
-        raise ValueError(f"{path}: seed must be a non-negative integer")
+    arm_spec = MICRO_ARM_REGISTRY[payload["arm_name"]]
+    if not isinstance(payload.get("mechanism"), str) or not payload["mechanism"]:
+        raise ValueError(f"{path}: mechanism must be a non-empty string")
+    if not isinstance(payload.get("hyperparameters"), dict):
+        raise ValueError(f"{path}: hyperparameters must be an object")
+    payload["hyperparameters"] = dict(
+        _freeze_micro_hyperparameters(
+            payload["hyperparameters"], context=f"{path}: hyperparameters"
+        )
+    )
+    if payload["mechanism"] != arm_spec.mechanism:
+        raise ValueError(
+            f"{path}: mechanism does not match registered arm {arm_spec.name!r}"
+        )
+    if payload["hyperparameters"] != dict(arm_spec.hyperparameters):
+        raise ValueError(
+            f"{path}: hyperparameters do not match registered arm {arm_spec.name!r}"
+        )
+    environment = payload.get("environment")
+    required_environment_fields = ("jax", "numpy", "python", "platform")
+    if not isinstance(environment, dict) or any(
+        not isinstance(environment.get(field), str) or not environment[field]
+        for field in required_environment_fields
+    ):
+        raise ValueError(
+            f"{path}: environment must record non-empty jax, numpy, python, and platform strings"
+        )
+    config = MicroStreamConfig.from_mapping(
+        payload.get("stream_config"), source=f"{path}: stream_config"
+    )
+    if payload.get("family") != config.family:
+        raise ValueError(
+            f"{path}: family {payload.get('family')!r} does not match "
+            f"stream_config family {config.family!r}"
+        )
+    for fieldname, (lower, upper) in _MICRO_CURVE_DOMAINS.items():
+        payload[fieldname] = _validated_curve(
+            payload.get(fieldname),
+            n_regimes=config.n_regimes,
+            lower=lower,
+            upper=upper,
+            context=f"{path}: {fieldname}",
+        )
+    payload["wall_clock_seconds"] = _validated_wall_clock_seconds(
+        payload.get("wall_clock_seconds"), path
+    )
+    payload["seed"] = require_jax_seed(payload.get("seed"), name=f"{path}: seed")
     for fieldname in ("hidden1", "hidden2"):
         value = payload.get(fieldname)
         if type(value) is not int or value <= 0:
@@ -880,12 +1255,10 @@ def _late_window_slope(per_regime: np.ndarray, window: int) -> float:
     return float(np.sum(x * (tail - tail.mean())) / denominator)
 
 
-def merge_micro_shards(
-    paths: Sequence[Path | str], bayes_samples: int = 200_000
-) -> dict[str, Any]:
-    """Merge shards of one (family, config) into a ranked summary with the
-    analytic Bayes reference attached."""
-    shards = [load_micro_shard(path) for path in paths]
+def _micro_shard_batch_contract(
+    shards: Sequence[dict[str, Any]],
+) -> tuple[MicroStreamConfig, dict[str, str]]:
+    """Validate fields that must be identical across one derived artifact."""
     if not shards:
         raise ValueError("no shards given")
     configs = {tuple(sorted(shard["stream_config"].items())) for shard in shards}
@@ -894,7 +1267,60 @@ def merge_micro_shards(
     nets = {(shard["hidden1"], shard["hidden2"]) for shard in shards}
     if len(nets) != 1:
         raise ValueError("shards span multiple network sizes; merge them separately")
-    config = MicroStreamConfig(**shards[0]["stream_config"])
+    reference_environment = shards[0]["environment"]
+    environment_mismatches = [
+        f"{shard['arm_name']}/seed={shard['seed']}"
+        for shard in shards
+        if shard["environment"] != reference_environment
+    ]
+    if environment_mismatches:
+        raise ValueError(
+            "shards span multiple runtime environments; process same-environment runs "
+            f"separately (mismatched: {environment_mismatches})"
+        )
+    return (
+        MicroStreamConfig.from_mapping(
+            shards[0]["stream_config"], source="stream_config"
+        ),
+        dict(reference_environment),
+    )
+
+
+def _validate_micro_arm_contract(
+    arm_name: str,
+    per_seed: Mapping[int, dict[str, Any]],
+) -> None:
+    """Reject cross-seed mechanism or hyperparameter drift within one arm."""
+    seeds = sorted(per_seed)
+    for fieldname in ("hyperparameters", "mechanism"):
+        reference = per_seed[seeds[0]][fieldname]
+        mismatched = [
+            seed for seed in seeds if per_seed[seed][fieldname] != reference
+        ]
+        if mismatched:
+            raise ValueError(
+                f"arm {arm_name!r} has inconsistent {fieldname} across seeds: "
+                f"seed {seeds[0]} used {reference!r}, seed(s) {mismatched} used "
+                "different values"
+            )
+
+
+def merge_micro_shards(
+    paths: Sequence[Path | str], bayes_samples: int = 200_000
+) -> dict[str, Any]:
+    """Merge shards of one (family, config) into a ranked summary with the
+    analytic Bayes reference attached.
+
+    Every arm must carry the same seed set: the ranking and the Bayes
+    reference are only meaningful as paired comparisons on shared streams.
+
+    Raises:
+        ValueError: If shards duplicate an ``(arm, seed)`` pair, span more
+            than one stream config or environment, drift within an arm, or
+            cover different seed sets across arms.
+    """
+    shards = [load_micro_shard(path) for path in paths]
+    config, reference_environment = _micro_shard_batch_contract(shards)
     quarter = max(1, config.n_regimes // 4)
 
     by_arm: dict[str, dict[int, dict[str, Any]]] = {}
@@ -905,12 +1331,24 @@ def merge_micro_shards(
                 f"duplicate shard for arm={shard['arm_name']} seed={shard['seed']}"
             )
         per_seed[shard["seed"]] = shard
+    seed_sets = {arm: tuple(sorted(per_seed)) for arm, per_seed in sorted(by_arm.items())}
+    if len(set(seed_sets.values())) != 1:
+        raise ValueError(
+            f"seed sets differ across arms: {seed_sets}; "
+            "merge_micro_shards ranks arms on paired seeds only"
+        )
 
     entries: list[dict[str, Any]] = []
     all_seeds: set[int] = set()
     for arm_name, per_seed in sorted(by_arm.items()):
         seeds = sorted(per_seed)
         all_seeds.update(seeds)
+        _validate_micro_arm_contract(arm_name, per_seed)
+        wall_clock_values = [per_seed[s]["wall_clock_seconds"] for s in seeds]
+        wall_clock_total = _finite_wall_clock_total(
+            wall_clock_values,
+            context=f"arm {arm_name!r}",
+        )
         curves = np.stack(
             [
                 np.asarray(per_seed[s]["per_regime_accuracy"], dtype=np.float64)
@@ -941,13 +1379,9 @@ def merge_micro_shards(
                 "first_window_accuracy_mean": float(curves[:, :quarter].mean()),
                 "late_window_accuracy_mean": float(curves[:, -quarter:].mean()),
                 "late_window_slope_mean": float(slopes.mean()),
-                "wall_clock_seconds_total": round(
-                    float(sum(per_seed[s]["wall_clock_seconds"] for s in seeds)), 3
-                ),
+                "wall_clock_seconds_total": round(wall_clock_total, 3),
                 "wall_clock_seconds_mean": round(
-                    float(
-                        np.mean([per_seed[s]["wall_clock_seconds"] for s in seeds])
-                    ),
+                    float(np.mean(wall_clock_values)),
                     3,
                 ),
             }
@@ -978,6 +1412,7 @@ def merge_micro_shards(
         "created_unix": time.time(),
         "family": config.family,
         "stream_config": config.to_config(),
+        "environment": dict(reference_environment),
         "hidden1": shards[0]["hidden1"],
         "hidden2": shards[0]["hidden2"],
         "n_shards": len(shards),
@@ -1190,30 +1625,32 @@ def transfer_validation(
 def transfer_validation_from_shards(paths: Sequence[Path | str]) -> dict[str, Any]:
     """Build and run :func:`transfer_validation` from ladder shards (M1 only)."""
     shards = [load_micro_shard(path) for path in paths]
-    if not shards:
-        raise ValueError("no shards given")
+    config, environment = _micro_shard_batch_contract(shards)
     families = {shard["family"] for shard in shards}
     if families != {"input_permutation"}:
         raise ValueError(
             "transfer validation is defined on the input_permutation family "
             f"(M1); got {sorted(families)}"
         )
-    configs = {tuple(sorted(shard["stream_config"].items())) for shard in shards}
-    if len(configs) != 1:
-        raise ValueError("shards span multiple stream configs; validate them separately")
-    per_arm: dict[str, dict[int, np.ndarray]] = {}
+    raw_per_arm: dict[str, dict[int, dict[str, Any]]] = {}
     for shard in shards:
-        per_seed = per_arm.setdefault(shard["arm_name"], {})
+        per_seed = raw_per_arm.setdefault(shard["arm_name"], {})
         if shard["seed"] in per_seed:
             raise ValueError(
                 f"duplicate shard for arm={shard['arm_name']} seed={shard['seed']}"
             )
-        per_seed[shard["seed"]] = np.asarray(
-            shard["per_regime_accuracy"], dtype=np.float64
-        )
+        per_seed[shard["seed"]] = shard
+    per_arm: dict[str, dict[int, np.ndarray]] = {}
+    for arm_name, raw_per_seed in raw_per_arm.items():
+        _validate_micro_arm_contract(arm_name, raw_per_seed)
+        per_arm[arm_name] = {
+            seed: np.asarray(shard["per_regime_accuracy"], dtype=np.float64)
+            for seed, shard in raw_per_seed.items()
+        }
     report = transfer_validation(per_arm)
     report["family"] = "input_permutation"
-    report["stream_config"] = dict(shards[0]["stream_config"])
+    report["stream_config"] = config.to_config()
+    report["environment"] = environment
     report["hidden1"] = shards[0]["hidden1"]
     report["hidden2"] = shards[0]["hidden2"]
     return report
@@ -1228,7 +1665,7 @@ def _atomic_replace_json(path: Path, payload: dict[str, Any]) -> None:
     """Atomically (re)write one derived JSON artifact (summaries are
     regenerable from immutable shards, so replacement is allowed here)."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    encoded = json.dumps(payload, indent=1, sort_keys=True) + "\n"
+    encoded = _strict_json_text(payload)
     fd, temporary = tempfile.mkstemp(
         dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
     )
@@ -1306,7 +1743,11 @@ def _run_or_skip_shard(
     hidden1: int,
     hidden2: int,
 ) -> Path:
-    """Idempotent shard execution: existing shards are validated and kept."""
+    """Idempotent shard execution: existing shards are validated and kept.
+
+    A shard is only reused when it was produced by the same stream config
+    and the same network size; anything else must go to a fresh directory.
+    """
     path = micro_shard_path(out_dir, config.family, arm_name, seed)
     if path.exists():
         payload = load_micro_shard(path)
@@ -1314,6 +1755,13 @@ def _run_or_skip_shard(
             raise ValueError(
                 f"{path}: existing shard was produced by a different stream "
                 "config; use a fresh --out directory"
+            )
+        if (payload["hidden1"], payload["hidden2"]) != (hidden1, hidden2):
+            raise ValueError(
+                f"{path}: existing shard was produced by a different network size "
+                f"(hidden1={payload['hidden1']}, hidden2={payload['hidden2']}); "
+                f"requested hidden1={hidden1}, hidden2={hidden2}; "
+                "use a fresh --out directory"
             )
         logger.info("shard exists, skipping: %s", path)
         return path
@@ -1367,15 +1815,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     config = _config_from_args(args)
 
     if args.command == "run":
+        seed = require_jax_seed(args.seed, name="seed")
         _run_or_skip_shard(
-            config, args.arm, args.seed, args.out, args.hidden1, args.hidden2
+            config, args.arm, seed, args.out, args.hidden1, args.hidden2
         )
         return 0
 
     # ladder
+    seeds = require_unique_jax_seeds(args.seeds, name="seeds")
     paths: list[Path] = []
     for arm_name in args.arms:
-        for seed in args.seeds:
+        for seed in seeds:
             paths.append(
                 _run_or_skip_shard(
                     config, arm_name, seed, args.out, args.hidden1, args.hidden2

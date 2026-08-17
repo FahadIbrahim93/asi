@@ -29,6 +29,7 @@ import jax.random as jr
 from jax import Array
 from jaxtyping import Bool, PRNGKeyArray
 
+from alberta_framework.core._float32_scalars import validated_float32_scalar
 from alberta_framework.core.types import TimeStep
 from alberta_framework.streams.base import ScanStream
 
@@ -46,6 +47,11 @@ class MaskMode(enum.Enum):
     FIXED = "fixed"
     RANDOM = "random"
     PERIODIC = "periodic"
+
+
+def _require_unit_interval_probability(name: str, value: object) -> float:
+    """Return a canonical probability valid at the float32 execution sink."""
+    return validated_float32_scalar(name, value, lower=0.0, upper=1.0)
 
 
 # =============================================================================
@@ -88,7 +94,9 @@ class PartialObservationWrapper[InnerStateT]:
             expectation.
         schedule: Tuple of boolean masks of shape ``(feature_dim,)``;
             cycled each step under PERIODIC mode.
-        sentinel: Value that replaces masked entries (default ``0.0``).
+        sentinel: Finite real that replaces masked entries (default ``0.0``).
+            Boolean and non-finite values are rejected so a hidden channel
+            cannot silently become ``1.0``, ``NaN``, or ``Inf``.
 
     Examples
     --------
@@ -116,7 +124,7 @@ class PartialObservationWrapper[InnerStateT]:
         self._inner = inner
         self._mode = mode
         self._mask_prob = mask_prob
-        self._sentinel = sentinel
+        self._sentinel = validated_float32_scalar("sentinel", sentinel)
 
         feature_dim = inner.feature_dim
 
@@ -137,18 +145,18 @@ class PartialObservationWrapper[InnerStateT]:
                 raise ValueError(
                     "MaskMode.PERIODIC requires a non-empty schedule."
                 )
-            sched = jnp.stack([jnp.asarray(m, dtype=jnp.bool_) for m in schedule], axis=0)
-            if sched.shape[1] != feature_dim:
+            masks = [jnp.asarray(m, dtype=jnp.bool_) for m in schedule]
+            if any(mask.shape != (feature_dim,) for mask in masks):
                 raise ValueError(
                     f"schedule masks must each have shape (feature_dim={feature_dim},)"
                 )
+            sched = jnp.stack(masks, axis=0)
             self._schedule: Array | None = sched
         else:
             self._schedule = None
 
         if mode == MaskMode.RANDOM:
-            if not (0.0 <= mask_prob <= 1.0):
-                raise ValueError(f"mask_prob must lie in [0, 1]; got {mask_prob}")
+            self._mask_prob = _require_unit_interval_probability("mask_prob", mask_prob)
 
     @property
     def feature_dim(self) -> int:

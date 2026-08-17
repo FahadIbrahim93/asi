@@ -33,8 +33,10 @@ assert meta["epoch"] == 1
 ```
 """
 
+import json
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import orbax.checkpoint as ocp
 
@@ -47,6 +49,34 @@ _FORMAT_VERSION = 2
 
 # Internal metadata key — stripped from user-facing metadata
 _VERSION_KEY = "_format_version"
+
+
+def _copy_mapping(payload: object, *, name: str) -> dict[str, Any]:
+    if not issubclass(type(payload), Mapping):
+        raise ValueError(f"{name} must be a mapping")
+    try:
+        values = dict(cast(Mapping[str, Any], payload))
+    except Exception as error:
+        raise ValueError(f"{name} must be a readable mapping") from error
+    if any(type(key) is not str for key in values):
+        raise ValueError(f"{name} keys must be exact strings")
+    return values
+
+
+def _require_path(value: object, *, name: str = "checkpoint path") -> Path:
+    if type(value) is str:
+        return Path(value)
+    if isinstance(value, Path) and type(value).__module__.startswith("pathlib"):
+        return Path(value)
+    raise ValueError(f"{name} must be an exact str or Path")
+
+
+def _require_json_safe_metadata(metadata: dict[str, Any]) -> None:
+    """Reject metadata that cannot round-trip as finite JSON."""
+    try:
+        json.dumps(metadata, allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("checkpoint metadata must be JSON-safe and finite") from exc
 
 
 def save_checkpoint(
@@ -66,12 +96,15 @@ def save_checkpoint(
         metadata: Optional user metadata dict to store alongside
             the checkpoint (e.g. epoch, learner config, etc.)
     """
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    path = _require_path(path)
 
-    meta_to_save = {_VERSION_KEY: _FORMAT_VERSION}
-    if metadata is not None:
-        meta_to_save.update(metadata)
+    if metadata is None:
+        meta_to_save: dict[str, Any] = {}
+    else:
+        meta_to_save = _copy_mapping(metadata, name="checkpoint metadata")
+    _require_json_safe_metadata(meta_to_save)
+    meta_to_save[_VERSION_KEY] = _FORMAT_VERSION
+    path.parent.mkdir(parents=True, exist_ok=True)
 
     with ocp.Checkpointer(ocp.CompositeCheckpointHandler()) as ckptr:
         ckptr.save(
@@ -107,7 +140,7 @@ def load_checkpoint(
         FileNotFoundError: If checkpoint directory doesn't exist
         ValueError: If state structure doesn't match template
     """
-    path = Path(path)
+    path = _require_path(path)
 
     if not path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {path}")
@@ -128,8 +161,10 @@ def load_checkpoint(
             f"Original error: {e}"
         ) from e
 
-    user_metadata = dict(loaded.metadata)
+    raw_metadata = loaded.metadata
+    user_metadata = _copy_mapping(raw_metadata, name="checkpoint metadata")
     user_metadata.pop(_VERSION_KEY, None)
+    _require_json_safe_metadata(user_metadata)
     return loaded.state, user_metadata
 
 
@@ -148,7 +183,7 @@ def load_checkpoint_metadata(path: str | Path) -> dict[str, Any]:
     Raises:
         FileNotFoundError: If checkpoint directory doesn't exist
     """
-    path = Path(path)
+    path = _require_path(path)
 
     if not path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {path}")
@@ -161,8 +196,10 @@ def load_checkpoint_metadata(path: str | Path) -> dict[str, Any]:
             ),
         )
 
-    user_metadata = dict(loaded.metadata)
+    raw_metadata = loaded.metadata
+    user_metadata = _copy_mapping(raw_metadata, name="checkpoint metadata")
     user_metadata.pop(_VERSION_KEY, None)
+    _require_json_safe_metadata(user_metadata)
     return user_metadata
 
 
@@ -175,6 +212,6 @@ def checkpoint_exists(path: str | Path) -> bool:
     Returns:
         True if a checkpoint directory exists at the path.
     """
-    path = Path(path)
+    path = _require_path(path)
     # Orbax checkpoints are directories containing a state/ subdirectory
     return path.is_dir() and (path / "state").is_dir()

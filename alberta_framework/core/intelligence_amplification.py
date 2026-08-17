@@ -37,15 +37,21 @@ References:
 from __future__ import annotations
 
 import dataclasses
+import math
+import operator
 from collections.abc import Mapping
-from typing import Any, cast
+from numbers import Real
+from typing import Any, SupportsIndex, cast
 
 import chex
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import Array
 from jaxtyping import Bool, Float, Int, UInt
 
+from alberta_framework._float32 import round_real_to_float32
+from alberta_framework.core._float32_scalars import validated_float32_scalar
 from alberta_framework.core.normalizers import (
     _checked_lifetime_words_increment,
     _lifetime_counter_valid,
@@ -63,6 +69,7 @@ from alberta_framework.core.oak import (
     migrate_legacy_oak_state,
     oak_total_lifetime_counter_nbytes,
 )
+from alberta_framework.core.update_safety import checked_integer_action_array
 
 EXO_CEREBELLUM_STATE_SCHEMA = "alberta.exo-cerebellum-state.v2"
 IA_STATE_SCHEMA = "alberta.intelligence-amplification-state.v2"
@@ -75,14 +82,65 @@ RECOMMENDATION_PROTOCOL_STATE_SCHEMA = "alberta.recommendation-protocol-state.v2
 EXO_CEREBELLUM_LIFETIME_COUNTER_NBYTES = 12
 EXO_CEREBELLUM_LIFETIME_COUNTER_DELTA_NBYTES = 8
 IA_LIFETIME_COUNTER_NBYTES = (
-    2 * EXO_CEREBELLUM_LIFETIME_COUNTER_NBYTES
-    + 3 * OAK_LIFETIME_COUNTER_NBYTES
+    2 * EXO_CEREBELLUM_LIFETIME_COUNTER_NBYTES + 3 * OAK_LIFETIME_COUNTER_NBYTES
 )
 IA_LIFETIME_COUNTER_DELTA_NBYTES = 2 * EXO_CEREBELLUM_LIFETIME_COUNTER_DELTA_NBYTES
 RECOMMENDATION_PROTOCOL_LIFETIME_COUNTER_NBYTES = 36
 RECOMMENDATION_PROTOCOL_LIFETIME_COUNTER_DELTA_NBYTES = 24
 
 _INT32_MAX = 2**31 - 1
+_ACTUAL_INT_TYPES = frozenset(
+    {
+        int,
+        np.int8,
+        np.int16,
+        np.int32,
+        np.int64,
+        np.uint8,
+        np.uint16,
+        np.uint32,
+        np.uint64,
+        np.longlong,
+        np.ulonglong,
+    }
+)
+
+
+def _require_int32(name: str, value: object, *, minimum: int, maximum: int = _INT32_MAX) -> int:
+    if type(value) not in _ACTUAL_INT_TYPES:
+        raise ValueError(f"{name} must be an integer in [{minimum}, {maximum}]")
+    canonical = operator.index(cast(SupportsIndex, value))
+    if not minimum <= canonical <= maximum:
+        raise ValueError(f"{name} must be an integer in [{minimum}, {maximum}]")
+    return canonical
+
+
+def _positive_float32_scalar(name: str, value: object) -> float:
+    """Validate and canonicalize a positive scalar in its execution dtype."""
+    message = f"{name} must be a finite positive float32 scalar"
+    preserve_builtin_float = type(value) is float
+    preserve_builtin_int = type(value) is int
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError(message)
+    try:
+        if value <= 0:
+            raise ValueError
+        narrowed = round_real_to_float32(value)
+    except (FloatingPointError, OverflowError, TypeError, ValueError) as error:
+        raise ValueError(message) from error
+    if not math.isfinite(narrowed) or narrowed <= 0.0:
+        raise ValueError(message)
+
+    # A valid built-in float already has an exact binary64 payload, so keeping
+    # it preserves existing serialized configs without changing its float32
+    # sink. Other Real implementations are stored as that exact sink. A small
+    # built-in integer is likewise safe only when it is exactly representable.
+    if preserve_builtin_float:
+        return cast(float, value)
+    if preserve_builtin_int and value == narrowed:
+        return float(value)
+    return narrowed
+
 
 # ---------------------------------------------------------------------------
 # Exo-cerebellum
@@ -107,12 +165,18 @@ class ExoCerebellumConfig:
     step_size: float = 0.05
 
     def __post_init__(self) -> None:
-        if self.n_demons <= 0:
-            raise ValueError("n_demons must be positive")
-        if self.obs_dim <= 0:
-            raise ValueError("obs_dim must be positive")
-        if self.step_size <= 0.0:
-            raise ValueError("step_size must be positive")
+        object.__setattr__(
+            self,
+            "n_demons",
+            _require_int32("n_demons", self.n_demons, minimum=1),
+        )
+        object.__setattr__(
+            self,
+            "obs_dim",
+            _require_int32("obs_dim", self.obs_dim, minimum=1),
+        )
+        step_size = _positive_float32_scalar("step_size", self.step_size)
+        object.__setattr__(self, "step_size", step_size)
 
     def to_config(self) -> dict[str, Any]:
         return {"type": "ExoCerebellumConfig", **dataclasses.asdict(self)}
@@ -252,8 +316,8 @@ class ExoCerebellumAgent:
         input_valid = jnp.all(jnp.isfinite(obs)) & jnp.all(jnp.isfinite(next_obs))
         safe_obs = jnp.where(jnp.isfinite(obs), obs, jnp.float32(0.0))
         safe_next_obs = jnp.where(jnp.isfinite(next_obs), next_obs, jnp.float32(0.0))
-        proposed_step_words, lifetime_capacity_available = (
-            _checked_lifetime_words_increment(state.step_words)
+        proposed_step_words, lifetime_capacity_available = _checked_lifetime_words_increment(
+            state.step_words
         )
         alpha = jnp.asarray(self._config.step_size, dtype=jnp.float32)
         predictions = state.weights @ safe_obs
@@ -266,10 +330,7 @@ class ExoCerebellumAgent:
         )
         candidate_state_valid = self.state_is_valid(candidate_state)
         update_applied = (
-            source_state_valid
-            & input_valid
-            & lifetime_capacity_available
-            & candidate_state_valid
+            source_state_valid & input_valid & lifetime_capacity_available & candidate_state_valid
         )
         new_state = jax.tree.map(
             lambda candidate, source: jnp.where(update_applied, candidate, source),
@@ -342,14 +403,12 @@ def _checked_partner_action(
         raise ValueError("partner_action must be scalar")
     if not jnp.issubdtype(raw.dtype, jnp.integer):
         raise ValueError("partner_action must have an integer dtype")
-    executed = jnp.asarray(raw, dtype=jnp.int32)
-    valid = (executed >= 0) & (executed < n_primitive_actions)
+    valid = (raw >= 0) & (raw < n_primitive_actions)
     if not isinstance(valid, jax.core.Tracer) and not bool(valid):
-        raise ValueError(
-            f"partner_action must be in [0, {n_primitive_actions})"
-        )
+        raise ValueError(f"partner_action must be in [0, {n_primitive_actions})")
+    executed = jnp.where(valid, raw, 0).astype(jnp.int32)
     return (
-        jnp.where(valid, executed, jnp.array(0, dtype=jnp.int32)),
+        executed,
         valid,
     )
 
@@ -395,9 +454,7 @@ class ExoCortexAgent:
         outer_valid = _oak_outer_state_validity(state, self.config)[-1]
         nested_valid = self._oak.stomp_agent.state_valid(state.stomp_state)
         return (
-            outer_valid
-            & nested_valid
-            & jnp.all(state.step_words == state.stomp_state.step_words)
+            outer_valid & nested_valid & jnp.all(state.step_words == state.stomp_state.step_words)
         )
 
     def _prepare_update_source(
@@ -476,11 +533,7 @@ class ExoCortexAgent:
             partner_action,
             discount,
         )
-        decision_obs = (
-            partner_next_obs
-            if decision_observation is None
-            else decision_observation
-        )
+        decision_obs = partner_next_obs if decision_observation is None else decision_observation
         result = self._oak.update(
             state,
             partner_reward,
@@ -675,8 +728,17 @@ class RecommendationProtocolConfig:
     acceptance_ema_decay: float = 0.95
 
     def __post_init__(self) -> None:
-        if not 0.0 <= self.acceptance_ema_decay < 1.0:
-            raise ValueError("acceptance_ema_decay must be in [0, 1)")
+        object.__setattr__(
+            self,
+            "acceptance_ema_decay",
+            validated_float32_scalar(
+                "acceptance_ema_decay",
+                self.acceptance_ema_decay,
+                lower=0.0,
+                upper=1.0,
+                upper_inclusive=False,
+            ),
+        )
 
     def to_config(self) -> dict[str, Any]:
         """Serialize to a JSON-compatible dictionary."""
@@ -868,17 +930,15 @@ def update_recommendation_protocol(
         state.accepted_words,
         state.rejected_words,
     )
-    exact_partition_valid = source_sum_available & jnp.all(
-        source_total_words == state.step_words
+    exact_partition_valid = source_sum_available & jnp.all(source_total_words == state.step_words)
+    next_step_words, lifetime_capacity_available = _checked_lifetime_words_increment(
+        state.step_words
     )
-    next_step_words, lifetime_capacity_available = (
-        _checked_lifetime_words_increment(state.step_words)
+    next_accepted_words, accepted_capacity_available = _checked_lifetime_words_increment(
+        state.accepted_words
     )
-    next_accepted_words, accepted_capacity_available = (
-        _checked_lifetime_words_increment(state.accepted_words)
-    )
-    next_rejected_words, rejected_capacity_available = (
-        _checked_lifetime_words_increment(state.rejected_words)
+    next_rejected_words, rejected_capacity_available = _checked_lifetime_words_increment(
+        state.rejected_words
     )
     selected_counter_capacity_available = jnp.where(
         accepted,
@@ -993,9 +1053,7 @@ class IAAgent:
         return (
             jnp.all(state.step_words == state.cerebellum_state.step_words)
             & jnp.all(state.step_words == state.cortex_state.step_words)
-            & jnp.all(
-                state.step_words == state.cortex_state.stomp_state.step_words
-            )
+            & jnp.all(state.step_words == state.cortex_state.stomp_state.step_words)
         )
 
     def state_is_valid(self, state: IAState) -> Bool[Array, ""]:
@@ -1038,9 +1096,7 @@ class IAAgent:
         start_applied = source_state_valid & input_valid & candidate_valid
         return jax.tree_util.tree_map(
             lambda proposed, source: (
-                jnp.where(start_applied, proposed, source)
-                if isinstance(source, Array)
-                else source
+                jnp.where(start_applied, proposed, source) if isinstance(source, Array) else source
             ),
             candidate,
             state,
@@ -1083,13 +1139,10 @@ class IAAgent:
         reward = jnp.asarray(partner_reward, dtype=jnp.float32)
         expected_obs_shape = (self._config.cortex.observation_dim,)
         if obs.shape != expected_obs_shape:
-            raise ValueError(
-                f"partner_obs must have shape {expected_obs_shape}, got {obs.shape}"
-            )
+            raise ValueError(f"partner_obs must have shape {expected_obs_shape}, got {obs.shape}")
         if next_obs.shape != expected_obs_shape:
             raise ValueError(
-                "partner_next_obs must have shape "
-                f"{expected_obs_shape}, got {next_obs.shape}"
+                f"partner_next_obs must have shape {expected_obs_shape}, got {next_obs.shape}"
             )
         if reward.shape != ():
             raise ValueError("partner_reward must be scalar")
@@ -1122,12 +1175,10 @@ class IAAgent:
                 partner_action,
                 n_primitive_actions=self._config.cortex.n_primitive_actions,
             )
-        prepared_cortex_state, _, prepared_action_valid = (
-            self._cortex._prepare_update_source(
-                state.cortex_state,
-                partner_action,
-                discount,
-            )
+        prepared_cortex_state, _, prepared_action_valid = self._cortex._prepare_update_source(
+            state.cortex_state,
+            partner_action,
+            discount,
         )
         action_valid = action_valid & prepared_action_valid
         input_valid = (
@@ -1145,14 +1196,12 @@ class IAAgent:
             & self._cortex.state_is_valid(prepared_cortex_state)
             & child_clocks_aligned
         )
-        proposed_step_words, lifetime_capacity_available = (
-            _checked_lifetime_words_increment(state.step_words)
+        proposed_step_words, lifetime_capacity_available = _checked_lifetime_words_increment(
+            state.step_words
         )
 
         # Cerebellum: predict from obs, update from (obs, next_obs)
-        cerebellum_result = self._cerebellum.update_result(
-            state.cerebellum_state, obs, next_obs
-        )
+        cerebellum_result = self._cerebellum.update_result(state.cerebellum_state, obs, next_obs)
 
         # Cortex: update Q from (reward, next_obs) crediting the partner's
         # executed action when known, get recommendation
@@ -1280,9 +1329,7 @@ class IAAgent:
                 next_ob,
                 partner_action=action if use_actions else None,
                 discount=transition_discount if use_discounts else None,
-                decision_observation=(
-                    decision_ob if use_decision_observations else None
-                ),
+                decision_observation=(decision_ob if use_decision_observations else None),
                 execution_boundary=execution_boundary,
             )
             return result.state, (
@@ -1303,12 +1350,24 @@ class IAAgent:
                 result.update_applied,
             )
 
-        num_steps = jnp.asarray(partner_rewards).shape[0]
-        scan_actions = (
-            jnp.asarray(partner_actions, dtype=jnp.int32)
-            if partner_actions is not None
-            else jnp.zeros((num_steps,), dtype=jnp.int32)
-        )
+        partner_rewards_shape = tuple(partner_rewards.shape)
+        if len(partner_rewards_shape) != 1 or partner_rewards_shape[0] < 1:
+            raise ValueError("partner_rewards must have shape (num_steps,)")
+        num_steps = partner_rewards_shape[0]
+        if partner_actions is not None:
+            _, _ = checked_integer_action_array(
+                partner_actions,
+                self._config.cortex.n_primitive_actions,
+                name="partner_actions",
+                expected_shape=(num_steps,),
+                range_message="partner_actions must lie in the primitive action range",
+            )
+            # Preserve the original integer dtype until each scalar reaches
+            # ``_checked_partner_action``; narrowing here would erase wide
+            # invalid values such as uint64(2**32).
+            scan_actions = jnp.asarray(partner_actions)
+        else:
+            scan_actions = jnp.zeros((num_steps,), dtype=jnp.int32)
         scan_discounts = (
             jnp.asarray(discounts, dtype=jnp.float32)
             if discounts is not None
@@ -1386,10 +1445,7 @@ def _host_field_mapping(value: Any, *, name: str) -> dict[str, Any]:
     if isinstance(value, Mapping):
         return dict(value)
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
-        return {
-            field.name: getattr(value, field.name)
-            for field in dataclasses.fields(value)
-        }
+        return {field.name: getattr(value, field.name) for field in dataclasses.fields(value)}
     raise TypeError(f"legacy {name} state must be a mapping or dataclass")
 
 
@@ -1419,8 +1475,7 @@ def migrate_legacy_exo_cerebellum_state(
         missing = sorted({"weights", "step_count"} - set(fields))
         extra = sorted(set(fields) - {"weights", "step_count"})
         raise ValueError(
-            "legacy exo-cerebellum field manifest is not exact; "
-            f"missing={missing}, extra={extra}"
+            f"legacy exo-cerebellum field manifest is not exact; missing={missing}, extra={extra}"
         )
     step = _strict_legacy_counter(fields["step_count"], name="exo-cerebellum step_count")
     state = ExoCerebellumState(
@@ -1447,10 +1502,7 @@ def migrate_legacy_ia_state(
     if set(fields) != expected:
         missing = sorted(expected - set(fields))
         extra = sorted(set(fields) - expected)
-        raise ValueError(
-            "legacy IA field manifest is not exact; "
-            f"missing={missing}, extra={extra}"
-        )
+        raise ValueError(f"legacy IA field manifest is not exact; missing={missing}, extra={extra}")
     step = _strict_legacy_counter(fields["step_count"], name="IA step_count")
     cerebellum = migrate_legacy_exo_cerebellum_state(
         fields["cerebellum_state"],
@@ -1458,9 +1510,7 @@ def migrate_legacy_ia_state(
     )
     cortex_raw = fields["cortex_state"]
     cortex = (
-        cortex_raw
-        if isinstance(cortex_raw, OaKState)
-        else migrate_legacy_oak_state(cortex_raw)
+        cortex_raw if isinstance(cortex_raw, OaKState) else migrate_legacy_oak_state(cortex_raw)
     )
     state = IAState(
         cerebellum_state=cerebellum,
@@ -1541,9 +1591,7 @@ def measure_ia_state_nbytes(state: IAState) -> int:
 def measure_ia_wrapper_state_nbytes(state: IAState) -> int:
     """Measure IA-owned outer/cerebellum arrays, excluding nested OaK."""
 
-    return measure_ia_state_nbytes(state) - measure_oak_state_nbytes(
-        state.cortex_state
-    )
+    return measure_ia_state_nbytes(state) - measure_oak_state_nbytes(state.cortex_state)
 
 
 def measure_recommendation_protocol_state_nbytes(
@@ -1567,10 +1615,7 @@ def exo_cerebellum_lifetime_counter_nbytes() -> int:
 def ia_lifetime_counter_nbytes() -> int:
     """Return bytes for IA, cerebellum, and all nested OaK clocks."""
 
-    return (
-        2 * EXO_CEREBELLUM_LIFETIME_COUNTER_NBYTES
-        + oak_total_lifetime_counter_nbytes()
-    )
+    return 2 * EXO_CEREBELLUM_LIFETIME_COUNTER_NBYTES + oak_total_lifetime_counter_nbytes()
 
 
 def recommendation_protocol_lifetime_counter_nbytes() -> int:

@@ -1,4 +1,4 @@
-"""Utility functions for ASI's ``alberta_framework`` compatibility package."""
+"""Utility functions for the Alberta Framework."""
 
 # Experiment runner (no external deps)
 from alberta_framework.utils.experiments import (
@@ -37,29 +37,6 @@ from alberta_framework.utils.metrics import (
     extract_metric,
     summarize_continual_learning,
 )
-from alberta_framework.utils.statistics import (
-    SignificanceResult,
-    StatisticalSummary,
-    bonferroni_correction,
-    bootstrap_ci,
-    cohens_d,
-    compute_statistics,
-    compute_timeseries_statistics,
-    holm_correction,
-    mann_whitney_comparison,
-    pairwise_comparisons,
-    ttest_comparison,
-    wilcoxon_comparison,
-)
-from alberta_framework.utils.visualization import (
-    create_comparison_figure,
-    plot_final_performance_bars,
-    plot_hyperparameter_heatmap,
-    plot_learning_curves,
-    plot_step_size_evolution,
-    save_figure,
-    set_publication_style,
-)
 
 __all__ = [
     # Metrics
@@ -93,7 +70,33 @@ __all__ = [
     "generate_latex_table",
     "generate_markdown_table",
     "save_experiment_report",
-    # Statistics (optional scipy imports remain function-local)
+]
+
+from alberta_framework.utils.statistics import (
+    SignificanceResult,
+    StatisticalSummary,
+    bonferroni_correction,
+    bootstrap_ci,
+    cohens_d,
+    compute_statistics,
+    compute_timeseries_statistics,
+    holm_correction,
+    mann_whitney_comparison,
+    pairwise_comparisons,
+    ttest_comparison,
+    wilcoxon_comparison,
+)
+from alberta_framework.utils.visualization import (
+    create_comparison_figure,
+    plot_final_performance_bars,
+    plot_hyperparameter_heatmap,
+    plot_learning_curves,
+    plot_step_size_evolution,
+    save_figure,
+    set_publication_style,
+)
+
+__all__ += [
     "SignificanceResult",
     "StatisticalSummary",
     "bonferroni_correction",
@@ -106,7 +109,6 @@ __all__ = [
     "pairwise_comparisons",
     "ttest_comparison",
     "wilcoxon_comparison",
-    # Visualization (matplotlib imports remain function-local)
     "create_comparison_figure",
     "plot_final_performance_bars",
     "plot_hyperparameter_heatmap",

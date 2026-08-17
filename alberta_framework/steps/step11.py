@@ -15,6 +15,11 @@ additional mechanisms:
 This facade exposes a minimal, stable surface over the core
 :class:`~alberta_framework.core.oak.OaKAgent` implementation.
 
+The facade rejects illegal dimensions and scientific scalars — epsilons,
+gamma, decays, step sizes, and curation thresholds — before constructing the
+core agent. Accepted numbers are canonicalized to builtin ints and floats;
+legal endpoints stay valid.
+
 References:
     Sutton, Bowling, & Pilarski (2022). "The Alberta Plan for AI Research."
     Sutton (RLC 2025). "The OaK Architecture: A Vision of SuperIntelligence."
@@ -24,12 +29,15 @@ References:
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from typing import Any
+from numbers import Integral
+from typing import Any, cast
 
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 from jax import Array
 
+from alberta_framework._seed_validation import require_jax_seed
 from alberta_framework.core.oak import (
     KeyboardChordLearnerConfig,
     KeyboardChordLearnerState,
@@ -45,6 +53,11 @@ from alberta_framework.core.oak import (
     update_keyboard_chord_learner,
 )
 from alberta_framework.core.options import STOMPConfig, SubtaskSpec
+from alberta_framework.steps._float32_validation import (
+    canonical_float32_storage,
+    finite_real_and_float32,
+)
+from alberta_framework.steps._smoke_record_validation import require_step_shape
 
 
 @dataclass(frozen=True)
@@ -92,6 +105,10 @@ class Step11OaKConfig:
     epsilon_option: float = 0.1
     utility_ema_decay: float = 0.99
     curation_threshold: float = 0.0
+
+    def __post_init__(self) -> None:
+        """Reject illegal dimensions and scientific scalars, then canonicalize."""
+        _validate_oak_facade_config(self)
 
     def to_config(self) -> dict[str, Any]:
         """Return a JSON-serializable representation."""
@@ -151,6 +168,192 @@ class Step11OaKConfig:
         )
 
 
+_INT32_MAX = 2**31 - 1
+_NUMPY_INTEGER_TYPES = frozenset(
+    np.dtype(code).type for code in ("b", "B", "h", "H", "i", "I", "l", "L", "q", "Q")
+)
+
+
+def _require_real(name: str, value: object) -> float:
+    real, _, _, narrowed = finite_real_and_float32(name, value)
+    return canonical_float32_storage(real, narrowed)
+
+
+def _require_unit_interval(name: str, value: object) -> float:
+    real, numerator, denominator, narrowed = finite_real_and_float32(name, value)
+    if (
+        real < 0.0
+        or not real <= 1.0
+        or numerator < 0
+        or numerator > denominator
+        or narrowed < 0.0
+        or not narrowed <= 1.0
+    ):
+        raise ValueError(f"{name} must be in [0, 1], got {value!r}")
+    return canonical_float32_storage(real, narrowed)
+
+
+def _require_nonnegative_real(name: str, value: object) -> float:
+    real, numerator, _, narrowed = finite_real_and_float32(name, value)
+    if real < 0.0 or numerator < 0 or narrowed < 0.0:
+        raise ValueError(f"{name} must be non-negative, got {value!r}")
+    return canonical_float32_storage(real, narrowed)
+
+
+def _require_positive_real(name: str, value: object) -> float:
+    real, numerator, _, narrowed = finite_real_and_float32(name, value)
+    if real <= 0.0 or numerator <= 0 or narrowed <= 0.0:
+        raise ValueError(f"{name} must be positive, got {value!r}")
+    return canonical_float32_storage(real, narrowed)
+
+
+def _require_int(
+    name: str,
+    value: object,
+    *,
+    minimum: int | None = None,
+    maximum: int | None = None,
+) -> int:
+    actual_type = type(value)
+    if actual_type is int:
+        number = cast(int, value)
+    elif actual_type in _NUMPY_INTEGER_TYPES:
+        number = int(cast(Integral, value))
+    else:
+        raise ValueError(f"{name} must be an integer, got {value!r}")
+    if minimum is not None and number < minimum:
+        if minimum == 1:
+            raise ValueError(f"{name} must be positive, got {value!r}")
+        if minimum == 0:
+            raise ValueError(f"{name} must be non-negative, got {value!r}")
+        raise ValueError(f"{name} must be >= {minimum}, got {value!r}")
+    if maximum is not None and number > maximum:
+        raise ValueError(f"{name} must be at most int32 max, got {value!r}")
+    return number
+
+
+def _require_bool(name: str, value: object) -> bool:
+    if type(value) is not bool:
+        raise ValueError(f"{name} must be a boolean, got {value!r}")
+    return value
+
+
+def _validate_oak_facade_config(config: Step11OaKConfig) -> None:
+    observation_dim = _require_int(
+        "observation_dim",
+        config.observation_dim,
+        minimum=1,
+        maximum=_INT32_MAX,
+    )
+    n_primitive_actions = _require_int(
+        "n_primitive_actions",
+        config.n_primitive_actions,
+        minimum=1,
+        maximum=_INT32_MAX,
+    )
+    option_planning_backups_per_step = _require_int(
+        "option_planning_backups_per_step",
+        config.option_planning_backups_per_step,
+        minimum=0,
+        maximum=_INT32_MAX - 1,
+    )
+    if type(config.subtask_specs) is not tuple:
+        raise ValueError(
+            f"subtask_specs must be a tuple of SubtaskSpec, got {config.subtask_specs!r}"
+        )
+    canonical_specs: list[SubtaskSpec] = []
+    for spec in config.subtask_specs:
+        if type(spec) is not SubtaskSpec:
+            raise ValueError(f"subtask_specs must contain SubtaskSpec values, got {spec!r}")
+        feature_index = _require_int(
+            "feature_index",
+            spec.feature_index,
+            minimum=0,
+            maximum=_INT32_MAX,
+        )
+        if feature_index >= observation_dim:
+            raise ValueError(
+                f"feature_index must be < observation_dim, got {spec.feature_index!r}"
+            )
+        threshold = _require_positive_real("threshold", spec.threshold)
+        pseudo_reward_scale = _require_positive_real(
+            "pseudo_reward_scale",
+            spec.pseudo_reward_scale,
+        )
+        max_option_steps = _require_int(
+            "max_option_steps",
+            spec.max_option_steps,
+            minimum=1,
+            maximum=_INT32_MAX,
+        )
+        canonical_specs.append(
+            SubtaskSpec(
+                feature_index=feature_index,
+                threshold=threshold,
+                pseudo_reward_scale=pseudo_reward_scale,
+                max_option_steps=max_option_steps,
+            )
+        )
+    base_step_size = _require_nonnegative_real("base_step_size", config.base_step_size)
+    base_avg_reward_step_size = _require_nonnegative_real(
+        "base_avg_reward_step_size",
+        config.base_avg_reward_step_size,
+    )
+    base_trace_decay = _require_unit_interval("base_trace_decay", config.base_trace_decay)
+    option_step_size = _require_nonnegative_real(
+        "option_step_size",
+        config.option_step_size,
+    )
+    option_avg_reward_step_size = _require_nonnegative_real(
+        "option_avg_reward_step_size",
+        config.option_avg_reward_step_size,
+    )
+    option_trace_decay = _require_unit_interval(
+        "option_trace_decay",
+        config.option_trace_decay,
+    )
+    option_gamma = _require_unit_interval("option_gamma", config.option_gamma)
+    option_model_decay = _require_unit_interval(
+        "option_model_decay",
+        config.option_model_decay,
+    )
+    option_model_step_size = _require_nonnegative_real(
+        "option_model_step_size",
+        config.option_model_step_size,
+    )
+    epsilon_base = _require_unit_interval("epsilon_base", config.epsilon_base)
+    epsilon_option = _require_unit_interval("epsilon_option", config.epsilon_option)
+    utility_ema_decay = _require_unit_interval(
+        "utility_ema_decay",
+        config.utility_ema_decay,
+    )
+    curation_threshold = _require_nonnegative_real(
+        "curation_threshold",
+        config.curation_threshold,
+    )
+    object.__setattr__(config, "subtask_specs", tuple(canonical_specs))
+    object.__setattr__(config, "observation_dim", observation_dim)
+    object.__setattr__(config, "n_primitive_actions", n_primitive_actions)
+    object.__setattr__(config, "base_step_size", base_step_size)
+    object.__setattr__(config, "base_avg_reward_step_size", base_avg_reward_step_size)
+    object.__setattr__(config, "base_trace_decay", base_trace_decay)
+    object.__setattr__(config, "option_step_size", option_step_size)
+    object.__setattr__(config, "option_avg_reward_step_size", option_avg_reward_step_size)
+    object.__setattr__(config, "option_trace_decay", option_trace_decay)
+    object.__setattr__(config, "option_gamma", option_gamma)
+    object.__setattr__(config, "option_model_decay", option_model_decay)
+    object.__setattr__(config, "option_model_step_size", option_model_step_size)
+    object.__setattr__(
+        config,
+        "option_planning_backups_per_step",
+        option_planning_backups_per_step,
+    )
+    object.__setattr__(config, "epsilon_base", epsilon_base)
+    object.__setattr__(config, "epsilon_option", epsilon_option)
+    object.__setattr__(config, "utility_ema_decay", utility_ema_decay)
+    object.__setattr__(config, "curation_threshold", curation_threshold)
+
+
 @dataclass(frozen=True)
 class Step11SmokeResult:
     """Summary returned by :func:`run_step11_smoke`."""
@@ -165,6 +368,34 @@ class Step11SmokeResult:
     finite: bool
     option_termination_count: int
     agent_config: dict[str, Any]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "steps", _require_int("steps", self.steps, minimum=1, maximum=_INT32_MAX)
+        )
+        object.__setattr__(self, "seed", require_jax_seed(self.seed, name="seed"))
+        for name in (
+            "td_errors_shape",
+            "average_rewards_shape",
+            "primitive_actions_shape",
+            "utility_emas_shape",
+        ):
+            object.__setattr__(
+                self,
+                name,
+                require_step_shape(name, getattr(self, name), steps=self.steps),
+            )
+        object.__setattr__(self, "finite", _require_bool("finite", self.finite))
+        object.__setattr__(
+            self,
+            "option_termination_count",
+            _require_int(
+                "option_termination_count",
+                self.option_termination_count,
+                minimum=0,
+                maximum=_INT32_MAX,
+            ),
+        )
 
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-serializable representation."""
@@ -275,8 +506,8 @@ def run_step11_smoke(
     Returns:
         :class:`Step11SmokeResult` with shape/fineness summary.
     """
-    if steps < 1:
-        raise ValueError("steps must be positive")
+    steps = _require_int("steps", steps, minimum=1, maximum=_INT32_MAX)
+    seed = require_jax_seed(seed, name="seed")
 
     cfg = config
     if cfg is None:

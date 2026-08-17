@@ -36,7 +36,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 from io import BytesIO
 from pathlib import Path, PurePosixPath
-from types import MappingProxyType
+from types import MappingProxyType, SimpleNamespace
 from typing import Any, NoReturn, cast
 
 import pytest
@@ -1039,6 +1039,53 @@ def test_replay_uses_frozen_open_builder_transforms_including_search_oracle() ->
             original,
         )
         assert hashlib.sha256(replayed).hexdigest() == derived_sha256
+
+
+@pytest.mark.parametrize("invalid", [float("nan"), float("inf"), float("-inf")])
+def test_replay_configuration_transforms_rejects_nonfinite_copy(
+    monkeypatch: pytest.MonkeyPatch, invalid: float
+) -> None:
+    """Host-boundary transform copies must not launder NaN/Inf through json.dumps."""
+
+    candidate = SimpleNamespace(
+        configuration=SimpleNamespace(
+            allowed_transforms=(
+                SimpleNamespace(
+                    transform_type="byte_preserving_unique_literal_replacement",
+                    value_type="integer",
+                    value=2,
+                    target="total_steps",
+                ),
+            )
+        )
+    )
+    monkeypatch.setattr(
+        executor, "decode_strict_json", lambda raw: {"total_steps": invalid}
+    )
+    with pytest.raises(
+        executor.ForagerMatchedExecutorError,
+        match="finite canonical JSON",
+    ):
+        executor._replay_configuration_transforms(candidate, b'{"total_steps": 1}')
+
+
+def test_replay_configuration_transforms_keeps_finite_configuration_copy() -> None:
+    candidate = SimpleNamespace(
+        configuration=SimpleNamespace(
+            allowed_transforms=(
+                SimpleNamespace(
+                    transform_type="byte_preserving_unique_literal_replacement",
+                    value_type="integer",
+                    value=2,
+                    target="total_steps",
+                ),
+            )
+        )
+    )
+    rewritten = executor._replay_configuration_transforms(
+        candidate, b'{"total_steps": 1}'
+    )
+    assert b'"total_steps": 2' in rewritten or b'"total_steps":2' in rewritten
 
 
 @pytest.mark.parametrize(
@@ -2075,6 +2122,41 @@ def test_scorer_output_rejects_extra_reward_values_and_noncanonical_bytes(
             tmp_path / "raw-extra.tar",
             live,
             runner=runner,
+        )
+
+
+@pytest.mark.parametrize(
+    ("path", "replacement"),
+    [
+        (("horizon",), 499_712.0),
+        (("seeds", 0), float(2_300_001)),
+        (("records", 0, "seed"), float(2_300_001)),
+        (("records", 0, "reward_shape", 0), 499_712.0),
+        (("records", 0, "ema_sample_count"), 4_998.0),
+        (("records", 0, "ema_tail_start_index"), 4_498.0),
+        (("records", 0, "ema_tail_sample_count"), 500.0),
+        (("records", 0, "ema_tail_sample_count"), True),
+    ],
+)
+def test_scorer_output_rejects_numeric_aliases_for_integer_fields(
+    tmp_path: Path,
+    path: tuple[str | int, ...],
+    replacement: float | bool,
+) -> None:
+    plan = _plan(tmp_path)
+    seed = plan.protocol.active_seeds[0]
+    payload = executor.decode_strict_json(_scoring_output(plan, seed))
+    target: Any = payload
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] = replacement
+
+    with pytest.raises(executor.ForagerMatchedExecutorError, match="must be an integer"):
+        executor._parse_scorer_output(
+            executor.canonical_json_bytes(payload),
+            plan=plan,
+            candidate=plan.candidates[0],
+            seed=seed,
         )
 
 

@@ -1,0 +1,516 @@
+---
+name: IPMNIST preregistration
+run-name: ipmnist-${{ inputs.protocol }}-${{ inputs.launch_sha }}
+
+# This workflow is deliberately manual-only. It is launch infrastructure for
+# three permanently nonpromoting development protocols, not a CI benchmark lane.
+"on":
+  workflow_dispatch:
+    inputs:
+      protocol:
+        description: Exact preregistration to execute
+        required: true
+        type: choice
+        options:
+          - issue51
+          - issue184
+          - issue188
+      launch_sha:
+        description: Full 40-character commit SHA of the reviewed launch tag
+        required: true
+        type: string
+
+concurrency:
+  # One protocol consumes one frozen seed schedule and one append-only namespace.
+  # Serialize different reviewed source objects too, not merely duplicate SHAs.
+  group: ipmnist-prereg-${{ inputs.protocol }}
+  cancel-in-progress: false
+
+permissions:
+  actions: read
+  contents: read
+  issues: read
+
+env:
+  CUDA_VISIBLE_DEVICES: ""
+  JAX_ENABLE_X64: "false"
+  JAX_PLATFORM_NAME: cpu
+  JAX_PLATFORMS: cpu
+  OMP_NUM_THREADS: "1"
+  PYTHONHASHSEED: "0"
+  PYTHONOPTIMIZE: "0"
+  XLA_FLAGS: --xla_force_host_platform_device_count=1
+  XLA_PYTHON_CLIENT_PREALLOCATE: "false"
+
+jobs:
+  run:
+    if: github.repository == 'elizaOS/asi'
+    runs-on: macos-14
+    timeout-minutes: 360
+    steps:
+      - name: Require the exact GitHub-hosted runner context
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$RUNNER_ENVIRONMENT" != "github-hosted" \
+             || "$RUNNER_OS" != "macOS" \
+             || "$RUNNER_ARCH" != "ARM64" ]]; then
+            echo "runner context is not GitHub-hosted macOS ARM64" >&2
+            exit 1
+          fi
+
+      - name: Check out the exact launch object
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ inputs.launch_sha }}
+
+      - name: Bind source, tag, workflow, and lock identities
+        id: identity
+        shell: bash
+        env:
+          LAUNCH_SHA: ${{ inputs.launch_sha }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$LAUNCH_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "launch_sha must be a full lowercase SHA-1" >&2
+            exit 1
+          fi
+          if [[ "$GITHUB_REF_TYPE" != "tag" ]]; then
+            echo "dispatch ref must be a reviewed tag" >&2
+            exit 1
+          fi
+          if [[ "$GITHUB_SHA" != "$LAUNCH_SHA" || "$WORKFLOW_SHA" != "$LAUNCH_SHA" ]]; then
+            echo "dispatch, input, and workflow source identities differ" >&2
+            exit 1
+          fi
+          if [[ "$(git rev-parse --verify HEAD)" != "$LAUNCH_SHA" ]]; then
+            echo "checkout HEAD differs from the authorized source" >&2
+            exit 1
+          fi
+          if [[ "$(git rev-parse --verify "$GITHUB_REF^{commit}")" != "$LAUNCH_SHA" ]]; then
+            echo "launch tag does not peel to the authorized source" >&2
+            exit 1
+          fi
+          if ! git diff --quiet || ! git diff --cached --quiet; then
+            echo "tracked checkout is dirty before launch" >&2
+            exit 1
+          fi
+          tree="$(git rev-parse --verify 'HEAD^{tree}')"
+          uv_lock_sha256="$(shasum -a 256 uv.lock | awk '{print $1}')"
+          workflow_blob_sha1="$(git rev-parse "HEAD:.github/workflows/ipmnist-prereg.yml")"
+          driver_blob_sha1="$(git rev-parse "HEAD:.github/scripts/ipmnist_prereg.py")"
+          {
+            echo "tree=$tree"
+            echo "uv_lock_sha256=$uv_lock_sha256"
+            echo "workflow_blob_sha1=$workflow_blob_sha1"
+            echo "driver_blob_sha1=$driver_blob_sha1"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Refuse occupied output namespaces
+        id: protocol
+        shell: bash
+        env:
+          PROTOCOL: ${{ inputs.protocol }}
+        run: |
+          set -euo pipefail
+          case "$PROTOCOL" in
+            issue51) namespace="replication_r1" ;;
+            issue184) namespace="rls_preset_ablation_r1" ;;
+            issue188) namespace="gate_ablation_r3" ;;
+            *) echo "unsupported protocol" >&2; exit 1 ;;
+          esac
+          target="outputs/ipmnist_screening/$namespace"
+          for parent in outputs outputs/ipmnist_screening; do
+            if [[ -L "$parent" ]]; then
+              echo "output parent must not be a symlink: $parent" >&2
+              exit 1
+            fi
+          done
+          if [[ -e "$target" || -L "$target" ]]; then
+            echo "append-only namespace is already occupied: $target" >&2
+            exit 1
+          fi
+          echo "output_root=$target" >> "$GITHUB_OUTPUT"
+
+      - name: Require exact owner authorization and sole dispatch before setup
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PROTOCOL: ${{ inputs.protocol }}
+          SOURCE: ${{ inputs.launch_sha }}
+          TREE: ${{ steps.identity.outputs.tree }}
+          UV_LOCK_SHA256: ${{ steps.identity.outputs.uv_lock_sha256 }}
+          WORKFLOW_BLOB_SHA1: ${{ steps.identity.outputs.workflow_blob_sha1 }}
+          DRIVER_BLOB_SHA1: ${{ steps.identity.outputs.driver_blob_sha1 }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/ipmnist_prereg.py authorize \
+            --protocol "$PROTOCOL" \
+            --repository "$GITHUB_REPOSITORY" \
+            --source "$SOURCE" \
+            --tree "$TREE" \
+            --uv-lock-sha256 "$UV_LOCK_SHA256" \
+            --workflow-blob-sha1 "$WORKFLOW_BLOB_SHA1" \
+            --driver-blob-sha1 "$DRIVER_BLOB_SHA1" \
+            --ref-name "$GITHUB_REF_NAME" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --output "$RUNNER_TEMP/prereg-metadata/owner-authorization.json"
+
+      - name: Set up exact uv 0.9.24
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e
+        with:
+          version: 0.9.24
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install exact uv-managed CPython 3.12.12
+        id: python
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$(uv --version)" != "uv 0.9.24" ]]; then
+            echo "setup-uv did not install exact uv 0.9.24" >&2
+            exit 1
+          fi
+          if [[ "$PYTHONOPTIMIZE" != "0" ]]; then
+            echo "PYTHONOPTIMIZE must be exactly zero" >&2
+            exit 1
+          fi
+          uv python install --managed-python 3.12.12
+          python_path="$(uv python find --managed-python --no-project 3.12.12)"
+          identity="$("$python_path" -c \
+            'import platform; print(platform.python_implementation(), platform.python_version(), platform.machine())')"
+          if [[ "$identity" != "CPython 3.12.12 arm64" ]]; then
+            echo "uv-managed Python identity mismatch: $identity" >&2
+            exit 1
+          fi
+          if [[ "$("$python_path" -c 'import sys; print(sys.flags.optimize)')" != "0" ]]; then
+            echo "uv-managed Python unexpectedly enabled optimized mode" >&2
+            exit 1
+          fi
+          echo "path=$python_path" >> "$GITHUB_OUTPUT"
+
+      - name: Synchronize the committed environment
+        shell: bash
+        env:
+          PYTHON_PATH: ${{ steps.python.outputs.path }}
+        run: |
+          set -euo pipefail
+          cpu_brand="$(sysctl -n machdep.cpu.brand_string)"
+          if [[ "$cpu_brand" != *"Apple M1"* ]]; then
+            echo "macos-14 runner is not an Apple M1 family host: $cpu_brand" >&2
+            exit 1
+          fi
+          uv sync \
+            --locked \
+            --python "$PYTHON_PATH" \
+            --extra research
+          uv run --no-sync python - "$cpu_brand" "$RUNNER_TEMP/prereg-metadata/runner.json" <<'PY'
+          import importlib.metadata
+          import json
+          import os
+          import platform
+          import sys
+          from pathlib import Path
+
+          import jax
+
+          def require(condition, message):
+              if not condition:
+                  raise RuntimeError(message)
+
+          expected = {
+              "chex": "0.1.92",
+              "jax": "0.11.0",
+              "jaxlib": "0.11.0",
+              "numpy": "2.5.1",
+              "scikit-learn": "1.9.0",
+          }
+          expected_jax_config = {
+              "jax_enable_x64": False,
+              "jax_default_matmul_precision": None,
+              "jax_disable_jit": False,
+              "jax_numpy_dtype_promotion": "standard",
+              "jax_numpy_rank_promotion": "allow",
+              "jax_random_seed_offset": 0,
+              "jax_threefry_partitionable": True,
+              "jax_default_prng_impl": "threefry2x32",
+          }
+          runner_environment = os.environ.get("RUNNER_ENVIRONMENT")
+          runner_os = os.environ.get("RUNNER_OS")
+          runner_arch = os.environ.get("RUNNER_ARCH")
+          macos_version = platform.mac_ver()[0]
+          require(sys.flags.optimize == 0, "Python optimized mode is forbidden")
+          require(os.environ.get("PYTHONOPTIMIZE") == "0", "PYTHONOPTIMIZE must be zero")
+          require(runner_environment == "github-hosted", "runner must be GitHub-hosted")
+          require(runner_os == "macOS", "runner OS must be macOS")
+          require(runner_arch == "ARM64", "runner architecture must be ARM64")
+          require(platform.python_implementation() == "CPython", "CPython is required")
+          require(platform.python_version() == "3.12.12", "Python 3.12.12 is required")
+          require(platform.system() == "Darwin", "Darwin is required")
+          require(platform.machine() == "arm64", "arm64 is required")
+          require(platform.release().split(".", maxsplit=1)[0] == "23", "Darwin 23 is required")
+          require(macos_version.startswith("14."), "macOS 14 is required")
+          package_versions = {
+              name: importlib.metadata.version(name) for name in expected
+          }
+          require(package_versions == expected, "locked package versions differ")
+          devices = jax.devices()
+          require(jax.default_backend() == "cpu", "JAX backend must be CPU")
+          require(len(devices) == 1, "exactly one JAX device is required")
+          require(devices[0].platform == "cpu", "JAX device must be CPU")
+          jax_config = {
+              "jax_enable_x64": bool(jax.config.jax_enable_x64),
+              "jax_default_matmul_precision": (
+                  None
+                  if jax.config.jax_default_matmul_precision is None
+                  else str(jax.config.jax_default_matmul_precision)
+              ),
+              "jax_disable_jit": bool(jax.config.jax_disable_jit),
+              "jax_numpy_dtype_promotion": str(jax.config.jax_numpy_dtype_promotion),
+              "jax_numpy_rank_promotion": str(jax.config.jax_numpy_rank_promotion),
+              "jax_random_seed_offset": int(jax.config.jax_random_seed_offset),
+              "jax_threefry_partitionable": bool(
+                  jax.config.jax_threefry_partitionable
+              ),
+              "jax_default_prng_impl": str(jax.config.jax_default_prng_impl),
+          }
+          require(jax_config == expected_jax_config, "JAX semantic config differs")
+          destination = Path(sys.argv[2])
+          destination.parent.mkdir(parents=True, exist_ok=True)
+          encoded = (
+              json.dumps(
+                  {
+                      "schema": "asi.ipmnist_prereg.runner.v2",
+                      "runner_label": "macos-14",
+                      "runner_environment": runner_environment,
+                      "runner_os": runner_os,
+                      "runner_arch": runner_arch,
+                      "cpu_brand": sys.argv[1],
+                      "platform": {
+                          "system": platform.system(),
+                          "release": platform.release(),
+                          "machine": platform.machine(),
+                      },
+                      "macos_version": macos_version,
+                      "machine": platform.machine(),
+                      "python": platform.python_version(),
+                      "python_optimization_level": sys.flags.optimize,
+                      "python_optimize_environment": os.environ.get("PYTHONOPTIMIZE"),
+                      "packages": expected,
+                      "jax_backend": jax.default_backend(),
+                      "jax_config": jax_config,
+                      "jax_devices": [
+                          {
+                              "id": int(device.id),
+                              "platform": device.platform,
+                              "device_kind": device.device_kind,
+                              "process_index": int(device.process_index),
+                          }
+                          for device in devices
+                      ],
+                  },
+                  allow_nan=False,
+                  indent=2,
+                  sort_keys=True,
+              )
+              + "\n"
+          )
+          with destination.open("x", encoding="utf-8") as stream:
+              stream.write(encoded)
+          PY
+
+      - name: Recheck authorization and reconstruct prerequisites after sync
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PROTOCOL: ${{ inputs.protocol }}
+          SOURCE: ${{ inputs.launch_sha }}
+          TREE: ${{ steps.identity.outputs.tree }}
+          UV_LOCK_SHA256: ${{ steps.identity.outputs.uv_lock_sha256 }}
+          WORKFLOW_BLOB_SHA1: ${{ steps.identity.outputs.workflow_blob_sha1 }}
+          DRIVER_BLOB_SHA1: ${{ steps.identity.outputs.driver_blob_sha1 }}
+        run: |
+          set -euo pipefail
+          metadata="$RUNNER_TEMP/prereg-metadata/launch-preflight.json"
+          uv run --no-sync python .github/scripts/ipmnist_prereg.py preflight \
+            --protocol "$PROTOCOL" \
+            --repository "$GITHUB_REPOSITORY" \
+            --source "$SOURCE" \
+            --tree "$TREE" \
+            --uv-lock-sha256 "$UV_LOCK_SHA256" \
+            --workflow-blob-sha1 "$WORKFLOW_BLOB_SHA1" \
+            --driver-blob-sha1 "$DRIVER_BLOB_SHA1" \
+            --ref-name "$GITHUB_REF_NAME" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --root "$GITHUB_WORKSPACE" \
+            --owner-authorization \
+              "$RUNNER_TEMP/prereg-metadata/owner-authorization.json" \
+            --output "$metadata"
+
+      - name: Run code-only preregistration preflight tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv run --no-sync python -m pytest \
+            tests/test_ipmnist_prereg_workflow.py \
+            tests/test_ipmnist_screening.py \
+            -q \
+            -o addopts="" \
+            --strict-config \
+            --strict-markers \
+            -k "ipmnist_prereg or TestRLSHead or TestShiftNorm or TestShardsAndMerge"
+
+      - name: Materialize and hash the canonical MNIST cache
+        shell: bash
+        run: |
+          set -euo pipefail
+          data_home="$RUNNER_TEMP/openml-cache"
+          uv run --no-sync python - "$data_home" <<'PY'
+          import hashlib
+          import os
+          import sys
+          from pathlib import Path
+
+          from alberta_framework.benchmarks.upgd_ipmnist import load_mnist_train
+          from alberta_framework.evaluation.upgd_ipmnist_nonpromoting import (
+              MNIST_CACHE_RELATIVE_PATH,
+              MNIST_CACHE_SHA256,
+          )
+
+          data_home = Path(sys.argv[1])
+          x, y = load_mnist_train(data_home)
+          if sys.flags.optimize != 0 or os.environ.get("PYTHONOPTIMIZE") != "0":
+              raise RuntimeError("Python optimized mode is forbidden for dataset validation")
+          if x.shape != (60_000, 784) or y.shape != (60_000,):
+              raise RuntimeError(f"unexpected canonical MNIST shapes: {x.shape}, {y.shape}")
+          cache = data_home / MNIST_CACHE_RELATIVE_PATH
+          raw = cache.read_bytes()
+          if len(raw) != 15_469_256:
+              raise RuntimeError(f"unexpected canonical MNIST cache size: {len(raw)}")
+          if hashlib.sha256(raw).hexdigest() != MNIST_CACHE_SHA256:
+              raise RuntimeError("canonical MNIST cache digest mismatch")
+          PY
+
+      - name: Run the frozen arms sequentially and merge once
+        id: measurement
+        shell: bash
+        env:
+          PROTOCOL: ${{ inputs.protocol }}
+        run: |
+          set -euo pipefail
+          case "$PROTOCOL" in
+            issue51)
+              namespace="replication_r1"
+              control="sigma0_shiftnorm_d099"
+              candidate="rls_head_resid_l1_preset005"
+              seeds=(0 1 2)
+              summary="summary.json"
+              ;;
+            issue184)
+              namespace="rls_preset_ablation_r1"
+              control="rls_head_resid_l1_preset005"
+              candidate="rls_head_resid_l1_noreset"
+              seeds=(0 1 2)
+              summary="summary.json"
+              ;;
+            issue188)
+              namespace="gate_ablation_r3"
+              control="rls_head_resid_l1_preset005"
+              candidate="rls_head_resid_l1_preset005_nogate"
+              seeds=(3 4 5 6 7 8 9 10 11 12)
+              summary="summary_resid_gate_ablation_r3.json"
+              ;;
+            *) echo "unsupported protocol" >&2; exit 1 ;;
+          esac
+          data_home="$RUNNER_TEMP/openml-cache"
+          output_root="outputs/ipmnist_screening/$namespace"
+          shards_dir="$output_root/shards"
+          logs_dir="$RUNNER_TEMP/prereg-metadata/logs"
+          mkdir -p "$shards_dir" "$logs_dir"
+          shard_args=()
+          for seed in "${seeds[@]}"; do
+            for arm in "$control" "$candidate"; do
+              shard="$shards_dir/${arm}_seed${seed}.json"
+              log="$logs_dir/${arm}_seed${seed}.log"
+              uv run --no-sync python -m \
+                alberta_framework.benchmarks.ipmnist_screening run \
+                --config-name "$arm" \
+                --seed "$seed" \
+                --n-tasks 60 \
+                --task-length 5000 \
+                --data-home "$data_home" \
+                --noise-mode step \
+                --progress-every 10 \
+                --out "$shard" \
+                2>&1 | tee "$log"
+              shard_args+=("$shard")
+            done
+          done
+          uv run --no-sync python -m \
+            alberta_framework.benchmarks.ipmnist_screening merge \
+            --shards "${shard_args[@]}" \
+            --control-name "$control" \
+            --slope-window 15 \
+            --output "$output_root/$summary" \
+            2>&1 | tee "$logs_dir/merge.log"
+          {
+            echo "namespace=$namespace"
+            echo "summary=$summary"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Independently validate exact coverage, provenance, and frozen outcome
+        shell: bash
+        env:
+          PROTOCOL: ${{ inputs.protocol }}
+          SOURCE: ${{ inputs.launch_sha }}
+          TREE: ${{ steps.identity.outputs.tree }}
+          UV_LOCK_SHA256: ${{ steps.identity.outputs.uv_lock_sha256 }}
+        run: |
+          set -euo pipefail
+          result="$RUNNER_TEMP/prereg-metadata/result-validation.json"
+          uv run --no-sync python .github/scripts/ipmnist_prereg.py validate \
+            --protocol "$PROTOCOL" \
+            --root "$GITHUB_WORKSPACE" \
+            --runner-receipt "$RUNNER_TEMP/prereg-metadata/runner.json" \
+            --source "$SOURCE" \
+            --tree "$TREE" \
+            --uv-lock-sha256 "$UV_LOCK_SHA256" \
+            --output "$result"
+          {
+            echo "## Permanently nonpromoting IPMNIST result"
+            echo
+            echo "- Protocol: $PROTOCOL"
+            echo "- Source: $SOURCE"
+            echo "- Outcome: $(uv run --no-sync python -c 'import json,sys; print(json.load(open(sys.argv[1]))["outcome"])' "$result")"
+            echo "- Validation metadata: result-validation.json"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Seal a committed-ready completion record
+        shell: bash
+        env:
+          PROTOCOL: ${{ inputs.protocol }}
+        run: |
+          set -euo pipefail
+          uv run --no-sync python .github/scripts/ipmnist_prereg.py seal \
+            --protocol "$PROTOCOL" \
+            --root "$GITHUB_WORKSPACE" \
+            --launch-preflight "$RUNNER_TEMP/prereg-metadata/launch-preflight.json" \
+            --result-validation "$RUNNER_TEMP/prereg-metadata/result-validation.json" \
+            --runner-receipt "$RUNNER_TEMP/prereg-metadata/runner.json"
+
+      - name: Upload 90-day result or partial recovery bundle
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ipmnist-${{ inputs.protocol }}-${{ inputs.launch_sha }}-${{ github.run_id }}
+          path: |
+            ${{ steps.protocol.outputs.output_root }}
+            ${{ runner.temp }}/prereg-metadata
+          if-no-files-found: warn
+          retention-days: 90

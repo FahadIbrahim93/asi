@@ -11,15 +11,21 @@ correction terms that are still separate from this shared-trunk backend.
 from __future__ import annotations
 
 import functools
+import math
+import operator
 import time
-from typing import Any, cast
+from collections.abc import Mapping
+from typing import Any, SupportsIndex, cast
 
 import chex
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import Array
-from jaxtyping import Float
+from jaxtyping import Bool, Float, Int
 
+from alberta_framework.core._float32_scalars import validated_float32_scalar
+from alberta_framework.core.learners import _update_from_gradient_with_diagnostics
 from alberta_framework.core.multi_head_learner import (
     AnyOptimizer,
     MultiHeadMLPLearner,
@@ -29,11 +35,129 @@ from alberta_framework.core.normalizers import (
     EMANormalizerState,
     Normalizer,
     WelfordNormalizerState,
-    _checked_lifetime_words_increment,
     _saturating_int32_counter_increment,
 )
 from alberta_framework.core.optimizers import LMS, Bounder
 from alberta_framework.core.types import HordeSpec, MLPParams, TraceMode
+from alberta_framework.core.update_safety import (
+    floating_tree_is_finite as _floating_tree_is_finite,
+)
+
+_INT32_MAX = 2**31 - 1
+_ACTUAL_INT_TYPES = frozenset(
+    {
+        int,
+        np.int8,
+        np.int16,
+        np.int32,
+        np.int64,
+        np.uint8,
+        np.uint16,
+        np.uint32,
+        np.uint64,
+        np.longlong,
+        np.ulonglong,
+    }
+)
+_TRUSTED_REAL_TYPES = (
+    _ACTUAL_INT_TYPES | frozenset(np.dtype(code).type for code in ("e", "f", "d", "g")) | {float}
+)
+
+
+def _require_int32(name: str, value: object, *, minimum: int, maximum: int = _INT32_MAX) -> int:
+    if type(value) not in _ACTUAL_INT_TYPES:
+        raise ValueError(f"{name} must be an integer in [{minimum}, {maximum}]")
+    canonical = operator.index(cast(SupportsIndex, value))
+    if not minimum <= canonical <= maximum:
+        raise ValueError(f"{name} must be an integer in [{minimum}, {maximum}]")
+    return canonical
+
+
+def _require_float32(name: str, value: object, **bounds: Any) -> float:
+    if type(value) not in _TRUSTED_REAL_TYPES:
+        raise ValueError(f"{name} must be a finite real scalar")
+    return validated_float32_scalar(name, value, **bounds)
+
+
+def _require_positive_clip(name: str, value: object) -> float:
+    """Positive float32 clip that keeps +inf legal as the no-clip sentinel.
+
+    The Baird counterexample tests drive the learner with effectively
+    infinite clips; rejecting +inf breaks that documented usage.
+    """
+    if type(value) is float and math.isinf(value) and value > 0.0:
+        return value
+    return _require_float32(name, value, positive=True)
+
+
+def _preflight_nonlinear_state(*, n_demons: int, hidden_size: int, feature_dim: int) -> None:
+    hidden_features = hidden_size * feature_dim
+    demon_hidden_features = n_demons * hidden_features
+    demon_hidden = n_demons * hidden_size
+    float_scalars = (
+        hidden_features * (n_demons + 1) + hidden_size + 3 * demon_hidden + 2 * n_demons + 2
+    )
+    logical_scalars = float_scalars + 1
+    for name, value in (
+        ("trunk weight scalars", hidden_features),
+        ("secondary trunk weight scalars", demon_hidden_features),
+        ("demon-hidden scalars", demon_hidden),
+        ("persistent state scalars", logical_scalars),
+        ("persistent state bytes", 4 * logical_scalars),
+    ):
+        if not 1 <= value <= _INT32_MAX:
+            raise ValueError(f"derived nonlinear Horde {name} must fit signed int32")
+
+
+def _require_typed_threefry_key(name: str, value: object) -> Array:
+    """Reject legacy or non-Threefry keys before random operations."""
+    if not isinstance(value, jax.Array) or tuple(value.shape) != ():
+        raise ValueError(f"{name} must be a typed scalar threefry2x32 key")
+    try:
+        implementation = str(jax.random.key_impl(value))
+        words = jax.random.key_data(value)
+    except Exception as error:
+        raise ValueError(f"{name} must be a typed scalar threefry2x32 key") from error
+    if implementation != "threefry2x32" or tuple(words.shape) != (2,):
+        raise ValueError(f"{name} must be a typed scalar threefry2x32 key")
+    return value
+
+
+def _stable_l2_norm(*values: Array) -> Array:
+    """Compute a joint float32 L2 norm without squaring at the input scale."""
+    scale = jnp.asarray(0.0, dtype=jnp.float32)
+    for value in values:
+        scale = jnp.maximum(scale, jnp.max(jnp.abs(value), initial=0.0))
+    square_sum = jnp.asarray(0.0, dtype=jnp.float32)
+    for value in values:
+        normalized = jnp.where(scale > 0.0, value / scale, jnp.zeros_like(value))
+        square_sum = square_sum + jnp.sum(jnp.square(normalized))
+    return scale * jnp.sqrt(square_sum)
+
+
+def _skip_zero_scale(scale: Array, value: Array) -> Array:
+    """Return 0 when ``scale`` is 0 so a 0*inf product cannot form."""
+    return jnp.where(scale == 0.0, jnp.zeros_like(value), scale * value)
+
+
+def _report_demon_values(
+    values: Array,
+    requested: Array,
+    updates_applied: Array,
+) -> Array:
+    """Preserve inactive NaN sentinels and neutralize rejected demons."""
+    mask_shape = (requested.shape[0],) + (1,) * (values.ndim - 1)
+    requested_mask = jnp.reshape(requested, mask_shape)
+    applied_mask = jnp.reshape(updates_applied, mask_shape)
+    return jnp.where(
+        applied_mask,
+        values,
+        jnp.where(
+            requested_mask,
+            jnp.zeros_like(values),
+            jnp.full_like(values, jnp.nan),
+        ),
+    )
 
 
 def _extract_mean_step_size(opt_state: Any) -> Array:
@@ -76,6 +200,8 @@ class OffPolicyHordeUpdateResult:
     trace_coefficients: Float[Array, " n_demons"]
     per_demon_metrics: Float[Array, "n_demons 6"]
     trunk_bounding_metric: Float[Array, ""]
+    head_updates_applied: Bool[Array, " n_demons"]
+    update_applied: Bool[Array, ""]
 
 
 @chex.dataclass(frozen=True)
@@ -86,6 +212,8 @@ class OffPolicyHordeLearningResult:
     per_demon_metrics: Float[Array, "num_steps n_demons 6"]
     td_errors: Float[Array, "num_steps n_demons"]
     clipped_rhos: Float[Array, "num_steps n_demons"]
+    head_updates_applied: Bool[Array, "num_steps n_demons"]
+    updates_applied: Bool[Array, " num_steps"]
 
 
 @chex.dataclass(frozen=True)
@@ -106,9 +234,9 @@ class NonlinearSharedGTDHordeState:
     secondary_trunk_b: Float[Array, "n_demons hidden_dim"]
     secondary_head_w: Float[Array, "n_demons hidden_dim"]
     secondary_head_b: Float[Array, " n_demons"]
-    step_count: Float[Array, ""]
-    birth_timestamp: float = 0.0
-    uptime_s: float = 0.0
+    step_count: Int[Array, ""]
+    birth_timestamp: Float[Array, ""]
+    uptime_s: Float[Array, ""]
 
 
 @chex.dataclass(frozen=True)
@@ -123,6 +251,8 @@ class NonlinearSharedGTDHordeUpdateResult:
     clipped_rhos: Float[Array, " n_demons"]
     correction_norms: Float[Array, " n_demons"]
     secondary_norms: Float[Array, " n_demons"]
+    head_updates_applied: Bool[Array, " n_demons"]
+    update_applied: Bool[Array, ""]
 
 
 @chex.dataclass(frozen=True)
@@ -205,17 +335,11 @@ class OffPolicyHordeLearner:
             trace_ratio_clip: Clip for the eligibility-trace ratio.
             min_behavior_probability: Denominator floor for probability API.
         """
-        if ratio_clip <= 0.0:
-            raise ValueError(f"ratio_clip must be positive; got {ratio_clip}")
-        if trace_ratio_clip <= 0.0:
-            raise ValueError(
-                f"trace_ratio_clip must be positive; got {trace_ratio_clip}"
-            )
-        if min_behavior_probability <= 0.0:
-            raise ValueError(
-                "min_behavior_probability must be positive; "
-                f"got {min_behavior_probability}"
-            )
+        ratio_clip = _require_positive_clip("ratio_clip", ratio_clip)
+        trace_ratio_clip = _require_positive_clip("trace_ratio_clip", trace_ratio_clip)
+        min_behavior_probability = _require_float32(
+            "min_behavior_probability", min_behavior_probability, positive=True
+        )
 
         self._horde_spec = horde_spec
         self._hidden_sizes = hidden_sizes
@@ -286,7 +410,6 @@ class OffPolicyHordeLearner:
     def predict(self, state: MultiHeadMLPState, observation: Array) -> Array:
         """Predict all demon values for one observation."""
         return self._learner.predict(state, observation)  # type: ignore[no-any-return]
-
 
     def update(
         self,
@@ -362,6 +485,7 @@ class OffPolicyHordeLearner:
         """Update using explicit ratios and transition discounts."""
         n_demons = self.n_demons
         replacing = self._trace_mode == TraceMode.REPLACING
+        counter_status = self._learner._counter_status(state)
 
         rhos = jnp.asarray(rhos, dtype=jnp.float32)
         discounts = jnp.asarray(discounts, dtype=jnp.float32)
@@ -375,18 +499,69 @@ class OffPolicyHordeLearner:
         )
 
         next_predictions = self._learner.predict(state, next_observation)
-        td_targets = cumulants + discounts * next_predictions
-        active_mask = ~jnp.isnan(td_targets)
+        zero_discount_mask = discounts == 0.0
+        bootstrap_predictions = jnp.where(
+            zero_discount_mask,
+            jnp.zeros_like(next_predictions),
+            next_predictions,
+        )
+        td_targets = cumulants + discounts * bootstrap_predictions
+        requested_mask = ~jnp.isnan(cumulants)
+        checked_state = state
+        if self._utility_decay == 0.0:
+            checked_state = checked_state.replace(  # type: ignore[attr-defined]
+                hidden_unit_utilities=tuple(
+                    jnp.zeros_like(utility) for utility in state.hidden_unit_utilities
+                )
+            )
+        if replacing:
+            checked_state = checked_state.replace(  # type: ignore[attr-defined]
+                trunk_traces=tuple(jnp.zeros_like(trace) for trace in state.trunk_traces),
+            )
+        lamdas = self._horde_spec.lamdas
+        head_decay_unused = jnp.all(
+            (discounts == 0.0) | (jnp.asarray(lamdas, dtype=jnp.float32) == 0.0)
+        )
+        checked_state = checked_state.replace(  # type: ignore[attr-defined]
+            head_traces=tuple(
+                (
+                    jnp.where(head_decay_unused, jnp.zeros_like(old_w), old_w),
+                    jnp.where(head_decay_unused, jnp.zeros_like(old_b), old_b),
+                )
+                for old_w, old_b in state.head_traces
+            )
+        )
+        source_state_finite = _floating_tree_is_finite(checked_state)
+        global_inputs_valid = jnp.all(jnp.isfinite(observation))
+        next_observation_valid = jnp.all(jnp.isfinite(next_observation))
+        head_inputs_valid = (
+            requested_mask
+            & jnp.isfinite(cumulants)
+            & jnp.isfinite(rhos)
+            & jnp.isfinite(discounts)
+            & (discounts >= 0.0)
+            & (discounts <= 1.0)
+            & (zero_discount_mask | (next_observation_valid & jnp.isfinite(next_predictions)))
+            & jnp.isfinite(td_targets)
+        )
+        active_mask = head_inputs_valid & global_inputs_valid & source_state_finite
         safe_targets = jnp.where(active_mask, td_targets, 0.0)
+        safe_clipped_rhos = jnp.where(active_mask, clipped_rhos, 0.0)
+        safe_trace_coefficients = jnp.where(active_mask, trace_coefficients, 0.0)
+        safe_discounts = jnp.where(active_mask, discounts, 0.0)
 
         obs = observation
         new_normalizer_state = state.normalizer_state
+        normalizer_update_applied = jnp.asarray(True, dtype=jnp.bool_)
         if self._normalizer is not None and state.normalizer_state is not None:
             normalizer: Any = self._normalizer
-            obs, new_normalizer_state = normalizer.normalize(
+            normalizer_result = normalizer.normalize_with_diagnostics(
                 state.normalizer_state,
                 observation,
             )
+            obs = normalizer_result.normalized
+            new_normalizer_state = normalizer_result.state
+            normalizer_update_applied = normalizer_result.update_applied
 
         slope = self._leaky_relu_slope
         use_layer_norm = self._use_layer_norm
@@ -429,16 +604,12 @@ class OffPolicyHordeLearner:
             )
             td_error_i = safe_targets[i] - pred_i
             masked_td_error_i = jnp.where(active_mask[i], td_error_i, 0.0)
-            effective_error_i = clipped_rhos[i] * masked_td_error_i
+            effective_error_i = safe_clipped_rhos[i] * masked_td_error_i
 
             predictions_list.append(pred_i)
-            td_errors_list.append(
-                jnp.where(active_mask[i], td_error_i, jnp.nan)
-            )
+            td_errors_list.append(jnp.where(active_mask[i], td_error_i, jnp.nan))
             masked_td_errors_list.append(masked_td_error_i)
-            cotangent = cotangent + effective_error_i * jnp.squeeze(
-                state.head_params.weights[i]
-            )
+            cotangent = cotangent + effective_error_i * jnp.squeeze(state.head_params.weights[i])
 
         predictions = jnp.stack(predictions_list)
         td_errors = jnp.stack(td_errors_list)
@@ -456,45 +627,50 @@ class OffPolicyHordeLearner:
             )
             utility_signal = jnp.abs(activations[i] * trunk_bias_grads[i])
             new_hidden_unit_utilities.append(
-                utility_decay * old_utility
+                _skip_zero_scale(utility_decay, old_utility)
                 + (1.0 - utility_decay) * utility_signal
             )
 
         new_trunk_traces: list[Array] = []
         trunk_steps: list[Array] = []
         new_trunk_opt_states: list[Any] = []
+        optimizer_updates_applied: list[Array] = []
         n_trunk_layers = len(state.trunk_params.weights)
 
         for i in range(n_trunk_layers):
             w_grad_i = trunk_weight_grads[i]
             old_w_trace = state.trunk_traces[2 * i]
             if replacing:
-                new_w_trace = jnp.where(w_grad_i != 0.0, w_grad_i, old_w_trace * 0.0)
+                new_w_trace = jnp.where(w_grad_i != 0.0, w_grad_i, jnp.zeros_like(old_w_trace))
             else:
                 new_w_trace = w_grad_i
             new_trunk_traces.append(new_w_trace)
-            w_step, new_w_opt = self._optimizer.update_from_gradient(
+            w_step, new_w_opt, w_update_applied = _update_from_gradient_with_diagnostics(
+                self._optimizer,
                 state.trunk_optimizer_states[2 * i],
                 new_w_trace,
                 error=None,
             )
             trunk_steps.append(w_step)
             new_trunk_opt_states.append(new_w_opt)
+            optimizer_updates_applied.append(w_update_applied)
 
             b_grad_i = trunk_bias_grads[i]
             old_b_trace = state.trunk_traces[2 * i + 1]
             if replacing:
-                new_b_trace = jnp.where(b_grad_i != 0.0, b_grad_i, old_b_trace * 0.0)
+                new_b_trace = jnp.where(b_grad_i != 0.0, b_grad_i, jnp.zeros_like(old_b_trace))
             else:
                 new_b_trace = b_grad_i
             new_trunk_traces.append(new_b_trace)
-            b_step, new_b_opt = self._optimizer.update_from_gradient(
+            b_step, new_b_opt, b_update_applied = _update_from_gradient_with_diagnostics(
+                self._optimizer,
                 state.trunk_optimizer_states[2 * i + 1],
                 new_b_trace,
                 error=None,
             )
             trunk_steps.append(b_step)
             new_trunk_opt_states.append(new_b_opt)
+            optimizer_updates_applied.append(b_update_applied)
 
         trunk_bounding_metric = jnp.array(1.0, dtype=jnp.float32)
         if self._bounder is not None and n_trunk_layers > 0:
@@ -513,12 +689,8 @@ class OffPolicyHordeLearner:
         new_trunk_weights: list[Array] = []
         new_trunk_biases: list[Array] = []
         for i in range(n_trunk_layers):
-            new_trunk_weights.append(
-                state.trunk_params.weights[i] + trunk_steps[2 * i]
-            )
-            new_trunk_biases.append(
-                state.trunk_params.biases[i] + trunk_steps[2 * i + 1]
-            )
+            new_trunk_weights.append(state.trunk_params.weights[i] + trunk_steps[2 * i])
+            new_trunk_biases.append(state.trunk_params.biases[i] + trunk_steps[2 * i + 1])
 
         new_trunk_params = MLPParams(
             weights=tuple(new_trunk_weights),
@@ -530,6 +702,7 @@ class OffPolicyHordeLearner:
         new_head_traces: list[tuple[Array, Array]] = []
         new_head_opt_states: list[tuple[Any, Any]] = []
         per_demon_metrics: list[Array] = []
+        head_candidates_finite: list[Array] = []
         head_optimizer = self._head_optimizer or self._optimizer
         lamdas = self._horde_spec.lamdas
 
@@ -544,36 +717,40 @@ class OffPolicyHordeLearner:
             # (trace-clipped) ratio forward, so ``z = rho (gl z + grad)``
             # when the two clips agree.  The update below is ``delta * z``
             # with no additional ratio.
-            w_grad = clipped_rhos[i] * hidden.reshape(1, -1)
-            b_grad = clipped_rhos[i] * jnp.ones(1, dtype=jnp.float32)
-            head_gl = discounts[i] * lamdas[i] * trace_coefficients[i]
+            safe_hidden = jnp.where(active_mask[i], hidden, jnp.zeros_like(hidden))
+            w_grad = safe_clipped_rhos[i] * safe_hidden.reshape(1, -1)
+            b_grad = safe_clipped_rhos[i] * jnp.ones(1, dtype=jnp.float32)
+            head_gl = safe_discounts[i] * lamdas[i] * safe_trace_coefficients[i]
 
             if replacing:
                 new_w_trace = jnp.where(
                     w_grad != 0.0,
                     w_grad,
-                    head_gl * old_w_trace,
+                    _skip_zero_scale(head_gl, old_w_trace),
                 )
                 new_b_trace = jnp.where(
                     b_grad != 0.0,
                     b_grad,
-                    head_gl * old_b_trace,
+                    _skip_zero_scale(head_gl, old_b_trace),
                 )
             else:
-                new_w_trace = head_gl * old_w_trace + w_grad
-                new_b_trace = head_gl * old_b_trace + b_grad
+                new_w_trace = _skip_zero_scale(head_gl, old_w_trace) + w_grad
+                new_b_trace = _skip_zero_scale(head_gl, old_b_trace) + b_grad
 
             error_i = masked_td_errors[i]
-            w_step, new_w_opt = head_optimizer.update_from_gradient(
+            w_step, new_w_opt, w_update_applied = _update_from_gradient_with_diagnostics(
+                head_optimizer,
                 old_w_opt,
                 new_w_trace,
                 error=error_i,
             )
-            b_step, new_b_opt = head_optimizer.update_from_gradient(
+            b_step, new_b_opt, b_update_applied = _update_from_gradient_with_diagnostics(
+                head_optimizer,
                 old_b_opt,
                 new_b_trace,
                 error=error_i,
             )
+            optimizer_updates_applied.extend((w_update_applied, b_update_applied))
 
             if self._bounder is not None:
                 bounded_head_steps, bound_scale = self._bounder.bound(
@@ -587,18 +764,34 @@ class OffPolicyHordeLearner:
 
             new_w = head_w + error_i * w_step
             new_b = head_b + error_i * b_step
-
-            new_w = jnp.where(active_mask[i], new_w, head_w)
-            new_b = jnp.where(active_mask[i], new_b, head_b)
-            new_w_trace = jnp.where(active_mask[i], new_w_trace, old_w_trace)
-            new_b_trace = jnp.where(active_mask[i], new_b_trace, old_b_trace)
+            # Inf TD error zeros the ObGD step, then error_i * step is 0*inf=NaN.
+            # Hold that head's previous finite params/traces/opt like a NaN cumulant.
+            head_ok = (
+                active_mask[i]
+                & jnp.isfinite(error_i)
+                & _floating_tree_is_finite(
+                    (
+                        new_w,
+                        new_b,
+                        new_w_trace,
+                        new_b_trace,
+                        new_w_opt,
+                        new_b_opt,
+                    )
+                )
+            )
+            head_candidates_finite.append((~active_mask[i]) | head_ok)
+            new_w = jnp.where(head_ok, new_w, head_w)
+            new_b = jnp.where(head_ok, new_b, head_b)
+            new_w_trace = jnp.where(head_ok, new_w_trace, old_w_trace)
+            new_b_trace = jnp.where(head_ok, new_b_trace, old_b_trace)
             new_w_opt = jax.tree.map(
-                lambda new, old: jnp.where(active_mask[i], new, old),
+                lambda new, old: jnp.where(head_ok, new, old),
                 new_w_opt,
                 old_w_opt,
             )
             new_b_opt = jax.tree.map(
-                lambda new, old: jnp.where(active_mask[i], new, old),
+                lambda new, old: jnp.where(head_ok, new, old),
                 new_b_opt,
                 old_b_opt,
             )
@@ -639,7 +832,6 @@ class OffPolicyHordeLearner:
             weights=tuple(new_head_weights),
             biases=tuple(new_head_biases),
         )  # type: ignore[call-arg]
-        next_step_words, _ = _checked_lifetime_words_increment(state.step_words)
         new_state = MultiHeadMLPState(
             trunk_params=new_trunk_params,
             head_params=new_head_params,
@@ -650,22 +842,72 @@ class OffPolicyHordeLearner:
             hidden_unit_utilities=tuple(new_hidden_unit_utilities),
             normalizer_state=new_normalizer_state,
             step_count=_saturating_int32_counter_increment(state.step_count),
-            step_words=next_step_words,
+            step_words=counter_status.proposed_step_words,
             birth_timestamp=state.birth_timestamp,
             uptime_s=state.uptime_s,
         )  # type: ignore[call-arg]
 
+        candidate_state_finite = _floating_tree_is_finite(new_state)
+        all_active_candidates_finite = jnp.all(jnp.stack(head_candidates_finite))
+        has_accepted_work = jnp.any(active_mask) | jnp.all(~requested_mask)
+        update_applied = (
+            counter_status.update_available
+            & global_inputs_valid
+            & source_state_finite
+            & normalizer_update_applied
+            & all_active_candidates_finite
+            & candidate_state_finite
+            & has_accepted_work
+            & jnp.all(jnp.stack(optimizer_updates_applied))
+        )
+        head_updates_applied = active_mask & update_applied
+        committed_state = jax.lax.cond(update_applied, lambda: new_state, lambda: state)
+        raw_metrics = jnp.stack(per_demon_metrics)
+        reported_predictions = jnp.where(
+            update_applied,
+            jnp.where(
+                requested_mask & ~head_updates_applied,
+                jnp.zeros_like(predictions),
+                predictions,
+            ),
+            jnp.zeros_like(predictions),
+        )
+        sanitized_next_predictions = jnp.where(
+            head_updates_applied & zero_discount_mask & ~jnp.isfinite(next_predictions),
+            jnp.zeros_like(next_predictions),
+            next_predictions,
+        )
+        reported_next_predictions = jnp.where(
+            update_applied,
+            jnp.where(
+                requested_mask & ~head_updates_applied,
+                jnp.zeros_like(next_predictions),
+                sanitized_next_predictions,
+            ),
+            jnp.zeros_like(next_predictions),
+        )
+
         return OffPolicyHordeUpdateResult(
-            state=new_state,
-            predictions=predictions,
-            next_predictions=next_predictions,
-            td_targets=td_targets,
-            td_errors=td_errors,
-            rhos=rhos,
-            clipped_rhos=jnp.where(active_mask, clipped_rhos, jnp.nan),
-            trace_coefficients=jnp.where(active_mask, trace_coefficients, jnp.nan),
-            per_demon_metrics=jnp.stack(per_demon_metrics),
-            trunk_bounding_metric=trunk_bounding_metric,
+            state=committed_state,
+            predictions=reported_predictions,
+            next_predictions=reported_next_predictions,
+            td_targets=_report_demon_values(td_targets, requested_mask, head_updates_applied),
+            td_errors=_report_demon_values(td_errors, requested_mask, head_updates_applied),
+            rhos=jnp.where(head_updates_applied, rhos, jnp.zeros_like(rhos)),
+            clipped_rhos=_report_demon_values(clipped_rhos, requested_mask, head_updates_applied),
+            trace_coefficients=_report_demon_values(
+                trace_coefficients, requested_mask, head_updates_applied
+            ),
+            per_demon_metrics=_report_demon_values(
+                raw_metrics, requested_mask, head_updates_applied
+            ),
+            trunk_bounding_metric=jnp.where(
+                update_applied,
+                trunk_bounding_metric,
+                jnp.asarray(0.0, dtype=jnp.float32),
+            ),
+            head_updates_applied=head_updates_applied,
+            update_applied=update_applied,
         )  # type: ignore[call-arg]
 
     def to_config(self) -> dict[str, Any]:
@@ -680,9 +922,7 @@ class OffPolicyHordeLearner:
             "sparsity": self._sparsity,
             "leaky_relu_slope": self._leaky_relu_slope,
             "use_layer_norm": self._use_layer_norm,
-            "head_optimizer": (
-                self._head_optimizer.to_config() if self._head_optimizer else None
-            ),
+            "head_optimizer": (self._head_optimizer.to_config() if self._head_optimizer else None),
             "trace_mode": self._trace_mode.value,
             "utility_decay": self._utility_decay,
             "ratio_clip": self._ratio_clip,
@@ -708,11 +948,7 @@ class OffPolicyHordeLearner:
         normalizer_cfg = config.pop("normalizer", None)
         normalizer = normalizer_from_config(normalizer_cfg) if normalizer_cfg else None
         head_optimizer_cfg = config.pop("head_optimizer", None)
-        head_optimizer = (
-            optimizer_from_config(head_optimizer_cfg)
-            if head_optimizer_cfg
-            else None
-        )
+        head_optimizer = optimizer_from_config(head_optimizer_cfg) if head_optimizer_cfg else None
         trace_mode = TraceMode(config.pop("trace_mode", TraceMode.ACCUMULATING.value))
 
         return cls(
@@ -745,22 +981,42 @@ class NonlinearSharedGTDHordeLearner:
         ratio_clip: float = 10.0,
         init_scale: float = 0.25,
     ) -> None:
-        if hidden_size <= 0:
-            raise ValueError("hidden_size must be positive")
-        if primary_step_size <= 0.0:
-            raise ValueError("primary_step_size must be positive")
-        if secondary_step_size <= 0.0:
-            raise ValueError("secondary_step_size must be positive")
-        if ratio_clip <= 0.0:
-            raise ValueError("ratio_clip must be positive")
-        if init_scale <= 0.0:
-            raise ValueError("init_scale must be positive")
+        if type(horde_spec) is not HordeSpec:
+            raise ValueError("horde_spec must be an exact HordeSpec")
+        if not horde_spec.demons:
+            raise ValueError("horde_spec must contain at least one demon")
+        if type(horde_spec.demons) is not tuple:
+            raise ValueError("horde_spec.demons must be an exact tuple")
+        n_demons = len(horde_spec.demons)
+        for name, value in (
+            ("horde_spec.gammas", horde_spec.gammas),
+            ("horde_spec.lamdas", horde_spec.lamdas),
+        ):
+            if not isinstance(value, jax.Array):
+                raise TypeError(f"{name} must be a JAX array")
+            if tuple(value.shape) != (n_demons,):
+                raise ValueError(f"{name} must have shape ({n_demons},)")
+            if jnp.dtype(value.dtype) != jnp.dtype(jnp.float32):
+                raise TypeError(f"{name} must have dtype float32")
+            host = np.asarray(value)
+            if not bool(np.all(np.isfinite(host))) or not bool(
+                np.all((host >= 0.0) & (host <= 1.0))
+            ):
+                raise ValueError(f"{name} must contain values in [0, 1]")
+        hidden_size = _require_int32("hidden_size", hidden_size, minimum=1)
         self._horde_spec = horde_spec
         self._hidden_size = hidden_size
-        self._primary_step_size = primary_step_size
-        self._secondary_step_size = secondary_step_size
-        self._ratio_clip = ratio_clip
-        self._init_scale = init_scale
+        self._primary_step_size = _require_float32(
+            "primary_step_size", primary_step_size, positive=True
+        )
+        self._secondary_step_size = _require_float32(
+            "secondary_step_size", secondary_step_size, positive=True
+        )
+        self._ratio_clip = _require_positive_clip("ratio_clip", ratio_clip)
+        self._init_scale = _require_float32("init_scale", init_scale, positive=True)
+        _preflight_nonlinear_state(
+            n_demons=len(horde_spec.demons), hidden_size=hidden_size, feature_dim=1
+        )
 
     @property
     def horde_spec(self) -> HordeSpec:
@@ -772,8 +1028,91 @@ class NonlinearSharedGTDHordeLearner:
         """Number of demons."""
         return len(self._horde_spec.demons)
 
+    def to_config(self) -> dict[str, Any]:
+        """Serialize the complete nonlinear Horde construction."""
+        return {
+            "type": self.__class__.__name__,
+            "horde_spec": self._horde_spec.to_config(),
+            "hidden_size": self._hidden_size,
+            "primary_step_size": self._primary_step_size,
+            "secondary_step_size": self._secondary_step_size,
+            "ratio_clip": self._ratio_clip,
+            "init_scale": self._init_scale,
+        }
+
+    @classmethod
+    def from_config(cls, config: Mapping[str, Any]) -> NonlinearSharedGTDHordeLearner:
+        """Reconstruct the exact serialized nonlinear Horde schema."""
+        if not issubclass(type(config), Mapping):
+            raise ValueError("config must be an actual mapping")
+        try:
+            payload = dict(config)
+        except Exception as error:
+            raise ValueError("config must be a readable mapping") from error
+        expected = {
+            "type",
+            "horde_spec",
+            "hidden_size",
+            "primary_step_size",
+            "secondary_step_size",
+            "ratio_clip",
+            "init_scale",
+        }
+        if any(type(key) is not str for key in payload) or set(payload) != expected:
+            raise ValueError("config fields do not match the serialized schema")
+        marker = payload.pop("type")
+        if type(marker) is not str or marker != cls.__name__:
+            raise ValueError("config type differs")
+        raw_horde = payload.pop("horde_spec")
+        if type(raw_horde) is not dict or set(raw_horde) != {"demons"}:
+            raise ValueError("serialized horde_spec does not match its schema")
+        if type(raw_horde["demons"]) is not list:
+            raise ValueError("serialized horde_spec demons must be an exact list")
+        demon_fields = {
+            "name",
+            "demon_type",
+            "gamma",
+            "lamda",
+            "cumulant_index",
+            "terminal_reward",
+        }
+        for demon in raw_horde["demons"]:
+            if (
+                type(demon) is not dict
+                or any(type(key) is not str for key in demon)
+                or set(demon) != demon_fields
+            ):
+                raise ValueError("serialized demon does not match the exact schema")
+            if (
+                type(demon["name"]) is not str
+                or type(demon["demon_type"]) is not str
+                or type(demon["cumulant_index"]) is not int
+                or any(
+                    type(demon[name]) is not float for name in ("gamma", "lamda", "terminal_reward")
+                )
+            ):
+                raise ValueError("serialized demon scalar types must be exact JSON values")
+        if type(payload["hidden_size"]) is not int or any(
+            type(payload[name]) is not float
+            for name in (
+                "primary_step_size",
+                "secondary_step_size",
+                "ratio_clip",
+                "init_scale",
+            )
+        ):
+            raise ValueError("serialized scalar fields must be exact JSON numbers")
+        return cls(horde_spec=HordeSpec.from_config(raw_horde), **payload)
+
     def init(self, feature_dim: int, key: Array) -> NonlinearSharedGTDHordeState:
         """Initialize primary and secondary weights."""
+        feature_dim = _require_int32("feature_dim", feature_dim, minimum=1)
+        key = _require_typed_threefry_key("key", key)
+        _preflight_nonlinear_state(
+            n_demons=self.n_demons,
+            hidden_size=self._hidden_size,
+            feature_dim=feature_dim,
+        )
         trunk_key, head_key = jax.random.split(key)
         trunk_w = self._init_scale * jax.random.normal(
             trunk_key,
@@ -785,7 +1124,7 @@ class NonlinearSharedGTDHordeLearner:
             (self.n_demons, self._hidden_size),
             dtype=jnp.float32,
         )
-        return NonlinearSharedGTDHordeState(  # type: ignore[call-arg]
+        state = NonlinearSharedGTDHordeState(  # type: ignore[call-arg]
             trunk_w=trunk_w,
             trunk_b=jnp.zeros(self._hidden_size, dtype=jnp.float32),
             head_w=head_w,
@@ -804,13 +1143,66 @@ class NonlinearSharedGTDHordeLearner:
             ),
             secondary_head_b=jnp.zeros(self.n_demons, dtype=jnp.float32),
             step_count=jnp.array(0, dtype=jnp.int32),
-            birth_timestamp=time.time(),
-            uptime_s=0.0,
+            birth_timestamp=jnp.asarray(time.time(), dtype=jnp.float32),
+            uptime_s=jnp.asarray(0.0, dtype=jnp.float32),
         )
+        if not bool(_floating_tree_is_finite(state)):
+            raise ValueError("initialized nonlinear Horde state must be finite")
+        return state
+
+    def _validate_state_static_contract(self, state: NonlinearSharedGTDHordeState) -> int:
+        """Return feature_dim after rejecting malformed adopted state metadata."""
+        if type(state) is not NonlinearSharedGTDHordeState:
+            raise TypeError("state must be a NonlinearSharedGTDHordeState")
+        if not isinstance(state.trunk_w, jax.Array):
+            raise TypeError("state.trunk_w must be a JAX array")
+        shape = tuple(state.trunk_w.shape)
+        if len(shape) != 2 or shape[0] != self._hidden_size or shape[1] < 1:
+            raise ValueError("state.trunk_w has an invalid shape")
+        feature_dim = int(shape[1])
+        d = self.n_demons
+        h = self._hidden_size
+        expected = (
+            ("state.trunk_w", state.trunk_w, (h, feature_dim), jnp.float32),
+            ("state.trunk_b", state.trunk_b, (h,), jnp.float32),
+            ("state.head_w", state.head_w, (d, h), jnp.float32),
+            ("state.head_b", state.head_b, (d,), jnp.float32),
+            (
+                "state.secondary_trunk_w",
+                state.secondary_trunk_w,
+                (d, h, feature_dim),
+                jnp.float32,
+            ),
+            ("state.secondary_trunk_b", state.secondary_trunk_b, (d, h), jnp.float32),
+            ("state.secondary_head_w", state.secondary_head_w, (d, h), jnp.float32),
+            ("state.secondary_head_b", state.secondary_head_b, (d,), jnp.float32),
+            ("state.step_count", state.step_count, (), jnp.int32),
+            ("state.birth_timestamp", state.birth_timestamp, (), jnp.float32),
+            ("state.uptime_s", state.uptime_s, (), jnp.float32),
+        )
+        for name, value, expected_shape, dtype in expected:
+            if not isinstance(value, jax.Array):
+                raise TypeError(f"{name} must be a JAX array")
+            if tuple(value.shape) != expected_shape:
+                raise ValueError(f"{name} has an invalid shape")
+            if jnp.dtype(value.dtype) != jnp.dtype(dtype):
+                raise TypeError(f"{name} has an invalid dtype")
+        return feature_dim
+
+    @staticmethod
+    def _state_is_valid(state: NonlinearSharedGTDHordeState) -> Bool[Array, ""]:
+        return _floating_tree_is_finite(state) & (state.step_count >= 0)
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def predict(self, state: NonlinearSharedGTDHordeState, observation: Array) -> Array:
         """Predict all demon values for one observation."""
+        feature_dim = self._validate_state_static_contract(state)
+        if not isinstance(observation, jax.Array):
+            raise TypeError("observation must be a JAX array")
+        if tuple(observation.shape) != (feature_dim,):
+            raise ValueError(f"observation must have shape ({feature_dim},)")
+        if jnp.dtype(observation.dtype) != jnp.dtype(jnp.float32):
+            raise TypeError("observation must have dtype float32")
         hidden = jnp.tanh(state.trunk_w @ observation + state.trunk_b)
         return state.head_w @ hidden + state.head_b
 
@@ -825,13 +1217,53 @@ class NonlinearSharedGTDHordeLearner:
         discounts: Array,
     ) -> NonlinearSharedGTDHordeUpdateResult:
         """Update with explicit per-demon ratios and discounts."""
+        feature_dim = self._validate_state_static_contract(state)
+        for name, value, shape in (
+            ("observation", observation, (feature_dim,)),
+            ("cumulants", cumulants, (self.n_demons,)),
+            ("next_observation", next_observation, (feature_dim,)),
+            ("rhos", rhos, (self.n_demons,)),
+            ("discounts", discounts, (self.n_demons,)),
+        ):
+            if not isinstance(value, jax.Array):
+                raise TypeError(f"{name} must be a JAX array")
+            if tuple(value.shape) != shape:
+                raise ValueError(f"{name} must have shape {shape}")
+            if jnp.dtype(value.dtype) != jnp.dtype(jnp.float32):
+                raise TypeError(f"{name} must have dtype float32")
         hidden = jnp.tanh(state.trunk_w @ observation + state.trunk_b)
-        next_hidden = jnp.tanh(state.trunk_w @ next_observation + state.trunk_b)
+        next_observation_valid = jnp.all(jnp.isfinite(next_observation))
+        safe_next_observation = jnp.where(
+            next_observation_valid,
+            next_observation,
+            jnp.zeros_like(next_observation),
+        )
+        next_hidden = jnp.tanh(state.trunk_w @ safe_next_observation + state.trunk_b)
         predictions = state.head_w @ hidden + state.head_b
         next_predictions = state.head_w @ next_hidden + state.head_b
-        td_targets = cumulants + discounts * next_predictions
+        zero_discount_mask = discounts == 0.0
+        bootstrap_predictions = jnp.where(
+            zero_discount_mask,
+            jnp.zeros_like(next_predictions),
+            next_predictions,
+        )
+        td_targets = cumulants + discounts * bootstrap_predictions
         td_errors = td_targets - predictions
-        active_mask = ~jnp.isnan(td_targets)
+        requested = ~jnp.isnan(cumulants)
+        active_mask = (
+            requested
+            & jnp.isfinite(cumulants)
+            & jnp.isfinite(rhos)
+            & (rhos >= 0.0)
+            & jnp.isfinite(discounts)
+            & (discounts >= 0.0)
+            & (discounts <= 1.0)
+            & ((discounts == 0.0) | next_observation_valid)
+            & jnp.isfinite(td_targets)
+        )
+        inputs_valid = jnp.all(jnp.isfinite(observation))
+        source_state_finite = self._state_is_valid(state)
+        effective_mask = active_mask & inputs_valid & source_state_finite
         safe_td_errors = jnp.where(active_mask, td_errors, 0.0)
         clipped_rhos = jnp.minimum(
             jnp.maximum(jnp.asarray(rhos, dtype=jnp.float32), 0.0),
@@ -863,7 +1295,7 @@ class NonlinearSharedGTDHordeLearner:
             next_grad_head_w = next_hidden
             next_grad_head_b = jnp.array(1.0, dtype=jnp.float32)
             next_grad_hidden = state.head_w[i] * next_one_minus_hidden_sq
-            next_grad_trunk_w = next_grad_hidden[:, None] * next_observation[None, :]
+            next_grad_trunk_w = next_grad_hidden[:, None] * safe_next_observation[None, :]
             next_grad_trunk_b = next_grad_hidden
 
             secondary_dot = (
@@ -876,12 +1308,33 @@ class NonlinearSharedGTDHordeLearner:
             # importance sampling, Sutton & Barto 2nd ed., Section 11.7;
             # GQ(0) with e = rho grad, Maei & Sutton 2010).  Inactive demons
             # (NaN cumulant) contribute nothing this step.
-            masked_rho = jnp.where(active_mask[i], clipped_rhos[i], 0.0)
-            rho_dot = masked_rho * discounts[i] * secondary_dot
-            correction_trunk_w = rho_dot * next_grad_trunk_w
-            correction_trunk_b = rho_dot * next_grad_trunk_b
-            correction_head_w = rho_dot * next_grad_head_w
-            correction_head_b = rho_dot * next_grad_head_b
+            masked_rho = jnp.where(effective_mask[i], clipped_rhos[i], 0.0)
+            terminated_i = discounts[i] == 0.0
+            rho_dot = jnp.where(
+                terminated_i,
+                jnp.zeros_like(secondary_dot),
+                masked_rho * discounts[i] * secondary_dot,
+            )
+            correction_trunk_w = jnp.where(
+                terminated_i,
+                jnp.zeros_like(next_grad_trunk_w),
+                rho_dot * next_grad_trunk_w,
+            )
+            correction_trunk_b = jnp.where(
+                terminated_i,
+                jnp.zeros_like(next_grad_trunk_b),
+                rho_dot * next_grad_trunk_b,
+            )
+            correction_head_w = jnp.where(
+                terminated_i,
+                jnp.zeros_like(next_grad_head_w),
+                rho_dot * next_grad_head_w,
+            )
+            correction_head_b = jnp.where(
+                terminated_i,
+                jnp.zeros_like(next_grad_head_b),
+                rho_dot * next_grad_head_b,
+            )
             rho_delta = masked_rho * safe_td_errors[i]
 
             trunk_w_step = trunk_w_step + primary_alpha * (
@@ -897,7 +1350,7 @@ class NonlinearSharedGTDHordeLearner:
                 primary_alpha * (rho_delta * grad_head_b - correction_head_b)
             )
 
-            masked_beta = jnp.where(active_mask[i], secondary_beta, 0.0)
+            masked_beta = jnp.where(effective_mask[i], secondary_beta, 0.0)
             sec_trunk_w = state.secondary_trunk_w[i] + masked_beta * (
                 rho_delta * grad_trunk_w - secondary_dot * grad_trunk_w
             )
@@ -915,23 +1368,18 @@ class NonlinearSharedGTDHordeLearner:
             new_secondary_head_w.append(sec_head_w)
             new_secondary_head_b.append(sec_head_b)
             correction_norms.append(
-                jnp.sqrt(
-                    jnp.vdot(correction_trunk_w, correction_trunk_w)
-                    + jnp.vdot(correction_trunk_b, correction_trunk_b)
-                    + jnp.vdot(correction_head_w, correction_head_w)
-                    + correction_head_b**2
+                _stable_l2_norm(
+                    correction_trunk_w,
+                    correction_trunk_b,
+                    correction_head_w,
+                    correction_head_b,
                 )
             )
             secondary_norms.append(
-                jnp.sqrt(
-                    jnp.vdot(sec_trunk_w, sec_trunk_w)
-                    + jnp.vdot(sec_trunk_b, sec_trunk_b)
-                    + jnp.vdot(sec_head_w, sec_head_w)
-                    + sec_head_b**2
-                )
+                _stable_l2_norm(sec_trunk_w, sec_trunk_b, sec_head_w, sec_head_b)
             )
 
-        new_state = state.replace(  # type: ignore[attr-defined]
+        proposed_state = state.replace(  # type: ignore[attr-defined]
             trunk_w=state.trunk_w + trunk_w_step,
             trunk_b=state.trunk_b + trunk_b_step,
             head_w=state.head_w + head_w_step,
@@ -940,17 +1388,62 @@ class NonlinearSharedGTDHordeLearner:
             secondary_trunk_b=jnp.stack(new_secondary_trunk_b),
             secondary_head_w=jnp.stack(new_secondary_head_w),
             secondary_head_b=jnp.stack(new_secondary_head_b),
-            step_count=state.step_count + 1,
+            step_count=_saturating_int32_counter_increment(state.step_count),
+        )
+        candidate_state_finite = _floating_tree_is_finite(proposed_state)
+        correction_norms_array = jnp.stack(correction_norms)
+        secondary_norms_array = jnp.stack(secondary_norms)
+        reported_next_predictions = jnp.where(
+            zero_discount_mask, jnp.zeros_like(next_predictions), next_predictions
+        )
+        active_outputs_finite = jnp.all(
+            (~active_mask)
+            | (
+                jnp.isfinite(predictions)
+                & jnp.isfinite(reported_next_predictions)
+                & jnp.isfinite(td_targets)
+                & jnp.isfinite(td_errors)
+                & jnp.isfinite(clipped_rhos)
+                & jnp.isfinite(correction_norms_array)
+                & jnp.isfinite(secondary_norms_array)
+            )
+        )
+        update_applied = (
+            inputs_valid
+            & source_state_finite
+            & candidate_state_finite
+            & active_outputs_finite
+            & (jnp.any(active_mask) | jnp.all(~requested))
+        )
+        head_updates_applied = effective_mask & update_applied
+        new_state = jax.lax.cond(
+            update_applied,
+            lambda: proposed_state,
+            lambda: state,
         )
         return NonlinearSharedGTDHordeUpdateResult(  # type: ignore[call-arg]
             state=new_state,
-            predictions=predictions,
-            next_predictions=next_predictions,
-            td_targets=td_targets,
-            td_errors=td_errors,
-            clipped_rhos=clipped_rhos,
-            correction_norms=jnp.stack(correction_norms),
-            secondary_norms=jnp.stack(secondary_norms),
+            predictions=jnp.where(update_applied, predictions, jnp.zeros_like(predictions)),
+            next_predictions=jnp.where(
+                update_applied,
+                reported_next_predictions,
+                jnp.zeros_like(reported_next_predictions),
+            ),
+            td_targets=jnp.where(update_applied, td_targets, jnp.zeros_like(td_targets)),
+            td_errors=jnp.where(update_applied, td_errors, jnp.zeros_like(td_errors)),
+            clipped_rhos=jnp.where(update_applied, clipped_rhos, jnp.zeros_like(clipped_rhos)),
+            correction_norms=jnp.where(
+                update_applied,
+                correction_norms_array,
+                jnp.zeros_like(correction_norms_array),
+            ),
+            secondary_norms=jnp.where(
+                update_applied,
+                secondary_norms_array,
+                jnp.zeros_like(secondary_norms_array),
+            ),
+            head_updates_applied=head_updates_applied,
+            update_applied=update_applied,
         )
 
 
@@ -970,7 +1463,7 @@ def run_off_policy_horde_learning_loop(
     def step_fn(
         carry: MultiHeadMLPState,
         inputs: tuple[Array, Array, Array, Array, Array],
-    ) -> tuple[MultiHeadMLPState, tuple[Array, Array, Array]]:
+    ) -> tuple[MultiHeadMLPState, tuple[Array, Array, Array, Array, Array]]:
         obs, cums, next_obs, rho_t, discount_t = inputs
         result = learner.update_with_ratios_and_discounts(
             carry,
@@ -986,11 +1479,22 @@ def run_off_policy_horde_learning_loop(
                 result.per_demon_metrics,
                 result.td_errors,
                 result.clipped_rhos,
+                result.head_updates_applied,
+                result.update_applied,
             ),
         )
 
     t0 = time.time()
-    final_state, (per_demon_metrics, td_errors, clipped_rhos) = jax.lax.scan(
+    (
+        final_state,
+        (
+            per_demon_metrics,
+            td_errors,
+            clipped_rhos,
+            head_updates_applied,
+            updates_applied,
+        ),
+    ) = jax.lax.scan(
         step_fn,
         state,
         (observations, cumulants, next_observations, rhos, discounts),
@@ -1005,6 +1509,8 @@ def run_off_policy_horde_learning_loop(
         per_demon_metrics=per_demon_metrics,
         td_errors=td_errors,
         clipped_rhos=clipped_rhos,
+        head_updates_applied=head_updates_applied,
+        updates_applied=updates_applied,
     )  # type: ignore[call-arg]
 
 
@@ -1019,7 +1525,9 @@ def run_off_policy_horde_learning_loop_batched(
 ) -> OffPolicyHordeLearningResult:
     """Run the off-policy Horde loop for multiple initialization keys."""
 
-    def single_run(key: Array) -> tuple[MultiHeadMLPState, Array, Array, Array]:
+    def single_run(
+        key: Array,
+    ) -> tuple[MultiHeadMLPState, Array, Array, Array, Array, Array]:
         init_state = learner.init(observations.shape[1], key)
         result = run_off_policy_horde_learning_loop(
             learner,
@@ -1035,14 +1543,25 @@ def run_off_policy_horde_learning_loop_batched(
             result.per_demon_metrics,
             result.td_errors,
             result.clipped_rhos,
+            result.head_updates_applied,
+            result.updates_applied,
         )
 
-    states, per_demon_metrics, td_errors, clipped_rhos = jax.vmap(single_run)(keys)
+    (
+        states,
+        per_demon_metrics,
+        td_errors,
+        clipped_rhos,
+        head_updates_applied,
+        updates_applied,
+    ) = jax.vmap(single_run)(keys)
     return OffPolicyHordeLearningResult(
         state=states,
         per_demon_metrics=per_demon_metrics,
         td_errors=td_errors,
         clipped_rhos=clipped_rhos,
+        head_updates_applied=head_updates_applied,
+        updates_applied=updates_applied,
     )  # type: ignore[call-arg]
 
 

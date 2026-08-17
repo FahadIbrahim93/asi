@@ -1,7 +1,6 @@
 """Experience streams for continual learning."""
 
-from importlib import import_module
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from alberta_framework.streams.base import ScanStream
 from alberta_framework.streams.closed_loop import (
@@ -152,15 +151,34 @@ _GYMNASIUM_EXPORTS = (
     "make_gymnasium_stream",
     "make_random_policy",
 )
-
 __all__ += list(_GYMNASIUM_EXPORTS)
+
+if TYPE_CHECKING:
+    from alberta_framework.streams import gymnasium as _gymnasium_types
+
+    GymnasiumStream = _gymnasium_types.GymnasiumStream
+    PredictionMode = _gymnasium_types.PredictionMode
+    TDStream = _gymnasium_types.TDStream
+    collect_trajectory = _gymnasium_types.collect_trajectory
+    learn_from_trajectory = _gymnasium_types.learn_from_trajectory
+    learn_from_trajectory_normalized = _gymnasium_types.learn_from_trajectory_normalized
+    make_epsilon_greedy_policy = _gymnasium_types.make_epsilon_greedy_policy
+    make_gymnasium_stream = _gymnasium_types.make_gymnasium_stream
+    make_random_policy = _gymnasium_types.make_random_policy
 
 
 def __getattr__(name: str) -> Any:
-    """Load the optional Gymnasium adapter without coupling core imports to it."""
+    """Load Gymnasium adapter exports without creating a core/streams cycle."""
     if name not in _GYMNASIUM_EXPORTS:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    module = import_module("alberta_framework.streams.gymnasium")
-    value = getattr(module, name)
+
+    from alberta_framework.streams import gymnasium as gymnasium_streams
+
+    value = getattr(gymnasium_streams, name)
     globals()[name] = value
     return value
+
+
+def __dir__() -> list[str]:
+    """Include lazy adapter names in interactive discovery."""
+    return sorted(set(globals()) | set(_GYMNASIUM_EXPORTS))

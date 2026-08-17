@@ -29,6 +29,7 @@ import sqlite3
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 import numpy as np
@@ -132,6 +133,37 @@ def _canonical_json_sha256(value: Any) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def _pairing_json(value: Any, *, name: str) -> str:
+    """Encode an exact pairing identity without invoking fallback hooks."""
+
+    def plain(item: Any) -> Any:
+        if type(item) in (dict, MappingProxyType):
+            result: dict[str, Any] = {}
+            for key, child in item.items():
+                if type(key) is not str:
+                    raise ValueError(f"{name} must have exact string keys")
+                result[key] = plain(child)
+            return result
+        if type(item) in (list, tuple):
+            return [plain(child) for child in item]
+        if type(item) is float:
+            if not math.isfinite(item):
+                raise ValueError(f"{name} must contain finite numbers")
+            return item
+        if item is None or type(item) in (str, bool, int):
+            return item
+        raise ValueError(f"{name} contains a non-JSON identity")
+
+    try:
+        return json.dumps(
+            plain(value),
+            allow_nan=False,
+            sort_keys=True,
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be finite JSON") from exc
+
+
 def _json_mapping_copy(value: Mapping[str, Any], *, name: str) -> dict[str, Any]:
     """Return a detached JSON mapping while rejecting non-finite/unsafe values."""
     try:
@@ -194,11 +226,18 @@ def _json_without_duplicate_keys(payload: bytes, *, path: Path) -> Mapping[str, 
     def invalid_constant(value: str) -> None:
         raise ValueError(f"{path} contains non-standard JSON constant {value!r}")
 
+    def parse_float(value: str) -> float:
+        parsed = float(value)
+        if not math.isfinite(parsed):
+            raise ValueError(f"{path} contains non-finite JSON number {value!r}")
+        return parsed
+
     try:
         parsed = json.loads(
             payload,
             object_pairs_hook=object_pairs,
             parse_constant=invalid_constant,
+            parse_float=parse_float,
         )
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError(f"{path} is not valid UTF-8 JSON") from exc
@@ -1560,6 +1599,21 @@ def import_official_foragax_npz(
     final_window: int = 100_000,
 ) -> ForagerRunResult:
     """Convert one official ``data/<seed>.npz`` archive to Alberta's schema."""
+    # NumPy's concrete float64 scalar was accepted by the historical
+    # isinstance gate. Retain that compatibility without admitting arbitrary
+    # user-defined int/float subclasses with overloaded conversion hooks.
+    if type(ewm_decay) not in (int, float, np.float64):
+        raise ValueError("ewm_decay must be a finite number in [0, 1)")
+    try:
+        ewm_decay_as_float = float(cast(Any, ewm_decay))
+    except OverflowError as exc:
+        raise ValueError("ewm_decay must be a finite number in [0, 1)") from exc
+    if not math.isfinite(ewm_decay_as_float) or not 0.0 <= ewm_decay_as_float < 1.0:
+        raise ValueError("ewm_decay must be a finite number in [0, 1)")
+    if type(record_every) is not int or record_every < 1:
+        raise ValueError("record_every must be a positive integer")
+    if type(final_window) is not int or final_window < 1:
+        raise ValueError("final_window must be a positive integer")
     protocol_attested = spec.attestation_evidence is not None
     runtime_profile_id: str | None = None
     environment_runtime_profile_sha256: str | None = None
@@ -2139,10 +2193,9 @@ def _environment_signature(run: ForagerRunResult) -> tuple[Any, ...]:
     semantic = _foragax_semantic_signature(run)
     environment_signature: str | tuple[str, str]
     if semantic is None:
-        environment_signature = json.dumps(
+        environment_signature = _pairing_json(
             run.environment,
-            sort_keys=True,
-            default=str,
+            name="environment pairing identity",
         )
     else:
         implementation = _foragax_implementation_signature(run)
@@ -2153,7 +2206,10 @@ def _environment_signature(run: ForagerRunResult) -> tuple[Any, ...]:
         environment_signature = (semantic, implementation)
     return (
         environment_signature,
-        json.dumps(run.metric_contract, sort_keys=True, default=str),
+        _pairing_json(
+            run.metric_contract,
+            name="metric_contract pairing identity",
+        ),
         run.steps,
     )
 

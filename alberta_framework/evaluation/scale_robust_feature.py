@@ -33,9 +33,11 @@ import numpy as np
 from jax import Array
 from numpy.typing import NDArray
 
+from alberta_framework._seed_validation import require_jax_seed, require_unique_jax_seeds
 from alberta_framework.core.interaction_features import (
     FixedBudgetInteractionLearner,
 )
+from alberta_framework.evaluation._measurement_validation import nonnegative_finite_real
 from alberta_framework.streams.gauntlet import (
     SEGMENT_NAMES,
     GauntletConfig,
@@ -208,6 +210,64 @@ EXPECTED_MEMORY: dict[str, dict[str, int | bool]] = {
 }
 
 
+def _nonnegative_int(value: object, *, name: str) -> int:
+    if type(value) is not int or value < 0:
+        raise ValueError(f"{name} must be a non-negative integer")
+    return value
+
+
+def _optional_finite_float(value: object, *, name: str) -> float | None:
+    if value is None:
+        return None
+    return nonnegative_finite_real(name, value)
+
+
+def _finite_float(value: object, *, name: str) -> float:
+    return nonnegative_finite_real(name, value)
+
+
+def _integer_pairs(
+    value: object, *, name: str
+) -> tuple[tuple[int, int], ...]:
+    if type(value) is not tuple:
+        raise TypeError(f"{name} must be an exact tuple")
+    pairs: list[tuple[int, int]] = []
+    for index, pair in enumerate(value):
+        if type(pair) is not tuple or len(pair) != 2:
+            raise ValueError(f"{name}[{index}] must be an exact integer pair")
+        left, right = pair
+        if type(left) is not int or type(right) is not int:
+            raise ValueError(f"{name}[{index}] must contain integers")
+        pairs.append((left, right))
+    return tuple(pairs)
+
+
+def _resource_accounting_map(value: object) -> dict[str, dict[str, int | bool]]:
+    if type(value) is not dict:
+        raise TypeError("memory_by_condition must be an exact dictionary")
+    result: dict[str, dict[str, int | bool]] = {}
+    for condition, accounting in value.items():
+        if type(condition) is not str or not condition:
+            raise ValueError("memory_by_condition keys must be non-empty strings")
+        if type(accounting) is not dict:
+            raise TypeError(f"memory_by_condition[{condition}] must be an exact dictionary")
+        normalized: dict[str, int | bool] = {}
+        for name, count in accounting.items():
+            if type(name) is not str or not name:
+                raise ValueError("resource-accounting keys must be non-empty strings")
+            if type(count) is bool:
+                normalized[name] = count
+            elif type(count) is int and count >= 0:
+                normalized[name] = count
+            else:
+                raise ValueError(
+                    f"memory_by_condition[{condition}][{name}] must be a non-negative "
+                    "integer or boolean"
+                )
+        result[condition] = normalized
+    return result
+
+
 @dataclass(frozen=True)
 class PhaseWindowRecord:
     """Sufficient prequential-error statistics for one 3,000-step phase."""
@@ -224,6 +284,72 @@ class PhaseWindowRecord:
     asymptotic_squared_error_sum: float | None
     asymptotic_count: int
 
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "phase_index",
+            _nonnegative_int(self.phase_index, name="phase_index"),
+        )
+        if type(self.phase_name) is not str:
+            raise ValueError("phase_name must be a string")
+        object.__setattr__(
+            self,
+            "step_count",
+            _nonnegative_int(self.step_count, name="step_count"),
+        )
+        object.__setattr__(
+            self,
+            "nonfinite_steps",
+            _nonnegative_int(self.nonfinite_steps, name="nonfinite_steps"),
+        )
+        object.__setattr__(
+            self,
+            "phase_squared_error_sum",
+            _optional_finite_float(
+                self.phase_squared_error_sum,
+                name="phase_squared_error_sum",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "early_squared_error_sum",
+            _optional_finite_float(
+                self.early_squared_error_sum,
+                name="early_squared_error_sum",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "early_count",
+            _nonnegative_int(self.early_count, name="early_count"),
+        )
+        object.__setattr__(
+            self,
+            "tail_squared_error_sum",
+            _optional_finite_float(
+                self.tail_squared_error_sum,
+                name="tail_squared_error_sum",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "tail_count",
+            _nonnegative_int(self.tail_count, name="tail_count"),
+        )
+        object.__setattr__(
+            self,
+            "asymptotic_squared_error_sum",
+            _optional_finite_float(
+                self.asymptotic_squared_error_sum,
+                name="asymptotic_squared_error_sum",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "asymptotic_count",
+            _nonnegative_int(self.asymptotic_count, name="asymptotic_count"),
+        )
+
 
 @dataclass(frozen=True)
 class ConditionSeedRecord:
@@ -236,6 +362,36 @@ class ConditionSeedRecord:
     end_segment_7_active_pairs: tuple[tuple[int, int], ...]
     final_active_pairs: tuple[tuple[int, int], ...]
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "seed", require_jax_seed(self.seed, name="seed"))
+        if type(self.condition) is not str or not self.condition:
+            raise ValueError("condition must be a non-empty string")
+        if type(self.phases) is not tuple:
+            raise TypeError("phases must be an exact tuple")
+        if any(type(phase) is not PhaseWindowRecord for phase in self.phases):
+            raise TypeError("phases must contain PhaseWindowRecord values")
+        object.__setattr__(
+            self,
+            "end_segment_5_active_pairs",
+            _integer_pairs(
+                self.end_segment_5_active_pairs,
+                name="end_segment_5_active_pairs",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "end_segment_7_active_pairs",
+            _integer_pairs(
+                self.end_segment_7_active_pairs,
+                name="end_segment_7_active_pairs",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "final_active_pairs",
+            _integer_pairs(self.final_active_pairs, name="final_active_pairs"),
+        )
+
 
 @dataclass(frozen=True)
 class ScaleRobustFeatureReport:
@@ -245,6 +401,33 @@ class ScaleRobustFeatureReport:
     records: tuple[ConditionSeedRecord, ...]
     memory_by_condition: Mapping[str, Mapping[str, int | bool]]
     wall_time_seconds_by_condition: Mapping[str, float]
+
+    def __post_init__(self) -> None:
+        if type(self.seeds) is not tuple:
+            raise TypeError("seeds must be an exact tuple")
+        object.__setattr__(self, "seeds", require_unique_jax_seeds(self.seeds, name="seeds"))
+        if type(self.records) is not tuple:
+            raise TypeError("records must be an exact tuple")
+        if any(type(record) is not ConditionSeedRecord for record in self.records):
+            raise TypeError("records must contain ConditionSeedRecord values")
+        object.__setattr__(
+            self,
+            "memory_by_condition",
+            _resource_accounting_map(self.memory_by_condition),
+        )
+        if type(self.wall_time_seconds_by_condition) is not dict:
+            raise TypeError("wall_time_seconds_by_condition must be an exact dictionary")
+        for name in self.wall_time_seconds_by_condition:
+            if type(name) is not str or not name:
+                raise ValueError("wall_time_seconds_by_condition keys must be non-empty strings")
+        object.__setattr__(
+            self,
+            "wall_time_seconds_by_condition",
+            {
+                name: _finite_float(value, name=f"wall_time_seconds_by_condition[{name}]")
+                for name, value in self.wall_time_seconds_by_condition.items()
+            },
+        )
 
 
 def frozen_stream_config() -> GauntletConfig:
@@ -589,15 +772,21 @@ def run_scale_robust_feature_evaluation(
     The public default is the fresh namespace-derived 30-seed schedule.
     Alternate schedules are useful only for development diagnostics; the v2
     evidence validator will not accept them.
+
+    Raises:
+        ValueError: If ``seeds`` is empty, contains a non-canonical-``int``
+            value (a ``bool``, a ``float`` that would otherwise be silently
+            truncated by ``int()``, a numpy/JAX scalar, or a numeric
+            string), a duplicate, or a value outside the JAX uint32 scalar
+            key domain ``[0, 2**32 - 1]`` -- ``jax.random.key`` reduces an
+            out-of-range seed modulo ``2**32``, so two distinct declared
+            seeds could otherwise silently execute the identical random
+            stream while being recorded as different identities.
     """
 
-    seed_schedule = tuple(int(seed) for seed in seeds)
-    if not seed_schedule:
-        raise ValueError("seeds must be non-empty")
-    if len(set(seed_schedule)) != len(seed_schedule):
-        raise ValueError("seeds must be unique")
-    if any(seed < 0 for seed in seed_schedule):
-        raise ValueError("seeds must be non-negative")
+    if type(seeds) not in (list, tuple):
+        raise ValueError("seeds must be an actual list or tuple")
+    seed_schedule = require_unique_jax_seeds(seeds, name="seeds")
 
     stream = GauntletStream(frozen_stream_config())
     records: list[ConditionSeedRecord] = []

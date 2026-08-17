@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+from typing import cast
+
 import chex
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.experimental import checkify
 
 from alberta_framework.utils.nexting import (
     forward_view_returns,
@@ -21,6 +25,19 @@ class TestForwardViewReturns:
         c = jnp.array([1.0, 2.0, 3.0, 4.0, 5.0])
         g = forward_view_returns(c, gamma=0.0)
         chex.assert_trees_all_close(g, c)
+
+    def test_gamma_zero_skips_inf_later_return(self) -> None:
+        """gamma=0 is G_t = c_{t+1}; 0 * inf G_{t+1} is NaN.
+
+        Fail-closed: a zero discount does not multiply the later return.
+        """
+        c = jnp.array([1.0, jnp.inf, 3.0])
+        g = forward_view_returns(c, gamma=0.0)
+        assert bool(jnp.isfinite(g[0]))
+        assert bool(jnp.isfinite(g[2]))
+        chex.assert_trees_all_close(g[0], jnp.float32(1.0))
+        chex.assert_trees_all_close(g[2], jnp.float32(3.0))
+        assert bool(jnp.isinf(g[1]))
 
     def test_gamma_one_undiscounted(self) -> None:
         c = jnp.array([1.0, 2.0, 3.0, 4.0, 5.0])
@@ -46,6 +63,56 @@ class TestForwardViewReturns:
         # G_0 = 0 + 1 * 11 = 11
         g = forward_view_returns(c, gamma=1.0, terminal_value=10.0)
         chex.assert_trees_all_close(g, jnp.array([11.0, 11.0, 11.0]))
+
+    @pytest.mark.parametrize("gamma", [True, False, float("nan"), float("inf"), -0.1, 1.1])
+    def test_gamma_rejects_boolean_and_non_discount_host_values(self, gamma: object) -> None:
+        """True used to compile as undiscounted gamma=1.0; False as gamma=0.0."""
+
+        c = jnp.array([1.0, 2.0, 3.0], dtype=jnp.float32)
+        with pytest.raises(ValueError, match="gamma"):
+            forward_view_returns(c, gamma=cast(float, gamma))
+
+    def test_gamma_true_is_not_the_undiscounted_identity(self) -> None:
+        c = jnp.array([1.0, 2.0, 3.0], dtype=jnp.float32)
+        legal = forward_view_returns(c, gamma=1.0)
+        chex.assert_trees_all_close(legal, jnp.array([6.0, 5.0, 3.0]))
+        with pytest.raises(ValueError, match="boolean"):
+            forward_view_returns(c, gamma=True)
+
+    @pytest.mark.parametrize("terminal_value", [True, False, float("nan"), float("inf")])
+    def test_terminal_value_rejects_boolean_and_nonfinite_hosts(
+        self, terminal_value: object
+    ) -> None:
+        c = jnp.array([1.0, 2.0, 3.0], dtype=jnp.float32)
+        with pytest.raises(ValueError, match="terminal_value"):
+            forward_view_returns(c, gamma=0.0, terminal_value=cast(float, terminal_value))
+
+    def test_bool_gamma_vector_is_not_the_one_zero_horizon_pair(self) -> None:
+        c = jnp.array([1.0, 2.0, 3.0], dtype=jnp.float32)
+        legal = multi_horizon_returns(c, jnp.array([1.0, 0.0], dtype=jnp.float32))
+        chex.assert_shape(legal, (3, 2))
+        with pytest.raises(ValueError, match="gammas"):
+            multi_horizon_returns(c, jnp.array([True, False]))
+
+    @pytest.mark.parametrize("array_type", [np.asarray, jnp.asarray])
+    @pytest.mark.parametrize("gamma", [float("nan"), float("inf"), -0.1, 1.1])
+    def test_concrete_array_gamma_is_validated(self, array_type, gamma: float) -> None:
+        c = jnp.array([1.0, 2.0, 3.0], dtype=jnp.float32)
+        with pytest.raises(ValueError, match="gamma"):
+            forward_view_returns(c, gamma=array_type(gamma))
+
+    @pytest.mark.parametrize("array_type", [np.asarray, jnp.asarray])
+    def test_concrete_gamma_vector_values_are_validated(self, array_type) -> None:
+        c = jnp.array([1.0, 2.0, 3.0], dtype=jnp.float32)
+        with pytest.raises(ValueError, match="gammas"):
+            multi_horizon_returns(c, array_type([0.5, float("nan")]))
+        with pytest.raises(ValueError, match="gammas"):
+            multi_horizon_returns(c, array_type([0.5, 1.1]))
+
+    def test_jit_traced_legal_gamma_remains_supported(self) -> None:
+        c = jnp.array([1.0, 2.0, 3.0], dtype=jnp.float32)
+        actual = jax.jit(forward_view_returns)(c, jnp.array(0.5, dtype=jnp.float32))
+        chex.assert_trees_all_close(actual, jnp.array([2.75, 3.5, 3.0]))
 
 
 class TestMultiHorizon:
@@ -104,6 +171,107 @@ class TestMultiChannel:
 
 
 class TestRMSE:
+    def test_large_finite_errors_do_not_overflow(self) -> None:
+        predictions = jnp.asarray([[2.0e20], [2.0e20]], dtype=jnp.float32)
+        returns = jnp.zeros_like(predictions)
+
+        with jax.debug_infs(True):
+            rmse = per_horizon_rmse(predictions, returns)
+
+        assert bool(jnp.isfinite(rmse[0]))
+        np.testing.assert_allclose(np.asarray(rmse), np.asarray([2.0e20], dtype=np.float32))
+
+    def test_zero_error_does_not_form_a_discarded_zero_division(self) -> None:
+        predictions = jnp.zeros((3, 2), dtype=jnp.float32)
+
+        with jax.debug_nans(True):
+            rmse = per_horizon_rmse(predictions, predictions)
+
+        np.testing.assert_array_equal(np.asarray(rmse), np.zeros(2, dtype=np.float32))
+
+    def test_near_max_finite_errors_do_not_underflow_during_scaling(self) -> None:
+        values = np.linspace(-1.0e38, 1.0e38, 257, dtype=np.float32)[:, None]
+        predictions = jnp.asarray(values)
+        returns = jnp.zeros_like(predictions)
+        reference = np.sqrt(np.mean(np.square(values.astype(np.float64)), axis=0))
+
+        with jax.debug_infs(True):
+            rmse = per_horizon_rmse(predictions, returns)
+
+        assert bool(jnp.isfinite(rmse[0]))
+        np.testing.assert_allclose(np.asarray(rmse), reference, rtol=2e-6)
+        compiled = jax.jit(per_horizon_rmse)(predictions, returns)
+        np.testing.assert_allclose(np.asarray(compiled), reference, rtol=2e-6)
+
+    def test_finite_stable_rmse_has_no_checkify_float_errors(self) -> None:
+        checked = checkify.checkify(per_horizon_rmse, errors=checkify.float_checks)
+
+        for predictions in (
+            jnp.zeros((3, 1), dtype=jnp.float32),
+            jnp.full((3, 1), 2.0e20, dtype=jnp.float32),
+            jnp.linspace(-1.0e38, 1.0e38, 257, dtype=jnp.float32)[:, None],
+        ):
+            error, rmse = checked(predictions, jnp.zeros_like(predictions))
+            error.throw()
+            chex.assert_tree_all_finite(rmse)
+
+    def test_huge_finite_error_gradient_is_correct_eager_and_jit(self) -> None:
+        predictions = jnp.asarray([[3.0e38], [-1.0e38]], dtype=jnp.float32)
+        returns = jnp.zeros_like(predictions)
+
+        def scalar_rmse(values: jax.Array) -> jax.Array:
+            return per_horizon_rmse(values, returns)[0]
+
+        reference_values = np.asarray(predictions, dtype=np.float64)
+        reference_rmse = np.sqrt(np.mean(reference_values**2, axis=0))[0]
+        expected = reference_values / (predictions.shape[0] * reference_rmse)
+
+        eager = jax.grad(scalar_rmse)(predictions)
+        compiled = jax.jit(jax.grad(scalar_rmse))(predictions)
+
+        assert bool(jnp.all(jnp.isfinite(eager)))
+        assert bool(jnp.all(jnp.isfinite(compiled)))
+        np.testing.assert_allclose(np.asarray(eager), expected, rtol=2e-6, atol=0.0)
+        np.testing.assert_allclose(np.asarray(compiled), expected, rtol=2e-6, atol=0.0)
+
+    @pytest.mark.parametrize("magnitude", [2.0e20, 1.0e38, 3.0e38])
+    def test_large_finite_rmse_has_stable_eager_and_jit_gradients(
+        self,
+        magnitude: float,
+    ) -> None:
+        predictions = jnp.full((2, 1), magnitude, dtype=jnp.float32)
+        returns = jnp.zeros_like(predictions)
+
+        def loss(values: jax.Array) -> jax.Array:
+            return jnp.sum(per_horizon_rmse(values, returns))
+
+        expected = jnp.full_like(predictions, 0.5)
+        eager = jax.grad(loss)(predictions)
+        compiled = jax.jit(jax.grad(loss))(predictions)
+
+        chex.assert_trees_all_close(eager, expected, rtol=5e-6, atol=0.0)
+        chex.assert_trees_all_close(compiled, expected, rtol=5e-6, atol=0.0)
+
+    def test_zero_rmse_uses_zero_eager_jit_and_forward_gradient_convention(self) -> None:
+        predictions = jnp.zeros((3, 2), dtype=jnp.float32)
+        returns = jnp.zeros_like(predictions)
+
+        def loss(values: jax.Array) -> jax.Array:
+            return jnp.sum(per_horizon_rmse(values, returns))
+
+        expected = jnp.zeros_like(predictions)
+        eager = jax.grad(loss)(predictions)
+        compiled = jax.jit(jax.grad(loss))(predictions)
+        _primal, tangent = jax.jvp(
+            lambda values: per_horizon_rmse(values, returns),
+            (predictions,),
+            (jnp.ones_like(predictions),),
+        )
+
+        chex.assert_trees_all_equal(eager, expected)
+        chex.assert_trees_all_equal(compiled, expected)
+        chex.assert_trees_all_equal(tangent, jnp.zeros((2,), dtype=jnp.float32))
+
     def test_zero_error_when_predictions_match(self) -> None:
         t, h = 50, 4
         truths = jnp.ones((t, h))
@@ -127,14 +295,175 @@ class TestRMSE:
         assert float(rmse_no_burn[0]) > 0.0
         chex.assert_trees_all_close(rmse_burn, jnp.zeros(h), atol=1e-6)
 
-    @pytest.mark.parametrize("burn_in", [-1, 4])
-    def test_burn_in_must_leave_evaluation_data(self, burn_in: int) -> None:
-        values = jnp.zeros((4, 1))
-        with pytest.raises(ValueError, match="burn_in"):
-            per_horizon_rmse(values, values, burn_in=burn_in)
+    @pytest.mark.parametrize(
+        "burn_in",
+        [
+            pytest.param(True, id="bool"),
+            pytest.param(1.0, id="float"),
+            pytest.param(np.int64(1), id="numpy-scalar"),
+            pytest.param(jnp.asarray(1, dtype=jnp.int32), id="jax-scalar"),
+        ],
+    )
+    def test_burn_in_requires_exact_builtin_int(self, burn_in: object) -> None:
+        predictions = jnp.ones((3, 2))
+        returns = jnp.zeros((3, 2))
+
+        with pytest.raises(ValueError, match=r"^burn_in must be a built-in int$"):
+            per_horizon_rmse(predictions, returns, burn_in=cast(int, burn_in))
+
+    @pytest.mark.parametrize("burn_in", [-1, 3, 5])
+    def test_burn_in_out_of_range_is_rejected(self, burn_in: int) -> None:
+        predictions = jnp.ones((3, 2))
+        returns = jnp.zeros((3, 2))
+
+        with pytest.raises(ValueError) as exc_info:
+            per_horizon_rmse(predictions, returns, burn_in=burn_in)
+
+        assert str(exc_info.value) == (
+            "burn_in must satisfy 0 <= burn_in < n_steps "
+            f"(got burn_in={burn_in}, n_steps=3)"
+        )
+
+    @pytest.mark.parametrize(
+        ("prediction_shape", "return_shape"),
+        [
+            pytest.param((), (), id="rank-zero"),
+            pytest.param((3,), (3,), id="rank-one"),
+            pytest.param((3, 2, 1), (3, 2, 1), id="rank-three"),
+            pytest.param((3, 1), (3, 2), id="broadcast-horizon"),
+            pytest.param((1, 2), (3, 2), id="broadcast-time"),
+            pytest.param((0, 2), (0, 2), id="empty-time"),
+            pytest.param((3, 0), (3, 0), id="empty-horizon"),
+        ],
+    )
+    def test_inputs_require_equal_rank_two_nonempty_shape(
+        self,
+        prediction_shape: tuple[int, ...],
+        return_shape: tuple[int, ...],
+    ) -> None:
+        predictions = jnp.zeros(prediction_shape)
+        returns = jnp.zeros(return_shape)
+
+        with pytest.raises(
+            ValueError,
+            match=r"must be rank-2 arrays with identical nonempty shape \(T, H\)",
+        ):
+            per_horizon_rmse(predictions, returns)
+
+    def test_burn_in_boundaries_are_bitexact_eager_and_static_jit(self) -> None:
+        predictions = jnp.array(
+            [[1.0, 2.0], [1.0, 2.0], [5.0, -10.0]],
+            dtype=jnp.float32,
+        )
+        returns = jnp.zeros_like(predictions)
+        compiled = jax.jit(per_horizon_rmse, static_argnames=("burn_in",))
+        expected_by_burn_in = {
+            0: np.array([3.0, 6.0], dtype=np.float32),
+            2: np.array([5.0, 10.0], dtype=np.float32),
+        }
+
+        for burn_in, expected in expected_by_burn_in.items():
+            eager = per_horizon_rmse(predictions, returns, burn_in=burn_in)
+            jitted = compiled(predictions, returns, burn_in=burn_in)
+            np.testing.assert_array_equal(np.asarray(eager), expected)
+            np.testing.assert_array_equal(np.asarray(jitted), expected)
+
+        closed_over = jax.jit(lambda p, r: per_horizon_rmse(p, r, burn_in=2))
+        np.testing.assert_array_equal(
+            np.asarray(closed_over(predictions, returns)),
+            expected_by_burn_in[2],
+        )
+
+    def test_nonfinite_errors_remain_visible(self) -> None:
+        predictions = jnp.array([[1.0, 1.0], [jnp.nan, jnp.inf]])
+        returns = jnp.zeros_like(predictions)
+
+        rmse = per_horizon_rmse(predictions, returns)
+
+        assert bool(jnp.isnan(rmse[0]))
+        assert bool(jnp.isinf(rmse[1]))
+
+    def test_dynamic_jit_burn_in_is_named_and_default_call_recovers(self) -> None:
+        predictions = jnp.tile(jnp.array([[3.0, -4.0]], dtype=jnp.float32), (3, 1))
+        returns = jnp.zeros_like(predictions)
+        compiled = jax.jit(per_horizon_rmse)
+
+        with pytest.raises(ValueError, match=r"^burn_in must be a built-in int"):
+            compiled(predictions, returns, burn_in=1)
+
+        recovered = compiled(predictions, returns)
+        np.testing.assert_array_equal(np.asarray(recovered), np.array([3.0, 4.0]))
+
+    def test_jit_rejects_broadcasting_at_the_shape_boundary(self) -> None:
+        predictions = jnp.ones((3, 2))
+        returns = jnp.zeros((3, 1))
+
+        with pytest.raises(
+            ValueError,
+            match=r"must be rank-2 arrays with identical nonempty shape \(T, H\)",
+        ):
+            jax.jit(per_horizon_rmse)(predictions, returns)
 
 
 class TestRunningRMSE:
+    def test_large_finite_errors_do_not_overflow(self) -> None:
+        predictions = jnp.asarray([[2.0e20], [2.0e20]], dtype=jnp.float32)
+        returns = jnp.zeros_like(predictions)
+
+        with jax.debug_infs(True):
+            running = per_horizon_running_rmse(predictions, returns, window_size=2)
+
+        assert bool(jnp.all(jnp.isfinite(running)))
+        np.testing.assert_allclose(
+            np.asarray(running),
+            np.full((2, 1), 2.0e20, dtype=np.float32),
+        )
+
+    @pytest.mark.parametrize("magnitude", [2.0e20, 1.0e38, 3.0e38])
+    def test_large_finite_running_rmse_has_stable_eager_jit_and_jvp_gradients(
+        self, magnitude: float
+    ) -> None:
+        predictions = jnp.full((2, 1), magnitude, dtype=jnp.float32)
+        returns = jnp.zeros_like(predictions)
+
+        def loss(values: jax.Array) -> jax.Array:
+            return per_horizon_running_rmse(values, returns, window_size=2)[1, 0]
+
+        expected = jnp.full_like(predictions, 0.5)
+        eager = jax.grad(loss)(predictions)
+        compiled = jax.jit(jax.grad(loss))(predictions)
+        _primal, tangent = jax.jvp(
+            lambda values: per_horizon_running_rmse(values, returns, window_size=2),
+            (predictions,),
+            (jnp.ones_like(predictions),),
+        )
+
+        chex.assert_trees_all_close(eager, expected, rtol=5e-6, atol=0.0)
+        chex.assert_trees_all_close(compiled, expected, rtol=5e-6, atol=0.0)
+        chex.assert_trees_all_close(tangent, jnp.ones_like(tangent), rtol=5e-6, atol=0.0)
+
+    def test_zero_running_rmse_uses_zero_eager_jit_and_jvp_gradient_convention(
+        self,
+    ) -> None:
+        predictions = jnp.zeros((3, 2), dtype=jnp.float32)
+        returns = jnp.zeros_like(predictions)
+
+        def loss(values: jax.Array) -> jax.Array:
+            return jnp.sum(per_horizon_running_rmse(values, returns, window_size=2))
+
+        expected = jnp.zeros_like(predictions)
+        eager = jax.grad(loss)(predictions)
+        compiled = jax.jit(jax.grad(loss))(predictions)
+        _primal, tangent = jax.jvp(
+            lambda values: per_horizon_running_rmse(values, returns, window_size=2),
+            (predictions,),
+            (jnp.ones_like(predictions),),
+        )
+
+        chex.assert_trees_all_equal(eager, expected)
+        chex.assert_trees_all_equal(compiled, expected)
+        chex.assert_trees_all_equal(tangent, jnp.zeros_like(tangent))
+
     def test_shape(self) -> None:
         t, h = 50, 3
         preds = jnp.zeros((t, h))
@@ -150,6 +479,132 @@ class TestRunningRMSE:
         # All windows should contain the same constant error
         np.testing.assert_allclose(np.asarray(running), 2.0, atol=1e-6)
 
+    @pytest.mark.parametrize(
+        "window_size",
+        [
+            pytest.param(True, id="bool"),
+            pytest.param(1.0, id="float"),
+            pytest.param(np.int64(1), id="numpy-scalar"),
+            pytest.param(jnp.asarray(1, dtype=jnp.int32), id="jax-scalar"),
+        ],
+    )
+    def test_window_size_requires_exact_builtin_int(self, window_size: object) -> None:
+        predictions = jnp.ones((3, 2))
+        returns = jnp.zeros((3, 2))
+
+        with pytest.raises(ValueError, match=r"^window_size must be a built-in int$"):
+            per_horizon_running_rmse(
+                predictions,
+                returns,
+                window_size=cast(int, window_size),
+            )
+
+    @pytest.mark.parametrize("window_size", [-1, 0, 4])
+    def test_window_size_out_of_range_is_rejected(self, window_size: int) -> None:
+        predictions = jnp.ones((3, 2))
+        returns = jnp.zeros((3, 2))
+
+        with pytest.raises(ValueError) as exc_info:
+            per_horizon_running_rmse(predictions, returns, window_size=window_size)
+
+        assert str(exc_info.value) == (
+            "window_size must satisfy 1 <= window_size <= n_steps "
+            f"(got window_size={window_size}, n_steps=3)"
+        )
+
+    @pytest.mark.parametrize(
+        ("prediction_shape", "return_shape"),
+        [
+            pytest.param((), (), id="rank-zero"),
+            pytest.param((3,), (3,), id="rank-one"),
+            pytest.param((3, 2, 1), (3, 2, 1), id="rank-three"),
+            pytest.param((3, 1), (3, 2), id="broadcast-horizon"),
+            pytest.param((1, 2), (3, 2), id="broadcast-time"),
+            pytest.param((0, 2), (0, 2), id="empty-time"),
+            pytest.param((3, 0), (3, 0), id="empty-horizon"),
+        ],
+    )
+    def test_inputs_require_equal_rank_two_nonempty_shape(
+        self,
+        prediction_shape: tuple[int, ...],
+        return_shape: tuple[int, ...],
+    ) -> None:
+        predictions = jnp.zeros(prediction_shape)
+        returns = jnp.zeros(return_shape)
+
+        with pytest.raises(
+            ValueError,
+            match=r"must be rank-2 arrays with identical nonempty shape \(T, H\)",
+        ):
+            per_horizon_running_rmse(predictions, returns, window_size=1)
+
+    def test_window_boundaries_are_bitexact_eager_and_static_jit(self) -> None:
+        predictions = jnp.array(
+            [[1.0, 2.0], [1.0, 2.0], [5.0, -10.0]],
+            dtype=jnp.float32,
+        )
+        returns = jnp.zeros_like(predictions)
+        compiled = jax.jit(
+            per_horizon_running_rmse,
+            static_argnames=("window_size",),
+        )
+        expected_by_window = {
+            1: np.array([[1.0, 2.0], [1.0, 2.0], [5.0, 10.0]], dtype=np.float32),
+            3: np.tile(np.array([[3.0, 6.0]], dtype=np.float32), (3, 1)),
+        }
+
+        for window_size, expected in expected_by_window.items():
+            eager = per_horizon_running_rmse(
+                predictions,
+                returns,
+                window_size=window_size,
+            )
+            jitted = compiled(predictions, returns, window_size=window_size)
+            np.testing.assert_array_equal(np.asarray(eager), expected)
+            np.testing.assert_array_equal(np.asarray(jitted), expected)
+
+        closed_over = jax.jit(
+            lambda p, r: per_horizon_running_rmse(p, r, window_size=3)
+        )
+        np.testing.assert_array_equal(
+            np.asarray(closed_over(predictions, returns)),
+            expected_by_window[3],
+        )
+
+    def test_nonfinite_errors_remain_visible(self) -> None:
+        predictions = jnp.array([[1.0, 1.0], [jnp.nan, jnp.inf]])
+        returns = jnp.zeros_like(predictions)
+
+        running = per_horizon_running_rmse(predictions, returns, window_size=2)
+
+        assert bool(jnp.all(jnp.isnan(running[:, 0])))
+        assert bool(jnp.all(jnp.isinf(running[:, 1])))
+
+    def test_dynamic_jit_window_is_named_and_default_call_recovers(self) -> None:
+        predictions = jnp.tile(jnp.array([[3.0, -4.0]], dtype=jnp.float32), (100, 1))
+        returns = jnp.zeros_like(predictions)
+        compiled = jax.jit(per_horizon_running_rmse)
+
+        with pytest.raises(ValueError, match=r"^window_size must be a built-in int"):
+            compiled(predictions, returns, window_size=1)
+
+        recovered = compiled(predictions, returns)
+        expected = np.tile(np.array([[3.0, 4.0]], dtype=np.float32), (100, 1))
+        np.testing.assert_array_equal(np.asarray(recovered), expected)
+
+    def test_jit_rejects_broadcasting_at_the_shape_boundary(self) -> None:
+        predictions = jnp.ones((3, 2))
+        returns = jnp.zeros((1, 2))
+
+        with pytest.raises(
+            ValueError,
+            match=r"must be rank-2 arrays with identical nonempty shape \(T, H\)",
+        ):
+            jax.jit(lambda p, r: per_horizon_running_rmse(p, r, window_size=1))(
+                predictions,
+                returns,
+            )
+
     def test_decay(self) -> None:
         # First half big errors, second half no errors. Running RMSE
         # should drop in the second half.
@@ -162,9 +617,3 @@ class TestRunningRMSE:
         assert float(running[-1, 0]) < 0.01
         # Mid-series transition: some error
         assert float(running[19, 0]) > 0.5
-
-    @pytest.mark.parametrize("window_size", [0, 5])
-    def test_window_must_fit_trace(self, window_size: int) -> None:
-        values = jnp.zeros((4, 1))
-        with pytest.raises(ValueError, match="window_size"):
-            per_horizon_running_rmse(values, values, window_size=window_size)

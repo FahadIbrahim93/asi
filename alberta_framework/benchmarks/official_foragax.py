@@ -1227,11 +1227,20 @@ def _strict_json_loads(
             f"{label} contains non-finite JSON constant {constant}"
         )
 
+    def parse_float(value: str) -> float:
+        parsed = float(value)
+        if not math.isfinite(parsed):
+            raise OfficialForagaxValidationError(
+                f"{label} contains non-finite JSON number {value}"
+            )
+        return parsed
+
     try:
         return json.loads(
             value,
             object_pairs_hook=object_pairs,
             parse_constant=reject_constant,
+            parse_float=parse_float,
         )
     except OfficialForagaxValidationError:
         raise
@@ -3586,11 +3595,18 @@ def _sanitize_package_freeze_line(line: str) -> str:
         url = direct_url.get("url")
         if isinstance(url, str) and url.startswith("file:"):
             direct_url["url"] = "<LOCAL_PATH>"
-    return (
-        prefix
-        + " ; direct_url="
-        + json.dumps(direct_url, sort_keys=True, separators=(",", ":"))
-    )
+    try:
+        encoded = json.dumps(
+            direct_url,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (TypeError, ValueError) as exc:
+        raise OfficialForagaxValidationError(
+            "package freeze direct_url is not finite JSON"
+        ) from exc
+    return prefix + " ; direct_url=" + encoded
 
 
 def _extract_probe_payload(stdout: bytes) -> Mapping[str, Any]:
@@ -3951,7 +3967,7 @@ payload = {{
         "class_source_sha256": class_source["sha256"],
     }},
 }}
-sys.stdout.write({_PROBE_PREFIX!r} + json.dumps(payload, sort_keys=True) + "\\n")
+sys.stdout.write({_PROBE_PREFIX!r} + json.dumps(payload, sort_keys=True, allow_nan=False) + "\\n")
 """
     result = _run_execution_python(
         repository=repository,
@@ -4614,7 +4630,7 @@ payload = {{
     }},
     "immutable_runtime": {immutable_runtime!r},
 }}
-sys.stdout.write({_PROBE_PREFIX!r} + json.dumps(payload, sort_keys=True) + "\\n")
+sys.stdout.write({_PROBE_PREFIX!r} + json.dumps(payload, sort_keys=True, allow_nan=False) + "\\n")
 """
     result = _run_execution_python(
         repository=repository,
@@ -5147,14 +5163,15 @@ for distribution in distributions():
                 json.loads(direct_url),
                 sort_keys=True,
                 separators=(",", ":"),
+                allow_nan=False,
             )
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, TypeError, ValueError):
             direct_url = direct_url.strip()
         line += f" ; direct_url={{direct_url}}"
     packages.append(line)
 sys.stdout.write(
     {_PROBE_PREFIX!r}
-    + json.dumps({{"packages": sorted(set(packages))}}, sort_keys=True)
+    + json.dumps({{"packages": sorted(set(packages))}}, sort_keys=True, allow_nan=False)
     + "\\n"
 )
 """
@@ -6239,17 +6256,6 @@ def prepare_official_foragax_batch_run(
     )
 
 
-def _fsync_directory(path: Path) -> None:
-    descriptor, _metadata = _open_directory_path_nofollow(
-        path,
-        label="fsync directory",
-    )
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-
-
 def _create_and_open_directory_path_nofollow(
     path: Path,
     *,
@@ -6882,42 +6888,6 @@ def _recover_stale_running_lock_at(root_descriptor: int) -> None:
         ".running",
         missing_ok=False,
     )
-
-
-def _unlink_and_fsync(path: Path, *, missing_ok: bool = False) -> None:
-    try:
-        path.unlink()
-    except FileNotFoundError:
-        if not missing_ok:
-            raise
-        return
-    _fsync_directory(path.parent)
-
-
-def _atomic_write_bytes(path: Path, contents: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.",
-        suffix=".tmp",
-        dir=path.parent,
-    )
-    temporary_path = Path(temporary_name)
-    try:
-        with os.fdopen(descriptor, "wb") as handle:
-            handle.write(contents)
-            handle.flush()
-            os.fsync(handle.fileno())
-        temporary_path.replace(path)
-        _fsync_directory(path.parent)
-    finally:
-        _unlink_and_fsync(temporary_path, missing_ok=True)
-
-
-def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
-    encoded = (
-        json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n"
-    ).encode()
-    _atomic_write_bytes(path, encoded)
 
 
 def _atomic_write_json_at(

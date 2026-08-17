@@ -5,6 +5,7 @@ import time
 import chex
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 import pytest
 
 from alberta_framework import (
@@ -19,12 +20,66 @@ from alberta_framework import (
     RandomWalkStream,
     StepSizeHistory,
     StepSizeTrackingConfig,
+    WelfordNormalizer,
     agent_age_s,
     agent_uptime_s,
     metrics_to_dicts,
     run_learning_loop,
     run_learning_loop_batched,
 )
+from alberta_framework.core.learners import TDLinearLearner, TrueOnlineTDLearner
+
+
+class TestLinearLearnerNormalizerVeto:
+    """LinearLearner must honour the normalizer's fail-closed verdict like MLPLearner does."""
+
+    @staticmethod
+    def _fail_stopped_welford_state(learner: LinearLearner, feature_dim: int):
+        state = learner.init(feature_dim)
+        boundary = 2**24
+        normalizer_state = state.normalizer_state.replace(  # type: ignore[union-attr]
+            sample_count=jnp.asarray(boundary, dtype=jnp.int32),
+            sample_count_words=jnp.asarray((0, boundary), dtype=jnp.uint32),
+            mean=jnp.full(feature_dim, 100.0, dtype=jnp.float32),
+            var=jnp.full(feature_dim, 4.0, dtype=jnp.float32),
+            p=jnp.full(feature_dim, 4.0 * (boundary - 1), dtype=jnp.float32),
+        )
+        return state.replace(normalizer_state=normalizer_state)  # type: ignore[attr-defined]
+
+    def test_fail_stopped_normalizer_rejects_the_linear_update(self) -> None:
+        normalizer = WelfordNormalizer()
+        learner = LinearLearner(optimizer=LMS(0.1), normalizer=normalizer)
+        state = self._fail_stopped_welford_state(learner, 3)
+        observation = jnp.ones(3, dtype=jnp.float32)
+        diagnostics = normalizer.normalize_with_diagnostics(state.normalizer_state, observation)
+        assert not bool(diagnostics.update_applied)
+
+        result = learner.update(state, observation, jnp.asarray(1.0, dtype=jnp.float32))
+
+        assert not bool(result.update_applied)
+        chex.assert_trees_all_equal(result.state, state)
+
+    def test_mismatched_ema_config_rejects_the_linear_update(self) -> None:
+        normalizer = EMANormalizer(decay=0.99)
+        learner = LinearLearner(optimizer=LMS(0.1), normalizer=normalizer)
+        state = learner.init(3)
+        persisted = state.normalizer_state.replace(  # type: ignore[union-attr]
+            decay=jnp.asarray(0.5, dtype=jnp.float32)
+        )
+        state = state.replace(normalizer_state=persisted)  # type: ignore[attr-defined]
+        assert not bool(normalizer.counter_status(persisted).counter_valid)
+
+        result = learner.update(state, jnp.ones(3, dtype=jnp.float32), jnp.asarray(1.0))
+
+        assert not bool(result.update_applied)
+        chex.assert_trees_all_equal(result.state, state)
+
+    def test_healthy_normalizer_still_applies(self) -> None:
+        learner = LinearLearner(optimizer=LMS(0.1), normalizer=WelfordNormalizer())
+        state = learner.init(3)
+        result = learner.update(state, jnp.ones(3, dtype=jnp.float32), jnp.asarray(1.0))
+        assert bool(result.update_applied)
+        assert int(result.state.step_count) == 1
 
 
 class TestLinearLearner:
@@ -891,3 +946,19 @@ class TestLifecycleUtilities:
 
         state, _ = run_learning_loop(learner, stream, num_steps=100, key=rng_key)
         assert agent_uptime_s(state) > 0.0
+
+
+@pytest.mark.parametrize(
+    "learner",
+    [LinearLearner(), TDLinearLearner(), TrueOnlineTDLearner()],
+)
+def test_linear_family_feature_dimensions_are_exact_and_preflighted(learner) -> None:
+    for invalid in (True, 0, 4.5, 2**31, np.uint64(2**63)):
+        with pytest.raises(ValueError, match="feature_dim"):
+            learner.init(invalid)
+
+    state = learner.init(np.longlong(4))
+    assert state.weights.shape == (4,)
+
+    with pytest.raises(ValueError, match="resource"):
+        learner.init(2**26)

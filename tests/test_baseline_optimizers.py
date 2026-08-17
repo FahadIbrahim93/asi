@@ -87,6 +87,28 @@ class TestAdaGain:
 
         assert recreated.to_config() == config
 
+    def test_full_forget_does_not_multiply_inf_traces(self) -> None:
+        """forgetting_rate=1 drops leftover traces; 0 * inf must not freeze."""
+        optimizer = AdaGain(
+            initial_step_size=0.05,
+            meta_step_size=0.0,
+            forgetting_rate=1.0,
+        )
+        state = optimizer.init(feature_dim=2)
+        state = state.replace(
+            gradient_trace=jnp.full(2, jnp.inf, dtype=jnp.float32),
+            bias_gradient_trace=jnp.asarray(jnp.inf, dtype=jnp.float32),
+        )
+        raw = jnp.asarray(0.0, dtype=jnp.float32) * jnp.asarray(jnp.inf, dtype=jnp.float32)
+        assert not bool(jnp.isfinite(raw))
+
+        observation = jnp.asarray([0.5, -0.25], dtype=jnp.float32)
+        error = jnp.asarray(1.0, dtype=jnp.float32)
+        result = optimizer.update(state, error, observation)
+        assert bool(result.update_applied)
+        chex.assert_trees_all_close(result.new_state.gradient_trace, error * observation)
+        assert float(result.new_state.bias_gradient_trace) == pytest.approx(1.0)
+
 
 # =============================================================================
 # Adam
@@ -263,6 +285,62 @@ class TestAdam:
         assert isinstance(recreated, Adam)
         assert recreated.to_config()["weight_decay"] == pytest.approx(0.0)
 
+    def test_zero_beta_does_not_multiply_inf_moments(self):
+        """beta1=beta2=0 times an infinite moment EMA is NaN."""
+        optimizer = Adam(step_size=0.01, beta1=0.0, beta2=0.0)
+        state = optimizer.init(feature_dim=3).replace(
+            m=jnp.full(3, jnp.inf, dtype=jnp.float32),
+            v=jnp.full(3, jnp.inf, dtype=jnp.float32),
+            bias_m=jnp.asarray(jnp.inf, dtype=jnp.float32),
+            bias_v=jnp.asarray(jnp.inf, dtype=jnp.float32),
+        )
+        raw = jnp.asarray(0.0, dtype=jnp.float32) * jnp.asarray(jnp.inf, dtype=jnp.float32)
+        assert not bool(jnp.isfinite(raw))
+
+        result = optimizer.update(
+            state,
+            jnp.asarray(0.5, dtype=jnp.float32),
+            jnp.ones(3, dtype=jnp.float32),
+        )
+        assert bool(result.update_applied)
+        chex.assert_tree_all_finite(result.new_state)
+        chex.assert_tree_all_finite(result.weight_delta)
+        chex.assert_tree_all_finite(result.bias_delta)
+
+    def test_zero_beta_recovers_poisoned_per_parameter_moments(self):
+        """The checked MLP path has the same zero-decay recovery contract."""
+        optimizer = Adam(step_size=0.01, beta1=0.0, beta2=0.0)
+        state = optimizer.init_for_shape((2, 3)).replace(
+            m=jnp.full((2, 3), jnp.inf, dtype=jnp.float32),
+            v=jnp.full((2, 3), jnp.inf, dtype=jnp.float32),
+        )
+
+        result = optimizer.update_from_gradient_checked(
+            state,
+            jnp.full((2, 3), 0.25, dtype=jnp.float32),
+        )
+
+        assert bool(result.update_applied)
+        chex.assert_tree_all_finite(result.step)
+        chex.assert_tree_all_finite(result.new_state)
+
+    def test_zero_config_does_not_relax_a_nonzero_persisted_beta(self):
+        """Recovery requires the persisted tracker decay itself to be disabled."""
+        optimizer = Adam(step_size=0.01, beta1=0.0, beta2=0.0)
+        state = optimizer.init_for_shape((3,)).replace(
+            beta1=jnp.asarray(0.5, dtype=jnp.float32),
+            m=jnp.full(3, jnp.inf, dtype=jnp.float32),
+        )
+
+        result = optimizer.update_from_gradient_checked(
+            state,
+            jnp.ones(3, dtype=jnp.float32),
+        )
+
+        assert not bool(result.update_applied)
+        chex.assert_trees_all_equal(result.new_state, state)
+        chex.assert_trees_all_equal(result.step, jnp.zeros(3, dtype=jnp.float32))
+
 
 # =============================================================================
 # RMSprop
@@ -330,6 +408,59 @@ class TestRMSprop:
         assert isinstance(state, RMSpropParamState)
         chex.assert_shape(state.v, (3, 4))
         chex.assert_trees_all_close(state.v, jnp.zeros((3, 4)))
+
+    def test_zero_decay_does_not_multiply_inf_second_moment(self):
+        """decay=0 times an infinite squared-gradient EMA is NaN."""
+        optimizer = RMSprop(step_size=0.01, decay=0.0)
+        state = optimizer.init(feature_dim=3).replace(
+            v=jnp.full(3, jnp.inf, dtype=jnp.float32),
+            bias_v=jnp.asarray(jnp.inf, dtype=jnp.float32),
+        )
+        raw = jnp.asarray(0.0, dtype=jnp.float32) * jnp.asarray(jnp.inf, dtype=jnp.float32)
+        assert not bool(jnp.isfinite(raw))
+
+        result = optimizer.update(
+            state,
+            jnp.asarray(0.5, dtype=jnp.float32),
+            jnp.ones(3, dtype=jnp.float32),
+        )
+        assert bool(result.update_applied)
+        chex.assert_tree_all_finite(result.new_state)
+        chex.assert_tree_all_finite(result.weight_delta)
+        chex.assert_tree_all_finite(result.bias_delta)
+
+    def test_zero_decay_recovers_poisoned_per_parameter_moment(self):
+        """The checked MLP path skips a disabled poisoned second moment."""
+        optimizer = RMSprop(step_size=0.01, decay=0.0)
+        state = optimizer.init_for_shape((2, 3)).replace(
+            v=jnp.full((2, 3), jnp.inf, dtype=jnp.float32)
+        )
+
+        result = optimizer.update_from_gradient_checked(
+            state,
+            jnp.full((2, 3), 0.25, dtype=jnp.float32),
+        )
+
+        assert bool(result.update_applied)
+        chex.assert_tree_all_finite(result.step)
+        chex.assert_tree_all_finite(result.new_state)
+
+    def test_zero_config_does_not_relax_a_nonzero_persisted_decay(self):
+        """A nonzero persisted decay still consumes and validates its history."""
+        optimizer = RMSprop(step_size=0.01, decay=0.0)
+        state = optimizer.init_for_shape((3,)).replace(
+            decay=jnp.asarray(0.5, dtype=jnp.float32),
+            v=jnp.full(3, jnp.inf, dtype=jnp.float32),
+        )
+
+        result = optimizer.update_from_gradient_checked(
+            state,
+            jnp.ones(3, dtype=jnp.float32),
+        )
+
+        assert not bool(result.update_applied)
+        chex.assert_trees_all_equal(result.new_state, state)
+        chex.assert_trees_all_equal(result.step, jnp.zeros(3, dtype=jnp.float32))
 
 
 # =============================================================================
@@ -427,3 +558,22 @@ class TestNADALINE:
         result = optimizer.update(state, error, observation)
         # bias_delta = alpha * error
         assert float(result.bias_delta) == pytest.approx(0.05 * 0.7, abs=1e-6)
+
+    def test_zero_decay_does_not_multiply_inf_second_moment(self):
+        """decay=0 times an infinite feature second-moment EMA is NaN."""
+        optimizer = NADALINE(step_size=0.01, decay=0.0)
+        state = optimizer.init(feature_dim=3).replace(
+            feature_second_moment=jnp.full(3, jnp.inf, dtype=jnp.float32),
+        )
+        raw = jnp.asarray(0.0, dtype=jnp.float32) * jnp.asarray(jnp.inf, dtype=jnp.float32)
+        assert not bool(jnp.isfinite(raw))
+
+        result = optimizer.update(
+            state,
+            jnp.asarray(0.5, dtype=jnp.float32),
+            jnp.ones(3, dtype=jnp.float32),
+        )
+        assert bool(result.update_applied)
+        chex.assert_tree_all_finite(result.new_state)
+        chex.assert_tree_all_finite(result.weight_delta)
+        chex.assert_tree_all_finite(result.bias_delta)

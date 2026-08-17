@@ -1,5 +1,8 @@
 """Tests for the closed-loop micro-MDPs (actions affect observations)."""
 
+from fractions import Fraction
+from numbers import Real
+
 import chex
 import jax
 import jax.numpy as jnp
@@ -17,6 +20,32 @@ from alberta_framework.streams import (
     SwitchingTwoStateConfig,
     SwitchingTwoStateMDP,
 )
+from alberta_framework.streams.closed_loop import (
+    RiverSwimState,
+    SwitchingTwoStateState,
+    _riverswim_persistent_resources,
+)
+
+_INT32_MAX = 2**31 - 1
+_INVALID_PHASE_LENGTHS = (0, -1, False, True, 1.5, None, 2**31, 10**100)
+
+
+class _SpoofedReward:
+    """Non-real object whose ``__class__`` property impersonates ``float``."""
+
+    @property
+    def __class__(self) -> type:  # type: ignore[override]
+        return float
+
+    def as_integer_ratio(self) -> tuple[int, int]:
+        return (1, 2)
+
+
+class _ExplodingRewardFloat(float):
+    """Float subclass whose untrusted ratio hook must never execute."""
+
+    def as_integer_ratio(self) -> tuple[int, int]:
+        raise RuntimeError("untrusted reward ratio hook executed")
 
 
 def _rollout_two_state(
@@ -121,13 +150,63 @@ class TestSwitchingTwoStateDynamics:
         assert float(reward_a) == 1.0
         assert float(reward_b) == 0.0
 
-    def test_invalid_config_raises(self):
-        """Bad phase lengths and payoff shapes are rejected."""
-        with pytest.raises(ValueError, match="phase_length"):
-            SwitchingTwoStateMDP(SwitchingTwoStateConfig(phase_length=0))
+    @pytest.mark.parametrize("phase_length", _INVALID_PHASE_LENGTHS)
+    def test_invalid_phase_length_raises(self, phase_length):
+        """Schedule divisors must be built-in positive JAX-int32 integers."""
+        with pytest.raises(
+            ValueError,
+            match=rf"phase_length must be a positive integer in \[1, {_INT32_MAX}\]",
+        ):
+            SwitchingTwoStateMDP(
+                SwitchingTwoStateConfig(phase_length=phase_length)  # type: ignore[arg-type]
+            )
+
+    def test_int32_max_phase_length_runs_first_eager_and_jit_query(self):
+        """The largest JAX-int32 phase divisor is accepted without overflow."""
+        env = SwitchingTwoStateMDP(SwitchingTwoStateConfig(phase_length=_INT32_MAX))
+        state = env.init(jr.key(0))
+        assert int(env.phase_id(state)) == PHASE_A
+        assert int(jax.jit(env.phase_id)(state)) == PHASE_A
+
+    def test_switching_config_rejects_bool_and_nan_identities(self):
+        """Switching payoff records must not persist True/NaN identities."""
+        with pytest.raises(
+            ValueError,
+            match=rf"phase_length must be a positive integer in \[1, {_INT32_MAX}\]",
+        ):
+            SwitchingTwoStateConfig(phase_length=True)
+        with pytest.raises(ValueError, match="finite"):
+            SwitchingTwoStateConfig(payoffs_a=((True, 1.0), (1.0, 0.0)))
+        with pytest.raises(ValueError, match="finite"):
+            SwitchingTwoStateConfig(payoffs_b=((1.0, 0.0), (0.0, float("nan"))))
+
+    def test_invalid_payoff_shape_raises(self):
+        """Payoff matrices must preserve the fixed state/action shape."""
         with pytest.raises(ValueError, match="2x2"):
             SwitchingTwoStateMDP(
                 SwitchingTwoStateConfig(payoffs_a=((0.0, 1.0, 2.0),) * 2)  # type: ignore[arg-type]
+            )
+
+    @pytest.mark.parametrize(
+        "payoffs_a",
+        [
+            ((float("nan"), 0.0), (0.0, 1.0)),
+            ((float("inf"), 0.0), (0.0, 1.0)),
+            ((-1.0, 0.0), (0.0, float("-inf"))),
+        ],
+    )
+    def test_non_finite_payoffs_raise(self, payoffs_a):
+        """Payoff matrices must contain only finite values."""
+        with pytest.raises(ValueError, match="finite"):
+            SwitchingTwoStateMDP(SwitchingTwoStateConfig(payoffs_a=payoffs_a))
+
+    def test_non_finite_payoffs_b_raise(self):
+        """payoffs_b is validated like payoffs_a."""
+        with pytest.raises(ValueError, match="finite"):
+            SwitchingTwoStateMDP(
+                SwitchingTwoStateConfig(
+                    payoffs_b=((0.0, float("nan")), (1.0, 0.0))  # type: ignore[arg-type]
+                )
             )
 
 
@@ -252,6 +331,71 @@ class TestSwitchingScanRollout:
 class TestRiverSwim:
     """Dynamics, rewards, and analytic helpers of the stochastic variant."""
 
+    @pytest.mark.parametrize("reward_left", [float("nan"), float("inf"), float("-inf")])
+    def test_non_finite_reward_left_raises(self, reward_left):
+        """reward_left must be finite."""
+        with pytest.raises(ValueError, match="reward_left must be finite"):
+            RiverSwimMDP(RiverSwimConfig(reward_left=reward_left))
+
+    @pytest.mark.parametrize("reward_right", [float("nan"), float("inf")])
+    def test_non_finite_reward_right_raises(self, reward_right):
+        """reward_right must be finite."""
+        with pytest.raises(ValueError, match="reward_right must be finite"):
+            RiverSwimMDP(RiverSwimConfig(reward_right=reward_right))
+
+    @pytest.mark.parametrize("field", ["reward_left", "reward_right"])
+    @pytest.mark.parametrize(
+        "value",
+        [
+            True,
+            np.bool_(False),
+            "0.5",
+            object(),
+            _SpoofedReward(),
+            _ExplodingRewardFloat(0.5),
+            1.0e100,
+            -1.0e100,
+        ],
+        ids=(
+            "bool",
+            "numpy-bool",
+            "string",
+            "object",
+            "class-spoof",
+            "exploding-ratio",
+            "positive-overflow",
+            "negative-overflow",
+        ),
+    )
+    def test_rewards_reject_untrusted_or_non_float32_values(
+        self,
+        field: str,
+        value: object,
+    ) -> None:
+        with pytest.raises(ValueError, match=field):
+            RiverSwimMDP(RiverSwimConfig(**{field: value}))  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize("field", ["reward_left", "reward_right"])
+    def test_rewards_are_canonicalized_directly_to_json_safe_float32(
+        self,
+        field: str,
+    ) -> None:
+        midpoint_plus = Fraction(1) + Fraction(1, 1 << 24) + Fraction(1, 1 << 60)
+        expected = float(np.nextafter(np.float32(1.0), np.float32(2.0)))
+
+        env = RiverSwimMDP(RiverSwimConfig(**{field: midpoint_plus}))  # type: ignore[arg-type]
+        stored = getattr(env.config, field)
+
+        assert type(stored) is float
+        assert stored == expected
+        assert np.isfinite(np.asarray(env.reward_tensor)).all()
+
+    @pytest.mark.parametrize("initial_state", [1.5, True, 2.0])
+    def test_non_integer_initial_state_raises(self, initial_state):
+        """initial_state must be a canonical integer in range."""
+        with pytest.raises(ValueError, match="initial_state must be an integer"):
+            RiverSwimMDP(RiverSwimConfig(initial_state=initial_state))  # type: ignore[arg-type]
+
     def test_transition_tensor_structure(self):
         """Kernels are row-stochastic with drift folded at the boundaries."""
         config = RiverSwimConfig(n_states=4, p_right_up=0.3, p_right_down=0.1)
@@ -356,6 +500,10 @@ class TestRiverSwim:
         """Chain length, drift, and start-state validation."""
         with pytest.raises(ValueError, match="n_states"):
             RiverSwimMDP(RiverSwimConfig(n_states=1))
+        with pytest.raises(ValueError, match="p_right_up must be finite"):
+            RiverSwimMDP(RiverSwimConfig(p_right_up=float("nan")))
+        with pytest.raises(ValueError, match="p_right_down must be finite"):
+            RiverSwimMDP(RiverSwimConfig(p_right_down=float("nan")))
         with pytest.raises(ValueError, match="p_right_down"):
             RiverSwimMDP(RiverSwimConfig(p_right_down=0.0))
         with pytest.raises(ValueError, match="must not exceed 1"):
@@ -364,3 +512,305 @@ class TestRiverSwim:
             RiverSwimMDP(RiverSwimConfig(n_states=3, initial_state=3))
         with pytest.raises(ValueError, match="policy"):
             RiverSwimMDP(RiverSwimConfig(n_states=3)).policy_average_reward([0, 1])
+
+    def test_riverswim_config_rejects_bool_and_nan_identities(self):
+        """The public config record must not persist True/NaN step identities."""
+        with pytest.raises(ValueError, match="p_right_up must be finite"):
+            RiverSwimConfig(p_right_up=True)
+        with pytest.raises(ValueError, match="p_right_up must be finite"):
+            RiverSwimConfig(p_right_up=float("nan"))
+        with pytest.raises(ValueError, match="n_states"):
+            RiverSwimConfig(n_states=True)
+        with pytest.raises(ValueError, match="reward_left"):
+            RiverSwimConfig(reward_left=True)
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            True,
+            False,
+            "0.2",
+            None,
+            10**400,
+            1.0e-50,
+            np.nextafter(np.longdouble(0.0), np.longdouble(1.0)),
+            jnp.asarray(0.2),
+            jnp.asarray([0.2]),
+        ],
+    )
+    @pytest.mark.parametrize("field", ["p_right_up", "p_right_down"])
+    def test_transition_probabilities_require_positive_float32_reals(
+        self,
+        field,
+        value,
+    ):
+        kwargs = {field: value}
+        with pytest.raises(ValueError, match=field):
+            RiverSwimMDP(RiverSwimConfig(**kwargs))
+
+    @pytest.mark.parametrize("field", ["p_right_up", "p_right_down"])
+    def test_transition_probabilities_reject_class_spoofed_reals(self, field):
+        """``__class__``-spoofed non-``Real`` objects must not defeat validation."""
+
+        class _SpoofedFloat:
+            """Mimics ``float`` via ``__class__`` to defeat ``isinstance``."""
+
+            @property
+            def __class__(self) -> type:  # type: ignore[override]
+                return float
+
+            def __float__(self) -> float:
+                return 0.3
+
+            def as_integer_ratio(self) -> tuple[int, int]:
+                return (3, 10)
+
+        assert isinstance(_SpoofedFloat(), Real)
+        assert not issubclass(type(_SpoofedFloat()), Real)
+
+        kwargs = {field: _SpoofedFloat()}
+        with pytest.raises(ValueError, match=field):
+            RiverSwimMDP(RiverSwimConfig(**kwargs))  # type: ignore[arg-type]
+
+    def test_transition_probabilities_preserve_real_scalars_and_normalize_runtime(self):
+        env = RiverSwimMDP(
+            RiverSwimConfig(
+                p_right_up=Fraction(1, 5),
+                p_right_down=np.float64(0.1),
+            )
+        )
+
+        assert type(env.config.p_right_up) is float
+        assert type(env.config.p_right_down) is float
+        assert env.config.p_right_up == float(np.float32(0.2))
+        assert env.config.p_right_down == float(np.float32(0.1))
+        np.testing.assert_allclose(env.transition_tensor.sum(axis=2), 1.0, atol=1e-7)
+
+    def test_float32_probability_sum_cannot_create_invalid_stay_mass(self):
+        with pytest.raises(ValueError, match="must not exceed 1"):
+            RiverSwimMDP(
+                RiverSwimConfig(
+                    p_right_up=0.6,
+                    p_right_down=0.4,
+                )
+            )
+
+    @pytest.mark.parametrize(
+        ("p_right_up", "p_right_down"),
+        [
+            (
+                np.nextafter(np.longdouble(0.5), np.longdouble(1.0)),
+                np.longdouble(0.5),
+            ),
+            (Fraction((2**100) + 1, 2**101), Fraction(1, 2)),
+        ],
+    )
+    def test_transition_probability_sum_is_checked_before_narrowing(
+        self,
+        p_right_up,
+        p_right_down,
+    ):
+        with pytest.raises(ValueError, match="must not exceed 1"):
+            RiverSwimMDP(
+                RiverSwimConfig(
+                    p_right_up=p_right_up,
+                    p_right_down=p_right_down,
+                )
+            )
+
+
+@pytest.mark.parametrize("code", ("b", "B", "h", "H", "i", "I", "l", "L", "q", "Q"))
+def test_closed_loop_integer_configs_accept_and_canonicalize_numpy_families(code: str) -> None:
+    integer_type = np.dtype(code).type
+    switching = SwitchingTwoStateMDP(
+        SwitchingTwoStateConfig(phase_length=integer_type(3))
+    )
+    river = RiverSwimMDP(
+        RiverSwimConfig(n_states=integer_type(4), initial_state=integer_type(1))
+    )
+    assert type(switching.config.phase_length) is int
+    assert type(river.config.n_states) is int
+    assert type(river.config.initial_state) is int
+
+
+def test_closed_loop_integer_rejection_never_invokes_hostile_hooks() -> None:
+    class HostileInt(int):
+        def __index__(self) -> int:
+            raise AssertionError("untrusted index hook executed")
+
+        def __repr__(self) -> str:
+            raise AssertionError("untrusted repr hook executed")
+
+    class ClassSpoof:
+        @property
+        def __class__(self) -> type:  # type: ignore[override]
+            return int
+
+        def __repr__(self) -> str:
+            raise AssertionError("untrusted repr hook executed")
+
+    with pytest.raises(ValueError, match="phase_length"):
+        SwitchingTwoStateConfig(phase_length=HostileInt(2))
+    with pytest.raises(ValueError, match="phase_length"):
+        SwitchingTwoStateConfig(phase_length=ClassSpoof())  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="n_states"):
+        RiverSwimConfig(n_states=ClassSpoof())  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="initial_state"):
+        RiverSwimConfig(initial_state=HostileInt(0))
+
+
+def test_riverswim_resource_formula_matches_resident_arrays() -> None:
+    env = RiverSwimMDP(RiverSwimConfig(n_states=5))
+    actual_bytes = (
+        env._transitions_np.nbytes
+        + env._rewards_np.nbytes
+        + env._transition_logits.nbytes
+        + env._rewards.nbytes
+    )
+    assert env.persistent_resource_budget == _riverswim_persistent_resources(5)
+    assert env.persistent_resource_budget["persistent_bytes"] == actual_bytes
+
+
+def test_riverswim_resource_limit_fails_before_numpy_allocation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert _riverswim_persistent_resources(2047)["persistent_bytes"] <= 64 * 1024 * 1024
+    monkeypatch.setattr(
+        np,
+        "zeros",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("allocation started")),
+    )
+    with pytest.raises(ValueError, match="64 MiB"):
+        RiverSwimMDP(RiverSwimConfig(n_states=2048))
+
+
+def test_riverswim_exact_policy_api_has_separate_practical_bound() -> None:
+    env = RiverSwimMDP(RiverSwimConfig(n_states=13))
+    with pytest.raises(ValueError, match="at most 12"):
+        env.optimal_policy()
+    with pytest.raises(ValueError, match="at most 12"):
+        env.optimal_average_reward()
+
+
+def test_closed_loop_step_counts_saturate_eager_and_outer_jit() -> None:
+    maximum = jnp.asarray(_INT32_MAX, dtype=jnp.int32)
+    switching = SwitchingTwoStateMDP()
+    switching_state = SwitchingTwoStateState(
+        state_index=jnp.asarray(0, dtype=jnp.int32), step_count=maximum
+    )
+    switched = jax.jit(lambda state: switching.step(state, jnp.asarray(1), jr.key(0))[2])(
+        switching_state
+    )
+    assert int(switched.step_count) == _INT32_MAX
+
+    river = RiverSwimMDP()
+    river_state = RiverSwimState(
+        state_index=jnp.asarray(0, dtype=jnp.int32), step_count=maximum
+    )
+    advanced = river.step(river_state, jnp.asarray(0), jr.key(1))[2]
+    assert int(advanced.step_count) == _INT32_MAX
+
+
+@pytest.mark.parametrize(
+    "state",
+    (
+        RiverSwimState(
+            state_index=jnp.zeros((1,), dtype=jnp.int32),
+            step_count=jnp.asarray(0, dtype=jnp.int32),
+        ),
+        RiverSwimState(
+            state_index=jnp.asarray(0, dtype=jnp.int16),
+            step_count=jnp.asarray(0, dtype=jnp.int32),
+        ),
+    ),
+)
+def test_riverswim_rejects_invalid_static_state_contract(state: RiverSwimState) -> None:
+    env = RiverSwimMDP()
+    with pytest.raises((TypeError, ValueError), match="state.state_index"):
+        env.step(state, jnp.asarray(0), jr.key(0))
+
+
+def test_closed_loop_configs_require_exact_record_types() -> None:
+    class SwitchingSubclass(SwitchingTwoStateConfig):
+        pass
+
+    class RiverSubclass(RiverSwimConfig):
+        pass
+
+    with pytest.raises(ValueError, match="actual SwitchingTwoStateConfig"):
+        SwitchingTwoStateMDP(SwitchingSubclass())
+    with pytest.raises(ValueError, match="actual RiverSwimConfig"):
+        RiverSwimMDP(RiverSubclass())
+
+
+@pytest.mark.parametrize("value", [True, np.bool_(False), "0.5", object()])
+def test_switching_payoffs_reject_non_concrete_real_scalars(value: object) -> None:
+    with pytest.raises(ValueError, match=r"payoffs_a\[0\]\[0\]"):
+        SwitchingTwoStateMDP(
+            SwitchingTwoStateConfig(payoffs_a=((value, 0.0), (0.0, 1.0)))  # type: ignore[arg-type]
+        )
+
+
+def test_switching_payoffs_are_canonical_tuple_float32_values() -> None:
+    env = SwitchingTwoStateMDP(
+        SwitchingTwoStateConfig(
+            payoffs_a=np.asarray(
+                [[Fraction(1, 10), np.float64(0.2)], [np.int16(1), 0.0]],
+                dtype=object,
+            )  # type: ignore[arg-type]
+        )
+    )
+
+    assert type(env.config.payoffs_a) is tuple
+    assert all(type(row) is tuple for row in env.config.payoffs_a)
+    assert all(type(value) is float for row in env.config.payoffs_a for value in row)
+    assert env.config.payoffs_a[0][0] == float(np.float32(0.1))
+
+
+def test_hostile_payoff_container_failure_never_formats_repr() -> None:
+    class HostileContainer:
+        def __len__(self) -> int:
+            raise RuntimeError("hostile length")
+
+        def __repr__(self) -> str:
+            raise AssertionError("untrusted repr hook executed")
+
+    with pytest.raises(ValueError, match="payoffs_a"):
+        SwitchingTwoStateMDP(
+            SwitchingTwoStateConfig(payoffs_a=HostileContainer())  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.parametrize("field", ["p_right_up", "p_right_down"])
+def test_riverswim_probability_ratio_hook_runs_once(field: str) -> None:
+    class CountingReal(float):
+        def __new__(cls):
+            instance = super().__new__(cls, 0.2)
+            instance.calls = 0
+            return instance
+
+        def as_integer_ratio(self) -> tuple[int, int]:
+            self.calls += 1
+            return (1, 5)
+
+    value = CountingReal()
+    env = RiverSwimMDP(RiverSwimConfig(**{field: value}))  # type: ignore[arg-type]
+
+    assert value.calls == 1
+    assert getattr(env.config, field) == float(np.float32(0.2))
+
+
+@pytest.mark.parametrize("field", ["p_right_up", "p_right_down"])
+def test_riverswim_probability_exception_is_normalized_without_repr(field: str) -> None:
+    class ExplodingReal(float):
+        def __new__(cls):
+            return super().__new__(cls, 0.2)
+
+        def as_integer_ratio(self) -> tuple[int, int]:
+            raise RuntimeError("hostile ratio")
+
+        def __repr__(self) -> str:
+            raise AssertionError("untrusted repr hook executed")
+
+    with pytest.raises(ValueError, match=field):
+        RiverSwimMDP(RiverSwimConfig(**{field: ExplodingReal()}))  # type: ignore[arg-type]

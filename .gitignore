@@ -4,7 +4,13 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
+.hypothesis/
+.coverage
+.coverage.*
+htmlcov/
+build/
 dist/
+*.egg-info/
 
 # Benchmark-run bulk that is NOT evidence: frozen source duplicates used for
 # concurrent-edit-proof matrix execution, failed-run diagnostic retries, and
@@ -12,6 +18,7 @@ dist/
 outputs/forager/frozen_src_*/
 outputs/forager/*failed_source_drift*/
 outputs/forager/relearning_logs/
+outputs/forager/local_toolchain/
 outputs/forager/**/*.running
 outputs/upgd_ipmnist/reconstructed_openml_cache/
 outputs/upgd_label_emnist/openml_cache/

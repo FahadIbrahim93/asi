@@ -1,7 +1,9 @@
 """Tests for LMS, IDBD, Autostep, and ObGD optimizers."""
 
 import chex
+import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 
 from alberta_framework import (
@@ -13,6 +15,9 @@ from alberta_framework import (
     ObGD,
     optimizer_from_config,
 )
+from alberta_framework.core.optimizers import TDIDBD, AutoTDIDBD
+
+_INT32_MAX = 2**31 - 1
 
 
 class TestLMS:
@@ -63,6 +68,30 @@ class TestIDBD:
         chex.assert_trees_all_close(state.traces, jnp.zeros(10))
         assert state.meta_step_size == pytest.approx(0.001)
 
+    @pytest.mark.parametrize("initial_step_size", [float("nan"), float("inf"), 0.0, -0.1, True])
+    def test_rejects_illegal_initial_step_size(self, initial_step_size: object) -> None:
+        with pytest.raises(ValueError, match="initial_step_size"):
+            IDBD(initial_step_size=initial_step_size)  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize("meta_step_size", [float("nan"), float("inf"), -0.1, True])
+    def test_rejects_illegal_meta_step_size(self, meta_step_size: object) -> None:
+        with pytest.raises(ValueError, match="meta_step_size"):
+            IDBD(meta_step_size=meta_step_size)  # type: ignore[arg-type]
+
+    def test_zero_meta_step_size_remains_legal(self) -> None:
+        optimizer = IDBD(initial_step_size=0.01, meta_step_size=0.0)
+        state = optimizer.init(feature_dim=2)
+        assert float(state.meta_step_size) == 0.0
+        assert bool(jnp.all(jnp.isfinite(state.log_step_sizes)))
+
+    def test_positive_meta_step_size_must_survive_float32_narrowing(self) -> None:
+        with pytest.raises(ValueError, match="remain nonzero"):
+            IDBD(meta_step_size=1e-100)
+
+        smallest_subnormal = float(np.nextafter(np.float32(0.0), np.float32(1.0)))
+        state = IDBD(meta_step_size=smallest_subnormal).init(feature_dim=2)
+        assert float(state.meta_step_size) == smallest_subnormal
+
     def test_update_returns_correct_shapes(self, sample_observation):
         """IDBD update should return correctly shaped deltas."""
         optimizer = IDBD()
@@ -109,6 +138,70 @@ class TestIDBD:
         assert "mean_step_size" in result.metrics
         assert "min_step_size" in result.metrics
         assert "max_step_size" in result.metrics
+
+    def test_infinite_error_does_not_poison_step_sizes(self):
+        """An inf error against fresh zero traces must skip adaptation.
+
+        h=0 means "no gradient correlation yet": inf * 0 = NaN used to flow
+        through the clip (clip(NaN) is NaN), leaving log step-sizes, the bias
+        step-size, and every later finite update permanently NaN.
+        """
+        optimizer = IDBD(initial_step_size=0.01, meta_step_size=0.01)
+        state = optimizer.init(feature_dim=2)
+        observation = jnp.ones(2, dtype=jnp.float32)
+
+        poisoned = optimizer.update(state, jnp.array(jnp.inf, dtype=jnp.float32), observation)
+        assert bool(jnp.all(jnp.isfinite(poisoned.new_state.log_step_sizes)))
+        assert bool(jnp.isfinite(poisoned.new_state.bias_step_size))
+        # Skipped adaptation keeps the previous (clipped) log step-sizes.
+        chex.assert_trees_all_close(poisoned.new_state.log_step_sizes, state.log_step_sizes)
+
+        recovered = optimizer.update(
+            poisoned.new_state, jnp.array(1.0, dtype=jnp.float32), observation
+        )
+        assert bool(jnp.all(jnp.isfinite(recovered.new_state.log_step_sizes)))
+
+    def test_collapsed_h_decay_does_not_multiply_inf_traces(self) -> None:
+        """When 1 - alpha x^2 collapses to 0, leftover inf h-traces are 0*inf."""
+        optimizer = IDBD(initial_step_size=0.01, meta_step_size=0.0)
+        state = optimizer.init(feature_dim=2)
+        observation = jnp.array([10.0, 10.0], dtype=jnp.float32)
+        state = state.replace(traces=jnp.full(2, jnp.inf, dtype=jnp.float32))
+        raw = jnp.asarray(0.0, dtype=jnp.float32) * jnp.asarray(jnp.inf, dtype=jnp.float32)
+        assert not bool(jnp.isfinite(raw))
+
+        result = optimizer.update(state, jnp.array(1.0, dtype=jnp.float32), observation)
+        assert bool(result.update_applied)
+        chex.assert_tree_all_finite(result.new_state.traces)
+        expected = jnp.exp(state.log_step_sizes) * observation
+        chex.assert_trees_all_close(result.new_state.traces, expected)
+
+    def test_finite_overflow_product_keeps_meta_update_zero(self):
+        """|error * x| overflowing float32 must not NaN a zero-trace channel.
+
+        (error * x) * h evaluates inf * 0 = NaN when the finite product
+        overflows; the non-finite guard skips adaptation for that channel
+        (previous log step-size kept), which equals the zero meta-update the
+        h=0 contract demands.
+        """
+        optimizer = IDBD(initial_step_size=0.01, meta_step_size=0.01)
+        state = optimizer.init(feature_dim=2)
+        observation = jnp.array([1e20, 1.0], dtype=jnp.float32)
+
+        result = optimizer.update(state, jnp.array(1e20, dtype=jnp.float32), observation)
+        assert bool(jnp.all(jnp.isfinite(result.new_state.log_step_sizes)))
+        chex.assert_trees_all_close(result.new_state.log_step_sizes, state.log_step_sizes)
+
+    def test_finite_gradients_still_adapt_after_guard(self):
+        """The non-finite guard must not change ordinary adaptation."""
+        optimizer = IDBD(initial_step_size=0.01, meta_step_size=0.05)
+        state = optimizer.init(feature_dim=2)
+        observation = jnp.ones(2, dtype=jnp.float32)
+
+        first = optimizer.update(state, jnp.array(1.0), observation)
+        second = optimizer.update(first.new_state, jnp.array(1.0), observation)
+        # Correlated errors on the same feature raise the log step-sizes.
+        assert bool(jnp.all(second.new_state.log_step_sizes > state.log_step_sizes))
 
 
 class TestAutostep:
@@ -213,9 +306,10 @@ class TestAutostep:
         result = optimizer.update(state, error, large_observation)
 
         # After M normalization: sum(alpha_i * x_i^2) + alpha_bias <= 1.0
-        effective = jnp.sum(
-            result.new_state.step_sizes * large_observation**2
-        ) + result.new_state.bias_step_size
+        effective = (
+            jnp.sum(result.new_state.step_sizes * large_observation**2)
+            + result.new_state.bias_step_size
+        )
         assert float(effective) <= 1.0 + 1e-6
 
     def test_normalizer_tracks_meta_gradient_not_primary(self):
@@ -241,6 +335,136 @@ class TestAutostep:
         # v[2]/v[0] should be closer to (3/1)^2 = 9 than to (3/1) = 3
         ratio = float(v[2]) / float(jnp.maximum(v[0], 1e-10))
         assert ratio > 4.0  # Well above linear (3), closer to quadratic (9)
+
+    def test_nonfinite_meta_gradient_does_not_poison_adaptation_state(self):
+        """A non-finite correlation must preserve the last finite meta-state."""
+        optimizer = Autostep(initial_step_size=0.01, meta_step_size=0.01)
+        observation = jnp.ones(2, dtype=jnp.float32)
+        state = optimizer.init(feature_dim=2)
+
+        fresh = optimizer.update(state, jnp.array(jnp.inf), observation).new_state
+        chex.assert_trees_all_close(fresh.step_sizes, state.step_sizes)
+        chex.assert_trees_all_close(fresh.normalizers, state.normalizers)
+        chex.assert_trees_all_close(fresh.traces, state.traces)
+        chex.assert_trees_all_close(fresh.bias_step_size, state.bias_step_size)
+        chex.assert_trees_all_close(fresh.bias_normalizer, state.bias_normalizer)
+        chex.assert_trees_all_close(fresh.bias_trace, state.bias_trace)
+
+        warmed = state
+        for _ in range(5):
+            warmed = optimizer.update(warmed, jnp.array(1.0), observation).new_state
+        finite_reference = optimizer.update(warmed, jnp.array(1.0), observation).new_state
+        guarded = optimizer.update(warmed, jnp.array(jnp.inf), observation).new_state
+        chex.assert_trees_all_close(guarded.step_sizes, warmed.step_sizes)
+        chex.assert_trees_all_close(guarded.normalizers, warmed.normalizers)
+        chex.assert_trees_all_close(guarded.traces, warmed.traces)
+        chex.assert_trees_all_close(guarded.bias_step_size, warmed.bias_step_size)
+        chex.assert_trees_all_close(guarded.bias_normalizer, warmed.bias_normalizer)
+        chex.assert_trees_all_close(guarded.bias_trace, warmed.bias_trace)
+
+        recovered = optimizer.update(guarded, jnp.array(1.0), observation).new_state
+        chex.assert_trees_all_close(recovered, finite_reference)
+
+    def test_gradient_path_nonfinite_correlation_keeps_meta_state_finite(self):
+        """The arbitrary-shape Autostep path has the same guarded meta-update."""
+        optimizer = Autostep(initial_step_size=0.01, meta_step_size=0.01)
+        state = optimizer.init_for_shape((4, 3))
+
+        _, guarded = optimizer.update_from_gradient(
+            state,
+            jnp.full((4, 3), jnp.inf, dtype=jnp.float32),
+            error=jnp.array(1.0),
+        )
+
+        chex.assert_trees_all_close(guarded.step_sizes, state.step_sizes)
+        chex.assert_trees_all_close(guarded.normalizers, state.normalizers)
+        chex.assert_trees_all_close(guarded.traces, state.traces)
+
+        finite_gradient = jnp.full((4, 3), 0.1, dtype=jnp.float32)
+        finite_step, recovered = optimizer.update_from_gradient(
+            guarded, finite_gradient, error=jnp.array(1.0)
+        )
+        reference_step, reference = optimizer.update_from_gradient(
+            state, finite_gradient, error=jnp.array(1.0)
+        )
+        chex.assert_trees_all_close(finite_step, reference_step)
+        chex.assert_trees_all_close(recovered, reference)
+
+    def test_finite_square_overflow_does_not_poison_autostep_state(self):
+        """Finite inputs whose squared feature overflows must fail closed."""
+        optimizer = Autostep(initial_step_size=0.01, meta_step_size=0.01)
+        state = optimizer.init(feature_dim=2)
+
+        result = optimizer.update(
+            state,
+            jnp.array(0.0, dtype=jnp.float32),
+            jnp.array([1e20, 1.0], dtype=jnp.float32),
+        )
+
+        assert not bool(result.update_applied)
+        chex.assert_tree_all_finite(result.new_state)
+        chex.assert_trees_all_equal(result.new_state, state)
+        chex.assert_trees_all_equal(result.weight_delta, jnp.zeros(2))
+        chex.assert_trees_all_equal(result.bias_delta, jnp.array(0.0))
+        chex.assert_tree_all_finite(result.weight_delta)
+
+    def test_infinite_error_on_silent_feature_has_zero_channel_update(self):
+        """A non-finite public error rejects the complete optimizer update."""
+        optimizer = Autostep(initial_step_size=0.01, meta_step_size=0.01)
+        state = optimizer.init(feature_dim=2)
+
+        result = optimizer.update(
+            state,
+            jnp.array(jnp.inf, dtype=jnp.float32),
+            jnp.array([0.0, 1.0], dtype=jnp.float32),
+        )
+
+        assert not bool(result.update_applied)
+        chex.assert_trees_all_equal(result.weight_delta, jnp.zeros(2))
+        chex.assert_trees_all_equal(result.bias_delta, jnp.array(0.0))
+        chex.assert_trees_all_equal(result.new_state, state)
+
+    def test_collapsed_h_decay_does_not_multiply_inf_traces(self) -> None:
+        """When 1 - alpha z^2 collapses to 0, leftover inf h-traces are 0*inf.
+
+        The linear Autostep path jointly normalizes bias into M, so the
+        collapse is exact on the bias-free parameter path.
+        """
+        optimizer = Autostep(initial_step_size=0.01, meta_step_size=0.0)
+        state = optimizer.init_for_shape((1,))
+        state = state.replace(traces=jnp.full(1, jnp.inf, dtype=jnp.float32))
+        raw = jnp.asarray(0.0, dtype=jnp.float32) * jnp.asarray(jnp.inf, dtype=jnp.float32)
+        assert not bool(jnp.isfinite(raw))
+
+        result = optimizer.update_from_gradient_checked(
+            state,
+            jnp.array([10.0], dtype=jnp.float32),
+            error=jnp.array(1.0, dtype=jnp.float32),
+        )
+        assert bool(result.update_applied)
+        chex.assert_tree_all_finite(result.new_state.traces)
+
+    def test_nonfinite_guards_compile_under_jit(self):
+        import jax
+
+        optimizer = Autostep(initial_step_size=0.01, meta_step_size=0.01)
+        state = optimizer.init(feature_dim=2)
+        result = jax.jit(optimizer.update)(
+            state,
+            jnp.array(jnp.inf, dtype=jnp.float32),
+            jnp.array([0.0, 1.0], dtype=jnp.float32),
+        )
+        assert not bool(result.update_applied)
+        chex.assert_trees_all_equal(result.weight_delta, jnp.zeros(2))
+        chex.assert_tree_all_finite(result.new_state)
+
+        param_state = optimizer.init_for_shape((2,))
+        _, guarded = jax.jit(
+            lambda current, gradient: optimizer.update_from_gradient(
+                current, gradient, error=jnp.array(1.0)
+            )
+        )(param_state, jnp.full((2,), jnp.inf, dtype=jnp.float32))
+        chex.assert_tree_all_finite(guarded)
 
 
 class TestAutostepGTDLambda:
@@ -280,13 +504,24 @@ class TestAutostepGTDLambda:
             result = optimizer.update(state, jnp.array(1.0), sample_observation)
             chex.assert_shape(result.weight_delta, sample_observation.shape)
             chex.assert_shape(result.new_state.step_sizes, sample_observation.shape)
-            chex.assert_shape(
-                result.new_state.eligibility_traces, sample_observation.shape
-            )
+            chex.assert_shape(result.new_state.eligibility_traces, sample_observation.shape)
             chex.assert_tree_all_finite(result.weight_delta)
             chex.assert_tree_all_finite(result.bias_delta)
             chex.assert_tree_all_finite(result.new_state)
             state = result.new_state
+
+    def test_zero_trace_decay_does_not_multiply_inf_eligibility(self) -> None:
+        """Default trace_decay is 0; 0 * inf eligibility is NaN and would freeze."""
+        optimizer = AutostepGTDLambda()
+        state = optimizer.init(feature_dim=2)
+        state = state.replace(
+            eligibility_traces=jnp.full(2, jnp.inf, dtype=jnp.float32),
+            bias_eligibility_trace=jnp.asarray(jnp.inf, dtype=jnp.float32),
+        )
+        observation = jnp.asarray([0.5, -0.25], dtype=jnp.float32)
+        result = optimizer.update(state, jnp.asarray(1.0, dtype=jnp.float32), observation)
+        assert bool(result.update_applied)
+        chex.assert_trees_all_close(result.new_state.eligibility_traces, observation)
 
     def test_jit_compiles(self):
         """update should compile under jax.jit."""
@@ -344,9 +579,7 @@ class TestAutostepGTDLambda:
             chex.assert_trees_all_close(
                 res_g.weight_delta, res_a.weight_delta, atol=1e-5, rtol=1e-5
             )
-            chex.assert_trees_all_close(
-                res_g.bias_delta, res_a.bias_delta, atol=1e-5
-            )
+            chex.assert_trees_all_close(res_g.bias_delta, res_a.bias_delta, atol=1e-5)
             chex.assert_trees_all_close(
                 res_g.new_state.step_sizes,
                 res_a.new_state.step_sizes,
@@ -384,22 +617,16 @@ class TestAutostepGTDLambda:
 
     def test_eligibility_trace_accumulates_with_lambda(self):
         """With trace_decay > 0 the eligibility trace should accumulate."""
-        optimizer = AutostepGTDLambda(
-            initial_step_size=0.01, meta_step_size=0.01, trace_decay=0.5
-        )
+        optimizer = AutostepGTDLambda(initial_step_size=0.01, meta_step_size=0.01, trace_decay=0.5)
         state = optimizer.init(feature_dim=3)
         observation = jnp.array([1.0, 0.5, -0.25], dtype=jnp.float32)
 
         result1 = optimizer.update(state, jnp.array(1.0), observation)
-        chex.assert_trees_all_close(
-            result1.new_state.eligibility_traces, observation, atol=1e-6
-        )
+        chex.assert_trees_all_close(result1.new_state.eligibility_traces, observation, atol=1e-6)
 
         result2 = optimizer.update(result1.new_state, jnp.array(1.0), observation)
         expected = 0.5 * observation + observation
-        chex.assert_trees_all_close(
-            result2.new_state.eligibility_traces, expected, atol=1e-6
-        )
+        chex.assert_trees_all_close(result2.new_state.eligibility_traces, expected, atol=1e-6)
 
 
 class TestObGD:
@@ -510,6 +737,23 @@ class TestObGD:
         chex.assert_tree_all_finite(result.weight_delta)
         chex.assert_tree_all_finite(result.bias_delta)
 
+    def test_zero_trace_decay_does_not_multiply_inf_traces(self) -> None:
+        """Default gamma*lamda is 0; 0 * inf traces is NaN and would freeze."""
+        optimizer = ObGD(step_size=0.1, kappa=2.0)
+        state = optimizer.init(2)
+        state = state.replace(
+            traces=jnp.full(2, jnp.inf, dtype=jnp.float32),
+            bias_trace=jnp.asarray(jnp.inf, dtype=jnp.float32),
+        )
+        raw = jnp.asarray(0.0, dtype=jnp.float32) * jnp.asarray(jnp.inf, dtype=jnp.float32)
+        assert not bool(jnp.isfinite(raw))
+
+        observation = jnp.asarray([0.5, -0.25], dtype=jnp.float32)
+        result = optimizer.update(state, jnp.asarray(1.0, dtype=jnp.float32), observation)
+        assert bool(result.update_applied)
+        chex.assert_trees_all_close(result.new_state.traces, observation)
+        assert bool(jnp.isfinite(result.new_state.bias_trace))
+
 
 class TestAdaptiveObGDBounding:
     """Tests for the adaptive ObGD bounder."""
@@ -579,9 +823,7 @@ class TestIDBDParamState:
 
         chex.assert_shape(state.log_step_sizes, (32, 10))
         chex.assert_shape(state.traces, (32, 10))
-        chex.assert_trees_all_close(
-            jnp.exp(state.log_step_sizes), jnp.full((32, 10), 0.01)
-        )
+        chex.assert_trees_all_close(jnp.exp(state.log_step_sizes), jnp.full((32, 10), 0.01))
         chex.assert_trees_all_close(state.traces, jnp.zeros((32, 10)))
         assert state.meta_step_size == pytest.approx(0.001)
 
@@ -592,9 +834,7 @@ class TestIDBDParamState:
 
         chex.assert_shape(state.log_step_sizes, (16,))
         chex.assert_shape(state.traces, (16,))
-        chex.assert_trees_all_close(
-            jnp.exp(state.log_step_sizes), jnp.full(16, 0.05)
-        )
+        chex.assert_trees_all_close(jnp.exp(state.log_step_sizes), jnp.full(16, 0.05))
 
     def test_update_from_gradient_shapes(self):
         """update_from_gradient should return correct shapes and finite values."""
@@ -612,6 +852,27 @@ class TestIDBDParamState:
         chex.assert_tree_all_finite(step)
         chex.assert_tree_all_finite(new_state.log_step_sizes)
         chex.assert_tree_all_finite(new_state.traces)
+
+    def test_update_from_gradient_infinite_z_does_not_poison_step_sizes(self):
+        """The gradient path's meta-update has the same inf * 0 = NaN hole.
+
+        z * traces with fresh zero traces and an inf gradient produced NaN
+        past the clip, exactly like the linear path.
+        """
+        optimizer = IDBD(initial_step_size=0.01, meta_step_size=0.01)
+        state = optimizer.init_for_shape((4, 3))
+
+        gradient = jnp.full((4, 3), jnp.inf, dtype=jnp.float32)
+        step, poisoned = optimizer.update_from_gradient(state, gradient, error=jnp.array(1.0))
+        del step
+        assert bool(jnp.all(jnp.isfinite(poisoned.log_step_sizes)))
+        chex.assert_trees_all_close(poisoned.log_step_sizes, state.log_step_sizes)
+
+        finite_step, recovered = optimizer.update_from_gradient(
+            poisoned, jnp.ones((4, 3)) * 0.1, error=jnp.array(1.0)
+        )
+        chex.assert_tree_all_finite(finite_step)
+        chex.assert_tree_all_finite(recovered.log_step_sizes)
 
     def test_update_from_gradient_without_error(self):
         """update_from_gradient should work without error (trunk path)."""
@@ -662,9 +923,7 @@ class TestIDBDParamState:
 
     def test_loss_grads_mode(self):
         """loss_grads h_decay_mode should produce finite results."""
-        optimizer = IDBD(
-            initial_step_size=0.01, meta_step_size=0.01, h_decay_mode="loss_grads"
-        )
+        optimizer = IDBD(initial_step_size=0.01, meta_step_size=0.01, h_decay_mode="loss_grads")
         state = optimizer.init_for_shape((8, 4))
 
         gradient = jnp.ones((8, 4)) * 0.1
@@ -695,9 +954,7 @@ class TestIDBDParamState:
         def single_update(s, g, e):
             return optimizer.update_from_gradient(s, g, error=e)
 
-        batched_step, batched_new_state = jax.vmap(single_update)(
-            batched_state, gradient, error
-        )
+        batched_step, batched_new_state = jax.vmap(single_update)(batched_state, gradient, error)
 
         chex.assert_shape(batched_step, (3, 8, 4))
         chex.assert_tree_all_finite(batched_step)
@@ -777,3 +1034,114 @@ class TestSupportedForMLP:
             step, _ = optimizer.update_from_gradient(state, jnp.ones((2, 3)))
             assert optimizer.supported_for_mlp()
             assert step.shape == (2, 3)
+
+
+def test_optimizers_init_integer_and_shape_validation() -> None:
+    lms = LMS(step_size=0.01)
+    idbd = IDBD(initial_step_size=0.01)
+    autostep = Autostep(initial_step_size=0.01)
+
+    with pytest.raises(ValueError, match="feature_dim"):
+        lms.init(feature_dim=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="feature_dim"):
+        idbd.init(feature_dim=4.5)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="feature_dim"):
+        autostep.init(feature_dim=0)
+
+    with pytest.raises(ValueError, match="shape"):
+        lms.init_for_shape(shape=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="shape"):
+        idbd.init_for_shape(shape=(True, 4))  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="shape"):
+        autostep.init_for_shape(shape=(4, 0))
+
+    s_lms = lms.init(feature_dim=np.int32(4))
+    s_idbd = idbd.init(feature_dim=np.int64(4))
+    s_auto = autostep.init(feature_dim=np.int32(4))
+    assert float(s_lms.step_size) == pytest.approx(0.01)
+    assert s_idbd.traces.shape == (4,)
+    assert s_auto.traces.shape == (4,)
+
+    s_lms_p = lms.init_for_shape(shape=(np.int32(4), np.int64(8)))
+    s_idbd_p = idbd.init_for_shape(shape=(np.int32(4), np.int64(8)))
+    s_auto_p = autostep.init_for_shape(shape=(np.int32(4), np.int64(8)))
+    assert float(s_lms_p.step_size) == pytest.approx(0.01)
+    assert s_idbd_p.traces.shape == (4, 8)
+    assert s_auto_p.traces.shape == (4, 8)
+
+
+@pytest.mark.parametrize(
+    ("optimizer", "array_field"),
+    [
+        (AutostepGTDLambda(), "step_sizes"),
+        (ObGD(), "traces"),
+        (TDIDBD(), "log_step_sizes"),
+        (AutoTDIDBD(), "log_step_sizes"),
+    ],
+)
+def test_all_vector_optimizer_initializers_reject_hostile_dimensions(
+    optimizer: object,
+    array_field: str,
+) -> None:
+    class HostileInt(int):
+        def __index__(self) -> int:
+            raise AssertionError("index hook executed")
+
+    with pytest.raises(ValueError, match="feature_dim"):
+        optimizer.init(HostileInt(4))  # type: ignore[attr-defined]
+    state = optimizer.init(np.int64(4))  # type: ignore[attr-defined]
+    assert getattr(state, array_field).shape == (4,)
+
+
+def test_optimizer_state_allocations_are_preflighted_at_exact_byte_bounds() -> None:
+    float32_scalar_limit = _INT32_MAX // 4
+    idbd_last = (float32_scalar_limit - 3) // 2
+    with pytest.raises(ValueError, match="IDBD state byte count"):
+        IDBD().init(idbd_last + 1)
+
+    autostep_last = (float32_scalar_limit - 5) // 3
+    with pytest.raises(ValueError, match="Autostep state byte count"):
+        Autostep().init(autostep_last + 1)
+
+    gtd_last = (float32_scalar_limit - 7) // 4
+    with pytest.raises(ValueError, match="AutostepGTDLambda state byte count"):
+        AutostepGTDLambda().init(gtd_last + 1)
+
+    obgd_last = float32_scalar_limit - 5
+    with pytest.raises(ValueError, match="ObGD state byte count"):
+        ObGD().init(obgd_last + 1)
+
+    td_last = (float32_scalar_limit - 5) // 3
+    with pytest.raises(ValueError, match="TDIDBD state byte count"):
+        TDIDBD().init(td_last + 1)
+
+    auto_td_last = (float32_scalar_limit - 7) // 4
+    with pytest.raises(ValueError, match="AutoTDIDBD state byte count"):
+        AutoTDIDBD().init(auto_td_last + 1)
+
+
+def test_optimizer_parameter_shape_products_are_preflighted_without_allocation() -> None:
+    with pytest.raises(ValueError, match="IDBD parameter state (scalar|byte) count"):
+        IDBD().init_for_shape((50_000, 50_000))
+    with pytest.raises(ValueError, match="Autostep parameter state (scalar|byte) count"):
+        Autostep().init_for_shape((50_000, 50_000))
+
+
+@pytest.mark.parametrize(
+    ("optimizer", "expected_scalars"),
+    [
+        (IDBD(), 2 * 4 + 3),
+        (Autostep(), 3 * 4 + 5),
+        (AutostepGTDLambda(), 4 * 4 + 7),
+        (ObGD(), 4 + 5),
+        (TDIDBD(), 3 * 4 + 5),
+        (AutoTDIDBD(), 4 * 4 + 7),
+    ],
+)
+def test_optimizer_vector_state_resource_formulas_are_exact(
+    optimizer: object,
+    expected_scalars: int,
+) -> None:
+    state = optimizer.init(4)  # type: ignore[attr-defined]
+    assert sum(int(leaf.size) for leaf in jax.tree.leaves(state)) == expected_scalars
+    assert sum(int(leaf.nbytes) for leaf in jax.tree.leaves(state)) == 4 * expected_scalars

@@ -16,6 +16,7 @@ import jax
 import jax.numpy as jnp
 import jax.random as jr
 import numpy as np
+import pytest
 
 from alberta_framework import (
     LMS,
@@ -48,6 +49,79 @@ class TestInit:
         state = learner.init(3)
         pred = learner.predict(state, jnp.array([1.0, 2.0, 3.0]))
         chex.assert_trees_all_close(pred, jnp.array([0.0]))
+
+    @pytest.mark.parametrize("step_size", [float("nan"), float("inf"), 0.0, -0.1, True])
+    def test_rejects_illegal_step_size(self, step_size: object) -> None:
+        with pytest.raises(ValueError, match="step_size"):
+            TrueOnlineTDLearner(step_size=step_size)  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize("trace_decay", [float("nan"), float("inf"), -0.1, 1.5, True])
+    def test_rejects_illegal_trace_decay(self, trace_decay: object) -> None:
+        with pytest.raises(ValueError, match="trace_decay"):
+            TrueOnlineTDLearner(trace_decay=trace_decay)  # type: ignore[arg-type]
+
+    def test_legal_zero_trace_decay_is_td0(self) -> None:
+        learner = TrueOnlineTDLearner(step_size=0.05, trace_decay=0.0)
+        assert learner._trace_decay == 0.0
+
+    def test_inf_reward_silent_feature_holds_finite_state(self) -> None:
+        """Inf reward * a silent feature is 0*inf = NaN in the Dutch-trace update.
+
+        Fail-closed: keep the previous finite weights, traces, and v_old.
+        """
+        learner = TrueOnlineTDLearner(step_size=0.1, trace_decay=0.5)
+        state = learner.init(2)
+        obs = jnp.array([0.0, 1.0], dtype=jnp.float32)
+        nxt = jnp.zeros(2, dtype=jnp.float32)
+        result = learner.update(
+            state,
+            obs,
+            jnp.array(jnp.inf, dtype=jnp.float32),
+            nxt,
+            jnp.array(0.0, dtype=jnp.float32),
+        )
+        assert bool(jnp.all(jnp.isfinite(result.state.weights)))
+        assert bool(jnp.isfinite(result.state.bias))
+        assert bool(jnp.all(jnp.isfinite(result.state.eligibility_traces)))
+        assert bool(jnp.isfinite(result.state.v_old))
+        chex.assert_trees_all_close(result.state.weights, state.weights)
+        chex.assert_trees_all_close(result.state.eligibility_traces, state.eligibility_traces)
+        chex.assert_trees_all_close(result.state.v_old, state.v_old)
+        assert not bool(result.update_applied)
+        chex.assert_trees_all_close(result.td_error, jnp.zeros_like(result.td_error))
+        chex.assert_trees_all_close(result.metrics, jnp.zeros_like(result.metrics))
+        assert bool(jnp.all(jnp.isfinite(result.prediction)))
+        assert bool(jnp.all(jnp.isfinite(result.next_prediction)))
+
+    def test_zero_gamma_does_not_multiply_inf_next_observation(self) -> None:
+        """gamma=0 must skip V(s') so an unused inf next observation can still commit."""
+        learner = TrueOnlineTDLearner(step_size=0.1, trace_decay=0.5)
+        state = learner.init(2)
+        observation = jnp.array([1.0, 0.0], dtype=jnp.float32)
+        reward = jnp.array(0.25, dtype=jnp.float32)
+        next_observation = jnp.array([jnp.inf, 0.0], dtype=jnp.float32)
+        raw = jnp.asarray(0.0, dtype=jnp.float32) * jnp.asarray(jnp.inf, dtype=jnp.float32)
+        assert not bool(jnp.isfinite(raw))
+
+        result = learner.update(
+            state,
+            observation,
+            reward,
+            next_observation,
+            jnp.array(0.0, dtype=jnp.float32),
+        )
+        assert bool(result.update_applied)
+        chex.assert_tree_all_finite(result.state.weights)
+        chex.assert_tree_all_finite(result.td_error)
+        finite_next = learner.update(
+            state,
+            observation,
+            reward,
+            jnp.zeros_like(next_observation),
+            jnp.array(0.0, dtype=jnp.float32),
+        )
+        chex.assert_trees_all_close(result.state.weights, finite_next.state.weights)
+        chex.assert_trees_all_close(result.td_error, finite_next.td_error)
 
 
 # =============================================================================

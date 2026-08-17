@@ -28,6 +28,7 @@ from alberta_framework.core.state_builder import (
     OnlineGatedStateBuilder,
     OnlineGatedStateBuilderConfig,
     StateBuilder,
+    StateBuilderBudget,
     StateBuilderConfig,
     StateBuilderLearningProposal,
     load_state_builder_checkpoint,
@@ -435,9 +436,7 @@ def test_online_learn_equals_propose_then_same_state_commit() -> None:
 
 def test_online_proposal_capacity_max_minus_one_and_exhaustion_are_fail_closed() -> None:
     builder, source, gradient = _online_learning_source()
-    almost_exhausted = source.replace(
-        update_count=jnp.asarray(2**31 - 2, dtype=jnp.int32)
-    )
+    almost_exhausted = source.replace(update_count=jnp.asarray(2**31 - 2, dtype=jnp.int32))
     proposal = builder.propose_learning_update(almost_exhausted, gradient)
     final_state, final_diagnostics = builder.commit_learning_update(
         almost_exhausted,
@@ -500,9 +499,7 @@ def test_online_commit_rejects_corrupt_proposal_and_static_contract_errors() -> 
     "builder",
     [
         IdentityStateBuilder(IdentityStateBuilderConfig(observation_dim=2)),
-        FixedTraceStateBuilder(
-            FixedTraceStateBuilderConfig(observation_dim=2, n_actions=2)
-        ),
+        FixedTraceStateBuilder(FixedTraceStateBuilderConfig(observation_dim=2, n_actions=2)),
     ],
     ids=("identity", "fixed-trace"),
 )
@@ -1194,3 +1191,260 @@ def test_nonfinite_builder_hyperparameters_are_rejected(invalid: float) -> None:
         OnlineGatedStateBuilderConfig(observation_dim=1, initial_gate_bias=invalid)
     with pytest.raises(ValueError, match="initialization_scale"):
         OnlineGatedStateBuilderConfig(observation_dim=1, initialization_scale=invalid)
+
+
+def test_builder_configs_reject_booleans_and_non_integers() -> None:
+    # Booleans
+    with pytest.raises(ValueError, match="observation_dim"):
+        IdentityStateBuilderConfig(observation_dim=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="observation_dim"):
+        FixedTraceStateBuilderConfig(observation_dim=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="n_actions"):
+        FixedTraceStateBuilderConfig(observation_dim=4, n_actions=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="include_raw_observation"):
+        FixedTraceStateBuilderConfig(observation_dim=4, include_raw_observation=1)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="hidden_dim"):
+        OnlineGatedStateBuilderConfig(observation_dim=4, hidden_dim=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="include_raw_observation"):
+        OnlineGatedStateBuilderConfig(observation_dim=4, include_raw_observation=0)  # type: ignore[arg-type]
+
+    # Non-integer floats
+    with pytest.raises(ValueError, match="observation_dim"):
+        IdentityStateBuilderConfig(observation_dim=4.5)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="n_actions"):
+        FixedTraceStateBuilderConfig(observation_dim=4, n_actions=2.5)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="hidden_dim"):
+        OnlineGatedStateBuilderConfig(observation_dim=4, hidden_dim=8.5)  # type: ignore[arg-type]
+
+    # Non-tuple decay rates
+    with pytest.raises(ValueError, match="observation_decay_rates"):
+        FixedTraceStateBuilderConfig(observation_dim=4, observation_decay_rates=[0.5, 0.9])  # type: ignore[arg-type]
+
+    # Float32 boundary decay rate (1.0 - 1e-10 rounds to 1.0 in float32)
+    with pytest.raises(ValueError, match="observation_decay_rates"):
+        FixedTraceStateBuilderConfig(observation_dim=4, observation_decay_rates=(1.0 - 1e-10,))
+
+
+def test_builder_configs_accept_and_canonicalize_numpy_integers() -> None:
+    cfg_id = IdentityStateBuilderConfig(observation_dim=np.int32(4))
+    assert type(cfg_id.observation_dim) is int
+    assert cfg_id.observation_dim == 4
+
+    cfg_ft = FixedTraceStateBuilderConfig(
+        observation_dim=np.int64(4),
+        n_actions=np.uint16(2),
+    )
+    assert type(cfg_ft.observation_dim) is int
+    assert type(cfg_ft.n_actions) is int
+    assert cfg_ft.observation_dim == 4
+    assert cfg_ft.n_actions == 2
+
+    cfg_og = OnlineGatedStateBuilderConfig(
+        observation_dim=np.int32(4),
+        n_actions=np.int16(2),
+        hidden_dim=np.uint8(8),
+    )
+    assert type(cfg_og.observation_dim) is int
+    assert type(cfg_og.n_actions) is int
+    assert type(cfg_og.hidden_dim) is int
+    assert cfg_og.observation_dim == 4
+    assert cfg_og.n_actions == 2
+    assert cfg_og.hidden_dim == 8
+
+
+def test_state_builder_budget_validation() -> None:
+    budget = StateBuilderBudget(
+        output_scalars=np.int32(10),
+        trainable_scalars=np.int64(20),
+        state_scalars=np.uint16(30),
+        state_bytes=np.int32(120),
+    )
+    assert type(budget.output_scalars) is int
+    assert type(budget.trainable_scalars) is int
+    assert type(budget.state_scalars) is int
+    assert type(budget.state_bytes) is int
+
+    large_host_budget = StateBuilderBudget(
+        output_scalars=1,
+        trainable_scalars=0,
+        state_scalars=2**31,
+        state_bytes=2**33,
+    )
+    assert large_host_budget.state_scalars == 2**31
+    assert large_host_budget.state_bytes == 2**33
+
+    with pytest.raises(ValueError, match="output_scalars"):
+        StateBuilderBudget(
+            output_scalars=-1,
+            trainable_scalars=0,
+            state_scalars=0,
+            state_bytes=0,
+        )
+    with pytest.raises(ValueError, match="state_bytes"):
+        StateBuilderBudget(
+            output_scalars=1,
+            trainable_scalars=0,
+            state_scalars=0,
+            state_bytes=True,  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [
+        lambda value: IdentityStateBuilderConfig(observation_dim=value),
+        lambda value: FixedTraceStateBuilderConfig(observation_dim=value),
+        lambda value: OnlineGatedStateBuilderConfig(observation_dim=value),
+    ],
+)
+@pytest.mark.parametrize("value", [2**31, np.uint64(2**63), -1])
+def test_builder_dimensions_reject_values_outside_signed_int32(factory, value) -> None:
+    with pytest.raises(ValueError, match="observation_dim"):
+        factory(value)
+
+
+def test_fixed_trace_from_config_does_not_coerce_invalid_scalars() -> None:
+    base = FixedTraceStateBuilderConfig(observation_dim=4).to_config()
+    for field, value in (
+        ("observation_dim", True),
+        ("n_actions", False),
+        ("include_raw_observation", 1),
+        ("include_raw_observation", "false"),
+    ):
+        payload = {**base, field: value}
+        with pytest.raises(ValueError, match=field):
+            FixedTraceStateBuilderConfig.from_config(payload)
+
+
+def test_builder_configs_reject_class_spoofed_scalars() -> None:
+    class Spoof:
+        @property
+        def __class__(self):
+            return int
+
+        def __index__(self):
+            return 4
+
+    with pytest.raises(ValueError, match="observation_dim"):
+        IdentityStateBuilderConfig(observation_dim=Spoof())  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="step_size"):
+        OnlineGatedStateBuilderConfig(  # type: ignore[arg-type]
+            observation_dim=4,
+            step_size=Spoof(),
+        )
+
+
+@pytest.mark.parametrize("field", ["step_size", "gradient_clip", "initialization_scale"])
+@pytest.mark.parametrize("value", [True, 1e100, 1e-100])
+def test_online_builder_positive_scalars_are_valid_at_float32_sink(field, value) -> None:
+    with pytest.raises(ValueError, match=field):
+        OnlineGatedStateBuilderConfig(observation_dim=4, **{field: value})
+
+
+@pytest.mark.parametrize("value", [True, 1e100])
+def test_online_builder_gate_bias_is_finite_at_float32_sink(value) -> None:
+    with pytest.raises(ValueError, match="initial_gate_bias"):
+        OnlineGatedStateBuilderConfig(observation_dim=4, initial_gate_bias=value)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "field"),
+    [
+        (
+            {
+                "observation_dim": 2**31 - 1,
+                "n_actions": 0,
+                "observation_decay_rates": (0.5,),
+                "action_decay_rates": (),
+                "outcome_decay_rates": (),
+            },
+            "feature_dim",
+        ),
+        (
+            {
+                "observation_dim": 2**31 - 3,
+                "n_actions": 0,
+                "observation_decay_rates": (0.5,),
+                "action_decay_rates": (),
+                "outcome_decay_rates": (),
+                "include_raw_observation": False,
+            },
+            "state_scalars",
+        ),
+        (
+            {
+                "observation_dim": 600_000_000,
+                "n_actions": 0,
+                "observation_decay_rates": (0.5,),
+                "action_decay_rates": (),
+                "outcome_decay_rates": (),
+                "include_raw_observation": False,
+            },
+            "state_bytes",
+        ),
+    ],
+)
+def test_fixed_trace_rejects_derived_int32_overflow_without_allocation(
+    kwargs: dict[str, object], field: str
+) -> None:
+    with pytest.raises(ValueError, match=field):
+        FixedTraceStateBuilderConfig(**kwargs)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "field"),
+    [
+        ({"observation_dim": 2**31 - 1}, "event_dim"),
+        (
+            {
+                "observation_dim": 2**31 - 3,
+                "hidden_dim": 4,
+                "include_raw_observation": True,
+            },
+            "feature_dim",
+        ),
+        ({"observation_dim": 1, "hidden_dim": 300_000_000}, "parameter_count"),
+        ({"observation_dim": 1, "hidden_dim": 20_000}, "state_scalars"),
+        ({"observation_dim": 1, "hidden_dim": 10_000}, "state_bytes"),
+    ],
+)
+def test_online_builder_rejects_derived_int32_overflow_without_allocation(
+    kwargs: dict[str, object], field: str
+) -> None:
+    with pytest.raises(ValueError, match=field):
+        OnlineGatedStateBuilderConfig(**kwargs)  # type: ignore[arg-type]
+
+
+def test_derived_preflights_do_not_bound_host_only_budget_values() -> None:
+    budget = StateBuilderBudget(
+        output_scalars=2**31,
+        trainable_scalars=2**32,
+        state_scalars=2**33,
+        state_bytes=2**35,
+    )
+    assert budget.to_config() == {
+        "output_scalars": 2**31,
+        "trainable_scalars": 2**32,
+        "state_scalars": 2**33,
+        "state_bytes": 2**35,
+    }
+
+
+def test_online_builder_init_rejects_nonfinite_generated_parameters() -> None:
+    config = OnlineGatedStateBuilderConfig(
+        observation_dim=2,
+        initialization_scale=np.finfo(np.float32).max,
+    )
+    builder = OnlineGatedStateBuilder(config)
+
+    with pytest.raises(ValueError, match="initialization_scale"):
+        builder.init(jr.key(0))
+
+
+def test_online_builder_init_returns_a_valid_state_at_normal_scale() -> None:
+    builder = OnlineGatedStateBuilder(
+        OnlineGatedStateBuilderConfig(observation_dim=2, initialization_scale=0.2)
+    )
+    state = builder.init(jr.key(0))
+
+    assert bool(builder.state_valid(state))

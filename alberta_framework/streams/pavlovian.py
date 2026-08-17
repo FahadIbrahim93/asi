@@ -39,15 +39,161 @@ References
 
 from __future__ import annotations
 
+import math
+from fractions import Fraction
+from numbers import Real
+from typing import Any, cast
+
 import chex
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 from jax import Array
 from jaxtyping import Int, PRNGKeyArray
 
+from alberta_framework._float32 import (
+    round_real_to_float32,
+    round_real_to_float32_with_ratio,
+)
 from alberta_framework.core.types import TimeStep
 from alberta_framework.streams.base import ScanStream  # noqa: F401  (re-exported)
+
+_INT32_MAX = 2**31 - 1
+_ACTUAL_INT_TYPES: frozenset[type] = frozenset(
+    {
+        int,
+        np.int8,
+        np.int16,
+        np.int32,
+        np.int64,
+        np.uint8,
+        np.uint16,
+        np.uint32,
+        np.uint64,
+        np.longlong,
+        np.ulonglong,
+    }
+)
+_ACTUAL_FLOAT_TYPES: frozenset[type] = frozenset(
+    {float, Fraction, *(np.dtype(code).type for code in ("e", "f", "d", "g"))}
+)
+_ALLOWED_REAL_TYPES: frozenset[type] = _ACTUAL_INT_TYPES | _ACTUAL_FLOAT_TYPES
+
+
+def _require_pavlovian_resources(
+    *, n_phases: int, n_cs: int, n_distractors: int
+) -> None:
+    """Preflight all persistent JAX arrays owned by the stream and its state."""
+    static_scalars = n_phases * n_cs + 4 * n_phases
+    # State owns feature countdowns, four int32 counters, and one two-word key.
+    state_scalars = n_cs + n_distractors + 6
+    total_scalars = static_scalars + state_scalars
+    if total_scalars > _INT32_MAX:
+        raise ValueError("Pavlovian persistent scalar count must fit signed int32")
+    if 4 * total_scalars > _INT32_MAX:
+        raise ValueError("Pavlovian persistent byte count must fit signed int32")
+
+
+def _require_finite_real(
+    value: object,
+    *,
+    name: str,
+    nonnegative: bool = False,
+) -> float:
+    """Return a finite real, rejecting bools, NaN, and infinities."""
+    # Exact-type whitelist prevents ``__class__`` spoofing and hostile
+    # ``as_integer_ratio`` subclasses from reaching the narrowing routine.
+    if issubclass(type(value), bool) or type(value) not in _ALLOWED_REAL_TYPES:
+        raise ValueError(f"{name} must be a finite real")
+    real_value = cast(Real, value)
+    try:
+        number = float(real_value)
+    except Exception as error:
+        raise ValueError(f"{name} must be a finite real") from error
+    if not math.isfinite(number):
+        raise ValueError(f"{name} must be a finite real")
+    if nonnegative and number < 0.0:
+        raise ValueError(f"{name} must be a non-negative finite real")
+    return number
+
+
+def _require_nonnegative_float32(value: object, *, name: str) -> float:
+    """Return the value rounded to the stream's non-negative float32 domain.
+
+    Host-finite values that overflow float32 are rejected. Positive values
+    below the float32 subnormal range are accepted as exact zero, matching the
+    noise-free trajectory they produce in the stream's float32 arithmetic.
+    """
+    # Exact-type whitelist rejects hostile subclasses before ``as_integer_ratio``
+    # is ever consulted — mirrors the world-model ensemble gate.
+    if issubclass(type(value), bool) or type(value) not in _ALLOWED_REAL_TYPES:
+        raise ValueError(f"{name} must be a non-negative finite real")
+    real_value = cast(Real, value)
+    try:
+        is_negative = bool(real_value < 0)
+    except Exception as error:
+        raise ValueError(f"{name} must be a non-negative finite real") from error
+    if is_negative:
+        raise ValueError(f"{name} must be a non-negative finite real")
+    try:
+        narrowed = round_real_to_float32(real_value)
+    except Exception as error:
+        raise ValueError(
+            f"{name} must remain finite when rounded to float32"
+        ) from error
+    if not bool(np.isfinite(narrowed)):
+        raise ValueError(
+            f"{name} must remain finite when rounded to float32"
+        )
+    return narrowed
+
+
+def _require_unit_interval(value: object, *, name: str) -> float:
+    """Return a probability valid in both exact-host and float32 domains."""
+    if issubclass(type(value), bool) or type(value) not in _ALLOWED_REAL_TYPES:
+        raise ValueError(f"{name} must be in [0, 1]")
+    try:
+        numerator, denominator, narrowed = round_real_to_float32_with_ratio(
+            cast(Real, value)
+        )
+    except Exception as error:
+        raise ValueError(f"{name} must be in [0, 1]") from error
+    if not 0 <= numerator <= denominator or not 0.0 <= narrowed <= 1.0:
+        raise ValueError(f"{name} must be in [0, 1]")
+    return narrowed
+
+
+def _require_state_array(
+    value: Any,
+    *,
+    name: str,
+    shape: tuple[int, ...],
+    dtype: jnp.dtype,
+) -> Array:
+    array = jnp.asarray(value)
+    if array.shape != shape:
+        raise ValueError(f"{name} must have shape {shape}")
+    if array.dtype != dtype:
+        raise TypeError(f"{name} must have dtype {dtype}")
+    return array
+
+
+def _require_builtin_int(
+    value: object,
+    *,
+    name: str,
+    minimum: int,
+    maximum: int = _INT32_MAX,
+) -> int:
+    """Return a built-in int at or above ``minimum``; reject bool and numpy ints."""
+    if type(value) is not int:
+        raise ValueError(f"{name} must be a built-in integer")
+    if value < minimum:
+        raise ValueError(f"{name} must be >= {minimum}")
+    if value > maximum:
+        raise ValueError(f"{name} must be <= {maximum}")
+    return value
 
 # =============================================================================
 # State and phase descriptors
@@ -159,7 +305,9 @@ class ClassicalConditioningStream:
         cs_duration: How many steps a CS stays active.
         iti_min: Minimum ITI (steps).
         iti_max: Maximum ITI (steps, inclusive).
-        noise_std: Std of Gaussian observation noise.
+        noise_std: Std of Gaussian observation noise, canonicalized to
+            float32. Positive values below the float32 subnormal range
+            become exact zero.
         distractor_prob: Per-step probability that an idle distractor
             fires.
         phases: Tuple of ``PavlovianPhase``.
@@ -195,41 +343,99 @@ class ClassicalConditioningStream:
             iti_min: Minimum inter-trial interval (steps).
             iti_max: Maximum inter-trial interval (steps, inclusive).
             noise_std: Gaussian noise added to the observation features.
+                Accepted values are rounded to float32; positive values below
+                its subnormal range become exact zero.
             distractor_prob: Per-step probability that an idle
                 distractor turns on.
 
         Raises:
-            ValueError: if ``phases`` is empty, ``n_cs <= 0``, the
-                ITI range is malformed, or any phase references a CS
-                index that does not exist.
+            ValueError: if ``phases`` is empty, an integer knob is not a
+                built-in int in its domain, the ITI range is malformed,
+                any phase references a CS index that does not exist, a
+                phase contingency is not a finite real in ``[0, 1]``, or
+                ``noise_std`` / ``distractor_prob`` is not a legal
+                scientific scalar, or ``noise_std`` becomes non-finite when
+                rounded to the stream's float32 execution dtype.
         """
-        if not phases:
-            raise ValueError("phases must be non-empty")
-        if n_cs <= 0:
-            raise ValueError(f"n_cs must be positive, got {n_cs}")
-        if n_distractors < 0:
-            raise ValueError(f"n_distractors must be >= 0, got {n_distractors}")
-        if cs_us_delay <= 0:
-            raise ValueError(f"cs_us_delay must be positive, got {cs_us_delay}")
-        if cs_duration <= 0:
-            raise ValueError(f"cs_duration must be positive, got {cs_duration}")
-        if iti_min < 0 or iti_max < iti_min:
+        if type(phases) is not tuple or not phases:
+            raise ValueError("phases must be a non-empty exact tuple")
+        n_cs = _require_builtin_int(n_cs, name="n_cs", minimum=1)
+        n_distractors = _require_builtin_int(
+            n_distractors, name="n_distractors", minimum=0
+        )
+        cs_us_delay = _require_builtin_int(cs_us_delay, name="cs_us_delay", minimum=1)
+        cs_duration = _require_builtin_int(cs_duration, name="cs_duration", minimum=1)
+        iti_min = _require_builtin_int(
+            iti_min,
+            name="iti_min",
+            minimum=0,
+            maximum=_INT32_MAX - 1,
+        )
+        iti_max = _require_builtin_int(
+            iti_max,
+            name="iti_max",
+            minimum=0,
+            maximum=_INT32_MAX - 1,
+        )
+        if iti_max < iti_min:
             raise ValueError(f"need 0 <= iti_min <= iti_max, got {iti_min}, {iti_max}")
+        noise_std = _require_nonnegative_float32(noise_std, name="noise_std")
+        distractor_prob = _require_unit_interval(
+            distractor_prob, name="distractor_prob"
+        )
 
+        canonical_phases: list[PavlovianPhase] = []
         for phase in phases:
+            if type(phase) is not PavlovianPhase:
+                raise ValueError("each phase must be an exact PavlovianPhase")
+            if type(phase.name) is not str:
+                raise ValueError("phase name must be a string")
+            try:
+                contingency = _require_unit_interval(
+                    phase.cs_us_contingency, name="cs_us_contingency"
+                )
+            except ValueError as error:
+                raise ValueError(
+                    f"phase {phase.name!r} cs_us_contingency must be in [0, 1]"
+                ) from error
+            n_steps = _require_builtin_int(phase.n_steps, name="n_steps", minimum=1)
+            compound_index = _require_builtin_int(
+                phase.compound_index, name="compound_index", minimum=-1
+            )
+            if type(phase.cs_active) is not tuple:
+                raise ValueError("phase cs_active must be a tuple of integers")
             for cs_idx in phase.cs_active:
+                if type(cs_idx) is not int:
+                    raise ValueError(
+                        f"phase {phase.name!r} cs_active index must be a built-in integer"
+                    )
                 if not (0 <= cs_idx < n_cs):
                     raise ValueError(
-                        f"phase {phase.name!r} references cs_active index {cs_idx}, "
-                        f"but n_cs={n_cs}"
+                        f"phase {phase.name!r} references cs_active index out of range"
                     )
-            if phase.compound_index >= n_cs:
+            if compound_index >= n_cs:
                 raise ValueError(
-                    f"phase {phase.name!r} has compound_index={phase.compound_index} "
-                    f"but n_cs={n_cs}"
+                    f"phase {phase.name!r} has compound_index out of range"
                 )
-            if phase.n_steps <= 0:
-                raise ValueError(f"phase {phase.name!r} must have n_steps > 0")
+            canonical_phases.append(
+                PavlovianPhase(
+                    name=phase.name,
+                    n_steps=n_steps,
+                    cs_us_contingency=contingency,
+                    cs_active=phase.cs_active,
+                    compound_index=compound_index,
+                )
+            )
+
+        phases = tuple(canonical_phases)
+        feature_dim = int(n_cs) + int(n_distractors)
+        if feature_dim > _INT32_MAX:
+            raise ValueError("feature_dim must fit signed int32")
+        _require_pavlovian_resources(
+            n_phases=len(phases),
+            n_cs=n_cs,
+            n_distractors=n_distractors,
+        )
 
         self._phases = tuple(phases)
         self._n_cs = int(n_cs)
@@ -295,6 +501,49 @@ class ClassicalConditioningStream:
         """Configured CS active duration."""
         return self._cs_duration
 
+    def _require_state_contract(self, state: object) -> PavlovianState:
+        """Validate static state structure before indexed JAX operations."""
+        if type(state) is not PavlovianState:
+            raise TypeError("state must be an actual PavlovianState")
+        key = jnp.asarray(state.key)
+        if key.shape != () or not jnp.issubdtype(key.dtype, jax.dtypes.prng_key):
+            raise TypeError("state.key must be a scalar PRNG key")
+        for name, value, shape in (
+            (
+                "cs_active_steps_remaining",
+                state.cs_active_steps_remaining,
+                (self._n_cs,),
+            ),
+            ("us_pending_steps_remaining", state.us_pending_steps_remaining, ()),
+            ("phase_idx", state.phase_idx, ()),
+            ("step_in_phase", state.step_in_phase, ()),
+            (
+                "n_distractor_active",
+                state.n_distractor_active,
+                (self._n_distractors,),
+            ),
+            ("iti_steps_remaining", state.iti_steps_remaining, ()),
+        ):
+            _require_state_array(
+                value,
+                name=f"state.{name}",
+                shape=shape,
+                dtype=jnp.dtype(jnp.int32),
+            )
+        return state
+
+    def _state_values_valid(self, state: PavlovianState) -> Array:
+        """Return the dynamic state-domain verdict used for atomic updates."""
+        return (
+            jnp.all(state.cs_active_steps_remaining >= 0)
+            & (state.us_pending_steps_remaining >= -1)
+            & (state.phase_idx >= 0)
+            & (state.phase_idx < len(self._phases))
+            & (state.step_in_phase >= 0)
+            & jnp.all(state.n_distractor_active >= 0)
+            & (state.iti_steps_remaining >= 0)
+        )
+
     def init(self, key: Array) -> PavlovianState:
         """Initialize stream state.
 
@@ -308,7 +557,12 @@ class ClassicalConditioningStream:
         Returns:
             Initial ``PavlovianState``.
         """
-        key, k_iti = jr.split(key)
+        key_array = jnp.asarray(key)
+        if key_array.shape != () or not jnp.issubdtype(
+            key_array.dtype, jax.dtypes.prng_key
+        ):
+            raise TypeError("key must be a scalar PRNG key")
+        key, k_iti = jr.split(key_array)
         iti = jr.randint(k_iti, (), self._iti_min, self._iti_max + 1)
         return PavlovianState(
             key=key,
@@ -336,6 +590,8 @@ class ClassicalConditioningStream:
             ``(1,)`` containing the US indicator.
         """
         del idx  # unused
+        state = self._require_state_contract(state)
+        state_valid = self._state_values_valid(state)
 
         (
             key,
@@ -353,7 +609,7 @@ class ClassicalConditioningStream:
         # 1. Phase progression
         # ------------------------------------------------------------------
         # If we have spent >= n_steps in this phase, advance (clamped).
-        cur_phase = state.phase_idx
+        cur_phase = jnp.clip(state.phase_idx, 0, n_phases - 1)
         cur_phase_steps = self._phase_n_steps[cur_phase]
         # Only advance phases that have a successor; the final phase repeats.
         on_last_phase = cur_phase >= (n_phases - 1)
@@ -420,7 +676,9 @@ class ClassicalConditioningStream:
             jax.nn.one_hot(jnp.maximum(compound_idx, 0), self._n_cs, dtype=jnp.int32),
             jnp.zeros(self._n_cs, dtype=jnp.int32),
         )
-        cs_activations = (chosen_cs_oh + compound_oh) * jnp.int32(self._cs_duration)
+        cs_activations = jnp.maximum(chosen_cs_oh, compound_oh) * jnp.int32(
+            self._cs_duration
+        )
 
         # ------------------------------------------------------------------
         # 5. Update CS / US / ITI counters
@@ -499,16 +757,41 @@ class ClassicalConditioningStream:
             observation=observation,
             target=jnp.atleast_1d(target),
         )
-        new_state = PavlovianState(
+        candidate_state = PavlovianState(
             key=key,
             cs_active_steps_remaining=new_cs_active.astype(jnp.int32),
             us_pending_steps_remaining=new_us_pending.astype(jnp.int32),
             phase_idx=new_phase_idx.astype(jnp.int32),
-            step_in_phase=(new_step_in_phase + 1).astype(jnp.int32),
+            step_in_phase=(
+                jnp.minimum(jnp.maximum(new_step_in_phase, 0), _INT32_MAX - 1) + 1
+            ).astype(jnp.int32),
             n_distractor_active=new_distractor_active.astype(jnp.int32),
             iti_steps_remaining=new_iti_remaining.astype(jnp.int32),
         )
-        return timestep, new_state
+        update_applied = state_valid & self._state_values_valid(candidate_state)
+        new_state = cast(
+            PavlovianState,
+            jax.tree.map(
+                lambda proposed, current: jnp.where(
+                    update_applied, proposed, current
+                ),
+                candidate_state,
+                state,
+            ),
+        )
+        safe_timestep = TimeStep(
+            observation=jnp.where(
+                update_applied,
+                timestep.observation,
+                jnp.zeros_like(timestep.observation),
+            ),
+            target=jnp.where(
+                update_applied,
+                timestep.target,
+                jnp.zeros_like(timestep.target),
+            ),
+        )
+        return safe_timestep, new_state
 
 
 # =============================================================================
@@ -727,10 +1010,12 @@ def partial_reinforcement_scenario(
         ``ClassicalConditioningStream`` with one phase.
 
     Raises:
-        ValueError: if ``p`` is outside ``[0, 1]``.
+        ValueError: if ``p`` is not a finite real in ``[0, 1]``.
     """
-    if not (0.0 <= p <= 1.0):
-        raise ValueError(f"p must be in [0, 1], got {p}")
+    try:
+        p = _require_unit_interval(p, name="p")
+    except ValueError as error:
+        raise ValueError(f"p must be in [0, 1], got {p}") from error
     phases = (
         PavlovianPhase(
             name="partial_reinforcement",

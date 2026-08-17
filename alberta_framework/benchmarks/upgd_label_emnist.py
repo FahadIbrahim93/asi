@@ -98,7 +98,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 import chex
 import jax
@@ -107,6 +107,7 @@ import jax.random as jr
 import numpy as np
 from jax import Array
 
+from alberta_framework._seed_validation import require_jax_seed, require_unique_jax_seeds
 from alberta_framework.benchmarks.ipmnist_screening import (
     ScreeningStepFn,
     _make_sgd_ema_norm_learner,
@@ -120,7 +121,9 @@ from alberta_framework.benchmarks.upgd_ipmnist import (
     atomic_write_new_json,
     init_mlp_params,
     task_index_for_step,
+    validated_ipmnist_data,
 )
+from alberta_framework.core._float32_scalars import validated_float32_scalar
 
 logger = logging.getLogger(__name__)
 
@@ -226,6 +229,20 @@ _LEARNER_DEFAULT_HYPERPARAMETERS: dict[str, dict[str, float]] = {
     "upgd_ema_norm_sigma0": UPGD_EMA_NORM_SIGMA0_HYPERPARAMETERS,
     "sgd_ema_norm": SGD_EMA_NORM_HYPERPARAMETERS,
 }
+
+
+def _validated_hyperparameter(name: str, value: object) -> float:
+    """Validate one JSON override in its exact host and float32 execution domains."""
+    if type(value) not in (int, float):
+        raise ValueError(f"hyperparameter {name!r} must be a finite JSON number")
+    label = f"hyperparameter {name!r}"
+    if name in {"step_size", "eps", "norm_epsilon"}:
+        return validated_float32_scalar(label, value, positive=True)
+    if name in {"utility_decay", "beta1", "beta2", "norm_decay"}:
+        return validated_float32_scalar(
+            label, value, lower=0.0, upper=1.0, upper_inclusive=False
+        )
+    return validated_float32_scalar(label, value, lower=0.0)
 
 
 def _wrapped_v1_factory(
@@ -405,6 +422,27 @@ def build_schedule(key: Array, config: LabelEMNISTConfig, n_train: int) -> Label
     )
 
 
+def _require_finite_real(name: str, value: object) -> float:
+    if type(value) not in (int, float):
+        raise ValueError(f"{name} must be a finite real number")
+    number = float(cast("int | float", value))
+    if not math.isfinite(number):
+        raise ValueError(f"{name} must be a finite real number")
+    return number
+
+
+def _require_nonempty_string(name: str, value: object) -> str:
+    if type(value) is not str or not value:
+        raise ValueError(f"{name} must be a non-empty string")
+    return value
+
+
+def _require_seed_identities(values: object, *, name: str) -> tuple[int, ...]:
+    if type(values) is not tuple:
+        raise ValueError(f"{name} must be an exact tuple of unique integer seeds")
+    return require_unique_jax_seeds(values, name=name)
+
+
 @dataclass(frozen=True)
 class LabelEMNISTRunResult:
     """Host-side result of one learner's multi-seed run.
@@ -429,6 +467,15 @@ class LabelEMNISTRunResult:
     label_permutations: np.ndarray | None = None
     example_indices: np.ndarray | None = None
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "learner", _require_nonempty_string("learner", self.learner))
+        object.__setattr__(self, "seeds", _require_seed_identities(self.seeds, name="seeds"))
+        object.__setattr__(
+            self,
+            "wall_clock_seconds",
+            _require_finite_real("wall_clock_seconds", self.wall_clock_seconds),
+        )
+
 
 def resolve_hyperparameters(
     learner: str, overrides: dict[str, float] | None = None
@@ -444,7 +491,10 @@ def resolve_hyperparameters(
         unknown = set(overrides) - set(merged)
         if unknown:
             raise ValueError(f"unknown hyperparameters for {learner}: {sorted(unknown)}")
-        merged.update({name: float(value) for name, value in overrides.items()})
+        validated: dict[str, float] = {}
+        for name, value in overrides.items():
+            validated[name] = _validated_hyperparameter(name, value)
+        merged.update(validated)
     return merged
 
 
@@ -476,26 +526,27 @@ def run_label_emnist(
     Returns:
         Host-side result arrays; see :class:`LabelEMNISTRunResult`.
     """
+    if progress_every is not None and (
+        type(progress_every) is not int or progress_every <= 0
+    ):
+        raise ValueError("progress_every must be a positive integer or None")
+    seed_tuple = require_unique_jax_seeds(seeds, name="seeds")
     if config is None:
         config = LabelEMNISTConfig()
+    resolved_x, resolved_y = validated_ipmnist_data(
+        data_x,
+        data_y,
+        input_dim=config.input_dim,
+        n_classes=config.n_classes,
+        min_length=config.task_length,
+    )
     hp = resolve_hyperparameters(learner, hyperparameters)
     init_fn, step_fn = _FULL_STEP_FACTORIES[learner](hp)
 
-    data_x = jnp.asarray(data_x, dtype=jnp.float32)
-    data_y = jnp.asarray(data_y, dtype=jnp.int32)
-    if data_x.ndim != 2 or data_x.shape[1] != config.input_dim:
-        raise ValueError(
-            f"data_x must have shape (n_train, {config.input_dim}), got {data_x.shape}"
-        )
-    if data_y.shape != (data_x.shape[0],):
-        raise ValueError("data_y must be (n_train,) aligned with data_x")
+    data_x = jnp.asarray(resolved_x, dtype=jnp.float32)
+    data_y = jnp.asarray(resolved_y, dtype=jnp.int32)
     n_train = int(data_x.shape[0])
-    if n_train < config.task_length:
-        raise ValueError("dataset smaller than task_length; cannot sample without replacement")
 
-    seed_tuple = tuple(int(seed) for seed in seeds)
-    if not seed_tuple:
-        raise ValueError("at least one seed is required")
     seeds_array = jnp.asarray(seed_tuple, dtype=jnp.uint32)
     initialization_config = IPMNISTConfig(**config.to_config())
 
@@ -642,7 +693,7 @@ def load_emnist_balanced_train(
     if x_path.is_file() and y_path.is_file() and meta_path.is_file():
         x = np.load(x_path)
         y = np.load(y_path)
-        cached_meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        cached_meta = _strict_json_object(meta_path)
         if (
             materialized_array_sha256(x) != cached_meta["x_sha256"]
             or materialized_array_sha256(y) != cached_meta["y_sha256"]
@@ -708,13 +759,21 @@ def load_emnist_balanced_train(
 
 def _stderr(values: np.ndarray) -> float:
     if values.shape[0] < 2:
-        return 0.0
+        raise ValueError(
+            "stderr is undefined for fewer than two observations; "
+            "refusing to report a look-alike zero"
+        )
     return float(values.std(ddof=1) / math.sqrt(values.shape[0]))
 
 
 def summarize_result(result: LabelEMNISTRunResult) -> dict[str, Any]:
     """Reduce one learner's run to JSON-serializable summary statistics."""
     accuracy = result.average_online_accuracy
+    if accuracy.shape[0] < 2:
+        raise ValueError(
+            "stderr is undefined for fewer than two observations; "
+            "refusing to report a look-alike zero"
+        )
     quarter = max(1, result.config.n_tasks // 4)
     per_seed_first = result.per_task_accuracy[:, :quarter].mean(axis=1)
     per_seed_last = result.per_task_accuracy[:, -quarter:].mean(axis=1)
@@ -806,13 +865,10 @@ def build_plan_payload(
     notes: Sequence[str] = (),
 ) -> dict[str, Any]:
     """Build the pre-run plan binding config, arms, seeds, and dataset digests."""
-    seeds = tuple(int(seed) for seed in seed_ids)
-    if not seeds:
+    raw_seeds = tuple(seed_ids)
+    if not raw_seeds:
         raise ValueError("a plan requires at least one seed")
-    if any(seed < 0 for seed in seeds):
-        raise ValueError("seed IDs must be non-negative")
-    if len(set(seeds)) != len(seeds):
-        raise ValueError("seed IDs must be unique")
+    seeds = require_unique_jax_seeds(raw_seeds, name="seed IDs")
     if seeds != tuple(sorted(seeds)):
         raise ValueError("seed IDs must be sorted")
     learner_ids = tuple(learners)
@@ -867,14 +923,48 @@ def _strict_json_object(path: Path) -> dict[str, Any]:
     def reject_constant(value: str) -> object:
         raise ValueError(f"non-finite JSON constant is forbidden: {value}")
 
+    def parse_float(value: str) -> float:
+        parsed = float(value)
+        if not math.isfinite(parsed):
+            raise ValueError(f"non-finite JSON number is forbidden: {value}")
+        return parsed
+
     payload = json.loads(
         Path(path).read_text(encoding="utf-8"),
         object_pairs_hook=pairs_hook,
         parse_constant=reject_constant,
+        parse_float=parse_float,
     )
     if not isinstance(payload, dict):
         raise ValueError(f"{path}: payload must be one JSON object")
     return payload
+
+
+def _validated_float_hyperparameters(
+    value: object, learner: str, *, context: str
+) -> dict[str, float]:
+    """Require every hyperparameter to be an exact finite ``float``.
+
+    Python's ``0 == 0.0`` and ``True == 1.0`` make ``float(v)`` coercion and
+    dict ``==`` alias-tolerant, so an int/bool-aliased arm could slip through
+    intake and be measured under a different hyperparameter vector than the
+    registered one. Mirror ``ipmnist_screening``'s strict gate instead:
+    ``type(...) is float`` (rejecting bool, the int subclass, and every other
+    alias) plus finiteness, before any comparison.
+    """
+    if not isinstance(value, dict):
+        raise ValueError(f"{context}: {learner} hyperparameters must be an object")
+    invalid = sorted(
+        str(name)
+        for name, entry in value.items()
+        if type(entry) is not float or not math.isfinite(entry)
+    )
+    if invalid:
+        raise ValueError(
+            f"{context}: {learner} hyperparameters must be finite floats "
+            f"(int/bool aliases are forbidden); invalid field(s): {invalid}"
+        )
+    return {str(name): cast(float, entry) for name, entry in value.items()}
 
 
 def load_plan(path: Path) -> dict[str, Any]:
@@ -900,15 +990,22 @@ def load_plan(path: Path) -> dict[str, Any]:
     if sorted(body["hyperparameters"]) != sorted(learner_ids):
         raise ValueError(f"{path}: hyperparameter learner keys differ from learner_ids")
     for learner in learner_ids:
-        resolved = resolve_hyperparameters(
-            learner,
-            {k: float(v) for k, v in body["hyperparameters"][learner].items()},
+        provided = _validated_float_hyperparameters(
+            body["hyperparameters"][learner], learner, context=str(path)
         )
-        if resolved != {k: float(v) for k, v in body["hyperparameters"][learner].items()}:
-            raise ValueError(f"{path}: {learner} hyperparameters have unknown keys")
-    seeds = body["seed_ids"]
-    if len(set(seeds)) != len(seeds) or seeds != sorted(seeds):
-        raise ValueError(f"{path}: plan seed_ids must be unique and sorted")
+        resolved = resolve_hyperparameters(learner, provided)
+        if sorted(resolved) != sorted(provided) or any(
+            resolved[name].hex() != provided[name].hex() for name in provided
+        ):
+            raise ValueError(
+                f"{path}: {learner} hyperparameters must list the complete arm"
+            )
+    raw_seeds = body.get("seed_ids")
+    if not isinstance(raw_seeds, list):
+        raise ValueError(f"{path}: plan seed_ids must be a list")
+    seeds = require_unique_jax_seeds(raw_seeds, name=f"{path}: plan seed_ids")
+    if seeds != tuple(sorted(seeds)):
+        raise ValueError(f"{path}: plan seed_ids must be sorted")
     if body["planned_shard_count"] != len(learner_ids) * len(seeds):
         raise ValueError(f"{path}: planned_shard_count is inconsistent")
     return payload
@@ -918,7 +1015,8 @@ def partial_payload(
     result: LabelEMNISTRunResult, plan_sha256: str
 ) -> dict[str, Any]:
     """Serialize one single-seed run shard bound to its plan hash."""
-    if len(result.seeds) != 1:
+    seeds = require_unique_jax_seeds(result.seeds, name="result seeds")
+    if len(seeds) != 1:
         raise ValueError("a v1 partial must contain exactly one seed")
     return {
         "schema": PARTIAL_SCHEMA,
@@ -927,7 +1025,7 @@ def partial_payload(
         "plan_sha256": plan_sha256,
         "learner": result.learner,
         "hyperparameters": result.hyperparameters,
-        "seed_id": result.seeds[0],
+        "seed_id": seeds[0],
         "config": result.config.to_config(),
         "per_task_accuracy": [round(float(v), 6) for v in result.per_task_accuracy[0]],
         "per_task_loss": [round(float(v), 6) for v in result.per_task_loss[0]],
@@ -949,10 +1047,18 @@ def _validated_partial(path: Path, plan: dict[str, Any]) -> dict[str, Any]:
     learner = payload.get("learner")
     if learner not in body["learner_ids"]:
         raise ValueError(f"{path}: learner {learner!r} is not planned")
-    if payload.get("hyperparameters") != body["hyperparameters"][learner]:
+    shard_hp = _validated_float_hyperparameters(
+        payload.get("hyperparameters"), str(learner), context=str(path)
+    )
+    planned_hp = _validated_float_hyperparameters(
+        body["hyperparameters"][learner], str(learner), context=f"{path}: plan"
+    )
+    if sorted(shard_hp) != sorted(planned_hp) or any(
+        shard_hp[name].hex() != planned_hp[name].hex() for name in shard_hp
+    ):
         raise ValueError(f"{path}: hyperparameters differ from the plan")
-    seed = payload.get("seed_id")
-    if not isinstance(seed, int) or isinstance(seed, bool) or seed not in body["seed_ids"]:
+    seed = require_jax_seed(payload.get("seed_id"), name=f"{path}: seed_id")
+    if seed not in body["seed_ids"]:
         raise ValueError(f"{path}: seed_id {seed!r} is not planned")
     plan_config = {k: v for k, v in body["config"].items() if k != "n_steps"}
     if payload.get("config") != plan_config:
@@ -1092,9 +1198,10 @@ def build_artifact(
 
 def _cmd_plan(args: argparse.Namespace) -> None:
     config = LabelEMNISTConfig(n_tasks=args.n_tasks, task_length=args.task_length)
+    raw_seeds = [int(part) for part in args.seed_list.split(",") if part.strip()]
+    seeds = require_unique_jax_seeds(raw_seeds, name="seed IDs")
     data_home = args.data_home if args.data_home is not None else default_openml_data_home()
     _, _, meta = load_emnist_balanced_train(data_home)
-    seeds = [int(part) for part in args.seed_list.split(",") if part.strip()]
     learners = [name.strip() for name in args.learners.split(",") if name.strip()]
     payload = build_plan_payload(config, seeds, meta, learners, notes=args.note)
     atomic_write_new_json(args.plan_out, payload)

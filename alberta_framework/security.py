@@ -9,10 +9,116 @@ requiring either sibling repository at import time.
 from __future__ import annotations
 
 import dataclasses
+import json
+import math
+import operator
 import time
 from collections.abc import Mapping, Sequence
 from enum import IntEnum
-from typing import Any
+from fractions import Fraction
+from types import MappingProxyType
+from typing import Any, SupportsIndex, cast
+
+import numpy as np
+
+from alberta_framework.core._float32_scalars import validated_float32_scalar
+
+
+def _require_rfc_json_mapping(payload: Mapping[str, Any], *, name: str) -> None:
+    """Raise ``ValueError`` unless ``payload`` serializes as RFC-compliant JSON."""
+    try:
+        json.dumps(payload, allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be RFC-compliant JSON") from exc
+
+
+_INT32_MAX: int = 2**31 - 1
+
+_ACTUAL_INT_TYPES = frozenset(
+    {
+        int,
+        np.int8,
+        np.int16,
+        np.int32,
+        np.int64,
+        np.uint8,
+        np.uint16,
+        np.uint32,
+        np.uint64,
+        np.longlong,
+        np.ulonglong,
+    }
+)
+_ACTUAL_FLOAT_TYPES = frozenset(
+    {float, Fraction, *(np.dtype(code).type for code in ("e", "f", "d", "g"))}
+)
+_ALLOWED_REAL_TYPES = _ACTUAL_INT_TYPES | _ACTUAL_FLOAT_TYPES
+
+
+def _copy_mapping(payload: object, *, name: str) -> dict[str, Any]:
+    if type(payload) not in (dict, MappingProxyType):
+        raise ValueError(f"{name} must be a mapping")
+    try:
+        values = dict(cast(Mapping[str, Any], payload))
+    except Exception as error:
+        raise ValueError(f"{name} must be a readable mapping") from error
+    if any(type(key) is not str for key in values):
+        raise ValueError(f"{name} keys must be exact strings")
+    return values
+
+
+def _copy_json_value(value: object, *, name: str) -> Any:
+    if value is None or type(value) in (bool, int, str):
+        return value
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise ValueError(f"{name} must be RFC-compliant JSON with finite numbers")
+        return value
+    if type(value) in (list, tuple):
+        return [_copy_json_value(item, name=name) for item in cast(Sequence[object], value)]
+    if type(value) in (dict, MappingProxyType):
+        payload = _copy_mapping(value, name=name)
+        return {key: _copy_json_value(item, name=name) for key, item in payload.items()}
+    raise ValueError(f"{name} must contain exact JSON values")
+
+
+def _copy_json_mapping(payload: object, *, name: str) -> dict[str, Any]:
+    copied = _copy_mapping(payload, name=name)
+    return {key: _copy_json_value(value, name=name) for key, value in copied.items()}
+
+
+def _require_exact_str(name: str, value: object) -> str:
+    if type(value) is not str:
+        raise ValueError(f"{name} must be an exact string")
+    return value
+
+
+def _require_int(
+    name: str,
+    value: object,
+    *,
+    minimum: int | None = None,
+    maximum: int | None = None,
+) -> int:
+    if type(value) not in _ACTUAL_INT_TYPES:
+        raise ValueError(f"{name} must be an integer")
+    number = operator.index(cast(SupportsIndex, value))
+    if minimum is not None and number < minimum:
+        raise ValueError(f"{name} must be >= {minimum}")
+    if maximum is not None and number > maximum:
+        raise ValueError(f"{name} must be <= {maximum}")
+    return number
+
+
+def _require_finite_real(name: str, value: object) -> float:
+    if type(value) not in _ALLOWED_REAL_TYPES:
+        raise ValueError(f"{name} must be a real number")
+    # validated_float32_scalar ensures finite and canonical float32 domain;
+    # use permissive domain to allow any finite real then check isfinite via validator.
+    try:
+        return validated_float32_scalar(name, value)
+    except ValueError:
+        raise ValueError(f"{name} must be a finite real number") from None
 
 
 class SecurityAction(IntEnum):
@@ -86,7 +192,9 @@ class SecurityRewardWeights:
 
     def to_dict(self) -> dict[str, float]:
         """Return a JSON-serializable weight mapping."""
-        return dataclasses.asdict(self)
+        payload = dataclasses.asdict(self)
+        _require_rfc_json_mapping(payload, name="security reward weights")
+        return payload
 
 
 def security_reward(
@@ -98,12 +206,24 @@ def security_reward(
     Unknown component names are ignored so sibling environments can log richer
     diagnostics while keeping the learning reward contract stable.
     """
-    weight_map = weights.to_dict() if isinstance(weights, SecurityRewardWeights) else weights
-    if weight_map is None:
+    component_map = _copy_mapping(components, name="security reward components")
+    if weights is None:
         weight_map = SecurityRewardWeights().to_dict()
-    return float(
-        sum(float(components.get(name, 0.0)) * weight for name, weight in weight_map.items())
-    )
+    elif type(weights) is SecurityRewardWeights:
+        weight_map = weights.to_dict()
+    else:
+        weight_map = _copy_mapping(weights, name="security reward weights")
+    terms = []
+    for name, raw_weight in weight_map.items():
+        weight = _require_finite_real(f"security reward weight {name}", raw_weight)
+        component = _require_finite_real(
+            f"security reward component {name}", component_map.get(name, 0.0)
+        )
+        terms.append(component * weight)
+    reward = math.fsum(terms)
+    if not math.isfinite(reward):
+        raise ValueError("security reward must be finite")
+    return reward
 
 
 @dataclasses.dataclass(frozen=True)
@@ -115,10 +235,16 @@ class SecurityFeatureSchema:
     dtype: str = "float32"
 
     def __post_init__(self) -> None:
+        if type(self.names) is not tuple:
+            raise ValueError("feature schema names must be an exact tuple")
         if not self.names:
             raise ValueError("feature schema must contain at least one feature")
+        for idx, name in enumerate(self.names):
+            _require_exact_str(f"names[{idx}]", name)
         if len(set(self.names)) != len(self.names):
             raise ValueError("feature names must be unique")
+        _require_exact_str("version", self.version)
+        _require_exact_str("dtype", self.dtype)
 
     @property
     def feature_dim(self) -> int:
@@ -135,21 +261,34 @@ class SecurityFeatureSchema:
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serializable schema mapping."""
-        return {
+        payload = {
             "version": self.version,
             "dtype": self.dtype,
             "names": list(self.names),
             "feature_dim": self.feature_dim,
         }
+        _require_rfc_json_mapping(payload, name="security feature schema")
+        return payload
 
     @classmethod
-    def from_dict(cls, data: Mapping[str, Any]) -> SecurityFeatureSchema:
+    def from_dict(cls, data: object) -> SecurityFeatureSchema:
         """Reconstruct a schema from ``to_dict`` output."""
-        return cls(
-            names=tuple(str(name) for name in data["names"]),
-            version=str(data.get("version", "security-gym-v1")),
-            dtype=str(data.get("dtype", "float32")),
+        payload = _copy_mapping(data, name="security feature schema")
+        raw_names = payload.get("names")
+        if type(raw_names) not in (list, tuple):
+            raise ValueError("security feature schema names must be a list or tuple")
+        names = tuple(
+            _require_exact_str(f"names[{i}]", n)
+            for i, n in enumerate(cast(Sequence[Any], raw_names))
         )
+        version = payload.get("version", "security-gym-v1")
+        dtype = payload.get("dtype", "float32")
+        _require_exact_str("version", version)
+        _require_exact_str("dtype", dtype)
+        feature_dim = payload.get("feature_dim")
+        if feature_dim is not None and (type(feature_dim) is not int or feature_dim != len(names)):
+            raise ValueError("feature_dim must match the number of feature names")
+        return cls(names=names, version=version, dtype=dtype)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -166,7 +305,7 @@ class SecurityRolloutStep:
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serializable transition mapping."""
-        return {
+        payload = {
             "state": list(self.state),
             "action": int(self.action),
             "action_name": self.action.name.lower(),
@@ -174,20 +313,52 @@ class SecurityRolloutStep:
             "next_state": list(self.next_state),
             "terminated": self.terminated,
             "truncated": self.truncated,
-            "policy_metadata": dict(self.policy_metadata),
+            "policy_metadata": _copy_json_mapping(
+                self.policy_metadata, name="policy_metadata"
+            ),
         }
+        _require_rfc_json_mapping(payload, name="security rollout step")
+        return payload
 
     @classmethod
-    def from_dict(cls, data: Mapping[str, Any]) -> SecurityRolloutStep:
+    def from_dict(cls, data: object) -> SecurityRolloutStep:
         """Reconstruct a rollout step from ``to_dict`` output."""
+        payload = _copy_mapping(data, name="security rollout step")
+        raw_state = payload.get("state")
+        raw_next = payload.get("next_state")
+        if type(raw_state) not in (list, tuple) or type(raw_next) not in (list, tuple):
+            raise ValueError("security rollout step state must be a list or tuple")
+        state = tuple(
+            _require_finite_real(f"state[{i}]", v)
+            for i, v in enumerate(cast(Sequence[Any], raw_state))
+        )
+        next_state = tuple(
+            _require_finite_real(f"next_state[{i}]", v)
+            for i, v in enumerate(cast(Sequence[Any], raw_next))
+        )
+        action = coerce_security_action(payload.get("action"))
+        action_name = payload.get("action_name")
+        if action_name is not None and (
+            type(action_name) is not str or action_name != action.name.lower()
+        ):
+            raise ValueError("action_name must match action")
+        reward = _require_finite_real("reward", payload.get("reward"))
+        terminated = payload.get("terminated")
+        truncated = payload.get("truncated", False)
+        if type(terminated) is not bool:
+            raise ValueError("terminated must be an exact bool")
+        if type(truncated) is not bool:
+            raise ValueError("truncated must be an exact bool")
+        raw_meta = payload.get("policy_metadata", {})
+        meta = _copy_json_mapping(raw_meta, name="policy_metadata")
         return cls(
-            state=tuple(float(value) for value in data["state"]),
-            action=coerce_security_action(data["action"]),
-            reward=float(data["reward"]),
-            next_state=tuple(float(value) for value in data["next_state"]),
-            terminated=bool(data["terminated"]),
-            truncated=bool(data.get("truncated", False)),
-            policy_metadata=dict(data.get("policy_metadata", {})),
+            state=state,
+            action=action,
+            reward=reward,
+            next_state=next_state,
+            terminated=terminated,
+            truncated=truncated,
+            policy_metadata=meta,
         )
 
 
@@ -204,22 +375,29 @@ class SecurityOracleExperience:
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serializable oracle experience mapping."""
-        return {
+        payload = {
             "schema": self.schema,
             "state": list(self.state),
             "action": int(self.action),
             "action_name": security_gym_action_name(self.action),
             "reward": self.reward,
-            "outcome": dict(self.outcome),
-            "policy_metadata": dict(self.policy_metadata),
+            "outcome": _copy_json_mapping(self.outcome, name="security oracle outcome"),
+            "policy_metadata": _copy_json_mapping(
+                self.policy_metadata, name="policy_metadata"
+            ),
         }
+        _require_rfc_json_mapping(payload, name="security oracle experience")
+        return payload
 
 
 def security_rollout_step_to_oracle_experience(
     step: SecurityRolloutStep,
 ) -> SecurityOracleExperience:
     """Convert a rollout transition to a compact oracle-review record."""
-    is_malicious = bool(step.policy_metadata.get("is_malicious", False))
+    policy_metadata = _copy_json_mapping(step.policy_metadata, name="policy_metadata")
+    is_malicious = policy_metadata.get("is_malicious", False)
+    if type(is_malicious) is not bool:
+        raise ValueError("policy_metadata is_malicious must be an exact bool")
     defensive_action = step.action in (
         SecurityAction.THROTTLE,
         SecurityAction.BLOCK,
@@ -242,7 +420,7 @@ def security_rollout_step_to_oracle_experience(
             "terminated": step.terminated,
             "truncated": step.truncated,
         },
-        policy_metadata=step.policy_metadata,
+        policy_metadata=policy_metadata,
     )
 
 
@@ -260,29 +438,37 @@ def validate_security_oracle_experience(
             raise ValueError(f"invalid oracle experience {idx}: missing outcome label")
 
 
-def coerce_security_action(action: SecurityAction | int | str) -> SecurityAction:
+def coerce_security_action(action: object) -> SecurityAction:
     """Coerce an integer or name to ``SecurityAction``."""
-    if isinstance(action, SecurityAction):
+    if type(action) is bool:
+        raise ValueError("security action must not be a boolean")
+    if type(action) is SecurityAction:
         return action
-    if isinstance(action, int):
-        return SecurityAction(action)
-    normalized = action.strip().lower()
-    if normalized in _ACTION_ALIASES:
-        return _ACTION_ALIASES[normalized]
-    for candidate in SecurityAction:
-        if candidate.name.lower() == normalized:
-            return candidate
-    raise ValueError(f"unknown security action: {action!r}")
+    if type(action) is int:
+        try:
+            return SecurityAction(action)
+        except ValueError as exc:
+            raise ValueError("unknown security action") from exc
+    if type(action) is str:
+        _require_exact_str("security action", action)
+        normalized = action.strip().lower()
+        if normalized in _ACTION_ALIASES:
+            return _ACTION_ALIASES[normalized]
+        for candidate in SecurityAction:
+            if candidate.name.lower() == normalized:
+                return candidate
+        raise ValueError("unknown security action")
+    raise ValueError("unknown security action")
 
 
-def security_gym_action_name(action: SecurityAction | int | str) -> str:
+def security_gym_action_name(action: object) -> str:
     """Return the action name expected by ``security-gym``."""
     return SECURITY_GYM_ACTION_NAMES[int(coerce_security_action(action))]
 
 
 def to_security_gym_action(
-    action: SecurityAction | int | str,
-    risk_score: float = 0.0,
+    action: object,
+    risk_score: object = 0.0,
 ) -> dict[str, int | tuple[float]]:
     """Convert a framework action into a ``security-gym`` action dict.
 
@@ -290,7 +476,15 @@ def to_security_gym_action(
     ``action`` id and a one-element ``risk_score`` array. A one-element tuple is
     accepted by the environment and keeps this module dependency-free.
     """
-    clipped_risk = min(10.0, max(0.0, float(risk_score)))
+    if type(risk_score) not in _ALLOWED_REAL_TYPES:
+        raise ValueError("risk_score must be a finite real number")
+    try:
+        val = validated_float32_scalar("risk_score", risk_score)
+    except ValueError as exc:
+        raise ValueError("risk_score must be a finite real number") from exc
+    if not math.isfinite(val):
+        raise ValueError("risk_score must be a finite real number")
+    clipped_risk = min(10.0, max(0.0, val))
     return {
         "action": int(coerce_security_action(action)),
         "risk_score": (clipped_risk,),
@@ -298,11 +492,13 @@ def to_security_gym_action(
 
 
 def security_gym_action_reward(
-    action: SecurityAction | int | str,
+    action: object,
     *,
-    is_malicious: bool,
+    is_malicious: object,
 ) -> float:
     """Return the immediate action reward from ``security-gym`` v0.4.x."""
+    if type(is_malicious) is not bool:
+        raise ValueError("is_malicious must be an exact bool")
     table = _SECURITY_GYM_ATTACK_REWARDS if is_malicious else _SECURITY_GYM_BENIGN_REWARDS
     return table[coerce_security_action(action)]
 
@@ -327,6 +523,19 @@ class ThroughputMeasurement:
     n_events: int
     elapsed_s: float
 
+    def __post_init__(self) -> None:
+        n_events = _require_int("n_events", self.n_events, minimum=0, maximum=_INT32_MAX)
+        if type(self.elapsed_s) not in _ALLOWED_REAL_TYPES:
+            raise ValueError("elapsed_s must be a real number")
+        try:
+            elapsed_s = float(self.elapsed_s)
+        except (OverflowError, ValueError) as exc:
+            raise ValueError("elapsed_s must be representable as a float") from exc
+        object.__setattr__(self, "n_events", n_events)
+        object.__setattr__(self, "elapsed_s", elapsed_s)
+        # Non-finite and nonpositive telemetry remains constructible for compatibility;
+        # strict JSON publication rejects its derived non-finite rate in ``to_dict``.
+
     @property
     def events_per_second(self) -> float:
         """Throughput in events per second."""
@@ -336,11 +545,13 @@ class ThroughputMeasurement:
 
     def to_dict(self) -> dict[str, float | int]:
         """Return a JSON-serializable measurement mapping."""
-        return {
+        payload = {
             "n_events": self.n_events,
             "elapsed_s": self.elapsed_s,
             "events_per_second": self.events_per_second,
         }
+        _require_rfc_json_mapping(payload, name="throughput measurement")
+        return payload
 
 
 class ThroughputMeter:
@@ -350,11 +561,12 @@ class ThroughputMeter:
         self._start = time.perf_counter()
         self._n_events = 0
 
-    def tick(self, n_events: int = 1) -> None:
+    def tick(self, n_events: object = 1) -> None:
         """Record completed events."""
-        if n_events < 0:
-            raise ValueError("n_events must be non-negative")
-        self._n_events += n_events
+        n_events_int = _require_int("n_events", n_events, minimum=0, maximum=_INT32_MAX)
+        if n_events_int > _INT32_MAX - self._n_events:
+            raise ValueError("cumulative n_events must fit signed int32")
+        self._n_events += n_events_int
 
     def measure(self) -> ThroughputMeasurement:
         """Return current throughput measurement."""

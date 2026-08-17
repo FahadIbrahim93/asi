@@ -35,8 +35,9 @@ from __future__ import annotations
 import dataclasses
 import functools
 import math
-from collections.abc import Callable
-from typing import Any, NamedTuple, Self, cast
+import operator
+from collections.abc import Callable, Mapping
+from typing import Any, NamedTuple, Self, SupportsIndex, cast
 
 import jax
 import jax.numpy as jnp
@@ -45,7 +46,11 @@ import numpy as np
 from jax import Array
 from jax.nn.initializers import lecun_normal
 
+from alberta_framework.core._float32_scalars import validated_float32_scalar_with_ratio
 from alberta_framework.core.initializers import sparse_init
+from alberta_framework.core.update_safety import (
+    floating_tree_is_finite as _floating_tree_is_finite,
+)
 
 _FLOAT32_MAX = float(np.finfo(np.float32).max)
 _FLOAT32_TINY = float(np.finfo(np.float32).tiny)
@@ -67,9 +72,7 @@ def _validate_normal_float32_config_value(name: str, value: float) -> None:
         raise ValueError(f"{name} must be finite")
     magnitude = abs(value)
     if magnitude > _FLOAT32_MAX or (magnitude != 0.0 and magnitude < _FLOAT32_TINY):
-        raise ValueError(
-            f"{name} must be exactly zero or representable as a finite normal float32"
-        )
+        raise ValueError(f"{name} must be exactly zero or representable as a finite normal float32")
 
 
 class RTUParameters(NamedTuple):
@@ -212,6 +215,7 @@ class RecurrentTraceActorCriticUpdateResult(NamedTuple):
     critic_step_size: Array
     actor_obgd_scale: Array
     critic_obgd_scale: Array
+    update_applied: Array
 
 
 class ObGDUpdate(NamedTuple):
@@ -220,6 +224,7 @@ class ObGDUpdate(NamedTuple):
     updates: Any
     step_size: Array
     scale: Array
+    update_applied: Array
 
 
 class AdaptiveObGDUpdate(NamedTuple):
@@ -229,6 +234,154 @@ class AdaptiveObGDUpdate(NamedTuple):
     second_moment: Any
     step_size: Array
     scale: Array
+    update_applied: Array
+
+
+_INT32_MAX = 2**31 - 1
+_ACTUAL_INT_TYPES = frozenset(
+    {
+        int,
+        np.int8,
+        np.int16,
+        np.int32,
+        np.int64,
+        np.uint8,
+        np.uint16,
+        np.uint32,
+        np.uint64,
+        np.longlong,
+        np.ulonglong,
+    }
+)
+_ACTUAL_FLOAT_TYPES = frozenset(
+    {float, *(np.dtype(code).type for code in ("e", "f", "d", "g"))}
+)
+
+
+def _require_int32(name: str, value: object, *, minimum: int, maximum: int = _INT32_MAX) -> int:
+    if type(value) not in _ACTUAL_INT_TYPES:
+        raise ValueError(f"{name} must be an integer in [{minimum}, {maximum}]")
+    canonical = operator.index(cast(SupportsIndex, value))
+    if not minimum <= canonical <= maximum:
+        raise ValueError(f"{name} must be an integer in [{minimum}, {maximum}]")
+    return canonical
+
+
+def _validated_config_float(name: str, value: object, **bounds: Any) -> float:
+    if type(value) is bool or type(value) is np.bool_:
+        raise ValueError(f"{name} must be numeric, not bool")
+    if type(value) not in (_ACTUAL_INT_TYPES | _ACTUAL_FLOAT_TYPES):
+        raise ValueError(f"{name} must be a finite real scalar")
+    try:
+        magnitude = abs(float(cast(Any, value)))
+    except (OverflowError, ValueError) as error:
+        raise ValueError(
+            f"{name} must be exactly zero or representable as a finite normal float32"
+        ) from error
+    if (
+        not math.isfinite(magnitude)
+        or magnitude > _FLOAT32_MAX
+        or (magnitude != 0.0 and magnitude < _FLOAT32_TINY)
+    ):
+        raise ValueError(
+            f"{name} must be exactly zero or representable as a finite normal float32"
+        )
+    normalized, numerator, _ = validated_float32_scalar_with_ratio(name, value, **bounds)
+    narrowed_magnitude = abs(float(np.float32(normalized)))
+    if numerator != 0 and narrowed_magnitude < _FLOAT32_TINY:
+        raise ValueError(
+            f"{name} must be exactly zero or representable as a finite normal float32"
+        )
+    _validate_normal_float32_config_value(name, normalized)
+    return normalized
+
+
+def _network_parameter_scalars(
+    *,
+    feature_dim: int,
+    output_dim: int,
+    hidden_size: int,
+    encoder_width: int,
+    output_width: int,
+) -> int:
+    products = {
+        "encoder matrix": encoder_width * feature_dim,
+        "RTU input matrices": 2 * hidden_size * encoder_width,
+        "output matrix": 2 * output_width * hidden_size,
+        "head matrix": output_dim * output_width,
+    }
+    for name, value in products.items():
+        if value > _INT32_MAX:
+            raise ValueError(f"derived {name} scalars must fit signed int32")
+    return (
+        products["encoder matrix"]
+        + encoder_width
+        + 2 * hidden_size
+        + products["RTU input matrices"]
+        + products["output matrix"]
+        + output_width
+        + products["head matrix"]
+        + output_dim
+    )
+
+
+def _preflight_state_resources(
+    config: RecurrentTraceActorCriticConfig,
+    feature_dim: object,
+) -> dict[str, int]:
+    width = _require_int32("feature_dim", feature_dim, minimum=1)
+    actor_parameters = _network_parameter_scalars(
+        feature_dim=width,
+        output_dim=config.n_actions,
+        hidden_size=config.hidden_size,
+        encoder_width=config.encoder_width,
+        output_width=config.output_width,
+    )
+    critic_parameters = _network_parameter_scalars(
+        feature_dim=width,
+        output_dim=1,
+        hidden_size=config.hidden_size,
+        encoder_width=config.encoder_width,
+        output_width=config.output_width,
+    )
+    parameters = actor_parameters + critic_parameters
+    sensitivity_scalars = 4 * config.hidden_size * (config.encoder_width + 1)
+    float32_scalars = (
+        parameters * (3 if config.adaptive_obgd else 2)
+        + 2 * sensitivity_scalars * (2 if config.rtrl_taylor_correction else 1)
+        + 4 * config.hidden_size
+        + 4 * width
+        + 3
+    )
+    # Two statistics counters, last action, typed key, step counter, and the
+    # started flag are six logical array elements. The typed key occupies two
+    # uint32 words physically, which is reflected separately in state_nbytes.
+    logical_scalars = float32_scalars + 6
+    state_nbytes = 4 * (float32_scalars + 6) + 1
+    resources = {
+        "parameter_scalars": parameters,
+        "sensitivity_scalars_per_network": sensitivity_scalars,
+        "float32_state_scalars": float32_scalars,
+        "state_scalars": logical_scalars,
+        "state_nbytes": state_nbytes,
+    }
+    for name, value in resources.items():
+        if value > _INT32_MAX:
+            raise ValueError(f"derived {name} must fit signed int32")
+    return resources
+
+
+def _copy_config_mapping(name: str, config: object) -> dict[str, Any]:
+    """Copy a legacy-compatible mapping while normalizing hostile hooks."""
+    if not isinstance(config, Mapping):
+        raise ValueError(f"{name} must be a mapping")
+    try:
+        payload = dict(config)
+    except Exception as error:
+        raise ValueError(f"{name} must be a readable mapping") from error
+    if any(type(key) is not str for key in payload):
+        raise ValueError(f"{name} fields must be strings")
+    return cast(dict[str, Any], payload)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -298,53 +451,43 @@ class RecurrentTraceActorCriticConfig:
 
     def __post_init__(self) -> None:
         """Validate shape and numerical invariants eagerly."""
-        for integer_name, integer_value in (
-            ("n_actions", self.n_actions),
-            ("hidden_size", self.hidden_size),
-            ("encoder_width", self.encoder_width),
-            ("output_width", self.output_width),
-        ):
-            if (
-                isinstance(integer_value, bool)
-                or not isinstance(integer_value, int)
-                or integer_value <= 0
-            ):
-                raise ValueError(f"{integer_name} must be a positive integer")
+        n_actions = _require_int32("n_actions", self.n_actions, minimum=1)
+        hidden_size = _require_int32("hidden_size", self.hidden_size, minimum=1)
+        encoder_width = _require_int32("encoder_width", self.encoder_width, minimum=2)
+        output_width = _require_int32("output_width", self.output_width, minimum=2)
 
-        for width_name, width_value in (
-            ("encoder_width", self.encoder_width),
-            ("output_width", self.output_width),
-        ):
-            if width_value < 2:
-                raise ValueError(
-                    f"{width_name} must be at least 2 because parameterless "
-                    "layer normalization makes a width-1 block identically zero"
-                )
+        object.__setattr__(self, "n_actions", n_actions)
+        object.__setattr__(self, "hidden_size", hidden_size)
+        object.__setattr__(self, "encoder_width", encoder_width)
+        object.__setattr__(self, "output_width", output_width)
 
-        for numeric_name, numeric_value in (
-            ("gamma", self.gamma),
-            ("actor_lamda", self.actor_lamda),
-            ("critic_lamda", self.critic_lamda),
-            ("actor_alpha", self.actor_alpha),
-            ("critic_alpha", self.critic_alpha),
-            ("actor_kappa", self.actor_kappa),
-            ("critic_kappa", self.critic_kappa),
-            ("entropy_coefficient", self.entropy_coefficient),
-            ("temperature", self.temperature),
-            ("sparsity", self.sparsity),
-            ("r_min", self.r_min),
-            ("r_max", self.r_max),
-            ("max_phase", self.max_phase),
-            ("rtu_epsilon", self.rtu_epsilon),
-            ("layer_norm_epsilon", self.layer_norm_epsilon),
-            ("leaky_relu_slope", self.leaky_relu_slope),
-            ("normalization_epsilon", self.normalization_epsilon),
-            ("beta2", self.beta2),
-            ("epsilon", self.epsilon),
-        ):
-            if isinstance(numeric_value, bool):
-                raise ValueError(f"{numeric_name} must be numeric, not bool")
-            _validate_normal_float32_config_value(numeric_name, numeric_value)
+        float_domains: dict[str, dict[str, Any]] = {
+            "gamma": {"lower": 0.0, "upper": 1.0},
+            "actor_lamda": {"lower": 0.0, "upper": 1.0},
+            "critic_lamda": {"lower": 0.0, "upper": 1.0},
+            "actor_alpha": {"lower": 0.0},
+            "critic_alpha": {"lower": 0.0},
+            "actor_kappa": {"positive": True},
+            "critic_kappa": {"positive": True},
+            "entropy_coefficient": {"lower": 0.0},
+            "temperature": {"positive": True},
+            "sparsity": {"lower": 0.0, "upper": 1.0, "upper_inclusive": False},
+            "r_min": {"lower": 0.0, "upper": 1.0},
+            "r_max": {"positive": True, "upper": 1.0},
+            "max_phase": {"positive": True, "upper": 2.0 * math.pi},
+            "rtu_epsilon": {"positive": True, "upper": 1.0, "upper_inclusive": False},
+            "layer_norm_epsilon": {"positive": True},
+            "leaky_relu_slope": {"lower": 0.0},
+            "normalization_epsilon": {"positive": True},
+            "beta2": {"lower": 0.0, "upper": 1.0, "upper_inclusive": False},
+            "epsilon": {"positive": True},
+        }
+        for name, bounds in float_domains.items():
+            object.__setattr__(
+                self,
+                name,
+                _validated_config_float(name, getattr(self, name), **bounds),
+            )
 
         for interval_name, interval_value in (
             ("gamma", self.gamma),
@@ -404,21 +547,21 @@ class RecurrentTraceActorCriticConfig:
             raise ValueError("max_phase must not exceed 2*pi")
         if self.rtu_epsilon >= 1.0:
             raise ValueError("rtu_epsilon must be less than 1")
-        if (
-            not 0.0 <= self.beta2 < 1.0
-            or not float(np.float32(self.beta2)) < 1.0
-        ):
-            raise ValueError(
-                "beta2 must remain in [0, 1) after conversion to float32"
-            )
+        if not 0.0 <= self.beta2 < 1.0 or not float(np.float32(self.beta2)) < 1.0:
+            raise ValueError("beta2 must remain in [0, 1) after conversion to float32")
         for name, value in (
             ("normalize_observations", self.normalize_observations),
             ("normalize_rewards", self.normalize_rewards),
             ("rtrl_taylor_correction", self.rtrl_taylor_correction),
             ("adaptive_obgd", self.adaptive_obgd),
         ):
-            if not isinstance(value, bool):
+            if type(value) is not bool:
                 raise ValueError(f"{name} must be a bool")
+        _preflight_state_resources(self, 1)
+
+    def state_resource_budget(self, feature_dim: object) -> dict[str, int]:
+        """Return exact persistent-state counts for an observation width."""
+        return _preflight_state_resources(self, feature_dim)
 
     def to_config(self) -> dict[str, Any]:
         """Return a JSON-compatible configuration mapping.
@@ -438,10 +581,14 @@ class RecurrentTraceActorCriticConfig:
     @classmethod
     def from_config(
         cls,
-        config: dict[str, Any],
+        config: Mapping[str, Any],
     ) -> RecurrentTraceActorCriticConfig:
         """Reconstruct and validate a configuration mapping."""
-        return cls(**dict(config))
+        payload = _copy_config_mapping("config", config)
+        try:
+            return cls(**payload)
+        except TypeError as error:
+            raise ValueError("config fields do not match the serialized schema") from error
 
 
 def parameterless_layer_norm(inputs: Array, epsilon: float = 1e-5) -> Array:
@@ -460,6 +607,7 @@ def leaky_relu(inputs: Array, negative_slope: float = 0.01) -> Array:
 
 def zero_rtu_state(hidden_size: int, dtype: jnp.dtype[Any] = jnp.float32) -> RTUState:
     """Construct a zero RTU state."""
+    hidden_size = _require_int32("hidden_size", hidden_size, minimum=1)
     zeros = jnp.zeros((hidden_size,), dtype=dtype)
     return RTUState(real=zeros, imaginary=zeros)
 
@@ -470,6 +618,8 @@ def zero_rtu_sensitivities(
     dtype: jnp.dtype[Any] = jnp.float32,
 ) -> RTUSensitivities:
     """Construct zero compressed RTRL sensitivities."""
+    hidden_size = _require_int32("hidden_size", hidden_size, minimum=1)
+    input_dim = _require_int32("input_dim", input_dim, minimum=1)
     recurrent = jnp.zeros((2, hidden_size), dtype=dtype)
     inputs = jnp.zeros((2, hidden_size, input_dim), dtype=dtype)
     return RTUSensitivities(
@@ -634,13 +784,16 @@ def _propagate_postactivation_trace(
     )
     propagated_real = g_broadcast * trace[0] - phi_broadcast * trace[1]
     propagated_imaginary = phi_broadcast * trace[0] + g_broadcast * trace[1]
-    return jnp.stack(
-        (
-            derivative_real_broadcast * propagated_real,
-            derivative_imaginary_broadcast * propagated_imaginary,
-        ),
-        axis=0,
-    ) + direct
+    return (
+        jnp.stack(
+            (
+                derivative_real_broadcast * propagated_real,
+                derivative_imaginary_broadcast * propagated_imaginary,
+            ),
+            axis=0,
+        )
+        + direct
+    )
 
 
 def _rtu_coefficient_second_derivatives(
@@ -657,12 +810,8 @@ def _rtu_coefficient_second_derivatives(
     transforms and the floored input-normalization branch have zero first and
     second derivative outside their active intervals.
     """
-    d2g_d_nu_log2 = (
-        jnp.square(d_exp_nu_d_nu_log) - d_exp_nu_d_nu_log
-    ) * g
-    d2phi_d_nu_log2 = (
-        jnp.square(d_exp_nu_d_nu_log) - d_exp_nu_d_nu_log
-    ) * phi
+    d2g_d_nu_log2 = (jnp.square(d_exp_nu_d_nu_log) - d_exp_nu_d_nu_log) * g
+    d2phi_d_nu_log2 = (jnp.square(d_exp_nu_d_nu_log) - d_exp_nu_d_nu_log) * phi
 
     minimum_exp_log = jnp.asarray(_MINIMUM_EXP_LOG, dtype=params.nu_log.dtype)
     maximum_nu_log = jnp.asarray(_MAXIMUM_NU_LOG, dtype=params.nu_log.dtype)
@@ -690,24 +839,15 @@ def _rtu_coefficient_second_derivatives(
     )
     d2norm_d_nu_log2 = jnp.where(
         norm_branch_active,
-        d_exp_nu_d_nu_log
-        * radius_squared
-        * (1.0 - 2.0 * d_exp_nu_d_nu_log)
-        / norm_denominator
+        d_exp_nu_d_nu_log * radius_squared * (1.0 - 2.0 * d_exp_nu_d_nu_log) / norm_denominator
         - jnp.square(d_exp_nu_d_nu_log)
         * jnp.square(radius_squared)
         / jnp.power(norm_denominator, 3),
         jnp.zeros_like(radius),
     )
 
-    d2g_d_theta_log2 = (
-        -g * jnp.square(d_theta_d_theta_log)
-        - phi * d_theta_d_theta_log
-    )
-    d2phi_d_theta_log2 = (
-        -phi * jnp.square(d_theta_d_theta_log)
-        + g * d_theta_d_theta_log
-    )
+    d2g_d_theta_log2 = -g * jnp.square(d_theta_d_theta_log) - phi * d_theta_d_theta_log
+    d2phi_d_theta_log2 = -phi * jnp.square(d_theta_d_theta_log) + g * d_theta_d_theta_log
     return (
         d2g_d_nu_log2,
         d2phi_d_nu_log2,
@@ -878,22 +1018,12 @@ def rtu_taylor_step(
     decrease.  This is not an exact moving-parameter RTRL sensitivity.
     """
     corrected_previous = RTUSensitivities(
-        nu_log=(
-            sensitivities.nu_log
-            + taylor_trace.nu_log * parameter_delta.nu_log[None, :]
-        ),
+        nu_log=(sensitivities.nu_log + taylor_trace.nu_log * parameter_delta.nu_log[None, :]),
         theta_log=(
-            sensitivities.theta_log
-            + taylor_trace.theta_log * parameter_delta.theta_log[None, :]
+            sensitivities.theta_log + taylor_trace.theta_log * parameter_delta.theta_log[None, :]
         ),
-        b_real=(
-            sensitivities.b_real
-            + taylor_trace.b_real * parameter_delta.b_real[None, :, :]
-        ),
-        b_imag=(
-            sensitivities.b_imag
-            + taylor_trace.b_imag * parameter_delta.b_imag[None, :, :]
-        ),
+        b_real=(sensitivities.b_real + taylor_trace.b_real * parameter_delta.b_real[None, :, :]),
+        b_imag=(sensitivities.b_imag + taylor_trace.b_imag * parameter_delta.b_imag[None, :, :]),
     )
     next_state, next_sensitivities = rtu_step(
         params,
@@ -914,9 +1044,7 @@ def rtu_taylor_step(
     derivative_real = 1.0 - jnp.square(next_state.real)
     derivative_imaginary = 1.0 - jnp.square(next_state.imaginary)
     second_derivative_real = -2.0 * next_state.real * derivative_real
-    second_derivative_imaginary = (
-        -2.0 * next_state.imaginary * derivative_imaginary
-    )
+    second_derivative_imaginary = -2.0 * next_state.imaginary * derivative_imaginary
     input_real = params.b_real @ inputs
     input_imaginary = params.b_imag @ inputs
 
@@ -970,10 +1098,8 @@ def rtu_taylor_step(
     )
     direct_second_theta = jnp.stack(
         (
-            d2g_d_theta_log2 * state.real
-            - d2phi_d_theta_log2 * state.imaginary,
-            d2g_d_theta_log2 * state.imaginary
-            + d2phi_d_theta_log2 * state.real,
+            d2g_d_theta_log2 * state.real - d2phi_d_theta_log2 * state.imaginary,
+            d2g_d_theta_log2 * state.imaginary + d2phi_d_theta_log2 * state.real,
         ),
         axis=0,
     )
@@ -1236,20 +1362,37 @@ def obgd_update(
     z_sum = jnp.asarray(0.0, dtype=signal.dtype)
     for leaf in jax.tree_util.tree_leaves(traces):
         z_sum = z_sum + jnp.sum(jnp.abs(leaf))
-    denominator = jnp.maximum(
-        1.0,
-        jnp.asarray(alpha, dtype=signal.dtype)
-        * jnp.asarray(kappa, dtype=signal.dtype)
-        * jnp.maximum(jnp.abs(signal), 1.0)
-        * z_sum,
-    )
+    alpha_array = jnp.asarray(alpha, dtype=signal.dtype)
+    kappa_array = jnp.asarray(kappa, dtype=signal.dtype)
+    bound_term = alpha_array * kappa_array * jnp.maximum(jnp.abs(signal), 1.0) * z_sum
+    denominator = jnp.maximum(1.0, bound_term)
     scale = jnp.reciprocal(denominator)
-    step_size = jnp.asarray(alpha, dtype=signal.dtype) * scale
-    updates = jax.tree_util.tree_map(
+    step_size = alpha_array * scale
+    proposed_updates = jax.tree_util.tree_map(
         lambda trace: step_size * signal * trace,
         traces,
     )
-    return ObGDUpdate(updates=updates, step_size=step_size, scale=scale)
+    update_applied = (
+        jnp.isfinite(signal)
+        & jnp.isfinite(alpha_array)
+        & (alpha_array >= 0.0)
+        & jnp.isfinite(kappa_array)
+        & (kappa_array >= 0.0)
+        & _floating_tree_is_finite(traces)
+        & _floating_tree_is_finite(proposed_updates)
+        & jnp.isfinite(step_size)
+        & jnp.isfinite(scale)
+    )
+    updates = jax.tree_util.tree_map(
+        lambda proposed: jnp.where(update_applied, proposed, jnp.zeros_like(proposed)),
+        proposed_updates,
+    )
+    return ObGDUpdate(
+        updates=updates,
+        step_size=jnp.where(update_applied, step_size, jnp.zeros_like(step_size)),
+        scale=jnp.where(update_applied, scale, jnp.zeros_like(scale)),
+        update_applied=update_applied,
+    )
 
 
 def adaptive_obgd_update(
@@ -1282,18 +1425,18 @@ def adaptive_obgd_update(
 
     beta = jnp.asarray(beta2, dtype=signal.dtype)
     epsilon_array = jnp.asarray(epsilon, dtype=signal.dtype)
-    new_second_moment = jax.tree_util.tree_map(
+    proposed_second_moment = jax.tree_util.tree_map(
         lambda previous, trace: (
-            beta * previous
+            jnp.where(beta == 0.0, jnp.zeros_like(previous), beta * previous)
             + (1.0 - beta) * jnp.square(signal * trace)
         ),
         second_moment,
         traces,
     )
-    bias_correction = 1.0 - beta ** step_array
+    bias_correction = 1.0 - beta**step_array
     corrected_second_moment = jax.tree_util.tree_map(
         lambda moment: moment / bias_correction,
-        new_second_moment,
+        proposed_second_moment,
     )
     normalized_traces = jax.tree_util.tree_map(
         lambda trace, corrected: trace / (jnp.sqrt(corrected) + epsilon_array),
@@ -1304,24 +1447,58 @@ def adaptive_obgd_update(
     z_sum = jnp.asarray(0.0, dtype=signal.dtype)
     for leaf in jax.tree_util.tree_leaves(normalized_traces):
         z_sum = z_sum + jnp.sum(jnp.abs(leaf))
-    denominator = jnp.maximum(
-        1.0,
+    bound_term = (
         jnp.maximum(jnp.abs(signal), 1.0)
         * z_sum
         * jnp.asarray(alpha, dtype=signal.dtype)
-        * jnp.asarray(kappa, dtype=signal.dtype),
+        * jnp.asarray(kappa, dtype=signal.dtype)
     )
+    denominator = jnp.maximum(1.0, bound_term)
     scale = jnp.reciprocal(denominator)
     step_size = jnp.asarray(alpha, dtype=signal.dtype) / denominator
-    updates = jax.tree_util.tree_map(
+    proposed_updates = jax.tree_util.tree_map(
         lambda normalized_trace: step_size * signal * normalized_trace,
         normalized_traces,
+    )
+    alpha_array = jnp.asarray(alpha, dtype=signal.dtype)
+    kappa_array = jnp.asarray(kappa, dtype=signal.dtype)
+    checked_second_moment = jax.tree_util.tree_map(
+        lambda previous: jnp.where(beta == 0.0, jnp.zeros_like(previous), previous),
+        second_moment,
+    )
+    update_applied = (
+        jnp.isfinite(signal)
+        & jnp.isfinite(alpha_array)
+        & (alpha_array >= 0.0)
+        & jnp.isfinite(kappa_array)
+        & (kappa_array >= 0.0)
+        & jnp.isfinite(beta)
+        & (beta >= 0.0)
+        & (beta < 1.0)
+        & jnp.isfinite(epsilon_array)
+        & (epsilon_array > 0.0)
+        & _floating_tree_is_finite(traces)
+        & _floating_tree_is_finite(checked_second_moment)
+        & _floating_tree_is_finite(proposed_second_moment)
+        & _floating_tree_is_finite(proposed_updates)
+        & jnp.isfinite(step_size)
+        & jnp.isfinite(scale)
+    )
+    updates = jax.tree_util.tree_map(
+        lambda proposed: jnp.where(update_applied, proposed, jnp.zeros_like(proposed)),
+        proposed_updates,
+    )
+    new_second_moment = jax.tree_util.tree_map(
+        lambda proposed, previous: jnp.where(update_applied, proposed, previous),
+        proposed_second_moment,
+        second_moment,
     )
     return AdaptiveObGDUpdate(
         updates=updates,
         second_moment=new_second_moment,
-        step_size=step_size,
-        scale=scale,
+        step_size=jnp.where(update_applied, step_size, jnp.zeros_like(step_size)),
+        scale=jnp.where(update_applied, scale, jnp.zeros_like(scale)),
+        update_applied=update_applied,
     )
 
 
@@ -1393,6 +1570,8 @@ def initialize_rtu_network_parameters(
     config: RecurrentTraceActorCriticConfig,
 ) -> RTUNetworkParameters:
     """Initialize sparse feedforward/head blocks and a dense-input RTU."""
+    input_dim = _require_int32("input_dim", input_dim, minimum=1)
+    output_dim = _require_int32("output_dim", output_dim, minimum=1)
     encoder_key, rtu_key, output_key, head_key = jr.split(key, 4)
     return RTUNetworkParameters(
         encoder_weights=_live_sparse_init(
@@ -1661,28 +1840,27 @@ class RecurrentTraceActorCriticAgent:
     @classmethod
     def from_config(
         cls,
-        config: dict[str, Any],
+        config: Mapping[str, Any],
     ) -> RecurrentTraceActorCriticAgent:
         """Reconstruct an agent from :meth:`to_config` output."""
-        payload = dict(config)
+        payload = _copy_config_mapping("serialized agent", config)
         agent_type = payload.pop("type", cls.__name__)
-        if agent_type != cls.__name__:
-            raise ValueError(f"unsupported agent type {agent_type!r}")
+        if type(agent_type) is not str or agent_type != cls.__name__:
+            raise ValueError("unsupported agent type")
         if "config" in payload:
             raw_config = payload.pop("config")
             if payload:
-                unknown = ", ".join(sorted(payload))
-                raise ValueError(f"unknown serialized agent fields: {unknown}")
+                raise ValueError("serialized agent fields do not match the schema")
         else:
             raw_config = payload
-        if not isinstance(raw_config, dict):
-            raise ValueError("serialized config must be a dictionary")
+        if not isinstance(raw_config, Mapping):
+            raise ValueError("serialized config must be a mapping")
         return cls(RecurrentTraceActorCriticConfig.from_config(raw_config))
 
     def init(self, feature_dim: int, key: Array) -> RecurrentTraceActorCriticState:
         """Initialize independent actor/critic parameters and streaming state."""
-        if isinstance(feature_dim, bool) or not isinstance(feature_dim, int) or feature_dim <= 0:
-            raise ValueError("feature_dim must be a positive integer")
+        feature_dim = _require_int32("feature_dim", feature_dim, minimum=1)
+        self._config.state_resource_budget(feature_dim)
         actor_key, critic_key, policy_key = jr.split(key, 3)
         actor_params = initialize_rtu_network_parameters(
             actor_key,
@@ -1723,14 +1901,10 @@ class RecurrentTraceActorCriticAgent:
             actor_traces=_zero_network_like(actor_params),
             critic_traces=_zero_network_like(critic_params),
             actor_second_moments=(
-                _zero_network_like(actor_params)
-                if self._config.adaptive_obgd
-                else None
+                _zero_network_like(actor_params) if self._config.adaptive_obgd else None
             ),
             critic_second_moments=(
-                _zero_network_like(critic_params)
-                if self._config.adaptive_obgd
-                else None
+                _zero_network_like(critic_params) if self._config.adaptive_obgd else None
             ),
             observation_statistics=_initial_running_statistics((feature_dim,)),
             reward_statistics=_initial_reward_statistics(),
@@ -1810,7 +1984,13 @@ class RecurrentTraceActorCriticAgent:
             (),
         )
         continuing = 1.0 - boundary.astype(reward.dtype)
-        discounted_return = reward + self._config.gamma * statistics.discounted_return * continuing
+        gamma = jnp.asarray(self._config.gamma, dtype=reward.dtype)
+        bootstrap_return = jnp.where(
+            (continuing == 0.0) | (gamma == 0.0),
+            jnp.zeros_like(statistics.discounted_return),
+            gamma * statistics.discounted_return,
+        )
+        discounted_return = reward + bootstrap_return
         sample_count, can_increment = _saturating_int32_increment(
             statistics.sample_count,
         )
@@ -1832,7 +2012,11 @@ class RecurrentTraceActorCriticAgent:
             sample_count=sample_count,
             mean=mean,
             m2=m2,
-            discounted_return=discounted_return * continuing,
+            discounted_return=jnp.where(
+                continuing == 0.0,
+                jnp.zeros_like(discounted_return),
+                discounted_return,
+            ),
         )
         return normalized, next_statistics
 
@@ -2341,9 +2525,7 @@ class RecurrentTraceActorCriticAgent:
             state.actor_params,
             state.actor_rtu_state,
         )
-        current_log_policy = jax.nn.log_softmax(
-            current_logits / self._config.temperature
-        )
+        current_log_policy = jax.nn.log_softmax(current_logits / self._config.temperature)
         current_policy = jnp.exp(current_log_policy)
         current_entropy = -jnp.sum(current_policy * current_log_policy)
 
@@ -2417,9 +2599,12 @@ class RecurrentTraceActorCriticAgent:
             )[0],
             (),
         )
-        td_error = (
-            normalized_reward + transition_discount * jax.lax.stop_gradient(next_value) - value
+        bootstrap = jnp.where(
+            transition_discount == 0.0,
+            jnp.zeros_like(next_value),
+            transition_discount * jax.lax.stop_gradient(next_value),
         )
+        td_error = normalized_reward + bootstrap - value
         _, actor_gradient = self._actor_gradient(state, td_error)
 
         # The terminating reward must still credit traces accumulated within
@@ -2435,7 +2620,10 @@ class RecurrentTraceActorCriticAgent:
         actor_traces = cast(
             RTUNetworkParameters,
             jax.tree_util.tree_map(
-                lambda trace, gradient: actor_decay * trace + gradient,
+                lambda trace, gradient: (
+                    jnp.where(actor_decay == 0.0, jnp.zeros_like(trace), actor_decay * trace)
+                    + gradient
+                ),
                 state.actor_traces,
                 actor_gradient,
             ),
@@ -2443,7 +2631,10 @@ class RecurrentTraceActorCriticAgent:
         critic_traces = cast(
             RTUNetworkParameters,
             jax.tree_util.tree_map(
-                lambda trace, gradient: critic_decay * trace + gradient,
+                lambda trace, gradient: (
+                    jnp.where(critic_decay == 0.0, jnp.zeros_like(trace), critic_decay * trace)
+                    + gradient
+                ),
                 state.critic_traces,
                 critic_gradient,
             ),
@@ -2456,13 +2647,9 @@ class RecurrentTraceActorCriticAgent:
         critic_second_moments: RTUNetworkParameters | None
         if self._config.adaptive_obgd:
             if state.actor_second_moments is None:
-                raise ValueError(
-                    "adaptive-ObGD actor state requires a second-moment tree"
-                )
+                raise ValueError("adaptive-ObGD actor state requires a second-moment tree")
             if state.critic_second_moments is None:
-                raise ValueError(
-                    "adaptive-ObGD critic state requires a second-moment tree"
-                )
+                raise ValueError("adaptive-ObGD critic state requires a second-moment tree")
             actor_adaptive_obgd = adaptive_obgd_update(
                 actor_traces,
                 state.actor_second_moments,
@@ -2497,6 +2684,8 @@ class RecurrentTraceActorCriticAgent:
             critic_step_size = critic_adaptive_obgd.step_size
             actor_obgd_scale = actor_adaptive_obgd.scale
             critic_obgd_scale = critic_adaptive_obgd.scale
+            actor_update_applied = actor_adaptive_obgd.update_applied
+            critic_update_applied = critic_adaptive_obgd.update_applied
         else:
             actor_legacy_obgd = obgd_update(
                 actor_traces,
@@ -2518,6 +2707,8 @@ class RecurrentTraceActorCriticAgent:
             critic_step_size = critic_legacy_obgd.step_size
             actor_obgd_scale = actor_legacy_obgd.scale
             critic_obgd_scale = critic_legacy_obgd.scale
+            actor_update_applied = actor_legacy_obgd.update_applied
+            critic_update_applied = critic_legacy_obgd.update_applied
         actor_params = cast(
             RTUNetworkParameters,
             jax.tree_util.tree_map(
@@ -2607,7 +2798,7 @@ class RecurrentTraceActorCriticAgent:
             parameter_delta=critic_rtu_delta,
         )
 
-        updated = parameter_state.replace(
+        proposed_state = parameter_state.replace(
             actor_rtu_state=next_actor_state,
             critic_rtu_state=next_critic_state,
             actor_sensitivities=next_actor_sensitivities,
@@ -2622,24 +2813,66 @@ class RecurrentTraceActorCriticAgent:
             last_observation=stored_raw_observation,
             step_count=step_count,
         )
-        next_action, key, next_policy = self.select_action(updated)
-        updated = updated.replace(
+        candidate_applied = (
+            actor_update_applied
+            & critic_update_applied
+            & _floating_tree_is_finite(
+                state.replace(
+                    reward_statistics=state.reward_statistics._replace(
+                        discounted_return=jnp.where(
+                            boundary,
+                            jnp.zeros_like(state.reward_statistics.discounted_return),
+                            state.reward_statistics.discounted_return,
+                        )
+                    )
+                )
+            )
+            & _floating_tree_is_finite(proposed_state)
+            & state.started
+            & (state.last_action >= 0)
+            & (state.last_action < self._config.n_actions)
+        )
+        action_state = jax.lax.cond(
+            candidate_applied,
+            lambda: proposed_state,
+            lambda: state,
+        )
+        next_action, key, next_policy = self.select_action(action_state)
+        committed_state = proposed_state.replace(
             last_action=next_action,
             rng_key=key,
         )
+        update_applied = (
+            candidate_applied
+            & _floating_tree_is_finite(committed_state)
+            & jnp.all(jnp.isfinite(next_policy))
+            & (next_action >= 0)
+            & (next_action < self._config.n_actions)
+        )
+        updated = jax.lax.cond(
+            update_applied,
+            lambda: committed_state,
+            lambda: state,
+        )
+        zero = jnp.asarray(0.0, dtype=jnp.float32)
         return RecurrentTraceActorCriticUpdateResult(
             state=updated,
-            action=next_action,
-            policy=next_policy,
-            value=value,
-            next_value=next_value,
-            td_error=td_error,
-            entropy=current_entropy,
-            normalized_reward=normalized_reward,
-            actor_step_size=actor_step_size,
-            critic_step_size=critic_step_size,
-            actor_obgd_scale=actor_obgd_scale,
-            critic_obgd_scale=critic_obgd_scale,
+            action=jnp.where(
+                update_applied,
+                next_action,
+                jnp.asarray(0, dtype=jnp.int32),
+            ),
+            policy=jnp.where(update_applied, next_policy, jnp.zeros_like(next_policy)),
+            value=jnp.where(update_applied, value, zero),
+            next_value=jnp.where(update_applied & jnp.isfinite(next_value), next_value, zero),
+            td_error=jnp.where(update_applied, td_error, zero),
+            entropy=jnp.where(update_applied, current_entropy, zero),
+            normalized_reward=jnp.where(update_applied, normalized_reward, zero),
+            actor_step_size=jnp.where(update_applied, actor_step_size, zero),
+            critic_step_size=jnp.where(update_applied, critic_step_size, zero),
+            actor_obgd_scale=jnp.where(update_applied, actor_obgd_scale, zero),
+            critic_obgd_scale=jnp.where(update_applied, critic_obgd_scale, zero),
+            update_applied=update_applied,
         )
 
 

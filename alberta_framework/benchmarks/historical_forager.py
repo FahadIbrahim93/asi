@@ -275,9 +275,15 @@ def _require_environment(value: Any) -> HistoricalForagerEnvironment:
 
 
 def _finite_reward(value: Any) -> float:
-    if isinstance(value, bool) or not isinstance(value, Real):
+    actual_type = type(value)
+    if issubclass(actual_type, bool) or not issubclass(actual_type, Real):
         raise HistoricalForagerContractError("historical reward must be a real scalar")
-    result = float(value)
+    try:
+        result = float(cast(Real, value))
+    except Exception as error:
+        raise HistoricalForagerContractError(
+            "historical reward must be a finite real scalar"
+        ) from error
     if not math.isfinite(result):
         raise HistoricalForagerContractError("historical reward must be finite")
     return result
@@ -654,17 +660,16 @@ class HistoricalForagerRunConfig:
     allow_unverified_development_adapter: bool = False
 
     def __post_init__(self) -> None:
-        if isinstance(self.seed, bool) or not isinstance(self.seed, int):
+        if type(self.seed) is not int:
             raise HistoricalForagerContractError("seed must be an integer")
         if not 0 <= self.seed <= _MAX_SEED:
             raise HistoricalForagerContractError(f"seed must lie in [0, {_MAX_SEED}]")
-        if isinstance(self.steps, bool) or not isinstance(self.steps, int):
+        if type(self.steps) is not int:
             raise HistoricalForagerContractError("steps must be an integer")
         if not 1 <= self.steps <= _MAX_STEPS:
             raise HistoricalForagerContractError(f"steps must lie in [1, {_MAX_STEPS}]")
         if (
-            isinstance(self.aperture_size, bool)
-            or not isinstance(self.aperture_size, int)
+            type(self.aperture_size) is not int
             or self.aperture_size not in range(1, 16, 2)
         ):
             raise HistoricalForagerContractError(
@@ -866,6 +871,23 @@ class HistoricalForagerRunResult:
     runtime: Mapping[str, Any]
     kernel: Mapping[str, Any]
 
+    def __post_init__(self) -> None:
+        if type(self.seed) is not int:
+            raise HistoricalForagerContractError("seed must be an integer")
+        if not 0 <= self.seed <= _MAX_SEED:
+            raise HistoricalForagerContractError(f"seed must lie in [0, {_MAX_SEED}]")
+        if type(self.steps) is not int:
+            raise HistoricalForagerContractError("steps must be an integer")
+        if not 1 <= self.steps <= _MAX_STEPS:
+            raise HistoricalForagerContractError(f"steps must lie in [1, {_MAX_STEPS}]")
+        if (
+            type(self.aperture_size) is not int
+            or self.aperture_size not in range(1, 16, 2)
+        ):
+            raise HistoricalForagerContractError(
+                "aperture_size must be one of 1, 3, 5, 7, 9, 11, 13, 15"
+            )
+
     def to_dict(self) -> dict[str, Any]:
         """Return the canonical manifest payload."""
         provenance = historical_forager_provenance()
@@ -1031,11 +1053,20 @@ def _strict_json_object(path: Path) -> tuple[dict[str, Any], bytes]:
             f"artifact contains non-standard JSON constant {value!r}"
         )
 
+    def parse_float(value: str) -> float:
+        parsed = float(value)
+        if not math.isfinite(parsed):
+            raise HistoricalForagerArtifactError(
+                f"artifact contains non-finite JSON number {value!r}"
+            )
+        return parsed
+
     try:
         parsed = json.loads(
             payload,
             object_pairs_hook=object_pairs,
             parse_constant=invalid_constant,
+            parse_float=parse_float,
         )
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise HistoricalForagerArtifactError("result.json is not valid UTF-8 JSON") from exc

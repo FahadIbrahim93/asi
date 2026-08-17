@@ -5,15 +5,20 @@ using chex dataclasses for JAX compatibility and jaxtyping for shape annotations
 """
 
 import enum
+import math
+import operator
 import time
 from collections.abc import Sequence
-from typing import Any
+from numbers import Real
+from typing import Any, SupportsIndex, cast
 
 import chex
 import jax.numpy as jnp
+import numpy as np
 from jax import Array
 from jaxtyping import Float, Int
 
+from alberta_framework.core._float32_scalars import validated_float32_scalar_with_ratio
 from alberta_framework.core.normalizers import (
     AnyNormalizerState,
 )
@@ -23,6 +28,16 @@ Observation = Array  # x_t: feature vector
 Target = Array  # y*_t: desired output
 Prediction = Array  # y_t: model output
 Reward = float  # r_t: scalar reward
+_FLOAT32_TINY = float(np.finfo(np.float32).tiny)
+_FLOAT32_HALF_MIN_SUBNORMAL_DENOMINATOR = 1 << 150
+_INT32_MAX = 2**31 - 1
+_ACTUAL_REAL_SCALAR_TYPES = frozenset(
+    {float, np.float16, np.float32, np.float64, int}
+)
+
+_ACTUAL_INT_TYPES = frozenset(
+    {int, *(np.dtype(code).type for code in "bBhHiIlLqQpP")}
+)
 
 
 @chex.dataclass(frozen=True)
@@ -661,6 +676,60 @@ class TraceMode(enum.Enum):
     REPLACING = "replacing"
 
 
+def _normalized_gvf_probability(name: str, value: object) -> float:
+    """Return one static GVF probability with stable float32 semantics."""
+    message = f"{name} must be a real non-boolean scalar in [0, 1]"
+    actual_type = type(value)
+    if issubclass(actual_type, (bool, np.bool_)) or not issubclass(actual_type, Real):
+        raise ValueError(message)
+    try:
+        comparable = cast(Any, value)
+        if comparable < 0 or comparable > 1:
+            raise ValueError(message)
+        if comparable != 0 and comparable < _FLOAT32_TINY:
+            raise ValueError(f"{name} must be zero or a normal float32 value in [0, 1]")
+        normalized = float(comparable)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(message) from exc
+    if not math.isfinite(normalized) or not 0.0 <= normalized <= 1.0:
+        raise ValueError(message)
+    return normalized
+
+
+def _require_gvf_name(value: object) -> str:
+    if type(value) is not str or value == "":
+        raise ValueError("name must be a nonempty string")
+    return value
+
+
+def _require_gvf_cumulant_index(value: object) -> int:
+    if type(value) not in _ACTUAL_INT_TYPES:
+        raise ValueError("cumulant_index must be an integer")
+    number = operator.index(cast(SupportsIndex, value))
+    if not -1 <= number <= _INT32_MAX:
+        raise ValueError(f"cumulant_index must be an integer in [-1, {_INT32_MAX}]")
+    return number
+
+
+def _validated_gvf_reward(value: object) -> float:
+    """Validate a float32 reward without silently erasing an exact nonzero."""
+    if type(value) not in _ACTUAL_REAL_SCALAR_TYPES and type(value) not in _ACTUAL_INT_TYPES:
+        # Exact-type gate: untrusted float subclasses must be rejected
+        # without ever invoking their conversion hooks.
+        raise ValueError("terminal_reward must be a finite real number")
+    stored, numerator, denominator = validated_float32_scalar_with_ratio(
+        "terminal_reward", value
+    )
+    if (
+        numerator != 0
+        and abs(numerator) * _FLOAT32_HALF_MIN_SUBNORMAL_DENOMINATOR <= denominator
+    ):
+        raise ValueError(
+            "terminal_reward must remain nonzero once narrowed to float32"
+        )
+    return stored
+
+
 @chex.dataclass(frozen=True)
 class GVFSpec:
     """One GVF demon's question functions (Sutton et al. 2011).
@@ -683,6 +752,21 @@ class GVFSpec:
     lamda: float
     cumulant_index: int
     terminal_reward: float = 0.0
+
+    def __post_init__(self) -> None:
+        """Reject invalid GVF question parameters before they can be serialized."""
+        name = _require_gvf_name(self.name)
+        if type(self.demon_type) is not DemonType:
+            raise ValueError("demon_type must be a DemonType")
+        gamma = _normalized_gvf_probability("gamma", self.gamma)
+        lamda = _normalized_gvf_probability("lamda", self.lamda)
+        cumulant_index = _require_gvf_cumulant_index(self.cumulant_index)
+        terminal_reward = _validated_gvf_reward(self.terminal_reward)
+        object.__setattr__(self, "name", name)
+        object.__setattr__(self, "gamma", gamma)
+        object.__setattr__(self, "lamda", lamda)
+        object.__setattr__(self, "cumulant_index", cumulant_index)
+        object.__setattr__(self, "terminal_reward", terminal_reward)
 
     def to_config(self) -> dict[str, Any]:
         """Serialize to dict.
@@ -728,6 +812,13 @@ class HordeSpec:
     gammas: Float[Array, " n_demons"]
     lamdas: Float[Array, " n_demons"]
 
+    def __post_init__(self) -> None:
+        """Reject an empty or type-spoofed demon collection."""
+        if type(self.demons) is not tuple or not self.demons:
+            raise ValueError("demons must be a nonempty tuple of GVFSpec")
+        if any(type(demon) is not GVFSpec for demon in self.demons):
+            raise ValueError("demons must be a nonempty tuple of GVFSpec")
+
     def to_config(self) -> dict[str, Any]:
         """Serialize to dict.
 
@@ -764,6 +855,8 @@ def create_horde_spec(demons: Sequence[GVFSpec]) -> HordeSpec:
         HordeSpec with pre-computed arrays
     """
     demons_tuple = tuple(demons)
+    if not demons_tuple or any(type(demon) is not GVFSpec for demon in demons_tuple):
+        raise ValueError("demons must be a nonempty sequence of GVFSpec")
     gammas = jnp.array([d.gamma for d in demons_tuple], dtype=jnp.float32)
     lamdas = jnp.array([d.lamda for d in demons_tuple], dtype=jnp.float32)
     return HordeSpec(demons=demons_tuple, gammas=gammas, lamdas=lamdas)

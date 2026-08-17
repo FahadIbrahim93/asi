@@ -1,16 +1,21 @@
 """Tests for Gymnasium experience streams."""
 
 import jax.numpy as jnp
+import numpy as np
 import pytest
 
 # Skip all tests if gymnasium is not installed
 gymnasium = pytest.importorskip("gymnasium")
 
+import alberta_framework.streams.gymnasium as gymnasium_stream_module  # noqa: E402
 from alberta_framework import TimeStep  # noqa: E402
 from alberta_framework.streams.gymnasium import (  # noqa: E402
     GymnasiumStream,
     PredictionMode,
     TDStream,
+    _flatten_action,
+    _flatten_observation,
+    _flatten_space,
     collect_trajectory,
     make_epsilon_greedy_policy,
     make_gymnasium_stream,
@@ -26,6 +31,298 @@ class TestPredictionMode:
         assert PredictionMode.REWARD.value == "reward"
         assert PredictionMode.NEXT_STATE.value == "next_state"
         assert PredictionMode.VALUE.value == "value"
+
+
+@pytest.mark.parametrize("invalid", (True, float("nan"), float("inf"), -0.1, 1.1))
+def test_gamma_entry_points_reject_invalid_float32_probabilities(invalid: object) -> None:
+    env = gymnasium.make("CartPole-v1")
+    try:
+        with pytest.raises(ValueError, match="gamma"):
+            GymnasiumStream(env, gamma=invalid)  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="gamma"):
+            TDStream(env, gamma=invalid)  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="gamma"):
+            collect_trajectory(  # type: ignore[arg-type]
+                env, None, num_steps=1, gamma=invalid
+            )
+        with pytest.raises(ValueError, match="gamma"):
+            make_gymnasium_stream(  # type: ignore[arg-type]
+                "CartPole-v1", gamma=invalid
+            )
+    finally:
+        env.close()
+
+
+def test_probability_entry_points_normalize_hostile_real_failures_without_repr() -> None:
+    class HostileFloat(float):
+        def as_integer_ratio(self) -> tuple[int, int]:
+            raise RuntimeError("untrusted ratio hook")
+
+        def __repr__(self) -> str:
+            raise AssertionError("repr hook executed")
+
+    env = gymnasium.make("CartPole-v1")
+    try:
+        with pytest.raises(ValueError, match="gamma"):
+            GymnasiumStream(env, gamma=HostileFloat(0.5))
+        with pytest.raises(ValueError, match="epsilon"):
+            make_epsilon_greedy_policy(
+                lambda _observation: 0,
+                env,
+                epsilon=HostileFloat(0.5),
+            )
+    finally:
+        env.close()
+
+
+@pytest.mark.parametrize(
+    "integer_type",
+    tuple(
+        dict.fromkeys(
+            (
+                np.int8,
+                np.int16,
+                np.int32,
+                np.int64,
+                np.uint8,
+                np.uint16,
+                np.uint32,
+                np.uint64,
+                np.longlong,
+                np.ulonglong,
+            )
+        )
+    ),
+)
+def test_num_steps_accepts_all_numpy_integer_families(integer_type: type[np.integer]) -> None:
+    env = gymnasium.make("CartPole-v1")
+    try:
+        observations, targets = collect_trajectory(env, None, integer_type(1))
+        assert observations.shape == (1, 5)
+        assert targets.shape == (1, 1)
+    finally:
+        env.close()
+
+
+def test_schedule_and_shape_contracts_fail_before_environment_execution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env = gymnasium.make("CartPole-v1")
+
+    def forbidden(*args: object, **kwargs: object) -> None:
+        raise AssertionError("environment executed before trajectory preflight")
+
+    monkeypatch.setattr(env, "reset", forbidden)
+    try:
+        for num_steps in (0, -1, True, 1.5, "1"):
+            with pytest.raises(ValueError, match="num_steps"):
+                collect_trajectory(env, None, num_steps)  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="trajectory output"):
+            collect_trajectory(env, None, 2**31 - 1)
+        with pytest.raises(ValueError, match="exact bool"):
+            collect_trajectory(env, None, 1, include_action_in_features=1)  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="PredictionMode"):
+            collect_trajectory(env, None, 1, mode="reward")  # type: ignore[arg-type]
+    finally:
+        env.close()
+
+
+def test_seed_contracts_reject_aliases_and_spoofs_without_shrinking_uint32_domain() -> None:
+    class Spoof:
+        @property
+        def __class__(self) -> type[int]:  # type: ignore[override,misc]
+            return int
+
+        def __index__(self) -> int:
+            raise AssertionError("unapproved index hook executed")
+
+        def __repr__(self) -> str:
+            raise AssertionError("error path invoked repr")
+
+    env = gymnasium.make("CartPole-v1")
+    try:
+        for seed in (True, np.uint32(1), -1, 2**32, Spoof()):
+            with pytest.raises(ValueError, match="seed"):
+                make_random_policy(env, seed=seed)  # type: ignore[arg-type]
+        policy = make_epsilon_greedy_policy(
+            lambda _observation: 0,
+            env,
+            epsilon=1.0,
+            seed=2**32 - 1,
+        )
+        assert env.action_space.contains(policy(jnp.zeros(4)))
+    finally:
+        env.close()
+
+
+def test_random_policy_respects_nonzero_and_multiaxis_discrete_starts() -> None:
+    class StubEnv:
+        def __init__(self, action_space: object):
+            self.action_space = action_space
+
+    discrete = gymnasium.spaces.Discrete(3, start=5)
+    discrete_policy = make_random_policy(StubEnv(discrete), seed=1)  # type: ignore[arg-type]
+    assert {discrete_policy(jnp.zeros(1)) for _ in range(20)} <= {5, 6, 7}
+
+    multi = gymnasium.spaces.MultiDiscrete(
+        np.asarray(((2, 3), (4, 5))),
+        start=np.asarray(((10, 20), (30, 40))),
+    )
+    multi_policy = make_random_policy(StubEnv(multi), seed=2)  # type: ignore[arg-type]
+    action = multi_policy(jnp.zeros(1))
+    assert action.shape == (2, 2)
+    assert np.all(action >= multi.start)
+    assert np.all(action < multi.start + multi.nvec)
+    assert _flatten_space(multi) == 4
+    assert _flatten_observation(multi.start, multi).shape == (4,)
+    assert _flatten_action(action, multi).shape == (4,)
+
+
+def test_random_policy_rejects_discrete_ranges_wider_than_jax_int32() -> None:
+    class StubEnv:
+        def __init__(self, action_space: object):
+            self.action_space = action_space
+
+    discrete = gymnasium.spaces.Discrete(2**31, start=-(2**30))
+    with pytest.raises(ValueError, match="signed int32"):
+        make_random_policy(StubEnv(discrete), seed=0)  # type: ignore[arg-type]
+
+    multi = gymnasium.spaces.MultiDiscrete(
+        np.asarray([2**31], dtype=np.uint32),
+        start=np.asarray([-(2**30)], dtype=np.int64),
+    )
+    with pytest.raises(ValueError, match="signed int32"):
+        make_random_policy(StubEnv(multi), seed=0)  # type: ignore[arg-type]
+
+
+def test_random_box_policy_rejects_nonfinite_bounds() -> None:
+    class StubEnv:
+        action_space = gymnasium.spaces.Box(-np.inf, np.inf, shape=(1,), dtype=np.float32)
+
+    with pytest.raises(ValueError, match="finite ordered"):
+        make_random_policy(StubEnv(), seed=0)  # type: ignore[arg-type]
+
+
+def test_random_box_policy_samples_full_finite_float32_domain() -> None:
+    maximum = np.finfo(np.float32).max
+
+    class StubEnv:
+        action_space = gymnasium.spaces.Box(
+            np.asarray((-maximum, -maximum, maximum / 2), dtype=np.float32),
+            np.asarray((maximum, -maximum / 2, maximum), dtype=np.float32),
+            dtype=np.float32,
+        )
+
+    policy = make_random_policy(StubEnv(), seed=0)  # type: ignore[arg-type]
+    for _ in range(20):
+        action = policy(jnp.zeros(1, dtype=jnp.float32))
+        assert bool(jnp.all(jnp.isfinite(action)))
+        assert bool(jnp.all(action >= StubEnv.action_space.low))
+        assert bool(jnp.all(action < StubEnv.action_space.high))
+
+
+def test_random_box_preflights_dimension_before_jax_bound_conversion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class StubEnv:
+        action_space = gymnasium.spaces.Box(-1.0, 1.0, shape=(1,), dtype=np.float32)
+
+    monkeypatch.setattr(
+        gymnasium_stream_module,
+        "_flatten_space",
+        lambda _space: (_ for _ in ()).throw(ValueError("dimension preflight")),
+    )
+    monkeypatch.setattr(
+        gymnasium_stream_module.jnp,
+        "asarray",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("JAX conversion ran before dimension preflight")
+        ),
+    )
+    with pytest.raises(ValueError, match="dimension preflight"):
+        make_random_policy(StubEnv(), seed=0)  # type: ignore[arg-type]
+
+
+def test_epsilon_wrapper_rejects_base_policy_before_environment_access() -> None:
+    class HostileEnv:
+        @property
+        def action_space(self) -> object:
+            raise AssertionError("environment accessed before base-policy validation")
+
+    with pytest.raises(ValueError, match="base_policy"):
+        make_epsilon_greedy_policy(object(), HostileEnv())  # type: ignore[arg-type]
+
+
+def test_runtime_values_must_match_declared_flattened_shapes_and_be_finite() -> None:
+    box = gymnasium.spaces.Box(-1.0, 1.0, shape=(2,), dtype=np.float32)
+    with pytest.raises(ValueError, match="observation.*shape"):
+        _flatten_observation(np.zeros((1,), dtype=np.float32), box)
+    with pytest.raises(ValueError, match="action.*shape"):
+        _flatten_action(np.zeros((3,), dtype=np.float32), box)
+    with pytest.raises(ValueError, match="observation.*finite"):
+        _flatten_observation(np.asarray((0.0, np.nan), dtype=np.float32), box)
+    with pytest.raises(ValueError, match="action.*finite"):
+        _flatten_action(np.asarray((0.0, np.inf), dtype=np.float32), box)
+
+
+def test_runtime_shape_metadata_rejects_before_jax_conversion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    box = gymnasium.spaces.Box(-1.0, 1.0, shape=(2,), dtype=np.float32)
+
+    class OversizedStub:
+        shape = (2**31 - 1,)
+
+        def __array__(self, *_args: object, **_kwargs: object) -> np.ndarray:
+            raise AssertionError("array conversion ran before shape preflight")
+
+    monkeypatch.setattr(
+        gymnasium_stream_module.jnp,
+        "asarray",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("JAX conversion ran before shape preflight")
+        ),
+    )
+    with pytest.raises(ValueError, match="observation.*declared shape"):
+        _flatten_observation(OversizedStub(), box)
+    with pytest.raises(ValueError, match="action.*declared shape"):
+        _flatten_action(OversizedStub(), box)
+
+
+def test_factory_rejects_noncallable_policy_before_environment_construction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    def forbidden_make(*_args: object, **_kwargs: object) -> None:
+        nonlocal calls
+        calls += 1
+        raise AssertionError("environment constructed before policy validation")
+
+    monkeypatch.setattr(gymnasium, "make", forbidden_make)
+    with pytest.raises(ValueError, match="policy"):
+        make_gymnasium_stream("CartPole-v1", policy=object())  # type: ignore[arg-type]
+    assert calls == 0
+
+
+def test_factory_closes_environment_when_stream_validation_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class InvalidEnv:
+        observation_space = gymnasium.spaces.Tuple(
+            (gymnasium.spaces.Discrete(2), gymnasium.spaces.Discrete(2))
+        )
+        action_space = gymnasium.spaces.Discrete(2)
+        closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    env = InvalidEnv()
+    monkeypatch.setattr(gymnasium, "make", lambda *args, **kwargs: env)
+    with pytest.raises(ValueError, match="Unsupported space type"):
+        make_gymnasium_stream("invalid-v0")
+    assert env.closed
 
 
 class TestGymnasiumStreamRewardMode:
@@ -145,6 +442,18 @@ class TestGymnasiumStreamValueMode:
         # Without estimator, targets are just r + 0.99*0 = r
         # So targets with estimator should generally be larger
         assert sum(targets_with_estimator) > sum(targets_without)
+
+    def test_zero_gamma_skips_inf_bootstrap(self) -> None:
+        """gamma=0 is the next reward; 0 * inf V(s') is NaN.
+
+        Fail-closed: a zero discount does not multiply the bootstrap value.
+        """
+        env = gymnasium.make("CartPole-v1")
+        stream = GymnasiumStream(env, mode=PredictionMode.VALUE, gamma=0.0, seed=0)
+        stream.set_value_estimator(lambda _obs: float("inf"))
+        target = stream._construct_target(1.25, jnp.ones(4, dtype=jnp.float32), terminated=False)
+        assert bool(jnp.isfinite(target).all())
+        assert float(target[0]) == pytest.approx(1.25)
 
 
 class TestGymnasiumStreamAutoReset:
@@ -306,23 +615,16 @@ class TestTDStream:
         # At least some should be larger (terminal states will be the same)
         assert sum(targets_with_value) > sum(targets_zero)
 
-    def test_action_value_bootstrap_uses_next_policy_action(self):
-        """Action-value targets should bootstrap from Q(s', a'), not Q(s', a)."""
+    def test_zero_gamma_skips_inf_value_function(self) -> None:
+        """gamma=0 times inf V(s') is NaN in TDStream targets.
+
+        Fail-closed: a zero discount does not multiply the value function.
+        """
         env = gymnasium.make("CartPole-v1")
-        actions = iter((0, 1))
-        stream = TDStream(
-            env,
-            policy=lambda _observation: next(actions),
-            gamma=0.5,
-            include_action_in_features=True,
-            seed=42,
-        )
-        stream.update_value_function(lambda features: float(features[-1]))
-
-        timestep = next(stream)
-
-        assert float(timestep.observation[-1]) == 0.0
-        assert float(timestep.target[0]) == pytest.approx(1.5)
+        stream = TDStream(env, gamma=0.0, seed=0)
+        stream.update_value_function(lambda _obs: float("inf"))
+        target = next(stream).target
+        assert bool(jnp.isfinite(target).all())
 
     def test_episode_tracking(self):
         """TDStream should track episode count."""
@@ -506,6 +808,23 @@ class TestCollectTrajectoryValueMode:
         assert bool(jnp.all(bootstrapped | terminal))
         # Random CartPole rollouts of 60 steps contain non-terminal steps.
         assert bool(jnp.any(bootstrapped))
+
+    def test_zero_gamma_skips_inf_bootstrap(self) -> None:
+        """gamma=0 times inf V(s') is NaN in collected VALUE targets.
+
+        Fail-closed: a zero discount does not multiply the estimator.
+        """
+        env = gymnasium.make("CartPole-v1")
+        _, targets = collect_trajectory(
+            env,
+            None,
+            num_steps=20,
+            mode=PredictionMode.VALUE,
+            seed=11,
+            value_estimator=lambda _obs: float("inf"),
+            gamma=0.0,
+        )
+        assert bool(jnp.all(jnp.isfinite(targets)))
 
     def test_estimator_receives_next_observation(self):
         """The bootstrap value is computed from the next observation."""

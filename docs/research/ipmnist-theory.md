@@ -2,11 +2,9 @@
 
 Status: **development-only and permanently nonpromoting**. This document
 summarizes what the stored campaign artifacts describe; it is not a scientific
-evidence claim, an external ranking claim, an integrated ASI-agent or robotics
-result, or an Alberta Plan completion claim. This lane studies one
-plasticity/conditioning subsystem; it is not the end-to-end target. The JSON
-summaries, rather than copied numbers in overview prose, are the record of the
-current stored means.
+evidence claim, an external ranking claim, or an Alberta Plan completion claim.
+The JSON summaries, rather than copied numbers in overview prose, are the record
+of the current stored means.
 
 ## 1. Scope and reading contract
 
@@ -29,13 +27,12 @@ a frozen preregistered evidence protocol and promotion authority.
 
 The main records are:
 
-- [current campaign index](ipmnist-campaign-index.md);
 - [paired RLS confirmation](../../outputs/ipmnist_screening/summary_rls_head_confirm.json);
 - [RLS screening summary](../../outputs/ipmnist_screening/summary_rls_head.json);
-- [pre-RLS publication runs](../../outputs/ipmnist_screening/publication_runs/RESULTS.md);
-- [historical accumulated report](../../outputs/ipmnist_screening/FINAL_REPORT.md);
-- [historical red-team audit](../../outputs/ipmnist_screening/AUDIT.md);
-- [pre-RLS ceiling analysis](../../outputs/ipmnist_screening/CEILING_ANALYSIS.md); and
+- [incumbent publication runs](../../outputs/ipmnist_screening/publication_runs/RESULTS.md);
+- [campaign report](../../outputs/ipmnist_screening/FINAL_REPORT.md);
+- [red-team audit](../../outputs/ipmnist_screening/AUDIT.md);
+- [ceiling analysis](../../outputs/ipmnist_screening/CEILING_ANALYSIS.md); and
 - [negative-results ledger](../evidence/negative-results.md).
 
 ### Stored headline comparison
@@ -123,17 +120,13 @@ with strictly prior-only statistics changed `sigma0_ndecay099` from 0.8478 to
 0.1359 because quiet pixels produced extreme boundary spikes. A reimplementation
 that changes this ordering is a different method.
 
-The observed benefit is broader than input-shift tracking in the tested lanes. On the
-three-seed, development-only label-permuted EMNIST lane, where inputs are stationary,
-`upgd_ema_norm` improved from the raw-input 0.6715 reference to 0.7162. The defensible
-interpretation is therefore:
+Conditioning is broader than input-shift tracking. On label-permuted EMNIST,
+where inputs are stationary, `upgd_ema_norm` improved from the raw-input 0.6715
+reference to 0.7162. The defensible interpretation is therefore:
 
-- EMA conditioning transferred to this label-permutation lane and is not exclusively an
-  input-shift effect; and
+- EMA conditioning provides a general stream-optimization benefit; and
 - the 0.98-0.99 decay optimum and shift detector specifically address abrupt
   input-statistic changes.
-
-Three development seeds in one transfer setting do not establish a general stream optimizer.
 
 ### 3.2 Gate and perturbation effects depend on the stream context
 

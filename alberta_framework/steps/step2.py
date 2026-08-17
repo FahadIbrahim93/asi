@@ -1,10 +1,12 @@
 # mypy: disable-error-code="call-arg"
-"""Public Step 2 kernel.
+"""Production Step 2 kernel.
 
-The Step 2 surface exposes target-structure UPGD: a learner with online hidden-feature
+The Step 2 production surface exposes the current packaged learner:
+target-structure UPGD.  It is a single learner with online hidden-feature
 utility, low-utility perturbation, ObGD-bounded updates, and vector-output
 heads.  It is not a theorem of universal representation learning; it is the
-configuration used by the supervised Step 2 smoke and development checks.
+current development-selected kernel for the supervised Step 2 acceptance
+matrix.
 
 For retained class-view memory, Step 2 also exposes a JAX fixed-budget
 prototype memory and a packaged UPGD-memory learner that updates both the
@@ -15,13 +17,18 @@ contracts are exercised in ``tests/test_prototype_memory.py`` and
 
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass
+from numbers import Integral, Real
 from typing import Any, Literal, cast
 
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 from jax import Array
 
+from alberta_framework._float32 import round_real_to_float32_with_ratio
+from alberta_framework._seed_validation import require_jax_seed
 from alberta_framework.core.associative_memory import (
     AssociativeFeatureFamily,
     AssociativeMemoryConfig,
@@ -38,6 +45,7 @@ from alberta_framework.core.temporal_context import (
 )
 from alberta_framework.core.upgd import UPGDLearner, run_upgd_arrays
 from alberta_framework.core.upgd_memory import UPGDMemoryConfig, UPGDMemoryLearner
+from alberta_framework.steps._smoke_record_validation import require_step_shape
 from alberta_framework.streams.out_of_class import (
     CompositionalStream,
     FrequencyMismatchStream,
@@ -55,10 +63,312 @@ Step2ReadoutMode = Literal[
 ]
 Step2HybridReadoutMode = Literal["linear_mse", "softmax_ce"]
 
+_VALID_STEP2_STREAMS: frozenset[str] = frozenset(
+    {"polynomial", "frequency", "compositional"}
+)
+_VALID_STEP2_READOUT_MODES: frozenset[str] = frozenset(
+    {
+        "linear_mse",
+        "softmax_ce",
+        "adaptive_simplex",
+        "factorized_simplex",
+        "adaptive_factorized_simplex",
+        "two_timescale_simplex",
+    }
+)
+_VALID_STEP2_LOSS_NORMALIZATIONS: frozenset[str] = frozenset(
+    {"target_structure", "target_density"}
+)
+_STEP2_KERNEL_CONFIG_KEYS = frozenset(
+    {
+        "feature_dim",
+        "n_heads",
+        "hidden_sizes",
+        "stream",
+        "readout_mode",
+        "step_size",
+        "loss_normalization",
+        "context_length",
+        "noise_std",
+    }
+)
+_STEP2_STRICT_DIGIT_CONFIG_KEYS = frozenset(
+    {"n_heads", "hidden_sizes", "step_size"}
+)
+_STEP2_MEMORY_CONFIG_KEYS = frozenset(
+    {
+        "feature_dim",
+        "n_classes",
+        "slots_per_class",
+        "update_rate",
+        "novelty_threshold",
+        "bandwidth",
+    }
+)
+_STEP2_ASSOCIATIVE_CONFIG_KEYS = frozenset(
+    {
+        "vocab_size",
+        "block_size",
+        "suffix_length",
+        "feature_family",
+        "max_features",
+        "write_lr",
+        "retention",
+        "utility_lr",
+        "utility_decay",
+        "min_weight",
+        "max_weight",
+        "logit_scale",
+        "normalize_by_weight",
+        "adaptive_feature_family",
+        "adaptive_window",
+        "adaptive_budget",
+        "scope_lr",
+        "budget_lr",
+        "initial_budget_fraction",
+        "min_effective_budget",
+        "scope_logit_clip",
+    }
+)
+_INT32_MAX = 2**31 - 1
+_ACTUAL_INT_TYPES: tuple[type, ...] = (
+    int,
+    np.int8,
+    np.int16,
+    np.int32,
+    np.int64,
+    np.longlong,
+    np.uint8,
+    np.uint16,
+    np.uint32,
+    np.uint64,
+    np.ulonglong,
+)
+
+
+def _require_exact_keys(
+    config_name: str,
+    payload: dict[str, object],
+    expected: frozenset[str],
+) -> None:
+    if set(payload) != expected:
+        raise ValueError(
+            f"{config_name} payload keys must be exactly {sorted(expected)!r}"
+        )
+
+
+def finite_real_and_float32(name: str, value: object) -> tuple[Real, int, int, float]:
+    """Return the original real, exact ratio, and finite binary32 rounding."""
+    actual_type = type(value)
+    if issubclass(actual_type, bool) or not issubclass(actual_type, Real):
+        raise ValueError(f"{name} must be a real number, got {value!r}")
+    real = cast(Real, value)
+    try:
+        numerator, denominator, narrowed = round_real_to_float32_with_ratio(real)
+    except (FloatingPointError, OverflowError, TypeError, ValueError):
+        raise ValueError(f"{name} must narrow to a finite float32, got {value!r}") from None
+    if not math.isfinite(narrowed):
+        raise ValueError(f"{name} must narrow to a finite float32, got {value!r}")
+    return real, numerator, denominator, narrowed
+
+
+def canonical_float32_storage(value: object, narrowed: float) -> float:
+    actual_type = type(value)
+    if (actual_type is int or actual_type is float) and (
+        bool(narrowed != 0.0) or value == 0
+    ):
+        return float(cast(int | float, value))
+    return float(narrowed)
+
+
+def _require_real(name: str, value: object) -> float:
+    real, _, _, narrowed = finite_real_and_float32(name, value)
+    return canonical_float32_storage(real, narrowed)
+
+
+def _require_unit_interval(name: str, value: object) -> float:
+    real, numerator, denominator, narrowed = finite_real_and_float32(name, value)
+    if (
+        real < 0.0
+        or not real <= 1.0
+        or numerator < 0
+        or numerator > denominator
+        or narrowed < 0.0
+        or not narrowed <= 1.0
+    ):
+        raise ValueError(f"{name} must be in [0, 1], got {value!r}")
+    return canonical_float32_storage(real, narrowed)
+
+
+def _require_half_open_unit_interval(name: str, value: object) -> float:
+    real, numerator, denominator, narrowed = finite_real_and_float32(name, value)
+    if (
+        real <= 0.0
+        or not real <= 1.0
+        or numerator <= 0
+        or numerator > denominator
+        or narrowed <= 0.0
+        or not narrowed <= 1.0
+    ):
+        raise ValueError(f"{name} must be in (0, 1], got {value!r}")
+    return canonical_float32_storage(real, narrowed)
+
+
+def _require_nonnegative_real(name: str, value: object) -> float:
+    real, numerator, _, narrowed = finite_real_and_float32(name, value)
+    if real < 0.0 or numerator < 0 or narrowed < 0.0:
+        raise ValueError(f"{name} must be non-negative, got {value!r}")
+    return canonical_float32_storage(real, narrowed)
+
+
+def _require_positive_real(name: str, value: object) -> float:
+    real, numerator, _, narrowed = finite_real_and_float32(name, value)
+    if real <= 0.0 or numerator <= 0 or narrowed <= 0.0:
+        raise ValueError(
+            f"{name} must be positive in float32 execution sink, got {value!r}"
+        )
+    return canonical_float32_storage(real, narrowed)
+
+
+def _require_int(
+    name: str,
+    value: object,
+    *,
+    minimum: int | None = None,
+    maximum: int | None = None,
+) -> int:
+    if type(value) not in _ACTUAL_INT_TYPES:
+        raise ValueError(f"{name} must be an integer, got {value!r}")
+    try:
+        number = int(cast(Integral, value))
+    except (OverflowError, TypeError, ValueError):
+        raise ValueError(f"{name} must be an integer, got {value!r}") from None
+    if minimum is not None and number < minimum:
+        if minimum == 1:
+            raise ValueError(f"{name} must be positive, got {value!r}")
+        if minimum == 0:
+            raise ValueError(f"{name} must be non-negative, got {value!r}")
+        raise ValueError(f"{name} must be >= {minimum}, got {value!r}")
+    if maximum is not None and number > maximum:
+        raise ValueError(f"{name} must be <= {maximum}, got {value!r}")
+    return number
+
+
+def _require_bool(name: str, value: object) -> bool:
+    """Require an actual builtin bool (``__class__`` spoofing is ignored)."""
+    if type(value) is not bool:
+        raise ValueError(f"{name} must be a bool, got {value!r}")
+    return value
+
+
+def _validate_step2_kernel_config(config: Step2KernelConfig) -> None:
+    feature_dim = _require_int(
+        "feature_dim", config.feature_dim, minimum=1, maximum=_INT32_MAX
+    )
+    n_heads = _require_int(
+        "n_heads", config.n_heads, minimum=1, maximum=_INT32_MAX
+    )
+    if type(config.hidden_sizes) is not tuple:
+        raise ValueError(
+            f"hidden_sizes must be a tuple of integers, got {config.hidden_sizes!r}"
+        )
+    canonical_hidden: list[int] = []
+    for h in config.hidden_sizes:
+        canonical_hidden.append(
+            _require_int(
+                "hidden_sizes element", h, minimum=1, maximum=_INT32_MAX
+            )
+        )
+    if type(config.stream) is not str or config.stream not in _VALID_STEP2_STREAMS:
+        raise ValueError(
+            f"unknown Step 2 stream field {config.stream!r}; "
+            f"expected one of {sorted(_VALID_STEP2_STREAMS)}"
+        )
+    if config.stream == "polynomial" and feature_dim < 3:
+        raise ValueError("feature_dim must be at least 3 for the polynomial stream")
+    if (
+        type(config.readout_mode) is not str
+        or config.readout_mode not in _VALID_STEP2_READOUT_MODES
+    ):
+        raise ValueError(
+            f"unknown Step 2 readout_mode field {config.readout_mode!r}; "
+            f"expected one of {sorted(_VALID_STEP2_READOUT_MODES)}"
+        )
+    if (
+        type(config.loss_normalization) is not str
+        or config.loss_normalization not in _VALID_STEP2_LOSS_NORMALIZATIONS
+    ):
+        raise ValueError(
+            f"unknown Step 2 loss_normalization field {config.loss_normalization!r}; "
+            f"expected one of {sorted(_VALID_STEP2_LOSS_NORMALIZATIONS)}"
+        )
+    step_size = _require_nonnegative_real("step_size", config.step_size)
+    context_length = _require_int(
+        "context_length",
+        config.context_length,
+        minimum=1,
+        maximum=_INT32_MAX,
+    )
+    noise_std = _require_nonnegative_real("noise_std", config.noise_std)
+    object.__setattr__(config, "feature_dim", feature_dim)
+    object.__setattr__(config, "n_heads", n_heads)
+    object.__setattr__(config, "hidden_sizes", tuple(canonical_hidden))
+    object.__setattr__(config, "step_size", step_size)
+    object.__setattr__(config, "context_length", context_length)
+    object.__setattr__(config, "noise_std", noise_std)
+
+
+def _validate_step2_strict_digit_config(config: Step2StrictDigitReadoutConfig) -> None:
+    n_heads = _require_int(
+        "n_heads", config.n_heads, minimum=1, maximum=_INT32_MAX
+    )
+    if type(config.hidden_sizes) is not tuple:
+        raise ValueError(
+            f"hidden_sizes must be a tuple of integers, got {config.hidden_sizes!r}"
+        )
+    canonical_hidden: list[int] = []
+    for h in config.hidden_sizes:
+        canonical_hidden.append(
+            _require_int(
+                "hidden_sizes element", h, minimum=1, maximum=_INT32_MAX
+            )
+        )
+    step_size = _require_nonnegative_real("step_size", config.step_size)
+    object.__setattr__(config, "n_heads", n_heads)
+    object.__setattr__(config, "hidden_sizes", tuple(canonical_hidden))
+    object.__setattr__(config, "step_size", step_size)
+
+
+def _validate_step2_memory_config(config: Step2MemoryConfig) -> None:
+    feature_dim = _require_int(
+        "feature_dim", config.feature_dim, minimum=1, maximum=_INT32_MAX
+    )
+    n_classes = _require_int(
+        "n_classes", config.n_classes, minimum=2, maximum=_INT32_MAX
+    )
+    slots_per_class = _require_int(
+        "slots_per_class",
+        config.slots_per_class,
+        minimum=1,
+        maximum=_INT32_MAX,
+    )
+    update_rate = _require_half_open_unit_interval("update_rate", config.update_rate)
+    novelty_threshold = _require_nonnegative_real(
+        "novelty_threshold",
+        config.novelty_threshold,
+    )
+    bandwidth = _require_positive_real("bandwidth", config.bandwidth)
+    object.__setattr__(config, "feature_dim", feature_dim)
+    object.__setattr__(config, "n_classes", n_classes)
+    object.__setattr__(config, "slots_per_class", slots_per_class)
+    object.__setattr__(config, "update_rate", update_rate)
+    object.__setattr__(config, "novelty_threshold", novelty_threshold)
+    object.__setattr__(config, "bandwidth", bandwidth)
+
 
 @dataclass(frozen=True)
 class Step2KernelConfig:
-    """Config for the public Step 2 UPGD kernel."""
+    """Config for the production Step 2 UPGD kernel."""
 
     feature_dim: int = 8
     n_heads: int = 3
@@ -72,6 +382,10 @@ class Step2KernelConfig:
     context_length: int = 128
     noise_std: float = 0.05
 
+    def __post_init__(self) -> None:
+        """Reject invalid parameters and canonicalize scalars."""
+        _validate_step2_kernel_config(self)
+
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-serializable representation."""
         payload = asdict(self)
@@ -81,8 +395,10 @@ class Step2KernelConfig:
     @classmethod
     def from_dict(cls, payload: dict[str, object]) -> Step2KernelConfig:
         """Reconstruct from :meth:`to_dict` output."""
+        _require_exact_keys(cls.__name__, payload, _STEP2_KERNEL_CONFIG_KEYS)
         config = dict(payload)
-        config["hidden_sizes"] = tuple(cast(list[int], config["hidden_sizes"]))
+        if isinstance(config["hidden_sizes"], list):
+            config["hidden_sizes"] = tuple(cast(list[int], config["hidden_sizes"]))
         return cls(**cast(Any, config))
 
 
@@ -100,6 +416,10 @@ class Step2StrictDigitReadoutConfig:
     hidden_sizes: tuple[int, ...] = (64, 64)
     step_size: float = 0.018
 
+    def __post_init__(self) -> None:
+        """Reject invalid parameters and canonicalize scalars."""
+        _validate_step2_strict_digit_config(self)
+
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-serializable representation."""
         payload = asdict(self)
@@ -112,14 +432,16 @@ class Step2StrictDigitReadoutConfig:
         payload: dict[str, object],
     ) -> Step2StrictDigitReadoutConfig:
         """Reconstruct from :meth:`to_dict` output."""
+        _require_exact_keys(cls.__name__, payload, _STEP2_STRICT_DIGIT_CONFIG_KEYS)
         config = dict(payload)
-        config["hidden_sizes"] = tuple(cast(list[int], config["hidden_sizes"]))
+        if isinstance(config["hidden_sizes"], list):
+            config["hidden_sizes"] = tuple(cast(list[int], config["hidden_sizes"]))
         return cls(**cast(Any, config))
 
 
 @dataclass(frozen=True)
 class Step2MemoryConfig:
-    """Config for the public Step 2 retained-view memory."""
+    """Config for the production Step 2 retained-view memory."""
 
     feature_dim: int = 784
     n_classes: int = 10
@@ -128,6 +450,10 @@ class Step2MemoryConfig:
     novelty_threshold: float = 0.08
     bandwidth: float = 0.01
 
+    def __post_init__(self) -> None:
+        """Reject invalid parameters and canonicalize scalars."""
+        _validate_step2_memory_config(self)
+
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-serializable representation."""
         return asdict(self)
@@ -135,6 +461,7 @@ class Step2MemoryConfig:
     @classmethod
     def from_dict(cls, payload: dict[str, object]) -> Step2MemoryConfig:
         """Reconstruct from :meth:`to_dict` output."""
+        _require_exact_keys(cls.__name__, payload, _STEP2_MEMORY_CONFIG_KEYS)
         return cls(**cast(Any, payload))
 
 
@@ -164,6 +491,12 @@ class Step2AssociativeConfig:
     min_effective_budget: int = 1
     scope_logit_clip: float = 8.0
 
+    def __post_init__(self) -> None:
+        """Reject invalid parameters and canonicalize via the core config."""
+        core = self.to_core_config()
+        for name in _STEP2_ASSOCIATIVE_CONFIG_KEYS:
+            object.__setattr__(self, name, getattr(core, name))
+
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-serializable representation."""
         return asdict(self)
@@ -171,6 +504,7 @@ class Step2AssociativeConfig:
     @classmethod
     def from_dict(cls, payload: dict[str, object]) -> Step2AssociativeConfig:
         """Reconstruct from :meth:`to_dict` output."""
+        _require_exact_keys(cls.__name__, payload, _STEP2_ASSOCIATIVE_CONFIG_KEYS)
         return cls(**cast(Any, payload))
 
     def to_core_config(self) -> AssociativeMemoryConfig:
@@ -202,7 +536,7 @@ class Step2AssociativeConfig:
 
 @dataclass(frozen=True)
 class Step2HybridConfig:
-    """Config for the public Step 2 UPGD plus memory learner.
+    """Config for the production Step 2 UPGD plus memory learner.
 
     Fields mirror
     :class:`~alberta_framework.core.upgd_memory.UPGDMemoryConfig`
@@ -269,7 +603,7 @@ class Step2HybridConfig:
 
 @dataclass(frozen=True)
 class Step2TemporalContextConfig:
-    """Config for the phase-context UPGD stressor kernel.
+    """Config for the packaged phase-context UPGD stressor kernel.
 
     ``periods`` drives the sin/cos clock features of
     :class:`~alberta_framework.core.temporal_context.TemporalContextConfig`:
@@ -329,6 +663,23 @@ class Step2SmokeResult:
     finite: bool
     learner_config: dict[str, Any]
 
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "steps", _require_int("steps", self.steps, minimum=1, maximum=_INT32_MAX)
+        )
+        object.__setattr__(self, "seed", require_jax_seed(self.seed, name="seed"))
+        object.__setattr__(
+            self,
+            "metrics_shape",
+            require_step_shape("metrics_shape", self.metrics_shape, steps=self.steps),
+        )
+        object.__setattr__(
+            self,
+            "final_window_mse",
+            _require_real("final_window_mse", self.final_window_mse),
+        )
+        object.__setattr__(self, "finite", _require_bool("finite", self.finite))
+
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-serializable representation."""
         payload = asdict(self)
@@ -350,6 +701,28 @@ class Step2AssociativeSmokeResult:
     finite: bool
     learner_config: dict[str, object]
 
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "steps", _require_int("steps", self.steps, minimum=1, maximum=_INT32_MAX)
+        )
+        object.__setattr__(self, "seed", require_jax_seed(self.seed, name="seed"))
+        object.__setattr__(
+            self,
+            "metrics_shape",
+            require_step_shape("metrics_shape", self.metrics_shape, steps=self.steps),
+        )
+        object.__setattr__(
+            self,
+            "initial_window_nll",
+            _require_real("initial_window_nll", self.initial_window_nll),
+        )
+        object.__setattr__(
+            self,
+            "final_window_nll",
+            _require_real("final_window_nll", self.final_window_nll),
+        )
+        object.__setattr__(self, "finite", _require_bool("finite", self.finite))
+
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-serializable representation."""
         payload = asdict(self)
@@ -359,7 +732,7 @@ class Step2AssociativeSmokeResult:
 
 
 def make_step2_learner(config: Step2KernelConfig | None = None) -> UPGDLearner:
-    """Create the Step 2 target-structure UPGD learner."""
+    """Create the packaged Step 2 target-structure UPGD learner."""
     cfg = config or Step2KernelConfig()
     return UPGDLearner.step2_default(
         n_heads=cfg.n_heads,
@@ -375,7 +748,7 @@ def make_step2_strict_digit_readout_learner(
 ) -> UPGDLearner:
     """Create the strict online-MSE digit/readout Step 2 learner.
 
-    This is the heavier two-timescale simplex branch configured for
+    This is the heavier two-timescale simplex branch selected for
     sklearn-digits-style one-hot online classification streams.  The broad
     supervised default remains :func:`make_step2_learner`.
     """
@@ -390,7 +763,7 @@ def make_step2_strict_digit_readout_learner(
 def make_step2_memory_learner(
     config: Step2MemoryConfig | None = None,
 ) -> PrototypeMemoryLearner:
-    """Create the Step 2 retained-view memory learner."""
+    """Create the packaged Step 2 retained-view memory learner."""
     cfg = config or Step2MemoryConfig()
     return PrototypeMemoryLearner(
         PrototypeMemoryConfig(
@@ -470,7 +843,7 @@ def make_step2_hybrid_learner(
 def make_step2_temporal_context(
     config: Step2TemporalContextConfig | None = None,
 ) -> TemporalContextFeaturizer:
-    """Create the causal phase-product context featurizer."""
+    """Create the packaged causal phase-product context featurizer."""
     cfg = config or Step2TemporalContextConfig()
     return TemporalContextFeaturizer(
         TemporalContextConfig(
@@ -539,8 +912,7 @@ def collect_step2_arrays(
     experiments use their dedicated runners so they can capture full metadata,
     baselines, and paired seed statistics.
     """
-    if steps < 1:
-        raise ValueError(f"steps must be positive, got {steps}")
+    steps = _require_int("steps", steps, minimum=1, maximum=_INT32_MAX)
     state = stream.init(key)
     observations = []
     targets = []
@@ -564,10 +936,9 @@ def run_step2_smoke(
     utility/perturbation metrics, and config serialization.  It is not a
     canonical MLP comparison.
     """
-    if final_window < 1 or final_window > steps:
-        raise ValueError(
-            f"final_window must be in [1, steps], got {final_window}"
-        )
+    steps = _require_int("steps", steps, minimum=1, maximum=_INT32_MAX)
+    seed = require_jax_seed(seed, name="seed")
+    final_window = _require_int("final_window", final_window, minimum=1, maximum=steps)
     cfg = config or Step2KernelConfig()
     learner = make_step2_learner(cfg)
     stream = make_step2_stream(cfg)
@@ -604,10 +975,9 @@ def run_step2_associative_smoke(
     associative table should lower NLL over time.
     """
     cfg = config or Step2AssociativeConfig()
-    if steps < 2:
-        raise ValueError(f"steps must be at least 2, got {steps}")
-    if window < 1 or window > steps // 2:
-        raise ValueError(f"window must be in [1, steps//2], got {window}")
+    steps = _require_int("steps", steps, minimum=2, maximum=_INT32_MAX)
+    seed = require_jax_seed(seed, name="seed")
+    window = _require_int("window", window, minimum=1, maximum=steps // 2)
     pattern_count = min(8, max(2, steps // 8))
     key = jr.key(seed)
     patterns = jr.randint(

@@ -53,7 +53,7 @@ from alberta_framework.benchmarks import forager_matched_statistics as statistic
 from tests import test_forager_matched_executor as executor_fixtures
 from tests import test_forager_matched_open_protocol as protocol_fixtures
 
-pytestmark = pytest.mark.integration
+pytestmark = [pytest.mark.integration, pytest.mark.slow]
 
 
 def _sha(label: str) -> str:
@@ -920,21 +920,23 @@ def test_publish_orders_authentication_before_analysis_and_replays_offline(
         output,
         **kwargs,
     )
+    # The authenticated analysis closure carries the source-derived protocol,
+    # executor, score, and selection identities from both campaign stages.
     golden_payload_sha256 = {
         "manifest.json": (
-            "c643c798718b78f0c4de6421e2c2a899319f1827ea876549be7c23bb71746323"
+            "b6eac95fa946d2ef25dc0f7511771454484385099d1609919483aa68acc2a94a"
         ),
         "analysis/analysis-runtime-source.json": (
             "ca6656e3d1e12aeab5c660921cc3a9ce00611e9c41a612e646a2ca458f70f52b"
         ),
         "analysis/evaluation-authenticated-bindings-cache.json": (
-            "2d230d5ffc115598065fd7794402e0b1044eaa71e8b6b3eaf6f68417c2e506e7"
+            "5ec971824840403822c4c5fa910c10916730b1df3f6f418b8599fcc001242146"
         ),
         "analysis/statistics-contract.json": (
-            "fa20ac49b10bbbe5fa8605735fe46db7d572e642faf99728346af9b15d31cdc6"
+            "823f09a5f0e92e47786919d6c4d84c571e22284a3379ff16d91ab30a84762694"
         ),
         "analysis/statistics-result.json": (
-            "96fe23912bbf5929184477b183af59012a78527d5868888c805292a6b1d4678b"
+            "766810474dd08d5f5d4d932dcb09f94e99a9892f6f6d824b69730a33a13b363f"
         ),
     }
     for relative, expected_sha256 in golden_payload_sha256.items():
@@ -944,7 +946,7 @@ def test_publish_orders_authentication_before_analysis_and_replays_offline(
             f"{expected_sha256}\n".encode("ascii")
         )
     assert content.manifest["payload_sha256"] == (
-        "dcfdbe291c3606b06253446ac367bcb20e585314a8a1e3ab3719244b2c881e3f"
+        "f4db083c410857e4f51062eabd920318a713599edf5ce9abe6c93a09080657ac"
     )
     assert content.analysis_runtime_source["payload_sha256"] == (
         "a23e65272f0785d4a2b3843610800088a5f2ca8352ef858d9ab4dfeed3caafd6"
@@ -2482,6 +2484,7 @@ def test_source_projection_and_command_templates_are_exact(
         )
 
     malformed_plan_cases: tuple[tuple[str, Any], ...] = (
+        ("horizon", float(seal_content.sealed_protocol.horizon)),
         ("active_seeds", None),
         (
             "active_seeds",

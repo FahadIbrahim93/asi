@@ -5,10 +5,12 @@ prefix property), pin combination steps to their reference equations, and
 test shard/merge/validation plumbing. Benchmark executions never run here.
 """
 
+import hashlib
 import json
 import math
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 
 import chex
@@ -18,8 +20,12 @@ import jax.random as jr
 import numpy as np
 import pytest
 
+import alberta_framework.benchmarks.ipmnist_screening as ipmnist_screening
 from alberta_framework.benchmarks.ipmnist_screening import (
     _CBP_LAYERS,
+    CONFIRMATION_THRESHOLD,
+    LEGACY_SHARD_SCHEMA,
+    NONPROMOTING_POLICY,
     PROXY_N_TASKS,
     SCREENING_REGISTRY,
     SHARD_SCHEMA,
@@ -47,9 +53,12 @@ from alberta_framework.benchmarks.ipmnist_screening import (
     _make_rff_rls_learner,
     _make_sgd_ema_norm_learner,
     _make_sgd_momentum_gate_learner,
+    _make_sigma0_gated_l2init_learner,
     _make_snr_ema_norm_learner,
     _make_upgd_alpha_utility_learner,
+    _make_upgd_autostep_learner,
     _make_upgd_ema_norm_ext_learner,
+    _make_upgd_ema_norm_learner,
     _make_upgd_idbd_learner,
     _make_upgd_shiftnorm_learner,
     _make_upgd_w_fade_head_learner,
@@ -73,6 +82,7 @@ from alberta_framework.benchmarks.ipmnist_screening import (
     shift_adaptive_normalize,
     snr_maybe_reset_layer,
     upgd_alpha_utility_update,
+    upgd_autostep_update,
     upgd_idbd_swift_update,
     upgd_idbd_update,
     upgd_l2init_update,
@@ -98,6 +108,99 @@ from alberta_framework.core.normalizers import EMANormalizer
 SMALL = IPMNISTConfig(
     n_tasks=3, task_length=30, input_dim=12, hidden1=8, hidden2=6, n_classes=5
 )
+
+
+def _test_source_provenance(
+    *, source_sha256: str = "3" * 64,
+) -> dict[str, object]:
+    return {
+        "schema": "alberta.ipmnist_screening.source_provenance.v1",
+        "git_commit": "1" * 40,
+        "git_tree": "2" * 40,
+        "git_object_format": "sha1",
+        "relevant_source_scope": "tracked:alberta_framework/**,pyproject.toml,uv.lock",
+        "relevant_source_file_count": 3,
+        "relevant_source_sha256": source_sha256,
+        "uv_lock_sha256": "4" * 64,
+        "worktree_clean": True,
+    }
+
+
+def _test_runtime_environment(
+    *, machine: str = "test-machine",
+) -> dict[str, object]:
+    return {
+        "schema": "alberta.ipmnist_screening.runtime.v1",
+        "python": {"implementation": "CPython", "version": "3.12.12"},
+        "platform": {"system": "TestOS", "release": "1", "machine": machine},
+        "packages": {
+            "chex": "0.1.91",
+            "jax": "0.11.0",
+            "jaxlib": "0.11.0",
+            "numpy": "2.5.1",
+            "scikit-learn": "1.7.1",
+        },
+        "jax": {
+            "backend": "cpu",
+            "devices": [
+                {"id": 0, "platform": "cpu", "device_kind": "test-cpu", "process_index": 0}
+            ],
+            "config": {
+                "jax_enable_x64": False,
+                "jax_default_matmul_precision": None,
+                "jax_disable_jit": False,
+                "jax_numpy_dtype_promotion": "standard",
+                "jax_numpy_rank_promotion": "allow",
+                "jax_random_seed_offset": 0,
+                "jax_threefry_partitionable": True,
+                "jax_default_prng_impl": "threefry2x32",
+            },
+        },
+        "process_environment": {
+            "CUDA_VISIBLE_DEVICES": None,
+            "JAX_DEFAULT_MATMUL_PRECISION": None,
+            "JAX_ENABLE_X64": None,
+            "JAX_PLATFORM_NAME": None,
+            "JAX_PLATFORMS": None,
+            "OMP_NUM_THREADS": "1",
+            "XLA_FLAGS": None,
+        },
+    }
+
+
+def _test_dataset_provenance() -> dict[str, object]:
+    return {
+        "schema": "alberta.ipmnist_screening.dataset_provenance.v1",
+        "source": {
+            "provider": "openml",
+            "name": "mnist_784",
+            "version": 1,
+            "row_start": 0,
+            "row_stop_exclusive": 60000,
+        },
+        "materialization": "alberta.ipmnist.float32-neg1-pos1-int32-labels.v1",
+        "x": {"dtype": "<f4", "shape": [60000, 784], "sha256": "5" * 64},
+        "y": {"dtype": "<i4", "shape": [60000], "sha256": "6" * 64},
+    }
+
+
+def _bound_shard_payload(
+    result: ipmnist_screening.ScreeningRunResult,
+) -> dict[str, object]:
+    artifact_config = IPMNISTConfig(
+        n_tasks=result.config.n_tasks,
+        task_length=result.config.task_length,
+        input_dim=784,
+        hidden1=result.config.hidden1,
+        hidden2=result.config.hidden2,
+        n_classes=10,
+    )
+    return shard_payload(
+        replace(result, config=artifact_config),
+        source_provenance=_test_source_provenance(),
+        dataset_provenance=_test_dataset_provenance(),
+        environment=_test_runtime_environment(),
+    )
 
 
 @pytest.fixture(scope="module")
@@ -206,6 +309,9 @@ class TestRegistry:
             "rls_head_l1_preset003",
             "rls_head_l0999_pcap",
             "rls_head_resid_l1_preset005",
+            "rls_head_resid_l1_noreset",
+            "rls_head_resid_l1_preset005_l2init",
+            "rls_head_resid_l1_preset005_nogate",
             "rls_head_l0999_preset005_r01",
             "rls_head_l0999_preset005_r003",
             "rls_head_l0999_preset005_r001",
@@ -263,6 +369,66 @@ class TestControlParity:
         )
 
 
+@pytest.mark.unit
+class TestScreeningInputDomain:
+    """Issue #527: run_screening_config must refuse out-of-domain data before the factory."""
+
+    @staticmethod
+    def _boom_factory(hyperparameters):
+        del hyperparameters
+        raise AssertionError("out-of-domain data reached the learner factory")
+
+    @pytest.mark.parametrize("noise_mode", ["step", "pool"])
+    @pytest.mark.parametrize(
+        ("mutate", "message"),
+        [
+            (lambda x, y: (x, y + 100), "must be smaller than"),
+            (lambda x, y: (x, y - 1), "non-negative"),
+            (lambda x, y: (x, y.astype(np.float32) + 0.9), "integer class labels"),
+            (lambda x, y: (x.at[0, 0].set(np.inf), y), "finite"),
+            (lambda x, y: (x.at[3, 1].set(np.nan), y), "finite"),
+            (
+                lambda x, y: (np.full(np.shape(x), np.timedelta64("NaT", "s")), y),
+                "real numeric",
+            ),
+            (
+                lambda x, y: (
+                    x[: SMALL.task_length - 1],
+                    y[: SMALL.task_length - 1],
+                ),
+                "task_length",
+            ),
+        ],
+    )
+    def test_rejects_before_learner_factory(
+        self, small_data, noise_mode: str, mutate, message: str
+    ) -> None:
+        x, y = small_data
+        x, y = mutate(jnp.asarray(x), jnp.asarray(y))
+        spec = replace(screening_spec("upgd_w_control"), factory=self._boom_factory)
+        with pytest.raises(ValueError, match=message):
+            run_screening_config(
+                x, y, spec, seed=0, config=SMALL, noise_mode=noise_mode
+            )
+
+    @pytest.mark.parametrize("progress_every", [0, -1, True, 1.5])
+    def test_rejects_invalid_progress_interval_before_learner_factory(
+        self, small_data, progress_every: object
+    ) -> None:
+        """Host-boundary progress identities must not reach the learner factory."""
+        x, y = small_data
+        spec = replace(screening_spec("upgd_w_control"), factory=self._boom_factory)
+        with pytest.raises(ValueError, match="progress_every"):
+            run_screening_config(
+                x,
+                y,
+                spec,
+                seed=0,
+                config=SMALL,
+                progress_every=progress_every,  # type: ignore[arg-type]
+            )
+
+
 class TestIDBDCombo:
     def test_meta_zero_reduces_to_lean_upgd(self):
         """With meta=0 and initial alpha = published lr, IDBD == lean UPGD-W."""
@@ -300,6 +466,60 @@ class TestIDBDCombo:
             assert bool(jnp.all(state.log_alpha[n] >= -10.0))
             assert bool(jnp.all(state.log_alpha[n] <= 0.0))
             assert bool(jnp.all(jnp.isfinite(params[n])))
+
+    def test_nonfinite_gated_gradient_does_not_poison_log_alpha(self):
+        params = init_mlp_params(jr.key(0), SMALL)
+        hp = dict(UPGD_W_PROTOCOL_HYPERPARAMETERS)
+        hp.update({"meta_step_size": 0.01, "initial_step_size": 0.01})
+        init_fn, _ = _make_upgd_idbd_learner(hp)
+        state = init_fn(params)
+        grads = {name: jnp.zeros_like(value) for name, value in params.items()}
+        grads["w1"] = jnp.full_like(params["w1"], jnp.inf)
+        noise = {name: jnp.zeros_like(value) for name, value in params.items()}
+
+        _, guarded = upgd_idbd_update(params, state, grads, noise, hp)
+
+        np.testing.assert_array_equal(guarded.log_alpha["w1"], state.log_alpha["w1"])
+        assert bool(jnp.all(jnp.isfinite(guarded.log_alpha["w1"])))
+
+
+class TestAutostepCombo:
+    def test_nonfinite_gated_gradient_does_not_poison_meta_state(self):
+        params = init_mlp_params(jr.key(0), SMALL)
+        hp = dict(UPGD_W_PROTOCOL_HYPERPARAMETERS)
+        hp.update({"meta_step_size": 0.01, "initial_step_size": 0.01, "tau": 1e4})
+        init_fn, _ = _make_upgd_autostep_learner(hp)
+        state = init_fn(params)
+        grads = {name: jnp.zeros_like(value) for name, value in params.items()}
+        grads["w1"] = jnp.full_like(params["w1"], jnp.inf)
+        noise = {name: jnp.zeros_like(value) for name, value in params.items()}
+
+        _, guarded = upgd_autostep_update(params, state, grads, noise, hp)
+
+        np.testing.assert_array_equal(guarded.normalizer["w1"], state.normalizer["w1"])
+        np.testing.assert_array_equal(guarded.alpha["w1"], state.alpha["w1"])
+        np.testing.assert_array_equal(guarded.trace["w1"], state.trace["w1"])
+        assert bool(jnp.all(jnp.isfinite(guarded.normalizer["w1"])))
+        assert bool(jnp.all(jnp.isfinite(guarded.alpha["w1"])))
+
+    def test_finite_square_overflow_keeps_state_finite_and_triggers_bound(self):
+        params = init_mlp_params(jr.key(0), SMALL)
+        hp = dict(UPGD_W_PROTOCOL_HYPERPARAMETERS)
+        hp.update({"meta_step_size": 0.01, "initial_step_size": 0.01, "tau": 1e4})
+        init_fn, _ = _make_upgd_autostep_learner(hp)
+        state = init_fn(params)
+        grads = {name: jnp.zeros_like(value) for name, value in params.items()}
+        grads["w1"] = jnp.full_like(params["w1"], 1e30)
+        noise = {name: jnp.zeros_like(value) for name, value in params.items()}
+
+        _, guarded = upgd_autostep_update(params, state, grads, noise, hp)
+
+        assert bool(jnp.all(jnp.isfinite(guarded.normalizer["w1"])))
+        assert bool(jnp.all(jnp.isfinite(guarded.trace["w1"])))
+        np.testing.assert_array_equal(guarded.normalizer["w1"], state.normalizer["w1"])
+        np.testing.assert_array_equal(
+            guarded.alpha["w1"], jnp.full_like(state.alpha["w1"], 1e-8)
+        )
 
 
 class TestFadeHead:
@@ -476,6 +696,20 @@ class TestIDBDSwift:
                 )
             params = p_swift
 
+    def test_nonfinite_gated_gradient_does_not_poison_log_alpha(self):
+        params = init_mlp_params(jr.key(0), SMALL)
+        hp = self._hp()
+        init_fn, _ = _make_upgd_idbd_learner(hp)
+        state = init_fn(params)
+        grads = {name: jnp.zeros_like(value) for name, value in params.items()}
+        grads["w1"] = jnp.full_like(params["w1"], jnp.inf)
+        noise = {name: jnp.zeros_like(value) for name, value in params.items()}
+
+        _, guarded = upgd_idbd_swift_update(params, state, grads, noise, hp)
+
+        np.testing.assert_array_equal(guarded.log_alpha["w1"], state.log_alpha["w1"])
+        assert bool(jnp.all(jnp.isfinite(guarded.log_alpha["w1"])))
+
     def test_overshoot_bound_triggers_and_caps_effective_step(self):
         """Large alpha: sum_i alpha_i z_i^2 >> eta, so the applied step is the
         unbounded step scaled by eta/tau, the effective correction ratio is
@@ -553,6 +787,32 @@ class TestL2Init:
 
 
 class TestEMANorm:
+    def test_decay_one_preserves_initial_moment_pseudo_sample(self):
+        """The scan restatement includes the initialized moments as one sample."""
+        state = EMANormState(
+            mean=jnp.zeros(1),
+            var=jnp.ones(1),
+            count=jnp.array(0.0),
+        )
+
+        _, state = ema_normalize(
+            state,
+            jnp.asarray([5.0], dtype=jnp.float32),
+            1.0,
+            1e-8,
+        )
+        np.testing.assert_array_equal(np.asarray(state.mean), np.asarray([2.5]))
+        np.testing.assert_array_equal(np.asarray(state.var), np.asarray([6.75]))
+
+        _, state = ema_normalize(
+            state,
+            jnp.asarray([7.0], dtype=jnp.float32),
+            1.0,
+            1e-8,
+        )
+        np.testing.assert_array_equal(np.asarray(state.mean), np.asarray([4.0]))
+        np.testing.assert_array_equal(np.asarray(state.var), np.asarray([9.0]))
+
     def test_parity_with_core_ema_normalizer(self):
         normalizer = EMANormalizer(epsilon=1e-8, decay=0.999)
         core_state = normalizer.init(6)
@@ -755,6 +1015,51 @@ class TestLocalGateNorm:
         )
 
 
+class TestSeedBoundary:
+    @pytest.mark.parametrize("seed", [True, np.int64(0), 0.0, -1, 2**32])
+    def test_runner_rejects_noncanonical_seed_before_setup(
+        self, monkeypatch: pytest.MonkeyPatch, seed: object
+    ) -> None:
+        def unexpected_setup(*args: object, **kwargs: object) -> None:
+            del args, kwargs
+            raise AssertionError("invalid seed reached screening setup")
+
+        monkeypatch.setattr(
+            ipmnist_screening, "_validated_screening_noise_mode", unexpected_setup
+        )
+        with pytest.raises(ValueError, match="seed.*uint32"):
+            run_screening_config(
+                np.empty((1, 1), dtype=np.float32),
+                np.empty((1,), dtype=np.int32),
+                screening_spec("upgd_w_control"),
+                seed=seed,  # type: ignore[arg-type]
+                config=SMALL,
+            )
+
+    def test_cli_rejects_aliased_seed_before_loading_mnist(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def unexpected_load(*args: object, **kwargs: object) -> None:
+            del args, kwargs
+            raise AssertionError("invalid seed reached dataset loading")
+
+        monkeypatch.setattr(ipmnist_screening, "load_mnist_train", unexpected_load)
+        output = tmp_path / "must-not-exist.json"
+        with pytest.raises(ValueError, match="seed.*uint32"):
+            main(
+                [
+                    "run",
+                    "--config-name",
+                    "upgd_w_control",
+                    "--seed",
+                    str(2**32),
+                    "--out",
+                    str(output),
+                ]
+            )
+        assert not output.exists()
+
+
 class TestSmokeRuns:
     """Every combination runs at tiny scale, learns above chance, stays finite."""
 
@@ -783,11 +1088,17 @@ class TestSmokeRuns:
 
 
 class TestShardsAndMerge:
-    def _make_shard(self, tmp_path, small_data, name, seed):
+    def _make_shard(self, tmp_path, small_data, config_name, seed):
         x, y = small_data
-        result = run_screening_config(x, y, screening_spec(name), seed=seed, config=SMALL)
-        path = tmp_path / f"{name}_seed{seed}.json"
-        path.write_text(json.dumps(shard_payload(result)), encoding="utf-8")
+        result = run_screening_config(
+            x,
+            y,
+            screening_spec(config_name),
+            seed=seed,
+            config=SMALL,
+        )
+        path = tmp_path / f"{config_name}_seed{seed}.json"
+        path.write_text(json.dumps(_bound_shard_payload(result)), encoding="utf-8")
         return path
 
     def test_shard_roundtrip_and_merge(self, tmp_path, small_data):
@@ -813,6 +1124,520 @@ class TestShardsAndMerge:
         assert isinstance(l2["paired_vs_control"]["confirmation_candidate"], bool)
         control = next(e for e in summary["results"] if e["config_name"] == "upgd_w_control")
         assert "paired_vs_control" not in control
+
+    def test_load_shard_rejects_seed_outside_jax_key_domain(
+        self, tmp_path, small_data
+    ) -> None:
+        path = self._make_shard(tmp_path, small_data, "upgd_w_control", 0)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["seed"] = 2**32
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+        with pytest.raises(ValueError, match="seed.*uint32"):
+            load_shard(path)
+
+    @pytest.mark.parametrize("location", ["top-level", "nested"])
+    def test_load_shard_rejects_duplicate_top_level_and_nested_keys(
+        self, tmp_path: Path, location: str
+    ) -> None:
+        spec = screening_spec("upgd_w_control")
+        payload = _bound_shard_payload(
+            ipmnist_screening.ScreeningRunResult(
+                config_name=spec.name,
+                base_learner=spec.base_learner,
+                hyperparameters=dict(spec.hyperparameters),
+                seed=0,
+                config=SMALL,
+                per_task_accuracy=np.zeros(SMALL.n_tasks),
+                per_task_loss=np.zeros(SMALL.n_tasks),
+                per_task_plasticity=np.zeros(SMALL.n_tasks),
+                wall_clock_seconds=0.0,
+            )
+        )
+        encoded = json.dumps(payload, separators=(",", ":"))
+        encoded_config = json.dumps(payload["config"], separators=(",", ":"))
+        duplicate_config = '{"n_tasks":999,' + encoded_config[1:]
+        variants = {
+            "top-level": '{"schema":"forged",' + encoded[1:],
+            "nested": encoded.replace(
+                f'"config":{encoded_config}',
+                f'"config":{duplicate_config}',
+                1,
+            ),
+        }
+
+        path = tmp_path / f"duplicate-{location}.json"
+        path.write_text(variants[location], encoding="utf-8")
+        with pytest.raises(ValueError, match="duplicate JSON object key"):
+            load_shard(path)
+
+    def test_merge_rejects_zero_seed_overlap_with_control(self, tmp_path, small_data):
+        """An arm sharing no seeds with a present control must refuse to merge:
+        the entry would rank in the summary with no paired_vs_control block and
+        nothing in the artifact marking it unpaired (issue #49)."""
+        paths = [
+            self._make_shard(tmp_path, small_data, "upgd_w_control", 0),
+            self._make_shard(tmp_path, small_data, "upgd_w_control", 1),
+            self._make_shard(tmp_path, small_data, "upgd_l2init", 2),
+        ]
+        with pytest.raises(
+            ValueError,
+            match=r"'upgd_l2init' shares no seeds with control 'upgd_w_control'",
+        ):
+            merge_shards(paths, control_name="upgd_w_control", slope_window=2)
+
+    def test_merge_rejects_partial_seed_overlap(self, tmp_path):
+        """A ranked summary must compare every arm on exactly paired seeds."""
+        paths = [
+            self._write_inband_shard(tmp_path, "upgd_w_control", 0, 0.40),
+            self._write_inband_shard(tmp_path, "upgd_w_control", 1, 0.60),
+            self._write_inband_shard(tmp_path, "upgd_l2init", 1, 0.55),
+            self._write_inband_shard(tmp_path, "upgd_l2init", 2, 0.90),
+        ]
+
+        with pytest.raises(
+            ValueError,
+            match=r"seed sets differ across configs.*ranks configs on paired seeds only",
+        ):
+            merge_shards(paths, control_name="upgd_w_control", slope_window=2)
+
+    def _write_inband_shard(self, tmp_path, config_name, seed, accuracy):
+        """Write a structurally valid shard with controlled accuracy."""
+        payload = {
+            "schema": LEGACY_SHARD_SCHEMA,
+            "config_name": config_name,
+            "base_learner": "upgd_w",
+            "hyperparameters": {},
+            "seed": seed,
+            "noise_mode": "step",
+            "config": SMALL.to_config(),
+            "per_task_accuracy": [float(accuracy)] * SMALL.n_tasks,
+            "per_task_loss": [0.1] * SMALL.n_tasks,
+            "per_task_plasticity": [0.5] * SMALL.n_tasks,
+            "wall_clock_seconds": 1.0,
+            "environment": {
+                "jax": "test-jax",
+                "numpy": "test-numpy",
+                "python": "test-python",
+                "platform": "test-platform",
+            },
+        }
+        path = tmp_path / f"{config_name}_seed{seed}.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        return path
+
+    @pytest.mark.parametrize(
+        ("fieldname", "mutate", "message"),
+        [
+            ("per_task_accuracy", lambda curve: [5.0] * len(curve), r"must be in \[0, 1\]"),
+            ("per_task_accuracy", lambda curve: [-0.5] * len(curve), r"must be in \[0, 1\]"),
+            ("per_task_plasticity", lambda curve: [1.5] * len(curve), r"must be in \[0, 1\]"),
+            ("per_task_loss", lambda curve: [-1.0] * len(curve), "must be non-negative"),
+            (
+                "per_task_accuracy",
+                lambda curve: [str(v) for v in curve],
+                "must be a list of finite JSON numbers",
+            ),
+            (
+                "per_task_accuracy",
+                lambda curve: [True] * len(curve),
+                "must be a list of finite JSON numbers",
+            ),
+            (
+                "per_task_loss",
+                lambda curve: [str(v) for v in curve],
+                "must be a list of finite JSON numbers",
+            ),
+        ],
+    )
+    def test_load_shard_applies_curve_typing_and_domain_to_legacy_v1(
+        self, tmp_path, fieldname, mutate, message
+    ):
+        """v1 is the campaign's live shard format; its curves get the same domain checks as v2."""
+        path = self._write_inband_shard(tmp_path, "upgd_w_control", 0, 0.5)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload[fieldname] = mutate(list(payload[fieldname]))
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        with pytest.raises(ValueError, match=message):
+            load_shard(path)
+
+    def test_load_shard_canonicalizes_legacy_v1_integer_curve_entries(self, tmp_path):
+        path = self._write_inband_shard(tmp_path, "upgd_w_control", 0, 0.5)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["per_task_accuracy"] = [1] + payload["per_task_accuracy"][1:]
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        loaded = load_shard(path)
+        assert loaded["per_task_accuracy"][0] == 1.0
+        assert type(loaded["per_task_accuracy"][0]) is float
+
+    def test_out_of_domain_legacy_shard_cannot_top_a_merge(self, tmp_path):
+        control = self._write_inband_shard(tmp_path, "upgd_w_control", 0, 0.5)
+        winner = self._write_inband_shard(tmp_path, "upgd_l2init", 0, 0.6)
+        payload = json.loads(winner.read_text(encoding="utf-8"))
+        payload["per_task_accuracy"] = [5.0] * SMALL.n_tasks
+        winner.write_text(json.dumps(payload), encoding="utf-8")
+        with pytest.raises(ValueError, match=r"must be in \[0, 1\]"):
+            merge_shards([control, winner], control_name="upgd_w_control", slope_window=2)
+
+    def test_load_shard_rejects_invalid_wall_clock_types_and_values(self, tmp_path):
+        path = self._write_inband_shard(tmp_path, "upgd_w_control", 0, 0.5)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+
+        for wall_clock in (
+            None,
+            True,
+            False,
+            "1.0",
+            [],
+            {},
+            math.inf,
+            -math.inf,
+            math.nan,
+            -1,
+            10**309,
+        ):
+            payload["wall_clock_seconds"] = wall_clock
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            message = (
+                "non-standard JSON numeric constant"
+                if type(wall_clock) is float and not math.isfinite(wall_clock)
+                else "wall_clock_seconds"
+            )
+            with pytest.raises(ValueError, match=message):
+                load_shard(path)
+
+    @pytest.mark.parametrize("wall_clock", [0, 0.0, 1, 1.25, 1e308])
+    def test_load_shard_preserves_valid_wall_clock(self, tmp_path, wall_clock):
+        path = self._write_inband_shard(tmp_path, "upgd_w_control", 0, 0.5)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["wall_clock_seconds"] = wall_clock
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+        loaded = load_shard(path)["wall_clock_seconds"]
+        assert type(loaded) is float
+        assert loaded == float(wall_clock)
+
+    def test_load_shard_rejects_unknown_noise_mode(self, tmp_path):
+        path = self._write_inband_shard(tmp_path, "upgd_w_control", 0, 0.5)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["noise_mode"] = "teleport"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+        with pytest.raises(ValueError) as exc_info:
+            load_shard(path)
+
+        assert str(exc_info.value) == (
+            f"{path}: noise_mode must be 'step' or 'pool', got 'teleport'"
+        )
+
+    @pytest.mark.parametrize("noise_mode", [None, True, 0, [], {}])
+    def test_load_shard_rejects_non_string_noise_mode(self, tmp_path, noise_mode):
+        path = self._write_inband_shard(tmp_path, "upgd_w_control", 0, 0.5)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["noise_mode"] = noise_mode
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+        with pytest.raises(ValueError, match="noise_mode must be"):
+            load_shard(path)
+
+    def test_load_shard_rejects_pool_mode_for_incompatible_arm(self, tmp_path):
+        path = self._write_inband_shard(tmp_path, "upgd_idbd", 0, 0.5)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["noise_mode"] = "pool"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+        with pytest.raises(ValueError) as exc_info:
+            load_shard(path)
+
+        assert str(exc_info.value) == (
+            f"{path}: noise_mode='pool' is unsupported for 'upgd_idbd': "
+            "the arm declares no noise-consuming update"
+        )
+
+    @pytest.mark.parametrize(
+        ("config_name", "noise_mode"),
+        [("upgd_idbd", "step"), ("upgd_w_control", "pool")],
+    )
+    def test_load_shard_accepts_runner_supported_noise_modes(
+        self, tmp_path, config_name, noise_mode
+    ):
+        path = self._write_inband_shard(tmp_path, config_name, 0, 0.5)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["noise_mode"] = noise_mode
+        if noise_mode == "pool":
+            payload["noise_pool_steps"] = 64
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+        loaded = load_shard(path)
+        assert loaded["noise_mode"] == noise_mode
+        assert loaded["noise_pool_steps"] == (64 if noise_mode == "pool" else None)
+
+    @pytest.mark.parametrize(
+        "noise_pool_steps",
+        [None, True, False, 8.0, "8", [], {}, 1, 0, -1],
+    )
+    def test_load_shard_rejects_invalid_pool_size(
+        self, tmp_path: Path, noise_pool_steps: object
+    ) -> None:
+        path = self._write_inband_shard(tmp_path, "upgd_w_control", 0, 0.5)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["noise_mode"] = "pool"
+        payload["noise_pool_steps"] = noise_pool_steps
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+        with pytest.raises(ValueError, match="noise_pool_steps"):
+            load_shard(path)
+
+    def test_load_shard_preserves_unrecorded_legacy_pool_size_as_unknown(
+        self, tmp_path: Path
+    ) -> None:
+        path = self._write_inband_shard(tmp_path, "upgd_w_control", 0, 0.5)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["noise_mode"] = "pool"
+        payload.pop("noise_pool_steps", None)
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+        loaded = load_shard(path)
+        assert loaded["noise_mode"] == "pool"
+        assert loaded["noise_pool_steps"] is None
+
+        with pytest.raises(ValueError, match="do not record noise_pool_steps"):
+            merge_shards([path], control_name="upgd_w_control", slope_window=2)
+
+    def test_load_shard_rejects_pool_size_for_step_mode(self, tmp_path: Path) -> None:
+        path = self._write_inband_shard(tmp_path, "upgd_w_control", 0, 0.5)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["noise_pool_steps"] = 64
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+        with pytest.raises(ValueError, match="null or absent.*noise_mode='step'"):
+            load_shard(path)
+
+    @pytest.mark.parametrize("noise_mode", [None, "step"])
+    def test_load_shard_normalizes_legacy_and_step_pool_size_to_none(
+        self, tmp_path: Path, noise_mode: str | None
+    ) -> None:
+        path = self._write_inband_shard(tmp_path, "upgd_w_control", 0, 0.5)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if noise_mode is None:
+            payload.pop("noise_mode")
+        payload.pop("noise_pool_steps", None)
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+        loaded = load_shard(path)
+        assert loaded["noise_mode"] == "step"
+        assert loaded["noise_pool_steps"] is None
+
+    def test_merge_rejects_mixed_pool_sizes(self, tmp_path: Path) -> None:
+        paths = [
+            self._write_inband_shard(tmp_path, "upgd_w_control", seed, 0.5)
+            for seed in (0, 1)
+        ]
+        for path, noise_pool_steps in zip(paths, (8, 512), strict=True):
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload["noise_mode"] = "pool"
+            payload["noise_pool_steps"] = noise_pool_steps
+            path.write_text(json.dumps(payload), encoding="utf-8")
+
+        with pytest.raises(ValueError, match="multiple noise_pool_steps"):
+            merge_shards(paths, control_name="upgd_w_control", slope_window=2)
+
+    def test_merge_rejects_known_and_unrecorded_pool_sizes(self, tmp_path: Path) -> None:
+        paths = [
+            self._write_inband_shard(tmp_path, "upgd_w_control", seed, 0.5)
+            for seed in (0, 1)
+        ]
+        for path in paths:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload["noise_mode"] = "pool"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+        known = json.loads(paths[0].read_text(encoding="utf-8"))
+        known["noise_pool_steps"] = 8
+        paths[0].write_text(json.dumps(known), encoding="utf-8")
+
+        with pytest.raises(ValueError, match="do not record noise_pool_steps"):
+            merge_shards(paths, control_name="upgd_w_control", slope_window=2)
+
+    def test_merge_requires_one_pool_size_across_all_arms(self, tmp_path: Path) -> None:
+        paths = [
+            self._write_inband_shard(tmp_path, "upgd_w_control", 0, 0.5),
+            self._write_inband_shard(tmp_path, "upgd_w_localgate", 0, 0.6),
+        ]
+        for path, noise_pool_steps in zip(paths, (8, 512), strict=True):
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload["noise_mode"] = "pool"
+            payload["noise_pool_steps"] = noise_pool_steps
+            path.write_text(json.dumps(payload), encoding="utf-8")
+
+        with pytest.raises(ValueError, match="multiple noise_pool_steps"):
+            merge_shards(paths, control_name="upgd_w_control", slope_window=2)
+
+    def test_merge_records_one_pool_size_across_all_arms(self, tmp_path: Path) -> None:
+        paths = [
+            self._write_inband_shard(tmp_path, "upgd_w_control", 0, 0.5),
+            self._write_inband_shard(tmp_path, "upgd_w_localgate", 0, 0.6),
+        ]
+        for path in paths:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload["noise_mode"] = "pool"
+            payload["noise_pool_steps"] = 8
+            path.write_text(json.dumps(payload), encoding="utf-8")
+
+        summary = merge_shards(paths, control_name="upgd_w_control", slope_window=2)
+
+        assert summary["noise_mode"] == "pool"
+        assert summary["noise_pool_steps"] == 8
+
+    @pytest.mark.parametrize(
+        ("config_name", "noise_mode", "error"),
+        [
+            (
+                "upgd_w_control",
+                "teleport",
+                "noise_mode must be 'step' or 'pool'",
+            ),
+            (
+                "upgd_idbd",
+                "pool",
+                "noise_mode='pool' is unsupported for 'upgd_idbd'",
+            ),
+        ],
+    )
+    def test_merge_cli_rejects_impossible_noise_mode_without_publishing(
+        self, tmp_path, config_name, noise_mode, error
+    ):
+        paths = [
+            self._write_inband_shard(tmp_path, config_name, seed, 0.5)
+            for seed in (0, 1)
+        ]
+        for path in paths:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload["noise_mode"] = noise_mode
+            path.write_text(json.dumps(payload), encoding="utf-8")
+        output = tmp_path / "summary.json"
+
+        with pytest.raises(ValueError, match=error):
+            main(
+                [
+                    "merge",
+                    "--shards",
+                    *(str(path) for path in paths),
+                    "--control-name",
+                    config_name,
+                    "--slope-window",
+                    "2",
+                    "--output",
+                    str(output),
+                ]
+            )
+
+        assert not output.exists()
+
+    @pytest.mark.parametrize("noise_mode", [None, "step", "pool"])
+    def test_merge_preserves_legacy_and_supported_noise_modes(
+        self, tmp_path, noise_mode
+    ):
+        path = self._write_inband_shard(tmp_path, "upgd_w_control", 0, 0.5)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if noise_mode is None:
+            del payload["noise_mode"]
+            expected = "step"
+        else:
+            payload["noise_mode"] = noise_mode
+            expected = noise_mode
+        if noise_mode == "pool":
+            payload["noise_pool_steps"] = 64
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+        summary = merge_shards(
+            [path], control_name="upgd_w_control", slope_window=2
+        )
+
+        assert summary["noise_mode"] == expected
+        assert summary["noise_pool_steps"] == (64 if noise_mode == "pool" else None)
+
+    def test_merge_preserves_valid_wall_clock_summary(self, tmp_path):
+        paths = [
+            self._write_inband_shard(tmp_path, "upgd_w_control", seed, 0.5)
+            for seed in (0, 1)
+        ]
+        for path, wall_clock in zip(paths, (0, 1.25), strict=True):
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload["wall_clock_seconds"] = wall_clock
+            path.write_text(json.dumps(payload), encoding="utf-8")
+
+        summary = merge_shards(paths, control_name="upgd_w_control", slope_window=2)
+
+        assert summary["results"][0]["wall_clock_seconds_total"] == 1.25
+
+    def test_merge_rejects_wall_clock_total_overflow(self, tmp_path):
+        paths = [
+            self._write_inband_shard(tmp_path, "upgd_w_control", seed, 0.5)
+            for seed in (0, 1)
+        ]
+        for path in paths:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload["wall_clock_seconds"] = 1e308
+            path.write_text(json.dumps(payload), encoding="utf-8")
+
+        with pytest.raises(ValueError, match="wall_clock_seconds_total must be finite"):
+            merge_shards(paths, control_name="upgd_w_control", slope_window=2)
+
+    def test_confirmation_candidate_requires_two_paired_seeds(self, tmp_path):
+        """One paired seed cannot authorize a confirmation wave."""
+        paths = [
+            self._write_inband_shard(tmp_path, "upgd_w_control", 0, 0.50),
+            self._write_inband_shard(tmp_path, "upgd_l2init", 0, 0.56),
+        ]
+        summary = merge_shards(paths, control_name="upgd_w_control", slope_window=2)
+        result = next(
+            entry for entry in summary["results"] if entry["config_name"] == "upgd_l2init"
+        )
+        paired = result["paired_vs_control"]
+
+        assert paired["seeds"] == [0]
+        assert paired["mean_diff"] > CONFIRMATION_THRESHOLD
+        assert paired["stderr_diff"] == 0.0
+        assert paired["all_seeds_improve"] is True
+        assert paired["beats_control"] is True
+        assert paired["confirmation_candidate"] is False
+
+    def test_confirmation_candidate_allows_two_paired_seeds(self, tmp_path):
+        """Two shared improving seeds preserve the existing decision boundary."""
+        paths = [
+            self._write_inband_shard(tmp_path, "upgd_w_control", 0, 0.50),
+            self._write_inband_shard(tmp_path, "upgd_w_control", 1, 0.50),
+            self._write_inband_shard(tmp_path, "upgd_l2init", 0, 0.56),
+            self._write_inband_shard(tmp_path, "upgd_l2init", 1, 0.56),
+        ]
+        summary = merge_shards(paths, control_name="upgd_w_control", slope_window=2)
+        result = next(
+            entry for entry in summary["results"] if entry["config_name"] == "upgd_l2init"
+        )
+        paired = result["paired_vs_control"]
+
+        assert paired["seeds"] == [0, 1]
+        assert paired["mean_diff"] > CONFIRMATION_THRESHOLD
+        assert paired["confirmation_candidate"] is True
+
+    def test_confirmation_candidate_rejects_mixed_sign_paired_differences(self, tmp_path):
+        """A strong mean cannot hide an aligned seed that regresses."""
+        paths = [
+            self._write_inband_shard(tmp_path, "upgd_w_control", 0, 0.50),
+            self._write_inband_shard(tmp_path, "upgd_w_control", 1, 0.50),
+            self._write_inband_shard(tmp_path, "upgd_l2init", 0, 0.60),
+            self._write_inband_shard(tmp_path, "upgd_l2init", 1, 0.499),
+        ]
+        summary = merge_shards(paths, control_name="upgd_w_control", slope_window=2)
+        result = next(
+            entry for entry in summary["results"] if entry["config_name"] == "upgd_l2init"
+        )
+        paired = result["paired_vs_control"]
+
+        assert paired["seeds"] == [0, 1]
+        assert paired["mean_diff"] > CONFIRMATION_THRESHOLD
+        assert paired["all_seeds_improve"] is False
+        assert paired["confirmation_candidate"] is False
 
     def test_atomic_writer_refuses_duplicate_without_mutating_first_result(
         self, tmp_path: Path
@@ -928,6 +1753,9 @@ class TestShardsAndMerge:
             "proxy_preserves_upgd_over_adamw": accepted,
         }
         monkeypatch.setattr(screening, "validate_proxy", lambda *_args, **_kwargs: report)
+        monkeypatch.setattr(
+            screening, "_screening_derivation_bindings", lambda _paths: None
+        )
         output = tmp_path / f"proxy-{accepted}.json"
 
         status = screening.main(
@@ -943,12 +1771,124 @@ class TestShardsAndMerge:
         assert status == expected_status
         assert json.loads(output.read_text(encoding="utf-8")) == report
 
+    def test_merge_rejects_absent_control(self, tmp_path, small_data):
+        paths = [
+            self._make_shard(tmp_path, small_data, "upgd_l2init", 0),
+            self._make_shard(tmp_path, small_data, "upgd_l2init", 1),
+        ]
+        with pytest.raises(
+            ValueError,
+            match=r"control 'upgd_w_control' is not among the merged shards",
+        ):
+            merge_shards(paths, control_name="upgd_w_control", slope_window=2)
+
+    def test_merge_rejects_typoed_control_name(self, tmp_path, small_data):
+        paths = [
+            self._make_shard(tmp_path, small_data, "upgd_w_control", 0),
+            self._make_shard(tmp_path, small_data, "upgd_l2init", 0),
+        ]
+        with pytest.raises(
+            ValueError,
+            match=r"control 'upgd_w_contrl' is not among the merged shards",
+        ):
+            merge_shards(paths, control_name="upgd_w_contrl", slope_window=2)
+
     def test_merge_rejects_duplicate_seed(self, tmp_path, small_data):
         p1 = self._make_shard(tmp_path, small_data, "upgd_w_control", 0)
         p2 = tmp_path / "dup.json"
         p2.write_text(p1.read_text(encoding="utf-8"), encoding="utf-8")
         with pytest.raises(ValueError, match="duplicate shard"):
             merge_shards([p1, p2], expected_seeds=(0,), slope_window=2)
+
+    def test_merge_rejects_hyperparameter_drift_across_seeds(self, tmp_path):
+        """Two shards under one config_name with different hyperparameters must
+        not merge: nothing else catches a registry value that changed between
+        two `run` invocations, and a silent merge would average per-task
+        accuracy across genuinely different mechanisms while reporting only
+        the first seed's hyperparameters as if representative of the arm."""
+        p0 = self._write_inband_shard(tmp_path, "upgd_w_control", 0, 0.5)
+        p1 = self._write_inband_shard(tmp_path, "upgd_l2init", 0, 0.5)
+        p2 = self._write_inband_shard(tmp_path, "upgd_l2init", 1, 0.5)
+
+        payload2 = json.loads(p2.read_text(encoding="utf-8"))
+        payload2["hyperparameters"] = {
+            **payload2["hyperparameters"],
+            "meta_step_size": 999.0,
+        }
+        p2.write_text(json.dumps(payload2), encoding="utf-8")
+
+        with pytest.raises(
+            ValueError,
+            match=r"'upgd_l2init' has inconsistent hyperparameters across seeds",
+        ):
+            merge_shards([p0, p1, p2], control_name="upgd_w_control", slope_window=2)
+
+    def test_merge_rejects_base_learner_drift_across_seeds(self, tmp_path):
+        p0 = self._write_inband_shard(tmp_path, "upgd_w_control", 0, 0.5)
+        p1 = self._write_inband_shard(tmp_path, "upgd_l2init", 0, 0.5)
+        p2 = self._write_inband_shard(tmp_path, "upgd_l2init", 1, 0.5)
+
+        payload2 = json.loads(p2.read_text(encoding="utf-8"))
+        payload2["base_learner"] = "adamw"
+        p2.write_text(json.dumps(payload2), encoding="utf-8")
+
+        with pytest.raises(
+            ValueError,
+            match=r"'upgd_l2init' has inconsistent base_learner across seeds",
+        ):
+            merge_shards([p0, p1, p2], control_name="upgd_w_control", slope_window=2)
+
+    def test_merge_rejects_environment_drift_and_records_environment(
+        self, tmp_path, small_data
+    ):
+        p0 = self._make_shard(tmp_path, small_data, "upgd_w_control", 0)
+        p1 = self._make_shard(tmp_path, small_data, "upgd_w_control", 1)
+        reference_environment = load_shard(p0)["environment"]
+
+        summary = merge_shards([p0, p1], control_name="upgd_w_control", slope_window=2)
+        assert summary["environment"] == reference_environment
+
+        payload1 = json.loads(p1.read_text(encoding="utf-8"))
+        payload1["environment"] = _test_runtime_environment(machine="different-machine")
+        p1.write_text(json.dumps(payload1), encoding="utf-8")
+
+        with pytest.raises(ValueError, match="shards span multiple runtime environments"):
+            merge_shards([p0, p1], control_name="upgd_w_control", slope_window=2)
+
+    @pytest.mark.parametrize(
+        "environment",
+        [
+            None,
+            {},
+            {"jax": "test", "numpy": "test", "python": "test"},
+            {"jax": "", "numpy": "test", "python": "test", "platform": "test"},
+        ],
+    )
+    def test_load_rejects_incomplete_environment(
+        self, tmp_path, small_data, environment
+    ):
+        path = self._make_shard(tmp_path, small_data, "upgd_w_control", 0)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["environment"] = environment
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+        with pytest.raises(ValueError, match="runtime environment"):
+            load_shard(path)
+
+    @pytest.mark.parametrize(
+        ("fieldname", "bad_value"),
+        [("base_learner", []), ("hyperparameters", "not-an-object")],
+    )
+    def test_load_rejects_invalid_arm_contract_field(
+        self, tmp_path, small_data, fieldname, bad_value
+    ):
+        path = self._make_shard(tmp_path, small_data, "upgd_w_control", 0)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload[fieldname] = bad_value
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+        with pytest.raises(ValueError, match=fieldname):
+            load_shard(path)
 
     def test_validate_proxy_prefix_and_ordering(self, tmp_path, small_data):
         x, y = small_data
@@ -959,9 +1899,23 @@ class TestShardsAndMerge:
         shard_paths = []
         for name, learner in (("upgd_w_control", "upgd_w"), ("adamw_control", "adamw")):
             full = run_ipmnist(x, y, learner, seeds=[0], config=SMALL)
+            reference_payload = {
+                "schema": "upgd_ipmnist.partial.v1",
+                "learner": learner,
+                "hyperparameters": full.hyperparameters,
+                "seeds": [0],
+                "config": {
+                    **full.config.to_config(),
+                    "input_dim": 784,
+                    "n_classes": 10,
+                },
+                "per_task_accuracy": full.per_task_accuracy.tolist(),
+                "per_task_loss": full.per_task_loss.tolist(),
+                "per_task_plasticity": full.per_task_plasticity.tolist(),
+                "wall_clock_seconds": full.wall_clock_seconds,
+            }
             (partials / f"{learner}_seed0.json").write_text(
-                json.dumps({"per_task_accuracy": full.per_task_accuracy.tolist()}),
-                encoding="utf-8",
+                json.dumps(reference_payload), encoding="utf-8"
             )
             proxy = run_screening_config(
                 x, y, screening_spec(name), seed=0, config=IPMNISTConfig(
@@ -970,19 +1924,175 @@ class TestShardsAndMerge:
                 )
             )
             path = shard_dir / f"{name}_seed0.json"
-            path.write_text(json.dumps(shard_payload(proxy)), encoding="utf-8")
+            path.write_text(json.dumps(_bound_shard_payload(proxy)), encoding="utf-8")
             shard_paths.append(path)
         report = validate_proxy(shard_paths, partials, atol=1e-6)
         assert report["all_prefixes_match"] is True
+        assert report["environment"] == load_shard(shard_paths[0])["environment"]
+        assert report["evidence_policy"] == NONPROMOTING_POLICY
+        assert report["source_provenance"] == _test_source_provenance()
+        assert report["dataset_provenance"] == _test_dataset_provenance()
+        assert report["schema"].endswith(".v2")
+        assert len(report["shard_manifest"]) == 2
+        assert len(report["reference_partial_manifest"]) == 2
+        for field in ("shard_manifest", "reference_partial_manifest"):
+            for entry in report[field]:
+                raw = Path(entry["path"]).read_bytes()
+                assert entry["size_bytes"] == len(raw)
+                assert entry["sha256"] == hashlib.sha256(raw).hexdigest()
         for check in report["checks"]:
             assert check["max_abs_per_task_diff"] <= 1e-6
         # ordering flags are booleans (tiny-scale runs may order either way)
         assert isinstance(report["proxy_preserves_upgd_over_adamw"], bool)
         assert isinstance(report["full_prefix_preserves_upgd_over_adamw"], bool)
 
+        changed = json.loads(shard_paths[-1].read_text(encoding="utf-8"))
+        changed["environment"] = _test_runtime_environment(machine="different-machine")
+        changed_path = tmp_path / "changed-environment.json"
+        changed_path.write_text(json.dumps(changed), encoding="utf-8")
+        with pytest.raises(ValueError, match="shards span multiple runtime environments"):
+            validate_proxy([shard_paths[0], changed_path], partials, atol=1e-6)
+
+        reference_payloads = {
+            path.name: json.loads(path.read_text(encoding="utf-8"))
+            for path in partials.iterdir()
+        }
+        tamper_cases = [
+            (
+                "learner",
+                lambda payload: payload.update(learner="adamw"),
+                # Hyperparameter-domain validation may reject the mismatched
+                # learner before the identity comparison does; either refusal
+                # is a correct fail-closed outcome.
+                "does not match expected learner|invalid hyperparameters",
+            ),
+            (
+                "seed",
+                lambda payload: payload.update(seeds=[1]),
+                "reference seeds must equal",
+            ),
+            (
+                "config",
+                lambda payload: payload["config"].update(hidden1=999),
+                "reference config is incompatible",
+            ),
+            (
+                "hyperparameters",
+                lambda payload: payload["hyperparameters"].update(step_size=999.0),
+                "reference hyperparameters do not match",
+            ),
+        ]
+        for case_name, mutate, message in tamper_cases:
+            tampered_dir = tmp_path / f"tampered-{case_name}"
+            tampered_dir.mkdir()
+            for filename, payload in reference_payloads.items():
+                candidate = json.loads(json.dumps(payload))
+                if filename == "upgd_w_seed0.json":
+                    mutate(candidate)
+                (tampered_dir / filename).write_text(
+                    json.dumps(candidate), encoding="utf-8"
+                )
+            with pytest.raises(ValueError, match=message):
+                validate_proxy(shard_paths, tampered_dir, atol=1e-6)
+
+    def test_validate_proxy_rejects_duplicate_control_seed(self, tmp_path, small_data):
+        path = self._make_shard(tmp_path, small_data, "upgd_w_control", 0)
+        with pytest.raises(ValueError, match="duplicate proxy-validation shard"):
+            validate_proxy([path, path], tmp_path)
+
+    def test_validate_proxy_requires_paired_control_seed_sets(
+        self, tmp_path, small_data
+    ):
+        paths = [
+            self._make_shard(tmp_path, small_data, "upgd_w_control", 0),
+            self._make_shard(tmp_path, small_data, "upgd_w_control", 1),
+            self._make_shard(tmp_path, small_data, "adamw_control", 0),
+        ]
+        with pytest.raises(ValueError, match="control seed sets differ"):
+            validate_proxy(paths, tmp_path)
+
+    def test_validate_proxy_rejects_mixed_protocol_configs(self, tmp_path, small_data):
+        upgd = self._make_shard(tmp_path, small_data, "upgd_w_control", 0)
+        adam = self._make_shard(tmp_path, small_data, "adamw_control", 0)
+        changed = json.loads(adam.read_text(encoding="utf-8"))
+        changed["config"] = {**changed["config"], "hidden1": changed["config"]["hidden1"] + 1}
+        changed_path = tmp_path / "changed-config.json"
+        changed_path.write_text(json.dumps(changed), encoding="utf-8")
+
+        with pytest.raises(ValueError, match="multiple protocol configs or horizons"):
+            validate_proxy([upgd, changed_path], tmp_path)
+
+    def test_validate_proxy_rejects_misreported_base_learner(
+        self, tmp_path, small_data
+    ):
+        upgd = self._make_shard(tmp_path, small_data, "upgd_w_control", 0)
+        adam = self._make_shard(tmp_path, small_data, "adamw_control", 0)
+        changed = json.loads(adam.read_text(encoding="utf-8"))
+        changed["base_learner"] = "upgd_w"
+        changed_path = tmp_path / "changed-base.json"
+        changed_path.write_text(json.dumps(changed), encoding="utf-8")
+
+        with pytest.raises(ValueError, match="base_learner must match registered arm 'adamw'"):
+            validate_proxy([upgd, changed_path], tmp_path)
+
+    def test_validate_proxy_rejects_misreported_control_hyperparameters(
+        self, tmp_path, small_data
+    ):
+        upgd = self._make_shard(tmp_path, small_data, "upgd_w_control", 0)
+        adam = self._make_shard(tmp_path, small_data, "adamw_control", 0)
+        changed = json.loads(adam.read_text(encoding="utf-8"))
+        changed["hyperparameters"] = {
+            **changed["hyperparameters"],
+            "step_size": 999.0,
+        }
+        changed_path = tmp_path / "changed-hyperparameters.json"
+        changed_path.write_text(json.dumps(changed), encoding="utf-8")
+
+        with pytest.raises(ValueError, match="hyperparameters must exactly match"):
+            validate_proxy([upgd, changed_path], tmp_path)
+
 
 class TestPoolConfirmation:
     """Screening-only pool-noise mode for full-protocol confirmation runs."""
+
+    @pytest.mark.parametrize(
+        "noise_pool_steps", [None, True, False, np.int64(8), 8.0, "8", 1, 0, -1]
+    )
+    def test_pool_rejects_noncanonical_pool_size_before_data_setup(
+        self, noise_pool_steps: object
+    ) -> None:
+        with pytest.raises(ValueError, match="noise_pool_steps.*built-in integer >= 2"):
+            run_screening_config(
+                np.empty((1, 1), dtype=np.float32),
+                np.empty((1,), dtype=np.int32),
+                screening_spec("upgd_w_control"),
+                seed=0,
+                config=SMALL,
+                noise_mode="pool",
+                noise_pool_steps=noise_pool_steps,  # type: ignore[arg-type]
+            )
+
+    @pytest.mark.parametrize("noise_pool_steps", [None, True, np.int64(8), 8.0, 1])
+    def test_shard_payload_rejects_noncanonical_pool_size(
+        self, noise_pool_steps: object
+    ) -> None:
+        spec = screening_spec("upgd_w_control")
+        result = ipmnist_screening.ScreeningRunResult(
+            config_name=spec.name,
+            base_learner=spec.base_learner,
+            hyperparameters=dict(spec.hyperparameters),
+            seed=0,
+            config=SMALL,
+            per_task_accuracy=np.zeros(SMALL.n_tasks),
+            per_task_loss=np.zeros(SMALL.n_tasks),
+            per_task_plasticity=np.zeros(SMALL.n_tasks),
+            wall_clock_seconds=0.0,
+            noise_mode="pool",
+            noise_pool_steps=noise_pool_steps,  # type: ignore[arg-type]
+        )
+
+        with pytest.raises(ValueError, match="noise_pool_steps"):
+            _bound_shard_payload(result)
 
     def test_pool_control_matches_run_ipmnist_pool(self, small_data):
         """Control arm under pool mode reproduces run_ipmnist's pool chain."""
@@ -996,6 +2106,8 @@ class TestPoolConfirmation:
             noise_mode="pool", noise_pool_steps=8,
         )
         assert ours.noise_mode == "pool"
+        assert ours.noise_pool_steps == 8
+        assert _bound_shard_payload(ours)["noise_pool_steps"] == 8
         np.testing.assert_allclose(
             ours.per_task_accuracy, reference.per_task_accuracy[0], atol=1e-7
         )
@@ -1035,10 +2147,12 @@ class TestPoolConfirmation:
             x, y, screening_spec("upgd_w_localgate"), seed=0, config=SMALL,
             noise_mode="pool", noise_pool_steps=8,
         )
-        exact_payload = shard_payload(exact)
-        pool_payload = shard_payload(pool)
+        exact_payload = _bound_shard_payload(exact)
+        pool_payload = _bound_shard_payload(pool)
         assert exact_payload["noise_mode"] == "step"
+        assert exact_payload["noise_pool_steps"] is None
         assert pool_payload["noise_mode"] == "pool"
+        assert pool_payload["noise_pool_steps"] == 8
         p_exact = tmp_path / "exact.json"
         p_pool = tmp_path / "pool.json"
         p_exact.write_text(json.dumps(exact_payload), encoding="utf-8")
@@ -1055,7 +2169,7 @@ class TestPoolConfirmation:
             noise_mode="pool", noise_pool_steps=8,
         )
         path = tmp_path / "pool.json"
-        path.write_text(json.dumps(shard_payload(pool)), encoding="utf-8")
+        path.write_text(json.dumps(_bound_shard_payload(pool)), encoding="utf-8")
         with pytest.raises(ValueError, match="noise_mode"):
             validate_proxy([path], tmp_path)
 
@@ -1498,6 +2612,20 @@ class TestAlphaUtility:
                 )
             params = new_params
 
+    def test_nonfinite_raw_gradient_does_not_poison_log_alpha(self):
+        params = init_mlp_params(jr.key(0), SMALL)
+        hp = self._hp()
+        init_fn, _ = _make_upgd_alpha_utility_learner(hp)
+        state = init_fn(params)
+        grads = {name: jnp.zeros_like(value) for name, value in params.items()}
+        grads["w1"] = jnp.full_like(params["w1"], jnp.inf)
+        noise = {name: jnp.zeros_like(value) for name, value in params.items()}
+
+        _, guarded = upgd_alpha_utility_update(params, state, grads, noise, hp)
+
+        np.testing.assert_array_equal(guarded.log_alpha["w1"], state.log_alpha["w1"])
+        assert bool(jnp.all(jnp.isfinite(guarded.log_alpha["w1"])))
+
     def test_consistent_gradient_earns_more_protection(self):
         """A weight with a persistent-sign gradient must end with higher
         log-alpha (more protection => smaller applied delta) than a weight
@@ -1611,6 +2739,30 @@ class TestSigma0Frontier:
         np.testing.assert_array_equal(ours.per_task_accuracy, ref.per_task_accuracy)
         np.testing.assert_array_equal(ours.per_task_loss, ref.per_task_loss)
         np.testing.assert_array_equal(ours.per_task_plasticity, ref.per_task_plasticity)
+
+    def test_ext_defaults_lower_to_identical_hlo(self):
+        """At inert defaults the extension factory compiles to the same graph
+        as upgd_ema_norm_sigma0's factory.  Identical lowered HLO leaves XLA
+        no fusion or reassociation freedom, so derived float32 metrics cannot
+        drift between the two factories on any backend — value equality alone
+        does not guarantee this (issue #46)."""
+        base = screening_spec("upgd_ema_norm_sigma0")
+        params = init_mlp_params(jr.key(11), SMALL)
+        x = jr.normal(jr.key(12), (SMALL.input_dim,))
+        y = jnp.array(1, jnp.int32)
+        key = jr.key(13)
+
+        def lowered_text(factory, hp):
+            init_fn, step_fn = factory(hp)
+            jitted = jax.jit(lambda p, s, xx, yy, k: step_fn(p, s, xx, yy, k))
+            return jitted.lower(params, init_fn(params), x, y, key).as_text()
+
+        ref = lowered_text(_make_upgd_ema_norm_learner, base.hyperparameters)
+        ext = lowered_text(
+            _make_upgd_ema_norm_ext_learner,
+            {**base.hyperparameters, **self.EXT_DEFAULTS},
+        )
+        assert ref == ext
 
     def test_key_is_unused_on_every_arm(self):
         """sigma0 arms consume no randomness: different RNG keys, same step."""
@@ -3001,6 +4153,134 @@ class TestOptimizerFloorHybrids:
             ), name
 
 
+class TestGatedL2Init:
+    """``sigma0_ndecay099_gated_l2init``: an additive, utility-gated pull
+    toward the initial weights on top of a historical comparison baseline (ported CCBP /
+    Calibrated-Partial-Resets-style graded reset; see
+    :func:`alberta_framework.benchmarks.ipmnist_screening._make_sigma0_gated_l2init_learner`)."""
+
+    def test_registry_binds_ema_frozen_probe_input(self):
+        spec = screening_spec("sigma0_ndecay099_gated_l2init")
+        assert spec.frozen_probe_input is _ema_frozen_probe_input
+
+    def test_pull_scale_zero_reduces_to_sigma0_ndecay099_bitwise(self):
+        """``l2init_pull_scale=0`` collapses the additive pull term to
+        exactly zero, so the trajectory equals the ``sigma0_ndecay099``
+        champion bit-for-bit (same normalizer, same gate, same decay)."""
+        hp = dict(screening_spec("sigma0_ndecay099_gated_l2init").hyperparameters)
+        hp["l2init_pull_scale"] = 0.0
+        init_fn, step_fn = _make_sigma0_gated_l2init_learner(hp)
+        champion = screening_spec("sigma0_ndecay099")
+        init_ref, step_ref = champion.factory(champion.hyperparameters)
+        params = init_mlp_params(jr.key(29), SMALL)
+        s_ours = init_fn(params)
+        s_ref = init_ref(params)
+        p_ours = p_ref = params
+        key = jr.key(43)
+        for i in range(5):
+            x = jr.normal(jr.fold_in(key, i), (SMALL.input_dim,)) + 0.1
+            y = jnp.array(i % SMALL.n_classes, jnp.int32)
+            p_ours, s_ours, _ = step_fn(p_ours, s_ours, x, y, jr.key(600 + i))
+            p_ref, s_ref, _ = step_ref(p_ref, s_ref, x, y, jr.key(600 + i))
+            for n in p_ours:
+                np.testing.assert_array_equal(
+                    np.asarray(p_ours[n]), np.asarray(p_ref[n]), err_msg=n
+                )
+
+    def test_registered_pull_scale_hand_computed(self):
+        """The registered arm equals a hand-computed normalize -> grad ->
+        gate -> ``w*(1-lr*wd) - lr*pull_scale*(1-gate)*(w-w0) -
+        lr*(1-gate)*grad`` trajectory, bit for bit."""
+        hp = screening_spec("sigma0_ndecay099_gated_l2init").hyperparameters
+        assert hp["l2init_pull_scale"] == 0.01
+        init_fn, step_fn = _make_sigma0_gated_l2init_learner(hp)
+        params = init_mlp_params(jr.key(14), SMALL)
+        w0 = {n: v for n, v in params.items()}
+        state = init_fn(params)
+        ref_params = params
+        ref_utility = {n: jnp.zeros_like(v) for n, v in params.items()}
+        norm_state = EMANormState(
+            mean=jnp.zeros(SMALL.input_dim),
+            var=jnp.ones(SMALL.input_dim),
+            count=jnp.array(0.0),
+        )
+        key = jr.key(15)
+        for i in range(4):
+            x = jr.normal(jr.fold_in(key, i), (SMALL.input_dim,)) * 2.0 + 0.5
+            y = jnp.array(i % SMALL.n_classes, jnp.int32)
+            params, state, _ = step_fn(params, state, x, y, jr.key(500 + i))
+            x_norm, norm_state = ema_normalize(
+                norm_state, x, hp["norm_decay"], hp["norm_epsilon"]
+            )
+            _, grads = jax.value_and_grad(cross_entropy_loss, has_aux=True)(
+                ref_params, x_norm, y
+            )
+            beta = hp["utility_decay"]
+            ref_utility = {
+                n: beta * ref_utility[n] + (1.0 - beta) * (-grads[n] * ref_params[n])
+                for n in ref_params
+            }
+            count = i + 1
+            bias_correction = 1.0 - beta**count
+            global_max = jnp.max(
+                jnp.stack([jnp.max(ref_utility[n]) for n in sorted(ref_params)])
+            )
+            new_ref: dict[str, jnp.ndarray] = {}
+            for n in ref_params:
+                gate = jax.nn.sigmoid((ref_utility[n] / bias_correction) / global_max)
+                pull = hp["l2init_pull_scale"] * (1.0 - gate) * (ref_params[n] - w0[n])
+                new_ref[n] = (
+                    ref_params[n] * (1.0 - hp["step_size"] * hp["weight_decay"])
+                    - hp["step_size"] * pull
+                    - hp["step_size"] * (grads[n] * (1.0 - gate))
+                )
+            ref_params = new_ref
+            for n in ref_params:
+                # Independently reordered floating-point ops (this hand
+                # derivation vs. the factory's fused expression) can diverge
+                # by a few ULP even when both implement the identical
+                # equation; the bit-exact contract lives in
+                # test_pull_scale_zero_reduces_to_sigma0_ndecay099_bitwise,
+                # which calls the champion's own reduction path directly.
+                np.testing.assert_allclose(
+                    np.asarray(params[n]),
+                    np.asarray(ref_params[n]),
+                    atol=1e-6,
+                    rtol=1e-5,
+                    err_msg=n,
+                )
+
+    def test_nonzero_pull_diverges_from_champion_and_stays_finite(self, small_data):
+        """The registered arm's trajectory differs from the champion's and
+        remains finite over a tiny-protocol smoke run."""
+        x, y = small_data
+        champion = run_screening_config(
+            x, y, screening_spec("sigma0_ndecay099"), seed=19, config=SMALL
+        )
+        result = run_screening_config(
+            x, y, screening_spec("sigma0_ndecay099_gated_l2init"), seed=19, config=SMALL
+        )
+        assert np.all(np.isfinite(result.per_task_accuracy))
+        assert np.all(np.isfinite(result.per_task_loss))
+        assert not np.array_equal(result.per_task_loss, champion.per_task_loss)
+
+    def test_key_is_unused_for_no_extra_randomness(self):
+        """The arm draws no perturbation noise (noise_std=0 by inheritance
+        from ``_sigma0_ext_hp``): different RNG keys must still reach an
+        identical result via the shared per-step noise draw's sigma=0
+        short-circuit."""
+        params = init_mlp_params(jr.key(3), SMALL)
+        x = jr.normal(jr.key(90), (SMALL.input_dim,))
+        y = jnp.array(2, jnp.int32)
+        spec = screening_spec("sigma0_ndecay099_gated_l2init")
+        init_fn, step_fn = spec.factory(spec.hyperparameters)
+        state = init_fn(params)
+        p_a, _, _ = step_fn(params, state, x, y, jr.key(0))
+        p_b, _, _ = step_fn(params, state, x, y, jr.key(987654))
+        for n in params:
+            np.testing.assert_array_equal(np.asarray(p_a[n]), np.asarray(p_b[n]), err_msg=n)
+
+
 class TestComparisonArms:
     """Reviewer comparison rows: published plasticity mechanisms behind the
     champion's EMA input conditioning (decay 0.99) on a plain-SGD base — no
@@ -3636,13 +4916,19 @@ class TestDiscoveredRuleFactory:
     def test_discovered_arms_registered(self, name, flags, lr):
         from alberta_framework.benchmarks.ipmnist_screening import (
             _ema_frozen_probe_input,
+            _hidden_rms_frozen_probe_input,
             _make_discovered_rule_learner,
         )
 
         spec = screening_spec(name)
         assert spec.mechanism == "discovered_rule"
         assert spec.factory is _make_discovered_rule_learner
-        assert spec.frozen_probe_input is _ema_frozen_probe_input
+        expected_probe = (
+            _hidden_rms_frozen_probe_input
+            if flags["flag_hidden_rms"] != 0.0
+            else _ema_frozen_probe_input
+        )
+        assert spec.frozen_probe_input is expected_probe
         assert spec.hyperparameters["step_size"] == pytest.approx(lr, rel=1e-12)
         for key, value in flags.items():
             assert spec.hyperparameters[key] == value
@@ -3961,6 +5247,210 @@ class TestRLSHead:
                 np.asarray(rls_state.norm.count), np.asarray(champ_state.norm.count)
             )
 
+    def test_gate_scale_one_is_bitexact_legacy_incumbent(self):
+        """The explicit gate-on endpoint must preserve the pre-ablation
+        incumbent trajectory, including every carried state and metric bit."""
+        from alberta_framework.benchmarks.ipmnist_screening import (
+            _make_rls_head_learner,
+        )
+
+        incumbent = {
+            "rls_lambda": 1.0,
+            "rls_reset_frac": 0.05,
+            "head_resid": 1.0,
+        }
+        legacy_hp = self._hp(**incumbent)
+        assert legacy_hp["gate_scale"] == 1.0
+        legacy_hp.pop("gate_scale")
+        legacy_init, legacy_step = _make_rls_head_learner(legacy_hp)
+        gated_init, gated_step = self._factory(**incumbent, gate_scale=1.0)
+        params = init_mlp_params(jr.key(31), SMALL)
+        legacy_params = gated_params = params
+        legacy_state, gated_state = legacy_init(params), gated_init(params)
+        xs, ys = self._stream(n_steps=10, seed=37)
+        for step, (x, y) in enumerate(zip(xs, ys)):
+            legacy_params, legacy_state, legacy_metrics = legacy_step(
+                legacy_params, legacy_state, x, y, jr.key(step)
+            )
+            gated_params, gated_state, gated_metrics = gated_step(
+                gated_params, gated_state, x, y, jr.key(step)
+            )
+            for name in sorted(params):
+                np.testing.assert_array_equal(
+                    np.asarray(gated_params[name]), np.asarray(legacy_params[name]), name
+                )
+                np.testing.assert_array_equal(
+                    np.asarray(gated_state.utility[name]),
+                    np.asarray(legacy_state.utility[name]),
+                    name,
+                )
+            for field in ("step", "fast_mean", "p", "wout"):
+                np.testing.assert_array_equal(
+                    np.asarray(getattr(gated_state, field)),
+                    np.asarray(getattr(legacy_state, field)),
+                    field,
+                )
+            for field in ("mean", "var", "count"):
+                np.testing.assert_array_equal(
+                    np.asarray(getattr(gated_state.norm, field)),
+                    np.asarray(getattr(legacy_state.norm, field)),
+                    f"norm.{field}",
+                )
+            for actual, expected in zip(gated_metrics, legacy_metrics):
+                np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
+
+    @pytest.mark.parametrize("gate_scale", [-1.0, 0.25, 0.5, 2.0, math.nan])
+    def test_gate_scale_rejects_non_endpoint_values(self, gate_scale):
+        with pytest.raises(ValueError, match="gate_scale"):
+            self._factory(head_resid=1.0, gate_scale=gate_scale)
+
+    def test_gate_off_requires_residual_body(self):
+        with pytest.raises(ValueError, match="residual"):
+            self._factory(gate_scale=0.0)
+
+    def test_gate_off_two_step_plain_sgd_and_identical_head(self):
+        """The ablation does only decayed SGD on the residual body.
+
+        Step one has a zero residual-body gradient because the readout starts
+        at zero, so the gated incumbent and ablation enter step two with the
+        same body.  Their RLS transitions must therefore remain bit-identical
+        for both steps, while the second ablation body update follows the
+        explicit chain-rule gradient and carries no utility clock or EMA.
+        """
+        params = {
+            "w1": jnp.full((SMALL.input_dim, SMALL.hidden1), 0.01, jnp.float32),
+            "b1": jnp.full((SMALL.hidden1,), 0.5, jnp.float32),
+            "w2": jnp.full((SMALL.hidden1, SMALL.hidden2), 0.02, jnp.float32),
+            "b2": jnp.full((SMALL.hidden2,), 0.5, jnp.float32),
+            "w3": jnp.full((SMALL.hidden2, SMALL.n_classes), 0.03, jnp.float32),
+            "b3": jnp.full((SMALL.n_classes,), 0.04, jnp.float32),
+        }
+        overrides = {
+            "rls_lambda": 1.0,
+            "rls_reset_frac": 0.05,
+            "head_resid": 1.0,
+        }
+        plain_init, plain_step = self._factory(**overrides, gate_scale=0.0)
+        gated_init, gated_step = self._factory(**overrides, gate_scale=1.0)
+        plain_state, gated_state = plain_init(params), gated_init(params)
+        plain_params = gated_params = params
+        expected_params = {name: jnp.asarray(value) for name, value in params.items()}
+        expected_norm = plain_state.norm
+        expected_fast = plain_state.fast_mean
+        expected_p = plain_state.p
+        expected_wout = plain_state.wout
+        hp = self._hp(**overrides, gate_scale=0.0)
+        decay = jnp.asarray(
+            1.0 - hp["step_size"] * hp["weight_decay"], jnp.float32
+        )
+        scale = jnp.asarray(
+            1.0 / math.sqrt(SMALL.hidden2 + 1), dtype=jnp.float32
+        )
+        xs = (
+            jnp.linspace(0.2, 1.3, SMALL.input_dim, dtype=jnp.float32),
+            jnp.linspace(1.1, 0.1, SMALL.input_dim, dtype=jnp.float32),
+        )
+        ys = (jnp.array(0, jnp.int32), jnp.array(1, jnp.int32))
+
+        for step, (x, y) in enumerate(zip(xs, ys)):
+            x_norm, expected_norm, expected_fast, shifted = shift_adaptive_normalize(
+                expected_norm,
+                expected_fast,
+                x,
+                decay=hp["norm_decay"],
+                fast_decay=hp["fast_decay"],
+                epsilon=hp["norm_epsilon"],
+                shift_k=hp["shift_k"],
+                shift_delta=hp["shift_delta"],
+                shift_refractory=hp["shift_refractory"],
+            )
+            assert not bool(jnp.any(shifted))
+            z1 = x_norm @ expected_params["w1"] + expected_params["b1"]
+            a1 = jax.nn.relu(z1)
+            z2 = a1 @ expected_params["w2"] + expected_params["b2"]
+            a2 = jax.nn.relu(z2)
+            phi = jnp.concatenate([a2 * scale, jnp.ones((1,), jnp.float32)])
+            logits = expected_wout.T @ phi
+            target = jax.nn.one_hot(y, SMALL.n_classes, dtype=jnp.float32)
+            dlogits = logits - target
+            dphi = expected_wout @ dlogits
+            dz2 = (dphi[:-1] * scale) * (z2 > 0.0)
+            grads = {
+                "w2": jnp.outer(a1, dz2),
+                "b2": dz2,
+            }
+            dz1 = (expected_params["w2"] @ dz2) * (z1 > 0.0)
+            grads["w1"] = jnp.outer(x_norm, dz1)
+            grads["b1"] = dz1
+            for name in ("w1", "b1", "w2", "b2"):
+                expected_params[name] = (
+                    expected_params[name] * decay - hp["step_size"] * grads[name]
+                )
+
+            err = target - logits
+            pp = expected_p @ phi
+            gain = pp / (hp["rls_lambda"] + phi @ pp)
+            expected_wout = expected_wout + jnp.outer(gain, err)
+            expected_p = (expected_p - jnp.outer(gain, pp)) / hp["rls_lambda"]
+            expected_p = 0.5 * (expected_p + expected_p.T)
+
+            plain_params, plain_state, plain_metrics = plain_step(
+                plain_params, plain_state, x, y, jr.key(step)
+            )
+            gated_params, gated_state, gated_metrics = gated_step(
+                gated_params, gated_state, x, y, jr.key(step)
+            )
+            for name in ("w1", "b1", "w2", "b2"):
+                np.testing.assert_allclose(
+                    np.asarray(plain_params[name]),
+                    np.asarray(expected_params[name]),
+                    rtol=0.0,
+                    atol=2e-7,
+                    err_msg=name,
+                )
+            for name in ("w3", "b3"):
+                np.testing.assert_array_equal(
+                    np.asarray(plain_params[name]), np.asarray(params[name]), name
+                )
+            np.testing.assert_array_equal(
+                np.asarray(plain_state.p), np.asarray(expected_p)
+            )
+            np.testing.assert_array_equal(
+                np.asarray(plain_state.wout), np.asarray(expected_wout)
+            )
+            np.testing.assert_array_equal(
+                np.asarray(plain_state.p), np.asarray(gated_state.p)
+            )
+            np.testing.assert_array_equal(
+                np.asarray(plain_state.wout), np.asarray(gated_state.wout)
+            )
+            np.testing.assert_array_equal(
+                np.asarray(plain_state.fast_mean), np.asarray(expected_fast)
+            )
+            np.testing.assert_array_equal(
+                np.asarray(plain_state.fast_mean), np.asarray(gated_state.fast_mean)
+            )
+            for field in ("mean", "var", "count"):
+                np.testing.assert_array_equal(
+                    np.asarray(getattr(plain_state.norm, field)),
+                    np.asarray(getattr(expected_norm, field)),
+                    f"norm.{field}",
+                )
+                np.testing.assert_array_equal(
+                    np.asarray(getattr(plain_state.norm, field)),
+                    np.asarray(getattr(gated_state.norm, field)),
+                    f"gated norm.{field}",
+                )
+            for actual, expected in zip(plain_metrics, gated_metrics):
+                np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
+            assert int(plain_state.step) == 0
+            for name in sorted(params):
+                assert not np.any(np.asarray(plain_state.utility[name])), name
+
+        assert not np.array_equal(
+            np.asarray(plain_params["w1"]), np.asarray(gated_params["w1"])
+        )
+
     def test_infinite_ridge_is_frozen_degenerate_head(self):
         """Reduction pin: rls_ridge_init=inf gives P=0 exactly, so the head
         never updates (wout stays 0), every prediction is the constant argmax
@@ -4203,14 +5693,18 @@ class TestRLSHead:
         )
         assert bool(jnp.all(jnp.isfinite(new_state.p)))
 
-    def test_smoke_runs_above_chance_both_modes(self):
+    def test_smoke_runs_above_chance_all_body_modes(self):
         x, y = self._learnable_stream()
         config = IPMNISTConfig(
             n_tasks=2, task_length=200, input_dim=12, hidden1=8, hidden2=6, n_classes=5
         )
         from alberta_framework.benchmarks.ipmnist_screening import _rls_head_hp
 
-        for overrides in ({}, {"head_resid": 1.0}):
+        for overrides in (
+            {},
+            {"head_resid": 1.0},
+            {"head_resid": 1.0, "gate_scale": 0.0},
+        ):
             spec = ScreeningSpec(
                 name="rls_head_smoke",
                 base_learner="upgd_w",
@@ -4356,6 +5850,15 @@ class TestRLSHead:
             "rls_head_resid_l1_preset005": {
                 "rls_lambda": 1.0, "rls_reset_frac": 0.05, "head_resid": 1.0
             },
+            "rls_head_resid_l1_noreset": {
+                "rls_lambda": 1.0, "rls_reset_frac": 2.0, "head_resid": 1.0
+            },
+            "rls_head_resid_l1_preset005_nogate": {
+                "rls_lambda": 1.0,
+                "rls_reset_frac": 0.05,
+                "head_resid": 1.0,
+                "gate_scale": 0.0,
+            },
             # Wave 3 — ridge star (2-task seed-0 diagnostic: smaller initial
             # ridge = larger early/post-reset gains; .8328/.8465/.853/.8578/
             # .8596 for ridge 1.0/0.3/0.1/0.03/0.01, monotone), plus the
@@ -4401,6 +5904,433 @@ class TestRLSHead:
             assert hp["shift_k"] == pytest.approx(1.0), name
             assert hp["shift_delta"] == pytest.approx(0.02), name
             assert hp["noise_std"] == 0.0, name
+        incumbent_hp = screening_spec(
+            "rls_head_resid_l1_preset005"
+        ).hyperparameters
+        nogate_hp = screening_spec(
+            "rls_head_resid_l1_preset005_nogate"
+        ).hyperparameters
+        assert nogate_hp == {**incumbent_hp, "gate_scale": 0.0}
+
+
+class TestRLSHeadNoReset:
+    """Issue #184's code-only detector-reset ablation endpoint."""
+
+    @staticmethod
+    def _assert_tree_equal(actual, expected):
+        actual_leaves, actual_tree = jax.tree_util.tree_flatten(actual)
+        expected_leaves, expected_tree = jax.tree_util.tree_flatten(expected)
+        assert actual_tree == expected_tree
+        assert len(actual_leaves) == len(expected_leaves)
+        for actual_leaf, expected_leaf in zip(actual_leaves, expected_leaves, strict=True):
+            np.testing.assert_array_equal(
+                np.asarray(actual_leaf), np.asarray(expected_leaf)
+            )
+
+    def test_registry_differs_from_incumbent_only_at_reset_fraction(self):
+        incumbent = screening_spec("rls_head_resid_l1_preset005")
+        candidate = screening_spec("rls_head_resid_l1_noreset")
+        assert candidate.base_learner == incumbent.base_learner == "upgd_w"
+        assert candidate.mechanism == incumbent.mechanism == "rls_readout"
+        assert candidate.factory is incumbent.factory
+        assert candidate.frozen_probe_input is incumbent.frozen_probe_input
+        assert candidate.noise_update is incumbent.noise_update is None
+        assert candidate.hyperparameters == {
+            **incumbent.hyperparameters,
+            "rls_reset_frac": 2.0,
+        }
+        assert {
+            name
+            for name in incumbent.hyperparameters
+            if incumbent.hyperparameters[name] != candidate.hyperparameters[name]
+        } == {"rls_reset_frac"}
+
+    @pytest.mark.parametrize("compiled", [False, True])
+    def test_pretrigger_trajectory_is_bitexact_incumbent(self, compiled):
+        incumbent = screening_spec("rls_head_resid_l1_preset005")
+        candidate = screening_spec("rls_head_resid_l1_noreset")
+        incumbent_init, incumbent_step = incumbent.factory(incumbent.hyperparameters)
+        candidate_init, candidate_step = candidate.factory(candidate.hyperparameters)
+        if compiled:
+            incumbent_step = jax.jit(incumbent_step)
+            candidate_step = jax.jit(candidate_step)
+
+        params = init_mlp_params(jr.key(184), SMALL)
+        incumbent_params = candidate_params = params
+        incumbent_state = incumbent_init(params)
+        candidate_state = candidate_init(params)
+        xs = [
+            jnp.linspace(0.05 * i, 0.05 * i + 0.3, SMALL.input_dim, dtype=jnp.float32)
+            for i in range(1, 7)
+        ]
+        ys = [jnp.array(i % SMALL.n_classes, jnp.int32) for i in range(6)]
+        for step, (x, y) in enumerate(zip(xs, ys)):
+            incumbent_out = incumbent_step(
+                incumbent_params, incumbent_state, x, y, jr.key(step)
+            )
+            candidate_out = candidate_step(
+                candidate_params, candidate_state, x, y, jr.key(step)
+            )
+            self._assert_tree_equal(candidate_out, incumbent_out)
+            incumbent_params, incumbent_state, _ = incumbent_out
+            candidate_params, candidate_state, _ = candidate_out
+
+    @pytest.mark.parametrize("compiled", [False, True])
+    def test_forced_trigger_resets_only_incumbent_covariance(self, compiled):
+        incumbent = screening_spec("rls_head_resid_l1_preset005")
+        candidate = screening_spec("rls_head_resid_l1_noreset")
+        incumbent_init, incumbent_step = incumbent.factory(incumbent.hyperparameters)
+        candidate_init, candidate_step = candidate.factory(candidate.hyperparameters)
+        if compiled:
+            incumbent_step = jax.jit(incumbent_step)
+            candidate_step = jax.jit(candidate_step)
+
+        params = init_mlp_params(jr.key(185), SMALL)
+        state = incumbent_init(params)
+        candidate_state = candidate_init(params)
+        self._assert_tree_equal(candidate_state, state)
+        mature = replace(
+            state,
+            norm=replace(
+                state.norm,
+                mean=jnp.zeros(SMALL.input_dim, jnp.float32),
+                var=jnp.full((SMALL.input_dim,), 1e-4, jnp.float32),
+                count=jnp.full((SMALL.input_dim,), 1000.0, jnp.float32),
+            ),
+            fast_mean=jnp.zeros(SMALL.input_dim, jnp.float32),
+        )
+        x_shift = jnp.full((SMALL.input_dim,), 10.0, jnp.float32)
+        y = jnp.array(2, jnp.int32)
+        incumbent_out = incumbent_step(params, mature, x_shift, y, jr.key(0))
+        candidate_out = candidate_step(params, mature, x_shift, y, jr.key(0))
+        incumbent_params, incumbent_state, incumbent_metrics = incumbent_out
+        candidate_params, candidate_state, candidate_metrics = candidate_out
+
+        self._assert_tree_equal(candidate_params, incumbent_params)
+        self._assert_tree_equal(candidate_metrics, incumbent_metrics)
+        np.testing.assert_array_equal(
+            np.asarray(candidate_state.wout), np.asarray(incumbent_state.wout)
+        )
+        ridge = incumbent.hyperparameters["rls_ridge_init"]
+        expected_reset = np.eye(mature.p.shape[0], dtype=np.float32) / ridge
+        np.testing.assert_array_equal(np.asarray(incumbent_state.p), expected_reset)
+        assert not np.array_equal(np.asarray(candidate_state.p), expected_reset)
+        assert not np.array_equal(np.asarray(candidate_state.p), np.asarray(mature.p))
+        assert np.any(np.asarray(candidate_state.wout))
+
+        x_norm, _, _, shifted = shift_adaptive_normalize(
+            mature.norm,
+            mature.fast_mean,
+            x_shift,
+            decay=incumbent.hyperparameters["norm_decay"],
+            fast_decay=incumbent.hyperparameters["fast_decay"],
+            epsilon=incumbent.hyperparameters["norm_epsilon"],
+            shift_k=incumbent.hyperparameters["shift_k"],
+            shift_delta=incumbent.hyperparameters["shift_delta"],
+            shift_refractory=incumbent.hyperparameters["shift_refractory"],
+        )
+        assert bool(jnp.all(shifted))
+        a1 = jax.nn.relu(x_norm @ params["w1"] + params["b1"])
+        a2 = jax.nn.relu(a1 @ params["w2"] + params["b2"])
+        phi = jnp.concatenate(
+            [
+                a2 / math.sqrt(SMALL.hidden2 + 1),
+                jnp.ones((1,), jnp.float32),
+            ]
+        )
+        pp = mature.p @ phi
+        gain = pp / (incumbent.hyperparameters["rls_lambda"] + phi @ pp)
+        expected_p = mature.p - jnp.outer(gain, pp)
+        expected_p = 0.5 * (expected_p + expected_p.T)
+        np.testing.assert_allclose(
+            np.asarray(candidate_state.p), np.asarray(expected_p), rtol=1e-6, atol=1e-7
+        )
+
+        for field in ("utility", "step", "norm", "fast_mean"):
+            self._assert_tree_equal(
+                getattr(candidate_state, field), getattr(incumbent_state, field)
+            )
+
+
+class TestRLSHeadL2Init:
+    """Issue #14's body-only L2-to-initialization code prerequisite."""
+
+    _BODY = ("w1", "b1", "w2", "b2")
+
+    @staticmethod
+    def _assert_tree_equal(actual, expected):
+        actual_leaves, actual_tree = jax.tree_util.tree_flatten(actual)
+        expected_leaves, expected_tree = jax.tree_util.tree_flatten(expected)
+        assert actual_tree == expected_tree
+        assert len(actual_leaves) == len(expected_leaves)
+        for actual_leaf, expected_leaf in zip(actual_leaves, expected_leaves, strict=True):
+            np.testing.assert_array_equal(
+                np.asarray(actual_leaf), np.asarray(expected_leaf)
+            )
+
+    @staticmethod
+    def _manual_params() -> dict[str, jax.Array]:
+        return {
+            "w1": jnp.full((SMALL.input_dim, SMALL.hidden1), 0.05, jnp.float32),
+            "b1": jnp.full((SMALL.hidden1,), 0.10, jnp.float32),
+            "w2": jnp.full((SMALL.hidden1, SMALL.hidden2), 0.04, jnp.float32),
+            "b2": jnp.full((SMALL.hidden2,), 0.10, jnp.float32),
+            "w3": jnp.full((SMALL.hidden2, SMALL.n_classes), 0.03, jnp.float32),
+            "b3": jnp.full((SMALL.n_classes,), 0.02, jnp.float32),
+        }
+
+    def test_registry_is_exactly_incumbent_plus_frozen_endpoint(self):
+        from alberta_framework.benchmarks.ipmnist_screening import (
+            RLSHeadL2InitState,
+            RLSHeadState,
+            _make_rls_head_l2init_learner,
+            _rls_head_frozen_probe_input,
+        )
+
+        incumbent = screening_spec("rls_head_resid_l1_preset005")
+        candidate = screening_spec("rls_head_resid_l1_preset005_l2init")
+        assert candidate.base_learner == incumbent.base_learner == "upgd_w"
+        assert candidate.mechanism == incumbent.mechanism == "rls_readout"
+        assert candidate.factory is _make_rls_head_l2init_learner
+        assert candidate.frozen_probe_input is _rls_head_frozen_probe_input
+        assert candidate.noise_update is None
+        assert candidate.hyperparameters == {
+            **incumbent.hyperparameters,
+            "decay_to_init": 1.0,
+        }
+
+        params = self._manual_params()
+        incumbent_state = incumbent.factory(incumbent.hyperparameters)[0](params)
+        candidate_state = candidate.factory(candidate.hyperparameters)[0](params)
+        assert type(incumbent_state) is RLSHeadState
+        assert not hasattr(incumbent_state, "init_params")
+        assert type(candidate_state) is RLSHeadL2InitState
+        assert set(candidate_state.init_params) == set(self._BODY)
+        for name in self._BODY:
+            np.testing.assert_array_equal(
+                np.asarray(candidate_state.init_params[name]), np.asarray(params[name])
+            )
+        for field in ("utility", "step", "norm", "fast_mean", "p", "wout"):
+            self._assert_tree_equal(
+                jax.device_get(getattr(candidate_state, field)),
+                jax.device_get(getattr(incumbent_state, field)),
+            )
+
+    def test_factory_rejects_every_nonfrozen_config(self):
+        from alberta_framework.benchmarks.ipmnist_screening import (
+            _make_rls_head_l2init_learner,
+            _rls_head_l2init_hp,
+        )
+
+        expected = _rls_head_l2init_hp()
+        invalid = []
+        without_endpoint = dict(expected)
+        without_endpoint.pop("decay_to_init")
+        invalid.append(without_endpoint)
+        invalid.extend(
+            [
+                {**expected, "decay_to_init": 0.0},
+                {**expected, "decay_to_init": True},
+                {**expected, "step_size": 0.02},
+                {**expected, "rls_lambda": 1},
+                {**expected, "noise_std": -0.0},
+                {**expected, "unexpected": 0.0},
+            ]
+        )
+        for hp in invalid:
+            with pytest.raises(ValueError, match="frozen L2-Init configuration"):
+                _make_rls_head_l2init_learner(hp)
+
+        _make_rls_head_l2init_learner(expected)
+
+    def test_body_and_rls_updates_match_equations_and_freeze_sgd_head(self):
+        import dataclasses
+
+        from alberta_framework.benchmarks.ipmnist_screening import (
+            _make_rls_head_l2init_learner,
+            _rls_head_l2init_hp,
+        )
+
+        hp = _rls_head_l2init_hp()
+        init_fn, step_fn = _make_rls_head_l2init_learner(hp)
+        init_params = self._manual_params()
+        state = init_fn(init_params)
+        params = dict(init_params)
+        for index, name in enumerate(self._BODY, start=1):
+            params[name] = init_params[name] + jnp.asarray(
+                0.01 * index, dtype=jnp.float32
+            )
+
+        m = SMALL.hidden2 + 1
+        wout = jnp.linspace(
+            -0.2, 0.3, m * SMALL.n_classes, dtype=jnp.float32
+        ).reshape((m, SMALL.n_classes))
+        state = dataclasses.replace(
+            state,
+            p=jnp.eye(m, dtype=jnp.float32) * 0.7,
+            wout=wout,
+        )
+        x = jnp.linspace(0.1, 0.4, SMALL.input_dim, dtype=jnp.float32)
+        y = jnp.asarray(2, dtype=jnp.int32)
+
+        x_norm, expected_norm, expected_fast, shifted = shift_adaptive_normalize(
+            state.norm,
+            state.fast_mean,
+            x,
+            decay=hp["norm_decay"],
+            fast_decay=hp["fast_decay"],
+            epsilon=hp["norm_epsilon"],
+            shift_k=hp["shift_k"],
+            shift_delta=hp["shift_delta"],
+            shift_refractory=hp["shift_refractory"],
+        )
+        assert not bool(jnp.any(shifted))
+
+        body = {name: params[name] for name in self._BODY}
+
+        def residual_loss(
+            body_params: dict[str, jax.Array],
+        ) -> jax.Array:
+            merged = dict(params)
+            merged.update(body_params)
+            a1 = jax.nn.relu(x_norm @ merged["w1"] + merged["b1"])
+            a2 = jax.nn.relu(a1 @ merged["w2"] + merged["b2"])
+            phi = jnp.concatenate(
+                [
+                    a2 * (1.0 / math.sqrt(m)),
+                    jnp.ones((1,), dtype=jnp.float32),
+                ]
+            )
+            logits = state.wout.T @ phi
+            target = jax.nn.one_hot(y, SMALL.n_classes, dtype=jnp.float32)
+            error = target - logits
+            return 0.5 * jnp.sum(error * error)
+
+        grads = jax.grad(residual_loss)(body)
+        count = state.step + jnp.asarray(1, dtype=jnp.int32)
+        utility = dict(state.utility)
+        for name in self._BODY:
+            utility[name] = hp["utility_decay"] * state.utility[name] + (
+                1.0 - hp["utility_decay"]
+            ) * (-grads[name] * params[name])
+        bias_correction = 1.0 - jnp.power(
+            jnp.asarray(hp["utility_decay"], dtype=jnp.float32),
+            count.astype(jnp.float32),
+        )
+        global_max = jnp.max(
+            jnp.stack([jnp.max(utility[name]) for name in sorted(self._BODY)])
+        )
+        global_max = jnp.where(global_max == 0.0, 1.0, global_max)
+        expected_params = dict(params)
+        for name in self._BODY:
+            gated_gradient = grads[name] * (
+                1.0
+                - jax.nn.sigmoid((utility[name] / bias_correction) / global_max)
+            )
+            expected_params[name] = (
+                params[name]
+                - hp["step_size"]
+                * hp["weight_decay"]
+                * (params[name] - state.init_params[name])
+                - hp["step_size"] * gated_gradient
+            )
+
+        a1 = jax.nn.relu(x_norm @ params["w1"] + params["b1"])
+        a2 = jax.nn.relu(a1 @ params["w2"] + params["b2"])
+        phi = jnp.concatenate(
+            [
+                a2 * (1.0 / math.sqrt(m)),
+                jnp.ones((1,), dtype=jnp.float32),
+            ]
+        )
+        target = jax.nn.one_hot(y, SMALL.n_classes, dtype=jnp.float32)
+        error = target - state.wout.T @ phi
+        pp = state.p @ phi
+        gain = pp / (hp["rls_lambda"] + phi @ pp)
+        expected_wout = state.wout + jnp.outer(gain, error)
+        expected_p = (state.p - jnp.outer(gain, pp)) / hp["rls_lambda"]
+        expected_p = 0.5 * (expected_p + expected_p.T)
+
+        new_params, new_state, _ = step_fn(params, state, x, y, jr.key(99))
+
+        for name in self._BODY:
+            np.testing.assert_array_equal(
+                np.asarray(new_params[name]), np.asarray(expected_params[name]), name
+            )
+            np.testing.assert_array_equal(
+                np.asarray(new_state.utility[name]), np.asarray(utility[name]), name
+            )
+            np.testing.assert_array_equal(
+                np.asarray(new_state.init_params[name]),
+                np.asarray(state.init_params[name]),
+                name,
+            )
+        for name in ("w3", "b3"):
+            np.testing.assert_array_equal(
+                np.asarray(new_params[name]), np.asarray(params[name]), name
+            )
+            np.testing.assert_array_equal(
+                np.asarray(new_state.utility[name]),
+                np.asarray(state.utility[name]),
+                name,
+            )
+        assert not np.array_equal(np.asarray(expected_p), np.asarray(state.p))
+        assert not np.array_equal(np.asarray(expected_wout), np.asarray(state.wout))
+        np.testing.assert_array_equal(
+            np.asarray(new_state.p), np.asarray(expected_p)
+        )
+        np.testing.assert_array_equal(
+            np.asarray(new_state.wout), np.asarray(expected_wout)
+        )
+        self._assert_tree_equal(
+            jax.device_get(new_state.norm), jax.device_get(expected_norm)
+        )
+        np.testing.assert_array_equal(
+            np.asarray(new_state.fast_mean), np.asarray(expected_fast)
+        )
+        assert int(new_state.step) == 1
+
+    def test_jit_and_pytree_state_roundtrip_preserve_initial_snapshot(self):
+        from alberta_framework.benchmarks.ipmnist_screening import (
+            RLSHeadL2InitState,
+            _make_rls_head_l2init_learner,
+            _rls_head_l2init_hp,
+        )
+
+        init_fn, step_fn = _make_rls_head_l2init_learner(_rls_head_l2init_hp())
+        params = self._manual_params()
+        state = init_fn(params)
+        leaves, tree = jax.tree_util.tree_flatten(state)
+        restored = jax.tree_util.tree_unflatten(tree, leaves)
+        assert type(restored) is RLSHeadL2InitState
+        self._assert_tree_equal(jax.device_get(restored), jax.device_get(state))
+
+        compiled = jax.jit(step_fn)
+        x = jnp.linspace(-0.2, 0.4, SMALL.input_dim, dtype=jnp.float32)
+        new_params, new_state, metrics = compiled(
+            params, restored, x, jnp.asarray(1, jnp.int32), jr.key(7)
+        )
+        assert type(new_state) is RLSHeadL2InitState
+        for name in self._BODY:
+            np.testing.assert_array_equal(
+                np.asarray(new_state.init_params[name]), np.asarray(params[name]), name
+            )
+        for name in ("w3", "b3"):
+            np.testing.assert_array_equal(
+                np.asarray(new_params[name]), np.asarray(params[name]), name
+            )
+        assert all(bool(jnp.isfinite(metric)) for metric in metrics)
+
+    @pytest.mark.integration
+    def test_registered_arm_runs_through_synthetic_screening_harness(self, small_data):
+        x, y = small_data
+        spec = screening_spec("rls_head_resid_l1_preset005_l2init")
+        result = run_screening_config(x, y, spec, seed=2, config=SMALL)
+        assert result.config_name == spec.name
+        assert result.hyperparameters == spec.hyperparameters
+        assert np.all(np.isfinite(result.per_task_accuracy))
+        assert np.all(np.isfinite(result.per_task_loss))
+        assert np.all(np.isfinite(result.per_task_plasticity))
 
 
 class TestNBEnsemble:

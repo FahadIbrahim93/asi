@@ -48,15 +48,19 @@ from __future__ import annotations
 
 import dataclasses
 import functools
-from typing import Any, cast
+import operator
+from collections.abc import Mapping
+from typing import Any, SupportsIndex, cast
 
 import chex
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 from jax import Array
 from jaxtyping import Bool, Float
 
+from alberta_framework.core._float32_scalars import validated_float32_scalar
 from alberta_framework.core.multi_head_learner import (
     AnyOptimizer,
     MultiHeadMLPLearner,
@@ -65,9 +69,66 @@ from alberta_framework.core.multi_head_learner import (
 )
 from alberta_framework.core.optimizers import Bounder
 from alberta_framework.core.types import TraceMode
+from alberta_framework.core.update_safety import (
+    floating_tree_is_finite,
+    neutralize_array,
+    safe_discrete_action,
+    select_transaction,
+)
 
 EVIDENCE_LEVEL = "L0"
 SCIENTIFIC_PROMOTION_ALLOWED = False
+_INT32_MAX = 2**31 - 1
+_ACTUAL_INT_TYPES = frozenset(
+    {
+        int,
+        np.int8,
+        np.int16,
+        np.int32,
+        np.int64,
+        np.uint8,
+        np.uint16,
+        np.uint32,
+        np.uint64,
+        np.longlong,
+        np.ulonglong,
+    }
+)
+
+
+def _require_int32(name: str, value: object, *, minimum: int, maximum: int = _INT32_MAX) -> int:
+    if type(value) not in _ACTUAL_INT_TYPES:
+        raise ValueError(f"{name} must be an integer in [{minimum}, {maximum}]")
+    canonical = operator.index(cast(SupportsIndex, value))
+    if not minimum <= canonical <= maximum:
+        raise ValueError(f"{name} must be an integer in [{minimum}, {maximum}]")
+    return canonical
+
+
+def _validate_hidden_sizes(sizes: object) -> tuple[int, ...]:
+    if type(sizes) is not tuple:
+        raise ValueError("hidden_sizes must be an actual tuple")
+    return tuple(
+        _require_int32(f"hidden_sizes[{index}]", size, minimum=1)
+        for index, size in enumerate(sizes)
+    )
+
+
+def _require_int32_product(name: str, left: int, right: int) -> int:
+    if left > _INT32_MAX // right:
+        raise ValueError(f"derived {name} must fit in signed int32")
+    return left * right
+
+
+def _require_bool(name: str, value: object) -> bool:
+    if type(value) is not bool:
+        raise ValueError(f"{name} must be a bool")
+    return value
+
+
+def _saturating_int32_increment(value: Array) -> Array:
+    maximum = jnp.asarray(_INT32_MAX, dtype=jnp.int32)
+    return jnp.where(value < maximum, value + jnp.asarray(1, dtype=jnp.int32), maximum)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -109,6 +170,119 @@ class LatentWorldModelConfig:
     max_encoder_update: float = 0.1
     encoder_collapse_gate_threshold: float = 0.0
 
+    def __post_init__(self) -> None:
+        """Validate and canonicalize the complete static construction."""
+        object.__setattr__(
+            self,
+            "observation_dim",
+            _require_int32("observation_dim", self.observation_dim, minimum=1),
+        )
+        object.__setattr__(
+            self,
+            "n_actions",
+            _require_int32("n_actions", self.n_actions, minimum=1),
+        )
+        object.__setattr__(
+            self,
+            "latent_dim",
+            _require_int32("latent_dim", self.latent_dim, minimum=1),
+        )
+        object.__setattr__(
+            self,
+            "hidden_sizes",
+            _validate_hidden_sizes(self.hidden_sizes),
+        )
+        for name in (
+            "predict_delta",
+            "use_layer_norm",
+            "include_action_interactions",
+            "encoder_learning",
+        ):
+            object.__setattr__(self, name, _require_bool(name, getattr(self, name)))
+        if type(self.trace_mode) is not TraceMode:
+            raise ValueError("trace_mode must be a TraceMode")
+
+        observation_scale = self.observation_scale
+        if observation_scale is not None:
+            if type(observation_scale) is not tuple:
+                raise ValueError("observation_scale must be an actual tuple or None")
+            if len(observation_scale) != self.observation_dim:
+                raise ValueError("observation_scale length must equal observation_dim")
+            observation_scale = tuple(
+                validated_float32_scalar(
+                    f"observation_scale[{index}]", scale, positive=True
+                )
+                for index, scale in enumerate(observation_scale)
+            )
+            object.__setattr__(self, "observation_scale", observation_scale)
+
+        scalar_specs: tuple[tuple[str, dict[str, Any]], ...] = (
+            ("gamma", {"lower": 0.0, "upper": 1.0}),
+            ("reward_scale", {"positive": True}),
+            ("encoder_scale", {"positive": True}),
+            ("encoder_bias_scale", {"lower": 0.0}),
+            ("step_size", {"positive": True}),
+            ("sparsity", {"lower": 0.0, "upper": 1.0}),
+            ("leaky_relu_slope", {"lower": 0.0, "upper": 1.0}),
+            ("utility_decay", {"lower": 0.0, "upper": 1.0, "upper_inclusive": False}),
+            ("surprise_decay", {"lower": 0.0, "upper": 1.0, "upper_inclusive": False}),
+            ("collapse_decay", {"lower": 0.0, "upper": 1.0, "upper_inclusive": False}),
+            ("min_latent_std", {"lower": 0.0}),
+            ("max_latent_delta", {"positive": True}),
+            ("encoder_step_size", {"positive": True}),
+            ("max_encoder_update", {"positive": True}),
+            ("encoder_collapse_gate_threshold", {"lower": 0.0, "upper": 1.0}),
+        )
+        for name, bounds in scalar_specs:
+            object.__setattr__(
+                self,
+                name,
+                validated_float32_scalar(name, getattr(self, name), **bounds),
+            )
+
+        _require_int32_product(
+            "encoder_matrix_scalars", self.observation_dim, self.latent_dim
+        )
+        if self.latent_dim > _INT32_MAX - 2:
+            raise ValueError("derived n_heads must fit in signed int32")
+        n_heads = self.latent_dim + 2
+        if self.latent_dim > _INT32_MAX - self.n_actions:
+            raise ValueError("derived input_dim must fit in signed int32")
+        input_dim = self.latent_dim + self.n_actions
+        if self.include_action_interactions:
+            interactions = _require_int32_product(
+                "action_interaction_scalars", self.latent_dim, self.n_actions
+            )
+            if input_dim > _INT32_MAX - interactions:
+                raise ValueError("derived input_dim must fit in signed int32")
+            input_dim += interactions
+        layer_sizes = (input_dim, *self.hidden_sizes)
+        for index, (fan_in, fan_out) in enumerate(
+            zip(layer_sizes, layer_sizes[1:], strict=False)
+        ):
+            _require_int32_product(f"hidden_layer[{index}]_scalars", fan_in, fan_out)
+        head_input = self.hidden_sizes[-1] if self.hidden_sizes else input_dim
+        _require_int32_product("head_weight_scalars", n_heads, head_input)
+        layer_sizes = (input_dim, *self.hidden_sizes)
+        trunk_parameters = sum(
+            fan_out * (fan_in + 1)
+            for fan_in, fan_out in zip(layer_sizes, layer_sizes[1:], strict=False)
+        )
+        head_parameters = n_heads * (head_input + 1)
+        learner_direct_scalars = (
+            2 * (trunk_parameters + head_parameters) + sum(self.hidden_sizes) + 3
+        )
+        outer_state_scalars = (
+            self.observation_dim * self.latent_dim + 3 * self.latent_dim + 4
+        )
+        combined_direct_state_scalars = learner_direct_scalars + outer_state_scalars
+        for name, value in (
+            ("combined_direct_state_scalars", combined_direct_state_scalars),
+            ("combined_direct_state_bytes", 4 * combined_direct_state_scalars),
+        ):
+            if value > _INT32_MAX:
+                raise ValueError(f"derived {name} must fit in signed int32")
+
     def to_config(self) -> dict[str, Any]:
         """Serialize to a JSON-compatible dictionary."""
         payload = dataclasses.asdict(self)
@@ -120,17 +294,36 @@ class LatentWorldModelConfig:
         return payload
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> LatentWorldModelConfig:
+    def from_config(cls, config: Mapping[str, object]) -> LatentWorldModelConfig:
         """Reconstruct from :meth:`to_config` output."""
+        if not issubclass(type(config), Mapping):
+            raise ValueError("config must be an actual mapping")
         payload = dict(config)
-        payload.pop("type", None)
+        config_type = payload.pop("type", None)
+        if type(config_type) is not str or config_type != "LatentWorldModelConfig":
+            raise ValueError("unexpected latent world model config type")
+        expected_fields = {field.name for field in dataclasses.fields(cls)}
+        legacy_optional = {
+            "encoder_learning",
+            "encoder_step_size",
+            "max_encoder_update",
+            "encoder_collapse_gate_threshold",
+        }
+        if set(payload) - expected_fields or (expected_fields - legacy_optional) - set(payload):
+            raise ValueError("config fields do not match the serialized schema")
         if "hidden_sizes" in payload:
+            if type(payload["hidden_sizes"]) is not list:
+                raise ValueError("hidden_sizes must be a list in serialized config")
             payload["hidden_sizes"] = tuple(payload["hidden_sizes"])
         if "observation_scale" in payload and payload["observation_scale"] is not None:
+            if type(payload["observation_scale"]) is not list:
+                raise ValueError("observation_scale must be a list in serialized config")
             payload["observation_scale"] = tuple(payload["observation_scale"])
         if "trace_mode" in payload:
+            if type(payload["trace_mode"]) is not str:
+                raise ValueError("trace_mode must be a string in serialized config")
             payload["trace_mode"] = TraceMode(payload["trace_mode"])
-        return cls(**payload)
+        return cls(**cast(dict[str, Any], payload))
 
 
 @chex.dataclass(frozen=True)
@@ -185,6 +378,7 @@ class LatentWorldModelUpdateResult:
     encoder_update_applied: Bool[Array, ""]
     encoder_collapse_gated: Bool[Array, ""]
     encoder_gradient_norm: Float[Array, ""]
+    update_applied: Bool[Array, ""]
 
 
 @chex.dataclass(frozen=True)
@@ -207,6 +401,41 @@ class LatentWorldModelLearningResult:
     encoder_updates_applied: Bool[Array, " num_steps"]
     encoder_collapse_gates: Bool[Array, " num_steps"]
     encoder_gradient_norms: Float[Array, " num_steps"]
+    updates_applied: Bool[Array, " num_steps"]
+
+
+def _rollback_multi_head_result(
+    result: MultiHeadMLPUpdateResult,
+    previous_state: MultiHeadMLPState,
+    outer_update_applied: Array,
+) -> MultiHeadMLPUpdateResult:
+    """Make the nested learner result match the committed latent transaction."""
+    requested = ~jnp.isnan(result.errors)
+    return cast(
+        MultiHeadMLPUpdateResult,
+        dataclasses.replace(
+            cast(Any, result),
+            state=select_transaction(outer_update_applied, result.state, previous_state),
+            predictions=neutralize_array(outer_update_applied, result.predictions),
+            errors=jnp.where(
+                requested,
+                neutralize_array(outer_update_applied, result.errors),
+                jnp.nan,
+            ),
+            per_head_metrics=jnp.where(
+                requested[:, None],
+                neutralize_array(outer_update_applied, result.per_head_metrics),
+                jnp.nan,
+            ),
+            trunk_bounding_metric=neutralize_array(
+                outer_update_applied, result.trunk_bounding_metric
+            ),
+            post_step_words=jnp.where(
+                outer_update_applied, result.post_step_words, result.pre_step_words
+            ),
+            update_applied=result.update_applied & outer_update_applied,
+        ),
+    )
 
 
 class LatentWorldModel:
@@ -225,7 +454,7 @@ class LatentWorldModel:
         head_optimizer: AnyOptimizer | None = None,
     ):
         """Initialize the latent world model."""
-        self._validate_config(config)
+        config = self._validate_config(config)
         self._config = config
         self._observation_scale = (
             tuple(1.0 for _ in range(config.observation_dim))
@@ -280,16 +509,26 @@ class LatentWorldModel:
         }
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> LatentWorldModel:
+    def from_config(cls, config: Mapping[str, object]) -> LatentWorldModel:
         """Reconstruct from :meth:`to_config` output."""
         from alberta_framework.core.optimizers import (
             bounder_from_config,
             optimizer_from_config,
         )
 
+        if not issubclass(type(config), Mapping):
+            raise ValueError("model config must be an actual mapping")
+        if set(config) != {"type", "config", "learner"}:
+            raise ValueError("model config fields do not match the serialized schema")
+        if config.get("type") != "LatentWorldModel":
+            raise ValueError("unexpected latent world model type")
         payload = dict(config)
-        payload.pop("type", None)
-        model_config = LatentWorldModelConfig.from_config(payload["config"])
+        payload.pop("type")
+        if not issubclass(type(payload["config"]), Mapping) or type(payload["learner"]) is not dict:
+            raise ValueError("nested model configs must use canonical mappings")
+        model_config = LatentWorldModelConfig.from_config(
+            cast(Mapping[str, object], payload["config"])
+        )
         learner_cfg = dict(payload["learner"])
         optimizer = optimizer_from_config(learner_cfg["optimizer"])
         bounder_cfg = learner_cfg.get("bounder")
@@ -324,6 +563,11 @@ class LatentWorldModel:
             if self._config.encoder_bias_scale > 0.0
             else jnp.zeros((latent_dim,), dtype=jnp.float32)
         )
+        if not bool(
+            jnp.all(jnp.isfinite(encoder_matrix))
+            & jnp.all(jnp.isfinite(encoder_bias))
+        ):
+            raise ValueError("encoder initialization produced non-finite parameters")
         return LatentWorldModelState(
             encoder_matrix=encoder_matrix,
             encoder_bias=encoder_bias,
@@ -343,9 +587,7 @@ class LatentWorldModel:
         observation: Array,
     ) -> Float[Array, " latent_dim"]:
         """Encode one observation with explicit (differentiable) encoder params."""
-        obs = jnp.asarray(observation, dtype=jnp.float32).reshape(
-            (self._config.observation_dim,)
-        )
+        obs = jnp.asarray(observation, dtype=jnp.float32).reshape((self._config.observation_dim,))
         scale = jnp.asarray(self._observation_scale, dtype=jnp.float32)
         scaled = obs / jnp.maximum(scale, jnp.asarray(1e-6, dtype=jnp.float32))
         return jnp.tanh(scaled @ encoder_matrix + encoder_bias)
@@ -367,16 +609,33 @@ class LatentWorldModel:
     ) -> Float[Array, " input_dim"]:
         """Return ``concat(latent, one_hot(action), optional interactions)``."""
         z = jnp.asarray(latent, dtype=jnp.float32).reshape((self._config.latent_dim,))
+        safe_action, action_valid = safe_discrete_action(
+            action,
+            self._config.n_actions,
+        )
         action_one_hot = jax.nn.one_hot(
-            action.astype(jnp.int32),
+            safe_action,
             self._config.n_actions,
             dtype=jnp.float32,
         )
-        features = [z, action_one_hot]
+        latent_valid = jnp.all(jnp.isfinite(z))
+        features_valid = action_valid & latent_valid
+        # Inf latent times a silent one-hot is 0*inf = NaN. Zero both
+        # factors before the product; keep the invalid-action NaN reject.
+        safe_z = jnp.where(features_valid, z, jnp.zeros_like(z))
+        safe_action_one_hot = jnp.where(
+            features_valid, action_one_hot, jnp.zeros_like(action_one_hot)
+        )
+        features = [safe_z, safe_action_one_hot]
         if self._config.include_action_interactions:
-            interactions = (z[:, None] * action_one_hot[None, :]).reshape((-1,))
+            interactions = (safe_z[:, None] * safe_action_one_hot[None, :]).reshape((-1,))
             features.append(interactions)
-        return jnp.concatenate(features, axis=0)
+        encoded = jnp.concatenate(features, axis=0)
+        return jnp.where(
+            features_valid,
+            encoded,
+            jnp.full_like(encoded, jnp.nan),
+        )
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def input_features(
@@ -495,9 +754,7 @@ class LatentWorldModel:
             encoder_bias: Array,
         ) -> Array:
             latent = self._encode_with(encoder_matrix, encoder_bias, observation)
-            target_next_latent = self._encode_with(
-                encoder_matrix, encoder_bias, next_observation
-            )
+            target_next_latent = self._encode_with(encoder_matrix, encoder_bias, next_observation)
             raw_predictions = self._learner.predict(
                 state.learner_state,
                 self.input_features_from_latent(latent, action),
@@ -526,9 +783,7 @@ class LatentWorldModel:
         )
         step_size = jnp.asarray(config.encoder_step_size, dtype=jnp.float32)
         bound = jnp.asarray(config.max_encoder_update, dtype=jnp.float32)
-        candidate_matrix = state.encoder_matrix + jnp.clip(
-            -step_size * grad_matrix, -bound, bound
-        )
+        candidate_matrix = state.encoder_matrix + jnp.clip(-step_size * grad_matrix, -bound, bound)
         candidate_bias = state.encoder_bias + jnp.clip(-step_size * grad_bias, -bound, bound)
         gate_blocked = collapse_score > jnp.asarray(
             config.encoder_collapse_gate_threshold, dtype=jnp.float32
@@ -561,17 +816,54 @@ class LatentWorldModel:
         ``encoder_learning=False`` the computation is exactly the
         fixed-encoder path.
         """
-        prediction = self.predict(state, observation, action)
-        targets = self.targets(state, observation, reward, discount, next_observation)
+        observation_arr = jnp.asarray(observation, dtype=jnp.float32).reshape(
+            (self._config.observation_dim,)
+        )
+        action_arr, action_valid = safe_discrete_action(
+            action,
+            self._config.n_actions,
+        )
+        reward_arr = jnp.asarray(reward, dtype=jnp.float32)
+        discount_arr = jnp.asarray(discount, dtype=jnp.float32)
+        next_observation_arr = jnp.asarray(next_observation, dtype=jnp.float32).reshape(
+            (self._config.observation_dim,)
+        )
+        inputs_valid = (
+            jnp.all(jnp.isfinite(observation_arr))
+            & action_valid
+            & jnp.all(jnp.isfinite(reward_arr))
+            & jnp.all(jnp.isfinite(discount_arr))
+            & jnp.all(discount_arr >= 0.0)
+            & jnp.all(discount_arr <= 1.0)
+            & jnp.all(jnp.isfinite(next_observation_arr))
+        )
+        safe_observation = jnp.where(inputs_valid, observation_arr, jnp.zeros_like(observation_arr))
+        safe_action = jnp.where(inputs_valid, action_arr, jnp.zeros_like(action_arr))
+        safe_reward = jnp.where(inputs_valid, reward_arr, jnp.zeros_like(reward_arr))
+        safe_discount = jnp.where(inputs_valid, discount_arr, jnp.zeros_like(discount_arr))
+        safe_next_observation = jnp.where(
+            inputs_valid,
+            next_observation_arr,
+            jnp.zeros_like(next_observation_arr),
+        )
+
+        prediction = self.predict(state, safe_observation, safe_action)
+        targets = self.targets(
+            state,
+            safe_observation,
+            safe_reward,
+            safe_discount,
+            safe_next_observation,
+        )
         learner_result = self._learner.update(
             state.learner_state,
-            self.input_features_from_latent(prediction.latent, action),
+            self.input_features_from_latent(prediction.latent, safe_action),
             targets,
         )
-        target_next_latent = self.encode(state, next_observation)
+        target_next_latent = self.encode(state, safe_next_observation)
         surprise = jnp.mean((prediction.next_latent - target_next_latent) ** 2)
-        reward_error = prediction.reward - jnp.asarray(reward, dtype=jnp.float32)
-        discount_error = prediction.discount - jnp.asarray(discount, dtype=jnp.float32)
+        reward_error = prediction.reward - safe_reward
+        discount_error = prediction.discount - safe_discount
         prediction_error = surprise + reward_error**2 + discount_error**2
 
         collapse_decay = jnp.asarray(self._config.collapse_decay, dtype=jnp.float32)
@@ -580,8 +872,7 @@ class LatentWorldModel:
         next_mean = jnp.where(
             first,
             target_next_latent,
-            collapse_decay * state.latent_mean_ema
-            + (1.0 - collapse_decay) * target_next_latent,
+            collapse_decay * state.latent_mean_ema + (1.0 - collapse_decay) * target_next_latent,
         )
         centered = target_next_latent - next_mean
         next_var = jnp.where(
@@ -604,8 +895,7 @@ class LatentWorldModel:
         next_prediction_error_ema = jnp.where(
             first,
             prediction_error,
-            surprise_decay * state.prediction_error_ema
-            + (1.0 - surprise_decay) * prediction_error,
+            surprise_decay * state.prediction_error_ema + (1.0 - surprise_decay) * prediction_error,
         )
         next_collapse_score_ema = jnp.where(
             first,
@@ -620,7 +910,13 @@ class LatentWorldModel:
                 encoder_update_applied,
                 encoder_collapse_gated,
                 encoder_gradient_norm,
-            ) = self._encoder_step(state, observation, action, next_observation, collapse_score)
+            ) = self._encoder_step(
+                state,
+                safe_observation,
+                safe_action,
+                safe_next_observation,
+                collapse_score,
+            )
         else:
             encoder_matrix = state.encoder_matrix
             encoder_bias = state.encoder_bias
@@ -628,7 +924,7 @@ class LatentWorldModel:
             encoder_collapse_gated = jnp.asarray(False, dtype=jnp.bool_)
             encoder_gradient_norm = jnp.asarray(0.0, dtype=jnp.float32)
 
-        new_state = LatentWorldModelState(
+        candidate_state = LatentWorldModelState(
             encoder_matrix=encoder_matrix,
             encoder_bias=encoder_bias,
             learner_state=learner_result.state,
@@ -637,65 +933,65 @@ class LatentWorldModel:
             surprise_ema=next_surprise_ema,
             prediction_error_ema=next_prediction_error_ema,
             collapse_score_ema=next_collapse_score_ema,
-            step_count=state.step_count + 1,
+            step_count=_saturating_int32_increment(state.step_count),
+        )
+        diagnostics_finite = (
+            floating_tree_is_finite(prediction)
+            & jnp.all(jnp.isfinite(target_next_latent))
+            & jnp.all(jnp.isfinite(targets))
+            & jnp.all(jnp.isfinite(learner_result.errors))
+            & jnp.all(jnp.isfinite(learner_result.per_head_metrics))
+            & jnp.isfinite(surprise)
+            & jnp.isfinite(reward_error)
+            & jnp.isfinite(discount_error)
+            & jnp.isfinite(prediction_error)
+            & jnp.isfinite(latent_std_mean)
+            & jnp.isfinite(collapse_score)
+            & jnp.isfinite(encoder_gradient_norm)
+        )
+        update_applied = (
+            inputs_valid
+            & learner_result.update_applied
+            & floating_tree_is_finite(state)
+            & floating_tree_is_finite(candidate_state)
+            & diagnostics_finite
+        )
+        committed_state = select_transaction(update_applied, candidate_state, state)
+        reported_learner_result = _rollback_multi_head_result(
+            learner_result, state.learner_state, update_applied
+        )
+        reported_prediction = LatentWorldModelPrediction(
+            latent=neutralize_array(update_applied, prediction.latent),
+            next_latent=neutralize_array(update_applied, prediction.next_latent),
+            reward=neutralize_array(update_applied, prediction.reward),
+            discount=neutralize_array(update_applied, prediction.discount),
+            raw_predictions=neutralize_array(update_applied, prediction.raw_predictions),
         )
         return LatentWorldModelUpdateResult(
-            state=new_state,
-            prediction=prediction,
-            target_next_latent=target_next_latent,
-            targets=targets,
-            errors=learner_result.errors,
-            surprise=surprise,
-            reward_error=reward_error,
-            discount_error=discount_error,
-            prediction_error=prediction_error,
-            latent_std_mean=latent_std_mean,
-            collapse_score=collapse_score,
-            per_head_metrics=learner_result.per_head_metrics,
-            learner_result=learner_result,
-            encoder_update_applied=encoder_update_applied,
-            encoder_collapse_gated=encoder_collapse_gated,
-            encoder_gradient_norm=encoder_gradient_norm,
+            state=committed_state,
+            prediction=reported_prediction,
+            target_next_latent=neutralize_array(update_applied, target_next_latent),
+            targets=neutralize_array(update_applied, targets),
+            errors=reported_learner_result.errors,
+            surprise=neutralize_array(update_applied, surprise),
+            reward_error=neutralize_array(update_applied, reward_error),
+            discount_error=neutralize_array(update_applied, discount_error),
+            prediction_error=neutralize_array(update_applied, prediction_error),
+            latent_std_mean=neutralize_array(update_applied, latent_std_mean),
+            collapse_score=neutralize_array(update_applied, collapse_score),
+            per_head_metrics=reported_learner_result.per_head_metrics,
+            learner_result=reported_learner_result,
+            encoder_update_applied=encoder_update_applied & update_applied,
+            encoder_collapse_gated=encoder_collapse_gated & update_applied,
+            encoder_gradient_norm=neutralize_array(update_applied, encoder_gradient_norm),
+            update_applied=update_applied,
         )
 
-    def _validate_config(self, config: LatentWorldModelConfig) -> None:
-        if config.observation_dim <= 0:
-            raise ValueError("observation_dim must be positive")
-        if config.n_actions <= 0:
-            raise ValueError("n_actions must be positive")
-        if config.latent_dim <= 0:
-            raise ValueError("latent_dim must be positive")
-        if not 0.0 <= config.gamma <= 1.0:
-            raise ValueError("gamma must be in [0, 1]")
-        if config.observation_scale is not None:
-            if len(config.observation_scale) != config.observation_dim:
-                raise ValueError("observation_scale length must equal observation_dim")
-            if any(scale <= 0.0 for scale in config.observation_scale):
-                raise ValueError("observation_scale values must be positive")
-        if config.reward_scale <= 0.0:
-            raise ValueError("reward_scale must be positive")
-        if config.encoder_scale <= 0.0:
-            raise ValueError("encoder_scale must be positive")
-        if config.encoder_bias_scale < 0.0:
-            raise ValueError("encoder_bias_scale must be non-negative")
-        if any(size <= 0 for size in config.hidden_sizes):
-            raise ValueError("hidden_sizes must contain only positive widths")
-        if not 0.0 <= config.utility_decay < 1.0:
-            raise ValueError("utility_decay must be in [0, 1)")
-        if not 0.0 <= config.surprise_decay < 1.0:
-            raise ValueError("surprise_decay must be in [0, 1)")
-        if not 0.0 <= config.collapse_decay < 1.0:
-            raise ValueError("collapse_decay must be in [0, 1)")
-        if config.min_latent_std < 0.0:
-            raise ValueError("min_latent_std must be non-negative")
-        if config.max_latent_delta <= 0.0:
-            raise ValueError("max_latent_delta must be positive")
-        if config.encoder_step_size <= 0.0:
-            raise ValueError("encoder_step_size must be positive")
-        if config.max_encoder_update <= 0.0:
-            raise ValueError("max_encoder_update must be positive")
-        if not 0.0 <= config.encoder_collapse_gate_threshold <= 1.0:
-            raise ValueError("encoder_collapse_gate_threshold must be in [0, 1]")
+    def _validate_config(self, config: LatentWorldModelConfig) -> LatentWorldModelConfig:
+        """Return the fail-closed canonical dataclass construction."""
+        if type(config) is not LatentWorldModelConfig:
+            raise ValueError("config must be a LatentWorldModelConfig")
+        return config
 
 
 def run_latent_world_model_learning_loop(
@@ -709,9 +1005,10 @@ def run_latent_world_model_learning_loop(
 ) -> LatentWorldModelLearningResult:
     """Run online latent world-model learning over transition arrays."""
     if discounts is None:
-        discounts = jnp.full_like(
-            rewards,
+        discounts = jnp.full(
+            jnp.shape(rewards),
             jnp.asarray(model.config.gamma, dtype=jnp.float32),
+            dtype=jnp.float32,
         )
 
     def _scan_fn(
@@ -736,24 +1033,29 @@ def run_latent_world_model_learning_loop(
             result.encoder_update_applied,
             result.encoder_collapse_gated,
             result.encoder_gradient_norm,
+            result.update_applied,
         )
 
-    final_state, (
-        latent_predictions,
-        next_latent_predictions,
-        reward_predictions,
-        discount_predictions,
-        target_next_latents,
-        surprises,
-        prediction_errors,
-        reward_errors,
-        discount_errors,
-        latent_std_means,
-        collapse_scores,
-        per_head_metrics,
-        encoder_updates_applied,
-        encoder_collapse_gates,
-        encoder_gradient_norms,
+    (
+        final_state,
+        (
+            latent_predictions,
+            next_latent_predictions,
+            reward_predictions,
+            discount_predictions,
+            target_next_latents,
+            surprises,
+            prediction_errors,
+            reward_errors,
+            discount_errors,
+            latent_std_means,
+            collapse_scores,
+            per_head_metrics,
+            encoder_updates_applied,
+            encoder_collapse_gates,
+            encoder_gradient_norms,
+            updates_applied,
+        ),
     ) = jax.lax.scan(
         _scan_fn,
         state,
@@ -776,6 +1078,7 @@ def run_latent_world_model_learning_loop(
         encoder_updates_applied=encoder_updates_applied,
         encoder_collapse_gates=encoder_collapse_gates,
         encoder_gradient_norms=encoder_gradient_norms,
+        updates_applied=updates_applied,
     )
 
 

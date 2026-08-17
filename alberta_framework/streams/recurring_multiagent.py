@@ -43,6 +43,7 @@ import jax.random as jr
 from jax import Array
 from jaxtyping import Bool, Float, Int, PRNGKeyArray
 
+from alberta_framework.core._float32_scalars import validated_float32_scalar
 from alberta_framework.core.checkpoints import (
     load_checkpoint,
     load_checkpoint_metadata,
@@ -69,13 +70,28 @@ _UINT32_MAX = 2**32 - 1
 RECURRING_TWO_AGENT_CONFIG_SCHEMA = "alberta.recurring-two-agent-config.v2"
 RECURRING_TWO_AGENT_STATE_SCHEMA = "alberta.recurring-two-agent-state.v2"
 RECURRING_TWO_AGENT_CHECKPOINT_SCHEMA = "alberta.recurring-two-agent-checkpoint.v2"
-_LEGACY_RECURRING_TWO_AGENT_CHECKPOINT_SCHEMA = (
-    "alberta.recurring-two-agent-checkpoint.v1"
-)
+_LEGACY_RECURRING_TWO_AGENT_CHECKPOINT_SCHEMA = "alberta.recurring-two-agent-checkpoint.v1"
 RECURRING_TWO_AGENT_CLOCK_NBYTES = 12
 RECURRING_TWO_AGENT_CLOCK_DELTA_NBYTES = 8
 
 type PartnerPolicy = Callable[[Array, Array], Array]
+
+
+def _require_int(
+    name: str,
+    value: object,
+    *,
+    minimum: int = 0,
+    maximum: int = _INT32_MAX,
+) -> int:
+    # This record is a JSON/provenance boundary.  Require the exact built-in
+    # identity before comparing the value so hostile ``int`` subclasses cannot
+    # execute comparison hooks and NumPy scalars cannot leak into ``to_dict``.
+    if type(value) is not int:
+        raise ValueError(f"{name} must be an integer")
+    if value < minimum or value > maximum:
+        raise ValueError(f"{name} must lie in [{minimum}, {maximum}]")
+    return value
 
 
 def _require_array(
@@ -135,9 +151,7 @@ def _divmod_words_by_u32(words: Array, divisor: int | Array) -> tuple[Array, Arr
         doubled = remainder + remainder + bit
         subtract = doubled >= divisor_array
         remainder = jnp.where(subtract, doubled - divisor_array, doubled)
-        mask = jnp.left_shift(
-            jnp.asarray(1, dtype=jnp.uint32), bit_index.astype(jnp.uint32)
-        )
+        mask = jnp.left_shift(jnp.asarray(1, dtype=jnp.uint32), bit_index.astype(jnp.uint32))
         quotient_high = jnp.where(
             in_high & subtract,
             jnp.bitwise_or(quotient_high, mask),
@@ -261,6 +275,29 @@ class RecurringTwoAgentResourceBudget:
     trainable_scalars: int = 0
     replay_capacity: int = 0
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "state_nbytes", _require_int("state_nbytes", self.state_nbytes))
+        object.__setattr__(
+            self,
+            "exact_clock_nbytes",
+            _require_int("exact_clock_nbytes", self.exact_clock_nbytes),
+        )
+        object.__setattr__(
+            self,
+            "exact_clock_delta_nbytes",
+            _require_int("exact_clock_delta_nbytes", self.exact_clock_delta_nbytes),
+        )
+        object.__setattr__(
+            self,
+            "trainable_scalars",
+            _require_int("trainable_scalars", self.trainable_scalars),
+        )
+        object.__setattr__(
+            self,
+            "replay_capacity",
+            _require_int("replay_capacity", self.replay_capacity),
+        )
+
     def to_dict(self) -> dict[str, int | str]:
         return {
             "type": type(self).__name__,
@@ -287,8 +324,7 @@ def scripted_meet_avoid_partner_policy(
     del key
     relative_position = partner_observation[RELATIVE_POSITION_INDEX]
     objective_direction = (
-        partner_observation[MEET_CONTEXT_INDEX]
-        - partner_observation[AVOID_CONTEXT_INDEX]
+        partner_observation[MEET_CONTEXT_INDEX] - partner_observation[AVOID_CONTEXT_INDEX]
     )
     return jnp.sign(relative_position) * objective_direction
 
@@ -350,9 +386,7 @@ class RecurringTwoAgentWorld:
             or not isinstance(context_length, int)
             or context_length <= 0
         ):
-            raise ValueError(
-                f"context_length must be positive, got {context_length}"
-            )
+            raise ValueError(f"context_length must be positive, got {context_length}")
         if context_length > _INT32_MAX // 2:
             raise ValueError("2 * context_length must fit in signed schedule telemetry")
         if isinstance(nuisance_dim, bool) or not isinstance(nuisance_dim, int) or nuisance_dim < 0:
@@ -370,9 +404,7 @@ class RecurringTwoAgentWorld:
             if not math.isfinite(float(value)):
                 raise ValueError(f"{name} must be finite")
         if nuisance_scale < 0.0:
-            raise ValueError(
-                f"nuisance_scale must be non-negative, got {nuisance_scale}"
-            )
+            raise ValueError(f"nuisance_scale must be non-negative, got {nuisance_scale}")
         if world_limit <= 0.0:
             raise ValueError(f"world_limit must be positive, got {world_limit}")
         if not 0.0 <= damping < 1.0:
@@ -383,17 +415,14 @@ class RecurringTwoAgentWorld:
             raise ValueError(f"time_delta must be positive, got {time_delta}")
         if max_speed <= 0.0:
             raise ValueError(f"max_speed must be positive, got {max_speed}")
-        if len(initial_positions) != N_AGENTS:
-            raise ValueError(
-                f"initial_positions must contain {N_AGENTS} values, "
-                f"got {len(initial_positions)}"
-            )
-        if any(not math.isfinite(float(position)) for position in initial_positions):
-            raise ValueError("initial_positions must be finite")
-        if any(abs(position) > world_limit for position in initial_positions):
-            raise ValueError(
-                "initial_positions must lie within [-world_limit, world_limit]"
-            )
+        if type(initial_positions) is not tuple or len(initial_positions) != N_AGENTS:
+            raise ValueError(f"initial_positions must be an exact {N_AGENTS}-tuple")
+        canonical_positions = tuple(
+            validated_float32_scalar(f"initial_positions[{index}]", position)
+            for index, position in enumerate(initial_positions)
+        )
+        if any(abs(position) > world_limit for position in canonical_positions):
+            raise ValueError("initial_positions must lie within [-world_limit, world_limit]")
 
         self._context_length = int(context_length)
         self._nuisance_dim = int(nuisance_dim)
@@ -403,13 +432,11 @@ class RecurringTwoAgentWorld:
         self._acceleration = float(acceleration)
         self._time_delta = float(time_delta)
         self._max_speed = float(max_speed)
-        self._initial_positions_tuple = tuple(float(value) for value in initial_positions)
-        self._initial_positions = jnp.asarray(initial_positions, dtype=jnp.float32)
+        self._initial_positions_tuple = canonical_positions
+        self._initial_positions = jnp.asarray(canonical_positions, dtype=jnp.float32)
         self._partner_policy_is_default = partner_policy is None
         self._partner_policy = (
-            scripted_meet_avoid_partner_policy
-            if partner_policy is None
-            else partner_policy
+            scripted_meet_avoid_partner_policy if partner_policy is None else partner_policy
         )
 
     @property
@@ -560,21 +587,15 @@ class RecurringTwoAgentWorld:
         segment_words, _remainder = _divmod_words_by_u32(
             cast(Array, state.step_words), self._context_length
         )
-        return jnp.bitwise_and(
-            segment_words[1], jnp.asarray(1, dtype=jnp.uint32)
-        ).astype(jnp.int32)
+        return jnp.bitwise_and(segment_words[1], jnp.asarray(1, dtype=jnp.uint32)).astype(jnp.int32)
 
-    def _schedule_identities(
-        self, words: Array
-    ) -> tuple[Array, Array, Array, Array]:
+    def _schedule_identities(self, words: Array) -> tuple[Array, Array, Array, Array]:
         """Return exact segment/cycle identities and bounded schedule phase."""
-        segment_words, segment_step = _divmod_words_by_u32(
-            words, self._context_length
-        )
+        segment_words, segment_step = _divmod_words_by_u32(words, self._context_length)
         cycle_words, _parity = _divmod_words_by_u32(segment_words, 2)
-        context = jnp.bitwise_and(
-            segment_words[1], jnp.asarray(1, dtype=jnp.uint32)
-        ).astype(jnp.int32)
+        context = jnp.bitwise_and(segment_words[1], jnp.asarray(1, dtype=jnp.uint32)).astype(
+            jnp.int32
+        )
         return segment_words, cycle_words, segment_step.astype(jnp.int32), context
 
     def init(self, key: Array) -> RecurringTwoAgentState:
@@ -596,9 +617,7 @@ class RecurringTwoAgentWorld:
 
         other = jnp.array([1, 0], dtype=jnp.int32)
         own_positions = state.positions / self._world_limit
-        relative_positions = (
-            state.positions[other] - state.positions
-        ) / (2.0 * self._world_limit)
+        relative_positions = (state.positions[other] - state.positions) / (2.0 * self._world_limit)
         own_velocities = state.velocities / self._max_speed
         other_velocities = state.velocities[other] / self._max_speed
 
@@ -673,9 +692,7 @@ class RecurringTwoAgentWorld:
         )
         learner_action_array = jnp.asarray(learner_action, dtype=jnp.float32)
         if partner_action.size != 1:
-            raise ValueError(
-                "partner policy must return a scalar or one-element action"
-            )
+            raise ValueError("partner policy must return a scalar or one-element action")
         if learner_action_array.size != 1:
             raise ValueError("learner_action must be scalar or one-element")
         joint_action = jnp.stack(
@@ -704,8 +721,7 @@ class RecurringTwoAgentWorld:
         requested_actions = jnp.asarray(joint_action)
         if requested_actions.shape != (N_AGENTS,):
             raise ValueError(
-                f"joint_action must have shape ({N_AGENTS},), "
-                f"got {requested_actions.shape}"
+                f"joint_action must have shape ({N_AGENTS},), got {requested_actions.shape}"
             )
         if requested_actions.dtype != jnp.dtype(jnp.float32):
             raise TypeError("joint_action must have dtype float32")
@@ -717,18 +733,13 @@ class RecurringTwoAgentWorld:
         safe_actions = jnp.where(jnp.isfinite(requested_actions), requested_actions, 0.0)
         applied_actions = jnp.clip(safe_actions, -1.0, 1.0)
 
-        accelerated = (
-            self._damping * state.velocities
-            + self._acceleration * applied_actions
-        )
+        accelerated = self._damping * state.velocities + self._acceleration * applied_actions
         candidate_velocities = jnp.clip(
             accelerated,
             -self._max_speed,
             self._max_speed,
         )
-        candidate_positions = (
-            state.positions + self._time_delta * candidate_velocities
-        )
+        candidate_positions = state.positions + self._time_delta * candidate_velocities
         positions = jnp.clip(
             candidate_positions,
             -self._world_limit,
@@ -765,10 +776,7 @@ class RecurringTwoAgentWorld:
         )
         candidate_state_valid = self.state_is_valid(candidate_state)
         update_applied = (
-            state_valid
-            & input_valid
-            & lifetime_capacity_available
-            & candidate_state_valid
+            state_valid & input_valid & lifetime_capacity_available & candidate_state_valid
         )
         new_state = cast(
             RecurringTwoAgentState,
@@ -895,9 +903,7 @@ def _restore_recurring_empty_arrays(
         RecurringTwoAgentState,
         jax.tree.map(
             lambda stored, expected: (
-                expected
-                if isinstance(expected, Array) and expected.size == 0
-                else stored
+                expected if isinstance(expected, Array) and expected.size == 0 else stored
             ),
             restored,
             template,
@@ -997,9 +1003,7 @@ def load_recurring_two_agent_checkpoint(
     )
     if restored_metadata != metadata:
         raise ValueError("recurring two-agent checkpoint metadata changed between reads")
-    state = _restore_recurring_empty_arrays(
-        cast(RecurringTwoAgentState, restored), template
-    )
+    state = _restore_recurring_empty_arrays(cast(RecurringTwoAgentState, restored), template)
     world._require_state_contract(state)
     if not bool(jax.device_get(world.state_is_valid(state))):
         raise ValueError("restored recurring two-agent state is invalid")

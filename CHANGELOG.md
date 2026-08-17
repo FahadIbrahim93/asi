@@ -7,170 +7,273 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Added the code-only, permanently nonpromoting IPMNIST gate-ablation arm
+  `rls_head_resid_l1_preset005_nogate`. It has no result artifact and does not authorize a
+  benchmark run; execution remains gated by the issue's source receipt and owner-approved
+  compute budget.
+- Added the code-only, permanently nonpromoting IPMNIST arm
+  `rls_head_resid_l1_preset005_l2init`, which snapshots and decays exactly `w1`, `b1`, `w2`,
+  and `b2` toward initialization while leaving `w3`, `b3`, the incumbent state/configuration,
+  and the RLS recursion unchanged. It has no result artifact and does not authorize a benchmark
+  run; execution still requires a replacement frozen protocol, fresh eligible seeds, and
+  owner-approved compute.
+- Added the code-only, permanently nonpromoting IPMNIST reset ablation
+  `rls_head_resid_l1_noreset`, which changes only the incumbent's detector-driven covariance
+  reset threshold to its existing untriggerable endpoint. It has no result artifact and does
+  not authorize a benchmark run; execution remains gated on protocol, seed, and compute
+  approval.
+
+### Changed
+
+- Made new IPMNIST screening shards and summaries strict v2 artifacts bound to a clean Git
+  commit/tree, the actual tracked package and `uv.lock` bytes, runtime/JAX details, and the
+  canonical materialized MNIST feature/label bytes. The run CLI now captures these bindings
+  before execution and verifies them again before immutable publication. Merge and proxy
+  validation now bind their exact input files and live derivation environment, enforce strict
+  policy, hyperparameter, metric-domain, device, and tolerance contracts, and reject changed or
+  mismatched provenance while legacy v1 shards remain readable.
+- Moved plotting, dataset, progress, and parallel-execution dependencies from the base
+  installation into a `research` extra; the `dev` extra retains the complete contributor
+  toolchain.
+- Made the source-checkout installation path explicit and documented that the existing
+  `alberta-framework` project on PyPI is a different distribution.
+- Consolidated locked CI setup, pytest shard planning, and package validation so each concern
+  has one implementation and built artifacts are tested without rebuilding them.
+- Extended pre-1.0 learner and optimizer result schemas with explicit scalar or per-channel
+  `update_applied` masks. Transaction-aware callers use the checked optimizer boundary while
+  the legacy two-value `update_from_gradient` API remains available.
+- Added explicit scalar and per-event transaction masks to working-memory checked-update,
+  step, and array results while preserving the latter two legacy unpacking surfaces.
+- Kept finite one-step optimizer results byte-pinned. The added JAX transaction predicates can
+  lower differently in compiled multi-step scans and may change last-bit rounding without
+  changing the finite-path equations or acceptance semantics.
+
+### Fixed
+
+- Required `PartialObservationWrapper`'s RANDOM-mode `mask_prob` to be a
+  concrete, non-bool real number in `[0, 1]` before use. The prior check
+  compared the raw value directly (`0.0 <= mask_prob <= 1.0`) with no type
+  gate at all, so any object supporting `__le__`/`__ge__` — including a
+  `__class__`-spoofed non-real whose comparison hooks raise — reached that
+  comparison and could leak an uncaught exception instead of the documented
+  `ValueError`, or silently pass through as a non-canonical value.
+- Required persisted micro-stream scalar fields to be concrete real values and
+  canonicalized them to built-in floats, preventing numeric strings or custom
+  conversion objects from crossing the strict development-artifact boundary.
+- Validated frequency-mismatch bounds and Pavlovian noise in their actual
+  float32 execution domain, rejecting overflowed or collapsed frequency
+  intervals and overflowed noise scales before stream state can become invalid.
+- Preserved non-finite sentinels on rejected recurring-multiagent transition
+  payloads because the compatibility `step()` surface does not return the
+  separate transaction-validity bit; invalid events cannot masquerade as
+  ordinary finite zero-reward samples.
+- Rejected SIGReg samples, embeddings, directions, and derived projections that are
+  non-finite in float32 arithmetic before they can become silent NaN losses, including
+  under compiled and vectorized JAX calls.
+- Added an explicit traced validity verdict to behavior-model input gradients so finite neutral
+  payloads from rejected inputs cannot be mistaken for valid state-builder updates; eager,
+  compiled, and vectorized consumers can gate mutation on the same result field.
+- Built action-conditioned world-model interaction features from finite internal operands while
+  preserving NaN as the fail-visible public result for non-finite observations or invalid actions;
+  valid eager, compiled, and vectorized predictions retain the same values.
+- Required automatic feature-to-subtask counts to be non-negative integer scalars before
+  ranking, while retaining NumPy/JAX integer-scalar compatibility and zero/oversized bounds.
+- Aligned plotted trailing-window learning-curve means and confidence intervals with the
+  time step where each complete window closes instead of backdating padded values.
+- Preserved initialized weights and input-scale vectors for one complete configured segment
+  before `XDistShiftStream`, `AbruptChangeStream`, and `DynamicScaleShiftStream` perform
+  their first abrupt changes.
+- Made RiverSwim reject malformed, non-finite, subnormal, or jointly invalid
+  transition probabilities before float32 narrowing can create a negative or
+  non-stochastic transition row.
+- Required GVF discount and eligibility-decay parameters to be concrete finite
+  float32-domain probabilities, preventing invalid or silently narrowed values from
+  corrupting Horde TD targets and traces.
+- Rejected malformed or float32-unsafe SIGReg kernel widths before Epps-Pulley
+  arithmetic can emit NaN, while preserving valid dynamic JIT and vectorized calls;
+  SIGReg configuration scalars now enforce the same finite representability contract.
+- Isolated Step 9 candidate, behavior-rollout, and control-rollout RNG branches, persisted
+  a reserved future master through real and dream control-update rejection, rejected dreams
+  with any failed rollout transaction, and kept zero-budget updates identical to the
+  real-only path.
+- Kept Step 7 real and rollout control RNG streams linear through transactional rejection
+  whenever planning is enabled, while retaining the exact real-only path at planning zero.
+- Rejected nonfinite and out-of-range Pavlovian phase contingencies before they can
+  silently behave like zero- or certain-reinforcement probabilities.
+- Required nexting RMSE inputs to be equal nonempty rank-two arrays and their
+  burn-in/window controls to be static built-in integers within trace bounds, preventing
+  broadcasted metrics, empty outputs, and late JAX slicing errors.
+- Preserved every leading batch axis when applying gauntlet EMA smoothing along the last
+  axis, fixing rank-three and higher inputs while retaining rank-one and rank-two behavior.
+- Made the pair-, triple-, and micro-component stream generators select exactly their
+  configured fixed count under tied random scores, with stable source-index tie-breaking;
+  pair/triple counts now require positive built-in integers before JAX initialization.
+- Bound each new IPMNIST screening pool shard and merged summary to its effective
+  `noise_pool_steps`, rejected malformed or cross-shard pool sizes, and made merge refuse
+  legacy pool shards whose omitted size remains inspectable but unknowable. Legacy shards
+  without a noise mode remain compatible as exact step-mode runs.
+- Made strict evidence, IPMNIST-screening, micro-continual, UPGD/Label-EMNIST, and sealed
+  Forager artifact loaders reject duplicate JSON object keys at every nesting depth and JSON
+  numeric tokens whose float conversion overflows to infinity.
+- Rejected out-of-int32-range, zero, negative, boolean, and non-integer schedule divisors in
+  synthetic and closed-loop streams before JAX modulo, floor-division, or periodic arithmetic
+  can silently corrupt a regime clock or raise late overflow errors; valid int32 schedules
+  retain their existing trajectories.
+- Required every periodic partial-observation mask to match the wrapped stream's exact feature
+  shape before stacking, preventing broadcast expansion of feature vectors into matrices.
+- Made experiment CSV and JSON artifacts preserve finite binary64 measurements exactly. A
+  shared preflight now requires nonempty aggregates, canonical uint32 seed identities,
+  aligned nonempty metric arrays and summary samples, finite measurements, and the requested
+  report metric before touching a parent, destination, or report directory; complete
+  serialized files publish atomically, while display-only table rounding remains unchanged.
+- Protected the reserved checkpoint `_format_version` metadata key so every newly saved
+  checkpoint carries the canonical on-disk format stamp even if caller metadata collides.
+- Made sparse initialization reject malformed dimensions and non-finite or out-of-range
+  sparsity before array allocation, while retaining the paper-specified uniform bound.
+- Validated rule-discovery and UPGD run, plan, CLI, shard, and artifact seed identities before
+  integer/uint32 conversion: schedules must use unique built-in integers in the JAX key domain,
+  so duplicate or aliased trajectories cannot be counted or recorded as independent runs.
+- `get_final_performance` now refuses a non-positive `window` and an empty time
+  axis instead of silently averaging the whole trace (`window=0`, because
+  `arr[:, -0:]` is a full slice) or a prefix (`window < 0`) and publishing NaN.
+- Statistical helpers now reject empty Mann–Whitney groups and unequal or
+  underpowered Wilcoxon pairs before calling SciPy; an empty Bonferroni family
+  is a stable no-op that retains the requested family-wise alpha.
+- Continual-learning metrics now require finite first and final evaluations and
+  reject infinite post-exposure trajectories instead of backfilling across
+  numerical divergence; intermediate NaN gaps remain valid missing probes.
+- Removed broad package-import fallbacks that hid internal failures, and broke the
+  learner/stream import cycle without making Gymnasium a base dependency.
+- Added regression coverage for package import boundaries, release metadata, CI shard
+  planning, synchronized agent guides, and local documentation links.
+- Required at least two shared seeds and a positive candidate-minus-control
+  difference on every aligned seed before an IPMNIST arm can authorize
+  confirmation compute; one-seed paired summaries remain available for
+  development inspection.
+- Kept core Autostep and the screening lane's IDBD/Autostep meta-state finite when a
+  non-finite correlation would otherwise turn a silent trace into a persistent NaN.
+- Made optimizer, learner, Horde, actor-critic, model, option, normalizer, and utility updates
+  reject non-finite transactions atomically, preserve the last valid state, expose the
+  rejection, and return neutral outward diagnostics instead of partially committing a model.
+- Selected exact zero bootstraps before multiplication in Horde, SARSA, nexting, and
+  Gymnasium value streams, so terminal or disabled channels do not manufacture `0 * inf`
+  NaNs while nonzero channels still expose invalid inputs.
+- Held temporal/history context state on non-finite observations and kept valid finite
+  coordinates observable without silently converting arbitrary invalid inputs into evidence.
+- Made working/prototype/UPGD memory, state builders, world models, and their scan wrappers
+  roll back complete invalid transitions. Rejected results expose explicit verdicts where the
+  public result schema supports them and never report plausible success metrics; the Step 7
+  and Step 9 scan facades retain the per-event model verdict.
+- Rejected non-finite dream candidates and invalid or float32-unrepresentable resource costs;
+  exact zero-weight channels remain unused, while positive-weight products must be finite.
+  Discrete action/context identifiers and Exp3 credit probabilities are validated before any
+  integer cast, lookup, or state update, and invalid prediction/selection queries stay visible.
+- Strengthened IPMNIST and micro-continual shard merging to reject cross-seed learner,
+  hyperparameter, mechanism, or runtime-environment drift, plus malformed or
+  aggregate-overflowing wall-clock timings. The common runtime environment is now retained in
+  derived summaries and validation receipts instead of being discarded.
+- Aligned IPMNIST screening shard loading with the runner's noise-mode contract: unknown modes
+  and pool attribution to arms without a noise-consuming update now fail before publication,
+  while legacy shards with no mode remain compatible as exact step-mode runs.
+- Made proxy receipts require strict historical reference schemas, frozen control identities
+  and hyperparameters, compatible horizons, unique paired control seeds, and one common
+  protocol before a validation result can be issued.
+- Left the immutable evidence artifacts untouched. Registered-source hardening keeps the live
+  five-claim registry fail-closed and `invalid` until separately authorized evidence renewal.
+
+### Removed
+
+- Removed superseded private helpers, unreachable branches, and the duplicate documentation
+  index while preserving public APIs, evidence validators, and protocol boundaries.
+
+## [0.29.0] - 2026-08-14
+
 Changes since 0.28.0 are summarized by durable user-visible behavior. Development campaign
 measurements remain in their primary output records; none promotes a registry claim.
 
-Entries before 0.27.0 continue upstream history. This development fork intentionally omits
-some upstream root benchmark, script, example, documentation, and output trees, so historical
-claims that depend on those omitted files are provenance records rather than locally
-reproducible results. See `VENDORING.md` for the exact scope.
-
 ### Added
-
-#### Reference-agent protocol
-
-- Added the host-facing `preview1` reference-agent transaction contract. Its
-  preview schemas are versioned but not frozen v1: canonical configuration and
-  manifest identities, exact-dtype immutable payloads, distinct authorization,
-  settlement, pre-execution command, post-execution applied-action receipt, and
-  outcome records, explicit bootstrap/reset observation IDs, a pure semantic
-  reducer, and a process-local single-writer ledger are covered at L0.
-  The live ledger uses lock-protected current-object identity compare-and-swap,
-  rejects stale snapshots and repeated initialization, and deliberately cannot
-  be pickled. Rejection leaves the event unconsumed and the ledger halted with
-  recovery required; the final uint64-indexed event is consumed before the state
-  becomes exhausted. Preview restrictions include scalar reward/discount, no
-  sidecars or wire decoder, adapter-asserted rather than adapter-proven
-  rebinding, and executor acknowledgements rather than physical-dispatch proof.
-  The transaction module alone supplies no durable replay/restore, aggregate
-  runner, whole-life checkpoint, exact-resume gate, or `reference-dev`.
-- Added a development-only, manifest-bound Prototype L0 agent transaction
-  bridge and retained tests. It supports only primitive actions, exact dispatch,
-  and continuing-task outcomes; foreign-configuration state, replacement/veto,
-  boundary transactions, stale or relabelled decisions, and premature disarming
-  fail closed without committing the functional candidate. The bridge is not
-  by itself an environment/executor adapter or runner and supplies no whole-life
-  checkpoint, exact-resume result, options/rebinding/boundary conformance,
-  `reference-dev`, or evidence.
-- Added the development-only aggregate Prototype + SwitchingTwoState/RiverSwim
-  L0 life runner and retained tests. Its canonical immutable configuration
-  binds the complete selected agent, environment, exact-dispatch, and metric
-  configurations/digests plus the smallest component event capacity. One
-  immutable aggregate owns agent, environment, transaction, dispatch, RNG
-  cursor, metrics, counters, pending outcome, halt, transcript, and
-  commit/checkpoint generations. A process-local outer lock/CAS covers
-  authority, settlement, command, strict environment execution validation,
-  post-execution receipt, outcome, agent/metric staging, and aggregate commit.
-  The CI-cheap panel covers concurrency, phase/stationary reward/oracle/regret
-  metrics, horizon completion, transcript hashing, capacity preflight, abort,
-  fault retention, and complete-outcome recovery without redispatch. RiverSwim
-  uses a distinct manifest/state discriminator and stationary metrics, rejects
-  configurations outside `2 <= n_states <= 12` before exponential exact-oracle
-  construction, supplies the identical runner-derived JAX key to execution and
-  validation, and replays the keyed stochastic transition during validation.
-  This is a `preview1` L0 mechanism, not `reference-dev`, evidence, safety conformance,
-  or robotics readiness. The declared static exact authority is not a safety
-  policy; the ordinary-`Exception` at-most-once guard is process-local and is
-  not a durable executor guarantee or protection from process death or
-  `BaseException`. The runner alone does not provide checkpoint persistence,
-  process-crash recovery, durable dispatch, safety, or evidence.
-- Added the development-only current-schema quiescent whole-life checkpoint
-  codec and retained exact-resume tests for primitive Prototype +
-  SwitchingTwoState and Prototype + RiverSwim. Successful save uses Linux
-  atomic no-replace publication for one immutable generation, advances
-  commit/checkpoint generations, nests
-  the complete Prototype v3 checkpoint, encodes all aggregate owners, binds
-  current source/runtime/dependency identities plus child consistency hashes,
-  reconstructs fresh components, and validates strict cross-component
-  adoption. Original and restored runners produce exact continuation from the
-  same persisted barrier. This is an unfrozen `preview1` L0
-  simulation mechanism, not a portable migration contract,
-  authenticated execution attestation, process-crash or durable-executor
-  guarantee, safety result, `reference-dev`, RiverSwim learning/performance
-  result, or evidence. Only quiescent pre-completion state for the two
-  implemented simulators is supported. The RiverSwim gate reconstructs from its
-  distinct environment discriminator and produces exact original/restored keyed
-  stochastic continuation from the same persisted barrier. It supplies no
-  safety/options/boundary/Forager/robot conformance or broader environment
-  support.
-- Added permanently nonpromoting matched reference-life scorecard machinery:
-  environment-bound control adapters, explicit Threefry roots, finite-horizon
-  privileged dynamic-programming normalization, 144 fresh-process shards over
-  12 consumed development seeds, strict reward/counter/config validation, and
-  canonical numeric-payload accounting. The `asi-reference-life-scorecard` CLI
-  writes new immutable plan/shard/summary paths. This is L0 development
-  infrastructure, not a completed scorecard, authenticated execution receipt,
-  `reference-dev` selection, performance claim, or scientific evidence.
 
 #### Continual-learning benchmarks
 
-- Added strict nonpromoting IPMNIST `shard.v2` and `summary.v2` records. They bind
-  arm fields and normalized callback code/default/closure descriptors, post-cast
-  input bytes, a package-wide Python disk snapshot, available checkout lock
-  documents, selected runtime/JAX and RNG configuration, invocation fields,
-  exact per-arm seed sets, and raw input-shard bytes. Summary loading always
-  revalidates the shards and recomputes derived results. The digest is an
-  unkeyed consistency hash, not an authenticated execution receipt or dataset
-  semantic attestation; loaded module/global state and active lock conformance
-  are not attested either.
 - Extended the nonpromoting IPMNIST campaign with RLS-head, transient-ensemble,
   reviewer-comparison, update-rule-discovery, and input-conditioning controls. Moving
   measurements live under `outputs/ipmnist_screening/`; bounded conclusions are retained in
   `docs/evidence/negative-results.md`.
 - Added the `gauss-v1` micro-continual suite for input permutation, label permutation, scale
   shift, and recurrence, with analytic references and campaign-arm reuse.
-- The vendored merged record reports completion of the three-seed, 800-task OPMNIST closure
-  (48 million online updates per seed). The source runner, raw shards, merge code, and gate code
-  are absent from this fork, so execution cannot be independently reproduced here.
-  Hybrid-memory candidates win the stored online/tracking metrics while fair MLPs retain
-  test-MSE/test-accuracy advantages. The stored strict gate remains
+- Completed the three-seed, 800-task OPMNIST closure (48 million online updates per seed).
+  Hybrid-memory candidates win the recorded online/tracking metrics while fair MLPs retain
+  test-MSE/test-accuracy advantages. The strict gate remains
   `solved_opmnist_step2=false`; this is limited OPMNIST evidence, not a Step 2 solution.
 - Added a fail-closed audit of the historical IPMNIST record. All stored shards parse and
   reported means reconstruct, but the proxy receipt rejects three UPGD prefix comparisons,
   the summary is incomplete, and the round-2 driver cannot reproduce its later result file.
   Those v1 shards remain hypothesis-generating observations, not current-source evidence.
-- Added a repository anti-LARP audit and a mutable IPMNIST campaign index that
-  distinguish live validator state, current development records, superseded
-  append-only reports, and work that still requires new experiments.
 
 ### Changed
 
-#### Project identity and research direction
-
-- Standardized the active project and repository identity as **ASI** and defined its
-  evidence-driven hillclimb toward an end-to-end continual-learning application for real
-  workloads and robotics. The Alberta Plan remains a major inspiration and status crosswalk,
-  not a binding roadmap. The compatibility distribution/import/CLI names and all historical
-  artifact identifiers remain unchanged. Development-tree citation metadata now uses ASI;
-  its 0.28.0 version/date continue to identify the latest release until the next coordinated
-  release transaction.
-
 #### Reliability and compatibility
 
-- IPMNIST strict merge now refuses v1 shards, requires an explicit exact
-  `--expected-seeds` contract and a present control arm, and refuses relative or
-  noncanonical summary input paths. Historical v1 parsing is available only
-  behind the proxy audit's explicit `--legacy-v1-quarantine` flag.
-- Recurring-IPMNIST sentinel evaluation now uses each registered arm's exact
-  frozen deployed forward path, including hidden-RMS, RFF/linear RLS,
-  naive-Bayes ensembles, and RLS-head arms, with output and state-immutability
-  checks.
 - OaK extended-action masks now exclude cold options consistently from selection, real
   bootstraps, planning selection, and planning bootstraps.
-- CI now runs the complete non-slow suite on pull requests; the redundant main-only matrix
-  and the sparse `unit`-marker-only gate were removed.
+- **Pre-1.0 breaking API cleanup:** contracted the `alberta_framework` and
+  `alberta_framework.core` convenience re-export namespaces. APIs owned by retired HCCL,
+  embodied, prototype-expansion, and self-certifying evaluation modules were removed with
+  those modules. Retained low-level schema, checkpoint-migration, resource-accounting,
+  experimental-optimizer, and prototype-integration APIs now require imports from their
+  defining modules instead of the package convenience namespaces. The robot track's documented
+  continual-RL imports remain available.
+- CI now runs the complete non-slow suite on Python 3.12 and 3.13, checks the lock and built
+  distributions, exercises the exact NumPy/JAX floor, and exposes the retained slow lane by
+  manual dispatch. The redundant main-only and sparse `unit`-only gates were removed.
+- Raised the supported JAX/JAXlib floor from 0.4 to 0.7.1 while retaining NumPy 1.26
+  compatibility for the robot track. The GPU extra uses the same JAX floor.
+- The test harness preserves Chex tree-assertion semantics when exercising the NumPy 1.26
+  floor, whose `numpy.testing.assert_allclose` predates the `strict` keyword Chex passes.
+- Console-script loading is now safe when uv installs wheel files as hard links. The strict
+  Forager source-identity checks still run when an attested command is actually executed.
 - Normalizer coverage now uses a small deterministic exact-moment sequence instead of
-  thousands of eager random JAX updates. PrototypeAgent coverage likewise consolidates
-  repeated full-stack updates and removes benchmark loops from pytest, keeping both files
-  in the normal CI lane.
+  thousands of eager random JAX updates, so the file returns to the normal CI lane.
 - Removed the unused direct Flax dependency from the base installation. The Forager extra
   still installs it transitively through Gymnax where that runtime inventory is relevant.
-- Moved plotting/dataframe/research utilities out of the base dependency set
-  into a `research` extra, made optional Forager console imports lazy, and
-  made OCI help use its shared dependency-light parser so default hard-linked
-  wheel installs remain inspectable while real operations keep their strict
-  source checks. Aligned the JAX/JAXlib floor with the tested 0.7.1 runtime and
-  restored non-slow runtime coverage for Python 3.13 on main/manual CI runs.
 
 #### Scientific and evidence status
 
-- Evidence writers for continual IA and continual multiagent artifacts now use
-  exclusive creation, the manifest CLI cannot replace the pinned registry
-  snapshot, and invalid multiagent artifacts follow the documented exit-2
-  convention.
-- No Unreleased result promotes an evidence-registry claim. IPMNIST, micro-suite,
+- No 0.29.0 result promotes an evidence-registry claim. IPMNIST, micro-suite,
   rule-discovery, partner, memory, and planning measurements remain development-only.
+- The live evidence registry remains fail-closed with all five claims `invalid` because
+  registered source bytes have changed since their artifacts were pinned. The immutable
+  artifacts are unchanged; this release does not renew or promote those claims.
 - Closed and consumed conclusions are indexed in `docs/evidence/negative-results.md`.
+
+### Fixed
+
+- Paired statistical comparisons now validate seed identities and metric-row counts,
+  align paired t-test and Wilcoxon samples by seed, and reject unequal seed sets instead
+  of silently pairing rows by position. Paired t-tests reject empty, undersized, or
+  identical inputs; Wilcoxon rejects identical pairs instead of inheriting
+  version-dependent SciPy outcomes; and empty bootstrap samples reject instead of
+  producing NaN intervals. Valid unpaired singleton-vs-multi-value tests remain supported,
+  Mann-Whitney comparisons remain unpaired, and one-seed time-series confidence intervals
+  return the finite point trajectory.
+- Seed-axis summaries, final-performance helpers, and per-step spread bands now use the
+  sample standard deviation consistently, with zero spread for one seed. The within-run
+  `compare_learners` helper remains explicitly population dispersion over recorded steps.
+- Statistical helpers now reject nonpositive comparison windows, empty metric step axes,
+  invalid confidence levels, unknown bootstrap statistics, and nonpositive bootstrap
+  counts. Cohen's d reports a signed infinite effect for separated zero-variance groups
+  instead of falsely reporting no effect.
+- Multi-seed experiments now reject duplicate configuration names and duplicate explicit
+  seeds before executing any learner or stream factory, preventing distinct treatments
+  from being merged or deterministic trajectories from being counted twice.
+- IDBD now preserves finite weight and bias step-size state when a non-finite meta-update
+  reaches the clip guard, while retaining the existing bitwise finite-update trajectory.
+- IPMNIST shard merging now refuses a missing named control or a candidate with no shared
+  control seeds instead of ranking a comparison-less entry. Sigma-zero screening factories
+  share one RNG-free noise path, keeping the reference and inert extension on identical
+  lowered graphs.
 
 ### Removed
 
@@ -188,8 +291,7 @@ reproducible results. See `VENDORING.md` for the exact scope.
 - Retired the unconsumed slowly-changing-regression development harness; its historical
   partial records remain under `outputs/` and its bounded conclusion remains in the ledger.
 - Retired the unissued UPGD-IPMNIST v3 governance stack, validator, runbook, and tests.
-  The underlying benchmark equations and immutable v1/v2 development records remain; the
-  public CLI now dispatches to the retained v2 interface and writes exclusively.
+  The benchmark implementation and immutable v1/v2 development records remain unchanged.
 - Removed the deprecated `alberta-evidence-gate` alias and its forwarding shim; use
   `alberta-evidence-status`.
 - Removed the speculative WP0–WP9 and HCCL design documents. Current status and evidence

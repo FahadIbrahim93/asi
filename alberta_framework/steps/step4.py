@@ -22,6 +22,7 @@ References:
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from numbers import Integral
 from typing import Any, Literal, cast
 
 import chex
@@ -30,6 +31,7 @@ import jax.numpy as jnp
 import jax.random as jr
 from jax import Array
 
+from alberta_framework._seed_validation import require_jax_seed
 from alberta_framework.core.optimizers import (
     IDBD,
     LMS,
@@ -45,9 +47,16 @@ from alberta_framework.core.sarsa import (
     SARSAUpdateResult,
 )
 from alberta_framework.core.types import GVFSpec, TraceMode
+from alberta_framework.steps._float32_validation import (
+    canonical_float32_storage,
+    finite_real_and_float32,
+)
+from alberta_framework.steps._smoke_record_validation import require_step_shape
 
 Step4OptimizerName = Literal["lms", "idbd", "autostep"]
 Step4BounderName = Literal["none", "obgd"]
+_INT32_MAX = 2**31 - 1
+_FLOAT32_MIN_NORMAL = float.fromhex("0x1.0p-126")
 
 
 @dataclass(frozen=True)
@@ -71,10 +80,8 @@ class Step4SARSAConfig:
     trace_mode: Literal["accumulating", "replacing"] = "accumulating"
 
     def __post_init__(self) -> None:
-        """Validate action count."""
-        if self.n_actions < 1:
-            msg = f"n_actions must be positive, got {self.n_actions}"
-            raise ValueError(msg)
+        """Reject illegal SARSA scientific scalars and canonicalize reals."""
+        _validate_sarsa_config(self)
 
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-serializable representation."""
@@ -113,6 +120,17 @@ class Step4SmokeResult:
     finite: bool
     agent_config: dict[str, Any]
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "steps", _require_positive_int("steps", self.steps))
+        object.__setattr__(self, "seed", require_jax_seed(self.seed, name="seed"))
+        for name in ("q_values_shape", "td_errors_shape", "actions_shape"):
+            object.__setattr__(
+                self,
+                name,
+                require_step_shape(name, getattr(self, name), steps=self.steps),
+            )
+        object.__setattr__(self, "finite", _require_bool("finite", self.finite))
+
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-serializable representation."""
         payload = asdict(self)
@@ -132,6 +150,115 @@ class Step4OneStepResult:
     q_values: Array
     td_error: Array
     reward: Array
+
+
+def _require_unit_interval(name: str, value: object) -> float:
+    real, numerator, denominator, narrowed = finite_real_and_float32(name, value)
+    if (
+        real < 0.0
+        or not real <= 1.0
+        or numerator < 0
+        or numerator > denominator
+        or narrowed < 0.0
+        or not narrowed <= 1.0
+    ):
+        raise ValueError(f"{name} must be in [0, 1], got {value!r}")
+    return canonical_float32_storage(real, narrowed)
+
+
+def _require_gvf_probability(name: str, value: object) -> float:
+    real, numerator, denominator, narrowed = finite_real_and_float32(name, value)
+    if (
+        real < 0.0
+        or not real <= 1.0
+        or numerator < 0
+        or numerator > denominator
+        or narrowed < 0.0
+        or not narrowed <= 1.0
+    ):
+        raise ValueError(f"{name} must be in [0, 1], got {value!r}")
+    if (
+        (numerator != 0 and numerator << 126 < denominator)
+        or (real != 0.0 and real < _FLOAT32_MIN_NORMAL)
+        or (narrowed != 0.0 and narrowed < _FLOAT32_MIN_NORMAL)
+    ):
+        raise ValueError(f"{name} must be zero or a normal float32 value in [0, 1]")
+    return canonical_float32_storage(real, narrowed)
+
+
+def _require_nonnegative_real(name: str, value: object) -> float:
+    real, numerator, _, narrowed = finite_real_and_float32(name, value)
+    if real < 0.0 or numerator < 0 or narrowed < 0.0:
+        raise ValueError(f"{name} must be non-negative, got {value!r}")
+    return canonical_float32_storage(real, narrowed)
+
+
+def _require_positive_real(name: str, value: object) -> float:
+    real, numerator, _, narrowed = finite_real_and_float32(name, value)
+    if real <= 0.0 or numerator <= 0 or narrowed <= 0.0:
+        raise ValueError(f"{name} must be positive, got {value!r}")
+    return canonical_float32_storage(real, narrowed)
+
+
+def _require_positive_int(name: str, value: object) -> int:
+    actual_type = type(value)
+    if issubclass(actual_type, bool) or not issubclass(actual_type, Integral):
+        raise ValueError(f"{name} must be a positive integer, got {value!r}")
+    number = int(cast(Integral, value))
+    if number < 1:
+        raise ValueError(f"{name} must be positive, got {value!r}")
+    if number > _INT32_MAX:
+        raise ValueError(f"{name} must be at most int32 max, got {value!r}")
+    return number
+
+
+def _require_nonneg_int(name: str, value: object) -> int:
+    actual_type = type(value)
+    if issubclass(actual_type, bool) or not issubclass(actual_type, Integral):
+        raise ValueError(f"{name} must be a non-negative integer, got {value!r}")
+    number = int(cast(Integral, value))
+    if number < 0:
+        raise ValueError(f"{name} must be a non-negative integer, got {value!r}")
+    if number > _INT32_MAX:
+        raise ValueError(f"{name} must be at most int32 max, got {value!r}")
+    return number
+
+
+def _require_bool(name: str, value: object) -> bool:
+    if type(value) is not bool:
+        raise ValueError(f"{name} must be a boolean, got {value!r}")
+    return value
+
+
+def _validate_sarsa_config(config: Step4SARSAConfig) -> None:
+    n_actions = _require_positive_int("n_actions", config.n_actions)
+    hidden_sizes = tuple(
+        _require_positive_int("hidden_sizes", size) for size in config.hidden_sizes
+    )
+    gamma = _require_gvf_probability("gamma", config.gamma)
+    epsilon_start = _require_unit_interval("epsilon_start", config.epsilon_start)
+    epsilon_end = _require_unit_interval("epsilon_end", config.epsilon_end)
+    epsilon_decay_steps = _require_nonneg_int("epsilon_decay_steps", config.epsilon_decay_steps)
+    lamda = _require_gvf_probability("lamda", config.lamda)
+    step_size = _require_nonnegative_real("step_size", config.step_size)
+    meta_step_size = _require_nonnegative_real("meta_step_size", config.meta_step_size)
+    bounder_kappa = _require_positive_real("bounder_kappa", config.bounder_kappa)
+    sparsity = _require_unit_interval("sparsity", config.sparsity)
+    if type(config.use_layer_norm) is not bool:
+        raise ValueError(
+            f"use_layer_norm must be a boolean, got {config.use_layer_norm!r}"
+        )
+    object.__setattr__(config, "n_actions", n_actions)
+    object.__setattr__(config, "hidden_sizes", hidden_sizes)
+    object.__setattr__(config, "gamma", gamma)
+    object.__setattr__(config, "epsilon_start", epsilon_start)
+    object.__setattr__(config, "epsilon_end", epsilon_end)
+    object.__setattr__(config, "epsilon_decay_steps", epsilon_decay_steps)
+    object.__setattr__(config, "lamda", lamda)
+    object.__setattr__(config, "step_size", step_size)
+    object.__setattr__(config, "meta_step_size", meta_step_size)
+    object.__setattr__(config, "bounder_kappa", bounder_kappa)
+    object.__setattr__(config, "sparsity", sparsity)
 
 
 def make_step4_optimizer(config: Step4SARSAConfig) -> Any:

@@ -33,16 +33,19 @@ References:
 from __future__ import annotations
 
 import dataclasses
+import operator
 from collections.abc import Mapping
-from typing import Any, cast
+from typing import Any, SupportsIndex, cast
 
 import chex
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 from jax import Array
 from jaxtyping import Bool, Float, Int, UInt
 
+from alberta_framework.core._float32_scalars import validated_float32_scalar
 from alberta_framework.core.normalizers import (
     _checked_lifetime_words_increment,
     _lifetime_counter_valid,
@@ -59,6 +62,7 @@ from alberta_framework.core.options import (
     SubtaskSpec,
     _checked_lifetime_words_advance,
     _lifetime_words_at_least,
+    _stomp_direct_array_scalars,
     load_stomp_state_with_migration,
     measure_stomp_state_nbytes,
     replace_dispatched_primitive_action,
@@ -72,7 +76,50 @@ OAK_STATE_SCHEMA = "alberta.oak-state.v2"
 OAK_LIFETIME_COUNTER_NBYTES = 12
 OAK_LIFETIME_COUNTER_DELTA_NBYTES = 8
 
+_INT32_MAX = 2**31 - 1
 _UINT64_MAX = 2**64 - 1
+_ACTUAL_INT_TYPES = frozenset(
+    {
+        int,
+        np.int8,
+        np.int16,
+        np.int32,
+        np.int64,
+        np.uint8,
+        np.uint16,
+        np.uint32,
+        np.uint64,
+        np.longlong,
+        np.ulonglong,
+    }
+)
+
+
+def _require_int32(name: str, value: object, *, minimum: int, maximum: int = _INT32_MAX) -> int:
+    if type(value) not in _ACTUAL_INT_TYPES:
+        raise ValueError(f"{name} must be an integer in [{minimum}, {maximum}]")
+    canonical = operator.index(cast(SupportsIndex, value))
+    if not minimum <= canonical <= maximum:
+        raise ValueError(f"{name} must be an integer in [{minimum}, {maximum}]")
+    return canonical
+
+
+def _require_uint64(
+    name: str, value: object, *, minimum: int = 0, maximum: int = _UINT64_MAX
+) -> int:
+    if type(value) not in _ACTUAL_INT_TYPES:
+        raise ValueError(f"{name} must be an integer in [{minimum}, {maximum}]")
+    canonical = operator.index(cast(SupportsIndex, value))
+    if not minimum <= canonical <= maximum:
+        raise ValueError(f"{name} must be an integer in [{minimum}, {maximum}]")
+    return canonical
+
+
+def _require_exact_bool(name: str, value: object) -> bool:
+    if type(value) is not bool:
+        raise ValueError(f"{name} must be an actual bool")
+    return value
+
 
 # ---------------------------------------------------------------------------
 # Default config helper
@@ -113,14 +160,33 @@ class OaKConfig:
     min_steps_before_curation: int = 0
 
     def __post_init__(self) -> None:
-        if not 0.0 <= self.utility_ema_decay <= 1.0:
-            raise ValueError("utility_ema_decay must be in [0, 1]")
-        if self.curation_threshold < 0.0:
-            raise ValueError("curation_threshold must be non-negative")
-        if self.min_steps_before_curation < 0:
-            raise ValueError("min_steps_before_curation must be non-negative")
-        if self.min_steps_before_curation > _UINT64_MAX:
-            raise ValueError("min_steps_before_curation must fit the uint64 lifetime")
+        min_steps = _require_uint64(
+            "min_steps_before_curation",
+            self.min_steps_before_curation,
+            minimum=0,
+            maximum=_UINT64_MAX,
+        )
+        object.__setattr__(self, "min_steps_before_curation", min_steps)
+
+        if type(self.stomp) is not STOMPConfig:
+            raise ValueError("stomp must be an actual STOMPConfig")
+        object.__setattr__(
+            self,
+            "utility_ema_decay",
+            validated_float32_scalar(
+                "utility_ema_decay", self.utility_ema_decay, lower=0.0, upper=1.0
+            ),
+        )
+        object.__setattr__(
+            self,
+            "curation_threshold",
+            validated_float32_scalar(
+                "curation_threshold", self.curation_threshold, lower=0.0
+            ),
+        )
+        combined_scalars = _stomp_direct_array_scalars(self.stomp) + 3 * self.n_options + 3
+        if combined_scalars > _INT32_MAX or 4 * combined_scalars > _INT32_MAX:
+            raise ValueError("derived OaK direct array bytes must fit signed int32")
 
     @property
     def n_options(self) -> int:
@@ -147,9 +213,24 @@ class OaKConfig:
     @classmethod
     def from_config(cls, payload: dict[str, Any]) -> OaKConfig:
         """Reconstruct from :meth:`to_config` output."""
+        if type(payload) is not dict:
+            raise ValueError("OaK config must be an actual dict")
         data = dict(payload)
-        data.pop("type", None)
+        if data.pop("type", None) != "OaKConfig":
+            raise ValueError("OaK config type is invalid")
+        expected = {field.name for field in dataclasses.fields(cls)}
+        if set(data) not in (expected, expected - {"min_steps_before_curation"}):
+            raise ValueError("OaK config fields do not match its schema")
         stomp_raw = data.pop("stomp")
+        if type(stomp_raw) is not dict:
+            raise ValueError("serialized stomp config must be an actual dict")
+        if "min_steps_before_curation" in data and type(
+            data["min_steps_before_curation"]
+        ) is not int:
+            raise ValueError("serialized min_steps_before_curation must be a JSON integer")
+        for name in ("utility_ema_decay", "curation_threshold"):
+            if type(data[name]) is not float:
+                raise ValueError(f"serialized {name} must be a JSON number")
         stomp = STOMPConfig.from_config(stomp_raw)
         return cls(stomp=stomp, **data)
 
@@ -373,9 +454,8 @@ def _oak_outer_state_validity(
             config.observation_dim,
         )
     )
-    values_finite = (
-        jnp.all(jnp.isfinite(state.cumulative_pseudo_rewards))
-        & jnp.all(jnp.isfinite(state.utility_ema))
+    values_finite = jnp.all(jnp.isfinite(state.cumulative_pseudo_rewards)) & jnp.all(
+        jnp.isfinite(state.utility_ema)
     )
     counter_ceiling = jnp.where(
         state.step_count < jnp.int32(2_147_483_647),
@@ -389,11 +469,7 @@ def _oak_outer_state_validity(
         & jnp.all(state.execution_counts >= 0)
         & jnp.all(state.execution_counts <= counter_ceiling)
     )
-    valid = (
-        jnp.asarray(static_contract_valid, dtype=jnp.bool_)
-        & values_finite
-        & counters_valid
-    )
+    valid = jnp.asarray(static_contract_valid, dtype=jnp.bool_) & values_finite & counters_valid
     return (
         jnp.asarray(static_contract_valid, dtype=jnp.bool_),
         values_finite,
@@ -430,9 +506,8 @@ def _exact_tree_equal(left: Any, right: Any) -> Bool[Array, ""]:
         return jnp.asarray(False, dtype=jnp.bool_)
     left_leaves, left_structure = jax.tree_util.tree_flatten(left)
     right_leaves, right_structure = jax.tree_util.tree_flatten(right)
-    if (
-        cast(object, left_structure) != cast(object, right_structure)
-        or len(left_leaves) != len(right_leaves)
+    if cast(object, left_structure) != cast(object, right_structure) or len(left_leaves) != len(
+        right_leaves
     ):
         return jnp.asarray(False, dtype=jnp.bool_)
     equal = jnp.asarray(True, dtype=jnp.bool_)
@@ -684,9 +759,7 @@ def measure_oak_state_nbytes(state: OaKState) -> int:
 def measure_oak_wrapper_state_nbytes(state: OaKState) -> int:
     """Measure only OaK-owned arrays, excluding the nested STOMP state."""
 
-    return measure_oak_state_nbytes(state) - measure_stomp_state_nbytes(
-        state.stomp_state
-    )
+    return measure_oak_state_nbytes(state) - measure_stomp_state_nbytes(state.stomp_state)
 
 
 def oak_lifetime_counter_nbytes() -> int:
@@ -711,10 +784,7 @@ def _oak_host_field_mapping(value: Any) -> dict[str, Any]:
     if isinstance(value, Mapping):
         return dict(value)
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
-        return {
-            field.name: getattr(value, field.name)
-            for field in dataclasses.fields(value)
-        }
+        return {field.name: getattr(value, field.name) for field in dataclasses.fields(value)}
     raise TypeError("legacy OaK state must be a mapping or dataclass")
 
 
@@ -738,8 +808,7 @@ def migrate_legacy_oak_state(legacy_state: Any) -> OaKState:
         missing = sorted(legacy_names - supplied_names)
         extra = sorted(supplied_names - legacy_names)
         raise ValueError(
-            "legacy OaK field manifest is not exact; "
-            f"missing={missing}, extra={extra}"
+            f"legacy OaK field manifest is not exact; missing={missing}, extra={extra}"
         )
 
     step_count = jnp.asarray(fields["step_count"])
@@ -757,9 +826,7 @@ def migrate_legacy_oak_state(legacy_state: Any) -> OaKState:
         nested = load_stomp_state_with_migration(_oak_host_field_mapping(nested))
     if not bool(_lifetime_counter_valid(nested.step_words, nested.step_count)):
         raise ValueError("legacy OaK nested STOMP lifetime counter is invalid")
-    if int(nested.step_count) != step or not bool(
-        jnp.all(nested.step_words == step_words)
-    ):
+    if int(nested.step_count) != step or not bool(jnp.all(nested.step_words == step_words)):
         raise ValueError("legacy OaK and nested STOMP clocks are not aligned")
 
     execution_counts = jnp.asarray(fields["execution_counts"])
@@ -779,14 +846,10 @@ def migrate_legacy_oak_state(legacy_state: Any) -> OaKState:
     if not owned_contract_valid:
         raise ValueError("legacy OaK owned-array contract is invalid")
     counter_ceiling = min(step + 1, 2**31 - 1)
-    if not bool(
-        jnp.all(execution_counts >= 0)
-        & jnp.all(execution_counts <= counter_ceiling)
-    ):
+    if not bool(jnp.all(execution_counts >= 0) & jnp.all(execution_counts <= counter_ceiling)):
         raise ValueError("legacy OaK execution counters are invalid")
     if not bool(
-        jnp.all(jnp.isfinite(cumulative_pseudo_rewards))
-        & jnp.all(jnp.isfinite(utility_ema))
+        jnp.all(jnp.isfinite(cumulative_pseudo_rewards)) & jnp.all(jnp.isfinite(utility_ema))
     ):
         raise ValueError("legacy OaK utility values are non-finite")
 
@@ -857,16 +920,29 @@ class KeyboardChordLearnerConfig:
     max_norm: float = 10.0
 
     def __post_init__(self) -> None:
-        if self.n_options <= 0:
-            raise ValueError("n_options must be positive")
-        if self.step_size < 0.0:
-            raise ValueError("step_size must be non-negative")
-        if not 0.0 <= self.baseline_decay < 1.0:
-            raise ValueError("baseline_decay must be in [0, 1)")
-        if self.l2_penalty < 0.0:
-            raise ValueError("l2_penalty must be non-negative")
-        if self.max_norm <= 0.0:
-            raise ValueError("max_norm must be positive")
+        n_options = _require_int32("n_options", self.n_options, minimum=1)
+        object.__setattr__(self, "n_options", n_options)
+
+        object.__setattr__(
+            self, "step_size", validated_float32_scalar("step_size", self.step_size, lower=0.0)
+        )
+        object.__setattr__(
+            self,
+            "baseline_decay",
+            validated_float32_scalar(
+                "baseline_decay", self.baseline_decay, lower=0.0, upper=1.0, upper_inclusive=False
+            ),
+        )
+        object.__setattr__(
+            self,
+            "l2_penalty",
+            validated_float32_scalar("l2_penalty", self.l2_penalty, lower=0.0),
+        )
+        object.__setattr__(
+            self, "max_norm", validated_float32_scalar("max_norm", self.max_norm, positive=True)
+        )
+        if 4 * (self.n_options + 2) > _INT32_MAX:
+            raise ValueError("derived keyboard state bytes must fit signed int32")
 
     def to_config(self) -> dict[str, Any]:
         """Serialize to a JSON-compatible dictionary."""
@@ -877,8 +953,18 @@ class KeyboardChordLearnerConfig:
     @classmethod
     def from_config(cls, payload: dict[str, Any]) -> KeyboardChordLearnerConfig:
         """Reconstruct from :meth:`to_config` output."""
+        if type(payload) is not dict:
+            raise ValueError("keyboard chord config must be an actual dict")
         data = dict(payload)
-        data.pop("type", None)
+        if data.pop("type", None) != "KeyboardChordLearnerConfig":
+            raise ValueError("keyboard chord config type is invalid")
+        if set(data) != {field.name for field in dataclasses.fields(cls)}:
+            raise ValueError("keyboard chord config fields do not match its schema")
+        if type(data["n_options"]) is not int:
+            raise ValueError("serialized n_options must be a JSON integer")
+        for name in ("step_size", "baseline_decay", "l2_penalty", "max_norm"):
+            if type(data[name]) is not float:
+                raise ValueError(f"serialized {name} must be a JSON number")
         return cls(**data)
 
 
@@ -917,20 +1003,30 @@ def update_keyboard_chord_learner(
     chord_norm = chord / (jnp.linalg.norm(chord) + 1.0e-8)
     reward_arr = jnp.asarray(reward, dtype=jnp.float32)
     baseline = (
-        config.baseline_decay * state.reward_baseline
-        + (1.0 - config.baseline_decay) * reward_arr
+        config.baseline_decay * state.reward_baseline + (1.0 - config.baseline_decay) * reward_arr
     )
     advantage = reward_arr - state.reward_baseline
-    new_vector = (
+    proposed_vector = (
         state.chord_vector * (1.0 - config.step_size * config.l2_penalty)
         + config.step_size * advantage * chord_norm
     )
-    norm = jnp.linalg.norm(new_vector)
+    norm = jnp.linalg.norm(proposed_vector)
     scale = jnp.minimum(1.0, jnp.asarray(config.max_norm, dtype=jnp.float32) / (norm + 1.0e-8))
-    return KeyboardChordLearnerState(
-        chord_vector=new_vector * scale,
+    proposed_state = KeyboardChordLearnerState(
+        chord_vector=proposed_vector * scale,
         reward_baseline=baseline,
         step_count=state.step_count + 1,
+    )
+    # Inf reward * a zero chord coordinate is 0*inf = NaN, then the
+    # max-norm rescaling is nan/inf and the whole vector stays poisoned.
+    inputs_valid = jnp.all(jnp.isfinite(chord)) & jnp.isfinite(reward_arr)
+    proposed_finite = jnp.all(jnp.isfinite(proposed_state.chord_vector)) & jnp.isfinite(
+        proposed_state.reward_baseline
+    )
+    return jax.lax.cond(
+        inputs_valid & proposed_finite,
+        lambda: proposed_state,
+        lambda: state,
     )
 
 
@@ -995,9 +1091,9 @@ def keyboard_action(
     """
     q_vals = keyboard_q_values(stomp_state, observation, keyboard_vector)
     key, explore_key, noise_key = jr.split(key, 3)
-    greedy = jnp.argmax(
-        q_vals + 1e-6 * jr.gumbel(noise_key, (n_primitive_actions,))
-    ).astype(jnp.int32)
+    greedy = jnp.argmax(q_vals + 1e-6 * jr.gumbel(noise_key, (n_primitive_actions,))).astype(
+        jnp.int32
+    )
     random_action = jr.randint(explore_key, (), 0, n_primitive_actions).astype(jnp.int32)
     action = jnp.where(
         jr.uniform(key) < jnp.asarray(epsilon, dtype=jnp.float32),
@@ -1096,9 +1192,8 @@ class OaKAgent:
                 & jnp.all(jnp.isfinite(observation))
             )
         started_option = new_stomp.executing_option
-        started_mask = (
-            jnp.arange(self._config.n_options, dtype=jnp.int32)
-            == jnp.maximum(started_option, jnp.array(0, dtype=jnp.int32))
+        started_mask = jnp.arange(self._config.n_options, dtype=jnp.int32) == jnp.maximum(
+            started_option, jnp.array(0, dtype=jnp.int32)
         )
         new_execution_counts = jnp.where(
             started_mask & (started_option >= 0),
@@ -1160,9 +1255,7 @@ class OaKAgent:
             state.step_words,
             state.step_count,
         )
-        nested_counter_aligned = jnp.all(
-            state.step_words == state.stomp_state.step_words
-        )
+        nested_counter_aligned = jnp.all(state.step_words == state.stomp_state.step_words)
         source_nested_counter_aligned = jnp.all(
             source_state.step_words == source_state.stomp_state.step_words
         )
@@ -1176,15 +1269,11 @@ class OaKAgent:
         proposed_step_words, outer_capacity = _checked_lifetime_words_increment(
             source_state.step_words
         )
-        expected_nested_words, computed_nested_capacity = (
-            _checked_lifetime_words_advance(
-                source_state.stomp_state.base_learner_state.step_words,
-                stomp_result.nested_updates_required,
-            )
+        expected_nested_words, computed_nested_capacity = _checked_lifetime_words_advance(
+            source_state.stomp_state.base_learner_state.step_words,
+            stomp_result.nested_updates_required,
         )
-        expected_step_count = _saturating_int32_counter_increment(
-            source_state.step_count
-        )
+        expected_step_count = _saturating_int32_counter_increment(source_state.step_count)
         result_clock_binding_valid = (
             jnp.array_equal(
                 stomp_result.pre_step_words,
@@ -1240,9 +1329,7 @@ class OaKAgent:
             & idle_outputs_valid
             & continuing_owner_valid
         )
-        inferred_real_updates = (
-            stomp_result.nested_updates_applied - stomp_result.planning_backups
-        )
+        inferred_real_updates = stomp_result.nested_updates_applied - stomp_result.planning_backups
         result_diagnostics_valid = (
             stomp_result.inputs_valid
             & stomp_result.lifetime_counter_valid
@@ -1252,15 +1339,9 @@ class OaKAgent:
             & stomp_result.proposed_state_valid
             & stomp_result.update_applied
             & (stomp_result.nested_updates_required >= 0)
-            & (
-                stomp_result.nested_updates_applied
-                == stomp_result.nested_updates_required
-            )
+            & (stomp_result.nested_updates_applied == stomp_result.nested_updates_required)
             & (stomp_result.planning_backups >= 0)
-            & (
-                stomp_result.planning_backups
-                <= cfg.stomp.option_planning_backups_per_step
-            )
+            & (stomp_result.planning_backups <= cfg.stomp.option_planning_backups_per_step)
             & (inferred_real_updates >= 0)
             & (inferred_real_updates <= 1)
             & (stomp_result.option_importance_ratio >= 0.0)
@@ -1271,14 +1352,11 @@ class OaKAgent:
             prior_option,
             jnp.asarray(0, dtype=jnp.int32),
         )
-        prior_option_mask = (
-            jnp.arange(n_options, dtype=jnp.int32) == prior_option_index
-        )
+        prior_option_mask = jnp.arange(n_options, dtype=jnp.int32) == prior_option_index
         decay = jnp.asarray(cfg.utility_ema_decay, dtype=jnp.float32)
         new_utility_ema = jnp.where(
             prior_option_mask & prior_active,
-            decay * source_state.utility_ema
-            + (1.0 - decay) * stomp_result.pseudo_reward,
+            decay * source_state.utility_ema + (1.0 - decay) * stomp_result.pseudo_reward,
             source_state.utility_ema,
         )
 
@@ -1287,29 +1365,22 @@ class OaKAgent:
             post_option,
             jnp.asarray(0, dtype=jnp.int32),
         )
-        post_option_mask = (
-            jnp.arange(n_options, dtype=jnp.int32) == post_option_index
-        )
+        post_option_mask = jnp.arange(n_options, dtype=jnp.int32) == post_option_index
         post_active = post_option >= jnp.asarray(0, dtype=jnp.int32)
-        just_started = post_active & (
-            (~prior_active) | stomp_result.option_terminated
-        )
+        just_started = post_active & ((~prior_active) | stomp_result.option_terminated)
         new_execution_counts = jnp.where(
             post_option_mask & just_started,
             _saturating_int32_counter_increment(source_state.execution_counts),
             source_state.execution_counts,
         )
-        new_cumulative_pseudo_rewards = (
-            source_state.cumulative_pseudo_rewards
-            + jnp.where(
-                prior_option_mask & prior_active,
-                jnp.full(
-                    n_options,
-                    stomp_result.pseudo_reward,
-                    dtype=jnp.float32,
-                ),
-                jnp.zeros(n_options, dtype=jnp.float32),
-            )
+        new_cumulative_pseudo_rewards = source_state.cumulative_pseudo_rewards + jnp.where(
+            prior_option_mask & prior_active,
+            jnp.full(
+                n_options,
+                stomp_result.pseudo_reward,
+                dtype=jnp.float32,
+            ),
+            jnp.zeros(n_options, dtype=jnp.float32),
         )
         proposed_state = OaKState(
             stomp_state=stomp_result.state,
@@ -1319,9 +1390,7 @@ class OaKAgent:
             step_count=expected_step_count,
             step_words=proposed_step_words,
         )
-        post_nested_counter_aligned = jnp.all(
-            stomp_result.state.step_words == proposed_step_words
-        )
+        post_nested_counter_aligned = jnp.all(stomp_result.state.step_words == proposed_step_words)
         proposed_state_valid = (
             _oak_outer_state_validity(proposed_state, cfg)[-1]
             & self._stomp.state_valid(proposed_state.stomp_state)
@@ -1437,10 +1506,7 @@ class OaKAgent:
                 f"({self._config.n_options},), got {reset_slots.shape}"
             )
         if reset_slots.dtype != jnp.bool_:
-            raise TypeError(
-                "reset_slot_mask must have dtype bool, "
-                f"got {reset_slots.dtype}"
-            )
+            raise TypeError(f"reset_slot_mask must have dtype bool, got {reset_slots.dtype}")
 
         source_state_valid = (
             _oak_outer_state_validity(state, self._config)[-1]
@@ -1616,6 +1682,9 @@ class OaKAgent:
     ) -> OaKTracedUpdateResult:
         """Evaluate STOMP exactly once and return its transient adoption trace."""
 
+        enable_option_planning = _require_exact_bool(
+            "enable_option_planning", enable_option_planning
+        )
         stomp_result: STOMPUpdateResult = self._stomp.update(
             state.stomp_state,
             env_reward,
@@ -1625,9 +1694,7 @@ class OaKAgent:
             execution_boundary=execution_boundary,
             extended_action_mask=extended_action_mask,
             enable_planning=enable_option_planning,
-            preselection_feature_reset_mask=(
-                preselection_feature_reset_mask
-            ),
+            preselection_feature_reset_mask=(preselection_feature_reset_mask),
         )
         update = self.adopt_stomp_update(
             state,
@@ -1674,9 +1741,7 @@ class OaKAgent:
                 decision_observation=decision_obs,
                 execution_boundary=execution_boundary,
                 extended_action_mask=(
-                    extended_action_mask
-                    if extended_action_masks is not None
-                    else None
+                    extended_action_mask if extended_action_masks is not None else None
                 ),
             )
             return result.state, (
@@ -1723,25 +1788,28 @@ class OaKAgent:
             else jnp.asarray(extended_action_masks)
         )
 
-        final_state, (
-            td_errors,
-            average_rewards,
-            primitive_actions,
-            executing_options,
-            option_terminations,
-            pseudo_rewards,
-            utility_emas,
-            planning_backups,
-            planning_td_errors,
-            pre_step_words,
-            post_step_words,
-            outer_state_valid,
-            lifetime_counter_valid,
-            lifetime_capacity_available,
-            nested_counter_aligned,
-            nested_update_applied,
-            proposed_state_valid,
-            update_applied,
+        (
+            final_state,
+            (
+                td_errors,
+                average_rewards,
+                primitive_actions,
+                executing_options,
+                option_terminations,
+                pseudo_rewards,
+                utility_emas,
+                planning_backups,
+                planning_td_errors,
+                pre_step_words,
+                post_step_words,
+                outer_state_valid,
+                lifetime_counter_valid,
+                lifetime_capacity_available,
+                nested_counter_aligned,
+                nested_update_applied,
+                proposed_state_valid,
+                update_applied,
+            ),
         ) = jax.lax.scan(
             step_fn,
             state,
@@ -1815,14 +1883,8 @@ class OaKAgent:
         utility = state.utility_ema
 
         outer_valid = _oak_outer_state_validity(state, cfg)[-1]
-        nested_aligned = jnp.all(
-            state.step_words == state.stomp_state.step_words
-        )
-        if not bool(
-            outer_valid
-            & nested_aligned
-            & self._stomp.state_valid(state.stomp_state)
-        ):
+        nested_aligned = jnp.all(state.step_words == state.stomp_state.step_words)
+        if not bool(outer_valid & nested_aligned & self._stomp.state_valid(state.stomp_state)):
             return self, state
 
         # Minimum-uptime guard: never evict before utilities have had time
@@ -1879,9 +1941,7 @@ class OaKAgent:
         new_op_traces = state.stomp_state.option_policies.traces.at[idx].set(
             jnp.zeros_like(state.stomp_state.option_policies.traces[idx])
         )
-        new_op_average_rewards = (
-            state.stomp_state.option_policies.average_rewards.at[idx].set(0.0)
-        )
+        new_op_average_rewards = state.stomp_state.option_policies.average_rewards.at[idx].set(0.0)
         new_option_policies = cast(
             IntraOptionPoliciesState,
             state.stomp_state.option_policies.replace(
@@ -1900,9 +1960,9 @@ class OaKAgent:
                 cumreward_ema=state.stomp_state.option_models.cumreward_ema.at[idx].set(0.0),
                 env_return_ema=state.stomp_state.option_models.env_return_ema.at[idx].set(0.0),
                 duration_ema=state.stomp_state.option_models.duration_ema.at[idx].set(0.0),
-                baseline_mass_ema=state.stomp_state.option_models.baseline_mass_ema.at[
-                    idx
-                ].set(0.0),
+                baseline_mass_ema=state.stomp_state.option_models.baseline_mass_ema.at[idx].set(
+                    0.0
+                ),
                 discount_ema=state.stomp_state.option_models.discount_ema.at[idx].set(1.0),
                 next_state_weights=new_ns_weights,
                 n_completions=state.stomp_state.option_models.n_completions.at[idx].set(0),
@@ -1951,9 +2011,7 @@ class OaKAgent:
         new_state = OaKState(
             stomp_state=new_stomp_state,
             execution_counts=jnp.where(replace_mask, 0, state.execution_counts),
-            cumulative_pseudo_rewards=jnp.where(
-                replace_mask, 0.0, state.cumulative_pseudo_rewards
-            ),
+            cumulative_pseudo_rewards=jnp.where(replace_mask, 0.0, state.cumulative_pseudo_rewards),
             utility_ema=jnp.where(replace_mask, 0.0, state.utility_ema),
             step_count=state.step_count,
             step_words=state.step_words,
@@ -2001,8 +2059,7 @@ class OaKAgent:
         )
         raw_chord = jnp.asarray(keyboard_vector)
         keyboard_vector_static_contract_valid = (
-            raw_chord.shape == (self._config.n_options,)
-            and raw_chord.dtype == jnp.float32
+            raw_chord.shape == (self._config.n_options,) and raw_chord.dtype == jnp.float32
         )
         chord = (
             raw_chord
@@ -2010,10 +2067,9 @@ class OaKAgent:
             else jnp.zeros((self._config.n_options,), dtype=jnp.float32)
         )
 
-        observation_valid = (
-            jnp.asarray(observation_static_contract_valid, dtype=jnp.bool_)
-            & jnp.all(jnp.isfinite(observation))
-        )
+        observation_valid = jnp.asarray(
+            observation_static_contract_valid, dtype=jnp.bool_
+        ) & jnp.all(jnp.isfinite(observation))
         chord_l1 = jnp.sum(jnp.abs(chord))
         keyboard_vector_valid = (
             jnp.asarray(keyboard_vector_static_contract_valid, dtype=jnp.bool_)

@@ -46,10 +46,10 @@ original Dohare implementation uses in practice.
 
 Replacement
 -----------
-On every step, ``replacement_rate * num_hidden_units`` units (rounded
-up) per layer are *eligible* for replacement. Of those, only units that
-are at least ``maturity_threshold`` updates old AND have the lowest
-utility in the layer are actually replaced. Replaced units have their
+On every step, ``replacement_rate * num_mature_units`` fractional
+replacements accrue per layer (units younger than ``maturity_threshold``
+earn no budget), and at most one accumulated replacement is delivered per
+step: the mature unit with the lowest utility in the layer is replaced. Replaced units have their
 incoming weights re-drawn via :func:`sparse_init` and their outgoing
 weights zeroed (so a freshly initialized unit does not destabilize the
 prediction immediately). The unit's age and utility are reset to 0.
@@ -64,17 +64,23 @@ References
 from __future__ import annotations
 
 import functools
+import operator
 import time
-from typing import Any
+from collections.abc import Mapping
+from fractions import Fraction
+from typing import Any, SupportsIndex, cast
 
 import chex
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 from jax import Array
 from jaxtyping import Float, Int
 
-from alberta_framework.core._float32_scalars import validated_float32_scalar
+from alberta_framework.core._float32_scalars import (
+    validated_float32_scalar_with_ratio,
+)
 from alberta_framework.core.initializers import sparse_init
 from alberta_framework.core.multi_head_learner import (
     MULTI_HEAD_MLP_STATE_SCHEMA,
@@ -82,11 +88,124 @@ from alberta_framework.core.multi_head_learner import (
     MultiHeadMLPLearner,
     MultiHeadMLPState,
     MultiHeadMLPUpdateResult,
-    _require_hidden_width,
 )
 from alberta_framework.core.normalizers import Normalizer
 from alberta_framework.core.optimizers import Bounder
 from alberta_framework.core.types import TraceMode
+
+_NUMPY_FLOAT_SCALAR_TYPES = frozenset((np.float16, np.float32, np.float64, np.longdouble))
+_NUMPY_INTEGER_SCALAR_TYPES = frozenset(
+    (
+        np.int8,
+        np.int16,
+        np.int32,
+        np.int64,
+        np.longlong,
+        np.uint8,
+        np.uint16,
+        np.uint32,
+        np.uint64,
+        np.ulonglong,
+    )
+)
+_CBP_CONFIG_FIELDS = frozenset(
+    {"decay_rate", "replacement_rate", "maturity_threshold", "enabled"}
+)
+_CBP_MULTI_CONFIG_FIELDS = frozenset(
+    {
+        "type",
+        "state_schema",
+        "cbp_config",
+        "n_heads",
+        "hidden_sizes",
+        "optimizer",
+        "bounder",
+        "normalizer",
+        "head_optimizer",
+        "sparsity",
+        "leaky_relu_slope",
+        "use_layer_norm",
+        "gamma",
+        "lamda",
+        "per_head_gamma_lamda",
+        "trace_mode",
+        "utility_decay",
+    }
+)
+_CBP_SINGLE_CONFIG_FIELDS = _CBP_MULTI_CONFIG_FIELDS - {
+    "n_heads",
+    "per_head_gamma_lamda",
+}
+_INT32_MAX = 2**31 - 1
+_ACTUAL_INT_TYPES: frozenset[type] = frozenset(
+    {
+        int,
+        np.int8,
+        np.int16,
+        np.int32,
+        np.int64,
+        np.uint8,
+        np.uint16,
+        np.uint32,
+        np.uint64,
+        np.longlong,
+        np.ulonglong,
+    }
+)
+_ACTUAL_FLOAT_TYPES: frozenset[type] = frozenset(
+    {float, Fraction, *(np.dtype(c).type for c in ("e", "f", "d", "g"))}
+)
+_ALLOWED_REAL_TYPES: frozenset[type] = _ACTUAL_INT_TYPES | _ACTUAL_FLOAT_TYPES
+
+
+def _require_int(name: str, value: object, *, minimum: int, maximum: int = _INT32_MAX) -> int:
+    if type(value) not in _ACTUAL_INT_TYPES:
+        raise ValueError(f"{name} must be an integer")
+    canonical = operator.index(cast(SupportsIndex, value))
+    if not minimum <= canonical <= maximum:
+        raise ValueError(f"{name} must be an integer")
+    return canonical
+
+
+def _require_bool(name: str, value: object) -> bool:
+    if type(value) is not bool:
+        raise ValueError(f"{name} must be an actual bool")
+    return value
+
+
+def _validated_config_float(
+    name: str,
+    value: object,
+    *,
+    lower: float | None = None,
+    upper: float | None = None,
+    upper_inclusive: bool = True,
+) -> float:
+    if type(value) not in _ALLOWED_REAL_TYPES:
+        raise ValueError(f"{name} must be a finite real number")
+    stored, numerator, denominator = validated_float32_scalar_with_ratio(
+        name,
+        value,
+        lower=lower,
+        upper=upper,
+        upper_inclusive=upper_inclusive,
+    )
+    if numerator != 0 and abs(numerator) * (1 << 149) <= denominator:
+        raise ValueError(f"{name} must remain nonzero once narrowed to float32")
+    return stored
+
+
+def _copy_mapping(payload: object, *, name: str) -> dict[str, object]:
+    if not isinstance(payload, Mapping):
+        raise ValueError(f"{name} payload must be a mapping")
+    try:
+        data = dict(payload)  # type: ignore[arg-type]
+    except Exception as exc:
+        raise ValueError(f"{name} payload could not be read") from exc
+    for key in data:
+        if type(key) is not str:
+            raise ValueError(f"{name} payload has exact strings as keys")
+    return data
 
 # =============================================================================
 # Config / state
@@ -118,6 +237,36 @@ class ContinualBackpropConfig:
     maturity_threshold: int = 100
     enabled: bool = True
 
+    def __post_init__(self) -> None:
+        """Validate and canonicalize configuration at its execution boundaries."""
+        object.__setattr__(
+            self,
+            "decay_rate",
+            _validated_config_float(
+                "decay_rate",
+                self.decay_rate,
+                lower=0.0,
+                upper=1.0,
+                upper_inclusive=False,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "replacement_rate",
+            _validated_config_float(
+                "replacement_rate",
+                self.replacement_rate,
+                lower=0.0,
+                upper=1.0,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "maturity_threshold",
+            _require_int("maturity_threshold", self.maturity_threshold, minimum=0),
+        )
+        object.__setattr__(self, "enabled", _require_bool("enabled", self.enabled))
+
     def to_config(self) -> dict[str, Any]:
         """Serialize to dict."""
         return {
@@ -128,9 +277,15 @@ class ContinualBackpropConfig:
         }
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> ContinualBackpropConfig:
+    def from_config(cls, config: object) -> ContinualBackpropConfig:
         """Reconstruct from dict."""
-        return cls(**config)
+        payload = _copy_mapping(config, name="ContinualBackpropConfig")
+        if set(payload) != _CBP_CONFIG_FIELDS:
+            raise ValueError("ContinualBackpropConfig fields do not match the schema")
+        return cls(**payload)  # type: ignore[arg-type]
+
+
+
 
 
 @chex.dataclass(frozen=True)
@@ -146,9 +301,11 @@ class ContinualBackpropState:
             ``utilities``.
         replacement_accumulators: One scalar per hidden layer that
             accumulates the (fractional) number of replacements
-            scheduled by ``replacement_rate * num_units`` each step.
-            Whenever an accumulator exceeds 1.0 a single unit in that
-            layer is replaced and the accumulator is decremented by 1.
+            scheduled by ``replacement_rate * num_mature_units`` each
+            step. Whenever an accumulator reaches 1.0 and a mature unit
+            exists, a single unit in that layer is replaced and the
+            accumulator is decremented by 1; it never carries more than
+            one pending replacement.
             This makes ``replacement_rate << 1`` behave as expected in
             the JIT-compiled scan loop without integer arithmetic.
         rng_key: PRNG key used to draw fresh weights for replaced
@@ -177,7 +334,7 @@ def init_cbp_state(
         mlp_state: An initialized :class:`MultiHeadMLPState`. Used only
             to validate that ``hidden_sizes`` matches the trunk shape.
         hidden_sizes: Hidden layer sizes from the learner constructor.
-            Must match ``len(mlp_state.trunk_params.weights)``.
+            Must match the trunk layer count and every layer's width.
         key: JAX random key for replacement weight sampling.
 
     Returns:
@@ -191,6 +348,14 @@ def init_cbp_state(
             f"count ({len(mlp_state.trunk_params.weights)})."
         )
         raise ValueError(msg)
+    for layer_idx, (width, weight) in enumerate(
+        zip(hidden_sizes, mlp_state.trunk_params.weights, strict=True)
+    ):
+        if int(weight.shape[0]) != int(width):
+            raise ValueError(
+                f"hidden_sizes[{layer_idx}]={width} does not match trunk layer "
+                f"{layer_idx} width ({weight.shape[0]})"
+            )
 
     utilities = tuple(
         jnp.zeros(h, dtype=jnp.float32) for h in hidden_sizes
@@ -285,7 +450,17 @@ def update_utility(
     new_ages: list[Array] = []
     for i in range(n_layers):
         contribution = jnp.abs(activations[i] * activation_grads[i])
-        u_new = decay * cbp_state.utilities[i] + (1.0 - decay) * contribution
+        # Inf activation * a silent gradient is 0*inf = NaN. Hold the
+        # previous finite utility so replacement does not treat NaN as
+        # the lowest-utility unit.
+        contribution_finite = jnp.isfinite(contribution)
+        decayed = jnp.where(
+            decay == 0.0,
+            jnp.zeros_like(cbp_state.utilities[i]),
+            decay * cbp_state.utilities[i],
+        )
+        u_new = decayed + (1.0 - decay) * contribution
+        u_new = jnp.where(contribution_finite, u_new, cbp_state.utilities[i])
         new_utilities.append(u_new)
         new_ages.append(cbp_state.ages[i] + 1)
 
@@ -307,8 +482,8 @@ def _select_replacement_index(
     exists, ``selected`` is ``-1`` (sentinel) and ``has_candidate`` is
     ``False``.
 
-    Implementation: replace the utility of immature units with ``+inf``
-    before taking ``argmin`` so they are never chosen.
+    Implementation: replace the utility of immature or non-finite units
+    with ``+inf`` before taking ``argmin`` so they are never chosen.
 
     Args:
         utility: Per-unit utility array, shape ``(num_units,)``.
@@ -320,8 +495,9 @@ def _select_replacement_index(
         unit (or ``-1``) and ``has_candidate`` is a boolean scalar.
     """
     mature = age >= jnp.asarray(maturity_threshold, dtype=age.dtype)
-    masked_utility = jnp.where(mature, utility, jnp.inf)
-    has_candidate = jnp.any(mature)
+    eligible = mature & jnp.isfinite(utility)
+    masked_utility = jnp.where(eligible, utility, jnp.inf)
+    has_candidate = jnp.any(eligible)
     idx = jnp.argmin(masked_utility)
     selected = jnp.where(has_candidate, idx, jnp.int32(-1))
     return selected.astype(jnp.int32), has_candidate
@@ -456,25 +632,45 @@ def maybe_replace_units(
     Returns:
         Updated ``(mlp_state, cbp_state)``.
     """
-    if not config.enabled:
-        return mlp_state, cbp_state
+    new_mlp_state, new_cbp_state, _replaced = replace_units_with_flags(
+        mlp_state, cbp_state, config, sparsity
+    )
+    return new_mlp_state, new_cbp_state
 
+
+def replace_units_with_flags(
+    mlp_state: MultiHeadMLPState,
+    cbp_state: ContinualBackpropState,
+    config: ContinualBackpropConfig,
+    sparsity: float,
+) -> tuple[MultiHeadMLPState, ContinualBackpropState, Array]:
+    """Run :func:`maybe_replace_units` and also return the per-layer replacement flags.
+
+    Returns:
+        ``(mlp_state, cbp_state, replaced)`` where ``replaced`` is a boolean
+        array with one entry per hidden layer that is ``True`` exactly when
+        that layer's gated replacement fired this step.
+    """
     n_layers = len(cbp_state.utilities)
-    if n_layers == 0:
-        return mlp_state, cbp_state
+    no_replacements = jnp.zeros((n_layers,), dtype=jnp.bool_)
+    if not config.enabled or n_layers == 0:
+        return mlp_state, cbp_state, no_replacements
 
     rate = jnp.asarray(config.replacement_rate, dtype=jnp.float32)
     accum_arr = cbp_state.replacement_accumulators
     new_accum_list: list[Array] = []
+    replaced_flags: list[Array] = []
 
     new_mlp_state = mlp_state
     new_cbp_state = cbp_state
     rng_key = cbp_state.rng_key
     for layer_idx in range(n_layers):
-        layer_size = cbp_state.utilities[layer_idx].shape[0]
-        layer_size_f = jnp.asarray(layer_size, dtype=jnp.float32)
-        # Add this step's fractional replacements to the accumulator.
-        accum = accum_arr[layer_idx] + rate * layer_size_f
+        # Add this step's fractional replacements to the accumulator, accrued
+        # against the units that are actually eligible (mature) right now, as in
+        # the reference GnT implementation; immature units earn no budget.
+        eligible = new_cbp_state.ages[layer_idx] >= config.maturity_threshold
+        n_eligible = jnp.sum(eligible).astype(jnp.float32)
+        accum = accum_arr[layer_idx] + rate * n_eligible
         # Will we replace one unit this step?
         do_replace = accum >= 1.0
         # Pick lowest-utility mature unit from the *current* CBP state.
@@ -495,15 +691,17 @@ def maybe_replace_units(
             new_cbp_state,
             subkey,
         )
-        # Decrement accumulator only if we actually replaced.
-        accum_after = jnp.where(gated, accum - 1.0, accum)
+        # Decrement accumulator only if we actually replaced, and never carry
+        # more than the one replacement a step can deliver.
+        accum_after = jnp.minimum(jnp.where(gated, accum - 1.0, accum), 1.0)
         new_accum_list.append(accum_after)
+        replaced_flags.append(gated)
 
     new_cbp_state = new_cbp_state.replace(  # type: ignore[attr-defined]
         replacement_accumulators=jnp.stack(new_accum_list),
         rng_key=rng_key,
     )
-    return new_mlp_state, new_cbp_state
+    return new_mlp_state, new_cbp_state, jnp.stack(replaced_flags)
 
 
 # =============================================================================
@@ -587,6 +785,19 @@ class ContinualBackpropTracker:
     config: ContinualBackpropConfig
     sparsity: float = 0.9
 
+    def __post_init__(self) -> None:
+        """Reject bool/non-finite sparsity identities used at replacement."""
+        object.__setattr__(
+            self,
+            "sparsity",
+            _validated_config_float(
+                "sparsity",
+                self.sparsity,
+                lower=0.0,
+                upper=1.0,
+            ),
+        )
+
 
 class CBPMultiHeadMLPLearner:
     """Multi-head MLP learner with Continual Backprop unit replacement.
@@ -658,16 +869,20 @@ class CBPMultiHeadMLPLearner:
             utility_decay: EMA decay for the underlying MLP's native
                 hidden-unit utility diagnostics.
         """
-        self._n_heads = n_heads
-        if type(hidden_sizes) is not tuple:
-            raise ValueError(
-                f"hidden_sizes must be an actual tuple, got {type(hidden_sizes).__name__}"
-            )
-        hidden_sizes = tuple(
-            _require_hidden_width(f"hidden_sizes[{i}]", v) for i, v in enumerate(hidden_sizes)
-        )
-        self._hidden_sizes = hidden_sizes
         self._cbp_config = cbp_config or ContinualBackpropConfig()
+        if type(use_layer_norm) is not bool:
+            raise ValueError("use_layer_norm must be an actual bool")
+        sparsity = _validated_config_float(
+            "sparsity",
+            sparsity,
+            lower=0.0,
+            upper=1.0,
+        )
+        leaky_relu_slope = _validated_config_float(
+            "leaky_relu_slope",
+            leaky_relu_slope,
+            lower=0.0,
+        )
         self._sparsity = sparsity
         self._leaky_relu_slope = leaky_relu_slope
         self._use_layer_norm = use_layer_norm
@@ -689,6 +904,8 @@ class CBPMultiHeadMLPLearner:
             trace_mode=trace_mode,
             utility_decay=utility_decay,
         )
+        self._n_heads = self._learner.n_heads
+        self._hidden_sizes = self._learner.hidden_sizes
 
     @property
     def learner(self) -> MultiHeadMLPLearner:
@@ -721,7 +938,7 @@ class CBPMultiHeadMLPLearner:
         }
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> CBPMultiHeadMLPLearner:
+    def from_config(cls, config: object) -> CBPMultiHeadMLPLearner:
         """Reconstruct from a config dict produced by :meth:`to_config`."""
         from alberta_framework.core.normalizers import normalizer_from_config
         from alberta_framework.core.optimizers import (
@@ -729,13 +946,27 @@ class CBPMultiHeadMLPLearner:
             optimizer_from_config,
         )
 
-        config = dict(config)
-        config.pop("type", None)
-        state_schema = config.pop("state_schema", MULTI_HEAD_MLP_STATE_SCHEMA)
-        if state_schema != MULTI_HEAD_MLP_STATE_SCHEMA:
-            raise ValueError(
-                f"Unsupported MultiHeadMLP state schema: {state_schema!r}"
-            )
+        payload = _copy_mapping(config, name="CBPMultiHeadMLPLearner")
+        if set(payload) != _CBP_MULTI_CONFIG_FIELDS:
+            raise ValueError("CBPMultiHeadMLPLearner config fields do not match the schema")
+        config = payload
+        if type(config["type"]) is not str or config["type"] != "CBPMultiHeadMLPLearner":
+            raise ValueError("unexpected CBPMultiHeadMLPLearner config type")
+        if (
+            type(config["state_schema"]) is not str
+            or config["state_schema"] != MULTI_HEAD_MLP_STATE_SCHEMA
+        ):
+            raise ValueError("unsupported MultiHeadMLP state schema")
+        if type(config["hidden_sizes"]) is not list:
+            raise ValueError("hidden_sizes must be a list")
+        if (
+            config["per_head_gamma_lamda"] is not None
+            and type(config["per_head_gamma_lamda"]) is not list
+        ):
+            raise ValueError("per_head_gamma_lamda must be a list")
+        config = config.copy()
+        config.pop("type")
+        config.pop("state_schema")
         cbp_cfg_dict = config.pop("cbp_config")
         cbp_config = ContinualBackpropConfig.from_config(cbp_cfg_dict)
 
@@ -751,36 +982,19 @@ class CBPMultiHeadMLPLearner:
             optimizer_from_config(head_opt_cfg) if head_opt_cfg is not None else None
         )
 
-        per_head_gl = config.pop("per_head_gamma_lamda", None)
+        per_head_gl = config.pop("per_head_gamma_lamda")
         if per_head_gl is not None:
-            if type(per_head_gl) is not list:
-                raise ValueError(
-                    f"per_head_gamma_lamda must be a list, got {type(per_head_gl).__name__}"
-                )
-            per_head_gl = tuple(
-                validated_float32_scalar(
-                    f"per_head_gamma_lamda[{i}]", v, lower=0.0, upper=1.0
-                )
-                for i, v in enumerate(per_head_gl)
-            )
+            per_head_gl = tuple(per_head_gl)
 
-        trace_mode_str = config.pop("trace_mode", None)
-        trace_mode = (
-            TraceMode(trace_mode_str)
-            if trace_mode_str is not None
-            else TraceMode.ACCUMULATING
-        )
+        trace_mode_str = config.pop("trace_mode")
+        if type(trace_mode_str) is not str:
+            raise ValueError("trace_mode must be a string")
+        trace_mode = TraceMode(trace_mode_str)
 
         raw_hidden = config.pop("hidden_sizes")
-        if type(raw_hidden) is not list:
-            raise ValueError(f"hidden_sizes must be a list, got {type(raw_hidden).__name__}")
-        hidden_sizes = tuple(
-            _require_hidden_width(f"hidden_sizes[{i}]", v) for i, v in enumerate(raw_hidden)
-        )
-
         return cls(
             n_heads=config.pop("n_heads"),
-            hidden_sizes=hidden_sizes,
+            hidden_sizes=tuple(raw_hidden),
             cbp_config=cbp_config,
             optimizer=optimizer,
             bounder=bounder,
@@ -933,22 +1147,14 @@ class CBPMultiHeadMLPLearner:
             self._cbp_config.decay_rate,
         )
 
-        # 4. Possibly replace low-utility mature units.
-        # Track which layers actually replaced for diagnostics. We
-        # detect by checking whether the accumulator decremented.
-        old_accum = new_cbp_state.replacement_accumulators
-        new_post_state, new_cbp_state = maybe_replace_units(
+        # 4. Possibly replace low-utility mature units, reporting the exact
+        #    gated decision per layer as the diagnostic.
+        new_post_state, new_cbp_state, replacements_made = replace_units_with_flags(
             post_state,
             new_cbp_state,
             self._cbp_config,
             self._sparsity,
         )
-        new_accum = new_cbp_state.replacement_accumulators
-        replacements_made = (old_accum + jnp.float32(
-            self._cbp_config.replacement_rate
-        ) * jnp.array(
-            [s for s in self._hidden_sizes], dtype=jnp.float32
-        )) - new_accum >= 0.5
 
         new_state = CBPMultiHeadMLPState(  # type: ignore[call-arg]
             mlp_state=new_post_state,
@@ -1024,11 +1230,18 @@ class CBPMLPLearner:
         return cfg
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> CBPMLPLearner:
+    def from_config(cls, config: object) -> CBPMLPLearner:
         """Reconstruct from a config dict produced by :meth:`to_config`."""
-        config = dict(config)
+        payload = _copy_mapping(config, name="CBPMLPLearner")
+        if set(payload) != _CBP_SINGLE_CONFIG_FIELDS:
+            raise ValueError("CBPMLPLearner config fields do not match the schema")
+        config = payload
+        if type(config["type"]) is not str or config["type"] != "CBPMLPLearner":
+            raise ValueError("unexpected CBPMLPLearner config type")
+        config = config.copy()
         config["type"] = "CBPMultiHeadMLPLearner"
         config["n_heads"] = 1
+        config["per_head_gamma_lamda"] = None
         rebuilt = CBPMultiHeadMLPLearner.from_config(config)
         instance = cls.__new__(cls)
         instance._learner = rebuilt

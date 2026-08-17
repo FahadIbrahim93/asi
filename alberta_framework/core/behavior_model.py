@@ -11,23 +11,114 @@ from __future__ import annotations
 
 import dataclasses
 import functools
-import math
-from typing import Any
+import operator
+from typing import Any, SupportsIndex, cast
 
 import chex
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 from jax import Array
-from jaxtyping import Float, Int
+from jaxtyping import Bool, Float, Int
+
+from alberta_framework.core._float32_scalars import validated_float32_scalar
 
 _INT32_MAX = 2**31 - 1
+_ACTUAL_INT_TYPES = frozenset(
+    {
+        int,
+        np.int8,
+        np.int16,
+        np.int32,
+        np.int64,
+        np.uint8,
+        np.uint16,
+        np.uint32,
+        np.uint64,
+        np.longlong,
+        np.ulonglong,
+    }
+)
+_ACTUAL_FLOAT_TYPES = frozenset((float, np.float16, np.float32, np.float64, np.longdouble))
+_CONFIG_FIELDS = frozenset(
+    {
+        "n_actions",
+        "step_size",
+        "temperature",
+        "l2_penalty",
+        "max_gradient_norm",
+        "min_probability",
+        "ratio_clip",
+        "diagnostic_decay",
+    }
+)
+
+
+def _require_int32(name: str, value: object, *, minimum: int, maximum: int = _INT32_MAX) -> int:
+    if type(value) not in _ACTUAL_INT_TYPES:
+        raise ValueError(f"{name} must be an integer in [{minimum}, {maximum}]")
+    canonical = operator.index(cast(SupportsIndex, value))
+    if not minimum <= canonical <= maximum:
+        raise ValueError(f"{name} must be an integer in [{minimum}, {maximum}]")
+    return canonical
+
+
+def _validated_config_float(name: str, value: object, **bounds: Any) -> float:
+    """Validate only trusted concrete host scalar types at the float32 sink."""
+    if type(value) not in (_ACTUAL_INT_TYPES | _ACTUAL_FLOAT_TYPES):
+        raise ValueError(f"{name} must be a finite real scalar")
+    return validated_float32_scalar(name, value, **bounds)
+
+
+def _resource_counts(n_actions: int, feature_dim: int) -> tuple[int, int]:
+    """Return exact trainable scalars and bytes, rejecting unsafe derived counts."""
+    trainable = n_actions * feature_dim + n_actions
+    state_nbytes = 4 * (trainable + 3 + 1 + 2)
+    if trainable > _INT32_MAX:
+        raise ValueError(f"derived trainable scalars must be at most {_INT32_MAX}")
+    if state_nbytes > _INT32_MAX:
+        raise ValueError(f"derived state_nbytes must be at most {_INT32_MAX}")
+    return trainable, state_nbytes
 
 
 def _saturating_int32_increment(value: Array) -> Array:
     maximum = jnp.asarray(_INT32_MAX, dtype=jnp.int32)
     counter = jnp.asarray(value, dtype=jnp.int32)
     return jnp.minimum(jnp.maximum(counter, 0), maximum - 1) + 1
+
+
+def _integer_action_ids(
+    actions: object,
+    *,
+    n_actions: int,
+    expected_shape: tuple[int, ...],
+) -> tuple[Array, Bool[Array, " *shape"]]:
+    """Validate original-width action IDs before exposing safe int32 indices."""
+
+    if isinstance(actions, jax.core.Tracer):
+        raw_shape = tuple(actions.shape)
+        raw_dtype = np.dtype(actions.dtype)
+    else:
+        host_actions = np.asarray(actions)
+        raw_shape = tuple(host_actions.shape)
+        raw_dtype = host_actions.dtype
+        if not np.issubdtype(raw_dtype, np.integer):
+            raise ValueError("actions must have an integer dtype")
+        if not bool(np.all((host_actions >= 0) & (host_actions < n_actions))):
+            raise ValueError(f"actions must lie in [0, {n_actions})")
+    if not np.issubdtype(raw_dtype, np.integer):
+        raise ValueError("actions must have an integer dtype")
+    try:
+        broadcast_shape = np.broadcast_shapes(raw_shape, expected_shape)
+    except ValueError as error:
+        raise ValueError(f"actions must broadcast to shape {expected_shape}") from error
+    if broadcast_shape != expected_shape:
+        raise ValueError(f"actions must broadcast to shape {expected_shape}")
+    raw_actions = jnp.broadcast_to(jnp.asarray(actions), expected_shape)
+    valid = (raw_actions >= 0) & (raw_actions < n_actions)
+    safe = jnp.where(valid, raw_actions, 0).astype(jnp.int32)
+    return safe, valid
 
 
 def floor_and_renormalize_probabilities(
@@ -67,10 +158,15 @@ def selected_action_probabilities(
     broadcast to ``probabilities.shape[:-1]``.
     """
     probs = jnp.asarray(probabilities, dtype=jnp.float32)
-    action_ids = jnp.asarray(actions, dtype=jnp.int32)
+    action_ids, actions_valid = _integer_action_ids(
+        actions,
+        n_actions=probs.shape[-1],
+        expected_shape=tuple(probs.shape[:-1]),
+    )
     one_hot = jax.nn.one_hot(action_ids, probs.shape[-1], dtype=jnp.float32)
     selected = jnp.sum(probs * one_hot, axis=-1)
-    return jnp.maximum(selected, jnp.asarray(min_probability, dtype=jnp.float32))
+    floor = jnp.asarray(min_probability, dtype=jnp.float32)
+    return jnp.where(actions_valid, jnp.maximum(selected, floor), floor)
 
 
 def action_log_likelihoods(
@@ -174,28 +270,46 @@ class BehaviorModelConfig:
 
     def __post_init__(self) -> None:
         """Validate scalar hyperparameters."""
-        if (
-            isinstance(self.n_actions, bool)
-            or not isinstance(self.n_actions, int)
-            or self.n_actions <= 0
-        ):
-            raise ValueError("n_actions must be positive")
-        if not math.isfinite(self.step_size) or self.step_size < 0.0:
-            raise ValueError("step_size must be finite and non-negative")
-        if not math.isfinite(self.temperature) or self.temperature <= 0.0:
-            raise ValueError("temperature must be finite and positive")
-        if not math.isfinite(self.l2_penalty) or self.l2_penalty < 0.0:
-            raise ValueError("l2_penalty must be finite and non-negative")
-        if self.max_gradient_norm is not None and (
-            not math.isfinite(self.max_gradient_norm) or self.max_gradient_norm <= 0.0
-        ):
-            raise ValueError("max_gradient_norm must be positive when provided")
-        if not math.isfinite(self.min_probability) or not 0.0 < self.min_probability < 1.0:
-            raise ValueError("min_probability must be finite and lie in (0, 1)")
-        if not math.isfinite(self.ratio_clip) or self.ratio_clip <= 0.0:
-            raise ValueError("ratio_clip must be finite and positive")
-        if not math.isfinite(self.diagnostic_decay) or not 0.0 <= self.diagnostic_decay < 1.0:
-            raise ValueError("diagnostic_decay must be finite and lie in [0, 1)")
+        object.__setattr__(
+            self,
+            "n_actions",
+            _require_int32("n_actions", self.n_actions, minimum=1),
+        )
+        _resource_counts(self.n_actions, 1)
+        step_size = _validated_config_float("step_size", self.step_size, lower=0.0)
+        temperature = _validated_config_float("temperature", self.temperature, positive=True)
+        l2_penalty = _validated_config_float("l2_penalty", self.l2_penalty, lower=0.0)
+        max_gradient_norm = (
+            _validated_config_float(
+                "max_gradient_norm",
+                self.max_gradient_norm,
+                positive=True,
+            )
+            if self.max_gradient_norm is not None
+            else None
+        )
+        min_probability = _validated_config_float(
+            "min_probability",
+            self.min_probability,
+            positive=True,
+            upper=1.0,
+            upper_inclusive=False,
+        )
+        ratio_clip = _validated_config_float("ratio_clip", self.ratio_clip, positive=True)
+        diagnostic_decay = _validated_config_float(
+            "diagnostic_decay",
+            self.diagnostic_decay,
+            lower=0.0,
+            upper=1.0,
+            upper_inclusive=False,
+        )
+        object.__setattr__(self, "step_size", step_size)
+        object.__setattr__(self, "temperature", temperature)
+        object.__setattr__(self, "l2_penalty", l2_penalty)
+        object.__setattr__(self, "max_gradient_norm", max_gradient_norm)
+        object.__setattr__(self, "min_probability", min_probability)
+        object.__setattr__(self, "ratio_clip", ratio_clip)
+        object.__setattr__(self, "diagnostic_decay", diagnostic_decay)
 
     def to_config(self) -> dict[str, Any]:
         """Serialize configuration to a JSON-compatible dictionary."""
@@ -204,6 +318,10 @@ class BehaviorModelConfig:
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> BehaviorModelConfig:
         """Reconstruct from :meth:`to_config` output."""
+        if type(config) is not dict:
+            raise ValueError("BehaviorModelConfig payload must be an actual dict")
+        if not all(type(key) is str for key in config) or set(config) != _CONFIG_FIELDS:
+            raise ValueError("BehaviorModelConfig fields do not match the schema")
         return cls(**config)
 
 
@@ -240,6 +358,85 @@ class BehaviorModelResourceBudget:
     learned_float32_scalars_touched_per_update: int
     replay_capacity: int
 
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "feature_dim",
+            _require_int32("feature_dim", self.feature_dim, minimum=1),
+        )
+        object.__setattr__(
+            self,
+            "n_actions",
+            _require_int32("n_actions", self.n_actions, minimum=1),
+        )
+        object.__setattr__(
+            self,
+            "trainable_float32_scalars",
+            _require_int32(
+                "trainable_float32_scalars",
+                self.trainable_float32_scalars,
+                minimum=0,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "diagnostic_float32_scalars",
+            _require_int32(
+                "diagnostic_float32_scalars",
+                self.diagnostic_float32_scalars,
+                minimum=0,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "administrative_int32_scalars",
+            _require_int32(
+                "administrative_int32_scalars",
+                self.administrative_int32_scalars,
+                minimum=0,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "rng_uint32_scalars",
+            _require_int32("rng_uint32_scalars", self.rng_uint32_scalars, minimum=0),
+        )
+        object.__setattr__(
+            self,
+            "state_nbytes",
+            _require_int32("state_nbytes", self.state_nbytes, minimum=0),
+        )
+        object.__setattr__(
+            self,
+            "learned_float32_scalars_touched_per_update",
+            _require_int32(
+                "learned_float32_scalars_touched_per_update",
+                self.learned_float32_scalars_touched_per_update,
+                minimum=0,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "replay_capacity",
+            _require_int32("replay_capacity", self.replay_capacity, minimum=0),
+        )
+        trainable, state_nbytes = _resource_counts(self.n_actions, self.feature_dim)
+        expected = {
+            "trainable_float32_scalars": trainable,
+            "diagnostic_float32_scalars": 3,
+            "administrative_int32_scalars": 1,
+            "rng_uint32_scalars": 2,
+            "state_nbytes": state_nbytes,
+            "learned_float32_scalars_touched_per_update": trainable + 3,
+            "replay_capacity": 0,
+        }
+        for name, expected_value in expected.items():
+            if getattr(self, name) != expected_value:
+                raise ValueError(
+                    f"{name} must equal the exact behavior-model resource formula "
+                    f"({expected_value})"
+                )
+
     def to_dict(self) -> dict[str, int]:
         """Return a JSON-compatible resource record."""
         return dataclasses.asdict(self)
@@ -252,7 +449,10 @@ class BehaviorModelInputGradient:
     This result is read-only: computing it does not advance diagnostics, RNG,
     or parameters. ``gradient`` is the derivative of the unfloored softmax
     cross entropy. Probability flooring remains confined to reporting and
-    importance-ratio safety.
+    importance-ratio safety. ``valid`` is the traced transaction verdict for
+    the complete result: callers must gate any downstream state mutation on
+    it. Numeric fields are neutralized when it is false so an invalid operand
+    cannot poison a speculative update.
     """
 
     logits: Float[Array, " n_actions"]
@@ -260,6 +460,7 @@ class BehaviorModelInputGradient:
     loss: Float[Array, ""]
     gradient: Float[Array, " feature_dim"]
     gradient_norm: Float[Array, ""]
+    valid: Bool[Array, ""]
 
 
 @chex.dataclass(frozen=True)
@@ -276,6 +477,7 @@ class BehaviorModelUpdateResult:
     confidence: Float[Array, ""]
     predicted_action: Int[Array, ""]
     correct: Float[Array, ""]
+    update_applied: Bool[Array, ""]
 
 
 @chex.dataclass(frozen=True)
@@ -301,6 +503,7 @@ class BehaviorModelArrayResult:
     entropies: Float[Array, " num_steps"]
     confidences: Float[Array, " num_steps"]
     correct: Float[Array, " num_steps"]
+    updates_applied: Bool[Array, " num_steps"]
 
 
 class BehaviorModel:
@@ -331,14 +534,21 @@ class BehaviorModel:
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> BehaviorModel:
         """Reconstruct a behavior model from :meth:`to_config` output."""
-        config = dict(config)
-        config.pop("type", None)
-        return cls(BehaviorModelConfig.from_config(config["config"]))
+        if type(config) is not dict:
+            raise ValueError("BehaviorModel construction must be an actual dict")
+        if not all(type(key) is str for key in config) or set(config) != {"type", "config"}:
+            raise ValueError("BehaviorModel construction fields do not match the schema")
+        if type(config["type"]) is not str or config["type"] != "BehaviorModel":
+            raise ValueError("unexpected BehaviorModel construction type")
+        nested = config["config"]
+        if type(nested) is not dict:
+            raise ValueError("BehaviorModel nested config must be an actual dict")
+        return cls(BehaviorModelConfig.from_config(nested))
 
     def init(self, feature_dim: int, key: Array) -> BehaviorModelState:
         """Initialize parameters and diagnostics."""
-        if isinstance(feature_dim, bool) or not isinstance(feature_dim, int) or feature_dim <= 0:
-            raise ValueError("feature_dim must be a positive integer")
+        feature_dim = _require_int32("feature_dim", feature_dim, minimum=1)
+        _resource_counts(self._config.n_actions, feature_dim)
         return BehaviorModelState(
             weights=jnp.zeros(
                 (self._config.n_actions, feature_dim),
@@ -359,13 +569,11 @@ class BehaviorModel:
         float32 arrays, keeps three float32 diagnostics and one int32 counter,
         and stores a default JAX typed key backed by two uint32 words.
         """
-        if isinstance(feature_dim, bool) or not isinstance(feature_dim, int) or feature_dim <= 0:
-            raise ValueError("feature_dim must be a positive integer")
-        trainable = self._config.n_actions * feature_dim + self._config.n_actions
+        feature_dim = _require_int32("feature_dim", feature_dim, minimum=1)
+        trainable, state_nbytes = _resource_counts(self._config.n_actions, feature_dim)
         diagnostics = 3
         administrative = 1
         rng_words = 2
-        state_nbytes = 4 * (trainable + diagnostics + administrative + rng_words)
         return BehaviorModelResourceBudget(
             feature_dim=feature_dim,
             n_actions=self._config.n_actions,
@@ -398,7 +606,6 @@ class BehaviorModel:
         logits = self.predict_logits(state, observation)
         return jax.nn.softmax(logits / self._config.temperature)
 
-    @functools.partial(jax.jit, static_argnums=(0,))
     def action_probability(
         self,
         state: BehaviorModelState,
@@ -413,7 +620,6 @@ class BehaviorModel:
             min_probability=self._config.min_probability,
         )
 
-    @functools.partial(jax.jit, static_argnums=(0,))
     def action_log_likelihood(
         self,
         state: BehaviorModelState,
@@ -423,7 +629,6 @@ class BehaviorModel:
         """Return the floor-clipped log-likelihood of ``action``."""
         return jnp.log(self.action_probability(state, observation, action))
 
-    @functools.partial(jax.jit, static_argnums=(0,))
     def input_loss_gradient(
         self,
         state: BehaviorModelState,
@@ -436,11 +641,36 @@ class BehaviorModel:
         trainable state builder. Callers must invoke it before
         :meth:`update`, and before advancing a recurrent state builder to the
         next observation, so the gradient refers to the representation that
-        produced the scored prediction.
+        produced the scored prediction. Any consumer that proposes a state
+        mutation from this result must commit it only when ``result.valid`` is
+        true.
         """
+        action_id, action_valid = _integer_action_ids(
+            action,
+            n_actions=self._config.n_actions,
+            expected_shape=(),
+        )
+        return cast(
+            BehaviorModelInputGradient,
+            self._input_loss_gradient_jit(
+                state,
+                observation,
+                action_id,
+                action_valid,
+            ),
+        )
+
+    @functools.partial(jax.jit, static_argnums=(0,))
+    def _input_loss_gradient_jit(
+        self,
+        state: BehaviorModelState,
+        observation: Array,
+        action_id: Array,
+        action_valid: Array,
+    ) -> BehaviorModelInputGradient:
+        """Execute one already identity-checked input-gradient transaction."""
         cfg = self._config
         obs = jnp.asarray(observation, dtype=jnp.float32)
-        action_id = jnp.asarray(action, dtype=jnp.int32)
         logits = state.weights @ obs + state.bias
         scaled_logits = logits / cfg.temperature
         probabilities = jax.nn.softmax(scaled_logits)
@@ -448,15 +678,38 @@ class BehaviorModel:
         loss = -jnp.sum(one_hot * jax.nn.log_softmax(scaled_logits))
         logit_gradient = (probabilities - one_hot) / cfg.temperature
         gradient = state.weights.T @ logit_gradient
+        gradient_norm = jnp.linalg.norm(gradient)
+        # Inf observation makes softmax NaN and W.T @ (p - one_hot)
+        # non-finite, including 0*inf on a silent feature. The parameter
+        # update already no-ops; this pre-update bridge must not hand a
+        # NaN gradient to the state builder.
+        inputs_valid = (
+            jnp.all(jnp.isfinite(obs))
+            & action_valid
+        )
+        source_finite = jnp.all(jnp.isfinite(state.weights)) & jnp.all(
+            jnp.isfinite(state.bias)
+        )
+        proposed_finite = (
+            jnp.all(jnp.isfinite(logits))
+            & jnp.all(jnp.isfinite(probabilities))
+            & jnp.isfinite(loss)
+            & jnp.all(jnp.isfinite(gradient))
+            & jnp.isfinite(gradient_norm)
+        )
+        valid = source_finite & inputs_valid & proposed_finite
+        zero_logits = jnp.zeros_like(logits)
+        zero_gradient = jnp.zeros_like(gradient)
+        zero_loss = jnp.asarray(0.0, dtype=jnp.float32)
         return BehaviorModelInputGradient(
-            logits=logits,
-            probabilities=probabilities,
-            loss=loss,
-            gradient=gradient,
-            gradient_norm=jnp.linalg.norm(gradient),
+            logits=jnp.where(valid, logits, zero_logits),
+            probabilities=jnp.where(valid, probabilities, jnp.zeros_like(probabilities)),
+            loss=jnp.where(valid, loss, zero_loss),
+            gradient=jnp.where(valid, gradient, zero_gradient),
+            gradient_norm=jnp.where(valid, gradient_norm, zero_loss),
+            valid=valid,
         )
 
-    @functools.partial(jax.jit, static_argnums=(0,))
     def update(
         self,
         state: BehaviorModelState,
@@ -464,9 +717,32 @@ class BehaviorModel:
         action: Array,
     ) -> BehaviorModelUpdateResult:
         """Update the behavior model from one observed action."""
+        action_id, action_valid = _integer_action_ids(
+            action,
+            n_actions=self._config.n_actions,
+            expected_shape=(),
+        )
+        return cast(
+            BehaviorModelUpdateResult,
+            self._update_jit(
+                state,
+                observation,
+                action_id,
+                action_valid,
+            ),
+        )
+
+    @functools.partial(jax.jit, static_argnums=(0,))
+    def _update_jit(
+        self,
+        state: BehaviorModelState,
+        observation: Array,
+        action_id: Array,
+        action_valid: Array,
+    ) -> BehaviorModelUpdateResult:
+        """Execute one already identity-checked atomic update."""
         cfg = self._config
         obs = jnp.asarray(observation, dtype=jnp.float32)
-        action_id = jnp.asarray(action, dtype=jnp.int32)
         logits = state.weights @ obs + state.bias
         probabilities = jax.nn.softmax(logits / cfg.temperature)
         one_hot = jax.nn.one_hot(action_id, cfg.n_actions, dtype=jnp.float32)
@@ -504,20 +780,27 @@ class BehaviorModel:
 
         decay = jnp.asarray(cfg.diagnostic_decay, dtype=jnp.float32)
         first = state.step_count == 0
+        carried_nll = jnp.where(decay == 0.0, jnp.zeros_like(state.nll_ema), decay * state.nll_ema)
+        carried_accuracy = jnp.where(
+            decay == 0.0, jnp.zeros_like(state.accuracy_ema), decay * state.accuracy_ema
+        )
+        carried_confidence = jnp.where(
+            decay == 0.0, jnp.zeros_like(state.confidence_ema), decay * state.confidence_ema
+        )
         nll_ema = jnp.where(
             first,
             loss,
-            decay * state.nll_ema + (1.0 - decay) * loss,
+            carried_nll + (1.0 - decay) * loss,
         )
         accuracy_ema = jnp.where(
             first,
             correct,
-            decay * state.accuracy_ema + (1.0 - decay) * correct,
+            carried_accuracy + (1.0 - decay) * correct,
         )
         confidence_ema = jnp.where(
             first,
             confidence,
-            decay * state.confidence_ema + (1.0 - decay) * confidence,
+            carried_confidence + (1.0 - decay) * confidence,
         )
 
         new_state = state.replace(  # type: ignore[attr-defined]
@@ -528,17 +811,57 @@ class BehaviorModel:
             accuracy_ema=accuracy_ema,
             confidence_ema=confidence_ema,
         )
+        # Inf observation makes softmax NaN and logit_error * x = 0*inf = NaN
+        # on silent features. Hold the previous finite state.
+        diagnostics_required = jnp.asarray(cfg.diagnostic_decay != 0.0, dtype=jnp.bool_)
+        source_finite = (
+            jnp.all(jnp.isfinite(state.weights))
+            & jnp.all(jnp.isfinite(state.bias))
+            & (
+                (~diagnostics_required)
+                | (
+                    jnp.isfinite(state.nll_ema)
+                    & jnp.isfinite(state.accuracy_ema)
+                    & jnp.isfinite(state.confidence_ema)
+                )
+            )
+        )
+        inputs_valid = (
+            jnp.all(jnp.isfinite(obs))
+            & action_valid
+        )
+        proposed_finite = (
+            jnp.all(jnp.isfinite(new_state.weights))
+            & jnp.all(jnp.isfinite(new_state.bias))
+            & jnp.isfinite(new_state.nll_ema)
+            & jnp.isfinite(new_state.accuracy_ema)
+            & jnp.isfinite(new_state.confidence_ema)
+        )
+        update_applied = source_finite & inputs_valid & proposed_finite
+        committed = jax.lax.cond(
+            update_applied,
+            lambda: new_state,
+            lambda: state,
+        )
+        neutral_float = jnp.asarray(0.0, dtype=jnp.float32)
         return BehaviorModelUpdateResult(
-            state=new_state,
-            logits=logits,
-            probabilities=probabilities,
-            action_probability=action_prob,
-            log_likelihood=log_likelihood,
-            loss=loss,
-            entropy=entropy,
-            confidence=confidence,
-            predicted_action=predicted_action,
-            correct=correct,
+            state=committed,
+            logits=jnp.where(update_applied, logits, jnp.zeros_like(logits)),
+            probabilities=jnp.where(
+                update_applied, probabilities, jnp.zeros_like(probabilities)
+            ),
+            action_probability=jnp.where(update_applied, action_prob, neutral_float),
+            log_likelihood=jnp.where(update_applied, log_likelihood, neutral_float),
+            loss=jnp.where(update_applied, loss, neutral_float),
+            entropy=jnp.where(update_applied, entropy, neutral_float),
+            confidence=jnp.where(update_applied, confidence, neutral_float),
+            predicted_action=jnp.where(
+                update_applied,
+                predicted_action,
+                jnp.asarray(0, dtype=jnp.int32),
+            ),
+            correct=jnp.where(update_applied, correct, neutral_float),
+            update_applied=update_applied,
         )
 
     @functools.partial(jax.jit, static_argnums=(0,))
@@ -570,7 +893,6 @@ class BehaviorModel:
             log_likelihood=jnp.log(action_prob),
         )
 
-    @functools.partial(jax.jit, static_argnums=(0,))
     def importance_ratio(
         self,
         state: BehaviorModelState,
@@ -598,10 +920,21 @@ def run_behavior_model_from_arrays(
 ) -> BehaviorModelArrayResult:
     """Run online behavior prediction over arrays with ``jax.lax.scan``."""
 
+    if len(observations.shape) != 2:
+        raise ValueError("observations must have shape (num_steps, feature_dim)")
+    _, _ = _integer_action_ids(
+        actions,
+        n_actions=model.config.n_actions,
+        expected_shape=(observations.shape[0],),
+    )
+
     def _scan_fn(
         carry: BehaviorModelState,
         inputs: tuple[Array, Array],
-    ) -> tuple[BehaviorModelState, tuple[Array, Array, Array, Array, Array, Array, Array]]:
+    ) -> tuple[
+        BehaviorModelState,
+        tuple[Array, Array, Array, Array, Array, Array, Array, Array],
+    ]:
         obs, action = inputs
         result = model.update(carry, obs, action)
         return result.state, (
@@ -612,6 +945,7 @@ def run_behavior_model_from_arrays(
             result.entropy,
             result.confidence,
             result.correct,
+            result.update_applied,
         )
 
     (
@@ -624,6 +958,7 @@ def run_behavior_model_from_arrays(
             entropies,
             confidences,
             correct,
+            updates_applied,
         ),
     ) = jax.lax.scan(_scan_fn, state, (observations, actions))
     return BehaviorModelArrayResult(
@@ -635,6 +970,7 @@ def run_behavior_model_from_arrays(
         entropies=entropies,
         confidences=confidences,
         correct=correct,
+        updates_applied=updates_applied,
     )
 
 

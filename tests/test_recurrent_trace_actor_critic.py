@@ -8,12 +8,15 @@ import pickle
 from collections.abc import Callable
 from typing import Any, cast
 
+import chex
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 import pytest
 from jax import Array
 
+import alberta_framework.core.recurrent_trace_actor_critic as recurrent_trace_module
 from alberta_framework.core import (
     RecurrentTraceActorCriticAgent as ExportedRecurrentTraceActorCriticAgent,
 )
@@ -609,6 +612,134 @@ def test_obgd_large_error_contract_applies_signal_once() -> None:
     assert jnp.allclose(update_l1, 1.0 / 2.0)
 
 
+def test_obgd_infinite_signal_zeros_bounded_update() -> None:
+    """Inf signal zeros the ObGD scale, then scale*signal*z is 0*inf=NaN."""
+    traces = {
+        "first": jnp.asarray((2.0, -1.0), dtype=jnp.float32),
+        "second": jnp.asarray((3.0,), dtype=jnp.float32),
+    }
+    result = obgd_update(traces, jnp.asarray(jnp.inf, dtype=jnp.float32), alpha=0.5, kappa=2.0)
+    for leaf in jax.tree_util.tree_leaves(result.updates):
+        assert bool(jnp.all(jnp.isfinite(leaf)))
+        assert bool(jnp.allclose(leaf, 0.0))
+    assert bool(jnp.isfinite(result.scale))
+    assert bool(jnp.allclose(result.scale, 0.0))
+    assert not bool(result.update_applied)
+
+    unbounded = obgd_update(traces, jnp.asarray(jnp.inf, dtype=jnp.float32), alpha=0.5, kappa=0.0)
+    for leaf in jax.tree_util.tree_leaves(unbounded.updates):
+        assert bool(jnp.all(jnp.isfinite(leaf)))
+        assert bool(jnp.allclose(leaf, 0.0))
+    assert not bool(unbounded.update_applied)
+
+
+def test_terminated_does_not_multiply_inf_discounted_return() -> None:
+    """A terminal 0 * inf return tracker is NaN and would freeze reward stats."""
+    config = _small_config(
+        actor_alpha=0.0,
+        critic_alpha=0.0,
+        normalize_rewards=False,
+    )
+    agent = RecurrentTraceActorCriticAgent(config)
+    state = agent.init(2, jr.key(0))
+    state, _, _ = agent.start(
+        state,
+        jnp.asarray((0.5, -0.25), dtype=jnp.float32),
+    )
+    state = state.replace(
+        reward_statistics=state.reward_statistics._replace(
+            discounted_return=jnp.asarray(jnp.inf, dtype=jnp.float32)
+        )
+    )
+    raw = jnp.asarray(0.0, dtype=jnp.float32) * jnp.asarray(jnp.inf, dtype=jnp.float32)
+    assert not bool(jnp.isfinite(raw))
+
+    result = agent.update(
+        state,
+        jnp.asarray(1.0, dtype=jnp.float32),
+        jnp.asarray((-0.3, 0.7), dtype=jnp.float32),
+        terminated=jnp.asarray(True),
+    )
+    assert bool(result.update_applied)
+    assert bool(jnp.isfinite(result.state.reward_statistics.discounted_return))
+    assert float(result.state.reward_statistics.discounted_return) == 0.0
+
+
+def test_adaptive_obgd_infinite_signal_keeps_finite_updates() -> None:
+    traces = {
+        "first": jnp.asarray((2.0, -1.0), dtype=jnp.float32),
+        "second": jnp.asarray((0.5,), dtype=jnp.float32),
+    }
+    second_moment = {
+        "first": jnp.asarray((0.25, 0.5), dtype=jnp.float32),
+        "second": jnp.asarray((1.0,), dtype=jnp.float32),
+    }
+    result = adaptive_obgd_update(
+        traces,
+        second_moment,
+        jnp.asarray(jnp.inf, dtype=jnp.float32),
+        alpha=0.2,
+        kappa=2.0,
+        beta2=0.9,
+        epsilon=1e-4,
+        step=4,
+    )
+    for leaf in jax.tree_util.tree_leaves(result.updates):
+        assert bool(jnp.all(jnp.isfinite(leaf)))
+        assert bool(jnp.allclose(leaf, 0.0))
+    assert not bool(result.update_applied)
+    chex.assert_trees_all_close(result.second_moment, second_moment)
+    zero_traces = jax.tree_util.tree_map(jnp.zeros_like, traces)
+    zeroed = adaptive_obgd_update(
+        zero_traces,
+        second_moment,
+        jnp.asarray(jnp.inf, dtype=jnp.float32),
+        alpha=0.2,
+        kappa=2.0,
+        beta2=0.9,
+        epsilon=1e-4,
+        step=4,
+    )
+    for leaf in jax.tree_util.tree_leaves(zeroed.second_moment):
+        assert bool(jnp.all(jnp.isfinite(leaf)))
+    for leaf in jax.tree_util.tree_leaves(zeroed.updates):
+        assert bool(jnp.all(jnp.isfinite(leaf)))
+    assert not bool(zeroed.update_applied)
+    chex.assert_trees_all_close(zeroed.second_moment, second_moment)
+
+
+def test_adaptive_obgd_zero_beta2_does_not_multiply_inf_moments() -> None:
+    """beta2=0 drops leftover v; 0 * inf must not freeze the update."""
+    traces = {
+        "first": jnp.asarray((2.0, -1.0), dtype=jnp.float32),
+        "second": jnp.asarray((0.5,), dtype=jnp.float32),
+    }
+    second_moment = {
+        "first": jnp.full((2,), jnp.inf, dtype=jnp.float32),
+        "second": jnp.full((1,), jnp.inf, dtype=jnp.float32),
+    }
+    raw = jnp.asarray(0.0, dtype=jnp.float32) * jnp.asarray(jnp.inf, dtype=jnp.float32)
+    assert not bool(jnp.isfinite(raw))
+
+    signal = jnp.asarray(-3.0, dtype=jnp.float32)
+    result = adaptive_obgd_update(
+        traces,
+        second_moment,
+        signal,
+        alpha=0.2,
+        kappa=2.0,
+        beta2=0.0,
+        epsilon=1e-4,
+        step=4,
+    )
+    assert bool(result.update_applied)
+    expected = jax.tree_util.tree_map(
+        lambda trace: jnp.square(signal * trace),
+        traces,
+    )
+    chex.assert_trees_all_close(result.second_moment, expected)
+
+
 def test_adaptive_obgd_matches_memorax_second_moment_formula() -> None:
     traces = {
         "first": jnp.asarray((2.0, -1.0), dtype=jnp.float32),
@@ -636,9 +767,7 @@ def test_adaptive_obgd_matches_memorax_second_moment_formula() -> None:
         step=step,
     )
     expected_second_moment = jax.tree_util.tree_map(
-        lambda previous, trace: (
-            beta2 * previous + (1.0 - beta2) * jnp.square(signal * trace)
-        ),
+        lambda previous, trace: beta2 * previous + (1.0 - beta2) * jnp.square(signal * trace),
         second_moment,
         traces,
     )
@@ -652,10 +781,7 @@ def test_adaptive_obgd_matches_memorax_second_moment_formula() -> None:
         expected_corrected,
     )
     expected_z_sum = sum(
-        (
-            jnp.sum(jnp.abs(leaf))
-            for leaf in jax.tree_util.tree_leaves(expected_normalized)
-        ),
+        (jnp.sum(jnp.abs(leaf)) for leaf in jax.tree_util.tree_leaves(expected_normalized)),
         start=jnp.asarray(0.0, dtype=jnp.float32),
     )
     expected_denominator = jnp.maximum(
@@ -991,10 +1117,7 @@ def test_counters_and_welford_moments_saturate_without_wrap_eager_or_jit() -> No
         assert int(result.state.observation_statistics.sample_count) == maximum
         assert int(result.state.reward_statistics.sample_count) == maximum
         assert int(result.state.step_count) == maximum
-        assert jnp.all(
-            result.state.observation_statistics.m2
-            >= state.observation_statistics.m2
-        )
+        assert jnp.all(result.state.observation_statistics.m2 >= state.observation_statistics.m2)
         assert result.state.reward_statistics.m2 >= state.reward_statistics.m2
         _assert_tree_finite(result)
 
@@ -1220,18 +1343,14 @@ def test_adaptive_moments_persist_across_restart_and_checkpoint_resume() -> None
     actor_moment_l1 = sum(
         (
             jnp.sum(jnp.abs(leaf))
-            for leaf in jax.tree_util.tree_leaves(
-                first.state.actor_second_moments
-            )
+            for leaf in jax.tree_util.tree_leaves(first.state.actor_second_moments)
         ),
         start=jnp.asarray(0.0),
     )
     critic_moment_l1 = sum(
         (
             jnp.sum(jnp.abs(leaf))
-            for leaf in jax.tree_util.tree_leaves(
-                first.state.critic_second_moments
-            )
+            for leaf in jax.tree_util.tree_leaves(first.state.critic_second_moments)
         ),
         start=jnp.asarray(0.0),
     )
@@ -1933,6 +2052,57 @@ def test_config_and_agent_serialization_round_trip() -> None:
     assert RecurrentTraceActorCriticConfig.from_config(adaptive_payload) == adaptive
 
 
+def test_config_rejects_hostile_numeric_and_serialized_container_hooks() -> None:
+    class HostileFloat(float):
+        def __float__(self) -> float:
+            raise AssertionError("float hook must not run")
+
+        def __repr__(self) -> str:
+            raise AssertionError("repr hook must not run")
+
+    class DictSubclass(dict[str, Any]):
+        pass
+
+    with pytest.raises(ValueError, match="gamma"):
+        _small_config(gamma=HostileFloat(0.9))
+    with pytest.raises(ValueError, match="finite normal float32"):
+        _small_config(gamma=10**1000)
+    payload = _small_config().to_config()
+    assert RecurrentTraceActorCriticConfig.from_config(DictSubclass(payload)) == _small_config()
+    envelope = RecurrentTraceActorCriticAgent(_small_config()).to_config()
+    assert (
+        RecurrentTraceActorCriticAgent.from_config(DictSubclass(envelope)).config
+        == _small_config()
+    )
+    with pytest.raises(ValueError, match="fields"):
+        RecurrentTraceActorCriticConfig.from_config({**payload, "unknown": 1})
+
+
+def test_state_resource_budget_is_exact_and_init_preflights_before_rng(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _small_config()
+    budget = config.state_resource_budget(2)
+    assert budget == {
+        "parameter_scalars": 124,
+        "sensitivity_scalars_per_network": 36,
+        "float32_state_scalars": 343,
+        "state_scalars": 349,
+        "state_nbytes": 1397,
+    }
+    state = RecurrentTraceActorCriticAgent(config).init(2, jr.key(2))
+    leaves = jax.tree.leaves(state)
+    assert budget["state_scalars"] == sum(int(leaf.size) for leaf in leaves)
+    assert budget["state_nbytes"] == sum(int(leaf.nbytes) for leaf in leaves)
+
+    def forbidden_split(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("RNG split must not run before resource validation")
+
+    monkeypatch.setattr(recurrent_trace_module.jr, "split", forbidden_split)
+    with pytest.raises(ValueError, match="derived"):
+        RecurrentTraceActorCriticAgent(config).init(2**31 - 1, jr.key(0))
+
+
 def test_canonical_discrete_architecture_defaults_and_core_export() -> None:
     config = RecurrentTraceActorCriticConfig(n_actions=4)
     assert config.hidden_size == 192
@@ -2104,3 +2274,175 @@ def test_phase_initialization_matches_upstream_and_ignores_rtu_epsilon() -> None
 
     recovered_phase = jnp.exp(params.rtu.theta_log)
     assert jnp.min(recovered_phase) < config.rtu_epsilon * config.max_phase
+
+
+def test_rtac_config_rejects_booleans_and_non_integers() -> None:
+    with pytest.raises(ValueError, match="n_actions"):
+        RecurrentTraceActorCriticConfig(n_actions=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="n_actions"):
+        RecurrentTraceActorCriticConfig(n_actions=3.5)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="hidden_size"):
+        RecurrentTraceActorCriticConfig(n_actions=2, hidden_size=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="encoder_width"):
+        RecurrentTraceActorCriticConfig(n_actions=2, encoder_width=1)
+
+
+def test_rtac_config_accepts_and_canonicalizes_numpy_integers() -> None:
+    cfg = RecurrentTraceActorCriticConfig(
+        n_actions=np.int32(3),
+        hidden_size=np.int64(64),
+        encoder_width=np.int32(32),
+        output_width=np.int64(32),
+    )
+    assert type(cfg.n_actions) is int
+    assert type(cfg.hidden_size) is int
+    assert type(cfg.encoder_width) is int
+    assert type(cfg.output_width) is int
+    assert cfg.n_actions == 3
+    assert cfg.hidden_size == 64
+    assert cfg.encoder_width == 32
+    assert cfg.output_width == 32
+
+
+@pytest.mark.parametrize("bad", [True, False, 1.5, 0, -1, 2**31, float("nan"), "3"])
+def test_zero_rtu_state_rejects_non_integer_hidden_size(bad: object) -> None:
+    with pytest.raises(ValueError, match="hidden_size"):
+        zero_rtu_state(bad)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("hidden_size", "input_dim", "match"),
+    [
+        (True, 3, "hidden_size"),
+        (1.5, 3, "hidden_size"),
+        (3, True, "input_dim"),
+        (3, 1.5, "input_dim"),
+        (3, 0, "input_dim"),
+        (0, 3, "hidden_size"),
+    ],
+)
+def test_zero_rtu_sensitivities_rejects_non_integer_dimensions(
+    hidden_size: object,
+    input_dim: object,
+    match: str,
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        zero_rtu_sensitivities(hidden_size, input_dim)  # type: ignore[arg-type]
+
+
+def test_zero_rtu_helpers_accept_numpy_integers() -> None:
+    state = zero_rtu_state(np.int64(2))
+    assert state.real.shape == (2,)
+    sensitivities = zero_rtu_sensitivities(np.int32(2), np.int64(3))
+    assert sensitivities.nu_log.shape == (2, 2)
+    assert sensitivities.b_real.shape == (2, 2, 3)
+
+
+@pytest.mark.parametrize(
+    ("input_dim", "output_dim", "match"),
+    [
+        (True, 3, "input_dim"),
+        (1.5, 3, "input_dim"),
+        (2, True, "output_dim"),
+        (2, 1.5, "output_dim"),
+    ],
+)
+def test_initialize_rtu_network_parameters_rejects_non_integer_dimensions(
+    input_dim: object,
+    output_dim: object,
+    match: str,
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        initialize_rtu_network_parameters(
+            jr.key(0),
+            input_dim,  # type: ignore[arg-type]
+            output_dim,  # type: ignore[arg-type]
+            _small_config(),
+        )
+
+
+@pytest.mark.parametrize(
+    "field",
+    ("gamma", "actor_lamda", "critic_lamda", "sparsity", "beta2"),
+)
+def test_float32_endpoints_check_exact_numpy_value(field: str) -> None:
+    above_one = np.nextafter(np.longdouble(1.0), np.longdouble(2.0))
+    with pytest.raises(ValueError, match=field):
+        RecurrentTraceActorCriticConfig(n_actions=2, **{field: above_one})
+
+
+@pytest.mark.parametrize(
+    "field",
+    (
+        "gamma",
+        "actor_lamda",
+        "critic_lamda",
+        "actor_alpha",
+        "critic_alpha",
+        "entropy_coefficient",
+        "sparsity",
+        "r_min",
+        "leaky_relu_slope",
+        "beta2",
+    ),
+)
+def test_nonzero_longdouble_cannot_underflow_into_legal_zero(field: str) -> None:
+    nonzero = np.nextafter(np.longdouble(0.0), np.longdouble(1.0))
+    with pytest.raises(ValueError, match=rf"{field}.*finite normal float32"):
+        RecurrentTraceActorCriticConfig(n_actions=2, **{field: nonzero})
+
+
+@pytest.mark.parametrize("code", ("e", "f", "d", "g"))
+def test_config_canonicalizes_supported_numpy_float_families(code: str) -> None:
+    value = np.dtype(code).type(0.5)
+    config = RecurrentTraceActorCriticConfig(n_actions=2, gamma=value)
+    assert type(config.gamma) is float
+    assert config.gamma == 0.5
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (("n_actions", np.int64(2)), ("gamma", np.float32(0.5))),
+)
+def test_from_config_preserves_supported_runtime_scalar_families(
+    field: str, value: object
+) -> None:
+    payload = RecurrentTraceActorCriticConfig(n_actions=2).to_config()
+    payload[field] = value
+    reconstructed = RecurrentTraceActorCriticConfig.from_config(payload)
+    expected_type = int if field == "n_actions" else float
+    assert type(getattr(reconstructed, field)) is expected_type
+
+
+@pytest.mark.parametrize("code", ("b", "B", "h", "H", "i", "I", "l", "L", "q", "Q"))
+def test_init_accepts_supported_numpy_integer_feature_dimensions(code: str) -> None:
+    config = RecurrentTraceActorCriticConfig(
+        n_actions=2,
+        hidden_size=2,
+        encoder_width=2,
+        output_width=2,
+    )
+    state = RecurrentTraceActorCriticAgent(config).init(np.dtype(code).type(3), jr.key(1))
+    assert state.last_observation.shape == (3,)
+
+
+@pytest.mark.parametrize(
+    ("taylor", "adaptive"),
+    ((False, False), (True, False), (False, True), (True, True)),
+)
+def test_state_resource_budget_matches_optional_state_trees(
+    taylor: bool, adaptive: bool
+) -> None:
+    config = RecurrentTraceActorCriticConfig(
+        n_actions=3,
+        hidden_size=4,
+        encoder_width=5,
+        output_width=6,
+        rtrl_taylor_correction=taylor,
+        adaptive_obgd=adaptive,
+    )
+    state = RecurrentTraceActorCriticAgent(config).init(7, jr.key(5))
+    leaves = jax.tree_util.tree_leaves(state)
+    budget = config.state_resource_budget(7)
+    assert budget["state_scalars"] == sum(int(leaf.size) for leaf in leaves)
+    assert budget["state_nbytes"] == sum(int(leaf.nbytes) for leaf in leaves)

@@ -1,7 +1,11 @@
 """Tests for experience streams."""
 
+from fractions import Fraction
+
 import chex
+import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 
 from alberta_framework import (
@@ -17,6 +21,9 @@ from alberta_framework import (
     make_scale_range,
 )
 
+_INT32_MAX = 2**31 - 1
+_INVALID_SCHEDULE_MODULI = (0, -1, False, True, 1.5, None, 2**31, 10**100)
+
 
 class TestRandomWalkStream:
     """Tests for the RandomWalkStream class."""
@@ -28,6 +35,42 @@ class TestRandomWalkStream:
 
         assert state.key is not None
         chex.assert_shape(state.true_weights, (10,))
+
+    def test_rejects_invalid_feature_dim(self):
+        """Should reject non-positive, bool, or non-integer feature_dim."""
+        for feature_dim in (0, -1, True, 2.5):
+            with pytest.raises(ValueError, match="feature_dim"):
+                RandomWalkStream(feature_dim=feature_dim)
+
+    def test_rejects_non_finite_or_negative_float_params(self):
+        """Should reject NaN/inf/negative drift_rate, noise_std, feature_std."""
+        for name, value in (
+            ("drift_rate", float("nan")),
+            ("drift_rate", float("inf")),
+            ("drift_rate", -1.0),
+            ("noise_std", float("nan")),
+            ("feature_std", -0.5),
+        ):
+            with pytest.raises(ValueError, match=name):
+                RandomWalkStream(feature_dim=4, **{name: value})
+
+    def test_rejects_spoofed_hostile_and_exact_negative_float_params(self):
+        class ClassSpoof:
+            @property
+            def __class__(self):
+                return float
+
+            def __float__(self):
+                return 0.1
+
+        class HostileFloat(float):
+            def as_integer_ratio(self):
+                raise RuntimeError("untrusted ratio hook executed")
+
+        for name in ("drift_rate", "noise_std", "feature_std"):
+            for value in (ClassSpoof(), HostileFloat(0.1), Fraction(-1, 10**400)):
+                with pytest.raises(ValueError, match=name):
+                    RandomWalkStream(feature_dim=4, **{name: value})
 
     def test_step_produces_valid_timestep(self, rng_key):
         """Step should produce valid observation and target."""
@@ -90,25 +133,31 @@ class TestRandomWalkStream:
 class TestAbruptChangeStream:
     """Tests for the AbruptChangeStream class."""
 
-    def test_weights_change_at_interval(self, rng_key):
-        """Weights should change at specified interval."""
-        stream = AbruptChangeStream(feature_dim=10, change_interval=10)
+    def test_rejects_non_finite_or_negative_float_params(self):
+        """Should reject NaN/inf/negative noise_std and feature_std."""
+        for name, value in (
+            ("noise_std", float("nan")),
+            ("noise_std", float("inf")),
+            ("feature_std", -1.0),
+        ):
+            with pytest.raises(ValueError, match=name):
+                AbruptChangeStream(feature_dim=4, **{name: value})
+
+    @pytest.mark.parametrize("compiled", [False, True], ids=["eager", "jit"])
+    def test_initial_weights_last_for_first_full_segment(self, rng_key, compiled):
+        """Initialized weights govern exactly one complete change interval."""
+        change_interval = 3
+        stream = AbruptChangeStream(feature_dim=10, change_interval=change_interval)
         state = stream.init(rng_key)
+        initial_weights = state.true_weights
+        step = jax.jit(stream.step) if compiled else stream.step
 
-        # Step count starts at 0, changes happen when step_count % interval == 0
-        # So first change at step 0 (initial), then step 10, 20, etc.
-        weights_at_0 = state.true_weights.copy()
+        for i in range(change_interval):
+            _, state = step(state, jnp.array(i, dtype=jnp.int32))
+            chex.assert_trees_all_equal(state.true_weights, initial_weights)
 
-        # Run 9 steps (step_count goes 0->9)
-        for i in range(9):
-            _, state = stream.step(state, jnp.array(i))
-
-        # Run one more step (step_count becomes 10)
-        _, state = stream.step(state, jnp.array(9))
-
-        # Weights should have changed at step 10
-        with pytest.raises(AssertionError):
-            chex.assert_trees_all_close(weights_at_0, state.true_weights)
+        _, state = step(state, jnp.array(change_interval, dtype=jnp.int32))
+        assert not bool(jnp.array_equal(state.true_weights, initial_weights))
 
     def test_generates_valid_timesteps(self, rng_key):
         """Should generate valid TimeStep instances."""
@@ -172,6 +221,16 @@ class TestSuttonExperiment1Stream:
 class TestCyclicStream:
     """Tests for the CyclicStream class."""
 
+    def test_rejects_non_finite_or_negative_float_params(self):
+        """Should reject NaN/inf/negative noise_std and feature_std."""
+        for name, value in (
+            ("noise_std", float("nan")),
+            ("noise_std", float("inf")),
+            ("feature_std", -1.0),
+        ):
+            with pytest.raises(ValueError, match=name):
+                CyclicStream(feature_dim=4, **{name: value})
+
     def test_cycles_through_configurations(self, rng_key):
         """Should cycle through configurations."""
         stream = CyclicStream(
@@ -227,6 +286,17 @@ class TestCyclicStream:
 
 class TestPeriodicChangeStream:
     """Tests for the PeriodicChangeStream class."""
+
+    def test_rejects_non_finite_or_negative_float_params(self):
+        """Should reject NaN/inf/negative amplitude, noise_std, feature_std."""
+        for name, value in (
+            ("amplitude", float("nan")),
+            ("amplitude", float("inf")),
+            ("noise_std", -0.5),
+            ("feature_std", float("nan")),
+        ):
+            with pytest.raises(ValueError, match=name):
+                PeriodicChangeStream(feature_dim=4, **{name: value})
 
     def test_init_creates_valid_state(self, rng_key):
         """Stream init should create valid state with correct shapes."""
@@ -366,6 +436,16 @@ class TestScaledStreamWrapper:
         with pytest.raises(ValueError, match="must match"):
             ScaledStreamWrapper(inner, feature_scales=scales)
 
+    def test_rejects_non_finite_scales(self):
+        """Should raise error if scales contain NaN or infinity."""
+        inner = RandomWalkStream(feature_dim=5)
+        for scales in (
+            jnp.array([1.0, float("nan"), 2.0, 3.0, 4.0]),
+            jnp.array([1.0, float("inf"), 2.0, 3.0, 4.0]),
+        ):
+            with pytest.raises(ValueError, match="finite"):
+                ScaledStreamWrapper(inner, feature_scales=scales)
+
     def test_works_with_different_streams(self, rng_key):
         """Should work with any stream implementing the protocol."""
         scales = jnp.array([0.01, 0.1, 1.0, 10.0, 100.0])
@@ -396,6 +476,123 @@ class TestMakeScaleRange:
         # Middle value should be geometric mean ≈ 1.0
         chex.assert_trees_all_close(scales[2], jnp.array(1.0), rtol=0.1)
 
+    @pytest.mark.parametrize(
+        ("min_scale", "max_scale"),
+        [
+            pytest.param(-1.0, 100.0, id="min-negative"),
+            pytest.param(0.01, -100.0, id="max-negative"),
+            pytest.param(0.0, 100.0, id="min-zero"),
+            pytest.param(0.01, 0.0, id="max-zero"),
+            pytest.param(float("nan"), 100.0, id="min-nan"),
+            pytest.param(0.01, float("nan"), id="max-nan"),
+            pytest.param(float("inf"), 100.0, id="min-positive-infinity"),
+            pytest.param(0.01, float("inf"), id="max-positive-infinity"),
+            pytest.param(float("-inf"), 100.0, id="min-negative-infinity"),
+            pytest.param(0.01, float("-inf"), id="max-negative-infinity"),
+            pytest.param(1e-50, 1.0, id="min-below-float32-range"),
+            pytest.param(1.0, 1e-50, id="max-below-float32-range"),
+            pytest.param(1e100, 1.0, id="min-above-float32-range"),
+            pytest.param(1.0, 1e100, id="max-above-float32-range"),
+        ],
+    )
+    def test_log_spaced_range_rejects_invalid_bounds(
+        self,
+        min_scale,
+        max_scale,
+    ):
+        """Log-spaced scales require bounds in JAX's normal float32 domain."""
+        with pytest.raises(ValueError, match="normal float32"):
+            make_scale_range(
+                5,
+                min_scale=min_scale,
+                max_scale=max_scale,
+                log_spaced=True,
+            )
+
+    @pytest.mark.parametrize(
+        ("min_scale", "max_scale"),
+        [
+            pytest.param(0.01, 100.0, id="ascending"),
+            pytest.param(100.0, 0.01, id="descending"),
+            pytest.param(np.float32(0.123), np.float32(0.123), id="equal"),
+            pytest.param(
+                np.float32(3.0),
+                np.nextafter(np.float32(3.0), np.float32("inf")),
+                id="adjacent-ascending",
+            ),
+            pytest.param(
+                np.nextafter(np.float32(3.0), np.float32("inf")),
+                np.float32(3.0),
+                id="adjacent-descending",
+            ),
+            pytest.param(
+                float(np.finfo(np.float32).tiny),
+                float(np.finfo(np.float32).max),
+                id="float32-boundaries",
+            ),
+            pytest.param(
+                float(np.finfo(np.float32).tiny),
+                float(np.finfo(np.float32).tiny),
+                id="equal-float32-tiny",
+            ),
+            pytest.param(
+                float(np.finfo(np.float32).max),
+                float(np.finfo(np.float32).max),
+                id="equal-float32-max",
+            ),
+        ],
+    )
+    def test_log_spaced_range_has_valid_float32_postconditions(
+        self,
+        min_scale,
+        max_scale,
+    ):
+        """Generated ranges preserve canonical endpoints and ordering."""
+        scales = make_scale_range(
+            5,
+            min_scale=min_scale,
+            max_scale=max_scale,
+            log_spaced=True,
+        )
+        values = np.asarray(scales)
+        lower_bound = np.float32(min(min_scale, max_scale))
+        upper_bound = np.float32(max(min_scale, max_scale))
+
+        assert values.dtype == np.dtype(np.float32)
+        assert values[0] == np.float32(min_scale)
+        assert values[-1] == np.float32(max_scale)
+        assert np.all(np.isfinite(values))
+        assert np.all(values > 0.0)
+        assert np.all(values >= lower_bound)
+        assert np.all(values <= upper_bound)
+        if min_scale <= max_scale:
+            assert np.all(values[:-1] <= values[1:])
+        else:
+            assert np.all(values[:-1] >= values[1:])
+
+    @pytest.mark.parametrize(
+        "generated",
+        [
+            pytest.param(jnp.array([1.0, jnp.nan, 10.0]), id="non-finite"),
+            pytest.param(jnp.array([1.0, 0.0, 10.0]), id="non-positive"),
+            pytest.param(jnp.array([1.0, 9.0, 8.0, 10.0]), id="unordered"),
+        ],
+    )
+    def test_log_spaced_range_rejects_invalid_generated_values(self, monkeypatch, generated):
+        """Backend numerical failures must fail closed before scales escape."""
+        monkeypatch.setattr(
+            "alberta_framework.streams.synthetic.np.geomspace",
+            lambda *args, **kwargs: generated,
+        )
+
+        with pytest.raises(ValueError, match="generated log-spaced scales"):
+            make_scale_range(
+                generated.size,
+                min_scale=1.0,
+                max_scale=10.0,
+                log_spaced=True,
+            )
+
     def test_linear_spaced_range(self):
         """Linear-spaced scales should span min to max linearly."""
         scales = make_scale_range(5, min_scale=0.0, max_scale=100.0, log_spaced=False)
@@ -414,9 +611,58 @@ class TestMakeScaleRange:
         chex.assert_trees_all_close(scales[0], jnp.array(0.001), rtol=1e-5)
         chex.assert_trees_all_close(scales[-1], jnp.array(1000.0), rtol=1e-5)
 
+    @pytest.mark.parametrize(
+        "log_spaced",
+        [
+            pytest.param(1, id="int-one"),
+            pytest.param(0, id="int-zero"),
+            pytest.param("yes", id="string-yes"),
+            pytest.param(np.bool_(True), id="numpy-bool-true"),
+            pytest.param(np.bool_(False), id="numpy-bool-false"),
+        ],
+    )
+    def test_log_spaced_rejects_non_bool_identities(self, log_spaced):
+        """Spacing must be an exact bool; 1/'yes' must not pick geomspace."""
+        with pytest.raises(ValueError, match="log_spaced"):
+            make_scale_range(5, min_scale=0.01, max_scale=100.0, log_spaced=log_spaced)
+
 
 class TestDynamicScaleShiftStream:
     """Tests for the DynamicScaleShiftStream class."""
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"min_scale": 0.0},
+            {"min_scale": -1.0},
+            {"min_scale": float("nan")},
+            {"max_scale": float("inf")},
+            {"min_scale": 10.0, "max_scale": 1.0},
+            {"max_scale": 1e39},
+            {"max_scale": Fraction(10**400)},
+            {"min_scale": True},
+            {"max_scale": True},
+            {"min_scale": 1e-40},
+        ],
+    )
+    def test_rejects_nonpositive_nonfinite_or_reversed_scale_bounds(self, kwargs):
+        """These bounds produced NaN/inf observations or an inverted log-uniform range."""
+        with pytest.raises(ValueError, match="scale"):
+            DynamicScaleShiftStream(feature_dim=4, **kwargs)
+
+    def test_scale_bounds_are_narrowed_once_and_compared_after_narrowing(self, rng_key):
+        """Exact-ratio inputs round straight to float32; equal narrowed bounds are accepted."""
+        midpoint = Fraction(1) + Fraction(1, 2**24)
+        stream = DynamicScaleShiftStream(feature_dim=4, min_scale=midpoint, max_scale=midpoint)
+        assert stream._min_scale == 1.0
+        assert stream._max_scale == 1.0
+        assert type(stream._min_scale) is float
+        max_finite = float(np.finfo(np.float32).max)
+        stream = DynamicScaleShiftStream(feature_dim=4, min_scale=1.0, max_scale=max_finite)
+        assert stream._max_scale == max_finite
+        stream = DynamicScaleShiftStream(feature_dim=4, min_scale=0.5, max_scale=0.5)
+        timestep, _ = stream.step(stream.init(rng_key), jnp.array(0))
+        chex.assert_tree_all_finite(timestep.observation)
 
     def test_init_creates_valid_state(self, rng_key):
         """Stream init should create valid state with correct shapes."""
@@ -445,46 +691,28 @@ class TestDynamicScaleShiftStream:
         stream = DynamicScaleShiftStream(feature_dim=20)
         assert stream.feature_dim == 20
 
-    def test_scales_change_at_interval(self, rng_key):
-        """Scales should change at specified interval."""
-        stream = DynamicScaleShiftStream(
-            feature_dim=10,
-            scale_change_interval=10,
-            weight_change_interval=1000,  # Don't change weights
-        )
+    @pytest.mark.parametrize("field", ["current_scales", "true_weights"])
+    @pytest.mark.parametrize("compiled", [False, True], ids=["eager", "jit"])
+    def test_initial_parameters_last_for_first_full_segment(
+        self, rng_key, field, compiled
+    ):
+        """Initialized scales and weights each govern one complete interval."""
+        change_interval = 3
+        intervals = {
+            "scale_change_interval": change_interval if field == "current_scales" else 97,
+            "weight_change_interval": change_interval if field == "true_weights" else 97,
+        }
+        stream = DynamicScaleShiftStream(feature_dim=10, **intervals)
         state = stream.init(rng_key)
+        initial_value = getattr(state, field)
+        step = jax.jit(stream.step) if compiled else stream.step
 
-        initial_scales = state.current_scales.copy()
+        for i in range(change_interval):
+            _, state = step(state, jnp.array(i, dtype=jnp.int32))
+            chex.assert_trees_all_equal(getattr(state, field), initial_value)
 
-        # Run 9 steps (step_count goes 0->9)
-        for i in range(9):
-            _, state = stream.step(state, jnp.array(i))
-
-        # Run one more step (step_count becomes 10)
-        _, state = stream.step(state, jnp.array(9))
-
-        # Scales should have changed at step 10
-        with pytest.raises(AssertionError):
-            chex.assert_trees_all_close(initial_scales, state.current_scales)
-
-    def test_weights_change_at_interval(self, rng_key):
-        """Weights should change at specified interval."""
-        stream = DynamicScaleShiftStream(
-            feature_dim=10,
-            scale_change_interval=1000,  # Don't change scales
-            weight_change_interval=10,
-        )
-        state = stream.init(rng_key)
-
-        initial_weights = state.true_weights.copy()
-
-        # Run 10 steps
-        for i in range(10):
-            _, state = stream.step(state, jnp.array(i))
-
-        # Weights should have changed at step 10
-        with pytest.raises(AssertionError):
-            chex.assert_trees_all_close(initial_weights, state.true_weights)
+        _, state = step(state, jnp.array(change_interval, dtype=jnp.int32))
+        assert not bool(jnp.array_equal(getattr(state, field), initial_value))
 
     def test_scales_within_bounds(self, rng_key):
         """Scales should be within min_scale and max_scale."""
@@ -521,6 +749,86 @@ class TestDynamicScaleShiftStream:
 
 class TestScaleDriftStream:
     """Tests for the ScaleDriftStream class."""
+
+    @pytest.mark.parametrize(
+        ("kwargs", "message"),
+        [
+            (
+                {"min_log_scale": 4.0, "max_log_scale": -4.0},
+                "min_log_scale must be <= max_log_scale",
+            ),
+            ({"min_log_scale": float("nan")}, "min_log_scale must be finite"),
+            ({"max_log_scale": float("inf")}, "max_log_scale must be finite"),
+            ({"min_log_scale": -1e100, "max_log_scale": 1e100}, "min_log_scale must be finite"),
+            ({"max_log_scale": 1e39}, "max_log_scale must be finite"),
+            ({"max_log_scale": Fraction(10**400)}, "max_log_scale must be finite"),
+            ({"min_log_scale": True}, "min_log_scale must be finite"),
+            ({"max_log_scale": False}, "max_log_scale must be finite"),
+            ({"min_log_scale": -88.0}, "min_log_scale must be finite"),
+            ({"max_log_scale": 89.0}, "max_log_scale must be finite"),
+        ],
+    )
+    def test_rejects_reversed_or_nonfinite_log_scale_bounds(self, kwargs, message):
+        """Reversed clip bounds pin every scale to max_log_scale: a stationary stream."""
+        with pytest.raises(ValueError, match=message):
+            ScaleDriftStream(feature_dim=4, **kwargs)
+
+    def test_equal_log_scale_bounds_are_accepted(self, rng_key):
+        stream = ScaleDriftStream(feature_dim=4, min_log_scale=0.0, max_log_scale=0.0)
+        timestep, _ = stream.step(stream.init(rng_key), jnp.array(0))
+        chex.assert_tree_all_finite(timestep.observation)
+
+    def test_log_scale_bounds_are_narrowed_once_before_comparison(self):
+        """A Fraction midpoint rounds once (ties-to-even) to the float32 clip bound."""
+        midpoint = Fraction(1) + Fraction(1, 2**24)
+        stream = ScaleDriftStream(feature_dim=4, min_log_scale=midpoint, max_log_scale=1.0)
+        assert stream._min_log_scale == 1.0
+        assert stream._max_log_scale == 1.0
+        assert type(stream._min_log_scale) is float
+
+    def test_log_scale_bounds_have_positive_finite_float32_exponentials(self):
+        """Accepted clip endpoints cannot collapse or overflow the scale factor."""
+        min_safe = float(
+            np.nextafter(
+                np.float32(np.log(np.finfo(np.float32).tiny)), np.float32(np.inf)
+            )
+        )
+        max_safe = float(
+            np.nextafter(
+                np.float32(np.log(np.finfo(np.float32).max)), np.float32(-np.inf)
+            )
+        )
+        stream = ScaleDriftStream(
+            feature_dim=4, min_log_scale=min_safe, max_log_scale=max_safe
+        )
+        endpoint_scales = jnp.exp(
+            jnp.asarray([stream._min_log_scale, stream._max_log_scale], dtype=jnp.float32)
+        )
+        assert bool(jnp.all(endpoint_scales > 0.0))
+        assert bool(jnp.all(jnp.isfinite(endpoint_scales)))
+
+        with pytest.raises(ValueError, match="min_log_scale"):
+            ScaleDriftStream(
+                feature_dim=4,
+                min_log_scale=float(np.nextafter(np.float32(min_safe), np.float32(-np.inf))),
+            )
+        with pytest.raises(ValueError, match="max_log_scale"):
+            ScaleDriftStream(
+                feature_dim=4,
+                max_log_scale=float(np.nextafter(np.float32(max_safe), np.float32(np.inf))),
+            )
+
+    def test_clip_bounds_stay_finite_at_execution(self, rng_key):
+        """The stored bounds are exactly what jnp.clip receives, so the walk is bounded."""
+        stream = ScaleDriftStream(
+            feature_dim=4, scale_drift_rate=10.0, min_log_scale=-1.0, max_log_scale=1.0
+        )
+        state = stream.init(rng_key)
+        for step in range(50):
+            _, state = stream.step(state, jnp.array(step))
+        assert bool(jnp.all(jnp.isfinite(state.log_scales)))
+        assert bool(jnp.all(state.log_scales >= -1.0))
+        assert bool(jnp.all(state.log_scales <= 1.0))
 
     def test_init_creates_valid_state(self, rng_key):
         """Stream init should create valid state with correct shapes."""
@@ -621,3 +929,89 @@ class TestScaleDriftStream:
             assert isinstance(timestep, TimeStep)
             chex.assert_tree_all_finite(timestep.observation)
             chex.assert_tree_all_finite(timestep.target)
+
+
+class TestScheduleModuliRejectInvalid:
+    """Schedule divisors must be positive JAX-int32 integers before arithmetic."""
+
+    @pytest.mark.parametrize("period", _INVALID_SCHEDULE_MODULI)
+    def test_periodic_change_period_must_be_positive_int(self, period):
+        with pytest.raises(
+            ValueError,
+            match=rf"period must be a positive integer in \[1, {_INT32_MAX}\]",
+        ):
+            PeriodicChangeStream(feature_dim=3, period=period)
+
+    @pytest.mark.parametrize("cycle_length", _INVALID_SCHEDULE_MODULI)
+    def test_cyclic_cycle_length_must_be_positive_int(self, cycle_length):
+        with pytest.raises(
+            ValueError,
+            match=rf"cycle_length must be a positive integer in \[1, {_INT32_MAX}\]",
+        ):
+            CyclicStream(feature_dim=3, cycle_length=cycle_length)
+
+    @pytest.mark.parametrize("num_configurations", _INVALID_SCHEDULE_MODULI)
+    def test_cyclic_num_configurations_must_be_positive_int(self, num_configurations):
+        with pytest.raises(
+            ValueError,
+            match=rf"num_configurations must be a positive integer in \[1, {_INT32_MAX}\]",
+        ):
+            CyclicStream(feature_dim=3, num_configurations=num_configurations)
+
+    @pytest.mark.parametrize("change_interval", _INVALID_SCHEDULE_MODULI)
+    def test_abrupt_change_interval_must_be_positive_int(self, change_interval):
+        with pytest.raises(
+            ValueError,
+            match=rf"change_interval must be a positive integer in \[1, {_INT32_MAX}\]",
+        ):
+            AbruptChangeStream(feature_dim=3, change_interval=change_interval)
+
+    @pytest.mark.parametrize("change_interval", _INVALID_SCHEDULE_MODULI)
+    def test_sutton_change_interval_must_be_positive_int(self, change_interval):
+        with pytest.raises(
+            ValueError,
+            match=rf"change_interval must be a positive integer in \[1, {_INT32_MAX}\]",
+        ):
+            SuttonExperiment1Stream(change_interval=change_interval)
+
+    @pytest.mark.parametrize("name", ["scale_change_interval", "weight_change_interval"])
+    @pytest.mark.parametrize("value", _INVALID_SCHEDULE_MODULI)
+    def test_dynamic_scale_shift_intervals_must_be_positive_ints(self, name, value):
+        with pytest.raises(
+            ValueError,
+            match=rf"{name} must be a positive integer in \[1, {_INT32_MAX}\]",
+        ):
+            DynamicScaleShiftStream(feature_dim=3, **{name: value})
+
+    @pytest.mark.parametrize(
+        "stream",
+        [
+            AbruptChangeStream(feature_dim=3, change_interval=_INT32_MAX),
+            SuttonExperiment1Stream(change_interval=_INT32_MAX),
+            CyclicStream(feature_dim=3, cycle_length=_INT32_MAX),
+            PeriodicChangeStream(feature_dim=3, period=_INT32_MAX),
+            DynamicScaleShiftStream(feature_dim=3, scale_change_interval=_INT32_MAX),
+            DynamicScaleShiftStream(feature_dim=3, weight_change_interval=_INT32_MAX),
+        ],
+        ids=["abrupt", "sutton", "cyclic", "periodic", "dynamic-scale", "dynamic-weight"],
+    )
+    def test_int32_max_schedule_runs_first_eager_and_jit_step(self, stream, rng_key):
+        state = stream.init(rng_key)
+        eager_timestep, eager_state = stream.step(state, jnp.array(0, dtype=jnp.int32))
+        jit_timestep, jit_state = jax.jit(stream.step)(state, jnp.array(0, dtype=jnp.int32))
+
+        chex.assert_tree_all_finite(eager_timestep)
+        chex.assert_tree_all_finite(jit_timestep)
+        chex.assert_trees_all_close(eager_timestep, jit_timestep)
+        jax.block_until_ready((eager_state, jit_state))
+
+    def test_cyclic_int32_max_num_configurations_constructs(self):
+        """The representable boundary is valid even when allocation would be impractical."""
+        stream = CyclicStream(feature_dim=3, num_configurations=_INT32_MAX)
+        assert stream.feature_dim == 3
+
+
+def test_scaled_stream_wrapper_rejects_non_vector_feature_scales():
+    """Per-feature scales must stay one-dimensional to preserve observation shape."""
+    with pytest.raises(ValueError, match=r"feature_scales shape \(\(3, 1\)\)"):
+        ScaledStreamWrapper(RandomWalkStream(feature_dim=3), jnp.ones((3, 1)))

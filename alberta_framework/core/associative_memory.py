@@ -13,14 +13,195 @@ from __future__ import annotations
 
 import functools
 import math
-from dataclasses import asdict, dataclass
-from typing import Any, Literal, cast
+import operator
+from collections.abc import Mapping
+from dataclasses import asdict, dataclass, fields
+from numbers import Real
+from typing import Any, Literal, SupportsIndex, cast
 
 import chex
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import Array
-from jaxtyping import Float, Int
+from jaxtyping import Bool, Float, Int
+
+from alberta_framework._float32 import round_real_to_float32_with_ratio
+from alberta_framework.core.update_safety import (
+    floating_tree_is_finite,
+    neutralize_array,
+    safe_discrete_action,
+    select_transaction,
+)
+
+_INT32_MAX: int = 2**31 - 1
+_UINT32_MAX: int = 4294967295
+_ACTUAL_INT_TYPES: tuple[type, ...] = (
+    int,
+    np.int8,
+    np.int16,
+    np.int32,
+    np.int64,
+    np.uint8,
+    np.uint16,
+    np.uint32,
+    np.uint64,
+    np.longlong,
+    np.ulonglong,
+)
+
+
+def _require_float32_resource(
+    name: str,
+    *,
+    vector_scalars: int,
+    fixed_scalars: int = 0,
+) -> None:
+    total_scalars = vector_scalars + fixed_scalars
+    if total_scalars > _INT32_MAX:
+        raise ValueError(f"{name} scalar count must fit signed int32")
+    if 4 * total_scalars > _INT32_MAX:
+        raise ValueError(f"{name} byte count must fit signed int32")
+
+
+def _require_sequence_resource(name: str, *, scalars: int, bools: int = 0) -> None:
+    if scalars + bools > _INT32_MAX:
+        raise ValueError(f"{name} scalar count must fit signed int32")
+    if 4 * scalars + bools > _INT32_MAX:
+        raise ValueError(f"{name} byte count must fit signed int32")
+
+
+def _read_mapping(name: str, value: object) -> dict[str, Any]:
+    if not issubclass(type(value), Mapping):
+        raise ValueError(f"{name} must be a mapping")
+    try:
+        return dict(cast(Mapping[str, Any], value))
+    except Exception as error:
+        raise ValueError(f"{name} mapping could not be read") from error
+
+
+def _require_array(
+    name: str,
+    value: object,
+    *,
+    shape: tuple[int, ...],
+    dtype: Any,
+) -> None:
+    try:
+        actual_shape = tuple(value.shape)  # type: ignore[attr-defined]
+        actual_dtype = jnp.dtype(value.dtype)  # type: ignore[attr-defined]
+    except Exception as error:
+        raise TypeError(f"{name} must expose array shape and dtype metadata") from error
+    if actual_shape != shape:
+        raise ValueError(f"{name} has an invalid shape")
+    if actual_dtype != jnp.dtype(dtype):
+        raise TypeError(f"{name} has an invalid dtype")
+
+
+def _saturating_increment(value: Array) -> Array:
+    return jnp.minimum(value, jnp.asarray(_INT32_MAX - 1, dtype=jnp.int32)) + jnp.asarray(
+        1, dtype=jnp.int32
+    )
+
+
+def _saturating_add_bool(value: Array, increment: Array) -> Array:
+    room = value < jnp.asarray(_INT32_MAX, dtype=jnp.int32)
+    return value + (increment & room).astype(jnp.int32)
+
+
+def finite_real_and_float32(name: str, value: object) -> tuple[Real, int, int, float]:
+    """Return the original real, exact ratio, and finite binary32 rounding."""
+    actual_type = type(value)
+    if issubclass(actual_type, bool) or not issubclass(actual_type, Real):
+        raise ValueError(f"{name} must be a real number")
+    real = cast(Real, value)
+    try:
+        numerator, denominator, narrowed = round_real_to_float32_with_ratio(real)
+    except Exception:
+        raise ValueError(f"{name} must narrow to a finite float32") from None
+    if not math.isfinite(narrowed):
+        raise ValueError(f"{name} must narrow to a finite float32")
+    return real, numerator, denominator, narrowed
+
+
+def canonical_float32_storage(value: Real, narrowed: float) -> float:
+    if not isinstance(value, (int, float, np.floating)):
+        return narrowed
+    try:
+        number = float(value)
+    except (OverflowError, TypeError, ValueError):
+        return narrowed
+    if not math.isfinite(number):
+        raise ValueError("scalar must be finite")
+    with np.errstate(invalid="ignore", over="ignore", under="ignore"):
+        renarrowed = np.asarray(number, dtype=np.float32)
+    if not bool(np.array_equal(narrowed, renarrowed)):
+        number = float(narrowed)
+    return number
+
+
+def _require_unit_interval(name: str, value: object) -> float:
+    real, numerator, denominator, narrowed = finite_real_and_float32(name, value)
+    if (
+        real < 0.0
+        or not real <= 1.0
+        or numerator < 0
+        or numerator > denominator
+        or narrowed < 0.0
+        or not narrowed <= 1.0
+    ):
+        raise ValueError(f"{name} must be in [0, 1], got invalid value")
+    return canonical_float32_storage(real, narrowed)
+
+
+def _require_half_open_unit_interval(name: str, value: object) -> float:
+    real, numerator, denominator, narrowed = finite_real_and_float32(name, value)
+    if (
+        real <= 0.0
+        or not real <= 1.0
+        or numerator <= 0
+        or numerator > denominator
+        or narrowed <= 0.0
+        or not narrowed <= 1.0
+    ):
+        raise ValueError(f"{name} must be in (0, 1], got invalid value")
+    return canonical_float32_storage(real, narrowed)
+
+
+def _require_nonnegative_real(name: str, value: object) -> float:
+    real, numerator, _, narrowed = finite_real_and_float32(name, value)
+    if real < 0.0 or numerator < 0 or narrowed < 0.0:
+        raise ValueError(f"{name} must be non-negative, got invalid value")
+    return canonical_float32_storage(real, narrowed)
+
+
+def _require_positive_real(name: str, value: object) -> float:
+    real, numerator, _, narrowed = finite_real_and_float32(name, value)
+    if real <= 0.0 or numerator <= 0 or narrowed <= 0.0:
+        raise ValueError(f"{name} must be positive, got invalid value")
+    return canonical_float32_storage(real, narrowed)
+
+
+def _require_int(
+    name: str,
+    value: object,
+    *,
+    minimum: int | None = None,
+    maximum: int | None = None,
+) -> int:
+    if type(value) not in _ACTUAL_INT_TYPES:
+        raise ValueError(f"{name} must be an integer")
+    number = operator.index(cast(SupportsIndex, value))
+    if minimum is not None and number < minimum:
+        if minimum == 1:
+            raise ValueError(f"{name} must be positive, got invalid value")
+        if minimum == 0:
+            raise ValueError(f"{name} must be non-negative, got invalid value")
+        raise ValueError(f"{name} must be >= {minimum}, got invalid value")
+    if maximum is not None and number > maximum:
+        raise ValueError(f"{name} must be <= {maximum}, got invalid value")
+    return number
+
 
 AssociativeFeatureFamily = Literal[
     "position_token",
@@ -90,6 +271,10 @@ class AssociativeMemoryConfig:
     min_effective_budget: int = 1
     scope_logit_clip: float = 8.0
 
+    def __post_init__(self) -> None:
+        """Validate and canonicalize configuration."""
+        _validate_config(self)
+
     def to_config(self) -> dict[str, object]:
         """Serialize to a plain config dictionary."""
         payload = asdict(self)
@@ -97,10 +282,39 @@ class AssociativeMemoryConfig:
         return payload
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> AssociativeMemoryConfig:
+    def from_config(cls, config: Mapping[str, Any]) -> AssociativeMemoryConfig:
         """Reconstruct from :meth:`to_config` output."""
-        payload = dict(config)
-        payload.pop("type", None)
+        payload = _read_mapping("AssociativeMemoryConfig payload", config)
+        if payload.pop("type", None) != "AssociativeMemoryConfig":
+            raise ValueError("AssociativeMemoryConfig type is invalid")
+        if set(payload) != {field.name for field in fields(cls)}:
+            raise ValueError("AssociativeMemoryConfig fields do not match its schema")
+        integer_fields = {
+            "vocab_size",
+            "block_size",
+            "suffix_length",
+            "max_features",
+            "min_effective_budget",
+        }
+        boolean_fields = {
+            "normalize_by_weight",
+            "adaptive_feature_family",
+            "adaptive_window",
+            "adaptive_budget",
+        }
+        string_fields = {"feature_family"}
+        for name, value in payload.items():
+            if name in integer_fields and type(value) is not int:
+                raise ValueError(f"serialized {name} must be a JSON integer")
+            if name in boolean_fields and type(value) is not bool:
+                raise ValueError(f"serialized {name} must be a JSON boolean")
+            if name in string_fields and type(value) is not str:
+                raise ValueError(f"serialized {name} must be a JSON string")
+            if (
+                name not in integer_fields | boolean_fields | string_fields
+                and type(value) is not float
+            ):
+                raise ValueError(f"serialized {name} must be a JSON number")
         return cls(**payload)
 
 
@@ -111,7 +325,7 @@ class AssociativeMemoryState:
     keys: Int[Array, "max_features key_width"]
     values: Float[Array, "max_features vocab_size"]
     utility: Float[Array, " max_features"]
-    counts: Float[Array, " max_features"]
+    counts: Int[Array, " max_features"]
     last_update: Int[Array, " max_features"]
     prior: Float[Array, " vocab_size"]
     family_logits: Float[Array, " family_count"]
@@ -149,6 +363,7 @@ class AssociativeMemoryUpdateResult:
     predictions: Float[Array, " vocab_size"]
     logits: Float[Array, " vocab_size"]
     metrics: Float[Array, " 8"]
+    update_applied: Bool[Array, ""]
 
 
 @chex.dataclass(frozen=True)
@@ -158,51 +373,165 @@ class AssociativeMemoryLearningResult:
     state: AssociativeMemoryState
     predictions: Float[Array, "steps vocab_size"]
     metrics: Float[Array, "steps 8"]
+    updates_applied: Bool[Array, " steps"]
+
+
+def _associative_resource_counts(
+    *, vocab_size: int, block_size: int, suffix_length: int, max_features: int
+) -> tuple[int, int, int, int, int]:
+    pair_count = suffix_length * (suffix_length - 1) // 2
+    active = block_size + pair_count
+    windows = suffix_length - 1
+    persistent = max_features * vocab_size + 8 * max_features + vocab_size + suffix_length + 5
+    descriptors = 5 * pair_count + 2 * block_size + suffix_length - 1
+    window_matrix = pair_count * windows
+    query = (
+        persistent
+        + block_size
+        + 16 * active
+        + active * max_features
+        + max_features
+        + active * vocab_size
+        + window_matrix
+        + 4 * vocab_size
+        + 5 * windows
+        + 32
+    )
+    update = (
+        query
+        + 2 * persistent
+        + active * vocab_size
+        + 10 * active
+        + 5 * vocab_size
+        + 5 * windows
+        + 64
+    )
+    return pair_count, active, descriptors, query, update
 
 
 def _validate_config(config: AssociativeMemoryConfig) -> None:
-    if config.vocab_size < 2:
-        raise ValueError("vocab_size must be at least 2")
-    if config.block_size < 1:
-        raise ValueError("block_size must be positive")
-    if config.suffix_length < 2:
-        raise ValueError("suffix_length must be at least 2")
-    if config.suffix_length > config.block_size:
-        raise ValueError("suffix_length must be <= block_size")
-    if config.feature_family not in {
+    vocab_size = _require_int(
+        "vocab_size", config.vocab_size, minimum=2, maximum=_INT32_MAX
+    )
+    block_size = _require_int(
+        "block_size", config.block_size, minimum=1, maximum=_INT32_MAX
+    )
+    suffix_length = _require_int(
+        "suffix_length", config.suffix_length, minimum=2, maximum=block_size
+    )
+    feature_family = config.feature_family
+    if type(feature_family) is not str:
+        raise ValueError("feature_family must be an actual string")
+    if feature_family not in {
         "position_token",
         "suffix_pair",
         "token_suffix_pair",
     }:
         raise ValueError("unknown feature_family")
-    if config.max_features < 1:
-        raise ValueError("max_features must be positive")
-    if config.write_lr <= 0.0:
-        raise ValueError("write_lr must be positive")
-    if not 0.0 <= config.retention <= 1.0:
-        raise ValueError("retention must be in [0, 1]")
-    if config.utility_lr < 0.0:
-        raise ValueError("utility_lr must be non-negative")
-    if not 0.0 <= config.utility_decay <= 1.0:
-        raise ValueError("utility_decay must be in [0, 1]")
-    if config.min_weight <= 0.0:
-        raise ValueError("min_weight must be positive")
-    if config.max_weight < config.min_weight:
+    canonical_feature_family = str(feature_family)
+    max_features = _require_int(
+        "max_features", config.max_features, minimum=1, maximum=_INT32_MAX
+    )
+    write_lr = _require_positive_real("write_lr", config.write_lr)
+    retention = _require_unit_interval("retention", config.retention)
+    utility_lr = _require_nonnegative_real("utility_lr", config.utility_lr)
+    utility_decay = _require_unit_interval("utility_decay", config.utility_decay)
+    min_weight = _require_positive_real("min_weight", config.min_weight)
+    max_weight = _require_positive_real("max_weight", config.max_weight)
+    if max_weight < min_weight:
         raise ValueError("max_weight must be >= min_weight")
-    if config.logit_scale <= 0.0:
-        raise ValueError("logit_scale must be positive")
-    if config.scope_lr < 0.0:
-        raise ValueError("scope_lr must be non-negative")
-    if config.budget_lr < 0.0:
-        raise ValueError("budget_lr must be non-negative")
-    if not 0.0 < config.initial_budget_fraction <= 1.0:
-        raise ValueError("initial_budget_fraction must be in (0, 1]")
-    if config.min_effective_budget < 1:
-        raise ValueError("min_effective_budget must be positive")
-    if config.min_effective_budget > config.max_features:
-        raise ValueError("min_effective_budget must be <= max_features")
-    if config.scope_logit_clip <= 0.0:
-        raise ValueError("scope_logit_clip must be positive")
+    logit_scale = _require_positive_real("logit_scale", config.logit_scale)
+    if type(config.normalize_by_weight) is not bool:
+        raise ValueError(
+            "normalize_by_weight must be a bool"
+        )
+    for name in (
+        "adaptive_feature_family",
+        "adaptive_window",
+        "adaptive_budget",
+    ):
+        val = getattr(config, name)
+        if type(val) is not bool:
+            raise ValueError(f"{name} must be a boolean")
+        object.__setattr__(config, name, bool(val))
+    scope_lr = _require_nonnegative_real("scope_lr", config.scope_lr)
+    budget_lr = _require_nonnegative_real("budget_lr", config.budget_lr)
+    initial_budget_fraction = _require_half_open_unit_interval(
+        "initial_budget_fraction", config.initial_budget_fraction
+    )
+    min_effective_budget = _require_int(
+        "min_effective_budget",
+        config.min_effective_budget,
+        minimum=1,
+        maximum=max_features,
+    )
+    scope_logit_clip = _require_positive_real(
+        "scope_logit_clip", config.scope_logit_clip
+    )
+
+    object.__setattr__(config, "vocab_size", vocab_size)
+    object.__setattr__(config, "block_size", block_size)
+    object.__setattr__(config, "suffix_length", suffix_length)
+    object.__setattr__(config, "feature_family", canonical_feature_family)
+    object.__setattr__(config, "max_features", max_features)
+    object.__setattr__(config, "write_lr", write_lr)
+    object.__setattr__(config, "retention", retention)
+    object.__setattr__(config, "utility_lr", utility_lr)
+    object.__setattr__(config, "utility_decay", utility_decay)
+    object.__setattr__(config, "min_weight", min_weight)
+    object.__setattr__(config, "max_weight", max_weight)
+    object.__setattr__(config, "logit_scale", logit_scale)
+    object.__setattr__(config, "normalize_by_weight", bool(config.normalize_by_weight))
+    object.__setattr__(config, "scope_lr", scope_lr)
+    object.__setattr__(config, "budget_lr", budget_lr)
+    object.__setattr__(config, "initial_budget_fraction", initial_budget_fraction)
+    object.__setattr__(config, "min_effective_budget", min_effective_budget)
+    object.__setattr__(config, "scope_logit_clip", scope_logit_clip)
+    if max_features * vocab_size > _INT32_MAX:
+        raise ValueError("AssociativeMemoryConfig dimensions must fit signed int32")
+    if max_features * block_size > _INT32_MAX:
+        raise ValueError("AssociativeMemoryConfig dimensions must fit signed int32")
+    pair_count, active_features, descriptor_scalars, query_scalars, update_scalars = (
+        _associative_resource_counts(
+            vocab_size=vocab_size,
+            block_size=block_size,
+            suffix_length=suffix_length,
+            max_features=max_features,
+        )
+    )
+    for name, count in (
+        ("pair count", pair_count),
+        ("active feature count", active_features),
+        ("feature-key count", 5 * active_features),
+        ("lookup match count", active_features * max_features),
+        ("row-value count", active_features * vocab_size),
+        ("window-scope count", pair_count * (suffix_length - 1)),
+    ):
+        if count > _INT32_MAX:
+            raise ValueError(f"AssociativeMemoryConfig {name} must fit signed int32")
+    total_values_scalars = max_features * vocab_size
+    fixed_state_scalars = (
+        8 * max_features + vocab_size + suffix_length + 5
+    )
+    _require_float32_resource(
+        "AssociativeMemoryConfig state",
+        vector_scalars=total_values_scalars,
+        fixed_scalars=fixed_state_scalars,
+    )
+    persistent_bytes = 4 * (total_values_scalars + fixed_state_scalars)
+    if persistent_bytes > _INT32_MAX:
+        raise ValueError("AssociativeMemoryConfig state byte count must fit signed int32")
+    if persistent_bytes > _UINT32_MAX:
+        raise ValueError("associative memory allocation exceeds uint32 byte accounting")
+    _require_float32_resource(
+        "AssociativeMemoryConfig descriptors", vector_scalars=descriptor_scalars
+    )
+    _require_float32_resource(
+        "AssociativeMemoryConfig query", vector_scalars=query_scalars
+    )
+    _require_float32_resource(
+        "AssociativeMemoryConfig update", vector_scalars=update_scalars
+    )
 
 
 def _softmax(logits: Array) -> Array:
@@ -299,10 +628,57 @@ class AssociativeMemoryLearner:
         }
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> AssociativeMemoryLearner:
+    def from_config(cls, config: Mapping[str, Any]) -> AssociativeMemoryLearner:
         """Reconstruct from :meth:`to_config` output."""
-        return cls(
-            AssociativeMemoryConfig.from_config(cast(dict[str, Any], config["config"]))
+        payload = _read_mapping("AssociativeMemoryLearner payload", config)
+        if set(payload) != {"type", "config"}:
+            raise ValueError("AssociativeMemoryLearner fields do not match its schema")
+        if payload["type"] != "AssociativeMemoryLearner":
+            raise ValueError("AssociativeMemoryLearner type is invalid")
+        inner = payload["config"]
+        if not issubclass(type(inner), Mapping):
+            raise ValueError("AssociativeMemoryLearner config must be a mapping")
+        return cls(AssociativeMemoryConfig.from_config(cast(Mapping[str, Any], inner)))
+
+    def _validate_state_static_contract(self, state: AssociativeMemoryState) -> None:
+        if type(state) is not AssociativeMemoryState:
+            raise TypeError("state must be an AssociativeMemoryState")
+        c = self._config
+        expected = (
+            ("state.keys", state.keys, (c.max_features, KEY_WIDTH), jnp.int32),
+            ("state.values", state.values, (c.max_features, c.vocab_size), jnp.float32),
+            ("state.utility", state.utility, (c.max_features,), jnp.float32),
+            ("state.counts", state.counts, (c.max_features,), jnp.int32),
+            ("state.last_update", state.last_update, (c.max_features,), jnp.int32),
+            ("state.prior", state.prior, (c.vocab_size,), jnp.float32),
+            ("state.family_logits", state.family_logits, (FAMILY_COUNT,), jnp.float32),
+            ("state.window_logits", state.window_logits, (c.suffix_length - 1,), jnp.float32),
+            ("state.budget_logit", state.budget_logit, (), jnp.float32),
+            ("state.allocations", state.allocations, (), jnp.int32),
+            ("state.replacements", state.replacements, (), jnp.int32),
+            ("state.step_count", state.step_count, (), jnp.int32),
+        )
+        for name, value, shape, dtype in expected:
+            _require_array(name, value, shape=shape, dtype=dtype)
+
+    @staticmethod
+    def _state_is_valid(state: AssociativeMemoryState) -> Bool[Array, ""]:
+        return (
+            floating_tree_is_finite(state)
+            & jnp.all(state.counts >= 0.0)
+            & jnp.all(state.last_update >= 0)
+            & (state.allocations >= 0)
+            & (state.replacements >= 0)
+            & (state.step_count >= 0)
+            & jnp.all(state.last_update <= state.step_count)
+        )
+
+    def _validate_context_static_contract(self, context: object) -> None:
+        _require_array(
+            "context",
+            context,
+            shape=(self._config.block_size,),
+            dtype=jnp.int32,
         )
 
     def init(self) -> AssociativeMemoryState:
@@ -318,7 +694,7 @@ class AssociativeMemoryLearner:
             ),
             values=jnp.zeros((c.max_features, c.vocab_size), dtype=jnp.float32),
             utility=jnp.zeros((c.max_features,), dtype=jnp.float32),
-            counts=jnp.zeros((c.max_features,), dtype=jnp.float32),
+            counts=jnp.zeros((c.max_features,), dtype=jnp.int32),
             last_update=jnp.zeros((c.max_features,), dtype=jnp.int32),
             prior=jnp.zeros((c.vocab_size,), dtype=jnp.float32),
             family_logits=jnp.zeros((FAMILY_COUNT,), dtype=jnp.float32),
@@ -329,14 +705,21 @@ class AssociativeMemoryLearner:
             step_count=jnp.array(0, dtype=jnp.int32),
         )
 
-    @functools.partial(jax.jit, static_argnums=(0,))
     def feature_keys(
         self,
         context: Int[Array, " block_size"],
     ) -> tuple[Int[Array, "max_active key_width"], Int[Array, " max_active"]]:
         """Return fixed-shape active feature keys and a 0/1 mask."""
+        self._validate_context_static_contract(context)
+        return cast(tuple[Array, Array], self._feature_keys_jit(context))
+
+    @functools.partial(jax.jit, static_argnums=(0,))
+    def _feature_keys_jit(
+        self,
+        context: Int[Array, " block_size"],
+    ) -> tuple[Int[Array, "max_active key_width"], Int[Array, " max_active"]]:
         c = self._config
-        tokens = jnp.asarray(context, dtype=jnp.int32)
+        tokens = jnp.asarray(context)
         token_positions = jnp.arange(c.block_size, dtype=jnp.int32)
         token_keys = jnp.stack(
             [
@@ -449,14 +832,23 @@ class AssociativeMemoryLearner:
         uniform_loss = jnp.log(jnp.asarray(self._config.vocab_size, dtype=jnp.float32))
         return jnp.where(total_weight > 0.0, loss, uniform_loss)
 
-    @functools.partial(jax.jit, static_argnums=(0,))
     def predict(
         self,
         state: AssociativeMemoryState,
         context: Int[Array, " block_size"],
     ) -> AssociativeMemoryPrediction:
         """Predict label probabilities before any write."""
-        keys, mask = self.feature_keys(context)
+        self._validate_state_static_contract(state)
+        self._validate_context_static_contract(context)
+        return cast(AssociativeMemoryPrediction, self._predict_jit(state, context))
+
+    @functools.partial(jax.jit, static_argnums=(0,))
+    def _predict_jit(
+        self,
+        state: AssociativeMemoryState,
+        context: Int[Array, " block_size"],
+    ) -> AssociativeMemoryPrediction:
+        keys, mask = self._feature_keys_jit(context)
         found, indices = self._lookup(state, keys, mask)
         row_values = state.values[indices]
         row_utility = state.utility[indices]
@@ -465,7 +857,13 @@ class AssociativeMemoryLearner:
         window_scope, window_probs = self._window_scope_weights(state)
         scope_weights = family_scope * window_scope * mask.astype(jnp.float32)
         weights = base_weights * scope_weights
-        evidence = jnp.sum(weights[:, None] * row_values, axis=0)
+        weight_col = weights[:, None]
+        # Silent features have weight 0. An inf stored value times that
+        # weight is 0*inf = NaN. Skip the product on exact zeros.
+        evidence = jnp.sum(
+            jnp.where(weight_col == 0.0, jnp.zeros_like(row_values), weight_col * row_values),
+            axis=0,
+        )
         # The decayed label-frequency prior enters with a small fixed weight:
         # it dominates only when no feature rows match (evidence is zero, so
         # the prediction falls back to base rates) and is otherwise a weak
@@ -614,7 +1012,6 @@ class AssociativeMemoryLearner:
             next_state.replace(budget_logit=budget_logit),  # type: ignore[attr-defined]
         )
 
-    @functools.partial(jax.jit, static_argnums=(0,))
     def update(
         self,
         state: AssociativeMemoryState,
@@ -622,8 +1019,54 @@ class AssociativeMemoryLearner:
         label: Int[Array, ""],
     ) -> AssociativeMemoryUpdateResult:
         """Predict, then update active associative rows."""
-        prediction = self.predict(state, context)
-        label = jnp.clip(label.astype(jnp.int32), 0, self._config.vocab_size - 1)
+        self._validate_state_static_contract(state)
+        self._validate_context_static_contract(context)
+        safe_label, label_valid = self._prepare_label(label)
+        return cast(
+            AssociativeMemoryUpdateResult,
+            self._update(state, context, safe_label, label_valid),
+        )
+
+    def _prepare_label(self, label: object) -> tuple[Array, Array]:
+        """Validate a discrete label before JAX can narrow or reshape it."""
+        actual_type = type(label)
+        if issubclass(actual_type, jax.core.Tracer):
+            array = jnp.asarray(label)
+            if not (jnp.issubdtype(array.dtype, jnp.integer) and array.shape == ()):
+                return jnp.asarray(0, dtype=jnp.int32), jnp.asarray(False)
+            # Static checks cannot see traced values, so the vocabulary-domain
+            # verdict must be a runtime predicate folded into update_applied.
+            return safe_discrete_action(array, self._config.vocab_size)
+
+        allowed = (
+            actual_type is int
+            or issubclass(actual_type, np.integer)
+            or actual_type is np.ndarray
+            or issubclass(actual_type, jax.Array)
+        )
+        if not allowed:
+            return jnp.asarray(0, dtype=jnp.int32), jnp.asarray(False)
+        try:
+            host = np.asarray(label)
+        except (OverflowError, TypeError, ValueError):
+            return jnp.asarray(0, dtype=jnp.int32), jnp.asarray(False)
+        if host.shape != () or host.dtype.kind not in ("i", "u"):
+            return jnp.asarray(0, dtype=jnp.int32), jnp.asarray(False)
+        value = int(host.item())
+        if value < 0 or value >= self._config.vocab_size:
+            return jnp.asarray(0, dtype=jnp.int32), jnp.asarray(False)
+        return jnp.asarray(value, dtype=jnp.int32), jnp.asarray(True)
+
+    @functools.partial(jax.jit, static_argnums=(0,))
+    def _update(
+        self,
+        state: AssociativeMemoryState,
+        context: Int[Array, " block_size"],
+        label: Int[Array, ""],
+        label_valid: Bool[Array, ""],
+    ) -> AssociativeMemoryUpdateResult:
+        """Execute one already-domain-checked associative transaction."""
+        prediction = self._predict_jit(state, context)
         loss = _cross_entropy_from_logits(prediction.logits, label)
         accuracy = (jnp.argmax(prediction.logits) == label).astype(jnp.float32)
         next_state = state.replace(  # type: ignore[attr-defined]
@@ -643,8 +1086,11 @@ class AssociativeMemoryLearner:
             existing_slot = indices[0]
             replacement_slot, used_empty = self._replacement_slot(carry)
             slot = jnp.where(found_scalar, existing_slot, replacement_slot)
-            old_row = carry.values[slot]
-            old_utility = carry.utility[slot]
+            # A slot allocated or reused for a new key starts empty: the values,
+            # utility, and count of an evicted occupant must not be inherited.
+            slot_values = carry.values[slot]
+            old_row = jnp.where(found_scalar, slot_values, jnp.zeros_like(slot_values))
+            old_utility = jnp.where(found_scalar, carry.utility[slot], 0.0)
             row_logits = self._config.logit_scale * old_row
             feature_loss = jnp.where(
                 found_scalar,
@@ -664,12 +1110,14 @@ class AssociativeMemoryLearner:
             new_row = old_row * self._config.retention
             new_row = new_row.at[label].add(self._config.write_lr)
             active_bool = active > 0
-            allocations = carry.allocations + (
-                active_bool & (~found_scalar) & used_empty
-            ).astype(jnp.int32)
-            replacements = carry.replacements + (
-                active_bool & (~found_scalar) & (~used_empty)
-            ).astype(jnp.int32)
+            allocations = _saturating_add_bool(
+                carry.allocations,
+                active_bool & (~found_scalar) & used_empty,
+            )
+            replacements = _saturating_add_bool(
+                carry.replacements,
+                active_bool & (~found_scalar) & (~used_empty),
+            )
             next_carry = carry.replace(  # type: ignore[attr-defined]
                 keys=jnp.where(
                     active_bool,
@@ -688,7 +1136,13 @@ class AssociativeMemoryLearner:
                 ),
                 counts=jnp.where(
                     active_bool,
-                    carry.counts.at[slot].add(1.0),
+                    carry.counts.at[slot].set(
+                        jnp.where(
+                            found_scalar,
+                            _saturating_increment(carry.counts[slot]),
+                            jnp.asarray(1, dtype=jnp.int32),
+                        )
+                    ),
                     carry.counts,
                 ),
                 last_update=jnp.where(
@@ -710,7 +1164,7 @@ class AssociativeMemoryLearner:
         next_state = self._update_window_scope(next_state, state, prediction, label, loss)
         next_state = self._update_budget_scope(next_state, state, prediction, loss)
         next_state = next_state.replace(  # type: ignore[attr-defined]
-            step_count=state.step_count + 1
+            step_count=_saturating_increment(state.step_count)
         )
         active_count = jnp.sum(prediction.feature_mask.astype(jnp.float32))
         occupied_count = jnp.sum((next_state.counts > 0.0).astype(jnp.float32))
@@ -731,11 +1185,20 @@ class AssociativeMemoryLearner:
             ],
             dtype=jnp.float32,
         )
+        update_applied = (
+            label_valid
+            & self._state_is_valid(state)
+            & floating_tree_is_finite(prediction)
+            & jnp.isfinite(loss)
+            & floating_tree_is_finite(next_state)
+            & jnp.all(jnp.isfinite(metrics))
+        )
         return AssociativeMemoryUpdateResult(
-            state=next_state,
-            predictions=prediction.probabilities,
-            logits=prediction.logits,
-            metrics=metrics,
+            state=select_transaction(update_applied, next_state, state),
+            predictions=neutralize_array(update_applied, prediction.probabilities),
+            logits=neutralize_array(update_applied, prediction.logits),
+            metrics=neutralize_array(update_applied, metrics),
+            update_applied=update_applied,
         )
 
 
@@ -746,16 +1209,56 @@ def run_associative_memory_arrays(
     labels: Int[Array, " steps"],
 ) -> AssociativeMemoryLearningResult:
     """Run a scan-compatible online associative learner over arrays."""
+    if type(learner) is not AssociativeMemoryLearner:
+        raise TypeError("learner must be an AssociativeMemoryLearner")
+    learner._validate_state_static_contract(state)
+    c = learner.config
+    try:
+        context_shape = tuple(contexts.shape)
+        label_shape = tuple(labels.shape)
+    except Exception as error:
+        raise TypeError("contexts and labels must expose array metadata") from error
+    if len(context_shape) != 2 or context_shape[1] != c.block_size:
+        raise ValueError("contexts have an invalid shape")
+    steps = context_shape[0]
+    if type(steps) is not int or steps < 0:
+        raise ValueError("associative memory step count must be a non-negative integer")
+    if label_shape != (steps,):
+        raise ValueError("labels have an invalid shape")
+    _require_array("contexts", contexts, shape=(steps, c.block_size), dtype=jnp.int32)
+    _require_array("labels", labels, shape=(steps,), dtype=jnp.int32)
+    _, _, _, query_scalars, update_scalars = _associative_resource_counts(
+        vocab_size=c.vocab_size,
+        block_size=c.block_size,
+        suffix_length=c.suffix_length,
+        max_features=c.max_features,
+    )
+    _require_sequence_resource(
+        "associative memory scan outputs",
+        scalars=steps * (c.vocab_size + 8),
+        bools=steps,
+    )
+    _require_sequence_resource(
+        "associative memory scan aggregate",
+        scalars=steps * (c.block_size + 1 + c.vocab_size + 8)
+        + query_scalars
+        + update_scalars,
+        bools=steps,
+    )
 
     def step_fn(
         carry: AssociativeMemoryState,
         inputs: tuple[Array, Array],
-    ) -> tuple[AssociativeMemoryState, tuple[Array, Array]]:
+    ) -> tuple[AssociativeMemoryState, tuple[Array, Array, Array]]:
         context_t, label_t = inputs
         result = learner.update(carry, context_t, label_t)
-        return result.state, (result.predictions, result.metrics)
+        return result.state, (
+            result.predictions,
+            result.metrics,
+            result.update_applied,
+        )
 
-    final_state, (predictions, metrics) = jax.lax.scan(
+    final_state, (predictions, metrics, updates_applied) = jax.lax.scan(
         step_fn,
         state,
         (contexts, labels),
@@ -764,4 +1267,5 @@ def run_associative_memory_arrays(
         state=final_state,
         predictions=predictions,
         metrics=metrics,
+        updates_applied=updates_applied,
     )

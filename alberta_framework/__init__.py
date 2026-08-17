@@ -1,18 +1,15 @@
-"""ASI's JAX continual-learning research package.
-
-The ``alberta_framework`` namespace is retained for compatibility with robot consumers,
-packaging, and historical evidence. It provides foundational components for continual
-reinforcement-learning research. Many core learners expose stepwise,
-predict-before-update paths with explicit carried state. The package also includes batched
-experiment loops, bounded replay, periodic lifecycle operations, and Python-level
-orchestration where their contracts require them.
+"""Alberta Framework: A JAX-based research framework for continual AI.
+The Alberta Framework provides foundational components for continual reinforcement
+learning research. Built on JAX for hardware acceleration, the framework emphasizes
+temporally uniform online updates without special training phases; vectorized helpers
+can run multiple independent agent lives efficiently.
 Research status
 ---------------
-ASI is hillclimbing toward an end-to-end continual-learning application. The
-package also exposes implementation surfaces spanning all twelve steps of the
-Alberta Plan, which is an inspiration rather than a binding roadmap. Module
-presence is not a completion or state-of-the-art claim. See ``docs/status.md``
-for the evidence levels, known failures, and remaining end-to-end gates.
+The package exposes implementation surfaces spanning all twelve steps of the
+Alberta Plan.  Module presence is not a completion claim: no step currently
+satisfies the repository's benchmark-plus-integration completion rule.  See
+``docs/status.md`` for the evidence levels, held-out results, known
+failures, and remaining end-to-end gates.
 Examples
 --------
 ```python
@@ -32,7 +29,7 @@ References
 - Tuning-free Step-size Adaptation (Mahmood et al., 2012)
 - Streaming Deep Reinforcement Learning Finally Works (Elsayed et al., 2024)
 """
-__version__ = "0.28.0"
+__version__ = "0.29.0"
 # Baseline optimizers
 from alberta_framework.core.actor_critic import (
     ActorCriticAgent,
@@ -392,6 +389,8 @@ from alberta_framework.core.multi_head_learner import (
 from alberta_framework.core.normalizers import (
     BOUNDED_RECENCY_ESTIMATOR_SEMANTICS,
     CUMULATIVE_FLOAT32_ESTIMATOR_SEMANTICS,
+    EMA_PRIOR_BOUNDED_RECENCY_ESTIMATOR_SEMANTICS,
+    EMA_PRIOR_CUMULATIVE_FLOAT32_ESTIMATOR_SEMANTICS,
     NORMALIZER_LIFETIME_COUNTER_DELTA_NBYTES,
     NORMALIZER_LIFETIME_COUNTER_NBYTES,
     NORMALIZER_STATE_SCHEMA,
@@ -596,6 +595,7 @@ from alberta_framework.core.representation_gradient_mixer import (
     GradientNormalization,
     RepresentationGradientMixDiagnostics,
     RepresentationGradientMixerConfig,
+    RepresentationGradientMixerResourceBudget,
     RepresentationGradientMixResult,
     mix_representation_gradients,
 )
@@ -714,10 +714,13 @@ from alberta_framework.core.upgd_memory import (
     run_upgd_memory_arrays,
 )
 from alberta_framework.core.working_memory import (
+    WorkingMemoryArrayResult,
     WorkingMemoryConfig,
     WorkingMemoryDiagnostics,
     WorkingMemoryFeaturizer,
     WorkingMemoryState,
+    WorkingMemoryStepResult,
+    WorkingMemoryUpdateResult,
     transform_working_memory_arrays,
 )
 from alberta_framework.core.world_model import (
@@ -748,6 +751,8 @@ from alberta_framework.core.world_model_ensemble import (
     load_world_model_ensemble_checkpoint,
     save_world_model_ensemble_checkpoint,
 )
+
+# Production Step 1-4 pipeline.
 from alberta_framework.pipeline import (
     AlbertaPipeline,
     AlbertaPipelineArrayResult,
@@ -850,6 +855,9 @@ from alberta_framework.streams.feature_discovery import (
     NonlinearFeatureDiscoveryStream,
     collect_feature_discovery_stream,
 )
+
+# Gymnasium adapters import without Gymnasium; constructing an adapter still
+# requires the optional ``gymnasium`` dependency.
 from alberta_framework.streams.gymnasium import (
     GymnasiumStream,
     PredictionMode,
@@ -1001,6 +1009,8 @@ __all__ = [
     # Normalizers
     "BOUNDED_RECENCY_ESTIMATOR_SEMANTICS",
     "CUMULATIVE_FLOAT32_ESTIMATOR_SEMANTICS",
+    "EMA_PRIOR_BOUNDED_RECENCY_ESTIMATOR_SEMANTICS",
+    "EMA_PRIOR_CUMULATIVE_FLOAT32_ESTIMATOR_SEMANTICS",
     "NORMALIZER_LIFETIME_COUNTER_DELTA_NBYTES",
     "NORMALIZER_LIFETIME_COUNTER_NBYTES",
     "NORMALIZER_STATE_SCHEMA",
@@ -1102,7 +1112,6 @@ __all__ = [
     "ReplayWriteResult",
     "ReservoirSelection",
     "reservoir_selection",
-    # Non-learning embodied hard envelope and shadow readiness readout
     # Atomic model-only replay rehearsal composition
     "MODEL_REPLAY_REHEARSAL_SCHEMA",
     "MODEL_REPLAY_REHEARSAL_STATUS",
@@ -1124,6 +1133,7 @@ __all__ = [
     "GradientNormalization",
     "RepresentationGradientMixDiagnostics",
     "RepresentationGradientMixerConfig",
+    "RepresentationGradientMixerResourceBudget",
     "RepresentationGradientMixResult",
     "mix_representation_gradients",
     # PrototypeAgent — experimental composition surface spanning Steps 1–12
@@ -1157,8 +1167,6 @@ __all__ = [
     "feature_to_subtask_specs",
     "load_prototype_checkpoint",
     "save_prototype_checkpoint",
-    # Strict opt-in live Prototype/STOMP calibrated-search sidecar
-    # Opt-in action-changing consolidated-memory consumer
     # Bounded Prototype pair-feature lifecycle
     "PROTOTYPE_FEATURE_LIFECYCLE_CHECKPOINT_SCHEMA",
     "PROTOTYPE_FEATURE_LIFECYCLE_CONFIG_SCHEMA",
@@ -1175,8 +1183,6 @@ __all__ = [
     "PrototypePairGradientPullback",
     "load_prototype_feature_lifecycle_checkpoint",
     "save_prototype_feature_lifecycle_checkpoint",
-    # Diagnostic-only causal utility for the shared Prototype feature bank
-    # Audit-ranked curation influence for the shared Prototype feature bank
     # Learners - Supervised Learning
     "LinearLearner",
     "run_learning_loop",
@@ -1279,10 +1285,13 @@ __all__ = [
     "PartnerPolicyFusionState",
     "GeneratorMetaResourceManager",
     "HistoryFeatureExtractor",
+    "WorkingMemoryArrayResult",
     "WorkingMemoryConfig",
     "WorkingMemoryDiagnostics",
     "WorkingMemoryFeaturizer",
     "WorkingMemoryState",
+    "WorkingMemoryStepResult",
+    "WorkingMemoryUpdateResult",
     "transform_working_memory_arrays",
     # Causal state construction
     "STATE_BUILDER_CHECKPOINT_SCHEMA",
@@ -1369,7 +1378,6 @@ __all__ = [
     "RecurrentLatentWorldModelUpdateResult",
     "load_recurrent_latent_world_model_ensemble_checkpoint",
     "save_recurrent_latent_world_model_ensemble_checkpoint",
-    "run_action_conditioned_world_model_learning_loop",
     "run_latent_world_model_learning_loop",
     # Typed predict-before-update learning signals
     "LearningSignalAvailability",
@@ -1433,6 +1441,7 @@ __all__ = [
     "run_upgd_memory_arrays",
     "run_off_policy_horde_learning_loop",
     "run_off_policy_horde_learning_loop_batched",
+    "run_action_conditioned_world_model_learning_loop",
     # World model (Steps 7/8)
     "OneStepWorldModel",
     "WorldModelConfig",
@@ -1456,7 +1465,6 @@ __all__ = [
     "floor_and_renormalize_probabilities",
     "run_behavior_model_from_arrays",
     "selected_action_probabilities",
-    # Differentiable EML
     # GVF / Horde (Step 3)
     "BatchedIndependentDemonHordeResult",
     "BatchedHordeResult",
@@ -1594,7 +1602,6 @@ __all__ = [
     "NonlinearFeatureDiscoveryState",
     "NonlinearFeatureDiscoveryStream",
     "collect_feature_discovery_stream",
-    # Streams - uncued recurring hidden-partner mapping life
     # Streams - Step 2 out-of-class
     "CompositionalState",
     "CompositionalStream",
@@ -1650,7 +1657,6 @@ __all__ = [
     "load_checkpoint",
     "load_checkpoint_metadata",
     "save_checkpoint",
-    # Diagnostics
     # Security integration
     "N_SECURITY_ACTIONS",
     "SECURITY_ACTION_NAMES",

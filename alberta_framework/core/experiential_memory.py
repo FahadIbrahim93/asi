@@ -24,19 +24,38 @@ References:
 from __future__ import annotations
 
 import functools
-import math
-from dataclasses import asdict, dataclass
-from typing import Any, cast
+import operator
+from dataclasses import asdict, dataclass, fields
+from typing import Any, SupportsIndex, cast
 
 import chex
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import Array
 from jaxtyping import Bool, Float, Int
+
+from alberta_framework.core._float32_scalars import validated_float32_scalar
 
 _INT32_MAX = 2_147_483_647
 _UINT32_MAX = 4_294_967_295
 
+_ACTUAL_INT_TYPES: tuple[type, ...] = (
+    int,
+    np.int8,
+    np.int16,
+    np.int32,
+    np.int64,
+    np.uint8,
+    np.uint16,
+    np.uint32,
+    np.uint64,
+    np.longlong,
+    np.ulonglong,
+)
+_ACTUAL_FLOAT_TYPES = frozenset(
+    {float, *(np.dtype(code).type for code in ("e", "f", "d", "g"))}
+)
 
 @dataclass(frozen=True)
 class ExperientialMemoryConfig:
@@ -89,6 +108,9 @@ class ExperientialMemoryConfig:
     eviction_recency_weight: float = 1.0
     recency_scale: float = 100.0
 
+    def __post_init__(self) -> None:
+        _validate_config(self)
+
     def to_config(self) -> dict[str, object]:
         """Return a JSON-serializable configuration."""
         payload = asdict(self)
@@ -98,14 +120,16 @@ class ExperientialMemoryConfig:
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> ExperientialMemoryConfig:
         """Reconstruct and validate a configuration dictionary."""
+        if type(config) is not dict:
+            raise ValueError("config must be an exact built-in dict")
+        expected = {field.name for field in fields(cls)} | {"type"}
+        if any(type(key) is not str for key in config) or set(config) != expected:
+            raise ValueError("config fields do not match the serialized schema")
+        if type(config["type"]) is not str or config["type"] != "ExperientialMemoryConfig":
+            raise ValueError("config type differs")
         payload = dict(config)
-        type_name = payload.pop("type", None)
-        if type_name not in {None, "ExperientialMemoryConfig"}:
-            raise ValueError(f"unexpected config type: {type_name!r}")
-        result = cls(**payload)
-        _validate_config(result)
-        return result
-
+        payload.pop("type")
+        return cls(**payload)
 
 @chex.dataclass(frozen=True)
 class ExperientialMemoryEntry:
@@ -129,10 +153,14 @@ class ExperientialMemoryEntry:
     provenance_id: Int[Array, ""]
     source_id: Int[Array, ""]
 
-
 @chex.dataclass(frozen=True)
 class ExperientialMemoryEntries:
-    """Fixed-capacity structure-of-arrays for persistent exemplars."""
+    """Fixed-capacity structure-of-arrays for persistent exemplars.
+
+    ``ages`` is the exemplar's chronological age. ``recency_ages`` is local
+    time since its last accepted retrieval: zero on write and on access, then
+    incremented once per later memory step while the slot remains valid.
+    """
 
     observations: Float[Array, "capacity observation_dim"]
     keys: Float[Array, "capacity key_dim"]
@@ -154,7 +182,6 @@ class ExperientialMemoryEntries:
     source_ids: Int[Array, " capacity"]
     retrieval_counts: Int[Array, " capacity"]
 
-
 @chex.dataclass(frozen=True)
 class ExperientialMemoryState:
     """Complete fixed-shape persistent memory state."""
@@ -168,7 +195,6 @@ class ExperientialMemoryState:
     rejected_write_count: Int[Array, ""]
     eviction_count: Int[Array, ""]
     persistent_bytes: Array
-
 
 @chex.dataclass(frozen=True)
 class ExperientialMemoryRetrieval:
@@ -203,7 +229,6 @@ class ExperientialMemoryRetrieval:
     safety_ok: Bool[Array, ""]
     has_neighbors: Bool[Array, ""]
 
-
 @chex.dataclass(frozen=True)
 class ExperientialMemoryWriteResult:
     """State and accounting returned by one bounded write."""
@@ -213,7 +238,6 @@ class ExperientialMemoryWriteResult:
     slot: Int[Array, ""]
     evicted: Bool[Array, ""]
     evicted_provenance_id: Int[Array, ""]
-
 
 @chex.dataclass(frozen=True)
 class ExperientialMemoryStepResult:
@@ -225,7 +249,6 @@ class ExperientialMemoryStepResult:
     slot: Int[Array, ""]
     evicted: Bool[Array, ""]
     evicted_provenance_id: Int[Array, ""]
-
 
 @chex.dataclass(frozen=True)
 class ExperientialMemoryAccounting:
@@ -241,12 +264,31 @@ class ExperientialMemoryAccounting:
     rejected_writes: Int[Array, ""]
     evictions: Int[Array, ""]
 
+def _require_positive_int(name: str, value: object) -> int:
+    if type(value) not in _ACTUAL_INT_TYPES:
+        raise ValueError(f"{name} must be a positive integer in [1, {_INT32_MAX}]")
+    number = operator.index(cast(SupportsIndex, value))
+    if number < 1 or number > _INT32_MAX:
+        raise ValueError(f"{name} must be a positive integer in [1, {_INT32_MAX}]")
+    return number
 
-def _validate_finite(name: str, value: float) -> None:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError(f"{name} must be a real number")
-    if not math.isfinite(value):
-        raise ValueError(f"{name} must be finite")
+def _require_nonnegative_int(name: str, value: object) -> int:
+    if type(value) not in _ACTUAL_INT_TYPES:
+        raise ValueError(f"{name} must be an integer in [0, {_INT32_MAX}]")
+    number = operator.index(cast(SupportsIndex, value))
+    if number < 0 or number > _INT32_MAX:
+        raise ValueError(f"{name} must be an integer in [0, {_INT32_MAX}]")
+    return number
+
+def _validated_config_float(name: str, value: object, **bounds: Any) -> float:
+    if type(value) not in (frozenset(_ACTUAL_INT_TYPES) | _ACTUAL_FLOAT_TYPES):
+        raise ValueError(f"{name} must be a finite real scalar")
+    return validated_float32_scalar(name, value, **bounds)
+
+
+def _require_float32_allocation(name: str, scalars: int) -> None:
+    if scalars > _INT32_MAX or 4 * scalars > _INT32_MAX:
+        raise ValueError(f"{name} scalar and byte counts must fit signed int32")
 
 
 def _validate_config(config: ExperientialMemoryConfig) -> None:
@@ -259,66 +301,128 @@ def _validate_config(config: ExperientialMemoryConfig) -> None:
         "top_k",
         "min_neighbors",
     ):
-        value = getattr(config, name)
-        if isinstance(value, bool) or not isinstance(value, int):
-            raise ValueError(f"{name} must be an integer")
-        if value < 1:
-            raise ValueError(f"{name} must be positive")
+        canonical = _require_positive_int(name, getattr(config, name))
+        object.__setattr__(config, name, canonical)
     if config.top_k > config.capacity:
         raise ValueError("top_k must be <= capacity")
     if config.min_neighbors > config.top_k:
         raise ValueError("min_neighbors must be <= top_k")
-    if isinstance(config.max_age, bool) or not isinstance(config.max_age, int):
-        raise ValueError("max_age must be an integer")
-    if config.max_age < 0:
-        raise ValueError("max_age must be non-negative")
+    canonical_max_age = _require_nonnegative_int("max_age", config.max_age)
+    object.__setattr__(config, "max_age", canonical_max_age)
 
-    for name in (
-        "distance_scale",
-        "min_similarity",
-        "min_effective_reliability",
-        "max_uncertainty",
-        "max_safety_cost",
-        "staleness_scale",
-        "utility_decay",
-        "eviction_utility_weight",
-        "eviction_recency_weight",
-        "recency_scale",
+    vector_values = (
+        config.observation_dim + config.key_dim + config.action_dim + config.outcome_dim
+    )
+    if vector_values > _INT32_MAX:
+        raise ValueError("ExperientialMemoryConfig dimensions must fit signed int32")
+    logical_scalars = config.capacity * (vector_values + 15) + 8
+    persistent_bytes = config.capacity * (4 * (vector_values + 11) + 4) + 32
+    if logical_scalars > _INT32_MAX:
+        raise ValueError("ExperientialMemoryConfig state scalar count must fit signed int32")
+    if persistent_bytes > _INT32_MAX:
+        raise ValueError("ExperientialMemoryConfig state byte count must fit signed int32")
+    if persistent_bytes > _UINT32_MAX:
+        raise ValueError("persistent memory allocation exceeds uint32 byte accounting")
+    for name, scalars in (
+        ("query key-distance work", config.capacity * config.key_dim),
+        ("query observation gather", config.top_k * config.observation_dim),
+        ("query key gather", config.top_k * config.key_dim),
+        ("query action gather", config.top_k * config.action_dim),
+        ("query outcome gather", config.top_k * config.outcome_dim),
+        ("query gathered payload", config.top_k * vector_values),
+        ("query neighbor diagnostics", 7 * config.top_k),
     ):
-        _validate_finite(name, cast(float, getattr(config, name)))
+        _require_float32_allocation(f"ExperientialMemoryConfig {name}", scalars)
+    payload_values = config.observation_dim + config.action_dim + config.outcome_dim
+    # Conservative simultaneous query envelope, expressed as four-byte scalar
+    # equivalents.  It includes the persistent state plus every full-width
+    # logical temporary in _query_jit: row-finiteness predicates; safe keys,
+    # key differences and squares; safe payload matrices; nineteen capacity
+    # vectors; gathered values and their weighted products; top-k diagnostics;
+    # and reduced payload outputs.  Booleans can be smaller, but are charged at
+    # four bytes so this remains an upper bound across JAX backends.
+    query_temporary_scalars = (
+        config.capacity * vector_values
+        + 3 * config.capacity * config.key_dim
+        + config.capacity * payload_values
+        + 19 * config.capacity
+        + 2 * config.top_k * (payload_values + 4)
+        + 9 * config.top_k
+        + payload_values
+        + 4
+    )
+    if persistent_bytes + 4 * query_temporary_scalars > _INT32_MAX:
+        raise ValueError(
+            "ExperientialMemoryConfig aggregate query working-set bytes "
+            "must fit signed int32"
+        )
 
-    if config.distance_scale <= 0.0:
-        raise ValueError("distance_scale must be positive")
-    if not 0.0 <= config.min_similarity <= 1.0:
-        raise ValueError("min_similarity must be in [0, 1]")
-    if not 0.0 < config.min_effective_reliability <= 1.0:
-        raise ValueError("min_effective_reliability must be in (0, 1]")
-    if config.max_uncertainty < 0.0:
-        raise ValueError("max_uncertainty must be non-negative")
-    if config.max_safety_cost < 0.0:
-        raise ValueError("max_safety_cost must be non-negative")
-    if config.staleness_scale <= 0.0:
-        raise ValueError("staleness_scale must be positive")
-    if not 0.0 <= config.utility_decay <= 1.0:
-        raise ValueError("utility_decay must be in [0, 1]")
-    if config.eviction_utility_weight < 0.0:
-        raise ValueError("eviction_utility_weight must be non-negative")
-    if config.eviction_recency_weight < 0.0:
-        raise ValueError("eviction_recency_weight must be non-negative")
-    if config.eviction_utility_weight + config.eviction_recency_weight <= 0.0:
+    object.__setattr__(
+        config,
+        "distance_scale",
+        _validated_config_float("distance_scale", config.distance_scale, positive=True),
+    )
+    object.__setattr__(
+        config,
+        "min_similarity",
+        _validated_config_float("min_similarity", config.min_similarity, lower=0, upper=1),
+    )
+    object.__setattr__(
+        config,
+        "min_effective_reliability",
+        _validated_config_float(
+            "min_effective_reliability", config.min_effective_reliability, positive=True, upper=1
+        ),
+    )
+    object.__setattr__(
+        config,
+        "max_uncertainty",
+        _validated_config_float("max_uncertainty", config.max_uncertainty, lower=0),
+    )
+    object.__setattr__(
+        config,
+        "max_safety_cost",
+        _validated_config_float("max_safety_cost", config.max_safety_cost, lower=0),
+    )
+    object.__setattr__(
+        config,
+        "staleness_scale",
+        _validated_config_float("staleness_scale", config.staleness_scale, positive=True),
+    )
+    object.__setattr__(
+        config,
+        "utility_decay",
+        _validated_config_float("utility_decay", config.utility_decay, lower=0, upper=1),
+    )
+    object.__setattr__(
+        config,
+        "eviction_utility_weight",
+        _validated_config_float(
+            "eviction_utility_weight", config.eviction_utility_weight, lower=0
+        ),
+    )
+    object.__setattr__(
+        config,
+        "eviction_recency_weight",
+        _validated_config_float(
+            "eviction_recency_weight", config.eviction_recency_weight, lower=0
+        ),
+    )
+    utility_weight_f32 = float(np.asarray(config.eviction_utility_weight, dtype=np.float32))
+    recency_weight_f32 = float(np.asarray(config.eviction_recency_weight, dtype=np.float32))
+    if utility_weight_f32 + recency_weight_f32 <= 0.0:
         raise ValueError("at least one eviction retention weight must be positive")
-    if config.recency_scale <= 0.0:
-        raise ValueError("recency_scale must be positive")
-
-
+    object.__setattr__(
+        config,
+        "recency_scale",
+        _validated_config_float("recency_scale", config.recency_scale, positive=True),
+    )
 def _saturating_increment(value: Array) -> Array:
     maximum_minus_one = jnp.asarray(_INT32_MAX - 1, dtype=jnp.int32)
     return jnp.minimum(value, maximum_minus_one) + jnp.asarray(1, dtype=jnp.int32)
 
-
 def _tree_nbytes(tree: Any) -> int:
     return sum(int(leaf.size) * int(leaf.dtype.itemsize) for leaf in jax.tree.leaves(tree))
-
 
 def _configured_nbytes(config: ExperientialMemoryConfig) -> tuple[int, int]:
     vector_values = config.observation_dim + config.key_dim + config.action_dim + config.outcome_dim
@@ -327,7 +431,6 @@ def _configured_nbytes(config: ExperientialMemoryConfig) -> tuple[int, int]:
     # Seven int32 counters and the uint32 byte-count scalar live beside slots.
     persistent_bytes = config.capacity * slot_bytes + 8 * 4
     return persistent_bytes, slot_bytes
-
 
 def _require_array(
     value: Any,
@@ -345,7 +448,6 @@ def _require_array(
     actual_dtype = jnp.dtype(value.dtype)
     if actual_dtype != expected_dtype:
         raise TypeError(f"{name} must have dtype {expected_dtype}; got {actual_dtype}")
-
 
 class ExperientialMemory:
     """Fixed-capacity episodic memory with conservative retrieval.
@@ -390,8 +492,14 @@ class ExperientialMemory:
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> ExperientialMemory:
         """Reconstruct a memory from :meth:`to_config` output."""
-        if config.get("type") not in {None, "ExperientialMemory"}:
-            raise ValueError(f"unexpected memory type: {config.get('type')!r}")
+        if type(config) is not dict:
+            raise ValueError("config must be an exact built-in dict")
+        if any(type(key) is not str for key in config) or set(config) != {"type", "config"}:
+            raise ValueError("config fields do not match the serialized schema")
+        if type(config["type"]) is not str or config["type"] != "ExperientialMemory":
+            raise ValueError("config type differs")
+        if type(config["config"]) is not dict:
+            raise ValueError("nested config must be an exact built-in dict")
         inner = cast(dict[str, Any], config["config"])
         return cls(ExperientialMemoryConfig.from_config(inner))
 
@@ -817,10 +925,19 @@ class ExperientialMemory:
             -squared_distance / jnp.asarray(cfg.distance_scale, dtype=jnp.float32)
         )
         safe_ages = jnp.where(entries.ages >= 0, entries.ages, 0)
-        staleness = jnp.exp(
-            -safe_ages.astype(jnp.float32)
-            / jnp.asarray(cfg.staleness_scale, dtype=jnp.float32)
+        staleness_scale = jnp.asarray(cfg.staleness_scale, dtype=jnp.float32)
+        # Every positive float32 scale is legal. Cap the mathematically huge
+        # quotient before division so a tiny scale yields exact zero staleness
+        # without first creating an infinity in the JAX operation graph.
+        maximum_exponent = jnp.asarray(
+            np.finfo(np.float32).max / 2.0,
+            dtype=jnp.float32,
         )
+        bounded_staleness_age = jnp.minimum(
+            safe_ages.astype(jnp.float32),
+            maximum_exponent * jnp.minimum(staleness_scale, 1.0),
+        )
+        staleness = jnp.exp(-bounded_staleness_age / staleness_scale)
         safe_reliabilities = jnp.where(
             jnp.isfinite(entries.reliabilities)
             & (entries.reliabilities >= 0.0)
@@ -840,7 +957,8 @@ class ExperientialMemory:
         neighbor_mask = jnp.isfinite(top_scores) & (top_scores > 0.0)
         positive_scores = jnp.where(neighbor_mask, top_scores, 0.0)
         score_sum = jnp.sum(positive_scores)
-        neighbor_weights = positive_scores / jnp.maximum(score_sum, 1.0e-12)
+        weight_denominator = jnp.where(score_sum > 0.0, score_sum, 1.0)
+        neighbor_weights = positive_scores / weight_denominator
 
         neighbor_similarities = similarities[indices]
         neighbor_reliabilities = effective_reliabilities[indices]
@@ -949,7 +1067,8 @@ class ExperientialMemory:
         )
         utilities = jnp.where(
             valid,
-            entries.utilities * jnp.asarray(self._config.utility_decay, dtype=jnp.float32),
+            entries.utilities
+            * jnp.asarray(self._config.utility_decay, dtype=jnp.float32),
             entries.utilities,
         )
         return ExperientialMemoryState(
@@ -1054,20 +1173,25 @@ class ExperientialMemory:
             current_entries = current.entries
             has_empty = jnp.any(~current_entries.valid)
             empty_slot = jnp.argmax((~current_entries.valid).astype(jnp.int32))
-            recency_score = 1.0 / (
-                1.0
-                + current_entries.recency_ages.astype(jnp.float32)
-                / jnp.asarray(cfg.recency_scale, dtype=jnp.float32)
+            recency_scale = jnp.asarray(cfg.recency_scale, dtype=jnp.float32)
+            # Algebraically equivalent to 1 / (1 + age / scale), but remains
+            # finite for every positive float32 scale in the public contract.
+            recency_score = recency_scale / (
+                recency_scale + current_entries.recency_ages.astype(jnp.float32)
             )
             eviction_utilities = jnp.where(
                 current_entries.utility_available,
                 current_entries.utilities,
                 0.0,
             )
+            utility_weight = jnp.asarray(cfg.eviction_utility_weight, dtype=jnp.float32)
+            recency_weight = jnp.asarray(cfg.eviction_recency_weight, dtype=jnp.float32)
+            # These weights are relative. Normalization preserves ordering and
+            # prevents finite configured weights from overflowing their products.
+            weight_scale = jnp.maximum(utility_weight, recency_weight)
             retention_score = (
-                jnp.asarray(cfg.eviction_utility_weight, dtype=jnp.float32)
-                * eviction_utilities
-                + jnp.asarray(cfg.eviction_recency_weight, dtype=jnp.float32) * recency_score
+                utility_weight / weight_scale * eviction_utilities
+                + recency_weight / weight_scale * recency_score
             )
             retention_score = jnp.where(current_entries.valid, retention_score, jnp.inf)
             eviction_slot = jnp.argmin(retention_score)
@@ -1101,7 +1225,9 @@ class ExperientialMemory:
                 ),
                 valid=current_entries.valid.at[slot].set(True),
                 ages=current_entries.ages.at[slot].set(entry.age),
-                recency_ages=current_entries.recency_ages.at[slot].set(entry.age),
+                # Recency is time since this memory last retrieved the
+                # exemplar, not the exemplar's imported chronological age.
+                recency_ages=current_entries.recency_ages.at[slot].set(0),
                 provenance_ids=current_entries.provenance_ids.at[slot].set(entry.provenance_id),
                 source_ids=current_entries.source_ids.at[slot].set(entry.source_id),
                 retrieval_counts=current_entries.retrieval_counts.at[slot].set(0),
@@ -1244,23 +1370,13 @@ class ExperientialMemory:
             ),
         )
 
-    @functools.partial(jax.jit, static_argnums=(0,))
-    def _step_jit(
+    def _step_from_retrieval(
         self,
         state: ExperientialMemoryState,
-        query_key: Array,
-        representation_version: Array,
-        query_uncertainty: Array,
-        query_uncertainty_available: Array,
+        retrieval: ExperientialMemoryRetrieval,
         entry: ExperientialMemoryEntry,
     ) -> ExperientialMemoryStepResult:
-        retrieval = self._query_jit(
-            state,
-            query_key,
-            representation_version,
-            query_uncertainty,
-            query_uncertainty_available,
-        )
+        """Age, record one already-computed pre-state query, and write once."""
 
         def apply(_: None) -> ExperientialMemoryStepResult:
             advanced = self._advance(state)
@@ -1291,6 +1407,25 @@ class ExperientialMemory:
         )
 
     @functools.partial(jax.jit, static_argnums=(0,))
+    def _step_jit(
+        self,
+        state: ExperientialMemoryState,
+        query_key: Array,
+        representation_version: Array,
+        query_uncertainty: Array,
+        query_uncertainty_available: Array,
+        entry: ExperientialMemoryEntry,
+    ) -> ExperientialMemoryStepResult:
+        retrieval = self._query_jit(
+            state,
+            query_key,
+            representation_version,
+            query_uncertainty,
+            query_uncertainty_available,
+        )
+        return self._step_from_retrieval(state, retrieval, entry)
+
+    @functools.partial(jax.jit, static_argnums=(0,))
     def accounting(
         self,
         state: ExperientialMemoryState,
@@ -1307,7 +1442,6 @@ class ExperientialMemory:
             rejected_writes=state.rejected_write_count,
             evictions=state.eviction_count,
         )
-
 
 __all__ = [
     "ExperientialMemory",

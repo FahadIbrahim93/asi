@@ -9,7 +9,18 @@ from typing import Any
 import chex
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
+
+
+class _HostileFloat(float):
+    def as_integer_ratio(self) -> tuple[int, int]:
+        raise AssertionError("scalar hook must not run")
+
+
+class _HostileDict(dict[str, Any]):
+    def __iter__(self):
+        raise AssertionError("mapping hook must not run")
 
 try:
     from alberta_framework.core.behavior_model import (
@@ -91,6 +102,143 @@ def test_init_predict_update_finite_and_shapes() -> None:
     _assert_behavior_update_finite(result)
     assert int(result.state.step_count) == 1
     assert float(result.loss) > 0.0
+
+
+def test_infinite_observation_does_not_poison_weights() -> None:
+    """Inf obs makes softmax NaN and logit_error * x = 0*inf on a silent feature."""
+    model = BehaviorModel(BehaviorModelConfig(n_actions=2, step_size=0.1))
+    state = model.init(feature_dim=2, key=jax.random.key(0))
+    obs = jnp.array([0.0, jnp.inf], dtype=jnp.float32)
+    action = jnp.array(0, dtype=jnp.int32)
+
+    poisoned = model.update(state, obs, action)
+    chex.assert_trees_all_close(poisoned.state.weights, state.weights)
+    chex.assert_trees_all_close(poisoned.state.bias, state.bias)
+    assert int(poisoned.state.step_count) == int(state.step_count)
+    assert not bool(poisoned.update_applied)
+    assert float(poisoned.loss) == 0.0
+    assert int(poisoned.predicted_action) == 0
+    chex.assert_trees_all_close(poisoned.probabilities, jnp.zeros_like(poisoned.probabilities))
+
+    recovered = model.update(
+        poisoned.state,
+        jnp.array([0.0, 1.0], dtype=jnp.float32),
+        action,
+    )
+    chex.assert_tree_all_finite(recovered.state.weights)
+    chex.assert_tree_all_finite(recovered.state.bias)
+    assert bool(recovered.update_applied)
+
+
+def test_zero_diagnostic_decay_does_not_multiply_inf_ema() -> None:
+    """decay=0 times an infinite diagnostic EMA is NaN and would reject a finite sample."""
+    model = BehaviorModel(
+        BehaviorModelConfig(n_actions=2, step_size=0.1, diagnostic_decay=0.0)
+    )
+    state = model.init(feature_dim=2, key=jax.random.key(0))
+    obs = jnp.array([0.5, -0.25], dtype=jnp.float32)
+    action = jnp.array(0, dtype=jnp.int32)
+    state = model.update(state, obs, action).state
+    state = state.replace(  # type: ignore[attr-defined]
+        nll_ema=jnp.asarray(jnp.inf, dtype=jnp.float32),
+        accuracy_ema=jnp.asarray(jnp.inf, dtype=jnp.float32),
+        confidence_ema=jnp.asarray(jnp.inf, dtype=jnp.float32),
+    )
+    raw = jnp.asarray(0.0, dtype=jnp.float32) * jnp.asarray(jnp.inf, dtype=jnp.float32)
+    assert not bool(jnp.isfinite(raw))
+
+    result = model.update(state, obs, action)
+    assert bool(result.update_applied)
+    chex.assert_tree_all_finite(result.state.nll_ema)
+    chex.assert_tree_all_finite(result.state.accuracy_ema)
+    chex.assert_tree_all_finite(result.state.confidence_ema)
+    chex.assert_trees_all_close(result.state.nll_ema, result.loss)
+    chex.assert_trees_all_close(result.state.accuracy_ema, result.correct)
+    chex.assert_trees_all_close(result.state.confidence_ema, result.confidence)
+
+
+def test_infinite_observation_marks_input_loss_gradient_invalid() -> None:
+    """The state-builder bridge returns a neutral payload with a false verdict.
+
+    Inf observation makes softmax NaN and ``W.T @ (p - one_hot)`` non-finite,
+    even on a silent feature coordinate. The explicit verdict prevents the
+    neutral zero gradient from being mistaken for a valid training signal.
+    """
+    model = BehaviorModel(BehaviorModelConfig(n_actions=2, step_size=0.1))
+    state = model.init(feature_dim=2, key=jax.random.key(0))
+    obs = jnp.array([0.0, jnp.inf], dtype=jnp.float32)
+
+    result = jax.jit(model.input_loss_gradient)(state, obs, jnp.array(0, dtype=jnp.int32))
+
+    chex.assert_tree_all_finite(result)
+    assert not bool(result.valid)
+    chex.assert_trees_all_close(result.gradient, jnp.zeros(2, dtype=jnp.float32))
+    assert float(result.loss) == 0.0
+    assert float(result.gradient_norm) == 0.0
+
+
+def test_input_loss_gradient_verdict_is_consistent_eager_jit_and_vmap() -> None:
+    """The traced verdict gates mutation in every supported transform."""
+    model = BehaviorModel(BehaviorModelConfig(n_actions=2, step_size=0.1))
+    state = model.init(feature_dim=2, key=jax.random.key(1))
+    valid_obs = jnp.array([0.25, -0.5], dtype=jnp.float32)
+    invalid_obs = jnp.array([0.25, jnp.inf], dtype=jnp.float32)
+    action = jnp.array(1, dtype=jnp.int32)
+    builder_state = jnp.array([3.0, -2.0], dtype=jnp.float32)
+
+    def consume(observation: jax.Array) -> tuple[Any, jax.Array]:
+        result = model.input_loss_gradient(state, observation, action)
+        proposal = builder_state - jnp.asarray(0.1, dtype=jnp.float32) * result.gradient
+        committed = jnp.where(result.valid, proposal, builder_state)
+        return result, committed
+
+    with jax.disable_jit():
+        eager_valid, eager_committed = consume(valid_obs)
+        eager_invalid, eager_rejected = consume(invalid_obs)
+    compiled_valid, compiled_committed = jax.jit(consume)(valid_obs)
+    compiled_invalid, compiled_rejected = jax.jit(consume)(invalid_obs)
+    batched_results, batched_committed = jax.vmap(consume)(
+        jnp.stack([valid_obs, invalid_obs])
+    )
+
+    assert bool(eager_valid.valid)
+    assert bool(compiled_valid.valid)
+    assert bool(batched_results.valid[0])
+    assert not bool(eager_invalid.valid)
+    assert not bool(compiled_invalid.valid)
+    assert not bool(batched_results.valid[1])
+    chex.assert_trees_all_close(eager_valid, compiled_valid)
+    chex.assert_trees_all_close(eager_valid, jax.tree.map(lambda x: x[0], batched_results))
+    chex.assert_trees_all_close(eager_committed, compiled_committed)
+    chex.assert_trees_all_close(eager_committed, batched_committed[0])
+    chex.assert_trees_all_close(eager_rejected, builder_state)
+    chex.assert_trees_all_close(compiled_rejected, builder_state)
+    chex.assert_trees_all_close(batched_committed[1], builder_state)
+
+
+def test_input_loss_gradient_rejects_finite_gradient_with_overflowed_norm() -> None:
+    """The verdict covers every numeric field, including derived diagnostics."""
+    model = BehaviorModel(BehaviorModelConfig(n_actions=2, step_size=0.1))
+    state = model.init(feature_dim=2, key=jax.random.key(2))
+    maximum = jnp.finfo(jnp.float32).max
+    state = state.replace(  # type: ignore[attr-defined]
+        weights=jnp.array(
+            [[maximum, maximum], [-maximum, -maximum]],
+            dtype=jnp.float32,
+        ),
+        bias=jnp.zeros((2,), dtype=jnp.float32),
+    )
+
+    result = model.input_loss_gradient(
+        state,
+        jnp.zeros((2,), dtype=jnp.float32),
+        jnp.array(0, dtype=jnp.int32),
+    )
+
+    assert not bool(result.valid)
+    chex.assert_tree_all_finite(result)
+    chex.assert_trees_all_close(result.gradient, jnp.zeros((2,), dtype=jnp.float32))
+    assert float(result.gradient_norm) == 0.0
 
 
 @pytest.mark.parametrize(
@@ -222,6 +370,75 @@ def test_probability_simplex_and_helper_invariants() -> None:
     chex.assert_trees_all_close(logs, jnp.log(selected))
 
 
+@pytest.mark.parametrize(
+    "action",
+    [
+        jnp.array(1.9, dtype=jnp.float32),
+        jnp.array(True, dtype=jnp.bool_),
+    ],
+)
+def test_update_rejects_non_integer_action_dtypes(action: jax.Array) -> None:
+    model = BehaviorModel(BehaviorModelConfig(n_actions=3, step_size=0.1))
+    state = model.init(feature_dim=2, key=jax.random.key(0))
+    observation = jnp.array([1.0, -0.5], dtype=jnp.float32)
+
+    with pytest.raises(ValueError, match="actions must have an integer dtype"):
+        model.update(state, observation, action)
+
+
+@pytest.mark.parametrize(
+    "action",
+    (
+        np.int64(2**32),
+        np.uint64(2**32),
+        np.int64(-1),
+    ),
+)
+def test_behavior_model_rejects_original_width_action_before_jax_narrowing(
+    action: object,
+) -> None:
+    model = BehaviorModel(BehaviorModelConfig(n_actions=3, step_size=0.1))
+    state = model.init(feature_dim=2, key=jax.random.key(0))
+    observation = jnp.array([1.0, -0.5], dtype=jnp.float32)
+    probabilities = jnp.array([0.2, 0.3, 0.5], dtype=jnp.float32)
+
+    with pytest.raises(ValueError, match="actions must lie"):
+        model.update(state, observation, action)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="actions must lie"):
+        model.input_loss_gradient(state, observation, action)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="actions must lie"):
+        selected_action_probabilities(probabilities, action)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="actions must lie"):
+        run_behavior_model_from_arrays(
+            model,
+            state,
+            observations=observation[None, :],
+            actions=np.asarray([action]),  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.parametrize("action", (-1, 3, 2**31 - 1))
+def test_behavior_model_staged_invalid_actions_are_atomic_and_neutral(action: int) -> None:
+    model = BehaviorModel(BehaviorModelConfig(n_actions=3, step_size=0.1))
+    state = model.init(feature_dim=2, key=jax.random.key(0))
+    observation = jnp.array([1.0, -0.5], dtype=jnp.float32)
+
+    staged_update = jax.jit(lambda current, selected: model.update(current, observation, selected))
+    result = staged_update(state, jnp.asarray(action, dtype=jnp.int32))
+    assert not bool(result.update_applied)
+    chex.assert_trees_all_equal(result.state, state)
+    chex.assert_trees_all_equal(result.probabilities, jnp.zeros((3,), dtype=jnp.float32))
+    assert float(result.loss) == 0.0
+
+    staged_gradient = jax.jit(
+        lambda current, selected: model.input_loss_gradient(current, observation, selected)
+    )
+    gradient = staged_gradient(state, jnp.asarray(action, dtype=jnp.int32))
+    assert not bool(gradient.valid)
+    chex.assert_trees_all_equal(gradient.gradient, jnp.zeros((2,), dtype=jnp.float32))
+    assert float(gradient.loss) == 0.0
+
+
 def test_likelihood_improves_on_deterministic_policy_stream() -> None:
     model = BehaviorModel(BehaviorModelConfig(n_actions=2, step_size=0.2, diagnostic_decay=0.9))
     state = model.init(feature_dim=2, key=jax.random.key(2))
@@ -317,3 +534,102 @@ def test_importance_ratio_and_epsilon_greedy_helpers() -> None:
         jnp.array([0.1, 0.9], dtype=jnp.float32),
     )
     assert float(ratio) == 1.25
+
+
+def test_behavior_model_config_rejects_booleans_and_non_integers() -> None:
+    with pytest.raises(ValueError, match="n_actions"):
+        BehaviorModelConfig(n_actions=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="n_actions"):
+        BehaviorModelConfig(n_actions=2.5)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="step_size"):
+        BehaviorModelConfig(n_actions=2, step_size=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="diagnostic_decay"):
+        BehaviorModelConfig(n_actions=2, diagnostic_decay=1.0 - 1e-10)
+
+
+def test_behavior_model_config_accepts_and_canonicalizes_numpy_integers() -> None:
+    config = BehaviorModelConfig(n_actions=np.int32(3))
+    assert type(config.n_actions) is int
+    assert config.n_actions == 3
+
+    model = BehaviorModel(config)
+    state = model.init(feature_dim=np.int64(4), key=jax.random.key(0))
+    assert state.weights.shape == (3, 4)
+
+    budget = model.resource_budget(np.uint16(4))
+    assert budget.feature_dim == 4
+    assert type(budget.feature_dim) is int
+
+
+@pytest.mark.parametrize(
+    "scalar_type",
+    [
+        np.int8,
+        np.int16,
+        np.int32,
+        np.int64,
+        np.uint8,
+        np.uint16,
+        np.uint32,
+        np.uint64,
+        np.longlong,
+        np.ulonglong,
+    ],
+)
+def test_behavior_model_accepts_full_numpy_integer_family(scalar_type: type) -> None:
+    config = BehaviorModelConfig(n_actions=scalar_type(2))  # type: ignore[call-arg,arg-type]
+    assert type(config.n_actions) is int
+    assert config.n_actions == 2
+
+
+def test_behavior_model_rejects_hostile_scalar_without_running_hooks() -> None:
+    with pytest.raises(ValueError, match="step_size"):
+        BehaviorModelConfig(n_actions=2, step_size=_HostileFloat(0.1))
+
+
+def test_behavior_model_deserialization_requires_exact_complete_dicts() -> None:
+    model = BehaviorModel(BehaviorModelConfig(n_actions=2))
+    construction = model.to_config()
+    with pytest.raises(ValueError, match="actual dict"):
+        BehaviorModel.from_config(_HostileDict(construction))
+
+    wrong_type = model.to_config()
+    wrong_type["type"] = _HostileFloat(0.0)
+    with pytest.raises(ValueError, match="type"):
+        BehaviorModel.from_config(wrong_type)
+    missing = model.to_config()
+    missing.pop("type")
+    with pytest.raises(ValueError, match="fields"):
+        BehaviorModel.from_config(missing)
+    nested_subclass = model.to_config()
+    nested = nested_subclass["config"]
+    assert isinstance(nested, dict)
+    nested_subclass["config"] = _HostileDict(nested)
+    with pytest.raises(ValueError, match="nested config"):
+        BehaviorModel.from_config(nested_subclass)
+
+
+def test_behavior_model_preflights_resource_bytes_before_allocation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = BehaviorModel(BehaviorModelConfig(n_actions=2))
+    max_feature_dim = ((2**31 - 1) - 32) // 8
+    budget = model.resource_budget(max_feature_dim)
+    assert budget.state_nbytes <= 2**31 - 1
+    with pytest.raises(ValueError, match="state_nbytes"):
+        model.resource_budget(max_feature_dim + 1)
+
+    calls = 0
+
+    def forbidden_zeros(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        raise AssertionError("allocator reached")
+
+    monkeypatch.setattr("alberta_framework.core.behavior_model.jnp.zeros", forbidden_zeros)
+    with pytest.raises(ValueError, match="state_nbytes"):
+        model.init(max_feature_dim + 1, jax.random.key(0))
+    assert calls == 0
+    with pytest.raises(AssertionError, match="allocator reached"):
+        model.init(max_feature_dim, jax.random.key(0))
+    assert calls == 1

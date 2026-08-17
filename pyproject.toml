@@ -1,35 +1,23 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling==1.32.0", "editables==0.6"]
 build-backend = "hatchling.build"
 
 [project]
-# Compatibility distribution name; the project/repository identity is ASI.
 name = "alberta-framework"
-version = "0.28.0"
-description = "ASI: evidence-driven JAX research for end-to-end continual learning"
+version = "0.29.0"
+description = "JAX research framework for investigating continual learning and the Alberta Plan"
 readme = "README.md"
 license = "Apache-2.0"
-# Python 3.12 supports the package's PEP 695 syntax and the robot track's
-# in-process continual-RL imports. JAX 0.7.1 is the tested floor compatible
-# with the NumPy 1.26 minimum.
+# Developed alongside the elizaOS robot research package (see VENDORING.md). Relaxed from
+# upstream ">=3.13" to ">=3.12": the continual-RL subset only uses PEP 695
+# syntax (3.12+), and eliza-robot imports it in-process on Python 3.12 where
+# brax/mujoco pin numpy<2. JAX 0.7.1 is the tested floor that remains
+# compatible with the robot track's NumPy 1.26 runtime.
 requires-python = ">=3.12"
-# Distribution authorship records package provenance. CITATION.cff provides
-# research attribution; maintainers identify current stewardship.
 authors = [
     { name = "J. Klawson", email = "j-klawson@users.noreply.github.com" }
 ]
-maintainers = [
-    { name = "elizaOS research contributors" }
-]
-keywords = [
-    "machine-learning",
-    "continual-learning",
-    "online-learning",
-    "meta-learning",
-    "jax",
-    "reinforcement-learning",
-    "robotics",
-]
+keywords = ["machine-learning", "continual-learning", "meta-learning", "jax", "reinforcement-learning"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",
@@ -51,10 +39,14 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+    "editables==0.6",
+    "hatchling==1.32.0",
+    "uv==0.9.24",
     "pytest>=8.0",
     "pytest-xdist>=3.6",
     "ruff",
     "mypy",
+    "twine>=5.1",
     "pandas>=2.2",
     "matplotlib>=3.8",
     "scikit-learn>=1.5",
@@ -86,7 +78,6 @@ Issues = "https://github.com/elizaOS/asi/issues"
 Upstream = "https://github.com/lalalune/alberta"
 
 [project.scripts]
-asi-reference-life-scorecard = "alberta_framework.benchmarks.reference_life_scorecard:main"
 alberta-step1-smoke = "alberta_framework.cli:step1_smoke_main"
 alberta-step2-smoke = "alberta_framework.cli:step2_smoke_main"
 alberta-evidence-status = "alberta_framework.evaluation.evidence_manifest_cli:main"
@@ -285,9 +276,11 @@ disable_error_code = ["call-arg", "no-any-return"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "--strict-config --strict-markers"
 markers = [
     "unit: fast isolated behavior or contract tests; never scientific evidence",
     "integration: tests spanning components, persistence, or process/CLI boundaries",
     "scientific: frozen promoted-evidence protocols; may be expensive and require preregistered seeds",
     "slow: wall-clock heavy modules (>~30s serial); excluded from the fast per-PR CI lane",
+    "package: built-distribution and installed-entry-point contracts; run in the package lane",
 ]

@@ -135,6 +135,41 @@ class TestTDIDBD:
         chex.assert_tree_all_finite(result.weight_delta)
         chex.assert_tree_all_finite(result.new_state.log_step_sizes)
 
+    def test_zero_gamma_does_not_multiply_inf_next_observation(self) -> None:
+        """Ordinary-gradient 0 * inf phi(s') is NaN when gamma is exactly 0."""
+        optimizer = TDIDBD(use_semi_gradient=False)
+        obs = jnp.asarray([0.5, -0.25], dtype=jnp.float32)
+        state = optimizer.init(feature_dim=2)
+        result = optimizer.update(
+            state,
+            jnp.asarray(1.0, dtype=jnp.float32),
+            obs,
+            jnp.asarray([jnp.inf, 0.0], dtype=jnp.float32),
+            jnp.asarray(0.0, dtype=jnp.float32),
+        )
+        assert bool(result.update_applied)
+        assert bool(jnp.all(jnp.isfinite(result.weight_delta)))
+        chex.assert_trees_all_close(result.new_state.eligibility_traces, obs)
+
+    def test_zero_trace_decay_does_not_multiply_inf_traces(self) -> None:
+        """Default lambda is 0; 0 * inf eligibility is NaN and would freeze."""
+        optimizer = TDIDBD()
+        obs = jnp.asarray([0.5, -0.25], dtype=jnp.float32)
+        state = optimizer.init(feature_dim=2)
+        state = state.replace(
+            eligibility_traces=jnp.full(2, jnp.inf, dtype=jnp.float32),
+            bias_eligibility_trace=jnp.asarray(jnp.inf, dtype=jnp.float32),
+        )
+        result = optimizer.update(
+            state,
+            jnp.asarray(0.3, dtype=jnp.float32),
+            obs,
+            obs * 0.5,
+            jnp.asarray(0.9, dtype=jnp.float32),
+        )
+        assert bool(result.update_applied)
+        chex.assert_trees_all_close(result.new_state.eligibility_traces, obs)
+
 
 class TestAutoTDIDBD:
     """Tests for the AutoTDIDBD optimizer."""
@@ -235,6 +270,22 @@ class TestAutoTDIDBD:
 
         chex.assert_tree_all_finite(result.weight_delta)
         chex.assert_tree_all_finite(result.new_state.log_step_sizes)
+
+    def test_zero_gamma_does_not_multiply_inf_next_observation(self) -> None:
+        """AutoTDIDBD 0 * inf phi(s') is NaN when gamma is exactly 0."""
+        optimizer = AutoTDIDBD()
+        obs = jnp.asarray([0.5, -0.25], dtype=jnp.float32)
+        state = optimizer.init(feature_dim=2)
+        result = optimizer.update(
+            state,
+            jnp.asarray(1.0, dtype=jnp.float32),
+            obs,
+            jnp.asarray([jnp.inf, 0.0], dtype=jnp.float32),
+            jnp.asarray(0.0, dtype=jnp.float32),
+        )
+        assert bool(result.update_applied)
+        assert bool(jnp.all(jnp.isfinite(result.weight_delta)))
+        chex.assert_trees_all_close(result.new_state.eligibility_traces, obs)
 
 
 class TestTDOptimizerComparison:

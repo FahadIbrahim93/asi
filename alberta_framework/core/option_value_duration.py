@@ -27,19 +27,81 @@ from __future__ import annotations
 
 import dataclasses
 import functools
-import math
+import operator
 import time
-from typing import Any
+from collections.abc import Mapping
+from typing import Any, SupportsIndex, cast
 
 import chex
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import Array
-from jaxtyping import Float, Int
+from jaxtyping import Bool, Float, Int
+
+from alberta_framework.core._float32_scalars import validated_float32_scalar_with_ratio
 
 REWARD_HEAD = 0
 DURATION_HEAD = 1
 N_HEADS = 2
+_INT32_MAX = 2_147_483_647
+_MAX_PERSISTENT_STATE_BYTES = 256 * 1024 * 1024
+_ACTUAL_INT_TYPES = frozenset(
+    {int, *(np.dtype(code).type for code in ("b", "B", "h", "H", "i", "I", "l", "L", "q", "Q"))}
+)
+def _require_int32(name: str, value: object, *, minimum: int = 1) -> int:
+    """Canonicalize one concrete Python/NumPy integer without invoking hooks."""
+    if type(value) not in _ACTUAL_INT_TYPES:
+        raise ValueError(f"{name} must be an integer in [{minimum}, {_INT32_MAX}]")
+    canonical = operator.index(cast(SupportsIndex, value))
+    if not minimum <= canonical <= _INT32_MAX:
+        raise ValueError(f"{name} must be an integer in [{minimum}, {_INT32_MAX}]")
+    return canonical
+
+
+def _require_float32_real(
+    name: str,
+    value: object,
+    *,
+    strictly_positive: bool,
+) -> float:
+    """Validate one host scalar in its exact domain and float32 sink."""
+    domain = "positive" if strictly_positive else "non-negative"
+    try:
+        stored, numerator, _ = validated_float32_scalar_with_ratio(
+            name,
+            value,
+            positive=strictly_positive,
+            lower=None if strictly_positive else 0.0,
+        )
+    except Exception as error:
+        raise ValueError(f"{name} must be finite and {domain}") from error
+    narrowed = float(np.float32(stored))
+    if numerator != 0 and narrowed == 0.0:
+        raise ValueError(f"{name} must not underflow to zero in float32")
+    return stored
+
+
+def _state_resources(n_options: int, feature_dim: int) -> dict[str, int]:
+    """Exact persistent array envelope, excluding Python/compiled/transient data."""
+    trainable_parameters = n_options * N_HEADS * feature_dim
+    persistent_scalars = trainable_parameters + n_options + 1
+    persistent_bytes = 4 * persistent_scalars
+    if trainable_parameters > _INT32_MAX or persistent_scalars > _INT32_MAX:
+        raise ValueError("derived option-duration persistent scalars must fit signed int32")
+    if persistent_bytes > _MAX_PERSISTENT_STATE_BYTES:
+        raise ValueError("derived option-duration persistent state exceeds 256 MiB")
+    return {
+        "trainable_parameters": trainable_parameters,
+        "persistent_scalars": persistent_scalars,
+        "persistent_bytes": persistent_bytes,
+    }
+
+
+def _saturating_increment(value: Array) -> Array:
+    """Increment an int32 counter without wrapping at its lifetime limit."""
+    maximum = jnp.asarray(_INT32_MAX, dtype=jnp.int32)
+    return jnp.where(value < maximum, value + jnp.asarray(1, dtype=jnp.int32), maximum)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -58,13 +120,34 @@ class OptionValueDurationConfig:
     duration_floor: float = 1e-6
 
     def __post_init__(self) -> None:
-        """Validate scalar hyperparameters."""
-        if not math.isfinite(self.reward_step_size) or self.reward_step_size < 0.0:
-            raise ValueError("reward_step_size must be finite and non-negative")
-        if not math.isfinite(self.duration_step_size) or self.duration_step_size < 0.0:
-            raise ValueError("duration_step_size must be finite and non-negative")
-        if not math.isfinite(self.duration_floor) or self.duration_floor <= 0.0:
-            raise ValueError("duration_floor must be finite and positive")
+        """Validate float32 execution values and canonicalize host scalars."""
+        object.__setattr__(
+            self,
+            "reward_step_size",
+            _require_float32_real(
+                "reward_step_size",
+                self.reward_step_size,
+                strictly_positive=False,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "duration_step_size",
+            _require_float32_real(
+                "duration_step_size",
+                self.duration_step_size,
+                strictly_positive=False,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "duration_floor",
+            _require_float32_real(
+                "duration_floor",
+                self.duration_floor,
+                strictly_positive=True,
+            ),
+        )
 
     def to_config(self) -> dict[str, Any]:
         """Return a JSON-serializable configuration."""
@@ -76,11 +159,21 @@ class OptionValueDurationConfig:
         }
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> OptionValueDurationConfig:
+    def from_config(cls, config: Mapping[str, Any]) -> OptionValueDurationConfig:
         """Reconstruct a config from :meth:`to_config` output."""
-        payload = dict(config)
+        if not issubclass(type(config), Mapping):
+            raise ValueError("config must be a mapping")
+        try:
+            payload = dict(config)
+        except Exception as error:
+            raise ValueError("config must be a readable mapping") from error
+        if any(type(key) is not str for key in payload):
+            raise ValueError("config keys must be strings")
         payload.pop("type", None)
-        return cls(**payload)
+        try:
+            return cls(**payload)
+        except TypeError as error:
+            raise ValueError("config has unsupported fields") from error
 
 
 @chex.dataclass(frozen=True)
@@ -128,6 +221,8 @@ class OptionValueDurationUpdateResult:
     td_targets: Float[Array, " 2"]
     td_errors: Float[Array, " 2"]
     continuation_discount: Float[Array, ""]
+    head_updates_applied: Bool[Array, " 2"]
+    update_applied: Bool[Array, ""]
 
 
 @chex.dataclass(frozen=True)
@@ -140,6 +235,8 @@ class OptionValueDurationArrayResult:
     td_targets: Float[Array, "num_steps 2"]
     td_errors: Float[Array, "num_steps 2"]
     continuation_discounts: Float[Array, " num_steps"]
+    head_updates_applied: Bool[Array, "num_steps 2"]
+    updates_applied: Bool[Array, " num_steps"]
 
 
 class OptionValueDurationLearner:
@@ -157,10 +254,13 @@ class OptionValueDurationLearner:
         config: OptionValueDurationConfig | None = None,
     ):
         """Create a fixed-capacity option predictor."""
-        if n_options < 1:
-            raise ValueError("n_options must be positive")
-        self._n_options = n_options
-        self._config = config or OptionValueDurationConfig()
+        self._n_options = _require_int32("n_options", n_options)
+        _state_resources(self._n_options, 1)
+        if config is None:
+            config = OptionValueDurationConfig()
+        if type(config) is not OptionValueDurationConfig:
+            raise ValueError("config must be an actual OptionValueDurationConfig")
+        self._config = config
 
     @property
     def n_options(self) -> int:
@@ -181,25 +281,41 @@ class OptionValueDurationLearner:
         }
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> OptionValueDurationLearner:
+    def from_config(cls, config: Mapping[str, Any]) -> OptionValueDurationLearner:
         """Reconstruct a learner from :meth:`to_config` output."""
-        payload = dict(config)
+        if not issubclass(type(config), Mapping):
+            raise ValueError("config must be a mapping")
+        try:
+            payload = dict(config)
+        except Exception as error:
+            raise ValueError("config must be a readable mapping") from error
+        if any(type(key) is not str for key in payload):
+            raise ValueError("config keys must be strings")
         payload.pop("type", None)
-        return cls(
-            n_options=int(payload["n_options"]),
-            config=OptionValueDurationConfig.from_config(payload["config"]),
-        )
+        try:
+            return cls(
+                n_options=payload["n_options"],
+                config=OptionValueDurationConfig.from_config(payload["config"]),
+            )
+        except (KeyError, TypeError) as error:
+            raise ValueError("config has missing or unsupported fields") from error
 
     def trainable_parameter_count(self, feature_dim: int) -> int:
         """Return the exact history-independent trainable parameter count."""
-        if feature_dim < 1:
-            raise ValueError("feature_dim must be positive")
-        return self._n_options * N_HEADS * feature_dim
+        validated_feature_dim = _require_int32("feature_dim", feature_dim)
+        return _state_resources(self._n_options, validated_feature_dim)[
+            "trainable_parameters"
+        ]
+
+    def persistent_resource_budget(self, feature_dim: int) -> dict[str, int]:
+        """Return the exact retained-array budget before initialization."""
+        validated_feature_dim = _require_int32("feature_dim", feature_dim)
+        return _state_resources(self._n_options, validated_feature_dim)
 
     def init(self, feature_dim: int) -> OptionValueDurationState:
         """Initialize all heads to zero."""
-        if feature_dim < 1:
-            raise ValueError("feature_dim must be positive")
+        feature_dim = _require_int32("feature_dim", feature_dim)
+        _state_resources(self._n_options, feature_dim)
         return OptionValueDurationState(
             weights=jnp.zeros(
                 (self._n_options, N_HEADS, feature_dim),
@@ -211,6 +327,64 @@ class OptionValueDurationLearner:
             uptime_s=0.0,
         )
 
+    def _require_state_contract(
+        self, state: object
+    ) -> tuple[OptionValueDurationState, int]:
+        if type(state) is not OptionValueDurationState:
+            raise ValueError("state must be an actual OptionValueDurationState")
+        canonical = state
+        try:
+            weights_ndim = canonical.weights.ndim
+            weights_shape = canonical.weights.shape
+            weights_dtype = canonical.weights.dtype
+            counts_shape = canonical.option_update_counts.shape
+            counts_dtype = canonical.option_update_counts.dtype
+            step_shape = canonical.step_count.shape
+            step_dtype = canonical.step_count.dtype
+        except Exception as error:
+            raise ValueError("state arrays must expose readable shape and dtype") from error
+        if weights_ndim != 3:
+            raise ValueError("state.weights must be rank 3")
+        feature_dim = weights_shape[2]
+        if (
+            weights_shape != (self._n_options, N_HEADS, feature_dim)
+            or weights_dtype != jnp.float32
+        ):
+            raise ValueError("state.weights has an incompatible shape or dtype")
+        if (
+            counts_shape != (self._n_options,)
+            or counts_dtype != jnp.int32
+        ):
+            raise ValueError("state.option_update_counts has an incompatible shape or dtype")
+        if step_shape != () or step_dtype != jnp.int32:
+            raise ValueError("state.step_count must be scalar int32")
+        _state_resources(self._n_options, feature_dim)
+        return canonical, feature_dim
+
+    @staticmethod
+    def _require_array(
+        name: str,
+        value: object,
+        *,
+        shape: tuple[int, ...],
+        dtype: Any,
+    ) -> Array:
+        try:
+            array = jnp.asarray(value)
+        except Exception as error:
+            raise ValueError(f"{name} must be a readable array") from error
+        if array.shape != shape or array.dtype != dtype:
+            raise ValueError(f"{name} must have shape {shape} and dtype {dtype}")
+        return array
+
+    @staticmethod
+    def _state_values_valid(state: OptionValueDurationState) -> Array:
+        return (
+            jnp.all(jnp.isfinite(state.weights))
+            & jnp.all(state.option_update_counts >= 0)
+            & (state.step_count >= 0)
+        )
+
     @functools.partial(jax.jit, static_argnums=(0,))
     def predict_heads(
         self,
@@ -218,8 +392,15 @@ class OptionValueDurationLearner:
         observation: Array,
     ) -> Float[Array, "n_options 2"]:
         """Return raw ``[reward, duration]`` head predictions for all options."""
-        observation = jnp.asarray(observation, dtype=jnp.float32)
-        return jnp.einsum("ohf,f->oh", state.weights, observation)
+        state, feature_dim = self._require_state_contract(state)
+        observation = self._require_array(
+            "observation",
+            observation,
+            shape=(feature_dim,),
+            dtype=jnp.float32,
+        )
+        heads = jnp.einsum("ohf,f->oh", state.weights, observation)
+        return jnp.where(self._state_values_valid(state), heads, jnp.zeros_like(heads))
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def predict(
@@ -259,19 +440,42 @@ class OptionValueDurationLearner:
         responsible for supplying a scalar discount in ``[0, 1]`` and for
         setting it to zero when the option terminates.
         """
-        observation = jnp.asarray(observation, dtype=jnp.float32)
-        next_observation = jnp.asarray(next_observation, dtype=jnp.float32)
-        option_index = jnp.asarray(option_index, dtype=jnp.int32)
-        reward = jnp.squeeze(jnp.asarray(reward, dtype=jnp.float32))
-        continuation_discount = jnp.squeeze(jnp.asarray(continuation_discount, dtype=jnp.float32))
+        state, feature_dim = self._require_state_contract(state)
+        observation = self._require_array(
+            "observation", observation, shape=(feature_dim,), dtype=jnp.float32
+        )
+        next_observation = self._require_array(
+            "next_observation",
+            next_observation,
+            shape=(feature_dim,),
+            dtype=jnp.float32,
+        )
+        option_index = self._require_array(
+            "option_index", option_index, shape=(), dtype=jnp.int32
+        )
+        option_index_valid = (option_index >= 0) & (option_index < self._n_options)
+        safe_option_index = jnp.clip(option_index, 0, self._n_options - 1)
+        reward = self._require_array("reward", reward, shape=(), dtype=jnp.float32)
+        continuation_discount = self._require_array(
+            "continuation_discount",
+            continuation_discount,
+            shape=(),
+            dtype=jnp.float32,
+        )
 
-        option_weights = state.weights[option_index]
+        option_weights = state.weights[safe_option_index]
         predictions = option_weights @ observation
         next_predictions = option_weights @ next_observation
         cumulants = jnp.stack(
             (reward, jnp.array(1.0, dtype=jnp.float32)),
         )
-        td_targets = cumulants + continuation_discount * next_predictions
+        terminated = continuation_discount == 0.0
+        bootstrap = jnp.where(
+            terminated,
+            jnp.zeros_like(next_predictions),
+            continuation_discount * next_predictions,
+        )
+        td_targets = cumulants + bootstrap
         td_errors = td_targets - predictions
         step_sizes = jnp.array(
             [
@@ -280,21 +484,69 @@ class OptionValueDurationLearner:
             ],
             dtype=jnp.float32,
         )
-        updated_option_weights = (
+        proposed_option_weights = (
             option_weights + step_sizes[:, None] * td_errors[:, None] * observation[None, :]
         )
-        new_state = state.replace(
-            weights=state.weights.at[option_index].set(updated_option_weights),
-            option_update_counts=state.option_update_counts.at[option_index].add(1),
-            step_count=state.step_count + 1,
+        source_valid = self._state_values_valid(state)
+        next_needed = continuation_discount != 0.0
+        shared_inputs_valid = (
+            jnp.all(jnp.isfinite(observation))
+            & ((~next_needed) | jnp.all(jnp.isfinite(next_observation)))
+            & jnp.isfinite(continuation_discount)
+            & (continuation_discount >= 0.0)
+            & (continuation_discount <= 1.0)
+            & option_index_valid
+            & source_valid
+        )
+        head_inputs_valid = jnp.stack(
+            (
+                jnp.isfinite(reward),
+                jnp.asarray(True, dtype=jnp.bool_),
+            )
+        )
+        candidate_finite = jnp.all(jnp.isfinite(proposed_option_weights), axis=1)
+        head_updates_applied = (
+            shared_inputs_valid & head_inputs_valid & candidate_finite
+        )
+        updated_option_weights = jnp.where(
+            head_updates_applied[:, None], proposed_option_weights, option_weights
+        )
+        update_applied = jnp.any(head_updates_applied)
+        proposed_state = state.replace(
+            weights=state.weights.at[safe_option_index].set(updated_option_weights),
+            option_update_counts=state.option_update_counts.at[safe_option_index].set(
+                _saturating_increment(state.option_update_counts[safe_option_index])
+            ),
+            step_count=_saturating_increment(state.step_count),
+        )
+        new_state = jax.lax.cond(
+            update_applied,
+            lambda: proposed_state,
+            lambda: state,
         )
         return OptionValueDurationUpdateResult(
             state=new_state,
-            predictions=predictions,
-            next_predictions=next_predictions,
-            td_targets=td_targets,
-            td_errors=td_errors,
-            continuation_discount=continuation_discount,
+            predictions=jnp.where(
+                head_updates_applied, predictions, jnp.zeros_like(predictions)
+            ),
+            next_predictions=jnp.where(
+                head_updates_applied & (~terminated),
+                next_predictions,
+                jnp.zeros_like(next_predictions),
+            ),
+            td_targets=jnp.where(
+                head_updates_applied, td_targets, jnp.zeros_like(td_targets)
+            ),
+            td_errors=jnp.where(
+                head_updates_applied, td_errors, jnp.zeros_like(td_errors)
+            ),
+            continuation_discount=jnp.where(
+                update_applied,
+                continuation_discount,
+                jnp.asarray(0.0, dtype=jnp.float32),
+            ),
+            head_updates_applied=head_updates_applied,
+            update_applied=update_applied,
         )
 
 
@@ -308,12 +560,45 @@ def run_option_value_duration_from_arrays(
     continuation_discounts: Float[Array, " num_steps"],
 ) -> OptionValueDurationArrayResult:
     """Scan online TD(0) updates over primitive option transitions."""
+    if type(learner) is not OptionValueDurationLearner:
+        raise ValueError("learner must be an actual OptionValueDurationLearner")
+    state, feature_dim = learner._require_state_contract(state)
+    try:
+        observations = jnp.asarray(observations)
+    except Exception as error:
+        raise ValueError("observations must be a readable float32 matrix") from error
+    if observations.ndim != 2 or observations.shape[1] != feature_dim:
+        raise ValueError("observations have an incompatible shape")
+    if observations.dtype != jnp.float32:
+        raise ValueError("observations must have dtype float32")
+    num_steps = observations.shape[0]
+    next_observations = learner._require_array(
+        "next_observations",
+        next_observations,
+        shape=(num_steps, feature_dim),
+        dtype=jnp.float32,
+    )
+    option_indices = learner._require_array(
+        "option_indices", option_indices, shape=(num_steps,), dtype=jnp.int32
+    )
+    rewards = learner._require_array(
+        "rewards", rewards, shape=(num_steps,), dtype=jnp.float32
+    )
+    continuation_discounts = learner._require_array(
+        "continuation_discounts",
+        continuation_discounts,
+        shape=(num_steps,),
+        dtype=jnp.float32,
+    )
     start = time.time()
 
     def _scan_fn(
         carry: OptionValueDurationState,
         inputs: tuple[Array, Array, Array, Array, Array],
-    ) -> tuple[OptionValueDurationState, tuple[Array, Array, Array, Array, Array]]:
+    ) -> tuple[
+        OptionValueDurationState,
+        tuple[Array, Array, Array, Array, Array, Array, Array],
+    ]:
         observation, option_index, reward, next_observation, discount = inputs
         result = learner.update(
             carry,
@@ -329,6 +614,8 @@ def run_option_value_duration_from_arrays(
             result.td_targets,
             result.td_errors,
             result.continuation_discount,
+            result.head_updates_applied,
+            result.update_applied,
         )
 
     (
@@ -339,6 +626,8 @@ def run_option_value_duration_from_arrays(
             td_targets,
             td_errors,
             discounts,
+            head_updates_applied,
+            updates_applied,
         ),
     ) = jax.lax.scan(
         _scan_fn,
@@ -359,4 +648,6 @@ def run_option_value_duration_from_arrays(
         td_targets=td_targets,
         td_errors=td_errors,
         continuation_discounts=discounts,
+        head_updates_applied=head_updates_applied,
+        updates_applied=updates_applied,
     )

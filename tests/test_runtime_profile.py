@@ -422,6 +422,28 @@ def test_runtime_profile_rejects_identity_drift(
         validate_environment_runtime_profile(profile)
 
 
+@pytest.mark.parametrize(
+    ("path", "invalid"),
+    [
+        (("bundled_executables", "imageio-ffmpeg", "mode"), 365.0),
+        (("bundled_executables", "imageio-ffmpeg", "mode"), True),
+        (("import_shadow_contract", "tmp_src_mode"), 365.0),
+        (("import_shadow_contract", "tmp_src_mode"), True),
+    ],
+)
+def test_runtime_profile_rejects_numeric_aliases_for_executable_modes(
+    path: tuple[str, ...], invalid: object
+) -> None:
+    profile = _matched_gpu_profile()
+    owner = profile
+    for name in path[:-1]:
+        owner = owner[name]  # type: ignore[assignment,index]
+    owner[path[-1]] = invalid  # type: ignore[index]
+
+    with pytest.raises(ValueError):
+        validate_environment_runtime_profile(profile)
+
+
 def test_runtime_profile_rejects_duplicate_environment_variable() -> None:
     profile = _matched_gpu_profile()
     environment = profile["container_environment"]

@@ -11,14 +11,23 @@ updates.
 from __future__ import annotations
 
 import functools
-from dataclasses import asdict, dataclass
+from collections.abc import Iterator, Mapping
+from dataclasses import asdict, dataclass, fields
 from typing import Any, cast
 
 import chex
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import Array
-from jaxtyping import Float
+from jaxtyping import Bool, Float
+
+from alberta_framework.core._float32_scalars import validated_float32_scalar
+from alberta_framework.core.update_safety import (
+    floating_tree_is_finite,
+    neutralize_array,
+    select_transaction,
+)
 
 
 @dataclass(frozen=True)
@@ -63,6 +72,9 @@ class WorkingMemoryConfig:
     gate_threshold: float = 0.0
     gate_temperature: float = 1.0
 
+    def __post_init__(self) -> None:
+        _validate_config(self)
+
     def feature_dim(self) -> int:
         """Return the working-memory feature dimensionality."""
         dim = 0
@@ -92,17 +104,47 @@ class WorkingMemoryConfig:
         return payload
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> WorkingMemoryConfig:
+    def from_config(cls, config: Mapping[str, Any]) -> WorkingMemoryConfig:
         """Reconstruct from :meth:`to_config` output."""
-        payload = dict(config)
-        payload.pop("type", None)
+        if not issubclass(type(config), Mapping):
+            raise ValueError("WorkingMemoryConfig payload must be a mapping")
+        try:
+            payload = dict(config)
+        except Exception as error:
+            raise ValueError("WorkingMemoryConfig mapping could not be read") from error
+        if payload.pop("type", None) != "WorkingMemoryConfig":
+            raise ValueError("WorkingMemoryConfig type is invalid")
+        if set(payload) != {field.name for field in fields(cls)}:
+            raise ValueError("WorkingMemoryConfig fields do not match its schema")
         for key in (
             "observation_decay_rates",
             "action_decay_rates",
             "reward_decay_rates",
         ):
             if key in payload:
-                payload[key] = tuple(payload[key])
+                value = payload[key]
+                if type(value) is list:
+                    payload[key] = tuple(value)
+                elif type(value) is not tuple:
+                    raise ValueError(f"{key} must be an actual list or tuple")
+                if any(type(item) is not float for item in payload[key]):
+                    raise ValueError(f"serialized {key} values must be JSON numbers")
+        for key in ("observation_dim", "action_dim", "reward_dim"):
+            if type(payload[key]) is not int:
+                raise ValueError(f"serialized {key} must be a JSON integer")
+        for key in (
+            "include_current_observation",
+            "include_current_action",
+            "include_current_reward",
+            "include_traces",
+            "include_innovations",
+            "gated_update",
+        ):
+            if type(payload[key]) is not bool:
+                raise ValueError(f"serialized {key} must be a JSON boolean")
+        for key in ("gate_threshold", "gate_temperature"):
+            if type(payload[key]) is not float:
+                raise ValueError(f"serialized {key} must be a JSON number")
         return cls(**payload)
 
 
@@ -130,31 +172,226 @@ class WorkingMemoryDiagnostics:
     last_gate: Float[Array, " 3"]
 
 
-def _validate_decay_rates(name: str, rates: tuple[float, ...]) -> None:
-    if any(rate < 0.0 or rate >= 1.0 for rate in rates):
-        raise ValueError(f"{name} must lie in [0, 1); got {rates}")
+@chex.dataclass(frozen=True)
+class WorkingMemoryUpdateResult:
+    """Checked state transition for one working-memory event."""
+
+    state: WorkingMemoryState
+    update_applied: Bool[Array, ""]
+
+
+@chex.dataclass(frozen=True, mappable_dataclass=False)
+class WorkingMemoryStepResult:
+    """Checked feature-and-update result with legacy two-value unpacking.
+
+    Iteration intentionally yields ``(state, features)`` so existing callers
+    retain their pre-1.0 unpacking surface. Transaction-aware callers should
+    inspect :attr:`update_applied` before consuming the features.
+    """
+
+    state: WorkingMemoryState
+    features: Float[Array, " feature_dim"]
+    update_applied: Bool[Array, ""]
+
+    def __iter__(self) -> Iterator[Any]:
+        yield self.state
+        yield self.features
+
+
+@chex.dataclass(frozen=True, mappable_dataclass=False)
+class WorkingMemoryArrayResult:
+    """Checked causal transform with one transaction verdict per event.
+
+    Iteration preserves the historical ``(state, features)`` return surface;
+    new callers should also consume :attr:`updates_applied`.
+    """
+
+    state: WorkingMemoryState
+    features: Float[Array, "steps feature_dim"]
+    updates_applied: Bool[Array, " steps"]
+
+    def __iter__(self) -> Iterator[Any]:
+        yield self.state
+        yield self.features
+
+
+_INT32_MAX = 2**31 - 1
+_FLOAT32_MIN_NORMAL = float.fromhex("0x1.0p-126")
+_ACTUAL_INT_TYPES: tuple[type, ...] = (
+    int,
+    np.int8,
+    np.int16,
+    np.int32,
+    np.int64,
+    np.uint8,
+    np.uint16,
+    np.uint32,
+    np.uint64,
+    np.longlong,
+    np.ulonglong,
+)
+
+
+def _require_int32(name: str, value: object, *, minimum: int) -> int:
+    if type(value) not in _ACTUAL_INT_TYPES:
+        raise ValueError(f"{name} must be an integer")
+    number = int(cast(int, value))
+    if number < minimum or number > _INT32_MAX:
+        raise ValueError(f"{name} must be in [{minimum}, {_INT32_MAX}]")
+    return number
+
+
+_UINT32_MAX: int = 4294967295
+
+
+def _require_float32_resource(
+    name: str,
+    *,
+    vector_scalars: int,
+    fixed_scalars: int = 0,
+) -> None:
+    total_scalars = vector_scalars + fixed_scalars
+    if total_scalars > _INT32_MAX:
+        raise ValueError(f"{name} scalar count must fit signed int32")
+    if 4 * total_scalars > _INT32_MAX:
+        raise ValueError(f"{name} byte count must fit signed int32")
+
+
+def _require_sequence_resource(name: str, *, float32_scalars: int, bool_scalars: int) -> None:
+    if float32_scalars + bool_scalars > _INT32_MAX:
+        raise ValueError(f"{name} scalar count must fit signed int32")
+    if 4 * float32_scalars + bool_scalars > _INT32_MAX:
+        raise ValueError(f"{name} byte count must fit signed int32")
+
+
+def _require_array(
+    name: str,
+    value: object,
+    *,
+    shape: tuple[int, ...],
+    dtype: Any = jnp.float32,
+) -> None:
+    try:
+        actual_shape = tuple(value.shape)  # type: ignore[attr-defined]
+        actual_dtype = jnp.dtype(value.dtype)  # type: ignore[attr-defined]
+    except Exception as error:
+        raise TypeError(f"{name} must expose array shape and dtype metadata") from error
+    if actual_shape != shape:
+        if name == "vector":
+            raise ValueError("vector must have shape matching its configured dimension")
+        raise ValueError(f"{name} must have the configured shape")
+    if actual_dtype != jnp.dtype(dtype):
+        raise TypeError(f"{name} has an invalid dtype")
+
+
+def _validate_decay_rates(name: str, rates: object) -> tuple[float, ...]:
+    if type(rates) is not tuple:
+        raise ValueError(f"{name} must be an actual tuple")
+    return tuple(
+        validated_float32_scalar(
+            f"{name}[{index}]",
+            value,
+            lower=0.0,
+            upper=1.0,
+            upper_inclusive=False,
+        )
+        for index, value in enumerate(rates)
+    )
 
 
 def _validate_config(config: WorkingMemoryConfig) -> None:
-    if config.observation_dim < 1:
-        raise ValueError("observation_dim must be positive")
-    if config.action_dim < 0:
-        raise ValueError("action_dim must be non-negative")
-    if config.reward_dim < 0:
-        raise ValueError("reward_dim must be non-negative")
-    _validate_decay_rates("observation_decay_rates", config.observation_decay_rates)
-    _validate_decay_rates("action_decay_rates", config.action_decay_rates)
-    _validate_decay_rates("reward_decay_rates", config.reward_decay_rates)
-    if config.gate_temperature <= 0.0:
-        raise ValueError("gate_temperature must be positive")
-    if config.gate_threshold < 0.0:
-        raise ValueError("gate_threshold must be non-negative")
-    if config.feature_dim() < 1:
-        raise ValueError("configuration must produce at least one feature")
+    observation_dim = _require_int32("observation_dim", config.observation_dim, minimum=1)
+    action_dim = _require_int32("action_dim", config.action_dim, minimum=0)
+    reward_dim = _require_int32("reward_dim", config.reward_dim, minimum=0)
+    observation_decay_rates = _validate_decay_rates(
+        "observation_decay_rates", config.observation_decay_rates
+    )
+    action_decay_rates = _validate_decay_rates(
+        "action_decay_rates", config.action_decay_rates
+    )
+    reward_decay_rates = _validate_decay_rates(
+        "reward_decay_rates", config.reward_decay_rates
+    )
+    gate_threshold = validated_float32_scalar(
+        "gate_threshold", config.gate_threshold, lower=0.0
+    )
+    gate_temperature = validated_float32_scalar(
+        "gate_temperature", config.gate_temperature, lower=_FLOAT32_MIN_NORMAL
+    )
+    for name in (
+        "include_current_observation",
+        "include_current_action",
+        "include_current_reward",
+        "include_traces",
+        "include_innovations",
+        "gated_update",
+    ):
+        if type(getattr(config, name)) is not bool:
+            raise ValueError(f"{name} must be an actual bool")
+
+    object.__setattr__(config, "observation_dim", observation_dim)
+    object.__setattr__(config, "action_dim", action_dim)
+    object.__setattr__(config, "reward_dim", reward_dim)
+    object.__setattr__(config, "observation_decay_rates", observation_decay_rates)
+    object.__setattr__(config, "action_decay_rates", action_decay_rates)
+    object.__setattr__(config, "reward_decay_rates", reward_decay_rates)
+    object.__setattr__(config, "gate_threshold", gate_threshold)
+    object.__setattr__(config, "gate_temperature", gate_temperature)
+
+    feature_dim = config.feature_dim()
+    if feature_dim < 1 or feature_dim > _INT32_MAX:
+        raise ValueError(
+            f"configuration feature_dim must be in [1, {_INT32_MAX}], got {feature_dim}"
+        )
+    trace_scalars = (
+        observation_dim * len(observation_decay_rates)
+        + action_dim * len(action_decay_rates)
+        + reward_dim * len(reward_decay_rates)
+    )
+    if trace_scalars > _INT32_MAX:
+        raise ValueError("WorkingMemoryConfig dimensions must fit signed int32")
+    total_state_scalars = trace_scalars + 4
+    _require_float32_resource(
+        "WorkingMemoryConfig state",
+        vector_scalars=trace_scalars,
+        fixed_scalars=4,
+    )
+    persistent_bytes = 4 * total_state_scalars
+    if persistent_bytes > _INT32_MAX:
+        raise ValueError("WorkingMemoryConfig state byte count must fit signed int32")
+    if persistent_bytes > _UINT32_MAX:
+        raise ValueError("working memory allocation exceeds uint32 byte accounting")
+    decay_scalars = (
+        len(observation_decay_rates)
+        + len(action_decay_rates)
+        + len(reward_decay_rates)
+    )
+    signal_scalars = observation_dim + action_dim + reward_dim
+    feature_work = total_state_scalars + feature_dim + 2 * signal_scalars
+    update_work = (
+        3 * total_state_scalars
+        + 6 * trace_scalars
+        + 4 * signal_scalars
+        + decay_scalars
+        + feature_dim
+        + 32
+    )
+    diagnostics_work = total_state_scalars + 3 * trace_scalars + 9
+    _require_float32_resource("WorkingMemoryConfig features", vector_scalars=feature_dim)
+    _require_float32_resource(
+        "WorkingMemoryConfig feature operation", vector_scalars=feature_work
+    )
+    _require_float32_resource(
+        "WorkingMemoryConfig update operation", vector_scalars=update_work
+    )
+    _require_float32_resource(
+        "WorkingMemoryConfig diagnostics operation", vector_scalars=diagnostics_work
+    )
 
 
 def _empty_or_vector(value: Array, dim: int) -> Array:
-    return jnp.asarray(value, dtype=jnp.float32).reshape((dim,))
+    _require_array("vector", value, shape=(dim,))
+    return jnp.asarray(value)
 
 
 def _trace_bank(decay_count: int, dim: int) -> Array:
@@ -175,13 +412,27 @@ def _flatten_traces(state: WorkingMemoryState) -> Array:
 def _root_mean_square(values: Array) -> Array:
     if values.size == 0:
         return jnp.asarray(0.0, dtype=jnp.float32)
-    return jnp.sqrt(jnp.mean(values * values))
+    scale = jnp.max(jnp.abs(values))
+    safe_scale = jnp.where(scale > 0.0, scale, 1.0)
+    normalized = jnp.where(
+        jnp.abs(values) == scale,
+        jnp.sign(values),
+        values / safe_scale,
+    )
+    return jnp.where(scale > 0.0, scale * jnp.sqrt(jnp.mean(normalized * normalized)), 0.0)
 
 
 def _effective_dimension(values: Array) -> Array:
     if values.size == 0:
         return jnp.asarray(0.0, dtype=jnp.float32)
-    squared = values * values
+    scale = jnp.max(jnp.abs(values))
+    safe_scale = jnp.where(scale > 0.0, scale, 1.0)
+    normalized = jnp.where(
+        jnp.abs(values) == scale,
+        jnp.sign(values),
+        values / safe_scale,
+    )
+    squared = normalized * normalized
     energy = jnp.sum(squared)
     fourth = jnp.sum(squared * squared)
     return jnp.where(fourth > 0.0, (energy * energy) / fourth, 0.0)
@@ -219,9 +470,61 @@ class WorkingMemoryFeaturizer:
         }
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> WorkingMemoryFeaturizer:
+    def from_config(cls, config: Mapping[str, Any]) -> WorkingMemoryFeaturizer:
         """Reconstruct a featurizer from :meth:`to_config` output."""
-        return cls(WorkingMemoryConfig.from_config(dict(config["config"])))
+        if not issubclass(type(config), Mapping):
+            raise ValueError("WorkingMemoryFeaturizer payload must be a mapping")
+        try:
+            payload = dict(config)
+        except Exception as error:
+            raise ValueError("WorkingMemoryFeaturizer mapping could not be read") from error
+        if set(payload) != {"type", "config"}:
+            raise ValueError("WorkingMemoryFeaturizer fields do not match its schema")
+        if payload["type"] != "WorkingMemoryFeaturizer":
+            raise ValueError("WorkingMemoryFeaturizer type is invalid")
+        inner = payload["config"]
+        if not issubclass(type(inner), Mapping):
+            raise ValueError("WorkingMemoryFeaturizer config must be a mapping")
+        return cls(WorkingMemoryConfig.from_config(cast(Mapping[str, Any], inner)))
+
+    def _validate_state_static_contract(self, state: WorkingMemoryState) -> None:
+        """Reject malformed adopted state before traced computation."""
+        if type(state) is not WorkingMemoryState:
+            raise TypeError("state must be a WorkingMemoryState")
+        cfg = self._config
+        expected = (
+            (
+                "state.observation_traces",
+                state.observation_traces,
+                (len(cfg.observation_decay_rates), cfg.observation_dim),
+                jnp.float32,
+            ),
+            (
+                "state.action_traces",
+                state.action_traces,
+                (len(cfg.action_decay_rates), cfg.action_dim),
+                jnp.float32,
+            ),
+            (
+                "state.reward_traces",
+                state.reward_traces,
+                (len(cfg.reward_decay_rates), cfg.reward_dim),
+                jnp.float32,
+            ),
+            ("state.step_count", state.step_count, (), jnp.int32),
+            ("state.last_gate", state.last_gate, (3,), jnp.float32),
+        )
+        for name, value, shape, dtype in expected:
+            _require_array(name, value, shape=shape, dtype=dtype)
+
+    @staticmethod
+    def _state_is_valid(state: WorkingMemoryState) -> Bool[Array, ""]:
+        return (
+            floating_tree_is_finite(state)
+            & (state.step_count >= 0)
+            & jnp.all(state.last_gate >= 0.0)
+            & jnp.all(state.last_gate <= 1.0)
+        )
 
     def init(self) -> WorkingMemoryState:
         """Return an all-zero memory state."""
@@ -267,7 +570,13 @@ class WorkingMemoryFeaturizer:
             return traces
         decay = jnp.asarray(decay_rates, dtype=jnp.float32)[:, None]
         update_rate = (1.0 - decay) * gate
-        return traces + update_rate * (value[None, :] - traces)
+        persist = 1.0 - update_rate
+        delta_update = traces + update_rate * (value[None, :] - traces)
+        return jnp.where(
+            persist == 0.0,
+            jnp.broadcast_to(value[None, :], traces.shape),
+            jnp.where(update_rate == 0.0, traces, delta_update),
+        )
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def features(
@@ -278,6 +587,7 @@ class WorkingMemoryFeaturizer:
         reward: Float[Array, " reward_dim"],
     ) -> Float[Array, " feature_dim"]:
         """Return current working-memory features without advancing state."""
+        self._validate_state_static_contract(state)
         cfg = self._config
         obs = _empty_or_vector(observation, cfg.observation_dim)
         act = _empty_or_vector(action, cfg.action_dim)
@@ -308,6 +618,107 @@ class WorkingMemoryFeaturizer:
         return jnp.concatenate(blocks, axis=0)
 
     @functools.partial(jax.jit, static_argnums=(0,))
+    def update_checked(
+        self,
+        state: WorkingMemoryState,
+        observation: Float[Array, " observation_dim"],
+        action: Float[Array, " action_dim"],
+        reward: Float[Array, " reward_dim"],
+        external_gate: Float[Array, ""] | float = 1.0,
+    ) -> WorkingMemoryUpdateResult:
+        """Advance one event and report whether the transaction committed."""
+        self._validate_state_static_contract(state)
+        cfg = self._config
+        obs = _empty_or_vector(observation, cfg.observation_dim)
+        act = _empty_or_vector(action, cfg.action_dim)
+        rew = _empty_or_vector(reward, cfg.reward_dim)
+        raw_outer_gate = jnp.asarray(external_gate, dtype=jnp.float32)
+        if raw_outer_gate.shape != ():
+            raise ValueError(
+                f"external_gate must have scalar shape (); got {raw_outer_gate.shape}"
+            )
+        inputs_valid = (
+            jnp.all(jnp.isfinite(obs))
+            & jnp.all(jnp.isfinite(act))
+            & jnp.all(jnp.isfinite(rew))
+            & jnp.all(jnp.isfinite(raw_outer_gate))
+        )
+        safe_obs = jnp.where(inputs_valid, obs, jnp.zeros_like(obs))
+        safe_act = jnp.where(inputs_valid, act, jnp.zeros_like(act))
+        safe_rew = jnp.where(inputs_valid, rew, jnp.zeros_like(rew))
+        outer_gate = jnp.clip(
+            jnp.where(inputs_valid, raw_outer_gate, jnp.zeros_like(raw_outer_gate)),
+            0.0,
+            1.0,
+        )
+        threshold = jnp.asarray(cfg.gate_threshold, dtype=jnp.float32)
+
+        observation_gate = outer_gate * self._surprise_gate(
+            state.observation_traces,
+            safe_obs,
+            threshold,
+        )
+        action_gate = outer_gate * self._surprise_gate(
+            state.action_traces,
+            safe_act,
+            threshold,
+        )
+        reward_gate = outer_gate * self._surprise_gate(
+            state.reward_traces,
+            safe_rew,
+            threshold,
+        )
+
+        candidate = WorkingMemoryState(
+            observation_traces=self._update_trace_bank(
+                state.observation_traces,
+                safe_obs,
+                cfg.observation_decay_rates,
+                observation_gate,
+            ),
+            action_traces=self._update_trace_bank(
+                state.action_traces,
+                safe_act,
+                cfg.action_decay_rates,
+                action_gate,
+            ),
+            reward_traces=self._update_trace_bank(
+                state.reward_traces,
+                safe_rew,
+                cfg.reward_decay_rates,
+                reward_gate,
+            ),
+            step_count=jnp.minimum(
+                state.step_count,
+                jnp.asarray(_INT32_MAX - 1, dtype=jnp.int32),
+            )
+            + jnp.asarray(1, dtype=jnp.int32),
+            last_gate=jnp.stack([observation_gate, action_gate, reward_gate]),
+        )
+        previous_checked = state
+        if cfg.observation_decay_rates and all(rate == 0.0 for rate in cfg.observation_decay_rates):
+            previous_checked = previous_checked.replace(  # type: ignore[attr-defined]
+                observation_traces=jnp.zeros_like(state.observation_traces),
+            )
+        if cfg.action_decay_rates and all(rate == 0.0 for rate in cfg.action_decay_rates):
+            previous_checked = previous_checked.replace(  # type: ignore[attr-defined]
+                action_traces=jnp.zeros_like(state.action_traces),
+            )
+        if cfg.reward_decay_rates and all(rate == 0.0 for rate in cfg.reward_decay_rates):
+            previous_checked = previous_checked.replace(  # type: ignore[attr-defined]
+                reward_traces=jnp.zeros_like(state.reward_traces),
+            )
+        update_applied = (
+            inputs_valid
+            & self._state_is_valid(previous_checked)
+            & self._state_is_valid(candidate)
+        )
+        return WorkingMemoryUpdateResult(
+            state=select_transaction(update_applied, candidate, state),
+            update_applied=update_applied,
+        )
+
+    @functools.partial(jax.jit, static_argnums=(0,))
     def update(
         self,
         state: WorkingMemoryState,
@@ -316,51 +727,19 @@ class WorkingMemoryFeaturizer:
         reward: Float[Array, " reward_dim"],
         external_gate: Float[Array, ""] | float = 1.0,
     ) -> WorkingMemoryState:
-        """Advance memory after one observation/action/reward transition."""
-        cfg = self._config
-        obs = _empty_or_vector(observation, cfg.observation_dim)
-        act = _empty_or_vector(action, cfg.action_dim)
-        rew = _empty_or_vector(reward, cfg.reward_dim)
-        outer_gate = jnp.clip(jnp.asarray(external_gate, dtype=jnp.float32), 0.0, 1.0)
-        threshold = jnp.asarray(cfg.gate_threshold, dtype=jnp.float32)
+        """Advance memory, retaining the legacy state-only return surface.
 
-        observation_gate = outer_gate * self._surprise_gate(
-            state.observation_traces,
-            obs,
-            threshold,
-        )
-        action_gate = outer_gate * self._surprise_gate(
-            state.action_traces,
-            act,
-            threshold,
-        )
-        reward_gate = outer_gate * self._surprise_gate(
-            state.reward_traces,
-            rew,
-            threshold,
-        )
-
-        return WorkingMemoryState(
-            observation_traces=self._update_trace_bank(
-                state.observation_traces,
-                obs,
-                cfg.observation_decay_rates,
-                observation_gate,
-            ),
-            action_traces=self._update_trace_bank(
-                state.action_traces,
-                act,
-                cfg.action_decay_rates,
-                action_gate,
-            ),
-            reward_traces=self._update_trace_bank(
-                state.reward_traces,
-                rew,
-                cfg.reward_decay_rates,
-                reward_gate,
-            ),
-            step_count=state.step_count + 1,
-            last_gate=jnp.stack([observation_gate, action_gate, reward_gate]),
+        Transaction-aware callers should use :meth:`update_checked`.
+        """
+        return cast(
+            WorkingMemoryState,
+            self.update_checked(
+                state,
+                observation,
+                action,
+                reward,
+                external_gate,
+            ).state,
         )
 
     @functools.partial(jax.jit, static_argnums=(0,))
@@ -371,15 +750,21 @@ class WorkingMemoryFeaturizer:
         action: Float[Array, " action_dim"],
         reward: Float[Array, " reward_dim"],
         external_gate: Float[Array, ""] | float = 1.0,
-    ) -> tuple[WorkingMemoryState, Float[Array, " feature_dim"]]:
-        """Return pre-update features, then advance memory."""
-        features = self.features(state, observation, action, reward)
-        next_state = self.update(state, observation, action, reward, external_gate)
-        return next_state, features
+    ) -> WorkingMemoryStepResult:
+        """Return neutral pre-update features and an explicit update verdict."""
+        raw_features = self.features(state, observation, action, reward)
+        update = self.update_checked(state, observation, action, reward, external_gate)
+        update_applied = update.update_applied & jnp.all(jnp.isfinite(raw_features))
+        return WorkingMemoryStepResult(
+            state=select_transaction(update_applied, update.state, state),
+            features=neutralize_array(update_applied, raw_features),
+            update_applied=update_applied,
+        )
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def diagnostics(self, state: WorkingMemoryState) -> WorkingMemoryDiagnostics:
         """Return memory energy, participation-ratio dimension, and gates."""
+        self._validate_state_static_contract(state)
         flat = _flatten_traces(state)
         return WorkingMemoryDiagnostics(
             step_count=state.step_count,
@@ -400,27 +785,89 @@ def transform_working_memory_arrays(
     *,
     state: WorkingMemoryState | None = None,
     external_gates: Float[Array, " steps"] | None = None,
-) -> tuple[WorkingMemoryState, Float[Array, "steps feature_dim"]]:
-    """Transform transition arrays into causal working-memory features."""
+) -> WorkingMemoryArrayResult:
+    """Transform arrays and expose one checked transaction mask per event."""
+    if type(featurizer) is not WorkingMemoryFeaturizer:
+        raise TypeError("featurizer must be a WorkingMemoryFeaturizer")
+    cfg = featurizer.config
+    try:
+        observation_shape = tuple(observations.shape)
+        action_shape = tuple(actions.shape)
+        reward_shape = tuple(rewards.shape)
+    except Exception as error:
+        raise TypeError("transform inputs must expose array metadata") from error
+    if len(observation_shape) != 2 or observation_shape[1] != cfg.observation_dim:
+        raise ValueError("observations have an invalid shape")
+    steps = observation_shape[0]
+    if type(steps) is not int or steps < 0:
+        raise ValueError("transform step count must be a non-negative integer")
+    if action_shape != (steps, cfg.action_dim):
+        raise ValueError("actions have an invalid shape")
+    if reward_shape != (steps, cfg.reward_dim):
+        raise ValueError("rewards have an invalid shape")
+    _require_sequence_resource(
+        "working memory transform outputs",
+        float32_scalars=steps * cfg.feature_dim(),
+        bool_scalars=steps,
+    )
+    trace_scalars = (
+        cfg.observation_dim * len(cfg.observation_decay_rates)
+        + cfg.action_dim * len(cfg.action_decay_rates)
+        + cfg.reward_dim * len(cfg.reward_decay_rates)
+    )
+    state_scalars = trace_scalars + 4
+    signal_scalars = cfg.observation_dim + cfg.action_dim + cfg.reward_dim
+    decay_scalars = (
+        len(cfg.observation_decay_rates)
+        + len(cfg.action_decay_rates)
+        + len(cfg.reward_decay_rates)
+    )
+    per_step_work = (
+        3 * state_scalars
+        + 6 * trace_scalars
+        + 4 * signal_scalars
+        + decay_scalars
+        + cfg.feature_dim()
+        + 32
+    )
+    _require_sequence_resource(
+        "working memory transform aggregate",
+        float32_scalars=steps * (signal_scalars + cfg.feature_dim() + 1)
+        + per_step_work,
+        bool_scalars=steps,
+    )
+    _require_array("observations", observations, shape=(steps, cfg.observation_dim))
+    _require_array("actions", actions, shape=(steps, cfg.action_dim))
+    _require_array("rewards", rewards, shape=(steps, cfg.reward_dim))
+    if external_gates is not None:
+        _require_array("external_gates", external_gates, shape=(steps,))
+    _obs = jnp.asarray(observations)
+    _act = jnp.asarray(actions)
+    _rew = jnp.asarray(rewards)
     if state is None:
         state = featurizer.init()
+    featurizer._validate_state_static_contract(state)
     gates = (
-        jnp.ones((observations.shape[0],), dtype=jnp.float32)
+        jnp.ones((steps,), dtype=jnp.float32)
         if external_gates is None
-        else jnp.asarray(external_gates, dtype=jnp.float32)
+        else jnp.asarray(external_gates)
     )
 
     def step_fn(
         carry: WorkingMemoryState,
         inputs: tuple[Array, Array, Array, Array],
-    ) -> tuple[WorkingMemoryState, Array]:
+    ) -> tuple[WorkingMemoryState, tuple[Array, Array]]:
         obs, act, rew, gate = inputs
-        return cast(
-            tuple[WorkingMemoryState, Array],
-            featurizer.step(carry, obs, act, rew, gate),
-        )
+        result = featurizer.step(carry, obs, act, rew, gate)
+        return result.state, (result.features, result.update_applied)
 
-    return cast(
-        tuple[WorkingMemoryState, Float[Array, "steps feature_dim"]],
-        jax.lax.scan(step_fn, state, (observations, actions, rewards, gates)),
+    final_state, (features, updates_applied) = jax.lax.scan(
+        step_fn,
+        state,
+        (_obs, _act, _rew, gates),
+    )
+    return WorkingMemoryArrayResult(
+        state=final_state,
+        features=features,
+        updates_applied=updates_applied,
     )

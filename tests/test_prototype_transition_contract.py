@@ -174,8 +174,10 @@ def test_primitive_backup_matches_hand_derived_discount(discount: float) -> None
         executing_option=jnp.array(-1, dtype=jnp.int32),
         base_last_obs=last_obs,
         base_last_action=jnp.array(0, dtype=jnp.int32),
+        last_primitive_action=jnp.array(0, dtype=jnp.int32),
         base_average_reward=jnp.array(0.4, dtype=jnp.float32),
     )
+    assert bool(agent.state_valid(state))
     reward = jnp.array(1.7, dtype=jnp.float32)
     q_previous = agent.base_learner.predict(state.base_learner_state, last_obs)[0]
     q_next = jnp.max(agent.base_learner.predict(state.base_learner_state, next_obs))
@@ -202,17 +204,20 @@ def test_option_return_product_baseline_and_terminal_are_hand_derived() -> None:
     rewards = (2.0, 3.0, 5.0)
     discounts = (0.5, 0.25, 0.0)
     option_action = 2
-    state = agent.start(agent.init(jr.key(1)), start_obs).replace(
+    state = agent.start(agent.init(jr.key(1)), start_obs)
+    state = state.replace(
         executing_option=jnp.array(0, dtype=jnp.int32),
         base_last_obs=start_obs,
         base_last_action=jnp.array(option_action, dtype=jnp.int32),
         base_average_reward=jnp.array(0.3, dtype=jnp.float32),
         option_start_obs=start_obs,
+        option_last_intra_action=state.last_primitive_action,
         option_env_cumreward=jnp.array(0.0, dtype=jnp.float32),
         option_baseline_mass=jnp.array(0.0, dtype=jnp.float32),
         option_discount=jnp.array(1.0, dtype=jnp.float32),
         option_steps=jnp.array(0, dtype=jnp.int32),
     )
+    assert bool(agent.state_valid(state))
 
     first = agent.update(state, rewards[0], observations[0], discounts[0])
     assert not bool(first.option_terminated)
@@ -272,6 +277,7 @@ def test_legacy_stomp_update_retains_configured_option_gamma() -> None:
         option_discount=jnp.array(1.0, dtype=jnp.float32),
         option_steps=jnp.array(0, dtype=jnp.int32),
     )
+    assert bool(agent.state_valid(state))
 
     result = agent.update(state, jnp.array(1.0), observation)
 
@@ -315,6 +321,50 @@ def test_world_model_error_uses_supplied_discount_target() -> None:
     )
 
 
+def test_rejected_world_model_update_rejects_the_complete_prototype_transition() -> None:
+    agent = PrototypeAgent(_prototype_config(world_model=True))
+    state = agent.start(agent.init(jr.key(303)), jnp.asarray([0.4, -0.2]))
+    warm = agent.update_transition(
+        state,
+        _explicit_transition(
+            state,
+            reward=jnp.asarray(0.5),
+            next_observation=jnp.asarray([0.1, 0.3]),
+            discount=jnp.asarray(0.9),
+        ),
+    )
+    state = warm.state
+    maximum = jnp.asarray(2_147_483_647, dtype=jnp.int32)
+    world_model_state = state.world_model_state
+    exhausted_world_model_state = world_model_state.replace(
+        learner_state=world_model_state.learner_state.replace(
+            step_count=maximum,
+            step_words=jnp.asarray([0xFFFFFFFF, 0xFFFFFFFF], dtype=jnp.uint32),
+        ),
+        step_count=maximum,
+    )
+    exhausted = state.replace(world_model_state=exhausted_world_model_state)
+
+    result = agent.update_transition(
+        exhausted,
+        _explicit_transition(
+            exhausted,
+            reward=jnp.asarray(0.25),
+            next_observation=jnp.asarray([-0.2, 0.6]),
+            discount=jnp.asarray(0.9),
+        ),
+    )
+
+    assert not bool(result.transition_diagnostics.valid)
+    assert bool(result.transition_diagnostics.rejected)
+    chex.assert_trees_all_equal(
+        _materialize_typed_keys(result.state),
+        _materialize_typed_keys(exhausted),
+    )
+    assert float(result.world_model_error) == 0.0
+    assert int(result.state.buffer_state.size) == int(exhausted.buffer_state.size)
+
+
 def test_legacy_prototype_wrapper_retains_split_discount_behavior() -> None:
     agent = PrototypeAgent(_prototype_config(world_model=True))
     last_obs = jnp.array([0.4, -0.2], dtype=jnp.float32)
@@ -326,10 +376,16 @@ def test_legacy_prototype_wrapper_retains_split_discount_behavior() -> None:
                 executing_option=jnp.array(0, dtype=jnp.int32),
                 base_last_action=jnp.array(2, dtype=jnp.int32),
                 option_start_obs=last_obs,
+                option_last_intra_action=(
+                    state.oak_state.stomp_state.last_primitive_action
+                ),
                 option_discount=jnp.array(1.0, dtype=jnp.float32),
                 option_steps=jnp.array(0, dtype=jnp.int32),
             )
         )
+    )
+    assert bool(
+        agent.oak_agent.stomp_agent.state_valid(state.oak_state.stomp_state)
     )
     assert agent._world_model is not None
     prediction = agent._world_model.predict(

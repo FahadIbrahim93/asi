@@ -20,6 +20,7 @@ from alberta_framework.benchmarks.upgd_ipmnist import (
     merge_legacy_v1_partial_results,
     merge_partial_results,
 )
+from alberta_framework.evaluation import upgd_ipmnist_nonpromoting as nonpromoting
 from alberta_framework.evaluation.upgd_ipmnist_nonpromoting import (
     EXPECTED_CONFIG,
     EXPECTED_HYPERPARAMETERS,
@@ -33,6 +34,7 @@ from alberta_framework.evaluation.upgd_ipmnist_nonpromoting import (
 )
 
 _ROOT = Path(__file__).resolve().parents[1]
+_IMMUTABLE_V1_ARTIFACT = _ROOT / "outputs/upgd_ipmnist/results.v1.json"
 _IMMUTABLE_V1_RECEIPT = _ROOT / "outputs/upgd_ipmnist/nonpromoting_receipt.v1.json"
 _IMMUTABLE_V1_RECEIPT_SHA256 = (
     "c32595829f93ac86b96c6eefc722291bf365dbf724982a70f207d193bbcfc26e"
@@ -83,6 +85,11 @@ def _write_artifact(tmp_path: Path, paths: list[Path]) -> Path:
         tmp_path / "openml-cache",
         notes=(EXPECTED_NOTE,),
     )
+    # This fixture exercises the immutable historical v1 contract.  The
+    # builder records the live runner, while the validator correctly requires
+    # the exact audited environment stored in the pinned artifact.
+    historical_artifact = json.loads(_IMMUTABLE_V1_ARTIFACT.read_text(encoding="utf-8"))
+    artifact["environment"] = historical_artifact["environment"]
     path = tmp_path / "results.v1.json"
     path.write_text(json.dumps(artifact, sort_keys=True), encoding="utf-8")
     return path
@@ -160,6 +167,39 @@ def test_complete_artifact_recomputes_but_can_never_promote(tmp_path: Path) -> N
         ("upgd_w", 0),
         ("upgd_w", 1),
     )
+
+
+@pytest.mark.unit
+def test_duplicate_expected_seeds_cannot_bypass_artifact_validation(tmp_path: Path) -> None:
+    paths = _write_shards(tmp_path, seeds=(0,))
+    artifact = tmp_path / "empty-artifact.json"
+    artifact.write_text("{}", encoding="utf-8")
+
+    validation = validate_upgd_ipmnist_artifact(
+        artifact,
+        paths,
+        expected_seeds=(0, 0),
+    )
+
+    assert not validation.valid
+    assert any("expected_seeds must contain unique seeds" in error for error in validation.errors)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "expected_seeds",
+    [(), (True,), (np.int64(0),), (0.0,), (-1,), (2**32,)],
+)
+def test_invalid_expected_seed_schedules_fail_closed(
+    tmp_path: Path, expected_seeds: tuple[object, ...]
+) -> None:
+    validation = validate_upgd_ipmnist_partials(
+        [],
+        expected_seeds=expected_seeds,  # type: ignore[arg-type]
+    )
+
+    assert not validation.valid
+    assert any("expected_seeds" in error for error in validation.errors)
 
 
 @pytest.mark.unit
@@ -346,6 +386,114 @@ def test_v2_artifact_manifest_binds_exact_shard_bytes(tmp_path: Path) -> None:
 
     assert not validation.valid
     assert any("does not bind exact shard bytes" in error for error in validation.errors)
+
+
+@pytest.mark.unit
+def test_v2_expected_manifest_does_not_mix_digest_and_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A second-read identity swap cannot bind snapshot B to digest A.
+
+    The public validator already one-reads shards before reconstructing the
+    expected manifest, so a first-read file replacement would be consumed by
+    that earlier guard. The remaining hole is the loop's second
+    ``_strict_json_object(path)`` after ``path.read_bytes()``; swapping that
+    helper is the same split-read as replacing the path between the two calls.
+    """
+    paths = _write_v2_shards(tmp_path, seeds=(0,))
+    artifact = _write_v2_artifact(tmp_path, paths)
+    target = next(path for path in paths if path.name.startswith("upgd_w_"))
+    swapped_identity = _v2_partial_payload("adamw", 1)
+    original = nonpromoting._strict_json_object
+
+    def split_read_identity(path: Path) -> dict[str, object]:
+        if Path(path).resolve() == target.resolve():
+            return dict(swapped_identity)
+        return original(path)
+
+    monkeypatch.setattr(nonpromoting, "_strict_json_object", split_read_identity)
+
+    validation = validate_upgd_ipmnist_v2_artifact(artifact, paths)
+
+    assert validation.valid, validation.errors
+    payload = json.loads(artifact.read_text(encoding="utf-8"))
+    target_entry = next(
+        entry for entry in payload["partial_manifest"] if entry["path"] == target.as_posix()
+    )
+    raw = target.read_bytes()
+    assert target_entry["learner"] == "upgd_w"
+    assert target_entry["seed_id"] == 0
+    assert target_entry["sha256"] == hashlib.sha256(raw).hexdigest()
+    assert target_entry["size_bytes"] == len(raw)
+    assert (target_entry["learner"], target_entry["seed_id"]) != ("adamw", 1)
+
+
+@pytest.mark.unit
+def test_v2_expected_manifest_stable_shards_match_file_digest(tmp_path: Path) -> None:
+    paths = _write_v2_shards(tmp_path, seeds=(0, 1))
+    artifact = _write_v2_artifact(tmp_path, paths)
+    payload = json.loads(artifact.read_text(encoding="utf-8"))
+    identities = [(entry["learner"], entry["seed_id"]) for entry in payload["partial_manifest"]]
+    assert identities == [("adamw", 0), ("adamw", 1), ("upgd_w", 0), ("upgd_w", 1)]
+    by_path = {entry["path"]: entry for entry in payload["partial_manifest"]}
+    for path in paths:
+        raw = path.read_bytes()
+        entry = by_path[path.as_posix()]
+        assert entry["size_bytes"] == len(raw)
+        assert entry["sha256"] == hashlib.sha256(raw).hexdigest()
+
+    validation = validate_upgd_ipmnist_v2_artifact(artifact, paths)
+    assert validation.valid, validation.errors
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("schema_version", [2.0, "2"])
+def test_v2_artifact_rejects_non_int_schema_version(
+    tmp_path: Path, schema_version: object
+) -> None:
+    paths = _write_v2_shards(tmp_path, seeds=(0,))
+    artifact = _write_v2_artifact(tmp_path, paths)
+    payload = json.loads(artifact.read_text(encoding="utf-8"))
+    payload["schema_version"] = schema_version
+    artifact.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+
+    validation = validate_upgd_ipmnist_v2_artifact(artifact, paths)
+
+    assert not validation.valid
+    assert any("schema_version" in error for error in validation.errors)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "policy_updates",
+    [
+        {
+            "development_only": 1,
+            "scientific_promotion_allowed": 0,
+            "execution_attestation": 0,
+        },
+        {
+            "development_only": 1.0,
+            "scientific_promotion_allowed": 0.0,
+            "execution_attestation": 0.0,
+        },
+    ],
+)
+def test_v2_artifact_rejects_numeric_policy_aliases(
+    tmp_path: Path, policy_updates: dict[str, object]
+) -> None:
+    paths = _write_v2_shards(tmp_path, seeds=(0,))
+    artifact = _write_v2_artifact(tmp_path, paths)
+    payload = json.loads(artifact.read_text(encoding="utf-8"))
+    policy = dict(payload["evidence_policy"])
+    policy.update(policy_updates)
+    payload["evidence_policy"] = policy
+    artifact.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+
+    validation = validate_upgd_ipmnist_v2_artifact(artifact, paths)
+
+    assert not validation.valid
+    assert any("evidence policy" in error for error in validation.errors)
 
 
 @pytest.mark.unit

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 from alberta_framework import forager_cli
@@ -77,3 +79,47 @@ def test_parser_exposes_causal_map_policy() -> None:
 
     assert args.preset == "field_of_view"
     assert args.agents == ["causal-map"]
+
+
+def test_explicit_int_or_default_keeps_requested_zero() -> None:
+    """``0 or default`` is the live hole: argparse 0 must not become missing."""
+    assert forager_cli._explicit_int_or_default(None, 100_000) == 100_000
+    assert forager_cli._explicit_int_or_default(0, 100_000) == 0
+    assert forager_cli._explicit_int_or_default(50_000, 100_000) == 50_000
+
+
+def test_final_window_zero_is_not_replaced_by_protocol_default() -> None:
+    args = forager_cli._parser().parse_args(["--final-window", "0"])
+    assert args.final_window == 0
+    # The previous main() expression was ``args.final_window or protocol.default``.
+    assert (args.final_window or 100_000) == 100_000
+    resolved = forager_cli._explicit_int_or_default(args.final_window, 100_000)
+    assert resolved == 0
+
+
+def test_json_safe_rejects_nonfinite_protocol_identities() -> None:
+    """Protocol/baseline dumps must not coerce NaN/Inf into JSON null."""
+    finite = forager_cli._json_safe({"preset": "toy", "scale": 1.0})
+    assert finite == {"preset": "toy", "scale": 1.0}
+    encoded = json.dumps(finite, indent=2, sort_keys=True, allow_nan=False)
+    assert '"scale": 1.0' in encoded
+
+    for bad in (float("nan"), float("inf"), float("-inf"), np.float64("nan")):
+        with pytest.raises(ValueError, match="forager CLI payload is not finite JSON"):
+            forager_cli._json_safe({"scale": bad})
+
+
+def test_protocol_and_baseline_dumps_refuse_nonfinite_json() -> None:
+    source = __import__("inspect").getsource(forager_cli.main)
+    assert "allow_nan=False" in source
+    assert "json.dumps(_json_safe(baseline_payload), indent=2, sort_keys=True)" not in source
+    assert "json.dumps(_json_safe(protocol.to_dict()), indent=2, sort_keys=True)" not in source
+
+
+def test_main_passes_explicit_final_window_to_config() -> None:
+    import inspect
+
+    source = inspect.getsource(forager_cli.main)
+    assert "_explicit_int_or_default(" in source
+    assert "args.final_window, protocol.final_window_steps" in source
+    assert "args.final_window or protocol.final_window_steps" not in source

@@ -197,6 +197,15 @@ class KeyFrame:
     next_key: tuple[int, int]
     environment_key: tuple[int, int]
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "input_key", _require_key_words(self.input_key, "input_key"))
+        object.__setattr__(self, "next_key", _require_key_words(self.next_key, "next_key"))
+        object.__setattr__(
+            self,
+            "environment_key",
+            _require_key_words(self.environment_key, "environment_key"),
+        )
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "input_key": list(self.input_key),
@@ -212,6 +221,23 @@ class TreeDigest:
     leaf_count: int
     structure_sha256: str
     content_sha256: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "leaf_count",
+            _require_int(self.leaf_count, "leaf_count", minimum=1, maximum=100_000),
+        )
+        object.__setattr__(
+            self,
+            "structure_sha256",
+            _require_sha256(self.structure_sha256, "structure_sha256"),
+        )
+        object.__setattr__(
+            self,
+            "content_sha256",
+            _require_sha256(self.content_sha256, "content_sha256"),
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -594,11 +620,20 @@ def _require_sha256(value: Any, path: str) -> str:
 
 
 def _require_int(value: Any, path: str, *, minimum: int, maximum: int) -> int:
-    if isinstance(value, bool) or not isinstance(value, int):
+    if type(value) is not int:
         raise ForagerRngParityError(f"{path} must be an integer")
     if not minimum <= value <= maximum:
         raise ForagerRngParityError(f"{path} must lie in [{minimum}, {maximum}]")
     return value
+
+
+def _require_key_words(value: Any, path: str) -> tuple[int, int]:
+    if type(value) is not tuple or len(value) != 2:
+        raise ForagerRngParityError(f"{path} must contain exactly two words")
+    return (
+        _require_int(value[0], f"{path}[0]", minimum=0, maximum=_KEY_WORD_MAX),
+        _require_int(value[1], f"{path}[1]", minimum=0, maximum=_KEY_WORD_MAX),
+    )
 
 
 def _key_words(key: Any) -> tuple[int, int]:

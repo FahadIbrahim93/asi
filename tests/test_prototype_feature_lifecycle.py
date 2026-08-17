@@ -252,8 +252,10 @@ def test_config_is_strict_versioned_mechanism_only_and_round_trips() -> None:
             for field in dataclasses.fields(exact_stomp)
         }
     )
-    with pytest.raises(TypeError, match="exact STOMPConfig"):
-        lifecycle.require_compatible_oak_config(OaKConfig(stomp=stomp_subclass))
+    # OaKConfig is now the authoritative first boundary: it must reject an
+    # unvalidated STOMP subclass before derived OaK resource accounting runs.
+    with pytest.raises(ValueError, match="actual STOMPConfig"):
+        OaKConfig(stomp=stomp_subclass)
 
     payload = config.to_config()
     payload["scientific_promotion_allowed"] = True
@@ -298,22 +300,11 @@ def test_config_is_strict_versioned_mechanism_only_and_round_trips() -> None:
     with pytest.raises(ValueError, match="subtask attestation"):
         lifecycle.require_compatible_oak_config(mismatched_oak)
     for malformed_index in (True, 1.0):
-        malformed_specs = (
-            SubtaskSpec(feature_index=0),
-            SubtaskSpec(feature_index=cast(int, malformed_index)),
-        )
-        malformed_oak = OaKConfig(
-            stomp=STOMPConfig(
-                subtask_specs=malformed_specs,
-                observation_dim=config.total_feature_dim,
-                n_primitive_actions=config.n_primitive_actions,
-            )
-        )
-        with pytest.raises(ValueError, match="subtask attestation"):
-            lifecycle.require_compatible_oak_config(malformed_oak)
+        with pytest.raises(ValueError, match="feature_index"):
+            SubtaskSpec(feature_index=cast(int, malformed_index))
     for malformed_dimension in (float(config.total_feature_dim),):
-        malformed_oak = OaKConfig(
-            stomp=STOMPConfig(
+        with pytest.raises(ValueError, match="observation_dim"):
+            STOMPConfig(
                 subtask_specs=(
                     SubtaskSpec(feature_index=0),
                     SubtaskSpec(feature_index=1),
@@ -321,11 +312,8 @@ def test_config_is_strict_versioned_mechanism_only_and_round_trips() -> None:
                 observation_dim=cast(int, malformed_dimension),
                 n_primitive_actions=config.n_primitive_actions,
             )
-        )
-        with pytest.raises(ValueError, match="subtask attestation"):
-            lifecycle.require_compatible_oak_config(malformed_oak)
-    malformed_actions = OaKConfig(
-        stomp=STOMPConfig(
+    with pytest.raises(ValueError, match="n_primitive_actions"):
+        STOMPConfig(
             subtask_specs=(
                 SubtaskSpec(feature_index=0),
                 SubtaskSpec(feature_index=1),
@@ -333,13 +321,10 @@ def test_config_is_strict_versioned_mechanism_only_and_round_trips() -> None:
             observation_dim=config.total_feature_dim,
             n_primitive_actions=cast(int, float(config.n_primitive_actions)),
         )
-    )
-    with pytest.raises(ValueError, match="subtask attestation"):
-        lifecycle.require_compatible_oak_config(malformed_actions)
     single_action_config = dataclasses.replace(config, n_primitive_actions=1)
-    single_action_lifecycle = PrototypeFeatureLifecycle(single_action_config)
-    boolean_actions = OaKConfig(
-        stomp=STOMPConfig(
+    PrototypeFeatureLifecycle(single_action_config)
+    with pytest.raises(ValueError, match="n_primitive_actions"):
+        STOMPConfig(
             subtask_specs=(
                 SubtaskSpec(feature_index=0),
                 SubtaskSpec(feature_index=1),
@@ -347,9 +332,6 @@ def test_config_is_strict_versioned_mechanism_only_and_round_trips() -> None:
             observation_dim=single_action_config.total_feature_dim,
             n_primitive_actions=cast(int, True),
         )
-    )
-    with pytest.raises(ValueError, match="subtask attestation"):
-        single_action_lifecycle.require_compatible_oak_config(boolean_actions)
 
 
 def test_allocation_and_python_collection_ceilings_fail_before_construction() -> None:
@@ -1080,3 +1062,59 @@ def test_checkpoint_round_trip_is_strict_and_resource_bound(
             corrupt,
             tmp_path / "corrupt",
         )
+
+
+@pytest.mark.parametrize(
+    "field",
+    (
+        "base_feature_dim",
+        "active_pair_slots",
+        "candidate_pair_slots",
+        "n_tasks",
+        "n_options",
+        "n_primitive_actions",
+        "replacement_interval",
+        "min_feature_age",
+        "candidate_min_age",
+        "max_observations",
+    ),
+)
+@pytest.mark.parametrize("code", ("b", "B", "h", "H", "i", "I", "l", "L", "q", "Q"))
+def test_lifecycle_config_canonicalizes_numpy_integer_families(
+    field: str, code: str
+) -> None:
+    value = getattr(_config(), field)
+    config = dataclasses.replace(_config(), **{field: np.dtype(code).type(value)})
+    assert type(getattr(config, field)) is int
+
+
+@pytest.mark.parametrize("code", ("b", "B", "h", "H", "i", "I", "l", "L", "q", "Q"))
+def test_lifecycle_config_canonicalizes_numpy_option_indices(code: str) -> None:
+    integer_type = np.dtype(code).type
+    config = dataclasses.replace(
+        _config(), option_subtask_feature_indices=(integer_type(0), integer_type(1))
+    )
+    assert all(type(value) is int for value in config.option_subtask_feature_indices)
+
+
+def test_lifecycle_config_rejects_hostile_integer_without_hooks() -> None:
+    class HostileInt(int):
+        def __index__(self) -> int:
+            raise AssertionError("untrusted index hook executed")
+
+        def __repr__(self) -> str:
+            raise AssertionError("untrusted repr hook executed")
+
+    with pytest.raises(ValueError, match="base_feature_dim"):
+        dataclasses.replace(_config(), base_feature_dim=HostileInt(4))
+    with pytest.raises(ValueError, match="option_subtask_feature_indices"):
+        dataclasses.replace(
+            _config(), option_subtask_feature_indices=(HostileInt(0), 1)
+        )
+
+
+def test_lifecycle_serialized_schema_remains_exact_json() -> None:
+    payload = _config().to_config()
+    payload["base_feature_dim"] = np.int64(4)
+    with pytest.raises(ValueError, match="base_feature_dim"):
+        PrototypeFeatureLifecycleConfig.from_config(payload)

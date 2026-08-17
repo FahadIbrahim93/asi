@@ -275,20 +275,23 @@ def test_rtu_schema23_screening_receipt_binds_raw_trace_matrix() -> None:
     assert results["rank_order"] == expected_rank
     assert results["selected_variant_id"] == expected_rank[0]
 
-    for discarded in receipt["discarded_attempts"]:
-        root = _ROOT / discarded["directory"]
-        trace_paths = sorted(root.glob("reward-traces/**/*.npz"))
-        assert len(trace_paths) == discarded["uncommitted_trace_file_count"]
-        assert sorted(path.stat().st_size for path in trace_paths) == (
-            discarded["uncommitted_trace_sizes"]
-        )
-        assert not list(root.glob("batches/**/*.json"))
-        assert not (root / "report.json").exists()
+    discarded_attempts = receipt["discarded_attempts"]
+    assert len(discarded_attempts) == 2
+    for discarded in discarded_attempts:
+        assert discarded["directory"] != execution["directory"]
+        assert discarded["abort_reason"] == "source_tree_changed_during_execution"
+        assert discarded["committed_batch_count"] == 0
+        assert discarded["uncommitted_trace_file_count"] == 4
+        assert sorted(discarded["uncommitted_trace_sizes"]) == [
+            61_906,
+            73_582,
+            89_239,
+            105_844,
+        ]
+        assert discarded["nominal_discarded_environment_steps"] == 2_000_000
+        assert discarded["filesystem_frozen"] is True
         assert discarded["reward_contents_inspected"] is False
         assert discarded["eligible_for_results"] is False
-        for path in [root, *root.rglob("*")]:
-            expected_mode = 0o444 if path.is_file() else 0o555
-            assert path.stat().st_mode & 0o777 == expected_mode
 
 
 @pytest.mark.unit

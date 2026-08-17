@@ -490,6 +490,13 @@ def _reject_nonfinite(value: str) -> NoReturn:
     raise ForagerMatchedQualificationError(f"non-finite JSON number {value!r}")
 
 
+def _parse_finite_json_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ForagerMatchedQualificationError(f"non-finite JSON number {value!r}")
+    return parsed
+
+
 def _decode_json(raw: bytes, label: str) -> Any:
     if not raw or len(raw) > _MAX_JSON_BYTES or raw.startswith(b"\xef\xbb\xbf"):
         raise ForagerMatchedQualificationError(f"{label} violates the JSON byte contract")
@@ -498,6 +505,7 @@ def _decode_json(raw: bytes, label: str) -> Any:
             raw.decode("utf-8"),
             object_pairs_hook=_reject_duplicate_keys,
             parse_constant=_reject_nonfinite,
+            parse_float=_parse_finite_json_float,
         )
     except ForagerMatchedQualificationError:
         raise
@@ -506,16 +514,22 @@ def _decode_json(raw: bytes, label: str) -> Any:
 
 
 def _plain_json(value: Any, path: str = "value") -> Any:
-    if value is None or type(value) in {str, bool, int, float}:
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise ForagerMatchedQualificationError(
+                f"{path} contains a non-finite JSON number"
+            )
         return value
-    if isinstance(value, Mapping):
+    if value is None or type(value) in {str, bool, int}:
+        return value
+    if type(value) in (dict, MappingProxyType):
         result: dict[str, Any] = {}
         for key, item in value.items():
             if type(key) is not str:
                 raise ForagerMatchedQualificationError(f"{path} has a non-string key")
             result[key] = _plain_json(item, f"{path}.{key}")
         return result
-    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+    if type(value) in (list, tuple):
         return [_plain_json(item, f"{path}[]") for item in value]
     raise ForagerMatchedQualificationError(f"{path} contains unsupported {type(value).__name__}")
 
@@ -1821,7 +1835,15 @@ def _replace_integer_literals(raw: bytes, transforms: Sequence[Any]) -> bytes:
     parsed = _decode_json(raw, "original configuration")
     if type(parsed) is not dict:
         raise ForagerMatchedQualificationError("original configuration must be an object")
-    expected = cast(dict[str, Any], json.loads(json.dumps(parsed)))
+    try:
+        expected = cast(
+            dict[str, Any],
+            json.loads(json.dumps(parsed, allow_nan=False)),
+        )
+    except (TypeError, ValueError) as exc:
+        raise ForagerMatchedQualificationError(
+            "original configuration is not finite canonical JSON"
+        ) from exc
     transformed = raw
     for transform in transforms:
         if (
@@ -4372,6 +4394,13 @@ def _mapping(value: Any, label: str) -> dict[str, Any]:
     return cast(dict[str, Any], value)
 
 
+def _json_exact_equal(left: Any, right: Any) -> bool:
+    try:
+        return _canonical_json_bytes({"value": left}) == _canonical_json_bytes({"value": right})
+    except (OverflowError, RecursionError, TypeError, ValueError):
+        return False
+
+
 def _load_canonical(path: Path, label: str) -> dict[str, Any]:
     raw = _read_stable(path, label, maximum=_MAX_JSON_BYTES)
     value = _mapping(_decode_json(raw, label), label)
@@ -4533,7 +4562,7 @@ def _verify_probe_payload(
         payload["schema_version"] != MATCHED_CURRENT_PROBE_SCHEMA_VERSION
         or payload["status"] != "structurally_qualified_content_only"
         or payload["candidate_id"] != invocation.candidate_id
-        or payload["qualification_seed"] != PUBLIC_QUALIFICATION_SEED
+        or not _json_exact_equal(payload["qualification_seed"], PUBLIC_QUALIFICATION_SEED)
         or payload["source_key"] != invocation.source_key
         or payload["implementation_kind"] != invocation.implementation_kind
         or payload["resolved_agent"] != invocation.expected_agent
@@ -4565,12 +4594,15 @@ def _verify_probe_payload(
         "upstream_drqn": "PyExpUtils.ExperimentModel+problem.registry",
         "upstream_search_oracle": "PyExpUtils.ExperimentModel+problem.registry",
     }[invocation.implementation_kind]
-    if configuration != {
-        "path": _CONTAINER_WORK_CONFIG,
-        "sha256": invocation.configuration_sha256,
-        "parser_identity": parser_identity,
-        "round_trip_accepted": True,
-    }:
+    if not _json_exact_equal(
+        configuration,
+        {
+            "path": _CONTAINER_WORK_CONFIG,
+            "sha256": invocation.configuration_sha256,
+            "parser_identity": parser_identity,
+            "round_trip_accepted": True,
+        },
+    ):
         raise ForagerMatchedQualificationError("persisted probe configuration drifted")
 
     required_literals = {
@@ -4629,21 +4661,24 @@ def _verify_probe_payload(
     else:
         expected_agent_words = [0, 0]
         expected_agent_derivation = "effective_seed_constructor_input_v1"
-    if seed_resolution != {
-        "candidate_id": invocation.candidate_id,
-        "qualification_seed_class": "public_nonbenchmark_seed",
-        "requested_seed": PUBLIC_QUALIFICATION_SEED,
-        "stored_seed": PUBLIC_QUALIFICATION_SEED,
-        "offset": 0,
-        "effective_seed": PUBLIC_QUALIFICATION_SEED,
-        "transport": invocation.seed_transport,
-        "prng_impl": "threefry2x32",
-        "effective_seed_key_words": [0, 0],
-        "agent_rng_provenance_derivation": expected_agent_derivation,
-        "agent_rng_provenance_key_words": expected_agent_words,
-        "environment_transition_count": 0,
-        "reward_array_read_count": 0,
-    }:
+    if not _json_exact_equal(
+        seed_resolution,
+        {
+            "candidate_id": invocation.candidate_id,
+            "qualification_seed_class": "public_nonbenchmark_seed",
+            "requested_seed": PUBLIC_QUALIFICATION_SEED,
+            "stored_seed": PUBLIC_QUALIFICATION_SEED,
+            "offset": 0,
+            "effective_seed": PUBLIC_QUALIFICATION_SEED,
+            "transport": invocation.seed_transport,
+            "prng_impl": "threefry2x32",
+            "effective_seed_key_words": [0, 0],
+            "agent_rng_provenance_derivation": expected_agent_derivation,
+            "agent_rng_provenance_key_words": expected_agent_words,
+            "environment_transition_count": 0,
+            "reward_array_read_count": 0,
+        },
+    ):
         raise ForagerMatchedQualificationError("persisted probe seed resolution drifted")
 
     resources = _mapping(payload["resources"], "probe resources")
@@ -4719,24 +4754,28 @@ def _verify_probe_payload(
     boundary = _mapping(payload["reward_blind_boundary"], "probe reward boundary")
     authority = _mapping(payload["authority"], "probe authority")
     if (
-        boundary
-        != {
-            "environment_resets": 1,
-            "environment_transitions": 0,
-            "reward_arrays_read": 0,
-            "result_archives_opened": 0,
-            "benchmark_seeds_used": [],
-        }
-        or authority
-        != {
-            "identity": MATCHED_CURRENT_AUTHORITY_IDENTITY,
-            "content_only": True,
-            "externally_endorsed": False,
-            "external_signature_created": False,
-            "trust_profile_created": False,
-            "promotion_authorized": False,
-            "performance_claim": False,
-        }
+        not _json_exact_equal(
+            boundary,
+            {
+                "environment_resets": 1,
+                "environment_transitions": 0,
+                "reward_arrays_read": 0,
+                "result_archives_opened": 0,
+                "benchmark_seeds_used": [],
+            },
+        )
+        or not _json_exact_equal(
+            authority,
+            {
+                "identity": MATCHED_CURRENT_AUTHORITY_IDENTITY,
+                "content_only": True,
+                "externally_endorsed": False,
+                "external_signature_created": False,
+                "trust_profile_created": False,
+                "promotion_authorized": False,
+                "performance_claim": False,
+            },
+        )
     ):
         raise ForagerMatchedQualificationError(
             "persisted probe crossed its reward-blind authority boundary"
@@ -4900,25 +4939,29 @@ def load_matched_current_qualification_bundle(
         or manifest.get("promotion_authorized") is not False
         or manifest.get("performance_claim") is not False
         or manifest.get("external_verification_required") is not True
-        or authority
-        != {
-            "identity": MATCHED_CURRENT_AUTHORITY_IDENTITY,
-            "content_only": True,
-            "externally_endorsed": False,
-            "external_signature_created": False,
-            "trust_profile_created": False,
-        }
-        or boundary
-        != {
-            "qualification_seed": PUBLIC_QUALIFICATION_SEED,
-            "qualification_seed_class": "public_nonbenchmark_seed",
-            "tuning_seeds_used": [],
-            "evaluation_seeds_used": [],
-            "environment_resets": len(builder.MATCHED_CURRENT_CANDIDATE_IDS),
-            "environment_transitions": 0,
-            "reward_arrays_read": 0,
-            "result_archives_opened": 0,
-        }
+        or not _json_exact_equal(
+            authority,
+            {
+                "identity": MATCHED_CURRENT_AUTHORITY_IDENTITY,
+                "content_only": True,
+                "externally_endorsed": False,
+                "external_signature_created": False,
+                "trust_profile_created": False,
+            },
+        )
+        or not _json_exact_equal(
+            boundary,
+            {
+                "qualification_seed": PUBLIC_QUALIFICATION_SEED,
+                "qualification_seed_class": "public_nonbenchmark_seed",
+                "tuning_seeds_used": [],
+                "evaluation_seeds_used": [],
+                "environment_resets": len(builder.MATCHED_CURRENT_CANDIDATE_IDS),
+                "environment_transitions": 0,
+                "reward_arrays_read": 0,
+                "result_archives_opened": 0,
+            },
+        )
     ):
         raise ForagerMatchedQualificationError("qualification authority boundary drifted")
     candidate_order = manifest.get("candidate_order")

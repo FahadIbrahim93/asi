@@ -44,6 +44,39 @@ def _sha(label: str) -> str:
 _QUALIFICATION_MANIFEST_SHA256 = _sha("matched-current-qualification-manifest")
 
 
+@pytest.mark.parametrize("invalid", [float("nan"), float("inf"), float("-inf")])
+def test_plain_rejects_nonfinite_number_identities(invalid: float) -> None:
+    """Seal canonicalization must not keep NaN/Inf as trusted JSON scalars."""
+
+    with pytest.raises(seal.ForagerMatchedSealError, match="non-finite JSON number"):
+        seal._plain(invalid)
+    with pytest.raises(seal.ForagerMatchedSealError, match="non-finite JSON number"):
+        seal._plain({"score": invalid})
+
+
+def test_plain_keeps_finite_canonical_scalars() -> None:
+    assert seal._plain({"score": 1.25, "ok": True, "n": 2}) == {
+        "score": 1.25,
+        "ok": True,
+        "n": 2,
+    }
+    assert seal.canonical_json_bytes({"score": 1.25}) == b'{"score":1.25}'
+
+
+def test_plain_rejects_hostile_container_subclasses_without_hooks() -> None:
+    class HostileMapping(dict[str, object]):
+        def items(self):  # type: ignore[no-untyped-def, override]
+            raise AssertionError("canonicalization must not invoke mapping hooks")
+
+    class HostileSequence(list[object]):
+        def __iter__(self):
+            raise AssertionError("canonicalization must not invoke sequence hooks")
+
+    for value in (HostileMapping(value=1), HostileSequence()):
+        with pytest.raises(seal.ForagerMatchedSealError, match="unsupported"):
+            seal._plain(value)  # noqa: SLF001
+
+
 def _canonical_sha(value: dict[str, Any]) -> str:
     return hashlib.sha256(executor.canonical_json_bytes(value)).hexdigest()
 
@@ -534,6 +567,26 @@ def test_qualification_manifest_cross_carrier_tampering_fails_closed(
             receipt_index,
             completed.score_evidence,
             completed.verification_request,
+        )
+
+
+@pytest.mark.parametrize("invalid_horizon", [499_712.0, True])
+def test_execution_plan_rejects_non_integer_horizon(
+    tmp_path: Path,
+    invalid_horizon: object,
+) -> None:
+    completed, _ = _completed_campaign(tmp_path)
+    plan_payload = seal._decode_canonical(
+        completed.plan.canonical_bytes,
+        "test execution plan",
+    )
+    plan_payload["horizon"] = invalid_horizon
+
+    with pytest.raises(seal.ForagerMatchedSealError, match="horizon must be an integer"):
+        seal._validate_execution_plan_snapshot(
+            plan_payload,
+            completed.protocol,
+            completed.score_evidence,
         )
 
 

@@ -39,17 +39,21 @@ import dataclasses
 import functools
 import hashlib
 import json
-import math
+import operator
+from collections.abc import Mapping
+from fractions import Fraction
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, SupportsIndex, cast
 
 import chex
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 from jax import Array
 from jaxtyping import Bool, Float, Int
 
+from alberta_framework.core._float32_scalars import validated_float32_scalar
 from alberta_framework.core.checkpoints import (
     load_checkpoint,
     load_checkpoint_metadata,
@@ -71,6 +75,113 @@ from alberta_framework.core.world_model import (
 WORLD_MODEL_ENSEMBLE_CHECKPOINT_SCHEMA = "alberta.world_model_ensemble.v2"
 _WORLD_MODEL_ENSEMBLE_CHECKPOINT_SCHEMA_V1 = "alberta.world_model_ensemble.v1"
 _INT32_MAX = 2**31 - 1
+_ACTUAL_INT_TYPES: tuple[type, ...] = (
+    int,
+    np.int8,
+    np.int16,
+    np.int32,
+    np.int64,
+    np.uint8,
+    np.uint16,
+    np.uint32,
+    np.uint64,
+    np.longlong,
+    np.ulonglong,
+)
+_ACTUAL_FLOAT_TYPES = frozenset(
+    {float, Fraction, *(np.dtype(code).type for code in ("e", "f", "d", "g"))}
+)
+
+
+def _require_int(
+    name: str,
+    value: object,
+    *,
+    minimum: int | None = None,
+    maximum: int | None = None,
+) -> int:
+    if type(value) not in _ACTUAL_INT_TYPES:
+        raise ValueError(f"{name} must be an integer")
+    number = operator.index(cast(SupportsIndex, value))
+    if minimum is not None and number < minimum:
+        raise ValueError(f"{name} must be >= {minimum}")
+    if maximum is not None and number > maximum:
+        raise ValueError(f"{name} must be <= {maximum}")
+    return number
+
+
+def _validated_config_float(name: str, value: object, **bounds: Any) -> float:
+    if type(value) not in (frozenset(_ACTUAL_INT_TYPES) | _ACTUAL_FLOAT_TYPES):
+        raise ValueError(f"{name} must be a finite real scalar")
+    return validated_float32_scalar(name, value, **bounds)
+
+
+def _member_state_scalars(config: ActionConditionedWorldModelConfig) -> int:
+    """Return exact default-LMS member state scalars counted by the budget surface."""
+    input_dim = config.observation_dim + config.n_actions
+    if config.include_action_interactions:
+        input_dim += config.observation_dim * config.n_actions
+    layer_sizes = (input_dim, *config.hidden_sizes)
+    trunk_parameters = sum(
+        fan_out * (fan_in + 1)
+        for fan_in, fan_out in zip(layer_sizes, layer_sizes[1:], strict=False)
+    )
+    n_heads = config.observation_dim + 2
+    final_width = config.hidden_sizes[-1] if config.hidden_sizes else input_dim
+    parameters = trunk_parameters + n_heads * (final_width + 1)
+    tensor_count = 2 * len(config.hidden_sizes) + 2 * n_heads
+    return (
+        2 * parameters
+        + tensor_count
+        + sum(config.hidden_sizes)
+        + 2 * config.observation_dim
+        + 9
+    )
+
+
+def _ensemble_state_resource_counts(
+    *, model: ActionConditionedWorldModelConfig, ensemble_size: int
+) -> tuple[int, int]:
+    target_dim = model.observation_dim + 2
+    members = ensemble_size * _member_state_scalars(model)
+    residuals = ensemble_size * target_dim
+    logical_scalars = members + residuals + 4 * ensemble_size + 15
+    logical_bytes = 4 * members + 4 * residuals + 10 * ensemble_size + 60
+    for name, value in (
+        ("ensemble member state scalars", members),
+        ("ensemble residual scalars", residuals),
+        ("ensemble persistent state scalars", logical_scalars),
+        ("ensemble persistent state bytes", logical_bytes),
+    ):
+        if not 1 <= value <= _INT32_MAX:
+            raise ValueError(f"derived {name} must fit signed int32")
+
+    update_float32_scalars = (
+        2 * ensemble_size * target_dim
+        + 3 * target_dim
+        + ensemble_size * model.observation_dim
+        + 2 * model.observation_dim
+        + 3 * ensemble_size
+        + 13
+    )
+    update_bool_scalars = 2 * ensemble_size + 20
+    update_scalars = logical_scalars + update_float32_scalars + update_bool_scalars
+    update_bytes = logical_bytes + 4 * update_float32_scalars + update_bool_scalars
+    for name, value in (
+        ("ensemble update-result scalars", update_scalars),
+        ("ensemble update-result bytes", update_bytes),
+    ):
+        if not 1 <= value <= _INT32_MAX:
+            raise ValueError(f"derived {name} must fit signed int32")
+    return logical_scalars, logical_bytes
+
+
+def _safe_mean(values: Array, *, axis: int | None = None) -> Array:
+    """Compute a float32 mean without first forming an overflowing sum."""
+    divisor = values.size if axis is None else values.shape[axis]
+    return jnp.sum(values / jnp.asarray(divisor, dtype=values.dtype), axis=axis)
+
+
 _REPLAY_KEY_FOLD_IN = 0x5245504C
 _V1_REPLAY_KEY_FOLD_IN = 0x50525632
 
@@ -127,43 +238,56 @@ class WorldModelEnsembleConfig:
     residual_variance_floor: float = 1.0e-6
 
     def __post_init__(self) -> None:
-        if (
-            isinstance(self.ensemble_size, bool)
-            or not isinstance(self.ensemble_size, int)
-            or self.ensemble_size < 2
-        ):
-            raise ValueError("ensemble_size must be an integer >= 2")
-        if (
-            not math.isfinite(self.bootstrap_probability)
-            or not 0.0 < self.bootstrap_probability < 1.0
-        ):
-            raise ValueError("bootstrap_probability must be finite and in (0, 1)")
-        if (
-            not math.isfinite(self.residual_variance_decay)
-            or not 0.0 <= self.residual_variance_decay < 1.0
-        ):
-            raise ValueError("residual_variance_decay must be finite and in [0, 1)")
-        if (
-            isinstance(self.residual_variance_warmup_steps, bool)
-            or not isinstance(self.residual_variance_warmup_steps, int)
-            or not 1 <= self.residual_variance_warmup_steps <= _INT32_MAX
-        ):
-            raise ValueError("residual_variance_warmup_steps must be an integer in [1, int32 max]")
-        if not math.isfinite(self.residual_variance_floor) or self.residual_variance_floor <= 0.0:
-            raise ValueError("residual_variance_floor must be positive and finite")
-        if self.signal_estimator.ensemble_size != self.ensemble_size:
+        if type(self.model) is not ActionConditionedWorldModelConfig:
+            raise ValueError("model must be an exact ActionConditionedWorldModelConfig")
+        if type(self.signal_estimator) is not LearningSignalEstimatorConfig:
+            raise ValueError("signal_estimator must be an exact LearningSignalEstimatorConfig")
+        ensemble_size = _require_int(
+            "ensemble_size", self.ensemble_size, minimum=2, maximum=_INT32_MAX - 1
+        )
+        bootstrap_probability = _validated_config_float(
+            "bootstrap_probability",
+            self.bootstrap_probability,
+            lower=0.0,
+            upper=1.0,
+            upper_inclusive=False,
+            positive=True,
+        )
+        residual_variance_decay = _validated_config_float(
+            "residual_variance_decay",
+            self.residual_variance_decay,
+            lower=0.0,
+            upper=1.0,
+            upper_inclusive=False,
+        )
+        residual_variance_warmup_steps = _require_int(
+            "residual_variance_warmup_steps",
+            self.residual_variance_warmup_steps,
+            minimum=1,
+            maximum=_INT32_MAX,
+        )
+        residual_variance_floor = _validated_config_float(
+            "residual_variance_floor",
+            self.residual_variance_floor,
+            positive=True,
+        )
+        if residual_variance_floor < self.signal_estimator.variance_floor:
+            raise ValueError("residual_variance_floor must be >= signal_estimator.variance_floor")
+        if residual_variance_floor > self.signal_estimator.max_predicted_variance:
+            raise ValueError("residual_variance_floor exceeds the signal estimator variance bound")
+        if self.signal_estimator.ensemble_size != ensemble_size:
             raise ValueError("signal_estimator.ensemble_size must match ensemble_size")
         expected_target_dim = self.model.observation_dim + 2
         if self.signal_estimator.target_dim != expected_target_dim:
             raise ValueError("signal_estimator.target_dim must equal model.observation_dim + 2")
-        if self.residual_variance_floor < self.signal_estimator.variance_floor:
-            raise ValueError("residual_variance_floor must be >= signal_estimator.variance_floor")
-        if self.residual_variance_floor > self.signal_estimator.max_predicted_variance:
-            raise ValueError("residual_variance_floor exceeds the signal estimator variance bound")
-
-        # Reuse the model's complete constructor validation rather than
-        # maintaining a second, drifting copy here.
-        ActionConditionedWorldModel(self.model)
+        object.__setattr__(self, "ensemble_size", ensemble_size)
+        object.__setattr__(self, "bootstrap_probability", bootstrap_probability)
+        object.__setattr__(self, "residual_variance_decay", residual_variance_decay)
+        object.__setattr__(
+            self, "residual_variance_warmup_steps", residual_variance_warmup_steps
+        )
+        object.__setattr__(self, "residual_variance_floor", residual_variance_floor)
+        _ensemble_state_resource_counts(model=self.model, ensemble_size=ensemble_size)
 
     @property
     def target_dim(self) -> int:
@@ -186,22 +310,39 @@ class WorldModelEnsembleConfig:
         }
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> WorldModelEnsembleConfig:
+    def from_config(cls, config: Mapping[str, Any]) -> WorldModelEnsembleConfig:
         """Reconstruct the exact development-only configuration."""
-        payload = dict(config)
-        type_name = payload.pop("type", "WorldModelEnsembleConfig")
-        if type_name != "WorldModelEnsembleConfig":
+        if not issubclass(type(config), Mapping):
+            raise ValueError("config must be an actual mapping")
+        try:
+            payload = dict(config)
+        except Exception as error:
+            raise ValueError("config must be a readable mapping") from error
+        if any(type(key) is not str for key in payload):
+            raise ValueError("config keys must be exact strings")
+        type_name = payload.pop("type", None)
+        if type_name is not None and (
+            type(type_name) is not str or type_name != "WorldModelEnsembleConfig"
+        ):
             raise ValueError("type must be WorldModelEnsembleConfig")
         if payload.pop("development_only", True) is not True:
             raise ValueError("world-model ensemble is development_only")
         if payload.pop("accepted_scientific_evidence", False) is not False:
             raise ValueError("world-model ensemble is not accepted scientific evidence")
-        model = ActionConditionedWorldModelConfig.from_config(
-            cast(dict[str, Any], payload.pop("model"))
-        )
-        signal_estimator = LearningSignalEstimatorConfig.from_config(
-            cast(dict[str, Any], payload.pop("signal_estimator"))
-        )
+        raw_model = payload.pop("model")
+        raw_signals = payload.pop("signal_estimator")
+        if not issubclass(type(raw_model), Mapping) or not issubclass(
+            type(raw_signals), Mapping
+        ):
+            raise ValueError("nested configs must be actual mappings")
+        model = ActionConditionedWorldModelConfig.from_config(raw_model)
+        try:
+            signal_payload = dict(raw_signals)
+        except Exception as error:
+            raise ValueError("signal_estimator must be a readable mapping") from error
+        if any(type(key) is not str for key in signal_payload):
+            raise ValueError("signal_estimator keys must be exact strings")
+        signal_estimator = LearningSignalEstimatorConfig.from_config(signal_payload)
         return cls(model=model, signal_estimator=signal_estimator, **payload)
 
 
@@ -258,6 +399,154 @@ class WorldModelEnsembleResourceBudget:
     max_replay_event_count: int
     max_replay_member_update_count: int
     replay_capacity: int
+
+    def __post_init__(self) -> None:
+        for name in (
+            "ensemble_size",
+            "observation_dim",
+            "target_dim",
+            "member_state_scalars_per_member",
+            "member_state_bytes_per_member",
+            "member_trainable_scalars",
+            "total_trainable_scalars",
+            "persistent_float32_scalars",
+            "persistent_float64_scalars",
+            "persistent_int32_scalars",
+            "persistent_int64_scalars",
+            "persistent_uint32_scalars",
+            "persistent_bool_scalars",
+            "persistent_state_scalars",
+            "persistent_state_bytes",
+            "bootstrap_prng_keys",
+            "bootstrap_prng_uint32_scalars",
+            "bootstrap_prng_bytes",
+            "prediction_output_logical_scalars",
+            "prediction_output_logical_bytes",
+            "update_result_output_logical_scalars",
+            "update_result_output_logical_bytes",
+            "replay_update_result_output_logical_scalars",
+            "replay_update_result_output_logical_bytes",
+            "member_update_candidates_per_valid_event",
+            "max_member_updates_per_event",
+            "replay_member_update_candidates_per_available_sample",
+            "max_replay_member_updates_per_available_sample",
+            "max_event_count",
+            "max_member_update_count",
+            "max_replay_event_count",
+            "max_replay_member_update_count",
+            "replay_capacity",
+        ):
+            object.__setattr__(
+                self,
+                name,
+                _require_int(name, getattr(self, name), minimum=0, maximum=_INT32_MAX),
+            )
+        if self.ensemble_size < 2:
+            raise ValueError("ensemble_size must be at least two")
+        if self.observation_dim < 1:
+            raise ValueError("observation_dim must be positive")
+        if self.member_state_scalars_per_member <= 4 or self.member_trainable_scalars < 1:
+            raise ValueError("member state and trainable scalar counts must be positive")
+        if self.member_trainable_scalars > self.member_state_scalars_per_member - 4:
+            raise ValueError("member_trainable_scalars cannot exceed member state scalars")
+        expected = {
+            "target_dim": self.observation_dim + 2,
+            "member_state_bytes_per_member": 4 * self.member_state_scalars_per_member,
+            "total_trainable_scalars": self.ensemble_size * self.member_trainable_scalars,
+            "persistent_float32_scalars": (
+                self.ensemble_size * (self.member_state_scalars_per_member - 4)
+                + self.ensemble_size * self.target_dim
+                + 5
+            ),
+            "persistent_float64_scalars": 0,
+            "persistent_int32_scalars": 4 * self.ensemble_size + 6,
+            "persistent_int64_scalars": 0,
+            "persistent_uint32_scalars": 2 * self.ensemble_size + 4,
+            "persistent_bool_scalars": 2 * self.ensemble_size,
+            "persistent_state_scalars": (
+                self.ensemble_size * self.member_state_scalars_per_member
+                + self.ensemble_size * self.target_dim
+                + 4 * self.ensemble_size
+                + 15
+            ),
+            "persistent_state_bytes": (
+                self.ensemble_size * self.member_state_bytes_per_member
+                + 4 * self.ensemble_size * self.target_dim
+                + 10 * self.ensemble_size
+                + 60
+            ),
+            "bootstrap_prng_keys": 2,
+            "bootstrap_prng_uint32_scalars": 4,
+            "bootstrap_prng_bytes": 16,
+            "member_update_candidates_per_valid_event": self.ensemble_size,
+            "max_member_updates_per_event": self.ensemble_size,
+            "replay_member_update_candidates_per_available_sample": self.ensemble_size,
+            "max_replay_member_updates_per_available_sample": self.ensemble_size,
+            "max_event_count": _INT32_MAX,
+            "max_member_update_count": _INT32_MAX,
+            "max_replay_event_count": _INT32_MAX,
+            "max_replay_member_update_count": _INT32_MAX,
+            "replay_capacity": 0,
+        }
+        prediction_float_scalars = (
+            2 * self.ensemble_size * self.target_dim
+            + self.ensemble_size * self.observation_dim
+            + 2 * self.target_dim
+            + self.observation_dim
+            + 2 * self.ensemble_size
+            + 3
+        )
+        expected["prediction_output_logical_scalars"] = prediction_float_scalars + 2
+        expected["prediction_output_logical_bytes"] = 4 * prediction_float_scalars + 2
+        update_float_scalars = (
+            prediction_float_scalars
+            + self.target_dim
+            + self.ensemble_size
+            + self.observation_dim
+            + 10
+        )
+        update_bool_scalars = 2 * self.ensemble_size + 20
+        expected["update_result_output_logical_scalars"] = (
+            self.persistent_state_scalars + update_float_scalars + update_bool_scalars
+        )
+        expected["update_result_output_logical_bytes"] = (
+            self.persistent_state_bytes + 4 * update_float_scalars + update_bool_scalars
+        )
+        replay_float_scalars = (
+            prediction_float_scalars + self.target_dim + self.ensemble_size + 1
+        )
+        replay_bool_scalars = 2 * self.ensemble_size + 12
+        expected["replay_update_result_output_logical_scalars"] = (
+            self.persistent_state_scalars + replay_float_scalars + replay_bool_scalars
+        )
+        expected["replay_update_result_output_logical_bytes"] = (
+            self.persistent_state_bytes + 4 * replay_float_scalars + replay_bool_scalars
+        )
+        dtype_scalars = (
+            self.persistent_float32_scalars
+            + self.persistent_float64_scalars
+            + self.persistent_int32_scalars
+            + self.persistent_int64_scalars
+            + self.persistent_uint32_scalars
+            + self.persistent_bool_scalars
+        )
+        if dtype_scalars != self.persistent_state_scalars:
+            raise ValueError(
+                "persistent dtype scalar counts do not sum to persistent_state_scalars"
+            )
+        dtype_bytes = (
+            4 * self.persistent_float32_scalars
+            + 8 * self.persistent_float64_scalars
+            + 4 * self.persistent_int32_scalars
+            + 8 * self.persistent_int64_scalars
+            + 4 * self.persistent_uint32_scalars
+            + self.persistent_bool_scalars
+        )
+        if dtype_bytes != self.persistent_state_bytes:
+            raise ValueError("persistent dtype byte counts do not sum to persistent_state_bytes")
+        for name, value in expected.items():
+            if getattr(self, name) != value:
+                raise ValueError(f"{name} does not match the world-model ensemble implementation")
 
     def to_config(self) -> dict[str, int]:
         """Return a JSON-compatible exact accounting record."""
@@ -551,6 +840,8 @@ class WorldModelEnsemble:
     """Fixed-size bootstrap ensemble with causal typed learning signals."""
 
     def __init__(self, config: WorldModelEnsembleConfig):
+        if type(config) is not WorldModelEnsembleConfig:
+            raise ValueError("config must be an exact WorldModelEnsembleConfig")
         self._config = config
         self._model = ActionConditionedWorldModel(config.model)
         self._signals = LearningSignalEstimator(config.signal_estimator)
@@ -580,15 +871,27 @@ class WorldModelEnsemble:
         }
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> WorldModelEnsemble:
+    def from_config(cls, config: Mapping[str, Any]) -> WorldModelEnsemble:
         """Reconstruct from :meth:`to_config` output."""
-        payload = dict(config)
-        type_name = payload.pop("type", "WorldModelEnsemble")
-        if type_name != "WorldModelEnsemble":
+        if not issubclass(type(config), Mapping):
+            raise ValueError("ensemble payload must be an actual mapping")
+        try:
+            payload = dict(config)
+        except Exception as error:
+            raise ValueError("ensemble payload must be a readable mapping") from error
+        if any(type(key) is not str for key in payload):
+            raise ValueError("ensemble payload keys must be exact strings")
+        type_name = payload.pop("type", None)
+        if type_name is not None and (
+            type(type_name) is not str or type_name != "WorldModelEnsemble"
+        ):
             raise ValueError("type must be WorldModelEnsemble")
         if set(payload) != {"config"}:
             raise ValueError("world-model ensemble config keys are invalid")
-        return cls(WorldModelEnsembleConfig.from_config(cast(dict[str, Any], payload["config"])))
+        nested = payload["config"]
+        if not issubclass(type(nested), Mapping):
+            raise ValueError("nested ensemble config must be an actual mapping")
+        return cls(WorldModelEnsembleConfig.from_config(nested))
 
     def init(self, key: Array) -> WorldModelEnsembleState:
         """Initialize distinct members and isolated real/replay mask streams."""
@@ -676,7 +979,10 @@ class WorldModelEnsemble:
             raise TypeError("bootstrap PRNG key storage must use uint32 words")
         bootstrap_words = int(bootstrap_key_data.size + replay_key_data.size)
         bootstrap_bytes = int(bootstrap_key_data.nbytes + replay_key_data.nbytes)
-        if persistent.uint32_scalars != bootstrap_words or bootstrap_bytes != 4 * bootstrap_words:
+        expected_uint32 = (
+            bootstrap_words + member_account.uint32_scalars * self._config.ensemble_size
+        )
+        if persistent.uint32_scalars != expected_uint32 or bootstrap_bytes != 4 * bootstrap_words:
             raise ValueError("bootstrap PRNG key accounting does not match state")
 
         prediction = _logical_tree_accounting(self._zero_prediction())
@@ -935,25 +1241,39 @@ class WorldModelEnsemble:
         )
         rewards = jnp.stack([prediction.reward for prediction in predictions])
         discounts = jnp.stack([prediction.discount for prediction in predictions])
-        per_head_epistemic = jnp.var(raw, axis=0)
+        mean_raw = _safe_mean(raw, axis=0)
+        mean_next_observation = _safe_mean(next_observations, axis=0)
+        mean_reward = _safe_mean(rewards)
+        mean_discount = _safe_mean(discounts)
+        per_head_epistemic = _safe_mean(jnp.square(raw - mean_raw[None, :]), axis=0)
+        epistemic_disagreement = _safe_mean(per_head_epistemic)
+        aggregates_finite = (
+            jnp.all(jnp.isfinite(mean_raw))
+            & jnp.all(jnp.isfinite(mean_next_observation))
+            & jnp.isfinite(mean_reward)
+            & jnp.isfinite(mean_discount)
+            & jnp.all(jnp.isfinite(per_head_epistemic))
+            & jnp.isfinite(epistemic_disagreement)
+        )
         finite = (
             jnp.all(jnp.isfinite(raw))
             & jnp.all(jnp.isfinite(next_observations))
             & jnp.all(jnp.isfinite(rewards))
             & jnp.all(jnp.isfinite(discounts))
             & jnp.all(jnp.abs(raw) <= self._config.signal_estimator.max_input_magnitude)
+            & aggregates_finite
         )
         return WorldModelEnsemblePrediction(
             member_raw_predictions=raw,
-            mean_raw_prediction=jnp.mean(raw, axis=0),
+            mean_raw_prediction=mean_raw,
             member_next_observations=next_observations,
-            mean_next_observation=jnp.mean(next_observations, axis=0),
+            mean_next_observation=mean_next_observation,
             member_rewards=rewards,
-            mean_reward=jnp.mean(rewards),
+            mean_reward=mean_reward,
             member_discounts=discounts,
-            mean_discount=jnp.mean(discounts),
+            mean_discount=mean_discount,
             per_head_epistemic_variance=per_head_epistemic,
-            epistemic_disagreement=jnp.mean(per_head_epistemic),
+            epistemic_disagreement=epistemic_disagreement,
             residual_variances=state.residual_variances,
             residual_proxy_ready=(state.event_count >= self._config.residual_variance_warmup_steps),
             valid=finite,
@@ -984,10 +1304,15 @@ class WorldModelEnsemble:
 
         def do_predict(_: None) -> WorldModelEnsemblePrediction:
             result = self._predict_unchecked(state, obs, act)
-            return dataclasses.replace(
-                result,
-                valid=result.valid & valid,
-            )  # type: ignore[type-var]
+            result_valid = result.valid & valid
+            return cast(
+                WorldModelEnsemblePrediction,
+                jax.lax.cond(
+                    result_valid,
+                    lambda: dataclasses.replace(cast(Any, result), valid=result_valid),
+                    self._zero_prediction,
+                ),
+            )
 
         return cast(
             WorldModelEnsemblePrediction,
@@ -1181,8 +1506,8 @@ class WorldModelEnsemble:
             targets = self._model.targets(obs, rew, disc, next_obs)
             residuals = prediction.member_raw_predictions - targets[None, :]
             squared_residuals = jnp.square(residuals)
-            member_losses = jnp.mean(squared_residuals, axis=1)
-            observed_loss = jnp.mean(member_losses)
+            member_losses = _safe_mean(squared_residuals, axis=1)
+            observed_loss = _safe_mean(member_losses)
             signal_cfg = self._config.signal_estimator
             predictions_valid = (
                 prediction.valid
@@ -1361,7 +1686,7 @@ class WorldModelEnsemble:
                     act,
                 )
                 residual = preupdate_prediction.member_raw_predictions - stopped_targets[None, :]
-                return 0.5 * jnp.mean(jnp.square(residual)), preupdate_prediction
+                return 0.5 * _safe_mean(jnp.square(residual)), preupdate_prediction
 
             (
                 (representation_objective, prediction),
@@ -1369,8 +1694,8 @@ class WorldModelEnsemble:
             ) = jax.value_and_grad(representation_loss, has_aux=True)(obs)
             residuals = prediction.member_raw_predictions - stopped_targets[None, :]
             squared_residuals = jnp.square(residuals)
-            member_losses = jnp.mean(squared_residuals, axis=1)
-            observed_loss = jnp.mean(member_losses)
+            member_losses = _safe_mean(squared_residuals, axis=1)
+            observed_loss = _safe_mean(member_losses)
             signal_cfg = self._config.signal_estimator
             predictions_valid = (
                 prediction.valid
@@ -1512,7 +1837,10 @@ class WorldModelEnsemble:
             )
             return WorldModelEnsembleUpdateResult(
                 state=next_state,
-                prediction=prediction,
+                prediction=cast(
+                    WorldModelEnsemblePrediction,
+                    jax.lax.cond(applied, lambda: prediction, self._zero_prediction),
+                ),
                 signals=reported_signals,
                 targets=jnp.where(applied, targets, zero_target),
                 observed_loss=jnp.where(applied, observed_loss, 0.0),

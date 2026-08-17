@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import configparser
 import importlib
 import json
+import os
 import shutil
 import subprocess
+import sys
 import tarfile
 import tomllib
 import zipfile
@@ -35,15 +38,48 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 provenance_module = importlib.import_module(
     "alberta_framework.benchmarks.historical_forager_provenance"
 )
-_DISTRIBUTION_FILES = (
-    "alberta_framework/benchmarks/__init__.py",
-    "alberta_framework/benchmarks/_official_foragax_oci_cli.py",
-    "alberta_framework/benchmarks/historical_forager.py",
-    "alberta_framework/benchmarks/historical_forager_provenance.py",
-    "alberta_framework/console_entrypoints.py",
-    "alberta_framework/forager_cli.py",
+_WHEEL_FILES = tuple(
+    path.relative_to(_REPO_ROOT).as_posix()
+    for path in sorted((_REPO_ROOT / "alberta_framework").rglob("*"))
+    if path.is_file()
+    and "__pycache__" not in path.parts
+    and (path.suffix == ".py" or path.name == "py.typed")
 )
-_SDIST_ONLY_FILES = ("VENDORING.md",)
+_EXPECTED_SCRIPT_NAMES = {
+    "alberta-evidence-status",
+    "alberta-forager-benchmark",
+    "alberta-forager-matched-campaign",
+    "alberta-forager-matched-qualification",
+    "alberta-forager-matched-sealed-evaluation",
+    "alberta-foragax-oci",
+    "alberta-foragax-open-screen",
+    "alberta-ftl-evidence",
+    "alberta-historical-forager",
+    "alberta-ia-evidence",
+    "alberta-multiagent-evidence",
+    "alberta-recurring-feature-evidence",
+    "alberta-scale-robust-evidence",
+    "alberta-step1-smoke",
+    "alberta-step2-smoke",
+}
+_HARD_LINK_SENSITIVE_SOURCES = (
+    "alberta_framework/benchmarks/official_foragax.py",
+    "alberta_framework/benchmarks/runtime_profile.py",
+    "alberta_framework/benchmarks/forager_results.py",
+)
+_SDIST_EXTRA_FILES = (
+    "CHANGELOG.md",
+    "CITATION.cff",
+    "FORAGER_BENCHMARK.md",
+    "LICENSE",
+    "README.md",
+    "VENDORING.md",
+    "pyproject.toml",
+    *(
+        path.relative_to(_REPO_ROOT).as_posix()
+        for path in sorted((_REPO_ROOT / "docs").rglob("*.md"))
+    ),
+)
 
 
 class _TinyHistoricalEnvironment:
@@ -183,42 +219,52 @@ def test_historical_cli_reports_provenance_and_validates_strict_pairing(
     assert "must be a real directory" in missing.stderr
 
 
-def test_wheel_and_sdist_ship_historical_code_and_entrypoint(tmp_path: Path) -> None:
+@pytest.mark.package
+def test_wheel_and_sdist_are_complete_and_hard_link_safe(tmp_path: Path) -> None:
     uv = shutil.which("uv")
     if uv is None:
-        pytest.skip("uv is required for the distribution integration check")
-    output_directory = tmp_path / "dist"
-    build_arguments = (
-        uv,
-        "build",
-        "--no-build-logs",
-        "--no-create-gitignore",
-        "--no-python-downloads",
-        "--out-dir",
-        str(output_directory),
-        str(_REPO_ROOT),
-    )
-    completed = subprocess.run(
-        (*build_arguments[:2], "--offline", *build_arguments[2:]),
-        cwd=_REPO_ROOT,
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
-    if completed.returncode != 0 and "network was disabled" in completed.stderr:
+        interpreter_bin = str(Path(sys.executable).parent)
+        uv = shutil.which("uv", path=interpreter_bin)
+    if uv is None:
+        pytest.fail("uv is required; install the project's dev dependencies")
+    prebuilt_directory = os.environ.get("ALBERTA_PREBUILT_DIST_DIR")
+    if prebuilt_directory:
+        output_directory = Path(prebuilt_directory)
+    else:
+        output_directory = tmp_path / "dist"
+        build_arguments = [uv, "build", "--no-build-isolation"]
+        if os.environ.get("ALBERTA_PACKAGE_BUILD_ALLOW_NETWORK") != "1":
+            build_arguments.append("--offline")
+        build_arguments.extend(
+            (
+                "--no-build-logs",
+                "--no-create-gitignore",
+                "--no-python-downloads",
+                "--out-dir",
+                str(output_directory),
+                str(_REPO_ROOT),
+            )
+        )
+        build_environment = os.environ.copy()
+        build_environment["VIRTUAL_ENV"] = sys.prefix
+        build_environment["PATH"] = os.pathsep.join(
+            (str(Path(sys.executable).parent), build_environment.get("PATH", ""))
+        )
         completed = subprocess.run(
             build_arguments,
             cwd=_REPO_ROOT,
+            env=build_environment,
             check=False,
             capture_output=True,
             text=True,
             timeout=120,
         )
-    assert completed.returncode == 0, completed.stderr
+        assert completed.returncode == 0, completed.stderr
 
     project = tomllib.loads((_REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     version = project["project"]["version"]
+    expected_scripts = project["project"]["scripts"]
+    assert set(expected_scripts) == _EXPECTED_SCRIPT_NAMES
     wheel_path = output_directory / f"alberta_framework-{version}-py3-none-any.whl"
     sdist_path = output_directory / f"alberta_framework-{version}.tar.gz"
     assert wheel_path.is_file()
@@ -226,22 +272,148 @@ def test_wheel_and_sdist_ship_historical_code_and_entrypoint(tmp_path: Path) -> 
 
     with zipfile.ZipFile(wheel_path) as wheel:
         wheel_names = set(wheel.namelist())
-        for relative_path in _DISTRIBUTION_FILES:
+        for relative_path in _WHEEL_FILES:
             assert relative_path in wheel_names
+            assert wheel.read(relative_path) == (_REPO_ROOT / relative_path).read_bytes()
         entry_points_name = next(
             name for name in wheel_names if name.endswith(".dist-info/entry_points.txt")
         )
-        entry_points = wheel.read(entry_points_name).decode("utf-8")
-        assert (
-            "alberta-historical-forager = "
-            "alberta_framework.console_entrypoints:historical_forager_main"
-            in entry_points
-        )
-        assert "alberta-foragax-oci" in entry_points
+        entry_points = configparser.ConfigParser(interpolation=None)
+        entry_points.optionxform = str
+        entry_points.read_string(wheel.read(entry_points_name).decode("utf-8"))
+        assert dict(entry_points["console_scripts"]) == expected_scripts
+
+    install_directory = tmp_path / "wheel-install"
+    install_environment = os.environ.copy()
+    install_environment["UV_CACHE_DIR"] = str(tmp_path / "uv-cache")
+    installed = subprocess.run(
+        (
+            uv,
+            "pip",
+            "install",
+            "--offline",
+            "--no-python-downloads",
+            "--link-mode",
+            "hardlink",
+            "--target",
+            str(install_directory),
+            "--no-deps",
+            str(wheel_path),
+        ),
+        cwd=tmp_path,
+        env=install_environment,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert installed.returncode == 0, installed.stderr
+
+    for relative_path in _HARD_LINK_SENSITIVE_SOURCES:
+        source = install_directory / relative_path
+        assert source.stat().st_nlink >= 2
+
+    probe = """
+import contextlib
+import importlib.metadata
+import io
+import json
+from pathlib import Path
+import sys
+
+import alberta_framework
+
+install_root = Path(sys.argv[1]).resolve()
+package_path = Path(alberta_framework.__file__).resolve()
+if install_root not in package_path.parents:
+    raise SystemExit(f"source checkout shadowed installed wheel: {package_path}")
+
+distribution = importlib.metadata.distribution("alberta-framework")
+distribution_root = Path(distribution.locate_file("")).resolve()
+if distribution_root != install_root:
+    raise SystemExit(f"wrong distribution loaded: {distribution_root}")
+
+entry_points = sorted(distribution.entry_points, key=lambda item: item.name)
+console_scripts = [item for item in entry_points if item.group == "console_scripts"]
+for entry_point in console_scripts:
+    entry_point.load()
+
+official_module = "alberta_framework.benchmarks.official_foragax"
+if official_module in sys.modules:
+    raise SystemExit("entry-point loading eagerly imported the official verifier")
+
+historical = next(
+    item for item in console_scripts if item.name == "alberta-historical-forager"
+)
+original_argv = sys.argv
+sys.argv = ["alberta-historical-forager", "provenance"]
+try:
+    historical_output = io.StringIO()
+    historical_errors = io.StringIO()
+    with (
+        contextlib.redirect_stdout(historical_output),
+        contextlib.redirect_stderr(historical_errors),
+    ):
+        historical_status = historical.load()()
+finally:
+    sys.argv = original_argv
+historical_payload = json.loads(historical_output.getvalue())
+
+if official_module in sys.modules:
+    raise SystemExit("historical inspection imported the official verifier")
+
+strict = next(item for item in console_scripts if item.name == "alberta-foragax-oci")
+try:
+    strict.load()()
+except Exception as error:
+    strict_failure = {"message": str(error), "type": type(error).__name__}
+else:
+    raise SystemExit("scientific implementation accepted hard-linked source files")
+
+print(
+    json.dumps(
+        {
+            "historical_errors": historical_errors.getvalue(),
+            "historical_family": historical_payload["family_id"],
+            "historical_status": historical_status,
+            "names": [item.name for item in console_scripts],
+            "strict_failure": strict_failure,
+        }
+    )
+)
+"""
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(install_directory)
+    loaded = subprocess.run(
+        (sys.executable, "-c", probe, str(install_directory)),
+        cwd=tmp_path,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert loaded.returncode == 0, loaded.stderr
+    smoke = json.loads(loaded.stdout)
+    assert smoke["names"] == sorted(expected_scripts)
+    assert smoke["historical_status"] == 0
+    assert smoke["historical_errors"] == ""
+    assert smoke["historical_family"] == HISTORICAL_FORAGER_FAMILY_ID
+    assert smoke["strict_failure"] == {
+        "message": (
+            "official harness source "
+            "alberta_framework/benchmarks/official_foragax.py must not have external "
+            "hard-link aliases"
+        ),
+        "type": "OfficialForagaxValidationError",
+    }
 
     prefix = f"alberta_framework-{version}"
     with tarfile.open(sdist_path, mode="r:gz") as source_distribution:
         sdist_names = set(source_distribution.getnames())
-        for relative_path in (*_DISTRIBUTION_FILES, *_SDIST_ONLY_FILES):
+        for relative_path in (*_WHEEL_FILES, *_SDIST_EXTRA_FILES):
             archived_path = f"{prefix}/{relative_path}"
             assert archived_path in sdist_names
+            extracted = source_distribution.extractfile(archived_path)
+            assert extracted is not None
+            assert extracted.read() == (_REPO_ROOT / relative_path).read_bytes()

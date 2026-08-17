@@ -1,15 +1,25 @@
 """Production facade tests for Alberta Plan Steps 5, 6, and 7."""
 
+from __future__ import annotations
+
+import json
+from fractions import Fraction
+from typing import Any
+
 import chex
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
+import pytest
 
 from alberta_framework.steps import (
     Step5AverageRewardTDConfig,
     Step6DifferentialSARSAConfig,
+    Step6SmokeResult,
     Step7DynaConfig,
     Step8WorldModelConfig,
+    Step9DreamingConfig,
     init_step6_state,
     init_step7_state,
     make_step5_td_learner,
@@ -22,6 +32,8 @@ from alberta_framework.steps import (
     step6_update,
     step7_update,
 )
+from alberta_framework.steps import step5 as step5_module
+from alberta_framework.steps import step6 as step6_module
 from alberta_framework.steps.step7 import (
     _apply_planning_importance_correction,
     _pop_prioritized_planning_anchor,
@@ -42,12 +54,208 @@ def test_step5_facade_config_roundtrip_and_smoke() -> None:
     result = run_step5_smoke(config, steps=12, feature_dim=3)
 
     assert restored == config
+    assert config.to_dict() == {
+        "step_size": 0.03,
+        "average_reward_step_size": 0.02,
+        "trace_decay": 0.25,
+    }
     assert learner.config.trace_decay == 0.25
     assert result.finite
     assert result.predictions_shape == (12,)
     assert result.td_errors_shape == (12,)
     assert result.average_rewards_shape == (12,)
     assert result.learner_config["type"] == "DifferentialTDLearner"
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["step_size", "average_reward_step_size", "trace_decay"],
+)
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        True,
+        False,
+        "0.1",
+        None,
+        0.1 + 0.0j,
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+        3.5e38,
+        -3.5e38,
+    ],
+)
+def test_step5_config_rejects_malformed_scientific_scalars(
+    field: str,
+    malformed: object,
+) -> None:
+    payload: dict[str, object] = {
+        "step_size": 0.05,
+        "average_reward_step_size": 0.01,
+        "trace_decay": 0.0,
+    }
+    payload[field] = malformed
+
+    with pytest.raises(ValueError, match=field):
+        Step5AverageRewardTDConfig(**payload)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match=field):
+        Step5AverageRewardTDConfig.from_dict(payload)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("step_size", -0.01),
+        ("average_reward_step_size", -0.01),
+        ("trace_decay", -0.01),
+        ("trace_decay", 1.01),
+        ("step_size", Fraction(-1, 10**400)),
+        ("average_reward_step_size", Fraction(-1, 10**400)),
+        ("trace_decay", Fraction(-1, 10**400)),
+        ("trace_decay", Fraction(10**400 + 1, 10**400)),
+    ],
+)
+def test_step5_config_enforces_scientific_scalar_domains(field: str, value: object) -> None:
+    payload: dict[str, object] = {
+        "step_size": 0.05,
+        "average_reward_step_size": 0.01,
+        "trace_decay": 0.0,
+    }
+    payload[field] = value
+
+    with pytest.raises(ValueError, match=field):
+        Step5AverageRewardTDConfig(**payload)  # type: ignore[arg-type]
+
+
+def test_step5_config_accepts_finite_float32_boundary_and_domain_endpoints() -> None:
+    float32_max = 3.4028234663852886e38
+    config = Step5AverageRewardTDConfig(
+        step_size=float32_max,
+        average_reward_step_size=0,
+        trace_decay=1,
+    )
+
+    assert config.to_dict() == {
+        "step_size": float32_max,
+        "average_reward_step_size": 0,
+        "trace_decay": 1,
+    }
+
+
+def test_step5_config_uses_direct_float32_narrowing_at_overflow_boundary() -> None:
+    overflow_midpoint = np.ldexp(
+        np.longdouble(2) - np.ldexp(np.longdouble(1), -24),
+        127,
+    )
+    largest_finite_input = np.nextafter(
+        overflow_midpoint,
+        np.longdouble("-inf"),
+    )
+
+    config = Step5AverageRewardTDConfig(step_size=largest_finite_input)
+    learner = make_step5_td_learner(config)
+
+    assert bool(np.isfinite(np.asarray(config.step_size, dtype=np.float32)))
+    assert learner.config.step_size == config.step_size
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        Fraction(1, 4),
+        np.float32(0.25),
+        np.longdouble("0.25"),
+        np.int64(1),
+    ],
+)
+def test_step5_config_canonicalizes_accepted_real_scalars_for_json(value: object) -> None:
+    config = Step5AverageRewardTDConfig(
+        step_size=value,  # type: ignore[arg-type]
+        average_reward_step_size=value,  # type: ignore[arg-type]
+        trace_decay=value,  # type: ignore[arg-type]
+    )
+
+    payload = config.to_dict()
+    assert all(type(payload[field]) is float for field in payload)
+    encoded = json.dumps(payload, allow_nan=False, sort_keys=True)
+    restored = Step5AverageRewardTDConfig.from_dict(json.loads(encoded))
+    assert restored == config
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"step_size": 0.05, "average_reward_step_size": 0.01},
+        {
+            "step_size": 0.05,
+            "average_reward_step_size": 0.01,
+            "trace_decay": 0.0,
+            "unexpected": 1,
+        },
+    ],
+)
+def test_step5_config_from_dict_requires_exact_keys(payload: dict[str, object]) -> None:
+    expected = (
+        "Step5AverageRewardTDConfig payload keys must be exactly "
+        "['average_reward_step_size', 'step_size', 'trace_decay']"
+    )
+
+    with pytest.raises(ValueError) as exc_info:
+        Step5AverageRewardTDConfig.from_dict(payload)
+
+    assert str(exc_info.value) == expected
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (("steps", True), ("steps", 1.5), ("feature_dim", False), ("feature_dim", 1.5)),
+)
+def test_step5_smoke_rejects_non_integral_dimensions(field: str, value: Any) -> None:
+    with pytest.raises(ValueError, match=field):
+        run_step5_smoke(**{field: value})
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("steps", 0),
+        ("steps", 2**31),
+        ("feature_dim", 0),
+        ("feature_dim", 2**31),
+        ("seed", -1),
+        ("seed", 2**31),
+        ("seed", True),
+    ],
+)
+def test_step5_smoke_rejects_out_of_range_dimensions_and_seed(
+    field: str,
+    value: Any,
+) -> None:
+    with pytest.raises(ValueError, match=field):
+        run_step5_smoke(**{field: value})
+
+
+def test_step5_smoke_health_gate_reports_any_refused_update(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_run = step5_module.run_differential_td_from_arrays
+
+    def _refuse_updates(*args: Any, **kwargs: Any) -> Any:
+        result = original_run(*args, **kwargs)
+        return result.replace(  # type: ignore[attr-defined]
+            updates_applied=result.updates_applied.at[0].set(False)
+        )
+
+    monkeypatch.setattr(
+        step5_module,
+        "run_differential_td_from_arrays",
+        _refuse_updates,
+    )
+
+    result = run_step5_smoke(steps=3, feature_dim=2)
+
+    assert not result.finite
 
 
 def test_step6_facade_config_roundtrip_one_step_and_smoke() -> None:
@@ -81,6 +289,509 @@ def test_step6_facade_config_roundtrip_one_step_and_smoke() -> None:
     assert smoke.average_rewards_shape == (12,)
     assert smoke.actions_shape == (12,)
     assert smoke.agent_config["type"] == "DifferentialSARSAAgent"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (("steps", True), ("steps", 1.5), ("feature_dim", False), ("feature_dim", 1.5)),
+)
+def test_step6_smoke_rejects_non_integral_dimensions(field: str, value: Any) -> None:
+    with pytest.raises(ValueError, match=field):
+        run_step6_smoke(**{field: value})
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("steps", 0),
+        ("steps", 2**31),
+        ("feature_dim", 0),
+        ("feature_dim", 2**31),
+        ("seed", -1),
+        ("seed", 2**31),
+        ("seed", True),
+        ("steps", np.int64(2**31)),
+        ("feature_dim", np.int64(2**31)),
+        ("seed", np.int64(2**31)),
+        ("seed", np.int64(-1)),
+    ],
+)
+def test_step6_smoke_rejects_out_of_range_dimensions_and_seed(
+    field: str,
+    value: Any,
+) -> None:
+    with pytest.raises(ValueError, match=field):
+        run_step6_smoke(**{field: value})
+
+
+def _legal_step6_smoke_result(**overrides: object) -> Step6SmokeResult:
+    payload: dict[str, object] = {
+        "config": Step6DifferentialSARSAConfig(),
+        "steps": 8,
+        "seed": 0,
+        "q_values_shape": (8, 2),
+        "td_errors_shape": (8,),
+        "average_rewards_shape": (8,),
+        "actions_shape": (8,),
+        "finite": True,
+        "agent_config": {"ok": True},
+    }
+    payload.update(overrides)
+    return Step6SmokeResult(**payload)  # type: ignore[arg-type]
+
+
+def test_step6_smoke_result_rejects_leftover_identities() -> None:
+    """Public Step 6 smoke records must not keep leftover bool/int identities."""
+
+    with pytest.raises(ValueError, match="steps"):
+        _legal_step6_smoke_result(steps=True)
+    with pytest.raises(ValueError, match="steps"):
+        _legal_step6_smoke_result(steps=float("nan"))
+    with pytest.raises(ValueError, match="seed"):
+        _legal_step6_smoke_result(seed=True)
+    with pytest.raises(ValueError, match="finite"):
+        _legal_step6_smoke_result(finite=1)
+
+    legal = _legal_step6_smoke_result()
+    dumped = json.dumps(
+        {
+            "steps": legal.steps,
+            "seed": legal.seed,
+            "finite": legal.finite,
+        },
+        allow_nan=False,
+    )
+    assert '"steps": 8' in dumped
+    assert '"seed": 0' in dumped
+    assert '"finite": true' in dumped
+    assert '"steps": true' not in dumped
+    assert '"seed": true' not in dumped
+    assert '"finite": 1' not in dumped
+
+
+@pytest.mark.parametrize("feature_dim", [0, 2**31, True, np.int64(2**31)])
+def test_init_step6_state_rejects_invalid_feature_dim(feature_dim: Any) -> None:
+    agent = make_step6_differential_sarsa_agent()
+
+    with pytest.raises(ValueError, match="feature_dim"):
+        init_step6_state(
+            agent,
+            feature_dim=feature_dim,
+            key=jr.key(0),
+            initial_features=jnp.ones((1,), dtype=jnp.float32),
+        )
+
+
+_INVALID_STEP6_FIELDS: tuple[tuple[str, Any], ...] = (
+    ("n_actions", 0),
+    ("n_actions", -1),
+    ("n_actions", True),
+    ("n_actions", False),
+    ("n_actions", "2"),
+    ("n_actions", 2.5),
+    ("n_actions", float("nan")),
+    ("n_actions", float("inf")),
+    ("n_actions", None),
+    ("n_actions", 2**31),
+    ("q_step_size", float("nan")),
+    ("q_step_size", float("inf")),
+    ("q_step_size", float("-inf")),
+    ("q_step_size", True),
+    ("q_step_size", False),
+    ("q_step_size", -1.0),
+    ("q_step_size", 3.5e38),
+    ("q_step_size", "0.05"),
+    ("q_step_size", None),
+    ("average_reward_step_size", float("nan")),
+    ("average_reward_step_size", float("inf")),
+    ("average_reward_step_size", True),
+    ("average_reward_step_size", False),
+    ("average_reward_step_size", -0.01),
+    ("average_reward_step_size", 3.5e38),
+    ("average_reward_step_size", "0.01"),
+    ("average_reward_step_size", None),
+    ("trace_decay", float("nan")),
+    ("trace_decay", float("inf")),
+    ("trace_decay", True),
+    ("trace_decay", False),
+    ("trace_decay", -0.1),
+    ("trace_decay", 1.1),
+    ("trace_decay", "0.0"),
+    ("trace_decay", None),
+    ("epsilon_start", float("nan")),
+    ("epsilon_start", float("inf")),
+    ("epsilon_start", True),
+    ("epsilon_start", False),
+    ("epsilon_start", -0.1),
+    ("epsilon_start", 1.1),
+    ("epsilon_start", "0.1"),
+    ("epsilon_start", None),
+    ("epsilon_end", float("nan")),
+    ("epsilon_end", float("inf")),
+    ("epsilon_end", True),
+    ("epsilon_end", False),
+    ("epsilon_end", -0.1),
+    ("epsilon_end", 1.1),
+    ("epsilon_end", "0.01"),
+    ("epsilon_end", None),
+    ("epsilon_decay_steps", -1),
+    ("epsilon_decay_steps", 2**31),
+    ("epsilon_decay_steps", True),
+    ("epsilon_decay_steps", False),
+    ("epsilon_decay_steps", "0"),
+    ("epsilon_decay_steps", 1.5),
+    ("epsilon_decay_steps", float("nan")),
+    ("epsilon_decay_steps", float("inf")),
+    ("epsilon_decay_steps", None),
+)
+
+
+@pytest.mark.parametrize(("field", "value"), _INVALID_STEP6_FIELDS)
+def test_step6_fields_reject_invalid_inputs(field: str, value: object) -> None:
+    with pytest.raises(ValueError, match=field):
+        Step6DifferentialSARSAConfig(**{field: value})
+
+
+def test_step6_fields_preserve_legal_endpoints() -> None:
+    config = Step6DifferentialSARSAConfig(
+        n_actions=1,
+        q_step_size=0.0,
+        average_reward_step_size=0.0,
+        trace_decay=0.0,
+        epsilon_start=0.0,
+        epsilon_end=0.0,
+        epsilon_decay_steps=0,
+    )
+    agent = make_step6_differential_sarsa_agent(config)
+    payload = config.to_dict()
+    json.dumps(payload, allow_nan=False)
+    restored = Step6DifferentialSARSAConfig.from_dict(payload)
+    assert restored.n_actions == 1
+    assert restored.q_step_size == 0.0
+    assert restored.average_reward_step_size == 0.0
+    assert restored.trace_decay == 0.0
+    assert restored.epsilon_start == 0.0
+    assert restored.epsilon_end == 0.0
+    assert restored.epsilon_decay_steps == 0
+    assert agent.config.n_actions == 1
+
+    upper = Step6DifferentialSARSAConfig(
+        n_actions=10,
+        q_step_size=1.0,
+        average_reward_step_size=1.0,
+        trace_decay=1.0,
+        epsilon_start=1.0,
+        epsilon_end=1.0,
+        epsilon_decay_steps=2**31 - 1,
+    )
+    make_step6_differential_sarsa_agent(upper)
+    assert upper.trace_decay == 1.0
+    assert upper.epsilon_start == 1.0
+    assert upper.epsilon_end == 1.0
+    assert upper.epsilon_decay_steps == 2**31 - 1
+
+
+def test_step6_fields_canonicalize_nonbuiltin_numbers() -> None:
+    value = np.float64(0.05)
+    config = Step6DifferentialSARSAConfig(
+        n_actions=np.int64(3),
+        q_step_size=value,
+        average_reward_step_size=value,
+        trace_decay=value,
+        epsilon_start=value,
+        epsilon_end=value,
+        epsilon_decay_steps=np.int64(100),
+    )
+    agent = make_step6_differential_sarsa_agent(config)
+    payload = config.to_dict()
+    json.dumps(payload, allow_nan=False)
+    assert config.n_actions == 3
+    assert config.q_step_size == float(np.float32(0.05))
+    assert config.epsilon_decay_steps == 100
+    assert type(payload["n_actions"]) is int
+    assert type(payload["epsilon_decay_steps"]) is int
+    assert type(payload["q_step_size"]) is float
+    assert type(payload["average_reward_step_size"]) is float
+    assert type(payload["trace_decay"]) is float
+    assert type(payload["epsilon_start"]) is float
+    assert type(payload["epsilon_end"]) is float
+    assert agent.config.n_actions == 3
+
+
+def test_step6_fields_canonicalize_longdouble_and_fraction_scalars() -> None:
+    config = Step6DifferentialSARSAConfig(
+        q_step_size=np.longdouble("0.05"),
+        average_reward_step_size=np.longdouble("0.01"),
+        trace_decay=Fraction(1, 3),
+        epsilon_start=Fraction(1, 10),
+        epsilon_end=np.longdouble("0.01"),
+    )
+    fields = (
+        "q_step_size",
+        "average_reward_step_size",
+        "trace_decay",
+        "epsilon_start",
+        "epsilon_end",
+    )
+    for field in fields:
+        assert type(getattr(config, field)) is float, field
+    assert config.q_step_size == float(np.float32(0.05))
+    assert config.trace_decay == float(np.float32(1.0 / 3.0))
+    assert config.epsilon_start == float(np.float32(0.1))
+    payload = config.to_dict()
+    json.dumps(payload, allow_nan=False)
+    for field in fields:
+        assert type(payload[field]) is float, field
+    restored = Step6DifferentialSARSAConfig.from_dict(payload)
+    assert restored == config
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("q_step_size", Fraction(-1, 10**400)),
+        ("average_reward_step_size", Fraction(-1, 10**400)),
+        ("trace_decay", Fraction(-1, 10**400)),
+        ("trace_decay", Fraction(10**400 + 1, 10**400)),
+        ("epsilon_start", Fraction(-1, 10**400)),
+        ("epsilon_start", Fraction(10**400 + 1, 10**400)),
+        ("epsilon_end", Fraction(-1, 10**400)),
+        ("epsilon_end", Fraction(10**400 + 1, 10**400)),
+    ],
+)
+def test_step6_fields_enforce_exact_scientific_domains(
+    field: str,
+    value: object,
+) -> None:
+    with pytest.raises(ValueError, match=field):
+        Step6DifferentialSARSAConfig(**{field: value})
+
+
+@pytest.mark.parametrize(
+    ("field", "ratio"),
+    [
+        ("q_step_size", (-1, 2**200)),
+        ("average_reward_step_size", (-1, 2**200)),
+        ("trace_decay", (-1, 2**200)),
+        ("trace_decay", (2**200 + 1, 2**200)),
+        ("epsilon_start", (-1, 2**200)),
+        ("epsilon_start", (2**200 + 1, 2**200)),
+        ("epsilon_end", (-1, 2**200)),
+        ("epsilon_end", (2**200 + 1, 2**200)),
+    ],
+)
+def test_step6_fields_reject_hostile_exact_ratio_domains(
+    field: str,
+    ratio: tuple[int, int],
+) -> None:
+    class HostileRatioFloat(float):
+        def as_integer_ratio(self) -> tuple[int, int]:
+            return ratio
+
+    with pytest.raises(ValueError, match=field):
+        Step6DifferentialSARSAConfig(**{field: HostileRatioFloat(0.5)})
+
+
+def test_step6_exact_ratio_is_read_once() -> None:
+    class StatefulRatioFloat(float):
+        calls = 0
+
+        def as_integer_ratio(self) -> tuple[int, int]:
+            type(self).calls += 1
+            if type(self).calls == 1:
+                return (1, 2)
+            return (-1, 1)
+
+    config = Step6DifferentialSARSAConfig(q_step_size=StatefulRatioFloat(0.5))
+
+    assert StatefulRatioFloat.calls == 1
+    assert config.q_step_size == 0.5
+
+
+def test_step6_class_spoof_cannot_bypass_exact_ratio_dispatch() -> None:
+    class IntegralSpoofFloat(float):
+        calls = 0
+
+        @property
+        def __class__(self) -> type[int]:
+            return int
+
+        def as_integer_ratio(self) -> tuple[int, int]:
+            type(self).calls += 1
+            return (-1, 2**200)
+
+    with pytest.raises(ValueError, match="q_step_size"):
+        Step6DifferentialSARSAConfig(q_step_size=IntegralSpoofFloat(0.5))
+    assert IntegralSpoofFloat.calls == 1
+
+
+@pytest.mark.parametrize("field", ["n_actions", "epsilon_decay_steps"])
+def test_step6_integer_fields_reject_class_spoof(field: str) -> None:
+    class IntegerSpoof:
+        @property
+        def __class__(self) -> type[int]:
+            return int
+
+        def __int__(self) -> int:
+            return 2
+
+    with pytest.raises(ValueError, match=field):
+        Step6DifferentialSARSAConfig(**{field: IntegerSpoof()})
+
+
+@pytest.mark.parametrize(
+    "config_type",
+    [
+        pytest.param(Step7DynaConfig, id="step7"),
+        pytest.param(Step9DreamingConfig, id="step9"),
+    ],
+)
+def test_nested_step6_payload_refuses_integral_class_spoof(
+    config_type: type[Step7DynaConfig] | type[Step9DreamingConfig],
+) -> None:
+    class IntegralSpoofFloat(float):
+        calls = 0
+
+        @property
+        def __class__(self) -> type[int]:
+            return int
+
+        def as_integer_ratio(self) -> tuple[int, int]:
+            type(self).calls += 1
+            return (-1, 2**200)
+
+    payload = config_type().to_dict()
+    control = payload["control"]
+    assert isinstance(control, dict)
+    control["q_step_size"] = IntegralSpoofFloat(0.5)
+
+    with pytest.raises(ValueError, match="q_step_size"):
+        config_type.from_dict(payload)
+    assert IntegralSpoofFloat.calls == 1
+
+
+def test_step6_builtin_float_serialization_and_signed_zero_are_preserved() -> None:
+    config = Step6DifferentialSARSAConfig(
+        q_step_size=0.1,
+        average_reward_step_size=-0.0,
+        trace_decay=-0.0,
+        epsilon_start=-0.0,
+        epsilon_end=-0.0,
+    )
+    payload = config.to_dict()
+
+    assert type(payload["q_step_size"]) is float
+    assert payload["q_step_size"] == 0.1
+    for field in (
+        "average_reward_step_size",
+        "trace_decay",
+        "epsilon_start",
+        "epsilon_end",
+    ):
+        assert type(payload[field]) is float
+        assert np.signbit(payload[field])
+    assert Step6DifferentialSARSAConfig.from_dict(payload) == config
+
+
+@pytest.mark.parametrize(
+    "wrap",
+    [
+        pytest.param(lambda control: Step7DynaConfig(control=control), id="step7"),
+        pytest.param(lambda control: Step9DreamingConfig(control=control), id="step9"),
+    ],
+)
+def test_nested_step7_and_step9_refuse_hostile_step6_ratio(wrap: Any) -> None:
+    class HiddenNegativeFloat(float):
+        def as_integer_ratio(self) -> tuple[int, int]:
+            return (-1, 2**200)
+
+    with pytest.raises(ValueError, match="q_step_size"):
+        wrap(Step6DifferentialSARSAConfig(q_step_size=HiddenNegativeFloat(0.5)))
+
+
+def test_step6_float32_narrowing_avoids_longdouble_double_rounding() -> None:
+    overflow_midpoint = np.ldexp(
+        np.longdouble(2) - np.ldexp(np.longdouble(1), -24),
+        127,
+    )
+    largest_finite_input = np.nextafter(
+        overflow_midpoint,
+        np.longdouble("-inf"),
+    )
+
+    config = Step6DifferentialSARSAConfig(q_step_size=largest_finite_input)
+    agent = make_step6_differential_sarsa_agent(config)
+
+    assert bool(np.isfinite(np.asarray(config.q_step_size, dtype=np.float32)))
+    assert agent.config.q_step_size == config.q_step_size
+
+
+@pytest.mark.parametrize(
+    ("offset", "expected"),
+    [
+        (-Fraction(1, 2**80), 1.0),
+        (Fraction(0), 1.0),
+        (
+            Fraction(1, 2**80),
+            float(np.nextafter(np.float32(1.0), np.float32(np.inf))),
+        ),
+    ],
+)
+def test_step6_fraction_midpoint_rounds_once_to_nearest_even(
+    offset: Fraction,
+    expected: float,
+) -> None:
+    midpoint = Fraction(1) + Fraction(1, 2**24)
+    config = Step6DifferentialSARSAConfig(q_step_size=midpoint + offset)
+
+    assert config.q_step_size == expected
+
+
+def test_step6_fraction_float32_overflow_midpoint_is_exact() -> None:
+    maximum = Fraction((2**24 - 1) * 2**104)
+    overflow_midpoint = maximum + 2**103
+
+    just_below = Step6DifferentialSARSAConfig(q_step_size=overflow_midpoint - 1)
+    assert just_below.q_step_size == float(np.finfo(np.float32).max)
+    with pytest.raises(ValueError, match="q_step_size"):
+        Step6DifferentialSARSAConfig(q_step_size=overflow_midpoint)
+
+
+def test_step6_float32_underflow_canonicalizes_to_legal_zero_endpoint() -> None:
+    config = Step6DifferentialSARSAConfig(
+        q_step_size=1e-50,
+        average_reward_step_size=np.longdouble("1e-50"),
+        epsilon_start=1e-50,
+        epsilon_end=np.longdouble("1e-50"),
+    )
+
+    assert config.q_step_size == 0.0
+    assert config.average_reward_step_size == 0.0
+    assert config.epsilon_start == 0.0
+    assert config.epsilon_end == 0.0
+    assert run_step6_smoke(config, steps=3, feature_dim=2).finite
+
+
+def test_step6_smoke_health_gate_reports_any_refused_update(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_run = step6_module.run_differential_sarsa_from_arrays
+
+    def _refuse_updates(*args: Any, **kwargs: Any) -> Any:
+        result = original_run(*args, **kwargs)
+        return result.replace(
+            updates_applied=result.updates_applied.at[0].set(False)
+        )
+
+    monkeypatch.setattr(
+        step6_module,
+        "run_differential_sarsa_from_arrays",
+        _refuse_updates,
+    )
+
+    result = run_step6_smoke(steps=3, feature_dim=2)
+
+    assert not result.finite
 
 
 def test_step7_dyna_facade_roundtrip_one_step_and_smoke() -> None:

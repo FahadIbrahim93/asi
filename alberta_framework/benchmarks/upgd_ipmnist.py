@@ -94,14 +94,15 @@ import hashlib
 import json
 import logging
 import math
+import operator
 import os
 import platform
 import tempfile
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, SupportsIndex, cast
 
 import chex
 import jax
@@ -110,8 +111,17 @@ import jax.random as jr
 import numpy as np
 from jax import Array
 
+from alberta_framework._seed_validation import (
+    require_jax_seed,
+    require_unique_jax_seeds,
+)
+from alberta_framework.core._float32_scalars import validated_float32_scalar
 from alberta_framework.core.baseline_optimizers import Adam
 from alberta_framework.core.canonical_upgd import CanonicalUPGD, CanonicalUPGDConfig
+from alberta_framework.core.update_safety import (
+    floating_tree_is_finite,
+    select_transaction,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -261,6 +271,47 @@ REPRODUCTION_GAP_THRESHOLD = 0.02
 
 _PLASTICITY_LOSS_FLOOR = 1e-8
 
+_INT32_MAX: int = 2**31 - 1
+_ACTUAL_INT_TYPES = frozenset(
+    {
+        int,
+        *(np.dtype(code).type for code in ("b", "B", "h", "H", "i", "I", "l", "L", "q", "Q")),
+    }
+)
+
+
+def _require_int32(name: str, value: object, *, minimum: int = 1) -> int:
+    if type(value) not in _ACTUAL_INT_TYPES:
+        raise ValueError(f"{name} must be an integer")
+    try:
+        number = operator.index(cast(SupportsIndex, value))
+    except Exception as error:
+        raise ValueError(f"{name} must be an integer") from error
+    if number < minimum or number > _INT32_MAX:
+        raise ValueError(f"{name} must be in [{minimum}, {_INT32_MAX}]")
+    return number
+
+
+def _require_finite_real(name: str, value: object) -> float:
+    if type(value) not in (int, float):
+        raise ValueError(f"{name} must be a finite real number")
+    number = float(cast("int | float", value))
+    if not math.isfinite(number):
+        raise ValueError(f"{name} must be a finite real number")
+    return number
+
+
+def _require_nonempty_string(name: str, value: object) -> str:
+    if type(value) is not str or not value:
+        raise ValueError(f"{name} must be a non-empty string")
+    return value
+
+
+def _require_seed_identities(values: object, *, name: str) -> tuple[int, ...]:
+    if type(values) is not tuple:
+        raise ValueError(f"{name} must be an exact tuple of unique integer seeds")
+    return require_unique_jax_seeds(values, name=name)
+
 
 @dataclass(frozen=True)
 class IPMNISTConfig:
@@ -287,14 +338,31 @@ class IPMNISTConfig:
 
     def __post_init__(self) -> None:
         for name in ("n_tasks", "task_length", "input_dim", "hidden1", "hidden2", "n_classes"):
-            value = getattr(self, name)
-            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
-                raise ValueError(f"{name} must be a positive integer, got {value!r}")
+            value = _require_int32(name, getattr(self, name), minimum=1)
+            object.__setattr__(self, name, value)
+        if self.n_tasks * self.task_length > _INT32_MAX:
+            raise ValueError("derived run horizon must fit in signed int32")
+        if self.n_tasks * self.input_dim > _INT32_MAX:
+            raise ValueError("derived permutation schedule must fit in signed int32")
+        if self.parameter_count > _INT32_MAX:
+            raise ValueError("derived total parameter allocation must fit in signed int32")
 
     @property
     def n_steps(self) -> int:
         """Total online steps (examples) in a run."""
         return self.n_tasks * self.task_length
+
+    @property
+    def parameter_count(self) -> int:
+        """Total flattened MLP parameter count used by perturbation draws."""
+        return (
+            self.input_dim * self.hidden1
+            + self.hidden1 * self.hidden2
+            + self.hidden2 * self.n_classes
+            + self.hidden1
+            + self.hidden2
+            + self.n_classes
+        )
 
     @property
     def matches_selected_publication_configuration(self) -> bool:
@@ -391,6 +459,75 @@ def init_mlp_params(key: Array, config: IPMNISTConfig) -> dict[str, Array]:
     return params
 
 
+_REAL_NUMERIC_DTYPE_KINDS = frozenset({"i", "u", "f"})
+"""Concrete dtype kinds admitted as ``data_x``: signed/unsigned integers and floats.
+
+An allowlist is load-bearing here: ``np.issubdtype(np.timedelta64, np.number)``
+is true, and a ``NaT`` timedelta casts to a *finite* float32 sentinel, so a
+``number``-based check would let non-finite-in-spirit data through the finite
+gate.  Kind codes exclude bool (``b``), complex (``c``), timedelta (``m``),
+datetime (``M``), and every non-numeric kind.
+"""
+
+
+def validated_ipmnist_data(
+    data_x: np.ndarray | Array,
+    data_y: np.ndarray | Array,
+    *,
+    input_dim: int | None,
+    n_classes: int | None,
+    min_length: int | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return ``(data_x, data_y)`` as finite float32 / int32 arrays inside the protocol domain.
+
+    JAX gathers clamp out-of-range indices instead of raising, so a label at
+    or above ``n_classes`` would silently be scored and trained as the last
+    class, and a non-finite input would still yield an in-range accuracy.
+    Every runner that indexes the softmax by label must go through here
+    before touching any hyperparameter resolver or learner factory.
+
+    Args:
+        data_x: Candidate ``(n_train, input_dim)`` example matrix.
+        data_y: Candidate ``(n_train,)`` integer label vector.
+        input_dim: Required example width (``None`` = any).
+        n_classes: Exclusive label upper bound (``None`` = any).
+        min_length: Required minimum row count -- pass ``config.task_length``
+            so per-task sampling without replacement is feasible
+            (``None`` = any).
+
+    Raises:
+        ValueError: If ``data_x`` is not a finite ``(n_train, input_dim)``
+            matrix of a real numeric dtype kind with at least ``min_length``
+            rows, or ``data_y`` is not an aligned vector of integer labels in
+            ``[0, n_classes)``.
+    """
+    raw_x = np.asarray(jax.device_get(data_x))
+    raw_y = np.asarray(jax.device_get(data_y))
+    if raw_x.ndim != 2:
+        raise ValueError("data_x must be a two-dimensional example matrix")
+    if input_dim is not None and raw_x.shape[1] != input_dim:
+        raise ValueError(f"data_x must have shape (n_train, {input_dim})")
+    if raw_y.shape != (raw_x.shape[0],):
+        raise ValueError("data_y must be (n_train,) aligned with data_x")
+    if min_length is not None and raw_x.shape[0] < min_length:
+        raise ValueError(
+            "dataset smaller than task_length; cannot sample without replacement"
+        )
+    if raw_x.dtype.kind not in _REAL_NUMERIC_DTYPE_KINDS:
+        raise ValueError("data_x must use a real numeric, non-boolean dtype")
+    if raw_y.dtype.kind not in {"i", "u"}:
+        raise ValueError("data_y must contain integer class labels")
+    if np.any(raw_y < 0) or np.any(raw_y > np.iinfo(np.int32).max):
+        raise ValueError("data_y class labels must fit non-negative int32")
+    resolved_x = np.asarray(raw_x, dtype=np.float32)
+    resolved_y = np.asarray(raw_y, dtype=np.int32)
+    if not np.all(np.isfinite(resolved_x)):
+        raise ValueError("data_x must contain only finite values")
+    if n_classes is not None and np.any(resolved_y >= n_classes):
+        raise ValueError(f"data_y class labels must be smaller than {n_classes}")
+    return resolved_x, resolved_y
+
+
 def mlp_logits(params: dict[str, Array], x: Array) -> Array:
     """Forward pass of the protocol MLP for a single flattened example."""
     hidden = jax.nn.relu(x @ params["w1"] + params["b1"])
@@ -407,9 +544,30 @@ def cross_entropy_loss(
 
 
 LearnerInitFn = Callable[[dict[str, Array]], Any]
+
+
+@chex.dataclass(frozen=True, mappable_dataclass=False)
+class LearnerUpdateResult:
+    """Checked learner step with backward-compatible two-value unpacking.
+
+    Existing benchmark and screening callers unpack learner steps as
+    ``params, state = step_fn(...)``.  Iteration deliberately preserves that
+    surface while ``update_applied`` makes an atomic rejection observable to
+    callers that need the checked contract.
+    """
+
+    params: dict[str, Array]
+    state: Any
+    update_applied: Array
+
+    def __iter__(self) -> Iterator[Any]:
+        yield self.params
+        yield self.state
+
+
 LearnerStepFn = Callable[
     [dict[str, Array], Any, dict[str, Array], Array],
-    tuple[dict[str, Array], Any],
+    tuple[dict[str, Array], Any] | LearnerUpdateResult,
 ]
 
 
@@ -567,17 +725,36 @@ def _make_adamw_learner(hp: dict[str, float]) -> tuple[LearnerInitFn, LearnerSte
 
     def step_fn(
         params: dict[str, Array], state: dict[str, Any], grads: dict[str, Array], key: Array
-    ) -> tuple[dict[str, Array], dict[str, Any]]:
+    ) -> LearnerUpdateResult:
         del key  # AdamW is deterministic
-        new_params: dict[str, Array] = {}
-        new_state: dict[str, Any] = {}
+        candidate_params: dict[str, Array] = {}
+        candidate_state: dict[str, Any] = {}
+        update_applied = jnp.asarray(True, dtype=jnp.bool_)
         for name, value in params.items():
-            step_arr, leaf_state = optimizer.update_from_gradient(
+            leaf_update = optimizer.update_from_gradient_checked(
                 state[name], grads[name], error=None, param=value
             )
-            new_params[name] = value - step_arr
-            new_state[name] = leaf_state
-        return new_params, new_state
+            candidate_params[name] = value - leaf_update.step
+            candidate_state[name] = leaf_update.new_state
+            update_applied = update_applied & leaf_update.update_applied
+
+        # A finite optimizer step can still overflow when it is applied to a
+        # finite parameter.  The learner owns the enclosing transaction, so
+        # validate and select the complete parameter and optimizer-state
+        # trees only after every leaf candidate has been assembled.
+        update_applied = (
+            update_applied
+            & floating_tree_is_finite(params)
+            & floating_tree_is_finite(state)
+            & floating_tree_is_finite(grads)
+            & floating_tree_is_finite(candidate_params)
+            & floating_tree_is_finite(candidate_state)
+        )
+        return LearnerUpdateResult(
+            params=select_transaction(update_applied, candidate_params, params),
+            state=select_transaction(update_applied, candidate_state, state),
+            update_applied=update_applied,
+        )  # type: ignore[call-arg]
 
     return init_fn, step_fn
 
@@ -590,6 +767,20 @@ _LEARNER_DEFAULT_HYPERPARAMETERS: dict[str, dict[str, float]] = {
     "upgd_w": UPGD_W_PROTOCOL_HYPERPARAMETERS,
     "adamw": ADAMW_PROTOCOL_HYPERPARAMETERS,
 }
+
+
+def _validated_hyperparameter(name: str, value: object) -> float:
+    """Validate one JSON override in its exact host and float32 execution domains."""
+    if type(value) not in (int, float):
+        raise ValueError(f"hyperparameter {name!r} must be a finite JSON number")
+    label = f"hyperparameter {name!r}"
+    if name in {"step_size", "eps"}:
+        return validated_float32_scalar(label, value, positive=True)
+    if name in {"utility_decay", "beta1", "beta2"}:
+        return validated_float32_scalar(
+            label, value, lower=0.0, upper=1.0, upper_inclusive=False
+        )
+    return validated_float32_scalar(label, value, lower=0.0)
 
 
 @dataclass(frozen=True)
@@ -617,6 +808,20 @@ class IPMNISTRunResult:
     example_indices: np.ndarray | None = None
     noise_mode: str = "step"
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "learner", _require_nonempty_string("learner", self.learner))
+        object.__setattr__(self, "seeds", _require_seed_identities(self.seeds, name="seeds"))
+        object.__setattr__(
+            self,
+            "wall_clock_seconds",
+            _require_finite_real("wall_clock_seconds", self.wall_clock_seconds),
+        )
+        object.__setattr__(
+            self,
+            "noise_mode",
+            _require_nonempty_string("noise_mode", self.noise_mode),
+        )
+
 
 def resolve_hyperparameters(
     learner: str, overrides: dict[str, float] | None = None
@@ -630,7 +835,10 @@ def resolve_hyperparameters(
         unknown = set(overrides) - set(merged)
         if unknown:
             raise ValueError(f"unknown hyperparameters for {learner}: {sorted(unknown)}")
-        merged.update({name: float(value) for name, value in overrides.items()})
+        validated: dict[str, float] = {}
+        for name, value in overrides.items():
+            validated[name] = _validated_hyperparameter(name, value)
+        merged.update(validated)
     return merged
 
 
@@ -679,36 +887,41 @@ def run_ipmnist(
     Returns:
         Host-side result arrays; see :class:`IPMNISTRunResult`.
     """
+    seed_tuple = require_unique_jax_seeds(seeds, name="seeds")
+    if progress_every is not None:
+        progress_every = _require_int32("progress_every", progress_every)
     if config is None:
         config = IPMNISTConfig()
     if noise_mode not in ("step", "pool"):
         raise ValueError(f"noise_mode must be 'step' or 'pool', got {noise_mode!r}")
-    if noise_mode == "pool" and noise_pool_steps < 2:
-        raise ValueError(f"noise_pool_steps must be >= 2, got {noise_pool_steps}")
+    if noise_mode == "pool":
+        noise_pool_steps = _require_int32(
+            "noise_pool_steps", noise_pool_steps, minimum=2
+        )
+    resolved_x, resolved_y = validated_ipmnist_data(
+        data_x,
+        data_y,
+        input_dim=config.input_dim,
+        n_classes=config.n_classes,
+        min_length=config.task_length,
+    )
     hp = resolve_hyperparameters(learner, hyperparameters)
     init_fn, step_fn = _LEARNER_FACTORIES[learner](hp)
     shapes = _sorted_param_shapes(config)
-    n_flat = int(sum(np.prod(shape) for shape in shapes.values()))
+    n_flat = config.parameter_count
 
-    data_x = jnp.asarray(data_x, dtype=jnp.float32)
-    data_y = jnp.asarray(data_y, dtype=jnp.int32)
-    if data_x.ndim != 2 or data_x.shape[1] != config.input_dim:
-        raise ValueError(
-            f"data_x must have shape (n_train, {config.input_dim}), got {data_x.shape}"
-        )
-    if data_y.shape != (data_x.shape[0],):
-        raise ValueError("data_y must be (n_train,) aligned with data_x")
+    data_x = jnp.asarray(resolved_x, dtype=jnp.float32)
+    data_y = jnp.asarray(resolved_y, dtype=jnp.int32)
     n_train = int(data_x.shape[0])
-    if n_train < config.task_length:
-        raise ValueError("dataset smaller than task_length; cannot sample without replacement")
 
-    seed_tuple = tuple(int(seed) for seed in seeds)
-    if not seed_tuple:
-        raise ValueError("at least one seed is required")
     seeds_array = jnp.asarray(seed_tuple, dtype=jnp.uint32)
 
     use_pool = noise_mode == "pool" and learner in _STOCHASTIC_LEARNERS
     pool_len = int(noise_pool_steps) * n_flat if use_pool else 0
+    if pool_len > _INT32_MAX:
+        raise ValueError(
+            "derived noise_pool_steps * parameter_count must fit in signed int32"
+        )
     pool_noise_std = float(hp["noise_std"]) if use_pool else 0.0
 
     def init_seed(seed: Array) -> tuple[dict[str, Array], Any, IPMNISTSchedule, Array]:
@@ -986,10 +1199,7 @@ def _validate_result_set(
             raise ValueError(f"result key {learner!r} does not match payload learner")
         if result.config != config:
             raise ValueError(f"{learner}: result config does not match artifact config")
-        if not result.seeds:
-            raise ValueError(f"{learner}: at least one seed is required")
-        if len(set(result.seeds)) != len(result.seeds):
-            raise ValueError(f"{learner}: duplicate seed ids")
+        require_unique_jax_seeds(result.seeds, name=f"{learner} seeds")
 
 
 def _study_design_payload(results: Mapping[str, IPMNISTRunResult]) -> dict[str, object]:
@@ -1124,7 +1334,8 @@ _V2_PARTIAL_FIELDS = {
 
 def partial_payload(result: IPMNISTRunResult) -> dict[str, Any]:
     """Serialize one run shard with the strict, nonpromoting v2 schema."""
-    if len(result.seeds) != 1:
+    seeds = require_unique_jax_seeds(result.seeds, name="result seeds")
+    if len(seeds) != 1:
         raise ValueError("a v2 partial must contain exactly one seed")
     if result.noise_mode != "step":
         raise ValueError(
@@ -1137,7 +1348,7 @@ def partial_payload(result: IPMNISTRunResult) -> dict[str, Any]:
         "evidence_policy": dict(NONPROMOTING_POLICY),
         "learner": result.learner,
         "hyperparameters": result.hyperparameters,
-        "seed_id": result.seeds[0],
+        "seed_id": seeds[0],
         "seed_count": 1,
         "config": result.config.to_config(),
         "matches_selected_publication_configuration": (
@@ -1154,7 +1365,7 @@ def partial_payload(result: IPMNISTRunResult) -> dict[str, Any]:
     }
 
 
-def _strict_json_object(path: Path) -> dict[str, Any]:
+def _decode_strict_json_object(raw: bytes, *, path: Path) -> dict[str, Any]:
     def pairs_hook(pairs: list[tuple[str, object]]) -> dict[str, object]:
         parsed: dict[str, object] = {}
         for key, value in pairs:
@@ -1166,36 +1377,52 @@ def _strict_json_object(path: Path) -> dict[str, Any]:
     def reject_constant(value: str) -> object:
         raise ValueError(f"non-finite JSON constant is forbidden: {value}")
 
+    def parse_float(value: str) -> float:
+        parsed = float(value)
+        if not math.isfinite(parsed):
+            raise ValueError(f"non-finite JSON number is forbidden: {value}")
+        return parsed
+
     payload = json.loads(
-        Path(path).read_text(encoding="utf-8"),
+        raw.decode("utf-8"),
         object_pairs_hook=pairs_hook,
         parse_constant=reject_constant,
+        parse_float=parse_float,
     )
     if not isinstance(payload, dict):
         raise ValueError(f"{path}: payload must be one JSON object")
     return payload
 
 
+def _strict_json_object(path: Path) -> dict[str, Any]:
+    resolved = Path(path)
+    return _decode_strict_json_object(resolved.read_bytes(), path=resolved)
+
+
 def _v2_partial_manifest(paths: Sequence[Path]) -> list[dict[str, object]]:
     """Bind supplied v2 shard bytes to exact learner/seed identities."""
     def identity(entry: Mapping[str, object]) -> tuple[str, int]:
         learner = entry["learner"]
-        seed = entry["seed_id"]
-        if not isinstance(learner, str) or type(seed) is not int:
+        if not isinstance(learner, str):
             raise ValueError("v2 partial manifest contains an invalid identity")
+        seed = require_jax_seed(
+            entry["seed_id"], name="v2 partial manifest seed_id"
+        )
         return learner, seed
 
     entries: list[dict[str, object]] = []
     for path_value in paths:
         path = Path(path_value)
         raw = path.read_bytes()
-        payload = _strict_json_object(path)
+        payload = _decode_strict_json_object(raw, path=path)
         if payload.get("schema") != PARTIAL_SCHEMA:
             raise ValueError(f"{path}: partial manifest accepts only strict v2 shards")
         learner = payload.get("learner")
-        seed = payload.get("seed_id")
-        if not isinstance(learner, str) or type(seed) is not int:
+        if not isinstance(learner, str):
             raise ValueError(f"{path}: partial manifest identity is invalid")
+        seed = require_jax_seed(
+            payload.get("seed_id"), name=f"{path}: partial manifest seed_id"
+        )
         entries.append(
             {
                 "learner": learner,
@@ -1240,7 +1467,22 @@ def _validated_partial_payload(
             raise ValueError(f"{path}: hyperparameters must be finite named numbers")
         if not math.isfinite(float(value)):
             raise ValueError(f"{path}: hyperparameters must be finite named numbers")
-
+    try:
+        resolved_hyperparameters = resolve_hyperparameters(
+            learner, dict(hyperparameters)
+        )
+    except ValueError as exc:
+        raise ValueError(f"{path}: invalid hyperparameters: {exc}") from exc
+    serialized_hyperparameters = json.dumps(
+        dict(hyperparameters), allow_nan=False, separators=(",", ":"), sort_keys=True
+    )
+    serialized_resolved = json.dumps(
+        resolved_hyperparameters, allow_nan=False, separators=(",", ":"), sort_keys=True
+    )
+    if serialized_hyperparameters != serialized_resolved:
+        raise ValueError(
+            f"{path}: hyperparameters must contain the complete learner configuration"
+        )
     config_payload = payload.get("config")
     if not isinstance(config_payload, Mapping) or set(config_payload) != set(
         IPMNISTConfig().to_config()
@@ -1261,20 +1503,18 @@ def _validated_partial_payload(
 
     raw_seeds = payload.get(seed_field)
     if schema == PARTIAL_SCHEMA:
-        if type(raw_seeds) is not int or raw_seeds < 0:
-            raise ValueError(f"{path}: seed_id must be one non-negative integer")
-        seed_ids = [raw_seeds]
+        seed_ids = list(
+            require_unique_jax_seeds((raw_seeds,), name=f"{path}: seed_id")
+        )
         seed_count = payload.get("seed_count")
         if type(seed_count) is not int or seed_count != 1:
             raise ValueError(f"{path}: seed_count must equal one")
     else:
         if not isinstance(raw_seeds, list) or not raw_seeds:
             raise ValueError(f"{path}: {seed_field} must be a non-empty list")
-        if any(type(seed) is not int or seed < 0 for seed in raw_seeds):
-            raise ValueError(f"{path}: {seed_field} must contain non-negative integers")
-        if len(set(raw_seeds)) != len(raw_seeds):
-            raise ValueError(f"{path}: duplicate seed ids within shard")
-        seed_ids = raw_seeds
+        seed_ids = list(
+            require_unique_jax_seeds(raw_seeds, name=f"{path}: {seed_field}")
+        )
 
     expected_shape = (len(seed_ids), config.n_tasks)
     matrix_bounds = {
@@ -1428,14 +1668,15 @@ def main_v2_compat(argv: Sequence[str] | None = None) -> None:
         if name not in _LEARNER_FACTORIES:
             raise SystemExit(f"unknown learner {name!r}")
 
+    if args.seed_list is not None:
+        raw_seeds = [int(part) for part in args.seed_list.split(",") if part.strip()]
+    else:
+        raw_seeds = list(range(args.seed_start, args.seed_start + args.seeds))
+    seeds = require_unique_jax_seeds(raw_seeds, name="seeds")
+
     logger.info("loading MNIST from data_home=%s", data_home)
     data_x, data_y = load_mnist_train(data_home)
     logger.info("train split: x=%s y=%s", data_x.shape, data_y.shape)
-
-    if args.seed_list is not None:
-        seeds = [int(part) for part in args.seed_list.split(",") if part.strip()]
-    else:
-        seeds = list(range(args.seed_start, args.seed_start + args.seeds))
     results = {}
     for name in learners:
         logger.info("running %s for %d seeds x %d steps", name, len(seeds), config.n_steps)

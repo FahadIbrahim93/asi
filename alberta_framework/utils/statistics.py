@@ -1,16 +1,48 @@
-"""Statistical analysis utilities for multi-seed experiments.
+"""Statistical analysis utilities for publication-quality experiments.
 
 Provides functions for computing confidence intervals, significance tests,
 effect sizes, and multiple comparison corrections.
 """
 
-from typing import TYPE_CHECKING, NamedTuple
+import operator
+from collections.abc import Mapping
+from fractions import Fraction
+from typing import TYPE_CHECKING, NamedTuple, SupportsIndex, cast
 
 import numpy as np
 from numpy.typing import NDArray
 
+from alberta_framework.core._float32_scalars import validated_float32_scalar
+
 if TYPE_CHECKING:
     from alberta_framework.utils.experiments import AggregatedResults
+
+
+_ACTUAL_INT_TYPES = frozenset(
+    {
+        int,
+        np.int8,
+        np.int16,
+        np.int32,
+        np.int64,
+        np.uint8,
+        np.uint16,
+        np.uint32,
+        np.uint64,
+        np.longlong,
+        np.ulonglong,
+    }
+)
+_ACTUAL_FLOAT_TYPES = frozenset(
+    {float, Fraction, *(np.dtype(code).type for code in ("e", "f", "d", "g"))}
+)
+_ALLOWED_REAL_TYPES = _ACTUAL_INT_TYPES | _ACTUAL_FLOAT_TYPES
+
+
+def _require_exact_str(name: str, value: object) -> str:
+    if type(value) is not str:
+        raise ValueError(f"{name} must be an exact string")
+    return value
 
 
 class StatisticalSummary(NamedTuple):
@@ -61,20 +93,78 @@ class SignificanceResult(NamedTuple):
     method_b: str
 
 
-def _validated_values(
-    values: NDArray[np.float64] | list[float], *, name: str
-) -> NDArray[np.float64]:
-    arr = np.asarray(values, dtype=np.float64)
-    if arr.ndim != 1 or arr.size == 0:
-        raise ValueError(f"{name} must be a non-empty one-dimensional sample")
-    if not np.all(np.isfinite(arr)):
-        raise ValueError(f"{name} must contain only finite values")
+def _validate_confidence_level(confidence_level: object) -> None:
+    if type(confidence_level) not in _ALLOWED_REAL_TYPES:
+        raise ValueError("confidence_level must be strictly between 0 and 1")
+    try:
+        validated = validated_float32_scalar(
+            "confidence_level",
+            confidence_level,
+            positive=True,
+            upper=1.0,
+            upper_inclusive=False,
+        )
+    except ValueError:
+        raise ValueError("confidence_level must be strictly between 0 and 1") from None
+    # validated ensures (0,1); keep for mypy
+    _ = validated
+
+
+def _require_finite_values(values: NDArray[np.floating], *, name: str) -> None:
+    """Reject NaN/inf samples so summaries cannot gold-plate a poisoned seed."""
+    if not np.isfinite(values).all():
+        raise ValueError(f"{name} must be finite")
+
+
+def _require_sample_vector(values: object, *, name: str) -> NDArray[np.float64]:
+    """Return ``values`` as a rank-1 array: exactly one sample per seed.
+
+    A ``(n_seeds, n_steps)`` matrix would otherwise be flattened by the
+    spread estimators while ``n_seeds`` still reported the row count.
+    """
+    arr = np.asarray(values)
+    if arr.ndim != 1:
+        raise ValueError(
+            f"{name} must be a one-dimensional sample vector (one value per seed), "
+            f"got shape {arr.shape}; reduce per seed first or use "
+            "compute_timeseries_statistics"
+        )
     return arr
 
 
-def _validate_probability(value: float, *, name: str) -> None:
-    if not np.isfinite(value) or not 0.0 < value < 1.0:
-        raise ValueError(f"{name} must be strictly between zero and one")
+def _require_probability(value: object, *, name: str, strict: bool) -> float:
+    if type(value) not in _ALLOWED_REAL_TYPES:
+        domain = "strictly between 0 and 1" if strict else "in [0, 1]"
+        raise ValueError(f"{name} must be a finite real {domain}")
+    try:
+        if strict:
+            return validated_float32_scalar(
+                name, value, positive=True, upper=1.0, upper_inclusive=False
+            )
+        return validated_float32_scalar(
+            name, value, lower=0.0, upper=1.0, upper_inclusive=True
+        )
+    except ValueError:
+        domain = "strictly between 0 and 1" if strict else "in [0, 1]"
+        raise ValueError(f"{name} must be a finite real {domain}") from None
+
+
+def _require_alpha(alpha: object) -> float:
+    return _require_probability(alpha, name="alpha", strict=True)
+
+
+def _require_positive_int(name: str, value: object) -> int:
+    """Reject bool/float aliases that ordered comparisons treat as legal counts."""
+    if type(value) not in _ACTUAL_INT_TYPES:
+        raise ValueError(f"{name} must be a positive integer")
+    count = operator.index(cast(SupportsIndex, value))
+    if count <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return count
+
+
+def _require_p_value(value: object, *, name: str) -> float:
+    return _require_probability(value, name=name, strict=False)
 
 
 def compute_statistics(
@@ -89,10 +179,17 @@ def compute_statistics(
 
     Returns:
         StatisticalSummary with all statistics
+
+    Raises:
+        ValueError: If values is empty, any sample is non-finite, or
+            ``confidence_level`` is not strictly between 0 and 1.
     """
-    _validate_probability(confidence_level, name="confidence_level")
-    arr = _validated_values(values, name="values")
+    arr = _require_sample_vector(values, name="values")
     n = len(arr)
+    if n == 0:
+        raise ValueError("values must be non-empty")
+    _require_finite_values(arr, name="values")
+    _validate_confidence_level(confidence_level)
 
     mean = float(np.mean(arr))
     std = float(np.std(arr, ddof=1)) if n > 1 else 0.0
@@ -101,15 +198,26 @@ def compute_statistics(
     q75, q25 = np.percentile(arr, [75, 25])
     iqr = float(q75 - q25)
 
-    if n > 1:
+    # Compute confidence interval
+    try:
         from scipy import stats
 
-        t_value = float(stats.t.ppf((1 + confidence_level) / 2, n - 1))
-        margin = t_value * sem
+        if n > 1:
+            t_value = float(stats.t.ppf((1 + confidence_level) / 2, n - 1))
+            margin = t_value * sem
+            ci_lower = mean - margin
+            ci_upper = mean + margin
+        else:
+            ci_lower = ci_upper = mean
+    except ImportError:
+        # Fallback without scipy: normal approximation.  Only two quantiles
+        # are wired in — 0.95 -> z=1.96; every other confidence level silently
+        # gets the 99% quantile z=2.576.  The normal approximation also
+        # understates the t-based interval width at small n.
+        z_value = 1.96 if confidence_level == 0.95 else 2.576  # 95% or 99%
+        margin = z_value * sem
         ci_lower = mean - margin
         ci_upper = mean + margin
-    else:
-        ci_lower = ci_upper = mean
 
     return StatisticalSummary(
         mean=mean,
@@ -135,24 +243,35 @@ def compute_timeseries_statistics(
 
     Returns:
         Tuple of (mean, ci_lower, ci_upper) arrays of shape (n_steps,)
+
+    Raises:
+        ValueError: If metric_array has no seed rows, any sample is
+            non-finite, or ``confidence_level`` is not strictly between 0 and 1.
     """
-    _validate_probability(confidence_level, name="confidence_level")
-    metric_array = np.asarray(metric_array, dtype=np.float64)
-    if metric_array.ndim != 2 or 0 in metric_array.shape:
-        raise ValueError("metric_array must have shape (n_seeds, n_steps) with nonzero axes")
-    if not np.all(np.isfinite(metric_array)):
-        raise ValueError("metric_array must contain only finite values")
     n_seeds = metric_array.shape[0]
+    if n_seeds == 0:
+        raise ValueError("metric_array must contain at least one seed row")
+    _require_finite_values(metric_array, name="metric_array")
+    _validate_confidence_level(confidence_level)
     mean = np.mean(metric_array, axis=0)
-    std = np.std(metric_array, axis=0, ddof=1) if n_seeds > 1 else np.zeros_like(mean)
+
+    if n_seeds == 1:
+        # One seed has no between-seed spread estimate; return the degenerate
+        # point interval, matching compute_statistics([x]). The ddof=1 /
+        # Student-t path below would produce all-NaN bounds (df=0).
+        return mean, mean.copy(), mean.copy()
+
+    std = np.std(metric_array, axis=0, ddof=1)
     sem = std / np.sqrt(n_seeds)
 
-    if n_seeds > 1:
+    try:
         from scipy import stats
 
         t_value = stats.t.ppf((1 + confidence_level) / 2, n_seeds - 1)
-    else:
-        t_value = 0.0
+    except ImportError:
+        # Same limitation as compute_statistics: 0.95 -> z=1.96, any other
+        # level silently gets the 99% quantile z=2.576.
+        t_value = 1.96 if confidence_level == 0.95 else 2.576
 
     margin = t_value * sem
     ci_lower = mean - margin
@@ -172,32 +291,48 @@ def cohens_d(
         values_b: Values for second group
 
     Returns:
-        Cohen's d (positive means a > b)
-    """
-    a = _validated_values(values_a, name="values_a")
-    b = _validated_values(values_b, name="values_b")
+        Cohen's d (positive means a > b). Unequal groups with zero pooled
+        variance have a signed-infinite standardized difference.
 
-    mean_a = np.mean(a)
-    mean_b = np.mean(b)
+    Raises:
+        ValueError: If either group is not a finite one-dimensional sample
+            vector, is empty, or the pooled degrees of freedom
+            ``n_a + n_b - 2`` are not positive.
+    """
+    a = _require_sample_vector(values_a, name="values_a")
+    b = _require_sample_vector(values_b, name="values_b")
+    _require_finite_values(a, name="values_a")
+    _require_finite_values(b, name="values_b")
 
     n_a = len(a)
     n_b = len(b)
+
+    if n_a == 0 or n_b == 0:
+        raise ValueError(
+            f"cohens_d requires non-empty groups (got n_a={n_a}, n_b={n_b})"
+        )
+
+    pooled_df = n_a + n_b - 2
+    if pooled_df <= 0:
+        raise ValueError(
+            "cohens_d requires positive pooled degrees of freedom "
+            f"(got n_a={n_a}, n_b={n_b}, pooled_df={pooled_df})"
+        )
+
+    mean_a = np.mean(a)
+    mean_b = np.mean(b)
 
     # Pooled standard deviation
     var_a = np.var(a, ddof=1) if n_a > 1 else 0.0
     var_b = np.var(b, ddof=1) if n_b > 1 else 0.0
 
-    degrees_of_freedom = n_a + n_b - 2
-    if degrees_of_freedom <= 0:
-        raise ValueError("Cohen's d requires at least three values across both samples")
-    pooled_std = np.sqrt(
-        ((n_a - 1) * var_a + (n_b - 1) * var_b) / degrees_of_freedom
-    )
+    pooled_std = np.sqrt(((n_a - 1) * var_a + (n_b - 1) * var_b) / pooled_df)
 
     if pooled_std == 0:
-        if mean_a == mean_b:
+        mean_difference = mean_a - mean_b
+        if mean_difference == 0:
             return 0.0
-        raise ValueError("Cohen's d is undefined when pooled variance is zero")
+        return float(np.copysign(np.inf, mean_difference))
 
     return float((mean_a - mean_b) / pooled_std)
 
@@ -222,12 +357,43 @@ def ttest_comparison(
 
     Returns:
         SignificanceResult with test results
+
+    Raises:
+        ValueError: If ``alpha`` is not a finite probability strictly between
+            0 and 1, scipy returns an invalid p-value, ``paired`` samples
+            differ in length or hold fewer than 2 pairs or are identical, or
+            an unpaired group is empty or has no positive pooled degrees of
+            freedom.
     """
-    _validate_probability(alpha, name="alpha")
-    a = _validated_values(values_a, name="values_a")
-    b = _validated_values(values_b, name="values_b")
-    if paired and a.shape != b.shape:
-        raise ValueError("paired samples must have the same length")
+    alpha_value = _require_alpha(alpha)
+    a = _require_sample_vector(values_a, name="values_a")
+    b = _require_sample_vector(values_b, name="values_b")
+    _require_finite_values(a, name="values_a")
+    _require_finite_values(b, name="values_b")
+
+    if paired:
+        if len(a) != len(b):
+            raise ValueError(
+                f"paired t-test requires equal-length samples (got {len(a)} and {len(b)})"
+            )
+        if len(a) < 2:
+            raise ValueError(f"paired t-test requires at least 2 pairs (got {len(a)})")
+        _require_exact_str("method_a", method_a)
+        _require_exact_str("method_b", method_b)
+        if np.array_equal(a, b):
+            raise ValueError(
+                f"Paired comparison '{method_a}' vs '{method_b}' has identical "
+                "samples; the paired t statistic is undefined"
+            )
+    elif len(a) == 0 or len(b) == 0:
+        raise ValueError(
+            f"independent t-test requires non-empty groups (got {len(a)} and {len(b)})"
+        )
+    elif len(a) + len(b) - 2 <= 0:
+        raise ValueError(
+            "independent t-test requires positive pooled degrees of freedom "
+            f"(got {len(a)} and {len(b)})"
+        )
 
     try:
         from scipy import stats
@@ -240,7 +406,9 @@ def ttest_comparison(
             test_name = "independent t-test"
         # scipy returns (statistic, pvalue) tuple
         stat_val = float(result[0])
-        p_val = float(result[1])
+        p_val = _require_p_value(
+            result[1], name=f"p_value returned by {test_name}"
+        )
     except ImportError:
         raise ImportError("scipy is required for t-test. Install with: pip install scipy")
 
@@ -250,8 +418,8 @@ def ttest_comparison(
         test_name=test_name,
         statistic=stat_val,
         p_value=p_val,
-        significant=p_val < alpha,
-        alpha=alpha,
+        significant=p_val < alpha_value,
+        alpha=alpha_value,
         effect_size=effect,
         method_a=method_a,
         method_b=method_b,
@@ -276,22 +444,43 @@ def mann_whitney_comparison(
 
     Returns:
         SignificanceResult with test results
+
+    Raises:
+        ValueError: If ``alpha`` is not a finite probability strictly between
+            0 and 1, either sample is empty, or scipy returns an invalid
+            p-value.
     """
-    _validate_probability(alpha, name="alpha")
-    a = _validated_values(values_a, name="values_a")
-    b = _validated_values(values_b, name="values_b")
+    alpha_value = _require_alpha(alpha)
+    a = _require_sample_vector(values_a, name="values_a")
+    b = _require_sample_vector(values_b, name="values_b")
+    _require_finite_values(a, name="values_a")
+    _require_finite_values(b, name="values_b")
 
-    try:
-        from scipy import stats
-
-        result = stats.mannwhitneyu(a, b, alternative="two-sided")
-        # scipy returns (statistic, pvalue) tuple
-        stat_val = float(result[0])
-        p_val = float(result[1])
-    except ImportError:
-        raise ImportError(
-            "scipy is required for Mann-Whitney test. Install with: pip install scipy"
+    if len(a) == 0 or len(b) == 0:
+        raise ValueError(
+            f"independent Mann-Whitney test requires non-empty groups (got {len(a)} and {len(b)})"
         )
+
+    if np.all(a == a[0]) and np.all(b == a[0]):
+        # Every cross-group pair is a tie.  The exact permutation null puts
+        # all mass at U=n_a*n_b/2, hence p=1; scipy's asymptotic tie variance
+        # is zero and some supported versions return NaN instead.
+        stat_val = len(a) * len(b) / 2.0
+        p_val = 1.0
+    else:
+        try:
+            from scipy import stats
+
+            result = stats.mannwhitneyu(a, b, alternative="two-sided")
+            # scipy returns (statistic, pvalue) tuple
+            stat_val = float(result[0])
+            p_val = _require_p_value(
+                result[1], name="p_value returned by Mann-Whitney U"
+            )
+        except ImportError:
+            raise ImportError(
+                "scipy is required for Mann-Whitney test. Install with: pip install scipy"
+            )
 
     # Compute rank-biserial correlation as effect size (Kerby 2014):
     # r = 2*U1/(n_a*n_b) - 1, where scipy's statistic is U1 (pairs favoring a).
@@ -304,8 +493,8 @@ def mann_whitney_comparison(
         test_name="Mann-Whitney U",
         statistic=stat_val,
         p_value=p_val,
-        significant=p_val < alpha,
-        alpha=alpha,
+        significant=p_val < alpha_value,
+        alpha=alpha_value,
         effect_size=r,
         method_a=method_a,
         method_b=method_b,
@@ -335,12 +524,35 @@ def wilcoxon_comparison(
 
     Returns:
         SignificanceResult with test results
+
+    Raises:
+        ValueError: If ``alpha`` is not a finite probability strictly between
+            0 and 1, scipy returns an invalid p-value, or the paired samples
+            differ in length, hold fewer than 2 pairs, or are identical, for
+            which the Wilcoxon signed-rank statistic is undefined.
     """
-    _validate_probability(alpha, name="alpha")
-    a = _validated_values(values_a, name="values_a")
-    b = _validated_values(values_b, name="values_b")
-    if a.shape != b.shape:
-        raise ValueError("paired samples must have the same length")
+    alpha_value = _require_alpha(alpha)
+    a = _require_sample_vector(values_a, name="values_a")
+    b = _require_sample_vector(values_b, name="values_b")
+    _require_finite_values(a, name="values_a")
+    _require_finite_values(b, name="values_b")
+
+    if len(a) != len(b):
+        raise ValueError(
+            f"Wilcoxon signed-rank test requires equal-length samples "
+            f"(got {len(a)} and {len(b)})"
+        )
+    _require_exact_str("method_a", method_a)
+    _require_exact_str("method_b", method_b)
+    if a.size > 0 and np.array_equal(a, b):
+        raise ValueError(
+            f"Paired comparison '{method_a}' vs '{method_b}' has identical "
+            "samples; the Wilcoxon signed-rank statistic is undefined"
+        )
+    if len(a) < 2:
+        raise ValueError(
+            f"Wilcoxon signed-rank test requires at least 2 pairs (got {len(a)})"
+        )
 
     try:
         from scipy import stats
@@ -348,7 +560,9 @@ def wilcoxon_comparison(
         result = stats.wilcoxon(a, b, alternative="two-sided")
         # scipy returns (statistic, pvalue) tuple
         stat_val = float(result[0])
-        p_val = float(result[1])
+        p_val = _require_p_value(
+            result[1], name="p_value returned by Wilcoxon signed-rank"
+        )
     except ImportError:
         raise ImportError("scipy is required for Wilcoxon test. Install with: pip install scipy")
 
@@ -358,8 +572,8 @@ def wilcoxon_comparison(
         test_name="Wilcoxon signed-rank",
         statistic=stat_val,
         p_value=p_val,
-        significant=p_val < alpha,
-        alpha=alpha,
+        significant=p_val < alpha_value,
+        alpha=alpha_value,
         effect_size=effect,
         method_a=method_a,
         method_b=method_b,
@@ -378,15 +592,21 @@ def bonferroni_correction(
 
     Returns:
         Tuple of (list of significant booleans, corrected alpha)
+
+    Raises:
+        ValueError: If ``alpha`` is not strictly between 0 and 1 or any
+            p-value is not finite and inside [0, 1].
     """
-    _validate_probability(alpha, name="alpha")
-    if not p_values:
-        raise ValueError("p_values must not be empty")
-    if any(not np.isfinite(p) or not 0.0 <= p <= 1.0 for p in p_values):
-        raise ValueError("p_values must contain probabilities in [0, 1]")
-    n_tests = len(p_values)
-    corrected_alpha = alpha / n_tests
-    significant = [p < corrected_alpha for p in p_values]
+    alpha_value = _require_alpha(alpha)
+    validated_p_values = [
+        _require_p_value(p_value, name=f"p_values[{index}]")
+        for index, p_value in enumerate(p_values)
+    ]
+    n_tests = len(validated_p_values)
+    if n_tests == 0:
+        return [], alpha_value
+    corrected_alpha = alpha_value / n_tests
+    significant = [p < corrected_alpha for p in validated_p_values]
     return significant, corrected_alpha
 
 
@@ -404,22 +624,26 @@ def holm_correction(
 
     Returns:
         List of significant booleans
+
+    Raises:
+        ValueError: If ``alpha`` is not strictly between 0 and 1 or any
+            p-value is not finite and inside [0, 1].
     """
-    _validate_probability(alpha, name="alpha")
-    if not p_values:
-        raise ValueError("p_values must not be empty")
-    if any(not np.isfinite(p) or not 0.0 <= p <= 1.0 for p in p_values):
-        raise ValueError("p_values must contain probabilities in [0, 1]")
-    n_tests = len(p_values)
+    alpha_value = _require_alpha(alpha)
+    validated_p_values = [
+        _require_p_value(p_value, name=f"p_values[{index}]")
+        for index, p_value in enumerate(p_values)
+    ]
+    n_tests = len(validated_p_values)
 
     # Sort p-values and track original indices
-    sorted_indices = np.argsort(p_values)
-    sorted_p = [p_values[i] for i in sorted_indices]
+    sorted_indices = np.argsort(validated_p_values)
+    sorted_p = [validated_p_values[i] for i in sorted_indices]
 
     # Apply Holm correction
     significant_sorted = []
     for i, p in enumerate(sorted_p):
-        corrected_alpha = alpha / (n_tests - i)
+        corrected_alpha = alpha_value / (n_tests - i)
         if p < corrected_alpha:
             significant_sorted.append(True)
         else:
@@ -433,6 +657,34 @@ def holm_correction(
         significant[orig_idx] = sig
 
     return significant
+
+
+def common_final_window(step_counts: Mapping[str, int], window: int, metric: str) -> int:
+    """Return the number of final steps every method averages, or fail closed.
+
+    The documented ``min(window, n_steps)`` convention only holds when it
+    yields the same window for every method. When ``window`` exceeds the
+    shortest trace and the traces differ in length, a per-method minimum
+    would silently compare methods over different horizons.
+
+    Raises:
+        ValueError: If ``step_counts`` is empty or the per-method
+            ``min(window, n_steps)`` values disagree.
+    """
+    if not step_counts:
+        raise ValueError("at least one method is required to derive a final window")
+    final_windows = {min(window, n_steps) for n_steps in step_counts.values()}
+    if len(final_windows) != 1:
+        described = ", ".join(
+            f"{name}: {n_steps} steps" for name, n_steps in sorted(step_counts.items())
+        )
+        _require_exact_str("metric", metric)
+        raise ValueError(
+            f"window={window} exceeds the shortest '{metric}' trace and the traces differ "
+            f"in length ({described}); every method must average the same number of "
+            "final steps"
+        )
+    return final_windows.pop()
 
 
 def pairwise_comparisons(
@@ -455,36 +707,60 @@ def pairwise_comparisons(
 
     Returns:
         Dictionary mapping (method_a, method_b) to SignificanceResult
+
+    Raises:
+        ValueError: If ``alpha`` is not a finite probability strictly between
+            0 and 1, ``window`` is not positive, a metric has no steps, seed
+            identities are duplicated, seeds do not match metric rows, seeds
+            differ between methods used by a paired test, or ``window`` exceeds
+            the shortest trace while trace lengths differ between methods.
+            Paired rows are aligned by seed identity; Mann-Whitney samples
+            remain unpaired.
     """
     from alberta_framework.utils.experiments import AggregatedResults
+
+    alpha_value = _require_alpha(alpha)
+    window = _require_positive_int("window", window)
 
     names = list(results.keys())
     n = len(names)
 
-    if n < 2:
-        return {}
-
-    _validate_probability(alpha, name="alpha")
-    if window < 1:
-        raise ValueError("window must be positive")
-
-    # Paired tests below assume that row i denotes the same seed in every arm.
-    reference_seeds: list[int] | None = None
-    final_values: dict[str, NDArray[np.float64]] = {}
+    # Extract final values for each method
+    metric_arrays: dict[str, NDArray[np.float64]] = {}
+    seeds_by_name: dict[str, list[int]] = {}
     for name, agg in results.items():
         if not isinstance(agg, AggregatedResults):
             raise TypeError(f"Expected AggregatedResults, got {type(agg)}")
-        if reference_seeds is None:
-            reference_seeds = agg.seeds
-        elif agg.seeds != reference_seeds:
-            raise ValueError("paired comparisons require identical seed ordering")
-        arr = np.asarray(agg.metric_arrays[metric], dtype=np.float64)
-        if arr.ndim != 2 or arr.shape[0] != len(agg.seeds) or arr.shape[1] == 0:
-            raise ValueError(f"{name}.{metric} does not align with its seed list")
-        if not np.all(np.isfinite(arr)):
-            raise ValueError(f"{name}.{metric} must contain only finite values")
-        final_window = min(window, arr.shape[1])
-        final_values[name] = np.mean(arr[:, -final_window:], axis=1)
+        arr = agg.metric_arrays[metric]
+        _require_exact_str("name", name)
+        if len(set(agg.seeds)) != len(agg.seeds):
+            raise ValueError(f"AggregatedResults '{name}' contains duplicate seeds")
+        _require_exact_str("name", name)
+        _require_exact_str("metric", metric)
+        if len(agg.seeds) != arr.shape[0]:
+            raise ValueError(
+                f"AggregatedResults '{name}' seed count ({len(agg.seeds)}) does not match "
+                f"metric rows ({arr.shape[0]}) for '{metric}'"
+            )
+        _require_exact_str("name", name)
+        _require_exact_str("metric", metric)
+        if arr.shape[1] == 0:
+            raise ValueError(
+                f"AggregatedResults '{name}' must contain at least one metric step "
+                f"for '{metric}'"
+            )
+        metric_arrays[name] = arr
+        seeds_by_name[name] = agg.seeds
+
+    if n < 2:
+        return {}
+
+    final_window = common_final_window(
+        {name: arr.shape[1] for name, arr in metric_arrays.items()}, window, metric
+    )
+    final_values: dict[str, NDArray[np.float64]] = {
+        name: np.mean(arr[:, -final_window:], axis=1) for name, arr in metric_arrays.items()
+    }
 
     if test not in ("ttest", "mann_whitney", "wilcoxon"):
         raise ValueError(f"Unknown test: {test}")
@@ -499,12 +775,22 @@ def pairwise_comparisons(
             values_a = final_values[name_a]
             values_b = final_values[name_b]
 
+            if test in ("ttest", "wilcoxon"):
+                seeds_a = seeds_by_name[name_a]
+                seeds_b = seeds_by_name[name_b]
+                if set(seeds_a) != set(seeds_b):
+                    raise ValueError(
+                        f"Paired comparison '{name_a}' vs '{name_b}' requires equal seed sets"
+                    )
+                index_b_by_seed = {seed: index for index, seed in enumerate(seeds_b)}
+                values_b = values_b[[index_b_by_seed[seed] for seed in seeds_a]]
+
             if test == "ttest":
                 result = ttest_comparison(
                     values_a,
                     values_b,
                     paired=True,
-                    alpha=alpha,
+                    alpha=alpha_value,
                     method_a=name_a,
                     method_b=name_b,
                 )
@@ -512,7 +798,7 @@ def pairwise_comparisons(
                 result = mann_whitney_comparison(
                     values_a,
                     values_b,
-                    alpha=alpha,
+                    alpha=alpha_value,
                     method_a=name_a,
                     method_b=name_b,
                 )
@@ -520,7 +806,7 @@ def pairwise_comparisons(
                 result = wilcoxon_comparison(
                     values_a,
                     values_b,
-                    alpha=alpha,
+                    alpha=alpha_value,
                     method_a=name_a,
                     method_b=name_b,
                 )
@@ -530,9 +816,9 @@ def pairwise_comparisons(
 
     # Apply multiple comparison correction
     if correction == "bonferroni":
-        significant_list, _ = bonferroni_correction(p_values, alpha)
+        significant_list, _ = bonferroni_correction(p_values, alpha_value)
     elif correction == "holm":
-        significant_list = holm_correction(p_values, alpha)
+        significant_list = holm_correction(p_values, alpha_value)
     else:
         raise ValueError(f"Unknown correction: {correction}")
 
@@ -544,7 +830,7 @@ def pairwise_comparisons(
             statistic=result.statistic,
             p_value=result.p_value,
             significant=sig,
-            alpha=alpha,
+            alpha=alpha_value,
             effect_size=result.effect_size,
             method_a=result.method_a,
             method_b=result.method_b,
@@ -571,13 +857,23 @@ def bootstrap_ci(
 
     Returns:
         Tuple of (point_estimate, ci_lower, ci_upper)
+
+    Raises:
+        ValueError: If ``values`` is empty or contains a non-finite sample,
+            ``statistic`` is not ``"mean"`` or ``"median"``, ``confidence_level``
+            is not strictly between 0 and 1, or ``n_bootstrap`` is not positive.
     """
-    _validate_probability(confidence_level, name="confidence_level")
-    if statistic not in {"mean", "median"}:
-        raise ValueError("statistic must be 'mean' or 'median'")
-    if n_bootstrap < 1:
-        raise ValueError("n_bootstrap must be positive")
-    arr = _validated_values(values, name="values")
+    arr = _require_sample_vector(values, name="values")
+    if len(arr) == 0:
+        raise ValueError(
+            "bootstrap_ci requires at least one value; got an empty array "
+            "(a NaN interval would be indistinguishable from a real CI)"
+        )
+    _require_finite_values(arr, name="values")
+    if type(statistic) is not str or statistic not in ("mean", "median"):
+        raise ValueError("statistic must be either 'mean' or 'median'")
+    _validate_confidence_level(confidence_level)
+    n_bootstrap = _require_positive_int("n_bootstrap", n_bootstrap)
     rng = np.random.default_rng(seed)
 
     stat_func = np.mean if statistic == "mean" else np.median

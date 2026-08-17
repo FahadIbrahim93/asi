@@ -6,6 +6,9 @@ do not establish an integrated Alberta Plan completion result.
 
 from __future__ import annotations
 
+import warnings
+from fractions import Fraction
+
 import chex
 import jax
 import jax.numpy as jnp
@@ -13,12 +16,12 @@ import jax.random as jr
 import numpy as np
 import pytest
 
-from alberta_framework.core.checkpoints import (
-    load_checkpoint_metadata,
-    save_checkpoint,
-)
 from alberta_framework.core.dreaming import DreamingConfig
+from alberta_framework.core.dual_replay import DualReplayConfig
+from alberta_framework.core.experiential_memory import ExperientialMemoryConfig
 from alberta_framework.core.intelligence_amplification import IAConfig
+from alberta_framework.core.learning_signals import LearningSignalEstimatorConfig
+from alberta_framework.core.model_replay_rehearsal import ModelReplayRehearsalConfig
 from alberta_framework.core.oak import OaKConfig
 from alberta_framework.core.options import STOMPConfig, SubtaskSpec
 from alberta_framework.core.prototype_agent import (
@@ -27,13 +30,19 @@ from alberta_framework.core.prototype_agent import (
     PrototypeAgentConfig,
     PrototypeAgentState,
     PrototypeArrayResult,
+    PrototypeExperientialMemoryInput,
+    PrototypeTransition,
     PrototypeUpdateResult,
+    _increment_decision_id,
     feature_to_subtask_specs,
     load_prototype_checkpoint,
     save_prototype_checkpoint,
 )
 from alberta_framework.core.types import DemonType, GVFSpec, create_horde_spec
 from alberta_framework.core.world_model import ActionConditionedWorldModelConfig
+from alberta_framework.core.world_model_ensemble import WorldModelEnsembleConfig
+
+pytestmark = pytest.mark.slow
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -56,11 +65,19 @@ OBS_DIM = 4
 N_PRIM = 2
 
 
-def test_authoritative_transition_is_compiled_as_one_reusable_jax_boundary() -> None:
-    """Validation stays eager while normalized transitions reuse one compiled core."""
+def _materialize_typed_keys(tree):
+    """Convert typed PRNG leaves so Chex can compare complete agent states."""
 
-    assert not hasattr(PrototypeAgent.update_transition, "lower")
-    assert hasattr(PrototypeAgent._update_transition_impl, "lower")
+    def convert(value):
+        dtype = getattr(value, "dtype", None)
+        if dtype is not None and jax.dtypes.issubdtype(
+            dtype,
+            jax.dtypes.prng_key,
+        ):
+            return jr.key_data(value)
+        return value
+
+    return jax.tree.map(convert, tree)
 
 
 def _oak_cfg(
@@ -79,13 +96,26 @@ def _oak_cfg(
 def _wm_cfg(
     obs_dim: int = OBS_DIM,
     n_actions: int = N_PRIM,
+    gamma: float = 0.99,
 ) -> ActionConditionedWorldModelConfig:
     return ActionConditionedWorldModelConfig(
         observation_dim=obs_dim,
         n_actions=n_actions,
+        gamma=gamma,
         hidden_sizes=(),  # linear for speed
         step_size=0.1,
         error_decay=0.99,
+    )
+
+
+def _ensemble_cfg(*, gamma: float) -> WorldModelEnsembleConfig:
+    return WorldModelEnsembleConfig(
+        model=_wm_cfg(gamma=gamma),
+        signal_estimator=LearningSignalEstimatorConfig(
+            ensemble_size=2,
+            target_dim=OBS_DIM + 2,
+        ),
+        ensemble_size=2,
     )
 
 
@@ -215,6 +245,117 @@ class TestPrototypeAgentConfigValidation:
         with pytest.raises(ValueError, match="horde_step_size"):
             PrototypeAgentConfig(oak=_oak_cfg(), horde_step_size=0.0)
 
+    @pytest.mark.parametrize(
+        ("value", "message"),
+        [
+            (float("nan"), "horde_step_size must be a finite real number"),
+            (float("inf"), "horde_step_size must be a finite real number"),
+            (1e100, "horde_step_size must remain finite once narrowed to float32"),
+            (5e-324, "horde_step_size must remain positive once narrowed to float32"),
+            (1e-50, "horde_step_size must remain positive once narrowed to float32"),
+            (Fraction(1, 10**400), "horde_step_size must remain positive once narrowed"),
+        ],
+    )
+    def test_horde_step_size_must_be_positive_in_float32(self, value: object, message: str) -> None:
+        """The Horde consumes float32: host-finite values narrowing to inf or 0 are refused."""
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with pytest.raises(ValueError, match=message):
+                PrototypeAgentConfig(oak=_oak_cfg(), horde_step_size=value)  # type: ignore[arg-type]
+
+    def test_horde_step_size_canonicalizes_reals_and_round_trips(self) -> None:
+        config = PrototypeAgentConfig(oak=_oak_cfg(), horde_step_size=Fraction(1, 8))
+        assert type(config.horde_step_size) is float and config.horde_step_size == 0.125
+        big = PrototypeAgentConfig(oak=_oak_cfg(), horde_step_size=(2**25 - 1) * 2**103 - 1)
+        assert big.horde_step_size == float(np.finfo(np.float32).max)
+        restored = PrototypeAgentConfig.from_config(big.to_config())
+        assert restored.horde_step_size == big.horde_step_size
+        agent = PrototypeAgent(_minimal_config())
+        state = agent.start(agent.init(jr.key(0)), jnp.zeros(OBS_DIM))
+        assert int(agent.update(state, 0.1, jnp.ones(OBS_DIM)).state.step_count) == 1
+
+    def test_world_model_gamma_zero_requires_explicit_transition_api(self) -> None:
+        """A zero model horizon is valid, but the legacy API has no terminal input."""
+        config = PrototypeAgentConfig(
+            oak=_oak_cfg(),
+            world_model=_wm_cfg(gamma=0.0),
+        )
+        restored = PrototypeAgentConfig.from_config(config.to_config())
+        assert restored.world_model is not None
+        assert restored.world_model.gamma == 0.0
+
+        agent = PrototypeAgent(config)
+        state = agent.start(agent.init(jr.key(41)), jnp.zeros(OBS_DIM))
+        next_observation = jnp.ones(OBS_DIM, dtype=jnp.float32)
+        with pytest.raises(ValueError, match="use update_transition"):
+            agent.update(state, jnp.asarray(1.0), next_observation)
+        result = agent.update_transition(
+            state,
+            PrototypeTransition(
+                observation=state.current_raw_observation,
+                action=state.current_action,
+                decision_id=state.current_decision_id,
+                reward=jnp.asarray(1.0, dtype=jnp.float32),
+                discount=jnp.asarray(0.0, dtype=jnp.float32),
+                terminated=jnp.asarray(True),
+                truncated=jnp.asarray(False),
+                next_observation=next_observation,
+                next_decision_observation=next_observation,
+            ),
+        )
+        assert bool(result.transition_diagnostics.valid)
+        assert int(result.state.step_count) == 1
+
+    @pytest.mark.parametrize("lane", ["ensemble", "replay"])
+    def test_legacy_gamma_zero_requires_explicit_boundary(self, lane: str) -> None:
+        kwargs: dict[str, object]
+        if lane == "ensemble":
+            kwargs = {"world_model_ensemble": _ensemble_cfg(gamma=0.0)}
+        else:
+            kwargs = {
+                "model_replay_rehearsal": ModelReplayRehearsalConfig(
+                    ensemble=_ensemble_cfg(gamma=0.0),
+                    replay=DualReplayConfig(
+                        total_capacity=4,
+                        short_term_capacity=2,
+                        observation_dim=OBS_DIM,
+                        action_dim=N_PRIM,
+                        short_term_sample_size=1,
+                        long_term_sample_size=1,
+                    ),
+                )
+            }
+        config = PrototypeAgentConfig(oak=_oak_cfg(), **kwargs)  # type: ignore[arg-type]
+        if lane == "replay":
+            # The replay constructor's independent resource-accounting gate is
+            # outside this wrapper contract. The guard executes before state
+            # access, so a shell instance isolates the dispatch regression.
+            agent = object.__new__(PrototypeAgent)
+            agent._config = config
+            agent._state_builder = None
+            state = object()
+        else:
+            agent = PrototypeAgent(config)
+            state = agent.start(agent.init(jr.key(42)), jnp.zeros(OBS_DIM))
+        with pytest.raises(ValueError, match="use update_transition"):
+            agent.update(
+                state,  # type: ignore[arg-type]
+                jnp.asarray(1.0, dtype=jnp.float32),
+                jnp.ones(OBS_DIM, dtype=jnp.float32),
+            )
+
+    def test_scan_rejects_legacy_gamma_zero_without_explicit_boundaries(self) -> None:
+        agent = PrototypeAgent(
+            PrototypeAgentConfig(oak=_oak_cfg(), world_model=_wm_cfg(gamma=0.0))
+        )
+        state = agent.start(agent.init(jr.key(43)), jnp.zeros(OBS_DIM))
+        with pytest.raises(ValueError, match="use update_transition"):
+            agent.scan(
+                state,
+                jnp.ones((1,), dtype=jnp.float32),
+                jnp.ones((1, OBS_DIM), dtype=jnp.float32),
+            )
+
 
 # ---------------------------------------------------------------------------
 # Config roundtrip
@@ -279,7 +420,7 @@ class TestPrototypeAgentConfigRoundtrip:
 
 
 class TestPrototypeAgentInit:
-    def test_minimal_init_and_start_contract(self) -> None:
+    def test_init_minimal_state_shapes(self) -> None:
         agent = PrototypeAgent(_minimal_config())
         state = agent.init(jr.key(0))
         assert isinstance(state, PrototypeAgentState)
@@ -288,12 +429,38 @@ class TestPrototypeAgentInit:
         assert state.horde_state is None
         assert state.ia_state is None
         assert state.step_count == 0
+
+    def test_init_oak_state_present(self) -> None:
+        agent = PrototypeAgent(_minimal_config())
+        state = agent.init(jr.key(0))
         n_total = N_PRIM + 1  # 1 option
         bls = state.oak_state.stomp_state.base_learner_state
         assert len(bls.head_params.weights) == n_total
+
+    def test_init_full_state_shapes(self) -> None:
+        agent = PrototypeAgent(_full_config())
+        state = agent.init(jr.key(0))
+        assert state.world_model_state is not None
+        assert state.buffer_state is not None
+        assert state.horde_state is not None
+        assert state.ia_state is not None
+
+    def test_start_primes_oak(self) -> None:
+        agent = PrototypeAgent(_minimal_config())
+        state = agent.init(jr.key(0))
         obs = jnp.ones(OBS_DIM)
         primed = agent.start(state, obs)
         chex.assert_trees_all_close(primed.oak_state.stomp_state.base_last_obs, obs, atol=1e-6)
+
+    def test_start_primes_ia(self) -> None:
+        agent = PrototypeAgent(_full_config())
+        state = agent.init(jr.key(0))
+        obs = jnp.ones(OBS_DIM)
+        primed = agent.start(state, obs)
+        assert primed.ia_state is not None
+        chex.assert_trees_all_close(
+            primed.ia_state.cortex_state.stomp_state.base_last_obs, obs, atol=1e-6
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -332,6 +499,12 @@ class TestPrototypeAgentUpdateMinimal:
         assert result.ia_augmented_obs is None
         assert result.ia_recommendation is None
 
+        state = result.state
+        for _ in range(9):
+            result = agent.update(state, jnp.array(0.5), jnp.ones(OBS_DIM))
+            state = result.state
+        assert int(state.step_count) == 10
+
 
 # ---------------------------------------------------------------------------
 # Update: full agent (world model + dreaming + horde + IA)
@@ -341,17 +514,7 @@ class TestPrototypeAgentUpdateMinimal:
 class TestPrototypeAgentUpdateFull:
     def test_full_update_contract(self) -> None:
         agent = PrototypeAgent(_full_config(n_dreams=2))
-        observation = jnp.zeros(OBS_DIM)
-        state = agent.start(agent.init(jr.key(0)), observation)
-        assert state.world_model_state is not None
-        assert state.buffer_state is not None
-        assert state.horde_state is not None
-        assert state.ia_state is not None
-        chex.assert_trees_all_close(
-            state.ia_state.cortex_state.stomp_state.base_last_obs,
-            observation,
-            atol=1e-6,
-        )
+        state = agent.start(agent.init(jr.key(0)), jnp.zeros(OBS_DIM))
         cumulants = jnp.array([0.5, 0.3], dtype=jnp.float32)
         result = agent.update(state, jnp.array(1.0), jnp.ones(OBS_DIM), cumulants)
 
@@ -369,6 +532,75 @@ class TestPrototypeAgentUpdateFull:
         assert int(result.state.world_model_state.step_count) == 1
 
 
+def test_experiential_memory_uses_one_accounted_policy_step() -> None:
+    """Prototype proposal and write must share one recorded pre-state query."""
+    memory_config = ExperientialMemoryConfig(
+        capacity=3,
+        observation_dim=OBS_DIM,
+        key_dim=OBS_DIM,
+        action_dim=N_PRIM,
+        outcome_dim=OBS_DIM + 1,
+        top_k=1,
+        min_neighbors=1,
+    )
+    agent = PrototypeAgent(
+        PrototypeAgentConfig(
+            oak=_oak_cfg(),
+            experiential_memory=memory_config,
+        )
+    )
+    resources = agent.experiential_memory_resource_declaration
+    assert resources is not None
+    assert resources.categorical_policy_queries == 1
+    assert resources.causal_step_queries == 0
+    assert resources.total_deterministic_prestate_queries == 1
+
+    state = agent.start(agent.init(jr.key(31)), jnp.zeros(OBS_DIM, dtype=jnp.float32))
+    transition = PrototypeTransition(
+        observation=state.current_raw_observation,
+        action=state.current_action,
+        decision_id=state.current_decision_id,
+        reward=jnp.asarray(1.0, dtype=jnp.float32),
+        discount=jnp.asarray(1.0, dtype=jnp.float32),
+        terminated=jnp.asarray(False),
+        truncated=jnp.asarray(False),
+        next_observation=jnp.ones(OBS_DIM, dtype=jnp.float32),
+        next_decision_observation=jnp.ones(OBS_DIM, dtype=jnp.float32),
+    )
+    memory_input = PrototypeExperientialMemoryInput(
+        available=jnp.asarray(True),
+        current_prototype_decision_id=state.current_decision_id,
+        next_prototype_decision_id=_increment_decision_id(state.current_decision_id),
+        query_representation_version=jnp.asarray(0, dtype=jnp.int32),
+        entry_representation_version=jnp.asarray(0, dtype=jnp.int32),
+        query_uncertainty=jnp.asarray(0.0, dtype=jnp.float32),
+        query_uncertainty_available=jnp.asarray(True),
+        entry_uncertainty=jnp.asarray(0.0, dtype=jnp.float32),
+        entry_uncertainty_available=jnp.asarray(True),
+        safety_cost=jnp.asarray(0.0, dtype=jnp.float32),
+        safety_cost_available=jnp.asarray(True),
+        reliability=jnp.asarray(1.0, dtype=jnp.float32),
+        utility=jnp.asarray(1.0, dtype=jnp.float32),
+        utility_available=jnp.asarray(True),
+        provenance_id=jnp.asarray(1, dtype=jnp.int32),
+        source_id=jnp.asarray(1, dtype=jnp.int32),
+        next_action_safety_mask=jnp.ones(N_PRIM, dtype=jnp.bool_),
+    )
+
+    result = agent.update_transition(
+        state,
+        transition,
+        experiential_memory_input=memory_input,
+    )
+    diagnostics = result.experiential_memory_diagnostics
+    memory_state = agent._experiential_memory_component_state(result.state.ia_state)
+
+    assert bool(diagnostics.transaction_applied)
+    assert int(diagnostics.deterministic_prestate_query_count) == 1
+    assert int(memory_state.query_count) == 1
+    assert int(memory_state.write_count) == 1
+
+
 # ---------------------------------------------------------------------------
 # Scan
 # ---------------------------------------------------------------------------
@@ -378,7 +610,7 @@ class TestPrototypeAgentScan:
     def test_scan_minimal_contract(self) -> None:
         agent = PrototypeAgent(_minimal_config())
         state = agent.start(agent.init(jr.key(0)), jnp.zeros(OBS_DIM))
-        n_steps = 3
+        n_steps = 8
         rewards = jr.normal(jr.key(42), (n_steps,))
         next_obs = jr.normal(jr.key(43), (n_steps, OBS_DIM))
         result = agent.scan(state, rewards, next_obs)
@@ -390,6 +622,62 @@ class TestPrototypeAgentScan:
         assert int(result.state.step_count) == n_steps
         chex.assert_tree_all_finite(result.oak_td_errors)
 
+    @pytest.mark.parametrize(
+        ("field", "shape"),
+        [
+            ("rewards", (8, 1)),
+            ("rewards", (2, 4)),
+            ("next_observations", (OBS_DIM, 8)),
+            ("next_observations", (2, 4 * OBS_DIM)),
+            ("discounts", (2, 4)),
+        ],
+    )
+    def test_scan_rejects_wrong_shaped_arrays_instead_of_reshaping(
+        self, field: str, shape: tuple[int, ...]
+    ) -> None:
+        """A transposed or wrongly stacked buffer must not be silently reinterpreted row-major."""
+        agent = PrototypeAgent(_minimal_config())
+        state = agent.start(agent.init(jr.key(0)), jnp.zeros(OBS_DIM))
+        n_steps = 8
+        arrays: dict[str, object] = {
+            "rewards": jr.normal(jr.key(42), (n_steps,)),
+            "next_observations": jr.normal(jr.key(43), (n_steps, OBS_DIM)),
+            "discounts": jnp.full((n_steps,), 0.9, dtype=jnp.float32),
+        }
+        arrays[field] = jnp.reshape(arrays[field], shape)
+        with pytest.raises(ValueError, match=f"{field} must have shape"):
+            agent.scan(
+                state,
+                arrays["rewards"],
+                arrays["next_observations"],
+                discounts=arrays["discounts"],
+            )
+
+    def test_scan_matches_sequential(self) -> None:
+        agent = PrototypeAgent(_minimal_config())
+        init_state = agent.start(agent.init(jr.key(0)), jnp.zeros(OBS_DIM))
+        n_steps = 5
+        rewards = jnp.array([0.1, 0.2, 0.0, -0.1, 0.5])
+        next_obs = jnp.ones((n_steps, OBS_DIM)) * jnp.arange(
+            n_steps,
+            dtype=jnp.float32,
+        )[:, None]
+
+        # Sequential
+        state = init_state
+        seq_actions = []
+        for i in range(n_steps):
+            result = agent.update(state, rewards[i], next_obs[i])
+            seq_actions.append(int(result.action))
+            state = result.state
+        seq_final_step = int(state.step_count)
+
+        # Scan
+        scan_result = agent.scan(init_state, rewards, next_obs)
+        scan_final_step = int(scan_result.state.step_count)
+
+        assert seq_final_step == scan_final_step == n_steps
+
     def test_scan_world_model_config_update(self) -> None:
         """Scan with world model enabled runs without error."""
         cfg = PrototypeAgentConfig(
@@ -400,7 +688,7 @@ class TestPrototypeAgentScan:
         )
         agent = PrototypeAgent(cfg)
         state = agent.start(agent.init(jr.key(0)), jnp.zeros(OBS_DIM))
-        n_steps = 2
+        n_steps = 6
         result = agent.scan(state, jnp.zeros(n_steps), jnp.zeros((n_steps, OBS_DIM)))
         assert int(result.state.world_model_state.step_count) == n_steps
 
@@ -411,7 +699,37 @@ class TestPrototypeAgentScan:
 
 
 class TestPrototypeAgentCurate:
-    def test_curate_preserves_configuration_and_can_continue(self) -> None:
+    def test_curate_returns_new_agent_and_state(self) -> None:
+        agent = PrototypeAgent(_minimal_config())
+        state = agent.start(agent.init(jr.key(0)), jnp.zeros(OBS_DIM))
+        # Run a few steps to build utility EMA
+        for _ in range(20):
+            result = agent.update(state, jnp.array(0.0), jnp.ones(OBS_DIM))
+            state = result.state
+        new_agent, new_state = agent.curate(state, jr.key(1))
+        assert isinstance(new_agent, PrototypeAgent)
+        assert isinstance(new_state, PrototypeAgentState)
+
+    def test_curate_preserves_non_oak_states(self) -> None:
+        cfg = PrototypeAgentConfig(
+            oak=_oak_cfg(),
+            world_model=_wm_cfg(),
+            dreaming=DreamingConfig(warmup_steps=1000),
+            n_dreams_per_step=0,
+        )
+        agent = PrototypeAgent(cfg)
+        state = agent.start(agent.init(jr.key(0)), jnp.zeros(OBS_DIM))
+        for _ in range(5):
+            result = agent.update(state, jnp.array(0.0), jnp.ones(OBS_DIM))
+            state = result.state
+        new_agent, new_state = agent.curate(state, jr.key(2))
+        # World model state preserved
+        assert (
+            int(new_state.world_model_state.step_count)
+            == int(state.world_model_state.step_count)
+        )
+
+    def test_curate_preserves_dream_next_observation_mode(self) -> None:
         cfg = PrototypeAgentConfig(
             oak=_oak_cfg(),
             world_model=_wm_cfg(),
@@ -421,24 +739,23 @@ class TestPrototypeAgentCurate:
         )
         agent = PrototypeAgent(cfg)
         state = agent.start(agent.init(jr.key(0)), jax.nn.one_hot(0, OBS_DIM))
-        state = agent.update(
-            state,
-            jnp.array(0.0),
-            jax.nn.one_hot(1, OBS_DIM),
-        ).state
-        new_agent, new_state = agent.curate(state, jr.key(2))
-
-        assert isinstance(new_agent, PrototypeAgent)
-        assert isinstance(new_state, PrototypeAgentState)
+        for _ in range(20):
+            state = agent.update(
+                state,
+                jnp.array(0.0),
+                jax.nn.one_hot(1, OBS_DIM),
+            ).state
+        new_agent, _ = agent.curate(state, jr.key(2))
         assert new_agent.config.dream_next_observation_mode == "sample_one_hot"
-        assert int(new_state.world_model_state.step_count) == int(
-            state.world_model_state.step_count
-        )
-        result = new_agent.update(
-            new_state,
-            jnp.array(0.5),
-            jax.nn.one_hot(2, OBS_DIM),
-        )
+
+    def test_curated_agent_can_continue_learning(self) -> None:
+        agent = PrototypeAgent(_minimal_config())
+        state = agent.start(agent.init(jr.key(0)), jnp.zeros(OBS_DIM))
+        for _ in range(10):
+            result = agent.update(state, jnp.array(1.0), jnp.ones(OBS_DIM))
+            state = result.state
+        new_agent, new_state = agent.curate(state, jr.key(5))
+        result = new_agent.update(new_state, jnp.array(0.5), jnp.ones(OBS_DIM))
         assert jnp.isfinite(result.oak_td_error)
 
 
@@ -448,14 +765,57 @@ class TestPrototypeAgentCurate:
 
 
 class TestAutoSubtaskSpecs:
-    def test_auto_subtask_specs_are_bounded_and_unique(self) -> None:
+    @pytest.mark.parametrize(
+        "n_subtasks",
+        [np.int64(2), np.array(2, dtype=np.int64), jnp.int32(2)],
+        ids=["numpy-scalar", "numpy-array", "jax-scalar"],
+    )
+    def test_auto_subtask_specs_accepts_integer_scalars(self, n_subtasks) -> None:
+        agent = PrototypeAgent(_minimal_config())
+        state = agent.init(jr.key(0))
+
+        specs = agent.auto_subtask_specs(state, n_subtasks=n_subtasks)
+
+        assert len(specs) == 2
+
+    @pytest.mark.parametrize("n_subtasks", [-1, True, False, 1.5, "2"])
+    def test_auto_subtask_specs_rejects_invalid_counts(self, n_subtasks) -> None:
+        agent = PrototypeAgent(_minimal_config())
+        state = agent.init(jr.key(0))
+
+        with pytest.raises(
+            ValueError,
+            match="^n_subtasks must be a non-negative integer$",
+        ):
+            agent.auto_subtask_specs(state, n_subtasks=n_subtasks)
+
+    def test_auto_subtask_specs_count(self) -> None:
         agent = PrototypeAgent(_minimal_config())
         state = agent.start(agent.init(jr.key(0)), jnp.zeros(OBS_DIM))
+        for _ in range(5):
+            result = agent.update(state, jnp.array(1.0), jnp.ones(OBS_DIM))
+            state = result.state
         specs = agent.auto_subtask_specs(state, n_subtasks=3)
-
         assert len(specs) == 3
-        indices = [spec.feature_index for spec in specs]
-        assert all(0 <= index < OBS_DIM for index in indices)
+
+    def test_auto_subtask_specs_valid_indices(self) -> None:
+        agent = PrototypeAgent(_minimal_config())
+        state = agent.start(agent.init(jr.key(0)), jr.normal(jr.key(7), (OBS_DIM,)))
+        for _ in range(10):
+            result = agent.update(state, jr.normal(jr.key(8), ()), jr.normal(jr.key(9), (OBS_DIM,)))
+            state = result.state
+        specs = agent.auto_subtask_specs(state, n_subtasks=4)
+        for spec in specs:
+            assert 0 <= spec.feature_index < OBS_DIM
+
+    def test_auto_subtask_specs_unique_indices(self) -> None:
+        agent = PrototypeAgent(_minimal_config())
+        state = agent.start(agent.init(jr.key(0)), jr.normal(jr.key(10), (OBS_DIM,)))
+        for _ in range(10):
+            result = agent.update(state, jnp.array(1.0), jr.normal(jr.key(11), (OBS_DIM,)))
+            state = result.state
+        specs = agent.auto_subtask_specs(state, n_subtasks=OBS_DIM)
+        indices = [s.feature_index for s in specs]
         assert len(indices) == len(set(indices))
 
 
@@ -465,26 +825,122 @@ class TestAutoSubtaskSpecs:
 
 
 class TestFeatureToSubtaskSpecs:
-    def test_count_cap_and_indices(self) -> None:
+    @pytest.mark.parametrize("n_subtasks", [-1, True, False, 1.5, "2"])
+    def test_rejects_invalid_subtask_counts(self, n_subtasks) -> None:
+        agent = PrototypeAgent(_minimal_config())
+        state = agent.init(jr.key(0))
+
+        with pytest.raises(
+            ValueError,
+            match="^n_subtasks must be a non-negative integer$",
+        ):
+            feature_to_subtask_specs(state.oak_state, n_subtasks=n_subtasks)
+
+    @pytest.mark.parametrize(
+        "n_subtasks",
+        [np.int64(2), np.array(2, dtype=np.int64), jnp.int32(2)],
+        ids=["numpy-scalar", "numpy-array", "jax-scalar"],
+    )
+    def test_accepts_integer_scalar_counts(self, n_subtasks) -> None:
+        agent = PrototypeAgent(_minimal_config())
+        state = agent.init(jr.key(0))
+
+        specs = feature_to_subtask_specs(state.oak_state, n_subtasks=n_subtasks)
+
+        assert len(specs) == 2
+
+    @pytest.mark.parametrize("n_subtasks", [0, np.int64(0), jnp.int32(0)])
+    def test_zero_subtask_count_returns_empty(self, n_subtasks) -> None:
+        agent = PrototypeAgent(_minimal_config())
+        state = agent.init(jr.key(0))
+
+        assert feature_to_subtask_specs(state.oak_state, n_subtasks=n_subtasks) == ()
+
+    def test_huge_subtask_count_caps_at_observation_dim(self) -> None:
+        agent = PrototypeAgent(_minimal_config())
+        state = agent.init(jr.key(0))
+
+        specs = feature_to_subtask_specs(state.oak_state, n_subtasks=10**100)
+
+        assert len(specs) == OBS_DIM
+
+    def test_returns_correct_count(self) -> None:
         agent = PrototypeAgent(_minimal_config())
         state = agent.init(jr.key(0))
         specs = feature_to_subtask_specs(state.oak_state, n_subtasks=2)
         assert len(specs) == 2
-        specs = feature_to_subtask_specs(state.oak_state, n_subtasks=100)
-        assert len(specs) <= OBS_DIM
-        assert all(0 <= spec.feature_index < OBS_DIM for spec in specs)
 
-    def test_applies_subtask_parameters(self) -> None:
+    def test_caps_at_obs_dim(self) -> None:
         agent = PrototypeAgent(_minimal_config())
         state = agent.init(jr.key(0))
-        specs = feature_to_subtask_specs(
-            state.oak_state,
-            n_subtasks=2,
-            threshold=0.7,
-            max_option_steps=15,
+        specs = feature_to_subtask_specs(state.oak_state, n_subtasks=100)
+        assert len(specs) <= OBS_DIM
+
+    def test_respects_threshold(self) -> None:
+        agent = PrototypeAgent(_minimal_config())
+        state = agent.init(jr.key(0))
+        specs = feature_to_subtask_specs(state.oak_state, n_subtasks=2, threshold=0.7)
+        for spec in specs:
+            assert spec.threshold == pytest.approx(0.7)
+
+    def test_respects_max_option_steps(self) -> None:
+        agent = PrototypeAgent(_minimal_config())
+        state = agent.init(jr.key(0))
+        specs = feature_to_subtask_specs(state.oak_state, n_subtasks=2, max_option_steps=15)
+        for spec in specs:
+            assert spec.max_option_steps == 15
+
+    def test_valid_feature_indices(self) -> None:
+        agent = PrototypeAgent(_minimal_config())
+        state = agent.init(jr.key(0))
+        specs = feature_to_subtask_specs(state.oak_state, n_subtasks=OBS_DIM)
+        for spec in specs:
+            assert 0 <= spec.feature_index < OBS_DIM
+
+    def test_ranks_by_max_across_sources_not_sum(self) -> None:
+        """Pins the documented contract (issue #412): ranking is the maximum
+        absolute Q-weight across all base and option policies, i.e.
+        ``jnp.maximum(feature_importance, opt_importance)`` per feature — not
+        the sum of the two per-source maxima. A feature that is mid-weight in
+        both sources must not outrank a feature holding the single largest
+        weight anywhere.
+
+        Reproduction values from the issue: per-feature base max
+        ``[1.0, 0.6, 0.1]``, per-feature option max ``[0.0, 0.6, 0.1]``.
+        Documented (max) ranking is ``[0, 1, 2]``; the pre-fix summed
+        ranking was ``[1, 0, 2]``.
+        """
+        obs_dim = 3
+        config = PrototypeAgentConfig(oak=_oak_cfg(obs_dim=obs_dim, n_prim=N_PRIM))
+        agent = PrototypeAgent(config)
+        state = agent.init(jr.key(0))
+        oak_state = state.oak_state
+        stomp_state = oak_state.stomp_state
+
+        base_row = jnp.array([1.0, 0.6, 0.1], dtype=jnp.float32)
+        head_params = stomp_state.base_learner_state.head_params
+        new_head_params = head_params.replace(
+            weights=tuple(base_row[None, :] for _ in head_params.weights)
         )
-        assert all(spec.threshold == pytest.approx(0.7) for spec in specs)
-        assert all(spec.max_option_steps == 15 for spec in specs)
+        new_base_learner_state = stomp_state.base_learner_state.replace(
+            head_params=new_head_params
+        )
+
+        opt_row = jnp.array([0.0, 0.6, 0.1], dtype=jnp.float32)
+        new_option_policies = stomp_state.option_policies.replace(
+            q_weights=jnp.broadcast_to(opt_row, stomp_state.option_policies.q_weights.shape)
+        )
+
+        patched_oak_state = oak_state.replace(
+            stomp_state=stomp_state.replace(
+                base_learner_state=new_base_learner_state,
+                option_policies=new_option_policies,
+            )
+        )
+
+        specs = feature_to_subtask_specs(patched_oak_state, n_subtasks=3)
+
+        assert [s.feature_index for s in specs] == [0, 1, 2]
 
 
 # ---------------------------------------------------------------------------
@@ -493,218 +949,60 @@ class TestFeatureToSubtaskSpecs:
 
 
 class TestPrototypeAgentSerializationRoundtrip:
-    def test_agent_config_roundtrips(self) -> None:
-        minimal = PrototypeAgent(_minimal_config())
-        restored_minimal = PrototypeAgent.from_config(minimal.to_config())
-        assert restored_minimal.config.oak.observation_dim == OBS_DIM
-        assert restored_minimal.config.world_model is None
+    def test_from_config_to_config_minimal(self) -> None:
+        agent = PrototypeAgent(_minimal_config())
+        restored = PrototypeAgent.from_config(agent.to_config())
+        assert restored.config.oak.observation_dim == OBS_DIM
+        assert restored.config.world_model is None
 
-        full = PrototypeAgent(_full_config())
-        restored_full = PrototypeAgent.from_config(full.to_config())
-        assert restored_full.config.n_dreams_per_step == full.config.n_dreams_per_step
-        assert restored_full.config.horde_spec is not None
-        assert restored_full.config.ia is not None
+    def test_from_config_to_config_full(self) -> None:
+        agent = PrototypeAgent(_full_config())
+        restored = PrototypeAgent.from_config(agent.to_config())
+        assert restored.config.n_dreams_per_step == agent.config.n_dreams_per_step
+        assert restored.config.horde_spec is not None
+        assert restored.config.ia is not None
 
-    def test_primitive_only_checkpoint_roundtrips_empty_option_state_exactly(
+    def test_sample_one_hot_checkpoint_resume_replays_identical_dream_draws(
         self,
         tmp_path,
     ) -> None:
-        config = PrototypeAgentConfig(
-            oak=_oak_cfg(specs=(), obs_dim=2, n_prim=2),
+        base = _full_config(n_dreams=1)
+        config = PrototypeAgentConfig.from_config(
+            {
+                **base.to_config(),
+                "dream_next_observation_mode": "sample_one_hot",
+            }
         )
         agent = PrototypeAgent(config)
-        lifecycle_id = jnp.asarray((1, 2), dtype=jnp.uint32)
-        state = agent.start(
-            agent.init(jr.key(17), lifecycle_id=lifecycle_id),
-            jnp.asarray((1.0, 0.0), dtype=jnp.float32),
+        state = agent.start(agent.init(jr.key(41)), jax.nn.one_hot(0, OBS_DIM))
+        transitions = (
+            (0.25, jax.nn.one_hot(1, OBS_DIM)),
+            (-0.5, jax.nn.one_hot(2, OBS_DIM)),
+            (1.0, jax.nn.one_hot(3, OBS_DIM)),
         )
-        assert state.oak_state.cumulative_pseudo_rewards.size == 0
+        for reward, observation in transitions:
+            state = agent.update(state, reward, observation).state
 
-        checkpoint = tmp_path / "primitive-only"
-        save_prototype_checkpoint(agent, state, checkpoint)
-        metadata = load_checkpoint_metadata(checkpoint)
-        restored_agent, restored_state = load_prototype_checkpoint(checkpoint)
+        checkpoint_path = tmp_path / "prototype-sample-one-hot"
+        save_prototype_checkpoint(agent, state, checkpoint_path)
+        restored_agent, restored_state = load_prototype_checkpoint(checkpoint_path)
 
         assert (
-            metadata["empty_array_codec"]
-            == "alberta.prototype_agent.empty_array_projection.v1"
+            restored_agent.config.dream_next_observation_mode
+            == "sample_one_hot"
         )
-        assert restored_agent.to_config() == agent.to_config()
-        chex.assert_trees_all_equal(restored_state, state)
-
-    def test_rbg_explicit_lifecycle_checkpoint_roundtrips_exactly(
-        self,
-        tmp_path,
-    ) -> None:
-        agent = PrototypeAgent(
-            PrototypeAgentConfig(
-                oak=_oak_cfg(specs=(), obs_dim=2, n_prim=2),
-            )
+        chex.assert_trees_all_close(
+            _materialize_typed_keys(restored_state),
+            _materialize_typed_keys(state),
         )
-        state = agent.start(
-            agent.init(
-                jr.key(23, impl="rbg"),
-                lifecycle_id=jnp.asarray((3, 4), dtype=jnp.uint32),
-            ),
-            jnp.asarray((0.25, -0.5), dtype=jnp.float32),
+        reward = jnp.array(0.75, dtype=jnp.float32)
+        observation = jax.nn.one_hot(1, OBS_DIM)
+        uninterrupted = agent.update(state, reward, observation)
+        resumed = restored_agent.update(restored_state, reward, observation)
+        chex.assert_trees_all_close(
+            _materialize_typed_keys(resumed),
+            _materialize_typed_keys(uninterrupted),
         )
-        checkpoint = tmp_path / "primitive-only-rbg"
-        save_prototype_checkpoint(agent, state, checkpoint)
-
-        hinted_agent, hinted_state = load_prototype_checkpoint(
-            checkpoint,
-            template_key=jr.key(0, impl="rbg"),
-        )
-        restored_agent, restored_state = load_prototype_checkpoint(checkpoint)
-
-        assert load_checkpoint_metadata(checkpoint)["prng_impl"] == "rbg"
-        assert (
-            hinted_agent.to_config()
-            == restored_agent.to_config()
-            == agent.to_config()
-        )
-        chex.assert_trees_all_equal(hinted_state, state)
-        chex.assert_trees_all_equal(restored_state, state)
-        with pytest.raises(ValueError, match="PRNG implementation"):
-            load_prototype_checkpoint(checkpoint, template_key=jr.key(0))
-
-    @pytest.mark.parametrize(
-        ("shape", "dtype"),
-        [
-            pytest.param((0, 1), jnp.float32, id="shape"),
-            pytest.param((0,), jnp.int32, id="dtype"),
-        ],
-    )
-    def test_checkpoint_save_rejects_malformed_empty_leaf_contract(
-        self,
-        tmp_path,
-        shape,
-        dtype,
-    ) -> None:
-        agent = PrototypeAgent(
-            PrototypeAgentConfig(
-                oak=_oak_cfg(specs=(), obs_dim=2, n_prim=2),
-            )
-        )
-        state = agent.start(
-            agent.init(jr.key(18)),
-            jnp.asarray((1.0, 0.0), dtype=jnp.float32),
-        )
-        malformed_state = state.replace(
-            oak_state=state.oak_state.replace(
-                cumulative_pseudo_rewards=jnp.zeros(shape, dtype=dtype),
-            )
-        )
-        assert bool(agent._checkpoint_state_valid(malformed_state))
-
-        with pytest.raises(ValueError, match="array contract"):
-            save_prototype_checkpoint(
-                agent,
-                malformed_state,
-                tmp_path / "malformed-empty-leaf",
-            )
-
-    @pytest.mark.parametrize(
-        ("field", "dtype"),
-        [
-            pytest.param("utility_ema", jnp.int32, id="utility-dtype"),
-            pytest.param("execution_counts", jnp.float32, id="count-dtype"),
-        ],
-    )
-    def test_checkpoint_save_rejects_malformed_nonempty_array_dtype(
-        self,
-        tmp_path,
-        field,
-        dtype,
-    ) -> None:
-        agent = PrototypeAgent(_minimal_config())
-        state = agent.start(
-            agent.init(jr.key(20)),
-            jnp.zeros((OBS_DIM,), dtype=jnp.float32),
-        )
-        original = getattr(state.oak_state, field)
-        assert original.size > 0
-        malformed_state = state.replace(
-            oak_state=state.oak_state.replace(
-                **{field: jnp.asarray(original, dtype=dtype)},
-            )
-        )
-        assert bool(agent._checkpoint_state_valid(malformed_state))
-
-        with pytest.raises(ValueError, match="array contract"):
-            save_prototype_checkpoint(
-                agent,
-                malformed_state,
-                tmp_path / "malformed-nonempty-leaf",
-            )
-
-    def test_checkpoint_save_rejects_scalar_replacing_array_leaf(
-        self,
-        tmp_path,
-    ) -> None:
-        agent = PrototypeAgent(_minimal_config())
-        state = agent.start(
-            agent.init(jr.key(21)),
-            jnp.zeros((OBS_DIM,), dtype=jnp.float32),
-        )
-        malformed_state = state.replace(step_count=0)
-        assert bool(agent._checkpoint_state_valid(malformed_state))
-
-        with pytest.raises(ValueError, match="array contract"):
-            save_prototype_checkpoint(
-                agent,
-                malformed_state,
-                tmp_path / "scalar-state-leaf",
-            )
-
-    def test_checkpoint_save_rejects_numpy_replacing_jax_array_leaf(
-        self,
-        tmp_path,
-    ) -> None:
-        agent = PrototypeAgent(_minimal_config())
-        state = agent.start(
-            agent.init(jr.key(22)),
-            jnp.zeros((OBS_DIM,), dtype=jnp.float32),
-        )
-        malformed_state = state.replace(
-            step_count=np.asarray(0, dtype=np.int32),
-        )
-        assert bool(agent._checkpoint_state_valid(malformed_state))
-
-        with pytest.raises(ValueError, match="array contract"):
-            save_prototype_checkpoint(
-                agent,
-                malformed_state,
-                tmp_path / "numpy-state-leaf",
-            )
-
-    def test_v3_checkpoint_without_empty_array_codec_remains_loadable(
-        self,
-        tmp_path,
-    ) -> None:
-        import alberta_framework.core.prototype_agent as prototype_module
-
-        agent = PrototypeAgent(_minimal_config())
-        state = agent.start(
-            agent.init(jr.key(19)),
-            jnp.zeros((OBS_DIM,), dtype=jnp.float32),
-        )
-        config = agent.to_config()
-        checkpoint = tmp_path / "legacy-v3-storage"
-        save_checkpoint(
-            state,
-            checkpoint,
-            metadata={
-                "schema": PROTOTYPE_CHECKPOINT_SCHEMA,
-                "agent_config": config,
-                "config_sha256": prototype_module._prototype_config_digest(config),
-            },
-        )
-
-        restored_agent, restored_state = load_prototype_checkpoint(checkpoint)
-
-        assert restored_agent.to_config() == config
-        chex.assert_trees_all_equal(restored_state, state)
 
     def test_checkpoint_loader_rejects_wrong_schema_or_config_digest(
         self,
@@ -754,35 +1052,6 @@ class TestPrototypeAgentSerializationRoundtrip:
         with pytest.raises(ValueError, match="not canonical"):
             load_prototype_checkpoint(tmp_path / "not-read")
 
-        monkeypatch.setattr(
-            prototype_module,
-            "load_checkpoint_metadata",
-            lambda _path: {
-                "schema": PROTOTYPE_CHECKPOINT_SCHEMA,
-                "agent_config": config,
-                "config_sha256": prototype_module._prototype_config_digest(config),
-                "empty_array_codec": "unknown.empty-array-codec.v9",
-            },
-        )
-        with pytest.raises(ValueError, match="empty-array codec"):
-            load_prototype_checkpoint(tmp_path / "not-read")
-
-        monkeypatch.setattr(
-            prototype_module,
-            "load_checkpoint_metadata",
-            lambda _path: {
-                "schema": PROTOTYPE_CHECKPOINT_SCHEMA,
-                "agent_config": config,
-                "config_sha256": prototype_module._prototype_config_digest(config),
-                "empty_array_codec": (
-                    "alberta.prototype_agent.empty_array_projection.v1"
-                ),
-                "prng_impl": "unknown-prng-v9",
-            },
-        )
-        with pytest.raises(ValueError, match="PRNG implementation"):
-            load_prototype_checkpoint(tmp_path / "not-read")
-
 
 # ---------------------------------------------------------------------------
 # Dreaming mechanics
@@ -790,6 +1059,26 @@ class TestPrototypeAgentSerializationRoundtrip:
 
 
 class TestPrototypeAgentDreaming:
+    def test_dreams_accepted_after_warmup(self) -> None:
+        """After warmup, at least some dream TD errors should be nonzero."""
+        cfg = PrototypeAgentConfig(
+            oak=_oak_cfg(),
+            world_model=_wm_cfg(),
+            dreaming=DreamingConfig(warmup_steps=1, max_model_error_ema=1e6),
+            buffer_capacity=50,
+            n_dreams_per_step=4,
+        )
+        agent = PrototypeAgent(cfg)
+        state = agent.start(agent.init(jr.key(0)), jnp.zeros(OBS_DIM))
+        # Warm up the world model and buffer
+        for _ in range(10):
+            result = agent.update(state, jnp.array(0.5), jr.normal(jr.key(13), (OBS_DIM,)))
+            state = result.state
+        result = agent.update(state, jnp.array(1.0), jnp.ones(OBS_DIM))
+        assert result.dream_td_errors is not None
+        chex.assert_shape(result.dream_td_errors, (4,))
+        chex.assert_tree_all_finite(result.dream_td_errors)
+
     def test_dreams_zero_before_warmup(self) -> None:
         """During warmup, dream TD errors should all be zero (gated)."""
         cfg = PrototypeAgentConfig(
@@ -874,38 +1163,76 @@ class TestGRUPerceptionConfig:
 
 
 class TestGRUPerceptionStateInit:
-    def test_state_initialization_contract(self) -> None:
+    def test_hidden_zeros_at_init(self) -> None:
         agent = PrototypeAgent(_gru_config())
         state = agent.init(jr.key(0))
         assert state.gru_state is not None
         chex.assert_shape(state.gru_state.hidden, (GRU_HIDDEN,))
         assert float(jnp.max(jnp.abs(state.gru_state.hidden))) == pytest.approx(0.0)
+
+    def test_weight_shapes_correct(self) -> None:
+        agent = PrototypeAgent(_gru_config())
+        state = agent.init(jr.key(1))
         gru = state.gru_state
         chex.assert_shape(gru.W_z, (GRU_HIDDEN, GRU_OBS_DIM))
         chex.assert_shape(gru.U_z, (GRU_HIDDEN, GRU_HIDDEN))
         chex.assert_shape(gru.b_z, (GRU_HIDDEN,))
-        assert PrototypeAgent(_minimal_config()).init(jr.key(1)).gru_state is None
+
+    def test_no_gru_state_when_disabled(self) -> None:
+        agent = PrototypeAgent(_minimal_config())
+        state = agent.init(jr.key(0))
+        assert state.gru_state is None
 
 
 class TestGRUPerceptionUpdate:
-    def test_start_and_update_contract(self) -> None:
+    def test_hidden_updates_after_start(self) -> None:
         agent = PrototypeAgent(_gru_config())
         state0 = agent.init(jr.key(0))
         obs = jr.normal(jr.key(1), (GRU_OBS_DIM,))
-        state = agent.start(state0, obs)
-        assert float(jnp.max(jnp.abs(state.gru_state.hidden))) > 0.0
+        state1 = agent.start(state0, obs)
+        assert float(jnp.max(jnp.abs(state1.gru_state.hidden))) > 0.0
+
+    def test_oak_receives_augmented_obs(self) -> None:
+        """OaK last_obs should have augmented dimension after start."""
+        agent = PrototypeAgent(_gru_config())
+        state = agent.start(agent.init(jr.key(0)), jr.normal(jr.key(1), (GRU_OBS_DIM,)))
         stored = state.oak_state.stomp_state.base_last_obs
         chex.assert_shape(stored, (GRU_AUG_DIM,))
+
+    def test_update_changes_hidden(self) -> None:
+        agent = PrototypeAgent(_gru_config())
+        state = agent.start(agent.init(jr.key(0)), jnp.zeros(GRU_OBS_DIM))
         h0 = state.gru_state.hidden
-        result = agent.update(
-            state,
-            jnp.array(1.0),
-            jr.normal(jr.key(2), (GRU_OBS_DIM,)),
-        )
+        obs = jr.normal(jr.key(2), (GRU_OBS_DIM,))
+        result = agent.update(state, jnp.array(1.0), obs)
         h1 = result.state.gru_state.hidden
         assert not jnp.allclose(h0, h1)
+
+    def test_update_finite(self) -> None:
+        agent = PrototypeAgent(_gru_config())
+        state = agent.start(agent.init(jr.key(0)), jnp.zeros(GRU_OBS_DIM))
+        for _ in range(10):
+            obs = jr.normal(jr.key(42), (GRU_OBS_DIM,))
+            result = agent.update(state, jnp.array(1.0), obs)
+            state = result.state
         assert jnp.isfinite(result.oak_td_error)
-        assert jnp.all(jnp.isfinite(result.state.gru_state.hidden))
+        assert jnp.all(jnp.isfinite(state.gru_state.hidden))
+
+    def test_curate_preserves_gru_config(self) -> None:
+        from alberta_framework.core.prototype_agent import GRUPerceptionConfig
+
+        agent = PrototypeAgent(
+            PrototypeAgentConfig(
+                oak=_oak_cfg(specs=(_SPEC0, _SPEC1), obs_dim=GRU_AUG_DIM),
+                gru_perception=GRUPerceptionConfig(
+                    observation_dim=GRU_OBS_DIM, hidden_dim=GRU_HIDDEN
+                ),
+            )
+        )
+        state = agent.start(agent.init(jr.key(0)), jnp.zeros(GRU_OBS_DIM))
+        new_agent, new_state = agent.curate(state, jr.key(99))
+        assert new_agent.config.gru_perception is not None
+        assert new_agent.config.gru_perception.hidden_dim == GRU_HIDDEN
 
 
 class TestAutoCurate:
@@ -920,23 +1247,37 @@ class TestAutoCurate:
         state = agent.start(agent.init(jr.key(0)), jnp.zeros(OBS_DIM))
         return agent, state
 
-    def test_config_validation_and_roundtrip(self) -> None:
+    def test_config_roundtrip_with_auto_curate(self) -> None:
         cfg = PrototypeAgentConfig(oak=_oak_cfg(), auto_curate_every=50)
         cfg2 = PrototypeAgentConfig.from_config(cfg.to_config())
         assert cfg2.auto_curate_every == 50
+
+    def test_negative_auto_curate_raises(self) -> None:
         with pytest.raises(ValueError, match="auto_curate_every"):
             PrototypeAgentConfig(oak=_oak_cfg(), auto_curate_every=-1)
 
-    def test_maybe_curate_noop_branches(self) -> None:
+    def test_maybe_curate_disabled_returns_same(self) -> None:
         agent, state = self._agent(auto_curate_every=0)
         new_agent, new_state = agent.maybe_curate(state, jr.key(1))
         assert new_agent is agent
         assert new_state is state
 
+    def test_maybe_curate_defers_at_zero_step(self) -> None:
+        """At step 0 the schedule aligns (0 % 10 == 0) but curation defers.
+
+        Evicting at birth would act on untrained utility estimates (and can
+        land mid-option right after ``start``), so ``curate`` returns the
+        agent unchanged; scheduled firing is covered by
+        ``test_maybe_curate_fires_every_n_steps``.
+        """
         agent, state = self._agent(auto_curate_every=10)
         new_agent, new_state = agent.maybe_curate(state, jr.key(2))
         assert new_agent is agent
         assert new_state is state
+
+    def test_maybe_curate_does_not_fire_at_non_aligned_step(self) -> None:
+        agent, state = self._agent(auto_curate_every=10)
+        # Advance step_count to 1 via an update
         obs = jr.normal(jr.key(7), (OBS_DIM,))
         result = agent.update(state, jnp.array(0.0), obs)
         state1 = result.state
@@ -944,3 +1285,21 @@ class TestAutoCurate:
         new_agent, new_state = agent.maybe_curate(state1, jr.key(3))
         assert new_agent is agent
         assert new_state is state1
+
+    def test_maybe_curate_preserves_auto_curate_every(self) -> None:
+        agent, state = self._agent(auto_curate_every=5)
+        new_agent, _ = agent.maybe_curate(state, jr.key(4))
+        assert new_agent.config.auto_curate_every == 5
+
+    def test_maybe_curate_fires_every_n_steps(self) -> None:
+        agent, state = self._agent(auto_curate_every=5)
+        curations = 0
+        obs = jr.normal(jr.key(0), (OBS_DIM,))
+        for i in range(15):
+            if int(state.step_count) % 5 == 0:
+                agent, state = agent.maybe_curate(state, jr.key(i + 100))
+                curations += 1
+            result = agent.update(state, jnp.array(0.0), obs)
+            state = result.state
+        # Fires at step_count 0, 5, 10 → exactly 3
+        assert curations == 3

@@ -6,7 +6,9 @@ learn a one-step model — expected reward and next observation (or observation
 delta, with ``predict_delta=True``) given the current observation and action —
 online, from the same stream the control learner sees.  Step 7's Dyna backups
 and Step 9's guarded dreaming both consume this model.  The implementation
-lives in :mod:`alberta_framework.core.world_model`.
+lives in :mod:`alberta_framework.core.world_model`. The facade rejects illegal
+dimensions and decay/step-size/sparsity/leaky-ReLU scalars before constructing
+that core model; accepted numbers are canonicalized to builtin ints and floats.
 
 Network defaults follow the streaming stability recipe used across the
 package (Elsayed et al. 2024, "Streaming Deep Reinforcement Learning Finally
@@ -25,12 +27,14 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass
+from numbers import Integral
 from typing import Any, cast
 
 import jax.numpy as jnp
 import jax.random as jr
 from jax import Array
 
+from alberta_framework._seed_validation import require_jax_seed
 from alberta_framework.core.world_model import (
     OneStepWorldModel,
     WorldModelConfig,
@@ -39,6 +43,11 @@ from alberta_framework.core.world_model import (
     WorldModelUpdateResult,
     run_world_model_learning_loop,
 )
+from alberta_framework.steps._float32_validation import (
+    canonical_float32_storage,
+    finite_real_and_float32,
+)
+from alberta_framework.steps._smoke_record_validation import require_step_shape
 
 
 @dataclass(frozen=True)
@@ -56,10 +65,22 @@ class Step8WorldModelConfig:
     predict_delta: bool = False
     utility_decay: float = 0.99
 
+    def __post_init__(self) -> None:
+        """Reject illegal dimensions and scientific scalars, then canonicalize."""
+        _validate_world_model_config(self)
+
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-serializable representation."""
         payload = asdict(self)
-        payload["hidden_sizes"] = list(self.hidden_sizes)
+        payload["hidden_sizes"] = [int(h) for h in self.hidden_sizes]
+        payload["observation_dim"] = int(self.observation_dim)
+        if self.n_actions is not None:
+            payload["n_actions"] = int(self.n_actions)
+        payload["action_dim"] = int(self.action_dim)
+        payload["step_size"] = float(self.step_size)
+        payload["sparsity"] = float(self.sparsity)
+        payload["leaky_relu_slope"] = float(self.leaky_relu_slope)
+        payload["utility_decay"] = float(self.utility_decay)
         return payload
 
     @classmethod
@@ -68,7 +89,7 @@ class Step8WorldModelConfig:
         data = dict(payload)
         hidden_sizes = data.get("hidden_sizes", (64,))
         if isinstance(hidden_sizes, list):
-            data["hidden_sizes"] = tuple(int(v) for v in hidden_sizes)
+            data["hidden_sizes"] = tuple(hidden_sizes)
         return cls(**cast(Any, data))
 
     def to_core_config(self) -> WorldModelConfig:
@@ -87,6 +108,114 @@ class Step8WorldModelConfig:
         )
 
 
+_INT32_MAX = 2**31 - 1
+
+
+def _require_nonnegative_real(name: str, value: object) -> float:
+    real, numerator, _, narrowed = finite_real_and_float32(name, value)
+    if real < 0.0 or numerator < 0 or narrowed < 0.0:
+        raise ValueError(f"{name} must be non-negative, got {value!r}")
+    return canonical_float32_storage(real, narrowed)
+
+
+def _require_unit_interval(name: str, value: object) -> float:
+    real, numerator, denominator, narrowed = finite_real_and_float32(name, value)
+    if (
+        real < 0.0
+        or not real <= 1.0
+        or numerator < 0
+        or numerator > denominator
+        or narrowed < 0.0
+        or not narrowed <= 1.0
+    ):
+        raise ValueError(f"{name} must be in [0, 1], got {value!r}")
+    return canonical_float32_storage(real, narrowed)
+
+
+def _require_half_open_unit_interval(name: str, value: object) -> float:
+    real, numerator, denominator, narrowed = finite_real_and_float32(name, value)
+    if (
+        real < 0.0
+        or not real < 1.0
+        or numerator < 0
+        or numerator >= denominator
+        or narrowed < 0.0
+        or not narrowed < 1.0
+    ):
+        raise ValueError(f"{name} must be in [0, 1), got {value!r}")
+    return canonical_float32_storage(real, narrowed)
+
+
+def _require_int(
+    name: str,
+    value: object,
+    *,
+    minimum: int | None = None,
+    maximum: int | None = None,
+) -> int:
+    actual_type = type(value)
+    if issubclass(actual_type, bool) or not issubclass(actual_type, Integral):
+        raise ValueError(f"{name} must be an integer, got {value!r}")
+    number = int(cast(Integral, value))
+    if minimum is not None and number < minimum:
+        if minimum == 1:
+            raise ValueError(f"{name} must be positive, got {value!r}")
+        if minimum == 0:
+            raise ValueError(f"{name} must be non-negative, got {value!r}")
+        raise ValueError(f"{name} must be >= {minimum}, got {value!r}")
+    if maximum is not None and number > maximum:
+        raise ValueError(f"{name} must be at most int32 max, got {value!r}")
+    return number
+
+
+def _require_bool(name: str, value: object) -> bool:
+    if type(value) is not bool:
+        raise ValueError(f"{name} must be a built-in bool")
+    return value
+
+
+def _validate_world_model_config(config: Step8WorldModelConfig) -> None:
+    observation_dim = _require_int(
+        "observation_dim",
+        config.observation_dim,
+        minimum=1,
+        maximum=_INT32_MAX,
+    )
+    n_actions = (
+        None
+        if config.n_actions is None
+        else _require_int("n_actions", config.n_actions, minimum=1, maximum=_INT32_MAX)
+    )
+    action_dim = _require_int("action_dim", config.action_dim, minimum=1, maximum=_INT32_MAX)
+    if type(config.hidden_sizes) is not tuple:
+        raise ValueError(
+            f"hidden_sizes must be an actual tuple, got {type(config.hidden_sizes).__name__}"
+        )
+    hidden_sizes = tuple(
+        _require_int("hidden_sizes", size, minimum=1, maximum=_INT32_MAX)
+        for size in config.hidden_sizes
+    )
+    step_size = _require_nonnegative_real("step_size", config.step_size)
+    sparsity = _require_unit_interval("sparsity", config.sparsity)
+    leaky_relu_slope = _require_nonnegative_real(
+        "leaky_relu_slope",
+        config.leaky_relu_slope,
+    )
+    utility_decay = _require_half_open_unit_interval("utility_decay", config.utility_decay)
+    use_layer_norm = _require_bool("use_layer_norm", config.use_layer_norm)
+    predict_delta = _require_bool("predict_delta", config.predict_delta)
+    object.__setattr__(config, "observation_dim", observation_dim)
+    object.__setattr__(config, "n_actions", n_actions)
+    object.__setattr__(config, "action_dim", action_dim)
+    object.__setattr__(config, "hidden_sizes", hidden_sizes)
+    object.__setattr__(config, "step_size", step_size)
+    object.__setattr__(config, "sparsity", sparsity)
+    object.__setattr__(config, "leaky_relu_slope", leaky_relu_slope)
+    object.__setattr__(config, "use_layer_norm", use_layer_norm)
+    object.__setattr__(config, "predict_delta", predict_delta)
+    object.__setattr__(config, "utility_decay", utility_decay)
+
+
 @dataclass(frozen=True)
 class Step8SmokeResult:
     """Summary returned by :func:`run_step8_smoke`."""
@@ -100,6 +229,24 @@ class Step8SmokeResult:
     next_observation_errors_shape: tuple[int, ...]
     finite: bool
     model_config: dict[str, Any]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "steps", _require_int("steps", self.steps, minimum=1, maximum=_INT32_MAX)
+        )
+        object.__setattr__(self, "seed", require_jax_seed(self.seed, name="seed"))
+        for name in (
+            "reward_predictions_shape",
+            "next_observation_predictions_shape",
+            "reward_errors_shape",
+            "next_observation_errors_shape",
+        ):
+            object.__setattr__(
+                self,
+                name,
+                require_step_shape(name, getattr(self, name), steps=self.steps),
+            )
+        object.__setattr__(self, "finite", _require_bool("finite", self.finite))
 
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-serializable representation."""
@@ -178,9 +325,7 @@ def step8_ensemble_predict(
     mean_reward = jnp.mean(reward_predictions, axis=0)
     mean_next_observation = jnp.mean(next_observation_predictions, axis=0)
     reward_disagreement = jnp.var(reward_predictions, axis=0)
-    next_observation_disagreement = jnp.mean(
-        jnp.var(next_observation_predictions, axis=0)
-    )
+    next_observation_disagreement = jnp.mean(jnp.var(next_observation_predictions, axis=0))
     total_disagreement = reward_disagreement + next_observation_disagreement
     return Step8EnsemblePrediction(
         reward_predictions=reward_predictions,

@@ -18,9 +18,10 @@ Reference: Elsayed et al. 2024, "Streaming Deep Reinforcement Learning Finally W
 import dataclasses
 import functools
 import math
+import operator
 import time
 from collections.abc import Mapping
-from typing import Any, cast
+from typing import Any, SupportsIndex, cast
 
 import chex
 import jax
@@ -29,8 +30,9 @@ import numpy as np
 from jax import Array
 from jaxtyping import Bool, Float, UInt
 
-from alberta_framework.core._float32_scalars import validated_float32_scalar
+from alberta_framework.core._float32_scalars import validated_float32_scalar_with_ratio
 from alberta_framework.core.initializers import sparse_init
+from alberta_framework.core.learners import _update_from_gradient_with_diagnostics
 from alberta_framework.core.normalizers import (
     AnyNormalizerState,
     Normalizer,
@@ -54,35 +56,130 @@ from alberta_framework.core.types import (
     ObGDState,
     TraceMode,
 )
+from alberta_framework.core.update_safety import (
+    floating_tree_is_finite as _floating_tree_is_finite,
+)
 
 MULTI_HEAD_MLP_STATE_SCHEMA = "alberta.multi-head-mlp-state.v2"
 MULTI_HEAD_LIFETIME_COUNTER_NBYTES = 12
 MULTI_HEAD_LIFETIME_COUNTER_DELTA_NBYTES = 8
 
 _INT32_MAX = 2**31 - 1
+_FLOAT32_HALF_MIN_SUBNORMAL_DENOMINATOR = 1 << 150
+_CONFIG_FIELDS = frozenset(
+    {
+        "type",
+        "state_schema",
+        "n_heads",
+        "hidden_sizes",
+        "optimizer",
+        "bounder",
+        "normalizer",
+        "head_optimizer",
+        "sparsity",
+        "leaky_relu_slope",
+        "use_layer_norm",
+        "gamma",
+        "lamda",
+        "per_head_gamma_lamda",
+        "trace_mode",
+        "utility_decay",
+    }
+)
+
 _ACTUAL_INT_TYPES: tuple[type, ...] = (
     int,
     np.int8,
     np.int16,
     np.int32,
     np.int64,
-    np.longlong,
     np.uint8,
     np.uint16,
     np.uint32,
     np.uint64,
+    np.longlong,
     np.ulonglong,
 )
 
 
-def _require_hidden_width(name: str, value: object) -> int:
-    actual_type = type(value)
-    if issubclass(actual_type, bool) or actual_type not in _ACTUAL_INT_TYPES:
-        raise ValueError(f"{name} must be an integer in [1, {_INT32_MAX}]")
-    number = int(cast(int, value))
-    if not 1 <= number <= _INT32_MAX:
-        raise ValueError(f"{name} must be an integer in [1, {_INT32_MAX}], got {value!r}")
+def _validated_nonnegative_float32_scalar(
+    name: str,
+    value: object,
+    *,
+    upper: float | None = None,
+    upper_inclusive: bool = True,
+) -> float:
+    """Validate a nonnegative float32 sink without erasing a nonzero."""
+    stored, numerator, denominator = validated_float32_scalar_with_ratio(
+        name,
+        value,
+        lower=0.0,
+        upper=upper,
+        upper_inclusive=upper_inclusive,
+    )
+    if (
+        numerator != 0
+        and numerator * _FLOAT32_HALF_MIN_SUBNORMAL_DENOMINATOR <= denominator
+    ):
+        raise ValueError(f"{name} must remain nonzero once narrowed to float32")
+    return stored
+
+
+def _require_int(
+    name: str,
+    value: object,
+    *,
+    minimum: int | None = None,
+    maximum: int | None = None,
+) -> int:
+    if type(value) not in _ACTUAL_INT_TYPES:
+        raise ValueError(f"{name} must be an integer")
+    number = operator.index(cast(SupportsIndex, value))
+    if minimum is not None and number < minimum:
+        if minimum == 1:
+            raise ValueError(f"{name} must be positive, got {number}")
+        if minimum == 0:
+            raise ValueError(f"{name} must be non-negative, got {number}")
+        raise ValueError(f"{name} must be >= {minimum}, got {number}")
+    if maximum is not None and number > maximum:
+        raise ValueError(f"{name} must be <= {maximum}, got {number}")
     return number
+
+
+def _require_int32_product(name: str, left: int, right: int) -> int:
+    """Return a derived allocation count or reject it before array construction."""
+    if left > _INT32_MAX // right:
+        raise ValueError(f"derived {name} must be at most {_INT32_MAX}")
+    return left * right
+
+
+def _validate_direct_state_resources(
+    n_heads: int,
+    hidden_sizes: tuple[int, ...],
+    feature_dim: int,
+) -> None:
+    """Preflight aggregate arrays allocated directly by ``init``."""
+    layer_sizes = (feature_dim, *hidden_sizes)
+    trunk_parameter_count = sum(
+        fan_out * (fan_in + 1)
+        for fan_in, fan_out in zip(layer_sizes, layer_sizes[1:], strict=False)
+    )
+    final_width = hidden_sizes[-1] if hidden_sizes else feature_dim
+    head_parameter_count = n_heads * (final_width + 1)
+    parameter_count = trunk_parameter_count + head_parameter_count
+    direct_state_scalars = 2 * parameter_count + sum(hidden_sizes) + 3
+    for name, value in (
+        ("parameter_count", parameter_count),
+        ("direct_state_scalars", direct_state_scalars),
+        ("direct_state_bytes", 4 * direct_state_scalars),
+    ):
+        if not 1 <= value <= _INT32_MAX:
+            raise ValueError(f"derived {name} must be at most {_INT32_MAX}")
+
+
+def _skip_zero_scale(scale: Array, value: Array) -> Array:
+    """Return 0 when ``scale`` is 0 so IEEE ``0 * inf`` does not become NaN."""
+    return jnp.where(scale == 0.0, jnp.zeros_like(value), scale * value)
 
 
 def _extract_mean_step_size(
@@ -102,17 +199,6 @@ def _extract_mean_step_size(
         # LMSState
         return opt_state.step_size
     return jnp.array(0.0, dtype=jnp.float32)
-
-
-def _floating_tree_is_finite(tree: object) -> Bool[Array, ""]:
-    """Return whether every floating/complex persistent leaf is finite."""
-
-    valid = jnp.asarray(True, dtype=jnp.bool_)
-    for leaf in jax.tree.leaves(tree):
-        array = jnp.asarray(leaf)
-        if jnp.issubdtype(array.dtype, jnp.inexact):
-            valid = valid & jnp.all(jnp.isfinite(array))
-    return valid
 
 
 # =============================================================================
@@ -384,35 +470,49 @@ class MultiHeadMLPLearner:
                 gradient is nonzero, decaying the old trace elsewhere.
             utility_decay: EMA decay for hidden-unit utility diagnostics.
         """
-        if not 0.0 <= utility_decay < 1.0:
-            raise ValueError("utility_decay must be in [0, 1)")
-
-        n_heads = _require_hidden_width("n_heads", n_heads)
+        n_heads = _require_int("n_heads", n_heads, minimum=1, maximum=_INT32_MAX)
         if type(hidden_sizes) is not tuple:
             raise ValueError(
                 f"hidden_sizes must be an actual tuple, got {type(hidden_sizes).__name__}"
             )
         hidden_sizes = tuple(
-            _require_hidden_width(f"hidden_sizes[{i}]", value)
-            for i, value in enumerate(hidden_sizes)
+            _require_int(f"hidden_sizes[{i}]", v, minimum=1, maximum=_INT32_MAX)
+            for i, v in enumerate(hidden_sizes)
         )
-        if per_head_gamma_lamda is not None:
-            if type(per_head_gamma_lamda) is not tuple:
-                raise ValueError(
-                    "per_head_gamma_lamda must be an actual tuple, "
-                    f"got {type(per_head_gamma_lamda).__name__}"
-                )
-            if len(per_head_gamma_lamda) != n_heads:
-                raise ValueError(
-                    f"per_head_gamma_lamda must have length n_heads ({n_heads}), "
-                    f"got {len(per_head_gamma_lamda)}"
-                )
-            per_head_gamma_lamda = tuple(
-                validated_float32_scalar(
-                    f"per_head_gamma_lamda[{i}]", value, lower=0.0, upper=1.0
-                )
-                for i, value in enumerate(per_head_gamma_lamda)
+        for layer_index, (fan_in, fan_out) in enumerate(
+            zip(hidden_sizes, hidden_sizes[1:], strict=False)
+        ):
+            _require_int32_product(
+                f"hidden_layer[{layer_index}]_scalars",
+                fan_in,
+                fan_out,
             )
+        _require_int32_product("per_head_metrics_scalars", n_heads, 3)
+        if hidden_sizes:
+            _require_int32_product("head_weight_scalars", n_heads, hidden_sizes[-1])
+        _validate_direct_state_resources(n_heads, hidden_sizes, feature_dim=1)
+        if per_head_gamma_lamda is not None and type(per_head_gamma_lamda) is not tuple:
+            raise ValueError(
+                "per_head_gamma_lamda must be an actual tuple when constructed directly"
+            )
+        sparsity = _validated_nonnegative_float32_scalar(
+            "sparsity", sparsity, upper=1.0
+        )
+        leaky_relu_slope = _validated_nonnegative_float32_scalar(
+            "leaky_relu_slope", leaky_relu_slope
+        )
+        gamma = _validated_nonnegative_float32_scalar("gamma", gamma, upper=1.0)
+        lamda = _validated_nonnegative_float32_scalar("lamda", lamda, upper=1.0)
+        if type(use_layer_norm) is not bool:
+            raise ValueError("use_layer_norm must be an exact bool")
+        if type(trace_mode) is not TraceMode:
+            raise ValueError("trace_mode must be a TraceMode")
+        utility_decay = _validated_nonnegative_float32_scalar(
+            "utility_decay",
+            utility_decay,
+            upper=1.0,
+            upper_inclusive=False,
+        )
 
         self._n_heads = n_heads
         self._hidden_sizes = hidden_sizes
@@ -453,11 +553,36 @@ class MultiHeadMLPLearner:
                 f"trace decay with a shared trunk."
             )
             raise ValueError(msg)
+        if gamma != 0.0 and lamda != 0.0:
+            _validated_nonnegative_float32_scalar(
+                "gamma * lamda",
+                gamma * lamda,
+                upper=1.0,
+            )
+        if per_head_gamma_lamda is not None:
+            if len(per_head_gamma_lamda) != self._n_heads:
+                raise ValueError(
+                    f"per_head_gamma_lamda must have length n_heads ({self._n_heads}), "
+                    f"got {len(per_head_gamma_lamda)}"
+                )
+            self._per_head_gl = tuple(
+                _validated_nonnegative_float32_scalar(
+                    f"per_head_gamma_lamda[{head_index}]",
+                    gl,
+                    upper=1.0,
+                )
+                for head_index, gl in enumerate(per_head_gamma_lamda)
+            )
 
     @property
     def n_heads(self) -> int:
         """Number of prediction heads."""
         return self._n_heads
+
+    @property
+    def hidden_sizes(self) -> tuple[int, ...]:
+        """Canonical hidden-layer widths."""
+        return self._hidden_sizes
 
     @property
     def normalizer(self) -> Normalizer[Any] | None:
@@ -515,13 +640,27 @@ class MultiHeadMLPLearner:
             optimizer_from_config,
         )
 
-        config = dict(config)
-        config.pop("type", None)
-        state_schema = config.pop("state_schema", MULTI_HEAD_MLP_STATE_SCHEMA)
-        if state_schema != MULTI_HEAD_MLP_STATE_SCHEMA:
-            raise ValueError(
-                f"Unsupported MultiHeadMLP state schema: {state_schema!r}"
-            )
+        if type(config) is not dict:
+            raise ValueError("MultiHeadMLPLearner config must be an actual dict")
+        if not all(type(key) is str for key in config) or set(config) != _CONFIG_FIELDS:
+            raise ValueError("MultiHeadMLPLearner config fields do not match the schema")
+        if type(config["type"]) is not str or config["type"] != "MultiHeadMLPLearner":
+            raise ValueError("unexpected MultiHeadMLPLearner config type")
+        if (
+            type(config["state_schema"]) is not str
+            or config["state_schema"] != MULTI_HEAD_MLP_STATE_SCHEMA
+        ):
+            raise ValueError("unsupported MultiHeadMLP state schema")
+        if type(config["hidden_sizes"]) is not list:
+            raise ValueError("hidden_sizes must be a list")
+        if (
+            config["per_head_gamma_lamda"] is not None
+            and type(config["per_head_gamma_lamda"]) is not list
+        ):
+            raise ValueError("per_head_gamma_lamda must be a list")
+        config = config.copy()
+        config.pop("type")
+        config.pop("state_schema")
 
         optimizer = optimizer_from_config(config.pop("optimizer"))
         bounder_cfg = config.pop("bounder", None)
@@ -535,22 +674,16 @@ class MultiHeadMLPLearner:
             optimizer_from_config(head_opt_cfg) if head_opt_cfg is not None else None
         )
 
-        per_head_gl = config.pop("per_head_gamma_lamda", None)
+        per_head_gl = config.pop("per_head_gamma_lamda")
         if per_head_gl is not None:
-            if type(per_head_gl) is not list:
-                raise ValueError(
-                    f"per_head_gamma_lamda must be a list, got {type(per_head_gl).__name__}"
-                )
             per_head_gl = tuple(per_head_gl)
 
-        trace_mode_str = config.pop("trace_mode", None)
-        trace_mode = (
-            TraceMode(trace_mode_str) if trace_mode_str is not None else TraceMode.ACCUMULATING
-        )
+        trace_mode_str = config.pop("trace_mode")
+        if type(trace_mode_str) is not str:
+            raise ValueError("trace_mode must be a string")
+        trace_mode = TraceMode(trace_mode_str)
 
         raw_hidden = config.pop("hidden_sizes")
-        if type(raw_hidden) is not list:
-            raise ValueError(f"hidden_sizes must be a list, got {type(raw_hidden).__name__}")
 
         return cls(
             n_heads=config.pop("n_heads"),
@@ -575,6 +708,16 @@ class MultiHeadMLPLearner:
             Initial state with sparse trunk weights, zero biases, and
             per-head output layers
         """
+        feature_dim = _require_int(
+            "feature_dim", feature_dim, minimum=1, maximum=_INT32_MAX
+        )
+        if self._hidden_sizes:
+            _require_int32_product(
+                "input_layer_scalars", feature_dim, self._hidden_sizes[0]
+            )
+        else:
+            _require_int32_product("linear_head_weight_scalars", self._n_heads, feature_dim)
+        _validate_direct_state_resources(self._n_heads, self._hidden_sizes, feature_dim)
         # Trunk: [feature_dim, *hidden_sizes] — all hidden layers
         trunk_layer_sizes = [feature_dim, *self._hidden_sizes]
 
@@ -836,6 +979,13 @@ class MultiHeadMLPLearner:
             MultiHeadMLPUpdateResult with updated state, predictions,
             errors, and per-head metrics
 
+        Raises:
+            ValueError: If ``targets`` is not one value per head. A
+                broadcastable scalar or length-1 target would silently reuse
+                its single value for every head via JAX's clamped static
+                indexing, training and reporting a finite (non-NaN) error for
+                heads that were meant to be inactive.
+
         The learner and configured normalizer form one clock transaction. A
         validity, alignment, estimator-horizon, or uint64-capacity failure
         prevents the nested update call and preserves every persistent JAX
@@ -843,13 +993,47 @@ class MultiHeadMLPLearner:
         are outside that bit-exact contract.
         """
         n_heads = self._n_heads
+        targets = jnp.asarray(targets, dtype=jnp.float32)
+        if targets.shape != (n_heads,):
+            raise ValueError(
+                f"targets must have shape ({n_heads},), got {targets.shape}"
+            )
         counter_status = self._counter_status(state)
-        source_state_finite = _floating_tree_is_finite(state)
         inputs_valid = jnp.all(jnp.isfinite(observation)) & jnp.all(
             jnp.isfinite(targets) | jnp.isnan(targets)
         )
         gamma_lamda = jnp.array(self._gamma * self._lamda, dtype=jnp.float32)
         replacing = self._trace_mode == TraceMode.REPLACING
+        previous_checked = state
+        if self._gamma * self._lamda == 0.0:
+            previous_checked = previous_checked.replace(  # type: ignore[attr-defined]
+                trunk_traces=tuple(
+                    jnp.zeros_like(trace) for trace in state.trunk_traces
+                ),
+            )
+        checked_head_traces = []
+        for i, (old_w_trace, old_b_trace) in enumerate(state.head_traces):
+            head_decay_value = (
+                self._per_head_gl[i]
+                if self._per_head_gl is not None
+                else self._gamma * self._lamda
+            )
+            if head_decay_value == 0.0:
+                checked_head_traces.append(
+                    (jnp.zeros_like(old_w_trace), jnp.zeros_like(old_b_trace))
+                )
+            else:
+                checked_head_traces.append((old_w_trace, old_b_trace))
+        previous_checked = previous_checked.replace(  # type: ignore[attr-defined]
+            head_traces=tuple(checked_head_traces),
+        )
+        if self._utility_decay == 0.0:
+            previous_checked = previous_checked.replace(
+                hidden_unit_utilities=tuple(
+                    jnp.zeros_like(utility) for utility in state.hidden_unit_utilities
+                ),
+            )
+        source_state_finite = _floating_tree_is_finite(previous_checked)
 
         # 1. Handle NaN targets
         active_mask = ~jnp.isnan(targets)  # (n_heads,)
@@ -858,20 +1042,29 @@ class MultiHeadMLPLearner:
         # 2. Normalize observation if needed
         obs = observation
         new_normalizer_state = state.normalizer_state
+        normalizer_update_applied = jnp.asarray(True, dtype=jnp.bool_)
         if self._normalizer is not None and state.normalizer_state is not None:
             normalizer = self._normalizer
             normalizer_state = state.normalizer_state
 
-            def update_normalizer(_: None) -> tuple[Array, AnyNormalizerState]:
-                return normalizer.normalize(normalizer_state, observation)
+            def update_normalizer(
+                _: None,
+            ) -> tuple[Array, AnyNormalizerState, Bool[Array, ""]]:
+                result = normalizer.normalize_with_diagnostics(
+                    normalizer_state, observation
+                )
+                return result.normalized, result.state, result.update_applied
 
-            def preserve_normalizer(_: None) -> tuple[Array, AnyNormalizerState]:
+            def preserve_normalizer(
+                _: None,
+            ) -> tuple[Array, AnyNormalizerState, Bool[Array, ""]]:
                 return (
                     normalizer.normalize_only(normalizer_state, observation),
                     normalizer_state,
+                    jnp.asarray(False, dtype=jnp.bool_),
                 )
 
-            obs, new_normalizer_state = jax.lax.cond(
+            obs, new_normalizer_state, normalizer_update_applied = jax.lax.cond(
                 counter_status.update_available,
                 update_normalizer,
                 preserve_normalizer,
@@ -942,7 +1135,8 @@ class MultiHeadMLPLearner:
             )
             utility_signal = jnp.abs(activations[i] * trunk_bias_grads[i])
             new_hidden_unit_utilities.append(
-                utility_decay * old_utility + (1.0 - utility_decay) * utility_signal
+                _skip_zero_scale(utility_decay, old_utility)
+                + (1.0 - utility_decay) * utility_signal
             )
 
         # 6. Update trunk traces and optimizer
@@ -950,6 +1144,7 @@ class MultiHeadMLPLearner:
         new_trunk_traces: list[Array] = []
         trunk_steps: list[Array] = []
         new_trunk_opt_states: list[LMSState | AutostepParamState] = []
+        optimizer_updates_applied: list[Bool[Array, ""]] = []
 
         for i in range(n_trunk_layers):
             # Weight trace (index 2*i)
@@ -957,29 +1152,37 @@ class MultiHeadMLPLearner:
             old_wt = state.trunk_traces[2 * i]
             if replacing:
                 # Replacing: use grad where nonzero, else decay old trace
-                new_wt = jnp.where(w_grad_i != 0.0, w_grad_i, gamma_lamda * old_wt)
+                new_wt = jnp.where(
+                    w_grad_i != 0.0, w_grad_i, _skip_zero_scale(gamma_lamda, old_wt)
+                )
             else:
-                new_wt = gamma_lamda * old_wt + w_grad_i
+                new_wt = _skip_zero_scale(gamma_lamda, old_wt) + w_grad_i
             new_trunk_traces.append(new_wt)
-            w_step, new_w_opt = self._optimizer.update_from_gradient(
+            w_step, new_w_opt, w_update_applied = _update_from_gradient_with_diagnostics(
+                self._optimizer,
                 state.trunk_optimizer_states[2 * i], new_wt, error=None
             )
             trunk_steps.append(w_step)
             new_trunk_opt_states.append(new_w_opt)
+            optimizer_updates_applied.append(w_update_applied)
 
             # Bias trace (index 2*i + 1)
             b_grad_i = trunk_bias_grads[i]
             old_bt = state.trunk_traces[2 * i + 1]
             if replacing:
-                new_bt = jnp.where(b_grad_i != 0.0, b_grad_i, gamma_lamda * old_bt)
+                new_bt = jnp.where(
+                    b_grad_i != 0.0, b_grad_i, _skip_zero_scale(gamma_lamda, old_bt)
+                )
             else:
-                new_bt = gamma_lamda * old_bt + b_grad_i
+                new_bt = _skip_zero_scale(gamma_lamda, old_bt) + b_grad_i
             new_trunk_traces.append(new_bt)
-            b_step, new_b_opt = self._optimizer.update_from_gradient(
+            b_step, new_b_opt, b_update_applied = _update_from_gradient_with_diagnostics(
+                self._optimizer,
                 state.trunk_optimizer_states[2 * i + 1], new_bt, error=None
             )
             trunk_steps.append(b_step)
             new_trunk_opt_states.append(new_b_opt)
+            optimizer_updates_applied.append(b_update_applied)
 
         # Trunk bounding (pseudo_error=1.0 since error is in gradient)
         # Scale traces by the bounding factor for consistency with future updates
@@ -1035,11 +1238,15 @@ class MultiHeadMLPLearner:
                 else gamma_lamda
             )
             if replacing:
-                new_w_trace = jnp.where(w_grad != 0.0, w_grad, head_gl * old_w_trace)
-                new_b_trace = jnp.where(b_grad != 0.0, b_grad, head_gl * old_b_trace)
+                new_w_trace = jnp.where(
+                    w_grad != 0.0, w_grad, _skip_zero_scale(head_gl, old_w_trace)
+                )
+                new_b_trace = jnp.where(
+                    b_grad != 0.0, b_grad, _skip_zero_scale(head_gl, old_b_trace)
+                )
             else:
-                new_w_trace = head_gl * old_w_trace + w_grad
-                new_b_trace = head_gl * old_b_trace + b_grad
+                new_w_trace = _skip_zero_scale(head_gl, old_w_trace) + w_grad
+                new_b_trace = _skip_zero_scale(head_gl, old_b_trace) + b_grad
 
             # Error for this head (masked to 0 for inactive)
             error_i = jnp.where(
@@ -1048,12 +1255,13 @@ class MultiHeadMLPLearner:
 
             # Optimizer step (with error for meta-learning)
             head_opt = self._head_optimizer if self._head_optimizer is not None else self._optimizer
-            w_step, new_w_opt = head_opt.update_from_gradient(
-                old_w_opt, new_w_trace, error=error_i
+            w_step, new_w_opt, w_update_applied = _update_from_gradient_with_diagnostics(
+                head_opt, old_w_opt, new_w_trace, error=error_i
             )
-            b_step, new_b_opt = head_opt.update_from_gradient(
-                old_b_opt, new_b_trace, error=error_i
+            b_step, new_b_opt, b_update_applied = _update_from_gradient_with_diagnostics(
+                head_opt, old_b_opt, new_b_trace, error=error_i
             )
+            optimizer_updates_applied.extend((w_update_applied, b_update_applied))
 
             # Head bounding — scale traces by the bounding factor so that
             # future trace-based updates reflect the effective step magnitude
@@ -1123,6 +1331,8 @@ class MultiHeadMLPLearner:
         candidate_state_finite = _floating_tree_is_finite(proposed_state)
         update_applied = (
             counter_status.update_available
+            & normalizer_update_applied
+            & jnp.all(jnp.stack(optimizer_updates_applied))
             & source_state_finite
             & inputs_valid
             & candidate_state_finite
@@ -1134,13 +1344,28 @@ class MultiHeadMLPLearner:
         )
 
         per_head_metrics = jnp.stack(per_head_metrics_list)  # (n_heads, 3)
+        reported_predictions = jnp.where(
+            update_applied, predictions_arr, jnp.zeros_like(predictions_arr)
+        )
+        reported_errors = jnp.where(
+            active_mask,
+            jnp.where(update_applied, errors_arr, jnp.zeros_like(errors_arr)),
+            jnp.nan,
+        )
+        reported_metrics = jnp.where(
+            active_mask[:, None],
+            jnp.where(update_applied, per_head_metrics, jnp.zeros_like(per_head_metrics)),
+            jnp.nan,
+        )
 
         return MultiHeadMLPUpdateResult(
             state=new_state,
-            predictions=predictions_arr,
-            errors=errors_arr,
-            per_head_metrics=per_head_metrics,
-            trunk_bounding_metric=trunk_bounding_metric,
+            predictions=reported_predictions,
+            errors=reported_errors,
+            per_head_metrics=reported_metrics,
+            trunk_bounding_metric=jnp.where(
+                update_applied, trunk_bounding_metric, jnp.asarray(0.0)
+            ),
             pre_step_words=state.step_words,
             post_step_words=new_state.step_words,
             lifetime_counter_valid=(

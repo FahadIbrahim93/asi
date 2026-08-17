@@ -43,6 +43,22 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 # canonical bytes with a self-consistent digest triple exercise the binding.
 _QUALIFICATION_MANIFEST = {"schema_version": "test.matched_current_qualification.v1"}
 _QUALIFICATION_MANIFEST_BYTES = campaign.canonical_json_bytes(_QUALIFICATION_MANIFEST)
+
+
+def test_canonical_json_rejects_nonstring_keys_without_string_hooks() -> None:
+    class HostileKey:
+        def __str__(self) -> str:
+            raise AssertionError("canonicalization must not stringify keys")
+
+    with pytest.raises(campaign.ForagerMatchedCampaignError, match="canonical JSON"):
+        campaign.canonical_json_bytes({HostileKey(): 1})  # type: ignore[dict-item]
+
+    class HostileMapping(dict[str, object]):
+        def items(self):  # type: ignore[no-untyped-def, override]
+            raise AssertionError("canonicalization must not invoke mapping hooks")
+
+    with pytest.raises(campaign.ForagerMatchedCampaignError, match="canonical JSON"):
+        campaign.canonical_json_bytes(HostileMapping(value=1))
 _QUALIFICATION_MANIFEST_SHA256 = hashlib.sha256(_QUALIFICATION_MANIFEST_BYTES).hexdigest()
 
 
@@ -463,13 +479,13 @@ def test_open_campaign_v2_golden_byte_contract(tmp_path: Path) -> None:
             "6a9315cb996fe5698e4c1580d30da9b0524e9875ce085d1399bb975cc5b510a8"
         ),
         "execution-plan.json": (
-            "3fe36c652f07cf9dbda075ad23bac10a1ff468953c574ed87376dabe94b384ca"
+            "da881ac9300f6d3bb2668855ab0ccd931fc3e162758867f387657cd07721abbb"
         ),
         "source-manifest.json": (
             "9aa2a792a6e48438ed91d3ac180e87348ce3f4781fd6a87a987634593b604f23"
         ),
         "executor-manifest.json": (
-            "fd6cdf04b961e3ed8cb25fae7375e396985fcacc536888bb734f5b59db40f369"
+            "162c5037803e2bd25c2d63705a107fbdc67bfb8bb9acff3eeac31c6abba59df3"
         ),
         "qualification-manifest.json": (
             "0ac448b2686c7f7da8cc3f2a489bc764f76e215193de67cd62308ac21d83d24a"
@@ -478,10 +494,10 @@ def test_open_campaign_v2_golden_byte_contract(tmp_path: Path) -> None:
             "06cbe35d345bc3e4fdc79d7628a181a0ac126f929e0c0b70c2b25d9ef250d7d5"
         ),
         "live-runtime.json": (
-            "e21cfe5bcc592f83dc696826540d17b9aec5ad850acb4f59ca20d5a24b701e54"
+            "d3ea32b2091b84146ff276b34d72b00e9fa2084fe00a50810277f69a35e35be1"
         ),
         "campaign.json": (
-            "f19e230e7f8007624ad8a5920037cc25405604367ce807385ebdd79878767263"
+            "9cb3fca20ffd4dbb1950da8da88fe59cf6ebf3aaabe9b4c1cc15c116e912a3dc"
         ),
     }
     assert frozen_schedule["schedule_sha256"] == (
@@ -501,7 +517,7 @@ def test_open_campaign_v2_golden_byte_contract(tmp_path: Path) -> None:
         attempt,
     )
     assert binding_sha256 == (
-        "1c1a91c905cce03ff9faff9eb8cb969eebf8d4bc6a5e6f378e244e2b9c664822"
+        "890d4c8b8c6d21803c1aa7efd78c27286aaab9ccf1976acbece4309eb0e9e0ca"
     )
     artifact = executor.score_seed_archive(
         context.rebuilt.plan,
@@ -522,7 +538,7 @@ def test_open_campaign_v2_golden_byte_contract(tmp_path: Path) -> None:
         artifact.to_dict(),
     )
     assert bundle_sha256 == (
-        "6f29c96dd419825a99a128033ae608b83fe11fbebd83f43bc6d2c98bd07f16d3"
+        "1a1130d342bf689e8fed389e45bb26205bf246f49b920691d8998c6e2c10f679"
     )
     pointer = campaign._completion_pointer(
         context,
@@ -533,7 +549,7 @@ def test_open_campaign_v2_golden_byte_contract(tmp_path: Path) -> None:
         bundle_sha256,
     )
     assert digest(campaign.canonical_json_bytes(pointer)) == (
-        "96249c685eb73edc24890a7fbb01622551a9dc73ea3f03e67b29d20d5781c046"
+        "a9fa7c0057215eb0689587973b2dd8fa560ac64cae6d0e3326c07488df540388"
     )
     campaign._persist_failure(
         attempt,
@@ -551,16 +567,16 @@ def test_open_campaign_v2_golden_byte_contract(tmp_path: Path) -> None:
     _complete_loader_context(completed_context)
     expected_final = {
         "execution-receipt-index.json": (
-            "4392777d515cde317b560d7d98343f2275fab121b002259f1bb8f626725086b8"
+            "a8dcafdb050d2c0f32d2ef6743750d187d0cdec5cac6783315dd2342796a7691"
         ),
         "score-evidence.json": (
-            "fd5809132b42bb409dff542ebbf6cfa90bac93c12be09b57b9b722cd64379a61"
+            "6fdfe584ac705b62da1042ba35d035c29e1fd574a93381a5b536d91d78df2266"
         ),
         "verification-request.json": (
-            "505b8e5e8be4840c3ecb056a2d8e9f8d61c73ea4396acec2ec1b0c1719071dfd"
+            "91567672900044aa8d7a5f10983e3dac423d11985993dc6f27672bfa3da0c591"
         ),
         "completion-summary.json": (
-            "ced7b22ad99ba7b8fcab1f18a4b5521c5bdfd1778032fdbbbb27212099e12744"
+            "9553ec581ca9660d5975b38e227dd30116a15ff7a63d92f5e1d57a27e3f9f9eb"
         ),
     }
     for name, expected_digest in expected_final.items():
@@ -575,7 +591,7 @@ def test_open_campaign_v2_golden_byte_contract(tmp_path: Path) -> None:
     )
     normalized_status = replace(status, output_root=Path("/golden/open-campaign"))
     assert digest(campaign.canonical_json_bytes(normalized_status.to_dict())) == (
-        "d13a838d672bf497d3db8331af5f7e10558c4b3c275cfefed2908802e9a1ec8a"
+        "817f793086abb911dd7b21bd46114aa9fbab21f72365030ad92428007146e970"
     )
 
 
@@ -944,6 +960,39 @@ def test_bound_raw_corruption_fails_before_any_oci_call(tmp_path: Path) -> None:
         # Validation happens before the scorer-only runner can be selected.
         campaign._scan_cell(context, candidate_id, seed)
     assert oci_called is False
+
+
+def test_raw_binding_rejects_equal_valued_float_size_alias(tmp_path: Path) -> None:
+    context = _context(tmp_path)
+    candidate_id = context.rebuilt.candidate_ids[0]
+    seed = context.rebuilt.protocol.active_seeds[0]
+    run_cell, _completion = campaign._cell_paths(context.root, candidate_id, seed)
+    attempt = run_cell / "attempt-000001"
+    attempt.mkdir(parents=True)
+    raw_path = attempt / "raw-output.tar"
+    raw_path.write_bytes(b"opaque-raw-content")
+    raw_sha256, raw_size = campaign._stable_file_hash(
+        raw_path,
+        "test opaque raw archive",
+        maximum=1024,
+    )
+    binding = campaign._raw_binding(
+        context,
+        candidate_id,
+        seed,
+        attempt.name,
+        raw_sha256,
+        raw_size,
+    )
+    cast(dict[str, Any], binding["raw_archive"])["size_bytes"] = float(raw_size)
+    binding_bytes = campaign.canonical_json_bytes(binding)
+    (attempt / "raw-binding.json").write_bytes(binding_bytes)
+    (attempt / "raw-binding.json.sha256").write_text(
+        hashlib.sha256(binding_bytes).hexdigest() + "\n"
+    )
+
+    with pytest.raises(campaign.ForagerMatchedCampaignError, match="raw archive binding"):
+        campaign._validate_raw_binding(context, candidate_id, seed, attempt)
 
 
 def test_completed_bundle_without_pointer_repairs_only_the_pointer(
@@ -1394,3 +1443,28 @@ def test_campaign_and_qualification_console_scripts_are_registered() -> None:
     assert scripts["alberta-forager-matched-qualification"] == (
         "alberta_framework.benchmarks.forager_matched_qualification:main"
     )
+
+
+@pytest.mark.parametrize("invalid", [float("nan"), float("inf"), float("-inf")])
+def test_plain_rejects_nonfinite_number_identities(invalid: float) -> None:
+    """Campaign canonicalization must not keep NaN/Inf as trusted JSON scalars."""
+
+    with pytest.raises(
+        campaign.ForagerMatchedCampaignError,
+        match="non-finite JSON number",
+    ):
+        campaign._plain(invalid)
+    with pytest.raises(
+        campaign.ForagerMatchedCampaignError,
+        match="non-finite JSON number",
+    ):
+        campaign._plain({"score": invalid})
+
+
+def test_plain_keeps_finite_canonical_scalars() -> None:
+    assert campaign._plain({"score": 1.25, "ok": True, "n": 2}) == {
+        "score": 1.25,
+        "ok": True,
+        "n": 2,
+    }
+    assert campaign.canonical_json_bytes({"score": 1.25}) == b'{"score":1.25}'

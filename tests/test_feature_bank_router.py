@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 from collections.abc import Mapping
+from types import MappingProxyType
 from typing import Any, cast
 
 import jax
@@ -15,6 +17,7 @@ from alberta_framework.core.feature_bank_router import (
     CONFIG_SCHEMA_VERSION,
     FeatureBankRouter,
     FeatureBankRouterConfig,
+    FeatureBankRouterResourceBudget,
     FeatureBankRouterState,
 )
 
@@ -36,6 +39,46 @@ _NEW = jnp.asarray(
     ],
     dtype=jnp.int32,
 )
+
+_NUMPY_INTEGER_TYPES = tuple(
+    dict.fromkeys(
+        np.dtype(code).type
+        for code in ("b", "B", "h", "H", "i", "I", "l", "L", "q", "Q", "p", "P")
+    )
+)
+
+
+class _RaisingIntegerSpoof:
+    @property
+    def __class__(self) -> type[int]:
+        return int
+
+    def __index__(self) -> int:
+        raise AssertionError("__index__ must not be called")
+
+    def __repr__(self) -> str:
+        raise AssertionError("__repr__ must not be called")
+
+
+class _IntegerSubclass(int):
+    def __repr__(self) -> str:
+        raise AssertionError("__repr__ must not be called")
+
+
+class _StringSubclass(str):
+    pass
+
+
+class _RaisingStringSpoof:
+    @property
+    def __class__(self) -> type[str]:
+        return str
+
+    def __eq__(self, other: object) -> bool:
+        raise AssertionError("__eq__ must not be called")
+
+    def __repr__(self) -> str:
+        raise AssertionError("__repr__ must not be called")
 
 
 def _router() -> FeatureBankRouter:
@@ -500,3 +543,170 @@ def test_consumer_layout_and_descriptor_static_contracts_are_strict() -> None:
             _NEW.astype(jnp.float32),
             feature_axes=_feature_axes(),
         )
+
+
+@pytest.mark.unit
+def test_router_config_rejects_booleans_and_non_integers() -> None:
+    with pytest.raises(ValueError, match="base_dim"):
+        FeatureBankRouterConfig(base_dim=True, active_slots=4)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="active_slots"):
+        FeatureBankRouterConfig(base_dim=4, active_slots=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="base_dim"):
+        FeatureBankRouterConfig(base_dim=4.5, active_slots=4)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="active_slots"):
+        FeatureBankRouterConfig(base_dim=4, active_slots=4.5)  # type: ignore[arg-type]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("integer_type", _NUMPY_INTEGER_TYPES)
+def test_router_config_accepts_and_canonicalizes_all_numpy_integers(
+    integer_type: type[np.integer[Any]],
+) -> None:
+    config = FeatureBankRouterConfig(
+        base_dim=integer_type(4),
+        active_slots=integer_type(4),
+    )
+    assert type(config.base_dim) is int
+    assert type(config.active_slots) is int
+    assert config.base_dim == 4
+    assert config.active_slots == 4
+    assert json.loads(json.dumps(config.to_config())) == config.to_config()
+
+
+@pytest.mark.unit
+def test_router_config_rejects_derived_feature_width_outside_signed_int32() -> None:
+    with pytest.raises(ValueError, match="total_feature_dim"):
+        FeatureBankRouterConfig(base_dim=2**31 - 1, active_slots=1)
+
+    boundary = FeatureBankRouterConfig(base_dim=2**31 - 2, active_slots=1)
+    assert boundary.total_feature_dim == 2**31 - 1
+
+
+@pytest.mark.unit
+def test_router_config_preflights_derived_state_counts_before_allocation() -> None:
+    with pytest.raises(ValueError, match="descriptor_int32_scalars"):
+        FeatureBankRouterConfig(base_dim=2, active_slots=1_073_741_824)
+    with pytest.raises(ValueError, match="router_state_scalars"):
+        FeatureBankRouterConfig(base_dim=2, active_slots=1_073_741_823)
+    with pytest.raises(ValueError, match="router_state_nbytes"):
+        FeatureBankRouterConfig(base_dim=2, active_slots=268_435_455)
+
+    boundary = FeatureBankRouterConfig(base_dim=2, active_slots=268_435_454)
+    assert 4 * (2 * boundary.active_slots + 2) == 2_147_483_640
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "hostile",
+    [_RaisingIntegerSpoof(), _IntegerSubclass(4), np.bool_(True), np.float32(4.0)],
+    ids=["class-spoof", "int-subclass", "numpy-bool", "numpy-float"],
+)
+def test_router_config_rejects_integer_spoofs_without_invoking_hooks(hostile: object) -> None:
+    with pytest.raises(ValueError, match="base_dim"):
+        FeatureBankRouterConfig(base_dim=hostile, active_slots=4)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="active_slots"):
+        FeatureBankRouterConfig(base_dim=4, active_slots=hostile)  # type: ignore[arg-type]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("field", "hostile", "message"),
+    [
+        ("type", _StringSubclass("FeatureBankRouter"), "type is invalid"),
+        ("type", _RaisingStringSpoof(), "type is invalid"),
+        ("schema_version", _StringSubclass(CONFIG_SCHEMA_VERSION), "schema version"),
+        ("schema_version", _RaisingStringSpoof(), "schema version"),
+    ],
+    ids=["type-str-subclass", "type-class-spoof", "schema-str-subclass", "schema-class-spoof"],
+)
+def test_router_config_rejects_string_spoofs_without_invoking_hooks(
+    field: str,
+    hostile: object,
+    message: str,
+) -> None:
+    serialized = FeatureBankRouterConfig(base_dim=4, active_slots=4).to_config()
+    serialized[field] = hostile
+    with pytest.raises(ValueError, match=message):
+        FeatureBankRouterConfig.from_config(serialized)
+
+
+@pytest.mark.unit
+def test_router_from_config_accepts_mappings_and_normalizes_hostile_hooks() -> None:
+    payload = FeatureBankRouterConfig(base_dim=4, active_slots=3).to_config()
+
+    class HostileMapping(Mapping[str, object]):
+        def __iter__(self) -> Any:
+            raise RuntimeError("mapping hooks must be normalized")
+
+        def __len__(self) -> int:
+            return len(payload)
+
+        def __getitem__(self, key: str) -> object:
+            return payload[key]
+
+        def __repr__(self) -> str:
+            raise AssertionError("repr hook must not run")
+
+    for loader in (FeatureBankRouterConfig.from_config, FeatureBankRouter.from_config):
+        assert loader(MappingProxyType(payload)).to_config() == payload
+        with pytest.raises(ValueError, match="could not be read"):
+            loader(HostileMapping())
+        with pytest.raises(ValueError, match="keys"):
+            loader({key: value for key, value in payload.items() if key != "active_slots"})
+        with pytest.raises(ValueError, match="keys"):
+            loader({**payload, "unexpected": 1})
+        with pytest.raises(ValueError, match="base_dim"):
+            loader({**payload, "base_dim": 4.5})
+        with pytest.raises(ValueError, match="active_slots"):
+            loader({**payload, "active_slots": True})
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "field",
+    [
+        "total_feature_slots",
+        "descriptor_int32_scalars",
+        "counter_int32_scalars",
+        "router_state_scalars",
+        "router_state_nbytes",
+        "consumer_stable_prefix_scalars",
+        "consumer_dynamic_tail_scalars",
+        "consumer_total_scalars",
+        "total_managed_nbytes",
+    ],
+)
+def test_router_resource_budget_rejects_each_inconsistent_derived_count(field: str) -> None:
+    router = _router()
+    budget = router.resource_budget(
+        router.init(_OLD),
+        _consumers(),
+        feature_axes=_feature_axes(),
+    )
+    with pytest.raises(ValueError, match=field):
+        dataclasses.replace(budget, **{field: getattr(budget, field) + 1})
+
+
+@pytest.mark.unit
+def test_router_resource_budget_keeps_host_only_consumer_counts_unbounded() -> None:
+    groups = 10**30
+    consumer_nbytes = 10**40
+    budget = FeatureBankRouterResourceBudget(
+        base_feature_slots=np.int32(2),
+        dynamic_feature_slots=np.uint8(1),
+        total_feature_slots=np.int64(3),
+        descriptor_int32_scalars=np.int16(2),
+        counter_int32_scalars=np.uint16(2),
+        router_state_scalars=np.int32(4),
+        router_state_nbytes=np.int64(16),
+        consumer_leaf_count=np.uint8(1),
+        consumer_feature_groups=groups,
+        consumer_stable_prefix_scalars=2 * groups,
+        consumer_dynamic_tail_scalars=groups,
+        consumer_total_scalars=3 * groups,
+        consumer_state_nbytes=consumer_nbytes,
+        total_managed_nbytes=consumer_nbytes + 16,
+    )
+    assert budget.consumer_total_scalars > 2**31
+    assert budget.consumer_state_nbytes > 2**31
+    assert all(type(value) is int for value in budget.to_dict().values())

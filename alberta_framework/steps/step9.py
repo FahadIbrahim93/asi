@@ -16,12 +16,17 @@ anchored multi-step dreaming.  Key additions over Step 7:
 
 The control learner is the same :class:`DifferentialSARSAAgent` from Step 6,
 preserving the continuing / average-reward formulation.
+
+The facade rejects illegal dimensions and scientific scalars before any core
+object is constructed. Accepted numbers are canonicalized to builtin ints and
+floats; legal endpoints stay valid.
 """
 
 from __future__ import annotations
 
 import functools
 from dataclasses import asdict, dataclass, field
+from numbers import Integral
 from typing import Any, cast
 
 import chex
@@ -30,6 +35,7 @@ import jax.numpy as jnp
 import jax.random as jr
 from jax import Array
 
+from alberta_framework._seed_validation import require_jax_seed
 from alberta_framework.core.average_reward import (
     DifferentialSARSAAgent,
     DifferentialSARSAState,
@@ -52,10 +58,17 @@ from alberta_framework.core.world_model import (
     ActionConditionedWorldModelState,
     WorldModelUpdateResult,
 )
+from alberta_framework.steps._float32_validation import (
+    canonical_float32_storage,
+    finite_real_and_float32,
+)
+from alberta_framework.steps._smoke_record_validation import require_step_shape
 from alberta_framework.steps.step6 import (
     Step6DifferentialSARSAConfig,
     make_step6_differential_sarsa_agent,
 )
+
+_INT32_MAX = 2**31 - 1
 
 
 @dataclass(frozen=True)
@@ -131,26 +144,8 @@ class Step9DreamingConfig:
     dreams_update_average_reward: bool = False
 
     def __post_init__(self) -> None:
-        """Validate hyperparameters."""
-        if self.control.n_actions != self.n_actions:
-            raise ValueError(
-                f"control.n_actions ({self.control.n_actions}) must equal "
-                f"n_actions ({self.n_actions})"
-            )
-        if self.planning_budget < 0:
-            raise ValueError("planning_budget must be non-negative")
-        if self.dreaming_warmup_steps < 0:
-            raise ValueError("dreaming_warmup_steps must be non-negative")
-        if self.dreaming_max_model_error < 0.0:
-            raise ValueError("dreaming_max_model_error must be non-negative")
-        if self.buffer_capacity < 1:
-            raise ValueError("buffer_capacity must be positive")
-        if self.behavior_model_step_size < 0.0:
-            raise ValueError("behavior_model_step_size must be non-negative")
-        if self.dream_rollout_horizon < 1:
-            raise ValueError("dream_rollout_horizon must be positive")
-        if self.dream_candidate_count < 1:
-            raise ValueError("dream_candidate_count must be positive")
+        """Reject illegal dimensions and scientific scalars, then canonicalize."""
+        _validate_dreaming_config(self)
 
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-serializable representation."""
@@ -168,7 +163,7 @@ class Step9DreamingConfig:
         )
         hs = data.get("model_hidden_sizes", (64,))
         if isinstance(hs, list):
-            data["model_hidden_sizes"] = tuple(int(v) for v in hs)
+            data["model_hidden_sizes"] = tuple(hs)
         return cls(**cast(Any, data))
 
     def to_world_model_config(self) -> ActionConditionedWorldModelConfig:
@@ -184,6 +179,186 @@ class Step9DreamingConfig:
             error_decay=self.model_error_decay,
             include_action_interactions=self.model_include_action_interactions,
         )
+
+
+def _require_real(name: str, value: object) -> float:
+    real, _, _, narrowed = finite_real_and_float32(name, value)
+    return canonical_float32_storage(real, narrowed)
+
+
+def _require_nonneg_real(name: str, value: object) -> float:
+    real, numerator, _, narrowed = finite_real_and_float32(name, value)
+    if real < 0.0 or numerator < 0 or narrowed < 0.0:
+        raise ValueError(f"{name} must be non-negative, got {value!r}")
+    return canonical_float32_storage(real, narrowed)
+
+
+def _require_unit_interval(name: str, value: object) -> float:
+    real, numerator, denominator, narrowed = finite_real_and_float32(name, value)
+    if (
+        real < 0.0
+        or not real <= 1.0
+        or numerator < 0
+        or numerator > denominator
+        or narrowed < 0.0
+        or not narrowed <= 1.0
+    ):
+        raise ValueError(f"{name} must be in [0, 1], got {value!r}")
+    return canonical_float32_storage(real, narrowed)
+
+
+def _require_half_open_unit_interval(name: str, value: object) -> float:
+    real, numerator, denominator, narrowed = finite_real_and_float32(name, value)
+    if (
+        real < 0.0
+        or not real < 1.0
+        or numerator < 0
+        or numerator >= denominator
+        or narrowed < 0.0
+        or not narrowed < 1.0
+    ):
+        raise ValueError(f"{name} must be in [0, 1), got {value!r}")
+    return canonical_float32_storage(real, narrowed)
+
+
+def _require_int(
+    name: str,
+    value: object,
+    *,
+    minimum: int | None = None,
+    maximum: int | None = None,
+) -> int:
+    actual_type = type(value)
+    if issubclass(actual_type, bool) or not issubclass(actual_type, Integral):
+        raise ValueError(f"{name} must be an integer, got {value!r}")
+    number = int(cast(Integral, value))
+    if minimum is not None and number < minimum:
+        if minimum == 1:
+            raise ValueError(f"{name} must be positive, got {value!r}")
+        if minimum == 0:
+            raise ValueError(f"{name} must be non-negative, got {value!r}")
+        raise ValueError(f"{name} must be >= {minimum}, got {value!r}")
+    if maximum is not None and number > maximum:
+        raise ValueError(f"{name} must be <= {maximum}, got {value!r}")
+    return number
+
+
+def _require_bool(name: str, value: object) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError(f"{name} must be a bool, got {value!r}")
+    return value
+
+
+def _validate_dreaming_config(config: Step9DreamingConfig) -> None:
+    observation_dim = _require_int(
+        "observation_dim", config.observation_dim, minimum=1, maximum=_INT32_MAX
+    )
+    n_actions = _require_int(
+        "n_actions", config.n_actions, minimum=1, maximum=_INT32_MAX
+    )
+    if config.control.n_actions != n_actions:
+        raise ValueError(
+            f"control.n_actions ({config.control.n_actions}) must equal "
+            f"n_actions ({n_actions})"
+        )
+    if type(config.model_hidden_sizes) is not tuple:
+        raise ValueError(
+            f"model_hidden_sizes must be a tuple of integers, got "
+            f"{config.model_hidden_sizes!r}"
+        )
+    model_hidden_sizes = tuple(
+        _require_int("model_hidden_sizes", size, minimum=1, maximum=_INT32_MAX)
+        for size in config.model_hidden_sizes
+    )
+    model_step_size = _require_nonneg_real("model_step_size", config.model_step_size)
+    model_sparsity = _require_unit_interval("model_sparsity", config.model_sparsity)
+    model_include_action_interactions = _require_bool(
+        "model_include_action_interactions",
+        config.model_include_action_interactions,
+    )
+    model_use_layer_norm = _require_bool(
+        "model_use_layer_norm",
+        config.model_use_layer_norm,
+    )
+    model_gamma = _require_unit_interval("model_gamma", config.model_gamma)
+    # The world-model warmup clock is stored as a signed int32 scalar.
+    dreaming_warmup_steps = _require_int(
+        "dreaming_warmup_steps",
+        config.dreaming_warmup_steps,
+        minimum=0,
+        maximum=_INT32_MAX,
+    )
+    dreaming_max_model_error = _require_nonneg_real(
+        "dreaming_max_model_error",
+        config.dreaming_max_model_error,
+    )
+    model_error_decay = _require_half_open_unit_interval(
+        "model_error_decay",
+        config.model_error_decay,
+    )
+    behavior_model_step_size = _require_nonneg_real(
+        "behavior_model_step_size",
+        config.behavior_model_step_size,
+    )
+    planning_budget = _require_int(
+        "planning_budget", config.planning_budget, minimum=0, maximum=_INT32_MAX
+    )
+    dream_rollout_horizon = _require_int(
+        "dream_rollout_horizon",
+        config.dream_rollout_horizon,
+        minimum=1,
+        maximum=_INT32_MAX,
+    )
+    # Candidate selection publishes selected indices as signed int32 values.
+    dream_candidate_count = _require_int(
+        "dream_candidate_count",
+        config.dream_candidate_count,
+        minimum=1,
+        maximum=_INT32_MAX,
+    )
+    dream_surprise_weight = _require_real(
+        "dream_surprise_weight",
+        config.dream_surprise_weight,
+    )
+    dream_utility_weight = _require_real(
+        "dream_utility_weight",
+        config.dream_utility_weight,
+    )
+    # Buffer ``size`` and ``index`` are int32. Leaving one count below the
+    # maximum keeps repeated full-buffer increments and modulo updates in range.
+    buffer_capacity = _require_int(
+        "buffer_capacity",
+        config.buffer_capacity,
+        minimum=1,
+        maximum=_INT32_MAX - 1,
+    )
+    dreams_update_average_reward = _require_bool(
+        "dreams_update_average_reward",
+        config.dreams_update_average_reward,
+    )
+    object.__setattr__(config, "observation_dim", observation_dim)
+    object.__setattr__(config, "n_actions", n_actions)
+    object.__setattr__(config, "model_hidden_sizes", model_hidden_sizes)
+    object.__setattr__(config, "model_step_size", model_step_size)
+    object.__setattr__(config, "model_sparsity", model_sparsity)
+    object.__setattr__(
+        config,
+        "model_include_action_interactions",
+        model_include_action_interactions,
+    )
+    object.__setattr__(config, "model_use_layer_norm", model_use_layer_norm)
+    object.__setattr__(config, "model_gamma", model_gamma)
+    object.__setattr__(config, "dreaming_warmup_steps", dreaming_warmup_steps)
+    object.__setattr__(config, "dreaming_max_model_error", dreaming_max_model_error)
+    object.__setattr__(config, "model_error_decay", model_error_decay)
+    object.__setattr__(config, "behavior_model_step_size", behavior_model_step_size)
+    object.__setattr__(config, "planning_budget", planning_budget)
+    object.__setattr__(config, "dream_rollout_horizon", dream_rollout_horizon)
+    object.__setattr__(config, "dream_candidate_count", dream_candidate_count)
+    object.__setattr__(config, "dream_surprise_weight", dream_surprise_weight)
+    object.__setattr__(config, "dream_utility_weight", dream_utility_weight)
+    object.__setattr__(config, "buffer_capacity", buffer_capacity)
+    object.__setattr__(config, "dreams_update_average_reward", dreams_update_average_reward)
 
 
 @chex.dataclass(frozen=True)
@@ -217,6 +392,7 @@ class Step9ArrayResult:
     average_rewards: Array
     actions: Array
     model_prediction_errors: Array
+    model_updates_applied: Array
     dream_td_errors: Array
     dream_accepted: Array
 
@@ -235,6 +411,29 @@ class Step9SmokeResult:
     dream_acceptance_count: int
     control_config: dict[str, Any]
     world_model_config: dict[str, Any]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "steps", _require_int("steps", self.steps, minimum=1, maximum=_INT32_MAX)
+        )
+        object.__setattr__(self, "seed", require_jax_seed(self.seed, name="seed"))
+        for name in ("real_td_errors_shape", "dream_td_errors_shape", "actions_shape"):
+            object.__setattr__(
+                self,
+                name,
+                require_step_shape(name, getattr(self, name), steps=self.steps),
+            )
+        object.__setattr__(self, "finite", _require_bool("finite", self.finite))
+        object.__setattr__(
+            self,
+            "dream_acceptance_count",
+            _require_int(
+                "dream_acceptance_count",
+                self.dream_acceptance_count,
+                minimum=0,
+                maximum=_INT32_MAX,
+            ),
+        )
 
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-serializable representation."""
@@ -286,6 +485,34 @@ def init_step9_state(
     )
 
 
+def _update_control_with_linear_rng(
+    agent: DifferentialSARSAAgent,
+    state: DifferentialSARSAState,
+    reward: Array,
+    next_observation: Array,
+    discount: Array,
+) -> DifferentialSARSAUpdateResult:
+    """Apply one control backup while advancing its RNG on rejection.
+
+    ``DifferentialSARSAAgent.update`` rolls its whole state back when a
+    transaction is rejected, including the key consumed while selecting the
+    proposed next action.  Select that action explicitly so the advanced key
+    can remain linear even when the numerical update is rejected.
+    """
+    next_action, next_key = agent.select_action(state, next_observation)
+    advanced_state = state.replace(rng_key=next_key)
+    return cast(
+        DifferentialSARSAUpdateResult,
+        agent.update(
+            advanced_state,
+            reward,
+            next_observation,
+            next_action=next_action,
+            discount=discount,
+        ),
+    )
+
+
 @functools.partial(jax.jit, static_argnums=(0, 1, 2, 3))
 def step9_update(
     config: Step9DreamingConfig,
@@ -302,7 +529,8 @@ def step9_update(
     error EMA then gates each dream in the planning budget: a dream is
     accepted when ``model_state.step_count >= dreaming_warmup_steps`` AND
     ``model_state.model_error_ema <= dreaming_max_model_error`` AND the
-    predicted transition is numerically finite.
+    predicted transition is numerically finite AND every rollout control
+    transaction applies.
     """
     real_discount = jnp.asarray(config.model_gamma, dtype=jnp.float32)
     real_model_result = model.update(
@@ -313,12 +541,26 @@ def step9_update(
         real_discount,
         next_observation,
     )
-    real_control_result = agent.update(
-        state.control_state,
-        reward,
-        next_observation,
-        discount=real_discount,
-    )
+    if config.planning_budget == 0:
+        # The real-only lane remains the exact pre-dreaming control path: no
+        # additional selection or split is introduced for a zero budget.
+        real_control_result = agent.update(
+            state.control_state,
+            reward,
+            next_observation,
+            discount=real_discount,
+        )
+    else:
+        # A rejected real update must not hand its already-consumed parent key
+        # to the dream scheduler, whose four-way split would reproduce the
+        # failed action selection's sibling keys.
+        real_control_result = _update_control_with_linear_rng(
+            agent,
+            state.control_state,
+            reward,
+            next_observation,
+            real_discount,
+        )
     control_after_real = real_control_result.state
     model_state = cast(ActionConditionedWorldModelState, real_model_result.state)
     behavior_model = BehaviorModel(
@@ -343,11 +585,13 @@ def step9_update(
     dream_gate = warmup_ready & error_ok
 
     def dream_step(
-        carry: tuple[DifferentialSARSAState, BehaviorModelState, Array],
+        carry: tuple[DifferentialSARSAState, BehaviorModelState],
         _: Array,
-    ) -> tuple[tuple[DifferentialSARSAState, BehaviorModelState, Array], tuple[Array, Array]]:
-        ctrl_state, behavior_state, key = carry
-        key, candidate_key = jr.split(key)
+    ) -> tuple[tuple[DifferentialSARSAState, BehaviorModelState], tuple[Array, Array]]:
+        ctrl_state, behavior_state = carry
+        next_master_key, candidate_key, behavior_rollout_key, control_rollout_key = (
+            jr.split(ctrl_state.rng_key, 4)
+        )
         candidate_keys = jr.split(candidate_key, config.dream_candidate_count)
 
         def candidate_step(candidate_item: tuple[Array, Array]) -> tuple[Array, ...]:
@@ -413,8 +657,11 @@ def step9_update(
         selected_index = selection.selected_indices[0]
         anchor_obs = candidate_anchors[selected_index]
         action = candidate_actions[selected_index]
+        initial_control_state = ctrl_state.replace(
+            rng_key=control_rollout_key
+        )
         initial_behavior_state = behavior_state.replace(
-            rng_key=key
+            rng_key=behavior_rollout_key
         )
 
         def rollout_step(
@@ -427,7 +674,7 @@ def step9_update(
             _: Array,
         ) -> tuple[
             tuple[DifferentialSARSAState, BehaviorModelState, Array, Array],
-            tuple[Array, Array],
+            tuple[Array, Array, Array],
         ]:
             rollout_ctrl, rollout_behavior, rollout_obs, rollout_action = (
                 rollout_carry
@@ -437,11 +684,12 @@ def step9_update(
                 last_observation=rollout_obs,
                 last_action=rollout_action,
             )
-            dream_result = agent.update(
+            dream_result = _update_control_with_linear_rng(
+                agent,
                 temp_state,
                 prediction.reward,
                 prediction.next_observation,
-                discount=prediction.discount,
+                prediction.discount,
             )
             dream_state = dream_result.state
             if not config.dreams_update_average_reward:
@@ -463,14 +711,15 @@ def step9_update(
             ), (
                 dream_result.td_error,
                 prediction.discount,
+                dream_result.update_applied,
             )
 
         (
             (rollout_ctrl, rollout_behavior, _rollout_obs, _rollout_action),
-            (rollout_td_errors, rollout_discounts),
+            (rollout_td_errors, rollout_discounts, rollout_updates_applied),
         ) = jax.lax.scan(
             rollout_step,
-            (ctrl_state, initial_behavior_state, anchor_obs, action),
+            (initial_control_state, initial_behavior_state, anchor_obs, action),
             jnp.arange(config.dream_rollout_horizon, dtype=jnp.int32),
         )
         rollout_td_signal = jnp.sum(rollout_td_errors)
@@ -484,12 +733,12 @@ def step9_update(
             & finite
             & selected_accepted
             & (selected_discount >= 0.0)
+            & jnp.all(rollout_updates_applied)
         )
 
         restored = rollout_ctrl.replace(
             last_observation=control_after_real.last_observation,
             last_action=control_after_real.last_action,
-            rng_key=rollout_ctrl.rng_key,
         )
         next_ctrl = cast(
             DifferentialSARSAState,
@@ -499,6 +748,10 @@ def step9_update(
                 ctrl_state,
             ),
         )
+        # The reserved master branch always survives the transaction.  This
+        # keeps future dreams independent even when the gate or a rollout
+        # control update rejects every learned-state change.
+        next_ctrl = next_ctrl.replace(rng_key=next_master_key)
         next_behavior = cast(
             BehaviorModelState,
             jax.tree_util.tree_map(
@@ -507,14 +760,14 @@ def step9_update(
                 behavior_state,
             ),
         )
-        return (next_ctrl, next_behavior, key), (
+        return (next_ctrl, next_behavior), (
             jnp.where(accepted, rollout_td_signal, jnp.array(0.0, dtype=jnp.float32)),
             accepted,
         )
 
-    (final_ctrl, final_behavior, _), (dream_td_errors, dream_accepted) = jax.lax.scan(
+    (final_ctrl, final_behavior), (dream_td_errors, dream_accepted) = jax.lax.scan(
         dream_step,
-        (control_after_real, behavior_after_real, control_after_real.rng_key),
+        (control_after_real, behavior_after_real),
         jnp.arange(config.planning_budget, dtype=jnp.int32),
     )
 
@@ -556,6 +809,7 @@ def run_step9_scan(
             result.real_control_result.average_reward,
             result.real_control_result.action,
             result.real_model_result.prediction_error,
+            result.real_model_result.update_applied,
             result.dream_td_errors,
             result.dream_accepted,
         )
@@ -565,6 +819,7 @@ def run_step9_scan(
         average_rewards,
         actions,
         model_prediction_errors,
+        model_updates_applied,
         dream_td_errors,
         dream_accepted,
     ) = jax.lax.scan(scan_step, state, (rewards, next_observations))
@@ -574,6 +829,7 @@ def run_step9_scan(
         average_rewards=average_rewards,
         actions=actions,
         model_prediction_errors=model_prediction_errors,
+        model_updates_applied=model_updates_applied,
         dream_td_errors=dream_td_errors,
         dream_accepted=dream_accepted,
     )
@@ -586,8 +842,8 @@ def run_step9_smoke(
     seed: int = 0,
 ) -> Step9SmokeResult:
     """Run a tiny deterministic Step 9 dreaming integration probe."""
-    if steps < 1:
-        raise ValueError("steps must be positive")
+    steps = _require_int("steps", steps, minimum=1, maximum=_INT32_MAX)
+    seed = require_jax_seed(seed, name="seed")
 
     cfg = config or Step9DreamingConfig()
     agent, model, buffer = make_step9_components(cfg)

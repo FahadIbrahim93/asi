@@ -25,7 +25,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
-from typing import Any, BinaryIO, Final, cast
+from typing import Any, BinaryIO, Final, NoReturn, cast
 
 import numpy as np
 import numpy.typing as npt
@@ -260,9 +260,27 @@ def _reject_duplicate_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
+def _reject_nonfinite_json_number(value: str) -> NoReturn:
+    raise ScreenError(f"JSON contains non-finite number {value!r}")
+
+
+def _parse_finite_json_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ScreenError(f"JSON contains non-finite number {value!r}")
+    return parsed
+
+
 def _load_json_bytes(raw: bytes, label: str) -> dict[str, Any]:
     try:
-        value = json.loads(raw.decode("utf-8"), object_pairs_hook=_reject_duplicate_pairs)
+        value = json.loads(
+            raw.decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_pairs,
+            parse_constant=_reject_nonfinite_json_number,
+            parse_float=_parse_finite_json_float,
+        )
+    except ScreenError:
+        raise
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ScreenError(f"{label} is not valid duplicate-free UTF-8 JSON") from error
     if not isinstance(value, dict):
@@ -1022,7 +1040,13 @@ def _inspect_image(docker: str, image_id: str) -> dict[str, Any]:
         detail = capture.stderr.decode("utf-8", errors="replace").strip()
         raise ScreenError(f"cannot inspect exact OCI image {image_id}: {detail}")
     try:
-        value = json.loads(capture.stdout.decode("utf-8"))
+        value = json.loads(
+            capture.stdout.decode("utf-8"),
+            parse_constant=_reject_nonfinite_json_number,
+            parse_float=_parse_finite_json_float,
+        )
+    except ScreenError:
+        raise
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ScreenError("docker image inspect returned invalid JSON") from error
     if not isinstance(value, list) or len(value) != 1 or not isinstance(value[0], dict):

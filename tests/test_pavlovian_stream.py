@@ -11,10 +11,13 @@ Covers:
 
 from __future__ import annotations
 
+from fractions import Fraction
+
 import chex
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 import pytest
 
 from alberta_framework.streams.pavlovian import (
@@ -406,6 +409,20 @@ def test_construct_rejects_bad_cs_index():
         raise AssertionError("expected ValueError for invalid CS index")
 
 
+@pytest.mark.parametrize("contingency", [-0.1, 1.1, float("nan")])
+def test_construct_rejects_invalid_phase_contingency(contingency: float):
+    """Every phase contingency must be a finite probability."""
+    bad_phase = PavlovianPhase(
+        name="bad",
+        n_steps=10,
+        cs_us_contingency=contingency,
+        cs_active=(0,),
+    )
+
+    with pytest.raises(ValueError, match="cs_us_contingency must be in"):
+        ClassicalConditioningStream(phases=(bad_phase,), n_cs=1)
+
+
 def test_partial_reinforcement_rejects_invalid_p():
     """``p`` outside [0, 1] is rejected."""
     for bad_p in (-0.1, 1.1):
@@ -414,6 +431,389 @@ def test_partial_reinforcement_rejects_invalid_p():
         except ValueError:
             continue
         raise AssertionError(f"expected ValueError for p={bad_p}")
+
+
+def _valid_phase(**overrides: object) -> PavlovianPhase:
+    payload = {
+        "name": "acq",
+        "n_steps": 10,
+        "cs_us_contingency": 1.0,
+        "cs_active": (0,),
+    }
+    payload.update(overrides)
+    return PavlovianPhase(**payload)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+        True,
+        -1.0,
+        1e100,
+        10**400,
+    ],
+)
+def test_construct_rejects_illegal_noise_std(value: object) -> None:
+    """Noise must remain non-negative and finite in float32 execution."""
+    with pytest.raises(ValueError, match="noise_std"):
+        ClassicalConditioningStream(phases=(_valid_phase(),), noise_std=value)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        float(np.finfo(np.float32).max),
+        float(np.nextafter(np.float32(0.0), np.float32(1.0))),
+    ],
+)
+def test_construct_accepts_float32_noise_std_boundaries(value: float) -> None:
+    """Finite float32 endpoints survive constructor canonicalization."""
+    stream = ClassicalConditioningStream(phases=(_valid_phase(),), noise_std=value)
+    assert stream._noise_std == value  # noqa: SLF001 - normalization is under test
+
+
+def test_construct_canonicalizes_underflowing_noise_std_to_zero() -> None:
+    """A positive host float below float32 range has exact zero-noise semantics."""
+    stream = ClassicalConditioningStream(phases=(_valid_phase(),), noise_std=1e-50)
+    assert stream._noise_std == 0.0  # noqa: SLF001 - normalization is under test
+
+
+def test_construct_canonicalizes_noise_std_to_float32() -> None:
+    """Stored noise matches the scalar used by the float32 trajectory."""
+    stream = ClassicalConditioningStream(phases=(_valid_phase(),), noise_std=0.1)
+    assert stream._noise_std == float(np.float32(0.1))  # noqa: SLF001
+
+
+def test_construct_narrows_original_noise_real_once() -> None:
+    midpoint_plus = (
+        np.longdouble(1.0)
+        + np.longdouble(2.0) ** -24
+        + np.longdouble(2.0) ** -60
+    )
+    assert np.float32(midpoint_plus) != np.float32(float(midpoint_plus))
+
+    stream = ClassicalConditioningStream(
+        phases=(_valid_phase(),),
+        noise_std=midpoint_plus,
+    )
+    assert stream._noise_std == float(np.float32(midpoint_plus))  # noqa: SLF001
+
+
+def test_construct_rejects_negative_real_that_rounds_to_zero() -> None:
+    below_zero = -np.nextafter(np.longdouble(0.0), np.longdouble(1.0))
+    assert float(below_zero) == 0.0
+    with pytest.raises(ValueError, match="noise_std"):
+        ClassicalConditioningStream(phases=(_valid_phase(),), noise_std=below_zero)
+
+
+@pytest.mark.parametrize(
+    ("noise_std", "expected"),
+    [
+        (
+            Fraction(1, 1) + Fraction(1, 2**24) - Fraction(1, 2**60),
+            1.0,
+        ),
+        (Fraction(1, 1) + Fraction(1, 2**24), 1.0),
+        (
+            Fraction(1, 1) + Fraction(1, 2**24) + Fraction(1, 2**60),
+            float(np.nextafter(np.float32(1.0), np.float32(2.0))),
+        ),
+    ],
+    ids=("below", "tie-to-even", "above"),
+)
+def test_construct_rounds_fraction_noise_midpoints_once(
+    noise_std: Fraction,
+    expected: float,
+) -> None:
+    stream = ClassicalConditioningStream(
+        phases=(_valid_phase(),),
+        noise_std=noise_std,
+    )
+    assert stream._noise_std == expected  # noqa: SLF001
+
+
+def test_construct_applies_exact_float32_overflow_midpoint() -> None:
+    float32_max = (2**24 - 1) * 2**104
+    overflow_midpoint = float32_max + 2**103
+
+    stream = ClassicalConditioningStream(
+        phases=(_valid_phase(),),
+        noise_std=Fraction(overflow_midpoint - 1),
+    )
+    assert stream._noise_std == float(np.finfo(np.float32).max)  # noqa: SLF001
+    with pytest.raises(ValueError, match="noise_std"):
+        ClassicalConditioningStream(
+            phases=(_valid_phase(),),
+            noise_std=Fraction(overflow_midpoint),
+        )
+
+
+def test_construct_applies_exact_subnormal_midpoint_and_signed_zero() -> None:
+    subnormal_midpoint = Fraction(1, 2**150)
+    tie = ClassicalConditioningStream(
+        phases=(_valid_phase(),),
+        noise_std=subnormal_midpoint,
+    )
+    above = ClassicalConditioningStream(
+        phases=(_valid_phase(),),
+        noise_std=subnormal_midpoint + Fraction(1, 2**200),
+    )
+    negative_zero = ClassicalConditioningStream(
+        phases=(_valid_phase(),),
+        noise_std=-0.0,
+    )
+
+    assert tie._noise_std == 0.0  # noqa: SLF001
+    assert above._noise_std == float(  # noqa: SLF001
+        np.nextafter(np.float32(0.0), np.float32(1.0))
+    )
+    assert np.signbit(negative_zero._noise_std)  # noqa: SLF001
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -0.1, 1.1, True])
+def test_construct_rejects_illegal_distractor_prob(value: object) -> None:
+    """Distractor probability must be a finite real in ``[0, 1]``."""
+    with pytest.raises(ValueError, match="distractor_prob"):
+        ClassicalConditioningStream(
+            phases=(_valid_phase(),),
+            distractor_prob=value,  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.parametrize("value", [True, False])
+def test_construct_rejects_bool_phase_contingency(value: bool) -> None:
+    """A bool is not a scientific contingency, even though ``True == 1``."""
+    with pytest.raises(ValueError, match="cs_us_contingency"):
+        ClassicalConditioningStream(phases=(_valid_phase(cs_us_contingency=value),))
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), True])
+def test_partial_reinforcement_rejects_illegal_p(value: object) -> None:
+    """Scenario ``p`` must be a finite real in ``[0, 1]``, not a bool or NaN."""
+    with pytest.raises(ValueError, match=r"\bp\b"):
+        partial_reinforcement_scenario(p=value)  # type: ignore[arg-type]
+
+
+class _SpoofedReal:
+    """Mimics ``float`` via ``__class__`` to defeat ``isinstance`` checks."""
+
+    def __init__(self, value: float = 0.5) -> None:
+        self._value = value
+
+    @property
+    def __class__(self) -> type:  # type: ignore[override]
+        return float
+
+    def __float__(self) -> float:
+        return self._value
+
+    def __lt__(self, other: object) -> bool:
+        return self._value < other  # type: ignore[operator]
+
+    def __le__(self, other: object) -> bool:
+        return self._value <= other  # type: ignore[operator]
+
+
+class _RaisingSpoofedReal:
+    """A ``__class__`` spoof whose numeric hooks raise when actually used."""
+
+    @property
+    def __class__(self) -> type:  # type: ignore[override]
+        return float
+
+    def __float__(self) -> float:
+        raise RuntimeError("untrusted __float__ hook executed")
+
+    def __lt__(self, other: object) -> bool:
+        raise RuntimeError("untrusted __lt__ hook executed")
+
+    def __le__(self, other: object) -> bool:
+        raise RuntimeError("untrusted __le__ hook executed")
+
+    def __repr__(self) -> str:
+        raise RuntimeError("untrusted __repr__ hook executed")
+
+    def __str__(self) -> str:
+        raise RuntimeError("untrusted __str__ hook executed")
+
+
+def test_construct_rejects_class_spoofed_noise_std() -> None:
+    """A non-real whose ``__class__`` reports ``float`` must still be rejected."""
+    with pytest.raises(ValueError, match="noise_std"):
+        ClassicalConditioningStream(
+            phases=(_valid_phase(),),
+            noise_std=_SpoofedReal(0.1),  # type: ignore[arg-type]
+        )
+
+
+def test_construct_raising_class_spoofed_noise_std_stays_a_value_error() -> None:
+    """A spoof with raising numeric hooks must not leak its raw exception."""
+    with pytest.raises(ValueError, match="noise_std"):
+        ClassicalConditioningStream(
+            phases=(_valid_phase(),),
+            noise_std=_RaisingSpoofedReal(),  # type: ignore[arg-type]
+        )
+
+
+def test_construct_rejects_class_spoofed_distractor_prob() -> None:
+    """A non-real whose ``__class__`` reports ``float`` must still be rejected."""
+    with pytest.raises(ValueError, match="distractor_prob"):
+        ClassicalConditioningStream(
+            phases=(_valid_phase(),),
+            distractor_prob=_SpoofedReal(0.1),  # type: ignore[arg-type]
+        )
+
+
+def test_construct_raising_class_spoofed_distractor_prob_stays_a_value_error() -> None:
+    """A spoof with raising numeric hooks must not leak its raw exception."""
+    with pytest.raises(ValueError, match="distractor_prob"):
+        ClassicalConditioningStream(
+            phases=(_valid_phase(),),
+            distractor_prob=_RaisingSpoofedReal(),  # type: ignore[arg-type]
+        )
+
+
+def test_construct_rejects_class_spoofed_phase_contingency() -> None:
+    """A non-real whose ``__class__`` reports ``float`` must still be rejected."""
+    with pytest.raises(ValueError, match="cs_us_contingency"):
+        ClassicalConditioningStream(
+            phases=(_valid_phase(cs_us_contingency=_SpoofedReal(0.1)),)
+        )
+
+
+def test_construct_raising_class_spoofed_phase_contingency_stays_a_value_error() -> None:
+    """A spoof with raising numeric/repr hooks must not leak its raw exception."""
+    with pytest.raises(ValueError, match="cs_us_contingency"):
+        ClassicalConditioningStream(
+            phases=(_valid_phase(cs_us_contingency=_RaisingSpoofedReal()),)
+        )
+
+
+def test_construct_accepts_zero_noise_and_zero_distractor_prob() -> None:
+    stream = ClassicalConditioningStream(
+        phases=(_valid_phase(),),
+        noise_std=0.0,
+        distractor_prob=0.0,
+    )
+    assert stream.feature_dim == 1
+
+
+@pytest.mark.parametrize(
+    "value",
+    [True, False, 1.0, 1.5, np.int64(5), -1, float("nan"), "5", None],
+)
+def test_iti_min_rejects_bool_nonintegral_and_out_of_domain(value: object) -> None:
+    """``iti_min`` is a built-in int in ``[0, iti_max]``."""
+    with pytest.raises(ValueError, match="iti_min"):
+        ClassicalConditioningStream(
+            phases=(_valid_phase(),),
+            iti_min=value,  # type: ignore[arg-type]
+            iti_max=20,
+        )
+
+
+@pytest.mark.parametrize("value", [True, False, 20.0, np.int64(20), -1])
+def test_iti_max_rejects_bool_nonintegral_and_out_of_domain(value: object) -> None:
+    with pytest.raises(ValueError, match="iti_max"):
+        ClassicalConditioningStream(
+            phases=(_valid_phase(),),
+            iti_min=0,
+            iti_max=value,  # type: ignore[arg-type]
+        )
+
+
+def test_iti_min_accepts_zero_and_equal_max_endpoints() -> None:
+    zero = ClassicalConditioningStream(phases=(_valid_phase(),), iti_min=0, iti_max=20)
+    equal = ClassicalConditioningStream(phases=(_valid_phase(),), iti_min=0, iti_max=0)
+    matched = ClassicalConditioningStream(phases=(_valid_phase(),), iti_min=5, iti_max=5)
+    assert zero.feature_dim == 1
+    assert equal.feature_dim == 1
+    assert matched.feature_dim == 1
+
+
+def test_iti_min_rejects_greater_than_iti_max() -> None:
+    with pytest.raises(ValueError, match="iti_min <= iti_max"):
+        ClassicalConditioningStream(phases=(_valid_phase(),), iti_min=6, iti_max=5)
+
+
+@pytest.mark.parametrize(
+    ("field", "minimum"),
+    [
+        ("n_cs", 1),
+        ("n_distractors", 0),
+        ("cs_us_delay", 1),
+        ("cs_duration", 1),
+    ],
+)
+@pytest.mark.parametrize("value", [True, False, 1.0, np.int64(1)])
+def test_pavlovian_integer_fields_reject_bool_and_nonintegral(
+    field: str, minimum: int, value: object
+) -> None:
+    del minimum
+    with pytest.raises(ValueError, match=field):
+        ClassicalConditioningStream(
+            phases=(_valid_phase(),),
+            **{field: value},  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.parametrize("value", [True, False, 1.0, np.int64(10), 0])
+def test_phase_n_steps_requires_positive_builtin_int(value: object) -> None:
+    with pytest.raises(ValueError, match="n_steps"):
+        ClassicalConditioningStream(phases=(_valid_phase(n_steps=value),))
+
+
+@pytest.mark.parametrize("value", [True, False, 1.0, np.int64(-1)])
+def test_phase_compound_index_requires_builtin_int(value: object) -> None:
+    with pytest.raises(ValueError, match="compound_index"):
+        ClassicalConditioningStream(
+            phases=(_valid_phase(compound_index=value),),
+            n_cs=2,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("n_distractors", 2**31),
+        ("cs_us_delay", 2**31),
+        ("cs_duration", 2**31),
+        ("iti_max", 2**31 - 1),
+    ],
+)
+def test_schedule_fields_reject_values_outside_jax_int32(
+    field: str,
+    value: int,
+) -> None:
+    """Accepted configuration must remain representable in JAX state."""
+    kwargs: dict[str, object] = {field: value}
+    with pytest.raises(ValueError, match=field):
+        ClassicalConditioningStream(
+            phases=(_valid_phase(),),
+            **kwargs,  # type: ignore[arg-type]
+        )
+
+
+def test_phase_n_steps_rejects_values_outside_jax_int32() -> None:
+    """Phase validation must run before materializing the int32 phase array."""
+    with pytest.raises(ValueError, match="n_steps"):
+        ClassicalConditioningStream(phases=(_valid_phase(n_steps=2**31),))
+
+
+def test_schedule_fields_accept_jax_int32_upper_endpoints() -> None:
+    stream = ClassicalConditioningStream(
+        phases=(_valid_phase(n_steps=2**31 - 1),),
+        cs_us_delay=2**31 - 1,
+        cs_duration=2**31 - 1,
+        iti_min=2**31 - 2,
+        iti_max=2**31 - 2,
+    )
+    state = stream.init(jr.key(99))
+    stream.step(state, jnp.array(0))
+    assert int(state.iti_steps_remaining) == 2**31 - 2
 
 
 def test_reacquisition_runs_three_phases():

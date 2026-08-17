@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import math
+import warnings
+from types import MappingProxyType
 
 import chex
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 import pytest
 from jax import Array
 
@@ -96,6 +99,149 @@ def test_latent_world_model_update_and_prediction_shapes() -> None:
     chex.assert_tree_all_finite(result.latent_std_mean)
 
 
+def test_latent_default_discounts_do_not_inherit_the_reward_dtype() -> None:
+    config = LatentWorldModelConfig(
+        observation_dim=2,
+        n_actions=2,
+        latent_dim=4,
+        hidden_sizes=(8,),
+    )
+    model = LatentWorldModel(config)
+    state = model.init(jr.key(3))
+    observations = jnp.array([[0.0, 0.0], [0.1, 0.0], [0.1, 0.2]], dtype=jnp.float32)
+    next_observations = jnp.array([[0.1, 0.0], [0.1, 0.2], [0.2, 0.2]], dtype=jnp.float32)
+    actions = jnp.array([0, 1, 0], dtype=jnp.int32)
+    integer_rewards = jnp.array([1, 0, 1], dtype=jnp.int32)
+    explicit = run_latent_world_model_learning_loop(
+        model,
+        state,
+        observations,
+        actions,
+        integer_rewards.astype(jnp.float32),
+        next_observations,
+        jnp.full((3,), config.gamma, dtype=jnp.float32),
+    )
+    defaulted = run_latent_world_model_learning_loop(
+        model, state, observations, actions, integer_rewards, next_observations
+    )
+    chex.assert_trees_all_close(defaulted.discount_errors, explicit.discount_errors)
+    chex.assert_trees_all_close(defaulted.discount_predictions, explicit.discount_predictions)
+class _FloatSpoof:
+    @property
+    def __class__(self) -> type[float]:  # type: ignore[override]
+        return float
+
+    def as_integer_ratio(self) -> tuple[int, int]:
+        return (1, 2)
+
+    def __float__(self) -> float:
+        return 0.5
+
+    def __le__(self, other: object) -> bool:
+        return True
+
+    def __lt__(self, other: object) -> bool:
+        return True
+
+    def __ge__(self, other: object) -> bool:
+        return True
+
+    def __gt__(self, other: object) -> bool:
+        return True
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"encoder_scale": _FloatSpoof()}, "encoder_scale must be a finite real number"),
+        ({"reward_scale": 1e100}, "reward_scale must remain finite once narrowed"),
+        ({"encoder_scale": 1e-100}, "encoder_scale must remain positive once narrowed"),
+        ({"max_latent_delta": 1e-100}, "max_latent_delta must remain positive once narrowed"),
+        (
+            {"surprise_decay": 1.0 - 1e-10},
+            r"surprise_decay must remain in \[0.0, 1.0\) once narrowed",
+        ),
+        (
+            {"collapse_decay": 1.0 - 1e-10},
+            r"collapse_decay must remain in \[0.0, 1.0\) once narrowed",
+        ),
+        ({"encoder_step_size": 1e100}, "encoder_step_size must remain finite once narrowed"),
+    ],
+)
+def test_latent_config_rejects_scalars_that_leave_the_float32_domain(
+    overrides: dict[str, object], message: str
+) -> None:
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        with pytest.raises(ValueError, match=message):
+            LatentWorldModelConfig(
+                observation_dim=2,
+                n_actions=2,
+                latent_dim=4,
+                hidden_sizes=(8,),
+                **overrides,  # type: ignore[arg-type]
+            )
+
+
+def test_latent_config_canonicalizes_real_scalars() -> None:
+    from fractions import Fraction
+
+    model = LatentWorldModel(
+        LatentWorldModelConfig(
+            observation_dim=2,
+            n_actions=2,
+            latent_dim=4,
+            hidden_sizes=(8,),
+            encoder_scale=Fraction(1, 2),
+            min_latent_std=np.float64(0.05),
+        )
+    )
+    assert type(model.config.encoder_scale) is float and model.config.encoder_scale == 0.5
+    assert type(model.config.min_latent_std) is float
+    assert model.config.min_latent_std == float(np.float32(0.05))
+    restored = LatentWorldModel.from_config(model.to_config())
+    assert restored.config == model.config
+
+
+@pytest.mark.parametrize("discount", [1.5, -0.5])
+def test_latent_update_rejects_out_of_range_discounts(discount: float) -> None:
+    config = LatentWorldModelConfig(observation_dim=2, n_actions=2, latent_dim=4, hidden_sizes=(8,))
+    model = LatentWorldModel(config)
+    state = model.init(jr.key(3))
+    obs = jnp.array([0.1, -0.2], dtype=jnp.float32)
+    result = model.update(state, obs, jnp.int32(1), 0.5, discount, jnp.array([0.2, 0.1]))
+    assert not bool(result.update_applied)
+    assert int(result.state.step_count) == int(state.step_count)
+    chex.assert_trees_all_equal(
+        result.state.learner_state.trunk_params, state.learner_state.trunk_params
+    )
+
+
+def test_latent_update_saturates_step_count_at_int32_max() -> None:
+    config = LatentWorldModelConfig(
+        observation_dim=2,
+        n_actions=2,
+        latent_dim=2,
+        hidden_sizes=(),
+    )
+    model = LatentWorldModel(config)
+    state = model.init(jr.key(0)).replace(
+        step_count=jnp.asarray(2**31 - 1, dtype=jnp.int32)
+    )
+
+    result = model.update(
+        state,
+        jnp.asarray([0.1, -0.2], dtype=jnp.float32),
+        jnp.asarray(1, dtype=jnp.int32),
+        jnp.asarray(0.5, dtype=jnp.float32),
+        jnp.asarray(0.9, dtype=jnp.float32),
+        jnp.asarray([0.2, -0.1], dtype=jnp.float32),
+    )
+
+    assert bool(result.update_applied)
+    assert int(result.state.step_count) == 2**31 - 1
+
+
 def test_latent_world_model_scan_loop_and_config_roundtrip() -> None:
     config = LatentWorldModelConfig(
         observation_dim=2,
@@ -135,6 +281,25 @@ def test_latent_world_model_scan_loop_and_config_roundtrip() -> None:
     chex.assert_shape(result.surprises, (3,))
     chex.assert_shape(result.per_head_metrics, (3, 6, 3))
     chex.assert_tree_all_finite(result.prediction_errors)
+
+
+def test_latent_action_interactions_do_not_form_zero_times_inf() -> None:
+    """Inf latent times a silent action one-hot is 0*inf = NaN in the product."""
+    model = LatentWorldModel(
+        LatentWorldModelConfig(
+            observation_dim=2,
+            n_actions=3,
+            latent_dim=2,
+            hidden_sizes=(),
+            include_action_interactions=True,
+        )
+    )
+    latent = jnp.array([jnp.inf, 1.0], dtype=jnp.float32)
+    raw = latent[:, None] * jnp.array([1.0, 0.0, 0.0], dtype=jnp.float32)[None, :]
+    assert not bool(jnp.all(jnp.isfinite(raw)))
+
+    features = model.input_features_from_latent(latent, jnp.array(0, dtype=jnp.int32))
+    assert bool(jnp.all(jnp.isnan(features)))
 
 
 def test_score_dream_candidates_selects_surprising_useful_valid_items() -> None:
@@ -397,16 +562,190 @@ def test_trainable_encoder_serialization_roundtrip() -> None:
         {"max_encoder_update": -1.0},
         {"encoder_collapse_gate_threshold": -0.1},
         {"encoder_collapse_gate_threshold": 1.5},
+        {"encoder_step_size": float("nan")},
+        {"max_encoder_update": float("nan")},
+        {"min_latent_std": float("nan")},
+        {"min_latent_std": float("inf")},
+        {"max_latent_delta": float("nan")},
+        {"encoder_scale": float("nan")},
+        {"encoder_bias_scale": float("nan")},
+        {"reward_scale": float("inf")},
+        {"observation_scale": (float("nan"), 1.0)},
     ],
 )
 def test_trainable_encoder_config_validation_fails_closed(
     overrides: dict[str, float],
 ) -> None:
-    config = LatentWorldModelConfig(
-        observation_dim=2,
-        n_actions=2,
-        encoder_learning=True,
-        **overrides,  # type: ignore[arg-type]
-    )
     with pytest.raises(ValueError):
-        LatentWorldModel(config)
+        LatentWorldModelConfig(
+            observation_dim=2,
+            n_actions=2,
+            encoder_learning=True,
+            **overrides,  # type: ignore[arg-type]
+        )
+
+
+def test_latent_world_model_config_rejects_booleans_and_non_integers() -> None:
+    with pytest.raises(ValueError, match="observation_dim"):
+        LatentWorldModelConfig(observation_dim=True, n_actions=2)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="n_actions"):
+        LatentWorldModelConfig(observation_dim=2, n_actions=2.5)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="latent_dim"):
+        LatentWorldModelConfig(observation_dim=2, n_actions=2, latent_dim=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="hidden_sizes"):
+        LatentWorldModelConfig(observation_dim=2, n_actions=2, hidden_sizes=(True,))  # type: ignore[arg-type]
+
+
+def test_latent_world_model_config_accepts_and_canonicalizes_numpy_integers() -> None:
+    cfg = LatentWorldModelConfig(
+        observation_dim=np.int32(4),
+        n_actions=np.int64(2),
+        latent_dim=np.uint16(8),
+        hidden_sizes=(np.int32(32), np.int64(16)),
+    )
+    assert type(cfg.observation_dim) is int
+    assert type(cfg.n_actions) is int
+    assert type(cfg.latent_dim) is int
+    assert type(cfg.hidden_sizes[0]) is int
+    assert type(cfg.hidden_sizes[1]) is int
+    assert cfg.observation_dim == 4
+    assert cfg.n_actions == 2
+    assert cfg.latent_dim == 8
+    assert cfg.hidden_sizes == (32, 16)
+
+
+@pytest.mark.parametrize(
+    "field",
+    ("predict_delta", "use_layer_norm", "include_action_interactions", "encoder_learning"),
+)
+def test_latent_world_model_config_requires_exact_booleans(field: str) -> None:
+    with pytest.raises(ValueError, match=field):
+        LatentWorldModelConfig(
+            observation_dim=2,
+            n_actions=2,
+            **{field: 1},  # type: ignore[arg-type]
+        )
+
+
+def test_latent_world_model_config_requires_exact_containers_and_schema() -> None:
+    with pytest.raises(ValueError, match="hidden_sizes"):
+        LatentWorldModelConfig(
+            observation_dim=2,
+            n_actions=2,
+            hidden_sizes=[8],  # type: ignore[arg-type]
+        )
+    with pytest.raises(ValueError, match="observation_scale"):
+        LatentWorldModelConfig(
+            observation_dim=2,
+            n_actions=2,
+            observation_scale=[1.0, 1.0],  # type: ignore[arg-type]
+        )
+
+    payload = LatentWorldModelConfig(observation_dim=2, n_actions=2).to_config()
+    assert LatentWorldModelConfig.from_config(MappingProxyType(payload)).to_config() == payload
+    malformed = dict(payload)
+    malformed["hidden_sizes"] = (64,)
+    with pytest.raises(ValueError, match="hidden_sizes"):
+        LatentWorldModelConfig.from_config(malformed)
+    malformed = dict(payload)
+    malformed["task_id"] = 3
+    with pytest.raises(ValueError, match="fields"):
+        LatentWorldModelConfig.from_config(malformed)
+
+    model_payload = LatentWorldModel(
+        LatentWorldModelConfig(observation_dim=2, n_actions=2, hidden_sizes=())
+    ).to_config()
+    assert LatentWorldModel.from_config(MappingProxyType(model_payload)).config.to_config() == (
+        model_payload["config"]
+    )
+    malformed_model = dict(model_payload)
+    malformed_model["task_id"] = 3
+    with pytest.raises(ValueError, match="fields"):
+        LatentWorldModel.from_config(malformed_model)
+
+
+def test_latent_config_requires_complete_schema_except_legacy_encoder_defaults() -> None:
+    payload = LatentWorldModelConfig(observation_dim=2, n_actions=2).to_config()
+    missing = dict(payload)
+    del missing["gamma"]
+    with pytest.raises(ValueError, match="fields"):
+        LatentWorldModelConfig.from_config(missing)
+    wrong_type = dict(payload)
+    wrong_type["type"] = type("StringSubclass", (str,), {})("LatentWorldModelConfig")
+    with pytest.raises(ValueError, match="type"):
+        LatentWorldModelConfig.from_config(wrong_type)
+
+
+def test_latent_config_preflights_combined_direct_state_without_allocation() -> None:
+    with pytest.raises(ValueError, match="combined_direct_state_bytes"):
+        LatentWorldModelConfig(
+            observation_dim=1,
+            n_actions=1,
+            latent_dim=8,
+            hidden_sizes=(16_384, 16_384),
+        )
+
+
+def test_latent_config_mapping_gate_does_not_consult_spoofed_class() -> None:
+    class SpoofedMapping:
+        @property
+        def __class__(self) -> type:
+            raise AssertionError("__class__ hook must not run")
+
+    with pytest.raises(ValueError, match="actual mapping"):
+        LatentWorldModelConfig.from_config(SpoofedMapping())  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"observation_dim": 50_000, "latent_dim": 50_000}, "encoder_matrix"),
+        ({"observation_dim": 1, "latent_dim": 2**31 - 2}, "n_heads"),
+        (
+            {"observation_dim": 1, "latent_dim": 2**31 - 3, "n_actions": 3},
+            "input_dim",
+        ),
+        (
+            {
+                "observation_dim": 1,
+                "latent_dim": 50_000,
+                "n_actions": 50_000,
+                "include_action_interactions": True,
+            },
+            "action_interaction",
+        ),
+        ({"observation_dim": 1, "n_actions": 1, "hidden_sizes": (2**31 - 1,)}, "hidden_layer"),
+        ({"observation_dim": 1, "n_actions": 1, "hidden_sizes": (50_000, 50_000)}, "hidden_layer"),
+        (
+            {
+                "observation_dim": 1,
+                "n_actions": 1,
+                "latent_dim": 50_000,
+                "hidden_sizes": (1, 50_000),
+            },
+            "head_weight",
+        ),
+    ],
+)
+def test_latent_world_model_config_rejects_derived_allocation_overflow(
+    overrides: dict[str, object], message: str
+) -> None:
+    base: dict[str, object] = {"observation_dim": 2, "n_actions": 2}
+    base.update(overrides)
+    with pytest.raises(ValueError, match=message):
+        LatentWorldModelConfig(**base)  # type: ignore[arg-type]
+
+
+def test_latent_world_model_init_rejects_nonfinite_encoder_draw() -> None:
+    model = LatentWorldModel(
+        LatentWorldModelConfig(
+            observation_dim=2,
+            n_actions=2,
+            latent_dim=2,
+            hidden_sizes=(),
+            encoder_scale=np.finfo(np.float32).max,
+        )
+    )
+
+    with pytest.raises(ValueError, match="encoder initialization"):
+        model.init(jr.key(0))

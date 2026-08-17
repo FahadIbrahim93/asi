@@ -41,16 +41,66 @@ calibration on an external environment or a scientific-result claim.
 from __future__ import annotations
 
 import dataclasses
-import math
-from typing import Any
+import operator
+from typing import Any, SupportsIndex, cast
 
 import chex
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import Array
 from jaxtyping import Bool, Float, Int
 
+from alberta_framework.core._float32_scalars import (
+    validated_float32_scalar,
+    validated_float32_scalar_with_ratio,
+)
+
 _INT32_MAX = 2_147_483_647
+_FLOAT32_MAX = float.fromhex("0x1.fffffep+127")
+_ACTUAL_INT_TYPES = frozenset(
+    {
+        int,
+        np.int8,
+        np.int16,
+        np.int32,
+        np.int64,
+        np.uint8,
+        np.uint16,
+        np.uint32,
+        np.uint64,
+        np.longlong,
+        np.ulonglong,
+    }
+)
+
+
+def _require_int32(name: str, value: object, *, minimum: int, maximum: int = _INT32_MAX) -> int:
+    if type(value) not in _ACTUAL_INT_TYPES:
+        raise ValueError(f"{name} must be an integer in [{minimum}, {maximum}]")
+    canonical = operator.index(cast(SupportsIndex, value))
+    if not minimum <= canonical <= maximum:
+        raise ValueError(f"{name} must be an integer in [{minimum}, {maximum}]")
+    return canonical
+
+
+def _ratio_less(left: tuple[int, int], right: tuple[int, int]) -> bool:
+    return left[0] * right[1] < right[0] * left[1]
+
+
+def _ratio_less_equal(left: tuple[int, int], right: tuple[int, int]) -> bool:
+    return left[0] * right[1] <= right[0] * left[1]
+
+
+def _stable_mean(values: Array, *, axis: int | None = None) -> Array:
+    """Average bounded float32 values without overflowing the reduction sum."""
+    count = values.size if axis is None else values.shape[axis]
+    return jnp.sum(values / jnp.asarray(count, dtype=jnp.float32), axis=axis)
+
+
+def _skip_zero_scale(scale: Array, value: Array) -> Array:
+    """Skip ``0 * inf`` so a disabled EMA decay does not poison the next value."""
+    return jnp.where(scale == 0.0, jnp.zeros_like(value), scale * value)
 
 
 def _saturating_increment(value: Array) -> Array:
@@ -63,21 +113,6 @@ def _saturating_counter_sum(left: Array, right: Array) -> Array:
     """Add non-negative int32 counters without overflowing."""
     maximum = jnp.asarray(_INT32_MAX, dtype=jnp.int32)
     return left + jnp.minimum(right, maximum - left)
-
-
-def _positive_finite(name: str, value: float) -> None:
-    if not math.isfinite(value) or value <= 0.0:
-        raise ValueError(f"{name} must be positive and finite")
-
-
-def _unit_interval(name: str, value: float) -> None:
-    if not math.isfinite(value) or not 0.0 <= value < 1.0:
-        raise ValueError(f"{name} must be finite and in [0, 1)")
-
-
-def _positive_integer(name: str, value: int, *, minimum: int = 1) -> None:
-    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
-        raise ValueError(f"{name} must be an integer >= {minimum}")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -114,31 +149,122 @@ class LearningSignalEstimatorConfig:
 
     def __post_init__(self) -> None:
         """Reject invalid static shapes, timescales, and safety bounds."""
-        _positive_integer("ensemble_size", self.ensemble_size, minimum=2)
-        _positive_integer("target_dim", self.target_dim)
-        _positive_integer("progress_warmup_steps", self.progress_warmup_steps, minimum=2)
-        _positive_integer(
-            "change_calibration_steps",
-            self.change_calibration_steps,
-            minimum=2,
+        object.__setattr__(
+            self,
+            "ensemble_size",
+            _require_int32("ensemble_size", self.ensemble_size, minimum=2),
         )
-        if self.change_calibration_steps >= _INT32_MAX:
-            raise ValueError("change_calibration_steps must fit in int32")
-        _positive_finite("variance_floor", self.variance_floor)
-        _unit_interval("fast_loss_decay", self.fast_loss_decay)
-        _unit_interval("slow_loss_decay", self.slow_loss_decay)
-        if self.fast_loss_decay >= self.slow_loss_decay:
+        object.__setattr__(
+            self,
+            "target_dim",
+            _require_int32("target_dim", self.target_dim, minimum=1),
+        )
+        input_scalars = 2 * self.ensemble_size * self.target_dim + self.target_dim + 1
+        if input_scalars > _INT32_MAX:
+            raise ValueError(
+                "ensemble_size and target_dim input resource budget must fit signed int32"
+            )
+        object.__setattr__(
+            self,
+            "progress_warmup_steps",
+            _require_int32(
+                "progress_warmup_steps",
+                self.progress_warmup_steps,
+                minimum=2,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "change_calibration_steps",
+            _require_int32(
+                "change_calibration_steps",
+                self.change_calibration_steps,
+                minimum=2,
+                maximum=_INT32_MAX - 1,
+            ),
+        )
+        positive_values = {
+            field_name: validated_float32_scalar_with_ratio(
+                field_name, getattr(self, field_name), positive=True
+            )
+            for field_name in (
+                "variance_floor",
+                "change_z_threshold",
+                "change_temperature",
+                "calibration_scale_floor",
+                "max_normalized_residual",
+                "max_input_magnitude",
+                "max_predicted_variance",
+                "max_observed_loss",
+            )
+        }
+        fast_loss_decay, fast_n, fast_d = validated_float32_scalar_with_ratio(
+            "fast_loss_decay",
+            self.fast_loss_decay,
+            lower=0.0,
+            upper=1.0,
+            upper_inclusive=False,
+        )
+        slow_loss_decay, slow_n, slow_d = validated_float32_scalar_with_ratio(
+            "slow_loss_decay",
+            self.slow_loss_decay,
+            lower=0.0,
+            upper=1.0,
+            upper_inclusive=False,
+        )
+        if not _ratio_less((fast_n, fast_d), (slow_n, slow_d)) or not (
+            fast_loss_decay < slow_loss_decay
+        ):
             raise ValueError("fast_loss_decay must be smaller than slow_loss_decay")
-        _positive_finite("change_z_threshold", self.change_z_threshold)
-        _positive_finite("change_temperature", self.change_temperature)
-        _unit_interval("change_decay", self.change_decay)
-        _positive_finite("calibration_scale_floor", self.calibration_scale_floor)
-        _positive_finite("max_normalized_residual", self.max_normalized_residual)
-        _positive_finite("max_input_magnitude", self.max_input_magnitude)
-        _positive_finite("max_predicted_variance", self.max_predicted_variance)
-        _positive_finite("max_observed_loss", self.max_observed_loss)
-        if self.variance_floor > self.max_predicted_variance:
+        change_decay = validated_float32_scalar(
+            "change_decay",
+            self.change_decay,
+            lower=0.0,
+            upper=1.0,
+            upper_inclusive=False,
+        )
+        object.__setattr__(self, "fast_loss_decay", fast_loss_decay)
+        object.__setattr__(self, "slow_loss_decay", slow_loss_decay)
+        object.__setattr__(self, "change_decay", change_decay)
+        for field_name, (stored, _, _) in positive_values.items():
+            object.__setattr__(self, field_name, stored)
+        _, variance_floor_n, variance_floor_d = positive_values["variance_floor"]
+        _, max_variance_n, max_variance_d = positive_values["max_predicted_variance"]
+        if not _ratio_less_equal(
+            (variance_floor_n, variance_floor_d),
+            (max_variance_n, max_variance_d),
+        ) or self.variance_floor > self.max_predicted_variance:
             raise ValueError("variance_floor must not exceed max_predicted_variance")
+        max_input, max_input_n, max_input_d = positive_values["max_input_magnitude"]
+        float32_max_n, float32_max_d = _FLOAT32_MAX.as_integer_ratio()
+        total_variance_left = (
+            4 * max_input_n * max_input_n * max_variance_d
+            + max_variance_n * max_input_d * max_input_d
+        ) * float32_max_d
+        total_variance_right = (
+            float32_max_n * max_input_d * max_input_d * max_variance_d
+        )
+        if total_variance_left > total_variance_right or (
+            4.0 * max_input * max_input + self.max_predicted_variance > _FLOAT32_MAX
+        ):
+            raise ValueError(
+                "four times max_input_magnitude squared plus "
+                "max_predicted_variance must fit float32"
+            )
+        max_residual, max_residual_n, max_residual_d = positive_values[
+            "max_normalized_residual"
+        ]
+        calibration_left = (
+            _INT32_MAX * max_residual_n * max_residual_n * float32_max_d
+        )
+        calibration_right = float32_max_n * max_residual_d * max_residual_d
+        if calibration_left > calibration_right or (
+            _INT32_MAX * max_residual * max_residual > _FLOAT32_MAX
+        ):
+            raise ValueError(
+                "max_normalized_residual squared times the counter lifetime "
+                "must fit float32"
+            )
 
     def to_config(self) -> dict[str, Any]:
         """Return a JSON-compatible configuration."""
@@ -154,9 +280,11 @@ class LearningSignalEstimatorConfig:
         config: dict[str, Any],
     ) -> LearningSignalEstimatorConfig:
         """Reconstruct a configuration and reject a mismatched type marker."""
+        if type(config) is not dict:
+            raise ValueError("config must be an actual dict")
         payload = dict(config)
         type_name = payload.pop("type", "LearningSignalEstimatorConfig")
-        if type_name != "LearningSignalEstimatorConfig":
+        if type(type_name) is not str or type_name != "LearningSignalEstimatorConfig":
             raise ValueError("type must be LearningSignalEstimatorConfig")
         development_only = payload.pop("development_only", True)
         if development_only is not True:
@@ -185,6 +313,104 @@ class LearningSignalResourceBudget:
     output_bool_scalars: int
     output_logical_bytes: int
     trainable_scalars: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "input_float_scalars_per_step",
+            _require_int32(
+                "input_float_scalars_per_step",
+                self.input_float_scalars_per_step,
+                minimum=1,
+            ),
+        )
+        # Producer counts have the exact form D * (2E + 1) + 1 for
+        # ensemble size E >= 2 and target dimension D >= 1.  Removing all
+        # factors of two from count - 1 therefore leaves an odd factor >= 5.
+        odd_factor = self.input_float_scalars_per_step - 1
+        while odd_factor > 0 and odd_factor % 2 == 0:
+            odd_factor //= 2
+        if odd_factor < 5:
+            raise ValueError(
+                "input_float_scalars_per_step is not attainable by a legal estimator config"
+            )
+        object.__setattr__(
+            self,
+            "persistent_float32_scalars",
+            _require_int32(
+                "persistent_float32_scalars",
+                self.persistent_float32_scalars,
+                minimum=0,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "persistent_int32_scalars",
+            _require_int32(
+                "persistent_int32_scalars",
+                self.persistent_int32_scalars,
+                minimum=0,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "persistent_state_scalars",
+            _require_int32(
+                "persistent_state_scalars",
+                self.persistent_state_scalars,
+                minimum=0,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "persistent_state_bytes",
+            _require_int32(
+                "persistent_state_bytes",
+                self.persistent_state_bytes,
+                minimum=0,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "output_float32_scalars",
+            _require_int32(
+                "output_float32_scalars",
+                self.output_float32_scalars,
+                minimum=0,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "output_bool_scalars",
+            _require_int32("output_bool_scalars", self.output_bool_scalars, minimum=0),
+        )
+        object.__setattr__(
+            self,
+            "output_logical_bytes",
+            _require_int32(
+                "output_logical_bytes",
+                self.output_logical_bytes,
+                minimum=0,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "trainable_scalars",
+            _require_int32("trainable_scalars", self.trainable_scalars, minimum=0),
+        )
+        expected = {
+            "persistent_float32_scalars": 5,
+            "persistent_int32_scalars": 4,
+            "persistent_state_scalars": 9,
+            "persistent_state_bytes": 36,
+            "output_float32_scalars": 8,
+            "output_bool_scalars": 6,
+            "output_logical_bytes": 38,
+            "trainable_scalars": 0,
+        }
+        for name, value in expected.items():
+            if getattr(self, name) != value:
+                raise ValueError(f"{name} does not match the learning-signal implementation")
 
     def to_config(self) -> dict[str, int]:
         """Return a JSON-compatible budget description."""
@@ -309,14 +535,14 @@ class LearningSignalEstimator:
             array = jnp.asarray(value)
             if array.shape != ():
                 raise ValueError(f"state.{name} must be scalar")
-            if not jnp.issubdtype(array.dtype, jnp.integer):
-                raise ValueError(f"state.{name} must have an integer dtype")
+            if array.dtype != jnp.dtype(jnp.int32):
+                raise ValueError(f"state.{name} must have dtype int32")
         for name, value in float_values.items():
             array = jnp.asarray(value)
             if array.shape != ():
                 raise ValueError(f"state.{name} must be scalar")
-            if not jnp.issubdtype(array.dtype, jnp.inexact):
-                raise ValueError(f"state.{name} must have a floating dtype")
+            if array.dtype != jnp.dtype(jnp.float32):
+                raise ValueError(f"state.{name} must have dtype float32")
 
     def observe(
         self,
@@ -357,6 +583,21 @@ class LearningSignalEstimator:
         )
         loss = self._floating_array(jnp.asarray(observed_loss), (), name="observed_loss")
 
+        checked_fast_loss = (
+            jnp.zeros_like(state.fast_loss_ema)
+            if self._config.fast_loss_decay == 0.0
+            else state.fast_loss_ema
+        )
+        checked_slow_loss = (
+            jnp.zeros_like(state.slow_loss_ema)
+            if self._config.slow_loss_decay == 0.0
+            else state.slow_loss_ema
+        )
+        checked_change = (
+            jnp.zeros_like(state.sustained_change_probability)
+            if self._config.change_decay == 0.0
+            else state.sustained_change_probability
+        )
         state_valid = (
             (state.step_count >= 0)
             & (state.valid_count >= 0)
@@ -376,15 +617,15 @@ class LearningSignalEstimator:
             & (state.calibration_mean <= self._config.max_normalized_residual)
             & jnp.isfinite(state.calibration_m2)
             & (state.calibration_m2 >= 0.0)
-            & jnp.isfinite(state.fast_loss_ema)
-            & (state.fast_loss_ema >= 0.0)
-            & (state.fast_loss_ema <= self._config.max_observed_loss)
-            & jnp.isfinite(state.slow_loss_ema)
-            & (state.slow_loss_ema >= 0.0)
-            & (state.slow_loss_ema <= self._config.max_observed_loss)
-            & jnp.isfinite(state.sustained_change_probability)
-            & (state.sustained_change_probability >= 0.0)
-            & (state.sustained_change_probability <= 1.0)
+            & jnp.isfinite(checked_fast_loss)
+            & (checked_fast_loss >= 0.0)
+            & (checked_fast_loss <= self._config.max_observed_loss)
+            & jnp.isfinite(checked_slow_loss)
+            & (checked_slow_loss >= 0.0)
+            & (checked_slow_loss <= self._config.max_observed_loss)
+            & jnp.isfinite(checked_change)
+            & (checked_change >= 0.0)
+            & (checked_change <= 1.0)
         )
         input_valid = (
             jnp.all(jnp.isfinite(means))
@@ -443,14 +684,14 @@ class LearningSignalEstimator:
         )
         safe_loss = jnp.clip(safe_loss, 0.0, self._config.max_observed_loss)
 
-        ensemble_mean = jnp.mean(safe_means, axis=0)
-        per_dimension_epistemic = jnp.mean(
+        ensemble_mean = _stable_mean(safe_means, axis=0)
+        per_dimension_epistemic = _stable_mean(
             jnp.square(safe_means - ensemble_mean[None, :]),
             axis=0,
         )
-        per_dimension_aleatoric = jnp.mean(safe_variances, axis=0)
-        epistemic_disagreement = jnp.mean(per_dimension_epistemic)
-        epistemic_surprise = jnp.mean(
+        per_dimension_aleatoric = _stable_mean(safe_variances, axis=0)
+        epistemic_disagreement = _stable_mean(per_dimension_epistemic)
+        epistemic_surprise = _stable_mean(
             per_dimension_epistemic
             / jnp.maximum(per_dimension_aleatoric, self._config.variance_floor)
         )
@@ -458,29 +699,34 @@ class LearningSignalEstimator:
             epistemic_surprise,
             self._config.max_normalized_residual,
         )
-        aleatoric_uncertainty = jnp.mean(per_dimension_aleatoric)
+        aleatoric_uncertainty = _stable_mean(per_dimension_aleatoric)
         total_variance = jnp.maximum(
             per_dimension_epistemic + per_dimension_aleatoric,
             self._config.variance_floor,
         )
-        normalized_residual = jnp.mean(jnp.square(safe_target - ensemble_mean) / total_variance)
+        normalized_residual = _stable_mean(
+            jnp.square(safe_target - ensemble_mean) / total_variance
+        )
         normalized_residual = jnp.minimum(
             normalized_residual,
             self._config.max_normalized_residual,
         )
 
         first_valid_event = state.valid_count == 0
+        fast_decay = jnp.asarray(self._config.fast_loss_decay, dtype=jnp.float32)
+        slow_decay = jnp.asarray(self._config.slow_loss_decay, dtype=jnp.float32)
+        change_decay = jnp.asarray(self._config.change_decay, dtype=jnp.float32)
         fast_loss = jnp.where(
             first_valid_event,
             safe_loss,
-            self._config.fast_loss_decay * state.fast_loss_ema
-            + (1.0 - self._config.fast_loss_decay) * safe_loss,
+            _skip_zero_scale(fast_decay, state.fast_loss_ema)
+            + (1.0 - fast_decay) * safe_loss,
         )
         slow_loss = jnp.where(
             first_valid_event,
             safe_loss,
-            self._config.slow_loss_decay * state.slow_loss_ema
-            + (1.0 - self._config.slow_loss_decay) * safe_loss,
+            _skip_zero_scale(slow_decay, state.slow_loss_ema)
+            + (1.0 - slow_decay) * safe_loss,
         )
         learning_progress = slow_loss - fast_loss
         next_valid_count = _saturating_increment(state.valid_count)
@@ -519,8 +765,8 @@ class LearningSignalEstimator:
             / self._config.change_temperature
         )
         sustained_change_probability = (
-            self._config.change_decay * state.sustained_change_probability
-            + (1.0 - self._config.change_decay) * instantaneous_change_probability
+            _skip_zero_scale(change_decay, state.sustained_change_probability)
+            + (1.0 - change_decay) * instantaneous_change_probability
         )
         change_available = event_valid & calibration_ready
 

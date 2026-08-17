@@ -1,13 +1,23 @@
-"""Production-facing Step 4 SARSA facade tests (mirrors test_step3_production.py)."""
+"""Production-facing Step 4 SARSA facade tests (mirrors test_step3_production.py).
+
+Invalid scientific-scalar cases are written to fail on current main (bool,
+non-real, non-finite, and out-of-domain values accepted) and pass after
+the facade rejects them. Legal endpoints stay constructible.
+"""
+
+import json
+from typing import Any
 
 import chex
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 import pytest
 
 from alberta_framework.core.optimizers import IDBD, LMS, Autostep, ObGDBounding
 from alberta_framework.steps import (
     Step4SARSAConfig,
+    Step4SmokeResult,
     init_step4_state,
     make_step4_bounder,
     make_step4_optimizer,
@@ -15,6 +25,57 @@ from alberta_framework.steps import (
     run_step4_scan,
     run_step4_smoke,
     step4_update,
+)
+
+_INVALID_STEP4_SCALARS: tuple[tuple[str, Any], ...] = (
+    ("gamma", float("nan")),
+    ("gamma", float("inf")),
+    ("gamma", float("-inf")),
+    ("gamma", True),
+    ("gamma", False),
+    ("gamma", "0.99"),
+    ("gamma", -0.1),
+    ("gamma", 1.1),
+    ("epsilon_start", float("nan")),
+    ("epsilon_start", True),
+    ("epsilon_start", -0.1),
+    ("epsilon_start", 1.1),
+    ("epsilon_end", float("nan")),
+    ("epsilon_end", True),
+    ("epsilon_end", -0.1),
+    ("epsilon_end", 1.1),
+    ("lamda", float("nan")),
+    ("lamda", True),
+    ("lamda", -0.1),
+    ("lamda", 1.1),
+    ("step_size", float("nan")),
+    ("step_size", float("inf")),
+    ("step_size", True),
+    ("step_size", False),
+    ("step_size", -1.0),
+    ("meta_step_size", float("nan")),
+    ("meta_step_size", float("inf")),
+    ("meta_step_size", True),
+    ("meta_step_size", -1.0),
+    ("bounder_kappa", float("nan")),
+    ("bounder_kappa", float("inf")),
+    ("bounder_kappa", True),
+    ("bounder_kappa", 0.0),
+    ("bounder_kappa", -1.0),
+    ("sparsity", float("nan")),
+    ("sparsity", True),
+    ("sparsity", -0.1),
+    ("sparsity", 1.1),
+    ("epsilon_decay_steps", True),
+    ("epsilon_decay_steps", False),
+    ("epsilon_decay_steps", -1),
+    ("epsilon_decay_steps", 1.5),
+    ("epsilon_decay_steps", 2**31),
+    ("n_actions", True),
+    ("n_actions", 2**31),
+    ("hidden_sizes", (0,)),
+    ("hidden_sizes", (True,)),
+    ("hidden_sizes", (2**31,)),
 )
 
 
@@ -131,3 +192,189 @@ def test_step4_smoke_validation() -> None:
         run_step4_smoke(steps=0)
     with pytest.raises(ValueError, match="feature_dim"):
         run_step4_smoke(feature_dim=0)
+
+
+def _config_with(**overrides: Any) -> Step4SARSAConfig:
+    payload: dict[str, Any] = {"n_actions": 2}
+    payload.update(overrides)
+    return Step4SARSAConfig(**payload)
+
+
+@pytest.mark.parametrize(("field", "value"), _INVALID_STEP4_SCALARS)
+def test_step4_sarsa_scalars_reject_invalid_inputs(field: str, value: object) -> None:
+    with pytest.raises(ValueError, match=field):
+        _config_with(**{field: value})
+
+
+class _SpoofedInt:
+    """Mimics ``int`` via ``__class__`` to defeat ``isinstance`` checks."""
+
+    @property
+    def __class__(self) -> type:  # type: ignore[override]
+        return int
+
+    def __int__(self) -> int:
+        return 3
+
+    def __index__(self) -> int:
+        return 3
+
+
+@pytest.mark.parametrize("field", ["n_actions", "epsilon_decay_steps"])
+def test_step4_sarsa_fields_reject_class_spoofed_integers(field: str) -> None:
+    with pytest.raises(ValueError, match=field):
+        _config_with(**{field: _SpoofedInt()})
+
+
+def test_step4_sarsa_hidden_sizes_rejects_class_spoofed_integers() -> None:
+    with pytest.raises(ValueError, match="hidden_sizes"):
+        _config_with(hidden_sizes=(_SpoofedInt(),))
+
+
+@pytest.mark.parametrize("value", [0, 1, "false", None])
+def test_step4_sarsa_config_requires_exact_boolean_layer_norm(value: object) -> None:
+    with pytest.raises(ValueError, match="use_layer_norm must be a boolean"):
+        _config_with(use_layer_norm=value)
+
+
+def test_step4_sarsa_scalars_preserve_legal_boundaries() -> None:
+    config = Step4SARSAConfig(
+        n_actions=1,
+        hidden_sizes=(),
+        gamma=0.0,
+        epsilon_start=0.0,
+        epsilon_end=1.0,
+        epsilon_decay_steps=0,
+        lamda=1.0,
+        step_size=0.0,
+        meta_step_size=0.0,
+        bounder_kappa=0.5,
+        sparsity=1.0,
+        use_layer_norm=False,
+    )
+    agent = make_step4_sarsa_agent(config)
+    payload = config.to_dict()
+    json.dumps(payload, allow_nan=False)
+    restored = Step4SARSAConfig.from_dict(payload)
+    assert restored.gamma == 0.0
+    assert restored.epsilon_start == 0.0
+    assert restored.epsilon_end == 1.0
+    assert restored.lamda == 1.0
+    assert restored.step_size == 0.0
+    assert restored.meta_step_size == 0.0
+    assert restored.bounder_kappa == 0.5
+    assert restored.sparsity == 1.0
+    assert restored.epsilon_decay_steps == 0
+    assert restored.n_actions == 1
+    assert restored.hidden_sizes == ()
+    assert agent.to_config()["type"] == "SARSAAgent"
+
+    upper = Step4SARSAConfig(
+        n_actions=2,
+        gamma=1.0,
+        epsilon_start=1.0,
+        epsilon_end=0.0,
+        lamda=0.0,
+        sparsity=0.0,
+    )
+    make_step4_sarsa_agent(upper)
+    assert upper.gamma == 1.0
+    assert upper.epsilon_start == 1.0
+    assert upper.epsilon_end == 0.0
+    assert upper.lamda == 0.0
+    assert upper.sparsity == 0.0
+
+
+def test_step4_sarsa_scalars_canonicalize_nonbuiltin_reals() -> None:
+    value = np.float64(0.5)
+    config = Step4SARSAConfig(
+        n_actions=np.int64(3),
+        hidden_sizes=(np.int64(8),),
+        gamma=value,
+        epsilon_start=value,
+        epsilon_end=np.float64(0.0),
+        epsilon_decay_steps=np.int64(4),
+        lamda=value,
+        step_size=value,
+        meta_step_size=value,
+        bounder_kappa=np.float64(2.0),
+        sparsity=value,
+    )
+    agent = make_step4_sarsa_agent(config)
+    payload = config.to_dict()
+    json.dumps(payload, allow_nan=False)
+    assert config.gamma == 0.5
+    assert config.epsilon_start == 0.5
+    assert config.epsilon_end == 0.0
+    assert config.lamda == 0.5
+    assert type(payload["gamma"]) is float
+    assert type(payload["epsilon_start"]) is float
+    assert type(payload["epsilon_end"]) is float
+    assert type(payload["lamda"]) is float
+    assert type(payload["step_size"]) is float
+    assert type(payload["meta_step_size"]) is float
+    assert type(payload["bounder_kappa"]) is float
+    assert type(payload["sparsity"]) is float
+    assert type(payload["n_actions"]) is int
+    assert type(payload["epsilon_decay_steps"]) is int
+    assert type(payload["hidden_sizes"][0]) is int
+    assert agent.to_config()["type"] == "SARSAAgent"
+
+
+def test_step4_sarsa_dimensions_preserve_int32_maximum() -> None:
+    config = Step4SARSAConfig(
+        n_actions=np.int64(2**31 - 1),
+        epsilon_decay_steps=np.int64(2**31 - 1),
+        hidden_sizes=(np.int64(2**31 - 1),),
+    )
+
+    assert config.n_actions == 2**31 - 1
+    assert config.epsilon_decay_steps == 2**31 - 1
+    assert config.hidden_sizes == (2**31 - 1,)
+    assert type(config.n_actions) is int
+    assert type(config.epsilon_decay_steps) is int
+    assert type(config.hidden_sizes[0]) is int
+
+
+def _legal_step4_smoke_result(**overrides: object) -> Step4SmokeResult:
+    payload: dict[str, object] = {
+        "config": Step4SARSAConfig(),
+        "steps": 8,
+        "seed": 0,
+        "q_values_shape": (8, 2),
+        "td_errors_shape": (8,),
+        "actions_shape": (8,),
+        "finite": True,
+        "agent_config": {"ok": True},
+    }
+    payload.update(overrides)
+    return Step4SmokeResult(**payload)  # type: ignore[arg-type]
+
+
+def test_step4_smoke_result_rejects_leftover_identities() -> None:
+    """Public Step 4 smoke records must not keep leftover bool/int identities."""
+
+    with pytest.raises(ValueError, match="steps"):
+        _legal_step4_smoke_result(steps=True)
+    with pytest.raises(ValueError, match="steps"):
+        _legal_step4_smoke_result(steps=float("nan"))
+    with pytest.raises(ValueError, match="seed"):
+        _legal_step4_smoke_result(seed=True)
+    with pytest.raises(ValueError, match="finite"):
+        _legal_step4_smoke_result(finite=1)
+
+    legal = _legal_step4_smoke_result()
+    dumped = json.dumps(
+        {
+            "steps": legal.steps,
+            "seed": legal.seed,
+            "finite": legal.finite,
+        },
+        allow_nan=False,
+    )
+    assert '"steps": 8' in dumped
+    assert '"seed": 0' in dumped
+    assert '"finite": true' in dumped
+    assert '"steps": true' not in dumped
+    assert '"seed": true' not in dumped
+    assert '"finite": 1' not in dumped

@@ -9,6 +9,7 @@ import jax.numpy as jnp
 import jax.random as jr
 import numpy as np
 import pytest
+from jax.experimental import checkify
 
 from alberta_framework import (
     FixedBudgetFeatureLearner,
@@ -37,6 +38,7 @@ from alberta_framework.core.interaction_features import (
     load_interaction_feature_checkpoint,
     save_interaction_feature_checkpoint,
 )
+from alberta_framework.core.update_safety import floating_tree_is_finite
 
 
 def test_one_step_output_loss_reduction_is_causal_lms_counterfactual() -> None:
@@ -160,6 +162,126 @@ class TestNonlinearFeatureDiscoveryStream:
 class TestInteractionFeatureDiscoveryStream:
     """Tests for the hidden pair-product Step 2 benchmark stream."""
 
+    def test_init_selects_exact_active_count_when_scores_tie(self, monkeypatch) -> None:
+        stream = InteractionFeatureDiscoveryStream(
+            feature_dim=4, n_tasks=1, n_contexts=1, active_pairs_per_context=2
+        )
+
+        def tied_uniform(key, shape, dtype=jnp.float32, **kwargs):
+            return jnp.zeros(shape, dtype=dtype)
+
+        monkeypatch.setattr(
+            "alberta_framework.streams.feature_discovery.jr.uniform", tied_uniform
+        )
+        state = stream.init(jr.key(0))
+        assert int(jnp.count_nonzero(state.context_weights)) == 2
+
+    @pytest.mark.parametrize("active_count", [0, -1, True, 1.0, np.int64(1)])
+    def test_active_pair_count_requires_positive_builtin_int(
+        self, active_count: object
+    ) -> None:
+        with pytest.raises(ValueError, match="positive built-in integer"):
+            InteractionFeatureDiscoveryStream(
+                feature_dim=4,
+                active_pairs_per_context=active_count,  # type: ignore[arg-type]
+            )
+
+    def test_active_pair_count_caps_at_available_pairs(self) -> None:
+        stream = InteractionFeatureDiscoveryStream(
+            feature_dim=4,
+            n_tasks=2,
+            n_contexts=2,
+            active_pairs_per_context=100,
+        )
+        state = stream.init(jr.key(91))
+
+        assert state.context_weights.shape == (2, 2, 6)
+        assert int(jnp.count_nonzero(state.context_weights)) == state.context_weights.size
+
+    def test_unique_finite_scores_preserve_legacy_context_weights(self) -> None:
+        stream = InteractionFeatureDiscoveryStream(
+            feature_dim=4,
+            n_tasks=2,
+            n_contexts=2,
+            active_pairs_per_context=3,
+        )
+        root_key = jr.key(314)
+        state = stream.init(root_key)
+        _, context_key, mask_key, _ = jr.split(root_key, 4)
+        pair_count = state.pair_left.shape[0]
+        dense_weights = jr.normal(
+            context_key,
+            (2, 2, pair_count),
+            dtype=jnp.float32,
+        )
+        scores = jr.uniform(mask_key, (2, 2, pair_count), dtype=jnp.float32)
+        for row in np.asarray(scores).reshape((-1, pair_count)):
+            assert np.unique(row).size == pair_count
+        threshold = jnp.sort(scores, axis=-1)[..., 2:3]
+        legacy_mask = scores <= threshold
+        expected = dense_weights * legacy_mask.astype(jnp.float32) / jnp.sqrt(
+            jnp.sum(legacy_mask, axis=-1, keepdims=True)
+        )
+
+        np.testing.assert_array_equal(
+            np.asarray(state.context_weights),
+            np.asarray(expected),
+        )
+
+    @pytest.mark.parametrize("compiled", [False, True])
+    @pytest.mark.parametrize(
+        ("scores", "expected_mask"),
+        [
+            ([0.5, 0.5, 0.5, 0.5, 0.5, 0.5], [True, True, False, False, False, False]),
+            ([0.1, 0.5, 0.5, 0.2, 0.9, 0.8], [True, True, False, True, False, False]),
+        ],
+    )
+    def test_init_selects_exact_stable_active_count_under_ties(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        compiled: bool,
+        scores: list[float],
+        expected_mask: list[bool],
+    ) -> None:
+        stream = InteractionFeatureDiscoveryStream(
+            feature_dim=4,
+            n_tasks=2,
+            n_contexts=2,
+            active_pairs_per_context=3 if scores[0] != scores[1] else 2,
+            noise_std=0.0,
+        )
+
+        def fixed_normal(key, shape, dtype=jnp.float32, **kwargs):
+            del key, kwargs
+            return jnp.ones(shape, dtype=dtype)
+
+        def fixed_uniform(key, shape, dtype=jnp.float32, **kwargs):
+            del key, kwargs
+            return jnp.broadcast_to(jnp.asarray(scores, dtype=dtype), shape)
+
+        monkeypatch.setattr(
+            "alberta_framework.streams.feature_discovery.jr.normal", fixed_normal
+        )
+        monkeypatch.setattr(
+            "alberta_framework.streams.feature_discovery.jr.uniform", fixed_uniform
+        )
+        init = jax.jit(stream.init) if compiled else stream.init
+        state = init(jr.key(0))
+
+        actual_mask = state.context_weights != 0.0
+        expected = jnp.broadcast_to(
+            jnp.asarray(expected_mask), state.context_weights.shape
+        )
+        chex.assert_trees_all_equal(actual_mask, expected)
+
+        def body(carry, idx):
+            timestep, next_state = stream.step(carry, idx)
+            return next_state, (timestep.observation, timestep.target)
+
+        final_state, outputs = jax.lax.scan(body, state, jnp.arange(4))
+        assert int(final_state.step_count) == 4
+        chex.assert_tree_all_finite(outputs)
+
     def test_step_shapes(self) -> None:
         stream = InteractionFeatureDiscoveryStream(
             feature_dim=6,
@@ -179,6 +301,83 @@ class TestInteractionFeatureDiscoveryStream:
 
 class TestFixedBudgetFeatureLearner:
     """Tests for explicit feature construction, utility, and replacement."""
+
+    def test_active_topk_excludes_inactive_zero_placeholders(self) -> None:
+        """Mirror of the #275 fix for the interaction learner: inactive heads are not zeros."""
+        learner = FixedBudgetFeatureLearner(
+            n_features=1,
+            n_tasks=4,
+            candidate_count=0,
+            utility_aggregation="topk",
+            utility_top_k=2,
+            utility_task_balancing="active",
+        )
+        active_mask = jnp.asarray((True, False, False, False), dtype=jnp.bool_)
+        activity = jnp.ones((4,), dtype=jnp.float32)
+        signed_signal = jnp.asarray(((-4.0,), (99.0,), (99.0,), (99.0,)), dtype=jnp.float32)
+        utility = learner._aggregate_task_feature_signal(signed_signal, active_mask, activity)
+        np.testing.assert_array_equal(utility, np.asarray((-4.0,), dtype=np.float32))
+
+        output_weights = jnp.asarray(((6.0,), (5.0,), (5.0,), (5.0,)), dtype=jnp.float32)
+        features = jnp.ones((1,), dtype=jnp.float32)
+        for top_k in (1, 2, 4):
+            probe = FixedBudgetFeatureLearner(
+                n_features=1,
+                n_tasks=4,
+                candidate_count=0,
+                utility_aggregation="topk",
+                utility_top_k=top_k,
+                utility_task_balancing="active",
+            )
+            utility = probe._output_utility_signal(output_weights, features, active_mask, activity)
+            np.testing.assert_array_equal(utility, np.asarray((6.0,), dtype=np.float32))
+
+    @pytest.mark.parametrize(
+        "reducer_name", ["_aggregate_task_feature_signal", "_output_utility_signal"]
+    )
+    def test_active_topk_all_inactive_avoids_zero_division(self, reducer_name: str) -> None:
+        learner = FixedBudgetFeatureLearner(
+            n_features=1,
+            n_tasks=4,
+            candidate_count=0,
+            utility_aggregation="topk",
+            utility_top_k=2,
+            utility_task_balancing="active",
+        )
+        active_mask = jnp.zeros((4,), dtype=jnp.bool_)
+        activity = jnp.ones((4,), dtype=jnp.float32)
+        if reducer_name == "_aggregate_task_feature_signal":
+            args: tuple[Any, ...] = (
+                jnp.asarray(((1.0,), (2.0,), (3.0,), (4.0,)), dtype=jnp.float32),
+                active_mask,
+                activity,
+            )
+        else:
+            args = (
+                jnp.ones((4, 1), dtype=jnp.float32),
+                jnp.ones((1,), dtype=jnp.float32),
+                active_mask,
+                activity,
+            )
+        checked = checkify.checkify(getattr(learner, reducer_name), errors=checkify.float_checks)
+        error, utility = checked(*args)
+        error.throw()
+        np.testing.assert_array_equal(utility, np.zeros((1,), dtype=np.float32))
+
+    def test_unbalanced_topk_still_averages_largest_heads(self) -> None:
+        learner = FixedBudgetFeatureLearner(
+            n_features=1,
+            n_tasks=4,
+            candidate_count=0,
+            utility_aggregation="topk",
+            utility_top_k=2,
+            utility_task_balancing="none",
+        )
+        signal = jnp.asarray(((4.0,), (2.0,), (0.5,), (0.0,)), dtype=jnp.float32)
+        utility = learner._aggregate_task_feature_signal(
+            signal, jnp.ones((4,), dtype=jnp.bool_), jnp.ones((4,), dtype=jnp.float32)
+        )
+        np.testing.assert_array_equal(utility, np.asarray((3.0,), dtype=np.float32))
 
     def test_init_shapes(self) -> None:
         learner = FixedBudgetFeatureLearner(
@@ -215,6 +414,142 @@ class TestFixedBudgetFeatureLearner:
         chex.assert_shape(result.metrics, (7,))
         chex.assert_tree_all_finite(result.metrics)
         assert int(result.state.step_count) == 1
+
+    def test_zero_utility_decay_does_not_multiply_inf_utilities(self) -> None:
+        """utility_decay=0 times an infinite tracker is NaN and would freeze."""
+        learner = FixedBudgetFeatureLearner(
+            n_features=4,
+            n_tasks=2,
+            candidate_count=2,
+            replacement_interval=0,
+            utility_decay=0.0,
+        )
+        state = learner.init(feature_dim=3, key=jr.key(4))
+        state = state.replace(
+            utilities=jnp.full_like(state.utilities, jnp.inf),
+            candidate_utilities=jnp.full_like(state.candidate_utilities, jnp.inf),
+        )
+        raw = jnp.asarray(0.0, dtype=jnp.float32) * jnp.asarray(jnp.inf, dtype=jnp.float32)
+        assert not bool(jnp.isfinite(raw))
+
+        result = learner.update(
+            state,
+            jnp.array([0.1, -0.2, 0.3], dtype=jnp.float32),
+            jnp.array([1.0, -1.0], dtype=jnp.float32),
+        )
+        assert bool(result.update_applied)
+        assert bool(jnp.all(jnp.isfinite(result.state.utilities)))
+        assert bool(jnp.all(jnp.isfinite(result.state.candidate_utilities)))
+
+    def test_zero_decays_recover_poisoned_forgotten_trackers(self) -> None:
+        learner = FixedBudgetFeatureLearner(
+            n_features=3,
+            n_tasks=2,
+            candidate_count=2,
+            replacement_interval=0,
+            utility_decay=0.0,
+            task_activity_decay=0.0,
+            learn_feature_resources=True,
+            resource_discount=0.0,
+        )
+        state = learner.init(feature_dim=3, key=jr.key(40)).replace(
+            utilities=jnp.full((3,), jnp.inf, dtype=jnp.float32),
+            candidate_utilities=jnp.full((2,), -jnp.inf, dtype=jnp.float32),
+            task_activity_ema=jnp.array([jnp.inf, jnp.nan], dtype=jnp.float32),
+            generator_log_weights=jnp.array(
+                [jnp.inf, jnp.nan, -jnp.inf], dtype=jnp.float32
+            ),
+            generator_utility_ema=jnp.array(
+                [jnp.inf, jnp.nan, -jnp.inf], dtype=jnp.float32
+            ),
+            plasticity_log_weights=jnp.array(
+                [jnp.nan, jnp.inf, -jnp.inf], dtype=jnp.float32
+            ),
+            plasticity_signal_ema=jnp.array(
+                [jnp.nan, jnp.inf, -jnp.inf], dtype=jnp.float32
+            ),
+            birth_timestamp=0.0,
+        )
+        recovered_weights = learner._resource_weights(state.generator_log_weights)
+
+        chex.assert_tree_all_finite(recovered_weights)
+        assert float(jnp.sum(recovered_weights)) == pytest.approx(1.0)
+
+        result = jax.jit(learner.update)(
+            state,
+            jnp.array([0.1, -0.2, 0.3], dtype=jnp.float32),
+            jnp.array([1.0, -1.0], dtype=jnp.float32),
+        )
+
+        assert bool(result.update_applied)
+        assert bool(floating_tree_is_finite(result.state))
+        chex.assert_tree_all_finite(result.metrics)
+        chex.assert_trees_all_equal(
+            result.state.generator_utility_ema[1:],
+            jnp.zeros((2,), dtype=jnp.float32),
+        )
+
+    def test_zero_utility_decay_rejects_poison_consumed_by_retention(self) -> None:
+        learner = FixedBudgetFeatureLearner(
+            n_features=1,
+            n_tasks=1,
+            replacement_interval=1,
+            min_feature_age=0,
+            utility_decay=0.0,
+            utility_retention_decay=0.9,
+        )
+        state = learner.init(feature_dim=2, key=jr.key(41)).replace(
+            utilities=jnp.array([jnp.inf], dtype=jnp.float32),
+            birth_timestamp=0.0,
+        )
+
+        result = jax.jit(learner.update)(
+            state,
+            jnp.ones((2,), dtype=jnp.float32),
+            jnp.ones((1,), dtype=jnp.float32),
+        )
+
+        assert not bool(result.update_applied)
+        chex.assert_trees_all_equal(result.state, state)
+        chex.assert_trees_all_equal(result.predictions, jnp.zeros((1,), jnp.float32))
+        chex.assert_trees_all_equal(result.errors, jnp.zeros((1,), jnp.float32))
+        chex.assert_trees_all_equal(result.metrics, jnp.zeros((7,), jnp.float32))
+        assert int(result.replaced_slot) == -1
+
+    def test_zero_resource_discount_preserves_finite_resource_state_semantics(
+        self,
+    ) -> None:
+        learner = FixedBudgetFeatureLearner(
+            n_features=2,
+            n_tasks=1,
+            replacement_interval=0,
+            learn_feature_resources=True,
+            resource_discount=0.0,
+            resource_exploration=0.0,
+        )
+        logits = jnp.array([2.0, -1.0, 0.5], dtype=jnp.float32)
+        state = learner.init(feature_dim=2, key=jr.key(42)).replace(
+            generator_log_weights=logits,
+            generator_utility_ema=jnp.array([1.0, 2.0, 3.0], dtype=jnp.float32),
+        )
+
+        chex.assert_trees_all_equal(
+            learner._resource_weights(logits),
+            jax.nn.softmax(logits),
+        )
+        result = learner.update(
+            state,
+            jnp.ones((2,), dtype=jnp.float32),
+            jnp.ones((1,), dtype=jnp.float32),
+        )
+
+        assert bool(result.update_applied)
+        # Only generator zero has members; unavailable finite EMA slots retain
+        # their previous values even though the configured discount is zero.
+        chex.assert_trees_all_equal(
+            result.state.generator_utility_ema[1:],
+            state.generator_utility_ema[1:],
+        )
 
     def test_constructed_and_augmented_feature_shapes(self) -> None:
         learner = FixedBudgetFeatureLearner(n_features=6, n_tasks=2)
@@ -253,6 +588,42 @@ class TestFixedBudgetFeatureLearner:
             GENERATOR_MUTATE_PARENT,
             GENERATOR_IMPRINT,
         }
+
+    def test_age_corrected_promotion_restarts_raw_utility_ema(self) -> None:
+        learner = FixedBudgetFeatureLearner(
+            n_features=1,
+            n_tasks=1,
+            step_size_output=0.0,
+            step_size_feature=0.0,
+            utility_decay=0.5,
+            replacement_interval=1,
+            min_feature_age=0,
+            candidate_count=1,
+            candidate_min_age=0,
+            promotion_margin=1.0,
+            future_utility_mix=1.0,
+            future_utility_normalization="age",
+            use_obgd=False,
+        )
+        state = learner.init(feature_dim=2, key=jr.key(431)).replace(
+            utilities=jnp.array([0.1], dtype=jnp.float32),
+            ages=jnp.array([5], dtype=jnp.int32),
+            candidate_utilities=jnp.array([1.0], dtype=jnp.float32),
+            candidate_ages=jnp.array([5], dtype=jnp.int32),
+        )
+
+        promoted = jax.jit(learner.update)(
+            state,
+            jnp.ones((2,), dtype=jnp.float32),
+            jnp.zeros((1,), dtype=jnp.float32),
+        )
+
+        assert bool(promoted.update_applied)
+        assert int(promoted.promoted_candidate) == 0
+        assert int(promoted.state.ages[0]) == 0
+        assert float(promoted.state.utilities[0]) == 0.0
+        assert float(promoted.state.candidate_utilities[0]) == 0.0
+        chex.assert_tree_all_finite(promoted.metrics)
 
     def test_scan_loop_shapes(self) -> None:
         stream = NonlinearFeatureDiscoveryStream(
@@ -2713,3 +3084,334 @@ class TestReplaceFractionRemoval:
         restored = FixedBudgetFeatureLearner.from_config(legacy)
 
         assert restored.to_config() == learner.to_config()
+
+
+class TestFeatureDiscoveryStreamsValidation:
+    """Comprehensive validation tests for Step 2 feature-discovery streams."""
+
+    def test_nonlinear_properties_and_boundaries(self) -> None:
+        stream = NonlinearFeatureDiscoveryStream(
+            feature_dim=16,
+            n_tasks=3,
+            n_latents=64,
+            n_contexts=4,
+            context_length=200,
+            active_latents_per_context=8,
+            feature_std=1.5,
+            latent_scale=0.8,
+            linear_scale=0.02,
+            noise_std=0.05,
+        )
+        assert stream.feature_dim == 16
+        assert stream.target_dim == 3
+        assert stream.n_tasks == 3
+        assert stream.n_latents == 64
+        assert stream.n_contexts == 4
+        assert stream.context_length == 200
+        assert stream.active_latents_per_context == 8
+        assert stream.feature_std == 1.5
+        assert stream.latent_scale == 0.8
+        assert stream.linear_scale == 0.02
+        assert stream.noise_std == 0.05
+
+    @pytest.mark.parametrize(
+        ("kwargs", "match"),
+        [
+            ({"feature_dim": 0}, "feature_dim"),
+            ({"feature_dim": -1}, "feature_dim"),
+            ({"feature_dim": 2**31}, "feature_dim"),
+            ({"feature_dim": True}, "feature_dim"),
+            ({"n_tasks": 0}, "n_tasks"),
+            ({"n_latents": 0}, "n_latents"),
+            ({"n_contexts": 0}, "n_contexts"),
+            ({"context_length": 0}, "context_length"),
+            ({"active_latents_per_context": 0}, "active_latents_per_context"),
+            ({"feature_std": 0.0}, "feature_std"),
+            ({"feature_std": -1.0}, "feature_std"),
+            ({"latent_scale": 0.0}, "latent_scale"),
+            ({"latent_scale": -1.0}, "latent_scale"),
+            ({"linear_scale": -0.01}, "linear_scale"),
+            ({"noise_std": -0.01}, "noise_std"),
+        ],
+    )
+    def test_nonlinear_rejects_malformed_inputs(
+        self, kwargs: dict[str, Any], match: str
+    ) -> None:
+        base: dict[str, Any] = {"feature_dim": 8}
+        base.update(kwargs)
+        with pytest.raises(ValueError, match=match):
+            NonlinearFeatureDiscoveryStream(**base)
+
+    def test_nonlinear_rejects_adversarial_ratio(self) -> None:
+        class HiddenBoundaryFloat(float):
+            def as_integer_ratio(self) -> tuple[int, int]:
+                return (-1, 2**200)
+
+        with pytest.raises(ValueError, match="linear_scale must be non-negative"):
+            NonlinearFeatureDiscoveryStream(feature_dim=8, linear_scale=HiddenBoundaryFloat(0.5))
+
+    def test_nonlinear_rejects_spoofed_int_class(self) -> None:
+        class SpoofedIntFloat(float):
+            @property
+            def __class__(self) -> type[int]:
+                return int
+
+            def as_integer_ratio(self) -> tuple[int, int]:
+                return (-1, 2**200)
+
+        with pytest.raises(ValueError, match="noise_std must be non-negative"):
+            NonlinearFeatureDiscoveryStream(feature_dim=8, noise_std=SpoofedIntFloat(0.5))
+
+    def test_nonlinear_rejects_spoofed_ratio_components(self) -> None:
+        class SpoofedComponent:
+            @property
+            def __class__(self) -> type[int]:
+                return int
+
+            def __int__(self) -> int:
+                return 1
+
+        class BadRatioFloat(float):
+            def as_integer_ratio(self) -> tuple[Any, Any]:
+                return (SpoofedComponent(), 2)
+
+        with pytest.raises(ValueError, match="must narrow to a finite float32"):
+            NonlinearFeatureDiscoveryStream(feature_dim=8, noise_std=BadRatioFloat(0.5))
+
+    def test_interaction_properties_and_boundaries(self) -> None:
+        stream = InteractionFeatureDiscoveryStream(
+            feature_dim=12,
+            n_tasks=5,
+            n_contexts=6,
+            context_length=300,
+            active_pairs_per_context=10,
+            feature_std=1.2,
+            linear_scale=0.03,
+            noise_std=0.04,
+            include_squares=True,
+        )
+        assert stream.feature_dim == 12
+        assert stream.target_dim == 5
+        assert stream.n_tasks == 5
+        assert stream.n_contexts == 6
+        assert stream.context_length == 300
+        assert stream.active_pairs_per_context == 10
+        assert stream.feature_std == 1.2
+        assert stream.linear_scale == 0.03
+        assert stream.noise_std == 0.04
+        assert stream.include_squares
+
+    @pytest.mark.parametrize(
+        ("kwargs", "match"),
+        [
+            ({"feature_dim": 1}, "feature_dim"),
+            ({"feature_dim": 0}, "feature_dim"),
+            ({"feature_dim": 2**31}, "feature_dim"),
+            ({"n_tasks": 0}, "n_tasks"),
+            ({"n_contexts": 0}, "n_contexts"),
+            ({"context_length": 0}, "context_length"),
+            ({"active_pairs_per_context": 0}, "active_pairs_per_context"),
+            ({"feature_std": 0.0}, "feature_std"),
+            ({"linear_scale": -0.01}, "linear_scale"),
+            ({"noise_std": -0.01}, "noise_std"),
+        ],
+    )
+    def test_interaction_rejects_malformed_inputs(
+        self, kwargs: dict[str, Any], match: str
+    ) -> None:
+        base: dict[str, Any] = {"feature_dim": 6}
+        base.update(kwargs)
+        with pytest.raises(ValueError, match=match):
+            InteractionFeatureDiscoveryStream(**base)
+
+    def test_interaction_rejects_non_bool_include_squares(self) -> None:
+        with pytest.raises(TypeError, match="include_squares must be a boolean"):
+            InteractionFeatureDiscoveryStream(feature_dim=6, include_squares=1)  # type: ignore[arg-type]
+
+    def test_interaction_rejects_spoofed_bool_include_squares(self) -> None:
+        class SpoofedBool:
+            @property
+            def __class__(self) -> type[bool]:
+                return bool
+
+            def __bool__(self) -> bool:
+                return True
+
+        with pytest.raises(TypeError, match="include_squares must be a boolean"):
+            InteractionFeatureDiscoveryStream(
+                feature_dim=6,
+                include_squares=SpoofedBool(),  # type: ignore[arg-type]
+            )
+
+    def test_interaction_accepts_numpy_bool_include_squares(self) -> None:
+        stream = InteractionFeatureDiscoveryStream(
+            feature_dim=6,
+            include_squares=np.True_,  # type: ignore[arg-type]
+        )
+        assert stream.include_squares is True
+
+    def test_interaction_rejects_adversarial_ratio(self) -> None:
+        class HiddenBoundaryFloat(float):
+            def as_integer_ratio(self) -> tuple[int, int]:
+                return (-1, 2**200)
+
+        with pytest.raises(ValueError, match="linear_scale must be non-negative"):
+            InteractionFeatureDiscoveryStream(feature_dim=6, linear_scale=HiddenBoundaryFloat(0.5))
+
+    def test_collect_feature_discovery_stream_validation(self) -> None:
+        stream = NonlinearFeatureDiscoveryStream(feature_dim=4)
+        key = jr.key(0)
+        with pytest.raises(ValueError, match="num_steps"):
+            collect_feature_discovery_stream(stream, 0, key)
+        with pytest.raises(ValueError, match="num_steps"):
+            collect_feature_discovery_stream(stream, -1, key)
+        with pytest.raises(TypeError, match="init"):
+            collect_feature_discovery_stream(object(), 10, key)
+
+
+_NUMPY_INTEGER_TYPES = (
+    np.int8,
+    np.int16,
+    np.int32,
+    np.int64,
+    np.longlong,
+    np.uint8,
+    np.uint16,
+    np.uint32,
+    np.uint64,
+    np.ulonglong,
+)
+
+
+@pytest.mark.parametrize("integer_type", _NUMPY_INTEGER_TYPES)
+def test_fixed_budget_integer_fields_accept_and_canonicalize_numpy(
+    integer_type: type[np.integer[Any]],
+) -> None:
+    learner = FixedBudgetFeatureLearner(
+        n_features=integer_type(4),
+        n_tasks=integer_type(2),
+        candidate_count=integer_type(1),
+        replacement_interval=integer_type(2),
+        min_feature_age=integer_type(1),
+        candidate_min_age=integer_type(1),
+        utility_top_k=integer_type(1),
+    )
+    config = learner.to_config()
+    for name in (
+        "n_features",
+        "n_tasks",
+        "candidate_count",
+        "replacement_interval",
+        "min_feature_age",
+        "candidate_min_age",
+        "utility_top_k",
+    ):
+        assert type(config[name]) is int
+
+
+def test_fixed_budget_integer_validation_does_not_run_hostile_hooks() -> None:
+    calls: list[str] = []
+
+    class HostileInt(int):
+        def __index__(self) -> int:
+            calls.append("index")
+            return 4
+
+        def __repr__(self) -> str:
+            calls.append("repr")
+            raise AssertionError("repr executed")
+
+    with pytest.raises(ValueError, match="n_features must be an integer"):
+        FixedBudgetFeatureLearner(n_features=HostileInt(4), n_tasks=1)
+    assert calls == []
+
+
+def test_fixed_budget_float32_sink_rejects_exact_nonzero_underflow() -> None:
+    tiny = np.nextafter(np.longdouble(0), np.longdouble(1))
+    with pytest.raises(ValueError, match="step_size_output must remain nonzero"):
+        FixedBudgetFeatureLearner(n_features=2, n_tasks=1, step_size_output=tiny)
+    with pytest.raises(ValueError, match="step_size_output must remain nonzero"):
+        FixedBudgetFeatureLearner(n_features=2, n_tasks=1, step_size_output=1.0e-50)
+    learner = FixedBudgetFeatureLearner(n_features=2, n_tasks=1, step_size_output=-0.0)
+    assert learner.to_config()["step_size_output"] == 0.0
+
+
+def test_fixed_budget_from_config_preserves_historical_forms_and_round_trip() -> None:
+    learner = FixedBudgetFeatureLearner(n_features=np.int64(3), n_tasks=np.uint32(2))
+    restored = FixedBudgetFeatureLearner.from_config(learner.to_config())
+    assert restored.to_config() == learner.to_config()
+    malformed = learner.to_config()
+    malformed["generator_mix"] = tuple(malformed["generator_mix"])
+    malformed["n_features"] = np.int64(3)
+    compatible = FixedBudgetFeatureLearner.from_config(malformed)
+    assert compatible.n_features == 3
+
+    wrong_marker = learner.to_config()
+    wrong_marker["type"] = "AnotherLearner"
+    with pytest.raises(ValueError, match="type is unsupported"):
+        FixedBudgetFeatureLearner.from_config(wrong_marker)
+
+
+def test_fixed_budget_to_config_canonicalizes_numpy_decay_scalars() -> None:
+    learner = FixedBudgetFeatureLearner(
+        n_features=2,
+        n_tasks=1,
+        utility_decay=np.float64(0.9),
+        utility_retention_decay=np.float64(0.95),
+    )
+
+    assert type(learner.to_config()["utility_decay"]) is float
+    assert type(learner.to_config()["utility_retention_decay"]) is float
+
+
+def test_fixed_budget_init_preflights_aggregate_allocation(monkeypatch: pytest.MonkeyPatch) -> None:
+    learner = FixedBudgetFeatureLearner(n_features=1, n_tasks=1)
+    last_legal_feature_dim = 67_108_834
+    assert learner._configured_state_nbytes(last_legal_feature_dim) == 256 * 1024 * 1024
+    with pytest.raises(ValueError, match="state requires"):
+        learner._configured_state_nbytes(last_legal_feature_dim + 1)
+    split_called = False
+
+    def forbidden_split(*args: object, **kwargs: object) -> None:
+        nonlocal split_called
+        split_called = True
+        raise AssertionError("allocation path reached")
+
+    monkeypatch.setattr("alberta_framework.core.feature_discovery.jr.split", forbidden_split)
+    with pytest.raises(ValueError, match="state requires"):
+        learner.init(100_000_000, jr.key(0))
+    assert not split_called
+
+
+def test_fixed_budget_outer_jit_shapes_and_saturating_counters() -> None:
+    learner = FixedBudgetFeatureLearner(
+        n_features=2,
+        n_tasks=1,
+        candidate_count=1,
+        replacement_interval=0,
+    )
+    state = learner.init(3, jr.key(0)).replace(  # type: ignore[attr-defined]
+        ages=jnp.full((2,), 2**31 - 1, dtype=jnp.int32),
+        candidate_ages=jnp.full((1,), 2**31 - 1, dtype=jnp.int32),
+        step_count=jnp.asarray(2**31 - 1, dtype=jnp.int32),
+    )
+    step = jax.jit(lambda s, x, y: learner.update(s, x, y))
+    result = step(
+        state,
+        jnp.ones((3,), dtype=jnp.float32),
+        jnp.ones((1,), dtype=jnp.float32),
+    )
+    assert int(result.state.step_count) == 2**31 - 1
+    assert np.all(np.asarray(result.state.ages) == 2**31 - 1)
+    with pytest.raises(ValueError, match="observation must have shape"):
+        step(
+            state,
+            jnp.ones((1, 3), dtype=jnp.float32),
+            jnp.ones((1,), dtype=jnp.float32),
+        )
+    with pytest.raises(ValueError, match="targets must have shape"):
+        step(
+            state,
+            jnp.ones((3,), dtype=jnp.float32),
+            jnp.ones((1, 1), dtype=jnp.float32),
+        )

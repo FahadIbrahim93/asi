@@ -33,6 +33,10 @@ deltas are scaled by a clipped target/behavior probability ratio.  Planning
 output is discarded until the world model has absorbed
 ``planning_warmup_steps`` real transitions.
 
+The facade rejects illegal planning dimensions and scientific scalars
+before constructing the Step 6/8 components. Accepted numbers are
+canonicalized to builtin ints and floats; legal endpoints stay valid.
+
 References:
     Sutton (1990). "Integrated Architectures for Learning, Planning, and
         Reacting Based on Approximating Dynamic Programming."  (Dyna)
@@ -44,6 +48,7 @@ References:
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+from numbers import Integral
 from typing import Any, Literal, cast
 
 import chex
@@ -52,6 +57,7 @@ import jax.numpy as jnp
 import jax.random as jr
 from jax import Array
 
+from alberta_framework._seed_validation import require_jax_seed
 from alberta_framework.core.average_reward import (
     DifferentialSARSAAgent,
     DifferentialSARSAState,
@@ -62,6 +68,11 @@ from alberta_framework.core.world_model import (
     WorldModelState,
     WorldModelUpdateResult,
 )
+from alberta_framework.steps._float32_validation import (
+    canonical_float32_storage,
+    finite_real_and_float32,
+)
+from alberta_framework.steps._smoke_record_validation import require_step_shape
 from alberta_framework.steps.step6 import (
     Step6DifferentialSARSAConfig,
     make_step6_differential_sarsa_agent,
@@ -104,41 +115,21 @@ class Step7DynaConfig:
     planning_utility_step_size: float = 0.2
 
     def __post_init__(self) -> None:
-        """Validate planning hyperparameters and component compatibility."""
-        if self.planning_steps < 0:
-            raise ValueError("planning_steps must be non-negative")
-        if self.planning_rollout_depth < 1:
-            raise ValueError("planning_rollout_depth must be positive")
-        if self.planning_warmup_steps < 0:
-            raise ValueError("planning_warmup_steps must be non-negative")
-        if self.planning_memory_size < 1:
-            raise ValueError("planning_memory_size must be positive")
-        if self.planning_importance_ratio_clip <= 0.0:
-            raise ValueError("planning_importance_ratio_clip must be positive")
-        if self.planning_priority_propagation < 0.0:
-            raise ValueError("planning_priority_propagation must be non-negative")
-        if not 0.0 <= self.planning_utility_step_size <= 1.0:
-            raise ValueError("planning_utility_step_size must be in [0, 1]")
-        if self.planning_strategy not in (
-            "random",
-            "reward",
-            "surprise",
-            "predecessor",
-            "prioritized",
-            "learned",
-        ):
-            raise ValueError(
-                "planning_strategy must be random, reward, surprise, predecessor, "
-                "prioritized, or learned"
-            )
-        if self.world_model.n_actions != self.control.n_actions:
-            raise ValueError("world_model.n_actions must equal control.n_actions")
+        """Reject illegal planning dimensions and scalars, then canonicalize."""
+        _validate_planning_config(self)
 
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-serializable representation."""
         payload = asdict(self)
         payload["control"] = self.control.to_dict()
         payload["world_model"] = self.world_model.to_dict()
+        payload["planning_steps"] = int(self.planning_steps)
+        payload["planning_rollout_depth"] = int(self.planning_rollout_depth)
+        payload["planning_warmup_steps"] = int(self.planning_warmup_steps)
+        payload["planning_memory_size"] = int(self.planning_memory_size)
+        payload["planning_importance_ratio_clip"] = float(self.planning_importance_ratio_clip)
+        payload["planning_priority_propagation"] = float(self.planning_priority_propagation)
+        payload["planning_utility_step_size"] = float(self.planning_utility_step_size)
         return payload
 
     @classmethod
@@ -152,6 +143,143 @@ class Step7DynaConfig:
             cast(dict[str, object], data["world_model"])
         )
         return cls(**cast(Any, data))
+
+
+_INT32_MAX = 2**31 - 1
+
+
+def _require_nonnegative_real(name: str, value: object) -> float:
+    real, numerator, _, narrowed = finite_real_and_float32(name, value)
+    if real < 0.0 or numerator < 0 or narrowed < 0.0:
+        raise ValueError(f"{name} must be non-negative, got {value!r}")
+    return canonical_float32_storage(real, narrowed)
+
+
+def _require_positive_real(name: str, value: object) -> float:
+    real, numerator, _, narrowed = finite_real_and_float32(name, value)
+    if real <= 0.0 or numerator <= 0 or narrowed <= 0.0:
+        raise ValueError(f"{name} must be positive, got {value!r}")
+    return canonical_float32_storage(real, narrowed)
+
+
+def _require_unit_interval(name: str, value: object) -> float:
+    real, numerator, denominator, narrowed = finite_real_and_float32(name, value)
+    if (
+        real < 0.0
+        or not real <= 1.0
+        or numerator < 0
+        or numerator > denominator
+        or narrowed < 0.0
+        or not narrowed <= 1.0
+    ):
+        raise ValueError(f"{name} must be in [0, 1], got {value!r}")
+    return canonical_float32_storage(real, narrowed)
+
+
+def _require_int(
+    name: str,
+    value: object,
+    *,
+    minimum: int | None = None,
+    maximum: int | None = None,
+) -> int:
+    actual_type = type(value)
+    if issubclass(actual_type, bool) or not issubclass(actual_type, Integral):
+        raise ValueError(f"{name} must be an integer, got {value!r}")
+    number = int(cast(Integral, value))
+    if minimum is not None and number < minimum:
+        if minimum == 1:
+            raise ValueError(f"{name} must be positive, got {value!r}")
+        if minimum == 0:
+            raise ValueError(f"{name} must be non-negative, got {value!r}")
+        raise ValueError(f"{name} must be >= {minimum}, got {value!r}")
+    if maximum is not None and number > maximum:
+        raise ValueError(f"{name} must be at most int32 max, got {value!r}")
+    return number
+
+
+def _require_bool(name: str, value: object) -> bool:
+    if type(value) is not bool:
+        raise ValueError(f"{name} must be a boolean, got {value!r}")
+    return value
+
+
+def _validate_planning_config(config: Step7DynaConfig) -> None:
+    planning_steps = _require_int(
+        "planning_steps",
+        config.planning_steps,
+        minimum=0,
+        maximum=_INT32_MAX,
+    )
+    planning_rollout_depth = _require_int(
+        "planning_rollout_depth",
+        config.planning_rollout_depth,
+        minimum=1,
+        maximum=_INT32_MAX,
+    )
+    planning_warmup_steps = _require_int(
+        "planning_warmup_steps",
+        config.planning_warmup_steps,
+        minimum=0,
+        maximum=_INT32_MAX,
+    )
+    planning_memory_size = _require_int(
+        "planning_memory_size",
+        config.planning_memory_size,
+        minimum=1,
+        # ``memory_count + 1`` is computed in int32 before saturation.
+        maximum=_INT32_MAX - 1,
+    )
+    importance_clip = _require_positive_real(
+        "planning_importance_ratio_clip",
+        config.planning_importance_ratio_clip,
+    )
+    propagation = _require_nonnegative_real(
+        "planning_priority_propagation",
+        config.planning_priority_propagation,
+    )
+    utility_step = _require_unit_interval(
+        "planning_utility_step_size",
+        config.planning_utility_step_size,
+    )
+    if type(config.planning_apply_importance_correction) is not bool:
+        raise ValueError(
+            f"planning_apply_importance_correction must be a bool, got "
+            f"{config.planning_apply_importance_correction!r}"
+        )
+    strategy = config.planning_strategy
+    if type(strategy) is not str:
+        raise ValueError(
+            f"planning_strategy must be an actual string, got {strategy!r}"
+        )
+    if strategy not in (
+        "random",
+        "reward",
+        "surprise",
+        "predecessor",
+        "prioritized",
+        "learned",
+    ):
+        raise ValueError(
+            "planning_strategy must be random, reward, surprise, predecessor, "
+            "prioritized, or learned"
+        )
+    canonical_strategy = str(strategy)
+    if config.world_model.n_actions != config.control.n_actions:
+        raise ValueError("world_model.n_actions must equal control.n_actions")
+    object.__setattr__(config, "planning_steps", planning_steps)
+    object.__setattr__(config, "planning_rollout_depth", planning_rollout_depth)
+    object.__setattr__(config, "planning_warmup_steps", planning_warmup_steps)
+    object.__setattr__(config, "planning_memory_size", planning_memory_size)
+    object.__setattr__(config, "planning_importance_ratio_clip", importance_clip)
+    object.__setattr__(config, "planning_priority_propagation", propagation)
+    object.__setattr__(config, "planning_utility_step_size", utility_step)
+    object.__setattr__(
+        config,
+        "planning_apply_importance_correction",
+        bool(config.planning_apply_importance_correction),
+    )
+    object.__setattr__(config, "planning_strategy", canonical_strategy)
 
 
 @chex.dataclass(frozen=True)
@@ -199,6 +327,7 @@ class Step7DynaArrayResult:
     actions: Array
     model_reward_errors: Array
     model_next_observation_errors: Array
+    model_updates_applied: Array
     planning_td_errors: Array
     planning_priorities: Array
     planning_anchor_indices: Array
@@ -225,6 +354,36 @@ class Step7SmokeResult:
     planning_acceptance_count: int
     control_config: dict[str, Any]
     world_model_config: dict[str, Any]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "steps", _require_int("steps", self.steps, minimum=1, maximum=_INT32_MAX)
+        )
+        object.__setattr__(self, "seed", require_jax_seed(self.seed, name="seed"))
+        for name in (
+            "real_td_errors_shape",
+            "planning_td_errors_shape",
+            "planning_priorities_shape",
+            "planning_anchor_indices_shape",
+            "planning_importance_ratios_shape",
+            "actions_shape",
+        ):
+            object.__setattr__(
+                self,
+                name,
+                require_step_shape(name, getattr(self, name), steps=self.steps),
+            )
+        object.__setattr__(self, "finite", _require_bool("finite", self.finite))
+        object.__setattr__(
+            self,
+            "planning_acceptance_count",
+            _require_int(
+                "planning_acceptance_count",
+                self.planning_acceptance_count,
+                minimum=0,
+                maximum=_INT32_MAX,
+            ),
+        )
 
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-serializable representation."""
@@ -297,6 +456,32 @@ def _select_planning_action(
     key, action_key = jr.split(state.rng_key)
     action = jr.randint(action_key, (), 0, n_actions).astype(jnp.int32)
     return action, key
+
+
+def _update_control_with_linear_rng(
+    agent: DifferentialSARSAAgent,
+    state: DifferentialSARSAState,
+    reward: Array,
+    next_observation: Array,
+    *,
+    discount: Array | float = 1.0,
+) -> DifferentialSARSAUpdateResult:
+    """Apply a control backup while advancing its RNG on rejection."""
+    next_action, next_key = agent.select_action(state, next_observation)
+    advanced_state = cast(
+        DifferentialSARSAState,
+        state.replace(rng_key=next_key),  # type: ignore[attr-defined]
+    )
+    return cast(
+        DifferentialSARSAUpdateResult,
+        agent.update(
+            advanced_state,
+            reward,
+            next_observation,
+            next_action=next_action,
+            discount=discount,
+        ),
+    )
 
 
 def _score_planning_actions(
@@ -562,7 +747,23 @@ def step7_update(
         reward,
         next_observation,
     )
-    real_control_result = agent.update(state.control_state, reward, next_observation)
+    if config.planning_steps == 0:
+        # Preserve the exact real-only path, including transactional RNG
+        # rollback, when no planning work is requested.
+        real_control_result = agent.update(
+            state.control_state,
+            reward,
+            next_observation,
+        )
+    else:
+        # The planner must start below the real action selection's reserved
+        # child even when the real numerical update rolls back.
+        real_control_result = _update_control_with_linear_rng(
+            agent,
+            state.control_state,
+            reward,
+            next_observation,
+        )
     control_after_real = real_control_result.state
     model_state = cast(WorldModelState, real_model_result.state)
     planning_ready = model_state.step_count >= config.planning_warmup_steps
@@ -684,7 +885,8 @@ def step7_update(
                 last_action=rollout_action,
                 rng_key=rollout_key,
             )
-            planned = agent.update(
+            planned = _update_control_with_linear_rng(
+                agent,
                 temp_state,
                 prediction.reward,
                 prediction.next_observation,
@@ -845,6 +1047,7 @@ def run_step7_scan(
             result.real_control_result.action,
             result.real_model_result.reward_error,
             result.real_model_result.next_observation_errors,
+            result.real_model_result.update_applied,
             result.planning_td_errors,
             result.planning_priorities,
             result.planning_anchor_indices,
@@ -860,6 +1063,7 @@ def run_step7_scan(
         actions,
         model_reward_errors,
         model_next_observation_errors,
+        model_updates_applied,
         planning_td_errors,
         planning_priorities,
         planning_anchor_indices,
@@ -875,6 +1079,7 @@ def run_step7_scan(
         actions=actions,
         model_reward_errors=model_reward_errors,
         model_next_observation_errors=model_next_observation_errors,
+        model_updates_applied=model_updates_applied,
         planning_td_errors=planning_td_errors,
         planning_priorities=planning_priorities,
         planning_anchor_indices=planning_anchor_indices,

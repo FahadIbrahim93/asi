@@ -1,7 +1,7 @@
 """Gymnasium environment wrappers as experience streams.
 
 This module wraps Gymnasium environments to provide temporally-uniform experience
-streams compatible with ASI's ``alberta_framework`` learners.
+streams compatible with the Alberta Framework's learners.
 
 Gymnasium environments cannot be JIT-compiled, so this module provides:
 1. Trajectory collection: Collect data using Python loop, then learn with scan
@@ -21,22 +21,74 @@ Supports multiple prediction modes:
 
 from __future__ import annotations
 
+import math
+import operator
 import time
 from collections.abc import Callable, Iterator
 from enum import Enum
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, SupportsIndex, cast
 
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 from jax import Array
 
+from alberta_framework._seed_validation import JAX_KEY_SEED_MAX, require_jax_seed
+from alberta_framework.core._float32_scalars import validated_float32_scalar
+from alberta_framework.core.learners import LinearLearner
 from alberta_framework.core.types import LearnerState, TimeStep
 
 if TYPE_CHECKING:
     import gymnasium
 
-    from alberta_framework.core.learners import LinearLearner
+_INT32_MAX = 2**31 - 1
+_INT32_MIN = -(2**31)
+_ACTUAL_INT_TYPES = frozenset(
+    {
+        int,
+        np.int8,
+        np.int16,
+        np.int32,
+        np.int64,
+        np.uint8,
+        np.uint16,
+        np.uint32,
+        np.uint64,
+        np.longlong,
+        np.ulonglong,
+    }
+)
+
+
+def _require_positive_int32(name: str, value: object) -> int:
+    if type(value) not in _ACTUAL_INT_TYPES:
+        raise ValueError(f"{name} must be an integer in [1, {_INT32_MAX}]")
+    canonical = operator.index(cast(SupportsIndex, value))
+    if not 1 <= canonical <= _INT32_MAX:
+        raise ValueError(f"{name} must be an integer in [1, {_INT32_MAX}]")
+    return canonical
+
+
+def _require_allocation(name: str, scalars: int, *, itemsize: int) -> None:
+    if scalars > _INT32_MAX or itemsize * scalars > _INT32_MAX:
+        raise ValueError(f"derived {name} scalar and byte counts must fit signed int32")
+
+
+def _require_float32_allocation(name: str, scalars: int) -> None:
+    _require_allocation(name, scalars, itemsize=4)
+
+
+def _require_exact_bool(name: str, value: object) -> bool:
+    if type(value) is not bool:
+        raise ValueError(f"{name} must be an exact bool")
+    return value
+
+
+def _require_mode(mode: object) -> PredictionMode:
+    if type(mode) is not PredictionMode:
+        raise ValueError("mode must be an exact PredictionMode")
+    return mode
 
 
 class PredictionMode(Enum):
@@ -54,6 +106,13 @@ class PredictionMode(Enum):
     VALUE = "value"
 
 
+def _discounted_bootstrap(gamma: float, next_value: float) -> float:
+    """Return ``gamma * V(s')``, or 0 when gamma is 0 so 0*inf stays 0."""
+    if float(gamma) == 0.0:
+        return 0.0
+    return float(gamma) * float(next_value)
+
+
 def _flatten_space(space: gymnasium.spaces.Space[Any]) -> int:
     """Get the flattened dimension of a Gymnasium space.
 
@@ -69,11 +128,12 @@ def _flatten_space(space: gymnasium.spaces.Space[Any]) -> int:
     import gymnasium
 
     if isinstance(space, gymnasium.spaces.Box):
-        return int(jnp.prod(jnp.array(space.shape)))
+        dimension = math.prod(space.shape)
+        return _require_positive_int32("flattened Box dimension", dimension)
     elif isinstance(space, gymnasium.spaces.Discrete):
         return 1
     elif isinstance(space, gymnasium.spaces.MultiDiscrete):
-        return len(space.nvec)
+        return _require_positive_int32("flattened MultiDiscrete dimension", int(space.nvec.size))
     else:
         raise ValueError(
             f"Unsupported space type: {type(space).__name__}. "
@@ -93,14 +153,25 @@ def _flatten_observation(obs: Any, space: gymnasium.spaces.Space[Any]) -> Array:
     """
     import gymnasium
 
-    if isinstance(space, gymnasium.spaces.Box):
-        return jnp.asarray(obs, dtype=jnp.float32).flatten()
+    if isinstance(space, (gymnasium.spaces.Box, gymnasium.spaces.MultiDiscrete)):
+        _require_runtime_shape("observation", obs, tuple(space.shape))
     elif isinstance(space, gymnasium.spaces.Discrete):
-        return jnp.array([float(obs)], dtype=jnp.float32)
-    elif isinstance(space, gymnasium.spaces.MultiDiscrete):
-        return jnp.asarray(obs, dtype=jnp.float32)
-    else:
-        raise ValueError(f"Unsupported space type: {type(space).__name__}")
+        _require_runtime_shape("observation", obs, ())
+    try:
+        if isinstance(space, gymnasium.spaces.Box):
+            flattened = jnp.asarray(obs, dtype=jnp.float32).reshape((-1,))
+        elif isinstance(space, gymnasium.spaces.Discrete):
+            flattened = jnp.asarray([obs], dtype=jnp.float32)
+        elif isinstance(space, gymnasium.spaces.MultiDiscrete):
+            flattened = jnp.asarray(obs, dtype=jnp.float32).reshape((-1,))
+        else:
+            raise ValueError(f"Unsupported space type: {type(space).__name__}")
+    except Exception as error:
+        raise ValueError("observation could not be converted to float32") from error
+    expected = _flatten_space(space)
+    if flattened.shape != (expected,) or not bool(jnp.all(jnp.isfinite(flattened))):
+        raise ValueError("observation must match its declared flattened shape and be finite")
+    return flattened
 
 
 def _flatten_action(action: Any, space: gymnasium.spaces.Space[Any]) -> Array:
@@ -115,14 +186,129 @@ def _flatten_action(action: Any, space: gymnasium.spaces.Space[Any]) -> Array:
     """
     import gymnasium
 
-    if isinstance(space, gymnasium.spaces.Box):
-        return jnp.asarray(action, dtype=jnp.float32).flatten()
+    if isinstance(space, (gymnasium.spaces.Box, gymnasium.spaces.MultiDiscrete)):
+        _require_runtime_shape("action", action, tuple(space.shape))
     elif isinstance(space, gymnasium.spaces.Discrete):
-        return jnp.array([float(action)], dtype=jnp.float32)
-    elif isinstance(space, gymnasium.spaces.MultiDiscrete):
-        return jnp.asarray(action, dtype=jnp.float32)
+        _require_runtime_shape("action", action, ())
+    try:
+        if isinstance(space, gymnasium.spaces.Box):
+            flattened = jnp.asarray(action, dtype=jnp.float32).reshape((-1,))
+        elif isinstance(space, gymnasium.spaces.Discrete):
+            flattened = jnp.asarray([action], dtype=jnp.float32)
+        elif isinstance(space, gymnasium.spaces.MultiDiscrete):
+            flattened = jnp.asarray(action, dtype=jnp.float32).reshape((-1,))
+        else:
+            raise ValueError(f"Unsupported space type: {type(space).__name__}")
+    except Exception as error:
+        raise ValueError("action could not be converted to float32") from error
+    expected = _flatten_space(space)
+    if flattened.shape != (expected,) or not bool(jnp.all(jnp.isfinite(flattened))):
+        raise ValueError("action must match its declared flattened shape and be finite")
+    return flattened
+
+
+def _require_runtime_shape(name: str, value: object, expected: tuple[int, ...]) -> None:
+    """Check host shape metadata before conversion can allocate a device array."""
+    try:
+        metadata = getattr(value, "shape", None)
+        actual = tuple(metadata) if metadata is not None else tuple(np.shape(cast(Any, value)))
+    except Exception as error:
+        raise ValueError(f"{name} shape metadata could not be read") from error
+    if actual != expected:
+        raise ValueError(f"{name} must have declared shape {expected}; got {actual}")
+
+
+def _sample_finite_box(key: Array, low: Array, high: Array) -> Array:
+    """Sample a finite float32 Box without forming the possibly-overflowing full span."""
+    unit = jr.uniform(key, low.shape, dtype=jnp.float32)
+    midpoint = low / 2.0 + high / 2.0
+    lower = low + (midpoint - low) * (2.0 * unit)
+    upper = midpoint + (high - midpoint) * (2.0 * unit - 1.0)
+    sample = jnp.where(unit < 0.5, lower, upper)
+    upper_open = jnp.nextafter(high, low)
+    return jnp.where(low < high, jnp.minimum(sample, upper_open), low)
+
+
+def _make_random_policy(
+    env: gymnasium.Env[Any, Any], rng: Array
+) -> Callable[[Array], Any]:
+    """Build a bounded random policy from one already validated JAX key."""
+    import gymnasium
+
+    action_space = env.action_space
+    action_dim = _flatten_space(action_space)
+
+    if isinstance(action_space, gymnasium.spaces.Discrete):
+        discrete_low = int(action_space.start)
+        discrete_count = int(action_space.n)
+        discrete_high = discrete_low + discrete_count
+        if not (
+            1 <= discrete_count <= _INT32_MAX
+            and _INT32_MIN <= discrete_low < discrete_high <= _INT32_MAX
+        ):
+            raise ValueError("Discrete action bounds must fit JAX signed int32")
+    elif isinstance(action_space, gymnasium.spaces.Box):
+        _require_float32_allocation("random Box bounds and action", 3 * action_dim)
+        low_array = np.asarray(action_space.low, dtype=np.float32)
+        high_array = np.asarray(action_space.high, dtype=np.float32)
+        if not bool(
+            np.all(
+                np.isfinite(low_array)
+                & np.isfinite(high_array)
+                & (low_array <= high_array)
+            )
+        ):
+            raise ValueError("Box random actions require finite ordered float32 bounds")
+        low = jnp.asarray(low_array)
+        high = jnp.asarray(high_array)
+    elif isinstance(action_space, gymnasium.spaces.MultiDiscrete):
+        starts = np.asarray(action_space.start).reshape((-1,))
+        counts = np.asarray(action_space.nvec).reshape((-1,))
+        action_dtype = np.dtype(action_space.dtype)
+        _require_allocation(
+            "random MultiDiscrete action",
+            action_dim,
+            itemsize=action_dtype.itemsize,
+        )
+        for index in range(action_dim):
+            start = int(starts[index])
+            count = int(counts[index])
+            if not (
+                1 <= count <= _INT32_MAX
+                and _INT32_MIN <= start < start + count <= _INT32_MAX
+            ):
+                raise ValueError("MultiDiscrete action bounds must fit JAX signed int32")
     else:
-        raise ValueError(f"Unsupported space type: {type(space).__name__}")
+        raise ValueError(f"Unsupported action space: {type(action_space).__name__}")
+
+    def policy(_obs: Array) -> Any:
+        nonlocal rng
+        rng, key = jr.split(rng)
+
+        if isinstance(action_space, gymnasium.spaces.Discrete):
+            return int(jr.randint(key, (), discrete_low, discrete_high))
+        if isinstance(action_space, gymnasium.spaces.Box):
+            return _sample_finite_box(key, low, high)
+        if isinstance(action_space, gymnasium.spaces.MultiDiscrete):
+            samples = np.fromiter(
+                (
+                    int(
+                        jr.randint(
+                            jr.fold_in(key, index),
+                            (),
+                            int(starts[index]),
+                            int(starts[index]) + int(counts[index]),
+                        )
+                    )
+                    for index in range(action_dim)
+                ),
+                dtype=action_dtype,
+                count=action_dim,
+            )
+            return samples.reshape(action_space.shape)
+        raise AssertionError("action-space validation and dispatch diverged")
+
+    return policy
 
 
 def make_random_policy(env: gymnasium.Env[Any, Any], seed: int = 0) -> Callable[[Array], Any]:
@@ -135,29 +321,8 @@ def make_random_policy(env: gymnasium.Env[Any, Any], seed: int = 0) -> Callable[
     Returns:
         A callable that takes an observation and returns a random action
     """
-    import gymnasium
-
-    rng = jr.key(seed)
-    action_space = env.action_space
-
-    def policy(_obs: Array) -> Any:
-        nonlocal rng
-        rng, key = jr.split(rng)
-
-        if isinstance(action_space, gymnasium.spaces.Discrete):
-            return int(jr.randint(key, (), 0, int(action_space.n)))
-        elif isinstance(action_space, gymnasium.spaces.Box):
-            # Sample uniformly between low and high
-            low = jnp.asarray(action_space.low, dtype=jnp.float32)
-            high = jnp.asarray(action_space.high, dtype=jnp.float32)
-            return jr.uniform(key, action_space.shape, minval=low, maxval=high)
-        elif isinstance(action_space, gymnasium.spaces.MultiDiscrete):
-            nvec = action_space.nvec
-            return [int(jr.randint(jr.fold_in(key, i), (), 0, n)) for i, n in enumerate(nvec)]
-        else:
-            raise ValueError(f"Unsupported action space: {type(action_space).__name__}")
-
-    return policy
+    seed = require_jax_seed(seed)
+    return _make_random_policy(env, jr.key(seed))
 
 
 def make_epsilon_greedy_policy(
@@ -177,8 +342,13 @@ def make_epsilon_greedy_policy(
     Returns:
         Epsilon-greedy policy
     """
-    random_policy = make_random_policy(env, seed + 1)
+    if not callable(base_policy):
+        raise ValueError("base_policy must be callable")
+    epsilon = validated_float32_scalar("epsilon", epsilon, lower=0.0, upper=1.0)
+    seed = require_jax_seed(seed)
     rng = jr.key(seed)
+    random_rng = jr.key(seed + 1) if seed < JAX_KEY_SEED_MAX else jr.fold_in(rng, 1)
+    random_policy = _make_random_policy(env, random_rng)
 
     def policy(obs: Array) -> Any:
         nonlocal rng
@@ -227,6 +397,24 @@ def collect_trajectory(
         Tuple of (observations, targets) as JAX arrays with shape
         (num_steps, feature_dim) and (num_steps, target_dim)
     """
+    num_steps = _require_positive_int32("num_steps", num_steps)
+    mode = _require_mode(mode)
+    include_action_in_features = _require_exact_bool(
+        "include_action_in_features", include_action_in_features
+    )
+    seed = require_jax_seed(seed)
+    gamma = validated_float32_scalar("gamma", gamma, lower=0.0, upper=1.0)
+    if policy is not None and not callable(policy):
+        raise ValueError("policy must be callable or None")
+    if value_estimator is not None and not callable(value_estimator):
+        raise ValueError("value_estimator must be callable or None")
+    observation_dim = _flatten_space(env.observation_space)
+    action_dim = _flatten_space(env.action_space)
+    feature_dim = observation_dim + action_dim if include_action_in_features else observation_dim
+    target_dim = observation_dim if mode is PredictionMode.NEXT_STATE else 1
+    _require_float32_allocation(
+        "trajectory output", num_steps * (feature_dim + target_dim)
+    )
     if policy is None:
         policy = make_random_policy(env, seed)
 
@@ -261,7 +449,7 @@ def collect_trajectory(
             # estimator (documented on PredictionMode.VALUE) and on
             # termination, where the post-terminal value is defined as zero.
             if value_estimator is not None and not terminated:
-                bootstrap = gamma * float(value_estimator(next_obs))
+                bootstrap = _discounted_bootstrap(gamma, float(value_estimator(next_obs)))
             else:
                 bootstrap = 0.0
             target = jnp.atleast_1d(
@@ -383,30 +571,37 @@ class GymnasiumStream:
                 If False, features = obs only
             seed: Random seed for environment resets and random policy
         """
+        mode = _require_mode(mode)
+        include_action_in_features = _require_exact_bool(
+            "include_action_in_features", include_action_in_features
+        )
+        seed = require_jax_seed(seed)
+        if policy is not None and not callable(policy):
+            raise ValueError("policy must be callable or None")
+        gamma = validated_float32_scalar("gamma", gamma, lower=0.0, upper=1.0)
+        observation_dim = _flatten_space(env.observation_space)
+        action_dim = _flatten_space(env.action_space)
+        feature_dim = (
+            observation_dim + action_dim
+            if include_action_in_features
+            else observation_dim
+        )
+        target_dim = observation_dim if mode is PredictionMode.NEXT_STATE else 1
+        _require_float32_allocation("stream feature vector", feature_dim)
+        _require_float32_allocation("stream target vector", target_dim)
+
+        selected_policy = make_random_policy(env, seed) if policy is None else policy
         self._env = env
         self._mode = mode
         self._gamma = gamma
         self._include_action_in_features = include_action_in_features
         self._seed = seed
         self._reset_count = 0
-
-        if policy is None:
-            self._policy = make_random_policy(env, seed)
-        else:
-            self._policy = policy
-
-        self._obs_dim = _flatten_space(env.observation_space)
-        self._action_dim = _flatten_space(env.action_space)
-
-        if include_action_in_features:
-            self._feature_dim = self._obs_dim + self._action_dim
-        else:
-            self._feature_dim = self._obs_dim
-
-        if mode == PredictionMode.NEXT_STATE:
-            self._target_dim = self._obs_dim
-        else:
-            self._target_dim = 1
+        self._policy = selected_policy
+        self._obs_dim = observation_dim
+        self._action_dim = action_dim
+        self._feature_dim = feature_dim
+        self._target_dim = target_dim
 
         self._current_obs: Array | None = None
         self._episode_count = 0
@@ -440,6 +635,8 @@ class GymnasiumStream:
 
     def set_value_estimator(self, estimator: Callable[[Array], float]) -> None:
         """Set the value estimator for proper TD learning in VALUE mode."""
+        if not callable(estimator):
+            raise ValueError("estimator must be callable")
         self._value_estimator = estimator
 
     def _get_reset_seed(self) -> int:
@@ -476,7 +673,7 @@ class GymnasiumStream:
             else:
                 next_value = 0.0
 
-            target = reward + self._gamma * next_value
+            target = reward + _discounted_bootstrap(self._gamma, next_value)
             return jnp.atleast_1d(jnp.array(target, dtype=jnp.float32))
 
         else:
@@ -546,27 +743,34 @@ class TDStream:
             include_action_in_features: If True, learn Q(s,a). If False, learn V(s)
             seed: Random seed
         """
+        include_action_in_features = _require_exact_bool(
+            "include_action_in_features", include_action_in_features
+        )
+        seed = require_jax_seed(seed)
+        if policy is not None and not callable(policy):
+            raise ValueError("policy must be callable or None")
+        gamma = validated_float32_scalar("gamma", gamma, lower=0.0, upper=1.0)
+        observation_dim = _flatten_space(env.observation_space)
+        action_dim = _flatten_space(env.action_space)
+        feature_dim = (
+            observation_dim + action_dim
+            if include_action_in_features
+            else observation_dim
+        )
+        _require_float32_allocation("TD stream feature vector", feature_dim)
+
+        selected_policy = make_random_policy(env, seed) if policy is None else policy
         self._env = env
         self._gamma = gamma
         self._include_action_in_features = include_action_in_features
         self._seed = seed
         self._reset_count = 0
-
-        if policy is None:
-            self._policy = make_random_policy(env, seed)
-        else:
-            self._policy = policy
-
-        self._obs_dim = _flatten_space(env.observation_space)
-        self._action_dim = _flatten_space(env.action_space)
-
-        if include_action_in_features:
-            self._feature_dim = self._obs_dim + self._action_dim
-        else:
-            self._feature_dim = self._obs_dim
+        self._policy = selected_policy
+        self._obs_dim = observation_dim
+        self._action_dim = action_dim
+        self._feature_dim = feature_dim
 
         self._current_obs: Array | None = None
-        self._current_action: Any | None = None
         self._episode_count = 0
         self._step_count = 0
         self._value_fn: Callable[[Array], float] = lambda x: 0.0
@@ -588,6 +792,8 @@ class TDStream:
 
     def update_value_function(self, value_fn: Callable[[Array], float]) -> None:
         """Update the value function used for TD bootstrapping."""
+        if not callable(value_fn):
+            raise ValueError("value_fn must be callable")
         self._value_fn = value_fn
 
     def _get_reset_seed(self) -> int:
@@ -607,30 +813,32 @@ class TDStream:
         return self
 
     def __next__(self) -> TimeStep:
-        """Generate the next time step with a TD or SARSA-style target."""
+        """Generate the next time step with TD target.
+
+        Caveat: with ``include_action_in_features=True`` the bootstrap
+        features pair the *next* observation with the *current* action —
+        Q(s', a) rather than Q(s', a') — because the next action has not
+        been sampled yet.  The target is therefore biased relative to
+        SARSA's ``reward + gamma * Q(s', a')``.
+        """
         if self._current_obs is None:
             raw_obs, _ = self._env.reset(seed=self._get_reset_seed())
             self._current_obs = _flatten_observation(raw_obs, self._env.observation_space)
-            self._current_action = self._policy(self._current_obs)
 
-        action = self._current_action
-        if action is None:
-            raise RuntimeError("TDStream has an observation without an owned action")
+        action = self._policy(self._current_obs)
         flat_action = _flatten_action(action, self._env.action_space)
 
         raw_next_obs, reward, terminated, truncated, _ = self._env.step(action)
         next_obs = _flatten_observation(raw_next_obs, self._env.observation_space)
 
         features = self._construct_features(self._current_obs, flat_action)
+        next_features = self._construct_features(next_obs, flat_action)
 
         if terminated:
             target = jnp.atleast_1d(jnp.array(reward, dtype=jnp.float32))
         else:
-            next_action = self._policy(next_obs)
-            next_flat_action = _flatten_action(next_action, self._env.action_space)
-            next_features = self._construct_features(next_obs, next_flat_action)
             bootstrap = self._value_fn(next_features)
-            target_val = float(reward) + self._gamma * float(bootstrap)
+            target_val = float(reward) + _discounted_bootstrap(self._gamma, float(bootstrap))
             target = jnp.atleast_1d(jnp.array(target_val, dtype=jnp.float32))
 
         self._step_count += 1
@@ -638,10 +846,8 @@ class TDStream:
         if terminated or truncated:
             self._episode_count += 1
             self._current_obs = None
-            self._current_action = None
         else:
             self._current_obs = next_obs
-            self._current_action = next_action
 
         return TimeStep(observation=features, target=target)
 
@@ -669,14 +875,32 @@ def make_gymnasium_stream(
     Returns:
         GymnasiumStream wrapping the environment
     """
+    if type(env_id) is not str or not env_id:
+        raise ValueError("env_id must be a non-empty exact string")
+    mode = _require_mode(mode)
+    include_action_in_features = _require_exact_bool(
+        "include_action_in_features", include_action_in_features
+    )
+    seed = require_jax_seed(seed)
+    gamma = validated_float32_scalar("gamma", gamma, lower=0.0, upper=1.0)
+    if policy is not None and not callable(policy):
+        raise ValueError("policy must be callable or None")
+
     import gymnasium
 
     env = gymnasium.make(env_id, **env_kwargs)
-    return GymnasiumStream(
-        env=env,
-        mode=mode,
-        policy=policy,
-        gamma=gamma,
-        include_action_in_features=include_action_in_features,
-        seed=seed,
-    )
+    try:
+        return GymnasiumStream(
+            env=env,
+            mode=mode,
+            policy=policy,
+            gamma=gamma,
+            include_action_in_features=include_action_in_features,
+            seed=seed,
+        )
+    except Exception:
+        try:
+            env.close()
+        except Exception:
+            pass
+        raise

@@ -21,15 +21,20 @@ from __future__ import annotations
 
 import dataclasses
 import functools
-from typing import Any, Literal, Protocol, cast
+import operator
+from collections.abc import Mapping
+from fractions import Fraction
+from typing import Any, Literal, Protocol, SupportsIndex, cast
 
 import chex
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 from jax import Array
 from jaxtyping import Float, Int
 
+from alberta_framework.core._float32_scalars import validated_float32_scalar_with_ratio
 from alberta_framework.core.behavior_model import (
     BehaviorModel,
     BehaviorModelState,
@@ -43,6 +48,98 @@ from alberta_framework.core.world_model import (
 from alberta_framework.core.world_model import (
     WorldModelPrediction as ActionWorldModelPrediction,
 )
+
+_INT32_MAX = 2**31 - 1
+_ACTUAL_INT_TYPES: frozenset[type] = frozenset(
+    {
+        int,
+        np.int8,
+        np.int16,
+        np.int32,
+        np.int64,
+        np.uint8,
+        np.uint16,
+        np.uint32,
+        np.uint64,
+        np.longlong,
+        np.ulonglong,
+    }
+)
+_ACTUAL_FLOAT_TYPES: frozenset[type] = frozenset(
+    {
+        float,
+        Fraction,
+        *(np.dtype(c).type for c in ("e", "f", "d", "g")),
+    }
+)
+_ALLOWED_REAL_TYPES: frozenset[type] = _ACTUAL_INT_TYPES | _ACTUAL_FLOAT_TYPES
+
+
+def _require_int(
+    name: str, value: object, *, minimum: int, maximum: int = _INT32_MAX
+) -> int:
+    if type(value) not in _ACTUAL_INT_TYPES:
+        raise ValueError(f"{name} must be an integer")
+    canonical = operator.index(cast(SupportsIndex, value))
+    if not minimum <= canonical <= maximum:
+        raise ValueError(f"{name} must be an integer")
+    return canonical
+
+
+def _validated_config_float(
+    name: str,
+    value: object,
+    *,
+    positive: bool = False,
+    lower: float | None = None,
+    upper: float | None = None,
+    upper_inclusive: bool = True,
+) -> float:
+    if type(value) not in _ALLOWED_REAL_TYPES:
+        raise ValueError(f"{name} must be a finite real number")
+    stored, numerator, denominator = validated_float32_scalar_with_ratio(
+        name,
+        value,
+        positive=positive,
+        lower=lower,
+        upper=upper,
+        upper_inclusive=upper_inclusive,
+    )
+    if numerator != 0 and abs(numerator) * (1 << 149) <= denominator:
+        raise ValueError(f"{name} must remain nonzero once narrowed to float32")
+    return stored
+
+
+def _require_float32_resource(
+    name: str, *, vector_scalars: int, fixed_scalars: int = 0
+) -> None:
+    total = vector_scalars + fixed_scalars
+    if total > _INT32_MAX:
+        raise ValueError(f"{name} scalar count must fit signed int32")
+    if 4 * total > _INT32_MAX:
+        raise ValueError(f"{name} byte count must fit signed int32")
+
+
+def _copy_mapping(payload: object, *, name: str) -> dict[str, object]:
+    if not isinstance(payload, Mapping):
+        raise ValueError(f"{name} payload must be a mapping")
+    try:
+        data = dict(payload)
+    except Exception as error:
+        raise ValueError(f"{name} payload could not be read") from error
+    for key in data:
+        if type(key) is not str:
+            raise ValueError(f"{name} payload has exact strings as keys")
+    return data
+
+
+
+
+def _require_bool(value: object, name: str) -> bool:
+    """Reject truthy stand-ins for exact bools."""
+    if type(value) is not bool:
+        raise ValueError(f"{name} must be a bool")
+    return value
 
 
 @dataclasses.dataclass(frozen=True)
@@ -73,6 +170,43 @@ class DreamingConfig:
     discount_floor: float = 0.0
     stop_on_terminal: bool = True
 
+    def __post_init__(self) -> None:
+        """Validate scalar configuration, rejecting NaN and type stand-ins."""
+        object.__setattr__(
+            self,
+            "warmup_steps",
+            _require_int("warmup_steps", self.warmup_steps, minimum=0),
+        )
+        for name in (
+            "max_model_error_ema",
+            "max_uncertainty",
+            "min_discount",
+            "confidence_threshold",
+            "max_model_error",
+            "discount_floor",
+        ):
+            object.__setattr__(
+                self,
+                name,
+                _validated_config_float(name, getattr(self, name), lower=0.0),
+            )
+        if self.max_discount is not None:
+            object.__setattr__(
+                self,
+                "max_discount",
+                _validated_config_float(
+                    "max_discount", self.max_discount, lower=0.0
+                ),
+            )
+        object.__setattr__(
+            self,
+            "rollout_horizon",
+            _require_int("rollout_horizon", self.rollout_horizon, minimum=1),
+        )
+        object.__setattr__(
+            self, "stop_on_terminal", _require_bool(self.stop_on_terminal, "stop_on_terminal")
+        )
+
     def to_config(self) -> dict[str, Any]:
         """Serialize to a JSON-compatible dictionary."""
         payload = dataclasses.asdict(self)
@@ -80,11 +214,28 @@ class DreamingConfig:
         return payload
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> DreamingConfig:
+    def from_config(cls, config: object) -> DreamingConfig:
         """Reconstruct from :meth:`to_config` output."""
-        payload = dict(config)
-        payload.pop("type", None)
-        return cls(**payload)
+        data = _copy_mapping(config, name="DreamingConfig")
+        config_type = data.pop("type", None)
+        if type(config_type) is not str or config_type != "DreamingConfig":
+            raise ValueError("DreamingConfig payload type must be DreamingConfig")
+        allowed = {
+            "warmup_steps",
+            "max_model_error_ema",
+            "max_uncertainty",
+            "min_discount",
+            "max_discount",
+            "rollout_horizon",
+            "confidence_threshold",
+            "max_model_error",
+            "discount_floor",
+            "stop_on_terminal",
+        }
+        unknown = set(data) - allowed
+        if unknown:
+            raise ValueError("DreamingConfig payload has unknown fields")
+        return cls(**data)  # type: ignore[arg-type]
 
 
 @chex.dataclass(frozen=True)
@@ -139,13 +290,27 @@ class DreamSelectionConfig:
     max_model_error: float = 1.0e30
 
     def __post_init__(self) -> None:
-        """Validate scalar configuration."""
-        if self.max_items <= 0:
-            raise ValueError("max_items must be positive")
-        if self.min_confidence < 0.0:
-            raise ValueError("min_confidence must be non-negative")
-        if self.max_model_error < 0.0:
-            raise ValueError("max_model_error must be non-negative")
+        """Validate scalar configuration, rejecting NaN and type stand-ins."""
+        object.__setattr__(
+            self, "max_items", _require_int("max_items", self.max_items, minimum=1)
+        )
+        for name in (
+            "surprise_weight",
+            "utility_weight",
+            "confidence_weight",
+            "model_error_weight",
+            "min_surprise",
+            "min_utility",
+        ):
+            object.__setattr__(
+                self, name, _validated_config_float(name, getattr(self, name))
+            )
+        for name in ("min_confidence", "max_model_error"):
+            object.__setattr__(
+                self,
+                name,
+                _validated_config_float(name, getattr(self, name), lower=0.0),
+            )
 
     def to_config(self) -> dict[str, Any]:
         """Serialize to a JSON-compatible dictionary."""
@@ -154,11 +319,29 @@ class DreamSelectionConfig:
         return payload
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> DreamSelectionConfig:
+    def from_config(cls, config: object) -> DreamSelectionConfig:
         """Reconstruct from :meth:`to_config` output."""
-        payload = dict(config)
-        payload.pop("type", None)
-        return cls(**payload)
+        data = _copy_mapping(config, name="DreamSelectionConfig")
+        config_type = data.pop("type", None)
+        if type(config_type) is not str or config_type != "DreamSelectionConfig":
+            raise ValueError(
+                "DreamSelectionConfig payload type must be DreamSelectionConfig"
+            )
+        allowed = {
+            "max_items",
+            "surprise_weight",
+            "utility_weight",
+            "confidence_weight",
+            "model_error_weight",
+            "min_surprise",
+            "min_utility",
+            "min_confidence",
+            "max_model_error",
+        }
+        unknown = set(data) - allowed
+        if unknown:
+            raise ValueError("DreamSelectionConfig payload has unknown fields")
+        return cls(**data)  # type: ignore[arg-type]
 
 
 @chex.dataclass(frozen=True)
@@ -184,16 +367,32 @@ class GuardedDreamer:
     def __init__(self, config: DreamingConfig | None = None):
         """Initialize a guarded dream proposer."""
         self._config = config or DreamingConfig()
-        if self._config.warmup_steps < 0:
-            raise ValueError("warmup_steps must be non-negative")
-        if self._config.max_model_error_ema < 0.0:
-            raise ValueError("max_model_error_ema must be non-negative")
-        if self._config.max_uncertainty < 0.0:
-            raise ValueError("max_uncertainty must be non-negative")
-        if self._config.min_discount < 0.0:
-            raise ValueError("min_discount must be non-negative")
-        if self._config.max_discount is not None and self._config.max_discount < 0.0:
-            raise ValueError("max_discount must be non-negative")
+        # DreamingConfig.__post_init__ validates on construction; re-validate here
+        # so instances mutated through object.__setattr__ (or crafted subclasses)
+        # cannot smuggle NaN or type stand-ins past the guard.
+        _require_int("warmup_steps", self._config.warmup_steps, minimum=0)
+        _validated_config_float(
+            "max_model_error_ema", self._config.max_model_error_ema, lower=0.0
+        )
+        _validated_config_float(
+            "max_uncertainty", self._config.max_uncertainty, lower=0.0
+        )
+        _validated_config_float("min_discount", self._config.min_discount, lower=0.0)
+        if self._config.max_discount is not None:
+            _validated_config_float(
+                "max_discount", self._config.max_discount, lower=0.0
+            )
+        _require_int("rollout_horizon", self._config.rollout_horizon, minimum=1)
+        _validated_config_float(
+            "confidence_threshold", self._config.confidence_threshold, lower=0.0
+        )
+        _validated_config_float(
+            "max_model_error", self._config.max_model_error, lower=0.0
+        )
+        _validated_config_float(
+            "discount_floor", self._config.discount_floor, lower=0.0
+        )
+        _require_bool(self._config.stop_on_terminal, "stop_on_terminal")
 
     @property
     def config(self) -> DreamingConfig:
@@ -205,11 +404,18 @@ class GuardedDreamer:
         return {"type": "GuardedDreamer", "config": self._config.to_config()}
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> GuardedDreamer:
+    def from_config(cls, config: object) -> GuardedDreamer:
         """Reconstruct from :meth:`to_config` output."""
-        payload = dict(config)
-        payload.pop("type", None)
-        return cls(DreamingConfig.from_config(payload["config"]))
+        data = _copy_mapping(config, name="GuardedDreamer")
+        config_type = data.pop("type", None)
+        if type(config_type) is not str or config_type != "GuardedDreamer":
+            raise ValueError("GuardedDreamer payload type must be GuardedDreamer")
+        if set(data) != {"config"}:
+            raise ValueError("GuardedDreamer payload has unknown fields")
+        raw = data["config"]
+        if not isinstance(raw, Mapping):
+            raise ValueError("GuardedDreamer config must be a mapping")
+        return cls(DreamingConfig.from_config(raw))
 
     @functools.partial(jax.jit, static_argnums=(0, 1))
     def propose(
@@ -360,19 +566,35 @@ def score_dream_candidates(
     if valid_arr.shape != surprise_arr.shape:
         raise ValueError("valid must match surprises")
 
+    inputs_finite = (
+        jnp.isfinite(surprise_arr)
+        & jnp.isfinite(utility_arr)
+        & jnp.isfinite(confidence_arr)
+        & jnp.isfinite(error_arr)
+    )
     accepted = (
         valid_arr
+        & inputs_finite
         & (surprise_arr >= jnp.asarray(cfg.min_surprise, dtype=jnp.float32))
         & (utility_arr >= jnp.asarray(cfg.min_utility, dtype=jnp.float32))
         & (confidence_arr >= jnp.asarray(cfg.min_confidence, dtype=jnp.float32))
         & (error_arr <= jnp.asarray(cfg.max_model_error, dtype=jnp.float32))
     )
+    def weighted_term(weight: float, values: Array) -> Array:
+        weight_arr = jnp.asarray(weight, dtype=jnp.float32)
+        return jnp.where(
+            weight_arr == 0.0,
+            jnp.zeros_like(values),
+            weight_arr * values,
+        )
+
     raw_scores = (
-        cfg.surprise_weight * surprise_arr
-        + cfg.utility_weight * utility_arr
-        + cfg.confidence_weight * confidence_arr
-        - cfg.model_error_weight * error_arr
+        weighted_term(cfg.surprise_weight, surprise_arr)
+        + weighted_term(cfg.utility_weight, utility_arr)
+        + weighted_term(cfg.confidence_weight, confidence_arr)
+        - weighted_term(cfg.model_error_weight, error_arr)
     )
+    accepted = accepted & jnp.isfinite(raw_scores)
     scores = jnp.where(accepted, raw_scores, -jnp.inf)
     selected_indices = jnp.argsort(-scores)[: cfg.max_items].astype(jnp.int32)
     selected_accepted = accepted[selected_indices]
@@ -390,12 +612,14 @@ class RecentObservationBuffer:
 
     def __init__(self, capacity: int, observation_dim: int):
         """Initialize the buffer shape."""
-        if capacity <= 0:
-            raise ValueError("capacity must be positive")
-        if observation_dim <= 0:
-            raise ValueError("observation_dim must be positive")
-        self._capacity = capacity
-        self._observation_dim = observation_dim
+        self._capacity = _require_int("capacity", capacity, minimum=1)
+        self._observation_dim = _require_int(
+            "observation_dim", observation_dim, minimum=1
+        )
+        _require_float32_resource(
+            "RecentObservationBuffer",
+            vector_scalars=self._capacity * self._observation_dim,
+        )
 
     @property
     def capacity(self) -> int:
@@ -409,6 +633,10 @@ class RecentObservationBuffer:
 
     def init(self) -> RecentObservationBufferState:
         """Return an empty buffer state."""
+        _require_float32_resource(
+            "RecentObservationBuffer init",
+            vector_scalars=self._capacity * self._observation_dim,
+        )
         return RecentObservationBufferState(
             observations=jnp.zeros(
                 (self._capacity, self._observation_dim),
@@ -493,15 +721,21 @@ class DreamRolloutConfig:
     stop_on_terminal: bool = True
 
     def __post_init__(self) -> None:
-        """Validate scalar configuration."""
-        if self.rollout_horizon < 1:
-            raise ValueError("rollout_horizon must be positive")
-        if self.confidence_threshold < 0.0:
-            raise ValueError("confidence_threshold must be non-negative")
-        if self.max_model_error < 0.0:
-            raise ValueError("max_model_error must be non-negative")
-        if self.discount_floor < 0.0:
-            raise ValueError("discount_floor must be non-negative")
+        """Validate scalar configuration, rejecting NaN and type stand-ins."""
+        object.__setattr__(
+            self,
+            "rollout_horizon",
+            _require_int("rollout_horizon", self.rollout_horizon, minimum=1),
+        )
+        for name in ("confidence_threshold", "max_model_error", "discount_floor"):
+            object.__setattr__(
+                self,
+                name,
+                _validated_config_float(name, getattr(self, name), lower=0.0),
+            )
+        object.__setattr__(
+            self, "stop_on_terminal", _require_bool(self.stop_on_terminal, "stop_on_terminal")
+        )
 
     def to_config(self) -> dict[str, Any]:
         """Serialize to a JSON-compatible dictionary."""
@@ -510,11 +744,25 @@ class DreamRolloutConfig:
         return payload
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> DreamRolloutConfig:
+    def from_config(cls, config: object) -> DreamRolloutConfig:
         """Reconstruct from :meth:`to_config` output."""
-        payload = dict(config)
-        payload.pop("type", None)
-        return cls(**payload)
+        data = _copy_mapping(config, name="DreamRolloutConfig")
+        config_type = data.pop("type", None)
+        if type(config_type) is not str or config_type != "DreamRolloutConfig":
+            raise ValueError(
+                "DreamRolloutConfig payload type must be DreamRolloutConfig"
+            )
+        allowed = {
+            "rollout_horizon",
+            "confidence_threshold",
+            "max_model_error",
+            "discount_floor",
+            "stop_on_terminal",
+        }
+        unknown = set(data) - allowed
+        if unknown:
+            raise ValueError("DreamRolloutConfig payload has unknown fields")
+        return cls(**data)  # type: ignore[arg-type]
 
 
 @chex.dataclass(frozen=True)
@@ -695,7 +943,25 @@ def dream_one_step(
         dtype=jnp.float32,
     )
     terminated = jnp.logical_or(world_prediction.terminated, discount_terminal)
-    valid = jnp.logical_and(rollout_state.active, jnp.logical_and(confidence_ok, error_ok))
+    # A non-finite imagined step can never be valid: it would otherwise ship to
+    # the control learner with full weight and poison every later step of the
+    # rollout through the carried observation. The anchor observation and the
+    # sampled action are gated alongside the model prediction because both are
+    # copied verbatim into the emitted transition (mirroring the one-step
+    # guard's REJECT_NONFINITE, which also requires a finite anchor).
+    finite = (
+        jnp.all(jnp.isfinite(jnp.asarray(rollout_state.observation, dtype=jnp.float32)))
+        & jnp.all(jnp.isfinite(jnp.asarray(behavior_prediction.action, dtype=jnp.float32)))
+        & jnp.all(jnp.isfinite(world_prediction.next_observation))
+        & jnp.all(jnp.isfinite(world_prediction.reward))
+        & jnp.all(jnp.isfinite(world_prediction.discount))
+        & jnp.all(jnp.isfinite(world_prediction.confidence))
+        & jnp.all(jnp.isfinite(world_prediction.model_error))
+    )
+    valid = jnp.logical_and(
+        rollout_state.active,
+        jnp.logical_and(finite, jnp.logical_and(confidence_ok, error_ok)),
+    )
     next_active = jnp.logical_and(valid, jnp.logical_not(terminated))
     if not cfg.stop_on_terminal:
         next_active = valid
@@ -779,10 +1045,22 @@ def action_features(action: Array, n_actions: int | None = None) -> Array:
     """Return float action features for training-item conversion."""
     if n_actions is None:
         return jnp.ravel(jnp.asarray(action, dtype=jnp.float32))
-    if n_actions < 1:
-        raise ValueError("n_actions must be positive when provided")
-    action_index = jnp.squeeze(jnp.asarray(action, dtype=jnp.int32))
-    return jax.nn.one_hot(action_index, n_actions, dtype=jnp.float32)
+    n_actions = _require_int("n_actions", n_actions, minimum=1)
+    action_array = jnp.asarray(action)
+    if action_array.shape != () or not jnp.issubdtype(action_array.dtype, jnp.integer):
+        raise ValueError("discrete action must be a scalar integer array")
+    valid = (action_array >= 0) & (action_array < n_actions)
+    action_index = jnp.where(valid, action_array, 0).astype(jnp.int32)
+    return jax.nn.one_hot(action_index, n_actions, dtype=jnp.float32) * valid
+
+
+def _neutralize_invalid(value: Array, valid: Array) -> Array:
+    """Return zeros for rejected dream rows before weighted arithmetic."""
+    array = jnp.asarray(value)
+    mask = jnp.asarray(valid, dtype=jnp.bool_)
+    while mask.ndim < array.ndim:
+        mask = mask[..., None]
+    return jnp.where(mask, array, jnp.zeros_like(array))
 
 
 def imagined_transition_to_supervised_item(
@@ -805,17 +1083,21 @@ def imagined_transition_to_supervised_item(
     next_observation = jnp.ravel(
         jnp.asarray(transition.next_observation, dtype=jnp.float32)
     )
+    if type(target) is not str or target not in {
+        "next_observation",
+        "reward",
+        "reward_next_observation",
+    }:
+        raise ValueError("supervised target is unsupported")
     if target == "next_observation":
         targets = next_observation
     elif target == "reward":
         targets = reward
-    elif target == "reward_next_observation":
-        targets = jnp.concatenate([reward, next_observation], axis=0)
     else:
-        raise ValueError(f"unknown supervised target {target!r}")
+        targets = jnp.concatenate([reward, next_observation], axis=0)
     return DreamSupervisedTrainingItem(
-        inputs=inputs,
-        targets=targets,
+        inputs=_neutralize_invalid(inputs, transition.valid),
+        targets=_neutralize_invalid(targets, transition.valid),
         weights=jnp.asarray(transition.valid, dtype=jnp.float32),
     )
 
@@ -831,10 +1113,13 @@ def imagined_transition_to_gvf_item(
         else jnp.ravel(jnp.asarray(cumulants, dtype=jnp.float32))
     )
     return DreamGVFTrainingItem(
-        observations=transition.observation,
-        cumulants=cumulant_array,
-        next_observations=transition.next_observation,
-        discounts=jnp.reshape(jnp.asarray(transition.discount, dtype=jnp.float32), (1,)),
+        observations=_neutralize_invalid(transition.observation, transition.valid),
+        cumulants=_neutralize_invalid(cumulant_array, transition.valid),
+        next_observations=_neutralize_invalid(transition.next_observation, transition.valid),
+        discounts=_neutralize_invalid(
+            jnp.reshape(jnp.asarray(transition.discount, dtype=jnp.float32), (1,)),
+            transition.valid,
+        ),
         weights=jnp.reshape(jnp.asarray(transition.valid, dtype=jnp.float32), (1,)),
     )
 
@@ -851,10 +1136,14 @@ def imagined_rollout_to_gvf_items(
         else jnp.asarray(cumulants, dtype=jnp.float32)
     )
     return DreamGVFTrainingItem(
-        observations=transitions.observation,
-        cumulants=cumulant_array,
-        next_observations=transitions.next_observation,
-        discounts=jnp.asarray(transitions.discount, dtype=jnp.float32),
+        observations=_neutralize_invalid(transitions.observation, transitions.valid),
+        cumulants=_neutralize_invalid(cumulant_array, transitions.valid),
+        next_observations=_neutralize_invalid(
+            transitions.next_observation, transitions.valid
+        ),
+        discounts=_neutralize_invalid(
+            jnp.asarray(transitions.discount, dtype=jnp.float32), transitions.valid
+        ),
         weights=jnp.asarray(transitions.valid, dtype=jnp.float32),
     )
 
@@ -875,12 +1164,18 @@ def imagined_rollout_to_sarsa_items(
         next_actions = jnp.concatenate([actions[1:], bootstrap], axis=0)
         weights = jnp.asarray(transitions.valid, dtype=jnp.float32)
     return DreamSARSATrainingItem(
-        observations=transitions.observation,
-        actions=actions,
-        rewards=jnp.asarray(transitions.reward, dtype=jnp.float32),
-        next_observations=transitions.next_observation,
-        discounts=jnp.asarray(transitions.discount, dtype=jnp.float32),
-        next_actions=next_actions,
+        observations=_neutralize_invalid(transitions.observation, transitions.valid),
+        actions=_neutralize_invalid(actions, transitions.valid),
+        rewards=_neutralize_invalid(
+            jnp.asarray(transitions.reward, dtype=jnp.float32), transitions.valid
+        ),
+        next_observations=_neutralize_invalid(
+            transitions.next_observation, transitions.valid
+        ),
+        discounts=_neutralize_invalid(
+            jnp.asarray(transitions.discount, dtype=jnp.float32), transitions.valid
+        ),
+        next_actions=_neutralize_invalid(next_actions, transitions.valid),
         weights=weights,
     )
 

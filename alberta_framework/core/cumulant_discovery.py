@@ -53,14 +53,76 @@ Reference:
 from __future__ import annotations
 
 import functools
-from typing import Any
+import operator
+from collections.abc import Mapping
+from typing import Any, SupportsIndex, cast
 
 import chex
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 from jax import Array
 from jaxtyping import Float, Int, PRNGKeyArray
+
+from alberta_framework.core._float32_scalars import validated_float32_scalar_with_ratio
+
+_INT32_MAX = 2**31 - 1
+_MAX_PERSISTENT_STATE_BYTES = 256 * 1024 * 1024
+_ACTUAL_INT_TYPES = frozenset(
+    {int, *(np.dtype(code).type for code in ("b", "B", "h", "H", "i", "I", "l", "L", "q", "Q"))}
+)
+_ACTUAL_REAL_TYPES = _ACTUAL_INT_TYPES | frozenset(
+    {float, *(np.dtype(code).type for code in "efdg")}
+)
+
+
+def _require_int32(name: str, value: object, *, minimum: int) -> int:
+    if type(value) not in _ACTUAL_INT_TYPES:
+        raise ValueError(f"{name} must be an integer in [{minimum}, {_INT32_MAX}]")
+    canonical = operator.index(cast(SupportsIndex, value))
+    if not minimum <= canonical <= _INT32_MAX:
+        raise ValueError(f"{name} must be an integer in [{minimum}, {_INT32_MAX}]")
+    return canonical
+
+
+def _require_float32(
+    name: str,
+    value: object,
+    *,
+    lower: float | None = None,
+    upper: float | None = None,
+    upper_inclusive: bool = True,
+    positive: bool = False,
+    preserve_nonzero: bool = False,
+) -> float:
+    if type(value) not in _ACTUAL_REAL_TYPES:
+        raise ValueError(f"{name} must be a finite real number")
+    stored, numerator, _ = validated_float32_scalar_with_ratio(
+        name,
+        value,
+        lower=lower,
+        upper=upper,
+        upper_inclusive=upper_inclusive,
+        positive=positive,
+    )
+    if preserve_nonzero and numerator != 0 and stored == 0.0:
+        raise ValueError(f"{name} must remain nonzero once narrowed to float32")
+    return stored
+
+
+def _persistent_resources(raw_dim: int, n_candidates: int) -> dict[str, int]:
+    """Exact retained-array budget, excluding compiler and transient buffers."""
+    persistent_scalars = 2 * n_candidates * raw_dim + 3 * n_candidates + 2
+    persistent_bytes = 4 * persistent_scalars
+    if persistent_scalars > _INT32_MAX:
+        raise ValueError("derived cumulant-discovery persistent scalars must fit signed int32")
+    if persistent_bytes > _MAX_PERSISTENT_STATE_BYTES:
+        raise ValueError("derived cumulant-discovery persistent state exceeds 256 MiB")
+    return {
+        "persistent_scalars": persistent_scalars,
+        "persistent_bytes": persistent_bytes,
+    }
 
 # =============================================================================
 # State
@@ -135,24 +197,34 @@ class CumulantDiscovery:
         gamma: float = 0.0,
         enabled: bool = True,
     ):
-        if raw_dim <= 0:
-            raise ValueError(f"raw_dim must be positive; got {raw_dim}")
-        if n_candidates <= 0:
-            raise ValueError(f"n_candidates must be positive; got {n_candidates}")
-        if not 0.0 < decay_rate < 1.0:
-            raise ValueError(f"decay_rate must lie in (0, 1); got {decay_rate}")
-        if not 0.0 <= replacement_rate <= 1.0:
-            raise ValueError(
-                f"replacement_rate must lie in [0, 1]; got {replacement_rate}"
-            )
-        if maturity_threshold < 0:
-            raise ValueError(
-                f"maturity_threshold must be non-negative; got {maturity_threshold}"
-            )
-        if predictor_step_size <= 0:
-            raise ValueError(
-                f"predictor_step_size must be positive; got {predictor_step_size}"
-            )
+        raw_dim = _require_int32("raw_dim", raw_dim, minimum=1)
+        n_candidates = _require_int32("n_candidates", n_candidates, minimum=1)
+        maturity_threshold = _require_int32(
+            "maturity_threshold", maturity_threshold, minimum=0
+        )
+        _persistent_resources(raw_dim, n_candidates)
+        decay_rate = _require_float32(
+            "decay_rate",
+            decay_rate,
+            positive=True,
+            upper=1.0,
+            upper_inclusive=False,
+        )
+        replacement_rate = _require_float32(
+            "replacement_rate",
+            replacement_rate,
+            lower=0.0,
+            upper=1.0,
+            preserve_nonzero=True,
+        )
+        predictor_step_size = _require_float32(
+            "predictor_step_size", predictor_step_size, positive=True
+        )
+        gamma = _require_float32(
+            "gamma", gamma, lower=0.0, upper=1.0, preserve_nonzero=True
+        )
+        if type(enabled) is not bool:
+            raise ValueError("enabled must be an exact boolean")
 
         self._raw_dim = raw_dim
         self._n_candidates = n_candidates
@@ -162,6 +234,71 @@ class CumulantDiscovery:
         self._predictor_step_size = predictor_step_size
         self._gamma = gamma
         self._enabled = enabled
+
+    @staticmethod
+    def _require_typed_key(name: str, value: object) -> Array:
+        """Require a typed scalar Threefry key, never legacy uint32 words."""
+        try:
+            key = jnp.asarray(value)
+            implementation = str(jr.key_impl(value))  # type: ignore[arg-type]
+            words = jr.key_data(value)  # type: ignore[arg-type]
+        except Exception as error:
+            raise ValueError(f"{name} must be a typed scalar threefry2x32 key") from error
+        if (
+            key.shape != ()
+            or implementation != "threefry2x32"
+            or words.shape != (2,)
+            or words.dtype != jnp.uint32
+        ):
+            raise ValueError(f"{name} must be a typed scalar threefry2x32 key")
+        return key
+
+    def _require_state_contract(self, state: object) -> CumulantDiscoveryState:
+        if type(state) is not CumulantDiscoveryState:
+            raise ValueError("state must be an actual CumulantDiscoveryState")
+        canonical = state
+        matrix_shape = (self._n_candidates, self._raw_dim)
+        vector_shape = (self._n_candidates,)
+        for name in ("projections", "weights"):
+            leaf = getattr(canonical, name)
+            if leaf.shape != matrix_shape or leaf.dtype != jnp.float32:
+                raise ValueError(
+                    f"state.{name} must have shape {matrix_shape} and dtype float32"
+                )
+        for name in ("biases", "utility"):
+            leaf = getattr(canonical, name)
+            if leaf.shape != vector_shape or leaf.dtype != jnp.float32:
+                raise ValueError(
+                    f"state.{name} must have shape {vector_shape} and dtype float32"
+                )
+        if canonical.ages.shape != vector_shape or canonical.ages.dtype != jnp.int32:
+            raise ValueError(
+                f"state.ages must have shape {vector_shape} and dtype int32"
+            )
+        self._require_typed_key("state.key", canonical.key)
+        return canonical
+
+    def _require_observation(self, name: str, value: object) -> Array:
+        try:
+            observation = jnp.asarray(value)
+        except Exception as error:
+            raise ValueError(f"{name} must be a readable float32 vector") from error
+        if observation.shape != (self._raw_dim,) or observation.dtype != jnp.float32:
+            raise ValueError(
+                f"{name} must have shape ({self._raw_dim},) and dtype float32"
+            )
+        return observation
+
+    @staticmethod
+    def _state_values_valid(state: CumulantDiscoveryState) -> Array:
+        return (
+            jnp.all(jnp.isfinite(state.projections))
+            & jnp.all(jnp.isfinite(state.weights))
+            & jnp.all(jnp.isfinite(state.biases))
+            & jnp.all(jnp.isfinite(state.utility))
+            & jnp.all(state.utility >= 0.0)
+            & jnp.all(state.ages >= 0)
+        )
 
     @property
     def n_candidates(self) -> int:
@@ -175,9 +312,15 @@ class CumulantDiscovery:
     def enabled(self) -> bool:
         return self._enabled
 
+    @property
+    def persistent_resource_budget(self) -> dict[str, int]:
+        """Exact persistent JAX-array envelope."""
+        return _persistent_resources(self._raw_dim, self._n_candidates)
+
     def init(self, key: Array) -> CumulantDiscoveryState:
         """Initialize state with random projections, zero predictors,
         zero utility, zero ages."""
+        key = self._require_typed_key("key", key)
         k_proj, k_state = jr.split(key)
         # Unit-norm random projections
         raw_proj = jr.normal(
@@ -207,6 +350,8 @@ class CumulantDiscovery:
         ``s_t`` to ``s_{t+1}`` should use ``c_{t+1}``, so callers feeding a
         Horde should normally pass the *next* observation here.
         """
+        state = self._require_state_contract(state)
+        observation = self._require_observation("observation", observation)
         return state.projections @ observation
 
     @functools.partial(jax.jit, static_argnums=(0,))
@@ -238,6 +383,11 @@ class CumulantDiscovery:
         Returns:
             Updated discovery state
         """
+        state = self._require_state_contract(state)
+        observation = self._require_observation("observation", observation)
+        next_observation = self._require_observation(
+            "next_observation", next_observation
+        )
         alpha = jnp.asarray(self._predictor_step_size, dtype=jnp.float32)
         gamma = jnp.asarray(self._gamma, dtype=jnp.float32)
         decay = jnp.asarray(self._decay_rate, dtype=jnp.float32)
@@ -251,20 +401,34 @@ class CumulantDiscovery:
 
         # Predictor update (per-candidate semi-gradient TD step)
         # weights_i += alpha * td_i * obs
-        new_weights = state.weights + alpha * td[:, None] * observation[None, :]
-        new_biases = state.biases + alpha * td
-
-        # Utility EMA on squared surprise
-        new_utility = decay * state.utility + (1.0 - decay) * (td**2)
-        new_ages = state.ages + 1
-
-        return CumulantDiscoveryState(  # type: ignore[call-arg]
+        proposed_weights = state.weights + alpha * td[:, None] * observation[None, :]
+        proposed_biases = state.biases + alpha * td
+        proposed_utility = decay * state.utility + (1.0 - decay) * (td**2)
+        proposed_state = CumulantDiscoveryState(  # type: ignore[call-arg]
             projections=state.projections,
-            weights=new_weights,
-            biases=new_biases,
-            utility=new_utility,
-            ages=new_ages,
+            weights=proposed_weights,
+            biases=proposed_biases,
+            utility=proposed_utility,
+            ages=jnp.minimum(state.ages, jnp.asarray(_INT32_MAX - 1, dtype=jnp.int32)) + 1,
             key=state.key,
+        )
+        # Inf next obs makes 0 @ inf = NaN in V(s') at zero init, then
+        # alpha * nan * obs poisons every candidate. Hold the finite state.
+        inputs_valid = jnp.all(jnp.isfinite(observation)) & jnp.all(
+            jnp.isfinite(next_observation)
+        )
+        proposed_finite = (
+            jnp.all(jnp.isfinite(proposed_weights))
+            & jnp.all(jnp.isfinite(proposed_biases))
+            & jnp.all(jnp.isfinite(proposed_utility))
+        )
+        return cast(
+            CumulantDiscoveryState,
+            jax.lax.cond(
+                self._state_values_valid(state) & inputs_valid & proposed_finite,
+                lambda: proposed_state,
+                lambda: state,
+            ),
         )
 
     @functools.partial(jax.jit, static_argnums=(0,))
@@ -282,6 +446,7 @@ class CumulantDiscovery:
         Replacement: re-sample the projection row, zero the predictor
         weights/bias, reset utility to 0 and age to 0.
         """
+        state = self._require_state_contract(state)
         if not self._enabled:
             return state
 
@@ -332,13 +497,18 @@ class CumulantDiscovery:
             state.ages,
         )
 
-        return CumulantDiscoveryState(  # type: ignore[call-arg]
+        candidate = CumulantDiscoveryState(  # type: ignore[call-arg]
             projections=new_projections,
             weights=new_weights,
             biases=new_biases,
             utility=new_utility,
             ages=new_ages,
             key=k_next,
+        )
+        commit = self._state_values_valid(state) & self._state_values_valid(candidate)
+        return cast(
+            CumulantDiscoveryState,
+            jax.lax.cond(commit, lambda: candidate, lambda: state),
         )
 
     def to_config(self) -> dict[str, Any]:
@@ -356,8 +526,18 @@ class CumulantDiscovery:
         }
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> CumulantDiscovery:
+    def from_config(cls, config: Mapping[str, Any]) -> CumulantDiscovery:
         """Reconstruct from dict."""
-        config = dict(config)
-        config.pop("type", None)
-        return cls(**config)
+        if not issubclass(type(config), Mapping):
+            raise ValueError("config must be a mapping")
+        try:
+            payload = dict(config)
+        except Exception as error:
+            raise ValueError("config must be a readable mapping") from error
+        if any(type(key) is not str for key in payload):
+            raise ValueError("config keys must be strings")
+        payload.pop("type", None)
+        try:
+            return cls(**payload)
+        except TypeError as error:
+            raise ValueError("config has missing or unsupported fields") from error

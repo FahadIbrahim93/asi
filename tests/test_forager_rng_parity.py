@@ -15,6 +15,22 @@ import pytest
 from alberta_framework.benchmarks import forager_rng_parity as parity
 
 
+def test_key_frame_rejects_integer_subclasses_before_comparison_hooks() -> None:
+    class HostileInt(int):
+        def __lt__(self, other: object) -> bool:
+            raise AssertionError("hostile comparison must not run")
+
+        def __gt__(self, other: object) -> bool:
+            raise AssertionError("hostile comparison must not run")
+
+    with pytest.raises(parity.ForagerRngParityError, match=r"input_key\[0\]"):
+        parity.KeyFrame(
+            input_key=(HostileInt(0), 0),
+            next_key=(0, 0),
+            environment_key=(0, 0),
+        )
+
+
 def _runtime_identity() -> parity.VerifiedRuntimeIdentity:
     return parity.VerifiedRuntimeIdentity(
         required_oci_image_id=parity.REQUIRED_OCI_IMAGE_ID,
@@ -574,3 +590,31 @@ def test_result_round_trip_is_canonical_and_order_independent() -> None:
     parsed = parity.validate_parity_result(shuffled)
     assert parsed.canonical_bytes == parity.canonical_json_bytes(payload)
     assert parsed.payload_sha256 == payload["payload_sha256"]
+
+
+def test_key_frame_rejects_leftover_bool_identities() -> None:
+    """Public key-split records must not keep leftover bool-as-uint32 identities."""
+
+    with pytest.raises(parity.ForagerRngParityError, match="input_key"):
+        parity.KeyFrame((True, False), (0, 1), (2, 3))
+    with pytest.raises(parity.ForagerRngParityError, match="next_key"):
+        parity.KeyFrame((0, 1), (True, 0), (2, 3))
+    frame = parity.KeyFrame((0, 1), (2, 3), (4, 5))
+    dumped = json.dumps(frame.to_dict(), allow_nan=False)
+    assert '"input_key": [0, 1]' in dumped
+    assert "true" not in dumped
+
+
+def test_tree_digest_rejects_leftover_identities() -> None:
+    digest_a = hashlib.sha256(b"structure").hexdigest()
+    digest_b = hashlib.sha256(b"content").hexdigest()
+    with pytest.raises(parity.ForagerRngParityError, match="leaf_count"):
+        parity.TreeDigest(True, digest_a, digest_b)
+    with pytest.raises(parity.ForagerRngParityError, match="structure_sha256"):
+        parity.TreeDigest(1, "not-a-digest", digest_b)
+    with pytest.raises(parity.ForagerRngParityError, match="content_sha256"):
+        parity.TreeDigest(1, digest_a, float("nan"))  # type: ignore[arg-type]
+    digest = parity.TreeDigest(3, digest_a, digest_b)
+    dumped = json.dumps(digest.to_dict(), allow_nan=False)
+    assert '"leaf_count": 3' in dumped
+    assert '"leaf_count": true' not in dumped

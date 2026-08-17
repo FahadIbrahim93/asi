@@ -36,9 +36,11 @@ import functools
 import hashlib
 import json
 import math
+import operator
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
-from typing import Any, Literal, cast
+from numbers import Real
+from typing import Any, Literal, SupportsIndex, cast
 
 import chex
 import jax
@@ -47,6 +49,8 @@ import jax.random as jr
 import numpy as np
 import numpy.typing as npt
 from jax import Array
+
+from alberta_framework._float32 import round_real_to_float32
 
 DUAL_REPLAY_CONFIG_SCHEMA = "alberta.dual-replay.config.v1"
 DUAL_REPLAY_CHECKPOINT_SCHEMA = "alberta.dual-replay.checkpoint.v1"
@@ -60,6 +64,21 @@ LONG_TERM_STRATUM = 1
 
 _INT32_MAX = 2_147_483_647
 _UINT32_MAX = 4_294_967_295
+_ACTUAL_INT_TYPES = frozenset(
+    {
+        int,
+        np.int8,
+        np.int16,
+        np.int32,
+        np.int64,
+        np.uint8,
+        np.uint16,
+        np.uint32,
+        np.uint64,
+        np.longlong,
+        np.ulonglong,
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -104,6 +123,32 @@ class DualReplayConfig:
     aleatoric_downweight_scale: float = 1.0
     max_persistent_bytes: int | None = None
 
+    def __post_init__(self) -> None:
+        """Validate float32-consumed scalars in their sink domain and canonicalize them."""
+        for name in _POSITIVE_FLOAT32_FIELDS:
+            object.__setattr__(
+                self,
+                name,
+                _require_float32_real(name, getattr(self, name), strictly_positive=True),
+            )
+        object.__setattr__(
+            self,
+            "calibrated_priority_threshold",
+            _require_float32_real(
+                "calibrated_priority_threshold",
+                self.calibrated_priority_threshold,
+                strictly_positive=False,
+                maximum=1,
+            ),
+        )
+        for name in ("calibrated_replacement_margin", "max_aleatoric_uncertainty"):
+            object.__setattr__(
+                self,
+                name,
+                _require_float32_real(name, getattr(self, name), strictly_positive=False),
+            )
+        _validate_config(self)
+
     @property
     def long_term_capacity(self) -> int:
         """Number of long-term slots under the fixed total budget."""
@@ -126,6 +171,7 @@ class DualReplayConfig:
     @classmethod
     def from_config(cls, payload: Mapping[str, Any]) -> DualReplayConfig:
         """Reconstruct and validate an exact configuration payload."""
+        values = _copy_mapping(payload, name="dual replay config")
         expected = {
             "schema",
             "type",
@@ -141,20 +187,20 @@ class DualReplayConfig:
                 )
             ),
         }
-        if set(payload) != expected:
+        if set(values) != expected:
             raise ValueError("dual replay config fields do not match the v1 schema")
-        if payload.get("schema") != DUAL_REPLAY_CONFIG_SCHEMA:
+        if type(values["schema"]) is not str or values["schema"] != DUAL_REPLAY_CONFIG_SCHEMA:
             raise ValueError("unexpected dual replay config schema")
-        if payload.get("type") != "DualReplayConfig":
+        if type(values["type"]) is not str or values["type"] != "DualReplayConfig":
             raise ValueError("unexpected dual replay config type")
-        if payload.get("mechanism_status") != MECHANISM_STATUS:
+        if (
+            type(values["mechanism_status"]) is not str
+            or values["mechanism_status"] != MECHANISM_STATUS
+        ):
             raise ValueError("dual replay config must remain mechanism-only")
-        values = dict(payload)
         for name in ("schema", "type", "mechanism_status"):
             values.pop(name)
-        config = cls(**values)
-        _validate_config(config)
-        return config
+        return cls(**values)
 
 
 @chex.dataclass(frozen=True)
@@ -385,21 +431,110 @@ class DualReplayResourceAccounting:
     samples: Array
 
 
-def _validate_real(name: str, value: object) -> float:
-    if isinstance(value, bool) or not isinstance(value, int | float):
-        raise ValueError(f"{name} must be a real number")
-    result = float(value)
-    if not math.isfinite(result):
-        raise ValueError(f"{name} must be finite")
-    return result
+_POSITIVE_FLOAT32_FIELDS = (
+    "surprise_scale",
+    "coverage_scale",
+    "progress_scale",
+    "surprise_weight",
+    "coverage_weight",
+    "progress_weight",
+    "aleatoric_downweight_scale",
+)
 
 
-def _validate_positive_int(name: str, value: object) -> int:
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise ValueError(f"{name} must be an integer")
-    if value < 1:
-        raise ValueError(f"{name} must be positive")
-    return value
+def _require_float32_real(
+    name: str,
+    value: object,
+    *,
+    strictly_positive: bool,
+    maximum: int | None = None,
+) -> float:
+    """Validate one host scalar in its exact domain and its float32 sink.
+
+    Zero is only admitted where the exact domain allows it; a nonzero value
+    that narrows to zero, or a finite value that narrows to infinity, is
+    rejected because the compiled sink would silently run a different rule.
+    Built-in payloads that already narrow exactly are preserved for
+    serialization; other reals are canonicalized to the exact sink value.
+    """
+    domain = "positive" if strictly_positive else "non-negative"
+    if maximum is not None:
+        domain = f"{domain} and at most {maximum}"
+    preserve_builtin_payload = type(value) is int or type(value) is float
+    actual_type = type(value)
+    if issubclass(actual_type, bool | np.bool_) or not issubclass(actual_type, Real):
+        raise ValueError(f"{name} must be finite and {domain}")
+    real_value = cast(Any, value)
+
+    def in_domain(candidate: Any) -> bool:
+        if strictly_positive:
+            if not candidate > 0:
+                return False
+        elif not candidate >= 0:
+            return False
+        return maximum is None or bool(candidate <= maximum)
+
+    try:
+        if not in_domain(real_value):
+            raise ValueError
+        narrowed = round_real_to_float32(real_value)
+    except Exception as error:
+        raise ValueError(f"{name} must be finite and {domain}") from error
+    if not math.isfinite(narrowed):
+        raise ValueError(f"{name} must narrow to a finite float32")
+    try:
+        exact_nonzero = bool(real_value != 0)
+    except Exception as error:
+        raise ValueError(f"{name} must be finite and {domain}") from error
+    if exact_nonzero and narrowed == 0.0:
+        raise ValueError(f"{name} must not underflow to zero in float32")
+    if not in_domain(narrowed):
+        raise ValueError(f"{name} must remain {domain} once narrowed to float32")
+    if not preserve_builtin_payload:
+        return narrowed
+    number = float(real_value)
+    with np.errstate(invalid="ignore", over="ignore", under="ignore"):
+        renarrowed = float(np.float32(number))
+    return cast(float, value) if narrowed == renarrowed else narrowed
+
+
+def _validate_positive_int(
+    name: str,
+    value: object,
+    *,
+    minimum: int = 1,
+    maximum: int = _INT32_MAX,
+) -> int:
+    if type(value) not in _ACTUAL_INT_TYPES:
+        raise ValueError(f"{name} must be an integer in [{minimum}, {maximum}]")
+    canonical = operator.index(cast(SupportsIndex, value))
+    if not minimum <= canonical <= maximum:
+        raise ValueError(f"{name} must be an integer in [{minimum}, {maximum}]")
+    return canonical
+
+
+def _copy_mapping(payload: object, *, name: str) -> dict[str, Any]:
+    """Copy one supported mapping while normalizing hostile hooks."""
+    if not issubclass(type(payload), Mapping):
+        raise ValueError(f"{name} must be a mapping")
+    try:
+        return dict(cast(Mapping[str, Any], payload))
+    except Exception as error:
+        raise ValueError(f"{name} must be a readable mapping") from error
+
+
+def _allocation_sizes(config: DualReplayConfig) -> tuple[int, int]:
+    """Return exact slot and persistent bytes without allocating JAX arrays."""
+    slot_bytes = 4 * (2 * config.observation_dim + config.action_dim + 14) + 11
+    persistent_bytes = config.total_capacity * slot_bytes + 60
+    if persistent_bytes > _UINT32_MAX:
+        raise ValueError("dual replay allocation exceeds uint32 byte accounting")
+    if (
+        config.max_persistent_bytes is not None
+        and persistent_bytes > config.max_persistent_bytes
+    ):
+        raise ValueError("dual replay allocation exceeds max_persistent_bytes")
+    return slot_bytes, persistent_bytes
 
 
 def _validate_config(config: DualReplayConfig) -> None:
@@ -411,57 +546,54 @@ def _validate_config(config: DualReplayConfig) -> None:
         "short_term_sample_size",
         "long_term_sample_size",
     ):
-        _validate_positive_int(name, getattr(config, name))
-    if config.total_capacity > _INT32_MAX:
-        raise ValueError("total_capacity exceeds int32 indexing")
+        canonical = _validate_positive_int(name, getattr(config, name))
+        object.__setattr__(config, name, canonical)
     if config.short_term_capacity >= config.total_capacity:
         raise ValueError("short_term_capacity must leave at least one long-term slot")
     if config.short_term_sample_size > config.short_term_capacity:
         raise ValueError("short_term_sample_size exceeds short-term capacity")
     if config.long_term_sample_size > config.long_term_capacity:
         raise ValueError("long_term_sample_size exceeds long-term capacity")
-    if config.long_term_policy not in {"reservoir", "calibrated"}:
+    if type(config.long_term_policy) is not str or config.long_term_policy not in {
+        "reservoir",
+        "calibrated",
+    }:
         raise ValueError("long_term_policy must be 'reservoir' or 'calibrated'")
-    if config.aleatoric_control not in {"veto", "downweight"}:
+    if type(config.aleatoric_control) is not str or config.aleatoric_control not in {
+        "veto",
+        "downweight",
+    }:
         raise ValueError("aleatoric_control must be 'veto' or 'downweight'")
-    if isinstance(config.max_representation_lag, bool) or not isinstance(
-        config.max_representation_lag, int
-    ):
-        raise ValueError("max_representation_lag must be an integer")
-    if config.max_representation_lag < 0:
-        raise ValueError("max_representation_lag must be non-negative")
+    object.__setattr__(
+        config,
+        "max_representation_lag",
+        _validate_positive_int(
+            "max_representation_lag", config.max_representation_lag, minimum=0
+        ),
+    )
 
-    positive = (
-        "surprise_scale",
-        "coverage_scale",
-        "progress_scale",
-        "surprise_weight",
-        "coverage_weight",
-        "progress_weight",
-        "aleatoric_downweight_scale",
-    )
-    for name in positive:
-        if _validate_real(name, getattr(config, name)) <= 0.0:
-            raise ValueError(f"{name} must be positive")
-    threshold = _validate_real(
-        "calibrated_priority_threshold", config.calibrated_priority_threshold
-    )
-    if not 0.0 <= threshold <= 1.0:
-        raise ValueError("calibrated_priority_threshold must be in [0, 1]")
-    margin = _validate_real(
-        "calibrated_replacement_margin", config.calibrated_replacement_margin
-    )
-    if margin < 0.0:
-        raise ValueError("calibrated_replacement_margin must be non-negative")
-    maximum = _validate_real(
-        "max_aleatoric_uncertainty", config.max_aleatoric_uncertainty
-    )
-    if maximum < 0.0:
-        raise ValueError("max_aleatoric_uncertainty must be non-negative")
+    with np.errstate(over="ignore"):
+        weight_sum = float(
+            np.float32(config.surprise_weight)
+            + np.float32(config.coverage_weight)
+            + np.float32(config.progress_weight)
+        )
+    if not math.isfinite(weight_sum):
+        raise ValueError(
+            "surprise_weight, coverage_weight, and progress_weight must have a "
+            "finite float32 sum"
+        )
     if config.max_persistent_bytes is not None:
-        _validate_positive_int("max_persistent_bytes", config.max_persistent_bytes)
-        if config.max_persistent_bytes > _UINT32_MAX:
-            raise ValueError("max_persistent_bytes exceeds uint32 accounting")
+        object.__setattr__(
+            config,
+            "max_persistent_bytes",
+            _validate_positive_int(
+                "max_persistent_bytes",
+                config.max_persistent_bytes,
+                maximum=_UINT32_MAX,
+            ),
+        )
+    _allocation_sizes(config)
 
 
 def _require_array(
@@ -602,15 +734,10 @@ class DualReplayMemory:
     def __init__(self, config: DualReplayConfig):
         _validate_config(config)
         self._config = config
+        slot_bytes, persistent_bytes = _allocation_sizes(config)
         initial = self._make_initial_state(jnp.zeros((2,), dtype=jnp.uint32), 0)
-        persistent_bytes = _tree_nbytes(initial)
-        if persistent_bytes > _UINT32_MAX:
-            raise ValueError("dual replay allocation exceeds uint32 byte accounting")
-        if (
-            config.max_persistent_bytes is not None
-            and persistent_bytes > config.max_persistent_bytes
-        ):
-            raise ValueError("dual replay allocation exceeds max_persistent_bytes")
+        if _tree_nbytes(initial) != persistent_bytes:
+            raise RuntimeError("dual replay allocation formula disagrees with allocated state")
         short_bytes = _tree_nbytes(initial.short_term)
         long_bytes = _tree_nbytes(initial.long_term)
         short_slot_bytes = short_bytes // config.short_term_capacity
@@ -618,7 +745,9 @@ class DualReplayMemory:
         if short_slot_bytes != long_slot_bytes:
             raise RuntimeError("replay strata disagree on fixed slot bytes")
         self._persistent_bytes = persistent_bytes
-        self._slot_bytes = short_slot_bytes
+        if short_slot_bytes != slot_bytes:
+            raise RuntimeError("dual replay slot formula disagrees with allocated state")
+        self._slot_bytes = slot_bytes
 
     @property
     def config(self) -> DualReplayConfig:
@@ -647,19 +776,21 @@ class DualReplayMemory:
     @classmethod
     def from_config(cls, payload: Mapping[str, Any]) -> DualReplayMemory:
         """Reconstruct a memory from :meth:`to_config`."""
+        values = _copy_mapping(payload, name="dual replay memory config")
         expected = {"schema", "type", "mechanism_status", "config"}
-        if set(payload) != expected:
+        if set(values) != expected:
             raise ValueError("dual replay memory config fields do not match the v1 schema")
-        if payload.get("schema") != DUAL_REPLAY_CONFIG_SCHEMA:
+        if type(values["schema"]) is not str or values["schema"] != DUAL_REPLAY_CONFIG_SCHEMA:
             raise ValueError("unexpected dual replay memory schema")
-        if payload.get("type") != "DualReplayMemory":
+        if type(values["type"]) is not str or values["type"] != "DualReplayMemory":
             raise ValueError("unexpected dual replay memory type")
-        if payload.get("mechanism_status") != MECHANISM_STATUS:
+        if (
+            type(values["mechanism_status"]) is not str
+            or values["mechanism_status"] != MECHANISM_STATUS
+        ):
             raise ValueError("dual replay memory must remain mechanism-only")
-        inner = payload.get("config")
-        if not isinstance(inner, Mapping):
-            raise ValueError("dual replay memory config must be a mapping")
-        return cls(DualReplayConfig.from_config(inner))
+        inner = values["config"]
+        return cls(DualReplayConfig.from_config(cast(Mapping[str, Any], inner)))
 
     @staticmethod
     def _empty_entries(capacity: int, observation_dim: int, action_dim: int) -> ReplayEntries:
@@ -1354,15 +1485,16 @@ class DualReplayMemory:
             jnp.clip(nearest / jnp.asarray(cfg.coverage_scale, dtype=jnp.float32), 0.0, 1.0),
             jnp.asarray(1.0, dtype=jnp.float32),
         )
-        weight_sum = jnp.asarray(
-            cfg.surprise_weight + cfg.coverage_weight + cfg.progress_weight,
-            dtype=jnp.float32,
+        surprise_weight = jnp.asarray(cfg.surprise_weight, dtype=jnp.float32)
+        coverage_weight = jnp.asarray(cfg.coverage_weight, dtype=jnp.float32)
+        progress_weight = jnp.asarray(cfg.progress_weight, dtype=jnp.float32)
+        weight_sum = surprise_weight + coverage_weight + progress_weight
+        raw_priority = jnp.clip(
+            (surprise_weight * surprise + coverage_weight * coverage + progress_weight * progress)
+            / weight_sum,
+            0.0,
+            1.0,
         )
-        raw_priority = (
-            jnp.asarray(cfg.surprise_weight, dtype=jnp.float32) * surprise
-            + jnp.asarray(cfg.coverage_weight, dtype=jnp.float32) * coverage
-            + jnp.asarray(cfg.progress_weight, dtype=jnp.float32) * progress
-        ) / weight_sum
         components_available = (
             transition.epistemic_surprise_available
             & transition.learning_progress_available
@@ -1498,7 +1630,7 @@ class DualReplayMemory:
             coverage_component = jnp.asarray(0.0, dtype=jnp.float32)
             progress_component = jnp.asarray(0.0, dtype=jnp.float32)
             aleatoric_passed = jnp.asarray(False)
-            aleatoric_available = transition.aleatoric_uncertainty_available
+            aleatoric_available = jnp.asarray(False)
             next_key, draw_key = jr.split(_key_from_data(state.rng_key_data))
             selection = reservoir_selection(draw_key, candidate_number, cfg.long_term_capacity)
             wrote_long = selection.selected

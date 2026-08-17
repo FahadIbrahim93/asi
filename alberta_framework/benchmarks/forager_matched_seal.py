@@ -20,11 +20,12 @@ import ctypes
 import errno
 import hashlib
 import json
+import math
 import os
 import re
 import secrets
 import stat
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
@@ -116,16 +117,22 @@ class _OpenDirectory:
 
 
 def _plain(value: Any) -> Any:
-    if isinstance(value, Mapping):
+    if type(value) in (dict, MappingProxyType):
         result: dict[str, Any] = {}
         for key, item in value.items():
             if type(key) is not str:
                 raise ForagerMatchedSealError("canonical mappings require string keys")
             result[key] = _plain(item)
         return result
-    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+    if type(value) in (list, tuple):
         return [_plain(item) for item in value]
-    if value is None or type(value) in {str, bool, int, float}:
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise ForagerMatchedSealError(
+                "canonical content contains a non-finite JSON number"
+            )
+        return value
+    if value is None or type(value) in {str, bool, int}:
         return value
     raise ForagerMatchedSealError(
         f"canonical content contains unsupported {type(value).__name__}"
@@ -205,6 +212,13 @@ def _reject_nonfinite(value: str) -> NoReturn:
     raise ForagerMatchedSealError(f"non-finite JSON number {value!r} is forbidden")
 
 
+def _parse_finite_json_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ForagerMatchedSealError(f"non-finite JSON number {value!r} is forbidden")
+    return parsed
+
+
 def _validate_json_complexity(value: Any, label: str) -> None:
     pending: list[tuple[Any, int]] = [(value, 0)]
     nodes = 0
@@ -232,6 +246,7 @@ def _decode_canonical(raw: bytes, label: str) -> dict[str, Any]:
             raw.decode("utf-8"),
             object_pairs_hook=_reject_duplicate_keys,
             parse_constant=_reject_nonfinite,
+            parse_float=_parse_finite_json_float,
         )
     except ForagerMatchedSealError:
         raise
@@ -586,6 +601,7 @@ def _validate_execution_plan_snapshot(
         _require_int(item, "execution plan seed")
         for item in _require_array(value["active_seeds"], "execution plan active seeds")
     )
+    horizon = _require_int(value["horizon"], "execution plan horizon", minimum=1)
     candidate_order = tuple(
         _require_identifier(item, "execution plan candidate")
         for item in _require_array(value["candidate_order"], "execution plan candidate order")
@@ -607,7 +623,7 @@ def _validate_execution_plan_snapshot(
         value["protocol_sha256"] != open_protocol.protocol_sha256
         or qualification_digest != scores.qualification_manifest_sha256
         or active_seeds != open_protocol.active_seeds
-        or value["horizon"] != open_protocol.horizon
+        or horizon != open_protocol.horizon
         or candidate_order
         != tuple(item.candidate_id for item in scores.candidate_scores)
         or _canonical_sha256(source_manifest) != source_digest

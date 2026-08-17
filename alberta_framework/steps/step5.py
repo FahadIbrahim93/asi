@@ -24,17 +24,90 @@ References:
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from numbers import Integral
 from typing import Any, cast
 
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 
+from alberta_framework._seed_validation import require_jax_seed
 from alberta_framework.core.average_reward import (
     DifferentialTDArrayResult,
     DifferentialTDConfig,
     DifferentialTDLearner,
     run_differential_td_from_arrays,
 )
+from alberta_framework.steps._float32_validation import finite_real_and_float32
+from alberta_framework.steps._smoke_record_validation import require_step_shape
+
+_STEP5_CONFIG_KEYS = frozenset(
+    {"step_size", "average_reward_step_size", "trace_decay"}
+)
+_STEP5_CONFIG_KEYS_ERROR = (
+    "Step5AverageRewardTDConfig payload keys must be exactly "
+    "['average_reward_step_size', 'step_size', 'trace_decay']"
+)
+_INT32_MAX = 2**31 - 1
+_NUMPY_INTEGER_TYPES = (
+    np.byte,
+    np.short,
+    np.intc,
+    np.int_,
+    np.longlong,
+    np.ubyte,
+    np.ushort,
+    np.uintc,
+    np.uint,
+    np.ulonglong,
+)
+
+
+def _require_int(
+    name: str,
+    value: object,
+    *,
+    minimum: int | None = None,
+    maximum: int | None = None,
+) -> int:
+    """Reject non-integers (including bool and class-spoofed actual types)."""
+    actual_type = type(value)
+    if actual_type is int:
+        number = cast(int, value)
+    elif actual_type in _NUMPY_INTEGER_TYPES:
+        number = int(cast(Integral, value))
+    else:
+        raise ValueError(f"{name} must be an integer, got {value!r}")
+    if minimum is not None and number < minimum:
+        if minimum == 1:
+            raise ValueError(f"{name} must be positive, got {value!r}")
+        if minimum == 0:
+            raise ValueError(f"{name} must be non-negative, got {value!r}")
+        raise ValueError(f"{name} must be >= {minimum}, got {value!r}")
+    if maximum is not None and number > maximum:
+        raise ValueError(f"{name} must be <= {maximum}, got {value!r}")
+    return number
+
+
+def _require_bool(name: str, value: object) -> bool:
+    if type(value) is not bool:
+        raise ValueError(f"{name} must be a boolean, got {value!r}")
+    return value
+
+
+def _finite_float32_scalar(name: str, value: object) -> tuple[int, int, float]:
+    """Validate a real scalar and retain the exact ratio used for rounding."""
+    _, numerator, denominator, narrowed = finite_real_and_float32(name, value)
+    return numerator, denominator, narrowed
+
+
+def _compatible_float32_storage(value: object, narrowed: float) -> float:
+    """Preserve a builtin payload only when its eventual sink is proved equal."""
+    if type(value) is float:
+        return value
+    if type(value) is int and value == narrowed:
+        return value
+    return narrowed
 
 
 @dataclass(frozen=True)
@@ -45,6 +118,55 @@ class Step5AverageRewardTDConfig:
     average_reward_step_size: float = 0.01
     trace_decay: float = 0.0
 
+    def __post_init__(self) -> None:
+        """Reject malformed scientific scalars before JAX execution."""
+        step_numerator, _, step_size = _finite_float32_scalar(
+            "step_size",
+            self.step_size,
+        )
+        average_numerator, _, average_reward_step_size = _finite_float32_scalar(
+            "average_reward_step_size", self.average_reward_step_size
+        )
+        trace_numerator, trace_denominator, trace_decay = _finite_float32_scalar(
+            "trace_decay",
+            self.trace_decay,
+        )
+        if self.step_size < 0.0 or step_numerator < 0 or step_size < 0.0:
+            raise ValueError("step_size must be non-negative")
+        if (
+            self.average_reward_step_size < 0.0
+            or average_numerator < 0
+            or average_reward_step_size < 0.0
+        ):
+            raise ValueError("average_reward_step_size must be non-negative")
+        if (
+            not 0.0 <= self.trace_decay <= 1.0
+            or trace_numerator < 0
+            or trace_numerator > trace_denominator
+            or not 0.0 <= trace_decay <= 1.0
+        ):
+            raise ValueError("trace_decay must be in [0, 1]")
+        # Preserve builtin floats and sink-exact builtin integers. Other Reals
+        # need the already-rounded value so the JAX sink cannot double-round.
+        object.__setattr__(
+            self,
+            "step_size",
+            _compatible_float32_storage(self.step_size, step_size),
+        )
+        object.__setattr__(
+            self,
+            "average_reward_step_size",
+            _compatible_float32_storage(
+                self.average_reward_step_size,
+                average_reward_step_size,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "trace_decay",
+            _compatible_float32_storage(self.trace_decay, trace_decay),
+        )
+
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-serializable representation."""
         return asdict(self)
@@ -52,6 +174,8 @@ class Step5AverageRewardTDConfig:
     @classmethod
     def from_dict(cls, payload: dict[str, object]) -> Step5AverageRewardTDConfig:
         """Reconstruct from :meth:`to_dict` output."""
+        if set(payload) != _STEP5_CONFIG_KEYS:
+            raise ValueError(_STEP5_CONFIG_KEYS_ERROR)
         return cls(**cast(Any, payload))
 
     def to_core_config(self) -> DifferentialTDConfig:
@@ -75,6 +199,23 @@ class Step5SmokeResult:
     average_rewards_shape: tuple[int, ...]
     finite: bool
     learner_config: dict[str, Any]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "steps", _require_int("steps", self.steps, minimum=1, maximum=_INT32_MAX)
+        )
+        object.__setattr__(self, "seed", require_jax_seed(self.seed, name="seed"))
+        for name in (
+            "predictions_shape",
+            "td_errors_shape",
+            "average_rewards_shape",
+        ):
+            object.__setattr__(
+                self,
+                name,
+                require_step_shape(name, getattr(self, name), steps=self.steps),
+            )
+        object.__setattr__(self, "finite", _require_bool("finite", self.finite))
 
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-serializable representation."""
@@ -119,10 +260,9 @@ def run_step5_smoke(
     seed: int = 0,
 ) -> Step5SmokeResult:
     """Run a tiny deterministic Step 5 integration probe."""
-    if steps < 1:
-        raise ValueError("steps must be positive")
-    if feature_dim < 1:
-        raise ValueError("feature_dim must be positive")
+    steps = _require_int("steps", steps, minimum=1, maximum=_INT32_MAX)
+    feature_dim = _require_int("feature_dim", feature_dim, minimum=1, maximum=_INT32_MAX)
+    seed = _require_int("seed", seed, minimum=0, maximum=_INT32_MAX)
 
     cfg = config or Step5AverageRewardTDConfig()
     learner = make_step5_td_learner(cfg)
@@ -145,6 +285,7 @@ def run_step5_smoke(
         jnp.all(jnp.isfinite(result.predictions))
         & jnp.all(jnp.isfinite(result.td_errors))
         & jnp.all(jnp.isfinite(result.average_rewards))
+        & jnp.all(result.updates_applied)
     )
     return Step5SmokeResult(
         config=cfg,

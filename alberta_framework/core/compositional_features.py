@@ -21,18 +21,25 @@ under JIT compilation.
 """
 
 import functools
+import inspect
 import math
+import operator
 import time
-from typing import Any
+from collections.abc import Mapping
+from typing import Any, SupportsIndex, cast, get_args, get_type_hints
 
 import chex
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 from jax import Array
 from jaxtyping import Bool, Float, Int, PRNGKeyArray
 
+from alberta_framework.core._float32_scalars import validated_float32_scalar_with_ratio
 from alberta_framework.core.future_utility import (
+    bias_correct_future_utility,
+    canonical_float32_ema_decay,
     contribution_trace_output_loss_reduction,
     normalize_future_utility_signal,
     trace_output_loss_reduction,
@@ -41,6 +48,129 @@ from alberta_framework.core.resource_manager import (
     GeneratorMetaResourceManager,
     GeneratorMetaResourceManagerState,
 )
+from alberta_framework.core.update_safety import (
+    floating_tree_is_finite,
+    neutralize_array,
+    select_transaction,
+)
+
+_INT32_MAX = 2**31 - 1
+_ACTUAL_INT_TYPES = frozenset(
+    {
+        int,
+        np.int8,
+        np.int16,
+        np.int32,
+        np.int64,
+        np.uint8,
+        np.uint16,
+        np.uint32,
+        np.uint64,
+        np.longlong,
+        np.ulonglong,
+    }
+)
+_ACTUAL_REAL_TYPES = frozenset(
+    (*_ACTUAL_INT_TYPES, float, np.float16, np.float32, np.float64, np.longdouble)
+)
+
+
+def _require_int32(name: str, value: object, *, minimum: int, maximum: int = _INT32_MAX) -> int:
+    if type(value) not in _ACTUAL_INT_TYPES:
+        raise ValueError(f"{name} must be an integer in [{minimum}, {maximum}]")
+    canonical = operator.index(cast(SupportsIndex, value))
+    if not minimum <= canonical <= maximum:
+        raise ValueError(f"{name} must be an integer in [{minimum}, {maximum}]")
+    return canonical
+
+
+def _require_choice(name: str, value: object, choices: frozenset[str]) -> str:
+    if type(value) is not str or value not in choices:
+        raise ValueError(f"{name} is unsupported")
+    return value
+
+
+def _validated_float32_scalar(
+    name: str,
+    value: object,
+    *,
+    positive: bool = False,
+    lower: float | None = None,
+    upper: float | None = None,
+    upper_inclusive: bool = True,
+) -> float:
+    """Validate one float32 sink without silently erasing a nonzero value."""
+    if type(value) not in _ACTUAL_REAL_TYPES:
+        raise ValueError(f"{name} must be a finite real number")
+    stored, numerator, denominator = validated_float32_scalar_with_ratio(
+        name,
+        value,
+        positive=positive,
+        lower=lower,
+        upper=upper,
+        upper_inclusive=upper_inclusive,
+    )
+    if numerator != 0 and abs(numerator) * (1 << 150) <= denominator:
+        raise ValueError(f"{name} must remain nonzero once narrowed to float32")
+    return stored
+
+
+def _selector_state_nbytes(n_candidates: int) -> int:
+    return 12 * n_candidates + 4
+
+
+def _require_resource(name: str, *, scalars: int, nbytes: int) -> None:
+    if scalars > _INT32_MAX:
+        raise ValueError(f"{name} scalar count must fit signed int32")
+    if nbytes > _INT32_MAX:
+        raise ValueError(f"{name} byte count must fit signed int32")
+
+
+def _saturating_int32_increment(value: Array) -> Array:
+    one = jnp.asarray(1, dtype=jnp.int32)
+    return jnp.minimum(value, jnp.asarray(_INT32_MAX - 1, dtype=jnp.int32)) + one
+
+
+def _compositional_state_nbytes(
+    n_features: int,
+    n_tasks: int,
+    candidate_count: int,
+    generator_resource_contexts: int,
+) -> int:
+    """Return exact initialized persistent JAX-array bytes without allocation."""
+    return (
+        20
+        + 48 * generator_resource_contexts
+        + 56 * n_features
+        + 12 * n_tasks
+        + 68 * candidate_count
+        + 12 * n_features * n_tasks
+        + 12 * n_tasks * candidate_count
+        + 4 * n_features * candidate_count
+    )
+
+
+def _require_serialized_scalars(payload: Mapping[str, Any], owner: type[Any]) -> None:
+    annotations = get_type_hints(owner.__init__)
+    for name, parameter in inspect.signature(owner).parameters.items():
+        if name not in payload or payload[name] is None:
+            continue
+        annotation = annotations.get(name, parameter.annotation)
+        union_args = get_args(annotation)
+        if type(None) in union_args:
+            annotation = next(item for item in union_args if item is not type(None))
+        expected: type | None = None
+        if annotation is int:
+            expected = int
+        elif annotation is float:
+            expected = float
+        elif annotation is bool:
+            expected = bool
+        elif annotation is str:
+            expected = str
+        if expected is not None and type(payload[name]) is not expected:
+            raise ValueError(f"serialized {name} must be a JSON {expected.__name__}")
+
 
 OP_RAW = 0
 OP_PRODUCT = 1
@@ -252,7 +382,7 @@ class CompositionalFeatureState:
     candidate_ages: Int[Array, " n_candidates"]
     candidate_selector_log_weights: Float[Array, " n_candidates"]
     candidate_selector_cumulative_loss: Float[Array, " n_candidates"]
-    candidate_selector_action_counts: Float[Array, " n_candidates"]
+    candidate_selector_action_counts: Int[Array, " n_candidates"]
     feature_generator_policy: Int[Array, " n_features"]
     candidate_generator_policy: Int[Array, " n_candidates"]
     generator_resource_state: GeneratorMetaResourceManagerState
@@ -356,6 +486,7 @@ class CompositionalFeatureUpdateResult:
     replaced_slot: Int[Array, ""]
     promoted_candidate: Int[Array, ""]
     curation_trace: CompositionalCurationTrace
+    update_applied: Bool[Array, ""]
 
 
 @chex.dataclass(frozen=True)
@@ -364,6 +495,7 @@ class CompositionalFeatureLearningResult:
 
     state: CompositionalFeatureState
     metrics: Float[Array, "num_steps 7"]
+    updates_applied: Bool[Array, " num_steps"]
 
 
 @chex.dataclass(frozen=True)
@@ -377,7 +509,7 @@ class FiniteCandidateSelectorState:
 
     log_weights: Float[Array, " n_candidates"]
     cumulative_loss: Float[Array, " n_candidates"]
-    action_counts: Float[Array, " n_candidates"]
+    action_counts: Int[Array, " n_candidates"]
     step_count: Int[Array, ""]
 
 
@@ -421,24 +553,50 @@ class FiniteCandidateSelector:
             update_rule: ``"hedge"`` for full-information losses, or
                 ``"exp3"`` for selected-action importance-weighted updates.
         """
-        if n_candidates < 1:
-            raise ValueError("n_candidates must be positive")
-        if learning_rate <= 0.0:
-            raise ValueError("learning_rate must be positive")
-        if not 0.0 <= exploration < 1.0:
-            raise ValueError("exploration must be in [0, 1)")
+        n_candidates = _require_int32("n_candidates", n_candidates, minimum=1)
+        if _selector_state_nbytes(n_candidates) > _INT32_MAX:
+            raise ValueError("finite candidate selector state bytes must fit signed int32")
+        learning_rate = _validated_float32_scalar(
+            "learning_rate", learning_rate, positive=True
+        )
+        exploration = _validated_float32_scalar(
+            "exploration", exploration, lower=0.0, upper=1.0, upper_inclusive=False
+        )
+        loss_lower_bound = _validated_float32_scalar("loss_lower_bound", loss_lower_bound)
+        loss_upper_bound = _validated_float32_scalar("loss_upper_bound", loss_upper_bound)
         if loss_lower_bound >= loss_upper_bound:
             raise ValueError("loss_lower_bound must be < loss_upper_bound")
-        if update_rule not in {CANDIDATE_SELECTOR_HEDGE, CANDIDATE_SELECTOR_EXP3}:
-            raise ValueError("update_rule must be 'hedge' or 'exp3'")
+        loss_width = loss_upper_bound - loss_lower_bound
+        if not float(np.finfo(np.float32).tiny) <= loss_width <= float(
+            np.finfo(np.float32).max
+        ):
+            raise ValueError("loss bounds must have a finite normal float32 width")
+        update_rule = _require_choice(
+            "update_rule",
+            update_rule,
+            frozenset({CANDIDATE_SELECTOR_HEDGE, CANDIDATE_SELECTOR_EXP3}),
+        )
         if update_rule == CANDIDATE_SELECTOR_EXP3 and exploration <= 0.0:
             raise ValueError("exp3 selector requires positive exploration")
+        if update_rule == CANDIDATE_SELECTOR_EXP3:
+            minimum_probability = float(
+                np.float32(exploration) * np.float32(1.0 / n_candidates)
+            )
+            if minimum_probability == 0.0:
+                raise ValueError(
+                    "exp3 exploration must provide nonzero float32 mass to every candidate"
+                )
+            if learning_rate / minimum_probability > float(np.finfo(np.float32).max):
+                raise ValueError(
+                    "exp3 learning_rate / minimum probability must remain finite in float32"
+                )
 
-        self._n_candidates = int(n_candidates)
-        self._learning_rate = float(learning_rate)
-        self._exploration = float(exploration)
-        self._loss_lower_bound = float(loss_lower_bound)
-        self._loss_upper_bound = float(loss_upper_bound)
+        self._n_candidates = n_candidates
+        self._learning_rate = learning_rate
+        self._exploration = exploration
+        self._loss_lower_bound = loss_lower_bound
+        self._loss_upper_bound = loss_upper_bound
+        self._loss_width = float(np.float32(loss_width))
         self._update_rule = update_rule
 
     @property
@@ -464,18 +622,27 @@ class FiniteCandidateSelector:
         }
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> "FiniteCandidateSelector":
+    def from_config(cls, config: Mapping[str, Any]) -> "FiniteCandidateSelector":
         """Reconstruct a selector from :meth:`to_config` output."""
-        config = dict(config)
-        config.pop("type", None)
-        return cls(**config)
+        if not issubclass(type(config), Mapping):
+            raise ValueError("finite candidate selector config must be a mapping")
+        try:
+            payload = dict(config)
+        except Exception as error:
+            raise ValueError("finite candidate selector config could not be read") from error
+        if payload.pop("type", None) != "FiniteCandidateSelector":
+            raise ValueError("finite candidate selector config type is invalid")
+        if set(payload) != set(inspect.signature(cls).parameters):
+            raise ValueError("finite candidate selector fields do not match its schema")
+        _require_serialized_scalars(payload, cls)
+        return cls(**payload)
 
     def init(self) -> FiniteCandidateSelectorState:
         """Create a uniform selector state."""
         return FiniteCandidateSelectorState(
             log_weights=jnp.zeros(self._n_candidates, dtype=jnp.float32),
             cumulative_loss=jnp.zeros(self._n_candidates, dtype=jnp.float32),
-            action_counts=jnp.zeros(self._n_candidates, dtype=jnp.float32),
+            action_counts=jnp.zeros(self._n_candidates, dtype=jnp.int32),
             step_count=jnp.array(0, dtype=jnp.int32),
         )
 
@@ -484,6 +651,7 @@ class FiniteCandidateSelector:
         state: FiniteCandidateSelectorState,
     ) -> Float[Array, " n_candidates"]:
         """Return the current candidate probabilities."""
+        self._validate_state_static_contract(state)
         logits = state.log_weights - jnp.max(state.log_weights)
         weights = jax.nn.softmax(logits)
         if self._exploration > 0.0:
@@ -493,11 +661,10 @@ class FiniteCandidateSelector:
 
     def validate_bounded_losses(self, losses: Array) -> None:
         """Raise if finite losses violate the selector's theorem range."""
-        losses = jnp.asarray(losses, dtype=jnp.float32)
+        self._validate_losses_static_contract(losses)
+        losses = jnp.asarray(losses)
         finite = jnp.isfinite(losses)
-        outside = finite & (
-            (losses < self._loss_lower_bound) | (losses > self._loss_upper_bound)
-        )
+        outside = finite & ((losses < self._loss_lower_bound) | (losses > self._loss_upper_bound))
         if bool(jnp.any(outside)):
             raise ValueError(
                 "finite-candidate selector assumes finite losses in "
@@ -507,10 +674,7 @@ class FiniteCandidateSelector:
     def _unit_losses(self, losses: Array) -> Array:
         losses = jnp.asarray(losses, dtype=jnp.float32)
         finite = jnp.isfinite(losses)
-        width = jnp.asarray(
-            self._loss_upper_bound - self._loss_lower_bound,
-            dtype=jnp.float32,
-        )
+        width = jnp.asarray(self._loss_width, dtype=jnp.float32)
         unit = (losses - self._loss_lower_bound) / width
         unit = jnp.clip(unit, 0.0, 1.0)
         return jnp.where(finite, unit, jnp.nan)
@@ -525,30 +689,46 @@ class FiniteCandidateSelector:
 
         ``NaN`` losses are ignored.  For ``update_rule="hedge"``, all finite
         losses are observed.  For ``update_rule="exp3"``, only
-        ``selected_action`` receives an importance-weighted update.
+        ``selected_action`` receives an importance-weighted update and the
+        caller must provide that action explicitly.
         """
+        self._validate_state_static_contract(state)
+        self._validate_losses_static_contract(losses)
         bounded_losses = self._unit_losses(losses)
         finite = jnp.isfinite(bounded_losses)
         probabilities = self.probabilities(state)
         if self._update_rule == CANDIDATE_SELECTOR_EXP3:
-            action = (
-                jnp.argmax(probabilities).astype(jnp.int32)
-                if selected_action is None
-                else jnp.asarray(selected_action, dtype=jnp.int32)
-            )
-            probability = jnp.maximum(probabilities[action], 1e-6)
-            selected_finite = finite[action]
+            if selected_action is None:
+                raise ValueError("selected_action is required for update_rule='exp3'")
+            elif type(selected_action) in _ACTUAL_INT_TYPES:
+                host_action = operator.index(cast(SupportsIndex, selected_action))
+                # Do not narrow an untrusted wide integer before validating it:
+                # values such as uint64(2**32) otherwise wrap to action zero.
+                representable_action = (
+                    host_action if -(2**31) <= host_action <= _INT32_MAX else -1
+                )
+                action = jnp.asarray(representable_action, dtype=jnp.int32)
+            elif isinstance(selected_action, Array):
+                if selected_action.shape != () or selected_action.dtype != jnp.int32:
+                    raise TypeError("selected_action must be one scalar int32 action")
+                action = selected_action
+            else:
+                raise TypeError("selected_action must be one scalar integer action")
+            action_in_range = (action >= 0) & (action < self._n_candidates)
+            safe_action = jnp.clip(action, 0, self._n_candidates - 1)
+            raw_probability = probabilities[safe_action]
+            probability_valid = jnp.isfinite(raw_probability) & (raw_probability > 0.0)
+            probability = jnp.where(probability_valid, raw_probability, 1.0)
+            selected_finite = finite[safe_action] & action_in_range & probability_valid
             loss_hat = jnp.where(
                 selected_finite,
-                bounded_losses[action] / probability,
+                bounded_losses[safe_action] / probability,
                 jnp.array(0.0, dtype=jnp.float32),
             )
-            update_losses = jnp.zeros_like(bounded_losses).at[action].set(loss_hat)
-            update_finite = jnp.zeros_like(finite).at[action].set(selected_finite)
+            update_losses = jnp.zeros_like(bounded_losses).at[safe_action].set(loss_hat)
+            update_finite = jnp.zeros_like(finite).at[safe_action].set(selected_finite)
         else:
-            action = jnp.argmin(
-                jnp.where(finite, bounded_losses, jnp.inf)
-            ).astype(jnp.int32)
+            action = jnp.argmin(jnp.where(finite, bounded_losses, jnp.inf)).astype(jnp.int32)
             update_losses = jnp.where(finite, bounded_losses, 0.0)
             update_finite = finite
 
@@ -559,39 +739,92 @@ class FiniteCandidateSelector:
             jnp.nan_to_num(bounded_losses, nan=0.0),
             0.0,
         )
-        action_counts = state.action_counts + update_finite.astype(jnp.float32)
+        action_counts = state.action_counts + update_finite.astype(jnp.int32)
         next_state = FiniteCandidateSelectorState(
             log_weights=log_weights,
             cumulative_loss=cumulative_loss,
             action_counts=action_counts,
-            step_count=state.step_count + 1,
+            step_count=_saturating_int32_increment(state.step_count),
+        )
+        source_state_valid = (
+            floating_tree_is_finite(state)
+            & (state.step_count >= 0)
+            & jnp.all(state.cumulative_loss >= 0.0)
+            & jnp.all(state.action_counts >= 0.0)
+            & jnp.all(state.cumulative_loss <= state.action_counts)
+            & jnp.all(state.action_counts <= state.step_count)
+        )
+        update_available = (
+            source_state_valid
+            & (state.step_count < _INT32_MAX)
+            & (action_in_range if self._update_rule == CANDIDATE_SELECTOR_EXP3 else True)
+            & floating_tree_is_finite(next_state)
         )
         return FiniteCandidateSelectorUpdateResult(
-            state=next_state,
+            state=select_transaction(update_available, next_state, state),
             probabilities=probabilities,
             bounded_losses=bounded_losses,
             selected_action=action,
         )
 
+    def _validate_state_static_contract(self, state: FiniteCandidateSelectorState) -> None:
+        if type(state) is not FiniteCandidateSelectorState:
+            raise TypeError("state must be a FiniteCandidateSelectorState")
+        expected = (
+            (state.log_weights, (self._n_candidates,), jnp.float32),
+            (state.cumulative_loss, (self._n_candidates,), jnp.float32),
+            (state.action_counts, (self._n_candidates,), jnp.int32),
+            (state.step_count, (), jnp.int32),
+        )
+        for value, shape, dtype in expected:
+            try:
+                actual_shape = tuple(value.shape)
+                actual_dtype = jnp.dtype(value.dtype)
+            except Exception as error:
+                raise TypeError("finite candidate selector state metadata is invalid") from error
+            if actual_shape != shape or actual_dtype != jnp.dtype(dtype):
+                raise ValueError("finite candidate selector state shape or dtype is invalid")
+
+    def _validate_losses_static_contract(self, losses: object) -> None:
+        try:
+            shape = tuple(losses.shape)  # type: ignore[attr-defined]
+            dtype = jnp.dtype(losses.dtype)  # type: ignore[attr-defined]
+        except Exception as error:
+            raise TypeError("finite candidate selector losses metadata is invalid") from error
+        if shape != (self._n_candidates,):
+            raise ValueError("finite candidate selector losses shape is invalid")
+        if dtype != jnp.dtype(jnp.float32):
+            raise TypeError("finite candidate selector losses dtype must be float32")
+
     def regret_metadata(self, horizon: int) -> dict[str, Any]:
         """Return finite-candidate regret assumptions and bound metadata."""
-        if horizon < 1:
-            raise ValueError("horizon must be positive")
+        horizon = _require_int32("horizon", horizon, minimum=1)
         width = self._loss_upper_bound - self._loss_lower_bound
         log_k = math.log(self._n_candidates)
         if self._n_candidates == 1:
             regret_bound = 0.0
+            bound_kind = "exact"
         elif self._update_rule == CANDIDATE_SELECTOR_HEDGE:
             regret_bound = width * (
-                log_k / self._learning_rate + self._learning_rate * horizon / 8.0
+                log_k / self._learning_rate
+                + self._learning_rate * horizon / 8.0
+                + self._exploration * horizon
             )
+            bound_kind = "hedge_with_exploration_penalty"
         else:
-            regret_bound = width * 2.0 * math.sqrt(horizon * self._n_candidates * log_k)
+            # The usual O(sqrt(T K log K)) Exp3 claim requires coupled
+            # learning-rate/exploration tuning and actions sampled from the
+            # reported probabilities.  This abstraction accepts an external
+            # action and arbitrary valid tuning, so only the universal bounded-
+            # loss guarantee is truthful without additional execution proof.
+            regret_bound = width * horizon
+            bound_kind = "worst_case"
 
         return {
             "algorithm": self._update_rule,
             "candidate_count": self._n_candidates,
             "horizon": horizon,
+            "bound_kind": bound_kind,
             "assumptions": {
                 "finite_candidate_set": True,
                 "fixed_candidate_identities": True,
@@ -602,13 +835,17 @@ class FiniteCandidateSelector:
                 "exp3_requires_unbiased_importance_weighted_losses": (
                     self._update_rule == CANDIDATE_SELECTOR_EXP3
                 ),
+                "exp3_order_bound_requires_tuned_parameters_and_sampled_actions": (
+                    self._update_rule == CANDIDATE_SELECTOR_EXP3
+                ),
             },
             "regret_bound": regret_bound,
             "regret_statement": (
                 "Hedge full-information regret is bounded by "
-                "(b-a)(ln(K)/eta + eta*T/8) for losses in [a,b]. "
-                "The Exp3-style entry records the usual order bound and "
-                "requires positive exploration plus unbiased bandit losses."
+                "(b-a)(ln(K)/eta + eta*T/8 + exploration*T) for losses in [a,b]. "
+                "The Exp3-style entry reports the tuning-independent worst-case "
+                "(b-a)T bound; a sharper order bound additionally requires coupled "
+                "tuning, sampled actions, and unbiased importance-weighted losses."
             ),
         }
 
@@ -716,7 +953,6 @@ def _theta_local_grads(
     ops: Array,
     parent_a: Array,
     parent_b: Array,
-    theta: Array,
     feature_values: Array,
 ) -> tuple[Array, Array]:
     """Compute per-feature theta gradients for the local op output.
@@ -728,7 +964,6 @@ def _theta_local_grads(
         ops: Op types per slot.
         parent_a: First parent indices.
         parent_b: Second parent indices.
-        theta: Per-feature parameter vectors.
         feature_values: Already-computed feature values for this observation.
 
     Returns:
@@ -752,7 +987,6 @@ def _candidate_theta_local_grads(
     ops: Array,
     parent_a: Array,
     parent_b: Array,
-    theta: Array,
     candidate_values: Array,
     active_values: Array,
 ) -> tuple[Array, Array]:
@@ -791,9 +1025,9 @@ def _imprint_candidate_output_weights(
     blow the coefficient up.  Inactive heads already have zero error, so they
     stay zero.
 
-    ``CompositionalFeatureLearner._initial_candidate_output_weights`` evaluates
-    the candidate's feature value and delegates here with the configured
-    ``candidate_imprint_scale``.
+    ``CompositionalFeatureLearner._initial_candidate_output_weights`` is the
+    production call site: it evaluates the candidate's feature value and
+    delegates here with the learner's configured ``candidate_imprint_scale``.
     """
     denom = candidate_value * candidate_value + 1.0
     return scale * errors * candidate_value / (denom * active_count)
@@ -1026,27 +1260,214 @@ class CompositionalFeatureLearner:
             generator_resource_initial_preferences: Optional initial
                 log-preferences over generator policies.
         """
-        if n_features < 1:
-            raise ValueError("n_features must be positive")
-        if n_tasks < 1:
-            raise ValueError("n_tasks must be positive")
-        if candidate_count < 0:
-            raise ValueError("candidate_count must be non-negative")
-        if not 0.0 <= utility_decay < 1.0:
-            raise ValueError("utility_decay must be in [0, 1)")
-        if replacement_interval < 0:
-            raise ValueError("replacement_interval must be non-negative")
+        n_features = _require_int32("n_features", n_features, minimum=1)
+        n_tasks = _require_int32("n_tasks", n_tasks, minimum=1)
+        candidate_count = _require_int32("candidate_count", candidate_count, minimum=0)
+        replacement_interval = _require_int32(
+            "replacement_interval", replacement_interval, minimum=0
+        )
+        min_feature_age = _require_int32("min_feature_age", min_feature_age, minimum=0)
+        candidate_min_age = _require_int32("candidate_min_age", candidate_min_age, minimum=0)
+        max_depth = _require_int32("max_depth", max_depth, minimum=1)
+        signed_tanh_scaffold_count = _require_int32(
+            "signed_tanh_scaffold_count", signed_tanh_scaffold_count, minimum=0
+        )
+        retention_tanh_min_count = _require_int32(
+            "retention_tanh_min_count", retention_tanh_min_count, minimum=0
+        )
+        retention_product_min_count = _require_int32(
+            "retention_product_min_count", retention_product_min_count, minimum=0
+        )
+        generator_resource_contexts = _require_int32(
+            "generator_resource_contexts", generator_resource_contexts, minimum=1
+        )
+        persistent_nbytes = _compositional_state_nbytes(
+            n_features,
+            n_tasks,
+            candidate_count,
+            generator_resource_contexts,
+        )
+        if persistent_nbytes > _INT32_MAX:
+            raise ValueError("compositional feature persistent state bytes must fit signed int32")
+        for name, value in (
+            ("use_obgd", use_obgd),
+            ("train_candidate_theta", train_candidate_theta),
+            ("learn_generator_resources", learn_generator_resources),
+        ):
+            if type(value) is not bool:
+                raise ValueError(f"{name} must be an actual bool")
+        promotion_output_mode = _require_choice(
+            "promotion_output_mode",
+            promotion_output_mode,
+            frozenset({PROMOTION_SCALED_CANDIDATE, PROMOTION_BLEND}),
+        )
+        generation_strategy = _require_choice(
+            "generation_strategy",
+            generation_strategy,
+            frozenset(
+                {
+                    GENERATION_UNIFORM,
+                    GENERATION_UTILITY,
+                    GENERATION_MUTATION,
+                    GENERATION_RESIDUAL_IMPRINT,
+                    GENERATION_RECURSIVE_PRODUCT,
+                    GENERATION_ROBUST_RECURSIVE,
+                }
+            ),
+        )
+        future_utility_trace_mode = _require_choice(
+            "future_utility_trace_mode",
+            future_utility_trace_mode,
+            frozenset({"contribution", "marginal"}),
+        )
+        future_utility_normalization = _require_choice(
+            "future_utility_normalization",
+            future_utility_normalization,
+            frozenset({"none", "age", "uncertainty", "uncertainty_age"}),
+        )
+        candidate_scoring_mode = _require_choice(
+            "candidate_scoring_mode",
+            candidate_scoring_mode,
+            frozenset({"legacy", "energy_novelty"}),
+        )
+        candidate_selector = _require_choice(
+            "candidate_selector",
+            candidate_selector,
+            frozenset(
+                {CANDIDATE_SELECTOR_LEGACY, CANDIDATE_SELECTOR_HEDGE, CANDIDATE_SELECTOR_EXP3}
+            ),
+        )
+        generator_resource_update_rule = _require_choice(
+            "generator_resource_update_rule",
+            generator_resource_update_rule,
+            frozenset({"hedge", "exp3"}),
+        )
+        step_size_output = _validated_float32_scalar(
+            "step_size_output", step_size_output, lower=0.0
+        )
+        step_size_theta = _validated_float32_scalar(
+            "step_size_theta", step_size_theta, lower=0.0
+        )
+        utility_decay_input = utility_decay
+        utility_decay = canonical_float32_ema_decay(
+            "utility_decay",
+            utility_decay,
+        )
+        utility_decay_config = (
+            utility_decay_input if type(utility_decay_input) is float else utility_decay
+        )
+        promotion_margin = _validated_float32_scalar(
+            "promotion_margin", promotion_margin, lower=0.0
+        )
+        promotion_blend = _validated_float32_scalar(
+            "promotion_blend", promotion_blend, lower=0.0, upper=1.0
+        )
+        obgd_kappa = _validated_float32_scalar("obgd_kappa", obgd_kappa, positive=True)
+        parent_temperature = _validated_float32_scalar(
+            "parent_temperature", parent_temperature, positive=True
+        )
+        parent_novelty_weight = _validated_float32_scalar(
+            "parent_novelty_weight", parent_novelty_weight, lower=0.0
+        )
+        parent_depth_prior = _validated_float32_scalar(
+            "parent_depth_prior", parent_depth_prior, lower=0.0
+        )
+        retention_depth_bonus = _validated_float32_scalar(
+            "retention_depth_bonus", retention_depth_bonus, lower=0.0
+        )
+        residual_guidance = _validated_float32_scalar(
+            "residual_guidance", residual_guidance, lower=0.0
+        )
+        candidate_imprint_scale = _validated_float32_scalar(
+            "candidate_imprint_scale", candidate_imprint_scale, lower=0.0
+        )
+        future_utility_mix = _validated_float32_scalar(
+            "future_utility_mix", future_utility_mix, lower=0.0, upper=1.0
+        )
+        future_utility_trace_decay = _validated_float32_scalar(
+            "future_utility_trace_decay",
+            future_utility_trace_decay,
+            lower=0.0,
+            upper=1.0,
+            upper_inclusive=False,
+        )
+        future_utility_normalization_decay = _validated_float32_scalar(
+            "future_utility_normalization_decay",
+            future_utility_normalization_decay,
+            lower=0.0,
+            upper=1.0,
+            upper_inclusive=False,
+        )
+        future_utility_rare_task_power = _validated_float32_scalar(
+            "future_utility_rare_task_power", future_utility_rare_task_power, lower=0.0
+        )
+        future_utility_task_activity_decay = _validated_float32_scalar(
+            "future_utility_task_activity_decay",
+            future_utility_task_activity_decay,
+            lower=0.0,
+            upper=1.0,
+            upper_inclusive=False,
+        )
+        candidate_score_trace_decay = _validated_float32_scalar(
+            "candidate_score_trace_decay",
+            candidate_score_trace_decay,
+            lower=0.0,
+            upper=1.0,
+            upper_inclusive=False,
+        )
+        candidate_score_energy_epsilon = _validated_float32_scalar(
+            "candidate_score_energy_epsilon", candidate_score_energy_epsilon, positive=True
+        )
+        candidate_novelty_weight = _validated_float32_scalar(
+            "candidate_novelty_weight", candidate_novelty_weight, lower=0.0, upper=1.0
+        )
+        candidate_novelty_power = _validated_float32_scalar(
+            "candidate_novelty_power", candidate_novelty_power, positive=True
+        )
+        candidate_novelty_floor = _validated_float32_scalar(
+            "candidate_novelty_floor", candidate_novelty_floor, lower=0.0, upper=1.0
+        )
+        candidate_selector_learning_rate = _validated_float32_scalar(
+            "candidate_selector_learning_rate", candidate_selector_learning_rate, positive=True
+        )
+        candidate_selector_exploration = _validated_float32_scalar(
+            "candidate_selector_exploration",
+            candidate_selector_exploration,
+            lower=0.0,
+            upper=1.0,
+            upper_inclusive=False,
+        )
+        generator_resource_learning_rate = _validated_float32_scalar(
+            "generator_resource_learning_rate", generator_resource_learning_rate, lower=0.0
+        )
+        generator_resource_discount = _validated_float32_scalar(
+            "generator_resource_discount", generator_resource_discount, lower=0.0, upper=1.0
+        )
+        generator_resource_exploration = _validated_float32_scalar(
+            "generator_resource_exploration",
+            generator_resource_exploration,
+            lower=0.0,
+            upper=1.0,
+            upper_inclusive=False,
+        )
+        generator_resource_advantage_clip = _validated_float32_scalar(
+            "generator_resource_advantage_clip", generator_resource_advantage_clip, positive=True
+        )
+        generator_resource_cost_weight = _validated_float32_scalar(
+            "generator_resource_cost_weight", generator_resource_cost_weight, lower=0.0
+        )
+        generator_resource_promotion_credit = _validated_float32_scalar(
+            "generator_resource_promotion_credit",
+            generator_resource_promotion_credit,
+            lower=0.0,
+        )
         if not 0.0 <= promotion_blend <= 1.0:
             raise ValueError("promotion_blend must be in [0, 1]")
         if promotion_output_mode not in {
             PROMOTION_SCALED_CANDIDATE,
             PROMOTION_BLEND,
         }:
-            raise ValueError(
-                "promotion_output_mode must be 'scaled_candidate' or 'blend'"
-            )
-        if max_depth < 1:
-            raise ValueError("max_depth must be positive")
+            raise ValueError("promotion_output_mode must be 'scaled_candidate' or 'blend'")
         if generation_strategy not in {
             GENERATION_UNIFORM,
             GENERATION_UTILITY,
@@ -1079,9 +1500,7 @@ class CompositionalFeatureLearner:
         if not 0.0 <= future_utility_trace_decay < 1.0:
             raise ValueError("future_utility_trace_decay must be in [0, 1)")
         if future_utility_trace_mode not in {"contribution", "marginal"}:
-            raise ValueError(
-                "future_utility_trace_mode must be 'contribution' or 'marginal'"
-            )
+            raise ValueError("future_utility_trace_mode must be 'contribution' or 'marginal'")
         if future_utility_normalization not in {
             "none",
             "age",
@@ -1099,9 +1518,7 @@ class CompositionalFeatureLearner:
         if not 0.0 <= future_utility_task_activity_decay < 1.0:
             raise ValueError("future_utility_task_activity_decay must be in [0, 1)")
         if candidate_scoring_mode not in {"legacy", "energy_novelty"}:
-            raise ValueError(
-                "candidate_scoring_mode must be 'legacy' or 'energy_novelty'"
-            )
+            raise ValueError("candidate_scoring_mode must be 'legacy' or 'energy_novelty'")
         if not 0.0 <= candidate_score_trace_decay < 1.0:
             raise ValueError("candidate_score_trace_decay must be in [0, 1)")
         if candidate_score_energy_epsilon <= 0.0:
@@ -1124,23 +1541,33 @@ class CompositionalFeatureLearner:
             raise ValueError("candidate_selector_learning_rate must be positive")
         if not 0.0 <= candidate_selector_exploration < 1.0:
             raise ValueError("candidate_selector_exploration must be in [0, 1)")
-        if (
-            candidate_selector == CANDIDATE_SELECTOR_EXP3
-            and candidate_selector_exploration <= 0.0
-        ):
+        if candidate_selector == CANDIDATE_SELECTOR_EXP3 and candidate_selector_exploration <= 0.0:
             raise ValueError("exp3 candidate_selector requires positive exploration")
-        if not 0.0 <= retention_slow_utility_decay < 1.0:
-            raise ValueError("retention_slow_utility_decay must be in [0, 1)")
+        retention_slow_utility_decay_input = retention_slow_utility_decay
+        retention_slow_utility_decay = canonical_float32_ema_decay(
+            "retention_slow_utility_decay",
+            retention_slow_utility_decay,
+        )
+        retention_slow_utility_decay_config = (
+            retention_slow_utility_decay_input
+            if type(retention_slow_utility_decay_input) is float
+            else retention_slow_utility_decay
+        )
         if retention_tanh_min_count < 0:
             raise ValueError("retention_tanh_min_count must be non-negative")
         if retention_product_min_count < 0:
             raise ValueError("retention_product_min_count must be non-negative")
         if operation_prior is not None:
+            if type(operation_prior) is not tuple:
+                raise ValueError("operation_prior must be None or an exact tuple")
             if len(operation_prior) != NUM_OPS:
                 raise ValueError("operation_prior must have one entry per op")
-            if any(prob < 0.0 for prob in operation_prior):
-                raise ValueError("operation_prior entries must be non-negative")
-            if sum(operation_prior) <= 0.0:
+            operation_prior = tuple(
+                _validated_float32_scalar(f"operation_prior[{index}]", value, lower=0.0)
+                for index, value in enumerate(operation_prior)
+            )
+            prior_total = float(np.sum(np.asarray(operation_prior, dtype=np.float32)))
+            if not math.isfinite(prior_total) or prior_total <= 0.0:
                 raise ValueError("operation_prior must have positive mass")
         if generator_resource_contexts < 1:
             raise ValueError("generator_resource_contexts must be positive")
@@ -1158,14 +1585,21 @@ class CompositionalFeatureLearner:
             raise ValueError("generator_resource_update_rule must be 'hedge' or 'exp3'")
         if generator_resource_promotion_credit < 0.0:
             raise ValueError("generator_resource_promotion_credit must be non-negative")
-        if (
-            generator_resource_initial_preferences is not None
-            and len(generator_resource_initial_preferences)
-            != len(DEFAULT_GENERATOR_META_POLICY_NAMES)
-        ):
-            raise ValueError(
-                "generator_resource_initial_preferences must match the default "
-                "generator policy count"
+        if generator_resource_initial_preferences is not None:
+            if type(generator_resource_initial_preferences) is not tuple:
+                raise ValueError("generator_resource_initial_preferences must be an exact tuple")
+            if len(generator_resource_initial_preferences) != len(
+                DEFAULT_GENERATOR_META_POLICY_NAMES
+            ):
+                raise ValueError(
+                    "generator_resource_initial_preferences must match the default "
+                    "generator policy count"
+                )
+            generator_resource_initial_preferences = tuple(
+                _validated_float32_scalar(
+                    f"generator_resource_initial_preferences[{index}]", value
+                )
+                for index, value in enumerate(generator_resource_initial_preferences)
             )
 
         self._n_features = n_features
@@ -1174,6 +1608,7 @@ class CompositionalFeatureLearner:
         self._step_size_output = step_size_output
         self._step_size_theta = step_size_theta
         self._utility_decay = utility_decay
+        self._utility_decay_config = utility_decay_config
         self._replacement_interval = replacement_interval
         self._min_feature_age = min_feature_age
         self._candidate_min_age = candidate_min_age
@@ -1219,6 +1654,7 @@ class CompositionalFeatureLearner:
             )
         )
         self._retention_slow_utility_decay = retention_slow_utility_decay
+        self._retention_slow_utility_decay_config = retention_slow_utility_decay_config
         self._retention_tanh_min_count = retention_tanh_min_count
         self._retention_product_min_count = retention_product_min_count
         self._operation_prior = operation_prior
@@ -1231,20 +1667,14 @@ class CompositionalFeatureLearner:
         self._generator_resource_cost_weight = generator_resource_cost_weight
         self._generator_resource_update_rule = generator_resource_update_rule
         self._generator_resource_promotion_credit = generator_resource_promotion_credit
-        self._generator_resource_initial_preferences = (
-            generator_resource_initial_preferences
-        )
+        self._generator_resource_initial_preferences = generator_resource_initial_preferences
         self._generator_resource_manager = GeneratorMetaResourceManager(
             policy_names=DEFAULT_GENERATOR_META_POLICY_NAMES,
             op_ids=DEFAULT_GENERATOR_META_OP_IDS,
             parent_modes=DEFAULT_GENERATOR_META_PARENT_MODES,
             replacement_multipliers=DEFAULT_GENERATOR_META_REPLACEMENT_MULTIPLIERS,
-            promotion_margin_multipliers=(
-                DEFAULT_GENERATOR_META_PROMOTION_MARGIN_MULTIPLIERS
-            ),
-            candidate_min_age_multipliers=(
-                DEFAULT_GENERATOR_META_CANDIDATE_MIN_AGE_MULTIPLIERS
-            ),
+            promotion_margin_multipliers=(DEFAULT_GENERATOR_META_PROMOTION_MARGIN_MULTIPLIERS),
+            candidate_min_age_multipliers=(DEFAULT_GENERATOR_META_CANDIDATE_MIN_AGE_MULTIPLIERS),
             imprint_scales=DEFAULT_GENERATOR_META_IMPRINT_SCALES,
             n_contexts=generator_resource_contexts,
             learning_rate=generator_resource_learning_rate,
@@ -1280,7 +1710,7 @@ class CompositionalFeatureLearner:
             "candidate_count": self._candidate_count,
             "step_size_output": self._step_size_output,
             "step_size_theta": self._step_size_theta,
-            "utility_decay": self._utility_decay,
+            "utility_decay": self._utility_decay_config,
             "replacement_interval": self._replacement_interval,
             "min_feature_age": self._min_feature_age,
             "candidate_min_age": self._candidate_min_age,
@@ -1303,27 +1733,19 @@ class CompositionalFeatureLearner:
             "future_utility_trace_decay": self._future_utility_trace_decay,
             "future_utility_trace_mode": self._future_utility_trace_mode,
             "future_utility_normalization": self._future_utility_normalization,
-            "future_utility_normalization_decay": (
-                self._future_utility_normalization_decay
-            ),
+            "future_utility_normalization_decay": (self._future_utility_normalization_decay),
             "future_utility_rare_task_power": self._future_utility_rare_task_power,
-            "future_utility_task_activity_decay": (
-                self._future_utility_task_activity_decay
-            ),
+            "future_utility_task_activity_decay": (self._future_utility_task_activity_decay),
             "candidate_scoring_mode": self._candidate_scoring_mode,
             "candidate_score_trace_decay": self._candidate_score_trace_decay,
-            "candidate_score_energy_epsilon": (
-                self._candidate_score_energy_epsilon
-            ),
+            "candidate_score_energy_epsilon": (self._candidate_score_energy_epsilon),
             "candidate_novelty_weight": self._candidate_novelty_weight,
             "candidate_novelty_power": self._candidate_novelty_power,
             "candidate_novelty_floor": self._candidate_novelty_floor,
             "candidate_selector": self._candidate_selector_mode,
-            "candidate_selector_learning_rate": (
-                self._candidate_selector_learning_rate
-            ),
+            "candidate_selector_learning_rate": (self._candidate_selector_learning_rate),
             "candidate_selector_exploration": self._candidate_selector_exploration,
-            "retention_slow_utility_decay": self._retention_slow_utility_decay,
+            "retention_slow_utility_decay": (self._retention_slow_utility_decay_config),
             "retention_tanh_min_count": self._retention_tanh_min_count,
             "retention_product_min_count": self._retention_product_min_count,
             "operation_prior": (
@@ -1331,19 +1753,13 @@ class CompositionalFeatureLearner:
             ),
             "learn_generator_resources": self._learn_generator_resources,
             "generator_resource_contexts": self._generator_resource_contexts,
-            "generator_resource_learning_rate": (
-                self._generator_resource_learning_rate
-            ),
+            "generator_resource_learning_rate": (self._generator_resource_learning_rate),
             "generator_resource_discount": self._generator_resource_discount,
             "generator_resource_exploration": self._generator_resource_exploration,
-            "generator_resource_advantage_clip": (
-                self._generator_resource_advantage_clip
-            ),
+            "generator_resource_advantage_clip": (self._generator_resource_advantage_clip),
             "generator_resource_cost_weight": self._generator_resource_cost_weight,
             "generator_resource_update_rule": self._generator_resource_update_rule,
-            "generator_resource_promotion_credit": (
-                self._generator_resource_promotion_credit
-            ),
+            "generator_resource_promotion_credit": (self._generator_resource_promotion_credit),
             "generator_resource_initial_preferences": (
                 None
                 if self._generator_resource_initial_preferences is None
@@ -1352,11 +1768,26 @@ class CompositionalFeatureLearner:
         }
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> "CompositionalFeatureLearner":
+    def from_config(cls, config: Mapping[str, Any]) -> "CompositionalFeatureLearner":
         """Reconstruct learner from ``to_config`` output."""
-        config = dict(config)
-        config.pop("type", None)
-        return cls(**config)
+        if not issubclass(type(config), Mapping):
+            raise ValueError("compositional feature config must be a mapping")
+        try:
+            payload = dict(config)
+        except Exception as error:
+            raise ValueError("compositional feature config could not be read") from error
+        if payload.pop("type", None) != "CompositionalFeatureLearner":
+            raise ValueError("compositional feature config type is invalid")
+        if set(payload) != set(inspect.signature(cls).parameters):
+            raise ValueError("compositional feature config fields do not match its schema")
+        _require_serialized_scalars(payload, cls)
+        for name in ("operation_prior", "generator_resource_initial_preferences"):
+            raw = payload[name]
+            if raw is not None:
+                if type(raw) is not list or any(type(value) is not float for value in raw):
+                    raise ValueError(f"serialized {name} must be null or an exact JSON number list")
+                payload[name] = tuple(raw)
+        return cls(**payload)
 
     def init(self, feature_dim: int, key: Array) -> CompositionalFeatureState:
         """Initialize the active and candidate banks.
@@ -1366,12 +1797,31 @@ class CompositionalFeatureLearner:
         compositions of earlier slots; candidates are similarly random
         compositions of the active raw-input slots.
         """
-        if feature_dim < 1:
-            raise ValueError("feature_dim must be positive")
+        feature_dim = _require_int32("feature_dim", feature_dim, minimum=1)
         if self._n_features < feature_dim:
-            raise ValueError(
-                "n_features must be at least feature_dim so raw-input slots fit"
+            raise ValueError("n_features must be at least feature_dim so raw-input slots fit")
+        if self._n_features > feature_dim and self._generation_strategy in {
+            GENERATION_RECURSIVE_PRODUCT,
+            GENERATION_ROBUST_RECURSIVE,
+        }:
+            diagonal = 1 if self._generation_strategy == GENERATION_ROBUST_RECURSIVE else -1
+            pair_count = feature_dim * (feature_dim + diagonal) // 2
+            _require_resource(
+                "recursive parent construction",
+                scalars=2 * pair_count,
+                nbytes=8 * pair_count,
             )
+            if (
+                self._generation_strategy == GENERATION_ROBUST_RECURSIVE
+                and self._signed_tanh_scaffold_count > 0
+            ):
+                distinct_pairs = feature_dim * (feature_dim - 1) // 2
+                signed_scalars = 16 * distinct_pairs
+                _require_resource(
+                    "signed-tanh scaffold construction",
+                    scalars=signed_scalars,
+                    nbytes=4 * signed_scalars,
+                )
 
         n_features = self._n_features
 
@@ -1414,8 +1864,7 @@ class CompositionalFeatureLearner:
                         ops[slot] = OP_PRODUCT
                     elif (
                         self._generation_strategy == GENERATION_ROBUST_RECURSIVE
-                        and offset
-                        < len(pair_parents) + self._signed_tanh_scaffold_count
+                        and offset < len(pair_parents) + self._signed_tanh_scaffold_count
                     ):
                         signed_pairs = [
                             (left, right, sign_a, sign_b)
@@ -1429,9 +1878,7 @@ class CompositionalFeatureLearner:
                             )
                         ]
                         tanh_offset = offset - len(pair_parents)
-                        left, right, sign_a, sign_b = signed_pairs[
-                            tanh_offset % len(signed_pairs)
-                        ]
+                        left, right, sign_a, sign_b = signed_pairs[tanh_offset % len(signed_pairs)]
                         a, b = left, right
                         ops[slot] = OP_TANH
                         theta_arr = theta_arr.at[slot].set(
@@ -1443,20 +1890,16 @@ class CompositionalFeatureLearner:
                             - len(pair_parents)
                             - (
                                 self._signed_tanh_scaffold_count
-                                if self._generation_strategy
-                                == GENERATION_ROBUST_RECURSIVE
+                                if self._generation_strategy == GENERATION_ROBUST_RECURSIVE
                                 else 0
                             )
                         )
                         pair_slot = feature_dim + depth_offset % len(pair_parents)
-                        raw_parent = (
-                            depth_offset // len(pair_parents)
-                        ) % feature_dim
+                        raw_parent = (depth_offset // len(pair_parents)) % feature_dim
                         a, b = pair_slot, raw_parent
                         ops[slot] = (
                             OP_PRODUCT
-                            if self._generation_strategy
-                            == GENERATION_ROBUST_RECURSIVE
+                            if self._generation_strategy == GENERATION_ROBUST_RECURSIVE
                             else OP_SUM
                         )
                 else:
@@ -1468,11 +1911,7 @@ class CompositionalFeatureLearner:
                 # valid topological order under index iteration.  Restrict to
                 # those whose depth + 1 stays within max_depth.
                 max_parent_excl = slot
-                eligible = [
-                    p
-                    for p in range(max_parent_excl)
-                    if depth[p] + 1 <= self._max_depth
-                ]
+                eligible = [p for p in range(max_parent_excl) if depth[p] + 1 <= self._max_depth]
                 if not eligible:
                     # Fall back to a raw-input slot.
                     eligible = list(range(min(feature_dim, max_parent_excl)))
@@ -1528,11 +1967,7 @@ class CompositionalFeatureLearner:
                 else:
                     cand_ops[i] = int(jr.randint(op_key, (), 1, NUM_OPS))
                     # Candidates pull parents from active slots only.
-                    eligible = [
-                        p
-                        for p in range(n_features)
-                        if depth[p] + 1 <= self._max_depth
-                    ]
+                    eligible = [p for p in range(n_features) if depth[p] + 1 <= self._max_depth]
                     if not eligible:
                         eligible = list(range(feature_dim))
                     choices = jr.randint(parent_key, (2,), 0, len(eligible))
@@ -1549,21 +1984,15 @@ class CompositionalFeatureLearner:
             parent_b=active_state["parent_b"],
             theta=active_state["theta"],
             depth=active_state["depth"],
-            output_weights=jnp.zeros(
-                (self._n_tasks, n_features), dtype=jnp.float32
-            ),
+            output_weights=jnp.zeros((self._n_tasks, n_features), dtype=jnp.float32),
             output_bias=jnp.zeros(self._n_tasks, dtype=jnp.float32),
             utilities=jnp.zeros(n_features, dtype=jnp.float32),
-            utility_contribution_trace=jnp.zeros(
-                (self._n_tasks, n_features), dtype=jnp.float32
-            ),
+            utility_contribution_trace=jnp.zeros((self._n_tasks, n_features), dtype=jnp.float32),
             utility_error_trace=jnp.zeros(self._n_tasks, dtype=jnp.float32),
             utility_feature_trace=jnp.zeros(n_features, dtype=jnp.float32),
             utility_feature_energy_trace=jnp.zeros(n_features, dtype=jnp.float32),
             utility_signal_second_moment=jnp.zeros(n_features, dtype=jnp.float32),
-            feature_score_residual_trace=jnp.zeros(
-                (self._n_tasks, n_features), dtype=jnp.float32
-            ),
+            feature_score_residual_trace=jnp.zeros((self._n_tasks, n_features), dtype=jnp.float32),
             feature_score_energy_trace=jnp.zeros(n_features, dtype=jnp.float32),
             retention_slow_utilities=jnp.zeros(n_features, dtype=jnp.float32),
             task_activity_ema=jnp.zeros(self._n_tasks, dtype=jnp.float32),
@@ -1573,40 +2002,26 @@ class CompositionalFeatureLearner:
             candidate_parent_b=jnp.asarray(cand_parent_b, dtype=jnp.int32),
             candidate_theta=cand_theta,
             candidate_depth=jnp.asarray(cand_depth, dtype=jnp.int32),
-            candidate_output_weights=jnp.zeros(
-                (self._n_tasks, cand_count), dtype=jnp.float32
-            ),
+            candidate_output_weights=jnp.zeros((self._n_tasks, cand_count), dtype=jnp.float32),
             candidate_utilities=jnp.zeros(cand_count, dtype=jnp.float32),
             candidate_utility_contribution_trace=jnp.zeros(
                 (self._n_tasks, cand_count), dtype=jnp.float32
             ),
-            candidate_utility_feature_trace=jnp.zeros(
-                cand_count, dtype=jnp.float32
-            ),
-            candidate_utility_feature_energy_trace=jnp.zeros(
-                cand_count, dtype=jnp.float32
-            ),
-            candidate_utility_signal_second_moment=jnp.zeros(
-                cand_count, dtype=jnp.float32
-            ),
+            candidate_utility_feature_trace=jnp.zeros(cand_count, dtype=jnp.float32),
+            candidate_utility_feature_energy_trace=jnp.zeros(cand_count, dtype=jnp.float32),
+            candidate_utility_signal_second_moment=jnp.zeros(cand_count, dtype=jnp.float32),
             candidate_score_residual_trace=jnp.zeros(
                 (self._n_tasks, cand_count), dtype=jnp.float32
             ),
             candidate_score_energy_trace=jnp.zeros(cand_count, dtype=jnp.float32),
-            candidate_retention_slow_utilities=jnp.zeros(
-                cand_count, dtype=jnp.float32
-            ),
+            candidate_retention_slow_utilities=jnp.zeros(cand_count, dtype=jnp.float32),
             candidate_active_correlation_trace=jnp.zeros(
                 (cand_count, n_features), dtype=jnp.float32
             ),
             candidate_ages=jnp.zeros(cand_count, dtype=jnp.int32),
             candidate_selector_log_weights=jnp.zeros(cand_count, dtype=jnp.float32),
-            candidate_selector_cumulative_loss=jnp.zeros(
-                cand_count, dtype=jnp.float32
-            ),
-            candidate_selector_action_counts=jnp.zeros(
-                cand_count, dtype=jnp.float32
-            ),
+            candidate_selector_cumulative_loss=jnp.zeros(cand_count, dtype=jnp.float32),
+            candidate_selector_action_counts=jnp.zeros(cand_count, dtype=jnp.int32),
             feature_generator_policy=jnp.zeros(n_features, dtype=jnp.int32),
             candidate_generator_policy=jnp.zeros(cand_count, dtype=jnp.int32),
             generator_resource_state=self._generator_resource_manager.init(),
@@ -1648,10 +2063,7 @@ class CompositionalFeatureLearner:
 
         product = val_a * val_b
         summ = val_a + val_b
-        pre_tanh = (
-            state.candidate_theta[:, 0] * val_a
-            + state.candidate_theta[:, 1] * val_b
-        )
+        pre_tanh = state.candidate_theta[:, 0] * val_a + state.candidate_theta[:, 1] * val_b
         tanh_val = jnp.tanh(pre_tanh)
         gated = val_a * jax.nn.sigmoid(val_b)
 
@@ -1739,26 +2151,18 @@ class CompositionalFeatureLearner:
             age_bonus = jnp.zeros_like(utilities, dtype=jnp.float32)
             if ages is not None:
                 age_bonus = 1.0 / jnp.sqrt(ages.astype(jnp.float32) + 1.0)
-            novelty_scores = self._parent_novelty_weight * (
-                0.5 * inverse_utility + age_bonus
-            )
+            novelty_scores = self._parent_novelty_weight * (0.5 * inverse_utility + age_bonus)
         depth_scores = jnp.zeros_like(utilities, dtype=jnp.float32)
         if self._parent_depth_prior > 0.0 and depth is not None:
-            depth_scores = self._parent_depth_prior * jnp.log1p(
-                depth.astype(jnp.float32)
-            )
+            depth_scores = self._parent_depth_prior * jnp.log1p(depth.astype(jnp.float32))
         guided_scores = (
             utility_scores
             + self._residual_guidance * residual_scores
             + novelty_scores
             + depth_scores
         )
-        utility_logits = (
-            jnp.log(jnp.maximum(utility_scores, 1e-6)) / self._parent_temperature
-        )
-        residual_logits = (
-            jnp.log(jnp.maximum(guided_scores, 1e-6)) / self._parent_temperature
-        )
+        utility_logits = jnp.log(jnp.maximum(utility_scores, 1e-6)) / self._parent_temperature
+        residual_logits = jnp.log(jnp.maximum(guided_scores, 1e-6)) / self._parent_temperature
         logits = jnp.select(
             [
                 mode == PARENT_MODE_UNIFORM,
@@ -1876,9 +2280,8 @@ class CompositionalFeatureLearner:
         """Compute output weights for a promoted candidate slot."""
         if self._promotion_output_mode == PROMOTION_BLEND:
             return (
-                (1.0 - self._promotion_blend) * active_weights
-                + self._promotion_blend * candidate_weights
-            )
+                1.0 - self._promotion_blend
+            ) * active_weights + self._promotion_blend * candidate_weights
         return self._promotion_blend * candidate_weights
 
     def _future_utility_signal(
@@ -2013,9 +2416,8 @@ class CompositionalFeatureLearner:
         if self._future_utility_mix == 0.0:
             return current_signal
         return (
-            (1.0 - self._future_utility_mix) * current_signal
-            + self._future_utility_mix * future_signal
-        )
+            1.0 - self._future_utility_mix
+        ) * current_signal + self._future_utility_mix * future_signal
 
     def _retention_slow_utility(
         self,
@@ -2028,6 +2430,16 @@ class CompositionalFeatureLearner:
         decay = jnp.asarray(self._retention_slow_utility_decay, dtype=jnp.float32)
         return decay * previous_slow_utility + (1.0 - decay) * utility_signal
 
+    def _utility_update(self, previous_utility: Array, utility_signal: Array) -> Array:
+        """Update the raw utility EMA with one float32 decay/complement pair."""
+        if self._utility_decay == 0.0:
+            return utility_signal
+        decay = jnp.asarray(self._utility_decay, dtype=jnp.float32)
+        return (
+            decay * previous_utility
+            + (jnp.asarray(1.0, dtype=jnp.float32) - decay) * utility_signal
+        )
+
     def _retention_score(
         self,
         fast_utility: Array,
@@ -2038,6 +2450,16 @@ class CompositionalFeatureLearner:
             return fast_utility
         return jnp.maximum(fast_utility, slow_utility)
 
+    def _ranking_utility(
+        self,
+        raw_utility: Array,
+        ages: Array,
+        decay: float,
+    ) -> Array:
+        """Return curation/report scores without changing serialized EMA state."""
+        mode = self._future_utility_normalization if self._future_utility_mix > 0.0 else "none"
+        return bias_correct_future_utility(raw_utility, ages, decay, mode)
+
     def _energy_normalized_residual_score(
         self,
         errors: Array,
@@ -2046,13 +2468,15 @@ class CompositionalFeatureLearner:
         energy_trace: Array,
     ) -> tuple[Array, Array, Array]:
         """Return online matching-pursuit residual scores."""
-        trace_decay = jnp.asarray(
-            self._candidate_score_trace_decay, dtype=jnp.float32
-        )
-        new_residual_trace = (
-            trace_decay * residual_trace + errors[:, None] * feature_values[None, :]
-        )
-        new_energy_trace = trace_decay * energy_trace + feature_values * feature_values
+        residual_increment = errors[:, None] * feature_values[None, :]
+        energy_increment = feature_values * feature_values
+        if self._candidate_score_trace_decay == 0.0:
+            new_residual_trace = residual_increment
+            new_energy_trace = energy_increment
+        else:
+            trace_decay = jnp.asarray(self._candidate_score_trace_decay, dtype=jnp.float32)
+            new_residual_trace = trace_decay * residual_trace + residual_increment
+            new_energy_trace = trace_decay * energy_trace + energy_increment
         score = jnp.mean(jnp.abs(new_residual_trace), axis=0) / jnp.sqrt(
             new_energy_trace + self._candidate_score_energy_epsilon
         )
@@ -2067,13 +2491,14 @@ class CompositionalFeatureLearner:
         candidate_active_correlation_trace: Array,
     ) -> tuple[Array, Array]:
         """Return correlation novelty gates for candidate utility scores."""
-        trace_decay = jnp.asarray(
-            self._candidate_score_trace_decay, dtype=jnp.float32
-        )
-        new_correlation_trace = (
-            trace_decay * candidate_active_correlation_trace
-            + candidate_feature_values[:, None] * active_feature_values[None, :]
-        )
+        correlation_increment = candidate_feature_values[:, None] * active_feature_values[None, :]
+        if self._candidate_score_trace_decay == 0.0:
+            new_correlation_trace = correlation_increment
+        else:
+            trace_decay = jnp.asarray(self._candidate_score_trace_decay, dtype=jnp.float32)
+            new_correlation_trace = (
+                trace_decay * candidate_active_correlation_trace + correlation_increment
+            )
         denom = jnp.sqrt(
             candidate_energy_trace[:, None] * active_energy_trace[None, :]
             + self._candidate_score_energy_epsilon
@@ -2090,9 +2515,8 @@ class CompositionalFeatureLearner:
             self._candidate_novelty_power,
         )
         gate = (
-            (1.0 - self._candidate_novelty_weight)
-            + self._candidate_novelty_weight * novelty_gate
-        )
+            1.0 - self._candidate_novelty_weight
+        ) + self._candidate_novelty_weight * novelty_gate
         return gate, new_correlation_trace
 
     def _generator_policy_scores(
@@ -2113,9 +2537,7 @@ class CompositionalFeatureLearner:
             axis=1,
         )
         active_counts = jnp.sum(active_matches.astype(jnp.float32), axis=1)
-        candidate_matches = (
-            candidate_generator_policy[None, :] == policy_ids[:, None]
-        )
+        candidate_matches = candidate_generator_policy[None, :] == policy_ids[:, None]
         candidate_sums = jnp.sum(
             jnp.where(candidate_matches, candidate_utilities[None, :], 0.0),
             axis=1,
@@ -2151,9 +2573,7 @@ class CompositionalFeatureLearner:
         observation: Array,
     ) -> Array:
         """Concatenate raw observation with active compositional features."""
-        return jnp.concatenate(
-            [observation, self.constructed_features(state, observation)]
-        )
+        return jnp.concatenate([observation, self.constructed_features(state, observation)])
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def predict(
@@ -2207,12 +2627,9 @@ class CompositionalFeatureLearner:
             ``(op, parent_a, parent_b, theta, depth)`` as scalar / shape-2
             JAX arrays.
         """
-        op_key, pa_key, pb_key, fallback_pa_key, fallback_pb_key, theta_key = jr.split(
-            key, 6
-        )
+        op_key, pa_key, pb_key, fallback_pa_key, fallback_pb_key, theta_key = jr.split(key, 6)
         recursive_product = (
-            self._generation_strategy
-            in {GENERATION_RECURSIVE_PRODUCT, GENERATION_ROBUST_RECURSIVE}
+            self._generation_strategy in {GENERATION_RECURSIVE_PRODUCT, GENERATION_ROBUST_RECURSIVE}
             and forced_op is None
         )
         op = jr.categorical(op_key, self._op_logits(forced_op)).astype(jnp.int32)
@@ -2222,6 +2639,12 @@ class CompositionalFeatureLearner:
             utilities = jnp.ones_like(existing_depth, dtype=jnp.float32)
         else:
             utilities = existing_utilities
+            if existing_ages is not None:
+                utilities = self._ranking_utility(
+                    utilities,
+                    existing_ages,
+                    self._utility_decay,
+                )
         parent_logits = self._parent_logits(
             eligible,
             utilities,
@@ -2269,12 +2692,8 @@ class CompositionalFeatureLearner:
                 shallow_logits,
                 partner_logits,
             )
-            recursive_a = jr.categorical(
-                fallback_pa_key, recursive_logits
-            ).astype(jnp.int32)
-            recursive_b = jr.categorical(
-                fallback_pb_key, shallow_logits
-            ).astype(jnp.int32)
+            recursive_a = jr.categorical(fallback_pa_key, recursive_logits).astype(jnp.int32)
+            recursive_b = jr.categorical(fallback_pb_key, shallow_logits).astype(jnp.int32)
             a_idx = jnp.where(has_recursive_parent, recursive_a, a_idx)
             b_idx = jnp.where(
                 has_recursive_parent & has_shallow_parent,
@@ -2282,9 +2701,9 @@ class CompositionalFeatureLearner:
                 b_idx,
             )
         new_theta = 0.5 * jr.normal(theta_key, (2,), dtype=jnp.float32)
-        new_depth = (
-            jnp.maximum(existing_depth[a_idx], existing_depth[b_idx]) + 1
-        ).astype(jnp.int32)
+        new_depth = (jnp.maximum(existing_depth[a_idx], existing_depth[b_idx]) + 1).astype(
+            jnp.int32
+        )
         return op, a_idx, b_idx, new_theta, new_depth
 
     def _cascade_replace_with_mask(
@@ -2322,9 +2741,7 @@ class CompositionalFeatureLearner:
         del observation  # only the static shape is needed by the refresh path
 
         # Descendant cascade: scan through slots and propagate the mask.
-        def cascade_step(
-            carry_mask: Array, i: Array
-        ) -> tuple[Array, None]:
+        def cascade_step(carry_mask: Array, i: Array) -> tuple[Array, None]:
             a = parent_a[i]
             b = parent_b[i]
             is_composed = ops[i] != OP_RAW
@@ -2334,17 +2751,14 @@ class CompositionalFeatureLearner:
             safe_b = jnp.clip(b, 0, n_features - 1)
             parent_replaced = jnp.where(
                 is_composed,
-                carry_mask[safe_a]
-                | jnp.where(b >= 0, carry_mask[safe_b], jnp.bool_(False)),
+                carry_mask[safe_a] | jnp.where(b >= 0, carry_mask[safe_b], jnp.bool_(False)),
                 jnp.bool_(False),
             )
             new_mark = carry_mask[i] | parent_replaced
             new_carry = carry_mask.at[i].set(new_mark)
             return new_carry, None
 
-        cascaded_mask, _ = jax.lax.scan(
-            cascade_step, replaced_mask, jnp.arange(n_features)
-        )
+        cascaded_mask, _ = jax.lax.scan(cascade_step, replaced_mask, jnp.arange(n_features))
 
         # Generate fresh slot contents, respecting the strict-less-than
         # parent invariant.  Each replaced slot becomes a passthrough of a
@@ -2353,9 +2767,7 @@ class CompositionalFeatureLearner:
         def refill_step(
             carry: tuple[Array, Array, Array, Array, Array, Array, Array, Array],
             i: Array,
-        ) -> tuple[
-            tuple[Array, Array, Array, Array, Array, Array, Array, Array], None
-        ]:
+        ) -> tuple[tuple[Array, Array, Array, Array, Array, Array, Array, Array], None]:
             (
                 ops_c,
                 pa_c,
@@ -2382,9 +2794,14 @@ class CompositionalFeatureLearner:
             depth_ok = depth_c + 1 <= self._max_depth
             eligible = alive & depth_ok
             any_eligible = jnp.any(eligible)
+            ranking_utils = self._ranking_utility(
+                utils_c,
+                ages_c,
+                self._utility_decay,
+            )
             logits = self._parent_logits(
                 eligible,
-                utils_c,
+                ranking_utils,
                 feature_values=feature_values,
                 feature_credit=feature_credit,
                 depth=depth_c,
@@ -2394,7 +2811,7 @@ class CompositionalFeatureLearner:
             partner_logits = self._partner_logits(
                 eligible,
                 depth_c,
-                utils_c,
+                ranking_utils,
                 ages=ages_c,
                 parent_mode=parent_mode,
             )
@@ -2417,9 +2834,7 @@ class CompositionalFeatureLearner:
             # feature_dim-1) and parent_b is -1.  This keeps the slot valid.
             raw_a_idx = jnp.clip(jnp.minimum(i, feature_dim - 1), 0, feature_dim - 1)
             new_pa = jnp.where(any_eligible, a_idx, raw_a_idx)
-            new_pb = jnp.where(
-                any_eligible, b_idx, jnp.array(-1, dtype=jnp.int32)
-            )
+            new_pb = jnp.where(any_eligible, b_idx, jnp.array(-1, dtype=jnp.int32))
             new_theta = 0.5 * jr.normal(theta_key, (2,), dtype=jnp.float32)
             new_depth = jnp.where(
                 any_eligible,
@@ -2430,25 +2845,17 @@ class CompositionalFeatureLearner:
             ops_n = jnp.where(do_replace, ops_c.at[i].set(new_op), ops_c)
             pa_n = jnp.where(do_replace, pa_c.at[i].set(new_pa), pa_c)
             pb_n = jnp.where(do_replace, pb_c.at[i].set(new_pb), pb_c)
-            theta_n = jnp.where(
-                do_replace, theta_c.at[i].set(new_theta), theta_c
-            )
-            depth_n = jnp.where(
-                do_replace, depth_c.at[i].set(new_depth), depth_c
-            )
+            theta_n = jnp.where(do_replace, theta_c.at[i].set(new_theta), theta_c)
+            depth_n = jnp.where(do_replace, depth_c.at[i].set(new_depth), depth_c)
             utils_n = jnp.where(do_replace, utils_c.at[i].set(0.0), utils_c)
             ages_n = jnp.where(do_replace, ages_c.at[i].set(0), ages_c)
-            ow_n = jnp.where(
-                do_replace, ow_c.at[:, i].set(0.0), ow_c
-            )
+            ow_n = jnp.where(do_replace, ow_c.at[:, i].set(0.0), ow_c)
             return (ops_n, pa_n, pb_n, theta_n, depth_n, utils_n, ages_n, ow_n), None
 
-        (ops_f, pa_f, pb_f, theta_f, depth_f, utils_f, ages_f, ow_f), _ = (
-            jax.lax.scan(
-                refill_step,
-                (ops, parent_a, parent_b, theta, depth, utilities, ages, output_weights),
-                jnp.arange(n_features),
-            )
+        (ops_f, pa_f, pb_f, theta_f, depth_f, utils_f, ages_f, ow_f), _ = jax.lax.scan(
+            refill_step,
+            (ops, parent_a, parent_b, theta, depth, utilities, ages, output_weights),
+            jnp.arange(n_features),
         )
         return (
             ops_f,
@@ -2509,15 +2916,66 @@ class CompositionalFeatureLearner:
         context_id: Array | int = 0,
     ) -> CompositionalFeatureUpdateResult:
         """Perform one temporally-uniform compositional-feature update."""
+        previous_checked = state
+        if self._utility_decay == 0.0:
+            previous_checked = previous_checked.replace(  # type: ignore[attr-defined]
+                utilities=jnp.zeros_like(state.utilities),
+                candidate_utilities=jnp.zeros_like(state.candidate_utilities),
+            )
+        if self._future_utility_task_activity_decay == 0.0:
+            previous_checked = previous_checked.replace(  # type: ignore[attr-defined]
+                task_activity_ema=jnp.zeros_like(state.task_activity_ema),
+            )
+        if self._candidate_score_trace_decay == 0.0:
+            previous_checked = previous_checked.replace(  # type: ignore[attr-defined]
+                feature_score_residual_trace=jnp.zeros_like(state.feature_score_residual_trace),
+                feature_score_energy_trace=jnp.zeros_like(state.feature_score_energy_trace),
+                candidate_score_residual_trace=jnp.zeros_like(state.candidate_score_residual_trace),
+                candidate_score_energy_trace=jnp.zeros_like(state.candidate_score_energy_trace),
+                candidate_active_correlation_trace=jnp.zeros_like(
+                    state.candidate_active_correlation_trace
+                ),
+            )
+        source_state_finite = floating_tree_is_finite(previous_checked)
+        source_integer_state_valid = (
+            (state.step_count >= 0)
+            & jnp.all(state.ages >= 0)
+            & jnp.all(state.candidate_ages >= 0)
+            & jnp.all((state.ops >= OP_RAW) & (state.ops < NUM_OPS))
+            & jnp.all((state.candidate_ops >= OP_RAW) & (state.candidate_ops < NUM_OPS))
+            & jnp.all((state.depth >= 0) & (state.depth <= self._max_depth))
+            & jnp.all(
+                (state.candidate_depth >= 0) & (state.candidate_depth <= self._max_depth)
+            )
+            & jnp.all((state.parent_a >= 0) & (state.parent_a < self._n_features))
+            & jnp.all((state.parent_b >= -1) & (state.parent_b < self._n_features))
+            & jnp.all(
+                (state.candidate_parent_a >= 0)
+                & (state.candidate_parent_a < self._n_features)
+            )
+            & jnp.all(
+                (state.candidate_parent_b >= -1)
+                & (state.candidate_parent_b < self._n_features)
+            )
+        )
+        lifetime_capacity_available = state.step_count < _INT32_MAX
+        context_input = jnp.asarray(context_id)
+        inputs_valid = (
+            jnp.all(jnp.isfinite(observation))
+            & jnp.all(jnp.isfinite(targets) | jnp.isnan(targets))
+            & jnp.all(jnp.isfinite(context_input))
+        )
         context = jnp.asarray(context_id, dtype=jnp.int32)
         active_mask = ~jnp.isnan(targets)
         safe_targets = jnp.where(active_mask, targets, 0.0)
         active_count = jnp.maximum(jnp.sum(active_mask.astype(jnp.float32)), 1.0)
-        task_activity_ema = (
-            self._future_utility_task_activity_decay * state.task_activity_ema
-            + (1.0 - self._future_utility_task_activity_decay)
-            * active_mask.astype(jnp.float32)
-        )
+        if self._future_utility_task_activity_decay == 0.0:
+            task_activity_ema = active_mask.astype(jnp.float32)
+        else:
+            task_activity_ema = (
+                self._future_utility_task_activity_decay * state.task_activity_ema
+                + (1.0 - self._future_utility_task_activity_decay) * active_mask.astype(jnp.float32)
+            )
 
         feature_values = _compute_feature_values(
             state.ops,
@@ -2532,10 +2990,7 @@ class CompositionalFeatureLearner:
 
         # Output-weight update.
         output_delta = (
-            self._step_size_output
-            * errors[:, None]
-            * feature_values[None, :]
-            / active_count
+            self._step_size_output * errors[:, None] * feature_values[None, :] / active_count
         )
         output_bias_delta = self._step_size_output * errors / active_count
 
@@ -2545,7 +3000,6 @@ class CompositionalFeatureLearner:
             state.ops,
             state.parent_a,
             state.parent_b,
-            state.theta,
             feature_values,
         )
         theta_delta = self._step_size_theta * jnp.stack(
@@ -2557,10 +3011,9 @@ class CompositionalFeatureLearner:
         # and gradient credit (|errors @ W|, how much the residual would move
         # it).  Matches ``FixedBudgetFeatureLearner``'s default (mean-aggregated)
         # signal in feature_discovery.
-        current_utility_signal = (
-            0.5 * jnp.mean(jnp.abs(state.output_weights), axis=0) * jnp.abs(feature_values)
-            + 0.5 * jnp.abs(feature_credit)
-        )
+        current_utility_signal = 0.5 * jnp.mean(jnp.abs(state.output_weights), axis=0) * jnp.abs(
+            feature_values
+        ) + 0.5 * jnp.abs(feature_credit)
         (
             future_utility_signal,
             utility_contribution_trace,
@@ -2578,19 +3031,14 @@ class CompositionalFeatureLearner:
             state.utility_feature_trace,
             state.utility_feature_energy_trace,
         )
-        if (
-            self._future_utility_mix > 0.0
-            and self._future_utility_normalization != "none"
-        ):
-            future_utility_signal, utility_signal_second_moment = (
-                normalize_future_utility_signal(
-                    future_utility_signal,
-                    state.ages,
-                    state.utility_signal_second_moment,
-                    self._future_utility_normalization_decay,
-                    self._utility_decay,
-                    self._future_utility_normalization,
-                )
+        if self._future_utility_mix > 0.0 and self._future_utility_normalization != "none":
+            future_utility_signal, utility_signal_second_moment = normalize_future_utility_signal(
+                future_utility_signal,
+                state.ages,
+                state.utility_signal_second_moment,
+                self._future_utility_normalization_decay,
+                self._utility_decay,
+                self._future_utility_normalization,
             )
         else:
             utility_signal_second_moment = state.utility_signal_second_moment
@@ -2611,10 +3059,7 @@ class CompositionalFeatureLearner:
                 state.feature_score_residual_trace,
                 state.feature_score_energy_trace,
             )
-        new_utilities = (
-            self._utility_decay * state.utilities
-            + (1.0 - self._utility_decay) * utility_signal
-        )
+        new_utilities = self._utility_update(state.utilities, utility_signal)
         retention_slow_utilities = self._retention_slow_utility(
             state.retention_slow_utilities,
             utility_signal,
@@ -2625,40 +3070,27 @@ class CompositionalFeatureLearner:
         candidate_output_delta = jnp.zeros_like(state.candidate_output_weights)
         candidate_theta_delta = jnp.zeros_like(state.candidate_theta)
         new_candidate_utilities = state.candidate_utilities
-        candidate_utility_contribution_trace = (
-            state.candidate_utility_contribution_trace
-        )
+        candidate_utility_contribution_trace = state.candidate_utility_contribution_trace
         candidate_utility_feature_trace = state.candidate_utility_feature_trace
-        candidate_utility_feature_energy_trace = (
-            state.candidate_utility_feature_energy_trace
-        )
-        candidate_utility_signal_second_moment = (
-            state.candidate_utility_signal_second_moment
-        )
+        candidate_utility_feature_energy_trace = state.candidate_utility_feature_energy_trace
+        candidate_utility_signal_second_moment = state.candidate_utility_signal_second_moment
         candidate_score_residual_trace = state.candidate_score_residual_trace
         candidate_score_energy_trace = state.candidate_score_energy_trace
         candidate_active_correlation_trace = state.candidate_active_correlation_trace
-        candidate_feature_values = jnp.zeros(
-            (self._candidate_count,), dtype=jnp.float32
-        )
+        candidate_feature_values = jnp.zeros((self._candidate_count,), dtype=jnp.float32)
         if self._candidate_count > 0:
-            candidate_feature_values = self._candidate_features(
-                state, feature_values, observation
-            )
+            candidate_feature_values = self._candidate_features(state, feature_values, observation)
             candidate_output_delta = (
                 self._step_size_output
                 * errors[:, None]
                 * candidate_feature_values[None, :]
                 / active_count
             )
-            candidate_credit = (
-                errors @ state.candidate_output_weights
-            ) / active_count
+            candidate_credit = (errors @ state.candidate_output_weights) / active_count
             candidate_d_theta0, candidate_d_theta1 = _candidate_theta_local_grads(
                 state.candidate_ops,
                 state.candidate_parent_a,
                 state.candidate_parent_b,
-                state.candidate_theta,
                 candidate_feature_values,
                 feature_values,
             )
@@ -2671,12 +3103,9 @@ class CompositionalFeatureLearner:
             )
             if not self._train_candidate_theta:
                 candidate_theta_delta = jnp.zeros_like(candidate_theta_delta)
-            candidate_signal = (
-                0.5
-                * jnp.mean(jnp.abs(state.candidate_output_weights), axis=0)
-                * jnp.abs(candidate_feature_values)
-                + 0.5 * jnp.abs(candidate_credit)
-            )
+            candidate_signal = 0.5 * jnp.mean(
+                jnp.abs(state.candidate_output_weights), axis=0
+            ) * jnp.abs(candidate_feature_values) + 0.5 * jnp.abs(candidate_credit)
             (
                 candidate_future_signal,
                 candidate_utility_contribution_trace,
@@ -2693,10 +3122,7 @@ class CompositionalFeatureLearner:
                 state.candidate_utility_feature_trace,
                 state.candidate_utility_feature_energy_trace,
             )
-            if (
-                self._future_utility_mix > 0.0
-                and self._future_utility_normalization != "none"
-            ):
+            if self._future_utility_mix > 0.0 and self._future_utility_normalization != "none":
                 candidate_future_signal, candidate_utility_signal_second_moment = (
                     normalize_future_utility_signal(
                         candidate_future_signal,
@@ -2722,19 +3148,17 @@ class CompositionalFeatureLearner:
                     state.candidate_score_residual_trace,
                     state.candidate_score_energy_trace,
                 )
-                novelty_gate, candidate_active_correlation_trace = (
-                    self._candidate_novelty_gate(
-                        candidate_feature_values,
-                        feature_values,
-                        candidate_score_energy_trace,
-                        feature_score_energy_trace,
-                        state.candidate_active_correlation_trace,
-                    )
+                novelty_gate, candidate_active_correlation_trace = self._candidate_novelty_gate(
+                    candidate_feature_values,
+                    feature_values,
+                    candidate_score_energy_trace,
+                    feature_score_energy_trace,
+                    state.candidate_active_correlation_trace,
                 )
                 candidate_signal = candidate_signal * novelty_gate
-            new_candidate_utilities = (
-                self._utility_decay * state.candidate_utilities
-                + (1.0 - self._utility_decay) * candidate_signal
+            new_candidate_utilities = self._utility_update(
+                state.candidate_utilities,
+                candidate_signal,
             )
         candidate_retention_slow_utilities = self._retention_slow_utility(
             state.candidate_retention_slow_utilities,
@@ -2768,12 +3192,30 @@ class CompositionalFeatureLearner:
         output_bias = state.output_bias + output_bias_delta
         theta = state.theta + theta_delta
         candidate_theta = state.candidate_theta + candidate_theta_delta
-        candidate_output_weights = (
-            state.candidate_output_weights + candidate_output_delta
+        candidate_output_weights = state.candidate_output_weights + candidate_output_delta
+        ages = _saturating_int32_increment(state.ages)
+        candidate_ages = _saturating_int32_increment(state.candidate_ages)
+        ranking_utilities = self._ranking_utility(
+            new_utilities,
+            ages,
+            self._utility_decay,
         )
-        ages = state.ages + 1
-        candidate_ages = state.candidate_ages + 1
-        step_count = state.step_count + 1
+        ranking_retention_slow_utilities = self._ranking_utility(
+            retention_slow_utilities,
+            ages,
+            self._retention_slow_utility_decay,
+        )
+        ranking_candidate_utilities = self._ranking_utility(
+            new_candidate_utilities,
+            candidate_ages,
+            self._utility_decay,
+        )
+        ranking_candidate_retention_slow_utilities = self._ranking_utility(
+            candidate_retention_slow_utilities,
+            candidate_ages,
+            self._retention_slow_utility_decay,
+        )
+        step_count = _saturating_int32_increment(state.step_count)
         key, decision_key, curation_key = jr.split(state.key, 3)
         proposal_key, cascade_key = compositional_curation_keys(curation_key)
 
@@ -2790,6 +3232,7 @@ class CompositionalFeatureLearner:
         promotion_margin = jnp.asarray(self._promotion_margin, dtype=jnp.float32)
         candidate_min_age = jnp.asarray(self._candidate_min_age, dtype=jnp.float32)
         replacement_accumulator = state.replacement_accumulator
+        generator_decision_valid = jnp.asarray(True, dtype=jnp.bool_)
         if self._learn_generator_resources:
             decision = self._generator_resource_manager.select(
                 state.generator_resource_state,
@@ -2797,6 +3240,7 @@ class CompositionalFeatureLearner:
                 context,
             )
             generator_policy = decision.action
+            generator_decision_valid = decision.valid
             forced_op = decision.op_id
             parent_mode = decision.parent_mode
             imprint_scale = decision.imprint_scale
@@ -2805,22 +3249,18 @@ class CompositionalFeatureLearner:
             replacement_rate = (
                 jnp.array(0.0, dtype=jnp.float32)
                 if self._replacement_interval == 0
-                else decision.replacement_multiplier
-                / float(self._replacement_interval)
+                else decision.replacement_multiplier / float(self._replacement_interval)
             )
             replacement_accumulator = replacement_accumulator + replacement_rate
-            should_try_replace = (
-                (self._replacement_interval > 0) & (replacement_accumulator >= 1.0)
-            )
+            should_try_replace = (self._replacement_interval > 0) & (replacement_accumulator >= 1.0)
             replacement_accumulator = jnp.where(
                 should_try_replace,
                 replacement_accumulator - 1.0,
                 replacement_accumulator,
             )
         else:
-            should_try_replace = (
-                (self._replacement_interval > 0)
-                & (step_count % jnp.array(max(self._replacement_interval, 1)) == 0)
+            should_try_replace = (self._replacement_interval > 0) & (
+                step_count % jnp.array(max(self._replacement_interval, 1)) == 0
             )
 
         # Identify the worst eligible active slot.  Raw-input slots
@@ -2831,19 +3271,12 @@ class CompositionalFeatureLearner:
             & (state.depth == 1)
             & (self._generation_strategy == GENERATION_RECURSIVE_PRODUCT)
         )
-        tanh_quota_protected = (
-            (state.ops == OP_TANH)
-            & (
-                jnp.sum((state.ops == OP_TANH).astype(jnp.int32))
-                <= self._retention_tanh_min_count
-            )
+        tanh_quota_protected = (state.ops == OP_TANH) & (
+            jnp.sum((state.ops == OP_TANH).astype(jnp.int32)) <= self._retention_tanh_min_count
         )
-        product_quota_protected = (
-            (state.ops == OP_PRODUCT)
-            & (
-                jnp.sum((state.ops == OP_PRODUCT).astype(jnp.int32))
-                <= self._retention_product_min_count
-            )
+        product_quota_protected = (state.ops == OP_PRODUCT) & (
+            jnp.sum((state.ops == OP_PRODUCT).astype(jnp.int32))
+            <= self._retention_product_min_count
         )
         eligible_active = (
             (ages >= self._min_feature_age)
@@ -2853,8 +3286,8 @@ class CompositionalFeatureLearner:
             & (~product_quota_protected)
         )
         active_replacement_score = self._retention_score(
-            new_utilities,
-            retention_slow_utilities,
+            ranking_utilities,
+            ranking_retention_slow_utilities,
         )
         retention_bonus = (
             jnp.asarray(self._retention_depth_bonus, dtype=jnp.float32)
@@ -2886,9 +3319,7 @@ class CompositionalFeatureLearner:
         absent_index = jnp.asarray(-1, dtype=jnp.int32)
         absent_theta = jnp.zeros((2,), dtype=jnp.float32)
         proposal_formed = no_event
-        proposal_destination_bank = jnp.asarray(
-            CURATION_DESTINATION_NONE, dtype=jnp.int32
-        )
+        proposal_destination_bank = jnp.asarray(CURATION_DESTINATION_NONE, dtype=jnp.int32)
         proposal_destination_slot = absent_index
         proposal_op = absent_index
         proposal_parent_a = absent_index
@@ -2915,12 +3346,8 @@ class CompositionalFeatureLearner:
         root_change_mask = jnp.zeros((self._n_features,), dtype=jnp.bool_)
         cascade_change_mask = jnp.zeros((self._n_features,), dtype=jnp.bool_)
         active_change_mask = jnp.zeros((self._n_features,), dtype=jnp.bool_)
-        ordinary_candidate_refresh_mask = jnp.zeros(
-            (self._candidate_count,), dtype=jnp.bool_
-        )
-        post_promotion_candidate_refresh_mask = jnp.zeros(
-            (self._candidate_count,), dtype=jnp.bool_
-        )
+        ordinary_candidate_refresh_mask = jnp.zeros((self._candidate_count,), dtype=jnp.bool_)
+        post_promotion_candidate_refresh_mask = jnp.zeros((self._candidate_count,), dtype=jnp.bool_)
         candidate_rebound_mask = jnp.zeros((self._candidate_count,), dtype=jnp.bool_)
         candidate_selector_log_weights = state.candidate_selector_log_weights
         candidate_selector_cumulative_loss = state.candidate_selector_cumulative_loss
@@ -2952,12 +3379,10 @@ class CompositionalFeatureLearner:
                 & (slot_indices[None, :] > candidate_parent_max[:, None])
                 & (candidate_depth_after_all[:, None] <= self._max_depth)
             )
-            candidate_has_destination = jnp.any(
-                compatible_active_by_candidate, axis=1
-            )
+            candidate_has_destination = jnp.any(compatible_active_by_candidate, axis=1)
             candidate_promotion_scores = self._retention_score(
-                new_candidate_utilities,
-                candidate_retention_slow_utilities,
+                ranking_candidate_utilities,
+                ranking_candidate_retention_slow_utilities,
             )
             candidate_selector_state = FiniteCandidateSelectorState(
                 log_weights=candidate_selector_log_weights,
@@ -2989,19 +3414,13 @@ class CompositionalFeatureLearner:
                     selected_action=best_candidate,
                 )
                 candidate_selector_log_weights = selector_result.state.log_weights
-                candidate_selector_cumulative_loss = (
-                    selector_result.state.cumulative_loss
-                )
+                candidate_selector_cumulative_loss = selector_result.state.cumulative_loss
                 candidate_selector_action_counts = selector_result.state.action_counts
             has_refresh_candidate = jnp.any(eligible_candidates)
-            refresh_scores = jnp.where(
-                eligible_candidates, new_candidate_utilities, jnp.inf
-            )
+            refresh_scores = jnp.where(eligible_candidates, ranking_candidate_utilities, jnp.inf)
             worst_candidate = jnp.argmin(refresh_scores).astype(jnp.int32)
             compatible_active = compatible_active_by_candidate[best_candidate]
-            promotion_slot_scores = jnp.where(
-                compatible_active, active_replacement_score, jnp.inf
-            )
+            promotion_slot_scores = jnp.where(compatible_active, active_replacement_score, jnp.inf)
             promotion_slot = jnp.argmin(promotion_slot_scores).astype(jnp.int32)
             should_promote = (
                 should_try_replace
@@ -3052,17 +3471,18 @@ class CompositionalFeatureLearner:
                 cand_pb = cpb_a[best_candidate]
                 cand_op = co_a[best_candidate]
                 # Also ensure the resulting depth remains within budget.
-                cand_depth_after = jnp.maximum(
-                    depth_a[jnp.clip(cand_pa, 0, self._n_features - 1)],
-                    jnp.where(
-                        cand_pb >= 0,
-                        depth_a[jnp.clip(cand_pb, 0, self._n_features - 1)],
-                        0,
-                    ),
-                ) + 1
-                topo_ok = (cand_pa < promotion_slot) & (
-                    (cand_pb < 0) | (cand_pb < promotion_slot)
+                cand_depth_after = (
+                    jnp.maximum(
+                        depth_a[jnp.clip(cand_pa, 0, self._n_features - 1)],
+                        jnp.where(
+                            cand_pb >= 0,
+                            depth_a[jnp.clip(cand_pb, 0, self._n_features - 1)],
+                            0,
+                        ),
+                    )
+                    + 1
                 )
+                topo_ok = (cand_pa < promotion_slot) & ((cand_pb < 0) | (cand_pb < promotion_slot))
                 depth_ok = cand_depth_after <= self._max_depth
                 can_promote = topo_ok & depth_ok
 
@@ -3076,19 +3496,23 @@ class CompositionalFeatureLearner:
                     jnp.where(can_promote, cand_pb, pb_a[promotion_slot])
                 )
                 theta_b = theta_a.at[promotion_slot].set(
-                    jnp.where(
-                        can_promote, ctheta_a[best_candidate], theta_a[promotion_slot]
-                    )
+                    jnp.where(can_promote, ctheta_a[best_candidate], theta_a[promotion_slot])
                 )
                 depth_b = depth_a.at[promotion_slot].set(
-                    jnp.where(
-                        can_promote, cand_depth_after, depth_a[promotion_slot]
-                    ).astype(jnp.int32)
+                    jnp.where(can_promote, cand_depth_after, depth_a[promotion_slot]).astype(
+                        jnp.int32
+                    )
+                )
+                promoted_utility = (
+                    jnp.array(0.0, dtype=jnp.float32)
+                    if (
+                        self._future_utility_mix > 0.0
+                        and self._future_utility_normalization in {"age", "uncertainty_age"}
+                    )
+                    else cutil_a[best_candidate]
                 )
                 util_b = util_a.at[promotion_slot].set(
-                    jnp.where(
-                        can_promote, cutil_a[best_candidate], util_a[promotion_slot]
-                    )
+                    jnp.where(can_promote, promoted_utility, util_a[promotion_slot])
                 )
                 age_b = age_a.at[promotion_slot].set(
                     jnp.where(can_promote, 0, age_a[promotion_slot]).astype(jnp.int32)
@@ -3334,33 +3758,25 @@ class CompositionalFeatureLearner:
                 candidate_ages,
                 feature_generator_policy,
                 candidate_generator_policy,
-            ) = jax.lax.cond(
-                should_promote, promote_branch, refresh_branch, carry
-            )
+            ) = jax.lax.cond(should_promote, promote_branch, refresh_branch, carry)
             replaced_slot = jnp.where(should_promote, promotion_slot, replaced_slot)
-            promoted_candidate = jnp.where(
-                should_promote, best_candidate, promoted_candidate
-            )
+            promoted_candidate = jnp.where(should_promote, best_candidate, promoted_candidate)
             should_promote_for_trace = should_promote
             best_candidate_for_trace = best_candidate
             promoted_slot_for_trace = promotion_slot
             ordinary_candidate_refresh_mask = ordinary_candidate_refresh_mask.at[
                 worst_candidate
             ].set(ordinary_candidate_refresh_applied)
-            post_promotion_candidate_refresh_mask = (
-                post_promotion_candidate_refresh_mask.at[best_candidate].set(
-                    should_promote
-                )
-            )
+            post_promotion_candidate_refresh_mask = post_promotion_candidate_refresh_mask.at[
+                best_candidate
+            ].set(should_promote)
             proposal_formed = should_promote | ordinary_candidate_refresh_applied
             proposal_destination_bank = jnp.where(
                 proposal_formed,
                 jnp.asarray(CURATION_DESTINATION_CANDIDATE, dtype=jnp.int32),
                 proposal_destination_bank,
             )
-            proposed_candidate_slot = jnp.where(
-                should_promote, best_candidate, worst_candidate
-            )
+            proposed_candidate_slot = jnp.where(should_promote, best_candidate, worst_candidate)
             proposal_destination_slot = jnp.where(
                 proposal_formed,
                 proposed_candidate_slot,
@@ -3398,9 +3814,7 @@ class CompositionalFeatureLearner:
             )
 
             root_change_applied = should_promote
-            root_change_mask = root_change_mask.at[promotion_slot].set(
-                should_promote
-            )
+            root_change_mask = root_change_mask.at[promotion_slot].set(should_promote)
             post_root_pre_cascade_slot = jnp.where(
                 should_promote,
                 promotion_slot,
@@ -3497,11 +3911,7 @@ class CompositionalFeatureLearner:
                 # Mark direct descendants as needing replacement; the cascade
                 # routine will then propagate further.
                 composed = ops_x != OP_RAW
-                refs_a = (
-                    composed
-                    & (pa_x == promotion_slot)
-                    & (slot_indices > promotion_slot)
-                )
+                refs_a = composed & (pa_x == promotion_slot) & (slot_indices > promotion_slot)
                 refs_b = (
                     composed
                     & (pb_x >= 0)
@@ -3576,12 +3986,8 @@ class CompositionalFeatureLearner:
         else:
 
             def replace_active_branch(
-                args: tuple[
-                    Array, Array, Array, Array, Array, Array, Array, Array, Array, Array
-                ],
-            ) -> tuple[
-                Array, Array, Array, Array, Array, Array, Array, Array, Array, Array
-            ]:
+                args: tuple[Array, Array, Array, Array, Array, Array, Array, Array, Array, Array],
+            ) -> tuple[Array, Array, Array, Array, Array, Array, Array, Array, Array, Array]:
                 (
                     ops_x,
                     pa_x,
@@ -3605,7 +4011,11 @@ class CompositionalFeatureLearner:
                 eligible = in_range & depth_ok
                 logits = self._parent_logits(
                     eligible,
-                    util_x,
+                    self._ranking_utility(
+                        util_x,
+                        age_x,
+                        self._utility_decay,
+                    ),
                     feature_values=feature_values,
                     feature_credit=feature_credit,
                     depth=depth_x,
@@ -3615,19 +4025,19 @@ class CompositionalFeatureLearner:
                 partner_logits = self._partner_logits(
                     eligible,
                     depth_x,
-                    util_x,
+                    self._ranking_utility(
+                        util_x,
+                        age_x,
+                        self._utility_decay,
+                    ),
                     ages=age_x,
                     parent_mode=parent_mode,
                 )
                 a_idx = jr.categorical(pa_key, logits).astype(jnp.int32)
                 b_idx = jr.categorical(pb_key, partner_logits).astype(jnp.int32)
-                new_op = jr.categorical(op_key, self._op_logits(forced_op)).astype(
-                    jnp.int32
-                )
+                new_op = jr.categorical(op_key, self._op_logits(forced_op)).astype(jnp.int32)
                 new_theta = 0.5 * jr.normal(theta_key, (2,), dtype=jnp.float32)
-                new_depth = (
-                    jnp.maximum(depth_x[a_idx], depth_x[b_idx]) + 1
-                ).astype(jnp.int32)
+                new_depth = (jnp.maximum(depth_x[a_idx], depth_x[b_idx]) + 1).astype(jnp.int32)
 
                 ops_n = ops_x.at[worst_active].set(new_op)
                 pa_n = pa_x.at[worst_active].set(a_idx)
@@ -3643,10 +4053,7 @@ class CompositionalFeatureLearner:
                 composed = ops_n != OP_RAW
                 refs_a = composed & (pa_n == worst_active) & (slot_indices > worst_active)
                 refs_b = (
-                    composed
-                    & (pb_n >= 0)
-                    & (pb_n == worst_active)
-                    & (slot_indices > worst_active)
+                    composed & (pb_n >= 0) & (pb_n == worst_active) & (slot_indices > worst_active)
                 )
                 replaced_mask = refs_a | refs_b
                 (
@@ -3692,12 +4099,8 @@ class CompositionalFeatureLearner:
                 )
 
             def keep_active_branch(
-                args: tuple[
-                    Array, Array, Array, Array, Array, Array, Array, Array, Array, Array
-                ],
-            ) -> tuple[
-                Array, Array, Array, Array, Array, Array, Array, Array, Array, Array
-            ]:
+                args: tuple[Array, Array, Array, Array, Array, Array, Array, Array, Array, Array],
+            ) -> tuple[Array, Array, Array, Array, Array, Array, Array, Array, Array, Array]:
                 return args
 
             do_replace = should_try_replace & has_active_slot
@@ -3817,25 +4220,15 @@ class CompositionalFeatureLearner:
             # after the root mutation, so only the subsequent cascade can
             # rebound that fresh proposal and its newly sampled theta remains
             # valid for its post-root parents.
-            safe_candidate_pa = jnp.clip(
-                candidate_parent_a, 0, self._n_features - 1
-            )
-            safe_candidate_pb = jnp.clip(
-                candidate_parent_b, 0, self._n_features - 1
-            )
+            safe_candidate_pa = jnp.clip(candidate_parent_a, 0, self._n_features - 1)
+            safe_candidate_pb = jnp.clip(candidate_parent_b, 0, self._n_features - 1)
             references_active_change = (candidate_ops != OP_RAW) & (
                 active_change_mask[safe_candidate_pa]
-                | (
-                    (candidate_parent_b >= 0)
-                    & active_change_mask[safe_candidate_pb]
-                )
+                | ((candidate_parent_b >= 0) & active_change_mask[safe_candidate_pb])
             )
             references_later_cascade = (candidate_ops != OP_RAW) & (
                 cascade_change_mask[safe_candidate_pa]
-                | (
-                    (candidate_parent_b >= 0)
-                    & cascade_change_mask[safe_candidate_pb]
-                )
+                | ((candidate_parent_b >= 0) & cascade_change_mask[safe_candidate_pb])
             )
             candidate_indices = jnp.arange(self._candidate_count, dtype=jnp.int32)
             refreshed_after_root = should_promote_for_trace & (
@@ -3864,9 +4257,7 @@ class CompositionalFeatureLearner:
             )
             if self._train_candidate_theta:
                 preexisting_trainable_rebound = (
-                    candidate_rebound_mask
-                    & (~refreshed_after_root)
-                    & (candidate_ops == OP_TANH)
+                    candidate_rebound_mask & (~refreshed_after_root) & (candidate_ops == OP_TANH)
                 )
                 candidate_theta = jnp.where(
                     preexisting_trainable_rebound[:, None],
@@ -3895,48 +4286,42 @@ class CompositionalFeatureLearner:
             # below.  A freshly generated promoted-candidate slot and any
             # rebound candidates have age zero, but the promoted active root
             # still inherits the source candidate's pre-refresh traces.
-            safe_best_candidate = jnp.clip(
-                best_candidate_for_trace, 0, self._candidate_count - 1
-            )
+            safe_best_candidate = jnp.clip(best_candidate_for_trace, 0, self._candidate_count - 1)
             promoted_contribution_trace = candidate_utility_contribution_trace[
                 :, safe_best_candidate
             ]
-            promoted_feature_trace = candidate_utility_feature_trace[
-                safe_best_candidate
-            ]
+            promoted_feature_trace = candidate_utility_feature_trace[safe_best_candidate]
             promoted_feature_energy_trace = candidate_utility_feature_energy_trace[
                 safe_best_candidate
             ]
             promoted_signal_second_moment = candidate_utility_signal_second_moment[
                 safe_best_candidate
             ]
-            promoted_score_residual_trace = candidate_score_residual_trace[
-                :, safe_best_candidate
-            ]
-            promoted_score_energy_trace = candidate_score_energy_trace[
-                safe_best_candidate
-            ]
+            promoted_score_residual_trace = candidate_score_residual_trace[:, safe_best_candidate]
+            promoted_score_energy_trace = candidate_score_energy_trace[safe_best_candidate]
             promoted_retention_slow_utility = candidate_retention_slow_utilities[
                 safe_best_candidate
             ]
+            if self._future_utility_mix > 0.0 and self._future_utility_normalization in {
+                "age",
+                "uncertainty_age",
+            }:
+                promoted_retention_slow_utility = jnp.array(
+                    0.0,
+                    dtype=jnp.float32,
+                )
         else:
-            promoted_contribution_trace = jnp.zeros(
-                (self._n_tasks,), dtype=jnp.float32
-            )
+            promoted_contribution_trace = jnp.zeros((self._n_tasks,), dtype=jnp.float32)
             promoted_feature_trace = jnp.array(0.0, dtype=jnp.float32)
             promoted_feature_energy_trace = jnp.array(0.0, dtype=jnp.float32)
             promoted_signal_second_moment = jnp.array(0.0, dtype=jnp.float32)
-            promoted_score_residual_trace = jnp.zeros(
-                (self._n_tasks,), dtype=jnp.float32
-            )
+            promoted_score_residual_trace = jnp.zeros((self._n_tasks,), dtype=jnp.float32)
             promoted_score_energy_trace = jnp.array(0.0, dtype=jnp.float32)
             promoted_retention_slow_utility = jnp.array(0.0, dtype=jnp.float32)
         utility_contribution_trace = jnp.where(
             reset_active_traces[None, :], 0.0, utility_contribution_trace
         )
-        utility_feature_trace = jnp.where(
-            reset_active_traces, 0.0, utility_feature_trace
-        )
+        utility_feature_trace = jnp.where(reset_active_traces, 0.0, utility_feature_trace)
         utility_feature_energy_trace = jnp.where(
             reset_active_traces, 0.0, utility_feature_energy_trace
         )
@@ -3946,42 +4331,30 @@ class CompositionalFeatureLearner:
         feature_score_residual_trace = jnp.where(
             reset_active_traces[None, :], 0.0, feature_score_residual_trace
         )
-        feature_score_energy_trace = jnp.where(
-            reset_active_traces, 0.0, feature_score_energy_trace
-        )
-        retention_slow_utilities = jnp.where(
-            reset_active_traces, 0.0, retention_slow_utilities
-        )
-        utility_contribution_trace = utility_contribution_trace.at[
-            :, promoted_slot_for_trace
-        ].set(
+        feature_score_energy_trace = jnp.where(reset_active_traces, 0.0, feature_score_energy_trace)
+        retention_slow_utilities = jnp.where(reset_active_traces, 0.0, retention_slow_utilities)
+        utility_contribution_trace = utility_contribution_trace.at[:, promoted_slot_for_trace].set(
             jnp.where(
                 should_promote_for_trace,
                 promoted_contribution_trace,
                 utility_contribution_trace[:, promoted_slot_for_trace],
             )
         )
-        utility_feature_trace = utility_feature_trace.at[
-            promoted_slot_for_trace
-        ].set(
+        utility_feature_trace = utility_feature_trace.at[promoted_slot_for_trace].set(
             jnp.where(
                 should_promote_for_trace,
                 promoted_feature_trace,
                 utility_feature_trace[promoted_slot_for_trace],
             )
         )
-        utility_feature_energy_trace = utility_feature_energy_trace.at[
-            promoted_slot_for_trace
-        ].set(
+        utility_feature_energy_trace = utility_feature_energy_trace.at[promoted_slot_for_trace].set(
             jnp.where(
                 should_promote_for_trace,
                 promoted_feature_energy_trace,
                 utility_feature_energy_trace[promoted_slot_for_trace],
             )
         )
-        utility_signal_second_moment = utility_signal_second_moment.at[
-            promoted_slot_for_trace
-        ].set(
+        utility_signal_second_moment = utility_signal_second_moment.at[promoted_slot_for_trace].set(
             jnp.where(
                 should_promote_for_trace,
                 promoted_signal_second_moment,
@@ -3997,18 +4370,14 @@ class CompositionalFeatureLearner:
                 feature_score_residual_trace[:, promoted_slot_for_trace],
             )
         )
-        feature_score_energy_trace = feature_score_energy_trace.at[
-            promoted_slot_for_trace
-        ].set(
+        feature_score_energy_trace = feature_score_energy_trace.at[promoted_slot_for_trace].set(
             jnp.where(
                 should_promote_for_trace,
                 promoted_score_energy_trace,
                 feature_score_energy_trace[promoted_slot_for_trace],
             )
         )
-        retention_slow_utilities = retention_slow_utilities.at[
-            promoted_slot_for_trace
-        ].set(
+        retention_slow_utilities = retention_slow_utilities.at[promoted_slot_for_trace].set(
             jnp.where(
                 should_promote_for_trace,
                 promoted_retention_slow_utility,
@@ -4051,26 +4420,34 @@ class CompositionalFeatureLearner:
             reset_candidate_traces, 0.0, candidate_selector_cumulative_loss
         )
         candidate_selector_action_counts = jnp.where(
-            reset_candidate_traces, 0.0, candidate_selector_action_counts
+            reset_candidate_traces, 0, candidate_selector_action_counts
+        )
+
+        ranking_utilities = self._ranking_utility(
+            new_utilities,
+            ages,
+            self._utility_decay,
+        )
+        ranking_candidate_utilities = self._ranking_utility(
+            new_candidate_utilities,
+            candidate_ages,
+            self._utility_decay,
         )
 
         generator_resource_state = state.generator_resource_state
         if self._learn_generator_resources:
             policy_scores, policy_finite = self._generator_policy_scores(
-                new_utilities,
+                ranking_utilities,
                 feature_generator_policy,
-                new_candidate_utilities,
+                ranking_candidate_utilities,
                 candidate_generator_policy,
             )
             if self._generator_resource_promotion_credit > 0.0:
                 promoted_policy = feature_generator_policy[promoted_slot_for_trace]
-                promotion_bonus = (
-                    jnp.asarray(
-                        self._generator_resource_promotion_credit,
-                        dtype=jnp.float32,
-                    )
-                    * jnp.maximum(jnp.max(new_candidate_utilities), 0.0)
-                )
+                promotion_bonus = jnp.asarray(
+                    self._generator_resource_promotion_credit,
+                    dtype=jnp.float32,
+                ) * jnp.maximum(jnp.max(ranking_candidate_utilities), 0.0)
                 policy_ids = jnp.arange(
                     self._generator_resource_manager.n_policies,
                     dtype=jnp.int32,
@@ -4081,9 +4458,7 @@ class CompositionalFeatureLearner:
                     jnp.where(should_promote_for_trace, promotion_bonus, 0.0),
                     0.0,
                 )
-                policy_finite = policy_finite | (
-                    promotion_mask & should_promote_for_trace
-                )
+                policy_finite = policy_finite | (promotion_mask & should_promote_for_trace)
             replacement_cost = jnp.asarray(
                 DEFAULT_GENERATOR_META_REPLACEMENT_MULTIPLIERS,
                 dtype=jnp.float32,
@@ -4107,10 +4482,7 @@ class CompositionalFeatureLearner:
             # weights rank replacement churn as the dominant cost, imprint
             # and margin secondary, and trial age smallest.
             policy_costs = (
-                replacement_cost
-                + 0.25 * imprint_cost
-                + 0.25 * margin_cost
-                + 0.1 * age_cost
+                replacement_cost + 0.25 * imprint_cost + 0.25 * margin_cost + 0.1 * age_cost
             )
             generator_resource_state = self._generator_resource_manager.update(
                 generator_resource_state,
@@ -4122,7 +4494,7 @@ class CompositionalFeatureLearner:
                 selected_probability=decision.weights[decision.action],
             ).state
 
-        new_state = CompositionalFeatureState(
+        candidate_state = CompositionalFeatureState(
             key=key,
             ops=ops,
             parent_a=parent_a,
@@ -4151,12 +4523,8 @@ class CompositionalFeatureLearner:
             candidate_utilities=new_candidate_utilities,
             candidate_utility_contribution_trace=candidate_utility_contribution_trace,
             candidate_utility_feature_trace=candidate_utility_feature_trace,
-            candidate_utility_feature_energy_trace=(
-                candidate_utility_feature_energy_trace
-            ),
-            candidate_utility_signal_second_moment=(
-                candidate_utility_signal_second_moment
-            ),
+            candidate_utility_feature_energy_trace=(candidate_utility_feature_energy_trace),
+            candidate_utility_signal_second_moment=(candidate_utility_signal_second_moment),
             candidate_score_residual_trace=candidate_score_residual_trace,
             candidate_score_energy_trace=candidate_score_energy_trace,
             candidate_retention_slow_utilities=candidate_retention_slow_utilities,
@@ -4177,7 +4545,7 @@ class CompositionalFeatureLearner:
         loss = jnp.sum(errors**2) / active_count
         mean_abs_error = jnp.sum(jnp.abs(errors)) / active_count
         max_candidate_utility = (
-            jnp.max(new_candidate_utilities)
+            jnp.max(ranking_candidate_utilities)
             if self._candidate_count > 0
             else jnp.array(0.0, dtype=jnp.float32)
         )
@@ -4186,8 +4554,8 @@ class CompositionalFeatureLearner:
             [
                 loss,
                 mean_abs_error,
-                jnp.mean(new_utilities),
-                jnp.min(new_utilities),
+                jnp.mean(ranking_utilities),
+                jnp.min(ranking_utilities),
                 max_candidate_utility,
                 replacement_flag,
                 bounding_scale,
@@ -4229,9 +4597,7 @@ class CompositionalFeatureLearner:
             cascade_key=cascade_key,
             should_try_replace=jnp.asarray(should_try_replace, dtype=jnp.bool_),
             has_event=logical_event_count > 0,
-            generator_policy_sampled=jnp.asarray(
-                self._learn_generator_resources, dtype=jnp.bool_
-            ),
+            generator_policy_sampled=jnp.asarray(self._learn_generator_resources, dtype=jnp.bool_),
             generator_policy_id=generator_policy,
             proposal_formed=proposal_formed,
             proposal_destination_bank=proposal_destination_bank,
@@ -4250,9 +4616,7 @@ class CompositionalFeatureLearner:
             post_root_pre_cascade_parent_b=post_root_pre_cascade_parent_b,
             post_root_pre_cascade_theta=post_root_pre_cascade_theta,
             post_root_pre_cascade_depth=post_root_pre_cascade_depth,
-            post_root_pre_cascade_generator_policy=(
-                post_root_pre_cascade_generator_policy
-            ),
+            post_root_pre_cascade_generator_policy=(post_root_pre_cascade_generator_policy),
             promotion_applied=should_promote_for_trace,
             promotion_source_candidate=promotion_source_candidate,
             promotion_destination_active=promotion_destination_active,
@@ -4261,9 +4625,7 @@ class CompositionalFeatureLearner:
             promoted_pre_refresh_parent_b=promoted_pre_refresh_parent_b,
             promoted_pre_refresh_theta=promoted_pre_refresh_theta,
             promoted_pre_refresh_depth=promoted_pre_refresh_depth,
-            promoted_pre_refresh_generator_policy=(
-                promoted_pre_refresh_generator_policy
-            ),
+            promoted_pre_refresh_generator_policy=(promoted_pre_refresh_generator_policy),
             cascade_refill_mask=cascade_change_mask,
             cascade_final_ops=ops,
             cascade_final_parent_a=parent_a,
@@ -4273,9 +4635,7 @@ class CompositionalFeatureLearner:
             cascade_final_generator_policy=feature_generator_policy,
             active_change_mask=active_change_mask,
             ordinary_candidate_refresh_mask=ordinary_candidate_refresh_mask,
-            post_promotion_candidate_refresh_mask=(
-                post_promotion_candidate_refresh_mask
-            ),
+            post_promotion_candidate_refresh_mask=(post_promotion_candidate_refresh_mask),
             candidate_refresh_mask=candidate_refresh_mask,
             candidate_rebound_mask=candidate_rebound_mask,
             candidate_final_ops=candidate_ops,
@@ -4289,22 +4649,48 @@ class CompositionalFeatureLearner:
             promotion_count=promotion_count,
             cascade_refill_count=cascade_refill_count,
             ordinary_candidate_refresh_count=ordinary_candidate_refresh_count,
-            post_promotion_candidate_refresh_count=(
-                post_promotion_candidate_refresh_count
-            ),
+            post_promotion_candidate_refresh_count=(post_promotion_candidate_refresh_count),
             candidate_refresh_count=candidate_refresh_count,
             candidate_rebound_count=candidate_rebound_count,
             logical_event_count=logical_event_count,
         )
 
+        update_applied = (
+            source_state_finite
+            & source_integer_state_valid
+            & lifetime_capacity_available
+            & inputs_valid
+            & generator_decision_valid
+            & floating_tree_is_finite(candidate_state)
+            & floating_tree_is_finite(curation_trace)
+            & jnp.all(jnp.isfinite(predictions))
+            & jnp.all(jnp.isfinite(reported_errors) | jnp.isnan(reported_errors))
+            & jnp.all(jnp.isfinite(metrics))
+        )
+        new_state = select_transaction(update_applied, candidate_state, state)
+        neutral_slot = jnp.asarray(-1, dtype=jnp.int32)
+        neutral_curation_trace = jax.tree.map(jnp.zeros_like, curation_trace).replace(
+            pre_step=state.step_count,
+            post_step=state.step_count,
+        )
+
         return CompositionalFeatureUpdateResult(
             state=new_state,
-            predictions=predictions,
-            errors=reported_errors,
-            metrics=metrics,
-            replaced_slot=replaced_slot,
-            promoted_candidate=promoted_candidate,
-            curation_trace=curation_trace,
+            predictions=neutralize_array(update_applied, predictions),
+            errors=neutralize_array(update_applied, reported_errors),
+            metrics=neutralize_array(update_applied, metrics),
+            replaced_slot=jnp.where(update_applied, replaced_slot, neutral_slot),
+            promoted_candidate=jnp.where(
+                update_applied,
+                promoted_candidate,
+                neutral_slot,
+            ),
+            curation_trace=select_transaction(
+                update_applied,
+                curation_trace,
+                neutral_curation_trace,
+            ),
+            update_applied=update_applied,
         )
 
 
@@ -4319,18 +4705,22 @@ def run_compositional_arrays(
     def step_fn(
         carry: CompositionalFeatureState,
         inputs: tuple[Array, Array],
-    ) -> tuple[CompositionalFeatureState, Array]:
+    ) -> tuple[CompositionalFeatureState, tuple[Array, Array]]:
         observation, target = inputs
         result = learner.update(carry, observation, target)
-        return result.state, result.metrics
+        return result.state, (result.metrics, result.update_applied)
 
     t0 = time.time()
-    final_state, metrics = jax.lax.scan(step_fn, state, (observations, targets))
+    final_state, (metrics, updates_applied) = jax.lax.scan(step_fn, state, (observations, targets))
     elapsed = time.time() - t0
     final_state = final_state.replace(  # type: ignore[attr-defined]
         uptime_s=final_state.uptime_s + elapsed
     )
-    return CompositionalFeatureLearningResult(state=final_state, metrics=metrics)
+    return CompositionalFeatureLearningResult(
+        state=final_state,
+        metrics=metrics,
+        updates_applied=updates_applied,
+    )
 
 
 def run_compositional_loop(
@@ -4349,18 +4739,25 @@ def run_compositional_loop(
     def step_fn(
         carry: tuple[CompositionalFeatureState, Any],
         idx: Array,
-    ) -> tuple[tuple[CompositionalFeatureState, Any], Array]:
+    ) -> tuple[tuple[CompositionalFeatureState, Any], tuple[Array, Array]]:
         l_state, s_state = carry
         timestep, new_s_state = stream.step(s_state, idx)
         result = learner.update(l_state, timestep.observation, timestep.target)
-        return (result.state, new_s_state), result.metrics
+        return (
+            result.state,
+            new_s_state,
+        ), (result.metrics, result.update_applied)
 
     t0 = time.time()
-    (final_state, _), metrics = jax.lax.scan(
+    (final_state, _), (metrics, updates_applied) = jax.lax.scan(
         step_fn, (learner_state, stream_state), jnp.arange(num_steps)
     )
     elapsed = time.time() - t0
     final_state = final_state.replace(  # type: ignore[attr-defined]
         uptime_s=final_state.uptime_s + elapsed
     )
-    return CompositionalFeatureLearningResult(state=final_state, metrics=metrics)
+    return CompositionalFeatureLearningResult(
+        state=final_state,
+        metrics=metrics,
+        updates_applied=updates_applied,
+    )

@@ -1,4 +1,14 @@
-"""Shared validation for configuration scalars consumed as float32."""
+"""Shared validation for configuration scalars that are consumed as float32.
+
+A configuration scalar is checked in both domains that matter: the exact host
+value (so a lying ``as_integer_ratio`` or a value that only *rounds* into
+range cannot pass) and its binary32 rounding (so a host-finite value that
+narrows to infinity, zero, or the excluded end of a half-open interval is
+refused before it can freeze an EMA or divide by zero at the sink).  Only an
+actual built-in ``float`` is stored as-is — JAX narrows it once, exactly as
+validated here — while ints and other reals are stored as the validated
+binary32 value.
+"""
 
 from __future__ import annotations
 
@@ -18,7 +28,13 @@ def validated_float32_scalar(
     upper: float | None = None,
     upper_inclusive: bool = True,
 ) -> float:
-    """Return the canonical stored float32-consumed scalar or fail closed."""
+    """Return the canonical stored value of one float32-consumed scalar or fail closed.
+
+    Raises:
+        ValueError: If ``value`` is not an actual non-bool real, does not narrow
+            to a finite binary32, or leaves the declared domain either as the
+            exact host value or once narrowed to binary32.
+    """
     stored, _, _ = validated_float32_scalar_with_ratio(
         name,
         value,
@@ -39,7 +55,7 @@ def validated_float32_scalar_with_ratio(
     upper: float | None = None,
     upper_inclusive: bool = True,
 ) -> tuple[float, int, int]:
-    """Validate a scalar and return its exact host ratio."""
+    """Validate once and also return the exact host numerator and denominator."""
     actual_type = type(value)
     if issubclass(actual_type, bool) or not issubclass(actual_type, Real):
         raise ValueError(f"{name} must be a finite real number")
@@ -57,7 +73,9 @@ def validated_float32_scalar_with_ratio(
         if lower is not None and candidate < lower:
             return False
         if upper is not None:
-            return bool(candidate <= upper) if upper_inclusive else bool(candidate < upper)
+            if upper_inclusive:
+                return bool(candidate <= upper)
+            return bool(candidate < upper)
         return True
 
     def ratio_compares_to(bound: float) -> int:
@@ -87,10 +105,7 @@ def validated_float32_scalar_with_ratio(
 
 
 def _describe_domain(
-    positive: bool,
-    lower: float | None,
-    upper: float | None,
-    upper_inclusive: bool,
+    positive: bool, lower: float | None, upper: float | None, upper_inclusive: bool
 ) -> str:
     if upper is not None:
         floor = lower if lower is not None else "-inf"

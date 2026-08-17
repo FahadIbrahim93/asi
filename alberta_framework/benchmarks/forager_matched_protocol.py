@@ -106,6 +106,21 @@ class MatchedTask:
     task_identity_sha256: str
     environment_rng_schedule_sha256: str
 
+    def __post_init__(self) -> None:
+        aperture_size = _require_int(
+            self.aperture_size,
+            "task.aperture_size",
+            minimum=1,
+            maximum=65_535,
+        )
+        if aperture_size % 2 != 1:
+            raise ForagerMatchedProtocolError("task.aperture_size must be odd")
+        object.__setattr__(
+            self,
+            "aperture_size",
+            aperture_size,
+        )
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "task_id": self.task_id,
@@ -268,6 +283,13 @@ class AgentRNGContract:
     identity: str
     environment_key_shared: bool
 
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "environment_key_shared",
+            _require_bool(self.environment_key_shared, "agent_rng.environment_key_shared"),
+        )
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "identity": self.identity,
@@ -318,6 +340,48 @@ class ResourceAccounting:
     replay_capacity_transitions: int
     recurrent_state_elements: int
 
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "parameter_count",
+            _require_int(
+                self.parameter_count,
+                "resources.parameter_count",
+                minimum=0,
+                maximum=_MAX_RESOURCE_COUNT,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "optimizer_update_count",
+            _require_int(
+                self.optimizer_update_count,
+                "resources.optimizer_update_count",
+                minimum=0,
+                maximum=_MAX_RESOURCE_COUNT,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "replay_capacity_transitions",
+            _require_int(
+                self.replay_capacity_transitions,
+                "resources.replay_capacity_transitions",
+                minimum=0,
+                maximum=_MAX_RESOURCE_COUNT,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "recurrent_state_elements",
+            _require_int(
+                self.recurrent_state_elements,
+                "resources.recurrent_state_elements",
+                minimum=0,
+                maximum=_MAX_RESOURCE_COUNT,
+            ),
+        )
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "parameter_count": self.parameter_count,
@@ -334,6 +398,24 @@ class PairingEligibility:
     analysis_role: AnalysisRole
     eligible: bool
     exclusion_reasons: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        eligible = _require_bool(self.eligible, "pairing.eligible")
+        if eligible and (self.analysis_role != "inferential" or self.exclusion_reasons):
+            raise ForagerMatchedProtocolError(
+                "pairing eligible candidates must be inferential with no exclusion reasons"
+            )
+        if not eligible and (
+            self.analysis_role != "descriptive_only" or not self.exclusion_reasons
+        ):
+            raise ForagerMatchedProtocolError(
+                "pairing ineligible candidates must be descriptive with exclusion reasons"
+            )
+        object.__setattr__(
+            self,
+            "eligible",
+            eligible,
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -420,6 +502,13 @@ class SelectionSlot:
     selection_group: str
     rank: int
 
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "rank",
+            _require_int(self.rank, "selection_slot.rank", minimum=1, maximum=_MAX_CANDIDATES),
+        )
+
     def to_dict(self) -> dict[str, Any]:
         return {"selection_group": self.selection_group, "rank": self.rank}
 
@@ -431,6 +520,23 @@ class SelectionGroup:
     selection_group: str
     candidate_ids: tuple[str, ...]
     advance_count: int
+
+    def __post_init__(self) -> None:
+        advance_count = _require_int(
+            self.advance_count,
+            "selection_group.advance_count",
+            minimum=1,
+            maximum=_MAX_CANDIDATES,
+        )
+        if advance_count > len(self.candidate_ids):
+            raise ForagerMatchedProtocolError(
+                "selection_group.advance_count may not exceed the group candidate count"
+            )
+        object.__setattr__(
+            self,
+            "advance_count",
+            advance_count,
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -1053,7 +1159,7 @@ def _require_literal(value: Any, path: str, choices: tuple[str, ...]) -> str:
 
 
 def _require_bool(value: Any, path: str) -> bool:
-    if not isinstance(value, bool):
+    if type(value) is not bool:
         raise ForagerMatchedProtocolError(f"{path} must be a boolean")
     return value
 
@@ -1065,7 +1171,7 @@ def _require_int(
     minimum: int,
     maximum: int,
 ) -> int:
-    if isinstance(value, bool) or not isinstance(value, int):
+    if type(value) is not int:
         raise ForagerMatchedProtocolError(f"{path} must be an integer")
     if value < minimum or value > maximum:
         raise ForagerMatchedProtocolError(f"{path} must lie in [{minimum}, {maximum}]")
@@ -1211,8 +1317,6 @@ def _parse_task(value: Any) -> MatchedTask:
         minimum=1,
         maximum=65_535,
     )
-    if aperture % 2 != 1:
-        raise ForagerMatchedProtocolError(f"{path}.aperture_size must be odd")
     return MatchedTask(
         task_id=_require_identifier(payload["task_id"], f"{path}.task_id"),
         preset=preset,
@@ -1598,14 +1702,6 @@ def _parse_pairing(value: Any, path: str) -> PairingEligibility:
     reasons = _require_unique_identifiers(
         payload["exclusion_reasons"], f"{path}.exclusion_reasons", allow_empty=True
     )
-    if eligible and (role != "inferential" or reasons):
-        raise ForagerMatchedProtocolError(
-            f"{path} eligible candidates must be inferential with no exclusion reasons"
-        )
-    if not eligible and (role != "descriptive_only" or not reasons):
-        raise ForagerMatchedProtocolError(
-            f"{path} ineligible candidates must be descriptive with exclusion reasons"
-        )
     return PairingEligibility(
         analysis_role=cast(AnalysisRole, role),
         eligible=eligible,
@@ -1727,10 +1823,6 @@ def _parse_selection_plan(value: Any) -> SelectionPlan:
             minimum=1,
             maximum=_MAX_CANDIDATES,
         )
-        if advance_count > len(candidate_ids):
-            raise ForagerMatchedProtocolError(
-                f"{item_path}.advance_count may not exceed the group candidate count"
-            )
         groups.append(
             SelectionGroup(
                 selection_group=_require_identifier(

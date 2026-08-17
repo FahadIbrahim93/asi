@@ -48,6 +48,44 @@ def _sha(label: str) -> str:
     return hashlib.sha256(label.encode("ascii")).hexdigest()
 
 
+@pytest.mark.parametrize("invalid", [float("nan"), float("inf"), float("-inf")])
+def test_canonical_json_rejects_nonfinite_number_identities(invalid: float) -> None:
+    with pytest.raises(
+        qualification.ForagerMatchedQualificationError,
+        match="non-finite JSON number",
+    ):
+        qualification._canonical_json_bytes({"score": invalid})  # noqa: SLF001
+
+
+def test_canonical_json_rejects_hostile_container_subclasses_without_hooks() -> None:
+    class HostileMapping(dict[str, object]):
+        def items(self):  # type: ignore[no-untyped-def, override]
+            raise AssertionError("canonicalization must not invoke mapping hooks")
+
+    class HostileSequence(list[object]):
+        def __iter__(self):
+            raise AssertionError("canonicalization must not invoke sequence hooks")
+
+    for value in (HostileMapping(value=1), HostileSequence()):
+        with pytest.raises(
+            qualification.ForagerMatchedQualificationError,
+            match="unsupported",
+        ):
+            qualification._plain_json(value)  # noqa: SLF001
+
+
+def test_replace_integer_literals_keeps_finite_configuration_copy() -> None:
+    raw = b'{"total_steps": 1}'
+    transform = SimpleNamespace(
+        transform_type="byte_preserving_unique_literal_replacement",
+        value_type="integer",
+        value=2,
+        target="total_steps",
+    )
+    rewritten = qualification._replace_integer_literals(raw, (transform,))  # noqa: SLF001
+    assert b'"total_steps": 2' in rewritten or b'"total_steps":2' in rewritten
+
+
 def _fresh_replay_fixture(
     tmp_path: Path,
 ) -> tuple[Path, Any, str, dict[str, Any]]:
@@ -1907,6 +1945,155 @@ def test_probe_result_accepts_only_reward_blind_unendorsed_payload(tmp_path: Pat
     assert caught.value.__cause__ is overflow
 
 
+def _minimal_qualification_manifest() -> dict[str, Any]:
+    """Build the smallest manifest that reaches the authority/boundary gate.
+
+    Every field ahead of ``load_matched_current_qualification_bundle``'s
+    authority/reward-blind-boundary comparison (schema/status/candidate_order
+    consistency) is populated with its exact expected value; every field the
+    loader only inspects *after* that gate is populated with a placeholder,
+    since a manifest that fails the gate under test must never reach them.
+    """
+    candidate_order = list(builder.MATCHED_CURRENT_CANDIDATE_IDS)
+    return {
+        "schema_version": qualification.MATCHED_CURRENT_QUALIFICATION_SCHEMA_VERSION,
+        "classification": "content_only_unendorsed_nonpromoting",
+        "status": "structurally_qualified_external_trust_resolution_required",
+        "promotion_authorized": False,
+        "performance_claim": False,
+        "external_verification_required": True,
+        "authority": {
+            "identity": qualification.MATCHED_CURRENT_AUTHORITY_IDENTITY,
+            "content_only": True,
+            "externally_endorsed": False,
+            "external_signature_created": False,
+            "trust_profile_created": False,
+        },
+        "reward_blind_boundary": {
+            "qualification_seed": qualification.PUBLIC_QUALIFICATION_SEED,
+            "qualification_seed_class": "public_nonbenchmark_seed",
+            "tuning_seeds_used": [],
+            "evaluation_seeds_used": [],
+            "environment_resets": len(candidate_order),
+            "environment_transitions": 0,
+            "reward_arrays_read": 0,
+            "result_archives_opened": 0,
+        },
+        "runtime_qualification": {},
+        "qualification_probe": {},
+        "resource_accounting_semantics": {},
+        "executor_qualification_roots": {},
+        "frozen_executor_qualification_artifacts": {},
+        "candidate_order": candidate_order,
+        "sources": {},
+        "candidates": {},
+        "open_protocol_sha256": "",
+    }
+
+
+def _write_qualification_manifest(root: Path, manifest: dict[str, Any]) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    manifest_raw = qualification._canonical_json_bytes(manifest)  # noqa: SLF001
+    (root / "manifest.json").write_bytes(manifest_raw)
+    digest = hashlib.sha256(manifest_raw).hexdigest()
+    (root / "manifest.json.sha256").write_bytes(f"{digest}\n".encode("ascii"))
+
+
+@pytest.mark.parametrize(
+    ("section", "field", "alias"),
+    [
+        ("authority", "content_only", 1),
+        ("authority", "externally_endorsed", 0),
+        ("reward_blind_boundary", "environment_transitions", False),
+        ("reward_blind_boundary", "reward_arrays_read", 0.0),
+    ],
+)
+def test_manifest_rejects_wrong_type_numeric_aliases_in_authority_boundary(
+    tmp_path: Path,
+    section: str,
+    field: str,
+    alias: object,
+) -> None:
+    manifest = _minimal_qualification_manifest()
+    manifest[section][field] = alias
+    root = tmp_path / "qualification"
+    _write_qualification_manifest(root, manifest)
+
+    with pytest.raises(
+        qualification.ForagerMatchedQualificationError,
+        match="qualification authority boundary drifted",
+    ):
+        qualification.load_matched_current_qualification_bundle(root)
+
+
+def test_manifest_with_true_types_reaches_past_authority_boundary_gate(
+    tmp_path: Path,
+) -> None:
+    """A byte-identical, correctly-typed manifest must not trip this gate.
+
+    It is still rejected further down (placeholder executor/source/candidate
+    fields), proving the gate under test is not merely rejecting everything.
+    """
+    manifest = _minimal_qualification_manifest()
+    root = tmp_path / "qualification"
+    _write_qualification_manifest(root, manifest)
+
+    with pytest.raises(
+        qualification.ForagerMatchedQualificationError,
+        match="runtime qualification drifted",
+    ):
+        qualification.load_matched_current_qualification_bundle(root)
+
+
+@pytest.mark.parametrize(
+    ("section", "field", "alias"),
+    [
+        (None, "qualification_seed", 0.0),
+        ("seed_resolution", "requested_seed", False),
+        ("reward_blind_boundary", "environment_resets", True),
+        ("configuration", "round_trip_accepted", 1),
+        ("authority", "content_only", 1),
+        ("authority", "promotion_authorized", 0),
+    ],
+)
+def test_persisted_probe_rejects_wrong_type_numeric_aliases(
+    tmp_path: Path,
+    section: str | None,
+    field: str,
+    alias: object,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    config = tmp_path / "config.json"
+    config.write_bytes(b"{}")
+    probe = tmp_path / "probe.py"
+    probe.write_bytes(b"# staged probe\n")
+    invocation = qualification.ProbeInvocation(
+        candidate_id="external_dqn_plain",
+        source_key="upstream",
+        source_root=source,
+        probe_path=probe,
+        probe_sha256=hashlib.sha256(probe.read_bytes()).hexdigest(),
+        configuration=config,
+        configuration_sha256=hashlib.sha256(b"{}").hexdigest(),
+        entrypoint_path="src/continuing_main.py",
+        entrypoint_sha256=_sha("entrypoint"),
+        entrypoint_family="continuing_main",
+        implementation_kind="upstream_dqn_plain",
+        invocation_style="official_foragax_continuing_main_v4",
+        result_root="results/results/run/alberta/DQN",
+        seed_transport="top_level_seed",
+        expected_agent="DQN",
+        horizon=builder.MATCHED_CURRENT_HORIZON,
+    )
+    payload = _probe_payload(invocation)
+    target = payload if section is None else payload[section]
+    target[field] = alias
+
+    with pytest.raises(qualification.ForagerMatchedQualificationError):
+        qualification._verify_probe_payload(payload, invocation)  # noqa: SLF001
+
+
 @pytest.mark.parametrize(
     ("buffer_min_size", "expected"),
     [(32, 124_920), (50, 124_915)],
@@ -2046,7 +2233,7 @@ def test_bundle_preserves_exact_manifest_bytes_and_threads_one_digest(
 
     with pytest.raises(
         qualification.ForagerMatchedQualificationError,
-        match="bounded canonical JSON",
+        match="non-finite JSON number",
     ):
         replace(
             bundle,

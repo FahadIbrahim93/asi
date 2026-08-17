@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
+from fractions import Fraction
 
 import chex
 import jax
@@ -103,7 +104,7 @@ def test_config_roundtrip_validation_and_exact_resource_budget() -> None:
             target_dim=1,
             change_calibration_steps=1,
         )
-    with pytest.raises(ValueError, match="fit in int32"):
+    with pytest.raises(ValueError, match="change_calibration_steps"):
         LearningSignalEstimatorConfig(
             ensemble_size=2,
             target_dim=1,
@@ -325,6 +326,25 @@ def test_lifetime_counters_saturate_without_wraparound() -> None:
     assert int(still_saturated.invalid_count) == 1
 
 
+@pytest.mark.parametrize(
+    ("field", "value", "expected_dtype"),
+    [
+        ("step_count", jnp.asarray(0, dtype=jnp.int16), "int32"),
+        ("calibration_mean", jnp.asarray(0.0, dtype=jnp.float16), "float32"),
+    ],
+)
+def test_learning_signal_state_rejects_noncanonical_dtypes(
+    field: str,
+    value: jax.Array,
+    expected_dtype: str,
+) -> None:
+    estimator = _estimator()
+    state = replace(estimator.init(), **{field: value})
+
+    with pytest.raises(ValueError, match=rf"state\.{field} must have dtype {expected_dtype}"):
+        _observe_scalar(estimator, state)
+
+
 def test_shape_and_dtype_validation_is_strict() -> None:
     estimator = _estimator()
     state = estimator.init()
@@ -435,3 +455,180 @@ def test_checkpoint_resume_matches_uninterrupted_scan(tmp_path) -> None:
         jax.tree_util.tree_structure(expected_state),
         jax.tree_util.tree_structure(actual_state),
     )
+
+
+def test_zero_ema_decay_does_not_multiply_inf_trackers() -> None:
+    """A disabled EMA decay times an infinite tracker is NaN."""
+    estimator = _estimator(fast_loss_decay=0.0, change_decay=0.0)
+    state, _ = _observe_scalar(estimator, estimator.init())
+    state = state.replace(fast_loss_ema=jnp.asarray(jnp.inf, dtype=jnp.float32))
+    raw = jnp.asarray(0.0, dtype=jnp.float32) * jnp.asarray(jnp.inf, dtype=jnp.float32)
+    assert not bool(jnp.isfinite(raw))
+
+    next_state, _ = _observe_scalar(estimator, state, loss=0.25)
+    chex.assert_trees_all_close(
+        next_state.fast_loss_ema,
+        jnp.asarray(0.25, dtype=jnp.float32),
+    )
+
+    calibrated = _calibrated_state(estimator).replace(
+        sustained_change_probability=jnp.asarray(jnp.inf, dtype=jnp.float32),
+    )
+    next_calibrated, _ = _observe_scalar(estimator, calibrated)
+    assert bool(jnp.isfinite(next_calibrated.sustained_change_probability))
+
+
+def test_learning_signals_config_rejects_booleans_and_non_integers() -> None:
+    with pytest.raises(ValueError, match="ensemble_size"):
+        LearningSignalEstimatorConfig(ensemble_size=True, target_dim=1)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="target_dim"):
+        LearningSignalEstimatorConfig(ensemble_size=2, target_dim=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="progress_warmup_steps"):
+        LearningSignalEstimatorConfig(ensemble_size=2, target_dim=1, progress_warmup_steps=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="change_calibration_steps"):
+        LearningSignalEstimatorConfig(ensemble_size=2, target_dim=1, change_calibration_steps=True)  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="ensemble_size"):
+        LearningSignalEstimatorConfig(ensemble_size=2.5, target_dim=1)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="target_dim"):
+        LearningSignalEstimatorConfig(ensemble_size=2, target_dim=1.5)  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="fast_loss_decay"):
+        LearningSignalEstimatorConfig(ensemble_size=2, target_dim=1, fast_loss_decay=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="fast_loss_decay"):
+        LearningSignalEstimatorConfig(ensemble_size=2, target_dim=1, fast_loss_decay=1.0 - 1e-10)
+    with pytest.raises(ValueError, match="change_decay"):
+        LearningSignalEstimatorConfig(ensemble_size=2, target_dim=1, change_decay=True)  # type: ignore[arg-type]
+
+
+def test_learning_signals_config_accepts_and_canonicalizes_numpy_integers() -> None:
+    config = LearningSignalEstimatorConfig(
+        ensemble_size=np.int32(4),
+        target_dim=np.int64(2),
+        progress_warmup_steps=np.uint16(3),
+        change_calibration_steps=np.int8(8),
+    )
+    assert type(config.ensemble_size) is int
+    assert type(config.target_dim) is int
+    assert type(config.progress_warmup_steps) is int
+    assert type(config.change_calibration_steps) is int
+    assert config.ensemble_size == 4
+    assert config.target_dim == 2
+    assert config.progress_warmup_steps == 3
+    assert config.change_calibration_steps == 8
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    (
+        "variance_floor",
+        "change_z_threshold",
+        "change_temperature",
+        "calibration_scale_floor",
+        "max_normalized_residual",
+        "max_input_magnitude",
+        "max_predicted_variance",
+        "max_observed_loss",
+    ),
+)
+@pytest.mark.parametrize("invalid", (True, float("inf"), 1.0e40, 0.0))
+def test_learning_signals_positive_float32_fields_fail_closed(
+    field_name: str, invalid: object
+) -> None:
+    with pytest.raises(ValueError, match=field_name):
+        LearningSignalEstimatorConfig(
+            ensemble_size=2,
+            target_dim=1,
+            **{field_name: invalid},
+        )
+
+
+def test_learning_signals_config_rejects_spoofed_scalar_and_schema_types() -> None:
+    class HostileInt(int):
+        @property
+        def __class__(self) -> type:
+            return int
+
+        def __repr__(self) -> str:
+            raise AssertionError("repr executed")
+
+    class SpoofedStr(str):
+        @property
+        def __class__(self) -> type:
+            return str
+
+
+    with pytest.raises(ValueError, match="ensemble_size"):
+        LearningSignalEstimatorConfig(ensemble_size=HostileInt(2), target_dim=1)
+    with pytest.raises(ValueError, match="type"):
+        LearningSignalEstimatorConfig.from_config(
+            {
+                "type": SpoofedStr("LearningSignalEstimatorConfig"),
+                "ensemble_size": 2,
+                "target_dim": 1,
+            }
+        )
+    with pytest.raises(ValueError, match="actual dict"):
+        LearningSignalEstimatorConfig.from_config(  # type: ignore[arg-type]
+            _DictSubclass(ensemble_size=2, target_dim=1)
+        )
+
+
+class _DictSubclass(dict[str, object]):
+    """A mapping subtype that must not reach deserialization hooks."""
+
+
+def test_learning_signal_cross_scalar_order_holds_before_and_after_narrowing() -> None:
+    below = Fraction(1, 2) - Fraction(1, 2**80)
+    above = Fraction(1, 2) + Fraction(1, 2**80)
+    with pytest.raises(ValueError, match="fast_loss_decay"):
+        LearningSignalEstimatorConfig(
+            ensemble_size=2,
+            target_dim=1,
+            fast_loss_decay=below,
+            slow_loss_decay=above,
+        )
+    with pytest.raises(ValueError, match="variance_floor"):
+        LearningSignalEstimatorConfig(
+            ensemble_size=2,
+            target_dim=1,
+            variance_floor=above,
+            max_predicted_variance=Fraction(1, 2),
+        )
+
+
+def test_learning_signal_bounds_cover_actual_worst_case_operations() -> None:
+    with pytest.raises(ValueError, match="four times max_input_magnitude"):
+        LearningSignalEstimatorConfig(
+            ensemble_size=2,
+            target_dim=1,
+            max_input_magnitude=float.fromhex("0x1.fffffep+62"),
+            max_predicted_variance=np.finfo(np.float32).max,
+        )
+    with pytest.raises(ValueError, match="counter lifetime"):
+        LearningSignalEstimatorConfig(
+            ensemble_size=2,
+            target_dim=1,
+            max_normalized_residual=1.0e20,
+        )
+
+
+def test_learning_signal_stable_reductions_remain_finite_at_legal_large_bounds() -> None:
+    estimator = LearningSignalEstimator(
+        LearningSignalEstimatorConfig(
+            ensemble_size=2,
+            target_dim=1,
+            max_input_magnitude=1.0e18,
+            max_predicted_variance=1.0,
+        )
+    )
+    state = estimator.init()
+    next_state, signals = estimator.observe(
+        state,
+        jnp.asarray([[-1.0e18], [1.0e18]], dtype=jnp.float32),
+        jnp.ones((2, 1), dtype=jnp.float32),
+        jnp.asarray([-1.0e18], dtype=jnp.float32),
+        jnp.asarray(1.0, dtype=jnp.float32),
+    )
+    assert bool(jnp.isfinite(signals.epistemic_disagreement))
+    assert bool(jnp.isfinite(next_state.calibration_m2))

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from types import MappingProxyType
+
 import chex
 import jax
 import jax.numpy as jnp
@@ -111,6 +113,25 @@ class TestStep:
         # A non-zero next observation now produces surprise.
         s2 = d.step(s0, jnp.array([0.0, 0.0]), jnp.array([2.0, 0.0]))
         assert float(s2.utility[0]) > 0.0
+
+    def test_infinite_next_obs_does_not_poison_predictors(self) -> None:
+        """Zero init V(s') is 0 @ inf = NaN, then alpha * nan * obs poisons all."""
+        d = CumulantDiscovery(raw_dim=2, n_candidates=3, predictor_step_size=0.1)
+        state = d.init(jr.key(0))
+        obs = jnp.array([0.0, 1.0], dtype=jnp.float32)
+        nxt = jnp.array([jnp.inf, 1.0], dtype=jnp.float32)
+
+        poisoned = d.step(state, obs, nxt)
+        chex.assert_trees_all_close(poisoned.weights, state.weights)
+        chex.assert_trees_all_close(poisoned.biases, state.biases)
+        chex.assert_trees_all_close(poisoned.utility, state.utility)
+        chex.assert_trees_all_close(poisoned.ages, state.ages)
+
+        recovered = d.step(poisoned, obs, jnp.array([1.0, 1.0], dtype=jnp.float32))
+        chex.assert_tree_all_finite(recovered.weights)
+        chex.assert_tree_all_finite(recovered.biases)
+        chex.assert_tree_all_finite(recovered.utility)
+        chex.assert_trees_all_close(recovered.ages, state.ages + 1)
 
     def test_predictor_reduces_td_error(self) -> None:
         d = CumulantDiscovery(
@@ -274,3 +295,181 @@ class TestConfig:
         assert restored.raw_dim == 8
         assert restored.n_candidates == 12
         assert restored.enabled is True
+
+
+@pytest.mark.parametrize(
+    "integer_type",
+    [
+        np.int8,
+        np.int16,
+        np.int32,
+        np.int64,
+        np.longlong,
+        np.uint8,
+        np.uint16,
+        np.uint32,
+        np.uint64,
+        np.ulonglong,
+    ],
+)
+def test_cumulant_discovery_canonicalizes_numpy_integer_family(integer_type) -> None:
+    discovery = CumulantDiscovery(
+        raw_dim=integer_type(4),
+        n_candidates=integer_type(3),
+        maturity_threshold=integer_type(2),
+    )
+
+    assert type(discovery.raw_dim) is int
+    assert type(discovery.n_candidates) is int
+    assert type(discovery._maturity_threshold) is int
+
+
+@pytest.mark.parametrize("field", ["raw_dim", "n_candidates", "maturity_threshold"])
+def test_cumulant_discovery_rejects_hostile_integer_subclasses(field: str) -> None:
+    class HostileInt(int):
+        def __index__(self) -> int:
+            raise AssertionError("untrusted index hook executed")
+
+        def __repr__(self) -> str:
+            raise AssertionError("untrusted repr hook executed")
+
+    kwargs = {"raw_dim": 4, "n_candidates": 3, field: HostileInt(2)}
+    with pytest.raises(ValueError, match=field):
+        CumulantDiscovery(**kwargs)
+
+
+@pytest.mark.parametrize(
+    "field", ["decay_rate", "replacement_rate", "predictor_step_size", "gamma"]
+)
+def test_cumulant_discovery_rejects_float_subclasses_without_hooks(field: str) -> None:
+    class CountingFloat(float):
+        def __new__(cls):
+            instance = super().__new__(cls, 0.5)
+            instance.calls = 0
+            return instance
+
+        def as_integer_ratio(self) -> tuple[int, int]:
+            self.calls += 1
+            return (1, 2)
+
+    value = CountingFloat()
+    with pytest.raises(ValueError, match=field):
+        CumulantDiscovery(raw_dim=4, **{field: value})
+    assert value.calls == 0
+
+
+def test_cumulant_discovery_hostile_float_failure_never_formats_repr() -> None:
+    class ExplodingFloat(float):
+        def as_integer_ratio(self) -> tuple[int, int]:
+            raise RuntimeError("hostile ratio")
+
+        def __repr__(self) -> str:
+            raise AssertionError("untrusted repr hook executed")
+
+    with pytest.raises(ValueError, match="decay_rate"):
+        CumulantDiscovery(raw_dim=4, decay_rate=ExplodingFloat(0.5))
+
+
+@pytest.mark.parametrize("field", ["replacement_rate", "gamma"])
+def test_cumulant_discovery_rejects_exact_nonzero_float32_underflow(field: str) -> None:
+    tiny = np.nextafter(np.longdouble(0), np.longdouble(1))
+    with pytest.raises(ValueError, match="remain nonzero"):
+        CumulantDiscovery(raw_dim=4, **{field: tiny})
+
+
+def test_cumulant_discovery_resource_formula_matches_state() -> None:
+    discovery = CumulantDiscovery(raw_dim=5, n_candidates=3)
+    state = discovery.init(jr.key(0))
+    actual_bytes = sum(int(leaf.nbytes) for leaf in jax.tree_util.tree_leaves(state))
+
+    assert discovery.persistent_resource_budget["persistent_bytes"] == actual_bytes
+
+
+def test_cumulant_discovery_resource_boundary_is_allocation_free() -> None:
+    last_valid_dim = ((256 * 1024 * 1024 // 4) - 5) // 2
+    discovery = CumulantDiscovery(raw_dim=last_valid_dim, n_candidates=1)
+    assert discovery.persistent_resource_budget["persistent_bytes"] <= 256 * 1024 * 1024
+    with pytest.raises(ValueError, match="256 MiB"):
+        CumulantDiscovery(raw_dim=last_valid_dim + 1, n_candidates=1)
+
+
+def test_cumulant_discovery_config_preserves_historical_mapping_forms() -> None:
+    config = CumulantDiscovery(raw_dim=4).to_config()
+    config["raw_dim"] = np.int32(4)
+    assert CumulantDiscovery.from_config(MappingProxyType(config)).raw_dim == 4
+    partial = {"type": "historical-marker", "raw_dim": 4}
+    restored = CumulantDiscovery.from_config(partial)
+    assert restored.n_candidates == 16
+
+
+def test_cumulant_discovery_age_saturates_at_int32_max() -> None:
+    discovery = CumulantDiscovery(raw_dim=2, n_candidates=1)
+    state = discovery.init(jr.key(0)).replace(
+        ages=jnp.asarray([2**31 - 1], dtype=jnp.int32)
+    )
+    advanced = discovery.step(state, jnp.ones(2), jnp.ones(2))
+
+    assert int(advanced.ages[0]) == 2**31 - 1
+
+
+def test_cumulant_discovery_requires_exact_bool_and_typed_threefry_key() -> None:
+    with pytest.raises(ValueError, match="enabled"):
+        CumulantDiscovery(raw_dim=2, enabled=np.bool_(True))  # type: ignore[arg-type]
+
+    discovery = CumulantDiscovery(raw_dim=2)
+    with pytest.raises(ValueError, match="typed scalar threefry2x32"):
+        discovery.init(jr.key_data(jr.key(0)))
+
+
+@pytest.mark.parametrize("shape", [(), (1,), (1, 2), (2, 1), (3,)])
+def test_cumulant_discovery_rejects_wrong_observation_shapes(
+    shape: tuple[int, ...]
+) -> None:
+    discovery = CumulantDiscovery(raw_dim=2, n_candidates=2)
+    state = discovery.init(jr.key(0))
+    malformed = jnp.zeros(shape, dtype=jnp.float32)
+    with pytest.raises(ValueError, match="observation"):
+        discovery.cumulants(state, malformed)
+    with pytest.raises(ValueError, match="observation"):
+        discovery.step(state, malformed, jnp.zeros((2,), dtype=jnp.float32))
+
+    with pytest.raises(ValueError, match="dtype float32"):
+        discovery.cumulants(state, jnp.zeros((2,), dtype=jnp.int32))
+
+
+def test_cumulant_discovery_state_contract_and_invalid_atomicity() -> None:
+    discovery = CumulantDiscovery(raw_dim=2, n_candidates=2, replacement_rate=1.0)
+    state = discovery.init(jr.key(0))
+    malformed = state.replace(weights=jnp.zeros((2,), dtype=jnp.float32))
+    with pytest.raises(ValueError, match="state.weights"):
+        discovery.step(
+            malformed,
+            jnp.zeros((2,), dtype=jnp.float32),
+            jnp.zeros((2,), dtype=jnp.float32),
+        )
+
+    invalid = state.replace(ages=jnp.asarray([-1, 0], dtype=jnp.int32))
+    replaced = discovery.maybe_replace(invalid)
+    chex.assert_trees_all_equal(replaced, invalid)
+
+    nonfinite = state.replace(utility=jnp.asarray([jnp.nan, 0.0], dtype=jnp.float32))
+    stepped = discovery.step(
+        nonfinite,
+        jnp.zeros((2,), dtype=jnp.float32),
+        jnp.zeros((2,), dtype=jnp.float32),
+    )
+    chex.assert_trees_all_equal(stepped, nonfinite)
+
+
+def test_cumulant_discovery_hostile_observation_failure_is_normalized() -> None:
+    class HostileObservation:
+        def __jax_array__(self):
+            raise RuntimeError("hostile conversion")
+
+        def __repr__(self) -> str:
+            raise AssertionError("untrusted repr hook executed")
+
+    discovery = CumulantDiscovery(raw_dim=2)
+    state = discovery.init(jr.key(0))
+    with pytest.raises(ValueError, match="readable float32 vector"):
+        discovery.cumulants(state, HostileObservation())  # type: ignore[arg-type]

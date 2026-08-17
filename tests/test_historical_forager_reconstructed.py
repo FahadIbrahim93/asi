@@ -22,6 +22,7 @@ from alberta_framework.benchmarks.historical_forager import (
     HistoricalForagerContractError,
     HistoricalForagerPairingIdentity,
     HistoricalForagerRunConfig,
+    HistoricalForagerRunResult,
     HistoricalUpdateKernel,
     assert_historical_artifacts_pairable,
     development_historical_environment_adapter,
@@ -310,6 +311,51 @@ def test_nonempty_info_is_rejected_and_never_reaches_kernel(tmp_path: Path) -> N
     assert not config.output_directory.exists()
 
 
+class _SpoofedFloat:
+    """Mimics ``float`` via ``__class__`` to defeat ``isinstance`` checks."""
+
+    @property
+    def __class__(self) -> type:  # type: ignore[override]
+        return float
+
+    def __float__(self) -> float:
+        return 0.5
+
+
+def test_class_spoofed_reward_is_rejected_and_never_reaches_kernel(
+    tmp_path: Path,
+) -> None:
+    adapter, kernel, config, events, _, _ = _fake_lane(tmp_path, [_SpoofedFloat()])
+
+    with pytest.raises(HistoricalForagerContractError, match="reward must be a real scalar"):
+        run_historical_forager(adapter, kernel, config)
+
+    assert not any(event[0] == "kernel.update" for event in events)
+    assert not config.output_directory.exists()
+
+
+class _HostileFloatSubclass(float):
+    def __float__(self) -> float:
+        raise RuntimeError("hostile conversion")
+
+
+def test_hostile_real_conversion_is_translated_and_never_reaches_kernel(
+    tmp_path: Path,
+) -> None:
+    adapter, kernel, config, events, _, _ = _fake_lane(
+        tmp_path, [_HostileFloatSubclass(0.5)]
+    )
+
+    with pytest.raises(
+        HistoricalForagerContractError,
+        match="reward must be a finite real scalar",
+    ):
+        run_historical_forager(adapter, kernel, config)
+
+    assert not any(event[0] == "kernel.update" for event in events)
+    assert not config.output_directory.exists()
+
+
 @pytest.mark.parametrize("bad_action", [True, 1.0, -1, 4, np.asarray([1])])
 def test_invalid_actions_fail_closed_without_partial_artifact(
     tmp_path: Path,
@@ -548,3 +594,49 @@ def test_metric_rejects_nonfinite_or_unbounded_shapes() -> None:
         historical_fov_metrics(np.asarray([[1.0]]))
     with pytest.raises(HistoricalForagerContractError):
         historical_fov_metrics(np.asarray([math.nan]))
+
+
+def _legal_run_result(**overrides: object) -> HistoricalForagerRunResult:
+    payload: dict[str, object] = {
+        "seed": 0,
+        "aperture_size": 9,
+        "steps": 10,
+        "metrics": {"fov_last_10pct_ema_auc": 0.1},
+        "reward_sidecar": {"sha256": "a" * 64},
+        "environment_adapter": {"kind": "development"},
+        "runtime": {"python": "3.12"},
+        "kernel": {"name": "random"},
+    }
+    payload.update(overrides)
+    return HistoricalForagerRunResult(**payload)  # type: ignore[arg-type]
+
+
+def test_run_result_rejects_leftover_identities() -> None:
+    """Public historical result records must not keep leftover bool identities."""
+
+    with pytest.raises(HistoricalForagerContractError, match="seed"):
+        _legal_run_result(seed=True)
+    with pytest.raises(HistoricalForagerContractError, match="steps"):
+        _legal_run_result(steps=True)
+    with pytest.raises(HistoricalForagerContractError, match="aperture_size"):
+        _legal_run_result(aperture_size=True)
+
+    legal = _legal_run_result()
+    dumped = json.dumps(legal.to_dict()["run"], allow_nan=False)
+    assert '"seed": 0' in dumped
+    assert '"seed": true' not in dumped
+    assert '"steps": 10' in dumped
+    assert '"aperture_size": 9' in dumped
+
+
+def test_run_result_rejects_integer_subclasses_before_comparison_hooks() -> None:
+    class HostileInt(int):
+        def __le__(self, other: object) -> bool:
+            raise AssertionError("hostile comparison must not run")
+
+        def __ge__(self, other: object) -> bool:
+            raise AssertionError("hostile comparison must not run")
+
+    for field in ("seed", "steps", "aperture_size"):
+        with pytest.raises(HistoricalForagerContractError, match=field):
+            _legal_run_result(**{field: HostileInt(1)})

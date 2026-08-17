@@ -35,7 +35,6 @@ from alberta_framework.reference_agent import (
     DecisionOwnershipError,
     DispatchAck,
     DispatchAuthorization,
-    DispatchCommand,
     DispatchReceipt,
     DispatchStatus,
     ReferenceTransactionLedger,
@@ -130,19 +129,12 @@ def _record_outcome(
         settlement_id=f"{decision.decision_id}:settlement",
     )
     assert dispatch is not None
-    ledger_state, command = ledger.issue_dispatch(
+    ledger_state, receipt = ledger.record_dispatch(
         ledger_state,
         dispatch,
-        command_id=f"{decision.decision_id}:command",
-        executor_id="tests.executor",
-        executor_epoch="tests.executor_epoch.1",
-    )
-    receipt = DispatchReceipt(
-        command=command,
-        applied_action=dispatch.effective_action,
         receipt_id=f"{decision.decision_id}:receipt",
+        executor_id="tests.executor",
     )
-    ledger_state, receipt = ledger.record_dispatch(ledger_state, receipt)
     bootstrap = (
         np.asarray([0.0, 1.0], dtype=np.float32)
         if bootstrap_observation is None
@@ -205,16 +197,10 @@ def _exact_transaction_for_decision(
         effective_action=decision.proposed_action,
         settlement_id=f"{decision.decision_id}:settlement",
     )
-    command = DispatchCommand(
-        dispatch=dispatch,
-        command_id=f"{decision.decision_id}:command",
-        executor_id="tests.executor",
-        executor_epoch="tests.executor_epoch.1",
-    )
     receipt = DispatchReceipt(
-        command=command,
-        applied_action=dispatch.effective_action,
+        dispatch=dispatch,
         receipt_id=f"{decision.decision_id}:receipt",
+        executor_id="tests.executor",
     )
     encoded_observation = adapter.manifest.observation_spec.encode(next_observation)
     return Transaction(
@@ -436,13 +422,9 @@ def test_relabelled_decision_observation_id_is_rejected_without_learning() -> No
         transaction.receipt.dispatch,
         authorization=relabelled_authorization,
     )
-    relabelled_command = dataclasses.replace(
-        transaction.receipt.command,
-        dispatch=relabelled_dispatch,
-    )
     relabelled_receipt = dataclasses.replace(
         transaction.receipt,
-        command=relabelled_command,
+        dispatch=relabelled_dispatch,
     )
     relabelled_transaction = dataclasses.replace(
         transaction,
@@ -456,36 +438,6 @@ def test_relabelled_decision_observation_id_is_rejected_without_learning() -> No
     assert rejected.next_decision is None
     assert rejected.rejection_reason is not None
     assert "observation" in rejected.rejection_reason
-
-
-def test_executor_applied_action_mismatch_is_rejected_without_learning() -> None:
-    adapter = PrototypeReferenceAdapter.from_config(_config())
-    agent_state, decision = _start(adapter)
-    _, _, transaction = _record_outcome(adapter, decision)
-    proposed = transaction.decision.proposed_action
-    assert proposed is not None
-    proposed_index = proposed.to_python()
-    assert isinstance(proposed_index, int)
-    different_action = adapter.manifest.action_spec.encode(
-        np.asarray(1 - proposed_index, dtype=np.int32)
-    )
-    mismatched_receipt = dataclasses.replace(
-        transaction.receipt,
-        applied_action=different_action,
-    )
-    mismatched_transaction = dataclasses.replace(
-        transaction,
-        receipt=mismatched_receipt,
-    )
-
-    rejected = adapter.apply_outcome(agent_state, mismatched_transaction)
-
-    assert not rejected.accepted
-    assert rejected.state is agent_state
-    assert rejected.next_decision is None
-    assert rejected.rejection_reason is not None
-    assert "receipt action" in rejected.rejection_reason
-    assert int(rejected.state.agent_state.step_count) == 0
 
 
 def test_exact_settlement_is_an_agent_state_identity_operation() -> None:
@@ -641,19 +593,18 @@ def test_switching_two_state_exact_chain_crosses_phase_boundary() -> None:
             settlement_id=f"{decision.decision_id}:settlement",
         )
         assert dispatch is not None
-        ledger_state, command = ledger.issue_dispatch(
+        ledger_state, receipt = ledger.record_dispatch(
             ledger_state,
             dispatch,
-            command_id=f"{decision.decision_id}:command",
+            receipt_id=f"{decision.decision_id}:receipt",
             executor_id="tests.deterministic_environment",
-            executor_epoch="tests.deterministic_environment_epoch.1",
         )
-        assert ledger_state.phase is TransactionPhase.ISSUED
 
-        # Validate the issued command immediately before handing it to the
-        # deterministic test environment. No receipt exists until step returns.
+        # Validate the recorded effective action immediately before handing it
+        # to the deterministic test environment. The host receipt remains an
+        # acknowledgement, not proof of physical dispatch.
         effective_action = adapter.manifest.action_spec.encode(
-            command.effective_action
+            receipt.effective_action
         ).to_numpy()
         assert effective_action.shape == ()
         assert effective_action.dtype == np.dtype(np.int32)
@@ -671,17 +622,6 @@ def test_switching_two_state_exact_chain_crosses_phase_boundary() -> None:
             jr.key(event_index),
         )
         assert float(reward) == expected_reward
-
-        # The deterministic executor acknowledges the action it actually
-        # applied only after execution. This remains a test acknowledgement,
-        # not proof of physical dispatch.
-        receipt = DispatchReceipt(
-            command=command,
-            applied_action=adapter.manifest.action_spec.encode(environment_action),
-            receipt_id=f"{decision.decision_id}:receipt",
-        )
-        ledger_state, receipt = ledger.record_dispatch(ledger_state, receipt)
-        assert ledger_state.phase is TransactionPhase.DISPATCHED
 
         next_observation_id = f"{_LIFE_A}:observation:{event_index + 1}"
         assert next_observation_id not in observation_ids

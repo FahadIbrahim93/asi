@@ -23,8 +23,9 @@ so noise effects are unmistakable) and ``sparsity=0.5`` round-trips.
 import chex
 import jax.numpy as jnp
 import jax.random as jr
+import pytest
 
-from alberta_framework.core.optimizers import ObGDBounding
+from alberta_framework.core.optimizers import AdaptiveObGDBounding, ObGDBounding
 from alberta_framework.core.upgd import (
     UPGDLearner,
     UPGDLearningResult,
@@ -329,6 +330,32 @@ class TestInitShapes:
 
 class TestValidation:
     """Invalid deployment configurations should fail before JIT compilation."""
+
+    @pytest.mark.parametrize(
+        "step_size",
+        [float("nan"), float("inf"), float("-inf"), True, 1e40],
+    )
+    def test_rejects_non_finite_or_boolean_step_size(self, step_size):
+        with pytest.raises(ValueError, match="step_size"):
+            UPGDLearner(n_heads=1, step_size=step_size)
+
+    def test_from_config_rejects_non_finite_step_size(self):
+        config = UPGDLearner(n_heads=1).to_config()
+        config["step_size"] = float("nan")
+
+        with pytest.raises(ValueError, match="step_size"):
+            UPGDLearner.from_config(config)
+
+    @pytest.mark.parametrize("shape", [(1,), (), (4, 1), (5,)])
+    def test_update_rejects_targets_that_are_not_one_per_head(self, shape):
+        """A broadcastable target must not train every head while n_active counts 1."""
+        learner = UPGDLearner(
+            n_heads=4, hidden_sizes=(8,), sparsity=0.0, step_size=0.01, perturbation_sigma=0.0
+        )
+        state = learner.init(feature_dim=3, key=jr.key(0))
+        obs = jnp.array([1.0, -0.5, 0.25])
+        with pytest.raises(ValueError, match=r"targets must have shape \(4,\)"):
+            learner.update(state, obs, jnp.full(shape, 2.0, dtype=jnp.float32))
 
     def test_rejects_invalid_core_dimensions(self):
         invalid_kwargs = [
@@ -674,6 +701,28 @@ class TestUpdateMetrics:
             chex.assert_shape(result.errors, (2,))
             chex.assert_tree_all_finite(result.predictions)
             state = result.state
+
+    def test_reported_loss_is_not_scaled_by_the_slow_simplex_gradient_multiplier(self):
+        """metrics[0] must show the task-switch error even when the slow branch has zero budget."""
+        learner = UPGDLearner.step2_strict_digit_readout_default(n_heads=3, hidden_sizes=(8,))
+        state = learner.init(4, jr.key(0))
+        obs = jnp.ones(4)
+        target_a = jnp.array([1.0, 0.0, 0.0])
+        target_b = jnp.array([0.0, 0.0, 1.0])
+        reported: list[float] = []
+        true_half_se: list[float] = []
+        for step in range(230):
+            target = target_a if step < 200 else target_b
+            result = learner.update(state, obs, target)
+            state = result.state
+            reported.append(float(result.metrics[0]))
+            true_half_se.append(float(0.5 * jnp.sum((result.predictions - target) ** 2)))
+        assert max(true_half_se[200:210]) > 0.5
+        # The switch spike must be visible in the reported loss (it was identically 0.0).
+        assert reported[200] > 0.25
+        assert max(reported[200:210]) > 0.25
+        assert all(value >= 0.0 for value in reported)
+        assert reported[199] < reported[200]
 
     def test_sum_loss_normalization_scales_multihead_gradient(self):
         """Sum loss should avoid diluting gradients by active head count."""
@@ -1099,6 +1148,36 @@ class TestUpdateMetrics:
 
         assert float(adaptive_delta) > float(static_delta)
 
+    @pytest.mark.parametrize(
+        ("bounder", "reason"),
+        [
+            (ObGDBounding(kappa=2.0), "kappa 2.0 disagrees with adaptive_kappa_base=0.5"),
+            (AdaptiveObGDBounding(kappa=0.5), "the RMS stage would be silently dropped"),
+        ],
+    )
+    def test_adaptive_kappa_refuses_a_bounder_it_would_silently_discard(self, bounder, reason):
+        del reason
+        with pytest.raises(ValueError, match="adaptive_kappa_mode"):
+            UPGDLearner(
+                n_heads=1,
+                hidden_sizes=(4,),
+                bounder=bounder,
+                adaptive_kappa_mode="loss_ratio",
+                adaptive_kappa_base=0.5,
+            )
+
+    def test_adaptive_kappa_accepts_a_matching_obgd_bounder_or_none(self):
+        UPGDLearner(
+            n_heads=1,
+            hidden_sizes=(4,),
+            bounder=ObGDBounding(kappa=0.5),
+            adaptive_kappa_mode="loss_ratio",
+            adaptive_kappa_base=0.5,
+        )
+        UPGDLearner(
+            n_heads=1, hidden_sizes=(4,), adaptive_kappa_mode="loss_ratio", adaptive_kappa_base=0.5
+        )
+
     def test_gradient_alignment_can_learn_kappa_multiplier(self):
         learner = UPGDLearner(
             n_heads=1,
@@ -1422,6 +1501,50 @@ class TestUtilityTracking:
             jnp.ones_like(result.state.unit_ages[0]),
         )
 
+    def test_zero_utility_decay_does_not_multiply_inf_ema(self):
+        """utility_decay=0 times an infinite EMA is NaN and would be committed."""
+        learner = UPGDLearner(
+            n_heads=1,
+            hidden_sizes=(4,),
+            sparsity=0.0,
+            step_size=0.0,
+            perturbation_sigma=0.0,
+            utility_decay=0.0,
+            unit_utility_decay=0.0,
+            unit_long_utility_decay=0.0,
+            unit_gradient_decay=0.0,
+            loss_fast_decay=0.0,
+            loss_slow_decay=0.0,
+            head_repetition_decay=0.0,
+        )
+        state = learner.init(feature_dim=3, key=jr.key(0))
+        state = state.replace(  # type: ignore[attr-defined]
+            utilities=tuple(jnp.full_like(u, jnp.inf) for u in state.utilities),
+            unit_utilities=tuple(jnp.full_like(u, jnp.inf) for u in state.unit_utilities),
+            unit_long_utilities=tuple(
+                jnp.full_like(u, jnp.inf) for u in state.unit_long_utilities
+            ),
+            unit_gradient_emas=tuple(
+                jnp.full_like(u, jnp.inf) for u in state.unit_gradient_emas
+            ),
+            loss_fast_ema=jnp.asarray(jnp.inf, dtype=jnp.float32),
+            loss_slow_ema=jnp.asarray(jnp.inf, dtype=jnp.float32),
+            target_repeat_ema=jnp.asarray(jnp.inf, dtype=jnp.float32),
+            target_simplex_ema=jnp.asarray(jnp.inf, dtype=jnp.float32),
+        )
+        raw = jnp.asarray(0.0, dtype=jnp.float32) * jnp.asarray(jnp.inf, dtype=jnp.float32)
+        assert not bool(jnp.isfinite(raw))
+
+        result = learner.update(state, jnp.ones(3), jnp.array([1.0]))
+        chex.assert_tree_all_finite(result.state.utilities)
+        chex.assert_tree_all_finite(result.state.unit_utilities)
+        chex.assert_tree_all_finite(result.state.unit_long_utilities)
+        chex.assert_tree_all_finite(result.state.unit_gradient_emas)
+        assert bool(jnp.isfinite(result.state.loss_fast_ema))
+        assert bool(jnp.isfinite(result.state.loss_slow_ema))
+        assert bool(jnp.isfinite(result.state.target_repeat_ema))
+        assert bool(jnp.isfinite(result.state.target_simplex_ema))
+
     def test_unit_recycling_reinitializes_lowest_mature_unit(self):
         learner = UPGDLearner(
             n_heads=2,
@@ -1499,6 +1622,46 @@ class TestUtilityTracking:
 
         assert float(result_always.state.unit_replacement_accumulators[0]) > 0.0
         assert float(result_gated.state.unit_replacement_accumulators[0]) == 0.0
+
+    def test_recycling_budget_does_not_accrue_while_every_unit_is_immature(self):
+        """Warm-up debt must not be discharged as a replacement burst at maturity."""
+        learner = UPGDLearner(
+            n_heads=1,
+            hidden_sizes=(32,),
+            sparsity=0.0,
+            step_size=0.0,
+            perturbation_sigma=0.0,
+            unit_replacement_rate=0.02,
+            unit_maturity_threshold=50,
+        )
+        state = learner.init(feature_dim=3, key=jr.key(31))
+        for _ in range(49):
+            state = learner.update(state, jnp.zeros(3), jnp.zeros(1)).state
+        assert int(jnp.max(state.unit_ages[0])) == 49
+        assert float(state.unit_replacement_accumulators[0]) == 0.0
+        assert float(state.unit_replacement_counts[0]) == 0.0
+        for _ in range(11):
+            state = learner.update(state, jnp.zeros(3), jnp.zeros(1)).state
+        # rate * 32 mature units = 0.64 per step -> at most one replacement per step,
+        # and no more than ceil(7.04) in eleven steps; the old debt would fire every step.
+        assert float(state.unit_replacement_counts[0]) <= 8.0
+        assert float(state.unit_replacement_accumulators[0]) <= 1.0
+
+    def test_recycling_budget_never_carries_more_than_one_pending_unit(self):
+        learner = UPGDLearner(
+            n_heads=1,
+            hidden_sizes=(8,),
+            sparsity=0.0,
+            step_size=0.0,
+            perturbation_sigma=0.0,
+            unit_replacement_rate=0.5,
+            unit_maturity_threshold=0,
+        )
+        state = learner.init(feature_dim=3, key=jr.key(32))
+        for _ in range(20):
+            state = learner.update(state, jnp.zeros(3), jnp.zeros(1)).state
+        assert float(state.unit_replacement_counts[0]) == 20.0
+        assert float(state.unit_replacement_accumulators[0]) <= 1.0
 
     def test_loss_pressure_recycling_budget_scales_with_loss_spike(self):
         learner = UPGDLearner(

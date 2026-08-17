@@ -4,6 +4,7 @@ Provides functions for creating figures suitable for academic papers,
 including learning curves, bar plots, heatmaps, and multi-panel figures.
 """
 
+import math
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -31,6 +32,29 @@ _DEFAULT_STYLE = {
 _current_style = _DEFAULT_STYLE.copy()
 
 
+def _require_exact_bool(name: str, value: object) -> bool:
+    if type(value) is not bool:
+        raise ValueError(f"{name} must be an exact bool")
+    return value
+
+
+def _require_finite_positive(name: str, value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be a real number")
+    number = float(cast(Any, value))
+    if not math.isfinite(number) or number <= 0.0:
+        raise ValueError(f"{name} must be a finite positive number")
+    return number
+
+
+def _require_positive_int(name: str, value: object) -> int:
+    if type(value) is not int:
+        raise ValueError(f"{name} must be an exact int")
+    if value <= 0:
+        raise ValueError(f"{name} must be a positive int")
+    return value
+
+
 def set_publication_style(
     font_size: int = 10,
     use_latex: bool = False,
@@ -47,13 +71,19 @@ def set_publication_style(
         figure_height: Default figure height (auto if None)
         style: Matplotlib style to use
     """
+    font_size_value = _require_finite_positive("font_size", font_size)
+    use_latex = _require_exact_bool("use_latex", use_latex)
+    figure_width = _require_finite_positive("figure_width", figure_width)
+    if figure_height is not None:
+        figure_height = _require_finite_positive("figure_height", figure_height)
+
     try:
         import matplotlib.pyplot as plt
     except ImportError:
         raise ImportError("matplotlib is required. Install with: pip install matplotlib")
 
     # Update current style
-    _current_style["font_size"] = font_size
+    _current_style["font_size"] = font_size_value
     _current_style["figure_width"] = figure_width
     _current_style["use_latex"] = use_latex
     if figure_height is not None:
@@ -71,12 +101,12 @@ def set_publication_style(
     # Configure matplotlib
     plt.rcParams.update(
         {
-            "font.size": font_size,
-            "axes.labelsize": font_size,
-            "axes.titlesize": font_size + 1,
-            "xtick.labelsize": font_size - 1,
-            "ytick.labelsize": font_size - 1,
-            "legend.fontsize": font_size - 1,
+            "font.size": font_size_value,
+            "axes.labelsize": font_size_value,
+            "axes.titlesize": font_size_value + 1,
+            "xtick.labelsize": font_size_value - 1,
+            "ytick.labelsize": font_size_value - 1,
+            "legend.fontsize": font_size_value - 1,
             "figure.figsize": (_current_style["figure_width"], _current_style["figure_height"]),
             "figure.dpi": _current_style["dpi"],
             "savefig.dpi": _current_style["dpi"],
@@ -123,6 +153,10 @@ def plot_learning_curves(
     Returns:
         Tuple of (figure, axes)
     """
+    show_ci = _require_exact_bool("show_ci", show_ci)
+    log_scale = _require_exact_bool("log_scale", log_scale)
+    window_size = _require_positive_int("window_size", window_size)
+
     try:
         import matplotlib.pyplot as plt
     except ImportError:
@@ -153,9 +187,20 @@ def plot_learning_curves(
             ]
         )
 
+        # ``compute_running_mean`` marks every position NaN when the trace is
+        # shorter than the requested window. Preserve this plotting API's
+        # established raw short-trace fallback; otherwise drop the leading
+        # NaN prefix before plotting or computing confidence intervals.
+        if metric_array.shape[1] < window_size:
+            smoothed = np.asarray(metric_array, dtype=np.float64)
+            first_complete_window = 0
+        else:
+            first_complete_window = window_size - 1
+            smoothed = smoothed[:, first_complete_window:]
+
         mean, ci_lower, ci_upper = compute_timeseries_statistics(smoothed)
 
-        steps = np.arange(len(mean))
+        steps = np.arange(first_complete_window, first_complete_window + len(mean))
         ax.plot(steps, mean, color=color, label=label, linewidth=_current_style["line_width"])
 
         if show_ci:
@@ -195,18 +240,28 @@ def plot_final_performance_bars(
     Returns:
         Tuple of (figure, axes)
     """
+    show_significance = _require_exact_bool("show_significance", show_significance)
+    lower_is_better = _require_exact_bool("lower_is_better", lower_is_better)
+
     try:
         import matplotlib.pyplot as plt
     except ImportError:
         raise ImportError("matplotlib is required. Install with: pip install matplotlib")
 
+    names = list(results.keys())
+    if not names:
+        raise ValueError("plot_final_performance_bars requires at least one result")
+    means = [results[name].summary[metric].mean for name in names]
+    stds = [results[name].summary[metric].std for name in names]
+    means_arr = np.asarray(means, dtype=np.float64)
+    stds_arr = np.asarray(stds, dtype=np.float64)
+    if not np.all(np.isfinite(means_arr)) or not np.all(np.isfinite(stds_arr)):
+        raise ValueError("plot_final_performance_bars requires finite metric means and stds")
+
     if ax is None:
         fig, ax = plt.subplots()
     else:
         fig = cast("Figure", ax.figure)
-    names = list(results.keys())
-    means = [results[name].summary[metric].mean for name in names]
-    stds = [results[name].summary[metric].std for name in names]
 
     # Default colors
     default_colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
@@ -286,6 +341,8 @@ def plot_hyperparameter_heatmap(
     Returns:
         Tuple of (figure, axes)
     """
+    lower_is_better = _require_exact_bool("lower_is_better", lower_is_better)
+
     try:
         import matplotlib.pyplot as plt
     except ImportError:
@@ -359,6 +416,8 @@ def plot_step_size_evolution(
     Returns:
         Tuple of (figure, axes)
     """
+    show_ci = _require_exact_bool("show_ci", show_ci)
+
     try:
         import matplotlib.pyplot as plt
     except ImportError:

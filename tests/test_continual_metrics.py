@@ -2,18 +2,38 @@
 
 from __future__ import annotations
 
+import json
+
 import numpy as np
 import pytest
 
 from alberta_framework.utils.metrics import (
+    ContinualLearningSummary,
+    StabilityGap,
+    compare_learners,
     compute_backward_transfer,
     compute_forward_transfer,
     compute_per_task_forgetting,
     compute_prequential_performance,
     compute_recovery_lengths,
+    compute_running_mean,
     compute_stability_gap,
+    compute_tracking_error,
     summarize_continual_learning,
 )
+
+
+def test_compare_learners_uses_population_spread_over_recorded_steps() -> None:
+    summary = compare_learners(
+        {
+            "learner": [
+                {"squared_error": 0.0},
+                {"squared_error": 2.0},
+            ]
+        }
+    )
+
+    assert summary["learner"]["std"] == pytest.approx(1.0)
 
 
 def test_accuracy_matrix_forgetting_and_backward_transfer() -> None:
@@ -156,3 +176,230 @@ def test_task_matrix_validation(
 ) -> None:
     with pytest.raises(ValueError, match=message):
         compute_per_task_forgetting(matrix, first_exposure)
+
+
+@pytest.mark.parametrize(
+    ("matrix", "message"),
+    [
+        ([[np.nan], [0.6]], "first-post-exposure"),
+        ([[0.8], [np.nan]], "final evaluation"),
+    ],
+)
+def test_task_metrics_reject_missing_boundary_evaluations(
+    matrix: list[list[float]],
+    message: str,
+) -> None:
+    """Do not silently backfill required first/final checkpoints."""
+
+    with pytest.raises(ValueError, match=message):
+        compute_per_task_forgetting(matrix, [0])
+
+
+@pytest.mark.parametrize("value", [np.inf, -np.inf])
+def test_task_metrics_reject_infinite_post_exposure_evaluations(value: float) -> None:
+    """Do not treat a divergent metric as an unevaluated probe gap."""
+
+    with pytest.raises(ValueError, match="infinite evaluation"):
+        compute_per_task_forgetting([[0.8], [value], [0.6]], [0])
+
+
+def test_running_mean_does_not_backdate_a_future_informed_value() -> None:
+    """The leading positions must not be filled with a later window's mean.
+
+    Before this fix, ``compute_running_mean`` padded the first
+    ``window_size - 1`` entries with the mean of the *first complete*
+    trailing window -- a value that depends on observations from steps that
+    had not yet occurred at those earlier positions. #175/#176 documented
+    and worked around exactly this defect at one call site
+    (``plot_learning_curves``) without fixing the underlying function, so
+    every other caller of the public, top-level-exported
+    ``compute_running_mean``/``compute_tracking_error`` still received the
+    corrupted, future-informed trace directly.
+    """
+
+    result = compute_running_mean([0.0, 1.0, 2.0, 3.0, 4.0, 5.0], window_size=3)
+
+    assert result.shape == (6,)
+    assert np.all(np.isnan(result[:2]))
+    np.testing.assert_allclose(result[2:], [1.0, 2.0, 3.0, 4.0])
+
+
+def test_running_mean_exact_window_length_has_one_valid_entry() -> None:
+    result = compute_running_mean([1.0, 2.0, 3.0], window_size=3)
+
+    assert np.all(np.isnan(result[:2]))
+    np.testing.assert_allclose(result[2:], [2.0])
+
+
+def test_running_mean_shorter_than_window_has_no_computable_values() -> None:
+    result = compute_running_mean([2, 4], window_size=3)
+
+    assert result.shape == (2,)
+    assert result.dtype == np.float64
+    assert np.all(np.isnan(result))
+
+
+def test_tracking_error_inherits_the_causal_running_mean_fix() -> None:
+    history = [{"squared_error": float(v)} for v in range(6)]
+
+    result = compute_tracking_error(history, window_size=3)
+
+    assert np.all(np.isnan(result[:2]))
+    np.testing.assert_allclose(result[2:], [1.0, 2.0, 3.0, 4.0])
+
+
+def test_tracking_error_shorter_than_window_has_no_computable_values() -> None:
+    result = compute_tracking_error(
+        [{"squared_error": 2.0}, {"squared_error": 4.0}],
+        window_size=3,
+    )
+
+    assert result.shape == (2,)
+    assert np.all(np.isnan(result))
+
+
+@pytest.mark.parametrize("window_size", [True, False, np.int64(3), 3.0, 0, -1])
+def test_running_mean_rejects_invalid_window_size(window_size: object) -> None:
+    with pytest.raises(ValueError, match="window_size"):
+        compute_running_mean([1.0, 2.0, 3.0], window_size=window_size)  # type: ignore[arg-type]
+
+
+def test_first_exposure_true_is_not_checkpoint_row_one() -> None:
+    """Boolean True is a subclass of int, so asarray(..., int64) stored row 1.
+
+    On a one-task matrix that hides 0.05 forgetting when the legal first
+    exposure is row 0. The exposure index is the task-identity axis for
+    forgetting and backward transfer.
+    """
+
+    performance = np.array([[0.80], [0.60], [0.75]])
+
+    with pytest.raises(ValueError, match="first_exposure"):
+        compute_per_task_forgetting(performance, [True])
+
+    np.testing.assert_allclose(compute_per_task_forgetting(performance, [0]), [0.05])
+    np.testing.assert_allclose(compute_per_task_forgetting(performance, [1]), [0.0])
+
+
+@pytest.mark.parametrize("window_size", [True, False, np.int64(2), 2.0, 0, -1])
+def test_recovery_rejects_non_canonical_window_size(window_size: object) -> None:
+    with pytest.raises(ValueError, match="window_size"):
+        compute_recovery_lengths(
+            [0.9, 0.2, 0.8, 0.9],
+            change_points=[1],
+            threshold=0.8,
+            window_size=window_size,  # type: ignore[arg-type]
+        )
+
+
+def test_recovery_rejects_boolean_change_point() -> None:
+    """change_points=[True] used to start at index 1 instead of failing."""
+
+    online = [0.1, 0.9, 0.9]
+    with pytest.raises(ValueError, match="change_points"):
+        compute_recovery_lengths(online, change_points=[True], threshold=0.8, window_size=1)
+
+    np.testing.assert_array_equal(
+        compute_recovery_lengths(online, change_points=[0], threshold=0.8, window_size=1),
+        [2],
+    )
+    np.testing.assert_array_equal(
+        compute_recovery_lengths(online, change_points=[1], threshold=0.8, window_size=1),
+        [1],
+    )
+
+
+@pytest.mark.parametrize(
+    "change_points",
+    [
+        np.array([1.0]),
+        np.array([1.5]),
+        np.array([np.nan]),
+        np.array([np.iinfo(np.uint64).max], dtype=np.uint64),
+    ],
+)
+def test_recovery_rejects_coerced_numpy_change_points(change_points: object) -> None:
+    with pytest.raises(ValueError, match="change_points"):
+        compute_recovery_lengths(
+            [0.1, 0.9, 0.9],
+            change_points=change_points,  # type: ignore[arg-type]
+            threshold=0.8,
+            window_size=1,
+        )
+
+
+def test_nested_numpy_boolean_trace_is_rejected() -> None:
+    with pytest.raises(ValueError, match="online_performance"):
+        compute_prequential_performance([np.array(True), np.array(False)])
+
+
+@pytest.mark.parametrize("threshold", [True, False, float("nan"), float("inf"), "0.8"])
+def test_recovery_rejects_boolean_or_nonfinite_threshold(threshold: object) -> None:
+    with pytest.raises(ValueError, match="threshold"):
+        compute_recovery_lengths(
+            [0.0, 1.0, 1.0],
+            change_points=[0],
+            threshold=threshold,  # type: ignore[arg-type]
+            window_size=1,
+        )
+
+
+def test_stability_and_prequential_reject_boolean_identities() -> None:
+    with pytest.raises(ValueError, match="reference_performance"):
+        compute_stability_gap([0.0, 1.0, 0.5], True)
+    with pytest.raises(ValueError, match="online_performance"):
+        compute_prequential_performance([True, False])
+
+    gap = compute_stability_gap([0.0, 1.0, 0.5], 1.0)
+    np.testing.assert_allclose(gap.per_step, [1.0, 0.0, 0.5])
+    assert compute_prequential_performance([0.0, 1.0]) == pytest.approx(0.5)
+
+
+def test_stability_gap_rejects_leftover_identities() -> None:
+    """Public gap records must not keep leftover bool/NaN identities."""
+
+    with pytest.raises(ValueError, match="mean"):
+        StabilityGap(mean=True, maximum=0.0, per_step=np.array([0.0]))
+    with pytest.raises(ValueError, match="mean"):
+        StabilityGap(mean=float("nan"), maximum=0.0, per_step=np.array([0.0]))
+    with pytest.raises(ValueError, match="maximum"):
+        StabilityGap(mean=0.0, maximum=float("inf"), per_step=np.array([0.0]))
+
+    legal = StabilityGap(mean=0.1, maximum=0.2, per_step=np.array([0.0, 0.2]))
+    dumped = json.dumps({"mean": legal.mean, "maximum": legal.maximum}, allow_nan=False)
+    assert '"mean": 0.1' in dumped
+    assert '"mean": true' not in dumped
+
+
+def _legal_continual_summary(**overrides: object) -> ContinualLearningSummary:
+    payload: dict[str, object] = {
+        "final_performance": 0.8,
+        "prequential_performance": 0.7,
+        "mean_forgetting": 0.1,
+        "max_forgetting": 0.1,
+        "backward_transfer": 0.0,
+        "stability_gap_mean": 0.05,
+        "stability_gap_max": 0.1,
+        "per_task_final_performance": np.array([0.8]),
+        "per_task_forgetting": np.array([0.1]),
+        "per_task_backward_transfer": np.array([0.0]),
+    }
+    payload.update(overrides)
+    return ContinualLearningSummary(**payload)  # type: ignore[arg-type]
+
+
+def test_continual_learning_summary_rejects_leftover_identities() -> None:
+    with pytest.raises(ValueError, match="final_performance"):
+        _legal_continual_summary(final_performance=True)
+    with pytest.raises(ValueError, match="mean_forgetting"):
+        _legal_continual_summary(mean_forgetting=float("nan"))
+    with pytest.raises(ValueError, match="stability_gap_max"):
+        _legal_continual_summary(stability_gap_max=float("inf"))
+
+    legal = _legal_continual_summary()
+    dumped = json.dumps(
+        {"final_performance": legal.final_performance},
+        allow_nan=False,
+    )
+    assert '"final_performance": 0.8' in dumped
+    assert '"final_performance": true' not in dumped

@@ -1213,6 +1213,39 @@ def test_strict_loader_rejects_duplicate_ids_nonfinite_and_unsafe_reference(
         matrix.parse_forager_matrix_manifest(unsafe)
 
 
+def test_json_safe_rejects_nonfinite_artifact_identities() -> None:
+    """Artifact identities must not coerce NaN/Inf into JSON null."""
+    finite = matrix._json_safe({"scale": 1.0})
+    assert finite == {"scale": 1.0}
+    assert matrix._canonical_json_bytes(finite) == b'{"scale":1.0}'
+
+    for bad in (float("nan"), float("inf"), float("-inf"), np.float64("nan")):
+        with pytest.raises(
+            matrix.ForagerMatrixError,
+            match="matrix artifact identity is not finite JSON",
+        ):
+            matrix._json_safe({"scale": bad})
+
+    with pytest.raises(matrix.ForagerMatrixError, match="not canonical JSON"):
+        matrix._canonical_json_bytes({"scale": float("nan")})
+
+
+def test_json_safe_rejects_nonstring_keys_without_string_hooks() -> None:
+    class HostileKey:
+        def __str__(self) -> str:
+            raise AssertionError("artifact normalization must not stringify keys")
+
+    with pytest.raises(matrix.ForagerMatrixError, match="string keys"):
+        matrix._json_safe({HostileKey(): 1})
+
+    class HostileMapping(dict[str, object]):
+        def items(self):  # type: ignore[no-untyped-def, override]
+            raise AssertionError("artifact normalization must not invoke mapping hooks")
+
+    with pytest.raises(matrix.ForagerMatrixError, match="unsupported HostileMapping"):
+        matrix._json_safe(HostileMapping(value=1))
+
+
 def test_source_snapshot_is_reproducible_canonical_and_path_independent(
     _isolated_source_tree: Path,
 ) -> None:
@@ -1666,10 +1699,9 @@ def test_snapshot_only_atomic_prefix_is_resumable(
     output = tmp_path / "snapshot-prefix"
     output.mkdir()
     snapshot = matrix._build_source_snapshot()
-    matrix._atomic_create_bytes(
-        output / matrix.SOURCE_SNAPSHOT_FILENAME,
-        snapshot.archive_bytes,
-    )
+    snapshot_path = output / matrix.SOURCE_SNAPSHOT_FILENAME
+    snapshot_path.write_bytes(snapshot.archive_bytes)
+    snapshot_path.chmod(0o600)
 
     report = matrix.run_forager_matrix(manifest, output)
 

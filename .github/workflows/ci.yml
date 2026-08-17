@@ -1,23 +1,19 @@
+---
 name: ci
 
-# JAX compilation makes the suite memory-intensive on hosted runners. Test
-# files are sharded and each job is capped at two xdist workers to keep memory
-# use bounded.
-#
-#   lint — ruff + mypy on both supported interpreters.
-#   test — the complete non-slow suite on Python 3.12 for pull requests and
-#          both supported interpreters on main/manual runs.
-#
-# Benchmarks never run in CI. They are executed through their CLIs on hardware
-# that can afford them; see outputs/ipmnist_screening/RUNBOOK.md.
-on:
+# Benchmarks never execute in CI. The runtime lane collects only tests selected
+# by `not slow and not package`, balances their files by collected-node count,
+# and caps xdist at two workers so JAX compilation remains inside hosted-runner
+# memory limits.
+"on":
   push:
     branches: [main]
   pull_request:
   workflow_dispatch:
 
 concurrency:
-  group: ci-${{ github.event.pull_request.number || github.ref }}
+  group: >-
+    ci-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -25,70 +21,308 @@ permissions:
 
 env:
   SHARD_COUNT: "8"
+  XLA_PYTHON_CLIENT_PREALLOCATE: "false"
 
 jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up locked Python 3.12
+        uses: ./.github/actions/setup-locked-python
+        with:
+          python-version: "3.12"
+          extras: --extra dev
+
+      - name: Build wheel and source distribution
+        run: |
+          uv run --no-sync uv build \
+            --no-build-isolation \
+            --no-build-logs \
+            --no-create-gitignore \
+            --out-dir "$RUNNER_TEMP/package-preflight" \
+            .
+
+      - name: Validate distribution metadata
+        run: uv run --no-sync twine check "$RUNNER_TEMP"/package-preflight/*
+
+      - name: Exercise the wheel and sdist contract
+        env:
+          ALBERTA_PREBUILT_DIST_DIR: ${{ runner.temp }}/package-preflight
+        run: |
+          uv run --no-sync python -m pytest \
+            tests/test_historical_forager_cli_package.py \
+            -m package \
+            -q \
+            -o addopts="" \
+            --strict-config \
+            --strict-markers
+
+  robot-floor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install the robot compatibility floor
+        run: |
+          python - <<'PY'
+          import os
+          import re
+          import tomllib
+          from pathlib import Path
+
+          project = tomllib.loads(Path("pyproject.toml").read_text())
+          excluded = {"jax", "jaxlib", "numpy"}
+          retained = []
+          seen = set()
+          for requirement in project["project"]["dependencies"]:
+              match = re.match(r"[A-Za-z0-9_.-]+", requirement)
+              if match is None:
+                  raise SystemExit(f"unparseable requirement: {requirement}")
+              name = match.group(0).lower().replace("_", "-")
+              if name in excluded:
+                  seen.add(name)
+              else:
+                  retained.append(requirement)
+          if seen != excluded:
+              missing = excluded - seen
+              raise SystemExit(f"missing compatibility requirements: {missing}")
+          destination = (
+              Path(os.environ["RUNNER_TEMP"]) / "floor-requirements.txt"
+          )
+          destination.write_text("\n".join(retained) + "\n", encoding="utf-8")
+          PY
+          python -m venv "$RUNNER_TEMP/robot-floor"
+          floor_python="$RUNNER_TEMP/robot-floor/bin/python"
+          "$floor_python" -m pip install --upgrade pip
+          "$floor_python" -m pip install \
+            --requirement "$RUNNER_TEMP/floor-requirements.txt" \
+            'jax==0.7.1' \
+            'jaxlib==0.7.1' \
+            'numpy==1.26.0' \
+            'pytest>=8.0'
+          "$floor_python" -m pip check
+
+      - name: Eager-import the root and robot surfaces
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          "$RUNNER_TEMP/robot-floor/bin/python" - <<'PY'
+          import importlib
+
+          import jax
+          import jaxlib
+          import numpy
+
+          import alberta_framework
+
+          robot_modules = (
+              "alberta_framework.core.actor_critic",
+              "alberta_framework.core.continual_backprop",
+              "alberta_framework.core.initializers",
+              "alberta_framework.core.normalizers",
+              "alberta_framework.core.optimizers",
+              "alberta_framework.core.sarsa",
+          )
+          for module_name in robot_modules:
+              module = importlib.import_module(module_name)
+              assert module.__name__ == module_name
+
+          root_symbols = (
+              "ActorCriticAgent",
+              "ContinualBackpropConfig",
+              "IDBD",
+              "Normalizer",
+              "SARSAAgent",
+              "sparse_init",
+          )
+          for symbol in root_symbols:
+              assert getattr(alberta_framework, symbol) is not None
+
+          assert jax.__version__ == "0.7.1"
+          assert jaxlib.__version__ == "0.7.1"
+          assert numpy.__version__ == "1.26.0"
+          PY
+
+      - name: Exercise robot-floor runtime behavior
+        run: |
+          initializer_node="tests/test_initializers.py::"
+          initializer_node+="TestSparseInit::test_correct_output_shape"
+          chex_node="tests/test_initializers.py::"
+          chex_node+="TestSparseInit::test_correct_sparsity_fraction"
+          optimizer_node="tests/test_optimizer_registry.py::"
+          optimizer_node+="test_round_trip_with_default_args[IDBD]"
+          sarsa_node="tests/test_sarsa.py::"
+          sarsa_node+="TestSARSAConfigSerialization::test_agent_config_roundtrip"
+          actor_node="tests/test_actor_critic.py::"
+          actor_node+="test_actor_critic_update_is_jittable"
+          "$RUNNER_TEMP/robot-floor/bin/python" -m pytest \
+            "$initializer_node" \
+            "$chex_node" \
+            "$optimizer_node" \
+            "$sarsa_node" \
+            "$actor_node" \
+            -q \
+            -o addopts="" \
+            --strict-config \
+            --strict-markers
+
   lint:
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ["3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+      - name: Set up locked Python 3.12
+        uses: ./.github/actions/setup-locked-python
         with:
-          python-version: ${{ matrix.python-version }}
-          cache: pip
-          cache-dependency-path: pyproject.toml
-
-      - name: Install (editable, with dev extras)
-        run: |
-          python -m pip install -U pip
-          pip install -e '.[dev]'
+          python-version: "3.12"
+          extras: --extra dev
 
       - name: Ruff
-        run: ruff check .
+        run: uv run --no-sync ruff check .
 
       - name: Mypy
-        run: mypy
+        run: uv run --no-sync mypy
 
-  test:
+  test-plan:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ${{ fromJSON(github.event_name == 'pull_request' && '["3.12"]' || '["3.12", "3.13"]') }}
-        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+    timeout-minutes: 30
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+      - name: Set up locked Python 3.12
+        uses: ./.github/actions/setup-locked-python
         with:
-          python-version: ${{ matrix.python-version }}
-          cache: pip
-          cache-dependency-path: pyproject.toml
+          python-version: "3.12"
+          extras: --extra dev --extra gymnasium --extra forager
 
-      - name: Install (editable, with test extras)
+      - name: Collect selected non-slow tests
         run: |
-          python -m pip install -U pip
-          pip install -e '.[dev,gymnasium,forager]' pytest-xdist
+          uv run --no-sync python -m pytest tests \
+            --collect-only \
+            -q \
+            --disable-warnings \
+            -m "not slow and not package" \
+            -o addopts="" \
+            --strict-config \
+            --strict-markers \
+            > "$RUNNER_TEMP/non-slow-nodeids.txt"
 
-      - name: Test shard ${{ matrix.shard }} of ${{ env.SHARD_COUNT }}
+      - name: Build balanced nonempty shard matrix
+        id: plan
         run: |
-          set -euo pipefail
-          mapfile -t files < <(
-            find tests -name 'test_*.py' | sort |
-              awk -v n="$SHARD_COUNT" -v s="${{ matrix.shard }}" 'NR % n == s % n'
+          uv run --no-sync python .github/scripts/plan_pytest_shards.py \
+            --nodeids "$RUNNER_TEMP/non-slow-nodeids.txt" \
+            --shards "$SHARD_COUNT" \
+            --python-version 3.12 \
+            --python-version 3.13 \
+            --label "non-slow, non-package"
+
+  test:
+    name: >-
+      runtime py${{ matrix.python }} shard ${{ matrix.shard }}
+    needs: test-plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.test-plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up locked Python ${{ matrix.python }}
+        uses: ./.github/actions/setup-locked-python
+        with:
+          python-version: ${{ matrix.python }}
+          extras: --extra dev --extra gymnasium --extra forager
+
+      - name: Run selected non-slow tests
+        env:
+          JUNIT_PATH: >-
+            ${{ runner.temp }}/junit-py${{ matrix.python
+            }}-shard-${{ matrix.shard }}.xml
+          TEST_FILES_JSON: ${{ matrix.files_json }}
+        run: |
+          uv run --no-sync python - <<'PY'
+          import json
+          import os
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          files = json.loads(os.environ["TEST_FILES_JSON"])
+          if not files:
+              raise SystemExit("the test plan emitted an empty shard")
+          for value in files:
+              path = Path(value)
+              if path.parts[0] != "tests" or not path.is_file():
+                  raise SystemExit(f"invalid selected test file: {value}")
+
+          command = [
+              sys.executable,
+              "-m",
+              "pytest",
+              *files,
+              "-q",
+              "-rs",
+              "-o",
+              "addopts=",
+              "--strict-config",
+              "--strict-markers",
+              "-m",
+              "not slow and not package",
+              "-n",
+              "2",
+              "--dist",
+              "loadfile",
+              "--durations=25",
+              "--durations-min=1.0",
+              f"--junitxml={os.environ['JUNIT_PATH']}",
+          ]
+          print(
+              f"running {len(files)} files; planned selected nodes: "
+              "${{ matrix.node_count }}",
+              flush=True,
           )
-          if [ "${#files[@]}" -eq 0 ]; then
-            echo "::error::shard ${{ matrix.shard }} selected no test files"
-            exit 1
-          fi
-          echo "shard ${{ matrix.shard }}: ${#files[@]} files"
-          python -m pytest "${files[@]}" -q -rs \
-            -m "not slow" -n 2 --dist loadfile --durations=10
+          raise SystemExit(subprocess.run(command, check=False).returncode)
+          PY
+
+      - name: Upload runtime timing evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: >-
+            junit-runtime-py${{ matrix.python }}-shard-${{ matrix.shard }}
+          path: >-
+            ${{ runner.temp }}/junit-py${{ matrix.python
+            }}-shard-${{ matrix.shard }}.xml
+          if-no-files-found: warn
+          retention-days: 14
+
+  # Stable aggregate check for branch rulesets: the runtime matrix has
+  # dynamic job names, so merge gating requires this single context instead.
+  ci-ok:
+    if: always()
+    needs: [package, robot-floor, lint, test-plan, test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Verify every CI job succeeded
+        env:
+          RESULTS: ${{ toJSON(needs.*.result) }}
+        run: |
+          echo "$RESULTS"
+          echo "$RESULTS" | jq -e 'all(. == "success")'

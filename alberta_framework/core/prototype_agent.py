@@ -36,16 +36,20 @@ import hashlib
 import json
 import math
 import operator
+from collections.abc import Mapping
+from fractions import Fraction
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any, Literal, SupportsIndex, cast
 
 import chex
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 from jax import Array
 from jaxtyping import Bool, Float, Int, UInt
 
+from alberta_framework.core._float32_scalars import validated_float32_scalar
 from alberta_framework.core.checkpoints import (
     load_checkpoint,
     load_checkpoint_metadata,
@@ -92,6 +96,8 @@ from alberta_framework.core.model_replay_rehearsal import (
     ModelReplayRehearsalConfig,
     RealModelReplayEvent,
 )
+from alberta_framework.core.multi_head_learner import _validate_direct_state_resources
+from alberta_framework.core.normalizers import _lifetime_counter_valid
 from alberta_framework.core.oak import (
     OaKAgent,
     OaKConfig,
@@ -171,10 +177,6 @@ from alberta_framework.core.world_model_ensemble import (
 PROTOTYPE_CHECKPOINT_SCHEMA = "alberta.prototype_agent.v3"
 _PROTOTYPE_CHECKPOINT_SCHEMA_V2 = "alberta.prototype_agent.v2"
 _PROTOTYPE_CHECKPOINT_SCHEMA_V1 = "alberta.prototype_agent.v1"
-_PROTOTYPE_EMPTY_ARRAY_CODEC_KEY = "empty_array_codec"
-_PROTOTYPE_EMPTY_ARRAY_CODEC = "alberta.prototype_agent.empty_array_projection.v1"
-_PROTOTYPE_PRNG_IMPL_KEY = "prng_impl"
-_PROTOTYPE_SUPPORTED_PRNG_IMPLS = frozenset({"threefry2x32", "rbg"})
 _DREAM_NEXT_OBSERVATION_STREAM_TAG = 0x44524D4F
 _PROTOTYPE_V2_REPLAY_MIGRATION_TAG = 0x50525632
 _PROTOTYPE_FEATURE_LIFECYCLE_KEY_TAG = 0x50464C43
@@ -202,7 +204,7 @@ def feature_to_subtask_specs(
 
     Args:
         oak_state: Current OaK state.
-        n_subtasks: Number of subtask specs to return.
+        n_subtasks: Non-negative integer scalar number of subtask specs to return.
         threshold: Pseudo-reward threshold for subtask completion.
         pseudo_reward_scale: Pseudo-reward multiplier for generated specs.
         max_option_steps: Hard cap on option duration.
@@ -211,6 +213,15 @@ def feature_to_subtask_specs(
         Tuple of up to ``n_subtasks`` :class:`SubtaskSpec` instances, ordered
         by descending feature importance.
     """
+    if isinstance(n_subtasks, bool):
+        raise ValueError("n_subtasks must be a non-negative integer")
+    try:
+        normalized_n_subtasks = operator.index(n_subtasks)
+    except TypeError as exc:
+        raise ValueError("n_subtasks must be a non-negative integer") from exc
+    if normalized_n_subtasks < 0:
+        raise ValueError("n_subtasks must be a non-negative integer")
+
     bls = oak_state.stomp_state.base_learner_state
     trunk_ws = bls.trunk_params.weights
     if len(trunk_ws) == 0:
@@ -226,8 +237,8 @@ def feature_to_subtask_specs(
     obs_dim = int(opt_q.shape[-1])
     opt_importance = jnp.max(opt_q_abs.reshape(-1, obs_dim), axis=0)  # (obs_dim,)
 
-    combined = feature_importance + opt_importance
-    n = min(n_subtasks, obs_dim)
+    combined = jnp.maximum(feature_importance, opt_importance)
+    n = min(normalized_n_subtasks, obs_dim)
     ranking = sorted(range(obs_dim), key=lambda i: float(combined[i]), reverse=True)[:n]
 
     return tuple(
@@ -239,6 +250,85 @@ def feature_to_subtask_specs(
         )
         for idx in ranking
     )
+
+
+# ---------------------------------------------------------------------------
+# Validation helpers (hostile-safe, evidence-grade)
+# ---------------------------------------------------------------------------
+
+
+_INT32_MAX = 2**31 - 1
+_UINT32_MAX = 4_294_967_295
+_ACTUAL_INT_TYPES: frozenset[type] = frozenset(
+    {
+        int,
+        np.int8,
+        np.int16,
+        np.int32,
+        np.int64,
+        np.uint8,
+        np.uint16,
+        np.uint32,
+        np.uint64,
+        np.longlong,
+        np.ulonglong,
+    }
+)
+_ACTUAL_FLOAT_TYPES: frozenset[type] = frozenset(
+    {float, Fraction, *(np.dtype(code).type for code in ("e", "f", "d", "g"))}
+)
+_ALLOWED_REAL_TYPES: frozenset[type] = _ACTUAL_INT_TYPES | _ACTUAL_FLOAT_TYPES
+
+
+def _require_int(
+    name: str,
+    value: object,
+    *,
+    minimum: int | None = None,
+    maximum: int | None = None,
+) -> int:
+    if type(value) not in _ACTUAL_INT_TYPES:
+        raise ValueError(f"{name} must be an integer")
+    number = operator.index(cast(SupportsIndex, value))
+    if minimum is not None and number < minimum:
+        raise ValueError(f"{name} must be >= {minimum}")
+    if maximum is not None and number > maximum:
+        raise ValueError(f"{name} must be <= {maximum}")
+    return number
+
+
+def _validated_config_float(name: str, value: object, **bounds: Any) -> float:
+    if type(value) not in _ALLOWED_REAL_TYPES:
+        raise ValueError(f"{name} must be a finite real scalar")
+    return validated_float32_scalar(name, value, **bounds)
+
+
+def _require_float32_resource(
+    name: str,
+    *,
+    vector_scalars: int,
+    fixed_scalars: int = 0,
+) -> None:
+    if vector_scalars < 0 or fixed_scalars < 0:
+        raise ValueError(f"{name} scalar counts must be non-negative")
+    total = vector_scalars + fixed_scalars
+    if total > _INT32_MAX:
+        raise ValueError(f"{name} scalar count must fit signed int32")
+    if 4 * total > _INT32_MAX:
+        raise ValueError(f"{name} byte count must fit signed int32")
+
+
+def _copy_mapping(payload: object, *, name: str) -> dict[str, Any]:
+    if not issubclass(type(payload), Mapping):
+        raise ValueError(f"{name} payload must be a mapping")
+    try:
+        data = dict(cast(Mapping[str, Any], payload))
+    except Exception as error:
+        raise ValueError(f"{name} payload could not be read") from error
+    for key in data:
+        if type(key) is not str:
+            raise ValueError(f"{name} payload has exact strings as keys")
+    return data
 
 
 # ---------------------------------------------------------------------------
@@ -270,6 +360,26 @@ class GRUPerceptionConfig:
     observation_dim: int
     hidden_dim: int = 32
 
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "observation_dim",
+            _require_int("observation_dim", self.observation_dim, minimum=1, maximum=_INT32_MAX),
+        )
+        object.__setattr__(
+            self,
+            "hidden_dim",
+            _require_int("hidden_dim", self.hidden_dim, minimum=1, maximum=_INT32_MAX),
+        )
+        # GRU weights: 3*(h*obs + h*h + h) + hidden state h
+        h = int(self.hidden_dim)
+        obs = int(self.observation_dim)
+        _require_float32_resource(
+            "GRUPerception state",
+            vector_scalars=3 * h * obs + 3 * h * h,
+            fixed_scalars=4 * h,
+        )
+
     def augmented_dim(self) -> int:
         """Return ``observation_dim + hidden_dim``."""
         return self.observation_dim + self.hidden_dim
@@ -285,9 +395,13 @@ class GRUPerceptionConfig:
     @classmethod
     def from_config(cls, payload: dict[str, Any]) -> GRUPerceptionConfig:
         """Reconstruct from :meth:`to_config` output."""
-        d = dict(payload)
-        d.pop("type", None)
-        return cls(**d)
+        data = _copy_mapping(payload, name="GRUPerceptionConfig")
+        type_name = data.pop("type", None)
+        if type(type_name) is not str or type_name != "GRUPerceptionConfig":
+            raise ValueError("GRUPerceptionConfig payload type is invalid")
+        if set(data) != {"observation_dim", "hidden_dim"}:
+            raise ValueError("GRUPerceptionConfig payload fields are invalid")
+        return cls(**data)
 
 
 @chex.dataclass(frozen=True)
@@ -545,10 +659,8 @@ class PrototypeAgentConfig:
                     "option_search_control requires "
                     "oak.stomp.option_planning_backups_per_step == 0"
                 )
-        if self.buffer_capacity <= 0:
-            raise ValueError("buffer_capacity must be positive")
-        if self.n_dreams_per_step < 0:
-            raise ValueError("n_dreams_per_step must be non-negative")
+        if type(self.dream_next_observation_mode) is not str:
+            raise ValueError("dream_next_observation_mode must be a string")
         if self.dream_next_observation_mode not in {
             "model_prediction",
             "sample_one_hot",
@@ -557,11 +669,61 @@ class PrototypeAgentConfig:
                 "dream_next_observation_mode must be "
                 "'model_prediction' or 'sample_one_hot'"
             )
-        if self.horde_step_size <= 0.0:
-            raise ValueError("horde_step_size must be positive")
-        if self.auto_curate_every < 0:
-            raise ValueError("auto_curate_every must be non-negative")
-        if not isinstance(self.learn_state_builder_from_world_model, bool):
+        # Hostile-safe canonicalization (must precede any allocation)
+        object.__setattr__(
+            self,
+            "buffer_capacity",
+            _require_int("buffer_capacity", self.buffer_capacity, minimum=1, maximum=_INT32_MAX),
+        )
+        object.__setattr__(
+            self,
+            "n_dreams_per_step",
+            _require_int(
+                "n_dreams_per_step",
+                self.n_dreams_per_step,
+                minimum=0,
+                maximum=_INT32_MAX,
+            ),
+        )
+        # horde_hidden_sizes: hostile-safe per-element validation
+        raw_hidden = self.horde_hidden_sizes
+        if type(raw_hidden) is not tuple:
+            raise ValueError("horde_hidden_sizes must be a tuple of integers")
+        canonical_hidden: list[int] = []
+        for idx, value in enumerate(raw_hidden):
+            canonical_hidden.append(
+                _require_int(f"horde_hidden_sizes[{idx}]", value, minimum=1, maximum=_INT32_MAX)
+            )
+        object.__setattr__(self, "horde_hidden_sizes", tuple(canonical_hidden))
+        object.__setattr__(
+            self,
+            "horde_step_size",
+            _validated_config_float("horde_step_size", self.horde_step_size, positive=True),
+        )
+        object.__setattr__(
+            self,
+            "auto_curate_every",
+            _require_int(
+                "auto_curate_every",
+                self.auto_curate_every,
+                minimum=0,
+                maximum=_INT32_MAX,
+            ),
+        )
+        if self.world_model is not None:
+            _require_float32_resource(
+                "PrototypeAgent buffer",
+                vector_scalars=self.buffer_capacity * self.oak.observation_dim,
+                fixed_scalars=2,
+            )
+        if self.horde_spec is not None:
+            _validate_direct_state_resources(
+                len(self.horde_spec.demons),
+                self.horde_hidden_sizes,
+                self.oak.observation_dim,
+            )
+        # GRU resource already validated via GRUPerceptionConfig.__post_init__
+        if type(self.learn_state_builder_from_world_model) is not bool:
             raise ValueError("learn_state_builder_from_world_model must be boolean")
         mixer = self.representation_gradient_mixer
         if mixer is not None and not isinstance(
@@ -985,9 +1147,9 @@ class PrototypeAgentConfig:
         """Reconstruct from :meth:`to_config` output."""
         from alberta_framework.core.types import HordeSpec as _HordeSpec
 
-        data = dict(payload)
+        data = _copy_mapping(payload, name="PrototypeAgentConfig")
         config_type = data.pop("type", None)
-        if config_type != "PrototypeAgentConfig":
+        if type(config_type) is not str or config_type != "PrototypeAgentConfig":
             raise ValueError(
                 "PrototypeAgentConfig payload type must be 'PrototypeAgentConfig'"
             )
@@ -1091,7 +1253,7 @@ class PrototypeAgentConfig:
             "learn_state_builder_from_world_model",
             False,
         )
-        if not isinstance(learn_state_builder_from_world_model, bool):
+        if type(learn_state_builder_from_world_model) is not bool:
             raise ValueError(
                 "learn_state_builder_from_world_model must be boolean"
             )
@@ -1119,17 +1281,40 @@ class PrototypeAgentConfig:
             else None
         )
 
-        hidden = tuple(int(x) for x in data.pop("horde_hidden_sizes", [64, 64]))
-        buffer_capacity = int(data.pop("buffer_capacity", 200))
-        n_dreams_per_step = int(data.pop("n_dreams_per_step", 0))
+        # Hostile-safe scalar canonicalization for serialized fields
+        hidden_raw = data.pop("horde_hidden_sizes", [64, 64])
+        if type(hidden_raw) is not list:
+            raise ValueError("serialized horde_hidden_sizes must be an actual list")
+        hidden_list: list[int] = []
+        for idx, value in enumerate(hidden_raw):
+            hidden_list.append(
+                _require_int(f"horde_hidden_sizes[{idx}]", value, minimum=1, maximum=_INT32_MAX)
+            )
+        hidden = tuple(hidden_list)
+        buffer_capacity = _require_int(
+            "buffer_capacity", data.pop("buffer_capacity", 200), minimum=1, maximum=_INT32_MAX
+        )
+        n_dreams_per_step = _require_int(
+            "n_dreams_per_step", data.pop("n_dreams_per_step", 0), minimum=0, maximum=_INT32_MAX
+        )
         dream_next_observation_mode = data.pop(
             "dream_next_observation_mode",
             "model_prediction",
         )
-        horde_step_size = float(data.pop("horde_step_size", 0.1))
-        auto_curate_every = int(data.pop("auto_curate_every", 0))
+        if type(dream_next_observation_mode) is not str:
+            raise ValueError("dream_next_observation_mode must be a string")
+        if dream_next_observation_mode not in {"model_prediction", "sample_one_hot"}:
+            raise ValueError(
+                "dream_next_observation_mode must be 'model_prediction' or 'sample_one_hot'"
+            )
+        horde_step_size = _validated_config_float(
+            "horde_step_size", data.pop("horde_step_size", 0.1), positive=True
+        )
+        auto_curate_every = _require_int(
+            "auto_curate_every", data.pop("auto_curate_every", 0), minimum=0, maximum=_INT32_MAX
+        )
         if data:
-            unknown = ", ".join(sorted(data))
+            unknown = ", ".join(sorted(str(k) for k in data))
             raise ValueError(f"PrototypeAgentConfig payload has unknown fields: {unknown}")
         return cls(
             oak=oak,
@@ -1547,7 +1732,12 @@ class PrototypeExperientialMemoryDiagnostics:
 
 @dataclasses.dataclass(frozen=True)
 class PrototypeExperientialMemoryResourceDeclaration:
-    """Exact persistent allocation and bounded work per required transaction."""
+    """Exact persistent allocation and bounded work per required transaction.
+
+    ``categorical_policy_queries`` is the one query shared by proposal and
+    causal access/write accounting. ``causal_step_queries`` counts only an
+    additional query and is therefore zero for the fused transaction.
+    """
 
     persistent_state_bytes: int
     categorical_policy_queries: int
@@ -2015,6 +2205,14 @@ def _unavailable_state_builder_learning_diagnostics() -> StateBuilderLearningDia
     )
 
 
+def _shaped_float_array(value: Any, shape: tuple[int, ...], *, name: str) -> Array:
+    """Coerce to float32 without ever reshaping: static shape drift is a caller error."""
+    array = jnp.asarray(value, dtype=jnp.float32)
+    if array.shape != shape:
+        raise ValueError(f"{name} must have shape {shape}, got {array.shape}")
+    return array
+
+
 def _checked_finite_array(
     value: Any,
     shape: tuple[int, ...],
@@ -2023,7 +2221,7 @@ def _checked_finite_array(
     allow_nan: bool = False,
 ) -> Array:
     """Validate shape/finiteness eagerly and poison invalid traced values."""
-    array = jnp.asarray(value, dtype=jnp.float32).reshape(shape)
+    array = _shaped_float_array(value, shape, name=name)
     element_valid = ~jnp.isinf(array) if allow_nan else jnp.isfinite(array)
     valid = jnp.all(element_valid)
     if not _contains_tracer(array) and not bool(valid):
@@ -2034,7 +2232,7 @@ def _checked_finite_array(
 
 def _checked_unit_discount(value: Any, shape: tuple[int, ...], *, name: str) -> Array:
     """Validate finite ``[0, 1]`` discounts at eager and traced boundaries."""
-    array = jnp.asarray(value, dtype=jnp.float32).reshape(shape)
+    array = _shaped_float_array(value, shape, name=name)
     valid = jnp.all(
         jnp.isfinite(array) & (array >= 0.0) & (array <= 1.0)
     )
@@ -2220,6 +2418,8 @@ class PrototypeAgent:
     """
 
     def __init__(self, config: PrototypeAgentConfig) -> None:
+        if type(config) is not PrototypeAgentConfig:
+            raise ValueError("config must be an exact PrototypeAgentConfig")
         self._config = config
         self._oak = OaKAgent(config.oak)
         self._option_search_control: OptionSearchControl | None = None
@@ -2469,7 +2669,7 @@ class PrototypeAgent:
 
     @property
     def experiential_memory_policy(self) -> ExperientialMemoryPolicy | None:
-        """Return the read-only categorical memory proposal boundary."""
+        """Return the categorical memory proposal/transaction boundary."""
 
         return self._experiential_memory_policy
 
@@ -2477,14 +2677,14 @@ class PrototypeAgent:
     def experiential_memory_resource_declaration(
         self,
     ) -> PrototypeExperientialMemoryResourceDeclaration | None:
-        """Declare memory bytes and both deterministic pre-state queries."""
+        """Declare memory bytes and the single deterministic pre-state query."""
 
         policy = self._experiential_memory_policy
         if policy is None:
             return None
         policy_resources = policy.resource_declaration()
         categorical_queries = policy_resources.memory_queries_per_proposal
-        causal_queries = 1
+        causal_queries = 0
         return PrototypeExperientialMemoryResourceDeclaration(
             persistent_state_bytes=(
                 policy_resources.external_memory_persistent_state_bytes
@@ -3855,9 +4055,40 @@ class PrototypeAgent:
             return self._config.gru_perception.observation_dim
         return self._config.oak.observation_dim
 
+    @staticmethod
+    def _oak_state_numeric_valid(
+        oak_agent: OaKAgent,
+        state: OaKState,
+    ) -> Array:
+        """Authenticate one OaK wrapper and its complete nested STOMP state."""
+
+        counter_ceiling = jnp.where(
+            state.step_count < jnp.asarray(_INT32_MAX, dtype=jnp.int32),
+            state.step_count + jnp.asarray(1, dtype=jnp.int32),
+            state.step_count,
+        )
+        return (
+            _lifetime_counter_valid(state.step_words, state.step_count)
+            & _lifetime_counter_valid(
+                state.stomp_state.step_words,
+                state.stomp_state.step_count,
+            )
+            & jnp.all(state.step_words == state.stomp_state.step_words)
+            & (state.step_count == state.stomp_state.step_count)
+            & jnp.all(state.execution_counts >= 0)
+            & jnp.all(state.execution_counts <= counter_ceiling)
+            & jnp.all(jnp.isfinite(state.cumulative_pseudo_rewards))
+            & jnp.all(jnp.isfinite(state.utility_ema))
+            & oak_agent.stomp_agent.state_valid(state.stomp_state)
+        )
+
     def _state_numeric_valid(self, state: PrototypeAgentState) -> Array:
         """Validate state numerics while preserving world-model init sentinels."""
         sanitized_state = state
+        oak_state_valid = self._oak_state_numeric_valid(
+            self._oak,
+            self._oak_component_state(state.oak_state),
+        )
         world_model_bounds_valid = jnp.asarray(True)
         state_builder_valid = jnp.asarray(True)
         feature_lifecycle_valid = jnp.asarray(True, dtype=jnp.bool_)
@@ -4008,7 +4239,8 @@ class PrototypeAgent:
                 state.replace(world_model_state=sanitized_world_model_state),
             )
         return (
-            world_model_bounds_valid
+            oak_state_valid
+            & world_model_bounds_valid
             & state_builder_valid
             & feature_lifecycle_valid
             & interaction_state_valid
@@ -4780,14 +5012,6 @@ class PrototypeAgent:
             memory_input.next_action_safety_mask,
             jnp.ones_like(memory_input.next_action_safety_mask),
         )
-        proposal = policy.propose(
-            memory_state,
-            decision_representation,
-            query_version,
-            query_uncertainty,
-            query_uncertainty_available,
-            safety_mask,
-        )
         entry = ExperientialMemoryEntry(
             observation=current_representation,
             key=current_representation,
@@ -4817,28 +5041,44 @@ class PrototypeAgent:
             source_id=memory_input.source_id,
         )
 
-        def apply_step(_: None) -> ExperientialMemoryStepResult:
-            return memory.step(
+        def apply_step(
+            _: None,
+        ) -> tuple[ExperientialMemoryPolicyProposal, ExperientialMemoryStepResult]:
+            return policy.propose_and_step(
                 memory_state,
                 decision_representation,
-                memory_input.query_representation_version,
-                memory_input.query_uncertainty,
-                memory_input.query_uncertainty_available,
+                query_version,
+                query_uncertainty,
+                query_uncertainty_available,
+                safety_mask,
                 entry,
             )
 
-        def skip_step(_: None) -> ExperientialMemoryStepResult:
-            return ExperientialMemoryStepResult(
-                state=memory_state,
-                retrieval=proposal.retrieval,
-                wrote=jnp.asarray(False, dtype=jnp.bool_),
-                slot=jnp.asarray(-1, dtype=jnp.int32),
-                evicted=jnp.asarray(False, dtype=jnp.bool_),
-                evicted_provenance_id=jnp.asarray(-1, dtype=jnp.int32),
+        def skip_step(
+            _: None,
+        ) -> tuple[ExperientialMemoryPolicyProposal, ExperientialMemoryStepResult]:
+            proposal = policy.propose(
+                memory_state,
+                decision_representation,
+                query_version,
+                query_uncertainty,
+                query_uncertainty_available,
+                safety_mask,
+            )
+            return (
+                proposal,
+                ExperientialMemoryStepResult(
+                    state=memory_state,
+                    retrieval=proposal.retrieval,
+                    wrote=jnp.asarray(False, dtype=jnp.bool_),
+                    slot=jnp.asarray(-1, dtype=jnp.int32),
+                    evicted=jnp.asarray(False, dtype=jnp.bool_),
+                    evicted_provenance_id=jnp.asarray(-1, dtype=jnp.int32),
+                ),
             )
 
-        step = cast(
-            ExperientialMemoryStepResult,
+        proposal, step = cast(
+            tuple[ExperientialMemoryPolicyProposal, ExperientialMemoryStepResult],
             jax.lax.cond(
                 transaction_required,
                 apply_step,
@@ -4890,7 +5130,7 @@ class PrototypeAgent:
             query_before_write=transaction_required & retrieval_matches,
             deterministic_prestate_query_count=jnp.where(
                 transaction_required,
-                jnp.asarray(2, dtype=jnp.int32),
+                jnp.asarray(1, dtype=jnp.int32),
                 jnp.asarray(0, dtype=jnp.int32),
             ),
             wrote=step.wrote,
@@ -5115,7 +5355,8 @@ class PrototypeAgent:
             carry: tuple[OaKState, Array], dream_index: Array
         ) -> tuple[tuple[OaKState, Array], Float[Array, ""]]:
             oak_s, k = carry
-            # Both observation ablations use identical anchor/action key streams.
+            # Keep this legacy split unchanged so raw and sampled-one-hot
+            # ablations share identical anchor/action key streams.
             k, sample_key, action_key = jr.split(k, 3)
             anchor_obs, _ = self._buffer.sample(buf_state, sample_key)
             action = jr.randint(action_key, (), 0, n_prim, dtype=jnp.int32)
@@ -5201,7 +5442,9 @@ class PrototypeAgent:
         explicit discount.  This wrapper preserves the former behavior:
         primitive control bootstraps with one, option returns use
         ``STOMPConfig.option_gamma``, and the world model (when enabled)
-        receives its configured gamma as the target discount.
+        receives its configured gamma as the target discount. Because this
+        surface has no terminal flag, a configured zero model discount requires
+        the explicit :meth:`update_transition` API.
         """
         if self._state_builder is not None:
             raise ValueError(
@@ -5221,6 +5464,11 @@ class PrototypeAgent:
                 )
             )
         )
+        if legacy_model_discount == 0.0:
+            raise ValueError(
+                "legacy update is unavailable when the configured world-model gamma "
+                "is zero; use update_transition with an explicit terminal transition"
+            )
         current_oak_state = self._oak_component_state(state.oak_state)
         feature_consumer_binding = (
             self._feature_consumer_binding(state.oak_state)
@@ -5778,7 +6026,6 @@ class PrototypeAgent:
             transition_diagnostics=diagnostics,
         )
 
-    @functools.partial(jax.jit, static_argnums=(0,))
     def _update_transition_impl(
         self,
         state: PrototypeAgentState,
@@ -5798,7 +6045,7 @@ class PrototypeAgent:
         ),
         partner_policy_fusion_feedback_supplied: Array,
     ) -> PrototypeUpdateResult:
-        """Atomically apply one normalized transition at a reusable JAX boundary."""
+        """Atomically apply a valid transition or return an exact no-op."""
 
         def valid_branch(_: None) -> PrototypeUpdateResult:
             result = self._apply_valid_transition_impl(
@@ -5853,6 +6100,7 @@ class PrototypeAgent:
             post_valid = (
                 post_finite
                 & post_consistent
+                & result.transition_diagnostics.valid
                 & recurrent_transaction_valid
                 & memory_transaction_valid
             )
@@ -6165,6 +6413,10 @@ class PrototypeAgent:
         model_replay_sampled = jnp.asarray(False)
         model_replay_updates_applied = jnp.asarray(0, dtype=jnp.int32)
         model_replay_padding_count = jnp.asarray(0, dtype=jnp.int32)
+        plain_world_model_transaction_applied = jnp.asarray(
+            True,
+            dtype=jnp.bool_,
+        )
 
         if self._world_model is not None and self._buffer is not None:
             wm_result = self._world_model.update(
@@ -6176,6 +6428,7 @@ class PrototypeAgent:
                 bootstrap_obs,
             )
             new_wm_state = wm_result.state
+            plain_world_model_transaction_applied = wm_result.update_applied
             bootstrap_buffer_state = self._buffer.add(
                 state.buffer_state,
                 bootstrap_obs,
@@ -6820,6 +7073,19 @@ class PrototypeAgent:
             step_count=next_step_count,
         )
 
+        component_diagnostics = cast(
+            PrototypeTransitionDiagnostics,
+            diagnostics.replace(
+                valid=(
+                    diagnostics.valid
+                    & plain_world_model_transaction_applied
+                ),
+                rejected=~(
+                    diagnostics.valid
+                    & plain_world_model_transaction_applied
+                ),
+            ),
+        )
         return PrototypeUpdateResult(
             state=new_state,
             action=next_action,
@@ -6856,7 +7122,7 @@ class PrototypeAgent:
             ia_recommendation=ia_recommendation,
             experiential_memory_diagnostics=memory_diagnostics,
             partner_policy_fusion_diagnostics=partner_fusion_diagnostics,
-            transition_diagnostics=diagnostics,
+            transition_diagnostics=component_diagnostics,
         )
 
     # -- Scan-based loop ------------------------------------------------------
@@ -7543,7 +7809,7 @@ class PrototypeAgent:
 
         Args:
             state: Current agent state.
-            n_subtasks: Number of subtask specs to return.
+            n_subtasks: Non-negative integer scalar number of subtask specs to return.
 
         Returns:
             Tuple of :class:`SubtaskSpec` instances ranked by importance.
@@ -7570,220 +7836,6 @@ def _prototype_config_digest(config: dict[str, Any]) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def _is_empty_array_leaf(value: Any) -> bool:
-    """Return whether ``value`` is a concrete array leaf with zero elements."""
-
-    shape = getattr(value, "shape", None)
-    dtype = getattr(value, "dtype", None)
-    size = getattr(value, "size", None)
-    return (
-        isinstance(shape, tuple)
-        and dtype is not None
-        and isinstance(size, int)
-        and size == 0
-    )
-
-
-def _empty_array_storage_sentinel(value: Any) -> Array:
-    """Create the deterministic nonempty storage value for one empty array."""
-
-    return jnp.zeros((1,), dtype=value.dtype)
-
-
-def _project_empty_array_leaves(state: PrototypeAgentState) -> PrototypeAgentState:
-    """Replace semantic empty arrays with Orbax-compatible storage sentinels."""
-
-    return cast(
-        PrototypeAgentState,
-        jax.tree.map(
-            lambda leaf: (
-                _empty_array_storage_sentinel(leaf)
-                if _is_empty_array_leaf(leaf)
-                else leaf
-            ),
-            state,
-        ),
-    )
-
-
-def _array_leaf_signature(value: Any) -> tuple[tuple[int, ...], Any] | None:
-    """Return a concrete array leaf's exact shape and dtype, if it has them."""
-
-    if not isinstance(value, jax.Array):
-        return None
-    shape = getattr(value, "shape", None)
-    dtype = getattr(value, "dtype", None)
-    if not isinstance(shape, tuple) or dtype is None:
-        return None
-    return cast(tuple[int, ...], shape), dtype
-
-
-def _validate_checkpoint_array_contract(
-    state: PrototypeAgentState,
-    canonical_template: PrototypeAgentState,
-) -> None:
-    """Require exact array identity, shape, and dtype against the config template."""
-
-    state_leaves, state_structure = jax.tree_util.tree_flatten(state)
-    template_leaves, template_structure = jax.tree_util.tree_flatten(
-        canonical_template
-    )
-    if cast(Any, state_structure) != template_structure or len(state_leaves) != len(
-        template_leaves
-    ):
-        raise ValueError(
-            "prototype checkpoint array contract does not match canonical template"
-        )
-
-    for state_leaf, template_leaf in zip(
-        state_leaves,
-        template_leaves,
-        strict=True,
-    ):
-        state_signature = _array_leaf_signature(state_leaf)
-        template_signature = _array_leaf_signature(template_leaf)
-        if (
-            state_signature is None
-            or template_signature is None
-            or state_signature != template_signature
-        ):
-            raise ValueError(
-                "prototype checkpoint array contract does not match canonical template"
-            )
-
-
-def _typed_prng_key_impl(value: Any) -> str | None:
-    """Return a typed JAX key's implementation, or ``None`` for non-keys."""
-
-    dtype = getattr(value, "dtype", None)
-    if dtype is None:
-        return None
-    try:
-        is_typed_key = jax.dtypes.issubdtype(dtype, jax.dtypes.prng_key)
-    except (TypeError, ValueError):
-        return None
-    if not is_typed_key:
-        return None
-    try:
-        return str(jr.key_impl(value))
-    except (TypeError, ValueError) as exc:
-        raise ValueError("prototype state contains an invalid typed PRNG key") from exc
-
-
-def _prototype_state_prng_impl(state: PrototypeAgentState) -> str:
-    """Return the single supported implementation shared by every state key."""
-
-    implementations = {
-        implementation
-        for leaf in jax.tree_util.tree_leaves(state)
-        if (implementation := _typed_prng_key_impl(leaf)) is not None
-    }
-    if not implementations:
-        raise ValueError("prototype state does not contain a typed PRNG key")
-    if len(implementations) != 1:
-        raise ValueError("prototype state mixes PRNG implementations")
-    implementation = next(iter(implementations))
-    if implementation not in _PROTOTYPE_SUPPORTED_PRNG_IMPLS:
-        raise ValueError(
-            f"prototype state uses unsupported PRNG implementation {implementation!r}"
-        )
-    return implementation
-
-
-def _prototype_template_key_impl(key: Array) -> str:
-    """Validate one supported typed scalar key supplied as a restore hint."""
-
-    if getattr(key, "shape", None) != ():
-        raise ValueError("template_key must be a typed scalar JAX PRNG key")
-    implementation = _typed_prng_key_impl(key)
-    if implementation is None:
-        raise ValueError("template_key must be a typed scalar JAX PRNG key")
-    if implementation not in _PROTOTYPE_SUPPORTED_PRNG_IMPLS:
-        raise ValueError(
-            "template_key uses an unsupported PRNG implementation "
-            f"{implementation!r}"
-        )
-    return implementation
-
-
-def _prototype_checkpoint_lifecycle_id(key: Array) -> Array:
-    """Derive a stable two-word restore-template lifecycle from any key width."""
-
-    try:
-        session_key = jr.split(key, 7)[0]
-        key_words = jr.key_data(session_key).reshape((-1,))
-    except (TypeError, ValueError) as exc:
-        raise ValueError("checkpoint template key is not a valid JAX PRNG key") from exc
-    if key_words.dtype != jnp.uint32 or key_words.size < 2:
-        raise ValueError("checkpoint template key must provide two uint32 words")
-    return key_words[:2]
-
-
-def _checkpoint_prng_impl(metadata: dict[str, Any], schema: Any) -> str | None:
-    """Validate optional v3 PRNG binding metadata for legacy compatibility."""
-
-    if _PROTOTYPE_PRNG_IMPL_KEY not in metadata:
-        return None
-    implementation = metadata.get(_PROTOTYPE_PRNG_IMPL_KEY)
-    if schema != PROTOTYPE_CHECKPOINT_SCHEMA:
-        raise ValueError("prototype PRNG implementation metadata is valid only for v3")
-    if (
-        type(implementation) is not str
-        or implementation not in _PROTOTYPE_SUPPORTED_PRNG_IMPLS
-    ):
-        raise ValueError("prototype checkpoint uses an unsupported PRNG implementation")
-    return implementation
-
-
-def _array_leaves_exactly_equal(left: Any, right: Any) -> bool:
-    """Compare concrete array leaves without coercing typed PRNG keys."""
-
-    if (
-        getattr(left, "shape", None) != getattr(right, "shape", None)
-        or getattr(left, "dtype", None) != getattr(right, "dtype", None)
-    ):
-        return False
-    dtype = getattr(left, "dtype", None)
-    if dtype is None:
-        return False
-    if jax.dtypes.issubdtype(dtype, jax.dtypes.prng_key):
-        return bool(jnp.array_equal(jr.key_data(left), jr.key_data(right)))
-    return bool(jnp.array_equal(left, right))
-
-
-def _restore_empty_array_leaves(
-    projected_state: PrototypeAgentState,
-    semantic_template: PrototypeAgentState,
-) -> PrototypeAgentState:
-    """Validate storage sentinels and restore exact semantic empty leaves."""
-
-    projected_leaves, projected_structure = jax.tree_util.tree_flatten(projected_state)
-    template_leaves, template_structure = jax.tree_util.tree_flatten(semantic_template)
-    if cast(Any, projected_structure) != template_structure or len(
-        projected_leaves
-    ) != len(template_leaves):
-        raise ValueError("prototype empty-array checkpoint structure is inconsistent")
-
-    semantic_leaves: list[Any] = []
-    for projected_leaf, template_leaf in zip(
-        projected_leaves,
-        template_leaves,
-        strict=True,
-    ):
-        if not _is_empty_array_leaf(template_leaf):
-            semantic_leaves.append(projected_leaf)
-            continue
-        expected = _empty_array_storage_sentinel(template_leaf)
-        if not _array_leaves_exactly_equal(projected_leaf, expected):
-            raise ValueError("prototype empty-array storage sentinel is inconsistent")
-        semantic_leaves.append(template_leaf)
-
-    return cast(
-        PrototypeAgentState,
-        jax.tree_util.tree_unflatten(template_structure, semantic_leaves),
-    )
-
-
 def save_prototype_checkpoint(
     agent: PrototypeAgent,
     state: PrototypeAgentState,
@@ -7791,33 +7843,22 @@ def save_prototype_checkpoint(
 ) -> None:
     """Persist the complete prototype config, PyTree state, and every RNG.
 
-    This wrapper adds the configuration needed to reconstruct a matching
-    template, a digest that makes accidental config/metadata edits fail closed,
-    and a reversible storage projection for semantic empty arrays.
+    The generic checkpoint layer stores the state exactly as supplied.  This
+    wrapper adds the configuration needed to reconstruct a matching template
+    and a digest that makes accidental config/metadata edits fail closed.
     """
 
-    prng_impl = _prototype_state_prng_impl(state)
-    canonical_key = jr.key(0, impl=prng_impl)
-    canonical_template = agent.init(
-        canonical_key,
-        lifecycle_id=_prototype_checkpoint_lifecycle_id(canonical_key),
-    )
-    if _prototype_state_prng_impl(canonical_template) != prng_impl:
-        raise ValueError("prototype config does not preserve its state PRNG implementation")
-    _validate_checkpoint_array_contract(state, canonical_template)
     if not bool(agent._checkpoint_state_valid(state)):
         raise ValueError("cannot save an inconsistent PrototypeAgent state")
 
     config = agent.to_config()
     save_checkpoint(
-        _project_empty_array_leaves(state),
+        state,
         path,
         metadata={
             "schema": PROTOTYPE_CHECKPOINT_SCHEMA,
             "agent_config": config,
             "config_sha256": _prototype_config_digest(config),
-            _PROTOTYPE_EMPTY_ARRAY_CODEC_KEY: _PROTOTYPE_EMPTY_ARRAY_CODEC,
-            _PROTOTYPE_PRNG_IMPL_KEY: prng_impl,
         },
     )
 
@@ -7851,15 +7892,6 @@ def load_prototype_checkpoint(
         raise ValueError(
             "checkpoint is not an Alberta PrototypeAgent v1/v2/v3 checkpoint"
         )
-    has_empty_array_codec = _PROTOTYPE_EMPTY_ARRAY_CODEC_KEY in metadata
-    empty_array_codec = metadata.get(_PROTOTYPE_EMPTY_ARRAY_CODEC_KEY)
-    if has_empty_array_codec and empty_array_codec != _PROTOTYPE_EMPTY_ARRAY_CODEC:
-        raise ValueError("prototype checkpoint uses an unknown empty-array codec")
-    if has_empty_array_codec and schema != PROTOTYPE_CHECKPOINT_SCHEMA:
-        raise ValueError("prototype empty-array codec is valid only for v3 checkpoints")
-    checkpoint_prng_impl = _checkpoint_prng_impl(metadata, schema)
-    if has_empty_array_codec and checkpoint_prng_impl is None:
-        raise ValueError("prototype checkpoint is missing PRNG implementation metadata")
     config = metadata.get("agent_config")
     if not isinstance(config, dict):
         raise ValueError("prototype checkpoint is missing agent_config")
@@ -7880,47 +7912,13 @@ def load_prototype_checkpoint(
             "prototype_feature_lifecycle is unsupported by legacy v1/v2 "
             "PrototypeAgent checkpoints"
         )
-    if checkpoint_prng_impl is None:
-        key = jr.key(0) if template_key is None else template_key
-    elif template_key is None:
-        key = jr.key(0, impl=checkpoint_prng_impl)
-    else:
-        template_prng_impl = _prototype_template_key_impl(template_key)
-        if template_prng_impl != checkpoint_prng_impl:
-            raise ValueError(
-                "template_key PRNG implementation does not match checkpoint metadata"
-            )
-        key = template_key
-    template = agent.init(
-        key,
-        lifecycle_id=_prototype_checkpoint_lifecycle_id(key),
-    )
-    if (
-        checkpoint_prng_impl is not None
-        and _prototype_state_prng_impl(template) != checkpoint_prng_impl
-    ):
-        raise ValueError(
-            "prototype config does not preserve the checkpoint PRNG implementation"
-        )
+    key = jr.key(0) if template_key is None else template_key
+    template = agent.init(key)
     if schema == PROTOTYPE_CHECKPOINT_SCHEMA:
-        storage_template = (
-            _project_empty_array_leaves(template)
-            if has_empty_array_codec
-            else template
-        )
-        restored, restored_metadata = load_checkpoint(storage_template, path)
+        restored, restored_metadata = load_checkpoint(template, path)
         if restored_metadata != metadata:
             raise ValueError("prototype checkpoint metadata changed between reads")
         restored_state = cast(PrototypeAgentState, restored)
-        if has_empty_array_codec:
-            restored_state = _restore_empty_array_leaves(restored_state, template)
-        if (
-            checkpoint_prng_impl is not None
-            and _prototype_state_prng_impl(restored_state) != checkpoint_prng_impl
-        ):
-            raise ValueError(
-                "restored prototype state does not match its PRNG implementation metadata"
-            )
         if not bool(agent._checkpoint_state_valid(restored_state)):
             raise ValueError("prototype checkpoint decision/cache state is inconsistent")
         return agent, restored_state

@@ -1,4 +1,4 @@
-"""Core components for ASI's ``alberta_framework`` compatibility package."""
+"""Core components for the Alberta Framework."""
 from alberta_framework.core.actor_critic import (
     ActorCriticAgent,
     ActorCriticArrayResult,
@@ -451,6 +451,7 @@ from alberta_framework.core.representation_gradient_mixer import (
     GradientNormalization,
     RepresentationGradientMixDiagnostics,
     RepresentationGradientMixerConfig,
+    RepresentationGradientMixerResourceBudget,
     RepresentationGradientMixResult,
     mix_representation_gradients,
 )
@@ -520,10 +521,13 @@ from alberta_framework.core.types import (
     create_horde_spec,
 )
 from alberta_framework.core.working_memory import (
+    WorkingMemoryArrayResult,
     WorkingMemoryConfig,
     WorkingMemoryDiagnostics,
     WorkingMemoryFeaturizer,
     WorkingMemoryState,
+    WorkingMemoryStepResult,
+    WorkingMemoryUpdateResult,
     transform_working_memory_arrays,
 )
 from alberta_framework.core.world_model import (
@@ -771,6 +775,7 @@ __all__ = [
     "GradientNormalization",
     "RepresentationGradientMixDiagnostics",
     "RepresentationGradientMixerConfig",
+    "RepresentationGradientMixerResourceBudget",
     "RepresentationGradientMixResult",
     "mix_representation_gradients",
     # Dreaming / self-simulation
@@ -829,7 +834,6 @@ __all__ = [
     "FeatureBankRouterResourceBudget",
     "FeatureBankRouterState",
     "PairDescriptorValidation",
-    # L0 bounded hidden-partner integration mechanism
     # Average reward (Steps 5/6)
     "AverageRewardHordeLearner",
     "AverageRewardHordeActorCriticAgent",
@@ -937,10 +941,13 @@ __all__ = [
     "state_builder_config_from_config",
     "state_builder_from_config",
     # Working memory / predictive state
+    "WorkingMemoryArrayResult",
     "WorkingMemoryConfig",
     "WorkingMemoryDiagnostics",
     "WorkingMemoryFeaturizer",
     "WorkingMemoryState",
+    "WorkingMemoryStepResult",
+    "WorkingMemoryUpdateResult",
     "transform_working_memory_arrays",
     "LatentWorldModel",
     "LatentWorldModelConfig",

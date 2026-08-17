@@ -22,22 +22,95 @@ References:
 """
 
 import functools
+import operator
 import time
-from typing import Any
+from collections.abc import Mapping
+from typing import Any, SupportsIndex, cast
 
 import chex
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 from jax import Array
-from jaxtyping import Float, Int, PRNGKeyArray
+from jaxtyping import Bool, Float, Int, PRNGKeyArray
 
+from alberta_framework.core._float32_scalars import validated_float32_scalar_with_ratio
 from alberta_framework.core.future_utility import (
+    bias_correct_future_utility,
+    canonical_float32_ema_decay,
     contribution_trace_output_loss_reduction,
     normalize_future_utility_signal,
     one_step_output_loss_reduction,
     trace_output_loss_reduction,
 )
+from alberta_framework.core.update_safety import (
+    floating_tree_is_finite,
+    neutralize_array,
+    select_transaction,
+)
+
+_INT32_MAX = 2**31 - 1
+_UINT32_MAX = 2**32 - 1
+_MAX_STATE_NBYTES = 256 * 1024 * 1024
+_ACTUAL_INT_TYPES = frozenset(
+    {
+        int,
+        np.int8,
+        np.int16,
+        np.int32,
+        np.int64,
+        np.longlong,
+        np.uint8,
+        np.uint16,
+        np.uint32,
+        np.uint64,
+        np.ulonglong,
+    }
+)
+
+
+def _require_int32(name: str, value: object, *, minimum: int) -> int:
+    """Validate one concrete host integer without invoking hostile hooks."""
+    if type(value) not in _ACTUAL_INT_TYPES:
+        raise ValueError(f"{name} must be an integer in [{minimum}, {_INT32_MAX}]")
+    canonical = operator.index(cast(SupportsIndex, value))
+    if not minimum <= canonical <= _INT32_MAX:
+        raise ValueError(f"{name} must be an integer in [{minimum}, {_INT32_MAX}]")
+    return canonical
+
+
+def _saturating_int32_increment(value: Array) -> Array:
+    cap = jnp.asarray(_INT32_MAX, dtype=jnp.int32)
+    return jnp.where(value < cap, value + jnp.asarray(1, dtype=jnp.int32), cap)
+
+
+def validated_float32_scalar(name: str, value: object, **domain: Any) -> float:
+    """Validate a float32 sink and reject exact nonzero values that collapse to zero."""
+    stored, numerator, _ = validated_float32_scalar_with_ratio(name, value, **domain)
+    if numerator != 0 and float(np.float32(stored)) == 0.0:
+        raise ValueError(f"{name} must remain nonzero once narrowed to float32")
+    return stored
+
+
+def _skip_zero_scale(scale: float, value: Array) -> Array:
+    """Keep finite multiplication exact while repairing zero-scaled poison."""
+    product = scale * value
+    if scale != 0.0:
+        return product
+    return jnp.where(jnp.isfinite(value), product, jnp.zeros_like(value))
+
+
+def _recover_nonfinite_at_zero_scale(scale: float, value: Array) -> Array:
+    """Repair only non-finite history that a zero scale is configured to forget."""
+    if scale != 0.0:
+        return value
+    return jnp.where(
+        ~jnp.isfinite(value),
+        jnp.zeros_like(value),
+        value,
+    )
+
 
 GENERATOR_RANDOM = 0
 GENERATOR_MUTATE_PARENT = 1
@@ -100,6 +173,7 @@ class FeatureDiscoveryUpdateResult:
     metrics: Float[Array, " 7"]
     replaced_slot: Int[Array, ""]
     promoted_candidate: Int[Array, ""]
+    update_applied: Bool[Array, ""]
 
 
 @chex.dataclass(frozen=True)
@@ -108,6 +182,7 @@ class FeatureDiscoveryLearningResult:
 
     state: FeatureDiscoveryState
     metrics: Float[Array, "num_steps 7"]
+    updates_applied: Bool[Array, " num_steps"]
 
 
 class FixedBudgetFeatureLearner:
@@ -245,38 +320,74 @@ class FixedBudgetFeatureLearner:
                 ``(1.25, 1.0, 0.8)`` tighten or loosen promotion roughly
                 symmetrically on a log scale (``1.25 = 1 / 0.8``).
         """
-        if n_features < 1:
-            raise ValueError("n_features must be positive")
-        if n_tasks < 1:
-            raise ValueError("n_tasks must be positive")
-        if candidate_count < 0:
-            raise ValueError("candidate_count must be non-negative")
-        if not 0.0 <= utility_decay < 1.0:
-            raise ValueError("utility_decay must be in [0, 1)")
-        if replacement_interval < 0:
-            raise ValueError("replacement_interval must be non-negative")
-        if not 0.0 <= promotion_blend <= 1.0:
-            raise ValueError("promotion_blend must be in [0, 1]")
-        if utility_aggregation not in {"mean", "max", "topk"}:
+        n_features = _require_int32("n_features", n_features, minimum=1)
+        n_tasks = _require_int32("n_tasks", n_tasks, minimum=1)
+        candidate_count = _require_int32("candidate_count", candidate_count, minimum=0)
+        replacement_interval = _require_int32(
+            "replacement_interval", replacement_interval, minimum=0
+        )
+        min_feature_age = _require_int32("min_feature_age", min_feature_age, minimum=0)
+        candidate_min_age = _require_int32("candidate_min_age", candidate_min_age, minimum=0)
+        utility_top_k = _require_int32("utility_top_k", utility_top_k, minimum=1)
+        if type(use_obgd) is not bool:
+            raise ValueError("use_obgd must be a boolean")
+        if type(learn_feature_resources) is not bool:
+            raise ValueError("learn_feature_resources must be a boolean")
+        step_size_output = validated_float32_scalar("step_size_output", step_size_output, lower=0.0)
+        step_size_feature = validated_float32_scalar(
+            "step_size_feature", step_size_feature, lower=0.0
+        )
+        utility_decay_input = utility_decay
+        utility_decay = canonical_float32_ema_decay(
+            "utility_decay",
+            utility_decay,
+        )
+        utility_decay_config = (
+            utility_decay_input if type(utility_decay_input) is float else utility_decay
+        )
+        promotion_margin = validated_float32_scalar(
+            "promotion_margin", promotion_margin, positive=True
+        )
+        promotion_blend = validated_float32_scalar(
+            "promotion_blend", promotion_blend, lower=0.0, upper=1.0
+        )
+        if type(utility_aggregation) is not str or utility_aggregation not in {
+            "mean",
+            "max",
+            "topk",
+        }:
             raise ValueError("utility_aggregation must be 'mean', 'max', or 'topk'")
-        if utility_top_k < 1:
-            raise ValueError("utility_top_k must be positive")
-        if utility_task_balancing not in {"none", "active", "active_inverse_frequency"}:
+        if type(utility_task_balancing) is not str or utility_task_balancing not in {
+            "none",
+            "active",
+            "active_inverse_frequency",
+        }:
             raise ValueError(
-                "utility_task_balancing must be 'none', 'active', "
-                "or 'active_inverse_frequency'"
+                "utility_task_balancing must be 'none', 'active', or 'active_inverse_frequency'"
             )
-        if not 0.0 <= task_activity_decay < 1.0:
-            raise ValueError("task_activity_decay must be in [0, 1)")
-        if not 0.0 <= future_utility_mix <= 1.0:
-            raise ValueError("future_utility_mix must be in [0, 1]")
-        if not 0.0 <= future_utility_trace_decay < 1.0:
-            raise ValueError("future_utility_trace_decay must be in [0, 1)")
-        if future_utility_trace_mode not in {"contribution", "marginal"}:
-            raise ValueError(
-                "future_utility_trace_mode must be 'contribution' or 'marginal'"
-            )
-        if future_utility_normalization not in {
+        task_activity_decay = validated_float32_scalar(
+            "task_activity_decay",
+            task_activity_decay,
+            lower=0.0,
+            upper=1.0,
+            upper_inclusive=False,
+        )
+        future_utility_mix = validated_float32_scalar(
+            "future_utility_mix", future_utility_mix, lower=0.0, upper=1.0
+        )
+        future_utility_trace_decay = validated_float32_scalar(
+            "future_utility_trace_decay",
+            future_utility_trace_decay,
+            lower=0.0,
+            upper=1.0,
+            upper_inclusive=False,
+        )
+        if type(future_utility_trace_mode) is not str or future_utility_trace_mode not in {
+            "contribution",
+            "marginal",
+        }:
+            raise ValueError("future_utility_trace_mode must be 'contribution' or 'marginal'")
+        if type(future_utility_normalization) is not str or future_utility_normalization not in {
             "none",
             "age",
             "uncertainty",
@@ -286,49 +397,104 @@ class FixedBudgetFeatureLearner:
                 "future_utility_normalization must be one of "
                 "'none', 'age', 'uncertainty', or 'uncertainty_age'"
             )
-        if not 0.0 <= future_utility_normalization_decay < 1.0:
-            raise ValueError("future_utility_normalization_decay must be in [0, 1)")
-        if future_utility_rare_task_power < 0.0:
-            raise ValueError("future_utility_rare_task_power must be non-negative")
-        if utility_retention_decay is not None and not (
-            utility_decay <= utility_retention_decay < 1.0
-        ):
-            raise ValueError(
-                "utility_retention_decay must be in [utility_decay, 1) when set"
+        future_utility_normalization_decay = validated_float32_scalar(
+            "future_utility_normalization_decay",
+            future_utility_normalization_decay,
+            lower=0.0,
+            upper=1.0,
+            upper_inclusive=False,
+        )
+        future_utility_rare_task_power = validated_float32_scalar(
+            "future_utility_rare_task_power", future_utility_rare_task_power, lower=0.0
+        )
+        if utility_retention_decay is not None:
+            utility_retention_decay_input = utility_retention_decay
+            utility_retention_decay = canonical_float32_ema_decay(
+                "utility_retention_decay",
+                utility_retention_decay,
             )
+            if utility_retention_decay < utility_decay:
+                raise ValueError("utility_retention_decay must be in [utility_decay, 1) when set")
+            utility_retention_decay_config = (
+                utility_retention_decay_input
+                if type(utility_retention_decay_input) is float
+                else utility_retention_decay
+            )
+        else:
+            utility_retention_decay_config = None
 
-        mix = jnp.array(generator_mix, dtype=jnp.float32)
-        if mix.shape != (3,):
+        if type(generator_mix) is not tuple or len(generator_mix) != 3:
             raise ValueError("generator_mix must have three entries")
-        mix_sum = float(jnp.sum(mix))
+        validated_generator_mix = tuple(
+            validated_float32_scalar(f"generator_mix[{index}]", value, lower=0.0)
+            for index, value in enumerate(generator_mix)
+        )
+        generator_mix = (
+            validated_generator_mix[0],
+            validated_generator_mix[1],
+            validated_generator_mix[2],
+        )
+        mix_sum = sum(generator_mix)
         if mix_sum <= 0.0:
             raise ValueError("generator_mix must contain positive mass")
-        if resource_learning_rate < 0.0:
-            raise ValueError("resource_learning_rate must be non-negative")
-        if not 0.0 <= resource_discount <= 1.0:
-            raise ValueError("resource_discount must be in [0, 1]")
-        if not 0.0 <= resource_exploration < 1.0:
-            raise ValueError("resource_exploration must be in [0, 1)")
-        if resource_advantage_clip <= 0.0:
-            raise ValueError("resource_advantage_clip must be positive")
-        if len(plasticity_replacement_multipliers) != 3:
+        resource_learning_rate = validated_float32_scalar(
+            "resource_learning_rate", resource_learning_rate, lower=0.0
+        )
+        resource_discount = validated_float32_scalar(
+            "resource_discount", resource_discount, lower=0.0, upper=1.0
+        )
+        resource_exploration = validated_float32_scalar(
+            "resource_exploration",
+            resource_exploration,
+            lower=0.0,
+            upper=1.0,
+            upper_inclusive=False,
+        )
+        resource_advantage_clip = validated_float32_scalar(
+            "resource_advantage_clip", resource_advantage_clip, positive=True
+        )
+        init_scale = validated_float32_scalar("init_scale", init_scale, lower=0.0)
+        mutation_scale = validated_float32_scalar("mutation_scale", mutation_scale, lower=0.0)
+        obgd_kappa = validated_float32_scalar("obgd_kappa", obgd_kappa, positive=True)
+        if (
+            type(plasticity_replacement_multipliers) is not tuple
+            or len(plasticity_replacement_multipliers) != 3
+        ):
             raise ValueError("plasticity_replacement_multipliers must have length 3")
-        if len(plasticity_promotion_margin_multipliers) != 3:
-            raise ValueError(
-                "plasticity_promotion_margin_multipliers must have length 3"
+        if (
+            type(plasticity_promotion_margin_multipliers) is not tuple
+            or len(plasticity_promotion_margin_multipliers) != 3
+        ):
+            raise ValueError("plasticity_promotion_margin_multipliers must have length 3")
+        validated_replacement_multipliers = tuple(
+            validated_float32_scalar(
+                f"plasticity_replacement_multipliers[{index}]", value, positive=True
             )
-        if any(v <= 0.0 for v in plasticity_replacement_multipliers):
-            raise ValueError("plasticity_replacement_multipliers must be positive")
-        if any(v <= 0.0 for v in plasticity_promotion_margin_multipliers):
-            raise ValueError(
-                "plasticity_promotion_margin_multipliers must be positive"
+            for index, value in enumerate(plasticity_replacement_multipliers)
+        )
+        plasticity_replacement_multipliers = (
+            validated_replacement_multipliers[0],
+            validated_replacement_multipliers[1],
+            validated_replacement_multipliers[2],
+        )
+        validated_promotion_multipliers = tuple(
+            validated_float32_scalar(
+                f"plasticity_promotion_margin_multipliers[{index}]", value, positive=True
             )
+            for index, value in enumerate(plasticity_promotion_margin_multipliers)
+        )
+        plasticity_promotion_margin_multipliers = (
+            validated_promotion_multipliers[0],
+            validated_promotion_multipliers[1],
+            validated_promotion_multipliers[2],
+        )
 
         self._n_features = n_features
         self._n_tasks = n_tasks
         self._step_size_output = step_size_output
         self._step_size_feature = step_size_feature
         self._utility_decay = utility_decay
+        self._utility_decay_config = utility_decay_config
         self._replacement_interval = replacement_interval
         self._min_feature_age = min_feature_age
         self._candidate_count = candidate_count
@@ -347,6 +513,7 @@ class FixedBudgetFeatureLearner:
         self._future_utility_normalization_decay = future_utility_normalization_decay
         self._future_utility_rare_task_power = future_utility_rare_task_power
         self._utility_retention_decay = utility_retention_decay
+        self._utility_retention_decay_config = utility_retention_decay_config
         self._init_scale = init_scale
         self._mutation_scale = mutation_scale
         self._use_obgd = use_obgd
@@ -357,9 +524,7 @@ class FixedBudgetFeatureLearner:
         self._resource_exploration = resource_exploration
         self._resource_advantage_clip = resource_advantage_clip
         self._plasticity_replacement_multipliers = plasticity_replacement_multipliers
-        self._plasticity_promotion_margin_multipliers = (
-            plasticity_promotion_margin_multipliers
-        )
+        self._plasticity_promotion_margin_multipliers = plasticity_promotion_margin_multipliers
 
     @property
     def n_features(self) -> int:
@@ -371,6 +536,23 @@ class FixedBudgetFeatureLearner:
         """Number of output tasks."""
         return self._n_tasks
 
+    def _configured_state_nbytes(self, feature_dim: int) -> int:
+        bank_width = self._n_features + self._candidate_count
+        scalars = (
+            bank_width * feature_dim + (2 * self._n_tasks + 9) * bank_width + 3 * self._n_tasks + 16
+        )
+        if scalars > _INT32_MAX:
+            raise ValueError("feature-discovery state exceeds int32 scalar accounting")
+        state_nbytes = 4 * scalars
+        if state_nbytes > _UINT32_MAX:
+            raise ValueError("feature-discovery state exceeds uint32 byte accounting")
+        if state_nbytes > _MAX_STATE_NBYTES:
+            raise ValueError(
+                f"feature-discovery state requires {state_nbytes} bytes; "
+                f"the limit is {_MAX_STATE_NBYTES}"
+            )
+        return state_nbytes
+
     def to_config(self) -> dict[str, Any]:
         """Serialize learner configuration."""
         return {
@@ -379,7 +561,7 @@ class FixedBudgetFeatureLearner:
             "n_tasks": self._n_tasks,
             "step_size_output": self._step_size_output,
             "step_size_feature": self._step_size_feature,
-            "utility_decay": self._utility_decay,
+            "utility_decay": self._utility_decay_config,
             "replacement_interval": self._replacement_interval,
             "min_feature_age": self._min_feature_age,
             "candidate_count": self._candidate_count,
@@ -395,11 +577,9 @@ class FixedBudgetFeatureLearner:
             "future_utility_trace_decay": self._future_utility_trace_decay,
             "future_utility_trace_mode": self._future_utility_trace_mode,
             "future_utility_normalization": self._future_utility_normalization,
-            "future_utility_normalization_decay": (
-                self._future_utility_normalization_decay
-            ),
+            "future_utility_normalization_decay": (self._future_utility_normalization_decay),
             "future_utility_rare_task_power": self._future_utility_rare_task_power,
-            "utility_retention_decay": self._utility_retention_decay,
+            "utility_retention_decay": self._utility_retention_decay_config,
             "init_scale": self._init_scale,
             "mutation_scale": self._mutation_scale,
             "use_obgd": self._use_obgd,
@@ -409,54 +589,68 @@ class FixedBudgetFeatureLearner:
             "resource_discount": self._resource_discount,
             "resource_exploration": self._resource_exploration,
             "resource_advantage_clip": self._resource_advantage_clip,
-            "plasticity_replacement_multipliers": list(
-                self._plasticity_replacement_multipliers
-            ),
+            "plasticity_replacement_multipliers": list(self._plasticity_replacement_multipliers),
             "plasticity_promotion_margin_multipliers": list(
                 self._plasticity_promotion_margin_multipliers
             ),
         }
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> "FixedBudgetFeatureLearner":
+    def from_config(cls, config: Mapping[str, Any]) -> "FixedBudgetFeatureLearner":
         """Reconstruct learner from ``to_config`` output."""
-        config = dict(config)
-        config.pop("type", None)
-        # Accepted only as an inert compatibility field.
+        if not isinstance(config, Mapping):
+            raise ValueError("config must be a mapping")
+        try:
+            config = dict(config)
+        except Exception as error:
+            raise ValueError("config must be a readable mapping") from error
+        if any(type(key) is not str for key in config):
+            raise ValueError("config keys must be strings")
+        marker = config.pop("type", None)
+        if marker is not None and (
+            type(marker) is not str or marker != "FixedBudgetFeatureLearner"
+        ):
+            raise ValueError("config type is unsupported")
+        # replace_fraction was serialized by older versions but never read by
+        # the update path; drop it so old configs keep loading.
         config.pop("replace_fraction", None)
-        generator_mix = config.pop("generator_mix", (1.0, 0.0, 0.0))
+        generator_mix = config.pop("generator_mix", [1.0, 0.0, 0.0])
         replacement_multipliers = config.pop(
             "plasticity_replacement_multipliers",
-            (0.5, 1.0, 2.0),
+            [0.5, 1.0, 2.0],
         )
         promotion_multipliers = config.pop(
             "plasticity_promotion_margin_multipliers",
-            (1.25, 1.0, 0.8),
+            [1.25, 1.0, 0.8],
         )
-        replacement_tuple = (
-            float(replacement_multipliers[0]),
-            float(replacement_multipliers[1]),
-            float(replacement_multipliers[2]),
-        )
-        promotion_tuple = (
-            float(promotion_multipliers[0]),
-            float(promotion_multipliers[1]),
-            float(promotion_multipliers[2]),
-        )
-        generator_tuple = (
-            float(generator_mix[0]),
-            float(generator_mix[1]),
-            float(generator_mix[2]),
-        )
-        return cls(
-            generator_mix=generator_tuple,
-            plasticity_replacement_multipliers=replacement_tuple,
-            plasticity_promotion_margin_multipliers=promotion_tuple,
-            **config,
-        )
+        triples = {
+            "generator_mix": generator_mix,
+            "plasticity_replacement_multipliers": replacement_multipliers,
+            "plasticity_promotion_margin_multipliers": promotion_multipliers,
+        }
+        canonical_triples: dict[str, tuple[Any, Any, Any]] = {}
+        for name, values in triples.items():
+            if type(values) not in {list, tuple} or len(values) != 3:
+                raise ValueError(f"{name} must be a list or tuple with length 3")
+            canonical_triples[name] = (values[0], values[1], values[2])
+        try:
+            return cls(
+                generator_mix=canonical_triples["generator_mix"],
+                plasticity_replacement_multipliers=canonical_triples[
+                    "plasticity_replacement_multipliers"
+                ],
+                plasticity_promotion_margin_multipliers=canonical_triples[
+                    "plasticity_promotion_margin_multipliers"
+                ],
+                **config,
+            )
+        except TypeError as error:
+            raise ValueError("config has missing or unsupported fields") from error
 
     def init(self, feature_dim: int, key: Array) -> FeatureDiscoveryState:
         """Initialize active and candidate feature banks."""
+        feature_dim = _require_int32("feature_dim", feature_dim, minimum=1)
+        self._configured_state_nbytes(feature_dim)
         key, k_active, k_candidate = jr.split(key, 3)
         scale = self._init_scale / jnp.sqrt(float(feature_dim))
         feature_weights = scale * jr.normal(
@@ -481,12 +675,8 @@ class FixedBudgetFeatureLearner:
             ),
             utility_error_trace=jnp.zeros(self._n_tasks, dtype=jnp.float32),
             utility_feature_trace=jnp.zeros(self._n_features, dtype=jnp.float32),
-            utility_feature_energy_trace=jnp.zeros(
-                self._n_features, dtype=jnp.float32
-            ),
-            utility_signal_second_moment=jnp.zeros(
-                self._n_features, dtype=jnp.float32
-            ),
+            utility_feature_energy_trace=jnp.zeros(self._n_features, dtype=jnp.float32),
+            utility_signal_second_moment=jnp.zeros(self._n_features, dtype=jnp.float32),
             task_activity_ema=jnp.zeros(self._n_tasks, dtype=jnp.float32),
             ages=jnp.zeros(self._n_features, dtype=jnp.int32),
             candidate_weights=candidate_weights,
@@ -498,9 +688,7 @@ class FixedBudgetFeatureLearner:
             candidate_utility_contribution_trace=jnp.zeros(
                 (self._n_tasks, self._candidate_count), dtype=jnp.float32
             ),
-            candidate_utility_feature_trace=jnp.zeros(
-                self._candidate_count, dtype=jnp.float32
-            ),
+            candidate_utility_feature_trace=jnp.zeros(self._candidate_count, dtype=jnp.float32),
             candidate_utility_feature_energy_trace=jnp.zeros(
                 self._candidate_count, dtype=jnp.float32
             ),
@@ -510,19 +698,13 @@ class FixedBudgetFeatureLearner:
             candidate_ages=jnp.zeros(self._candidate_count, dtype=jnp.int32),
             feature_parent_a=jnp.full(self._n_features, -1, dtype=jnp.int32),
             feature_parent_b=jnp.full(self._n_features, -1, dtype=jnp.int32),
-            feature_generator=jnp.full(
-                self._n_features, GENERATOR_RANDOM, dtype=jnp.int32
-            ),
+            feature_generator=jnp.full(self._n_features, GENERATOR_RANDOM, dtype=jnp.int32),
             candidate_parent_a=jnp.full(self._candidate_count, -1, dtype=jnp.int32),
             candidate_parent_b=jnp.full(self._candidate_count, -1, dtype=jnp.int32),
-            candidate_generator=jnp.full(
-                self._candidate_count, GENERATOR_RANDOM, dtype=jnp.int32
-            ),
+            candidate_generator=jnp.full(self._candidate_count, GENERATOR_RANDOM, dtype=jnp.int32),
             generator_log_weights=(
                 jnp.log(jnp.asarray(self._generator_mix, dtype=jnp.float32) + 1e-8)
-                - jnp.mean(
-                    jnp.log(jnp.asarray(self._generator_mix, dtype=jnp.float32) + 1e-8)
-                )
+                - jnp.mean(jnp.log(jnp.asarray(self._generator_mix, dtype=jnp.float32) + 1e-8))
             ),
             generator_utility_ema=jnp.zeros(3, dtype=jnp.float32),
             plasticity_log_weights=jnp.zeros(3, dtype=jnp.float32),
@@ -539,16 +721,82 @@ class FixedBudgetFeatureLearner:
         values = jnp.tanh(pre)
         return values, 1.0 - values**2
 
+    def _validate_static_contract(
+        self,
+        state: FeatureDiscoveryState,
+        observation: Array,
+        targets: Array | None = None,
+    ) -> None:
+        """Fail while tracing before broadcasting or dtype promotion can occur."""
+        if state.feature_weights.ndim != 2:
+            raise ValueError("state.feature_weights must be a rank-2 array")
+        feature_dim = state.feature_weights.shape[1]
+        float_shapes = {
+            "feature_weights": (self._n_features, feature_dim),
+            "feature_biases": (self._n_features,),
+            "output_weights": (self._n_tasks, self._n_features),
+            "output_biases": (self._n_tasks,),
+            "utilities": (self._n_features,),
+            "utility_contribution_trace": (self._n_tasks, self._n_features),
+            "utility_error_trace": (self._n_tasks,),
+            "utility_feature_trace": (self._n_features,),
+            "utility_feature_energy_trace": (self._n_features,),
+            "utility_signal_second_moment": (self._n_features,),
+            "candidate_weights": (self._candidate_count, feature_dim),
+            "candidate_biases": (self._candidate_count,),
+            "candidate_output_weights": (self._n_tasks, self._candidate_count),
+            "candidate_utilities": (self._candidate_count,),
+            "candidate_utility_contribution_trace": (
+                self._n_tasks,
+                self._candidate_count,
+            ),
+            "candidate_utility_feature_trace": (self._candidate_count,),
+            "candidate_utility_feature_energy_trace": (self._candidate_count,),
+            "candidate_utility_signal_second_moment": (self._candidate_count,),
+            "task_activity_ema": (self._n_tasks,),
+            "generator_log_weights": (3,),
+            "generator_utility_ema": (3,),
+            "plasticity_log_weights": (3,),
+            "plasticity_signal_ema": (3,),
+            "replacement_accumulator": (),
+        }
+        for name, shape in float_shapes.items():
+            value = getattr(state, name)
+            if value.shape != shape or value.dtype != jnp.float32:
+                raise ValueError(f"state.{name} must have shape {shape} and dtype float32")
+        int_shapes = {
+            "ages": (self._n_features,),
+            "candidate_ages": (self._candidate_count,),
+            "feature_parent_a": (self._n_features,),
+            "feature_parent_b": (self._n_features,),
+            "feature_generator": (self._n_features,),
+            "candidate_parent_a": (self._candidate_count,),
+            "candidate_parent_b": (self._candidate_count,),
+            "candidate_generator": (self._candidate_count,),
+            "step_count": (),
+        }
+        for name, shape in int_shapes.items():
+            value = getattr(state, name)
+            if value.shape != shape or value.dtype != jnp.int32:
+                raise ValueError(f"state.{name} must have shape {shape} and dtype int32")
+        if observation.shape != (feature_dim,) or observation.dtype != jnp.float32:
+            raise ValueError(
+                f"observation must have shape {(feature_dim,)} and dtype float32"
+            )
+        if targets is not None and (
+            targets.shape != (self._n_tasks,) or targets.dtype != jnp.float32
+        ):
+            raise ValueError(f"targets must have shape {(self._n_tasks,)} and dtype float32")
+
     def _task_activity_update(
         self,
         old_activity: Array,
         active_mask: Array,
     ) -> Array:
         """Track active target heads for opt-in task-balanced utility."""
-        return (
-            self._task_activity_decay * old_activity
-            + (1.0 - self._task_activity_decay) * active_mask.astype(jnp.float32)
-        )
+        return _skip_zero_scale(self._task_activity_decay, old_activity) + (
+            1.0 - self._task_activity_decay
+        ) * active_mask.astype(jnp.float32)
 
     def _output_utility_signal(
         self,
@@ -562,9 +810,7 @@ class FixedBudgetFeatureLearner:
         if self._utility_task_balancing != "none":
             active = active_mask.astype(jnp.float32)
             if self._utility_task_balancing == "active_inverse_frequency":
-                frequency_floor = jnp.array(
-                    1.0 - self._task_activity_decay, dtype=jnp.float32
-                )
+                frequency_floor = jnp.array(1.0 - self._task_activity_decay, dtype=jnp.float32)
                 task_weights = active / jnp.maximum(task_activity_ema, frequency_floor)
             else:
                 task_weights = active
@@ -573,12 +819,24 @@ class FixedBudgetFeatureLearner:
         if self._utility_aggregation == "max":
             return jnp.max(weighted_activity, axis=0)
         if self._utility_aggregation == "topk":
-            k = min(self._utility_top_k, self._n_tasks)
-            return jnp.mean(jnp.sort(weighted_activity, axis=0)[-k:, :], axis=0)
+            return self._active_topk_mean(weighted_activity, active_mask)
         if self._utility_task_balancing in {"active", "active_inverse_frequency"}:
             active_count = jnp.maximum(jnp.sum(active_mask.astype(jnp.float32)), 1.0)
             return jnp.sum(weighted_activity, axis=0) / active_count
         return jnp.mean(weighted_activity, axis=0)
+
+    def _active_topk_mean(self, weighted: Array, active_mask: Array) -> Array:
+        """Mean of the top-k per-task rows; under task balancing only active rows compete."""
+        k = min(self._utility_top_k, self._n_tasks)
+        if self._utility_task_balancing == "none":
+            return jnp.mean(jnp.sort(weighted, axis=0)[-k:, :], axis=0)
+        scores = jnp.where(active_mask[:, None], weighted, -jnp.inf)
+        selected, _ = jax.lax.top_k(jnp.swapaxes(scores, 0, 1), k)
+        selected_count = jnp.minimum(jnp.sum(active_mask.astype(jnp.int32)), k)
+        selected_mask = jnp.arange(k) < selected_count
+        selected_sum = jnp.sum(jnp.where(selected_mask[None, :], selected, 0.0), axis=1)
+        safe_count = jnp.maximum(selected_count, 1)
+        return jnp.where(selected_count > 0, selected_sum / safe_count, 0.0)
 
     def _aggregate_task_feature_signal(
         self,
@@ -591,9 +849,7 @@ class FixedBudgetFeatureLearner:
         if self._utility_task_balancing != "none":
             active = active_mask.astype(jnp.float32)
             if self._utility_task_balancing == "active_inverse_frequency":
-                frequency_floor = jnp.array(
-                    1.0 - self._task_activity_decay, dtype=jnp.float32
-                )
+                frequency_floor = jnp.array(1.0 - self._task_activity_decay, dtype=jnp.float32)
                 task_weights = active / jnp.maximum(task_activity_ema, frequency_floor)
             else:
                 task_weights = active
@@ -602,8 +858,7 @@ class FixedBudgetFeatureLearner:
         if self._utility_aggregation == "max":
             return jnp.max(weighted_signal, axis=0)
         if self._utility_aggregation == "topk":
-            k = min(self._utility_top_k, self._n_tasks)
-            return jnp.mean(jnp.sort(weighted_signal, axis=0)[-k:, :], axis=0)
+            return self._active_topk_mean(weighted_signal, active_mask)
         if self._utility_task_balancing in {"active", "active_inverse_frequency"}:
             active_count = jnp.maximum(jnp.sum(active_mask.astype(jnp.float32)), 1.0)
             return jnp.sum(weighted_signal, axis=0) / active_count
@@ -669,9 +924,7 @@ class FixedBudgetFeatureLearner:
             new_feature_trace = feature_trace
 
         if self._future_utility_rare_task_power > 0.0:
-            frequency_floor = jnp.array(
-                1.0 - self._task_activity_decay, dtype=jnp.float32
-            )
+            frequency_floor = jnp.array(1.0 - self._task_activity_decay, dtype=jnp.float32)
             rare_weights = jnp.power(
                 1.0 / jnp.maximum(task_activity_ema, frequency_floor),
                 self._future_utility_rare_task_power,
@@ -739,24 +992,28 @@ class FixedBudgetFeatureLearner:
 
     def _utility_update(self, old_utilities: Array, utility_signal: Array) -> Array:
         """Update utility, optionally retaining recurrent-context peaks longer."""
+        decay = jnp.asarray(self._utility_decay, dtype=jnp.float32)
         ema = (
-            self._utility_decay * old_utilities
-            + (1.0 - self._utility_decay) * utility_signal
+            _skip_zero_scale(self._utility_decay, old_utilities)
+            + (jnp.asarray(1.0, dtype=jnp.float32) - decay) * utility_signal
         )
         if self._utility_retention_decay is None:
             return ema
-        retained = self._utility_retention_decay * old_utilities
+        retained = _skip_zero_scale(self._utility_retention_decay, old_utilities)
         return jnp.maximum(ema, retained)
 
     def _resource_weights(self, log_weights: Array) -> Array:
         """Return a soft resource allocation with optional exploration."""
+        log_weights = _recover_nonfinite_at_zero_scale(
+            self._resource_discount,
+            log_weights,
+        )
         weights = jax.nn.softmax(log_weights)
         if self._resource_exploration > 0.0:
             uniform = jnp.full_like(weights, 1.0 / weights.shape[0])
             weights = (
-                (1.0 - self._resource_exploration) * weights
-                + self._resource_exploration * uniform
-            )
+                1.0 - self._resource_exploration
+            ) * weights + self._resource_exploration * uniform
         return weights
 
     def _resource_log_weight_update(
@@ -777,7 +1034,7 @@ class FixedBudgetFeatureLearner:
             self._resource_advantage_clip,
         )
         new_log_weights = (
-            self._resource_discount * log_weights
+            _skip_zero_scale(self._resource_discount, log_weights)
             + self._resource_learning_rate * advantages
         )
         return new_log_weights - jnp.mean(new_log_weights)
@@ -882,9 +1139,8 @@ class FixedBudgetFeatureLearner:
         once Step 2 has found useful features, downstream predictors such as
         Horde/GVF learners can treat these values as given features.
         """
-        features, _ = self._features(
-            state.feature_weights, state.feature_biases, observation
-        )
+        self._validate_static_contract(state, observation)
+        features, _ = self._features(state.feature_weights, state.feature_biases, observation)
         return features
 
     @functools.partial(jax.jit, static_argnums=(0,))
@@ -894,9 +1150,7 @@ class FixedBudgetFeatureLearner:
         observation: Array,
     ) -> Array:
         """Concatenate raw observation with active constructed features."""
-        return jnp.concatenate(
-            [observation, self.constructed_features(state, observation)]
-        )
+        return jnp.concatenate([observation, self.constructed_features(state, observation)])
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def predict(self, state: FeatureDiscoveryState, observation: Array) -> Array:
@@ -912,13 +1166,39 @@ class FixedBudgetFeatureLearner:
         targets: Array,
     ) -> FeatureDiscoveryUpdateResult:
         """Perform one temporally-uniform feature-discovery update."""
+        self._validate_static_contract(state, observation, targets)
+        previous_checked = state
+        utility_history_discarded = self._utility_decay == 0.0 and (
+            self._utility_retention_decay is None or self._utility_retention_decay == 0.0
+        )
+        if utility_history_discarded:
+            previous_checked = previous_checked.replace(  # type: ignore[attr-defined]
+                utilities=jnp.zeros_like(state.utilities),
+                candidate_utilities=jnp.zeros_like(state.candidate_utilities),
+            )
+        if self._task_activity_decay == 0.0:
+            previous_checked = previous_checked.replace(  # type: ignore[attr-defined]
+                task_activity_ema=jnp.zeros_like(state.task_activity_ema),
+            )
+        if self._learn_feature_resources and self._resource_discount == 0.0:
+            previous_checked = previous_checked.replace(  # type: ignore[attr-defined]
+                generator_log_weights=jnp.zeros_like(state.generator_log_weights),
+                generator_utility_ema=jnp.zeros_like(state.generator_utility_ema),
+                plasticity_log_weights=jnp.zeros_like(state.plasticity_log_weights),
+                plasticity_signal_ema=jnp.zeros_like(state.plasticity_signal_ema),
+            )
+        source_state_finite = floating_tree_is_finite(previous_checked)
+        inputs_valid = jnp.all(jnp.isfinite(observation)) & jnp.all(
+            jnp.isfinite(targets) | jnp.isnan(targets)
+        )
         active_mask = ~jnp.isnan(targets)
         safe_targets = jnp.where(active_mask, targets, 0.0)
         active_count = jnp.maximum(jnp.sum(active_mask.astype(jnp.float32)), 1.0)
-        task_activity_ema = self._task_activity_update(
-            state.task_activity_ema, active_mask
-        )
+        task_activity_ema = self._task_activity_update(state.task_activity_ema, active_mask)
         generator_mix = jnp.asarray(self._generator_mix, dtype=jnp.float32)
+        future_utility_ranking_mode = (
+            self._future_utility_normalization if self._future_utility_mix > 0.0 else "none"
+        )
         plasticity_weights = jnp.array([0.0, 1.0, 0.0], dtype=jnp.float32)
         if self._learn_feature_resources:
             generator_mix = self._resource_weights(state.generator_log_weights)
@@ -929,9 +1209,7 @@ class FixedBudgetFeatureLearner:
                 self._plasticity_promotion_margin_multipliers,
                 dtype=jnp.float32,
             )
-            promotion_margin = promotion_margin * jnp.sum(
-                plasticity_weights * margin_multipliers
-            )
+            promotion_margin = promotion_margin * jnp.sum(plasticity_weights * margin_multipliers)
 
         features, feature_derivs = self._features(
             state.feature_weights, state.feature_biases, observation
@@ -940,12 +1218,7 @@ class FixedBudgetFeatureLearner:
         errors = jnp.where(active_mask, safe_targets - predictions, 0.0)
         reported_errors = jnp.where(active_mask, errors, jnp.nan)
 
-        output_delta = (
-            self._step_size_output
-            * errors[:, None]
-            * features[None, :]
-            / active_count
-        )
+        output_delta = self._step_size_output * errors[:, None] * features[None, :] / active_count
         output_bias_delta = self._step_size_output * errors / active_count
 
         feature_credit = (errors @ state.output_weights) * feature_derivs / active_count
@@ -960,9 +1233,7 @@ class FixedBudgetFeatureLearner:
             active_mask,
             task_activity_ema,
         )
-        current_utility_signal = 0.5 * output_utility_signal + 0.5 * jnp.abs(
-            feature_credit
-        )
+        current_utility_signal = 0.5 * output_utility_signal + 0.5 * jnp.abs(feature_credit)
         (
             utility_signal,
             utility_contribution_trace,
@@ -982,19 +1253,14 @@ class FixedBudgetFeatureLearner:
             state.utility_feature_energy_trace,
         )
         utility_signal_second_moment = state.utility_signal_second_moment
-        if (
-            self._future_utility_mix > 0.0
-            and self._future_utility_normalization != "none"
-        ):
-            utility_signal, utility_signal_second_moment = (
-                normalize_future_utility_signal(
-                    utility_signal,
-                    state.ages,
-                    state.utility_signal_second_moment,
-                    self._future_utility_normalization_decay,
-                    self._utility_decay,
-                    self._future_utility_normalization,
-                )
+        if self._future_utility_mix > 0.0 and self._future_utility_normalization != "none":
+            utility_signal, utility_signal_second_moment = normalize_future_utility_signal(
+                utility_signal,
+                state.ages,
+                state.utility_signal_second_moment,
+                self._future_utility_normalization_decay,
+                self._utility_decay,
+                self._future_utility_normalization,
             )
         new_utilities = self._utility_update(
             state.utilities,
@@ -1005,16 +1271,10 @@ class FixedBudgetFeatureLearner:
         candidate_weight_delta = jnp.zeros_like(state.candidate_weights)
         candidate_bias_delta = jnp.zeros_like(state.candidate_biases)
         new_candidate_utilities = state.candidate_utilities
-        candidate_utility_contribution_trace = (
-            state.candidate_utility_contribution_trace
-        )
+        candidate_utility_contribution_trace = state.candidate_utility_contribution_trace
         candidate_utility_feature_trace = state.candidate_utility_feature_trace
-        candidate_utility_feature_energy_trace = (
-            state.candidate_utility_feature_energy_trace
-        )
-        candidate_utility_signal_second_moment = (
-            state.candidate_utility_signal_second_moment
-        )
+        candidate_utility_feature_energy_trace = state.candidate_utility_feature_energy_trace
+        candidate_utility_signal_second_moment = state.candidate_utility_signal_second_moment
         if self._candidate_count > 0:
             candidate_features, candidate_derivs = self._features(
                 state.candidate_weights, state.candidate_biases, observation
@@ -1026,12 +1286,10 @@ class FixedBudgetFeatureLearner:
                 / active_count
             )
             candidate_credit = (
-                errors @ state.candidate_output_weights
-            ) * candidate_derivs / active_count
+                (errors @ state.candidate_output_weights) * candidate_derivs / active_count
+            )
             candidate_weight_delta = (
-                self._step_size_feature
-                * candidate_credit[:, None]
-                * observation[None, :]
+                self._step_size_feature * candidate_credit[:, None] * observation[None, :]
             )
             candidate_bias_delta = self._step_size_feature * candidate_credit
             candidate_output_signal = self._output_utility_signal(
@@ -1040,9 +1298,7 @@ class FixedBudgetFeatureLearner:
                 active_mask,
                 task_activity_ema,
             )
-            candidate_signal = 0.5 * candidate_output_signal + 0.5 * jnp.abs(
-                candidate_credit
-            )
+            candidate_signal = 0.5 * candidate_output_signal + 0.5 * jnp.abs(candidate_credit)
             (
                 candidate_signal,
                 candidate_utility_contribution_trace,
@@ -1062,10 +1318,7 @@ class FixedBudgetFeatureLearner:
                 state.candidate_utility_feature_energy_trace,
             )
             del _candidate_error_trace
-            if (
-                self._future_utility_mix > 0.0
-                and self._future_utility_normalization != "none"
-            ):
+            if self._future_utility_mix > 0.0 and self._future_utility_normalization != "none":
                 candidate_signal, candidate_utility_signal_second_moment = (
                     normalize_future_utility_signal(
                         candidate_signal,
@@ -1109,12 +1362,22 @@ class FixedBudgetFeatureLearner:
         output_biases = state.output_biases + output_bias_delta
         candidate_weights = state.candidate_weights + candidate_weight_delta
         candidate_biases = state.candidate_biases + candidate_bias_delta
-        candidate_output_weights = (
-            state.candidate_output_weights + candidate_output_delta
+        candidate_output_weights = state.candidate_output_weights + candidate_output_delta
+        ages = _saturating_int32_increment(state.ages)
+        candidate_ages = _saturating_int32_increment(state.candidate_ages)
+        ranking_utilities = bias_correct_future_utility(
+            new_utilities,
+            ages,
+            self._utility_decay,
+            future_utility_ranking_mode,
         )
-        ages = state.ages + 1
-        candidate_ages = state.candidate_ages + 1
-        step_count = state.step_count + 1
+        ranking_candidate_utilities = bias_correct_future_utility(
+            new_candidate_utilities,
+            candidate_ages,
+            self._utility_decay,
+            future_utility_ranking_mode,
+        )
+        step_count = _saturating_int32_increment(state.step_count)
         key, replacement_key = jr.split(state.key)
 
         replaced_slot = jnp.array(-1, dtype=jnp.int32)
@@ -1126,9 +1389,8 @@ class FixedBudgetFeatureLearner:
                 self._plasticity_replacement_multipliers,
                 dtype=jnp.float32,
             )
-            replacement_rate = (
-                jnp.sum(plasticity_weights * replacement_multipliers)
-                / float(self._replacement_interval)
+            replacement_rate = jnp.sum(plasticity_weights * replacement_multipliers) / float(
+                self._replacement_interval
             )
             replacement_accumulator = replacement_accumulator + replacement_rate
             should_try_replace = replacement_accumulator >= 1.0
@@ -1138,31 +1400,28 @@ class FixedBudgetFeatureLearner:
                 replacement_accumulator,
             )
         else:
-            should_try_replace = (
-                (self._replacement_interval > 0)
-                & (step_count % jnp.array(max(self._replacement_interval, 1)) == 0)
+            should_try_replace = (self._replacement_interval > 0) & (
+                step_count % jnp.array(max(self._replacement_interval, 1)) == 0
             )
 
         eligible_active = ages >= self._min_feature_age
-        active_scores = jnp.where(eligible_active, new_utilities, jnp.inf)
+        active_scores = jnp.where(eligible_active, ranking_utilities, jnp.inf)
         worst_active = jnp.argmin(active_scores).astype(jnp.int32)
         has_active_slot = jnp.any(eligible_active)
 
         if self._candidate_count > 0:
             eligible_candidates = candidate_ages >= self._candidate_min_age
-            candidate_scores = jnp.where(
-                eligible_candidates, new_candidate_utilities, -jnp.inf
-            )
+            candidate_scores = jnp.where(eligible_candidates, ranking_candidate_utilities, -jnp.inf)
             best_candidate = jnp.argmax(candidate_scores).astype(jnp.int32)
-            worst_candidate = jnp.argmin(new_candidate_utilities).astype(jnp.int32)
+            worst_candidate = jnp.argmin(ranking_candidate_utilities).astype(jnp.int32)
             has_candidate = jnp.any(eligible_candidates)
             should_promote = (
                 should_try_replace
                 & has_active_slot
                 & has_candidate
                 & (
-                    new_candidate_utilities[best_candidate]
-                    > promotion_margin * new_utilities[worst_active]
+                    ranking_candidate_utilities[best_candidate]
+                    > promotion_margin * ranking_utilities[worst_active]
                 )
             )
 
@@ -1222,15 +1481,32 @@ class FixedBudgetFeatureLearner:
                     cg,
                 ) = args
                 gen_key = replacement_key
+                parent_utilities = bias_correct_future_utility(
+                    util,
+                    age,
+                    self._utility_decay,
+                    future_utility_ranking_mode,
+                )
                 new_cw, new_cb, new_pa, new_pb, new_gen = self._generate_one(
-                    gen_key, observation, fw, fb, util, generator_mix
+                    gen_key,
+                    observation,
+                    fw,
+                    fb,
+                    parent_utilities,
+                    generator_mix,
                 )
                 fw = fw.at[worst_active].set(cw[best_candidate])
                 fb = fb.at[worst_active].set(cb[best_candidate])
-                ow = ow.at[:, worst_active].set(
-                    self._promotion_blend * cow[:, best_candidate]
+                ow = ow.at[:, worst_active].set(self._promotion_blend * cow[:, best_candidate])
+                # Active age tracks this new lifecycle, so the raw EMA must
+                # restart with it.  Inheriting a mature candidate EMA at age
+                # zero would apply the warm-up correction twice.
+                promoted_utility = (
+                    jnp.array(0.0, dtype=jnp.float32)
+                    if future_utility_ranking_mode in {"age", "uncertainty_age"}
+                    else cutil[best_candidate]
                 )
-                util = util.at[worst_active].set(cutil[best_candidate])
+                util = util.at[worst_active].set(promoted_utility)
                 age = age.at[worst_active].set(0)
                 fpa = fpa.at[worst_active].set(cpa[best_candidate])
                 fpb = fpb.at[worst_active].set(cpb[best_candidate])
@@ -1319,30 +1595,29 @@ class FixedBudgetFeatureLearner:
                     cg,
                 ) = args
                 gen_key = replacement_key
+                parent_utilities = bias_correct_future_utility(
+                    util,
+                    age,
+                    self._utility_decay,
+                    future_utility_ranking_mode,
+                )
                 new_cw, new_cb, new_pa, new_pb, new_gen = self._generate_one(
-                    gen_key, observation, fw, fb, util, generator_mix
+                    gen_key,
+                    observation,
+                    fw,
+                    fb,
+                    parent_utilities,
+                    generator_mix,
                 )
                 do_refresh = should_try_replace
                 cw = jax.lax.select(do_refresh, cw.at[worst_candidate].set(new_cw), cw)
                 cb = jax.lax.select(do_refresh, cb.at[worst_candidate].set(new_cb), cb)
-                cow = jax.lax.select(
-                    do_refresh, cow.at[:, worst_candidate].set(0.0), cow
-                )
-                cutil = jax.lax.select(
-                    do_refresh, cutil.at[worst_candidate].set(0.0), cutil
-                )
-                cage = jax.lax.select(
-                    do_refresh, cage.at[worst_candidate].set(0), cage
-                )
-                cpa = jax.lax.select(
-                    do_refresh, cpa.at[worst_candidate].set(new_pa), cpa
-                )
-                cpb = jax.lax.select(
-                    do_refresh, cpb.at[worst_candidate].set(new_pb), cpb
-                )
-                cg = jax.lax.select(
-                    do_refresh, cg.at[worst_candidate].set(new_gen), cg
-                )
+                cow = jax.lax.select(do_refresh, cow.at[:, worst_candidate].set(0.0), cow)
+                cutil = jax.lax.select(do_refresh, cutil.at[worst_candidate].set(0.0), cutil)
+                cage = jax.lax.select(do_refresh, cage.at[worst_candidate].set(0), cage)
+                cpa = jax.lax.select(do_refresh, cpa.at[worst_candidate].set(new_pa), cpa)
+                cpb = jax.lax.select(do_refresh, cpb.at[worst_candidate].set(new_pb), cpb)
+                cg = jax.lax.select(do_refresh, cg.at[worst_candidate].set(new_gen), cg)
                 return (
                     fw,
                     fb,
@@ -1397,21 +1672,28 @@ class FixedBudgetFeatureLearner:
                 candidate_parent_a,
                 candidate_parent_b,
                 candidate_generator,
-            ) = jax.lax.cond(
-                should_promote, promote_branch, refresh_candidate_branch, carry
-            )
+            ) = jax.lax.cond(should_promote, promote_branch, refresh_candidate_branch, carry)
             replaced_slot = jnp.where(should_promote, worst_active, replaced_slot)
-            promoted_candidate = jnp.where(
-                should_promote, best_candidate, promoted_candidate
-            )
+            promoted_candidate = jnp.where(should_promote, best_candidate, promoted_candidate)
         else:
 
             def replace_active_branch(
                 args: tuple[Array, Array, Array, Array, Array, Array, Array, Array],
             ) -> tuple[Array, Array, Array, Array, Array, Array, Array, Array]:
                 fw, fb, ow, util, age, fpa, fpb, fg = args
+                parent_utilities = bias_correct_future_utility(
+                    util,
+                    age,
+                    self._utility_decay,
+                    future_utility_ranking_mode,
+                )
                 new_w, new_b, new_pa, new_pb, new_gen = self._generate_one(
-                    replacement_key, observation, fw, fb, util, generator_mix
+                    replacement_key,
+                    observation,
+                    fw,
+                    fb,
+                    parent_utilities,
+                    generator_mix,
                 )
                 fw = fw.at[worst_active].set(new_w)
                 fb = fb.at[worst_active].set(new_b)
@@ -1463,15 +1745,31 @@ class FixedBudgetFeatureLearner:
         plasticity_log_weights = state.plasticity_log_weights
         plasticity_signal_ema = state.plasticity_signal_ema
         if self._learn_feature_resources:
-            generator_scores, generator_finite = self._generator_scores(
+            ranking_utilities = bias_correct_future_utility(
                 new_utilities,
-                feature_generator,
+                ages,
+                self._utility_decay,
+                future_utility_ranking_mode,
+            )
+            ranking_candidate_utilities = bias_correct_future_utility(
                 new_candidate_utilities,
+                candidate_ages,
+                self._utility_decay,
+                future_utility_ranking_mode,
+            )
+            generator_scores, generator_finite = self._generator_scores(
+                ranking_utilities,
+                feature_generator,
+                ranking_candidate_utilities,
                 candidate_generator,
+            )
+            generator_utility_ema = _recover_nonfinite_at_zero_scale(
+                self._resource_discount,
+                generator_utility_ema,
             )
             generator_utility_ema = jnp.where(
                 generator_finite,
-                self._resource_discount * generator_utility_ema
+                _skip_zero_scale(self._resource_discount, generator_utility_ema)
                 + (1.0 - self._resource_discount) * generator_scores,
                 generator_utility_ema,
             )
@@ -1483,27 +1781,20 @@ class FixedBudgetFeatureLearner:
             )
 
             if self._candidate_count > 0:
-                eligible_candidates_for_pressure = (
-                    candidate_ages >= self._candidate_min_age
-                )
+                eligible_candidates_for_pressure = candidate_ages >= self._candidate_min_age
                 candidate_pressure_scores = jnp.where(
                     eligible_candidates_for_pressure,
-                    new_candidate_utilities,
+                    ranking_candidate_utilities,
                     -jnp.inf,
                 )
-                best_candidate_for_pressure = jnp.argmax(
-                    candidate_pressure_scores
-                ).astype(jnp.int32)
-                has_candidate_for_pressure = jnp.any(
-                    eligible_candidates_for_pressure
+                best_candidate_for_pressure = jnp.argmax(candidate_pressure_scores).astype(
+                    jnp.int32
                 )
-                worst_active_utility = new_utilities[worst_active]
-                best_candidate_utility = new_candidate_utilities[
-                    best_candidate_for_pressure
-                ]
+                has_candidate_for_pressure = jnp.any(eligible_candidates_for_pressure)
+                worst_active_utility = ranking_utilities[worst_active]
+                best_candidate_utility = ranking_candidate_utilities[best_candidate_for_pressure]
                 pressure_raw = (
-                    best_candidate_utility
-                    - promotion_margin * worst_active_utility
+                    best_candidate_utility - promotion_margin * worst_active_utility
                 ) / (jnp.abs(worst_active_utility) + 1e-6)
                 pressure = jnp.where(
                     has_active_slot & has_candidate_for_pressure,
@@ -1512,11 +1803,9 @@ class FixedBudgetFeatureLearner:
                 )
             else:
                 pressure = jnp.array(0.0, dtype=jnp.float32)
-            plasticity_scores = jnp.stack(
-                [-pressure, jnp.array(0.0, dtype=jnp.float32), pressure]
-            )
+            plasticity_scores = jnp.stack([-pressure, jnp.array(0.0, dtype=jnp.float32), pressure])
             plasticity_signal_ema = (
-                self._resource_discount * plasticity_signal_ema
+                _skip_zero_scale(self._resource_discount, plasticity_signal_ema)
                 + (1.0 - self._resource_discount) * plasticity_scores
             )
             plasticity_log_weights = self._resource_log_weight_update(
@@ -1530,9 +1819,7 @@ class FixedBudgetFeatureLearner:
         utility_contribution_trace = jnp.where(
             reset_active_traces[None, :], 0.0, utility_contribution_trace
         )
-        utility_feature_trace = jnp.where(
-            reset_active_traces, 0.0, utility_feature_trace
-        )
+        utility_feature_trace = jnp.where(reset_active_traces, 0.0, utility_feature_trace)
         utility_feature_energy_trace = jnp.where(
             reset_active_traces, 0.0, utility_feature_energy_trace
         )
@@ -1555,7 +1842,22 @@ class FixedBudgetFeatureLearner:
             reset_candidate_traces, 0.0, candidate_utility_signal_second_moment
         )
 
-        new_state = FeatureDiscoveryState(
+        # Report the same bias-corrected scores used at the curation boundary,
+        # while retaining only the standard raw EMA in serializable state.
+        ranking_utilities = bias_correct_future_utility(
+            new_utilities,
+            ages,
+            self._utility_decay,
+            future_utility_ranking_mode,
+        )
+        ranking_candidate_utilities = bias_correct_future_utility(
+            new_candidate_utilities,
+            candidate_ages,
+            self._utility_decay,
+            future_utility_ranking_mode,
+        )
+
+        candidate_state = FeatureDiscoveryState(
             key=key,
             feature_weights=feature_weights,
             feature_biases=feature_biases,
@@ -1575,12 +1877,8 @@ class FixedBudgetFeatureLearner:
             candidate_utilities=new_candidate_utilities,
             candidate_utility_contribution_trace=candidate_utility_contribution_trace,
             candidate_utility_feature_trace=candidate_utility_feature_trace,
-            candidate_utility_feature_energy_trace=(
-                candidate_utility_feature_energy_trace
-            ),
-            candidate_utility_signal_second_moment=(
-                candidate_utility_signal_second_moment
-            ),
+            candidate_utility_feature_energy_trace=(candidate_utility_feature_energy_trace),
+            candidate_utility_signal_second_moment=(candidate_utility_signal_second_moment),
             candidate_ages=candidate_ages,
             feature_parent_a=feature_parent_a,
             feature_parent_b=feature_parent_b,
@@ -1601,7 +1899,7 @@ class FixedBudgetFeatureLearner:
         loss = jnp.sum(errors**2) / active_count
         mean_abs_error = jnp.sum(jnp.abs(errors)) / active_count
         max_candidate_utility = (
-            jnp.max(new_candidate_utilities)
+            jnp.max(ranking_candidate_utilities)
             if self._candidate_count > 0
             else jnp.array(0.0, dtype=jnp.float32)
         )
@@ -1610,8 +1908,8 @@ class FixedBudgetFeatureLearner:
             [
                 loss,
                 mean_abs_error,
-                jnp.mean(new_utilities),
-                jnp.min(new_utilities),
+                jnp.mean(ranking_utilities),
+                jnp.min(ranking_utilities),
                 max_candidate_utility,
                 replacement_flag,
                 bounding_scale,
@@ -1619,13 +1917,29 @@ class FixedBudgetFeatureLearner:
             dtype=jnp.float32,
         )
 
+        update_applied = (
+            source_state_finite
+            & inputs_valid
+            & floating_tree_is_finite(candidate_state)
+            & jnp.all(jnp.isfinite(predictions))
+            & jnp.all(jnp.isfinite(reported_errors) | jnp.isnan(reported_errors))
+            & jnp.all(jnp.isfinite(metrics))
+        )
+        new_state = select_transaction(update_applied, candidate_state, state)
+        neutral_slot = jnp.asarray(-1, dtype=jnp.int32)
+
         return FeatureDiscoveryUpdateResult(
             state=new_state,
-            predictions=predictions,
-            errors=reported_errors,
-            metrics=metrics,
-            replaced_slot=replaced_slot,
-            promoted_candidate=promoted_candidate,
+            predictions=neutralize_array(update_applied, predictions),
+            errors=neutralize_array(update_applied, reported_errors),
+            metrics=neutralize_array(update_applied, metrics),
+            replaced_slot=jnp.where(update_applied, replaced_slot, neutral_slot),
+            promoted_candidate=jnp.where(
+                update_applied,
+                promoted_candidate,
+                neutral_slot,
+            ),
+            update_applied=update_applied,
         )
 
 
@@ -1640,16 +1954,20 @@ def run_feature_discovery_arrays(
     def step_fn(
         carry: FeatureDiscoveryState,
         inputs: tuple[Array, Array],
-    ) -> tuple[FeatureDiscoveryState, Array]:
+    ) -> tuple[FeatureDiscoveryState, tuple[Array, Array]]:
         observation, target = inputs
         result = learner.update(carry, observation, target)
-        return result.state, result.metrics
+        return result.state, (result.metrics, result.update_applied)
 
     t0 = time.time()
-    final_state, metrics = jax.lax.scan(step_fn, state, (observations, targets))
+    final_state, (metrics, updates_applied) = jax.lax.scan(step_fn, state, (observations, targets))
     elapsed = time.time() - t0
     final_state = final_state.replace(uptime_s=final_state.uptime_s + elapsed)  # type: ignore[attr-defined]
-    return FeatureDiscoveryLearningResult(state=final_state, metrics=metrics)
+    return FeatureDiscoveryLearningResult(
+        state=final_state,
+        metrics=metrics,
+        updates_applied=updates_applied,
+    )
 
 
 def run_feature_discovery_loop(
@@ -1668,16 +1986,23 @@ def run_feature_discovery_loop(
     def step_fn(
         carry: tuple[FeatureDiscoveryState, Any],
         idx: Array,
-    ) -> tuple[tuple[FeatureDiscoveryState, Any], Array]:
+    ) -> tuple[tuple[FeatureDiscoveryState, Any], tuple[Array, Array]]:
         l_state, s_state = carry
         timestep, new_s_state = stream.step(s_state, idx)
         result = learner.update(l_state, timestep.observation, timestep.target)
-        return (result.state, new_s_state), result.metrics
+        return (
+            result.state,
+            new_s_state,
+        ), (result.metrics, result.update_applied)
 
     t0 = time.time()
-    (final_state, _), metrics = jax.lax.scan(
+    (final_state, _), (metrics, updates_applied) = jax.lax.scan(
         step_fn, (learner_state, stream_state), jnp.arange(num_steps)
     )
     elapsed = time.time() - t0
     final_state = final_state.replace(uptime_s=final_state.uptime_s + elapsed)  # type: ignore[attr-defined]
-    return FeatureDiscoveryLearningResult(state=final_state, metrics=metrics)
+    return FeatureDiscoveryLearningResult(
+        state=final_state,
+        metrics=metrics,
+        updates_applied=updates_applied,
+    )

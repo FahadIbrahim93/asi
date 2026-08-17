@@ -1,7 +1,7 @@
 """Reduced-horizon mechanism-combination screening for the UPGD IPMNIST lane.
 
-Screens optimizer/mechanism combinations against the reproduced published
-UPGD-W reference on the ICLR-2024 online Input-permuted MNIST protocol
+Screens optimizer/mechanism combinations that might exceed the reproduced
+UPGD-W SOTA on the ICLR-2024 online Input-permuted MNIST protocol
 (:mod:`alberta_framework.benchmarks.upgd_ipmnist`). The screening proxy is
 the *same* protocol at a reduced horizon (default 60 tasks x 5,000 steps
 instead of 200 tasks): because :func:`~alberta_framework.benchmarks.
@@ -126,7 +126,6 @@ scientific evidence. Benchmark executions happen through the CLI
 from __future__ import annotations
 
 import argparse
-import enum
 import hashlib
 import importlib.metadata
 import json
@@ -134,13 +133,13 @@ import logging
 import math
 import os
 import platform
-import sys
+import subprocess
 import time
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from types import CodeType, FunctionType, MappingProxyType
-from typing import Any, NoReturn
+from types import MappingProxyType
+from typing import Any, cast
 
 import chex
 import jax
@@ -149,9 +148,12 @@ import jax.random as jr
 import numpy as np
 from jax import Array
 
+from alberta_framework._seed_validation import require_jax_seed
+from alberta_framework._strict_json import load_strict_json_object
 from alberta_framework.benchmarks.upgd_ipmnist import (
     _PLASTICITY_LOSS_FLOOR,
     ADAMW_PROTOCOL_HYPERPARAMETERS,
+    PARTIAL_SCHEMA_V1,
     UPGD_W_PROTOCOL_HYPERPARAMETERS,
     IPMNISTConfig,
     LeanUPGDState,
@@ -162,6 +164,7 @@ from alberta_framework.benchmarks.upgd_ipmnist import (
     _preflight_new_output,
     _sorted_param_shapes,
     _split_flat_noise,
+    _validated_partial_payload,
     atomic_write_new,
     build_schedule,
     cross_entropy_loss,
@@ -170,6 +173,7 @@ from alberta_framework.benchmarks.upgd_ipmnist import (
     lean_upgd_w_update,
     load_mnist_train,
     mlp_logits,
+    validated_ipmnist_data,
 )
 from alberta_framework.evaluation.recurring_ipmnist_retention import (
     RecurringIPMNISTPhase,
@@ -185,29 +189,34 @@ logger = logging.getLogger(__name__)
 
 LEGACY_SHARD_SCHEMA = "alberta.ipmnist_screening.shard.v1"
 SHARD_SCHEMA = "alberta.ipmnist_screening.shard.v2"
+LEGACY_SUMMARY_SCHEMA = "alberta.ipmnist_screening.summary.v1"
 SUMMARY_SCHEMA = "alberta.ipmnist_screening.summary.v2"
-VALIDATION_SCHEMA = "alberta.ipmnist_screening.proxy_validation.v1"
+LEGACY_VALIDATION_SCHEMA = "alberta.ipmnist_screening.proxy_validation.v1"
+VALIDATION_SCHEMA = "alberta.ipmnist_screening.proxy_validation.v2"
+SOURCE_PROVENANCE_SCHEMA = "alberta.ipmnist_screening.source_provenance.v1"
+DATASET_PROVENANCE_SCHEMA = "alberta.ipmnist_screening.dataset_provenance.v1"
+RUNTIME_SCHEMA = "alberta.ipmnist_screening.runtime.v1"
 
-_CONTENT_DIGEST_CANONICALIZATION = "utf8-json-sort-keys-compact-no-nan"
-_CONTENT_DIGEST_SCOPE = "$ excluding $.content_digest"
-_SCREENING_SOURCE_SCOPE = "conservative-package-python-disk-snapshot-v1"
 _REPO_ROOT = Path(__file__).resolve().parents[2]
-_SOURCE_CAPTURE_VERSION = "stable-package-python-byte-snapshot.v1"
-_CHECKOUT_SOURCE_EXTRA_CANDIDATES = (Path("pyproject.toml"), Path("uv.lock"))
-_RNG_CONTRACT: dict[str, object] = {
-    "contract_version": "ipmnist-screening-rng.v2",
-    "seed_domain": "canonical-uint32",
-    "root": "jax.random.key(uint32(seed))",
-    "root_split": ["parameter_init", "schedule", "learner_noise"],
-    "schedule": "build_schedule(key_schedule, config, n_train)",
-    "step_mode": "split learner_noise once per online example",
-    "pool_mode": (
-        "split one pool key per task, then split one offset key per online example"
-    ),
-    "common_random_numbers": (
-        "parameter init and task/example schedules depend on seed and protocol only, not arm"
-    ),
+_SOURCE_SCOPE = ("alberta_framework", "pyproject.toml", "uv.lock")
+_SOURCE_SCOPE_LABEL = "tracked:alberta_framework/**,pyproject.toml,uv.lock"
+_RUNTIME_ENVIRONMENT_KEYS = (
+    "CUDA_VISIBLE_DEVICES",
+    "JAX_DEFAULT_MATMUL_PRECISION",
+    "JAX_ENABLE_X64",
+    "JAX_PLATFORM_NAME",
+    "JAX_PLATFORMS",
+    "OMP_NUM_THREADS",
+    "XLA_FLAGS",
+)
+_DATASET_SOURCE = {
+    "provider": "openml",
+    "name": "mnist_784",
+    "version": 1,
+    "row_start": 0,
+    "row_stop_exclusive": 60_000,
 }
+_DATASET_MATERIALIZATION = "alberta.ipmnist.float32-neg1-pos1-int32-labels.v1"
 
 #: Default reduced-horizon proxy: 60 tasks x 5,000 steps. At this horizon the
 #: completed 10-seed full runs separate UPGD-W from AdamW by ~+0.022 average
@@ -228,6 +237,43 @@ _IDBD_LOG_ALPHA_MIN = -10.0
 _IDBD_LOG_ALPHA_MAX = 0.0  # alpha <= 1 keeps per-weight decay factors positive
 _AUTOSTEP_ALPHA_MIN = 1e-8
 _AUTOSTEP_ALPHA_MAX = 1.0
+_MISSING_NOISE_POOL_STEPS = object()
+
+
+def _validated_wall_clock_seconds(value: object, path: Path | str) -> float:
+    """Return one shard wall clock as a finite, non-negative Python float."""
+    message = f"{path}: wall_clock_seconds must be a finite, non-negative number"
+    if type(value) not in (int, float):
+        raise ValueError(message)
+    numeric_value = cast(int | float, value)
+    try:
+        wall_clock_seconds = float(numeric_value)
+    except (OverflowError, ValueError) as exc:
+        raise ValueError(message) from exc
+    if not math.isfinite(wall_clock_seconds) or wall_clock_seconds < 0.0:
+        raise ValueError(message)
+    return wall_clock_seconds
+
+
+def _finite_wall_clock_total(values: Sequence[float], *, context: str) -> float:
+    """Preserve the existing sum order while refusing float overflow."""
+    try:
+        total = float(sum(values))
+    except OverflowError as exc:
+        raise ValueError(f"{context}: wall_clock_seconds_total must be finite") from exc
+    if not math.isfinite(total):
+        raise ValueError(f"{context}: wall_clock_seconds_total must be finite")
+    return total
+
+
+def _clip_finite_log_alpha(log_alpha: Array, meta_delta: Array) -> Array:
+    """Clip an IDBD log-step-size update, skipping non-finite channels."""
+    return jnp.where(
+        jnp.isfinite(meta_delta),
+        jnp.clip(log_alpha + meta_delta, _IDBD_LOG_ALPHA_MIN, _IDBD_LOG_ALPHA_MAX),
+        log_alpha,
+    )
+
 
 # Metrics returned by every screening step: (accuracy, loss, plasticity).
 StepMetrics = tuple[Array, Array, Array]
@@ -242,9 +288,6 @@ NoiseUpdateFn = Callable[
     tuple[dict[str, Array], Any],
 ]
 FrozenProbeInputFn = Callable[[Any, Array, Mapping[str, float]], Array]
-FrozenProbeLogitsFn = Callable[
-    [dict[str, Array], Any, Array, Mapping[str, float]], Array
-]
 
 
 def _lean_upgd_noise_update(
@@ -278,7 +321,20 @@ def _sorted_flat_noise(
     Identical construction (sorted names, one flat draw) to the lean UPGD-W
     learner in :mod:`alberta_framework.benchmarks.upgd_ipmnist`, so a combo
     that degenerates to plain UPGD-W consumes the same noise stream.
+
+    ``noise_std`` is a trace-time Python float; at exactly ``0.0`` the draw
+    is skipped and exact zeros are returned.  The values are identical either
+    way (``0.0 * normal`` is exact zeros), but XLA cannot fold the draw away
+    itself (a normal draw is not provably finite), so a factory that keeps
+    the draw and one that shortcuts it compile to structurally different
+    graphs whose fusions can reassociate derived float32 metrics by ~1 ulp
+    on some backends even when every parameter update is bit-identical
+    (issue #46).  The shortcut lives here, not in the callers, so every
+    sigma=0 factory sharing this helper lowers to the same RNG-free graph
+    while still skipping the draw's ~85-90% share of the UPGD step cost.
     """
+    if noise_std == 0.0:
+        return {name: jnp.zeros_like(value) for name, value in params.items()}
     names = sorted(params)
     shapes = [params[name].shape for name in names]
     counts = [int(np.prod(shape)) for shape in shapes]
@@ -418,10 +474,8 @@ def upgd_idbd_update(
     for name in params:
         keep = 1.0 - gate[name]
         z = grads[name] * keep
-        log_alpha = jnp.clip(
-            state.log_alpha[name] + meta * z * state.trace[name],
-            _IDBD_LOG_ALPHA_MIN,
-            _IDBD_LOG_ALPHA_MAX,
+        log_alpha = _clip_finite_log_alpha(
+            state.log_alpha[name], meta * z * state.trace[name]
         )
         alpha = jnp.exp(log_alpha)
         new_params[name] = params[name] * (1.0 - alpha * wd) - alpha * (
@@ -475,10 +529,8 @@ def upgd_idbd_swift_update(
     log_alpha_all: dict[str, Array] = {}
     for name in params:
         z_all[name] = grads[name] * (1.0 - gate[name])
-        log_alpha_all[name] = jnp.clip(
-            state.log_alpha[name] + meta * z_all[name] * state.trace[name],
-            _IDBD_LOG_ALPHA_MIN,
-            _IDBD_LOG_ALPHA_MAX,
+        log_alpha_all[name] = _clip_finite_log_alpha(
+            state.log_alpha[name], meta * z_all[name] * state.trace[name]
         )
     alpha_all = {name: jnp.exp(log_alpha_all[name]) for name in params}
     tau = jnp.sum(
@@ -604,17 +656,30 @@ def upgd_autostep_update(
         v_update = state.normalizer[name] + (1.0 / tau) * state.alpha[name] * z * z * (
             abs_meta - state.normalizer[name]
         )
-        v_new = jnp.maximum(abs_meta, v_update)
+        v_candidate = jnp.maximum(abs_meta, v_update)
+        valid_meta_update = jnp.logical_and(
+            jnp.isfinite(meta_gradient), jnp.isfinite(v_candidate)
+        )
+        v_new = jnp.where(valid_meta_update, v_candidate, state.normalizer[name])
         safe_v = jnp.maximum(v_new, 1e-38)
         raw_alpha[name] = jnp.where(
-            v_new > 0.0,
+            valid_meta_update & (v_new > 0.0),
             state.alpha[name] * jnp.exp(mu * meta_gradient / safe_v),
             state.alpha[name],
         )
         new_normalizer[name] = v_new
     effective = jnp.sum(
         jnp.stack(
-            [jnp.sum(raw_alpha[name] * z_all[name] * z_all[name]) for name in sorted(params)]
+            [
+                jnp.sum(
+                    jnp.where(
+                        jnp.isfinite(z_all[name]),
+                        raw_alpha[name] * z_all[name] * z_all[name],
+                        0.0,
+                    )
+                )
+                for name in sorted(params)
+            ]
         )
     )
     m_factor = jnp.maximum(effective, 1.0)
@@ -629,7 +694,12 @@ def upgd_autostep_update(
             (grads[name] + noise[name]) * keep
         )
         new_alpha[name] = alpha
-        new_trace[name] = state.trace[name] * (1.0 - alpha * z * z) + alpha * z
+        trace_candidate = state.trace[name] * (1.0 - alpha * z * z) + alpha * z
+        new_trace[name] = jnp.where(
+            jnp.isfinite(trace_candidate),
+            trace_candidate,
+            state.trace[name],
+        )
     return new_params, UPGDAutostepState(  # type: ignore[call-arg]
         utility=utility,
         step=count,
@@ -887,7 +957,7 @@ class EMANormState:
 def ema_normalize(
     state: EMANormState, observation: Array, decay: float, epsilon: float
 ) -> tuple[Array, EMANormState]:
-    """Equation-parity restatement of ``EMANormalizer.normalize`` (scan-friendly)."""
+    """Scan-friendly EMA with the core's zero-mean, unit-variance prior sample."""
     new_count = state.count + 1.0
     effective_decay = jnp.minimum(decay, 1.0 - 1.0 / (new_count + 1.0))
     delta = observation - state.mean
@@ -1049,10 +1119,11 @@ def _make_upgd_ema_norm_ext_learner(
 
     With every switch at its default the trajectory is bit-exact against
     ``upgd_ema_norm_sigma0`` (pinned by a unit test): the perturbation term
-    is the same explicit zeros the champion's ``noise_std=0`` draw produces,
-    without paying for the 282,160-element normal draw, and the RNG key is
-    left untouched.  ``noise_std > 0`` keeps the champion's exact noise
-    stream (``_sorted_flat_noise``) for completeness.
+    comes from the same ``_sorted_flat_noise`` call as the champion's
+    factory, whose sigma=0 short-circuit skips the 282,160-element normal
+    draw and leaves the RNG key untouched for both factories, so the two
+    lower to identical HLO (pinned; issue #46).  ``noise_std > 0`` keeps
+    the champion's exact noise stream for completeness.
     """
     noise_std = hp["noise_std"]
     step_size = hp["step_size"]
@@ -1096,11 +1167,30 @@ def _make_upgd_ema_norm_ext_learner(
         (loss, logits), grads = jax.value_and_grad(loss_fn, has_aux=True)(
             params, x_norm, y
         )
-        if noise_std == 0.0:
-            # Exactly the zeros the sigma=0 draw produces, minus the draw.
-            noise = {name: jnp.zeros_like(value) for name, value in params.items()}
-        else:
+        if not hidden_rms and not local_gate and gate_beta == 1.0:
+            # Keep the inert extension on the authoritative lean-UPGD path.
+            # Repeating the same equations here can produce low-bit parameter
+            # differences under JAX even when the accuracy and loss traces
+            # remain equal, which invalidates the reduction pin's plasticity
+            # metric.  The shared path also preserves the exact noise stream
+            # when a nonzero noise arm uses this factory.
+            lean_state = LeanUPGDState(  # type: ignore[call-arg]
+                utility=state.utility,
+                step=state.step,
+            )
+            lean_hp = {
+                name: hp[name]
+                for name in ("step_size", "utility_decay", "noise_std", "weight_decay")
+            }
             noise = _sorted_flat_noise(key, params, noise_std)
+            reduced_params, reduced_lean = lean_upgd_w_update(
+                params, lean_state, grads, noise, lean_hp
+            )
+            metrics = _step_metrics(reduced_params, x_norm, y, loss, logits)
+            return reduced_params, UPGDNormState(  # type: ignore[call-arg]
+                utility=reduced_lean.utility, step=reduced_lean.step, norm=new_norm
+            ), metrics
+        noise = _sorted_flat_noise(key, params, noise_std)
         count = state.step + jnp.array(1, dtype=jnp.int32)
         utility = {
             name: utility_decay * state.utility[name]
@@ -2663,10 +2753,8 @@ def upgd_alpha_utility_update(
     new_trace: dict[str, Array] = {}
     for name in params:
         g = grads[name]
-        la = jnp.clip(
-            state.log_alpha[name] + meta * g * state.trace[name],
-            _IDBD_LOG_ALPHA_MIN,
-            _IDBD_LOG_ALPHA_MAX,
+        la = _clip_finite_log_alpha(
+            state.log_alpha[name], meta * g * state.trace[name]
         )
         alpha = jnp.exp(la)
         new_log_alpha[name] = la
@@ -3164,8 +3252,8 @@ def _make_lin_rls_learner(
     concatenated with a constant bias feature (``m = d + 1``). No random
     projection, no nonlinearity, no backprop — the cheapest possible measure
     of how far pure linear tracking goes on this protocol. In the 2-task
-    calibration diagnostic this floor already reached 0.78, near the
-    published reference result, with no representation at all.
+    calibration diagnostic this floor already reached 0.78, i.e. the
+    published-SOTA neighborhood, with no representation at all.
     """
     clip = hp["rff_clip"]
     rls_lambda = hp["rls_lambda"]
@@ -3344,6 +3432,24 @@ def _make_naive_bayes_learner(
     return init_fn, full_step
 
 
+def _naive_bayes_frozen_probe_input(
+    state: Any, observation: Array, hyperparameters: Mapping[str, float]
+) -> Array:
+    """Refuse sentinel probes for the gradient-free naive-Bayes arm.
+
+    Exactly the :func:`_rff_frozen_probe_input` situation: the deployed
+    model is the streaming Gaussian statistics, not the (untouched,
+    randomly initialized) protocol MLP, so probing ``mlp_logits`` would
+    silently score a model that does not exist. Fail closed.
+    """
+    del state, observation, hyperparameters
+    raise NotImplementedError(
+        "sentinel probes are unsupported for the naive_bayes arm: there is "
+        "no trained protocol MLP to probe (the deployed model is the "
+        "streaming class-conditional Gaussian statistics)"
+    )
+
+
 # =============================================================================
 # (w) rls_head — champion body + recursive-least-squares readout
 # =============================================================================
@@ -3396,11 +3502,12 @@ class RLSHeadState:
     """Champion-body carry plus the RLS readout on penultimate features.
 
     ``utility``/``step`` are the champion's utility EMA and clock (over all
-    six tensors in parallel mode; the four body tensors in resid mode carry
-    the signal, the head tensors' utility stays zero).  ``norm``/``fast_mean``
-    are the shift-adaptive normalizer.  ``p`` is the (h2+1, h2+1) inverse
-    feature-correlation matrix and ``wout`` the (h2+1, n_classes) one-vs-all
-    readout on bias-augmented penultimate features.
+    six tensors in parallel mode; the four body tensors in gated resid mode
+    carry the signal, and both remain at their initial values in the no-gate
+    resid ablation).  ``norm``/``fast_mean`` are the shift-adaptive
+    normalizer.  ``p`` is the (h2+1, h2+1) inverse feature-correlation matrix
+    and ``wout`` the (h2+1, n_classes) one-vs-all readout on bias-augmented
+    penultimate features.
     """
 
     utility: dict[str, Array]
@@ -3414,13 +3521,34 @@ class RLSHeadState:
 _RLS_HEAD_BODY = ("w1", "b1", "w2", "b2")
 
 
+@chex.dataclass(frozen=True)
+class RLSHeadL2InitState:
+    """Opt-in RLS carry with an immutable body-initialization snapshot.
+
+    This distinct state keeps the incumbent :class:`RLSHeadState` schema
+    unchanged.  ``init_params`` contains exactly the four residual-trained
+    body tensors; the parallel protocol head and the RLS state are not part
+    of the L2-to-initialization mechanism.
+    """
+
+    utility: dict[str, Array]
+    step: Array
+    norm: EMANormState
+    fast_mean: Array
+    p: Array
+    wout: Array
+    init_params: dict[str, Array]
+
+
 def _rls_head_hp(**overrides: float) -> dict[str, float]:
     """Champion (``sigma0_shiftnorm_d099``) constants plus RLS-head defaults.
 
     ``rls_reset_frac`` defaults untriggerable (2.0 > any shifted fraction),
     which is bitwise the plain no-reset path (build-time composition,
     pinned).  ``head_resid`` selects the body error signal (0 = parallel
-    champion SGD head, 1 = RLS residual).
+    champion SGD head, 1 = RLS residual).  ``gate_scale`` is a frozen
+    endpoint switch, not a tuning knob: 1 keeps the incumbent utility-gated
+    update and 0 selects plain decayed SGD for the residual body.
     """
     merged = {
         "step_size": 0.01,
@@ -3438,13 +3566,53 @@ def _rls_head_hp(**overrides: float) -> dict[str, float]:
         "rls_reset_frac": 2.0,
         "rls_p_trace_cap": 0.0,
         "head_resid": 0.0,
+        "gate_scale": 1.0,
     }
     merged.update(overrides)
     return merged
 
 
+def _rls_head_l2init_hp() -> dict[str, float]:
+    """Frozen issue-#14 endpoint: incumbent plus body L2-Init."""
+    return {
+        **_rls_head_hp(
+            rls_lambda=1.0,
+            rls_reset_frac=0.05,
+            head_resid=1.0,
+        ),
+        "decay_to_init": 1.0,
+    }
+
+
+def _make_rls_head_l2init_learner(
+    hp: Mapping[str, float],
+) -> tuple[LearnerInitFn, ScreeningStepFn]:
+    """Build the one frozen body-only L2-Init arm, failing closed on drift."""
+    expected = _rls_head_l2init_hp()
+    if set(hp) != set(expected):
+        raise ValueError(
+            "frozen L2-Init configuration requires exactly the registered keys"
+        )
+    invalid = [
+        name
+        for name, expected_value in expected.items()
+        if type(hp[name]) is not float
+        or not math.isfinite(hp[name])
+        or hp[name].hex() != expected_value.hex()
+    ]
+    if invalid:
+        raise ValueError(
+            "frozen L2-Init configuration differs at: " + ", ".join(invalid)
+        )
+    base_hp = dict(hp)
+    del base_hp["decay_to_init"]
+    return _make_rls_head_learner(base_hp, _decay_to_init=True)
+
+
 def _make_rls_head_learner(
     hp: Mapping[str, float],
+    *,
+    _decay_to_init: bool = False,
 ) -> tuple[LearnerInitFn, ScreeningStepFn]:
     """Champion body + streaming-RLS readout on the penultimate features.
 
@@ -3461,6 +3629,12 @@ def _make_rls_head_learner(
        ``head_resid = 1``: the same gated step on
        ``d(0.5*||onehot - wout.T @ phi||^2)/d(body)`` with ``wout`` held
        constant (w3/b3 untouched, zero-utility gate guarded to 0.5).
+       The frozen ``gate_scale = 0`` endpoint instead applies plain decayed
+       SGD to that residual gradient and skips all utility bookkeeping.  The
+       private, opt-in L2-Init composition changes only the four residual
+       body tensors' decay target; it has a distinct state and strict
+       registered factory so the incumbent path and state schema remain
+       unchanged.
     4. Sherman-Morrison RLS with forgetting ``rls_lambda`` (symmetrized P,
        the rff_rls equations), then the optional detector-driven P reset
        (``mean(shifted) >= rls_reset_frac`` => ``p = eye/ridge``, wout kept).
@@ -3470,7 +3644,8 @@ def _make_rls_head_learner(
     """
     step_size = hp["step_size"]
     utility_decay = hp["utility_decay"]
-    param_decay = 1.0 - step_size * hp["weight_decay"]
+    weight_decay = hp["weight_decay"]
+    param_decay = 1.0 - step_size * weight_decay
     rls_lambda = hp["rls_lambda"]
     ridge_init = hp["rls_ridge_init"]
     reset_frac = hp["rls_reset_frac"]
@@ -3478,6 +3653,16 @@ def _make_rls_head_learner(
     trace_cap = hp["rls_p_trace_cap"]
     cap_enabled = trace_cap > 0.0
     resid = hp["head_resid"] != 0.0
+    gate_scale = hp.get("gate_scale", 1.0)
+    if gate_scale not in (0.0, 1.0):
+        raise ValueError(
+            "gate_scale is a frozen ablation endpoint and must be 0.0 or 1.0"
+        )
+    gate_enabled = gate_scale == 1.0
+    if not gate_enabled and not resid:
+        raise ValueError("gate_scale=0.0 is supported only for the residual body")
+    if _decay_to_init and (not resid or not gate_enabled):
+        raise ValueError("L2-Init is supported only for the gated residual body")
 
     def normalize(
         state: EMANormState, fast_mean: Array, x: Array
@@ -3492,10 +3677,28 @@ def _make_rls_head_learner(
             shift_refractory=hp["shift_refractory"],
         )
 
-    def init_fn(params: dict[str, Array]) -> RLSHeadState:
+    def init_fn(
+        params: dict[str, Array],
+    ) -> RLSHeadState | RLSHeadL2InitState:
         input_dim = params["w1"].shape[0]
         m = params["w2"].shape[1] + 1
         n_classes = params["w3"].shape[1]
+        if _decay_to_init:
+            return RLSHeadL2InitState(  # type: ignore[call-arg]
+                utility={
+                    name: jnp.zeros_like(value) for name, value in params.items()
+                },
+                step=jnp.array(0, dtype=jnp.int32),
+                norm=EMANormState(  # type: ignore[call-arg]
+                    mean=jnp.zeros(input_dim, dtype=jnp.float32),
+                    var=jnp.ones(input_dim, dtype=jnp.float32),
+                    count=jnp.zeros(input_dim, dtype=jnp.float32),
+                ),
+                fast_mean=jnp.zeros(input_dim, dtype=jnp.float32),
+                p=jnp.eye(m, dtype=jnp.float32) / ridge_init,
+                wout=jnp.zeros((m, n_classes), dtype=jnp.float32),
+                init_params={name: params[name] for name in _RLS_HEAD_BODY},
+            )
         return RLSHeadState(  # type: ignore[call-arg]
             utility={name: jnp.zeros_like(value) for name, value in params.items()},
             step=jnp.array(0, dtype=jnp.int32),
@@ -3523,6 +3726,7 @@ def _make_rls_head_learner(
         count: Array,
         names: tuple[str, ...],
         guard_zero_max: bool,
+        init_params: Mapping[str, Array] | None = None,
     ) -> tuple[dict[str, Array], dict[str, Array]]:
         """Champion utility-EMA + global-max sigmoid gate + gated decayed SGD
         over ``names``; other tensors pass through with untouched utility."""
@@ -3541,29 +3745,60 @@ def _make_rls_head_learner(
             global_max = jnp.where(global_max == 0.0, 1.0, global_max)
         new_params = dict(params)
         for name in names:
-            new_params[name] = params[name] * param_decay - step_size * (
-                grads[name]
-                * (
-                    1.0
-                    - jax.nn.sigmoid(
-                        (new_utility[name] / bias_correction) / global_max
+            if init_params is None:
+                # Keep the incumbent expression byte-for-byte unchanged.
+                new_params[name] = params[name] * param_decay - step_size * (
+                    grads[name]
+                    * (
+                        1.0
+                        - jax.nn.sigmoid(
+                            (new_utility[name] / bias_correction) / global_max
+                        )
                     )
                 )
-            )
+            else:
+                new_params[name] = (
+                    params[name]
+                    - step_size
+                    * weight_decay
+                    * (params[name] - init_params[name])
+                    - step_size
+                    * (
+                        grads[name]
+                        * (
+                            1.0
+                            - jax.nn.sigmoid(
+                                (new_utility[name] / bias_correction) / global_max
+                            )
+                        )
+                    )
+                )
         return new_params, new_utility
 
     def full_step(
         params: dict[str, Array],
-        state: RLSHeadState,
+        state: RLSHeadState | RLSHeadL2InitState,
         x: Array,
         y: Array,
         key: Array,
-    ) -> tuple[dict[str, Array], RLSHeadState, StepMetrics]:
+    ) -> tuple[
+        dict[str, Array], RLSHeadState | RLSHeadL2InitState, StepMetrics
+    ]:
         del key  # sigma-0 body, closed-form head: no randomness consumed
+        if _decay_to_init:
+            if not isinstance(state, RLSHeadL2InitState):
+                raise TypeError("L2-Init learner requires RLSHeadL2InitState")
+            init_params: Mapping[str, Array] | None = state.init_params
+        else:
+            init_params = None
         x_norm, new_norm, new_fast, shifted = normalize(
             state.norm, state.fast_mean, x
         )
-        count = state.step + jnp.array(1, dtype=jnp.int32)
+        count = (
+            state.step + jnp.array(1, dtype=jnp.int32)
+            if gate_enabled
+            else state.step
+        )
         n_classes = state.wout.shape[1]
         y_onehot = jax.nn.one_hot(y, n_classes, dtype=jnp.float32)
         if resid:
@@ -3582,10 +3817,27 @@ def _make_rls_head_learner(
             (loss, (logits, phi)), body_grads = jax.value_and_grad(
                 head_loss, has_aux=True
             )(body)
-            new_params, new_utility = _gated_sgd(
-                params, body_grads, state.utility, count,
-                _RLS_HEAD_BODY, guard_zero_max=True,
-            )
+            if gate_enabled:
+                new_params, new_utility = _gated_sgd(
+                    params,
+                    body_grads,
+                    state.utility,
+                    count,
+                    _RLS_HEAD_BODY,
+                    guard_zero_max=True,
+                    init_params=init_params,
+                )
+            else:
+                # Issue #52's frozen ablation endpoint: do not compute or
+                # carry utility EMA, bias correction, or sigmoid bookkeeping.
+                # The Python closure flag makes this a build-time branch, so
+                # the no-gate compiled graph contains only decayed SGD.
+                new_params = dict(params)
+                for name in _RLS_HEAD_BODY:
+                    new_params[name] = (
+                        params[name] * param_decay - step_size * body_grads[name]
+                    )
+                new_utility = state.utility
         else:
             _, grads = jax.value_and_grad(cross_entropy_loss, has_aux=True)(
                 params, x_norm, y
@@ -3624,6 +3876,17 @@ def _make_rls_head_learner(
         plasticity = jnp.clip(
             1.0 - loss_after / jnp.maximum(loss, _PLASTICITY_LOSS_FLOOR), 0.0, 1.0
         )
+        if _decay_to_init:
+            assert isinstance(state, RLSHeadL2InitState)
+            return new_params, RLSHeadL2InitState(  # type: ignore[call-arg]
+                utility=new_utility,
+                step=count,
+                norm=new_norm,
+                fast_mean=new_fast,
+                p=new_p,
+                wout=new_wout,
+                init_params=state.init_params,
+            ), (accuracy, loss, plasticity)
         return new_params, RLSHeadState(  # type: ignore[call-arg]
             utility=new_utility,
             step=count,
@@ -3634,6 +3897,24 @@ def _make_rls_head_learner(
         ), (accuracy, loss, plasticity)
 
     return init_fn, full_step
+
+
+def _rls_head_frozen_probe_input(
+    state: Any, observation: Array, hyperparameters: Mapping[str, float]
+) -> Array:
+    """Refuse sentinel probes for the RLS-readout arms.
+
+    The deployed prediction is ``argmax(wout.T @ phi)``, not ``mlp_logits``:
+    in resid mode w3/b3 are never trained, and in parallel mode probing the
+    SGD head would silently score the passenger model instead of the
+    deployed readout.  Fail closed, the rff_rls/naive_bayes precedent.
+    """
+    del state, observation, hyperparameters
+    raise NotImplementedError(
+        "sentinel probes are unsupported for the rls_head arms: the deployed "
+        "model is the champion body + RLS readout, not the protocol MLP head "
+        "that the probe harness would score"
+    )
 
 
 # =============================================================================
@@ -3933,6 +4214,24 @@ def _make_nb_ensemble_learner(
         return new_params, new_state, (accuracy, loss, plasticity)
 
     return init_fn, full_step
+
+
+def _nb_ensemble_frozen_probe_input(
+    state: Any, observation: Array, hyperparameters: Mapping[str, float]
+) -> Array:
+    """Refuse sentinel probes for the nb_ensemble arms.
+
+    The deployed predictor is the accuracy-weighted member mixture, not the
+    protocol MLP alone: probing ``mlp_logits`` on the champion member would
+    silently score a different model than the one the arm deploys.  Fail
+    closed, exactly like the other non-MLP deployments.
+    """
+    del state, observation, hyperparameters
+    raise NotImplementedError(
+        "sentinel probes are unsupported for the nb_ensemble arms: the "
+        "deployed predictor is the accuracy-weighted member mixture, not "
+        "the protocol MLP alone"
+    )
 
 
 # =============================================================================
@@ -4769,6 +5068,137 @@ def _make_l2init_ema_norm_learner(
     return init_fn, full_step
 
 
+@chex.dataclass(frozen=True)
+class UPGDGatedL2InitNormState:
+    """Lean-UPGD utility EMA/clock, a frozen copy of the initial parameters,
+    and the EMA input-normalizer state (see
+    :func:`_make_sigma0_gated_l2init_learner`)."""
+
+    utility: dict[str, Array]
+    step: Array
+    init_params: dict[str, Array]
+    norm: EMANormState
+
+
+def _make_sigma0_gated_l2init_learner(
+    hp: Mapping[str, float],
+) -> tuple[LearnerInitFn, ScreeningStepFn]:
+    """``sigma0_ndecay099`` baseline plus an additive, utility-gated pull
+    toward the initial weights.
+
+    Ported idea: continuous utility-scaled soft resets (CCBP,
+    OpenReview:UJqXhFFzKu; Calibrated Partial Resets, arXiv:2607.24996)
+    report that a *continuous*, per-unit-utility-scaled partial pull of
+    every hidden parameter toward its initial value dominates both
+    decay-based (L2/Shrink-and-Perturb) and hard-reset (CBP/ReDO) methods at
+    long horizons. This arm tests that mechanism's isolated marginal
+    contribution on top of that historical baseline, reusing the baseline's own
+    UPGD utility gate as the per-unit "graded reset" weight: ``1 - gate`` is
+    large for low-utility (unprotected) units and near zero for high-utility
+    (protected) ones, so the pull toward init is concentrated exactly where
+    the source papers' utility-scaled reset is meant to act. ``sigma0_ndecay099``
+    exposes no separate hidden-unit-firing utility signal of its own (unlike
+    CBP-family arms), so the UPGD gate is the closest available substitute
+    -- a documented deviation from the source papers' own utility statistic.
+
+    Deviation from the source papers: they replace their baseline's
+    decay/reset term outright; here the pull is an ADDITIVE new term next to
+    the baseline's existing uniform decoupled weight decay (rather than a
+    replacement), so this measures the isolated contribution of graded,
+    utility-gated pull-toward-init rather than a full swap of the
+    regularizer family.
+
+    ``l2init_pull_scale = 0`` (the default) is inert: the new term is
+    multiplied by exactly zero and the step routes through the identical
+    ``lean_upgd_w_update`` call the baseline factory's own inert path uses,
+    so the trajectory is bit-exact against ``sigma0_ndecay099`` (pinned by a
+    unit test) rather than relying on floating-point cancellation of a zero
+    term.
+    """
+    noise_std = hp["noise_std"]
+    norm_decay = hp["norm_decay"]
+    norm_epsilon = hp["norm_epsilon"]
+    pull_scale = hp.get("l2init_pull_scale", 0.0)
+    lean_hp = {
+        name: hp[name] for name in ("step_size", "utility_decay", "noise_std", "weight_decay")
+    }
+
+    def init_fn(params: dict[str, Array]) -> UPGDGatedL2InitNormState:
+        return UPGDGatedL2InitNormState(  # type: ignore[call-arg]
+            utility={name: jnp.zeros_like(value) for name, value in params.items()},
+            step=jnp.array(0, dtype=jnp.int32),
+            init_params={name: value for name, value in params.items()},
+            norm=_init_input_norm_state(params),
+        )
+
+    def full_step(
+        params: dict[str, Array],
+        state: UPGDGatedL2InitNormState,
+        x: Array,
+        y: Array,
+        key: Array,
+    ) -> tuple[dict[str, Array], UPGDGatedL2InitNormState, StepMetrics]:
+        x_norm, new_norm = ema_normalize(state.norm, x, norm_decay, norm_epsilon)
+        (loss, logits), grads = jax.value_and_grad(cross_entropy_loss, has_aux=True)(
+            params, x_norm, y
+        )
+        noise = _sorted_flat_noise(key, params, noise_std)
+        if pull_scale == 0.0:
+            # Exact champion path: call the identical function the champion
+            # factory's own inert path calls, rather than relying on
+            # floating-point cancellation of a zero-scaled extra term.
+            lean_state = LeanUPGDState(  # type: ignore[call-arg]
+                utility=state.utility, step=state.step
+            )
+            inert_new_params, new_lean = lean_upgd_w_update(
+                params, lean_state, grads, noise, lean_hp
+            )
+            metrics = _step_metrics(inert_new_params, x_norm, y, loss, logits)
+            return (
+                inert_new_params,
+                UPGDGatedL2InitNormState(  # type: ignore[call-arg]
+                    utility=new_lean.utility,
+                    step=new_lean.step,
+                    init_params=state.init_params,
+                    norm=new_norm,
+                ),
+                metrics,
+            )
+        beta = hp["utility_decay"]
+        step_size = hp["step_size"]
+        decay_factor = 1.0 - step_size * hp["weight_decay"]
+        count = state.step + jnp.array(1, dtype=jnp.int32)
+        utility = {
+            name: beta * state.utility[name] + (1.0 - beta) * (-grads[name] * params[name])
+            for name in params
+        }
+        global_max = jnp.max(
+            jnp.stack([jnp.max(utility[name]) for name in sorted(params)])
+        )
+        bias_correction = 1.0 - jnp.power(
+            jnp.asarray(beta, dtype=jnp.float32), count.astype(jnp.float32)
+        )
+        new_params: dict[str, Array] = {}
+        for name in params:
+            gate = jax.nn.sigmoid((utility[name] / bias_correction) / global_max)
+            pull = pull_scale * (1.0 - gate) * (params[name] - state.init_params[name])
+            new_params[name] = (
+                params[name] * decay_factor
+                - step_size * pull
+                - step_size * ((grads[name] + noise[name]) * (1.0 - gate))
+            )
+        metrics = _step_metrics(new_params, x_norm, y, loss, logits)
+        return (
+            new_params,
+            UPGDGatedL2InitNormState(  # type: ignore[call-arg]
+                utility=utility, step=count, init_params=state.init_params, norm=new_norm
+            ),
+            metrics,
+        )
+
+    return init_fn, full_step
+
+
 # =============================================================================
 # Config registry
 # =============================================================================
@@ -4804,142 +5234,57 @@ def _ema_frozen_probe_input(
     return (observation - norm.mean) / (jnp.sqrt(norm.var) + epsilon)
 
 
-def _hidden_rms_frozen_probe_logits(
-    params: dict[str, Array],
-    state: Any,
-    observation: Array,
-    hyperparameters: Mapping[str, float],
+def _hidden_rms_frozen_probe_input(
+    state: Any, observation: Array, hyperparameters: Mapping[str, float]
 ) -> Array:
-    """Evaluate the hidden-RMS MLP with frozen input-normalizer statistics."""
-    model_inputs = _ema_frozen_probe_input(state, observation, hyperparameters)
-    epsilon = hyperparameters.get("hidden_rms_epsilon")
-    if epsilon is None or not math.isfinite(epsilon) or epsilon <= 0.0:
-        raise ValueError("a hidden-RMS frozen probe requires finite positive epsilon")
+    """Refuse sentinel probes for arms whose forward pass is not the plain MLP.
 
-    def predict_one(x: Array) -> Array:
-        h1 = _hidden_rms_normalize(
-            jax.nn.relu(x @ params["w1"] + params["b1"]), epsilon
-        )
-        h2 = _hidden_rms_normalize(
-            jax.nn.relu(h1 @ params["w2"] + params["b2"]), epsilon
-        )
-        return h2 @ params["w3"] + params["b3"]
-
-    return jax.vmap(predict_one)(model_inputs)
-
-
-def _rff_rls_frozen_probe_logits(
-    params: dict[str, Array],
-    state: Any,
-    observation: Array,
-    hyperparameters: Mapping[str, float],
-) -> Array:
-    """Evaluate the frozen random-Fourier projection and learned RLS readout."""
-    del params
-    if not isinstance(state, RFFRLSState):
-        raise TypeError("an rff_rls frozen probe requires RFFRLSState")
-    normalized = _ema_frozen_probe_input(state, observation, hyperparameters)
-    clip = hyperparameters["rff_clip"]
-    z = jnp.clip(normalized, -clip, clip)
-    feature_scale = math.sqrt(2.0 / state.omega.shape[0])
-    features = feature_scale * jnp.cos(z @ state.omega.T + state.phase)
-    return features @ state.wout
-
-
-def _lin_rls_frozen_probe_logits(
-    params: dict[str, Array],
-    state: Any,
-    observation: Array,
-    hyperparameters: Mapping[str, float],
-) -> Array:
-    """Evaluate the frozen normalized-linear feature map and learned RLS readout."""
-    del params
-    if not isinstance(state, RFFRLSState):
-        raise TypeError("a lin_rls frozen probe requires RFFRLSState")
-    normalized = _ema_frozen_probe_input(state, observation, hyperparameters)
-    clip = hyperparameters["rff_clip"]
-    z = jnp.clip(normalized, -clip, clip)
-    features = jnp.concatenate(
-        [
-            z / jnp.sqrt(jnp.float32(z.shape[1])),
-            jnp.ones((z.shape[0], 1), dtype=jnp.float32),
-        ],
-        axis=1,
+    ``sigma0_hidden_norm`` RMS-normalizes the hidden activations inside the
+    forward pass; the probe harness computes logits with ``mlp_logits``, so
+    any input-side transform would silently probe the wrong model.  Failing
+    closed here is the honest option until the probe harness can accept a
+    per-arm forward function.
+    """
+    del state, observation, hyperparameters
+    raise NotImplementedError(
+        "sentinel probes are unsupported for hidden-RMS-normalized arms: the "
+        "deployed forward pass is not the plain protocol MLP"
     )
-    return features @ state.wout
 
 
-def _naive_bayes_frozen_probe_logits(
-    params: dict[str, Array],
-    state: Any,
-    observation: Array,
+def _discovered_rule_frozen_probe_input(
     hyperparameters: Mapping[str, float],
+) -> FrozenProbeInputFn:
+    """Select the sentinel probe for a discovered-rule arm from its flags.
+
+    ``flag_hidden_rms`` switches the discovered-rule forward pass to the same
+    hidden-layer RMS normalization as ``sigma0_hidden_norm``, so those arms
+    must fail closed exactly like it; the remaining discovered rules deploy
+    the plain MLP behind an EMA input normalizer.
+    """
+    if float(hyperparameters.get("flag_hidden_rms", 0.0)) != 0.0:
+        return _hidden_rms_frozen_probe_input
+    return _ema_frozen_probe_input
+
+
+def _rff_frozen_probe_input(
+    state: Any, observation: Array, hyperparameters: Mapping[str, float]
 ) -> Array:
-    """Evaluate the streaming Gaussian classifier without updating statistics."""
-    del params, hyperparameters
-    if not isinstance(state, NaiveBayesState):
-        raise TypeError("a naive_bayes frozen probe requires NaiveBayesState")
-    return jax.vmap(lambda x: naive_bayes_logits(state, x))(observation)
+    """Refuse sentinel probes for the no-backprop random-features arm.
 
-
-def _rls_head_frozen_probe_logits(
-    params: dict[str, Array],
-    state: Any,
-    observation: Array,
-    hyperparameters: Mapping[str, float],
-) -> Array:
-    """Evaluate the champion body and its deployed bias-augmented RLS readout."""
-    if not isinstance(state, RLSHeadState):
-        raise TypeError("an rls_head frozen probe requires RLSHeadState")
-    normalized = _ema_frozen_probe_input(state, observation, hyperparameters)
-    h1 = jax.nn.relu(normalized @ params["w1"] + params["b1"])
-    h2 = jax.nn.relu(h1 @ params["w2"] + params["b2"])
-    scale = 1.0 / math.sqrt(h2.shape[1] + 1)
-    features = jnp.concatenate(
-        [
-            h2 * scale,
-            jnp.ones((h2.shape[0], 1), dtype=jnp.float32),
-        ],
-        axis=1,
-    )
-    return features @ state.wout
-
-
-def _nb_ensemble_frozen_probe_logits(
-    params: dict[str, Array],
-    state: Any,
-    observation: Array,
-    hyperparameters: Mapping[str, float],
-) -> Array:
-    """Evaluate the deployed champion lock or accuracy-weighted member mixture."""
-    if not isinstance(state, NBEnsembleState):
-        raise TypeError("an nb_ensemble frozen probe requires NBEnsembleState")
-    normalized = _ema_frozen_probe_input(state.net, observation, hyperparameters)
-    network_logits = mlp_logits(params, normalized)
-    if hyperparameters["ens_lock_network"] != 0.0:
-        return network_logits
-
-    member_log_probabilities = [
-        jax.nn.log_softmax(network_logits),
-        jax.nn.log_softmax(
-            jax.vmap(lambda x: naive_bayes_logits(state.nb, x))(observation)
-        ),
-    ]
-    if hyperparameters["ens_use_rls"] != 0.0:
-        if state.rls is None:
-            raise TypeError("an RLS-enabled nb_ensemble probe requires its RLS state")
-        rls_logits = _lin_rls_frozen_probe_logits(
-            params, state.rls, observation, hyperparameters
-        )
-        member_log_probabilities.append(jax.nn.log_softmax(rls_logits))
-    log_weights = jax.nn.log_softmax(
-        hyperparameters["ens_beta"] * state.member_acc
-    )
-    return jax.nn.log_softmax(
-        jax.nn.logsumexp(
-            jnp.stack(member_log_probabilities) + log_weights[:, None, None],
-            axis=0,
-        )
+    ``rff_rls`` never trains the protocol MLP — its deployed model is the
+    frozen random projection plus the RLS readout.  The probe harness scores
+    ``mlp_logits`` on the (untouched, randomly initialized) MLP params, so
+    any input transform here would silently probe a model that does not
+    exist.  Fail closed, exactly like :func:`_hidden_rms_frozen_probe_input`,
+    so merge/reporting can never emit a meaningless plasticity/retention
+    number for this arm.
+    """
+    del state, observation, hyperparameters
+    raise NotImplementedError(
+        "sentinel probes are unsupported for the rff_rls arm: there is no "
+        "trained protocol MLP to probe (the deployed model is the frozen "
+        "random-features + RLS readout)"
     )
 
 
@@ -4959,21 +5304,16 @@ class ScreeningSpec:
         frozen_probe_input: Applies the learner's current input preprocessing
             without updating its state.  Raw-input learners use the identity
             transform; adaptive normalizers must opt in explicitly.
-        frozen_probe_logits: Optional arm-specific deployed forward pass for
-            learners that cannot be represented as input preprocessing plus
-            the protocol MLP. ``None`` uses ``frozen_probe_input`` followed by
-            :func:`mlp_logits`.
     """
 
     name: str
     base_learner: str
     mechanism: str
-    hyperparameters: Mapping[str, float]
+    hyperparameters: dict[str, float]
     factory: Callable[[Mapping[str, float]], tuple[LearnerInitFn, ScreeningStepFn]]
     description: str = ""
     noise_update: NoiseUpdateFn | None = None
     frozen_probe_input: FrozenProbeInputFn = _raw_frozen_probe_input
-    frozen_probe_logits: FrozenProbeLogitsFn | None = None
 
 
 def _upgd_hp(**overrides: float) -> dict[str, float]:
@@ -5222,7 +5562,7 @@ def _build_registry() -> dict[str, ScreeningSpec]:
             mechanism="hidden_normalization",
             hyperparameters=_sigma0_ext_hp(hidden_rms=1.0, hidden_rms_epsilon=1e-8),
             factory=_make_upgd_ema_norm_ext_learner,
-            frozen_probe_logits=_hidden_rms_frozen_probe_logits,
+            frozen_probe_input=_hidden_rms_frozen_probe_input,
             description=(
                 "upgd_ema_norm_sigma0 plus stateless per-example RMS "
                 "normalization of both hidden ReLU layers (no learnable "
@@ -5466,6 +5806,23 @@ def _build_registry() -> dict[str, ScreeningSpec]:
                 ),
             )
         )
+    specs.append(
+        ScreeningSpec(
+            name="sigma0_ndecay099_gated_l2init",
+            base_learner="upgd_w",
+            mechanism="gated_l2_init",
+            hyperparameters=_sigma0_ext_hp(norm_decay=0.99, l2init_pull_scale=0.01),
+            factory=_make_sigma0_gated_l2init_learner,
+            frozen_probe_input=_ema_frozen_probe_input,
+            description=(
+                "sigma0_ndecay099 historical baseline plus an additive utility-gated pull "
+                "toward init (CCBP/Calibrated-Partial-Resets-style graded reset; "
+                "l2init_pull_scale=0.01, matching the repo's established L2-Init "
+                "regularization strength); l2init_pull_scale=0 reduces bit-exactly "
+                "to the baseline."
+            ),
+        )
+    )
     # --- Wave 8: update-rule family swaps under the sigma0_ndecay099 champion's
     # conditioning (EMA input normalizer decay 0.99 + the exact UPGD utility
     # gate, no perturbation).  Only the descent direction changes per arm.
@@ -5703,7 +6060,7 @@ def _build_registry() -> dict[str, ScreeningSpec]:
                 mechanism="discovered_rule",
                 hyperparameters=_discovered_rule_hp(**disc_hp),
                 factory=_make_discovered_rule_learner,
-                frozen_probe_input=_ema_frozen_probe_input,
+                frozen_probe_input=_discovered_rule_frozen_probe_input(disc_hp),
                 description=disc_description,
             )
         )
@@ -5732,7 +6089,9 @@ def _build_registry() -> dict[str, ScreeningSpec]:
                     surprise_slow=0.9996305719081341,
                 ),
                 factory=_make_discovered_rule_learner,
-                frozen_probe_input=_ema_frozen_probe_input,
+                frozen_probe_input=_discovered_rule_frozen_probe_input(
+                    {"flag_hidden_rms": diag_rms}
+                ),
                 description=(
                     "disc_r1 structure at champion-scale constants "
                     f"({diag_axis}): shift-adaptive norm + surprise-gated "
@@ -5761,7 +6120,7 @@ def _build_registry() -> dict[str, ScreeningSpec]:
                 "noise_std": 0.0,
             },
             factory=_make_rff_rls_learner,
-            frozen_probe_logits=_rff_rls_frozen_probe_logits,
+            frozen_probe_input=_rff_frozen_probe_input,
             description=(
                 "No-backprop tracking control: champion EMA input normalizer "
                 "(decay 0.99), z-scores clipped to +/-3, frozen random "
@@ -5789,7 +6148,7 @@ def _build_registry() -> dict[str, ScreeningSpec]:
                 "noise_std": 0.0,
             },
             factory=_make_lin_rls_learner,
-            frozen_probe_logits=_lin_rls_frozen_probe_logits,
+            frozen_probe_input=_rff_frozen_probe_input,
             description=(
                 "Linear floor of the tracking control: champion EMA input "
                 "normalizer, z-scores clipped to +/-3 and scaled by "
@@ -5814,7 +6173,7 @@ def _build_registry() -> dict[str, ScreeningSpec]:
                 "noise_std": 0.0,
             },
             factory=_make_naive_bayes_learner,
-            frozen_probe_logits=_naive_bayes_frozen_probe_logits,
+            frozen_probe_input=_naive_bayes_frozen_probe_input,
             description=(
                 "Streaming naive Bayes (V3 development validation): online "
                 "class-conditional diagonal Gaussians with annealed "
@@ -5860,7 +6219,7 @@ def _build_registry() -> dict[str, ScreeningSpec]:
                 mechanism="transient_ensemble",
                 hyperparameters=_nb_ensemble_hp(**ens_overrides),
                 factory=_make_nb_ensemble_learner,
-                frozen_probe_logits=_nb_ensemble_frozen_probe_logits,
+                frozen_probe_input=_nb_ensemble_frozen_probe_input,
                 description=(
                     "Adaptive champion/NB ensemble (transient attack): "
                     "accuracy-weighted probability mixture with online vote "
@@ -5949,6 +6308,26 @@ def _build_registry() -> dict[str, ScreeningSpec]:
             "residual-driven body on the wind-up-immune head (probe c "
             "rerun on the stable configuration)",
         ),
+        (
+            "rls_head_resid_l1_noreset",
+            {"rls_lambda": 1.0, "rls_reset_frac": 2.0, "head_resid": 1.0},
+            "code-only issue-#184 endpoint: the standing residual-trained "
+            "incumbent with detector-driven covariance resets disabled; "
+            "this registry entry has no result artifact and does not "
+            "authorize execution",
+        ),
+        (
+            "rls_head_resid_l1_preset005_nogate",
+            {
+                "rls_lambda": 1.0,
+                "rls_reset_frac": 0.05,
+                "head_resid": 1.0,
+                "gate_scale": 0.0,
+            },
+            "issue #52's preregistered gate ablation of the standing "
+            "residual-trained incumbent: plain decayed SGD on the body, "
+            "with no utility EMA, bias correction, or sigmoid gate",
+        ),
         # Wave 3 — ridge star.  2-task seed-0 diagnostic: the initial/reset
         # ridge is the head's convergence-speed knob (P0 = I/ridge bounds
         # the earliest gains); means .8328/.8465/.8530/.8578/.8596 for
@@ -5994,6 +6373,11 @@ def _build_registry() -> dict[str, ScreeningSpec]:
             "probe on the residual loop)",
         ),
     ):
+        body_update = (
+            "plain decayed residual SGD (utility bookkeeping removed)"
+            if rls_overrides.get("gate_scale", 1.0) == 0.0
+            else "utility-gated sigma-0 SGD"
+        )
         specs.append(
             ScreeningSpec(
                 name=rls_name,
@@ -6001,10 +6385,11 @@ def _build_registry() -> dict[str, ScreeningSpec]:
                 mechanism="rls_readout",
                 hyperparameters=_rls_head_hp(**rls_overrides),
                 factory=_make_rls_head_learner,
-                frozen_probe_logits=_rls_head_frozen_probe_logits,
+                frozen_probe_input=_rls_head_frozen_probe_input,
                 description=(
                     "Champion body (shift-adaptive EMA-norm d099 + "
-                    "utility-gated sigma-0 SGD) with a streaming-RLS "
+                    + body_update
+                    + ") with a streaming-RLS "
                     "one-hot readout on the bias-augmented 150-dim "
                     "penultimate features — " + rls_extra + ". One-hot LS "
                     "regression + argmax by design (softmax/logistic "
@@ -6012,6 +6397,23 @@ def _build_registry() -> dict[str, ScreeningSpec]:
                 ),
             )
         )
+    specs.append(
+        ScreeningSpec(
+            name="rls_head_resid_l1_preset005_l2init",
+            base_learner="upgd_w",
+            mechanism="rls_readout",
+            hyperparameters=_rls_head_l2init_hp(),
+            factory=_make_rls_head_l2init_learner,
+            frozen_probe_input=_rls_head_frozen_probe_input,
+            description=(
+                "Code-only issue-#14 endpoint: the exact "
+                "rls_head_resid_l1_preset005 incumbent with decoupled "
+                "L2-to-initialization on w1/b1/w2/b2 only; w3/b3 and the "
+                "RLS recursion are unchanged. This registry entry has no "
+                "result artifact and does not authorize execution."
+            ),
+        )
+    )
     # --- Optimizer-floor hybrid wave (section (s) factories): Adam-class
     # step adaptation under the champion's full stability package.  The
     # naive composition adamw_cbp_ema_norm proved Adam-class task-1
@@ -6259,20 +6661,7 @@ def _build_registry() -> dict[str, ScreeningSpec]:
             ),
         )
     )
-    return {
-        spec.name: ScreeningSpec(
-            name=spec.name,
-            base_learner=spec.base_learner,
-            mechanism=spec.mechanism,
-            hyperparameters=MappingProxyType(dict(spec.hyperparameters)),
-            factory=spec.factory,
-            description=spec.description,
-            noise_update=spec.noise_update,
-            frozen_probe_input=spec.frozen_probe_input,
-            frozen_probe_logits=spec.frozen_probe_logits,
-        )
-        for spec in specs
-    }
+    return {spec.name: spec for spec in specs}
 
 
 SCREENING_REGISTRY: Mapping[str, ScreeningSpec] = MappingProxyType(_build_registry())
@@ -6288,13 +6677,72 @@ def screening_spec(name: str) -> ScreeningSpec:
     return SCREENING_REGISTRY[name]
 
 
+def _validated_screening_noise_mode(
+    noise_mode: object,
+    spec: ScreeningSpec,
+    *,
+    context: Path | str | None = None,
+) -> str:
+    """Validate one screening noise mode against the named arm's runner contract."""
+    prefix = "" if context is None else f"{context}: "
+    if not isinstance(noise_mode, str) or noise_mode not in ("step", "pool"):
+        raise ValueError(
+            f"{prefix}noise_mode must be 'step' or 'pool', got {noise_mode!r}"
+        )
+    if noise_mode == "pool" and spec.noise_update is None:
+        raise ValueError(
+            f"{prefix}noise_mode='pool' is unsupported for {spec.name!r}: the arm "
+            "declares no noise-consuming update"
+        )
+    return noise_mode
+
+
+def _validated_screening_noise_pool_steps(
+    noise_mode: str,
+    noise_pool_steps: object,
+    *,
+    context: Path | str | None = None,
+    allow_unrecorded_pool: bool = False,
+) -> int | None:
+    """Return the effective pool-size contract for one screening run or shard.
+
+    Exact step-mode runs do not consume a noise pool, so their canonical
+    effective value is ``None``.  This also keeps pre-pool legacy shards,
+    which omit both fields, readable as exact step-mode runs.  A loader may
+    preserve an omitted pool size as unknown so historical files remain
+    inspectable, but new results must record it and downstream merges refuse
+    the unknown value.  Inferring the historical default would relabel any
+    old custom-size run and recreate the ambiguity this provenance field
+    closes.
+    """
+    prefix = "" if context is None else f"{context}: "
+    if noise_mode == "step":
+        if noise_pool_steps is not _MISSING_NOISE_POOL_STEPS and noise_pool_steps is not None:
+            raise ValueError(
+                f"{prefix}noise_pool_steps must be null or absent when "
+                "noise_mode='step'"
+            )
+        return None
+    if noise_pool_steps is _MISSING_NOISE_POOL_STEPS:
+        if allow_unrecorded_pool:
+            return None
+        raise ValueError(
+            f"{prefix}noise_pool_steps must be recorded when noise_mode='pool'"
+        )
+    if type(noise_pool_steps) is not int or noise_pool_steps < 2:
+        raise ValueError(
+            f"{prefix}noise_pool_steps must be recorded as a built-in integer >= 2 "
+            "when noise_mode='pool'"
+        )
+    return noise_pool_steps
+
+
 # =============================================================================
 # Development-only recurring A/B/A retention adapter
 # =============================================================================
 
 
 RECURRING_IPMNIST_ADAPTER_SCHEMA = "alberta.ipmnist-screening.recurring-adapter.v1"
-_MAX_UINT32 = 2**32 - 1
 
 
 def _canonical_hash_array(array: object) -> np.ndarray:
@@ -6322,472 +6770,395 @@ def _array_bundle_sha256(domain: str, arrays: Mapping[str, object]) -> str:
         digest.update(encoded_name)
         digest.update(len(header).to_bytes(8, "little"))
         digest.update(header)
-        payload = array.tobytes(order="C")
-        digest.update(len(payload).to_bytes(8, "little"))
-        digest.update(payload)
+        digest.update(array.nbytes.to_bytes(8, "little"))
+        digest.update(memoryview(array).cast("B"))
     return digest.hexdigest()
 
 
-def _canonical_json_bytes(value: object) -> bytes:
-    """Encode a value as strict canonical JSON, preserving JSON scalar types."""
-    return json.dumps(
-        value,
-        allow_nan=False,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8")
-
-
-def _canonical_json_equal(left: object, right: object) -> bool:
-    """Compare JSON identities without Python's bool/numeric equality aliases."""
-    try:
-        return _canonical_json_bytes(left) == _canonical_json_bytes(right)
-    except (TypeError, ValueError):
-        return False
-
-
-def _same_typed_value(left: object, right: object) -> bool:
-    """Compare a JSON-like in-memory value while preserving Python scalar types."""
-    if type(left) is not type(right):
-        return False
-    if isinstance(left, dict) and isinstance(right, dict):
-        return left.keys() == right.keys() and all(
-            _same_typed_value(left[key], right[key]) for key in left
-        )
-    if isinstance(left, (list, tuple)) and isinstance(right, (list, tuple)):
-        return len(left) == len(right) and all(
-            _same_typed_value(a, b) for a, b in zip(left, right, strict=True)
-        )
-    return bool(left == right)
-
-
-def canonical_json_sha256(value: object) -> str:
-    """Return the SHA-256 of strict canonical JSON for ``value``."""
-    return hashlib.sha256(_canonical_json_bytes(value)).hexdigest()
-
-
-def _content_for_digest(payload: Mapping[str, object]) -> dict[str, object]:
-    """Select the v2 integrity-bound portion of a shard or summary."""
-    return {
-        key: value
-        for key, value in payload.items()
-        if key != "content_digest"
-    }
-
-
-def screening_content_sha256(payload: Mapping[str, object]) -> str:
-    """Digest the canonical integrity-bound content of a v2 document."""
-    return canonical_json_sha256(_content_for_digest(payload))
-
-
-def _callable_binding_value_identity(
-    value: object,
-    *,
-    active_functions: set[int],
-) -> object:
-    """Normalize one behavior-bearing function binding without using repr()."""
-    if value is None or type(value) in {bool, int, str}:
-        return value
-    if type(value) is float:
-        if not math.isfinite(value):
-            raise TypeError("callback bindings must not contain non-finite floats")
-        return value
-    if isinstance(value, FunctionType):
-        return {
-            "kind": "function",
-            "identity": _function_identity(
-                value,
-                active_functions=active_functions,
-            ),
-        }
-    raise TypeError(
-        "callback defaults and closure cells must contain only finite JSON "
-        "scalars or plain Python functions"
+def _is_lower_hex(value: object, length: int) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == length
+        and all(character in "0123456789abcdef" for character in value)
     )
 
 
-def _code_constant_identity(value: object) -> dict[str, object]:
-    """Normalize a Python code constant without paths or source positions."""
-    if value is None:
-        return {"kind": "none"}
-    if value is Ellipsis:
-        return {"kind": "ellipsis"}
-    if type(value) is bool:
-        return {"kind": "bool", "value": value}
-    if type(value) is int:
-        return {"kind": "int", "value": value}
-    if type(value) is float:
-        return {"kind": "float", "hex": value.hex()}
-    if type(value) is complex:
-        return {
-            "kind": "complex",
-            "real_hex": value.real.hex(),
-            "imag_hex": value.imag.hex(),
-        }
-    if isinstance(value, str):
-        return {"kind": "str", "value": value}
-    if isinstance(value, bytes):
-        return {"kind": "bytes", "hex": value.hex()}
-    if isinstance(value, tuple):
-        return {
-            "kind": "tuple",
-            "items": [_code_constant_identity(item) for item in value],
-        }
-    if isinstance(value, frozenset):
-        items = [_code_constant_identity(item) for item in value]
-        items.sort(key=_canonical_json_bytes)
-        return {"kind": "frozenset", "items": items}
-    if isinstance(value, CodeType):
-        return {"kind": "code", "value": _normalized_code_identity(value)}
-    raise TypeError(f"unsupported Python code constant type: {type(value)!r}")
-
-
-def _normalized_code_identity(code: CodeType) -> dict[str, object]:
-    """Return behavior-bearing code structure, excluding path/line metadata."""
-    return {
-        "argcount": code.co_argcount,
-        "posonlyargcount": code.co_posonlyargcount,
-        "kwonlyargcount": code.co_kwonlyargcount,
-        "nlocals": code.co_nlocals,
-        "stacksize": code.co_stacksize,
-        "flags": code.co_flags,
-        "code_hex": code.co_code.hex(),
-        "exceptiontable_hex": code.co_exceptiontable.hex(),
-        "consts": [_code_constant_identity(value) for value in code.co_consts],
-        "names": list(code.co_names),
-        "varnames": list(code.co_varnames),
-        "freevars": list(code.co_freevars),
-        "cellvars": list(code.co_cellvars),
-        "name": code.co_name,
-        "qualname": code.co_qualname,
-    }
-
-
-def _code_digest(code: CodeType) -> dict[str, str]:
-    return {
-        "algorithm": "sha256",
-        "normalization": "python-code-structural-no-paths-lines.v1",
-        "sha256": canonical_json_sha256(_normalized_code_identity(code)),
-    }
-
-
-def _function_identity(
-    callback: FunctionType,
-    *,
-    active_functions: set[int],
-) -> dict[str, object]:
-    """Describe a plain function's name and runtime-bound defaults/closure."""
-    callback_id = id(callback)
-    if callback_id in active_functions:
-        raise TypeError("recursive callback closure identities are unsupported")
-    active_functions.add(callback_id)
+def _git_capture(repo_root: Path, *args: str) -> bytes:
     try:
-        module = callback.__module__
-        qualname = callback.__qualname__
-        if not isinstance(module, str) or not isinstance(qualname, str):
-            raise TypeError("registered callbacks must expose module and qualname identities")
-        module_object = sys.modules.get(module)
-        if module_object is None or callback.__globals__ is not vars(module_object):
-            raise TypeError(
-                "registered callback must originate from its canonical module namespace"
-            )
-        defaults = callback.__defaults__
-        kwdefaults = callback.__kwdefaults__
-        closure = callback.__closure__ or ()
-        if len(callback.__code__.co_freevars) != len(closure):
-            raise TypeError("registered callback closure metadata is inconsistent")
-        closure_identity: list[dict[str, object]] = []
-        for name, cell in zip(callback.__code__.co_freevars, closure, strict=True):
-            try:
-                cell_value = cell.cell_contents
-            except ValueError as exc:
-                raise TypeError("registered callback contains an empty closure cell") from exc
-            closure_identity.append(
-                {
-                    "name": name,
-                    "value": _callable_binding_value_identity(
-                        cell_value,
-                        active_functions=active_functions,
-                    ),
-                }
-            )
-        return {
-            "binding": "python-function-code-name-defaults-closure.v1",
-            "module": module,
-            "qualname": qualname,
-            "globals_origin": "exact-sys.modules-module-namespace",
-            "code": _code_digest(callback.__code__),
-            "defaults": (
-                None
-                if defaults is None
-                else [
-                    _callable_binding_value_identity(
-                        value,
-                        active_functions=active_functions,
-                    )
-                    for value in defaults
-                ]
-            ),
-            "kwdefaults": (
-                None
-                if kwdefaults is None
-                else {
-                    name: _callable_binding_value_identity(
-                        value,
-                        active_functions=active_functions,
-                    )
-                    for name, value in sorted(kwdefaults.items())
-                }
-            ),
-            "closure": closure_identity,
-        }
-    finally:
-        active_functions.remove(callback_id)
-
-
-def _callable_identity(callback: object | None) -> dict[str, object] | None:
-    """Bind a registered plain function, including defaults and closure cells."""
-    if callback is None:
-        return None
-    if not isinstance(callback, FunctionType):
-        raise TypeError("registered callbacks must be plain Python functions")
-    return _function_identity(callback, active_functions=set())
-
-
-def screening_arm_definition(spec: ScreeningSpec) -> dict[str, object]:
-    """Return the exact JSON arm definition committed by v2 shards."""
-    return {
-        "name": spec.name,
-        "base_learner": spec.base_learner,
-        "mechanism": spec.mechanism,
-        "hyperparameters": dict(spec.hyperparameters),
-        "description": spec.description,
-        "factory": _callable_identity(spec.factory),
-        "noise_update": _callable_identity(spec.noise_update),
-        "frozen_probe_input": _callable_identity(spec.frozen_probe_input),
-        "frozen_probe_logits": _callable_identity(spec.frozen_probe_logits),
-    }
-
-
-def screening_arm_fingerprint(spec: ScreeningSpec) -> str:
-    """Return the canonical fingerprint of one exact registered arm."""
-    return canonical_json_sha256(screening_arm_definition(spec))
-
-
-def _screening_rng_contract_for_environment(
-    environment: Mapping[str, object],
-) -> dict[str, object]:
-    """Bind the RNG derivation contract to output-affecting JAX switches."""
-    resolved = json.loads(json.dumps(_RNG_CONTRACT, allow_nan=False))
-    assert isinstance(resolved, dict)
-    resolved["jax_runtime_config"] = {
-        "jax_default_prng_impl": environment["jax_default_prng_impl"],
-        "jax_random_seed_offset": environment["jax_random_seed_offset"],
-        "jax_threefry_partitionable": environment["jax_threefry_partitionable"],
-        "jax_disable_jit": environment["jax_disable_jit"],
-    }
-    return resolved
-
-
-def screening_rng_contract() -> dict[str, object]:
-    """Return the v2 RNG contract for the effective JAX runtime settings."""
-    return _screening_rng_contract_for_environment(_screening_environment_identity())
-
-
-def _capture_source_snapshot(
-    *,
-    repo_root: Path,
-    package_name: str = "alberta_framework",
-    explicit_extras: Sequence[Path] = (),
-) -> dict[Path, bytes]:
-    """Read every package Python file plus explicit extras, rejecting symlinks."""
-    root = repo_root.resolve(strict=True)
-    package_root = root / package_name
-    if not package_root.is_dir():
-        raise FileNotFoundError(f"source package is missing: {package_root}")
-    symlinks = [path for path in package_root.rglob("*") if path.is_symlink()]
-    if symlinks:
-        raise ValueError(
-            "screening source inventory refuses symlinks: "
-            + ", ".join(sorted(path.as_posix() for path in symlinks))
+        completed = subprocess.run(
+            ("git", "-C", str(repo_root), *args),
+            check=False,
+            capture_output=True,
         )
-    candidates = {
-        path.relative_to(root)
-        for path in package_root.rglob("*.py")
-        if path.is_file()
+    except OSError as exc:
+        raise RuntimeError(
+            "screening source provenance requires an available Git repository"
+        ) from exc
+    if completed.returncode != 0:
+        detail = completed.stderr.decode("utf-8", errors="replace").strip()
+        suffix = f": {detail}" if detail else ""
+        raise RuntimeError(
+            "screening source provenance requires an available Git repository" + suffix
+        )
+    return completed.stdout
+
+
+def _source_scope_status(repo_root: Path) -> bytes:
+    return _git_capture(
+        repo_root,
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "--untracked-files=all",
+        "--",
+        *_SOURCE_SCOPE,
+    )
+
+
+def _tracked_worktree_status(repo_root: Path) -> bytes:
+    return _git_capture(
+        repo_root,
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "--untracked-files=no",
+    )
+
+
+def _untracked_python_sources(repo_root: Path) -> bytes:
+    return _git_capture(
+        repo_root,
+        "ls-files",
+        "-z",
+        "--others",
+        "--exclude-standard",
+        "--",
+        "*.py",
+        "*.pyc",
+    )
+
+
+def _ignored_python_sources(repo_root: Path) -> bytes:
+    raw = _git_capture(
+        repo_root,
+        "ls-files",
+        "-z",
+        "--others",
+        "--ignored",
+        "--exclude-standard",
+        "--",
+        "*.py",
+        "*.pyc",
+    )
+    unsafe: list[bytes] = []
+    for entry in raw.split(b"\0"):
+        parts = entry.split(b"/")
+        if not entry or parts[0] in {b".venv", b"outputs"} or b"__pycache__" in parts:
+            continue
+        unsafe.append(entry)
+    return b"\0".join(unsafe)
+
+
+def _tracked_index_flags(repo_root: Path) -> bytes:
+    return _git_capture(repo_root, "ls-files", "-v", "-z")
+
+
+def _head_source_blobs(raw_tree: bytes) -> dict[Path, str]:
+    blobs: dict[Path, str] = {}
+    try:
+        for raw_entry in raw_tree.split(b"\0"):
+            if not raw_entry:
+                continue
+            metadata, raw_path = raw_entry.split(b"\t", 1)
+            _mode, object_type, object_id = metadata.split(b" ", 2)
+            if object_type != b"blob":
+                raise ValueError("non-blob source object")
+            path = Path(os.fsdecode(raw_path))
+            object_id_text = object_id.decode("ascii")
+            if not _is_lower_hex(object_id_text, 40):
+                raise ValueError("noncanonical source blob ID")
+            blobs[path] = object_id_text
+    except (UnicodeError, ValueError) as exc:
+        raise RuntimeError("screening source provenance could not parse the HEAD tree") from exc
+    return blobs
+
+
+def _screening_source_provenance(repo_root: Path | None = None) -> dict[str, object]:
+    """Bind a clean checkout and the actual package/lock bytes used by a run.
+
+    The cleanliness scope intentionally excludes ``outputs/`` so sequential workers can
+    append immutable shards. Any tracked change in the package/lock scope, including a
+    staged change, is rejected. Untracked or ignored package files are found independently
+    of Git status so an importable local module cannot evade the receipt.
+    """
+    requested_root = _REPO_ROOT if repo_root is None else Path(repo_root)
+    try:
+        root = requested_root.resolve(strict=True)
+    except OSError as exc:
+        raise RuntimeError(
+            "screening source provenance requires an available Git repository"
+        ) from exc
+    top_level_raw = _git_capture(root, "rev-parse", "--show-toplevel")
+    try:
+        top_level = Path(top_level_raw.decode("utf-8").strip()).resolve(strict=True)
+    except (OSError, UnicodeError) as exc:
+        raise RuntimeError(
+            "screening source provenance could not resolve the Git repository"
+        ) from exc
+    if top_level != root:
+        raise RuntimeError(
+            f"screening source provenance root {root} is not the Git top level {top_level}"
+        )
+
+    if _tracked_worktree_status(root):
+        raise RuntimeError("screening source worktree is not clean: tracked files changed")
+    if (
+        _source_scope_status(root)
+        or _untracked_python_sources(root)
+        or _ignored_python_sources(root)
+    ):
+        raise RuntimeError(
+            "screening source worktree is not clean: untracked Python/package source "
+            "or source-scope file"
+        )
+
+    index_flags = _tracked_index_flags(root)
+    if any(
+        not entry.startswith(b"H ")
+        for entry in index_flags.split(b"\0")
+        if entry
+    ):
+        raise RuntimeError(
+            "screening source worktree is not clean: tracked index flags can hide changes"
+        )
+
+    commit = _git_capture(root, "rev-parse", "--verify", "HEAD").decode("ascii").strip()
+    tree = _git_capture(root, "rev-parse", "--verify", "HEAD^{tree}").decode("ascii").strip()
+    object_format = _git_capture(root, "rev-parse", "--show-object-format").decode(
+        "ascii"
+    ).strip()
+    if object_format != "sha1" or not _is_lower_hex(commit, 40) or not _is_lower_hex(tree, 40):
+        raise RuntimeError("screening source provenance requires canonical SHA-1 Git identities")
+
+    tracked_raw = _git_capture(root, "ls-files", "-z", "--", *_SOURCE_SCOPE)
+    head_tree_raw = _git_capture(root, "ls-tree", "-r", "-z", "HEAD", "--", *_SOURCE_SCOPE)
+    try:
+        tracked = tuple(
+            sorted(
+                Path(os.fsdecode(raw))
+                for raw in tracked_raw.split(b"\0")
+                if raw
+            )
+        )
+    except UnicodeError as exc:
+        raise RuntimeError("screening source provenance requires UTF-8 source paths") from exc
+    head_blobs = _head_source_blobs(head_tree_raw)
+    if set(tracked) != set(head_blobs):
+        raise RuntimeError("screening source inventory does not exactly match HEAD")
+    required = {
+        Path("pyproject.toml"),
+        Path("uv.lock"),
+        Path("alberta_framework/benchmarks/ipmnist_screening.py"),
     }
-    candidates.update(explicit_extras)
-    snapshot: dict[Path, bytes] = {}
-    for relative in sorted(candidates, key=lambda path: path.as_posix()):
+    if not required.issubset(tracked):
+        missing = sorted(path.as_posix() for path in required.difference(tracked))
+        raise RuntimeError(
+            f"screening source provenance is missing tracked source files: {missing}"
+        )
+
+    tracked_set = set(tracked)
+    package_root = root / "alberta_framework"
+    for candidate in package_root.rglob("*"):
+        relative = candidate.relative_to(root)
+        if "__pycache__" in relative.parts:
+            continue
+        if (candidate.is_file() or candidate.is_symlink()) and relative not in tracked_set:
+            raise RuntimeError(
+                "screening source worktree is not clean: untracked package source "
+                f"{relative.as_posix()}"
+            )
+
+    digest = hashlib.sha256()
+    digest.update(b"alberta.ipmnist_screening.relevant_source.v1\0")
+    uv_lock_sha256: str | None = None
+    for relative in tracked:
         if relative.is_absolute() or ".." in relative.parts:
-            raise ValueError(f"source inventory path is not repository-relative: {relative}")
-        candidate = root / relative
-        if candidate.is_symlink():
-            raise ValueError(f"screening source inventory refuses symlink: {relative}")
-        resolved = candidate.resolve(strict=True)
+            raise RuntimeError(f"invalid tracked source path {relative}")
+        source_path = root / relative
+        if source_path.is_symlink() or not source_path.is_file():
+            raise RuntimeError(f"tracked source is unavailable or not a regular file: {relative}")
         try:
-            resolved.relative_to(root)
-        except ValueError as exc:
-            raise ValueError(
-                f"source inventory path escapes repository root: {relative}"
-            ) from exc
-        if not resolved.is_file():
-            raise ValueError(f"source inventory path is not a file: {relative}")
-        snapshot[relative] = resolved.read_bytes()
-    return snapshot
+            contents = source_path.read_bytes()
+            encoded_path = relative.as_posix().encode("utf-8")
+        except (OSError, UnicodeError) as exc:
+            raise RuntimeError(f"could not read tracked source bytes: {relative}") from exc
+        git_blob_digest = hashlib.sha1(
+            b"blob " + str(len(contents)).encode("ascii") + b"\0" + contents,
+            usedforsecurity=False,
+        ).hexdigest()
+        if git_blob_digest != head_blobs[relative]:
+            raise RuntimeError(
+                f"screening source worktree is not clean: {relative} differs from HEAD"
+            )
+        digest.update(len(encoded_path).to_bytes(4, "little"))
+        digest.update(encoded_path)
+        digest.update(len(contents).to_bytes(8, "little"))
+        digest.update(contents)
+        if relative == Path("uv.lock"):
+            uv_lock_sha256 = hashlib.sha256(contents).hexdigest()
 
-
-def _available_source_extras() -> tuple[Path, ...]:
-    return tuple(
-        path
-        for path in _CHECKOUT_SOURCE_EXTRA_CANDIDATES
-        if (_REPO_ROOT / path).is_file()
+    if uv_lock_sha256 is None:
+        raise RuntimeError("screening source provenance could not bind uv.lock")
+    final_identity = (
+        _git_capture(root, "rev-parse", "--verify", "HEAD").decode("ascii").strip(),
+        _git_capture(root, "rev-parse", "--verify", "HEAD^{tree}").decode("ascii").strip(),
+        _git_capture(root, "rev-parse", "--show-object-format").decode("ascii").strip(),
     )
-
-
-def _dependency_identity(extras: Sequence[Path]) -> dict[str, object]:
-    """Bind dependency documents without claiming the active environment was verified."""
-    if Path("uv.lock") in extras:
-        return {
-            "mode": "checkout-dependency-lock-document",
-            "dependency_lock_document_bound": True,
-            "active_environment_matches_lock_attested": False,
-            "files": [path.as_posix() for path in extras],
-        }
+    final_inventory = _git_capture(root, "ls-files", "-z", "--", *_SOURCE_SCOPE)
+    final_head_tree = _git_capture(
+        root, "ls-tree", "-r", "-z", "HEAD", "--", *_SOURCE_SCOPE
+    )
+    if final_identity != (commit, tree, object_format):
+        raise RuntimeError("screening source identity changed while provenance was captured")
+    if final_inventory != tracked_raw or final_head_tree != head_tree_raw:
+        raise RuntimeError("screening source inventory changed while provenance was captured")
+    if (
+        _tracked_worktree_status(root)
+        or _source_scope_status(root)
+        or _untracked_python_sources(root)
+        or _ignored_python_sources(root)
+        or _tracked_index_flags(root) != index_flags
+    ):
+        raise RuntimeError("screening source files changed while provenance was captured")
     return {
-        "mode": "source-tree-without-associated-dependency-lock",
-        "dependency_lock_document_bound": False,
-        "active_environment_matches_lock_attested": False,
-        "files": [path.as_posix() for path in extras],
+        "schema": SOURCE_PROVENANCE_SCHEMA,
+        "git_commit": commit,
+        "git_tree": tree,
+        "git_object_format": object_format,
+        "relevant_source_scope": _SOURCE_SCOPE_LABEL,
+        "relevant_source_file_count": len(tracked),
+        "relevant_source_sha256": digest.hexdigest(),
+        "uv_lock_sha256": uv_lock_sha256,
+        "worktree_clean": True,
     }
 
 
-def screening_source_identity() -> dict[str, object]:
-    """Bind stable pre/post package-Python disk bytes, not loaded code."""
-    for _ in range(3):
-        extras = _available_source_extras()
-        try:
-            snapshot_before = _capture_source_snapshot(
-                repo_root=_REPO_ROOT,
-                explicit_extras=extras,
-            )
-            snapshot_after = _capture_source_snapshot(
-                repo_root=_REPO_ROOT,
-                explicit_extras=extras,
-            )
-        except OSError:
-            continue
-        if snapshot_before != snapshot_after or _available_source_extras() != extras:
-            continue
-        files = [
+def _screening_runtime_environment() -> dict[str, object]:
+    """Return the runtime contract that must stay fixed through a screening run."""
+    try:
+        package_versions = {
+            name: importlib.metadata.version(name)
+            for name in ("chex", "jax", "jaxlib", "numpy", "scikit-learn")
+        }
+        backend = jax.default_backend()
+        devices = [
             {
-                "path": relative.as_posix(),
-                "sha256": hashlib.sha256(raw).hexdigest(),
+                "id": int(device.id),
+                "platform": str(device.platform),
+                "device_kind": str(device.device_kind),
+                "process_index": int(device.process_index),
             }
-            for relative, raw in snapshot_after.items()
-        ]
-        identity: dict[str, object] = {
-            "scope": _SCREENING_SOURCE_SCOPE,
-            "capture_version": _SOURCE_CAPTURE_VERSION,
-            "package_root": "alberta_framework",
-            "explicit_source_extras": [
-                path.as_posix() for path in extras
-            ],
-            "dependency_identity": _dependency_identity(extras),
-            "whole_package_python_included": True,
-            "stable_double_capture": True,
-            "loaded_code_bytes_attested": False,
-            "execution_authenticated": False,
-            "files": files,
-        }
-        identity["sha256"] = canonical_json_sha256(identity)
-        return identity
-    raise RuntimeError("source tree changed while capturing screening source identity")
-
-
-def screening_dataset_identity(
-    features: np.ndarray | Array,
-    labels: np.ndarray | Array,
-) -> dict[str, object]:
-    """Bind the exact post-cast feature and label arrays consumed by a run."""
-    resolved_features = _canonical_hash_array(features)
-    resolved_labels = _canonical_hash_array(labels)
-    return {
-        "algorithm": "sha256",
-        "canonicalization": "array-bundle-little-endian-v1",
-        "provenance": "caller-supplied-post-cast-arrays",
-        "semantic_dataset_identity_attested": False,
-        "sha256": _array_bundle_sha256(
-            "alberta.ipmnist-screening.input-dataset.v1",
-            {"features": resolved_features, "labels": resolved_labels},
-        ),
-        "features": {
-            "dtype": resolved_features.dtype.name,
-            "shape": list(resolved_features.shape),
-        },
-        "labels": {
-            "dtype": resolved_labels.dtype.name,
-            "shape": list(resolved_labels.shape),
-        },
-    }
-
-
-def _json_safe_jax_config_value(value: object) -> object:
-    """Normalize one effective JAX config value with an explicit type rule."""
-    if value is None or type(value) in {bool, int, str}:
-        return value
-    if type(value) is float:
-        if not math.isfinite(value):
-            raise ValueError("effective JAX config contains a non-finite float")
-        return value
-    type_name = f"{type(value).__module__}.{type(value).__qualname__}"
-    if isinstance(value, enum.Enum):
-        return {
-            "kind": "enum",
-            "type": type_name,
-            "value": _json_safe_jax_config_value(value.value),
-        }
-    return {"kind": "object", "type": type_name, "string": str(value)}
-
-
-def _jax_config_values_identity() -> dict[str, object]:
-    """Capture every effective JAX config value in deterministic JSON form."""
-    return {
-        name: _json_safe_jax_config_value(value)
-        for name, value in sorted(jax.config.values.items())
-    }
-
-
-def _screening_environment_identity() -> dict[str, object]:
-    """Capture the execution environment inside the v2 digest boundary."""
-    return {
-        "jax": jax.__version__,
-        "jaxlib": importlib.metadata.version("jaxlib"),
-        "numpy": np.__version__,
-        "python": platform.python_version(),
-        "python_implementation": platform.python_implementation(),
-        "platform": platform.platform(),
-        "jax_backend": jax.default_backend(),
-        "jax_enable_x64": bool(jax.config.jax_enable_x64),
-        "jax_default_matmul_precision": _json_safe_jax_config_value(
-            jax.config.jax_default_matmul_precision
-        ),
-        "jax_default_prng_impl": str(jax.config.jax_default_prng_impl),
-        "jax_random_seed_offset": int(jax.config.jax_random_seed_offset),
-        "jax_threefry_partitionable": bool(jax.config.jax_threefry_partitionable),
-        "jax_disable_jit": bool(jax.config.jax_disable_jit),
-        "jax_disable_most_optimizations": bool(
-            jax.config.values["jax_disable_most_optimizations"]
-        ),
-        "jax_config_values": _jax_config_values_identity(),
-        "xla_flags": os.environ.get("XLA_FLAGS"),
-        "jax_platforms": os.environ.get("JAX_PLATFORMS"),
-        "devices": [
-            {"platform": device.platform, "device_kind": device.device_kind}
             for device in jax.devices()
-        ],
+        ]
+    except Exception as exc:
+        raise RuntimeError("screening runtime provenance is unavailable") from exc
+    if not devices:
+        raise RuntimeError("screening runtime provenance found no JAX devices")
+    return {
+        "schema": RUNTIME_SCHEMA,
+        "python": {
+            "implementation": platform.python_implementation(),
+            "version": platform.python_version(),
+        },
+        "platform": {
+            "system": platform.system(),
+            "release": platform.release(),
+            "machine": platform.machine(),
+        },
+        "packages": package_versions,
+        "jax": {
+            "backend": backend,
+            "devices": devices,
+            "config": {
+                "jax_enable_x64": bool(jax.config.jax_enable_x64),
+                "jax_default_matmul_precision": (
+                    None
+                    if jax.config.jax_default_matmul_precision is None
+                    else str(jax.config.jax_default_matmul_precision)
+                ),
+                "jax_disable_jit": bool(jax.config.jax_disable_jit),
+                "jax_numpy_dtype_promotion": str(jax.config.jax_numpy_dtype_promotion),
+                "jax_numpy_rank_promotion": str(jax.config.jax_numpy_rank_promotion),
+                "jax_random_seed_offset": int(jax.config.jax_random_seed_offset),
+                "jax_threefry_partitionable": bool(
+                    jax.config.jax_threefry_partitionable
+                ),
+                "jax_default_prng_impl": str(jax.config.jax_default_prng_impl),
+            },
+        },
+        "process_environment": {
+            name: os.environ.get(name) for name in _RUNTIME_ENVIRONMENT_KEYS
+        },
     }
+
+
+def _materialized_dataset_provenance(
+    data_x: object, data_y: object
+) -> dict[str, object]:
+    """Hash the exact effective float32 features and int32 labels consumed by JAX."""
+    raw_x = np.asarray(jax.device_get(data_x))
+    raw_y = np.asarray(jax.device_get(data_y))
+    if raw_x.dtype.kind not in {"f", "i", "u"} or raw_x.ndim != 2 or raw_x.size == 0:
+        raise ValueError("dataset features must be a non-empty rank-two numeric array")
+    if raw_y.dtype.kind not in {"i", "u"} or raw_y.ndim != 1:
+        raise ValueError("dataset labels must be a rank-one integer array")
+    if raw_x.shape[0] != raw_y.shape[0] or raw_y.size == 0:
+        raise ValueError("dataset feature and label rows must be non-empty and aligned")
+    int32_info = np.iinfo(np.int32)
+    if np.any(raw_y < int32_info.min) or np.any(raw_y > int32_info.max):
+        raise ValueError("dataset labels must be representable as int32")
+    effective_x = _canonical_hash_array(np.asarray(raw_x, dtype=np.float32))
+    effective_y = _canonical_hash_array(np.asarray(raw_y, dtype=np.int32))
+    if not np.all(np.isfinite(effective_x)):
+        raise ValueError("dataset features must remain finite after float32 materialization")
+    return {
+        "schema": DATASET_PROVENANCE_SCHEMA,
+        "source": dict(_DATASET_SOURCE),
+        "materialization": _DATASET_MATERIALIZATION,
+        "x": {
+            "dtype": effective_x.dtype.str,
+            "shape": list(effective_x.shape),
+            "sha256": _array_bundle_sha256(
+                "alberta.ipmnist_screening.materialized_x.v1", {"x": effective_x}
+            ),
+        },
+        "y": {
+            "dtype": effective_y.dtype.str,
+            "shape": list(effective_y.shape),
+            "sha256": _array_bundle_sha256(
+                "alberta.ipmnist_screening.materialized_y.v1", {"y": effective_y}
+            ),
+        },
+    }
+
+
+def _screening_dataset_provenance(
+    data_x: object, data_y: object
+) -> dict[str, object]:
+    """Bind and validate the frozen OpenML MNIST training materialization."""
+    provenance = _materialized_dataset_provenance(data_x, data_y)
+    x = np.asarray(jax.device_get(data_x), dtype=np.float32)
+    y = np.asarray(jax.device_get(data_y), dtype=np.int32)
+    if x.shape != (60_000, 784) or y.shape != (60_000,):
+        raise ValueError(
+            "screening dataset must materialize OpenML mnist_784 v1 rows 0:60000 "
+            "as x=(60000, 784) and y=(60000,)"
+        )
+    if np.any(x < -1.0) or np.any(x > 1.0):
+        raise ValueError("screening dataset features must use the frozen [-1, 1] scaling")
+    if np.any(y < 0) or np.any(y > 9):
+        raise ValueError("screening dataset labels must be in [0, 9]")
+    return provenance
 
 
 def _validated_permutation(permutation: object, *, input_dim: int) -> np.ndarray:
@@ -6834,9 +7205,7 @@ def _validated_recurring_phase_lengths(
 
 
 def _validated_recurring_seed(seed: int) -> int:
-    if not isinstance(seed, int) or isinstance(seed, bool) or not 0 <= seed <= _MAX_UINT32:
-        raise ValueError("seed must be a canonical uint32 integer")
-    return seed
+    return require_jax_seed(seed, name="seed")
 
 
 def build_recurring_ipmnist_online_indices(
@@ -6892,26 +7261,15 @@ def _validated_ipmnist_data(
     *,
     input_dim: int | None,
     n_classes: int | None,
+    min_length: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    raw_x = np.asarray(jax.device_get(data_x))
-    raw_y = np.asarray(jax.device_get(data_y))
-    if raw_x.ndim != 2:
-        raise ValueError("data_x must be a two-dimensional example matrix")
-    if input_dim is not None and raw_x.shape[1] != input_dim:
-        raise ValueError(f"data_x must have shape (n_train, {input_dim})")
-    if raw_y.shape != (raw_x.shape[0],):
-        raise ValueError("data_y must be (n_train,) aligned with data_x")
-    if raw_y.dtype.kind not in {"i", "u"}:
-        raise ValueError("data_y must contain integer class labels")
-    if np.any(raw_y < 0) or np.any(raw_y > np.iinfo(np.int32).max):
-        raise ValueError("data_y class labels must fit non-negative int32")
-    resolved_x = np.asarray(raw_x, dtype=np.float32)
-    resolved_y = np.asarray(raw_y, dtype=np.int32)
-    if not np.all(np.isfinite(resolved_x)):
-        raise ValueError("data_x must contain only finite values")
-    if n_classes is not None and np.any(resolved_y >= n_classes):
-        raise ValueError(f"data_y class labels must be smaller than {n_classes}")
-    return resolved_x, resolved_y
+    return validated_ipmnist_data(
+        data_x,
+        data_y,
+        input_dim=input_dim,
+        n_classes=n_classes,
+        min_length=min_length,
+    )
 
 
 def ipmnist_permutation_sha256(permutation: np.ndarray | Array) -> str:
@@ -7261,33 +7619,19 @@ def run_recurring_ipmnist_retention_development(
             sentinel_inputs = jnp.asarray(
                 resolved_x[indices][:, permutation], dtype=jnp.float32
             )
-            if spec.frozen_probe_logits is None:
-                model_inputs = spec.frozen_probe_input(
-                    state, sentinel_inputs, spec.hyperparameters
-                )
-                if model_inputs.shape != sentinel_inputs.shape:
-                    raise ValueError("frozen_probe_input must preserve sentinel input shape")
-                probe_logits = mlp_logits(params, model_inputs)
-            else:
-                probe_logits = spec.frozen_probe_logits(
-                    params, state, sentinel_inputs, spec.hyperparameters
-                )
-            state_hash_after = _declared_learner_state_sha256(params, state, key_noise)
-            if state_hash_after != state_hash_before:
-                raise ValueError("a frozen sentinel probe must not mutate learner state")
-            expected_logits_shape = (len(indices), config.n_classes)
-            if probe_logits.shape != expected_logits_shape:
-                raise ValueError(
-                    "frozen_probe_logits must return shape "
-                    f"{expected_logits_shape}, got {probe_logits.shape}"
-                )
-            logits = np.asarray(jax.device_get(probe_logits))
+            model_inputs = spec.frozen_probe_input(
+                state, sentinel_inputs, spec.hyperparameters
+            )
+            if model_inputs.shape != sentinel_inputs.shape:
+                raise ValueError("frozen_probe_input must preserve sentinel input shape")
+            logits = np.asarray(jax.device_get(mlp_logits(params, model_inputs)))
             if not np.all(np.isfinite(logits)):
                 raise ValueError("a frozen sentinel probe produced non-finite logits")
             correctness = tuple(
                 bool(value)
                 for value in np.asarray(np.argmax(logits, axis=-1) == sentinel_labels)
             )
+            state_hash_after = _declared_learner_state_sha256(params, state, key_noise)
             snapshots.append(
                 SentinelProbeSnapshot.from_requirement(
                     requirement,
@@ -7320,20 +7664,14 @@ class ScreeningRunResult:
     config_name: str
     base_learner: str
     hyperparameters: dict[str, float]
-    arm_definition: dict[str, object]
     seed: int
     config: IPMNISTConfig
-    input_dataset: dict[str, object]
-    source_identity: dict[str, object]
-    environment: dict[str, object]
-    rng_contract: dict[str, object]
     per_task_accuracy: np.ndarray
     per_task_loss: np.ndarray
     per_task_plasticity: np.ndarray
     wall_clock_seconds: float
     noise_mode: str = "step"
-    noise_pool_steps: int = 64
-    progress_every: int | None = None
+    noise_pool_steps: int | None = None
 
 
 def run_screening_config(
@@ -7358,57 +7696,32 @@ def run_screening_config(
     control arm reproduces the full lane's pool trajectories bit-for-bit
     (pinned by a unit test) -- but consumes ``spec.noise_update`` instead of
     the fixed UPGD-W equations. Pool shards are a screening-only
-    approximation: they record ``noise_mode`` and never merge with exact
-    shards nor pass proxy validation.
+    approximation: they record ``noise_mode`` and their effective
+    ``noise_pool_steps`` and never merge with exact shards nor pass proxy
+    validation.
     """
-    resolved_seed = _validated_recurring_seed(seed)
     if progress_every is not None and (
-        isinstance(progress_every, bool)
-        or not isinstance(progress_every, int)
-        or progress_every < 1
+        type(progress_every) is not int or progress_every <= 0
     ):
-        raise ValueError("progress_every must be None or a positive integer")
-    if noise_mode not in ("step", "pool"):
-        raise ValueError(f"noise_mode must be 'step' or 'pool', got {noise_mode!r}")
-    if (
-        isinstance(noise_pool_steps, bool)
-        or not isinstance(noise_pool_steps, int)
-        or noise_pool_steps < 2
-    ):
-        raise ValueError(f"noise_pool_steps must be an integer >= 2, got {noise_pool_steps!r}")
-    if noise_mode == "pool" and spec.noise_update is None:
-        raise ValueError(
-            f"noise_mode='pool' is unsupported for {spec.name!r}: the arm "
-            "declares no noise-consuming update"
-        )
-    data_x = jnp.asarray(data_x, dtype=jnp.float32)
-    raw_data_y = np.asarray(jax.device_get(data_y))
-    if raw_data_y.dtype.kind not in {"i", "u"}:
-        raise TypeError("data_y must contain integer labels")
-    data_y = jnp.asarray(raw_data_y, dtype=jnp.int32)
-    if data_x.ndim != 2 or data_x.shape[0] < 1 or data_x.shape[1] != config.input_dim:
-        raise ValueError(
-            f"data_x must have non-empty shape (n_train, {config.input_dim}), "
-            f"got {data_x.shape}"
-        )
-    if not np.all(np.isfinite(np.asarray(jax.device_get(data_x)))):
-        raise ValueError("data_x must contain only finite float32 values")
-    if data_y.shape != (data_x.shape[0],):
-        raise ValueError("data_y must be (n_train,) aligned with data_x")
-    if np.any(raw_data_y < 0) or np.any(raw_data_y >= config.n_classes):
-        raise ValueError(f"data_y labels must lie in [0, {config.n_classes})")
+        raise ValueError("progress_every must be a positive integer or None")
+    resolved_seed = require_jax_seed(seed, name="seed")
+    noise_mode = _validated_screening_noise_mode(noise_mode, spec)
+    effective_noise_pool_steps = _validated_screening_noise_pool_steps(
+        noise_mode,
+        noise_pool_steps if noise_mode == "pool" else None,
+    )
+    resolved_x, resolved_y = _validated_ipmnist_data(
+        data_x,
+        data_y,
+        input_dim=config.input_dim,
+        n_classes=config.n_classes,
+        min_length=config.task_length,
+    )
+    data_x = jnp.asarray(resolved_x, dtype=jnp.float32)
+    data_y = jnp.asarray(resolved_y, dtype=jnp.int32)
     n_train = int(data_x.shape[0])
-    resolved_hyperparameters = dict(spec.hyperparameters)
-    arm_definition = screening_arm_definition(spec)
-    arm_definition["hyperparameters"] = dict(resolved_hyperparameters)
-    factory = spec.factory
-    noise_update = spec.noise_update
-    input_dataset = screening_dataset_identity(data_x, data_y)
-    source_identity = screening_source_identity()
-    environment = _screening_environment_identity()
-    rng_contract = _screening_rng_contract_for_environment(environment)
 
-    init_fn, step_fn = factory(dict(resolved_hyperparameters))
+    init_fn, step_fn = spec.factory(spec.hyperparameters)
 
     root = jr.key(jnp.uint32(resolved_seed))
     key_init, key_schedule, key_noise = jr.split(root, 3)
@@ -7440,9 +7753,14 @@ def run_screening_config(
 
     shapes = _sorted_param_shapes(config)
     n_flat = int(sum(np.prod(shape) for shape in shapes.values()))
-    pool_len = int(noise_pool_steps) * n_flat
-    pool_noise_std = float(resolved_hyperparameters.get("noise_std", 0.0))
-    hp: Mapping[str, float] = MappingProxyType(dict(resolved_hyperparameters))
+    pool_len = (
+        effective_noise_pool_steps * n_flat
+        if effective_noise_pool_steps is not None
+        else 0
+    )
+    pool_noise_std = float(spec.hyperparameters.get("noise_std", 0.0))
+    noise_update = spec.noise_update
+    hp = spec.hyperparameters
 
     def run_task_pool(
         params: dict[str, Array],
@@ -7506,36 +7824,18 @@ def run_screening_config(
                 task_accuracy[-1],
                 elapsed,
             )
-    wall_clock_seconds = time.monotonic() - started
-    if not _canonical_json_equal(screening_source_identity(), source_identity):
-        raise RuntimeError("source identity changed during the screening run")
-    final_environment = _screening_environment_identity()
-    if not _canonical_json_equal(final_environment, environment):
-        raise RuntimeError("environment identity changed during the screening run")
-    if not _canonical_json_equal(
-        _screening_rng_contract_for_environment(final_environment), rng_contract
-    ):
-        raise RuntimeError("RNG contract changed during the screening run")
-    if not _same_typed_value(screening_arm_definition(spec), arm_definition):
-        raise RuntimeError("screening arm definition changed during the screening run")
     return ScreeningRunResult(
         config_name=spec.name,
         base_learner=spec.base_learner,
-        hyperparameters=resolved_hyperparameters,
-        arm_definition=arm_definition,
+        hyperparameters=dict(spec.hyperparameters),
         seed=resolved_seed,
         config=config,
-        input_dataset=input_dataset,
-        source_identity=source_identity,
-        environment=environment,
-        rng_contract=rng_contract,
         per_task_accuracy=np.asarray(task_accuracy, dtype=np.float64),
         per_task_loss=np.asarray(task_loss, dtype=np.float64),
         per_task_plasticity=np.asarray(task_plasticity, dtype=np.float64),
-        wall_clock_seconds=wall_clock_seconds,
+        wall_clock_seconds=time.monotonic() - started,
         noise_mode=noise_mode,
-        noise_pool_steps=noise_pool_steps,
-        progress_every=progress_every,
+        noise_pool_steps=effective_noise_pool_steps,
     )
 
 
@@ -7550,553 +7850,665 @@ _V2_SHARD_FIELDS = frozenset(
         "evidence_policy",
         "config_name",
         "base_learner",
-        "mechanism",
         "hyperparameters",
-        "arm_definition",
-        "arm_definition_sha256",
         "seed",
         "noise_mode",
         "noise_pool_steps",
         "config",
-        "input_dataset",
-        "source_identity",
-        "rng_contract",
-        "execution_invocation",
         "per_task_accuracy",
         "per_task_loss",
         "per_task_plasticity",
         "wall_clock_seconds",
         "created_unix",
+        "source_provenance",
+        "dataset_provenance",
         "environment",
-        "content_digest",
-    }
-)
-_ENVIRONMENT_FIELDS = frozenset(
-    {
-        "jax",
-        "jaxlib",
-        "numpy",
-        "python",
-        "python_implementation",
-        "platform",
-        "jax_backend",
-        "jax_enable_x64",
-        "jax_default_matmul_precision",
-        "jax_default_prng_impl",
-        "jax_random_seed_offset",
-        "jax_threefry_partitionable",
-        "jax_disable_jit",
-        "jax_disable_most_optimizations",
-        "jax_config_values",
-        "xla_flags",
-        "jax_platforms",
-        "devices",
     }
 )
 
 
-def _content_digest_record(payload: Mapping[str, object]) -> dict[str, str]:
-    return {
-        "algorithm": "sha256",
-        "authentication": "none-unkeyed-self-hash",
-        "canonicalization": _CONTENT_DIGEST_CANONICALIZATION,
-        "scope": _CONTENT_DIGEST_SCOPE,
-        "sha256": screening_content_sha256(payload),
-    }
+def _require_exact_keys(
+    value: object, expected: frozenset[str] | set[str], *, context: str
+) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{context} must be an object")
+    actual = set(value)
+    missing = sorted(expected.difference(actual))
+    unexpected = sorted(actual.difference(expected))
+    if missing or unexpected:
+        parts: list[str] = []
+        if missing:
+            parts.append(f"missing field(s) {missing}")
+        if unexpected:
+            parts.append(f"unexpected field(s) {unexpected}")
+        raise ValueError(f"{context}: {'; '.join(parts)}")
+    return cast(Mapping[str, Any], value)
 
 
-def _execution_invocation(
-    result: ScreeningRunResult,
-    *,
-    cli_argv: Sequence[str] | None,
-) -> dict[str, object]:
-    return {
-        "authentication": "self-declared-unverified",
-        "execution_authenticated": False,
-        "interface": "cli" if cli_argv is not None else "python-library-call",
-        "entrypoint": (
-            "python -m alberta_framework.benchmarks.ipmnist_screening"
-            if cli_argv is not None
-            else "alberta_framework.benchmarks.ipmnist_screening.run_screening_config"
-        ),
-        "argv": None if cli_argv is None else list(cli_argv),
-        "resolved": {
-            "config_name": result.config_name,
-            "seed": result.seed,
-            "config": result.config.to_config(),
-            "noise_mode": result.noise_mode,
-            "noise_pool_steps": result.noise_pool_steps,
-            "progress_every": result.progress_every,
-        },
-    }
+def _required_nonempty_string(value: object, *, context: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{context} must be a non-empty string")
+    return value
 
 
-def _validate_cli_run_invocation(
-    invocation: Mapping[str, object],
-    *,
-    expected_resolved: Mapping[str, object],
-    path: Path,
-) -> None:
-    """Parse a recorded CLI command and bind its effective run arguments."""
-    argv = invocation.get("argv")
-    if not isinstance(argv, list) or any(not isinstance(argument, str) for argument in argv):
-        raise ValueError(f"{path}: CLI invocation identity is malformed")
+def _is_finite_json_number(value: object) -> bool:
+    if type(value) not in (int, float):
+        return False
     try:
-        args = _screening_cli_argument_parser(exit_on_error=False).parse_args(argv)
-    except (argparse.ArgumentError, SystemExit) as exc:
-        raise ValueError(f"{path}: CLI argv cannot be parsed") from exc
-    if args.command != "run":
-        raise ValueError(f"{path}: CLI invocation does not identify the run command")
-    cli_config = IPMNISTConfig(n_tasks=args.n_tasks, task_length=args.task_length)
-    cli_resolved = {
-        "config_name": args.config_name,
-        "seed": args.seed,
-        "config": cli_config.to_config(),
-        "noise_mode": args.noise_mode,
-        "noise_pool_steps": args.noise_pool_steps,
-        "progress_every": args.progress_every,
-    }
-    if not _canonical_json_equal(cli_resolved, expected_resolved):
-        raise ValueError(f"{path}: CLI argv contradicts resolved invocation inputs")
+        return math.isfinite(float(cast(int | float, value)))
+    except (OverflowError, ValueError):
+        return False
+
+
+def _require_screening_curve_domain(
+    values: np.ndarray, field: str, *, context: str
+) -> None:
+    if field in {"per_task_accuracy", "per_task_plasticity"}:
+        if np.any(values < 0.0) or np.any(values > 1.0):
+            raise ValueError(f"{context}: {field} values must be in [0, 1]")
+    elif field == "per_task_loss" and np.any(values < 0.0):
+        raise ValueError(f"{context}: {field} values must be non-negative")
+
+
+def _validated_nonpromoting_policy(value: object, *, context: str) -> dict[str, object]:
+    policy = _require_exact_keys(
+        value,
+        set(NONPROMOTING_POLICY),
+        context=f"{context} evidence_policy",
+    )
+    if any(
+        type(policy[name]) is not type(expected) or policy[name] != expected
+        for name, expected in NONPROMOTING_POLICY.items()
+    ):
+        raise ValueError(
+            f"{context}: evidence_policy must be the frozen nonpromoting policy"
+        )
+    return dict(policy)
+
+
+def _validated_registered_hyperparameters(
+    value: object, spec: ScreeningSpec, *, context: str
+) -> dict[str, float]:
+    hyperparameters = _require_exact_keys(
+        value,
+        set(spec.hyperparameters),
+        context=f"{context} hyperparameters",
+    )
+    invalid = [
+        name
+        for name, expected in spec.hyperparameters.items()
+        if type(hyperparameters[name]) is not float
+        or not math.isfinite(cast(float, hyperparameters[name]))
+        or cast(float, hyperparameters[name]).hex() != expected.hex()
+    ]
+    if invalid:
+        raise ValueError(
+            f"{context}: hyperparameters must exactly match the registered arm; "
+            f"invalid field(s): {sorted(invalid)}"
+        )
+    return {name: cast(float, hyperparameters[name]) for name in spec.hyperparameters}
+
+
+def _validated_source_provenance(value: object, *, context: str) -> dict[str, Any]:
+    provenance = _require_exact_keys(
+        value,
+        {
+            "schema",
+            "git_commit",
+            "git_tree",
+            "git_object_format",
+            "relevant_source_scope",
+            "relevant_source_file_count",
+            "relevant_source_sha256",
+            "uv_lock_sha256",
+            "worktree_clean",
+        },
+        context=f"{context} source provenance",
+    )
+    if provenance["schema"] != SOURCE_PROVENANCE_SCHEMA:
+        raise ValueError(f"{context} source provenance has an unsupported schema")
+    if provenance["git_object_format"] != "sha1":
+        raise ValueError(f"{context} source provenance git_object_format must be 'sha1'")
+    if not _is_lower_hex(provenance["git_commit"], 40) or not _is_lower_hex(
+        provenance["git_tree"], 40
+    ):
+        raise ValueError(f"{context} source provenance must record lowercase Git SHA-1 IDs")
+    if provenance["relevant_source_scope"] != _SOURCE_SCOPE_LABEL:
+        raise ValueError(f"{context} source provenance has an unsupported source scope")
+    file_count = provenance["relevant_source_file_count"]
+    if type(file_count) is not int or file_count <= 0:
+        raise ValueError(f"{context} source provenance file count must be positive")
+    if not _is_lower_hex(provenance["relevant_source_sha256"], 64) or not _is_lower_hex(
+        provenance["uv_lock_sha256"], 64
+    ):
+        raise ValueError(f"{context} source provenance must record lowercase SHA-256 digests")
+    if provenance["worktree_clean"] is not True:
+        raise ValueError(f"{context} source provenance must record a clean source worktree")
+    return dict(provenance)
+
+
+def _validated_dataset_provenance(value: object, *, context: str) -> dict[str, Any]:
+    provenance = _require_exact_keys(
+        value,
+        {"schema", "source", "materialization", "x", "y"},
+        context=f"{context} dataset provenance",
+    )
+    if provenance["schema"] != DATASET_PROVENANCE_SCHEMA:
+        raise ValueError(f"{context} dataset provenance has an unsupported schema")
+    source = _require_exact_keys(
+        provenance["source"],
+        {"provider", "name", "version", "row_start", "row_stop_exclusive"},
+        context=f"{context} dataset provenance source",
+    )
+    if (
+        not isinstance(source["provider"], str)
+        or not isinstance(source["name"], str)
+        or type(source["version"]) is not int
+        or type(source["row_start"]) is not int
+        or type(source["row_stop_exclusive"]) is not int
+        or dict(source) != _DATASET_SOURCE
+    ):
+        raise ValueError(f"{context} dataset provenance has an unsupported source selection")
+    if provenance["materialization"] != _DATASET_MATERIALIZATION:
+        raise ValueError(f"{context} dataset provenance has an unsupported materialization")
+
+    arrays: dict[str, Mapping[str, Any]] = {}
+    expected_ranks = {"x": 2, "y": 1}
+    expected_dtypes = {"x": "<f4", "y": "<i4"}
+    for name in ("x", "y"):
+        binding = _require_exact_keys(
+            provenance[name],
+            {"dtype", "shape", "sha256"},
+            context=f"{context} dataset provenance {name}",
+        )
+        shape = binding["shape"]
+        if (
+            not isinstance(shape, list)
+            or len(shape) != expected_ranks[name]
+            or any(type(dimension) is not int or dimension <= 0 for dimension in shape)
+        ):
+            raise ValueError(
+                f"{context} dataset provenance {name} shape must be a positive "
+                f"rank-{expected_ranks[name]} integer list"
+            )
+        if binding["dtype"] != expected_dtypes[name]:
+            raise ValueError(
+                f"{context} dataset provenance {name} dtype must be {expected_dtypes[name]!r}"
+            )
+        if not _is_lower_hex(binding["sha256"], 64):
+            raise ValueError(
+                f"{context} dataset provenance {name} must record a lowercase SHA-256"
+            )
+        arrays[name] = binding
+    if arrays["x"]["shape"][0] != arrays["y"]["shape"][0]:
+        raise ValueError(f"{context} dataset provenance x/y row counts must match")
+    if arrays["x"]["shape"] != [60_000, 784] or arrays["y"]["shape"] != [60_000]:
+        raise ValueError(
+            f"{context} dataset provenance must bind canonical x=[60000, 784] and "
+            "y=[60000] materializations"
+        )
+    return dict(provenance)
+
+
+def _validate_dataset_config_binding(
+    provenance: Mapping[str, Any], config: IPMNISTConfig, *, context: str
+) -> None:
+    x_binding = cast(Mapping[str, Any], provenance["x"])
+    x_shape = cast(list[int], x_binding["shape"])
+    if config.input_dim != x_shape[1]:
+        raise ValueError(
+            f"{context}: protocol input_dim={config.input_dim} does not match the "
+            f"dataset width {x_shape[1]}"
+        )
+    if config.n_classes != 10:
+        raise ValueError(f"{context}: canonical MNIST protocol n_classes must be 10")
+
+
+def _validated_runtime_environment(value: object, *, context: str) -> dict[str, Any]:
+    environment = _require_exact_keys(
+        value,
+        {"schema", "python", "platform", "packages", "jax", "process_environment"},
+        context=f"{context} runtime environment",
+    )
+    if environment["schema"] != RUNTIME_SCHEMA:
+        raise ValueError(f"{context} runtime environment has an unsupported schema")
+    python = _require_exact_keys(
+        environment["python"],
+        {"implementation", "version"},
+        context=f"{context} runtime environment python",
+    )
+    platform_binding = _require_exact_keys(
+        environment["platform"],
+        {"system", "release", "machine"},
+        context=f"{context} runtime environment platform",
+    )
+    packages = _require_exact_keys(
+        environment["packages"],
+        {"chex", "jax", "jaxlib", "numpy", "scikit-learn"},
+        context=f"{context} runtime environment packages",
+    )
+    jax_binding = _require_exact_keys(
+        environment["jax"],
+        {"backend", "devices", "config"},
+        context=f"{context} runtime environment jax",
+    )
+    jax_config = _require_exact_keys(
+        jax_binding["config"],
+        {
+            "jax_enable_x64",
+            "jax_default_matmul_precision",
+            "jax_disable_jit",
+            "jax_numpy_dtype_promotion",
+            "jax_numpy_rank_promotion",
+            "jax_random_seed_offset",
+            "jax_threefry_partitionable",
+            "jax_default_prng_impl",
+        },
+        context=f"{context} runtime environment jax.config",
+    )
+    process_environment = _require_exact_keys(
+        environment["process_environment"],
+        set(_RUNTIME_ENVIRONMENT_KEYS),
+        context=f"{context} runtime environment process_environment",
+    )
+    for field, item in python.items():
+        _required_nonempty_string(item, context=f"{context} runtime environment python.{field}")
+    for field, item in platform_binding.items():
+        _required_nonempty_string(
+            item, context=f"{context} runtime environment platform.{field}"
+        )
+    for field, item in packages.items():
+        _required_nonempty_string(
+            item, context=f"{context} runtime environment packages.{field}"
+        )
+    _required_nonempty_string(
+        jax_binding["backend"], context=f"{context} runtime environment jax.backend"
+    )
+    devices = jax_binding["devices"]
+    if not isinstance(devices, list) or not devices:
+        raise ValueError(f"{context} runtime environment JAX devices must be non-empty")
+    device_identities: set[tuple[str, int, int]] = set()
+    for index, device in enumerate(devices):
+        binding = _require_exact_keys(
+            device,
+            {"id", "platform", "device_kind", "process_index"},
+            context=f"{context} runtime environment JAX device {index}",
+        )
+        device_id = binding["id"]
+        process_index = binding["process_index"]
+        if (
+            type(device_id) is not int
+            or type(process_index) is not int
+            or device_id < 0
+            or process_index < 0
+        ):
+            raise ValueError(
+                f"{context} runtime environment JAX device IDs must be "
+                "non-negative integers"
+            )
+        device_platform = _required_nonempty_string(
+            binding["platform"],
+            context=f"{context} runtime environment JAX device {index}.platform",
+        )
+        identity = (device_platform, process_index, device_id)
+        if identity in device_identities:
+            raise ValueError(
+                f"{context} runtime environment JAX device identities must be unique"
+            )
+        device_identities.add(identity)
+        _required_nonempty_string(
+            binding["device_kind"],
+            context=f"{context} runtime environment JAX device {index}.device_kind",
+        )
+    for field in (
+        "jax_enable_x64",
+        "jax_disable_jit",
+        "jax_threefry_partitionable",
+    ):
+        if type(jax_config[field]) is not bool:
+            raise ValueError(f"{context} runtime environment {field} must be boolean")
+    precision = jax_config["jax_default_matmul_precision"]
+    if precision is not None and (not isinstance(precision, str) or not precision):
+        raise ValueError(
+            f"{context} runtime environment jax_default_matmul_precision must be a "
+            "string or null"
+        )
+    for field in (
+        "jax_numpy_dtype_promotion",
+        "jax_numpy_rank_promotion",
+        "jax_default_prng_impl",
+    ):
+        _required_nonempty_string(
+            jax_config[field], context=f"{context} runtime environment {field}"
+        )
+    if type(jax_config["jax_random_seed_offset"]) is not int:
+        raise ValueError(
+            f"{context} runtime environment jax_random_seed_offset must be an integer"
+        )
+    if any(
+        value is not None and not isinstance(value, str)
+        for value in process_environment.values()
+    ):
+        raise ValueError(
+            f"{context} runtime environment process values must be strings or null"
+        )
+    return dict(environment)
 
 
 def shard_payload(
     result: ScreeningRunResult,
     *,
-    cli_argv: Sequence[str] | None = None,
+    source_provenance: Mapping[str, object],
+    dataset_provenance: Mapping[str, object],
+    environment: Mapping[str, object],
 ) -> dict[str, Any]:
-    """Serialize one run to a source-, data-, invocation-, and arm-bound v2 shard."""
-    arm = dict(result.arm_definition)
-    arm_definition_sha256 = canonical_json_sha256(arm)
-    if (
-        arm.get("name") != result.config_name
-        or arm.get("base_learner") != result.base_learner
-        or not _canonical_json_equal(arm.get("hyperparameters"), result.hyperparameters)
-    ):
-        raise ValueError("run result fields disagree with the actual passed spec definition")
-    if result.noise_mode == "pool" and arm.get("noise_update") is None:
+    """Serialize one bound (config, seed) screening run as a strict v2 shard."""
+    seed = require_jax_seed(result.seed, name="result seed")
+    spec = screening_spec(result.config_name)
+    if result.base_learner != spec.base_learner:
         raise ValueError(
-            f"pool mode is unsupported for {result.config_name!r}: "
-            "the arm has no noise-consuming update"
+            f"new shard base_learner must match registered arm {spec.base_learner!r}"
         )
-    invocation = _execution_invocation(result, cli_argv=cli_argv)
-    if cli_argv is not None:
-        resolved_invocation = invocation["resolved"]
-        assert isinstance(resolved_invocation, dict)
-        _validate_cli_run_invocation(
-            invocation,
-            expected_resolved=resolved_invocation,
-            path=Path("<in-memory-shard>"),
-        )
+    hyperparameters = _validated_registered_hyperparameters(
+        result.hyperparameters, spec, context="new shard"
+    )
+    noise_mode = _validated_screening_noise_mode(result.noise_mode, spec)
+    noise_pool_steps = _validated_screening_noise_pool_steps(
+        noise_mode, result.noise_pool_steps
+    )
+    source_binding = _validated_source_provenance(source_provenance, context="new shard")
+    dataset_binding = _validated_dataset_provenance(dataset_provenance, context="new shard")
+    runtime_binding = _validated_runtime_environment(environment, context="new shard")
+    _validate_dataset_config_binding(dataset_binding, result.config, context="new shard")
+    if not isinstance(result.base_learner, str) or not result.base_learner:
+        raise ValueError("new shard base_learner must be a non-empty string")
+    curves: dict[str, np.ndarray] = {}
+    for field in ("per_task_accuracy", "per_task_loss", "per_task_plasticity"):
+        try:
+            raw_values = np.asarray(jax.device_get(getattr(result, field)))
+            if raw_values.dtype.kind not in {"i", "u", "f"}:
+                raise TypeError("non-numeric curve")
+            values = np.asarray(raw_values, dtype=np.float64)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"new shard {field} must be finite with shape ({result.config.n_tasks},)"
+            ) from exc
+        if values.shape != (result.config.n_tasks,) or not np.all(np.isfinite(values)):
+            raise ValueError(
+                f"new shard {field} must be finite with shape ({result.config.n_tasks},)"
+            )
+        _require_screening_curve_domain(values, field, context="new shard")
+        curves[field] = values
+    wall_clock_seconds = _validated_wall_clock_seconds(
+        result.wall_clock_seconds, "new shard"
+    )
     payload: dict[str, Any] = {
         "schema": SHARD_SCHEMA,
         "evidence_policy": dict(NONPROMOTING_POLICY),
         "config_name": result.config_name,
         "base_learner": result.base_learner,
-        "mechanism": arm["mechanism"],
-        "hyperparameters": result.hyperparameters,
-        "arm_definition": arm,
-        "arm_definition_sha256": arm_definition_sha256,
-        "seed": result.seed,
-        "noise_mode": result.noise_mode,
-        "noise_pool_steps": result.noise_pool_steps,
+        "hyperparameters": hyperparameters,
+        "seed": seed,
+        "noise_mode": noise_mode,
+        "noise_pool_steps": noise_pool_steps,
         "config": result.config.to_config(),
-        "input_dataset": dict(result.input_dataset),
-        "source_identity": dict(result.source_identity),
-        "rng_contract": dict(result.rng_contract),
-        "execution_invocation": invocation,
-        "per_task_accuracy": [round(float(v), 8) for v in result.per_task_accuracy],
-        "per_task_loss": [round(float(v), 8) for v in result.per_task_loss],
-        "per_task_plasticity": [round(float(v), 8) for v in result.per_task_plasticity],
-        "wall_clock_seconds": round(result.wall_clock_seconds, 2),
+        "per_task_accuracy": [round(float(v), 8) for v in curves["per_task_accuracy"]],
+        "per_task_loss": [round(float(v), 8) for v in curves["per_task_loss"]],
+        "per_task_plasticity": [
+            round(float(v), 8) for v in curves["per_task_plasticity"]
+        ],
+        "wall_clock_seconds": round(wall_clock_seconds, 2),
         "created_unix": time.time(),
-        "environment": dict(result.environment),
+        "source_provenance": source_binding,
+        "dataset_provenance": dataset_binding,
+        "environment": runtime_binding,
     }
-    payload["content_digest"] = _content_digest_record(payload)
+    try:
+        json.dumps(payload, allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("new shard payload must be strict JSON") from exc
     return payload
 
 
-def _reject_nonstandard_json_constant(value: str) -> NoReturn:
-    raise ValueError(f"non-standard JSON numeric constant: {value}")
-
-
-def _reject_duplicate_json_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
-    result: dict[str, object] = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError(f"duplicate JSON object key: {key}")
-        result[key] = value
-    return result
-
-
-def _valid_json_safe_jax_config_value(value: object) -> bool:
-    if value is None or type(value) in {bool, int, str}:
-        return True
-    if type(value) is float:
-        return math.isfinite(value)
-    if not isinstance(value, dict):
-        return False
-    if value.get("kind") == "enum" and set(value) == {"kind", "type", "value"}:
-        return isinstance(value["type"], str) and _valid_json_safe_jax_config_value(
-            value["value"]
+def load_shard(path: Path) -> dict[str, Any]:
+    """Load legacy v1 or strictly validate a source-bound v2 screening shard."""
+    payload = load_strict_json_object(path)
+    schema = payload.get("schema")
+    if schema not in {LEGACY_SHARD_SCHEMA, SHARD_SCHEMA}:
+        raise ValueError(
+            f"{path}: not a supported {LEGACY_SHARD_SCHEMA} or {SHARD_SCHEMA} shard"
         )
-    return (
-        value.get("kind") == "object"
-        and set(value) == {"kind", "type", "string"}
-        and isinstance(value["type"], str)
-        and isinstance(value["string"], str)
-    )
-
-
-def _strict_json_object(raw: bytes, *, path: Path) -> dict[str, Any]:
-    try:
-        parsed = json.loads(
-            raw.decode("utf-8"),
-            parse_constant=_reject_nonstandard_json_constant,
-            object_pairs_hook=_reject_duplicate_json_keys,
+    is_v2 = schema == SHARD_SCHEMA
+    if is_v2:
+        _require_exact_keys(payload, _V2_SHARD_FIELDS, context=str(path))
+        payload["evidence_policy"] = _validated_nonpromoting_policy(
+            payload["evidence_policy"], context=str(path)
         )
-    except (UnicodeError, json.JSONDecodeError, ValueError) as exc:
-        raise ValueError(f"{path}: invalid strict JSON: {exc}") from exc
-    if not isinstance(parsed, dict):
-        raise ValueError(f"{path}: shard must be a JSON object")
-    return parsed
-
-
-def _validate_metric_vectors(
-    payload: Mapping[str, object],
-    config: IPMNISTConfig,
-    *,
-    path: Path,
-    strict_v2: bool = False,
-) -> None:
+        created_unix = payload["created_unix"]
+        if type(created_unix) not in (int, float):
+            raise ValueError(f"{path}: created_unix must be a finite, non-negative number")
+        try:
+            created_value = float(created_unix)
+        except (OverflowError, ValueError) as exc:
+            raise ValueError(
+                f"{path}: created_unix must be a finite, non-negative number"
+            ) from exc
+        if not math.isfinite(created_value) or created_value < 0.0:
+            raise ValueError(f"{path}: created_unix must be a finite, non-negative number")
+        payload["created_unix"] = created_value
+        payload["source_provenance"] = _validated_source_provenance(
+            payload["source_provenance"], context=str(path)
+        )
+        payload["dataset_provenance"] = _validated_dataset_provenance(
+            payload["dataset_provenance"], context=str(path)
+        )
+        payload["environment"] = _validated_runtime_environment(
+            payload["environment"], context=str(path)
+        )
+    config = IPMNISTConfig(**payload["config"])
+    if is_v2:
+        _validate_dataset_config_binding(
+            payload["dataset_provenance"], config, context=str(path)
+        )
     for fieldname in ("per_task_accuracy", "per_task_loss", "per_task_plasticity"):
+        # Curve typing and metric-domain checks apply to every schema: the
+        # legacy v1 shards are the campaign's live format, and a numeric
+        # string, boolean, or out-of-domain value would otherwise rank.
         raw_values = payload.get(fieldname)
-        if strict_v2 and (
+        if (
             not isinstance(raw_values, list)
             or len(raw_values) != config.n_tasks
-            or any(
-                isinstance(value, bool) or not isinstance(value, (int, float))
-                for value in raw_values
-            )
+            or any(not _is_finite_json_number(value) for value in raw_values)
         ):
-            raise ValueError(f"{path}: {fieldname} must contain finite JSON numbers")
-        try:
-            values = np.asarray(raw_values, dtype=np.float64)
-        except (KeyError, TypeError, ValueError) as exc:
-            raise ValueError(f"{path}: {fieldname} must be a finite numeric vector") from exc
+            raise ValueError(
+                f"{path}: {fieldname} must be a list of finite JSON numbers "
+                f"with length {config.n_tasks}"
+            )
+        values = np.asarray(raw_values, dtype=np.float64)
         if values.shape != (config.n_tasks,) or not np.all(np.isfinite(values)):
             raise ValueError(f"{path}: {fieldname} must be finite with shape ({config.n_tasks},)")
-        if strict_v2 and fieldname in {"per_task_accuracy", "per_task_plasticity"}:
-            if np.any((values < 0.0) | (values > 1.0)):
-                raise ValueError(f"{path}: {fieldname} must lie in [0, 1]")
-        if strict_v2 and fieldname == "per_task_loss" and np.any(values < 0.0):
-            raise ValueError(f"{path}: per_task_loss must be non-negative")
-
-
-def _validate_legacy_shard(payload: dict[str, Any], *, path: Path) -> dict[str, Any]:
-    try:
-        config = IPMNISTConfig(**payload["config"])
-    except (KeyError, TypeError, ValueError) as exc:
-        raise ValueError(f"{path}: legacy shard config is invalid") from exc
-    _validate_metric_vectors(payload, config, path=path)
-    if type(payload.get("seed")) is not int or payload["seed"] < 0:
-        raise ValueError(f"{path}: seed must be a non-negative integer")
+        _require_screening_curve_domain(values, fieldname, context=str(path))
+        payload[fieldname] = [float(value) for value in values]
+    payload["wall_clock_seconds"] = _validated_wall_clock_seconds(
+        payload.get("wall_clock_seconds"), path
+    )
+    payload["seed"] = require_jax_seed(payload.get("seed"), name=f"{path}: seed")
     if payload.get("config_name") not in SCREENING_REGISTRY:
         raise ValueError(f"{path}: unknown config_name {payload.get('config_name')!r}")
-    quarantined = dict(payload)
-    quarantined["legacy_quarantine"] = {
-        "integrity": "unbound-v1",
-        "merge_allowed": False,
-        "scientific_promotion_allowed": False,
-    }
-    return quarantined
-
-
-def _is_sha256(value: object) -> bool:
-    return (
-        isinstance(value, str)
-        and len(value) == 64
-        and all(character in "0123456789abcdef" for character in value)
+    spec = SCREENING_REGISTRY[payload["config_name"]]
+    if is_v2 and payload.get("base_learner") != spec.base_learner:
+        raise ValueError(
+            f"{path}: base_learner must match registered arm {spec.base_learner!r}"
+        )
+    if is_v2:
+        payload["hyperparameters"] = _validated_registered_hyperparameters(
+            payload.get("hyperparameters"), spec, context=str(path)
+        )
+    noise_mode = _validated_screening_noise_mode(
+        payload.get("noise_mode", "step"), spec, context=path
     )
-
-
-def _validate_v2_shard(payload: dict[str, Any], *, path: Path) -> dict[str, Any]:
-    if set(payload) != _V2_SHARD_FIELDS:
-        missing = sorted(_V2_SHARD_FIELDS - set(payload))
-        extra = sorted(set(payload) - _V2_SHARD_FIELDS)
-        raise ValueError(f"{path}: v2 shard field set mismatch; missing={missing}, extra={extra}")
-    digest = payload["content_digest"]
-    expected_digest = _content_digest_record(payload)
-    if not _canonical_json_equal(digest, expected_digest):
-        raise ValueError(f"{path}: content digest mismatch")
-    if not _canonical_json_equal(payload["evidence_policy"], NONPROMOTING_POLICY):
-        raise ValueError(f"{path}: evidence policy mismatch")
-
-    raw_config = payload["config"]
-    try:
-        config = IPMNISTConfig(**raw_config)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{path}: protocol config is invalid") from exc
-    if not isinstance(raw_config, dict) or not _canonical_json_equal(
-        raw_config, config.to_config()
-    ):
-        raise ValueError(f"{path}: protocol config field set is not canonical")
-    _validate_metric_vectors(payload, config, path=path, strict_v2=True)
-    seed = payload["seed"]
-    if type(seed) is not int or not 0 <= seed <= _MAX_UINT32:
-        raise ValueError(f"{path}: seed must be a canonical uint32 integer")
-    if payload["noise_mode"] not in {"step", "pool"}:
-        raise ValueError(f"{path}: noise_mode is invalid")
-    if type(payload["noise_pool_steps"]) is not int or payload["noise_pool_steps"] < 2:
-        raise ValueError(f"{path}: noise_pool_steps must be an integer >= 2")
-
-    name = payload["config_name"]
-    if not isinstance(name, str) or name not in SCREENING_REGISTRY:
-        raise ValueError(f"{path}: unknown config_name {name!r}")
-    spec = screening_spec(name)
-    if payload["noise_mode"] == "pool" and spec.noise_update is None:
-        raise ValueError(f"{path}: pool mode is unsupported for registered arm {name!r}")
-    expected_arm = screening_arm_definition(spec)
-    if not _canonical_json_equal(payload["arm_definition"], expected_arm):
-        raise ValueError(f"{path}: registered arm definition mismatch")
-    try:
-        payload_arm_sha256 = canonical_json_sha256(payload["arm_definition"])
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{path}: registered arm definition is not canonical JSON") from exc
-    if payload["arm_definition_sha256"] != payload_arm_sha256:
-        raise ValueError(f"{path}: arm definition fingerprint does not bind payload")
-    if payload_arm_sha256 != screening_arm_fingerprint(spec):
-        raise ValueError(f"{path}: registered arm definition fingerprint mismatch")
-    if (
-        payload["base_learner"] != spec.base_learner
-        or payload["mechanism"] != spec.mechanism
-        or not _canonical_json_equal(
-            payload["hyperparameters"], dict(spec.hyperparameters)
-        )
-    ):
-        raise ValueError(f"{path}: registered arm fields mismatch")
-
-    dataset = payload["input_dataset"]
-    if not isinstance(dataset, dict) or set(dataset) != {
-        "algorithm",
-        "canonicalization",
-        "provenance",
-        "semantic_dataset_identity_attested",
-        "sha256",
-        "features",
-        "labels",
-    }:
-        raise ValueError(f"{path}: input dataset identity is malformed")
-    if (
-        dataset["algorithm"] != "sha256"
-        or dataset["canonicalization"] != "array-bundle-little-endian-v1"
-        or dataset["provenance"] != "caller-supplied-post-cast-arrays"
-        or dataset["semantic_dataset_identity_attested"] is not False
-        or not _is_sha256(dataset["sha256"])
-    ):
-        raise ValueError(f"{path}: input dataset identity is malformed")
-    features = dataset["features"]
-    labels = dataset["labels"]
-    if (
-        not isinstance(features, dict)
-        or not isinstance(labels, dict)
-        or set(features) != {"dtype", "shape"}
-        or set(labels) != {"dtype", "shape"}
-        or features.get("dtype") != "float32"
-        or labels.get("dtype") != "int32"
-        or not isinstance(features.get("shape"), list)
-        or not isinstance(labels.get("shape"), list)
-        or len(features["shape"]) != 2
-        or any(
-            isinstance(dimension, bool)
-            or not isinstance(dimension, int)
-            or dimension < 1
-            for dimension in features["shape"]
-        )
-        or any(
-            isinstance(dimension, bool)
-            or not isinstance(dimension, int)
-            or dimension < 1
-            for dimension in labels["shape"]
-        )
-        or features["shape"][1] != config.input_dim
-        or labels["shape"] != [features["shape"][0]]
-    ):
-        raise ValueError(f"{path}: input dataset shape/dtype identity is malformed")
-
-    if not _canonical_json_equal(payload["source_identity"], screening_source_identity()):
-        raise ValueError(f"{path}: source identity does not match the live closure")
-    environment = payload["environment"]
-    if not isinstance(environment, dict) or set(environment) != _ENVIRONMENT_FIELDS:
-        raise ValueError(f"{path}: environment identity field set mismatch")
-    required_strings = {
-        "jax",
-        "jaxlib",
-        "numpy",
-        "python",
-        "python_implementation",
-        "platform",
-        "jax_backend",
-        "jax_default_prng_impl",
-    }
-    optional_strings = {"xla_flags", "jax_platforms"}
-    devices = environment["devices"]
-    jax_config_values = environment["jax_config_values"]
-    if (
-        any(not isinstance(environment[field], str) for field in required_strings)
-        or any(
-            environment[field] is not None and not isinstance(environment[field], str)
-            for field in optional_strings
-        )
-        or not isinstance(environment["jax_enable_x64"], bool)
-        or isinstance(environment["jax_random_seed_offset"], bool)
-        or not isinstance(environment["jax_random_seed_offset"], int)
-        or not isinstance(environment["jax_threefry_partitionable"], bool)
-        or not isinstance(environment["jax_disable_jit"], bool)
-        or not isinstance(environment["jax_disable_most_optimizations"], bool)
-        or not _valid_json_safe_jax_config_value(
-            environment["jax_default_matmul_precision"]
-        )
-        or not isinstance(jax_config_values, dict)
-        or not jax_config_values
-        or any(
-            not isinstance(name, str)
-            or not name
-            or not _valid_json_safe_jax_config_value(value)
-            for name, value in (
-                jax_config_values.items() if isinstance(jax_config_values, dict) else ()
-            )
-        )
-        or not isinstance(devices, list)
-        or not devices
-        or any(
-            not isinstance(device, dict)
-            or set(device) != {"platform", "device_kind"}
-            or not isinstance(device["platform"], str)
-            or not isinstance(device["device_kind"], str)
-            for device in devices
-        )
-    ):
-        raise ValueError(f"{path}: environment identity types are invalid")
-    explicit_jax_config = {
-        "jax_default_prng_impl": environment["jax_default_prng_impl"],
-        "jax_random_seed_offset": environment["jax_random_seed_offset"],
-        "jax_threefry_partitionable": environment["jax_threefry_partitionable"],
-        "jax_disable_jit": environment["jax_disable_jit"],
-        "jax_disable_most_optimizations": environment[
-            "jax_disable_most_optimizations"
-        ],
-        "jax_enable_x64": environment["jax_enable_x64"],
-        "jax_default_matmul_precision": environment[
-            "jax_default_matmul_precision"
-        ],
-    }
-    if any(
-        field not in jax_config_values
-        or not _canonical_json_equal(jax_config_values[field], value)
-        for field, value in explicit_jax_config.items()
-    ):
-        raise ValueError(f"{path}: explicit JAX config differs from full config snapshot")
-    if not _canonical_json_equal(
-        payload["rng_contract"], _screening_rng_contract_for_environment(environment)
-    ):
-        raise ValueError(f"{path}: RNG contract mismatch")
-
-    invocation = payload["execution_invocation"]
-    if not isinstance(invocation, dict) or set(invocation) != {
-        "authentication",
-        "execution_authenticated",
-        "interface",
-        "entrypoint",
-        "argv",
-        "resolved",
-    }:
-        raise ValueError(f"{path}: execution invocation is malformed")
-    if (
-        invocation["authentication"] != "self-declared-unverified"
-        or invocation["execution_authenticated"] is not False
-    ):
-        raise ValueError(f"{path}: execution invocation authentication claim is invalid")
-    resolved = invocation["resolved"]
-    expected_resolved = {
-        "config_name": name,
-        "seed": seed,
-        "config": payload["config"],
-        "noise_mode": payload["noise_mode"],
-        "noise_pool_steps": payload["noise_pool_steps"],
-        "progress_every": resolved.get("progress_every") if isinstance(resolved, dict) else None,
-    }
-    if not isinstance(resolved, dict) or not _canonical_json_equal(
-        resolved, expected_resolved
-    ):
-        raise ValueError(f"{path}: execution invocation does not bind resolved inputs")
-    progress_every = resolved["progress_every"]
-    if progress_every is not None and (
-        isinstance(progress_every, bool)
-        or not isinstance(progress_every, int)
-        or progress_every < 1
-    ):
-        raise ValueError(f"{path}: execution progress_every is invalid")
-    if invocation["interface"] == "python-library-call":
-        if invocation["entrypoint"] != (
-            "alberta_framework.benchmarks.ipmnist_screening.run_screening_config"
-        ) or invocation["argv"] is not None:
-            raise ValueError(f"{path}: library invocation identity is malformed")
-    elif invocation["interface"] == "cli":
-        if (
-            invocation["entrypoint"]
-            != "python -m alberta_framework.benchmarks.ipmnist_screening"
+    noise_pool_steps = _validated_screening_noise_pool_steps(
+        noise_mode,
+        payload.get("noise_pool_steps", _MISSING_NOISE_POOL_STEPS),
+        context=path,
+        allow_unrecorded_pool=not is_v2,
+    )
+    payload["noise_mode"] = noise_mode
+    payload["noise_pool_steps"] = noise_pool_steps
+    if not isinstance(payload.get("base_learner"), str) or not payload["base_learner"]:
+        raise ValueError(f"{path}: base_learner must be a non-empty string")
+    if not isinstance(payload.get("hyperparameters"), dict):
+        raise ValueError(f"{path}: hyperparameters must be an object")
+    if not is_v2:
+        environment = payload.get("environment")
+        required_environment_fields = ("jax", "numpy", "python", "platform")
+        if not isinstance(environment, dict) or any(
+            not isinstance(environment.get(field), str) or not environment[field]
+            for field in required_environment_fields
         ):
-            raise ValueError(f"{path}: CLI invocation identity is malformed")
-        _validate_cli_run_invocation(
-            invocation,
-            expected_resolved=expected_resolved,
-            path=path,
-        )
-    else:
-        raise ValueError(f"{path}: execution invocation interface is unsupported")
-    for field in ("wall_clock_seconds", "created_unix"):
-        value = payload[field]
-        if (
-            isinstance(value, bool)
-            or not isinstance(value, (int, float))
-            or not math.isfinite(value)
-            or value < 0.0
-        ):
-            raise ValueError(f"{path}: {field} must be finite and non-negative")
-    return payload
-
-
-def _load_shard_record(
-    path: Path,
-    *,
-    legacy_v1_quarantine: bool,
-) -> tuple[dict[str, Any], str]:
-    resolved_path = Path(path)
-    raw = resolved_path.read_bytes()
-    raw_sha256 = hashlib.sha256(raw).hexdigest()
-    payload = _strict_json_object(raw, path=resolved_path)
-    if payload.get("schema") == LEGACY_SHARD_SCHEMA:
-        if not legacy_v1_quarantine:
             raise ValueError(
-                f"{resolved_path}: legacy v1 shards require explicit quarantine parsing"
+                f"{path}: environment must record non-empty jax, numpy, python, "
+                "and platform strings"
             )
-        return _validate_legacy_shard(payload, path=resolved_path), raw_sha256
-    if payload.get("schema") != SHARD_SCHEMA:
-        raise ValueError(f"{resolved_path}: not an {SHARD_SCHEMA} shard")
-    return _validate_v2_shard(payload, path=resolved_path), raw_sha256
-
-
-def load_shard(
-    path: Path,
-    *,
-    legacy_v1_quarantine: bool = False,
-) -> dict[str, Any]:
-    """Load one strict v2 shard; v1 is available only as explicit quarantine."""
-    payload, _ = _load_shard_record(
-        Path(path), legacy_v1_quarantine=legacy_v1_quarantine
-    )
     return payload
+
+
+def _artifact_file_binding(path: Path, *, context: str) -> dict[str, object]:
+    artifact_path = Path(path)
+    try:
+        raw = artifact_path.read_bytes()
+    except OSError as exc:
+        raise ValueError(f"{context}: could not read artifact {artifact_path}") from exc
+    return {
+        "path": artifact_path.as_posix(),
+        "size_bytes": len(raw),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+    }
+
+
+def _artifact_file_bindings(
+    paths: Sequence[Path], *, context: str
+) -> list[dict[str, object]]:
+    return [
+        _artifact_file_binding(Path(path), context=context)
+        for path in paths
+    ]
+
+
+def _require_artifact_bindings_unchanged(
+    paths: Sequence[Path],
+    expected: Sequence[Mapping[str, object]],
+    *,
+    context: str,
+) -> None:
+    current = _artifact_file_bindings(paths, context=context)
+    expected_base = [
+        {
+            "path": binding["path"],
+            "size_bytes": binding["size_bytes"],
+            "sha256": binding["sha256"],
+        }
+        for binding in expected
+    ]
+    if current != expected_base:
+        raise RuntimeError(f"{context} changed while the derived receipt was built")
+
+
+def _require_embedded_artifact_manifest_unchanged(
+    manifest: object, *, context: str
+) -> None:
+    if not isinstance(manifest, list) or not manifest:
+        raise RuntimeError(f"{context} is missing an input artifact manifest")
+    paths: list[Path] = []
+    bindings: list[Mapping[str, object]] = []
+    for item in manifest:
+        if not isinstance(item, Mapping):
+            raise RuntimeError(f"{context} has an invalid input artifact manifest")
+        path = item.get("path")
+        size_bytes = item.get("size_bytes")
+        sha256 = item.get("sha256")
+        if (
+            not isinstance(path, str)
+            or not path
+            or type(size_bytes) is not int
+            or size_bytes < 0
+            or not _is_lower_hex(sha256, 64)
+        ):
+            raise RuntimeError(f"{context} has an invalid input artifact manifest")
+        paths.append(Path(path))
+        bindings.append(cast(Mapping[str, object], item))
+    _require_artifact_bindings_unchanged(paths, bindings, context=context)
+
+
+def _screening_batch_environment(
+    shards: Sequence[dict[str, Any]],
+) -> dict[str, Any]:
+    """Return the exact runtime contract shared by one derived artifact."""
+    if not shards:
+        raise ValueError("no shards given")
+    reference_environment = shards[0]["environment"]
+    environment_mismatches = [
+        f"{shard['config_name']}/seed={shard['seed']}"
+        for shard in shards
+        if shard["environment"] != reference_environment
+    ]
+    if environment_mismatches:
+        raise ValueError(
+            "shards span multiple runtime environments; process same-environment runs "
+            f"separately (mismatched: {environment_mismatches})"
+        )
+    return dict(reference_environment)
+
+
+def _screening_batch_binding(
+    shards: Sequence[dict[str, Any]], *, field: str, label: str
+) -> dict[str, Any]:
+    """Return an exact provenance binding shared by every v2 shard."""
+    if not shards:
+        raise ValueError("no shards given")
+    reference = shards[0][field]
+    mismatches = [
+        f"{shard['config_name']}/seed={shard['seed']}"
+        for shard in shards
+        if shard[field] != reference
+    ]
+    if mismatches:
+        raise ValueError(
+            f"shards span multiple {label} bindings; process matching runs separately "
+            f"(mismatched: {mismatches})"
+        )
+    return dict(reference)
+
+
+def _validate_screening_arm_contract(
+    config_name: str,
+    per_seed: Mapping[int, dict[str, Any]],
+) -> None:
+    """Reject learner or hyperparameter drift within one named arm."""
+    seeds = sorted(per_seed)
+    reference_base_learner = per_seed[seeds[0]]["base_learner"]
+    mismatched_base_learners = [
+        seed
+        for seed in seeds
+        if per_seed[seed]["base_learner"] != reference_base_learner
+    ]
+    if mismatched_base_learners:
+        raise ValueError(
+            f"config {config_name!r} has inconsistent base_learner across seeds: "
+            f"seed {seeds[0]} used {reference_base_learner!r}, seed(s) "
+            f"{mismatched_base_learners} used different values"
+        )
+    reference_hp = per_seed[seeds[0]]["hyperparameters"]
+    mismatched_hp = [
+        seed for seed in seeds if per_seed[seed]["hyperparameters"] != reference_hp
+    ]
+    if mismatched_hp:
+        raise ValueError(
+            f"config {config_name!r} has inconsistent hyperparameters across seeds: "
+            f"seed {seeds[0]} used {reference_hp!r}, seed(s) {mismatched_hp} used "
+            "different values; refusing to merge runs of different mechanisms "
+            "under one config_name"
+        )
 
 
 def _late_window_slope(per_task_accuracy: np.ndarray, window: int) -> float:
@@ -8110,154 +8522,80 @@ def _late_window_slope(per_task_accuracy: np.ndarray, window: int) -> float:
     return float(np.sum(x * (tail - tail.mean())) / denom)
 
 
-def _aggregate_screening_results(
-    by_config: Mapping[str, Mapping[int, Mapping[str, Any]]],
-    *,
-    control_name: str,
-    slope_window: int,
-) -> list[dict[str, Any]]:
-    """Recompute every deterministic summary result from validated shards."""
-    control = by_config.get(control_name, {})
-    entries: list[dict[str, Any]] = []
-    for name, per_seed in sorted(by_config.items()):
-        seeds = sorted(per_seed)
-        acc = np.stack(
-            [np.asarray(per_seed[seed]["per_task_accuracy"], dtype=np.float64) for seed in seeds]
-        )
-        per_seed_avg = acc.mean(axis=1)
-        slopes = np.asarray(
-            [_late_window_slope(acc[index], slope_window) for index in range(len(seeds))]
-        )
-        entry: dict[str, Any] = {
-            "config_name": name,
-            "base_learner": per_seed[seeds[0]]["base_learner"],
-            "mechanism": per_seed[seeds[0]]["mechanism"],
-            "hyperparameters": per_seed[seeds[0]]["hyperparameters"],
-            "arm_definition_sha256": per_seed[seeds[0]]["arm_definition_sha256"],
-            "seeds": seeds,
-            "n_seeds": len(seeds),
-            "average_online_accuracy_mean": float(per_seed_avg.mean()),
-            "average_online_accuracy_stderr": (
-                float(per_seed_avg.std(ddof=1) / math.sqrt(len(seeds)))
-                if len(seeds) > 1
-                else 0.0
-            ),
-            "per_seed_average_online_accuracy": [
-                round(float(value), 6) for value in per_seed_avg
-            ],
-            "late_window_slope_mean": float(slopes.mean()),
-            "per_seed_late_window_slope": [
-                round(float(value), 8) for value in slopes
-            ],
-            "average_plasticity_mean": float(
-                np.mean(
-                    [
-                        np.mean(per_seed[seed]["per_task_plasticity"])
-                        for seed in seeds
-                    ]
-                )
-            ),
-            "wall_clock_seconds_total": round(
-                float(sum(per_seed[seed]["wall_clock_seconds"] for seed in seeds)), 2
-            ),
-        }
-        common = [seed for seed in seeds if seed in control]
-        if name != control_name and common:
-            control_avg = np.asarray(
-                [
-                    np.mean(
-                        np.asarray(control[seed]["per_task_accuracy"], dtype=np.float64)
-                    )
-                    for seed in common
-                ]
-            )
-            ours_avg = np.asarray(
-                [
-                    np.mean(
-                        np.asarray(per_seed[seed]["per_task_accuracy"], dtype=np.float64)
-                    )
-                    for seed in common
-                ]
-            )
-            diff = ours_avg - control_avg
-            entry["paired_vs_control"] = {
-                "control": control_name,
-                "seeds": common,
-                "per_seed_diff": [round(float(value), 6) for value in diff],
-                "mean_diff": float(diff.mean()),
-                "stderr_diff": (
-                    float(diff.std(ddof=1) / math.sqrt(len(common)))
-                    if len(common) > 1
-                    else 0.0
-                ),
-                "all_seeds_improve": bool(np.all(diff > 0.0)),
-                "beats_control": bool(diff.mean() > 0.0),
-                "confirmation_candidate": bool(diff.mean() > CONFIRMATION_THRESHOLD),
-            }
-        entries.append(entry)
-    entries.sort(key=lambda entry: entry["average_online_accuracy_mean"], reverse=True)
-    return entries
+def _validated_proxy_atol(value: object) -> float:
+    if (
+        type(value) is not float
+        or not math.isfinite(value)
+        or value < 0.0
+        or value > 1e-6
+    ):
+        raise ValueError("proxy validation atol must be a finite float in [0, 1e-6]")
+    return value
 
 
 def merge_shards(
-    paths: Iterable[Path],
+    paths: Sequence[Path],
     control_name: str = "upgd_w_control",
     slope_window: int = 15,
-    expected_seeds: Sequence[int] | None = None,
 ) -> dict[str, Any]:
-    """Merge strict v2 shards under an explicit exact per-arm seed contract."""
-    resolved_paths = tuple(Path(path).resolve(strict=True) for path in paths)
-    records = [
-        _load_shard_record(path, legacy_v1_quarantine=False)
-        for path in resolved_paths
-    ]
-    shards = [record[0] for record in records]
+    """Merge shards into a ranked screening summary with paired comparisons.
+
+    Every config must carry exactly the same seed set. The headline ranking
+    and every comparison against the control are therefore computed over the
+    same paired runs; an incomplete worker batch is rejected before ranking.
+    """
+    normalized_paths = [Path(path) for path in paths]
+    input_bindings = _artifact_file_bindings(
+        normalized_paths, context="screening shard input"
+    )
+    shards = [load_shard(path) for path in normalized_paths]
     if not shards:
         raise ValueError("no shards given")
-    if expected_seeds is None:
-        raise ValueError("an explicit seed-set contract is required")
-    resolved_expected_seeds = tuple(expected_seeds)
-    if (
-        not resolved_expected_seeds
-        or len(set(resolved_expected_seeds)) != len(resolved_expected_seeds)
-        or any(
-            type(seed) is not int or not 0 <= seed <= _MAX_UINT32
-            for seed in resolved_expected_seeds
+    shard_schemas = {shard["schema"] for shard in shards}
+    if len(shard_schemas) != 1:
+        raise ValueError("shards span multiple shard schemas; merge v1 and v2 separately")
+    shard_schema = shard_schemas.pop()
+    source_provenance = (
+        _screening_batch_binding(
+            shards, field="source_provenance", label="source provenance"
         )
-    ):
-        raise ValueError("expected_seeds must contain unique canonical uint32 integers")
-    canonical_expected_seeds = tuple(sorted(resolved_expected_seeds))
+        if shard_schema == SHARD_SCHEMA
+        else None
+    )
+    dataset_provenance = (
+        _screening_batch_binding(shards, field="dataset_provenance", label="dataset")
+        if shard_schema == SHARD_SCHEMA
+        else None
+    )
     configs = {tuple(sorted(s["config"].items())) for s in shards}
     if len(configs) != 1:
         raise ValueError("shards span multiple protocol configs; merge them separately")
-    protocol_config = IPMNISTConfig(**shards[0]["config"])
-    if (
-        isinstance(slope_window, bool)
-        or not isinstance(slope_window, int)
-        or not 1 <= slope_window <= protocol_config.n_tasks
-    ):
-        raise ValueError(
-            f"slope_window must be in [1, {protocol_config.n_tasks}]"
-        )
-    noise_modes = {s.get("noise_mode", "step") for s in shards}
+    if type(slope_window) is not int or slope_window < 2:
+        raise ValueError("slope_window must be a built-in integer of at least 2")
+    noise_modes = {s["noise_mode"] for s in shards}
     if len(noise_modes) != 1:
         raise ValueError(
             "shards span multiple noise modes (pool results are a screening-only "
             "approximation); merge them separately"
         )
     noise_mode = noise_modes.pop()
-    noise_pool_steps = {s["noise_pool_steps"] for s in shards}
-    if len(noise_pool_steps) != 1:
-        raise ValueError("shards span multiple noise_pool_steps values")
-    for field, label in (
-        ("input_dataset", "input datasets"),
-        ("source_identity", "source identities"),
-        ("rng_contract", "RNG contracts"),
-        ("environment", "environment identities"),
-    ):
-        identities = {canonical_json_sha256(shard[field]) for shard in shards}
-        if len(identities) != 1:
-            raise ValueError(f"shards span multiple {label}")
+    unrecorded_pool_shards = [
+        f"{s['config_name']}/seed={s['seed']}"
+        for s in shards
+        if noise_mode == "pool" and s["noise_pool_steps"] is None
+    ]
+    if unrecorded_pool_shards:
+        raise ValueError(
+            "pool-mode shard(s) do not record noise_pool_steps; rerun them to a new path "
+            f"before merging (unrecorded: {unrecorded_pool_shards})"
+        )
+    noise_pool_sizes = {s["noise_pool_steps"] for s in shards}
+    if len(noise_pool_sizes) != 1:
+        raise ValueError(
+            "pool-mode shards span multiple noise_pool_steps values; merge them separately"
+        )
+    noise_pool_steps = noise_pool_sizes.pop()
+    reference_environment = _screening_batch_environment(shards)
     by_config: dict[str, dict[int, dict[str, Any]]] = {}
     for shard in shards:
         per_seed = by_config.setdefault(shard["config_name"], {})
@@ -8268,269 +8606,155 @@ def merge_shards(
         per_seed[shard["seed"]] = shard
 
     if control_name not in by_config:
-        raise ValueError(f"control arm {control_name!r} is absent from the shard set")
+        raise ValueError(
+            f"control {control_name!r} is not among the merged shards "
+            f"(present: {sorted(by_config)}); a summary without its control "
+            "would silently carry no paired_vs_control blocks"
+        )
     for name, per_seed in sorted(by_config.items()):
-        observed = tuple(sorted(per_seed))
-        if observed != canonical_expected_seeds:
+        _validate_screening_arm_contract(name, per_seed)
+    control = by_config[control_name]
+    control_seeds = sorted(control)
+    for name, per_seed in sorted(by_config.items()):
+        seeds = sorted(per_seed)
+        if name != control_name and not any(seed in control for seed in seeds):
             raise ValueError(
-                f"seed-set contract failed for {name!r}: "
-                f"expected {list(canonical_expected_seeds)}, observed {list(observed)}"
+                f"config {name!r} shares no seeds with control {control_name!r} "
+                f"(seeds {seeds} vs {control_seeds}); refusing to rank an "
+                "unpaired entry in the summary"
             )
+    seed_sets = {
+        name: tuple(sorted(per_seed))
+        for name, per_seed in sorted(by_config.items())
+    }
+    if len(set(seed_sets.values())) != 1:
+        raise ValueError(
+            f"seed sets differ across configs: {seed_sets}; "
+            "merge_shards ranks configs on paired seeds only"
+        )
 
-    entries = _aggregate_screening_results(
-        by_config,
-        control_name=control_name,
-        slope_window=slope_window,
-    )
-    input_shards = [
-        {
-            "path": path.as_posix(),
-            "sha256": raw_sha256,
-            "config_name": shard["config_name"],
-            "seed": shard["seed"],
+    entries: list[dict[str, Any]] = []
+    for name, per_seed in sorted(by_config.items()):
+        seeds = sorted(per_seed)
+        wall_clock_total = _finite_wall_clock_total(
+            [per_seed[s]["wall_clock_seconds"] for s in seeds],
+            context=f"config {name!r}",
+        )
+        acc = np.stack(
+            [np.asarray(per_seed[s]["per_task_accuracy"], dtype=np.float64) for s in seeds]
+        )
+        per_seed_avg = acc.mean(axis=1)
+        slopes = np.asarray([_late_window_slope(acc[i], slope_window) for i in range(len(seeds))])
+        entry: dict[str, Any] = {
+            "config_name": name,
+            "base_learner": per_seed[seeds[0]]["base_learner"],
+            "hyperparameters": per_seed[seeds[0]]["hyperparameters"],
+            "seeds": seeds,
+            "n_seeds": len(seeds),
+            "average_online_accuracy_mean": float(per_seed_avg.mean()),
+            "average_online_accuracy_stderr": (
+                float(per_seed_avg.std(ddof=1) / math.sqrt(len(seeds)))
+                if len(seeds) > 1
+                else 0.0
+            ),
+            "per_seed_average_online_accuracy": [round(float(v), 6) for v in per_seed_avg],
+            "late_window_slope_mean": float(slopes.mean()),
+            "per_seed_late_window_slope": [round(float(v), 8) for v in slopes],
+            "average_plasticity_mean": float(
+                np.mean(
+                    [
+                        np.mean(per_seed[s]["per_task_plasticity"])
+                        for s in seeds
+                    ]
+                )
+            ),
+            "wall_clock_seconds_total": round(wall_clock_total, 2),
         }
-        for path, (shard, raw_sha256) in zip(resolved_paths, records, strict=True)
-    ]
+        common = [s for s in seeds if s in control]
+        if name != control_name and common:
+            control_avg = np.asarray(
+                [
+                    np.mean(np.asarray(control[s]["per_task_accuracy"], dtype=np.float64))
+                    for s in common
+                ]
+            )
+            ours_avg = np.asarray(
+                [
+                    np.mean(np.asarray(per_seed[s]["per_task_accuracy"], dtype=np.float64))
+                    for s in common
+                ]
+            )
+            diff = ours_avg - control_avg
+            entry["paired_vs_control"] = {
+                "control": control_name,
+                "seeds": common,
+                "per_seed_diff": [round(float(v), 6) for v in diff],
+                "mean_diff": float(diff.mean()),
+                "stderr_diff": (
+                    float(diff.std(ddof=1) / math.sqrt(len(common)))
+                    if len(common) > 1
+                    else 0.0
+                ),
+                "all_seeds_improve": bool(np.all(diff > 0.0)),
+                "beats_control": bool(diff.mean() > 0.0),
+                # A one-seed paired mean has no spread, so it cannot authorize
+                # the expensive confirmation wave. Keep the paired summary
+                # available for mid-wave inspection, but require two shared
+                # seeds that all improve before setting the compute-spending
+                # flag.
+                "confirmation_candidate": bool(
+                    len(common) >= 2
+                    and np.all(diff > 0.0)
+                    and diff.mean() > CONFIRMATION_THRESHOLD
+                ),
+            }
+        entries.append(entry)
+
+    entries.sort(key=lambda e: e["average_online_accuracy_mean"], reverse=True)
     summary: dict[str, Any] = {
-        "schema": SUMMARY_SCHEMA,
+        "schema": SUMMARY_SCHEMA if shard_schema == SHARD_SCHEMA else LEGACY_SUMMARY_SCHEMA,
         "evidence_policy": dict(NONPROMOTING_POLICY),
         "created_unix": time.time(),
         "protocol_config": dict(shards[0]["config"]),
-        "input_dataset": shards[0]["input_dataset"],
-        "source_identity": shards[0]["source_identity"],
-        "rng_contract": shards[0]["rng_contract"],
-        "environment": shards[0]["environment"],
+        "environment": dict(reference_environment),
         "noise_mode": noise_mode,
-        "noise_pool_steps": next(iter(noise_pool_steps)),
+        "noise_pool_steps": noise_pool_steps,
         "control_name": control_name,
         "confirmation_threshold": CONFIRMATION_THRESHOLD,
         "slope_window": slope_window,
         "n_shards": len(shards),
-        "seed_set_contract": {
-            "expected_seeds": list(canonical_expected_seeds),
-            "require_exact_per_arm": True,
-        },
-        "input_shards": input_shards,
         "results": entries,
     }
-    summary["content_digest"] = _content_digest_record(summary)
+    if source_provenance is not None and dataset_provenance is not None:
+        summary["source_provenance"] = source_provenance
+        summary["dataset_provenance"] = dataset_provenance
+        summary["shard_manifest"] = sorted(
+            (
+                {
+                    **binding,
+                    "config_name": shard["config_name"],
+                    "seed": shard["seed"],
+                }
+                for binding, shard in zip(input_bindings, shards, strict=True)
+            ),
+            key=lambda entry: (
+                cast(str, entry["config_name"]),
+                cast(int, entry["seed"]),
+                cast(str, entry["path"]),
+            ),
+        )
+    _require_artifact_bindings_unchanged(
+        normalized_paths,
+        input_bindings,
+        context="screening shard input",
+    )
     return summary
-
-
-_V2_SUMMARY_FIELDS = frozenset(
-    {
-        "schema",
-        "evidence_policy",
-        "created_unix",
-        "protocol_config",
-        "input_dataset",
-        "source_identity",
-        "rng_contract",
-        "environment",
-        "noise_mode",
-        "noise_pool_steps",
-        "control_name",
-        "confirmation_threshold",
-        "slope_window",
-        "n_shards",
-        "seed_set_contract",
-        "input_shards",
-        "results",
-        "content_digest",
-    }
-)
-
-
-def load_summary(path: Path, *, verify_inputs: bool = True) -> dict[str, Any]:
-    """Load a strict v2 summary and rebind every exact shard byte stream."""
-    if verify_inputs is not True:
-        raise ValueError("strict v2 summary loading cannot disable input verification")
-    summary_path = Path(path)
-    payload = _strict_json_object(summary_path.read_bytes(), path=summary_path)
-    if payload.get("schema") != SUMMARY_SCHEMA:
-        raise ValueError(f"{summary_path}: not an {SUMMARY_SCHEMA} summary")
-    if set(payload) != _V2_SUMMARY_FIELDS:
-        missing = sorted(_V2_SUMMARY_FIELDS - set(payload))
-        extra = sorted(set(payload) - _V2_SUMMARY_FIELDS)
-        raise ValueError(
-            f"{summary_path}: v2 summary field set mismatch; "
-            f"missing={missing}, extra={extra}"
-        )
-    if not _canonical_json_equal(payload["content_digest"], _content_digest_record(payload)):
-        raise ValueError(f"{summary_path}: content digest mismatch")
-    if not _canonical_json_equal(payload["evidence_policy"], NONPROMOTING_POLICY):
-        raise ValueError(f"{summary_path}: evidence policy mismatch")
-    raw_config = payload["protocol_config"]
-    try:
-        config = IPMNISTConfig(**raw_config)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{summary_path}: protocol config is invalid") from exc
-    if not isinstance(raw_config, dict) or not _canonical_json_equal(
-        raw_config, config.to_config()
-    ):
-        raise ValueError(f"{summary_path}: protocol config field set is not canonical")
-    slope_window = payload["slope_window"]
-    if type(slope_window) is not int or not 1 <= slope_window <= config.n_tasks:
-        raise ValueError(f"{summary_path}: slope_window is invalid")
-    if (
-        payload["confirmation_threshold"] != CONFIRMATION_THRESHOLD
-        or not isinstance(payload["control_name"], str)
-        or payload["control_name"] not in SCREENING_REGISTRY
-        or payload["noise_mode"] not in {"step", "pool"}
-        or type(payload["noise_pool_steps"]) is not int
-        or payload["noise_pool_steps"] < 2
-    ):
-        raise ValueError(f"{summary_path}: summary protocol identity is invalid")
-    created_unix = payload["created_unix"]
-    if (
-        isinstance(created_unix, bool)
-        or not isinstance(created_unix, (int, float))
-        or not math.isfinite(created_unix)
-        or created_unix < 0.0
-    ):
-        raise ValueError(f"{summary_path}: created_unix must be finite and non-negative")
-
-    seed_contract = payload["seed_set_contract"]
-    if not isinstance(seed_contract, dict) or set(seed_contract) != {
-        "expected_seeds", "require_exact_per_arm"
-    }:
-        raise ValueError(f"{summary_path}: seed-set contract is malformed")
-    expected_raw = seed_contract["expected_seeds"]
-    if (
-        not isinstance(expected_raw, list)
-        or not expected_raw
-        or expected_raw != sorted(expected_raw)
-        or len(set(expected_raw)) != len(expected_raw)
-        or any(type(seed) is not int or not 0 <= seed <= _MAX_UINT32 for seed in expected_raw)
-        or seed_contract["require_exact_per_arm"] is not True
-    ):
-        raise ValueError(f"{summary_path}: seed-set contract is invalid")
-    expected_seeds = tuple(expected_raw)
-
-    input_records = payload["input_shards"]
-    if (
-        not isinstance(input_records, list)
-        or type(payload["n_shards"]) is not int
-        or payload["n_shards"] != len(input_records)
-        or not input_records
-    ):
-        raise ValueError(f"{summary_path}: input shard count is invalid")
-    observed_by_arm: dict[str, set[int]] = {}
-    seen_paths: set[str] = set()
-    seen_pairs: set[tuple[str, int]] = set()
-    verified_shards: list[dict[str, Any]] = []
-    for record in input_records:
-        if not isinstance(record, dict) or set(record) != {
-            "path", "sha256", "config_name", "seed"
-        }:
-            raise ValueError(f"{summary_path}: input shard record is malformed")
-        record_path = record["path"]
-        name = record["config_name"]
-        seed = record["seed"]
-        canonical_record_path: Path | None = None
-        if isinstance(record_path, str) and record_path:
-            candidate_path = Path(record_path)
-            try:
-                resolved_record_path = candidate_path.resolve(strict=True)
-            except OSError:
-                pass
-            else:
-                if (
-                    candidate_path.is_absolute()
-                    and record_path == resolved_record_path.as_posix()
-                ):
-                    canonical_record_path = resolved_record_path
-        if (
-            not isinstance(record_path, str)
-            or not record_path
-            or canonical_record_path is None
-            or record_path in seen_paths
-            or not _is_sha256(record["sha256"])
-            or not isinstance(name, str)
-            or name not in SCREENING_REGISTRY
-            or type(seed) is not int
-            or (name, seed) in seen_pairs
-        ):
-            raise ValueError(f"{summary_path}: input shard record is invalid")
-        seen_paths.add(record_path)
-        seen_pairs.add((name, seed))
-        observed_by_arm.setdefault(name, set()).add(seed)
-        if verify_inputs:
-            shard_path = canonical_record_path
-            assert shard_path is not None
-            raw = shard_path.read_bytes()
-            if hashlib.sha256(raw).hexdigest() != record["sha256"]:
-                raise ValueError(f"{summary_path}: input shard byte digest mismatch")
-            shard = _strict_json_object(raw, path=shard_path)
-            if shard.get("schema") != SHARD_SCHEMA:
-                raise ValueError(f"{summary_path}: input is not a strict v2 shard")
-            _validate_v2_shard(shard, path=shard_path)
-            verified_shards.append(shard)
-            if shard["config_name"] != name or shard["seed"] != seed:
-                raise ValueError(f"{summary_path}: input shard identity mismatch")
-            for field, summary_field in (
-                ("config", "protocol_config"),
-                ("input_dataset", "input_dataset"),
-                ("source_identity", "source_identity"),
-                ("rng_contract", "rng_contract"),
-                ("environment", "environment"),
-                ("noise_mode", "noise_mode"),
-                ("noise_pool_steps", "noise_pool_steps"),
-            ):
-                if not _canonical_json_equal(shard[field], payload[summary_field]):
-                    raise ValueError(
-                        f"{summary_path}: input shard {field} differs from summary"
-                    )
-    if any(
-        tuple(sorted(seeds)) != expected_seeds
-        or len(seeds) != len(expected_seeds)
-        for seeds in observed_by_arm.values()
-    ):
-        raise ValueError(f"{summary_path}: input seed-set contract failed")
-    if payload["control_name"] not in observed_by_arm:
-        raise ValueError(f"{summary_path}: control arm is absent from input shards")
-
-    results = payload["results"]
-    if not isinstance(results, list) or not results:
-        raise ValueError(f"{summary_path}: results must be a non-empty list")
-    result_names: set[str] = set()
-    for result in results:
-        if not isinstance(result, dict):
-            raise ValueError(f"{summary_path}: result entry is malformed")
-        name = result.get("config_name")
-        if (
-            not isinstance(name, str)
-            or name in result_names
-            or name not in observed_by_arm
-            or result.get("seeds") != list(expected_seeds)
-            or result.get("n_seeds") != len(expected_seeds)
-        ):
-            raise ValueError(f"{summary_path}: result seed-set identity is invalid")
-        result_names.add(name)
-    if result_names != set(observed_by_arm):
-        raise ValueError(f"{summary_path}: results do not cover the exact input arms")
-    if verify_inputs:
-        verified_by_config: dict[str, dict[int, dict[str, Any]]] = {}
-        for shard in verified_shards:
-            verified_by_config.setdefault(shard["config_name"], {})[
-                shard["seed"]
-            ] = shard
-        recomputed_results = _aggregate_screening_results(
-            verified_by_config,
-            control_name=payload["control_name"],
-            slope_window=slope_window,
-        )
-        if not _canonical_json_equal(results, recomputed_results):
-            raise ValueError(f"{summary_path}: derived results do not match input shards")
-    return payload
 
 
 def validate_proxy(
     shard_paths: Sequence[Path],
     partials_dir: Path,
     atol: float = 1e-6,
-    *,
-    legacy_v1_quarantine: bool = False,
 ) -> dict[str, Any]:
     """Validate control shards against the completed full-horizon partials.
 
@@ -8540,30 +8764,150 @@ def validate_proxy(
     UPGD-W > AdamW ordering both in the proxy runs and in the full-run
     prefixes at the same task index.
     """
+    atol = _validated_proxy_atol(atol)
     partials_dir = Path(partials_dir)
-    checks: list[dict[str, Any]] = []
-    proxy_avg: dict[str, list[float]] = {"upgd_w": [], "adamw": []}
-    full_avg: dict[str, list[float]] = {"upgd_w": [], "adamw": []}
-    n_tasks_seen: set[int] = set()
-    for path in shard_paths:
-        shard = load_shard(
-            Path(path), legacy_v1_quarantine=legacy_v1_quarantine
+    normalized_shard_paths = [Path(path) for path in shard_paths]
+    shard_bindings = _artifact_file_bindings(
+        normalized_shard_paths, context="proxy-validation shard input"
+    )
+    shards = [load_shard(path) for path in normalized_shard_paths]
+    if not shards:
+        raise ValueError("no shards given")
+    shard_schemas = {shard["schema"] for shard in shards}
+    if len(shard_schemas) != 1:
+        raise ValueError(
+            "proxy-validation shards span multiple shard schemas; validate v1 and v2 "
+            "separately"
         )
+    shard_schema = shard_schemas.pop()
+    source_provenance = (
+        _screening_batch_binding(
+            shards, field="source_provenance", label="source provenance"
+        )
+        if shard_schema == SHARD_SCHEMA
+        else None
+    )
+    dataset_provenance = (
+        _screening_batch_binding(shards, field="dataset_provenance", label="dataset")
+        if shard_schema == SHARD_SCHEMA
+        else None
+    )
+    environment = _screening_batch_environment(shards)
+    configs = {tuple(sorted(shard["config"].items())) for shard in shards}
+    if len(configs) != 1:
+        raise ValueError(
+            "proxy-validation shards span multiple protocol configs or horizons; "
+            "validate them separately"
+        )
+    learner_by_control = {
+        "upgd_w_control": "upgd_w",
+        "adamw_control": "adamw",
+    }
+    by_control: dict[str, dict[int, dict[str, Any]]] = {}
+    for path, shard in zip(shard_paths, shards, strict=True):
         if shard.get("noise_mode", "step") != "step":
             raise ValueError(
                 f"{path}: proxy validation requires noise_mode='step' shards "
                 f"(got {shard.get('noise_mode')!r})"
             )
-        learner = {"upgd_w_control": "upgd_w", "adamw_control": "adamw"}.get(
-            shard["config_name"]
-        )
+        learner = learner_by_control.get(shard["config_name"])
         if learner is None:
             raise ValueError(f"{path}: proxy validation accepts only control shards")
+        if shard["base_learner"] != learner:
+            raise ValueError(
+                f"{path}: control {shard['config_name']!r} must record "
+                f"base_learner={learner!r}"
+            )
+        expected_hp = SCREENING_REGISTRY[shard["config_name"]].hyperparameters
+        if shard["hyperparameters"] != expected_hp:
+            raise ValueError(
+                f"{path}: control {shard['config_name']!r} must record its frozen "
+                f"hyperparameters {expected_hp!r}"
+            )
+        per_seed = by_control.setdefault(shard["config_name"], {})
+        if shard["seed"] in per_seed:
+            raise ValueError(
+                f"duplicate proxy-validation shard for control={shard['config_name']} "
+                f"seed={shard['seed']}"
+            )
+        per_seed[shard["seed"]] = shard
+    missing_controls = sorted(set(learner_by_control) - set(by_control))
+    if missing_controls:
+        raise ValueError(f"proxy validation is missing control shard(s): {missing_controls}")
+    for config_name, per_seed in by_control.items():
+        _validate_screening_arm_contract(config_name, per_seed)
+    control_seed_sets = {
+        config_name: tuple(sorted(per_seed))
+        for config_name, per_seed in by_control.items()
+    }
+    if len(set(control_seed_sets.values())) != 1:
+        raise ValueError(
+            f"proxy-validation control seed sets differ: {control_seed_sets}; "
+            "paired controls are required"
+        )
+    checks: list[dict[str, Any]] = []
+    proxy_avg: dict[str, list[float]] = {"upgd_w": [], "adamw": []}
+    full_avg: dict[str, list[float]] = {"upgd_w": [], "adamw": []}
+    n_tasks_seen: set[int] = set()
+    reference_paths: list[Path] = []
+    reference_bindings: list[dict[str, object]] = []
+    reference_manifest: list[dict[str, object]] = []
+    for path, shard in zip(shard_paths, shards, strict=True):
+        learner = learner_by_control[shard["config_name"]]
         seed = shard["seed"]
         n_tasks = int(shard["config"]["n_tasks"])
         n_tasks_seen.add(n_tasks)
         partial_path = partials_dir / f"{learner}_seed{seed}.json"
-        reference = json.loads(partial_path.read_text(encoding="utf-8"))
+        reference_binding = _artifact_file_binding(
+            partial_path, context="proxy-validation reference partial"
+        )
+        reference = _validated_partial_payload(
+            partial_path,
+            schema=PARTIAL_SCHEMA_V1,
+            seed_field="seeds",
+        )
+        reference_paths.append(partial_path)
+        reference_bindings.append(reference_binding)
+        reference_manifest.append(
+            {
+                **reference_binding,
+                "learner": learner,
+                "seed": seed,
+            }
+        )
+        if reference["learner"] != learner:
+            raise ValueError(
+                f"{partial_path}: reference learner {reference['learner']!r} does not "
+                f"match expected learner {learner!r}"
+            )
+        if reference["seeds"] != [seed]:
+            raise ValueError(
+                f"{partial_path}: reference seeds must equal the shard seed [{seed}]"
+            )
+        expected_reference_hp = {
+            "upgd_w": UPGD_W_PROTOCOL_HYPERPARAMETERS,
+            "adamw": ADAMW_PROTOCOL_HYPERPARAMETERS,
+        }[learner]
+        if reference["hyperparameters"] != expected_reference_hp:
+            raise ValueError(
+                f"{partial_path}: reference hyperparameters do not match the frozen "
+                f"{learner} protocol"
+            )
+        reference_config = dict(reference["config"])
+        proxy_config = dict(shard["config"])
+        reference_shape = {
+            key: value for key, value in reference_config.items() if key != "n_tasks"
+        }
+        proxy_shape = {
+            key: value for key, value in proxy_config.items() if key != "n_tasks"
+        }
+        if (
+            reference_shape != proxy_shape
+            or int(reference_config["n_tasks"]) < int(proxy_config["n_tasks"])
+        ):
+            raise ValueError(
+                f"{partial_path}: reference config is incompatible with the proxy prefix"
+            )
         full_curve = np.asarray(reference["per_task_accuracy"][0], dtype=np.float64)
         proxy_curve = np.asarray(shard["per_task_accuracy"], dtype=np.float64)
         max_abs_diff = float(np.max(np.abs(proxy_curve - full_curve[:n_tasks])))
@@ -8588,10 +8932,13 @@ def validate_proxy(
         if full_avg["upgd_w"] and full_avg["adamw"]
         else None
     )
-    return {
-        "schema": VALIDATION_SCHEMA,
+    report: dict[str, Any] = {
+        "schema": (
+            VALIDATION_SCHEMA if shard_schema == SHARD_SCHEMA else LEGACY_VALIDATION_SCHEMA
+        ),
         "created_unix": time.time(),
         "atol": atol,
+        "environment": environment,
         "n_tasks": sorted(n_tasks_seen),
         "checks": checks,
         "all_prefixes_match": bool(all(c["prefix_match"] for c in checks)),
@@ -8609,6 +8956,44 @@ def validate_proxy(
             and ordering_full_prefix is True
         ),
     }
+    if source_provenance is not None and dataset_provenance is not None:
+        report["evidence_policy"] = dict(NONPROMOTING_POLICY)
+        report["source_provenance"] = source_provenance
+        report["dataset_provenance"] = dataset_provenance
+        report["shard_manifest"] = sorted(
+            (
+                {
+                    **binding,
+                    "config_name": shard["config_name"],
+                    "seed": shard["seed"],
+                }
+                for binding, shard in zip(shard_bindings, shards, strict=True)
+            ),
+            key=lambda entry: (
+                cast(str, entry["config_name"]),
+                cast(int, entry["seed"]),
+                cast(str, entry["path"]),
+            ),
+        )
+        report["reference_partial_manifest"] = sorted(
+            reference_manifest,
+            key=lambda entry: (
+                cast(str, entry["learner"]),
+                cast(int, entry["seed"]),
+                cast(str, entry["path"]),
+            ),
+        )
+    _require_artifact_bindings_unchanged(
+        normalized_shard_paths,
+        shard_bindings,
+        context="proxy-validation shard input",
+    )
+    _require_artifact_bindings_unchanged(
+        reference_paths,
+        reference_bindings,
+        context="proxy-validation reference partial",
+    )
+    return report
 
 
 # =============================================================================
@@ -8624,17 +9009,59 @@ def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
     keeps a duplicate launch from silently replacing another worker's shard.
     """
 
-    encoded = (json.dumps(payload, indent=1, sort_keys=True) + "\n").encode("utf-8")
+    encoded = (
+        json.dumps(payload, allow_nan=False, indent=1, sort_keys=True) + "\n"
+    ).encode("utf-8")
     atomic_write_new(Path(path), encoded)
 
 
-def _screening_cli_argument_parser(
-    *, exit_on_error: bool = True
-) -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="IPMNIST mechanism-combination screening",
-        exit_on_error=exit_on_error,
+def _screening_derivation_bindings(
+    shard_paths: Sequence[Path],
+) -> tuple[dict[str, object], dict[str, object]] | None:
+    """Capture the current derivation context only for strict v2 inputs."""
+    if not shard_paths:
+        return None
+    first = load_strict_json_object(Path(shard_paths[0]))
+    if first.get("schema") != SHARD_SCHEMA:
+        return None
+    return _screening_source_provenance(), _screening_runtime_environment()
+
+
+def _require_v2_derivation_context(
+    payload: Mapping[str, Any],
+    bindings: tuple[dict[str, object], dict[str, object]] | None,
+) -> None:
+    schema = payload.get("schema")
+    if schema not in {SUMMARY_SCHEMA, VALIDATION_SCHEMA}:
+        return
+    if bindings is None:
+        raise RuntimeError("v2 derivation did not capture a source/runtime context")
+    source_provenance, runtime_environment = bindings
+    if payload.get("source_provenance") != source_provenance:
+        raise RuntimeError(
+            "v2 derivation source does not match the source recorded by its shards"
+        )
+    if payload.get("environment") != runtime_environment:
+        raise RuntimeError(
+            "v2 derivation runtime does not match the runtime recorded by its shards"
+        )
+    if _screening_source_provenance() != source_provenance:
+        raise RuntimeError("screening source provenance changed during derivation")
+    if _screening_runtime_environment() != runtime_environment:
+        raise RuntimeError("screening runtime environment changed during derivation")
+    _require_embedded_artifact_manifest_unchanged(
+        payload.get("shard_manifest"), context="v2 shard inputs"
     )
+    if schema == VALIDATION_SCHEMA:
+        _require_embedded_artifact_manifest_unchanged(
+            payload.get("reference_partial_manifest"),
+            context="v2 proxy reference partials",
+        )
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Screening CLI: ``run`` one (config, seed); ``merge``; ``validate-proxy``."""
+    parser = argparse.ArgumentParser(description="IPMNIST mechanism-combination screening")
     sub = parser.add_subparsers(dest="command", required=True)
 
     run_p = sub.add_parser("run", help="run one (config, seed) shard")
@@ -8646,45 +9073,38 @@ def _screening_cli_argument_parser(
     run_p.add_argument("--out", type=Path, required=True)
     run_p.add_argument("--progress-every", type=int, default=10)
     run_p.add_argument(
-        "--noise-mode",
-        choices=("step", "pool"),
-        default="step",
+        "--noise-mode", choices=("step", "pool"), default="step",
         help="'pool' = screening-only pool-noise approximation "
-        "(lean-UPGD-family arms only; never mergeable with exact shards)",
+             "(lean-UPGD-family arms only; never mergeable with exact shards)",
     )
-    run_p.add_argument("--noise-pool-steps", type=int, default=64)
+    run_p.add_argument(
+        "--noise-pool-steps",
+        type=int,
+        default=64,
+        help="effective pool size recorded in pool-mode shards (must be >= 2)",
+    )
 
     merge_p = sub.add_parser("merge", help="merge shards into a ranked summary")
     merge_p.add_argument("--shards", type=Path, nargs="+", required=True)
     merge_p.add_argument("--control-name", default="upgd_w_control")
     merge_p.add_argument("--slope-window", type=int, default=15)
-    merge_p.add_argument("--expected-seeds", type=int, nargs="+", required=True)
     merge_p.add_argument("--output", type=Path, required=True)
 
     val_p = sub.add_parser("validate-proxy", help="validate control shards vs full partials")
     val_p.add_argument("--shards", type=Path, nargs="+", required=True)
-    val_p.add_argument(
-        "--partials-dir",
-        type=Path,
-        default=Path("outputs/upgd_ipmnist/partials"),
-    )
+    val_p.add_argument("--partials-dir", type=Path,
+                       default=Path("outputs/upgd_ipmnist/partials"))
     val_p.add_argument("--atol", type=float, default=1e-6)
-    val_p.add_argument(
-        "--legacy-v1-quarantine",
-        action="store_true",
-        help="parse unbound v1 shards only for this nonpromoting proxy audit",
-    )
     val_p.add_argument("--output", type=Path, required=True)
-    return parser
 
-
-def main(argv: Sequence[str] | None = None) -> int:
-    """Screening CLI: ``run`` one (config, seed); ``merge``; ``validate-proxy``."""
-    parser = _screening_cli_argument_parser()
-    resolved_argv = list(sys.argv[1:] if argv is None else argv)
-    args = parser.parse_args(resolved_argv)
+    args = parser.parse_args(argv)
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", force=True
+    )
+    run_seed = (
+        require_jax_seed(args.seed, name="seed")
+        if args.command == "run"
+        else None
     )
 
     # Refuse an already-published destination before loading data or processing
@@ -8695,51 +9115,70 @@ def main(argv: Sequence[str] | None = None) -> int:
     output_path = _preflight_new_output(
         args.out if args.command == "run" else args.output
     )
+    derivation_bindings = (
+        _screening_derivation_bindings(args.shards)
+        if args.command in {"merge", "validate-proxy"}
+        else None
+    )
 
     if args.command == "run":
+        assert run_seed is not None
+        seed = run_seed
         spec = screening_spec(args.config_name)
         config = IPMNISTConfig(n_tasks=args.n_tasks, task_length=args.task_length)
+        source_provenance = _screening_source_provenance()
+        runtime_environment = _screening_runtime_environment()
         data_home = args.data_home if args.data_home is not None else default_openml_data_home()
         logger.info("loading MNIST from data_home=%s", data_home)
         data_x, data_y = load_mnist_train(data_home)
+        dataset_provenance = _screening_dataset_provenance(data_x, data_y)
         logger.info(
-            "running %s seed=%d for %d tasks x %d steps (noise_mode=%s)",
-            spec.name, args.seed, config.n_tasks, config.task_length, args.noise_mode,
+            "running %s seed=%d for %d tasks x %d steps "
+            "(noise_mode=%s, noise_pool_steps=%s)",
+            spec.name,
+            seed,
+            config.n_tasks,
+            config.task_length,
+            args.noise_mode,
+            args.noise_pool_steps if args.noise_mode == "pool" else None,
         )
         result = run_screening_config(
-            data_x, data_y, spec, args.seed, config,
+            data_x, data_y, spec, seed, config,
             progress_every=args.progress_every,
             noise_mode=args.noise_mode,
             noise_pool_steps=args.noise_pool_steps,
         )
-        _atomic_write_json(
-            output_path,
-            shard_payload(result, cli_argv=resolved_argv),
+        if _screening_source_provenance() != source_provenance:
+            raise RuntimeError("screening source provenance changed during execution")
+        if _screening_runtime_environment() != runtime_environment:
+            raise RuntimeError("screening runtime environment changed during execution")
+        if _screening_dataset_provenance(data_x, data_y) != dataset_provenance:
+            raise RuntimeError("screening dataset provenance changed during execution")
+        payload = shard_payload(
+            result,
+            source_provenance=source_provenance,
+            dataset_provenance=dataset_provenance,
+            environment=runtime_environment,
         )
+        _atomic_write_json(output_path, payload)
         logger.info(
             "%s seed=%d done: avg online acc %.4f (wall %.1fs) -> %s",
             spec.name,
-            args.seed,
+            seed,
             float(result.per_task_accuracy.mean()),
             result.wall_clock_seconds,
             args.out,
         )
     elif args.command == "merge":
         summary = merge_shards(
-            args.shards,
-            control_name=args.control_name,
-            slope_window=args.slope_window,
-            expected_seeds=args.expected_seeds,
+            args.shards, control_name=args.control_name, slope_window=args.slope_window
         )
+        _require_v2_derivation_context(summary, derivation_bindings)
         _atomic_write_json(output_path, summary)
         logger.info("merged %d shards -> %s", summary["n_shards"], args.output)
     elif args.command == "validate-proxy":
-        report = validate_proxy(
-            args.shards,
-            args.partials_dir,
-            atol=args.atol,
-            legacy_v1_quarantine=args.legacy_v1_quarantine,
-        )
+        report = validate_proxy(args.shards, args.partials_dir, atol=args.atol)
+        _require_v2_derivation_context(report, derivation_bindings)
         _atomic_write_json(output_path, report)
         logger.info(
             "proxy_validated=%s (prefix_match=%s ordering=%s) -> %s",
