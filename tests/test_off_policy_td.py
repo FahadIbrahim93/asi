@@ -957,6 +957,25 @@ def test_public_boundaries_validate_host_metadata_before_jax_conversion() -> Non
         gradient.predict(gradient.init(2), HostileVector())  # type: ignore[arg-type]
 
 
+def test_config_real_subclasses_are_rejected_without_running_hooks() -> None:
+    calls = 0
+
+    class HostileFraction(Fraction):
+        def as_integer_ratio(self) -> tuple[int, int]:
+            nonlocal calls
+            calls += 1
+            raise AssertionError("hostile ratio hook ran")
+
+    for factory in (
+        lambda: OffPolicyTDLinearLearner(step_size=HostileFraction(1, 4)),
+        lambda: ETDLinearLearner(trace_decay=HostileFraction(1, 2)),
+        lambda: GradientTDLinearLearner(ratio_clip=HostileFraction(2, 1)),
+    ):
+        with pytest.raises(ValueError):
+            factory()
+    assert calls == 0
+
+
 def test_state_metadata_is_hostile_safe_and_counters_saturate() -> None:
     class HostileLeaf:
         @property

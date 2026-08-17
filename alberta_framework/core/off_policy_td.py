@@ -55,7 +55,7 @@ import math
 import operator
 import time
 from collections.abc import Mapping
-from numbers import Real
+from fractions import Fraction
 from typing import Any, SupportsIndex, cast
 
 import chex
@@ -87,7 +87,11 @@ _ACTUAL_INT_TYPES = frozenset(
         np.ulonglong,
     }
 )
-_ACTUAL_FLOAT_TYPES = frozenset({float, np.float16, np.float32, np.float64, np.longdouble})
+_ACTUAL_FLOAT_TYPES = frozenset(
+    {float, Fraction, np.float16, np.float32, np.float64, np.longdouble}
+)
+_TRUSTED_REAL_TYPES = _ACTUAL_INT_TYPES | _ACTUAL_FLOAT_TYPES
+_INFINITY_TYPES = _ACTUAL_FLOAT_TYPES - {Fraction}
 
 
 def _require_feature_dim(
@@ -109,17 +113,23 @@ def _require_feature_dim(
 def _positive_float32_or_infinity(name: str, value: object) -> float:
     """Preserve the documented infinity sentinel but reject finite overflow."""
     actual_type = type(value)
-    if issubclass(actual_type, bool) or not issubclass(actual_type, Real):
+    if actual_type not in _TRUSTED_REAL_TYPES:
         raise ValueError(f"{name} must be positive or infinity")
     try:
         numeric_value = cast(Any, value)
-        if actual_type in _ACTUAL_FLOAT_TYPES and bool(np.isinf(numeric_value)):
+        if actual_type in _INFINITY_TYPES and bool(np.isinf(numeric_value)):
             if bool(np.signbit(numeric_value)):
                 raise ValueError(f"{name} must be positive or infinity")
             return math.inf
     except Exception as error:
         raise ValueError(f"{name} must be positive or infinity") from error
     return validated_float32_scalar(name, value, positive=True)
+
+
+def _validated_config_float(name: str, value: object, **bounds: Any) -> float:
+    if type(value) not in _TRUSTED_REAL_TYPES:
+        raise ValueError(f"{name} must be a finite real scalar")
+    return validated_float32_scalar(name, value, **bounds)
 
 
 def _skip_zero_scale(scale: Array, value: Array) -> Array:
@@ -134,11 +144,14 @@ def _zero_if_unused(scale: Array, value: Array) -> Array:
 
 def _array_metadata(name: str, value: object, shape: tuple[int, ...]) -> Array:
     """Require exact float32 host metadata before a value reaches JAX."""
-    try:
-        actual_shape = tuple(value.shape)  # type: ignore[attr-defined]
-        actual_dtype = np.dtype(value.dtype)  # type: ignore[attr-defined]
-    except Exception as error:
-        raise ValueError(f"{name} must expose array shape and dtype metadata") from error
+    if not (
+        type(value) is np.ndarray
+        or isinstance(value, jax.Array)
+        or type(value) is jax.ShapeDtypeStruct
+    ):
+        raise ValueError(f"{name} must expose trusted array metadata")
+    actual_shape = tuple(value.shape)
+    actual_dtype = np.dtype(value.dtype)
     if actual_shape != shape or actual_dtype != np.dtype(np.float32):
         raise ValueError(f"{name} must have shape {shape} and dtype float32")
     return cast(Array, value)
@@ -438,8 +451,8 @@ class OffPolicyTDLinearLearner:
             retrace_clip: Maximum allowed importance ratio (default 1.0;
                 pass float("inf") to disable clipping).
         """
-        self._step_size = validated_float32_scalar("step_size", step_size, positive=True)
-        self._trace_decay = validated_float32_scalar(
+        self._step_size = _validated_config_float("step_size", step_size, positive=True)
+        self._trace_decay = _validated_config_float(
             "trace_decay", trace_decay, lower=0.0, upper=1.0
         )
         self._retrace_clip = _positive_float32_or_infinity("retrace_clip", retrace_clip)
@@ -657,8 +670,8 @@ class ETDLinearLearner:
             step_size: Learning rate alpha (scalar)
             trace_decay: Eligibility trace decay lambda in [0, 1]
         """
-        self._step_size = validated_float32_scalar("step_size", step_size, positive=True)
-        self._trace_decay = validated_float32_scalar(
+        self._step_size = _validated_config_float("step_size", step_size, positive=True)
+        self._trace_decay = _validated_config_float(
             "trace_decay", trace_decay, lower=0.0, upper=1.0
         )
 
@@ -870,11 +883,11 @@ class GradientTDLinearLearner:
         ratio_clip: float = 10.0,
     ):
         """Initialize the learner."""
-        self._step_size = validated_float32_scalar("step_size", step_size, positive=True)
-        self._secondary_step_size = validated_float32_scalar(
+        self._step_size = _validated_config_float("step_size", step_size, positive=True)
+        self._secondary_step_size = _validated_config_float(
             "secondary_step_size", secondary_step_size, lower=0.0
         )
-        self._trace_decay = validated_float32_scalar(
+        self._trace_decay = _validated_config_float(
             "trace_decay", trace_decay, lower=0.0, upper=1.0
         )
         self._ratio_clip = _positive_float32_or_infinity("ratio_clip", ratio_clip)
@@ -1086,11 +1099,11 @@ def run_gradient_td_learning_loop(
     if len(observations_shape) != 2 or observations_shape[0] < 1:
         raise ValueError("observations must have shape (num_steps, feature_dim)")
     num_steps = observations_shape[0]
+    _require_scan_resources(num_steps, feature_dim)
     _array_metadata("observations", observations, (num_steps, feature_dim))
     _array_metadata("next_observations", next_observations, (num_steps, feature_dim))
     for name, value in (("rewards", rewards), ("gammas", gammas), ("rhos", rhos)):
         _array_metadata(name, value, (num_steps,))
-    _require_scan_resources(num_steps, feature_dim)
 
     def step_fn(
         carry: GradientTDState,
