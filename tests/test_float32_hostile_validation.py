@@ -225,6 +225,33 @@ def test_shared_helper_rejects_hostile_bound_without_comparison_hook() -> None:
     assert calls == 0
 
 
+def test_shared_helper_rejects_bound_class_spoof_without_class_hook() -> None:
+    calls = 0
+
+    class ClassSpoof:
+        @property
+        def __class__(self) -> type[float]:  # pragma: no cover
+            nonlocal calls
+            calls += 1
+            raise AssertionError("class hook")
+
+    with pytest.raises(ValueError, match="lower must be"):
+        validated_float32_scalar("value", 0.5, lower=ClassSpoof())
+    assert calls == 0
+
+
+@pytest.mark.parametrize(
+    "bound",
+    [
+        pytest.param(10**10_000, id="integer"),
+        pytest.param(Fraction(10**10_000, 3), id="fraction"),
+    ],
+)
+def test_shared_helper_normalizes_huge_bound_conversion(bound: object) -> None:
+    with pytest.raises(ValueError, match="upper must be"):
+        validated_float32_scalar("value", 0.5, upper=bound)
+
+
 def test_shared_helper_accepts_exact_canonical_bound_families() -> None:
     one_third = Fraction(1, 3)
     assert validated_float32_scalar("value", one_third, lower=one_third) == float(
