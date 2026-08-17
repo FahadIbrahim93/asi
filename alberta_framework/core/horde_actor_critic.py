@@ -1517,6 +1517,11 @@ class NonlinearHordeActorCriticAgent:
         self._actor_optimizer = (
             actor_optimizer if actor_optimizer is not None else Autostep(initial_step_size=0.01)
         )
+        if not self._actor_optimizer.supported_for_mlp():
+            raise ValueError(
+                f"actor_optimizer {type(self._actor_optimizer).__name__} does not support "
+                "the MLP shape-generic update API"
+            )
         self._actor_bounder = actor_bounder
 
     @property
@@ -2184,6 +2189,11 @@ class NonlinearQHordeActorCriticAgent:
         self._actor_optimizer = (
             actor_optimizer if actor_optimizer is not None else Autostep(initial_step_size=0.01)
         )
+        if not self._actor_optimizer.supported_for_mlp():
+            raise ValueError(
+                f"actor_optimizer {type(self._actor_optimizer).__name__} does not support "
+                "the MLP shape-generic update API"
+            )
         self._actor_bounder = actor_bounder
 
     @property
