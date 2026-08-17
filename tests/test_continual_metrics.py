@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import json
+
 import numpy as np
 import pytest
 
 from alberta_framework.utils.metrics import (
+    ContinualLearningSummary,
+    StabilityGap,
     compare_learners,
     compute_backward_transfer,
     compute_forward_transfer,
@@ -349,3 +353,53 @@ def test_stability_and_prequential_reject_boolean_identities() -> None:
     gap = compute_stability_gap([0.0, 1.0, 0.5], 1.0)
     np.testing.assert_allclose(gap.per_step, [1.0, 0.0, 0.5])
     assert compute_prequential_performance([0.0, 1.0]) == pytest.approx(0.5)
+
+
+def test_stability_gap_rejects_leftover_identities() -> None:
+    """Public gap records must not keep leftover bool/NaN identities."""
+
+    with pytest.raises(ValueError, match="mean"):
+        StabilityGap(mean=True, maximum=0.0, per_step=np.array([0.0]))
+    with pytest.raises(ValueError, match="mean"):
+        StabilityGap(mean=float("nan"), maximum=0.0, per_step=np.array([0.0]))
+    with pytest.raises(ValueError, match="maximum"):
+        StabilityGap(mean=0.0, maximum=float("inf"), per_step=np.array([0.0]))
+
+    legal = StabilityGap(mean=0.1, maximum=0.2, per_step=np.array([0.1]))
+    dumped = json.dumps({"mean": legal.mean, "maximum": legal.maximum}, allow_nan=False)
+    assert '"mean": 0.1' in dumped
+    assert '"mean": true' not in dumped
+
+
+def _legal_continual_summary(**overrides: object) -> ContinualLearningSummary:
+    payload: dict[str, object] = {
+        "final_performance": 0.8,
+        "prequential_performance": 0.7,
+        "mean_forgetting": 0.1,
+        "max_forgetting": 0.2,
+        "backward_transfer": 0.0,
+        "stability_gap_mean": 0.05,
+        "stability_gap_max": 0.1,
+        "per_task_final_performance": np.array([0.8]),
+        "per_task_forgetting": np.array([0.1]),
+        "per_task_backward_transfer": np.array([0.0]),
+    }
+    payload.update(overrides)
+    return ContinualLearningSummary(**payload)  # type: ignore[arg-type]
+
+
+def test_continual_learning_summary_rejects_leftover_identities() -> None:
+    with pytest.raises(ValueError, match="final_performance"):
+        _legal_continual_summary(final_performance=True)
+    with pytest.raises(ValueError, match="mean_forgetting"):
+        _legal_continual_summary(mean_forgetting=float("nan"))
+    with pytest.raises(ValueError, match="stability_gap_max"):
+        _legal_continual_summary(stability_gap_max=float("inf"))
+
+    legal = _legal_continual_summary()
+    dumped = json.dumps(
+        {"final_performance": legal.final_performance},
+        allow_nan=False,
+    )
+    assert '"final_performance": 0.8' in dumped
+    assert '"final_performance": true' not in dumped
