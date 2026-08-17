@@ -49,6 +49,16 @@ from alberta_framework.core.types import TimeStep
 
 _FLOAT32_MULTIPLIER_MAX = float(np.sqrt(np.finfo(np.float32).max))
 _INT32_MAX = int(np.iinfo(np.int32).max)
+
+
+def _require_positive_dimension(name: str, value: object) -> int:
+    """Return a positive builtin int inside the int32 host-dimension domain."""
+    canonical = require_positive_builtin_int(value, name=name)
+    if canonical > _INT32_MAX:
+        raise ValueError(f"{name} must be at most int32 max")
+    return canonical
+
+
 _SUPPORTED_NUMPY_REAL_SCALAR_TYPES: tuple[type[object], ...] = (
     np.int8,
     np.int16,
@@ -467,16 +477,14 @@ class FrequencyMismatchStream:
                 a centered Gaussian times this factor).
             noise_std: Standard deviation of target noise.
         """
-        if feature_dim < 1:
-            raise ValueError("feature_dim must be positive")
-        if n_tasks < 1:
-            raise ValueError("n_tasks must be positive")
-        if n_components_per_task < 1:
-            raise ValueError("n_components_per_task must be positive")
-        if n_contexts < 1:
-            raise ValueError("n_contexts must be positive")
-        if context_length < 1:
-            raise ValueError("context_length must be positive")
+        feature_dim = _require_positive_dimension("feature_dim", feature_dim)
+        n_tasks = _require_positive_dimension("n_tasks", n_tasks)
+        n_components_per_task = _require_positive_dimension(
+            "n_components_per_task",
+            n_components_per_task,
+        )
+        n_contexts = _require_positive_dimension("n_contexts", n_contexts)
+        context_length = _require_positive_dimension("context_length", context_length)
         omega_min_float32 = _require_positive_float32(omega_min, "omega_min")
         omega_max_float32 = _require_positive_float32(omega_max, "omega_max")
         if omega_max_float32 <= omega_min_float32:
@@ -702,18 +710,15 @@ class CompositionalStream:
             amplitude_scale: Scale of per-component output amplitudes.
             noise_std: Standard deviation of target noise.
         """
-        if feature_dim < 1:
-            raise ValueError("feature_dim must be positive")
-        if n_tasks < 1:
-            raise ValueError("n_tasks must be positive")
-        if inner_hidden < 1:
-            raise ValueError("inner_hidden must be positive")
-        if outer_components < 1:
-            raise ValueError("outer_components must be positive")
-        if n_contexts < 1:
-            raise ValueError("n_contexts must be positive")
-        if context_length < 1:
-            raise ValueError("context_length must be positive")
+        feature_dim = _require_positive_dimension("feature_dim", feature_dim)
+        n_tasks = _require_positive_dimension("n_tasks", n_tasks)
+        inner_hidden = _require_positive_dimension("inner_hidden", inner_hidden)
+        outer_components = _require_positive_dimension(
+            "outer_components",
+            outer_components,
+        )
+        n_contexts = _require_positive_dimension("n_contexts", n_contexts)
+        context_length = _require_positive_dimension("context_length", context_length)
         feature_std_float32 = _require_finite_float32_multiplier(
             feature_std,
             name="feature_std",
