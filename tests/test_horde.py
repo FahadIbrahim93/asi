@@ -1,8 +1,11 @@
 """Tests for the HordeLearner, learning loops, and equivalence with MultiHeadMLPLearner."""
 
+import math
+
 import chex
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 import pytest
 
 from alberta_framework import (
@@ -913,3 +916,62 @@ def test_gamma_zero_inf_next_pred_is_not_nan_target() -> None:
     )
     assert bool(jnp.isfinite(discounted.td_targets[0]))
     chex.assert_trees_all_close(discounted.td_targets[0], jnp.float32(1.25))
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("step_size", True),
+        ("step_size", False),
+        ("step_size", float("nan")),
+        ("step_size", float("inf")),
+        ("step_size", -0.1),
+        ("sparsity", True),
+        ("sparsity", 1.5),
+        ("leaky_relu_slope", True),
+        ("leaky_relu_slope", -0.01),
+        ("use_layer_norm", 1),
+        ("use_layer_norm", 0),
+        ("use_layer_norm", np.bool_(True)),
+    ],
+)
+def test_horde_learner_rejects_bool_and_nonfinite_constructor_identities(
+    field: str, value: object
+) -> None:
+    spec = create_horde_spec(_make_all_gamma0_spec(1))
+    with pytest.raises(ValueError, match=field):
+        HordeLearner(horde_spec=spec, hidden_sizes=(4,), **{field: value})  # type: ignore[arg-type]
+
+
+def test_horde_learner_keeps_legal_constructor_scalars() -> None:
+    spec = create_horde_spec(_make_all_gamma0_spec(1))
+    horde = HordeLearner(
+        horde_spec=spec,
+        hidden_sizes=(4,),
+        step_size=np.float64(0.0),
+        sparsity=0,
+        leaky_relu_slope=np.float32(0.01),
+        use_layer_norm=False,
+    )
+    assert horde._step_size == 0.0
+    assert horde._sparsity == 0.0
+    assert math.isfinite(horde._leaky_relu_slope)
+    assert horde._use_layer_norm is False
+
+
+def test_mixed_horde_rejects_bool_step_size_before_inner_construction() -> None:
+    from alberta_framework.core.horde import MixedHorde
+
+    spec = create_horde_spec(
+        [
+            GVFSpec(
+                name="d0",
+                demon_type=DemonType.PREDICTION,
+                gamma=0.9,
+                lamda=0.8,
+                cumulant_index=0,
+            )
+        ]
+    )
+    with pytest.raises(ValueError, match="step_size"):
+        MixedHorde(horde_spec=spec, hidden_sizes=(4,), step_size=True)  # type: ignore[arg-type]
