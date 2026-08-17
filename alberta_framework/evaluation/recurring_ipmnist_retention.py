@@ -270,6 +270,32 @@ class SentinelProbeRequirement:
     sentinel_set_sha256: str
     sentinel_case_count: int
 
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "phase_index",
+            _nonnegative_int(self.phase_index, name="phase_index"),
+        )
+        object.__setattr__(
+            self,
+            "checkpoint_step",
+            _positive_int(self.checkpoint_step, name="checkpoint_step"),
+        )
+        _identifier(self.permutation_id, name="permutation_id", versioned=True)
+        _sha256(self.permutation_sha256, name="permutation_sha256")
+        object.__setattr__(
+            self,
+            "exposure_index",
+            _nonnegative_int(self.exposure_index, name="exposure_index"),
+        )
+        _identifier(self.sentinel_set_id, name="sentinel_set_id", versioned=True)
+        _sha256(self.sentinel_set_sha256, name="sentinel_set_sha256")
+        object.__setattr__(
+            self,
+            "sentinel_case_count",
+            _positive_int(self.sentinel_case_count, name="sentinel_case_count"),
+        )
+
     @property
     def ordering_key(self) -> tuple[int, int, str, int]:
         return (

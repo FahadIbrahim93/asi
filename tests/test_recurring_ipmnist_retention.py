@@ -12,6 +12,7 @@ from alberta_framework.evaluation.recurring_ipmnist_retention import (
     RecurringIPMNISTProtocol,
     RecurringIPMNISTTrace,
     SentinelProbeBinding,
+    SentinelProbeRequirement,
     SentinelProbeSnapshot,
     build_recurring_ipmnist_retention_report,
 )
@@ -337,6 +338,28 @@ def test_recurring_ipmnist_dataclasses_reject_booleans_and_non_integers() -> Non
             sentinel_set_sha256=_sha("2"),
             sentinel_case_count=2.5,  # type: ignore[arg-type]
         )
+    with pytest.raises(ValueError, match="phase_index"):
+        SentinelProbeRequirement(
+            phase_index=True,  # type: ignore[arg-type]
+            checkpoint_step=4,
+            permutation_id="permutation-a.v1",
+            permutation_sha256=_sha("a"),
+            exposure_index=0,
+            sentinel_set_id="sentinel-a.v1",
+            sentinel_set_sha256=_sha("2"),
+            sentinel_case_count=1,
+        )
+    with pytest.raises(ValueError, match="sentinel_case_count"):
+        SentinelProbeRequirement(
+            phase_index=0,
+            checkpoint_step=4,
+            permutation_id="permutation-a.v1",
+            permutation_sha256=_sha("a"),
+            exposure_index=0,
+            sentinel_set_id="sentinel-a.v1",
+            sentinel_set_sha256=_sha("2"),
+            sentinel_case_count=True,  # type: ignore[arg-type]
+        )
 
     class HostileInt(int):
         def __index__(self) -> int:
@@ -395,6 +418,23 @@ def test_recurring_ipmnist_dataclasses_accept_and_canonicalize_numpy_integers() 
     assert type(snapshot.checkpoint_step) is int
     assert type(snapshot.exposure_index) is int
     assert type(snapshot.to_config()["checkpoint_step"]) is int
+
+    requirement = SentinelProbeRequirement(
+        phase_index=np.int32(0),
+        checkpoint_step=np.uint16(4),
+        permutation_id="permutation-a.v1",
+        permutation_sha256=_sha("a"),
+        exposure_index=np.uint8(0),
+        sentinel_set_id="sentinel-a.v1",
+        sentinel_set_sha256=_sha("2"),
+        sentinel_case_count=np.int32(1),
+    )
+    assert type(requirement.phase_index) is int
+    assert type(requirement.checkpoint_step) is int
+    assert type(requirement.exposure_index) is int
+    assert type(requirement.sentinel_case_count) is int
+    assert type(requirement.to_config()["phase_index"]) is int
+    assert requirement.to_config()["phase_index"] is not True
 
 
 def test_recurring_ipmnist_phase_preflights_derived_stop_step() -> None:
