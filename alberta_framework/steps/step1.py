@@ -140,6 +140,13 @@ _TRUSTED_INT_TYPES: tuple[type, ...] = (
 )
 
 
+def _require_bool(name: str, value: object) -> bool:
+    """Require an actual builtin bool (``__class__`` spoofing is ignored)."""
+    if type(value) is not bool:
+        raise ValueError(f"{name} must be a bool, got {value!r}")
+    return value
+
+
 def _require_int(
     name: str,
     value: object,
@@ -265,6 +272,18 @@ class Step1SmokeResult:
     final_window_mse: float
     metrics_shape: tuple[int, ...]
     finite: bool
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "steps", _require_int("steps", self.steps, minimum=1, maximum=_INT32_MAX)
+        )
+        object.__setattr__(self, "seed", require_jax_seed(self.seed, name="seed"))
+        object.__setattr__(
+            self,
+            "final_window_mse",
+            _require_real("final_window_mse", self.final_window_mse)[0],
+        )
+        object.__setattr__(self, "finite", _require_bool("finite", self.finite))
 
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-serializable representation."""
