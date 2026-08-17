@@ -54,14 +54,69 @@ Reference:
 from __future__ import annotations
 
 import functools
-from typing import Any, cast
+import operator
+from typing import Any, SupportsIndex, cast
 
 import chex
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 from jax import Array
 from jaxtyping import Float, Int, PRNGKeyArray
+
+from alberta_framework.core._float32_scalars import validated_float32_scalar
+
+_INT32_MAX = 2**31 - 1
+_MAX_PERSISTENT_STATE_BYTES = 256 * 1024 * 1024
+_ACTUAL_INT_TYPES = frozenset(
+    {int, *(np.dtype(code).type for code in ("b", "B", "h", "H", "i", "I", "l", "L", "q", "Q"))}
+)
+
+
+def _require_int32(name: str, value: object, *, minimum: int) -> int:
+    if type(value) not in _ACTUAL_INT_TYPES:
+        raise ValueError(f"{name} must be an integer in [{minimum}, {_INT32_MAX}]")
+    canonical = operator.index(cast(SupportsIndex, value))
+    if not minimum <= canonical <= _INT32_MAX:
+        raise ValueError(f"{name} must be an integer in [{minimum}, {_INT32_MAX}]")
+    return canonical
+
+
+def _require_float32(
+    name: str,
+    value: object,
+    *,
+    lower: float | None = None,
+    upper: float | None = None,
+    upper_inclusive: bool = True,
+    positive: bool = False,
+) -> float:
+    try:
+        return validated_float32_scalar(
+            name,
+            value,
+            lower=lower,
+            upper=upper,
+            upper_inclusive=upper_inclusive,
+            positive=positive,
+        )
+    except Exception as error:
+        raise ValueError(f"{name} is outside its finite float32 domain") from error
+
+
+def _persistent_resources(raw_dim: int, n_candidates: int) -> dict[str, int]:
+    """Exact retained-array budget, excluding compiler and transient buffers."""
+    persistent_scalars = 2 * n_candidates * raw_dim + 3 * n_candidates + 2
+    persistent_bytes = 4 * persistent_scalars
+    if persistent_scalars > _INT32_MAX:
+        raise ValueError("derived cumulant-discovery persistent scalars must fit signed int32")
+    if persistent_bytes > _MAX_PERSISTENT_STATE_BYTES:
+        raise ValueError("derived cumulant-discovery persistent state exceeds 256 MiB")
+    return {
+        "persistent_scalars": persistent_scalars,
+        "persistent_bytes": persistent_bytes,
+    }
 
 # =============================================================================
 # State
@@ -136,24 +191,29 @@ class CumulantDiscovery:
         gamma: float = 0.0,
         enabled: bool = True,
     ):
-        if raw_dim <= 0:
-            raise ValueError(f"raw_dim must be positive; got {raw_dim}")
-        if n_candidates <= 0:
-            raise ValueError(f"n_candidates must be positive; got {n_candidates}")
-        if not 0.0 < decay_rate < 1.0:
-            raise ValueError(f"decay_rate must lie in (0, 1); got {decay_rate}")
-        if not 0.0 <= replacement_rate <= 1.0:
-            raise ValueError(
-                f"replacement_rate must lie in [0, 1]; got {replacement_rate}"
-            )
-        if maturity_threshold < 0:
-            raise ValueError(
-                f"maturity_threshold must be non-negative; got {maturity_threshold}"
-            )
-        if predictor_step_size <= 0:
-            raise ValueError(
-                f"predictor_step_size must be positive; got {predictor_step_size}"
-            )
+        raw_dim = _require_int32("raw_dim", raw_dim, minimum=1)
+        n_candidates = _require_int32("n_candidates", n_candidates, minimum=1)
+        maturity_threshold = _require_int32(
+            "maturity_threshold", maturity_threshold, minimum=0
+        )
+        _persistent_resources(raw_dim, n_candidates)
+        decay_rate = _require_float32(
+            "decay_rate",
+            decay_rate,
+            positive=True,
+            upper=1.0,
+            upper_inclusive=False,
+        )
+        replacement_rate = _require_float32(
+            "replacement_rate", replacement_rate, lower=0.0, upper=1.0
+        )
+        predictor_step_size = _require_float32(
+            "predictor_step_size", predictor_step_size, positive=True
+        )
+        gamma = _require_float32("gamma", gamma, lower=0.0, upper=1.0)
+        if type(enabled) not in (bool, np.bool_):
+            raise ValueError("enabled must be a boolean")
+        enabled = bool(enabled)
 
         self._raw_dim = raw_dim
         self._n_candidates = n_candidates
@@ -175,6 +235,11 @@ class CumulantDiscovery:
     @property
     def enabled(self) -> bool:
         return self._enabled
+
+    @property
+    def persistent_resource_budget(self) -> dict[str, int]:
+        """Exact persistent JAX-array envelope."""
+        return _persistent_resources(self._raw_dim, self._n_candidates)
 
     def init(self, key: Array) -> CumulantDiscoveryState:
         """Initialize state with random projections, zero predictors,
@@ -260,7 +325,7 @@ class CumulantDiscovery:
             weights=proposed_weights,
             biases=proposed_biases,
             utility=proposed_utility,
-            ages=state.ages + 1,
+            ages=jnp.minimum(state.ages, jnp.asarray(_INT32_MAX - 1, dtype=jnp.int32)) + 1,
             key=state.key,
         )
         # Inf next obs makes 0 @ inf = NaN in V(s') at zero init, then
@@ -373,6 +438,35 @@ class CumulantDiscovery:
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> CumulantDiscovery:
         """Reconstruct from dict."""
+        if type(config) is not dict:
+            raise ValueError("cumulant-discovery config must be an exact dictionary")
         config = dict(config)
-        config.pop("type", None)
+        expected = {
+            "type",
+            "raw_dim",
+            "n_candidates",
+            "decay_rate",
+            "replacement_rate",
+            "maturity_threshold",
+            "predictor_step_size",
+            "gamma",
+            "enabled",
+        }
+        if set(config) != expected:
+            raise ValueError("cumulant-discovery config keys are not the exact schema")
+        if config.pop("type") != "CumulantDiscovery":
+            raise ValueError("cumulant-discovery config type is unsupported")
+        for name in ("raw_dim", "n_candidates", "maturity_threshold"):
+            if type(config[name]) is not int:
+                raise ValueError(f"serialized {name} must be an exact JSON integer")
+        for name in (
+            "decay_rate",
+            "replacement_rate",
+            "predictor_step_size",
+            "gamma",
+        ):
+            if type(config[name]) is not float:
+                raise ValueError(f"serialized {name} must be an exact JSON float")
+        if type(config["enabled"]) is not bool:
+            raise ValueError("serialized enabled must be an exact JSON boolean")
         return cls(**config)
