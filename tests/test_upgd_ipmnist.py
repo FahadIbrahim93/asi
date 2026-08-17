@@ -21,6 +21,7 @@ from alberta_framework.benchmarks.upgd_ipmnist import (
     PARTIAL_SCHEMA,
     UPGD_W_PROTOCOL_HYPERPARAMETERS,
     IPMNISTConfig,
+    IPMNISTRunResult,
     LeanUPGDState,
     LearnerUpdateResult,
     _make_adamw_learner,
@@ -1136,3 +1137,52 @@ class TestSummariesAndComparison:
         )
         assert not clean["learners"]["upgd_w"]["reproduction_gap_flagged"]
         assert clean["reference"] is PAPER_REFERENCE
+
+
+def _legal_ipmnist_run_result(**overrides: object) -> IPMNISTRunResult:
+    payload: dict[str, object] = {
+        "learner": "adamw",
+        "hyperparameters": dict(ADAMW_PROTOCOL_HYPERPARAMETERS),
+        "seeds": (0,),
+        "config": TINY,
+        "per_task_accuracy": np.zeros((1, TINY.n_tasks)),
+        "per_task_loss": np.zeros((1, TINY.n_tasks)),
+        "per_task_plasticity": np.zeros((1, TINY.n_tasks)),
+        "average_online_accuracy": np.zeros((1,)),
+        "wall_clock_seconds": 1.0,
+    }
+    payload.update(overrides)
+    return IPMNISTRunResult(**payload)  # type: ignore[arg-type]
+
+
+def test_ipmnist_run_result_rejects_leftover_identities() -> None:
+    """Public IPMNIST result records must not keep leftover bool/NaN identities."""
+
+    with pytest.raises(ValueError, match="wall_clock_seconds"):
+        _legal_ipmnist_run_result(wall_clock_seconds=True)
+    with pytest.raises(ValueError, match="wall_clock_seconds"):
+        _legal_ipmnist_run_result(wall_clock_seconds=float("nan"))
+    with pytest.raises(ValueError, match="wall_clock_seconds"):
+        _legal_ipmnist_run_result(wall_clock_seconds=float("inf"))
+    with pytest.raises(ValueError, match="learner"):
+        _legal_ipmnist_run_result(learner=True)
+    with pytest.raises(ValueError, match="seeds"):
+        _legal_ipmnist_run_result(seeds=(True,))
+    with pytest.raises(ValueError, match="noise_mode"):
+        _legal_ipmnist_run_result(noise_mode=True)
+
+    legal = _legal_ipmnist_run_result()
+    dumped = json.dumps(
+        {
+            "learner": legal.learner,
+            "seeds": list(legal.seeds),
+            "wall_clock_seconds": legal.wall_clock_seconds,
+            "noise_mode": legal.noise_mode,
+        },
+        allow_nan=False,
+    )
+    assert '"wall_clock_seconds": 1.0' in dumped
+    assert '"wall_clock_seconds": true' not in dumped
+    assert '"learner": true' not in dumped
+    assert '"seeds": [true]' not in dumped
+    assert '"noise_mode": true' not in dumped
