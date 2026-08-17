@@ -1014,3 +1014,37 @@ def test_differential_learners_integer_validation() -> None:
     assert s_gtd.weights.shape == (4,)
     assert s_td.weights.shape == (4,)
     assert s_horde.average_rewards.shape == (2,)
+
+
+def test_differential_td_and_gtd_configs_reject_invalid_scalars() -> None:
+    # DifferentialTDConfig
+    with pytest.raises(ValueError, match="step_size"):
+        DifferentialTDConfig(step_size=float("nan"))
+    with pytest.raises(ValueError, match="step_size"):
+        DifferentialTDConfig(step_size=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="average_reward_step_size"):
+        DifferentialTDConfig(average_reward_step_size=float("nan"))
+    with pytest.raises(ValueError, match="trace_decay"):
+        DifferentialTDConfig(trace_decay=float("nan"))
+
+    # DifferentialGTDConfig
+    with pytest.raises(ValueError, match="value_step_size"):
+        DifferentialGTDConfig(value_step_size=float("nan"))
+    with pytest.raises(ValueError, match="secondary_step_size"):
+        DifferentialGTDConfig(secondary_step_size=float("nan"))
+    with pytest.raises(ValueError, match="ratio_clip"):
+        DifferentialGTDConfig(ratio_clip=float("nan"))
+    with pytest.raises(ValueError, match="ratio_clip"):
+        DifferentialGTDConfig(ratio_clip=0.0)
+
+    # AverageRewardHordeLearner
+    with pytest.raises(ValueError, match="average_reward_step_size"):
+        AverageRewardHordeLearner(1, average_reward_step_size=float("nan"))
+    with pytest.raises(ValueError, match="step_size"):
+        AverageRewardHordeLearner(1, step_size=float("nan"))
+    with pytest.raises(ValueError, match="trace_decay"):
+        AverageRewardHordeLearner(1, trace_decay=float("nan"))
+    with pytest.raises(ValueError, match="sparsity"):
+        AverageRewardHordeLearner(1, sparsity=float("nan"))
+    with pytest.raises(ValueError, match="use_layer_norm"):
+        AverageRewardHordeLearner(1, use_layer_norm=1)  # type: ignore[arg-type]
