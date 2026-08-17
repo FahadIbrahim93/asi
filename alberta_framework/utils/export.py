@@ -27,6 +27,8 @@ if TYPE_CHECKING:
 
 def _exported_number(value: SupportsFloat) -> str:
     """Return the shortest text that round-trips one finite binary64 value."""
+    if isinstance(value, (bool, np.bool_)):
+        raise ValueError(f"refusing to export boolean as numeric measurement: {value!r}")
     number = float(value)
     if not math.isfinite(number):
         raise ValueError(f"refusing to export non-finite measurement: {number!r}")
@@ -78,9 +80,7 @@ def _preflight_export_results(
         for metric_name, values in aggregate.metric_arrays.items():
             qualified_name = f"AggregatedResults {name!r} metric {metric_name!r}"
             if values.ndim != 2:
-                raise ValueError(
-                    f"{qualified_name} must be a two-dimensional seed-by-step array"
-                )
+                raise ValueError(f"{qualified_name} must be a two-dimensional seed-by-step array")
             if values.shape[0] != seed_count:
                 raise ValueError(
                     f"AggregatedResults {name!r} seed count ({seed_count}) does not match "
@@ -242,10 +242,10 @@ def export_to_json(
         summary_data: dict[str, dict[str, Any]] = {}
         for metric_name, summary in agg.summary.items():
             summary_data[metric_name] = {
-                "mean": summary.mean,
-                "std": summary.std,
-                "min": summary.min,
-                "max": summary.max,
+                "mean": float(_exported_number(summary.mean)),
+                "std": float(_exported_number(summary.std)),
+                "min": float(_exported_number(summary.min)),
+                "max": float(_exported_number(summary.max)),
                 "n_seeds": summary.n_seeds,
                 "values": summary.values.tolist(),
             }
@@ -271,15 +271,16 @@ def _finite_table_summaries(
     metric: str,
 ) -> dict[str, "MetricSummary"]:
     """Return display summaries only after validating their rendered statistics."""
-    if not results:
-        raise ValueError("table results must be non-empty")
+    _preflight_export_results(results, metric=metric)
 
     summaries: dict[str, MetricSummary] = {}
     for name, aggregate in results.items():
         summary = aggregate.summary[metric]
         mean = float(_exported_number(summary.mean))
         std = float(_exported_number(summary.std))
-        summaries[name] = summary._replace(mean=mean, std=std)
+        minimum = float(_exported_number(summary.min))
+        maximum = float(_exported_number(summary.max))
+        summaries[name] = summary._replace(mean=mean, std=std, min=minimum, max=maximum)
     return summaries
 
 

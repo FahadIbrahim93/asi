@@ -87,9 +87,7 @@ def _result_with_nonfinite(surface: str, number: float) -> AggregatedResults:
         summary = summary._replace(values=np.asarray([number], dtype=np.float64))
         return result._replace(summary={_METRIC: summary})
     if surface == "timeseries":
-        return result._replace(
-            metric_arrays={_METRIC: np.asarray([[number]], dtype=np.float64)}
-        )
+        return result._replace(metric_arrays={_METRIC: np.asarray([[number]], dtype=np.float64)})
     raise AssertionError(f"unknown test surface: {surface}")
 
 
@@ -124,21 +122,13 @@ def _preflight_invalid_results(case: str) -> dict[str, AggregatedResults]:
     elif case == "seed_above_uint32":
         result = result._replace(seeds=[1 << 32])
     elif case == "zero_seed_axis":
-        result = result._replace(
-            metric_arrays={_METRIC: np.empty((0, 1), dtype=np.float64)}
-        )
+        result = result._replace(metric_arrays={_METRIC: np.empty((0, 1), dtype=np.float64)})
     elif case == "zero_step_axis":
-        result = result._replace(
-            metric_arrays={_METRIC: np.empty((1, 0), dtype=np.float64)}
-        )
+        result = result._replace(metric_arrays={_METRIC: np.empty((1, 0), dtype=np.float64)})
     elif case == "metric_ndim":
-        result = result._replace(
-            metric_arrays={_METRIC: np.ones((1, 1, 1), dtype=np.float64)}
-        )
+        result = result._replace(metric_arrays={_METRIC: np.ones((1, 1, 1), dtype=np.float64)})
     elif case == "metric_row_count":
-        result = result._replace(
-            metric_arrays={_METRIC: np.ones((2, 1), dtype=np.float64)}
-        )
+        result = result._replace(metric_arrays={_METRIC: np.ones((2, 1), dtype=np.float64)})
     elif case == "summary_values_ndim":
         bad_summary = summary._replace(values=np.ones((1, 1), dtype=np.float64))
         result = result._replace(summary={_METRIC: bad_summary})
@@ -157,9 +147,7 @@ def _preflight_invalid_results(case: str) -> dict[str, AggregatedResults]:
         )
     elif case == "nonfinite_unselected_summary":
         bad_summary = summary._replace(mean=math.inf)
-        result = result._replace(
-            summary={_METRIC: summary, "unselected": bad_summary}
-        )
+        result = result._replace(summary={_METRIC: summary, "unselected": bad_summary})
     elif case == "empty_metric_arrays":
         result = result._replace(metric_arrays={})
     elif case == "empty_summary":
@@ -348,9 +336,7 @@ def test_csv_preflight_requires_requested_metric_in_every_aggregate(
     valid = _constant_result("valid")
     missing = _constant_result("missing")
     if include_timeseries:
-        missing = missing._replace(
-            metric_arrays={"other": missing.metric_arrays[_METRIC]}
-        )
+        missing = missing._replace(metric_arrays={"other": missing.metric_arrays[_METRIC]})
     else:
         missing = missing._replace(summary={"other": missing.summary[_METRIC]})
     results = {"valid": valid, "missing": missing}
@@ -526,3 +512,27 @@ def test_display_only_tables_keep_four_decimal_presentation() -> None:
 
     assert r"\textbf{0.1235} $\pm$ 0.0000" in latex
     assert "**0.1235** ± 0.0000" in markdown
+
+
+@pytest.mark.parametrize("value", [True, False, np.bool_(True), np.bool_(False)])
+@pytest.mark.parametrize("field", ["mean", "std", "min", "max"])
+def test_export_rejects_boolean_summary_statistics(
+    tmp_path: Path,
+    field: str,
+    value: object,
+) -> None:
+    result = _constant_result("candidate", 1.0)
+    summary = result.summary[_METRIC]._replace(**{field: value})
+    results = {"candidate": result._replace(summary={_METRIC: summary})}
+
+    with pytest.raises(ValueError, match="refusing to export boolean as numeric measurement"):
+        export_to_csv(results, tmp_path / "summary.csv")
+
+    with pytest.raises(ValueError, match="refusing to export boolean as numeric measurement"):
+        export_to_json(results, tmp_path / "summary.json")
+
+    with pytest.raises(ValueError, match="refusing to export boolean as numeric measurement"):
+        generate_latex_table(results)
+
+    with pytest.raises(ValueError, match="refusing to export boolean as numeric measurement"):
+        generate_markdown_table(results)
