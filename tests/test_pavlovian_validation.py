@@ -8,7 +8,7 @@ import pytest
 from alberta_framework.streams.pavlovian import (
     ClassicalConditioningStream,
     PavlovianPhase,
-    _require_float32_resource,
+    _require_pavlovian_resources,
 )
 
 _INT32_MAX = 2**31 - 1
@@ -143,15 +143,14 @@ def test_pavlovian_cs_active_hostile_and_range() -> None:
         _stream(phases=(_phase(cs_active=[0]),))  # type: ignore[arg-type]
 
 
-def test_pavlovian_require_float32_resource_boundaries() -> None:
-    legal = _INT32_MAX // 4
-    _require_float32_resource("test", vector_scalars=legal)
+def test_pavlovian_resource_boundaries_include_static_arrays_state_and_key() -> None:
+    _require_pavlovian_resources(n_phases=1, n_cs=1, n_distractors=0)
     with pytest.raises(ValueError, match="byte count must fit signed int32"):
-        _require_float32_resource("test", vector_scalars=legal + 1)
-    with pytest.raises(ValueError, match="scalar count must fit signed int32"):
-        _require_float32_resource("test", vector_scalars=_INT32_MAX + 1)
-    with pytest.raises(ValueError, match="scalar count must fit signed int32"):
-        _require_float32_resource("test", vector_scalars=_INT32_MAX, fixed_scalars=1)
+        _require_pavlovian_resources(
+            n_phases=1,
+            n_cs=_INT32_MAX // 4,
+            n_distractors=0,
+        )
 
 
 def test_pavlovian_resource_preflight_without_allocation() -> None:
@@ -159,27 +158,45 @@ def test_pavlovian_resource_preflight_without_allocation() -> None:
     # small case passes
     s = _stream(n_cs=2, n_distractors=1, phases=(_phase(), _phase(name="ext")))
     assert s.feature_dim == 3
-    # helper reflects same bound used in __init__
-    _require_float32_resource("Pavlovian phase mask", vector_scalars=2 * 2)
-    # large mask: n_phases=1, n_cs = INT32//4+1 -> byte overflow
-    legal_mask = _INT32_MAX // 4
-    _require_float32_resource("Pavlovian phase mask", vector_scalars=legal_mask)
-    with pytest.raises(ValueError, match="byte count"):
-        _require_float32_resource("Pavlovian phase mask", vector_scalars=legal_mask + 1)
-    # feature state: vector = n_cs + n_distractors = INT32, fixed=4 -> scalar overflow
+    _require_pavlovian_resources(n_phases=2, n_cs=2, n_distractors=1)
     with pytest.raises(ValueError, match="scalar count"):
-        _require_float32_resource(
-            "Pavlovian feature state", vector_scalars=_INT32_MAX, fixed_scalars=4
+        _require_pavlovian_resources(
+            n_phases=_INT32_MAX,
+            n_cs=_INT32_MAX,
+            n_distractors=0,
         )
-    # feature state byte overflow without scalar overflow: total = INT32//4 is max byte-pass
-    legal_feature = _INT32_MAX // 4 - 4
-    _require_float32_resource(
-        "Pavlovian feature state", vector_scalars=legal_feature, fixed_scalars=4
+
+
+def test_pavlovian_phase_container_and_values_are_canonicalized() -> None:
+    from fractions import Fraction
+
+    with pytest.raises(ValueError, match="exact tuple"):
+        _stream(phases=[_phase()])  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="exact PavlovianPhase"):
+        _stream(phases=({"name": "bad"},))  # type: ignore[arg-type]
+
+    stream = _stream(phases=(_phase(cs_us_contingency=Fraction(1, 2)),))
+    assert type(stream.phases[0].cs_us_contingency) is float
+
+
+def test_pavlovian_counters_saturate_and_compound_does_not_double_activate() -> None:
+    import jax.numpy as jnp
+    import jax.random as jr
+
+    stream = _stream(
+        phases=(_phase(cs_active=(0,), compound_index=0),),
+        cs_duration=_INT32_MAX,
+        iti_min=0,
+        iti_max=0,
+        noise_std=0.0,
     )
-    with pytest.raises(ValueError, match="byte count"):
-        _require_float32_resource(
-            "Pavlovian feature state", vector_scalars=legal_feature + 1, fixed_scalars=4
-        )
+    state = stream.init(jr.key(0)).replace(
+        iti_steps_remaining=jnp.asarray(0, dtype=jnp.int32),
+        step_in_phase=jnp.asarray(_INT32_MAX, dtype=jnp.int32),
+    )
+    _, next_state = stream.step(state, jnp.asarray(0, dtype=jnp.int32))
+    assert int(next_state.cs_active_steps_remaining[0]) == _INT32_MAX
+    assert int(next_state.step_in_phase) == _INT32_MAX
 
 
 def test_pavlovian_valid_construction_and_jit() -> None:

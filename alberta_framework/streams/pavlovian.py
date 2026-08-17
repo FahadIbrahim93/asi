@@ -57,7 +57,6 @@ from alberta_framework.core.types import TimeStep
 from alberta_framework.streams.base import ScanStream  # noqa: F401  (re-exported)
 
 _INT32_MAX = 2**31 - 1
-_UINT32_MAX = 4_294_967_295
 _ACTUAL_INT_TYPES: frozenset[type] = frozenset(
     {
         int,
@@ -79,14 +78,18 @@ _ACTUAL_FLOAT_TYPES: frozenset[type] = frozenset(
 _ALLOWED_REAL_TYPES: frozenset[type] = _ACTUAL_INT_TYPES | _ACTUAL_FLOAT_TYPES
 
 
-def _require_float32_resource(
-    name: str, *, vector_scalars: int, fixed_scalars: int = 0
+def _require_pavlovian_resources(
+    *, n_phases: int, n_cs: int, n_distractors: int
 ) -> None:
-    total_scalars = vector_scalars + fixed_scalars
+    """Preflight all persistent JAX arrays owned by the stream and its state."""
+    static_scalars = n_phases * n_cs + 4 * n_phases
+    # State owns feature countdowns, four int32 counters, and one two-word key.
+    state_scalars = n_cs + n_distractors + 6
+    total_scalars = static_scalars + state_scalars
     if total_scalars > _INT32_MAX:
-        raise ValueError(f"{name} scalar count must fit signed int32")
+        raise ValueError("Pavlovian persistent scalar count must fit signed int32")
     if 4 * total_scalars > _INT32_MAX:
-        raise ValueError(f"{name} byte count must fit signed int32")
+        raise ValueError("Pavlovian persistent byte count must fit signed int32")
 
 
 def _require_finite_real(
@@ -336,8 +339,8 @@ class ClassicalConditioningStream:
                 scientific scalar, or ``noise_std`` becomes non-finite when
                 rounded to the stream's float32 execution dtype.
         """
-        if not phases:
-            raise ValueError("phases must be non-empty")
+        if type(phases) is not tuple or not phases:
+            raise ValueError("phases must be a non-empty exact tuple")
         n_cs = _require_builtin_int(n_cs, name="n_cs", minimum=1)
         n_distractors = _require_builtin_int(
             n_distractors, name="n_distractors", minimum=0
@@ -363,22 +366,25 @@ class ClassicalConditioningStream:
             distractor_prob, name="distractor_prob"
         )
 
+        canonical_phases: list[PavlovianPhase] = []
         for phase in phases:
+            if type(phase) is not PavlovianPhase:
+                raise ValueError("each phase must be an exact PavlovianPhase")
             if type(phase.name) is not str:
                 raise ValueError("phase name must be a string")
             try:
-                _require_unit_interval(
+                contingency = _require_unit_interval(
                     phase.cs_us_contingency, name="cs_us_contingency"
                 )
             except ValueError as error:
                 raise ValueError(
                     f"phase {phase.name!r} cs_us_contingency must be in [0, 1]"
                 ) from error
-            _require_builtin_int(phase.n_steps, name="n_steps", minimum=1)
+            n_steps = _require_builtin_int(phase.n_steps, name="n_steps", minimum=1)
             compound_index = _require_builtin_int(
                 phase.compound_index, name="compound_index", minimum=-1
             )
-            if not isinstance(phase.cs_active, tuple):
+            if type(phase.cs_active) is not tuple:
                 raise ValueError("phase cs_active must be a tuple of integers")
             for cs_idx in phase.cs_active:
                 if type(cs_idx) is not int:
@@ -393,22 +399,25 @@ class ClassicalConditioningStream:
                 raise ValueError(
                     f"phase {phase.name!r} has compound_index out of range"
                 )
+            canonical_phases.append(
+                PavlovianPhase(
+                    name=phase.name,
+                    n_steps=n_steps,
+                    cs_us_contingency=contingency,
+                    cs_active=phase.cs_active,
+                    compound_index=compound_index,
+                )
+            )
 
-        # Derived allocations must fit signed int32 without allocating JAX arrays
+        phases = tuple(canonical_phases)
         feature_dim = int(n_cs) + int(n_distractors)
         if feature_dim > _INT32_MAX:
             raise ValueError("feature_dim must fit signed int32")
-        _require_float32_resource(
-            "Pavlovian phase mask",
-            vector_scalars=len(phases) * int(n_cs),
+        _require_pavlovian_resources(
+            n_phases=len(phases),
+            n_cs=n_cs,
+            n_distractors=n_distractors,
         )
-        _require_float32_resource(
-            "Pavlovian feature state",
-            vector_scalars=feature_dim,
-            fixed_scalars=4,
-        )
-        if len(phases) > _INT32_MAX:
-            raise ValueError("n_phases must fit signed int32")
 
         self._phases = tuple(phases)
         self._n_cs = int(n_cs)
@@ -599,7 +608,9 @@ class ClassicalConditioningStream:
             jax.nn.one_hot(jnp.maximum(compound_idx, 0), self._n_cs, dtype=jnp.int32),
             jnp.zeros(self._n_cs, dtype=jnp.int32),
         )
-        cs_activations = (chosen_cs_oh + compound_oh) * jnp.int32(self._cs_duration)
+        cs_activations = jnp.maximum(chosen_cs_oh, compound_oh) * jnp.int32(
+            self._cs_duration
+        )
 
         # ------------------------------------------------------------------
         # 5. Update CS / US / ITI counters
@@ -683,7 +694,9 @@ class ClassicalConditioningStream:
             cs_active_steps_remaining=new_cs_active.astype(jnp.int32),
             us_pending_steps_remaining=new_us_pending.astype(jnp.int32),
             phase_idx=new_phase_idx.astype(jnp.int32),
-            step_in_phase=(new_step_in_phase + 1).astype(jnp.int32),
+            step_in_phase=(
+                jnp.minimum(jnp.maximum(new_step_in_phase, 0), _INT32_MAX - 1) + 1
+            ).astype(jnp.int32),
             n_distractor_active=new_distractor_active.astype(jnp.int32),
             iti_steps_remaining=new_iti_remaining.astype(jnp.int32),
         )
