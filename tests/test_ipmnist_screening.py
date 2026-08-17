@@ -410,6 +410,23 @@ class TestScreeningInputDomain:
                 x, y, spec, seed=0, config=SMALL, noise_mode=noise_mode
             )
 
+    @pytest.mark.parametrize("progress_every", [0, -1, True, 1.5])
+    def test_rejects_invalid_progress_interval_before_learner_factory(
+        self, small_data, progress_every: object
+    ) -> None:
+        """Host-boundary progress identities must not reach the learner factory."""
+        x, y = small_data
+        spec = replace(screening_spec("upgd_w_control"), factory=self._boom_factory)
+        with pytest.raises(ValueError, match="progress_every"):
+            run_screening_config(
+                x,
+                y,
+                spec,
+                seed=0,
+                config=SMALL,
+                progress_every=progress_every,  # type: ignore[arg-type]
+            )
+
 
 class TestIDBDCombo:
     def test_meta_zero_reduces_to_lean_upgd(self):

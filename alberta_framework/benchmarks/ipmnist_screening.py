@@ -7700,6 +7700,10 @@ def run_screening_config(
     ``noise_pool_steps`` and never merge with exact shards nor pass proxy
     validation.
     """
+    if progress_every is not None and (
+        type(progress_every) is not int or progress_every <= 0
+    ):
+        raise ValueError("progress_every must be a positive integer or None")
     resolved_seed = require_jax_seed(seed, name="seed")
     noise_mode = _validated_screening_noise_mode(noise_mode, spec)
     effective_noise_pool_steps = _validated_screening_noise_pool_steps(
