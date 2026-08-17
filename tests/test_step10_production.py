@@ -307,13 +307,12 @@ def test_step10_stomp_fields_reject_invalid_inputs(field: str, value: object) ->
 @pytest.mark.unit
 def test_step10_stomp_int_dimensions_stay_within_int32() -> None:
     int32_max = 2**31 - 1
-    upper = Step10STOMPConfig(
-        subtask_specs=(_SPEC1,),
-        observation_dim=int32_max,
-        n_primitive_actions=int32_max,
-    )
-    assert upper.observation_dim == int32_max
-    assert upper.n_primitive_actions == int32_max
+    # Individual dimensions may fit int32 while the arrays derived from them
+    # do not. The core resource contract must reject those combinations too.
+    with pytest.raises(ValueError, match="derived STOMP direct array bytes"):
+        Step10STOMPConfig(subtask_specs=(_SPEC1,), observation_dim=int32_max)
+    with pytest.raises(ValueError, match="derived n_total_actions"):
+        Step10STOMPConfig(subtask_specs=(_SPEC1,), n_primitive_actions=int32_max)
     with pytest.raises(ValueError, match="observation_dim"):
         Step10STOMPConfig(subtask_specs=(_SPEC1,), observation_dim=int32_max + 1)
     with pytest.raises(ValueError, match="n_primitive_actions"):
@@ -330,8 +329,8 @@ def test_step10_stomp_feature_index_stays_within_int32() -> None:
             observation_dim=2**40,
         )
     spec = SubtaskSpec(feature_index=2**31 - 2)
-    cfg = Step10STOMPConfig(subtask_specs=(spec,), observation_dim=2**31 - 1)
-    assert cfg.subtask_specs[0].feature_index == 2**31 - 2
+    with pytest.raises(ValueError, match="derived STOMP direct array bytes"):
+        Step10STOMPConfig(subtask_specs=(spec,), observation_dim=2**31 - 1)
 
 
 class _SpoofedInt:
