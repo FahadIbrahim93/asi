@@ -1793,6 +1793,11 @@ def causal_map_step(
     reward_sum = state.reward_sum.at[safe_channel].add(
         jnp.where(observed_reward, reward, 0.0)
     )
+    reward_sum = _runtime_require(
+        jnp.all(jnp.isfinite(reward_sum)),
+        reward_sum,
+        message="causal-map reward accumulation must remain finite",
+    )
     next_reward_count = _saturating_add_int32(
         state.reward_count[safe_channel],
         observed_reward.astype(jnp.int32),
