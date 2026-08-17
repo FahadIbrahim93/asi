@@ -78,6 +78,7 @@ from alberta_framework.core.update_safety import (
 from alberta_framework.streams.base import ScanStream
 
 _INT32_MAX = 2**31 - 1
+_MAX_RESOURCE_BYTES = 256 * 1024 * 1024
 _ACTUAL_INT_TYPES = frozenset(
     {
         int,
@@ -95,12 +96,12 @@ _ACTUAL_INT_TYPES = frozenset(
 )
 
 
-def _require_int32(name: str, value: object, *, minimum: int, maximum: int = _INT32_MAX) -> int:
+def _require_int32(name: str, value: object, *, minimum: int) -> int:
     if type(value) not in _ACTUAL_INT_TYPES:
-        raise ValueError(f"{name} must be an integer in [{minimum}, {maximum}]")
+        raise ValueError(f"{name} must be an integer in [{minimum}, {_INT32_MAX}]")
     canonical = operator.index(cast(SupportsIndex, value))
-    if not minimum <= canonical <= maximum:
-        raise ValueError(f"{name} must be an integer in [{minimum}, {maximum}]")
+    if not minimum <= canonical <= _INT32_MAX:
+        raise ValueError(f"{name} must be an integer in [{minimum}, {_INT32_MAX}]")
     return canonical
 
 
@@ -108,8 +109,17 @@ def _require_hidden_sizes(hidden_sizes: object) -> tuple[int, ...]:
     if type(hidden_sizes) is not tuple:
         raise ValueError("hidden_sizes must be an actual tuple")
     return tuple(
-        _require_int32(f"hidden_sizes[{i}]", h, minimum=1) for i, h in enumerate(hidden_sizes)
+        _require_int32(f"hidden_sizes[{index}]", width, minimum=1)
+        for index, width in enumerate(hidden_sizes)
     )
+
+
+def _preflight_float32_resources(name: str, scalar_count: int) -> None:
+    byte_count = 4 * scalar_count
+    if scalar_count > _INT32_MAX or byte_count > _INT32_MAX:
+        raise ValueError(f"{name} resource must fit signed-int32 scalar and byte bounds")
+    if byte_count > _MAX_RESOURCE_BYTES:
+        raise ValueError(f"{name} resource must not exceed the 256 MiB budget")
 
 
 def _skip_zero_scale(scale: Array, value: Array) -> Array:
@@ -230,6 +240,7 @@ class LinearLearner:
             Initial learner state with zero weights and bias
         """
         feature_dim = _require_int32("feature_dim", feature_dim, minimum=1)
+        _preflight_float32_resources("linear learner state", feature_dim + 2)
         optimizer_state = self._optimizer.init(feature_dim)
 
         normalizer_state = None
@@ -337,9 +348,13 @@ class LinearLearner:
                 dtype=jnp.float32,
             )
         else:
-            metrics = jnp.array([squared_error, error, mean_step_size], dtype=jnp.float32)
+            metrics = jnp.array(
+                [squared_error, error, mean_step_size], dtype=jnp.float32
+            )
 
-        inputs_valid = jnp.all(jnp.isfinite(observation)) & jnp.all(jnp.isfinite(target))
+        inputs_valid = jnp.all(jnp.isfinite(observation)) & jnp.all(
+            jnp.isfinite(target)
+        )
         update_applied = (
             floating_tree_is_finite(state)
             & inputs_valid
@@ -350,7 +365,9 @@ class LinearLearner:
             & jnp.isfinite(error)
             & jnp.all(jnp.isfinite(metrics))
         )
-        new_state = select_transaction(update_applied, candidate_state, state).replace(  # type: ignore[attr-defined]
+        new_state = select_transaction(
+            update_applied, candidate_state, state
+        ).replace(  # type: ignore[attr-defined]
             birth_timestamp=state.birth_timestamp,
             uptime_s=state.uptime_s,
         )
@@ -596,7 +613,9 @@ def run_learning_loop[StreamStateT](
                 bias_ss = opt_state.step_size
 
             new_ss_hist = _maybe_record(should_record_ss, ss_hist, recording_idx, weight_ss)
-            new_ss_bias_hist = _maybe_record(should_record_ss, ss_bias_hist, recording_idx, bias_ss)
+            new_ss_bias_hist = _maybe_record(
+                should_record_ss, ss_bias_hist, recording_idx, bias_ss
+            )
             new_ss_rec = _maybe_record(should_record_ss, ss_rec, recording_idx, idx)
             # Track Autostep normalizers (v_i) if applicable
             if ss_norm is not None and hasattr(opt_state, "normalizers"):
@@ -751,13 +770,8 @@ def run_learning_loop_batched[StreamStateT](
         key: Array,
     ) -> tuple[LearnerState, Array, StepSizeHistory | None, NormalizerHistory | None]:
         result = run_learning_loop(
-            learner,
-            stream,
-            num_steps,
-            key,
-            learner_state,
-            step_size_tracking,
-            normalizer_tracking,
+            learner, stream, num_steps, key, learner_state,
+            step_size_tracking, normalizer_tracking,
         )
 
         # Unpack based on what tracking was enabled
@@ -768,7 +782,9 @@ def run_learning_loop_batched[StreamStateT](
             )
             return state, metrics, ss_history, norm_history
         elif step_size_tracking is not None:
-            state, metrics, ss_history = cast(tuple[LearnerState, Array, StepSizeHistory], result)
+            state, metrics, ss_history = cast(
+                tuple[LearnerState, Array, StepSizeHistory], result
+            )
             return state, metrics, ss_history, None
         elif normalizer_tracking is not None:
             state, metrics, norm_history = cast(
@@ -989,7 +1005,9 @@ class MLPLearner:
         return self._normalizer
 
     @staticmethod
-    def dormant_neuron_fraction(state: MLPLearnerState, threshold: float = 0.01) -> float:
+    def dormant_neuron_fraction(
+        state: MLPLearnerState, threshold: float = 0.01
+    ) -> float:
         """Fraction of hidden neurons whose utility EMA is below *threshold*.
 
         Args:
@@ -1109,7 +1127,9 @@ class MLPLearner:
             "bounder": self._bounder.to_config() if self._bounder is not None else None,
             "normalizer": self._normalizer.to_config() if self._normalizer is not None else None,
             "head_optimizer": (
-                self._head_optimizer.to_config() if self._head_optimizer is not None else None
+                self._head_optimizer.to_config()
+                if self._head_optimizer is not None
+                else None
             ),
             "sparsity": self._sparsity,
             "leaky_relu_slope": self._leaky_relu_slope,
@@ -1168,8 +1188,19 @@ class MLPLearner:
             Initial MLP learner state with sparse weights and zero biases
         """
         feature_dim = _require_int32("feature_dim", feature_dim, minimum=1)
-        # Build layer sizes: [feature_dim, hidden1, hidden2, ..., 1]
         layer_sizes = [feature_dim, *self._hidden_sizes, 1]
+        parameter_count = sum(
+            fan_out * (fan_in + 1)
+            for fan_in, fan_out in zip(layer_sizes, layer_sizes[1:])
+        )
+        utility_count = sum(self._hidden_sizes) if self._track_neuron_utility else 0
+        # Parameters, traces, optimizer working/state copies, and optional utility.
+        _preflight_float32_resources(
+            "MLP learner state and initialization work",
+            8 * parameter_count + utility_count + 3,
+        )
+
+        # Build layer sizes: [feature_dim, hidden1, hidden2, ..., 1]
 
         weights_list = []
         biases_list = []
@@ -1381,11 +1412,13 @@ class MLPLearner:
         for j in range(n_trace_entries):
             is_output = self._head_optimizer is not None and j >= n_trace_entries - 2
             opt = self._head_optimizer if is_output else self._optimizer
-            step, new_opt, optimizer_update_applied = _update_from_gradient_with_diagnostics(
-                opt,
-                state.optimizer_states[j],
-                new_traces[j],
-                error=error,
+            step, new_opt, optimizer_update_applied = (
+                _update_from_gradient_with_diagnostics(
+                    opt,
+                    state.optimizer_states[j],
+                    new_traces[j],
+                    error=error,
+                )
             )
             all_steps.append(step)
             new_opt_states.append(new_opt)
@@ -1411,7 +1444,9 @@ class MLPLearner:
             new_b = state.params.biases[i] + error * all_steps[2 * i + 1]
             new_biases.append(new_b)
 
-        new_params = MLPParams(weights=tuple(new_weights), biases=tuple(new_biases))
+        new_params = MLPParams(
+            weights=tuple(new_weights), biases=tuple(new_biases)
+        )
 
         # Per-hidden-unit gradient utility: EMA of row-wise L2 norm of weight gradients
         new_neuron_utility: tuple[Array, ...] | None = state.neuron_utility
@@ -1423,7 +1458,8 @@ class MLPLearner:
                     jnp.zeros_like(state.neuron_utility[i]),
                     decay * state.neuron_utility[i],
                 )
-                + (1.0 - decay) * jnp.sqrt(jnp.sum(weight_grads[i] ** 2, axis=1) + 1e-12)
+                + (1.0 - decay)
+                * jnp.sqrt(jnp.sum(weight_grads[i] ** 2, axis=1) + 1e-12)
                 for i in range(len(self._hidden_sizes))
             )
 
@@ -1442,9 +1478,14 @@ class MLPLearner:
             previous_checked = state.replace(  # type: ignore[attr-defined]
                 traces=tuple(jnp.zeros_like(trace) for trace in state.traces),
             )
-        if state.neuron_utility is not None and self._neuron_utility_decay == 0.0:
+        if (
+            state.neuron_utility is not None
+            and self._neuron_utility_decay == 0.0
+        ):
             previous_checked = previous_checked.replace(  # type: ignore[attr-defined]
-                neuron_utility=tuple(jnp.zeros_like(utility) for utility in state.neuron_utility),
+                neuron_utility=tuple(
+                    jnp.zeros_like(utility) for utility in state.neuron_utility
+                ),
             )
         inputs_valid = jnp.all(jnp.isfinite(observation)) & jnp.isfinite(target_scalar)
         update_applied = (
@@ -1468,7 +1509,9 @@ class MLPLearner:
                 dtype=jnp.float32,
             )
         else:
-            metrics = jnp.array([squared_error, error, bounding_metric], dtype=jnp.float32)
+            metrics = jnp.array(
+                [squared_error, error, bounding_metric], dtype=jnp.float32
+            )
 
         return MLPUpdateResult(
             state=new_state,
@@ -1490,7 +1533,10 @@ def run_mlp_learning_loop[StreamStateT](
     key: Array,
     learner_state: MLPLearnerState | None = None,
     normalizer_tracking: NormalizerTrackingConfig | None = None,
-) -> tuple[MLPLearnerState, Array] | tuple[MLPLearnerState, Array, NormalizerHistory]:
+) -> (
+    tuple[MLPLearnerState, Array]
+    | tuple[MLPLearnerState, Array, NormalizerHistory]
+):
     """Run the MLP learning loop using jax.lax.scan.
 
     This is a JIT-compiled learning loop that uses scan for efficiency.
@@ -1762,6 +1808,8 @@ class TDLinearLearner:
         Returns:
             Initial TD learner state with zero weights and bias
         """
+        feature_dim = _require_int32("feature_dim", feature_dim, minimum=1)
+        _preflight_float32_resources("TD learner state", feature_dim + 2)
         optimizer_state = self._optimizer.init(feature_dim)
 
         return TDLearnerState(
@@ -1866,7 +1914,9 @@ class TDLinearLearner:
             & jnp.isfinite(td_error)
             & jnp.all(jnp.isfinite(metrics))
         )
-        new_state = select_transaction(update_applied, candidate_state, state).replace(  # type: ignore[attr-defined]
+        new_state = select_transaction(
+            update_applied, candidate_state, state
+        ).replace(  # type: ignore[attr-defined]
             birth_timestamp=state.birth_timestamp,
             uptime_s=state.uptime_s,
         )
@@ -1932,6 +1982,7 @@ class TrueOnlineTDLearner:
     def init(self, feature_dim: int) -> TrueOnlineTDState:
         """Initialize learner state."""
         feature_dim = _require_int32("feature_dim", feature_dim, minimum=1)
+        _preflight_float32_resources("true-online TD state", 2 * feature_dim + 5)
         return TrueOnlineTDState(
             weights=jnp.zeros(feature_dim, dtype=jnp.float32),
             bias=jnp.array(0.0, dtype=jnp.float32),
@@ -1981,8 +2032,16 @@ class TrueOnlineTDLearner:
 
         correction = value - state.v_old
         update_scale = alpha * (td_error + correction)
-        new_weights = state.weights + update_scale * new_traces - alpha * correction * observation
-        new_bias = state.bias + update_scale * new_bias_trace - alpha * correction
+        new_weights = (
+            state.weights
+            + update_scale * new_traces
+            - alpha * correction * observation
+        )
+        new_bias = (
+            state.bias
+            + update_scale * new_bias_trace
+            - alpha * correction
+        )
 
         terminal = gamma_scalar == 0.0
         stored_traces = jnp.where(terminal, jnp.zeros_like(new_traces), new_traces)

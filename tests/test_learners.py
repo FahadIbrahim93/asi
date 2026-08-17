@@ -948,32 +948,17 @@ class TestLifecycleUtilities:
         assert agent_uptime_s(state) > 0.0
 
 
-def test_learners_feature_dim_integer_validation() -> None:
-    linear = LinearLearner()
-    td_linear = TDLinearLearner()
-    true_online = TrueOnlineTDLearner()
+@pytest.mark.parametrize(
+    "learner",
+    [LinearLearner(), TDLinearLearner(), TrueOnlineTDLearner()],
+)
+def test_linear_family_feature_dimensions_are_exact_and_preflighted(learner) -> None:
+    for invalid in (True, 0, 4.5, 2**31, np.uint64(2**63)):
+        with pytest.raises(ValueError, match="feature_dim"):
+            learner.init(invalid)
 
-    with pytest.raises(ValueError, match="feature_dim"):
-        linear.init(feature_dim=True)  # type: ignore[arg-type]
-    with pytest.raises(ValueError, match="feature_dim"):
-        linear.init(feature_dim=0)
-    with pytest.raises(ValueError, match="feature_dim"):
-        linear.init(feature_dim=4.5)  # type: ignore[arg-type]
+    state = learner.init(np.longlong(4))
+    assert state.weights.shape == (4,)
 
-    with pytest.raises(ValueError, match="feature_dim"):
-        td_linear.init(feature_dim=True)  # type: ignore[arg-type]
-    with pytest.raises(ValueError, match="feature_dim"):
-        td_linear.init(feature_dim=0)
-
-    with pytest.raises(ValueError, match="feature_dim"):
-        true_online.init(feature_dim=True)  # type: ignore[arg-type]
-    with pytest.raises(ValueError, match="feature_dim"):
-        true_online.init(feature_dim=0)
-
-    s1 = linear.init(feature_dim=np.int32(4))
-    s2 = td_linear.init(feature_dim=np.int64(4))
-    s3 = true_online.init(feature_dim=np.int32(4))
-
-    assert s1.weights.shape == (4,)
-    assert s2.weights.shape == (4,)
-    assert s3.weights.shape == (4,)
+    with pytest.raises(ValueError, match="resource"):
+        learner.init(2**26)
