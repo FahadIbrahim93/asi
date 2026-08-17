@@ -1,4 +1,4 @@
-# mypy: disable-error-code="call-arg"
+# mypy: disable-error-code="attr-defined,call-arg,comparison-overlap,redundant-cast,unused-ignore"
 """Production-facing Step 5 average-reward prediction facade (Predict II).
 
 Step 5 of the Alberta Plan moves prediction to the continuing, average-reward
@@ -23,19 +23,23 @@ References:
 
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass
 from numbers import Integral
 from typing import Any, cast
 
+import jax
 import jax.numpy as jnp
 import jax.random as jr
 import numpy as np
+from jax import Array
 
 from alberta_framework._seed_validation import require_jax_seed
 from alberta_framework.core.average_reward import (
     DifferentialTDArrayResult,
     DifferentialTDConfig,
     DifferentialTDLearner,
+    DifferentialTDState,
     run_differential_td_from_arrays,
 )
 from alberta_framework.steps._float32_validation import finite_real_and_float32
@@ -119,6 +123,8 @@ class Step5AverageRewardTDConfig:
 
     def __post_init__(self) -> None:
         """Reject malformed scientific scalars before JAX execution."""
+        if type(self) is not Step5AverageRewardTDConfig:
+            raise ValueError("config must be an actual Step5AverageRewardTDConfig")
         step_numerator, _, step_size = _finite_float32_scalar(
             "step_size",
             self.step_size,
@@ -165,6 +171,7 @@ class Step5AverageRewardTDConfig:
             "trace_decay",
             _compatible_float32_storage(self.trace_decay, trace_decay),
         )
+        self.to_core_config()
 
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-serializable representation."""
@@ -173,7 +180,13 @@ class Step5AverageRewardTDConfig:
     @classmethod
     def from_dict(cls, payload: dict[str, object]) -> Step5AverageRewardTDConfig:
         """Reconstruct from :meth:`to_dict` output."""
-        if set(payload) != _STEP5_CONFIG_KEYS:
+        if cls is not Step5AverageRewardTDConfig:
+            raise ValueError("cls must be Step5AverageRewardTDConfig")
+        if type(payload) is not dict:
+            raise ValueError("payload must be an actual dict")
+        if any(type(key) is not str for key in payload):
+            raise ValueError("payload keys must be exact strings")
+        if payload.keys() != _STEP5_CONFIG_KEYS:
             raise ValueError(_STEP5_CONFIG_KEYS_ERROR)
         return cls(**cast(Any, payload))
 
@@ -200,6 +213,10 @@ class Step5SmokeResult:
     learner_config: dict[str, Any]
 
     def __post_init__(self) -> None:
+        if type(self) is not Step5SmokeResult:
+            raise ValueError("result must be an actual Step5SmokeResult")
+        if type(self.config) is not Step5AverageRewardTDConfig:
+            raise ValueError("config must be an actual Step5AverageRewardTDConfig")
         object.__setattr__(
             self, "steps", _require_int("steps", self.steps, minimum=1, maximum=_INT32_MAX)
         )
@@ -215,6 +232,11 @@ class Step5SmokeResult:
                 require_step_shape(name, getattr(self, name), steps=self.steps),
             )
         object.__setattr__(self, "finite", _require_bool("finite", self.finite))
+        for name in ("predictions_shape", "td_errors_shape", "average_rewards_shape"):
+            if getattr(self, name) != (self.steps,):
+                raise ValueError(f"{name} must be exactly (steps,)")
+        if type(self.learner_config) is not dict:
+            raise ValueError("learner_config must be an actual dict")
 
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-serializable representation."""
@@ -226,11 +248,93 @@ class Step5SmokeResult:
         return payload
 
 
+def _trusted_array(
+    name: str,
+    value: object,
+    *,
+    shape: tuple[int, ...],
+    dtype: Any,
+) -> Array:
+    actual_type = type(value)
+    if not (
+        actual_type is np.ndarray
+        or issubclass(actual_type, jax.Array)
+        or issubclass(actual_type, jax.core.Tracer)
+    ):
+        raise TypeError(f"{name} must be a trusted array")
+    try:
+        actual_shape = tuple(value.shape)  # type: ignore[attr-defined]
+        actual_dtype = jnp.dtype(value.dtype)  # type: ignore[attr-defined]
+    except (AttributeError, TypeError, ValueError) as error:
+        raise TypeError(f"{name} must expose trusted shape and dtype metadata") from error
+    if actual_shape != shape:
+        raise ValueError(f"{name} must have shape {shape}")
+    if actual_dtype != jnp.dtype(dtype):
+        raise TypeError(f"{name} must have dtype {jnp.dtype(dtype)}")
+    return cast(Array, value)
+
+
+def _preflight_smoke_resources(steps: int, feature_dim: int) -> None:
+    # The smoke lane owns its (T+1, D) observation table and T rewards in
+    # addition to the learner's two D-vectors and four scalar leaves.
+    learner_scalars = 2 * feature_dim + 4
+    input_scalars = (steps + 1) * feature_dim + steps
+    if any(
+        count > _INT32_MAX or 4 * count > _INT32_MAX
+        for count in (learner_scalars, input_scalars, learner_scalars + input_scalars)
+    ):
+        raise ValueError("derived Step 5 smoke float32 resources exceed signed-int32 bounds")
+
+
+def _state_feature_dim(state: DifferentialTDState) -> int:
+    weights = state.weights
+    actual_type = type(weights)
+    if not (
+        actual_type is np.ndarray
+        or issubclass(actual_type, jax.Array)
+        or issubclass(actual_type, jax.core.Tracer)
+    ):
+        raise TypeError("state.weights must be a trusted array")
+    try:
+        shape = tuple(weights.shape)
+    except (AttributeError, TypeError, ValueError) as error:
+        raise TypeError("state.weights must expose trusted shape metadata") from error
+    if len(shape) != 1 or not 1 <= shape[0] <= _INT32_MAX:
+        raise ValueError("state.weights must be a nonempty signed-int32 vector")
+    feature_dim = shape[0]
+    _trusted_array("state.weights", weights, shape=(feature_dim,), dtype=jnp.float32)
+    _trusted_array(
+        "state.eligibility_traces",
+        state.eligibility_traces,
+        shape=(feature_dim,),
+        dtype=jnp.float32,
+    )
+    for name in ("bias", "bias_eligibility_trace", "average_reward"):
+        _trusted_array(
+            name=f"state.{name}",
+            value=getattr(state, name),
+            shape=(),
+            dtype=jnp.float32,
+        )
+    _trusted_array("state.step_count", state.step_count, shape=(), dtype=jnp.int32)
+    if type(state.birth_timestamp) is not float or not math.isfinite(state.birth_timestamp):
+        raise ValueError("state.birth_timestamp must be a finite built-in float")
+    if (
+        type(state.uptime_s) is not float
+        or not math.isfinite(state.uptime_s)
+        or state.uptime_s < 0.0
+    ):
+        raise ValueError("state.uptime_s must be a finite non-negative built-in float")
+    return feature_dim
+
+
 def make_step5_td_learner(
     config: Step5AverageRewardTDConfig | None = None,
 ) -> DifferentialTDLearner:
     """Create the production Step 5 differential TD learner."""
-    cfg = config or Step5AverageRewardTDConfig()
+    cfg = Step5AverageRewardTDConfig() if config is None else config
+    if type(cfg) is not Step5AverageRewardTDConfig:
+        raise TypeError("config must be an actual Step5AverageRewardTDConfig")
     return DifferentialTDLearner(cfg.to_core_config())
 
 
@@ -242,12 +346,36 @@ def run_step5_scan(
     next_observations: object,
 ) -> DifferentialTDArrayResult:
     """Run Step 5 differential TD over pre-collected transition arrays."""
+    if type(learner) is not DifferentialTDLearner:
+        raise TypeError("learner must be an actual DifferentialTDLearner")
+    if type(state) is not DifferentialTDState:
+        raise TypeError("state must be an actual DifferentialTDState")
+    feature_dim = _state_feature_dim(state)
+    actual_type = type(observations)
+    if not (
+        actual_type is np.ndarray
+        or issubclass(actual_type, jax.Array)
+        or issubclass(actual_type, jax.core.Tracer)
+    ):
+        raise TypeError("observations must be a trusted array")
+    try:
+        steps = int(observations.shape[0])  # type: ignore[attr-defined]
+    except (AttributeError, IndexError, TypeError, ValueError) as error:
+        raise TypeError("observations must expose trusted shape metadata") from error
+    if not 1 <= steps <= _INT32_MAX:
+        raise ValueError("observations must contain between 1 and signed-int32 steps")
+    checked_observations = _trusted_array(
+        "observations", observations, shape=(steps, feature_dim), dtype=jnp.float32
+    )
+    checked_rewards = _trusted_array("rewards", rewards, shape=(steps,), dtype=jnp.float32)
+    checked_next = _trusted_array(
+        "next_observations",
+        next_observations,
+        shape=(steps, feature_dim),
+        dtype=jnp.float32,
+    )
     return run_differential_td_from_arrays(
-        learner,
-        state,  # type: ignore[arg-type]
-        observations,  # type: ignore[arg-type]
-        rewards,  # type: ignore[arg-type]
-        next_observations,  # type: ignore[arg-type]
+        learner, state, checked_observations, checked_rewards, checked_next
     )
 
 
@@ -262,8 +390,11 @@ def run_step5_smoke(
     steps = _require_int("steps", steps, minimum=1, maximum=_INT32_MAX)
     feature_dim = _require_int("feature_dim", feature_dim, minimum=1, maximum=_INT32_MAX)
     seed = require_jax_seed(seed, name="seed")
+    _preflight_smoke_resources(steps, feature_dim)
 
-    cfg = config or Step5AverageRewardTDConfig()
+    cfg = Step5AverageRewardTDConfig() if config is None else config
+    if type(cfg) is not Step5AverageRewardTDConfig:
+        raise TypeError("config must be an actual Step5AverageRewardTDConfig")
     learner = make_step5_td_learner(cfg)
     key = jr.key(seed)
     obs_key, reward_key = jr.split(key)
@@ -272,13 +403,7 @@ def run_step5_smoke(
         observations[:-1, 0] + jr.normal(reward_key, (steps,), dtype=jnp.float32)
     )
     state = learner.init(feature_dim)
-    result = run_differential_td_from_arrays(
-        learner,
-        state,
-        observations[:-1],
-        rewards,
-        observations[1:],
-    )
+    result = run_step5_scan(learner, state, observations[:-1], rewards, observations[1:])
     result.td_errors.block_until_ready()
     finite = bool(
         jnp.all(jnp.isfinite(result.predictions))
