@@ -447,6 +447,56 @@ def test_v2_expected_manifest_stable_shards_match_file_digest(tmp_path: Path) ->
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("schema_version", [2.0, "2"])
+def test_v2_artifact_rejects_non_int_schema_version(
+    tmp_path: Path, schema_version: object
+) -> None:
+    paths = _write_v2_shards(tmp_path, seeds=(0,))
+    artifact = _write_v2_artifact(tmp_path, paths)
+    payload = json.loads(artifact.read_text(encoding="utf-8"))
+    payload["schema_version"] = schema_version
+    artifact.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+
+    validation = validate_upgd_ipmnist_v2_artifact(artifact, paths)
+
+    assert not validation.valid
+    assert any("schema_version" in error for error in validation.errors)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "policy_updates",
+    [
+        {
+            "development_only": 1,
+            "scientific_promotion_allowed": 0,
+            "execution_attestation": 0,
+        },
+        {
+            "development_only": 1.0,
+            "scientific_promotion_allowed": 0.0,
+            "execution_attestation": 0.0,
+        },
+    ],
+)
+def test_v2_artifact_rejects_numeric_policy_aliases(
+    tmp_path: Path, policy_updates: dict[str, object]
+) -> None:
+    paths = _write_v2_shards(tmp_path, seeds=(0,))
+    artifact = _write_v2_artifact(tmp_path, paths)
+    payload = json.loads(artifact.read_text(encoding="utf-8"))
+    policy = dict(payload["evidence_policy"])
+    policy.update(policy_updates)
+    payload["evidence_policy"] = policy
+    artifact.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+
+    validation = validate_upgd_ipmnist_v2_artifact(artifact, paths)
+
+    assert not validation.valid
+    assert any("evidence policy" in error for error in validation.errors)
+
+
+@pytest.mark.unit
 def test_v2_validator_rejects_v1_schema_even_when_filename_says_v2(tmp_path: Path) -> None:
     v1_paths = _write_shards(tmp_path, seeds=(0,))
     misleading_path = tmp_path / "results.reconciled_nonpromoting.v2.json"
