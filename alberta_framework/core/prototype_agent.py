@@ -259,8 +259,7 @@ def feature_to_subtask_specs(
 
 _INT32_MAX = 2**31 - 1
 _UINT32_MAX = 4_294_967_295
-_ACTUAL_INT_TYPES: frozenset[type] = frozenset(
-    {
+_ACTUAL_INT_TYPES: tuple[type, ...] = (
         int,
         np.int8,
         np.int16,
@@ -272,12 +271,13 @@ _ACTUAL_INT_TYPES: frozenset[type] = frozenset(
         np.uint64,
         np.longlong,
         np.ulonglong,
-    }
 )
-_ACTUAL_FLOAT_TYPES: frozenset[type] = frozenset(
-    {float, Fraction, *(np.dtype(code).type for code in ("e", "f", "d", "g"))}
+_ACTUAL_FLOAT_TYPES: tuple[type, ...] = (
+    float,
+    Fraction,
+    *(np.dtype(code).type for code in ("e", "f", "d", "g")),
 )
-_ALLOWED_REAL_TYPES: frozenset[type] = _ACTUAL_INT_TYPES | _ACTUAL_FLOAT_TYPES
+_ALLOWED_REAL_TYPES: tuple[type, ...] = _ACTUAL_INT_TYPES + _ACTUAL_FLOAT_TYPES
 
 
 def _require_int(
@@ -287,7 +287,8 @@ def _require_int(
     minimum: int | None = None,
     maximum: int | None = None,
 ) -> int:
-    if type(value) not in _ACTUAL_INT_TYPES:
+    actual_type = type(value)
+    if not any(actual_type is candidate for candidate in _ACTUAL_INT_TYPES):
         raise ValueError(f"{name} must be an integer")
     number = operator.index(cast(SupportsIndex, value))
     if minimum is not None and number < minimum:
@@ -298,7 +299,8 @@ def _require_int(
 
 
 def _validated_config_float(name: str, value: object, **bounds: Any) -> float:
-    if type(value) not in _ALLOWED_REAL_TYPES:
+    actual_type = type(value)
+    if not any(actual_type is candidate for candidate in _ALLOWED_REAL_TYPES):
         raise ValueError(f"{name} must be a finite real scalar")
     return validated_float32_scalar(name, value, **bounds)
 
@@ -953,9 +955,9 @@ class PrototypeAgentConfig:
                 )
         if self.experiential_memory is not None:
             memory = self.experiential_memory
-            if not isinstance(memory, ExperientialMemoryConfig):
+            if type(memory) is not ExperientialMemoryConfig:
                 raise ValueError(
-                    "experiential_memory must be an ExperientialMemoryConfig"
+                    "experiential_memory must be an exact ExperientialMemoryConfig"
                 )
             # ExperientialMemoryConfig predates dataclass-level validation;
             # constructing the bounded substrate enforces its complete static
@@ -1226,10 +1228,7 @@ class PrototypeAgentConfig:
             else None
         )
         experiential_memory_raw = data.pop("experiential_memory", None)
-        if experiential_memory_raw is not None and not isinstance(
-            experiential_memory_raw,
-            dict,
-        ):
+        if experiential_memory_raw is not None and type(experiential_memory_raw) is not dict:
             raise ValueError("experiential_memory must be a configuration object")
         experiential_memory = (
             ExperientialMemoryConfig.from_config(experiential_memory_raw)
@@ -1739,6 +1738,11 @@ class PrototypeExperientialMemoryResourceDeclaration:
     additional query and is therefore zero for the fused transaction.
     """
 
+    memory_capacity: int
+    memory_observation_dim: int
+    memory_key_dim: int
+    memory_action_dim: int
+    memory_outcome_dim: int
     persistent_state_bytes: int
     categorical_policy_queries: int
     causal_step_queries: int
@@ -1749,7 +1753,17 @@ class PrototypeExperientialMemoryResourceDeclaration:
     hard_safety_values_interpreted: int
 
     def __post_init__(self) -> None:
+        if type(self) is not PrototypeExperientialMemoryResourceDeclaration:
+            raise TypeError(
+                "declaration must be an exact "
+                "PrototypeExperientialMemoryResourceDeclaration"
+            )
         for name in (
+            "memory_capacity",
+            "memory_observation_dim",
+            "memory_key_dim",
+            "memory_action_dim",
+            "memory_outcome_dim",
             "persistent_state_bytes",
             "categorical_policy_queries",
             "causal_step_queries",
@@ -1762,8 +1776,45 @@ class PrototypeExperientialMemoryResourceDeclaration:
             object.__setattr__(
                 self,
                 name,
-                _require_int(name, getattr(self, name), minimum=0),
+                _require_int(
+                    name,
+                    getattr(self, name),
+                    minimum=0,
+                    maximum=_INT32_MAX,
+                ),
             )
+        for name in (
+            "memory_capacity",
+            "memory_observation_dim",
+            "memory_key_dim",
+            "memory_action_dim",
+            "memory_outcome_dim",
+        ):
+            if getattr(self, name) < 1:
+                raise ValueError(f"{name} must be positive")
+
+        vector_values = (
+            self.memory_observation_dim
+            + self.memory_key_dim
+            + self.memory_action_dim
+            + self.memory_outcome_dim
+        )
+        expected_persistent_bytes = (
+            self.memory_capacity * (4 * (vector_values + 11) + 4) + 32
+        )
+        expected = {
+            "persistent_state_bytes": expected_persistent_bytes,
+            "categorical_policy_queries": 1,
+            "causal_step_queries": 0,
+            "total_deterministic_prestate_queries": 1,
+            "writes_attempted": 1,
+            "random_draws": 0,
+            "score_mass_values_interpreted": self.memory_action_dim,
+            "hard_safety_values_interpreted": self.memory_action_dim,
+        }
+        for name, expected_value in expected.items():
+            if getattr(self, name) != expected_value:
+                raise ValueError(f"{name} does not match its exact derived identity")
 
     def to_config(self) -> dict[str, int]:
         """Return the exact JSON-compatible resource declaration."""
@@ -2700,9 +2751,15 @@ class PrototypeAgent:
         if policy is None:
             return None
         policy_resources = policy.resource_declaration()
+        memory_config = policy.memory.config
         categorical_queries = policy_resources.memory_queries_per_proposal
         causal_queries = 0
         return PrototypeExperientialMemoryResourceDeclaration(
+            memory_capacity=memory_config.capacity,
+            memory_observation_dim=memory_config.observation_dim,
+            memory_key_dim=memory_config.key_dim,
+            memory_action_dim=memory_config.action_dim,
+            memory_outcome_dim=memory_config.outcome_dim,
             persistent_state_bytes=(
                 policy_resources.external_memory_persistent_state_bytes
             ),
