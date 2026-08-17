@@ -44,6 +44,25 @@ def _sha(label: str) -> str:
 _QUALIFICATION_MANIFEST_SHA256 = _sha("matched-current-qualification-manifest")
 
 
+@pytest.mark.parametrize("invalid", [float("nan"), float("inf"), float("-inf")])
+def test_plain_rejects_nonfinite_number_identities(invalid: float) -> None:
+    """Seal canonicalization must not keep NaN/Inf as trusted JSON scalars."""
+
+    with pytest.raises(seal.ForagerMatchedSealError, match="non-finite JSON number"):
+        seal._plain(invalid)
+    with pytest.raises(seal.ForagerMatchedSealError, match="non-finite JSON number"):
+        seal._plain({"score": invalid})
+
+
+def test_plain_keeps_finite_canonical_scalars() -> None:
+    assert seal._plain({"score": 1.25, "ok": True, "n": 2}) == {
+        "score": 1.25,
+        "ok": True,
+        "n": 2,
+    }
+    assert seal.canonical_json_bytes({"score": 1.25}) == b'{"score":1.25}'
+
+
 def _canonical_sha(value: dict[str, Any]) -> str:
     return hashlib.sha256(executor.canonical_json_bytes(value)).hexdigest()
 

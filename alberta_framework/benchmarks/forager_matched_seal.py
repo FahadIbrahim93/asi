@@ -126,7 +126,13 @@ def _plain(value: Any) -> Any:
         return result
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
         return [_plain(item) for item in value]
-    if value is None or type(value) in {str, bool, int, float}:
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise ForagerMatchedSealError(
+                "canonical content contains a non-finite JSON number"
+            )
+        return value
+    if value is None or type(value) in {str, bool, int}:
         return value
     raise ForagerMatchedSealError(
         f"canonical content contains unsupported {type(value).__name__}"
