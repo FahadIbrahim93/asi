@@ -7,6 +7,7 @@ eta_t`` with non-stationarity in either the target functions or the input
 distribution.
 """
 
+from fractions import Fraction
 from typing import Any
 
 import chex
@@ -378,27 +379,30 @@ class TestStep1StreamsValidation:
             pytest.param((-1, 2**200), id="negative-subnormal-ratio"),
         ],
     )
-    def test_alberta_plan_step1_rejects_adversarial_ratio_drift(
+    def test_alberta_plan_step1_rejects_exact_fraction_drift(
         self, ratio: tuple[int, int]
     ) -> None:
-        class HiddenBoundaryFloat(float):
-            def as_integer_ratio(self) -> tuple[int, int]:
-                return ratio
-
-        with pytest.raises(ValueError, match="drift_rate_w must narrow to a finite float32"):
-            AlbertaPlanStep1Stream(drift_rate_w=HiddenBoundaryFloat(0.5))
+        with pytest.raises(ValueError, match="drift_rate_w must be non-negative"):
+            AlbertaPlanStep1Stream(drift_rate_w=Fraction(*ratio))
 
     def test_alberta_plan_step1_rejects_spoofed_int_class(self) -> None:
         class SpoofedIntFloat(float):
+            class_calls = 0
+            ratio_calls = 0
+
             @property
             def __class__(self) -> type[int]:
+                type(self).class_calls += 1
                 return int
 
             def as_integer_ratio(self) -> tuple[int, int]:
+                type(self).ratio_calls += 1
                 return (-1, 2**200)
 
         with pytest.raises(ValueError, match="drift_rate_w must narrow to a finite float32"):
             AlbertaPlanStep1Stream(drift_rate_w=SpoofedIntFloat(0.5))
+        assert SpoofedIntFloat.class_calls == 0
+        assert SpoofedIntFloat.ratio_calls == 0
 
     def test_alberta_plan_step1_rejects_spoofed_ratio_components(self) -> None:
         class SpoofedComponent:
@@ -410,11 +414,15 @@ class TestStep1StreamsValidation:
                 return 1
 
         class BadRatioFloat(float):
+            calls = 0
+
             def as_integer_ratio(self) -> tuple[Any, Any]:
+                type(self).calls += 1
                 return (SpoofedComponent(), 2)
 
         with pytest.raises(ValueError, match="must narrow to a finite float32"):
             AlbertaPlanStep1Stream(drift_rate_w=BadRatioFloat(0.5))
+        assert BadRatioFloat.calls == 0
 
     def test_xdist_shift_stream_properties_and_boundaries(self) -> None:
         stream = XDistShiftStream(
@@ -495,10 +503,10 @@ class TestStep1StreamsValidation:
                 scale_max=1.00000002,
             )
 
-    def test_xdist_shift_rejects_adversarial_ratio(self) -> None:
-        class HiddenBoundaryFloat(float):
-            def as_integer_ratio(self) -> tuple[int, int]:
-                return (-1, 2**200)
-
-        with pytest.raises(ValueError, match="noise_std must narrow to a finite float32"):
-            XDistShiftStream(feature_dim=10, num_relevant=3, noise_std=HiddenBoundaryFloat(0.5))
+    def test_xdist_shift_rejects_exact_negative_fraction(self) -> None:
+        with pytest.raises(ValueError, match="noise_std must be non-negative"):
+            XDistShiftStream(
+                feature_dim=10,
+                num_relevant=3,
+                noise_std=Fraction(-1, 2**200),
+            )

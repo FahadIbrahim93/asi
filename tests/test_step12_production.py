@@ -1144,15 +1144,11 @@ def test_step12_smoke_rejects_invalid_inputs(kwargs: dict[str, Any], match: str)
         pytest.param((2**200 + 1, 2**200), id="above-one-rounds-to-one"),
     ],
 )
-def test_step12_rejects_adversarial_ratio_floats(
+def test_step12_rejects_exact_fraction_boundaries(
     ratio: tuple[int, int]
 ) -> None:
-    class HiddenBoundaryFloat(float):
-        def as_integer_ratio(self) -> tuple[int, int]:
-            return ratio
-
     with pytest.raises(ValueError, match=r"option_gamma must be in \[0, 1\]"):
-        Step12IAConfig(option_gamma=HiddenBoundaryFloat(0.5))
+        Step12IAConfig(option_gamma=Fraction(*ratio))
 
 
 def test_step12_rejects_class_property_spoofing_float() -> None:
@@ -1171,15 +1167,22 @@ def test_step12_rejects_class_property_spoofing_float() -> None:
 
 def test_step12_rejects_spoofed_int_class_with_negative_ratio() -> None:
     class SpoofedIntFloat(float):
+        class_calls = 0
+        ratio_calls = 0
+
         @property
         def __class__(self) -> type[int]:
+            type(self).class_calls += 1
             return int
 
         def as_integer_ratio(self) -> tuple[int, int]:
+            type(self).ratio_calls += 1
             return (-1, 2**200)
 
-    with pytest.raises(ValueError, match="base_step_size must be non-negative"):
+    with pytest.raises(ValueError, match="base_step_size must be finite"):
         Step12IAConfig(base_step_size=SpoofedIntFloat(0.5))
+    assert SpoofedIntFloat.class_calls == 0
+    assert SpoofedIntFloat.ratio_calls == 0
 
 
 def test_step12_rejects_integer_subclass_conversion_hooks() -> None:
@@ -1201,11 +1204,15 @@ def test_step12_rejects_spoofed_ratio_components() -> None:
             return 1
 
     class BadRatioFloat(float):
+        calls = 0
+
         def as_integer_ratio(self) -> tuple[Any, Any]:
+            type(self).calls += 1
             return (SpoofedComponent(), 2)
 
     with pytest.raises(ValueError, match="must be finite"):
         Step12IAConfig(option_gamma=BadRatioFloat(0.5))
+    assert BadRatioFloat.calls == 0
 
 
 def _legal_step12_smoke_result(**overrides: object) -> Step12SmokeResult:
