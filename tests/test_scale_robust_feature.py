@@ -17,14 +17,21 @@ computation starts, so they stay fast: a rejection must be raised before the
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from alberta_framework._seed_validation import JAX_KEY_SEED_MAX
 from alberta_framework.evaluation.scale_robust_feature import (
+    CONDITION_PRIMARY,
     DEVELOPMENT_SEEDS,
     EVIDENCE_SEEDS,
+    ConditionSeedRecord,
+    PhaseWindowRecord,
+    ScaleRobustFeatureReport,
     run_scale_robust_feature_evaluation,
 )
+from alberta_framework.evaluation.scale_robust_feature_artifact import _phase_payload
 
 
 class _ProtocolStartedError(Exception):
@@ -124,3 +131,84 @@ def test_canonical_evidence_and_development_seeds_pass_validation() -> None:
         run_scale_robust_feature_evaluation(seeds=EVIDENCE_SEEDS)
     with pytest.raises(_ProtocolStartedError):
         run_scale_robust_feature_evaluation(seeds=DEVELOPMENT_SEEDS)
+
+
+def _legal_phase(**overrides: object) -> PhaseWindowRecord:
+    payload: dict[str, object] = {
+        "phase_index": 0,
+        "phase_name": "scale",
+        "step_count": 1,
+        "nonfinite_steps": 0,
+        "phase_squared_error_sum": 1.0,
+        "early_squared_error_sum": 1.0,
+        "early_count": 1,
+        "tail_squared_error_sum": 1.0,
+        "tail_count": 1,
+        "asymptotic_squared_error_sum": 1.0,
+        "asymptotic_count": 1,
+    }
+    payload.update(overrides)
+    return PhaseWindowRecord(**payload)  # type: ignore[arg-type]
+
+
+def test_phase_window_record_rejects_bool_and_nonfinite_identities() -> None:
+    """Public measurement records must not keep leftover bool/NaN identities."""
+
+    with pytest.raises(ValueError, match="phase_index"):
+        _legal_phase(phase_index=True)
+    with pytest.raises(ValueError, match="step_count"):
+        _legal_phase(step_count=False)
+    with pytest.raises(ValueError, match="phase_squared_error_sum"):
+        _legal_phase(phase_squared_error_sum=float("nan"))
+    with pytest.raises(ValueError, match="early_squared_error_sum"):
+        _legal_phase(early_squared_error_sum=float("inf"))
+
+    legal = _legal_phase()
+    dumped = json.dumps(_phase_payload(legal), allow_nan=False)
+    assert '"phase_index": 0' in dumped
+    assert '"phase_index": true' not in dumped
+    assert _legal_phase(phase_squared_error_sum=None).phase_squared_error_sum is None
+
+
+def test_condition_seed_and_report_reject_leftover_identities() -> None:
+    with pytest.raises(ValueError, match="seed"):
+        ConditionSeedRecord(
+            seed=True,  # type: ignore[arg-type]
+            condition=CONDITION_PRIMARY,
+            phases=(),
+            end_segment_5_active_pairs=(),
+            end_segment_7_active_pairs=(),
+            final_active_pairs=(),
+        )
+    with pytest.raises(ValueError, match="end_segment_5_active_pairs"):
+        ConditionSeedRecord(
+            seed=8,
+            condition=CONDITION_PRIMARY,
+            phases=(),
+            end_segment_5_active_pairs=((True, 1),),  # type: ignore[arg-type]
+            end_segment_7_active_pairs=(),
+            final_active_pairs=(),
+        )
+    with pytest.raises(ValueError, match="seeds"):
+        ScaleRobustFeatureReport(
+            seeds=(True,),  # type: ignore[arg-type]
+            records=(),
+            memory_by_condition={},
+            wall_time_seconds_by_condition={CONDITION_PRIMARY: 1.0},
+        )
+    with pytest.raises(ValueError, match="wall_time_seconds_by_condition"):
+        ScaleRobustFeatureReport(
+            seeds=(8,),
+            records=(),
+            memory_by_condition={},
+            wall_time_seconds_by_condition={CONDITION_PRIMARY: float("nan")},
+        )
+
+    report = ScaleRobustFeatureReport(
+        seeds=(8,),
+        records=(),
+        memory_by_condition={},
+        wall_time_seconds_by_condition={CONDITION_PRIMARY: 1.25},
+    )
+    assert report.seeds == (8,)
+    assert report.wall_time_seconds_by_condition[CONDITION_PRIMARY] == 1.25
