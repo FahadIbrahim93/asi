@@ -15,6 +15,7 @@ References:
 
 import operator
 from abc import ABC, abstractmethod
+from math import prod
 from typing import Any, SupportsIndex, cast
 
 import chex
@@ -79,6 +80,17 @@ def _require_shape(shape: object) -> tuple[int, ...]:
     if type(shape) is not tuple:
         raise ValueError("shape must be an actual tuple")
     return tuple(_require_int32(f"shape[{i}]", s, minimum=1) for i, s in enumerate(shape))
+
+
+def _require_float32_state(name: str, scalar_count: int) -> None:
+    if scalar_count > _INT32_MAX:
+        raise ValueError(f"{name} scalar count must fit signed int32")
+    if 4 * scalar_count > _INT32_MAX:
+        raise ValueError(f"{name} byte count must fit signed int32")
+
+
+def _shape_size(shape: tuple[int, ...]) -> int:
+    return prod(shape, start=1)
 
 
 # =============================================================================
@@ -723,6 +735,7 @@ class IDBD(Optimizer[IDBDState]):
             IDBD state with per-weight step-sizes and traces
         """
         feature_dim = _require_int32("feature_dim", feature_dim, minimum=1)
+        _require_float32_state("IDBD state", 2 * feature_dim + 3)
         return IDBDState(
             log_step_sizes=jnp.full(
                 feature_dim, jnp.log(self._initial_step_size), dtype=jnp.float32
@@ -743,6 +756,7 @@ class IDBD(Optimizer[IDBDState]):
             IDBDParamState with arrays matching the given shape
         """
         shape = _require_shape(shape)
+        _require_float32_state("IDBD parameter state", 2 * _shape_size(shape) + 1)
         return IDBDParamState(
             log_step_sizes=jnp.full(shape, jnp.log(self._initial_step_size), dtype=jnp.float32),
             traces=jnp.zeros(shape, dtype=jnp.float32),
@@ -1064,6 +1078,7 @@ class Autostep(Optimizer[AutostepState]):
             Autostep state with per-weight step-sizes, traces, and normalizers
         """
         feature_dim = _require_int32("feature_dim", feature_dim, minimum=1)
+        _require_float32_state("Autostep state", 3 * feature_dim + 5)
         return AutostepState(
             step_sizes=jnp.full(feature_dim, self._initial_step_size, dtype=jnp.float32),
             traces=jnp.zeros(feature_dim, dtype=jnp.float32),
@@ -1085,6 +1100,7 @@ class Autostep(Optimizer[AutostepState]):
             AutostepParamState with arrays matching the given shape
         """
         shape = _require_shape(shape)
+        _require_float32_state("Autostep parameter state", 3 * _shape_size(shape) + 2)
         return AutostepParamState(
             step_sizes=jnp.full(shape, self._initial_step_size, dtype=jnp.float32),
             traces=jnp.zeros(shape, dtype=jnp.float32),
@@ -1448,6 +1464,8 @@ class AutostepGTDLambda(Optimizer[AutostepGTDLambdaState]):
 
     def init(self, feature_dim: int) -> AutostepGTDLambdaState:
         """Initialize optimizer state."""
+        feature_dim = _require_int32("feature_dim", feature_dim, minimum=1)
+        _require_float32_state("AutostepGTDLambda state", 4 * feature_dim + 7)
         base_state = self._base.init(feature_dim)
         return AutostepGTDLambdaState(
             step_sizes=base_state.step_sizes,
@@ -1591,6 +1609,8 @@ class ObGD(Optimizer[ObGDState]):
         Returns:
             ObGD state with eligibility traces
         """
+        feature_dim = _require_int32("feature_dim", feature_dim, minimum=1)
+        _require_float32_state("ObGD state", feature_dim + 5)
         return ObGDState(
             step_size=jnp.array(self._step_size, dtype=jnp.float32),
             kappa=jnp.array(self._kappa, dtype=jnp.float32),
@@ -1818,6 +1838,8 @@ class TDIDBD(TDOptimizer[TDIDBDState]):
         Returns:
             TD-IDBD state with per-weight step-sizes, traces, and h traces
         """
+        feature_dim = _require_int32("feature_dim", feature_dim, minimum=1)
+        _require_float32_state("TDIDBD state", 3 * feature_dim + 5)
         return TDIDBDState(
             log_step_sizes=jnp.full(
                 feature_dim, jnp.log(self._initial_step_size), dtype=jnp.float32
@@ -2030,6 +2052,8 @@ class AutoTDIDBD(TDOptimizer[AutoTDIDBDState]):
         Returns:
             AutoTDIDBD state with per-weight step-sizes, traces, h traces, and normalizers
         """
+        feature_dim = _require_int32("feature_dim", feature_dim, minimum=1)
+        _require_float32_state("AutoTDIDBD state", 4 * feature_dim + 7)
         return AutoTDIDBDState(
             log_step_sizes=jnp.full(
                 feature_dim, jnp.log(self._initial_step_size), dtype=jnp.float32

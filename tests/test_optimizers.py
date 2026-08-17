@@ -1,6 +1,7 @@
 """Tests for LMS, IDBD, Autostep, and ObGD optimizers."""
 
 import chex
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -14,6 +15,9 @@ from alberta_framework import (
     ObGD,
     optimizer_from_config,
 )
+from alberta_framework.core.optimizers import TDIDBD, AutoTDIDBD
+
+_INT32_MAX = 2**31 - 1
 
 
 class TestLMS:
@@ -1040,3 +1044,80 @@ def test_optimizers_init_integer_and_shape_validation() -> None:
     assert float(s_lms_p.step_size) == pytest.approx(0.01)
     assert s_idbd_p.traces.shape == (4, 8)
     assert s_auto_p.traces.shape == (4, 8)
+
+
+@pytest.mark.parametrize(
+    ("optimizer", "array_field"),
+    [
+        (AutostepGTDLambda(), "step_sizes"),
+        (ObGD(), "traces"),
+        (TDIDBD(), "log_step_sizes"),
+        (AutoTDIDBD(), "log_step_sizes"),
+    ],
+)
+def test_all_vector_optimizer_initializers_reject_hostile_dimensions(
+    optimizer: object,
+    array_field: str,
+) -> None:
+    class HostileInt(int):
+        def __index__(self) -> int:
+            raise AssertionError("index hook executed")
+
+    with pytest.raises(ValueError, match="feature_dim"):
+        optimizer.init(HostileInt(4))  # type: ignore[attr-defined]
+    state = optimizer.init(np.int64(4))  # type: ignore[attr-defined]
+    assert getattr(state, array_field).shape == (4,)
+
+
+def test_optimizer_state_allocations_are_preflighted_at_exact_byte_bounds() -> None:
+    float32_scalar_limit = _INT32_MAX // 4
+    idbd_last = (float32_scalar_limit - 3) // 2
+    with pytest.raises(ValueError, match="IDBD state byte count"):
+        IDBD().init(idbd_last + 1)
+
+    autostep_last = (float32_scalar_limit - 5) // 3
+    with pytest.raises(ValueError, match="Autostep state byte count"):
+        Autostep().init(autostep_last + 1)
+
+    gtd_last = (float32_scalar_limit - 7) // 4
+    with pytest.raises(ValueError, match="AutostepGTDLambda state byte count"):
+        AutostepGTDLambda().init(gtd_last + 1)
+
+    obgd_last = float32_scalar_limit - 5
+    with pytest.raises(ValueError, match="ObGD state byte count"):
+        ObGD().init(obgd_last + 1)
+
+    td_last = (float32_scalar_limit - 5) // 3
+    with pytest.raises(ValueError, match="TDIDBD state byte count"):
+        TDIDBD().init(td_last + 1)
+
+    auto_td_last = (float32_scalar_limit - 7) // 4
+    with pytest.raises(ValueError, match="AutoTDIDBD state byte count"):
+        AutoTDIDBD().init(auto_td_last + 1)
+
+
+def test_optimizer_parameter_shape_products_are_preflighted_without_allocation() -> None:
+    with pytest.raises(ValueError, match="IDBD parameter state (scalar|byte) count"):
+        IDBD().init_for_shape((50_000, 50_000))
+    with pytest.raises(ValueError, match="Autostep parameter state (scalar|byte) count"):
+        Autostep().init_for_shape((50_000, 50_000))
+
+
+@pytest.mark.parametrize(
+    ("optimizer", "expected_scalars"),
+    [
+        (IDBD(), 2 * 4 + 3),
+        (Autostep(), 3 * 4 + 5),
+        (AutostepGTDLambda(), 4 * 4 + 7),
+        (ObGD(), 4 + 5),
+        (TDIDBD(), 3 * 4 + 5),
+        (AutoTDIDBD(), 4 * 4 + 7),
+    ],
+)
+def test_optimizer_vector_state_resource_formulas_are_exact(
+    optimizer: object,
+    expected_scalars: int,
+) -> None:
+    state = optimizer.init(4)  # type: ignore[attr-defined]
+    assert sum(int(leaf.size) for leaf in jax.tree.leaves(state)) == expected_scalars
+    assert sum(int(leaf.nbytes) for leaf in jax.tree.leaves(state)) == 4 * expected_scalars
