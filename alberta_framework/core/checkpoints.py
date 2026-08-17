@@ -33,6 +33,7 @@ assert meta["epoch"] == 1
 ```
 """
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -47,6 +48,14 @@ _FORMAT_VERSION = 2
 
 # Internal metadata key — stripped from user-facing metadata
 _VERSION_KEY = "_format_version"
+
+
+def _require_json_safe_metadata(metadata: dict[str, Any]) -> None:
+    """Reject metadata that cannot round-trip as finite JSON."""
+    try:
+        json.dumps(metadata, allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("checkpoint metadata must be JSON-safe and finite") from exc
 
 
 def save_checkpoint(
@@ -67,10 +76,11 @@ def save_checkpoint(
             the checkpoint (e.g. epoch, learner config, etc.)
     """
     path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
 
     meta_to_save = dict(metadata) if metadata is not None else {}
+    _require_json_safe_metadata(meta_to_save)
     meta_to_save[_VERSION_KEY] = _FORMAT_VERSION
+    path.parent.mkdir(parents=True, exist_ok=True)
 
     with ocp.Checkpointer(ocp.CompositeCheckpointHandler()) as ckptr:
         ckptr.save(
@@ -129,6 +139,7 @@ def load_checkpoint(
 
     user_metadata = dict(loaded.metadata)
     user_metadata.pop(_VERSION_KEY, None)
+    _require_json_safe_metadata(user_metadata)
     return loaded.state, user_metadata
 
 
@@ -162,6 +173,7 @@ def load_checkpoint_metadata(path: str | Path) -> dict[str, Any]:
 
     user_metadata = dict(loaded.metadata)
     user_metadata.pop(_VERSION_KEY, None)
+    _require_json_safe_metadata(user_metadata)
     return user_metadata
 
 
