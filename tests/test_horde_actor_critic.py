@@ -18,7 +18,7 @@ from alberta_framework.core.horde_actor_critic import (
     QHordeActorCriticState,
     run_horde_actor_critic_from_arrays,
 )
-from alberta_framework.core.optimizers import Autostep, ObGDBounding
+from alberta_framework.core.optimizers import Autostep, ObGD, ObGDBounding
 from alberta_framework.core.types import (
     DemonType,
     GVFSpec,
@@ -803,6 +803,17 @@ class TestNonlinearHordeActorCriticConfig:
                 self._simple_critic(),
             )
 
+    def test_actor_optimizer_must_support_mlp(self) -> None:
+        # An optimizer without the shape-generic MLP hooks (init_for_shape /
+        # update_from_gradient) must be rejected at construction time rather
+        # than raising NotImplementedError deep inside a jitted update.
+        with pytest.raises(ValueError, match="does not support the MLP"):
+            NonlinearHordeActorCriticAgent(
+                NonlinearHordeActorCriticConfig(n_actions=2, hidden_sizes=(16,)),
+                self._simple_critic(),
+                actor_optimizer=ObGD(),  # type: ignore[arg-type]
+            )
+
     def test_config_roundtrip(self) -> None:
         cfg = NonlinearHordeActorCriticConfig(
             n_actions=4,
@@ -1253,6 +1264,29 @@ class TestNonlinearQHordeActorCritic:
             critic,
             actor_optimizer=Autostep(initial_step_size=0.01),
         )
+
+    def test_actor_optimizer_must_support_mlp(self) -> None:
+        demons = [
+            GVFSpec(  # type: ignore[call-arg]
+                name=f"q_{action}",
+                demon_type=DemonType.CONTROL,
+                gamma=0.0,
+                lamda=0.0,
+                cumulant_index=-1,
+            )
+            for action in range(N_ACTIONS)
+        ]
+        critic = HordeLearner(
+            create_horde_spec(demons),
+            hidden_sizes=(16,),
+            step_size=0.03,
+        )
+        with pytest.raises(ValueError, match="does not support the MLP"):
+            NonlinearQHordeActorCriticAgent(
+                NonlinearQHordeActorCriticConfig(n_actions=N_ACTIONS, hidden_sizes=(16,)),
+                critic,
+                actor_optimizer=ObGD(),  # type: ignore[arg-type]
+            )
 
     def test_update_returns_finite_q_values(self) -> None:
         agent = self._agent()
