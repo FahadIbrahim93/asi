@@ -865,14 +865,23 @@ def validate_upgd_ipmnist_v2_artifact(
         errors.append("v2 artifact fields do not match the strict schema")
     if artifact.get("schema") != UPGD_IPMNIST_ARTIFACT_SCHEMA_V2:
         errors.append("artifact is not an alberta.upgd_ipmnist.artifact.v2 payload")
-    if artifact.get("schema_version") != 2:
-        errors.append("v2 artifact schema_version must equal 2")
+    schema_version = artifact.get("schema_version")
+    if type(schema_version) is not int or schema_version != 2:
+        errors.append("v2 artifact schema_version must be integer 2")
     if artifact.get("benchmark") != UPGD_IPMNIST_BENCHMARK:
         errors.append("v2 artifact benchmark identifier is unsupported")
     created = _finite_number(artifact.get("created_unix"))
     if created is None or created <= 0.0:
         errors.append("v2 artifact created_unix must be finite and positive")
-    if artifact.get("evidence_policy") != V2_NONPROMOTING_POLICY:
+    policy = artifact.get("evidence_policy")
+    if (
+        not isinstance(policy, Mapping)
+        or set(policy) != set(V2_NONPROMOTING_POLICY)
+        or policy.get("evidence_class") != V2_NONPROMOTING_POLICY["evidence_class"]
+        or policy.get("development_only") is not True
+        or policy.get("scientific_promotion_allowed") is not False
+        or policy.get("execution_attestation") is not False
+    ):
         errors.append("v2 artifact evidence policy must remain permanently nonpromoting")
     if artifact.get("deviations") != V2_PROTOCOL_DEVIATIONS:
         errors.append("v2 artifact structured deviations do not match the contract")
