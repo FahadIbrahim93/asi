@@ -57,9 +57,7 @@ def test_security_gym_action_adapter_matches_sibling_contract() -> None:
         "action": 3,
         "risk_score": (10.0,),
     }
-    assert security_gym_action_reward(SecurityAction.BLOCK, is_malicious=True) == pytest.approx(
-        1.0
-    )
+    assert security_gym_action_reward(SecurityAction.BLOCK, is_malicious=True) == pytest.approx(1.0)
     assert security_gym_action_reward(SecurityAction.BLOCK, is_malicious=False) == pytest.approx(
         -1.0
     )
@@ -202,3 +200,24 @@ def test_security_to_dict_rejects_nonfinite_numbers() -> None:
         step.to_dict()
     with pytest.raises(ValueError, match="RFC-compliant JSON"):
         experience.to_dict()
+
+
+def test_coerce_security_action_and_to_security_gym_action_scalars_validation() -> None:
+    # coerce_security_action rejects boolean
+    with pytest.raises(ValueError, match="action"):
+        coerce_security_action(True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="action"):
+        coerce_security_action(False)  # type: ignore[arg-type]
+
+    # to_security_gym_action rejects boolean or non-finite risk_score
+    with pytest.raises(ValueError, match="risk_score"):
+        to_security_gym_action(SecurityAction.PASS, risk_score=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="risk_score"):
+        to_security_gym_action(SecurityAction.PASS, risk_score=False)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="risk_score"):
+        to_security_gym_action(SecurityAction.PASS, risk_score=float("nan"))
+    with pytest.raises(ValueError, match="risk_score"):
+        to_security_gym_action(SecurityAction.PASS, risk_score=float("inf"))
+
+    res = to_security_gym_action("alert", risk_score=5.5)
+    assert res == {"action": 1, "risk_score": (5.5,)}

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import math
 import time
 from collections.abc import Mapping, Sequence
 from enum import IntEnum
@@ -279,16 +280,23 @@ def validate_security_oracle_experience(
 
 def coerce_security_action(action: SecurityAction | int | str) -> SecurityAction:
     """Coerce an integer or name to ``SecurityAction``."""
+    if isinstance(action, bool):
+        raise ValueError(f"action must not be a boolean: {action!r}")
     if isinstance(action, SecurityAction):
         return action
-    if isinstance(action, int):
-        return SecurityAction(action)
-    normalized = action.strip().lower()
-    if normalized in _ACTION_ALIASES:
-        return _ACTION_ALIASES[normalized]
-    for candidate in SecurityAction:
-        if candidate.name.lower() == normalized:
-            return candidate
+    if type(action) is int:
+        try:
+            return SecurityAction(action)
+        except ValueError as exc:
+            raise ValueError(f"unknown security action: {action!r}") from exc
+    if isinstance(action, str):
+        normalized = action.strip().lower()
+        if normalized in _ACTION_ALIASES:
+            return _ACTION_ALIASES[normalized]
+        for candidate in SecurityAction:
+            if candidate.name.lower() == normalized:
+                return candidate
+        raise ValueError(f"unknown security action: {action!r}")
     raise ValueError(f"unknown security action: {action!r}")
 
 
@@ -307,7 +315,15 @@ def to_security_gym_action(
     ``action`` id and a one-element ``risk_score`` array. A one-element tuple is
     accepted by the environment and keeps this module dependency-free.
     """
-    clipped_risk = min(10.0, max(0.0, float(risk_score)))
+    if isinstance(risk_score, bool):
+        raise ValueError("risk_score must not be a boolean")
+    try:
+        val = float(risk_score)
+        if not math.isfinite(val):
+            raise ValueError(f"risk_score must be finite, got {risk_score!r}")
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"risk_score must be a finite real number, got {risk_score!r}") from exc
+    clipped_risk = min(10.0, max(0.0, val))
     return {
         "action": int(coerce_security_action(action)),
         "risk_score": (clipped_risk,),
