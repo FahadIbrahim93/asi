@@ -11,13 +11,19 @@ import pytest
 from alberta_framework.evaluation.continual_multiagent import (
     _MAX_CONFIGURED_ARRAY_NBYTES,
     AcceptanceThresholds,
+    BootstrapInterval,
     ContinualMultiAgentConfig,
+    ControllerBudget,
+    TimingMetrics,
     _bootstrap_working_nbytes,
     _condition_result_array_nbytes,
     _condition_working_nbytes,
     _world_array_nbytes,
     paired_bootstrap_mean_interval,
     run_continual_multiagent_benchmark,
+)
+from alberta_framework.evaluation.continual_multiagent_artifact import (
+    _interval_payload,
 )
 
 _INT32_MAX = 2**31 - 1
@@ -269,3 +275,68 @@ def test_default_configuration_and_thresholds_round_trip_through_canonical_json(
     threshold_payload = json.loads(json.dumps(asdict(AcceptanceThresholds()), sort_keys=True))
     assert ContinualMultiAgentConfig(**config_payload) == ContinualMultiAgentConfig()
     assert AcceptanceThresholds(**threshold_payload) == AcceptanceThresholds()
+
+
+def _legal_interval(**overrides: object) -> BootstrapInterval:
+    payload: dict[str, object] = {
+        "estimate": 0.1,
+        "lower": 0.0,
+        "upper": 0.2,
+        "confidence_level": 0.95,
+        "resamples": 1_000,
+        "sample_size": 30,
+    }
+    payload.update(overrides)
+    return BootstrapInterval(**payload)  # type: ignore[arg-type]
+
+
+def test_controller_budget_rejects_leftover_identities() -> None:
+    """Public resource records must not keep leftover bool-as-int identities."""
+
+    with pytest.raises(ValueError, match="state_scalars"):
+        ControllerBudget(True, 1, 1)
+    with pytest.raises(ValueError, match="state_bytes"):
+        ControllerBudget(1, False, 1)
+    with pytest.raises(ValueError, match="action_scalars_per_step"):
+        ControllerBudget(1, 1, True)
+    budget = ControllerBudget(8, 64, 2)
+    dumped = json.dumps(
+        {
+            "state_scalars": budget.state_scalars,
+            "state_bytes": budget.state_bytes,
+            "action_scalars_per_step": budget.action_scalars_per_step,
+        },
+        allow_nan=False,
+    )
+    assert '"state_scalars": 8' in dumped
+    assert '"state_scalars": true' not in dumped
+
+
+def test_bootstrap_interval_rejects_leftover_identities() -> None:
+    with pytest.raises(ValueError, match="resamples"):
+        _legal_interval(resamples=True)
+    with pytest.raises(ValueError, match="sample_size"):
+        _legal_interval(sample_size=False)
+    with pytest.raises(ValueError, match="estimate"):
+        _legal_interval(estimate=True)
+    with pytest.raises(ValueError, match="estimate"):
+        _legal_interval(estimate=float("nan"))
+    with pytest.raises(ValueError, match="upper"):
+        _legal_interval(upper=float("inf"))
+
+    legal = _legal_interval()
+    dumped = json.dumps(_interval_payload(legal), allow_nan=False)
+    assert '"resamples": 1000' in dumped
+    assert '"resamples": true' not in dumped
+    assert '"estimate": 0.1' in dumped
+
+
+def test_timing_metrics_reject_leftover_identities() -> None:
+    with pytest.raises(ValueError, match="wall_seconds"):
+        TimingMetrics(True, 0.0, 0.0, 0.0)
+    with pytest.raises(ValueError, match="mean_update_latency_ms"):
+        TimingMetrics(0.0, 0.0, float("nan"), 0.0)
+    timing = TimingMetrics(1.25, 0.5, 0.25, 0.75)
+    dumped = json.dumps({"wall_seconds": timing.wall_seconds}, allow_nan=False)
+    assert '"wall_seconds": 1.25' in dumped
+    assert '"wall_seconds": true' not in dumped

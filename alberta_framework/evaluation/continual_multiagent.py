@@ -32,6 +32,7 @@ solution.  All updates are predict-act-observe-update and use no replay.
 
 from __future__ import annotations
 
+import math
 import operator
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -104,6 +105,16 @@ def _require_int32(name: str, value: object, *, minimum: int, maximum: int = _IN
 
 def _require_uint32(name: str, value: object) -> int:
     return _require_int32(name, value, minimum=0, maximum=_UINT32_MAX)
+
+
+def _finite_real(name: str, value: object) -> float:
+    """Reject leftover bool and non-finite identities without narrowing."""
+    if type(value) is bool or type(value) not in (int, float):
+        raise ValueError(f"{name} must be a finite real number")
+    numeric = float(value)
+    if not math.isfinite(numeric):
+        raise ValueError(f"{name} must be a finite real number")
+    return numeric
 
 
 def _require_seed(value: object) -> int:
@@ -310,6 +321,18 @@ class ControllerBudget:
     state_bytes: int
     action_scalars_per_step: int
 
+    def __post_init__(self) -> None:
+        for name, minimum in (
+            ("state_scalars", 0),
+            ("state_bytes", 0),
+            ("action_scalars_per_step", 1),
+        ):
+            object.__setattr__(
+                self,
+                name,
+                _require_int32(name, getattr(self, name), minimum=minimum),
+            )
+
 
 @dataclass(frozen=True)
 class TimingMetrics:
@@ -319,6 +342,15 @@ class TimingMetrics:
     mean_step_latency_ms: float
     mean_update_latency_ms: float
     p95_update_latency_ms: float
+
+    def __post_init__(self) -> None:
+        for name in (
+            "wall_seconds",
+            "mean_step_latency_ms",
+            "mean_update_latency_ms",
+            "p95_update_latency_ms",
+        ):
+            object.__setattr__(self, name, _finite_real(name, getattr(self, name)))
 
 
 @dataclass(frozen=True)
@@ -332,6 +364,28 @@ class BootstrapInterval:
     resamples: int
     sample_size: int
     method: str = "paired-percentile-bootstrap"
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "estimate", _finite_real("estimate", self.estimate))
+        object.__setattr__(self, "lower", _finite_real("lower", self.lower))
+        object.__setattr__(self, "upper", _finite_real("upper", self.upper))
+        object.__setattr__(
+            self,
+            "confidence_level",
+            _finite_real("confidence_level", self.confidence_level),
+        )
+        object.__setattr__(
+            self,
+            "resamples",
+            _require_int32("resamples", self.resamples, minimum=1),
+        )
+        object.__setattr__(
+            self,
+            "sample_size",
+            _require_int32("sample_size", self.sample_size, minimum=1),
+        )
+        if type(self.method) is not str or not self.method:
+            raise ValueError("method must be a non-empty string")
 
 
 @dataclass(frozen=True)
