@@ -235,9 +235,10 @@ def _require_builtin_int(
 
 def _require_real(value: Any, *, name: str) -> float:
     """Validate a built-in finite real scalar while excluding booleans."""
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    actual_type = type(value)
+    if issubclass(actual_type, bool) or not issubclass(actual_type, (int, float)):
         raise ValueError(f"{name} must be a real number")
-    converted = float(value)
+    converted = float(cast(Any, value))
     if not math.isfinite(converted):
         raise ValueError(f"{name} must be finite")
     return converted
