@@ -167,10 +167,14 @@ if TYPE_CHECKING:
     make_random_policy = _gymnasium_types.make_random_policy
 
 
-def __getattr__(name: str) -> Any:
+def __getattr__(name: object) -> Any:
     """Load Gymnasium adapter exports without creating a core/streams cycle."""
+    if type(name) is not str:
+        raise AttributeError("module attribute name must be a string")
+    if type(__name__) is not str:
+        raise AttributeError("module name must be a string")
     if name not in _GYMNASIUM_EXPORTS:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+        raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
 
     from alberta_framework.streams import gymnasium as gymnasium_streams
 
