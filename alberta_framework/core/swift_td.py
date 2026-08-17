@@ -560,6 +560,8 @@ class SwiftTD:
             & jnp.all(jnp.isfinite(observation))
             & (next_observation_finite | (gamma_scalar == 0.0))
             & jnp.isfinite(gamma_scalar)
+            & (gamma_scalar >= 0.0)
+            & (gamma_scalar <= 1.0)
         )
         update_applied = (
             self._state_is_valid(state)

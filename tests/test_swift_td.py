@@ -724,3 +724,24 @@ def test_swift_td_invalid_adopted_scalar_domain_rolls_back() -> None:
     )
     assert not bool(result.update_applied)
     chex.assert_trees_all_equal(result.new_state, state)
+
+
+@pytest.mark.parametrize("gamma", (-0.5, 1.5))
+def test_swift_td_out_of_range_discount_rolls_back(gamma: float) -> None:
+    optimizer = SwiftTD(initial_step_size=0.01, trace_decay=0.9)
+    state = optimizer.init(3)
+    observation = jnp.ones((3,), dtype=jnp.float32)
+    result = jax.jit(optimizer.update)(
+        state,
+        jnp.asarray(1.0, dtype=jnp.float32),
+        observation,
+        observation,
+        jnp.asarray(gamma, dtype=jnp.float32),
+    )
+
+    assert not bool(result.update_applied)
+    chex.assert_trees_all_equal(result.new_state, state)
+    chex.assert_trees_all_equal(result.weight_delta, jnp.zeros_like(result.weight_delta))
+    chex.assert_trees_all_equal(result.bias_delta, jnp.zeros_like(result.bias_delta))
+    for value in result.metrics.values():
+        chex.assert_trees_all_equal(value, jnp.zeros_like(value))
