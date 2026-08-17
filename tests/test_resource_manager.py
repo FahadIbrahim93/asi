@@ -236,6 +236,59 @@ class TestLearnedResourceManager:
         with pytest.raises(ValueError):
             finite_candidate_hedge_regret_bound(2, 10, 0.1, loss_bound=0.0)
 
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"n_actions": True, "horizon": 8},
+            {"n_actions": 3, "horizon": True},
+            {"n_actions": 3.0, "horizon": 8},
+            {"n_actions": float("nan"), "horizon": 8},
+            {"n_actions": 3, "horizon": float("inf")},
+            {"n_actions": 3, "horizon": 8, "loss_bound": float("nan")},
+            {"n_actions": 3, "horizon": 8, "loss_bound": float("inf")},
+            {"n_actions": 3, "horizon": 8, "loss_bound": True},
+        ],
+    )
+    def test_optimal_hedge_rate_rejects_bool_and_nonfinite_preconditions(
+        self,
+        kwargs: dict[str, object],
+    ) -> None:
+        with pytest.raises(ValueError):
+            optimal_hedge_learning_rate(**kwargs)  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"n_actions": True, "horizon": 8, "learning_rate": 0.1},
+            {"n_actions": 3, "horizon": True, "learning_rate": 0.1},
+            {"n_actions": 3, "horizon": 8, "learning_rate": float("nan")},
+            {"n_actions": 3, "horizon": 8, "learning_rate": float("inf")},
+            {"n_actions": 3, "horizon": 8, "learning_rate": True},
+            {"n_actions": 3, "horizon": 8, "learning_rate": 0.1, "loss_bound": float("nan")},
+            {"n_actions": 3, "horizon": 8, "learning_rate": 0.1, "loss_bound": True},
+        ],
+    )
+    def test_hedge_regret_bound_rejects_bool_and_nonfinite_preconditions(
+        self,
+        kwargs: dict[str, object],
+    ) -> None:
+        with pytest.raises(ValueError):
+            finite_candidate_hedge_regret_bound(**kwargs)  # type: ignore[arg-type]
+
+    def test_manager_regret_bound_rejects_nonfinite_horizon_and_loss_bound(self) -> None:
+        manager = LearnedResourceManager(
+            n_actions=3,
+            learning_rate=0.1,
+            discount=1.0,
+            exploration=0.0,
+        )
+        with pytest.raises(ValueError):
+            manager.fixed_candidate_regret_bound(float("nan"))  # type: ignore[arg-type]
+        with pytest.raises(ValueError):
+            manager.fixed_candidate_regret_bound(True)  # type: ignore[arg-type]
+        with pytest.raises(ValueError):
+            manager.fixed_candidate_regret_bound(8, loss_bound=float("nan"))
+
 
 class TestGeneratorMetaResourceManager:
     """Behavioral checks for generator-internal meta-resource policies."""
