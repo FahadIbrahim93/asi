@@ -30,6 +30,7 @@ from typing import Any, cast
 import jax.numpy as jnp
 import jax.random as jr
 
+from alberta_framework._seed_validation import require_jax_seed
 from alberta_framework.core.average_reward import (
     DifferentialTDArrayResult,
     DifferentialTDConfig,
@@ -69,6 +70,12 @@ def _require_int(
     if maximum is not None and number > maximum:
         raise ValueError(f"{name} must be <= {maximum}, got {value!r}")
     return number
+
+
+def _require_bool(name: str, value: object) -> bool:
+    if type(value) is not bool:
+        raise ValueError(f"{name} must be a boolean, got {value!r}")
+    return value
 
 
 def _finite_float32_scalar(name: str, value: object) -> tuple[int, int, float]:
@@ -175,6 +182,13 @@ class Step5SmokeResult:
     average_rewards_shape: tuple[int, ...]
     finite: bool
     learner_config: dict[str, Any]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "steps", _require_int("steps", self.steps, minimum=1, maximum=_INT32_MAX)
+        )
+        object.__setattr__(self, "seed", require_jax_seed(self.seed, name="seed"))
+        object.__setattr__(self, "finite", _require_bool("finite", self.finite))
 
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-serializable representation."""
