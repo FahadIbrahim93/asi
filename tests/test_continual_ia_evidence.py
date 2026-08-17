@@ -22,6 +22,7 @@ from alberta_framework.evaluation.continual_ia import (
     IAAcceptanceThresholds,
     IAConditionName,
     IAConditionResult,
+    PairedBootstrapInterval,
     aggregate_ia_evidence,
     condition_controller_budgets,
     evaluate_ia_acceptance,
@@ -31,6 +32,7 @@ from alberta_framework.evaluation.continual_ia import (
 from alberta_framework.evaluation.continual_ia_artifact import (
     PROTOCOL_VERSION,
     SCHEMA_VERSION,
+    _interval_payload,
     build_ia_evidence_artifact,
     ia_artifact_json,
     load_ia_evidence_artifact,
@@ -687,6 +689,57 @@ def test_controller_budget_rejects_hostile_or_out_of_domain_payloads() -> None:
         ControllerBudget(0, True, 1, 1, 1, False)
     with pytest.raises(ValueError, match="ia_attached"):
         ControllerBudget(0, 0, 1, 1, 1, 1)
+
+
+def _legal_interval(**overrides: object) -> PairedBootstrapInterval:
+    payload: dict[str, object] = {
+        "estimate": 0.1,
+        "lower": 0.0,
+        "upper": 0.2,
+        "confidence_level": 0.95,
+        "resamples": 1_000,
+        "sample_size": 30,
+    }
+    payload.update(overrides)
+    return PairedBootstrapInterval(**payload)  # type: ignore[arg-type]
+
+
+def test_paired_bootstrap_interval_rejects_leftover_identities() -> None:
+    """Public interval records must not keep leftover bool/NaN identities."""
+
+    with pytest.raises(ValueError, match="resamples"):
+        _legal_interval(resamples=True)
+    with pytest.raises(ValueError, match="sample_size"):
+        _legal_interval(sample_size=False)
+    with pytest.raises(ValueError, match="estimate"):
+        _legal_interval(estimate=True)
+    with pytest.raises(ValueError, match="estimate"):
+        _legal_interval(estimate=float("nan"))
+    with pytest.raises(ValueError, match="lower"):
+        _legal_interval(lower=float("inf"))
+
+    legal = _legal_interval()
+    dumped = json.dumps(_interval_payload(legal), allow_nan=False)
+    assert '"resamples": 1000' in dumped
+    assert '"resamples": true' not in dumped
+    assert '"estimate": 0.1' in dumped
+
+
+def test_condition_timing_rejects_leftover_identities() -> None:
+    with pytest.raises(ValueError, match="wall_seconds"):
+        ConditionTiming(wall_seconds=True, mean_step_latency_ms=0.0)
+    with pytest.raises(ValueError, match="mean_step_latency_ms"):
+        ConditionTiming(wall_seconds=0.0, mean_step_latency_ms=float("nan"))
+    timing = ConditionTiming(wall_seconds=1.25, mean_step_latency_ms=0.5)
+    dumped = json.dumps(
+        {
+            "wall_seconds": timing.wall_seconds,
+            "mean_step_latency_ms": timing.mean_step_latency_ms,
+        },
+        allow_nan=False,
+    )
+    assert '"wall_seconds": 1.25' in dumped
+    assert '"wall_seconds": true' not in dumped
 
 
 def test_bootstrap_and_run_work_preflights_fire_before_large_allocations() -> None:
