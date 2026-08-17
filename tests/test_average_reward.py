@@ -950,3 +950,34 @@ def test_differential_sarsa_preflights_state_before_allocation() -> None:
         agent.init(last_legal_feature_dim + 1, jr.key(0))
     with pytest.raises(ValueError, match="feature_dim"):
         agent.init(True, jr.key(0))  # type: ignore[arg-type]
+
+
+def test_differential_learners_integer_validation() -> None:
+    gtd = DifferentialGTDLearner(DifferentialGTDConfig())
+    td = DifferentialTDLearner(DifferentialTDConfig())
+    horde = AverageRewardHordeLearner(n_demons=2, hidden_sizes=(16,))
+
+    with pytest.raises(ValueError, match="feature_dim"):
+        gtd.init(feature_dim=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="feature_dim"):
+        gtd.init(feature_dim=0)
+    with pytest.raises(ValueError, match="feature_dim"):
+        gtd.init(feature_dim=4.5)  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="feature_dim"):
+        td.init(feature_dim=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="feature_dim"):
+        td.init(feature_dim=0)
+
+    with pytest.raises(ValueError, match="feature_dim"):
+        horde.init(feature_dim=True, key=jr.key(0))  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="feature_dim"):
+        horde.init(feature_dim=0, key=jr.key(0))
+
+    s_gtd = gtd.init(feature_dim=np.int32(4))
+    s_td = td.init(feature_dim=np.int64(4))
+    s_horde = horde.init(feature_dim=np.int32(4), key=jr.key(0))
+
+    assert s_gtd.weights.shape == (4,)
+    assert s_td.weights.shape == (4,)
+    assert s_horde.average_rewards.shape == (2,)
