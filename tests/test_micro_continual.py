@@ -776,6 +776,21 @@ class TestBayesReference:
             np.asarray(base_predictions), np.asarray(transformed)
         )
 
+    def test_bayes_predict_avoids_common_offset_cancellation(self):
+        component_means = jnp.asarray(
+            [[[10_000.0, 10_000.0]], [[10_001.0, 10_001.0]]],
+            dtype=jnp.float32,
+        )
+        observations = jnp.asarray([[10_001.0, 10_001.0]], dtype=jnp.float32)
+
+        predictions = bayes_predict(
+            component_means,
+            jnp.ones((2,), dtype=jnp.float32),
+            observations,
+        )
+
+        np.testing.assert_array_equal(predictions, np.asarray([1], dtype=np.int32))
+
     def test_stream_geometry_matches_reference_geometry(self):
         stream = generate_stream(TINY, seed=5)
         means, dim_sigma = class_geometry(TINY, seed=5)
