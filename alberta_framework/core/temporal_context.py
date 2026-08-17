@@ -317,7 +317,11 @@ class TemporalContextFeaturizer:
         )
         proposed = TemporalContextState(
             observation_ema=decayed_ema + (1.0 - decay) * obs,
-            step_count=state.step_count + 1,
+            step_count=jnp.minimum(
+                state.step_count,
+                jnp.asarray(_INT32_MAX - 1, dtype=jnp.int32),
+            )
+            + jnp.asarray(1, dtype=jnp.int32),
         )
         return cast(
             TemporalContextState,
