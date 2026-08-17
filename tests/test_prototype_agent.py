@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import warnings
 from fractions import Fraction
+from typing import Any, cast
 
 import chex
 import jax
@@ -532,6 +533,51 @@ class TestPrototypeAgentUpdateFull:
         assert int(result.state.world_model_state.step_count) == 1
 
 
+def test_experiential_memory_config_requires_exact_identity_before_hooks() -> None:
+    class HostileMemoryConfig(ExperientialMemoryConfig):
+        calls = 0
+
+        def __getattribute__(self, name: str) -> Any:
+            type(self).calls += 1
+            raise AssertionError(f"memory config hook must not run: {name}")
+
+    class HostileDict(dict[str, object]):
+        calls = 0
+
+        def __iter__(self):  # type: ignore[override]
+            type(self).calls += 1
+            raise AssertionError("mapping hook must not run")
+
+    hostile_config = object.__new__(HostileMemoryConfig)
+    HostileMemoryConfig.calls = 0
+    with pytest.raises(ValueError, match="exact ExperientialMemoryConfig"):
+        PrototypeAgentConfig(
+            oak=_oak_cfg(),
+            experiential_memory=cast(Any, hostile_config),
+        )
+    assert HostileMemoryConfig.calls == 0
+
+    memory_config = ExperientialMemoryConfig(
+        capacity=3,
+        observation_dim=OBS_DIM,
+        key_dim=OBS_DIM,
+        action_dim=N_PRIM,
+        outcome_dim=OBS_DIM + 1,
+        top_k=1,
+        min_neighbors=1,
+    )
+    payload = PrototypeAgentConfig(
+        oak=_oak_cfg(), experiential_memory=memory_config
+    ).to_config()
+    payload["experiential_memory"] = HostileDict(
+        cast(dict[str, object], payload["experiential_memory"])
+    )
+    HostileDict.calls = 0
+    with pytest.raises(ValueError, match="experiential_memory must be a configuration object"):
+        PrototypeAgentConfig.from_config(cast(Any, payload))
+    assert HostileDict.calls == 0
+
+
 def test_experiential_memory_uses_one_accounted_policy_step() -> None:
     """Prototype proposal and write must share one recorded pre-state query."""
     memory_config = ExperientialMemoryConfig(
@@ -554,6 +600,14 @@ def test_experiential_memory_uses_one_accounted_policy_step() -> None:
     assert resources.categorical_policy_queries == 1
     assert resources.causal_step_queries == 0
     assert resources.total_deterministic_prestate_queries == 1
+    assert resources.memory_capacity == memory_config.capacity
+    assert resources.memory_observation_dim == memory_config.observation_dim
+    assert resources.memory_key_dim == memory_config.key_dim
+    assert resources.memory_action_dim == memory_config.action_dim
+    assert resources.memory_outcome_dim == memory_config.outcome_dim
+    assert resources.persistent_state_bytes == agent.experiential_memory.persistent_bytes
+    assert resources.score_mass_values_interpreted == memory_config.action_dim
+    assert resources.hard_safety_values_interpreted == memory_config.action_dim
 
     state = agent.start(agent.init(jr.key(31)), jnp.zeros(OBS_DIM, dtype=jnp.float32))
     transition = PrototypeTransition(
