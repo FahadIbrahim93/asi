@@ -212,11 +212,13 @@ def test_wm_ensemble_dimensions_preflight_without_allocation() -> None:
         _base_cfg(ensemble_size=600_000_000)
 
 
-def test_wm_ensemble_state_preflight_bytes_without_allocation() -> None:
-    # This base has 61 scalars/member; total persistent bytes are 270*ensemble + 60.
-    last_legal = (2**31 - 1 - 60) // 270
+def test_wm_ensemble_result_preflight_bytes_without_allocation() -> None:
+    # This base has 61 member-state scalars and target_dim=4. Persistent bytes
+    # are 270*ensemble+60; the complete update result is the stricter
+    # 324*ensemble+196 after the aggregate result contract added in #868.
+    last_legal = (2**31 - 1 - 196) // 324
     _base_cfg(ensemble_size=last_legal)
-    with pytest.raises(ValueError, match="persistent state bytes"):
+    with pytest.raises(ValueError, match="update-result bytes"):
         _base_cfg(ensemble_size=last_legal + 1)
     with pytest.raises(ValueError, match="fit signed int32"):
         _base_cfg(ensemble_size=500_000_000)

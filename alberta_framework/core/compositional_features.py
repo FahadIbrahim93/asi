@@ -1270,11 +1270,14 @@ class CompositionalFeatureLearner:
         step_size_theta = _validated_float32_scalar(
             "step_size_theta", step_size_theta, lower=0.0
         )
+        utility_decay_input = utility_decay
         utility_decay = canonical_float32_ema_decay(
             "utility_decay",
             utility_decay,
         )
-        utility_decay_config = utility_decay
+        utility_decay_config = (
+            utility_decay_input if type(utility_decay_input) is float else utility_decay
+        )
         promotion_margin = _validated_float32_scalar(
             "promotion_margin", promotion_margin, lower=0.0
         )
@@ -1462,11 +1465,16 @@ class CompositionalFeatureLearner:
             raise ValueError("candidate_selector_exploration must be in [0, 1)")
         if candidate_selector == CANDIDATE_SELECTOR_EXP3 and candidate_selector_exploration <= 0.0:
             raise ValueError("exp3 candidate_selector requires positive exploration")
+        retention_slow_utility_decay_input = retention_slow_utility_decay
         retention_slow_utility_decay = canonical_float32_ema_decay(
             "retention_slow_utility_decay",
             retention_slow_utility_decay,
         )
-        retention_slow_utility_decay_config = retention_slow_utility_decay
+        retention_slow_utility_decay_config = (
+            retention_slow_utility_decay_input
+            if type(retention_slow_utility_decay_input) is float
+            else retention_slow_utility_decay
+        )
         if retention_tanh_min_count < 0:
             raise ValueError("retention_tanh_min_count must be non-negative")
         if retention_product_min_count < 0:

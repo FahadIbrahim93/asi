@@ -337,11 +337,14 @@ class FixedBudgetFeatureLearner:
         step_size_feature = validated_float32_scalar(
             "step_size_feature", step_size_feature, lower=0.0
         )
+        utility_decay_input = utility_decay
         utility_decay = canonical_float32_ema_decay(
             "utility_decay",
             utility_decay,
         )
-        utility_decay_config = utility_decay
+        utility_decay_config = (
+            utility_decay_input if type(utility_decay_input) is float else utility_decay
+        )
         promotion_margin = validated_float32_scalar(
             "promotion_margin", promotion_margin, positive=True
         )
@@ -405,13 +408,20 @@ class FixedBudgetFeatureLearner:
             "future_utility_rare_task_power", future_utility_rare_task_power, lower=0.0
         )
         if utility_retention_decay is not None:
+            utility_retention_decay_input = utility_retention_decay
             utility_retention_decay = canonical_float32_ema_decay(
                 "utility_retention_decay",
                 utility_retention_decay,
             )
             if utility_retention_decay < utility_decay:
                 raise ValueError("utility_retention_decay must be in [utility_decay, 1) when set")
-        utility_retention_decay_config = utility_retention_decay
+            utility_retention_decay_config = (
+                utility_retention_decay_input
+                if type(utility_retention_decay_input) is float
+                else utility_retention_decay
+            )
+        else:
+            utility_retention_decay_config = None
 
         if type(generator_mix) is not tuple or len(generator_mix) != 3:
             raise ValueError("generator_mix must have three entries")

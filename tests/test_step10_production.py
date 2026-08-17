@@ -322,9 +322,9 @@ def test_step10_stomp_int_dimensions_stay_within_int32() -> None:
 
 @pytest.mark.unit
 def test_step10_stomp_feature_index_stays_within_int32() -> None:
-    # An out-of-int32 feature_index can only pass the observation_dim bound
-    # check if observation_dim itself escapes int32, so both must reject.
-    with pytest.raises(ValueError, match="observation_dim"):
+    # SubtaskSpec now rejects its own out-of-int32 index before the enclosing
+    # Step10 configuration can inspect observation_dim.
+    with pytest.raises(ValueError, match="feature_index"):
         Step10STOMPConfig(
             subtask_specs=(SubtaskSpec(feature_index=2**35),),
             observation_dim=2**40,

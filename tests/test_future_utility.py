@@ -1,6 +1,7 @@
 """Tests for causal future-utility estimators."""
 
 from collections.abc import Callable
+from fractions import Fraction
 
 import chex
 import jax
@@ -283,6 +284,88 @@ def test_compositional_ema_and_age_correction_share_float32_decay() -> None:
     assert near_one.to_config()["utility_decay"] == 0.9999999
 
 
+def test_utility_decay_serialization_preserves_builtin_and_canonicalizes_numpy() -> None:
+    fixed = FixedBudgetFeatureLearner(
+        n_features=2,
+        n_tasks=1,
+        utility_decay=0.9,
+        utility_retention_decay=0.95,
+    )
+    compositional = CompositionalFeatureLearner(
+        n_features=3,
+        n_tasks=1,
+        utility_decay=0.9,
+        retention_slow_utility_decay=0.95,
+    )
+    assert fixed.to_config()["utility_decay"] == 0.9
+    assert fixed.to_config()["utility_retention_decay"] == 0.95
+    assert compositional.to_config()["utility_decay"] == 0.9
+    assert compositional.to_config()["retention_slow_utility_decay"] == 0.95
+
+    numpy_fixed = FixedBudgetFeatureLearner(
+        n_features=2,
+        n_tasks=1,
+        utility_decay=np.float64(0.9),
+        utility_retention_decay=np.float64(0.95),
+    )
+    numpy_compositional = CompositionalFeatureLearner(
+        n_features=3,
+        n_tasks=1,
+        utility_decay=np.float64(0.9),
+        retention_slow_utility_decay=np.float64(0.95),
+    )
+    assert numpy_fixed.to_config()["utility_decay"] == float(np.float32(0.9))
+    assert numpy_fixed.to_config()["utility_retention_decay"] == float(np.float32(0.95))
+    assert numpy_compositional.to_config()["utility_decay"] == float(np.float32(0.9))
+    assert numpy_compositional.to_config()["retention_slow_utility_decay"] == float(
+        np.float32(0.95)
+    )
+
+    exact_fixed = FixedBudgetFeatureLearner(
+        n_features=2,
+        n_tasks=1,
+        utility_decay=Fraction(9, 10),
+        utility_retention_decay=Fraction(19, 20),
+    )
+    int_compositional = CompositionalFeatureLearner(
+        n_features=3,
+        n_tasks=1,
+        utility_decay=0,
+        retention_slow_utility_decay=Fraction(19, 20),
+    )
+    assert exact_fixed.to_config()["utility_decay"] == float(np.float32(0.9))
+    assert type(exact_fixed.to_config()["utility_decay"]) is float
+    assert exact_fixed.to_config()["utility_retention_decay"] == float(np.float32(0.95))
+    assert int_compositional.to_config()["utility_decay"] == 0.0
+    assert type(int_compositional.to_config()["utility_decay"]) is float
+    assert int_compositional.to_config()["retention_slow_utility_decay"] == float(
+        np.float32(0.95)
+    )
+
+
+def test_utility_decay_rejects_hostile_float_subclasses_before_ratio_hook() -> None:
+    class HostileFloat(float):
+        calls = 0
+
+        def as_integer_ratio(self) -> tuple[int, int]:  # pragma: no cover
+            type(self).calls += 1
+            raise RuntimeError("hostile ratio hook")
+
+    with pytest.raises(ValueError, match="utility_decay"):
+        FixedBudgetFeatureLearner(
+            n_features=2,
+            n_tasks=1,
+            utility_decay=HostileFloat(0.9),
+        )
+    with pytest.raises(ValueError, match="retention_slow_utility_decay"):
+        CompositionalFeatureLearner(
+            n_features=3,
+            n_tasks=1,
+            retention_slow_utility_decay=HostileFloat(0.95),
+        )
+    assert HostileFloat.calls == 0
+
+
 @pytest.mark.parametrize(
     "factory",
     [
@@ -314,6 +397,68 @@ def test_utility_ema_decay_rejects_values_narrowing_to_float32_one(
 ) -> None:
     with pytest.raises(ValueError, match="finite float32 in \\[0, 1\\)"):
         factory()
+
+
+@pytest.mark.parametrize(
+    "decay",
+    [
+        Fraction(-1, 2**200),
+        -float.fromhex("0x1p-150"),
+        Fraction(1, 2**200),
+        float.fromhex("0x1p-150"),
+    ],
+)
+@pytest.mark.parametrize(
+    "factory",
+    [
+        lambda decay: FixedBudgetFeatureLearner(
+            n_features=2,
+            n_tasks=1,
+            utility_decay=decay,
+        ),
+        lambda decay: FixedBudgetFeatureLearner(
+            n_features=2,
+            n_tasks=1,
+            utility_decay=0.5,
+            utility_retention_decay=decay,
+        ),
+        lambda decay: CompositionalFeatureLearner(
+            n_features=3,
+            n_tasks=1,
+            utility_decay=decay,
+        ),
+        lambda decay: CompositionalFeatureLearner(
+            n_features=3,
+            n_tasks=1,
+            retention_slow_utility_decay=decay,
+        ),
+    ],
+)
+def test_utility_ema_decay_rejects_exact_values_erased_at_float32_zero(
+    factory: Callable[[object], object],
+    decay: object,
+) -> None:
+    with pytest.raises(ValueError, match="finite float32 in \\[0, 1\\)"):
+        factory(decay)
+
+
+def test_utility_ema_decay_accepts_smallest_positive_float32_exactly() -> None:
+    decay = Fraction(1, 2**149)
+    fixed = FixedBudgetFeatureLearner(
+        n_features=2,
+        n_tasks=1,
+        utility_decay=decay,
+    )
+    compositional = CompositionalFeatureLearner(
+        n_features=3,
+        n_tasks=1,
+        utility_decay=decay,
+    )
+    expected = float.fromhex("0x1p-149")
+    assert fixed._utility_decay == expected
+    assert fixed.to_config()["utility_decay"] == expected
+    assert compositional._utility_decay == expected
+    assert compositional.to_config()["utility_decay"] == expected
 
 
 def test_feature_discovery_future_utility_config_roundtrip_extended_knobs() -> None:
