@@ -32,20 +32,35 @@ from alberta_framework._float32 import round_real_to_float32_with_ratio
 from alberta_framework.core.types import TimeStep
 
 _INT32_MAX = 2**31 - 1
+_ACTUAL_INT_TYPES = frozenset(
+    {
+        int,
+        np.int8,
+        np.int16,
+        np.int32,
+        np.int64,
+        np.uint8,
+        np.uint16,
+        np.uint32,
+        np.uint64,
+        np.longlong,
+        np.ulonglong,
+    }
+)
 
 
 def _finite_real_and_float32(name: str, value: object) -> tuple[Real, int, int, float]:
     """Return the original real, exact ratio, and finite binary32 rounding."""
     actual_type = type(value)
     if issubclass(actual_type, bool) or not issubclass(actual_type, Real):
-        raise ValueError(f"{name} must be a real number, got {value!r}")
+        raise ValueError(f"{name} must be a real number")
     real = cast(Real, value)
     try:
         numerator, denominator, narrowed = round_real_to_float32_with_ratio(real)
     except (FloatingPointError, OverflowError, TypeError, ValueError):
-        raise ValueError(f"{name} must narrow to a finite float32, got {value!r}") from None
+        raise ValueError(f"{name} must narrow to a finite float32") from None
     if not math.isfinite(narrowed):
-        raise ValueError(f"{name} must narrow to a finite float32, got {value!r}")
+        raise ValueError(f"{name} must narrow to a finite float32")
     return real, numerator, denominator, narrowed
 
 
@@ -68,14 +83,14 @@ def _canonical_float32_storage(value: Real, narrowed: float) -> float:
 def _require_nonnegative_real(name: str, value: object) -> float:
     real, numerator, _, narrowed = _finite_real_and_float32(name, value)
     if real < 0.0 or numerator < 0 or narrowed < 0.0:
-        raise ValueError(f"{name} must be non-negative, got {value!r}")
+        raise ValueError(f"{name} must be non-negative")
     return _canonical_float32_storage(real, narrowed)
 
 
 def _require_positive_real(name: str, value: object) -> float:
     real, numerator, _, narrowed = _finite_real_and_float32(name, value)
     if real <= 0.0 or numerator <= 0 or narrowed <= 0.0:
-        raise ValueError(f"{name} must be positive, got {value!r}")
+        raise ValueError(f"{name} must be positive")
     return _canonical_float32_storage(real, narrowed)
 
 
@@ -87,17 +102,17 @@ def _require_int(
     maximum: int | None = None,
 ) -> int:
     actual_type = type(value)
-    if issubclass(actual_type, bool) or not issubclass(actual_type, Integral):
-        raise ValueError(f"{name} must be an integer, got {value!r}")
+    if actual_type not in _ACTUAL_INT_TYPES:
+        raise ValueError(f"{name} must be an integer")
     number = int(cast(Integral, value))
     if minimum is not None and number < minimum:
         if minimum == 1:
-            raise ValueError(f"{name} must be positive, got {value!r}")
+            raise ValueError(f"{name} must be positive")
         if minimum == 0:
-            raise ValueError(f"{name} must be non-negative, got {value!r}")
-        raise ValueError(f"{name} must be >= {minimum}, got {value!r}")
+            raise ValueError(f"{name} must be non-negative")
+        raise ValueError(f"{name} must be >= {minimum}")
     if maximum is not None and number > maximum:
-        raise ValueError(f"{name} must be <= {maximum}, got {value!r}")
+        raise ValueError(f"{name} must be <= {maximum}")
     return number
 
 
@@ -428,9 +443,7 @@ class InteractionFeatureDiscoveryStream:
         if type(include_squares) is bool or type(include_squares) is np.bool_:
             include_squares_val = bool(include_squares)
         else:
-            raise TypeError(
-                f"include_squares must be a boolean, got {include_squares!r}"
-            )
+            raise TypeError("include_squares must be a boolean")
 
         self._feature_dim = feature_dim_val
         self._n_tasks = n_tasks_val
