@@ -7,7 +7,11 @@ import numpy as np
 import pytest
 
 from alberta_framework.core.options import SubtaskSpec
-from alberta_framework.steps.step10 import Step10STOMPConfig
+from alberta_framework.steps.step10 import (
+    Step10STOMPConfig,
+    make_step10_stomp_agent,
+    run_step10_smoke,
+)
 
 
 class _EvilStr(str):
@@ -157,3 +161,57 @@ def test_float_subclass_with_lying_ratio_is_rejected() -> None:
     with pytest.raises(ValueError, match="must be finite"):
         Step10STOMPConfig(base_step_size=RatioFloat(0.05))
     assert RatioFloat.calls == 0
+
+
+def test_from_config_requires_exact_complete_nested_schema_without_hooks() -> None:
+    class HostileDict(dict[object, object]):
+        calls = 0
+
+        def __iter__(self):  # pragma: no cover - must not run
+            type(self).calls += 1
+            raise AssertionError("mapping hook must not run")
+
+    with pytest.raises(ValueError, match="exact dictionary"):
+        Step10STOMPConfig.from_config(cast(Any, HostileDict()))
+    assert HostileDict.calls == 0
+    payload = Step10STOMPConfig().to_config()
+    payload["type"] = "wrong"
+    with pytest.raises(ValueError, match="payload type"):
+        Step10STOMPConfig.from_config(payload)
+    payload = Step10STOMPConfig(
+        subtask_specs=(SubtaskSpec(feature_index=0),)
+    ).to_config()
+    payload["subtask_specs"] = [HostileDict()]
+    with pytest.raises(ValueError, match="exact dictionary"):
+        Step10STOMPConfig.from_config(payload)
+    assert HostileDict.calls == 0
+
+
+def test_subtask_iteration_and_planning_work_are_bounded() -> None:
+    spec = SubtaskSpec(feature_index=0)
+    with pytest.raises(ValueError, match="at most 4096"):
+        Step10STOMPConfig(subtask_specs=(spec,) * 4_097)
+    with pytest.raises(ValueError, match="option_planning_backups_per_step"):
+        Step10STOMPConfig(option_planning_backups_per_step=4_097)
+
+
+def test_runtime_entry_points_require_exact_config_without_truthiness_hooks() -> None:
+    calls = 0
+
+    class HostileConfig:
+        def __bool__(self) -> bool:  # pragma: no cover - must not run
+            nonlocal calls
+            calls += 1
+            raise AssertionError("truthiness hook must not run")
+
+    value = HostileConfig()
+    with pytest.raises(TypeError, match="exact Step10STOMPConfig"):
+        make_step10_stomp_agent(cast(Any, value))
+    with pytest.raises(TypeError, match="exact Step10STOMPConfig"):
+        run_step10_smoke(cast(Any, value), steps=1)
+    assert calls == 0
+
+
+def test_smoke_preflights_output_resources_before_allocation() -> None:
+    with pytest.raises(ValueError, match="observation row count"):
+        run_step10_smoke(steps=2**31 - 1)

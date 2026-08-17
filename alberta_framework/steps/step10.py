@@ -143,11 +143,40 @@ class Step10STOMPConfig:
     @classmethod
     def from_config(cls, payload: dict[str, Any]) -> Step10STOMPConfig:
         """Reconstruct from :meth:`to_config` output."""
-        data = dict(payload)
-        data.pop("type", None)
-        specs_raw = data.pop("subtask_specs", [])
-        specs = tuple(SubtaskSpec(**s) for s in specs_raw)
-        return cls(subtask_specs=specs, **data)
+        data = _require_payload(
+            payload,
+            name="Step10STOMPConfig payload",
+            fields=_STEP10_CONFIG_FIELDS,
+        )
+        if type(data["type"]) is not str or data["type"] != "Step10STOMPConfig":
+            raise ValueError("Step10STOMPConfig payload type must be 'Step10STOMPConfig'")
+        raw_specs = data.pop("subtask_specs")
+        if type(raw_specs) is not list:
+            raise ValueError("subtask_specs payload must be an exact list")
+        values = cast(list[object], raw_specs)
+        _require_subtask_count(len(values))
+        specs: list[SubtaskSpec] = []
+        for index in range(len(values)):
+            raw = _require_payload(
+                values[index],
+                name=f"subtask_specs[{index}]",
+                fields=_SUBTASK_SPEC_FIELDS,
+            )
+            specs.append(
+                SubtaskSpec(
+                    feature_index=_require_int("feature_index", raw["feature_index"], minimum=0),
+                    threshold=_require_positive_real("threshold", raw["threshold"]),
+                    pseudo_reward_scale=_require_positive_real(
+                        "pseudo_reward_scale", raw["pseudo_reward_scale"]
+                    ),
+                    max_option_steps=_require_int(
+                        "max_option_steps", raw["max_option_steps"], minimum=1,
+                        maximum=_INT32_MAX
+                    ),
+                )
+            )
+        data.pop("type")
+        return cls(subtask_specs=tuple(specs), **data)
 
     def to_stomp_config(self) -> STOMPConfig:
         """Convert to the core :class:`STOMPConfig`."""
@@ -173,6 +202,12 @@ class Step10STOMPConfig:
 
 
 _INT32_MAX = 2**31 - 1
+_MAX_SUBTASK_SPECS = 4_096
+_MAX_PLANNING_BACKUPS_PER_STEP = 4_096
+_STEP10_CONFIG_FIELDS = frozenset(
+    {"type", "subtask_specs", *Step10STOMPConfig.__dataclass_fields__}
+)
+_SUBTASK_SPEC_FIELDS = frozenset(SubtaskSpec.__dataclass_fields__)
 _ACTUAL_INT_TYPES = frozenset(
     {
         int,
@@ -260,7 +295,61 @@ def _require_bool(name: object, value: object) -> bool:
     return value
 
 
+def _require_payload(
+    value: object, *, name: str, fields: frozenset[str]
+) -> dict[str, Any]:
+    if type(value) is not dict:
+        raise ValueError(f"{name} must be an exact dictionary")
+    raw = cast(dict[object, object], value)
+    if any(type(key) is not str for key in raw):
+        raise ValueError(f"{name} keys must be exact strings")
+    if cast(set[str], set(raw)) != fields:
+        raise ValueError(f"{name} fields do not match the schema")
+    return cast(dict[str, Any], dict(raw))
+
+
+def _require_subtask_count(count: int) -> None:
+    if count > _MAX_SUBTASK_SPECS:
+        raise ValueError(f"subtask_specs must contain at most {_MAX_SUBTASK_SPECS} values")
+
+
+def _checked_product(name: str, *factors: int) -> int:
+    product = 1
+    for factor in factors:
+        if factor < 0 or (factor != 0 and product > _INT32_MAX // factor):
+            raise ValueError(f"derived {name} must fit signed int32")
+        product *= factor
+    return product
+
+
+def _checked_sum(name: str, *terms: int) -> int:
+    total = 0
+    for term in terms:
+        if term < 0 or term > _INT32_MAX - total:
+            raise ValueError(f"derived {name} must fit signed int32")
+        total += term
+    return total
+
+
+def _preflight_step10_smoke_resources(config: Step10STOMPConfig, steps: int) -> None:
+    rows = _checked_sum("Step 10 observation row count", steps, 1)
+    observations = _checked_product(
+        "Step 10 observation count", rows, config.observation_dim
+    )
+    option_outputs = _checked_product(
+        "Step 10 option output count", steps, len(config.subtask_specs)
+    )
+    _checked_sum(
+        "Step 10 smoke array bytes",
+        _checked_product("Step 10 observation bytes", 4, observations),
+        _checked_product("Step 10 scalar output bytes", 21, steps),
+        _checked_product("Step 10 option output bytes", 4, option_outputs),
+    )
+
+
 def _validate_stomp_facade_config(config: Step10STOMPConfig) -> None:
+    if type(config) is not Step10STOMPConfig:
+        raise TypeError("config must be an exact Step10STOMPConfig")
     # Observation dimensions and action indices flow into int32 JAX sinks;
     # bounding both keeps every feature_index (< observation_dim) in range.
     observation_dim = _require_int(
@@ -279,10 +368,11 @@ def _validate_stomp_facade_config(config: Step10STOMPConfig) -> None:
         "option_planning_backups_per_step",
         config.option_planning_backups_per_step,
         minimum=0,
-        exclusive_maximum=_INT32_MAX,
+        maximum=_MAX_PLANNING_BACKUPS_PER_STEP,
     )
     if type(config.subtask_specs) is not tuple:
         raise ValueError("subtask_specs must be a tuple of SubtaskSpec")
+    _require_subtask_count(len(config.subtask_specs))
     canonical_specs: list[SubtaskSpec] = []
     for spec in config.subtask_specs:
         if type(spec) is not SubtaskSpec:
@@ -369,6 +459,7 @@ def _validate_stomp_facade_config(config: Step10STOMPConfig) -> None:
     object.__setattr__(config, "epsilon_option", epsilon_option)
     object.__setattr__(config, "option_target_epsilon", option_target_epsilon)
     object.__setattr__(config, "option_importance_clip", option_importance_clip)
+    config.to_stomp_config()
 
 
 @dataclass(frozen=True)
@@ -388,6 +479,10 @@ class Step10SmokeResult:
     agent_config: dict[str, Any]
 
     def __post_init__(self) -> None:
+        if type(self.config) is not Step10STOMPConfig:
+            raise TypeError("config must be an exact Step10STOMPConfig")
+        if type(self.agent_config) is not dict:
+            raise TypeError("agent_config must be an exact dictionary")
         object.__setattr__(
             self, "steps", _require_int("steps", self.steps, minimum=1, maximum=_INT32_MAX)
         )
@@ -447,6 +542,8 @@ def make_step10_stomp_agent(config: Step10STOMPConfig | None = None) -> STOMPAge
         config = Step10STOMPConfig(
             subtask_specs=(SubtaskSpec(feature_index=0),),
         )
+    elif type(config) is not Step10STOMPConfig:
+        raise TypeError("config must be an exact Step10STOMPConfig")
     if not config.subtask_specs:
         raise ValueError("Step 10 STOMP requires at least one subtask")
     return STOMPAgent(config.to_stomp_config())
@@ -556,14 +653,18 @@ def run_step10_smoke(
     Returns:
         :class:`Step10SmokeResult` with shape/fineness summary.
     """
-    if steps < 1:
-        raise ValueError("steps must be positive")
+    steps = _require_int("steps", steps, minimum=1, maximum=_INT32_MAX)
+    seed = require_jax_seed(seed, name="seed")
 
     cfg = config
     if cfg is None:
         cfg = Step10STOMPConfig(
             subtask_specs=(SubtaskSpec(feature_index=0),),
         )
+    elif type(cfg) is not Step10STOMPConfig:
+        raise TypeError("config must be an exact Step10STOMPConfig")
+
+    _preflight_step10_smoke_resources(cfg, steps)
 
     agent = make_step10_stomp_agent(cfg)
     obs_dim = cfg.observation_dim
