@@ -18,6 +18,7 @@ from numbers import Integral, Real
 from typing import Any, cast
 
 import chex
+import jax
 import jax.numpy as jnp
 import jax.random as jr
 import numpy as np
@@ -114,6 +115,58 @@ def _require_int(
     if maximum is not None and number > maximum:
         raise ValueError(f"{name} must be <= {maximum}")
     return number
+
+
+def _checked_product(name: str, *factors: int) -> int:
+    product = 1
+    for factor in factors:
+        if factor < 0 or (factor != 0 and product > _INT32_MAX // factor):
+            raise ValueError(f"{name} must fit signed int32")
+        product *= factor
+    return product
+
+
+def _checked_sum(name: str, *terms: int) -> int:
+    total = 0
+    for term in terms:
+        if term < 0 or term > _INT32_MAX - total:
+            raise ValueError(f"{name} must fit signed int32")
+        total += term
+    return total
+
+
+def _require_array(
+    value: object,
+    *,
+    name: str,
+    shape: tuple[int, ...],
+    dtype: jnp.dtype,
+) -> Array:
+    actual_type = type(value)
+    if not (
+        issubclass(actual_type, jax.Array) or issubclass(actual_type, jax.core.Tracer)
+    ):
+        raise TypeError(f"{name} must be a trusted JAX array")
+    trusted = cast(Array, value)
+    if trusted.shape != shape or trusted.dtype != dtype:
+        raise ValueError(f"{name} must have shape {shape} and dtype {dtype}")
+    return trusted
+
+
+def _require_key(value: object, *, name: str) -> Array:
+    actual_type = type(value)
+    if not (
+        issubclass(actual_type, jax.Array) or issubclass(actual_type, jax.core.Tracer)
+    ):
+        raise TypeError(f"{name} must be a scalar typed Threefry JAX key")
+    trusted = cast(Array, value)
+    try:
+        words = jr.key_data(trusted)
+    except (TypeError, ValueError) as error:
+        raise TypeError(f"{name} must be a scalar typed Threefry JAX key") from error
+    if trusted.shape != () or words.shape != (2,) or words.dtype != jnp.dtype(jnp.uint32):
+        raise TypeError(f"{name} must be a scalar typed Threefry JAX key")
+    return trusted
 
 
 @chex.dataclass(frozen=True)
@@ -214,6 +267,25 @@ class NonlinearFeatureDiscoveryStream:
         linear_scale_val = _require_nonnegative_real("linear_scale", linear_scale)
         noise_std_val = _require_nonnegative_real("noise_std", noise_std)
 
+        latent_weight_cells = _checked_product(
+            "nonlinear latent weight count", n_latents_val, feature_dim_val
+        )
+        context_cells = _checked_product(
+            "nonlinear context weight count", n_contexts_val, n_tasks_val, n_latents_val
+        )
+        linear_cells = _checked_product(
+            "nonlinear linear weight count", n_tasks_val, feature_dim_val
+        )
+        _checked_sum(
+            "nonlinear initialization byte count",
+            12,
+            _checked_product("nonlinear latent weight bytes", 4, latent_weight_cells),
+            _checked_product("nonlinear latent bias bytes", 4, n_latents_val),
+            # Persistent context weights plus dense, mask, and result temporaries.
+            _checked_product("nonlinear context initialization bytes", 13, context_cells),
+            _checked_product("nonlinear linear weight bytes", 4, linear_cells),
+        )
+
         self._feature_dim = feature_dim_val
         self._n_tasks = n_tasks_val
         self._n_latents = n_latents_val
@@ -282,6 +354,7 @@ class NonlinearFeatureDiscoveryStream:
 
     def init(self, key: Array) -> NonlinearFeatureDiscoveryState:
         """Initialize stream state."""
+        key = _require_key(key, name="key")
         key, k_latent, k_bias, k_ctx, k_mask, k_linear = jr.split(key, 6)
 
         # LeCun-style 1/sqrt(feature_dim) scaling gives each latent a roughly
@@ -332,7 +405,40 @@ class NonlinearFeatureDiscoveryStream:
         idx: Array,
     ) -> tuple[TimeStep, NonlinearFeatureDiscoveryState]:
         """Generate one multitask supervised sample."""
-        del idx
+        if type(state) is not NonlinearFeatureDiscoveryState:
+            raise TypeError("state must be an exact NonlinearFeatureDiscoveryState")
+        _require_key(state.key, name="state.key")
+        _require_array(
+            state.latent_weights,
+            name="state.latent_weights",
+            shape=(self._n_latents, self._feature_dim),
+            dtype=jnp.dtype(jnp.float32),
+        )
+        _require_array(
+            state.latent_biases,
+            name="state.latent_biases",
+            shape=(self._n_latents,),
+            dtype=jnp.dtype(jnp.float32),
+        )
+        _require_array(
+            state.context_weights,
+            name="state.context_weights",
+            shape=(self._n_contexts, self._n_tasks, self._n_latents),
+            dtype=jnp.dtype(jnp.float32),
+        )
+        _require_array(
+            state.linear_weights,
+            name="state.linear_weights",
+            shape=(self._n_tasks, self._feature_dim),
+            dtype=jnp.dtype(jnp.float32),
+        )
+        _require_array(
+            state.step_count,
+            name="state.step_count",
+            shape=(),
+            dtype=jnp.dtype(jnp.int32),
+        )
+        _require_array(idx, name="idx", shape=(), dtype=jnp.dtype(jnp.int32))
         key, k_x, k_noise = jr.split(state.key, 3)
 
         x = self._feature_std * jr.normal(
@@ -362,13 +468,18 @@ def collect_feature_discovery_stream(
     see the exact same stream.  It still uses the one-step stream interface and
     ``jax.lax.scan``; it does not imply experience replay inside a learner.
     """
-    import jax
-
     num_steps = _require_int("num_steps", num_steps, minimum=1, maximum=_INT32_MAX)
-    if not hasattr(stream, "init") or not callable(stream.init):
-        raise TypeError("stream must provide a callable init method")
-    if not hasattr(stream, "step") or not callable(stream.step):
-        raise TypeError("stream must provide a callable step method")
+    if type(stream) not in (NonlinearFeatureDiscoveryStream, InteractionFeatureDiscoveryStream):
+        raise TypeError(
+            "stream must be an exact feature-discovery stream with init and step"
+        )
+    key = _require_key(key, name="key")
+    output_cells = _checked_product(
+        "collected feature-discovery output count",
+        num_steps,
+        _checked_sum("collected row width", stream.feature_dim, stream.target_dim),
+    )
+    _checked_product("collected feature-discovery output bytes", 4, output_cells)
 
     state = stream.init(key)
 
@@ -380,7 +491,7 @@ def collect_feature_discovery_stream(
         return new_state, (timestep.observation, timestep.target)
 
     _, (observations, targets) = jax.lax.scan(
-        step_fn, state, jnp.arange(num_steps)
+        step_fn, state, jnp.arange(num_steps, dtype=jnp.int32)
     )
     return observations, targets
 
@@ -445,6 +556,31 @@ class InteractionFeatureDiscoveryStream:
         else:
             raise TypeError("include_squares must be a boolean")
 
+        pair_count = (
+            feature_dim_val * (feature_dim_val + 1) // 2
+            if include_squares_val
+            else feature_dim_val * (feature_dim_val - 1) // 2
+        )
+        if pair_count > _INT32_MAX:
+            raise ValueError("interaction pair count must fit signed int32")
+        context_cells = _checked_product(
+            "interaction context weight count",
+            n_contexts_val,
+            n_tasks_val,
+            pair_count,
+        )
+        linear_cells = _checked_product(
+            "interaction linear weight count", n_tasks_val, feature_dim_val
+        )
+        _checked_sum(
+            "interaction initialization byte count",
+            12,
+            _checked_product("interaction pair bytes", 8, pair_count),
+            # Persistent context weights plus scores, mask, and result temporaries.
+            _checked_product("interaction context initialization bytes", 13, context_cells),
+            _checked_product("interaction linear weight bytes", 4, linear_cells),
+        )
+
         self._feature_dim = feature_dim_val
         self._n_tasks = n_tasks_val
         self._n_contexts = n_contexts_val
@@ -454,6 +590,7 @@ class InteractionFeatureDiscoveryStream:
         self._linear_scale = linear_scale_val
         self._noise_std = noise_std_val
         self._include_squares = include_squares_val
+        self._n_pairs = pair_count
 
     @property
     def feature_dim(self) -> int:
@@ -516,6 +653,7 @@ class InteractionFeatureDiscoveryStream:
 
     def init(self, key: Array) -> InteractionFeatureDiscoveryState:
         """Initialize stream state."""
+        key = _require_key(key, name="key")
         key, k_ctx, k_mask, k_linear = jr.split(key, 4)
         pair_left, pair_right = self._pairs()
         n_pairs = pair_left.shape[0]
@@ -557,7 +695,40 @@ class InteractionFeatureDiscoveryStream:
         idx: Array,
     ) -> tuple[TimeStep, InteractionFeatureDiscoveryState]:
         """Generate one multitask interaction sample."""
-        del idx
+        if type(state) is not InteractionFeatureDiscoveryState:
+            raise TypeError("state must be an exact InteractionFeatureDiscoveryState")
+        _require_key(state.key, name="state.key")
+        _require_array(
+            state.pair_left,
+            name="state.pair_left",
+            shape=(self._n_pairs,),
+            dtype=jnp.dtype(jnp.int32),
+        )
+        _require_array(
+            state.pair_right,
+            name="state.pair_right",
+            shape=(self._n_pairs,),
+            dtype=jnp.dtype(jnp.int32),
+        )
+        _require_array(
+            state.context_weights,
+            name="state.context_weights",
+            shape=(self._n_contexts, self._n_tasks, self._n_pairs),
+            dtype=jnp.dtype(jnp.float32),
+        )
+        _require_array(
+            state.linear_weights,
+            name="state.linear_weights",
+            shape=(self._n_tasks, self._feature_dim),
+            dtype=jnp.dtype(jnp.float32),
+        )
+        _require_array(
+            state.step_count,
+            name="state.step_count",
+            shape=(),
+            dtype=jnp.dtype(jnp.int32),
+        )
+        _require_array(idx, name="idx", shape=(), dtype=jnp.dtype(jnp.int32))
         key, k_x, k_noise = jr.split(state.key, 3)
         x = self._feature_std * jr.normal(
             k_x, (self._feature_dim,), dtype=jnp.float32
