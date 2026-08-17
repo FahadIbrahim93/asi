@@ -207,6 +207,21 @@ def _weighted_cost_terms(costs: Array, cost_weight: float) -> tuple[Array, Array
     return terms, valid
 
 
+def _require_theorem_real(name: str, value: object, *, positive: bool) -> float:
+    """Reject bool/non-finite host scalars without changing legal float values."""
+    if type(value) not in _ACTUAL_REAL_TYPES:
+        raise ValueError(f"{name} must be a finite real number")
+    real = float(cast(Any, value))
+    if not math.isfinite(real):
+        raise ValueError(f"{name} must be finite")
+    if positive:
+        if real <= 0.0:
+            raise ValueError(f"{name} must be positive")
+    elif real < 0.0:
+        raise ValueError(f"{name} must be non-negative")
+    return real
+
+
 def optimal_hedge_learning_rate(
     n_actions: int,
     horizon: int,
@@ -221,12 +236,9 @@ def optimal_hedge_learning_rate(
     Cesa-Bianchi & Lugosi 2006, ch. 2).  For ``n_actions == 1`` the regret is
     identically zero, so the returned learning rate is ``0.0``.
     """
-    if n_actions < 1:
-        raise ValueError("n_actions must be positive")
-    if horizon < 1:
-        raise ValueError("horizon must be positive")
-    if loss_bound <= 0.0:
-        raise ValueError("loss_bound must be positive")
+    n_actions = _require_int32("n_actions", n_actions, minimum=1)
+    horizon = _require_int32("horizon", horizon, minimum=1)
+    loss_bound = _require_theorem_real("loss_bound", loss_bound, positive=True)
     if n_actions == 1:
         return 0.0
     return math.sqrt(8.0 * math.log(n_actions) / (horizon * loss_bound**2))
@@ -250,14 +262,10 @@ def finite_candidate_hedge_regret_bound(
     promote/delete rules require separate terms and must not cite this helper
     as a proof.
     """
-    if n_actions < 1:
-        raise ValueError("n_actions must be positive")
-    if horizon < 1:
-        raise ValueError("horizon must be positive")
-    if learning_rate < 0.0:
-        raise ValueError("learning_rate must be non-negative")
-    if loss_bound <= 0.0:
-        raise ValueError("loss_bound must be positive")
+    n_actions = _require_int32("n_actions", n_actions, minimum=1)
+    horizon = _require_int32("horizon", horizon, minimum=1)
+    learning_rate = _require_theorem_real("learning_rate", learning_rate, positive=False)
+    loss_bound = _require_theorem_real("loss_bound", loss_bound, positive=True)
     if n_actions == 1:
         return 0.0
     if learning_rate == 0.0:
