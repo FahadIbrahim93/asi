@@ -885,6 +885,20 @@ def test_official_npz_import_accepts_finite_endpoint_values(tmp_path: Path) -> N
     assert result.mean_reward == pytest.approx(1.0)
 
 
+def test_official_npz_import_accepts_numpy_float64_ewm_decay(tmp_path: Path) -> None:
+    path = tmp_path / "0.npz"
+    np.savez_compressed(path, rewards=np.ones((4,), dtype=np.float32))
+
+    result = import_official_foragax_npz(
+        OfficialForagaxRunSpec(agent="DQN", seed=0, path=path, expected_steps=4),
+        ewm_decay=np.float64(0.5),
+        record_every=1,
+        final_window=1,
+    )
+
+    assert result.mean_reward == pytest.approx(1.0)
+
+
 def test_protocol_attestation_cannot_be_minted_by_constructing_evidence(
     tmp_path: Path,
 ) -> None:
