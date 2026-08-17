@@ -289,6 +289,22 @@ class TestLearnedResourceManager:
         with pytest.raises(ValueError):
             manager.fixed_candidate_regret_bound(8, loss_bound=float("nan"))
 
+    def test_theorem_helpers_fail_closed_or_saturate_at_finite_extremes(self) -> None:
+        with pytest.raises(ValueError, match="finite learning rate"):
+            optimal_hedge_learning_rate(
+                2,
+                1,
+                loss_bound=float.fromhex("0x0.0000000000001p-1022"),
+            )
+
+        bound = finite_candidate_hedge_regret_bound(
+            2,
+            1,
+            learning_rate=1.0,
+            loss_bound=1e308,
+        )
+        assert math.isinf(bound)
+
 
 class TestGeneratorMetaResourceManager:
     """Behavioral checks for generator-internal meta-resource policies."""

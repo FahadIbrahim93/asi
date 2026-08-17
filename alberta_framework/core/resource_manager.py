@@ -241,7 +241,10 @@ def optimal_hedge_learning_rate(
     loss_bound = _require_theorem_real("loss_bound", loss_bound, positive=True)
     if n_actions == 1:
         return 0.0
-    return math.sqrt(8.0 * math.log(n_actions) / (horizon * loss_bound**2))
+    rate = math.sqrt(8.0 * math.log(n_actions) / horizon) / loss_bound
+    if not math.isfinite(rate):
+        raise ValueError("the theorem preconditions must produce a finite learning rate")
+    return rate
 
 
 def finite_candidate_hedge_regret_bound(
@@ -270,7 +273,13 @@ def finite_candidate_hedge_regret_bound(
         return 0.0
     if learning_rate == 0.0:
         return math.inf
-    return math.log(n_actions) / learning_rate + learning_rate * horizon * loss_bound**2 / 8.0
+    first_term = math.log(n_actions) / learning_rate
+    # Multiplication intentionally replaces ``loss_bound**2``: finite large
+    # bounds should conservatively saturate to infinity, not raise OverflowError.
+    second_term = learning_rate * loss_bound
+    second_term *= loss_bound
+    second_term *= horizon / 8.0
+    return first_term + second_term
 
 
 @chex.dataclass(frozen=True)
