@@ -479,23 +479,25 @@ def test_display_tables_reject_nonfinite_summaries(field: str, value: float) -> 
 
 
 @pytest.mark.parametrize("field", ["mean", "std"])
-def test_display_tables_render_the_same_canonical_float_they_validate(field: str) -> None:
+def test_display_tables_reject_float_subclass_without_calling_hook(field: str) -> None:
+    calls = 0
+
     class InfiniteFloatWithFiniteCoercion(float):
         def __float__(self) -> float:
+            nonlocal calls
+            calls += 1
             return 0.0
 
     value = InfiniteFloatWithFiniteCoercion(math.inf)
-    assert float(value) == 0.0
-    assert format(value, ".4f") == "inf"
 
     result = _constant_result("candidate", 1.0)
     summary = result.summary[_METRIC]._replace(**{field: value})
     results = {"candidate": result._replace(summary={_METRIC: summary})}
 
     for render in (generate_latex_table, generate_markdown_table):
-        table = render(results)
-        assert "inf" not in table
-        assert "0.0000" in table
+        with pytest.raises(ValueError, match="non-canonical"):
+            render(results)
+    assert calls == 0
 
 
 def test_display_tables_reject_empty_results() -> None:
