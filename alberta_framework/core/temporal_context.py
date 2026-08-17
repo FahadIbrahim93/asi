@@ -217,6 +217,68 @@ class TemporalContextState:
     step_count: Array
 
 
+def _require_array_metadata(
+    name: str,
+    value: object,
+    *,
+    shape: tuple[int, ...],
+    dtype: object,
+) -> Array:
+    """Require trusted JAX metadata before any coercion or arithmetic."""
+    actual_type = type(value)
+    if not (
+        issubclass(actual_type, jax.Array)
+        or issubclass(actual_type, jax.core.Tracer)
+    ):
+        raise ValueError(f"{name} must be a JAX array")
+    array = cast(Array, value)
+    if array.shape != shape:
+        raise ValueError(f"{name} must have shape {shape}")
+    if array.dtype != dtype:
+        raise ValueError(f"{name} must have dtype {dtype}")
+    return array
+
+
+def _require_state_metadata(
+    state: object,
+    *,
+    input_dim: int,
+) -> TemporalContextState:
+    """Require the exact public state schema without reading hostile objects."""
+    if type(state) is not TemporalContextState:
+        raise ValueError("state must be an exact TemporalContextState")
+    trusted = state
+    _require_array_metadata(
+        "state.observation_ema",
+        trusted.observation_ema,
+        shape=(input_dim,),
+        dtype=jnp.float32,
+    )
+    _require_array_metadata(
+        "state.step_count",
+        trusted.step_count,
+        shape=(),
+        dtype=jnp.int32,
+    )
+    return trusted
+
+
+def _require_observation_batch_metadata(value: object, *, input_dim: int) -> Array:
+    """Require one trusted float32 batch without touching arbitrary hooks."""
+    actual_type = type(value)
+    if not (
+        issubclass(actual_type, jax.Array)
+        or issubclass(actual_type, jax.core.Tracer)
+    ):
+        raise ValueError("observations must be a JAX array")
+    observations = cast(Array, value)
+    if observations.ndim != 2 or observations.shape[1] != input_dim:
+        raise ValueError(f"observations must have shape (steps, {input_dim})")
+    if observations.dtype != jnp.float32:
+        raise ValueError("observations must have dtype float32")
+    return observations
+
+
 def _validate_config(config: TemporalContextConfig) -> None:
     input_dim = _require_int(
         "input_dim", config.input_dim, minimum=1, maximum=_INT32_MAX
@@ -271,7 +333,6 @@ class TemporalContextFeaturizer:
             step_count=jnp.array(0, dtype=jnp.int32),
         )
 
-    @functools.partial(jax.jit, static_argnums=(0,))
     def features(
         self,
         state: TemporalContextState,
@@ -279,19 +340,47 @@ class TemporalContextFeaturizer:
     ) -> Float[Array, " output_dim"]:
         """Return current causal context features without advancing state."""
         cfg = self._config
-        obs = jnp.asarray(observation, dtype=jnp.float32)
+        state = _require_state_metadata(state, input_dim=cfg.input_dim)
+        obs = _require_array_metadata(
+            "observation",
+            observation,
+            shape=(cfg.input_dim,),
+            dtype=jnp.float32,
+        )
+        return cast(Array, self._features_jit(state, obs))
+
+    @functools.partial(jax.jit, static_argnums=(0,))
+    def _features_jit(
+        self,
+        state: TemporalContextState,
+        obs: Array,
+    ) -> Array:
+        """Compiled feature implementation after public metadata gates."""
+        cfg = self._config
         coordinate_valid = jnp.isfinite(obs)
         safe_obs = jnp.where(coordinate_valid, obs, jnp.zeros_like(obs))
+        ema_valid = jnp.all(jnp.isfinite(state.observation_ema))
+        safe_ema = jnp.where(
+            ema_valid,
+            state.observation_ema,
+            jnp.zeros_like(state.observation_ema),
+        )
         blocks = []
         if cfg.include_raw:
             blocks.append(safe_obs)
         if cfg.include_ema:
-            blocks.append(state.observation_ema)
+            blocks.append(safe_ema)
         if cfg.include_delta:
-            delta = obs - state.observation_ema
+            delta = obs - safe_ema
             blocks.append(jnp.where(coordinate_valid, delta, jnp.zeros_like(delta)))
         if cfg.periods:
-            step = state.step_count.astype(jnp.float32)
+            counter_valid = state.step_count >= jnp.asarray(0, dtype=jnp.int32)
+            safe_step_count = jnp.where(
+                counter_valid,
+                state.step_count,
+                jnp.asarray(0, dtype=jnp.int32),
+            )
+            step = safe_step_count.astype(jnp.float32)
             periods = jnp.asarray(cfg.periods, dtype=jnp.float32)
             angles = (2.0 * jnp.pi * step) / periods
             phase = jnp.ravel(jnp.stack([jnp.sin(angles), jnp.cos(angles)], axis=1))
@@ -300,39 +389,89 @@ class TemporalContextFeaturizer:
                 blocks.append(jnp.ravel(phase[:, None] * safe_obs[None, :]))
         return jnp.concatenate(blocks, axis=0)
 
-    @functools.partial(jax.jit, static_argnums=(0,))
     def update(
         self,
         state: TemporalContextState,
         observation: Float[Array, " input_dim"],
     ) -> TemporalContextState:
-        """Advance the context state after observing one input."""
+        """Advance the context state after observing one input.
+
+        ``step_count`` is a signed-int32 lifetime coordinate. At exhaustion it
+        remains at ``INT32_MAX``: EMA learning continues, while phase features
+        deliberately stay at the final representable coordinate. Invalid
+        observations, counters, or proposed EMA values commit no state field.
+        """
+        state = _require_state_metadata(state, input_dim=self._config.input_dim)
+        obs = _require_array_metadata(
+            "observation",
+            observation,
+            shape=(self._config.input_dim,),
+            dtype=jnp.float32,
+        )
+        return cast(TemporalContextState, self._update_jit(state, obs))
+
+    @functools.partial(jax.jit, static_argnums=(0,))
+    def _update_jit(
+        self,
+        state: TemporalContextState,
+        obs: Array,
+    ) -> TemporalContextState:
+        """Compiled atomic update after public metadata gates."""
         decay = jnp.asarray(self._config.ema_decay, dtype=jnp.float32)
-        obs = jnp.asarray(observation, dtype=jnp.float32)
         observation_valid = jnp.all(jnp.isfinite(obs))
+        counter_valid = state.step_count >= jnp.asarray(0, dtype=jnp.int32)
         decayed_ema = jnp.where(
             decay == 0.0,
             jnp.zeros_like(state.observation_ema),
             decay * state.observation_ema,
         )
+        proposed_ema = decayed_ema + (1.0 - decay) * obs
         proposed = TemporalContextState(
-            observation_ema=decayed_ema + (1.0 - decay) * obs,
-            step_count=state.step_count + 1,
+            observation_ema=proposed_ema,
+            step_count=jnp.minimum(
+                state.step_count,
+                jnp.asarray(_INT32_MAX - 1, dtype=jnp.int32),
+            )
+            + jnp.asarray(1, dtype=jnp.int32),
         )
         return cast(
             TemporalContextState,
-            jax.lax.cond(observation_valid, lambda: proposed, lambda: state),
+            jax.lax.cond(
+                observation_valid
+                & counter_valid
+                & jnp.all(jnp.isfinite(proposed_ema)),
+                lambda: proposed,
+                lambda: state,
+            ),
         )
 
-    @functools.partial(jax.jit, static_argnums=(0,))
     def step(
         self,
         state: TemporalContextState,
         observation: Float[Array, " input_dim"],
     ) -> tuple[TemporalContextState, Float[Array, " output_dim"]]:
         """Return features and then advance context state."""
-        features = self.features(state, observation)
-        next_state = self.update(state, observation)
+        state = _require_state_metadata(state, input_dim=self._config.input_dim)
+        obs = _require_array_metadata(
+            "observation",
+            observation,
+            shape=(self._config.input_dim,),
+            dtype=jnp.float32,
+        )
+        return cast(
+            tuple[TemporalContextState, Float[Array, " output_dim"]],
+            self._step_jit(state, obs),
+        )
+
+    @functools.partial(jax.jit, static_argnums=(0,))
+    def _step_jit(
+        self,
+        state: TemporalContextState,
+        obs: Array,
+    ) -> tuple[TemporalContextState, Array]:
+        """Compiled combined path after public metadata gates."""
+        features = self._features_jit(state, obs)
+        next_state = self._update_jit(state, obs)
         return next_state, features
 
 
@@ -343,6 +482,10 @@ def transform_temporal_context_arrays(
     state: TemporalContextState | None = None,
 ) -> tuple[TemporalContextState, Float[Array, "steps output_dim"]]:
     """Transform an observation array with a causal scan."""
+    observations = _require_observation_batch_metadata(
+        observations,
+        input_dim=featurizer.config.input_dim,
+    )
     if state is None:
         state = featurizer.init()
 
@@ -350,7 +493,7 @@ def transform_temporal_context_arrays(
         carry: TemporalContextState,
         observation: Array,
     ) -> tuple[TemporalContextState, Array]:
-        return cast(tuple[TemporalContextState, Array], featurizer.step(carry, observation))
+        return featurizer.step(carry, observation)
 
     return cast(
         tuple[TemporalContextState, Float[Array, "steps output_dim"]],

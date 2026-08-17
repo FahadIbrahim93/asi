@@ -40,6 +40,19 @@ from alberta_framework.steps._float32_validation import finite_real_and_float32
 from alberta_framework.steps._smoke_record_validation import require_step_shape
 
 _INT32_MAX = 2**31 - 1
+_ACTUAL_INT_TYPES = (
+    int,
+    np.int8,
+    np.int16,
+    np.int32,
+    np.int64,
+    np.uint8,
+    np.uint16,
+    np.uint32,
+    np.uint64,
+    np.longlong,
+    np.ulonglong,
+)
 
 
 def _compatible_float32_storage(value: object, narrowed: float) -> float:
@@ -61,14 +74,14 @@ def _require_unit_interval(name: str, value: object) -> float:
         or narrowed < 0.0
         or not narrowed <= 1.0
     ):
-        raise ValueError(f"{name} must be in [0, 1], got {value!r}")
+        raise ValueError(f"{name} must be in [0, 1]")
     return _compatible_float32_storage(real, narrowed)
 
 
 def _require_nonnegative_real(name: str, value: object) -> float:
     real, numerator, _, narrowed = finite_real_and_float32(name, value)
     if real < 0.0 or numerator < 0 or narrowed < 0.0:
-        raise ValueError(f"{name} must be non-negative, got {value!r}")
+        raise ValueError(f"{name} must be non-negative")
     return _compatible_float32_storage(real, narrowed)
 
 
@@ -80,27 +93,29 @@ def _require_int(
     maximum: int | None = None,
 ) -> int:
     actual_type = type(value)
-    if actual_type in (bool, np.bool_) or not issubclass(actual_type, Integral):
-        raise ValueError(f"{name} must be an integer, got {value!r}")
+    if all(actual_type is not allowed for allowed in _ACTUAL_INT_TYPES):
+        raise ValueError(f"{name} must be an integer")
     number = int(cast(Integral, value))
     if minimum is not None and number < minimum:
         if minimum == 1:
-            raise ValueError(f"{name} must be positive, got {value!r}")
+            raise ValueError(f"{name} must be positive")
         if minimum == 0:
-            raise ValueError(f"{name} must be non-negative, got {value!r}")
-        raise ValueError(f"{name} must be >= {minimum}, got {value!r}")
+            raise ValueError(f"{name} must be non-negative")
+        raise ValueError(f"{name} must be >= {minimum}")
     if maximum is not None and number > maximum:
-        raise ValueError(f"{name} must be at most int32 max, got {value!r}")
+        raise ValueError(f"{name} must be at most int32 max")
     return number
 
 
 def _require_bool(name: str, value: object) -> bool:
     if type(value) is not bool:
-        raise ValueError(f"{name} must be a boolean, got {value!r}")
+        raise ValueError(f"{name} must be a built-in bool")
     return value
 
 
 def _validate_step6_config(config: Step6DifferentialSARSAConfig) -> None:
+    if type(config) is not Step6DifferentialSARSAConfig:
+        raise TypeError("config must be an exact Step6DifferentialSARSAConfig")
     n_actions = _require_int(
         "n_actions",
         config.n_actions,
@@ -128,6 +143,7 @@ def _validate_step6_config(config: Step6DifferentialSARSAConfig) -> None:
     object.__setattr__(config, "epsilon_start", epsilon_start)
     object.__setattr__(config, "epsilon_end", epsilon_end)
     object.__setattr__(config, "epsilon_decay_steps", epsilon_decay_steps)
+    config.to_core_config()
 
 
 @dataclass(frozen=True)
@@ -161,7 +177,14 @@ class Step6DifferentialSARSAConfig:
     @classmethod
     def from_dict(cls, payload: dict[str, object]) -> Step6DifferentialSARSAConfig:
         """Reconstruct from :meth:`to_dict` output."""
-        return cls(**cast(Any, payload))
+        if type(payload) is not dict:
+            raise ValueError("Step6DifferentialSARSAConfig payload must be an exact dictionary")
+        raw = cast(dict[object, object], payload)
+        if any(type(key) is not str for key in raw):
+            raise ValueError("Step6DifferentialSARSAConfig payload keys must be exact strings")
+        if cast(set[str], set(raw)) != frozenset(cls.__dataclass_fields__):
+            raise ValueError("Step6DifferentialSARSAConfig payload fields do not match the schema")
+        return cls(**cast(Any, dict(raw)))
 
     def to_core_config(self) -> DifferentialSARSAConfig:
         """Return the core differential SARSA config."""
@@ -191,6 +214,10 @@ class Step6SmokeResult:
     agent_config: dict[str, Any]
 
     def __post_init__(self) -> None:
+        if type(self.config) is not Step6DifferentialSARSAConfig:
+            raise TypeError("config must be an exact Step6DifferentialSARSAConfig")
+        if type(self.agent_config) is not dict:
+            raise TypeError("agent_config must be an exact dictionary")
         object.__setattr__(
             self, "steps", _require_int("steps", self.steps, minimum=1, maximum=_INT32_MAX)
         )
@@ -223,8 +250,53 @@ def make_step6_differential_sarsa_agent(
     config: Step6DifferentialSARSAConfig | None = None,
 ) -> DifferentialSARSAAgent:
     """Create the public Step 6 differential SARSA agent."""
-    cfg = config or Step6DifferentialSARSAConfig()
+    if config is None:
+        cfg = Step6DifferentialSARSAConfig()
+    elif type(config) is Step6DifferentialSARSAConfig:
+        cfg = config
+    else:
+        raise TypeError("config must be an exact Step6DifferentialSARSAConfig")
     return DifferentialSARSAAgent(cfg.to_core_config())
+
+
+def _checked_product(name: str, *factors: int) -> int:
+    product = 1
+    for factor in factors:
+        if factor < 0 or (factor != 0 and product > _INT32_MAX // factor):
+            raise ValueError(f"derived {name} must fit signed int32")
+        product *= factor
+    return product
+
+
+def _checked_sum(name: str, *terms: int) -> int:
+    total = 0
+    for term in terms:
+        if term < 0 or term > _INT32_MAX - total:
+            raise ValueError(f"derived {name} must fit signed int32")
+        total += term
+    return total
+
+
+def _preflight_step6_smoke_resources(
+    config: Step6DifferentialSARSAConfig,
+    *,
+    steps: int,
+    feature_dim: int,
+) -> None:
+    state_parameters = _checked_product(
+        "Step 6 state parameter count", config.n_actions, feature_dim
+    )
+    _checked_product("Step 6 state parameter bytes", 8, state_parameters)
+    rows = _checked_sum("Step 6 observation row count", steps, 1)
+    observations = _checked_product("Step 6 observation count", rows, feature_dim)
+    q_values = _checked_product("Step 6 q-value count", steps, config.n_actions)
+    _checked_sum(
+        "Step 6 smoke array bytes",
+        _checked_product("Step 6 observation bytes", 4, observations),
+        _checked_product("Step 6 q-value bytes", 4, q_values),
+        # rewards, TD errors, average rewards, actions, and validity flags.
+        _checked_product("Step 6 scalar output bytes", 17, steps),
+    )
 
 
 def init_step6_state(
@@ -238,6 +310,9 @@ def init_step6_state(
     feature_dim = _require_int(
         "feature_dim", feature_dim, minimum=1, maximum=_INT32_MAX
     )
+    if type(agent) is not DifferentialSARSAAgent:
+        raise TypeError("agent must be an exact DifferentialSARSAAgent")
+    _checked_product("Step 6 state parameter bytes", 8, agent.config.n_actions, feature_dim)
     state = agent.init(feature_dim, key)
     state, _action = agent.start(state, initial_features)
     return cast(DifferentialSARSAState, state)
@@ -275,9 +350,15 @@ def run_step6_smoke(
     feature_dim = _require_int(
         "feature_dim", feature_dim, minimum=1, maximum=_INT32_MAX
     )
-    seed = _require_int("seed", seed, minimum=0, maximum=_INT32_MAX)
+    seed = require_jax_seed(seed, name="seed")
 
-    cfg = config or Step6DifferentialSARSAConfig()
+    if config is None:
+        cfg = Step6DifferentialSARSAConfig()
+    elif type(config) is Step6DifferentialSARSAConfig:
+        cfg = config
+    else:
+        raise TypeError("config must be an exact Step6DifferentialSARSAConfig")
+    _preflight_step6_smoke_resources(cfg, steps=steps, feature_dim=feature_dim)
     agent = make_step6_differential_sarsa_agent(cfg)
     data_key, state_key = jr.split(jr.key(seed))
     observations = jr.normal(data_key, (steps + 1, feature_dim), dtype=jnp.float32)

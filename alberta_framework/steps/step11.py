@@ -29,6 +29,7 @@ References:
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from fractions import Fraction
 from numbers import Integral
 from typing import Any, cast
 
@@ -169,18 +170,49 @@ class Step11OaKConfig:
 
 
 _INT32_MAX = 2**31 - 1
-_NUMPY_INTEGER_TYPES = frozenset(
-    np.dtype(code).type for code in ("b", "B", "h", "H", "i", "I", "l", "L", "q", "Q")
+_ACTUAL_INT_TYPES = (
+    int,
+    np.int8,
+    np.int16,
+    np.int32,
+    np.int64,
+    np.uint8,
+    np.uint16,
+    np.uint32,
+    np.uint64,
+    np.longlong,
+    np.ulonglong,
+)
+_ACTUAL_REAL_TYPES = _ACTUAL_INT_TYPES + (
+    float,
+    Fraction,
+    np.dtype("e").type,
+    np.dtype("f").type,
+    np.dtype("d").type,
+    np.dtype("g").type,
 )
 
 
+def _finite_real_and_float32(name: str, value: object) -> tuple[Any, int, int, float]:
+    """Validate the runtime type without invoking hooks on its metaclass."""
+    actual_type = type(value)
+    if not any(actual_type is allowed_type for allowed_type in _ACTUAL_REAL_TYPES):
+        mro = type.__getattribute__(actual_type, "__mro__")
+        has_real_lineage = actual_type is not bool and any(
+            base is int or base is float or base is Fraction for base in mro
+        )
+        requirement = "finite" if has_real_lineage else "a real number"
+        raise ValueError(f"{name} must be {requirement}")
+    return finite_real_and_float32(name, value)
+
+
 def _require_real(name: str, value: object) -> float:
-    real, _, _, narrowed = finite_real_and_float32(name, value)
+    real, _, _, narrowed = _finite_real_and_float32(name, value)
     return canonical_float32_storage(real, narrowed)
 
 
 def _require_unit_interval(name: str, value: object) -> float:
-    real, numerator, denominator, narrowed = finite_real_and_float32(name, value)
+    real, numerator, denominator, narrowed = _finite_real_and_float32(name, value)
     if (
         real < 0.0
         or not real <= 1.0
@@ -189,21 +221,21 @@ def _require_unit_interval(name: str, value: object) -> float:
         or narrowed < 0.0
         or not narrowed <= 1.0
     ):
-        raise ValueError(f"{name} must be in [0, 1], got {value!r}")
+        raise ValueError(f"{name} must be in [0, 1]")
     return canonical_float32_storage(real, narrowed)
 
 
 def _require_nonnegative_real(name: str, value: object) -> float:
-    real, numerator, _, narrowed = finite_real_and_float32(name, value)
+    real, numerator, _, narrowed = _finite_real_and_float32(name, value)
     if real < 0.0 or numerator < 0 or narrowed < 0.0:
-        raise ValueError(f"{name} must be non-negative, got {value!r}")
+        raise ValueError(f"{name} must be non-negative")
     return canonical_float32_storage(real, narrowed)
 
 
 def _require_positive_real(name: str, value: object) -> float:
-    real, numerator, _, narrowed = finite_real_and_float32(name, value)
+    real, numerator, _, narrowed = _finite_real_and_float32(name, value)
     if real <= 0.0 or numerator <= 0 or narrowed <= 0.0:
-        raise ValueError(f"{name} must be positive, got {value!r}")
+        raise ValueError(f"{name} must be positive")
     return canonical_float32_storage(real, narrowed)
 
 
@@ -215,26 +247,23 @@ def _require_int(
     maximum: int | None = None,
 ) -> int:
     actual_type = type(value)
-    if actual_type is int:
-        number = cast(int, value)
-    elif actual_type in _NUMPY_INTEGER_TYPES:
-        number = int(cast(Integral, value))
-    else:
-        raise ValueError(f"{name} must be an integer, got {value!r}")
+    if not any(actual_type is allowed_type for allowed_type in _ACTUAL_INT_TYPES):
+        raise ValueError(f"{name} must be an integer")
+    number = int(cast(Integral, value))
     if minimum is not None and number < minimum:
         if minimum == 1:
-            raise ValueError(f"{name} must be positive, got {value!r}")
+            raise ValueError(f"{name} must be positive")
         if minimum == 0:
-            raise ValueError(f"{name} must be non-negative, got {value!r}")
-        raise ValueError(f"{name} must be >= {minimum}, got {value!r}")
+            raise ValueError(f"{name} must be non-negative")
+        raise ValueError(f"{name} must be >= {minimum}")
     if maximum is not None and number > maximum:
-        raise ValueError(f"{name} must be at most int32 max, got {value!r}")
+        raise ValueError(f"{name} must be <= {maximum}")
     return number
 
 
 def _require_bool(name: str, value: object) -> bool:
     if type(value) is not bool:
-        raise ValueError(f"{name} must be a boolean, got {value!r}")
+        raise ValueError(f"{name} must be a boolean")
     return value
 
 
@@ -258,13 +287,11 @@ def _validate_oak_facade_config(config: Step11OaKConfig) -> None:
         maximum=_INT32_MAX - 1,
     )
     if type(config.subtask_specs) is not tuple:
-        raise ValueError(
-            f"subtask_specs must be a tuple of SubtaskSpec, got {config.subtask_specs!r}"
-        )
+        raise ValueError("subtask_specs must be a tuple of SubtaskSpec")
     canonical_specs: list[SubtaskSpec] = []
     for spec in config.subtask_specs:
         if type(spec) is not SubtaskSpec:
-            raise ValueError(f"subtask_specs must contain SubtaskSpec values, got {spec!r}")
+            raise ValueError("subtask_specs must contain SubtaskSpec values")
         feature_index = _require_int(
             "feature_index",
             spec.feature_index,
@@ -272,9 +299,7 @@ def _validate_oak_facade_config(config: Step11OaKConfig) -> None:
             maximum=_INT32_MAX,
         )
         if feature_index >= observation_dim:
-            raise ValueError(
-                f"feature_index must be < observation_dim, got {spec.feature_index!r}"
-            )
+            raise ValueError("feature_index must be < observation_dim")
         threshold = _require_positive_real("threshold", spec.threshold)
         pseudo_reward_scale = _require_positive_real(
             "pseudo_reward_scale",

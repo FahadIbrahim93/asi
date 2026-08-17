@@ -406,13 +406,13 @@ def test_step12_ia_fields_preserve_legal_endpoints() -> None:
         option_gamma=1.0,
         epsilon_base=1.0,
         utility_ema_decay=1.0,
-        option_planning_backups_per_step=2**31 - 2,
+        option_planning_backups_per_step=4_096,
     )
     make_step12_ia_agent(upper)
     assert upper.option_gamma == 1.0
     assert upper.epsilon_base == 1.0
     assert upper.utility_ema_decay == 1.0
-    assert upper.option_planning_backups_per_step == 2**31 - 2
+    assert upper.option_planning_backups_per_step == 4_096
 
 
 def test_step12_ia_fields_canonicalize_nonbuiltin_numbers() -> None:
@@ -550,14 +550,14 @@ def test_step12_float32_underflow_and_finite_boundaries_are_canonical() -> None:
     assert maximum.subtask_specs[0].pseudo_reward_scale == _FLOAT32_MAX
 
 
-def test_step12_int32_counter_boundaries_match_core_sinks() -> None:
+def test_step12_counter_and_planning_work_boundaries() -> None:
     config = _config_with(
         subtask_specs=(SubtaskSpec(feature_index=0, max_option_steps=_INT32_MAX),),
-        option_planning_backups_per_step=_INT32_MAX - 1,
+        option_planning_backups_per_step=4_096,
     )
     make_step12_ia_agent(config)
     assert config.subtask_specs[0].max_option_steps == _INT32_MAX
-    assert config.option_planning_backups_per_step == _INT32_MAX - 1
+    assert config.option_planning_backups_per_step == 4_096
 
     with pytest.raises(ValueError, match="max_option_steps"):
         _config_with(
@@ -566,7 +566,7 @@ def test_step12_int32_counter_boundaries_match_core_sinks() -> None:
             )
         )
     with pytest.raises(ValueError, match="option_planning_backups_per_step"):
-        _config_with(option_planning_backups_per_step=_INT32_MAX)
+        _config_with(option_planning_backups_per_step=4_097)
 
 
 def test_step12_builtin_json_roundtrip_preserves_canonical_config() -> None:
@@ -1084,28 +1084,28 @@ def test_step12_state_stays_finite_200_steps() -> None:
 def test_step12_config_preserves_float32_boundaries() -> None:
     f32_max = float(np.finfo(np.float32).max)
     spec = SubtaskSpec(
-        feature_index=2**31 - 2,
+        feature_index=0,
         threshold=f32_max,
         pseudo_reward_scale=f32_max,
         max_option_steps=2**31 - 1,
     )
     config = Step12IAConfig(
-        n_demons=2**31 - 1,
+        n_demons=1,
         cerebellum_step_size=f32_max,
         subtask_specs=(spec,),
-        observation_dim=2**31 - 1,
-        n_primitive_actions=2**31 - 1,
+        observation_dim=1,
+        n_primitive_actions=1,
         base_step_size=f32_max,
         base_avg_reward_step_size=f32_max,
         option_step_size=f32_max,
         option_gamma=1.0,
-        option_planning_backups_per_step=2**31 - 2,
+        option_planning_backups_per_step=4_096,
         epsilon_base=1.0,
         utility_ema_decay=1.0,
     )
-    assert config.n_demons == 2**31 - 1
-    assert config.observation_dim == 2**31 - 1
-    assert config.option_planning_backups_per_step == 2**31 - 2
+    assert config.n_demons == 1
+    assert config.observation_dim == 1
+    assert config.option_planning_backups_per_step == 4_096
     assert config.cerebellum_step_size == f32_max
 
 

@@ -126,11 +126,43 @@ class Step12IAConfig:
     @classmethod
     def from_config(cls, payload: dict[str, Any]) -> Step12IAConfig:
         """Reconstruct from :meth:`to_config` output."""
-        data = dict(payload)
-        data.pop("type", None)
-        specs_raw = data.pop("subtask_specs", [])
-        specs = tuple(SubtaskSpec(**s) for s in specs_raw)
-        return cls(subtask_specs=specs, **data)
+        data = _require_payload(
+            payload,
+            name="Step12IAConfig payload",
+            allowed=_STEP12_CONFIG_FIELDS,
+        )
+        if type(data["type"]) is not str or data["type"] != "Step12IAConfig":
+            raise ValueError("Step12IAConfig payload type must be 'Step12IAConfig'")
+        specs_raw = data.pop("subtask_specs")
+        if type(specs_raw) is not list:
+            raise ValueError("subtask_specs payload must be an exact list")
+        raw_specs = cast(list[object], specs_raw)
+        _require_subtask_count(len(raw_specs))
+        specs: list[SubtaskSpec] = []
+        for index in range(len(raw_specs)):
+            raw_spec = _require_payload(
+                raw_specs[index],
+                name=f"subtask_specs[{index}]",
+                allowed=_SUBTASK_SPEC_FIELDS,
+            )
+            specs.append(
+                SubtaskSpec(
+                    feature_index=_require_int(
+                        "feature_index", raw_spec["feature_index"], minimum=0,
+                        maximum=_INT32_MAX
+                    ),
+                    threshold=_require_positive_real("threshold", raw_spec["threshold"]),
+                    pseudo_reward_scale=_require_positive_real(
+                        "pseudo_reward_scale", raw_spec["pseudo_reward_scale"]
+                    ),
+                    max_option_steps=_require_int(
+                        "max_option_steps", raw_spec["max_option_steps"], minimum=1,
+                        maximum=_INT32_MAX
+                    ),
+                )
+            )
+        data.pop("type")
+        return cls(subtask_specs=tuple(specs), **data)
 
     def to_ia_config(self) -> IAConfig:
         """Convert to the core :class:`IAConfig`."""
@@ -158,9 +190,138 @@ class Step12IAConfig:
 
 
 _INT32_MAX = 2**31 - 1
-_NUMPY_INTEGER_TYPES = frozenset(
-    np.dtype(code).type for code in ("b", "B", "h", "H", "i", "I", "l", "L", "q", "Q")
+_MAX_SUBTASK_SPECS = 4_096
+_MAX_PLANNING_BACKUPS_PER_STEP = 4_096
+_STEP12_CONFIG_FIELDS = frozenset(
+    {
+        "type",
+        "n_demons",
+        "cerebellum_step_size",
+        "subtask_specs",
+        "observation_dim",
+        "n_primitive_actions",
+        "base_step_size",
+        "base_avg_reward_step_size",
+        "option_step_size",
+        "option_gamma",
+        "option_planning_backups_per_step",
+        "epsilon_base",
+        "utility_ema_decay",
+    }
 )
+_SUBTASK_SPEC_FIELDS = frozenset(
+    {"feature_index", "threshold", "pseudo_reward_scale", "max_option_steps"}
+)
+_ACTUAL_INT_TYPES = frozenset(
+    {
+        int,
+        np.int8,
+        np.int16,
+        np.int32,
+        np.int64,
+        np.uint8,
+        np.uint16,
+        np.uint32,
+        np.uint64,
+        np.longlong,
+        np.ulonglong,
+    }
+)
+
+
+def _require_payload(
+    value: object,
+    *,
+    name: str,
+    allowed: frozenset[str],
+) -> dict[str, Any]:
+    """Copy one exact record after checking its complete fixed schema."""
+    if type(value) is not dict:
+        raise ValueError(f"{name} must be an exact dictionary")
+    raw = cast(dict[object, object], value)
+    if any(type(key) is not str for key in raw):
+        raise ValueError(f"{name} keys must be exact strings")
+    keys = cast(set[str], set(raw))
+    if keys != allowed:
+        raise ValueError(f"{name} fields do not match the schema")
+    return cast(dict[str, Any], dict(raw))
+
+
+def _require_subtask_count(count: int) -> None:
+    if count > _MAX_SUBTASK_SPECS:
+        raise ValueError(
+            f"subtask_specs must contain at most {_MAX_SUBTASK_SPECS} values"
+        )
+
+
+def _checked_product(name: str, *factors: int) -> int:
+    product = 1
+    for factor in factors:
+        if factor < 0 or (factor != 0 and product > _INT32_MAX // factor):
+            raise ValueError(f"derived {name} must fit signed int32")
+        product *= factor
+    return product
+
+
+def _checked_sum(name: str, *terms: int) -> int:
+    total = 0
+    for term in terms:
+        if term < 0 or term > _INT32_MAX - total:
+            raise ValueError(f"derived {name} must fit signed int32")
+        total += term
+    return total
+
+
+def _preflight_step12_agent_resources(config: Step12IAConfig) -> None:
+    augmented_dim = _checked_sum(
+        "Step 12 augmented observation dimension",
+        config.observation_dim,
+        config.n_demons,
+    )
+    weights = _checked_product(
+        "Step 12 cerebellum weight count",
+        config.n_demons,
+        config.observation_dim,
+    )
+    _checked_sum(
+        "Step 12 direct agent bytes",
+        _checked_product("Step 12 cerebellum weight bytes", 4, weights),
+        _checked_product("Step 12 demon index bytes", 4, config.n_demons),
+        _checked_product("Step 12 augmented row bytes", 4, augmented_dim),
+    )
+
+
+def _preflight_step12_smoke_resources(
+    config: Step12IAConfig,
+    steps: int,
+) -> None:
+    observation_rows = _checked_sum("Step 12 observation row count", steps, 1)
+    observations = _checked_product(
+        "Step 12 observation count", observation_rows, config.observation_dim
+    )
+    demon_outputs = _checked_product(
+        "Step 12 demon output count", steps, config.n_demons
+    )
+    augmented_outputs = _checked_product(
+        "Step 12 augmented output count",
+        steps,
+        _checked_sum(
+            "Step 12 augmented observation dimension",
+            config.observation_dim,
+            config.n_demons,
+        ),
+    )
+    _checked_sum(
+        "Step 12 smoke array bytes",
+        _checked_product("Step 12 observation bytes", 4, observations),
+        _checked_product("Step 12 reward bytes", 4, steps),
+        _checked_product("Step 12 demon output bytes", 8, demon_outputs),
+        _checked_product("Step 12 augmented output bytes", 4, augmented_outputs),
+        # recommendation + TD error + two two-word clocks
+        _checked_product("Step 12 scalar and clock output bytes", 24, steps),
+        # Eight one-byte transaction-validity arrays.
+        _checked_product("Step 12 validity output bytes", 8, steps),
+    )
 
 
 def _require_unit_interval(name: str, value: object) -> float:
@@ -173,21 +334,21 @@ def _require_unit_interval(name: str, value: object) -> float:
         or narrowed < 0.0
         or not narrowed <= 1.0
     ):
-        raise ValueError(f"{name} must be in [0, 1], got {value!r}")
+        raise ValueError(f"{name} must be in [0, 1]")
     return float(narrowed)
 
 
 def _require_nonnegative_real(name: str, value: object) -> float:
     real, numerator, _, narrowed = finite_real_and_float32(name, value)
     if real < 0.0 or numerator < 0 or narrowed < 0.0:
-        raise ValueError(f"{name} must be non-negative, got {value!r}")
+        raise ValueError(f"{name} must be non-negative")
     return float(narrowed)
 
 
 def _require_positive_real(name: str, value: object) -> float:
     real, numerator, _, narrowed = finite_real_and_float32(name, value)
     if real <= 0.0 or numerator <= 0 or narrowed <= 0.0:
-        raise ValueError(f"{name} must be positive, got {value!r}")
+        raise ValueError(f"{name} must be positive")
     return float(narrowed)
 
 
@@ -204,31 +365,29 @@ def _require_int(
     maximum: int | None = None,
 ) -> int:
     actual_type = type(value)
-    number: int
-    if actual_type is int:
-        number = cast(int, value)
-    elif actual_type in _NUMPY_INTEGER_TYPES:
-        number = int(cast(Integral, value))
-    else:
-        raise ValueError(f"{name} must be an integer, got {value!r}")
+    if actual_type not in _ACTUAL_INT_TYPES:
+        raise ValueError(f"{name} must be an integer")
+    number = int(cast(Integral, value))
     if minimum is not None and number < minimum:
         if minimum == 1:
-            raise ValueError(f"{name} must be positive, got {value!r}")
+            raise ValueError(f"{name} must be positive")
         if minimum == 0:
-            raise ValueError(f"{name} must be non-negative, got {value!r}")
-        raise ValueError(f"{name} must be >= {minimum}, got {value!r}")
+            raise ValueError(f"{name} must be non-negative")
+        raise ValueError(f"{name} must be >= {minimum}")
     if maximum is not None and number > maximum:
-        raise ValueError(f"{name} must be <= {maximum}, got {value!r}")
+        raise ValueError(f"{name} must be <= {maximum}")
     return number
 
 
 def _require_bool(name: str, value: object) -> bool:
     if type(value) is not bool:
-        raise ValueError(f"{name} must be a boolean, got {value!r}")
+        raise ValueError(f"{name} must be a boolean")
     return value
 
 
 def _validate_ia_facade_config(config: Step12IAConfig) -> None:
+    if type(config) is not Step12IAConfig:
+        raise TypeError("config must be an exact Step12IAConfig")
     n_demons = _require_int("n_demons", config.n_demons, minimum=1, maximum=_INT32_MAX)
     observation_dim = _require_int(
         "observation_dim",
@@ -246,16 +405,15 @@ def _validate_ia_facade_config(config: Step12IAConfig) -> None:
         "option_planning_backups_per_step",
         config.option_planning_backups_per_step,
         minimum=0,
-        maximum=_INT32_MAX - 1,
+        maximum=_MAX_PLANNING_BACKUPS_PER_STEP,
     )
     if type(config.subtask_specs) is not tuple:
-        raise ValueError(
-            f"subtask_specs must be a tuple of SubtaskSpec, got {config.subtask_specs!r}"
-        )
+        raise ValueError("subtask_specs must be a tuple of SubtaskSpec")
+    _require_subtask_count(len(config.subtask_specs))
     canonical_specs: list[SubtaskSpec] = []
     for spec in config.subtask_specs:
         if type(spec) is not SubtaskSpec:
-            raise ValueError(f"subtask_specs must contain SubtaskSpec values, got {spec!r}")
+            raise ValueError("subtask_specs must contain SubtaskSpec values")
         feature_index = _require_int(
             "feature_index",
             spec.feature_index,
@@ -263,9 +421,7 @@ def _validate_ia_facade_config(config: Step12IAConfig) -> None:
             maximum=_INT32_MAX,
         )
         if feature_index >= observation_dim:
-            raise ValueError(
-                f"feature_index must be < observation_dim, got {spec.feature_index!r}"
-            )
+            raise ValueError("feature_index must be < observation_dim")
         threshold = _require_positive_real("threshold", spec.threshold)
         pseudo_reward_scale = _require_positive_real(
             "pseudo_reward_scale",
@@ -320,6 +476,10 @@ def _validate_ia_facade_config(config: Step12IAConfig) -> None:
     )
     object.__setattr__(config, "epsilon_base", epsilon_base)
     object.__setattr__(config, "utility_ema_decay", utility_ema_decay)
+    _preflight_step12_agent_resources(config)
+    # Constructing the nested configs is allocation-free and applies their
+    # exact derived STOMP/OaK resource formulas at this facade boundary.
+    config.to_ia_config()
 
 
 @dataclass(frozen=True)
@@ -338,6 +498,10 @@ class Step12SmokeResult:
     agent_config: dict[str, Any]
 
     def __post_init__(self) -> None:
+        if type(self.config) is not Step12IAConfig:
+            raise TypeError("config must be an exact Step12IAConfig")
+        if type(self.agent_config) is not dict:
+            raise TypeError("agent_config must be an exact dictionary")
         object.__setattr__(
             self, "steps", _require_int("steps", self.steps, minimum=1, maximum=_INT32_MAX)
         )
@@ -384,6 +548,9 @@ def make_step12_ia_agent(config: Step12IAConfig | None = None) -> IAAgent:
     """
     if config is None:
         config = Step12IAConfig()
+    elif type(config) is not Step12IAConfig:
+        raise TypeError("config must be an exact Step12IAConfig")
+    _preflight_step12_agent_resources(config)
     return IAAgent(config.to_ia_config())
 
 
@@ -474,7 +641,14 @@ def run_step12_smoke(
     steps = _require_int("steps", steps, minimum=1, maximum=_INT32_MAX)
     seed = _require_int("seed", seed, minimum=0, maximum=_INT32_MAX)
 
-    cfg = config or Step12IAConfig()
+    if config is None:
+        cfg = Step12IAConfig()
+    elif type(config) is Step12IAConfig:
+        cfg = config
+    else:
+        raise TypeError("config must be an exact Step12IAConfig")
+    _preflight_step12_agent_resources(cfg)
+    _preflight_step12_smoke_resources(cfg, steps)
     agent = make_step12_ia_agent(cfg)
     obs_dim = cfg.observation_dim
 

@@ -977,10 +977,63 @@ class KeyboardChordLearnerState:
     step_count: Int[Array, ""]
 
 
+def _keyboard_array_operand(
+    name: str,
+    value: object,
+    *,
+    shape: tuple[int, ...],
+    dtype: object,
+) -> Array:
+    """Require trusted JAX metadata before keyboard arithmetic or coercion."""
+    actual_type = type(value)
+    if not (
+        issubclass(actual_type, jax.Array)
+        or issubclass(actual_type, jax.core.Tracer)
+    ):
+        raise ValueError(f"{name} must be a JAX array")
+    array = cast(Array, value)
+    if array.shape != shape:
+        raise ValueError(f"{name} must have shape {shape}")
+    if array.dtype != dtype:
+        raise ValueError(f"{name} must have dtype {dtype}")
+    return array
+
+
+def _keyboard_state_operand(
+    config: KeyboardChordLearnerConfig,
+    state: object,
+) -> KeyboardChordLearnerState:
+    """Require the exact keyboard learner state schema without hostile hooks."""
+    if type(state) is not KeyboardChordLearnerState:
+        raise ValueError("state must be an exact KeyboardChordLearnerState")
+    trusted = state
+    _keyboard_array_operand(
+        "state.chord_vector",
+        trusted.chord_vector,
+        shape=(config.n_options,),
+        dtype=jnp.float32,
+    )
+    _keyboard_array_operand(
+        "state.reward_baseline",
+        trusted.reward_baseline,
+        shape=(),
+        dtype=jnp.float32,
+    )
+    _keyboard_array_operand(
+        "state.step_count",
+        trusted.step_count,
+        shape=(),
+        dtype=jnp.int32,
+    )
+    return trusted
+
+
 def init_keyboard_chord_learner(
     config: KeyboardChordLearnerConfig,
 ) -> KeyboardChordLearnerState:
     """Initialize keyboard-chord learner state."""
+    if type(config) is not KeyboardChordLearnerConfig:
+        raise ValueError("config must be an exact KeyboardChordLearnerConfig")
     return KeyboardChordLearnerState(
         chord_vector=jnp.ones(config.n_options, dtype=jnp.float32) / config.n_options,
         reward_baseline=jnp.array(0.0, dtype=jnp.float32),
@@ -998,10 +1051,34 @@ def update_keyboard_chord_learner(
 
     Positive advantage moves the learned chord vector toward the selected
     chord; negative advantage moves it away.  The reward baseline is an EMA.
+    The int32 step count is saturating telemetry: learning continues after
+    exhaustion while the counter remains at its final representable value.
+    Invalid source state, inputs, or proposed values commit no state field.
     """
-    chord = jnp.asarray(selected_chord, dtype=jnp.float32).reshape((config.n_options,))
-    chord_norm = chord / (jnp.linalg.norm(chord) + 1.0e-8)
-    reward_arr = jnp.asarray(reward, dtype=jnp.float32)
+    if type(config) is not KeyboardChordLearnerConfig:
+        raise ValueError("config must be an exact KeyboardChordLearnerConfig")
+    state = _keyboard_state_operand(config, state)
+    chord = _keyboard_array_operand(
+        "selected_chord",
+        selected_chord,
+        shape=(config.n_options,),
+        dtype=jnp.float32,
+    )
+    reward_arr = _keyboard_array_operand(
+        "reward",
+        reward,
+        shape=(),
+        dtype=jnp.float32,
+    )
+    chord_max = jnp.max(jnp.abs(chord))
+    _, chord_exponent = jnp.frexp(chord_max)
+    scaled_chord = jnp.ldexp(chord, -chord_exponent)
+    scaled_chord_norm = jnp.linalg.norm(scaled_chord)
+    chord_norm = jnp.where(
+        chord_max > 0.0,
+        scaled_chord / scaled_chord_norm,
+        jnp.zeros_like(chord),
+    )
     baseline = (
         config.baseline_decay * state.reward_baseline + (1.0 - config.baseline_decay) * reward_arr
     )
@@ -1010,21 +1087,35 @@ def update_keyboard_chord_learner(
         state.chord_vector * (1.0 - config.step_size * config.l2_penalty)
         + config.step_size * advantage * chord_norm
     )
-    norm = jnp.linalg.norm(proposed_vector)
-    scale = jnp.minimum(1.0, jnp.asarray(config.max_norm, dtype=jnp.float32) / (norm + 1.0e-8))
+    vector_max = jnp.max(jnp.abs(proposed_vector))
+    _, vector_exponent = jnp.frexp(vector_max)
+    scaled_vector = jnp.ldexp(proposed_vector, -vector_exponent)
+    scaled_vector_norm = jnp.linalg.norm(scaled_vector)
+    max_norm = jnp.asarray(config.max_norm, dtype=jnp.float32)
+    exceeds_max_norm = vector_max > max_norm / scaled_vector_norm
+    bounded_vector = jnp.where(
+        exceeds_max_norm,
+        (scaled_vector / scaled_vector_norm) * max_norm,
+        proposed_vector,
+    )
     proposed_state = KeyboardChordLearnerState(
-        chord_vector=proposed_vector * scale,
+        chord_vector=bounded_vector,
         reward_baseline=baseline,
-        step_count=state.step_count + 1,
+        step_count=_saturating_int32_counter_increment(state.step_count),
     )
     # Inf reward * a zero chord coordinate is 0*inf = NaN, then the
     # max-norm rescaling is nan/inf and the whole vector stays poisoned.
+    source_valid = (
+        jnp.all(jnp.isfinite(state.chord_vector))
+        & jnp.isfinite(state.reward_baseline)
+        & (state.step_count >= jnp.asarray(0, dtype=jnp.int32))
+    )
     inputs_valid = jnp.all(jnp.isfinite(chord)) & jnp.isfinite(reward_arr)
     proposed_finite = jnp.all(jnp.isfinite(proposed_state.chord_vector)) & jnp.isfinite(
         proposed_state.reward_baseline
     )
     return jax.lax.cond(
-        inputs_valid & proposed_finite,
+        source_valid & inputs_valid & proposed_finite,
         lambda: proposed_state,
         lambda: state,
     )

@@ -29,6 +29,7 @@ import chex
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 from jax import Array
 
 from alberta_framework._seed_validation import require_jax_seed
@@ -56,6 +57,21 @@ from alberta_framework.steps._smoke_record_validation import require_step_shape
 Step4OptimizerName = Literal["lms", "idbd", "autostep"]
 Step4BounderName = Literal["none", "obgd"]
 _INT32_MAX = 2**31 - 1
+_ACTUAL_INT_TYPES = frozenset(
+    {
+        int,
+        np.int8,
+        np.int16,
+        np.int32,
+        np.int64,
+        np.uint8,
+        np.uint16,
+        np.uint32,
+        np.uint64,
+        np.longlong,
+        np.ulonglong,
+    }
+)
 _FLOAT32_MIN_NORMAL = float.fromhex("0x1.0p-126")
 
 
@@ -162,7 +178,7 @@ def _require_unit_interval(name: str, value: object) -> float:
         or narrowed < 0.0
         or not narrowed <= 1.0
     ):
-        raise ValueError(f"{name} must be in [0, 1], got {value!r}")
+        raise ValueError(f"{name} must be in [0, 1]")
     return canonical_float32_storage(real, narrowed)
 
 
@@ -176,7 +192,7 @@ def _require_gvf_probability(name: str, value: object) -> float:
         or narrowed < 0.0
         or not narrowed <= 1.0
     ):
-        raise ValueError(f"{name} must be in [0, 1], got {value!r}")
+        raise ValueError(f"{name} must be in [0, 1]")
     if (
         (numerator != 0 and numerator << 126 < denominator)
         or (real != 0.0 and real < _FLOAT32_MIN_NORMAL)
@@ -189,49 +205,57 @@ def _require_gvf_probability(name: str, value: object) -> float:
 def _require_nonnegative_real(name: str, value: object) -> float:
     real, numerator, _, narrowed = finite_real_and_float32(name, value)
     if real < 0.0 or numerator < 0 or narrowed < 0.0:
-        raise ValueError(f"{name} must be non-negative, got {value!r}")
+        raise ValueError(f"{name} must be non-negative")
     return canonical_float32_storage(real, narrowed)
 
 
 def _require_positive_real(name: str, value: object) -> float:
     real, numerator, _, narrowed = finite_real_and_float32(name, value)
     if real <= 0.0 or numerator <= 0 or narrowed <= 0.0:
-        raise ValueError(f"{name} must be positive, got {value!r}")
+        raise ValueError(f"{name} must be positive")
     return canonical_float32_storage(real, narrowed)
 
 
 def _require_positive_int(name: str, value: object) -> int:
     actual_type = type(value)
-    if issubclass(actual_type, bool) or not issubclass(actual_type, Integral):
-        raise ValueError(f"{name} must be a positive integer, got {value!r}")
+    if actual_type not in _ACTUAL_INT_TYPES:
+        raise ValueError(f"{name} must be a positive integer")
     number = int(cast(Integral, value))
     if number < 1:
-        raise ValueError(f"{name} must be positive, got {value!r}")
+        raise ValueError(f"{name} must be positive")
     if number > _INT32_MAX:
-        raise ValueError(f"{name} must be at most int32 max, got {value!r}")
+        raise ValueError(f"{name} must be at most int32 max")
     return number
 
 
 def _require_nonneg_int(name: str, value: object) -> int:
     actual_type = type(value)
-    if issubclass(actual_type, bool) or not issubclass(actual_type, Integral):
-        raise ValueError(f"{name} must be a non-negative integer, got {value!r}")
+    if actual_type not in _ACTUAL_INT_TYPES:
+        raise ValueError(f"{name} must be a non-negative integer")
     number = int(cast(Integral, value))
     if number < 0:
-        raise ValueError(f"{name} must be a non-negative integer, got {value!r}")
+        raise ValueError(f"{name} must be a non-negative integer")
     if number > _INT32_MAX:
-        raise ValueError(f"{name} must be at most int32 max, got {value!r}")
+        raise ValueError(f"{name} must be at most int32 max")
     return number
 
 
 def _require_bool(name: str, value: object) -> bool:
     if type(value) is not bool:
-        raise ValueError(f"{name} must be a boolean, got {value!r}")
+        raise ValueError(f"{name} must be a boolean")
+    return value
+
+
+def _require_choice(name: str, value: object, choices: tuple[str, ...]) -> str:
+    if type(value) is not str or value not in choices:
+        raise ValueError(f"{name} must be one of {', '.join(choices)}")
     return value
 
 
 def _validate_sarsa_config(config: Step4SARSAConfig) -> None:
     n_actions = _require_positive_int("n_actions", config.n_actions)
+    if type(config.hidden_sizes) is not tuple:
+        raise ValueError("hidden_sizes must be an actual tuple")
     hidden_sizes = tuple(
         _require_positive_int("hidden_sizes", size) for size in config.hidden_sizes
     )
@@ -244,10 +268,12 @@ def _validate_sarsa_config(config: Step4SARSAConfig) -> None:
     meta_step_size = _require_nonnegative_real("meta_step_size", config.meta_step_size)
     bounder_kappa = _require_positive_real("bounder_kappa", config.bounder_kappa)
     sparsity = _require_unit_interval("sparsity", config.sparsity)
-    if type(config.use_layer_norm) is not bool:
-        raise ValueError(
-            f"use_layer_norm must be a boolean, got {config.use_layer_norm!r}"
-        )
+    use_layer_norm = _require_bool("use_layer_norm", config.use_layer_norm)
+    optimizer = _require_choice("optimizer", config.optimizer, ("lms", "idbd", "autostep"))
+    bounder = _require_choice("bounder", config.bounder, ("none", "obgd"))
+    trace_mode = _require_choice(
+        "trace_mode", config.trace_mode, ("accumulating", "replacing")
+    )
     object.__setattr__(config, "n_actions", n_actions)
     object.__setattr__(config, "hidden_sizes", hidden_sizes)
     object.__setattr__(config, "gamma", gamma)
@@ -259,6 +285,10 @@ def _validate_sarsa_config(config: Step4SARSAConfig) -> None:
     object.__setattr__(config, "meta_step_size", meta_step_size)
     object.__setattr__(config, "bounder_kappa", bounder_kappa)
     object.__setattr__(config, "sparsity", sparsity)
+    object.__setattr__(config, "use_layer_norm", use_layer_norm)
+    object.__setattr__(config, "optimizer", optimizer)
+    object.__setattr__(config, "bounder", bounder)
+    object.__setattr__(config, "trace_mode", trace_mode)
 
 
 def make_step4_optimizer(config: Step4SARSAConfig) -> Any:
@@ -275,8 +305,7 @@ def make_step4_optimizer(config: Step4SARSAConfig) -> Any:
             initial_step_size=config.step_size,
             meta_step_size=config.meta_step_size,
         )
-    msg = f"unknown Step 4 optimizer {config.optimizer!r}"
-    raise ValueError(msg)
+    raise ValueError("unknown Step 4 optimizer")
 
 
 def make_step4_bounder(config: Step4SARSAConfig) -> Bounder | None:
@@ -285,8 +314,7 @@ def make_step4_bounder(config: Step4SARSAConfig) -> Bounder | None:
         return None
     if config.bounder == "obgd":
         return ObGDBounding(kappa=config.bounder_kappa)
-    msg = f"unknown Step 4 bounder {config.bounder!r}"
-    raise ValueError(msg)
+    raise ValueError("unknown Step 4 bounder")
 
 
 def make_step4_sarsa_agent(
@@ -396,12 +424,9 @@ def run_step4_smoke(
     seed: int = 0,
 ) -> Step4SmokeResult:
     """Run a tiny deterministic Step 4 integration probe."""
-    if steps < 1:
-        msg = f"steps must be positive, got {steps}"
-        raise ValueError(msg)
-    if feature_dim < 1:
-        msg = f"feature_dim must be positive, got {feature_dim}"
-        raise ValueError(msg)
+    steps = _require_positive_int("steps", steps)
+    feature_dim = _require_positive_int("feature_dim", feature_dim)
+    seed = require_jax_seed(seed, name="seed")
 
     cfg = config or Step4SARSAConfig()
     agent = make_step4_sarsa_agent(cfg)

@@ -424,6 +424,47 @@ class TestStep1StreamsValidation:
             AlbertaPlanStep1Stream(drift_rate_w=BadRatioFloat(0.5))
         assert BadRatioFloat.calls == 0
 
+    @pytest.mark.parametrize(
+        "field",
+        ["drift_rate_w", "drift_rate_b", "noise_std", "feature_std"],
+    )
+    def test_alberta_plan_step1_float_sinks_do_not_format_rejected_subclasses(
+        self, field: str
+    ) -> None:
+        class HostileFloat(float):
+            repr_calls = 0
+
+            def __repr__(self) -> str:  # pragma: no cover - must not run
+                type(self).repr_calls += 1
+                raise RuntimeError("repr hook must not run")
+
+        with pytest.raises(ValueError, match=field):
+            AlbertaPlanStep1Stream(**{field: HostileFloat(0.5)})
+        assert HostileFloat.repr_calls == 0
+
+    @pytest.mark.parametrize("field", ["feature_dim", "num_relevant"])
+    def test_alberta_plan_step1_int_sinks_do_not_run_subclass_hooks(
+        self, field: str
+    ) -> None:
+        class HostileInt(int):
+            hook_calls = 0
+
+            def __int__(self) -> int:  # pragma: no cover - must not run
+                type(self).hook_calls += 1
+                raise RuntimeError("int hook must not run")
+
+            def __index__(self) -> int:  # pragma: no cover - must not run
+                type(self).hook_calls += 1
+                raise RuntimeError("index hook must not run")
+
+            def __repr__(self) -> str:  # pragma: no cover - must not run
+                type(self).hook_calls += 1
+                raise RuntimeError("repr hook must not run")
+
+        with pytest.raises(ValueError, match=field):
+            AlbertaPlanStep1Stream(**{field: HostileInt(5)})
+        assert HostileInt.hook_calls == 0
+
     def test_xdist_shift_stream_properties_and_boundaries(self) -> None:
         stream = XDistShiftStream(
             feature_dim=10,
@@ -510,3 +551,60 @@ class TestStep1StreamsValidation:
                 num_relevant=3,
                 noise_std=Fraction(-1, 2**200),
             )
+
+    @pytest.mark.parametrize("field", ["noise_std", "scale_min", "scale_max"])
+    def test_xdist_float_sinks_do_not_format_rejected_subclasses(self, field: str) -> None:
+        class HostileFloat(float):
+            repr_calls = 0
+
+            def __repr__(self) -> str:  # pragma: no cover - must not run
+                type(self).repr_calls += 1
+                raise RuntimeError("repr hook must not run")
+
+        kwargs: dict[str, object] = {"feature_dim": 10, "num_relevant": 3}
+        kwargs[field] = HostileFloat(0.5)
+        with pytest.raises(ValueError, match=field):
+            XDistShiftStream(**kwargs)  # type: ignore[arg-type]
+        assert HostileFloat.repr_calls == 0
+
+    @pytest.mark.parametrize(
+        "field", ["feature_dim", "num_relevant", "scale_change_interval"]
+    )
+    def test_xdist_int_sinks_do_not_run_subclass_hooks(self, field: str) -> None:
+        class HostileInt(int):
+            hook_calls = 0
+
+            def __int__(self) -> int:  # pragma: no cover - must not run
+                type(self).hook_calls += 1
+                raise RuntimeError("int hook must not run")
+
+            def __index__(self) -> int:  # pragma: no cover - must not run
+                type(self).hook_calls += 1
+                raise RuntimeError("index hook must not run")
+
+            def __repr__(self) -> str:  # pragma: no cover - must not run
+                type(self).hook_calls += 1
+                raise RuntimeError("repr hook must not run")
+
+        kwargs: dict[str, object] = {"feature_dim": 10, "num_relevant": 3}
+        kwargs[field] = HostileInt(5)
+        with pytest.raises(ValueError, match=field):
+            XDistShiftStream(**kwargs)  # type: ignore[arg-type]
+        assert HostileInt.hook_calls == 0
+
+    def test_xdist_boolean_sink_does_not_format_rejected_value(self) -> None:
+        class HostileBoolLike:
+            repr_calls = 0
+
+            def __repr__(self) -> str:  # pragma: no cover - must not run
+                type(self).repr_calls += 1
+                raise RuntimeError("repr hook must not run")
+
+        value = HostileBoolLike()
+        with pytest.raises(TypeError, match="noise_in_target must be a boolean"):
+            XDistShiftStream(
+                feature_dim=10,
+                num_relevant=3,
+                noise_in_target=value,  # type: ignore[arg-type]
+            )
+        assert HostileBoolLike.repr_calls == 0
