@@ -217,6 +217,31 @@ def test_latent_update_rejects_out_of_range_discounts(discount: float) -> None:
     )
 
 
+def test_latent_update_saturates_step_count_at_int32_max() -> None:
+    config = LatentWorldModelConfig(
+        observation_dim=2,
+        n_actions=2,
+        latent_dim=2,
+        hidden_sizes=(),
+    )
+    model = LatentWorldModel(config)
+    state = model.init(jr.key(0)).replace(
+        step_count=jnp.asarray(2**31 - 1, dtype=jnp.int32)
+    )
+
+    result = model.update(
+        state,
+        jnp.asarray([0.1, -0.2], dtype=jnp.float32),
+        jnp.asarray(1, dtype=jnp.int32),
+        jnp.asarray(0.5, dtype=jnp.float32),
+        jnp.asarray(0.9, dtype=jnp.float32),
+        jnp.asarray([0.2, -0.1], dtype=jnp.float32),
+    )
+
+    assert bool(result.update_applied)
+    assert int(result.state.step_count) == 2**31 - 1
+
+
 def test_latent_world_model_scan_loop_and_config_roundtrip() -> None:
     config = LatentWorldModelConfig(
         observation_dim=2,

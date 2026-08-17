@@ -126,6 +126,11 @@ def _require_bool(name: str, value: object) -> bool:
     return value
 
 
+def _saturating_int32_increment(value: Array) -> Array:
+    maximum = jnp.asarray(_INT32_MAX, dtype=jnp.int32)
+    return jnp.where(value < maximum, value + jnp.asarray(1, dtype=jnp.int32), maximum)
+
+
 @dataclasses.dataclass(frozen=True)
 class LatentWorldModelConfig:
     """Configuration for :class:`LatentWorldModel`.
@@ -928,7 +933,7 @@ class LatentWorldModel:
             surprise_ema=next_surprise_ema,
             prediction_error_ema=next_prediction_error_ema,
             collapse_score_ema=next_collapse_score_ema,
-            step_count=state.step_count + 1,
+            step_count=_saturating_int32_increment(state.step_count),
         )
         diagnostics_finite = (
             floating_tree_is_finite(prediction)
