@@ -3595,11 +3595,18 @@ def _sanitize_package_freeze_line(line: str) -> str:
         url = direct_url.get("url")
         if isinstance(url, str) and url.startswith("file:"):
             direct_url["url"] = "<LOCAL_PATH>"
-    return (
-        prefix
-        + " ; direct_url="
-        + json.dumps(direct_url, sort_keys=True, separators=(",", ":"))
-    )
+    try:
+        encoded = json.dumps(
+            direct_url,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (TypeError, ValueError) as exc:
+        raise OfficialForagaxValidationError(
+            "package freeze direct_url is not finite JSON"
+        ) from exc
+    return prefix + " ; direct_url=" + encoded
 
 
 def _extract_probe_payload(stdout: bytes) -> Mapping[str, Any]:
@@ -3960,7 +3967,7 @@ payload = {{
         "class_source_sha256": class_source["sha256"],
     }},
 }}
-sys.stdout.write({_PROBE_PREFIX!r} + json.dumps(payload, sort_keys=True) + "\\n")
+sys.stdout.write({_PROBE_PREFIX!r} + json.dumps(payload, sort_keys=True, allow_nan=False) + "\\n")
 """
     result = _run_execution_python(
         repository=repository,
@@ -4623,7 +4630,7 @@ payload = {{
     }},
     "immutable_runtime": {immutable_runtime!r},
 }}
-sys.stdout.write({_PROBE_PREFIX!r} + json.dumps(payload, sort_keys=True) + "\\n")
+sys.stdout.write({_PROBE_PREFIX!r} + json.dumps(payload, sort_keys=True, allow_nan=False) + "\\n")
 """
     result = _run_execution_python(
         repository=repository,
@@ -5156,14 +5163,15 @@ for distribution in distributions():
                 json.loads(direct_url),
                 sort_keys=True,
                 separators=(",", ":"),
+                allow_nan=False,
             )
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, TypeError, ValueError):
             direct_url = direct_url.strip()
         line += f" ; direct_url={{direct_url}}"
     packages.append(line)
 sys.stdout.write(
     {_PROBE_PREFIX!r}
-    + json.dumps({{"packages": sorted(set(packages))}}, sort_keys=True)
+    + json.dumps({{"packages": sorted(set(packages))}}, sort_keys=True, allow_nan=False)
     + "\\n"
 )
 """
