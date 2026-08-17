@@ -226,6 +226,20 @@ def test_config_is_strict_versioned_mechanism_only_and_round_trips() -> None:
     class ListSubclass(list[int]):
         pass
 
+    class DictSubclass(dict[str, object]):
+        calls = 0
+
+        def __iter__(self):  # type: ignore[override]
+            type(self).calls += 1
+            raise AssertionError("mapping hook must not run")
+
+    class HostileString(str):
+        calls = 0
+
+        def __eq__(self, other: object) -> bool:
+            type(self).calls += 1
+            raise AssertionError("equality hook must not run")
+
     config = _config()
     lifecycle = PrototypeFeatureLifecycle(config)
     assert PrototypeFeatureLifecycleConfig.from_config(config.to_config()) == config
@@ -236,12 +250,20 @@ def test_config_is_strict_versioned_mechanism_only_and_round_trips() -> None:
     assert config.to_config()["scientific_promotion_allowed"] is False
     assert PROTOTYPE_FEATURE_LIFECYCLE_SCIENTIFIC_PROMOTION_ALLOWED is False
 
-    config_subclass = ConfigSubclass(**dataclasses.asdict(config))
-    with pytest.raises(TypeError, match="PrototypeFeatureLifecycleConfig"):
-        PrototypeFeatureLifecycle(config_subclass)
-    assert type(config_subclass.from_config(config.to_config())) is (
-        PrototypeFeatureLifecycleConfig
-    )
+    with pytest.raises(TypeError, match="exact PrototypeFeatureLifecycleConfig"):
+        ConfigSubclass(**dataclasses.asdict(config))
+    with pytest.raises(TypeError, match="config class"):
+        ConfigSubclass.from_config(config.to_config())
+    DictSubclass.calls = 0
+    with pytest.raises(ValueError, match="exact dictionary"):
+        PrototypeFeatureLifecycleConfig.from_config(DictSubclass(config.to_config()))
+    assert DictSubclass.calls == 0
+    hostile_metadata = config.to_config()
+    hostile_metadata["schema"] = HostileString(str(hostile_metadata["schema"]))
+    HostileString.calls = 0
+    with pytest.raises(ValueError, match="schema must be a JSON string"):
+        PrototypeFeatureLifecycleConfig.from_config(hostile_metadata)
+    assert HostileString.calls == 0
     oak_subclass = OaKConfigSubclass(stomp=_oak_agent(config).config.stomp)
     with pytest.raises(TypeError, match="OaKConfig"):
         lifecycle.require_compatible_oak_config(oak_subclass)
