@@ -724,6 +724,36 @@ def test_associative_memory_config_rejects_invalid_inputs(kwargs: dict[str, obje
         AssociativeMemoryConfig(**kwargs)  # type: ignore[arg-type]
 
 
+@pytest.mark.parametrize("kwargs", _INVALID_ASSOCIATIVE_CONFIGS)
+def test_step2_associative_config_rejects_invalid_inputs(kwargs: dict[str, object]) -> None:
+    with pytest.raises(ValueError):
+        Step2AssociativeConfig(**kwargs)  # type: ignore[arg-type]
+
+
+def test_step2_associative_config_rejects_non_bool_adaptive_flags() -> None:
+    with pytest.raises(ValueError, match="adaptive_budget must be a boolean"):
+        Step2AssociativeConfig(adaptive_budget=0)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="adaptive_window must be a boolean"):
+        Step2AssociativeConfig(adaptive_window=1)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="adaptive_feature_family must be a boolean"):
+        Step2AssociativeConfig(adaptive_feature_family="")  # type: ignore[arg-type]
+
+
+def test_step2_associative_from_dict_rejects_unknown_and_partial_keys() -> None:
+    payload = Step2AssociativeConfig().to_dict()
+    extra = dict(payload)
+    extra["extra"] = True
+    with pytest.raises(ValueError, match="payload keys must be exactly"):
+        Step2AssociativeConfig.from_dict(extra)
+    partial = {"vocab_size": 8, "block_size": 5}
+    with pytest.raises(ValueError, match="payload keys must be exactly"):
+        Step2AssociativeConfig.from_dict(partial)
+    illegal = dict(payload)
+    illegal["write_lr"] = float("nan")
+    with pytest.raises(ValueError):
+        Step2AssociativeConfig.from_dict(illegal)
+
+
 @pytest.mark.parametrize(
     "ratio",
     [
