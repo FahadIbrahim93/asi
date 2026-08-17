@@ -16,34 +16,67 @@ References:
 """
 
 import math
+import operator
 from dataclasses import dataclass
-from numbers import Real
-from typing import cast
+from fractions import Fraction
+from typing import SupportsIndex, cast
 
 import numpy as np
 from numpy.typing import NDArray
 
+_INT32_MAX: int = 2**31 - 1
+
+_ACTUAL_INT_TYPES = frozenset(
+    {
+        int,
+        np.int8,
+        np.int16,
+        np.int32,
+        np.int64,
+        np.uint8,
+        np.uint16,
+        np.uint32,
+        np.uint64,
+        np.longlong,
+        np.ulonglong,
+    }
+)
+_ACTUAL_FLOAT_TYPES = frozenset(
+    {float, Fraction, *(np.dtype(code).type for code in ("e", "f", "d", "g"))}
+)
+_ALLOWED_REAL_TYPES = _ACTUAL_INT_TYPES | _ACTUAL_FLOAT_TYPES
+
 
 def _is_bool(value: object) -> bool:
-    return type(value) is bool or type(value) is np.bool_
+    return isinstance(value, bool) or isinstance(value, np.bool_)
 
 
 def _is_index_int(value: object) -> bool:
     return (type(value) is int or isinstance(value, np.integer)) and not _is_bool(value)
 
 
-def _require_positive_builtin_int(name: str, value: object) -> int:
-    if type(value) is not int or value < 1:
-        raise ValueError(f"{name} must be a positive built-in integer")
+def _require_exact_str(name: str, value: object) -> str:
+    if type(value) is not str:
+        raise ValueError(f"{name} must be an exact string")
     return value
 
 
+def _require_positive_builtin_int(name: str, value: object) -> int:
+    if type(value) is not int:
+        raise ValueError(f"{name} must be a positive built-in integer")
+    number = operator.index(cast(SupportsIndex, value))
+    if number < 1:
+        raise ValueError(f"{name} must be a positive built-in integer")
+    return number
+
+
 def _require_finite_real(name: str, value: object) -> float:
-    actual_type = type(value)
-    if issubclass(actual_type, bool) or not issubclass(actual_type, Real):
+    if _is_bool(value):
+        raise ValueError(f"{name} must be a finite real number")
+    if type(value) not in _ALLOWED_REAL_TYPES:
         raise ValueError(f"{name} must be a finite real number")
     try:
-        number = float(cast(Real, value))
+        number = float(cast(float, value))
     except (OverflowError, TypeError, ValueError) as exc:
         raise ValueError(f"{name} must be a finite real number") from exc
     if not math.isfinite(number):
@@ -447,6 +480,7 @@ def compute_cumulative_error(
     Returns:
         Array of cumulative errors at each time step
     """
+    _require_exact_str("error_key", error_key)
     errors = np.array([m[error_key] for m in metrics_history])
     return np.cumsum(errors)
 
@@ -475,10 +509,7 @@ def compute_running_mean(
         Array of running mean values (same length as input), with ``NaN``
         wherever a complete trailing window is not yet available.
     """
-    if type(window_size) is not int:
-        raise ValueError("window_size must be a built-in int")
-    if window_size < 1:
-        raise ValueError("window_size must be positive")
+    window_size = _require_positive_builtin_int("window_size", window_size)
 
     values_arr = np.asarray(values, dtype=np.float64)
     if len(values_arr) < window_size:
@@ -514,6 +545,7 @@ def compute_tracking_error(
     Returns:
         Array of tracking errors at each time step
     """
+    window_size = _require_positive_builtin_int("window_size", window_size)
     errors = np.array([m["squared_error"] for m in metrics_history])
     return compute_running_mean(errors, window_size)
 
@@ -531,6 +563,7 @@ def extract_metric(
     Returns:
         Array of values for that metric
     """
+    _require_exact_str("key", key)
     return np.array([m[key] for m in metrics_history])
 
 
@@ -552,8 +585,10 @@ def compare_learners(
     Returns:
         Dictionary with summary statistics for each learner
     """
+    _require_exact_str("metric", metric)
     summary = {}
     for name, metrics_history in results.items():
+        _require_exact_str("learner name", name)
         values = extract_metric(metrics_history, metric)
         summary[name] = {
             "mean": float(np.mean(values)),
