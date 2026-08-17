@@ -215,9 +215,7 @@ def _validate_world_model_config(config: Step8WorldModelConfig) -> None:
     )
     action_dim = _require_int("action_dim", config.action_dim, minimum=1, maximum=_INT32_MAX)
     if type(config.hidden_sizes) is not tuple:
-        raise ValueError(
-            f"hidden_sizes must be an actual tuple, got {type(config.hidden_sizes).__name__}"
-        )
+        raise ValueError("hidden_sizes must be an actual tuple")
     hidden_sizes = tuple(
         _require_int("hidden_sizes", size, minimum=1, maximum=_INT32_MAX)
         for size in config.hidden_sizes

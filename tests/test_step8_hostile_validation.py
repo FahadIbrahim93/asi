@@ -49,6 +49,20 @@ class _HostileFloat(float):
         raise AssertionError("HostileFloat.__repr__ must not be called")
 
 
+class _HostileTypeName(type):
+    calls = 0
+
+    def __getattribute__(cls, name: str) -> Any:
+        if name == "__name__":
+            _HostileTypeName.calls += 1
+            raise AssertionError("metaclass __name__ hook must not be called")
+        return super().__getattribute__(name)
+
+
+class _HostileHiddenSizes(metaclass=_HostileTypeName):
+    pass
+
+
 def test_rejects_string_subclass_for_observation_dim() -> None:
     with pytest.raises(ValueError, match="must be an integer"):
         Step8WorldModelConfig(observation_dim=_StringSubclass("4"))  # type: ignore[arg-type]
@@ -114,6 +128,13 @@ def test_rejects_use_layer_norm_non_bool_without_repr() -> None:
     assert "!r" not in str(exc.value)
     with pytest.raises(ValueError, match="must be a built-in bool"):
         Step8WorldModelConfig(use_layer_norm="true")  # type: ignore[arg-type]
+
+
+def test_rejects_hidden_sizes_without_type_name_hook() -> None:
+    _HostileTypeName.calls = 0
+    with pytest.raises(ValueError, match="hidden_sizes must be an actual tuple"):
+        Step8WorldModelConfig(hidden_sizes=_HostileHiddenSizes())  # type: ignore[arg-type]
+    assert _HostileTypeName.calls == 0
 
 
 def test_valid_configs_still_pass() -> None:
