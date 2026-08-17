@@ -705,3 +705,52 @@ def test_nonlinear_shared_gtd_horde_outer_counter_saturates() -> None:
     )
     assert bool(result.update_applied)
     assert int(result.state.step_count) == 2**31 - 1
+
+
+def test_nonlinear_shared_gtd_horde_runtime_metadata_is_hostile_safe() -> None:
+    calls = 0
+
+    class HostileLeaf:
+        @property
+        def shape(self):  # type: ignore[no-untyped-def]
+            nonlocal calls
+            calls += 1
+            raise AssertionError("shape hook ran")
+
+    learner = NonlinearSharedGTDHordeLearner(_spec(), hidden_size=2)
+    malformed = learner.init(2, jax.random.key(0)).replace(trunk_w=HostileLeaf())
+    with pytest.raises(TypeError, match="state.trunk_w"):
+        learner.predict(malformed, jnp.ones(2, dtype=jnp.float32))
+    assert calls == 0
+
+    state = learner.init(2, jax.random.key(0))
+    with pytest.raises(TypeError, match="observation"):
+        learner.predict(state, jnp.ones(2, dtype=jnp.float16))
+    with pytest.raises(ValueError, match="shape"):
+        learner.predict(state, jnp.ones(3, dtype=jnp.float32))
+
+
+def test_nonlinear_shared_gtd_horde_terminal_next_and_ratio_domains() -> None:
+    learner = NonlinearSharedGTDHordeLearner(_spec(gammas=(0.0,)), hidden_size=2)
+    state = learner.init(2, jax.random.key(0))
+    terminal = learner.update_with_ratios_and_discounts(
+        state,
+        jnp.ones(2, dtype=jnp.float32),
+        jnp.ones(1, dtype=jnp.float32),
+        jnp.full(2, jnp.inf, dtype=jnp.float32),
+        jnp.ones(1, dtype=jnp.float32),
+        jnp.zeros(1, dtype=jnp.float32),
+    )
+    assert bool(terminal.update_applied)
+    chex.assert_trees_all_equal(terminal.next_predictions, jnp.zeros(1, dtype=jnp.float32))
+
+    rejected = learner.update_with_ratios_and_discounts(
+        state,
+        jnp.ones(2, dtype=jnp.float32),
+        jnp.ones(1, dtype=jnp.float32),
+        jnp.ones(2, dtype=jnp.float32),
+        -jnp.ones(1, dtype=jnp.float32),
+        jnp.zeros(1, dtype=jnp.float32),
+    )
+    assert not bool(rejected.update_applied)
+    chex.assert_trees_all_equal(rejected.state, state)

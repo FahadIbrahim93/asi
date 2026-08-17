@@ -21,7 +21,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jax import Array
-from jaxtyping import Bool, Float
+from jaxtyping import Bool, Float, Int
 
 from alberta_framework.core._float32_scalars import validated_float32_scalar
 from alberta_framework.core.learners import _update_from_gradient_with_diagnostics
@@ -196,9 +196,9 @@ class NonlinearSharedGTDHordeState:
     secondary_trunk_b: Float[Array, "n_demons hidden_dim"]
     secondary_head_w: Float[Array, "n_demons hidden_dim"]
     secondary_head_b: Float[Array, " n_demons"]
-    step_count: Float[Array, ""]
-    birth_timestamp: float = 0.0
-    uptime_s: float = 0.0
+    step_count: Int[Array, ""]
+    birth_timestamp: Float[Array, ""]
+    uptime_s: Float[Array, ""]
 
 
 @chex.dataclass(frozen=True)
@@ -950,6 +950,24 @@ class NonlinearSharedGTDHordeLearner:
             raise ValueError("horde_spec must be an exact HordeSpec")
         if not horde_spec.demons:
             raise ValueError("horde_spec must contain at least one demon")
+        if type(horde_spec.demons) is not tuple:
+            raise ValueError("horde_spec.demons must be an exact tuple")
+        n_demons = len(horde_spec.demons)
+        for name, value in (
+            ("horde_spec.gammas", horde_spec.gammas),
+            ("horde_spec.lamdas", horde_spec.lamdas),
+        ):
+            if not isinstance(value, jax.Array):
+                raise TypeError(f"{name} must be a JAX array")
+            if tuple(value.shape) != (n_demons,):
+                raise ValueError(f"{name} must have shape ({n_demons},)")
+            if jnp.dtype(value.dtype) != jnp.dtype(jnp.float32):
+                raise TypeError(f"{name} must have dtype float32")
+            host = np.asarray(value)
+            if not bool(np.all(np.isfinite(host))) or not bool(
+                np.all((host >= 0.0) & (host <= 1.0))
+            ):
+                raise ValueError(f"{name} must contain values in [0, 1]")
         hidden_size = _require_int32("hidden_size", hidden_size, minimum=1)
         self._horde_spec = horde_spec
         self._hidden_size = hidden_size
@@ -1089,13 +1107,63 @@ class NonlinearSharedGTDHordeLearner:
             ),
             secondary_head_b=jnp.zeros(self.n_demons, dtype=jnp.float32),
             step_count=jnp.array(0, dtype=jnp.int32),
-            birth_timestamp=time.time(),
-            uptime_s=0.0,
+            birth_timestamp=jnp.asarray(time.time(), dtype=jnp.float32),
+            uptime_s=jnp.asarray(0.0, dtype=jnp.float32),
         )
+
+    def _validate_state_static_contract(self, state: NonlinearSharedGTDHordeState) -> int:
+        """Return feature_dim after rejecting malformed adopted state metadata."""
+        if type(state) is not NonlinearSharedGTDHordeState:
+            raise TypeError("state must be a NonlinearSharedGTDHordeState")
+        if not isinstance(state.trunk_w, jax.Array):
+            raise TypeError("state.trunk_w must be a JAX array")
+        shape = tuple(state.trunk_w.shape)
+        if len(shape) != 2 or shape[0] != self._hidden_size or shape[1] < 1:
+            raise ValueError("state.trunk_w has an invalid shape")
+        feature_dim = int(shape[1])
+        d = self.n_demons
+        h = self._hidden_size
+        expected = (
+            ("state.trunk_w", state.trunk_w, (h, feature_dim), jnp.float32),
+            ("state.trunk_b", state.trunk_b, (h,), jnp.float32),
+            ("state.head_w", state.head_w, (d, h), jnp.float32),
+            ("state.head_b", state.head_b, (d,), jnp.float32),
+            (
+                "state.secondary_trunk_w",
+                state.secondary_trunk_w,
+                (d, h, feature_dim),
+                jnp.float32,
+            ),
+            ("state.secondary_trunk_b", state.secondary_trunk_b, (d, h), jnp.float32),
+            ("state.secondary_head_w", state.secondary_head_w, (d, h), jnp.float32),
+            ("state.secondary_head_b", state.secondary_head_b, (d,), jnp.float32),
+            ("state.step_count", state.step_count, (), jnp.int32),
+            ("state.birth_timestamp", state.birth_timestamp, (), jnp.float32),
+            ("state.uptime_s", state.uptime_s, (), jnp.float32),
+        )
+        for name, value, expected_shape, dtype in expected:
+            if not isinstance(value, jax.Array):
+                raise TypeError(f"{name} must be a JAX array")
+            if tuple(value.shape) != expected_shape:
+                raise ValueError(f"{name} has an invalid shape")
+            if jnp.dtype(value.dtype) != jnp.dtype(dtype):
+                raise TypeError(f"{name} has an invalid dtype")
+        return feature_dim
+
+    @staticmethod
+    def _state_is_valid(state: NonlinearSharedGTDHordeState) -> Bool[Array, ""]:
+        return _floating_tree_is_finite(state) & (state.step_count >= 0)
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def predict(self, state: NonlinearSharedGTDHordeState, observation: Array) -> Array:
         """Predict all demon values for one observation."""
+        feature_dim = self._validate_state_static_contract(state)
+        if not isinstance(observation, jax.Array):
+            raise TypeError("observation must be a JAX array")
+        if tuple(observation.shape) != (feature_dim,):
+            raise ValueError(f"observation must have shape ({feature_dim},)")
+        if jnp.dtype(observation.dtype) != jnp.dtype(jnp.float32):
+            raise TypeError("observation must have dtype float32")
         hidden = jnp.tanh(state.trunk_w @ observation + state.trunk_b)
         return state.head_w @ hidden + state.head_b
 
@@ -1110,8 +1178,28 @@ class NonlinearSharedGTDHordeLearner:
         discounts: Array,
     ) -> NonlinearSharedGTDHordeUpdateResult:
         """Update with explicit per-demon ratios and discounts."""
+        feature_dim = self._validate_state_static_contract(state)
+        for name, value, shape in (
+            ("observation", observation, (feature_dim,)),
+            ("cumulants", cumulants, (self.n_demons,)),
+            ("next_observation", next_observation, (feature_dim,)),
+            ("rhos", rhos, (self.n_demons,)),
+            ("discounts", discounts, (self.n_demons,)),
+        ):
+            if not isinstance(value, jax.Array):
+                raise TypeError(f"{name} must be a JAX array")
+            if tuple(value.shape) != shape:
+                raise ValueError(f"{name} must have shape {shape}")
+            if jnp.dtype(value.dtype) != jnp.dtype(jnp.float32):
+                raise TypeError(f"{name} must have dtype float32")
         hidden = jnp.tanh(state.trunk_w @ observation + state.trunk_b)
-        next_hidden = jnp.tanh(state.trunk_w @ next_observation + state.trunk_b)
+        next_observation_valid = jnp.all(jnp.isfinite(next_observation))
+        safe_next_observation = jnp.where(
+            next_observation_valid,
+            next_observation,
+            jnp.zeros_like(next_observation),
+        )
+        next_hidden = jnp.tanh(state.trunk_w @ safe_next_observation + state.trunk_b)
         predictions = state.head_w @ hidden + state.head_b
         next_predictions = state.head_w @ next_hidden + state.head_b
         zero_discount_mask = discounts == 0.0
@@ -1127,11 +1215,15 @@ class NonlinearSharedGTDHordeLearner:
             requested
             & jnp.isfinite(cumulants)
             & jnp.isfinite(rhos)
+            & (rhos >= 0.0)
             & jnp.isfinite(discounts)
+            & (discounts >= 0.0)
+            & (discounts <= 1.0)
+            & ((discounts == 0.0) | next_observation_valid)
             & jnp.isfinite(td_targets)
         )
-        inputs_valid = jnp.all(jnp.isfinite(observation)) & jnp.all(jnp.isfinite(next_observation))
-        source_state_finite = _floating_tree_is_finite(state)
+        inputs_valid = jnp.all(jnp.isfinite(observation))
+        source_state_finite = self._state_is_valid(state)
         effective_mask = active_mask & inputs_valid & source_state_finite
         safe_td_errors = jnp.where(active_mask, td_errors, 0.0)
         clipped_rhos = jnp.minimum(
@@ -1164,7 +1256,7 @@ class NonlinearSharedGTDHordeLearner:
             next_grad_head_w = next_hidden
             next_grad_head_b = jnp.array(1.0, dtype=jnp.float32)
             next_grad_hidden = state.head_w[i] * next_one_minus_hidden_sq
-            next_grad_trunk_w = next_grad_hidden[:, None] * next_observation[None, :]
+            next_grad_trunk_w = next_grad_hidden[:, None] * safe_next_observation[None, :]
             next_grad_trunk_b = next_grad_hidden
 
             secondary_dot = (
