@@ -696,8 +696,10 @@ def bayes_predict(component_means: Array, dim_sigma: Array, x: Array) -> Array:
     ``(n, C, K, dim)`` difference tensor.
     """
     c, k, d = component_means.shape
-    whitened_x = x / dim_sigma[None, :]
     whitened_means = (component_means / dim_sigma[None, None, :]).reshape(c * k, d)
+    origin = whitened_means[0]
+    whitened_x = x / dim_sigma[None, :] - origin
+    whitened_means = whitened_means - origin
     cross = whitened_x @ whitened_means.T
     x_norms = jnp.sum(whitened_x * whitened_x, axis=1)
     mean_norms = jnp.sum(whitened_means * whitened_means, axis=1)
