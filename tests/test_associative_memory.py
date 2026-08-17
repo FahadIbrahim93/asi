@@ -2,6 +2,7 @@
 """Tests for the Step 2 fixed-budget associative memory."""
 
 import math
+from fractions import Fraction
 
 import chex
 import jax.numpy as jnp
@@ -788,18 +789,14 @@ def test_step2_associative_from_dict_rejects_unknown_and_partial_keys() -> None:
         pytest.param((2**200 + 1, 2**200), id="above-one-rounds-to-one"),
     ],
 )
-def test_associative_memory_rejects_adversarial_ratio_floats(
-    ratio: tuple[int, int]
+def test_associative_memory_rejects_exact_fraction_boundaries(
+    ratio: tuple[int, int],
 ) -> None:
-    class HiddenBoundaryFloat(float):
-        def as_integer_ratio(self) -> tuple[int, int]:
-            return ratio
-
     with pytest.raises(ValueError, match=r"retention must be in \[0, 1\]"):
         AssociativeMemoryConfig(
             vocab_size=4,
             block_size=8,
-            retention=HiddenBoundaryFloat(0.5),
+            retention=Fraction(*ratio),
         )
 
 

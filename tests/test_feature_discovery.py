@@ -1,5 +1,6 @@
 """Tests for Step 2 fixed-budget feature discovery."""
 
+from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
@@ -3142,25 +3143,28 @@ class TestFeatureDiscoveryStreamsValidation:
         with pytest.raises(ValueError, match=match):
             NonlinearFeatureDiscoveryStream(**base)
 
-    def test_nonlinear_rejects_adversarial_ratio(self) -> None:
-        class HiddenBoundaryFloat(float):
-            def as_integer_ratio(self) -> tuple[int, int]:
-                return (-1, 2**200)
-
+    def test_nonlinear_rejects_exact_negative_fraction(self) -> None:
         with pytest.raises(ValueError, match="linear_scale must be non-negative"):
-            NonlinearFeatureDiscoveryStream(feature_dim=8, linear_scale=HiddenBoundaryFloat(0.5))
+            NonlinearFeatureDiscoveryStream(
+                feature_dim=8,
+                linear_scale=Fraction(-1, 2**200),
+            )
 
     def test_nonlinear_rejects_spoofed_int_class(self) -> None:
         class SpoofedIntFloat(float):
+            calls = 0
+
             @property
             def __class__(self) -> type[int]:
+                type(self).calls += 1
                 return int
 
             def as_integer_ratio(self) -> tuple[int, int]:
                 return (-1, 2**200)
 
-        with pytest.raises(ValueError, match="noise_std must be non-negative"):
+        with pytest.raises(ValueError, match="noise_std must narrow to a finite float32"):
             NonlinearFeatureDiscoveryStream(feature_dim=8, noise_std=SpoofedIntFloat(0.5))
+        assert SpoofedIntFloat.calls == 0
 
     def test_nonlinear_rejects_spoofed_ratio_components(self) -> None:
         class SpoofedComponent:
@@ -3250,13 +3254,12 @@ class TestFeatureDiscoveryStreamsValidation:
         )
         assert stream.include_squares is True
 
-    def test_interaction_rejects_adversarial_ratio(self) -> None:
-        class HiddenBoundaryFloat(float):
-            def as_integer_ratio(self) -> tuple[int, int]:
-                return (-1, 2**200)
-
+    def test_interaction_rejects_exact_negative_fraction(self) -> None:
         with pytest.raises(ValueError, match="linear_scale must be non-negative"):
-            InteractionFeatureDiscoveryStream(feature_dim=6, linear_scale=HiddenBoundaryFloat(0.5))
+            InteractionFeatureDiscoveryStream(
+                feature_dim=6,
+                linear_scale=Fraction(-1, 2**200),
+            )
 
     def test_collect_feature_discovery_stream_validation(self) -> None:
         stream = NonlinearFeatureDiscoveryStream(feature_dim=4)
