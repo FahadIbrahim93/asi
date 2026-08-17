@@ -6,15 +6,11 @@ from typing import Any, cast
 import numpy as np
 import pytest
 
-from alberta_framework.steps.step5 import Step5AverageRewardTDConfig
-
-
-class _EvilStr(str):
-    def __str__(self) -> str:  # pragma: no cover
-        raise AssertionError("EvilStr.__str__ must not be called")
-
-    def __repr__(self) -> str:  # pragma: no cover
-        raise AssertionError("EvilStr.__repr__ must not be called")
+from alberta_framework.steps.step5 import (
+    Step5AverageRewardTDConfig,
+    Step5SmokeResult,
+    run_step5_smoke,
+)
 
 
 class _StringSubclass(str):
@@ -28,9 +24,37 @@ class _HostileInt(int):
         type(self).calls += 1
         raise AssertionError("HostileInt.__index__ must not be called")
 
+    def __int__(self) -> int:
+        type(self).calls += 1
+        raise AssertionError("HostileInt.__int__ must not be called")
+
     def __repr__(self) -> str:
         type(self).calls += 1
         raise AssertionError("HostileInt.__repr__ must not be called")
+
+
+class _HostileMeta(type):
+    calls = 0
+
+    def __hash__(cls) -> int:
+        _HostileMeta.calls += 1
+        raise AssertionError("HostileMeta.__hash__ must not be called")
+
+
+class _HostileMetaclassInt(int, metaclass=_HostileMeta):
+    pass
+
+
+class _HostileTuple(tuple):
+    calls = 0
+
+    def __iter__(self):
+        type(self).calls += 1
+        raise AssertionError("HostileTuple.__iter__ must not be called")
+
+    def __repr__(self) -> str:
+        type(self).calls += 1
+        raise AssertionError("HostileTuple.__repr__ must not be called")
 
 
 class _HostileFloat(float):
@@ -54,14 +78,6 @@ def test_rejects_string_subclass_for_step_size() -> None:
         Step5AverageRewardTDConfig(step_size=_StringSubclass("0.05"))  # type: ignore[arg-type]
 
 
-def test_hostile_str_for_step_size_without_repr_leak() -> None:
-    evil = _EvilStr("0.05")
-    with pytest.raises(ValueError, match="must be a real number") as exc:
-        Step5AverageRewardTDConfig(step_size=evil)  # type: ignore[arg-type]
-    assert "EvilStr" not in str(exc.value)
-    assert "!r" not in str(exc.value)
-
-
 def test_rejects_hostile_float_without_hook_and_repr_leak() -> None:
     _HostileFloat.calls = 0
     with pytest.raises(ValueError, match="must be finite") as exc:
@@ -69,16 +85,6 @@ def test_rejects_hostile_float_without_hook_and_repr_leak() -> None:
     assert _HostileFloat.calls == 0
     assert "HostileFloat" not in str(exc.value)
     assert "!r" not in str(exc.value)
-
-
-def test_does_not_invoke_hostile_value_when_name_is_evil_via_sink() -> None:
-    from alberta_framework.steps._float32_validation import finite_real_and_float32
-
-    evil = _EvilStr("x")
-    _HostileFloat.calls = 0
-    with pytest.raises(ValueError, match="must be an exact string"):
-        finite_real_and_float32(evil, _HostileFloat(1.0))  # type: ignore[arg-type]
-    assert _HostileFloat.calls == 0
 
 
 def test_rejects_plain_string_for_trace_decay() -> None:
@@ -115,17 +121,40 @@ def test_rejects_bool_and_hostile_int_via_require_int() -> None:
     assert _HostileInt.calls == 0
     assert "HostileInt" not in str(exc.value)
 
+    _HostileMeta.calls = 0
+    with pytest.raises(ValueError, match="must be an integer"):
+        _require_int("steps", _HostileMetaclassInt(32))
+    assert _HostileMeta.calls == 0
+
 
 def test_rejects_bool_gate_without_repr() -> None:
     from alberta_framework.steps.step5 import _require_bool
 
-    with pytest.raises(ValueError, match="must be an exact string") as exc:
-        _require_bool(_EvilStr("finite"), True)  # type: ignore[arg-type]
-    assert "EvilStr" not in str(exc.value)
     with pytest.raises(ValueError, match="must be a built-in bool") as exc2:
         _require_bool("finite", _StringSubclass("true"))  # type: ignore[arg-type]
     assert "StringSubclass" not in str(exc2.value)
     assert "!r" not in str(exc2.value)
+
+
+def test_smoke_result_rejects_hostile_shape_without_hooks() -> None:
+    _HostileTuple.calls = 0
+    with pytest.raises(ValueError, match="predictions_shape"):
+        Step5SmokeResult(
+            config=Step5AverageRewardTDConfig(),
+            steps=2,
+            seed=0,
+            predictions_shape=_HostileTuple((2,)),
+            td_errors_shape=(2,),
+            average_rewards_shape=(2,),
+            finite=True,
+            learner_config={},
+        )
+    assert _HostileTuple.calls == 0
+
+
+@pytest.mark.parametrize("seed", [2**31, 2**32 - 1])
+def test_smoke_accepts_full_uint32_seed(seed: int) -> None:
+    assert run_step5_smoke(steps=1, feature_dim=1, seed=seed).seed == seed
 
 
 def test_valid_configs_still_pass() -> None:

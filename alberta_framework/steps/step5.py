@@ -49,65 +49,54 @@ _STEP5_CONFIG_KEYS_ERROR = (
     "['average_reward_step_size', 'step_size', 'trace_decay']"
 )
 _INT32_MAX = 2**31 - 1
-_ACTUAL_INT_TYPES = frozenset(
-    {
-        int,
-        np.int8,
-        np.int16,
-        np.int32,
-        np.int64,
-        np.uint8,
-        np.uint16,
-        np.uint32,
-        np.uint64,
-        np.longlong,
-        np.ulonglong,
-    }
+_ACTUAL_INT_TYPES = (
+    int,
+    np.int8,
+    np.int16,
+    np.int32,
+    np.int64,
+    np.uint8,
+    np.uint16,
+    np.uint32,
+    np.uint64,
+    np.longlong,
+    np.ulonglong,
 )
 _NUMPY_INTEGER_TYPES = _ACTUAL_INT_TYPES
 
 
-def _require_exact_str(name: str, value: object) -> str:
-    if type(value) is not str:
-        raise ValueError(f"{name} must be an exact string")
-    return value
-
-
 def _require_int(
-    name: object,
+    name: str,
     value: object,
     *,
     minimum: int | None = None,
     maximum: int | None = None,
 ) -> int:
     """Reject non-integers (including bool and class-spoofed actual types)."""
-    host_name = _require_exact_str("name", name)
     actual_type = type(value)
-    if actual_type not in _ACTUAL_INT_TYPES:
-        raise ValueError(f"{host_name} must be an integer")
+    if not any(actual_type is candidate for candidate in _ACTUAL_INT_TYPES):
+        raise ValueError(f"{name} must be an integer")
     number = int(cast(Integral, value))
     if minimum is not None and number < minimum:
         if minimum == 1:
-            raise ValueError(f"{host_name} must be positive")
+            raise ValueError(f"{name} must be positive")
         if minimum == 0:
-            raise ValueError(f"{host_name} must be non-negative")
-        raise ValueError(f"{host_name} must be >= {minimum}")
+            raise ValueError(f"{name} must be non-negative")
+        raise ValueError(f"{name} must be >= {minimum}")
     if maximum is not None and number > maximum:
-        raise ValueError(f"{host_name} must be <= {maximum}")
+        raise ValueError(f"{name} must be <= {maximum}")
     return number
 
 
-def _require_bool(name: object, value: object) -> bool:
-    host_name = _require_exact_str("name", name)
+def _require_bool(name: str, value: object) -> bool:
     if type(value) is not bool:
-        raise ValueError(f"{host_name} must be a built-in bool")
+        raise ValueError(f"{name} must be a built-in bool")
     return value
 
 
-def _finite_float32_scalar(name: object, value: object) -> tuple[int, int, float]:
+def _finite_float32_scalar(name: str, value: object) -> tuple[int, int, float]:
     """Validate a real scalar and retain the exact ratio used for rounding."""
-    host_name = _require_exact_str("name", name)
-    _, numerator, denominator, narrowed = finite_real_and_float32(host_name, value)
+    _, numerator, denominator, narrowed = finite_real_and_float32(name, value)
     return numerator, denominator, narrowed
 
 
@@ -272,7 +261,7 @@ def run_step5_smoke(
     """Run a tiny deterministic Step 5 integration probe."""
     steps = _require_int("steps", steps, minimum=1, maximum=_INT32_MAX)
     feature_dim = _require_int("feature_dim", feature_dim, minimum=1, maximum=_INT32_MAX)
-    seed = _require_int("seed", seed, minimum=0, maximum=_INT32_MAX)
+    seed = require_jax_seed(seed, name="seed")
 
     cfg = config or Step5AverageRewardTDConfig()
     learner = make_step5_td_learner(cfg)
