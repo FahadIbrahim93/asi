@@ -27,6 +27,8 @@ if TYPE_CHECKING:
 
 def _exported_number(value: SupportsFloat) -> str:
     """Return the shortest text that round-trips one finite binary64 value."""
+    if type(value) is bool or type(value) is np.bool_:
+        raise ValueError(f"refusing to export a boolean as a measurement: {value!r}")
     number = float(value)
     if not math.isfinite(number):
         raise ValueError(f"refusing to export non-finite measurement: {number!r}")
@@ -242,10 +244,10 @@ def export_to_json(
         summary_data: dict[str, dict[str, Any]] = {}
         for metric_name, summary in agg.summary.items():
             summary_data[metric_name] = {
-                "mean": summary.mean,
-                "std": summary.std,
-                "min": summary.min,
-                "max": summary.max,
+                "mean": float(_exported_number(summary.mean)),
+                "std": float(_exported_number(summary.std)),
+                "min": float(_exported_number(summary.min)),
+                "max": float(_exported_number(summary.max)),
                 "n_seeds": summary.n_seeds,
                 "values": summary.values.tolist(),
             }

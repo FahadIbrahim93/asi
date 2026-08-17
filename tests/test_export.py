@@ -481,6 +481,49 @@ def test_atomic_publish_failure_preserves_destination_and_removes_temporary_file
 
 
 @pytest.mark.parametrize("field", ["mean", "std"])
+@pytest.mark.parametrize("value", [True, False, np.bool_(True), np.bool_(False)])
+def test_display_tables_reject_boolean_summaries(field: str, value: object) -> None:
+    result = _constant_result("invalid")
+    summary = result.summary[_METRIC]._replace(**{field: value})
+    results = {"invalid": result._replace(summary={_METRIC: summary})}
+
+    for render in (generate_latex_table, generate_markdown_table):
+        with pytest.raises(ValueError, match="boolean"):
+            render(results)
+
+
+@pytest.mark.parametrize("format_name", ["csv", "json"])
+@pytest.mark.parametrize("field", ["mean", "std", "min", "max"])
+def test_boolean_export_rejects_before_any_destination_mutation(
+    format_name: str,
+    field: str,
+    tmp_path: Path,
+) -> None:
+    result = _constant_result("invalid")
+    summary = result.summary[_METRIC]._replace(**{field: True})
+    results = {"invalid": result._replace(summary={_METRIC: summary})}
+
+    def export(path: Path) -> None:
+        if format_name == "csv":
+            export_to_csv(results, path)
+        else:
+            export_to_json(results, path)
+
+    existing = tmp_path / f"existing.{format_name}"
+    sentinel = "existing artifact\n"
+    existing.write_text(sentinel, encoding="utf-8")
+    with pytest.raises(ValueError, match="boolean"):
+        export(existing)
+    assert existing.read_text(encoding="utf-8") == sentinel
+
+    absent = tmp_path / "not-created" / f"absent.{format_name}"
+    with pytest.raises(ValueError, match="boolean"):
+        export(absent)
+    assert not absent.exists()
+    assert not absent.parent.exists()
+
+
+@pytest.mark.parametrize("field", ["mean", "std"])
 @pytest.mark.parametrize("value", [math.nan, math.inf, -math.inf])
 def test_display_tables_reject_nonfinite_summaries(field: str, value: float) -> None:
     result = _constant_result("invalid")
