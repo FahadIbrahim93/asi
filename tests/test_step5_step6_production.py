@@ -16,6 +16,7 @@ import pytest
 from alberta_framework.steps import (
     Step5AverageRewardTDConfig,
     Step6DifferentialSARSAConfig,
+    Step6SmokeResult,
     Step7DynaConfig,
     Step8WorldModelConfig,
     Step9DreamingConfig,
@@ -321,6 +322,51 @@ def test_step6_smoke_rejects_out_of_range_dimensions_and_seed(
 ) -> None:
     with pytest.raises(ValueError, match=field):
         run_step6_smoke(**{field: value})
+
+
+def _legal_step6_smoke_result(**overrides: object) -> Step6SmokeResult:
+    payload: dict[str, object] = {
+        "config": Step6DifferentialSARSAConfig(),
+        "steps": 8,
+        "seed": 0,
+        "q_values_shape": (8, 2),
+        "td_errors_shape": (8,),
+        "average_rewards_shape": (8,),
+        "actions_shape": (8,),
+        "finite": True,
+        "agent_config": {"ok": True},
+    }
+    payload.update(overrides)
+    return Step6SmokeResult(**payload)  # type: ignore[arg-type]
+
+
+def test_step6_smoke_result_rejects_leftover_identities() -> None:
+    """Public Step 6 smoke records must not keep leftover bool/int identities."""
+
+    with pytest.raises(ValueError, match="steps"):
+        _legal_step6_smoke_result(steps=True)
+    with pytest.raises(ValueError, match="steps"):
+        _legal_step6_smoke_result(steps=float("nan"))
+    with pytest.raises(ValueError, match="seed"):
+        _legal_step6_smoke_result(seed=True)
+    with pytest.raises(ValueError, match="finite"):
+        _legal_step6_smoke_result(finite=1)
+
+    legal = _legal_step6_smoke_result()
+    dumped = json.dumps(
+        {
+            "steps": legal.steps,
+            "seed": legal.seed,
+            "finite": legal.finite,
+        },
+        allow_nan=False,
+    )
+    assert '"steps": 8' in dumped
+    assert '"seed": 0' in dumped
+    assert '"finite": true' in dumped
+    assert '"steps": true' not in dumped
+    assert '"seed": true' not in dumped
+    assert '"finite": 1' not in dumped
 
 
 @pytest.mark.parametrize("feature_dim", [0, 2**31, True, np.int64(2**31)])
