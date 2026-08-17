@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-import math
 import struct
 from fractions import Fraction
-from typing import cast
+from typing import Any, cast
 
 import numpy as np
 
@@ -113,17 +112,21 @@ def _float32_from_ratio(
 
 def _real_ratio(value: object) -> tuple[int, int, bool]:
     """Return one normalized exact ratio and its zero-sign metadata."""
-    if isinstance(value, (bool, np.bool_)):
-        raise TypeError("value must be an actual non-bool real")
-    if type(value) not in _ALLOWED_REAL_TYPES:
+    actual_type = type(value)
+    if actual_type not in _ALLOWED_REAL_TYPES:
         raise TypeError("value must be an actual non-bool real")
     if _is_actual_int(value):
-        ratio: object = (int(cast(int, value)), 1)
+        ratio: object = (int(cast(Any, value)), 1)
+    elif actual_type is float:
+        ratio = float.as_integer_ratio(cast(float, value))
+    elif actual_type is Fraction:
+        fraction = cast(Fraction, value)
+        ratio = (fraction.numerator, fraction.denominator)
     else:
-        ratio_method = getattr(value, "as_integer_ratio", None)
-        if not callable(ratio_method):
-            raise TypeError("real value must expose as_integer_ratio")
-        ratio = ratio_method()
+        # NumPy's concrete floating scalar classes are in the allow-list.
+        # Dispatch through the concrete class after the exact-type gate so an
+        # instance cannot substitute an attribute hook.
+        ratio = cast(Any, actual_type).as_integer_ratio(value)
     if type(ratio) is not tuple:
         raise TypeError("as_integer_ratio must return an integer pair")
     ratio_tuple = cast(tuple[object, ...], ratio)
@@ -132,14 +135,16 @@ def _real_ratio(value: object) -> tuple[int, int, bool]:
     numerator_raw, denominator_raw = ratio_tuple
     if not _is_actual_int(numerator_raw) or not _is_actual_int(denominator_raw):
         raise TypeError("as_integer_ratio must return an integer pair")
-    numerator = int(cast(int, numerator_raw))
-    denominator = int(cast(int, denominator_raw))
+    numerator = int(cast(Any, numerator_raw))
+    denominator = int(cast(Any, denominator_raw))
     if denominator < 0:
         numerator = -numerator
         denominator = -denominator
     if denominator == 0:
         raise ValueError("ratio denominator must be nonzero")
-    negative_zero = numerator == 0 and math.copysign(1.0, float(cast(float, value))) < 0.0
+    negative_zero = numerator == 0 and actual_type in _ACTUAL_FLOAT_TYPES and bool(
+        np.signbit(cast(Any, value))
+    )
     return numerator, denominator, negative_zero
 
 

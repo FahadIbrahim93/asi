@@ -782,7 +782,7 @@ def test_hostile_payoff_container_failure_never_formats_repr() -> None:
 
 
 @pytest.mark.parametrize("field", ["p_right_up", "p_right_down"])
-def test_riverswim_probability_ratio_hook_runs_once(field: str) -> None:
+def test_riverswim_rejects_probability_subclass_before_ratio_hook(field: str) -> None:
     class CountingReal(float):
         def __new__(cls):
             instance = super().__new__(cls, 0.2)
@@ -794,10 +794,9 @@ def test_riverswim_probability_ratio_hook_runs_once(field: str) -> None:
             return (1, 5)
 
     value = CountingReal()
-    env = RiverSwimMDP(RiverSwimConfig(**{field: value}))  # type: ignore[arg-type]
-
-    assert value.calls == 1
-    assert getattr(env.config, field) == float(np.float32(0.2))
+    with pytest.raises(ValueError, match="normal float32 probability"):
+        RiverSwimMDP(RiverSwimConfig(**{field: value}))  # type: ignore[arg-type]
+    assert value.calls == 0
 
 
 @pytest.mark.parametrize("field", ["p_right_up", "p_right_down"])
