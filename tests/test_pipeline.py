@@ -568,6 +568,35 @@ def test_observation_channel_cumulant_fn_rejects_invalid_shapes() -> None:
         observation_channel_cumulant_fn(n_demons=1, observation_dim=0)
 
 
+@pytest.mark.parametrize(
+    ("n_demons", "observation_dim"),
+    [
+        (True, 3),
+        (1.5, 3),
+        ("3", 3),
+        (1, True),
+        (1, 1.5),
+        (1, "3"),
+    ],
+)
+def test_observation_channel_cumulant_fn_rejects_non_integer_identities(
+    n_demons: object,
+    observation_dim: object,
+) -> None:
+    with pytest.raises(ValueError, match="must be an integer"):
+        observation_channel_cumulant_fn(
+            n_demons=n_demons,  # type: ignore[arg-type]
+            observation_dim=observation_dim,  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.parametrize("field", ["n_demons", "observation_dim"])
+def test_observation_channel_cumulant_fn_rejects_int32_overflow(field: str) -> None:
+    kwargs = {"n_demons": 5, "observation_dim": 3, field: 2**31}
+    with pytest.raises(ValueError, match="must be <="):
+        observation_channel_cumulant_fn(**kwargs)
+
+
 _INVALID_PIPELINE_FEATURE_FIELDS: tuple[tuple[str, object], ...] = (
     ("observation_dim", 0),
     ("observation_dim", -1),

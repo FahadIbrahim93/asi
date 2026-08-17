@@ -786,14 +786,12 @@ def observation_channel_cumulant_fn(
     n_demons: int, observation_dim: int
 ) -> CumulantFn:
     """Return a cumulant function that maps demons to observation channels."""
-    if n_demons < 1:
-        msg = f"n_demons must be positive, got {n_demons}"
-        raise ValueError(msg)
-    if observation_dim < 1:
-        msg = f"observation_dim must be positive, got {observation_dim}"
-        raise ValueError(msg)
+    n_demons = _require_int("n_demons", n_demons, minimum=1, maximum=_INT32_MAX)
+    observation_dim = _require_int(
+        "observation_dim", observation_dim, minimum=1, maximum=_INT32_MAX
+    )
 
-    indices = jnp.arange(n_demons) % max(observation_dim, 1)
+    indices = jnp.arange(n_demons) % observation_dim
 
     def cumulant_fn(
         observation: Array, _reward: Array, _terminated: Array
