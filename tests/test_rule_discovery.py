@@ -49,8 +49,10 @@ from alberta_framework.benchmarks.rule_discovery import (
     penalized_fitness,
     random_genomes,
     rule_step,
+    run_search,
     run_stream,
     seed_genomes,
+    tune_champion_baseline,
 )
 from alberta_framework.benchmarks.upgd_ipmnist import IPMNISTConfig, init_mlp_params
 
@@ -408,6 +410,89 @@ def test_evaluate_population_rejects_nonfinite_genomes_before_materialization(
     genomes = jnp.zeros((2, GENOME_SIZE), dtype=jnp.float32).at[1, 0].set(invalid)
     with pytest.raises(ValueError, match="genomes must contain only finite values"):
         evaluate_population(genomes, MICRO_SUITE["M1"], seeds=(0,))
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"n_random": True}, "n_random"),
+        ({"n_random": -1}, "n_random"),
+        ({"population": True}, "population"),
+        ({"population": 0}, "population"),
+        ({"generations": True}, "generations"),
+        ({"generations": -1}, "generations"),
+        ({"elite": True}, "elite"),
+        ({"elite": 0}, "elite"),
+        ({"top_k": True}, "top_k"),
+        ({"top_k": 0}, "top_k"),
+        ({"batch_size": True}, "batch_size"),
+        ({"batch_size": 0}, "batch_size"),
+    ],
+)
+def test_run_search_rejects_invalid_search_identities_before_genome_generation(
+    monkeypatch: pytest.MonkeyPatch, kwargs: dict[str, object], match: str
+) -> None:
+    def unexpected_generation(*args: object, **kw: object) -> None:
+        del args, kw
+        raise AssertionError("invalid search identity reached genome generation")
+
+    monkeypatch.setattr(rule_discovery, "seed_genomes", unexpected_generation)
+    monkeypatch.setattr(rule_discovery, "random_genomes", unexpected_generation)
+    payload: dict[str, object] = {
+        "n_random": 2,
+        "population": 2,
+        "generations": 0,
+        "elite": 1,
+        "eval_seeds": (0,),
+        "holdout_seeds": (101,),
+        "top_k": 1,
+        "batch_size": 2,
+    }
+    payload.update(kwargs)
+    with pytest.raises(ValueError, match=match):
+        run_search(**payload)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("n_tasks", [True, 0, -1, 1.5])
+def test_resolved_suite_rejects_invalid_n_tasks_identities(n_tasks: object) -> None:
+    with pytest.raises(ValueError, match="n_tasks"):
+        rule_discovery._resolved_suite(n_tasks, None)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("task_length", [True, 0, -1, 1.5])
+def test_resolved_suite_rejects_invalid_task_length_identities(
+    task_length: object,
+) -> None:
+    with pytest.raises(ValueError, match="task_length"):
+        rule_discovery._resolved_suite(None, task_length)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"n_random": True}, "n_random"),
+        ({"generations": True}, "generations"),
+        ({"children": True}, "children"),
+        ({"children": 0}, "children"),
+    ],
+)
+def test_tune_champion_baseline_rejects_invalid_search_identities(
+    monkeypatch: pytest.MonkeyPatch, kwargs: dict[str, object], match: str
+) -> None:
+    def unexpected_generation(*args: object, **kw: object) -> None:
+        del args, kw
+        raise AssertionError("invalid search identity reached genome generation")
+
+    monkeypatch.setattr(rule_discovery, "random_genomes", unexpected_generation)
+    with pytest.raises(ValueError, match=match):
+        tune_champion_baseline(
+            jr.key(0),
+            task_names=("M1",),
+            eval_seeds=(0,),
+            batch_size=2,
+            suite=MICRO_SUITE,
+            **kwargs,  # type: ignore[arg-type]
+        )
 
 
 @pytest.mark.parametrize("batch_size", [0, -4, True])
