@@ -1232,3 +1232,43 @@ def test_probe_ppo_schedule_rejects_bool_rollout_and_updates() -> None:
             probe._validate_ppo_schedule(rollout, updates, 32, "configs/demo.json")
     with pytest.raises(RuntimeError, match="PPO schedule does not equal the frozen horizon"):
         probe._validate_ppo_schedule(4, 4, 32, "configs/demo.json")
+
+
+@pytest.mark.parametrize("payload", ['[{"Id": NaN}]', '[{"Id": Infinity}]', '[{"Id": -Infinity}]'])
+def test_inspect_image_rejects_nonfinite_json(
+    monkeypatch: pytest.MonkeyPatch, payload: str
+) -> None:
+    """Docker inspect identities must not coerce NaN/Inf into trusted JSON."""
+
+    monkeypatch.setattr(
+        screen,
+        "_capture_process",
+        lambda command: screen.ProcessCapture(0, payload.encode("utf-8"), b""),
+    )
+    with pytest.raises(screen.ScreenError, match="non-finite"):
+        screen._inspect_image("docker", "sha256:" + ("ab" * 32))
+
+
+def test_inspect_image_accepts_finite_inspect_json(monkeypatch: pytest.MonkeyPatch) -> None:
+    image_id = "sha256:" + ("ab" * 32)
+    payload = json.dumps(
+        [
+            {
+                "Id": image_id,
+                "Config": {
+                    "Entrypoint": screen._EXPECTED_IMAGE_ENTRYPOINT,
+                    "WorkingDir": screen._EXPECTED_IMAGE_WORKDIR,
+                },
+            }
+        ]
+    )
+    monkeypatch.setattr(
+        screen,
+        "_capture_process",
+        lambda command: screen.ProcessCapture(0, payload.encode("utf-8"), b""),
+    )
+    assert screen._inspect_image("docker", image_id) == {
+        "id": image_id,
+        "entrypoint": screen._EXPECTED_IMAGE_ENTRYPOINT,
+        "working_dir": screen._EXPECTED_IMAGE_WORKDIR,
+    }
