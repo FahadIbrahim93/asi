@@ -325,7 +325,7 @@ class AssociativeMemoryState:
     keys: Int[Array, "max_features key_width"]
     values: Float[Array, "max_features vocab_size"]
     utility: Float[Array, " max_features"]
-    counts: Float[Array, " max_features"]
+    counts: Int[Array, " max_features"]
     last_update: Int[Array, " max_features"]
     prior: Float[Array, " vocab_size"]
     family_logits: Float[Array, " family_count"]
@@ -648,7 +648,7 @@ class AssociativeMemoryLearner:
             ("state.keys", state.keys, (c.max_features, KEY_WIDTH), jnp.int32),
             ("state.values", state.values, (c.max_features, c.vocab_size), jnp.float32),
             ("state.utility", state.utility, (c.max_features,), jnp.float32),
-            ("state.counts", state.counts, (c.max_features,), jnp.float32),
+            ("state.counts", state.counts, (c.max_features,), jnp.int32),
             ("state.last_update", state.last_update, (c.max_features,), jnp.int32),
             ("state.prior", state.prior, (c.vocab_size,), jnp.float32),
             ("state.family_logits", state.family_logits, (FAMILY_COUNT,), jnp.float32),
@@ -694,7 +694,7 @@ class AssociativeMemoryLearner:
             ),
             values=jnp.zeros((c.max_features, c.vocab_size), dtype=jnp.float32),
             utility=jnp.zeros((c.max_features,), dtype=jnp.float32),
-            counts=jnp.zeros((c.max_features,), dtype=jnp.float32),
+            counts=jnp.zeros((c.max_features,), dtype=jnp.int32),
             last_update=jnp.zeros((c.max_features,), dtype=jnp.int32),
             prior=jnp.zeros((c.vocab_size,), dtype=jnp.float32),
             family_logits=jnp.zeros((FAMILY_COUNT,), dtype=jnp.float32),
@@ -1137,7 +1137,11 @@ class AssociativeMemoryLearner:
                 counts=jnp.where(
                     active_bool,
                     carry.counts.at[slot].set(
-                        jnp.where(found_scalar, carry.counts[slot] + 1.0, 1.0)
+                        jnp.where(
+                            found_scalar,
+                            _saturating_increment(carry.counts[slot]),
+                            jnp.asarray(1, dtype=jnp.int32),
+                        )
                     ),
                     carry.counts,
                 ),
