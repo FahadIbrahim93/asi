@@ -8,6 +8,7 @@ import chex
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 import pytest
 
 from alberta_framework.streams import (
@@ -226,8 +227,7 @@ def test_meet_and_avoid_rewards_use_post_action_distance() -> None:
     assert float(meet_transition.oracle.meet_reward) == pytest.approx(0.25)
     assert float(meet_transition.oracle.avoid_reward) == pytest.approx(0.75)
     assert float(
-        meet_transition.oracle.meet_reward
-        + meet_transition.oracle.avoid_reward
+        meet_transition.oracle.meet_reward + meet_transition.oracle.avoid_reward
     ) == pytest.approx(1.0)
 
 
@@ -496,9 +496,7 @@ def test_jitted_scan_runs_continually_and_remains_bounded() -> None:
     ) = outputs
 
     expected_contexts = (jnp.arange(num_steps) // world.context_length) % 2
-    expected_next_contexts = (
-        (jnp.arange(num_steps) + 1) // world.context_length
-    ) % 2
+    expected_next_contexts = ((jnp.arange(num_steps) + 1) // world.context_length) % 2
     chex.assert_trees_all_equal(contexts, expected_contexts)
     chex.assert_trees_all_equal(switched, contexts != expected_next_contexts)
     assert int(final_state.step_count) == num_steps
@@ -508,6 +506,26 @@ def test_jitted_scan_runs_continually_and_remains_bounded() -> None:
     assert jnp.all(jnp.abs(velocities) <= world.max_speed)
     chex.assert_shape(rewards, (num_steps, 2))
     chex.assert_shape(observations, (num_steps, 2, world.observation_dim))
-    chex.assert_tree_all_finite(
-        (rewards, discounts, positions, velocities, observations)
-    )
+    chex.assert_tree_all_finite((rewards, discounts, positions, velocities, observations))
+
+
+def test_recurring_two_agent_world_initial_positions_reject_booleans() -> None:
+    # Boolean initial positions
+    with pytest.raises(ValueError, match="initial_positions"):
+        RecurringTwoAgentWorld(initial_positions=(True, False))  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="initial_positions"):
+        RecurringTwoAgentWorld(initial_positions=(False, True))  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="initial_positions"):
+        RecurringTwoAgentWorld(initial_positions=(np.True_, 0.0))  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="initial_positions"):
+        RecurringTwoAgentWorld(initial_positions=(1.0, False))  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="initial_positions"):
+        RecurringTwoAgentWorld(initial_positions=(float("nan"), 0.5))
+
+    # Valid initial positions
+    world = RecurringTwoAgentWorld(initial_positions=(-0.5, 0.5))
+    assert world.to_config()["initial_positions"] == [-0.5, 0.5]
