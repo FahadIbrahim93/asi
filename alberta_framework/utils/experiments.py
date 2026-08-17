@@ -368,7 +368,7 @@ def run_multi_seed_experiment(
                 "of unique built-in integer seeds"
             )
         try:
-            raw_seeds = tuple(seeds)
+            raw_seeds = tuple(cast("Sequence[int]", seeds))
         except TypeError as exc:
             raise ValueError(
                 "seeds must be a positive built-in integer count or a sequence "

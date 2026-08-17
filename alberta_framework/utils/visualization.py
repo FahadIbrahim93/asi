@@ -56,7 +56,7 @@ def _require_positive_int(name: str, value: object) -> int:
 
 
 def set_publication_style(
-    font_size: int = 10,
+    font_size: float = 10,
     use_latex: bool = False,
     figure_width: float = 3.5,
     figure_height: float | None = None,

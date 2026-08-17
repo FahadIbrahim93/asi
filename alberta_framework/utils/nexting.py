@@ -35,6 +35,7 @@ from __future__ import annotations
 import math
 from functools import partial
 from numbers import Real
+from typing import TypeVar
 
 import jax
 import jax.numpy as jnp
@@ -42,12 +43,14 @@ import numpy as np
 from jax import Array
 from jaxtyping import Float
 
+_ScalarT = TypeVar("_ScalarT")
+
 
 def _is_bool(value: object) -> bool:
     return type(value) is bool or type(value) is np.bool_
 
 
-def _require_host_discount(name: str, value: object) -> object:
+def _require_host_discount(name: str, value: _ScalarT) -> _ScalarT:
     """Reject boolean / non-finite host discounts before they become 0/1 identities."""
     if _is_bool(value):
         raise ValueError(f"{name} must be a finite discount in [0, 1], not a boolean")
@@ -64,7 +67,7 @@ def _require_host_discount(name: str, value: object) -> object:
     raise ValueError(f"{name} must be a finite discount in [0, 1]")
 
 
-def _require_host_finite_real(name: str, value: object) -> object:
+def _require_host_finite_real(name: str, value: _ScalarT) -> _ScalarT:
     """Reject boolean / non-finite host scalars before they become 0/1 bootstraps."""
     if _is_bool(value):
         raise ValueError(f"{name} must be a finite real number, not a boolean")
