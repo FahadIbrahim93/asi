@@ -6,10 +6,16 @@ from typing import Any, cast
 import numpy as np
 import pytest
 
-from alberta_framework.steps.step1 import Step1KernelConfig
+from alberta_framework.steps.step1 import Step1KernelConfig, Step1SmokeResult, run_step1_smoke
 
 
 class _EvilStr(str):
+    calls = 0
+
+    def lower(self) -> str:
+        type(self).calls += 1
+        raise AssertionError("EvilStr.lower must not be called")
+
     def __str__(self) -> str:  # pragma: no cover
         raise AssertionError("EvilStr.__str__ must not be called")
 
@@ -28,9 +34,41 @@ class _HostileInt(int):
         type(self).calls += 1
         raise AssertionError("HostileInt.__index__ must not be called")
 
+    def __int__(self) -> int:
+        type(self).calls += 1
+        raise AssertionError("HostileInt.__int__ must not be called")
+
     def __repr__(self) -> str:
         type(self).calls += 1
         raise AssertionError("HostileInt.__repr__ must not be called")
+
+
+class _HostileMeta(type):
+    calls = 0
+
+    def __hash__(cls) -> int:
+        _HostileMeta.calls += 1
+        raise AssertionError("HostileMeta.__hash__ must not be called")
+
+
+class _HostileMetaclassInt(int, metaclass=_HostileMeta):
+    pass
+
+
+class _HostileMetaclassFloat(float, metaclass=_HostileMeta):
+    pass
+
+
+class _HostileTuple(tuple):
+    calls = 0
+
+    def __iter__(self):
+        type(self).calls += 1
+        raise AssertionError("HostileTuple.__iter__ must not be called")
+
+    def __repr__(self) -> str:
+        type(self).calls += 1
+        raise AssertionError("HostileTuple.__repr__ must not be called")
 
 
 class _HostileFloat(float):
@@ -71,6 +109,11 @@ def test_rejects_bool_and_hostile_int() -> None:
     assert _HostileInt.calls == 0
     assert "HostileInt" not in str(exc.value)
 
+    _HostileMeta.calls = 0
+    with pytest.raises(ValueError, match="must be an integer"):
+        Step1KernelConfig(feature_dim=_HostileMetaclassInt(4))
+    assert _HostileMeta.calls == 0
+
 
 def test_rejects_hostile_float_without_hook_and_repr_leak() -> None:
     _HostileFloat.calls = 0
@@ -80,15 +123,10 @@ def test_rejects_hostile_float_without_hook_and_repr_leak() -> None:
     assert "HostileFloat" not in str(exc.value)
     assert "!r" not in str(exc.value)
 
-
-def test_does_not_invoke_hostile_value_when_name_is_evil_via_sink() -> None:
-    from alberta_framework.steps.step1 import finite_real_and_float32
-
-    evil = _EvilStr("x")
-    _HostileFloat.calls = 0
-    with pytest.raises(ValueError, match="must be an exact string"):
-        finite_real_and_float32(evil, _HostileFloat(1.0))  # type: ignore[arg-type]
-    assert _HostileFloat.calls == 0
+    _HostileMeta.calls = 0
+    with pytest.raises(ValueError, match="must be a real number"):
+        Step1KernelConfig(step_size=_HostileMetaclassFloat(0.01))
+    assert _HostileMeta.calls == 0
 
 
 def test_rejects_plain_string_for_step_size() -> None:
@@ -121,6 +159,30 @@ def test_rejects_unknown_optimizer_without_repr() -> None:
         Step1KernelConfig(optimizer="evil")  # type: ignore[arg-type]
     assert "evil" not in str(exc.value)
     assert "!r" not in str(exc.value)
+
+    _EvilStr.calls = 0
+    with pytest.raises(ValueError, match="unknown Step 1 optimizer"):
+        Step1KernelConfig(optimizer=_EvilStr("lms"))  # type: ignore[arg-type]
+    assert _EvilStr.calls == 0
+
+
+def test_smoke_result_rejects_hostile_shape_without_hooks() -> None:
+    _HostileTuple.calls = 0
+    with pytest.raises(ValueError, match="metrics_shape"):
+        Step1SmokeResult(
+            config=Step1KernelConfig(),
+            steps=2,
+            seed=0,
+            final_window_mse=0.0,
+            metrics_shape=_HostileTuple((2, 2)),
+            finite=True,
+        )
+    assert _HostileTuple.calls == 0
+
+
+@pytest.mark.parametrize("seed", [2**31, 2**32 - 1])
+def test_smoke_accepts_full_uint32_seed(seed: int) -> None:
+    assert run_step1_smoke(steps=2, final_window=1, seed=seed).seed == seed
 
 
 def test_valid_configs_still_pass() -> None:
