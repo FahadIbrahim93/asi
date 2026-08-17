@@ -40,6 +40,7 @@ import chex
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 from jax import Array
 from jaxtyping import Bool, Float, Int, PRNGKeyArray
 
@@ -388,9 +389,17 @@ class RecurringTwoAgentWorld:
                 f"initial_positions must contain {N_AGENTS} values, "
                 f"got {len(initial_positions)}"
             )
-        if any(not math.isfinite(float(position)) for position in initial_positions):
-            raise ValueError("initial_positions must be finite")
-        if any(abs(position) > world_limit for position in initial_positions):
+        canonical_positions: list[float] = []
+        for position in initial_positions:
+            if isinstance(position, (bool, np.bool_)) or not isinstance(
+                position, (int, float, np.integer, np.floating)
+            ):
+                raise ValueError("initial_positions must be finite real numbers")
+            number = float(position)
+            if not math.isfinite(number):
+                raise ValueError("initial_positions must be finite")
+            canonical_positions.append(number)
+        if any(abs(position) > world_limit for position in canonical_positions):
             raise ValueError(
                 "initial_positions must lie within [-world_limit, world_limit]"
             )
@@ -403,8 +412,8 @@ class RecurringTwoAgentWorld:
         self._acceleration = float(acceleration)
         self._time_delta = float(time_delta)
         self._max_speed = float(max_speed)
-        self._initial_positions_tuple = tuple(float(value) for value in initial_positions)
-        self._initial_positions = jnp.asarray(initial_positions, dtype=jnp.float32)
+        self._initial_positions_tuple = tuple(canonical_positions)
+        self._initial_positions = jnp.asarray(canonical_positions, dtype=jnp.float32)
         self._partner_policy_is_default = partner_policy is None
         self._partner_policy = (
             scripted_meet_avoid_partner_policy
