@@ -1,4 +1,4 @@
-# mypy: disable-error-code="call-arg"
+# mypy: disable-error-code="attr-defined,call-arg,comparison-overlap,redundant-cast,unused-ignore"
 """Production-facing Step 7 bounded Dyna planning facade.
 
 Alberta Plan Step 7 (incremental average-reward planning): each real
@@ -55,6 +55,7 @@ import chex
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 from jax import Array
 
 from alberta_framework._seed_validation import require_jax_seed
@@ -135,6 +136,18 @@ class Step7DynaConfig:
     @classmethod
     def from_dict(cls, payload: dict[str, object]) -> Step7DynaConfig:
         """Reconstruct from :meth:`to_dict` output."""
+        if cls is not Step7DynaConfig:
+            raise ValueError("cls must be Step7DynaConfig")
+        if type(payload) is not dict:
+            raise ValueError("payload must be an actual dict")
+        if any(type(key) is not str for key in payload):
+            raise ValueError("payload keys must be exact strings")
+        if payload.keys() != _STEP7_CONFIG_FIELDS:
+            raise ValueError("payload must contain the exact Step7DynaConfig fields")
+        if type(payload["control"]) is not dict:
+            raise ValueError("control payload must be an actual dict")
+        if type(payload["world_model"]) is not dict:
+            raise ValueError("world_model payload must be an actual dict")
         data = dict(payload)
         data["control"] = Step6DifferentialSARSAConfig.from_dict(
             cast(dict[str, object], data["control"])
@@ -146,24 +159,63 @@ class Step7DynaConfig:
 
 
 _INT32_MAX = 2**31 - 1
+_STEP7_CONFIG_FIELDS = frozenset(
+    {
+        "control",
+        "world_model",
+        "planning_steps",
+        "planning_rollout_depth",
+        "planning_warmup_steps",
+        "planning_memory_size",
+        "planning_strategy",
+        "planning_importance_ratio_clip",
+        "planning_apply_importance_correction",
+        "planning_priority_propagation",
+        "planning_utility_step_size",
+    }
+)
+_ACTUAL_INT_TYPES = frozenset(
+    {
+        int,
+        np.int8,
+        np.int16,
+        np.int32,
+        np.int64,
+        np.uint8,
+        np.uint16,
+        np.uint32,
+        np.uint64,
+        np.longlong,
+        np.ulonglong,
+    }
+)
 
 
-def _require_nonnegative_real(name: str, value: object) -> float:
-    real, numerator, _, narrowed = finite_real_and_float32(name, value)
+def _require_exact_str(name: str, value: object) -> str:
+    if type(value) is not str:
+        raise ValueError(f"{name} must be an exact string")
+    return value
+
+
+def _require_nonnegative_real(name: object, value: object) -> float:
+    host_name = _require_exact_str("name", name)
+    real, numerator, _, narrowed = finite_real_and_float32(host_name, value)
     if real < 0.0 or numerator < 0 or narrowed < 0.0:
-        raise ValueError(f"{name} must be non-negative, got {value!r}")
+        raise ValueError(f"{host_name} must be non-negative")
     return canonical_float32_storage(real, narrowed)
 
 
-def _require_positive_real(name: str, value: object) -> float:
-    real, numerator, _, narrowed = finite_real_and_float32(name, value)
+def _require_positive_real(name: object, value: object) -> float:
+    host_name = _require_exact_str("name", name)
+    real, numerator, _, narrowed = finite_real_and_float32(host_name, value)
     if real <= 0.0 or numerator <= 0 or narrowed <= 0.0:
-        raise ValueError(f"{name} must be positive, got {value!r}")
+        raise ValueError(f"{host_name} must be positive")
     return canonical_float32_storage(real, narrowed)
 
 
-def _require_unit_interval(name: str, value: object) -> float:
-    real, numerator, denominator, narrowed = finite_real_and_float32(name, value)
+def _require_unit_interval(name: object, value: object) -> float:
+    host_name = _require_exact_str("name", name)
+    real, numerator, denominator, narrowed = finite_real_and_float32(host_name, value)
     if (
         real < 0.0
         or not real <= 1.0
@@ -172,39 +224,47 @@ def _require_unit_interval(name: str, value: object) -> float:
         or narrowed < 0.0
         or not narrowed <= 1.0
     ):
-        raise ValueError(f"{name} must be in [0, 1], got {value!r}")
+        raise ValueError(f"{host_name} must be in [0, 1]")
     return canonical_float32_storage(real, narrowed)
 
 
 def _require_int(
-    name: str,
+    name: object,
     value: object,
     *,
     minimum: int | None = None,
     maximum: int | None = None,
 ) -> int:
+    host_name = _require_exact_str("name", name)
     actual_type = type(value)
-    if issubclass(actual_type, bool) or not issubclass(actual_type, Integral):
-        raise ValueError(f"{name} must be an integer, got {value!r}")
+    if actual_type not in _ACTUAL_INT_TYPES:
+        raise ValueError(f"{host_name} must be an integer")
     number = int(cast(Integral, value))
     if minimum is not None and number < minimum:
         if minimum == 1:
-            raise ValueError(f"{name} must be positive, got {value!r}")
+            raise ValueError(f"{host_name} must be positive")
         if minimum == 0:
-            raise ValueError(f"{name} must be non-negative, got {value!r}")
-        raise ValueError(f"{name} must be >= {minimum}, got {value!r}")
+            raise ValueError(f"{host_name} must be non-negative")
+        raise ValueError(f"{host_name} must be >= {minimum}")
     if maximum is not None and number > maximum:
-        raise ValueError(f"{name} must be at most int32 max, got {value!r}")
+        raise ValueError(f"{host_name} must be at most int32 max")
     return number
 
 
-def _require_bool(name: str, value: object) -> bool:
+def _require_bool(name: object, value: object) -> bool:
+    host_name = _require_exact_str("name", name)
     if type(value) is not bool:
-        raise ValueError(f"{name} must be a boolean, got {value!r}")
+        raise ValueError(f"{host_name} must be a built-in bool")
     return value
 
 
 def _validate_planning_config(config: Step7DynaConfig) -> None:
+    if type(config) is not Step7DynaConfig:
+        raise ValueError("config must be an actual Step7DynaConfig")
+    if type(config.control) is not Step6DifferentialSARSAConfig:
+        raise ValueError("control must be an actual Step6DifferentialSARSAConfig")
+    if type(config.world_model) is not Step8WorldModelConfig:
+        raise ValueError("world_model must be an actual Step8WorldModelConfig")
     planning_steps = _require_int(
         "planning_steps",
         config.planning_steps,
@@ -243,15 +303,10 @@ def _validate_planning_config(config: Step7DynaConfig) -> None:
         config.planning_utility_step_size,
     )
     if type(config.planning_apply_importance_correction) is not bool:
-        raise ValueError(
-            f"planning_apply_importance_correction must be a bool, got "
-            f"{config.planning_apply_importance_correction!r}"
-        )
+        raise ValueError("planning_apply_importance_correction must be a built-in bool")
     strategy = config.planning_strategy
     if type(strategy) is not str:
-        raise ValueError(
-            f"planning_strategy must be an actual string, got {strategy!r}"
-        )
+        raise ValueError("planning_strategy must be an actual string")
     if strategy not in (
         "random",
         "reward",
@@ -267,6 +322,18 @@ def _validate_planning_config(config: Step7DynaConfig) -> None:
     canonical_strategy = str(strategy)
     if config.world_model.n_actions != config.control.n_actions:
         raise ValueError("world_model.n_actions must equal control.n_actions")
+    planning_evaluations = planning_steps * planning_rollout_depth
+    if planning_evaluations > _INT32_MAX:
+        raise ValueError("derived planning evaluations per update must fit signed int32")
+    memory_scalars = (
+        2 * planning_memory_size * config.world_model.observation_dim
+        + 4 * planning_memory_size
+        + 3
+    )
+    if memory_scalars > _INT32_MAX or 4 * memory_scalars > _INT32_MAX:
+        raise ValueError("derived Step 7 planning-memory bytes must fit signed int32")
+    config.control.to_core_config()
+    config.world_model.to_core_config()
     object.__setattr__(config, "planning_steps", planning_steps)
     object.__setattr__(config, "planning_rollout_depth", planning_rollout_depth)
     object.__setattr__(config, "planning_warmup_steps", planning_warmup_steps)
@@ -356,6 +423,10 @@ class Step7SmokeResult:
     world_model_config: dict[str, Any]
 
     def __post_init__(self) -> None:
+        if type(self) is not Step7SmokeResult:
+            raise ValueError("result must be an actual Step7SmokeResult")
+        if type(self.config) is not Step7DynaConfig:
+            raise ValueError("config must be an actual Step7DynaConfig")
         object.__setattr__(
             self, "steps", _require_int("steps", self.steps, minimum=1, maximum=_INT32_MAX)
         )
@@ -384,6 +455,21 @@ class Step7SmokeResult:
                 maximum=_INT32_MAX,
             ),
         )
+        if self.real_td_errors_shape != (self.steps,) or self.actions_shape != (self.steps,):
+            raise ValueError("real/action shapes must be exactly (steps,)")
+        planning_shape = (self.steps, self.config.planning_steps)
+        for name in (
+            "planning_td_errors_shape",
+            "planning_priorities_shape",
+            "planning_anchor_indices_shape",
+            "planning_importance_ratios_shape",
+        ):
+            if getattr(self, name) != planning_shape:
+                raise ValueError(f"{name} must be exactly (steps, planning_steps)")
+        if self.planning_acceptance_count > self.steps * self.config.planning_steps:
+            raise ValueError("planning_acceptance_count exceeds attempted planning backups")
+        if type(self.control_config) is not dict or type(self.world_model_config) is not dict:
+            raise ValueError("component configs must be actual dicts")
 
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-serializable representation."""
@@ -402,11 +488,108 @@ class Step7SmokeResult:
         return payload
 
 
+def _trusted_array(
+    name: str,
+    value: object,
+    *,
+    shape: tuple[int, ...],
+    dtype: Any,
+) -> Array:
+    actual_type = type(value)
+    if not (
+        actual_type is np.ndarray
+        or issubclass(actual_type, jax.Array)
+        or issubclass(actual_type, jax.core.Tracer)
+    ):
+        raise TypeError(f"{name} must be a trusted array")
+    try:
+        actual_shape = tuple(value.shape)  # type: ignore[attr-defined]
+        actual_dtype = jnp.dtype(value.dtype)  # type: ignore[attr-defined]
+    except (AttributeError, TypeError, ValueError) as error:
+        raise TypeError(f"{name} must expose trusted shape and dtype metadata") from error
+    if actual_shape != shape:
+        raise ValueError(f"{name} must have shape {shape}")
+    if actual_dtype != jnp.dtype(dtype):
+        raise TypeError(f"{name} must have dtype {jnp.dtype(dtype)}")
+    return cast(Array, value)
+
+
+def _require_typed_key(name: str, value: object) -> Array:
+    actual_type = type(value)
+    if not (issubclass(actual_type, jax.Array) or issubclass(actual_type, jax.core.Tracer)):
+        raise TypeError(f"{name} must be a scalar typed JAX PRNG key")
+    try:
+        shape = tuple(value.shape)  # type: ignore[attr-defined]
+        words = jr.key_data(cast(Array, value))
+        implementation = str(jr.key_impl(cast(Array, value)))
+    except (AttributeError, TypeError, ValueError) as error:
+        raise TypeError(f"{name} must be a scalar typed JAX PRNG key") from error
+    if shape != () or words.shape != (2,) or words.dtype != jnp.uint32:
+        raise TypeError(f"{name} must be a scalar typed JAX PRNG key")
+    if implementation != "threefry2x32":
+        raise ValueError(f"{name} must use Threefry2x32")
+    return cast(Array, value)
+
+
+def _require_components(
+    config: Step7DynaConfig,
+    agent: object,
+    model: object,
+) -> tuple[DifferentialSARSAAgent, OneStepWorldModel]:
+    if type(agent) is not DifferentialSARSAAgent:
+        raise TypeError("agent must be an actual DifferentialSARSAAgent")
+    if type(model) is not OneStepWorldModel:
+        raise TypeError("model must be an actual OneStepWorldModel")
+    checked_agent = cast(DifferentialSARSAAgent, agent)
+    checked_model = cast(OneStepWorldModel, model)
+    if checked_agent.config != config.control.to_core_config():
+        raise ValueError("agent config must match Step 7 control config")
+    if checked_model.config != config.world_model.to_core_config():
+        raise ValueError("model config must match Step 7 world-model config")
+    return checked_agent, checked_model
+
+
+def _validate_step7_state(config: Step7DynaConfig, state: object) -> Step7DynaState:
+    if type(state) is not Step7DynaState:
+        raise TypeError("state must be an actual Step7DynaState")
+    checked = cast(Step7DynaState, state)
+    if type(checked.control_state) is not DifferentialSARSAState:
+        raise TypeError("state.control_state must be an actual DifferentialSARSAState")
+    if type(checked.world_model_state) is not WorldModelState:
+        raise TypeError("state.world_model_state must be an actual WorldModelState")
+    memory_size = config.planning_memory_size
+    observation_dim = config.world_model.observation_dim
+    _trusted_array(
+        "state.memory_observations",
+        checked.memory_observations,
+        shape=(memory_size, observation_dim),
+        dtype=jnp.float32,
+    )
+    _trusted_array(
+        "state.memory_next_observations",
+        checked.memory_next_observations,
+        shape=(memory_size, observation_dim),
+        dtype=jnp.float32,
+    )
+    _trusted_array(
+        "state.memory_actions", checked.memory_actions, shape=(memory_size,), dtype=jnp.int32
+    )
+    for name in ("memory_rewards", "memory_priorities", "memory_utilities"):
+        _trusted_array(
+            f"state.{name}", getattr(checked, name), shape=(memory_size,), dtype=jnp.float32
+        )
+    for name in ("memory_count", "memory_position", "step_count"):
+        _trusted_array(f"state.{name}", getattr(checked, name), shape=(), dtype=jnp.int32)
+    return checked
+
+
 def make_step7_components(
     config: Step7DynaConfig | None = None,
 ) -> tuple[DifferentialSARSAAgent, OneStepWorldModel]:
     """Create the Step 7 continuing-control agent and world model."""
-    cfg = config or Step7DynaConfig()
+    cfg = Step7DynaConfig() if config is None else config
+    if type(cfg) is not Step7DynaConfig:
+        raise TypeError("config must be an actual Step7DynaConfig")
     return (
         make_step6_differential_sarsa_agent(cfg.control),
         make_step8_world_model(cfg.world_model),
@@ -422,12 +605,29 @@ def init_step7_state(
     memory_size: int = 64,
 ) -> Step7DynaState:
     """Initialize and prime the Step 7 state."""
-    if memory_size < 1:
-        raise ValueError("memory_size must be positive")
-    control_key, model_key = jr.split(key)
-    feature_dim = int(jnp.ravel(initial_observation).shape[0])
+    if type(agent) is not DifferentialSARSAAgent:
+        raise TypeError("agent must be an actual DifferentialSARSAAgent")
+    if type(model) is not OneStepWorldModel:
+        raise TypeError("model must be an actual OneStepWorldModel")
+    memory_size = _require_int(
+        "memory_size", memory_size, minimum=1, maximum=_INT32_MAX - 1
+    )
+    feature_dim = model.config.observation_dim
+    if model.config.n_actions != agent.config.n_actions:
+        raise ValueError("model and agent action counts must match")
+    checked_key = _require_typed_key("key", key)
+    observation = _trusted_array(
+        "initial_observation",
+        initial_observation,
+        shape=(feature_dim,),
+        dtype=jnp.float32,
+    )
+    memory_scalars = 2 * memory_size * feature_dim + 4 * memory_size + 3
+    if memory_scalars > _INT32_MAX or 4 * memory_scalars > _INT32_MAX:
+        raise ValueError("derived Step 7 planning-memory bytes must fit signed int32")
+    control_key, model_key = jr.split(checked_key)
     control_state = agent.init(feature_dim, control_key)
-    control_state, _ = agent.start(control_state, initial_observation)
+    control_state, _ = agent.start(control_state, observation)
     return Step7DynaState(
         control_state=control_state,
         world_model_state=model.init(model_key),
@@ -738,6 +938,17 @@ def step7_update(
     next_observation: Array,
 ) -> Step7DynaUpdateResult:
     """Run one foreground real update plus bounded background planning."""
+    if type(config) is not Step7DynaConfig:
+        raise TypeError("config must be an actual Step7DynaConfig")
+    agent, model = _require_components(config, agent, model)
+    state = _validate_step7_state(config, state)
+    reward = _trusted_array("reward", reward, shape=(), dtype=jnp.float32)
+    next_observation = _trusted_array(
+        "next_observation",
+        next_observation,
+        shape=(config.world_model.observation_dim,),
+        dtype=jnp.float32,
+    )
     real_observation = state.control_state.last_observation
     real_action = state.control_state.last_action
     real_model_result = model.update(
@@ -1034,6 +1245,30 @@ def run_step7_scan(
     next_observations: Array,
 ) -> Step7DynaArrayResult:
     """Run Step 7 Dyna over real continuing transition arrays."""
+    if type(config) is not Step7DynaConfig:
+        raise TypeError("config must be an actual Step7DynaConfig")
+    agent, model = _require_components(config, agent, model)
+    state = _validate_step7_state(config, state)
+    actual_type = type(rewards)
+    if not (
+        actual_type is np.ndarray
+        or issubclass(actual_type, jax.Array)
+        or issubclass(actual_type, jax.core.Tracer)
+    ):
+        raise TypeError("rewards must be a trusted array")
+    try:
+        steps = int(rewards.shape[0])
+    except (AttributeError, IndexError, TypeError, ValueError) as error:
+        raise TypeError("rewards must expose trusted shape metadata") from error
+    if not 1 <= steps <= _INT32_MAX:
+        raise ValueError("rewards must contain between 1 and signed-int32 steps")
+    rewards = _trusted_array("rewards", rewards, shape=(steps,), dtype=jnp.float32)
+    next_observations = _trusted_array(
+        "next_observations",
+        next_observations,
+        shape=(steps, config.world_model.observation_dim),
+        dtype=jnp.float32,
+    )
 
     def scan_step(
         carry: Step7DynaState,
@@ -1097,10 +1332,19 @@ def run_step7_smoke(
     seed: int = 0,
 ) -> Step7SmokeResult:
     """Run a tiny deterministic Step 7 Dyna integration probe."""
-    if steps < 1:
-        raise ValueError("steps must be positive")
+    steps = _require_int("steps", steps, minimum=1, maximum=_INT32_MAX)
+    seed = require_jax_seed(seed, name="seed")
 
-    cfg = config or Step7DynaConfig()
+    cfg = Step7DynaConfig() if config is None else config
+    if type(cfg) is not Step7DynaConfig:
+        raise TypeError("config must be an actual Step7DynaConfig")
+    smoke_scalars = (steps + 1) * cfg.world_model.observation_dim + steps
+    planning_outputs = steps * cfg.planning_steps * 9
+    if any(
+        count > _INT32_MAX or 4 * count > _INT32_MAX
+        for count in (smoke_scalars, planning_outputs, smoke_scalars + planning_outputs)
+    ):
+        raise ValueError("derived Step 7 smoke float32 resources exceed signed-int32 bounds")
     agent, model = make_step7_components(cfg)
     data_key, state_key = jr.split(jr.key(seed))
     observations = jr.normal(
