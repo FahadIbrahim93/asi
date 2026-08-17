@@ -3330,6 +3330,8 @@ def test_fixed_budget_float32_sink_rejects_exact_nonzero_underflow() -> None:
     tiny = np.nextafter(np.longdouble(0), np.longdouble(1))
     with pytest.raises(ValueError, match="step_size_output must remain nonzero"):
         FixedBudgetFeatureLearner(n_features=2, n_tasks=1, step_size_output=tiny)
+    with pytest.raises(ValueError, match="step_size_output must remain nonzero"):
+        FixedBudgetFeatureLearner(n_features=2, n_tasks=1, step_size_output=1.0e-50)
     learner = FixedBudgetFeatureLearner(n_features=2, n_tasks=1, step_size_output=-0.0)
     assert learner.to_config()["step_size_output"] == 0.0
 
@@ -3343,6 +3345,23 @@ def test_fixed_budget_from_config_preserves_historical_forms_and_round_trip() ->
     malformed["n_features"] = np.int64(3)
     compatible = FixedBudgetFeatureLearner.from_config(malformed)
     assert compatible.n_features == 3
+
+    wrong_marker = learner.to_config()
+    wrong_marker["type"] = "AnotherLearner"
+    with pytest.raises(ValueError, match="type is unsupported"):
+        FixedBudgetFeatureLearner.from_config(wrong_marker)
+
+
+def test_fixed_budget_to_config_canonicalizes_numpy_decay_scalars() -> None:
+    learner = FixedBudgetFeatureLearner(
+        n_features=2,
+        n_tasks=1,
+        utility_decay=np.float64(0.9),
+        utility_retention_decay=np.float64(0.95),
+    )
+
+    assert type(learner.to_config()["utility_decay"]) is float
+    assert type(learner.to_config()["utility_retention_decay"]) is float
 
 
 def test_fixed_budget_init_preflights_aggregate_allocation(monkeypatch: pytest.MonkeyPatch) -> None:

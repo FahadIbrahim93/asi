@@ -88,7 +88,7 @@ def _saturating_int32_increment(value: Array) -> Array:
 def validated_float32_scalar(name: str, value: object, **domain: Any) -> float:
     """Validate a float32 sink and reject exact nonzero values that collapse to zero."""
     stored, numerator, _ = validated_float32_scalar_with_ratio(name, value, **domain)
-    if numerator != 0 and stored == 0.0:
+    if numerator != 0 and float(np.float32(stored)) == 0.0:
         raise ValueError(f"{name} must remain nonzero once narrowed to float32")
     return stored
 
@@ -337,11 +337,11 @@ class FixedBudgetFeatureLearner:
         step_size_feature = validated_float32_scalar(
             "step_size_feature", step_size_feature, lower=0.0
         )
-        utility_decay_config = utility_decay
         utility_decay = canonical_float32_ema_decay(
             "utility_decay",
             utility_decay,
         )
+        utility_decay_config = utility_decay
         promotion_margin = validated_float32_scalar(
             "promotion_margin", promotion_margin, positive=True
         )
@@ -404,7 +404,6 @@ class FixedBudgetFeatureLearner:
         future_utility_rare_task_power = validated_float32_scalar(
             "future_utility_rare_task_power", future_utility_rare_task_power, lower=0.0
         )
-        utility_retention_decay_config = utility_retention_decay
         if utility_retention_decay is not None:
             utility_retention_decay = canonical_float32_ema_decay(
                 "utility_retention_decay",
@@ -412,6 +411,7 @@ class FixedBudgetFeatureLearner:
             )
             if utility_retention_decay < utility_decay:
                 raise ValueError("utility_retention_decay must be in [utility_decay, 1) when set")
+        utility_retention_decay_config = utility_retention_decay
 
         if type(generator_mix) is not tuple or len(generator_mix) != 3:
             raise ValueError("generator_mix must have three entries")
@@ -596,7 +596,11 @@ class FixedBudgetFeatureLearner:
             raise ValueError("config must be a readable mapping") from error
         if any(type(key) is not str for key in config):
             raise ValueError("config keys must be strings")
-        config.pop("type", None)
+        marker = config.pop("type", None)
+        if marker is not None and (
+            type(marker) is not str or marker != "FixedBudgetFeatureLearner"
+        ):
+            raise ValueError("config type is unsupported")
         # replace_fraction was serialized by older versions but never read by
         # the update path; drop it so old configs keep loading.
         config.pop("replace_fraction", None)
