@@ -490,29 +490,25 @@ def test_step12_rejects_pseudo_reward_scale_that_overflows_float32(value: float)
 
 
 @pytest.mark.parametrize(
-    ("field", "value", "expected"),
+    ("field", "expected"),
     [
-        ("cerebellum_step_size", 1.0e-50, "cerebellum_step_size"),
-        (
-            "subtask_specs",
-            (SubtaskSpec(feature_index=0, threshold=1.0e-50),),
-            "threshold",
-        ),
-        (
-            "subtask_specs",
-            (SubtaskSpec(feature_index=0, pseudo_reward_scale=1.0e-50),),
-            "pseudo_reward_scale",
-        ),
+        ("cerebellum_step_size", "cerebellum_step_size"),
+        ("threshold", "threshold"),
+        ("pseudo_reward_scale", "pseudo_reward_scale"),
     ],
     ids=("cerebellum_step_size", "threshold", "pseudo_reward_scale"),
 )
 def test_step12_strict_positive_fields_reject_float32_zero_collapse(
     field: str,
-    value: object,
     expected: str,
 ) -> None:
     with pytest.raises(ValueError, match=expected):
-        _config_with(**{field: value})
+        if field == "cerebellum_step_size":
+            _config_with(cerebellum_step_size=1.0e-50)
+        else:
+            _config_with(
+                subtask_specs=(SubtaskSpec(feature_index=0, **{field: 1.0e-50}),),
+            )
 
 
 def test_step12_float32_underflow_and_finite_boundaries_are_canonical() -> None:
