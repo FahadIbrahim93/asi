@@ -194,3 +194,42 @@ def test_config_normalizes_hostile_mapping_failure() -> None:
 
     with pytest.raises(ValueError, match="could not be read"):
         FixedBudgetInteractionLearner.from_config(HostileMapping())
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "step_size_output",
+        "obgd_kappa",
+        "utility_decay",
+        "promotion_blend",
+        "future_utility_mix",
+        "task_activity_decay",
+        "scale_normalizer_decay",
+        "scale_normalizer_epsilon",
+    ],
+)
+def test_leftover_constructor_scalars_reject_bool_and_nonfinite(field: str) -> None:
+    for invalid in (True, False, np.bool_(True), float("nan"), float("inf")):
+        with pytest.raises(ValueError, match=field):
+            _construct(**{field: invalid})
+
+
+def test_leftover_constructor_scalars_keep_legal_floats() -> None:
+    learner = _construct(
+        step_size_output=0.0,
+        obgd_kappa=2.0,
+        utility_decay=0.0,
+        promotion_blend=1.0,
+        future_utility_mix=0.0,
+        task_activity_decay=0.0,
+        scale_normalizer_decay=0.0,
+        scale_normalizer_epsilon=1e-6,
+    )
+    payload = learner.to_config()
+    assert payload["step_size_output"] == 0.0
+    assert payload["obgd_kappa"] == 2.0
+    assert payload["utility_decay"] == 0.0
+    assert payload["promotion_blend"] == 1.0
+    assert type(payload["step_size_output"]) is float
+    assert type(payload["obgd_kappa"]) is float
