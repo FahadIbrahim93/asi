@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -95,10 +96,19 @@ def test_final_window_zero_is_not_replaced_by_protocol_default() -> None:
     assert resolved == 0
 
 
-def test_main_passes_explicit_final_window_to_config() -> None:
-    import inspect
-
-    source = inspect.getsource(forager_cli.main)
-    assert "_explicit_int_or_default(" in source
-    assert "args.final_window, protocol.final_window_steps" in source
-    assert "args.final_window or protocol.final_window_steps" not in source
+def test_main_rejects_final_window_zero(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "forager_cli.py",
+            "--preset",
+            "field_of_view",
+            "--steps",
+            "10",
+            "--final-window",
+            "0",
+        ],
+    )
+    with pytest.raises(ValueError, match="final_window"):
+        forager_cli.main()

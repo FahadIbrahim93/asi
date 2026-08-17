@@ -917,6 +917,7 @@ def validate_environment_runtime_profile(
         or shadow["tmp_src_entries"] != []
         or shadow["tmp_src_exists"] is not True
         or shadow["tmp_src_is_mount"] is not True
+        or type(shadow["tmp_src_mode"]) is not int
         or shadow["tmp_src_mode"] != 0o555
         or shadow["tmp_src_writable"] is not False
         or shadow["trusted_source_path_in_base_sys_path"] is not False
