@@ -1040,7 +1040,13 @@ def _inspect_image(docker: str, image_id: str) -> dict[str, Any]:
         detail = capture.stderr.decode("utf-8", errors="replace").strip()
         raise ScreenError(f"cannot inspect exact OCI image {image_id}: {detail}")
     try:
-        value = json.loads(capture.stdout.decode("utf-8"))
+        value = json.loads(
+            capture.stdout.decode("utf-8"),
+            parse_constant=_reject_nonfinite_json_number,
+            parse_float=_parse_finite_json_float,
+        )
+    except ScreenError:
+        raise
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ScreenError("docker image inspect returned invalid JSON") from error
     if not isinstance(value, list) or len(value) != 1 or not isinstance(value[0], dict):
