@@ -293,3 +293,121 @@ class TestConfig:
         assert restored.raw_dim == 8
         assert restored.n_candidates == 12
         assert restored.enabled is True
+
+
+@pytest.mark.parametrize(
+    "integer_type",
+    [
+        np.int8,
+        np.int16,
+        np.int32,
+        np.int64,
+        np.longlong,
+        np.uint8,
+        np.uint16,
+        np.uint32,
+        np.uint64,
+        np.ulonglong,
+    ],
+)
+def test_cumulant_discovery_canonicalizes_numpy_integer_family(integer_type) -> None:
+    discovery = CumulantDiscovery(
+        raw_dim=integer_type(4),
+        n_candidates=integer_type(3),
+        maturity_threshold=integer_type(2),
+    )
+
+    assert type(discovery.raw_dim) is int
+    assert type(discovery.n_candidates) is int
+    assert type(discovery._maturity_threshold) is int
+
+
+@pytest.mark.parametrize("field", ["raw_dim", "n_candidates", "maturity_threshold"])
+def test_cumulant_discovery_rejects_hostile_integer_subclasses(field: str) -> None:
+    class HostileInt(int):
+        def __index__(self) -> int:
+            raise AssertionError("untrusted index hook executed")
+
+        def __repr__(self) -> str:
+            raise AssertionError("untrusted repr hook executed")
+
+    kwargs = {"raw_dim": 4, "n_candidates": 3, field: HostileInt(2)}
+    with pytest.raises(ValueError, match=field):
+        CumulantDiscovery(**kwargs)
+
+
+@pytest.mark.parametrize(
+    "field", ["decay_rate", "replacement_rate", "predictor_step_size", "gamma"]
+)
+def test_cumulant_discovery_float_hook_runs_once(field: str) -> None:
+    class CountingFloat(float):
+        def __new__(cls):
+            instance = super().__new__(cls, 0.5)
+            instance.calls = 0
+            return instance
+
+        def as_integer_ratio(self) -> tuple[int, int]:
+            self.calls += 1
+            return (1, 2)
+
+    value = CountingFloat()
+    discovery = CumulantDiscovery(raw_dim=4, **{field: value})
+
+    assert value.calls == 1
+    assert type(getattr(discovery, f"_{field}")) is float
+
+
+def test_cumulant_discovery_hostile_float_failure_never_formats_repr() -> None:
+    class ExplodingFloat(float):
+        def as_integer_ratio(self) -> tuple[int, int]:
+            raise RuntimeError("hostile ratio")
+
+        def __repr__(self) -> str:
+            raise AssertionError("untrusted repr hook executed")
+
+    with pytest.raises(ValueError, match="decay_rate"):
+        CumulantDiscovery(raw_dim=4, decay_rate=ExplodingFloat(0.5))
+
+
+def test_cumulant_discovery_resource_formula_matches_state() -> None:
+    discovery = CumulantDiscovery(raw_dim=5, n_candidates=3)
+    state = discovery.init(jr.key(0))
+    actual_bytes = sum(int(leaf.nbytes) for leaf in jax.tree_util.tree_leaves(state))
+
+    assert discovery.persistent_resource_budget["persistent_bytes"] == actual_bytes
+
+
+def test_cumulant_discovery_resource_boundary_is_allocation_free() -> None:
+    last_valid_dim = ((256 * 1024 * 1024 // 4) - 5) // 2
+    discovery = CumulantDiscovery(raw_dim=last_valid_dim, n_candidates=1)
+    assert discovery.persistent_resource_budget["persistent_bytes"] <= 256 * 1024 * 1024
+    with pytest.raises(ValueError, match="256 MiB"):
+        CumulantDiscovery(raw_dim=last_valid_dim + 1, n_candidates=1)
+
+
+def test_cumulant_discovery_config_schema_is_exact_json() -> None:
+    config = CumulantDiscovery(raw_dim=4).to_config()
+    config["raw_dim"] = np.int32(4)
+    with pytest.raises(ValueError, match="exact JSON integer"):
+        CumulantDiscovery.from_config(config)
+
+    config = CumulantDiscovery(raw_dim=4).to_config()
+    config["unknown"] = 1
+    with pytest.raises(ValueError, match="exact schema"):
+        CumulantDiscovery.from_config(config)
+
+    class ConfigSubclass(dict):
+        pass
+
+    with pytest.raises(ValueError, match="exact dictionary"):
+        CumulantDiscovery.from_config(ConfigSubclass())
+
+
+def test_cumulant_discovery_age_saturates_at_int32_max() -> None:
+    discovery = CumulantDiscovery(raw_dim=2, n_candidates=1)
+    state = discovery.init(jr.key(0)).replace(
+        ages=jnp.asarray([2**31 - 1], dtype=jnp.int32)
+    )
+    advanced = discovery.step(state, jnp.ones(2), jnp.ones(2))
+
+    assert int(advanced.ages[0]) == 2**31 - 1
