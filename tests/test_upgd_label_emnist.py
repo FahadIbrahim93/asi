@@ -870,3 +870,48 @@ class TestPlanShardFloatAliasIntake:
         atomic_write_new_json(path, payload)
         with pytest.raises(ValueError, match="differ from the plan"):
             merge_partials(plan, [path], allow_incomplete=True)
+
+
+def _legal_label_emnist_run_result(**overrides: object) -> LabelEMNISTRunResult:
+    payload: dict[str, object] = {
+        "learner": "adamw",
+        "hyperparameters": dict(ADAMW_PROTOCOL_HYPERPARAMETERS),
+        "seeds": (0,),
+        "config": TINY,
+        "per_task_accuracy": np.zeros((1, TINY.n_tasks)),
+        "per_task_loss": np.zeros((1, TINY.n_tasks)),
+        "per_task_plasticity": np.zeros((1, TINY.n_tasks)),
+        "average_online_accuracy": np.zeros((1,)),
+        "wall_clock_seconds": 1.0,
+    }
+    payload.update(overrides)
+    return LabelEMNISTRunResult(**payload)  # type: ignore[arg-type]
+
+
+def test_label_emnist_run_result_rejects_leftover_identities() -> None:
+    """Public Label-EMNIST result records must not keep leftover bool/NaN identities."""
+
+    with pytest.raises(ValueError, match="wall_clock_seconds"):
+        _legal_label_emnist_run_result(wall_clock_seconds=True)
+    with pytest.raises(ValueError, match="wall_clock_seconds"):
+        _legal_label_emnist_run_result(wall_clock_seconds=float("nan"))
+    with pytest.raises(ValueError, match="wall_clock_seconds"):
+        _legal_label_emnist_run_result(wall_clock_seconds=float("inf"))
+    with pytest.raises(ValueError, match="learner"):
+        _legal_label_emnist_run_result(learner=True)
+    with pytest.raises(ValueError, match="seeds"):
+        _legal_label_emnist_run_result(seeds=(True,))
+
+    legal = _legal_label_emnist_run_result()
+    dumped = json.dumps(
+        {
+            "learner": legal.learner,
+            "seeds": list(legal.seeds),
+            "wall_clock_seconds": legal.wall_clock_seconds,
+        },
+        allow_nan=False,
+    )
+    assert '"wall_clock_seconds": 1.0' in dumped
+    assert '"wall_clock_seconds": true' not in dumped
+    assert '"learner": true' not in dumped
+    assert '"seeds": [true]' not in dumped
