@@ -793,13 +793,9 @@ def test_config_rejects_objects_that_only_spoof_float_through_class(field: str) 
         _strict_memory(**{field: _FloatSpoof()})
 
 
-def test_config_accepts_honest_float_subclasses_as_canonical_floats() -> None:
-    memory = _strict_memory(surprise_weight=_LyingFloat(0.5, (1, 2)))
-    assert type(memory.config.surprise_weight) is float
-    assert memory.config.surprise_weight == 0.5
-    payload = memory.to_config()
-    json.dumps(payload, allow_nan=False)
-    assert DualReplayMemory.from_config(payload).config == memory.config
+def test_config_rejects_float_subclass_even_with_honest_ratio() -> None:
+    with pytest.raises(ValueError, match="surprise_weight"):
+        _strict_memory(surprise_weight=_LyingFloat(0.5, (1, 2)))
 
 
 @pytest.mark.parametrize("field", _FLOAT32_SCALARS)

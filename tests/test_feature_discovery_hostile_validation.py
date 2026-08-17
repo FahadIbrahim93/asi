@@ -1,5 +1,8 @@
 """Hostile validation for streams/feature_discovery sink gates."""
 
+import jax
+import jax.numpy as jnp
+import jax.random as jr
 import numpy as np
 import pytest
 
@@ -7,6 +10,8 @@ from alberta_framework.streams.feature_discovery import (
     InteractionFeatureDiscoveryStream,
     NonlinearFeatureDiscoveryStream,
 )
+
+_INT32_MAX = 2**31 - 1
 
 
 class _EvilStr(str):
@@ -27,6 +32,27 @@ class _HostileFloat(float):
     def as_integer_ratio(self):  # type: ignore[override]
         type(self).calls += 1
         raise AssertionError("HostileFloat hook must not leak via !r")
+
+
+class _HostileInt(int):
+    calls = 0
+
+    @property
+    def __class__(self) -> type[int]:  # pragma: no cover
+        type(self).calls += 1
+        raise AssertionError("class hook")
+
+    def __int__(self) -> int:  # pragma: no cover
+        type(self).calls += 1
+        raise AssertionError("int hook")
+
+    def __index__(self) -> int:  # pragma: no cover
+        type(self).calls += 1
+        raise AssertionError("index hook")
+
+    def __repr__(self) -> str:  # pragma: no cover
+        type(self).calls += 1
+        raise AssertionError("repr hook")
 
     def __float__(self) -> float:  # type: ignore[override]
         type(self).calls += 1
@@ -65,6 +91,35 @@ def test_rejects_bool_and_hostile_int_for_feature_dim() -> None:
     _HostileInt.calls = 0
     with pytest.raises(ValueError, match="must be an integer"):
         NonlinearFeatureDiscoveryStream(feature_dim=_HostileInt(4))
+    assert _HostileInt.calls == 0
+
+
+@pytest.mark.parametrize(
+    ("factory", "field"),
+    [
+        (NonlinearFeatureDiscoveryStream, "feature_dim"),
+        (NonlinearFeatureDiscoveryStream, "n_tasks"),
+        (NonlinearFeatureDiscoveryStream, "n_latents"),
+        (NonlinearFeatureDiscoveryStream, "n_contexts"),
+        (NonlinearFeatureDiscoveryStream, "context_length"),
+        (NonlinearFeatureDiscoveryStream, "active_latents_per_context"),
+        (InteractionFeatureDiscoveryStream, "feature_dim"),
+        (InteractionFeatureDiscoveryStream, "n_tasks"),
+        (InteractionFeatureDiscoveryStream, "n_contexts"),
+        (InteractionFeatureDiscoveryStream, "context_length"),
+        (InteractionFeatureDiscoveryStream, "active_pairs_per_context"),
+    ],
+)
+def test_every_integer_field_rejects_subclass_without_hooks(
+    factory: type[NonlinearFeatureDiscoveryStream] | type[InteractionFeatureDiscoveryStream],
+    field: str,
+) -> None:
+    _HostileInt.calls = 0
+    kwargs: dict[str, object] = {field: _HostileInt(4)}
+    if field != "feature_dim":
+        kwargs["feature_dim"] = 4
+    with pytest.raises(ValueError, match=field):
+        factory(**kwargs)  # type: ignore[arg-type]
     assert _HostileInt.calls == 0
 
 
@@ -126,3 +181,115 @@ def test_float_subclass_with_lying_ratio_is_rejected() -> None:
 
     with pytest.raises(ValueError, match="must narrow to a finite float32"):
         NonlinearFeatureDiscoveryStream(feature_dim=4, feature_std=RatioFloat(0.5))  # type: ignore[arg-type]
+
+
+def test_derived_nonlinear_resources_fail_before_allocation() -> None:
+    with pytest.raises(ValueError, match="context weight count"):
+        NonlinearFeatureDiscoveryStream(
+            feature_dim=2,
+            n_tasks=50_000,
+            n_latents=50_000,
+            n_contexts=2,
+        )
+    with pytest.raises(ValueError, match="latent weight bytes"):
+        NonlinearFeatureDiscoveryStream(
+            feature_dim=20_000,
+            n_tasks=1,
+            n_latents=50_000,
+            n_contexts=1,
+        )
+
+
+@pytest.mark.parametrize(
+    ("feature_dim", "include_squares"),
+    [(65_536, True), (65_537, False)],
+)
+def test_interaction_pair_count_fails_before_python_pair_construction(
+    feature_dim: int, include_squares: bool
+) -> None:
+    with pytest.raises(ValueError, match="pair count"):
+        InteractionFeatureDiscoveryStream(
+            feature_dim=feature_dim,
+            include_squares=include_squares,
+        )
+
+
+def test_interaction_derived_context_resources_fail_before_allocation() -> None:
+    with pytest.raises(ValueError, match="context weight count"):
+        InteractionFeatureDiscoveryStream(
+            feature_dim=100,
+            n_tasks=50_000,
+            n_contexts=50_000,
+        )
+
+
+def test_collect_rejects_hostile_duck_stream_without_attribute_hooks() -> None:
+    calls = 0
+
+    class HostileStream:
+        @property
+        def __class__(self) -> type[NonlinearFeatureDiscoveryStream]:  # pragma: no cover
+            nonlocal calls
+            calls += 1
+            raise AssertionError("class hook")
+
+        def __getattribute__(self, name: str) -> object:  # pragma: no cover
+            if name != "__class__":
+                nonlocal calls
+                calls += 1
+                raise AssertionError("attribute hook")
+            return super().__getattribute__(name)
+
+    from alberta_framework.streams.feature_discovery import collect_feature_discovery_stream
+
+    with pytest.raises(TypeError, match="exact feature-discovery stream"):
+        collect_feature_discovery_stream(HostileStream(), 1, jr.key(0))
+    assert calls == 0
+
+
+def test_collect_preflights_output_resource_total() -> None:
+    from alberta_framework.streams.feature_discovery import collect_feature_discovery_stream
+
+    stream = NonlinearFeatureDiscoveryStream(feature_dim=4, n_tasks=1)
+    with pytest.raises(ValueError, match="output (count|bytes)"):
+        collect_feature_discovery_stream(stream, _INT32_MAX, jr.key(0))
+
+
+@pytest.mark.parametrize(
+    "factory", [NonlinearFeatureDiscoveryStream, InteractionFeatureDiscoveryStream]
+)
+def test_init_requires_scalar_typed_threefry_key(
+    factory: type[NonlinearFeatureDiscoveryStream] | type[InteractionFeatureDiscoveryStream],
+) -> None:
+    stream = factory(feature_dim=4)
+    for bad in (jnp.asarray([0, 1], dtype=jnp.uint32), jnp.asarray(0, dtype=jnp.int32)):
+        with pytest.raises(TypeError, match="Threefry"):
+            stream.init(bad)
+
+
+@pytest.mark.parametrize(
+    "factory", [NonlinearFeatureDiscoveryStream, InteractionFeatureDiscoveryStream]
+)
+def test_eager_and_jit_transactions_match_and_validate_static_contracts(
+    factory: type[NonlinearFeatureDiscoveryStream] | type[InteractionFeatureDiscoveryStream],
+) -> None:
+    stream = factory(feature_dim=4, n_tasks=2, n_contexts=2)
+    state = stream.init(jr.key(7))
+    idx = jnp.asarray(0, dtype=jnp.int32)
+    eager_timestep, eager_state = stream.step(state, idx)
+    jit_timestep, jit_state = jax.jit(stream.step)(state, idx)
+    np.testing.assert_array_equal(eager_timestep.observation, jit_timestep.observation)
+    np.testing.assert_array_equal(eager_timestep.target, jit_timestep.target)
+    np.testing.assert_array_equal(eager_state.step_count, jit_state.step_count)
+
+    with pytest.raises(ValueError, match="idx"):
+        stream.step(state, jnp.asarray(0.0, dtype=jnp.float32))
+
+
+def test_step_rejects_wrong_state_array_before_jax_computation() -> None:
+    stream = NonlinearFeatureDiscoveryStream(feature_dim=4, n_latents=3)
+    state = stream.init(jr.key(0)).replace(
+        latent_weights=jnp.zeros((3, 4), dtype=jnp.int32)
+    )
+    with pytest.raises(ValueError, match="latent_weights"):
+        stream.step(state, jnp.asarray(0, dtype=jnp.int32))

@@ -180,7 +180,7 @@ def test_associative_float_validators_reject_hostile_ratio() -> None:
 
     with pytest.raises(ValueError, match="write_lr"):
         _base_cfg(write_lr=HostileFloat(1.0))  # type: ignore[arg-type]
-    assert HostileFloat.calls == 1
+    assert HostileFloat.calls == 0
 
 
 def test_associative_dimensions_preflight_without_allocation() -> None:
