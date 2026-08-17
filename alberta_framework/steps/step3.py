@@ -20,11 +20,13 @@ from dataclasses import asdict, dataclass, fields
 from typing import Any, Literal, SupportsIndex, cast
 
 import chex
+import jax
 import jax.numpy as jnp
 import jax.random as jr
 import numpy as np
 from jax import Array
 
+from alberta_framework._seed_validation import require_jax_seed
 from alberta_framework.core.horde import (
     HordeLearner,
     HordeLearningResult,
@@ -66,6 +68,97 @@ _ACTUAL_INT_TYPES = frozenset(
     }
 )
 _FLOAT32_MIN_NORMAL = float.fromhex("0x1.0p-126")
+_STEP3_CONFIG_FIELDS = frozenset(
+    {
+        "gammas",
+        "lamdas",
+        "hidden_sizes",
+        "step_size",
+        "use_obgd",
+        "obgd_kappa",
+        "normalizer",
+        "sparsity",
+        "use_layer_norm",
+        "trace_mode",
+        "routing",
+    }
+)
+
+
+def _require_exact_str(name: str, value: object) -> str:
+    if type(value) is not str:
+        raise ValueError(f"{name} must be an exact string")
+    return value
+
+
+def _require_float32_matrix(name: str, value: object) -> Array:
+    """Require trusted matrix metadata before any JAX coercion or hooks."""
+    actual_type = type(value)
+    if not (
+        issubclass(actual_type, jax.Array)
+        or issubclass(actual_type, jax.core.Tracer)
+    ):
+        raise ValueError(f"{name} must be a JAX array")
+    array = cast(Array, value)
+    if array.ndim != 2:
+        raise ValueError(f"{name} must be 2D")
+    if array.dtype != jnp.float32:
+        raise ValueError(f"{name} must have dtype float32")
+    return array
+
+
+def _require_float32_vector(name: str, value: object) -> Array:
+    """Require one trusted float32 vector without coercion."""
+    actual_type = type(value)
+    if not (
+        issubclass(actual_type, jax.Array)
+        or issubclass(actual_type, jax.core.Tracer)
+    ):
+        raise ValueError(f"{name} must be a JAX array")
+    array = cast(Array, value)
+    if array.ndim != 1:
+        raise ValueError(f"{name} must be 1D")
+    if array.dtype != jnp.float32:
+        raise ValueError(f"{name} must have dtype float32")
+    return array
+
+
+def _require_typed_key(name: str, value: object) -> Array:
+    """Require one scalar typed JAX PRNG key without legacy laundering."""
+    actual_type = type(value)
+    if not (
+        issubclass(actual_type, jax.Array)
+        or issubclass(actual_type, jax.core.Tracer)
+    ):
+        raise ValueError(f"{name} must be a typed JAX PRNG key")
+    key = cast(Array, value)
+    if key.shape != () or not jax.dtypes.issubdtype(  # type: ignore[attr-defined]
+        key.dtype, jax.dtypes.prng_key
+    ):
+        raise ValueError(f"{name} must be a scalar typed JAX PRNG key")
+    return key
+
+
+def _require_handoff_resources(
+    *,
+    steps: int,
+    raw_dim: int,
+    constructed_dim: int,
+    n_demons: int,
+) -> int:
+    """Preflight exact derived handoff shapes and newly allocated bytes."""
+    feature_dim = raw_dim + constructed_dim
+    logical_scalars = steps * (2 * feature_dim + n_demons)
+    allocated_bytes = 8 * steps * feature_dim
+    if feature_dim > _INT32_MAX:
+        raise ValueError("derived Step 3 feature_dim must fit signed int32")
+    if logical_scalars > _INT32_MAX:
+        raise ValueError("derived Step 3 handoff scalars must fit signed int32")
+    if allocated_bytes > _INT32_MAX:
+        raise ValueError("derived Step 3 handoff allocation bytes must fit signed int32")
+    return feature_dim
+
+
 Step3RoutingName = Literal["shared", "independent", "mixed"]
 
 
@@ -113,12 +206,29 @@ class Step3HordeConfig:
         """Reconstruct from :meth:`to_dict` output."""
         if type(payload) is not dict:
             raise ValueError("Step 3 config must be an actual dict")
+        if any(type(key) is not str for key in payload):
+            raise ValueError("Step3HordeConfig keys must be exact strings")
         expected = {field.name for field in fields(cls)}
         if set(payload) != expected:
             raise ValueError("Step 3 config fields do not match its schema")
         for name in ("gammas", "lamdas", "hidden_sizes"):
             if type(payload[name]) is not list:
                 raise ValueError(f"serialized {name} must be a JSON array")
+        if any(type(value) is not float for value in cast(list[object], payload["gammas"])):
+            raise ValueError("serialized gammas values must be JSON numbers")
+        if any(type(value) is not float for value in cast(list[object], payload["lamdas"])):
+            raise ValueError("serialized lamdas values must be JSON numbers")
+        if any(type(value) is not int for value in cast(list[object], payload["hidden_sizes"])):
+            raise ValueError("serialized hidden_sizes values must be JSON integers")
+        for name in ("step_size", "obgd_kappa", "sparsity"):
+            if type(payload[name]) is not float:
+                raise ValueError(f"serialized {name} must be a JSON number")
+        for name in ("use_obgd", "use_layer_norm"):
+            if type(payload[name]) is not bool:
+                raise ValueError(f"{name} must be a boolean")
+        for name in ("normalizer", "trace_mode", "routing"):
+            if type(payload[name]) is not str:
+                raise ValueError(f"serialized {name} must be a JSON string")
         config = dict(payload)
         config["gammas"] = tuple(cast(list[float], config["gammas"]))
         config["lamdas"] = tuple(cast(list[float], config["lamdas"]))
@@ -139,6 +249,27 @@ class Step3HandoffArrays:
     observations: Array
     cumulants: Array
     next_observations: Array
+
+    def __post_init__(self) -> None:
+        """Authenticate exact array identities and cross-field dimensions."""
+        observations = _require_float32_matrix("observations", self.observations)
+        cumulants = _require_float32_matrix("cumulants", self.cumulants)
+        next_observations = _require_float32_matrix(
+            "next_observations", self.next_observations
+        )
+        steps, feature_dim = observations.shape
+        if steps < 1 or feature_dim < 1:
+            raise ValueError("observations must have positive row and feature dimensions")
+        if cumulants.shape[0] != steps or cumulants.shape[1] < 1:
+            raise ValueError("cumulants must match observation rows and have demons")
+        if next_observations.shape != observations.shape:
+            raise ValueError("next_observations must match observations exactly")
+        _require_handoff_resources(
+            steps=steps,
+            raw_dim=feature_dim,
+            constructed_dim=0,
+            n_demons=cumulants.shape[1],
+        )
 
     @property
     def feature_dim(self) -> int:
@@ -290,6 +421,8 @@ def _require_choice(name: str, value: object, choices: Sequence[str]) -> str:
 
 
 def _validate_horde_config(config: Step3HordeConfig) -> None:
+    if type(config) is not Step3HordeConfig:
+        raise ValueError("config must be an exact Step3HordeConfig")
     for name in ("gammas", "lamdas", "hidden_sizes"):
         if type(getattr(config, name)) is not tuple:
             raise ValueError(f"{name} must be an actual tuple")
@@ -335,6 +468,7 @@ def make_step3_normalizer(
     config: Step3HordeConfig,
 ) -> Normalizer[Any] | None:
     """Construct the configured Step 3 input normalizer."""
+    _validate_horde_config(config)
     if config.normalizer == "none":
         return None
     if config.normalizer == "ema":
@@ -345,7 +479,7 @@ def make_step3_normalizer(
 
 def make_step3_horde_spec(config: Step3HordeConfig | None = None) -> Any:
     """Create the GVF metadata used by the production Horde."""
-    cfg = config or Step3HordeConfig()
+    cfg = Step3HordeConfig() if config is None else config
     _validate_horde_config(cfg)
     demons = [
         GVFSpec(
@@ -377,7 +511,7 @@ def make_step3_horde(
       constraint while keeping memory cost low when most demons are
       single-step (gamma*lamda=0).
     """
-    cfg = config or Step3HordeConfig()
+    cfg = Step3HordeConfig() if config is None else config
     _validate_horde_config(cfg)
     bounder = ObGDBounding(kappa=cfg.obgd_kappa) if cfg.use_obgd else None
     common_kwargs: dict[str, Any] = {
@@ -407,6 +541,10 @@ def init_step3_state(
     key: Array,
 ) -> MultiHeadMLPState:
     """Initialize a Step 3 Horde state."""
+    if type(horde) is not HordeLearner:
+        raise ValueError("horde must be an exact HordeLearner")
+    feature_dim = _require_positive_int("feature_dim", feature_dim)
+    key = _require_typed_key("key", key)
     return horde.init(feature_dim, key)
 
 
@@ -416,6 +554,11 @@ def step3_predict(
     features: Array,
 ) -> Array:
     """Return one prediction per Step 3 demon."""
+    if type(horde) is not HordeLearner:
+        raise ValueError("horde must be an exact HordeLearner")
+    if type(state) is not MultiHeadMLPState:
+        raise ValueError("state must be an exact MultiHeadMLPState")
+    features = _require_float32_vector("features", features)
     return cast(Array, horde.predict(state, features))
 
 
@@ -427,6 +570,17 @@ def step3_update(
     next_features: Array,
 ) -> Step3OneStepResult:
     """Run one Step 3 Horde transition update."""
+    if type(horde) is not HordeLearner:
+        raise ValueError("horde must be an exact HordeLearner")
+    if type(state) is not MultiHeadMLPState:
+        raise ValueError("state must be an exact MultiHeadMLPState")
+    features = _require_float32_vector("features", features)
+    cumulants = _require_float32_vector("cumulants", cumulants)
+    next_features = _require_float32_vector("next_features", next_features)
+    if next_features.shape != features.shape:
+        raise ValueError("next_features must match features")
+    if cumulants.shape != (horde.n_demons,):
+        raise ValueError("cumulants must match the configured demons")
     result: HordeUpdateResult = horde.update(
         state,
         features,
@@ -450,6 +604,17 @@ def run_step3_scan(
     next_features: Array,
 ) -> HordeLearningResult:
     """Run the Step 3 Horde over transition arrays."""
+    if type(horde) is not HordeLearner:
+        raise ValueError("horde must be an exact HordeLearner")
+    if type(state) is not MultiHeadMLPState:
+        raise ValueError("state must be an exact MultiHeadMLPState")
+    features = _require_float32_matrix("features", features)
+    cumulants = _require_float32_matrix("cumulants", cumulants)
+    next_features = _require_float32_matrix("next_features", next_features)
+    if next_features.shape != features.shape:
+        raise ValueError("next_features must match features")
+    if cumulants.shape != (features.shape[0], horde.n_demons):
+        raise ValueError("cumulants must match steps and configured demons")
     return run_horde_learning_loop(
         horde,
         state,
@@ -481,17 +646,11 @@ def build_step2_to_step3_arrays(
         TD target bootstraps on its own features — one boundary row out of
         ``steps``, kept so all arrays share the same length.
     """
-    raw = jnp.asarray(raw_observations, dtype=jnp.float32)
-    constructed = jnp.asarray(constructed_features, dtype=jnp.float32)
-    cums = jnp.asarray(cumulants, dtype=jnp.float32)
-
-    if raw.ndim != 2:
-        raise ValueError(f"raw_observations must be 2D, got shape {raw.shape}")
-    if constructed.ndim != 2:
-        msg = f"constructed_features must be 2D, got shape {constructed.shape}"
-        raise ValueError(msg)
-    if cums.ndim != 2:
-        raise ValueError(f"cumulants must be 2D, got shape {cums.shape}")
+    raw = _require_float32_matrix("raw_observations", raw_observations)
+    constructed = _require_float32_matrix(
+        "constructed_features", constructed_features
+    )
+    cums = _require_float32_matrix("cumulants", cumulants)
     steps = raw.shape[0]
     if steps < 1:
         raise ValueError("at least one transition is required")
@@ -511,6 +670,12 @@ def build_step2_to_step3_arrays(
             f"got {cums.shape[0]} and {steps}"
         )
         raise ValueError(msg)
+    _require_handoff_resources(
+        steps=steps,
+        raw_dim=raw.shape[1],
+        constructed_dim=constructed.shape[1],
+        n_demons=cums.shape[1],
+    )
 
     observations = jnp.concatenate([raw, constructed], axis=1)
     # Boundary row: the successor of the final observation is unobserved, so
@@ -553,7 +718,6 @@ def run_step3_smoke(
     It is not a feature-discovery or throughput claim.
     """
     steps = _require_int("steps", steps, minimum=1, maximum=_INT32_MAX)
-    seed = _require_int("seed", seed, minimum=0, maximum=_UINT32_MAX)
     final_window = _require_int(
         "final_window", final_window, minimum=1, maximum=_INT32_MAX
     )
@@ -566,11 +730,18 @@ def run_step3_smoke(
         minimum=0,
         maximum=_INT32_MAX,
     )
-    if final_window > steps:
-        raise ValueError("final_window must be at most steps")
+    seed = require_jax_seed(seed, name="seed")
+    if final_window < 1 or final_window > steps:
+        raise ValueError("final_window must be in [1, steps]")
 
-    cfg = config or Step3HordeConfig()
+    cfg = Step3HordeConfig() if config is None else config
     _validate_horde_config(cfg)
+    _require_handoff_resources(
+        steps=steps,
+        raw_dim=raw_feature_dim,
+        constructed_dim=constructed_feature_dim,
+        n_demons=cfg.n_demons,
+    )
     data_key, learner_key = jr.split(jr.key(seed))
     raw_observations = jr.normal(data_key, (steps, raw_feature_dim))
     constructed_features = _synthetic_step2_features(
