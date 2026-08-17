@@ -96,6 +96,7 @@ from alberta_framework.core.model_replay_rehearsal import (
     ModelReplayRehearsalConfig,
     RealModelReplayEvent,
 )
+from alberta_framework.core.multi_head_learner import _validate_direct_state_resources
 from alberta_framework.core.normalizers import _lifetime_counter_valid
 from alberta_framework.core.oak import (
     OaKAgent,
@@ -308,7 +309,9 @@ def _require_float32_resource(
     vector_scalars: int,
     fixed_scalars: int = 0,
 ) -> None:
-    total = int(vector_scalars) + int(fixed_scalars)
+    if vector_scalars < 0 or fixed_scalars < 0:
+        raise ValueError(f"{name} scalar counts must be non-negative")
+    total = vector_scalars + fixed_scalars
     if total > _INT32_MAX:
         raise ValueError(f"{name} scalar count must fit signed int32")
     if 4 * total > _INT32_MAX:
@@ -316,10 +319,10 @@ def _require_float32_resource(
 
 
 def _copy_mapping(payload: object, *, name: str) -> dict[str, Any]:
-    if not isinstance(payload, Mapping):
+    if not issubclass(type(payload), Mapping):
         raise ValueError(f"{name} payload must be a mapping")
     try:
-        data = dict(payload)
+        data = dict(cast(Mapping[str, Any], payload))
     except Exception as error:
         raise ValueError(f"{name} payload could not be read") from error
     for key in data:
@@ -393,9 +396,11 @@ class GRUPerceptionConfig:
     def from_config(cls, payload: dict[str, Any]) -> GRUPerceptionConfig:
         """Reconstruct from :meth:`to_config` output."""
         data = _copy_mapping(payload, name="GRUPerceptionConfig")
-        data.pop("type", None)
-        if data.keys() - {"observation_dim", "hidden_dim"}:
-            raise ValueError("GRUPerceptionConfig payload has unknown fields")
+        type_name = data.pop("type", None)
+        if type(type_name) is not str or type_name != "GRUPerceptionConfig":
+            raise ValueError("GRUPerceptionConfig payload type is invalid")
+        if set(data) != {"observation_dim", "hidden_dim"}:
+            raise ValueError("GRUPerceptionConfig payload fields are invalid")
         return cls(**data)
 
 
@@ -705,26 +710,18 @@ class PrototypeAgentConfig:
                 maximum=_INT32_MAX,
             ),
         )
-        # Derived allocations must fit signed int32 without allocating JAX arrays
-        _require_float32_resource(
-            "PrototypeAgent buffer",
-            vector_scalars=int(self.buffer_capacity) * int(self.oak.observation_dim),
-            fixed_scalars=2,
-        )
-        # Horde trunk/head scalars: sum hidden + products with obs_dim
-        obs_dim = int(self.oak.observation_dim)
-        horde_vector = 0
-        prev = obs_dim
-        for hidden in self.horde_hidden_sizes:
-            horde_vector += prev * int(hidden) + int(hidden)
-            prev = int(hidden)
-        # Horde heads: n_options * prev * n_actions approximated as n_options*prev
-        # Use conservative bound including option policies from OaK
-        n_options = int(self.oak.n_options)
-        if self.horde_spec is not None and n_options > 0 and prev > 0:
-            horde_vector += n_options * prev
-        if horde_vector:
-            _require_float32_resource("PrototypeAgent horde", vector_scalars=horde_vector)
+        if self.world_model is not None:
+            _require_float32_resource(
+                "PrototypeAgent buffer",
+                vector_scalars=self.buffer_capacity * self.oak.observation_dim,
+                fixed_scalars=2,
+            )
+        if self.horde_spec is not None:
+            _validate_direct_state_resources(
+                len(self.horde_spec.demons),
+                self.horde_hidden_sizes,
+                self.oak.observation_dim,
+            )
         # GRU resource already validated via GRUPerceptionConfig.__post_init__
         if type(self.learn_state_builder_from_world_model) is not bool:
             raise ValueError("learn_state_builder_from_world_model must be boolean")
@@ -2421,6 +2418,8 @@ class PrototypeAgent:
     """
 
     def __init__(self, config: PrototypeAgentConfig) -> None:
+        if type(config) is not PrototypeAgentConfig:
+            raise ValueError("config must be an exact PrototypeAgentConfig")
         self._config = config
         self._oak = OaKAgent(config.oak)
         self._option_search_control: OptionSearchControl | None = None
