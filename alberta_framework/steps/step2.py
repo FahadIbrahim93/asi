@@ -253,6 +253,13 @@ def _require_int(
     return number
 
 
+def _require_bool(name: str, value: object) -> bool:
+    """Require an actual builtin bool (``__class__`` spoofing is ignored)."""
+    if type(value) is not bool:
+        raise ValueError(f"{name} must be a bool, got {value!r}")
+    return value
+
+
 def _validate_step2_kernel_config(config: Step2KernelConfig) -> None:
     feature_dim = _require_int(
         "feature_dim", config.feature_dim, minimum=1, maximum=_INT32_MAX
@@ -655,6 +662,18 @@ class Step2SmokeResult:
     finite: bool
     learner_config: dict[str, Any]
 
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "steps", _require_int("steps", self.steps, minimum=1, maximum=_INT32_MAX)
+        )
+        object.__setattr__(self, "seed", require_jax_seed(self.seed, name="seed"))
+        object.__setattr__(
+            self,
+            "final_window_mse",
+            _require_real("final_window_mse", self.final_window_mse),
+        )
+        object.__setattr__(self, "finite", _require_bool("finite", self.finite))
+
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-serializable representation."""
         payload = asdict(self)
@@ -675,6 +694,23 @@ class Step2AssociativeSmokeResult:
     metrics_shape: tuple[int, ...]
     finite: bool
     learner_config: dict[str, object]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "steps", _require_int("steps", self.steps, minimum=1, maximum=_INT32_MAX)
+        )
+        object.__setattr__(self, "seed", require_jax_seed(self.seed, name="seed"))
+        object.__setattr__(
+            self,
+            "initial_window_nll",
+            _require_real("initial_window_nll", self.initial_window_nll),
+        )
+        object.__setattr__(
+            self,
+            "final_window_nll",
+            _require_real("final_window_nll", self.final_window_nll),
+        )
+        object.__setattr__(self, "finite", _require_bool("finite", self.finite))
 
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-serializable representation."""
