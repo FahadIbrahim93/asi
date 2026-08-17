@@ -515,6 +515,25 @@ def test_reward_sign_and_magnitude_are_learned_from_own_transition() -> None:
     assert int(state.cell_ready_step[1, 0]) == 11
 
 
+def test_reward_accumulation_overflow_is_rejected_eager_and_jit() -> None:
+    config = CausalMapForagerConfig()
+    observation = _observation((1, 0, 0), aperture=3, channels=1)
+    state, action = causal_map_start(observation, config, 0)
+    assert int(action) == 0
+    maximum = jnp.asarray(jnp.finfo(jnp.float32).max, dtype=jnp.float32)
+    state, _, _ = causal_map_step(state, maximum, observation, config)
+
+    with pytest.raises(Exception, match="reward accumulation must remain finite"):
+        jax.block_until_ready(  # type: ignore[no-untyped-call]
+            causal_map_step(state, maximum, observation, config)
+        )
+    compiled = jax.jit(
+        lambda current: causal_map_step(current, maximum, observation, config)
+    )
+    with pytest.raises(Exception, match="reward accumulation must remain finite"):
+        jax.block_until_ready(compiled(state))  # type: ignore[no-untyped-call]
+
+
 def test_zero_reward_without_collection_does_not_corrupt_channel_mean() -> None:
     config = CausalMapForagerConfig()
     state, action = causal_map_start(_observation((1, 0, 0)), config, 0)
