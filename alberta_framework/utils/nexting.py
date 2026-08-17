@@ -36,8 +36,67 @@ from functools import partial
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import Array
 from jaxtyping import Float
+
+
+def _is_bool(value: object) -> bool:
+    return type(value) is bool or type(value) is np.bool_
+
+
+def _concrete_numeric_array(
+    name: str,
+    value: object,
+    *,
+    ndim: int,
+) -> np.ndarray | None:
+    """Return a concrete numeric host view, or ``None`` for a JAX tracer."""
+    if isinstance(value, jax.core.Tracer):
+        if value.ndim != ndim:
+            raise ValueError(f"{name} must be {ndim}-dimensional")
+        if jnp.issubdtype(value.dtype, jnp.bool_):
+            raise ValueError(f"{name} must not be boolean")
+        return None
+    try:
+        array = np.asarray(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be numeric") from exc
+    if array.ndim != ndim:
+        raise ValueError(f"{name} must be {ndim}-dimensional")
+    if array.dtype.kind not in "biuf":
+        raise ValueError(f"{name} must be real-valued")
+    return array
+
+
+def _require_host_discount[T](name: str, value: T, *, ndim: int) -> T:
+    """Reject boolean / non-finite host discounts before they become 0/1 identities."""
+    if _is_bool(value):
+        raise ValueError(f"{name} must be a finite discount in [0, 1], not a boolean")
+    array = _concrete_numeric_array(name, value, ndim=ndim)
+    if array is None:
+        return value
+    if array.dtype.kind == "b":
+        raise ValueError(f"{name} must be a finite discount in [0, 1], not a boolean")
+    if not bool(np.all(np.isfinite(array))) or not bool(
+        np.all((array >= 0.0) & (array <= 1.0))
+    ):
+        raise ValueError(f"{name} must be a finite discount in [0, 1]")
+    return value
+
+
+def _require_host_finite_real[T](name: str, value: T) -> T:
+    """Reject boolean / non-finite host scalars before they become 0/1 bootstraps."""
+    if _is_bool(value):
+        raise ValueError(f"{name} must be a finite real number, not a boolean")
+    array = _concrete_numeric_array(name, value, ndim=0)
+    if array is None:
+        return value
+    if array.dtype.kind == "b":
+        raise ValueError(f"{name} must be a finite real number, not a boolean")
+    if not bool(np.isfinite(array)):
+        raise ValueError(f"{name} must be a finite real number")
+    return value
 
 
 def forward_view_returns(
@@ -61,6 +120,8 @@ def forward_view_returns(
         Array of shape ``(T,)`` where index ``t`` is the forward-view
         return ``G_t = c_{t+1} + gamma * c_{t+2} + gamma^2 * c_{t+3} + ...``.
     """
+    gamma = _require_host_discount("gamma", gamma, ndim=0)
+    terminal_value = _require_host_finite_real("terminal_value", terminal_value)
     gamma_s = jnp.asarray(gamma, dtype=cumulants.dtype)
     init = jnp.asarray(terminal_value, dtype=cumulants.dtype)
 
@@ -93,6 +154,8 @@ def multi_horizon_returns(
         Array of shape ``(T, H)`` -- ``[t, h]`` is the forward-view return
         from step ``t`` at horizon ``gammas[h]``.
     """
+    gammas = _require_host_discount("gammas", gammas, ndim=1)
+    terminal_value = _require_host_finite_real("terminal_value", terminal_value)
 
     def per_gamma(g: Array) -> Array:
         return forward_view_returns(cumulants, g, terminal_value=terminal_value)

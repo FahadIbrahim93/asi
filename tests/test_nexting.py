@@ -64,6 +64,56 @@ class TestForwardViewReturns:
         g = forward_view_returns(c, gamma=1.0, terminal_value=10.0)
         chex.assert_trees_all_close(g, jnp.array([11.0, 11.0, 11.0]))
 
+    @pytest.mark.parametrize("gamma", [True, False, float("nan"), float("inf"), -0.1, 1.1])
+    def test_gamma_rejects_boolean_and_non_discount_host_values(self, gamma: object) -> None:
+        """True used to compile as undiscounted gamma=1.0; False as gamma=0.0."""
+
+        c = jnp.array([1.0, 2.0, 3.0], dtype=jnp.float32)
+        with pytest.raises(ValueError, match="gamma"):
+            forward_view_returns(c, gamma=cast(float, gamma))
+
+    def test_gamma_true_is_not_the_undiscounted_identity(self) -> None:
+        c = jnp.array([1.0, 2.0, 3.0], dtype=jnp.float32)
+        legal = forward_view_returns(c, gamma=1.0)
+        chex.assert_trees_all_close(legal, jnp.array([6.0, 5.0, 3.0]))
+        with pytest.raises(ValueError, match="boolean"):
+            forward_view_returns(c, gamma=True)
+
+    @pytest.mark.parametrize("terminal_value", [True, False, float("nan"), float("inf")])
+    def test_terminal_value_rejects_boolean_and_nonfinite_hosts(
+        self, terminal_value: object
+    ) -> None:
+        c = jnp.array([1.0, 2.0, 3.0], dtype=jnp.float32)
+        with pytest.raises(ValueError, match="terminal_value"):
+            forward_view_returns(c, gamma=0.0, terminal_value=cast(float, terminal_value))
+
+    def test_bool_gamma_vector_is_not_the_one_zero_horizon_pair(self) -> None:
+        c = jnp.array([1.0, 2.0, 3.0], dtype=jnp.float32)
+        legal = multi_horizon_returns(c, jnp.array([1.0, 0.0], dtype=jnp.float32))
+        chex.assert_shape(legal, (3, 2))
+        with pytest.raises(ValueError, match="gammas"):
+            multi_horizon_returns(c, jnp.array([True, False]))
+
+    @pytest.mark.parametrize("array_type", [np.asarray, jnp.asarray])
+    @pytest.mark.parametrize("gamma", [float("nan"), float("inf"), -0.1, 1.1])
+    def test_concrete_array_gamma_is_validated(self, array_type, gamma: float) -> None:
+        c = jnp.array([1.0, 2.0, 3.0], dtype=jnp.float32)
+        with pytest.raises(ValueError, match="gamma"):
+            forward_view_returns(c, gamma=array_type(gamma))
+
+    @pytest.mark.parametrize("array_type", [np.asarray, jnp.asarray])
+    def test_concrete_gamma_vector_values_are_validated(self, array_type) -> None:
+        c = jnp.array([1.0, 2.0, 3.0], dtype=jnp.float32)
+        with pytest.raises(ValueError, match="gammas"):
+            multi_horizon_returns(c, array_type([0.5, float("nan")]))
+        with pytest.raises(ValueError, match="gammas"):
+            multi_horizon_returns(c, array_type([0.5, 1.1]))
+
+    def test_jit_traced_legal_gamma_remains_supported(self) -> None:
+        c = jnp.array([1.0, 2.0, 3.0], dtype=jnp.float32)
+        actual = jax.jit(forward_view_returns)(c, jnp.array(0.5, dtype=jnp.float32))
+        chex.assert_trees_all_close(actual, jnp.array([2.75, 3.5, 3.0]))
+
 
 class TestMultiHorizon:
     def test_shape(self) -> None:
