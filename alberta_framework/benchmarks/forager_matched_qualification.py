@@ -514,7 +514,13 @@ def _decode_json(raw: bytes, label: str) -> Any:
 
 
 def _plain_json(value: Any, path: str = "value") -> Any:
-    if value is None or type(value) in {str, bool, int, float}:
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise ForagerMatchedQualificationError(
+                f"{path} contains a non-finite JSON number"
+            )
+        return value
+    if value is None or type(value) in {str, bool, int}:
         return value
     if isinstance(value, Mapping):
         result: dict[str, Any] = {}
@@ -1829,7 +1835,15 @@ def _replace_integer_literals(raw: bytes, transforms: Sequence[Any]) -> bytes:
     parsed = _decode_json(raw, "original configuration")
     if type(parsed) is not dict:
         raise ForagerMatchedQualificationError("original configuration must be an object")
-    expected = cast(dict[str, Any], json.loads(json.dumps(parsed)))
+    try:
+        expected = cast(
+            dict[str, Any],
+            json.loads(json.dumps(parsed, allow_nan=False)),
+        )
+    except (TypeError, ValueError) as exc:
+        raise ForagerMatchedQualificationError(
+            "original configuration is not finite canonical JSON"
+        ) from exc
     transformed = raw
     for transform in transforms:
         if (

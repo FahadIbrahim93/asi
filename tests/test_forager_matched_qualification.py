@@ -48,6 +48,27 @@ def _sha(label: str) -> str:
     return hashlib.sha256(label.encode("ascii")).hexdigest()
 
 
+@pytest.mark.parametrize("invalid", [float("nan"), float("inf"), float("-inf")])
+def test_canonical_json_rejects_nonfinite_number_identities(invalid: float) -> None:
+    with pytest.raises(
+        qualification.ForagerMatchedQualificationError,
+        match="non-finite JSON number",
+    ):
+        qualification._canonical_json_bytes({"score": invalid})  # noqa: SLF001
+
+
+def test_replace_integer_literals_keeps_finite_configuration_copy() -> None:
+    raw = b'{"total_steps": 1}'
+    transform = SimpleNamespace(
+        transform_type="byte_preserving_unique_literal_replacement",
+        value_type="integer",
+        value=2,
+        target="total_steps",
+    )
+    rewritten = qualification._replace_integer_literals(raw, (transform,))  # noqa: SLF001
+    assert b'"total_steps": 2' in rewritten or b'"total_steps":2' in rewritten
+
+
 def _fresh_replay_fixture(
     tmp_path: Path,
 ) -> tuple[Path, Any, str, dict[str, Any]]:
@@ -2195,7 +2216,7 @@ def test_bundle_preserves_exact_manifest_bytes_and_threads_one_digest(
 
     with pytest.raises(
         qualification.ForagerMatchedQualificationError,
-        match="bounded canonical JSON",
+        match="non-finite JSON number",
     ):
         replace(
             bundle,
