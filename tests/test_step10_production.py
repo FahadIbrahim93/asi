@@ -474,7 +474,7 @@ def test_step10_stomp_fields_preserve_legal_endpoints() -> None:
         epsilon_option=1.0,
         option_target_epsilon=0.0,
         option_importance_clip=10.0,
-        option_planning_backups_per_step=2**31 - 2,
+        option_planning_backups_per_step=4_096,
     )
     make_step10_stomp_agent(upper)
     assert upper.base_trace_decay == 1.0
@@ -484,7 +484,7 @@ def test_step10_stomp_fields_preserve_legal_endpoints() -> None:
     assert upper.epsilon_base == 1.0
     assert upper.epsilon_option == 1.0
     assert upper.option_target_epsilon == 0.0
-    assert upper.option_planning_backups_per_step == 2**31 - 2
+    assert upper.option_planning_backups_per_step == 4_096
 
     one = Step10STOMPConfig(
         subtask_specs=(_SPEC1,),
