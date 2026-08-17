@@ -15,7 +15,7 @@ import functools
 import math
 import operator
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from numbers import Real
 from typing import Any, Literal, SupportsIndex, cast
 
@@ -285,13 +285,37 @@ class AssociativeMemoryConfig:
     def from_config(cls, config: Mapping[str, Any]) -> AssociativeMemoryConfig:
         """Reconstruct from :meth:`to_config` output."""
         payload = _read_mapping("AssociativeMemoryConfig payload", config)
-        payload.pop("type", None)
-        try:
-            return cls(**payload)
-        except ValueError:
-            raise
-        except Exception as error:
-            raise ValueError("serialized AssociativeMemoryConfig is invalid") from error
+        if payload.pop("type", None) != "AssociativeMemoryConfig":
+            raise ValueError("AssociativeMemoryConfig type is invalid")
+        if set(payload) != {field.name for field in fields(cls)}:
+            raise ValueError("AssociativeMemoryConfig fields do not match its schema")
+        integer_fields = {
+            "vocab_size",
+            "block_size",
+            "suffix_length",
+            "max_features",
+            "min_effective_budget",
+        }
+        boolean_fields = {
+            "normalize_by_weight",
+            "adaptive_feature_family",
+            "adaptive_window",
+            "adaptive_budget",
+        }
+        string_fields = {"feature_family"}
+        for name, value in payload.items():
+            if name in integer_fields and type(value) is not int:
+                raise ValueError(f"serialized {name} must be a JSON integer")
+            if name in boolean_fields and type(value) is not bool:
+                raise ValueError(f"serialized {name} must be a JSON boolean")
+            if name in string_fields and type(value) is not str:
+                raise ValueError(f"serialized {name} must be a JSON string")
+            if (
+                name not in integer_fields | boolean_fields | string_fields
+                and type(value) is not float
+            ):
+                raise ValueError(f"serialized {name} must be a JSON number")
+        return cls(**payload)
 
 
 @chex.dataclass(frozen=True)
@@ -607,7 +631,11 @@ class AssociativeMemoryLearner:
     def from_config(cls, config: Mapping[str, Any]) -> AssociativeMemoryLearner:
         """Reconstruct from :meth:`to_config` output."""
         payload = _read_mapping("AssociativeMemoryLearner payload", config)
-        inner = payload.get("config")
+        if set(payload) != {"type", "config"}:
+            raise ValueError("AssociativeMemoryLearner fields do not match its schema")
+        if payload["type"] != "AssociativeMemoryLearner":
+            raise ValueError("AssociativeMemoryLearner type is invalid")
+        inner = payload["config"]
         if not issubclass(type(inner), Mapping):
             raise ValueError("AssociativeMemoryLearner config must be a mapping")
         return cls(AssociativeMemoryConfig.from_config(cast(Mapping[str, Any], inner)))
