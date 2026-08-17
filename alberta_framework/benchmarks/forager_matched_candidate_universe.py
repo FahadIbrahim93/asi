@@ -28,6 +28,8 @@ FORAGER_MATCHED_CANDIDATE_UNIVERSE_SCHEMA_VERSION: Final = (
 )
 
 _MAX_JSON_BYTES: Final = 2 * 1024 * 1024
+_MAX_INT32: Final = 2**31 - 1
+_MAX_JAX_SEED: Final = 2**32 - 1
 _OPEN_DEVELOPMENT_SEEDS: Final = (2_000_001, 2_000_002)
 
 ScreenId = Literal[
@@ -59,6 +61,21 @@ def _require_exact_int(value: Any, path: str) -> int:
     return value
 
 
+def _require_bounded_int(
+    value: Any,
+    path: str,
+    *,
+    minimum: int,
+    maximum: int,
+) -> int:
+    number = _require_exact_int(value, path)
+    if not minimum <= number <= maximum:
+        raise ForagerMatchedCandidateUniverseError(
+            f"{path} must lie in [{minimum}, {maximum}]"
+        )
+    return number
+
+
 def _require_exact_bool(value: Any, path: str) -> bool:
     if type(value) is not bool:
         raise ForagerMatchedCandidateUniverseError(f"{path} must be a boolean")
@@ -66,29 +83,31 @@ def _require_exact_bool(value: Any, path: str) -> bool:
 
 
 def _require_finite_real(value: Any, path: str) -> float:
-    if type(value) is bool or not isinstance(value, (int, float)):
+    if type(value) not in (int, float):
         raise ForagerMatchedCandidateUniverseError(f"{path} must be a finite number")
-    try:
-        number = float(value)
-    except (OverflowError, ValueError) as exc:
-        raise ForagerMatchedCandidateUniverseError(f"{path} must be a finite number") from exc
+    number = float(cast("int | float", value))
     if not math.isfinite(number):
         raise ForagerMatchedCandidateUniverseError(f"{path} must be a finite number")
     return number
 
 
 def _require_seed_identities(values: object, *, name: str) -> tuple[int, ...]:
-    if type(values) is bool:
-        raise ForagerMatchedCandidateUniverseError(f"{name} must not be a boolean")
-    if isinstance(values, (str, bytes)):
-        raise ForagerMatchedCandidateUniverseError(f"{name} must be a sequence of integer seeds")
-    try:
-        raw: tuple[object, ...] = tuple(values)  # type: ignore[arg-type]
-    except TypeError as exc:
+    if type(values) is not tuple or not values:
         raise ForagerMatchedCandidateUniverseError(
-            f"{name} must be a sequence of integer seeds"
-        ) from exc
-    return tuple(_require_exact_int(item, f"{name}[{index}]") for index, item in enumerate(raw))
+            f"{name} must be a non-empty exact tuple of unique JAX seeds"
+        )
+    seeds = tuple(
+        _require_bounded_int(
+            item,
+            f"{name}[{index}]",
+            minimum=0,
+            maximum=_MAX_JAX_SEED,
+        )
+        for index, item in enumerate(values)
+    )
+    if len(set(seeds)) != len(seeds):
+        raise ForagerMatchedCandidateUniverseError(f"{name} must contain unique seeds")
+    return seeds
 
 
 @dataclass(frozen=True)
@@ -111,12 +130,22 @@ class ScreeningArtifactBinding:
         object.__setattr__(
             self,
             "horizon_per_seed",
-            _require_exact_int(self.horizon_per_seed, "horizon_per_seed"),
+            _require_bounded_int(
+                self.horizon_per_seed,
+                "horizon_per_seed",
+                minimum=1,
+                maximum=_MAX_INT32,
+            ),
         )
         object.__setattr__(
             self,
             "candidate_count",
-            _require_exact_int(self.candidate_count, "candidate_count"),
+            _require_bounded_int(
+                self.candidate_count,
+                "candidate_count",
+                minimum=1,
+                maximum=_MAX_INT32,
+            ),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -183,12 +212,22 @@ class LocalCandidateGenerationBinding:
         object.__setattr__(
             self,
             "horizon_per_seed",
-            _require_exact_int(self.horizon_per_seed, "horizon_per_seed"),
+            _require_bounded_int(
+                self.horizon_per_seed,
+                "horizon_per_seed",
+                minimum=1,
+                maximum=_MAX_INT32,
+            ),
         )
         object.__setattr__(
             self,
             "candidate_count",
-            _require_exact_int(self.candidate_count, "candidate_count"),
+            _require_bounded_int(
+                self.candidate_count,
+                "candidate_count",
+                minimum=1,
+                maximum=_MAX_INT32,
+            ),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -233,7 +272,12 @@ class ScreenedArmDecision:
         object.__setattr__(
             self,
             "open_development_rank",
-            _require_exact_int(self.open_development_rank, "open_development_rank"),
+            _require_bounded_int(
+                self.open_development_rank,
+                "open_development_rank",
+                minimum=1,
+                maximum=_MAX_INT32,
+            ),
         )
         object.__setattr__(
             self,
