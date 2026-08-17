@@ -208,12 +208,22 @@ class DifferentialTDConfig:
 
     def __post_init__(self) -> None:
         """Validate scalar hyperparameters."""
-        if self.step_size < 0.0:
-            raise ValueError("step_size must be non-negative")
-        if self.average_reward_step_size < 0.0:
-            raise ValueError("average_reward_step_size must be non-negative")
-        if not 0.0 <= self.trace_decay <= 1.0:
-            raise ValueError("trace_decay must be in [0, 1]")
+        for name in ("step_size", "average_reward_step_size"):
+            object.__setattr__(
+                self,
+                name,
+                validated_float32_scalar(name, getattr(self, name), lower=0.0),
+            )
+        object.__setattr__(
+            self,
+            "trace_decay",
+            validated_float32_scalar(
+                "trace_decay",
+                self.trace_decay,
+                lower=0.0,
+                upper=1.0,
+            ),
+        )
 
     def to_config(self) -> dict[str, Any]:
         """Serialize this config to a dictionary."""
@@ -302,16 +312,31 @@ class DifferentialGTDConfig:
 
     def __post_init__(self) -> None:
         """Validate scalar hyperparameters."""
-        if self.value_step_size < 0.0:
-            raise ValueError("value_step_size must be non-negative")
-        if self.secondary_step_size < 0.0:
-            raise ValueError("secondary_step_size must be non-negative")
-        if self.average_reward_step_size < 0.0:
-            raise ValueError("average_reward_step_size must be non-negative")
-        if not 0.0 <= self.trace_decay <= 1.0:
-            raise ValueError("trace_decay must be in [0, 1]")
-        if self.ratio_clip <= 0.0:
-            raise ValueError("ratio_clip must be positive")
+        for name in (
+            "value_step_size",
+            "secondary_step_size",
+            "average_reward_step_size",
+        ):
+            object.__setattr__(
+                self,
+                name,
+                validated_float32_scalar(name, getattr(self, name), lower=0.0),
+            )
+        object.__setattr__(
+            self,
+            "trace_decay",
+            validated_float32_scalar(
+                "trace_decay",
+                self.trace_decay,
+                lower=0.0,
+                upper=1.0,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "ratio_clip",
+            validated_float32_scalar("ratio_clip", self.ratio_clip, positive=True),
+        )
 
     def to_config(self) -> dict[str, Any]:
         """Serialize this config to a dictionary."""
@@ -948,10 +973,17 @@ class AverageRewardHordeLearner:
         """Initialize the average-reward Horde."""
         if n_demons < 1:
             raise ValueError("n_demons must be positive")
-        if average_reward_step_size < 0.0:
-            raise ValueError("average_reward_step_size must be non-negative")
-        if not 0.0 <= trace_decay <= 1.0:
-            raise ValueError("trace_decay must be in [0, 1]")
+        average_reward_step_size = validated_float32_scalar(
+            "average_reward_step_size",
+            average_reward_step_size,
+            lower=0.0,
+        )
+        trace_decay = validated_float32_scalar(
+            "trace_decay",
+            trace_decay,
+            lower=0.0,
+            upper=1.0,
+        )
         self._n_demons = n_demons
         self._hidden_sizes = hidden_sizes
         self._step_size = step_size
