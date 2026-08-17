@@ -19,6 +19,7 @@ from alberta_framework.core.option_value_duration import (
     DURATION_HEAD,
     OptionValueDurationConfig,
     OptionValueDurationLearner,
+    run_option_value_duration_from_arrays,
 )
 
 pytestmark = pytest.mark.unit
@@ -417,3 +418,208 @@ def test_infinite_reward_on_zero_feature_does_not_poison_duration_head() -> None
     chex.assert_tree_all_finite(recovered.state.weights[0, DURATION_HEAD])
     assert bool(recovered.update_applied)
     assert bool(jnp.all(recovered.head_updates_applied))
+
+
+@pytest.mark.parametrize(
+    "integer_type",
+    [
+        np.int8,
+        np.int16,
+        np.int32,
+        np.int64,
+        np.longlong,
+        np.uint8,
+        np.uint16,
+        np.uint32,
+        np.uint64,
+        np.ulonglong,
+    ],
+)
+def test_option_duration_canonicalizes_numpy_integer_family(integer_type) -> None:
+    learner = OptionValueDurationLearner(integer_type(2))
+
+    assert type(learner.n_options) is int
+    assert learner.trainable_parameter_count(integer_type(3)) == 12
+    assert learner.init(integer_type(3)).weights.shape == (2, 2, 3)
+
+
+@pytest.mark.parametrize("field", ["n_options", "feature_dim"])
+def test_option_duration_rejects_hostile_integer_subclasses(field: str) -> None:
+    class HostileInt(int):
+        def __index__(self) -> int:
+            raise AssertionError("untrusted index hook executed")
+
+        def __repr__(self) -> str:
+            raise AssertionError("untrusted repr hook executed")
+
+    if field == "n_options":
+        with pytest.raises(ValueError, match=field):
+            OptionValueDurationLearner(HostileInt(2))
+    else:
+        learner = OptionValueDurationLearner(2)
+        with pytest.raises(ValueError, match=field):
+            learner.init(HostileInt(3))
+
+
+def test_option_duration_float_hook_runs_once_and_normalizes_failures() -> None:
+    class CountingFloat(float):
+        def __new__(cls):
+            instance = super().__new__(cls, 0.25)
+            instance.calls = 0
+            return instance
+
+        def as_integer_ratio(self) -> tuple[int, int]:
+            self.calls += 1
+            return (1, 4)
+
+    value = CountingFloat()
+    config = OptionValueDurationConfig(reward_step_size=value)
+    assert value.calls == 1
+    assert type(config.reward_step_size) is float
+
+    class ExplodingFloat(float):
+        def as_integer_ratio(self) -> tuple[int, int]:
+            raise RuntimeError("hostile ratio")
+
+        def __repr__(self) -> str:
+            raise AssertionError("untrusted repr hook executed")
+
+    with pytest.raises(ValueError, match="reward_step_size"):
+        OptionValueDurationConfig(reward_step_size=ExplodingFloat(0.25))
+
+
+def test_option_duration_rejects_builtin_float32_underflow() -> None:
+    with pytest.raises(ValueError, match="reward_step_size"):
+        OptionValueDurationConfig(reward_step_size=1.0e-50)
+
+
+def test_option_duration_config_schemas_and_record_type_are_exact() -> None:
+    class ConfigSubclass(OptionValueDurationConfig):
+        pass
+
+    with pytest.raises(ValueError, match="actual OptionValueDurationConfig"):
+        OptionValueDurationLearner(2, ConfigSubclass())
+
+    learner_payload = OptionValueDurationLearner(2).to_config()
+    learner_payload["n_options"] = np.int32(2)
+    with pytest.raises(ValueError, match="exact JSON integer"):
+        OptionValueDurationLearner.from_config(learner_payload)
+
+    config_payload = OptionValueDurationConfig().to_config()
+    config_payload["type"] = "AnotherConfig"
+    with pytest.raises(ValueError, match="type is unsupported"):
+        OptionValueDurationConfig.from_config(config_payload)
+
+    class PayloadSubclass(dict):
+        pass
+
+    with pytest.raises(ValueError, match="exact dictionary"):
+        OptionValueDurationLearner.from_config(PayloadSubclass())
+
+
+def test_option_duration_resource_formula_matches_materialized_state() -> None:
+    learner = OptionValueDurationLearner(3)
+    state = learner.init(5)
+    actual_bytes = sum(
+        int(leaf.nbytes)
+        for leaf in jax.tree_util.tree_leaves(state)
+        if hasattr(leaf, "nbytes")
+    )
+
+    assert learner.persistent_resource_budget(5) == {
+        "trainable_parameters": 30,
+        "persistent_scalars": 34,
+        "persistent_bytes": actual_bytes,
+    }
+
+
+def test_option_duration_resource_limit_precedes_allocation(monkeypatch) -> None:
+    learner = OptionValueDurationLearner(1)
+    last_valid = ((256 * 1024 * 1024 // 4) - 2) // 2
+    assert learner.persistent_resource_budget(last_valid)["persistent_bytes"] <= 256 * 1024 * 1024
+
+    monkeypatch.setattr(
+        jnp,
+        "zeros",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("allocation began before resource preflight")
+        ),
+    )
+    with pytest.raises(ValueError, match="256 MiB"):
+        learner.init(last_valid + 1)
+
+    last_valid_options = ((256 * 1024 * 1024 // 4) - 1) // 3
+    OptionValueDurationLearner(last_valid_options)
+    with pytest.raises(ValueError, match="256 MiB"):
+        OptionValueDurationLearner(last_valid_options + 1)
+
+
+def test_option_duration_runtime_shape_dtype_and_state_contracts() -> None:
+    learner = OptionValueDurationLearner(2)
+    state = learner.init(3)
+    malformed = state.replace(weights=jnp.zeros((2, 3), dtype=jnp.float32))
+    with pytest.raises(ValueError, match="state.weights"):
+        learner.predict(malformed, jnp.ones(3, dtype=jnp.float32))
+
+    with pytest.raises(ValueError, match="observation"):
+        learner.predict(state, jnp.ones((1, 3), dtype=jnp.float32))
+    with pytest.raises(ValueError, match="dtype"):
+        learner.predict(state, jnp.ones(3, dtype=jnp.int32))
+    with pytest.raises(ValueError, match="option_index"):
+        learner.update(
+            state,
+            jnp.ones(3, dtype=jnp.float32),
+            jnp.asarray(0.0, dtype=jnp.float32),
+            jnp.asarray(1.0, dtype=jnp.float32),
+            jnp.ones(3, dtype=jnp.float32),
+            jnp.asarray(0.0, dtype=jnp.float32),
+        )
+
+    class HostileArray:
+        @property
+        def ndim(self):
+            raise RuntimeError("hostile shape")
+
+        def __repr__(self) -> str:
+            raise AssertionError("untrusted repr hook executed")
+
+    hostile_state = state.replace(weights=HostileArray())
+    with pytest.raises(ValueError, match="readable shape and dtype"):
+        learner._require_state_contract(hostile_state)
+
+
+def test_option_duration_invalid_dynamic_state_is_held_atomically() -> None:
+    learner = OptionValueDurationLearner(1)
+    state = learner.init(1).replace(
+        option_update_counts=jnp.asarray([-1], dtype=jnp.int32)
+    )
+    result = learner.update(
+        state,
+        jnp.ones(1, dtype=jnp.float32),
+        jnp.asarray(0, dtype=jnp.int32),
+        jnp.asarray(1.0, dtype=jnp.float32),
+        jnp.ones(1, dtype=jnp.float32),
+        jnp.asarray(0.0, dtype=jnp.float32),
+    )
+
+    chex.assert_trees_all_equal(result.state.weights, state.weights)
+    chex.assert_trees_all_equal(
+        result.state.option_update_counts, state.option_update_counts
+    )
+    chex.assert_trees_all_equal(result.state.step_count, state.step_count)
+    assert not bool(result.update_applied)
+
+
+def test_option_duration_array_runner_requires_exact_shapes() -> None:
+    learner = OptionValueDurationLearner(1)
+    state = learner.init(2)
+    with pytest.raises(ValueError, match="option_indices"):
+        run_option_value_duration_from_arrays(
+            learner,
+            state,
+            jnp.ones((2, 2), dtype=jnp.float32),
+            jnp.zeros((2, 1), dtype=jnp.int32),
+            jnp.ones((2,), dtype=jnp.float32),
+            jnp.ones((2, 2), dtype=jnp.float32),
+            jnp.zeros((2,), dtype=jnp.float32),
+        )
