@@ -14,6 +14,7 @@ import alberta_framework as af
 from alberta_framework.pipeline import (
     AlbertaPipeline,
     AlbertaPipelineConfig,
+    AlbertaPipelineSmokeResult,
     HordeActorCriticPipelineConfig,
     Step2AssociativePipelineConfig,
     Step2FeatureConfig,
@@ -939,6 +940,50 @@ def test_pipeline_full_config_json_roundtrip() -> None:
     )
     payload = json.loads(json.dumps(config.to_dict()))
     assert AlbertaPipelineConfig.from_dict(payload) == config
+
+
+def _legal_pipeline_smoke_result(**overrides: object) -> AlbertaPipelineSmokeResult:
+    payload: dict[str, object] = {
+        "config": _small_pipeline_config(),
+        "steps": 8,
+        "seed": 0,
+        "feature_shape": (8, 3),
+        "horde_predictions_shape": (8, 2),
+        "q_values_shape": (8, 2),
+        "actions_shape": (8,),
+        "finite": True,
+    }
+    payload.update(overrides)
+    return AlbertaPipelineSmokeResult(**payload)  # type: ignore[arg-type]
+
+
+def test_pipeline_smoke_result_rejects_leftover_identities() -> None:
+    """Public pipeline smoke records must not keep leftover bool/int identities."""
+
+    with pytest.raises(ValueError, match="steps"):
+        _legal_pipeline_smoke_result(steps=True)
+    with pytest.raises(ValueError, match="steps"):
+        _legal_pipeline_smoke_result(steps=float("nan"))
+    with pytest.raises(ValueError, match="seed"):
+        _legal_pipeline_smoke_result(seed=True)
+    with pytest.raises(ValueError, match="finite"):
+        _legal_pipeline_smoke_result(finite=1)
+
+    legal = _legal_pipeline_smoke_result()
+    dumped = json.dumps(
+        {
+            "steps": legal.steps,
+            "seed": legal.seed,
+            "finite": legal.finite,
+        },
+        allow_nan=False,
+    )
+    assert '"steps": 8' in dumped
+    assert '"seed": 0' in dumped
+    assert '"finite": true' in dumped
+    assert '"steps": true' not in dumped
+    assert '"seed": true' not in dumped
+    assert '"finite": 1' not in dumped
 
 
 # silence the import lint warnings used in the test runner
