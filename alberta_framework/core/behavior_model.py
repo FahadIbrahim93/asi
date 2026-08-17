@@ -88,6 +88,14 @@ def _saturating_int32_increment(value: Array) -> Array:
     return jnp.minimum(jnp.maximum(counter, 0), maximum - 1) + 1
 
 
+def _integer_action_ids(actions: Array) -> Array:
+    """Narrow integer action IDs without laundering floats or booleans."""
+    raw_actions = jnp.asarray(actions)
+    if not jnp.issubdtype(raw_actions.dtype, jnp.integer):
+        raise ValueError("actions must have an integer dtype")
+    return raw_actions.astype(jnp.int32)
+
+
 def floor_and_renormalize_probabilities(
     probabilities: Array,
     min_probability: float = 1e-6,
@@ -125,7 +133,7 @@ def selected_action_probabilities(
     broadcast to ``probabilities.shape[:-1]``.
     """
     probs = jnp.asarray(probabilities, dtype=jnp.float32)
-    action_ids = jnp.asarray(actions, dtype=jnp.int32)
+    action_ids = _integer_action_ids(actions)
     one_hot = jax.nn.one_hot(action_ids, probs.shape[-1], dtype=jnp.float32)
     selected = jnp.sum(probs * one_hot, axis=-1)
     return jnp.maximum(selected, jnp.asarray(min_probability, dtype=jnp.float32))
@@ -533,7 +541,7 @@ class BehaviorModel:
         """
         cfg = self._config
         obs = jnp.asarray(observation, dtype=jnp.float32)
-        action_id = jnp.asarray(action, dtype=jnp.int32)
+        action_id = _integer_action_ids(action)
         logits = state.weights @ obs + state.bias
         scaled_logits = logits / cfg.temperature
         probabilities = jax.nn.softmax(scaled_logits)
@@ -584,7 +592,7 @@ class BehaviorModel:
         """Update the behavior model from one observed action."""
         cfg = self._config
         obs = jnp.asarray(observation, dtype=jnp.float32)
-        action_id = jnp.asarray(action, dtype=jnp.int32)
+        action_id = _integer_action_ids(action)
         logits = state.weights @ obs + state.bias
         probabilities = jax.nn.softmax(logits / cfg.temperature)
         one_hot = jax.nn.one_hot(action_id, cfg.n_actions, dtype=jnp.float32)

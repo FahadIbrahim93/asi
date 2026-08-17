@@ -370,6 +370,22 @@ def test_probability_simplex_and_helper_invariants() -> None:
     chex.assert_trees_all_close(logs, jnp.log(selected))
 
 
+@pytest.mark.parametrize(
+    "action",
+    [
+        jnp.array(1.9, dtype=jnp.float32),
+        jnp.array(True, dtype=jnp.bool_),
+    ],
+)
+def test_update_rejects_non_integer_action_dtypes(action: jax.Array) -> None:
+    model = BehaviorModel(BehaviorModelConfig(n_actions=3, step_size=0.1))
+    state = model.init(feature_dim=2, key=jax.random.key(0))
+    observation = jnp.array([1.0, -0.5], dtype=jnp.float32)
+
+    with pytest.raises(ValueError, match="actions must have an integer dtype"):
+        model.update(state, observation, action)
+
+
 def test_likelihood_improves_on_deterministic_policy_stream() -> None:
     model = BehaviorModel(BehaviorModelConfig(n_actions=2, step_size=0.2, diagnostic_decay=0.9))
     state = model.init(feature_dim=2, key=jax.random.key(2))
