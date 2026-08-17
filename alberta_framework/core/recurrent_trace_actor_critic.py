@@ -607,6 +607,7 @@ def leaky_relu(inputs: Array, negative_slope: float = 0.01) -> Array:
 
 def zero_rtu_state(hidden_size: int, dtype: jnp.dtype[Any] = jnp.float32) -> RTUState:
     """Construct a zero RTU state."""
+    hidden_size = _require_int32("hidden_size", hidden_size, minimum=1)
     zeros = jnp.zeros((hidden_size,), dtype=dtype)
     return RTUState(real=zeros, imaginary=zeros)
 
@@ -617,6 +618,8 @@ def zero_rtu_sensitivities(
     dtype: jnp.dtype[Any] = jnp.float32,
 ) -> RTUSensitivities:
     """Construct zero compressed RTRL sensitivities."""
+    hidden_size = _require_int32("hidden_size", hidden_size, minimum=1)
+    input_dim = _require_int32("input_dim", input_dim, minimum=1)
     recurrent = jnp.zeros((2, hidden_size), dtype=dtype)
     inputs = jnp.zeros((2, hidden_size, input_dim), dtype=dtype)
     return RTUSensitivities(
@@ -1567,6 +1570,8 @@ def initialize_rtu_network_parameters(
     config: RecurrentTraceActorCriticConfig,
 ) -> RTUNetworkParameters:
     """Initialize sparse feedforward/head blocks and a dense-input RTU."""
+    input_dim = _require_int32("input_dim", input_dim, minimum=1)
+    output_dim = _require_int32("output_dim", output_dim, minimum=1)
     encoder_key, rtu_key, output_key, head_key = jr.split(key, 4)
     return RTUNetworkParameters(
         encoder_weights=_live_sparse_init(

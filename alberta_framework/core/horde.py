@@ -27,9 +27,11 @@ from typing import Any, cast
 import chex
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import Array
 from jaxtyping import Bool, Float
 
+from alberta_framework.core._float32_scalars import validated_float32_scalar
 from alberta_framework.core.multi_head_learner import (
     MULTI_HEAD_MLP_STATE_SCHEMA,
     AnyOptimizer,
@@ -43,6 +45,44 @@ from alberta_framework.core.normalizers import (
 )
 from alberta_framework.core.optimizers import Bounder
 from alberta_framework.core.types import HordeSpec, TraceMode
+
+_ACTUAL_INT_TYPES = frozenset({int, *(np.dtype(code).type for code in "bBhHiIlLqQpP")})
+_ACTUAL_REAL_TYPES = _ACTUAL_INT_TYPES | frozenset(
+    {float, *(np.dtype(code).type for code in "efdg")}
+)
+
+
+def _require_float32(
+    name: str,
+    value: object,
+    *,
+    lower: float | None = None,
+    upper: float | None = None,
+) -> float:
+    if type(value) not in _ACTUAL_REAL_TYPES:
+        raise ValueError(f"{name} must be a finite real number")
+    return validated_float32_scalar(name, value, lower=lower, upper=upper)
+
+
+def _require_exact_bool(name: str, value: object) -> bool:
+    if type(value) is not bool:
+        raise ValueError(f"{name} must be an exact bool")
+    return value
+
+
+def _canonical_horde_host_scalars(
+    step_size: object,
+    sparsity: object,
+    leaky_relu_slope: object,
+    use_layer_norm: object,
+) -> tuple[float, float, float, bool]:
+    """Reject bool/non-real/non-finite host identities before they reach kernels."""
+    return (
+        _require_float32("step_size", step_size, lower=0.0),
+        _require_float32("sparsity", sparsity, lower=0.0, upper=1.0),
+        _require_float32("leaky_relu_slope", leaky_relu_slope, lower=0.0),
+        _require_exact_bool("use_layer_norm", use_layer_norm),
+    )
 
 # =============================================================================
 # Types
@@ -218,6 +258,9 @@ class HordeLearner:
             trace_mode: Eligibility trace mode (ACCUMULATING or REPLACING)
             utility_decay: EMA decay for hidden-unit utility diagnostics.
         """
+        step_size, sparsity, leaky_relu_slope, use_layer_norm = _canonical_horde_host_scalars(
+            step_size, sparsity, leaky_relu_slope, use_layer_norm
+        )
         self._horde_spec = horde_spec
         self._hidden_sizes = hidden_sizes
         self._step_size = step_size
@@ -572,6 +615,9 @@ class MixedHorde:
             IndependentDemonHorde,
         )
 
+        step_size, sparsity, leaky_relu_slope, use_layer_norm = _canonical_horde_host_scalars(
+            step_size, sparsity, leaky_relu_slope, use_layer_norm
+        )
         self._horde_spec = horde_spec
         self._hidden_sizes = hidden_sizes
         self._optimizer = optimizer

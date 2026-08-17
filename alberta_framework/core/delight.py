@@ -1773,6 +1773,10 @@ class DelightfulPolicyGradientConfig:
         _validate_float32_config_value("diagnostics_epsilon", self.diagnostics_epsilon)
         if self.diagnostics_epsilon <= 0.0:
             raise ValueError("diagnostics_epsilon must be positive")
+        if type(self.kondo_enabled) is not bool:
+            raise ValueError(
+                f"kondo_enabled must be an actual bool, got {self.kondo_enabled!r}"
+            )
         if self.kondo_enabled:
             raise ValueError(
                 "Kondo compute gating is unavailable in this full-batch helper; "

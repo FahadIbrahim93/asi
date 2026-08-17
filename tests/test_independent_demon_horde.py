@@ -655,6 +655,11 @@ class _SequenceSpoof:
 @pytest.mark.parametrize(
     ("field", "value"),
     [
+        ("step_size", True),
+        ("step_size", False),
+        ("step_size", float("nan")),
+        ("step_size", float("inf")),
+        ("step_size", -0.1),
         ("sparsity", True),
         ("sparsity", _HostileFloat(0.5)),
         ("sparsity", np.float64(1.0 + 1e-10)),
@@ -674,9 +679,11 @@ def test_independent_horde_config_accepts_mapping_and_exact_list_or_tuple() -> N
     horde = IndependentDemonHorde(
         horde_spec=spec,
         hidden_sizes=(np.int32(4),),
+        step_size=np.float64(0.0),
         sparsity=np.float64(0.5),
         leaky_relu_slope=np.float32(0.125),
     )
+    assert horde._step_size == 0.0
     config = horde.to_config()
     clone = IndependentDemonHorde.from_config(MappingProxyType(config))
     assert clone.to_config() == config

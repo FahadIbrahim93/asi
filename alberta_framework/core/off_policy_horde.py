@@ -323,14 +323,11 @@ class OffPolicyHordeLearner:
             trace_ratio_clip: Clip for the eligibility-trace ratio.
             min_behavior_probability: Denominator floor for probability API.
         """
-        if ratio_clip <= 0.0:
-            raise ValueError(f"ratio_clip must be positive; got {ratio_clip}")
-        if trace_ratio_clip <= 0.0:
-            raise ValueError(f"trace_ratio_clip must be positive; got {trace_ratio_clip}")
-        if min_behavior_probability <= 0.0:
-            raise ValueError(
-                f"min_behavior_probability must be positive; got {min_behavior_probability}"
-            )
+        ratio_clip = _require_float32("ratio_clip", ratio_clip, positive=True)
+        trace_ratio_clip = _require_float32("trace_ratio_clip", trace_ratio_clip, positive=True)
+        min_behavior_probability = _require_float32(
+            "min_behavior_probability", min_behavior_probability, positive=True
+        )
 
         self._horde_spec = horde_spec
         self._hidden_sizes = hidden_sizes
@@ -1414,23 +1411,15 @@ class NonlinearSharedGTDHordeLearner:
         )
         return NonlinearSharedGTDHordeUpdateResult(  # type: ignore[call-arg]
             state=new_state,
-            predictions=jnp.where(
-                update_applied, predictions, jnp.zeros_like(predictions)
-            ),
+            predictions=jnp.where(update_applied, predictions, jnp.zeros_like(predictions)),
             next_predictions=jnp.where(
                 update_applied,
                 reported_next_predictions,
                 jnp.zeros_like(reported_next_predictions),
             ),
-            td_targets=jnp.where(
-                update_applied, td_targets, jnp.zeros_like(td_targets)
-            ),
-            td_errors=jnp.where(
-                update_applied, td_errors, jnp.zeros_like(td_errors)
-            ),
-            clipped_rhos=jnp.where(
-                update_applied, clipped_rhos, jnp.zeros_like(clipped_rhos)
-            ),
+            td_targets=jnp.where(update_applied, td_targets, jnp.zeros_like(td_targets)),
+            td_errors=jnp.where(update_applied, td_errors, jnp.zeros_like(td_errors)),
+            clipped_rhos=jnp.where(update_applied, clipped_rhos, jnp.zeros_like(clipped_rhos)),
             correction_norms=jnp.where(
                 update_applied,
                 correction_norms_array,

@@ -814,3 +814,41 @@ def test_nonlinear_shared_gtd_rejection_neutralizes_complete_result() -> None:
         result.secondary_norms,
     ):
         chex.assert_trees_all_equal(value, jnp.zeros_like(value))
+
+
+def test_off_policy_horde_ratio_clip_scalars_reject_booleans_and_nans() -> None:
+    spec = _spec(gammas=(1.0,))
+
+    # ratio_clip
+    with pytest.raises(ValueError, match="ratio_clip"):
+        OffPolicyHordeLearner(spec, ratio_clip=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="ratio_clip"):
+        OffPolicyHordeLearner(spec, ratio_clip=float("nan"))
+    with pytest.raises(ValueError, match="ratio_clip"):
+        OffPolicyHordeLearner(spec, ratio_clip=float("inf"))
+    with pytest.raises(ValueError, match="ratio_clip"):
+        OffPolicyHordeLearner(spec, ratio_clip=0.0)
+
+    # trace_ratio_clip
+    with pytest.raises(ValueError, match="trace_ratio_clip"):
+        OffPolicyHordeLearner(spec, trace_ratio_clip=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="trace_ratio_clip"):
+        OffPolicyHordeLearner(spec, trace_ratio_clip=float("nan"))
+    with pytest.raises(ValueError, match="trace_ratio_clip"):
+        OffPolicyHordeLearner(spec, trace_ratio_clip=0.0)
+
+    # min_behavior_probability
+    with pytest.raises(ValueError, match="min_behavior_probability"):
+        OffPolicyHordeLearner(spec, min_behavior_probability=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="min_behavior_probability"):
+        OffPolicyHordeLearner(spec, min_behavior_probability=float("nan"))
+    with pytest.raises(ValueError, match="min_behavior_probability"):
+        OffPolicyHordeLearner(spec, min_behavior_probability=0.0)
+
+    # Valid construction
+    learner = OffPolicyHordeLearner(
+        spec, ratio_clip=2, trace_ratio_clip=1.0, min_behavior_probability=1e-6
+    )
+    assert learner._ratio_clip == 2.0
+    assert learner._trace_ratio_clip == 1.0
+    assert learner._min_behavior_probability == 1e-6
