@@ -25,9 +25,12 @@ from __future__ import annotations
 
 import functools
 import math
+import operator
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
-from numbers import Integral, Real
-from typing import Any, cast
+from fractions import Fraction
+from numbers import Real
+from typing import Any, SupportsIndex, cast
 
 import chex
 import jax
@@ -40,23 +43,62 @@ from alberta_framework._float32 import round_real_to_float32_with_ratio
 
 _INT32_MAX: int = 2**31 - 1
 
+_ACTUAL_INT_TYPES = frozenset(
+    {
+        int,
+        np.int8,
+        np.int16,
+        np.int32,
+        np.int64,
+        np.uint8,
+        np.uint16,
+        np.uint32,
+        np.uint64,
+        np.longlong,
+        np.ulonglong,
+    }
+)
+_ACTUAL_FLOAT_TYPES = frozenset(
+    {float, Fraction, *(np.dtype(code).type for code in ("e", "f", "d", "g"))}
+)
+_ALLOWED_REAL_TYPES = _ACTUAL_INT_TYPES | _ACTUAL_FLOAT_TYPES
+
+
+def _copy_mapping(payload: object, *, name: str) -> dict[str, Any]:
+    if not issubclass(type(payload), Mapping):
+        raise ValueError(f"{name} must be a mapping")
+    try:
+        values = dict(cast(Mapping[str, Any], payload))
+    except Exception as error:
+        raise ValueError(f"{name} must be a readable mapping") from error
+    if any(type(key) is not str for key in values):
+        raise ValueError(f"{name} keys must be exact strings")
+    return values
+
+
+def _require_exact_str(name: str, value: object) -> str:
+    if type(value) is not str:
+        raise ValueError(f"{name} must be an exact string")
+    return value
+
 
 def finite_real_and_float32(name: str, value: object) -> tuple[Real, int, int, float]:
     """Return the original real, exact ratio, and finite binary32 rounding."""
-    actual_type = type(value)
-    if issubclass(actual_type, bool) or not issubclass(actual_type, Real):
-        raise ValueError(f"{name} must be a real number, got {value!r}")
-    real = cast(Real, value)
+    if type(value) not in _ALLOWED_REAL_TYPES:
+        raise ValueError(f"{name} must be a real number")
+    real_obj = cast(Real, value)
     try:
-        numerator, denominator, narrowed = round_real_to_float32_with_ratio(real)
+        numerator, denominator, narrowed = round_real_to_float32_with_ratio(
+            real_obj
+        )
     except (FloatingPointError, OverflowError, TypeError, ValueError):
-        raise ValueError(f"{name} must narrow to a finite float32, got {value!r}") from None
+        raise ValueError(f"{name} must narrow to a finite float32") from None
     if not math.isfinite(narrowed):
-        raise ValueError(f"{name} must narrow to a finite float32, got {value!r}")
-    return real, numerator, denominator, narrowed
+        raise ValueError(f"{name} must narrow to a finite float32")
+    return real_obj, numerator, denominator, narrowed
 
 
-def canonical_float32_storage(value: Real, narrowed: float) -> float:
+def canonical_float32_storage(value: object, narrowed: float) -> float:
     if not isinstance(value, (int, float, np.floating)):
         return narrowed
     try:
@@ -82,14 +124,14 @@ def _require_half_open_zero_one_interval(name: str, value: object) -> float:
         or narrowed < 0.0
         or not narrowed < 1.0
     ):
-        raise ValueError(f"{name} must be in [0, 1), got {value!r}")
+        raise ValueError(f"{name} must be in [0, 1)")
     return canonical_float32_storage(real, narrowed)
 
 
 def _require_positive_real(name: str, value: object) -> float:
     real, numerator, _, narrowed = finite_real_and_float32(name, value)
     if real <= 0.0 or numerator <= 0 or narrowed <= 0.0:
-        raise ValueError(f"{name} must be positive, got {value!r}")
+        raise ValueError(f"{name} must be positive")
     return canonical_float32_storage(real, narrowed)
 
 
@@ -100,18 +142,17 @@ def _require_int(
     minimum: int | None = None,
     maximum: int | None = None,
 ) -> int:
-    actual_type = type(value)
-    if issubclass(actual_type, bool) or not issubclass(actual_type, Integral):
-        raise ValueError(f"{name} must be an integer, got {value!r}")
-    number = int(cast(Integral, value))
+    if type(value) not in _ACTUAL_INT_TYPES:
+        raise ValueError(f"{name} must be an integer")
+    number = operator.index(cast(SupportsIndex, value))
     if minimum is not None and number < minimum:
         if minimum == 1:
-            raise ValueError(f"{name} must be positive, got {value!r}")
+            raise ValueError(f"{name} must be positive")
         if minimum == 0:
-            raise ValueError(f"{name} must be non-negative, got {value!r}")
-        raise ValueError(f"{name} must be >= {minimum}, got {value!r}")
+            raise ValueError(f"{name} must be non-negative")
+        raise ValueError(f"{name} must be >= {minimum}")
     if maximum is not None and number > maximum:
-        raise ValueError(f"{name} must be <= {maximum}, got {value!r}")
+        raise ValueError(f"{name} must be <= {maximum}")
     return number
 
 
@@ -156,12 +197,15 @@ class TemporalContextConfig:
         return payload
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> TemporalContextConfig:
+    def from_config(cls, config: object) -> TemporalContextConfig:
         """Reconstruct from :meth:`to_config` output."""
-        payload = dict(config)
+        payload = _copy_mapping(config, name="TemporalContextConfig")
         payload.pop("type", None)
         if "periods" in payload:
-            payload["periods"] = tuple(payload["periods"])
+            raw = payload["periods"]
+            if type(raw) not in (list, tuple):
+                raise ValueError("periods must be a list or tuple")
+            payload["periods"] = tuple(raw)
         return cls(**payload)
 
 
@@ -178,21 +222,21 @@ def _validate_config(config: TemporalContextConfig) -> None:
         "input_dim", config.input_dim, minimum=1, maximum=_INT32_MAX
     )
     if type(config.include_raw) is not bool:
-        raise ValueError(f"include_raw must be a bool, got {config.include_raw!r}")
+        raise ValueError("include_raw must be a bool")
     if type(config.include_ema) is not bool:
-        raise ValueError(f"include_ema must be a bool, got {config.include_ema!r}")
+        raise ValueError("include_ema must be a bool")
     if type(config.include_delta) is not bool:
-        raise ValueError(f"include_delta must be a bool, got {config.include_delta!r}")
+        raise ValueError("include_delta must be a bool")
     if type(config.include_phase_products) is not bool:
         raise ValueError(
-            f"include_phase_products must be a bool, got {config.include_phase_products!r}"
+            "include_phase_products must be a bool"
         )
     if not (config.include_raw or config.include_ema or config.include_delta):
         raise ValueError("at least one observation feature block must be included")
     ema_decay = _require_half_open_zero_one_interval("ema_decay", config.ema_decay)
     if type(config.periods) is not tuple:
         raise ValueError(
-            f"periods must be an actual tuple, got {type(config.periods).__name__}"
+            "periods must be an actual tuple"
         )
     canonical_periods = tuple(
         _require_positive_real("period", p) for p in config.periods
