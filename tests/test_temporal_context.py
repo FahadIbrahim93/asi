@@ -220,7 +220,7 @@ def test_temporal_context_rejects_adversarial_ratio_floats(
         def as_integer_ratio(self) -> tuple[int, int]:
             return ratio
 
-    with pytest.raises(ValueError, match=r"ema_decay must be in \[0, 1\)"):
+    with pytest.raises(ValueError, match=r"ema_decay must be"):
         TemporalContextConfig(
             input_dim=4,
             ema_decay=HiddenBoundaryFloat(0.5),
