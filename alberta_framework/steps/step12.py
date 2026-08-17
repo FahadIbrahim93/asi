@@ -173,18 +173,10 @@ _ACTUAL_INT_TYPES = frozenset(
         np.ulonglong,
     }
 )
-_NUMPY_INTEGER_TYPES = _ACTUAL_INT_TYPES - {int}
 
 
-def _require_exact_str(name: str, value: object) -> str:
-    if type(value) is not str:
-        raise ValueError(f"{name} must be an exact string")
-    return value
-
-
-def _require_unit_interval(name: object, value: object) -> float:
-    host_name = _require_exact_str("name", name)
-    real, numerator, denominator, narrowed = finite_real_and_float32(host_name, value)
+def _require_unit_interval(name: str, value: object) -> float:
+    real, numerator, denominator, narrowed = finite_real_and_float32(name, value)
     if (
         real < 0.0
         or not real <= 1.0
@@ -193,59 +185,54 @@ def _require_unit_interval(name: object, value: object) -> float:
         or narrowed < 0.0
         or not narrowed <= 1.0
     ):
-        raise ValueError(f"{host_name} must be in [0, 1]")
+        raise ValueError(f"{name} must be in [0, 1]")
     return float(narrowed)
 
 
-def _require_nonnegative_real(name: object, value: object) -> float:
-    host_name = _require_exact_str("name", name)
-    real, numerator, _, narrowed = finite_real_and_float32(host_name, value)
+def _require_nonnegative_real(name: str, value: object) -> float:
+    real, numerator, _, narrowed = finite_real_and_float32(name, value)
     if real < 0.0 or numerator < 0 or narrowed < 0.0:
-        raise ValueError(f"{host_name} must be non-negative")
+        raise ValueError(f"{name} must be non-negative")
     return float(narrowed)
 
 
-def _require_positive_real(name: object, value: object) -> float:
-    host_name = _require_exact_str("name", name)
-    real, numerator, _, narrowed = finite_real_and_float32(host_name, value)
+def _require_positive_real(name: str, value: object) -> float:
+    real, numerator, _, narrowed = finite_real_and_float32(name, value)
     if real <= 0.0 or numerator <= 0 or narrowed <= 0.0:
-        raise ValueError(f"{host_name} must be positive")
+        raise ValueError(f"{name} must be positive")
     return float(narrowed)
 
 
-def _require_real_scalar(name: object, value: object) -> float:
-    host_name = _require_exact_str("name", name)
-    _, _, _, narrowed = finite_real_and_float32(host_name, value)
+def _require_real_scalar(name: str, value: object) -> float:
+    _, _, _, narrowed = finite_real_and_float32(name, value)
     return float(narrowed)
 
 
 def _require_int(
-    name: object,
+    name: str,
     value: object,
     *,
     minimum: int | None = None,
     maximum: int | None = None,
 ) -> int:
-    host_name = _require_exact_str("name", name)
     actual_type = type(value)
     if actual_type not in _ACTUAL_INT_TYPES:
-        raise ValueError(f"{host_name} must be an integer")
+        raise ValueError(f"{name} must be an integer")
     number = int(cast(Integral, value))
     if minimum is not None and number < minimum:
         if minimum == 1:
-            raise ValueError(f"{host_name} must be positive")
+            raise ValueError(f"{name} must be positive")
         if minimum == 0:
-            raise ValueError(f"{host_name} must be non-negative")
-        raise ValueError(f"{host_name} must be >= {minimum}")
+            raise ValueError(f"{name} must be non-negative")
+        raise ValueError(f"{name} must be >= {minimum}")
     if maximum is not None and number > maximum:
-        raise ValueError(f"{host_name} must be <= {maximum}")
+        raise ValueError(f"{name} must be <= {maximum}")
     return number
 
 
-def _require_bool(name: object, value: object) -> bool:
-    host_name = _require_exact_str("name", name)
+def _require_bool(name: str, value: object) -> bool:
     if type(value) is not bool:
-        raise ValueError(f"{host_name} must be a boolean")
+        raise ValueError(f"{name} must be a boolean")
     return value
 
 
