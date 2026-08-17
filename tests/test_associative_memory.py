@@ -229,7 +229,6 @@ def test_corrupted_active_family_logits_remain_fail_visible() -> None:
     [
         "values",
         "utility",
-        "counts",
         "prior",
         "family_logits",
         "window_logits",
@@ -254,8 +253,6 @@ def test_update_rejects_nonfinite_source_state_leaf(leaf: str) -> None:
         state = state.replace(values=state.values.at[0, 0].set(poison))
     elif leaf == "utility":
         state = state.replace(utility=state.utility.at[0].set(poison))
-    elif leaf == "counts":
-        state = state.replace(counts=state.counts.at[0].set(poison))
     elif leaf == "prior":
         state = state.replace(prior=state.prior.at[0].set(poison))
     elif leaf == "family_logits":
@@ -284,7 +281,7 @@ def test_array_runner_exposes_rejected_update_mask() -> None:
         AssociativeMemoryConfig(vocab_size=4, block_size=3, suffix_length=2, max_features=8)
     )
     state = learner.init().replace(
-        counts=learner.init().counts.at[0].set(jnp.asarray(jnp.inf, dtype=jnp.float32))
+        counts=learner.init().counts.at[0].set(jnp.asarray(-1, dtype=jnp.int32))
     )
     contexts = jnp.asarray([[1, 2, 3], [2, 3, 0]], dtype=jnp.int32)
     labels = jnp.asarray([1, 2], dtype=jnp.int32)
@@ -533,7 +530,35 @@ def test_evicted_row_is_reset_before_a_new_key_writes_into_it() -> None:
     chex.assert_trees_all_close(rows[:, 3], jnp.zeros((rows.shape[0],), dtype=jnp.float32))
     assert bool(jnp.all(rows[:, 1] > 0.0))
     assert int(jnp.argmax(prediction.logits)) == 1
-    chex.assert_trees_all_close(state.counts[slots], jnp.ones((rows.shape[0],), dtype=jnp.float32))
+    chex.assert_trees_all_equal(state.counts[slots], jnp.ones((rows.shape[0],), dtype=jnp.int32))
+
+
+def test_associative_row_counts_advance_past_float32_integer_limit() -> None:
+    learner = AssociativeMemoryLearner(
+        AssociativeMemoryConfig(
+            vocab_size=4,
+            block_size=2,
+            suffix_length=2,
+            feature_family="position_token",
+            max_features=2,
+        )
+    )
+    context = jnp.asarray([0, 1], dtype=jnp.int32)
+    label = jnp.asarray(2, dtype=jnp.int32)
+    state = learner.update(learner.init(), context, label).state
+    prediction = learner.predict(state, context)
+    active_slots = prediction.indices[prediction.feature_mask > 0]
+    state = state.replace(
+        counts=state.counts.at[active_slots].set(jnp.asarray(2**24, dtype=jnp.int32))
+    )
+
+    result = learner.update(state, context, label)
+
+    assert bool(result.update_applied)
+    chex.assert_trees_all_equal(
+        result.state.counts[active_slots],
+        jnp.full(active_slots.shape, 2**24 + 1, dtype=jnp.int32),
+    )
 
 
 def test_associative_adaptive_family_scope_prefers_useful_pairs() -> None:
