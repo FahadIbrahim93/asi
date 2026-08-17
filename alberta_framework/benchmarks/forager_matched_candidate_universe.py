@@ -53,6 +53,44 @@ class ForagerMatchedCandidateUniverseError(ValueError):
     """The candidate-universe artifact or one of its bindings is invalid."""
 
 
+def _require_exact_int(value: Any, path: str) -> int:
+    if type(value) is not int:
+        raise ForagerMatchedCandidateUniverseError(f"{path} must be an integer")
+    return value
+
+
+def _require_exact_bool(value: Any, path: str) -> bool:
+    if type(value) is not bool:
+        raise ForagerMatchedCandidateUniverseError(f"{path} must be a boolean")
+    return value
+
+
+def _require_finite_real(value: Any, path: str) -> float:
+    if type(value) is bool or not isinstance(value, (int, float)):
+        raise ForagerMatchedCandidateUniverseError(f"{path} must be a finite number")
+    try:
+        number = float(value)
+    except (OverflowError, ValueError) as exc:
+        raise ForagerMatchedCandidateUniverseError(f"{path} must be a finite number") from exc
+    if not math.isfinite(number):
+        raise ForagerMatchedCandidateUniverseError(f"{path} must be a finite number")
+    return number
+
+
+def _require_seed_identities(values: object, *, name: str) -> tuple[int, ...]:
+    if type(values) is bool:
+        raise ForagerMatchedCandidateUniverseError(f"{name} must not be a boolean")
+    if isinstance(values, (str, bytes)):
+        raise ForagerMatchedCandidateUniverseError(f"{name} must be a sequence of integer seeds")
+    try:
+        raw: tuple[object, ...] = tuple(values)  # type: ignore[arg-type]
+    except TypeError as exc:
+        raise ForagerMatchedCandidateUniverseError(
+            f"{name} must be a sequence of integer seeds"
+        ) from exc
+    return tuple(_require_exact_int(item, f"{name}[{index}]") for index, item in enumerate(raw))
+
+
 @dataclass(frozen=True)
 class ScreeningArtifactBinding:
     """Exact JSON bindings for one historical open-development screen."""
@@ -68,6 +106,18 @@ class ScreeningArtifactBinding:
     protocol_schema_version: str
     horizon_per_seed: int
     candidate_count: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "horizon_per_seed",
+            _require_exact_int(self.horizon_per_seed, "horizon_per_seed"),
+        )
+        object.__setattr__(
+            self,
+            "candidate_count",
+            _require_exact_int(self.candidate_count, "candidate_count"),
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -124,6 +174,23 @@ class LocalCandidateGenerationBinding:
     source_inventory_sha256: str
     artifacts: tuple[BoundJsonArtifact, ...]
 
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "seeds",
+            _require_seed_identities(self.seeds, name="seeds"),
+        )
+        object.__setattr__(
+            self,
+            "horizon_per_seed",
+            _require_exact_int(self.horizon_per_seed, "horizon_per_seed"),
+        )
+        object.__setattr__(
+            self,
+            "candidate_count",
+            _require_exact_int(self.candidate_count, "candidate_count"),
+        )
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "screen_id": self.screen_id,
@@ -162,6 +229,21 @@ class ScreenedArmDecision:
     worker_configuration_sha256: str | None = None
     historical_descriptor_sha256: str | None = None
 
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "open_development_rank",
+            _require_exact_int(self.open_development_rank, "open_development_rank"),
+        )
+        object.__setattr__(
+            self,
+            "open_development_aggregate_mean",
+            _require_finite_real(
+                self.open_development_aggregate_mean,
+                "open_development_aggregate_mean",
+            ),
+        )
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "screen_id": self.screen_id,
@@ -193,6 +275,13 @@ class RegisteredCandidateDecision:
     rng_relationship: str
     observation_access: str
     rationale: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "pairing_eligible",
+            _require_exact_bool(self.pairing_eligible, "pairing_eligible"),
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -1399,12 +1488,6 @@ def _read_bound_json(
 def _require_false(value: Mapping[str, Any], key: str, context: str) -> None:
     if value.get(key) is not False:
         raise ForagerMatchedCandidateUniverseError(f"{context}.{key} must be false")
-
-
-def _require_exact_int(value: Any, path: str) -> int:
-    if type(value) is not int:
-        raise ForagerMatchedCandidateUniverseError(f"{path} must be an integer")
-    return value
 
 
 def _require_exact_int_list(value: Any, path: str) -> list[int]:
