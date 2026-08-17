@@ -533,6 +533,27 @@ class UPGDLearner:
             msg = f"hidden_sizes must contain only positive sizes, got {hidden_sizes!r}"
             raise ValueError(msg)
         validated_step_size = validated_float32_scalar("step_size", step_size, lower=0.0)
+        utility_decay = validated_float32_scalar(
+            "utility_decay",
+            utility_decay,
+            lower=0.0,
+            upper=1.0,
+            upper_inclusive=False,
+        )
+        sparsity = validated_float32_scalar("sparsity", sparsity, lower=0.0, upper=1.0)
+        head_step_size_multiplier = validated_float32_scalar(
+            "head_step_size_multiplier",
+            head_step_size_multiplier,
+            positive=True,
+        )
+        adaptive_kappa_base = validated_float32_scalar(
+            "adaptive_kappa_base", adaptive_kappa_base, positive=True
+        )
+        readout_adaptive_gate_width = validated_float32_scalar(
+            "readout_adaptive_gate_width",
+            readout_adaptive_gate_width,
+            positive=True,
+        )
         if perturbation_sigma < 0.0:
             msg = f"perturbation_sigma must be non-negative, got {perturbation_sigma}"
             raise ValueError(msg)
