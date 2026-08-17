@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+from typing import Final
+
+import jax
 import jax.numpy as jnp
 from jax import Array
+
+_INT32_MAX: Final[int] = (1 << 31) - 1
 
 
 def _require_exact_str(name: str, value: object) -> str:
@@ -13,11 +18,13 @@ def _require_exact_str(name: str, value: object) -> str:
 
 
 def require_positive_builtin_int(value: object, *, name: str) -> int:
-    """Return an exact built-in positive integer or fail before JAX tracing."""
+    """Return an exact positive built-in integer in the JAX int32 domain."""
 
     _require_exact_str("name", name)
-    if type(value) is not int or value < 1:
-        raise ValueError(f"{name} must be a positive built-in integer")
+    if type(value) is not int or not 1 <= value <= _INT32_MAX:
+        raise ValueError(
+            f"{name} must be a positive built-in integer at most int32 max ({_INT32_MAX})"
+        )
     return value
 
 
@@ -31,7 +38,19 @@ def stable_smallest_mask(scores: Array, count: int) -> Array:
     public stream constructors impose their stricter positive-count contract.
     """
 
-    if type(count) is not int or not 0 <= count <= scores.shape[-1]:
+    if type(count) is not int or count < 0:
+        raise ValueError("count must be a built-in integer within the candidate axis")
+    score_type = type(scores)
+    if not (
+        issubclass(score_type, jax.Array)
+        or issubclass(score_type, jax.core.Tracer)
+    ):
+        raise ValueError("scores must be a JAX array")
+    if scores.ndim < 1:
+        raise ValueError("scores must have a candidate axis")
+    if not jnp.issubdtype(scores.dtype, jnp.floating):
+        raise ValueError("scores must have a floating dtype")
+    if count > scores.shape[-1]:
         raise ValueError("count must be a built-in integer within the candidate axis")
     finite_scores = jnp.where(jnp.isfinite(scores), scores, jnp.inf)
     order = jnp.argsort(finite_scores, axis=-1, stable=True)
