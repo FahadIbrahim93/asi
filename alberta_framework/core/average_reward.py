@@ -123,6 +123,17 @@ def _validated_nonnegative_float32_scalar(
     return stored
 
 
+def _validated_float32_scalar_preserving_nonzero(name: str, value: object) -> float:
+    """Validate a signed float32 scalar without erasing an exact nonzero."""
+    stored, numerator, denominator = validated_float32_scalar_with_ratio(name, value)
+    if (
+        numerator != 0
+        and abs(numerator) * _FLOAT32_HALF_MIN_SUBNORMAL_DENOMINATOR <= denominator
+    ):
+        raise ValueError(f"{name} must remain nonzero once narrowed to float32")
+    return stored
+
+
 def _preflight_actor_state(
     n_actions: int,
     observation_dim: int,
@@ -163,6 +174,24 @@ def _preflight_differential_sarsa_state(n_actions: int, feature_dim: int) -> Non
     scalar_count = float32_scalars + 6
     _require_state_resources(
         "differential SARSA",
+        scalars=scalar_count,
+        nbytes=4 * scalar_count,
+    )
+
+
+def _preflight_differential_td_state(feature_dim: int) -> None:
+    scalar_count = 2 * feature_dim + 4
+    _require_state_resources(
+        "differential TD",
+        scalars=scalar_count,
+        nbytes=4 * scalar_count,
+    )
+
+
+def _preflight_differential_gtd_state(feature_dim: int) -> None:
+    scalar_count = 3 * feature_dim + 5
+    _require_state_resources(
+        "differential GTD",
         scalars=scalar_count,
         nbytes=4 * scalar_count,
     )
@@ -1064,8 +1093,7 @@ class AverageRewardHordeLearner:
 
     def init(self, feature_dim: int, key: Array) -> AverageRewardHordeState:
         """Initialize shared-trunk and per-demon reward-rate state."""
-        if feature_dim < 1:
-            raise ValueError("feature_dim must be positive")
+        feature_dim = _require_int32("feature_dim", feature_dim, minimum=1)
         return AverageRewardHordeState(
             learner_state=self._learner.init(feature_dim, key),
             average_rewards=jnp.zeros(self._n_demons, dtype=jnp.float32),
@@ -1217,8 +1245,11 @@ class DifferentialGTDLearner:
         average_reward: float = 0.0,
     ) -> DifferentialGTDState:
         """Initialize primary weights, secondary weights, and traces."""
-        if feature_dim < 1:
-            raise ValueError("feature_dim must be positive")
+        feature_dim = _require_int32("feature_dim", feature_dim, minimum=1)
+        _preflight_differential_gtd_state(feature_dim)
+        average_reward = _validated_float32_scalar_preserving_nonzero(
+            "average_reward", average_reward
+        )
         return DifferentialGTDState(
             weights=jnp.zeros(feature_dim, dtype=jnp.float32),
             bias=jnp.array(0.0, dtype=jnp.float32),
@@ -1379,8 +1410,11 @@ class DifferentialTDLearner:
         average_reward: float = 0.0,
     ) -> DifferentialTDState:
         """Initialize value weights, traces, and reward-rate estimate."""
-        if feature_dim < 1:
-            raise ValueError("feature_dim must be positive")
+        feature_dim = _require_int32("feature_dim", feature_dim, minimum=1)
+        _preflight_differential_td_state(feature_dim)
+        average_reward = _validated_float32_scalar_preserving_nonzero(
+            "average_reward", average_reward
+        )
         return DifferentialTDState(
             weights=jnp.zeros(feature_dim, dtype=jnp.float32),
             bias=jnp.array(0.0, dtype=jnp.float32),

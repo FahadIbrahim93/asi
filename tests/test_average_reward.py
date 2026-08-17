@@ -1040,3 +1040,76 @@ def test_differential_sarsa_preflights_state_before_allocation() -> None:
         agent.init(last_legal_feature_dim + 1, jr.key(0))
     with pytest.raises(ValueError, match="feature_dim"):
         agent.init(True, jr.key(0))  # type: ignore[arg-type]
+
+
+def test_differential_learners_integer_validation() -> None:
+    gtd = DifferentialGTDLearner(DifferentialGTDConfig())
+    td = DifferentialTDLearner(DifferentialTDConfig())
+    horde = AverageRewardHordeLearner(n_demons=2, hidden_sizes=(16,))
+
+    with pytest.raises(ValueError, match="feature_dim"):
+        gtd.init(feature_dim=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="feature_dim"):
+        gtd.init(feature_dim=0)
+    with pytest.raises(ValueError, match="feature_dim"):
+        gtd.init(feature_dim=4.5)  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="feature_dim"):
+        td.init(feature_dim=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="feature_dim"):
+        td.init(feature_dim=0)
+
+    with pytest.raises(ValueError, match="feature_dim"):
+        horde.init(feature_dim=True, key=jr.key(0))  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="feature_dim"):
+        horde.init(feature_dim=0, key=jr.key(0))
+
+    s_gtd = gtd.init(feature_dim=np.int32(4))
+    s_td = td.init(feature_dim=np.int64(4))
+    s_horde = horde.init(feature_dim=np.int32(4), key=jr.key(0))
+
+    assert s_gtd.weights.shape == (4,)
+    assert s_td.weights.shape == (4,)
+    assert s_horde.average_rewards.shape == (2,)
+
+
+def test_differential_initializers_preflight_state_before_allocation() -> None:
+    gtd = DifferentialGTDLearner(DifferentialGTDConfig())
+    td = DifferentialTDLearner(DifferentialTDConfig())
+    max_float32_scalars = (2**31 - 1) // 4
+    last_legal_td_dim = (max_float32_scalars - 4) // 2
+    last_legal_gtd_dim = (max_float32_scalars - 5) // 3
+
+    with pytest.raises(ValueError, match="differential TD state bytes"):
+        td.init(feature_dim=last_legal_td_dim + 1)
+    with pytest.raises(ValueError, match="differential GTD state bytes"):
+        gtd.init(feature_dim=last_legal_gtd_dim + 1)
+
+
+@pytest.mark.parametrize("learner_type", [DifferentialTDLearner, DifferentialGTDLearner])
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_differential_initializers_reject_nonfinite_average_reward(
+    learner_type, value
+) -> None:
+    learner = learner_type()
+    with pytest.raises(ValueError, match="average_reward"):
+        learner.init(feature_dim=1, average_reward=value)
+
+
+@pytest.mark.parametrize("learner_type", [DifferentialTDLearner, DifferentialGTDLearner])
+@pytest.mark.parametrize("value", [2.0**-150, -(2.0**-150), 5e-324, -5e-324])
+def test_differential_initializers_reject_average_reward_underflow(
+    learner_type, value
+) -> None:
+    learner = learner_type()
+    with pytest.raises(ValueError, match="average_reward must remain nonzero"):
+        learner.init(feature_dim=1, average_reward=value)
+
+
+@pytest.mark.parametrize("learner_type", [DifferentialTDLearner, DifferentialGTDLearner])
+@pytest.mark.parametrize("value", [0.0, 2.0**-149, -(2.0**-149)])
+def test_differential_initializers_preserve_zero_and_float32_minsubnormal(
+    learner_type, value
+) -> None:
+    state = learner_type().init(feature_dim=1, average_reward=value)
+    assert float(state.average_reward) == value
