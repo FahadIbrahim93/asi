@@ -106,6 +106,13 @@ class MatchedTask:
     task_identity_sha256: str
     environment_rng_schedule_sha256: str
 
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "aperture_size",
+            _require_int(self.aperture_size, "task.aperture_size", minimum=1, maximum=65_535),
+        )
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "task_id": self.task_id,
@@ -268,6 +275,13 @@ class AgentRNGContract:
     identity: str
     environment_key_shared: bool
 
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "environment_key_shared",
+            _require_bool(self.environment_key_shared, "agent_rng.environment_key_shared"),
+        )
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "identity": self.identity,
@@ -318,6 +332,48 @@ class ResourceAccounting:
     replay_capacity_transitions: int
     recurrent_state_elements: int
 
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "parameter_count",
+            _require_int(
+                self.parameter_count,
+                "resources.parameter_count",
+                minimum=0,
+                maximum=_MAX_RESOURCE_COUNT,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "optimizer_update_count",
+            _require_int(
+                self.optimizer_update_count,
+                "resources.optimizer_update_count",
+                minimum=0,
+                maximum=_MAX_RESOURCE_COUNT,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "replay_capacity_transitions",
+            _require_int(
+                self.replay_capacity_transitions,
+                "resources.replay_capacity_transitions",
+                minimum=0,
+                maximum=_MAX_RESOURCE_COUNT,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "recurrent_state_elements",
+            _require_int(
+                self.recurrent_state_elements,
+                "resources.recurrent_state_elements",
+                minimum=0,
+                maximum=_MAX_RESOURCE_COUNT,
+            ),
+        )
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "parameter_count": self.parameter_count,
@@ -334,6 +390,13 @@ class PairingEligibility:
     analysis_role: AnalysisRole
     eligible: bool
     exclusion_reasons: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "eligible",
+            _require_bool(self.eligible, "pairing.eligible"),
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -420,6 +483,13 @@ class SelectionSlot:
     selection_group: str
     rank: int
 
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "rank",
+            _require_int(self.rank, "selection_slot.rank", minimum=1, maximum=_MAX_CANDIDATES),
+        )
+
     def to_dict(self) -> dict[str, Any]:
         return {"selection_group": self.selection_group, "rank": self.rank}
 
@@ -431,6 +501,18 @@ class SelectionGroup:
     selection_group: str
     candidate_ids: tuple[str, ...]
     advance_count: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "advance_count",
+            _require_int(
+                self.advance_count,
+                "selection_group.advance_count",
+                minimum=1,
+                maximum=_MAX_CANDIDATES,
+            ),
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {
