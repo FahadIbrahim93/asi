@@ -411,3 +411,66 @@ def test_cumulant_discovery_age_saturates_at_int32_max() -> None:
     advanced = discovery.step(state, jnp.ones(2), jnp.ones(2))
 
     assert int(advanced.ages[0]) == 2**31 - 1
+
+
+def test_cumulant_discovery_requires_exact_bool_and_typed_threefry_key() -> None:
+    with pytest.raises(ValueError, match="enabled"):
+        CumulantDiscovery(raw_dim=2, enabled=np.bool_(True))  # type: ignore[arg-type]
+
+    discovery = CumulantDiscovery(raw_dim=2)
+    with pytest.raises(ValueError, match="typed scalar threefry2x32"):
+        discovery.init(jr.key_data(jr.key(0)))
+
+
+@pytest.mark.parametrize("shape", [(), (1,), (1, 2), (2, 1), (3,)])
+def test_cumulant_discovery_rejects_wrong_observation_shapes(
+    shape: tuple[int, ...]
+) -> None:
+    discovery = CumulantDiscovery(raw_dim=2, n_candidates=2)
+    state = discovery.init(jr.key(0))
+    malformed = jnp.zeros(shape, dtype=jnp.float32)
+    with pytest.raises(ValueError, match="observation"):
+        discovery.cumulants(state, malformed)
+    with pytest.raises(ValueError, match="observation"):
+        discovery.step(state, malformed, jnp.zeros((2,), dtype=jnp.float32))
+
+    with pytest.raises(ValueError, match="dtype float32"):
+        discovery.cumulants(state, jnp.zeros((2,), dtype=jnp.int32))
+
+
+def test_cumulant_discovery_state_contract_and_invalid_atomicity() -> None:
+    discovery = CumulantDiscovery(raw_dim=2, n_candidates=2, replacement_rate=1.0)
+    state = discovery.init(jr.key(0))
+    malformed = state.replace(weights=jnp.zeros((2,), dtype=jnp.float32))
+    with pytest.raises(ValueError, match="state.weights"):
+        discovery.step(
+            malformed,
+            jnp.zeros((2,), dtype=jnp.float32),
+            jnp.zeros((2,), dtype=jnp.float32),
+        )
+
+    invalid = state.replace(ages=jnp.asarray([-1, 0], dtype=jnp.int32))
+    replaced = discovery.maybe_replace(invalid)
+    chex.assert_trees_all_equal(replaced, invalid)
+
+    nonfinite = state.replace(utility=jnp.asarray([jnp.nan, 0.0], dtype=jnp.float32))
+    stepped = discovery.step(
+        nonfinite,
+        jnp.zeros((2,), dtype=jnp.float32),
+        jnp.zeros((2,), dtype=jnp.float32),
+    )
+    chex.assert_trees_all_equal(stepped, nonfinite)
+
+
+def test_cumulant_discovery_hostile_observation_failure_is_normalized() -> None:
+    class HostileObservation:
+        def __jax_array__(self):
+            raise RuntimeError("hostile conversion")
+
+        def __repr__(self) -> str:
+            raise AssertionError("untrusted repr hook executed")
+
+    discovery = CumulantDiscovery(raw_dim=2)
+    state = discovery.init(jr.key(0))
+    with pytest.raises(ValueError, match="readable float32 vector"):
+        discovery.cumulants(state, HostileObservation())  # type: ignore[arg-type]
