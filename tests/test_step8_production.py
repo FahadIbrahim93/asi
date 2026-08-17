@@ -19,6 +19,7 @@ import numpy as np
 import pytest
 
 from alberta_framework.steps.step8 import (
+    Step8SmokeResult,
     Step8WorldModelConfig,
     init_step8_state,
     make_step8_world_model,
@@ -424,3 +425,48 @@ def test_step8_world_model_rejects_spoofed_int_class_and_adversarial_ratios() ->
 
     with pytest.raises(ValueError, match="utility_decay"):
         Step8WorldModelConfig(utility_decay=SpoofedIntFloat(0.5))
+
+
+def _legal_step8_smoke_result(**overrides: object) -> Step8SmokeResult:
+    payload: dict[str, object] = {
+        "config": Step8WorldModelConfig(),
+        "steps": 8,
+        "seed": 0,
+        "reward_predictions_shape": (8,),
+        "next_observation_predictions_shape": (8, 4),
+        "reward_errors_shape": (8,),
+        "next_observation_errors_shape": (8, 4),
+        "finite": True,
+        "model_config": {"ok": True},
+    }
+    payload.update(overrides)
+    return Step8SmokeResult(**payload)  # type: ignore[arg-type]
+
+
+def test_step8_smoke_result_rejects_leftover_identities() -> None:
+    """Public Step 8 smoke records must not keep leftover bool/int identities."""
+
+    with pytest.raises(ValueError, match="steps"):
+        _legal_step8_smoke_result(steps=True)
+    with pytest.raises(ValueError, match="steps"):
+        _legal_step8_smoke_result(steps=float("nan"))
+    with pytest.raises(ValueError, match="seed"):
+        _legal_step8_smoke_result(seed=True)
+    with pytest.raises(ValueError, match="finite"):
+        _legal_step8_smoke_result(finite=1)
+
+    legal = _legal_step8_smoke_result()
+    dumped = json.dumps(
+        {
+            "steps": legal.steps,
+            "seed": legal.seed,
+            "finite": legal.finite,
+        },
+        allow_nan=False,
+    )
+    assert '"steps": 8' in dumped
+    assert '"seed": 0' in dumped
+    assert '"finite": true' in dumped
+    assert '"steps": true' not in dumped
+    assert '"seed": true' not in dumped
+    assert '"finite": 1' not in dumped
