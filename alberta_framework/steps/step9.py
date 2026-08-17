@@ -33,6 +33,7 @@ import chex
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 from jax import Array
 
 from alberta_framework._seed_validation import require_jax_seed
@@ -69,6 +70,27 @@ from alberta_framework.steps.step6 import (
 )
 
 _INT32_MAX = 2**31 - 1
+_ACTUAL_INT_TYPES = frozenset(
+    {
+        int,
+        np.int8,
+        np.int16,
+        np.int32,
+        np.int64,
+        np.uint8,
+        np.uint16,
+        np.uint32,
+        np.uint64,
+        np.longlong,
+        np.ulonglong,
+    }
+)
+
+
+def _require_exact_str(name: str, value: object) -> str:
+    if type(value) is not str:
+        raise ValueError(f"{name} must be an exact string")
+    return value
 
 
 @dataclass(frozen=True)
@@ -181,20 +203,23 @@ class Step9DreamingConfig:
         )
 
 
-def _require_real(name: str, value: object) -> float:
-    real, _, _, narrowed = finite_real_and_float32(name, value)
+def _require_real(name: object, value: object) -> float:
+    host_name = _require_exact_str("name", name)
+    real, _, _, narrowed = finite_real_and_float32(host_name, value)
     return canonical_float32_storage(real, narrowed)
 
 
-def _require_nonneg_real(name: str, value: object) -> float:
-    real, numerator, _, narrowed = finite_real_and_float32(name, value)
+def _require_nonneg_real(name: object, value: object) -> float:
+    host_name = _require_exact_str("name", name)
+    real, numerator, _, narrowed = finite_real_and_float32(host_name, value)
     if real < 0.0 or numerator < 0 or narrowed < 0.0:
-        raise ValueError(f"{name} must be non-negative, got {value!r}")
+        raise ValueError(f"{host_name} must be non-negative")
     return canonical_float32_storage(real, narrowed)
 
 
-def _require_unit_interval(name: str, value: object) -> float:
-    real, numerator, denominator, narrowed = finite_real_and_float32(name, value)
+def _require_unit_interval(name: object, value: object) -> float:
+    host_name = _require_exact_str("name", name)
+    real, numerator, denominator, narrowed = finite_real_and_float32(host_name, value)
     if (
         real < 0.0
         or not real <= 1.0
@@ -203,12 +228,13 @@ def _require_unit_interval(name: str, value: object) -> float:
         or narrowed < 0.0
         or not narrowed <= 1.0
     ):
-        raise ValueError(f"{name} must be in [0, 1], got {value!r}")
+        raise ValueError(f"{host_name} must be in [0, 1]")
     return canonical_float32_storage(real, narrowed)
 
 
-def _require_half_open_unit_interval(name: str, value: object) -> float:
-    real, numerator, denominator, narrowed = finite_real_and_float32(name, value)
+def _require_half_open_unit_interval(name: object, value: object) -> float:
+    host_name = _require_exact_str("name", name)
+    real, numerator, denominator, narrowed = finite_real_and_float32(host_name, value)
     if (
         real < 0.0
         or not real < 1.0
@@ -217,35 +243,37 @@ def _require_half_open_unit_interval(name: str, value: object) -> float:
         or narrowed < 0.0
         or not narrowed < 1.0
     ):
-        raise ValueError(f"{name} must be in [0, 1), got {value!r}")
+        raise ValueError(f"{host_name} must be in [0, 1)")
     return canonical_float32_storage(real, narrowed)
 
 
 def _require_int(
-    name: str,
+    name: object,
     value: object,
     *,
     minimum: int | None = None,
     maximum: int | None = None,
 ) -> int:
+    host_name = _require_exact_str("name", name)
     actual_type = type(value)
-    if issubclass(actual_type, bool) or not issubclass(actual_type, Integral):
-        raise ValueError(f"{name} must be an integer, got {value!r}")
+    if actual_type not in _ACTUAL_INT_TYPES:
+        raise ValueError(f"{host_name} must be an integer")
     number = int(cast(Integral, value))
     if minimum is not None and number < minimum:
         if minimum == 1:
-            raise ValueError(f"{name} must be positive, got {value!r}")
+            raise ValueError(f"{host_name} must be positive")
         if minimum == 0:
-            raise ValueError(f"{name} must be non-negative, got {value!r}")
-        raise ValueError(f"{name} must be >= {minimum}, got {value!r}")
+            raise ValueError(f"{host_name} must be non-negative")
+        raise ValueError(f"{host_name} must be >= {minimum}")
     if maximum is not None and number > maximum:
-        raise ValueError(f"{name} must be <= {maximum}, got {value!r}")
+        raise ValueError(f"{host_name} must be <= {maximum}")
     return number
 
 
-def _require_bool(name: str, value: object) -> bool:
-    if not isinstance(value, bool):
-        raise ValueError(f"{name} must be a bool, got {value!r}")
+def _require_bool(name: object, value: object) -> bool:
+    host_name = _require_exact_str("name", name)
+    if type(value) is not bool:
+        raise ValueError(f"{host_name} must be a built-in bool")
     return value
 
 
@@ -262,10 +290,7 @@ def _validate_dreaming_config(config: Step9DreamingConfig) -> None:
             f"n_actions ({n_actions})"
         )
     if type(config.model_hidden_sizes) is not tuple:
-        raise ValueError(
-            f"model_hidden_sizes must be a tuple of integers, got "
-            f"{config.model_hidden_sizes!r}"
-        )
+        raise ValueError("model_hidden_sizes must be a tuple of integers")
     model_hidden_sizes = tuple(
         _require_int("model_hidden_sizes", size, minimum=1, maximum=_INT32_MAX)
         for size in config.model_hidden_sizes
