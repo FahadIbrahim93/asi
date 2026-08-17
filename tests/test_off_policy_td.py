@@ -924,7 +924,10 @@ def test_config_scalars_canonicalize_reals_and_preserve_infinity_clip_sentinel()
             gradient.trace_decay,
         )
     )
-    huge_finite = np.longdouble("1e400")
+    # finfo.max is finite on every platform (np.longdouble is only 64-bit on
+    # some targets, where "1e400" would overflow to the legal inf sentinel)
+    # while still exceeding the float32 range, so narrowing must reject it.
+    huge_finite = np.longdouble(np.finfo(np.longdouble).max)
     with pytest.raises(ValueError, match="retrace_clip"):
         OffPolicyTDLinearLearner(retrace_clip=huge_finite)
     with pytest.raises(ValueError, match="ratio_clip"):
