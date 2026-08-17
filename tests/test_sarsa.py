@@ -1459,16 +1459,18 @@ def test_sarsa_prediction_demons_require_exact_nested_scalar_schema() -> None:
         def __repr__(self) -> str:
             raise AssertionError("untrusted repr hook must not run")
 
-    hostile_direct = GVFSpec(
-        name="prediction",
-        demon_type=DemonType.PREDICTION,
-        gamma=0.5,
-        lamda=0.5,
-        cumulant_index=0,
-        terminal_reward=HostileFloat(0.0),
-    )
+    # GVFSpec itself fail-closes on untrusted float subclasses at
+    # construction (exact-type gate, hooks never invoked), so the hostile
+    # spec can no longer even be built.
     with pytest.raises(ValueError, match="terminal_reward"):
-        SARSAAgent(SARSAConfig(n_actions=2), prediction_demons=[hostile_direct])
+        GVFSpec(
+            name="prediction",
+            demon_type=DemonType.PREDICTION,
+            gamma=0.5,
+            lamda=0.5,
+            cumulant_index=0,
+            terminal_reward=HostileFloat(0.0),
+        )
 
     valid = GVFSpec(
         name="prediction",

@@ -31,6 +31,10 @@ Reward = float  # r_t: scalar reward
 _FLOAT32_TINY = float(np.finfo(np.float32).tiny)
 _FLOAT32_HALF_MIN_SUBNORMAL_DENOMINATOR = 1 << 150
 _INT32_MAX = 2**31 - 1
+_ACTUAL_REAL_SCALAR_TYPES = frozenset(
+    {float, np.float16, np.float32, np.float64, int}
+)
+
 _ACTUAL_INT_TYPES = frozenset(
     {int, *(np.dtype(code).type for code in "bBhHiIlLqQpP")}
 )
@@ -709,6 +713,10 @@ def _require_gvf_cumulant_index(value: object) -> int:
 
 def _validated_gvf_reward(value: object) -> float:
     """Validate a float32 reward without silently erasing an exact nonzero."""
+    if type(value) not in _ACTUAL_REAL_SCALAR_TYPES and type(value) not in _ACTUAL_INT_TYPES:
+        # Exact-type gate: untrusted float subclasses must be rejected
+        # without ever invoking their conversion hooks.
+        raise ValueError("terminal_reward must be a finite real number")
     stored, numerator, denominator = validated_float32_scalar_with_ratio(
         "terminal_reward", value
     )

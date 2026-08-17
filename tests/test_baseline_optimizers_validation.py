@@ -27,6 +27,11 @@ class _ClassSpoof:
     def __float__(self) -> float:  # pragma: no cover
         return 0.1
 
+    def __repr__(self) -> str:
+        # Stable id for pytest-xdist: the default repr embeds the memory
+        # address, which desynchronizes parametrized test ids across workers.
+        return "_ClassSpoof()"
+
 
 @pytest.mark.parametrize(
     ("ctor", "field", "bad"),

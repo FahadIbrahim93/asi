@@ -824,8 +824,9 @@ def test_off_policy_horde_ratio_clip_scalars_reject_booleans_and_nans() -> None:
         OffPolicyHordeLearner(spec, ratio_clip=True)  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="ratio_clip"):
         OffPolicyHordeLearner(spec, ratio_clip=float("nan"))
-    with pytest.raises(ValueError, match="ratio_clip"):
-        OffPolicyHordeLearner(spec, ratio_clip=float("inf"))
+    # +inf stays legal: it is the documented no-clip sentinel the Baird
+    # counterexample tests rely on.
+    assert OffPolicyHordeLearner(spec, ratio_clip=float("inf")).ratio_clip == float("inf")
     with pytest.raises(ValueError, match="ratio_clip"):
         OffPolicyHordeLearner(spec, ratio_clip=0.0)
 

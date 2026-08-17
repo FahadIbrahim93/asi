@@ -11,6 +11,7 @@ correction terms that are still separate from this shared-trunk backend.
 from __future__ import annotations
 
 import functools
+import math
 import operator
 import time
 from collections.abc import Mapping
@@ -76,6 +77,17 @@ def _require_float32(name: str, value: object, **bounds: Any) -> float:
     if type(value) not in _TRUSTED_REAL_TYPES:
         raise ValueError(f"{name} must be a finite real scalar")
     return validated_float32_scalar(name, value, **bounds)
+
+
+def _require_positive_clip(name: str, value: object) -> float:
+    """Positive float32 clip that keeps +inf legal as the no-clip sentinel.
+
+    The Baird counterexample tests drive the learner with effectively
+    infinite clips; rejecting +inf breaks that documented usage.
+    """
+    if type(value) is float and math.isinf(value) and value > 0.0:
+        return value
+    return _require_float32(name, value, positive=True)
 
 
 def _preflight_nonlinear_state(*, n_demons: int, hidden_size: int, feature_dim: int) -> None:
@@ -323,8 +335,8 @@ class OffPolicyHordeLearner:
             trace_ratio_clip: Clip for the eligibility-trace ratio.
             min_behavior_probability: Denominator floor for probability API.
         """
-        ratio_clip = _require_float32("ratio_clip", ratio_clip, positive=True)
-        trace_ratio_clip = _require_float32("trace_ratio_clip", trace_ratio_clip, positive=True)
+        ratio_clip = _require_positive_clip("ratio_clip", ratio_clip)
+        trace_ratio_clip = _require_positive_clip("trace_ratio_clip", trace_ratio_clip)
         min_behavior_probability = _require_float32(
             "min_behavior_probability", min_behavior_probability, positive=True
         )
@@ -1000,7 +1012,7 @@ class NonlinearSharedGTDHordeLearner:
         self._secondary_step_size = _require_float32(
             "secondary_step_size", secondary_step_size, positive=True
         )
-        self._ratio_clip = _require_float32("ratio_clip", ratio_clip, positive=True)
+        self._ratio_clip = _require_positive_clip("ratio_clip", ratio_clip)
         self._init_scale = _require_float32("init_scale", init_scale, positive=True)
         _preflight_nonlinear_state(
             n_demons=len(horde_spec.demons), hidden_size=hidden_size, feature_dim=1
