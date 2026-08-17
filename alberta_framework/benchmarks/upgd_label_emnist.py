@@ -97,6 +97,7 @@ import platform
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from numbers import Real
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -422,6 +423,40 @@ def build_schedule(key: Array, config: LabelEMNISTConfig, n_train: int) -> Label
     )
 
 
+def _require_finite_real(name: str, value: object) -> float:
+    actual_type = type(value)
+    if issubclass(actual_type, bool) or not issubclass(actual_type, Real):
+        raise ValueError(f"{name} must be a finite real number")
+    try:
+        number = float(cast(Real, value))
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a finite real number") from exc
+    if not math.isfinite(number):
+        raise ValueError(f"{name} must be a finite real number")
+    return number
+
+
+def _require_nonempty_string(name: str, value: object) -> str:
+    if type(value) is not str or not value:
+        raise ValueError(f"{name} must be a non-empty string")
+    return value
+
+
+def _require_seed_identities(values: object, *, name: str) -> tuple[int, ...]:
+    if type(values) is bool:
+        raise ValueError(f"{name} must not be a boolean")
+    if isinstance(values, (str, bytes)):
+        raise ValueError(f"{name} must be a sequence of integer seeds")
+    try:
+        raw: tuple[object, ...] = tuple(values)  # type: ignore[arg-type]
+    except TypeError as exc:
+        raise ValueError(f"{name} must be a sequence of integer seeds") from exc
+    return tuple(
+        require_jax_seed(value, name=f"{name}[{index}]")
+        for index, value in enumerate(raw)
+    )
+
+
 @dataclass(frozen=True)
 class LabelEMNISTRunResult:
     """Host-side result of one learner's multi-seed run.
@@ -445,6 +480,15 @@ class LabelEMNISTRunResult:
     initial_params: dict[str, np.ndarray] | None = None
     label_permutations: np.ndarray | None = None
     example_indices: np.ndarray | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "learner", _require_nonempty_string("learner", self.learner))
+        object.__setattr__(self, "seeds", _require_seed_identities(self.seeds, name="seeds"))
+        object.__setattr__(
+            self,
+            "wall_clock_seconds",
+            _require_finite_real("wall_clock_seconds", self.wall_clock_seconds),
+        )
 
 
 def resolve_hyperparameters(
