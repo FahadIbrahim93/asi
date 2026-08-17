@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import chex
 import jax
 import jax.numpy as jnp
@@ -243,3 +245,37 @@ class TestDeterminism:
         out1 = run()
         out2 = run()
         chex.assert_trees_all_close(out1, out2)
+
+
+class TestSentinel:
+    def test_legal_nonzero_sentinel_fills_hidden_channels(self) -> None:
+        inner = RandomWalkStream(feature_dim=4, drift_rate=0.0, noise_std=0.0)
+        mask = jnp.array([True, False, True, False])
+        wrapper = PartialObservationWrapper(
+            inner, mode=MaskMode.FIXED, fixed_mask=mask, sentinel=-1.0
+        )
+        timestep, _ = wrapper.step(wrapper.init(jr.key(0)), jnp.array(0))
+        assert float(timestep.observation[1]) == -1.0
+        assert float(timestep.observation[3]) == -1.0
+        assert math.isfinite(float(timestep.observation[0]))
+        assert math.isfinite(float(timestep.observation[2]))
+
+    @pytest.mark.parametrize("sentinel", [float("nan"), float("inf"), float("-inf"), True])
+    def test_rejects_non_finite_or_bool_sentinel(self, sentinel: object) -> None:
+        inner = RandomWalkStream(feature_dim=4, drift_rate=0.0)
+        mask = jnp.array([True, False, True, False])
+        with pytest.raises(ValueError, match="sentinel"):
+            PartialObservationWrapper(
+                inner, mode=MaskMode.FIXED, fixed_mask=mask, sentinel=sentinel
+            )
+
+    def test_rejects_non_real_sentinel(self) -> None:
+        inner = RandomWalkStream(feature_dim=4, drift_rate=0.0)
+        mask = jnp.array([True, False, True, False])
+        with pytest.raises(ValueError, match="sentinel"):
+            PartialObservationWrapper(
+                inner,
+                mode=MaskMode.FIXED,
+                fixed_mask=mask,
+                sentinel="0.0",  # type: ignore[arg-type]
+            )
