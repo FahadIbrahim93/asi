@@ -114,6 +114,16 @@ def _require_alpha(alpha: object) -> float:
     return _require_probability(alpha, name="alpha", strict=True)
 
 
+def _require_positive_int(name: str, value: object) -> int:
+    """Reject bool/float aliases that ordered comparisons treat as legal counts."""
+    if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+        raise ValueError(f"{name} must be a positive integer (got {value!r})")
+    count = int(value)
+    if count <= 0:
+        raise ValueError(f"{name} must be a positive integer (got {value})")
+    return count
+
+
 def _require_p_value(value: object, *, name: str) -> float:
     return _require_probability(value, name=name, strict=False)
 
@@ -666,8 +676,7 @@ def pairwise_comparisons(
     from alberta_framework.utils.experiments import AggregatedResults
 
     alpha_value = _require_alpha(alpha)
-    if window <= 0:
-        raise ValueError(f"window must be positive (got {window})")
+    window = _require_positive_int("window", window)
 
     names = list(results.keys())
     n = len(names)
@@ -817,8 +826,7 @@ def bootstrap_ci(
             f"statistic must be either 'mean' or 'median' (got {statistic!r})"
         )
     _validate_confidence_level(confidence_level)
-    if n_bootstrap <= 0:
-        raise ValueError(f"n_bootstrap must be positive (got {n_bootstrap})")
+    n_bootstrap = _require_positive_int("n_bootstrap", n_bootstrap)
     rng = np.random.default_rng(seed)
 
     stat_func = np.mean if statistic == "mean" else np.median
