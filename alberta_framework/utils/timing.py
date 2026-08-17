@@ -122,13 +122,16 @@ class Timer:
         exc_val: BaseException | None,
         exc_tb: TracebackType | None,
     ) -> None:
-        """Stop the timer and optionally print the duration."""
+        """Stop the timer and report completion or failure, never both."""
         self.end_time = time.perf_counter()
         self.duration = self.end_time - self.start_time
 
         if self.verbose:
             formatted = format_duration(self.duration)
-            self.print_fn(f"{self.name} completed in {formatted}")
+            if exc_type is None:
+                self.print_fn(f"{self.name} completed in {formatted}")
+            else:
+                self.print_fn(f"{self.name} failed after {formatted}")
 
     def elapsed(self) -> float:
         """Get elapsed time since timer started (can be called during execution).
