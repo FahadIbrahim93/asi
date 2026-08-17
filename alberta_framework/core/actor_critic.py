@@ -131,6 +131,33 @@ def _trusted_shape(name: str, value: object) -> tuple[int, ...]:
     return tuple(value.shape)
 
 
+def _validated_bounder_result(
+    name: str,
+    result: object,
+    templates: tuple[Array, ...],
+) -> tuple[tuple[Array, ...], Array]:
+    """Validate one third-party bounder result before using it in state arithmetic."""
+    if type(result) is not tuple or len(result) != 2:
+        raise ValueError(f"{name} bounder result must be a (steps, metric) tuple")
+    steps, metric = result
+    if type(steps) is not tuple or len(steps) != len(templates):
+        raise ValueError(f"{name} bounder steps must match the parameter tree")
+    for step, template in zip(steps, templates, strict=True):
+        if (
+            not isinstance(step, jax.Array)
+            or tuple(step.shape) != tuple(template.shape)
+            or step.dtype != template.dtype
+        ):
+            raise ValueError(f"{name} bounder steps must match parameter shapes and dtypes")
+    if (
+        not isinstance(metric, jax.Array)
+        or tuple(metric.shape) != ()
+        or metric.dtype != jnp.float32
+    ):
+        raise ValueError(f"{name} bounder metric must be a scalar float32 JAX array")
+    return steps, metric
+
+
 def _require_key(key: object) -> Array:
     if not isinstance(key, jax.Array):
         raise ValueError("key must be a Threefry JAX key")
@@ -627,15 +654,23 @@ class ActorCriticAgent:
         actor_metric = jnp.array(1.0, dtype=jnp.float32)
         critic_metric = jnp.array(1.0, dtype=jnp.float32)
         if self._bounder is not None:
-            actor_steps, actor_metric = self._bounder.bound(
+            actor_steps, actor_metric = _validated_bounder_result(
+                "actor",
+                self._bounder.bound(
+                    actor_steps,
+                    td_error,
+                    (state.actor_weights, state.actor_bias),
+                ),
                 actor_steps,
-                td_error,
-                (state.actor_weights, state.actor_bias),
             )
-            critic_steps, critic_metric = self._bounder.bound(
+            critic_steps, critic_metric = _validated_bounder_result(
+                "critic",
+                self._bounder.bound(
+                    critic_steps,
+                    td_error,
+                    (state.critic_weights, state.critic_bias),
+                ),
                 critic_steps,
-                td_error,
-                (state.critic_weights, state.critic_bias),
             )
         actor_steps = tuple(td_error * step for step in actor_steps)
         critic_steps = tuple(td_error * step for step in critic_steps)
@@ -1435,15 +1470,23 @@ class ContinuousActorCriticAgent:
         actor_metric = jnp.array(1.0, dtype=jnp.float32)
         critic_metric = jnp.array(1.0, dtype=jnp.float32)
         if self._bounder is not None:
-            actor_steps, actor_metric = self._bounder.bound(
+            actor_steps, actor_metric = _validated_bounder_result(
+                "actor",
+                self._bounder.bound(
+                    actor_steps,
+                    td_error,
+                    (state.mean_weights, state.mean_bias, state.log_sigma),
+                ),
                 actor_steps,
-                td_error,
-                (state.mean_weights, state.mean_bias, state.log_sigma),
             )
-            critic_steps, critic_metric = self._bounder.bound(
+            critic_steps, critic_metric = _validated_bounder_result(
+                "critic",
+                self._bounder.bound(
+                    critic_steps,
+                    td_error,
+                    (state.critic_weights, state.critic_bias),
+                ),
                 critic_steps,
-                td_error,
-                (state.critic_weights, state.critic_bias),
             )
         actor_steps = tuple(td_error * step for step in actor_steps)
         critic_steps = tuple(td_error * step for step in critic_steps)

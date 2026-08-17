@@ -43,6 +43,20 @@ class _HostileArray:
         raise AssertionError("conversion executed before trusted metadata rejection")
 
 
+class _MalformedBounder(Bounder):
+    def to_config(self) -> dict[str, Any]:
+        return {"type": "test-only"}
+
+    def bound(
+        self,
+        steps: tuple[Array, ...],
+        error: Array,
+        params: tuple[Array, ...],
+    ) -> tuple[tuple[Array, ...], Array]:
+        del error, params
+        return (steps[0][None, ...], *steps[1:]), jnp.ones((1,), dtype=jnp.float32)
+
+
 @pytest.mark.parametrize("continuous", [False, True])
 def test_bound_metric_average_of_finite_extremes_remains_finite(continuous: bool) -> None:
     if continuous:
@@ -60,6 +74,26 @@ def test_bound_metric_average_of_finite_extremes_remains_finite(continuous: bool
     )
     assert bool(result.update_applied)
     assert bool(jnp.isfinite(result.bound_metric))
+
+
+@pytest.mark.parametrize("continuous", [False, True])
+def test_bounder_result_must_match_parameter_tree_and_scalar_metric(continuous: bool) -> None:
+    if continuous:
+        agent = ContinuousActorCriticAgent(
+            ContinuousActorCriticConfig(action_dim=2), bounder=_MalformedBounder()
+        )
+        state = agent.init(2, jr.key(0))
+    else:
+        agent = ActorCriticAgent(
+            ActorCriticConfig(n_actions=2), bounder=_MalformedBounder()
+        )
+        state = agent.init(2, jr.key(0)).replace(  # type: ignore[attr-defined]
+            last_action=jnp.asarray(0, dtype=jnp.int32)
+        )
+    with pytest.raises(ValueError, match="bounder steps"):
+        agent.update(  # type: ignore[union-attr]
+            state, jnp.asarray(0.0, dtype=jnp.float32), jnp.zeros((2,), dtype=jnp.float32)
+        )
 
 
 @pytest.mark.parametrize("continuous", [False, True])
