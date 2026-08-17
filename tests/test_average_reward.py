@@ -707,6 +707,18 @@ def test_differential_sarsa_config_roundtrip_and_exact_td_error() -> None:
     chex.assert_trees_all_close(result.average_reward, state.average_reward)
 
 
+def test_differential_sarsa_start_with_action_rejects_fractional_action() -> None:
+    agent = DifferentialSARSAAgent(DifferentialSARSAConfig(n_actions=3))
+    state = agent.init(2, jr.key(0))
+
+    with pytest.raises(TypeError, match="action must have dtype int32"):
+        agent.start_with_action(
+            state,
+            jnp.array([1.0, 0.0], dtype=jnp.float32),
+            jnp.array(1.75, dtype=jnp.float32),
+        )
+
+
 def test_differential_sarsa_update_and_scan_are_finite() -> None:
     agent = DifferentialSARSAAgent(
         DifferentialSARSAConfig(
