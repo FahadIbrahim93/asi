@@ -3,12 +3,15 @@
 from fractions import Fraction
 from typing import Any, cast
 
+import jax.numpy as jnp
 import numpy as np
 import pytest
 
 from alberta_framework.steps.step5 import (
     Step5AverageRewardTDConfig,
     Step5SmokeResult,
+    make_step5_td_learner,
+    run_step5_scan,
     run_step5_smoke,
 )
 
@@ -184,3 +187,69 @@ def test_float_subclass_with_lying_ratio_is_rejected() -> None:
     with pytest.raises(ValueError, match="must be finite"):
         Step5AverageRewardTDConfig(step_size=RatioFloat(0.05))
     assert RatioFloat.calls == 0
+
+
+def test_config_subclass_and_dict_subclass_are_rejected() -> None:
+    class ConfigSubclass(Step5AverageRewardTDConfig):
+        pass
+
+    with pytest.raises(ValueError, match="actual Step5AverageRewardTDConfig"):
+        ConfigSubclass()
+
+    class DictSubclass(dict[str, object]):
+        pass
+
+    with pytest.raises(ValueError, match="actual dict"):
+        Step5AverageRewardTDConfig.from_dict(
+            DictSubclass(Step5AverageRewardTDConfig().to_dict())
+        )
+
+
+class _HostileArray:
+    calls = 0
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        type(self).calls += 1
+        raise AssertionError("shape hook must not run")
+
+
+def test_scan_rejects_hostile_arrays_without_hooks() -> None:
+    learner = make_step5_td_learner()
+    state = learner.init(2)
+    _HostileArray.calls = 0
+    with pytest.raises(TypeError, match="trusted array"):
+        run_step5_scan(
+            learner,
+            state,
+            cast(Any, _HostileArray()),
+            jnp.zeros(1, dtype=jnp.float32),
+            jnp.zeros((1, 2), dtype=jnp.float32),
+        )
+    assert _HostileArray.calls == 0
+
+
+def test_scan_requires_exact_float32_shapes() -> None:
+    learner = make_step5_td_learner()
+    state = learner.init(2)
+    with pytest.raises(TypeError, match="rewards.*float32"):
+        run_step5_scan(
+            learner,
+            state,
+            jnp.zeros((1, 2), dtype=jnp.float32),
+            jnp.zeros(1, dtype=jnp.int32),
+            jnp.zeros((1, 2), dtype=jnp.float32),
+        )
+    with pytest.raises(ValueError, match="next_observations must have shape"):
+        run_step5_scan(
+            learner,
+            state,
+            jnp.zeros((1, 2), dtype=jnp.float32),
+            jnp.zeros(1, dtype=jnp.float32),
+            jnp.zeros((2, 2), dtype=jnp.float32),
+        )
+
+
+def test_smoke_rejects_derived_allocation_before_jax() -> None:
+    with pytest.raises(ValueError, match="derived Step 5 smoke"):
+        run_step5_smoke(steps=2**20, feature_dim=2**20)
