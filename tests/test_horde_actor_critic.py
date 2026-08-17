@@ -1678,3 +1678,31 @@ def test_actor_resource_budgets_preflight_before_allocation(
     for feature_dim in (True, 2**31 - 1):
         with pytest.raises(ValueError):
             agent.init(feature_dim, jr.key(0))  # type: ignore[arg-type]
+
+
+def test_run_horde_actor_critic_from_arrays_rejects_non_integer_actions() -> None:
+    from alberta_framework.core.horde_actor_critic import run_horde_actor_critic_from_arrays
+
+    agent = _make_agent()
+    state = agent.init(feature_dim=4, key=jr.key(0))
+    obs = jnp.zeros((2, 4), dtype=jnp.float32)
+    rewards = jnp.zeros(2, dtype=jnp.float32)
+    next_obs = jnp.zeros((2, 4), dtype=jnp.float32)
+
+    # Fractional float actions rejected
+    with pytest.raises(ValueError, match="actions must have an integer dtype"):
+        run_horde_actor_critic_from_arrays(
+            agent, state, obs, rewards, next_obs, actions=jnp.array([1.75, 0.25], dtype=jnp.float32)
+        )
+
+    # Boolean actions rejected
+    with pytest.raises(ValueError, match="actions must have an integer dtype"):
+        run_horde_actor_critic_from_arrays(
+            agent, state, obs, rewards, next_obs, actions=jnp.array([True, False])
+        )
+
+    # Valid integer actions accepted
+    result = run_horde_actor_critic_from_arrays(
+        agent, state, obs, rewards, next_obs, actions=jnp.array([1, 0], dtype=jnp.int32)
+    )
+    assert result.actions.shape == (2,)
