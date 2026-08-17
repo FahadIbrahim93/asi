@@ -3,12 +3,16 @@
 import pytest
 
 from alberta_framework.benchmarks._forager_matched_alberta_worker import (
+    MatchedAlbertaWorkerConfiguration,
     MatchedAlbertaWorkerError,
+    _MatchedRewardTraceSink,
     _parse_agent_configuration,
     _parse_finite_json_float,
     _reject_duplicate_keys,
     _reject_nonfinite,
 )
+from alberta_framework.benchmarks.causal_map_forager import CausalMapForagerConfig
+from alberta_framework.benchmarks.forager import AlbertaForagerConfig
 
 
 class _EvilStr(str):
@@ -127,3 +131,40 @@ def test_parse_agent_configuration_unsupported_sanitized() -> None:
         _parse_agent_configuration("unknown_kind", {})
     assert "!r" not in str(exc.value)
     assert "unknown_kind" not in str(exc.value)
+
+
+def test_configuration_envelope_binds_exact_kind_and_config_type() -> None:
+    with pytest.raises(MatchedAlbertaWorkerError, match="type mismatch"):
+        MatchedAlbertaWorkerConfiguration(
+            implementation_kind="alberta_causal_map",
+            configuration=AlbertaForagerConfig(),
+        )
+    legal = MatchedAlbertaWorkerConfiguration(
+        implementation_kind="alberta_causal_map",
+        configuration=CausalMapForagerConfig(),
+    )
+    assert legal.to_dict()["implementation_kind"] == "alberta_causal_map"
+
+
+class _HostileMapping(dict[str, object]):
+    calls = 0
+
+    def __iter__(self):
+        type(self).calls += 1
+        raise AssertionError("mapping hook must not run")
+
+
+def test_agent_parser_rejects_mapping_subclass_without_hooks() -> None:
+    _HostileMapping.calls = 0
+    with pytest.raises(MatchedAlbertaWorkerError, match="must be an object"):
+        _parse_agent_configuration("alberta_causal_map", _HostileMapping())
+    assert _HostileMapping.calls == 0
+
+
+def test_reward_sink_constructor_rejects_noncanonical_counts(tmp_path) -> None:
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    with pytest.raises(MatchedAlbertaWorkerError, match="seed"):
+        _MatchedRewardTraceSink(data_root, seed=True, steps=1)
+    with pytest.raises(MatchedAlbertaWorkerError, match="steps"):
+        _MatchedRewardTraceSink(data_root, seed=1, steps=0)

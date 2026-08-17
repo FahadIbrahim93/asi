@@ -52,6 +52,9 @@ MATCHED_ALBERTA_WORKER_CONFIGURATION_SCHEMA_VERSION: Final = (
     "alberta.forager_matched_worker_configuration.v1"
 )
 _COPY_BUFFER_BYTES: Final = 1024 * 1024
+_MAX_CONFIGURATION_BYTES: Final = 1024 * 1024
+_MAX_JSON_OBJECT_FIELDS: Final = 4096
+_MAX_CONFIGURATION_SEQUENCE: Final = 4096
 _LOGGER = logging.getLogger(__name__)
 
 MatchedAlbertaImplementationKind = Literal[
@@ -74,12 +77,34 @@ def _require_exact_str(name: str, value: object) -> str:
     return value
 
 
+def _require_builtin_int(name: str, value: object, *, minimum: int, maximum: int) -> int:
+    if type(value) is not int or not minimum <= value <= maximum:
+        raise MatchedAlbertaWorkerError(f"{name} must be an integer in the allowed range")
+    return value
+
+
 @dataclass(frozen=True, slots=True)
 class MatchedAlbertaWorkerConfiguration:
     """One explicitly typed Alberta-family configuration envelope."""
 
     implementation_kind: MatchedAlbertaImplementationKind
     configuration: MatchedAlbertaAgentConfig
+
+    def __post_init__(self) -> None:
+        if type(self) is not MatchedAlbertaWorkerConfiguration:
+            raise MatchedAlbertaWorkerError(
+                "configuration must be an actual MatchedAlbertaWorkerConfiguration"
+            )
+        kind = _require_exact_str("implementation_kind", self.implementation_kind)
+        expected = {
+            "alberta_causal_map": CausalMapForagerConfig,
+            "alberta_horde_actor_critic": AlbertaForagerConfig,
+            "alberta_rtu_rtrl": RTURTRLForagerConfig,
+        }.get(kind)
+        if expected is None:
+            raise MatchedAlbertaWorkerError("unsupported Alberta implementation kind")
+        if type(self.configuration) is not expected:
+            raise MatchedAlbertaWorkerError("implementation kind and configuration type mismatch")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -90,6 +115,10 @@ class MatchedAlbertaWorkerConfiguration:
 
 
 def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    if type(pairs) is not list:
+        raise MatchedAlbertaWorkerError("configuration pairs must be an array")
+    if len(pairs) > _MAX_JSON_OBJECT_FIELDS:
+        raise MatchedAlbertaWorkerError("configuration object has too many fields")
     result: dict[str, Any] = {}
     for key, value in pairs:
         host_key = _require_exact_str("key", key)
@@ -113,12 +142,16 @@ def _parse_finite_json_float(token: object) -> float:
 
 
 def _feature_configuration(value: Any) -> ForagerFeatureConfig:
-    if not isinstance(value, Mapping):
+    if type(value) is not dict:
         raise MatchedAlbertaWorkerError("feature configuration must be an object")
+    if len(value) > _MAX_JSON_OBJECT_FIELDS:
+        raise MatchedAlbertaWorkerError("feature configuration has too many fields")
     payload = dict(value)
     decays = payload.get("reward_trace_decays")
     if type(decays) is not list:
         raise MatchedAlbertaWorkerError("feature reward_trace_decays must be an array")
+    if len(decays) > _MAX_CONFIGURATION_SEQUENCE:
+        raise MatchedAlbertaWorkerError("feature reward_trace_decays is too long")
     payload["reward_trace_decays"] = tuple(decays)
     try:
         result = ForagerFeatureConfig(**payload)
@@ -136,8 +169,10 @@ def _parse_agent_configuration(
     value: Any,
 ) -> MatchedAlbertaAgentConfig:
     _require_exact_str("implementation_kind", implementation_kind)
-    if not isinstance(value, Mapping):
+    if type(value) is not dict:
         raise MatchedAlbertaWorkerError("agent configuration must be an object")
+    if len(value) > _MAX_JSON_OBJECT_FIELDS:
+        raise MatchedAlbertaWorkerError("agent configuration has too many fields")
     payload = dict(value)
     try:
         if implementation_kind == "alberta_causal_map":
@@ -149,14 +184,21 @@ def _parse_agent_configuration(
                 raise MatchedAlbertaWorkerError(
                     "Horde hidden-size configurations must be arrays"
                 )
+            if (
+                len(actor_widths) > _MAX_CONFIGURATION_SEQUENCE
+                or len(critic_widths) > _MAX_CONFIGURATION_SEQUENCE
+            ):
+                raise MatchedAlbertaWorkerError("Horde hidden-size configuration is too long")
             payload["actor_hidden_sizes"] = tuple(actor_widths)
             payload["critic_hidden_sizes"] = tuple(critic_widths)
             payload["features"] = _feature_configuration(payload.get("features"))
             result = AlbertaForagerConfig(**payload)
         elif implementation_kind == "alberta_rtu_rtrl":
             core = payload.get("core")
-            if not isinstance(core, Mapping):
+            if type(core) is not dict:
                 raise MatchedAlbertaWorkerError("RTU core configuration must be an object")
+            if len(core) > _MAX_JSON_OBJECT_FIELDS:
+                raise MatchedAlbertaWorkerError("RTU core configuration has too many fields")
             payload["core"] = RecurrentTraceActorCriticConfig.from_config(dict(core))
             payload["features"] = _feature_configuration(payload.get("features"))
             result = RTURTRLForagerConfig(**payload)
@@ -175,10 +217,31 @@ def _parse_agent_configuration(
 
 def _load_configuration(path: Path) -> MatchedAlbertaWorkerConfiguration:
     try:
-        raw = path.read_bytes()
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0),
+        )
     except OSError as exc:
         raise MatchedAlbertaWorkerError("configuration could not be read") from exc
-    if not raw or len(raw) > 1024 * 1024 or raw.startswith(b"\xef\xbb\xbf"):
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or not 1 <= before.st_size <= _MAX_CONFIGURATION_BYTES
+        ):
+            raise MatchedAlbertaWorkerError("configuration byte contract is invalid")
+        raw = os.read(descriptor, _MAX_CONFIGURATION_BYTES + 1)
+        if len(raw) != before.st_size or _stat_identity(
+            os.fstat(descriptor)
+        ) != _stat_identity(before):
+            raise MatchedAlbertaWorkerError("configuration changed while reading")
+    finally:
+        os.close(descriptor)
+    if not raw or len(raw) > _MAX_CONFIGURATION_BYTES or raw.startswith(b"\xef\xbb\xbf"):
         raise MatchedAlbertaWorkerError("configuration byte contract is invalid")
     try:
         text = raw.decode("utf-8")
@@ -192,7 +255,7 @@ def _load_configuration(path: Path) -> MatchedAlbertaWorkerConfiguration:
         raise
     except (UnicodeError, ValueError, RecursionError) as exc:
         raise MatchedAlbertaWorkerError("configuration is not strict UTF-8 JSON") from exc
-    if not isinstance(payload, Mapping):
+    if type(payload) is not dict:
         raise MatchedAlbertaWorkerError("configuration envelope must be a JSON object")
     if set(payload) != {"schema_version", "implementation_kind", "configuration"}:
         raise MatchedAlbertaWorkerError("configuration envelope fields are invalid")
@@ -267,14 +330,18 @@ class _MatchedRewardTraceSink:
     """Bounded-memory, atomic writer for one exact ``rewards.npy`` NPZ."""
 
     def __init__(self, data_root: Path, seed: int, steps: int) -> None:
-        self._seed = seed
-        self._steps = steps
+        self._seed = _require_builtin_int(
+            "seed", seed, minimum=0, maximum=int(np.iinfo(np.uint32).max)
+        )
+        self._steps = _require_builtin_int(
+            "steps", steps, minimum=1, maximum=MATCHED_CURRENT_HORIZON
+        )
         self._offset = 0
         self._finalized = False
         self._array: np.memmap | None = None
-        self._npy_path = data_root / f".{seed}.rewards.npy.partial"
-        self._partial_path = data_root / f".{seed}.npz.partial"
-        self._final_path = data_root / f"{seed}.npz"
+        self._npy_path = data_root / f".{self._seed}.rewards.npy.partial"
+        self._partial_path = data_root / f".{self._seed}.npz.partial"
+        self._final_path = data_root / f"{self._seed}.npz"
         for path in (self._npy_path, self._partial_path, self._final_path):
             if path.exists() or path.is_symlink():
                 raise MatchedAlbertaWorkerError("trace output path already exists")
@@ -283,7 +350,7 @@ class _MatchedRewardTraceSink:
                 self._npy_path,
                 mode="w+",
                 dtype=np.dtype("<f4"),
-                shape=(steps,),
+                shape=(self._steps,),
             )
         except BaseException:
             self.abort()
@@ -292,10 +359,13 @@ class _MatchedRewardTraceSink:
     def append(self, rewards: np.ndarray, biome_regrets: np.ndarray) -> None:
         if self._finalized or self._array is None:
             raise MatchedAlbertaWorkerError("reward trace sink is already closed")
-        reward_array = np.asarray(rewards)
-        regret_array = np.asarray(biome_regrets)
+        if type(rewards) is not np.ndarray or type(biome_regrets) is not np.ndarray:
+            raise MatchedAlbertaWorkerError("trace chunks must be actual NumPy arrays")
+        reward_array = rewards
+        regret_array = biome_regrets
         if (
             reward_array.ndim != 1
+            or reward_array.size == 0
             or reward_array.dtype != np.dtype(np.float32)
             or regret_array.shape != reward_array.shape
             or regret_array.dtype != np.dtype(np.float32)
@@ -422,6 +492,13 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    if argv is not None:
+        if type(argv) not in {list, tuple}:
+            raise MatchedAlbertaWorkerError("argv must be an actual list or tuple")
+        if len(argv) > 32:
+            raise MatchedAlbertaWorkerError("argv contains too many tokens")
+        if any(type(token) is not str for token in argv):
+            raise MatchedAlbertaWorkerError("argv tokens must be actual strings")
     args = _parser().parse_args(argv)
     if args.seed < 0 or args.seed > np.iinfo(np.uint32).max:
         raise MatchedAlbertaWorkerError("seed must be uint32-compatible")
@@ -452,7 +529,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         jax_chunk_size=10_000,
     )
     if worker_config.implementation_kind == "alberta_causal_map":
-        if not isinstance(worker_config.configuration, CausalMapForagerConfig):
+        if type(worker_config.configuration) is not CausalMapForagerConfig:
             raise MatchedAlbertaWorkerError("causal-map configuration type mismatch")
         results = run_causal_map_forager_seeds(
             worker_config.configuration,
@@ -462,7 +539,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             reward_trace_sink_factory=sink_factory,
         )
     elif worker_config.implementation_kind == "alberta_horde_actor_critic":
-        if not isinstance(worker_config.configuration, AlbertaForagerConfig):
+        if type(worker_config.configuration) is not AlbertaForagerConfig:
             raise MatchedAlbertaWorkerError("Horde configuration type mismatch")
         results = run_alberta_forager_seeds(
             worker_config.configuration,
@@ -472,7 +549,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             reward_trace_sink_factory=sink_factory,
         )
     elif worker_config.implementation_kind == "alberta_rtu_rtrl":
-        if not isinstance(worker_config.configuration, RTURTRLForagerConfig):
+        if type(worker_config.configuration) is not RTURTRLForagerConfig:
             raise MatchedAlbertaWorkerError("RTU configuration type mismatch")
         results = run_rtu_rtrl_forager_seeds(
             worker_config.configuration,
