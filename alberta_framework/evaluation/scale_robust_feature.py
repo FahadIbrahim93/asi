@@ -24,7 +24,7 @@ import math
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
@@ -220,7 +220,7 @@ def _optional_finite_float(value: object, *, name: str) -> float | None:
         return None
     if type(value) is bool or type(value) not in (int, float):
         raise ValueError(f"{name} must be a finite real number or None")
-    numeric = float(value)
+    numeric = float(cast("int | float", value))
     if not math.isfinite(numeric):
         raise ValueError(f"{name} must be a finite real number or None")
     return numeric
@@ -229,7 +229,7 @@ def _optional_finite_float(value: object, *, name: str) -> float | None:
 def _finite_float(value: object, *, name: str) -> float:
     if type(value) is bool or type(value) not in (int, float):
         raise ValueError(f"{name} must be a finite real number")
-    numeric = float(value)
+    numeric = float(cast("int | float", value))
     if not math.isfinite(numeric):
         raise ValueError(f"{name} must be a finite real number")
     return numeric

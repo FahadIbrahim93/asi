@@ -115,7 +115,7 @@ def _finite_real(name: str, value: object) -> float:
     """Reject leftover bool and non-finite identities without narrowing."""
     if type(value) is bool or type(value) not in (int, float):
         raise ValueError(f"{name} must be a finite real number")
-    numeric = float(value)
+    numeric = float(cast("int | float", value))
     if not math.isfinite(numeric):
         raise ValueError(f"{name} must be a finite real number")
     return numeric
