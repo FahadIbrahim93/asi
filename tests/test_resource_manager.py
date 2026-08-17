@@ -111,6 +111,16 @@ class TestLearnedResourceManager:
         assert result.state.action_counts[0, 0] == pytest.approx(1.0)
         assert result.state.action_counts[0, 1] == pytest.approx(0.0)
 
+    def test_action_counts_increment_past_float32_exact_integer_limit(self) -> None:
+        manager = LearnedResourceManager(n_actions=2)
+        state = manager.init().replace(
+            action_counts=manager.init().action_counts.at[0, 0].set(2**24)
+        )
+
+        result = manager.update(state, jnp.asarray([0.0, jnp.nan], dtype=jnp.float32))
+
+        assert int(result.state.action_counts[0, 0]) == 2**24 + 1
+
     def test_zero_discount_recovers_nonfinite_logits(self) -> None:
         manager = LearnedResourceManager(
             n_actions=2,
@@ -328,6 +338,19 @@ class TestGeneratorMetaResourceManager:
             exploration=0.0,
             reward_decay=reward_decay,
         )
+
+    def test_action_counts_increment_past_float32_exact_integer_limit(self) -> None:
+        manager = self._manager()
+        state = manager.init().replace(  # type: ignore[attr-defined]
+            action_counts=manager.init().action_counts.at[0, 0].set(2**24)
+        )
+
+        result = manager.update(
+            state,
+            jnp.asarray([1.0, jnp.nan], dtype=jnp.float32),
+        )
+
+        assert int(result.state.action_counts[0, 0]) == 2**24 + 1
 
     def test_zero_discount_recovers_nonfinite_logits(self) -> None:
         manager = self._manager(discount=0.0)
