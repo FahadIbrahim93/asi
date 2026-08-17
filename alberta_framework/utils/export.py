@@ -25,13 +25,27 @@ if TYPE_CHECKING:
     from alberta_framework.utils.statistics import SignificanceResult
 
 
+def _require_path(value: object, *, name: str = "path") -> Path:
+    if type(value) is str:
+        return Path(value)
+    if isinstance(value, Path) and type(value).__module__.startswith("pathlib"):
+        return Path(value)
+    raise ValueError(f"{name} must be an exact str or Path")
+
+
+def _require_exact_str(name: str, value: object) -> str:
+    if type(value) is not str:
+        raise ValueError(f"{name} must be an exact string")
+    return value
+
+
 def _exported_number(value: SupportsFloat) -> str:
     """Return the shortest text that round-trips one finite binary64 value."""
     if isinstance(value, (bool, np.bool_)):
-        raise ValueError(f"refusing to export boolean as numeric measurement: {value!r}")
+        raise ValueError("refusing to export boolean as numeric measurement")
     number = float(value)
     if not math.isfinite(number):
-        raise ValueError(f"refusing to export non-finite measurement: {number!r}")
+        raise ValueError("refusing to export non-finite measurement")
     return repr(number)
 
 
@@ -53,45 +67,50 @@ def _preflight_export_results(
     """Validate the complete aggregate before any export touches the filesystem."""
     if not results:
         raise ValueError("export results must be non-empty")
+    if metric is not None:
+        _require_exact_str("metric", metric)
 
     for name, aggregate in results.items():
+        _require_exact_str("config name", name)
         seeds = require_unique_jax_seeds(
             aggregate.seeds,
-            name=f"AggregatedResults {name!r} seeds",
+            name=f"AggregatedResults {name} seeds",
         )
         seed_count = len(seeds)
 
         if not aggregate.metric_arrays:
-            raise ValueError(f"AggregatedResults {name!r} metric_arrays must be non-empty")
+            raise ValueError(f"AggregatedResults {name} metric_arrays must be non-empty")
         if not aggregate.summary:
-            raise ValueError(f"AggregatedResults {name!r} summary must be non-empty")
+            raise ValueError(f"AggregatedResults {name} summary must be non-empty")
         if metric is not None and (
             metric not in aggregate.metric_arrays or metric not in aggregate.summary
         ):
             raise ValueError(
-                f"AggregatedResults {name!r} must contain requested metric {metric!r} "
+                f"AggregatedResults {name} must contain requested metric {metric} "
                 "in both metric_arrays and summary"
             )
         if set(aggregate.metric_arrays) != set(aggregate.summary):
             raise ValueError(
-                f"AggregatedResults {name!r} metric_arrays and summary must contain "
+                f"AggregatedResults {name} metric_arrays and summary must contain "
                 "the same metric names"
             )
         for metric_name, values in aggregate.metric_arrays.items():
-            qualified_name = f"AggregatedResults {name!r} metric {metric_name!r}"
+            _require_exact_str("metric name", metric_name)
+            qualified_name = f"AggregatedResults {name} metric {metric_name}"
             if values.ndim != 2:
                 raise ValueError(f"{qualified_name} must be a two-dimensional seed-by-step array")
             if values.shape[0] != seed_count:
                 raise ValueError(
-                    f"AggregatedResults {name!r} seed count ({seed_count}) does not match "
-                    f"metric rows ({values.shape[0]}) for {metric_name!r}"
+                    f"AggregatedResults {name} seed count ({seed_count}) does not match "
+                    f"metric rows ({values.shape[0]}) for {metric_name}"
                 )
             if values.shape[1] == 0:
                 raise ValueError(f"{qualified_name} must contain at least one metric step")
             _require_finite_array(values, name=qualified_name)
 
         for metric_name, summary in aggregate.summary.items():
-            qualified_name = f"AggregatedResults {name!r} summary {metric_name!r}"
+            _require_exact_str("metric name", metric_name)
+            qualified_name = f"AggregatedResults {name} summary {metric_name}"
             if summary.values.ndim != 1:
                 raise ValueError(f"{qualified_name} values must be one-dimensional")
             if type(summary.n_seeds) is not int:
@@ -109,6 +128,7 @@ def _preflight_export_results(
 
 def _write_text_atomically(filepath: Path, payload: str) -> None:
     """Replace ``filepath`` only after complete text is staged beside it."""
+    _require_exact_str("filepath parent check", str(filepath.parent))
     filepath.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=f".{filepath.name}.",
@@ -146,7 +166,8 @@ def export_to_csv(
         metric: Metric to export
         include_timeseries: Whether to include full timeseries (large!)
     """
-    filepath = Path(filepath)
+    filepath = _require_path(filepath, name="filepath")
+    _require_exact_str("metric", metric)
 
     if include_timeseries:
         _export_timeseries_csv(results, filepath, metric)
@@ -233,7 +254,7 @@ def export_to_json(
         include_timeseries: Whether to include full timeseries (large!)
     """
     _preflight_export_results(results)
-    filepath = Path(filepath)
+    filepath = _require_path(filepath, name="filepath")
 
     from typing import Any
 
@@ -272,6 +293,7 @@ def _finite_table_summaries(
 ) -> dict[str, "MetricSummary"]:
     """Return display summaries only after validating their rendered statistics."""
     _preflight_export_results(results, metric=metric)
+    _require_exact_str("metric", metric)
 
     summaries: dict[str, MetricSummary] = {}
     for name, aggregate in results.items():
@@ -307,6 +329,7 @@ def generate_latex_table(
     Returns:
         LaTeX table as a string
     """
+    _require_exact_str("metric", metric)
     lines = []
     lines.append(r"\begin{table}[ht]")
     lines.append(r"\centering")
@@ -408,6 +431,7 @@ def generate_markdown_table(
     Returns:
         Markdown table as a string
     """
+    _require_exact_str("metric", metric)
     lines = []
     lines.append(f"| Method | {metric_label} (mean ± std) | Seeds |")
     lines.append("|--------|-------------------------|-------|")
@@ -489,6 +513,7 @@ def generate_significance_table(
     Returns:
         Formatted table as string
     """
+    _require_exact_str("format", format)
     if format == "latex":
         return _generate_significance_latex(significance_results)
     else:
@@ -562,7 +587,9 @@ def save_experiment_report(
         Dictionary mapping artifact type to file path
     """
     _preflight_export_results(results, metric=metric)
-    output_dir = Path(output_dir)
+    output_dir = _require_path(output_dir, name="output_dir")
+    _require_exact_str("experiment_name", experiment_name)
+    _require_exact_str("metric", metric)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     artifacts: dict[str, Path] = {}
@@ -633,6 +660,7 @@ def results_to_dataframe(
     Returns:
         DataFrame with results
     """
+    _require_exact_str("metric", metric)
     try:
         import pandas as pd
     except ImportError:
