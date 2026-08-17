@@ -535,6 +535,30 @@ class _NonfiniteFloatThatConvertsFinite(float):
         return 0j
 
 
+@pytest.mark.parametrize(
+    "coordinate",
+    [
+        np.longdouble("inf"),
+        np.longdouble("nan"),
+        # Overflows to inf at parse wherever longdouble is float64 (aarch64),
+        # and stays a finite extended value where it is wider (x86-64): the
+        # validator must classify by the platform's actual value, not the
+        # literal, so this case is finite-or-rejected but never a crash.
+        np.longdouble("1e4000"),
+    ],
+)
+def test_extract_hyperparameter_results_classifies_longdouble_by_platform_value(
+    coordinate: object,
+) -> None:
+    trace = {"candidate": _flat_trace("candidate", 1.0)}
+    if bool(np.isfinite(coordinate)):
+        extracted = extract_hyperparameter_results(trace, param_extractor=lambda _: coordinate)
+        assert next(iter(extracted)) is coordinate
+    else:
+        with pytest.raises(ValueError, match=r"noncanonical coordinate"):
+            extract_hyperparameter_results(trace, param_extractor=lambda _: coordinate)
+
+
 def test_extract_hyperparameter_results_rejects_spoofed_numeric_subclasses() -> None:
     coordinate = _NonfiniteFloatThatConvertsFinite()
     assert coordinate == float("inf")
@@ -552,7 +576,12 @@ def test_extract_hyperparameter_results_rejects_spoofed_numeric_subclasses() -> 
         10**1000,
         Fraction(10**1000, 3),
         Decimal("1e4000"),
-        np.longdouble("1e4000"),
+        # The widest finite value the platform's longdouble can hold. On x86-64
+        # this is an 80-bit extended value far outside float64 range; on
+        # aarch64 (macOS arm64) longdouble *is* float64, so a literal such as
+        # ``np.longdouble("1e4000")`` overflows to inf at parse and can never
+        # be a "finite" fixture there.
+        np.finfo(np.longdouble).max,
     ],
 )
 def test_extract_hyperparameter_results_keeps_wide_finite_numeric_coordinates(
