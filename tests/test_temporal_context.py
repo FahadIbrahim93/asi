@@ -186,6 +186,184 @@ def test_temporal_context_step_count_saturates_at_int32_max() -> None:
     assert int(next_state.step_count) == np.iinfo(np.int32).max
 
 
+@pytest.mark.parametrize("disable_jit", [True, False])
+def test_temporal_context_saturation_is_atomic_in_eager_and_jit(
+    disable_jit: bool,
+) -> None:
+    featurizer = TemporalContextFeaturizer(
+        TemporalContextConfig(input_dim=1, ema_decay=0.5, periods=(4.0,))
+    )
+    state = TemporalContextState(
+        observation_ema=jnp.zeros((1,), dtype=jnp.float32),
+        step_count=jnp.asarray(np.iinfo(np.int32).max - 1, dtype=jnp.int32),
+    )
+
+    with jax.disable_jit(disable_jit):
+        at_max = featurizer.update(
+            state,
+            jnp.asarray([2.0], dtype=jnp.float32),
+        )
+        after_max = featurizer.update(
+            at_max,
+            jnp.asarray([4.0], dtype=jnp.float32),
+        )
+        rejected = featurizer.update(
+            after_max,
+            jnp.asarray([jnp.nan], dtype=jnp.float32),
+        )
+
+    assert int(at_max.step_count) == np.iinfo(np.int32).max
+    assert int(after_max.step_count) == np.iinfo(np.int32).max
+    chex.assert_trees_all_close(at_max.observation_ema, jnp.asarray([1.0]))
+    chex.assert_trees_all_close(after_max.observation_ema, jnp.asarray([2.5]))
+    chex.assert_trees_all_equal(rejected, after_max)
+    chex.assert_trees_all_equal(
+        featurizer.features(at_max, jnp.asarray([0.0], dtype=jnp.float32))[-2:],
+        featurizer.features(after_max, jnp.asarray([0.0], dtype=jnp.float32))[-2:],
+    )
+
+
+def test_temporal_context_scan_saturates_and_rejects_rows_atomically() -> None:
+    featurizer = TemporalContextFeaturizer(
+        TemporalContextConfig(input_dim=1, ema_decay=0.5, periods=())
+    )
+    state = TemporalContextState(
+        observation_ema=jnp.zeros((1,), dtype=jnp.float32),
+        step_count=jnp.asarray(np.iinfo(np.int32).max - 1, dtype=jnp.int32),
+    )
+    observations = jnp.asarray([[2.0], [jnp.nan], [4.0]], dtype=jnp.float32)
+
+    @jax.jit
+    def run(
+        initial_state: TemporalContextState,
+        rows: jax.Array,
+    ) -> tuple[TemporalContextState, jax.Array]:
+        return transform_temporal_context_arrays(
+            featurizer,
+            rows,
+            state=initial_state,
+        )
+
+    final_state, features = run(state, observations)
+
+    assert int(final_state.step_count) == np.iinfo(np.int32).max
+    chex.assert_trees_all_close(final_state.observation_ema, jnp.asarray([2.5]))
+    chex.assert_tree_all_finite(features)
+
+
+@pytest.mark.parametrize(
+    "step_count",
+    [
+        jnp.asarray(0.0, dtype=jnp.float32),
+        jnp.asarray([0], dtype=jnp.int32),
+        jnp.asarray(False, dtype=jnp.bool_),
+    ],
+)
+def test_temporal_context_rejects_malformed_counter_metadata(step_count: jax.Array) -> None:
+    featurizer = TemporalContextFeaturizer(
+        TemporalContextConfig(input_dim=1, periods=())
+    )
+    state = TemporalContextState(
+        observation_ema=jnp.zeros((1,), dtype=jnp.float32),
+        step_count=step_count,
+    )
+
+    with pytest.raises(ValueError, match="state.step_count"):
+        featurizer.update(state, jnp.ones((1,), dtype=jnp.float32))
+
+
+def test_temporal_context_invalid_counter_and_candidate_hold_state() -> None:
+    finite_observation = jnp.ones((1,), dtype=jnp.float32)
+    featurizer = TemporalContextFeaturizer(
+        TemporalContextConfig(input_dim=1, ema_decay=0.5, periods=())
+    )
+    negative = TemporalContextState(
+        observation_ema=jnp.zeros((1,), dtype=jnp.float32),
+        step_count=jnp.asarray(-1, dtype=jnp.int32),
+    )
+    nonfinite_ema = TemporalContextState(
+        observation_ema=jnp.asarray([jnp.inf], dtype=jnp.float32),
+        step_count=jnp.asarray(7, dtype=jnp.int32),
+    )
+
+    chex.assert_trees_all_equal(
+        featurizer.update(negative, finite_observation),
+        negative,
+    )
+    chex.assert_trees_all_equal(
+        featurizer.update(nonfinite_ema, finite_observation),
+        nonfinite_ema,
+    )
+    chex.assert_tree_all_finite(featurizer.features(nonfinite_ema, finite_observation))
+
+
+@pytest.mark.parametrize(
+    "observation",
+    [
+        jnp.asarray([1], dtype=jnp.int32),
+        jnp.asarray([True], dtype=jnp.bool_),
+        jnp.asarray([[1.0]], dtype=jnp.float32),
+    ],
+)
+def test_temporal_context_rejects_observation_laundering(observation: jax.Array) -> None:
+    featurizer = TemporalContextFeaturizer(
+        TemporalContextConfig(input_dim=1, periods=())
+    )
+    state = featurizer.init()
+
+    with pytest.raises(ValueError, match="observation"):
+        featurizer.step(state, observation)
+
+
+def test_temporal_context_rejects_hostile_runtime_objects_without_hooks() -> None:
+    class Hostile:
+        calls = 0
+
+        def __getattribute__(self, name: str) -> object:
+            if name == "calls":
+                return object.__getattribute__(self, name)
+            type(self).calls += 1
+            raise AssertionError("hostile attribute hook executed")
+
+        def __jax_array__(self) -> jax.Array:
+            type(self).calls += 1
+            raise AssertionError("hostile JAX coercion hook executed")
+
+    featurizer = TemporalContextFeaturizer(
+        TemporalContextConfig(input_dim=1, periods=())
+    )
+    hostile = Hostile()
+
+    with pytest.raises(ValueError, match="state must be"):
+        featurizer.update(hostile, jnp.ones((1,), dtype=jnp.float32))  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="observation must be"):
+        featurizer.update(featurizer.init(), hostile)  # type: ignore[arg-type]
+    assert Hostile.calls == 0
+
+
+@pytest.mark.parametrize(
+    "observation_ema",
+    [
+        jnp.asarray([0], dtype=jnp.int32),
+        jnp.asarray(0.0, dtype=jnp.float32),
+        jnp.zeros((2,), dtype=jnp.float32),
+    ],
+)
+def test_temporal_context_rejects_malformed_ema_metadata(
+    observation_ema: jax.Array,
+) -> None:
+    featurizer = TemporalContextFeaturizer(
+        TemporalContextConfig(input_dim=1, periods=())
+    )
+    state = TemporalContextState(
+        observation_ema=observation_ema,
+        step_count=jnp.asarray(0, dtype=jnp.int32),
+    )
+
+    with pytest.raises(ValueError, match="state.observation_ema"):
+        featurizer.update(state, jnp.ones((1,), dtype=jnp.float32))
+
+
 _INVALID_TEMPORAL_CONTEXT_CONFIGS: tuple[dict[str, object], ...] = (
     {"input_dim": 0},
     {"input_dim": -1},
