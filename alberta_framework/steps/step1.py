@@ -66,8 +66,7 @@ _VALID_OPTIMIZERS: frozenset[str] = frozenset(
 _VALID_NORMALIZERS: frozenset[str] = frozenset({"none", "ema", "welford", "streaming_batch"})
 _VALID_STREAMS: frozenset[str] = frozenset({"alberta", "xdist_shift"})
 _INT32_MAX: int = 2**31 - 1
-_ACTUAL_INT_TYPES = frozenset(
-    {
+_ACTUAL_INT_TYPES = (
         int,
         np.int8,
         np.int16,
@@ -79,40 +78,30 @@ _ACTUAL_INT_TYPES = frozenset(
         np.uint64,
         np.longlong,
         np.ulonglong,
-    }
 )
-_ACTUAL_FLOAT_TYPES = frozenset(
-    {
+_ACTUAL_FLOAT_TYPES = (
         float,
         Fraction,
         np.dtype("e").type,
         np.dtype("f").type,
         np.dtype("d").type,
         np.dtype("g").type,
-    }
 )
-_ALLOWED_REAL_TYPES = _ACTUAL_INT_TYPES | _ACTUAL_FLOAT_TYPES
+_ALLOWED_REAL_TYPES = _ACTUAL_INT_TYPES + _ACTUAL_FLOAT_TYPES
 
 
-def _require_exact_str(name: str, value: object) -> str:
-    if type(value) is not str:
-        raise ValueError(f"{name} must be an exact string")
-    return value
-
-
-def finite_real_and_float32(name: object, value: object) -> tuple[Real, int, int, float]:
+def finite_real_and_float32(name: str, value: object) -> tuple[Real, int, int, float]:
     """Return the original real, exact ratio, and finite binary32 rounding."""
-    host_name = _require_exact_str("name", name)
     actual_type = type(value)
-    if actual_type not in _ALLOWED_REAL_TYPES:
-        raise ValueError(f"{host_name} must be a real number")
+    if not any(actual_type is candidate for candidate in _ALLOWED_REAL_TYPES):
+        raise ValueError(f"{name} must be a real number")
     real = cast(Real, value)
     try:
         numerator, denominator, narrowed = round_real_to_float32_with_ratio(real)
     except (FloatingPointError, OverflowError, TypeError, ValueError):
-        raise ValueError(f"{host_name} must narrow to a finite float32") from None
+        raise ValueError(f"{name} must narrow to a finite float32") from None
     if not math.isfinite(narrowed):
-        raise ValueError(f"{host_name} must narrow to a finite float32")
+        raise ValueError(f"{name} must narrow to a finite float32")
     return real, numerator, denominator, narrowed
 
 
@@ -132,16 +121,14 @@ def canonical_float32_storage(value: Real, narrowed: float) -> float:
     return number
 
 
-def _require_real(name: object, value: object) -> tuple[float, float]:
+def _require_real(name: str, value: object) -> tuple[float, float]:
     """Return a JSON scalar and the value consumed by float32 JAX sinks."""
-    host_name = _require_exact_str("name", name)
-    real, _, _, narrowed = finite_real_and_float32(host_name, value)
+    real, _, _, narrowed = finite_real_and_float32(name, value)
     return canonical_float32_storage(real, narrowed), narrowed
 
 
-def _require_unit_interval(name: object, value: object) -> float:
-    host_name = _require_exact_str("name", name)
-    real, numerator, denominator, narrowed = finite_real_and_float32(host_name, value)
+def _require_unit_interval(name: str, value: object) -> float:
+    real, numerator, denominator, narrowed = finite_real_and_float32(name, value)
     if (
         real < 0.0
         or not real <= 1.0
@@ -150,23 +137,21 @@ def _require_unit_interval(name: object, value: object) -> float:
         or narrowed < 0.0
         or not narrowed <= 1.0
     ):
-        raise ValueError(f"{host_name} must be in [0, 1]")
+        raise ValueError(f"{name} must be in [0, 1]")
     return canonical_float32_storage(real, narrowed)
 
 
-def _require_nonnegative_real(name: object, value: object) -> float:
-    host_name = _require_exact_str("name", name)
-    real, numerator, _, narrowed = finite_real_and_float32(host_name, value)
+def _require_nonnegative_real(name: str, value: object) -> float:
+    real, numerator, _, narrowed = finite_real_and_float32(name, value)
     if real < 0.0 or numerator < 0 or narrowed < 0.0:
-        raise ValueError(f"{host_name} must be non-negative")
+        raise ValueError(f"{name} must be non-negative")
     return canonical_float32_storage(real, narrowed)
 
 
-def _require_positive_real(name: object, value: object) -> float:
-    host_name = _require_exact_str("name", name)
-    real, numerator, _, narrowed = finite_real_and_float32(host_name, value)
+def _require_positive_real(name: str, value: object) -> float:
+    real, numerator, _, narrowed = finite_real_and_float32(name, value)
     if real <= 0.0 or numerator <= 0 or narrowed <= 0.0:
-        raise ValueError(f"{host_name} must remain positive in float32")
+        raise ValueError(f"{name} must remain positive in float32")
     return canonical_float32_storage(real, narrowed)
 
 
@@ -174,34 +159,32 @@ def _require_positive_real(name: object, value: object) -> float:
 _TRUSTED_INT_TYPES = _ACTUAL_INT_TYPES
 
 
-def _require_bool(name: object, value: object) -> bool:
+def _require_bool(name: str, value: object) -> bool:
     """Require an actual builtin bool (``__class__`` spoofing is ignored)."""
-    host_name = _require_exact_str("name", name)
     if type(value) is not bool:
-        raise ValueError(f"{host_name} must be a built-in bool")
+        raise ValueError(f"{name} must be a built-in bool")
     return value
 
 
 def _require_int(
-    name: object,
+    name: str,
     value: object,
     *,
     minimum: int | None = None,
     maximum: int | None = None,
 ) -> int:
-    host_name = _require_exact_str("name", name)
     actual_type = type(value)
-    if actual_type not in _ACTUAL_INT_TYPES:
-        raise ValueError(f"{host_name} must be an integer")
+    if not any(actual_type is candidate for candidate in _ACTUAL_INT_TYPES):
+        raise ValueError(f"{name} must be an integer")
     number: int = int(cast(Any, value))
     if minimum is not None and number < minimum:
         if minimum == 1:
-            raise ValueError(f"{host_name} must be positive")
+            raise ValueError(f"{name} must be positive")
         if minimum == 0:
-            raise ValueError(f"{host_name} must be non-negative")
-        raise ValueError(f"{host_name} must be >= {minimum}")
+            raise ValueError(f"{name} must be non-negative")
+        raise ValueError(f"{name} must be >= {minimum}")
     if maximum is not None and number > maximum:
-        raise ValueError(f"{host_name} must be <= {maximum}")
+        raise ValueError(f"{name} must be <= {maximum}")
     return number
 
 
@@ -212,20 +195,20 @@ def _validate_step1_config(config: Step1KernelConfig) -> None:
         raise ValueError(
             f"num_relevant ({num_relevant}) must be <= feature_dim ({feature_dim})"
         )
-    if not isinstance(config.optimizer, str) or config.optimizer.lower() not in _VALID_OPTIMIZERS:
+    if type(config.optimizer) is not str or config.optimizer.lower() not in _VALID_OPTIMIZERS:
         raise ValueError(
             "unknown Step 1 optimizer; "
             f"expected one of {sorted(_VALID_OPTIMIZERS)}"
         )
     if (
-        not isinstance(config.normalizer, str)
+        type(config.normalizer) is not str
         or config.normalizer.lower() not in _VALID_NORMALIZERS
     ):
         raise ValueError(
             "unknown Step 1 normalizer; "
             f"expected one of {sorted(_VALID_NORMALIZERS)}"
         )
-    if not isinstance(config.stream, str) or config.stream.lower() not in _VALID_STREAMS:
+    if type(config.stream) is not str or config.stream.lower() not in _VALID_STREAMS:
         raise ValueError(
             "unknown Step 1 stream; "
             f"expected one of {sorted(_VALID_STREAMS)}"
