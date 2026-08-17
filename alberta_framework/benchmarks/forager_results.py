@@ -132,6 +132,19 @@ def _canonical_json_sha256(value: Any) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def _pairing_json(value: Any, *, name: str) -> str:
+    """Encode a pairing identity while rejecting non-finite JSON numbers."""
+    try:
+        return json.dumps(
+            value,
+            allow_nan=False,
+            sort_keys=True,
+            default=str,
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be finite JSON") from exc
+
+
 def _json_mapping_copy(value: Mapping[str, Any], *, name: str) -> dict[str, Any]:
     """Return a detached JSON mapping while rejecting non-finite/unsafe values."""
     try:
@@ -2161,10 +2174,9 @@ def _environment_signature(run: ForagerRunResult) -> tuple[Any, ...]:
     semantic = _foragax_semantic_signature(run)
     environment_signature: str | tuple[str, str]
     if semantic is None:
-        environment_signature = json.dumps(
+        environment_signature = _pairing_json(
             run.environment,
-            sort_keys=True,
-            default=str,
+            name="environment pairing identity",
         )
     else:
         implementation = _foragax_implementation_signature(run)
@@ -2175,7 +2187,10 @@ def _environment_signature(run: ForagerRunResult) -> tuple[Any, ...]:
         environment_signature = (semantic, implementation)
     return (
         environment_signature,
-        json.dumps(run.metric_contract, sort_keys=True, default=str),
+        _pairing_json(
+            run.metric_contract,
+            name="metric_contract pairing identity",
+        ),
         run.steps,
     )
 
