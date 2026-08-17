@@ -60,9 +60,9 @@ def _validate_policy(
     if type(name) is not str:
         raise ValueError("name must be an exact string")
     if type(positive) is not bool:
-        raise ValueError("positive must be an exact bool")
+        raise ValueError("positive must be an exact bool; built-in bool required")
     if type(upper_inclusive) is not bool:
-        raise ValueError("upper_inclusive must be an exact bool")
+        raise ValueError("upper_inclusive must be an exact bool; built-in bool required")
     checked_lower = _optional_bound("lower", lower)
     checked_upper = _optional_bound("upper", upper)
     if checked_lower is not None and checked_upper is not None:
@@ -82,13 +82,13 @@ def _validate_policy(
 
 
 def validated_float32_scalar(
-    name: str,
+    name: object,
     value: object,
     *,
-    positive: bool = False,
+    positive: object = False,
     lower: object | None = None,
     upper: object | None = None,
-    upper_inclusive: bool = True,
+    upper_inclusive: object = True,
 ) -> float:
     """Return the canonical stored value of one float32-consumed scalar or fail closed.
 
@@ -109,13 +109,13 @@ def validated_float32_scalar(
 
 
 def validated_float32_scalar_with_ratio(
-    name: str,
+    name: object,
     value: object,
     *,
-    positive: bool = False,
+    positive: object = False,
     lower: object | None = None,
     upper: object | None = None,
-    upper_inclusive: bool = True,
+    upper_inclusive: object = True,
 ) -> tuple[float, int, int]:
     """Validate once and also return the exact host numerator and denominator."""
     name, positive, lower, upper, upper_inclusive = _validate_policy(
@@ -184,10 +184,13 @@ def validated_float32_scalar_with_ratio(
 
 
 def _describe_domain(
-    positive: bool, lower: float | None, upper: float | None, upper_inclusive: bool
+    positive: bool,
+    lower: object | None,
+    upper: object | None,
+    upper_inclusive: bool,
 ) -> str:
     if upper is not None:
-        floor = lower if lower is not None else "-inf"
+        floor: object = lower if lower is not None else "-inf"
         bracket = "]" if upper_inclusive else ")"
         return f"in [{floor}, {upper}{bracket}"
     if positive:
