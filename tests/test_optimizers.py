@@ -68,6 +68,30 @@ class TestIDBD:
         chex.assert_trees_all_close(state.traces, jnp.zeros(10))
         assert state.meta_step_size == pytest.approx(0.001)
 
+    @pytest.mark.parametrize("initial_step_size", [float("nan"), float("inf"), 0.0, -0.1, True])
+    def test_rejects_illegal_initial_step_size(self, initial_step_size: object) -> None:
+        with pytest.raises(ValueError, match="initial_step_size"):
+            IDBD(initial_step_size=initial_step_size)  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize("meta_step_size", [float("nan"), float("inf"), -0.1, True])
+    def test_rejects_illegal_meta_step_size(self, meta_step_size: object) -> None:
+        with pytest.raises(ValueError, match="meta_step_size"):
+            IDBD(meta_step_size=meta_step_size)  # type: ignore[arg-type]
+
+    def test_zero_meta_step_size_remains_legal(self) -> None:
+        optimizer = IDBD(initial_step_size=0.01, meta_step_size=0.0)
+        state = optimizer.init(feature_dim=2)
+        assert float(state.meta_step_size) == 0.0
+        assert bool(jnp.all(jnp.isfinite(state.log_step_sizes)))
+
+    def test_positive_meta_step_size_must_survive_float32_narrowing(self) -> None:
+        with pytest.raises(ValueError, match="remain nonzero"):
+            IDBD(meta_step_size=1e-100)
+
+        smallest_subnormal = float(np.nextafter(np.float32(0.0), np.float32(1.0)))
+        state = IDBD(meta_step_size=smallest_subnormal).init(feature_dim=2)
+        assert float(state.meta_step_size) == smallest_subnormal
+
     def test_update_returns_correct_shapes(self, sample_observation):
         """IDBD update should return correctly shaped deltas."""
         optimizer = IDBD()
