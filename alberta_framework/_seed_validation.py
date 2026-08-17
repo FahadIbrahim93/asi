@@ -8,15 +8,21 @@ same random stream while being recorded as different identities.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from typing import Final
 
 JAX_KEY_SEED_MAX: Final[int] = (1 << 32) - 1
 
 
+def _require_exact_str(name: str, value: object) -> str:
+    if type(value) is not str:
+        raise ValueError(f"{name} must be an exact string")
+    return value
+
+
 def require_jax_seed(value: object, *, name: str = "seed") -> int:
     """Return one exact built-in integer in JAX's scalar-key seed domain."""
 
+    _require_exact_str("name", name)
     if type(value) is not int:
         raise ValueError(
             f"{name} must be a built-in integer in [0, {JAX_KEY_SEED_MAX}] "
@@ -32,11 +38,16 @@ def require_jax_seed(value: object, *, name: str = "seed") -> int:
 
 
 def require_unique_jax_seeds(
-    values: Sequence[object], *, name: str = "seeds"
+    values: object, *, name: str = "seeds"
 ) -> tuple[int, ...]:
     """Validate a non-empty, ordered sequence of unique canonical JAX seeds."""
 
-    raw = tuple(values)
+    _require_exact_str("name", name)
+    if isinstance(values, (str, bytes, bytearray)):
+        raise ValueError(f"{name} must be a non-string sequence")
+    if type(values) not in (list, tuple):
+        raise ValueError(f"{name} must be a list or tuple of seeds")
+    raw: tuple[object, ...] = tuple(values)  # type: ignore[arg-type]
     if not raw:
         raise ValueError(f"{name} must be non-empty")
     seeds = tuple(
