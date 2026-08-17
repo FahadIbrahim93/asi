@@ -211,9 +211,8 @@ class CumulantDiscovery:
             "predictor_step_size", predictor_step_size, positive=True
         )
         gamma = _require_float32("gamma", gamma, lower=0.0, upper=1.0)
-        if type(enabled) not in (bool, np.bool_):
-            raise ValueError("enabled must be a boolean")
-        enabled = bool(enabled)
+        if type(enabled) is not bool:
+            raise ValueError("enabled must be an exact boolean")
 
         self._raw_dim = raw_dim
         self._n_candidates = n_candidates
@@ -223,6 +222,71 @@ class CumulantDiscovery:
         self._predictor_step_size = predictor_step_size
         self._gamma = gamma
         self._enabled = enabled
+
+    @staticmethod
+    def _require_typed_key(name: str, value: object) -> Array:
+        """Require a typed scalar Threefry key, never legacy uint32 words."""
+        try:
+            key = jnp.asarray(value)
+            implementation = str(jr.key_impl(value))  # type: ignore[arg-type]
+            words = jr.key_data(value)  # type: ignore[arg-type]
+        except Exception as error:
+            raise ValueError(f"{name} must be a typed scalar threefry2x32 key") from error
+        if (
+            key.shape != ()
+            or implementation != "threefry2x32"
+            or words.shape != (2,)
+            or words.dtype != jnp.uint32
+        ):
+            raise ValueError(f"{name} must be a typed scalar threefry2x32 key")
+        return key
+
+    def _require_state_contract(self, state: object) -> CumulantDiscoveryState:
+        if type(state) is not CumulantDiscoveryState:
+            raise ValueError("state must be an actual CumulantDiscoveryState")
+        canonical = state
+        matrix_shape = (self._n_candidates, self._raw_dim)
+        vector_shape = (self._n_candidates,)
+        for name in ("projections", "weights"):
+            leaf = getattr(canonical, name)
+            if leaf.shape != matrix_shape or leaf.dtype != jnp.float32:
+                raise ValueError(
+                    f"state.{name} must have shape {matrix_shape} and dtype float32"
+                )
+        for name in ("biases", "utility"):
+            leaf = getattr(canonical, name)
+            if leaf.shape != vector_shape or leaf.dtype != jnp.float32:
+                raise ValueError(
+                    f"state.{name} must have shape {vector_shape} and dtype float32"
+                )
+        if canonical.ages.shape != vector_shape or canonical.ages.dtype != jnp.int32:
+            raise ValueError(
+                f"state.ages must have shape {vector_shape} and dtype int32"
+            )
+        self._require_typed_key("state.key", canonical.key)
+        return canonical
+
+    def _require_observation(self, name: str, value: object) -> Array:
+        try:
+            observation = jnp.asarray(value)
+        except Exception as error:
+            raise ValueError(f"{name} must be a readable float32 vector") from error
+        if observation.shape != (self._raw_dim,) or observation.dtype != jnp.float32:
+            raise ValueError(
+                f"{name} must have shape ({self._raw_dim},) and dtype float32"
+            )
+        return observation
+
+    @staticmethod
+    def _state_values_valid(state: CumulantDiscoveryState) -> Array:
+        return (
+            jnp.all(jnp.isfinite(state.projections))
+            & jnp.all(jnp.isfinite(state.weights))
+            & jnp.all(jnp.isfinite(state.biases))
+            & jnp.all(jnp.isfinite(state.utility))
+            & jnp.all(state.utility >= 0.0)
+            & jnp.all(state.ages >= 0)
+        )
 
     @property
     def n_candidates(self) -> int:
@@ -244,6 +308,7 @@ class CumulantDiscovery:
     def init(self, key: Array) -> CumulantDiscoveryState:
         """Initialize state with random projections, zero predictors,
         zero utility, zero ages."""
+        key = self._require_typed_key("key", key)
         k_proj, k_state = jr.split(key)
         # Unit-norm random projections
         raw_proj = jr.normal(
@@ -273,6 +338,8 @@ class CumulantDiscovery:
         ``s_t`` to ``s_{t+1}`` should use ``c_{t+1}``, so callers feeding a
         Horde should normally pass the *next* observation here.
         """
+        state = self._require_state_contract(state)
+        observation = self._require_observation("observation", observation)
         return state.projections @ observation
 
     @functools.partial(jax.jit, static_argnums=(0,))
@@ -304,6 +371,11 @@ class CumulantDiscovery:
         Returns:
             Updated discovery state
         """
+        state = self._require_state_contract(state)
+        observation = self._require_observation("observation", observation)
+        next_observation = self._require_observation(
+            "next_observation", next_observation
+        )
         alpha = jnp.asarray(self._predictor_step_size, dtype=jnp.float32)
         gamma = jnp.asarray(self._gamma, dtype=jnp.float32)
         decay = jnp.asarray(self._decay_rate, dtype=jnp.float32)
@@ -341,7 +413,7 @@ class CumulantDiscovery:
         return cast(
             CumulantDiscoveryState,
             jax.lax.cond(
-                inputs_valid & proposed_finite,
+                self._state_values_valid(state) & inputs_valid & proposed_finite,
                 lambda: proposed_state,
                 lambda: state,
             ),
@@ -362,6 +434,7 @@ class CumulantDiscovery:
         Replacement: re-sample the projection row, zero the predictor
         weights/bias, reset utility to 0 and age to 0.
         """
+        state = self._require_state_contract(state)
         if not self._enabled:
             return state
 
@@ -412,13 +485,18 @@ class CumulantDiscovery:
             state.ages,
         )
 
-        return CumulantDiscoveryState(  # type: ignore[call-arg]
+        candidate = CumulantDiscoveryState(  # type: ignore[call-arg]
             projections=new_projections,
             weights=new_weights,
             biases=new_biases,
             utility=new_utility,
             ages=new_ages,
             key=k_next,
+        )
+        commit = self._state_values_valid(state) & self._state_values_valid(candidate)
+        return cast(
+            CumulantDiscoveryState,
+            jax.lax.cond(commit, lambda: candidate, lambda: state),
         )
 
     def to_config(self) -> dict[str, Any]:
