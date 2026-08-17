@@ -168,6 +168,18 @@ class TestSwitchingTwoStateDynamics:
         assert int(env.phase_id(state)) == PHASE_A
         assert int(jax.jit(env.phase_id)(state)) == PHASE_A
 
+    def test_switching_config_rejects_bool_and_nan_identities(self):
+        """Switching payoff records must not persist True/NaN identities."""
+        with pytest.raises(
+            ValueError,
+            match=rf"phase_length must be a positive integer in \[1, {_INT32_MAX}\]",
+        ):
+            SwitchingTwoStateConfig(phase_length=True)
+        with pytest.raises(ValueError, match="finite"):
+            SwitchingTwoStateConfig(payoffs_a=((True, 1.0), (1.0, 0.0)))
+        with pytest.raises(ValueError, match="finite"):
+            SwitchingTwoStateConfig(payoffs_b=((1.0, 0.0), (0.0, float("nan"))))
+
     def test_invalid_payoff_shape_raises(self):
         """Payoff matrices must preserve the fixed state/action shape."""
         with pytest.raises(ValueError, match="2x2"):
@@ -501,6 +513,17 @@ class TestRiverSwim:
         with pytest.raises(ValueError, match="policy"):
             RiverSwimMDP(RiverSwimConfig(n_states=3)).policy_average_reward([0, 1])
 
+    def test_riverswim_config_rejects_bool_and_nan_identities(self):
+        """The public config record must not persist True/NaN step identities."""
+        with pytest.raises(ValueError, match="p_right_up must be finite"):
+            RiverSwimConfig(p_right_up=True)
+        with pytest.raises(ValueError, match="p_right_up must be finite"):
+            RiverSwimConfig(p_right_up=float("nan"))
+        with pytest.raises(ValueError, match="n_states"):
+            RiverSwimConfig(n_states=True)
+        with pytest.raises(ValueError, match="reward_left"):
+            RiverSwimConfig(reward_left=True)
+
     @pytest.mark.parametrize(
         "value",
         [
@@ -626,16 +649,14 @@ def test_closed_loop_integer_rejection_never_invokes_hostile_hooks() -> None:
         def __repr__(self) -> str:
             raise AssertionError("untrusted repr hook executed")
 
-    for config in (
-        SwitchingTwoStateConfig(phase_length=HostileInt(2)),
-        SwitchingTwoStateConfig(phase_length=ClassSpoof()),  # type: ignore[arg-type]
-    ):
-        with pytest.raises(ValueError, match="phase_length"):
-            SwitchingTwoStateMDP(config)
+    with pytest.raises(ValueError, match="phase_length"):
+        SwitchingTwoStateConfig(phase_length=HostileInt(2))
+    with pytest.raises(ValueError, match="phase_length"):
+        SwitchingTwoStateConfig(phase_length=ClassSpoof())  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="n_states"):
-        RiverSwimMDP(RiverSwimConfig(n_states=ClassSpoof()))  # type: ignore[arg-type]
+        RiverSwimConfig(n_states=ClassSpoof())  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="initial_state"):
-        RiverSwimMDP(RiverSwimConfig(initial_state=HostileInt(0)))
+        RiverSwimConfig(initial_state=HostileInt(0))
 
 
 def test_riverswim_resource_formula_matches_resident_arrays() -> None:

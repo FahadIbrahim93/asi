@@ -160,6 +160,33 @@ def _normalized_finite_float32_reward(name: str, value: object) -> float:
     return narrowed
 
 
+def _canonical_two_state_payoffs(
+    name: str, raw_payoff: object
+) -> tuple[tuple[float, float], tuple[float, float]]:
+    """Return one 2x2 payoff matrix after rejecting bool/NaN identities."""
+    try:
+        payoff_shape = tuple(np.shape(cast(Any, raw_payoff)))
+    except Exception as error:
+        raise ValueError(f"{name} shape must be readable") from error
+    if payoff_shape != (_TWO_STATE_N, _TWO_STATE_ACTIONS):
+        raise ValueError(f"{name} must be 2x2 (state x action)")
+    try:
+        object_payoff = np.asarray(raw_payoff, dtype=object)
+    except Exception as error:
+        raise ValueError(f"{name} must be readable") from error
+    normalized = tuple(
+        _normalized_finite_float32_reward(
+            f"{name}[{index // _TWO_STATE_ACTIONS}][{index % _TWO_STATE_ACTIONS}]",
+            value,
+        )
+        for index, value in enumerate(object_payoff.flat)
+    )
+    return (
+        (normalized[0], normalized[1]),
+        (normalized[2], normalized[3]),
+    )
+
+
 def _normalized_positive_float32_probability(
     name: str, value: object
 ) -> tuple[float, int, int]:
@@ -234,6 +261,21 @@ class SwitchingTwoStateConfig:
     payoffs_a: tuple[tuple[float, float], tuple[float, float]] = ((0.0, 1.0), (1.0, 0.0))
     payoffs_b: tuple[tuple[float, float], tuple[float, float]] = ((1.0, 0.0), (0.0, 1.0))
 
+    def __post_init__(self) -> None:
+        """Reject bool/NaN identities before the record can be serialized."""
+        try:
+            phase_length = _require_int32("phase_length", self.phase_length, minimum=1)
+        except ValueError:
+            raise ValueError(
+                f"phase_length must be a positive integer in [1, {_INT32_MAX}]"
+            ) from None
+        canonical_payoffs: list[tuple[tuple[float, float], tuple[float, float]]] = []
+        for name in ("payoffs_a", "payoffs_b"):
+            canonical_payoffs.append(_canonical_two_state_payoffs(name, getattr(self, name)))
+        object.__setattr__(self, "phase_length", phase_length)
+        object.__setattr__(self, "payoffs_a", canonical_payoffs[0])
+        object.__setattr__(self, "payoffs_b", canonical_payoffs[1])
+
 
 @chex.dataclass(frozen=True)
 class SwitchingTwoStateState:
@@ -276,28 +318,7 @@ class SwitchingTwoStateMDP:
         phase_payoffs: list[np.ndarray] = []
         canonical_payoffs: list[tuple[tuple[float, float], tuple[float, float]]] = []
         for name in ("payoffs_a", "payoffs_b"):
-            raw_payoff = getattr(config, name)
-            try:
-                payoff_shape = tuple(np.shape(cast(Any, raw_payoff)))
-            except Exception as error:
-                raise ValueError(f"{name} shape must be readable") from error
-            if payoff_shape != (_TWO_STATE_N, _TWO_STATE_ACTIONS):
-                raise ValueError(f"{name} must be 2x2 (state x action)")
-            try:
-                object_payoff = np.asarray(raw_payoff, dtype=object)
-            except Exception as error:
-                raise ValueError(f"{name} must be readable") from error
-            normalized = tuple(
-                _normalized_finite_float32_reward(
-                    f"{name}[{index // _TWO_STATE_ACTIONS}][{index % _TWO_STATE_ACTIONS}]",
-                    value,
-                )
-                for index, value in enumerate(object_payoff.flat)
-            )
-            canonical = (
-                (normalized[0], normalized[1]),
-                (normalized[2], normalized[3]),
-            )
+            canonical = _canonical_two_state_payoffs(name, getattr(config, name))
             payoff = np.asarray(canonical, dtype=np.float32)
             phase_payoffs.append(payoff)
             canonical_payoffs.append(canonical)
@@ -468,6 +489,41 @@ class RiverSwimConfig:
     reward_left: float = 0.005
     reward_right: float = 1.0
     initial_state: int = 0
+
+    def __post_init__(self) -> None:
+        """Reject bool/NaN identities before the record can be serialized."""
+        n_states = _require_int32("n_states", self.n_states, minimum=2)
+        initial_state = _require_int32(
+            "initial_state", self.initial_state, minimum=0, maximum=n_states - 1
+        )
+        _riverswim_persistent_resources(n_states)
+        p_right_up, up_numerator, up_denominator = _normalized_positive_float32_probability(
+            "p_right_up",
+            self.p_right_up,
+        )
+        (
+            p_right_down,
+            down_numerator,
+            down_denominator,
+        ) = _normalized_positive_float32_probability(
+            "p_right_down",
+            self.p_right_down,
+        )
+        if (
+            up_numerator * down_denominator + down_numerator * up_denominator
+            > up_denominator * down_denominator
+        ):
+            raise ValueError("p_right_up + p_right_down must not exceed 1")
+        reward_left = _normalized_finite_float32_reward("reward_left", self.reward_left)
+        reward_right = _normalized_finite_float32_reward("reward_right", self.reward_right)
+        if p_right_up + p_right_down > 1.0:
+            raise ValueError("p_right_up + p_right_down must not exceed 1")
+        object.__setattr__(self, "n_states", n_states)
+        object.__setattr__(self, "initial_state", initial_state)
+        object.__setattr__(self, "p_right_up", p_right_up)
+        object.__setattr__(self, "p_right_down", p_right_down)
+        object.__setattr__(self, "reward_left", reward_left)
+        object.__setattr__(self, "reward_right", reward_right)
 
 
 @chex.dataclass(frozen=True)
