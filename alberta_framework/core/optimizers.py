@@ -13,11 +13,14 @@ References:
 - Elsayed et al. 2024, "Streaming Deep Reinforcement Learning Finally Works"
 """
 
+import operator
 from abc import ABC, abstractmethod
-from typing import Any, cast
+from math import prod
+from typing import Any, SupportsIndex, cast
 
 import chex
 import jax.numpy as jnp
+import numpy as np
 from jax import Array
 from jaxtyping import Bool, Float
 
@@ -44,6 +47,51 @@ from alberta_framework.core.update_safety import (
 def _skip_zero_scale(scale: Array, value: Array) -> Array:
     """Return 0 when ``scale`` is 0 so IEEE ``0 * inf`` does not become NaN."""
     return jnp.where(scale == 0.0, jnp.zeros_like(value), scale * value)
+
+
+_INT32_MAX = 2**31 - 1
+_ACTUAL_INT_TYPES = frozenset(
+    {
+        int,
+        np.int8,
+        np.int16,
+        np.int32,
+        np.int64,
+        np.uint8,
+        np.uint16,
+        np.uint32,
+        np.uint64,
+        np.longlong,
+        np.ulonglong,
+    }
+)
+
+
+def _require_int32(name: str, value: object, *, minimum: int, maximum: int = _INT32_MAX) -> int:
+    if type(value) not in _ACTUAL_INT_TYPES:
+        raise ValueError(f"{name} must be an integer in [{minimum}, {maximum}]")
+    canonical = operator.index(cast(SupportsIndex, value))
+    if not minimum <= canonical <= maximum:
+        raise ValueError(f"{name} must be an integer in [{minimum}, {maximum}]")
+    return canonical
+
+
+def _require_shape(shape: object) -> tuple[int, ...]:
+    if type(shape) is not tuple:
+        raise ValueError("shape must be an actual tuple")
+    return tuple(_require_int32(f"shape[{i}]", s, minimum=1) for i, s in enumerate(shape))
+
+
+def _require_float32_state(name: str, scalar_count: int) -> None:
+    if scalar_count > _INT32_MAX:
+        raise ValueError(f"{name} scalar count must fit signed int32")
+    if 4 * scalar_count > _INT32_MAX:
+        raise ValueError(f"{name} byte count must fit signed int32")
+
+
+def _shape_size(shape: tuple[int, ...]) -> int:
+    return prod(shape, start=1)
+
 
 # =============================================================================
 # Bounder ABC
@@ -97,10 +145,7 @@ def _apply_obgd_bound(
     scale = 1.0 / jnp.maximum(kappa * delta_bar * total_step, 1.0)
     collapsed = scale == 0
     return (
-        tuple(
-            zero_if_collapsed_infinity(scale * step, step, collapsed)
-            for step in steps
-        ),
+        tuple(zero_if_collapsed_infinity(scale * step, step, collapsed) for step in steps),
         scale,
     )
 
@@ -218,9 +263,7 @@ class AdaptiveObGDBounding(Bounder):
         for s in bounded:
             sum_sq = sum_sq + jnp.sum(s**2)
             n_weights = n_weights + s.size
-        rms = jnp.sqrt(
-            sum_sq / jnp.maximum(n_weights.astype(jnp.float32), 1.0) + self._eps
-        )
+        rms = jnp.sqrt(sum_sq / jnp.maximum(n_weights.astype(jnp.float32), 1.0) + self._eps)
         rms_scale = jnp.maximum(rms, 1.0)
         adaptive = tuple(s / rms_scale for s in bounded)
         return adaptive, scale
@@ -291,9 +334,7 @@ class AGCBounding(Bounder):
             needs_clip = g_norm > max_norm
             clipped_step = jnp.where(needs_clip, step * scale, step)
             collapsed = needs_clip & (scale == 0)
-            clipped.append(
-                zero_if_collapsed_infinity(clipped_step, step, collapsed)
-            )
+            clipped.append(zero_if_collapsed_infinity(clipped_step, step, collapsed))
 
             total_units += needs_clip.size
             clipped_units = clipped_units + jnp.sum(needs_clip.astype(jnp.float32))
@@ -321,8 +362,7 @@ class OptimizerUpdate:
     weight_delta: Float[Array, " feature_dim"]
     bias_delta: Float[Array, ""]
     new_state: (
-        LMSState | IDBDState | AutostepState | AutostepGTDLambdaState | ObGDState
-        | IDBDParamState
+        LMSState | IDBDState | AutostepState | AutostepGTDLambdaState | ObGDState | IDBDParamState
     )
     metrics: dict[str, Array]
     update_applied: Bool[Array, ""]
@@ -345,8 +385,13 @@ class ParamOptimizerUpdate:
 
 class Optimizer[
     StateT: (
-        LMSState, IDBDState, AutostepState, AutostepGTDLambdaState, ObGDState,
-        AutostepParamState, IDBDParamState,
+        LMSState,
+        IDBDState,
+        AutostepState,
+        AutostepGTDLambdaState,
+        ObGDState,
+        AutostepParamState,
+        IDBDParamState,
     )
 ](ABC):
     """Base class for optimizers."""
@@ -474,9 +519,7 @@ class Optimizer[
 
         step, new_state = self.update_from_gradient(state, gradient, error=error)
         error_is_finite = (
-            jnp.asarray(True, dtype=jnp.bool_)
-            if error is None
-            else jnp.all(jnp.isfinite(error))
+            jnp.asarray(True, dtype=jnp.bool_) if error is None else jnp.all(jnp.isfinite(error))
         )
         update_applied = (
             floating_tree_is_finite(state)
@@ -525,6 +568,7 @@ class LMS(Optimizer[LMSState]):
         Returns:
             LMS state containing the step-size
         """
+        _require_int32("feature_dim", feature_dim, minimum=1)
         return LMSState(step_size=jnp.array(self._step_size, dtype=jnp.float32))
 
     def init_for_shape(self, shape: tuple[int, ...]) -> LMSState:
@@ -533,6 +577,7 @@ class LMS(Optimizer[LMSState]):
         LMS state is shape-independent (single scalar), so this returns
         the same state regardless of shape.
         """
+        _require_shape(shape)
         return LMSState(step_size=jnp.array(self._step_size, dtype=jnp.float32))
 
     def update_from_gradient(
@@ -558,9 +603,7 @@ class LMS(Optimizer[LMSState]):
 
         step = state.step_size * gradient
         error_is_finite = (
-            jnp.asarray(True, dtype=jnp.bool_)
-            if error is None
-            else jnp.all(jnp.isfinite(error))
+            jnp.asarray(True, dtype=jnp.bool_) if error is None else jnp.all(jnp.isfinite(error))
         )
         update_applied = (
             floating_tree_is_finite(state)
@@ -691,6 +734,8 @@ class IDBD(Optimizer[IDBDState]):
         Returns:
             IDBD state with per-weight step-sizes and traces
         """
+        feature_dim = _require_int32("feature_dim", feature_dim, minimum=1)
+        _require_float32_state("IDBD state", 2 * feature_dim + 3)
         return IDBDState(
             log_step_sizes=jnp.full(
                 feature_dim, jnp.log(self._initial_step_size), dtype=jnp.float32
@@ -710,10 +755,10 @@ class IDBD(Optimizer[IDBDState]):
         Returns:
             IDBDParamState with arrays matching the given shape
         """
+        shape = _require_shape(shape)
+        _require_float32_state("IDBD parameter state", 2 * _shape_size(shape) + 1)
         return IDBDParamState(
-            log_step_sizes=jnp.full(
-                shape, jnp.log(self._initial_step_size), dtype=jnp.float32
-            ),
+            log_step_sizes=jnp.full(shape, jnp.log(self._initial_step_size), dtype=jnp.float32),
             traces=jnp.zeros(shape, dtype=jnp.float32),
             meta_step_size=jnp.array(self._meta_step_size, dtype=jnp.float32),
         )
@@ -825,9 +870,7 @@ class IDBD(Optimizer[IDBDState]):
             meta_step_size=beta,
         )
         error_is_finite = (
-            jnp.asarray(True, dtype=jnp.bool_)
-            if error is None
-            else jnp.all(jnp.isfinite(error))
+            jnp.asarray(True, dtype=jnp.bool_) if error is None else jnp.all(jnp.isfinite(error))
         )
         unused_traces = (beta == 0.0) & (decay == 0.0)
         previous_checked = state.replace(  # type: ignore[attr-defined]
@@ -1034,6 +1077,8 @@ class Autostep(Optimizer[AutostepState]):
         Returns:
             Autostep state with per-weight step-sizes, traces, and normalizers
         """
+        feature_dim = _require_int32("feature_dim", feature_dim, minimum=1)
+        _require_float32_state("Autostep state", 3 * feature_dim + 5)
         return AutostepState(
             step_sizes=jnp.full(feature_dim, self._initial_step_size, dtype=jnp.float32),
             traces=jnp.zeros(feature_dim, dtype=jnp.float32),
@@ -1054,6 +1099,8 @@ class Autostep(Optimizer[AutostepState]):
         Returns:
             AutostepParamState with arrays matching the given shape
         """
+        shape = _require_shape(shape)
+        _require_float32_state("Autostep parameter state", 3 * _shape_size(shape) + 2)
         return AutostepParamState(
             step_sizes=jnp.full(shape, self._initial_step_size, dtype=jnp.float32),
             traces=jnp.zeros(shape, dtype=jnp.float32),
@@ -1160,9 +1207,7 @@ class Autostep(Optimizer[AutostepState]):
             trace_candidate = decayed_traces + new_step_sizes * error_scalar * z
         else:
             trace_candidate = decayed_traces + new_step_sizes * z
-        new_traces = jnp.where(
-            jnp.isfinite(trace_candidate), trace_candidate, state.traces
-        )
+        new_traces = jnp.where(jnp.isfinite(trace_candidate), trace_candidate, state.traces)
 
         candidate_state = AutostepParamState(
             step_sizes=new_step_sizes,
@@ -1172,9 +1217,7 @@ class Autostep(Optimizer[AutostepState]):
             tau=tau,
         )
         error_is_finite = (
-            jnp.asarray(True, dtype=jnp.bool_)
-            if error is None
-            else jnp.all(jnp.isfinite(error))
+            jnp.asarray(True, dtype=jnp.bool_) if error is None else jnp.all(jnp.isfinite(error))
         )
         unused_traces = (mu == 0.0) & (trace_decay == 0.0)
         previous_checked = state.replace(  # type: ignore[attr-defined]
@@ -1267,9 +1310,7 @@ class Autostep(Optimizer[AutostepState]):
         bias_v_update = state.bias_normalizer + (1.0 / tau) * state.bias_step_size * (
             abs_bias_meta_gradient - state.bias_normalizer
         )
-        bias_normalizer_candidate = jnp.maximum(
-            abs_bias_meta_gradient, bias_v_update
-        )
+        bias_normalizer_candidate = jnp.maximum(abs_bias_meta_gradient, bias_v_update)
         valid_bias_meta_update = jnp.logical_and(
             jnp.isfinite(bias_meta_gradient),
             jnp.isfinite(bias_normalizer_candidate),
@@ -1309,18 +1350,14 @@ class Autostep(Optimizer[AutostepState]):
         # Trace update: h_i = h_i*(1 - α_i*x_i²) + α_i*δ*x_i
         trace_decay = 1.0 - new_step_sizes * x_sq
         trace_candidate = (
-            _skip_zero_scale(trace_decay, state.traces)
-            + new_step_sizes * error_scalar * x
+            _skip_zero_scale(trace_decay, state.traces) + new_step_sizes * error_scalar * x
         )
-        new_traces = jnp.where(
-            jnp.isfinite(trace_candidate), trace_candidate, state.traces
-        )
+        new_traces = jnp.where(jnp.isfinite(trace_candidate), trace_candidate, state.traces)
 
         # Bias trace: h_bias = h_bias*(1 - α_bias) + α_bias*δ
         bias_trace_decay = 1.0 - new_bias_step_size
         bias_trace_candidate = (
-            _skip_zero_scale(bias_trace_decay, state.bias_trace)
-            + new_bias_step_size * error_scalar
+            _skip_zero_scale(bias_trace_decay, state.bias_trace) + new_bias_step_size * error_scalar
         )
         new_bias_trace = jnp.where(
             jnp.isfinite(bias_trace_candidate),
@@ -1427,6 +1464,8 @@ class AutostepGTDLambda(Optimizer[AutostepGTDLambdaState]):
 
     def init(self, feature_dim: int) -> AutostepGTDLambdaState:
         """Initialize optimizer state."""
+        feature_dim = _require_int32("feature_dim", feature_dim, minimum=1)
+        _require_float32_state("AutostepGTDLambda state", 4 * feature_dim + 7)
         base_state = self._base.init(feature_dim)
         return AutostepGTDLambdaState(
             step_sizes=base_state.step_sizes,
@@ -1449,12 +1488,8 @@ class AutostepGTDLambda(Optimizer[AutostepGTDLambdaState]):
         observation: Array,
     ) -> OptimizerUpdate:
         """Compute one supervised-limit Autostep-for-GTD(lambda) update."""
-        eligibility = (
-            _skip_zero_scale(state.trace_decay, state.eligibility_traces) + observation
-        )
-        bias_eligibility = (
-            _skip_zero_scale(state.trace_decay, state.bias_eligibility_trace) + 1.0
-        )
+        eligibility = _skip_zero_scale(state.trace_decay, state.eligibility_traces) + observation
+        bias_eligibility = _skip_zero_scale(state.trace_decay, state.bias_eligibility_trace) + 1.0
         base_state = AutostepState(
             step_sizes=state.step_sizes,
             traces=state.traces,
@@ -1574,6 +1609,8 @@ class ObGD(Optimizer[ObGDState]):
         Returns:
             ObGD state with eligibility traces
         """
+        feature_dim = _require_int32("feature_dim", feature_dim, minimum=1)
+        _require_float32_state("ObGD state", feature_dim + 5)
         return ObGDState(
             step_size=jnp.array(self._step_size, dtype=jnp.float32),
             kappa=jnp.array(self._kappa, dtype=jnp.float32),
@@ -1801,6 +1838,8 @@ class TDIDBD(TDOptimizer[TDIDBDState]):
         Returns:
             TD-IDBD state with per-weight step-sizes, traces, and h traces
         """
+        feature_dim = _require_int32("feature_dim", feature_dim, minimum=1)
+        _require_float32_state("TDIDBD state", 3 * feature_dim + 5)
         return TDIDBDState(
             log_step_sizes=jnp.full(
                 feature_dim, jnp.log(self._initial_step_size), dtype=jnp.float32
@@ -2013,6 +2052,8 @@ class AutoTDIDBD(TDOptimizer[AutoTDIDBDState]):
         Returns:
             AutoTDIDBD state with per-weight step-sizes, traces, h traces, and normalizers
         """
+        feature_dim = _require_int32("feature_dim", feature_dim, minimum=1)
+        _require_float32_state("AutoTDIDBD state", 4 * feature_dim + 7)
         return AutoTDIDBDState(
             log_step_sizes=jnp.full(
                 feature_dim, jnp.log(self._initial_step_size), dtype=jnp.float32
