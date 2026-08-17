@@ -34,14 +34,16 @@ import dataclasses
 import functools
 import hashlib
 import json
+import operator
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any, Literal, SupportsIndex, cast
 
 import chex
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 from jax import Array
 
 from alberta_framework.core.checkpoints import (
@@ -76,6 +78,44 @@ MECHANISM_STATUS = "model-only-replay-mechanism-no-scientific-claim"
 _INT32_MAX = 2_147_483_647
 _UINT32_MAX = 4_294_967_295
 _MAX_EXACT_FLOAT32_INTEGER = 16_777_216
+_ACTUAL_INT_TYPES: tuple[type, ...] = (
+    int,
+    np.int8,
+    np.int16,
+    np.int32,
+    np.int64,
+    np.uint8,
+    np.uint16,
+    np.uint32,
+    np.uint64,
+    np.longlong,
+    np.ulonglong,
+)
+
+
+def _require_int(
+    name: str, value: object, *, minimum: int, maximum: int = _INT32_MAX
+) -> int:
+    if type(value) not in _ACTUAL_INT_TYPES:
+        raise ValueError(f"{name} must be an integer")
+    number = operator.index(cast(SupportsIndex, value))
+    if number < minimum:
+        raise ValueError(f"{name} must be >= {minimum}")
+    if number > maximum:
+        raise ValueError(f"{name} must be <= {maximum}")
+    return number
+
+
+def _require_float32_resource(
+    name: str, *, vector_scalars: int, fixed_scalars: int = 0
+) -> None:
+    total_scalars = vector_scalars + fixed_scalars
+    if total_scalars > _INT32_MAX:
+        raise ValueError(f"{name} scalar count must fit signed int32")
+    if 4 * total_scalars > _INT32_MAX:
+        raise ValueError(f"{name} byte count must fit signed int32")
+
+
 def _copy_mapping(payload: object, *, name: str) -> dict[str, Any]:
     if not issubclass(type(payload), Mapping):
         raise ValueError(f"{name} must be a mapping")
@@ -122,6 +162,24 @@ class ModelReplayRehearsalConfig:
             raise ValueError("ensemble and replay observation dimensions must match")
         if self.ensemble.model.n_actions > _MAX_EXACT_FLOAT32_INTEGER:
             raise ValueError("n_actions exceeds exact float32 action-index storage")
+        _require_int(
+            "ensemble.model.n_actions",
+            self.ensemble.model.n_actions,
+            minimum=1,
+            maximum=_INT32_MAX,
+        )
+        _require_int(
+            "replay.action_dim",
+            self.replay.action_dim,
+            minimum=1,
+            maximum=_INT32_MAX,
+        )
+        _require_int(
+            "replay.batch_size",
+            self.replay.batch_size,
+            minimum=1,
+            maximum=_INT32_MAX,
+        )
         if self.action_encoding == "scalar_index":
             if self.replay.action_dim != 1:
                 raise ValueError("scalar_index requires replay.action_dim == 1")
@@ -432,6 +490,10 @@ class ModelReplayRehearsal:
         self._replay = DualReplayMemory(config.replay)
         template = self._make_initial_state(jr.key(0), persistent_bytes=0)
         persistent_scalars, persistent_bytes = _logical_tree_size(template)
+        _require_float32_resource(
+            "ModelReplayRehearsal state",
+            vector_scalars=persistent_scalars,
+        )
         if persistent_bytes > _INT32_MAX:
             raise ValueError("ModelReplayRehearsal state byte count must fit signed int32")
         if persistent_bytes > _UINT32_MAX:
@@ -1019,6 +1081,10 @@ class ModelReplayRehearsal:
         composer_bytes = persistent_bytes - ensemble_bytes - replay_bytes
         if persistent_bytes != self._persistent_bytes or composer_bytes != 28:
             raise ValueError("model replay rehearsal resource allocation is invalid")
+        _require_float32_resource(
+            "ModelReplayRehearsal state",
+            vector_scalars=scalars,
+        )
         if persistent_bytes > _INT32_MAX:
             raise ValueError("ModelReplayRehearsal state byte count must fit signed int32")
         if persistent_bytes > _UINT32_MAX:
