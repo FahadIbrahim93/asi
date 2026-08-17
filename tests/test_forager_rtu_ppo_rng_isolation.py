@@ -526,3 +526,28 @@ def test_public_runtime_probe_rejects_frozen_schedule_drift(
         match="public environment key trace differs",
     ):
         isolation.run_public_rng_isolation_probe(source)
+
+
+@pytest.mark.parametrize("invalid", [float("nan"), float("inf"), float("-inf")])
+def test_plain_json_rejects_nonfinite_number_identities(invalid: float) -> None:
+    """RNG-isolation descriptors must not keep NaN/Inf as trusted JSON scalars."""
+
+    with pytest.raises(
+        isolation.RTUPPORngIsolationError,
+        match="non-finite JSON number",
+    ):
+        isolation._plain_json(invalid)
+    with pytest.raises(
+        isolation.RTUPPORngIsolationError,
+        match="non-finite JSON number",
+    ):
+        isolation._plain_json({"score": invalid})
+
+
+def test_plain_json_keeps_finite_canonical_scalars() -> None:
+    assert isolation._plain_json({"score": 1.25, "ok": True, "n": 2}) == {
+        "score": 1.25,
+        "ok": True,
+        "n": 2,
+    }
+    assert isolation._canonical_json({"score": 1.25}) == b'{"score":1.25}'

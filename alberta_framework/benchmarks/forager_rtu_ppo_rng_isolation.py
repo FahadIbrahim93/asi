@@ -19,6 +19,7 @@ import dataclasses
 import difflib
 import hashlib
 import json
+import math
 from collections.abc import Mapping, Sequence
 from types import MappingProxyType
 from typing import Any, Final, cast
@@ -227,7 +228,13 @@ def _unified_diff(upstream: bytes, derived: bytes) -> bytes:
 
 def _plain_json(value: Any, *, path: str = "descriptor") -> Any:
     """Return a detached JSON value from mutable or frozen containers."""
-    if value is None or isinstance(value, (str, bool, int, float)):
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise RTUPPORngIsolationError(
+                f"{path} contains a non-finite JSON number"
+            )
+        return value
+    if value is None or isinstance(value, (str, bool, int)):
         return value
     if isinstance(value, Mapping):
         result: dict[str, Any] = {}
