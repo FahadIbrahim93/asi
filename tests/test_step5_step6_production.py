@@ -580,19 +580,15 @@ def test_step6_fields_enforce_exact_scientific_domains(
         ("epsilon_end", (2**200 + 1, 2**200)),
     ],
 )
-def test_step6_fields_reject_hostile_exact_ratio_domains(
+def test_step6_fields_reject_exact_fraction_domains(
     field: str,
     ratio: tuple[int, int],
 ) -> None:
-    class HostileRatioFloat(float):
-        def as_integer_ratio(self) -> tuple[int, int]:
-            return ratio
-
     with pytest.raises(ValueError, match=field):
-        Step6DifferentialSARSAConfig(**{field: HostileRatioFloat(0.5)})
+        Step6DifferentialSARSAConfig(**{field: Fraction(*ratio)})
 
 
-def test_step6_exact_ratio_is_read_once() -> None:
+def test_step6_rejects_float_subclass_before_ratio_hook() -> None:
     class StatefulRatioFloat(float):
         calls = 0
 
@@ -602,10 +598,9 @@ def test_step6_exact_ratio_is_read_once() -> None:
                 return (1, 2)
             return (-1, 1)
 
-    config = Step6DifferentialSARSAConfig(q_step_size=StatefulRatioFloat(0.5))
-
-    assert StatefulRatioFloat.calls == 1
-    assert config.q_step_size == 0.5
+    with pytest.raises(ValueError, match="q_step_size must be finite"):
+        Step6DifferentialSARSAConfig(q_step_size=StatefulRatioFloat(0.5))
+    assert StatefulRatioFloat.calls == 0
 
 
 def test_step6_class_spoof_cannot_bypass_exact_ratio_dispatch() -> None:
@@ -622,7 +617,7 @@ def test_step6_class_spoof_cannot_bypass_exact_ratio_dispatch() -> None:
 
     with pytest.raises(ValueError, match="q_step_size"):
         Step6DifferentialSARSAConfig(q_step_size=IntegralSpoofFloat(0.5))
-    assert IntegralSpoofFloat.calls == 1
+    assert IntegralSpoofFloat.calls == 0
 
 
 @pytest.mark.parametrize("field", ["n_actions", "epsilon_decay_steps"])
@@ -667,7 +662,7 @@ def test_nested_step6_payload_refuses_integral_class_spoof(
 
     with pytest.raises(ValueError, match="q_step_size"):
         config_type.from_dict(payload)
-    assert IntegralSpoofFloat.calls == 1
+    assert IntegralSpoofFloat.calls == 0
 
 
 def test_step6_builtin_float_serialization_and_signed_zero_are_preserved() -> None:
@@ -700,13 +695,9 @@ def test_step6_builtin_float_serialization_and_signed_zero_are_preserved() -> No
         pytest.param(lambda control: Step9DreamingConfig(control=control), id="step9"),
     ],
 )
-def test_nested_step7_and_step9_refuse_hostile_step6_ratio(wrap: Any) -> None:
-    class HiddenNegativeFloat(float):
-        def as_integer_ratio(self) -> tuple[int, int]:
-            return (-1, 2**200)
-
+def test_nested_step7_and_step9_refuse_exact_negative_step6_fraction(wrap: Any) -> None:
     with pytest.raises(ValueError, match="q_step_size"):
-        wrap(Step6DifferentialSARSAConfig(q_step_size=HiddenNegativeFloat(0.5)))
+        wrap(Step6DifferentialSARSAConfig(q_step_size=Fraction(-1, 2**200)))
 
 
 def test_step6_float32_narrowing_avoids_longdouble_double_rounding() -> None:

@@ -453,15 +453,11 @@ def test_step1_smoke_accepts_full_uint32_seed_domain(seed: int) -> None:
         pytest.param((2**200 + 1, 2**200), id="above-one-rounds-to-one"),
     ],
 )
-def test_step1_unit_interval_rejects_adversarial_ratio_floats(
+def test_step1_unit_interval_rejects_exact_fraction_boundaries(
     field: str, ratio: tuple[int, int]
 ) -> None:
-    class HiddenBoundaryFloat(float):
-        def as_integer_ratio(self) -> tuple[int, int]:
-            return ratio
-
     with pytest.raises(ValueError, match=rf"{field} must be in \[0, 1\]"):
-        Step1KernelConfig(**{field: HiddenBoundaryFloat(0.5)})
+        Step1KernelConfig(**{field: Fraction(*ratio)})
 
 
 @pytest.mark.parametrize(
@@ -474,13 +470,9 @@ def test_step1_unit_interval_rejects_adversarial_ratio_floats(
         "noise_std",
     ],
 )
-def test_step1_nonnegative_rejects_adversarial_negative_ratio(field: str) -> None:
-    class HiddenNegativeFloat(float):
-        def as_integer_ratio(self) -> tuple[int, int]:
-            return (-1, 1)
-
+def test_step1_nonnegative_rejects_exact_negative_fraction(field: str) -> None:
     with pytest.raises(ValueError, match=rf"{field} must be non-negative"):
-        Step1KernelConfig(**{field: HiddenNegativeFloat(0.5)})
+        Step1KernelConfig(**{field: Fraction(-1, 1)})
 
 
 def test_step1_rejects_class_property_spoofing_float() -> None:
@@ -499,15 +491,22 @@ def test_step1_rejects_class_property_spoofing_float() -> None:
 
 def test_step1_rejects_spoofed_int_class_with_negative_ratio() -> None:
     class SpoofedIntFloat(float):
+        class_calls = 0
+        ratio_calls = 0
+
         @property
         def __class__(self) -> type[int]:
+            type(self).class_calls += 1
             return int
 
         def as_integer_ratio(self) -> tuple[int, int]:
+            type(self).ratio_calls += 1
             return (-1, 2**200)
 
-    with pytest.raises(ValueError, match="step_size must be non-negative"):
+    with pytest.raises(ValueError, match="step_size must narrow to a finite float32"):
         Step1KernelConfig(step_size=SpoofedIntFloat(0.5))
+    assert SpoofedIntFloat.class_calls == 0
+    assert SpoofedIntFloat.ratio_calls == 0
 
 
 def test_step1_rejects_spoofed_ratio_components() -> None:
@@ -520,11 +519,15 @@ def test_step1_rejects_spoofed_ratio_components() -> None:
             return 1
 
     class BadRatioFloat(float):
+        calls = 0
+
         def as_integer_ratio(self) -> tuple[Any, Any]:
+            type(self).calls += 1
             return (SpoofedComponent(), 2)
 
     with pytest.raises(ValueError, match="must narrow to a finite float32"):
         Step1KernelConfig(step_size=BadRatioFloat(0.5))
+    assert BadRatioFloat.calls == 0
 
 
 
@@ -785,15 +788,22 @@ def test_step2_configs_enforce_exact_scientific_domains(
 
 def test_step2_rejects_spoofed_int_class_with_negative_ratio() -> None:
     class SpoofedIntFloat(float):
+        class_calls = 0
+        ratio_calls = 0
+
         @property
         def __class__(self) -> type[int]:
+            type(self).class_calls += 1
             return int
 
         def as_integer_ratio(self) -> tuple[int, int]:
+            type(self).ratio_calls += 1
             return (-1, 2**200)
 
-    with pytest.raises(ValueError, match="step_size must be non-negative"):
+    with pytest.raises(ValueError, match="step_size must narrow to a finite float32"):
         Step2KernelConfig(step_size=SpoofedIntFloat(0.5))
+    assert SpoofedIntFloat.class_calls == 0
+    assert SpoofedIntFloat.ratio_calls == 0
 
 
 def test_step2_rejects_spoofed_ratio_components() -> None:
@@ -806,11 +816,15 @@ def test_step2_rejects_spoofed_ratio_components() -> None:
             return 1
 
     class BadRatioFloat(float):
+        calls = 0
+
         def as_integer_ratio(self) -> tuple[Any, Any]:
+            type(self).calls += 1
             return (SpoofedComponent(), 2)
 
     with pytest.raises(ValueError, match="must narrow to a finite float32"):
         Step2KernelConfig(step_size=BadRatioFloat(0.5))
+    assert BadRatioFloat.calls == 0
 
 
 
@@ -1271,15 +1285,11 @@ def test_step2_associative_smoke_rejects_invalid_inputs(
         pytest.param((2**200 + 1, 2**200), id="above-one-rounds-to-one"),
     ],
 )
-def test_step2_unit_interval_rejects_adversarial_ratio_floats(
+def test_step2_unit_interval_rejects_exact_fraction_boundaries(
     ratio: tuple[int, int]
 ) -> None:
-    class HiddenBoundaryFloat(float):
-        def as_integer_ratio(self) -> tuple[int, int]:
-            return ratio
-
     with pytest.raises(ValueError, match=r"update_rate must be in \(0, 1\]"):
-        Step2MemoryConfig(update_rate=HiddenBoundaryFloat(0.5))
+        Step2MemoryConfig(update_rate=Fraction(*ratio))
 
 
 @pytest.mark.parametrize(
@@ -1291,15 +1301,11 @@ def test_step2_unit_interval_rejects_adversarial_ratio_floats(
         (Step2MemoryConfig, "novelty_threshold"),
     ],
 )
-def test_step2_nonnegative_rejects_adversarial_negative_ratio(
+def test_step2_nonnegative_rejects_exact_negative_fraction(
     config_type: type[Any], field: str
 ) -> None:
-    class HiddenNegativeFloat(float):
-        def as_integer_ratio(self) -> tuple[int, int]:
-            return (-1, 1)
-
     with pytest.raises(ValueError, match=rf"{field} must be non-negative"):
-        config_type(**{field: HiddenNegativeFloat(0.5)})
+        config_type(**{field: Fraction(-1, 1)})
 
 
 def test_step2_rejects_class_property_spoofing_float() -> None:
