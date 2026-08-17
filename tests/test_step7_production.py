@@ -760,3 +760,57 @@ def test_step7_dyna_json_roundtrip() -> None:
     )
     assert restored.planning_priority_propagation == config.planning_priority_propagation
     assert restored.planning_utility_step_size == config.planning_utility_step_size
+
+
+def _legal_step7_smoke_result(**overrides: object) -> Step7SmokeResult:
+    payload: dict[str, object] = {
+        "config": Step7DynaConfig(),
+        "steps": 8,
+        "seed": 0,
+        "real_td_errors_shape": (8,),
+        "planning_td_errors_shape": (8, 1),
+        "planning_priorities_shape": (8, 1),
+        "planning_anchor_indices_shape": (8, 1),
+        "planning_importance_ratios_shape": (8, 1),
+        "actions_shape": (8,),
+        "finite": True,
+        "planning_acceptance_count": 0,
+        "control_config": {"ok": True},
+        "world_model_config": {"ok": True},
+    }
+    payload.update(overrides)
+    return Step7SmokeResult(**payload)  # type: ignore[arg-type]
+
+
+def test_step7_smoke_result_rejects_leftover_identities() -> None:
+    """Public Step 7 smoke records must not keep leftover bool/int identities."""
+
+    with pytest.raises(ValueError, match="steps"):
+        _legal_step7_smoke_result(steps=True)
+    with pytest.raises(ValueError, match="steps"):
+        _legal_step7_smoke_result(steps=float("nan"))
+    with pytest.raises(ValueError, match="seed"):
+        _legal_step7_smoke_result(seed=True)
+    with pytest.raises(ValueError, match="finite"):
+        _legal_step7_smoke_result(finite=1)
+    with pytest.raises(ValueError, match="planning_acceptance_count"):
+        _legal_step7_smoke_result(planning_acceptance_count=True)
+
+    legal = _legal_step7_smoke_result()
+    dumped = json.dumps(
+        {
+            "steps": legal.steps,
+            "seed": legal.seed,
+            "finite": legal.finite,
+            "planning_acceptance_count": legal.planning_acceptance_count,
+        },
+        allow_nan=False,
+    )
+    assert '"steps": 8' in dumped
+    assert '"seed": 0' in dumped
+    assert '"finite": true' in dumped
+    assert '"planning_acceptance_count": 0' in dumped
+    assert '"steps": true' not in dumped
+    assert '"seed": true' not in dumped
+    assert '"finite": 1' not in dumped
+    assert '"planning_acceptance_count": true' not in dumped
