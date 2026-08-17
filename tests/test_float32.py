@@ -32,6 +32,10 @@ def test_rounds_fraction_midpoint_exactly(offset: Fraction, expected: np.float32
     )
 
 
+def test_rounds_fraction_zero_without_numpy_conversion() -> None:
+    assert _raw_float32(round_real_to_float32(Fraction(0))) == 0
+
+
 def test_rounds_overflow_midpoint_outward() -> None:
     float32_max = (2**24 - 1) * 2**104
     midpoint = Fraction(float32_max + 2**103)

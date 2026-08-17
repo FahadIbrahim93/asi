@@ -142,8 +142,11 @@ def _real_ratio(value: object) -> tuple[int, int, bool]:
         denominator = -denominator
     if denominator == 0:
         raise ValueError("ratio denominator must be nonzero")
-    negative_zero = numerator == 0 and actual_type in _ACTUAL_FLOAT_TYPES and bool(
-        np.signbit(cast(Any, value))
+    negative_zero = (
+        numerator == 0
+        and actual_type in _ACTUAL_FLOAT_TYPES
+        and actual_type is not Fraction
+        and bool(np.signbit(cast(Any, value)))
     )
     return numerator, denominator, negative_zero
 
