@@ -58,6 +58,12 @@ def _require_positive_int(name: str, value: object) -> int:
     return number
 
 
+def _require_exact_bool(name: str, value: object) -> bool:
+    if type(value) is not bool:
+        raise ValueError(f"{name} must be an exact bool")
+    return value
+
+
 def _require_float32_resource(
     name: str,
     *,
@@ -975,6 +981,7 @@ def make_scale_range(
     """
     feature_dim = _require_positive_int("feature_dim", feature_dim)
     _require_float32_resource("scale range", vector_scalars=feature_dim)
+    log_spaced = _require_exact_bool("log_spaced", log_spaced)
     if log_spaced:
         min_bound = _require_normal_float32_scale("min_scale", min_scale)
         max_bound = _require_normal_float32_scale("max_scale", max_scale)
