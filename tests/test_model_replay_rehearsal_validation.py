@@ -13,7 +13,7 @@ from alberta_framework.core.learning_signals import LearningSignalEstimatorConfi
 from alberta_framework.core.model_replay_rehearsal import (
     ModelReplayRehearsal,
     ModelReplayRehearsalConfig,
-    _require_float32_resource,
+    _preflight_model_replay_state_resources,
 )
 from alberta_framework.core.world_model import ActionConditionedWorldModelConfig
 from alberta_framework.core.world_model_ensemble import WorldModelEnsembleConfig
@@ -274,29 +274,19 @@ def test_float_hostile_ratio_is_suppressed() -> None:
     assert _HostileFloat.calls == 0
 
 
-def test_require_float32_resource_boundaries_without_allocation() -> None:
-    legal = _INT32_MAX // 4
-    _require_float32_resource("test", vector_scalars=legal)
-    with pytest.raises(ValueError, match="byte count must fit signed int32"):
-        _require_float32_resource("test", vector_scalars=legal + 1)
-    with pytest.raises(ValueError, match="scalar count must fit signed int32"):
-        _require_float32_resource("test", vector_scalars=_INT32_MAX + 1)
-    with pytest.raises(ValueError, match="scalar count must fit signed int32"):
-        _require_float32_resource("test", vector_scalars=_INT32_MAX, fixed_scalars=1)
-
-
 def test_composer_persistent_bytes_preflight_without_allocation() -> None:
-    # Small composer is well within limits
     comp = _composer()
+    _preflight_model_replay_state_resources(comp)
     rehearsal = ModelReplayRehearsal(comp)
     budget = rehearsal.resource_budget()
     assert budget.persistent_state_bytes <= _INT32_MAX
     assert budget.persistent_state_bytes <= _UINT32_MAX
-    # Helper reflects the same bound used in __init__/resource_budget
-    _require_float32_resource(
-        "ModelReplayRehearsal state",
-        vector_scalars=budget.persistent_state_scalars,
+
+    oversized = _composer(
+        replay=_replay(total_capacity=24_000_000, short_term_capacity=1)
     )
+    with pytest.raises(ValueError, match="state byte count must fit signed int32"):
+        _preflight_model_replay_state_resources(oversized)
 
 
 def test_from_config_requires_exact_schema() -> None:

@@ -34,16 +34,14 @@ import dataclasses
 import functools
 import hashlib
 import json
-import operator
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Literal, SupportsIndex, cast
+from typing import Any, Literal, cast
 
 import chex
 import jax
 import jax.numpy as jnp
 import jax.random as jr
-import numpy as np
 from jax import Array
 
 from alberta_framework.core.checkpoints import (
@@ -58,6 +56,7 @@ from alberta_framework.core.dual_replay import (
     ReplayEntries,
     ReplayOutcome,
     ReplayPrediction,
+    _allocation_sizes,
 )
 from alberta_framework.core.learning_signals import (
     LearningSignalAvailability,
@@ -69,6 +68,7 @@ from alberta_framework.core.world_model_ensemble import (
     WorldModelEnsembleDiagnostics,
     WorldModelEnsemblePrediction,
     WorldModelEnsembleState,
+    _ensemble_state_resource_counts,
 )
 
 MODEL_REPLAY_REHEARSAL_SCHEMA = "alberta.model_replay_rehearsal.v1"
@@ -76,49 +76,28 @@ MECHANISM_STATUS = "model-only-replay-mechanism-no-scientific-claim"
 _INT32_MAX = 2_147_483_647
 _UINT32_MAX = 4_294_967_295
 _MAX_EXACT_FLOAT32_INTEGER = 16_777_216
-_ACTUAL_INT_TYPES: tuple[type, ...] = (
-    int,
-    np.int8,
-    np.int16,
-    np.int32,
-    np.int64,
-    np.uint8,
-    np.uint16,
-    np.uint32,
-    np.uint64,
-    np.longlong,
-    np.ulonglong,
-)
-
-
-def _require_float32_resource(
-    name: str, *, vector_scalars: int, fixed_scalars: int = 0
-) -> None:
-    total_scalars = vector_scalars + fixed_scalars
-    if total_scalars > _INT32_MAX:
-        raise ValueError(f"{name} scalar count must fit signed int32")
-    if 4 * total_scalars > _INT32_MAX:
-        raise ValueError(f"{name} byte count must fit signed int32")
-
-
-def _require_int(name: str, value: object, *, minimum: int, maximum: int = _INT32_MAX) -> int:
-    if type(value) not in _ACTUAL_INT_TYPES:
-        raise ValueError(f"{name} must be an integer")
-    number = operator.index(cast(SupportsIndex, value))
-    if number < minimum:
-        raise ValueError(f"{name} must be >= {minimum}")
-    if number > maximum:
-        raise ValueError(f"{name} must be <= {maximum}")
-    return number
-
-
 def _copy_mapping(payload: object, *, name: str) -> dict[str, Any]:
     if not issubclass(type(payload), Mapping):
         raise ValueError(f"{name} must be a mapping")
     try:
-        return dict(cast(Mapping[str, Any], payload))
+        values = dict(cast(Mapping[str, Any], payload))
     except Exception as error:
         raise ValueError(f"{name} must be a readable mapping") from error
+    if any(type(key) is not str for key in values):
+        raise ValueError(f"{name} keys must be exact strings")
+    return values
+
+
+def _preflight_model_replay_state_resources(config: ModelReplayRehearsalConfig) -> None:
+    """Reject an oversized combined state before either child allocates arrays."""
+    _, ensemble_bytes = _ensemble_state_resource_counts(
+        model=config.ensemble.model,
+        ensemble_size=config.ensemble.ensemble_size,
+    )
+    _, replay_bytes = _allocation_sizes(config.replay)
+    persistent_bytes = ensemble_bytes + replay_bytes + 7 * 4
+    if persistent_bytes > _INT32_MAX:
+        raise ValueError("model replay rehearsal state byte count must fit signed int32")
 
 
 ReplayActionEncoding = Literal["scalar_index", "one_hot"]
@@ -133,35 +112,16 @@ class ModelReplayRehearsalConfig:
     action_encoding: ReplayActionEncoding = "one_hot"
 
     def __post_init__(self) -> None:
-        if not isinstance(self.ensemble, WorldModelEnsembleConfig):
-            raise TypeError("ensemble must be a WorldModelEnsembleConfig")
-        if not isinstance(self.replay, DualReplayConfig):
-            raise TypeError("replay must be a DualReplayConfig")
+        if type(self.ensemble) is not WorldModelEnsembleConfig:
+            raise TypeError("ensemble must be an exact WorldModelEnsembleConfig")
+        if type(self.replay) is not DualReplayConfig:
+            raise TypeError("replay must be an exact DualReplayConfig")
         if type(self.action_encoding) is not str:
             raise ValueError("action_encoding must be 'scalar_index' or 'one_hot'")
         if self.ensemble.model.observation_dim != self.replay.observation_dim:
             raise ValueError("ensemble and replay observation dimensions must match")
         if self.ensemble.model.n_actions > _MAX_EXACT_FLOAT32_INTEGER:
             raise ValueError("n_actions exceeds exact float32 action-index storage")
-        # Derived config dimensions must fit signed int32 without allocation
-        _require_int(
-            "ensemble.model.n_actions",
-            self.ensemble.model.n_actions,
-            minimum=1,
-            maximum=_INT32_MAX,
-        )
-        _require_int(
-            "replay.action_dim",
-            self.replay.action_dim,
-            minimum=1,
-            maximum=_INT32_MAX,
-        )
-        _require_int(
-            "replay.batch_size",
-            self.replay.batch_size,
-            minimum=1,
-            maximum=_INT32_MAX,
-        )
         if self.action_encoding == "scalar_index":
             if self.replay.action_dim != 1:
                 raise ValueError("scalar_index requires replay.action_dim == 1")
@@ -203,21 +163,27 @@ class ModelReplayRehearsalConfig:
         }
         if set(values) != expected:
             raise ValueError("model replay config fields do not match the v1 schema")
-        if values.get("schema") != MODEL_REPLAY_REHEARSAL_SCHEMA:
+        if (
+            type(values.get("schema")) is not str
+            or values["schema"] != MODEL_REPLAY_REHEARSAL_SCHEMA
+        ):
             raise ValueError("unexpected model replay rehearsal schema")
-        if values.get("type") != "ModelReplayRehearsalConfig":
+        if type(values.get("type")) is not str or values["type"] != "ModelReplayRehearsalConfig":
             raise ValueError("unexpected model replay rehearsal config type")
-        if values.get("mechanism_status") != MECHANISM_STATUS:
+        if (
+            type(values.get("mechanism_status")) is not str
+            or values["mechanism_status"] != MECHANISM_STATUS
+        ):
             raise ValueError("model replay rehearsal must remain mechanism-only")
         if values.get("accepted_scientific_evidence") is not False:
             raise ValueError("model replay rehearsal has no accepted scientific evidence")
         ensemble_payload = values.get("ensemble")
         replay_payload = values.get("replay")
-        if not isinstance(ensemble_payload, dict) or not isinstance(replay_payload, dict):
-            raise ValueError("ensemble and replay configs must be mappings")
+        ensemble_values = _copy_mapping(ensemble_payload, name="ensemble config")
+        replay_values = _copy_mapping(replay_payload, name="replay config")
         return cls(
-            ensemble=WorldModelEnsembleConfig.from_config(ensemble_payload),
-            replay=DualReplayConfig.from_config(replay_payload),
+            ensemble=WorldModelEnsembleConfig.from_config(ensemble_values),
+            replay=DualReplayConfig.from_config(replay_values),
             action_encoding=cast(ReplayActionEncoding, values.get("action_encoding")),
         )
 
@@ -458,15 +424,14 @@ class ModelReplayRehearsal:
     """Causal, atomic composition of real model learning and model-only replay."""
 
     def __init__(self, config: ModelReplayRehearsalConfig):
+        if type(config) is not ModelReplayRehearsalConfig:
+            raise ValueError("config must be an exact ModelReplayRehearsalConfig")
+        _preflight_model_replay_state_resources(config)
         self._config = config
         self._ensemble = WorldModelEnsemble(config.ensemble)
         self._replay = DualReplayMemory(config.replay)
         template = self._make_initial_state(jr.key(0), persistent_bytes=0)
         persistent_scalars, persistent_bytes = _logical_tree_size(template)
-        _require_float32_resource(
-            "ModelReplayRehearsal state",
-            vector_scalars=persistent_scalars,
-        )
         if persistent_bytes > _INT32_MAX:
             raise ValueError("ModelReplayRehearsal state byte count must fit signed int32")
         if persistent_bytes > _UINT32_MAX:
@@ -505,12 +470,11 @@ class ModelReplayRehearsal:
         values = _copy_mapping(payload, name="model replay rehearsal construction")
         if set(values) != {"type", "config"}:
             raise ValueError("model replay rehearsal construction fields are invalid")
-        if values.get("type") != "ModelReplayRehearsal":
+        if type(values.get("type")) is not str or values["type"] != "ModelReplayRehearsal":
             raise ValueError("unexpected model replay rehearsal construction type")
         config = values.get("config")
-        if not isinstance(config, dict):
-            raise ValueError("model replay rehearsal construction is missing config")
-        return cls(ModelReplayRehearsalConfig.from_config(config))
+        config_values = _copy_mapping(config, name="model replay rehearsal config")
+        return cls(ModelReplayRehearsalConfig.from_config(config_values))
 
     def _make_initial_state(
         self,
@@ -1055,10 +1019,6 @@ class ModelReplayRehearsal:
         composer_bytes = persistent_bytes - ensemble_bytes - replay_bytes
         if persistent_bytes != self._persistent_bytes or composer_bytes != 28:
             raise ValueError("model replay rehearsal resource allocation is invalid")
-        _require_float32_resource(
-            "ModelReplayRehearsal state",
-            vector_scalars=scalars,
-        )
         if persistent_bytes > _INT32_MAX:
             raise ValueError("ModelReplayRehearsal state byte count must fit signed int32")
         if persistent_bytes > _UINT32_MAX:

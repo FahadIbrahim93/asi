@@ -139,9 +139,9 @@ def _member_state_scalars(config: ActionConditionedWorldModelConfig) -> int:
     )
 
 
-def _preflight_ensemble_state_resources(
+def _ensemble_state_resource_counts(
     *, model: ActionConditionedWorldModelConfig, ensemble_size: int
-) -> None:
+) -> tuple[int, int]:
     target_dim = model.observation_dim + 2
     members = ensemble_size * _member_state_scalars(model)
     residuals = ensemble_size * target_dim
@@ -173,6 +173,7 @@ def _preflight_ensemble_state_resources(
     ):
         if not 1 <= value <= _INT32_MAX:
             raise ValueError(f"derived {name} must fit signed int32")
+    return logical_scalars, logical_bytes
 
 
 def _safe_mean(values: Array, *, axis: int | None = None) -> Array:
@@ -286,7 +287,7 @@ class WorldModelEnsembleConfig:
             self, "residual_variance_warmup_steps", residual_variance_warmup_steps
         )
         object.__setattr__(self, "residual_variance_floor", residual_variance_floor)
-        _preflight_ensemble_state_resources(model=self.model, ensemble_size=ensemble_size)
+        _ensemble_state_resource_counts(model=self.model, ensemble_size=ensemble_size)
 
     @property
     def target_dim(self) -> int:
