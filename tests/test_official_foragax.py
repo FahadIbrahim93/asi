@@ -375,6 +375,36 @@ def test_strict_json_and_archive_contracts_reject_lossy_inputs(
             label="test JSON",
         )
 
+    redacted = official_foragax_module._sanitize_package_freeze_line(
+        'pkg==1.0 ; direct_url={"url":"file:/tmp/local-wheel"}'
+    )
+    assert redacted == (
+        'pkg==1.0 ; direct_url={"url":"<LOCAL_PATH>"}'
+    )
+    malformed = official_foragax_module._sanitize_package_freeze_line(
+        "pkg==1.0 ; direct_url={not-json"
+    )
+    assert malformed.endswith(" ; direct_url=<REDACTED>")
+    with pytest.raises(
+        OfficialForagaxValidationError,
+        match="package freeze direct_url is not finite JSON",
+    ):
+        official_foragax_module._sanitize_package_freeze_line(
+            'pkg==1.0 ; direct_url={"url":NaN}'
+        )
+    with pytest.raises(
+        OfficialForagaxValidationError,
+        match="package freeze direct_url is not finite JSON",
+    ):
+        official_foragax_module._sanitize_package_freeze_line(
+            'pkg==1.0 ; direct_url={"url":Infinity}'
+        )
+    freeze_source = official_foragax_module._package_freeze.__code__.co_consts
+    assert any(
+        isinstance(constant, str) and "allow_nan=False" in constant
+        for constant in freeze_source
+    )
+
     contracts = [
         {
             "name": "rewards",
