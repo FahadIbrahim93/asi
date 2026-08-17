@@ -884,8 +884,7 @@ def action_features(action: Array, n_actions: int | None = None) -> Array:
     """Return float action features for training-item conversion."""
     if n_actions is None:
         return jnp.ravel(jnp.asarray(action, dtype=jnp.float32))
-    if n_actions < 1:
-        raise ValueError("n_actions must be positive when provided")
+    n_actions = _require_exact_int(n_actions, "n_actions", minimum=1)
     action_index = jnp.squeeze(jnp.asarray(action, dtype=jnp.int32))
     return jax.nn.one_hot(action_index, n_actions, dtype=jnp.float32)
 
