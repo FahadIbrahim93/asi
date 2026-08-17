@@ -14,13 +14,15 @@ Research-scale evidence and open boundaries for Step 3 are tracked in
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
-from numbers import Integral
-from typing import Any, Literal, cast
+import operator
+from collections.abc import Sequence
+from dataclasses import asdict, dataclass, fields
+from typing import Any, Literal, SupportsIndex, cast
 
 import chex
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 from jax import Array
 
 from alberta_framework.core.horde import (
@@ -47,6 +49,22 @@ from alberta_framework.steps._float32_validation import (
 Step3NormalizerName = Literal["none", "ema"]
 Step3TraceModeName = Literal["accumulating", "replacing"]
 _INT32_MAX = 2**31 - 1
+_UINT32_MAX = 2**32 - 1
+_ACTUAL_INT_TYPES = frozenset(
+    {
+        int,
+        np.int8,
+        np.int16,
+        np.int32,
+        np.int64,
+        np.uint8,
+        np.uint16,
+        np.uint32,
+        np.uint64,
+        np.longlong,
+        np.ulonglong,
+    }
+)
 _FLOAT32_MIN_NORMAL = float.fromhex("0x1.0p-126")
 Step3RoutingName = Literal["shared", "independent", "mixed"]
 
@@ -93,6 +111,14 @@ class Step3HordeConfig:
     @classmethod
     def from_dict(cls, payload: dict[str, object]) -> Step3HordeConfig:
         """Reconstruct from :meth:`to_dict` output."""
+        if type(payload) is not dict:
+            raise ValueError("Step 3 config must be an actual dict")
+        expected = {field.name for field in fields(cls)}
+        if set(payload) != expected:
+            raise ValueError("Step 3 config fields do not match its schema")
+        for name in ("gammas", "lamdas", "hidden_sizes"):
+            if type(payload[name]) is not list:
+                raise ValueError(f"serialized {name} must be a JSON array")
         config = dict(payload)
         config["gammas"] = tuple(cast(list[float], config["gammas"]))
         config["lamdas"] = tuple(cast(list[float], config["lamdas"]))
@@ -185,7 +211,7 @@ def _require_unit_interval(name: str, value: object) -> float:
         or narrowed < 0.0
         or not narrowed <= 1.0
     ):
-        raise ValueError(f"{name} must be in [0, 1], got {value!r}")
+        raise ValueError(f"{name} must be in [0, 1]")
     return canonical_float32_storage(real, narrowed)
 
 
@@ -199,7 +225,7 @@ def _require_gvf_probability(name: str, value: object) -> float:
         or narrowed < 0.0
         or not narrowed <= 1.0
     ):
-        raise ValueError(f"{name} must be in [0, 1], got {value!r}")
+        raise ValueError(f"{name} must be in [0, 1]")
     if (
         (numerator != 0 and numerator << 126 < denominator)
         or (real != 0.0 and real < _FLOAT32_MIN_NORMAL)
@@ -212,36 +238,61 @@ def _require_gvf_probability(name: str, value: object) -> float:
 def _require_nonnegative_real(name: str, value: object) -> float:
     real, numerator, _, narrowed = finite_real_and_float32(name, value)
     if real < 0.0 or numerator < 0 or narrowed < 0.0:
-        raise ValueError(f"{name} must be non-negative, got {value!r}")
+        raise ValueError(f"{name} must be non-negative")
     return canonical_float32_storage(real, narrowed)
 
 
 def _require_positive_real(name: str, value: object) -> float:
     real, numerator, _, narrowed = finite_real_and_float32(name, value)
     if real <= 0.0 or numerator <= 0 or narrowed <= 0.0:
-        raise ValueError(f"{name} must be positive, got {value!r}")
+        raise ValueError(f"{name} must be positive")
     return canonical_float32_storage(real, narrowed)
+
+
+def _require_int(
+    name: str,
+    value: object,
+    *,
+    minimum: int,
+    maximum: int,
+) -> int:
+    actual_type = type(value)
+    if actual_type not in _ACTUAL_INT_TYPES:
+        raise ValueError(f"{name} must be an integer")
+    number = operator.index(cast(SupportsIndex, value))
+    if number < minimum or number > maximum:
+        raise ValueError(f"{name} must be in [{minimum}, {maximum}]")
+    return number
 
 
 def _require_positive_int(name: str, value: object) -> int:
     actual_type = type(value)
-    if issubclass(actual_type, bool) or not issubclass(actual_type, Integral):
-        raise ValueError(f"{name} must be a positive integer, got {value!r}")
-    number = int(cast(Integral, value))
+    if actual_type not in _ACTUAL_INT_TYPES:
+        raise ValueError(f"{name} must be a positive integer")
+    number = operator.index(cast(SupportsIndex, value))
     if number < 1:
-        raise ValueError(f"{name} must be positive, got {value!r}")
+        raise ValueError(f"{name} must be positive")
     if number > _INT32_MAX:
-        raise ValueError(f"{name} must be at most int32 max, got {value!r}")
+        raise ValueError(f"{name} must be at most int32 max")
     return number
 
 
 def _require_bool(name: str, value: object) -> bool:
     if type(value) is not bool:
-        raise ValueError(f"{name} must be a boolean, got {value!r}")
+        raise ValueError(f"{name} must be a boolean")
+    return value
+
+
+def _require_choice(name: str, value: object, choices: Sequence[str]) -> str:
+    if type(value) is not str or value not in choices:
+        raise ValueError(f"{name} must be one of {tuple(choices)}")
     return value
 
 
 def _validate_horde_config(config: Step3HordeConfig) -> None:
+    for name in ("gammas", "lamdas", "hidden_sizes"):
+        if type(getattr(config, name)) is not tuple:
+            raise ValueError(f"{name} must be an actual tuple")
     if len(config.gammas) == 0:
         raise ValueError("Step 3 Horde must have at least one demon")
     if len(config.gammas) != len(config.lamdas):
@@ -260,6 +311,13 @@ def _validate_horde_config(config: Step3HordeConfig) -> None:
     )
     use_obgd = _require_bool("use_obgd", config.use_obgd)
     use_layer_norm = _require_bool("use_layer_norm", config.use_layer_norm)
+    normalizer = _require_choice("normalizer", config.normalizer, ("none", "ema"))
+    trace_mode = _require_choice(
+        "trace_mode", config.trace_mode, ("accumulating", "replacing")
+    )
+    routing = _require_choice(
+        "routing", config.routing, ("shared", "independent", "mixed")
+    )
     object.__setattr__(config, "gammas", gammas)
     object.__setattr__(config, "lamdas", lamdas)
     object.__setattr__(config, "hidden_sizes", hidden_sizes)
@@ -268,6 +326,9 @@ def _validate_horde_config(config: Step3HordeConfig) -> None:
     object.__setattr__(config, "obgd_kappa", obgd_kappa)
     object.__setattr__(config, "use_obgd", use_obgd)
     object.__setattr__(config, "use_layer_norm", use_layer_norm)
+    object.__setattr__(config, "normalizer", normalizer)
+    object.__setattr__(config, "trace_mode", trace_mode)
+    object.__setattr__(config, "routing", routing)
 
 
 def make_step3_normalizer(
@@ -278,7 +339,7 @@ def make_step3_normalizer(
         return None
     if config.normalizer == "ema":
         return EMANormalizer()
-    msg = f"unknown Step 3 normalizer {config.normalizer!r}"
+    msg = "unknown Step 3 normalizer"
     raise ValueError(msg)
 
 
@@ -335,7 +396,7 @@ def make_step3_horde(
         return IndependentDemonHorde(**common_kwargs)
     if cfg.routing == "mixed":
         return MixedHorde(**common_kwargs)
-    msg = f"unknown Step 3 routing {cfg.routing!r}"
+    msg = "unknown Step 3 routing"
     raise ValueError(msg)
 
 
@@ -491,20 +552,22 @@ def run_step3_smoke(
     initialization, TD updates, finite diagnostics, and config serialization.
     It is not a feature-discovery or throughput claim.
     """
-    if steps < 1:
-        raise ValueError(f"steps must be positive, got {steps}")
-    if final_window < 1 or final_window > steps:
-        raise ValueError(
-            f"final_window must be in [1, steps], got {final_window}"
-        )
-    if raw_feature_dim < 1:
-        raise ValueError(f"raw_feature_dim must be positive, got {raw_feature_dim}")
-    if constructed_feature_dim < 0:
-        msg = (
-            "constructed_feature_dim must be non-negative, "
-            f"got {constructed_feature_dim}"
-        )
-        raise ValueError(msg)
+    steps = _require_int("steps", steps, minimum=1, maximum=_INT32_MAX)
+    seed = _require_int("seed", seed, minimum=0, maximum=_UINT32_MAX)
+    final_window = _require_int(
+        "final_window", final_window, minimum=1, maximum=_INT32_MAX
+    )
+    raw_feature_dim = _require_int(
+        "raw_feature_dim", raw_feature_dim, minimum=1, maximum=_INT32_MAX
+    )
+    constructed_feature_dim = _require_int(
+        "constructed_feature_dim",
+        constructed_feature_dim,
+        minimum=0,
+        maximum=_INT32_MAX,
+    )
+    if final_window > steps:
+        raise ValueError("final_window must be at most steps")
 
     cfg = config or Step3HordeConfig()
     _validate_horde_config(cfg)
