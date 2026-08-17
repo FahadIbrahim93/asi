@@ -21,21 +21,135 @@ from __future__ import annotations
 import dataclasses
 import functools
 import math
-from numbers import Real
-from typing import Any
+import operator
+from collections.abc import Mapping
+from fractions import Fraction
+from typing import Any, SupportsIndex, cast
 
 import chex
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 from jax import Array
 from jaxtyping import Bool, Float, Int
 
 from alberta_framework._float32 import round_real_to_float32
+from alberta_framework.core._float32_scalars import validated_float32_scalar_with_ratio
 from alberta_framework.core.optimizers import Bounder, bounder_from_config
 from alberta_framework.core.update_safety import (
     floating_tree_is_finite as _floating_tree_is_finite,
 )
+
+_INT32_MAX = 2**31 - 1
+_ACTUAL_INT_TYPES = frozenset(
+    {int, *(np.dtype(code).type for code in "bBhHiIlLqQpP")}
+)
+_ACTUAL_REAL_TYPES = _ACTUAL_INT_TYPES | frozenset(
+    {float, *(np.dtype(code).type for code in "efdg")}
+)
+
+
+def _require_int32(name: str, value: object, *, minimum: int, maximum: int = _INT32_MAX) -> int:
+    if type(value) not in _ACTUAL_INT_TYPES:
+        raise ValueError(f"{name} must be an integer in [{minimum}, {maximum}]")
+    canonical = operator.index(cast(SupportsIndex, value))
+    if not minimum <= canonical <= maximum:
+        raise ValueError(f"{name} must be an integer in [{minimum}, {maximum}]")
+    return canonical
+
+
+def _require_float32(
+    name: str,
+    value: object,
+    *,
+    positive: bool = False,
+    lower: float | None = None,
+    upper: float | None = None,
+    preserve_nonzero: bool = False,
+) -> float:
+    if type(value) not in _ACTUAL_REAL_TYPES:
+        raise ValueError(f"{name} must be a finite real number")
+    stored, numerator, denominator = validated_float32_scalar_with_ratio(
+        name, value, positive=positive, lower=lower, upper=upper
+    )
+    if preserve_nonzero and numerator != 0 and np.float32(numerator / denominator) == 0.0:
+        raise ValueError(f"{name} must remain nonzero once narrowed to float32")
+    return stored
+
+
+def _read_mapping(name: str, value: object) -> dict[str, Any]:
+    if not issubclass(type(value), Mapping):
+        raise ValueError(f"{name} must be a mapping")
+    try:
+        return dict(cast(Mapping[str, Any], value))
+    except Exception as error:
+        raise ValueError(f"{name} must be a readable mapping") from error
+
+
+def _serialized_mapping(
+    name: str, value: object, *, fields: frozenset[str]
+) -> dict[str, Any]:
+    payload = _read_mapping(name, value)
+    if any(type(key) is not str for key in payload) or set(payload) != fields:
+        raise ValueError(f"{name} fields do not match the serialized schema")
+    return payload
+
+
+def _require_discrete_state_resources(n_actions: int, feature_dim: int) -> None:
+    state_scalars = 2 * n_actions * feature_dim + 3 * feature_dim + 2 * n_actions + 5
+    state_bytes = 8 * n_actions * feature_dim + 12 * feature_dim + 8 * n_actions + 24
+    if state_scalars > _INT32_MAX or state_bytes > _INT32_MAX:
+        raise ValueError("derived actor-critic state exceeds the signed-int32 budget")
+
+
+def _require_continuous_state_resources(action_dim: int, feature_dim: int) -> None:
+    state_scalars = 2 * action_dim * feature_dim + 5 * action_dim + 3 * feature_dim + 4
+    state_bytes = 8 * action_dim * feature_dim + 20 * action_dim + 12 * feature_dim + 20
+    if state_scalars > _INT32_MAX or state_bytes > _INT32_MAX:
+        raise ValueError("derived continuous actor-critic state exceeds the signed-int32 budget")
+
+
+def _array(name: str, value: object, shape: tuple[int, ...], dtype: Any) -> Array:
+    if shape == () and dtype == jnp.bool_ and type(value) is bool:
+        return jnp.asarray(value, dtype=dtype)
+    if shape == () and dtype == jnp.float32 and type(value) in _ACTUAL_REAL_TYPES:
+        return jnp.asarray(_require_float32(name, value), dtype=dtype)
+    if not (type(value) is np.ndarray or isinstance(value, jax.Array)):
+        raise ValueError(f"{name} must expose trusted array metadata")
+    array = jnp.asarray(value)
+    if array.shape != shape:
+        raise ValueError(f"{name} must have shape {shape}")
+    if array.dtype != jnp.dtype(dtype):
+        raise ValueError(f"{name} must have dtype {jnp.dtype(dtype)}")
+    return array
+
+
+def _require_key(key: object) -> Array:
+    if not isinstance(key, jax.Array):
+        raise ValueError("key must be a Threefry JAX key")
+    try:
+        data = jr.key_data(cast(Any, key))
+    except Exception as error:
+        raise ValueError("key must be a Threefry JAX key") from error
+    if data.shape != (2,) or data.dtype != jnp.uint32:
+        raise ValueError("key must be a Threefry JAX key")
+    return key
+
+
+def _require_action_bound(name: str, value: object) -> float:
+    if type(value) not in _ACTUAL_REAL_TYPES | {Fraction}:
+        raise ValueError(f"{name} must be a finite real number")
+    try:
+        host = float(cast(Any, value))
+        narrowed = round_real_to_float32(cast(Any, value))
+    except Exception as error:
+        raise ValueError(f"{name} must be finite when set") from error
+    if not math.isfinite(host):
+        raise ValueError(f"{name} must be finite when set")
+    if not math.isfinite(narrowed):
+        raise ValueError(f"{name} must remain finite once narrowed to float32")
+    return host if type(value) is float else narrowed
 
 
 @dataclasses.dataclass(frozen=True)
@@ -60,6 +174,53 @@ class ActorCriticConfig:
     critic_lamda: float = 0.9
     temperature: float = 1.0
 
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "n_actions",
+            _require_int32("n_actions", self.n_actions, minimum=1),
+        )
+        object.__setattr__(
+            self,
+            "gamma",
+            _require_float32(
+                "gamma", self.gamma, lower=0.0, upper=1.0, preserve_nonzero=True
+            ),
+        )
+        object.__setattr__(
+            self,
+            "actor_step_size",
+            _require_float32(
+                "actor_step_size", self.actor_step_size, lower=0.0, preserve_nonzero=True
+            ),
+        )
+        object.__setattr__(
+            self,
+            "critic_step_size",
+            _require_float32(
+                "critic_step_size", self.critic_step_size, lower=0.0, preserve_nonzero=True
+            ),
+        )
+        object.__setattr__(
+            self,
+            "actor_lamda",
+            _require_float32(
+                "actor_lamda", self.actor_lamda, lower=0.0, upper=1.0, preserve_nonzero=True
+            ),
+        )
+        object.__setattr__(
+            self,
+            "critic_lamda",
+            _require_float32(
+                "critic_lamda", self.critic_lamda, lower=0.0, upper=1.0, preserve_nonzero=True
+            ),
+        )
+        object.__setattr__(
+            self,
+            "temperature",
+            _require_float32("temperature", self.temperature, positive=True),
+        )
+
     def to_config(self) -> dict[str, Any]:
         """Serialize this configuration to a dictionary."""
         return {
@@ -73,9 +234,15 @@ class ActorCriticConfig:
         }
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> ActorCriticConfig:
+    def from_config(cls, config: Mapping[str, Any]) -> ActorCriticConfig:
         """Reconstruct an ``ActorCriticConfig`` from a dictionary."""
-        return cls(**config)
+        fields = frozenset(field.name for field in dataclasses.fields(cls))
+        payload = _serialized_mapping("config", config, fields=fields)
+        if type(payload["n_actions"]) is not int or any(
+            type(payload[name]) is not float for name in fields - {"n_actions"}
+        ):
+            raise ValueError("serialized config scalars must be exact JSON numbers")
+        return cls(**payload)
 
 
 @chex.dataclass(frozen=True)
@@ -192,10 +359,10 @@ class ActorCriticAgent:
                 ``Bounder`` ABC. When present, actor and critic proposed steps
                 are bounded independently using the TD error.
         """
-        if config.n_actions <= 0:
-            raise ValueError("n_actions must be positive")
-        if config.temperature <= 0:
-            raise ValueError("temperature must be positive")
+        if type(config) is not ActorCriticConfig:
+            raise ValueError("config must be an ActorCriticConfig")
+        if bounder is not None and not isinstance(bounder, Bounder):
+            raise ValueError("bounder must be a Bounder or None")
         self._config = config
         self._bounder = bounder
 
@@ -218,12 +385,17 @@ class ActorCriticAgent:
         }
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> ActorCriticAgent:
+    def from_config(cls, config: Mapping[str, Any]) -> ActorCriticAgent:
         """Reconstruct an ``ActorCriticAgent`` from a dictionary."""
-        config = dict(config)
-        config.pop("type", None)
-        ac_config = ActorCriticConfig.from_config(config.pop("config"))
-        bounder_config = config.pop("bounder", None)
+        payload = _serialized_mapping(
+            "config", config, fields=frozenset({"type", "config", "bounder"})
+        )
+        if type(payload["type"]) is not str or payload.pop("type") != cls.__name__:
+            raise ValueError("config type differs")
+        ac_config = ActorCriticConfig.from_config(payload.pop("config"))
+        bounder_config = payload.pop("bounder")
+        if bounder_config is not None and not issubclass(type(bounder_config), Mapping):
+            raise ValueError("serialized bounder must be a mapping or None")
         bounder = bounder_from_config(bounder_config) if bounder_config else None
         return cls(config=ac_config, bounder=bounder)
 
@@ -237,6 +409,9 @@ class ActorCriticAgent:
         Returns:
             Initial immutable actor-critic state.
         """
+        feature_dim = _require_int32("feature_dim", feature_dim, minimum=1)
+        _require_discrete_state_resources(self._config.n_actions, feature_dim)
+        key = _require_key(key)
         zeros_actor = jnp.zeros((self._config.n_actions, feature_dim), dtype=jnp.float32)
         zeros_policy_bias = jnp.zeros((self._config.n_actions,), dtype=jnp.float32)
         zeros_critic = jnp.zeros((feature_dim,), dtype=jnp.float32)
@@ -255,6 +430,40 @@ class ActorCriticAgent:
             step_count=jnp.array(0, dtype=jnp.int32),
         )
 
+    def _feature_dim(self, state: ActorCriticState) -> int:
+        if type(state) is not ActorCriticState:
+            raise ValueError("state must be an ActorCriticState")
+        n_actions = self._config.n_actions
+        if state.actor_weights.ndim != 2 or state.actor_weights.shape[0] != n_actions:
+            raise ValueError("state.actor_weights must match n_actions and feature_dim")
+        feature_dim = state.actor_weights.shape[1]
+        matrix_shape = (n_actions, feature_dim)
+        for name in ("actor_weights", "actor_trace_weights"):
+            leaf = getattr(state, name)
+            if leaf.shape != matrix_shape or leaf.dtype != jnp.float32:
+                raise ValueError(f"state.{name} must have shape {matrix_shape} and dtype float32")
+        for name in ("actor_bias", "actor_trace_bias"):
+            leaf = getattr(state, name)
+            if leaf.shape != (n_actions,) or leaf.dtype != jnp.float32:
+                raise ValueError(f"state.{name} must have shape ({n_actions},) and dtype float32")
+        for name in ("critic_weights", "critic_trace_weights", "last_observation"):
+            leaf = getattr(state, name)
+            if leaf.shape != (feature_dim,) or leaf.dtype != jnp.float32:
+                raise ValueError(f"state.{name} must have shape ({feature_dim},) and dtype float32")
+        for name in ("critic_bias", "critic_trace_bias"):
+            leaf = getattr(state, name)
+            if leaf.shape != () or leaf.dtype != jnp.float32:
+                raise ValueError(f"state.{name} must be a scalar float32")
+        if state.last_action.shape != () or state.last_action.dtype != jnp.int32:
+            raise ValueError("state.last_action must be a scalar int32")
+        if state.step_count.shape != () or state.step_count.dtype != jnp.int32:
+            raise ValueError("state.step_count must be a scalar int32")
+        _require_key(state.rng_key)
+        return feature_dim
+
+    def _observation(self, state: ActorCriticState, value: object) -> Array:
+        return _array("observation", value, (self._feature_dim(state),), jnp.float32)
+
     @functools.partial(jax.jit, static_argnums=(0,))
     def policy(
         self,
@@ -262,12 +471,14 @@ class ActorCriticAgent:
         observation: Array,
     ) -> Float[Array, " n_actions"]:
         """Compute softmax action probabilities for one observation."""
+        observation = self._observation(state, observation)
         logits = state.actor_weights @ observation + state.actor_bias
         return jax.nn.softmax(logits / self._config.temperature)
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def value(self, state: ActorCriticState, observation: Array) -> Float[Array, ""]:
         """Compute the critic value estimate for one observation."""
+        observation = self._observation(state, observation)
         return jnp.dot(state.critic_weights, observation) + state.critic_bias
 
     @functools.partial(jax.jit, static_argnums=(0,))
@@ -285,11 +496,10 @@ class ActorCriticAgent:
         Returns:
             Tuple ``(action, new_rng_key, probabilities)``.
         """
+        observation = self._observation(state, observation)
         key, sample_key = jr.split(state.rng_key)
         probs = self.policy(state, observation)
-        action = jr.categorical(sample_key, jnp.log(jnp.maximum(probs, 1e-8))).astype(
-            jnp.int32
-        )
+        action = jr.categorical(sample_key, jnp.log(jnp.maximum(probs, 1e-8))).astype(jnp.int32)
         return action, key, probs
 
     @functools.partial(jax.jit, static_argnums=(0,))
@@ -299,6 +509,7 @@ class ActorCriticAgent:
         observation: Array,
     ) -> tuple[ActorCriticState, Int[Array, ""], Float[Array, " n_actions"]]:
         """Select and store the first action for a new stream or episode."""
+        observation = self._observation(state, observation)
         action, key, probs = self.select_action(state, observation)
         new_state = state.replace(  # type: ignore[attr-defined]
             last_observation=observation,
@@ -337,6 +548,12 @@ class ActorCriticAgent:
         Returns:
             ``ActorCriticUpdateResult`` containing the updated state and metrics.
         """
+        observation = self._observation(state, observation)
+        reward = _array("reward", reward, (), jnp.float32)
+        if terminated is not None:
+            terminated = _array("terminated", terminated, (), jnp.bool_)
+        if discount is not None:
+            discount = _array("discount", discount, (), jnp.float32)
         cfg = self._config
         prev_obs = state.last_observation
         action = state.last_action
@@ -351,9 +568,7 @@ class ActorCriticAgent:
                 discount = jnp.where(terminated, 0.0, cfg.gamma)
         discount = jnp.asarray(discount, dtype=jnp.float32)
         # Terminal 0 * inf V(s') is NaN and would freeze the critic.
-        bootstrap = jnp.where(
-            discount == 0.0, jnp.zeros_like(next_value), discount * next_value
-        )
+        bootstrap = jnp.where(discount == 0.0, jnp.zeros_like(next_value), discount * next_value)
         td_error = reward + bootstrap - value
 
         one_hot = jax.nn.one_hot(action, cfg.n_actions, dtype=jnp.float32)
@@ -441,7 +656,7 @@ class ActorCriticAgent:
             actor_trace_bias=stored_actor_trace_bias,
             critic_trace_weights=stored_critic_trace_weights,
             critic_trace_bias=stored_critic_trace_bias,
-            step_count=state.step_count + 1,
+            step_count=jnp.minimum(state.step_count, _INT32_MAX - 1) + 1,
         )
         # Reject the complete transition if its inputs or proposed persistent
         # state are non-finite. The result carries the rejection explicitly.
@@ -459,11 +674,10 @@ class ActorCriticAgent:
             & ((discount == 0.0) | jnp.isfinite(next_value))
             & jnp.isfinite(actor_metric)
             & jnp.isfinite(critic_metric)
+            & (state.step_count >= 0)
         )
         candidate_ok = (
-            inputs_valid
-            & _floating_tree_is_finite(state)
-            & _floating_tree_is_finite(updated)
+            inputs_valid & _floating_tree_is_finite(state) & _floating_tree_is_finite(updated)
         )
         held = jax.lax.cond(
             candidate_ok,
@@ -500,13 +714,9 @@ class ActorCriticAgent:
             ),
             policy=jnp.where(params_ok, next_policy, jnp.zeros_like(next_policy)),
             value=jnp.where(params_ok, value, zero),
-            next_value=jnp.where(
-                params_ok & jnp.isfinite(next_value), next_value, zero
-            ),
+            next_value=jnp.where(params_ok & jnp.isfinite(next_value), next_value, zero),
             td_error=jnp.where(params_ok, td_error, zero),
-            bound_metric=jnp.where(
-                params_ok, (actor_metric + critic_metric) / 2.0, zero
-            ),
+            bound_metric=jnp.where(params_ok, (actor_metric + critic_metric) / 2.0, zero),
             update_applied=params_ok,
         )
 
@@ -547,8 +757,31 @@ def run_actor_critic_from_arrays(
     Returns:
         ``ActorCriticArrayResult`` with final state and per-step metrics.
     """
+    feature_dim = agent._feature_dim(state)
+    observations = jnp.asarray(observations, dtype=jnp.float32)
+    next_observations = jnp.asarray(next_observations, dtype=jnp.float32)
+    rewards = jnp.asarray(rewards, dtype=jnp.float32)
+    if observations.ndim != 2 or observations.shape[0] < 1:
+        raise ValueError("observations must have shape (num_steps, feature_dim)")
+    num_steps = observations.shape[0]
+    if observations.shape[1] != feature_dim or next_observations.shape != observations.shape:
+        raise ValueError("observations and next_observations must match state feature_dim")
+    if rewards.shape != (num_steps,):
+        raise ValueError("rewards must have shape (num_steps,)")
+    output_scalars = num_steps * (agent.config.n_actions + 4)
+    output_bytes = num_steps * (4 * agent.config.n_actions + 13)
+    if output_scalars > _INT32_MAX or output_bytes > _INT32_MAX:
+        raise ValueError("derived actor-critic scan outputs exceed the signed-int32 budget")
     if terminated is None and discounts is None:
         raise ValueError("terminated or discounts must be provided")
+    if terminated is not None:
+        terminated = jnp.asarray(terminated, dtype=jnp.bool_)
+        if terminated.shape != (num_steps,):
+            raise ValueError("terminated must have shape (num_steps,)")
+    if discounts is not None:
+        discounts = jnp.asarray(discounts, dtype=jnp.float32)
+        if discounts.shape != (num_steps,):
+            raise ValueError("discounts must have shape (num_steps,)")
     if terminated is None:
         terminated = jnp.zeros_like(rewards, dtype=jnp.bool_)
     if discounts is None:
@@ -557,6 +790,9 @@ def run_actor_critic_from_arrays(
         actions = jnp.full_like(rewards, -1, dtype=jnp.int32)
         use_fixed_actions = False
     else:
+        actions = jnp.asarray(actions, dtype=jnp.int32)
+        if actions.shape != (num_steps,):
+            raise ValueError("actions must have shape (num_steps,)")
         use_fixed_actions = True
 
     def _scan_fn(
@@ -654,6 +890,79 @@ class ContinuousActorCriticConfig:
     action_low: float | None = None
     action_high: float | None = None
 
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "action_dim",
+            _require_int32("action_dim", self.action_dim, minimum=1),
+        )
+        object.__setattr__(
+            self,
+            "gamma",
+            _require_float32(
+                "gamma", self.gamma, lower=0.0, upper=1.0, preserve_nonzero=True
+            ),
+        )
+        object.__setattr__(
+            self,
+            "actor_step_size",
+            _require_float32(
+                "actor_step_size", self.actor_step_size, lower=0.0, preserve_nonzero=True
+            ),
+        )
+        object.__setattr__(
+            self,
+            "critic_step_size",
+            _require_float32(
+                "critic_step_size", self.critic_step_size, lower=0.0, preserve_nonzero=True
+            ),
+        )
+        object.__setattr__(
+            self,
+            "actor_lamda",
+            _require_float32(
+                "actor_lamda", self.actor_lamda, lower=0.0, upper=1.0, preserve_nonzero=True
+            ),
+        )
+        object.__setattr__(
+            self,
+            "critic_lamda",
+            _require_float32(
+                "critic_lamda", self.critic_lamda, lower=0.0, upper=1.0, preserve_nonzero=True
+            ),
+        )
+        object.__setattr__(
+            self,
+            "log_sigma_init",
+            _require_float32("log_sigma_init", self.log_sigma_init),
+        )
+        object.__setattr__(
+            self,
+            "log_sigma_min",
+            _require_float32("log_sigma_min", self.log_sigma_min),
+        )
+        object.__setattr__(
+            self,
+            "log_sigma_max",
+            _require_float32("log_sigma_max", self.log_sigma_max),
+        )
+        if self.log_sigma_min > self.log_sigma_max:
+            raise ValueError("log_sigma_min must be <= log_sigma_max")
+        action_low = (
+            None
+            if self.action_low is None
+            else _require_action_bound("action_low", self.action_low)
+        )
+        action_high = (
+            None
+            if self.action_high is None
+            else _require_action_bound("action_high", self.action_high)
+        )
+        if action_low is not None and action_high is not None and action_low > action_high:
+            raise ValueError("action_low must be <= action_high")
+        object.__setattr__(self, "action_low", action_low)
+        object.__setattr__(self, "action_high", action_high)
+
     def to_config(self) -> dict[str, Any]:
         """Serialize this configuration to a dictionary."""
         return {
@@ -671,9 +980,16 @@ class ContinuousActorCriticConfig:
         }
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> ContinuousActorCriticConfig:
+    def from_config(cls, config: Mapping[str, Any]) -> ContinuousActorCriticConfig:
         """Reconstruct a ``ContinuousActorCriticConfig`` from a dictionary."""
-        return cls(**config)
+        fields = frozenset(field.name for field in dataclasses.fields(cls))
+        payload = _serialized_mapping("config", config, fields=fields)
+        if type(payload["action_dim"]) is not int or any(
+            payload[name] is not None and type(payload[name]) is not float
+            for name in fields - {"action_dim"}
+        ):
+            raise ValueError("serialized config scalars must be exact JSON numbers or None")
+        return cls(**payload)
 
 
 @chex.dataclass(frozen=True)
@@ -795,40 +1111,10 @@ class ContinuousActorCriticAgent:
                 ``Bounder`` ABC. When present, actor and critic proposed steps
                 are bounded independently using the TD error.
         """
-        if config.action_dim <= 0:
-            raise ValueError("action_dim must be positive")
-        if config.log_sigma_min > config.log_sigma_max:
-            raise ValueError("log_sigma_min must be <= log_sigma_max")
-        canonical_bounds: dict[str, float | None] = {}
-        for name in ("action_low", "action_high"):
-            bound = getattr(config, name)
-            if bound is None:
-                canonical_bounds[name] = None
-                continue
-            actual_type = type(bound)
-            if issubclass(actual_type, bool) or not issubclass(actual_type, Real):
-                raise ValueError(f"{name} must be a finite real number when set")
-            if not math.isfinite(bound):
-                raise ValueError(f"{name} must be finite when set")
-            try:
-                narrowed = round_real_to_float32(bound)
-            except Exception as exc:
-                raise ValueError(f"{name} must be finite when set") from exc
-            if not math.isfinite(narrowed):
-                raise ValueError(f"{name} must remain finite once narrowed to float32")
-            # Only an actual built-in float is already the binary64 payload JAX will
-            # narrow exactly; ints and other reals store the validated binary32 value.
-            canonical_bounds[name] = bound if type(bound) is float else narrowed
-        low = canonical_bounds["action_low"]
-        high = canonical_bounds["action_high"]
-        if low is not None and high is not None and low > high:
-            raise ValueError("action_low must be <= action_high")
-        if (low, high) != (config.action_low, config.action_high) or any(
-            type(value) is not float
-            for value in (config.action_low, config.action_high)
-            if value is not None
-        ):
-            config = dataclasses.replace(config, action_low=low, action_high=high)
+        if type(config) is not ContinuousActorCriticConfig:
+            raise ValueError("config must be a ContinuousActorCriticConfig")
+        if bounder is not None and not isinstance(bounder, Bounder):
+            raise ValueError("bounder must be a Bounder or None")
         self._config = config
         self._bounder = bounder
 
@@ -851,12 +1137,17 @@ class ContinuousActorCriticAgent:
         }
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> ContinuousActorCriticAgent:
+    def from_config(cls, config: Mapping[str, Any]) -> ContinuousActorCriticAgent:
         """Reconstruct a ``ContinuousActorCriticAgent`` from a dictionary."""
-        config = dict(config)
-        config.pop("type", None)
-        ac_config = ContinuousActorCriticConfig.from_config(config.pop("config"))
-        bounder_config = config.pop("bounder", None)
+        payload = _serialized_mapping(
+            "config", config, fields=frozenset({"type", "config", "bounder"})
+        )
+        if type(payload["type"]) is not str or payload.pop("type") != cls.__name__:
+            raise ValueError("config type differs")
+        ac_config = ContinuousActorCriticConfig.from_config(payload.pop("config"))
+        bounder_config = payload.pop("bounder")
+        if bounder_config is not None and not issubclass(type(bounder_config), Mapping):
+            raise ValueError("serialized bounder must be a mapping or None")
         bounder = bounder_from_config(bounder_config) if bounder_config else None
         return cls(config=ac_config, bounder=bounder)
 
@@ -870,7 +1161,10 @@ class ContinuousActorCriticAgent:
         Returns:
             Initial immutable continuous actor-critic state.
         """
+        feature_dim = _require_int32("feature_dim", feature_dim, minimum=1)
         cfg = self._config
+        _require_continuous_state_resources(cfg.action_dim, feature_dim)
+        key = _require_key(key)
         zeros_mean = jnp.zeros((cfg.action_dim, feature_dim), dtype=jnp.float32)
         zeros_mean_bias = jnp.zeros((cfg.action_dim,), dtype=jnp.float32)
         log_sigma = jnp.full(
@@ -896,6 +1190,44 @@ class ContinuousActorCriticAgent:
             step_count=jnp.array(0, dtype=jnp.int32),
         )
 
+    def _feature_dim(self, state: ContinuousActorCriticState) -> int:
+        if type(state) is not ContinuousActorCriticState:
+            raise ValueError("state must be a ContinuousActorCriticState")
+        action_dim = self._config.action_dim
+        if state.mean_weights.ndim != 2 or state.mean_weights.shape[0] != action_dim:
+            raise ValueError("state.mean_weights must match action_dim and feature_dim")
+        feature_dim = state.mean_weights.shape[1]
+        matrix_shape = (action_dim, feature_dim)
+        for name in ("mean_weights", "mean_trace_weights"):
+            leaf = getattr(state, name)
+            if leaf.shape != matrix_shape or leaf.dtype != jnp.float32:
+                raise ValueError(f"state.{name} must have shape {matrix_shape} and dtype float32")
+        for name in (
+            "mean_bias",
+            "log_sigma",
+            "mean_trace_bias",
+            "log_sigma_trace",
+            "last_action",
+        ):
+            leaf = getattr(state, name)
+            if leaf.shape != (action_dim,) or leaf.dtype != jnp.float32:
+                raise ValueError(f"state.{name} must have shape ({action_dim},) and dtype float32")
+        for name in ("critic_weights", "critic_trace_weights", "last_observation"):
+            leaf = getattr(state, name)
+            if leaf.shape != (feature_dim,) or leaf.dtype != jnp.float32:
+                raise ValueError(f"state.{name} must have shape ({feature_dim},) and dtype float32")
+        for name in ("critic_bias", "critic_trace_bias"):
+            leaf = getattr(state, name)
+            if leaf.shape != () or leaf.dtype != jnp.float32:
+                raise ValueError(f"state.{name} must be a scalar float32")
+        if state.step_count.shape != () or state.step_count.dtype != jnp.int32:
+            raise ValueError("state.step_count must be a scalar int32")
+        _require_key(state.rng_key)
+        return feature_dim
+
+    def _observation(self, state: ContinuousActorCriticState, value: object) -> Array:
+        return _array("observation", value, (self._feature_dim(state),), jnp.float32)
+
     @functools.partial(jax.jit, static_argnums=(0,))
     def policy_params(
         self,
@@ -903,6 +1235,7 @@ class ContinuousActorCriticAgent:
         observation: Array,
     ) -> tuple[Float[Array, " action_dim"], Float[Array, " action_dim"]]:
         """Compute Gaussian policy mean and standard deviation for one observation."""
+        observation = self._observation(state, observation)
         mean = state.mean_weights @ observation + state.mean_bias
         sigma = jnp.exp(state.log_sigma)
         return mean, sigma
@@ -914,6 +1247,7 @@ class ContinuousActorCriticAgent:
         observation: Array,
     ) -> Float[Array, ""]:
         """Compute the critic value estimate for one observation."""
+        observation = self._observation(state, observation)
         return jnp.dot(state.critic_weights, observation) + state.critic_bias
 
     def _maybe_clip_action(self, action: Array) -> Array:
@@ -945,6 +1279,7 @@ class ContinuousActorCriticAgent:
             Tuple ``(action, new_rng_key, mean, sigma)`` where ``action`` is
             optionally clipped to the configured action bounds.
         """
+        observation = self._observation(state, observation)
         key, sample_key = jr.split(state.rng_key)
         mean, sigma = self.policy_params(state, observation)
         noise = jr.normal(sample_key, shape=mean.shape, dtype=jnp.float32)
@@ -964,6 +1299,7 @@ class ContinuousActorCriticAgent:
         Float[Array, " action_dim"],
     ]:
         """Select and store the first action for a new stream or episode."""
+        observation = self._observation(state, observation)
         action, key, mean, sigma = self.select_action(state, observation)
         new_state = state.replace(  # type: ignore[attr-defined]
             last_observation=observation,
@@ -1000,6 +1336,12 @@ class ContinuousActorCriticAgent:
         Returns:
             ``ContinuousActorCriticUpdateResult`` containing the updated state.
         """
+        observation = self._observation(state, observation)
+        reward = _array("reward", reward, (), jnp.float32)
+        if terminated is not None:
+            terminated = _array("terminated", terminated, (), jnp.bool_)
+        if discount is not None:
+            discount = _array("discount", discount, (), jnp.float32)
         cfg = self._config
         prev_obs = state.last_observation
         action = state.last_action
@@ -1014,9 +1356,7 @@ class ContinuousActorCriticAgent:
                 discount = jnp.where(terminated, 0.0, cfg.gamma)
         discount = jnp.asarray(discount, dtype=jnp.float32)
         # Terminal 0 * inf V(s') is NaN and would freeze the critic.
-        bootstrap = jnp.where(
-            discount == 0.0, jnp.zeros_like(next_value), discount * next_value
-        )
+        bootstrap = jnp.where(discount == 0.0, jnp.zeros_like(next_value), discount * next_value)
         td_error = reward + bootstrap - value
 
         sigma_sq = prev_sigma * prev_sigma + 1e-8
@@ -1128,7 +1468,7 @@ class ContinuousActorCriticAgent:
             log_sigma_trace=stored_log_sigma_trace,
             critic_trace_weights=stored_critic_trace_weights,
             critic_trace_bias=stored_critic_trace_bias,
-            step_count=state.step_count + 1,
+            step_count=jnp.minimum(state.step_count, _INT32_MAX - 1) + 1,
         )
         inputs_valid = (
             jnp.isfinite(jnp.squeeze(reward))
@@ -1143,11 +1483,10 @@ class ContinuousActorCriticAgent:
             & ((discount == 0.0) | jnp.isfinite(next_value))
             & jnp.isfinite(actor_metric)
             & jnp.isfinite(critic_metric)
+            & (state.step_count >= 0)
         )
         candidate_ok = (
-            inputs_valid
-            & _floating_tree_is_finite(state)
-            & _floating_tree_is_finite(updated)
+            inputs_valid & _floating_tree_is_finite(state) & _floating_tree_is_finite(updated)
         )
         held = jax.lax.cond(
             candidate_ok,
@@ -1155,9 +1494,7 @@ class ContinuousActorCriticAgent:
             lambda: state,
         )
         safe_observation = jnp.where(candidate_ok, observation, state.last_observation)
-        next_action, key, next_mean, next_sigma = self.select_action(
-            held, safe_observation
-        )
+        next_action, key, next_mean, next_sigma = self.select_action(held, safe_observation)
         proposed_final_state = held.replace(
             last_observation=observation,
             last_action=next_action,
@@ -1183,13 +1520,9 @@ class ContinuousActorCriticAgent:
             mean=jnp.where(params_ok, next_mean, jnp.zeros_like(next_mean)),
             sigma=jnp.where(params_ok, next_sigma, jnp.zeros_like(next_sigma)),
             value=jnp.where(params_ok, value, zero),
-            next_value=jnp.where(
-                params_ok & jnp.isfinite(next_value), next_value, zero
-            ),
+            next_value=jnp.where(params_ok & jnp.isfinite(next_value), next_value, zero),
             td_error=jnp.where(params_ok, td_error, zero),
-            bound_metric=jnp.where(
-                params_ok, (actor_metric + critic_metric) / 2.0, zero
-            ),
+            bound_metric=jnp.where(params_ok, (actor_metric + critic_metric) / 2.0, zero),
             update_applied=params_ok,
         )
 
@@ -1224,17 +1557,45 @@ def run_continuous_actor_critic_from_arrays(
     Returns:
         ``ContinuousActorCriticArrayResult`` with final state and per-step metrics.
     """
+    feature_dim = agent._feature_dim(state)
+    observations = jnp.asarray(observations, dtype=jnp.float32)
+    next_observations = jnp.asarray(next_observations, dtype=jnp.float32)
+    rewards = jnp.asarray(rewards, dtype=jnp.float32)
+    if observations.ndim != 2 or observations.shape[0] < 1:
+        raise ValueError("observations must have shape (num_steps, feature_dim)")
+    num_steps = observations.shape[0]
+    if observations.shape[1] != feature_dim or next_observations.shape != observations.shape:
+        raise ValueError("observations and next_observations must match state feature_dim")
+    if rewards.shape != (num_steps,):
+        raise ValueError("rewards must have shape (num_steps,)")
+    action_dim = agent.config.action_dim
+    output_scalars = num_steps * (3 * action_dim + 3)
+    output_bytes = num_steps * (12 * action_dim + 9)
+    if output_scalars > _INT32_MAX or output_bytes > _INT32_MAX:
+        raise ValueError(
+            "derived continuous actor-critic scan outputs exceed the signed-int32 budget"
+        )
     if terminated is None and discounts is None:
         raise ValueError("terminated or discounts must be provided")
+    if terminated is not None:
+        terminated = jnp.asarray(terminated, dtype=jnp.bool_)
+        if terminated.shape != (num_steps,):
+            raise ValueError("terminated must have shape (num_steps,)")
+    if discounts is not None:
+        discounts = jnp.asarray(discounts, dtype=jnp.float32)
+        if discounts.shape != (num_steps,):
+            raise ValueError("discounts must have shape (num_steps,)")
     if terminated is None:
         terminated = jnp.zeros_like(rewards, dtype=jnp.bool_)
     if discounts is None:
         discounts = jnp.where(terminated, 0.0, agent.config.gamma).astype(jnp.float32)
-    action_dim = agent.config.action_dim
     if actions is None:
         actions = jnp.zeros((rewards.shape[0], action_dim), dtype=jnp.float32)
         use_fixed_actions = False
     else:
+        actions = jnp.asarray(actions, dtype=jnp.float32)
+        if actions.shape != (num_steps, action_dim):
+            raise ValueError("actions must have shape (num_steps, action_dim)")
         use_fixed_actions = True
 
     def _scan_fn(
@@ -1253,9 +1614,7 @@ def run_continuous_actor_critic_from_arrays(
             current_action = fixed_action.astype(jnp.float32)
             current_mean, current_sigma = agent.policy_params(started_state, obs)
         else:
-            started_state, current_action, current_mean, current_sigma = agent.start(
-                carry, obs
-            )
+            started_state, current_action, current_mean, current_sigma = agent.start(carry, obs)
         result = agent.update(
             started_state,
             reward,
@@ -1268,15 +1627,9 @@ def run_continuous_actor_critic_from_arrays(
             lambda: carry,
         )
         return next_carry, (
-            jnp.where(
-                result.update_applied, current_action, jnp.zeros_like(current_action)
-            ),
-            jnp.where(
-                result.update_applied, current_mean, jnp.zeros_like(current_mean)
-            ),
-            jnp.where(
-                result.update_applied, current_sigma, jnp.zeros_like(current_sigma)
-            ),
+            jnp.where(result.update_applied, current_action, jnp.zeros_like(current_action)),
+            jnp.where(result.update_applied, current_mean, jnp.zeros_like(current_mean)),
+            jnp.where(result.update_applied, current_sigma, jnp.zeros_like(current_sigma)),
             result.value,
             result.td_error,
             result.update_applied,

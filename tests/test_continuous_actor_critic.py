@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import warnings
+from types import MappingProxyType
 
 import chex
 import jax
@@ -18,6 +19,7 @@ from alberta_framework.core import (
 from alberta_framework.core.actor_critic import (
     ContinuousActorCriticAgent,
     ContinuousActorCriticConfig,
+    _require_continuous_state_resources,
     run_continuous_actor_critic_from_arrays,
 )
 from alberta_framework.core.optimizers import ObGDBounding
@@ -223,8 +225,8 @@ def test_continuous_actor_critic_rejects_inverted_or_nonfinite_action_bounds(
     low: float | None, high: float | None, message: str | None
 ) -> None:
     """low > high makes jnp.clip return high for every input: a constant-action policy."""
-    config = ContinuousActorCriticConfig(action_dim=2, action_low=low, action_high=high)
     if message is None:
+        config = ContinuousActorCriticConfig(action_dim=2, action_low=low, action_high=high)
         agent = ContinuousActorCriticAgent(config)
         state = agent.init(feature_dim=1, key=jr.key(2))
         _state, action, _mean, _sigma = agent.start(state, jnp.array([1.0], dtype=jnp.float32))
@@ -233,7 +235,7 @@ def test_continuous_actor_critic_rejects_inverted_or_nonfinite_action_bounds(
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         with pytest.raises(ValueError, match=message):
-            ContinuousActorCriticAgent(config)
+            ContinuousActorCriticConfig(action_dim=2, action_low=low, action_high=high)
 
 
 class _FloatSpoof:
@@ -264,9 +266,10 @@ class _FloatSpoof:
 
 @pytest.mark.parametrize("field", ["action_low", "action_high"])
 def test_continuous_actor_critic_rejects_bounds_that_only_spoof_float(field: str) -> None:
-    config = ContinuousActorCriticConfig(action_dim=1, **{field: _FloatSpoof()})  # type: ignore[arg-type]
     with pytest.raises(ValueError, match=f"{field} must be a finite real number"):
-        ContinuousActorCriticAgent(config)
+        ContinuousActorCriticConfig(  # type: ignore[arg-type]
+            action_dim=1, **{field: _FloatSpoof()}
+        )
 
 
 @pytest.mark.parametrize(
@@ -319,7 +322,7 @@ def test_continuous_actor_critic_normalizes_conversion_hook_failures() -> None:
         def as_integer_ratio(self) -> tuple[int, int]:
             raise RuntimeError("conversion hook failed")
 
-    with pytest.raises(ValueError, match="action_low must be finite"):
+    with pytest.raises(ValueError, match="action_low must be"):
         ContinuousActorCriticAgent(
             ContinuousActorCriticConfig(
                 action_dim=1,
@@ -353,9 +356,7 @@ def test_continuous_actor_critic_action_clipping() -> None:
 def test_continuous_actor_critic_update_is_jittable() -> None:
     agent = ContinuousActorCriticAgent(ContinuousActorCriticConfig(action_dim=2))
     state = agent.init(feature_dim=2, key=jr.key(6))
-    state, _action, _mean, _sigma = agent.start(
-        state, jnp.array([1.0, 0.0], dtype=jnp.float32)
-    )
+    state, _action, _mean, _sigma = agent.start(state, jnp.array([1.0, 0.0], dtype=jnp.float32))
     update = jax.jit(agent.update)
     result = update(
         state,
@@ -370,12 +371,8 @@ def test_continuous_actor_critic_update_is_jittable() -> None:
 def test_continuous_actor_critic_run_from_arrays_scan() -> None:
     agent = ContinuousActorCriticAgent(ContinuousActorCriticConfig(action_dim=2))
     state = agent.init(feature_dim=2, key=jr.key(7))
-    observations = jnp.array(
-        [[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]], dtype=jnp.float32
-    )
-    next_observations = jnp.array(
-        [[0.0, 1.0], [1.0, 1.0], [0.5, -0.5]], dtype=jnp.float32
-    )
+    observations = jnp.array([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]], dtype=jnp.float32)
+    next_observations = jnp.array([[0.0, 1.0], [1.0, 1.0], [0.5, -0.5]], dtype=jnp.float32)
     rewards = jnp.array([1.0, 0.0, -1.0], dtype=jnp.float32)
     terminated = jnp.array([False, False, True])
 
@@ -459,9 +456,7 @@ def test_continuous_actor_critic_infinite_reward_with_obgd_does_not_poison() -> 
         bounder=ObGDBounding(kappa=2.0),
     )
     state = agent.init(feature_dim=3, key=jr.key(8))
-    state, _, _, _ = agent.start(
-        state, jnp.array([1.0, 0.0, -1.0], dtype=jnp.float32)
-    )
+    state, _, _, _ = agent.start(state, jnp.array([1.0, 0.0, -1.0], dtype=jnp.float32))
     poisoned = agent.update(
         state,
         reward=jnp.array(jnp.inf, dtype=jnp.float32),
@@ -472,9 +467,7 @@ def test_continuous_actor_critic_infinite_reward_with_obgd_does_not_poison() -> 
     assert bool(jnp.all(jnp.isfinite(poisoned.state.critic_weights)))
     chex.assert_trees_all_close(poisoned.state.mean_weights, state.mean_weights)
     chex.assert_trees_all_close(poisoned.state.critic_weights, state.critic_weights)
-    chex.assert_trees_all_equal(
-        jr.key_data(poisoned.state.rng_key), jr.key_data(state.rng_key)
-    )
+    chex.assert_trees_all_equal(jr.key_data(poisoned.state.rng_key), jr.key_data(state.rng_key))
     chex.assert_trees_all_close(
         poisoned.state.replace(rng_key=jr.key_data(poisoned.state.rng_key)),
         state.replace(rng_key=jr.key_data(state.rng_key)),
@@ -523,3 +516,119 @@ def test_continuous_actor_critic_terminal_does_not_multiply_inf_next_value() -> 
     assert bool(result.update_applied)
     chex.assert_trees_all_close(result.td_error, jnp.array(3.0, dtype=jnp.float32))
     _assert_continuous_actor_critic_state_finite(result.state)
+
+
+def test_continuous_actor_critic_integer_and_scalar_validation() -> None:
+    with pytest.raises(ValueError, match="action_dim"):
+        ContinuousActorCriticConfig(action_dim=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="action_dim"):
+        ContinuousActorCriticConfig(action_dim=0)
+    with pytest.raises(ValueError, match="action_dim"):
+        ContinuousActorCriticConfig(action_dim=2.5)  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="gamma"):
+        ContinuousActorCriticConfig(action_dim=2, gamma=1.5)
+    with pytest.raises(ValueError, match="actor_step_size"):
+        ContinuousActorCriticConfig(action_dim=2, actor_step_size=-0.1)
+
+    cfg = ContinuousActorCriticConfig(action_dim=np.int32(3))
+    assert cfg.action_dim == 3
+    assert type(cfg.action_dim) is int
+
+    agent = ContinuousActorCriticAgent(cfg)
+    with pytest.raises(ValueError, match="feature_dim"):
+        agent.init(feature_dim=True, key=jr.key(0))  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="feature_dim"):
+        agent.init(feature_dim=0, key=jr.key(0))
+
+    state = agent.init(feature_dim=np.int32(5), key=jr.key(0))
+    assert state.mean_weights.shape == (3, 5)
+
+
+class _HostileFloat(float):
+    def as_integer_ratio(self) -> tuple[int, int]:
+        raise RuntimeError("hostile hook executed")
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("gamma", _HostileFloat(0.5)),
+        ("actor_step_size", np.float64(1e-100)),
+        ("log_sigma_init", 1e100),
+        ("log_sigma_min", True),
+        ("action_low", _HostileFloat(-1.0)),
+        ("action_high", np.float64(1e100)),
+    ],
+)
+def test_continuous_actor_critic_rejects_invalid_float32_config(
+    field: str, value: object
+) -> None:
+    with pytest.raises(ValueError, match=field):
+        config = ContinuousActorCriticConfig(action_dim=2, **{field: value})  # type: ignore[arg-type]
+        ContinuousActorCriticAgent(config)
+
+
+def test_continuous_actor_critic_mapping_config_and_resource_boundary() -> None:
+    config = ContinuousActorCriticConfig(
+        action_dim=np.uint16(2), action_low=np.float32(-1), action_high=np.float64(1)
+    ).to_config()
+    clone = ContinuousActorCriticConfig.from_config(MappingProxyType(config))
+    assert clone.to_config() == config
+    _require_continuous_state_resources(1, 107_374_180)
+    with pytest.raises(ValueError, match="state exceeds"):
+        _require_continuous_state_resources(1, 107_374_181)
+
+
+class _HostileArray:
+    def __jax_array__(self) -> jax.Array:
+        raise RuntimeError("hostile array hook executed")
+
+
+def test_continuous_actor_critic_schema_and_hostile_inputs_fail_closed() -> None:
+    config = ContinuousActorCriticConfig(action_dim=2).to_config()
+    with pytest.raises(ValueError, match="serialized schema"):
+        ContinuousActorCriticConfig.from_config({**config, "unknown": 1})
+    with pytest.raises(ValueError, match="exact JSON"):
+        ContinuousActorCriticConfig.from_config({**config, "action_dim": np.int32(2)})
+
+    agent = ContinuousActorCriticAgent(ContinuousActorCriticConfig(action_dim=2))
+    payload = agent.to_config()
+    with pytest.raises(ValueError, match="type differs"):
+        ContinuousActorCriticAgent.from_config({**payload, "type": "wrong"})
+    with pytest.raises(ValueError, match="Bounder"):
+        ContinuousActorCriticAgent(agent.config, bounder=object())  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="Threefry"):
+        agent.init(2, _HostileArray())  # type: ignore[arg-type]
+    state = agent.init(2, jr.key(0))
+    with pytest.raises(ValueError, match="trusted array metadata"):
+        agent.policy_params.__wrapped__(agent, state, _HostileArray())  # type: ignore[attr-defined,arg-type]
+
+
+@pytest.mark.parametrize("shape", [(), (1,), (1, 2), (2, 1), (3,)])
+def test_continuous_actor_critic_rejects_wrong_observation_shapes(
+    shape: tuple[int, ...]
+) -> None:
+    agent = ContinuousActorCriticAgent(ContinuousActorCriticConfig(action_dim=2))
+    state = agent.init(2, jr.key(0))
+    malformed = jnp.zeros(shape, dtype=jnp.float32)
+    with pytest.raises(ValueError, match="observation"):
+        agent.policy_params(state, malformed)
+    with pytest.raises(ValueError, match="observation"):
+        agent.update(state, jnp.asarray(0.0), malformed)
+
+
+def test_continuous_actor_critic_state_contract_and_counter_saturation() -> None:
+    agent = ContinuousActorCriticAgent(ContinuousActorCriticConfig(action_dim=2))
+    state = agent.init(2, jr.key(0))
+    malformed = state.replace(mean_weights=jnp.zeros((2,), dtype=jnp.float32))
+    with pytest.raises(ValueError, match="mean_weights"):
+        agent.policy_params(malformed, jnp.zeros((2,), dtype=jnp.float32))
+    saturated = state.replace(step_count=jnp.asarray(2**31 - 1, dtype=jnp.int32))
+    result = agent.update(
+        saturated,
+        jnp.asarray(0.0),
+        jnp.zeros((2,), dtype=jnp.float32),
+    )
+    assert bool(result.update_applied)
+    assert int(result.state.step_count) == 2**31 - 1
