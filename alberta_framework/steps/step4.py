@@ -31,6 +31,7 @@ import jax.numpy as jnp
 import jax.random as jr
 from jax import Array
 
+from alberta_framework._seed_validation import require_jax_seed
 from alberta_framework.core.optimizers import (
     IDBD,
     LMS,
@@ -117,6 +118,11 @@ class Step4SmokeResult:
     actions_shape: tuple[int, ...]
     finite: bool
     agent_config: dict[str, Any]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "steps", _require_positive_int("steps", self.steps))
+        object.__setattr__(self, "seed", require_jax_seed(self.seed, name="seed"))
+        object.__setattr__(self, "finite", _require_bool("finite", self.finite))
 
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-serializable representation."""
@@ -209,6 +215,12 @@ def _require_nonneg_int(name: str, value: object) -> int:
     if number > _INT32_MAX:
         raise ValueError(f"{name} must be at most int32 max, got {value!r}")
     return number
+
+
+def _require_bool(name: str, value: object) -> bool:
+    if type(value) is not bool:
+        raise ValueError(f"{name} must be a boolean, got {value!r}")
+    return value
 
 
 def _validate_sarsa_config(config: Step4SARSAConfig) -> None:

@@ -17,6 +17,7 @@ import pytest
 from alberta_framework.core.optimizers import IDBD, LMS, Autostep, ObGDBounding
 from alberta_framework.steps import (
     Step4SARSAConfig,
+    Step4SmokeResult,
     init_step4_state,
     make_step4_bounder,
     make_step4_optimizer,
@@ -333,3 +334,47 @@ def test_step4_sarsa_dimensions_preserve_int32_maximum() -> None:
     assert type(config.n_actions) is int
     assert type(config.epsilon_decay_steps) is int
     assert type(config.hidden_sizes[0]) is int
+
+
+def _legal_step4_smoke_result(**overrides: object) -> Step4SmokeResult:
+    payload: dict[str, object] = {
+        "config": Step4SARSAConfig(),
+        "steps": 8,
+        "seed": 0,
+        "q_values_shape": (8, 2),
+        "td_errors_shape": (8,),
+        "actions_shape": (8,),
+        "finite": True,
+        "agent_config": {"ok": True},
+    }
+    payload.update(overrides)
+    return Step4SmokeResult(**payload)  # type: ignore[arg-type]
+
+
+def test_step4_smoke_result_rejects_leftover_identities() -> None:
+    """Public Step 4 smoke records must not keep leftover bool/int identities."""
+
+    with pytest.raises(ValueError, match="steps"):
+        _legal_step4_smoke_result(steps=True)
+    with pytest.raises(ValueError, match="steps"):
+        _legal_step4_smoke_result(steps=float("nan"))
+    with pytest.raises(ValueError, match="seed"):
+        _legal_step4_smoke_result(seed=True)
+    with pytest.raises(ValueError, match="finite"):
+        _legal_step4_smoke_result(finite=1)
+
+    legal = _legal_step4_smoke_result()
+    dumped = json.dumps(
+        {
+            "steps": legal.steps,
+            "seed": legal.seed,
+            "finite": legal.finite,
+        },
+        allow_nan=False,
+    )
+    assert '"steps": 8' in dumped
+    assert '"seed": 0' in dumped
+    assert '"finite": true' in dumped
+    assert '"steps": true' not in dumped
+    assert '"seed": true' not in dumped
+    assert '"finite": 1' not in dumped
