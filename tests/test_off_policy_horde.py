@@ -71,7 +71,7 @@ def test_invalid_clips_raise() -> None:
         ({"ratio_clip": True}, "ratio_clip"),
         ({"ratio_clip": False}, "ratio_clip"),
         ({"ratio_clip": float("nan")}, "ratio_clip"),
-        ({"ratio_clip": float("inf")}, "ratio_clip"),
+        ({"ratio_clip": float("-inf")}, "ratio_clip"),
         ({"trace_ratio_clip": True}, "trace_ratio_clip"),
         ({"trace_ratio_clip": float("nan")}, "trace_ratio_clip"),
         ({"min_behavior_probability": True}, "min_behavior_probability"),
@@ -99,6 +99,14 @@ def test_legal_ratio_identities_stay_builtin_floats() -> None:
         type(learner._min_behavior_probability) is float
         and learner._min_behavior_probability == 1e-6
     )
+    unclipped = OffPolicyHordeLearner(
+        _spec(),
+        hidden_sizes=(),
+        ratio_clip=float("inf"),
+        trace_ratio_clip=float("inf"),
+    )
+    assert unclipped.ratio_clip == float("inf")
+    assert unclipped.trace_ratio_clip == float("inf")
 
 
 def test_update_finite_and_shapes() -> None:

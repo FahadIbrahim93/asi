@@ -11,6 +11,7 @@ correction terms that are still separate from this shared-trunk backend.
 from __future__ import annotations
 
 import functools
+import math
 import operator
 import time
 from collections.abc import Mapping
@@ -76,6 +77,25 @@ def _require_float32(name: str, value: object, **bounds: Any) -> float:
     if type(value) not in _TRUSTED_REAL_TYPES:
         raise ValueError(f"{name} must be a finite real scalar")
     return validated_float32_scalar(name, value, **bounds)
+
+
+_INFINITY_TYPES = frozenset(np.dtype(code).type for code in ("e", "f", "d", "g")) | {float}
+
+
+def _positive_float32_or_infinity(name: str, value: object) -> float:
+    """Preserve the documented no-clipping infinity sentinel; reject finite overflow."""
+    actual_type = type(value)
+    if actual_type not in _TRUSTED_REAL_TYPES:
+        raise ValueError(f"{name} must be positive or infinity")
+    try:
+        numeric_value = cast(Any, value)
+        if actual_type in _INFINITY_TYPES and bool(np.isinf(numeric_value)):
+            if bool(np.signbit(numeric_value)):
+                raise ValueError(f"{name} must be positive or infinity")
+            return math.inf
+    except Exception as error:
+        raise ValueError(f"{name} must be positive or infinity") from error
+    return validated_float32_scalar(name, value, positive=True)
 
 
 def _preflight_nonlinear_state(*, n_demons: int, hidden_size: int, feature_dim: int) -> None:
@@ -323,10 +343,8 @@ class OffPolicyHordeLearner:
             trace_ratio_clip: Clip for the eligibility-trace ratio.
             min_behavior_probability: Denominator floor for probability API.
         """
-        ratio_clip = _require_float32("ratio_clip", ratio_clip, positive=True)
-        trace_ratio_clip = _require_float32(
-            "trace_ratio_clip", trace_ratio_clip, positive=True
-        )
+        ratio_clip = _positive_float32_or_infinity("ratio_clip", ratio_clip)
+        trace_ratio_clip = _positive_float32_or_infinity("trace_ratio_clip", trace_ratio_clip)
         min_behavior_probability = _require_float32(
             "min_behavior_probability", min_behavior_probability, positive=True
         )

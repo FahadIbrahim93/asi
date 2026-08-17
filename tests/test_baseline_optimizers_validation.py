@@ -27,6 +27,11 @@ class _ClassSpoof:
     def __float__(self) -> float:  # pragma: no cover
         return 0.1
 
+    def __repr__(self) -> str:
+        # Stable parametrize id: the default object repr embeds the memory
+        # address, which differs across xdist workers and breaks collection.
+        return "_ClassSpoof()"
+
 
 @pytest.mark.parametrize(
     ("ctor", "field", "bad"),
