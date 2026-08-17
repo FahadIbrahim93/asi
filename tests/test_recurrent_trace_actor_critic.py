@@ -2304,6 +2304,63 @@ def test_rtac_config_accepts_and_canonicalizes_numpy_integers() -> None:
     assert cfg.output_width == 32
 
 
+@pytest.mark.parametrize("bad", [True, False, 1.5, 0, -1, 2**31, float("nan"), "3"])
+def test_zero_rtu_state_rejects_non_integer_hidden_size(bad: object) -> None:
+    with pytest.raises(ValueError, match="hidden_size"):
+        zero_rtu_state(bad)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("hidden_size", "input_dim", "match"),
+    [
+        (True, 3, "hidden_size"),
+        (1.5, 3, "hidden_size"),
+        (3, True, "input_dim"),
+        (3, 1.5, "input_dim"),
+        (3, 0, "input_dim"),
+        (0, 3, "hidden_size"),
+    ],
+)
+def test_zero_rtu_sensitivities_rejects_non_integer_dimensions(
+    hidden_size: object,
+    input_dim: object,
+    match: str,
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        zero_rtu_sensitivities(hidden_size, input_dim)  # type: ignore[arg-type]
+
+
+def test_zero_rtu_helpers_accept_numpy_integers() -> None:
+    state = zero_rtu_state(np.int64(2))
+    assert state.real.shape == (2,)
+    sensitivities = zero_rtu_sensitivities(np.int32(2), np.int64(3))
+    assert sensitivities.nu_log.shape == (2, 2)
+    assert sensitivities.b_real.shape == (2, 2, 3)
+
+
+@pytest.mark.parametrize(
+    ("input_dim", "output_dim", "match"),
+    [
+        (True, 3, "input_dim"),
+        (1.5, 3, "input_dim"),
+        (2, True, "output_dim"),
+        (2, 1.5, "output_dim"),
+    ],
+)
+def test_initialize_rtu_network_parameters_rejects_non_integer_dimensions(
+    input_dim: object,
+    output_dim: object,
+    match: str,
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        initialize_rtu_network_parameters(
+            jr.key(0),
+            input_dim,  # type: ignore[arg-type]
+            output_dim,  # type: ignore[arg-type]
+            _small_config(),
+        )
+
+
 @pytest.mark.parametrize(
     "field",
     ("gamma", "actor_lamda", "critic_lamda", "sparsity", "beta2"),
