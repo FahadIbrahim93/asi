@@ -48,6 +48,7 @@ from alberta_framework.benchmarks.micro_continual import (
     MicroStream,
     MicroStreamConfig,
     MicroTaskConfig,
+    _atomic_replace_json,
     assemble_observed,
     bayes_predict,
     bayes_reference,
@@ -1298,6 +1299,29 @@ class TestShards:
         write_micro_shard(path, payload)
         with pytest.raises(FileExistsError):
             write_micro_shard(path, payload)
+
+    @pytest.mark.parametrize(
+        "number",
+        [math.nan, math.inf, -math.inf],
+        ids=["nan", "inf", "-inf"],
+    )
+    def test_write_refuses_nonfinite_json(self, tmp_path: Path, number: float):
+        """Shard bytes must be RFC-valid JSON; NaN / Infinity tokens are not."""
+        path = tmp_path / "nonfinite-shard.json"
+        with pytest.raises(ValueError, match="JSON compliant"):
+            write_micro_shard(path, {"wall_clock_seconds": number, "ok": 1})
+        assert not path.exists()
+
+    @pytest.mark.parametrize(
+        "number",
+        [math.nan, math.inf, -math.inf],
+        ids=["nan", "inf", "-inf"],
+    )
+    def test_derived_json_replace_refuses_nonfinite(self, tmp_path: Path, number: float):
+        path = tmp_path / "nonfinite-summary.json"
+        with pytest.raises(ValueError, match="JSON compliant"):
+            _atomic_replace_json(path, {"average_online_accuracy": number})
+        assert not path.exists()
 
     def test_load_rejects_wrong_schema(self, tmp_path: Path):
         payload = micro_shard_payload(self._result())
