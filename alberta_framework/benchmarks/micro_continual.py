@@ -202,6 +202,16 @@ def _require_nonempty_string(value: object, *, context: str) -> str:
     return value
 
 
+def _require_builtin_finite_real(value: object, *, context: str) -> float:
+    """Canonicalize a result scalar without invoking numeric subclass hooks."""
+    if type(value) not in (int, float):
+        raise ValueError(f"{context} must be a finite built-in real number")
+    number = float(cast("int | float", value))
+    if not math.isfinite(number):
+        raise ValueError(f"{context} must be a finite built-in real number")
+    return number
+
+
 # =============================================================================
 # Configuration
 # =============================================================================
@@ -988,13 +998,17 @@ class MicroRunResult:
         object.__setattr__(
             self,
             "overall_accuracy",
-            _require_finite_real(self.overall_accuracy, "MicroRunResult.overall_accuracy"),
+            _require_builtin_finite_real(
+                self.overall_accuracy,
+                context="MicroRunResult.overall_accuracy",
+            ),
         )
         object.__setattr__(
             self,
             "wall_clock_seconds",
-            _require_finite_real(
-                self.wall_clock_seconds, "MicroRunResult.wall_clock_seconds"
+            _require_builtin_finite_real(
+                self.wall_clock_seconds,
+                context="MicroRunResult.wall_clock_seconds",
             ),
         )
 

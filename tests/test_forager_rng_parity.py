@@ -15,6 +15,22 @@ import pytest
 from alberta_framework.benchmarks import forager_rng_parity as parity
 
 
+def test_key_frame_rejects_integer_subclasses_before_comparison_hooks() -> None:
+    class HostileInt(int):
+        def __lt__(self, other: object) -> bool:
+            raise AssertionError("hostile comparison must not run")
+
+        def __gt__(self, other: object) -> bool:
+            raise AssertionError("hostile comparison must not run")
+
+    with pytest.raises(parity.ForagerRngParityError, match=r"input_key\[0\]"):
+        parity.KeyFrame(
+            input_key=(HostileInt(0), 0),
+            next_key=(0, 0),
+            environment_key=(0, 0),
+        )
+
+
 def _runtime_identity() -> parity.VerifiedRuntimeIdentity:
     return parity.VerifiedRuntimeIdentity(
         required_oci_image_id=parity.REQUIRED_OCI_IMAGE_ID,

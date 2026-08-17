@@ -57,6 +57,23 @@ def test_canonical_json_rejects_nonfinite_number_identities(invalid: float) -> N
         qualification._canonical_json_bytes({"score": invalid})  # noqa: SLF001
 
 
+def test_canonical_json_rejects_hostile_container_subclasses_without_hooks() -> None:
+    class HostileMapping(dict[str, object]):
+        def items(self):  # type: ignore[no-untyped-def, override]
+            raise AssertionError("canonicalization must not invoke mapping hooks")
+
+    class HostileSequence(list[object]):
+        def __iter__(self):
+            raise AssertionError("canonicalization must not invoke sequence hooks")
+
+    for value in (HostileMapping(value=1), HostileSequence()):
+        with pytest.raises(
+            qualification.ForagerMatchedQualificationError,
+            match="unsupported",
+        ):
+            qualification._plain_json(value)  # noqa: SLF001
+
+
 def test_replace_integer_literals_keeps_finite_configuration_copy() -> None:
     raw = b'{"total_steps": 1}'
     transform = SimpleNamespace(

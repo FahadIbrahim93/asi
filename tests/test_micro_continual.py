@@ -2008,3 +2008,14 @@ def test_micro_run_result_rejects_leftover_identities() -> None:
     assert '"family": true' not in dumped
     assert '"seed": true' not in dumped
     assert '"hidden1": true' not in dumped
+
+
+def test_micro_run_result_rejects_numeric_subclasses_without_conversion_hooks() -> None:
+    class HostileFloat(float):
+        def __float__(self) -> float:
+            raise AssertionError("result validation must not invoke __float__")
+
+    with pytest.raises(ValueError, match="overall_accuracy"):
+        _legal_micro_run_result(overall_accuracy=HostileFloat(0.5))
+    with pytest.raises(ValueError, match="wall_clock_seconds"):
+        _legal_micro_run_result(wall_clock_seconds=HostileFloat(1.0))

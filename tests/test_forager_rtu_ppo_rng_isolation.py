@@ -551,3 +551,19 @@ def test_plain_json_keeps_finite_canonical_scalars() -> None:
         "n": 2,
     }
     assert isolation._canonical_json({"score": 1.25}) == b'{"score":1.25}'
+
+
+def test_plain_json_rejects_scalar_subclasses_without_conversion_hooks() -> None:
+    class HostileInt(int):
+        def __int__(self) -> int:
+            raise AssertionError("hostile integer conversion must not run")
+
+    with pytest.raises(isolation.RTUPPORngIsolationError, match="non-JSON value"):
+        isolation._plain_json({"count": HostileInt(1)})
+
+    class HostileSequence(list[object]):
+        def __iter__(self):
+            raise AssertionError("hostile iteration must not run")
+
+    with pytest.raises(isolation.RTUPPORngIsolationError, match="non-JSON value"):
+        isolation._plain_json(HostileSequence())
