@@ -77,3 +77,28 @@ def test_parser_exposes_causal_map_policy() -> None:
 
     assert args.preset == "field_of_view"
     assert args.agents == ["causal-map"]
+
+
+def test_explicit_int_or_default_keeps_requested_zero() -> None:
+    """``0 or default`` is the live hole: argparse 0 must not become missing."""
+    assert forager_cli._explicit_int_or_default(None, 100_000) == 100_000
+    assert forager_cli._explicit_int_or_default(0, 100_000) == 0
+    assert forager_cli._explicit_int_or_default(50_000, 100_000) == 50_000
+
+
+def test_final_window_zero_is_not_replaced_by_protocol_default() -> None:
+    args = forager_cli._parser().parse_args(["--final-window", "0"])
+    assert args.final_window == 0
+    # The previous main() expression was ``args.final_window or protocol.default``.
+    assert (args.final_window or 100_000) == 100_000
+    resolved = forager_cli._explicit_int_or_default(args.final_window, 100_000)
+    assert resolved == 0
+
+
+def test_main_passes_explicit_final_window_to_config() -> None:
+    import inspect
+
+    source = inspect.getsource(forager_cli.main)
+    assert "_explicit_int_or_default(" in source
+    assert "args.final_window, protocol.final_window_steps" in source
+    assert "args.final_window or protocol.final_window_steps" not in source
