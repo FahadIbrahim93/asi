@@ -1928,7 +1928,10 @@ class TestShardsAndMerge:
             (
                 "learner",
                 lambda payload: payload.update(learner="adamw"),
-                "does not match expected learner",
+                # Hyperparameter-domain validation may reject the mismatched
+                # learner before the identity comparison does; either refusal
+                # is a correct fail-closed outcome.
+                "does not match expected learner|invalid hyperparameters",
             ),
             (
                 "seed",
