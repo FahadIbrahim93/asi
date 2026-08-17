@@ -339,20 +339,20 @@ def test_gvf_probabilities_reject_exact_subnormal_that_rounds_to_normal(
         build_config(value)
 
 
-def test_zero_host_with_subnormal_ratio_is_rejected_before_core() -> None:
+def test_float_subclass_with_subnormal_ratio_is_rejected_before_hook() -> None:
     class SubnormalRatioFloat(float):
         def as_integer_ratio(self) -> tuple[int, int]:
             return (1, 2**149)
 
     value = SubnormalRatioFloat(0.0)
 
-    with pytest.raises(ValueError, match="zero or a normal float32"):
+    with pytest.raises(ValueError, match="must be finite"):
         Step3HordeConfig(gammas=(value,), lamdas=(0.0,))
-    with pytest.raises(ValueError, match="zero or a normal float32"):
+    with pytest.raises(ValueError, match="must be finite"):
         Step4SARSAConfig(gamma=value)
 
 
-def test_host_comparisons_cannot_hide_invalid_narrowed_domains() -> None:
+def test_float_subclass_ratio_hooks_are_outside_step_scalar_domain() -> None:
     class NegativeRatioFloat(float):
         def as_integer_ratio(self) -> tuple[int, int]:
             return (-1, 1)
@@ -364,15 +364,15 @@ def test_host_comparisons_cannot_hide_invalid_narrowed_domains() -> None:
     negative = NegativeRatioFloat(0.5)
     above_unit = AboveUnitRatioFloat(0.5)
 
-    with pytest.raises(ValueError, match="step_size must be non-negative"):
+    with pytest.raises(ValueError, match="step_size must be finite"):
         Step4SARSAConfig(step_size=negative)
-    with pytest.raises(ValueError, match="step_size must be non-negative"):
+    with pytest.raises(ValueError, match="step_size must be finite"):
         Step5AverageRewardTDConfig(step_size=negative)
-    with pytest.raises(ValueError, match="option_importance_clip must be positive"):
+    with pytest.raises(ValueError, match="option_importance_clip must be finite"):
         Step10STOMPConfig(option_importance_clip=negative)
-    with pytest.raises(ValueError, match=r"gammas must be in \[0, 1\]"):
+    with pytest.raises(ValueError, match="gammas must be finite"):
         Step3HordeConfig(gammas=(above_unit,), lamdas=(0.0,))
-    with pytest.raises(ValueError, match=r"trace_decay must be in \[0, 1\]"):
+    with pytest.raises(ValueError, match="trace_decay must be finite"):
         Step5AverageRewardTDConfig(trace_decay=above_unit)
 
 
@@ -413,7 +413,7 @@ def test_exact_ratio_cannot_hide_outside_closed_unit_domain(
         def as_integer_ratio(self) -> tuple[int, int]:
             return ratio
 
-    with pytest.raises(ValueError, match=r"must be in \[0, 1\]"):
+    with pytest.raises(ValueError, match="must be finite"):
         build_config(HiddenBoundaryFloat(0.5))
 
 
@@ -449,7 +449,7 @@ def test_exact_ratio_cannot_hide_negative_underflow_from_nonnegative_domain(
         def as_integer_ratio(self) -> tuple[int, int]:
             return (-1, 2**200)
 
-    with pytest.raises(ValueError, match="must be non-negative"):
+    with pytest.raises(ValueError, match="must be finite"):
         build_config(HiddenNegativeFloat(0.5))
 
 
@@ -475,7 +475,7 @@ def test_exact_ratio_cannot_hide_nonzero_gvf_underflow(
         def as_integer_ratio(self) -> tuple[int, int]:
             return (1, 2**150)
 
-    with pytest.raises(ValueError, match="zero or a normal float32"):
+    with pytest.raises(ValueError, match="must be finite"):
         build_config(HiddenTinyFloat(0.5))
 
 
@@ -494,11 +494,11 @@ def test_exact_ratio_cannot_hide_negative_underflow_from_half_open_domain(
         def as_integer_ratio(self) -> tuple[int, int]:
             return (-1, 2**200)
 
-    with pytest.raises(ValueError, match=rf"{field} must be in \[0, 1\)"):
+    with pytest.raises(ValueError, match=rf"{field} must be finite"):
         config_type(**{field: cast(Any, HiddenNegativeFloat(0.5))})
 
 
-def test_exact_ratio_is_read_once_during_validation() -> None:
+def test_float_subclass_ratio_is_not_read_during_validation() -> None:
     class StatefulRatioFloat(float):
         calls = 0
 
@@ -509,10 +509,9 @@ def test_exact_ratio_is_read_once_during_validation() -> None:
             return (2, 1)
 
     value = StatefulRatioFloat(0.5)
-    config = Step8WorldModelConfig(step_size=value)
-
-    assert StatefulRatioFloat.calls == 1
-    assert config.step_size == 0.5
+    with pytest.raises(ValueError, match="step_size must be finite"):
+        Step8WorldModelConfig(step_size=value)
+    assert StatefulRatioFloat.calls == 0
 
 
 @pytest.mark.parametrize(
@@ -756,15 +755,17 @@ def test_numpy_float64_midpoint_neighborhood_rounds_once() -> None:
     assert above_config.step_size == expected_upper
 
 
-def test_float_subclass_cannot_disagree_with_its_exact_ratio() -> None:
+def test_float_subclass_cannot_supply_an_exact_ratio() -> None:
     class RatioFloat(float):
         def as_integer_ratio(self) -> tuple[int, int]:
             return (3, 4)
 
     value = RatioFloat(0.5)
 
-    assert Step3HordeConfig(step_size=value).step_size == 0.75
-    assert Step8WorldModelConfig(step_size=value).step_size == 0.75
+    with pytest.raises(ValueError, match="step_size must be finite"):
+        Step3HordeConfig(step_size=value)
+    with pytest.raises(ValueError, match="step_size must be finite"):
+        Step8WorldModelConfig(step_size=value)
 
 
 def test_float_subclass_cannot_spoof_builtin_identity() -> None:
@@ -779,18 +780,17 @@ def test_float_subclass_cannot_spoof_builtin_identity() -> None:
 
     value = RatioFloat(0.5)
 
-    assert Step3HordeConfig(step_size=value).step_size == 0.75
+    with pytest.raises(ValueError, match="step_size must be finite"):
+        Step3HordeConfig(step_size=value)
 
 
-def test_nonfinite_float_subclass_cannot_bypass_exact_ratio_storage() -> None:
+def test_nonfinite_float_subclass_is_rejected_before_ratio_storage() -> None:
     class RatioFloat(float):
         def as_integer_ratio(self) -> tuple[int, int]:
             return (1, 1)
 
-    config = Step9DreamingConfig(dream_surprise_weight=RatioFloat(float("nan")))
-
-    assert config.dream_surprise_weight == 1.0
-    json.dumps(config.to_dict(), allow_nan=False)
+    with pytest.raises(ValueError, match="dream_surprise_weight must be finite"):
+        Step9DreamingConfig(dream_surprise_weight=RatioFloat(float("nan")))
 
 
 @pytest.mark.parametrize(
