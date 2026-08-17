@@ -1092,6 +1092,16 @@ def run_horde_actor_critic_from_arrays(
         actions = jnp.full_like(rewards, -1, dtype=jnp.int32)
         use_fixed_actions = False
     else:
+        try:
+            actions_dtype = np.dtype(actions.dtype)
+        except (AttributeError, TypeError) as error:
+            raise ValueError("actions must expose an integer dtype") from error
+        if not np.issubdtype(actions_dtype, np.integer):
+            raise ValueError("actions must have an integer dtype")
+        action_values = np.asarray(actions)
+        if not bool(np.all((action_values >= 0) & (action_values < agent.config.n_actions))):
+            raise ValueError("actions must lie in [0, n_actions)")
+        actions = jnp.asarray(actions, dtype=jnp.int32)
         use_fixed_actions = True
     if auxiliary_cumulants is None:
         auxiliary_cumulants = jnp.zeros(

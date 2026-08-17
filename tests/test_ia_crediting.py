@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import jax.numpy as jnp
 import jax.random as jr
+import pytest
 
 from alberta_framework.core.intelligence_amplification import (
     ExoCerebellumConfig,
@@ -295,3 +296,41 @@ def test_scan_with_partner_actions_matches_loop() -> None:
     for wl, ws, bl, bs in zip(w_loop, w_scan, b_loop, b_scan):
         assert jnp.allclose(wl, ws, atol=1e-6)
         assert jnp.allclose(bl, bs, atol=1e-6)
+
+
+def test_ia_agent_scan_rejects_non_integer_partner_actions() -> None:
+    agent = IAAgent(_make_ia_config())
+    state = agent.start(agent.init(jr.key(2)), _OBS0)
+    num_steps = 4
+    obs = jnp.tile(_OBS0, (num_steps, 1))
+    rewards = jnp.zeros(num_steps, dtype=jnp.float32)
+
+    # Fractional float actions rejected
+    with pytest.raises(ValueError, match="partner_actions must have an integer dtype"):
+        agent.scan(
+            state,
+            obs,
+            rewards,
+            obs,
+            partner_actions=jnp.array([1.75, 0.25, 0.5, 1.0], dtype=jnp.float32),
+        )
+
+    # Boolean actions rejected
+    with pytest.raises(ValueError, match="partner_actions must have an integer dtype"):
+        agent.scan(
+            state,
+            obs,
+            rewards,
+            obs,
+            partner_actions=jnp.array([True, False, True, False]),
+        )
+
+    # Valid integer actions accepted
+    result = agent.scan(
+        state,
+        obs,
+        rewards,
+        obs,
+        partner_actions=jnp.array([1, 0, 1, 0], dtype=jnp.int32),
+    )
+    assert result.state is not None

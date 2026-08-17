@@ -1350,11 +1350,16 @@ class IAAgent:
             )
 
         num_steps = jnp.asarray(partner_rewards).shape[0]
-        scan_actions = (
-            jnp.asarray(partner_actions, dtype=jnp.int32)
-            if partner_actions is not None
-            else jnp.zeros((num_steps,), dtype=jnp.int32)
-        )
+        if partner_actions is not None:
+            try:
+                partner_actions_dtype = np.dtype(partner_actions.dtype)
+            except (AttributeError, TypeError) as error:
+                raise ValueError("partner_actions must expose an integer dtype") from error
+            if not np.issubdtype(partner_actions_dtype, np.integer):
+                raise ValueError("partner_actions must have an integer dtype")
+            scan_actions = jnp.asarray(partner_actions, dtype=jnp.int32)
+        else:
+            scan_actions = jnp.zeros((num_steps,), dtype=jnp.int32)
         scan_discounts = (
             jnp.asarray(discounts, dtype=jnp.float32)
             if discounts is not None
