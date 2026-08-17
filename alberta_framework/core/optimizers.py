@@ -24,7 +24,7 @@ import numpy as np
 from jax import Array
 from jaxtyping import Bool, Float
 
-from alberta_framework.core._float32_scalars import validated_float32_scalar
+from alberta_framework.core._float32_scalars import validated_float32_scalar_with_ratio
 from alberta_framework.core.types import (
     AutostepGTDLambdaState,
     AutostepParamState,
@@ -92,6 +92,25 @@ def _require_float32_state(name: str, scalar_count: int) -> None:
 
 def _shape_size(shape: tuple[int, ...]) -> int:
     return prod(shape, start=1)
+
+
+def _validated_idbd_step_size(
+    name: str,
+    value: object,
+    *,
+    positive: bool = False,
+) -> float:
+    """Validate an IDBD rate without silently erasing a positive host value."""
+    stored, numerator, _ = validated_float32_scalar_with_ratio(
+        name,
+        value,
+        positive=positive,
+        lower=None if positive else 0.0,
+    )
+    narrowed = float(np.float32(stored))
+    if numerator != 0 and narrowed == 0.0:
+        raise ValueError(f"{name} must remain nonzero once narrowed to float32")
+    return stored
 
 
 # =============================================================================
@@ -714,12 +733,10 @@ class IDBD(Optimizer[IDBDState]):
                 f"Invalid h_decay_mode: {h_decay_mode!r}. "
                 "Must be 'prediction_grads' or 'loss_grads'."
             )
-        self._initial_step_size = validated_float32_scalar(
+        self._initial_step_size = _validated_idbd_step_size(
             "initial_step_size", initial_step_size, positive=True
         )
-        self._meta_step_size = validated_float32_scalar(
-            "meta_step_size", meta_step_size, lower=0.0
-        )
+        self._meta_step_size = _validated_idbd_step_size("meta_step_size", meta_step_size)
         self._h_decay_mode = h_decay_mode
 
     def to_config(self) -> dict[str, Any]:

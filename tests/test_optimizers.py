@@ -84,6 +84,14 @@ class TestIDBD:
         assert float(state.meta_step_size) == 0.0
         assert bool(jnp.all(jnp.isfinite(state.log_step_sizes)))
 
+    def test_positive_meta_step_size_must_survive_float32_narrowing(self) -> None:
+        with pytest.raises(ValueError, match="remain nonzero"):
+            IDBD(meta_step_size=1e-100)
+
+        smallest_subnormal = float(np.nextafter(np.float32(0.0), np.float32(1.0)))
+        state = IDBD(meta_step_size=smallest_subnormal).init(feature_dim=2)
+        assert float(state.meta_step_size) == smallest_subnormal
+
     def test_update_returns_correct_shapes(self, sample_observation):
         """IDBD update should return correctly shaped deltas."""
         optimizer = IDBD()
