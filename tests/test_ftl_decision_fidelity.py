@@ -19,7 +19,9 @@ from alberta_framework.evaluation.ftl_decision_fidelity import (
     CONDITION_NAMES,
     DEVELOPMENT_SEEDS,
     EVIDENCE_SEEDS,
+    BootstrapEstimate,
     DecisionFidelityConfig,
+    DecisionMetrics,
     evaluate_sparse_snapshot,
     precompute_decision_probes,
     run_ftl_decision_fidelity_evaluation,
@@ -451,3 +453,48 @@ def test_menu_resource_preflight_runs_before_element_hooks() -> None:
             horizon=2**31 - 1,
             menu_amplitudes=(hostile, hostile, hostile),  # type: ignore[arg-type]
         )
+
+
+def _legal_interval(**overrides: object) -> BootstrapEstimate:
+    payload: dict[str, object] = {
+        "estimate": 0.1,
+        "lower": 0.0,
+        "upper": 0.2,
+        "confidence_level": 0.95,
+        "resamples": 1_000,
+        "sample_size": 30,
+    }
+    payload.update(overrides)
+    return BootstrapEstimate(**payload)  # type: ignore[arg-type]
+
+
+def test_bootstrap_estimate_rejects_leftover_identities() -> None:
+    """Public interval records must not keep leftover bool/NaN identities."""
+
+    with pytest.raises(ValueError, match="resamples"):
+        _legal_interval(resamples=True)
+    with pytest.raises(ValueError, match="sample_size"):
+        _legal_interval(sample_size=False)
+    with pytest.raises(ValueError, match="estimate"):
+        _legal_interval(estimate=True)
+    with pytest.raises(ValueError, match="estimate"):
+        _legal_interval(estimate=float("nan"))
+    with pytest.raises(ValueError, match="upper"):
+        _legal_interval(upper=float("inf"))
+
+    legal = _legal_interval()
+    dumped = json.dumps(dataclasses.asdict(legal), allow_nan=False)
+    assert '"resamples": 1000' in dumped
+    assert '"resamples": true' not in dumped
+    assert '"estimate": 0.1' in dumped
+
+
+def test_decision_metrics_reject_leftover_identities() -> None:
+    with pytest.raises(ValueError, match="normalized_regret"):
+        DecisionMetrics("sparse_after_b", True, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    with pytest.raises(ValueError, match="reward_mae"):
+        DecisionMetrics("sparse_after_b", 0.0, 0.0, 0.0, 0.0, float("nan"), 0.0, 0.0)
+    metrics = DecisionMetrics("sparse_after_b", 0.1, 0.0, 0.2, 0.5, 0.25, 0.3, 0.05)
+    dumped = json.dumps({"normalized_regret": metrics.normalized_regret}, allow_nan=False)
+    assert '"normalized_regret": 0.1' in dumped
+    assert '"normalized_regret": true' not in dumped

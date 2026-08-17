@@ -106,6 +106,16 @@ def _require_uint32(name: str, value: object) -> int:
     return _require_int32(name, value, minimum=0, maximum=_UINT32_MAX)
 
 
+def _finite_real(name: str, value: object) -> float:
+    """Reject leftover bool and non-finite identities without narrowing."""
+    if type(value) is bool or type(value) not in (int, float):
+        raise ValueError(f"{name} must be a finite real number")
+    numeric = float(value)
+    if not math.isfinite(numeric):
+        raise ValueError(f"{name} must be a finite real number")
+    return numeric
+
+
 def _require_derived_int32(name: str, value: int) -> int:
     if value > _INT32_MAX:
         raise ValueError(f"derived {name} must be at most {_INT32_MAX}")
@@ -311,6 +321,20 @@ class DecisionMetrics:
     return_mae: float
     normalized_return_mae: float
 
+    def __post_init__(self) -> None:
+        if type(self.condition) is not str or not self.condition:
+            raise ValueError("condition must be a non-empty string")
+        for name in (
+            "normalized_regret",
+            "domain_a_normalized_regret",
+            "domain_b_normalized_regret",
+            "oracle_pick_rate",
+            "reward_mae",
+            "return_mae",
+            "normalized_return_mae",
+        ):
+            object.__setattr__(self, name, _finite_real(name, getattr(self, name)))
+
 
 @dataclass(frozen=True)
 class SeedDecisionResult:
@@ -334,6 +358,26 @@ class BootstrapEstimate:
     confidence_level: float
     resamples: int
     sample_size: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "estimate", _finite_real("estimate", self.estimate))
+        object.__setattr__(self, "lower", _finite_real("lower", self.lower))
+        object.__setattr__(self, "upper", _finite_real("upper", self.upper))
+        object.__setattr__(
+            self,
+            "confidence_level",
+            _finite_real("confidence_level", self.confidence_level),
+        )
+        object.__setattr__(
+            self,
+            "resamples",
+            _require_int32("resamples", self.resamples, minimum=1),
+        )
+        object.__setattr__(
+            self,
+            "sample_size",
+            _require_int32("sample_size", self.sample_size, minimum=1),
+        )
 
 
 @dataclass(frozen=True)
