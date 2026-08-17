@@ -870,3 +870,62 @@ class TestConfigRoundtrip:
         rebuilt = CBPMultiHeadMLPLearner.from_config(cfg)
         cfg2 = rebuilt.to_config()
         assert cfg2 == cfg
+
+
+class TestCBPWrapperConstructorIdentities:
+    """CBP replacement/activation copies reject bool and non-finite identities."""
+
+    @pytest.mark.parametrize(
+        ("kwargs", "match"),
+        [
+            ({"use_layer_norm": 1}, "use_layer_norm"),
+            ({"use_layer_norm": 0}, "use_layer_norm"),
+            ({"sparsity": True}, "sparsity"),
+            ({"sparsity": False}, "sparsity"),
+            ({"sparsity": float("nan")}, "sparsity"),
+            ({"sparsity": 1.1}, "sparsity"),
+            ({"leaky_relu_slope": True}, "leaky_relu_slope"),
+            ({"leaky_relu_slope": float("inf")}, "leaky_relu_slope"),
+            ({"leaky_relu_slope": -0.1}, "leaky_relu_slope"),
+        ],
+    )
+    def test_multihead_rejects_identity_aliases(
+        self, kwargs: dict[str, object], match: str
+    ) -> None:
+        with pytest.raises(ValueError, match=match):
+            CBPMultiHeadMLPLearner(n_heads=1, hidden_sizes=(4,), **kwargs)  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize(
+        ("kwargs", "match"),
+        [
+            ({"use_layer_norm": 1}, "use_layer_norm"),
+            ({"sparsity": True}, "sparsity"),
+            ({"leaky_relu_slope": True}, "leaky_relu_slope"),
+        ],
+    )
+    def test_single_head_adapter_rejects_identity_aliases(
+        self, kwargs: dict[str, object], match: str
+    ) -> None:
+        with pytest.raises(ValueError, match=match):
+            CBPMLPLearner(hidden_sizes=(4,), **kwargs)  # type: ignore[arg-type]
+
+    def test_tracker_rejects_boolean_sparsity(self) -> None:
+        with pytest.raises(ValueError, match="sparsity"):
+            ContinualBackpropTracker(
+                config=ContinualBackpropConfig(),
+                sparsity=True,  # type: ignore[arg-type]
+            )
+
+    def test_canonicalizes_numpy_sparsity_and_slope(self) -> None:
+        learner = CBPMultiHeadMLPLearner(
+            n_heads=1,
+            hidden_sizes=(4,),
+            sparsity=np.float64(0.25),
+            leaky_relu_slope=np.float32(0.02),
+            use_layer_norm=False,
+        )
+        assert type(learner._sparsity) is float
+        assert type(learner._leaky_relu_slope) is float
+        assert learner._sparsity == pytest.approx(0.25)
+        assert learner._leaky_relu_slope == pytest.approx(0.02)
+        assert learner._use_layer_norm is False
