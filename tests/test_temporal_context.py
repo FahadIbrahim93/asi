@@ -172,6 +172,20 @@ def test_finite_temporal_context_path_is_bitwise_unchanged() -> None:
     assert int(next_state.step_count) == 18
 
 
+def test_temporal_context_step_count_saturates_at_int32_max() -> None:
+    featurizer = TemporalContextFeaturizer(
+        TemporalContextConfig(input_dim=1, periods=())
+    )
+    state = TemporalContextState(
+        observation_ema=jnp.zeros((1,), dtype=jnp.float32),
+        step_count=jnp.asarray(np.iinfo(np.int32).max, dtype=jnp.int32),
+    )
+
+    next_state = featurizer.update(state, jnp.ones((1,), dtype=jnp.float32))
+
+    assert int(next_state.step_count) == np.iinfo(np.int32).max
+
+
 _INVALID_TEMPORAL_CONTEXT_CONFIGS: tuple[dict[str, object], ...] = (
     {"input_dim": 0},
     {"input_dim": -1},
