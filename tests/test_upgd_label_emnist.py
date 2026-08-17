@@ -457,6 +457,27 @@ def debug_run():
 
 class TestTinySmokeRun:
 
+    @pytest.mark.parametrize("progress_every", [0, -1, True, np.int64(1)])
+    def test_rejects_invalid_progress_interval_before_learner_setup(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        progress_every: object,
+    ) -> None:
+        def unexpected_setup(*args: object, **kwargs: object) -> None:
+            del args, kwargs
+            raise AssertionError("invalid progress interval reached learner setup")
+
+        monkeypatch.setattr(upgd_label_emnist, "resolve_hyperparameters", unexpected_setup)
+        with pytest.raises(ValueError, match="progress_every must be a positive integer"):
+            run_label_emnist(
+                np.empty((TINY.task_length, TINY.input_dim), dtype=np.float32),
+                np.zeros(TINY.task_length, dtype=np.int32),
+                "adamw",
+                seeds=[0],
+                config=TINY,
+                progress_every=progress_every,  # type: ignore[arg-type]
+            )
+
     def test_shapes_and_bounds(self, debug_run):
         assert debug_run.per_task_accuracy.shape == (2, TINY.n_tasks)
         assert debug_run.per_step_accuracy.shape == (2, TINY.n_tasks, TINY.task_length)

@@ -496,6 +496,10 @@ def run_label_emnist(
     Returns:
         Host-side result arrays; see :class:`LabelEMNISTRunResult`.
     """
+    if progress_every is not None and (
+        type(progress_every) is not int or progress_every <= 0
+    ):
+        raise ValueError("progress_every must be a positive integer or None")
     seed_tuple = require_unique_jax_seeds(seeds, name="seeds")
     if config is None:
         config = LabelEMNISTConfig()
