@@ -53,6 +53,7 @@ from __future__ import annotations
 import functools
 import operator
 import time
+from collections.abc import Mapping
 from typing import Any, SupportsIndex, cast
 
 import chex
@@ -62,6 +63,7 @@ import numpy as np
 from jax import Array
 from jaxtyping import Bool, Float, Int
 
+from alberta_framework.core._float32_scalars import validated_float32_scalar
 from alberta_framework.core.types import Observation
 from alberta_framework.core.update_safety import (
     floating_tree_is_finite as _floating_tree_is_finite,
@@ -83,6 +85,9 @@ _ACTUAL_INT_TYPES = frozenset(
         np.ulonglong,
     }
 )
+_TRUSTED_REAL_TYPES = (
+    _ACTUAL_INT_TYPES | frozenset(np.dtype(code).type for code in ("e", "f", "d", "g")) | {float}
+)
 
 
 def _require_int32(name: str, value: object, *, minimum: int, maximum: int = _INT32_MAX) -> int:
@@ -92,6 +97,52 @@ def _require_int32(name: str, value: object, *, minimum: int, maximum: int = _IN
     if not minimum <= canonical <= maximum:
         raise ValueError(f"{name} must be an integer in [{minimum}, {maximum}]")
     return canonical
+
+
+def _require_float32(name: str, value: object, **bounds: Any) -> float:
+    if type(value) not in _TRUSTED_REAL_TYPES:
+        raise ValueError(f"{name} must be a finite real scalar")
+    return validated_float32_scalar(name, value, **bounds)
+
+
+def _require_positive_clip(name: str, value: object) -> float:
+    if type(value) not in _TRUSTED_REAL_TYPES:
+        raise ValueError(f"{name} must be a positive real scalar")
+    concrete = float(cast(Any, value))
+    if concrete == float("inf"):
+        return concrete
+    return validated_float32_scalar(name, value, positive=True)
+
+
+def _require_state_resources(name: str, *, scalars: int, bytes_: int) -> None:
+    if scalars > _INT32_MAX:
+        raise ValueError(f"derived {name} state scalars must fit signed int32")
+    if bytes_ > _INT32_MAX:
+        raise ValueError(f"derived {name} state bytes must fit signed int32")
+
+
+def _serialized_payload(
+    config: Mapping[str, Any], *, type_name: str, fields: frozenset[str]
+) -> dict[str, Any]:
+    if not issubclass(type(config), Mapping):
+        raise ValueError("config must be an actual mapping")
+    try:
+        payload = dict(config)
+    except Exception as error:
+        raise ValueError("config must be a readable mapping") from error
+    if any(type(key) is not str for key in payload) or set(payload) != fields | {"type"}:
+        raise ValueError("config fields do not match the serialized schema")
+    marker = payload.pop("type")
+    if type(marker) is not str or marker != type_name:
+        raise ValueError("config type differs")
+    if any(type(value) not in (int, float) for value in payload.values()):
+        raise ValueError("serialized scalar fields must be exact JSON numbers")
+    return payload
+
+
+def _saturating_increment(value: Array) -> Array:
+    maximum = jnp.asarray(_INT32_MAX, dtype=jnp.int32)
+    return jnp.minimum(jnp.maximum(value, 0), maximum - 1) + 1
 
 
 def _skip_zero_scale(scale: Array, value: Array) -> Array:
@@ -286,15 +337,9 @@ class OffPolicyTDLinearLearner:
             retrace_clip: Maximum allowed importance ratio (default 1.0;
                 pass float("inf") to disable clipping).
         """
-        if step_size <= 0:
-            raise ValueError(f"step_size must be positive; got {step_size}")
-        if not 0.0 <= trace_decay <= 1.0:
-            raise ValueError(f"trace_decay must lie in [0, 1]; got {trace_decay}")
-        if retrace_clip <= 0:
-            raise ValueError(f"retrace_clip must be positive; got {retrace_clip}")
-        self._step_size = step_size
-        self._trace_decay = trace_decay
-        self._retrace_clip = retrace_clip
+        self._step_size = _require_float32("step_size", step_size, positive=True)
+        self._trace_decay = _require_float32("trace_decay", trace_decay, lower=0.0, upper=1.0)
+        self._retrace_clip = _require_positive_clip("retrace_clip", retrace_clip)
 
     @property
     def step_size(self) -> float:
@@ -314,6 +359,9 @@ class OffPolicyTDLinearLearner:
     def init(self, feature_dim: int) -> OffPolicyTDState:
         """Initialize learner state with zero weights and zero traces."""
         feature_dim = _require_int32("feature_dim", feature_dim, minimum=1)
+        _require_state_resources(
+            "OffPolicyTD", scalars=2 * feature_dim + 5, bytes_=8 * feature_dim + 20
+        )
         return OffPolicyTDState(  # type: ignore[call-arg]
             weights=jnp.zeros(feature_dim, dtype=jnp.float32),
             bias=jnp.array(0.0, dtype=jnp.float32),
@@ -384,7 +432,7 @@ class OffPolicyTDLinearLearner:
             bias=state.bias + scaled_update * new_e_b,
             eligibility_traces=new_e,
             bias_eligibility_trace=new_e_b,
-            step_count=state.step_count + 1,
+            step_count=_saturating_increment(state.step_count),
             birth_timestamp=state.birth_timestamp,
             uptime_s=state.uptime_s,
         )
@@ -439,11 +487,15 @@ class OffPolicyTDLinearLearner:
         }
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> OffPolicyTDLinearLearner:
+    def from_config(cls, config: Mapping[str, Any]) -> OffPolicyTDLinearLearner:
         """Reconstruct from dict."""
-        config = dict(config)
-        config.pop("type", None)
-        return cls(**config)
+        return cls(
+            **_serialized_payload(
+                config,
+                type_name=cls.__name__,
+                fields=frozenset({"step_size", "trace_decay", "retrace_clip"}),
+            )
+        )
 
 
 class ETDLinearLearner:
@@ -477,12 +529,8 @@ class ETDLinearLearner:
             step_size: Learning rate alpha (scalar)
             trace_decay: Eligibility trace decay lambda in [0, 1]
         """
-        if step_size <= 0:
-            raise ValueError(f"step_size must be positive; got {step_size}")
-        if not 0.0 <= trace_decay <= 1.0:
-            raise ValueError(f"trace_decay must lie in [0, 1]; got {trace_decay}")
-        self._step_size = step_size
-        self._trace_decay = trace_decay
+        self._step_size = _require_float32("step_size", step_size, positive=True)
+        self._trace_decay = _require_float32("trace_decay", trace_decay, lower=0.0, upper=1.0)
 
     @property
     def step_size(self) -> float:
@@ -497,6 +545,7 @@ class ETDLinearLearner:
     def init(self, feature_dim: int) -> ETDState:
         """Initialize learner state with zero weights and zero traces."""
         feature_dim = _require_int32("feature_dim", feature_dim, minimum=1)
+        _require_state_resources("ETD", scalars=2 * feature_dim + 7, bytes_=8 * feature_dim + 28)
         return ETDState(  # type: ignore[call-arg]
             weights=jnp.zeros(feature_dim, dtype=jnp.float32),
             bias=jnp.array(0.0, dtype=jnp.float32),
@@ -567,7 +616,7 @@ class ETDLinearLearner:
             bias_eligibility_trace=new_e_b,
             follow_on_trace=follow_on,
             emphasis=emphasis,
-            step_count=state.step_count + 1,
+            step_count=_saturating_increment(state.step_count),
             birth_timestamp=state.birth_timestamp,
             uptime_s=state.uptime_s,
         )
@@ -623,11 +672,15 @@ class ETDLinearLearner:
         }
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> ETDLinearLearner:
+    def from_config(cls, config: Mapping[str, Any]) -> ETDLinearLearner:
         """Reconstruct from dict."""
-        config = dict(config)
-        config.pop("type", None)
-        return cls(**config)
+        return cls(
+            **_serialized_payload(
+                config,
+                type_name=cls.__name__,
+                fields=frozenset({"step_size", "trace_decay"}),
+            )
+        )
 
 
 class GradientTDLinearLearner:
@@ -655,18 +708,12 @@ class GradientTDLinearLearner:
         ratio_clip: float = 10.0,
     ):
         """Initialize the learner."""
-        if step_size <= 0.0:
-            raise ValueError(f"step_size must be positive; got {step_size}")
-        if secondary_step_size < 0.0:
-            raise ValueError(f"secondary_step_size must be non-negative; got {secondary_step_size}")
-        if not 0.0 <= trace_decay <= 1.0:
-            raise ValueError(f"trace_decay must lie in [0, 1]; got {trace_decay}")
-        if ratio_clip <= 0.0:
-            raise ValueError(f"ratio_clip must be positive; got {ratio_clip}")
-        self._step_size = step_size
-        self._secondary_step_size = secondary_step_size
-        self._trace_decay = trace_decay
-        self._ratio_clip = ratio_clip
+        self._step_size = _require_float32("step_size", step_size, positive=True)
+        self._secondary_step_size = _require_float32(
+            "secondary_step_size", secondary_step_size, lower=0.0
+        )
+        self._trace_decay = _require_float32("trace_decay", trace_decay, lower=0.0, upper=1.0)
+        self._ratio_clip = _require_positive_clip("ratio_clip", ratio_clip)
 
     @property
     def step_size(self) -> float:
@@ -690,8 +737,11 @@ class GradientTDLinearLearner:
 
     def init(self, feature_dim: int) -> GradientTDState:
         """Initialize primary weights, secondary weights, and traces."""
-        feature_dim = _require_int32("feature_dim", feature_dim, minimum=1)
+        feature_dim = _require_int32("feature_dim", feature_dim, minimum=1, maximum=_INT32_MAX - 1)
         augmented_dim = feature_dim + 1
+        _require_state_resources(
+            "GradientTD", scalars=3 * augmented_dim + 3, bytes_=12 * augmented_dim + 12
+        )
         return GradientTDState(  # type: ignore[call-arg]
             weights=jnp.zeros(augmented_dim, dtype=jnp.float32),
             secondary_weights=jnp.zeros(augmented_dim, dtype=jnp.float32),
@@ -756,7 +806,7 @@ class GradientTDLinearLearner:
             weights=state.weights + primary_step,
             secondary_weights=state.secondary_weights + secondary_step,
             eligibility_traces=traces,
-            step_count=state.step_count + 1,
+            step_count=_saturating_increment(state.step_count),
             birth_timestamp=state.birth_timestamp,
             uptime_s=state.uptime_s,
         )
@@ -815,11 +865,15 @@ class GradientTDLinearLearner:
         }
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> GradientTDLinearLearner:
+    def from_config(cls, config: Mapping[str, Any]) -> GradientTDLinearLearner:
         """Reconstruct from dict."""
-        config = dict(config)
-        config.pop("type", None)
-        return cls(**config)
+        return cls(
+            **_serialized_payload(
+                config,
+                type_name=cls.__name__,
+                fields=frozenset({"step_size", "secondary_step_size", "trace_decay", "ratio_clip"}),
+            )
+        )
 
 
 def run_gradient_td_learning_loop(

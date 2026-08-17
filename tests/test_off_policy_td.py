@@ -861,3 +861,46 @@ def test_off_policy_td_learners_integer_validation() -> None:
     assert s_etd.weights.shape == (4,)
     assert s_gtd.weights.shape == (5,)
     assert s_gtd.secondary_weights.shape == (5,)
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [OffPolicyTDLinearLearner, ETDLinearLearner, GradientTDLinearLearner],
+)
+def test_off_policy_td_configs_reject_hostile_scalars_without_hooks(factory: type) -> None:
+    calls = 0
+
+    class HostileFloat(float):
+        def as_integer_ratio(self) -> tuple[int, int]:
+            nonlocal calls
+            calls += 1
+            raise AssertionError("hostile hook ran")
+
+    with pytest.raises(ValueError, match="finite real scalar"):
+        factory(step_size=HostileFloat(0.1))
+    assert calls == 0
+
+
+@pytest.mark.parametrize(
+    "learner",
+    [OffPolicyTDLinearLearner(), ETDLinearLearner(), GradientTDLinearLearner()],
+)
+def test_off_policy_td_serialized_schema_is_exact(learner: object) -> None:
+    config = learner.to_config()  # type: ignore[attr-defined]
+    assert type(learner).from_config(config).to_config() == config
+    with pytest.raises(ValueError, match="schema"):
+        type(learner).from_config({**config, "unknown": 1})
+    with pytest.raises(ValueError, match="type"):
+        type(learner).from_config({**config, "type": "wrong"})
+    scalar = next(name for name in config if name != "type")
+    with pytest.raises(ValueError, match="exact JSON"):
+        type(learner).from_config({**config, scalar: np.float32(config[scalar])})
+
+
+def test_off_policy_td_preflights_complete_state_bytes_before_allocation() -> None:
+    with pytest.raises(ValueError, match="state bytes"):
+        OffPolicyTDLinearLearner().init((2**31 - 1) // 8)
+    with pytest.raises(ValueError, match="state bytes"):
+        ETDLinearLearner().init((2**31 - 1) // 8)
+    with pytest.raises(ValueError, match="state bytes"):
+        GradientTDLinearLearner().init((2**31 - 1) // 12)

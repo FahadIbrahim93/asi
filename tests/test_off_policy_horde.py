@@ -655,3 +655,53 @@ def test_nonlinear_shared_gtd_horde_integer_validation() -> None:
 
     state = learner.init(feature_dim=np.int32(4), key=key)
     assert state.trunk_w.shape == (16, 4)
+
+
+def test_nonlinear_shared_gtd_horde_complete_scalar_and_schema_contract() -> None:
+    calls = 0
+
+    class HostileFloat(float):
+        def as_integer_ratio(self) -> tuple[int, int]:
+            nonlocal calls
+            calls += 1
+            raise AssertionError("hostile hook ran")
+
+    with pytest.raises(ValueError, match="finite real scalar"):
+        NonlinearSharedGTDHordeLearner(_spec(), primary_step_size=HostileFloat(0.1))
+    assert calls == 0
+
+    learner = NonlinearSharedGTDHordeLearner(
+        _spec(),
+        hidden_size=np.uint16(4),
+        primary_step_size=np.float64(0.01),
+    )
+    config = learner.to_config()
+    restored = NonlinearSharedGTDHordeLearner.from_config(config)
+    assert restored.to_config() == config
+    with pytest.raises(ValueError, match="schema"):
+        NonlinearSharedGTDHordeLearner.from_config({**config, "unknown": 1})
+    with pytest.raises(ValueError, match="type"):
+        NonlinearSharedGTDHordeLearner.from_config({**config, "type": "wrong"})
+
+
+def test_nonlinear_shared_gtd_horde_preflights_aggregate_state_bytes() -> None:
+    learner = NonlinearSharedGTDHordeLearner(_spec(), hidden_size=16)
+    with pytest.raises(ValueError, match="persistent state bytes"):
+        learner.init(20_000_000, jax.random.key(0))
+
+
+def test_nonlinear_shared_gtd_horde_outer_counter_saturates() -> None:
+    learner = NonlinearSharedGTDHordeLearner(_spec(gammas=(0.0,)), hidden_size=2)
+    state = learner.init(2, jax.random.key(0)).replace(
+        step_count=jnp.asarray(2**31 - 1, dtype=jnp.int32)
+    )
+    result = learner.update_with_ratios_and_discounts(
+        state,
+        jnp.ones(2, dtype=jnp.float32),
+        jnp.ones(1, dtype=jnp.float32),
+        jnp.ones(2, dtype=jnp.float32),
+        jnp.ones(1, dtype=jnp.float32),
+        jnp.zeros(1, dtype=jnp.float32),
+    )
+    assert bool(result.update_applied)
+    assert int(result.state.step_count) == 2**31 - 1

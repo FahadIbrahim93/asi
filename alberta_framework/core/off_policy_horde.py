@@ -13,6 +13,7 @@ from __future__ import annotations
 import functools
 import operator
 import time
+from collections.abc import Mapping
 from typing import Any, SupportsIndex, cast
 
 import chex
@@ -22,6 +23,7 @@ import numpy as np
 from jax import Array
 from jaxtyping import Bool, Float
 
+from alberta_framework.core._float32_scalars import validated_float32_scalar
 from alberta_framework.core.learners import _update_from_gradient_with_diagnostics
 from alberta_framework.core.multi_head_learner import (
     AnyOptimizer,
@@ -56,6 +58,9 @@ _ACTUAL_INT_TYPES = frozenset(
         np.ulonglong,
     }
 )
+_TRUSTED_REAL_TYPES = (
+    _ACTUAL_INT_TYPES | frozenset(np.dtype(code).type for code in ("e", "f", "d", "g")) | {float}
+)
 
 
 def _require_int32(name: str, value: object, *, minimum: int, maximum: int = _INT32_MAX) -> int:
@@ -65,6 +70,31 @@ def _require_int32(name: str, value: object, *, minimum: int, maximum: int = _IN
     if not minimum <= canonical <= maximum:
         raise ValueError(f"{name} must be an integer in [{minimum}, {maximum}]")
     return canonical
+
+
+def _require_float32(name: str, value: object, **bounds: Any) -> float:
+    if type(value) not in _TRUSTED_REAL_TYPES:
+        raise ValueError(f"{name} must be a finite real scalar")
+    return validated_float32_scalar(name, value, **bounds)
+
+
+def _preflight_nonlinear_state(*, n_demons: int, hidden_size: int, feature_dim: int) -> None:
+    hidden_features = hidden_size * feature_dim
+    demon_hidden_features = n_demons * hidden_features
+    demon_hidden = n_demons * hidden_size
+    float_scalars = (
+        hidden_features * (n_demons + 1) + hidden_size + 3 * demon_hidden + 2 * n_demons + 2
+    )
+    logical_scalars = float_scalars + 1
+    for name, value in (
+        ("trunk weight scalars", hidden_features),
+        ("secondary trunk weight scalars", demon_hidden_features),
+        ("demon-hidden scalars", demon_hidden),
+        ("persistent state scalars", logical_scalars),
+        ("persistent state bytes", 4 * logical_scalars),
+    ):
+        if not 1 <= value <= _INT32_MAX:
+            raise ValueError(f"derived nonlinear Horde {name} must fit signed int32")
 
 
 def _skip_zero_scale(scale: Array, value: Array) -> Array:
@@ -916,21 +946,24 @@ class NonlinearSharedGTDHordeLearner:
         ratio_clip: float = 10.0,
         init_scale: float = 0.25,
     ) -> None:
+        if type(horde_spec) is not HordeSpec:
+            raise ValueError("horde_spec must be an exact HordeSpec")
+        if not horde_spec.demons:
+            raise ValueError("horde_spec must contain at least one demon")
         hidden_size = _require_int32("hidden_size", hidden_size, minimum=1)
-        if primary_step_size <= 0.0:
-            raise ValueError("primary_step_size must be positive")
-        if secondary_step_size <= 0.0:
-            raise ValueError("secondary_step_size must be positive")
-        if ratio_clip <= 0.0:
-            raise ValueError("ratio_clip must be positive")
-        if init_scale <= 0.0:
-            raise ValueError("init_scale must be positive")
         self._horde_spec = horde_spec
         self._hidden_size = hidden_size
-        self._primary_step_size = primary_step_size
-        self._secondary_step_size = secondary_step_size
-        self._ratio_clip = ratio_clip
-        self._init_scale = init_scale
+        self._primary_step_size = _require_float32(
+            "primary_step_size", primary_step_size, positive=True
+        )
+        self._secondary_step_size = _require_float32(
+            "secondary_step_size", secondary_step_size, positive=True
+        )
+        self._ratio_clip = _require_float32("ratio_clip", ratio_clip, positive=True)
+        self._init_scale = _require_float32("init_scale", init_scale, positive=True)
+        _preflight_nonlinear_state(
+            n_demons=len(horde_spec.demons), hidden_size=hidden_size, feature_dim=1
+        )
 
     @property
     def horde_spec(self) -> HordeSpec:
@@ -942,9 +975,90 @@ class NonlinearSharedGTDHordeLearner:
         """Number of demons."""
         return len(self._horde_spec.demons)
 
+    def to_config(self) -> dict[str, Any]:
+        """Serialize the complete nonlinear Horde construction."""
+        return {
+            "type": self.__class__.__name__,
+            "horde_spec": self._horde_spec.to_config(),
+            "hidden_size": self._hidden_size,
+            "primary_step_size": self._primary_step_size,
+            "secondary_step_size": self._secondary_step_size,
+            "ratio_clip": self._ratio_clip,
+            "init_scale": self._init_scale,
+        }
+
+    @classmethod
+    def from_config(cls, config: Mapping[str, Any]) -> NonlinearSharedGTDHordeLearner:
+        """Reconstruct the exact serialized nonlinear Horde schema."""
+        if not issubclass(type(config), Mapping):
+            raise ValueError("config must be an actual mapping")
+        try:
+            payload = dict(config)
+        except Exception as error:
+            raise ValueError("config must be a readable mapping") from error
+        expected = {
+            "type",
+            "horde_spec",
+            "hidden_size",
+            "primary_step_size",
+            "secondary_step_size",
+            "ratio_clip",
+            "init_scale",
+        }
+        if any(type(key) is not str for key in payload) or set(payload) != expected:
+            raise ValueError("config fields do not match the serialized schema")
+        marker = payload.pop("type")
+        if type(marker) is not str or marker != cls.__name__:
+            raise ValueError("config type differs")
+        raw_horde = payload.pop("horde_spec")
+        if type(raw_horde) is not dict or set(raw_horde) != {"demons"}:
+            raise ValueError("serialized horde_spec does not match its schema")
+        if type(raw_horde["demons"]) is not list:
+            raise ValueError("serialized horde_spec demons must be an exact list")
+        demon_fields = {
+            "name",
+            "demon_type",
+            "gamma",
+            "lamda",
+            "cumulant_index",
+            "terminal_reward",
+        }
+        for demon in raw_horde["demons"]:
+            if (
+                type(demon) is not dict
+                or any(type(key) is not str for key in demon)
+                or set(demon) != demon_fields
+            ):
+                raise ValueError("serialized demon does not match the exact schema")
+            if (
+                type(demon["name"]) is not str
+                or type(demon["demon_type"]) is not str
+                or type(demon["cumulant_index"]) is not int
+                or any(
+                    type(demon[name]) is not float for name in ("gamma", "lamda", "terminal_reward")
+                )
+            ):
+                raise ValueError("serialized demon scalar types must be exact JSON values")
+        if type(payload["hidden_size"]) is not int or any(
+            type(payload[name]) is not float
+            for name in (
+                "primary_step_size",
+                "secondary_step_size",
+                "ratio_clip",
+                "init_scale",
+            )
+        ):
+            raise ValueError("serialized scalar fields must be exact JSON numbers")
+        return cls(horde_spec=HordeSpec.from_config(raw_horde), **payload)
+
     def init(self, feature_dim: int, key: Array) -> NonlinearSharedGTDHordeState:
         """Initialize primary and secondary weights."""
         feature_dim = _require_int32("feature_dim", feature_dim, minimum=1)
+        _preflight_nonlinear_state(
+            n_demons=self.n_demons,
+            hidden_size=self._hidden_size,
+            feature_dim=feature_dim,
+        )
         trunk_key, head_key = jax.random.split(key)
         trunk_w = self._init_scale * jax.random.normal(
             trunk_key,
@@ -1148,7 +1262,7 @@ class NonlinearSharedGTDHordeLearner:
             secondary_trunk_b=jnp.stack(new_secondary_trunk_b),
             secondary_head_w=jnp.stack(new_secondary_head_w),
             secondary_head_b=jnp.stack(new_secondary_head_b),
-            step_count=state.step_count + 1,
+            step_count=_saturating_int32_counter_increment(state.step_count),
         )
         candidate_state_finite = _floating_tree_is_finite(proposed_state)
         update_applied = (
