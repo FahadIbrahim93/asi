@@ -17,7 +17,7 @@ import numpy as np
 from jax import Array
 from jaxtyping import Bool, Float
 
-from alberta_framework._float32 import round_real_to_float32
+from alberta_framework._float32 import round_real_to_float32_with_ratio
 
 _ACTUAL_DECAY_TYPES = frozenset(
     {
@@ -35,15 +35,29 @@ def _skip_zero_scale(scale: Array, value: Array) -> Array:
 
 
 def canonical_float32_ema_decay(name: str, value: object) -> float:
-    """Validate and canonicalize an EMA decay at its float32 execution sink."""
+    """Validate an exact EMA decay and canonicalize its float32 execution value.
+
+    The exact-ratio checks retain domain facts that float32 narrowing can erase:
+    a tiny negative must not become an accepted ``-0.0``, and a positive decay
+    must not silently become the disabled-decay endpoint ``0.0``.
+    """
     message = f"{name} must narrow to a finite float32 in [0, 1)"
     if type(value) not in _ACTUAL_DECAY_TYPES:
         raise ValueError(message)
     try:
-        narrowed = round_real_to_float32(cast(Real, value))
+        numerator, denominator, narrowed = round_real_to_float32_with_ratio(
+            cast(Real, value)
+        )
     except (OverflowError, TypeError, ValueError) as error:
         raise ValueError(message) from error
-    if not math.isfinite(narrowed) or not 0.0 <= narrowed < 1.0:
+    exact_in_domain = 0 <= numerator < denominator
+    positive_underflow = numerator > 0 and narrowed == 0.0
+    if (
+        not exact_in_domain
+        or positive_underflow
+        or not math.isfinite(narrowed)
+        or not 0.0 <= narrowed < 1.0
+    ):
         raise ValueError(message)
     return narrowed
 
