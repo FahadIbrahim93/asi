@@ -951,6 +951,11 @@ class MicroRunResult:
     wall_clock_seconds: float
 
     def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "family",
+            _require_nonempty_string(self.family, context="MicroRunResult.family"),
+        )
         _require_nonempty_string(self.arm_name, context="MicroRunResult.arm_name")
         _require_nonempty_string(self.mechanism, context="MicroRunResult.mechanism")
         object.__setattr__(
@@ -958,6 +963,31 @@ class MicroRunResult:
             "hyperparameters",
             _freeze_micro_hyperparameters(
                 self.hyperparameters, context="MicroRunResult.hyperparameters"
+            ),
+        )
+        object.__setattr__(
+            self, "seed", require_jax_seed(self.seed, name="MicroRunResult.seed")
+        )
+        object.__setattr__(
+            self,
+            "hidden1",
+            _require_positive_int32(self.hidden1, name="MicroRunResult.hidden1"),
+        )
+        object.__setattr__(
+            self,
+            "hidden2",
+            _require_positive_int32(self.hidden2, name="MicroRunResult.hidden2"),
+        )
+        object.__setattr__(
+            self,
+            "overall_accuracy",
+            _require_finite_real(self.overall_accuracy, "MicroRunResult.overall_accuracy"),
+        )
+        object.__setattr__(
+            self,
+            "wall_clock_seconds",
+            _require_finite_real(
+                self.wall_clock_seconds, "MicroRunResult.wall_clock_seconds"
             ),
         )
 
