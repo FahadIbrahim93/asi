@@ -141,7 +141,7 @@ def _legal_step1_smoke_result(**overrides: object) -> Step1SmokeResult:
         "steps": 8,
         "seed": 0,
         "final_window_mse": 0.25,
-        "metrics_shape": (8, 2),
+        "metrics_shape": (8, 4),
         "finite": True,
     }
     payload.update(overrides)
