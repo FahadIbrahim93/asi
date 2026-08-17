@@ -1028,8 +1028,9 @@ class AverageRewardHordeLearner:
         leaky_relu_slope: float = 0.01,
     ):
         """Initialize the average-reward Horde."""
-        if n_demons < 1:
-            raise ValueError("n_demons must be positive")
+        n_demons = _require_int32("n_demons", n_demons, minimum=1)
+        hidden_sizes = _validate_hidden_sizes(hidden_sizes)
+        step_size = _validated_nonnegative_float32_scalar("step_size", step_size)
         average_reward_step_size = _validated_nonnegative_float32_scalar(
             "average_reward_step_size",
             average_reward_step_size,
@@ -1039,6 +1040,10 @@ class AverageRewardHordeLearner:
             trace_decay,
             upper=1.0,
         )
+        sparsity = validated_float32_scalar("sparsity", sparsity, lower=0.0, upper=1.0)
+        leaky_relu_slope = validated_float32_scalar("leaky_relu_slope", leaky_relu_slope, lower=0.0)
+        if type(use_layer_norm) is not bool:
+            raise ValueError("use_layer_norm must be an actual bool")
         self._n_demons = n_demons
         self._hidden_sizes = hidden_sizes
         self._step_size = step_size
