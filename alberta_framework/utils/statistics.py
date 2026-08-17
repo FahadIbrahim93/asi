@@ -5,15 +5,21 @@ effect sizes, and multiple comparison corrections.
 """
 
 import math
+import operator
 from collections.abc import Mapping
 from numbers import Real
-from typing import TYPE_CHECKING, NamedTuple, cast
+from typing import TYPE_CHECKING, NamedTuple, SupportsIndex, cast
 
 import numpy as np
 from numpy.typing import NDArray
 
 if TYPE_CHECKING:
     from alberta_framework.utils.experiments import AggregatedResults
+
+
+_ACTUAL_INT_TYPES = frozenset(
+    {int, *(np.dtype(code).type for code in "bBhHiIlLqQpP")}
+)
 
 
 class StatisticalSummary(NamedTuple):
@@ -112,6 +118,16 @@ def _require_probability(value: object, *, name: str, strict: bool) -> float:
 
 def _require_alpha(alpha: object) -> float:
     return _require_probability(alpha, name="alpha", strict=True)
+
+
+def _require_positive_int(name: str, value: object) -> int:
+    """Reject bool/float aliases that ordered comparisons treat as legal counts."""
+    if type(value) not in _ACTUAL_INT_TYPES:
+        raise ValueError(f"{name} must be a positive integer")
+    count = operator.index(cast(SupportsIndex, value))
+    if count <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return count
 
 
 def _require_p_value(value: object, *, name: str) -> float:
@@ -666,8 +682,7 @@ def pairwise_comparisons(
     from alberta_framework.utils.experiments import AggregatedResults
 
     alpha_value = _require_alpha(alpha)
-    if window <= 0:
-        raise ValueError(f"window must be positive (got {window})")
+    window = _require_positive_int("window", window)
 
     names = list(results.keys())
     n = len(names)
@@ -817,8 +832,7 @@ def bootstrap_ci(
             f"statistic must be either 'mean' or 'median' (got {statistic!r})"
         )
     _validate_confidence_level(confidence_level)
-    if n_bootstrap <= 0:
-        raise ValueError(f"n_bootstrap must be positive (got {n_bootstrap})")
+    n_bootstrap = _require_positive_int("n_bootstrap", n_bootstrap)
     rng = np.random.default_rng(seed)
 
     stat_func = np.mean if statistic == "mean" else np.median
