@@ -1054,14 +1054,19 @@ class MLPLearner:
         track_neuron_utility = _require_exact_bool(
             "track_neuron_utility", track_neuron_utility
         )
-        self._optimizer: AnyOptimizer = optimizer or LMS(step_size=step_size)
+        self._optimizer: AnyOptimizer = (
+            optimizer if optimizer is not None else LMS(step_size=step_size)
+        )
         self._head_optimizer: AnyOptimizer | None = head_optimizer
-        if not self._optimizer.supported_for_mlp():
+        if self._optimizer.supported_for_mlp() is not True:
             raise ValueError(
                 f"optimizer {type(self._optimizer).__name__} does not support the MLP "
                 "shape-generic update API"
             )
-        if self._head_optimizer is not None and not self._head_optimizer.supported_for_mlp():
+        if (
+            self._head_optimizer is not None
+            and self._head_optimizer.supported_for_mlp() is not True
+        ):
             raise ValueError(
                 f"head_optimizer {type(self._head_optimizer).__name__} does not support the MLP "
                 "shape-generic update API"
@@ -1236,6 +1241,8 @@ class MLPLearner:
             optimizer_from_config,
         )
 
+        if type(config) is not dict or any(type(key) is not str for key in config):
+            raise ValueError("MLPLearner config must be a plain dict with exact string keys")
         config = dict(config)
         config.pop("type", None)
 

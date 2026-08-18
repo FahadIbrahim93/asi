@@ -1465,6 +1465,27 @@ class TestMLPLearnerConstructorScalars:
         with pytest.raises(ValueError, match="sparsity"):
             MLPLearner(hidden_sizes=(8,), sparsity=Spoof())  # type: ignore[arg-type]
 
+    def test_optimizer_selection_does_not_invoke_truthiness(self) -> None:
+        class HostileLMS(LMS):
+            calls = 0
+
+            def __bool__(self) -> bool:
+                type(self).calls += 1
+                raise AssertionError("optimizer truth hook executed")
+
+        optimizer = HostileLMS(0.1)
+        learner = MLPLearner(hidden_sizes=(8,), optimizer=optimizer)
+        assert learner._optimizer is optimizer
+        assert HostileLMS.calls == 0
+
+    def test_from_config_requires_exact_outer_schema_identities(self) -> None:
+        class HostileDict(dict[str, object]):
+            def __iter__(self):  # type: ignore[no-untyped-def, override]
+                raise AssertionError("config iteration hook executed")
+
+        with pytest.raises(ValueError, match="plain dict"):
+            MLPLearner.from_config(HostileDict())  # type: ignore[arg-type]
+
     @pytest.mark.parametrize(
         "kwargs",
         [
