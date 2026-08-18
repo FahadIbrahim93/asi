@@ -197,6 +197,7 @@ def _prediction_demon_from_config(config: object, *, index: int) -> GVFSpec:
 
 
 def _preflight_sarsa_direct_state(
+    n_actions: int,
     n_heads: int,
     hidden_sizes: tuple[int, ...],
     feature_dim: int,
@@ -213,12 +214,19 @@ def _preflight_sarsa_direct_state(
     # last_observation, last_action, epsilon, step_count, and the two-word
     # Threefry key are all four-byte public-state leaves.
     aggregate_scalars = horde_direct_scalars + feature_dim + 5
+    persist_bytes = 4 * aggregate_scalars
     for name, value in (
         ("aggregate_direct_state_scalars", aggregate_scalars),
-        ("aggregate_direct_state_bytes", 4 * aggregate_scalars),
+        ("aggregate_direct_state_bytes", persist_bytes),
     ):
         if not 1 <= value <= _INT32_MAX:
             raise ValueError(f"derived SARSA {name} must be at most {_INT32_MAX}")
+    # Source persist, proposed persist, and returned action/Q/td/reward extras.
+    # Prediction heads are persisted but update() returns Q values only for
+    # the control-action prefix.
+    update_working_set_bytes = 2 * persist_bytes + 12 + 4 * n_actions
+    if update_working_set_bytes > _INT32_MAX:
+        raise ValueError("SARSA update working set byte count must fit signed int32")
 
 
 @chex.dataclass(frozen=True)
@@ -534,7 +542,12 @@ class SARSAAgent:
             _require_int32(f"hidden_sizes[{index}]", width, minimum=1)
             for index, width in enumerate(hidden_sizes)
         )
-        _preflight_sarsa_direct_state(total_heads, canonical_hidden, 1)
+        _preflight_sarsa_direct_state(
+            sarsa_config.n_actions,
+            total_heads,
+            canonical_hidden,
+            1,
+        )
 
         self._sarsa_config = sarsa_config
         self._hidden_sizes = canonical_hidden
@@ -727,6 +740,7 @@ class SARSAAgent:
         """
         feature_dim = _require_int32("feature_dim", feature_dim, minimum=1)
         _preflight_sarsa_direct_state(
+            self.n_actions,
             self._horde.n_demons,
             self._hidden_sizes,
             feature_dim,
