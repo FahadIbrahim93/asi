@@ -188,6 +188,23 @@ from alberta_framework.core.update_safety import (
     floating_tree_is_finite,
     select_transaction,
 )
+from alberta_framework.evaluation.bounded_elastic_ipmnist_nonpromoting import (
+    COMPARISON_ID as BOUNDED_ELASTIC_COMPARISON_ID,
+)
+from alberta_framework.evaluation.bounded_elastic_ipmnist_nonpromoting import (
+    PAPER_REVISION as BOUNDED_ELASTIC_PAPER_REVISION,
+)
+from alberta_framework.evaluation.bounded_elastic_ipmnist_nonpromoting import (
+    PAPER_SOURCE_SHA256 as BOUNDED_ELASTIC_PAPER_SOURCE_SHA256,
+)
+from alberta_framework.evaluation.bounded_elastic_ipmnist_nonpromoting import (
+    RESULT_SCHEMA as BOUNDED_ELASTIC_RESULT_SCHEMA,
+)
+from alberta_framework.evaluation.bounded_elastic_ipmnist_nonpromoting import (
+    bounded_elastic_resource_expectations,
+    registered_bounded_elastic_hyperparameters,
+    validate_bounded_elastic_development_result,
+)
 from alberta_framework.evaluation.l2er_ipmnist_nonpromoting import (
     COMPARISON_ID as L2ER_COMPARISON_ID,
 )
@@ -737,6 +754,147 @@ def _make_l2er_learner(
         )
         new_params, new_state = l2er_update(params, state, grads, x, checked_hp)
         return new_params, new_state, _step_metrics(new_params, x, y, loss, logits)
+
+    return init_fn, full_step
+
+
+# =============================================================================
+# Bounded growing/elastic adaptation (Kong & Sutton, arXiv:2608.01475v1)
+# =============================================================================
+
+
+@chex.dataclass(frozen=True, mappable_dataclass=False)
+class BoundedStructureState:
+    """Preallocated hidden-1 activity, online activation evidence, and clock."""
+
+    active1: Array
+    activation_sum1: Array
+    step: Array
+
+
+def bounded_masked_logits(
+    params: dict[str, Array], x: Array, active1: Array
+) -> tuple[Array, Array]:
+    """Return logits and hidden-1 activations under the static capacity mask."""
+    hidden1 = jax.nn.relu(x @ params["w1"] + params["b1"]) * active1
+    hidden2 = jax.nn.relu(hidden1 @ params["w2"] + params["b2"])
+    return hidden2 @ params["w3"] + params["b3"], hidden1
+
+
+def bounded_masked_loss(
+    params: dict[str, Array], x: Array, y: Array, active1: Array
+) -> tuple[Array, tuple[Array, Array]]:
+    """Cross-entropy with auxiliary masked logits and activations."""
+    logits, hidden1 = bounded_masked_logits(params, x, active1)
+    return -jax.nn.log_softmax(logits)[y], (logits, hidden1)
+
+
+def _fresh_hidden1_slot(
+    params: dict[str, Array], index: Array, key: Array, apply: Array
+) -> dict[str, Array]:
+    """Freshly initialize one hidden-1 slot using the runner's MLP convention."""
+    key_in, key_bias, key_out = jr.split(key, 3)
+    in_bound = 1.0 / math.sqrt(params["w1"].shape[0])
+    out_bound = 1.0 / math.sqrt(params["w2"].shape[0])
+    fresh_in = jr.uniform(key_in, (params["w1"].shape[0],), jnp.float32, -in_bound, in_bound)
+    fresh_bias = jr.uniform(key_bias, (), jnp.float32, -in_bound, in_bound)
+    fresh_out = jr.uniform(key_out, (params["w2"].shape[1],), jnp.float32, -out_bound, out_bound)
+    result = dict(params)
+    result["w1"] = params["w1"].at[:, index].set(jnp.where(apply, fresh_in, params["w1"][:, index]))
+    result["b1"] = params["b1"].at[index].set(jnp.where(apply, fresh_bias, params["b1"][index]))
+    result["w2"] = params["w2"].at[index, :].set(
+        jnp.where(apply, fresh_out, params["w2"][index, :])
+    )
+    return result
+
+
+def bounded_structure_event(
+    params: dict[str, Array], state: BoundedStructureState, key: Array, hp: Mapping[str, float]
+) -> tuple[dict[str, Array], BoundedStructureState]:
+    """Apply one protocol boundary event: optional least-active prune, then growth."""
+    active = state.active1
+    if hp["pruning_enabled"] == 1.0:
+        prune_index = jnp.argmin(jnp.where(active, state.activation_sum1, jnp.inf))
+        can_prune = jnp.any(active)
+        active = active.at[prune_index].set(
+            jnp.where(can_prune, jnp.asarray(False), active[prune_index])
+        )
+    if hp["growth_enabled"] == 1.0:
+        inactive = jnp.logical_not(active)
+        grow_index = jnp.argmax(inactive).astype(jnp.int32)
+        can_grow = jnp.any(inactive)
+        params = _fresh_hidden1_slot(params, grow_index, key, can_grow)
+        active = active.at[grow_index].set(
+            jnp.where(can_grow, jnp.asarray(True), active[grow_index])
+        )
+    return params, BoundedStructureState(  # type: ignore[call-arg]
+        active1=active,
+        activation_sum1=jnp.zeros_like(state.activation_sum1),
+        step=state.step,
+    )
+
+
+def bounded_structure_update(
+    params: dict[str, Array],
+    state: BoundedStructureState,
+    grads: dict[str, Array],
+    hidden1: Array,
+    key: Array,
+    hp: Mapping[str, float],
+) -> tuple[dict[str, Array], BoundedStructureState]:
+    """One SGD update followed by the registered fixed-length boundary event."""
+    candidate = {name: value - hp["step_size"] * grads[name] for name, value in params.items()}
+    next_step = state.step + jnp.asarray(1, dtype=jnp.int32)
+    accumulated = BoundedStructureState(  # type: ignore[call-arg]
+        active1=state.active1,
+        activation_sum1=state.activation_sum1 + jnp.abs(hidden1),
+        step=next_step,
+    )
+    interval = int(hp["structure_interval"])
+    due = next_step % interval == 0
+    result = jax.lax.cond(
+        due,
+        lambda operand: bounded_structure_event(operand[0], operand[1], key, hp),
+        lambda operand: operand,
+        (candidate, accumulated),
+    )
+    return cast(tuple[dict[str, Array], BoundedStructureState], result)
+
+
+def _make_bounded_structure_learner(
+    hp: Mapping[str, float],
+) -> tuple[LearnerInitFn, ScreeningStepFn]:
+    """Build the masked, preallocated adaptation used by all structure arms."""
+    if dict(hp) not in (
+        registered_bounded_elastic_hyperparameters("bounded_structure_off"),
+        registered_bounded_elastic_hyperparameters("bounded_growth"),
+        registered_bounded_elastic_hyperparameters("bounded_elastic"),
+    ):
+        raise ValueError("bounded structure hyperparameters are not a registered arm")
+
+    def init_fn(params: dict[str, Array]) -> BoundedStructureState:
+        width = params["w1"].shape[1]
+        active_count = max(1, int(width * hp["initial_active_fraction"]))
+        active = jnp.arange(width, dtype=jnp.int32) < active_count
+        return BoundedStructureState(  # type: ignore[call-arg]
+            active1=active,
+            activation_sum1=jnp.zeros(width, dtype=jnp.float32),
+            step=jnp.asarray(0, dtype=jnp.int32),
+        )
+
+    def full_step(
+        params: dict[str, Array], state: BoundedStructureState, x: Array, y: Array, key: Array
+    ) -> tuple[dict[str, Array], BoundedStructureState, StepMetrics]:
+        (loss, (logits, hidden1)), grads = jax.value_and_grad(bounded_masked_loss, has_aux=True)(
+            params, x, y, state.active1
+        )
+        new_params, new_state = bounded_structure_update(params, state, grads, hidden1, key, hp)
+        loss_after, _ = bounded_masked_loss(new_params, x, y, new_state.active1)
+        accuracy = (jnp.argmax(logits) == y).astype(jnp.float32)
+        plasticity = jnp.clip(
+            1.0 - loss_after / jnp.maximum(loss, _PLASTICITY_LOSS_FLOOR), 0.0, 1.0
+        )
+        return new_params, new_state, (accuracy, loss, plasticity)
 
     return init_fn, full_step
 
@@ -2927,6 +3085,51 @@ def _cbp_update(
         accumulator=jnp.stack([acc0, acc1]),
     )
     return params, opt_arrays, new_cbp
+
+
+def _make_sgd_cbp_budget_learner(
+    hp: Mapping[str, float],
+) -> tuple[LearnerInitFn, ScreeningStepFn]:
+    """Paper-step-size SGD with current fixed-capacity CBP recycling."""
+    if dict(hp) != registered_bounded_elastic_hyperparameters("bounded_fixed_cbp"):
+        raise ValueError("fixed CBP hyperparameters are not the registered budget arm")
+
+    def init_fn(params: dict[str, Array]) -> CBPState:
+        return _init_cbp_state(params["w1"].shape[1], params["w2"].shape[1])
+
+    def full_step(
+        params: dict[str, Array], state: CBPState, x: Array, y: Array, key: Array
+    ) -> tuple[dict[str, Array], CBPState, StepMetrics]:
+        def loss_with_activations(
+            current: dict[str, Array], observation: Array, label: Array
+        ) -> tuple[Array, tuple[Array, Array, Array, Array]]:
+            logits, _, hidden1, z2, hidden2 = _forward_with_activations(
+                current, observation
+            )
+            loss = -jax.nn.log_softmax(logits)[label]
+            return loss, (logits, hidden1, z2, hidden2)
+
+        (loss, (logits, hidden1, z2, hidden2)), grads = jax.value_and_grad(
+            loss_with_activations, has_aux=True
+        )(params, x, y)
+        grad_hidden1, grad_hidden2 = _activation_loss_grads(params, logits, y, z2)
+        candidate = {
+            name: value - hp["step_size"] * grads[name] for name, value in params.items()
+        }
+        candidate, _, new_state = _cbp_update(
+            candidate,
+            None,
+            state,
+            hidden1,
+            grad_hidden1,
+            hidden2,
+            grad_hidden2,
+            key,
+            hp,
+        )
+        return candidate, new_state, _step_metrics(candidate, x, y, loss, logits)
+
+    return init_fn, full_step
 
 
 @chex.dataclass(frozen=True)
@@ -7601,6 +7804,49 @@ def _build_registry() -> dict[str, ScreeningSpec]:
             frozen_probe_input=_ema_frozen_probe_input,
             description=description,
         ))
+    for arm, mechanism, description in (
+        (
+            "bounded_structure_off",
+            "bounded_structure_off",
+            "Mechanism-off masked SGD at the initial half-width; no growth or pruning.",
+        ),
+        (
+            "bounded_growth",
+            "bounded_growth",
+            "Preallocated adaptive growth by one freshly initialized hidden-1 unit per task.",
+        ),
+        (
+            "bounded_elastic",
+            "bounded_elastic",
+            "Boundary pruning of the least-active hidden-1 unit followed by fresh growth.",
+        ),
+    ):
+        specs.append(
+            ScreeningSpec(
+                name=arm,
+                base_learner="upgd_w",
+                mechanism=mechanism,
+                hyperparameters=registered_bounded_elastic_hyperparameters(arm),
+                factory=_make_bounded_structure_learner,
+                description=(
+                    description
+                    + " Bounded arXiv:2608.01475v1 adaptation; not paper/code parity."
+                ),
+            )
+        )
+    specs.append(
+        ScreeningSpec(
+            name="bounded_fixed_cbp",
+            base_learner="upgd_w",
+            mechanism="fixed_capacity_cbp",
+            hyperparameters=registered_bounded_elastic_hyperparameters("bounded_fixed_cbp"),
+            factory=_make_sgd_cbp_budget_learner,
+            description=(
+                "Fixed full-capacity SGD+CBP comparator under the same declared peak/final-size "
+                "budgets as the bounded growing and elastic adaptations."
+            ),
+        )
+    )
     return {spec.name: spec for spec in specs}
 
 
@@ -9063,6 +9309,68 @@ def validate_intentional_updates_development_record(
             raise ValueError("Intentional Updates resource counters do not match the run")
         raise ValueError("Intentional Updates record does not match the frozen protocol")
     return expected
+def bounded_elastic_development_result_payload(
+    result: ScreeningRunResult, *, outcome: str
+) -> dict[str, object]:
+    """Build and validate one exact development-only bounded-structure receipt."""
+    spec = screening_spec(result.config_name)
+    registered_arms = {
+        "bounded_structure_off",
+        "bounded_growth",
+        "bounded_elastic",
+        "bounded_fixed_cbp",
+    }
+    if result.config_name not in registered_arms or result.noise_mode != "step":
+        raise ValueError("receipt requires one exact-step registered bounded-structure arm")
+    if result.hyperparameters != spec.hyperparameters:
+        raise ValueError("result hyperparameters drift from the registered arm")
+    config = result.config
+    observations = config.n_tasks * config.task_length
+    structure_resources = bounded_elastic_resource_expectations(
+        arm=result.config_name,
+        n_tasks=config.n_tasks,
+        input_dim=config.input_dim,
+        hidden1=config.hidden1,
+        hidden2=config.hidden2,
+        n_classes=config.n_classes,
+    )
+    payload: dict[str, object] = {
+        "schema": BOUNDED_ELASTIC_RESULT_SCHEMA,
+        "comparison_id": BOUNDED_ELASTIC_COMPARISON_ID,
+        "paper_revision": BOUNDED_ELASTIC_PAPER_REVISION,
+        "paper_source_sha256": BOUNDED_ELASTIC_PAPER_SOURCE_SHA256,
+        "arm": result.config_name,
+        "seed": result.seed,
+        "n_tasks": config.n_tasks,
+        "task_length": config.task_length,
+        "input_dim": config.input_dim,
+        "hidden1": config.hidden1,
+        "hidden2": config.hidden2,
+        "n_classes": config.n_classes,
+        "observations": observations,
+        "updates": observations,
+        "allowed_boundary_information": ["known_fixed_length_task_boundary"],
+        "allowed_task_information": ["current_example_label"],
+        "hyperparameters": dict(spec.hyperparameters),
+        "metrics": {
+            "mean_online_accuracy": float(np.mean(result.per_task_accuracy)),
+            "mean_loss": float(np.mean(result.per_task_loss)),
+            "mean_plasticity": float(np.mean(result.per_task_plasticity)),
+        },
+        "resources": {
+            **structure_resources,
+            "environment_steps": 0,
+            "data_steps": observations,
+            "model_queries": 2 * observations,
+            "timing_seconds": float(result.wall_clock_seconds),
+            "timing_is_telemetry_only": True,
+        },
+        "outcome": outcome,
+        "outcome_retained": True,
+        "development_only": True,
+        "scientific_promotion_allowed": False,
+    }
+    return validate_bounded_elastic_development_result(payload)
 
 
 def run_screening_config(
@@ -9114,6 +9422,8 @@ def run_screening_config(
             raise ValueError("Intentional Updates model-query budget exceeds signed int32")
         if persistent_bytes > _INTENTIONAL_MAX_PERSISTENT_BYTES:
             raise ValueError("Intentional Updates persistent state exceeds 256 MiB")
+    if spec.name.startswith("bounded_") and config.task_length != 5000:
+        raise ValueError("bounded structure arms require the registered task_length=5000")
     effective_noise_pool_steps = _validated_screening_noise_pool_steps(
         noise_mode,
         noise_pool_steps if noise_mode == "pool" else None,
