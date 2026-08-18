@@ -172,7 +172,7 @@ class CausalMapForagerConfig:
 
     def __post_init__(self) -> None:
         if (
-            not isinstance(self.world_shape, tuple)
+            type(self.world_shape) is not tuple
             or len(self.world_shape) != 2
             or any(
                 type(value) is not int or value < 1
