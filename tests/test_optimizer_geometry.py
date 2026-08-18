@@ -1,11 +1,15 @@
+import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 
 from alberta_framework.evaluation.optimizer_geometry import (
     GEOMETRY_PROTOCOL,
     flad_noise_component,
+    flad_noise_component_transaction,
     orthogonal_correction,
     spectral_matrix_sign,
+    spectral_matrix_sign_transaction,
 )
 
 
@@ -36,3 +40,37 @@ def test_protocol_is_small_matrix_first_and_nonpromoting() -> None:
     )
     assert GEOMETRY_PROTOCOL["stage"] == "small_streaming_matrix_pre_ipmnist"
     assert GEOMETRY_PROTOCOL["scientific_promotion_allowed"] is False
+
+
+def test_geometry_primitives_are_outer_jit_safe() -> None:
+    corrected = jax.jit(orthogonal_correction)(jnp.array([1.0, 2.0]), jnp.array([[1.0, 0.0]]))
+    np.testing.assert_allclose(corrected, [0.0, 2.0])
+
+
+def test_geometry_rejects_empty_flad_and_hostile_array() -> None:
+    with pytest.raises(ValueError, match="non-empty"):
+        flad_noise_component(jnp.zeros(0), jnp.zeros(0))
+
+    class Hostile:
+        calls = 0
+
+        def __array__(self) -> np.ndarray:
+            self.calls += 1
+            raise AssertionError("must not run")
+
+    hostile = Hostile()
+    with pytest.raises(ValueError, match="exact NumPy or JAX"):
+        spectral_matrix_sign(hostile)  # type: ignore[arg-type]
+    assert hostile.calls == 0
+
+
+def test_geometry_float32_overflow_is_invalid_not_laundered() -> None:
+    maximum = jnp.finfo(jnp.float32).max
+    matrix, matrix_valid = jax.jit(spectral_matrix_sign_transaction)(jnp.full((2, 2), maximum))
+    assert bool(jnp.all(jnp.isfinite(matrix)))
+    assert not bool(matrix_valid)
+    component, component_valid = jax.jit(flad_noise_component_transaction)(
+        jnp.full((2,), maximum), jnp.full((2,), maximum)
+    )
+    assert bool(jnp.all(jnp.isfinite(component)))
+    assert not bool(component_valid)

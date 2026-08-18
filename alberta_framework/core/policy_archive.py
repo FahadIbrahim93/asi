@@ -9,6 +9,12 @@ from typing import Literal
 
 import numpy as np
 
+_MAX_ARCHIVE_BYTES = 256 * 1024 * 1024
+_MAX_ARCHIVE_ENTRIES = 4096
+_MAX_IDENTITY_CHARACTERS = 1024
+_MAX_POLICY_BYTES = 64 * 1024 * 1024
+_MAX_LATENT_WIDTH = 65_536
+
 POLICY_ARCHIVE_PROTOCOL = MappingProxyType(
     {
         "schema": "asi.policy-archive.protocol.v1",
@@ -37,11 +43,23 @@ class PolicyEntry:
     score: float
 
     def __post_init__(self) -> None:
-        if type(self.identity) is not str or not self.identity:
+        if (
+            type(self.identity) is not str
+            or not self.identity
+            or len(self.identity) > _MAX_IDENTITY_CHARACTERS
+        ):
             raise ValueError("identity must be a non-empty string")
-        if type(self.policy_bytes) is not bytes or not self.policy_bytes:
+        if (
+            type(self.policy_bytes) is not bytes
+            or not self.policy_bytes
+            or len(self.policy_bytes) > _MAX_POLICY_BYTES
+        ):
             raise ValueError("policy_bytes must be non-empty exact bytes")
-        if type(self.latent) is not tuple or not self.latent:
+        if (
+            type(self.latent) is not tuple
+            or not self.latent
+            or len(self.latent) > _MAX_LATENT_WIDTH
+        ):
             raise ValueError("latent must be a non-empty tuple")
         if any(type(value) is not float or not math.isfinite(value) for value in self.latent):
             raise ValueError("latent values must be finite floats")
@@ -69,8 +87,12 @@ class BoundedPolicyArchive:
     entries: tuple[PolicyEntry, ...] = ()
 
     def __post_init__(self) -> None:
-        if type(self.byte_budget) is not int or self.byte_budget < 1:
-            raise ValueError("byte_budget must be a positive integer")
+        if (
+            type(self.byte_budget) is not int
+            or self.byte_budget < 1
+            or self.byte_budget > _MAX_ARCHIVE_BYTES
+        ):
+            raise ValueError("byte_budget must be in [1, 256 MiB]")
         if (
             type(self.min_latent_distance) is not float
             or not math.isfinite(self.min_latent_distance)
@@ -83,14 +105,19 @@ class BoundedPolicyArchive:
             "fixed_snapshot",
         }:
             raise ValueError("unknown archive mode")
-        if type(self.entries) is not tuple or any(
-            type(entry) is not PolicyEntry for entry in self.entries
-        ):
+        if type(self.entries) is not tuple or len(self.entries) > _MAX_ARCHIVE_ENTRIES:
             raise ValueError("entries must be an exact tuple of PolicyEntry values")
-        if len({entry.identity for entry in self.entries}) != len(self.entries):
-            raise ValueError("entry identities must be unique")
-        if self.persistent_bytes > self.byte_budget:
-            raise ValueError("entries exceed byte budget")
+        retained_bytes = 0
+        identities: set[str] = set()
+        for entry in self.entries:
+            if type(entry) is not PolicyEntry:
+                raise ValueError("entries must be an exact tuple of PolicyEntry values")
+            retained_bytes += entry.persistent_bytes
+            if retained_bytes > self.byte_budget:
+                raise ValueError("entries exceed byte budget")
+            if entry.identity in identities:
+                raise ValueError("entry identities must be unique")
+            identities.add(entry.identity)
 
     @property
     def persistent_bytes(self) -> int:
@@ -122,6 +149,10 @@ class BoundedPolicyArchive:
                     return self
                 candidates = self.entries[:nearest] + (entry,) + self.entries[nearest + 1 :]
             else:
+                if len(self.entries) >= _MAX_ARCHIVE_ENTRIES:
+                    raise ValueError("candidate would exceed archive entry limit")
+                if self.persistent_bytes + entry.persistent_bytes > self.byte_budget:
+                    raise ValueError("candidate would exceed byte budget")
                 candidates = self.entries + (entry,)
         if sum(item.persistent_bytes for item in candidates) > self.byte_budget:
             raise ValueError("candidate would exceed byte budget")
