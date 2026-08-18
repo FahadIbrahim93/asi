@@ -307,11 +307,12 @@ def validate_host_qualification_receipt(
 ) -> HostQualificationReceipt:
     """Replay a receipt from its caller-held plan, collectors, and executor identity."""
     try:
-        decoded = (
-            parity.decode_strict_json(value)
-            if isinstance(value, (bytes, str))
-            else parity.decode_strict_json(parity.canonical_json_bytes(value))
-        )
+        if type(value) in (bytes, str):
+            decoded = parity.decode_strict_json(cast(bytes | str, value))
+        elif isinstance(value, (bytes, str)):
+            raise TypeError("qualification receipt must be a mapping, bytes, or str")
+        else:
+            decoded = parity.decode_strict_json(parity.canonical_json_bytes(value))
     except parity.ForagerRngParityError as exc:
         raise ForagerRngParityQualificationError(str(exc)) from exc
     if type(decoded) is not dict:

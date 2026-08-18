@@ -86,9 +86,10 @@ def _require_sha256(value: str, *, name: str) -> None:
 def _validate_json_value(value: Any, *, path: str, depth: int = 0) -> None:
     if depth > 64:
         raise ValueError(f"{path} exceeds the maximum canonical JSON nesting depth")
-    if value is None or isinstance(value, (str, bool, int)):
+    value_type = type(value)
+    if value is None or value_type is str or value_type is bool or value_type is int:
         return
-    if isinstance(value, float):
+    if value_type is float:
         if not math.isfinite(value):
             raise ValueError(f"{path} must contain only finite JSON numbers")
         return
@@ -98,7 +99,7 @@ def _validate_json_value(value: Any, *, path: str, depth: int = 0) -> None:
         return
     if isinstance(value, Mapping):
         for key, item in value.items():
-            if not isinstance(key, str):
+            if type(key) is not str:
                 raise ValueError(f"{path} JSON object keys must be strings")
             _validate_json_value(item, path=f"{path}.{key}", depth=depth + 1)
         return
@@ -719,7 +720,7 @@ class DispatchAuthorization:
         if self.status is AuthorizationStatus.VETOED:
             if self.authorized_action is not None:
                 raise ValueError("vetoed authorization cannot carry an action")
-            if not isinstance(self.veto_reason, str) or not self.veto_reason.strip():
+            if type(self.veto_reason) is not str or not self.veto_reason.strip():
                 raise ValueError("vetoed authorization requires a nonempty reason")
             return
         if not isinstance(self.authorized_action, ArrayValue):
@@ -1040,7 +1041,7 @@ class ReferenceAgentUpdate:
                 raise ValueError("a rejected update cannot change parameters")
             if self.next_decision is not None:
                 raise ValueError("a rejected update cannot arm a next decision")
-            if not isinstance(self.rejection_reason, str) or not self.rejection_reason.strip():
+            if type(self.rejection_reason) is not str or not self.rejection_reason.strip():
                 raise ValueError("a rejected update requires a nonempty reason")
 
 
@@ -1063,7 +1064,7 @@ class StepResult:
         if not self.transaction_accepted:
             if self.parameters_changed:
                 raise ValueError("a rejected transaction cannot change parameters")
-            if not isinstance(self.rejection_reason, str) or not self.rejection_reason.strip():
+            if type(self.rejection_reason) is not str or not self.rejection_reason.strip():
                 raise ValueError("a rejected transaction requires a nonempty rejection_reason")
             if self.next_decision is not None:
                 raise ValueError("a rejected transaction cannot arm a next decision")
@@ -1150,7 +1151,7 @@ class ReferenceTransactionState:
                 f"{MAX_DECISION_INDEX}"
             )
         if self.phase is TransactionPhase.HALTED:
-            if not isinstance(self.halt_reason, str) or not self.halt_reason.strip():
+            if type(self.halt_reason) is not str or not self.halt_reason.strip():
                 raise ValueError("halted state requires a nonempty halt_reason")
         elif self.halt_reason is not None:
             raise ValueError("non-halted state cannot carry halt_reason")
@@ -1294,7 +1295,7 @@ class ReferenceTransactionReducer:
         *,
         reason: str,
     ) -> ReferenceTransactionState:
-        if not isinstance(reason, str) or not reason.strip():
+        if type(reason) is not str or not reason.strip():
             raise ValueError("halt reason must be nonempty")
         return self._commit(
             state,
@@ -1634,7 +1635,7 @@ class ReferenceTransactionLedger:
         *,
         reason: str,
     ) -> ReferenceTransactionState:
-        if not isinstance(reason, str) or not reason.strip():
+        if type(reason) is not str or not reason.strip():
             raise ValueError("halt reason must be nonempty")
         halted = dataclasses.replace(
             state,

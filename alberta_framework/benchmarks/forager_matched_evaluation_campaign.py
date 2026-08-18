@@ -363,10 +363,10 @@ def _decode_schedule(
     value: Mapping[str, Any] | bytes | str,
 ) -> tuple[dict[str, Any], bytes | None]:
     raw: bytes | None = None
-    if isinstance(value, bytes):
+    if type(value) is bytes:
         raw = value
         encoded: bytes | str = value
-    elif isinstance(value, str):
+    elif type(value) is str:
         try:
             raw = value.encode("utf-8")
         except UnicodeEncodeError as exc:

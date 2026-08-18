@@ -2982,7 +2982,7 @@ def canonical_selection_result_sha256(
 def _parse_protocol_instance(
     value: ForagerMatchedProtocol | Mapping[str, Any] | bytes | str,
 ) -> ForagerMatchedProtocol:
-    if isinstance(value, ForagerMatchedProtocol):
+    if type(value) is ForagerMatchedProtocol:
         return parse_forager_matched_protocol(value.to_dict())
     return parse_forager_matched_protocol(value)
 
@@ -3207,7 +3207,7 @@ def normalize_forager_matched_protocol(value: Any) -> dict[str, Any]:
 
 def canonical_json_bytes(value: ForagerMatchedProtocol | Mapping[str, Any]) -> bytes:
     """Return deterministic bytes after replaying protocol validation."""
-    if isinstance(value, ForagerMatchedProtocol):
+    if type(value) is ForagerMatchedProtocol:
         payload = parse_forager_matched_protocol(value.to_dict()).to_dict()
     else:
         payload = parse_forager_matched_protocol(value).to_dict()
