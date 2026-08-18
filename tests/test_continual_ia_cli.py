@@ -94,3 +94,49 @@ def test_existing_output_path_is_refused_before_benchmark(
     assert emitted["valid"] is False
     assert "existing output path" in emitted["errors"][0]
     assert path.read_bytes() == sentinel
+
+
+def test_verify_reports_missing_artifact_with_status_one(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    missing = tmp_path / "missing.json"
+
+    status = continual_ia_cli.main(["--verify", str(missing)])
+    emitted = json.loads(capsys.readouterr().out)
+
+    assert status == 1
+    assert emitted["valid"] is False
+    assert emitted["accepted"] is False
+    assert "No such file or directory" in emitted["errors"][0]
+
+
+def test_verify_treats_missing_validator_dependency_as_invalid(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    artifact_path = tmp_path / "artifact.json"
+    monkeypatch.setattr(
+        continual_ia_cli,
+        "load_ia_evidence_artifact",
+        lambda path: {"loaded_from": str(path)},
+    )
+
+    def missing_dependency(artifact: object) -> object:
+        del artifact
+        raise FileNotFoundError("registered source dependency is missing")
+
+    monkeypatch.setattr(
+        continual_ia_cli,
+        "validate_ia_evidence_artifact",
+        missing_dependency,
+    )
+
+    status = continual_ia_cli.main(["--verify", str(artifact_path)])
+    emitted = json.loads(capsys.readouterr().out)
+
+    assert status == 2
+    assert emitted["valid"] is False
+    assert emitted["accepted"] is False
+    assert emitted["errors"] == ["registered source dependency is missing"]
