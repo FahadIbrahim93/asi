@@ -1,12 +1,32 @@
+import copy
+import json
+
+import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 
 from alberta_framework.evaluation.optimizer_geometry import (
+    FROZEN_GEOMETRY_CONFIG,
     GEOMETRY_PROTOCOL,
+    GEOMETRY_RESULT_SCHEMA,
     flad_noise_component,
+    muon_ogd_dual_update,
     orthogonal_correction,
+    run_streaming_matrix_evaluation,
     spectral_matrix_sign,
+    validate_streaming_matrix_result,
 )
+
+
+def _paper_ns5(matrix: jax.Array, *, steps: int) -> jax.Array:
+    value = matrix / jnp.maximum(jnp.linalg.norm(matrix), jnp.asarray(1e-12, matrix.dtype))
+    transposed = value.shape[0] > value.shape[1]
+    if transposed:
+        value = value.T
+    for _ in range(steps):
+        value = 1.5 * value - 0.5 * (value @ value.T) @ value
+    return value.T if transposed else value
 
 
 def test_orthogonal_correction_removes_protected_direction() -> None:
@@ -16,23 +36,94 @@ def test_orthogonal_correction_removes_protected_direction() -> None:
     np.testing.assert_array_equal(orthogonal_correction(update, jnp.zeros((0, 2))), update)
 
 
-def test_spectral_matrix_sign_has_bounded_singular_values() -> None:
-    result = spectral_matrix_sign(jnp.diag(jnp.array([3.0, 0.5])), steps=5)
-    assert float(jnp.linalg.svd(result, compute_uv=False)[0]) <= 1.1
-
-
-def test_flad_removes_gradient_aligned_component() -> None:
-    gradient = jnp.array([1.0, 0.0])
-    perturbation = jnp.array([2.0, 4.0])
-    np.testing.assert_allclose(flad_noise_component(perturbation, gradient), [0.0, 4.0])
-    np.testing.assert_array_equal(flad_noise_component(perturbation, jnp.zeros(2)), perturbation)
-
-
-def test_protocol_is_small_matrix_first_and_nonpromoting() -> None:
-    assert GEOMETRY_PROTOCOL["paper_revisions"] == (
-        "arXiv:2605.08949v2",
-        "arXiv:2606.10406v1",
-        "arXiv:2601.07636v1",
+@pytest.mark.parametrize("shape", [(2, 2), (2, 3), (3, 2)])
+def test_spectral_matrix_sign_matches_pinned_muon_ogd_ns5(shape: tuple[int, int]) -> None:
+    matrix = jnp.arange(1, shape[0] * shape[1] + 1, dtype=jnp.float32).reshape(shape)
+    np.testing.assert_allclose(
+        spectral_matrix_sign(matrix, steps=5), _paper_ns5(matrix, steps=5), rtol=1e-6
     )
-    assert GEOMETRY_PROTOCOL["stage"] == "small_streaming_matrix_pre_ipmnist"
+
+
+def test_spectral_matrix_sign_zero_and_jit_paths() -> None:
+    zero = jnp.zeros((3, 2), dtype=jnp.float32)
+    np.testing.assert_array_equal(spectral_matrix_sign(zero), zero)
+    jitted = jax.jit(spectral_matrix_sign)
+    np.testing.assert_allclose(jitted(jnp.eye(2, dtype=jnp.float32)), jnp.eye(2), rtol=1e-5)
+
+
+def test_muon_ogd_empty_constraints_reduces_exactly_to_ns5() -> None:
+    matrix = jnp.array([[2.0, 1.0], [0.5, -1.0]], dtype=jnp.float32)
+    update, dual = muon_ogd_dual_update(
+        matrix,
+        jnp.zeros((0, 2, 2), dtype=jnp.float32),
+        jnp.zeros((0,), dtype=jnp.float32),
+        dual_learning_rate=0.25,
+        dual_steps=2,
+    )
+    np.testing.assert_array_equal(dual, jnp.zeros((0,), dtype=jnp.float32))
+    np.testing.assert_allclose(update, spectral_matrix_sign(matrix), rtol=1e-6)
+
+
+def test_flad_zero_gradient_is_primal_and_derivative_safe() -> None:
+    perturbation = jnp.array([2.0, 4.0])
+    zero = jnp.zeros(2)
+    np.testing.assert_array_equal(flad_noise_component(perturbation, zero), perturbation)
+    delta_jacobian, gradient_jacobian = jax.jacrev(flad_noise_component, argnums=(0, 1))(
+        perturbation, zero
+    )
+    assert bool(jnp.all(jnp.isfinite(delta_jacobian)))
+    assert bool(jnp.all(jnp.isfinite(gradient_jacobian)))
+    np.testing.assert_array_equal(delta_jacobian, jnp.eye(2))
+
+
+def test_flad_jit_removes_gradient_aligned_component() -> None:
+    result = jax.jit(flad_noise_component)(jnp.array([2.0, 4.0]), jnp.array([1.0, 0.0]))
+    np.testing.assert_allclose(result, [0.0, 4.0])
+
+
+def test_streaming_matrix_evaluation_is_frozen_matched_and_nonpromoting() -> None:
+    result = run_streaming_matrix_evaluation()
+    assert result["schema"] == GEOMETRY_RESULT_SCHEMA
+    assert result["config"] == dict(FROZEN_GEOMETRY_CONFIG)
+    assert GEOMETRY_PROTOCOL["stage"] == "frozen_small_streaming_matrix_pre_ipmnist"
     assert GEOMETRY_PROTOCOL["scientific_promotion_allowed"] is False
+    arms = result["arms"]
+    assert isinstance(arms, list)
+    assert len(arms) == 6
+    for arm in arms:
+        resources = arm["resources"]
+        assert resources["observations"] == FROZEN_GEOMETRY_CONFIG["updates"]
+        assert resources["updates"] == FROZEN_GEOMETRY_CONFIG["updates"]
+        assert resources["data_steps"] == FROZEN_GEOMETRY_CONFIG["updates"]
+        assert resources["persistent_bytes"] > 0
+        assert resources["timing_qualified"] is False
+    assert result["policy"] == {
+        "status": "development-only-nonpromoting",
+        "development_only": True,
+        "scientific_promotion_allowed": False,
+        "negative_outcomes_retained": True,
+    }
+    validate_streaming_matrix_result(json.loads(json.dumps(result)))
+
+
+@pytest.mark.parametrize(
+    ("path", "replacement"),
+    [
+        (("config", "seed"), 1),
+        (("config", "updates"), 8.0),
+        (("policy", "scientific_promotion_allowed"), True),
+        (("arms", 0, "resources", "updates"), 7),
+        (("arms", 0, "metrics", "final_target_mse"), 0.0),
+        (("comparisons", 0, "outcome"), "unexpected"),
+    ],
+)
+def test_streaming_matrix_validator_rejects_tampering(
+    path: tuple[object, ...], replacement: object
+) -> None:
+    result = copy.deepcopy(run_streaming_matrix_evaluation())
+    target: object = result
+    for component in path[:-1]:
+        target = target[component]  # type: ignore[index]
+    target[path[-1]] = replacement  # type: ignore[index]
+    with pytest.raises(ValueError):
+        validate_streaming_matrix_result(result)
