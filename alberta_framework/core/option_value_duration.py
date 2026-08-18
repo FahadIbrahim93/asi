@@ -369,13 +369,14 @@ class OptionValueDurationLearner:
         shape: tuple[int, ...],
         dtype: Any,
     ) -> Array:
-        try:
-            actual_shape = tuple(value.shape)
-            actual_dtype = jnp.dtype(value.dtype)
-        except Exception as error:
-            raise TypeError(
-                f"{name} must expose array shape and dtype metadata"
-            ) from error
+        actual_type = type(value)
+        if not (
+            actual_type is np.ndarray
+            or issubclass(actual_type, (jax.Array, jax.core.Tracer))
+        ):
+            raise TypeError(f"{name} must expose trusted array metadata")
+        actual_shape = tuple(value.shape)
+        actual_dtype = jnp.dtype(value.dtype)
         if actual_shape != shape or actual_dtype != jnp.dtype(dtype):
             raise ValueError(f"{name} must have shape {shape} and dtype {dtype}")
         return jnp.asarray(value)

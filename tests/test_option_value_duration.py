@@ -644,19 +644,22 @@ def test_option_duration_array_runner_requires_exact_shapes() -> None:
         )
 
 
-def test_array_runner_rejects_untrusted_inputs_without_running_conversion_hooks() -> None:
-    """The array runner must gate on array metadata before any conversion.
+def test_array_runner_rejects_without_dispatching_hostile_metadata() -> None:
+    """Identity validation must precede even shape and dtype property access."""
 
-    ``_require_array`` reached ``jnp.asarray(value)`` before validating
-    anything, so an untrusted ``__array__`` hook executed ahead of the shape
-    and dtype checks and chose the value they then saw. The public ``update``
-    path is gated by an outer contract check; the array runner called the
-    helper directly.
-    """
+    class _HostileMetadata:
+        shape_reads = 0
+        dtype_reads = 0
 
-    class _HostileArray:
-        def __array__(self, dtype: object = None, copy: object = None) -> np.ndarray:
-            raise AssertionError("array hook must not run")
+        @property
+        def shape(self) -> tuple[int, ...]:
+            type(self).shape_reads += 1
+            raise AssertionError("shape property must not run")
+
+        @property
+        def dtype(self) -> np.dtype[np.int32]:
+            type(self).dtype_reads += 1
+            raise AssertionError("dtype property must not run")
 
     learner = OptionValueDurationLearner(3, OptionValueDurationConfig())
     state = learner.init(2)
@@ -665,29 +668,58 @@ def test_array_runner_rejects_untrusted_inputs_without_running_conversion_hooks(
     next_observations = jnp.zeros((steps, 2), dtype=jnp.float32)
     rewards = jnp.zeros((steps,), dtype=jnp.float32)
     discounts = jnp.zeros((steps,), dtype=jnp.float32)
-    option_indices = jnp.zeros((steps,), dtype=jnp.int32)
 
-    with pytest.raises(TypeError, match="shape and dtype metadata"):
+    with pytest.raises(TypeError, match="trusted array metadata"):
         run_option_value_duration_from_arrays(
             learner,
             state,
             observations,
-            _HostileArray(),
+            _HostileMetadata(),
             rewards,
             next_observations,
             discounts,
         )
+    assert _HostileMetadata.shape_reads == 0
+    assert _HostileMetadata.dtype_reads == 0
 
-    with pytest.raises(TypeError, match="shape and dtype metadata"):
+
+def test_array_runner_rejects_spoofed_metadata_without_conversion() -> None:
+    """Plausible public metadata must not authorize an arbitrary conversion hook."""
+
+    class _SpoofedArray:
+        shape = (2,)
+        dtype = np.dtype(np.float32)
+        class_reads = 0
+        conversions = 0
+
+        @property
+        def __class__(self) -> type[jax.Array]:
+            type(self).class_reads += 1
+            return jax.Array
+
+        def __array__(self, dtype: object = None, copy: object = None) -> np.ndarray:
+            type(self).conversions += 1
+            raise AssertionError("array conversion hook must not run")
+
+    learner = OptionValueDurationLearner(3, OptionValueDurationConfig())
+    state = learner.init(2)
+    observations = jnp.zeros((2, 2), dtype=jnp.float32)
+    option_indices = jnp.zeros((2,), dtype=jnp.int32)
+    next_observations = jnp.zeros((2, 2), dtype=jnp.float32)
+    discounts = jnp.zeros((2,), dtype=jnp.float32)
+
+    with pytest.raises(TypeError, match="trusted array metadata"):
         run_option_value_duration_from_arrays(
             learner,
             state,
             observations,
             option_indices,
-            _HostileArray(),
+            _SpoofedArray(),
             next_observations,
             discounts,
         )
+    assert _SpoofedArray.class_reads == 0
+    assert _SpoofedArray.conversions == 0
 
 
 def test_array_runner_still_accepts_trusted_arrays() -> None:
@@ -704,4 +736,21 @@ def test_array_runner_still_accepts_trusted_arrays() -> None:
         jnp.zeros((steps, 2), dtype=jnp.float32),
         jnp.zeros((steps,), dtype=jnp.float32),
     )
+    chex.assert_tree_all_finite(result.predictions)
+
+
+def test_array_runner_accepts_jax_arrays_under_jit() -> None:
+    learner = OptionValueDurationLearner(3, OptionValueDurationConfig())
+    state = learner.init(2)
+    observations = jnp.zeros((2, 2), dtype=jnp.float32)
+    option_indices = jnp.zeros((2,), dtype=jnp.int32)
+    rewards = jnp.zeros((2,), dtype=jnp.float32)
+    discounts = jnp.zeros((2,), dtype=jnp.float32)
+
+    compiled = jax.jit(
+        lambda obs, indices, rs, next_obs, ds: run_option_value_duration_from_arrays(
+            learner, state, obs, indices, rs, next_obs, ds
+        )
+    )
+    result = compiled(observations, option_indices, rewards, observations, discounts)
     chex.assert_tree_all_finite(result.predictions)
