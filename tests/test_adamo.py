@@ -32,6 +32,22 @@ def test_closed_form_gradient_matches_autodiff(shape: tuple[int, int]) -> None:
     np.testing.assert_allclose(isometry_gradient(weight), expected, rtol=1e-5, atol=1e-5)
 
 
+@pytest.mark.parametrize(
+    "weight",
+    [
+        jnp.full((2, 2), jnp.finfo(jnp.float32).max),
+        jnp.asarray([[jnp.nan]], dtype=jnp.float32),
+    ],
+)
+def test_penalty_preserves_invalidity_in_eager_and_traced_calls(weight: jax.Array) -> None:
+    with pytest.raises(ValueError, match="isometry penalty must be finite"):
+        isometry_penalty(weight)
+
+    traced = jax.jit(isometry_penalty)(weight)
+    assert bool(jnp.isnan(traced))
+    assert float(traced) != 0.0
+
+
 def test_zero_strength_reduces_exactly_to_adam_task_step() -> None:
     config = AdamOConfig(
         step_size=1e-3, beta1=0.9, beta2=0.99, eps=1e-8, isometry_strength=0.0
