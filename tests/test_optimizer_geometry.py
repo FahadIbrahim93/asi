@@ -111,8 +111,16 @@ def test_streaming_matrix_evaluation_is_frozen_matched_and_nonpromoting() -> Non
         "scientific_promotion_allowed": False,
         "negative_outcomes_retained": True,
     }
-    assert set(result["identity"]) == {"source_sha256", "plan_sha256"}
-    assert all(len(result["identity"][field]) == 64 for field in result["identity"])
+    assert set(result["identity"]) == {
+        "source_sha256",
+        "plan_sha256",
+        "runtime",
+        "consistency_not_attestation",
+    }
+    assert len(result["identity"]["source_sha256"]) == 64
+    assert len(result["identity"]["plan_sha256"]) == 64
+    assert result["identity"]["runtime"]["packages"].keys() == {"jax", "jaxlib", "numpy"}
+    assert result["identity"]["consistency_not_attestation"] is True
     validate_streaming_matrix_result(json.loads(json.dumps(result)))
 
 
@@ -146,6 +154,7 @@ def test_geometry_retention_rejects_namespace_symlink(tmp_path: Path) -> None:
         (("arms", 0, "resources", "updates"), 7),
         (("arms", 0, "metrics", "final_target_mse"), 0.0),
         (("comparisons", 0, "outcome"), "unexpected"),
+        (("identity", "runtime", "machine"), "different-machine"),
     ],
 )
 def test_streaming_matrix_validator_rejects_tampering(

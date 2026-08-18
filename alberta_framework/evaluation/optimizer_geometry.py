@@ -10,9 +10,12 @@ of the validated protocol rather than being left implicit.
 from __future__ import annotations
 
 import hashlib
+import importlib.metadata
 import json
 import math
 import os
+import platform
+import sys
 import time
 from pathlib import Path, PosixPath
 from types import MappingProxyType
@@ -384,9 +387,89 @@ def _source_sha256() -> str:
     return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
 
-def _plan_identity(source_sha256: str) -> str:
+def _runtime_text(name: str, value: object) -> str:
+    if type(value) is not str or not value or len(value.encode("utf-8")) > _MAX_TEXT_BYTES:
+        raise ValueError(f"runtime {name} must be a bounded non-empty UTF-8 string")
+    return value
+
+
+def _runtime_identity() -> dict[str, object]:
+    environment_names = (
+        "JAX_PLATFORMS",
+        "JAX_PLATFORM_NAME",
+        "JAX_ENABLE_X64",
+        "JAX_DEFAULT_PRNG_IMPL",
+        "JAX_DEFAULT_MATMUL_PRECISION",
+        "JAX_RANDOM_SEED_OFFSET",
+        "JAX_NUM_CPU_DEVICES",
+        "XLA_FLAGS",
+    )
+    environment: dict[str, str | None] = {}
+    for name in environment_names:
+        value = os.environ.get(name)
+        environment[name] = None if value is None else _runtime_text(name, value)
+    devices = sorted(
+        (
+            {
+                "id": int(device.id),
+                "process_index": int(device.process_index),
+                "platform": _runtime_text("device platform", str(device.platform)),
+                "device_kind": _runtime_text("device kind", str(device.device_kind)),
+            }
+            for device in jax.devices()
+        ),
+        key=lambda value: (
+            value["process_index"],
+            value["id"],
+            value["platform"],
+            value["device_kind"],
+        ),
+    )
+    if not 1 <= len(devices) <= 128:
+        raise ValueError("runtime device inventory exceeds its bound")
+    return {
+        "schema": "asi.optimizer-geometry.runtime.v1",
+        "python_implementation": _runtime_text(
+            "Python implementation", platform.python_implementation()
+        ),
+        "python_version": list(sys.version_info[:3]),
+        "byteorder": _runtime_text("byteorder", sys.byteorder),
+        "platform": _runtime_text("platform", sys.platform),
+        "machine": _runtime_text("machine", platform.machine()),
+        "packages": {
+            "jax": _runtime_text("JAX version", jax.__version__),
+            "jaxlib": _runtime_text(
+                "jaxlib version", importlib.metadata.version("jaxlib")
+            ),
+            "numpy": _runtime_text("NumPy version", np.__version__),
+        },
+        "default_backend": _runtime_text("JAX backend", jax.default_backend()),
+        "device_count": jax.device_count(),
+        "local_device_count": jax.local_device_count(),
+        "devices": devices,
+        "jax_enable_x64": bool(jax.config.jax_enable_x64),
+        "jax_default_prng_impl": _runtime_text(
+            "default PRNG", str(jax.config.jax_default_prng_impl)
+        ),
+        "jax_default_matmul_precision": _runtime_text(
+            "matmul precision", str(jax.config.jax_default_matmul_precision)
+        ),
+        "jax_random_seed_offset": int(jax.config.jax_random_seed_offset),
+        "jax_threefry_partitionable": bool(jax.config.jax_threefry_partitionable),
+        "jax_numpy_dtype_promotion": _runtime_text(
+            "dtype promotion", str(jax.config.jax_numpy_dtype_promotion)
+        ),
+        "jax_numpy_rank_promotion": _runtime_text(
+            "rank promotion", str(jax.config.jax_numpy_rank_promotion)
+        ),
+        "environment": environment,
+    }
+
+
+def _plan_identity(source_sha256: str, runtime_identity: dict[str, object]) -> str:
     payload = {
         "source_sha256": source_sha256,
+        "runtime_identity": runtime_identity,
         "protocol": _protocol_payload(),
         "config": dict(FROZEN_GEOMETRY_CONFIG),
         "arm_specs": _ARM_SPECS,
@@ -517,11 +600,14 @@ def _execute_frozen_stream(*, measure_timing: bool) -> dict[str, object]:
             }
         )
     source_sha256 = _source_sha256()
+    runtime_identity = _runtime_identity()
     payload: dict[str, object] = {
         "schema": GEOMETRY_RESULT_SCHEMA,
         "identity": {
             "source_sha256": source_sha256,
-            "plan_sha256": _plan_identity(source_sha256),
+            "plan_sha256": _plan_identity(source_sha256, runtime_identity),
+            "runtime": runtime_identity,
+            "consistency_not_attestation": True,
         },
         "protocol": _protocol_payload(),
         "config": dict(FROZEN_GEOMETRY_CONFIG),
