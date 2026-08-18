@@ -548,7 +548,7 @@ class QHordeActorCriticAgent:
             config=QHordeActorCriticConfig.from_config(config["config"]),
             critic=HordeLearner.from_config(config["critic"]),
             actor_bounder=bounder_from_config(config["actor_bounder"])
-            if config.get("actor_bounder")
+            if config.get("actor_bounder") is not None
             else None,
         )
 
@@ -840,7 +840,7 @@ class HordeActorCriticAgent:
             config=HordeActorCriticConfig.from_config(config["config"]),
             critic=HordeLearner.from_config(config["critic"]),
             actor_bounder=bounder_from_config(config["actor_bounder"])
-            if config.get("actor_bounder")
+            if config.get("actor_bounder") is not None
             else None,
         )
 
@@ -1600,7 +1600,7 @@ class NonlinearHordeActorCriticAgent:
             critic=HordeLearner.from_config(cfg["critic"]),
             actor_optimizer=actor_opt,
             actor_bounder=bounder_from_config(cfg["actor_bounder"])
-            if cfg.get("actor_bounder")
+            if cfg.get("actor_bounder") is not None
             else None,
         )
 
@@ -2273,7 +2273,7 @@ class NonlinearQHordeActorCriticAgent:
             critic=HordeLearner.from_config(payload["critic"]),
             actor_optimizer=actor_opt,
             actor_bounder=bounder_from_config(payload["actor_bounder"])
-            if payload.get("actor_bounder")
+            if payload.get("actor_bounder") is not None
             else None,
         )
 

@@ -496,7 +496,7 @@ class ActorCriticAgent:
         bounder_config = payload.pop("bounder")
         if bounder_config is not None and not issubclass(type(bounder_config), Mapping):
             raise ValueError("serialized bounder must be a mapping or None")
-        bounder = bounder_from_config(bounder_config) if bounder_config else None
+        bounder = bounder_from_config(bounder_config) if bounder_config is not None else None
         return cls(config=ac_config, bounder=bounder)
 
     def init(self, feature_dim: int, key: Array) -> ActorCriticState:
@@ -1271,7 +1271,7 @@ class ContinuousActorCriticAgent:
         bounder_config = payload.pop("bounder")
         if bounder_config is not None and not issubclass(type(bounder_config), Mapping):
             raise ValueError("serialized bounder must be a mapping or None")
-        bounder = bounder_from_config(bounder_config) if bounder_config else None
+        bounder = bounder_from_config(bounder_config) if bounder_config is not None else None
         return cls(config=ac_config, bounder=bounder)
 
     def init(self, feature_dim: int, key: Array) -> ContinuousActorCriticState:
