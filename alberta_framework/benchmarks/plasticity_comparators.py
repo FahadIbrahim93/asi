@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import dataclasses
 import math
+from collections.abc import Mapping
+from types import MappingProxyType
 from typing import Final, Literal, cast
 
 import jax.numpy as jnp
@@ -36,26 +38,36 @@ class ComparatorProtocol:
 
     def __post_init__(self) -> None:
         for field in ("name", "paper", "adaptation", "mechanism_off"):
-            if type(getattr(self, field)) is not str or not getattr(self, field):
+            value = getattr(self, field)
+            if type(value) is not str or not value:
                 raise ValueError(f"{field} must be an exact non-empty string")
         required_axes = ("seed", "updates", "observations", "example_order")
-        if type(self.matched_axes) is not tuple or self.matched_axes != required_axes:
+        if (
+            type(self.matched_axes) is not tuple
+            or len(self.matched_axes) != len(required_axes)
+            or any(type(value) is not str for value in self.matched_axes)
+            or self.matched_axes != required_axes
+        ):
             raise ValueError(f"matched_axes must equal {required_axes!r}")
         for field in ("persistent_bytes", "environment_or_data_steps", "model_queries"):
             value = getattr(self, field)
             if type(value) is not int or value < 0:
                 raise ValueError(f"{field} must be a nonnegative exact integer")
+        try:
+            timing = float(self.timing_telemetry_seconds)
+        except (OverflowError, TypeError, ValueError):
+            timing = math.nan
         if (
             type(self.timing_telemetry_seconds) not in (int, float)
-            or not math.isfinite(self.timing_telemetry_seconds)
-            or self.timing_telemetry_seconds < 0
+            or not math.isfinite(timing)
+            or timing < 0
         ):
             raise ValueError("timing_telemetry_seconds must be finite and nonnegative")
         if self.development_only is not True or self.scientific_promotion_allowed is not False:
             raise ValueError("comparator protocols are permanently nonpromoting")
 
 
-PAPER_REVISIONS: Final[dict[str, str]] = {
+PAPER_REVISIONS: Final[Mapping[str, str]] = MappingProxyType({
     "l2_er": "arXiv:2509.22335v3",
     "adamo": "arXiv:2606.09762v1",
     "intentional_updates": "arXiv:2604.19033v1",
@@ -67,7 +79,7 @@ PAPER_REVISIONS: Final[dict[str, str]] = {
     "aid": "arXiv:2502.01342v2",
     "deep_fourier": "arXiv:2410.20634v1",
     "noise_curvature": "arXiv:2509.19698v3",
-}
+})
 
 
 def protocol(
@@ -122,10 +134,13 @@ def protocol(
 def _finite_scalar(name: str, value: object, *, minimum: float = 0.0) -> float:
     if type(value) not in (int, float):
         raise ValueError(f"{name} must be an exact finite scalar >= {minimum}")
-    scalar = cast(int | float, value)
+    try:
+        scalar = float(cast(int | float, value))
+    except (OverflowError, TypeError, ValueError) as error:
+        raise ValueError(f"{name} must be an exact finite scalar >= {minimum}") from error
     if not math.isfinite(scalar) or scalar < minimum:
         raise ValueError(f"{name} must be an exact finite scalar >= {minimum}")
-    return float(scalar)
+    return scalar
 
 
 def _probability(name: str, value: object, *, include_one: bool = True) -> float:
@@ -137,9 +152,30 @@ def _probability(name: str, value: object, *, include_one: bool = True) -> float
 
 
 def _array(name: str, value: object) -> Array:
-    if type(value) is not np.ndarray and not isinstance(value, (Array, core.Tracer)):
+    actual_type = type(value)
+    if actual_type is not np.ndarray and not issubclass(actual_type, (Array, core.Tracer)):
         raise ValueError(f"{name} must be a NumPy or JAX array")
     return jnp.asarray(value)
+
+
+def _threefry_key(name: str, value: object) -> Array:
+    actual_type = type(value)
+    if not issubclass(actual_type, (Array, core.Tracer)):
+        raise ValueError(f"{name} must be a scalar typed Threefry JAX key")
+    trusted = cast(Array, value)
+    try:
+        words = jr.key_data(trusted)
+        implementation = str(jr.key_impl(trusted))
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{name} must be a scalar typed Threefry JAX key") from error
+    if (
+        trusted.shape != ()
+        or words.shape != (2,)
+        or words.dtype != jnp.dtype(jnp.uint32)
+        or implementation != "threefry2x32"
+    ):
+        raise ValueError(f"{name} must be a scalar typed Threefry JAX key")
+    return trusted
 
 
 def persistent_array_bytes(*arrays: Array | np.ndarray) -> int:
@@ -184,14 +220,20 @@ def l2_er_objective(
     rank_strength: float,
 ) -> Array:
     """Paper objective: task loss + L2 - mean effective rank."""
-    if not parameters or not feature_batches:
+    if (
+        type(parameters) is not tuple
+        or type(feature_batches) is not tuple
+        or not parameters
+        or not feature_batches
+    ):
         raise ValueError("parameters and feature_batches must be non-empty tuples")
     _finite_scalar("l2_strength", l2_strength)
     _finite_scalar("rank_strength", rank_strength)
-    loss = jnp.asarray(task_loss)
+    loss = _array("task_loss", task_loss)
     if loss.ndim != 0:
         raise ValueError("task_loss must be scalar")
-    l2 = sum((jnp.sum(jnp.square(value)) for value in parameters), jnp.asarray(0.0))
+    trusted_parameters = tuple(_array("parameter", value) for value in parameters)
+    l2 = sum((jnp.sum(jnp.square(value)) for value in trusted_parameters), jnp.asarray(0.0))
     ranks = jnp.stack(tuple(effective_rank(value) for value in feature_batches))
     return loss + l2_strength * l2 - rank_strength * jnp.mean(ranks)
 
@@ -352,6 +394,8 @@ def utility_scaled_pull(
     if weights.shape != initial.shape or utility.shape != weights.shape:
         raise ValueError("weights, initialization, and utilities must match")
     _probability("strength", strength)
+    if type(mode) is not str:
+        raise ValueError("unknown utility pull mode")
     if strength == 0:
         return weights
     if mode == "utility":
@@ -438,6 +482,7 @@ def interval_dropout(
     if type(training) is not bool:
         raise ValueError("training must be an exact bool")
     value = _array("value", value)
+    key = _threefry_key("key", key)
     if not training:
         return jnp.where(value >= 0, probability * value, (1.0 - probability) * value)
     use_relu = jr.bernoulli(key, probability, value.shape)
