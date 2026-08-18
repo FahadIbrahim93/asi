@@ -635,10 +635,7 @@ class RecurringFeatureGateResult:
         criteria: RecurringFeatureGateCriteria | None = None,
     ) -> RecurringFeatureGateDecision:
         """Evaluate this result without trusting a cached pass flag."""
-        return evaluate_recurring_feature_gate(
-            self,
-            criteria=criteria or RecurringFeatureGateCriteria(),
-        )
+        return evaluate_recurring_feature_gate(self, criteria=criteria)
 
     def require_pass(
         self,
@@ -692,9 +689,9 @@ def _validated_task_recovery(value: object) -> TaskRecoveryEvidence:
 def _validated_seed_evidence(value: object) -> RecurringFeatureSeedEvidence:
     if type(value) is not RecurringFeatureSeedEvidence:
         raise ValueError("seeds must contain exact RecurringFeatureSeedEvidence records")
-    if type(value.phase_evidence) is not tuple:
+    if type(value.phase_evidence) is not tuple or len(value.phase_evidence) > 4096:
         raise ValueError("phase_evidence must be a bounded exact tuple")
-    if type(value.task_recovery) is not tuple:
+    if type(value.task_recovery) is not tuple or len(value.task_recovery) > 4096:
         raise ValueError("task_recovery must be a bounded exact tuple")
     return RecurringFeatureSeedEvidence(
         seed=value.seed,
@@ -710,7 +707,7 @@ def _validated_seed_evidence(value: object) -> RecurringFeatureSeedEvidence:
 def _validated_variant_evidence(value: object) -> RecurringFeatureVariantEvidence:
     if type(value) is not RecurringFeatureVariantEvidence:
         raise ValueError("variants must be exact RecurringFeatureVariantEvidence records")
-    if type(value.seeds) is not tuple:
+    if type(value.seeds) is not tuple or len(value.seeds) > 4096:
         raise ValueError("seeds must be a bounded exact tuple")
     return RecurringFeatureVariantEvidence(
         name=value.name,
@@ -745,6 +742,16 @@ def _validated_gate_result(value: object) -> RecurringFeatureGateResult:
         no_retention=_validated_variant_evidence(value.no_retention),
         scope=value.scope,
     )
+
+
+def _validated_gate_criteria(value: object) -> RecurringFeatureGateCriteria:
+    if value is None:
+        return RecurringFeatureGateCriteria()
+    if type(value) is not RecurringFeatureGateCriteria:
+        raise ValueError("criteria must be an exact RecurringFeatureGateCriteria")
+    checked = replace(value)
+    checked.validate()
+    return checked
 
 
 @dataclass(frozen=True, slots=True)
@@ -1147,8 +1154,7 @@ def evaluate_recurring_feature_gate(
 ) -> RecurringFeatureGateDecision:
     """Recompute a fail-closed decision from raw per-seed evidence."""
     result = _validated_gate_result(result)
-    chosen = criteria or RecurringFeatureGateCriteria()
-    chosen.validate()
+    chosen = _validated_gate_criteria(criteria)
     failures = _canonical_protocol_failures(result.protocol)
     failures.extend(_seed_failures(result))
 

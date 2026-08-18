@@ -170,3 +170,24 @@ def test_decision_revalidates_and_cross_binds_memory_budget() -> None:
     )
     with pytest.raises(ValueError, match="capacities must match"):
         mismatched.decision()
+
+
+def test_decision_preflights_forged_nested_lengths_before_snapshot() -> None:
+    result = _decision_result()
+    seed = result.retained.seeds[0]
+    object.__setattr__(seed, "phase_evidence", seed.phase_evidence * 4097)
+    with pytest.raises(ValueError, match="bounded exact tuple"):
+        result.decision()
+
+
+def test_decision_rejects_hostile_criteria_without_truthiness_dispatch() -> None:
+    class HostileCriteria:
+        calls = 0
+
+        def __bool__(self) -> bool:
+            type(self).calls += 1
+            raise AssertionError("hostile truthiness")
+
+    with pytest.raises(ValueError, match="criteria must be an exact"):
+        _decision_result().decision(HostileCriteria())  # type: ignore[arg-type]
+    assert HostileCriteria.calls == 0
