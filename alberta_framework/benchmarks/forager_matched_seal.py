@@ -158,14 +158,14 @@ class _OpenDirectory:
 
 
 def _plain(value: Any) -> Any:
-    if type(value) in (dict, MappingProxyType):
+    if type(value) is dict or type(value) is MappingProxyType:
         result: dict[str, Any] = {}
         for key, item in value.items():
             if type(key) is not str:
                 raise ForagerMatchedSealError("canonical mappings require string keys")
             result[key] = _plain(item)
         return result
-    if type(value) in (list, tuple):
+    if type(value) is list or type(value) is tuple:
         return [_plain(item) for item in value]
     if type(value) is float:
         if not math.isfinite(value):
@@ -173,7 +173,7 @@ def _plain(value: Any) -> Any:
                 "canonical content contains a non-finite JSON number"
             )
         return value
-    if value is None or type(value) in {str, bool, int}:
+    if value is None or type(value) is str or type(value) is bool or type(value) is int:
         return value
     raise ForagerMatchedSealError(
         f"canonical content contains unsupported {type(value).__name__}"

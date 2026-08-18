@@ -290,7 +290,8 @@ _ACTUAL_INT_TYPES = frozenset(
 
 
 def _require_int32(name: str, value: object, *, minimum: int = 1) -> int:
-    if type(value) not in _ACTUAL_INT_TYPES:
+    actual_type = type(value)
+    if not any(actual_type is allowed_type for allowed_type in _ACTUAL_INT_TYPES):
         raise ValueError(f"{name} must be an integer")
     try:
         number = operator.index(cast(SupportsIndex, value))
@@ -302,7 +303,7 @@ def _require_int32(name: str, value: object, *, minimum: int = 1) -> int:
 
 
 def _require_finite_real(name: str, value: object) -> float:
-    if type(value) not in (int, float):
+    if type(value) is not int and type(value) is not float:
         raise ValueError(f"{name} must be a finite real number")
     number = float(cast("int | float", value))
     if not math.isfinite(number):
@@ -781,7 +782,7 @@ _LEARNER_DEFAULT_HYPERPARAMETERS: dict[str, dict[str, float]] = {
 def _validated_hyperparameter(name: object, value: object) -> float:
     """Validate one JSON override in its exact host and float32 execution domains."""
     host_name = _require_exact_str("name", name)
-    if type(value) not in (int, float):
+    if type(value) is not int and type(value) is not float:
         raise ValueError(f"hyperparameter '{host_name}' must be a finite JSON number")
     label = f"hyperparameter '{host_name}'"
     if name in {"step_size", "eps"}:
@@ -826,7 +827,7 @@ class IPMNISTRunResult:
         for name, value in self.hyperparameters.items():
             if type(name) is not str or not name:
                 raise TypeError("hyperparameters keys must be exact non-empty strings")
-            if type(value) not in (int, float) or not math.isfinite(value):
+            if (type(value) is not int and type(value) is not float) or not math.isfinite(value):
                 raise ValueError("hyperparameters values must be finite built-in numbers")
             normalized_hyperparameters[name] = float(value)
         object.__setattr__(self, "hyperparameters", normalized_hyperparameters)
