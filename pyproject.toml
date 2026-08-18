@@ -76,6 +76,7 @@ Issues = "https://github.com/elizaOS/asi/issues"
 Upstream = "https://github.com/lalalune/alberta"
 
 [project.scripts]
+asi-action-conditioned-latent = "alberta_framework.benchmarks.action_conditioned_latent:main"
 asi-ipmnist-campaign = "alberta_framework.benchmarks.ipmnist_campaign_tools:main"
 asi-ipmnist-ceiling = "alberta_framework.benchmarks.ipmnist_ceiling:main"
 asi-rule-discovery-summary = "alberta_framework.benchmarks.rule_discovery_summary:main"
