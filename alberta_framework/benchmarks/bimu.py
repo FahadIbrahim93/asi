@@ -56,6 +56,7 @@ NONPROMOTING_POLICY: Final[dict[str, object]] = {
 _REMAINING_PAPER_GAPS: Final[tuple[str, ...]] = (
     "official MNIST bytes and dataloader order are not content-bound",
     "one result is one development seed, not the paper's five-run aggregate",
+    "matched control results are not produced by this one-arm runner",
     "Concrete uniforms use float32-safe endpoint clipping instead of the official 1e-10 literal",
 )
 
@@ -94,9 +95,11 @@ _INT32_MAX = 2**31 - 1
 _MAX_VECTOR_ELEMENTS = 1_000_000
 
 
-def _exact_positive_int(value: object, name: str, *, minimum: int = 1) -> int:
-    if type(value) is not int or value < minimum:
-        raise ValueError(f"{name} must be an integer >= {minimum}")
+def _exact_positive_int(
+    value: object, name: str, *, minimum: int = 1, maximum: int = _INT32_MAX
+) -> int:
+    if type(value) is not int or value < minimum or value > maximum:
+        raise ValueError(f"{name} must be an integer in [{minimum}, {maximum}]")
     return value
 
 
@@ -199,7 +202,10 @@ class BiMUConfig:
             "train_examples_per_task": self.train_examples_per_task,
             "test_examples_per_task": self.test_examples_per_task,
             "train_batch_size": 1,
-            "test_batch_size": 500,
+            # This records the pinned official-code configuration. The local
+            # runner evaluates one example at a time, which is numerically
+            # equivalent because the network has no batch-dependent state.
+            "official_test_batch_size": 500,
             "epochs_per_task": 1,
             "train_samples": self.train_samples,
             "test_samples": self.test_samples,
@@ -265,9 +271,7 @@ def posterior_probability_transaction(natural_parameter: object) -> tuple[Array,
     logit = 2.0 * state
     result = jax.nn.sigmoid(logit)
     valid = (
-        jnp.all(jnp.isfinite(state))
-        & jnp.all(jnp.isfinite(logit))
-        & jnp.all(jnp.isfinite(result))
+        jnp.all(jnp.isfinite(state)) & jnp.all(jnp.isfinite(logit)) & jnp.all(jnp.isfinite(result))
     )
     return jnp.where(valid, result, jnp.full_like(result, 0.5)), valid
 
@@ -289,11 +293,10 @@ def sample_binary_weights(natural_parameter: object, key: Array) -> Array:
     return 2.0 * positive.astype(state.dtype) - 1.0
 
 
-def concrete_binary_weights(
-    natural_parameter: object, key: Array, *, temperature: float
-) -> Array:
+def concrete_binary_weights(natural_parameter: object, key: Array, *, temperature: float) -> Array:
     """Draw the paper's differentiable binary Concrete/Gumbel relaxation."""
     state = _floating_array(natural_parameter, name="natural_parameter")
+    _finite_float(temperature, "temperature", positive=True)
     epsilon = jnp.asarray(1e-7, dtype=state.dtype)
     uniform = jr.uniform(key, state.shape, dtype=state.dtype)
     uniform = jnp.clip(uniform, epsilon, 1.0 - epsilon)
@@ -399,15 +402,12 @@ def _reverse_binary_gate(value: Array) -> Array:
 
 
 @_reverse_binary_gate.defjvp
-def _reverse_binary_gate_jvp(
-    primals: tuple[Array], tangents: tuple[Array]
-) -> tuple[Array, Array]:
+def _reverse_binary_gate_jvp(primals: tuple[Array], tangents: tuple[Array]) -> tuple[Array, Array]:
     (value,), (tangent,) = primals, tangents
     output = _reverse_binary_gate(value)
-    surrogate = (
-        ((value > 0.5) & (value < 1.5)).astype(value.dtype)
-        - ((value > -1.5) & (value < -0.5)).astype(value.dtype)
-    )
+    surrogate = ((value > 0.5) & (value < 1.5)).astype(value.dtype) - (
+        (value > -1.5) & (value < -0.5)
+    ).astype(value.dtype)
     return output, tangent * surrogate
 
 
@@ -458,7 +458,7 @@ def _add_state(left: BiMUState, right: BiMUState) -> BiMUState:
     )
 
 
-@partial(jax.jit, static_argnames=("n_samples",))
+@partial(jax.jit, static_argnames=("temperature", "n_samples"))
 def _concrete_mean_gradient(
     state: BiMUState,
     features: Array,
@@ -472,9 +472,7 @@ def _concrete_mean_gradient(
     total = _zero_state_like(state)
     sample_keys = jr.split(key, n_samples)
     for sample_key in sample_keys:
-        concrete_state = _sample_state(
-            state, sample_key, concrete=True, temperature=temperature
-        )
+        concrete_state = _sample_state(state, sample_key, concrete=True, temperature=temperature)
         raw_gradient = jax.grad(_loss)(concrete_state, features, label)
 
         def correct(gradient: Array, natural: Array, relaxed: Array) -> Array:
@@ -498,15 +496,11 @@ def _concrete_mean_gradient(
 
 
 @partial(jax.jit, static_argnames=("n_samples",))
-def _binary_predictions(
-    state: BiMUState, features: Array, key: Array, *, n_samples: int
-) -> Array:
+def _binary_predictions(state: BiMUState, features: Array, key: Array, *, n_samples: int) -> Array:
     keys = jr.split(key, n_samples)
     logits = jnp.stack(
         [
-            _forward(
-                _sample_state(state, item, concrete=False, temperature=1.0), features
-            )
+            _forward(_sample_state(state, item, concrete=False, temperature=1.0), features)
             for item in keys
         ]
     )
@@ -621,7 +615,7 @@ def _validated_dataset(
     )
 
 
-def _state_sha256(state: BiMUState) -> str:
+def _state_sha256(state: BiMUState, *, optimizer_step: int, optimizer_seen: int) -> str:
     digest = hashlib.sha256()
     for name, value in (
         ("input_hidden", state.input_hidden),
@@ -631,6 +625,12 @@ def _state_sha256(state: BiMUState) -> str:
         digest.update(name.encode("ascii"))
         digest.update(str(host.shape).encode("ascii"))
         digest.update(host.tobytes(order="C"))
+    for counter_name, counter_value in (
+        ("optimizer_step", optimizer_step),
+        ("optimizer_seen", optimizer_seen),
+    ):
+        digest.update(counter_name.encode("ascii"))
+        digest.update(np.asarray(counter_value, dtype="<u4").tobytes())
     return digest.hexdigest()
 
 
@@ -704,10 +704,9 @@ def run_bimu_development(
     started = time.perf_counter()
     root = jr.key(seed)
     state = _initialize_state(config, jr.fold_in(root, _INIT_DOMAIN))
-    initial_sha256 = _state_sha256(state)
+    initial_sha256 = _state_sha256(state, optimizer_step=0, optimizer_seen=0)
     task_permutations = build_task_schedule(config, seed=seed)
-    schedule_records: list[dict[str, object]] = []
-    per_task_test_accuracy: list[float] = []
+    schedule_digest = hashlib.sha256()
     online_correct = 0
     observations = 0
     label_queries = 0
@@ -729,9 +728,7 @@ def run_bimu_development(
             predictions = _binary_predictions(
                 state, features, query_key, n_samples=config.query_samples
             )
-            prediction, variation_ratio = _majority_prediction(
-                predictions, config.n_classes
-            )
+            prediction, variation_ratio = _majority_prediction(predictions, config.n_classes)
             queried = variation_ratio >= config.query_threshold
             task_queries.append(queried)
             online_correct += int(prediction == label)
@@ -757,6 +754,27 @@ def run_bimu_development(
                 model_forward_queries += config.train_samples
             global_step += 1
 
+        # Stream schedule identity instead of retaining the paper schedule's
+        # sixty million query decisions in memory.
+        schedule_digest.update(
+            json.dumps(
+                {
+                    "task": task,
+                    "permutation": list(permutation_tuple),
+                    "example_order": [int(value) for value in example_order],
+                    "query_decisions": task_queries,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+
+    # The paper's named metric is evaluated after the complete stream, on the
+    # final five task distributions. Evaluating each task immediately after
+    # training measures plasticity instead and can conceal late-stream failure.
+    final_five_test_accuracy: list[float] = []
+    for task in range(config.n_tasks - 5, config.n_tasks):
+        permutation = np.asarray(task_permutations[task], dtype=np.int32)
         task_correct = 0
         for test_index in range(config.test_examples_per_task):
             features = jnp.asarray(test_x[test_index, permutation], dtype=jnp.float32)
@@ -772,20 +790,12 @@ def run_bimu_development(
             prediction, _ = _majority_prediction(predictions, config.n_classes)
             task_correct += int(prediction == int(test_y[test_index]))
             model_forward_queries += config.test_samples
-        per_task_test_accuracy.append(task_correct / config.test_examples_per_task)
-        schedule_records.append(
-            {
-                "task": task,
-                "permutation": list(permutation_tuple),
-                "example_order": [int(value) for value in example_order],
-                "query_decisions": task_queries,
-            }
-        )
+        final_five_test_accuracy.append(task_correct / config.test_examples_per_task)
 
-    schedule_sha256 = hashlib.sha256(
-        json.dumps(schedule_records, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
-    final_sha256 = _state_sha256(state)
+    schedule_sha256 = schedule_digest.hexdigest()
+    final_sha256 = _state_sha256(
+        state, optimizer_step=optimizer_updates, optimizer_seen=optimizer_updates
+    )
     parameter_bytes = config.trainable_scalar_count * np.dtype(np.float32).itemsize
     # The official optimizer persists ``step`` and ``seen`` in addition to the
     # natural parameters.  This lane represents them canonically as uint32;
@@ -804,11 +814,9 @@ def run_bimu_development(
         "initial_state_sha256": initial_sha256,
         "final_state_sha256": final_sha256,
         "metrics": {
-            "paper_late_five_test_accuracy": late_window_mean(
-                per_task_test_accuracy, window=5
-            ),
+            "paper_late_five_test_accuracy": late_window_mean(final_five_test_accuracy, window=5),
             "asi_whole_stream_online_accuracy": online_correct / observations,
-            "per_task_test_accuracy": per_task_test_accuracy,
+            "final_five_test_accuracy": final_five_test_accuracy,
         },
         "counters": {
             "environment_steps": observations,
@@ -836,16 +844,13 @@ def run_bimu_development(
     return result
 
 
-def late_window_mean(
-    task_accuracies: list[float] | tuple[float, ...], *, window: int = 5
-) -> float:
+def late_window_mean(task_accuracies: list[float] | tuple[float, ...], *, window: int = 5) -> float:
     """Compute the paper's late-task metric, never whole-stream accuracy."""
     if type(window) is not int or window < 1 or window > _MAX_VECTOR_ELEMENTS:
         raise ValueError("window must be an integer in [1, 1000000]")
-    if (
-        (type(task_accuracies) is not list and type(task_accuracies) is not tuple)
-        or len(task_accuracies) > _MAX_VECTOR_ELEMENTS
-    ):
+    if (type(task_accuracies) is not list and type(task_accuracies) is not tuple) or len(
+        task_accuracies
+    ) > _MAX_VECTOR_ELEMENTS:
         raise ValueError("task_accuracies must be an exact bounded list or tuple")
     if any(type(value) is not int and type(value) is not float for value in task_accuracies):
         raise ValueError("task_accuracies must contain exact real numbers")
@@ -878,7 +883,10 @@ _TOP_LEVEL_FIELDS: Final = {
 
 
 def _exact_mapping(value: object, fields: set[str], name: str) -> Mapping[str, object]:
-    if type(value) is not dict or set(value) != fields:
+    if type(value) is not dict:
+        raise ValueError(f"{name} fields do not match the strict schema")
+    keys = tuple(value.keys())
+    if any(type(key) is not str for key in keys) or set(keys) != fields:
         raise ValueError(f"{name} fields do not match the strict schema")
     return cast(Mapping[str, object], value)
 
@@ -886,6 +894,17 @@ def _exact_mapping(value: object, fields: set[str], name: str) -> Mapping[str, o
 def _payload_config(value: object) -> BiMUConfig:
     fields = set(BIMU_PAPER_CONFIG.to_protocol_payload())
     payload = _exact_mapping(value, fields, "protocol")
+    for field in (
+        "schema",
+        "paper_revision",
+        "official_code_url",
+        "official_code_commit",
+        "dataset",
+        "architecture",
+        "activation",
+    ):
+        if type(payload[field]) is not str:
+            raise ValueError(f"{field} must be an exact string")
     if payload["schema"] != PROTOCOL_SCHEMA:
         raise ValueError("protocol schema drifted")
     if payload["paper_revision"] != PAPER_REVISION:
@@ -902,7 +921,7 @@ def _payload_config(value: object) -> BiMUConfig:
         raise ValueError("activation declaration drifted")
     for field, expected in (
         ("train_batch_size", 1),
-        ("test_batch_size", 500),
+        ("official_test_batch_size", 500),
         ("epochs_per_task", 1),
     ):
         if payload[field] != expected or type(payload[field]) is not int:
@@ -911,9 +930,7 @@ def _payload_config(value: object) -> BiMUConfig:
         raise ValueError("learner task-boundary policy drifted")
     memory_value = payload["memory_window"]
     memory_window = (
-        None
-        if memory_value is None
-        else _exact_positive_int(memory_value, "memory_window")
+        None if memory_value is None else _exact_positive_int(memory_value, "memory_window")
     )
     config = BiMUConfig(
         input_dim=_exact_positive_int(payload["input_dim"], "input_dim"),
@@ -928,21 +945,15 @@ def _payload_config(value: object) -> BiMUConfig:
         ),
         train_samples=_exact_positive_int(payload["train_samples"], "train_samples"),
         test_samples=_exact_positive_int(payload["test_samples"], "test_samples"),
-        query_samples=_exact_positive_int(
-            payload["query_samples"], "query_samples", minimum=2
-        ),
+        query_samples=_exact_positive_int(payload["query_samples"], "query_samples", minimum=2),
         temperature=_finite_float(payload["temperature"], "temperature", positive=True),
         likelihood_multiplier=_finite_float(
             payload["likelihood_multiplier"], "likelihood_multiplier", positive=True
         ),
-        kl_multiplier=_finite_float(
-            payload["kl_multiplier"], "kl_multiplier", positive=True
-        ),
+        kl_multiplier=_finite_float(payload["kl_multiplier"], "kl_multiplier", positive=True),
         alpha_max=_finite_float(payload["alpha_max"], "alpha_max", positive=True),
         memory_window=memory_window,
-        gradient_scale=_finite_float(
-            payload["gradient_scale"], "gradient_scale", positive=True
-        ),
+        gradient_scale=_finite_float(payload["gradient_scale"], "gradient_scale", positive=True),
         query_threshold=_finite_float(
             payload["query_threshold"], "query_threshold", lower=0.0, upper=1.0
         ),
@@ -960,12 +971,24 @@ def _unit_interval(value: object, name: str) -> float:
 def validate_bimu_result(value: object) -> None:
     """Fail closed on any result, accounting, provenance, or policy drift."""
     payload = _exact_mapping(value, _TOP_LEVEL_FIELDS, "result")
-    if payload["schema"] != RESULT_SCHEMA or payload["status"] != "complete":
+    if (
+        type(payload["schema"]) is not str
+        or type(payload["status"]) is not str
+        or payload["schema"] != RESULT_SCHEMA
+        or payload["status"] != "complete"
+    ):
         raise ValueError("result identity or completion status drifted")
     seed = _exact_positive_int(payload["seed"], "seed", minimum=0)
     del seed
     config = _payload_config(payload["protocol"])
-    if payload["evidence_policy"] != NONPROMOTING_POLICY:
+    policy = _exact_mapping(payload["evidence_policy"], set(NONPROMOTING_POLICY), "evidence_policy")
+    if (
+        type(policy["evidence_class"]) is not str
+        or type(policy["development_only"]) is not bool
+        or type(policy["scientific_promotion_allowed"]) is not bool
+        or type(policy["sota_claim_allowed"]) is not bool
+        or dict(policy) != NONPROMOTING_POLICY
+    ):
         raise ValueError("evidence policy must remain permanently nonpromoting")
     for field in (
         "dataset_sha256",
@@ -985,15 +1008,15 @@ def validate_bimu_result(value: object) -> None:
         {
             "paper_late_five_test_accuracy",
             "asi_whole_stream_online_accuracy",
-            "per_task_test_accuracy",
+            "final_five_test_accuracy",
         },
         "metrics",
     )
-    raw_per_task = metrics["per_task_test_accuracy"]
-    if type(raw_per_task) is not list or len(cast(list[object], raw_per_task)) != config.n_tasks:
-        raise ValueError("per-task test accuracy length drifted")
+    raw_per_task = metrics["final_five_test_accuracy"]
+    if type(raw_per_task) is not list or len(cast(list[object], raw_per_task)) != 5:
+        raise ValueError("final-five test accuracy length drifted")
     per_task = [
-        _unit_interval(item, f"per_task_test_accuracy[{index}]")
+        _unit_interval(item, f"final_five_test_accuracy[{index}]")
         for index, item in enumerate(cast(list[object], raw_per_task))
     ]
     paper_metric = _unit_interval(
@@ -1001,9 +1024,7 @@ def validate_bimu_result(value: object) -> None:
     )
     if paper_metric != late_window_mean(per_task, window=5):
         raise ValueError("paper late-five metric is not canonical")
-    _unit_interval(
-        metrics["asi_whole_stream_online_accuracy"], "asi_whole_stream_online_accuracy"
-    )
+    _unit_interval(metrics["asi_whole_stream_online_accuracy"], "asi_whole_stream_online_accuracy")
 
     counters = _exact_mapping(
         payload["counters"],
@@ -1031,7 +1052,7 @@ def validate_bimu_result(value: object) -> None:
     expected_forwards = (
         expected_steps * config.query_samples
         + parsed_counters["label_queries"] * config.train_samples
-        + config.n_tasks * config.test_examples_per_task * config.test_samples
+        + 5 * config.test_examples_per_task * config.test_samples
     )
     if parsed_counters["model_forward_queries"] != expected_forwards:
         raise ValueError("model-forward query count drifted")
@@ -1059,9 +1080,12 @@ def validate_bimu_result(value: object) -> None:
     ):
         raise ValueError("parameter byte accounting drifted")
     optimizer_state_bytes = 2 * np.dtype(np.uint32).itemsize
-    if _exact_positive_int(
-        resources["optimizer_state_numeric_bytes"], "optimizer_state_numeric_bytes"
-    ) != optimizer_state_bytes:
+    if (
+        _exact_positive_int(
+            resources["optimizer_state_numeric_bytes"], "optimizer_state_numeric_bytes"
+        )
+        != optimizer_state_bytes
+    ):
         raise ValueError("optimizer-state byte accounting drifted")
     expected_bytes = parameter_bytes + optimizer_state_bytes
     for field in ("initial_persistent_numeric_bytes", "final_persistent_numeric_bytes"):
@@ -1081,5 +1105,13 @@ def validate_bimu_result(value: object) -> None:
     _finite_float(timing["wall_clock_seconds"], "wall_clock_seconds", lower=0.0)
     if timing["qualified"] is not False or timing["role"] != "telemetry_only":
         raise ValueError("timing must remain unqualified telemetry")
-    if payload["comparison"] != _comparison_payload():
+    comparison = _exact_mapping(payload["comparison"], set(_comparison_payload()), "comparison")
+    gaps = comparison["remaining_paper_gaps"]
+    if (
+        type(comparison["paper_comparable"]) is not bool
+        or type(comparison["development_only"]) is not bool
+        or type(gaps) is not list
+        or any(type(item) is not str for item in cast(list[object], gaps))
+        or dict(comparison) != _comparison_payload()
+    ):
         raise ValueError("paper-comparison fail-closed declaration drifted")

@@ -13,6 +13,7 @@ from alberta_framework.benchmarks.bimu import (
     BiMUConfig,
     BiMUState,
     _apply_gradient,
+    _state_sha256,
     bimu_update,
     bimu_update_transaction,
     build_task_schedule,
@@ -60,18 +61,14 @@ def _tiny_data() -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         dtype=np.float32,
     )
     train_y = np.asarray([0, 1, 0, 1], dtype=np.int32)
-    test_x = np.asarray(
-        [[1.0, 0.5, -0.5, -1.0], [-1.0, -0.5, 0.5, 1.0]], dtype=np.float32
-    )
+    test_x = np.asarray([[1.0, 0.5, -0.5, -1.0], [-1.0, -0.5, 0.5, 1.0]], dtype=np.float32)
     test_y = np.asarray([0, 1], dtype=np.int32)
     return train_x, train_y, test_x, test_y
 
 
 def test_protocol_pins_official_source_and_paper_configuration() -> None:
     assert BIMU_PROTOCOL["paper_revision"] == "arXiv:2605.30198v1"
-    assert BIMU_PROTOCOL["official_code_commit"] == (
-        "1b8a1a1fb892fbe89401390b3ff9611d7f3a5168"
-    )
+    assert BIMU_PROTOCOL["official_code_commit"] == ("1b8a1a1fb892fbe89401390b3ff9611d7f3a5168")
     assert BIMU_PAPER_CONFIG.n_tasks == 1000
     assert BIMU_PAPER_CONFIG.train_examples_per_task == 60_000
     assert BIMU_PAPER_CONFIG.hidden_units == 100
@@ -119,9 +116,7 @@ def test_binary_and_concrete_samples_are_explicit_and_reproducible() -> None:
     concrete = concrete_binary_weights(natural, key, temperature=0.7)
     np.testing.assert_allclose(concrete, concrete_binary_weights(natural, key, temperature=0.7))
     assert bool(jnp.all(jnp.abs(concrete) < 1.0))
-    derivative = jax.grad(
-        lambda x: concrete_binary_weights(x, key, temperature=0.7).sum()
-    )(natural)
+    derivative = jax.grad(lambda x: concrete_binary_weights(x, key, temperature=0.7).sum())(natural)
     assert bool(jnp.all(jnp.isfinite(derivative)))
 
 
@@ -139,9 +134,7 @@ def test_mechanism_off_removes_only_controlled_forgetting() -> None:
         gradient_scale=1.0,
     )
     uncertainty = 1.0 - jnp.tanh(state) ** 2
-    eta = 1.0 / (
-        uncertainty + 2.0 * jnp.tanh(state) * gradient + 2.0 + 2.0 * jnp.abs(gradient)
-    )
+    eta = 1.0 / (uncertainty + 2.0 * jnp.tanh(state) * gradient + 2.0 + 2.0 * jnp.abs(gradient))
     np.testing.assert_allclose(result, state - eta * gradient, rtol=1e-6)
 
 
@@ -187,8 +180,9 @@ def test_tiny_runner_is_end_to_end_strict_and_keeps_metrics_separate() -> None:
     counters = payload["counters"]
     resources = payload["resources"]
     assert metrics["paper_late_five_test_accuracy"] == pytest.approx(
-        np.mean(metrics["per_task_test_accuracy"][-5:])
+        np.mean(metrics["final_five_test_accuracy"])
     )
+    assert len(metrics["final_five_test_accuracy"]) == 5
     assert "asi_whole_stream_online_accuracy" in metrics
     assert counters["environment_steps"] == 20
     assert counters["observations"] == 20
@@ -198,9 +192,9 @@ def test_tiny_runner_is_end_to_end_strict_and_keeps_metrics_separate() -> None:
     assert resources["parameter_numeric_bytes"] == (4 * 3 + 3 * 2) * 4
     assert resources["optimizer_state_numeric_bytes"] == 8
     assert resources["initial_persistent_numeric_bytes"] == (4 * 3 + 3 * 2) * 4 + 8
-    assert resources["final_persistent_numeric_bytes"] == resources[
-        "initial_persistent_numeric_bytes"
-    ]
+    assert (
+        resources["final_persistent_numeric_bytes"] == resources["initial_persistent_numeric_bytes"]
+    )
     assert payload["comparison"]["paper_comparable"] is False
     assert payload["evidence_policy"]["scientific_promotion_allowed"] is False
 
@@ -213,6 +207,44 @@ def test_runner_replays_schedule_metrics_and_state_from_same_seed() -> None:
     assert first["final_state_sha256"] == second["final_state_sha256"]
     assert first["metrics"] == second["metrics"]
     assert first["counters"] == second["counters"]
+
+
+def test_paper_metric_evaluation_occurs_only_after_the_complete_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import alberta_framework.benchmarks.bimu as module
+
+    train_x, train_y, test_x, test_y = _tiny_data()
+    test_x = np.full_like(test_x, 99.0)
+    phases: list[str] = []
+    original_gradient = module._concrete_mean_gradient
+    original_predictions = module._binary_predictions
+
+    def recording_gradient(*args: object, **kwargs: object) -> BiMUState:
+        phases.append("train")
+        return original_gradient(*args, **kwargs)
+
+    def recording_predictions(
+        state: BiMUState, features: jax.Array, key: jax.Array, *, n_samples: int
+    ) -> jax.Array:
+        phases.append("test" if bool(jnp.all(features == 99.0)) else "train-query")
+        return original_predictions(state, features, key, n_samples=n_samples)
+
+    monkeypatch.setattr(module, "_concrete_mean_gradient", recording_gradient)
+    monkeypatch.setattr(module, "_binary_predictions", recording_predictions)
+    run_bimu_development(train_x, train_y, test_x, test_y, config=_tiny_config(), seed=29)
+    first_test = phases.index("test")
+    assert "train" in phases[:first_test]
+    assert set(phases[first_test:]) == {"test"}
+
+
+def test_state_identity_binds_live_optimizer_counters() -> None:
+    state = BiMUState(
+        input_hidden=jnp.zeros((2, 2), dtype=jnp.float32),
+        hidden_output=jnp.zeros((2, 2), dtype=jnp.float32),
+    )
+    initial = _state_sha256(state, optimizer_step=0, optimizer_seen=0)
+    assert _state_sha256(state, optimizer_step=1, optimizer_seen=1) != initial
 
 
 def test_no_query_schedule_performs_no_updates() -> None:
@@ -309,6 +341,41 @@ def test_primitives_reject_hostile_array_protocol_objects_without_calling_them()
     assert hostile.calls == 0
 
 
+def test_hostile_result_scalars_and_keys_are_rejected_before_hooks() -> None:
+    class HostileString(str):
+        calls = 0
+
+        def __eq__(self, other: object) -> bool:
+            self.calls += 1
+            raise AssertionError("must not run")
+
+        def __hash__(self) -> int:
+            self.calls += 1
+            return super().__hash__()
+
+    payload = run_bimu_development(*_tiny_data(), config=_tiny_config(), seed=31)
+    hostile_value = HostileString("complete")
+    payload["status"] = hostile_value
+    with pytest.raises(ValueError, match="identity"):
+        validate_bimu_result(payload)
+    assert hostile_value.calls == 0
+
+    payload = run_bimu_development(*_tiny_data(), config=_tiny_config(), seed=31)
+    hostile_key = HostileString("claim")
+    payload[hostile_key] = False
+    hostile_key.calls = 0
+    with pytest.raises(ValueError, match="fields"):
+        validate_bimu_result(payload)
+    assert hostile_key.calls == 0
+
+
+def test_configuration_and_concrete_scalars_are_exact_and_bounded() -> None:
+    with pytest.raises(ValueError, match="input_dim"):
+        _tiny_config(input_dim=2**31)
+    with pytest.raises(ValueError, match="temperature"):
+        concrete_binary_weights(jnp.zeros(2), jax.random.key(1), temperature=True)
+
+
 def test_float32_overflow_is_invalid_not_laundered() -> None:
     maximum = jnp.finfo(jnp.float32).max
     transact = jax.jit(
@@ -319,9 +386,7 @@ def test_float32_overflow_is_invalid_not_laundered() -> None:
     safe, valid = transact(jnp.full((2,), maximum))
     assert bool(jnp.all(jnp.isfinite(safe)))
     assert not bool(valid)
-    posterior, posterior_valid = jax.jit(posterior_probability_transaction)(
-        jnp.asarray([jnp.inf])
-    )
+    posterior, posterior_valid = jax.jit(posterior_probability_transaction)(jnp.asarray([jnp.inf]))
     np.testing.assert_array_equal(posterior, [0.5])
     assert not bool(posterior_valid)
     finite_posterior, finite_valid = jax.jit(posterior_probability_transaction)(
