@@ -48,13 +48,13 @@ def test_validate_oracle_experience_rejects_hostile_label_before_bool() -> None:
     schema = _schema()
     hostile = _HostileStr("safe")
     _HostileStr.calls = 0
-    record = SecurityOracleExperience(
-        state=(0.5,),
-        action=SecurityAction.PASS,
-        reward=0.0,
-        outcome={"label": hostile},  # type: ignore[dict-item]
-    )
-    with pytest.raises(ValueError, match="missing outcome label"):
+    with pytest.raises(ValueError, match="exact JSON values"):
+        record = SecurityOracleExperience(
+            state=(0.5,),
+            action=SecurityAction.PASS,
+            reward=0.0,
+            outcome={"label": hostile},  # type: ignore[dict-item]
+        )
         validate_security_oracle_experience([record], schema)
     assert _HostileStr.calls == 0
 
@@ -88,12 +88,12 @@ def test_hostile_empty_string_still_rejects_before_len() -> None:
     hostile = _HostileStr("")
     _HostileStr.calls = 0
     schema = _schema()
-    record = SecurityOracleExperience(
-        state=(0.5,),
-        action=SecurityAction.PASS,
-        reward=0.0,
-        outcome={"label": hostile},  # type: ignore[dict-item]
-    )
-    with pytest.raises(ValueError, match="missing outcome label"):
+    with pytest.raises(ValueError, match="exact JSON values"):
+        record = SecurityOracleExperience(
+            state=(0.5,),
+            action=SecurityAction.PASS,
+            reward=0.0,
+            outcome={"label": hostile},  # type: ignore[dict-item]
+        )
         validate_security_oracle_experience([record], schema)
     assert _HostileStr.calls == 0

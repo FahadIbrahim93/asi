@@ -226,13 +226,12 @@ def test_security_to_dict_rejects_nonfinite_numbers() -> None:
             next_state=(0.0, 1.0),
             terminated=False,
         )
-    experience = SecurityOracleExperience(
-        state=(0.0, 1.0),
-        action=SecurityAction.PASS,
-        reward=0.0,
-        outcome={"label": "true_negative", "score": float("nan")},
-    )
     with pytest.raises(ValueError, match="RFC-compliant JSON"):
         weights.to_dict()
     with pytest.raises(ValueError, match="RFC-compliant JSON"):
-        experience.to_dict()
+        SecurityOracleExperience(
+            state=(0.0, 1.0),
+            action=SecurityAction.PASS,
+            reward=0.0,
+            outcome={"label": "true_negative", "score": float("nan")},
+        )

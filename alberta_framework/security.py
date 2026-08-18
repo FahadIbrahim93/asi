@@ -33,6 +33,11 @@ def _require_rfc_json_mapping(payload: Mapping[str, Any], *, name: str) -> None:
 
 
 _INT32_MAX: int = 2**31 - 1
+_JSON_MAX_DEPTH: int = 32
+_JSON_MAX_NODES: int = 4096
+_JSON_MAX_STRING_LENGTH: int = 65_536
+_JSON_MAX_INTEGER_BITS: int = 64
+_ORACLE_EXPERIENCE_SCHEMA = "alberta.security_gym.oracle_experience.v1"
 
 _ACTUAL_INT_TYPES = frozenset(
     {
@@ -56,7 +61,8 @@ _ALLOWED_REAL_TYPES = _ACTUAL_INT_TYPES | _ACTUAL_FLOAT_TYPES
 
 
 def _copy_mapping(payload: object, *, name: str) -> dict[str, Any]:
-    if type(payload) not in (dict, MappingProxyType):
+    payload_type = type(payload)
+    if payload_type is not dict and payload_type is not MappingProxyType:
         raise ValueError(f"{name} must be a mapping")
     try:
         values = dict(cast(Mapping[str, Any], payload))
@@ -67,24 +73,59 @@ def _copy_mapping(payload: object, *, name: str) -> dict[str, Any]:
     return values
 
 
-def _copy_json_value(value: object, *, name: str) -> Any:
-    if value is None or type(value) in (bool, int, str):
+def _copy_json_value(
+    value: object,
+    *,
+    name: str,
+    depth: int = 0,
+    budget: list[int] | None = None,
+) -> Any:
+    if budget is None:
+        budget = [_JSON_MAX_NODES]
+    budget[0] -= 1
+    if budget[0] < 0:
+        raise ValueError(f"{name} exceeds the JSON value resource limit")
+    if depth > _JSON_MAX_DEPTH:
+        raise ValueError(f"{name} exceeds the JSON nesting limit")
+    value_type = type(value)
+    if value is None or value_type is bool:
         return value
-    if type(value) is float:
-        if not math.isfinite(value):
+    if value_type is int:
+        integer = cast(int, value)
+        if integer.bit_length() > _JSON_MAX_INTEGER_BITS:
+            raise ValueError(f"{name} contains an integer outside the supported range")
+        return integer
+    if value_type is str:
+        string = cast(str, value)
+        if len(string) > _JSON_MAX_STRING_LENGTH:
+            raise ValueError(f"{name} contains an oversized string")
+        return string
+    if value_type is float:
+        number = cast(float, value)
+        if not math.isfinite(number):
             raise ValueError(f"{name} must be RFC-compliant JSON with finite numbers")
-        return value
-    if type(value) in (list, tuple):
-        return [_copy_json_value(item, name=name) for item in cast(Sequence[object], value)]
-    if type(value) in (dict, MappingProxyType):
+        return number
+    if value_type is list or value_type is tuple:
+        return [
+            _copy_json_value(item, name=name, depth=depth + 1, budget=budget)
+            for item in cast(Sequence[object], value)
+        ]
+    if value_type is dict or value_type is MappingProxyType:
         payload = _copy_mapping(value, name=name)
-        return {key: _copy_json_value(item, name=name) for key, item in payload.items()}
+        return {
+            key: _copy_json_value(item, name=name, depth=depth + 1, budget=budget)
+            for key, item in payload.items()
+        }
     raise ValueError(f"{name} must contain exact JSON values")
 
 
 def _copy_json_mapping(payload: object, *, name: str) -> dict[str, Any]:
     copied = _copy_mapping(payload, name=name)
-    return {key: _copy_json_value(value, name=name) for key, value in copied.items()}
+    budget = [_JSON_MAX_NODES]
+    return {
+        key: _copy_json_value(value, name=name, depth=1, budget=budget)
+        for key, value in copied.items()
+    }
 
 
 def _require_exact_str(name: str, value: object) -> str:
@@ -410,7 +451,41 @@ class SecurityOracleExperience:
     reward: float
     outcome: Mapping[str, Any]
     policy_metadata: Mapping[str, Any] = dataclasses.field(default_factory=dict)
-    schema: str = "alberta.security_gym.oracle_experience.v1"
+    schema: str = _ORACLE_EXPERIENCE_SCHEMA
+
+    def __post_init__(self) -> None:
+        """Reject leftover action/reward/schema identities before JSON dump."""
+        if type(self.state) is not tuple:
+            raise ValueError("state must be an exact tuple")
+        state = tuple(
+            _require_finite_real(f"state[{index}]", value)
+            for index, value in enumerate(self.state)
+        )
+        if type(self.action) is not SecurityAction:
+            raise ValueError("action must be an exact SecurityAction")
+        reward = _require_finite_real("reward", self.reward)
+        schema = _require_exact_str("schema", self.schema)
+        if schema != _ORACLE_EXPERIENCE_SCHEMA:
+            raise ValueError("schema must identify the oracle-experience v1 contract")
+        outcome = _copy_json_mapping(self.outcome, name="security oracle outcome")
+        policy_metadata = _copy_json_mapping(self.policy_metadata, name="policy_metadata")
+        for flag in ("terminated", "truncated"):
+            if flag in outcome and type(outcome[flag]) is not bool:
+                raise ValueError(f"security oracle outcome {flag} must be an exact bool")
+        if "is_malicious" in policy_metadata and type(policy_metadata["is_malicious"]) is not bool:
+            raise ValueError("policy_metadata is_malicious must be an exact bool")
+        if "is_malicious" in policy_metadata:
+            label = outcome.get("label")
+            expected_label = _security_outcome_label(
+                action=self.action,
+                is_malicious=cast(bool, policy_metadata["is_malicious"]),
+            )
+            if type(label) is not str or label != expected_label:
+                raise ValueError("security oracle outcome label does not match action metadata")
+        object.__setattr__(self, "state", state)
+        object.__setattr__(self, "reward", reward)
+        object.__setattr__(self, "outcome", MappingProxyType(outcome))
+        object.__setattr__(self, "policy_metadata", MappingProxyType(policy_metadata))
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serializable oracle experience mapping."""
@@ -437,19 +512,7 @@ def security_rollout_step_to_oracle_experience(
     is_malicious = policy_metadata.get("is_malicious", False)
     if type(is_malicious) is not bool:
         raise ValueError("policy_metadata is_malicious must be an exact bool")
-    defensive_action = step.action in (
-        SecurityAction.THROTTLE,
-        SecurityAction.BLOCK,
-        SecurityAction.ISOLATE,
-    )
-    if is_malicious and defensive_action:
-        label = "true_positive"
-    elif is_malicious:
-        label = "false_negative"
-    elif defensive_action:
-        label = "false_positive"
-    else:
-        label = "true_negative"
+    label = _security_outcome_label(action=step.action, is_malicious=is_malicious)
     return SecurityOracleExperience(
         state=step.state,
         action=step.action,
@@ -463,17 +526,39 @@ def security_rollout_step_to_oracle_experience(
     )
 
 
+def _security_outcome_label(*, action: SecurityAction, is_malicious: bool) -> str:
+    defensive_action = (
+        action is SecurityAction.THROTTLE
+        or action is SecurityAction.BLOCK
+        or action is SecurityAction.ISOLATE
+    )
+    if is_malicious and defensive_action:
+        return "true_positive"
+    if is_malicious:
+        return "false_negative"
+    if defensive_action:
+        return "false_positive"
+    return "true_negative"
+
+
 def validate_security_oracle_experience(
     records: Sequence[SecurityOracleExperience],
     schema: SecurityFeatureSchema,
 ) -> None:
     """Validate oracle-review records against a feature schema."""
+    if type(records) is not list and type(records) is not tuple:
+        raise ValueError("oracle experience records must be an exact list or tuple")
+    if type(schema) is not SecurityFeatureSchema:
+        raise ValueError("schema must be an exact SecurityFeatureSchema")
     for idx, record in enumerate(records):
+        if type(record) is not SecurityOracleExperience:
+            raise ValueError(f"invalid oracle experience {idx}: wrong record type")
         try:
             schema.validate_observation(record.state)
         except ValueError as exc:
             raise ValueError(f"invalid oracle experience {idx}: {exc}") from exc
-        if type(record.outcome.get("label")) is not str or not record.outcome["label"]:
+        label = record.outcome.get("label")
+        if type(label) is not str or len(label) == 0:
             raise ValueError(f"invalid oracle experience {idx}: missing outcome label")
 
 
