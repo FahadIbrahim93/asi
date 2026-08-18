@@ -20,7 +20,7 @@ import math
 from collections.abc import Callable, Iterable, Sequence
 from decimal import Decimal
 from fractions import Fraction
-from typing import Any, NamedTuple, NoReturn, cast
+from typing import Any, NamedTuple, NoReturn, Self, cast
 
 import jax.random as jr
 import numpy as np
@@ -233,6 +233,21 @@ class ExperimentConfig(_ExperimentConfigTuple):
             ),
         )
 
+    @classmethod
+    def _make(cls, iterable: Iterable[Any]) -> Self:  # type: ignore[override]
+        values = tuple(iterable)
+        if len(values) != len(cls._fields):
+            raise TypeError(f"Expected {len(cls._fields)} arguments, got {len(values)}")
+        return cls(*values)
+
+    def _replace(self, **changes: object) -> ExperimentConfig:
+        unexpected = changes.keys() - self._fields
+        if unexpected:
+            raise ValueError(f"Got unexpected field names: {sorted(unexpected)!r}")
+        values = self._asdict()
+        values.update(changes)
+        return type(self)(**values)
+
 
 class _SingleRunResultTuple(NamedTuple):
     config_name: str
@@ -271,6 +286,21 @@ class SingleRunResult(_SingleRunResultTuple):
                 final_state,
             ),
         )
+
+    @classmethod
+    def _make(cls, iterable: Iterable[Any]) -> Self:  # type: ignore[override]
+        values = tuple(iterable)
+        if len(values) != len(cls._fields):
+            raise TypeError(f"Expected {len(cls._fields)} arguments, got {len(values)}")
+        return cls(*values)
+
+    def _replace(self, **changes: object) -> SingleRunResult:
+        unexpected = changes.keys() - self._fields
+        if unexpected:
+            raise ValueError(f"Got unexpected field names: {sorted(unexpected)!r}")
+        values = self._asdict()
+        values.update(changes)
+        return type(self)(**values)
 
 
 class MetricSummary(NamedTuple):
