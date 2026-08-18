@@ -522,33 +522,36 @@ class L2ERState:
     buffer_count: Array
 
 
-def l2er_effective_rank(features: Array, epsilon: float = 1e-8) -> Array:
-    """Official entropy effective-rank estimator for one activation matrix."""
+def l2er_effective_rank_transaction(
+    features: Array, epsilon: float = 1e-8
+) -> tuple[Array, Array]:
+    """Return the scale-stable entropy rank and caller-visible validity."""
     features = _l2er_array(features, name="features", ndim=2)
     if type(epsilon) is not float or not math.isfinite(epsilon) or epsilon <= 0.0:
         raise ValueError("epsilon must be an exact finite positive float")
     _l2er_preflight_svd(features)
     finite = jnp.all(jnp.isfinite(features))
-    if not isinstance(finite, jax.core.Tracer) and not bool(finite):
-        raise ValueError("features must contain only finite values")
-    features = jnp.where(finite, features, jnp.zeros_like(features))
-    singular_values = jnp.abs(jnp.linalg.svdvals(features.T))
-
-    def normalized(values: Array) -> Array:
-        scale = jnp.max(values)
-        scaled = values / scale
-        denominator = jnp.maximum(jnp.sum(scaled), epsilon / scale)
-        return scaled / denominator
-
-    probabilities = jax.lax.cond(
-        jnp.max(singular_values) > 0.0,
-        normalized,
-        jnp.zeros_like,
-        singular_values,
-    )
+    safe_features = jnp.where(finite, features, jnp.zeros_like(features))
+    scale = jnp.max(jnp.abs(safe_features))
+    _, exponent = jnp.frexp(scale)
+    scaled_features = jnp.ldexp(safe_features, -exponent)
+    singular_values = jnp.abs(jnp.linalg.svdvals(scaled_features.T))
+    total = jnp.sum(singular_values)
+    probabilities = singular_values / jnp.maximum(total, epsilon)
     entropy = -jnp.sum(probabilities * jnp.log(probabilities + epsilon))
     candidate = jnp.exp(entropy)
-    return jnp.where(jnp.isfinite(candidate), candidate, jnp.asarray(1.0, features.dtype))
+    valid = finite & jnp.all(jnp.isfinite(singular_values)) & jnp.isfinite(candidate)
+    return jnp.where(valid, candidate, jnp.zeros_like(candidate)), valid
+
+
+def l2er_effective_rank(features: Array, epsilon: float = 1e-8) -> Array:
+    """Official entropy effective-rank estimator with explicit invalidity."""
+    candidate, valid = l2er_effective_rank_transaction(features, epsilon)
+    if isinstance(valid, jax.core.Tracer):
+        return jnp.where(valid, candidate, jnp.full_like(candidate, jnp.nan))
+    if not bool(valid):
+        raise ValueError("effective rank must be finite")
+    return candidate
 
 
 def l2er_effective_rank_loss(
