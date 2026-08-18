@@ -40,6 +40,26 @@ class _HostileFloat(float):
         raise AssertionError("hostile float eq")
 
 
+class _HostileList(list[object]):
+    calls = 0
+
+    def __len__(self) -> int:
+        type(self).calls += 1
+        raise AssertionError("hostile list len")
+
+    def __iter__(self):  # type: ignore[no-untyped-def]
+        type(self).calls += 1
+        raise AssertionError("hostile list iteration")
+
+
+class _HostileDict(dict[str, object]):
+    calls = 0
+
+    def __iter__(self):  # type: ignore[no-untyped-def]
+        type(self).calls += 1
+        raise AssertionError("hostile dict iteration")
+
+
 def test_strict_json_equal_rejects_hostile_str_before_eq() -> None:
     from alberta_framework.core.recurrent_latent_world_model_ensemble import (
         _strict_json_equal,
@@ -92,3 +112,22 @@ def test_hostile_not_in_error_message() -> None:
     except ValueError as exc:
         assert "!r" not in str(exc)
         assert _HostileStr.calls == 0
+
+
+def test_strict_json_equal_rejects_hostile_containers_before_hooks() -> None:
+    from alberta_framework.core.recurrent_latent_world_model_ensemble import (
+        _strict_json_equal,
+    )
+
+    hostile_list = _HostileList([1])
+    hostile_dict = _HostileDict({"value": 1})
+    _HostileList.calls = 0
+    _HostileDict.calls = 0
+
+    assert _strict_json_equal([1], hostile_list) is False
+    assert _strict_json_equal(hostile_list, [1]) is False
+    assert _strict_json_equal({"value": 1}, hostile_dict) is False
+    assert _strict_json_equal(hostile_dict, {"value": 1}) is False
+
+    assert _HostileList.calls == 0
+    assert _HostileDict.calls == 0

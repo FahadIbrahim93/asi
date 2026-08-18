@@ -146,7 +146,7 @@ def _strict_json_equal(actual: object, expected: object) -> bool:
         return type(actual) is float and math.isfinite(actual) and actual == expected
     if type(expected) is str:
         return type(actual) is str and actual == expected
-    if isinstance(expected, list):
+    if type(expected) is list:
         return (
             type(actual) is list
             and len(actual) == len(expected)
@@ -155,9 +155,9 @@ def _strict_json_equal(actual: object, expected: object) -> bool:
                 for left, right in zip(actual, expected, strict=True)
             )
         )
-    if isinstance(expected, Mapping):
+    if type(expected) is dict:
         return (
-            isinstance(actual, Mapping)
+            type(actual) is dict
             and set(actual) == set(expected)
             and all(_strict_json_equal(actual[key], expected[key]) for key in expected)
         )
