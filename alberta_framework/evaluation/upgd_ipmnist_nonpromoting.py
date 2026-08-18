@@ -229,14 +229,26 @@ class UPGDIPMNISTValidation:
     def __post_init__(self) -> None:
         if type(self.valid) is not bool:
             raise ValueError("valid must be a boolean")
-        if type(self.errors) is not tuple or not all(isinstance(e, str) for e in self.errors):
+        if type(self.errors) is not tuple or not all(type(e) is str for e in self.errors):
             raise ValueError("errors must be a tuple of strings")
-        if type(self.partial_sha256) is not tuple:
-            raise ValueError("partial_sha256 must be a tuple")
+        if type(self.partial_sha256) is not tuple or not all(
+            type(pair) is tuple
+            and len(pair) == 2
+            and type(pair[0]) is str
+            and type(pair[1]) is str
+            for pair in self.partial_sha256
+        ):
+            raise ValueError("partial_sha256 must be a tuple of exact string pairs")
         if self.artifact_sha256 is not None and type(self.artifact_sha256) is not str:
             raise ValueError("artifact_sha256 must be a string or None")
-        if type(self.observed_seed_pairs) is not tuple:
-            raise ValueError("observed_seed_pairs must be a tuple")
+        if type(self.observed_seed_pairs) is not tuple or not all(
+            type(pair) is tuple
+            and len(pair) == 2
+            and type(pair[0]) is str
+            and type(pair[1]) is int
+            for pair in self.observed_seed_pairs
+        ):
+            raise ValueError("observed_seed_pairs must be exact string/integer pairs")
         if self.development_only is not True:
             raise ValueError("development_only must permanently remain True")
         if self.scientific_promotion_allowed is not False:
@@ -930,7 +942,7 @@ def validate_upgd_ipmnist_v2_artifact(
     elif any(type(value) is not str or not value for value in environment.values()):
         errors.append("v2 artifact environment values must be non-empty strings")
     notes = artifact.get("notes")
-    if not isinstance(notes, list) or any(not isinstance(note, str) for note in notes):
+    if not isinstance(notes, list) or any(type(note) is not str for note in notes):
         errors.append("v2 artifact notes must be a list of strings")
 
     if partial_validation.valid:
