@@ -487,17 +487,31 @@ class SecurityOracleExperience:
         object.__setattr__(self, "outcome", MappingProxyType(outcome))
         object.__setattr__(self, "policy_metadata", MappingProxyType(policy_metadata))
 
+    def _revalidated_copy(self) -> SecurityOracleExperience:
+        """Reconstruct the record before a public consumer trusts frozen fields."""
+        return SecurityOracleExperience(
+            state=self.state,
+            action=self.action,
+            reward=self.reward,
+            outcome=self.outcome,
+            policy_metadata=self.policy_metadata,
+            schema=self.schema,
+        )
+
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serializable oracle experience mapping."""
+        checked = self._revalidated_copy()
         payload = {
-            "schema": self.schema,
-            "state": list(self.state),
-            "action": int(self.action),
-            "action_name": security_gym_action_name(self.action),
-            "reward": self.reward,
-            "outcome": _copy_json_mapping(self.outcome, name="security oracle outcome"),
+            "schema": checked.schema,
+            "state": list(checked.state),
+            "action": int(checked.action),
+            "action_name": security_gym_action_name(checked.action),
+            "reward": checked.reward,
+            "outcome": _copy_json_mapping(
+                checked.outcome, name="security oracle outcome"
+            ),
             "policy_metadata": _copy_json_mapping(
-                self.policy_metadata, name="policy_metadata"
+                checked.policy_metadata, name="policy_metadata"
             ),
         }
         _require_rfc_json_mapping(payload, name="security oracle experience")
@@ -554,10 +568,14 @@ def validate_security_oracle_experience(
         if type(record) is not SecurityOracleExperience:
             raise ValueError(f"invalid oracle experience {idx}: wrong record type")
         try:
-            schema.validate_observation(record.state)
+            checked = record._revalidated_copy()
         except ValueError as exc:
             raise ValueError(f"invalid oracle experience {idx}: {exc}") from exc
-        label = record.outcome.get("label")
+        try:
+            schema.validate_observation(checked.state)
+        except ValueError as exc:
+            raise ValueError(f"invalid oracle experience {idx}: {exc}") from exc
+        label = checked.outcome.get("label")
         if type(label) is not str or len(label) == 0:
             raise ValueError(f"invalid oracle experience {idx}: missing outcome label")
 
