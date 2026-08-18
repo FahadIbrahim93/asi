@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -8,6 +9,7 @@ from alberta_framework.benchmarks.ipmnist_gradual import (
     GRADUAL_IPMNIST_PROTOCOL,
     GradualTransitionConfig,
     input_interpolation,
+    input_interpolation_transaction,
     output_interpolation,
     task_sampling_mask,
     transition_alpha,
@@ -71,3 +73,31 @@ def test_protocol_records_nonpromotion_and_information_allowance() -> None:
         "observations",
         "example_order",
     )
+
+
+def test_input_interpolation_is_outer_jit_safe() -> None:
+    interpolate = jax.jit(lambda old, new: input_interpolation(old, new, 0.5))
+    np.testing.assert_array_equal(
+        interpolate(jnp.array([0.0]), jnp.array([2.0])), jnp.array([1.0])
+    )
+
+    transact = jax.jit(
+        lambda old, new: input_interpolation_transaction(old, new, 0.5)
+    )
+    safe, valid = transact(jnp.array([jnp.inf]), jnp.array([2.0]))
+    np.testing.assert_array_equal(safe, jnp.zeros(1))
+    assert not bool(valid)
+
+
+def test_input_interpolation_rejects_array_protocol_objects_without_calling_them() -> None:
+    class Hostile:
+        calls = 0
+
+        def __array__(self) -> np.ndarray:
+            self.calls += 1
+            raise AssertionError("must not run")
+
+    hostile = Hostile()
+    with pytest.raises(ValueError, match="exact NumPy or JAX"):
+        input_interpolation(hostile, jnp.ones(1), 0.5)  # type: ignore[arg-type]
+    assert hostile.calls == 0

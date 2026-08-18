@@ -12,10 +12,11 @@ from __future__ import annotations
 import hashlib
 import math
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from types import MappingProxyType
 from typing import cast
 
+import jax
 import jax.numpy as jnp
 import jax.random as jr
 import numpy as np
@@ -60,6 +61,11 @@ GEOMETRY_PROTOCOL = MappingProxyType(
             "observations",
             "allowed_boundary_information",
         ),
+        "mechanism_off": "empty_basis_or_zero_gradient_exact_reduction",
+        "finite_kernel_preflight_required": True,
+        "persistent_bytes_accounting_required": True,
+        "environment_steps_accounting_required": True,
+        "model_queries_accounting_required": True,
         "timing_is_telemetry_only": True,
         "development_only": True,
         "scientific_promotion_allowed": False,
@@ -80,41 +86,121 @@ _CONTROL_BY_CANDIDATE = {
     "flad_ideal_noise": "flad_zero_gradient",
 }
 
+_MAX_MATRIX_ELEMENTS = 1_000_000
+
+
+def _trusted_array(value: object, *, name: str) -> Array:
+    actual_type = type(value)
+    if not (actual_type is np.ndarray or issubclass(actual_type, (jax.Array, jax.core.Tracer))):
+        raise ValueError(f"{name} must be an exact NumPy or JAX array")
+    result = jnp.asarray(value)
+    if result.size > _MAX_MATRIX_ELEMENTS or not jnp.issubdtype(result.dtype, jnp.floating):
+        raise ValueError(f"{name} must be a bounded floating array")
+    return result
+
+
+def _unwrap_transaction(result: tuple[Array, Array], *, name: str) -> Array:
+    safe, valid = result
+    if type(valid) is not jax.core.Tracer and not isinstance(valid, jax.core.Tracer):
+        if not bool(valid):
+            raise ValueError(f"{name} must be finite")
+    return safe
+
+
+def orthogonal_correction_transaction(update: Array, protected_basis: Array) -> tuple[Array, Array]:
+    """Return a finite orthogonal correction and caller-visible validity bit."""
+    vector = _trusted_array(update, name="update")
+    basis = _trusted_array(protected_basis, name="protected_basis")
+    if vector.ndim != 1 or basis.ndim != 2 or basis.shape[1] != vector.shape[0]:
+        raise ValueError("update must be a vector and basis rows must match its width")
+    coordinates = basis @ vector
+    projection = basis.T @ coordinates
+    candidate = vector - projection
+    valid = (
+        jnp.all(jnp.isfinite(vector))
+        & jnp.all(jnp.isfinite(basis))
+        & jnp.all(jnp.isfinite(coordinates))
+        & jnp.all(jnp.isfinite(projection))
+        & jnp.all(jnp.isfinite(candidate))
+    )
+    return jnp.where(valid, candidate, jnp.zeros_like(candidate)), valid
+
 
 def orthogonal_correction(update: Array, protected_basis: Array) -> Array:
     """Project a vector away from row-wise orthonormal protected directions."""
-    vector = jnp.asarray(update)
-    basis = jnp.asarray(protected_basis)
-    if vector.ndim != 1 or basis.ndim != 2 or basis.shape[1] != vector.shape[0]:
-        raise ValueError("update must be a vector and basis rows must match its width")
-    return vector - basis.T @ (basis @ vector)
+    return _unwrap_transaction(
+        orthogonal_correction_transaction(update, protected_basis),
+        name="orthogonal correction",
+    )
 
 
-def spectral_matrix_sign(matrix: Array, *, steps: int = 5) -> Array:
+def spectral_matrix_sign_transaction(matrix: Array, *, steps: int = 5) -> tuple[Array, Array]:
     """Apply Muon-OGD v2's cubic NS5 matrix-sign approximation.
 
     The pinned paper defines ``f(X) = 3/2 X - 1/2 XX^T X``. Frobenius
     normalization places every singular value in its convergence interval and
     preserves an exact zero for a zero matrix.
     """
-    value = jnp.asarray(matrix)
+    value = _trusted_array(matrix, name="matrix")
     if (
         value.ndim != 2
         or value.size == 0
         or not jnp.issubdtype(value.dtype, jnp.floating)
         or type(steps) is not int
         or steps < 1
+        or steps > 32
     ):
         raise ValueError("matrix must be non-empty and steps a positive integer")
-    x = value / jnp.maximum(jnp.linalg.norm(value), jnp.asarray(1e-12, dtype=value.dtype))
+    norm = jnp.linalg.norm(value)
+    valid = jnp.all(jnp.isfinite(value)) & jnp.isfinite(norm)
+    x = value / jnp.maximum(norm, jnp.asarray(1e-12, dtype=value.dtype))
     if x.shape[0] > x.shape[1]:
         x = x.T
         transposed = True
     else:
         transposed = False
     for _ in range(steps):
-        x = 1.5 * x - 0.5 * (x @ x.T) @ x
-    return x.T if transposed else x
+        a = x @ x.T
+        next_x = 1.5 * x - 0.5 * a @ x
+        valid = valid & jnp.all(jnp.isfinite(a)) & jnp.all(jnp.isfinite(next_x))
+        x = next_x
+    candidate = x.T if transposed else x
+    valid = valid & jnp.all(jnp.isfinite(candidate))
+    safe = jnp.where(valid, candidate, jnp.zeros_like(candidate))
+    return safe, valid
+
+
+def spectral_matrix_sign(matrix: Array, *, steps: int = 5) -> Array:
+    """Apply Muon-OGD v2's cubic NS5 matrix-sign approximation."""
+    return _unwrap_transaction(
+        spectral_matrix_sign_transaction(matrix, steps=steps), name="matrix sign"
+    )
+
+
+def flad_noise_component_transaction(perturbation: Array, gradient: Array) -> tuple[Array, Array]:
+    """Return a finite FLAD noise component and caller-visible validity bit."""
+    delta = _trusted_array(perturbation, name="perturbation")
+    direction = _trusted_array(gradient, name="gradient")
+    if delta.shape != direction.shape or delta.ndim != 1 or delta.size < 1:
+        raise ValueError("perturbation and gradient must be non-empty equal-width vectors")
+    squared_norm = jnp.vdot(direction, direction).real
+    numerator = jnp.vdot(direction, delta).real
+    active = squared_norm > 0.0
+    denominator = jnp.where(active, squared_norm, jnp.ones_like(squared_norm))
+    coefficient = numerator / denominator
+    projection = direction * coefficient * active.astype(delta.dtype)
+    candidate = delta - projection
+    valid = (
+        jnp.all(jnp.isfinite(delta))
+        & jnp.all(jnp.isfinite(direction))
+        & jnp.isfinite(squared_norm)
+        & jnp.isfinite(numerator)
+        & jnp.isfinite(coefficient)
+        & jnp.all(jnp.isfinite(projection))
+        & jnp.all(jnp.isfinite(candidate))
+    )
+    safe = jnp.where(valid, candidate, jnp.zeros_like(candidate))
+    return safe, valid
 
 
 def muon_ogd_dual_update(
@@ -127,9 +213,9 @@ def muon_ogd_dual_update(
     newton_schulz_steps: int = 5,
 ) -> tuple[Array, Array]:
     """Run the bounded matrix form of Muon-OGD v2 Algorithm 1."""
-    value = jnp.asarray(momentum)
-    protected = jnp.asarray(constraints)
-    multipliers = jnp.asarray(dual)
+    value = _trusted_array(momentum, name="momentum")
+    protected = _trusted_array(constraints, name="constraints")
+    multipliers = _trusted_array(dual, name="dual")
     if value.ndim != 2 or value.size == 0 or not jnp.issubdtype(value.dtype, jnp.floating):
         raise ValueError("momentum must be a non-empty floating matrix")
     if protected.ndim != 3 or protected.shape[1:] != value.shape:
@@ -151,16 +237,10 @@ def muon_ogd_dual_update(
 
 def flad_noise_component(perturbation: Array, gradient: Array) -> Array:
     """Remove the ideal FLAD gradient-aligned perturbation component safely."""
-    delta = jnp.asarray(perturbation)
-    direction = jnp.asarray(gradient)
-    if delta.shape != direction.shape or delta.ndim != 1:
-        raise ValueError("perturbation and gradient must be equal-width vectors")
-    squared_norm = jnp.vdot(direction, direction).real
-    active = squared_norm > 0.0
-    safe_squared_norm = jnp.where(active, squared_norm, jnp.ones_like(squared_norm))
-    coefficient = jnp.vdot(direction, delta).real / safe_squared_norm
-    projection = direction * coefficient * active.astype(delta.dtype)
-    return delta - projection
+    return _unwrap_transaction(
+        flad_noise_component_transaction(perturbation, gradient),
+        name="FLAD decomposition",
+    )
 
 
 def _frozen_stream() -> Array:
@@ -202,6 +282,11 @@ def _protocol_payload() -> dict[str, object]:
             cast(tuple[str, ...], GEOMETRY_PROTOCOL["protocol_differences"])
         ),
         "matched_axes": list(cast(tuple[str, ...], GEOMETRY_PROTOCOL["matched_axes"])),
+        "mechanism_off": GEOMETRY_PROTOCOL["mechanism_off"],
+        "finite_kernel_preflight_required": True,
+        "persistent_bytes_accounting_required": True,
+        "environment_steps_accounting_required": True,
+        "model_queries_accounting_required": True,
         "timing_is_telemetry_only": True,
         "development_only": True,
         "scientific_promotion_allowed": False,
@@ -340,16 +425,19 @@ def run_streaming_matrix_evaluation() -> dict[str, object]:
     return result
 
 
-def _mapping(value: object, *, name: str) -> Mapping[str, object]:
-    if not isinstance(value, Mapping) or not all(type(key) is str for key in value):
+def _mapping(value: object, *, name: str) -> dict[str, object]:
+    if type(value) is not dict:
         raise ValueError(f"{name} must be a string-keyed mapping")
-    return cast(Mapping[str, object], value)
+    result = cast(dict[object, object], value)
+    if not all(type(key) is str for key in result):
+        raise ValueError(f"{name} must be a string-keyed mapping")
+    return cast(dict[str, object], result)
 
 
-def _sequence(value: object, *, name: str) -> Sequence[object]:
-    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
-        raise ValueError(f"{name} must be a sequence")
-    return cast(Sequence[object], value)
+def _sequence(value: object, *, name: str) -> list[object]:
+    if type(value) is not list:
+        raise ValueError(f"{name} must be a list")
+    return cast(list[object], value)
 
 
 def _same_float(actual: object, expected: object, *, name: str) -> None:
@@ -362,29 +450,39 @@ def _same_float(actual: object, expected: object, *, name: str) -> None:
 def _exact_equal(actual: object, expected: object) -> bool:
     if type(actual) is not type(expected):
         return False
-    if isinstance(expected, Mapping):
-        if not isinstance(actual, Mapping) or set(actual) != set(expected):
+    if type(expected) is dict:
+        actual_dict = cast(dict[object, object], actual)
+        expected_dict = cast(dict[object, object], expected)
+        if set(actual_dict) != set(expected_dict):
             return False
-        return all(_exact_equal(actual[key], value) for key, value in expected.items())
-    if isinstance(expected, list):
-        return isinstance(actual, list) and len(actual) == len(expected) and all(
-            _exact_equal(left, right) for left, right in zip(actual, expected, strict=True)
+        return all(_exact_equal(actual_dict[key], value) for key, value in expected_dict.items())
+    if type(expected) is list:
+        actual_list = cast(list[object], actual)
+        expected_list = cast(list[object], expected)
+        return len(actual_list) == len(expected_list) and all(
+            _exact_equal(left, right)
+            for left, right in zip(actual_list, expected_list, strict=True)
         )
-    return bool(actual == expected)
+    if type(expected) in (str, int, float, bool, type(None)):
+        return bool(actual == expected)
+    return False
 
 
-def validate_streaming_matrix_result(result: Mapping[str, object]) -> None:
+def validate_streaming_matrix_result(result: object) -> None:
     """Fail closed unless ``result`` is an exact current frozen-run record."""
+    actual_result = _mapping(result, name="result")
     expected = _execute_frozen_stream(measure_timing=False)
     required_top = {"schema", "protocol", "config", "stream", "policy", "arms", "comparisons"}
-    if set(result) != required_top or result.get("schema") != GEOMETRY_RESULT_SCHEMA:
+    if set(actual_result) != required_top or not _exact_equal(
+        actual_result["schema"], GEOMETRY_RESULT_SCHEMA
+    ):
         raise ValueError("result fields or schema do not match the frozen protocol")
     for field in ("protocol", "config", "stream", "policy"):
-        actual_mapping = _mapping(result[field], name=field)
+        actual_mapping = _mapping(actual_result[field], name=field)
         expected_mapping = _mapping(expected[field], name=f"expected.{field}")
         if not _exact_equal(actual_mapping, expected_mapping):
             raise ValueError(f"{field} does not match the frozen protocol")
-    arms = _sequence(result["arms"], name="arms")
+    arms = _sequence(actual_result["arms"], name="arms")
     expected_arms = _sequence(expected["arms"], name="expected.arms")
     if len(arms) != len(_ARM_SPECS):
         raise ValueError("arms must contain every frozen candidate and control exactly once")
@@ -394,12 +492,10 @@ def validate_streaming_matrix_result(result: Mapping[str, object]) -> None:
         if set(arm) != {"arm", "mechanism", "mode", "metrics", "resources"}:
             raise ValueError(f"arms[{index}] fields do not match the schema")
         for field in ("arm", "mechanism", "mode"):
-            if arm[field] != expected_arm[field]:
+            if not _exact_equal(arm[field], expected_arm[field]):
                 raise ValueError(f"arms[{index}].{field} does not match the frozen plan")
         metrics = _mapping(arm["metrics"], name=f"arms[{index}].metrics")
-        expected_metrics = _mapping(
-            expected_arm["metrics"], name=f"expected.arms[{index}].metrics"
-        )
+        expected_metrics = _mapping(expected_arm["metrics"], name=f"expected.arms[{index}].metrics")
         if set(metrics) != set(expected_metrics):
             raise ValueError(f"arms[{index}].metrics fields do not match the schema")
         for metric, expected_value in expected_metrics.items():
@@ -416,7 +512,7 @@ def validate_streaming_matrix_result(result: Mapping[str, object]) -> None:
                     raise ValueError(f"arms[{index}].resources.timing_ns must be non-negative")
             elif not _exact_equal(resources[resource], expected_value):
                 raise ValueError(f"arms[{index}].resources.{resource} is not canonical")
-    comparisons = _sequence(result["comparisons"], name="comparisons")
+    comparisons = _sequence(actual_result["comparisons"], name="comparisons")
     expected_comparisons = _sequence(expected["comparisons"], name="expected.comparisons")
     if len(comparisons) != len(expected_comparisons):
         raise ValueError("comparisons must contain every matched A/B pair")
@@ -430,7 +526,7 @@ def validate_streaming_matrix_result(result: Mapping[str, object]) -> None:
         if set(comparison) != {"candidate", "control", "final_target_mse_delta", "outcome"}:
             raise ValueError(f"comparisons[{index}] fields do not match the schema")
         for field in ("candidate", "control", "outcome"):
-            if comparison[field] != expected_comparison[field]:
+            if not _exact_equal(comparison[field], expected_comparison[field]):
                 raise ValueError(f"comparisons[{index}].{field} is not canonical")
         _same_float(
             comparison["final_target_mse_delta"],

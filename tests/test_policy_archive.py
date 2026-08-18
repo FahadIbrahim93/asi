@@ -46,6 +46,20 @@ def test_archive_rejects_duplicate_identity() -> None:
         archive.add(_entry("a", (1.0,), 2.0))
 
 
+def test_archive_preflights_host_dimensions() -> None:
+    with pytest.raises(ValueError, match="256 MiB"):
+        BoundedPolicyArchive(byte_budget=256 * 1024 * 1024 + 1, min_latent_distance=0.0)
+    with pytest.raises(ValueError, match="identity"):
+        _entry("x" * 1025, (0.0,), 1.0)
+    entry = _entry("a", (0.0,), 1.0)
+    with pytest.raises(ValueError, match="exact tuple"):
+        BoundedPolicyArchive(
+            byte_budget=256 * 1024 * 1024,
+            min_latent_distance=0.0,
+            entries=(entry,) * 4097,
+        )
+
+
 def test_protocol_is_nonpromoting() -> None:
     assert POLICY_ARCHIVE_PROTOCOL["paper_revision"] == "arXiv:2604.15414v1"
     assert POLICY_ARCHIVE_PROTOCOL["controls"] == ("one_model", "fixed_snapshot")

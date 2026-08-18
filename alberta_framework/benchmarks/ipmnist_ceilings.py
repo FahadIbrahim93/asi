@@ -7,6 +7,9 @@ from types import MappingProxyType
 from typing import Literal
 
 _METHODS = ("replay", "in_context", "randumb", "ranpac", "prol")
+_INT32_MAX = 2**31 - 1
+_MAX_PERSISTENT_BYTES = 256 * 1024 * 1024
+_MAX_FEATURE_DIM = 1_000_000
 
 CEILING_PROTOCOL = MappingProxyType(
     {
@@ -29,9 +32,9 @@ CEILING_PROTOCOL = MappingProxyType(
 )
 
 
-def _nonnegative(name: str, value: object) -> int:
-    if type(value) is not int or value < 0:
-        raise ValueError(f"{name} must be a non-negative integer")
+def _nonnegative(name: str, value: object, *, maximum: int = _INT32_MAX) -> int:
+    if type(value) is not int or value < 0 or value > maximum:
+        raise ValueError(f"{name} must be an integer in [0, {maximum}]")
     return value
 
 
@@ -48,7 +51,16 @@ class CeilingResourceLedger:
 
     def __post_init__(self) -> None:
         for name in self.__dataclass_fields__:
-            object.__setattr__(self, name, _nonnegative(name, getattr(self, name)))
+            maximum = _MAX_PERSISTENT_BYTES if name.endswith("bytes") else _INT32_MAX
+            object.__setattr__(
+                self, name, _nonnegative(name, getattr(self, name), maximum=maximum)
+            )
+        if self.persistent_bytes + self.replay_bytes > _MAX_PERSISTENT_BYTES:
+            raise ValueError("total persistent bytes exceed 256 MiB")
+        if self.environment_steps + self.pretraining_steps > _INT32_MAX:
+            raise ValueError("total steps exceed signed int32")
+        if self.model_queries + self.extractor_queries > _INT32_MAX:
+            raise ValueError("total model queries exceed signed int32")
 
     @property
     def total_persistent_bytes(self) -> int:
@@ -74,8 +86,12 @@ class FrozenFeatureCeiling:
     def __post_init__(self) -> None:
         if type(self.method) is not str or self.method not in _METHODS:
             raise ValueError("method is not a registered ceiling")
-        if type(self.feature_dim) is not int or self.feature_dim < 1:
-            raise ValueError("feature_dim must be a positive integer")
+        if (
+            type(self.feature_dim) is not int
+            or self.feature_dim < 1
+            or self.feature_dim > _MAX_FEATURE_DIM
+        ):
+            raise ValueError("feature_dim must be in [1, 1000000]")
         _nonnegative("replay_capacity", self.replay_capacity)
 
     @property
@@ -83,6 +99,9 @@ class FrozenFeatureCeiling:
         return self.method == "randumb" and self.replay_capacity == 0
 
     def persistent_replay_bytes(self, *, example_bytes: int) -> int:
-        if type(example_bytes) is not int or example_bytes < 0:
-            raise ValueError("example_bytes must be a non-negative integer")
-        return self.replay_capacity * example_bytes
+        resolved = _nonnegative(
+            "example_bytes", example_bytes, maximum=_MAX_PERSISTENT_BYTES
+        )
+        if self.replay_capacity and resolved > _MAX_PERSISTENT_BYTES // self.replay_capacity:
+            raise ValueError("derived replay bytes exceed 256 MiB")
+        return self.replay_capacity * resolved

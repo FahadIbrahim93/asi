@@ -11,10 +11,12 @@ from alberta_framework.evaluation.optimizer_geometry import (
     GEOMETRY_PROTOCOL,
     GEOMETRY_RESULT_SCHEMA,
     flad_noise_component,
+    flad_noise_component_transaction,
     muon_ogd_dual_update,
     orthogonal_correction,
     run_streaming_matrix_evaluation,
     spectral_matrix_sign,
+    spectral_matrix_sign_transaction,
     validate_streaming_matrix_result,
 )
 
@@ -127,3 +129,115 @@ def test_streaming_matrix_validator_rejects_tampering(
     target[path[-1]] = replacement  # type: ignore[index]
     with pytest.raises(ValueError):
         validate_streaming_matrix_result(result)
+
+
+def test_streaming_matrix_validator_admits_exact_builtin_containers_before_hooks() -> None:
+    class HostileDict(dict[object, object]):
+        calls = 0
+
+        def __iter__(self):  # type: ignore[no-untyped-def]
+            self.calls += 1
+            raise AssertionError("must not iterate")
+
+        def __getitem__(self, key: object) -> object:
+            self.calls += 1
+            raise AssertionError("must not index")
+
+    hostile = HostileDict()
+    with pytest.raises(ValueError, match="string-keyed mapping"):
+        validate_streaming_matrix_result(hostile)
+    assert hostile.calls == 0
+
+
+@pytest.mark.parametrize("field", ["protocol", "arms"])
+def test_streaming_matrix_validator_rejects_nested_container_subclasses_without_hooks(
+    field: str,
+) -> None:
+    class HostileDict(dict[object, object]):
+        calls = 0
+
+        def __iter__(self):  # type: ignore[no-untyped-def]
+            self.calls += 1
+            raise AssertionError("must not iterate")
+
+    class HostileList(list[object]):
+        calls = 0
+
+        def __iter__(self):  # type: ignore[no-untyped-def]
+            self.calls += 1
+            raise AssertionError("must not iterate")
+
+    result = run_streaming_matrix_evaluation()
+    hostile: HostileDict | HostileList
+    if field == "protocol":
+        hostile = HostileDict()
+    else:
+        hostile = HostileList()
+    result[field] = hostile
+    with pytest.raises(ValueError):
+        validate_streaming_matrix_result(result)
+    assert hostile.calls == 0
+
+
+def test_streaming_matrix_validator_rejects_scalar_subclasses_without_equality_hooks() -> None:
+    class HostileStr(str):
+        calls = 0
+
+        def __eq__(self, other: object) -> bool:
+            self.calls += 1
+            raise AssertionError("must not compare")
+
+    class HostileFloat(float):
+        calls = 0
+
+        def __eq__(self, other: object) -> bool:
+            self.calls += 1
+            raise AssertionError("must not compare")
+
+    result = run_streaming_matrix_evaluation()
+    hostile_string = HostileStr("unexpected")
+    result["schema"] = hostile_string
+    with pytest.raises(ValueError):
+        validate_streaming_matrix_result(result)
+    assert hostile_string.calls == 0
+
+    result = run_streaming_matrix_evaluation()
+    hostile_number = HostileFloat(0.0)
+    result["arms"][0]["metrics"]["final_target_mse"] = hostile_number  # type: ignore[index]
+    with pytest.raises(ValueError):
+        validate_streaming_matrix_result(result)
+    assert hostile_number.calls == 0
+
+
+def test_geometry_primitives_are_outer_jit_safe() -> None:
+    corrected = jax.jit(orthogonal_correction)(jnp.array([1.0, 2.0]), jnp.array([[1.0, 0.0]]))
+    np.testing.assert_allclose(corrected, [0.0, 2.0])
+
+
+def test_geometry_rejects_empty_flad_and_hostile_array() -> None:
+    with pytest.raises(ValueError, match="non-empty"):
+        flad_noise_component(jnp.zeros(0), jnp.zeros(0))
+
+    class Hostile:
+        calls = 0
+
+        def __array__(self) -> np.ndarray:
+            self.calls += 1
+            raise AssertionError("must not run")
+
+    hostile = Hostile()
+    with pytest.raises(ValueError, match="exact NumPy or JAX"):
+        spectral_matrix_sign(hostile)  # type: ignore[arg-type]
+    assert hostile.calls == 0
+
+
+def test_geometry_float32_overflow_is_invalid_not_laundered() -> None:
+    maximum = jnp.finfo(jnp.float32).max
+    matrix, matrix_valid = jax.jit(spectral_matrix_sign_transaction)(jnp.full((2, 2), maximum))
+    assert bool(jnp.all(jnp.isfinite(matrix)))
+    assert not bool(matrix_valid)
+    component, component_valid = jax.jit(flad_noise_component_transaction)(
+        jnp.full((2,), maximum), jnp.full((2,), maximum)
+    )
+    assert bool(jnp.all(jnp.isfinite(component)))
+    assert not bool(component_valid)
