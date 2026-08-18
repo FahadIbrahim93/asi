@@ -14,12 +14,38 @@ _FIRST_PERSIST_OVERFLOW = ((2**31 - 1) // 4 - 12) // 5 + 1
 _FIRST_WORKING_SET_OVERFLOW = 53_687_089
 
 
-def _linear_persist_bytes(feature_dim: int, n_heads: int = 2) -> int:
-    return 4 * (5 * feature_dim + 12)
+def _direct_persist_bytes(
+    feature_dim: int,
+    n_heads: int = 2,
+    hidden_sizes: tuple[int, ...] = (),
+) -> int:
+    layer_sizes = (feature_dim, *hidden_sizes)
+    trunk_parameters = sum(
+        fan_out * (fan_in + 1)
+        for fan_in, fan_out in zip(layer_sizes, layer_sizes[1:], strict=False)
+    )
+    final_width = hidden_sizes[-1] if hidden_sizes else feature_dim
+    head_parameters = n_heads * (final_width + 1)
+    return 4 * (
+        2 * (trunk_parameters + head_parameters)
+        + sum(hidden_sizes)
+        + 3
+        + feature_dim
+        + 5
+    )
 
 
-def _linear_working_set_bytes(feature_dim: int, n_heads: int = 2) -> int:
-    return 2 * _linear_persist_bytes(feature_dim, n_heads) + 12 + 4 * n_heads
+def _working_set_bytes(
+    feature_dim: int,
+    n_actions: int = 2,
+    n_heads: int = 2,
+    hidden_sizes: tuple[int, ...] = (),
+) -> int:
+    return (
+        2 * _direct_persist_bytes(feature_dim, n_heads, hidden_sizes)
+        + 12
+        + 4 * n_actions
+    )
 
 
 def test_int32_wrap_forges_a_different_published_byte_identity() -> None:
@@ -32,10 +58,10 @@ def test_int32_wrap_forges_a_different_published_byte_identity() -> None:
 
 
 def test_sarsa_persist_fits_while_update_working_set_does_not() -> None:
-    persist = _linear_persist_bytes(_FIRST_WORKING_SET_OVERFLOW)
-    working = _linear_working_set_bytes(_FIRST_WORKING_SET_OVERFLOW)
+    persist = _direct_persist_bytes(_FIRST_WORKING_SET_OVERFLOW)
+    working = _working_set_bytes(_FIRST_WORKING_SET_OVERFLOW)
     assert persist <= _INT32_MAX
-    assert _linear_working_set_bytes(_FIRST_WORKING_SET_OVERFLOW - 1) <= _INT32_MAX
+    assert _working_set_bytes(_FIRST_WORKING_SET_OVERFLOW - 1) <= _INT32_MAX
     assert working > _INT32_MAX
     agent = SARSAAgent(SARSAConfig(n_actions=2), hidden_sizes=())
     with pytest.raises(ValueError, match="update working set byte count"):
@@ -43,7 +69,7 @@ def test_sarsa_persist_fits_while_update_working_set_does_not() -> None:
 
 
 def test_sarsa_persistent_aggregate_bound_still_fires_first() -> None:
-    assert _linear_persist_bytes(_FIRST_PERSIST_OVERFLOW) > _INT32_MAX
+    assert _direct_persist_bytes(_FIRST_PERSIST_OVERFLOW) > _INT32_MAX
     agent = SARSAAgent(SARSAConfig(n_actions=2), hidden_sizes=())
     with pytest.raises(ValueError, match="aggregate_direct_state_bytes"):
         agent.init(feature_dim=_FIRST_PERSIST_OVERFLOW, key=jr.key(0))
@@ -67,5 +93,17 @@ def test_legal_sarsa_init_and_update_identity_is_unchanged() -> None:
     )
     assert result.q_values.shape == (2,)
     assert result.action.shape == ()
-    assert _linear_persist_bytes(4) <= _INT32_MAX
-    assert _linear_working_set_bytes(4) <= _INT32_MAX
+    assert _direct_persist_bytes(4) <= _INT32_MAX
+    assert _working_set_bytes(4) <= _INT32_MAX
+
+
+def test_working_set_formula_uses_all_persisted_heads_but_only_returned_actions() -> None:
+    persist = _direct_persist_bytes(7, n_heads=5, hidden_sizes=(3, 2))
+    working = _working_set_bytes(
+        7,
+        n_actions=2,
+        n_heads=5,
+        hidden_sizes=(3, 2),
+    )
+    assert working == 2 * persist + 12 + 4 * 2
+    assert working != 2 * persist + 12 + 4 * 5
