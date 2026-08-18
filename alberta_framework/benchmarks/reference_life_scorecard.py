@@ -156,13 +156,13 @@ def _validate_json_value(value: Any, *, path: str = "$", depth: int = 0) -> None
         if not math.isfinite(value):
             _fail(f"{path}: JSON numbers must be finite")
         return
-    if isinstance(value, list):
+    if type(value) is list:
         for index, item in enumerate(value):
             _validate_json_value(item, path=f"{path}[{index}]", depth=depth + 1)
         return
-    if isinstance(value, Mapping):
+    if type(value) is dict:
         for key, item in value.items():
-            if not isinstance(key, str):
+            if type(key) is not str:
                 _fail(f"{path}: JSON object keys must be strings")
             _validate_json_value(item, path=f"{path}.{key}", depth=depth + 1)
         return
@@ -213,7 +213,7 @@ def _digest_excluding(payload: Mapping[str, Any], field: str) -> str:
 
 def _is_sha256(value: object) -> bool:
     return (
-        isinstance(value, str)
+        type(value) is str
         and len(value) == _SHA256_PATTERN_LENGTH
         and all(character in "0123456789abcdef" for character in value)
     )

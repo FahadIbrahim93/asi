@@ -25,6 +25,12 @@ def test_gate_decision_rejects_leftover_identities() -> None:
         RecurringFeatureGateDecision(True, "ok", None)
     with pytest.raises(ValueError, match="failures"):
         RecurringFeatureGateDecision(True, "ok", ("x", 1))
+    with pytest.raises(ValueError, match="summary"):
+        RecurringFeatureGateDecision(True, "", ())
+    with pytest.raises(ValueError, match="accepted"):
+        RecurringFeatureGateDecision(True, "ok", ("unexpected failure",))
+    with pytest.raises(ValueError, match="accepted"):
+        RecurringFeatureGateDecision(False, "failed", ())
 
     legal = RecurringFeatureGateDecision(True, "ok", ())
     dumped = json.dumps(asdict(legal), allow_nan=False)

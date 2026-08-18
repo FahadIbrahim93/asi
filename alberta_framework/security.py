@@ -319,14 +319,28 @@ class SecurityRolloutStep:
     def __post_init__(self) -> None:
         """Reject leftover action/reward/termination identities before JSON dump."""
 
+        if type(self.state) is not tuple or type(self.next_state) is not tuple:
+            raise ValueError("state and next_state must be exact tuples")
+        state = tuple(
+            _require_finite_real(f"state[{index}]", value)
+            for index, value in enumerate(self.state)
+        )
+        next_state = tuple(
+            _require_finite_real(f"next_state[{index}]", value)
+            for index, value in enumerate(self.next_state)
+        )
         if type(self.action) is not SecurityAction:
             raise ValueError("action must be an exact SecurityAction")
-        if type(self.reward) is bool or type(self.reward) not in _ALLOWED_REAL_TYPES:
-            raise ValueError("reward must be a finite real number")
+        reward = _require_finite_real("reward", self.reward)
         if type(self.terminated) is not bool:
             raise ValueError("terminated must be an exact bool")
         if type(self.truncated) is not bool:
             raise ValueError("truncated must be an exact bool")
+        metadata = _copy_json_mapping(self.policy_metadata, name="policy_metadata")
+        object.__setattr__(self, "state", state)
+        object.__setattr__(self, "reward", reward)
+        object.__setattr__(self, "next_state", next_state)
+        object.__setattr__(self, "policy_metadata", MappingProxyType(metadata))
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serializable transition mapping."""

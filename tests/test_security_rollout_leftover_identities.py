@@ -39,6 +39,14 @@ def test_security_rollout_step_rejects_leftover_identities() -> None:
         _legal_step(action="FIXED")
     with pytest.raises(ValueError, match="action"):
         _legal_step(action="BLOCK")
+    with pytest.raises(ValueError, match="exact tuples"):
+        _legal_step(state=[0.0, 1.0])
+    with pytest.raises(ValueError, match=r"state\[1\]"):
+        _legal_step(state=(0.0, float("nan")))
+    with pytest.raises(ValueError, match="reward"):
+        _legal_step(reward=float("inf"))
+    with pytest.raises(ValueError, match="policy_metadata"):
+        _legal_step(policy_metadata={"bad": object()})
 
     legal = _legal_step()
     dumped = json.dumps(legal.to_dict(), allow_nan=False)
