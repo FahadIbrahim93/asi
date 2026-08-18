@@ -68,6 +68,24 @@ from alberta_framework.streams.closed_loop import (
 # the state-agnostic update contract, not PrototypeAdapterUpdate.
 _REFERENCE_UPDATE_TYPE = ReferenceAgentUpdate
 
+
+def _checkpoint_source_identity() -> dict[str, Any]:
+    from alberta_framework.reference_life_checkpoint import _source_identity
+
+    return _source_identity()
+
+
+def _checkpoint_runtime_identity() -> dict[str, Any]:
+    from alberta_framework.reference_life_checkpoint import _runtime_identity
+
+    return _runtime_identity()
+
+
+def _checkpoint_dependency_identity() -> dict[str, Any]:
+    from alberta_framework.reference_life_checkpoint import _dependency_identity
+
+    return _dependency_identity()
+
 REFERENCE_LIFE_SCORECARD_PLAN_SCHEMA = "asi.reference_life_scorecard.plan.v1"
 REFERENCE_LIFE_SCORECARD_RUN_SCHEMA = "asi.reference_life_scorecard.run.v1"
 REFERENCE_LIFE_SCORECARD_ARTIFACT_SCHEMA = "asi.reference_life_scorecard.artifact.v1"
@@ -1568,16 +1586,6 @@ def _current_consistency_identities() -> tuple[dict[str, Any], dict[str, Any], d
     # Whole-life checkpoint publication is intentionally Linux-only. Keep that
     # dependency behind the artifact-construction boundary so the portable
     # scorecard CLI, help, and deterministic plan remain importable elsewhere.
-    from alberta_framework.reference_life_checkpoint import (
-        _dependency_identity as _checkpoint_dependency_identity,
-    )
-    from alberta_framework.reference_life_checkpoint import (
-        _runtime_identity as _checkpoint_runtime_identity,
-    )
-    from alberta_framework.reference_life_checkpoint import (
-        _source_identity as _checkpoint_source_identity,
-    )
-
     return (
         _checkpoint_source_identity(),
         _checkpoint_runtime_identity(),
