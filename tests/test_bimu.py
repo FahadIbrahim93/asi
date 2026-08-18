@@ -259,7 +259,7 @@ def test_no_query_schedule_performs_no_updates() -> None:
     assert payload["resources"]["state_changed"] is True
 
 
-def test_rng_domains_are_explicit_threefry_and_collision_free() -> None:
+def test_rng_domains_are_explicit_threefry_and_distinct_for_used_coordinates() -> None:
     import alberta_framework.benchmarks.bimu as module
 
     root = jax.random.key(23, impl="threefry2x32")
@@ -412,6 +412,20 @@ def test_hostile_result_scalars_and_keys_are_rejected_before_hooks() -> None:
     with pytest.raises(ValueError, match="fields"):
         validate_bimu_result(payload)
     assert hostile_key.calls == 0
+
+    payload = run_bimu_development(*_tiny_data(), config=_tiny_config(), seed=31)
+    hostile_assurance = HostileString("true")
+    payload["receipt_assurance"]["authenticated_execution_attestation"] = hostile_assurance
+    with pytest.raises(ValueError, match="assurance"):
+        validate_bimu_result(payload)
+    assert hostile_assurance.calls == 0
+
+    payload = run_bimu_development(*_tiny_data(), config=_tiny_config(), seed=31)
+    hostile_role = HostileString("telemetry_only")
+    payload["timing"]["role"] = hostile_role
+    with pytest.raises(ValueError, match="timing"):
+        validate_bimu_result(payload)
+    assert hostile_role.calls == 0
 
 
 def test_configuration_and_concrete_scalars_are_exact_and_bounded() -> None:
