@@ -206,7 +206,7 @@ def _require_builtin_finite_real(value: object, *, context: str) -> float:
     """Canonicalize a result scalar without invoking numeric subclass hooks."""
     if type(value) is not int and type(value) is not float:
         raise ValueError(f"{context} must be a finite built-in real number")
-    number = float(cast("int | float", value))
+    number = float(value)
     if not math.isfinite(number):
         raise ValueError(f"{context} must be a finite built-in real number")
     return number

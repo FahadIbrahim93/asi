@@ -456,7 +456,7 @@ def build_schedule(key: Array, config: LabelEMNISTConfig, n_train: int) -> Label
 def _require_finite_real(name: str, value: object) -> float:
     if type(value) is not int and type(value) is not float:
         raise ValueError(f"{name} must be a finite real number")
-    number = float(cast("int | float", value))
+    number = float(value)
     if not math.isfinite(number):
         raise ValueError(f"{name} must be a finite real number")
     return number

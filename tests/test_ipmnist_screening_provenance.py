@@ -360,7 +360,11 @@ def test_v2_writer_and_loader_bind_registered_mechanism(
 ) -> None:
     result = _result()
     if field == "base_learner":
-        changed_result = replace(result, base_learner="forged")
+        # Construction now rejects unsupported learner identities before the
+        # writer boundary.  Simulate a hostile adopted instance so this test
+        # continues to prove that the writer independently binds the registry.
+        changed_result = replace(result)
+        object.__setattr__(changed_result, "base_learner", "forged")
         replacement: object = "forged"
     else:
         changed_result = replace(
@@ -396,8 +400,11 @@ def test_v2_writer_and_loader_reject_registered_float_type_aliases(
         _result(),
         config_name=spec.name,
         base_learner=spec.base_learner,
-        hyperparameters=aliased_hyperparameters,
+        hyperparameters=dict(spec.hyperparameters),
     )
+    # Bypass the now-stricter constructor to retain an independent writer
+    # boundary test for JSON bool/int aliases of registered float fields.
+    object.__setattr__(result, "hyperparameters", aliased_hyperparameters)
     with pytest.raises(ValueError, match="registered arm"):
         screening.shard_payload(
             result,
@@ -445,8 +452,11 @@ def test_v2_curves_reject_boolean_and_string_numbers(tmp_path: Path, value: obje
     with pytest.raises(ValueError, match="list of finite JSON numbers"):
         screening.load_shard(path)
 
-    bool_result = replace(
-        _result(), per_task_accuracy=np.asarray([True, False, True], dtype=np.bool_)
+    bool_result = replace(_result())
+    object.__setattr__(
+        bool_result,
+        "per_task_accuracy",
+        np.asarray([True, False, True], dtype=np.bool_),
     )
     with pytest.raises(ValueError, match="per_task_accuracy"):
         screening.shard_payload(
@@ -472,7 +482,8 @@ def test_v2_writer_and_loader_reject_out_of_domain_curves(
 ) -> None:
     curve = np.full(SMALL.n_tasks, 0.5, dtype=np.float64)
     curve[1] = invalid
-    result = replace(_result(), **{field: curve})
+    result = replace(_result())
+    object.__setattr__(result, field, curve)
     with pytest.raises(ValueError, match=field):
         screening.shard_payload(
             result,
@@ -495,12 +506,13 @@ def test_v2_writer_and_atomic_publish_reject_nonfinite_json(
 ) -> None:
     result = _result()
     if failure == "curve":
-        result = replace(
+        object.__setattr__(
             result,
-            per_task_loss=np.asarray([0.1, np.nan, 0.1], dtype=np.float64),
+            "per_task_loss",
+            np.asarray([0.1, np.nan, 0.1], dtype=np.float64),
         )
     else:
-        result = replace(result, wall_clock_seconds=float("inf"))
+        object.__setattr__(result, "wall_clock_seconds", float("inf"))
     with pytest.raises(ValueError, match="finite"):
         screening.shard_payload(
             result,
