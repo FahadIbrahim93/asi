@@ -227,8 +227,20 @@ EXTERNAL_QUALIFICATION_PLANS: tuple[ExternalQualificationPlan, ...] = (
                 "https://github.com/linzhiqiu/continual-learning.git",
                 "620cab4a7d99921fde73b67b53879470533cb39a",
             ),
+            _revision(
+                "https://github.com/ElvishElvis/CLEAR-Continual_Learning_Benchmark.git",
+                "75d5d2e7d412a787e0decf0417a4868c56691252",
+            ),
+            _revision(
+                "https://github.com/ContinualAI/avalanche.git",
+                "eb075be393e1f458b2c352514ff6c17b5a2c0f4e",
+            ),
         ),
-        COMMON_GATES,
+        COMMON_GATES
+        + (
+            "provider_archive_revision_and_checksums_disclosed",
+            "yfcc_asset_rights_and_availability_reviewed",
+        ),
     ),
     ExternalQualificationPlan(
         1580,
