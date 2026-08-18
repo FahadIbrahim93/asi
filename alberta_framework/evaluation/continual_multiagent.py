@@ -939,12 +939,22 @@ def aggregate_evidence(
 
     if type(config) is not ContinualMultiAgentConfig:
         raise ValueError("config must be a ContinualMultiAgentConfig")
+    if type(results) not in (list, tuple):
+        raise ValueError("results must be an exact list or tuple")
     if not results:
         raise ValueError("results must be non-empty")
+    _require_resource_limit(
+        "aggregate condition result arrays",
+        len(results) * _condition_result_array_nbytes(config.phase_steps),
+    )
     validated: list[ConditionResult] = []
     for result in results:
         if type(result) is not ConditionResult:
             raise ValueError("results must contain exact ConditionResult records")
+        if type(result.controller_budget) is not ControllerBudget:
+            raise ValueError("controller_budget must be a ControllerBudget")
+        if type(result.timing) is not TimingMetrics:
+            raise ValueError("timing must be a TimingMetrics")
         budget = ControllerBudget(
             **{
                 field.name: getattr(result.controller_budget, field.name)
