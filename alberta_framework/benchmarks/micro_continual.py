@@ -936,8 +936,10 @@ def _build_arm_registry() -> dict[str, MicroArmSpec]:
 MICRO_ARM_REGISTRY: Mapping[str, MicroArmSpec] = MappingProxyType(_build_arm_registry())
 
 
-def micro_arm_spec(name: str) -> MicroArmSpec:
+def micro_arm_spec(name: object) -> MicroArmSpec:
     """Look up one ladder arm; raises ``KeyError`` for unknown names."""
+    if type(name) is not str:
+        raise TypeError("micro arm name must be an exact string")
     spec = MICRO_ARM_REGISTRY.get(name)
     if spec is None:
         raise KeyError(f"unknown micro arm {name!r}; known: {sorted(MICRO_ARM_REGISTRY)}")

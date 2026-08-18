@@ -9,6 +9,7 @@ from alberta_framework.benchmarks.ipmnist_screening import ScreeningRunResult
 from alberta_framework.benchmarks.micro_continual import (
     MicroStream,
     MicroTaskConfig,
+    micro_arm_spec,
 )
 from alberta_framework.benchmarks.upgd_ipmnist import IPMNISTConfig, IPMNISTRunResult
 from alberta_framework.benchmarks.upgd_label_emnist import (
@@ -19,6 +20,18 @@ from alberta_framework.benchmarks.upgd_label_emnist import (
 
 class _DictSubclass(dict[str, float]):
     """A mutable identity that must not cross an exact record boundary."""
+
+
+class _HostileStr(str):
+    calls = 0
+
+    def __hash__(self) -> int:
+        type(self).calls += 1
+        raise AssertionError("hostile hash must not execute")
+
+    def __eq__(self, other: object) -> bool:
+        type(self).calls += 1
+        raise AssertionError("hostile equality must not execute")
 
 
 def _ipmnist_result(**overrides: object) -> IPMNISTRunResult:
@@ -153,3 +166,10 @@ def test_micro_stream_is_exact_bounded_and_detached() -> None:
             hidden2=1,
             crop=False,
         )
+
+
+def test_micro_arm_lookup_gates_identity_before_mapping_hooks() -> None:
+    _HostileStr.calls = 0
+    with pytest.raises(TypeError, match="exact string"):
+        micro_arm_spec(_HostileStr("upgd_w_control"))
+    assert _HostileStr.calls == 0
