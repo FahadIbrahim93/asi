@@ -70,6 +70,36 @@ def _replay(*, observation_dim: int, action_dim: int = 2, total_capacity: int = 
     )
 
 
+def _working_bytes(config: ModelReplayRehearsalConfig) -> int:
+    model = config.ensemble.model
+    ensemble_size = config.ensemble.ensemble_size
+    target_dim = model.observation_dim + 2
+    _, ensemble_bytes = _ensemble_state_resource_counts(
+        model=model,
+        ensemble_size=ensemble_size,
+    )
+    slot_bytes, replay_bytes = _allocation_sizes(config.replay)
+    ensemble_update_extra_bytes = 4 * (
+        2 * ensemble_size * target_dim
+        + 3 * target_dim
+        + ensemble_size * model.observation_dim
+        + 2 * model.observation_dim
+        + 3 * ensemble_size
+        + 13
+    ) + (2 * ensemble_size + 20)
+    quota = config.replay.batch_size
+    return (
+        4 * ensemble_bytes
+        + 3 * replay_bytes
+        + 2 * ensemble_update_extra_bytes
+        + quota * (slot_bytes + 13)
+        + quota * (21 + ensemble_size)
+        + 8 * model.observation_dim
+        + 32
+        + 207
+    )
+
+
 def test_int32_wrap_forges_a_different_published_byte_identity() -> None:
     published_bytes = _INT32_MAX + 1
     wrapped_bytes = int(
@@ -80,20 +110,23 @@ def test_int32_wrap_forges_a_different_published_byte_identity() -> None:
 
 
 def test_rehearsal_one_bank_and_persistent_fit_while_update_working_set_does_not() -> None:
-    ensemble = _ensemble(observation_dim=_WORKING_SET_OVERFLOW)
-    replay = _replay(observation_dim=_WORKING_SET_OVERFLOW)
+    observation_dim = 6_000
+    ensemble = _ensemble(observation_dim=observation_dim)
+    replay = _replay(observation_dim=observation_dim)
     _, ensemble_bytes = _ensemble_state_resource_counts(
         model=ensemble.model, ensemble_size=ensemble.ensemble_size
     )
     _, replay_bytes = _allocation_sizes(replay)
     persistent_bytes = ensemble_bytes + replay_bytes + 28
-    update_bytes = 2 * ensemble_bytes + replay_bytes + _COMPOSER_ACCOUNTING_BYTES
-    assert ensemble_bytes <= _INT32_MAX
-    assert persistent_bytes <= _INT32_MAX
-    assert update_bytes > _INT32_MAX
+    contributor_bytes = 2 * ensemble_bytes + replay_bytes + _COMPOSER_ACCOUNTING_BYTES
     config = ModelReplayRehearsalConfig(
         ensemble=ensemble, replay=replay, action_encoding="one_hot"
     )
+    update_bytes = _working_bytes(config)
+    assert ensemble_bytes <= _INT32_MAX
+    assert persistent_bytes <= _INT32_MAX
+    assert contributor_bytes <= _INT32_MAX
+    assert update_bytes > _INT32_MAX
     with pytest.raises(ValueError, match="update working set byte count"):
         ModelReplayRehearsal(config)
 
@@ -140,30 +173,25 @@ def test_rehearsal_exact_last_legal_working_set_and_first_overflow() -> None:
     while low < high:
         middle = (low + high + 1) // 2
         candidate = config(middle)
-        _, ensemble_bytes = _ensemble_state_resource_counts(
-            model=candidate.ensemble.model,
-            ensemble_size=candidate.ensemble.ensemble_size,
-        )
-        _, replay_bytes = _allocation_sizes(candidate.replay)
-        if (
-            2 * ensemble_bytes + replay_bytes + _COMPOSER_ACCOUNTING_BYTES
-            <= _INT32_MAX
-        ):
+        if _working_bytes(candidate) <= _INT32_MAX:
             low = middle
         else:
             high = middle - 1
 
     last_legal = config(low)
     first_overflowing = config(low + 1)
+    assert _working_bytes(last_legal) <= _INT32_MAX
+    assert _working_bytes(first_overflowing) > _INT32_MAX
     _preflight_model_replay_state_resources(last_legal)
     with pytest.raises(ValueError, match="update working set byte count"):
         _preflight_model_replay_state_resources(first_overflowing)
 
 
 def test_rehearsal_general_shape_formula_preflights_before_child_allocation() -> None:
-    ensemble = _ensemble(observation_dim=7_000, n_actions=5, ensemble_size=3)
+    observation_dim = 5_000
+    ensemble = _ensemble(observation_dim=observation_dim, n_actions=5, ensemble_size=3)
     replay = _replay(
-        observation_dim=7_000,
+        observation_dim=observation_dim,
         action_dim=5,
         total_capacity=4,
     )
@@ -178,8 +206,10 @@ def test_rehearsal_general_shape_formula_preflights_before_child_allocation() ->
     )
     _, replay_bytes = _allocation_sizes(replay)
     persistent_bytes = ensemble_bytes + replay_bytes + _COMPOSER_ACCOUNTING_BYTES
-    update_bytes = 2 * ensemble_bytes + replay_bytes + _COMPOSER_ACCOUNTING_BYTES
+    contributor_bytes = 2 * ensemble_bytes + replay_bytes + _COMPOSER_ACCOUNTING_BYTES
+    update_bytes = _working_bytes(config)
     assert persistent_bytes <= _INT32_MAX
+    assert contributor_bytes <= _INT32_MAX
     assert update_bytes > _INT32_MAX
     with pytest.raises(ValueError, match="update working set byte count"):
         ModelReplayRehearsal(config)
