@@ -622,7 +622,7 @@ def _validate_artifact_payload(
         errors.append("artifact provenance fields do not match v1")
     else:
         data_home = provenance.get("openml_data_home")
-        if not isinstance(data_home, str) or not data_home:
+        if type(data_home) is not str or not data_home:
             errors.append("artifact provenance.openml_data_home must be non-empty")
         if provenance.get("deviations") != _EXPECTED_DEVIATIONS:
             errors.append("artifact deviations do not match the recorded protocol")
@@ -918,7 +918,7 @@ def validate_upgd_ipmnist_v2_artifact(
         errors.append("v2 artifact provenance fields do not match the strict schema")
     else:
         data_home = provenance.get("openml_data_home")
-        if not isinstance(data_home, str) or not data_home:
+        if type(data_home) is not str or not data_home:
             errors.append("v2 provenance.openml_data_home must be a non-empty locator")
         for field in _V2_PROVENANCE_FIELDS - {"openml_data_home"}:
             if provenance.get(field) is not False:
@@ -927,7 +927,7 @@ def validate_upgd_ipmnist_v2_artifact(
     environment = artifact.get("environment")
     if not isinstance(environment, Mapping) or set(environment) != _V2_ENVIRONMENT_FIELDS:
         errors.append("v2 artifact environment fields do not match the strict schema")
-    elif any(not isinstance(value, str) or not value for value in environment.values()):
+    elif any(type(value) is not str or not value for value in environment.values()):
         errors.append("v2 artifact environment values must be non-empty strings")
     notes = artifact.get("notes")
     if not isinstance(notes, list) or any(not isinstance(note, str) for note in notes):
