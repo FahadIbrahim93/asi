@@ -96,7 +96,10 @@ def _require_environment_shape(
     observation_dim: int,
     n_actions: int,
 ) -> None:
-    if environment_kind not in ("switching_two_state", "riverswim"):
+    if type(environment_kind) is not str or environment_kind not in (
+        "switching_two_state",
+        "riverswim",
+    ):
         raise ValueError("environment_kind must be switching_two_state or riverswim")
     if (
         isinstance(observation_dim, bool)
@@ -737,6 +740,8 @@ class AnalyticOracleReferenceConfig:
             self.policy_sha256
         ) is None:
             raise ValueError("oracle policy_sha256 must be a lowercase SHA-256 digest")
+        if type(self.environment_config_json) is not str:
+            raise ValueError("oracle environment config must be canonical JSON")
         try:
             decoded = json.loads(self.environment_config_json)
         except (TypeError, json.JSONDecodeError) as exc:
