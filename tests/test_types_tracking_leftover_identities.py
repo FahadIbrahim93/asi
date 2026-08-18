@@ -11,6 +11,15 @@ from alberta_framework.core.types import (
 )
 
 
+class _ExplodingHashMeta(type):
+    def __hash__(cls) -> int:
+        raise AssertionError("hostile runtime-class hash executed")
+
+
+class _HostileInterval(metaclass=_ExplodingHashMeta):
+    pass
+
+
 def test_step_size_tracking_config_rejects_leftover_identities() -> None:
     """Tracking intervals and include_bias must not keep leftover bool/float identities."""
 
@@ -62,3 +71,11 @@ def test_normalizer_tracking_config_rejects_leftover_identities() -> None:
     legal = NormalizerTrackingConfig(interval=0)
     assert legal.interval == 0
     assert type(legal.interval) is int
+
+
+def test_tracking_intervals_do_not_hash_hostile_runtime_classes() -> None:
+    hostile = _HostileInterval()
+    with pytest.raises(ValueError, match="interval"):
+        StepSizeTrackingConfig(interval=hostile)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="interval"):
+        NormalizerTrackingConfig(interval=hostile)  # type: ignore[arg-type]
