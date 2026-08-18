@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+from types import SimpleNamespace
+
 import pytest
 
 from alberta_framework.benchmarks import historical_forager
@@ -148,4 +151,39 @@ def test_historical_runtime_manifest_rejects_hostile_strings_before_hooks() -> N
     _HostileString.calls = 0
     with pytest.raises(historical_forager.HistoricalForagerArtifactError, match="runtime"):
         historical_forager._validate_runtime_manifest(runtime)
+    assert _HostileString.calls == 0
+
+
+def test_historical_module_identities_reject_hostile_strings_before_hooks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hostile = _HostileString("identity")
+    module_name = "hostile_historical_version_fixture"
+    monkeypatch.setitem(
+        historical_forager.sys.modules,
+        module_name,
+        SimpleNamespace(__version__=hostile),
+    )
+    monkeypatch.setattr(
+        historical_forager,
+        "_distribution_version",
+        lambda _name: "fallback",
+    )
+    _HostileString.calls = 0
+    assert (
+        historical_forager._module_or_distribution_version(module_name, "fixture")
+        == "fallback"
+    )
+
+    monkeypatch.setattr(historical_forager.os, "access", lambda *_args: False)
+    monkeypatch.setattr(
+        historical_forager.inspect,
+        "getmodule",
+        lambda _owner: SimpleNamespace(__file__=hostile),
+    )
+    with pytest.raises(HistoricalForagerContractError, match="filesystem identity"):
+        historical_forager._require_read_only_non_tmp_factory_source(
+            lambda: None,
+            Path.home(),
+        )
     assert _HostileString.calls == 0

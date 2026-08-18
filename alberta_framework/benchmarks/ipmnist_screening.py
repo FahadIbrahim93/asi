@@ -6717,7 +6717,9 @@ def _validated_screening_noise_mode(
 ) -> str:
     """Validate one screening noise mode against the named arm's runner contract."""
     prefix = "" if context is None else f"{context}: "
-    if type(noise_mode) is not str or noise_mode not in ("step", "pool"):
+    if type(noise_mode) is not str:
+        raise ValueError(f"{prefix}noise_mode must be 'step' or 'pool'")
+    if noise_mode not in ("step", "pool"):
         raise ValueError(
             f"{prefix}noise_mode must be 'step' or 'pool', got {noise_mode!r}"
         )
@@ -6809,7 +6811,7 @@ def _array_bundle_sha256(domain: str, arrays: Mapping[str, object]) -> str:
 
 def _is_lower_hex(value: object, length: int) -> bool:
     return (
-        isinstance(value, str)
+        type(value) is str
         and len(value) == length
         and all(character in "0123456789abcdef" for character in value)
     )
@@ -8084,8 +8086,8 @@ def _validated_dataset_provenance(value: object, *, context: str) -> dict[str, A
         context=f"{context} dataset provenance source",
     )
     if (
-        not isinstance(source["provider"], str)
-        or not isinstance(source["name"], str)
+        type(source["provider"]) is not str
+        or type(source["name"]) is not str
         or type(source["version"]) is not int
         or type(source["row_start"]) is not int
         or type(source["row_stop_exclusive"]) is not int
@@ -8251,7 +8253,7 @@ def _validated_runtime_environment(value: object, *, context: str) -> dict[str, 
         if type(jax_config[field]) is not bool:
             raise ValueError(f"{context} runtime environment {field} must be boolean")
     precision = jax_config["jax_default_matmul_precision"]
-    if precision is not None and (not isinstance(precision, str) or not precision):
+    if precision is not None and (type(precision) is not str or not precision):
         raise ValueError(
             f"{context} runtime environment jax_default_matmul_precision must be a "
             "string or null"
@@ -8269,7 +8271,7 @@ def _validated_runtime_environment(value: object, *, context: str) -> dict[str, 
             f"{context} runtime environment jax_random_seed_offset must be an integer"
         )
     if any(
-        value is not None and not isinstance(value, str)
+        value is not None and type(value) is not str
         for value in process_environment.values()
     ):
         raise ValueError(
@@ -8287,6 +8289,8 @@ def shard_payload(
 ) -> dict[str, Any]:
     """Serialize one bound (config, seed) screening run as a strict v2 shard."""
     seed = require_jax_seed(result.seed, name="result seed")
+    if type(result.base_learner) is not str or not result.base_learner:
+        raise ValueError("new shard base_learner must be a non-empty string")
     spec = screening_spec(result.config_name)
     if result.base_learner != spec.base_learner:
         raise ValueError(
@@ -8303,8 +8307,6 @@ def shard_payload(
     dataset_binding = _validated_dataset_provenance(dataset_provenance, context="new shard")
     runtime_binding = _validated_runtime_environment(environment, context="new shard")
     _validate_dataset_config_binding(dataset_binding, result.config, context="new shard")
-    if type(result.base_learner) is not str or not result.base_learner:
-        raise ValueError("new shard base_learner must be a non-empty string")
     curves: dict[str, np.ndarray] = {}
     for field in ("per_task_accuracy", "per_task_loss", "per_task_plasticity"):
         try:
@@ -8438,7 +8440,7 @@ def load_shard(path: Path) -> dict[str, Any]:
     )
     payload["noise_mode"] = noise_mode
     payload["noise_pool_steps"] = noise_pool_steps
-    if not isinstance(payload.get("base_learner"), str) or not payload["base_learner"]:
+    if type(payload.get("base_learner")) is not str or not payload["base_learner"]:
         raise ValueError(f"{path}: base_learner must be a non-empty string")
     if not isinstance(payload.get("hyperparameters"), dict):
         raise ValueError(f"{path}: hyperparameters must be an object")
@@ -8446,7 +8448,7 @@ def load_shard(path: Path) -> dict[str, Any]:
         environment = payload.get("environment")
         required_environment_fields = ("jax", "numpy", "python", "platform")
         if not isinstance(environment, dict) or any(
-            not isinstance(environment.get(field), str) or not environment[field]
+            type(environment.get(field)) is not str or not environment[field]
             for field in required_environment_fields
         ):
             raise ValueError(
@@ -8511,7 +8513,7 @@ def _require_embedded_artifact_manifest_unchanged(
         size_bytes = item.get("size_bytes")
         sha256 = item.get("sha256")
         if (
-            not isinstance(path, str)
+            type(path) is not str
             or not path
             or type(size_bytes) is not int
             or size_bytes < 0
