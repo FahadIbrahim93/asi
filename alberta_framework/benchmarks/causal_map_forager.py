@@ -175,7 +175,7 @@ class CausalMapForagerConfig:
             not isinstance(self.world_shape, tuple)
             or len(self.world_shape) != 2
             or any(
-                isinstance(value, bool) or not isinstance(value, int) or value < 1
+                type(value) is not int or value < 1
                 or value > _INT32_MAX
                 for value in self.world_shape
             )
@@ -2637,7 +2637,7 @@ class CausalMapForagerAgent:
         if config is not None and not isinstance(config, CausalMapForagerConfig):
             raise TypeError("config must be a CausalMapForagerConfig")
         self.config = config if config is not None else CausalMapForagerConfig()
-        if isinstance(seed, bool) or not isinstance(seed, (int, np.integer)):
+        if type(seed) is not int and not isinstance(seed, np.integer):
             raise ValueError("seed must be a uint32-compatible integer")
         self.seed = int(seed)
         if not 0 <= self.seed <= np.iinfo(np.uint32).max:
@@ -3530,7 +3530,7 @@ def run_causal_map_forager_seeds(
     if not raw_seeds:
         raise ValueError("seeds must be non-empty")
     if any(
-        isinstance(seed, bool) or not isinstance(seed, (int, np.integer))
+        type(seed) is not int and not isinstance(seed, np.integer)
         for seed in raw_seeds
     ):
         raise ValueError("seeds must be uint32-compatible integers without coercion")
