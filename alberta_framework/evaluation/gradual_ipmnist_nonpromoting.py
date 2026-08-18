@@ -1088,7 +1088,7 @@ def retain_frozen_gradual_input_development_report(
     if not _same(root["plan"], _plan_payload(FROZEN_GRADUAL_INPUT_PLAN)):
         raise ValueError("only the exact frozen gradual-input plan may be retained")
     digest = cast(str, root["result_sha256"])
-    segments = ("outputs", "ipmnist_gradual", "development.v1")
+    segments = ("outputs", "ipmnist_gradual", "development.v2")
     directory = repository_root.joinpath(*segments)
     destination = directory / f"result.{digest}.json"
     temporary_name = f".result.{digest}.tmp"
