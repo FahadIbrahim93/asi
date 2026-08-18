@@ -8,8 +8,10 @@ import pytest
 from alberta_framework.evaluation.continual_ia import (
     CONDITION_NAMES,
     ConditionTiming,
+    ContinualIAConfig,
     ControllerBudget,
     IAConditionResult,
+    aggregate_ia_evidence,
 )
 
 
@@ -137,3 +139,47 @@ def test_ia_condition_result_rejects_hostile_array_subclasses_without_hooks() ->
     with pytest.raises(ValueError, match="rewards must be an exact numpy.ndarray"):
         _legal(rewards=hostile)
     assert HostileArray.calls == 0
+
+
+def test_ia_condition_result_owns_read_only_array_snapshots() -> None:
+    rewards = np.zeros(2, dtype=np.float64)
+    result = _legal(rewards=rewards)
+
+    rewards[0] = 1.0
+
+    np.testing.assert_array_equal(result.rewards, np.zeros(2, dtype=np.float64))
+    assert not result.rewards.flags.writeable
+    with pytest.raises(ValueError, match="read-only"):
+        result.rewards[0] = 1.0
+
+
+def test_ia_condition_result_rejects_nested_subclasses() -> None:
+    class BudgetSubclass(ControllerBudget):
+        pass
+
+    class TimingSubclass(ConditionTiming):
+        pass
+
+    with pytest.raises(ValueError, match="controller_budget must be"):
+        _legal(controller_budget=BudgetSubclass(**vars(_budget())))
+    with pytest.raises(ValueError, match="timing must be"):
+        _legal(timing=TimingSubclass(**vars(_timing())))
+
+
+def test_ia_aggregation_revalidates_records_at_consumption() -> None:
+    result = _legal()
+    object.__setattr__(result, "mean_reward", 1.0)
+
+    with pytest.raises(ValueError, match="mean_reward does not match"):
+        aggregate_ia_evidence(
+            [result],
+            config=ContinualIAConfig(num_steps=2, phase_length=2, recovery_window=1),
+        )
+
+
+def test_ia_aggregation_revalidates_config_at_consumption() -> None:
+    config = ContinualIAConfig(num_steps=2, phase_length=2, recovery_window=1)
+    object.__setattr__(config, "phase_length", 0)
+
+    with pytest.raises(ValueError, match="phase_length must be an integer"):
+        aggregate_ia_evidence([_legal()], config=config)
