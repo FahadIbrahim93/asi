@@ -729,6 +729,18 @@ class SeedExecutionArtifacts:
     trace_artifact: Mapping[str, Any]
     scoring_record: Mapping[str, Any]
 
+    def __post_init__(self) -> None:
+        """Reject bool seed/score identities before they become JSON ``true``."""
+
+        _identifier(self.candidate_id, "candidate_id")
+        _integer(self.seed, "seed", minimum=0, maximum=2**31 - 1)
+        if type(self.score) is not float or not math.isfinite(self.score):
+            raise ForagerMatchedExecutorError("score must be a finite built-in float")
+        _sha256(self.live_runtime_identity_sha256, "live_runtime_identity_sha256")
+        for name in ("raw_artifact", "trace_artifact", "scoring_record"):
+            if not isinstance(getattr(self, name), Mapping):
+                raise ForagerMatchedExecutorError(f"{name} must be a mapping")
+
     @property
     def raw_artifact_sha256(self) -> str:
         return _canonical_sha256(self.raw_artifact)

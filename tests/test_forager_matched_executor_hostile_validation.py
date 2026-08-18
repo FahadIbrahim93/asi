@@ -10,6 +10,7 @@ from alberta_framework.benchmarks.forager_matched_executor import (
     ForagerMatchedExecutorError,
     LiveRuntimeIdentity,
     PreparedCandidate,
+    SeedExecutionArtifacts,
 )
 
 
@@ -59,3 +60,49 @@ def test_prepared_candidate_validation() -> None:
             capability_receipt_sha256="c" * 64,
             source_inventory={},
         )
+
+
+def _legal_seed_artifacts(**overrides: object) -> SeedExecutionArtifacts:
+    payload: dict[str, object] = {
+        "candidate_id": "isolated_ppo",
+        "seed": 2_200_001,
+        "score": 1.25,
+        "live_runtime_identity_sha256": "a" * 64,
+        "raw_artifact": {"kind": "raw"},
+        "trace_artifact": {"kind": "trace"},
+        "scoring_record": {"kind": "score"},
+    }
+    payload.update(overrides)
+    return SeedExecutionArtifacts(**payload)  # type: ignore[arg-type]
+
+
+def test_seed_execution_artifacts_remain_legal() -> None:
+    legal = _legal_seed_artifacts()
+    dumped = legal.to_dict()
+    assert dumped["seed"] == 2_200_001
+    assert dumped["seed"] is not True
+    assert dumped["score_hex"] == (1.25).hex()
+    assert dumped["candidate_id"] == "isolated_ppo"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("seed", True),
+        ("seed", False),
+        ("seed", -1),
+        ("score", True),
+        ("score", False),
+        ("score", float("nan")),
+        ("score", float("inf")),
+        ("score", 1),
+        ("candidate_id", ""),
+        ("live_runtime_identity_sha256", "not-a-digest"),
+        ("raw_artifact", ["not-a-mapping"]),
+    ],
+)
+def test_seed_execution_artifacts_reject_bool_seed_and_score(
+    field: str, value: object
+) -> None:
+    with pytest.raises(ForagerMatchedExecutorError, match=field):
+        _legal_seed_artifacts(**{field: value})
