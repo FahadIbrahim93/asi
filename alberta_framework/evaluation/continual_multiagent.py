@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import operator
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from time import perf_counter, perf_counter_ns
 from typing import Any, Literal, SupportsIndex, cast
 
@@ -469,6 +469,12 @@ class ConditionResult:
             raise ValueError("phase_mean_rewards must reconstruct from online_rewards")
         if type(self.summary) is not ContinualLearningSummary:
             raise ValueError("summary must be a ContinualLearningSummary")
+        summary = ContinualLearningSummary(
+            **{
+                field.name: getattr(self.summary, field.name)
+                for field in fields(ContinualLearningSummary)
+            }
+        )
         summary_without_reference = summarize_continual_learning(
             performance,
             [0, 1],
@@ -482,7 +488,7 @@ class ConditionResult:
             "max_forgetting",
             "backward_transfer",
         ):
-            if getattr(self.summary, name) != getattr(summary_without_reference, name):
+            if getattr(summary, name) != getattr(summary_without_reference, name):
                 raise ValueError(f"summary.{name} must reconstruct from primitive arrays")
         for name in (
             "per_task_final_performance",
@@ -490,7 +496,7 @@ class ConditionResult:
             "per_task_backward_transfer",
         ):
             if not np.array_equal(
-                getattr(self.summary, name), getattr(summary_without_reference, name)
+                getattr(summary, name), getattr(summary_without_reference, name)
             ):
                 raise ValueError(f"summary.{name} must reconstruct from performance_matrix")
         recovery = _require_ndarray(
@@ -517,14 +523,26 @@ class ConditionResult:
             raise ValueError("interference_forgetting must reconstruct from performance_matrix")
         if type(self.controller_budget) is not ControllerBudget:
             raise ValueError("controller_budget must be a ControllerBudget")
+        budget = ControllerBudget(
+            **{
+                field.name: getattr(self.controller_budget, field.name)
+                for field in fields(ControllerBudget)
+            }
+        )
         if type(self.timing) is not TimingMetrics:
             raise ValueError("timing must be a TimingMetrics")
+        timing = TimingMetrics(
+            **{field.name: getattr(self.timing, field.name) for field in fields(TimingMetrics)}
+        )
         object.__setattr__(self, "online_rewards", _freeze_ndarray(rewards))
         object.__setattr__(self, "phase_mean_rewards", _freeze_ndarray(phase_rewards))
         object.__setattr__(self, "performance_matrix", _freeze_ndarray(performance))
         object.__setattr__(self, "recovery_lengths", _freeze_ndarray(recovery))
         object.__setattr__(self, "recurrence_recovery_steps", recurrence)
         object.__setattr__(self, "interference_forgetting", interference)
+        object.__setattr__(self, "summary", summary)
+        object.__setattr__(self, "controller_budget", budget)
+        object.__setattr__(self, "timing", timing)
 
 
 @dataclass(frozen=True)
@@ -914,30 +932,53 @@ def paired_bootstrap_mean_interval(
 def aggregate_evidence(
     results: Sequence[ConditionResult],
     *,
+    config: ContinualMultiAgentConfig,
     confidence_level: float = 0.95,
     bootstrap_resamples: int = 10_000,
     bootstrap_seed: int = 2_026_073_000,
-    stability_reference_reward: float = 0.75,
 ) -> AggregateEvidence:
     """Aggregate paired condition results without discarding failed seeds."""
 
+    if type(config) is not ContinualMultiAgentConfig:
+        raise ValueError("config must be a ContinualMultiAgentConfig")
     if not results:
         raise ValueError("results must be non-empty")
-    reference = finite_real("stability_reference_reward", stability_reference_reward)
+    validated: list[ConditionResult] = []
     for result in results:
+        if type(result) is not ConditionResult:
+            raise ValueError("results must contain exact ConditionResult records")
+        result = ConditionResult(
+            **{field.name: getattr(result, field.name) for field in fields(ConditionResult)}
+        )
+        if result.online_rewards.size != 3 * config.phase_steps:
+            raise ValueError("result length does not match config.phase_steps")
+        expected_recoveries = compute_recovery_lengths(
+            result.online_rewards,
+            [config.phase_steps, 2 * config.phase_steps],
+            config.recovery_reward_threshold,
+            window_size=config.recovery_window,
+        )
+        if not np.array_equal(result.recovery_lengths, expected_recoveries):
+            raise ValueError("recovery_lengths do not match rewards and config")
         expected_summary = summarize_continual_learning(
             result.performance_matrix,
             [0, 1],
             result.online_rewards,
-            reference,
+            config.stability_reference_reward,
         )
-        if (
-            result.summary.stability_gap_mean != expected_summary.stability_gap_mean
-            or result.summary.stability_gap_max != expected_summary.stability_gap_max
-        ):
-            raise ValueError(
-                "condition summary must reconstruct from primitive arrays and stability reference"
+        summary_matches = all(
+            np.array_equal(
+                getattr(result.summary, field.name),
+                getattr(expected_summary, field.name),
             )
+            if isinstance(getattr(result.summary, field.name), np.ndarray)
+            else getattr(result.summary, field.name) == getattr(expected_summary, field.name)
+            for field in fields(ContinualLearningSummary)
+        )
+        if not summary_matches:
+            raise ValueError("summary does not match primitive arrays and config")
+        validated.append(result)
+    results = tuple(validated)
     frozen = _condition_results(results, "frozen")
     learner_only = _condition_results(results, "learner_only")
     joint_adaptive = _condition_results(results, "joint_adaptive")
@@ -1243,6 +1284,7 @@ def run_continual_multiagent_benchmark(
     )
     aggregate = aggregate_evidence(
         results,
+        config=benchmark_config,
         confidence_level=benchmark_config.confidence_level,
         bootstrap_resamples=benchmark_config.bootstrap_resamples,
         bootstrap_seed=benchmark_config.bootstrap_seed,

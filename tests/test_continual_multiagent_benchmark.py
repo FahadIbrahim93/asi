@@ -138,6 +138,7 @@ def test_seeded_learning_evidence_is_exactly_reproducible(
         )
     repeated_aggregate = aggregate_evidence(
         benchmark_report.condition_results,
+        config=benchmark_report.config,
         confidence_level=benchmark_report.config.confidence_level,
         bootstrap_resamples=benchmark_report.config.bootstrap_resamples,
         bootstrap_seed=benchmark_report.config.bootstrap_seed,
@@ -280,7 +281,7 @@ def test_public_aggregation_rejects_duplicate_seed_weighting(
         if result.seed == evidence_seed
     )
     with pytest.raises(ValueError, match="unique"):
-        aggregate_evidence(one_seed + one_seed)
+        aggregate_evidence(one_seed + one_seed, config=benchmark_report.config)
 
 
 def test_artifact_has_deterministic_scientific_content_and_digest(
