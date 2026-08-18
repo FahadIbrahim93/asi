@@ -479,6 +479,20 @@ class RecurringFeatureGateDecision:
     summary: str
     failures: tuple[str, ...]
 
+    def __post_init__(self) -> None:
+        """Reject leftover bool/int/string identities before they become a verdict."""
+        _require_exact_bool("accepted", self.accepted)
+        if type(self.summary) is not str:
+            raise ValueError("summary must be an exact string")
+        if not self.summary:
+            raise ValueError("summary must be non-empty")
+        if type(self.failures) is not tuple:
+            raise ValueError("failures must be an exact tuple")
+        if any(type(item) is not str or not item for item in self.failures):
+            raise ValueError("failures must contain non-empty exact strings")
+        if self.accepted == bool(self.failures):
+            raise ValueError("accepted must be true exactly when failures is empty")
+
     def require(self) -> None:
         """Raise an evidence-rich error unless every check passed."""
         if not self.accepted:
