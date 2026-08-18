@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Added the unfrozen `preview1` reference-agent transaction ledger, primitive
+  Prototype adapter, aggregate SwitchingTwoState/RiverSwim life runner, and
+  development-only quiescent checkpoint codec. These L0 mechanisms enforce
+  exact dispatch ownership, immutable aggregate state, strict transition
+  validation, and exact continuation for the documented simulator/configuration
+  pairs; they are not `reference-dev`, safety, robotics, performance, or
+  scientific evidence.
+- Added the permanently nonpromoting reference-life development scorecard and
+  `asi-reference-life-scorecard` CLI. Its literal-frozen 144-shard plan compares
+  six arms across two environments and 12 consumed development seeds with
+  explicit source identity, Threefry roots, reward/counter validation, and
+  numeric-payload accounting. The machinery does not constitute a completed
+  run or result.
 - Added the code-only, permanently nonpromoting IPMNIST gate-ablation arm
   `rls_head_resid_l1_preset005_nogate`. It has no result artifact and does not authorize a
   benchmark run; execution remains gated by the issue's source receipt and owner-approved
