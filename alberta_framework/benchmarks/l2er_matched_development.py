@@ -41,32 +41,50 @@ ARMS = (
     "l2er_er_only",
     "l2er_combined",
 )
-SEEDS = (1721, 1722, 1723)
+SEEDS = (1711, 1712, 1713)
 CONFIG = IPMNISTConfig(n_tasks=2, task_length=500)
-_T95_DF2 = math.sqrt(1.805 / 0.0975)
-_INVALID_V1_ATTEMPT = {
-    "schema": "asi.l2er-ipmnist.matched-development-report.v1",
-    "path": "outputs/l2er_matched_development/report.v1.json",
-    "artifact_sha256": "ab7f03b73993b79c53021970926181130980dd84b180e095779e30960953ff86",
-    "source_commit": "f62d157a449c30a79dcf01740ae7f20a6c27e726",
-    "seeds": [1701, 1702, 1703],
-    "disposition": "invalid_unmerged_historical_attempt",
-    "execution_history": [
-        "seed 1701 was consumed across all arms during executable-path audit",
-        "one planned invocation failed during dataset download before arm execution or output",
-        "a later complete v1 matrix produced the invalid unmerged artifact",
-    ],
-    "invalid_reasons": [
-        "normal critical 1.96 was used instead of Student t(df=2)",
-        "effective-rank parameter updates were omitted from the update counter",
-        "seed 1701 had already been consumed during executable-path audit",
-    ],
-}
+CONSUMED_AUDIT_SEEDS = (1701,)
+_T95_DF2 = 4.302652729696142
 _MAX_REPORT_RECORDS = 32
 _MAX_REPORT_BYTES = 16 * 1024 * 1024
 _PATH_TYPE = type(Path())
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 OUTPUT_PATH = _REPO_ROOT / "outputs/l2er_matched_development/report.v2.json"
+
+
+def _invalid_execution_history() -> list[dict[str, object]]:
+    """Return consumed invalid executions without changing the prospective v2 matrix."""
+    return [
+        {
+            "schema": "asi.l2er-ipmnist.matched-development-report.v1",
+            "path": "outputs/l2er_matched_development/report.v1.json",
+            "artifact_sha256": (
+                "ab7f03b73993b79c53021970926181130980dd84b180e095779e30960953ff86"
+            ),
+            "source_commit": "f62d157a449c30a79dcf01740ae7f20a6c27e726",
+            "seeds": [1701, 1702, 1703],
+            "disposition": "invalid_unmerged_historical_attempt",
+            "invalid_reasons": [
+                "normal critical 1.96 was used instead of the frozen Student t(df=2) rule",
+                "effective-rank parameter updates were omitted from the update counter",
+                "seed 1701 had already been consumed during executable-path audit",
+            ],
+        },
+        {
+            "schema": "asi.l2er-ipmnist.matched-development-report.v2",
+            "path": "outputs/l2er_matched_development/report.v2.json",
+            "artifact_sha256": (
+                "579c400412d3c50898c16a8fd02fa82e2cd712b5278b5a99974b5e89560707ec"
+            ),
+            "source_commit": "5fc85b69897fc5b74c27389579c3d1bc27931394",
+            "seeds": [1721, 1722, 1723],
+            "disposition": "invalid_unmerged_seed_churn_attempt",
+            "invalid_reasons": [
+                "the execution substituted unexplained seeds after the frozen 1711-1713 plan",
+                "the invalid output is not retained and cannot replace the prospective v2 matrix",
+            ],
+        },
+    ]
 
 
 def frozen_plan() -> dict[str, object]:
@@ -75,10 +93,12 @@ def frozen_plan() -> dict[str, object]:
         "plan_id": PLAN_ID,
         "arms": list(ARMS),
         "seeds": list(SEEDS),
-        "prior_invalid_attempt": {
-            key: list(value) if type(value) is list else value
-            for key, value in _INVALID_V1_ATTEMPT.items()
-        },
+        "consumed_preplan_audit_seeds": list(CONSUMED_AUDIT_SEEDS),
+        "consumed_preplan_audit_note": (
+            "seed 1701 ran once across all four arms during executable-path audit; "
+            "no complete report was produced"
+        ),
+        "invalid_execution_history": _invalid_execution_history(),
         "config": CONFIG.to_config(),
         "primary_metric": "mean_online_accuracy",
         "control_arm": "l2er_mechanism_off",
@@ -94,7 +114,7 @@ def frozen_plan() -> dict[str, object]:
         "null_delta": 0.0,
         "confidence_method": "two_sided_student_t",
         "confidence_level": 0.95,
-        "confidence_degrees_of_freedom": len(SEEDS) - 1,
+        "confidence_degrees_of_freedom": 2,
         "confidence_critical": _T95_DF2,
         "allowed_boundary_information": [],
         "allowed_task_information": ["current_example_label"],
@@ -226,6 +246,7 @@ def _validated_plan(value: object) -> dict[str, object]:
         "control_arm",
         "paired_direction",
         "confidence_method",
+        "consumed_preplan_audit_note",
         "arm_specific_charged_axis",
     ):
         if type(plan[key]) is not str:
@@ -235,6 +256,10 @@ def _validated_plan(value: object) -> dict[str, object]:
             raise ValueError(f"plan.{key} must be an exact bool")
     arms = plan["arms"]
     seeds = plan["seeds"]
+    consumed_seeds = plan["consumed_preplan_audit_seeds"]
+    invalid_history = _bounded_json(
+        plan["invalid_execution_history"], context="plan.invalid_execution_history"
+    )
     matched_axes = plan["matched_axes"]
     boundary = plan["allowed_boundary_information"]
     task = plan["allowed_task_information"]
@@ -250,35 +275,14 @@ def _validated_plan(value: object) -> dict[str, object]:
         or any(type(item) is not int for item in seeds)
     ):
         raise ValueError("plan.seeds must be an exact integer list")
-    prior = _object(
-        plan["prior_invalid_attempt"],
-        frozenset(_INVALID_V1_ATTEMPT),
-        context="plan.prior_invalid_attempt",
-    )
-    for key in ("schema", "path", "artifact_sha256", "source_commit", "disposition"):
-        if type(prior[key]) is not str:
-            raise ValueError(f"plan.prior_invalid_attempt.{key} must be an exact string")
-    prior_seeds = prior["seeds"]
-    history = prior["execution_history"]
-    reasons = prior["invalid_reasons"]
     if (
-        type(prior_seeds) is not list
-        or len(prior_seeds) != 3
-        or any(type(item) is not int for item in prior_seeds)
+        type(consumed_seeds) is not list
+        or len(consumed_seeds) != len(CONSUMED_AUDIT_SEEDS)
+        or any(type(item) is not int for item in consumed_seeds)
     ):
-        raise ValueError("plan.prior_invalid_attempt.seeds must be an exact integer list")
-    if (
-        type(history) is not list
-        or len(history) != 3
-        or any(type(item) is not str for item in history)
-    ):
-        raise ValueError("plan.prior_invalid_attempt.execution_history must be exact strings")
-    if (
-        type(reasons) is not list
-        or len(reasons) != 3
-        or any(type(item) is not str for item in reasons)
-    ):
-        raise ValueError("plan.prior_invalid_attempt.invalid_reasons must be exact strings")
+        raise ValueError("plan.consumed_preplan_audit_seeds must be an exact integer list")
+    if invalid_history != _invalid_execution_history():
+        raise ValueError("plan.invalid_execution_history does not match the audit record")
     if (
         type(matched_axes) is not list
         or len(matched_axes) != 5

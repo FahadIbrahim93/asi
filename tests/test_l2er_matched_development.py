@@ -235,9 +235,9 @@ def test_three_seed_interval_uses_student_t_not_normal_critical_value() -> None:
     assert outcome == "inconclusive"
     assert matched.frozen_plan()["confidence_method"] == "two_sided_student_t"
     critical = matched.frozen_plan()["confidence_critical"]
-    assert critical == 4.302652729749464
+    assert critical == 4.302652729696142
     assert isinstance(critical, float)
-    assert critical.hex() == "0x1.135ea98e146bbp+2"
+    assert critical.hex() == "0x1.135ea98e05c38p+2"
 
 
 def test_validator_rejects_obsolete_v1_report_identity(
@@ -274,12 +274,14 @@ def test_output_namespace_is_one_new_development_path() -> None:
     assert matched.OUTPUT_PATH.relative_to(matched._REPO_ROOT).as_posix() == (
         "outputs/l2er_matched_development/report.v2.json"
     )
-    assert matched.SEEDS == (1721, 1722, 1723)
-    prior = matched.frozen_plan()["prior_invalid_attempt"]
-    assert prior["artifact_sha256"] == (
-        "ab7f03b73993b79c53021970926181130980dd84b180e095779e30960953ff86"
+    assert matched.SEEDS == (1711, 1712, 1713)
+    assert matched.frozen_plan()["consumed_preplan_audit_seeds"] == [1701]
+    invalid = matched.frozen_plan()["invalid_execution_history"]
+    assert invalid[1]["seeds"] == [1721, 1722, 1723]
+    assert invalid[1]["artifact_sha256"] == (
+        "579c400412d3c50898c16a8fd02fa82e2cd712b5278b5a99974b5e89560707ec"
     )
-    assert prior["seeds"] == [1701, 1702, 1703]
+    assert invalid[1]["disposition"] == "invalid_unmerged_seed_churn_attempt"
     assert matched.frozen_plan()["development_only"] is True
     assert matched.frozen_plan()["scientific_promotion_allowed"] is False
 
