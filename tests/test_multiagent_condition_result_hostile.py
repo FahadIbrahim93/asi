@@ -198,3 +198,62 @@ def test_aggregation_revalidates_nested_records_at_consumption() -> None:
             ),
             bootstrap_resamples=2,
         )
+
+
+def test_aggregation_rejects_hostile_outer_container_before_hooks() -> None:
+    class HostileList(list[ConditionResult]):
+        def __len__(self) -> int:  # pragma: no cover - must not run
+            raise AssertionError("untrusted length hook executed")
+
+        def __iter__(self):  # type: ignore[no-untyped-def]  # pragma: no cover
+            raise AssertionError("untrusted iteration hook executed")
+
+    with pytest.raises(ValueError, match="exact list or tuple"):
+        aggregate_evidence(  # type: ignore[arg-type]
+            HostileList(),
+            config=ContinualMultiAgentConfig(),
+        )
+
+
+@pytest.mark.parametrize("field", ("controller_budget", "timing"))
+def test_aggregation_rejects_replaced_nested_record_before_hooks(field: str) -> None:
+    class HostileRecord:
+        def __getattribute__(self, name: str) -> object:  # pragma: no cover - must not run
+            raise AssertionError(f"untrusted attribute hook executed: {name}")
+
+    result = _legal()
+    object.__setattr__(result, field, HostileRecord())
+
+    with pytest.raises(ValueError, match=field):
+        aggregate_evidence(
+            [result],
+            config=ContinualMultiAgentConfig(
+                phase_steps=2,
+                probe_horizon=2,
+                probe_tail_steps=2,
+                recovery_window=1,
+            ),
+        )
+
+
+def test_aggregation_preflights_retained_arrays_before_record_iteration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result = _legal()
+    config = ContinualMultiAgentConfig(
+        phase_steps=2,
+        probe_horizon=2,
+        probe_tail_steps=2,
+        recovery_window=1,
+    )
+    object.__setattr__(result, "controller_budget", None)
+    monkeypatch.setattr(
+        "alberta_framework.evaluation.continual_multiagent._MAX_CONFIGURED_ARRAY_NBYTES",
+        1,
+    )
+
+    with pytest.raises(ValueError, match="aggregate condition result arrays requires"):
+        aggregate_evidence(
+            [result],
+            config=config,
+        )
