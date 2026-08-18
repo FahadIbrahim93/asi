@@ -31,28 +31,17 @@ def test_finite_positive_rejects_hostile_before_float() -> None:
 
     hostile = _HostileInt(1)
     _HostileInt.calls = 0
-    with pytest.raises(Exception, match="must be a real number"):
+    with pytest.raises(ValueError, match="must be a real number"):
         _require_finite_positive("x", hostile)  # type: ignore[arg-type]
     assert _HostileInt.calls == 0
     hf = _HostileFloat(1.0)
     _HostileFloat.calls = 0
-    with pytest.raises(Exception, match="must be a real number"):
+    with pytest.raises(ValueError, match="must be a real number"):
         _require_finite_positive("x", hf)  # type: ignore[arg-type]
     assert _HostileFloat.calls == 0
     with pytest.raises(Exception, match="must be a real number"):
         _require_finite_positive("x", True)  # type: ignore[arg-type]
     assert _require_finite_positive("x", 1) == 1.0
     assert _require_finite_positive("x", 1.0) == 1.0
-    with pytest.raises(Exception, match="must be a finite positive"):
+    with pytest.raises(ValueError, match="must be a finite positive"):
         _require_finite_positive("x", 0)
-
-
-def test_hostile_not_in_error_message() -> None:
-    hostile = _HostileInt(1)
-    _HostileInt.calls = 0
-    try:
-        if type(hostile) not in (int, float):
-            raise ValueError("must be a real number")
-    except ValueError as exc:
-        assert "!r" not in str(exc)
-        assert _HostileInt.calls == 0

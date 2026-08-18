@@ -48,31 +48,8 @@ def test_require_probability_rejects_hostile_before_float() -> None:
 
     hostile = _HostileInt(1)
     _HostileInt.calls = 0
-    with pytest.raises(Exception, match="must be a finite number"):
+    with pytest.raises(ValueError, match="must be a finite number"):
         _require_probability(hostile, "p")  # type: ignore[arg-type]
     assert _HostileInt.calls == 0
     # valid
     assert _require_probability(0.5, "p") == 0.5
-
-
-def test_number_value_rejects_hostile_before_float() -> None:
-
-    # _coerce_allowed_transform handles value_type number; test via direct call to internal?
-    # Simpler: test that type check rejects hostile int subclass before float conversion
-    hostile = _HostileInt(1)
-    _HostileInt.calls = 0
-    assert (type(hostile) not in (int, float)) is True
-    assert _HostileInt.calls == 0
-    assert (int not in (int, float)) is False
-    assert (float not in (int, float)) is False
-
-
-def test_hostile_not_in_error_message() -> None:
-    hostile = _HostileInt(1)
-    _HostileInt.calls = 0
-    try:
-        if type(hostile) not in (int, float):
-            raise ValueError("must be a finite number")
-    except ValueError as exc:
-        assert "!r" not in str(exc)
-        assert _HostileInt.calls == 0

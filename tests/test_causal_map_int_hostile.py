@@ -40,11 +40,11 @@ class _HostileFloat(float):
 def test_world_shape_rejects_hostile_before_lt() -> None:
     hostile = _HostileInt(2)
     _HostileInt.calls = 0
-    with pytest.raises(Exception, match="world_shape"):
+    with pytest.raises(ValueError, match="world_shape"):
         CausalMapForagerConfig(world_shape=(hostile, 2))  # type: ignore[arg-type]
     assert _HostileInt.calls == 0
     assert CausalMapForagerConfig(world_shape=(2, 2)).world_shape == (2, 2)
-    with pytest.raises(Exception, match="world_shape"):
+    with pytest.raises(ValueError, match="world_shape"):
         CausalMapForagerConfig(world_shape=(True, 2))  # type: ignore[arg-type]
 
 
@@ -67,7 +67,7 @@ def test_seed_rejects_hostile_before_range() -> None:
 
     hostile = _HostileInt(0)
     _HostileInt.calls = 0
-    with pytest.raises(Exception, match="seed must be a uint32"):
+    with pytest.raises(ValueError, match="seed must be a uint32"):
         CausalMapForagerAgent(seed=hostile)  # type: ignore[arg-type]
     assert _HostileInt.calls == 0
     assert CausalMapForagerAgent(seed=0).seed == 0
@@ -80,9 +80,9 @@ def test_config_rejects_hostile_numeric_subclasses_before_hooks() -> None:
     hostile_float = _HostileFloat(0.1)
     _HostileInt.calls = 0
     _HostileFloat.calls = 0
-    with pytest.raises(Exception, match="initial_retry_delay"):
+    with pytest.raises(ValueError, match="initial_retry_delay"):
         CausalMapForagerConfig(initial_retry_delay=hostile_int)  # type: ignore[arg-type]
-    with pytest.raises(Exception, match="distance_cost"):
+    with pytest.raises(ValueError, match="distance_cost"):
         CausalMapForagerConfig(distance_cost=hostile_float)  # type: ignore[arg-type]
     assert _HostileInt.calls == _HostileFloat.calls == 0
 
@@ -96,24 +96,11 @@ def test_seeds_rejects_hostile_before_lt() -> None:
 
     hostile = _HostileInt(1)
     _HostileInt.calls = 0
-    try:
+    with pytest.raises(ValueError, match="uint32|seeds"):
         run_causal_map_forager_seeds(
             CausalMapForagerConfig(),
             ForagerBenchmarkConfig(),
             seeds=(hostile,),  # type: ignore[arg-type]
             mode="vmap",
         )
-    except Exception as exc:
-        assert "uint32" in str(exc).lower() or "seeds" in str(exc).lower()
     assert _HostileInt.calls == 0
-
-
-def test_hostile_not_in_error_message() -> None:
-    hostile = _HostileInt(1)
-    _HostileInt.calls = 0
-    try:
-        if type(hostile) is not int:
-            raise ValueError("must be an integer")
-    except ValueError as exc:
-        assert "!r" not in str(exc)
-        assert _HostileInt.calls == 0

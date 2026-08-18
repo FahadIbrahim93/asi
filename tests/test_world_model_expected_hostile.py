@@ -97,23 +97,6 @@ def test_strict_json_equal_rejects_hostile_int_float_bool() -> None:
     assert _strict_json_equal(1, True) is False  # type: ignore[arg-type]
 
 
-def test_hostile_not_in_error_message() -> None:
-    hostile = _HostileStr("evil")
-    _HostileStr.calls = 0
-    from alberta_framework.core.recurrent_latent_world_model_ensemble import (
-        _strict_json_equal,
-    )
-
-    assert _strict_json_equal("ok", hostile) is False
-    assert _HostileStr.calls == 0
-    try:
-        if type(hostile) is not str:
-            raise ValueError("expected must be exact str")
-    except ValueError as exc:
-        assert "!r" not in str(exc)
-        assert _HostileStr.calls == 0
-
-
 def test_strict_json_equal_rejects_hostile_containers_before_hooks() -> None:
     from alberta_framework.core.recurrent_latent_world_model_ensemble import (
         _strict_json_equal,

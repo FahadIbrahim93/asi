@@ -87,6 +87,7 @@ def test_decode_mapping_rejects_hostile_without_canonical_check() -> None:
 
 def test_protocol_instance_rejects_subclass_without_to_dict() -> None:
     from alberta_framework.benchmarks.forager_matched_executor import (
+        ForagerMatchedExecutorError,
         _protocol_instance,
     )
     from alberta_framework.benchmarks.forager_matched_protocol import (
@@ -102,19 +103,6 @@ def test_protocol_instance_rejects_subclass_without_to_dict() -> None:
 
     hostile = object.__new__(_HostileProtocol)
     _HostileProtocol.calls = 0
-    with pytest.raises(Exception):
+    with pytest.raises(ForagerMatchedExecutorError):
         _protocol_instance(hostile)  # type: ignore[arg-type]
     assert _HostileProtocol.calls == 0
-
-
-def test_execution_plan_rejects_hostile_bytes_str() -> None:
-    # Ensure the exact-type gate in execution plan path (via _decode_mapping) rejects
-    hostile = _HostileStrSubclass('{"schema_version": "x"}')
-    _HostileStrSubclass.calls = 0
-    # Directly test the type gate mirror
-    gate = type(hostile) in (bytes, str)
-    assert gate is False
-    assert _HostileStrSubclass.calls == 0
-    # Builtin should pass gate
-    assert (str in (bytes, str)) is True
-    assert (type(b"a") in (bytes, str)) is True  # noqa: UP003

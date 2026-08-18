@@ -70,14 +70,3 @@ def test_actions_rejects_hostile_tuple_before_container_hooks() -> None:
     with pytest.raises(ForagerRngParityError, match="immutable tuple"):
         FixedActionProbeConfig(seed=0, actions=hostile)
     assert HostileTuple.calls == 0
-
-
-def test_hostile_not_in_error_message() -> None:
-    hostile = _HostileInt(1)
-    _HostileInt.calls = 0
-    try:
-        if type(hostile) is not int:
-            raise ValueError("seed must be an integer")
-    except ValueError as exc:
-        assert "!r" not in str(exc)
-        assert _HostileInt.calls == 0

@@ -194,12 +194,3 @@ def test_reference_transaction_ledger_halt_rejects_hostile_before_commit() -> No
     with pytest.raises(ValueError, match="halt reason must be nonempty"):
         ledger._halt(state, reason=hostile)  # type: ignore[arg-type]
     assert _HostileString.calls == 0
-
-
-def test_reference_ledger_halt_via_reducer_rejects_hostile() -> None:
-    hostile = _HostileString("abort")
-    _HostileString.calls = 0
-    assert type(hostile) is not str
-    assert _HostileString.calls == 0
-    assert (type(hostile) is not str or not hostile.strip()) is True
-    assert _HostileString.calls == 0

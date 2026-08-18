@@ -32,17 +32,6 @@ class _HostileDict(dict[str, object]):
         raise AssertionError("hostile dict ne executed")
 
 
-def test_ensemble_digest_rejects_hostile_before_eq() -> None:
-    from alberta_framework.core.world_model_ensemble import _ensemble_config_digest
-
-    config = {"ensemble": "test"}
-    digest = _ensemble_config_digest(config)
-    hostile = _HostileStr(digest)
-    _HostileStr.calls = 0
-    assert (type(hostile) is not str or hostile != digest) is True
-    assert _HostileStr.calls == 0
-
-
 def test_ensemble_checkpoint_rejects_hostile_digest() -> None:
     import tempfile
     from pathlib import Path

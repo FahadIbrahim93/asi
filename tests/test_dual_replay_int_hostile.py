@@ -95,20 +95,9 @@ def test_checkpoint_counter_rejects_hostile_before_range() -> None:
 
     hostile = _HostileInt(1)
     _HostileInt.calls = 0
-    with pytest.raises(Exception, match="must be a JSON integer"):
+    with pytest.raises(ValueError, match="must be a JSON integer"):
         DualReplayMemory._checkpoint_counter(hostile, name="c")  # type: ignore[arg-type]
     assert _HostileInt.calls == 0
-    with pytest.raises(Exception, match="must be a JSON integer"):
+    with pytest.raises(ValueError, match="must be a JSON integer"):
         DualReplayMemory._checkpoint_counter(True, name="c")  # type: ignore[arg-type]
     assert DualReplayMemory._checkpoint_counter(1, name="c").shape == ()
-
-
-def test_hostile_not_in_error_message() -> None:
-    hostile = _HostileInt(1)
-    _HostileInt.calls = 0
-    try:
-        if type(hostile) is not int:
-            raise ValueError("must be a JSON integer")
-    except ValueError as exc:
-        assert "!r" not in str(exc)
-        assert _HostileInt.calls == 0
