@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import numpy as np
 import pytest
 
 from alberta_framework.evaluation.ftl_decision_fidelity import (
@@ -10,6 +11,7 @@ from alberta_framework.evaluation.ftl_decision_fidelity import (
     DecisionFidelityConfig,
     DecisionFidelityReport,
     DecisionMetrics,
+    DecisionProbeSet,
     PairedComparison,
     SeedDecisionResult,
 )
@@ -225,3 +227,30 @@ def test_decision_fidelity_report_validation() -> None:
             aggregates=aggregates,
             comparisons=comparisons,
         )
+
+
+def _make_dummy_probe_set(*, seed: object = 42) -> DecisionProbeSet:
+    return DecisionProbeSet(
+        seed=seed,  # type: ignore[arg-type]
+        initial_observations=np.zeros((1, 2), dtype=np.float32),
+        goals=np.zeros((1, 2), dtype=np.float32),
+        domain_indices=np.zeros((1,), dtype=np.int64),
+        action_sequences=np.zeros((1, 1, 1), dtype=np.float32),
+        true_next_observations=np.zeros((1, 1, 1, 2), dtype=np.float64),
+        true_rewards=np.zeros((1, 1, 1), dtype=np.float64),
+        true_returns=np.zeros((1, 1), dtype=np.float64),
+    )
+
+
+def test_decision_probe_set_rejects_leftover_seed_identities() -> None:
+    probes = _make_dummy_probe_set(seed=42)
+    assert probes.seed == 42
+
+    with pytest.raises(ValueError, match="seed must be an integer"):
+        _make_dummy_probe_set(seed=True)
+
+    with pytest.raises(ValueError, match="seed must be an integer"):
+        _make_dummy_probe_set(seed=-1)
+
+    with pytest.raises(ValueError, match="seed must be an integer"):
+        _make_dummy_probe_set(seed="42")
