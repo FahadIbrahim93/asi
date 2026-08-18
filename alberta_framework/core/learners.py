@@ -85,6 +85,23 @@ from alberta_framework.streams.base import ScanStream
 _INT32_MAX = 2**31 - 1
 _MAX_RESOURCE_BYTES = 256 * 1024 * 1024
 _FLOAT32_HALF_MIN_SUBNORMAL_DENOMINATOR = 1 << 150
+_MLP_CONFIG_FIELDS = frozenset(
+    {
+        "type",
+        "hidden_sizes",
+        "optimizer",
+        "bounder",
+        "normalizer",
+        "head_optimizer",
+        "sparsity",
+        "leaky_relu_slope",
+        "use_layer_norm",
+        "gamma",
+        "lamda",
+        "track_neuron_utility",
+        "neuron_utility_decay",
+    }
+)
 _ACTUAL_INT_TYPES = frozenset(
     {
         int,
@@ -1241,10 +1258,16 @@ class MLPLearner:
             optimizer_from_config,
         )
 
-        if type(config) is not dict or any(type(key) is not str for key in config):
-            raise ValueError("MLPLearner config must be a plain dict with exact string keys")
-        config = dict(config)
-        config.pop("type", None)
+        if type(config) is not dict:
+            raise ValueError("MLPLearner config must be a plain dict")
+        if not all(type(key) is str for key in config) or set(config) != _MLP_CONFIG_FIELDS:
+            raise ValueError("MLPLearner config fields do not match the schema")
+        if type(config["type"]) is not str or config["type"] != "MLPLearner":
+            raise ValueError("unexpected MLPLearner config type")
+        if type(config["hidden_sizes"]) is not list:
+            raise ValueError("hidden_sizes must be a list")
+        config = config.copy()
+        config.pop("type")
 
         optimizer = optimizer_from_config(config.pop("optimizer"))
         bounder_cfg = config.pop("bounder", None)

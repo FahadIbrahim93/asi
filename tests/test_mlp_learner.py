@@ -1453,6 +1453,46 @@ class TestMLPLearnerConstructorScalars:
         with pytest.raises(ValueError, match="gamma"):
             MLPLearner.from_config(poisoned)
 
+    def test_from_config_rejects_hostile_containers_before_hooks(self) -> None:
+        calls = 0
+
+        class HostileDict(dict[str, object]):
+            def __iter__(self):  # type: ignore[no-untyped-def]
+                nonlocal calls
+                calls += 1
+                raise AssertionError("mapping iteration hook reached")
+
+        class HostileList(list[int]):
+            def __iter__(self):  # type: ignore[no-untyped-def]
+                nonlocal calls
+                calls += 1
+                raise AssertionError("list iteration hook reached")
+
+        config = MLPLearner(hidden_sizes=(8,), sparsity=0.0).to_config()
+        with pytest.raises(ValueError, match="plain dict"):
+            MLPLearner.from_config(HostileDict(config))  # type: ignore[arg-type]
+        config["hidden_sizes"] = HostileList([8])
+        with pytest.raises(ValueError, match="hidden_sizes must be a list"):
+            MLPLearner.from_config(config)
+        assert calls == 0
+
+    def test_from_config_rejects_hostile_keys_before_comparison(self) -> None:
+        calls = 0
+
+        class HostileKey(str):
+            def __eq__(self, other: object) -> bool:  # pragma: no cover
+                nonlocal calls
+                calls += 1
+                raise AssertionError("key comparison hook reached")
+
+            __hash__ = str.__hash__
+
+        config = MLPLearner(hidden_sizes=(8,), sparsity=0.0).to_config()
+        config[HostileKey("unexpected")] = config.pop("gamma")
+        with pytest.raises(ValueError, match="fields do not match"):
+            MLPLearner.from_config(config)
+        assert calls == 0
+
     def test_rejects_class_spoofed_sparsity_without_invoking_float(self) -> None:
         class Spoof:
             @property

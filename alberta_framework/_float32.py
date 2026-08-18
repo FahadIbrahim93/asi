@@ -37,7 +37,8 @@ _ALLOWED_REAL_TYPES = _ACTUAL_INT_TYPES | _ACTUAL_FLOAT_TYPES
 
 
 def _is_actual_int(value: object) -> bool:
-    return type(value) in _ACTUAL_INT_TYPES
+    actual_type = type(value)
+    return any(actual_type is allowed_type for allowed_type in _ACTUAL_INT_TYPES)
 
 
 def _round_quotient_ties_to_even(numerator: int, denominator: int) -> int:
@@ -113,7 +114,7 @@ def _float32_from_ratio(
 def _real_ratio(value: object) -> tuple[int, int, bool]:
     """Return one normalized exact ratio and its zero-sign metadata."""
     actual_type = type(value)
-    if actual_type not in _ALLOWED_REAL_TYPES:
+    if not any(actual_type is allowed_type for allowed_type in _ALLOWED_REAL_TYPES):
         raise TypeError("value must be an actual non-bool real")
     if _is_actual_int(value):
         ratio: object = (int(cast(Any, value)), 1)
