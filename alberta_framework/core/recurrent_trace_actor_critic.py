@@ -371,6 +371,25 @@ def _preflight_state_resources(
     return resources
 
 
+def _preflight_update_working_set(
+    config: RecurrentTraceActorCriticConfig,
+    state_resources: Mapping[str, int],
+) -> int:
+    """Preflight the source state and complete returned update result."""
+
+    # The result owns its returned state, one float32 policy value per action,
+    # one int32 action, nine float32 diagnostics, and one boolean verdict.
+    result_output_bytes = (
+        state_resources["state_nbytes"] + 4 * config.n_actions + 4 + 9 * 4 + 1
+    )
+    update_working_set_bytes = state_resources["state_nbytes"] + result_output_bytes
+    if update_working_set_bytes > _INT32_MAX:
+        raise ValueError(
+            "recurrent-trace actor-critic update working set byte count must fit signed int32"
+        )
+    return update_working_set_bytes
+
+
 def _copy_config_mapping(name: str, config: object) -> dict[str, Any]:
     """Copy a legacy-compatible mapping while normalizing hostile hooks."""
     if not isinstance(config, Mapping):
@@ -1861,12 +1880,7 @@ class RecurrentTraceActorCriticAgent:
         """Initialize independent actor/critic parameters and streaming state."""
         feature_dim = _require_int32("feature_dim", feature_dim, minimum=1)
         resources = self._config.state_resource_budget(feature_dim)
-        # Source state and proposed next state are live together in update().
-        update_working_set_bytes = 2 * resources["state_nbytes"]
-        if update_working_set_bytes > _INT32_MAX:
-            raise ValueError(
-                "recurrent-trace actor-critic update working set byte count must fit signed int32"
-            )
+        _preflight_update_working_set(self._config, resources)
         actor_key, critic_key, policy_key = jr.split(key, 3)
         actor_params = initialize_rtu_network_parameters(
             actor_key,
