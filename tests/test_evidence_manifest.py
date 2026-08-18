@@ -317,14 +317,14 @@ def test_registry_rejects_empty_duplicate_or_escaping_specs(
     with pytest.raises(ValueError, match="names must be unique"):
         build_evidence_manifest(tmp_path, specs=(duplicated, duplicated))
 
-    with pytest.raises(ValueError, match="remain under the repository root"):
+    with pytest.raises(ValueError, match="repository-relative Path"):
         replace(
             duplicated,
             name="escape_artifact",
             relative_path=Path("../outside.json"),
         )
 
-    with pytest.raises(ValueError, match="source_paths must remain"):
+    with pytest.raises(ValueError, match="repository-relative Path"):
         replace(
             duplicated,
             name="escape_source",

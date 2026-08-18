@@ -3,24 +3,61 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
-from alberta_framework.evaluation.evidence_manifest import EVIDENCE_SPECS, EvidenceSpec
+from alberta_framework.evaluation.evidence_manifest import (
+    EVIDENCE_SPECS,
+    EvidenceSpec,
+    _validated_evidence_specs,
+)
 
 
 class StringSubclass(str):
     """Leftover string identity that must not cross the spec boundary."""
 
 
-class PathSubclass(type(Path())):
+class PathSubclass(type(Path())):  # type: ignore[misc]
     """Leftover concrete-path identity that must not cross the spec boundary."""
 
 
 class CallableObject:
     def __call__(self, _value: object) -> object:
         return _value
+
+
+class HostileList(list[object]):
+    calls = 0
+
+    def __iter__(self):  # type: ignore[no-untyped-def]
+        type(self).calls += 1
+        raise AssertionError("hostile list iteration ran")
+
+
+class HostileCallable:
+    calls = 0
+
+    def __call__(self, *_args: object, **_kwargs: object) -> object:
+        type(self).calls += 1
+        raise AssertionError("hostile callable ran")
+
+
+class HostilePath(type(Path())):  # type: ignore[misc]
+    calls = 0
+
+    def is_absolute(self) -> bool:
+        type(self).calls += 1
+        raise AssertionError("hostile path method ran")
+
+
+class HostileTuple(tuple[object, ...]):
+    calls = 0
+
+    def __iter__(self):  # type: ignore[no-untyped-def]
+        type(self).calls += 1
+        raise AssertionError("hostile tuple iteration ran")
 
 
 def _load(_path: Path) -> dict[str, object]:
@@ -48,7 +85,7 @@ def _legal(**overrides: object) -> EvidenceSpec:
         "command_argv": ("python", "-m", "fixture"),
         "protocol": {"protocol_version": "test.protocol.v1"},
         "configuration": {"steps": 1},
-        "seeds": {"development": (0,)},
+        "seeds": {"development": [0]},
         "thresholds": {"minimum_effect": 0.25},
         "limitations": ("test fixture only",),
         "source_paths": (Path("fixture.py"),),
@@ -105,7 +142,7 @@ def test_evidence_spec_rejects_leftover_path_tuple_and_mapping_identities() -> N
         _legal(relative_path="fixture.json")
     with pytest.raises(ValueError, match="relative_path must be an exact platform Path"):
         _legal(relative_path=PathSubclass("fixture.json"))
-    with pytest.raises(ValueError, match="must remain under the repository root"):
+    with pytest.raises(ValueError, match="repository-relative Path"):
         _legal(relative_path=Path("../fixture.json"))
     with pytest.raises(ValueError, match="command_argv must be a non-empty tuple"):
         _legal(command_argv=["python"])
@@ -128,7 +165,80 @@ def test_evidence_spec_rejects_leftover_path_tuple_and_mapping_identities() -> N
 def test_evidence_spec_preflights_sequence_and_mapping_counts() -> None:
     with pytest.raises(ValueError, match="command_argv must be a non-empty tuple"):
         _legal(command_argv=("x",) * 257)
-    with pytest.raises(ValueError, match="protocol must be a non-empty dict"):
+    with pytest.raises(ValueError, match="protocol exceeds the mapping item limit"):
         _legal(protocol={f"key-{index}": index for index in range(257)})
     with pytest.raises(ValueError, match="exceeds 65536 UTF-8 bytes"):
         _legal(name="x" * 65_537)
+
+
+def test_evidence_spec_rejects_unsafe_and_hostile_paths_without_hooks() -> None:
+    hostile = HostilePath("fixture.json")
+    HostilePath.calls = 0
+    with pytest.raises(ValueError, match="relative_path must be an exact platform Path"):
+        _legal(relative_path=hostile)
+    with pytest.raises(ValueError, match=r"source_paths\[0\] must be an exact platform Path"):
+        _legal(source_paths=(hostile,))
+    assert HostilePath.calls == 0
+
+    for path in (Path("/tmp/fixture.json"), Path("../fixture.json"), Path(".")):
+        with pytest.raises(ValueError, match="repository-relative Path"):
+            _legal(relative_path=path)
+
+
+def test_evidence_spec_rejects_nested_non_json_identities_without_hooks() -> None:
+    hostile = HostileList([1])
+    HostileList.calls = 0
+    with pytest.raises(ValueError, match="finite exact JSON values"):
+        _legal(protocol={"nested": hostile})
+    assert HostileList.calls == 0
+
+    with pytest.raises(ValueError, match="finite exact JSON values"):
+        _legal(configuration={"nested": StringSubclass("value")})
+    with pytest.raises(ValueError, match="finite exact JSON values"):
+        _legal(thresholds={"value": float("nan")})
+
+    cyclic: dict[str, object] = {}
+    cyclic["self"] = cyclic
+    with pytest.raises(ValueError, match="must not contain a cycle"):
+        _legal(protocol=cyclic)
+
+
+def test_evidence_spec_rejects_callable_objects_without_calling_them() -> None:
+    hostile = HostileCallable()
+    HostileCallable.calls = 0
+    with pytest.raises(ValueError, match="loader must be an exact function"):
+        _legal(loader=hostile)
+    assert HostileCallable.calls == 0
+
+
+def test_registry_rejects_hostile_rosters_and_duplicate_identities_without_hooks() -> None:
+    HostileTuple.calls = 0
+    with pytest.raises(ValueError, match="EVIDENCE_SPECS must be a non-empty exact tuple"):
+        _validated_evidence_specs(HostileTuple(EVIDENCE_SPECS))
+    assert HostileTuple.calls == 0
+
+    first = EVIDENCE_SPECS[0]
+    duplicate_name = replace(EVIDENCE_SPECS[1], name=first.name)
+    with pytest.raises(ValueError, match="claim names must be unique"):
+        _validated_evidence_specs((first, duplicate_name))
+
+    duplicate_path = replace(EVIDENCE_SPECS[1], relative_path=first.relative_path)
+    with pytest.raises(ValueError, match="artifact paths must be unique"):
+        _validated_evidence_specs((first, duplicate_path))
+
+
+def test_evidence_spec_recursively_bounds_nested_json_values() -> None:
+    with pytest.raises(ValueError, match="sequence item limit"):
+        _legal(protocol={"nested": [0] * 257})
+    with pytest.raises(ValueError, match="65536 UTF-8 bytes"):
+        _legal(protocol={"nested": "x" * 65_537})
+
+    nested: object = None
+    for _ in range(65):
+        nested = [nested]
+    with pytest.raises(ValueError, match="maximum nesting depth"):
+        _legal(protocol={"nested": nested})
+
+    aggregate = [[0] * 16 for _ in range(256)]
+    with pytest.raises(ValueError, match="aggregate value limit"):
+        _legal(protocol={"nested": aggregate})
