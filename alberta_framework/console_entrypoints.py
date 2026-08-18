@@ -31,6 +31,20 @@ def historical_forager_main() -> int:
 def official_foragax_oci_main() -> int:
     """Load and run the official Foragax OCI CLI."""
 
+    import sys
+
+    if any(argument in {"-h", "--help"} for argument in sys.argv[1:]):
+        from alberta_framework.benchmarks._official_foragax_oci_cli import (
+            build_parser,
+        )
+
+        build_parser(
+            base_image_default="",
+            source_commit_default="",
+            uv_binary_sha256_default="",
+        ).parse_args()
+        return 0
+
     from alberta_framework.benchmarks.official_foragax_oci import main
 
     return main()

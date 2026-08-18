@@ -463,7 +463,7 @@ def test_option_duration_rejects_hostile_integer_subclasses(field: str) -> None:
             learner.init(HostileInt(3))
 
 
-def test_option_duration_float_hook_runs_once_and_normalizes_failures() -> None:
+def test_option_duration_float_subclasses_are_rejected_without_hooks() -> None:
     class CountingFloat(float):
         def __new__(cls):
             instance = super().__new__(cls, 0.25)
@@ -475,9 +475,9 @@ def test_option_duration_float_hook_runs_once_and_normalizes_failures() -> None:
             return (1, 4)
 
     value = CountingFloat()
-    config = OptionValueDurationConfig(reward_step_size=value)
-    assert value.calls == 1
-    assert type(config.reward_step_size) is float
+    with pytest.raises(ValueError, match="reward_step_size"):
+        OptionValueDurationConfig(reward_step_size=value)
+    assert value.calls == 0
 
     class ExplodingFloat(float):
         def as_integer_ratio(self) -> tuple[int, int]:

@@ -379,6 +379,23 @@ if official_module in sys.modules:
     raise SystemExit("historical inspection imported the official verifier")
 
 strict = next(item for item in console_scripts if item.name == "alberta-foragax-oci")
+original_argv = sys.argv
+sys.argv = ["alberta-foragax-oci", "--help"]
+try:
+    strict_help = io.StringIO()
+    with contextlib.redirect_stdout(strict_help):
+        try:
+            strict.load()()
+        except SystemExit as error:
+            if error.code != 0:
+                raise
+        else:
+            raise SystemExit("official OCI help did not terminate through argparse")
+finally:
+    sys.argv = original_argv
+if official_module in sys.modules:
+    raise SystemExit("official OCI help imported the source-attested implementation")
+
 try:
     strict.load()()
 except Exception as error:
@@ -394,6 +411,7 @@ print(
             "historical_status": historical_status,
             "names": [item.name for item in console_scripts],
             "scorecard_source_files": len(source_files),
+            "strict_help": strict_help.getvalue(),
             "strict_failure": strict_failure,
         }
     )
@@ -417,6 +435,9 @@ print(
     assert smoke["historical_errors"] == ""
     assert smoke["historical_family"] == HISTORICAL_FORAGER_FAMILY_ID
     assert smoke["scorecard_source_files"] > 4
+    assert "{prepare,archive-cache,build,inspect,cpu-probe,emit-launch,qualify}" in smoke[
+        "strict_help"
+    ]
     assert smoke["strict_failure"] == {
         "message": (
             "official harness source "

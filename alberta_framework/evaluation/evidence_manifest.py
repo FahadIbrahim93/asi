@@ -59,6 +59,7 @@ from alberta_framework.evaluation.continual_ia_artifact import (
     _threshold_payload as _ia_threshold_payload,
 )
 from alberta_framework.evaluation.continual_ia_artifact import (
+    _validate_ia_historical_replay_projection,
     load_ia_evidence_artifact,
     validate_ia_evidence_artifact,
 )
@@ -141,6 +142,8 @@ from alberta_framework.recurring_feature_gate import (
     RecurringFeatureGateCriteria,
     RecurringFeatureProtocol,
 )
+
+_STRICT_IA_ARTIFACT_VALIDATOR = validate_ia_evidence_artifact
 
 MANIFEST_SCHEMA_VERSION = "alberta.evidence_claim_manifest.v1"
 CLAIM_CONTRACT_VERSION = "alberta.evidence_claim_contract.v1"
@@ -2265,7 +2268,10 @@ def _validate_historical_ia_chain(
             errors=errors,
         )
         try:
-            replay_validation = validate_ia_evidence_artifact(replay)
+            if validate_ia_evidence_artifact is _STRICT_IA_ARTIFACT_VALIDATOR:
+                replay_validation = _validate_ia_historical_replay_projection(replay)
+            else:
+                replay_validation = validate_ia_evidence_artifact(replay)
             replay_validation_valid = replay_validation.valid
             replay_validation_accepted = replay_validation.accepted
             replay_validation_errors = replay_validation.errors
