@@ -29,7 +29,29 @@ from alberta_framework.benchmarks.upgd_ipmnist import (
     validated_ipmnist_data,
 )
 
-RESULT_SCHEMA = "asi.ipmnist.gradual-input.development-result.v1"
+RESULT_SCHEMA = "asi.ipmnist.gradual-input.development-result.v2"
+_PARENT_RESULT_SCHEMA = "asi.ipmnist.gradual-input.development-result.v1"
+_PARENT_RESULT_SHA256 = "7b2bf6c0f73b9fae20fcde53445f5f81656976ea4d042641772501e0108c6561"
+_HISTORICAL_EXECUTION_SOURCE = {
+    "alberta_framework/_seed_validation.py": (
+        "6bdbfd5e91f61ab11c61086f883cd526d8385fee6b514ab87ec901b09b4b6044"
+    ),
+    "alberta_framework/benchmarks/ipmnist_gradual.py": (
+        "7c075ad9e83baa4808398f1151ae3ae26a5c2b80f250f5383ed76aba5851e7fc"
+    ),
+    "alberta_framework/benchmarks/upgd_ipmnist.py": (
+        "071d54c2a119fba72b7be79f4ea46cade53beb0202e0c80efcb6e3875fb00975"
+    ),
+    "alberta_framework/core/baseline_optimizers.py": (
+        "d57744e5b3643ddbcf1374ef10257c7d18413f84a076b3bf5415592f1ef61900"
+    ),
+    "alberta_framework/core/update_safety.py": (
+        "8e3340541f6c9ce925e35b2e1e60aa6e0e91a680cab608d495e51c5376ce60ee"
+    ),
+    "alberta_framework/evaluation/gradual_ipmnist_nonpromoting.py": (
+        "02a8d0dd2b29f9c758a1f2e73c3a36c21b01d8b5fccfb44f281ba4b7f1c6efa6"
+    ),
+}
 _MAX_RESULT_BYTES = 4 * 1024 * 1024
 _MAX_TEXT_BYTES = 4096
 _MAX_JSON_NODES = 20_000
@@ -406,8 +428,8 @@ def _validated_run(
     return result
 
 
-def _outcome(delta: float) -> str:
-    return "improved" if delta > 0.0 else "worse" if delta < 0.0 else "tied"
+def _direction(delta: float) -> str:
+    return "candidate_higher" if delta > 0.0 else "candidate_lower" if delta < 0.0 else "tied"
 
 
 def _schedule_identities(seed: int, config: IPMNISTConfig, n_train: int) -> tuple[str, str]:
@@ -521,7 +543,7 @@ def build_gradual_input_development_report(
                     "metric": "online_accuracy",
                     "higher_is_better": True,
                     "candidate_minus_control": delta,
-                    "outcome": _outcome(delta),
+                    "descriptive_direction": _direction(delta),
                 },
             }
         )
@@ -556,9 +578,12 @@ def build_gradual_input_development_report(
     report: dict[str, object] = {
         "schema": RESULT_SCHEMA,
         "identity": {
-            "source_sha256": sources,
+            "execution_source_sha256": sources,
+            "derivation_source_sha256": sources,
             "runtime": runtime,
             "plan_sha256": hashlib.sha256(_canonical_bytes(identity_unsigned)).hexdigest(),
+            "parent_result_sha256": None,
+            "resource_accounting_correction": False,
             "consistency_not_attestation": True,
         },
         "protocol": {
@@ -575,7 +600,8 @@ def build_gradual_input_development_report(
             "paired_accuracy_delta_mean": mean_delta,
             "paired_accuracy_delta_stderr": stderr,
             "n": len(deltas),
-            "outcome": _outcome(mean_delta),
+            "descriptive_direction": _direction(mean_delta),
+            "conclusion": "inconclusive_small_development_screen",
             "arms": arm_summaries,
         },
         "policy": {
@@ -679,11 +705,28 @@ def validate_gradual_input_development_report(
         raise ValueError("plan is not canonical")
     identity = _fields(
         root["identity"],
-        ("source_sha256", "runtime", "plan_sha256", "consistency_not_attestation"),
+        (
+            "execution_source_sha256",
+            "derivation_source_sha256",
+            "runtime",
+            "plan_sha256",
+            "parent_result_sha256",
+            "resource_accounting_correction",
+            "consistency_not_attestation",
+        ),
         name="identity",
     )
+    parent_digest = identity["parent_result_sha256"]
+    if parent_digest is None:
+        execution_source = _source_identity()
+        correction = False
+    elif parent_digest == _PARENT_RESULT_SHA256:
+        execution_source = dict(_HISTORICAL_EXECUTION_SOURCE)
+        correction = True
+    else:
+        raise ValueError("identity parent result is not the frozen correction input")
     expected_identity_unsigned = {
-        "source_sha256": _source_identity(),
+        "source_sha256": execution_source,
         "runtime": _runtime_identity(),
         "plan": _plan_payload(plan),
     }
@@ -691,9 +734,12 @@ def validate_gradual_input_development_report(
     if not _same(
         identity,
         {
-            "source_sha256": expected_identity_unsigned["source_sha256"],
+            "execution_source_sha256": execution_source,
+            "derivation_source_sha256": _source_identity(),
             "runtime": expected_identity_unsigned["runtime"],
             "plan_sha256": expected_plan_sha,
+            "parent_result_sha256": parent_digest,
+            "resource_accounting_correction": correction,
             "consistency_not_attestation": True,
         },
     ):
@@ -702,7 +748,7 @@ def validate_gradual_input_development_report(
     if not _same(root["dataset"], expected_dataset):
         raise ValueError("dataset identity does not match supplied materialization")
     expected_persistent_numeric_bytes = (
-        plan.config.parameter_count * 12
+        plan.config.parameter_count * 16
         + 6 * 5 * 4
         + cast(int, expected_dataset["rows"]) * (plan.config.input_dim + 1) * 4
         + plan.config.n_tasks * (plan.config.input_dim + plan.config.task_length) * 4
@@ -816,10 +862,20 @@ def validate_gradual_input_development_report(
                 or resources["timing_qualified"] is not False
             ):
                 raise ValueError("resource receipt is invalid")
-            arm_resources.append(resources)
-            aggregate_persistent_bytes[arm_index].append(
-                resources["persistent_numeric_bytes"]
+            expected_persistent_bytes = (
+                16 * plan.config.parameter_count
+                + 6 * 5 * 4
+                + (
+                    cast(int, expected_dataset["rows"])
+                    * (cast(int, expected_dataset["columns"]) + 1)
+                    * 4
+                )
+                + plan.config.n_tasks * (plan.config.input_dim + plan.config.task_length) * 4
             )
+            if resources["persistent_numeric_bytes"] != expected_persistent_bytes:
+                raise ValueError("persistent bytes omit a frozen resident numeric bank")
+            arm_resources.append(resources)
+            aggregate_persistent_bytes[arm_index].append(resources["persistent_numeric_bytes"])
             aggregate_timing_ns[arm_index].append(resources["timing_ns"])
         for resource_name in (
             "observations",
@@ -837,7 +893,7 @@ def validate_gradual_input_development_report(
             "metric": "online_accuracy",
             "higher_is_better": True,
             "candidate_minus_control": delta,
-            "outcome": _outcome(delta),
+            "descriptive_direction": _direction(delta),
         }
         if not _same(record["comparison"], expected_comparison):
             raise ValueError("comparison is not derived from arm metrics")
@@ -869,7 +925,8 @@ def validate_gradual_input_development_report(
         "paired_accuracy_delta_mean": mean_delta,
         "paired_accuracy_delta_stderr": stderr,
         "n": len(deltas),
-        "outcome": _outcome(mean_delta),
+        "descriptive_direction": _direction(mean_delta),
+        "conclusion": "inconclusive_small_development_screen",
         "arms": expected_arm_summaries,
     }
     if not _same(root["aggregate"], expected_aggregate):
@@ -911,6 +968,103 @@ def validate_gradual_input_development_report(
         raise ValueError("result digest does not bind canonical bytes")
 
 
+def derive_gradual_input_resource_correction(
+    parent_report: object, data_x: object, data_y: object
+) -> dict[str, object]:
+    """Correct the frozen v1 resource omission without re-executing consumed seeds."""
+    _json_preflight(parent_report)
+    parent = _fields(
+        parent_report,
+        (
+            "schema",
+            "identity",
+            "protocol",
+            "plan",
+            "dataset",
+            "records",
+            "aggregate",
+            "policy",
+            "result_sha256",
+        ),
+        name="parent report",
+    )
+    if parent["schema"] != _PARENT_RESULT_SCHEMA:
+        raise ValueError("resource correction requires the exact v1 parent schema")
+    claimed_parent_digest = parent["result_sha256"]
+    unsigned_parent = dict(parent)
+    del unsigned_parent["result_sha256"]
+    if (
+        claimed_parent_digest != _PARENT_RESULT_SHA256
+        or hashlib.sha256(_canonical_bytes(unsigned_parent)).hexdigest() != _PARENT_RESULT_SHA256
+    ):
+        raise ValueError("resource correction parent digest is not frozen")
+    plan = _plan_payload(FROZEN_GRADUAL_INPUT_PLAN)
+    runtime = _runtime_identity()
+    expected_parent_identity = {
+        "source_sha256": dict(_HISTORICAL_EXECUTION_SOURCE),
+        "runtime": runtime,
+        "plan_sha256": hashlib.sha256(
+            _canonical_bytes(
+                {
+                    "source_sha256": dict(_HISTORICAL_EXECUTION_SOURCE),
+                    "runtime": runtime,
+                    "plan": plan,
+                }
+            )
+        ).hexdigest(),
+        "consistency_not_attestation": True,
+    }
+    if not _same(parent["identity"], expected_parent_identity):
+        raise ValueError("resource correction parent execution identity is invalid")
+    if not _same(parent["plan"], plan):
+        raise ValueError("resource correction parent plan is invalid")
+    if not _same(
+        parent["dataset"], _dataset_identity(data_x, data_y, FROZEN_GRADUAL_INPUT_PLAN.config)
+    ):
+        raise ValueError("resource correction parent dataset is invalid")
+
+    corrected = cast(dict[str, object], json.loads(_canonical_bytes(parent)))
+    corrected["schema"] = RESULT_SCHEMA
+    corrected["identity"] = {
+        "execution_source_sha256": dict(_HISTORICAL_EXECUTION_SOURCE),
+        "derivation_source_sha256": _source_identity(),
+        "runtime": runtime,
+        "plan_sha256": expected_parent_identity["plan_sha256"],
+        "parent_result_sha256": _PARENT_RESULT_SHA256,
+        "resource_accounting_correction": True,
+        "consistency_not_attestation": True,
+    }
+    parameter_bank_bytes = FROZEN_GRADUAL_INPUT_PLAN.config.parameter_count * 4
+    records = cast(list[dict[str, object]], corrected["records"])
+    for record in records:
+        arms = cast(list[dict[str, object]], record["arms"])
+        for arm in arms:
+            resources = cast(dict[str, object], arm["resources"])
+            resources["persistent_numeric_bytes"] = (
+                cast(int, resources["persistent_numeric_bytes"]) + parameter_bank_bytes
+            )
+        comparison = cast(dict[str, object], record["comparison"])
+        comparison["descriptive_direction"] = _direction(
+            cast(float, comparison["candidate_minus_control"])
+        )
+        del comparison["outcome"]
+    aggregate = cast(dict[str, object], corrected["aggregate"])
+    arm_summaries = cast(list[dict[str, object]], aggregate["arms"])
+    for summary in arm_summaries:
+        summary["persistent_numeric_bytes_max"] = (
+            cast(int, summary["persistent_numeric_bytes_max"]) + parameter_bank_bytes
+        )
+    aggregate["descriptive_direction"] = _direction(
+        cast(float, aggregate["paired_accuracy_delta_mean"])
+    )
+    aggregate["conclusion"] = "inconclusive_small_development_screen"
+    del aggregate["outcome"]
+    del corrected["result_sha256"]
+    corrected["result_sha256"] = hashlib.sha256(_canonical_bytes(corrected)).hexdigest()
+    validate_gradual_input_development_report(corrected, data_x, data_y)
+    return corrected
+
+
 def canonical_gradual_input_development_bytes(
     report: object, data_x: object, data_y: object
 ) -> bytes:
@@ -934,7 +1088,7 @@ def retain_frozen_gradual_input_development_report(
     if not _same(root["plan"], _plan_payload(FROZEN_GRADUAL_INPUT_PLAN)):
         raise ValueError("only the exact frozen gradual-input plan may be retained")
     digest = cast(str, root["result_sha256"])
-    segments = ("outputs", "ipmnist_gradual", "development.v1")
+    segments = ("outputs", "ipmnist_gradual", "development.v2")
     directory = repository_root.joinpath(*segments)
     destination = directory / f"result.{digest}.json"
     temporary_name = f".result.{digest}.tmp"

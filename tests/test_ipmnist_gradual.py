@@ -72,7 +72,8 @@ def test_transition_config_rejects_forged_and_hostile_values_without_index_hooks
     hostile = HostileInt(2)
     with pytest.raises(ValueError, match="integer"):
         GradualTransitionConfig(
-            mode="input_interpolation", transition_steps=hostile  # type: ignore[arg-type]
+            mode="input_interpolation",
+            transition_steps=hostile,  # type: ignore[arg-type]
         )
     assert hostile.calls == 0
 
@@ -92,7 +93,8 @@ def test_transition_config_rejects_forged_and_hostile_values_without_index_hooks
 
     with pytest.raises(ValueError, match="integer"):
         GradualTransitionConfig(
-            mode="input_interpolation", transition_steps=Hostile()  # type: ignore[arg-type]
+            mode="input_interpolation",
+            transition_steps=Hostile(),  # type: ignore[arg-type]
         )
     assert HostileMeta.calls == 0
 
@@ -127,13 +129,9 @@ def test_protocol_records_nonpromotion_and_information_allowance() -> None:
 
 def test_input_interpolation_is_outer_jit_safe() -> None:
     interpolate = jax.jit(lambda old, new: input_interpolation(old, new, 0.5))
-    np.testing.assert_array_equal(
-        interpolate(jnp.array([0.0]), jnp.array([2.0])), jnp.array([1.0])
-    )
+    np.testing.assert_array_equal(interpolate(jnp.array([0.0]), jnp.array([2.0])), jnp.array([1.0]))
 
-    transact = jax.jit(
-        lambda old, new: input_interpolation_transaction(old, new, 0.5)
-    )
+    transact = jax.jit(lambda old, new: input_interpolation_transaction(old, new, 0.5))
     safe, valid = transact(jnp.array([jnp.inf]), jnp.array([2.0]))
     np.testing.assert_array_equal(safe, jnp.zeros(1))
     assert not bool(valid)
@@ -204,9 +202,9 @@ def test_gradual_input_pair_runs_one_matched_real_learner_schedule() -> None:
     assert result.loss_sums.shape == (2, 3)
     assert np.all(np.isfinite(result.loss_sums))
     assert result.persistent_numeric_bytes.shape == (2,)
-    # 29 params * (parameter + Adam m + Adam v) float32 bytes, five
+    # 29 params * (initial + current + Adam m + Adam v) float32 bytes, five
     # optimizer scalars per each of six leaves, dataset, and full schedule.
-    assert np.all(result.persistent_numeric_bytes == 29 * 12 + 6 * 5 * 4 + 80 + 96)
+    assert np.all(result.persistent_numeric_bytes == 29 * 16 + 6 * 5 * 4 + 80 + 96)
     assert result.timing_ns.shape == (2,)
     assert np.all(result.timing_ns >= 0)
     assert not result.correct_counts.flags.writeable
