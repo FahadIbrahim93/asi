@@ -107,7 +107,28 @@ def _preflight_nonlinear_state(*, n_demons: int, hidden_size: int, feature_dim: 
     ):
         if not 1 <= value <= _INT32_MAX:
             raise ValueError(f"derived nonlinear Horde {name} must fit signed int32")
-    update_scalars = (2 * n_demons + 4) * hidden_features + 8
+    # Conservatively charge every source-level aggregate that can coexist at
+    # publication: source, proposed, and selected states; the primary steps
+    # plus retained per-demon secondary proposals; and the current, next, and
+    # correction gradient families.  The tail covers the two observations and
+    # all per-demon masks, predictions, targets, errors, norms, and result
+    # diagnostics.  Charging logical leaves as four-byte scalars also covers
+    # the int32 counter and boolean predicates.
+    parameter_scalars = (
+        hidden_features * (n_demons + 1)
+        + hidden_size
+        + 3 * demon_hidden
+        + 2 * n_demons
+    )
+    one_gradient_scalars = hidden_features + 2 * hidden_size + 1
+    update_scalars = (
+        3 * logical_scalars
+        + parameter_scalars
+        + 3 * one_gradient_scalars
+        + 2 * feature_dim
+        + 24 * n_demons
+        + 32
+    )
     if 4 * update_scalars > _INT32_MAX:
         raise ValueError(
             "derived nonlinear Horde update working set byte count must fit signed int32"

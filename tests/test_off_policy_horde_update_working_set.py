@@ -6,7 +6,10 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from alberta_framework.core.off_policy_horde import NonlinearSharedGTDHordeLearner
+from alberta_framework.core.off_policy_horde import (
+    NonlinearSharedGTDHordeLearner,
+    _preflight_nonlinear_state,
+)
 from alberta_framework.core.types import DemonType, GVFSpec, create_horde_spec
 
 _INT32_MAX = 2**31 - 1
@@ -51,7 +54,22 @@ def test_nonlinear_horde_one_bank_and_persistent_fit_while_update_working_set_do
     )
     one_bank_bytes = 4 * hidden_features
     persistent_bytes = 4 * persist_scalars
-    update_bytes = 4 * ((2 * _N_DEMONS + 4) * hidden_features + 8)
+    logical_scalars = persist_scalars
+    parameter_scalars = (
+        hidden_features * (_N_DEMONS + 1)
+        + _HIDDEN
+        + 3 * _N_DEMONS * _HIDDEN
+        + 2 * _N_DEMONS
+    )
+    one_gradient_scalars = hidden_features + 2 * _HIDDEN + 1
+    update_bytes = 4 * (
+        3 * logical_scalars
+        + parameter_scalars
+        + 3 * one_gradient_scalars
+        + 2 * fd
+        + 24 * _N_DEMONS
+        + 32
+    )
     assert one_bank_bytes <= _INT32_MAX
     assert persistent_bytes <= _INT32_MAX
     assert update_bytes > _INT32_MAX
@@ -88,3 +106,34 @@ def test_legal_nonlinear_horde_update_identity_is_unchanged() -> None:
     assert result.state.trunk_w.shape == (4, 2)
     assert result.predictions.shape == (2,)
     assert float(jnp.linalg.norm(result.state.trunk_w - state.trunk_w)) > 0.0
+
+
+def test_nonlinear_horde_update_working_set_has_exact_adjacent_byte_boundary() -> None:
+    # For D=H=1, the complete formula reduces exactly to 13*feature_dim+98.
+    max_scalars = _INT32_MAX // 4
+    last_legal = (max_scalars - 98) // 13
+    first_overflowing = last_legal + 1
+    learner = NonlinearSharedGTDHordeLearner(
+        create_horde_spec(
+            (
+                GVFSpec(
+                    name="demon",
+                    demon_type=DemonType.PREDICTION,
+                    gamma=0.8,
+                    lamda=0.0,
+                    cumulant_index=0,
+                ),  # type: ignore[call-arg]
+            )
+        ),
+        hidden_size=1,
+    )
+
+    # Exercise the arithmetic-only preflight without attempting either large
+    # allocation; the next scalar is the first byte-count overflow.
+    _preflight_nonlinear_state(n_demons=1, hidden_size=1, feature_dim=last_legal)
+    with pytest.raises(ValueError, match="update working set byte count"):
+        _preflight_nonlinear_state(n_demons=1, hidden_size=1, feature_dim=first_overflowing)
+
+    assert 4 * (13 * last_legal + 98) <= _INT32_MAX
+    assert 4 * (13 * first_overflowing + 98) > _INT32_MAX
+    assert learner.n_demons == 1
