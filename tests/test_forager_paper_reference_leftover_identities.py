@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import json
 
+import numpy as np
 import pytest
 
 from alberta_framework.benchmarks.forager import (
+    ForagerEnvConfig,
     ForagerRunResult,
     PaperBaseline,
     PaperForagerProtocol,
@@ -173,3 +175,93 @@ def test_forager_run_result_keeps_integer_json() -> None:
     assert '"seed": true' not in dumped
     assert '"steps": true' not in dumped
     assert '"privileged": false' in dumped
+
+
+def test_run_result_rejects_hostile_scalar_subclasses_before_hooks() -> None:
+    calls = 0
+
+    class HostileInt(int):
+        def __int__(self) -> int:
+            nonlocal calls
+            calls += 1
+            raise AssertionError("integer conversion hook reached")
+
+    class HostileFloat(float):
+        def __float__(self) -> float:
+            nonlocal calls
+            calls += 1
+            raise AssertionError("float conversion hook reached")
+
+    with pytest.raises(ValueError, match="seed"):
+        _legal_run_result(seed=HostileInt(1))
+    with pytest.raises(ValueError, match="mean_reward"):
+        _legal_run_result(mean_reward=HostileFloat(1.0))
+    assert calls == 0
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"curve_steps": ()},
+        {"curve_steps": (1, 1)},
+        {"curve_steps": (1, 11)},
+        {"curve_ewm_reward": (0.1,)},
+        {"curve_window_reward": (0.1,)},
+        {"duration_s": -1.0},
+        {"frames_per_second": -1.0},
+    ],
+)
+def test_run_result_rejects_cross_field_and_domain_drift(
+    overrides: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError):
+        _legal_run_result(**overrides)
+
+
+def test_protocol_rejects_hostile_string_subclasses_before_comparison() -> None:
+    calls = 0
+
+    class HostileString(str):
+        def __eq__(self, other: object) -> bool:
+            nonlocal calls
+            calls += 1
+            raise AssertionError("string comparison hook reached")
+
+        __hash__ = str.__hash__
+
+    legal = paper_protocol()
+    kwargs = {name: getattr(legal, name) for name in legal.__dataclass_fields__}
+    for field in ("preset", "primary_metric"):
+        hostile = dict(kwargs)
+        hostile[field] = HostileString(str(kwargs[field]))
+        with pytest.raises(ValueError, match=field):
+            PaperForagerProtocol(**hostile)  # type: ignore[arg-type]
+    assert calls == 0
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("final_window_steps", 10_000_001),
+        ("frozen_ablation_after_steps", 10_000_001),
+        ("hidden_switch_interval_steps", 10_000_001),
+        ("evaluation_seed_start", 2**31 - 20),
+    ],
+)
+def test_protocol_rejects_cross_field_resource_drift(field: str, value: int) -> None:
+    legal = paper_protocol()
+    kwargs = {name: getattr(legal, name) for name in legal.__dataclass_fields__}
+    kwargs[field] = value
+    with pytest.raises(ValueError):
+        PaperForagerProtocol(**kwargs)  # type: ignore[arg-type]
+
+
+def test_environment_rejects_hostile_container_and_scalar_subclasses() -> None:
+    with pytest.raises(ValueError, match="aperture_size"):
+        ForagerEnvConfig(aperture_size=np.int32(9))  # type: ignore[arg-type]
+
+    class MappingSubclass(dict[str, object]):
+        pass
+
+    with pytest.raises(ValueError, match="actual dict"):
+        ForagerEnvConfig(extra_kwargs=MappingSubclass())
