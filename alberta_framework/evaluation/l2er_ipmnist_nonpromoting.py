@@ -61,11 +61,15 @@ _HYPERPARAMETER_KEYS = frozenset(
         "er_enabled",
     }
 )
+_INT32_MAX = (1 << 31) - 1
+_MAX_BYTES = 256 * 1024 * 1024
+_MAX_STRINGS = 16
+_MAX_STRING_BYTES = 512
 
 
 def _object(value: object, keys: frozenset[str], *, context: str) -> Mapping[str, Any]:
-    if not isinstance(value, Mapping):
-        raise ValueError(f"{context} must be an object")
+    if type(value) is not dict:
+        raise ValueError(f"{context} must be an exact object")
     actual = set(value)
     if actual != keys:
         raise ValueError(f"{context} keys must be exactly {sorted(keys)}")
@@ -73,7 +77,7 @@ def _object(value: object, keys: frozenset[str], *, context: str) -> Mapping[str
 
 
 def _int(value: object, *, context: str, positive: bool = False) -> int:
-    if type(value) is not int or value < int(positive):
+    if type(value) is not int or not int(positive) <= value <= _INT32_MAX:
         raise ValueError(f"{context} must be a {'positive' if positive else 'nonnegative'} int")
     return value
 
@@ -87,7 +91,17 @@ def _float(value: object, *, context: str, nonnegative: bool = False) -> float:
 
 
 def _strings(value: object, *, context: str) -> tuple[str, ...]:
-    if type(value) is not list or any(type(item) is not str or not item for item in value):
+    if (
+        type(value) is not list
+        or len(value) > _MAX_STRINGS
+        or any(
+            type(item) is not str
+            or not item
+            or "\x00" in item
+            or len(item.encode("utf-8")) > _MAX_STRING_BYTES
+            for item in value
+        )
+    ):
         raise ValueError(f"{context} must be a list of non-empty strings")
     resolved = tuple(value)
     if len(set(resolved)) != len(resolved):
@@ -134,7 +148,7 @@ def validate_l2er_development_result(payload: object) -> dict[str, object]:
         ("paper_revision", PAPER_REVISION),
         ("official_commit", OFFICIAL_COMMIT),
     ):
-        if outer[key] != expected:
+        if type(outer[key]) is not str or outer[key] != expected:
             raise ValueError(f"{key} does not match the frozen L2-ER protocol")
     arm = outer["arm"]
     if type(arm) is not str or arm not in _ARMS:
@@ -148,6 +162,8 @@ def validate_l2er_development_result(payload: object) -> dict[str, object]:
     n_classes = _int(outer["n_classes"], context="n_classes", positive=True)
     observations = _int(outer["observations"], context="observations", positive=True)
     updates = _int(outer["updates"], context="updates", positive=True)
+    if n_tasks > _INT32_MAX // task_length:
+        raise ValueError("n_tasks * task_length exceeds signed int32")
     if observations != n_tasks * task_length or updates != observations:
         raise ValueError("observations and updates must equal n_tasks * task_length")
     boundary = _strings(
@@ -212,6 +228,8 @@ def validate_l2er_development_result(payload: object) -> dict[str, object]:
     timing_seconds = _float(
         resources["timing_seconds"], context="timing_seconds", nonnegative=True
     )
+    if persistent_bytes > _MAX_BYTES or timing_seconds > 604_800.0:
+        raise ValueError("resources exceed the bounded development protocol")
     if environment_steps != 0 or data_steps != observations:
         raise ValueError("environment_steps/data_steps do not match the supervised protocol")
     er_updates = observations // 100 if expected_enabled == 1.0 else 0
@@ -219,15 +237,20 @@ def validate_l2er_development_result(payload: object) -> dict[str, object]:
         raise ValueError("model_queries does not match the executed update semantics")
     if resources["timing_is_telemetry_only"] is not True:
         raise ValueError("timing_is_telemetry_only must permanently remain True")
-    parameter_count = (
-        input_dim * hidden1
-        + hidden1
-        + hidden1 * hidden2
-        + hidden2
-        + hidden2 * n_classes
-        + n_classes
+    products = (
+        input_dim * hidden1,
+        hidden1 * hidden2,
+        hidden2 * n_classes,
+        100 * input_dim,
     )
-    expected_persistent_bytes = 4 * (parameter_count + 100 * input_dim + 1)
+    if any(product > _INT32_MAX for product in products):
+        raise ValueError("derived parameter/buffer size exceeds signed int32")
+    parameter_count = sum(products[:3]) + hidden1 + hidden2 + n_classes
+    if parameter_count > _INT32_MAX - products[3] - 1:
+        raise ValueError("derived persistent scalar count exceeds signed int32")
+    expected_persistent_bytes = 4 * (parameter_count + products[3] + 1)
+    if expected_persistent_bytes > _MAX_BYTES:
+        raise ValueError("derived persistent bytes exceed 256 MiB")
     if persistent_bytes != expected_persistent_bytes:
         raise ValueError("persistent_bytes must exactly include parameters and ER buffer")
     if type(outer["outcome"]) is not str or outer["outcome"] not in {

@@ -429,6 +429,90 @@ def _step_metrics(
 # Adapted L2-ER comparator (Prakash et al., ICML 2026)
 # =============================================================================
 
+_L2ER_ARRAY_ELEMENTS = 1_000_000
+_L2ER_MAX_WORKING_BYTES = 256 * 1024 * 1024
+_L2ER_KEYS = frozenset(("w1", "b1", "w2", "b2", "w3", "b3"))
+_L2ER_HP_KEYS = frozenset(
+    (
+        "step_size",
+        "weight_decay",
+        "er_step_size",
+        "er_batch_size",
+        "er_steps_per_batch",
+        "er_epsilon",
+        "er_enabled",
+    )
+)
+
+
+def _l2er_array(value: object, *, name: str, ndim: int | None = None) -> Array:
+    actual_type = type(value)
+    if actual_type is not np.ndarray and not issubclass(
+        actual_type, (jax.Array, jax.core.Tracer)
+    ):
+        raise ValueError(f"{name} must be an exact NumPy or JAX array")
+    array = jnp.asarray(value)
+    if (
+        array.size < 1
+        or array.size > _L2ER_ARRAY_ELEMENTS
+        or not jnp.issubdtype(array.dtype, jnp.floating)
+        or (ndim is not None and array.ndim != ndim)
+    ):
+        raise ValueError(f"{name} must be a bounded float array with the required rank")
+    return array
+
+
+def _l2er_hp(hp: object) -> dict[str, float]:
+    if type(hp) is not dict or frozenset(hp) != _L2ER_HP_KEYS:
+        raise ValueError("L2-ER hyperparameters must be one exact registered object")
+    checked: dict[str, float] = {}
+    for name in _L2ER_HP_KEYS:
+        value = hp[name]
+        if type(value) is not float or not math.isfinite(value) or value < 0.0:
+            raise ValueError(f"L2-ER hyperparameter {name} must be a finite float")
+        checked[name] = value
+    if (
+        checked["er_batch_size"] != 100.0
+        or checked["er_steps_per_batch"] != 1.0
+        or checked["er_epsilon"] != 1e-8
+        or checked["er_enabled"] not in (0.0, 1.0)
+    ):
+        raise ValueError("L2-ER hyperparameters do not match the audited protocol")
+    return checked
+
+
+def _l2er_preflight_svd(features: Array) -> None:
+    smaller = min(features.shape)
+    if smaller and smaller > (2**31 - 1) // smaller:
+        raise ValueError("L2-ER SVD working elements exceed signed int32")
+    if smaller * smaller * features.dtype.itemsize > _L2ER_MAX_WORKING_BYTES:
+        raise ValueError("L2-ER SVD working set exceeds 256 MiB")
+
+
+def _l2er_params(params: object) -> dict[str, Array]:
+    if type(params) is not dict or frozenset(params) != _L2ER_KEYS:
+        raise ValueError("params must be one exact protocol MLP tree")
+    checked = {
+        name: _l2er_array(value, name=f"params.{name}")
+        for name, value in params.items()
+    }
+    w1, b1 = checked["w1"], checked["b1"]
+    w2, b2 = checked["w2"], checked["b2"]
+    w3, b3 = checked["w3"], checked["b3"]
+    if (
+        w1.ndim != 2
+        or b1.shape != (w1.shape[1],)
+        or w2.ndim != 2
+        or w2.shape[0] != w1.shape[1]
+        or b2.shape != (w2.shape[1],)
+        or w3.ndim != 2
+        or w3.shape[0] != w2.shape[1]
+        or b3.shape != (w3.shape[1],)
+        or any(value.dtype != jnp.dtype(jnp.float32) for value in checked.values())
+    ):
+        raise ValueError("params must match the float32 protocol MLP shapes")
+    return checked
+
 
 @chex.dataclass(frozen=True, mappable_dataclass=False)
 class L2ERState:
@@ -440,6 +524,14 @@ class L2ERState:
 
 def l2er_effective_rank(features: Array, epsilon: float = 1e-8) -> Array:
     """Official entropy effective-rank estimator for one activation matrix."""
+    features = _l2er_array(features, name="features", ndim=2)
+    if type(epsilon) is not float or not math.isfinite(epsilon) or epsilon <= 0.0:
+        raise ValueError("epsilon must be an exact finite positive float")
+    _l2er_preflight_svd(features)
+    finite = jnp.all(jnp.isfinite(features))
+    if not isinstance(finite, jax.core.Tracer) and not bool(finite):
+        raise ValueError("features must contain only finite values")
+    features = jnp.where(finite, features, jnp.zeros_like(features))
     singular_values = jnp.abs(jnp.linalg.svdvals(features.T))
 
     def normalized(values: Array) -> Array:
@@ -455,15 +547,32 @@ def l2er_effective_rank(features: Array, epsilon: float = 1e-8) -> Array:
         singular_values,
     )
     entropy = -jnp.sum(probabilities * jnp.log(probabilities + epsilon))
-    return jnp.exp(entropy)
+    candidate = jnp.exp(entropy)
+    return jnp.where(jnp.isfinite(candidate), candidate, jnp.asarray(1.0, features.dtype))
 
 
 def l2er_effective_rank_loss(
     params: dict[str, Array], examples: Array, epsilon: float = 1e-8
 ) -> Array:
     """Negative mean effective rank over the current MLP's hidden layers."""
-    hidden1 = jax.nn.relu(examples @ params["w1"] + params["b1"])
-    hidden2 = jax.nn.relu(hidden1 @ params["w2"] + params["b2"])
+    examples = _l2er_array(examples, name="examples", ndim=2)
+    checked_params = _l2er_params(params)
+    if examples.shape[1] != checked_params["w1"].shape[0]:
+        raise ValueError("examples and first-layer parameter shapes must match")
+    for width in (checked_params["w1"].shape[1], checked_params["w2"].shape[1]):
+        if examples.shape[0] > _L2ER_ARRAY_ELEMENTS // width:
+            raise ValueError("L2-ER activation allocation exceeds the element limit")
+    finite = jnp.asarray(True, dtype=jnp.bool_)
+    for value in checked_params.values():
+        finite = finite & jnp.all(jnp.isfinite(value))
+    if not isinstance(finite, jax.core.Tracer) and not bool(finite):
+        raise ValueError("params must contain only finite values")
+    checked_params = {
+        name: jnp.where(finite, value, jnp.zeros_like(value))
+        for name, value in checked_params.items()
+    }
+    hidden1 = jax.nn.relu(examples @ checked_params["w1"] + checked_params["b1"])
+    hidden2 = jax.nn.relu(hidden1 @ checked_params["w2"] + checked_params["b2"])
     return -jnp.mean(
         jnp.stack(
             (
@@ -488,20 +597,51 @@ def l2er_update(
     one gradient step minimizes negative mean hidden effective rank.  The ER
     step does not advance or alter the ordinary optimizer state.
     """
-    step_size = hp["step_size"]
-    weight_decay = hp["weight_decay"]
-    supervised_params = {
-        name: value - step_size * (grads[name] + weight_decay * value)
-        for name, value in params.items()
+    checked_hp = _l2er_hp(hp)
+    if type(state) is not L2ERState:
+        raise ValueError("state must be an exact L2ERState")
+    if type(params) is not dict or type(grads) is not dict:
+        raise ValueError("params and grads must be exact dicts")
+    if frozenset(params) != _L2ER_KEYS or frozenset(grads) != _L2ER_KEYS:
+        raise ValueError("params and grads must contain the exact protocol MLP keys")
+    example = _l2er_array(example, name="example", ndim=1)
+    checked_params = _l2er_params(params)
+    checked_grads = {
+        name: _l2er_array(value, name=f"grads.{name}") for name, value in grads.items()
     }
-    batch_size = int(hp["er_batch_size"])
-    buffered = state.example_buffer.at[state.buffer_count].set(example)
-    next_count = state.buffer_count + jnp.asarray(1, dtype=jnp.int32)
+    if any(
+        checked_grads[name].shape != value.shape
+        or checked_grads[name].dtype != value.dtype
+        for name, value in checked_params.items()
+    ):
+        raise ValueError("params and grads must have identical shapes and dtypes")
+    w1 = checked_params["w1"]
+    if w1.ndim != 2 or example.shape != (w1.shape[0],):
+        raise ValueError("example and first-layer parameter shapes must match")
+    batch_size = int(checked_hp["er_batch_size"])
+    buffer = _l2er_array(state.example_buffer, name="state.example_buffer", ndim=2)
+    if buffer.shape != (batch_size, example.shape[0]) or buffer.dtype != example.dtype:
+        raise ValueError("L2-ER buffer shape and dtype must match the protocol")
+    count = state.buffer_count
+    if not isinstance(count, (jax.Array, jax.core.Tracer)) or (
+        count.shape != () or count.dtype != jnp.dtype(jnp.int32)
+    ):
+        raise ValueError("buffer_count must be one scalar int32 JAX array")
+    step_size = checked_hp["step_size"]
+    weight_decay = checked_hp["weight_decay"]
+    supervised_params = {
+        name: value - step_size * (checked_grads[name] + weight_decay * value)
+        for name, value in checked_params.items()
+    }
+    count_valid = (count >= 0) & (count < batch_size)
+    safe_count = jnp.clip(count, 0, batch_size - 1)
+    buffered = buffer.at[safe_count].set(example)
+    next_count = safe_count + jnp.asarray(1, dtype=jnp.int32)
     complete = next_count == batch_size
 
-    if hp["er_enabled"] == 1.0:
-        er_step_size = hp["er_step_size"]
-        epsilon = hp["er_epsilon"]
+    if checked_hp["er_enabled"] == 1.0:
+        er_step_size = checked_hp["er_step_size"]
+        epsilon = checked_hp["er_epsilon"]
 
         def apply_er(operand: tuple[dict[str, Array], Array]) -> dict[str, Array]:
             current_params, batch = operand
@@ -519,28 +659,42 @@ def l2er_update(
         )
     else:
         new_params = supervised_params
-    new_state = L2ERState(  # type: ignore[call-arg]
+    candidate_state = L2ERState(  # type: ignore[call-arg]
         example_buffer=jax.lax.cond(
             complete, jnp.zeros_like, lambda value: value, buffered
         ),
         buffer_count=jnp.where(complete, jnp.asarray(0, dtype=jnp.int32), next_count),
     )
-    return new_params, new_state
+    valid = count_valid & floating_tree_is_finite(params) & floating_tree_is_finite(grads)
+    valid = valid & floating_tree_is_finite(new_params) & floating_tree_is_finite(candidate_state)
+    safe_prior_params = jax.tree.map(
+        lambda value: jnp.where(jnp.isfinite(value), value, jnp.zeros_like(value)),
+        checked_params,
+    )
+    safe_prior_state = L2ERState(  # type: ignore[call-arg]
+        example_buffer=jnp.where(jnp.isfinite(buffer), buffer, jnp.zeros_like(buffer)),
+        buffer_count=jnp.where(count_valid, count, jnp.asarray(0, dtype=jnp.int32)),
+    )
+    return (
+        select_transaction(valid, new_params, safe_prior_params),
+        select_transaction(valid, candidate_state, safe_prior_state),
+    )
 
 
 def _make_l2er_learner(
     hp: Mapping[str, float],
 ) -> tuple[LearnerInitFn, ScreeningStepFn]:
     """Build one registered L2/ER reduction on the current IPMNIST MLP."""
-    if hp["er_batch_size"] != 100.0 or hp["er_steps_per_batch"] != 1.0:
-        raise ValueError("the audited lop-jax comparator requires ER batch 100 and one ER step")
-    if hp["er_epsilon"] != 1e-8 or hp["er_enabled"] not in (0.0, 1.0):
-        raise ValueError("the L2-ER estimator constants do not match the audited revision")
+    checked_hp = _l2er_hp(hp)
 
     def init_fn(params: dict[str, Array]) -> L2ERState:
+        checked_params = _l2er_params(params)
+        input_dim = checked_params["w1"].shape[0]
+        if input_dim > _L2ER_ARRAY_ELEMENTS // int(checked_hp["er_batch_size"]):
+            raise ValueError("L2-ER buffer exceeds the 1000000-element limit")
         return L2ERState(  # type: ignore[call-arg]
             example_buffer=jnp.zeros(
-                (int(hp["er_batch_size"]), params["w1"].shape[0]), dtype=jnp.float32
+                (int(checked_hp["er_batch_size"]), input_dim), dtype=jnp.float32
             ),
             buffer_count=jnp.asarray(0, dtype=jnp.int32),
         )
@@ -552,7 +706,7 @@ def _make_l2er_learner(
         (loss, logits), grads = jax.value_and_grad(cross_entropy_loss, has_aux=True)(
             params, x, y
         )
-        new_params, new_state = l2er_update(params, state, grads, x, hp)
+        new_params, new_state = l2er_update(params, state, grads, x, checked_hp)
         return new_params, new_state, _step_metrics(new_params, x, y, loss, logits)
 
     return init_fn, full_step

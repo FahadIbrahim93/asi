@@ -10,6 +10,7 @@ import pytest
 from alberta_framework.benchmarks.ipmnist_screening import (
     L2ERState,
     ScreeningRunResult,
+    _make_l2er_learner,
     l2er_development_result_payload,
     l2er_effective_rank,
     l2er_effective_rank_loss,
@@ -121,6 +122,67 @@ def test_l2er_update_is_jittable() -> None:
     assert all(bool(jnp.all(jnp.isfinite(value))) for value in new_params.values())
 
 
+def test_update_rejects_hostile_structure_and_is_atomic_on_runtime_invalidity() -> None:
+    class HostileMapping:
+        def __iter__(self) -> object:
+            raise AssertionError("hostile iteration must not run")
+
+    params = _params()
+    grads = jax.tree.map(jnp.ones_like, params)
+    state = L2ERState(  # type: ignore[call-arg]
+        example_buffer=jnp.zeros((100, 2), dtype=jnp.float32),
+        buffer_count=jnp.asarray(0, dtype=jnp.int32),
+    )
+    with pytest.raises(ValueError, match="hyperparameters"):
+        l2er_update(  # type: ignore[arg-type]
+            params, state, grads, jnp.ones(2), HostileMapping()
+        )
+    bad_grads = dict(grads)
+    bad_grads["w2"] = jnp.ones((1, 3), dtype=jnp.float32)
+    with pytest.raises(ValueError, match="identical shapes"):
+        l2er_update(
+            params,
+            state,
+            bad_grads,
+            jnp.ones(2),
+            _hp(wd=0.0, er_lr=0.0, enabled=0.0),
+        )
+
+    bad_state = state.replace(buffer_count=jnp.asarray(100, dtype=jnp.int32))
+    unchanged, repaired = jax.jit(
+        lambda p, s, g: l2er_update(
+            p, s, g, jnp.ones(2), _hp(wd=0.0, er_lr=0.0, enabled=0.0)
+        )
+    )(params, bad_state, grads)
+    for name in params:
+        np.testing.assert_array_equal(unchanged[name], params[name])
+    assert int(repaired.buffer_count) == 0
+
+    nonfinite = dict(grads)
+    nonfinite["w1"] = jnp.full_like(grads["w1"], jnp.inf)
+    unchanged, _ = l2er_update(
+        params,
+        state,
+        nonfinite,
+        jnp.ones(2),
+        _hp(wd=0.0, er_lr=0.0, enabled=0.0),
+    )
+    for name in params:
+        np.testing.assert_array_equal(unchanged[name], params[name])
+
+
+def test_buffer_and_svd_resources_are_preflighted() -> None:
+    init, _ = _make_l2er_learner(_hp(wd=0.0, er_lr=0.0, enabled=0.0))
+    with pytest.raises(ValueError, match="exact protocol MLP tree"):
+        init({})
+    params = _params()
+    params["w1"] = jnp.ones((10_001, 2), dtype=jnp.float32)
+    with pytest.raises(ValueError, match="buffer exceeds"):
+        init(params)
+    with pytest.raises(ValueError, match="bounded float array"):
+        l2er_effective_rank(jnp.ones((1001, 1000), dtype=jnp.float32))
+
+
 def test_registry_contains_complete_matched_ablation() -> None:
     expected = {
         "l2er_mechanism_off": (0.0, 0.0, 0.0),
@@ -218,6 +280,18 @@ def test_result_receipt_accounts_resources_and_is_permanently_nonpromoting() -> 
     hostile_schema["unregistered_claim"] = True
     with pytest.raises(ValueError, match="result keys"):
         validate_l2er_development_result(hostile_schema)
+
+    hostile_counter = deepcopy(payload)
+    hostile_counter["n_tasks"] = 2**31
+    with pytest.raises(ValueError, match="n_tasks"):
+        validate_l2er_development_result(hostile_counter)
+
+    class HostileObject:
+        def __iter__(self) -> object:
+            raise AssertionError("hostile iteration must not run")
+
+    with pytest.raises(ValueError, match="exact object"):
+        validate_l2er_development_result(HostileObject())
 
 
 def test_matched_validator_requires_all_arms_and_axes() -> None:
