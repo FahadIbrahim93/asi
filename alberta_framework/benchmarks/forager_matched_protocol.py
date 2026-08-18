@@ -803,7 +803,7 @@ class RankedSelectionGroup:
     def __post_init__(self) -> None:
         _require_identifier(self.selection_group, "ranked_selection_group.selection_group")
         if type(self.ranked_candidate_ids) is not tuple or not all(
-            isinstance(cid, str) and cid for cid in self.ranked_candidate_ids
+            type(cid) is str and cid for cid in self.ranked_candidate_ids
         ):
             raise ForagerMatchedProtocolError(
                 "ranked_candidate_ids must be a tuple of candidate IDs"
@@ -912,7 +912,7 @@ class DescriptiveContext:
 
     def __post_init__(self) -> None:
         if type(self.candidate_ids) is not tuple or not all(
-            isinstance(cid, str) and cid for cid in self.candidate_ids
+            type(cid) is str and cid for cid in self.candidate_ids
         ):
             raise ForagerMatchedProtocolError("candidate_ids must be a tuple of candidate IDs")
         if self.analysis_role != "descriptive_only":
@@ -1088,7 +1088,7 @@ def _validate_json_complexity(value: Any) -> None:
             raise ForagerMatchedProtocolError("protocol exceeds the JSON nesting limit")
         if isinstance(item, Mapping):
             for key in item:
-                if not isinstance(key, str):
+                if type(key) is not str:
                     raise ForagerMatchedProtocolError("JSON object keys must be strings")
                 try:
                     key.encode("utf-8")
@@ -1099,7 +1099,7 @@ def _validate_json_complexity(value: Any) -> None:
             pending.extend((child, depth + 1) for child in item.values())
         elif isinstance(item, list):
             pending.extend((child, depth + 1) for child in item)
-        elif isinstance(item, str):
+        elif type(item) is str:
             try:
                 item.encode("utf-8")
             except UnicodeEncodeError as exc:
@@ -1117,17 +1117,21 @@ def _validate_json_complexity(value: Any) -> None:
 
 def decode_strict_json(data: bytes | str) -> Any:
     """Decode duplicate-free finite UTF-8 JSON with bounded complexity."""
+    data_type = type(data)
+    if data_type is not bytes and data_type is not str:
+        raise ForagerMatchedProtocolError("protocol must be exact bytes or string JSON")
     try:
-        if isinstance(data, bytes):
+        if type(data) is bytes:
             if len(data) > _MAX_MANIFEST_BYTES:
                 raise ForagerMatchedProtocolError("protocol exceeds the file-size limit")
             text = data.decode("utf-8")
         else:
-            if len(data) > _MAX_MANIFEST_BYTES:
+            raw_text = cast(str, data)
+            if len(raw_text) > _MAX_MANIFEST_BYTES:
                 raise ForagerMatchedProtocolError("protocol exceeds the file-size limit")
-            if len(data.encode("utf-8")) > _MAX_MANIFEST_BYTES:
+            if len(raw_text.encode("utf-8")) > _MAX_MANIFEST_BYTES:
                 raise ForagerMatchedProtocolError("protocol exceeds the file-size limit")
-            text = data
+            text = raw_text
         decoded = json.loads(
             text,
             object_pairs_hook=_duplicate_free_object,
@@ -1145,7 +1149,7 @@ def decode_strict_json(data: bytes | str) -> Any:
 def _require_object(value: Any, path: str) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
         raise ForagerMatchedProtocolError(f"{path} must be a JSON object")
-    if any(not isinstance(key, str) for key in value):
+    if any(type(key) is not str for key in value):
         raise ForagerMatchedProtocolError(f"{path} keys must be strings")
     return cast(Mapping[str, Any], value)
 
@@ -1171,7 +1175,7 @@ def _require_exact_keys(
 
 
 def _require_string(value: Any, path: str, *, maximum: int = 512) -> str:
-    if not isinstance(value, str) or not value or len(value) > maximum:
+    if type(value) is not str or not value or len(value) > maximum:
         raise ForagerMatchedProtocolError(
             f"{path} must be a non-empty string of at most {maximum} characters"
         )
@@ -2734,7 +2738,7 @@ def _validate_cross_references(
 
 def parse_forager_matched_protocol(value: Any) -> ForagerMatchedProtocol:
     """Decode if needed, then validate and normalize a matched protocol."""
-    if isinstance(value, (bytes, str)):
+    if type(value) in (bytes, str):
         value = decode_strict_json(value)
     _validate_json_complexity(value)
     payload = _require_object(value, "protocol")
@@ -2880,9 +2884,9 @@ def parse_forager_matched_protocol(value: Any) -> ForagerMatchedProtocol:
 
 def parse_forager_matched_selection_result(value: Any) -> ForagerMatchedSelectionResult:
     """Validate a canonicalizable, reward-opaque open-tuning selection result."""
-    if isinstance(value, ForagerMatchedSelectionResult):
+    if type(value) is ForagerMatchedSelectionResult:
         value = value.to_dict()
-    if isinstance(value, (bytes, str)):
+    if type(value) in (bytes, str):
         value = decode_strict_json(value)
     _validate_json_complexity(value)
     path = "selection_result"

@@ -10,7 +10,9 @@ from alberta_framework.benchmarks.forager_matched_campaign import (
     CampaignStatus,
     CompletedCampaignBundle,
     ForagerMatchedCampaignError,
+    _CellScan,
 )
+from alberta_framework.benchmarks.forager_matched_executor import SeedExecutionArtifacts
 
 
 def test_campaign_status_valid_construction() -> None:
@@ -102,3 +104,96 @@ def test_completed_campaign_bundle_validation() -> None:
             completion_summary={},
             final_file_sha256={},
         )
+
+
+def _legal_cell_scan(**overrides: object) -> _CellScan:
+    payload: dict[str, object] = {
+        "artifact": None,
+        "completed_attempt": None,
+        "raw_binding_sha256": None,
+        "bundle_sha256": None,
+        "resumable_attempt": None,
+        "resumable_binding": None,
+        "next_attempt_number": 1,
+        "pointer_present": False,
+        "retained_raw_bytes": 0,
+    }
+    payload.update(overrides)
+    return _CellScan(**payload)  # type: ignore[arg-type]
+
+
+def _legal_artifact() -> SeedExecutionArtifacts:
+    return SeedExecutionArtifacts(
+        candidate_id="isolated_ppo",
+        seed=2_200_001,
+        score=1.25,
+        live_runtime_identity_sha256="c" * 64,
+        raw_artifact={"kind": "raw"},
+        trace_artifact={"kind": "trace"},
+        scoring_record={"kind": "score"},
+    )
+
+
+def test_cell_scan_legal_empty_and_completed_shapes() -> None:
+    empty = _legal_cell_scan()
+    assert empty.next_attempt_number == 1
+    assert empty.pointer_present is False
+    assert empty.retained_raw_bytes == 0
+    completed = _legal_cell_scan(
+        artifact=_legal_artifact(),
+        completed_attempt=Path("attempts/attempt-001"),
+        raw_binding_sha256="a" * 64,
+        bundle_sha256="b" * 64,
+        next_attempt_number=2,
+        pointer_present=True,
+        retained_raw_bytes=1024,
+    )
+    assert completed.pointer_present is True
+    assert completed.next_attempt_number == 2
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("next_attempt_number", True),
+        ("next_attempt_number", False),
+        ("next_attempt_number", 0),
+        ("retained_raw_bytes", True),
+        ("retained_raw_bytes", False),
+        ("retained_raw_bytes", -1),
+        ("pointer_present", 1),
+        ("pointer_present", 0),
+        ("completed_attempt", "attempts/attempt-001"),
+        ("raw_binding_sha256", "not-a-digest"),
+        ("resumable_binding", ["not-a-mapping"]),
+    ],
+)
+def test_cell_scan_rejects_bool_attempt_and_byte_identities(
+    field: str, value: object
+) -> None:
+    with pytest.raises(ForagerMatchedCampaignError, match=field):
+        _legal_cell_scan(**{field: value})
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"completed_attempt": Path("attempt-001")}, "completed cell fields"),
+        ({"resumable_attempt": Path("attempt-001")}, "resumable cell fields"),
+        ({"pointer_present": True}, "completion pointer"),
+        (
+            {
+                "artifact": _legal_artifact(),
+                "completed_attempt": Path("attempt-001"),
+                "raw_binding_sha256": "a" * 64,
+                "bundle_sha256": "b" * 64,
+                "resumable_attempt": Path("attempt-002"),
+                "resumable_binding": {},
+            },
+            "both completed and resumable",
+        ),
+    ],
+)
+def test_cell_scan_rejects_incoherent_state(overrides: dict[str, object], message: str) -> None:
+    with pytest.raises(ForagerMatchedCampaignError, match=message):
+        _legal_cell_scan(**overrides)

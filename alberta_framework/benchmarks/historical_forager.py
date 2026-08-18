@@ -236,9 +236,9 @@ def _distribution_version(name: str) -> str | None:
 def _module_or_distribution_version(module_name: str, distribution_name: str) -> str | None:
     module = sys.modules.get(module_name)
     version = getattr(module, "__version__", None)
-    if isinstance(version, str) and version:
-        return version
-    return _distribution_version(distribution_name)
+    if type(version) is not str or not version:
+        return _distribution_version(distribution_name)
+    return version
 
 
 def historical_forager_runtime_identity() -> dict[str, Any]:
@@ -439,7 +439,7 @@ def _require_read_only_non_tmp_factory_source(
     owner = factory if inspect.isclass(factory) or inspect.isfunction(factory) else type(factory)
     module = inspect.getmodule(owner)
     module_file = getattr(module, "__file__", None)
-    if not isinstance(module_file, str):
+    if type(module_file) is not str:
         raise HistoricalForagerContractError("factory source module has no filesystem identity")
     try:
         source_file = Path(module_file).resolve(strict=True)
@@ -495,7 +495,7 @@ def _require_loaded_forager_modules_read_only_non_tmp() -> None:
 def _verify_installed_forager_source_inventory() -> None:
     package = sys.modules.get("forager")
     package_file = getattr(package, "__file__", None)
-    if not isinstance(package_file, str):
+    if type(package_file) is not str:
         raise HistoricalForagerContractError("loaded forager package has no source identity")
     try:
         package_root = Path(package_file).resolve(strict=True).parent
@@ -508,9 +508,9 @@ def _verify_installed_forager_source_inventory() -> None:
         raise RuntimeError("historical environment file inventory is malformed")
     expected: dict[str, str] = {}
     for raw_name, raw_digest in raw_files.items():
-        if not isinstance(raw_name, str) or not raw_name.startswith("forager/"):
+        if type(raw_name) is not str or not raw_name.startswith("forager/"):
             continue
-        if not isinstance(raw_digest, str):  # pragma: no cover - canonical constant invariant
+        if type(raw_digest) is not str:  # pragma: no cover - canonical constant invariant
             raise RuntimeError("historical environment source digest is malformed")
         expected[raw_name.removeprefix("forager/")] = raw_digest
 
@@ -624,7 +624,7 @@ class HistoricalUpdateKernel[KernelStateT]:
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        if not isinstance(self.name, str) or _KERNEL_NAME.fullmatch(self.name) is None:
+        if type(self.name) is not str or _KERNEL_NAME.fullmatch(self.name) is None:
             raise HistoricalForagerContractError("kernel name is invalid")
         if not callable(self.start_kernel) or not callable(self.update_kernel):
             raise HistoricalForagerContractError("kernel start/update functions must be callable")
@@ -675,7 +675,7 @@ class HistoricalForagerRunConfig:
             raise HistoricalForagerContractError(
                 "aperture_size must be one of 1, 3, 5, 7, 9, 11, 13, 15"
             )
-        if not isinstance(self.allow_unverified_development_adapter, bool):
+        if type(self.allow_unverified_development_adapter) is not bool:
             raise HistoricalForagerContractError(
                 "allow_unverified_development_adapter must be a boolean"
             )
@@ -1145,14 +1145,14 @@ def _validate_adapter_manifest(value: Any) -> None:
 
 
 def _validate_kernel_manifest(value: Any) -> None:
-    if not isinstance(value, Mapping):
+    if type(value) is not dict:
         raise HistoricalForagerArtifactError("kernel must be an object")
     _require_exact_keys(value, {"name", "privileged", "metadata"}, name="kernel")
     if (
-        not isinstance(value["name"], str)
+        type(value["name"]) is not str
         or _KERNEL_NAME.fullmatch(value["name"]) is None
         or value["privileged"] is not False
-        or not isinstance(value["metadata"], Mapping)
+        or type(value["metadata"]) is not dict
     ):
         raise HistoricalForagerArtifactError("kernel descriptor is invalid")
     try:
@@ -1168,7 +1168,7 @@ def _validate_kernel_manifest(value: Any) -> None:
 
 
 def _validate_runtime_manifest(value: Any) -> None:
-    if not isinstance(value, Mapping):
+    if type(value) is not dict:
         raise HistoricalForagerArtifactError("runtime must be an object")
     _require_exact_keys(
         value,
@@ -1190,10 +1190,10 @@ def _validate_runtime_manifest(value: Any) -> None:
     if (
         value["schema_version"] != "alberta.historical_numpy_forager.runtime.v1"
         or value["binding"] != "host_inventory_recorded_not_immutable"
-        or any(not isinstance(value[name], str) or not value[name] for name in string_fields)
-        or not (value["numba"] is None or isinstance(value["numba"], str) and bool(value["numba"]))
+        or any(type(value[name]) is not str or not value[name] for name in string_fields)
+        or not (value["numba"] is None or type(value["numba"]) is str and bool(value["numba"]))
         or not (
-            value["pillow"] is None or isinstance(value["pillow"], str) and bool(value["pillow"])
+            value["pillow"] is None or type(value["pillow"]) is str and bool(value["pillow"])
         )
         or value["runtime_is_historical_attestation"] is not False
     ):
@@ -1272,25 +1272,22 @@ def validate_historical_forager_artifact(output_directory: Path) -> dict[str, An
     _validate_kernel_manifest(manifest["kernel"])
 
     run = manifest["run"]
-    if not isinstance(run, Mapping):
+    if type(run) is not dict:
         raise HistoricalForagerArtifactError("run must be an object")
     _require_exact_keys(run, {"seed", "aperture_size", "steps"}, name="run")
     seed, aperture_size, steps = run["seed"], run["aperture_size"], run["steps"]
     if (
-        isinstance(seed, bool)
-        or not isinstance(seed, int)
+        type(seed) is not int
         or not 0 <= seed <= _MAX_SEED
-        or isinstance(aperture_size, bool)
-        or not isinstance(aperture_size, int)
+        or type(aperture_size) is not int
         or aperture_size not in range(1, 16, 2)
-        or isinstance(steps, bool)
-        or not isinstance(steps, int)
+        or type(steps) is not int
         or not 1 <= steps <= _MAX_STEPS
     ):
         raise HistoricalForagerArtifactError("run values are invalid")
 
     sidecar = manifest["reward_sidecar"]
-    if not isinstance(sidecar, Mapping):
+    if type(sidecar) is not dict:
         raise HistoricalForagerArtifactError("reward_sidecar must be an object")
     _require_exact_keys(
         sidecar,
@@ -1313,20 +1310,17 @@ def validate_historical_forager_artifact(output_directory: Path) -> dict[str, An
         or sidecar["path"] != _REWARD_FILENAME
         or sidecar["format"] != "npy-v1-little-endian-float64"
         or sidecar["dtype"] != _REWARD_DTYPE.str
-        or not isinstance(sidecar["shape"], list)
+        or type(sidecar["shape"]) is not list
         or len(sidecar["shape"]) != 1
-        or isinstance(sidecar["shape"][0], bool)
-        or not isinstance(sidecar["shape"][0], int)
+        or type(sidecar["shape"][0]) is not int
         or sidecar["shape"][0] != steps
-        or isinstance(sidecar["steps"], bool)
-        or not isinstance(sidecar["steps"], int)
+        or type(sidecar["steps"]) is not int
         or sidecar["steps"] != steps
         or sidecar["chronological"] is not True
         or sidecar["biome_regret_present"] is not False
-        or isinstance(sidecar["size"], bool)
-        or not isinstance(sidecar["size"], int)
+        or type(sidecar["size"]) is not int
         or sidecar["size"] <= 0
-        or not isinstance(sidecar["sha256"], str)
+        or type(sidecar["sha256"]) is not str
         or re.fullmatch(r"[0-9a-f]{64}", sidecar["sha256"]) is None
     ):
         raise HistoricalForagerArtifactError("reward sidecar metadata is invalid")

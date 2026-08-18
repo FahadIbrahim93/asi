@@ -27,6 +27,7 @@ import jax.random as jr
 import numpy as np
 import pytest
 
+import alberta_framework.benchmarks.micro_continual as micro_continual
 from alberta_framework._seed_validation import JAX_KEY_SEED_MAX
 from alberta_framework.benchmarks.ipmnist_screening import (
     SCREENING_REGISTRY,
@@ -112,6 +113,22 @@ class _ExplodingRepr:
     def __repr__(self) -> str:
         type(self).calls += 1
         raise RuntimeError("untrusted __repr__ hook executed")
+
+
+class _HostileString(str):
+    """A string facade whose data-model hooks must not cross shard gates."""
+
+    calls = 0
+
+    def __bool__(self) -> bool:
+        type(self).calls += 1
+        raise AssertionError("untrusted __bool__ hook executed")
+
+    def __eq__(self, other: object) -> bool:
+        type(self).calls += 1
+        raise AssertionError("untrusted __eq__ hook executed")
+
+    __hash__ = str.__hash__
 
 
 class _ExplodingHashMeta(type):
@@ -1208,6 +1225,27 @@ class TestShards:
         ):
             load_micro_shard(path)
 
+    @pytest.mark.parametrize("location", ["mechanism", "environment"])
+    def test_load_rejects_hostile_identity_strings_before_hooks(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, location: str
+    ) -> None:
+        payload = micro_shard_payload(self._result())
+        hostile = _HostileString("sgd")
+        if location == "mechanism":
+            payload["mechanism"] = hostile
+        else:
+            payload["environment"] = dict(payload["environment"])
+            payload["environment"]["jax"] = hostile
+        _HostileString.calls = 0
+        monkeypatch.setattr(
+            micro_continual, "load_strict_json_object", lambda _path: payload
+        )
+
+        with pytest.raises(ValueError, match=location):
+            load_micro_shard(tmp_path / "hostile.json")
+
+        assert _HostileString.calls == 0
+
     def test_payload_roundtrip(self, tmp_path: Path):
         result = self._result()
         payload = micro_shard_payload(result)
@@ -1441,6 +1479,9 @@ class TestShards:
         payload = micro_shard_payload(self._result())
         payload["per_regime_accuracy"] = [0] + list(payload["per_regime_accuracy"][1:])
         payload["per_regime_plasticity"] = [1] + list(payload["per_regime_plasticity"][1:])
+        payload["overall_average_online_accuracy"] = sum(
+            payload["per_regime_accuracy"]
+        ) / len(payload["per_regime_accuracy"])
         path = tmp_path / "ok.json"
         path.write_text(json.dumps(payload), encoding="utf-8")
         loaded = load_micro_shard(path)

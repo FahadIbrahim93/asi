@@ -170,16 +170,15 @@ def test_policy_metadata_rejects_nested_hostile_values_without_hook() -> None:
         def __iter__(self):  # type: ignore[no-untyped-def, override]
             raise AssertionError("container hook executed")
 
-    step = SecurityRolloutStep(
-        state=(0.0,),
-        action=SecurityAction.PASS,
-        reward=0.0,
-        next_state=(0.0,),
-        terminated=False,
-        policy_metadata={"nested": HostileList()},
-    )
     with pytest.raises(ValueError, match="exact JSON values"):
-        step.to_dict()
+        SecurityRolloutStep(
+            state=(0.0,),
+            action=SecurityAction.PASS,
+            reward=0.0,
+            next_state=(0.0,),
+            terminated=False,
+            policy_metadata={"nested": HostileList()},
+        )
 
 
 def test_security_reward_rejects_hostile_inputs_without_numeric_hooks() -> None:

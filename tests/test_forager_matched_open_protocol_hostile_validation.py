@@ -3,18 +3,34 @@
 from __future__ import annotations
 
 import hashlib
+from dataclasses import replace
 
 import pytest
 
 from alberta_framework.benchmarks.forager_matched_open_protocol import (
+    _CANDIDATE_SPECS,
+    MATCHED_CURRENT_HORIZON,
     ForagerMatchedOpenProtocolBuildError,
     MatchedCurrentCandidateQualification,
     MatchedCurrentRuntimeQualification,
+    _CandidateSpec,
 )
 
 
 def _digest(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
+
+
+class _HostileString(str):
+    calls = 0
+
+    def __hash__(self) -> int:
+        type(self).calls += 1
+        raise AssertionError("hostile string hashing executed")
+
+    def __eq__(self, other: object) -> bool:
+        type(self).calls += 1
+        raise AssertionError("hostile string equality executed")
 
 
 def test_runtime_qualification_valid_construction() -> None:
@@ -59,6 +75,19 @@ def test_runtime_qualification_rejects_invalid_inputs() -> None:
         )
 
 
+def test_runtime_qualification_rejects_digest_subclass_without_dispatch() -> None:
+    hostile = _HostileString(_digest(b"image"))
+    _HostileString.calls = 0
+    with pytest.raises(ForagerMatchedOpenProtocolBuildError, match="SHA-256"):
+        MatchedCurrentRuntimeQualification(
+            image_sha256=hostile,
+            runtime_profile_sha256=_digest(b"profile"),
+            executor_qualification_receipt_sha256=_digest(b"executor"),
+            qualification_trust_anchor_identity="anchor_id",
+        )
+    assert _HostileString.calls == 0
+
+
 def test_candidate_qualification_rejects_invalid_types() -> None:
     with pytest.raises(
         ForagerMatchedOpenProtocolBuildError, match="candidate source must be a SourceBinding"
@@ -70,3 +99,75 @@ def test_candidate_qualification_rejects_invalid_types() -> None:
             capability_qualification_receipt_sha256=_digest(b"receipt"),
             resources=None,  # type: ignore[arg-type]
         )
+
+
+def _legal_spec(candidate_id: str = "isolated_ppo") -> _CandidateSpec:
+    return next(spec for spec in _CANDIDATE_SPECS if spec.candidate_id == candidate_id)
+
+
+def test_frozen_candidate_specs_remain_legal() -> None:
+    assert len(_CANDIDATE_SPECS) == 23
+    isolated_ppo = _legal_spec("isolated_ppo")
+    isolated_rtu = _legal_spec("isolated_rtu")
+    oracle = _legal_spec("search_oracle")
+    causal = _legal_spec("causal_e025_q050")
+    assert isolated_ppo.rollout_steps == 2_048
+    assert MATCHED_CURRENT_HORIZON // isolated_ppo.rollout_steps == 244
+    assert isolated_rtu.rollout_steps == 128
+    assert MATCHED_CURRENT_HORIZON // isolated_rtu.rollout_steps == 3_904
+    assert causal.rollout_steps is None
+    assert isolated_ppo.aperture_size == 9
+    assert oracle.aperture_size == -1
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("rollout_steps", True),
+        ("rollout_steps", False),
+        ("rollout_steps", 0),
+        ("aperture_size", True),
+        ("aperture_size", False),
+        ("aperture_size", 0),
+        ("aperture_size", 8),
+        ("environment_key_shared", 1),
+        ("pairing_eligible", 1),
+        ("seed_transport", "not_a_transport"),
+        ("candidate_id", ""),
+    ],
+)
+def test_candidate_spec_rejects_bool_horizon_identities(
+    field: str, value: object
+) -> None:
+    with pytest.raises(ForagerMatchedOpenProtocolBuildError, match=field):
+        replace(_legal_spec(), **{field: value})
+
+
+def test_candidate_spec_bool_rollout_would_collapse_horizon_identity() -> None:
+    """On origin/main, True constructed and MATCHED_CURRENT_HORIZON // True == 499712."""
+
+    legal = _legal_spec("isolated_ppo")
+    assert MATCHED_CURRENT_HORIZON // legal.rollout_steps == 244
+    assert MATCHED_CURRENT_HORIZON // True == MATCHED_CURRENT_HORIZON
+    with pytest.raises(ForagerMatchedOpenProtocolBuildError, match="rollout_steps"):
+        replace(legal, rollout_steps=True)
+    with pytest.raises(ForagerMatchedOpenProtocolBuildError, match="aperture_size"):
+        replace(legal, aperture_size=True)
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"rollout_steps": 127},
+        {"rollout_steps": None},
+        {"source_base_commit": "A" * 40},
+        {"environment_key_shared": True},
+        {"privileged_fields": ("global_objects",)},
+        {"pairing_eligible": False},
+    ],
+)
+def test_candidate_spec_rejects_cross_field_and_provenance_drift(
+    updates: dict[str, object],
+) -> None:
+    with pytest.raises(ForagerMatchedOpenProtocolBuildError):
+        replace(_legal_spec(), **updates)

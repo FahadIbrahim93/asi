@@ -451,7 +451,7 @@ def _read_stable_regular_file(
 
 
 def _normalized_relative_path(value: Any, label: str) -> str:
-    if not isinstance(value, str) or not value:
+    if type(value) is not str or not value:
         raise ScreenError(f"{label} must be a non-empty relative path")
     path = PurePosixPath(value)
     if path.is_absolute() or "." in path.parts or ".." in path.parts:
@@ -462,19 +462,19 @@ def _normalized_relative_path(value: Any, label: str) -> str:
 
 
 def _require_dict(value: Any, label: str) -> dict[str, Any]:
-    if not isinstance(value, dict):
+    if type(value) is not dict:
         raise ScreenError(f"{label} must be an object")
     return cast(dict[str, Any], value)
 
 
 def _require_list(value: Any, label: str) -> list[Any]:
-    if not isinstance(value, list):
+    if type(value) is not list:
         raise ScreenError(f"{label} must be an array")
     return value
 
 
 def _require_positive_int(value: Any, label: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+    if type(value) is not int or value <= 0:
         raise ScreenError(f"{label} must be a positive integer")
     return value
 
@@ -1292,7 +1292,7 @@ def _run_preflight(protocol: FrozenProtocol, docker: str) -> tuple[dict[str, Any
             or item.get("num_permutations") != 1
             or item.get("stored_seeds") != list(protocol.seeds)
             or item.get("effective_seeds") != list(protocol.seeds)
-            or not isinstance(item.get("result_root"), str)
+            or type(item.get("result_root")) is not str
             or not isinstance(item.get("metadata_contract"), dict)
         ):
             raise ScreenError(f"OCI preflight configuration binding drift: {config.path}")
@@ -1348,7 +1348,7 @@ def _run_preflight(protocol: FrozenProtocol, docker: str) -> tuple[dict[str, Any
         or runtime.get("continual_foragax_version") != "0.55.0"
         or runtime.get("jax_default_backend") != "cpu"
         or not devices
-        or any(not isinstance(device, str) or not device.startswith("cpu:") for device in devices)
+        or any(type(device) is not str or not device.startswith("cpu:") for device in devices)
         or runtime.get("jax_platform_name") != "cpu"
         or runtime.get("jax_platforms") != "cpu"
         or runtime.get("nvidia_visible_devices") != "void"
@@ -2434,7 +2434,7 @@ def validate_reward_archives(
             )
             or _SHA256_RE.fullmatch(cast(str, record.get("reward_trace_sha256", "")))
             is None
-            or not isinstance(record.get("reward_dtype"), str)
+            or type(record.get("reward_dtype")) is not str
         ):
             raise ScreenError("pinned scorer record does not bind the exact NPZ and metric")
         results.append(record)
@@ -2918,7 +2918,7 @@ def _validate_completed_run(
         raise ScreenError(f"attempt.json is not canonical: {config.path}")
     started_at = attempt.get("started_at_utc")
     if (
-        not isinstance(started_at, str)
+        type(started_at) is not str
         or re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", started_at) is None
     ):
         raise ScreenError(f"attempt timestamp is invalid: {config.path}")
@@ -2940,7 +2940,7 @@ def _validate_completed_run(
         set(process) != {"completed_at_utc", "exit_code", "stderr_path", "stdout_path"}
         or process.get("stdout_path") != "stdout.log"
         or process.get("stderr_path") != "stderr.log"
-        or not isinstance(completed_at, str)
+        or type(completed_at) is not str
         or re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", completed_at) is None
     ):
         raise ScreenError(f"completed run log path contract drift: {config.path}")
@@ -3040,7 +3040,7 @@ def _validate_completed_run(
         allowed_prefixes = ("raw_reward_validation:", "pinned_image_scoring:")
         if exit_code == 0 and (
             len(failures) != 1
-            or not isinstance(failures[0], str)
+            or type(failures[0]) is not str
             or not failures[0].startswith(allowed_prefixes)
         ):
             raise ScreenError(f"ineligible run has an invalid trace failure: {config.path}")

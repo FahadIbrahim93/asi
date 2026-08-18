@@ -1377,6 +1377,74 @@ class _CellScan:
     pointer_present: bool
     retained_raw_bytes: int
 
+    def __post_init__(self) -> None:
+        """Reject bool attempt/byte identities before they become one-step scans."""
+
+        if self.artifact is not None and type(self.artifact) is not executor.SeedExecutionArtifacts:
+            raise ForagerMatchedCampaignError(
+                "artifact must be a SeedExecutionArtifacts or None"
+            )
+        for name in ("completed_attempt", "resumable_attempt"):
+            value = getattr(self, name)
+            if value is not None and not isinstance(value, Path):
+                raise ForagerMatchedCampaignError(f"{name} must be a Path or None")
+        for name in ("raw_binding_sha256", "bundle_sha256"):
+            value = getattr(self, name)
+            if value is not None and (
+                type(value) is not str or _SHA256_RE.fullmatch(value) is None
+            ):
+                raise ForagerMatchedCampaignError(f"{name} must be a SHA-256 or None")
+        if self.resumable_binding is not None and not isinstance(
+            self.resumable_binding, Mapping
+        ):
+            raise ForagerMatchedCampaignError("resumable_binding must be a mapping or None")
+        if (
+            type(self.next_attempt_number) is not int
+            or not 1 <= self.next_attempt_number <= _MAX_ATTEMPTS_PER_CELL + 1
+        ):
+            raise ForagerMatchedCampaignError(
+                "next_attempt_number must be an integer in "
+                f"[1, {_MAX_ATTEMPTS_PER_CELL + 1}]"
+            )
+        if type(self.pointer_present) is not bool:
+            raise ForagerMatchedCampaignError("pointer_present must be a boolean")
+        if (
+            type(self.retained_raw_bytes) is not int
+            or not 0 <= self.retained_raw_bytes <= _MAX_RETAINED_RAW_BYTES_PER_CELL
+        ):
+            raise ForagerMatchedCampaignError(
+                "retained_raw_bytes must be a non-negative int"
+            )
+        completed = (
+            self.artifact,
+            self.completed_attempt,
+            self.raw_binding_sha256,
+            self.bundle_sha256,
+        )
+        if any(value is not None for value in completed) and not all(
+            value is not None for value in completed
+        ):
+            raise ForagerMatchedCampaignError(
+                "completed cell fields must be all present or all absent"
+            )
+        resumable = (self.resumable_attempt, self.resumable_binding)
+        if any(value is not None for value in resumable) and not all(
+            value is not None for value in resumable
+        ):
+            raise ForagerMatchedCampaignError(
+                "resumable cell fields must be both present or both absent"
+            )
+        if all(value is not None for value in completed) and all(
+            value is not None for value in resumable
+        ):
+            raise ForagerMatchedCampaignError(
+                "cell cannot be both completed and resumable"
+            )
+        if self.pointer_present and not all(value is not None for value in completed):
+            raise ForagerMatchedCampaignError(
+                "completion pointer requires a complete artifact binding"
+            )
+
 
 def _validate_failures(
     attempt: Path,

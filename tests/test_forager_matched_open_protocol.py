@@ -564,11 +564,9 @@ def test_placeholder_or_mismatched_trust_bindings_fail_closed() -> None:
             candidate_qualifications=_qualifications(),
         )
 
-    qualifications = _qualifications()
-    target = qualifications["isolated_rtu"]
     with pytest.raises(builder.ForagerMatchedOpenProtocolBuildError, match="placeholder"):
         replace(
-            target,
+            _qualifications()["isolated_rtu"],
             capability_qualification_receipt_sha256="f" * 64,
         )
 

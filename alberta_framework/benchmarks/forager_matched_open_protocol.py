@@ -283,6 +283,42 @@ class MatchedCurrentCandidateQualification:
             )
 
 
+def _require_spec_text(value: object, name: str) -> str:
+    if type(value) is not str or not value:
+        raise ForagerMatchedOpenProtocolBuildError(f"{name} must be a non-empty string")
+    return value
+
+
+def _require_spec_choice(value: object, name: str, allowed: tuple[str, ...]) -> str:
+    if type(value) is not str:
+        raise ForagerMatchedOpenProtocolBuildError(f"{name} must be an exact string")
+    if value not in allowed:
+        raise ForagerMatchedOpenProtocolBuildError(f"{name} is invalid")
+    return value
+
+
+def _require_spec_bool(value: object, name: str) -> bool:
+    if type(value) is not bool:
+        raise ForagerMatchedOpenProtocolBuildError(f"{name} must be a boolean")
+    return value
+
+
+def _require_spec_int(
+    value: object,
+    name: str,
+    *,
+    minimum: int,
+    maximum: int = 2**31 - 1,
+) -> int:
+    if isinstance(value, bool) or type(value) is not int:
+        raise ForagerMatchedOpenProtocolBuildError(f"{name} must be an integer")
+    if not minimum <= value <= maximum:
+        raise ForagerMatchedOpenProtocolBuildError(
+            f"{name} must be an integer in [{minimum}, {maximum}]"
+        )
+    return value
+
+
 @dataclass(frozen=True)
 class _CandidateSpec:
     candidate_id: str
@@ -309,6 +345,122 @@ class _CandidateSpec:
     privileged_fields: tuple[str, ...]
     pairing_eligible: bool
     exclusion_reasons: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        """Reject bool horizons before they become one-step identities."""
+
+        _require_spec_text(self.candidate_id, "candidate_id")
+        _require_spec_text(self.selection_group, "selection_group")
+        _require_spec_choice(
+            self.stratum,
+            "stratum",
+            ("alberta_learning", "external_learning", "privileged_context"),
+        )
+        _require_spec_text(self.implementation_kind, "implementation_kind")
+        _require_spec_text(self.entrypoint_family, "entrypoint_family")
+        _require_spec_choice(
+            self.seed_transport,
+            "seed_transport",
+            ("direct", "top_level_seed", "adapter_injected"),
+        )
+        if self.rollout_steps is not None:
+            _require_spec_int(
+                self.rollout_steps,
+                "rollout_steps",
+                minimum=1,
+                maximum=MATCHED_CURRENT_HORIZON,
+            )
+        _require_spec_text(self.update_semantics, "update_semantics")
+        _require_spec_text(self.source_repository, "source_repository")
+        _require_spec_text(self.source_base_commit, "source_base_commit")
+        if self.source_repository not in (
+            MATCHED_CURRENT_ALBERTA_REPOSITORY,
+            MATCHED_CURRENT_UPSTREAM_REPOSITORY,
+        ):
+            raise ForagerMatchedOpenProtocolBuildError("source_repository is invalid")
+        if re.fullmatch(r"[0-9a-f]{40}", self.source_base_commit) is None:
+            raise ForagerMatchedOpenProtocolBuildError(
+                "source_base_commit must be a lowercase Git commit"
+            )
+        _require_spec_choice(
+            self.source_provenance_kind,
+            "source_provenance_kind",
+            ("git_tree", "reviewed_snapshot"),
+        )
+        _require_spec_choice(
+            self.agent_rng_identity,
+            "agent_rng_identity",
+            ("isolated_agent_rng_v1", "shared_agent_environment_rng_v1"),
+        )
+        _require_spec_bool(self.environment_key_shared, "environment_key_shared")
+        _require_spec_choice(
+            self.environment_rng_identity,
+            "environment_rng_identity",
+            (
+                "dedicated_environment_split_chain_v1",
+                "shared_agent_environment_rng_v1",
+            ),
+        )
+        _require_spec_choice(
+            self.access_mode,
+            "access_mode",
+            (
+                "partial_observation",
+                "privileged_global_objects",
+                "privileged_reward_grid",
+            ),
+        )
+        _require_spec_text(self.observation_type, "observation_type")
+        if isinstance(self.aperture_size, bool) or type(self.aperture_size) is not int:
+            raise ForagerMatchedOpenProtocolBuildError("aperture_size must be an integer")
+        if self.aperture_size != -1 and self.aperture_size not in range(1, 16, 2):
+            raise ForagerMatchedOpenProtocolBuildError(
+                "aperture_size must be -1 or one of 1, 3, 5, 7, 9, 11, 13, 15"
+            )
+        if type(self.privileged_fields) is not tuple or any(
+            type(field) is not str or not field for field in self.privileged_fields
+        ):
+            raise ForagerMatchedOpenProtocolBuildError(
+                "privileged_fields must be a tuple of non-empty strings"
+            )
+        _require_spec_bool(self.pairing_eligible, "pairing_eligible")
+        if type(self.exclusion_reasons) is not tuple or any(
+            type(reason) is not str or not reason for reason in self.exclusion_reasons
+        ):
+            raise ForagerMatchedOpenProtocolBuildError(
+                "exclusion_reasons must be a tuple of non-empty strings"
+            )
+        if (self.rollout_steps is None) != (
+            self.update_semantics == "environment_step_counted"
+        ):
+            raise ForagerMatchedOpenProtocolBuildError(
+                "rollout_steps and update_semantics are inconsistent"
+            )
+        if (
+            self.rollout_steps is not None
+            and MATCHED_CURRENT_HORIZON % self.rollout_steps != 0
+        ):
+            raise ForagerMatchedOpenProtocolBuildError(
+                "rollout_steps must divide the matched horizon"
+            )
+        shared_rng = self.agent_rng_identity == "shared_agent_environment_rng_v1"
+        if (
+            self.environment_key_shared is not shared_rng
+            or (self.environment_rng_identity == "shared_agent_environment_rng_v1")
+            is not shared_rng
+        ):
+            raise ForagerMatchedOpenProtocolBuildError(
+                "agent and environment RNG identities are inconsistent"
+            )
+        privileged_access = self.access_mode != "partial_observation"
+        if bool(self.privileged_fields) is not privileged_access:
+            raise ForagerMatchedOpenProtocolBuildError(
+                "privileged_fields do not match observation access"
+            )
+        if self.pairing_eligible == bool(self.exclusion_reasons):
+            raise ForagerMatchedOpenProtocolBuildError(
+                "pairing eligibility and exclusion reasons are inconsistent"
+            )
 
 
 def _causal_specs() -> tuple[_CandidateSpec, ...]:
@@ -861,7 +1013,7 @@ _UPSTREAM_CONFIGURATION_REQUIREMENTS: Final = MappingProxyType(
 
 
 def _require_real_sha256(value: str, path: str) -> None:
-    if not isinstance(value, str) or _SHA256_RE.fullmatch(value) is None:
+    if type(value) is not str or _SHA256_RE.fullmatch(value) is None:
         raise ForagerMatchedOpenProtocolBuildError(f"{path} must be a lowercase SHA-256")
     if _PLACEHOLDER_SHA256_RE.fullmatch(value) is not None:
         raise ForagerMatchedOpenProtocolBuildError(

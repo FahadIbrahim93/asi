@@ -268,16 +268,20 @@ class OfficialForagaxRunRequest:
             raise OfficialForagaxValidationError("config_path must not be empty")
         if not isinstance(self.gpu, bool):
             raise OfficialForagaxValidationError("gpu must be a boolean")
-        if not isinstance(self.expected_repository, str):
+        if type(self.expected_repository) is not str:
             raise OfficialForagaxValidationError(
                 "expected_repository must be a string"
             )
-        if not _COMMIT_PATTERN.fullmatch(self.execution_commit):
+        if (
+            type(self.execution_commit) is not str
+            or _COMMIT_PATTERN.fullmatch(self.execution_commit) is None
+        ):
             raise OfficialForagaxValidationError(
                 "execution_commit must be a full lowercase 40-character Git SHA"
             )
-        if self.config_commit is not None and not _COMMIT_PATTERN.fullmatch(
-            self.config_commit
+        if self.config_commit is not None and (
+            type(self.config_commit) is not str
+            or _COMMIT_PATTERN.fullmatch(self.config_commit) is None
         ):
             raise OfficialForagaxValidationError(
                 "config_commit must be a full lowercase 40-character Git SHA"
@@ -3637,8 +3641,10 @@ def _sanitized_runtime(runtime: Mapping[str, Any]) -> dict[str, Any]:
         if isinstance(direct_url, Mapping):
             normalized_url = dict(direct_url)
             url = normalized_url.get("url")
-            if isinstance(url, str) and url.startswith("file:"):
-                normalized_url["url"] = "<LOCAL_PATH>"
+            if isinstance(url, str):
+                normalized_url["url"] = str.__str__(url)
+                if normalized_url["url"].startswith("file:"):
+                    normalized_url["url"] = "<LOCAL_PATH>"
             normalized["direct_url"] = normalized_url
         result["foragax_implementation"] = normalized
     return result
@@ -3696,8 +3702,10 @@ def _sanitize_package_freeze_line(line: str) -> str:
         return prefix + " ; direct_url=<REDACTED>"
     if isinstance(direct_url, dict):
         url = direct_url.get("url")
-        if isinstance(url, str) and url.startswith("file:"):
-            direct_url["url"] = "<LOCAL_PATH>"
+        if isinstance(url, str):
+            direct_url["url"] = str.__str__(url)
+            if direct_url["url"].startswith("file:"):
+                direct_url["url"] = "<LOCAL_PATH>"
     try:
         encoded = json.dumps(
             direct_url,
@@ -4938,7 +4946,7 @@ def _validated_registry_identity(value: Any) -> dict[str, str]:
         )
     result: dict[str, str] = {}
     for key, item in value.items():
-        if not isinstance(item, str) or not item:
+        if type(key) is not str or type(item) is not str or not item:
             raise OfficialForagaxValidationError(
                 f"official agent registry {key} is invalid"
             )
@@ -5003,7 +5011,7 @@ def _validated_resolved_hyperparameters(
     def validate_strings(item: Any) -> None:
         if isinstance(item, dict):
             for key, nested in item.items():
-                if not isinstance(key, str):
+                if type(key) is not str:
                     raise OfficialForagaxValidationError(
                         "official resolved hyperparameter keys must be strings"
                     )
@@ -5011,7 +5019,7 @@ def _validated_resolved_hyperparameters(
         elif isinstance(item, list):
             for nested in item:
                 validate_strings(nested)
-        elif isinstance(item, str):
+        elif type(item) is str:
             if (
                 Path(item).is_absolute()
                 or PureWindowsPath(item).is_absolute()
@@ -5082,7 +5090,7 @@ def _classify_official_foragax_agent_access(
         and isinstance(temperature_prioritization, bool)
         and isinstance(use_sinusoidal_encoding, bool)
         and isinstance(channel_priorities, dict)
-        and all(isinstance(key, str) for key in channel_priorities)
+        and all(type(key) is str for key in channel_priorities)
         and all(finite_json_number(priority) for priority in channel_priorities.values())
     )
     aperture_size = semantic_environment.get("aperture_size")
@@ -5213,7 +5221,7 @@ def _verified_agent_access_sections(
             "official manifest agent registry hash does not verify"
         )
     agent = run.get("agent")
-    if not isinstance(agent, str) or not agent:
+    if type(agent) is not str or not agent:
         raise OfficialForagaxValidationError(
             "official manifest agent identity is invalid"
         )
@@ -5298,7 +5306,7 @@ sys.stdout.write(
     payload = _extract_probe_payload(result.stdout)
     packages = payload.get("packages")
     if not isinstance(packages, list) or not all(
-        isinstance(item, str) and item for item in packages
+        type(item) is str and item for item in packages
     ):
         raise OfficialForagaxValidationError(
             "supplied interpreter returned an invalid package freeze"
@@ -5427,7 +5435,7 @@ def prepare_official_foragax_run(
     problem = config_data.get("problem")
     configured_env_steps = config_data.get("total_steps")
     meta_parameters = config_data.get("metaParameters")
-    if not isinstance(agent, str) or not agent.strip():
+    if type(agent) is not str or not agent.strip():
         raise OfficialForagaxValidationError("official config has no non-empty agent")
     if problem != "Foragax":
         raise OfficialForagaxValidationError(
@@ -7837,7 +7845,7 @@ def _manifest_relative_file(
     *,
     label: str,
 ) -> Path:
-    if not isinstance(value, str):
+    if type(value) is not str:
         raise OfficialForagaxValidationError(f"official manifest {label} is invalid")
     relative = _canonical_relative_path(value, label=f"manifest {label}")
     return root / relative
@@ -9718,7 +9726,7 @@ def _verify_execution_and_logs(
 ) -> None:
     command = execution.get("command")
     if not isinstance(command, list) or not all(
-        isinstance(argument, str) for argument in command
+        type(argument) is str for argument in command
     ):
         raise OfficialForagaxValidationError("official manifest command is invalid")
     if any(Path(argument).is_absolute() for argument in command):
@@ -9741,7 +9749,7 @@ def _verify_execution_and_logs(
     if (
         not isinstance(freeze, list)
         or not freeze
-        or not all(isinstance(item, str) and item for item in freeze)
+        or not all(type(item) is str and item for item in freeze)
         or freeze != sorted(set(freeze))
     ):
         raise OfficialForagaxValidationError(
@@ -9789,7 +9797,7 @@ def _verify_execution_and_logs(
         not isinstance(relevant_environment, dict)
         or not required_environment_keys <= relevant_environment.keys()
         or any(
-            not isinstance(key, str) or not isinstance(value, str)
+            type(key) is not str or type(value) is not str
             for key, value in relevant_environment.items()
         )
     ):
@@ -9998,7 +10006,7 @@ def verify_official_foragax_manifest(
         or implementation.get("package") != "foragax"
         or implementation.get("install_tree_hash_scheme")
         != "relative-path+size+bytes-v1"
-        or not isinstance(implementation.get("install_tree_sha256"), str)
+        or type(implementation.get("install_tree_sha256")) is not str
     ):
         raise OfficialForagaxValidationError(
             "official Foragax implementation provenance is not verified"
@@ -10291,7 +10299,7 @@ def verify_official_foragax_batch_manifest(
         or implementation.get("package") != "foragax"
         or implementation.get("install_tree_hash_scheme")
         != "relative-path+size+bytes-v1"
-        or not isinstance(implementation.get("install_tree_sha256"), str)
+        or type(implementation.get("install_tree_sha256")) is not str
     ):
         raise OfficialForagaxValidationError(
             "official batch Foragax implementation is not verified"
@@ -11053,7 +11061,7 @@ def _official_spec_shared_kwargs(
     environment_provenance = manifest.get("environment")
     if (
         not isinstance(package_freeze, list)
-        or not all(isinstance(item, str) for item in package_freeze)
+        or not all(type(item) is str for item in package_freeze)
         or not isinstance(runtime, dict)
         or not isinstance(relevant_environment, dict)
         or not isinstance(environment_provenance, dict)

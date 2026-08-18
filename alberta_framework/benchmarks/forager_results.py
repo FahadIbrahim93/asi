@@ -104,7 +104,7 @@ def _validate_sha256(value: str | None, *, name: str) -> None:
     if value is None:
         return
     if (
-        not isinstance(value, str)
+        type(value) is not str
         or len(value) != 64
         or any(character not in "0123456789abcdef" for character in value)
     ):
@@ -115,7 +115,7 @@ def _validate_git_sha(value: str | None, *, name: str) -> None:
     if value is None:
         return
     if (
-        not isinstance(value, str)
+        type(value) is not str
         or len(value) != 40
         or any(character not in "0123456789abcdef" for character in value)
     ):
@@ -192,7 +192,7 @@ def _flatten_json(value: Any, *, prefix: str = "") -> dict[str, Any]:
     if isinstance(value, Mapping):
         flattened: dict[str, Any] = {}
         for key, child in value.items():
-            if not isinstance(key, str) or not key:
+            if type(key) is not str or not key:
                 raise ValueError("config object keys must be non-empty strings")
             child_prefix = f"{prefix}.{key}" if prefix else key
             flattened.update(_flatten_json(child, prefix=child_prefix))
@@ -260,7 +260,7 @@ def _sqlite_value_matches(actual: Any, expected: Any) -> bool:
             and math.isfinite(float(actual))
             and float(actual) == expected
         )
-    return isinstance(actual, str) and actual == expected
+    return type(actual) is str and actual == expected
 
 
 def _legacy_fov_display_agent(config_agent: str) -> str:
@@ -307,11 +307,11 @@ class LegacyFOVSQLiteRunSpec:
         if not isinstance(self.privileged, bool):
             raise ValueError("privileged must be a boolean")
         if (
-            not isinstance(self.expected_config_agent, str)
+            type(self.expected_config_agent) is not str
             or self.expected_config_agent not in LEGACY_FOV_CONFIG_AGENTS
         ):
             raise ValueError("expected_config_agent must name a checked-in paper FOV configuration")
-        if not isinstance(self.agent, str) or not self.agent:
+        if type(self.agent) is not str or not self.agent:
             raise ValueError("agent must be a non-empty string")
         if not isinstance(self.expected_aperture_size, int) or isinstance(
             self.expected_aperture_size, bool
@@ -812,7 +812,7 @@ def _validated_environment_provenance(
     if implementation["package"] != "foragax":
         raise ValueError("environment implementation must identify the foragax package")
     version = implementation["version"]
-    if not isinstance(version, str) or not version.strip():
+    if type(version) is not str or not version.strip():
         raise ValueError("environment implementation version must be non-empty")
     direct_url = implementation["direct_url"]
     if direct_url is not None and not isinstance(direct_url, dict):
@@ -890,7 +890,7 @@ class OfficialForagaxRunSpec:
     attestation_evidence: VerifiedOfficialForagaxEvidence | None = None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.agent, str) or not self.agent.strip():
+        if type(self.agent) is not str or not self.agent.strip():
             raise ValueError("agent must be a non-empty string")
         if not isinstance(self.seed, int) or isinstance(self.seed, bool) or self.seed < 0:
             raise ValueError("seed must be a non-negative integer")
@@ -912,7 +912,7 @@ class OfficialForagaxRunSpec:
 
         explicit_repository = self.source_repository
         if explicit_repository is not None and (
-            not isinstance(explicit_repository, str) or not explicit_repository
+            type(explicit_repository) is not str or not explicit_repository
         ):
             raise ValueError("source_repository must be a non-empty string")
         _validate_git_sha(self.source_commit, name="source_commit")
@@ -961,7 +961,7 @@ class OfficialForagaxRunSpec:
         ):
             raise ValueError("expected_steps must be a positive integer")
         if self.config_path is not None:
-            if not isinstance(self.config_path, str) or not self.config_path.strip():
+            if type(self.config_path) is not str or not self.config_path.strip():
                 raise ValueError("config_path must be a non-empty string")
             logical_config = Path(self.config_path)
             windows_config = PureWindowsPath(self.config_path)
@@ -977,7 +977,7 @@ class OfficialForagaxRunSpec:
                 raise ValueError("config_path must be a safe repository-relative path")
         if self.artifact_relative_path is not None:
             if (
-                not isinstance(self.artifact_relative_path, str)
+                type(self.artifact_relative_path) is not str
                 or not self.artifact_relative_path.strip()
             ):
                 raise ValueError("artifact_relative_path must be a non-empty string")
@@ -1035,7 +1035,7 @@ class OfficialForagaxRunSpec:
                 )
 
         if not isinstance(self.package_freeze, tuple) or any(
-            not isinstance(line, str) or not line for line in self.package_freeze
+            type(line) is not str or not line for line in self.package_freeze
         ):
             raise ValueError("package_freeze must be a tuple of non-empty strings")
         if len(set(self.package_freeze)) != len(self.package_freeze):
@@ -1089,7 +1089,7 @@ class OfficialForagaxRunSpec:
                     + ", ".join(missing_runtime)
                 )
             if any(
-                not isinstance(runtime[name], str) or not runtime[name]
+                type(runtime[name]) is not str or not runtime[name]
                 for name in required_runtime - {"jax_devices"}
             ):
                 raise ValueError("execution_runtime identity fields must be non-empty strings")
@@ -1102,7 +1102,7 @@ class OfficialForagaxRunSpec:
                 raise ValueError("execution_runtime.jax_devices must be a non-empty object list")
             object.__setattr__(self, "execution_runtime", runtime)
         if not isinstance(self.relevant_environment, Mapping) or any(
-            not isinstance(key, str) or not isinstance(value, str)
+            type(key) is not str or type(value) is not str
             for key, value in self.relevant_environment.items()
         ):
             raise ValueError("relevant_environment must map strings to strings")
@@ -1410,7 +1410,7 @@ def _official_environment_runtime_profile(
         raise ValueError("official runtime profile lacks runtime provenance")
     package_inventory = execution["package_inventory"]
     if not isinstance(package_inventory, list) or not all(
-        isinstance(line, str) for line in package_inventory
+        type(line) is str for line in package_inventory
     ):
         raise ValueError("official runtime profile package inventory is invalid")
     relevant_prefixes = (
@@ -1428,7 +1428,7 @@ def _official_environment_runtime_profile(
     )
     command = execution["command"]
     if not isinstance(command, list) or not all(
-        isinstance(argument, str) for argument in command
+        type(argument) is str for argument in command
     ):
         raise ValueError("official runtime profile command is invalid")
     container_environment = sorted(
@@ -2077,7 +2077,7 @@ def _foragax_semantic_signature(run: ForagerRunResult) -> str | None:
     environment = run.environment
     env_id = environment.get("env_id")
     is_foragax = (
-        isinstance(env_id, str)
+        type(env_id) is str
         and env_id.startswith("Foragax")
         or environment.get("foragax_distribution") == FORAGAX_DISTRIBUTION
         or isinstance(environment.get("environment_implementation"), Mapping)
@@ -2176,7 +2176,7 @@ def _foragax_implementation_signature(run: ForagerRunResult) -> str | None:
         }
     if (
         normalized.get("distribution") != FORAGAX_DISTRIBUTION
-        or not isinstance(normalized.get("version"), str)
+        or type(normalized.get("version")) is not str
         or normalized.get("install_tree_hash_scheme") != FORAGAX_INSTALL_TREE_HASH_SCHEME
     ):
         return None

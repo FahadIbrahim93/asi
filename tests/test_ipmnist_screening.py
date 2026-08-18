@@ -915,17 +915,24 @@ class TestCBPReplacement:
 class TestWeightClipping:
     """UPGD-W + weight clipping (Elsayed et al., RLC 2024)."""
 
-    def test_kappa_inf_is_rejected_at_the_spec_boundary(self):
+    def test_max_finite_kappa_reduces_exactly_to_control(self, small_data):
+        """With max-finite kappa the clip is a no-op: bit-exact control trajectory."""
+        x, y = small_data
         hp = dict(UPGD_W_PROTOCOL_HYPERPARAMETERS)
-        hp["clip_kappa"] = math.inf
-        with pytest.raises(ValueError, match="hyperparameter values must be finite"):
-            ScreeningSpec(
-                name="upgd_w_control",
-                base_learner="upgd_w",
-                mechanism="weight_clipping",
-                hyperparameters=hp,
-                factory=_make_upgd_w_wclip_learner,
-            )
+        hp["clip_kappa"] = float(np.finfo(np.float32).max)
+        spec = ScreeningSpec(
+            name="upgd_w_control",  # reuse control identity for shard plumbing
+            base_learner="upgd_w",
+            mechanism="weight_clipping",
+            hyperparameters=hp,
+            factory=_make_upgd_w_wclip_learner,
+        )
+        ours = run_screening_config(x, y, spec, seed=7, config=SMALL)
+        control = run_screening_config(
+            x, y, screening_spec("upgd_w_control"), seed=7, config=SMALL
+        )
+        np.testing.assert_array_equal(ours.per_task_accuracy, control.per_task_accuracy)
+        np.testing.assert_allclose(ours.per_task_loss, control.per_task_loss, rtol=1e-6)
 
     def test_clip_bounds_enforced_per_layer(self):
         """After one step every parameter obeys |w| <= kappa / sqrt(fan_in)."""
@@ -2050,7 +2057,7 @@ class TestPoolConfirmation:
             )
 
     @pytest.mark.parametrize("noise_pool_steps", [None, True, np.int64(8), 8.0, 1])
-    def test_run_result_rejects_noncanonical_pool_size(
+    def test_shard_payload_rejects_noncanonical_pool_size(
         self, noise_pool_steps: object
     ) -> None:
         spec = screening_spec("upgd_w_control")
@@ -4284,13 +4291,24 @@ class TestComparisonArms:
             factory=factory,
         )
 
-    def test_wclip_kappa_inf_is_rejected_at_the_spec_boundary(self):
+    def test_wclip_max_finite_kappa_reduces_to_sgd_base_bitwise(self, small_data):
+        """Max-finite clip_kappa is a no-op: bit-exact sgd_ema_norm_d099."""
+        x, y = small_data
         ref_spec = screening_spec("sgd_ema_norm_d099")
-        with pytest.raises(ValueError, match="hyperparameter values must be finite"):
+        ours = run_screening_config(
+            x, y,
             self._cloned(
                 "sgd_ema_norm_d099", _make_wclip_ema_norm_learner,
-                {**ref_spec.hyperparameters, "clip_kappa": math.inf},
-            )
+                {
+                    **ref_spec.hyperparameters,
+                    "clip_kappa": float(np.finfo(np.float32).max),
+                },
+            ),
+            seed=5, config=SMALL,
+        )
+        ref = run_screening_config(x, y, ref_spec, seed=5, config=SMALL)
+        np.testing.assert_array_equal(ours.per_task_accuracy, ref.per_task_accuracy)
+        np.testing.assert_array_equal(ours.per_task_loss, ref.per_task_loss)
 
     def test_wclip_bounds_enforced_per_layer(self):
         """After any step every weight and bias obeys |w| <= kappa/sqrt(fan_in)
@@ -4312,7 +4330,7 @@ class TestComparisonArms:
             assert np.all(values >= -bound - 1e-7), n
 
     def test_fade_lambda_zero_reduces_to_sgd_base_bitwise(self, small_data):
-        """theta=0 and gamma0=-inf (lambda=0) pin the head to the plain SGD
+        """theta=0 and a min-finite gamma0 (lambda=0) pin the head to the plain SGD
         step, so the whole arm equals the wd=0 normalized-SGD base."""
         x, y = small_data
         base_hp = {**self.BASE, "weight_decay": 0.0}
@@ -4323,7 +4341,7 @@ class TestComparisonArms:
                 {
                     **base_hp,
                     "fade_alpha": 0.005,
-                    "fade_gamma0": -1.0e6,
+                    "fade_gamma0": -float(np.finfo(np.float32).max),
                     "fade_theta_lambda": 0.0,
                 },
             ),

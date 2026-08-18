@@ -36,6 +36,7 @@ from alberta_framework.reference_agent import (
 )
 from alberta_framework.reference_life import (
     ExactDispatchAdapter,
+    ExactDispatchConfig,
     HaltStage,
     LifePhase,
     RecoveryMode,
@@ -44,6 +45,7 @@ from alberta_framework.reference_life import (
     ReferenceLifeRunner,
     SwitchingEnvironmentExecution,
     SwitchingTwoStateReferenceEnvironment,
+    _require_prototype_lifecycle_id,
     build_prototype_switching_life,
 )
 from alberta_framework.streams.closed_loop import (
@@ -57,6 +59,26 @@ pytestmark = pytest.mark.unit
 
 _LIFECYCLE_ID = "prototype.0000000100000002"
 
+
+class _HostileHaltReason(str):
+    hook_calls = 0
+
+    def __bool__(self) -> bool:
+        type(self).hook_calls += 1
+        raise AssertionError("hostile halt-reason truth hook executed")
+
+    def __eq__(self, other: object) -> bool:
+        del other
+        type(self).hook_calls += 1
+        raise AssertionError("hostile halt-reason equality hook executed")
+
+    def __hash__(self) -> int:
+        type(self).hook_calls += 1
+        raise AssertionError("hostile halt-reason hash hook executed")
+
+    def __len__(self) -> int:
+        type(self).hook_calls += 1
+        raise AssertionError("hostile halt-reason length hook executed")
 
 def _agent_config() -> PrototypeAgentConfig:
     return PrototypeAgentConfig(
@@ -1495,3 +1517,14 @@ def test_abort_is_terminal_and_preserves_pending_execution() -> None:
     assert aborted.halt.recovery_mode is RecoveryMode.ABORT_ONLY
     with pytest.raises(DecisionOwnershipError, match="aborted"):
         runner.step(aborted)
+
+
+def test_reference_life_id_helpers_reject_hostile_strings_without_hooks() -> None:
+    _HostileHaltReason.hook_calls = 0
+    with pytest.raises(ValueError, match="authority_id"):
+        ExactDispatchConfig(authority_id=_HostileHaltReason("asi.hostile.authority"))
+    with pytest.raises(ValueError, match="lifecycle_id"):
+        _require_prototype_lifecycle_id(
+            _HostileHaltReason("prototype.0000000100000002")
+        )
+    assert _HostileHaltReason.hook_calls == 0
