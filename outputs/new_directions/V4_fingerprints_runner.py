@@ -4,7 +4,8 @@ Pre-registered in elizaOS/asi#1311. Development diagnostic, permanently
 nonpromoting (``development_screening_diagnostic``). Touches no pinned
 artifact, edits no registered source, consumes no promotion seed.
 
-Protocol is inherited from V1 (``V1_assignment.md``) unchanged: seeds {0,1,2}
+Protocol is inherited from V1 (``V1_assignment.md``) except for the deviations
+recorded in ``V4_fingerprints.md``: seeds {0,1,2}
 x boundaries {0,1,2}, post-shift checkpoints N in {50,200,500,2000}, reference
 statistics = annealed fast-EMA (decay 0.99, ``ema_normalize`` equations) over
 the 5,000-sample pre-shift task, relevance on reference variance, Hungarian
@@ -146,8 +147,10 @@ def f4_descriptors(
 
     act_corr = _coupling(samples.astype(np.float64), activations)
 
-    # F4b: |dL/dx_i| coupled to each hidden unit, using the protocol's own
-    # softmax cross-entropy on the post-prediction label.
+    # F4b: batch correlation of |dL/dx_i| with each hidden unit, using the
+    # protocol's own softmax cross-entropy on the post-prediction label.  The
+    # preregistration called this an EMA; that implementation deviation is
+    # recorded explicitly and the arm is void under its oracle gate.
     def per_example_input_grad(sample: Any, label: Any) -> Any:
         def loss(inp: Any) -> Any:
             logits, _, _, _, _ = screening._forward_with_activations(params, inp)  # noqa: SLF001
@@ -413,7 +416,6 @@ def main() -> int:
         schedule = build_schedule(jr.key(np.uint32(seed)), config, x.shape[0])
         for boundary in args.boundaries:
             params = train_reference_network(seed, boundary, x, y, schedule)
-            cells.extend(run_cell(seed, boundary, x, y, schedule, params))
 
             if not args.skip_controls and seed == args.seeds[0] and boundary == args.boundaries[0]:
                 controls["exact_statistic_oracle"] = run_cell(
@@ -422,6 +424,7 @@ def main() -> int:
                 controls["no_shift"] = run_cell(
                     seed, boundary, x, y, schedule, params, no_shift=True
                 )
+            cells.extend(run_cell(seed, boundary, x, y, schedule, params))
 
     # Pre-registered control gates decide which fingerprints carry a result at
     # all: a family that misses the oracle bar is mis-implemented, not
@@ -454,8 +457,15 @@ def main() -> int:
         }
 
     aggregates = aggregate(cells)
+    # A fingerprint that failed a preregistered correctness control has no
+    # licensed online result.  Preserve its raw diagnostic rows, but do not
+    # turn them into the protocol's secondary N* measurement.
     floors = {
-        f"{fingerprint}/{solver}": sample_floor(aggregates, fingerprint, solver)
+        f"{fingerprint}/{solver}": (
+            "void"
+            if verdict[fingerprint]["void"]
+            else sample_floor(aggregates, fingerprint, solver)
+        )
         for fingerprint in FINGERPRINTS
         for solver in SOLVERS
     }
@@ -473,10 +483,34 @@ def main() -> int:
         "aggregates": aggregates,
         "controls": controls,
         "control_verdict": verdict,
+        "deviations": [
+            (
+                "controls were computed after the first online cell in the shipped "
+                "execution rather than before all online rows"
+            ),
+            (
+                "the control implementation was changed from online-checkpoint to exact "
+                "full-dataset statistics after the first runner draft"
+            ),
+            (
+                "F3 reference correlation descriptors use batch statistics over the "
+                "5000 pre-shift examples; the inherited EMA statistics supply the "
+                "relevance mask, not the correlation descriptor"
+            ),
+            (
+                "F4b uses batch gradient-activation correlation rather than the "
+                "preregistered EMA and is void because its oracle gate failed"
+            ),
+        ],
         "protocol": {
             "data": "IPMNIST protocol MNIST train split (load_mnist_train)",
             "permutations": "build_schedule per-seed protocol permutations",
-            "reference": "annealed fast-EMA (decay 0.99) over 5000 samples",
+            "reference_relevance_statistics": (
+                "annealed fast-EMA mean/variance (decay 0.99) over 5000 samples"
+            ),
+            "fingerprint_reference_statistics": (
+                "batch descriptors over the 5000 pre-shift examples"
+            ),
             "post_shift": "fresh statistics from stream start",
             "reference_arm": REFERENCE_ARM,
             "seeds": list(args.seeds),
