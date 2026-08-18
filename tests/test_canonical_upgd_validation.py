@@ -692,7 +692,17 @@ def _legal_official_resources(**overrides: object) -> OfficialAdaUPGDResources:
         (_legal_alberta_resources, "profile", _HostileStringIdentity(ALBERTA_ADAUPGD_PROFILE)),
         (_legal_alberta_resources, "official_reference_parity", True),
         (_legal_official_resources, "profile", ALBERTA_ADAUPGD_PROFILE),
+        (
+            _legal_official_resources,
+            "profile",
+            _HostileStringIdentity(OFFICIAL_ADAUPGD_PROFILE),
+        ),
         (_legal_official_resources, "source_commit", "main"),
+        (
+            _legal_official_resources,
+            "source_commit",
+            _HostileStringIdentity(OFFICIAL_ADAUPGD_COMMIT),
+        ),
         (
             _legal_official_resources,
             "source_path",
