@@ -498,14 +498,98 @@ class LabelEMNISTRunResult:
         object.__setattr__(self, "learner", _require_nonempty_string("learner", self.learner))
         if type(self.hyperparameters) is not dict:
             raise TypeError("hyperparameters must be a dict")
+        normalized_hyperparameters: dict[str, float] = {}
+        for name, value in self.hyperparameters.items():
+            if type(name) is not str or not name:
+                raise TypeError("hyperparameters keys must be exact non-empty strings")
+            if type(value) not in (int, float) or not math.isfinite(value):
+                raise ValueError("hyperparameters values must be finite built-in numbers")
+            normalized_hyperparameters[name] = float(value)
+        object.__setattr__(self, "hyperparameters", normalized_hyperparameters)
         object.__setattr__(self, "seeds", _require_seed_identities(self.seeds, name="seeds"))
         if type(self.config) is not LabelEMNISTConfig:
             raise TypeError("config must be a LabelEMNISTConfig")
+        shape = (len(self.seeds), self.config.n_tasks)
+        for name in (
+            "per_task_accuracy",
+            "per_task_loss",
+            "per_task_plasticity",
+        ):
+            value = getattr(self, name)
+            if (
+                type(value) is not np.ndarray
+                or value.shape != shape
+                or value.dtype not in (np.dtype(np.float32), np.dtype(np.float64))
+            ):
+                raise ValueError(f"{name} must have the exact floating run-result shape")
+            if not np.isfinite(value).all():
+                raise ValueError(f"{name} must contain only finite values")
+        if type(self.average_online_accuracy) is not np.ndarray or (
+            self.average_online_accuracy.shape != (len(self.seeds),)
+            or self.average_online_accuracy.dtype
+            not in (np.dtype(np.float32), np.dtype(np.float64))
+        ):
+            raise ValueError("average_online_accuracy must have the exact float32 seed shape")
+        if not np.isfinite(self.average_online_accuracy).all():
+            raise ValueError("average_online_accuracy must contain only finite values")
+        if np.any((self.per_task_accuracy < 0.0) | (self.per_task_accuracy > 1.0)):
+            raise ValueError("per_task_accuracy must lie in [0, 1]")
+        if np.any(self.per_task_loss < 0.0):
+            raise ValueError("per_task_loss must be non-negative")
+        if np.any((self.per_task_plasticity < 0.0) | (self.per_task_plasticity > 1.0)):
+            raise ValueError("per_task_plasticity must lie in [0, 1]")
+        if np.any((self.average_online_accuracy < 0.0) | (self.average_online_accuracy > 1.0)):
+            raise ValueError("average_online_accuracy must lie in [0, 1]")
+        debug_values = (
+            self.per_step_accuracy,
+            self.initial_params,
+            self.label_permutations,
+            self.example_indices,
+        )
+        if any(value is None for value in debug_values) != all(
+            value is None for value in debug_values
+        ):
+            raise ValueError("debug result fields must be all present or all absent")
+        if self.per_step_accuracy is not None:
+            step_shape = (*shape, self.config.task_length)
+            if (
+                type(self.per_step_accuracy) is not np.ndarray
+                or self.per_step_accuracy.shape != step_shape
+                or self.per_step_accuracy.dtype
+                not in (np.dtype(np.float32), np.dtype(np.float64))
+                or not np.isfinite(self.per_step_accuracy).all()
+            ):
+                raise ValueError("per_step_accuracy must match the exact float32 step shape")
+            if self.label_permutations is None or self.example_indices is None:
+                raise ValueError("debug schedules must be present with per_step_accuracy")
+            if type(self.label_permutations) is not np.ndarray or (
+                self.label_permutations.shape
+                != (len(self.seeds), self.config.n_tasks, self.config.n_classes)
+                or self.label_permutations.dtype != np.int32
+            ):
+                raise ValueError("label_permutations must match the exact int32 schedule shape")
+            if type(self.example_indices) is not np.ndarray or (
+                self.example_indices.shape
+                != (len(self.seeds), self.config.n_tasks, self.config.task_length)
+                or self.example_indices.dtype != np.int32
+            ):
+                raise ValueError("example_indices must match the exact int32 schedule shape")
+            if type(self.initial_params) is not dict or not self.initial_params:
+                raise ValueError("initial_params must be one non-empty exact dictionary")
+            for name, array_value in self.initial_params.items():
+                if type(name) is not str or not name or type(array_value) is not np.ndarray:
+                    raise TypeError("initial_params must map exact strings to exact ndarrays")
+                if not np.issubdtype(array_value.dtype, np.floating) or not np.isfinite(
+                    array_value
+                ).all():
+                    raise ValueError("initial_params arrays must contain finite floating values")
         object.__setattr__(
             self,
             "wall_clock_seconds",
             _require_finite_real("wall_clock_seconds", self.wall_clock_seconds),
         )
+        if self.wall_clock_seconds < 0.0:
+            raise ValueError("wall_clock_seconds must be non-negative")
 
 
 def resolve_hyperparameters(

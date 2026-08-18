@@ -1948,6 +1948,13 @@ class MicroTaskConfig:
     def __post_init__(self) -> None:
         _require_nonempty_string(self.name, context="MicroTaskConfig.name")
         _require_nonempty_string(self.kind, context="MicroTaskConfig.kind")
+        if type(self.kind) is not str or self.kind not in (
+            "input_permutation",
+            "label_permutation",
+            "affine_drift",
+            "permutation_affine",
+        ):
+            raise ValueError("MicroTaskConfig.kind is not a supported stream transformation")
         if type(self.role) is not str or self.role not in ("search", "holdout"):
             raise ValueError("MicroTaskConfig.role must be 'search' or 'holdout'")
         for field_name in (
@@ -1961,8 +1968,18 @@ class MicroTaskConfig:
             val = getattr(self, field_name)
             if type(val) is not int or val <= 0:
                 raise ValueError(f"MicroTaskConfig.{field_name} must be a positive integer")
+        if self.input_dim > 4_096 or self.n_classes > 65_535:
+            raise ValueError("MicroTaskConfig feature/class dimensions exceed the bounded domain")
+        if self.n_tasks > 4_096 or self.task_length > 10_000_000:
+            raise ValueError("MicroTaskConfig task schedule exceeds the bounded domain")
+        if self.n_tasks * self.task_length > 10_000_000:
+            raise ValueError("MicroTaskConfig materialized stream exceeds the step budget")
+        if self.hidden1 > 4_096 or self.hidden2 > 4_096:
+            raise ValueError("MicroTaskConfig hidden width exceeds the bounded domain")
         if type(self.crop) is not bool:
             raise ValueError("MicroTaskConfig.crop must be a boolean")
+        if self.input_dim != (49 if self.crop else 64) or self.n_classes != 10:
+            raise ValueError("MicroTaskConfig dimensions must match the digits source contract")
 
 
 MICRO_SUITE: dict[str, MicroTaskConfig] = {
@@ -2013,17 +2030,36 @@ class MicroStream:
     seed: int
 
     def __post_init__(self) -> None:
-        if not isinstance(self.xs, np.ndarray):
+        if type(self.xs) is not np.ndarray:
             raise TypeError("MicroStream.xs must be a numpy ndarray")
-        if not isinstance(self.ys, np.ndarray):
+        if type(self.ys) is not np.ndarray:
             raise TypeError("MicroStream.ys must be a numpy ndarray")
-        if not isinstance(self.example_indices, np.ndarray):
+        if type(self.example_indices) is not np.ndarray:
             raise TypeError("MicroStream.example_indices must be a numpy ndarray")
         if type(self.config) is not MicroTaskConfig:
             raise TypeError("MicroStream.config must be a MicroTaskConfig")
+        count = self.config.n_tasks * self.config.task_length
+        if self.xs.shape != (count, self.config.input_dim) or self.xs.dtype != np.float32:
+            raise ValueError("MicroStream.xs must match the exact float32 stream shape")
+        if self.ys.shape != (count,) or self.ys.dtype != np.int32:
+            raise ValueError("MicroStream.ys must match the exact int32 stream shape")
+        if self.example_indices.shape != (count,) or self.example_indices.dtype != np.int32:
+            raise ValueError(
+                "MicroStream.example_indices must match the exact int32 stream shape"
+            )
+        if not np.isfinite(self.xs).all():
+            raise ValueError("MicroStream.xs must contain only finite values")
+        if np.any((self.ys < 0) | (self.ys >= self.config.n_classes)):
+            raise ValueError("MicroStream.ys contains a label outside the configured domain")
+        if np.any(self.example_indices < 0):
+            raise ValueError("MicroStream.example_indices must be non-negative")
         object.__setattr__(
             self, "seed", require_jax_seed(self.seed, name="MicroStream.seed")
         )
+        for name in ("xs", "ys", "example_indices"):
+            detached = getattr(self, name).copy()
+            detached.flags.writeable = False
+            object.__setattr__(self, name, detached)
 
 
 @lru_cache(maxsize=2)
