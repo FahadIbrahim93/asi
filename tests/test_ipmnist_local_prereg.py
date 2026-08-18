@@ -1149,53 +1149,20 @@ def _write_combined_summary(root: Path) -> Path:
 
 
 def _validate(root: Path, protocol_key: str) -> dict[str, Any]:
-    if protocol_key != "issue184":
-        return cast(
-            dict[str, Any],
-            _validate_result_bundle(
-                protocol_key=protocol_key,
-                root=root,
-                repository_identity=_repository_identity(),
-                runner_receipt=_runner_receipt(),
-                verify_cache_file=False,
-            ),
-        )
-
-    import alberta_framework.benchmarks.ipmnist_screening as screening_module
-
-    protocol = _PROTOCOLS[protocol_key]
-    incumbent = screening_module.screening_spec(protocol.control)
-    retired = replace(
-        incumbent,
-        name=protocol.candidate,
-        hyperparameters={
-            **incumbent.hyperparameters,
-            "rls_reset_frac": 2.0,
-        },
+    return cast(
+        dict[str, Any],
+        _validate_result_bundle(
+            protocol_key=protocol_key,
+            root=root,
+            repository_identity=_repository_identity(),
+            runner_receipt=_runner_receipt(),
+            verify_cache_file=False,
+        ),
     )
-    historical_registry = MappingProxyType(
-        {**screening_module.SCREENING_REGISTRY, protocol.candidate: retired}
-    )
-    with pytest.MonkeyPatch.context() as registry_patch:
-        registry_patch.setattr(
-            screening_module,
-            "SCREENING_REGISTRY",
-            historical_registry,
-        )
-        return cast(
-            dict[str, Any],
-            _validate_result_bundle(
-                protocol_key=protocol_key,
-                root=root,
-                repository_identity=_repository_identity(),
-                runner_receipt=_runner_receipt(),
-                verify_cache_file=False,
-            ),
-        )
 
 
-def _historical_issue184_registry() -> tuple[Any, MappingProxyType[str, Any]]:
-    """Reconstruct the concluded arm only inside historical validation tests."""
+def _historical_issue184_registry() -> dict[str, Any]:
+    """Build the explicit registry used to reconstruct a historical summary."""
     import alberta_framework.benchmarks.ipmnist_screening as screening_module
 
     protocol = _PROTOCOLS["issue184"]
@@ -1209,32 +1176,22 @@ def _historical_issue184_registry() -> tuple[Any, MappingProxyType[str, Any]]:
             "rls_reset_frac": 2.0,
         },
     )
-    historical_registry = MappingProxyType(
-        {**screening_module.SCREENING_REGISTRY, protocol.candidate: retired}
-    )
-    return screening_module, historical_registry
+    return {**screening_module.SCREENING_REGISTRY, protocol.candidate: retired}
 
 
 def _publish_historical_issue184(root: Path) -> dict[str, Any]:
     """Exercise publication without restoring the retired arm to the live registry."""
-    screening_module, historical_registry = _historical_issue184_registry()
     protocol = _PROTOCOLS["issue184"]
-    with pytest.MonkeyPatch.context() as registry_patch:
-        registry_patch.setattr(
-            screening_module,
-            "SCREENING_REGISTRY",
-            historical_registry,
-        )
-        return cast(
-            dict[str, Any],
-            _validate_and_publish_result(
-                protocol_key=protocol.key,
-                root=root,
-                repository_identity=_repository_identity(),
-                runner_receipt=_runner_receipt(),
-                verify_cache_file=False,
-            ),
-        )
+    return cast(
+        dict[str, Any],
+        _validate_and_publish_result(
+            protocol_key=protocol.key,
+            root=root,
+            repository_identity=_repository_identity(),
+            runner_receipt=_runner_receipt(),
+            verify_cache_file=False,
+        ),
+    )
 
 
 @pytest.mark.parametrize(
@@ -1455,18 +1412,12 @@ def test_result_validation_rejects_shards_created_before_cache_receipt(
     prior = Path.cwd()
     os.chdir(tmp_path)
     try:
-        screening_module, historical_registry = _historical_issue184_registry()
-        with pytest.MonkeyPatch.context() as registry_patch:
-            registry_patch.setattr(
-                screening_module,
-                "SCREENING_REGISTRY",
-                historical_registry,
-            )
-            summary = merge_shards(
-                [path.relative_to(tmp_path) for path in paths],
-                control_name="rls_head_resid_l1_preset005",
-                slope_window=15,
-            )
+        summary = merge_shards(
+            [path.relative_to(tmp_path) for path in paths],
+            control_name="rls_head_resid_l1_preset005",
+            slope_window=15,
+            spec_registry=_historical_issue184_registry(),
+        )
     finally:
         os.chdir(prior)
     (namespace / "screen_60/summary.json").write_text(

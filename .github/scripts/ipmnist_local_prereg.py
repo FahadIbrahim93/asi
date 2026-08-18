@@ -27,7 +27,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import asdict, dataclass, is_dataclass
+from dataclasses import asdict, dataclass, is_dataclass, replace
 from pathlib import Path
 from types import ModuleType
 from typing import Any, Final, cast
@@ -2153,6 +2153,22 @@ def _validate_collection(
 ) -> dict[str, Any]:
     import alberta_framework.benchmarks.ipmnist_screening as screening
 
+    spec_registry = dict(screening.SCREENING_REGISTRY)
+    if protocol.key == "issue184":
+        # Issue 184 is concluded and deliberately absent from the live runnable
+        # registry. Historical validation must nevertheless retain its exact
+        # arm identity and hyperparameters instead of mutating the live global
+        # registry or failing to validate its immutable result bundle.
+        incumbent = screening.screening_spec(protocol.control)
+        spec_registry[protocol.candidate] = replace(
+            incumbent,
+            name=protocol.candidate,
+            hyperparameters={
+                **incumbent.hyperparameters,
+                "rls_reset_frac": 2.0,
+            },
+        )
+
     expected_pairs = {
         (arm, seed)
         for arm in (protocol.control, protocol.candidate)
@@ -2163,7 +2179,9 @@ def _validate_collection(
     }
     if len(paths) != len(expected_pairs) or {path.name for path in paths} != expected_names:
         raise ValueError("shard filename coverage is not exact")
-    shards = [screening.load_shard(path) for path in paths]
+    shards = [
+        screening.load_shard(path, spec_registry=spec_registry) for path in paths
+    ]
     initial_manifest = _expected_manifest(paths, shards, root=root)
     observed_pairs: set[tuple[str, int]] = set()
     first_dataset: Mapping[str, Any] | None = None
@@ -2233,6 +2251,7 @@ def _validate_collection(
         paths,
         control_name=protocol.control,
         slope_window=15,
+        spec_registry=spec_registry,
     )
     final_manifest = _expected_manifest(paths, shards, root=root)
     if _canonical_json(final_manifest) != _canonical_json(initial_manifest):
