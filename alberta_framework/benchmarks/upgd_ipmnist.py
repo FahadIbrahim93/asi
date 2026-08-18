@@ -123,6 +123,15 @@ from alberta_framework.core.update_safety import (
     select_transaction,
 )
 
+
+def _require_exact_str(name: object, value: object) -> str:
+    if type(name) is not str:
+        raise ValueError("name must be an exact string")
+    if type(value) is not str:
+        raise ValueError(f"{name} must be an exact string")
+    return value
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -769,11 +778,12 @@ _LEARNER_DEFAULT_HYPERPARAMETERS: dict[str, dict[str, float]] = {
 }
 
 
-def _validated_hyperparameter(name: str, value: object) -> float:
+def _validated_hyperparameter(name: object, value: object) -> float:
     """Validate one JSON override in its exact host and float32 execution domains."""
+    host_name = _require_exact_str("name", name)
     if type(value) not in (int, float):
-        raise ValueError(f"hyperparameter {name!r} must be a finite JSON number")
-    label = f"hyperparameter {name!r}"
+        raise ValueError(f"hyperparameter '{host_name}' must be a finite JSON number")
+    label = f"hyperparameter '{host_name}'"
     if name in {"step_size", "eps"}:
         return validated_float32_scalar(label, value, positive=True)
     if name in {"utility_decay", "beta1", "beta2"}:
@@ -810,31 +820,118 @@ class IPMNISTRunResult:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "learner", _require_nonempty_string("learner", self.learner))
+        if type(self.hyperparameters) is not dict:
+            raise TypeError("hyperparameters must be a dict")
+        normalized_hyperparameters: dict[str, float] = {}
+        for name, value in self.hyperparameters.items():
+            if type(name) is not str or not name:
+                raise TypeError("hyperparameters keys must be exact non-empty strings")
+            if type(value) not in (int, float) or not math.isfinite(value):
+                raise ValueError("hyperparameters values must be finite built-in numbers")
+            normalized_hyperparameters[name] = float(value)
+        object.__setattr__(self, "hyperparameters", normalized_hyperparameters)
         object.__setattr__(self, "seeds", _require_seed_identities(self.seeds, name="seeds"))
+        if type(self.config) is not IPMNISTConfig:
+            raise TypeError("config must be an IPMNISTConfig")
+        shape = (len(self.seeds), self.config.n_tasks)
+        for name in (
+            "per_task_accuracy",
+            "per_task_loss",
+            "per_task_plasticity",
+        ):
+            value = getattr(self, name)
+            if (
+                type(value) is not np.ndarray
+                or value.shape != shape
+                or value.dtype not in (np.dtype(np.float32), np.dtype(np.float64))
+            ):
+                raise ValueError(f"{name} must have the exact floating run-result shape")
+            if not np.isfinite(value).all():
+                raise ValueError(f"{name} must contain only finite values")
+        if type(self.average_online_accuracy) is not np.ndarray or (
+            self.average_online_accuracy.shape != (len(self.seeds),)
+            or self.average_online_accuracy.dtype
+            not in (np.dtype(np.float32), np.dtype(np.float64))
+        ):
+            raise ValueError("average_online_accuracy must have the exact float32 seed shape")
+        if not np.isfinite(self.average_online_accuracy).all():
+            raise ValueError("average_online_accuracy must contain only finite values")
+        if np.any((self.per_task_accuracy < 0.0) | (self.per_task_accuracy > 1.0)):
+            raise ValueError("per_task_accuracy must lie in [0, 1]")
+        if np.any(self.per_task_loss < 0.0):
+            raise ValueError("per_task_loss must be non-negative")
+        if np.any((self.per_task_plasticity < 0.0) | (self.per_task_plasticity > 1.0)):
+            raise ValueError("per_task_plasticity must lie in [0, 1]")
+        if np.any((self.average_online_accuracy < 0.0) | (self.average_online_accuracy > 1.0)):
+            raise ValueError("average_online_accuracy must lie in [0, 1]")
+        debug_values = (
+            self.per_step_accuracy,
+            self.initial_params,
+            self.permutations,
+            self.example_indices,
+        )
+        if any(value is None for value in debug_values) != all(
+            value is None for value in debug_values
+        ):
+            raise ValueError("debug result fields must be all present or all absent")
+        if self.per_step_accuracy is not None:
+            step_shape = (*shape, self.config.task_length)
+            if (
+                type(self.per_step_accuracy) is not np.ndarray
+                or self.per_step_accuracy.shape != step_shape
+                or self.per_step_accuracy.dtype
+                not in (np.dtype(np.float32), np.dtype(np.float64))
+                or not np.isfinite(self.per_step_accuracy).all()
+            ):
+                raise ValueError("per_step_accuracy must match the exact float32 step shape")
+            assert self.permutations is not None
+            assert self.example_indices is not None
+            if type(self.permutations) is not np.ndarray or self.permutations.shape != (
+                len(self.seeds), self.config.n_tasks, self.config.input_dim
+            ) or self.permutations.dtype != np.int32:
+                raise ValueError("permutations must match the exact int32 schedule shape")
+            if type(self.example_indices) is not np.ndarray or self.example_indices.shape != (
+                len(self.seeds), self.config.n_tasks, self.config.task_length
+            ) or self.example_indices.dtype != np.int32:
+                raise ValueError("example_indices must match the exact int32 schedule shape")
+            if type(self.initial_params) is not dict or not self.initial_params:
+                raise ValueError("initial_params must be one non-empty exact dictionary")
+            for name, array_value in self.initial_params.items():
+                if type(name) is not str or not name or type(array_value) is not np.ndarray:
+                    raise TypeError("initial_params must map exact strings to exact ndarrays")
+                if not np.issubdtype(array_value.dtype, np.floating) or not np.isfinite(
+                    array_value
+                ).all():
+                    raise ValueError("initial_params arrays must contain finite floating values")
         object.__setattr__(
             self,
             "wall_clock_seconds",
             _require_finite_real("wall_clock_seconds", self.wall_clock_seconds),
         )
+        if self.wall_clock_seconds < 0.0:
+            raise ValueError("wall_clock_seconds must be non-negative")
         object.__setattr__(
             self,
             "noise_mode",
             _require_nonempty_string("noise_mode", self.noise_mode),
         )
+        if self.noise_mode not in ("step", "pool"):
+            raise ValueError("noise_mode must be 'step' or 'pool'")
 
 
 def resolve_hyperparameters(
-    learner: str, overrides: dict[str, float] | None = None
+    learner: object, overrides: dict[str, float] | None = None
 ) -> dict[str, float]:
     """Merge overrides into the learner's published defaults, rejecting unknown keys."""
-    if learner not in _LEARNER_DEFAULT_HYPERPARAMETERS:
-        raise ValueError(f"unknown learner {learner!r}; expected one of "
+    host_learner = _require_exact_str("learner", learner)
+    if host_learner not in _LEARNER_DEFAULT_HYPERPARAMETERS:
+        raise ValueError(f"unknown learner '{host_learner}'; expected one of "
                          f"{sorted(_LEARNER_DEFAULT_HYPERPARAMETERS)}")
-    merged = dict(_LEARNER_DEFAULT_HYPERPARAMETERS[learner])
+    merged = dict(_LEARNER_DEFAULT_HYPERPARAMETERS[host_learner])
     if overrides:
         unknown = set(overrides) - set(merged)
         if unknown:
-            raise ValueError(f"unknown hyperparameters for {learner}: {sorted(unknown)}")
+            raise ValueError(f"unknown hyperparameters for '{host_learner}': {sorted(unknown)}")
         validated: dict[str, float] = {}
         for name, value in overrides.items():
             validated[name] = _validated_hyperparameter(name, value)
@@ -893,7 +990,8 @@ def run_ipmnist(
     if config is None:
         config = IPMNISTConfig()
     if noise_mode not in ("step", "pool"):
-        raise ValueError(f"noise_mode must be 'step' or 'pool', got {noise_mode!r}")
+        host_noise = _require_exact_str("noise_mode", noise_mode)
+        raise ValueError(f"noise_mode must be 'step' or 'pool', got '{host_noise}'")
     if noise_mode == "pool":
         noise_pool_steps = _require_int32(
             "noise_pool_steps", noise_pool_steps, minimum=2
@@ -1196,7 +1294,8 @@ def _validate_result_set(
         raise ValueError("at least one learner result is required")
     for learner, result in results.items():
         if learner != result.learner:
-            raise ValueError(f"result key {learner!r} does not match payload learner")
+            host_learner3 = _require_exact_str("learner", learner)
+            raise ValueError(f"result key '{host_learner3}' does not match payload learner")
         if result.config != config:
             raise ValueError(f"{learner}: result config does not match artifact config")
         require_unique_jax_seeds(result.seeds, name=f"{learner} seeds")
@@ -1338,9 +1437,10 @@ def partial_payload(result: IPMNISTRunResult) -> dict[str, Any]:
     if len(seeds) != 1:
         raise ValueError("a v2 partial must contain exactly one seed")
     if result.noise_mode != "step":
+        host_nm = _require_exact_str("noise_mode", result.noise_mode)
         raise ValueError(
             "only exact per-step noise results may become v2 shards; got "
-            f"noise_mode={result.noise_mode!r} (screening-only approximation)"
+            f"noise_mode='{host_nm}' (screening-only approximation)"
         )
     return {
         "schema": PARTIAL_SCHEMA,
@@ -1370,7 +1470,8 @@ def _decode_strict_json_object(raw: bytes, *, path: Path) -> dict[str, Any]:
         parsed: dict[str, object] = {}
         for key, value in pairs:
             if key in parsed:
-                raise ValueError(f"duplicate JSON key: {key!r}")
+                host_key = _require_exact_str("key", key)
+                raise ValueError(f"duplicate JSON key: '{host_key}'")
             parsed[key] = value
         return parsed
 
@@ -1666,7 +1767,8 @@ def main_v2_compat(argv: Sequence[str] | None = None) -> None:
     learners = [name.strip() for name in args.learners.split(",") if name.strip()]
     for name in learners:
         if name not in _LEARNER_FACTORIES:
-            raise SystemExit(f"unknown learner {name!r}")
+            host_name2 = _require_exact_str("name", name)
+            raise SystemExit(f"unknown learner '{host_name2}'")
 
     if args.seed_list is not None:
         raw_seeds = [int(part) for part in args.seed_list.split(",") if part.strip()]

@@ -96,10 +96,19 @@ def _integer_action_ids(
 ) -> tuple[Array, Bool[Array, " *shape"]]:
     """Validate original-width action IDs before exposing safe int32 indices."""
 
-    if isinstance(actions, jax.core.Tracer):
-        raw_shape = tuple(actions.shape)
-        raw_dtype = np.dtype(actions.dtype)
+    actual_type = type(actions)
+    if issubclass(actual_type, jax.core.Tracer):
+        traced_actions = cast(Any, actions)
+        raw_shape = tuple(traced_actions.shape)
+        raw_dtype = np.dtype(traced_actions.dtype)
     else:
+        trusted_host = (
+            actual_type is np.ndarray
+            or actual_type in _ACTUAL_INT_TYPES
+            or issubclass(actual_type, jax.Array)
+        )
+        if not trusted_host:
+            raise TypeError("actions must be a trusted array")
         host_actions = np.asarray(actions)
         raw_shape = tuple(host_actions.shape)
         raw_dtype = host_actions.dtype

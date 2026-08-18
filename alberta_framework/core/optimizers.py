@@ -45,6 +45,13 @@ from alberta_framework.core.update_safety import (
 )
 
 
+def _require_exact_str(name: object, value: object) -> str:
+    if type(name) is not str:
+        raise ValueError("name must be an exact string")
+    if type(value) is not str:
+        raise ValueError(f"{name} must be an exact string")
+    return value
+
 def _skip_zero_scale(scale: Array, value: Array) -> Array:
     """Return 0 when ``scale`` is 0 so IEEE ``0 * inf`` does not become NaN."""
     return jnp.where(scale == 0.0, jnp.zeros_like(value), scale * value)
@@ -88,6 +95,12 @@ def _require_float32_state(name: str, scalar_count: int) -> None:
         raise ValueError(f"{name} scalar count must fit signed int32")
     if 4 * scalar_count > _INT32_MAX:
         raise ValueError(f"{name} byte count must fit signed int32")
+
+
+def _require_float32_update_working_set(name: str, scalar_count: int) -> None:
+    """Reject simultaneous update tensors this optimizer cannot name."""
+
+    _require_float32_state(name, scalar_count)
 
 
 def _shape_size(shape: tuple[int, ...]) -> int:
@@ -706,7 +719,7 @@ class IDBD(Optimizer[IDBDState]):
         self,
         initial_step_size: float = 0.01,
         meta_step_size: float = 0.01,
-        h_decay_mode: str = "prediction_grads",
+        h_decay_mode: object = "prediction_grads",
     ):
         """Initialize IDBD optimizer.
 
@@ -728,16 +741,17 @@ class IDBD(Optimizer[IDBDState]):
                 declared domain (``initial_step_size`` positive;
                 ``meta_step_size`` nonnegative).
         """
-        if h_decay_mode not in ("prediction_grads", "loss_grads"):
+        host_mode = _require_exact_str("h_decay_mode", h_decay_mode)
+        if host_mode not in ("prediction_grads", "loss_grads"):
             raise ValueError(
-                f"Invalid h_decay_mode: {h_decay_mode!r}. "
+                f"Invalid h_decay_mode: '{host_mode}'. "
                 "Must be 'prediction_grads' or 'loss_grads'."
             )
         self._initial_step_size = _validated_idbd_step_size(
             "initial_step_size", initial_step_size, positive=True
         )
         self._meta_step_size = _validated_idbd_step_size("meta_step_size", meta_step_size)
-        self._h_decay_mode = h_decay_mode
+        self._h_decay_mode = host_mode
 
     def to_config(self) -> dict[str, Any]:
         """Serialize configuration to dict."""
@@ -761,6 +775,11 @@ class IDBD(Optimizer[IDBDState]):
         """
         feature_dim = _require_int32("feature_dim", feature_dim, minimum=1)
         _require_float32_state("IDBD state", 2 * feature_dim + 3)
+        # Live during linear update: observation, traces, log_step_sizes,
+        # correlation, meta_delta, new_log, new_alphas, weight_delta, new_traces.
+        _require_float32_update_working_set(
+            "IDBD update working set", 9 * feature_dim + 8
+        )
         return IDBDState(
             log_step_sizes=jnp.full(
                 feature_dim, jnp.log(self._initial_step_size), dtype=jnp.float32
@@ -781,7 +800,9 @@ class IDBD(Optimizer[IDBDState]):
             IDBDParamState with arrays matching the given shape
         """
         shape = _require_shape(shape)
-        _require_float32_state("IDBD parameter state", 2 * _shape_size(shape) + 1)
+        n = _shape_size(shape)
+        _require_float32_state("IDBD parameter state", 2 * n + 1)
+        _require_float32_update_working_set("IDBD update working set", 9 * n + 8)
         return IDBDParamState(
             log_step_sizes=jnp.full(shape, jnp.log(self._initial_step_size), dtype=jnp.float32),
             traces=jnp.zeros(shape, dtype=jnp.float32),
@@ -1104,6 +1125,12 @@ class Autostep(Optimizer[AutostepState]):
         """
         feature_dim = _require_int32("feature_dim", feature_dim, minimum=1)
         _require_float32_state("Autostep state", 3 * feature_dim + 5)
+        # Live during Table-1 update: observation, x^2, step_sizes, traces,
+        # normalizers, meta_gradient, v_update, new_normalizers, new_step_sizes,
+        # and weight_delta.
+        _require_float32_update_working_set(
+            "Autostep update working set", 10 * feature_dim + 8
+        )
         return AutostepState(
             step_sizes=jnp.full(feature_dim, self._initial_step_size, dtype=jnp.float32),
             traces=jnp.zeros(feature_dim, dtype=jnp.float32),
@@ -1125,7 +1152,9 @@ class Autostep(Optimizer[AutostepState]):
             AutostepParamState with arrays matching the given shape
         """
         shape = _require_shape(shape)
-        _require_float32_state("Autostep parameter state", 3 * _shape_size(shape) + 2)
+        n = _shape_size(shape)
+        _require_float32_state("Autostep parameter state", 3 * n + 2)
+        _require_float32_update_working_set("Autostep update working set", 10 * n + 8)
         return AutostepParamState(
             step_sizes=jnp.full(shape, self._initial_step_size, dtype=jnp.float32),
             traces=jnp.zeros(shape, dtype=jnp.float32),
@@ -1491,6 +1520,9 @@ class AutostepGTDLambda(Optimizer[AutostepGTDLambdaState]):
         """Initialize optimizer state."""
         feature_dim = _require_int32("feature_dim", feature_dim, minimum=1)
         _require_float32_state("AutostepGTDLambda state", 4 * feature_dim + 7)
+        _require_float32_update_working_set(
+            "AutostepGTDLambda update working set", 11 * feature_dim + 8
+        )
         base_state = self._base.init(feature_dim)
         return AutostepGTDLambdaState(
             step_sizes=base_state.step_sizes,
@@ -1636,6 +1668,7 @@ class ObGD(Optimizer[ObGDState]):
         """
         feature_dim = _require_int32("feature_dim", feature_dim, minimum=1)
         _require_float32_state("ObGD state", feature_dim + 5)
+        _require_float32_update_working_set("ObGD update working set", 5 * feature_dim + 8)
         return ObGDState(
             step_size=jnp.array(self._step_size, dtype=jnp.float32),
             kappa=jnp.array(self._kappa, dtype=jnp.float32),
@@ -1865,6 +1898,9 @@ class TDIDBD(TDOptimizer[TDIDBDState]):
         """
         feature_dim = _require_int32("feature_dim", feature_dim, minimum=1)
         _require_float32_state("TDIDBD state", 3 * feature_dim + 5)
+        _require_float32_update_working_set(
+            "TDIDBD update working set", 10 * feature_dim + 8
+        )
         return TDIDBDState(
             log_step_sizes=jnp.full(
                 feature_dim, jnp.log(self._initial_step_size), dtype=jnp.float32
@@ -2079,6 +2115,9 @@ class AutoTDIDBD(TDOptimizer[AutoTDIDBDState]):
         """
         feature_dim = _require_int32("feature_dim", feature_dim, minimum=1)
         _require_float32_state("AutoTDIDBD state", 4 * feature_dim + 7)
+        _require_float32_update_working_set(
+            "AutoTDIDBD update working set", 11 * feature_dim + 8
+        )
         return AutoTDIDBDState(
             log_step_sizes=jnp.full(
                 feature_dim, jnp.log(self._initial_step_size), dtype=jnp.float32
@@ -2331,9 +2370,10 @@ def optimizer_from_config(config: dict[str, Any]) -> Optimizer[Any]:
     _ensure_registry_extras()
     config = dict(config)
     type_name = config.pop("type")
-    cls = _OPTIMIZER_REGISTRY.get(type_name)
+    host_type = _require_exact_str("type_name", type_name)
+    cls = _OPTIMIZER_REGISTRY.get(host_type)
     if cls is None:
-        raise ValueError(f"Unknown optimizer type: {type_name!r}")
+        raise ValueError(f"Unknown optimizer type: '{host_type}'")
     result: Optimizer[Any] = cls(**config)
     return result
 
@@ -2352,8 +2392,9 @@ def bounder_from_config(config: dict[str, Any]) -> Bounder:
     """
     config = dict(config)
     type_name = config.pop("type")
-    cls = _BOUNDER_REGISTRY.get(type_name)
+    host_type = _require_exact_str("type_name", type_name)
+    cls = _BOUNDER_REGISTRY.get(host_type)
     if cls is None:
-        raise ValueError(f"Unknown bounder type: {type_name!r}")
+        raise ValueError(f"Unknown bounder type: '{host_type}'")
     result: Bounder = cls(**config)
     return result

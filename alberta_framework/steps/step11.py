@@ -33,6 +33,7 @@ from fractions import Fraction
 from numbers import Integral
 from typing import Any, cast
 
+import jax
 import jax.numpy as jnp
 import jax.random as jr
 import numpy as np
@@ -137,11 +138,38 @@ class Step11OaKConfig:
     @classmethod
     def from_config(cls, payload: dict[str, Any]) -> Step11OaKConfig:
         """Reconstruct from :meth:`to_config` output."""
-        data = dict(payload)
-        data.pop("type", None)
-        specs_raw = data.pop("subtask_specs", [])
-        specs = tuple(SubtaskSpec(**s) for s in specs_raw)
-        return cls(subtask_specs=specs, **data)
+        if cls is not Step11OaKConfig:
+            raise ValueError("cls must be Step11OaKConfig")
+        if type(payload) is not dict:
+            raise ValueError("payload must be an actual dict")
+        if any(type(key) is not str for key in payload):
+            raise ValueError("payload keys must be exact strings")
+        if payload.keys() != _STEP11_CONFIG_FIELDS:
+            raise ValueError("payload must contain the exact Step11OaKConfig fields")
+        if type(payload["type"]) is not str or payload["type"] != "Step11OaKConfig":
+            raise ValueError("payload type must be Step11OaKConfig")
+        specs_raw = payload["subtask_specs"]
+        if type(specs_raw) is not list:
+            raise ValueError("subtask_specs must be an actual list")
+        if len(specs_raw) > _MAX_SUBTASK_SPECS:
+            raise ValueError(
+                f"subtask_specs must contain at most {_MAX_SUBTASK_SPECS} elements"
+            )
+        specs: list[SubtaskSpec] = []
+        for raw in specs_raw:
+            if type(raw) is not dict:
+                raise ValueError("subtask_specs entries must be actual dicts")
+            if any(type(key) is not str for key in raw):
+                raise ValueError("subtask_specs entry keys must be exact strings")
+            if raw.keys() != _SUBTASK_SPEC_FIELDS:
+                raise ValueError("subtask_specs entries must contain the exact fields")
+            specs.append(SubtaskSpec(**raw))
+        data = {
+            key: value
+            for key, value in payload.items()
+            if key not in {"type", "subtask_specs"}
+        }
+        return cls(subtask_specs=tuple(specs), **data)
 
     def to_oak_config(self) -> OaKConfig:
         """Convert to the core :class:`OaKConfig`."""
@@ -170,6 +198,10 @@ class Step11OaKConfig:
 
 
 _INT32_MAX = 2**31 - 1
+_MAX_SUBTASK_SPECS = 4_096
+_MAX_PLANNING_BACKUPS_PER_STEP = 4_096
+_STEP11_CONFIG_FIELDS = frozenset({"type", *Step11OaKConfig.__dataclass_fields__})
+_SUBTASK_SPEC_FIELDS = frozenset(SubtaskSpec.__dataclass_fields__)
 _ACTUAL_INT_TYPES = (
     int,
     np.int8,
@@ -267,7 +299,108 @@ def _require_bool(name: str, value: object) -> bool:
     return value
 
 
+def _trusted_array(
+    name: str,
+    value: object,
+    *,
+    shape: tuple[int, ...],
+    dtype: Any,
+) -> Array:
+    """Validate static array metadata without dispatching on hostile objects."""
+    if not _has_trusted_array_type(value):
+        raise TypeError(f"{name} must be a trusted array")
+    trusted = cast(Array, value)
+    try:
+        actual_shape = tuple(trusted.shape)
+        actual_dtype = jnp.dtype(trusted.dtype)
+    except (AttributeError, TypeError, ValueError) as error:
+        raise TypeError(f"{name} must expose trusted shape and dtype metadata") from error
+    if actual_shape != shape:
+        raise ValueError(f"{name} must have shape {shape}")
+    if actual_dtype != jnp.dtype(dtype):
+        raise TypeError(f"{name} must have dtype {jnp.dtype(dtype)}")
+    return trusted
+
+
+def _has_trusted_array_type(value: object) -> bool:
+    actual_type = type(value)
+    return (
+        actual_type is np.ndarray
+        or issubclass(actual_type, jax.Array)
+        or issubclass(actual_type, jax.core.Tracer)
+    )
+
+
+def _require_typed_key(name: str, value: object) -> Array:
+    actual_type = type(value)
+    if not (issubclass(actual_type, jax.Array) or issubclass(actual_type, jax.core.Tracer)):
+        raise TypeError(f"{name} must be a scalar typed JAX PRNG key")
+    key = cast(Array, value)
+    try:
+        shape = tuple(key.shape)
+        words = jr.key_data(key)
+        implementation = str(jr.key_impl(key))
+    except (AttributeError, TypeError, ValueError) as error:
+        raise TypeError(f"{name} must be a scalar typed JAX PRNG key") from error
+    if shape != () or words.shape != (2,) or words.dtype != jnp.uint32:
+        raise TypeError(f"{name} must be a scalar typed JAX PRNG key")
+    if implementation != "threefry2x32":
+        raise ValueError(f"{name} must use Threefry2x32")
+    return key
+
+
+def _require_agent(agent: object) -> OaKAgent:
+    if type(agent) is not OaKAgent:
+        raise TypeError("agent must be an actual OaKAgent")
+    return agent
+
+
+def _require_state(state: object) -> OaKState:
+    if type(state) is not OaKState:
+        raise TypeError("state must be an actual OaKState")
+    return state
+
+
+def _checked_product(name: str, *factors: int) -> int:
+    product = 1
+    for factor in factors:
+        if factor < 0 or (factor != 0 and product > _INT32_MAX // factor):
+            raise ValueError(f"derived {name} must fit signed int32")
+        product *= factor
+    return product
+
+
+def _checked_sum(name: str, *terms: int) -> int:
+    total = 0
+    for term in terms:
+        if term < 0 or term > _INT32_MAX - total:
+            raise ValueError(f"derived {name} must fit signed int32")
+        total += term
+    return total
+
+
+def _preflight_step11_smoke_resources(config: Step11OaKConfig, steps: int) -> None:
+    rows = _checked_sum("Step 11 observation row count", steps, 1)
+    observations = _checked_product(
+        "Step 11 observation count", rows, config.observation_dim
+    )
+    utility_outputs = _checked_product(
+        "Step 11 utility output count", steps, len(config.subtask_specs)
+    )
+    # The scan exposes seven scalar 32-bit outputs, four uint32 counter words,
+    # and eight boolean outputs per step, plus the option utility matrix.
+    _checked_sum(
+        "Step 11 smoke array bytes",
+        _checked_product("Step 11 observation bytes", 4, observations),
+        _checked_product("Step 11 reward bytes", 4, steps),
+        _checked_product("Step 11 scalar output bytes", 52, steps),
+        _checked_product("Step 11 utility output bytes", 4, utility_outputs),
+    )
+
+
 def _validate_oak_facade_config(config: Step11OaKConfig) -> None:
+    if type(config) is not Step11OaKConfig:
+        raise ValueError("config must be an actual Step11OaKConfig")
     observation_dim = _require_int(
         "observation_dim",
         config.observation_dim,
@@ -284,10 +417,14 @@ def _validate_oak_facade_config(config: Step11OaKConfig) -> None:
         "option_planning_backups_per_step",
         config.option_planning_backups_per_step,
         minimum=0,
-        maximum=_INT32_MAX - 1,
+        maximum=_MAX_PLANNING_BACKUPS_PER_STEP,
     )
     if type(config.subtask_specs) is not tuple:
         raise ValueError("subtask_specs must be a tuple of SubtaskSpec")
+    if len(config.subtask_specs) > _MAX_SUBTASK_SPECS:
+        raise ValueError(
+            f"subtask_specs must contain at most {_MAX_SUBTASK_SPECS} elements"
+        )
     canonical_specs: list[SubtaskSpec] = []
     for spec in config.subtask_specs:
         if type(spec) is not SubtaskSpec:
@@ -377,6 +514,10 @@ def _validate_oak_facade_config(config: Step11OaKConfig) -> None:
     object.__setattr__(config, "epsilon_option", epsilon_option)
     object.__setattr__(config, "utility_ema_decay", utility_ema_decay)
     object.__setattr__(config, "curation_threshold", curation_threshold)
+    # Exercise the core constructor now, before the facade is accepted.  This
+    # carries the exact derived action-count and direct-array byte ceilings to
+    # direct records and JSON restores instead of deferring them to agent use.
+    config.to_oak_config()
 
 
 @dataclass(frozen=True)
@@ -395,6 +536,10 @@ class Step11SmokeResult:
     agent_config: dict[str, Any]
 
     def __post_init__(self) -> None:
+        if type(self) is not Step11SmokeResult:
+            raise ValueError("result must be an actual Step11SmokeResult")
+        if type(self.config) is not Step11OaKConfig:
+            raise ValueError("config must be an actual Step11OaKConfig")
         object.__setattr__(
             self, "steps", _require_int("steps", self.steps, minimum=1, maximum=_INT32_MAX)
         )
@@ -421,6 +566,18 @@ class Step11SmokeResult:
                 maximum=_INT32_MAX,
             ),
         )
+        if self.td_errors_shape != (self.steps,):
+            raise ValueError("td_errors_shape must be exactly (steps,)")
+        if self.average_rewards_shape != (self.steps,):
+            raise ValueError("average_rewards_shape must be exactly (steps,)")
+        if self.primitive_actions_shape != (self.steps,):
+            raise ValueError("primitive_actions_shape must be exactly (steps,)")
+        if self.utility_emas_shape != (self.steps, len(self.config.subtask_specs)):
+            raise ValueError("utility_emas_shape must be exactly (steps, n_options)")
+        if self.option_termination_count > self.steps:
+            raise ValueError("option_termination_count must not exceed steps")
+        if type(self.agent_config) is not dict:
+            raise ValueError("agent_config must be an actual dict")
 
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-serializable representation."""
@@ -449,6 +606,8 @@ def make_step11_oak_agent(config: Step11OaKConfig | None = None) -> OaKAgent:
     """
     if config is None:
         config = Step11OaKConfig(subtask_specs=(SubtaskSpec(feature_index=0),))
+    elif type(config) is not Step11OaKConfig:
+        raise TypeError("config must be an actual Step11OaKConfig")
     return OaKAgent(config.to_oak_config())
 
 
@@ -468,11 +627,18 @@ def init_step11_state(
     Returns:
         Primed :class:`OaKState`.
     """
-    init_key, start_key = jr.split(key)
+    checked_agent = _require_agent(agent)
+    checked_key = _require_typed_key("key", key)
+    observation = _trusted_array(
+        "initial_observation",
+        initial_observation,
+        shape=(checked_agent.config.observation_dim,),
+        dtype=jnp.float32,
+    )
+    init_key, start_key = jr.split(checked_key)
     del start_key
-    state = agent.init(init_key)
-    obs = jnp.asarray(initial_observation, dtype=jnp.float32)
-    return agent.start(state, obs)
+    state = checked_agent.init(init_key)
+    return checked_agent.start(state, observation)
 
 
 def step11_update(
@@ -492,7 +658,16 @@ def step11_update(
     Returns:
         :class:`OaKUpdateResult` with new state and diagnostics.
     """
-    return agent.update(state, env_reward, next_observation)
+    checked_agent = _require_agent(agent)
+    checked_state = _require_state(state)
+    reward = _trusted_array("env_reward", env_reward, shape=(), dtype=jnp.float32)
+    observation = _trusted_array(
+        "next_observation",
+        next_observation,
+        shape=(checked_agent.config.observation_dim,),
+        dtype=jnp.float32,
+    )
+    return checked_agent.update(checked_state, reward, observation)
 
 
 def run_step11_scan(
@@ -512,7 +687,24 @@ def run_step11_scan(
     Returns:
         :class:`OaKArrayResult` with per-step diagnostics.
     """
-    return agent.scan(state, rewards, next_observations)
+    checked_agent = _require_agent(agent)
+    checked_state = _require_state(state)
+    if not _has_trusted_array_type(rewards):
+        raise TypeError("rewards must be a trusted array")
+    try:
+        steps = int(rewards.shape[0])
+    except (AttributeError, IndexError, TypeError, ValueError) as error:
+        raise TypeError("rewards must expose trusted shape metadata") from error
+    if not 1 <= steps <= _INT32_MAX:
+        raise ValueError("rewards must contain between 1 and signed-int32 steps")
+    checked_rewards = _trusted_array("rewards", rewards, shape=(steps,), dtype=jnp.float32)
+    checked_observations = _trusted_array(
+        "next_observations",
+        next_observations,
+        shape=(steps, checked_agent.config.observation_dim),
+        dtype=jnp.float32,
+    )
+    return checked_agent.scan(checked_state, checked_rewards, checked_observations)
 
 
 def run_step11_smoke(
@@ -537,7 +729,10 @@ def run_step11_smoke(
     cfg = config
     if cfg is None:
         cfg = Step11OaKConfig(subtask_specs=(SubtaskSpec(feature_index=0),))
+    elif type(cfg) is not Step11OaKConfig:
+        raise TypeError("config must be an actual Step11OaKConfig")
 
+    _preflight_step11_smoke_resources(cfg, steps)
     agent = make_step11_oak_agent(cfg)
     obs_dim = cfg.observation_dim
 

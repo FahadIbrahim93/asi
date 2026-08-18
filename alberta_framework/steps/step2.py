@@ -18,10 +18,13 @@ contracts are exercised in ``tests/test_prototype_memory.py`` and
 from __future__ import annotations
 
 import math
+import operator
 from dataclasses import asdict, dataclass
-from numbers import Integral, Real
-from typing import Any, Literal, cast
+from fractions import Fraction
+from numbers import Real
+from typing import Any, Literal, SupportsIndex, cast
 
+import jax
 import jax.numpy as jnp
 import jax.random as jr
 import numpy as np
@@ -131,44 +134,111 @@ _STEP2_ASSOCIATIVE_CONFIG_KEYS = frozenset(
     }
 )
 _INT32_MAX = 2**31 - 1
-_ACTUAL_INT_TYPES: tuple[type, ...] = (
-    int,
-    np.int8,
-    np.int16,
-    np.int32,
-    np.int64,
-    np.longlong,
-    np.uint8,
-    np.uint16,
-    np.uint32,
-    np.uint64,
-    np.ulonglong,
+_ACTUAL_INT_TYPES = frozenset(
+    {
+        int,
+        np.int8,
+        np.int16,
+        np.int32,
+        np.int64,
+        np.uint8,
+        np.uint16,
+        np.uint32,
+        np.uint64,
+        np.longlong,
+        np.ulonglong,
+    }
 )
+_ACTUAL_FLOAT_TYPES = frozenset(
+    {
+        float,
+        Fraction,
+        np.dtype("e").type,
+        np.dtype("f").type,
+        np.dtype("d").type,
+        np.dtype("g").type,
+    }
+)
+_ALLOWED_REAL_TYPES = _ACTUAL_INT_TYPES | _ACTUAL_FLOAT_TYPES
+
+
+def _require_exact_str(name: object, value: object) -> str:
+    if type(name) is not str:
+        raise ValueError("name must be an exact string")
+    if type(value) is not str:
+        raise ValueError(f"{name} must be an exact string")
+    return value
 
 
 def _require_exact_keys(
-    config_name: str,
-    payload: dict[str, object],
+    config_name: object,
+    payload: object,
     expected: frozenset[str],
 ) -> None:
+    host_config = _require_exact_str("config_name", config_name)
+    if type(payload) is not dict:
+        raise ValueError(f"{host_config} payload must be an exact dict")
+    if any(type(key) is not str for key in payload):
+        raise ValueError(f"{host_config} payload keys must be exact strings")
     if set(payload) != expected:
-        raise ValueError(
-            f"{config_name} payload keys must be exactly {sorted(expected)!r}"
-        )
+        raise ValueError(f"{host_config} payload keys must be exactly the expected keys")
+
+
+def _require_serialized_fields(
+    config_name: str,
+    payload: dict[str, object],
+    *,
+    integers: tuple[str, ...] = (),
+    numbers: tuple[str, ...] = (),
+    booleans: tuple[str, ...] = (),
+    strings: tuple[str, ...] = (),
+    integer_lists: tuple[str, ...] = (),
+    number_lists: tuple[str, ...] = (),
+) -> None:
+    """Require JSON-primitive field identities after the exact schema gate."""
+    for name in integers:
+        if type(payload[name]) is not int:
+            raise ValueError(f"serialized {name} must be a JSON integer")
+    for name in numbers:
+        if type(payload[name]) is not float:
+            raise ValueError(f"serialized {name} must be a JSON number")
+    for name in booleans:
+        if type(payload[name]) is not bool:
+            raise ValueError(f"serialized {name} must be a JSON boolean")
+    for name in strings:
+        if type(payload[name]) is not str:
+            raise ValueError(f"serialized {name} must be a JSON string")
+    for name in integer_lists:
+        value = payload[name]
+        if type(value) is not list:
+            raise ValueError(f"serialized {name} must be a JSON array")
+        if any(type(item) is not int for item in cast(list[object], value)):
+            raise ValueError(f"serialized {name} values must be JSON integers")
+    for name in number_lists:
+        value = payload[name]
+        if type(value) is not list:
+            raise ValueError(f"serialized {name} must be a JSON array")
+        if any(type(item) is not float for item in cast(list[object], value)):
+            raise ValueError(f"serialized {name} values must be JSON numbers")
 
 
 def finite_real_and_float32(name: str, value: object) -> tuple[Real, int, int, float]:
     """Return the original real, exact ratio, and finite binary32 rounding."""
     actual_type = type(value)
-    if issubclass(actual_type, bool) or not issubclass(actual_type, Real):
-        raise ValueError(f"{name} must be a real number, got {value!r}")
+    if actual_type not in _ALLOWED_REAL_TYPES:
+        mro = type.__getattribute__(actual_type, "__mro__")
+        has_real_lineage = actual_type is not bool and any(
+            base is int or base is float or base is Fraction for base in mro
+        )
+        requirement = "finite" if has_real_lineage else "a real number"
+        raise ValueError(f"{name} must be {requirement}")
     real = cast(Real, value)
     try:
         numerator, denominator, narrowed = round_real_to_float32_with_ratio(real)
     except (FloatingPointError, OverflowError, TypeError, ValueError):
-        raise ValueError(f"{name} must narrow to a finite float32, got {value!r}") from None
+        raise ValueError(f"{name} must narrow to a finite float32") from None
     if not math.isfinite(narrowed):
-        raise ValueError(f"{name} must narrow to a finite float32, got {value!r}")
+        raise ValueError(f"{name} must narrow to a finite float32")
     return real, numerator, denominator, narrowed
 
 
@@ -196,7 +266,7 @@ def _require_unit_interval(name: str, value: object) -> float:
         or narrowed < 0.0
         or not narrowed <= 1.0
     ):
-        raise ValueError(f"{name} must be in [0, 1], got {value!r}")
+        raise ValueError(f"{name} must be in [0, 1]")
     return canonical_float32_storage(real, narrowed)
 
 
@@ -210,23 +280,21 @@ def _require_half_open_unit_interval(name: str, value: object) -> float:
         or narrowed <= 0.0
         or not narrowed <= 1.0
     ):
-        raise ValueError(f"{name} must be in (0, 1], got {value!r}")
+        raise ValueError(f"{name} must be in (0, 1]")
     return canonical_float32_storage(real, narrowed)
 
 
 def _require_nonnegative_real(name: str, value: object) -> float:
     real, numerator, _, narrowed = finite_real_and_float32(name, value)
     if real < 0.0 or numerator < 0 or narrowed < 0.0:
-        raise ValueError(f"{name} must be non-negative, got {value!r}")
+        raise ValueError(f"{name} must be non-negative")
     return canonical_float32_storage(real, narrowed)
 
 
 def _require_positive_real(name: str, value: object) -> float:
     real, numerator, _, narrowed = finite_real_and_float32(name, value)
     if real <= 0.0 or numerator <= 0 or narrowed <= 0.0:
-        raise ValueError(
-            f"{name} must be positive in float32 execution sink, got {value!r}"
-        )
+        raise ValueError(f"{name} must be positive in float32 execution sink")
     return canonical_float32_storage(real, narrowed)
 
 
@@ -237,31 +305,47 @@ def _require_int(
     minimum: int | None = None,
     maximum: int | None = None,
 ) -> int:
-    if type(value) not in _ACTUAL_INT_TYPES:
-        raise ValueError(f"{name} must be an integer, got {value!r}")
-    try:
-        number = int(cast(Integral, value))
-    except (OverflowError, TypeError, ValueError):
-        raise ValueError(f"{name} must be an integer, got {value!r}") from None
+    actual_type = type(value)
+    if actual_type not in _ACTUAL_INT_TYPES:
+        raise ValueError(f"{name} must be an integer")
+    number = operator.index(cast(SupportsIndex, value))
     if minimum is not None and number < minimum:
         if minimum == 1:
-            raise ValueError(f"{name} must be positive, got {value!r}")
+            raise ValueError(f"{name} must be positive")
         if minimum == 0:
-            raise ValueError(f"{name} must be non-negative, got {value!r}")
-        raise ValueError(f"{name} must be >= {minimum}, got {value!r}")
+            raise ValueError(f"{name} must be non-negative")
+        raise ValueError(f"{name} must be >= {minimum}")
     if maximum is not None and number > maximum:
-        raise ValueError(f"{name} must be <= {maximum}, got {value!r}")
+        raise ValueError(f"{name} must be <= {maximum}")
     return number
 
 
 def _require_bool(name: str, value: object) -> bool:
     """Require an actual builtin bool (``__class__`` spoofing is ignored)."""
     if type(value) is not bool:
-        raise ValueError(f"{name} must be a bool, got {value!r}")
+        raise ValueError(f"{name} must be a built-in bool")
     return value
 
 
+def _require_typed_key(name: str, value: object) -> Array:
+    """Require one scalar typed JAX key before stream dispatch."""
+    actual_type = type(value)
+    if not (
+        issubclass(actual_type, jax.Array)
+        or issubclass(actual_type, jax.core.Tracer)
+    ):
+        raise ValueError(f"{name} must be a typed JAX PRNG key")
+    key = cast(Array, value)
+    if key.shape != () or not jax.dtypes.issubdtype(  # type: ignore[attr-defined]
+        key.dtype, jax.dtypes.prng_key
+    ):
+        raise ValueError(f"{name} must be a scalar typed JAX PRNG key")
+    return key
+
+
 def _validate_step2_kernel_config(config: Step2KernelConfig) -> None:
+    if type(config) is not Step2KernelConfig:
+        raise ValueError("config must be an exact Step2KernelConfig")
     feature_dim = _require_int(
         "feature_dim", config.feature_dim, minimum=1, maximum=_INT32_MAX
     )
@@ -270,7 +354,7 @@ def _validate_step2_kernel_config(config: Step2KernelConfig) -> None:
     )
     if type(config.hidden_sizes) is not tuple:
         raise ValueError(
-            f"hidden_sizes must be a tuple of integers, got {config.hidden_sizes!r}"
+            "hidden_sizes must be a tuple of integers"
         )
     canonical_hidden: list[int] = []
     for h in config.hidden_sizes:
@@ -281,7 +365,7 @@ def _validate_step2_kernel_config(config: Step2KernelConfig) -> None:
         )
     if type(config.stream) is not str or config.stream not in _VALID_STEP2_STREAMS:
         raise ValueError(
-            f"unknown Step 2 stream field {config.stream!r}; "
+            "unknown Step 2 stream field; "
             f"expected one of {sorted(_VALID_STEP2_STREAMS)}"
         )
     if config.stream == "polynomial" and feature_dim < 3:
@@ -291,7 +375,7 @@ def _validate_step2_kernel_config(config: Step2KernelConfig) -> None:
         or config.readout_mode not in _VALID_STEP2_READOUT_MODES
     ):
         raise ValueError(
-            f"unknown Step 2 readout_mode field {config.readout_mode!r}; "
+            "unknown Step 2 readout_mode field; "
             f"expected one of {sorted(_VALID_STEP2_READOUT_MODES)}"
         )
     if (
@@ -299,7 +383,7 @@ def _validate_step2_kernel_config(config: Step2KernelConfig) -> None:
         or config.loss_normalization not in _VALID_STEP2_LOSS_NORMALIZATIONS
     ):
         raise ValueError(
-            f"unknown Step 2 loss_normalization field {config.loss_normalization!r}; "
+            "unknown Step 2 loss_normalization field; "
             f"expected one of {sorted(_VALID_STEP2_LOSS_NORMALIZATIONS)}"
         )
     step_size = _require_nonnegative_real("step_size", config.step_size)
@@ -319,12 +403,14 @@ def _validate_step2_kernel_config(config: Step2KernelConfig) -> None:
 
 
 def _validate_step2_strict_digit_config(config: Step2StrictDigitReadoutConfig) -> None:
+    if type(config) is not Step2StrictDigitReadoutConfig:
+        raise ValueError("config must be an exact Step2StrictDigitReadoutConfig")
     n_heads = _require_int(
         "n_heads", config.n_heads, minimum=1, maximum=_INT32_MAX
     )
     if type(config.hidden_sizes) is not tuple:
         raise ValueError(
-            f"hidden_sizes must be a tuple of integers, got {config.hidden_sizes!r}"
+            "hidden_sizes must be a tuple of integers"
         )
     canonical_hidden: list[int] = []
     for h in config.hidden_sizes:
@@ -340,6 +426,8 @@ def _validate_step2_strict_digit_config(config: Step2StrictDigitReadoutConfig) -
 
 
 def _validate_step2_memory_config(config: Step2MemoryConfig) -> None:
+    if type(config) is not Step2MemoryConfig:
+        raise ValueError("config must be an exact Step2MemoryConfig")
     feature_dim = _require_int(
         "feature_dim", config.feature_dim, minimum=1, maximum=_INT32_MAX
     )
@@ -396,9 +484,16 @@ class Step2KernelConfig:
     def from_dict(cls, payload: dict[str, object]) -> Step2KernelConfig:
         """Reconstruct from :meth:`to_dict` output."""
         _require_exact_keys(cls.__name__, payload, _STEP2_KERNEL_CONFIG_KEYS)
+        _require_serialized_fields(
+            cls.__name__,
+            payload,
+            integers=("feature_dim", "n_heads", "context_length"),
+            numbers=("step_size", "noise_std"),
+            strings=("stream", "readout_mode", "loss_normalization"),
+            integer_lists=("hidden_sizes",),
+        )
         config = dict(payload)
-        if isinstance(config["hidden_sizes"], list):
-            config["hidden_sizes"] = tuple(cast(list[int], config["hidden_sizes"]))
+        config["hidden_sizes"] = tuple(cast(list[int], config["hidden_sizes"]))
         return cls(**cast(Any, config))
 
 
@@ -433,9 +528,15 @@ class Step2StrictDigitReadoutConfig:
     ) -> Step2StrictDigitReadoutConfig:
         """Reconstruct from :meth:`to_dict` output."""
         _require_exact_keys(cls.__name__, payload, _STEP2_STRICT_DIGIT_CONFIG_KEYS)
+        _require_serialized_fields(
+            cls.__name__,
+            payload,
+            integers=("n_heads",),
+            numbers=("step_size",),
+            integer_lists=("hidden_sizes",),
+        )
         config = dict(payload)
-        if isinstance(config["hidden_sizes"], list):
-            config["hidden_sizes"] = tuple(cast(list[int], config["hidden_sizes"]))
+        config["hidden_sizes"] = tuple(cast(list[int], config["hidden_sizes"]))
         return cls(**cast(Any, config))
 
 
@@ -462,6 +563,12 @@ class Step2MemoryConfig:
     def from_dict(cls, payload: dict[str, object]) -> Step2MemoryConfig:
         """Reconstruct from :meth:`to_dict` output."""
         _require_exact_keys(cls.__name__, payload, _STEP2_MEMORY_CONFIG_KEYS)
+        _require_serialized_fields(
+            cls.__name__,
+            payload,
+            integers=("feature_dim", "n_classes", "slots_per_class"),
+            numbers=("update_rate", "novelty_threshold", "bandwidth"),
+        )
         return cls(**cast(Any, payload))
 
 
@@ -505,6 +612,37 @@ class Step2AssociativeConfig:
     def from_dict(cls, payload: dict[str, object]) -> Step2AssociativeConfig:
         """Reconstruct from :meth:`to_dict` output."""
         _require_exact_keys(cls.__name__, payload, _STEP2_ASSOCIATIVE_CONFIG_KEYS)
+        _require_serialized_fields(
+            cls.__name__,
+            payload,
+            integers=(
+                "vocab_size",
+                "block_size",
+                "suffix_length",
+                "max_features",
+                "min_effective_budget",
+            ),
+            numbers=(
+                "write_lr",
+                "retention",
+                "utility_lr",
+                "utility_decay",
+                "min_weight",
+                "max_weight",
+                "logit_scale",
+                "scope_lr",
+                "budget_lr",
+                "initial_budget_fraction",
+                "scope_logit_clip",
+            ),
+            booleans=(
+                "normalize_by_weight",
+                "adaptive_feature_family",
+                "adaptive_window",
+                "adaptive_budget",
+            ),
+            strings=("feature_family",),
+        )
         return cls(**cast(Any, payload))
 
     def to_core_config(self) -> AssociativeMemoryConfig:
@@ -587,6 +725,12 @@ class Step2HybridConfig:
     novelty_adaptation_rate: float = 0.02
     target_allocation_rate: float = 0.18
 
+    def __post_init__(self) -> None:
+        """Canonicalize through the exact core config and preflight resources."""
+        core = make_step2_hybrid_learner(self).config
+        for name in self.__dataclass_fields__:
+            object.__setattr__(self, name, getattr(core, name))
+
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-serializable representation."""
         payload = asdict(self)
@@ -596,6 +740,27 @@ class Step2HybridConfig:
     @classmethod
     def from_dict(cls, payload: dict[str, object]) -> Step2HybridConfig:
         """Reconstruct from :meth:`to_dict` output."""
+        expected = frozenset(cls.__dataclass_fields__)
+        _require_exact_keys(cls.__name__, payload, expected)
+        integer_fields = (
+            "feature_dim",
+            "n_heads",
+            "upgd_head_loss_pressure_warmup_steps",
+            "upgd_head_repetition_warmup_steps",
+            "slots_per_class",
+        )
+        _require_serialized_fields(
+            cls.__name__,
+            payload,
+            integers=integer_fields,
+            numbers=tuple(
+                name
+                for name in expected
+                if name not in {*integer_fields, "hidden_sizes", "readout_mode"}
+            ),
+            strings=("readout_mode",),
+            integer_lists=("hidden_sizes",),
+        )
         config = dict(payload)
         config["hidden_sizes"] = tuple(cast(list[int], config["hidden_sizes"]))
         return cls(**cast(Any, config))
@@ -635,6 +800,39 @@ class Step2TemporalContextConfig:
         192.0,
     )
 
+    def __post_init__(self) -> None:
+        """Validate exact schema and derived phase-product resources."""
+        feature_dim = _require_int(
+            "feature_dim", self.feature_dim, minimum=1, maximum=_INT32_MAX
+        )
+        n_heads = _require_int(
+            "n_heads", self.n_heads, minimum=1, maximum=_INT32_MAX
+        )
+        if type(self.hidden_sizes) is not tuple:
+            raise ValueError("hidden_sizes must be an exact tuple")
+        hidden_sizes = tuple(
+            _require_int("hidden_sizes element", value, minimum=1, maximum=_INT32_MAX)
+            for value in self.hidden_sizes
+        )
+        step_size = _require_nonnegative_real("step_size", self.step_size)
+        if type(self.periods) is not tuple:
+            raise ValueError("periods must be an exact tuple")
+        periods = tuple(_require_positive_real("period", value) for value in self.periods)
+        phase_dim = 2 * len(periods)
+        output_dim = feature_dim + phase_dim + phase_dim * feature_dim
+        if output_dim > _INT32_MAX or 4 * output_dim > _INT32_MAX:
+            raise ValueError("derived temporal feature bytes must fit signed int32")
+        object.__setattr__(self, "feature_dim", feature_dim)
+        object.__setattr__(self, "n_heads", n_heads)
+        object.__setattr__(self, "hidden_sizes", hidden_sizes)
+        object.__setattr__(self, "step_size", step_size)
+        object.__setattr__(self, "periods", periods)
+        UPGDLearner.step2_default(
+            n_heads=n_heads,
+            hidden_sizes=hidden_sizes,
+            step_size=step_size,
+        )
+
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-serializable representation."""
         payload = asdict(self)
@@ -645,6 +843,16 @@ class Step2TemporalContextConfig:
     @classmethod
     def from_dict(cls, payload: dict[str, object]) -> Step2TemporalContextConfig:
         """Reconstruct from :meth:`to_dict` output."""
+        expected = frozenset(cls.__dataclass_fields__)
+        _require_exact_keys(cls.__name__, payload, expected)
+        _require_serialized_fields(
+            cls.__name__,
+            payload,
+            integers=("feature_dim", "n_heads"),
+            numbers=("step_size",),
+            integer_lists=("hidden_sizes",),
+            number_lists=("periods",),
+        )
         config = dict(payload)
         config["hidden_sizes"] = tuple(cast(list[int], config["hidden_sizes"]))
         config["periods"] = tuple(cast(list[float], config["periods"]))
@@ -731,9 +939,18 @@ class Step2AssociativeSmokeResult:
         return payload
 
 
+def _exact_config_or_default(name: str, value: object, expected: type[Any]) -> Any:
+    """Return one exact config without invoking supplied truthiness hooks."""
+    if value is None:
+        return expected()
+    if type(value) is not expected:
+        raise ValueError(f"{name} must be an exact {expected.__name__}")
+    return value
+
+
 def make_step2_learner(config: Step2KernelConfig | None = None) -> UPGDLearner:
     """Create the packaged Step 2 target-structure UPGD learner."""
-    cfg = config or Step2KernelConfig()
+    cfg = cast(Step2KernelConfig, _exact_config_or_default("config", config, Step2KernelConfig))
     return UPGDLearner.step2_default(
         n_heads=cfg.n_heads,
         hidden_sizes=cfg.hidden_sizes,
@@ -752,7 +969,10 @@ def make_step2_strict_digit_readout_learner(
     sklearn-digits-style one-hot online classification streams.  The broad
     supervised default remains :func:`make_step2_learner`.
     """
-    cfg = config or Step2StrictDigitReadoutConfig()
+    cfg = cast(
+        Step2StrictDigitReadoutConfig,
+        _exact_config_or_default("config", config, Step2StrictDigitReadoutConfig),
+    )
     return UPGDLearner.step2_strict_digit_readout_default(
         n_heads=cfg.n_heads,
         hidden_sizes=cfg.hidden_sizes,
@@ -764,7 +984,7 @@ def make_step2_memory_learner(
     config: Step2MemoryConfig | None = None,
 ) -> PrototypeMemoryLearner:
     """Create the packaged Step 2 retained-view memory learner."""
-    cfg = config or Step2MemoryConfig()
+    cfg = cast(Step2MemoryConfig, _exact_config_or_default("config", config, Step2MemoryConfig))
     return PrototypeMemoryLearner(
         PrototypeMemoryConfig(
             feature_dim=cfg.feature_dim,
@@ -781,7 +1001,10 @@ def make_step2_associative_learner(
     config: Step2AssociativeConfig | None = None,
 ) -> AssociativeMemoryLearner:
     """Create the Step 2 fast/slow associative sequence learner."""
-    cfg = config or Step2AssociativeConfig()
+    cfg = cast(
+        Step2AssociativeConfig,
+        _exact_config_or_default("config", config, Step2AssociativeConfig),
+    )
     return AssociativeMemoryLearner(cfg.to_core_config())
 
 
@@ -789,7 +1012,7 @@ def make_step2_hybrid_learner(
     config: Step2HybridConfig | None = None,
 ) -> UPGDMemoryLearner:
     """Create the Step 2 UPGD plus adaptive prototype-memory learner."""
-    cfg = config or Step2HybridConfig()
+    cfg = cast(Step2HybridConfig, _exact_config_or_default("config", config, Step2HybridConfig))
     return UPGDMemoryLearner(
         UPGDMemoryConfig(
             feature_dim=cfg.feature_dim,
@@ -844,7 +1067,10 @@ def make_step2_temporal_context(
     config: Step2TemporalContextConfig | None = None,
 ) -> TemporalContextFeaturizer:
     """Create the packaged causal phase-product context featurizer."""
-    cfg = config or Step2TemporalContextConfig()
+    cfg = cast(
+        Step2TemporalContextConfig,
+        _exact_config_or_default("config", config, Step2TemporalContextConfig),
+    )
     return TemporalContextFeaturizer(
         TemporalContextConfig(
             input_dim=cfg.feature_dim,
@@ -862,7 +1088,10 @@ def make_step2_temporal_learner(
     config: Step2TemporalContextConfig | None = None,
 ) -> UPGDLearner:
     """Create UPGD configured for temporal-context features."""
-    cfg = config or Step2TemporalContextConfig()
+    cfg = cast(
+        Step2TemporalContextConfig,
+        _exact_config_or_default("config", config, Step2TemporalContextConfig),
+    )
     return UPGDLearner.step2_default(
         n_heads=cfg.n_heads,
         hidden_sizes=cfg.hidden_sizes,
@@ -874,7 +1103,7 @@ def make_step2_stream(
     config: Step2KernelConfig | None = None,
 ) -> OutOfClassPolynomialStream | FrequencyMismatchStream | CompositionalStream:
     """Construct a representative Step 2 stream for integration testing."""
-    cfg = config or Step2KernelConfig()
+    cfg = cast(Step2KernelConfig, _exact_config_or_default("config", config, Step2KernelConfig))
     if cfg.stream == "polynomial":
         return OutOfClassPolynomialStream(
             feature_dim=cfg.feature_dim,
@@ -896,7 +1125,7 @@ def make_step2_stream(
             context_length=cfg.context_length,
             noise_std=cfg.noise_std,
         )
-    msg = f"unknown Step 2 stream {cfg.stream!r}"
+    msg = "unknown Step 2 stream"
     raise ValueError(msg)
 
 
@@ -913,6 +1142,18 @@ def collect_step2_arrays(
     baselines, and paired seed statistics.
     """
     steps = _require_int("steps", steps, minimum=1, maximum=_INT32_MAX)
+    if type(stream) not in (
+        OutOfClassPolynomialStream,
+        FrequencyMismatchStream,
+        CompositionalStream,
+    ):
+        raise ValueError("stream must be an exact packaged Step 2 stream")
+    key = _require_typed_key("key", key)
+    feature_dim = int(stream.feature_dim)
+    target_dim = int(stream.target_dim)
+    output_bytes = 4 * steps * (feature_dim + target_dim)
+    if output_bytes > _INT32_MAX:
+        raise ValueError("derived Step 2 collection bytes must fit signed int32")
     state = stream.init(key)
     observations = []
     targets = []
@@ -939,7 +1180,7 @@ def run_step2_smoke(
     steps = _require_int("steps", steps, minimum=1, maximum=_INT32_MAX)
     seed = require_jax_seed(seed, name="seed")
     final_window = _require_int("final_window", final_window, minimum=1, maximum=steps)
-    cfg = config or Step2KernelConfig()
+    cfg = cast(Step2KernelConfig, _exact_config_or_default("config", config, Step2KernelConfig))
     learner = make_step2_learner(cfg)
     stream = make_step2_stream(cfg)
     data_key, learner_key = jr.split(jr.key(seed))
@@ -974,7 +1215,10 @@ def run_step2_associative_smoke(
     not shipped in this fork. It repeats a small set of contexts so a healthy
     associative table should lower NLL over time.
     """
-    cfg = config or Step2AssociativeConfig()
+    cfg = cast(
+        Step2AssociativeConfig,
+        _exact_config_or_default("config", config, Step2AssociativeConfig),
+    )
     steps = _require_int("steps", steps, minimum=2, maximum=_INT32_MAX)
     seed = require_jax_seed(seed, name="seed")
     window = _require_int("window", window, minimum=1, maximum=steps // 2)

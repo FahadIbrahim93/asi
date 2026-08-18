@@ -652,24 +652,33 @@ def test_step7_dyna_rejects_float32_overflow() -> None:
 def test_step7_dyna_preserves_float32_boundaries() -> None:
     f32_max = float(np.finfo(np.float32).max)
     config = Step7DynaConfig(
-        planning_steps=2**31 - 1,
-        planning_rollout_depth=2**31 - 1,
+        planning_steps=1,
+        planning_rollout_depth=1,
         planning_warmup_steps=2**31 - 1,
-        planning_memory_size=2**31 - 2,
+        planning_memory_size=8,
         planning_importance_ratio_clip=f32_max,
         planning_priority_propagation=f32_max,
         planning_utility_step_size=1.0,
     )
-    assert config.planning_steps == 2**31 - 1
-    assert config.planning_rollout_depth == 2**31 - 1
+    assert config.planning_steps == 1
+    assert config.planning_rollout_depth == 1
     assert config.planning_warmup_steps == 2**31 - 1
-    assert config.planning_memory_size == 2**31 - 2
+    assert config.planning_memory_size == 8
     assert config.planning_importance_ratio_clip == f32_max
     assert config.planning_priority_propagation == f32_max
     assert config.planning_utility_step_size == 1.0
 
     with pytest.raises(ValueError, match="planning_memory_size"):
         Step7DynaConfig(planning_memory_size=2**31 - 1)
+
+
+def test_step7_dyna_rejects_derived_work_and_memory_resources() -> None:
+    with pytest.raises(ValueError, match="derived planning evaluations"):
+        Step7DynaConfig(planning_steps=2**30, planning_rollout_depth=2)
+    with pytest.raises(ValueError, match="planning output bytes"):
+        Step7DynaConfig(planning_steps=2**26, planning_rollout_depth=1)
+    with pytest.raises(ValueError, match="planning-memory bytes"):
+        Step7DynaConfig(planning_memory_size=2**28)
 
 
 def test_step7_dyna_exact_fraction_rounding() -> None:

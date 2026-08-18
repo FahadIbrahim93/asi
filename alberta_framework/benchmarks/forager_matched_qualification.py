@@ -324,6 +324,54 @@ class ProbeInvocation:
     expected_agent: str
     horizon: int
 
+    def __post_init__(self) -> None:
+        if type(self.candidate_id) is not str or not self.candidate_id:
+            raise ForagerMatchedQualificationError("candidate_id must be a non-empty string")
+        if type(self.source_key) is not str or self.source_key not in (
+            "alberta",
+            "upstream",
+            "upstream_rng_isolated",
+        ):
+            raise ForagerMatchedQualificationError("source_key is invalid")
+        if not isinstance(self.source_root, Path):
+            raise ForagerMatchedQualificationError("source_root must be a Path")
+        if not isinstance(self.probe_path, Path):
+            raise ForagerMatchedQualificationError("probe_path must be a Path")
+        if type(self.probe_sha256) is not str or _SHA256.fullmatch(self.probe_sha256) is None:
+            raise ForagerMatchedQualificationError(
+                "probe_sha256 must be a 64-character hex string"
+            )
+        if not isinstance(self.configuration, Path):
+            raise ForagerMatchedQualificationError("configuration must be a Path")
+        if (
+            type(self.configuration_sha256) is not str
+            or _SHA256.fullmatch(self.configuration_sha256) is None
+        ):
+            raise ForagerMatchedQualificationError(
+                "configuration_sha256 must be a 64-character hex string"
+            )
+        for name in (
+            "entrypoint_path",
+            "entrypoint_family",
+            "implementation_kind",
+            "invocation_style",
+            "result_root",
+            "seed_transport",
+            "expected_agent",
+        ):
+            val = getattr(self, name)
+            if type(val) is not str or not val:
+                raise ForagerMatchedQualificationError(f"{name} must be a non-empty string")
+        if (
+            type(self.entrypoint_sha256) is not str
+            or _SHA256.fullmatch(self.entrypoint_sha256) is None
+        ):
+            raise ForagerMatchedQualificationError(
+                "entrypoint_sha256 must be a 64-character hex string"
+            )
+        if type(self.horizon) is not int or self.horizon <= 0:
+            raise ForagerMatchedQualificationError("horizon must be a positive int")
+
 
 @dataclass(frozen=True, slots=True)
 class _StagedSource:
