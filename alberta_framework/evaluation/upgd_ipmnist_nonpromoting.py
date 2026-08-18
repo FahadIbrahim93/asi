@@ -369,7 +369,7 @@ def _parse_partial(path: Path, errors: list[str]) -> _Shard | None:
         errors.append(f"{path}: unsupported partial schema")
 
     learner_value = payload.get("learner")
-    learner = learner_value if isinstance(learner_value, str) else ""
+    learner = learner_value if type(learner_value) is str else ""
     if learner not in EXPECTED_HYPERPARAMETERS:
         errors.append(f"{path}: learner must be one of {sorted(EXPECTED_HYPERPARAMETERS)}")
 
@@ -757,7 +757,7 @@ def validate_completed_upgd_ipmnist_run(
             errors.append("artifact bytes changed during validation")
         provenance = artifact.get("provenance")
         raw_home = provenance.get("openml_data_home") if isinstance(provenance, Mapping) else None
-        data_home = Path(raw_home) if isinstance(raw_home, str) else Path("__missing_data_home__")
+        data_home = Path(raw_home) if type(raw_home) is str else Path("__missing_data_home__")
     reconstructed = validate_upgd_ipmnist_reconstructed_provenance(root, data_home)
     errors.extend(reconstructed.errors)
     return UPGDIPMNISTValidation(
@@ -958,7 +958,7 @@ def validate_upgd_ipmnist_v2_artifact(
         def manifest_identity(entry: Mapping[str, object]) -> tuple[str, int]:
             learner = entry["learner"]
             seed = entry["seed_id"]
-            if not isinstance(learner, str) or type(seed) is not int:
+            if type(learner) is not str or type(seed) is not int:
                 raise ValueError("v2 partial manifest contains an invalid identity")
             return learner, seed
 
