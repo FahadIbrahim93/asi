@@ -1,0 +1,116 @@
+name: reference-life development scorecard
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/reference-life-scorecard-dev.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: reference-life-development-scorecard
+  cancel-in-progress: false
+
+jobs:
+  shards:
+    name: seed ${{ matrix.seed }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        seed:
+          - 70000
+          - 70001
+          - 70002
+          - 70003
+          - 70004
+          - 70005
+          - 70006
+          - 70007
+          - 70008
+          - 70009
+          - 70010
+          - 70011
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Set up locked Python 3.12
+        uses: ./.github/actions/setup-locked-python
+        with:
+          python-version: "3.12"
+          extras: --extra dev
+
+      - name: Run twelve fresh-process shards
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p scorecard/shards
+          for environment in switching_two_state riverswim; do
+            for arm in prototype prototype_frozen random privileged_oracle differential_sarsa sarsa; do
+              output="scorecard/shards/${environment}__${arm}__${{ matrix.seed }}.json"
+              uv run --no-sync python -m alberta_framework.benchmarks.reference_life_scorecard \
+                run-shard \
+                --environment "$environment" \
+                --arm "$arm" \
+                --seed "${{ matrix.seed }}" \
+                --output "$output"
+              uv run --no-sync python -m alberta_framework.benchmarks.reference_life_scorecard \
+                validate "$output"
+            done
+          done
+
+      - name: Upload immutable shard records
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: reference-life-shards-${{ matrix.seed }}
+          path: scorecard/shards/*.json
+          if-no-files-found: error
+          retention-days: 30
+
+  aggregate:
+    name: aggregate and validate
+    needs: shards
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Set up locked Python 3.12
+        uses: ./.github/actions/setup-locked-python
+        with:
+          python-version: "3.12"
+          extras: --extra dev
+
+      - name: Download all shard records
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: reference-life-shards-*
+          path: scorecard/shards
+          merge-multiple: true
+
+      - name: Build and strictly validate the aggregate
+        shell: bash
+        run: |
+          set -euo pipefail
+          count=$(find scorecard/shards -maxdepth 1 -type f -name '*.json' | wc -l | tr -d ' ')
+          test "$count" = 144
+          uv run --no-sync python -m alberta_framework.benchmarks.reference_life_scorecard \
+            plan --output scorecard/plan.json
+          uv run --no-sync python -m alberta_framework.benchmarks.reference_life_scorecard \
+            summarize \
+            --plan scorecard/plan.json \
+            --output scorecard/artifact.json \
+            scorecard/shards/*.json
+          uv run --no-sync python -m alberta_framework.benchmarks.reference_life_scorecard \
+            validate scorecard/artifact.json
+
+      - name: Upload complete validated campaign
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: reference-life-scorecard-validated
+          path: scorecard
+          if-no-files-found: error
+          retention-days: 30
