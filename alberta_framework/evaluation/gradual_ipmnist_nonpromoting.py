@@ -433,7 +433,7 @@ def _direction(delta: float) -> str:
 
 
 def _schedule_identities(seed: int, config: IPMNISTConfig, n_train: int) -> tuple[str, str]:
-    _, key_schedule, _ = jr.split(jr.key(np.uint32(seed)), 3)
+    _, key_schedule, _ = jr.split(jr.key(seed, impl="threefry2x32"), 3)
     schedule = build_schedule(key_schedule, config, n_train)
 
     def digest(domain: bytes, value: jax.Array) -> str:

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import copy
+import json
 from pathlib import Path
 from typing import Any, cast
 
+import jax
 import numpy as np
 import pytest
 
@@ -149,3 +151,44 @@ def test_gradual_report_retention_is_exclusive_and_reload_validated(
     )
     with pytest.raises(FileExistsError):
         retain_frozen_gradual_input_development_report(report, x, y, repository_root=tmp_path)
+
+
+def test_retained_v2_exactly_derives_from_v1_independent_of_default_prng(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository_root = Path(__file__).resolve().parents[1]
+    parent = json.loads(
+        (
+            repository_root
+            / "outputs/ipmnist_gradual/development.v1"
+            / "result.7b2bf6c0f73b9fae20fcde53445f5f81656976ea4d042641772501e0108c6561.json"
+        ).read_bytes()
+    )
+    retained = json.loads(
+        (
+            repository_root
+            / "outputs/ipmnist_gradual/development.v2"
+            / "result.9ff58ac51163004208b94e325f9539037cb8cfb3540024da95c847f50154b483.json"
+        ).read_bytes()
+    )
+    monkeypatch.setattr(
+        gradual_report,
+        "_dataset_identity",
+        lambda _x, _y, _config: copy.deepcopy(parent["dataset"]),
+    )
+    monkeypatch.setattr(
+        gradual_report,
+        "_runtime_identity",
+        lambda: copy.deepcopy(parent["identity"]["runtime"]),
+    )
+    monkeypatch.setattr(
+        gradual_report,
+        "_source_identity",
+        lambda: copy.deepcopy(retained["identity"]["derivation_source_sha256"]),
+    )
+
+    with jax.default_prng_impl("rbg"):
+        derived = gradual_report.derive_gradual_input_resource_correction(
+            parent, object(), object()
+        )
+    assert derived == retained
