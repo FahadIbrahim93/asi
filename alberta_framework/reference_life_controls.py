@@ -1887,7 +1887,17 @@ class DiscountedSARSAReferenceAdapter(_BaseReferenceControlAdapter):
             key,
             name="discounted-SARSA initial key",
         )
-        return None, self._sarsa_agent.init(self.config.observation_dim, explicit_key)
+        learner = self._sarsa_agent.init(self.config.observation_dim, explicit_key)
+        # The core learner exposes host-side lifecycle timers for its timed loop
+        # helpers.  This exact-dispatch adapter never uses those helpers, and a
+        # JIT update otherwise promotes both Python floats into persistent JAX
+        # leaves on the first transition.  Canonical scalar arrays keep the
+        # whole-life state shape fixed and exclude wall-clock time from state.
+        inner = learner.learner_state.replace(  # type: ignore[attr-defined]
+            birth_timestamp=jnp.asarray(0.0, dtype=jnp.float32),
+            uptime_s=jnp.asarray(0.0, dtype=jnp.float32),
+        )
+        return None, learner.replace(learner_state=inner)  # type: ignore[attr-defined]
 
     def _start_payload(
         self,
@@ -2001,6 +2011,12 @@ class DiscountedSARSAReferenceAdapter(_BaseReferenceControlAdapter):
         if inner.normalizer_state is not None:
             raise DecisionOwnershipError(
                 "discounted-SARSA state must not contain an undeclared normalizer"
+            )
+        for name in ("birth_timestamp", "uptime_s"):
+            _require_float32_array(
+                getattr(inner, name),
+                name=f"discounted-SARSA {name}",
+                shape=(),
             )
 
     def _validate_payload(

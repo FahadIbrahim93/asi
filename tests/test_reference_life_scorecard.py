@@ -203,6 +203,31 @@ def test_resource_estimate_counts_cached_array_value_payloads() -> None:
     assert estimate["trainable_scalar_count_estimate"] == 8
 
 
+def test_discounted_sarsa_persistent_resources_are_fixed_from_initialization() -> None:
+    plan = build_development_plan()
+    spec = next(
+        item
+        for item in scorecard.iter_run_specs(plan)
+        if item.environment_kind == "switching_two_state"
+        and item.arm == "sarsa"
+        and item.seed == SEED_ROSTER[0]
+    )
+    runner = scorecard.build_scorecard_runner(plan, spec)
+    initial = runner.init()
+    initial_resources = scorecard._agent_resource_payload(
+        runner.agent_adapter,
+        initial.agent_state,
+    )
+
+    step = runner.step(initial)
+
+    assert step.accepted
+    assert scorecard._agent_resource_payload(
+        runner.agent_adapter,
+        step.state.agent_state,
+    ) == initial_resources
+
+
 @pytest.mark.parametrize(
     ("arm", "changes", "passed"),
     [
