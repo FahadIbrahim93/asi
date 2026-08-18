@@ -38,6 +38,12 @@ from alberta_framework.benchmarks import forager_matched_executor as executor
 from alberta_framework.benchmarks import forager_matched_open_protocol as builder
 from alberta_framework.benchmarks import forager_matched_qualification as qualification
 from alberta_framework.benchmarks.forager_matched_protocol import SourceBinding
+from tests._forager_matched_platform import (
+    HAS_PROCFS_DESCRIPTORS,
+    HAS_RENAMEAT2,
+    requires_procfs_descriptors,
+    requires_renameat2,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -2440,6 +2446,7 @@ def test_public_api_allows_intended_outputs_forager_sibling(
     assert not output.exists()
 
 
+@requires_renameat2
 def test_publication_is_atomic_and_never_replaces_existing_directory(tmp_path: Path) -> None:
     source = tmp_path / "partial"
     source.mkdir()
@@ -2468,6 +2475,27 @@ def test_publication_is_atomic_and_never_replaces_existing_directory(tmp_path: P
     assert (destination / "manifest.json").read_bytes() == b"{}"
 
 
+@pytest.mark.skipif(HAS_RENAMEAT2, reason="Linux publishes the directory instead of refusing")
+def test_publication_fails_closed_without_renameat2(tmp_path: Path) -> None:
+    source = tmp_path / "partial"
+    source.mkdir()
+    (source / "manifest.json").write_bytes(b"{}")
+    destination = tmp_path / "final"
+
+    with pytest.raises(
+        qualification.ForagerMatchedQualificationError,
+        match="atomic no-replace publication is unavailable on this platform",
+    ):
+        qualification._publish_directory_no_replace(  # noqa: SLF001
+            source,
+            destination,
+            tmp_path,
+        )
+    assert not destination.exists()
+    assert (source / "manifest.json").read_bytes() == b"{}"
+
+
+@requires_renameat2
 def test_publication_parent_fsync_failure_is_published_uncertain(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2555,6 +2583,7 @@ def test_publication_rejects_parent_or_staging_inode_substitution(tmp_path: Path
     assert not (stable_parent / "final").exists()
 
 
+@requires_renameat2
 def test_publication_detects_destination_inode_substitution_after_rename(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2591,6 +2620,7 @@ def test_publication_detects_destination_inode_substitution_after_rename(
     assert (tmp_path / "displaced-final/manifest.json").read_bytes() == b"{}"
 
 
+@requires_renameat2
 def test_publication_detects_destination_replacement_inside_validator(
     tmp_path: Path,
 ) -> None:
@@ -2622,6 +2652,7 @@ def test_publication_detects_destination_replacement_inside_validator(
     assert (displaced / "manifest.json").read_bytes() == b"{}"
 
 
+@requires_procfs_descriptors
 def test_verified_tree_fsyncs_files_and_directories_bottom_up(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2699,6 +2730,8 @@ def test_verified_tree_rejects_link_and_detects_replacement_during_fsync(
     ):
         qualification._durably_sync_verified_tree(linked_root)  # noqa: SLF001
 
+    if not HAS_PROCFS_DESCRIPTORS:
+        pytest.skip("the replacement race reads descriptor paths back through procfs")
     race_root = tmp_path / "race"
     race_root.mkdir()
     payload = race_root / "payload"
@@ -2934,6 +2967,7 @@ def test_qualification_fresh_replay_failure_cleans_before_publication(
     assert not output.exists()
 
 
+@requires_renameat2
 def test_qualification_final_loader_failure_is_published_uncertain(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2975,6 +3009,7 @@ def test_qualification_final_loader_failure_is_published_uncertain(
     assert not list(tmp_path.glob(f".{output.name}.partial-*"))
 
 
+@requires_renameat2
 def test_qualification_post_publish_replay_failure_is_published_uncertain(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3029,6 +3064,7 @@ def test_qualification_post_publish_replay_failure_is_published_uncertain(
     assert not list(tmp_path.glob(f".{output.name}.partial-*"))
 
 
+@requires_renameat2
 def test_qualification_post_publish_returned_closure_mismatch_is_uncertain(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -34,6 +34,7 @@ from alberta_framework.benchmarks import forager_matched_open_protocol as open_p
 from alberta_framework.benchmarks import forager_matched_qualification as qualification
 from tests import test_forager_matched_executor as executor_fixtures
 from tests import test_forager_matched_open_protocol as protocol_fixtures
+from tests._forager_matched_platform import HAS_O_TMPFILE, requires_o_tmpfile
 
 pytestmark = pytest.mark.integration
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -366,6 +367,7 @@ def test_campaign_manifest_rejects_each_qualification_digest_carrier_drift(
         )
 
 
+@requires_o_tmpfile
 @pytest.mark.parametrize("carrier", ("payload", "sidecar"))
 def test_load_context_rejects_persisted_qualification_manifest_drift(
     tmp_path: Path,
@@ -408,6 +410,7 @@ def test_load_context_rejects_persisted_qualification_manifest_drift(
     assert context.rebuilt.bundle.manifest_sha256 == _QUALIFICATION_MANIFEST_SHA256
 
 
+@requires_o_tmpfile
 def test_load_context_rejects_literal_v1_open_campaign_manifest(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -629,6 +632,7 @@ def test_cell_bindings_derive_stage_from_context_protocol(tmp_path: Path) -> Non
     assert pointer["stage"] == "sealed_evaluation"
 
 
+@requires_o_tmpfile
 def test_custom_completion_summary_builder_flows_through_resume_and_replay(
     tmp_path: Path,
 ) -> None:
@@ -701,6 +705,7 @@ def test_custom_completion_summary_builder_flows_through_resume_and_replay(
         campaign._derive_status(context, scans)
 
 
+@requires_o_tmpfile
 def test_completed_campaign_loader_returns_exact_immutable_bundle(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -739,6 +744,7 @@ def test_completed_campaign_loader_returns_exact_immutable_bundle(
         cast(dict[str, str], bundle.final_file_sha256)["mutated"] = "0" * 64
 
 
+@requires_o_tmpfile
 def test_completed_campaign_loader_rejects_incomplete_campaign(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -758,6 +764,7 @@ def test_completed_campaign_loader_rejects_incomplete_campaign(
         )
 
 
+@requires_o_tmpfile
 @pytest.mark.parametrize("artifact_name", campaign._FINAL_ARTIFACTS)
 def test_completed_campaign_loader_rejects_each_self_consistent_final_tamper(
     tmp_path: Path,
@@ -787,6 +794,7 @@ def test_completed_campaign_loader_rejects_each_self_consistent_final_tamper(
         )
 
 
+@requires_o_tmpfile
 def test_completed_campaign_loader_is_read_only(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -816,6 +824,7 @@ def test_completed_campaign_loader_is_read_only(
     assert snapshot() == before
 
 
+@requires_o_tmpfile
 def test_completed_campaign_bundle_preserves_plan_candidate_seed_and_final_order(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -862,6 +871,7 @@ def test_prepare_rejects_an_existing_output_root(tmp_path: Path) -> None:
         )
 
 
+@requires_o_tmpfile
 def test_scorer_failure_resumes_bound_raw_without_rerunning_candidate(
     tmp_path: Path,
 ) -> None:
@@ -903,6 +913,7 @@ def test_scorer_failure_resumes_bound_raw_without_rerunning_candidate(
     assert (failed.resumable_attempt / "failures" / "failure-000001.json").is_file()
 
 
+@requires_o_tmpfile
 def test_raw_only_orphan_starts_a_new_attempt_and_is_never_resumed(tmp_path: Path) -> None:
     context = _context(tmp_path)
     candidate_id = context.rebuilt.candidate_ids[0]
@@ -931,6 +942,7 @@ def test_raw_only_orphan_starts_a_new_attempt_and_is_never_resumed(tmp_path: Pat
     assert (run_cell / "attempt-000002" / "bundle.json").is_file()
 
 
+@requires_o_tmpfile
 def test_bound_raw_corruption_fails_before_any_oci_call(tmp_path: Path) -> None:
     context = _context(tmp_path)
     candidate_id = context.rebuilt.candidate_ids[0]
@@ -995,6 +1007,7 @@ def test_raw_binding_rejects_equal_valued_float_size_alias(tmp_path: Path) -> No
         campaign._validate_raw_binding(context, candidate_id, seed, attempt)
 
 
+@requires_o_tmpfile
 def test_completed_bundle_without_pointer_repairs_only_the_pointer(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1033,6 +1046,7 @@ def test_completed_bundle_without_pointer_repairs_only_the_pointer(
     assert campaign._scan_cell(context, candidate_id, seed).pointer_present is True
 
 
+@requires_o_tmpfile
 def test_duplicate_completed_and_resumable_attempts_fail_closed(tmp_path: Path) -> None:
     context = _context(tmp_path)
     candidate_id = context.rebuilt.candidate_ids[0]
@@ -1055,6 +1069,7 @@ def test_duplicate_completed_and_resumable_attempts_fail_closed(tmp_path: Path) 
         campaign._scan_cell(context, candidate_id, seed)
 
 
+@requires_o_tmpfile
 def test_unknown_symlink_and_hardlinked_dynamic_artifacts_fail_closed(
     tmp_path: Path,
 ) -> None:
@@ -1102,6 +1117,7 @@ def test_unknown_symlink_and_hardlinked_dynamic_artifacts_fail_closed(
         campaign._scan_cell(hardlink_context, hard_candidate, hard_seed)
 
 
+@requires_o_tmpfile
 def test_final_artifacts_are_forbidden_early_and_exact_after_complete_block(
     tmp_path: Path,
 ) -> None:
@@ -1157,6 +1173,7 @@ def test_final_artifacts_are_forbidden_early_and_exact_after_complete_block(
     campaign._finalize_or_validate(context, scans, create=False)
 
 
+@requires_o_tmpfile
 def test_self_consistent_execution_receipt_index_tamper_fails_replay(
     tmp_path: Path,
 ) -> None:
@@ -1195,6 +1212,7 @@ def test_self_consistent_execution_receipt_index_tamper_fails_replay(
         campaign._finalize_or_validate(context, scans, create=False)
 
 
+@requires_o_tmpfile
 def test_run_mode_repairs_payload_first_sidecar_interruption(tmp_path: Path) -> None:
     context = _context(tmp_path)
     candidate_id = context.rebuilt.candidate_ids[0]
@@ -1221,6 +1239,7 @@ def test_run_mode_repairs_payload_first_sidecar_interruption(tmp_path: Path) -> 
     assert sidecar.is_file()
 
 
+@requires_o_tmpfile
 def test_persisted_live_runtime_identity_drift_fails_closed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1336,6 +1355,7 @@ def test_prepare_rejects_parent_symlink_redirection_before_qualification_write(
     assert not (safe_parent / "nested-parent" / "campaign").exists()
 
 
+@requires_o_tmpfile
 def test_anonymous_publication_failure_leaves_no_visible_partial(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1350,6 +1370,18 @@ def test_anonymous_publication_failure_leaves_no_visible_partial(
     assert list(tmp_path.iterdir()) == []
 
 
+@pytest.mark.skipif(HAS_O_TMPFILE, reason="Linux publishes the artifact instead of refusing")
+def test_publication_fails_closed_without_o_tmpfile(tmp_path: Path) -> None:
+    with pytest.raises(
+        campaign.ForagerMatchedCampaignError,
+        match="O_TMPFILE is required for crash-safe publication",
+    ):
+        campaign._publish_bytes(tmp_path / "artifact.json", b"{}")
+
+    assert list(tmp_path.iterdir()) == []
+
+
+@requires_o_tmpfile
 def test_campaign_lock_rejects_a_concurrent_writer(tmp_path: Path) -> None:
     root = tmp_path / "locked-campaign"
     root.mkdir()
