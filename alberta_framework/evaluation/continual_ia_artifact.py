@@ -1088,12 +1088,12 @@ def _validate_operational(
         errors.append("operational overall acceptance is inconsistent")
 
 
-def validate_ia_evidence_artifact(
+def _validate_ia_evidence_artifact(
     artifact: Mapping[str, object],
     *,
-    _allow_historical_projection: bool = False,
+    allow_historical_projection: bool,
 ) -> IAArtifactValidation:
-    """Validate historical v1 evidence or a policy-barred consumed-seed replay."""
+    """Implement strict validation and the registry's nonpromoting projection."""
 
     errors: list[str] = []
     schema = artifact.get("schema_version")
@@ -1195,7 +1195,7 @@ def validate_ia_evidence_artifact(
             not is_replay
             and isinstance(recorded, str)
             and recorded != HISTORICAL_CONTENT_SHA256
-            and not _allow_historical_projection
+            and not allow_historical_projection
         ):
             errors.append(
                 "historical v1 content digest is not the immutable recorded evaluation"
@@ -1212,4 +1212,31 @@ def validate_ia_evidence_artifact(
         valid=valid,
         accepted=valid and expected_acceptance and not is_replay,
         errors=tuple(errors),
+    )
+
+
+def validate_ia_evidence_artifact(
+    artifact: Mapping[str, object],
+) -> IAArtifactValidation:
+    """Strictly validate historical v1 evidence or a nonpromoting replay."""
+
+    return _validate_ia_evidence_artifact(
+        artifact,
+        allow_historical_projection=False,
+    )
+
+
+def _validate_ia_historical_replay_projection(
+    artifact: Mapping[str, object],
+) -> IAArtifactValidation:
+    """Validate the registry's old-schema replay without granting acceptance."""
+
+    validation = _validate_ia_evidence_artifact(
+        artifact,
+        allow_historical_projection=True,
+    )
+    return IAArtifactValidation(
+        valid=validation.valid,
+        accepted=False,
+        errors=validation.errors,
     )

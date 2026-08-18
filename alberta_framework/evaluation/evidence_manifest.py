@@ -59,6 +59,7 @@ from alberta_framework.evaluation.continual_ia_artifact import (
     _threshold_payload as _ia_threshold_payload,
 )
 from alberta_framework.evaluation.continual_ia_artifact import (
+    _validate_ia_historical_replay_projection,
     load_ia_evidence_artifact,
     validate_ia_evidence_artifact,
 )
@@ -2268,10 +2269,7 @@ def _validate_historical_ia_chain(
         )
         try:
             if validate_ia_evidence_artifact is _STRICT_IA_ARTIFACT_VALIDATOR:
-                replay_validation = validate_ia_evidence_artifact(
-                    replay,
-                    _allow_historical_projection=True,
-                )
+                replay_validation = _validate_ia_historical_replay_projection(replay)
             else:
                 replay_validation = validate_ia_evidence_artifact(replay)
             replay_validation_valid = replay_validation.valid
