@@ -206,11 +206,22 @@ FORAGER_FOV_EMA_SUBSAMPLE = 100
 FORAGER_FOV_TAIL_FRACTION = 0.10
 FORAGER_ENVIRONMENT_RNG_SCHEDULE = "dedicated_environment_split_chain_v1"
 _MAX_JAX_INT32 = 2**31 - 1
+_ACTUAL_NUMPY_INT_TYPES = frozenset(
+    np.dtype(code).type for code in ("b", "B", "h", "H", "i", "I", "l", "L", "q", "Q")
+)
+_ACTUAL_RESULT_SCALAR_TYPES = frozenset(
+    {
+        int,
+        float,
+        *_ACTUAL_NUMPY_INT_TYPES,
+        *(np.dtype(code).type for code in ("e", "f", "d", "g")),
+    }
+)
 
 
 def _validated_seed(value: Any, *, name: str = "seed") -> int:
     """Return one canonical JAX seed without accepting lossy coercions."""
-    if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+    if type(value) is not int and type(value) not in _ACTUAL_NUMPY_INT_TYPES:
         raise ValueError(f"{name} must be an integer")
     seed = int(value)
     if not 0 <= seed <= _MAX_JAX_INT32:
@@ -246,6 +257,16 @@ def _require_real(value: Any, *, name: str) -> float:
     except (OverflowError, TypeError, ValueError) as error:
         raise ValueError(f"{name} must be finite") from error
     if not math.isfinite(converted):
+        raise ValueError(f"{name} must be finite")
+    return converted
+
+
+def _require_result_scalar(value: Any, *, name: str) -> float:
+    """Reject bool/inf identities; NaN remains the historical unavailable marker."""
+    if type(value) not in _ACTUAL_RESULT_SCALAR_TYPES:
+        raise ValueError(f"{name} must be a real number")
+    converted = float(value)
+    if math.isinf(converted):
         raise ValueError(f"{name} must be finite")
     return converted
 
@@ -421,22 +442,18 @@ class ForagerEnvConfig:
     require_exact_version: bool = True
 
     def __post_init__(self) -> None:
-        if not isinstance(self.preset, str) or self.preset not in _PRESET_ENV_IDS:
+        if type(self.preset) is not str or self.preset not in _PRESET_ENV_IDS:
             raise ValueError(f"unknown Forager preset {self.preset!r}")
         if self.env_id is not None and (
-            not isinstance(self.env_id, str) or not self.env_id
+            type(self.env_id) is not str or not self.env_id
         ):
             raise ValueError("env_id must be a non-empty string when provided")
-        if (
-            isinstance(self.aperture_size, bool)
-            or not isinstance(self.aperture_size, int)
-            or (
+        if type(self.aperture_size) is not int or (
                 self.aperture_size != -1
                 and (
                     self.aperture_size < 1
                     or self.aperture_size % 2 == 0
                 )
-            )
         ):
             raise ValueError("aperture_size must be a positive odd integer or -1 for full world")
         _require_builtin_int(
@@ -449,16 +466,15 @@ class ForagerEnvConfig:
             name="random_shift_max_steps",
             minimum=0,
         )
-        if self.observation_type is not None and self.observation_type not in (
-            "color",
-            "rgb",
-            "object",
+        if self.observation_type is not None and (
+            type(self.observation_type) is not str
+            or self.observation_type not in ("color", "rgb", "object")
         ):
             raise ValueError(f"unknown observation_type {self.observation_type!r}")
-        if not isinstance(self.extra_kwargs, Mapping) or any(
-            not isinstance(key, str) for key in self.extra_kwargs
+        if type(self.extra_kwargs) is not dict or any(
+            type(key) is not str for key in self.extra_kwargs
         ):
-            raise ValueError("extra_kwargs must be a mapping with string keys")
+            raise ValueError("extra_kwargs must be an actual dict with string keys")
         reserved = {
             "aperture_size",
             "observation_type",
@@ -1778,6 +1794,65 @@ class ForagerRunResult:
     environment: Mapping[str, Any]
     metric_contract: Mapping[str, Any]
     agent_metadata: Mapping[str, Any]
+
+    def __post_init__(self) -> None:
+        """Reject bool/non-int identities before they become JSON ``true``."""
+
+        if type(self.agent) is not str or not self.agent:
+            raise ValueError("agent must be a non-empty string")
+        if type(self.privileged) is not bool:
+            raise ValueError("privileged must be a boolean")
+        object.__setattr__(self, "seed", _validated_seed(self.seed))
+        steps = _require_builtin_int(self.steps, name="steps", minimum=1)
+        for name in (
+            "total_reward",
+            "mean_reward",
+            "final_window_mean_reward",
+            "final_ewm_reward",
+            "mean_ewm_reward",
+            "fov_last_10pct_ema_auc",
+            "mean_biome_regret",
+            "final_biome_regret",
+            "duration_s",
+            "frames_per_second",
+        ):
+            object.__setattr__(
+                self,
+                name,
+                _require_result_scalar(getattr(self, name), name=name),
+            )
+        if type(self.curve_steps) is not tuple:
+            raise ValueError("curve_steps must be a tuple of integers")
+        curve_steps = tuple(
+            _validated_seed(step, name=f"curve_steps[{index}]")
+            for index, step in enumerate(self.curve_steps)
+        )
+        if (
+            not curve_steps
+            or curve_steps[0] < 1
+            or curve_steps[-1] > steps
+            or any(left >= right for left, right in zip(curve_steps, curve_steps[1:]))
+        ):
+            raise ValueError("curve_steps must be nonempty, increasing, and within steps")
+        object.__setattr__(self, "curve_steps", curve_steps)
+        for name in ("curve_ewm_reward", "curve_window_reward"):
+            values = getattr(self, name)
+            if type(values) is not tuple:
+                raise ValueError(f"{name} must be a tuple of real numbers")
+            object.__setattr__(
+                self,
+                name,
+                tuple(_require_result_scalar(value, name=name) for value in values),
+            )
+            if len(values) != len(curve_steps):
+                raise ValueError(f"{name} length must match curve_steps")
+        for name in ("duration_s", "frames_per_second"):
+            value = getattr(self, name)
+            if not math.isnan(value) and value < 0.0:
+                raise ValueError(f"{name} must be nonnegative or NaN")
+        for name in ("environment", "metric_contract", "agent_metadata"):
+            if not isinstance(getattr(self, name), Mapping):
+                raise ValueError(f"{name} must be a mapping")
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-compatible result."""
@@ -4006,6 +4081,83 @@ class PaperForagerProtocol:
     hidden_switch_interval_steps: int | None
     metric_definition: str
     single_stream: bool = True
+
+    def __post_init__(self) -> None:
+        """Reject bool counts/windows before they shrink evaluation to one seed."""
+
+        if type(self.preset) is not str:
+            raise ValueError("preset must be an exact string")
+        if self.preset not in ("relearning", "field_of_view", "unending"):
+            raise ValueError("preset is invalid")
+        if type(self.environment) is not ForagerEnvConfig:
+            raise ValueError("environment must be a ForagerEnvConfig")
+        for name in (
+            "tuning_steps",
+            "tuning_seeds",
+            "evaluation_steps",
+            "evaluation_seeds",
+            "final_window_steps",
+        ):
+            _require_builtin_int(getattr(self, name), name=name, minimum=1)
+        _require_builtin_int(
+            self.tuning_seed_offset, name="tuning_seed_offset", minimum=0
+        )
+        _require_builtin_int(
+            self.evaluation_seed_start, name="evaluation_seed_start", minimum=0
+        )
+        if self.frozen_ablation_after_steps is not None:
+            _require_builtin_int(
+                self.frozen_ablation_after_steps,
+                name="frozen_ablation_after_steps",
+                minimum=1,
+            )
+        if self.hidden_switch_interval_steps is not None:
+            _require_builtin_int(
+                self.hidden_switch_interval_steps,
+                name="hidden_switch_interval_steps",
+                minimum=1,
+            )
+        if self.final_window_steps > self.evaluation_steps:
+            raise ValueError("final_window_steps must not exceed evaluation_steps")
+        if (
+            self.frozen_ablation_after_steps is not None
+            and self.frozen_ablation_after_steps > self.evaluation_steps
+        ):
+            raise ValueError("frozen_ablation_after_steps must not exceed evaluation_steps")
+        if (
+            self.hidden_switch_interval_steps is not None
+            and self.hidden_switch_interval_steps > self.evaluation_steps
+        ):
+            raise ValueError("hidden_switch_interval_steps must not exceed evaluation_steps")
+        if self.tuning_seed_offset > _MAX_JAX_INT32 - (self.tuning_seeds - 1):
+            raise ValueError("tuning seed range must fit the JAX seed domain")
+        if self.evaluation_seed_start > _MAX_JAX_INT32 - (self.evaluation_seeds - 1):
+            raise ValueError("evaluation seed range must fit the JAX seed domain")
+        tuning_fraction = _require_real(self.tuning_fraction, name="tuning_fraction")
+        if not 0.0 <= tuning_fraction <= 1.0:
+            raise ValueError("tuning_fraction must lie in [0, 1]")
+        object.__setattr__(self, "tuning_fraction", tuning_fraction)
+        confidence = _require_real(self.confidence, name="confidence")
+        if not 0.0 < confidence <= 1.0:
+            raise ValueError("confidence must lie in (0, 1]")
+        object.__setattr__(self, "confidence", confidence)
+        ewm_decay = _require_real(self.ewm_decay, name="ewm_decay")
+        if not 0.0 <= ewm_decay < 1.0:
+            raise ValueError("ewm_decay must lie in [0, 1)")
+        object.__setattr__(self, "ewm_decay", ewm_decay)
+        if type(self.primary_metric) is not str:
+            raise ValueError("primary_metric must be an exact string")
+        if self.primary_metric not in (
+            "final_window_mean_reward",
+            "mean_ewm_reward",
+            "final_ewm_reward",
+            "fov_last_10pct_ema_auc",
+        ):
+            raise ValueError("primary_metric is invalid")
+        if type(self.metric_definition) is not str or not self.metric_definition:
+            raise ValueError("metric_definition must be a non-empty string")
+        if type(self.single_stream) is not bool:
+            raise ValueError("single_stream must be a boolean")
 
     def to_dict(self) -> dict[str, Any]:
         data = dataclasses.asdict(self)
