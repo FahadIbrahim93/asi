@@ -52,7 +52,8 @@ _ACTUAL_INT_TYPES = frozenset(
 
 
 def _require_int32(name: str, value: object, *, minimum: int, maximum: int = _INT32_MAX) -> int:
-    if type(value) not in _ACTUAL_INT_TYPES:
+    actual_type = type(value)
+    if not any(actual_type is allowed_type for allowed_type in _ACTUAL_INT_TYPES):
         raise ValueError(f"{name} must be an integer in [{minimum}, {maximum}]")
     canonical = operator.index(cast(SupportsIndex, value))
     if not minimum <= canonical <= maximum:
@@ -68,7 +69,8 @@ def _require_derived_int32(name: str, value: int, *, minimum: int = 0) -> int:
 
 def _require_host_count(name: str, value: object, *, minimum: int = 0) -> int:
     """Canonicalize one exact host-only accounting integer without narrowing it."""
-    if type(value) not in _ACTUAL_INT_TYPES:
+    actual_type = type(value)
+    if not any(actual_type is allowed_type for allowed_type in _ACTUAL_INT_TYPES):
         raise ValueError(f"{name} must be an integer >= {minimum}")
     canonical = operator.index(cast(SupportsIndex, value))
     if canonical < minimum:
@@ -532,7 +534,7 @@ class FeatureBankRouter:
         normalized_axes: list[int] = []
         for index, (leaf, raw_axis) in enumerate(zip(leaves, raw_axes, strict=True)):
             value = jnp.asarray(leaf)
-            if isinstance(raw_axis, bool) or not isinstance(raw_axis, int):
+            if type(raw_axis) is not int:
                 raise TypeError(f"feature axis for consumer leaf {index} must be an integer")
             axis = raw_axis if raw_axis >= 0 else value.ndim + raw_axis
             if axis < 0 or axis >= value.ndim:

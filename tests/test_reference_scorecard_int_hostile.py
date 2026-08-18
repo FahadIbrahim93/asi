@@ -36,9 +36,9 @@ def test_streaming_observe_rejects_hostile_before_float() -> None:
     summary = StreamingRunSummary.for_switching(horizon=10, phase_length=3, post_switch_window=2)
     hostile = _HostileInt(1)
     _HostileInt.calls = 0
-    with pytest.raises(Exception, match="must be a finite number"):
+    with pytest.raises(ValueError, match="must be a finite number"):
         summary.observe(
-            reward=hostile,  # type: ignore[arg-type]
+            reward=hostile,
             oracle_reward=1.0,
             regime_id=0,
             parameters_changed=False,
@@ -47,19 +47,19 @@ def test_streaming_observe_rejects_hostile_before_float() -> None:
     assert _HostileInt.calls == 0
     _HostileInt.calls = 0
     hostile2 = _HostileInt(2)
-    with pytest.raises(Exception, match="must be a finite number"):
+    with pytest.raises(ValueError, match="must be a finite number"):
         summary.observe(
             reward=1.0,
-            oracle_reward=hostile2,  # type: ignore[arg-type]
+            oracle_reward=hostile2,
             regime_id=0,
             parameters_changed=False,
             next_state_index=0,
         )
     assert _HostileInt.calls == 0
     # bool rejected
-    with pytest.raises(Exception, match="must be a finite number"):
+    with pytest.raises(ValueError, match="must be a finite number"):
         summary.observe(
-            reward=True,  # type: ignore[arg-type]
+            reward=True,
             oracle_reward=1.0,
             regime_id=0,
             parameters_changed=False,
@@ -76,23 +76,7 @@ def test_streaming_observe_rejects_hostile_before_float() -> None:
     assert summary.accepted_events == 1
 
 
-def test_streaming_observe_rejects_hostile_regime_before_equality() -> None:
-    from alberta_framework.benchmarks.reference_life_scorecard import StreamingRunSummary
-
-    summary = StreamingRunSummary.for_switching(horizon=10, phase_length=3, post_switch_window=2)
-    _HostileInt.calls = 0
-    with pytest.raises(ValueError, match="regime_id must be an integer"):
-        summary.observe(
-            reward=1.0,
-            oracle_reward=1.0,
-            regime_id=_HostileInt(0),  # type: ignore[arg-type]
-            parameters_changed=False,
-            next_state_index=0,
-        )
-    assert _HostileInt.calls == 0
-
-
-def test_run_shard_rejects_hostile_reward_without_dispatching_hooks(
+def test_run_shard_rejects_hostile_regime_without_dispatching_hooks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from alberta_framework.benchmarks import reference_life_scorecard as scorecard
@@ -106,16 +90,15 @@ def test_run_shard_rejects_hostile_reward_without_dispatching_hooks(
         accepted_events=0,
         environment_rng_cursor=0,
     )
-    hostile = _HostileInt(1)
     event = SimpleNamespace(
         transaction=SimpleNamespace(
-            reward=hostile,
+            reward=1.0,
             next_decision_observation=SimpleNamespace(
                 to_numpy=lambda: np.asarray([1.0, 0.0])
             ),
         ),
         oracle_reward=1.0,
-        regime_id=0,
+        regime_id=_HostileInt(0),
         step_result=SimpleNamespace(parameters_changed=False),
     )
     runner = SimpleNamespace(
@@ -148,7 +131,7 @@ def test_run_shard_rejects_hostile_reward_without_dispatching_hooks(
 
     assert record["status"] == "failed"
     assert record["failure"]["stage"] == "step"
-    assert record["failure"]["message"] == "reward must be a finite number"
+    assert record["failure"]["message"] == "regime_id must be an integer"
     assert _HostileInt.calls == 0
 
 
@@ -169,11 +152,11 @@ def test_reward_sum_rejects_hostile_before_float() -> None:
 
     hostile = _HostileInt(5)
     _HostileInt.calls = 0
-    with pytest.raises(Exception, match="must be finite"):
-        _reward_sum({"outcome": {"reward_sum": hostile}})  # type: ignore[dict-item]
+    with pytest.raises(ValueError, match="must be finite"):
+        _reward_sum({"outcome": {"reward_sum": hostile}})
     assert _HostileInt.calls == 0
-    with pytest.raises(Exception, match="must be finite"):
-        _reward_sum({"outcome": {"reward_sum": True}})  # type: ignore[dict-item]
+    with pytest.raises(ValueError, match="must be finite"):
+        _reward_sum({"outcome": {"reward_sum": True}})
     assert _HostileInt.calls == 0
     assert _reward_sum({"outcome": {"reward_sum": 5}}) == 5.0
     assert _reward_sum({"outcome": {"reward_sum": 5.0}}) == 5.0
@@ -184,11 +167,11 @@ def test_finite_nonnegative_rejects_hostile_before_float() -> None:
 
     hostile = _HostileInt(1)
     _HostileInt.calls = 0
-    with pytest.raises(Exception, match="must be a finite nonnegative"):
-        _require_finite_nonnegative(hostile, path="p")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="must be a finite nonnegative"):
+        _require_finite_nonnegative(hostile, path="p")
     assert _HostileInt.calls == 0
-    with pytest.raises(Exception, match="must be a finite nonnegative"):
-        _require_finite_nonnegative(True, path="p")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="must be a finite nonnegative"):
+        _require_finite_nonnegative(True, path="p")
     assert _HostileInt.calls == 0
     assert _require_finite_nonnegative(1.0, path="p") == 1.0
     assert _require_finite_nonnegative(0, path="p") == 0.0
@@ -199,21 +182,10 @@ def test_finite_number_rejects_hostile_before_float() -> None:
 
     hostile = _HostileInt(1)
     _HostileInt.calls = 0
-    with pytest.raises(Exception, match="must be a finite number"):
-        _require_finite_number(hostile, path="p")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="must be a finite number"):
+        _require_finite_number(hostile, path="p")
     assert _HostileInt.calls == 0
-    with pytest.raises(Exception, match="must be a finite number"):
-        _require_finite_number(True, path="p")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="must be a finite number"):
+        _require_finite_number(True, path="p")
     assert _HostileInt.calls == 0
     assert _require_finite_number(1, path="p") == 1.0
-
-
-def test_hostile_not_in_error_message() -> None:
-    hostile = _HostileInt(1)
-    _HostileInt.calls = 0
-    try:
-        if type(hostile) not in (int, float):
-            raise ValueError("must be a finite number")
-    except ValueError as exc:
-        assert "!r" not in str(exc)
-        assert _HostileInt.calls == 0

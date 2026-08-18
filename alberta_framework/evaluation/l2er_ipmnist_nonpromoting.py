@@ -38,7 +38,8 @@ L2ER_PROTOCOL = MappingProxyType(
         "official_er_steps_per_batch": 1,
         "effective_rank_epsilon": 1e-8,
         "persistent_bytes_scope": (
-            "float32 parameters plus the fixed 100-example float32 ER buffer and int32 count; "
+            "float32 parameters plus the fixed 100-example float32 ER buffer, int32 count, "
+            "and sticky bool transaction-validity flag; "
             "runner RNG and the externally supplied schedule are excluded"
         ),
         "development_only": True,
@@ -251,7 +252,7 @@ def validate_l2er_development_result(payload: object) -> dict[str, object]:
     parameter_count = sum(products[:3]) + hidden1 + hidden2 + n_classes
     if parameter_count > _INT32_MAX - products[3] - 1:
         raise ValueError("derived persistent scalar count exceeds signed int32")
-    expected_persistent_bytes = 4 * (parameter_count + products[3] + 1)
+    expected_persistent_bytes = 4 * (parameter_count + products[3] + 1) + 1
     if expected_persistent_bytes > _MAX_BYTES:
         raise ValueError("derived persistent bytes exceed 256 MiB")
     if persistent_bytes != expected_persistent_bytes:
