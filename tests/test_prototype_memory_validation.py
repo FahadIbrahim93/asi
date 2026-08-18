@@ -178,7 +178,7 @@ def test_prototype_float_validators_reject_hostile_ratio() -> None:
             slots_per_class=2,
             update_rate=HostileFloat(0.5),  # type: ignore[arg-type]
         )
-    assert HostileFloat.calls == 1
+    assert HostileFloat.calls == 0
 
 
 def test_prototype_float_validators_accept_valid_values() -> None:
