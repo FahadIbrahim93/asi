@@ -239,6 +239,11 @@ class TestAutostep:
         with pytest.raises(ValueError, match="meta_step_size"):
             Autostep(meta_step_size=meta_step_size)  # type: ignore[arg-type]
 
+    @pytest.mark.parametrize("tau", [float("nan"), float("inf"), 0.0, -0.1, True, False])
+    def test_rejects_illegal_tau(self, tau: object) -> None:
+        with pytest.raises(ValueError, match="tau"):
+            Autostep(tau=tau)  # type: ignore[arg-type]
+
     def test_update_returns_correct_shapes(self, sample_observation):
         """Autostep update should return correctly shaped deltas."""
         optimizer = Autostep()
