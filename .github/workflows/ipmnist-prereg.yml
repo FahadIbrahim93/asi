@@ -173,16 +173,19 @@ jobs:
         shell: bash
         env:
           UV_PATH: ${{ steps.uv.outputs.uv-path }}
+          UV_SHA256: "613eda52458300fa7af03231280d252b8cde8f96df56e43d10c0bcd0d583afea"
         run: |
           set -euo pipefail
           if [[ "$UV_PATH" != /* || ! -x "$UV_PATH" ]]; then
             echo "setup-uv did not return an absolute executable uv path" >&2
             exit 1
           fi
-          if [[ "$("$UV_PATH" --version)" != "uv 0.9.24" ]]; then
-            echo "setup-uv did not install exact uv 0.9.24" >&2
+          actual_uv_sha256="$(shasum -a 256 "$UV_PATH" | awk '{print $1}')"
+          if [[ "$actual_uv_sha256" != "$UV_SHA256" ]]; then
+            echo "setup-uv executable digest differs from official uv 0.9.24" >&2
             exit 1
           fi
+          "$UV_PATH" --version
           if [[ "$PYTHONOPTIMIZE" != "0" ]]; then
             echo "PYTHONOPTIMIZE must be exactly zero" >&2
             exit 1
