@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -50,6 +51,11 @@ _MAX_REPORT_BYTES = 16 * 1024 * 1024
 _PATH_TYPE = type(Path())
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 OUTPUT_PATH = _REPO_ROOT / "outputs/l2er_matched_development/report.v3.json"
+HISTORICAL_V2_PATH = _REPO_ROOT / "outputs/l2er_matched_development/report.v2.json"
+HISTORICAL_V2_SCHEMA = "asi.l2er-ipmnist.matched-development-report.v2"
+HISTORICAL_V2_SHA256 = (
+    "c5a6b8efb050d3c6c05648a46689ca0903389340764f7c20b589bfc4e8b0c6f2"
+)
 _V3_EXECUTION_AUTHORIZED = False
 
 
@@ -507,6 +513,11 @@ def validate_report(
         ),
         context="report",
     )
+    if type(report["schema"]) is str and report["schema"] == HISTORICAL_V2_SCHEMA:
+        historical = load_historical_v2_report()
+        if _bounded_json(report, context="historical_v2_report") != historical:
+            raise ValueError("historical v2 report does not match the exact retained artifact")
+        return historical
     if type(report["schema"]) is not str or report["schema"] != SCHEMA:
         raise ValueError("report schema does not match the frozen protocol")
     plan = _validated_plan(report["plan"])
@@ -641,6 +652,45 @@ def validate_report(
     }
 
 
+def load_historical_v2_report(
+    path: Path = HISTORICAL_V2_PATH,
+) -> dict[str, object]:
+    """Load only the exact immutable, historically validated v2 development result."""
+    if type(path) is not _PATH_TYPE or path != HISTORICAL_V2_PATH:
+        raise ValueError("historical v2 report path must be the exact retained artifact path")
+    try:
+        encoded = path.read_bytes()
+    except OSError as error:
+        raise ValueError("unable to read the retained historical v2 report") from error
+    if len(encoded) > _MAX_REPORT_BYTES:
+        raise ValueError("historical v2 report exceeds the output byte limit")
+    if hashlib.sha256(encoded).hexdigest() != HISTORICAL_V2_SHA256:
+        raise ValueError("historical v2 report does not match its retained artifact SHA-256")
+    try:
+        payload = json.loads(encoded)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("historical v2 report is not exact JSON") from error
+    report = _object(
+        payload,
+        frozenset(
+            {
+                "schema",
+                "plan",
+                "source_provenance",
+                "dataset_provenance",
+                "environment",
+                "records",
+                "paired_comparisons",
+                "policy",
+            }
+        ),
+        context="historical_v2_report",
+    )
+    if type(report["schema"]) is not str or report["schema"] != HISTORICAL_V2_SCHEMA:
+        raise ValueError("historical v2 report schema does not match its retained contract")
+    return cast(dict[str, object], _bounded_json(report, context="historical_v2_report"))
+
+
 def run(*, data_home: Path) -> dict[str, object]:
     """Execute only after a separate methodological disposition authorizes v3."""
     if type(data_home) is not _PATH_TYPE:
@@ -734,6 +784,7 @@ def _publish_report(
     report: dict[str, object],
 ) -> None:
     """Publish and reload one report through a pinned directory descriptor."""
+    _require_execution_authorized()
     normalized = validate_report(report)
     encoded = (
         json.dumps(normalized, allow_nan=False, indent=1, sort_keys=True) + "\n"
