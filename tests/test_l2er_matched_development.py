@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 from copy import deepcopy
 from typing import Never
 
@@ -150,7 +151,32 @@ def test_validator_recomputes_paired_arithmetic(
         matched.validate_report(reordered, require_current_source=False)
 
 
+def test_three_seed_interval_uses_student_t_not_normal_critical_value() -> None:
+    mean, lower, upper, outcome = matched._outcome((0.01, 0.01, 0.0))
+    assert mean > 0.0
+    assert lower < 0.0 < upper
+    assert outcome == "inconclusive"
+    assert matched.frozen_plan()["confidence_method"] == "two_sided_student_t"
+
+
+def test_report_revalidates_result_identity_before_reading_metrics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(matched, "_validated_source_provenance", lambda value, **_: value)
+    monkeypatch.setattr(matched, "_validated_dataset_provenance", lambda value, **_: value)
+    monkeypatch.setattr(matched, "_validated_runtime_environment", lambda value, **_: value)
+    results = _results()
+    results[0] = dataclasses.replace(results[0], base_learner="adamw")
+    with pytest.raises(ValueError, match="base learner"):
+        matched.build_report(
+            results, source_provenance={}, dataset_provenance={}, environment={}
+        )
+
+
 def test_output_namespace_is_one_new_development_path() -> None:
-    assert str(matched.OUTPUT_PATH) == "outputs/l2er_matched_development/report.v1.json"
+    assert matched.OUTPUT_PATH.relative_to(matched._REPO_ROOT).as_posix() == (
+        "outputs/l2er_matched_development/report.v1.json"
+    )
+    assert matched.frozen_plan()["consumed_preplan_audit_seeds"] == [1701]
     assert matched.frozen_plan()["development_only"] is True
     assert matched.frozen_plan()["scientific_promotion_allowed"] is False

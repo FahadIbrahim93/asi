@@ -35,18 +35,20 @@ from alberta_framework.evaluation.l2er_ipmnist_nonpromoting import (
 
 SCHEMA = "asi.l2er-ipmnist.matched-development-report.v1"
 PLAN_ID = "asi.l2er-ipmnist.cheap-screen.v1"
-OUTPUT_PATH = Path("outputs/l2er_matched_development/report.v1.json")
 ARMS = (
     "l2er_mechanism_off",
     "l2er_l2_only",
     "l2er_er_only",
     "l2er_combined",
 )
-SEEDS = (1701, 1702, 1703)
+SEEDS = (1711, 1712, 1713)
 CONFIG = IPMNISTConfig(n_tasks=2, task_length=500)
-_Z95 = 1.96
+CONSUMED_AUDIT_SEEDS = (1701,)
+_T95_DF2 = 4.302652729696142
 _MAX_REPORT_RECORDS = 32
 _PATH_TYPE = type(Path())
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+OUTPUT_PATH = _REPO_ROOT / "outputs/l2er_matched_development/report.v1.json"
 
 
 def frozen_plan() -> dict[str, object]:
@@ -55,12 +57,28 @@ def frozen_plan() -> dict[str, object]:
         "plan_id": PLAN_ID,
         "arms": list(ARMS),
         "seeds": list(SEEDS),
+        "consumed_preplan_audit_seeds": list(CONSUMED_AUDIT_SEEDS),
+        "consumed_preplan_audit_note": (
+            "seed 1701 ran once across all four arms during executable-path audit; "
+            "no complete report was produced"
+        ),
         "config": CONFIG.to_config(),
         "primary_metric": "mean_online_accuracy",
         "control_arm": "l2er_mechanism_off",
         "paired_direction": "higher_is_better",
+        "matched_axes": [
+            "example_schedule",
+            "observations",
+            "supervised_updates",
+            "allowed_boundary_information",
+            "allowed_task_information",
+        ],
+        "arm_specific_charged_axis": "effective_rank_updates",
         "null_delta": 0.0,
-        "confidence_z": _Z95,
+        "confidence_method": "two_sided_student_t",
+        "confidence_level": 0.95,
+        "confidence_degrees_of_freedom": 2,
+        "confidence_critical": _T95_DF2,
         "allowed_boundary_information": [],
         "allowed_task_information": ["current_example_label"],
         "development_only": True,
@@ -163,7 +181,7 @@ def _canonical_result(value: object) -> ScreeningRunResult:
     if type(value.config) is not IPMNISTConfig:
         raise ValueError("result.config must be an exact IPMNISTConfig")
     config = IPMNISTConfig(**value.config.to_config())
-    return ScreeningRunResult(
+    result = ScreeningRunResult(
         config_name=value.config_name,
         base_learner=value.base_learner,
         hyperparameters=value.hyperparameters,
@@ -176,11 +194,25 @@ def _canonical_result(value: object) -> ScreeningRunResult:
         noise_mode=value.noise_mode,
         noise_pool_steps=value.noise_pool_steps,
     )
+    spec = screening_spec(result.config_name)
+    if result.base_learner != spec.base_learner:
+        raise ValueError("result base learner does not match the registered arm")
+    if result.noise_mode != "step" or result.noise_pool_steps is not None:
+        raise ValueError("matched L2-ER results require exact-step execution")
+    return result
 
 
 def _validated_plan(value: object) -> dict[str, object]:
     plan = _object(value, frozenset(frozen_plan()), context="plan")
-    for key in ("plan_id", "primary_metric", "control_arm", "paired_direction"):
+    for key in (
+        "plan_id",
+        "primary_metric",
+        "control_arm",
+        "paired_direction",
+        "confidence_method",
+        "consumed_preplan_audit_note",
+        "arm_specific_charged_axis",
+    ):
         if type(plan[key]) is not str:
             raise ValueError(f"plan.{key} must be an exact string")
     for key in ("development_only", "scientific_promotion_allowed", "outcome_retention_required"):
@@ -188,6 +220,8 @@ def _validated_plan(value: object) -> dict[str, object]:
             raise ValueError(f"plan.{key} must be an exact bool")
     arms = plan["arms"]
     seeds = plan["seeds"]
+    consumed_seeds = plan["consumed_preplan_audit_seeds"]
+    matched_axes = plan["matched_axes"]
     boundary = plan["allowed_boundary_information"]
     task = plan["allowed_task_information"]
     if (
@@ -202,6 +236,18 @@ def _validated_plan(value: object) -> dict[str, object]:
         or any(type(item) is not int for item in seeds)
     ):
         raise ValueError("plan.seeds must be an exact integer list")
+    if (
+        type(consumed_seeds) is not list
+        or len(consumed_seeds) != len(CONSUMED_AUDIT_SEEDS)
+        or any(type(item) is not int for item in consumed_seeds)
+    ):
+        raise ValueError("plan.consumed_preplan_audit_seeds must be an exact integer list")
+    if (
+        type(matched_axes) is not list
+        or len(matched_axes) != 5
+        or any(type(item) is not str for item in matched_axes)
+    ):
+        raise ValueError("plan.matched_axes must be an exact string list")
     if type(boundary) is not list or boundary or any(type(item) is not str for item in boundary):
         raise ValueError("plan.allowed_boundary_information must be an exact string list")
     if type(task) is not list or len(task) != 1 or any(type(item) is not str for item in task):
@@ -210,7 +256,12 @@ def _validated_plan(value: object) -> dict[str, object]:
     if any(type(item) is not int for item in config.values()):
         raise ValueError("plan.config must contain exact integers")
     _finite_float(plan["null_delta"], context="plan.null_delta")
-    _finite_float(plan["confidence_z"], context="plan.confidence_z", nonnegative=True)
+    _finite_float(plan["confidence_level"], context="plan.confidence_level")
+    if type(plan["confidence_degrees_of_freedom"]) is not int:
+        raise ValueError("plan.confidence_degrees_of_freedom must be an exact integer")
+    _finite_float(
+        plan["confidence_critical"], context="plan.confidence_critical", nonnegative=True
+    )
     if plan != frozen_plan():
         raise ValueError("report plan does not match the literal frozen plan")
     return cast(dict[str, object], plan)
@@ -220,8 +271,8 @@ def _outcome(deltas: tuple[float, ...]) -> tuple[float, float, float, str]:
     values = np.asarray(deltas, dtype=np.float64)
     mean = float(values.mean())
     stderr = float(values.std(ddof=1) / math.sqrt(len(values)))
-    lower = mean - _Z95 * stderr
-    upper = mean + _Z95 * stderr
+    lower = mean - _T95_DF2 * stderr
+    upper = mean + _T95_DF2 * stderr
     outcome = "supported" if lower > 0.0 else "rejected" if upper <= 0.0 else "inconclusive"
     return mean, lower, upper, outcome
 
@@ -241,8 +292,6 @@ def build_report(
     by_identity: dict[tuple[int, str], ScreeningRunResult] = {}
     for raw_result in results:
         result = _canonical_result(raw_result)
-        if result.noise_mode != "step" or result.noise_pool_steps is not None:
-            raise ValueError("results must come from exact-step execution")
         identity = (result.seed, result.config_name)
         if identity in by_identity:
             raise ValueError("results must not contain duplicate seed-by-arm identities")
@@ -376,6 +425,12 @@ def validate_report(
                 ("n_classes", CONFIG.n_classes),
                 ("observations", CONFIG.n_steps),
                 ("updates", CONFIG.n_steps),
+                (
+                    "effective_rank_updates",
+                    CONFIG.n_steps // 100
+                    if screening_spec(identity[1]).hyperparameters["er_enabled"] == 1.0
+                    else 0,
+                ),
             )
         ):
             raise ValueError("record configuration drifts from the frozen plan")
