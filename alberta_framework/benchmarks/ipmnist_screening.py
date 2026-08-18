@@ -1468,6 +1468,18 @@ def _intentional_updates_hp(value: object) -> dict[str, float]:
         or checked["norm_epsilon"] <= 0.0
     ):
         raise ValueError("Intentional Updates hyperparameters violate the frozen bounds")
+    if (
+        checked["intended_fraction"] != 0.5
+        or checked["fixed_step_size"] != 0.01
+        or checked["beta2"] != 0.999
+        or checked["optimizer_epsilon"] != 1e-8
+        or checked["beta_clip"] != 0.9998
+        or checked["clip_mult"] != 20.0
+        or checked["weight_decay"] != 0.0
+        or checked["norm_decay"] != 0.99
+        or checked["norm_epsilon"] != 1e-8
+    ):
+        raise ValueError("Intentional Updates hyperparameters drift from the frozen protocol")
     return checked
 
 
@@ -1591,8 +1603,10 @@ def _make_intentional_updates_learner(
             & jnp.all(jnp.isfinite(norm_var))
             & jnp.isfinite(norm_count)
             & (step >= 0)
-            & (clip_step >= 0)
+            & (clip_step == step)
+            & (step < jnp.asarray((1 << 31) - 1, dtype=jnp.int32))
             & (norm_count >= 0.0)
+            & jnp.all(norm_var > 0.0)
             & (checked_y >= 0)
             & (checked_y < checked_params["b3"].shape[0])
         )
@@ -8713,6 +8727,32 @@ def _intentional_updates_persistent_numeric_bytes(
     return parameter_bytes + normalizer_bytes + mechanism_bytes
 
 
+_INTENTIONAL_MAX_RECORD_TASKS = 1_000_000
+_INTENTIONAL_MAX_PERSISTENT_BYTES = 256 * 1024 * 1024
+
+
+def _canonical_intentional_screening_result(result: object) -> ScreeningRunResult:
+    """Re-run host dataclass gates after possible frozen-instance mutation."""
+    if type(result) is not ScreeningRunResult:
+        raise TypeError("result must be an exact ScreeningRunResult")
+    if type(result.config) is not IPMNISTConfig:
+        raise TypeError("result.config must be an exact IPMNISTConfig")
+    config = IPMNISTConfig(**result.config.to_config())
+    return ScreeningRunResult(
+        config_name=result.config_name,
+        base_learner=result.base_learner,
+        hyperparameters=result.hyperparameters,
+        seed=result.seed,
+        config=config,
+        per_task_accuracy=result.per_task_accuracy,
+        per_task_loss=result.per_task_loss,
+        per_task_plasticity=result.per_task_plasticity,
+        wall_clock_seconds=result.wall_clock_seconds,
+        noise_mode=result.noise_mode,
+        noise_pool_steps=result.noise_pool_steps,
+    )
+
+
 def intentional_updates_development_record(
     result: ScreeningRunResult,
 ) -> dict[str, Any]:
@@ -8723,16 +8763,31 @@ def intentional_updates_development_record(
     resource counters requested by issue #1561 without creating or mutating
     anything under ``outputs/``.
     """
-    if type(result) is not ScreeningRunResult:
-        raise TypeError("result must be an exact ScreeningRunResult")
+    result = _canonical_intentional_screening_result(result)
+    if result.noise_mode != "step" or result.noise_pool_steps is not None:
+        raise ValueError("Intentional Updates records require exact-step execution")
     spec = SCREENING_REGISTRY.get(result.config_name)
     if spec is None or spec.mechanism != "intentional_updates":
         raise ValueError("result must use a registered Intentional Updates arm")
-    if result.hyperparameters != spec.hyperparameters:
+    if result.base_learner != spec.base_learner:
+        raise ValueError("result base learner must match the registered arm")
+    if _intentional_updates_hp(result.hyperparameters) != spec.hyperparameters:
         raise ValueError("result hyperparameters must match the registered arm")
     steps = result.config.n_steps
     mechanism_enabled = spec.hyperparameters["intentional_enabled"] == 1.0
     feature_updates = spec.hyperparameters["update_features"] == 1.0
+    persistent_bytes = _intentional_updates_persistent_numeric_bytes(
+        result.config, mechanism_enabled=mechanism_enabled
+    )
+    if steps > ((1 << 31) - 1) // 2:
+        raise ValueError("Intentional Updates model-query budget exceeds signed int32")
+    if persistent_bytes > _INTENTIONAL_MAX_PERSISTENT_BYTES:
+        raise ValueError("Intentional Updates persistent state exceeds 256 MiB")
+    scaled_correct = result.per_task_accuracy * result.config.task_length
+    correct_array = np.rint(scaled_correct)
+    if not np.allclose(scaled_correct, correct_array, rtol=0.0, atol=1e-5):
+        raise ValueError("per_task_accuracy must derive from integer correct counts")
+    per_task_correct = [int(value) for value in correct_array]
     return {
         "schema": INTENTIONAL_UPDATES_RECORD_SCHEMA,
         "references": {
@@ -8773,14 +8828,16 @@ def intentional_updates_development_record(
             # value_and_grad performs one pre-update model evaluation and
             # _step_metrics performs the post-update same-example query.
             "model_queries": 2 * steps,
-            "persistent_numeric_bytes": _intentional_updates_persistent_numeric_bytes(
-                result.config, mechanism_enabled=mechanism_enabled
-            ),
+            "persistent_numeric_bytes": persistent_bytes,
             "timing_telemetry_seconds": float(result.wall_clock_seconds),
             "timing_is_selection_metric": False,
         },
         "metrics": {
-            "per_task_accuracy": result.per_task_accuracy.tolist(),
+            "per_task_correct": per_task_correct,
+            "online_correct": sum(per_task_correct),
+            "per_task_accuracy": [
+                value / result.config.task_length for value in per_task_correct
+            ],
             "per_task_loss": result.per_task_loss.tolist(),
             "per_task_plasticity": result.per_task_plasticity.tolist(),
         },
@@ -8810,36 +8867,185 @@ def _trusted_intentional_json(value: object, *, context: str) -> object:
     raise ValueError(f"{context} must contain only finite exact JSON values")
 
 
+def _intentional_exact_object(
+    value: object, keys: frozenset[str], *, context: str
+) -> dict[str, Any]:
+    if type(value) is not dict:
+        raise ValueError(f"{context} must be an exact object")
+    resolved = cast(dict[str, Any], value)
+    if frozenset(resolved) != keys:
+        raise ValueError(f"{context} keys do not match the frozen schema")
+    return resolved
+
+
+def _intentional_exact_int(value: object, *, context: str, positive: bool = False) -> int:
+    minimum = 1 if positive else 0
+    if type(value) is not int or not minimum <= value <= (1 << 31) - 1:
+        raise ValueError(f"{context} must be a bounded exact integer")
+    return value
+
+
 def validate_intentional_updates_development_record(
     record: object,
 ) -> dict[str, Any]:
     """Fail closed over an Intentional Updates development record."""
     if type(record) is not dict:
         raise ValueError("Intentional Updates record must be an exact object")
-    payload = cast(
-        dict[str, Any], _trusted_intentional_json(record, context="Intentional Updates record")
+    payload = _intentional_exact_object(
+        _trusted_intentional_json(record, context="Intentional Updates record"),
+        frozenset(
+            {
+                "schema",
+                "references",
+                "arm",
+                "seed",
+                "config",
+                "hyperparameters",
+                "matched_axes",
+                "policy",
+                "gates",
+                "resources",
+                "metrics",
+            }
+        ),
+        context="Intentional Updates record",
     )
-    policy = payload.get("policy")
+    if payload["schema"] != INTENTIONAL_UPDATES_RECORD_SCHEMA or type(payload["schema"]) is not str:
+        raise ValueError("Intentional Updates schema does not match the frozen protocol")
+    references = _intentional_exact_object(
+        payload["references"],
+        frozenset({"paper", "official_code", "equation", "protocol_difference"}),
+        context="references",
+    )
+    if any(type(value) is not str for value in references.values()):
+        raise ValueError("references must contain exact strings")
+    if type(payload["arm"]) is not str:
+        raise ValueError("arm must be an exact string")
+    spec = screening_spec(payload["arm"])
+    if spec.mechanism != "intentional_updates":
+        raise ValueError("arm must be a registered Intentional Updates arm")
+    _intentional_exact_int(payload["seed"], context="seed")
+    config_raw = _intentional_exact_object(
+        payload["config"],
+        frozenset({"n_tasks", "task_length", "input_dim", "hidden1", "hidden2", "n_classes"}),
+        context="config",
+    )
+    for key, value in config_raw.items():
+        _intentional_exact_int(value, context=f"config.{key}", positive=True)
+    if config_raw["n_tasks"] > _INTENTIONAL_MAX_RECORD_TASKS:
+        raise ValueError("config.n_tasks exceeds the bounded record limit")
+    hyperparameters = _intentional_exact_object(
+        payload["hyperparameters"], _INTENTIONAL_UPDATES_HP_KEYS, context="hyperparameters"
+    )
+    if _intentional_updates_hp(hyperparameters) != spec.hyperparameters:
+        raise ValueError("hyperparameters do not match the registered arm")
+    matched_axes = payload["matched_axes"]
+    expected_axes = [
+        "seed",
+        "example_schedule",
+        "observations",
+        "updates",
+        "allowed_boundary_information:none",
+    ]
+    if (
+        type(matched_axes) is not list
+        or len(matched_axes) != len(expected_axes)
+        or any(type(value) is not str for value in matched_axes)
+        or matched_axes != expected_axes
+    ):
+        raise ValueError("matched_axes do not match the frozen protocol")
+    policy = _intentional_exact_object(
+        payload["policy"],
+        frozenset({"development_only", "scientific_promotion_allowed", "publication_equivalent"}),
+        context="policy",
+    )
     if policy != {
         "development_only": True,
         "scientific_promotion_allowed": False,
         "publication_equivalent": False,
-    }:
+    } or any(type(value) is not bool for value in policy.values()):
         raise ValueError("Intentional Updates records are permanently nonpromoting")
+    gates = _intentional_exact_object(
+        payload["gates"],
+        frozenset({"mechanism_enabled", "backpropagation", "feature_updates", "head_updates"}),
+        context="gates",
+    )
+    if any(type(value) is not bool for value in gates.values()):
+        raise ValueError("gates must contain exact booleans")
+    resources = _intentional_exact_object(
+        payload["resources"],
+        frozenset(
+            {
+                "observations",
+                "updates",
+                "backward_passes",
+                "model_queries",
+                "persistent_numeric_bytes",
+                "timing_telemetry_seconds",
+                "timing_is_selection_metric",
+            }
+        ),
+        context="resources",
+    )
+    for key in (
+        "observations",
+        "updates",
+        "backward_passes",
+        "model_queries",
+        "persistent_numeric_bytes",
+    ):
+        _intentional_exact_int(resources[key], context=f"resources.{key}")
+    if (
+        type(resources["timing_telemetry_seconds"]) is not float
+        or not 0.0 <= resources["timing_telemetry_seconds"] <= 604_800.0
+        or resources["timing_is_selection_metric"] is not False
+        or resources["persistent_numeric_bytes"] > _INTENTIONAL_MAX_PERSISTENT_BYTES
+    ):
+        raise ValueError("resources violate the bounded telemetry-only protocol")
+    metrics = _intentional_exact_object(
+        payload["metrics"],
+        frozenset(
+            {
+                "per_task_correct",
+                "online_correct",
+                "per_task_accuracy",
+                "per_task_loss",
+                "per_task_plasticity",
+            }
+        ),
+        context="metrics",
+    )
+    n_tasks = config_raw["n_tasks"]
+    per_task_correct = metrics["per_task_correct"]
+    if (
+        type(per_task_correct) is not list
+        or len(per_task_correct) != n_tasks
+        or any(
+            type(value) is not int or not 0 <= value <= config_raw["task_length"]
+            for value in per_task_correct
+        )
+    ):
+        raise ValueError("per_task_correct must contain bounded exact integers")
+    online_correct = _intentional_exact_int(
+        metrics["online_correct"], context="metrics.online_correct"
+    )
+    if online_correct != sum(per_task_correct):
+        raise ValueError("online_correct must equal the per-task numerator sum")
+    for key in ("per_task_accuracy", "per_task_loss", "per_task_plasticity"):
+        values = metrics[key]
+        if (
+            type(values) is not list
+            or len(values) != n_tasks
+            or any(type(value) is not float or not math.isfinite(value) for value in values)
+        ):
+            raise ValueError(f"{key} must contain one exact finite float per task")
+    expected_accuracy = [value / config_raw["task_length"] for value in per_task_correct]
+    if metrics["per_task_accuracy"] != expected_accuracy:
+        raise ValueError("per_task_accuracy must derive exactly from per_task_correct")
     try:
-        config_raw = payload["config"]
-        if type(config_raw) is not dict:
-            raise TypeError
         config = IPMNISTConfig(**config_raw)
         arm = payload["arm"]
         seed = require_jax_seed(payload["seed"], name="record seed")
-        hyperparameters = payload["hyperparameters"]
-        metrics = payload["metrics"]
-        resources = payload["resources"]
-        if type(arm) is not str or type(hyperparameters) is not dict:
-            raise TypeError
-        if type(metrics) is not dict or type(resources) is not dict:
-            raise TypeError
         result = ScreeningRunResult(
             config_name=arm,
             base_learner=screening_spec(arm).base_learner,
@@ -8908,6 +9114,15 @@ def run_screening_config(
         er_batch_size = int(spec.hyperparameters["er_batch_size"])
         if config.task_length % er_batch_size != 0:
             raise ValueError("L2-ER requires task_length divisible by er_batch_size")
+    if spec.mechanism == "intentional_updates":
+        enabled = spec.hyperparameters["intentional_enabled"] == 1.0
+        persistent_bytes = _intentional_updates_persistent_numeric_bytes(
+            config, mechanism_enabled=enabled
+        )
+        if config.n_steps > ((1 << 31) - 1) // 2:
+            raise ValueError("Intentional Updates model-query budget exceeds signed int32")
+        if persistent_bytes > _INTENTIONAL_MAX_PERSISTENT_BYTES:
+            raise ValueError("Intentional Updates persistent state exceeds 256 MiB")
     effective_noise_pool_steps = _validated_screening_noise_pool_steps(
         noise_mode,
         noise_pool_steps if noise_mode == "pool" else None,
