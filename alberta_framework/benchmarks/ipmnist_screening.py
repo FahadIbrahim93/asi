@@ -138,7 +138,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from types import MappingProxyType
+from types import FunctionType, MappingProxyType
 from typing import Any, cast
 
 import chex
@@ -5326,10 +5326,26 @@ class ScreeningSpec:
             val = getattr(self, attr)
             if type(val) is not str or not val:
                 raise ValueError(f"{attr} must be a non-empty string")
+        if type(self.base_learner) is not str or self.base_learner not in ("upgd_w", "adamw"):
+            raise ValueError("base_learner must name one supported screening learner")
+        if type(self.description) is not str:
+            raise TypeError("description must be an exact string")
         if type(self.hyperparameters) is not dict:
             raise TypeError("hyperparameters must be a dict")
-        if not callable(self.factory):
-            raise TypeError("factory must be callable")
+        normalized: dict[str, float] = {}
+        for key, value in self.hyperparameters.items():
+            if type(key) is not str or not key:
+                raise TypeError("hyperparameter keys must be exact non-empty strings")
+            if type(value) not in (int, float) or not math.isfinite(value):
+                raise ValueError("hyperparameter values must be finite built-in numbers")
+            normalized[key] = float(value)
+        object.__setattr__(self, "hyperparameters", normalized)
+        if type(self.factory) is not FunctionType:
+            raise TypeError("factory must be an exact Python function")
+        for name in ("noise_update", "frozen_probe_input"):
+            value = getattr(self, name)
+            if value is not None and type(value) is not FunctionType:
+                raise TypeError(f"{name} must be an exact Python function or None")
 
 
 def _upgd_hp(**overrides: float) -> dict[str, float]:
@@ -7694,18 +7710,46 @@ class ScreeningRunResult:
             val = getattr(self, attr)
             if type(val) is not str or not val:
                 raise ValueError(f"{attr} must be a non-empty string")
+        if type(self.base_learner) is not str or self.base_learner not in ("upgd_w", "adamw"):
+            raise ValueError("base_learner must name one supported screening learner")
+        if type(self.noise_mode) is not str or self.noise_mode not in ("step", "pool"):
+            raise ValueError("noise_mode must be 'step' or 'pool'")
         if type(self.hyperparameters) is not dict:
             raise TypeError("hyperparameters must be a dict")
+        normalized: dict[str, float] = {}
+        for key, value in self.hyperparameters.items():
+            if type(key) is not str or not key:
+                raise TypeError("hyperparameter keys must be exact non-empty strings")
+            if type(value) not in (int, float) or not math.isfinite(value):
+                raise ValueError("hyperparameter values must be finite built-in numbers")
+            normalized[key] = float(value)
+        object.__setattr__(self, "hyperparameters", normalized)
         object.__setattr__(self, "seed", require_jax_seed(self.seed, name="seed"))
         if type(self.config) is not IPMNISTConfig:
             raise TypeError("config must be an IPMNISTConfig")
-        for arr_name in ("per_task_accuracy", "per_task_loss", "per_task_plasticity"):
-            if type(getattr(self, arr_name)) is not np.ndarray:
-                raise TypeError(f"{arr_name} must be a numpy ndarray")
         if type(self.wall_clock_seconds) not in (int, float) or not math.isfinite(
             self.wall_clock_seconds
-        ):
+        ) or self.wall_clock_seconds < 0.0:
             raise ValueError("wall_clock_seconds must be a finite float")
+        for arr_name in ("per_task_accuracy", "per_task_loss", "per_task_plasticity"):
+            array = getattr(self, arr_name)
+            if type(array) is not np.ndarray:
+                raise TypeError(f"{arr_name} must be a numpy ndarray")
+            if array.dtype != np.dtype(np.float64) or array.shape != (self.config.n_tasks,):
+                raise ValueError(f"{arr_name} must be one float64 value per task")
+            if not np.isfinite(array).all():
+                raise ValueError(f"{arr_name} must contain only finite values")
+        if np.any((self.per_task_accuracy < 0.0) | (self.per_task_accuracy > 1.0)):
+            raise ValueError("per_task_accuracy must lie in [0, 1]")
+        if np.any(self.per_task_loss < 0.0):
+            raise ValueError("per_task_loss must be non-negative")
+        if np.any((self.per_task_plasticity < 0.0) | (self.per_task_plasticity > 1.0)):
+            raise ValueError("per_task_plasticity must lie in [0, 1]")
+        object.__setattr__(
+            self,
+            "noise_pool_steps",
+            _validated_screening_noise_pool_steps(self.noise_mode, self.noise_pool_steps),
+        )
 
 
 def run_screening_config(
