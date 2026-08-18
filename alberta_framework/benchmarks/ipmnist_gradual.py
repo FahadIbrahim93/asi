@@ -29,6 +29,7 @@ _MODES = frozenset(
     {"abrupt", "input_interpolation", "output_interpolation", "task_sampling"}
 )
 _INT32_MAX = 2**31 - 1
+_MAX_ARRAY_ELEMENTS = 1_000_000
 
 GRADUAL_IPMNIST_PROTOCOL = MappingProxyType(
     {
@@ -42,6 +43,7 @@ GRADUAL_IPMNIST_PROTOCOL = MappingProxyType(
         "matched_axes": ("seed", "updates", "observations", "example_order"),
         "learner_observes_transition_alpha": False,
         "learner_observes_task_boundary": False,
+        "transaction_validity_required": True,
         "persistent_bytes_accounting_required": True,
         "environment_steps_accounting_required": True,
         "model_queries_accounting_required": True,
@@ -102,18 +104,43 @@ def transition_alpha(step: int, config: GradualTransitionConfig) -> float:
     return min(resolved_step / config.transition_steps, 1.0)
 
 
-def input_interpolation(old: Array, new: Array, alpha: float) -> Array:
-    """Apply paper equation ``x_alpha = (1-alpha)x_old + alpha*x_new``."""
+def input_interpolation_transaction(
+    old: object, new: object, alpha: float
+) -> tuple[Array, Array]:
+    """Return a finite interpolation candidate and a traced validity bit."""
     resolved = _alpha(alpha)
+    old_type = type(old)
+    new_type = type(new)
+    if not (
+        old_type is np.ndarray or issubclass(old_type, (jax.Array, jax.core.Tracer))
+    ) or not (
+        new_type is np.ndarray or issubclass(new_type, (jax.Array, jax.core.Tracer))
+    ):
+        raise ValueError("old and new inputs must be exact NumPy or JAX arrays")
     old_array = jnp.asarray(old)
     new_array = jnp.asarray(new)
     if old_array.shape != new_array.shape:
         raise ValueError("old and new inputs must have identical shapes")
+    if old_array.size < 1 or old_array.size > _MAX_ARRAY_ELEMENTS:
+        raise ValueError("input size must be in [1, 1000000]")
     if old_array.dtype != new_array.dtype or not jnp.issubdtype(old_array.dtype, jnp.floating):
         raise ValueError("old and new inputs must share a floating dtype")
-    if not bool(jnp.all(jnp.isfinite(old_array))) or not bool(jnp.all(jnp.isfinite(new_array))):
-        raise ValueError("old and new inputs must contain only finite values")
-    return (1.0 - resolved) * old_array + resolved * new_array
+    candidate = (1.0 - resolved) * old_array + resolved * new_array
+    valid = (
+        jnp.all(jnp.isfinite(old_array))
+        & jnp.all(jnp.isfinite(new_array))
+        & jnp.all(jnp.isfinite(candidate))
+    )
+    safe = jnp.where(valid, candidate, jnp.zeros_like(candidate))
+    return safe, valid
+
+
+def input_interpolation(old: object, new: object, alpha: float) -> Array:
+    """Apply paper equation ``x_alpha = (1-alpha)x_old + alpha*x_new``."""
+    safe, valid = input_interpolation_transaction(old, new, alpha)
+    if not isinstance(valid, jax.core.Tracer) and not bool(valid):
+        raise ValueError("old and new inputs must produce only finite values")
+    return safe
 
 
 def output_interpolation(
@@ -122,6 +149,8 @@ def output_interpolation(
     """Interpolate old one-hot -> uniform -> new one-hot as paper section 4."""
     resolved_alpha = _alpha(alpha)
     classes = _exact_index("n_classes", n_classes, minimum=2)
+    if classes > _MAX_ARRAY_ELEMENTS:
+        raise ValueError("n_classes must be at most 1000000")
     old = _exact_index("old_label", old_label, minimum=0)
     new = _exact_index("new_label", new_label, minimum=0)
     if old >= classes or new >= classes:
@@ -146,6 +175,8 @@ def task_sampling_mask(
     resolved_seed = require_jax_seed(seed, name="seed")
     resolved_transition = _exact_index("transition_id", transition_id, minimum=0)
     resolved_count = _exact_index("count", count, minimum=1)
+    if resolved_count > _MAX_ARRAY_ELEMENTS:
+        raise ValueError("count must be at most 1000000")
     new_count = math.floor(_alpha(alpha) * resolved_count)
     order = np.asarray(
         jax.device_get(

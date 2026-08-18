@@ -38,3 +38,18 @@ def test_protocol_keeps_ceilings_separate_and_nonpromoting() -> None:
     assert CEILING_PROTOCOL["methods"] == ("replay", "in_context", "randumb", "ranpac", "prol")
     assert CEILING_PROTOCOL["pretraining_allowed_but_charged"] is True
     assert CEILING_PROTOCOL["scientific_promotion_allowed"] is False
+
+
+def test_ceiling_resources_reject_derived_overflow() -> None:
+    with pytest.raises(ValueError, match="total steps"):
+        CeilingResourceLedger(
+            persistent_bytes=0,
+            replay_bytes=0,
+            environment_steps=2**31 - 1,
+            pretraining_steps=1,
+            model_queries=0,
+            extractor_queries=0,
+        )
+    config = FrozenFeatureCeiling(method="replay", feature_dim=1, replay_capacity=2)
+    with pytest.raises(ValueError, match="derived replay"):
+        config.persistent_replay_bytes(example_bytes=256 * 1024 * 1024)
