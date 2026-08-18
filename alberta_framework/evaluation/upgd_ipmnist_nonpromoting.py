@@ -226,6 +226,22 @@ class UPGDIPMNISTValidation:
     development_only: bool = True
     scientific_promotion_allowed: bool = False
 
+    def __post_init__(self) -> None:
+        if type(self.valid) is not bool:
+            raise ValueError("valid must be a boolean")
+        if type(self.errors) is not tuple or not all(isinstance(e, str) for e in self.errors):
+            raise ValueError("errors must be a tuple of strings")
+        if type(self.partial_sha256) is not tuple:
+            raise ValueError("partial_sha256 must be a tuple")
+        if self.artifact_sha256 is not None and type(self.artifact_sha256) is not str:
+            raise ValueError("artifact_sha256 must be a string or None")
+        if type(self.observed_seed_pairs) is not tuple:
+            raise ValueError("observed_seed_pairs must be a tuple")
+        if self.development_only is not True:
+            raise ValueError("development_only must permanently remain True")
+        if self.scientific_promotion_allowed is not False:
+            raise ValueError("scientific_promotion_allowed must permanently remain False")
+
 
 @dataclass(frozen=True)
 class _Shard:
