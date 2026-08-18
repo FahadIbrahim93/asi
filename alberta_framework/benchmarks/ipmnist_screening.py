@@ -175,6 +175,12 @@ from alberta_framework.benchmarks.upgd_ipmnist import (
     mlp_logits,
     validated_ipmnist_data,
 )
+from alberta_framework.core.adamo import AdamO, AdamOConfig, isometry_gradient
+from alberta_framework.core.baseline_optimizers import Adam
+from alberta_framework.core.update_safety import (
+    floating_tree_is_finite,
+    select_transaction,
+)
 from alberta_framework.evaluation.recurring_ipmnist_retention import (
     RecurringIPMNISTPhase,
     RecurringIPMNISTProtocol,
@@ -5389,6 +5395,129 @@ def _control_factory(
     return factory
 
 
+def _make_adamo_raw_learner(
+    hp: Mapping[str, float],
+) -> tuple[LearnerInitFn, LearnerStepFn]:
+    """AdamO equations 16/19/20 adapted to the protocol MLP.
+
+    Every matrix weight receives the rectangular Gram penalty; bias vectors
+    remain unregularized. The task-gradient Adam moments never observe the
+    isometry gradient. ``isometry_strength=0`` reduces bit-exactly to the
+    protocol AdamW arm (whose selected weight decay is zero).
+    """
+
+    optimizer = AdamO(
+        AdamOConfig(
+            step_size=hp["step_size"],
+            beta1=hp["beta1"],
+            beta2=hp["beta2"],
+            eps=hp["eps"],
+            isometry_strength=hp["isometry_strength"],
+            isometry_step_size=hp["isometry_step_size"],
+        )
+    )
+
+    def init_fn(params: dict[str, Array]) -> dict[str, Any]:
+        return {
+            name: optimizer.init_for_shape(value.shape) for name, value in params.items()
+        }
+
+    def step_fn(
+        params: dict[str, Array],
+        state: dict[str, Any],
+        grads: dict[str, Array],
+        key: Array,
+    ) -> tuple[dict[str, Array], dict[str, Any]]:
+        del key
+        candidate_params: dict[str, Array] = {}
+        candidate_state: dict[str, Any] = {}
+        update_applied = jnp.asarray(True, dtype=jnp.bool_)
+        for name, value in params.items():
+            update = optimizer.update_from_gradient_checked(
+                state[name], grads[name], value, regularize=value.ndim == 2
+            )
+            candidate_params[name] = value - update.step
+            candidate_state[name] = update.new_state
+            update_applied = update_applied & update.update_applied
+        update_applied = (
+            update_applied
+            & floating_tree_is_finite(params)
+            & floating_tree_is_finite(state)
+            & floating_tree_is_finite(grads)
+            & floating_tree_is_finite(candidate_params)
+            & floating_tree_is_finite(candidate_state)
+        )
+        return (
+            select_transaction(update_applied, candidate_params, params),
+            select_transaction(update_applied, candidate_state, state),
+        )
+
+    return init_fn, step_fn
+
+
+def _make_adamo_learner(
+    hp: Mapping[str, float],
+) -> tuple[LearnerInitFn, ScreeningStepFn]:
+    return _wrap_grad_learner(*_make_adamo_raw_learner(hp))
+
+
+def _make_joint_adam_isometry_learner(
+    hp: Mapping[str, float],
+) -> tuple[LearnerInitFn, ScreeningStepFn]:
+    """Naive equation-18 Adam control whose moments mix both gradients."""
+
+    optimizer = Adam(
+        step_size=hp["step_size"],
+        beta1=hp["beta1"],
+        beta2=hp["beta2"],
+        eps=hp["eps"],
+        weight_decay=0.0,
+    )
+
+    def init_fn(params: dict[str, Array]) -> dict[str, Any]:
+        return {
+            name: optimizer.init_for_shape(value.shape) for name, value in params.items()
+        }
+
+    def step_fn(
+        params: dict[str, Array],
+        state: dict[str, Any],
+        grads: dict[str, Array],
+        key: Array,
+    ) -> tuple[dict[str, Array], dict[str, Any]]:
+        del key
+        candidate_params: dict[str, Array] = {}
+        candidate_state: dict[str, Any] = {}
+        update_applied = jnp.asarray(True, dtype=jnp.bool_)
+        for name, value in params.items():
+            combined_gradient = grads[name]
+            if value.ndim == 2 and hp["isometry_strength"] != 0.0:
+                combined_gradient = (
+                    combined_gradient
+                    + hp["isometry_strength"] * isometry_gradient(value)
+                )
+            update = optimizer.update_from_gradient_checked(
+                state[name], combined_gradient, error=None, param=value
+            )
+            candidate_params[name] = value - update.step
+            candidate_state[name] = update.new_state
+            update_applied = update_applied & update.update_applied
+        update_applied = (
+            update_applied
+            & floating_tree_is_finite(params)
+            & floating_tree_is_finite(state)
+            & floating_tree_is_finite(grads)
+            & floating_tree_is_finite(candidate_params)
+            & floating_tree_is_finite(candidate_state)
+        )
+        return (
+            select_transaction(update_applied, candidate_params, params),
+            select_transaction(update_applied, candidate_state, state),
+        )
+
+    return _wrap_grad_learner(init_fn, step_fn)
+
+
 _CBP_DEFAULTS = {
     "cbp_decay_rate": 0.99,
     "cbp_replacement_rate": 1e-4,
@@ -5414,6 +5543,49 @@ def _build_registry() -> dict[str, ScreeningSpec]:
             hyperparameters=dict(ADAMW_PROTOCOL_HYPERPARAMETERS),
             factory=_control_factory(_make_adamw_learner),
             description="Published AdamW baseline (proxy-ordering validation arm).",
+        ),
+        ScreeningSpec(
+            name="adamo_inert",
+            base_learner="adamw",
+            mechanism="decoupled_isometry_inert",
+            hyperparameters={
+                **ADAMW_PROTOCOL_HYPERPARAMETERS,
+                "isometry_strength": 0.0,
+                "isometry_step_size": ADAMW_PROTOCOL_HYPERPARAMETERS["step_size"],
+            },
+            factory=_make_adamo_learner,
+            description=(
+                "AdamO implementation with lambda=0; exact AdamW mechanism-off reduction."
+            ),
+        ),
+        ScreeningSpec(
+            name="adamo_l1e3",
+            base_learner="adamw",
+            mechanism="decoupled_isometry",
+            hyperparameters={
+                **ADAMW_PROTOCOL_HYPERPARAMETERS,
+                "isometry_strength": 1e-3,
+                "isometry_step_size": ADAMW_PROTOCOL_HYPERPARAMETERS["step_size"],
+            },
+            factory=_make_adamo_learner,
+            description=(
+                "AdamO equation-20 decoupled Gram-isometry step; paper lambda=1e-3, "
+                "adapted to ASI's matched AdamW hyperparameters and IPMNIST schedule."
+            ),
+        ),
+        ScreeningSpec(
+            name="adam_iso_joint_l1e3",
+            base_learner="adamw",
+            mechanism="joint_isometry",
+            hyperparameters={
+                **ADAMW_PROTOCOL_HYPERPARAMETERS,
+                "isometry_strength": 1e-3,
+            },
+            factory=_make_joint_adam_isometry_learner,
+            description=(
+                "Naive equation-18 composite-loss Adam control: task and isometry "
+                "gradients share moment statistics."
+            ),
         ),
         ScreeningSpec(
             name="upgd_idbd",

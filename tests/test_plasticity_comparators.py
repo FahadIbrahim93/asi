@@ -255,6 +255,29 @@ def test_protocol_and_formula_boundaries_fail_before_dispatch() -> None:
             mode=HostileValue(),  # type: ignore[arg-type]
         )
 
+    class HostileArrayIdentity:
+        calls = 0
+
+        @property
+        def __class__(self) -> type[object]:
+            self.calls += 1
+            raise AssertionError("hostile __class__ must not run")
+
+    hostile_array = HostileArrayIdentity()
+    with pytest.raises(ValueError, match="arrays"):
+        persistent_array_bytes(hostile_array)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="active"):
+        bounded_elastic_mask(hostile_array, np.ones(1), grow=0, prune=0)  # type: ignore[arg-type]
+    assert hostile_array.calls == 0
+
+    with pytest.raises(ValueError, match="element limit"):
+        bounded_elastic_mask(
+            np.zeros(1_000_001, dtype=np.bool_),
+            np.zeros(1_000_001, dtype=np.float32),
+            grow=0,
+            prune=0,
+        )
+
 
 def test_jitted_pure_kernel_matches_eager_without_partial_state() -> None:
     eager = isometry_gradient(jnp.eye(3, dtype=jnp.float32))
@@ -264,8 +287,19 @@ def test_jitted_pure_kernel_matches_eager_without_partial_state() -> None:
     overflowing = jnp.full((2, 2), 1e30, dtype=jnp.float32)
     with pytest.raises(ValueError, match="finite"):
         isometry_gradient(overflowing)
-    np.testing.assert_array_equal(
-        jax.jit(isometry_gradient)(overflowing), jnp.zeros_like(overflowing)
-    )
+    assert bool(jnp.all(jnp.isnan(jax.jit(isometry_gradient)(overflowing))))
+
+    updated = jax.jit(
+        lambda weights: adamo_update(
+            weights,
+            jnp.ones_like(weights),
+            jnp.zeros_like(weights),
+            jnp.zeros_like(weights),
+            step=1,
+            learning_rate=0.01,
+            isometry_strength=1.0,
+        )
+    )(overflowing)
+    assert all(bool(jnp.all(jnp.isnan(value))) for value in updated)
     with pytest.raises(ValueError, match="Threefry"):
         interval_dropout(jnp.ones(1), jnp.asarray([0, 0], dtype=jnp.uint32), relu_probability=1)

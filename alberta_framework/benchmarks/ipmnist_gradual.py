@@ -138,7 +138,9 @@ def input_interpolation_transaction(
 def input_interpolation(old: object, new: object, alpha: float) -> Array:
     """Apply paper equation ``x_alpha = (1-alpha)x_old + alpha*x_new``."""
     safe, valid = input_interpolation_transaction(old, new, alpha)
-    if not isinstance(valid, jax.core.Tracer) and not bool(valid):
+    if isinstance(valid, jax.core.Tracer):
+        return jnp.where(valid, safe, jnp.full_like(safe, jnp.nan))
+    if not bool(valid):
         raise ValueError("old and new inputs must produce only finite values")
     return safe
 

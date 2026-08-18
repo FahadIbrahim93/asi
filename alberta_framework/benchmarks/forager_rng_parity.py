@@ -165,7 +165,7 @@ class FixedActionProbeConfig:
     actions: tuple[int, ...]
 
     def __post_init__(self) -> None:
-        if isinstance(self.seed, bool) or not isinstance(self.seed, int):
+        if type(self.seed) is not int:
             raise ForagerRngParityError("seed must be an integer")
         if not 0 <= self.seed <= MAX_SEED:
             raise ForagerRngParityError(f"seed must lie in [0, {MAX_SEED}]")
@@ -174,7 +174,7 @@ class FixedActionProbeConfig:
         if not self.actions or len(self.actions) > MAX_ACTIONS:
             raise ForagerRngParityError(f"actions must contain between 1 and {MAX_ACTIONS} entries")
         for index, action in enumerate(self.actions):
-            if isinstance(action, bool) or not isinstance(action, int):
+            if type(action) is not int:
                 raise ForagerRngParityError(f"actions[{index}] must be an integer")
             if not 0 <= action < 4:
                 raise ForagerRngParityError(f"actions[{index}] must lie in [0, 3]")

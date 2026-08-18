@@ -49,6 +49,10 @@ class PolicyEntry:
             or len(self.identity) > _MAX_IDENTITY_CHARACTERS
         ):
             raise ValueError("identity must be a non-empty string")
+        try:
+            self.identity.encode("utf-8")
+        except UnicodeEncodeError as error:
+            raise ValueError("identity must be valid UTF-8 text") from error
         if (
             type(self.policy_bytes) is not bytes
             or not self.policy_bytes

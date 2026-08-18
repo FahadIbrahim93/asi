@@ -591,10 +591,10 @@ class LMS(Optimizer[LMSState]):
             step_size: Fixed learning rate
 
         Raises:
-            ValueError: If ``step_size`` is not a finite non-bool positive real.
+            ValueError: If ``step_size`` is not a finite non-bool nonnegative real.
         """
         self._step_size = validated_float32_scalar(
-            "step_size", step_size, positive=True
+            "step_size", step_size, lower=0.0
         )
 
     def to_config(self) -> dict[str, Any]:

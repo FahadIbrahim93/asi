@@ -212,11 +212,20 @@ def test_streaming_matrix_validator_rejects_scalar_subclasses_without_equality_h
 def test_geometry_primitives_are_outer_jit_safe() -> None:
     corrected = jax.jit(orthogonal_correction)(jnp.array([1.0, 2.0]), jnp.array([[1.0, 0.0]]))
     np.testing.assert_allclose(corrected, [0.0, 2.0])
+    invalid = jax.jit(flad_noise_component)(jnp.array([jnp.nan]), jnp.ones(1))
+    assert bool(jnp.all(jnp.isnan(invalid)))
+    safe, valid = jax.jit(flad_noise_component_transaction)(
+        jnp.array([jnp.nan]), jnp.ones(1)
+    )
+    np.testing.assert_array_equal(safe, jnp.zeros(1))
+    assert not bool(valid)
 
 
 def test_geometry_rejects_empty_flad_and_hostile_array() -> None:
     with pytest.raises(ValueError, match="non-empty"):
         flad_noise_component(jnp.zeros(0), jnp.zeros(0))
+    with pytest.raises(ValueError, match="non-empty"):
+        orthogonal_correction(jnp.zeros(0), jnp.zeros((0, 0)))
 
     class Hostile:
         calls = 0
@@ -232,7 +241,7 @@ def test_geometry_rejects_empty_flad_and_hostile_array() -> None:
 
 
 def test_geometry_float32_overflow_is_invalid_not_laundered() -> None:
-    maximum = jnp.finfo(jnp.float32).max
+    maximum = np.float32(np.finfo(np.float32).max)
     matrix, matrix_valid = jax.jit(spectral_matrix_sign_transaction)(jnp.full((2, 2), maximum))
     assert bool(jnp.all(jnp.isfinite(matrix)))
     assert not bool(matrix_valid)
