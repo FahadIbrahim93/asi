@@ -23,6 +23,7 @@ from alberta_framework.prototype_reference_adapter import (
     PrototypeReferenceAdapter,
 )
 from alberta_framework.reference_agent import (
+    ArrayValue,
     AuthorizationStatus,
     DecisionOwnershipError,
     DispatchAck,
@@ -30,6 +31,7 @@ from alberta_framework.reference_agent import (
     DispatchCommand,
     DispatchStatus,
     ReferenceAgentUpdate,
+    SpaceSpec,
     ReferenceTransactionLedger,
     ReferenceTransactionReducer,
     TransactionPhase,
@@ -38,6 +40,7 @@ from alberta_framework.reference_life import (
     ExactDispatchAdapter,
     ExactDispatchConfig,
     HaltStage,
+    LifeHalt,
     LifePhase,
     RecoveryMode,
     ReferenceLifeConfig,
@@ -58,6 +61,20 @@ from alberta_framework.streams.closed_loop import (
 pytestmark = pytest.mark.unit
 
 _LIFECYCLE_ID = "prototype.0000000100000002"
+
+
+class _HostileInt(int):
+    hook_calls = 0
+
+    def _explode(self) -> bool:
+        type(self).hook_calls += 1
+        raise AssertionError("hostile integer comparison hook executed")
+
+    __eq__ = lambda self, other: self._explode()
+    __lt__ = lambda self, other: self._explode()
+    __le__ = lambda self, other: self._explode()
+    __gt__ = lambda self, other: self._explode()
+    __ge__ = lambda self, other: self._explode()
 
 
 class _HostileHaltReason(str):
@@ -108,6 +125,60 @@ def _runner(
         seed=7,
         max_accepted_events=horizon,
     )
+
+
+def test_reference_life_host_integer_identities_fail_before_comparison_hooks() -> None:
+    runner = _runner()
+    state = runner.init()
+    hostile = _HostileInt(1)
+    checks = (
+        lambda: SpaceSpec.discrete(
+            cardinality=hostile,
+            dtype="int32",
+            semantic_id="tests.hostile_action.v1",
+        ),
+        lambda: dataclasses.replace(
+            state.transaction_state, next_decision_index=hostile
+        ),
+        lambda: dataclasses.replace(state.agent_state, decision_index=hostile),
+        lambda: dataclasses.replace(runner.config, seed=hostile),
+        lambda: dataclasses.replace(runner.config, max_accepted_events=hostile),
+        lambda: LifeHalt(
+            stage=HaltStage.PRE_DISPATCH,
+            recovery_mode=RecoveryMode.RETRY_OUTCOME,
+            reason="fixture",
+            recovery_attempts=hostile,
+        ),
+        lambda: dataclasses.replace(state, accepted_events=hostile),
+    )
+    for check in checks:
+        _HostileInt.hook_calls = 0
+        with pytest.raises(ValueError, match="integer|count|uint32|nonnegative"):
+            check()
+        assert _HostileInt.hook_calls == 0
+
+
+def test_switching_execution_rejects_boolean_decoded_action(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _runner()
+    state = runner.init()
+    step = runner.step(state)
+    assert step.event is not None
+    execution = runner.environment_adapter.execute(
+        state.environment_state,
+        step.event.command,
+        key=jr.key(99),
+    )
+    monkeypatch.setattr(ArrayValue, "to_python", lambda self: True)
+
+    with pytest.raises(DecisionOwnershipError, match="not a scalar integer"):
+        runner.environment_adapter.validate_execution(
+            state.environment_state,
+            step.event.command,
+            execution,
+            key=jr.key(99),
+        )
 
 
 def _corrupt_accepted_update(

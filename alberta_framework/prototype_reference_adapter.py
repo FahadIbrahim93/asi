@@ -98,8 +98,7 @@ class PrototypeReferenceState:
         ) is None:
             raise ValueError("lifecycle_id must use the Prototype lifecycle codec")
         if (
-            isinstance(self.decision_index, bool)
-            or not isinstance(self.decision_index, int)
+            type(self.decision_index) is not int
             or self.decision_index < 0
             or self.decision_index > MAX_DECISION_INDEX
         ):

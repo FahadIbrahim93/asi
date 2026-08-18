@@ -257,8 +257,7 @@ class ReferenceEnvironmentManifest:
         if not isinstance(self.action_spec, SpaceSpec):
             raise ValueError("action_spec must be a SpaceSpec")
         if (
-            isinstance(self.max_executions, bool)
-            or not isinstance(self.max_executions, int)
+            type(self.max_executions) is not int
             or self.max_executions <= 0
         ):
             raise ValueError("max_executions must be a positive integer")
@@ -398,7 +397,7 @@ class ExactDispatchState:
         _require_digest(self.manifest_id, name="manifest_id")
         for name in ("authorizations", "commands_issued", "receipts_recorded"):
             value = getattr(self, name)
-            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            if type(value) is not int or value < 0:
                 raise ValueError(f"{name} must be a nonnegative integer")
         if not (self.receipts_recorded <= self.commands_issued <= self.authorizations):
             raise ValueError("dispatch counters are out of order")
@@ -534,7 +533,7 @@ class ReferenceLifeMetricsState:
             "current_segment_events",
         ):
             value = getattr(self, name)
-            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            if type(value) is not int or value < 0:
                 raise ValueError(f"{name} must be a nonnegative integer")
         if self.current_phase not in (0, 1):
             raise ValueError("current_phase must be 0 or 1")
@@ -850,8 +849,7 @@ class SwitchingTwoStateReferenceEnvironment:
         _require_id(executor_epoch, name="executor_epoch")
         phase_length = config.phase_length
         if (
-            isinstance(phase_length, bool)
-            or not isinstance(phase_length, int)
+            type(phase_length) is not int
             or phase_length <= 0
             or phase_length > _MAX_SWITCHING_EXECUTIONS
         ):
@@ -1057,7 +1055,7 @@ class SwitchingTwoStateReferenceEnvironment:
             raise DecisionOwnershipError("execution step counter did not advance exactly once")
         applied = self.manifest.action_spec.encode(execution.applied_action)
         applied_value = applied.to_python()
-        if not isinstance(applied_value, int):
+        if type(applied_value) is not int:
             raise DecisionOwnershipError("execution applied action is not a scalar integer")
         next_state_index = int(np.asarray(execution.state.state_index))
         if next_state_index != applied_value:
@@ -1160,8 +1158,7 @@ class RiverSwimReferenceEnvironment:
             raise ValueError("RiverSwim config has the wrong type")
         n_states = config.n_states
         if (
-            isinstance(n_states, bool)
-            or not isinstance(n_states, int)
+            type(n_states) is not int
             or n_states < 2
             or n_states > RIVERSWIM_REFERENCE_MAX_STATES
         ):
@@ -1171,8 +1168,7 @@ class RiverSwimReferenceEnvironment:
             )
         initial_state = config.initial_state
         if (
-            isinstance(initial_state, bool)
-            or not isinstance(initial_state, int)
+            type(initial_state) is not int
             or initial_state < 0
             or initial_state >= n_states
         ):
@@ -1371,7 +1367,7 @@ class RiverSwimReferenceEnvironment:
             raise DecisionOwnershipError("RiverSwim execution belongs to another command")
         applied = self.manifest.action_spec.encode(execution.applied_action)
         applied_value = applied.to_python()
-        if not isinstance(applied_value, int):
+        if type(applied_value) is not int:
             raise DecisionOwnershipError("RiverSwim applied action is not scalar int32")
         try:
             expected_observation, expected_reward_array, expected_state = self._environment.step(
@@ -1458,15 +1454,13 @@ class ReferenceLifeConfig:
             raise ValueError("unsupported reference-life config schema")
         _require_id(self.lifecycle_id, name="lifecycle_id")
         if (
-            isinstance(self.seed, bool)
-            or not isinstance(self.seed, int)
+            type(self.seed) is not int
             or self.seed < 0
             or self.seed > int(np.iinfo(np.uint32).max)
         ):
             raise ValueError("seed must be a uint32 integer")
         if (
-            isinstance(self.max_accepted_events, bool)
-            or not isinstance(self.max_accepted_events, int)
+            type(self.max_accepted_events) is not int
             or self.max_accepted_events <= 0
             or self.max_accepted_events > MAX_DECISION_INDEX + 1
         ):
@@ -1566,8 +1560,7 @@ class LifeHalt:
         if type(self.reason) is not str or not self.reason.strip():
             raise ValueError("halt reason must be nonempty")
         if (
-            isinstance(self.recovery_attempts, bool)
-            or not isinstance(self.recovery_attempts, int)
+            type(self.recovery_attempts) is not int
             or self.recovery_attempts < 0
         ):
             raise ValueError("recovery_attempts must be nonnegative")
@@ -1629,7 +1622,7 @@ class ReferenceLifeState:
             "checkpoint_generation",
         ):
             value = getattr(self, name)
-            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            if type(value) is not int or value < 0:
                 raise ValueError(f"{name} must be a nonnegative integer")
         if not (self.accepted_events <= self.executed_events <= self.dispatch_attempts):
             raise ValueError("life counters violate accepted <= outcomes <= dispatches")
@@ -2129,7 +2122,7 @@ class ReferenceLifeRunner:
             if metrics_mode != "switching_two_phase":
                 raise DecisionOwnershipError("checkpoint switching metrics mode is invalid")
             phase_length = environment_config.get("phase_length")
-            if isinstance(phase_length, bool) or not isinstance(phase_length, int):
+            if type(phase_length) is not int:
                 raise DecisionOwnershipError("checkpoint environment phase schedule is invalid")
             if phase_length <= 0:
                 raise DecisionOwnershipError("checkpoint environment phase schedule is invalid")

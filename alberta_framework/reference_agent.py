@@ -287,8 +287,7 @@ class SpaceSpec:
             if dtype.kind not in {"i", "u"}:
                 raise ValueError("a discrete space dtype must be integer")
             if (
-                isinstance(self.cardinality, bool)
-                or not isinstance(self.cardinality, int)
+                type(self.cardinality) is not int
                 or self.cardinality <= 0
             ):
                 raise ValueError("discrete cardinality must be a positive integer")
@@ -1141,8 +1140,7 @@ class ReferenceTransactionState:
         if self.lifecycle_id is not None:
             _require_safe_id(self.lifecycle_id, name="lifecycle_id")
         if (
-            isinstance(self.next_decision_index, bool)
-            or not isinstance(self.next_decision_index, int)
+            type(self.next_decision_index) is not int
             or self.next_decision_index < 0
             or self.next_decision_index > MAX_DECISION_INDEX
         ):
