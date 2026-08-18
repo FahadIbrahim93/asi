@@ -42,6 +42,11 @@ from alberta_framework.benchmarks.upgd_ipmnist import (
     load_mnist_train,
 )
 
+_BATCH_TRAIN_SIZE = 60_000
+_MIN_BATCH_SIZE = 32
+_MAX_BATCH_EPOCHS = 30
+_MAX_BATCH_UPDATES = 50_000
+
 
 def _load_train() -> tuple[np.ndarray[Any, Any], np.ndarray[Any, Any]]:
     return load_mnist_train(default_openml_data_home())
@@ -176,6 +181,45 @@ def _publish_run(
     provenance: dict[str, Any],
 ) -> Path:
     """Atomically publish one self-contained run without replacement."""
+    tag = _safe_output_tag(tag)
+    spec_name = _safe_output_tag(spec_name)
+    if type(permutation_mode) is not str:
+        raise ValueError("permutation_mode must be an exact string")
+    seed = require_jax_seed(seed)
+    if type(n_tasks) is not int or n_tasks <= 0:
+        raise ValueError("n_tasks must be a positive built-in integer")
+    _validate_run_identity(tag, spec_name, permutation_mode, n_tasks)
+    if type(wall_seconds) not in (int, float) or not np.isfinite(wall_seconds):
+        raise ValueError("wall_seconds must be a finite built-in number")
+    if wall_seconds < 0:
+        raise ValueError("wall_seconds must be nonnegative")
+    if type(per_step) is not np.ndarray or per_step.dtype != np.dtype(np.uint8):
+        raise ValueError("per_step must be an exact uint8 numpy array")
+    if per_step.ndim != 2 or per_step.shape != (n_tasks, 5_000):
+        raise ValueError("per_step shape must be (n_tasks, 5000)")
+    if not bool(np.all((per_step == 0) | (per_step == 1))):
+        raise ValueError("per_step must contain only binary correctness values")
+    if type(per_task) is not np.ndarray or per_task.dtype != np.dtype(np.float64):
+        raise ValueError("per_task must be an exact float64 numpy array")
+    if per_task.shape != (n_tasks,) or not bool(np.all(np.isfinite(per_task))):
+        raise ValueError("per_task must be a finite vector with one value per task")
+    if not bool(np.all((0.0 <= per_task) & (per_task <= 1.0))):
+        raise ValueError("per_task values must be in [0, 1]")
+    if not bool(
+        np.allclose(
+            per_task,
+            per_step.astype(np.float64).mean(axis=1),
+            rtol=0.0,
+            atol=1e-7,
+            equal_nan=False,
+        )
+    ):
+        raise ValueError("per_task must match the per_step task means")
+    if (
+        type(provenance) is not dict
+        or provenance.get("schema") != "asi.ipmnist.ceiling_run_provenance.v1"
+    ):
+        raise ValueError("provenance must use the maintained ceiling-run schema")
     output_dir.mkdir(parents=True, exist_ok=True)
     artifact_path = output_dir / f"{tag}_seed{seed}.npz"
     if artifact_path.exists():
@@ -197,7 +241,9 @@ def _publish_run(
         "jax": jax.__version__,
         "provenance": provenance,
     }
-    metadata = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    metadata = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), allow_nan=False
+    )
 
     def write_archive(stream: BinaryIO) -> None:
         np.savez_compressed(
@@ -208,6 +254,38 @@ def _publish_run(
 
     _atomic_publish(artifact_path, write_archive)
     return artifact_path
+
+
+def _safe_output_tag(value: object) -> str:
+    if type(value) is not str or not value:
+        raise ValueError("tag must be a non-empty safe exact identifier")
+    alphanumeric = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    if value[0] not in alphanumeric or not all(
+        character in alphanumeric or character in "_-" for character in value
+    ):
+        raise ValueError("tag must be a non-empty safe exact identifier")
+    return value
+
+
+def _validate_run_identity(
+    tag: str, spec_name: str, permutation_mode: str, n_tasks: int
+) -> None:
+    expected: tuple[str, int | None]
+    if tag == f"stationary_{spec_name}":
+        expected = ("identity", 1)
+    elif tag == f"carried_{spec_name}":
+        expected = ("same", None)
+    elif tag == f"full_{spec_name}":
+        expected = ("protocol", 200)
+    else:
+        raise ValueError("tag must bind its run family and spec_name")
+    expected_mode, expected_tasks = expected
+    if permutation_mode != expected_mode:
+        raise ValueError("permutation_mode disagrees with tag family")
+    if expected_tasks is not None and n_tasks != expected_tasks:
+        raise ValueError("n_tasks disagrees with tag family")
+    if expected_tasks is None and n_tasks < 10:
+        raise ValueError("carried runs require at least ten tasks")
 
 
 def _atomic_publish(path: Path, writer: Callable[[BinaryIO], None]) -> None:
@@ -284,11 +362,26 @@ def run_batch_reference(
 ) -> Path:
     """Run the converged minibatch-Adam architecture reference."""
     seed = require_jax_seed(seed)
+    if type(epochs) is not int or not 1 <= epochs <= _MAX_BATCH_EPOCHS:
+        raise ValueError(
+            f"epochs must be a built-in integer in [1, {_MAX_BATCH_EPOCHS}]"
+        )
+    if (
+        type(batch_size) is not int
+        or not _MIN_BATCH_SIZE <= batch_size <= _BATCH_TRAIN_SIZE
+    ):
+        raise ValueError(
+            "batch_size must be a built-in integer in "
+            f"[{_MIN_BATCH_SIZE}, {_BATCH_TRAIN_SIZE}]"
+        )
+    update_count = epochs * (_BATCH_TRAIN_SIZE // batch_size)
+    if update_count > _MAX_BATCH_UPDATES:
+        raise ValueError(
+            f"batch run exceeds the {_MAX_BATCH_UPDATES} optimizer-update bound"
+        )
     import optax  # type: ignore[import-not-found]
     from sklearn.datasets import fetch_openml  # type: ignore[import-untyped]
 
-    if epochs <= 0 or batch_size <= 0:
-        raise ValueError("epochs and batch_size must be positive")
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / f"batch_reference_seed{seed}.json"
     if output_path.exists():
@@ -343,9 +436,11 @@ def run_batch_reference(
     history: list[float] = []
     started = time.monotonic()
     for epoch in range(epochs):
-        order = rng.permutation(60_000)
+        order = rng.permutation(_BATCH_TRAIN_SIZE)
         schedule_digest.update(memoryview(np.ascontiguousarray(order)).cast("B"))
-        for start in range(0, 60_000 - batch_size + 1, batch_size):
+        for start in range(
+            0, _BATCH_TRAIN_SIZE - batch_size + 1, batch_size
+        ):
             indices = order[start : start + batch_size]
             params, optimizer_state = train_step(
                 params, optimizer_state, train_x[indices], train_y[indices]
@@ -406,7 +501,9 @@ def run_batch_reference(
             "inputs": {"config": config.to_config(), "optimizer": "adam(1e-3)"},
         },
     }
-    encoded = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode()
+    encoded = (
+        json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n"
+    ).encode()
 
     def write_payload(stream: BinaryIO) -> None:
         stream.write(encoded)

@@ -10,6 +10,7 @@ from typing import BinaryIO
 import numpy as np
 import pytest
 
+import alberta_framework.benchmarks.ipmnist_campaign_tools as campaign_tools_module
 from alberta_framework.benchmarks.ipmnist_campaign_tools import (
     CONFIRM_ALIGNMENT_ATOL,
     across_seed_spread,
@@ -42,6 +43,10 @@ class _HostileSeed(int):
         raise AssertionError("seed representation hook executed")
 
 
+class _StringSubclass(str):
+    pass
+
+
 def _shard(path: Path, *, seed: int, accuracy: float) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
@@ -59,20 +64,34 @@ def _ceiling_run(
     tasks: int = 1,
 ) -> None:
     tag = prefix
+    family, spec_name = prefix.split("_", 1)
+    permutation_mode = {"stationary": "identity", "carried": "same", "full": "protocol"}[
+        family
+    ]
+    correct = int(round(mean_accuracy * 5000))
+    row = np.concatenate(
+        (np.ones(correct, dtype=np.uint8), np.zeros(5000 - correct, dtype=np.uint8))
+    )
+    per_step = np.tile(row, (tasks, 1))
+    per_task = per_step.astype(np.float64).mean(axis=1).tolist()
     (root / f"{prefix}_seed{seed}.json").write_text(
         json.dumps(
             {
                 "seed": seed,
                 "tag": tag,
-                "mean_accuracy": mean_accuracy,
-                "per_task_accuracy": [mean_accuracy] * tasks,
+                "spec_name": spec_name,
+                "perm_mode": permutation_mode,
+                "n_tasks": tasks,
+                "task_length": 5000,
+                "mean_accuracy": float(np.mean(per_task)),
+                "per_task_accuracy": per_task,
             }
         ),
         encoding="utf-8",
     )
     np.save(
         root / f"{tag}_seed{seed}_per_step.npy",
-        np.full((tasks, 5000), mean_accuracy, dtype=np.float64),
+        per_step,
         allow_pickle=False,
     )
 
@@ -99,6 +118,99 @@ def test_batch_reference_rejects_noncanonical_seed_before_publication(
     with pytest.raises(ValueError, match="built-in integer.*uint32"):
         run_batch_reference(output_dir, seed=seed)  # type: ignore[arg-type]
     assert not output_dir.exists()
+
+
+@pytest.mark.parametrize(
+    ("epochs", "batch_size"),
+    [
+        (True, 128),
+        (0, 128),
+        (31, 128),
+        (1, True),
+        (1, 31),
+        (1, 60_001),
+        (30, 32),
+    ],
+)
+def test_batch_reference_preflights_exact_bounded_work_before_io(
+    tmp_path: Path, epochs: object, batch_size: object
+) -> None:
+    output_dir = tmp_path / "must-not-exist"
+    with pytest.raises(ValueError):
+        run_batch_reference(
+            output_dir,
+            seed=0,
+            epochs=epochs,  # type: ignore[arg-type]
+            batch_size=batch_size,  # type: ignore[arg-type]
+        )
+    assert not output_dir.exists()
+
+
+@pytest.mark.parametrize(
+    ("base", "arms", "threshold", "created_unix"),
+    [
+        ("../base", ("candidate",), 0.0, 0.0),
+        ("base", (), 0.0, 0.0),
+        ("base", ("candidate", "candidate"), 0.0, 0.0),
+        ("base", ("base",), 0.0, 0.0),
+        ("base", (_StringSubclass("candidate"),), 0.0, 0.0),
+        ("base", ("../candidate",), 0.0, 0.0),
+        ("base", ("candidate",), True, 0.0),
+        ("base", ("candidate",), float("nan"), 0.0),
+        ("base", ("candidate",), 0.0, -1.0),
+        ("base", ("candidate",), 0.0, float("inf")),
+    ],
+)
+def test_frontier_rejects_hostile_identifiers_and_nonfinite_controls(
+    tmp_path: Path,
+    base: object,
+    arms: object,
+    threshold: object,
+    created_unix: object,
+) -> None:
+    with pytest.raises(ValueError):
+        build_frontier(
+            tmp_path / "screen",
+            tmp_path / "confirm",
+            base=base,  # type: ignore[arg-type]
+            arms=arms,  # type: ignore[arg-type]
+            threshold=threshold,  # type: ignore[arg-type]
+            created_unix=created_unix,  # type: ignore[arg-type]
+        )
+
+
+def test_frontier_requires_distinct_resolved_directories(tmp_path: Path) -> None:
+    directory = tmp_path / "campaign"
+    with pytest.raises(ValueError, match="distinct paths"):
+        build_frontier(directory, directory, base="base", arms=("candidate",))
+
+
+def test_frontier_seed_filename_must_bind_payload_seed(tmp_path: Path) -> None:
+    screen = tmp_path / "screen"
+    confirm = tmp_path / "confirm"
+    _shard(screen / "base_seed0.json", seed=1, accuracy=0.8)
+    with pytest.raises(ValueError, match="filename disagrees"):
+        build_frontier(screen, confirm, base="base", arms=("candidate",))
+
+
+def test_campaign_cli_uses_strict_json_serialization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        campaign_tools_module,
+        "build_frontier",
+        lambda *args, **kwargs: {"nonfinite": float("nan")},
+    )
+    with pytest.raises(ValueError, match="Out of range float values"):
+        campaign_tools_module.main(
+            [
+                "frontier",
+                "--screen-dir",
+                str(tmp_path / "screen"),
+                "--confirm-dir",
+                str(tmp_path / "confirm"),
+            ]
+        )
 
 
 def test_across_seed_spread_uses_sample_estimator() -> None:
@@ -236,21 +348,23 @@ def test_ceiling_publication_refuses_to_replace_existing_bytes(tmp_path: Path) -
     artifact_path = _publish_run(
         tmp_path,
         tag="stationary_sigma0_ndecay099",
-        spec_name="test",
+        spec_name="sigma0_ndecay099",
         seed=0,
         permutation_mode="identity",
         n_tasks=1,
         per_step=per_step,
         per_task=per_task,
         wall_seconds=1.0,
-        provenance={"schema": "test.provenance.v1"},
+        provenance={"schema": "asi.ipmnist.ceiling_run_provenance.v1"},
     )
     before = artifact_path.read_bytes()
     with np.load(artifact_path, allow_pickle=False) as archive:
         metadata = json.loads(str(archive["metadata"].item()))
         assert np.array_equal(archive["per_step"], per_step)
     assert metadata["schema"] == "asi.ipmnist_ceiling.run.v2"
-    assert metadata["provenance"]["schema"] == "test.provenance.v1"
+    assert metadata["provenance"]["schema"] == (
+        "asi.ipmnist.ceiling_run_provenance.v1"
+    )
     reconstructed = build_ceiling_summary(tmp_path, tmp_path / "confirm")
     assert reconstructed["stationary_sigma0_ndecay099"]["avg_online_mean"] == 1.0
 
@@ -258,17 +372,202 @@ def test_ceiling_publication_refuses_to_replace_existing_bytes(tmp_path: Path) -
         _publish_run(
             tmp_path,
             tag="stationary_sigma0_ndecay099",
-            spec_name="test",
+            spec_name="sigma0_ndecay099",
             seed=0,
             permutation_mode="identity",
             n_tasks=1,
             per_step=per_step,
             per_task=per_task,
             wall_seconds=1.0,
-            provenance={"schema": "test.provenance.v1"},
+            provenance={"schema": "asi.ipmnist.ceiling_run_provenance.v1"},
         )
 
     assert artifact_path.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"tag": "../escape"},
+        {"tag": _StringSubclass("stationary_sigma0_ndecay099")},
+        {"spec_name": "other"},
+        {"permutation_mode": "protocol"},
+        {"n_tasks": 2},
+        {"wall_seconds": float("nan")},
+        {"provenance": {"schema": "wrong"}},
+    ],
+)
+def test_ceiling_publisher_rejects_hostile_identity_and_scalar_contracts(
+    tmp_path: Path, override: dict[str, object]
+) -> None:
+    arguments: dict[str, object] = {
+        "tag": "stationary_sigma0_ndecay099",
+        "spec_name": "sigma0_ndecay099",
+        "seed": 0,
+        "permutation_mode": "identity",
+        "n_tasks": 1,
+        "per_step": np.ones((1, 5000), dtype=np.uint8),
+        "per_task": np.ones(1, dtype=np.float64),
+        "wall_seconds": 1.0,
+        "provenance": {"schema": "asi.ipmnist.ceiling_run_provenance.v1"},
+    }
+    arguments.update(override)
+    with pytest.raises(ValueError):
+        _publish_run(tmp_path / "out", **arguments)  # type: ignore[arg-type]
+    assert not (tmp_path / "out").exists()
+
+
+@pytest.mark.parametrize(
+    ("per_step", "per_task"),
+    [
+        (np.ones((1, 5000), dtype=np.float32), np.ones(1, dtype=np.float64)),
+        (np.full((1, 5000), 2, dtype=np.uint8), np.ones(1, dtype=np.float64)),
+        (np.ones((1, 4999), dtype=np.uint8), np.ones(1, dtype=np.float64)),
+        (np.ones((1, 5000), dtype=np.uint8), np.asarray([np.nan])),
+        (np.ones((1, 5000), dtype=np.uint8), np.asarray([0.5])),
+    ],
+)
+def test_ceiling_publisher_rejects_invalid_accuracy_arrays(
+    tmp_path: Path, per_step: np.ndarray, per_task: np.ndarray
+) -> None:
+    with pytest.raises(ValueError):
+        _publish_run(
+            tmp_path / "out",
+            tag="stationary_sigma0_ndecay099",
+            spec_name="sigma0_ndecay099",
+            seed=0,
+            permutation_mode="identity",
+            n_tasks=1,
+            per_step=per_step,
+            per_task=per_task,
+            wall_seconds=1.0,
+            provenance={"schema": "asi.ipmnist.ceiling_run_provenance.v1"},
+        )
+    assert not (tmp_path / "out").exists()
+
+
+def _write_legacy_ceiling_run(
+    root: Path,
+    *,
+    filename: str,
+    seed: int = 0,
+    task_length: int = 5000,
+    n_tasks: int = 1,
+) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    tag = "stationary_sigma0_ndecay099"
+    payload = {
+        "tag": tag,
+        "spec_name": "sigma0_ndecay099",
+        "seed": seed,
+        "perm_mode": "identity",
+        "n_tasks": n_tasks,
+        "task_length": task_length,
+        "per_task_accuracy": [1.0] * n_tasks,
+        "mean_accuracy": 1.0,
+    }
+    (root / filename).write_text(json.dumps(payload), encoding="utf-8")
+    np.save(
+        root / f"{tag}_seed{seed}_per_step.npy",
+        np.ones((n_tasks, task_length), dtype=np.uint8),
+        allow_pickle=False,
+    )
+
+
+def test_ceiling_analyzer_rejects_short_task_dimension(tmp_path: Path) -> None:
+    ceiling = tmp_path / "ceiling"
+    _write_legacy_ceiling_run(
+        ceiling,
+        filename="stationary_sigma0_ndecay099_seed0.json",
+        task_length=1,
+    )
+    with pytest.raises(ValueError, match="task_length must equal 5000"):
+        build_ceiling_summary(ceiling, tmp_path / "confirm")
+
+
+def test_ceiling_analyzer_rejects_duplicate_legacy_seed(tmp_path: Path) -> None:
+    ceiling = tmp_path / "ceiling"
+    _write_legacy_ceiling_run(
+        ceiling, filename="stationary_sigma0_ndecay099_seed0.json"
+    )
+    _write_legacy_ceiling_run(
+        ceiling, filename="stationary_sigma0_ndecay099_seed0_duplicate.json"
+    )
+    with pytest.raises(ValueError, match="duplicate ceiling seed"):
+        build_ceiling_summary(ceiling, tmp_path / "confirm")
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"development_only": False},
+        {"scientific_promotion_allowed": True},
+        {"evidence_class": "scientific_evidence"},
+        {"wall_clock_seconds": float("nan")},
+        {"provenance": {"schema": "wrong"}},
+    ],
+)
+def test_ceiling_analyzer_rejects_tampered_maintained_metadata(
+    tmp_path: Path, override: dict[str, object]
+) -> None:
+    ceiling = tmp_path / "ceiling"
+    ceiling.mkdir()
+    payload: dict[str, object] = {
+        "schema": "asi.ipmnist_ceiling.run.v2",
+        "evidence_class": "development_screening_diagnostic",
+        "development_only": True,
+        "scientific_promotion_allowed": False,
+        "tag": "stationary_sigma0_ndecay099",
+        "spec_name": "sigma0_ndecay099",
+        "seed": 0,
+        "perm_mode": "identity",
+        "n_tasks": 1,
+        "task_length": 5000,
+        "per_task_accuracy": [1.0],
+        "mean_accuracy": 1.0,
+        "wall_clock_seconds": 1.0,
+        "provenance": {"schema": "asi.ipmnist.ceiling_run_provenance.v1"},
+    }
+    payload.update(override)
+    np.savez_compressed(
+        ceiling / "stationary_sigma0_ndecay099_seed0.npz",
+        metadata=np.asarray(json.dumps(payload)),
+        per_step=np.ones((1, 5000), dtype=np.uint8),
+    )
+    with pytest.raises(ValueError):
+        build_ceiling_summary(ceiling, tmp_path / "confirm")
+
+
+def test_confirm_alignment_requires_matching_canonical_reference_seed(
+    tmp_path: Path,
+) -> None:
+    confirm = tmp_path / "confirm"
+    _shard(confirm / "sigma0_ndecay099_seed0.json", seed=1, accuracy=0.8)
+    with pytest.raises(ValueError, match="does not match ceiling seed"):
+        validate_confirm_alignment(
+            [{"seed": 0, "per_task_accuracy": [0.8, 0.8]}], confirm
+        )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"seed": 1, "test_accuracy_best": 0.9},
+        {"seed": -1, "test_accuracy_best": 0.9},
+        {"seed": 0, "test_accuracy_best": float("nan")},
+        {"seed": 0, "test_accuracy_best": 1.1},
+    ],
+)
+def test_ceiling_analyzer_rejects_invalid_batch_summary(
+    tmp_path: Path, payload: dict[str, object]
+) -> None:
+    ceiling = tmp_path / "ceiling"
+    ceiling.mkdir()
+    (ceiling / "batch_reference_seed0.json").write_text(
+        json.dumps(payload), encoding="utf-8"
+    )
+    with pytest.raises(ValueError):
+        build_ceiling_summary(ceiling, tmp_path / "confirm")
 
 
 def test_atomic_publication_cleans_up_writer_failure(tmp_path: Path) -> None:
@@ -346,6 +645,58 @@ def test_rule_discovery_summary_uses_explicit_directories(tmp_path: Path) -> Non
     assert len(summary["provenance"]["inputs"]) == 24
     assert "rule_discovery" in summary["provenance"]["sources"]
     assert "ipmnist_provenance" in summary["provenance"]["sources"]
+
+
+@pytest.mark.parametrize("seeds", [(), (0, 0), (True,), (-1,), (2**32,)])
+def test_rule_summary_rejects_noncanonical_or_duplicate_seeds_before_io(
+    tmp_path: Path, seeds: object
+) -> None:
+    with pytest.raises(ValueError):
+        build_legacy_rule_discovery_summary(
+            tmp_path / "screen",
+            tmp_path / "confirm",
+            seeds=seeds,  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.parametrize("accuracy", [[], [float("nan")], [-0.1], [1.1]])
+def test_rule_summary_rejects_invalid_accuracy_payloads(
+    tmp_path: Path, accuracy: list[float]
+) -> None:
+    screen = tmp_path / "screen"
+    path = screen / f"{SCREEN_ARMS[0]}_seed0.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"seed": 0, "per_task_accuracy": accuracy}), encoding="utf-8"
+    )
+    with pytest.raises(ValueError):
+        build_legacy_rule_discovery_summary(
+            screen, tmp_path / "confirm", seeds=(0,)
+        )
+
+
+def test_rule_summary_requires_payload_seed_to_match_requested_seed(
+    tmp_path: Path,
+) -> None:
+    screen = tmp_path / "screen"
+    _shard(screen / f"{SCREEN_ARMS[0]}_seed0.json", seed=1, accuracy=0.8)
+    with pytest.raises(ValueError, match="does not match requested seed"):
+        build_legacy_rule_discovery_summary(
+            screen, tmp_path / "confirm", seeds=(0,)
+        )
+
+
+def test_rule_summary_rejects_partial_confirmation_seed_set(tmp_path: Path) -> None:
+    screen = tmp_path / "screen"
+    confirm = tmp_path / "confirm"
+    for name in SCREEN_ARMS:
+        for seed in (0, 1):
+            _shard(screen / f"{name}_seed{seed}.json", seed=seed, accuracy=0.8)
+    _shard(
+        confirm / "disc_r1_pscale_norms_seed0.json", seed=0, accuracy=0.8
+    )
+    with pytest.raises(ValueError, match="confirmation seeds are incomplete"):
+        build_legacy_rule_discovery_summary(screen, confirm, seeds=(0, 1))
 
 
 def test_current_rule_discovery_legacy_payload_reconstructs_exactly() -> None:

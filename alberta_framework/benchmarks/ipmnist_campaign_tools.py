@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+import re
 import statistics
 import time
 from collections.abc import Sequence
@@ -17,6 +19,7 @@ from typing import Any, cast
 
 import numpy as np
 
+from alberta_framework._seed_validation import require_jax_seed
 from alberta_framework.benchmarks.ipmnist_provenance import analysis_provenance
 
 DEFAULT_BASE = "upgd_ema_norm_sigma0"
@@ -43,6 +46,37 @@ BUCKETS = (
     (2000, 3500),
     (3500, 5000),
 )
+_IDENTIFIER_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*\Z")
+
+
+def _safe_identifier(value: object, *, name: str) -> str:
+    if type(value) is not str or _IDENTIFIER_PATTERN.fullmatch(value) is None:
+        raise ValueError(f"{name} must be a safe exact identifier")
+    return value
+
+
+def _finite_scalar(value: object, *, name: str) -> float:
+    if type(value) not in (int, float):
+        raise ValueError(f"{name} must be a finite built-in number")
+    number = float(cast(int | float, value))
+    if not math.isfinite(number):
+        raise ValueError(f"{name} must be a finite built-in number")
+    return number
+
+
+def _frontier_arms(value: object, *, base: str) -> tuple[str, ...]:
+    if type(value) not in (list, tuple):
+        raise ValueError("arms must be a non-empty exact list or tuple")
+    raw = cast(list[object] | tuple[object, ...], value)
+    if len(raw) == 0:
+        raise ValueError("arms must be a non-empty exact list or tuple")
+    arms = tuple(
+        _safe_identifier(raw[index], name=f"arms[{index}]")
+        for index in range(len(raw))
+    )
+    if len(set(arms)) != len(arms) or base in arms:
+        raise ValueError("arms must be unique and distinct from base")
+    return arms
 
 
 def across_seed_spread(values: Sequence[float] | np.ndarray[Any, Any]) -> float:
@@ -62,15 +96,23 @@ def _json_object(path: Path) -> dict[str, Any]:
 
 def seed_means(root: Path, config_name: str) -> dict[int, float]:
     """Read mean per-task accuracy by seed for one campaign arm."""
+    config_name = _safe_identifier(config_name, name="config_name")
     result: dict[int, float] = {}
     for path in sorted(root.glob(f"{config_name}_seed*.json")):
         payload = _json_object(path)
-        seed = payload.get("seed")
+        raw_seed = payload.get("seed")
         accuracies = payload.get("per_task_accuracy")
-        if type(seed) is not int or type(accuracies) is not list or not accuracies:
+        if type(accuracies) is not list or not accuracies:
             raise ValueError(f"{path} lacks a valid seed or per_task_accuracy")
+        seed = require_jax_seed(raw_seed, name=f"{path} seed")
+        if path.name != f"{config_name}_seed{seed}.json":
+            raise ValueError(f"{path} filename disagrees with payload seed")
         values = np.asarray(accuracies, dtype=np.float64)
-        if values.ndim != 1 or not bool(np.all(np.isfinite(values))):
+        if (
+            values.ndim != 1
+            or not bool(np.all(np.isfinite(values)))
+            or not bool(np.all((0.0 <= values) & (values <= 1.0)))
+        ):
             raise ValueError(f"{path} has invalid per_task_accuracy")
         if seed in result:
             raise ValueError(f"duplicate seed {seed} for {config_name}")
@@ -88,12 +130,21 @@ def build_frontier(
     created_unix: float | None = None,
 ) -> dict[str, Any]:
     """Build a paired-seed development frontier without mixing seed sets."""
+    if screen_dir.resolve() == confirm_dir.resolve():
+        raise ValueError("screen_dir and confirm_dir must resolve to distinct paths")
+    base = _safe_identifier(base, name="base")
+    checked_arms = _frontier_arms(arms, base=base)
+    threshold = _finite_scalar(threshold, name="threshold")
+    if created_unix is not None:
+        created_unix = _finite_scalar(created_unix, name="created_unix")
+        if created_unix < 0:
+            raise ValueError("created_unix must be nonnegative")
     screen_base = seed_means(screen_dir, base)
     confirm_base = seed_means(confirm_dir, base)
     if not screen_base:
         raise ValueError(f"screen base {base!r} has no seeds")
     rows: list[dict[str, Any]] = []
-    for arm in arms:
+    for arm in checked_arms:
         screen = seed_means(screen_dir, arm)
         confirm = seed_means(confirm_dir, arm)
         if screen.keys() != screen_base.keys():
@@ -133,7 +184,7 @@ def build_frontier(
     input_paths = [
         path
         for directory in (screen_dir, confirm_dir)
-        for name in (base, *arms)
+        for name in (base, *checked_arms)
         for path in directory.glob(f"{name}_seed*.json")
     ]
     return {
@@ -166,15 +217,24 @@ def _ceiling_runs(
     *,
     input_paths: list[Path] | None = None,
 ) -> dict[int, dict[str, Any]]:
+    prefix = _safe_identifier(prefix, name="prefix")
     runs: dict[int, dict[str, Any]] = {}
     for path in sorted(ceiling_dir.glob(f"{prefix}_seed*.json")):
         payload = _json_object(path)
-        seed = payload.get("seed")
+        raw_seed = payload.get("seed")
         tag = payload.get("tag")
-        if type(seed) is not int or type(tag) is not str:
-            raise ValueError(f"{path} lacks a valid seed or tag")
+        seed = require_jax_seed(raw_seed, name=f"{path} seed")
+        tag = _safe_identifier(tag, name=f"{path} tag")
+        if tag != prefix:
+            raise ValueError(f"{path} tag disagrees with requested prefix")
+        if seed in runs:
+            raise ValueError(f"duplicate ceiling seed {seed} for {prefix}")
+        if path.name != f"{prefix}_seed{seed}.json":
+            raise ValueError(f"{path} filename disagrees with payload seed")
         per_step_path = ceiling_dir / f"{tag}_seed{seed}_per_step.npy"
-        payload["per_step"] = np.load(per_step_path, allow_pickle=False)
+        payload["per_step"] = _validated_ceiling_run(
+            payload, np.load(per_step_path, allow_pickle=False), path=path
+        )
         if input_paths is not None:
             input_paths.extend((path, per_step_path))
         runs[seed] = payload
@@ -186,23 +246,98 @@ def _ceiling_runs(
             raise ValueError(f"{path} metadata must be a JSON object")
         if payload.get("schema") != "asi.ipmnist_ceiling.run.v2":
             raise ValueError(f"{path} has an unsupported maintained run schema")
-        if type(payload.get("provenance")) is not dict:
+        if (
+            payload.get("evidence_class")
+            != "development_screening_diagnostic"
+            or payload.get("development_only") is not True
+            or payload.get("scientific_promotion_allowed") is not False
+        ):
+            raise ValueError(f"{path} violates the permanently nonpromoting policy")
+        wall_seconds = _finite_scalar(
+            payload.get("wall_clock_seconds"), name=f"{path} wall_clock_seconds"
+        )
+        if wall_seconds < 0:
+            raise ValueError(f"{path} wall_clock_seconds must be nonnegative")
+        provenance = payload.get("provenance")
+        if (
+            type(provenance) is not dict
+            or provenance.get("schema") != "asi.ipmnist.ceiling_run_provenance.v1"
+        ):
             raise ValueError(f"{path} lacks maintained run provenance")
-        seed = payload.get("seed")
-        if type(seed) is not int:
-            raise ValueError(f"{path} lacks a valid seed")
+        seed = require_jax_seed(payload.get("seed"), name=f"{path} seed")
         if seed in runs:
             raise ValueError(f"duplicate ceiling seed {seed} for {prefix}")
-        if per_step.ndim != 2 or list(per_step.shape) != [
-            payload.get("n_tasks"),
-            payload.get("task_length"),
-        ]:
-            raise ValueError(f"{path} per_step shape disagrees with metadata")
-        payload["per_step"] = per_step
+        if path.name != f"{prefix}_seed{seed}.npz":
+            raise ValueError(f"{path} filename disagrees with payload seed")
+        tag = _safe_identifier(payload.get("tag"), name=f"{path} tag")
+        if tag != prefix:
+            raise ValueError(f"{path} tag disagrees with requested prefix")
+        payload["per_step"] = _validated_ceiling_run(payload, per_step, path=path)
         if input_paths is not None:
             input_paths.append(path)
         runs[seed] = payload
     return runs
+
+
+def _validated_ceiling_run(
+    payload: dict[str, Any], per_step: object, *, path: Path
+) -> np.ndarray[Any, Any]:
+    n_tasks = payload.get("n_tasks")
+    task_length = payload.get("task_length")
+    if type(n_tasks) is not int or n_tasks <= 0:
+        raise ValueError(f"{path} has invalid n_tasks")
+    if type(task_length) is not int or task_length != 5_000:
+        raise ValueError(f"{path} task_length must equal 5000")
+    tag = _safe_identifier(payload.get("tag"), name=f"{path} tag")
+    spec_name = _safe_identifier(payload.get("spec_name"), name=f"{path} spec_name")
+    permutation_mode = payload.get("perm_mode")
+    if type(permutation_mode) is not str:
+        raise ValueError(f"{path} perm_mode must be an exact string")
+    if tag == f"stationary_{spec_name}":
+        expected_mode, expected_tasks = "identity", 1
+    elif tag == f"carried_{spec_name}":
+        expected_mode, expected_tasks = "same", None
+    elif tag == f"full_{spec_name}":
+        expected_mode, expected_tasks = "protocol", 200
+    else:
+        raise ValueError(f"{path} tag does not bind its spec_name")
+    if permutation_mode != expected_mode:
+        raise ValueError(f"{path} perm_mode disagrees with tag family")
+    if expected_tasks is not None and n_tasks != expected_tasks:
+        raise ValueError(f"{path} n_tasks disagrees with tag family")
+    if expected_tasks is None and n_tasks < 10:
+        raise ValueError(f"{path} carried runs require at least ten tasks")
+    array = np.asarray(per_step)
+    if array.shape != (n_tasks, task_length):
+        raise ValueError(f"{path} per_step shape disagrees with metadata")
+    if array.dtype != np.dtype(np.uint8) or not bool(np.all((array == 0) | (array == 1))):
+        raise ValueError(f"{path} per_step must be a uint8 binary matrix")
+    raw_per_task = payload.get("per_task_accuracy")
+    if type(raw_per_task) is not list:
+        raise ValueError(f"{path} per_task_accuracy must be an exact list")
+    per_task = _finite_vector(raw_per_task, name="per_task_accuracy")
+    if per_task.shape != (n_tasks,) or not bool(np.all((0.0 <= per_task) & (per_task <= 1.0))):
+        raise ValueError(f"{path} per_task_accuracy has invalid shape or domain")
+    observed_means = array.astype(np.float64).mean(axis=1)
+    if not bool(
+        np.allclose(
+            per_task,
+            observed_means,
+            rtol=0.0,
+            atol=CONFIRM_ALIGNMENT_ATOL,
+            equal_nan=False,
+        )
+    ):
+        raise ValueError(f"{path} per_task_accuracy disagrees with per_step means")
+    mean_accuracy = _finite_scalar(payload.get("mean_accuracy"), name="mean_accuracy")
+    if not 0.0 <= mean_accuracy <= 1.0 or not math.isclose(
+        mean_accuracy,
+        float(per_task.mean()),
+        rel_tol=0.0,
+        abs_tol=CONFIRM_ALIGNMENT_ATOL,
+    ):
+        raise ValueError(f"{path} mean_accuracy disagrees with per_task_accuracy")
+    return array
 
 
 def _finite_vector(value: object, *, name: str) -> np.ndarray[Any, np.dtype[np.float64]]:
@@ -231,6 +366,11 @@ def validate_confirm_alignment(
         seed = cast(int, run["seed"])
         reference_path = confirm_dir / f"sigma0_ndecay099_seed{seed}.json"
         reference = _json_object(reference_path)
+        reference_seed = require_jax_seed(
+            reference.get("seed"), name=f"{reference_path} seed"
+        )
+        if reference_seed != seed:
+            raise ValueError(f"{reference_path} seed does not match ceiling seed {seed}")
         if input_paths is not None:
             input_paths.append(reference_path)
         observed = _finite_vector(run["per_task_accuracy"], name="per_task_accuracy")
@@ -320,17 +460,30 @@ def build_ceiling_summary(ceiling_dir: Path, confirm_dir: Path) -> dict[str, Any
             "late_task_late_window": float(last_task_late.mean()),
         }
 
-    batch = [
-        _json_object(path)
-        for path in sorted(ceiling_dir.glob("batch_reference_seed*.json"))
-    ]
-    input_paths.extend(sorted(ceiling_dir.glob("batch_reference_seed*.json")))
+    batch_paths = sorted(ceiling_dir.glob("batch_reference_seed*.json"))
+    batch = []
+    batch_seeds: set[int] = set()
+    for path in batch_paths:
+        run = _json_object(path)
+        seed = require_jax_seed(run.get("seed"), name=f"{path} seed")
+        if seed in batch_seeds:
+            raise ValueError(f"{path} has a duplicate seed")
+        if path.name != f"batch_reference_seed{seed}.json":
+            raise ValueError(f"{path} filename disagrees with payload seed")
+        batch_seeds.add(seed)
+        best_score = _finite_scalar(
+            run.get("test_accuracy_best"), name="test_accuracy_best"
+        )
+        if not 0.0 <= best_score <= 1.0:
+            raise ValueError(f"{path} test_accuracy_best is outside [0, 1]")
+        batch.append(run)
+    input_paths.extend(batch_paths)
     if batch:
-        best = [float(run["test_accuracy_best"]) for run in batch]
+        best_scores = [float(run["test_accuracy_best"]) for run in batch]
         report["batch_reference"] = {
-            "test_best_mean": float(np.mean(best)),
-            "test_best_sample_standard_deviation": across_seed_spread(best),
-            "per_seed": best,
+            "test_best_mean": float(np.mean(best_scores)),
+            "test_best_sample_standard_deviation": across_seed_spread(best_scores),
+            "per_seed": best_scores,
         }
 
     full = _ceiling_runs(
@@ -418,7 +571,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     else:
         result = build_ceiling_summary(args.ceiling_dir, args.confirm_dir)
-    print(json.dumps(result, indent=2, sort_keys=True))
+    print(json.dumps(result, indent=2, sort_keys=True, allow_nan=False))
     return 0
 
 
