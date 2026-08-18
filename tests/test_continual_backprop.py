@@ -895,6 +895,9 @@ class TestCBPWrapperConstructorIdentities:
             ({"gamma": True}, "gamma"),
             ({"gamma": float("nan")}, "gamma"),
             ({"gamma": 1.5}, "gamma"),
+            ({"utility_decay": 1.0}, "utility_decay"),
+            ({"cbp_config": False}, "cbp_config"),
+            ({"cbp_config": 0}, "cbp_config"),
         ],
     )
     def test_multihead_rejects_identity_aliases(
@@ -911,6 +914,8 @@ class TestCBPWrapperConstructorIdentities:
             ({"leaky_relu_slope": True}, "leaky_relu_slope"),
             ({"step_size": True}, "step_size"),
             ({"step_size": float("nan")}, "step_size"),
+            ({"utility_decay": 1.0}, "utility_decay"),
+            ({"cbp_config": False}, "cbp_config"),
         ],
     )
     def test_single_head_adapter_rejects_identity_aliases(
@@ -939,3 +944,47 @@ class TestCBPWrapperConstructorIdentities:
         assert learner._sparsity == pytest.approx(0.25)
         assert learner._leaky_relu_slope == pytest.approx(0.02)
         assert learner._use_layer_norm is False
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("decay_rate", 1),
+            ("replacement_rate", np.float32(0.1)),
+            ("maturity_threshold", np.int32(1)),
+            ("enabled", 1),
+        ],
+    )
+    def test_cbp_config_parser_requires_exact_json_scalars(
+        self,
+        field: str,
+        value: object,
+    ) -> None:
+        payload = ContinualBackpropConfig().to_config()
+        payload[field] = value
+        with pytest.raises(ValueError, match="serialized"):
+            ContinualBackpropConfig.from_config(payload)
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("n_heads", np.int32(1)),
+            ("hidden_sizes", [np.int32(4)]),
+            ("sparsity", 0),
+            ("gamma", np.float32(0.0)),
+            ("use_layer_norm", 1),
+            ("per_head_gamma_lamda", [np.float32(0.0)]),
+        ],
+    )
+    def test_wrapper_parser_requires_exact_json_scalars(
+        self,
+        field: str,
+        value: object,
+    ) -> None:
+        payload = CBPMultiHeadMLPLearner(
+            n_heads=1,
+            hidden_sizes=(4,),
+            per_head_gamma_lamda=(0.0,),
+        ).to_config()
+        payload[field] = value
+        with pytest.raises(ValueError, match="serialized"):
+            CBPMultiHeadMLPLearner.from_config(payload)

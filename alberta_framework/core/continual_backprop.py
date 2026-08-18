@@ -284,6 +284,13 @@ class ContinualBackpropConfig:
         payload = _copy_mapping(config, name="ContinualBackpropConfig")
         if set(payload) != _CBP_CONFIG_FIELDS:
             raise ValueError("ContinualBackpropConfig fields do not match the schema")
+        for name in ("decay_rate", "replacement_rate"):
+            if type(payload[name]) is not float:
+                raise ValueError(f"serialized {name} must be an exact JSON float")
+        if type(payload["maturity_threshold"]) is not int:
+            raise ValueError("serialized maturity_threshold must be an exact JSON integer")
+        if type(payload["enabled"]) is not bool:
+            raise ValueError("serialized enabled must be an exact JSON bool")
         return cls(**payload)  # type: ignore[arg-type]
 
 
@@ -871,7 +878,11 @@ class CBPMultiHeadMLPLearner:
             utility_decay: EMA decay for the underlying MLP's native
                 hidden-unit utility diagnostics.
         """
-        self._cbp_config = cbp_config or ContinualBackpropConfig()
+        if cbp_config is None:
+            cbp_config = ContinualBackpropConfig()
+        elif type(cbp_config) is not ContinualBackpropConfig:
+            raise ValueError("cbp_config must be an actual ContinualBackpropConfig or None")
+        self._cbp_config = cbp_config
         if type(use_layer_norm) is not bool:
             raise ValueError("use_layer_norm must be an actual bool")
         sparsity = _validated_config_float(
@@ -893,6 +904,7 @@ class CBPMultiHeadMLPLearner:
             utility_decay,
             lower=0.0,
             upper=1.0,
+            upper_inclusive=False,
         )
         self._sparsity = sparsity
         self._leaky_relu_slope = leaky_relu_slope
@@ -975,6 +987,21 @@ class CBPMultiHeadMLPLearner:
             and type(config["per_head_gamma_lamda"]) is not list
         ):
             raise ValueError("per_head_gamma_lamda must be a list")
+        if type(config["n_heads"]) is not int:
+            raise ValueError("serialized n_heads must be an exact JSON integer")
+        if any(type(width) is not int for width in config["hidden_sizes"]):
+            raise ValueError("serialized hidden_sizes entries must be exact JSON integers")
+        for name in ("sparsity", "leaky_relu_slope", "gamma", "lamda", "utility_decay"):
+            if type(config[name]) is not float:
+                raise ValueError(f"serialized {name} must be an exact JSON float")
+        if type(config["use_layer_norm"]) is not bool:
+            raise ValueError("serialized use_layer_norm must be an exact JSON bool")
+        if config["per_head_gamma_lamda"] is not None and any(
+            type(value) is not float for value in config["per_head_gamma_lamda"]
+        ):
+            raise ValueError(
+                "serialized per_head_gamma_lamda entries must be exact JSON floats"
+            )
         config = config.copy()
         config.pop("type")
         config.pop("state_schema")
