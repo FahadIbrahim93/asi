@@ -153,7 +153,12 @@ def isometry_penalty(weight: Array) -> Array:
         gram = matrix @ matrix.T
         identity = jnp.eye(rows, dtype=matrix.dtype)
     candidate = jnp.sum(jnp.square(gram - identity))
-    return jnp.where(jnp.isfinite(candidate), candidate, jnp.zeros_like(candidate))
+    valid = jnp.isfinite(candidate)
+    if isinstance(valid, jax.core.Tracer):
+        return jnp.where(valid, candidate, jnp.full_like(candidate, jnp.nan))
+    if not bool(valid):
+        raise ValueError("isometry penalty must be finite")
+    return candidate
 
 
 def isometry_gradient(weight: Array) -> Array:
