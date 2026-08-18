@@ -1451,7 +1451,11 @@ _PROTOTYPE_METADATA_KEYS = {
     "empty_array_codec",
     "prng_impl",
 }
-_PROTOTYPE_RAW_METADATA_KEYS = {*_PROTOTYPE_METADATA_KEYS, "_format_version"}
+_PROTOTYPE_RAW_METADATA_KEYS = {
+    *_PROTOTYPE_METADATA_KEYS,
+    "_empty_array_leaves",
+    "_format_version",
+}
 
 
 def _load_raw_prototype_metadata(path: Path) -> dict[str, Any]:

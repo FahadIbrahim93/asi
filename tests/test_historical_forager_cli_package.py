@@ -46,6 +46,7 @@ _WHEEL_FILES = tuple(
     and (path.suffix == ".py" or path.name == "py.typed")
 )
 _EXPECTED_SCRIPT_NAMES = {
+    "asi-reference-life-scorecard",
     "alberta-evidence-status",
     "alberta-forager-benchmark",
     "alberta-forager-matched-campaign",

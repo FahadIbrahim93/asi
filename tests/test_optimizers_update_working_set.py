@@ -17,7 +17,7 @@ from alberta_framework.core.optimizers import (
 
 _INT32_MAX = 2**31 - 1
 _INT32_MIN = -(2**31)
-_WORKING_SET_OVERFLOW = 100_000_000
+_WORKING_SET_OVERFLOW = 30_000_000
 
 
 class _IntSubclass(int):
@@ -39,22 +39,27 @@ def test_int32_wrap_forges_a_different_published_byte_identity() -> None:
 
 
 def test_idbd_one_bank_and_persistent_fit_while_update_working_set_does_not() -> None:
-    one_bank_bytes = 4 * _WORKING_SET_OVERFLOW
-    persistent_bytes = 4 * (2 * _WORKING_SET_OVERFLOW + 3)
-    update_bytes = 4 * (9 * _WORKING_SET_OVERFLOW + 8)
+    width = 40_000_000
+    one_bank_bytes = 4 * width
+    persistent_bytes = 4 * (2 * width + 3)
+    contributor_update_bytes = 4 * (9 * width + 8)
+    update_bytes = 4 * (18 * width + 8)
     assert one_bank_bytes <= _INT32_MAX
     assert persistent_bytes <= _INT32_MAX
+    assert contributor_update_bytes <= _INT32_MAX
     assert update_bytes > _INT32_MAX
     with pytest.raises(ValueError, match="update working set byte count"):
-        IDBD().init(_WORKING_SET_OVERFLOW)
+        IDBD().init(width)
 
 
 def test_autostep_one_bank_and_persistent_fit_while_update_working_set_does_not() -> None:
     one_bank_bytes = 4 * _WORKING_SET_OVERFLOW
     persistent_bytes = 4 * (3 * _WORKING_SET_OVERFLOW + 5)
-    update_bytes = 4 * (10 * _WORKING_SET_OVERFLOW + 8)
+    contributor_update_bytes = 4 * (10 * _WORKING_SET_OVERFLOW + 8)
+    update_bytes = 4 * (30 * _WORKING_SET_OVERFLOW + 8)
     assert one_bank_bytes <= _INT32_MAX
     assert persistent_bytes <= _INT32_MAX
+    assert contributor_update_bytes <= _INT32_MAX
     assert update_bytes > _INT32_MAX
     with pytest.raises(ValueError, match="update working set byte count"):
         Autostep().init(_WORKING_SET_OVERFLOW)
@@ -95,12 +100,12 @@ def test_legal_idbd_and_autostep_update_identity_is_unchanged() -> None:
 @pytest.mark.parametrize(
     ("factory", "vectors", "label"),
     [
-        (IDBD, 9, "IDBD"),
-        (Autostep, 10, "Autostep"),
-        (AutostepGTDLambda, 11, "AutostepGTDLambda"),
-        (ObGD, 5, "ObGD"),
-        (TDIDBD, 10, "TDIDBD"),
-        (AutoTDIDBD, 11, "AutoTDIDBD"),
+        (IDBD, 18, "IDBD"),
+        (Autostep, 30, "Autostep"),
+        (AutostepGTDLambda, 40, "AutostepGTDLambda"),
+        (ObGD, 12, "ObGD"),
+        (TDIDBD, 22, "TDIDBD"),
+        (AutoTDIDBD, 32, "AutoTDIDBD"),
     ],
 )
 def test_every_vector_optimizer_rejects_first_overflowing_update_width(
@@ -164,7 +169,7 @@ def test_parameter_optimizer_shape_rejects_hostile_schema(
 
 @pytest.mark.parametrize(
     ("factory", "vectors", "label"),
-    [(IDBD, 9, "IDBD"), (Autostep, 10, "Autostep")],
+    [(IDBD, 18, "IDBD"), (Autostep, 30, "Autostep")],
 )
 def test_parameter_optimizer_rejects_derived_shape_working_set_before_allocation(
     factory: type[IDBD] | type[Autostep], vectors: int, label: str

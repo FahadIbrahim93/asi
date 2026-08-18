@@ -808,7 +808,8 @@ class DispatchCommand:
         _require_safe_id(self.executor_epoch, name="executor_epoch")
         expected_id = f"{self.decision_id}:command"
         if self.command_id != expected_id:
-            raise ValueError(f"command_id must use canonical value {expected_id!r}")
+            host_expected = _require_exact_str("expected_id", expected_id)
+            raise ValueError(f"command_id must use canonical value '{host_expected}'")
 
     @property
     def effective_action(self) -> ArrayValue:
@@ -880,7 +881,8 @@ class DispatchReceipt:
         _require_safe_id(self.receipt_id, name="receipt_id")
         expected_id = f"{self.decision.decision_id}:receipt"
         if self.receipt_id != expected_id:
-            raise ValueError(f"receipt_id must use canonical value {expected_id!r}")
+            host_expected = _require_exact_str("expected_id", expected_id)
+            raise ValueError(f"receipt_id must use canonical value '{host_expected}'")
 
     @property
     def effective_action(self) -> ArrayValue:

@@ -97,7 +97,8 @@ _ACTUAL_INT_TYPES: tuple[type, ...] = (
 def _require_int(
     name: str, value: object, *, minimum: int, maximum: int = _INT32_MAX
 ) -> int:
-    if type(value) not in _ACTUAL_INT_TYPES:
+    actual_type = type(value)
+    if not any(actual_type is allowed_type for allowed_type in _ACTUAL_INT_TYPES):
         raise ValueError(f"{name} must be an integer")
     number = operator.index(cast(SupportsIndex, value))
     if number < minimum:
@@ -135,14 +136,44 @@ def _preflight_model_replay_state_resources(config: ModelReplayRehearsalConfig) 
         model=config.ensemble.model,
         ensemble_size=config.ensemble.ensemble_size,
     )
-    _, replay_bytes = _allocation_sizes(config.replay)
+    replay_slot_bytes, replay_bytes = _allocation_sizes(config.replay)
     persistent_bytes = ensemble_bytes + replay_bytes + _COMPOSER_ACCOUNTING_BYTES
     if persistent_bytes > _INT32_MAX:
         raise ValueError("model replay rehearsal state byte count must fit signed int32")
-    # The complete source composer, including its seven accounting leaves,
-    # remains live beside the proposed real-update ensemble.
+
+    model = config.ensemble.model
+    ensemble_size = config.ensemble.ensemble_size
+    target_dim = model.observation_dim + 2
+    # Exact non-state leaves returned by one ensemble update.  A real result
+    # remains live while one rehearsal result is produced by the scan.
+    ensemble_update_extra_bytes = 4 * (
+        2 * ensemble_size * target_dim
+        + 3 * target_dim
+        + ensemble_size * model.observation_dim
+        + 2 * model.observation_dim
+        + 3 * ensemble_size
+        + 13
+    ) + (2 * ensemble_size + 20)
+
+    quota = config.replay.batch_size
+    replay_batch_bytes = quota * (replay_slot_bytes + 13)
+    # Five scalar/boolean trace vectors, three int32 vectors, one float32
+    # loss vector, and the per-member update mask.
+    trace_bytes = quota * (21 + ensemble_size)
+    event_bytes = 8 * model.observation_dim + 32
+    # At the transaction barrier the source ensemble, real-update ensemble,
+    # current rehearsal input, and rehearsal proposal coexist.  The source,
+    # write proposal, and sampled replay proposal likewise coexist.  The fixed
+    # tail charges source/accepted/rejected composer counters, replay write and
+    # sample diagnostics, composer diagnostics, and scalar result leaves.
     update_working_set_bytes = (
-        2 * ensemble_bytes + replay_bytes + _COMPOSER_ACCOUNTING_BYTES
+        4 * ensemble_bytes
+        + 3 * replay_bytes
+        + 2 * ensemble_update_extra_bytes
+        + replay_batch_bytes
+        + trace_bytes
+        + event_bytes
+        + 207
     )
     if update_working_set_bytes > _INT32_MAX:
         raise ValueError(

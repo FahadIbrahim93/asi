@@ -130,10 +130,10 @@ def _preflight_adam_resources(n: int) -> None:
         n,
         persistent_vectors=2,
         persistent_scalars=7,
-        # Live during update: observation, g, m, v, new_m, new_v, m_hat,
-        # v_hat, and weight_delta. Remaining scalars cover the bias path
-        # and transaction flags.
-        update_vectors=9,
+        # Complete named logical envelope: source moments, observation and
+        # gradient, proposed moments, bias-corrected moments, weight delta,
+        # checked moments, selected result moments, and neutral output.
+        update_vectors=14,
         update_scalars=8,
     )
 
@@ -144,7 +144,9 @@ def _preflight_adam_param_resources(n: int) -> None:
         n,
         persistent_vectors=2,
         persistent_scalars=5,
-        update_vectors=9,
+        # The parameter path can additionally retain the parameter/decay
+        # input while producing its neutral selected output.
+        update_vectors=15,
         update_scalars=8,
     )
 
@@ -157,10 +159,10 @@ def _preflight_adagain_resources(n: int) -> None:
         n,
         persistent_vectors=2,
         persistent_scalars=4,
-        # Live during update: observation, gradient, step_sizes,
-        # gradient_trace, gain_correlation, meta_delta, new_step_sizes,
-        # weight_delta, and new_gradient_trace.
-        update_vectors=9,
+        # Source banks, observation/gradient, correlation/meta buffers,
+        # proposed banks and delta, checked trace, selected banks, and the
+        # neutral returned delta.
+        update_vectors=13,
         update_scalars=8,
     )
 
@@ -171,7 +173,7 @@ def _preflight_rmsprop_resources(n: int) -> None:
         n,
         persistent_vectors=1,
         persistent_scalars=4,
-        update_vectors=6,
+        update_vectors=8,
         update_scalars=6,
     )
 
@@ -182,7 +184,7 @@ def _preflight_nadaline_resources(n: int) -> None:
         n,
         persistent_vectors=1,
         persistent_scalars=3,
-        update_vectors=6,
+        update_vectors=9,
         update_scalars=6,
     )
 
@@ -920,7 +922,7 @@ class RMSprop(Optimizer[Any]):
             _require_shape_scalars(shape),
             persistent_vectors=1,
             persistent_scalars=3,
-            update_vectors=6,
+            update_vectors=8,
             update_scalars=6,
         )
         return RMSpropParamState(

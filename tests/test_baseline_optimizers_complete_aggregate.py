@@ -11,7 +11,7 @@ from alberta_framework.core.baseline_optimizers import NADALINE, AdaGain, Adam, 
 _INT32_MAX = 2**31 - 1
 _INT32_MIN = -(2**31)
 _ONE_BANK_FITS = _INT32_MAX // 4
-_WORKING_SET_OVERFLOW = 100_000_000
+_WORKING_SET_OVERFLOW = 50_000_000
 
 
 class _IntSubclass(int):
@@ -53,9 +53,11 @@ def test_adagain_one_gain_bank_fits_while_persistent_aggregate_does_not() -> Non
 def test_adam_rejects_simultaneous_update_working_set() -> None:
     one_bank_bytes = 4 * _WORKING_SET_OVERFLOW
     persistent_bytes = 4 * (2 * _WORKING_SET_OVERFLOW + 7)
-    update_bytes = 4 * (9 * _WORKING_SET_OVERFLOW + 8)
+    contributor_update_bytes = 4 * (9 * _WORKING_SET_OVERFLOW + 8)
+    update_bytes = 4 * (14 * _WORKING_SET_OVERFLOW + 8)
     assert one_bank_bytes <= _INT32_MAX
     assert persistent_bytes <= _INT32_MAX
+    assert contributor_update_bytes <= _INT32_MAX
     assert update_bytes > _INT32_MAX
     with pytest.raises(ValueError, match="update working set byte count"):
         Adam().init(_WORKING_SET_OVERFLOW)
@@ -64,9 +66,11 @@ def test_adam_rejects_simultaneous_update_working_set() -> None:
 def test_adagain_rejects_simultaneous_update_working_set() -> None:
     one_bank_bytes = 4 * _WORKING_SET_OVERFLOW
     persistent_bytes = 4 * (2 * _WORKING_SET_OVERFLOW + 4)
-    update_bytes = 4 * (9 * _WORKING_SET_OVERFLOW + 8)
+    contributor_update_bytes = 4 * (9 * _WORKING_SET_OVERFLOW + 8)
+    update_bytes = 4 * (13 * _WORKING_SET_OVERFLOW + 8)
     assert one_bank_bytes <= _INT32_MAX
     assert persistent_bytes <= _INT32_MAX
+    assert contributor_update_bytes <= _INT32_MAX
     assert update_bytes > _INT32_MAX
     with pytest.raises(ValueError, match="update working set byte count"):
         AdaGain().init(_WORKING_SET_OVERFLOW)
@@ -100,10 +104,10 @@ def test_legal_adam_and_adagain_update_identity_is_unchanged() -> None:
 @pytest.mark.parametrize(
     ("factory", "vectors", "scalars", "label"),
     [
-        (Adam, 9, 8, "Adam"),
-        (AdaGain, 9, 8, "AdaGain"),
-        (RMSprop, 6, 6, "RMSprop"),
-        (NADALINE, 6, 6, "NADALINE"),
+        (Adam, 14, 8, "Adam"),
+        (AdaGain, 13, 8, "AdaGain"),
+        (RMSprop, 8, 6, "RMSprop"),
+        (NADALINE, 9, 6, "NADALINE"),
     ],
 )
 def test_every_linear_optimizer_rejects_first_overflowing_update_width(
@@ -155,8 +159,8 @@ def test_parameter_optimizer_shape_rejects_hostile_schema(
 @pytest.mark.parametrize(
     ("factory", "vectors", "scalars", "label"),
     [
-        (Adam, 9, 8, "Adam"),
-        (RMSprop, 6, 6, "RMSprop"),
+        (Adam, 15, 8, "Adam"),
+        (RMSprop, 8, 6, "RMSprop"),
     ],
 )
 def test_parameter_optimizer_rejects_derived_shape_working_set_before_allocation(

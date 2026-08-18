@@ -64,8 +64,14 @@ _TRUSTED_REAL_TYPES = (
 )
 
 
+def _has_exact_type(value: object, allowed: frozenset[type]) -> bool:
+    """Match a concrete type without invoking an untrusted metaclass hook."""
+    actual_type = type(value)
+    return any(actual_type is allowed_type for allowed_type in allowed)
+
+
 def _require_int32(name: str, value: object, *, minimum: int, maximum: int = _INT32_MAX) -> int:
-    if type(value) not in _ACTUAL_INT_TYPES:
+    if not _has_exact_type(value, _ACTUAL_INT_TYPES):
         raise ValueError(f"{name} must be an integer in [{minimum}, {maximum}]")
     canonical = operator.index(cast(SupportsIndex, value))
     if not minimum <= canonical <= maximum:
@@ -74,7 +80,7 @@ def _require_int32(name: str, value: object, *, minimum: int, maximum: int = _IN
 
 
 def _require_float32(name: str, value: object, **bounds: Any) -> float:
-    if type(value) not in _TRUSTED_REAL_TYPES:
+    if not _has_exact_type(value, _TRUSTED_REAL_TYPES):
         raise ValueError(f"{name} must be a finite real scalar")
     return validated_float32_scalar(name, value, **bounds)
 
@@ -125,7 +131,10 @@ def _preflight_nonlinear_state(*, n_demons: int, hidden_size: int, feature_dim: 
         3 * logical_scalars
         + parameter_scalars
         + 3 * one_gradient_scalars
-        + 2 * feature_dim
+        # Current observation, next observation, and the finite-safe next copy.
+        + 3 * feature_dim
+        # Current/next hidden activations and their two tanh-derivative vectors.
+        + 4 * hidden_size
         + 24 * n_demons
         + 32
     )
