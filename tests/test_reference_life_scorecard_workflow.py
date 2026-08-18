@@ -40,7 +40,10 @@ def test_reference_life_scorecard_fails_closed_on_source_and_runtime() -> None:
     assert text.count('test "$(git rev-parse HEAD)" = "$LAUNCH_SHA"') == 2
     assert text.count('python-version: "3.12.12"') == 2
     assert text.count('test "$uv_version" = "0.9.24"') == 2
-    assert '"$UV_PATH" run --no-sync "$PYTHON_PATH"' in text
+    assert text.count('python_path="$GITHUB_WORKSPACE/.venv/bin/python"') == 2
+    assert 'python_path="$(realpath' not in text
+    assert '"$PYTHON_PATH" -m alberta_framework.benchmarks.reference_life_scorecard' in text
+    assert "import alberta_framework, jax" in text
     assert "retention-days: 90" in text
     assert "retention-days: 30" not in text
 
