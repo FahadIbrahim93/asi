@@ -66,9 +66,13 @@ def _preflight_state_resources(feature_dim: int) -> None:
 
 
 def _preflight_update_working_set(feature_dim: int) -> None:
-    # Covariance, proposed covariance, and the outer-product rank-one term,
-    # plus the live feature-width vectors (x, weights, Px, gain, next weights).
-    update_scalars = 3 * feature_dim * feature_dim + 5 * feature_dim + 8
+    # The update retains the source covariance, the rank-one outer product,
+    # the proposed covariance, and the transaction-selected covariance.  The
+    # width terms are x, source weights, Px, gain, proposed weights, selected
+    # weights, and the neutralized gain returned to the caller.  In
+    # particular, the selected result is a distinct logical buffer even when
+    # an execution backend can sometimes donate/alias it.
+    update_scalars = 4 * feature_dim * feature_dim + 7 * feature_dim + 8
     if 4 * update_scalars > _INT32_MAX:
         raise ValueError(
             "reward-model update working set byte count must fit signed int32"

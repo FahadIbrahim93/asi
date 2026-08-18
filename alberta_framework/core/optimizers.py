@@ -775,10 +775,11 @@ class IDBD(Optimizer[IDBDState]):
         """
         feature_dim = _require_int32("feature_dim", feature_dim, minimum=1)
         _require_float32_state("IDBD state", 2 * feature_dim + 3)
-        # Live during linear update: observation, traces, log_step_sizes,
-        # correlation, meta_delta, new_log, new_alphas, weight_delta, new_traces.
+        # Complete named logical envelope for both linear and parameter
+        # paths, including checked source banks, selected result banks, and
+        # the neutral returned step/delta.
         _require_float32_update_working_set(
-            "IDBD update working set", 9 * feature_dim + 8
+            "IDBD update working set", 18 * feature_dim + 8
         )
         return IDBDState(
             log_step_sizes=jnp.full(
@@ -802,7 +803,7 @@ class IDBD(Optimizer[IDBDState]):
         shape = _require_shape(shape)
         n = _shape_size(shape)
         _require_float32_state("IDBD parameter state", 2 * n + 1)
-        _require_float32_update_working_set("IDBD update working set", 9 * n + 8)
+        _require_float32_update_working_set("IDBD update working set", 18 * n + 8)
         return IDBDParamState(
             log_step_sizes=jnp.full(shape, jnp.log(self._initial_step_size), dtype=jnp.float32),
             traces=jnp.zeros(shape, dtype=jnp.float32),
@@ -1125,11 +1126,11 @@ class Autostep(Optimizer[AutostepState]):
         """
         feature_dim = _require_int32("feature_dim", feature_dim, minimum=1)
         _require_float32_state("Autostep state", 3 * feature_dim + 5)
-        # Live during Table-1 update: observation, x^2, step_sizes, traces,
-        # normalizers, meta_gradient, v_update, new_normalizers, new_step_sizes,
-        # and weight_delta.
+        # Table-1's parameter path retains the source banks plus its squared
+        # feature, meta, normalizer, normalized-step, trace, checked-source,
+        # selected-result, and neutral-output buffers.
         _require_float32_update_working_set(
-            "Autostep update working set", 10 * feature_dim + 8
+            "Autostep update working set", 30 * feature_dim + 8
         )
         return AutostepState(
             step_sizes=jnp.full(feature_dim, self._initial_step_size, dtype=jnp.float32),
@@ -1154,7 +1155,7 @@ class Autostep(Optimizer[AutostepState]):
         shape = _require_shape(shape)
         n = _shape_size(shape)
         _require_float32_state("Autostep parameter state", 3 * n + 2)
-        _require_float32_update_working_set("Autostep update working set", 10 * n + 8)
+        _require_float32_update_working_set("Autostep update working set", 30 * n + 8)
         return AutostepParamState(
             step_sizes=jnp.full(shape, self._initial_step_size, dtype=jnp.float32),
             traces=jnp.zeros(shape, dtype=jnp.float32),
@@ -1521,7 +1522,7 @@ class AutostepGTDLambda(Optimizer[AutostepGTDLambdaState]):
         feature_dim = _require_int32("feature_dim", feature_dim, minimum=1)
         _require_float32_state("AutostepGTDLambda state", 4 * feature_dim + 7)
         _require_float32_update_working_set(
-            "AutostepGTDLambda update working set", 11 * feature_dim + 8
+            "AutostepGTDLambda update working set", 40 * feature_dim + 8
         )
         base_state = self._base.init(feature_dim)
         return AutostepGTDLambdaState(
@@ -1668,7 +1669,7 @@ class ObGD(Optimizer[ObGDState]):
         """
         feature_dim = _require_int32("feature_dim", feature_dim, minimum=1)
         _require_float32_state("ObGD state", feature_dim + 5)
-        _require_float32_update_working_set("ObGD update working set", 5 * feature_dim + 8)
+        _require_float32_update_working_set("ObGD update working set", 12 * feature_dim + 8)
         return ObGDState(
             step_size=jnp.array(self._step_size, dtype=jnp.float32),
             kappa=jnp.array(self._kappa, dtype=jnp.float32),
@@ -1899,7 +1900,7 @@ class TDIDBD(TDOptimizer[TDIDBDState]):
         feature_dim = _require_int32("feature_dim", feature_dim, minimum=1)
         _require_float32_state("TDIDBD state", 3 * feature_dim + 5)
         _require_float32_update_working_set(
-            "TDIDBD update working set", 10 * feature_dim + 8
+            "TDIDBD update working set", 22 * feature_dim + 8
         )
         return TDIDBDState(
             log_step_sizes=jnp.full(
@@ -2116,7 +2117,7 @@ class AutoTDIDBD(TDOptimizer[AutoTDIDBDState]):
         feature_dim = _require_int32("feature_dim", feature_dim, minimum=1)
         _require_float32_state("AutoTDIDBD state", 4 * feature_dim + 7)
         _require_float32_update_working_set(
-            "AutoTDIDBD update working set", 11 * feature_dim + 8
+            "AutoTDIDBD update working set", 32 * feature_dim + 8
         )
         return AutoTDIDBDState(
             log_step_sizes=jnp.full(
