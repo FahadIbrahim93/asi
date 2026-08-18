@@ -1676,7 +1676,7 @@ def _decode_mapping(value: Mapping[str, Any] | bytes | str, label: str) -> dict[
         decoded = decode_strict_json(canonical_json_bytes(dict(value)))
     elif type(value) in (bytes, str):
         decoded = decode_strict_json(value)
-        raw = value if type(value) is bytes else value.encode("utf-8")
+        raw = value if type(value) is bytes else cast(str, value).encode("utf-8")
         mapping = _object(decoded, label)
         if raw != canonical_json_bytes(mapping):
             raise ForagerMatchedExecutorError(f"{label} bytes are not canonical")
