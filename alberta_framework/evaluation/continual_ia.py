@@ -133,6 +133,10 @@ def _require_ndarray(
         raise ValueError(f"{name} must be one-dimensional")
     if length is not None and int(value.shape[0]) != length:
         raise ValueError(f"{name} must have length {length}")
+    return value
+
+
+def _snapshot_ndarray(value: NDArray[Any]) -> NDArray[Any]:
     snapshot = np.array(value, copy=True, order="C")
     snapshot.flags.writeable = False
     return snapshot
@@ -464,7 +468,6 @@ class IAConditionResult:
         if type(self.condition) is not str or self.condition not in CONDITION_NAMES:
             raise ValueError("condition must be a known IA condition name")
         rewards = _require_ndarray("rewards", self.rewards, dtype=np.dtype(np.float64))
-        object.__setattr__(self, "rewards", rewards)
         steps = int(rewards.shape[0])
         if steps < 1:
             raise ValueError("rewards must contain at least one step")
@@ -481,7 +484,6 @@ class IAConditionResult:
                 dtype=np.dtype(np.int64),
                 length=steps,
             )
-            object.__setattr__(self, name, action)
             action_arrays.append(action)
         accepted = _require_ndarray(
             "accepted_recommendations",
@@ -489,7 +491,6 @@ class IAConditionResult:
             dtype=np.dtype(np.bool_),
             length=steps,
         )
-        object.__setattr__(self, "accepted_recommendations", accepted)
         mean_reward = finite_real("mean_reward", self.mean_reward)
         object.__setattr__(self, "mean_reward", mean_reward)
         phase_means = _require_ndarray(
@@ -497,16 +498,29 @@ class IAConditionResult:
             self.phase_mean_rewards,
             dtype=np.dtype(np.float64),
         )
-        object.__setattr__(self, "phase_mean_rewards", phase_means)
         recoveries = _require_ndarray(
             "recovery_lengths",
             self.recovery_lengths,
             dtype=np.dtype(np.int64),
         )
-        object.__setattr__(self, "recovery_lengths", recoveries)
         arrays = (rewards, *action_arrays, accepted, phase_means, recoveries)
         if sum(array.nbytes for array in arrays) > _MAX_CONDITION_RESULT_BYTES:
             raise ValueError("condition result arrays exceed the bounded record budget")
+        for name, array in zip(
+            (
+                "rewards",
+                "credited_actions",
+                "executed_actions",
+                "recommendations",
+                "partner_proposals",
+                "accepted_recommendations",
+                "phase_mean_rewards",
+                "recovery_lengths",
+            ),
+            arrays,
+            strict=True,
+        ):
+            object.__setattr__(self, name, _snapshot_ndarray(array))
         if phase_means.size < 1 or recoveries.size != phase_means.size - 1:
             raise ValueError("phase and recovery arrays do not describe one shared schedule")
         if not bool(np.all(np.isfinite(rewards))) or not bool(np.all(np.isfinite(phase_means))):
@@ -1323,8 +1337,12 @@ def aggregate_ia_evidence(
     config = ContinualIAConfig(
         **{field.name: getattr(config, field.name) for field in fields(ContinualIAConfig)}
     )
+    if type(results) is not list and type(results) is not tuple:
+        raise ValueError("results must be an exact list or tuple")
     if not results:
         raise ValueError("results must be non-empty")
+    seed_count = (len(results) + len(CONDITION_NAMES) - 1) // len(CONDITION_NAMES)
+    _preflight_run_resources(config, seed_count)
     validated: list[IAConditionResult] = []
     for result in results:
         if type(result) is not IAConditionResult:
@@ -1341,6 +1359,8 @@ def aggregate_ia_evidence(
         if not np.array_equal(result.recovery_lengths, expected_recoveries):
             raise ValueError("recovery_lengths do not match rewards and config")
         validated.append(result)
+    if len(validated) % len(CONDITION_NAMES) != 0:
+        raise ValueError("results must contain complete IA condition tuples")
     results = tuple(validated)
     groups = {condition: _condition_group(results, condition) for condition in CONDITION_NAMES}
     seed_sets = {
