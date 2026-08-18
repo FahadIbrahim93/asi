@@ -94,6 +94,8 @@ def test_oracle_experience_snapshots_nested_payloads_on_real_conversion_path() -
     metadata_nested.append("changed")
     assert direct.to_dict()["outcome"]["nested"] == ["source"]
     assert direct.to_dict()["policy_metadata"]["nested"] == ["source"]
+    assert type(direct.outcome["nested"]) is tuple
+    assert type(direct.policy_metadata["nested"]) is tuple
 
 
 def test_oracle_experience_cross_binds_derived_label_to_action_metadata() -> None:
@@ -140,3 +142,58 @@ def test_oracle_validator_rejects_hostile_outer_container_without_hooks() -> Non
         validate_security_oracle_experience(
             _HostileRecords([_legal()]), SecurityFeatureSchema(names=("risk",))
         )
+
+
+@pytest.mark.parametrize("consumer", ["validate", "serialize"])
+def test_oracle_consumers_reject_forged_state_without_hooks(consumer: str) -> None:
+    class _HostileInt(int):
+        calls = 0
+
+        def __int__(self) -> int:  # type: ignore[override]
+            type(self).calls += 1
+            raise AssertionError("integer hook executed")
+
+        def __repr__(self) -> str:
+            type(self).calls += 1
+            raise AssertionError("representation hook executed")
+
+    record = _legal()
+    object.__setattr__(record, "action", _HostileInt(0))
+    _HostileInt.calls = 0
+    with pytest.raises(ValueError, match="action must be an exact SecurityAction"):
+        if consumer == "validate":
+            validate_security_oracle_experience(
+                [record], SecurityFeatureSchema(names=("risk",))
+            )
+        else:
+            record.to_dict()
+    assert _HostileInt.calls == 0
+
+
+def test_oracle_consumers_reject_forged_mutable_nested_alias() -> None:
+    record = _legal()
+    object.__setattr__(
+        record,
+        "outcome",
+        MappingProxyType({"label": "safe", "nested": ["mutable"]}),
+    )
+    with pytest.raises(ValueError, match="immutable exact JSON values"):
+        validate_security_oracle_experience(
+            [record], SecurityFeatureSchema(names=("risk",))
+        )
+    with pytest.raises(ValueError, match="immutable exact JSON values"):
+        record.to_dict()
+
+
+def test_oracle_consumers_bound_forged_immutable_nesting() -> None:
+    nested: object = "leaf"
+    for _ in range(34):
+        nested = (nested,)
+    record = _legal()
+    object.__setattr__(
+        record,
+        "outcome",
+        MappingProxyType({"label": "safe", "nested": nested}),
+    )
+    with pytest.raises(ValueError, match="nesting limit"):
+        record.to_dict()
