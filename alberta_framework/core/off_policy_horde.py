@@ -987,9 +987,9 @@ class OffPolicyHordeLearner:
         horde_spec = HordeSpec.from_config(config.pop("horde_spec"))
         optimizer = optimizer_from_config(config.pop("optimizer"))
         bounder_cfg = config.pop("bounder", None)
-        bounder = bounder_from_config(bounder_cfg) if bounder_cfg else None
+        bounder = bounder_from_config(bounder_cfg) if bounder_cfg is not None else None
         normalizer_cfg = config.pop("normalizer", None)
-        normalizer = normalizer_from_config(normalizer_cfg) if normalizer_cfg else None
+        normalizer = normalizer_from_config(normalizer_cfg) if normalizer_cfg is not None else None
         head_optimizer_cfg = config.pop("head_optimizer", None)
         head_optimizer = (
             optimizer_from_config(head_optimizer_cfg)
