@@ -3865,7 +3865,7 @@ def summarize_forager_runs(
         "fov_last_10pct_ema_auc",
     }
     if type(metric) is not str or metric not in supported_metrics:
-        raise ValueError(f"unsupported Forager summary metric {metric!r}")
+        raise ValueError("unsupported Forager summary metric")
     if type(runs) not in (list, tuple):
         raise TypeError("runs must be an actual list or tuple")
     if any(type(run) is not ForagerRunResult for run in runs):
