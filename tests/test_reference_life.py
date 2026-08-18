@@ -36,8 +36,8 @@ from alberta_framework.reference_agent import (
 )
 from alberta_framework.reference_life import (
     ExactDispatchAdapter,
+    ExactDispatchConfig,
     HaltStage,
-    LifeHalt,
     LifePhase,
     RecoveryMode,
     ReferenceLifeConfig,
@@ -45,6 +45,7 @@ from alberta_framework.reference_life import (
     ReferenceLifeRunner,
     SwitchingEnvironmentExecution,
     SwitchingTwoStateReferenceEnvironment,
+    _require_prototype_lifecycle_id,
     build_prototype_switching_life,
 )
 from alberta_framework.streams.closed_loop import (
@@ -66,11 +67,18 @@ class _HostileHaltReason(str):
         type(self).hook_calls += 1
         raise AssertionError("hostile halt-reason truth hook executed")
 
-    def strip(self, *args: str) -> str:
-        del args
+    def __eq__(self, other: object) -> bool:
+        del other
         type(self).hook_calls += 1
-        raise AssertionError("hostile halt-reason strip hook executed")
+        raise AssertionError("hostile halt-reason equality hook executed")
 
+    def __hash__(self) -> int:
+        type(self).hook_calls += 1
+        raise AssertionError("hostile halt-reason hash hook executed")
+
+    def __len__(self) -> int:
+        type(self).hook_calls += 1
+        raise AssertionError("hostile halt-reason length hook executed")
 
 def _agent_config() -> PrototypeAgentConfig:
     return PrototypeAgentConfig(
@@ -1511,17 +1519,12 @@ def test_abort_is_terminal_and_preserves_pending_execution() -> None:
         runner.step(aborted)
 
 
-def test_halt_and_abort_reject_hostile_reason_without_hooks() -> None:
+def test_reference_life_id_helpers_reject_hostile_strings_without_hooks() -> None:
     _HostileHaltReason.hook_calls = 0
-    hostile = _HostileHaltReason("operator stop")
-    with pytest.raises(ValueError, match="halt reason"):
-        LifeHalt(
-            stage=HaltStage.PRE_DISPATCH,
-            recovery_mode=RecoveryMode.RETRY_OUTCOME,
-            reason=hostile,
+    with pytest.raises(ValueError, match="authority_id"):
+        ExactDispatchConfig(authority_id=_HostileHaltReason("asi.hostile.authority"))
+    with pytest.raises(ValueError, match="lifecycle_id"):
+        _require_prototype_lifecycle_id(
+            _HostileHaltReason("prototype.0000000100000002")
         )
-
-    runner = _runner(horizon=1)
-    with pytest.raises(ValueError, match="abort reason"):
-        runner.abort(runner.init(), reason=hostile)
     assert _HostileHaltReason.hook_calls == 0

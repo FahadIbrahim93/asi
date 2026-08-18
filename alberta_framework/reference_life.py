@@ -87,7 +87,7 @@ _CheckpointPublishResult = TypeVar("_CheckpointPublishResult")
 
 def _require_id(value: str, *, name: str) -> None:
     if (
-        not isinstance(value, str)
+        type(value) is not str
         or not value
         or len(value) > _MAX_ID_LENGTH
         or _SAFE_ID.fullmatch(value) is None
@@ -128,7 +128,7 @@ def _require_finite_real(name: str, value: object) -> float:
 
 
 def _require_prototype_lifecycle_id(value: str) -> None:
-    if not isinstance(value, str) or _PROTOTYPE_LIFECYCLE.fullmatch(value) is None:
+    if type(value) is not str or _PROTOTYPE_LIFECYCLE.fullmatch(value) is None:
         raise ValueError(
             "lifecycle_id must use the Prototype lifecycle codec "
             "'prototype.' followed by 16 lowercase hexadecimal digits"
