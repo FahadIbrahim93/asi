@@ -56,6 +56,38 @@ def test_appendix_c1_mode_checks_observable_contract_without_claiming_independen
             ),
         )
 
+    with pytest.raises(ValueError, match="10,000 validation"):
+        estimate_appendix_c1_optimization_readiness(
+            loss=1.0,
+            full_validation_gradient=np.ones(2, dtype=np.float64),
+            batch_gradients=gradients,
+            full_validation_observations=9_999,
+            mini_batch_size=4,
+            sampling_provenance=(
+                "caller_reported_independent_with_replacement_not_verified_from_gradients"
+            ),
+        )
+    with pytest.raises(ValueError, match="mini-batch size 4"):
+        estimate_appendix_c1_optimization_readiness(
+            loss=1.0,
+            full_validation_gradient=np.ones(2, dtype=np.float64),
+            batch_gradients=gradients,
+            full_validation_observations=10_000,
+            mini_batch_size=1,
+            sampling_provenance=(
+                "caller_reported_independent_with_replacement_not_verified_from_gradients"
+            ),
+        )
+    with pytest.raises(ValueError, match="explicit unverified label"):
+        estimate_appendix_c1_optimization_readiness(
+            loss=1.0,
+            full_validation_gradient=np.ones(2, dtype=np.float64),
+            batch_gradients=gradients,
+            full_validation_observations=10_000,
+            mini_batch_size=4,
+            sampling_provenance="independence_proven",
+        )
+
 
 def test_generic_equation_helper_remains_explicitly_sampling_agnostic() -> None:
     report = estimate_optimization_readiness(
@@ -159,7 +191,7 @@ def _result_payload(*, arm_id: str = "candidate") -> dict[str, object]:
             "future_gain_rollout_count": 128,
             "future_gain_batch_size": 4,
             "future_gain_step_size": 1e-3,
-            "parameter_count": 2,
+            "parameter_count": 16,
             "sampling_provenance": (
                 "caller_reported_independent_with_replacement_not_verified_from_gradients"
             ),
@@ -172,7 +204,7 @@ def _result_payload(*, arm_id: str = "candidate") -> dict[str, object]:
         "resources": {
             "schema": "asi.optimization-readiness.resources.v1",
             "persistent_bytes": 4096,
-            "peak_working_set_bytes": 129 * 2 * 8,
+            "peak_working_set_bytes": 129 * 16 * 8,
             "environment_steps": 0,
             "data_steps": 1_291_024,
             "model_queries": 1_291_024,
@@ -264,7 +296,7 @@ def test_matched_result_validation_enforces_all_axes() -> None:
         ("resources", "data_steps", 1_291_023, "environment_steps plus data_steps"),
         ("resources", "model_queries", 1_291_023, "model_queries"),
         ("resources", "parameter_updates", 127, "parameter_updates"),
-        ("resources", "peak_working_set_bytes", 2_063, "peak_working_set_bytes"),
+        ("resources", "peak_working_set_bytes", 16_511, "peak_working_set_bytes"),
     ],
 )
 def test_resource_receipt_enforces_live_cross_field_identities(
@@ -274,6 +306,25 @@ def test_resource_receipt_enforces_live_cross_field_identities(
     nested = payload[section]
     assert isinstance(nested, dict)
     nested[field] = value
+    with pytest.raises(ValueError, match=match):
+        validate_development_result(payload)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "match"),
+    [
+        ("representation_energy_rank_0_99", 10_001, "validation row count"),
+        ("curvature_energy_rank_0_99", 17, "parameter_count"),
+        ("future_relative_loss_reduction", 1.0001, "cannot exceed one"),
+    ],
+)
+def test_reported_metrics_respect_mathematical_domains(
+    field: str, value: object, match: str
+) -> None:
+    payload = _result_payload()
+    metrics = payload["metrics"]
+    assert isinstance(metrics, dict)
+    metrics[field] = value
     with pytest.raises(ValueError, match=match):
         validate_development_result(payload)
 
@@ -399,4 +450,5 @@ def test_protocol_records_estimator_differences_and_nonpromotion() -> None:
     assert OPTIMIZATION_READINESS_PROTOCOL["completed_result_exists"] is False
     assert OPTIMIZATION_READINESS_PROTOCOL["outcome_retention_required"] is True
     assert OPTIMIZATION_READINESS_PROTOCOL["resource_receipts_are_authenticated"] is False
+    assert OPTIMIZATION_READINESS_PROTOCOL["metrics_are_recomputed_by_this_module"] is False
     assert OPTIMIZATION_READINESS_PROTOCOL["outcomes_are_derived_by_this_module"] is False
