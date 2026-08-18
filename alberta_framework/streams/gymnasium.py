@@ -36,12 +36,11 @@ from jax import Array
 
 from alberta_framework._seed_validation import JAX_KEY_SEED_MAX, require_jax_seed
 from alberta_framework.core._float32_scalars import validated_float32_scalar
+from alberta_framework.core.learners import LinearLearner
 from alberta_framework.core.types import LearnerState, TimeStep
 
 if TYPE_CHECKING:
     import gymnasium
-
-    from alberta_framework.core.learners import LinearLearner
 
 _INT32_MAX = 2**31 - 1
 _INT32_MIN = -(2**31)
