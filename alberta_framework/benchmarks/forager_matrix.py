@@ -900,7 +900,7 @@ def _require_string(value: Any, path: str) -> str:
 
 
 def _require_positive_int(value: Any, path: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int):
+    if type(value) is not int:
         raise ForagerMatrixManifestError(f"{path} must be an integer")
     if value < 1:
         raise ForagerMatrixManifestError(f"{path} must be positive")
@@ -908,7 +908,7 @@ def _require_positive_int(value: Any, path: str) -> int:
 
 
 def _require_nonnegative_int(value: Any, path: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int):
+    if type(value) is not int:
         raise ForagerMatrixManifestError(f"{path} must be an integer")
     if value < 0:
         raise ForagerMatrixManifestError(f"{path} must be non-negative")
@@ -926,7 +926,7 @@ def _require_seed_list(value: Any, path: str) -> tuple[int, ...]:
         )
     result: list[int] = []
     for index, seed in enumerate(value):
-        if isinstance(seed, bool) or not isinstance(seed, int):
+        if type(seed) is not int:
             raise ForagerMatrixManifestError(f"{path}[{index}] must be an integer")
         if not 0 <= seed <= _MAX_JAX_SEED:
             raise ForagerMatrixManifestError(f"{path}[{index}] must lie in [0, {_MAX_JAX_SEED}]")
@@ -970,11 +970,11 @@ def _coerce_typed_value(value: Any, annotation: Any, path: str) -> Any:
             raise ForagerMatrixManifestError(f"{path} must be a boolean")
         return value
     if annotation is int:
-        if isinstance(value, bool) or not isinstance(value, int):
+        if type(value) is not int:
             raise ForagerMatrixManifestError(f"{path} must be an integer")
         return value
     if annotation is float:
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
+        if type(value) is not float and type(value) is not int:
             raise ForagerMatrixManifestError(f"{path} must be a number")
         try:
             converted = float(value)
@@ -2841,7 +2841,7 @@ def _validate_source_snapshot_bytes(
         )
         size = entry["size"]
         digest = entry["sha256"]
-        if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+        if type(size) is not int or size < 0:
             raise ForagerMatrixStateError(f"{description} inventory size is invalid")
         if size > _MAX_SOURCE_FILE_BYTES:
             raise ForagerMatrixStateError(
@@ -5343,7 +5343,7 @@ def _validate_raw_metric_evidence(
 
 
 def _finite_number(value: Any, path: str, *, minimum: float | None = None) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    if type(value) not in (int, float):
         raise ForagerMatrixStateError(f"{path} must be a finite number")
     try:
         result = float(value)
