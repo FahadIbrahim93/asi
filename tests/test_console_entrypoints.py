@@ -21,6 +21,7 @@ _LAZY_SCRIPTS = {
     "alberta-foragax-oci": ("alberta_framework.console_entrypoints:official_foragax_oci_main"),
 }
 _ASI_SCRIPTS = {
+    "asi-adamo-diagnostic": "alberta_framework.benchmarks.adamo_diagnostic:main",
     "asi-reference-life-scorecard": (
         "alberta_framework.benchmarks.reference_life_scorecard:main"
     ),

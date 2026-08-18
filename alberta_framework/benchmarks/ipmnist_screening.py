@@ -9074,6 +9074,8 @@ def run_screening_config(
     progress_every: int | None = None,
     noise_mode: str = "step",
     noise_pool_steps: int = 64,
+    *,
+    _task_observer: Callable[[int, Mapping[str, Array], Any], None] | None = None,
 ) -> ScreeningRunResult:
     """Run one screening configuration for one seed.
 
@@ -9095,6 +9097,8 @@ def run_screening_config(
         type(progress_every) is not int or progress_every <= 0
     ):
         raise ValueError("progress_every must be a positive integer or None")
+    if _task_observer is not None and type(_task_observer) is not FunctionType:
+        raise TypeError("_task_observer must be an exact Python function or None")
     resolved_seed = require_jax_seed(seed, name="seed")
     noise_mode = _validated_screening_noise_mode(noise_mode, spec)
     if spec.mechanism == "l2_effective_rank":
@@ -9220,6 +9224,10 @@ def run_screening_config(
         task_accuracy.append(float(jnp.mean(accuracies)))
         task_loss.append(float(jnp.mean(losses)))
         task_plasticity.append(float(jnp.mean(plasticities)))
+        if _task_observer is not None:
+            # Diagnostics are deliberately downstream of the complete task update.  The
+            # learner never receives this task boundary or anything returned by the observer.
+            _task_observer(task, MappingProxyType(dict(params)), state)
         if progress_every is not None and (task + 1) % progress_every == 0:
             elapsed = time.monotonic() - started
             logger.info(
