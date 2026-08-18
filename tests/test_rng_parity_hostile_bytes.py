@@ -25,35 +25,45 @@ class _HostileStr(str):
 
 
 def test_rng_parity_rejects_hostile_bytes() -> None:
+    from alberta_framework.benchmarks.forager_rng_parity import validate_parity_result
+
     hostile = _HostileBytes(b'{"a": 1}')
     _HostileBytes.calls = 0
-    # decode_strict_json should reject hostile subclass before decode
-    # But our parity decode is in forager_rng_parity.py which now uses type is
-    # We test via the result parsing gate: type(value) in (bytes, str)
-    assert (type(hostile) in (bytes, str)) is False
+    with pytest.raises(TypeError, match="mapping, bytes, or str"):
+        validate_parity_result(hostile)  # type: ignore[arg-type]
     assert _HostileBytes.calls == 0
 
 
 def test_rng_parity_rejects_hostile_str() -> None:
+    from alberta_framework.benchmarks.forager_rng_parity import validate_collector_result
+
     hostile = _HostileStr('{"a": 1}')
     _HostileStr.calls = 0
-    assert (type(hostile) in (bytes, str)) is False
+    with pytest.raises(TypeError, match="mapping, bytes, or str"):
+        validate_collector_result(hostile)  # type: ignore[arg-type]
     assert _HostileStr.calls == 0
 
 
 def test_parity_qualification_rejects_hostile() -> None:
-    # We just test the gate: hostile bytes/str should not be treated as bytes/str
+    from alberta_framework.benchmarks.forager_rng_parity_qualification import (
+        validate_host_qualification_receipt,
+    )
+
     hostile_b = _HostileBytes(b'{"x": 1}')
     hostile_s = _HostileStr('{"x": 1}')
     _HostileBytes.calls = 0
     _HostileStr.calls = 0
-    assert (type(hostile_b) in (bytes, str)) is False
-    assert (type(hostile_s) in (bytes, str)) is False
+    for hostile in (hostile_b, hostile_s):
+        with pytest.raises(TypeError, match="mapping, bytes, or str"):
+            validate_host_qualification_receipt(  # type: ignore[arg-type]
+                hostile,
+                None,
+                {},
+                {},
+                expected_executor_qualification_receipt_sha256="0" * 64,
+            )
     assert _HostileBytes.calls == 0
     assert _HostileStr.calls == 0
-    # Builtin should still be True
-    assert (type(b"a") in (bytes, str)) is True  # noqa: UP003
-    assert (type("a") in (bytes, str)) is True  # noqa: UP003
 
 
 def test_canonical_json_bytes_not_hostile() -> None:

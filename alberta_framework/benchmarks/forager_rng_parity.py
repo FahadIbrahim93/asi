@@ -2121,7 +2121,9 @@ def validate_parity_result(
     expected hash and replay the probe in the pinned OCI image.
     """
     if type(value) in (bytes, str):
-        decoded = decode_strict_json(value)
+        decoded = decode_strict_json(cast(bytes | str, value))
+    elif isinstance(value, (bytes, str)):
+        raise TypeError("result must be a mapping, bytes, or str")
     else:
         decoded = decode_strict_json(canonical_json_bytes(value))
     payload = _require_object(decoded, "result")
@@ -2221,7 +2223,9 @@ def validate_collector_result(
 ) -> ParityCollectorResult:
     """Validate one hash-only collector payload without claiming execution authenticity."""
     if type(value) in (bytes, str):
-        decoded = decode_strict_json(value)
+        decoded = decode_strict_json(cast(bytes | str, value))
+    elif isinstance(value, (bytes, str)):
+        raise TypeError("collector result must be a mapping, bytes, or str")
     else:
         decoded = decode_strict_json(canonical_json_bytes(value))
     payload = _require_object(decoded, "collector_result")
