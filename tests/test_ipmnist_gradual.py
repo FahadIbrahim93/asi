@@ -74,6 +74,26 @@ def test_transition_config_rejects_forged_and_hostile_values_without_index_hooks
         )
     assert hostile.calls == 0
 
+    class HostileMeta(type):
+        calls = 0
+
+        def __eq__(cls, other: object) -> bool:
+            cls.calls += 1
+            raise AssertionError("must not compare types")
+
+        def __hash__(cls) -> int:
+            cls.calls += 1
+            raise AssertionError("must not hash types")
+
+    class Hostile(metaclass=HostileMeta):
+        pass
+
+    with pytest.raises(ValueError, match="integer"):
+        GradualTransitionConfig(
+            mode="input_interpolation", transition_steps=Hostile()  # type: ignore[arg-type]
+        )
+    assert HostileMeta.calls == 0
+
 
 def test_task_sampling_mask_is_matched_deterministic_and_monotone() -> None:
     first = task_sampling_mask(seed=7, transition_id=3, count=10, alpha=0.3)
@@ -174,7 +194,9 @@ def test_gradual_input_pair_runs_one_matched_real_learner_schedule() -> None:
     assert result.loss_sums.shape == (2, 3)
     assert np.all(np.isfinite(result.loss_sums))
     assert result.persistent_numeric_bytes.shape == (2,)
-    assert np.all(result.persistent_numeric_bytes > data_x.nbytes + data_y.nbytes)
+    # 29 params * (parameter + Adam m + Adam v) float32 bytes, five
+    # optimizer scalars per each of six leaves, dataset, and full schedule.
+    assert np.all(result.persistent_numeric_bytes == 29 * 12 + 6 * 5 * 4 + 80 + 96)
     assert result.timing_ns.shape == (2,)
     assert np.all(result.timing_ns >= 0)
 

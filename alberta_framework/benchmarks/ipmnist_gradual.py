@@ -81,7 +81,10 @@ GRADUAL_IPMNIST_PROTOCOL = MappingProxyType(
 
 
 def _exact_index(name: str, value: object, *, minimum: int) -> int:
-    if type(value) is not int and type(value) not in _NUMPY_INTEGER_TYPES:
+    actual_type = type(value)
+    if actual_type is not int and not any(
+        actual_type is allowed for allowed in _NUMPY_INTEGER_TYPES
+    ):
         raise ValueError(f"{name} must be an integer")
     try:
         resolved = operator.index(cast(SupportsIndex, value))
@@ -330,7 +333,7 @@ def run_gradual_input_pair(
     # before any protocol materialization or device initialization.
     aggregate_persistent_bytes = (
         checked_config.parameter_count * 12
-        + 6 * 4
+        + 6 * 5 * 4
         + dataset_elements * 4
         + schedule_elements * 4
     )
