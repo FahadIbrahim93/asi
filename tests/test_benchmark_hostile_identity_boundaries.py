@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from alberta_framework.benchmarks import _foragax_open_screen_probe as probe
 from alberta_framework.benchmarks import foragax_open_screen as screen
 from alberta_framework.benchmarks import forager_results as results
 from alberta_framework.benchmarks import ipmnist_screening as ipmnist
@@ -56,6 +57,17 @@ def test_open_screen_helpers_reject_hostile_identities_before_hooks() -> None:
         screen._require_dict(_HostileDict(), "payload")
     with pytest.raises(screen.ScreenError, match="array"):
         screen._require_list(_HostileList(), "records")
+    assert _HostileString.calls == 0
+
+
+def test_open_screen_probe_rejects_hostile_scalar_identities_before_hooks() -> None:
+    hostile = _HostileString("configs/agent.json")
+    _HostileString.calls = 0
+    with pytest.raises(RuntimeError, match="relative path"):
+        probe._relative_path(hostile, "configuration")
+    assert probe._is_exact_int(True) is False
+    assert probe._is_exact_int(1) is True
+    assert probe._is_exact_int(type("IntSubclass", (int,), {})(1)) is False
     assert _HostileString.calls == 0
 
 

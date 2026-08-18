@@ -1121,10 +1121,9 @@ def decode_strict_json(data: bytes | str) -> Any:
         raise ForagerMatchedProtocolError("protocol must be exact bytes or string JSON")
     try:
         if type(data) is bytes:
-            raw_bytes = cast(bytes, data)
-            if len(raw_bytes) > _MAX_MANIFEST_BYTES:
+            if len(data) > _MAX_MANIFEST_BYTES:
                 raise ForagerMatchedProtocolError("protocol exceeds the file-size limit")
-            text = raw_bytes.decode("utf-8")
+            text = data.decode("utf-8")
         else:
             raw_text = cast(str, data)
             if len(raw_text) > _MAX_MANIFEST_BYTES:
