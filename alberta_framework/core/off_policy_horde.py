@@ -961,7 +961,11 @@ class OffPolicyHordeLearner:
             "sparsity": self._sparsity,
             "leaky_relu_slope": self._leaky_relu_slope,
             "use_layer_norm": self._use_layer_norm,
-            "head_optimizer": (self._head_optimizer.to_config() if self._head_optimizer else None),
+            "head_optimizer": (
+                self._head_optimizer.to_config()
+                if self._head_optimizer is not None
+                else None
+            ),
             "trace_mode": self._trace_mode.value,
             "utility_decay": self._utility_decay,
             "ratio_clip": self._ratio_clip,

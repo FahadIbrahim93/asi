@@ -202,6 +202,7 @@ class TestOffPolicyHordeLearnerOptimizerTruthiness:
         )
         assert horde._optimizer is opt
         assert horde._head_optimizer is head_opt
+        assert horde.to_config()["head_optimizer"] == head_opt.to_config()
         assert _HostileLMS.calls == 0
 
 
