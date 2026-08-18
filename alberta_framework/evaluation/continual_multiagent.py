@@ -575,6 +575,10 @@ class AggregateEvidence:
         """Reject leftover seed/bool/measurement identities before acceptance."""
         if type(self.seeds) is not tuple or not self.seeds:
             raise ValueError("seeds must be a non-empty exact tuple")
+        _require_resource_limit(
+            "aggregate seed identities",
+            len(self.seeds) * np.dtype(np.int64).itemsize,
+        )
         seeds = tuple(_require_seed(seed) for seed in self.seeds)
         if len(set(seeds)) != len(seeds):
             raise ValueError("seeds must be unique")
@@ -590,17 +594,52 @@ class AggregateEvidence:
             "max_forgetting",
             "mean_interference_forgetting",
             "recurrence_recovery_fraction",
-            "mean_recurrence_recovery_steps",
             "mean_stability_gap",
             "maximum_update_latency_ms",
         ):
-            # real_number rejects leftover bools and still records non-finite
-            # recovery means the factory emits when no seed recovered.
-            object.__setattr__(self, name, real_number(name, getattr(self, name)))
+            object.__setattr__(self, name, finite_real(name, getattr(self, name)))
+        mean_recovery = real_number(
+            "mean_recurrence_recovery_steps",
+            self.mean_recurrence_recovery_steps,
+        )
+        if mean_recovery < 0.0 or mean_recovery == float("-inf"):
+            raise ValueError("mean_recurrence_recovery_steps must be nonnegative")
+        object.__setattr__(self, "mean_recurrence_recovery_steps", mean_recovery)
+        for name in (
+            "mean_forgetting",
+            "max_forgetting",
+            "mean_interference_forgetting",
+            "mean_stability_gap",
+            "maximum_update_latency_ms",
+        ):
+            if getattr(self, name) < 0.0:
+                raise ValueError(f"{name} must be nonnegative")
+        if not 0.0 <= self.recurrence_recovery_fraction <= 1.0:
+            raise ValueError("recurrence_recovery_fraction must lie in [0, 1]")
         if type(self.reward_uplift_interval) is not BootstrapInterval:
             raise ValueError("reward_uplift_interval must be a BootstrapInterval")
         if type(self.partner_uplift_interval) is not BootstrapInterval:
             raise ValueError("partner_uplift_interval must be a BootstrapInterval")
+        reward_interval = BootstrapInterval(
+            **{
+                field.name: getattr(self.reward_uplift_interval, field.name)
+                for field in fields(BootstrapInterval)
+            }
+        )
+        partner_interval = BootstrapInterval(
+            **{
+                field.name: getattr(self.partner_uplift_interval, field.name)
+                for field in fields(BootstrapInterval)
+            }
+        )
+        if reward_interval.sample_size != len(seeds) or partner_interval.sample_size != len(seeds):
+            raise ValueError("bootstrap interval sample_size must match seeds")
+        if reward_interval.estimate != self.reward_uplift_over_frozen:
+            raise ValueError("reward interval estimate must match reward_uplift_over_frozen")
+        if partner_interval.estimate != self.partner_uplift:
+            raise ValueError("partner interval estimate must match partner_uplift")
+        object.__setattr__(self, "reward_uplift_interval", reward_interval)
+        object.__setattr__(self, "partner_uplift_interval", partner_interval)
         phase_rewards = _require_ndarray(
             "joint_adaptive_phase_rewards",
             self.joint_adaptive_phase_rewards,
@@ -613,6 +652,16 @@ class AggregateEvidence:
             dtype=np.dtype(np.float64),
             ndim=2,
         )
+        if phase_rewards.shape != (3,):
+            raise ValueError("joint_adaptive_phase_rewards must have shape (3,)")
+        if performance.shape != (3, 2):
+            raise ValueError("joint_adaptive_performance_matrix must have shape (3, 2)")
+        if not np.all(np.isfinite(phase_rewards)) or not np.all(np.isfinite(performance)):
+            raise ValueError("aggregate arrays must contain only finite values")
+        if self.recurrent_a_probe_reward != float(performance[-1, MEET_CONTEXT]):
+            raise ValueError(
+                "recurrent_a_probe_reward must match joint_adaptive_performance_matrix"
+            )
         object.__setattr__(self, "joint_adaptive_phase_rewards", _freeze_ndarray(phase_rewards))
         object.__setattr__(
             self, "joint_adaptive_performance_matrix", _freeze_ndarray(performance)
@@ -626,12 +675,14 @@ class AggregateEvidence:
         object.__setattr__(
             self,
             "action_scalars_per_step",
-            _require_int32("action_scalars_per_step", self.action_scalars_per_step, minimum=0),
+            _require_int32("action_scalars_per_step", self.action_scalars_per_step, minimum=1),
         )
         if type(self.budgets_identical) is not bool:
             raise ValueError("budgets_identical must be an exact bool")
         if type(self.all_values_finite) is not bool:
             raise ValueError("all_values_finite must be an exact bool")
+        if not self.all_values_finite:
+            raise ValueError("all_values_finite must match validated finite aggregate payloads")
 
 
 @dataclass(frozen=True)
