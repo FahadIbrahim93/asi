@@ -10,12 +10,40 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 _FULL_COMMIT_LENGTH = 40
+_MAX_LANE_ID_BYTES = 128
+_MAX_REFERENCE_BYTES = 256
+_MAX_REPOSITORY_BYTES = 512
+_MAX_GATE_BYTES = 192
+_MAX_PAPER_REVISIONS = 16
+_MAX_CODE_REVISIONS = 16
+_MAX_GATES = 32
+_MAX_PLAN_UTF8_BYTES = 8192
 
 
-def _exact_string(value: object, *, name: str) -> str:
+def _bounded_exact_string(value: object, *, name: str, maximum_bytes: int) -> str:
     if type(value) is not str or not value:
         raise ValueError(f"{name} must be a non-empty exact string")
+    try:
+        encoded = value.encode("utf-8", errors="strict")
+    except UnicodeEncodeError as exc:
+        raise ValueError(f"{name} must contain valid Unicode") from exc
+    if len(encoded) > maximum_bytes:
+        raise ValueError(f"{name} exceeds its UTF-8 byte limit")
     return value
+
+
+def _validate_code_revision(revision: ExternalCodeRevision) -> int:
+    repository = _bounded_exact_string(
+        revision.repository, name="repository", maximum_bytes=_MAX_REPOSITORY_BYTES
+    )
+    commit = _bounded_exact_string(
+        revision.commit, name="commit", maximum_bytes=_FULL_COMMIT_LENGTH
+    )
+    if not repository.startswith("https://github.com/") or not repository.endswith(".git"):
+        raise ValueError("repository must be a credential-free GitHub HTTPS clone URL")
+    if len(commit) != _FULL_COMMIT_LENGTH or any(c not in "0123456789abcdef" for c in commit):
+        raise ValueError("commit must be a full lowercase Git commit ID")
+    return len(repository.encode("utf-8")) + len(commit)
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,12 +52,7 @@ class ExternalCodeRevision:
     commit: str
 
     def __post_init__(self) -> None:
-        repository = _exact_string(self.repository, name="repository")
-        commit = _exact_string(self.commit, name="commit")
-        if not repository.startswith("https://github.com/") or not repository.endswith(".git"):
-            raise ValueError("repository must be a credential-free GitHub HTTPS clone URL")
-        if len(commit) != _FULL_COMMIT_LENGTH or any(c not in "0123456789abcdef" for c in commit):
-            raise ValueError("commit must be a full lowercase Git commit ID")
+        _validate_code_revision(self)
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,26 +67,52 @@ class ExternalQualificationPlan:
     def __post_init__(self) -> None:
         if type(self.issue) is not int or self.issue <= 0:
             raise ValueError("issue must be a positive exact integer")
-        _exact_string(self.lane_id, name="lane_id")
+        lane_id = _bounded_exact_string(
+            self.lane_id, name="lane_id", maximum_bytes=_MAX_LANE_ID_BYTES
+        )
         if type(self.paper_revisions) is not tuple or not self.paper_revisions:
             raise ValueError("paper_revisions must be a non-empty exact tuple")
+        if len(self.paper_revisions) > _MAX_PAPER_REVISIONS:
+            raise ValueError("paper_revisions contains too many entries")
         if type(self.code_revisions) is not tuple:
             raise ValueError("code_revisions must be an exact tuple")
+        if len(self.code_revisions) > _MAX_CODE_REVISIONS:
+            raise ValueError("code_revisions contains too many entries")
         if type(self.required_gates) is not tuple or not self.required_gates:
             raise ValueError("required_gates must be a non-empty exact tuple")
+        if len(self.required_gates) > _MAX_GATES:
+            raise ValueError("required_gates contains too many entries")
         if type(self.completed_gates) is not tuple:
             raise ValueError("completed_gates must be an exact tuple")
-        for name, values in (
-            ("paper_revisions", self.paper_revisions),
-            ("required_gates", self.required_gates),
-            ("completed_gates", self.completed_gates),
+        if len(self.completed_gates) > _MAX_GATES:
+            raise ValueError("completed_gates contains too many entries")
+
+        total_bytes = len(lane_id.encode("utf-8"))
+        validated_groups: list[tuple[str, tuple[str, ...]]] = []
+        for name, values, maximum_bytes in (
+            ("paper_revisions", self.paper_revisions, _MAX_REFERENCE_BYTES),
+            ("required_gates", self.required_gates, _MAX_GATE_BYTES),
+            ("completed_gates", self.completed_gates, _MAX_GATE_BYTES),
         ):
-            if any(type(value) is not str or not value for value in values):
-                raise ValueError(f"{name} entries must be non-empty exact strings")
+            validated = tuple(
+                _bounded_exact_string(
+                    value,
+                    name=f"{name} entries",
+                    maximum_bytes=maximum_bytes,
+                )
+                for value in values
+            )
+            total_bytes += sum(len(value.encode("utf-8")) for value in validated)
+            validated_groups.append((name, validated))
+        for revision in self.code_revisions:
+            if type(revision) is not ExternalCodeRevision:
+                raise ValueError("code_revisions entries must be exact ExternalCodeRevision values")
+            total_bytes += _validate_code_revision(revision)
+        if total_bytes > _MAX_PLAN_UTF8_BYTES:
+            raise ValueError("qualification plan exceeds its aggregate UTF-8 byte limit")
+        for name, values in validated_groups:
             if len(values) != len(set(values)):
                 raise ValueError(f"{name} must not contain duplicates")
-        if any(type(revision) is not ExternalCodeRevision for revision in self.code_revisions):
-            raise ValueError("code_revisions entries must be exact ExternalCodeRevision values")
         if not set(self.completed_gates).issubset(self.required_gates):
             raise ValueError("completed_gates must be a subset of required_gates")
 
@@ -202,7 +251,7 @@ EXTERNAL_QUALIFICATION_PLANS: tuple[ExternalQualificationPlan, ...] = (
                 "a6b79580d85f3025bdb601566d3627c5f489f13b",
             ),
         ),
-        COMMON_GATES + ("costly_imagenet_and_rl_lanes_budget_approved",),
+        COMMON_GATES + ("costly_imagenet_and_rl_lanes_separately_registered",),
     ),
 )
 
