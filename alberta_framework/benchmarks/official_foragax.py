@@ -266,7 +266,7 @@ class OfficialForagaxRunRequest:
                 )
         if not self.config_path.parts:
             raise OfficialForagaxValidationError("config_path must not be empty")
-        if not isinstance(self.gpu, bool):
+        if type(self.gpu) is not bool:
             raise OfficialForagaxValidationError("gpu must be a boolean")
         if type(self.expected_repository) is not str:
             raise OfficialForagaxValidationError(
@@ -287,8 +287,7 @@ class OfficialForagaxRunRequest:
                 "config_commit must be a full lowercase 40-character Git SHA"
             )
         if (
-            isinstance(self.index, bool)
-            or not isinstance(self.index, int)
+            type(self.index) is not int
             or self.index < 0
             or self.index > OFFICIAL_FORAGAX_MAX_SEED
         ):
@@ -296,8 +295,7 @@ class OfficialForagaxRunRequest:
                 f"index must be an integer in [0, {OFFICIAL_FORAGAX_MAX_SEED}]"
             )
         if self.expected_seed is not None and (
-            isinstance(self.expected_seed, bool)
-            or not isinstance(self.expected_seed, int)
+            type(self.expected_seed) is not int
             or self.expected_seed < 0
             or self.expected_seed > OFFICIAL_FORAGAX_MAX_SEED
         ):
@@ -306,8 +304,7 @@ class OfficialForagaxRunRequest:
                 f"[0, {OFFICIAL_FORAGAX_MAX_SEED}]"
             )
         if self.max_env_steps is not None and (
-            isinstance(self.max_env_steps, bool)
-            or not isinstance(self.max_env_steps, int)
+            type(self.max_env_steps) is not int
             or self.max_env_steps < 1
         ):
             raise OfficialForagaxValidationError("max_env_steps must be positive")
@@ -350,8 +347,7 @@ class OfficialForagaxBatchRunRequest:
                 "a batch request must contain at least two indices"
             )
         if any(
-            isinstance(index, bool)
-            or not isinstance(index, int)
+            type(index) is not int
             or index < 0
             or index > OFFICIAL_FORAGAX_MAX_SEED
             for index in indices
@@ -376,8 +372,7 @@ class OfficialForagaxBatchRunRequest:
                     "expected_seeds must have one entry per requested index"
                 )
             if any(
-                isinstance(seed, bool)
-                or not isinstance(seed, int)
+                type(seed) is not int
                 or seed < 0
                 or seed > OFFICIAL_FORAGAX_MAX_SEED
                 for seed in expected_seeds
@@ -4859,8 +4854,7 @@ def _semantic_environment(probe: Mapping[str, Any]) -> dict[str, Any]:
     reward_delay = raw.get("reward_delay", 0)
     random_shift_max_steps = raw.get("random_shift_max_steps", 0)
     if (
-        isinstance(aperture_size, bool)
-        or not isinstance(aperture_size, int)
+        type(aperture_size) is not int
         or (aperture_size != -1 and (aperture_size < 1 or aperture_size % 2 == 0))
     ):
         raise OfficialForagaxValidationError(
@@ -5442,8 +5436,7 @@ def prepare_official_foragax_run(
             "official config problem must be exactly 'Foragax'"
         )
     if (
-        isinstance(configured_env_steps, bool)
-        or not isinstance(configured_env_steps, int)
+        type(configured_env_steps) is not int
         or configured_env_steps < 1
     ):
         raise OfficialForagaxValidationError(
@@ -5601,8 +5594,7 @@ def prepare_official_foragax_run(
         family: Literal["continuing", "ppo"] = "ppo"
         entrypoint = "src/rtu_ppo.py"
         if (
-            isinstance(rollout_steps, bool)
-            or not isinstance(rollout_steps, int)
+            type(rollout_steps) is not int
             or rollout_steps < 1
         ):
             raise OfficialForagaxValidationError(
@@ -5612,8 +5604,7 @@ def prepare_official_foragax_run(
         if configured_updates is None:
             configured_updates = configured_env_steps // rollout_steps + 1
         if (
-            isinstance(configured_updates, bool)
-            or not isinstance(configured_updates, int)
+            type(configured_updates) is not int
             or configured_updates < 1
         ):
             raise OfficialForagaxValidationError(
@@ -10055,8 +10046,7 @@ def verify_official_foragax_manifest(
     )
     expected_steps = run.get("expected_result_env_steps")
     if (
-        isinstance(expected_steps, bool)
-        or not isinstance(expected_steps, int)
+        type(expected_steps) is not int
         or expected_steps < 1
     ):
         raise OfficialForagaxValidationError(
@@ -10409,8 +10399,7 @@ def verify_official_foragax_batch_manifest(
         )
         expected_steps = run_entry.get("expected_result_env_steps")
         if (
-            isinstance(expected_steps, bool)
-            or not isinstance(expected_steps, int)
+            type(expected_steps) is not int
             or expected_steps < 1
         ):
             raise OfficialForagaxValidationError(

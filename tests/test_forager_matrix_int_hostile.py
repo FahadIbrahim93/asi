@@ -101,6 +101,26 @@ def test_finite_number_rejects_hostile_before_float() -> None:
     assert _finite_number(1.0, "p") == 1.0
 
 
+def test_tuning_rule_rejects_hostile_confidence_before_float() -> None:
+    from alberta_framework.benchmarks.forager_matrix import _parse_tuning_rule
+
+    hostile = _HostileFloat(0.95)
+    _HostileFloat.calls = 0
+    with pytest.raises(Exception, match="confidence must be finite"):
+        _parse_tuning_rule(
+            {
+                "metric": "mean_reward",
+                "direction": "maximize",
+                "statistic": "mean",
+                "confidence": hostile,
+                "bootstrap_resamples": 100,
+                "bootstrap_seed": 0,
+                "tie_break": "variant_id_lexicographic",
+            }
+        )
+    assert _HostileFloat.calls == 0
+
+
 def test_hostile_not_in_error_message() -> None:
     hostile = _HostileInt(1)
     _HostileInt.calls = 0

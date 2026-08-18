@@ -474,7 +474,7 @@ class ForagerMatrixManifest:
             raise ValueError("schema_version must be a non-empty string")
         for attr in ("steps", "jax_chunk_size", "seed_batch_size"):
             val = getattr(self, attr)
-            if type(val) is not int or isinstance(val, bool) or val <= 0:
+            if type(val) is not int or val <= 0:
                 raise ValueError(f"{attr} must be a positive integer")
         if type(self.selection_rule) is not ForagerTuningRule:
             raise TypeError("selection_rule must be a ForagerTuningRule")
@@ -1106,8 +1106,7 @@ def _parse_tuning_rule(value: Any) -> ForagerTuningRule:
     try:
         normalized_confidence = (
             float(confidence_value)
-            if not isinstance(confidence_value, bool)
-            and isinstance(confidence_value, (int, float))
+            if type(confidence_value) in (int, float)
             else math.nan
         )
     except (OverflowError, ValueError):
@@ -2800,8 +2799,7 @@ def _validate_source_snapshot_bytes(
         raise ForagerMatrixStateError(f"{description} metadata contract is invalid")
     archive_size = metadata["archive_size"]
     if (
-        isinstance(archive_size, bool)
-        or not isinstance(archive_size, int)
+        type(archive_size) is not int
         or not 0 < archive_size <= _MAX_SOURCE_ARCHIVE_BYTES
         or len(archive_bytes) != archive_size
     ):
@@ -4500,8 +4498,7 @@ def _validate_execution_manifest_structure(payload: Mapping[str, Any]) -> None:
         if type(identity[name]) is not str or _SHA256.fullmatch(identity[name]) is None:
             raise ForagerMatrixStateError(f"execution identity {name} is invalid")
     if (
-        isinstance(identity["source_archive_size"], bool)
-        or not isinstance(identity["source_archive_size"], int)
+        type(identity["source_archive_size"]) is not int
         or not 0 < identity["source_archive_size"] <= _MAX_SOURCE_ARCHIVE_BYTES
     ):
         raise ForagerMatrixStateError("execution identity source_archive_size is invalid")
@@ -4652,20 +4649,17 @@ def _validate_trace_descriptor(
     maximum_size = _maximum_canonical_trace_size(expected_steps)
     if (
         descriptor["schema_version"] != _RAW_TRACE_SCHEMA
-        or isinstance(seed, bool)
-        or not isinstance(seed, int)
+        or type(seed) is not int
         or seed != expected_seed
         or descriptor["format"] != _RAW_TRACE_FORMAT
-        or isinstance(steps, bool)
-        or not isinstance(steps, int)
+        or type(steps) is not int
         or steps != expected_steps
         or descriptor["biome_regret_present"] is not True
         or type(location) is not str
         or (expected_output_path is not None and location != expected_output_path)
         or type(descriptor["sha256"]) is not str
         or _SHA256.fullmatch(descriptor["sha256"]) is None
-        or isinstance(descriptor["size"], bool)
-        or not isinstance(descriptor["size"], int)
+        or type(descriptor["size"]) is not int
         or descriptor["size"] < 1
         or descriptor["size"] > maximum_size
     ):
@@ -5444,14 +5438,14 @@ def _run_from_payload(
         )
     seed = payload["seed"]
     steps = payload["steps"]
-    if isinstance(seed, bool) or not isinstance(seed, int) or seed != expected_seed:
+    if type(seed) is not int or seed != expected_seed:
         raise ForagerMatrixStateError(f"{path}.seed does not match its batch")
-    if isinstance(steps, bool) or not isinstance(steps, int) or steps != expected_steps:
+    if type(steps) is not int or steps != expected_steps:
         raise ForagerMatrixStateError(f"{path}.steps does not match the matrix horizon")
 
     curve_steps_raw = payload["curve_steps"]
     if not isinstance(curve_steps_raw, list) or any(
-        isinstance(item, bool) or not isinstance(item, int) or item < 1 or item > steps
+        type(item) is not int or item < 1 or item > steps
         for item in curve_steps_raw
     ):
         raise ForagerMatrixStateError(f"{path}.curve_steps is invalid")
@@ -5473,7 +5467,7 @@ def _run_from_payload(
             f"{path}.curve_steps must increase strictly from 1 through steps"
         )
     record_every = expected_metric_contract.get("record_every_steps")
-    if isinstance(record_every, bool) or not isinstance(record_every, int) or record_every < 1:
+    if type(record_every) is not int or record_every < 1:
         raise ForagerMatrixStateError(f"{path} metric contract has invalid record cadence")
     expected_curve_steps = sorted(
         {
@@ -5507,8 +5501,7 @@ def _run_from_payload(
         raise ForagerMatrixStateError(f"{path} Alberta configuration hash mismatch")
     metadata_seed = agent_metadata.get("seed")
     if (
-        isinstance(metadata_seed, bool)
-        or not isinstance(metadata_seed, int)
+        type(metadata_seed) is not int
         or metadata_seed != seed
     ):
         raise ForagerMatrixStateError(f"{path} agent and environment seeds differ")
@@ -5554,11 +5547,9 @@ def _run_from_payload(
     chunk_size = runner.get("chunk_size")
     runner_kind = runner.get("kind")
     if (
-        isinstance(batch_size, bool)
-        or not isinstance(batch_size, int)
+        type(batch_size) is not int
         or batch_size != len(expected_batch_seeds)
-        or isinstance(chunk_size, bool)
-        or not isinstance(chunk_size, int)
+        or type(chunk_size) is not int
         or chunk_size != expected_chunk_size
     ):
         raise ForagerMatrixStateError(f"{path} runner batch/chunk metadata is invalid")
