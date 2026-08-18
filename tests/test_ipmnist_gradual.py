@@ -11,9 +11,11 @@ from alberta_framework.benchmarks.ipmnist_gradual import (
     input_interpolation,
     input_interpolation_transaction,
     output_interpolation,
+    run_gradual_input_pair,
     task_sampling_mask,
     transition_alpha,
 )
+from alberta_framework.benchmarks.upgd_ipmnist import IPMNISTConfig
 
 
 def test_abrupt_mode_is_exact_new_task_reduction() -> None:
@@ -45,6 +47,52 @@ def test_output_interpolation_passes_through_uniform_distribution() -> None:
 def test_transition_alpha_is_deterministic_and_clamped() -> None:
     config = GradualTransitionConfig(mode="input_interpolation", transition_steps=4)
     assert [transition_alpha(step, config) for step in range(6)] == [0.0, 0.25, 0.5, 0.75, 1.0, 1.0]
+
+
+def test_transition_width_counts_intervals_including_both_endpoints() -> None:
+    config = GradualTransitionConfig(mode="input_interpolation", transition_steps=2)
+    assert [transition_alpha(step, config) for step in range(4)] == [0.0, 0.5, 1.0, 1.0]
+
+
+def test_transition_config_rejects_forged_and_hostile_values_without_index_hooks() -> None:
+    config = GradualTransitionConfig(mode="input_interpolation", transition_steps=2)
+    object.__setattr__(config, "transition_steps", 0)
+    with pytest.raises(ValueError, match="transition_steps"):
+        transition_alpha(0, config)
+
+    class HostileInt(np.int64):
+        calls = 0
+
+        def __index__(self) -> int:
+            self.calls += 1
+            raise AssertionError("must not execute")
+
+    hostile = HostileInt(2)
+    with pytest.raises(ValueError, match="integer"):
+        GradualTransitionConfig(
+            mode="input_interpolation", transition_steps=hostile  # type: ignore[arg-type]
+        )
+    assert hostile.calls == 0
+
+    class HostileMeta(type):
+        calls = 0
+
+        def __eq__(cls, other: object) -> bool:
+            cls.calls += 1
+            raise AssertionError("must not compare types")
+
+        def __hash__(cls) -> int:
+            cls.calls += 1
+            raise AssertionError("must not hash types")
+
+    class Hostile(metaclass=HostileMeta):
+        pass
+
+    with pytest.raises(ValueError, match="integer"):
+        GradualTransitionConfig(
+            mode="input_interpolation", transition_steps=Hostile()  # type: ignore[arg-type]
+        )
+    assert HostileMeta.calls == 0
 
 
 def test_task_sampling_mask_is_matched_deterministic_and_monotone() -> None:
@@ -102,3 +150,92 @@ def test_input_interpolation_rejects_array_protocol_objects_without_calling_them
     with pytest.raises(ValueError, match="exact NumPy or JAX"):
         input_interpolation(hostile, jnp.ones(1), 0.5)  # type: ignore[arg-type]
     assert hostile.calls == 0
+
+
+def test_gradual_input_pair_runs_one_matched_real_learner_schedule() -> None:
+    data_x = np.asarray(
+        [
+            [-1.0, -0.5, 0.5, 1.0],
+            [1.0, 0.5, -0.5, -1.0],
+            [-0.5, 1.0, -1.0, 0.5],
+            [0.5, -1.0, 1.0, -0.5],
+        ],
+        dtype=np.float32,
+    )
+    data_y = np.asarray([0, 1, 0, 1], dtype=np.int32)
+    config = IPMNISTConfig(
+        n_tasks=3,
+        task_length=4,
+        input_dim=4,
+        hidden1=3,
+        hidden2=2,
+        n_classes=2,
+    )
+
+    result = run_gradual_input_pair(
+        data_x,
+        data_y,
+        learner_name="adamw_control",
+        seed=17,
+        config=config,
+        transition_steps=2,
+    )
+
+    assert result.arm_names == ("abrupt", "input_interpolation")
+    assert result.seed == 17
+    assert result.observations == result.updates == 12
+    assert result.data_steps == 12
+    assert result.environment_steps == 0
+    assert result.model_queries == 24
+    assert result.schedule_sha256.startswith("sha256:")
+    assert result.example_order_sha256.startswith("sha256:")
+    assert result.correct_counts.shape == (2, 3)
+    assert np.all((result.correct_counts >= 0) & (result.correct_counts <= 4))
+    assert result.loss_sums.shape == (2, 3)
+    assert np.all(np.isfinite(result.loss_sums))
+    assert result.persistent_numeric_bytes.shape == (2,)
+    # 29 params * (parameter + Adam m + Adam v) float32 bytes, five
+    # optimizer scalars per each of six leaves, dataset, and full schedule.
+    assert np.all(result.persistent_numeric_bytes == 29 * 12 + 6 * 5 * 4 + 80 + 96)
+    assert result.timing_ns.shape == (2,)
+    assert np.all(result.timing_ns >= 0)
+
+
+def test_gradual_pair_rejects_transition_wider_than_each_task() -> None:
+    config = IPMNISTConfig(
+        n_tasks=2,
+        task_length=2,
+        input_dim=2,
+        hidden1=2,
+        hidden2=2,
+        n_classes=2,
+    )
+    with pytest.raises(ValueError, match="transition_steps must be smaller"):
+        run_gradual_input_pair(
+            np.zeros((2, 2), dtype=np.float32),
+            np.zeros(2, dtype=np.int32),
+            learner_name="adamw_control",
+            seed=1,
+            config=config,
+            transition_steps=2,
+        )
+
+
+def test_gradual_pair_preflights_parameter_allocation_before_initialization() -> None:
+    config = IPMNISTConfig(
+        n_tasks=2,
+        task_length=2,
+        input_dim=100_000,
+        hidden1=1000,
+        hidden2=2,
+        n_classes=2,
+    )
+    with pytest.raises(ValueError, match="aggregate persistent numeric allocation"):
+        run_gradual_input_pair(
+            np.zeros((2, 100_000), dtype=np.float32),
+            np.zeros(2, dtype=np.int32),
+            learner_name="adamw_control",
+            seed=1,
+            config=config,
+            transition_steps=1,
+        )
