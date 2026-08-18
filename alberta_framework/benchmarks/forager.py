@@ -1829,11 +1829,12 @@ class ForagerRunResult:
         )
         if (
             not curve_steps
-            or curve_steps[0] < 1
             or curve_steps[-1] > steps
             or any(left >= right for left, right in zip(curve_steps, curve_steps[1:]))
         ):
-            raise ValueError("curve_steps must be nonempty, increasing, and within steps")
+            raise ValueError(
+                "curve_steps must be nonempty, increasing, and within [0, steps]"
+            )
         object.__setattr__(self, "curve_steps", curve_steps)
         for name in ("curve_ewm_reward", "curve_window_reward"):
             values = getattr(self, name)
@@ -1844,7 +1845,7 @@ class ForagerRunResult:
                 name,
                 tuple(_require_result_scalar(value, name=name) for value in values),
             )
-            if len(values) != len(curve_steps):
+            if values and len(values) != len(curve_steps):
                 raise ValueError(f"{name} length must match curve_steps")
         for name in ("duration_s", "frames_per_second"):
             value = getattr(self, name)
