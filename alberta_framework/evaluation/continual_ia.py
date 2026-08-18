@@ -108,7 +108,8 @@ def _require_integer(
     maximum: int = _INT32_MAX,
 ) -> int:
     """Canonicalize only trusted Python/NumPy integer scalar families."""
-    if type(value) not in _ACTUAL_INT_TYPES:
+    actual_type = type(value)
+    if not any(actual_type is allowed_type for allowed_type in _ACTUAL_INT_TYPES):
         raise ValueError(f"{name} must be an integer in [{minimum}, {maximum}]")
     canonical = operator.index(cast(SupportsIndex, value))
     if not minimum <= canonical <= maximum:
@@ -1450,7 +1451,7 @@ def run_continual_ia_benchmark(
 
     benchmark_config = ContinualIAConfig() if config is None else config
     limits = IAAcceptanceThresholds() if thresholds is None else thresholds
-    if type(seeds) not in (tuple, list):
+    if type(seeds) is not tuple and type(seeds) is not list:
         raise ValueError("seeds must be an actual tuple or list")
     seed_count = len(seeds)
     if seed_count < 1:

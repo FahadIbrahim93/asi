@@ -602,7 +602,7 @@ def _validate_json_value(value: Any) -> None:
             raise ForagerRngParityError("JSON value exceeds the node limit")
         if depth > MAX_JSON_DEPTH:
             raise ForagerRngParityError("JSON value exceeds the nesting limit")
-        if isinstance(item, Mapping):
+        if type(item) is dict:
             for key in item:
                 if type(key) is not str:
                     raise ForagerRngParityError("JSON object keys must be strings")
@@ -613,7 +613,7 @@ def _validate_json_value(value: Any) -> None:
                         "JSON object keys must contain valid Unicode"
                     ) from exc
             pending.extend((child, depth + 1) for child in item.values())
-        elif isinstance(item, (list, tuple)):
+        elif type(item) is list or type(item) is tuple:
             pending.extend((child, depth + 1) for child in item)
         elif type(item) is str:
             try:
@@ -623,7 +623,7 @@ def _validate_json_value(value: Any) -> None:
         elif type(item) is float:
             if not math.isfinite(item):
                 raise ForagerRngParityError("non-finite JSON numbers are forbidden")
-        elif item is not None and type(item) not in (bool, int):
+        elif item is not None and type(item) is not bool and type(item) is not int:
             raise ForagerRngParityError(f"value contains non-JSON type {type(item).__name__}")
 
 
@@ -784,7 +784,7 @@ def _path_component(value: Any) -> list[Any]:
     name = type(value).__name__
     if name == "DictKey":
         key = value.key
-        if type(key) not in (str, int):
+        if type(key) is not str and type(key) is not int:
             raise ForagerRngParityError("pytree dictionary keys must be strings or integers")
         return ["dict", key]
     if name == "SequenceKey":

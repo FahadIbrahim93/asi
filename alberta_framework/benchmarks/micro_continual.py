@@ -204,7 +204,7 @@ def _require_nonempty_string(value: object, *, context: str) -> str:
 
 def _require_builtin_finite_real(value: object, *, context: str) -> float:
     """Canonicalize a result scalar without invoking numeric subclass hooks."""
-    if type(value) not in (int, float):
+    if type(value) is not int and type(value) is not float:
         raise ValueError(f"{context} must be a finite built-in real number")
     number = float(cast("int | float", value))
     if not math.isfinite(number):
@@ -234,7 +234,8 @@ _ACTUAL_INT_TYPES: tuple[type, ...] = (
 
 def _require_positive_int32(value: object, *, name: str, minimum: int = 1) -> int:
     """Canonicalize one trusted positive integer in JAX's shape/index domain."""
-    if type(value) not in _ACTUAL_INT_TYPES:
+    actual_type = type(value)
+    if not any(actual_type is allowed_type for allowed_type in _ACTUAL_INT_TYPES):
         raise ValueError(f"{name} must be an integer in [{minimum}, {_INT32_MAX}]")
     number = operator.index(cast(SupportsIndex, value))
     if not minimum <= number <= _INT32_MAX:

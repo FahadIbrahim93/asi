@@ -301,7 +301,7 @@ def canonical_json_bytes(value: Mapping[str, Any]) -> bytes:
 
 
 def _freeze_json(value: Any) -> Any:
-    if type(value) in (dict, MappingProxyType):
+    if type(value) is dict or type(value) is MappingProxyType:
         result: dict[str, Any] = {}
         for key, item in value.items():
             if type(key) is not str:
@@ -316,7 +316,7 @@ def _freeze_json(value: Any) -> Any:
 
 
 def _plain(value: Any) -> Any:
-    if type(value) in (dict, MappingProxyType):
+    if type(value) is dict or type(value) is MappingProxyType:
         result: dict[str, Any] = {}
         for key, item in value.items():
             if type(key) is not str:
@@ -333,7 +333,7 @@ def _plain(value: Any) -> Any:
                 "canonical content contains a non-finite JSON number"
             )
         return value
-    if value is None or type(value) in (str, bool, int):
+    if value is None or type(value) is str or type(value) is bool or type(value) is int:
         return value
     raise ForagerMatchedCampaignError(
         f"canonical content contains unsupported {type(value).__name__}"

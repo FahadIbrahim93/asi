@@ -259,7 +259,7 @@ _LEARNER_DEFAULT_HYPERPARAMETERS: dict[str, dict[str, float]] = {
 def _validated_hyperparameter(name: object, value: object) -> float:
     """Validate one JSON override in its exact host and float32 execution domains."""
     host_name = _require_exact_str("name", name)
-    if type(value) not in (int, float):
+    if type(value) is not int and type(value) is not float:
         raise ValueError(f"hyperparameter '{host_name}' must be a finite JSON number")
     label = f"hyperparameter '{host_name}'"
     if host_name in {"step_size", "eps", "norm_epsilon"}:
@@ -368,7 +368,11 @@ class LabelEMNISTConfig:
         for name in ("n_tasks", "task_length", "input_dim", "hidden1", "hidden2", "n_classes"):
             host_name = _require_exact_str("name", name)
             value = getattr(self, host_name)
-            if type(value) not in _ACTUAL_INT_TYPES or value <= 0:
+            actual_type = type(value)
+            if (
+                not any(actual_type is allowed_type for allowed_type in _ACTUAL_INT_TYPES)
+                or value <= 0
+            ):
                 raise ValueError(f"{host_name} must be a positive integer")
 
     @property
@@ -450,7 +454,7 @@ def build_schedule(key: Array, config: LabelEMNISTConfig, n_train: int) -> Label
 
 
 def _require_finite_real(name: str, value: object) -> float:
-    if type(value) not in (int, float):
+    if type(value) is not int and type(value) is not float:
         raise ValueError(f"{name} must be a finite real number")
     number = float(cast("int | float", value))
     if not math.isfinite(number):
@@ -502,7 +506,7 @@ class LabelEMNISTRunResult:
         for name, value in self.hyperparameters.items():
             if type(name) is not str or not name:
                 raise TypeError("hyperparameters keys must be exact non-empty strings")
-            if type(value) not in (int, float) or not math.isfinite(value):
+            if (type(value) is not int and type(value) is not float) or not math.isfinite(value):
                 raise ValueError("hyperparameters values must be finite built-in numbers")
             normalized_hyperparameters[name] = float(value)
         object.__setattr__(self, "hyperparameters", normalized_hyperparameters)
