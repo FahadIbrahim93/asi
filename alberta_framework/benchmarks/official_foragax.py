@@ -4874,7 +4874,7 @@ def _semantic_environment(probe: Mapping[str, Any]) -> dict[str, Any]:
         ("reward_delay", reward_delay),
         ("random_shift_max_steps", random_shift_max_steps),
     ):
-        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        if type(value) is not int or value < 0:
             raise OfficialForagaxValidationError(
                 f"official environment {name} is invalid"
             )
@@ -10360,11 +10360,11 @@ def verify_official_foragax_batch_manifest(
         )
     if (
         any(
-            isinstance(index, bool) or not isinstance(index, int)
+            type(index) is not int
             for index in indices
         )
         or any(
-            isinstance(seed, bool) or not isinstance(seed, int)
+            type(seed) is not int
             for seed in effective_seeds
         )
         or indices != list(range(indices[0], indices[-1] + 1))
@@ -10380,9 +10380,8 @@ def verify_official_foragax_batch_manifest(
         zip(indices, effective_seeds, run_entries, artifacts, strict=True)
     ):
         if (
-            isinstance(index, bool)
-            or not isinstance(index, int)
-            or not isinstance(effective_seed, int)
+            type(index) is not int
+            or type(effective_seed) is not int
             or not isinstance(run_entry, dict)
             or not isinstance(artifact, dict)
             or run_entry.get("index") != index
