@@ -15,6 +15,7 @@ from alberta_framework.benchmarks.upgd_ipmnist import IPMNISTConfig
 from alberta_framework.evaluation.gradual_ipmnist_nonpromoting import (
     GradualInputDevelopmentPlan,
     build_gradual_input_development_report,
+    derive_gradual_input_resource_correction,
     retain_frozen_gradual_input_development_report,
     validate_gradual_input_development_report,
 )
@@ -153,42 +154,56 @@ def test_gradual_report_retention_is_exclusive_and_reload_validated(
         retain_frozen_gradual_input_development_report(report, x, y, repository_root=tmp_path)
 
 
-def test_retained_v2_exactly_derives_from_v1_independent_of_default_prng(
+def test_resource_correction_preserves_v1_and_rejects_invalid_v2(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    repository_root = Path(__file__).resolve().parents[1]
+    root = Path(__file__).resolve().parents[1]
     parent = json.loads(
-        (
-            repository_root
-            / "outputs/ipmnist_gradual/development.v1"
-            / "result.7b2bf6c0f73b9fae20fcde53445f5f81656976ea4d042641772501e0108c6561.json"
-        ).read_bytes()
+        (root / "outputs/ipmnist_gradual/development.v1/"
+         "result.7b2bf6c0f73b9fae20fcde53445f5f81656976ea4d042641772501e0108c6561.json")
+        .read_text(encoding="utf-8")
     )
-    retained = json.loads(
-        (
-            repository_root
-            / "outputs/ipmnist_gradual/development.v2"
-            / "result.9ff58ac51163004208b94e325f9539037cb8cfb3540024da95c847f50154b483.json"
-        ).read_bytes()
+    invalid_v2 = json.loads(
+        (root / "outputs/ipmnist_gradual/development.v2/"
+         "result.9ff58ac51163004208b94e325f9539037cb8cfb3540024da95c847f50154b483.json")
+        .read_text(encoding="utf-8")
+    )
+    retained_v3 = json.loads(
+        next((root / "outputs/ipmnist_gradual/development.v3").glob("*.json")).read_bytes()
     )
     monkeypatch.setattr(
-        gradual_report,
-        "_dataset_identity",
-        lambda _x, _y, _config: copy.deepcopy(parent["dataset"]),
+        gradual_report, "_dataset_identity", lambda *_: copy.deepcopy(parent["dataset"])
     )
     monkeypatch.setattr(
         gradual_report,
         "_runtime_identity",
-        lambda: copy.deepcopy(parent["identity"]["runtime"]),
+        lambda: copy.deepcopy(retained_v3["identity"]["derivation_runtime"]),
     )
     monkeypatch.setattr(
         gradual_report,
         "_source_identity",
-        lambda: copy.deepcopy(retained["identity"]["derivation_source_sha256"]),
+        lambda: copy.deepcopy(retained_v3["identity"]["derivation_source_sha256"]),
     )
 
+    validate_gradual_input_development_report(parent, object(), object())
+    with pytest.raises(ValueError, match="v2 resource correction"):
+        validate_gradual_input_development_report(invalid_v2, object(), object())
+
     with jax.default_prng_impl("rbg"):
-        derived = gradual_report.derive_gradual_input_resource_correction(
-            parent, object(), object()
-        )
-    assert derived == retained
+        corrected = derive_gradual_input_resource_correction(parent, object(), object())
+    assert corrected == retained_v3
+    identity = corrected["identity"]
+    assert identity["parent_artifact_sha256"] == gradual_report._PARENT_ARTIFACT_SHA256
+    assert identity["invalid_intermediate_artifact_sha256"] == (
+        gradual_report._INVALID_V2_ARTIFACT_SHA256
+    )
+    assert corrected["aggregate"]["outcome"] == parent["aggregate"]["outcome"]
+    parameter_bank_bytes = gradual_report.FROZEN_GRADUAL_INPUT_PLAN.config.parameter_count * 4
+    for old_record, new_record in zip(parent["records"], corrected["records"], strict=True):
+        assert new_record["comparison"] == old_record["comparison"]
+        for old_arm, new_arm in zip(old_record["arms"], new_record["arms"], strict=True):
+            assert new_arm["metrics"] == old_arm["metrics"]
+            assert new_arm["resources"]["timing_ns"] == old_arm["resources"]["timing_ns"]
+            assert new_arm["resources"]["persistent_numeric_bytes"] == (
+                old_arm["resources"]["persistent_numeric_bytes"] + parameter_bank_bytes
+            )
