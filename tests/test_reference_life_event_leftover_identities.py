@@ -13,10 +13,14 @@ from alberta_framework.reference_agent import (
     Transaction,
 )
 from alberta_framework.reference_life import (
+    HaltStage,
+    LifeHalt,
     PendingOutcome,
+    RecoveryMode,
     ReferenceEnvironmentExecution,
     ReferenceEnvironmentStart,
     ReferenceLifeEvent,
+    ReferenceLifeRunner,
 )
 
 _DIGEST = "0" * 64
@@ -29,6 +33,14 @@ class _ExplodingHashMeta(type):
 
 class _HostileScalar(metaclass=_ExplodingHashMeta):
     pass
+
+
+class _HostileString(str):
+    calls = 0
+
+    def strip(self, chars: str | None = None) -> str:
+        type(self).calls += 1
+        raise AssertionError("hostile string method executed")
 
 
 def _legal_event(**overrides: object) -> ReferenceLifeEvent:
@@ -140,3 +152,22 @@ def test_real_type_gates_do_not_hash_hostile_runtime_classes() -> None:
         _legal_event(regime_id=hostile)
     with pytest.raises(ValueError, match="oracle_reward"):
         _legal_event(oracle_reward=hostile)
+
+
+def test_life_veto_reasons_reject_hostile_string_identities_before_dispatch() -> None:
+    hostile = _HostileString("operator stop")
+
+    with pytest.raises(ValueError, match="halt reason"):
+        LifeHalt(
+            stage=HaltStage.PRE_DISPATCH,
+            recovery_mode=RecoveryMode.ABORT_ONLY,
+            reason=hostile,
+        )
+    with pytest.raises(ValueError, match="abort reason"):
+        ReferenceLifeRunner.abort(  # type: ignore[arg-type]
+            object.__new__(ReferenceLifeRunner),
+            object(),
+            reason=hostile,
+        )
+
+    assert _HostileString.calls == 0
