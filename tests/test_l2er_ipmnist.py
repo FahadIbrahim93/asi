@@ -76,6 +76,7 @@ def test_l2_and_mechanism_off_are_exact_reductions() -> None:
     state = L2ERState(  # type: ignore[call-arg]
         example_buffer=jnp.zeros((100, 2), dtype=jnp.float32),
         buffer_count=jnp.asarray(0, dtype=jnp.int32),
+        transaction_valid=jnp.asarray(True, dtype=jnp.bool_),
     )
     example = jnp.asarray([0.4, 0.7], dtype=jnp.float32)
     off, off_state = l2er_update(params, state, grads, example, _hp(wd=0.0, er_lr=0.0, enabled=0.0))
@@ -95,6 +96,7 @@ def test_er_update_matches_official_separate_post_batch_step() -> None:
     state = L2ERState(  # type: ignore[call-arg]
         example_buffer=buffer,
         buffer_count=jnp.asarray(99, dtype=jnp.int32),
+        transaction_valid=jnp.asarray(True, dtype=jnp.bool_),
     )
     example = jnp.asarray([0.3, 0.9], dtype=jnp.float32)
     hp = _hp(wd=1e-4, er_lr=1e-3, enabled=1.0)
@@ -122,6 +124,7 @@ def test_l2er_update_is_jittable() -> None:
     state = L2ERState(  # type: ignore[call-arg]
         example_buffer=jnp.ones((100, 2), dtype=jnp.float32),
         buffer_count=jnp.asarray(99, dtype=jnp.int32),
+        transaction_valid=jnp.asarray(True, dtype=jnp.bool_),
     )
     update = jax.jit(
         lambda p, s, g, x: l2er_update(
@@ -143,6 +146,7 @@ def test_update_rejects_hostile_structure_and_is_atomic_on_runtime_invalidity() 
     state = L2ERState(  # type: ignore[call-arg]
         example_buffer=jnp.zeros((100, 2), dtype=jnp.float32),
         buffer_count=jnp.asarray(0, dtype=jnp.int32),
+        transaction_valid=jnp.asarray(True, dtype=jnp.bool_),
     )
     with pytest.raises(ValueError, match="hyperparameters"):
         l2er_update(  # type: ignore[arg-type]
@@ -168,10 +172,11 @@ def test_update_rejects_hostile_structure_and_is_atomic_on_runtime_invalidity() 
     for name in params:
         np.testing.assert_array_equal(unchanged[name], params[name])
     assert int(repaired.buffer_count) == 0
+    assert not bool(repaired.transaction_valid)
 
     nonfinite = dict(grads)
     nonfinite["w1"] = jnp.full_like(grads["w1"], jnp.inf)
-    unchanged, _ = l2er_update(
+    unchanged, invalid_state = l2er_update(
         params,
         state,
         nonfinite,
@@ -180,6 +185,15 @@ def test_update_rejects_hostile_structure_and_is_atomic_on_runtime_invalidity() 
     )
     for name in params:
         np.testing.assert_array_equal(unchanged[name], params[name])
+    assert not bool(invalid_state.transaction_valid)
+    _, still_invalid = l2er_update(
+        unchanged,
+        invalid_state,
+        grads,
+        jnp.ones(2),
+        _hp(wd=0.0, er_lr=0.0, enabled=0.0),
+    )
+    assert not bool(still_invalid.transaction_valid)
 
 
 def test_buffer_and_svd_resources_are_preflighted() -> None:
@@ -271,7 +285,7 @@ def test_result_receipt_accounts_resources_and_is_permanently_nonpromoting() -> 
     assert resources["data_steps"] == 100
     assert resources["environment_steps"] == 0
     assert resources["model_queries"] == 201
-    assert resources["persistent_bytes"] == 876
+    assert resources["persistent_bytes"] == 877
 
     hostile = deepcopy(payload)
     hostile_resources = hostile["resources"]
