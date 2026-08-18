@@ -548,6 +548,10 @@ def test_feature_finite_one_steps_are_bitwise_unchanged() -> None:
         jnp.array([0.4, -0.2], dtype=jnp.float32),
     )
     assert bool(compositional_result.update_applied)
+    # These event counters intentionally use int32 so they remain exact past
+    # the float32 consecutive-integer limit.  The golden digest includes dtype.
+    assert compositional_result.state.candidate_selector_action_counts.dtype == jnp.int32
+    assert compositional_result.state.generator_resource_state.action_counts.dtype == jnp.int32
     assert _digest(
         compositional_result.state,
         compositional_result.predictions,
@@ -556,4 +560,4 @@ def test_feature_finite_one_steps_are_bitwise_unchanged() -> None:
         compositional_result.replaced_slot,
         compositional_result.promoted_candidate,
         compositional_result.curation_trace,
-    ) == "e4b049797a2047b91ec8cfe34b76ec3536e4ecb662bcdb92effa49cd52a0635c"
+    ) == "cf84267749a5df5f6a0b499d1916d560c97b02648f070fe2ac0cc3eb1c66dfd1"
