@@ -467,6 +467,25 @@ class ForagerMatrixManifest:
     tuning_selection: ForagerTuningSelection | None = None
     source_path: Path | None = field(default=None, compare=False, repr=False)
 
+    def __post_init__(self) -> None:
+        if type(self.schema_version) is not str or not self.schema_version:
+            raise ValueError("schema_version must be a non-empty string")
+        for attr in ("steps", "jax_chunk_size", "seed_batch_size"):
+            val = getattr(self, attr)
+            if type(val) is not int or isinstance(val, bool) or val <= 0:
+                raise ValueError(f"{attr} must be a positive integer")
+        if type(self.selection_rule) is not ForagerTuningRule:
+            raise TypeError("selection_rule must be a ForagerTuningRule")
+        if not isinstance(self.variants, Mapping):
+            raise TypeError("variants must be a Mapping")
+        if (
+            self.tuning_selection is not None
+            and type(self.tuning_selection) is not ForagerTuningSelection
+        ):
+            raise TypeError(
+                "tuning_selection must be a ForagerTuningSelection or None"
+            )
+
     def to_dict(self) -> dict[str, Any]:
         """Return the normalized scientific configuration.
 
