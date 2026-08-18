@@ -206,13 +206,30 @@ def test_artifact_builder_admits_exact_record_containers_before_hooks() -> None:
     plan = scorecard.build_development_plan()
     hostile_records = HostileRecords()
     with pytest.raises(ValueError, match="exact list or tuple"):
-        scorecard.build_scorecard_artifact(plan, hostile_records)
+        scorecard.build_scorecard_artifact(plan, hostile_records)  # type: ignore[arg-type]
+    assert hostile_records.calls == 0
+    with pytest.raises(ValueError, match="exact list or tuple"):
+        scorecard.summarize_run_records(plan, hostile_records)  # type: ignore[arg-type]
     assert hostile_records.calls == 0
 
     hostile_record = HostileRecord()
     with pytest.raises(ValueError, match="exact string-keyed object"):
         scorecard.build_scorecard_artifact(plan, [hostile_record])
     assert hostile_record.calls == 0
+
+
+def test_aggregate_deep_admission_rejects_metaclass_value_before_hooks() -> None:
+    from alberta_framework.benchmarks import reference_life_scorecard as scorecard
+
+    record = {
+        "schedule_index": 0,
+        "nested": {"value": _MetaclassHostileInt(1)},
+    }
+    records = [record] * len(scorecard.iter_run_specs(scorecard.build_development_plan()))
+    _HostileMeta.calls = 0
+    with pytest.raises(ValueError, match="canonical JSON"):
+        scorecard.build_scorecard_artifact(scorecard.build_development_plan(), records)
+    assert _HostileMeta.calls == 0
 
 
 def test_reward_sum_rejects_hostile_before_float() -> None:

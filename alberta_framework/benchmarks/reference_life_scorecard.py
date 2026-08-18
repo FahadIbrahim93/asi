@@ -159,7 +159,8 @@ def _fail(message: str) -> NoReturn:
 def _validate_json_value(value: Any, *, path: str = "$", depth: int = 0) -> None:
     if depth > 64:
         _fail(f"{path}: JSON nesting exceeds 64 levels")
-    if value is None or type(value) in (str, bool, int):
+    value_type = type(value)
+    if value is None or value_type is str or value_type is bool or value_type is int:
         return
     if type(value) is float:
         if not math.isfinite(value):
@@ -993,13 +994,33 @@ def _record_identity(record: Mapping[str, Any]) -> tuple[str, str, int]:
     environment = record.get("environment_kind")
     arm = record.get("arm")
     seed = record.get("seed")
-    if environment not in ENVIRONMENT_ROSTER:
+    if type(environment) is not str or environment not in ENVIRONMENT_ROSTER:
         raise ValueError("run record has an unsupported environment")
-    if arm not in ARM_ROSTER:
+    if type(arm) is not str or arm not in ARM_ROSTER:
         raise ValueError("run record has an unsupported arm")
     if type(seed) is not int or seed not in SEED_ROSTER:
         raise ValueError("run record has a seed outside the fixed roster")
-    return cast(str, environment), cast(str, arm), seed
+    return environment, arm, seed
+
+
+def _admit_aggregate_records(
+    records: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Admit an exact canonical-JSON record sequence before any foreign hooks."""
+
+    if type(records) is not list and type(records) is not tuple:
+        raise ValueError("run records must be an exact list or tuple")
+    canonical_records: list[dict[str, Any]] = []
+    for raw_record in records:
+        if type(raw_record) is not dict:
+            raise ValueError("every run record must be an exact string-keyed object")
+        if any(type(key) is not str for key in raw_record):
+            raise ValueError("every run record must be an exact string-keyed object")
+        if type(raw_record.get("schedule_index")) is not int:
+            raise ValueError("every run record must have an integer schedule_index")
+        _validate_json_value(raw_record, path="$.runs[]")
+        canonical_records.append(cast(dict[str, Any], raw_record))
+    return canonical_records
 
 
 def _reward_sum(record: Mapping[str, Any]) -> float:
@@ -1324,13 +1345,12 @@ def summarize_run_records(
 
     if not isinstance(plan, ReferenceLifeDevelopmentPlan):
         raise TypeError("plan must be a ReferenceLifeDevelopmentPlan")
+    canonical_records = _admit_aggregate_records(records)
     specs = iter_run_specs(plan)
-    if len(records) != len(specs):
+    if len(canonical_records) != len(specs):
         raise ValueError("run records must contain exactly the fixed 144-shard matrix")
     by_identity: dict[tuple[str, str, int], Mapping[str, Any]] = {}
-    for record in records:
-        if not isinstance(record, Mapping):
-            raise ValueError("every run record must be an object")
+    for record in canonical_records:
         identity = _record_identity(record)
         if identity in by_identity:
             raise ValueError(f"duplicate run identity {identity!r}")
@@ -1644,19 +1664,7 @@ def build_scorecard_artifact(
 ) -> dict[str, Any]:
     """Assemble one immutable aggregate and bind its deterministic summary."""
 
-    if type(records) is not list and type(records) is not tuple:
-        raise ValueError("run records must be an exact list or tuple")
-    canonical_records: list[dict[str, Any]] = []
-    for raw_record in records:
-        if type(raw_record) is not dict:
-            raise ValueError("every run record must be an exact string-keyed object")
-        record = cast(dict[object, Any], raw_record)
-        if any(type(key) is not str for key in record):
-            raise ValueError("every run record must be an exact string-keyed object")
-        canonical = cast(dict[str, Any], record)
-        if type(canonical.get("schedule_index")) is not int:
-            raise ValueError("every run record must have an integer schedule_index")
-        canonical_records.append(canonical)
+    canonical_records = _admit_aggregate_records(records)
     ordered_records = sorted(
         canonical_records, key=lambda record: cast(int, record["schedule_index"])
     )
