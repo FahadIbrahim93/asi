@@ -169,6 +169,20 @@ from alberta_framework.benchmarks.cchain_ipmnist import (
     cchain_hyperparameters,
     make_cchain_learner,
 )
+from alberta_framework.benchmarks.replay_frozen_ipmnist import (
+    PROL_COMMIT,
+    PROL_PAPER_REVISION,
+    RANDUMB_COMMIT,
+    RANDUMB_PAPER_REVISION,
+    RANPAC_COMMIT,
+    RANPAC_PAPER_REVISION,
+    REPLAY_OFFICIAL_CODE,
+    REPLAY_PAPER_REVISION,
+    frozen_hyperparameters,
+    make_frozen_feature_learner,
+    make_replay_context_learner,
+    replay_hyperparameters,
+)
 from alberta_framework.benchmarks.upgd_ipmnist import (
     _PLASTICITY_LOSS_FLOOR,
     ADAMW_PROTOCOL_HYPERPARAMETERS,
@@ -258,6 +272,19 @@ from alberta_framework.evaluation.recurring_ipmnist_retention import (
     SentinelProbeBinding,
     SentinelProbeSnapshot,
     build_recurring_ipmnist_retention_report,
+)
+from alberta_framework.evaluation.replay_frozen_ipmnist_nonpromoting import (
+    COMPARISON_ID as REPLAY_FROZEN_COMPARISON_ID,
+)
+from alberta_framework.evaluation.replay_frozen_ipmnist_nonpromoting import (
+    PROTOCOL_GAPS as REPLAY_FROZEN_PROTOCOL_GAPS,
+)
+from alberta_framework.evaluation.replay_frozen_ipmnist_nonpromoting import (
+    RESULT_SCHEMA as REPLAY_FROZEN_RESULT_SCHEMA,
+)
+from alberta_framework.evaluation.replay_frozen_ipmnist_nonpromoting import (
+    expected_resources_for_result,
+    validate_replay_frozen_result,
 )
 
 logger = logging.getLogger(__name__)
@@ -8103,6 +8130,90 @@ def _build_registry() -> dict[str, ScreeningSpec]:
                 ),
             )
         )
+    for name, replay_update, context, description in (
+        (
+            "replay_context_mechanism_off",
+            0.0,
+            0.0,
+            "Charged Adam mechanism-off control for replay and label attention.",
+        ),
+        (
+            "replay_gradient_only",
+            1.0,
+            0.0,
+            "Prior-example replay-gradient ablation without contextual prediction.",
+        ),
+        (
+            "replay_context_only",
+            0.0,
+            1.0,
+            "Bounded label-attention prediction without replay-gradient influence.",
+        ),
+        (
+            "replay_context_full",
+            1.0,
+            1.0,
+            "Replay gradient plus bounded label-attention in-context proxy.",
+        ),
+    ):
+        specs.append(
+            ScreeningSpec(
+                name=name,
+                base_learner="adamw",
+                mechanism="replay_in_context",
+                hyperparameters=replay_hyperparameters(
+                    replay_update=replay_update, context=context
+                ),
+                factory=make_replay_context_learner,
+                description=(
+                    description
+                    + " Permanently nonpromoting; not a Transformer-paper reproduction."
+                ),
+            )
+        )
+    for name, method, mechanism, description in (
+        (
+            "randumb_random_features",
+            0.0,
+            1.0,
+            "RanDumb-inspired random Fourier extractor and online linear head.",
+        ),
+        (
+            "ranpac_random_projection",
+            1.0,
+            1.0,
+            "RanPAC-inspired random ReLU projection and recursive ridge readout.",
+        ),
+        (
+            "prol_prompt_mechanism_off",
+            2.0,
+            0.0,
+            "Charged frozen-extractor/head control with PROL proxy prompts disabled.",
+        ),
+        (
+            "prol_prompt_proxy",
+            2.0,
+            1.0,
+            "PROL architecture proxy with prompt/affine and hard-soft updates.",
+        ),
+    ):
+        specs.append(
+            ScreeningSpec(
+                name=name,
+                base_learner="upgd_w",
+                mechanism="frozen_feature_ceiling",
+                hyperparameters=frozen_hyperparameters(
+                    method=method, mechanism=mechanism
+                ),
+                factory=make_frozen_feature_learner,
+                frozen_probe_input=_rff_frozen_probe_input,
+                description=(
+                    description
+                    + " Zero imported pretraining is explicit; this is not a "
+                    "paper-level reproduction."
+                ),
+            )
+        )
     return {spec.name: spec for spec in specs}
 
 
@@ -9975,6 +10086,82 @@ def cchain_development_result_payload(
     return validate_cchain_development_result(payload)
 
 
+def replay_frozen_development_result_payload(
+    result: ScreeningRunResult, *, outcome: str
+) -> dict[str, object]:
+    """Build one strict replay/frozen-feature development receipt."""
+    spec = screening_spec(result.config_name)
+    if spec.mechanism not in {"replay_in_context", "frozen_feature_ceiling"}:
+        raise ValueError("result is not a registered replay/frozen-feature arm")
+    if result.noise_mode != "step" or result.hyperparameters != spec.hyperparameters:
+        raise ValueError("replay/frozen receipt requires exact-step registered settings")
+    family = (
+        "replay"
+        if spec.mechanism == "replay_in_context"
+        else {
+            "randumb_random_features": "randumb",
+            "ranpac_random_projection": "ranpac",
+            "prol_prompt_mechanism_off": "prol",
+            "prol_prompt_proxy": "prol",
+        }[result.config_name]
+    )
+    config = result.config
+    observations = config.n_tasks * config.task_length
+    resources = expected_resources_for_result(
+        family,
+        observations,
+        config.input_dim,
+        config.hidden1,
+        config.hidden2,
+        config.n_classes,
+    )
+    payload: dict[str, object] = {
+        "schema": REPLAY_FROZEN_RESULT_SCHEMA,
+        "comparison_id": REPLAY_FROZEN_COMPARISON_ID,
+        "paper_revisions": [
+            REPLAY_PAPER_REVISION,
+            RANDUMB_PAPER_REVISION,
+            RANPAC_PAPER_REVISION,
+            PROL_PAPER_REVISION,
+        ],
+        "official_commits": [
+            REPLAY_OFFICIAL_CODE,
+            RANDUMB_COMMIT,
+            RANPAC_COMMIT,
+            PROL_COMMIT,
+        ],
+        "protocol_gaps": list(REPLAY_FROZEN_PROTOCOL_GAPS),
+        "arm": result.config_name,
+        "family": family,
+        "seed": result.seed,
+        "n_tasks": config.n_tasks,
+        "task_length": config.task_length,
+        "input_dim": config.input_dim,
+        "hidden1": config.hidden1,
+        "hidden2": config.hidden2,
+        "n_classes": config.n_classes,
+        "observations": observations,
+        "allowed_boundary_information": [],
+        "allowed_task_information": ["current_example_label"],
+        "hyperparameters": dict(spec.hyperparameters),
+        "metrics": {
+            "mean_online_accuracy": float(np.mean(result.per_task_accuracy)),
+            "mean_loss": float(np.mean(result.per_task_loss)),
+            "mean_plasticity": float(np.mean(result.per_task_plasticity)),
+        },
+        "resources": {
+            **resources,
+            "timing_seconds": float(result.wall_clock_seconds),
+            "timing_is_telemetry_only": True,
+        },
+        "outcome": outcome,
+        "negative_outcome_retained": True,
+        "development_only": True,
+        "scientific_promotion_allowed": False,
+    }
+    return validate_replay_frozen_result(payload)
+
+
 def run_screening_config(
     data_x: np.ndarray | Array,
     data_y: np.ndarray | Array,
@@ -10198,7 +10385,7 @@ _V2_SHARD_FIELDS = frozenset(
         "environment",
     }
 )
-_V2_CCHAIN_SHARD_FIELDS = _V2_SHARD_FIELDS | frozenset({"mechanism_receipt"})
+_V2_MECHANISM_SHARD_FIELDS = _V2_SHARD_FIELDS | frozenset({"mechanism_receipt"})
 
 
 def _require_exact_keys(
@@ -10597,7 +10784,11 @@ def shard_payload(
         "dataset_provenance": dataset_binding,
         "environment": runtime_binding,
     }
-    if spec.mechanism == "c_chain":
+    if spec.mechanism in {
+        "c_chain",
+        "replay_in_context",
+        "frozen_feature_ceiling",
+    }:
         persisted_result = replace(
             result,
             per_task_accuracy=np.asarray(payload["per_task_accuracy"], dtype=np.float64),
@@ -10607,8 +10798,14 @@ def shard_payload(
             ),
             wall_clock_seconds=cast(float, payload["wall_clock_seconds"]),
         )
-        payload["mechanism_receipt"] = cchain_development_result_payload(
-            persisted_result, outcome="inconclusive"
+        payload["mechanism_receipt"] = (
+            cchain_development_result_payload(
+                persisted_result, outcome="inconclusive"
+            )
+            if spec.mechanism == "c_chain"
+            else replay_frozen_development_result_payload(
+                persisted_result, outcome="inconclusive"
+            )
         )
     elif result.mechanism_diagnostics is not None:
         raise ValueError(
@@ -10638,10 +10835,11 @@ def load_shard(
     if is_v2:
         config_name_value = payload.get("config_name")
         expected_fields = (
-            _V2_CCHAIN_SHARD_FIELDS
+            _V2_MECHANISM_SHARD_FIELDS
             if type(config_name_value) is str
             and config_name_value in SCREENING_REGISTRY
-            and SCREENING_REGISTRY[config_name_value].mechanism == "c_chain"
+            and SCREENING_REGISTRY[config_name_value].mechanism
+            in {"c_chain", "replay_in_context", "frozen_feature_ceiling"}
             else _V2_SHARD_FIELDS
         )
         _require_exact_keys(payload, expected_fields, context=str(path))
@@ -10750,6 +10948,43 @@ def load_shard(
             if receipt_resources["timing_seconds"] != payload["wall_clock_seconds"]:
                 raise ValueError(
                     f"{path}: C-CHAIN receipt timing drifts from its enclosing shard"
+                )
+            payload["mechanism_receipt"] = receipt
+        elif spec.mechanism in {"replay_in_context", "frozen_feature_ceiling"}:
+            receipt = validate_replay_frozen_result(payload["mechanism_receipt"])
+            expected_axes = {
+                "arm": config_name,
+                "seed": payload["seed"],
+                "n_tasks": config.n_tasks,
+                "task_length": config.task_length,
+                "input_dim": config.input_dim,
+                "hidden1": config.hidden1,
+                "hidden2": config.hidden2,
+                "n_classes": config.n_classes,
+                "hyperparameters": payload["hyperparameters"],
+            }
+            if any(receipt[name] != expected for name, expected in expected_axes.items()):
+                raise ValueError(
+                    f"{path}: replay/frozen receipt drifts from its enclosing shard"
+                )
+            if receipt["outcome"] != "inconclusive":
+                raise ValueError(
+                    f"{path}: a single replay/frozen shard must remain outcome-inconclusive"
+                )
+            receipt_metrics = cast(Mapping[str, float], receipt["metrics"])
+            expected_metrics = {
+                "mean_online_accuracy": float(np.mean(payload["per_task_accuracy"])),
+                "mean_loss": float(np.mean(payload["per_task_loss"])),
+                "mean_plasticity": float(np.mean(payload["per_task_plasticity"])),
+            }
+            if receipt_metrics != expected_metrics:
+                raise ValueError(
+                    f"{path}: replay/frozen receipt metrics drift from shard curves"
+                )
+            receipt_resources = cast(Mapping[str, object], receipt["resources"])
+            if receipt_resources["timing_seconds"] != payload["wall_clock_seconds"]:
+                raise ValueError(
+                    f"{path}: replay/frozen receipt timing drifts from its shard"
                 )
             payload["mechanism_receipt"] = receipt
     noise_mode = _validated_screening_noise_mode(
