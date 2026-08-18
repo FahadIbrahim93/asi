@@ -3833,6 +3833,57 @@ class ForagerBenchmarkSummary:
     confidence: float
     runs: tuple[ForagerRunResult, ...]
 
+    def __post_init__(self) -> None:
+        if type(self.agent) is not str or not self.agent:
+            raise ValueError("agent must be a non-empty string")
+        if type(self.privileged) is not bool:
+            raise ValueError("privileged must be an exact boolean")
+        if type(self.metric) is not str or self.metric not in (
+            "mean_reward",
+            "final_window_mean_reward",
+            "final_ewm_reward",
+            "mean_ewm_reward",
+            "fov_last_10pct_ema_auc",
+        ):
+            raise ValueError("metric is not a valid Forager summary metric")
+        if type(self.runs) is not tuple or not self.runs:
+            raise ValueError("runs must be a non-empty exact tuple")
+        if any(type(run) is not ForagerRunResult for run in self.runs):
+            raise ValueError("runs must contain exact ForagerRunResult records")
+        runs = tuple(
+            ForagerRunResult(
+                **{field.name: getattr(run, field.name) for field in dataclasses.fields(run)}
+            )
+            for run in self.runs
+        )
+        if type(self.seeds) is not tuple:
+            raise ValueError("seeds must be an exact tuple")
+        seeds = tuple(
+            _validated_seed(seed, name=f"seeds[{index}]")
+            for index, seed in enumerate(self.seeds)
+        )
+        if seeds != tuple(run.seed for run in runs) or len(set(seeds)) != len(seeds):
+            raise ValueError("seeds must exactly match the unique ordered runs")
+        if any(run.agent != self.agent or run.privileged is not self.privileged for run in runs):
+            raise ValueError("runs must match the named agent and privilege identity")
+        mean = _require_result_scalar(self.mean, name="mean")
+        ci_low = _require_result_scalar(self.ci_low, name="ci_low")
+        ci_high = _require_result_scalar(self.ci_high, name="ci_high")
+        confidence = _require_result_scalar(self.confidence, name="confidence")
+        if ci_low > ci_high:
+            raise ValueError("ci_low must not exceed ci_high")
+        if not 0.0 < confidence < 1.0:
+            raise ValueError("confidence must lie in (0, 1)")
+        expected_mean = float(np.mean([getattr(run, self.metric) for run in runs]))
+        if mean != expected_mean:
+            raise ValueError("mean must reconstruct from the selected run metric")
+        object.__setattr__(self, "runs", runs)
+        object.__setattr__(self, "seeds", seeds)
+        object.__setattr__(self, "mean", mean)
+        object.__setattr__(self, "ci_low", ci_low)
+        object.__setattr__(self, "ci_high", ci_high)
+        object.__setattr__(self, "confidence", confidence)
+
     def to_dict(self) -> dict[str, Any]:
         data = dataclasses.asdict(self)
         data["seeds"] = list(self.seeds)
@@ -3855,8 +3906,6 @@ def summarize_forager_runs(
     bootstrap_seed: int = 0,
 ) -> ForagerBenchmarkSummary:
     """Summarize same-agent runs without mixing privileged controls."""
-    if len(runs) == 0:
-        raise ValueError("at least one run is required")
     supported_metrics = {
         "mean_reward",
         "final_window_mean_reward",
@@ -3868,6 +3917,8 @@ def summarize_forager_runs(
         raise ValueError("unsupported Forager summary metric")
     if type(runs) not in (list, tuple):
         raise TypeError("runs must be an actual list or tuple")
+    if len(runs) == 0:
+        raise ValueError("at least one run is required")
     if any(type(run) is not ForagerRunResult for run in runs):
         raise TypeError("runs must contain only ForagerRunResult values")
     names = {run.agent for run in runs}
