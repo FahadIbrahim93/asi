@@ -3,14 +3,24 @@
 from __future__ import annotations
 
 import jax.numpy as jnp
+import numpy as np
 import pytest
 
-from alberta_framework.core.baseline_optimizers import AdaGain, Adam
+from alberta_framework.core.baseline_optimizers import NADALINE, AdaGain, Adam, RMSprop
 
 _INT32_MAX = 2**31 - 1
 _INT32_MIN = -(2**31)
 _ONE_BANK_FITS = _INT32_MAX // 4
 _WORKING_SET_OVERFLOW = 100_000_000
+
+
+class _IntSubclass(int):
+    pass
+
+
+class _IndexOnly:
+    def __index__(self) -> int:
+        return 4
 
 
 def test_int32_wrap_forges_a_different_published_byte_identity() -> None:
@@ -85,3 +95,79 @@ def test_legal_adam_and_adagain_update_identity_is_unchanged() -> None:
     assert bool(adagain_result.update_applied)
     assert adagain_result.weight_delta.shape == (4,)
     assert adagain_result.new_state.gradient_trace.shape == (4,)
+
+
+@pytest.mark.parametrize(
+    ("factory", "vectors", "scalars", "label"),
+    [
+        (Adam, 9, 8, "Adam"),
+        (AdaGain, 9, 8, "AdaGain"),
+        (RMSprop, 6, 6, "RMSprop"),
+        (NADALINE, 6, 6, "NADALINE"),
+    ],
+)
+def test_every_linear_optimizer_rejects_first_overflowing_update_width(
+    factory: type[Adam] | type[AdaGain] | type[RMSprop] | type[NADALINE],
+    vectors: int,
+    scalars: int,
+    label: str,
+) -> None:
+    float32_limit = _INT32_MAX // 4
+    first_overflowing = (float32_limit - scalars) // vectors + 1
+    assert 4 * (vectors * (first_overflowing - 1) + scalars) <= _INT32_MAX
+    assert 4 * (vectors * first_overflowing + scalars) > _INT32_MAX
+    with pytest.raises(ValueError, match=rf"{label} update working set byte count"):
+        factory().init(first_overflowing)
+
+
+@pytest.mark.parametrize("factory", [Adam, AdaGain, RMSprop, NADALINE])
+@pytest.mark.parametrize(
+    "feature_dim",
+    [True, 4.0, _IntSubclass(4), _IndexOnly(), jnp.asarray(4, dtype=jnp.int32)],
+)
+def test_linear_optimizer_feature_dim_rejects_hostile_integer_surrogates(
+    factory: type[Adam] | type[AdaGain] | type[RMSprop] | type[NADALINE],
+    feature_dim: object,
+) -> None:
+    with pytest.raises(ValueError, match="feature_dim must be an integer"):
+        factory().init(feature_dim)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("factory", [Adam, RMSprop])
+@pytest.mark.parametrize(
+    "shape",
+    [
+        [2, 2],
+        (2, True),
+        (2, 2.0),
+        (2, _IntSubclass(2)),
+        (2, _IndexOnly()),
+        (2, jnp.asarray(2, dtype=jnp.int32)),
+    ],
+)
+def test_parameter_optimizer_shape_rejects_hostile_schema(
+    factory: type[Adam] | type[RMSprop], shape: object
+) -> None:
+    with pytest.raises(ValueError, match="shape"):
+        factory().init_for_shape(shape)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("factory", "vectors", "scalars", "label"),
+    [
+        (Adam, 9, 8, "Adam"),
+        (RMSprop, 6, 6, "RMSprop"),
+    ],
+)
+def test_parameter_optimizer_rejects_derived_shape_working_set_before_allocation(
+    factory: type[Adam] | type[RMSprop], vectors: int, scalars: int, label: str
+) -> None:
+    float32_limit = _INT32_MAX // 4
+    first_overflowing = (float32_limit - scalars) // vectors + 1
+    with pytest.raises(ValueError, match=rf"{label} update working set byte count"):
+        factory().init_for_shape((first_overflowing,))
+
+
+def test_actual_numpy_integer_dimensions_remain_supported() -> None:
+    assert Adam().init(np.int64(4)).m.shape == (4,)
+    assert RMSprop().init_for_shape((np.uint16(2), np.int32(2))).v.shape == (2, 2)

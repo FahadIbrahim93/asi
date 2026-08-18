@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import jax.numpy as jnp
+import numpy as np
 import pytest
 
 from alberta_framework.core.off_policy_td import (
@@ -14,6 +15,15 @@ from alberta_framework.core.off_policy_td import (
 _INT32_MAX = 2**31 - 1
 _INT32_MIN = -(2**31)
 _WORKING_SET_OVERFLOW = 100_000_000
+
+
+class _IntSubclass(int):
+    pass
+
+
+class _IndexOnly:
+    def __index__(self) -> int:
+        return 4
 
 
 def test_int32_wrap_forges_a_different_published_byte_identity() -> None:
@@ -99,3 +109,59 @@ def test_legal_off_policy_td_update_identity_is_unchanged() -> None:
     assert bool(gradient_result.update_applied)
     assert gradient_result.state.weights.shape == (5,)
     assert gradient_result.state.secondary_weights.shape == (5,)
+
+
+@pytest.mark.parametrize(
+    ("factory", "vectors", "augmented"),
+    [
+        (OffPolicyTDLinearLearner, 8, False),
+        (ETDLinearLearner, 8, False),
+        (GradientTDLinearLearner, 9, True),
+    ],
+)
+def test_every_off_policy_learner_rejects_first_overflowing_update_width(
+    factory: type[OffPolicyTDLinearLearner]
+    | type[ETDLinearLearner]
+    | type[GradientTDLinearLearner],
+    vectors: int,
+    augmented: bool,
+) -> None:
+    float32_limit = _INT32_MAX // 4
+    first_overflowing_width = (float32_limit - 16) // vectors + 1
+    feature_dim = first_overflowing_width - int(augmented)
+    previous_width = first_overflowing_width - 1
+    assert 4 * (vectors * previous_width + 16) <= _INT32_MAX
+    assert 4 * (vectors * first_overflowing_width + 16) > _INT32_MAX
+    with pytest.raises(ValueError, match="update working set byte count"):
+        factory().init(feature_dim)
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [OffPolicyTDLinearLearner, ETDLinearLearner, GradientTDLinearLearner],
+)
+@pytest.mark.parametrize(
+    "feature_dim",
+    [True, 4.0, _IntSubclass(4), _IndexOnly(), jnp.asarray(4, dtype=jnp.int32)],
+)
+def test_off_policy_feature_dim_rejects_hostile_integer_surrogates(
+    factory: type[OffPolicyTDLinearLearner]
+    | type[ETDLinearLearner]
+    | type[GradientTDLinearLearner],
+    feature_dim: object,
+) -> None:
+    with pytest.raises(ValueError, match="feature_dim must be an integer"):
+        factory().init(feature_dim)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [OffPolicyTDLinearLearner, ETDLinearLearner, GradientTDLinearLearner],
+)
+def test_actual_numpy_integer_feature_dims_remain_supported(
+    factory: type[OffPolicyTDLinearLearner]
+    | type[ETDLinearLearner]
+    | type[GradientTDLinearLearner],
+) -> None:
+    state = factory().init(np.int64(4))
+    assert state.weights.shape[0] in (4, 5)
