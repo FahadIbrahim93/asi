@@ -243,9 +243,9 @@ _MISSING_NOISE_POOL_STEPS = object()
 def _validated_wall_clock_seconds(value: object, path: Path | str) -> float:
     """Return one shard wall clock as a finite, non-negative Python float."""
     message = f"{path}: wall_clock_seconds must be a finite, non-negative number"
-    if type(value) not in (int, float):
+    if type(value) is not int and type(value) is not float:
         raise ValueError(message)
-    numeric_value = cast(int | float, value)
+    numeric_value = value
     try:
         wall_clock_seconds = float(numeric_value)
     except (OverflowError, ValueError) as exc:
@@ -5336,7 +5336,7 @@ class ScreeningSpec:
         for key, value in self.hyperparameters.items():
             if type(key) is not str or not key:
                 raise TypeError("hyperparameter keys must be exact non-empty strings")
-            if type(value) not in (int, float) or not math.isfinite(value):
+            if (type(value) is not int and type(value) is not float) or not math.isfinite(value):
                 raise ValueError("hyperparameter values must be finite built-in numbers")
             normalized[key] = float(value)
         object.__setattr__(self, "hyperparameters", normalized)
@@ -7720,16 +7720,21 @@ class ScreeningRunResult:
         for key, value in self.hyperparameters.items():
             if type(key) is not str or not key:
                 raise TypeError("hyperparameter keys must be exact non-empty strings")
-            if type(value) not in (int, float) or not math.isfinite(value):
+            if (type(value) is not int and type(value) is not float) or not math.isfinite(value):
                 raise ValueError("hyperparameter values must be finite built-in numbers")
             normalized[key] = float(value)
         object.__setattr__(self, "hyperparameters", normalized)
         object.__setattr__(self, "seed", require_jax_seed(self.seed, name="seed"))
         if type(self.config) is not IPMNISTConfig:
             raise TypeError("config must be an IPMNISTConfig")
-        if type(self.wall_clock_seconds) not in (int, float) or not math.isfinite(
-            self.wall_clock_seconds
-        ) or self.wall_clock_seconds < 0.0:
+        if (
+            (
+                type(self.wall_clock_seconds) is not int
+                and type(self.wall_clock_seconds) is not float
+            )
+            or not math.isfinite(self.wall_clock_seconds)
+            or self.wall_clock_seconds < 0.0
+        ):
             raise ValueError("wall_clock_seconds must be a finite float")
         for arr_name in ("per_task_accuracy", "per_task_loss", "per_task_plasticity"):
             array = getattr(self, arr_name)
@@ -7970,10 +7975,10 @@ def _required_nonempty_string(value: object, *, context: str) -> str:
 
 
 def _is_finite_json_number(value: object) -> bool:
-    if type(value) not in (int, float):
+    if type(value) is not int and type(value) is not float:
         return False
     try:
-        return math.isfinite(float(cast(int | float, value)))
+        return math.isfinite(float(value))
     except (OverflowError, ValueError):
         return False
 
@@ -8363,7 +8368,7 @@ def load_shard(path: Path) -> dict[str, Any]:
             payload["evidence_policy"], context=str(path)
         )
         created_unix = payload["created_unix"]
-        if type(created_unix) not in (int, float):
+        if type(created_unix) is not int and type(created_unix) is not float:
             raise ValueError(f"{path}: created_unix must be a finite, non-negative number")
         try:
             created_value = float(created_unix)

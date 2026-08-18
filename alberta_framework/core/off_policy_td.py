@@ -104,7 +104,8 @@ def _require_feature_dim(
     augmented: bool = False,
 ) -> int:
     maximum = _INT32_MAX - 1 if augmented else _INT32_MAX
-    if type(value) not in _ACTUAL_INT_TYPES:
+    actual_type = type(value)
+    if not any(actual_type is allowed_type for allowed_type in _ACTUAL_INT_TYPES):
         raise ValueError(f"feature_dim must be an integer in [1, {maximum}]")
     feature_dim = operator.index(cast(SupportsIndex, value))
     if not 1 <= feature_dim <= maximum:
@@ -122,11 +123,13 @@ def _require_feature_dim(
 def _positive_float32_or_infinity(name: str, value: object) -> float:
     """Preserve the documented infinity sentinel but reject finite overflow."""
     actual_type = type(value)
-    if actual_type not in _TRUSTED_REAL_TYPES:
+    if not any(actual_type is allowed_type for allowed_type in _TRUSTED_REAL_TYPES):
         raise ValueError(f"{name} must be positive or infinity")
     try:
         numeric_value = cast(Any, value)
-        if actual_type in _INFINITY_TYPES and bool(np.isinf(numeric_value)):
+        if any(actual_type is allowed_type for allowed_type in _INFINITY_TYPES) and bool(
+            np.isinf(numeric_value)
+        ):
             if bool(np.signbit(numeric_value)):
                 raise ValueError(f"{name} must be positive or infinity")
             return math.inf
@@ -136,7 +139,8 @@ def _positive_float32_or_infinity(name: str, value: object) -> float:
 
 
 def _validated_config_float(name: str, value: object, **bounds: Any) -> float:
-    if type(value) not in _TRUSTED_REAL_TYPES:
+    actual_type = type(value)
+    if not any(actual_type is allowed_type for allowed_type in _TRUSTED_REAL_TYPES):
         raise ValueError(f"{name} must be a finite real scalar")
     return validated_float32_scalar(name, value, **bounds)
 
@@ -170,7 +174,8 @@ def _array_metadata(name: str, value: object, shape: tuple[int, ...]) -> Array:
 
 
 def _scalar_operand(name: str, value: object) -> Array:
-    if type(value) in _ACTUAL_INT_TYPES | _ACTUAL_FLOAT_TYPES:
+    actual_type = type(value)
+    if any(actual_type is allowed_type for allowed_type in _TRUSTED_REAL_TYPES):
         canonical = validated_float32_scalar(name, value)
         return jnp.asarray(canonical, dtype=jnp.float32)
     return _array_metadata(name, value, ())
@@ -178,7 +183,8 @@ def _scalar_operand(name: str, value: object) -> Array:
 
 def _discount_operand(value: object) -> Array:
     """Validate a discount in its exact host and consumed float32 domains."""
-    if type(value) in _ACTUAL_INT_TYPES | _ACTUAL_FLOAT_TYPES:
+    actual_type = type(value)
+    if any(actual_type is allowed_type for allowed_type in _TRUSTED_REAL_TYPES):
         canonical = validated_float32_scalar("gamma", value, lower=0.0, upper=1.0)
         return jnp.asarray(canonical, dtype=jnp.float32)
     return _array_metadata("gamma", value, ())
@@ -217,7 +223,7 @@ def _serialized_payload(
     marker = payload.pop("type")
     if type(marker) is not str or marker != type_name:
         raise ValueError("config type differs")
-    if any(type(value) not in (int, float) for value in payload.values()):
+    if any(type(value) is not int and type(value) is not float for value in payload.values()):
         raise ValueError("serialized scalar fields must be exact JSON numbers")
     return payload
 

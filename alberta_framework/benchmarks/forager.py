@@ -239,7 +239,7 @@ def _require_real(value: Any, *, name: str) -> float:
     # Preserve the historical acceptance of NumPy's concrete float64 scalar,
     # which is a float subtype, without admitting arbitrary user-defined
     # int/float subclasses with overloaded conversion or arithmetic hooks.
-    if actual_type not in (int, float, np.float64):
+    if actual_type is not int and actual_type is not float and actual_type is not np.float64:
         raise ValueError(f"{name} must be a real number")
     try:
         converted = float(cast(Any, value))
@@ -636,12 +636,15 @@ class ForagerFeatureState:
     def __post_init__(self) -> None:
         if type(self.last_action) is not int or isinstance(self.last_action, bool):
             raise ValueError("last_action must be an integer")
-        if type(self.last_reward) not in (int, float) or not math.isfinite(self.last_reward):
+        if (
+            type(self.last_reward) is not int
+            and type(self.last_reward) is not float
+        ) or not math.isfinite(self.last_reward):
             raise ValueError("last_reward must be a finite float")
         if type(self.reward_traces) is not tuple:
             raise ValueError("reward_traces must be a tuple")
         for trace in self.reward_traces:
-            if type(trace) not in (int, float) or not math.isfinite(trace):
+            if (type(trace) is not int and type(trace) is not float) or not math.isfinite(trace):
                 raise ValueError("reward_traces values must be finite floats")
 
 

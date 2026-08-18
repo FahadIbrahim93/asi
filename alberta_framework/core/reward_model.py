@@ -49,7 +49,8 @@ _ACTUAL_FLOAT_TYPES = frozenset(
 
 
 def _require_int32(name: str, value: object, *, minimum: int, maximum: int = _INT32_MAX) -> int:
-    if type(value) not in _ACTUAL_INT_TYPES:
+    actual_type = type(value)
+    if not any(actual_type is allowed_type for allowed_type in _ACTUAL_INT_TYPES):
         raise ValueError(f"{name} must be an integer in [{minimum}, {maximum}]")
     canonical = operator.index(cast(SupportsIndex, value))
     if not minimum <= canonical <= maximum:
@@ -80,7 +81,11 @@ def _preflight_update_working_set(feature_dim: int) -> None:
 
 
 def _validated_config_float(name: str, value: object, **bounds: Any) -> float:
-    if type(value) not in (_ACTUAL_INT_TYPES | _ACTUAL_FLOAT_TYPES):
+    actual_type = type(value)
+    if not any(
+        actual_type is allowed_type
+        for allowed_type in (*_ACTUAL_INT_TYPES, *_ACTUAL_FLOAT_TYPES)
+    ):
         raise ValueError(f"{name} must be a finite real scalar")
     return validated_float32_scalar(name, value, **bounds)
 
