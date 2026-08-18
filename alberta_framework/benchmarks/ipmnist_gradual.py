@@ -44,6 +44,9 @@ _INT32_MAX = 2**31 - 1
 _MAX_ARRAY_ELEMENTS = 1_000_000
 _MAX_RESOURCE_BYTES = 256 * 1024 * 1024
 _MAX_RUN_STEPS = 1_000_000
+_PRNG_IMPLEMENTATION = "threefry2x32"
+_PAIR_RESULT_SCHEMA = "asi.ipmnist.gradual-input-pair.result.v1"
+_ADAMW_IDENTITY = tuple(sorted(ADAMW_PROTOCOL_HYPERPARAMETERS.items()))
 _NUMPY_INTEGER_TYPES = (
     np.int8,
     np.int16,
@@ -67,6 +70,10 @@ GRADUAL_IPMNIST_PROTOCOL = MappingProxyType(
             "the paper iterates mini-batches within tasks without revealing boundaries"
         ),
         "matched_axes": ("seed", "updates", "observations", "example_order"),
+        "prng_implementation": _PRNG_IMPLEMENTATION,
+        "counter_scope": "per_arm",
+        "dataset_identity_required": True,
+        "base_learner_identity_required": True,
         "learner_observes_transition_alpha": False,
         "learner_observes_task_boundary": False,
         "transaction_validity_required": True,
@@ -217,7 +224,13 @@ def task_sampling_mask(
     new_count = math.floor(_alpha(alpha) * resolved_count)
     order = np.asarray(
         jax.device_get(
-            jr.permutation(jr.fold_in(jr.key(resolved_seed), resolved_transition), resolved_count)
+            jr.permutation(
+                jr.fold_in(
+                    jr.key(resolved_seed, impl=_PRNG_IMPLEMENTATION),
+                    resolved_transition,
+                ),
+                resolved_count,
+            )
         )
     )
     mask = np.zeros(resolved_count, dtype=np.bool_)
@@ -229,31 +242,144 @@ def task_sampling_mask(
 class GradualInputPairResult:
     """Host receipt for one matched abrupt/input-interpolation learner pair."""
 
+    schema: str
+    development_only: bool
+    scientific_promotion_allowed: bool
+    execution_attestation: bool
     arm_names: tuple[str, str]
     learner_name: str
+    learner_hyperparameters: tuple[tuple[str, float], ...]
+    prng_implementation: str
     seed: int
     config: IPMNISTConfig
     transition_steps: int
+    dataset_rows: int
+    dataset_sha256: str
     schedule_sha256: str
     example_order_sha256: str
     correct_counts: np.ndarray
     loss_sums: np.ndarray
     persistent_numeric_bytes: np.ndarray
     timing_ns: np.ndarray
-    observations: int
-    updates: int
-    data_steps: int
-    environment_steps: int
-    model_queries: int
+    observations_per_arm: int
+    updates_per_arm: int
+    data_steps_per_arm: int
+    environment_steps_per_arm: int
+    model_queries_per_arm: int
+
+    def __post_init__(self) -> None:
+        if type(self.schema) is not str or self.schema != _PAIR_RESULT_SCHEMA:
+            raise ValueError(f"schema must be {_PAIR_RESULT_SCHEMA!r}")
+        if self.development_only is not True:
+            raise ValueError("development_only must be true")
+        if self.scientific_promotion_allowed is not False:
+            raise ValueError("scientific_promotion_allowed must be false")
+        if self.execution_attestation is not False:
+            raise ValueError("execution_attestation must be false")
+        if type(self.arm_names) is not tuple or self.arm_names != (
+            "abrupt",
+            "input_interpolation",
+        ):
+            raise ValueError("arm_names must identify the matched pair")
+        if type(self.learner_name) is not str or self.learner_name != "adamw_control":
+            raise ValueError("learner_name must be 'adamw_control'")
+        hyperparameters = self.learner_hyperparameters
+        if type(hyperparameters) is not tuple or len(hyperparameters) != len(_ADAMW_IDENTITY):
+            raise ValueError("learner_hyperparameters must identify the frozen AdamW control")
+        for index, expected_identity_item in enumerate(_ADAMW_IDENTITY):
+            item = hyperparameters[index]
+            if (
+                type(item) is not tuple
+                or len(item) != 2
+                or type(item[0]) is not str
+                or type(item[1]) is not float
+                or item != expected_identity_item
+            ):
+                raise ValueError(
+                    "learner_hyperparameters must identify the frozen AdamW control"
+                )
+        if (
+            type(self.prng_implementation) is not str
+            or self.prng_implementation != _PRNG_IMPLEMENTATION
+        ):
+            raise ValueError("prng_implementation must be 'threefry2x32'")
+        seed = require_jax_seed(self.seed, name="seed")
+        if type(self.config) is not IPMNISTConfig:
+            raise ValueError("config must be an exact IPMNISTConfig")
+        config = IPMNISTConfig(**self.config.to_config())
+        width = _exact_index("transition_steps", self.transition_steps, minimum=1)
+        if width >= config.task_length:
+            raise ValueError("transition_steps must be smaller than task_length")
+        dataset_rows = _exact_index("dataset_rows", self.dataset_rows, minimum=config.task_length)
+        for name in ("dataset_sha256", "schedule_sha256", "example_order_sha256"):
+            value = getattr(self, name)
+            if (
+                type(value) is not str
+                or len(value) != 71
+                or not value.startswith("sha256:")
+                or any(character not in "0123456789abcdef" for character in value[7:])
+            ):
+                raise ValueError(f"{name} must be one canonical SHA-256 identity")
+
+        arrays = (
+            ("correct_counts", self.correct_counts, np.int32, (2, config.n_tasks)),
+            ("loss_sums", self.loss_sums, np.float64, (2, config.n_tasks)),
+            ("persistent_numeric_bytes", self.persistent_numeric_bytes, np.int64, (2,)),
+            ("timing_ns", self.timing_ns, np.int64, (2,)),
+        )
+        snapshots: dict[str, np.ndarray] = {}
+        for name, value, dtype, shape in arrays:
+            if type(value) is not np.ndarray or value.dtype != dtype or value.shape != shape:
+                raise ValueError(f"{name} must be an exact {dtype.__name__} array of shape {shape}")
+            snapshot = value.copy()
+            snapshot.flags.writeable = False
+            snapshots[name] = snapshot
+        if np.any(snapshots["correct_counts"] < 0) or np.any(
+            snapshots["correct_counts"] > config.task_length
+        ):
+            raise ValueError("correct_counts must be valid per-task integer numerators")
+        if not np.all(np.isfinite(snapshots["loss_sums"])) or np.any(
+            snapshots["loss_sums"] < 0.0
+        ):
+            raise ValueError("loss_sums must be finite and nonnegative")
+        expected_persistent_bytes = (
+            config.parameter_count * 12
+            + 6 * 5 * 4
+            + dataset_rows * (config.input_dim + 1) * 4
+            + config.n_tasks * (config.input_dim + config.task_length) * 4
+        )
+        if not np.all(snapshots["persistent_numeric_bytes"] == expected_persistent_bytes):
+            raise ValueError("persistent_numeric_bytes must equal the complete numeric state")
+        if np.any(snapshots["timing_ns"] < 0):
+            raise ValueError("timing_ns must be nonnegative telemetry")
+
+        expected_counters = {
+            "observations_per_arm": config.n_steps,
+            "updates_per_arm": config.n_steps,
+            "data_steps_per_arm": config.n_steps,
+            "environment_steps_per_arm": 0,
+            "model_queries_per_arm": 2 * config.n_steps,
+        }
+        for name, expected in expected_counters.items():
+            if type(getattr(self, name)) is not int or getattr(self, name) != expected:
+                raise ValueError(f"{name} must equal {expected}")
+
+        object.__setattr__(self, "seed", seed)
+        object.__setattr__(self, "config", config)
+        object.__setattr__(self, "transition_steps", width)
+        object.__setattr__(self, "dataset_rows", dataset_rows)
+        for name, snapshot in snapshots.items():
+            object.__setattr__(self, name, snapshot)
 
 
-def _array_sha256(domain: bytes, value: Array) -> str:
-    raw = np.asarray(jax.device_get(value))
+def _array_sha256(domain: bytes, *values: Array) -> str:
     digest = hashlib.sha256()
     digest.update(domain)
-    digest.update(raw.dtype.str.encode("ascii"))
-    digest.update(str(raw.shape).encode("ascii"))
-    digest.update(raw.tobytes(order="C"))
+    for value in values:
+        raw = np.asarray(jax.device_get(value))
+        digest.update(raw.dtype.str.encode("ascii"))
+        digest.update(str(raw.shape).encode("ascii"))
+        digest.update(raw.tobytes(order="C"))
     return f"sha256:{digest.hexdigest()}"
 
 
@@ -349,7 +475,7 @@ def run_gradual_input_pair(
     data_x_array = jnp.asarray(resolved_x, dtype=jnp.float32)
     data_y_array = jnp.asarray(resolved_y, dtype=jnp.int32)
     dataset_numeric_bytes = int(data_x_array.nbytes + data_y_array.nbytes)
-    init_fn, step_fn = _make_adamw_learner(dict(ADAMW_PROTOCOL_HYPERPARAMETERS))
+    init_fn, step_fn = _make_adamw_learner(dict(_ADAMW_IDENTITY))
 
     @jax.jit
     def checked_step(
@@ -365,7 +491,7 @@ def run_gradual_input_pair(
         accuracy = (jnp.argmax(logits) == y).astype(jnp.float32)
         return transaction, accuracy, loss, post_loss
 
-    root = jr.key(jnp.uint32(resolved_seed))
+    root = jr.key(resolved_seed, impl=_PRNG_IMPLEMENTATION)
     key_init, key_schedule, key_noise = jr.split(root, 3)
     initial_params = init_mlp_params(key_init, checked_config)
     schedule = build_schedule(key_schedule, checked_config, int(data_x_array.shape[0]))
@@ -429,11 +555,21 @@ def run_gradual_input_pair(
     arm_outputs = (run_arm(False), run_arm(True))
     horizon = checked_config.n_steps
     return GradualInputPairResult(
+        schema=_PAIR_RESULT_SCHEMA,
+        development_only=True,
+        scientific_promotion_allowed=False,
+        execution_attestation=False,
         arm_names=("abrupt", "input_interpolation"),
         learner_name=learner_name,
+        learner_hyperparameters=_ADAMW_IDENTITY,
+        prng_implementation=_PRNG_IMPLEMENTATION,
         seed=resolved_seed,
         config=checked_config,
         transition_steps=width,
+        dataset_rows=int(data_x_array.shape[0]),
+        dataset_sha256=_array_sha256(
+            b"asi.ipmnist.gradual.dataset.v1\0", data_x_array, data_y_array
+        ),
         schedule_sha256=_array_sha256(
             b"asi.ipmnist.gradual.permutations.v1\0", schedule.permutations
         ),
@@ -446,9 +582,9 @@ def run_gradual_input_pair(
             [output[2] for output in arm_outputs], dtype=np.int64
         ),
         timing_ns=np.asarray([output[3] for output in arm_outputs], dtype=np.int64),
-        observations=horizon,
-        updates=horizon,
-        data_steps=horizon,
-        environment_steps=0,
-        model_queries=2 * horizon,
+        observations_per_arm=horizon,
+        updates_per_arm=horizon,
+        data_steps_per_arm=horizon,
+        environment_steps_per_arm=0,
+        model_queries_per_arm=2 * horizon,
     )
