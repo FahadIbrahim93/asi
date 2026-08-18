@@ -241,6 +241,7 @@ The console scripts are grouped by responsibility; every command supports `--hel
 |---|---|
 | `alberta-step1-smoke`, `alberta-step2-smoke` | Nonpromoting mechanism smoke checks |
 | `asi-clear-qualification` | Verify local CLEAR archive identities and emit a permanently nonpromoting matched setup plan |
+| `asi-cora-catalog` | Inspect the blocked CORA qualification catalog without importing external runtimes |
 | `asi-reference-life-scorecard` | Run or validate the permanently nonpromoting reference-life development scorecard |
 | `asi-ipmnist-ceiling` | Produce new, atomic no-replace stationary/carried/full or batch ceiling diagnostics |
 | `asi-ipmnist-campaign` | Recompute paired frontiers or ceiling summaries from explicit input directories |
@@ -415,6 +416,7 @@ consumed seeds, or modify immutable `outputs/` records. See
 
 ### Research and historical audits
 
+- [CORA continual-RL qualification](docs/research/cora-qualification.md)
 - [IPMNIST theory](docs/research/ipmnist-theory.md)
 - [Current IPMNIST campaign index](docs/research/ipmnist-campaign-index.md)
 - [RTU Taylor-correction derivation](docs/design/rtu-taylor-correction.md)
