@@ -4,7 +4,9 @@ name: ci
 # Benchmarks never execute in CI. The runtime lane collects only tests selected
 # by `not slow and not package`, balances their files by collected-node count,
 # and caps xdist at two workers so JAX compilation remains inside hosted-runner
-# memory limits.
+# memory limits. Ten partitions also keep file-level runtime skew inside the
+# hosted-runner execution envelope; collected-node count alone underestimates
+# several integration-heavy files.
 "on":
   push:
     branches: [main]
@@ -20,7 +22,7 @@ permissions:
   contents: read
 
 env:
-  SHARD_COUNT: "8"
+  SHARD_COUNT: "10"
   XLA_PYTHON_CLIENT_PREALLOCATE: "false"
 
 jobs:
