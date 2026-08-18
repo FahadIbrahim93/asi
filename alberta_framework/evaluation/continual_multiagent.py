@@ -945,8 +945,28 @@ def aggregate_evidence(
     for result in results:
         if type(result) is not ConditionResult:
             raise ValueError("results must contain exact ConditionResult records")
+        budget = ControllerBudget(
+            **{
+                field.name: getattr(result.controller_budget, field.name)
+                for field in fields(ControllerBudget)
+            }
+        )
+        timing = TimingMetrics(
+            **{field.name: getattr(result.timing, field.name) for field in fields(TimingMetrics)}
+        )
         result = ConditionResult(
-            **{field.name: getattr(result, field.name) for field in fields(ConditionResult)}
+            seed=result.seed,
+            condition=result.condition,
+            learning_mask=result.learning_mask,
+            online_rewards=result.online_rewards,
+            phase_mean_rewards=result.phase_mean_rewards,
+            performance_matrix=result.performance_matrix,
+            summary=result.summary,
+            recovery_lengths=result.recovery_lengths,
+            recurrence_recovery_steps=result.recurrence_recovery_steps,
+            interference_forgetting=result.interference_forgetting,
+            controller_budget=budget,
+            timing=timing,
         )
         if result.online_rewards.size != 3 * config.phase_steps:
             raise ValueError("result length does not match config.phase_steps")
