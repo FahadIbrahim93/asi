@@ -240,8 +240,10 @@ def test_three_seed_interval_uses_student_t_not_normal_critical_value() -> None:
     assert critical.hex() == "0x1.135ea98e146bbp+2"
 
 
-def test_validator_rejects_obsolete_v1_report_identity(
+@pytest.mark.parametrize("version", ("v1", "v2"))
+def test_validator_rejects_obsolete_report_identity(
     monkeypatch: pytest.MonkeyPatch,
+    version: str,
 ) -> None:
     monkeypatch.setattr(matched, "_validated_source_provenance", lambda value, **_: value)
     monkeypatch.setattr(matched, "_validated_dataset_provenance", lambda value, **_: value)
@@ -249,7 +251,7 @@ def test_validator_rejects_obsolete_v1_report_identity(
     report = matched.build_report(
         _results(), source_provenance={}, dataset_provenance={}, environment={}
     )
-    report["schema"] = "asi.l2er-ipmnist.matched-development-report.v1"
+    report["schema"] = f"asi.l2er-ipmnist.matched-development-report.{version}"
     with pytest.raises(ValueError, match="schema does not match"):
         matched.validate_report(report, require_current_source=False)
 
@@ -269,10 +271,10 @@ def test_report_revalidates_result_identity_before_reading_metrics(
 
 
 def test_output_namespace_is_one_new_development_path() -> None:
-    assert matched.SCHEMA == "asi.l2er-ipmnist.matched-development-report.v2"
-    assert matched.PLAN_ID == "asi.l2er-ipmnist.cheap-screen.v2"
+    assert matched.SCHEMA == "asi.l2er-ipmnist.matched-development-report.v3"
+    assert matched.PLAN_ID == "asi.l2er-ipmnist.cheap-screen.v3"
     assert matched.OUTPUT_PATH.relative_to(matched._REPO_ROOT).as_posix() == (
-        "outputs/l2er_matched_development/report.v2.json"
+        "outputs/l2er_matched_development/report.v3.json"
     )
     assert matched.SEEDS == (1711, 1712, 1713)
     critical = matched.frozen_plan()["confidence_critical"]
@@ -281,11 +283,26 @@ def test_output_namespace_is_one_new_development_path() -> None:
     assert matched.frozen_plan()["statistical_correction_seed_policy"] == (
         "a pre-execution statistical correction does not authorize seed churn"
     )
+    assert matched.frozen_plan()["arm_specific_charged_axes"] == [
+        "effective_rank_updates",
+        "total_optimizer_updates",
+    ]
+    assert "differs by method" in matched.frozen_plan()[
+        "optimizer_update_matching_policy"
+    ]
     assert matched.frozen_plan()["consumed_preplan_audit_seeds"] == [1701]
     invalid = matched.frozen_plan()["invalid_execution_history"]
+    assert invalid[0]["pull_request"] == 1716
+    assert invalid[0]["result_head_commit"] == (
+        "1472d7d57bd92f34e4a5b146b8cb524baf25f06e"
+    )
     assert invalid[1]["seeds"] == [1721, 1722, 1723]
     assert invalid[1]["artifact_sha256"] == (
         "579c400412d3c50898c16a8fd02fa82e2cd712b5278b5a99974b5e89560707ec"
+    )
+    assert invalid[1]["pull_request"] == 1742
+    assert invalid[1]["result_head_commit"] == (
+        "039b51d2e58313049b6b1e93a453b5a8b6cede9b"
     )
     assert invalid[1]["disposition"] == "invalid_unmerged_seed_churn_attempt"
     assert matched.frozen_plan()["development_only"] is True
@@ -302,13 +319,13 @@ def test_output_directory_rejects_symlinked_segments_and_occupied_target(
     monkeypatch.setattr(
         matched,
         "OUTPUT_PATH",
-        tmp_path / "outputs/l2er_matched_development/report.v2.json",
+        tmp_path / "outputs/l2er_matched_development/report.v3.json",
     )
     with pytest.raises(OSError):
         matched._open_output_transaction()
 
     (tmp_path / "outputs").unlink()
-    target = tmp_path / "outputs/l2er_matched_development/report.v2.json"
+    target = tmp_path / "outputs/l2er_matched_development/report.v3.json"
     target.parent.mkdir(parents=True)
     target.write_text("occupied", encoding="utf-8")
     with pytest.raises(FileExistsError, match="refusing to overwrite"):
@@ -322,7 +339,7 @@ def test_output_publication_uses_pinned_dirfd_and_strict_reload(
     monkeypatch.setattr(
         matched,
         "OUTPUT_PATH",
-        tmp_path / "outputs/l2er_matched_development/report.v2.json",
+        tmp_path / "outputs/l2er_matched_development/report.v3.json",
     )
     monkeypatch.setattr(matched, "_validated_source_provenance", lambda value, **_: value)
     monkeypatch.setattr(matched, "_validated_dataset_provenance", lambda value, **_: value)

@@ -33,8 +33,8 @@ from alberta_framework.evaluation.l2er_ipmnist_nonpromoting import (
     validate_l2er_development_result,
 )
 
-SCHEMA = "asi.l2er-ipmnist.matched-development-report.v2"
-PLAN_ID = "asi.l2er-ipmnist.cheap-screen.v2"
+SCHEMA = "asi.l2er-ipmnist.matched-development-report.v3"
+PLAN_ID = "asi.l2er-ipmnist.cheap-screen.v3"
 ARMS = (
     "l2er_mechanism_off",
     "l2er_l2_only",
@@ -49,11 +49,11 @@ _MAX_REPORT_RECORDS = 32
 _MAX_REPORT_BYTES = 16 * 1024 * 1024
 _PATH_TYPE = type(Path())
 _REPO_ROOT = Path(__file__).resolve().parents[2]
-OUTPUT_PATH = _REPO_ROOT / "outputs/l2er_matched_development/report.v2.json"
+OUTPUT_PATH = _REPO_ROOT / "outputs/l2er_matched_development/report.v3.json"
 
 
 def _invalid_execution_history() -> list[dict[str, object]]:
-    """Return consumed invalid executions without changing the prospective v2 matrix."""
+    """Return consumed invalid executions without changing the prospective v3 matrix."""
     return [
         {
             "schema": "asi.l2er-ipmnist.matched-development-report.v1",
@@ -62,11 +62,13 @@ def _invalid_execution_history() -> list[dict[str, object]]:
                 "ab7f03b73993b79c53021970926181130980dd84b180e095779e30960953ff86"
             ),
             "source_commit": "f62d157a449c30a79dcf01740ae7f20a6c27e726",
+            "result_head_commit": "1472d7d57bd92f34e4a5b146b8cb524baf25f06e",
+            "pull_request": 1716,
             "seeds": [1701, 1702, 1703],
             "disposition": "invalid_unmerged_historical_attempt",
             "invalid_reasons": [
                 "normal critical 1.96 was used instead of the frozen Student t(df=2) rule",
-                "effective-rank parameter updates were omitted from the update counter",
+                "the ambiguous updates field did not separately report effective-rank steps",
                 "seed 1701 had already been consumed during executable-path audit",
             ],
         },
@@ -77,10 +79,13 @@ def _invalid_execution_history() -> list[dict[str, object]]:
                 "579c400412d3c50898c16a8fd02fa82e2cd712b5278b5a99974b5e89560707ec"
             ),
             "source_commit": "5fc85b69897fc5b74c27389579c3d1bc27931394",
+            "result_head_commit": "039b51d2e58313049b6b1e93a453b5a8b6cede9b",
+            "pull_request": 1742,
             "seeds": [1721, 1722, 1723],
             "disposition": "invalid_unmerged_seed_churn_attempt",
             "invalid_reasons": [
                 "the execution substituted unexplained seeds after the frozen 1711-1713 plan",
+                "the ambiguous updates field combined supervised and auxiliary optimizer steps",
                 "the invalid output is not retained and cannot replace the prospective v2 matrix",
             ],
         },
@@ -88,7 +93,7 @@ def _invalid_execution_history() -> list[dict[str, object]]:
 
 
 def frozen_plan() -> dict[str, object]:
-    """Return the literal plan committed before the first development run."""
+    """Return the literal v3 plan committed before any retained v3 execution."""
     return {
         "plan_id": PLAN_ID,
         "arms": list(ARMS),
@@ -110,7 +115,14 @@ def frozen_plan() -> dict[str, object]:
             "allowed_boundary_information",
             "allowed_task_information",
         ],
-        "arm_specific_charged_axis": "effective_rank_updates",
+        "arm_specific_charged_axes": [
+            "effective_rank_updates",
+            "total_optimizer_updates",
+        ],
+        "optimizer_update_matching_policy": (
+            "supervised_updates match across arms; total_optimizer_updates differs by method "
+            "because ER-enabled arms execute separately charged auxiliary optimizer steps"
+        ),
         "null_delta": 0.0,
         "confidence_method": "two_sided_student_t",
         "confidence_level": 0.95,
@@ -251,7 +263,7 @@ def _validated_plan(value: object) -> dict[str, object]:
         "confidence_method",
         "statistical_correction_seed_policy",
         "consumed_preplan_audit_note",
-        "arm_specific_charged_axis",
+        "optimizer_update_matching_policy",
     ):
         if type(plan[key]) is not str:
             raise ValueError(f"plan.{key} must be an exact string")
@@ -265,6 +277,7 @@ def _validated_plan(value: object) -> dict[str, object]:
         plan["invalid_execution_history"], context="plan.invalid_execution_history"
     )
     matched_axes = plan["matched_axes"]
+    charged_axes = plan["arm_specific_charged_axes"]
     boundary = plan["allowed_boundary_information"]
     task = plan["allowed_task_information"]
     if (
@@ -293,6 +306,12 @@ def _validated_plan(value: object) -> dict[str, object]:
         or any(type(item) is not str for item in matched_axes)
     ):
         raise ValueError("plan.matched_axes must be an exact string list")
+    if (
+        type(charged_axes) is not list
+        or len(charged_axes) != 2
+        or any(type(item) is not str for item in charged_axes)
+    ):
+        raise ValueError("plan.arm_specific_charged_axes must be an exact string list")
     if type(boundary) is not list or boundary or any(type(item) is not str for item in boundary):
         raise ValueError("plan.allowed_boundary_information must be an exact string list")
     if type(task) is not list or len(task) != 1 or any(type(item) is not str for item in task):
@@ -469,20 +488,21 @@ def validate_report(
                 ("hidden2", CONFIG.hidden2),
                 ("n_classes", CONFIG.n_classes),
                 ("observations", CONFIG.n_steps),
+                ("supervised_updates", CONFIG.n_steps),
                 (
-                    "updates",
+                    "effective_rank_updates",
+                    CONFIG.n_steps // 100
+                    if screening_spec(identity[1]).hyperparameters["er_enabled"] == 1.0
+                    else 0,
+                ),
+                (
+                    "total_optimizer_updates",
                     CONFIG.n_steps
                     + (
                         CONFIG.n_steps // 100
                         if screening_spec(identity[1]).hyperparameters["er_enabled"] == 1.0
                         else 0
                     ),
-                ),
-                (
-                    "effective_rank_updates",
-                    CONFIG.n_steps // 100
-                    if screening_spec(identity[1]).hyperparameters["er_enabled"] == 1.0
-                    else 0,
                 ),
             )
         ):
