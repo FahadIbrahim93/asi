@@ -18,6 +18,7 @@ concurrency:
 jobs:
   shards:
     name: ${{ matrix.environment }} / ${{ matrix.arm }} / ${{ matrix.seed }}
+    if: github.repository == 'elizaOS/asi'
     runs-on: ubuntu-latest
     timeout-minutes: 90
     strategy:
@@ -35,10 +36,13 @@ jobs:
         shell: bash
         env:
           LAUNCH_SHA: ${{ inputs.launch_sha }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
         run: |
           set -euo pipefail
           [[ "$LAUNCH_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$GITHUB_REF" = "refs/heads/main"
           test "$GITHUB_SHA" = "$LAUNCH_SHA"
+          test "$WORKFLOW_SHA" = "$LAUNCH_SHA"
           test "$(git rev-parse HEAD)" = "$LAUNCH_SHA"
           test -z "$(git status --short)"
 
@@ -77,17 +81,20 @@ jobs:
             --output "$output"
           "$PYTHON_PATH" -m alberta_framework.benchmarks.reference_life_scorecard \
             validate "$output"
+          test "$(find scorecard/shards -maxdepth 1 -type f -name '*.json' | wc -l | tr -d ' ')" = 1
+          test -f "$output"
 
       - name: Upload immutable shard record
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: reference-life-shard-${{ inputs.launch_sha }}-${{ github.run_id }}-${{ matrix.environment }}-${{ matrix.arm }}-${{ matrix.seed }}
-          path: scorecard/shards/*.json
+          path: scorecard/shards/${{ matrix.environment }}__${{ matrix.arm }}__${{ matrix.seed }}.json
           if-no-files-found: error
           retention-days: 90
 
   aggregate:
     name: aggregate and validate
+    if: github.repository == 'elizaOS/asi'
     needs: shards
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -100,10 +107,13 @@ jobs:
         shell: bash
         env:
           LAUNCH_SHA: ${{ inputs.launch_sha }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
         run: |
           set -euo pipefail
           [[ "$LAUNCH_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$GITHUB_REF" = "refs/heads/main"
           test "$GITHUB_SHA" = "$LAUNCH_SHA"
+          test "$WORKFLOW_SHA" = "$LAUNCH_SHA"
           test "$(git rev-parse HEAD)" = "$LAUNCH_SHA"
           test -z "$(git status --short)"
 
@@ -140,6 +150,7 @@ jobs:
           LAUNCH_SHA: ${{ inputs.launch_sha }}
           RUN_ID: ${{ github.run_id }}
           RUN_ATTEMPT: ${{ github.run_attempt }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
         run: |
           set -euo pipefail
           count=$(find scorecard/shards -maxdepth 1 -type f -name '*.json' | wc -l | tr -d ' ')
@@ -192,7 +203,10 @@ jobs:
               "schema": "asi.reference_life_scorecard.github_run.v1",
               "policy": "development_only_permanently_nonpromoting",
               "source": {
+                  "repository": os.environ["GITHUB_REPOSITORY"],
+                  "dispatch_ref": os.environ["GITHUB_REF"],
                   "commit": os.environ["LAUNCH_SHA"],
+                  "workflow_commit": os.environ["WORKFLOW_SHA"],
                   "tree": os.environ["SOURCE_TREE"],
                   "workflow_blob_sha1": os.environ["WORKFLOW_BLOB"],
                   "uv_lock_sha256": os.environ["UV_LOCK_SHA256"],
@@ -230,6 +244,10 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: reference-life-scorecard-${{ inputs.launch_sha }}-${{ github.run_id }}-validated
-          path: scorecard
+          path: |
+            scorecard/plan.json
+            scorecard/artifact.json
+            scorecard/run-receipt.v1.json
+            scorecard/shards/*.json
           if-no-files-found: error
           retention-days: 90
