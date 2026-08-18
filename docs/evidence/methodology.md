@@ -1,7 +1,7 @@
 # Evidence methodology
 
-This guide explains what counts as evidence in Alberta, how evidence is
-promoted, and which Alberta Plan properties have registered scientific
+This guide explains what counts as evidence in ASI, how evidence is promoted,
+and which Alberta Plan properties have registered scientific
 artifacts. It is intentionally not a session log, implementation inventory, or
 live results dashboard.
 
