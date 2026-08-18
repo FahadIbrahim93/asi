@@ -75,3 +75,46 @@ def test_score_evidence_rejects_hostile_without_encode() -> None:
     with pytest.raises((TypeError, ForagerMatchedEvidenceError)):
         parse_matched_score_evidence(hostile)  # type: ignore[arg-type]
     assert _HostileStr.calls == 0
+
+
+def test_protocol_subclass_rejected_without_to_dict_dispatch() -> None:
+    from alberta_framework.benchmarks.forager_matched_evidence import _protocol_instance
+    from alberta_framework.benchmarks.forager_matched_protocol import ForagerMatchedProtocol
+
+    class _HostileProtocol(ForagerMatchedProtocol):  # type: ignore[type-arg]
+        calls = 0
+
+        def to_dict(self) -> dict[str, object]:  # type: ignore[override]
+            type(self).calls += 1
+            raise AssertionError("hostile protocol to_dict")
+
+    hostile = object.__new__(_HostileProtocol)
+    _HostileProtocol.calls = 0
+    with pytest.raises((TypeError, ForagerMatchedEvidenceError)):
+        _protocol_instance(hostile)  # type: ignore[arg-type]
+    assert _HostileProtocol.calls == 0
+
+
+def test_selection_result_subclass_rejected_without_to_dict_dispatch() -> None:
+    from alberta_framework.benchmarks.forager_matched_evidence import (
+        _parse_matched_selection_report_structure,
+    )
+    from alberta_framework.benchmarks.forager_matched_protocol import (
+        ForagerMatchedSelectionResult,
+    )
+
+    class _HostileSelection(ForagerMatchedSelectionResult):  # type: ignore[type-arg]
+        calls = 0
+
+        def to_dict(self) -> dict[str, object]:  # type: ignore[override]
+            type(self).calls += 1
+            raise AssertionError("hostile selection to_dict")
+
+    hostile = object.__new__(_HostileSelection)
+    _HostileSelection.calls = 0
+    with pytest.raises((TypeError, ForagerMatchedEvidenceError)):
+        _parse_matched_selection_report_structure(  # type: ignore[arg-type]
+            {},
+            selection_result=hostile,
+        )
+    assert _HostileSelection.calls == 0
