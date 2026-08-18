@@ -245,7 +245,7 @@ def _validated_wall_clock_seconds(value: object, path: Path | str) -> float:
     message = f"{path}: wall_clock_seconds must be a finite, non-negative number"
     if type(value) is not int and type(value) is not float:
         raise ValueError(message)
-    numeric_value = cast(int | float, value)
+    numeric_value = value
     try:
         wall_clock_seconds = float(numeric_value)
     except (OverflowError, ValueError) as exc:
@@ -7978,7 +7978,7 @@ def _is_finite_json_number(value: object) -> bool:
     if type(value) is not int and type(value) is not float:
         return False
     try:
-        return math.isfinite(float(cast(int | float, value)))
+        return math.isfinite(float(value))
     except (OverflowError, ValueError):
         return False
 
