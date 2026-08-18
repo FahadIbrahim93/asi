@@ -2656,7 +2656,7 @@ def _entrypoint_contract(path: Path, invocation_style: str) -> dict[str, Any]:
         argument_literals.update(
             argument.value
             for argument in node.args
-            if isinstance(argument, ast.Constant) and isinstance(argument.value, str)
+            if type(argument) is ast.Constant and type(argument.value) is str
         )
     required = {
         "alberta_single_seed_v1": {
