@@ -14,6 +14,7 @@ from alberta_framework.benchmarks.ipmnist_screening import (
     l2er_development_result_payload,
     l2er_effective_rank,
     l2er_effective_rank_loss,
+    l2er_effective_rank_transaction,
     l2er_update,
     run_screening_config,
     screening_spec,
@@ -57,6 +58,16 @@ def test_effective_rank_matches_official_entropy_estimator() -> None:
     assert float(l2er_effective_rank(jnp.zeros((4, 3)))) == pytest.approx(1.0)
     huge = jnp.eye(4, dtype=jnp.float32) * jnp.asarray(1e38, dtype=jnp.float32)
     assert float(l2er_effective_rank(huge)) == pytest.approx(4.0, rel=1e-5)
+
+
+def test_effective_rank_preserves_invalidity_in_eager_and_traced_calls() -> None:
+    invalid = jnp.asarray([[jnp.inf]], dtype=jnp.float32)
+    with pytest.raises(ValueError, match="effective rank must be finite"):
+        l2er_effective_rank(invalid)
+    assert bool(jnp.isnan(jax.jit(l2er_effective_rank)(invalid)))
+    safe, valid = jax.jit(l2er_effective_rank_transaction)(invalid)
+    assert float(safe) == 0.0
+    assert not bool(valid)
 
 
 def test_l2_and_mechanism_off_are_exact_reductions() -> None:
