@@ -5,6 +5,7 @@ import copy
 import numpy as np
 import pytest
 
+import alberta_framework.evaluation.bimu_matched_nonpromoting as bimu_plan
 from alberta_framework.evaluation.bimu_matched_nonpromoting import (
     FROZEN_BIMU_MATCHED_PLAN,
     INVALID_PRIOR_ATTEMPT,
@@ -47,6 +48,8 @@ def test_frozen_bimu_plan_is_matched_and_prospective() -> None:
         "numeric_resource_ceiling_bytes": 256 * 1024 * 1024,
     }
     assert payload["comparison_scope"]["paper_comparable"] is False
+    with pytest.raises(TypeError):
+        INVALID_PRIOR_ATTEMPT["seed"] = 157001  # type: ignore[index]
 
 
 def test_manifest_binds_exact_data_source_runtime_and_plan(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -94,3 +97,20 @@ def test_manifest_rejects_hostile_key_without_hooks() -> None:
     with pytest.raises(ValueError, match="exact JSON"):
         validate_bimu_execution_manifest(payload, *_data())
     assert key.calls == 0
+
+
+def test_manifest_rejects_hostile_metaclass_without_hooks() -> None:
+    class HostileMeta(type):
+        calls = 0
+
+        def __eq__(cls, other: object) -> bool:
+            cls.calls += 1
+            raise AssertionError("must not compare runtime types")
+
+    class Hostile(metaclass=HostileMeta):
+        pass
+
+    HostileMeta.calls = 0
+    with pytest.raises(ValueError, match="exact JSON"):
+        bimu_plan._json_preflight({"value": Hostile()})
+    assert HostileMeta.calls == 0

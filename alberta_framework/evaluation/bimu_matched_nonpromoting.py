@@ -9,8 +9,10 @@ import math
 import os
 import platform
 import sys
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Final, cast
 
 import jax
@@ -26,7 +28,7 @@ _MAX_MANIFEST_BYTES = 2 * 1024 * 1024
 _MAX_DATASET_BYTES = 16 * 1024 * 1024
 _DIGEST = "85c681c2f5fc5c274870b30c9accb3d2a6e9eb90a4575a2bf1ccca64f58b6227"
 
-INVALID_PRIOR_ATTEMPT: Final[dict[str, object]] = {
+INVALID_PRIOR_ATTEMPT: Final[Mapping[str, object]] = MappingProxyType({
     "pull_request": 1686,
     "head_commit": "86a67df39781bba77e1a2c47451f646205daee65",
     "seed": 23,
@@ -37,17 +39,25 @@ INVALID_PRIOR_ATTEMPT: Final[dict[str, object]] = {
     ),
     "result_retained": False,
     "seed_reuse_allowed": False,
-    "unmerged_result_sha256": [
+    "unmerged_result_sha256": (
         "9b11c3944379323e33ee067cf80a9f4d772a3af4080f9718cec3b6e1d1e91a23",
         "00faf161ead42d11c8daed668ba96a905ef25baf18b0c77b04bc08e4435c4fa7",
         "0f665cbddf209422456d68835f835c8302a632372e59a0e2518297a41c30a5cb",
-    ],
-    "unmerged_artifact_file_sha256": [
+    ),
+    "unmerged_artifact_file_sha256": (
         "0e313a49c5b2e5fb3b7a4c61c6d2618815432dfc24aac30c64b16777ed1328cb",
         "7da4d6e0411546a39d431bf1d3b6c47372c7c634c372f7133f15481851132daa",
         "2d3a05db3ba2b8af50d522ba13564d82999829f340f426f0f4b1b1389607ade0",
-    ],
-}
+    ),
+})
+
+
+def _invalid_prior_attempt_payload() -> dict[str, object]:
+    """Return the exact JSON form of the immutable invalid-attempt record."""
+    return {
+        key: list(value) if type(value) is tuple else value
+        for key, value in INVALID_PRIOR_ATTEMPT.items()
+    }
 
 
 def _config(*, memory_window: int | None, input_dim: int = 784, n_classes: int = 10,
@@ -184,7 +194,7 @@ def _json_preflight(value: object) -> None:
         elif type(current) is float:
             if not math.isfinite(current):
                 raise ValueError("manifest float must be finite")
-        elif type(current) not in (bool, type(None)):
+        elif type(current) is not bool and type(current) is not type(None):
             raise ValueError("manifest must be an exact JSON tree")
 
 
@@ -222,7 +232,7 @@ def _plan_payload(plan: BiMUMatchedDevelopmentPlan) -> dict[str, object]:
         "candidate_config": checked.candidate_config.to_protocol_payload(),
         "dataset_sha256": checked.dataset_sha256,
         "dataset_selection": checked.dataset_selection,
-        "prior_invalid_attempts": [dict(INVALID_PRIOR_ATTEMPT)],
+        "prior_invalid_attempts": [_invalid_prior_attempt_payload()],
         "matched_axes": [
             "seed", "dataset", "schedule", "observations", "label_queries",
             "optimizer_seen", "model_forward_queries", "initial_state",
