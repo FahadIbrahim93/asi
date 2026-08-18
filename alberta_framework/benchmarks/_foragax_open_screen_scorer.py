@@ -25,6 +25,33 @@ MAX_UNCOMPRESSED_BYTES = 64 * 1024**2
 MAX_REWARD_MEMBER_BYTES = 4 * 1024**2
 
 
+def _require_host_int(name: str, value: object, *, minimum: int) -> int:
+    """Reject bool/float aliases that ordered comparisons treat as legal counts."""
+    if type(name) is not str:
+        raise ValueError("name must be an exact string")
+    if type(value) is not int or value < minimum:
+        raise ValueError(f"{name} must be an integer >= {minimum}")
+    return value
+
+
+def _require_seed_list(seeds: object) -> list[int]:
+    if type(seeds) is not list:
+        raise ValueError("seeds must be a list of built-in integers")
+    canonical = [
+        _require_host_int(f"seeds[{index}]", seed, minimum=0)
+        for index, seed in enumerate(seeds)
+    ]
+    if not canonical or len(canonical) != len(set(canonical)):
+        raise ValueError("seeds must be nonempty and unique")
+    return canonical
+
+
+def _require_payload_root(value: object) -> Path:
+    if not isinstance(value, Path) or not type(value).__module__.startswith("pathlib"):
+        raise ValueError("payload_root must be a pathlib Path")
+    return Path(value)
+
+
 def _sha256_stream(stream: BinaryIO) -> str:
     digest = hashlib.sha256()
     stream.seek(0)
@@ -39,6 +66,7 @@ def _validate_reward_header(
     horizon: int,
     path: Path,
 ) -> None:
+    horizon = _require_host_int("horizon", horizon, minimum=1)
     with archive.open(info, "r") as member:
         version = np.lib.format.read_magic(member)
         if version == (1, 0):
@@ -66,6 +94,7 @@ def _validate_reward_header(
 
 
 def _validate_zip(stream: BinaryIO, path: Path, horizon: int) -> None:
+    horizon = _require_host_int("horizon", horizon, minimum=1)
     stream.seek(0)
     with zipfile.ZipFile(stream, "r") as archive:
         infos = archive.infolist()
@@ -110,6 +139,7 @@ def _load_reward_archive(
     path: Path,
     horizon: int,
 ) -> tuple[np.ndarray, str, int]:
+    horizon = _require_host_int("horizon", horizon, minimum=1)
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(path, flags)
     with os.fdopen(descriptor, "rb") as stream:
@@ -149,10 +179,15 @@ def _load_reward_archive(
 
 def score_rewards(rewards: np.ndarray, horizon: int) -> dict[str, Any]:
     """Compute the frozen scorer with bit-identical arithmetic."""
+    horizon = _require_host_int("horizon", horizon, minimum=1)
+    if type(rewards) is not np.ndarray:
+        raise ValueError("raw rewards must be an exact numpy ndarray")
     if rewards.shape != (horizon,):
         raise ValueError(f"raw reward array must have exact shape ({horizon},)")
     if rewards.dtype.kind not in {"i", "u", "f"}:
         raise ValueError("raw rewards must have a numeric dtype")
+    if rewards.nbytes > MAX_REWARD_MEMBER_BYTES:
+        raise ValueError("raw rewards exceed the scorer byte bound")
     if not bool(np.all(np.isfinite(rewards))):
         raise ValueError("raw rewards must all be finite")
     rewards64 = rewards.astype(np.float64, copy=False)
@@ -191,6 +226,8 @@ def score_rewards(rewards: np.ndarray, horizon: int) -> dict[str, Any]:
 
 
 def _relative(value: str) -> PurePosixPath:
+    if type(value) is not str:
+        raise ValueError("result root must be an exact string")
     path = PurePosixPath(value)
     if (
         not path.parts
@@ -209,6 +246,9 @@ def score_archives(
     seeds: list[int],
     horizon: int,
 ) -> dict[str, Any]:
+    horizon = _require_host_int("horizon", horizon, minimum=1)
+    seeds = _require_seed_list(seeds)
+    payload_root = _require_payload_root(payload_root)
     root = payload_root.resolve(strict=True)
     relative_root = _relative(result_root)
     records: list[dict[str, Any]] = []
