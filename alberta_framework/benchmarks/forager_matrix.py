@@ -528,21 +528,6 @@ class _BatchPlan:
     batch_index: int
     seeds: tuple[int, ...]
 
-    def __post_init__(self) -> None:
-        if type(self.variant_id) is not str or not self.variant_id:
-            raise ForagerMatrixError("variant_id must be a non-empty string")
-        if (
-            type(self.batch_index) is not int
-            or isinstance(self.batch_index, bool)
-            or self.batch_index < 0
-        ):
-            raise ForagerMatrixError("batch_index must be a non-negative integer")
-        if type(self.seeds) is not tuple:
-            raise ForagerMatrixError("seeds must be a tuple")
-        for s in self.seeds:
-            if type(s) is not int or isinstance(s, bool) or s < 0:
-                raise ForagerMatrixError("seeds item must be a non-negative integer")
-
     @property
     def relative_path(self) -> str:
         return f"batches/{self.variant_id}/batch-{self.batch_index:05d}.json"
@@ -571,24 +556,6 @@ class _SourceSnapshot:
     tree_sha256: str
     inventory_sha256: str
     inventory: Mapping[str, Any]
-
-    def __post_init__(self) -> None:
-        if type(self.archive_bytes) is not bytes:
-            raise ForagerMatrixError("archive_bytes must be bytes")
-        for attr in ("archive_sha256", "tree_sha256", "inventory_sha256"):
-            val = getattr(self, attr)
-            if (
-                type(val) is not str
-                or len(val) != 64
-                or any(ch not in "0123456789abcdef" for ch in val)
-            ):
-                raise ForagerMatrixError(
-                    f"{attr} must be a 64-character lowercase hex string"
-                )
-        if hashlib.sha256(self.archive_bytes).hexdigest() != self.archive_sha256:
-            raise ForagerMatrixError("archive_sha256 does not match archive_bytes digest")
-        if not isinstance(self.inventory, Mapping):
-            raise ForagerMatrixError("inventory must be a Mapping")
 
     def metadata(self, source_execution_mode: SourceExecutionMode) -> dict[str, Any]:
         return {
@@ -2020,14 +1987,6 @@ class _BoundPathComponent:
     device: int
     inode: int
 
-    def __post_init__(self) -> None:
-        for attr in ("parent_descriptor", "child_descriptor", "device", "inode"):
-            val = getattr(self, attr)
-            if type(val) is not int or isinstance(val, bool):
-                raise ForagerMatrixStateError(f"{attr} must be an integer")
-        if type(self.name) is not str or not self.name:
-            raise ForagerMatrixStateError("name must be a non-empty string")
-
 
 @dataclass
 class _BoundDirectory:
@@ -2039,33 +1998,6 @@ class _BoundDirectory:
     device: int
     inode: int
     lock_identity: tuple[int, int] | None = None
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.path, Path):
-            raise ForagerMatrixStateError("path must be a Path")
-        for attr in ("root_descriptor", "device", "inode"):
-            val = getattr(self, attr)
-            if type(val) is not int or isinstance(val, bool):
-                raise ForagerMatrixStateError(f"{attr} must be an integer")
-        if type(self.bindings) is not tuple:
-            raise ForagerMatrixStateError("bindings must be a tuple")
-        for binding in self.bindings:
-            if not isinstance(binding, _BoundPathComponent):
-                raise ForagerMatrixStateError(
-                    "bindings item must be a _BoundPathComponent"
-                )
-        if self.lock_identity is not None:
-            if (
-                type(self.lock_identity) is not tuple
-                or len(self.lock_identity) != 2
-                or any(
-                    type(x) is not int or isinstance(x, bool)
-                    for x in self.lock_identity
-                )
-            ):
-                raise ForagerMatrixStateError(
-                    "lock_identity must be None or a tuple of two integers"
-                )
 
     def assert_bound(self) -> None:
         opened = os.fstat(self.root_descriptor)

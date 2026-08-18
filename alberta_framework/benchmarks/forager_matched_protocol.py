@@ -144,14 +144,6 @@ class AllowedTransform:
     value_type: Literal["string", "integer", "number", "boolean", "null"]
     value: TransformValue
 
-    def __post_init__(self) -> None:
-        if type(self.transform_type) is not str or not self.transform_type:
-            raise ForagerMatchedProtocolError("transform_type must be a non-empty string")
-        if type(self.target) is not str or not self.target:
-            raise ForagerMatchedProtocolError("target must be a non-empty string")
-        if self.value_type not in ("string", "integer", "number", "boolean", "null"):
-            raise ForagerMatchedProtocolError("invalid value_type")
-
     def to_dict(self) -> dict[str, Any]:
         return {
             "transform_type": self.transform_type,
@@ -181,18 +173,6 @@ class SourceBinding:
     inventory_sha256: str
     snapshot_descriptor_sha256: str | None
 
-    def __post_init__(self) -> None:
-        if self.provenance_kind not in ("git_tree", "reviewed_snapshot"):
-            raise ForagerMatchedProtocolError(
-                "provenance_kind must be git_tree or reviewed_snapshot"
-            )
-        if type(self.repository) is not str or not self.repository:
-            raise ForagerMatchedProtocolError("repository must be a non-empty string")
-        _require_sha256(self.archive_sha256, "archive_sha256")
-        _require_sha256(self.inventory_sha256, "inventory_sha256")
-        if self.snapshot_descriptor_sha256 is not None:
-            _require_sha256(self.snapshot_descriptor_sha256, "snapshot_descriptor_sha256")
-
     def to_dict(self) -> dict[str, Any]:
         return {
             "provenance_kind": self.provenance_kind,
@@ -213,19 +193,6 @@ class ConfigurationBinding:
     original_sha256: str
     derived_sha256: str
     allowed_transforms: tuple[AllowedTransform, ...]
-
-    def __post_init__(self) -> None:
-        if type(self.original_path) is not str or not self.original_path:
-            raise ForagerMatchedProtocolError("original_path must be a non-empty string")
-        _require_sha256(self.original_sha256, "original_sha256")
-        _require_sha256(self.derived_sha256, "derived_sha256")
-        if type(self.allowed_transforms) is not tuple:
-            raise ForagerMatchedProtocolError("allowed_transforms must be a tuple")
-        for item in self.allowed_transforms:
-            if not isinstance(item, AllowedTransform):
-                raise ForagerMatchedProtocolError(
-                    "allowed_transforms item must be an AllowedTransform"
-                )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -250,20 +217,6 @@ class SeedContract:
     effective_seed_expression: Literal["active_seed", "active_seed_plus_offset"]
     effective_seed_proof_sha256: str
 
-    def __post_init__(self) -> None:
-        if self.transport not in (
-            "direct",
-            "top_level_seed",
-            "nested_experiment_seed_offset",
-            "adapter_injected",
-        ):
-            raise ForagerMatchedProtocolError("invalid transport")
-        if type(self.offset) is not int or isinstance(self.offset, bool):
-            raise ForagerMatchedProtocolError("offset must be an integer")
-        if self.effective_seed_expression not in ("active_seed", "active_seed_plus_offset"):
-            raise ForagerMatchedProtocolError("invalid effective_seed_expression")
-        _require_sha256(self.effective_seed_proof_sha256, "effective_seed_proof_sha256")
-
     def to_dict(self) -> dict[str, Any]:
         return {
             "transport": self.transport,
@@ -280,22 +233,6 @@ class ExecutionSemantics:
     rollout_steps: int | None
     num_rollouts: int | None
     update_semantics: str
-
-    def __post_init__(self) -> None:
-        if self.rollout_steps is not None and (
-            type(self.rollout_steps) is not int
-            or isinstance(self.rollout_steps, bool)
-            or self.rollout_steps <= 0
-        ):
-            raise ForagerMatchedProtocolError("rollout_steps must be positive integer or None")
-        if self.num_rollouts is not None and (
-            type(self.num_rollouts) is not int
-            or isinstance(self.num_rollouts, bool)
-            or self.num_rollouts <= 0
-        ):
-            raise ForagerMatchedProtocolError("num_rollouts must be positive integer or None")
-        if type(self.update_semantics) is not str or not self.update_semantics:
-            raise ForagerMatchedProtocolError("update_semantics must be a non-empty string")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -645,58 +582,6 @@ class SelectionPlan:
     tie_break: Literal["candidate_id_ascending"]
     groups: tuple[SelectionGroup, ...]
 
-    def __post_init__(self) -> None:
-        if type(self.metric) is not str or not self.metric:
-            raise ForagerMatchedProtocolError("metric must be a non-empty string")
-        _require_sha256(self.metric_implementation_sha256, "metric_implementation_sha256")
-        _require_sha256(self.candidate_universe_sha256, "candidate_universe_sha256")
-        if self.direction != "maximize":
-            raise ForagerMatchedProtocolError("direction must be maximize")
-        if self.statistic not in ("mean", "conservative_ci_endpoint"):
-            raise ForagerMatchedProtocolError("invalid statistic")
-        _require_sha256(
-            self.statistic_implementation_sha256,
-            "statistic_implementation_sha256",
-        )
-        if (
-            not isinstance(self.confidence, (int, float))
-            or isinstance(self.confidence, bool)
-            or not math.isfinite(self.confidence)
-            or not (0.0 < self.confidence < 1.0)
-        ):
-            raise ForagerMatchedProtocolError("confidence must be a float in (0.0, 1.0)")
-        if (
-            type(self.bootstrap_resamples) is not int
-            or isinstance(self.bootstrap_resamples, bool)
-            or self.bootstrap_resamples <= 0
-        ):
-            raise ForagerMatchedProtocolError("bootstrap_resamples must be a positive integer")
-        if type(self.bootstrap_seed) is not int or isinstance(self.bootstrap_seed, bool):
-            raise ForagerMatchedProtocolError("bootstrap_seed must be an integer")
-        if self.bootstrap_rng_identity != "numpy_generator_pcg64":
-            raise ForagerMatchedProtocolError("invalid bootstrap_rng_identity")
-        _require_sha256(
-            self.bootstrap_rng_implementation_sha256,
-            "bootstrap_rng_implementation_sha256",
-        )
-        if self.resampling_unit != "candidate_seed_block":
-            raise ForagerMatchedProtocolError("invalid resampling_unit")
-        if self.quantile_method != "linear":
-            raise ForagerMatchedProtocolError("invalid quantile_method")
-        if self.bootstrap_interval != "two_sided_equal_tail":
-            raise ForagerMatchedProtocolError("invalid bootstrap_interval")
-        if self.conservative_endpoint != "lower":
-            raise ForagerMatchedProtocolError("invalid conservative_endpoint")
-        if self.endpoint_quantile != "(1-confidence)/2":
-            raise ForagerMatchedProtocolError("invalid endpoint_quantile")
-        if self.tie_break != "candidate_id_ascending":
-            raise ForagerMatchedProtocolError("invalid tie_break")
-        if type(self.groups) is not tuple:
-            raise ForagerMatchedProtocolError("groups must be a tuple")
-        for group in self.groups:
-            if not isinstance(group, SelectionGroup):
-                raise ForagerMatchedProtocolError("groups item must be a SelectionGroup")
-
     @property
     def slots(self) -> tuple[SelectionSlot, ...]:
         """Return the stage-invariant ordered winner slots."""
@@ -745,25 +630,6 @@ class EvaluationPanel:
     require_complete_blocks: Literal[True]
     pairing_failure_policy: Literal["fail_closed"]
 
-    def __post_init__(self) -> None:
-        if type(self.selection_slots) is not tuple:
-            raise ForagerMatchedProtocolError("selection_slots must be a tuple")
-        for slot in self.selection_slots:
-            if not isinstance(slot, SelectionSlot):
-                raise ForagerMatchedProtocolError("selection_slots item must be a SelectionSlot")
-        if type(self.fixed_descriptive_candidate_ids) is not tuple:
-            raise ForagerMatchedProtocolError("fixed_descriptive_candidate_ids must be a tuple")
-        if not isinstance(self.alberta_primary_slot, SelectionSlot):
-            raise ForagerMatchedProtocolError("alberta_primary_slot must be a SelectionSlot")
-        if not isinstance(self.primary_nonprivileged_external_baseline_slot, SelectionSlot):
-            raise ForagerMatchedProtocolError(
-                "primary_nonprivileged_external_baseline_slot must be a SelectionSlot"
-            )
-        if self.require_complete_blocks is not True:
-            raise ForagerMatchedProtocolError("require_complete_blocks must be True")
-        if self.pairing_failure_policy != "fail_closed":
-            raise ForagerMatchedProtocolError("pairing_failure_policy must be fail_closed")
-
     def to_dict(self) -> dict[str, Any]:
         return {
             "selection_slots": [slot.to_dict() for slot in self.selection_slots],
@@ -789,27 +655,6 @@ class MatchedHypothesis:
     alternative: Literal["greater"]
     difference_order: Literal["intervention_minus_comparator"]
     paired: Literal[True]
-
-    def __post_init__(self) -> None:
-        if type(self.hypothesis_id) is not str or not self.hypothesis_id:
-            raise ForagerMatchedProtocolError("hypothesis_id must be a non-empty string")
-        if not isinstance(self.intervention_slot, SelectionSlot):
-            raise ForagerMatchedProtocolError("intervention_slot must be a SelectionSlot")
-        if not isinstance(self.comparator_slot, SelectionSlot):
-            raise ForagerMatchedProtocolError("comparator_slot must be a SelectionSlot")
-        if self.estimand != "paired_mean_difference":
-            raise ForagerMatchedProtocolError("invalid estimand")
-        if self.method not in (
-            "paired_percentile_bootstrap_lower_bound",
-            "paired_sign_flip",
-        ):
-            raise ForagerMatchedProtocolError("invalid method")
-        if self.alternative != "greater":
-            raise ForagerMatchedProtocolError("invalid alternative")
-        if self.difference_order != "intervention_minus_comparator":
-            raise ForagerMatchedProtocolError("invalid difference_order")
-        if self.paired is not True:
-            raise ForagerMatchedProtocolError("paired must be True")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -837,38 +682,6 @@ class PrimaryBootstrapAnalysis:
     quantile_method: Literal["linear"]
     implementation_sha256: str
     gate: Literal["lower_bound_strictly_greater_than_margin"]
-
-    def __post_init__(self) -> None:
-        if self.method != "paired_percentile_bootstrap_lower_bound":
-            raise ForagerMatchedProtocolError("invalid method")
-        if (
-            type(self.resamples) is not int
-            or isinstance(self.resamples, bool)
-            or self.resamples <= 0
-        ):
-            raise ForagerMatchedProtocolError("resamples must be a positive integer")
-        if type(self.seed) is not int or isinstance(self.seed, bool):
-            raise ForagerMatchedProtocolError("seed must be an integer")
-        if (
-            not isinstance(self.confidence, (int, float))
-            or isinstance(self.confidence, bool)
-            or not math.isfinite(self.confidence)
-            or not (0.0 < self.confidence < 1.0)
-        ):
-            raise ForagerMatchedProtocolError("confidence must be a float in (0.0, 1.0)")
-        if (
-            not isinstance(self.primary_margin, (int, float))
-            or isinstance(self.primary_margin, bool)
-            or not math.isfinite(self.primary_margin)
-        ):
-            raise ForagerMatchedProtocolError("primary_margin must be a finite float")
-        if self.rng_algorithm != "PCG64":
-            raise ForagerMatchedProtocolError("invalid rng_algorithm")
-        if self.quantile_method != "linear":
-            raise ForagerMatchedProtocolError("invalid quantile_method")
-        _require_sha256(self.implementation_sha256, "implementation_sha256")
-        if self.gate != "lower_bound_strictly_greater_than_margin":
-            raise ForagerMatchedProtocolError("invalid gate")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -898,34 +711,6 @@ class SecondarySignFlipAnalysis:
     multiplicity_method: Literal["holm"]
     familywise_alpha: float
 
-    def __post_init__(self) -> None:
-        if self.method != "paired_sign_flip":
-            raise ForagerMatchedProtocolError("invalid method")
-        if (
-            type(self.monte_carlo_resamples) is not int
-            or isinstance(self.monte_carlo_resamples, bool)
-            or self.monte_carlo_resamples <= 0
-        ):
-            raise ForagerMatchedProtocolError("monte_carlo_resamples must be a positive integer")
-        if type(self.seed) is not int or isinstance(self.seed, bool):
-            raise ForagerMatchedProtocolError("seed must be an integer")
-        if self.exact_max_pairs != 20 or type(self.exact_max_pairs) is not int:
-            raise ForagerMatchedProtocolError("exact_max_pairs must be 20")
-        if self.rng_algorithm != "PCG64":
-            raise ForagerMatchedProtocolError("invalid rng_algorithm")
-        _require_sha256(self.implementation_sha256, "implementation_sha256")
-        if self.alternative != "greater":
-            raise ForagerMatchedProtocolError("invalid alternative")
-        if self.multiplicity_method != "holm":
-            raise ForagerMatchedProtocolError("invalid multiplicity_method")
-        if (
-            not isinstance(self.familywise_alpha, (int, float))
-            or isinstance(self.familywise_alpha, bool)
-            or not math.isfinite(self.familywise_alpha)
-            or not (0.0 < self.familywise_alpha < 1.0)
-        ):
-            raise ForagerMatchedProtocolError("familywise_alpha must be a float in (0.0, 1.0)")
-
     def to_dict(self) -> dict[str, Any]:
         return {
             "method": self.method,
@@ -949,17 +734,6 @@ class MatchedAnalysisPlan:
     metric_direction: Literal["maximize"]
     primary: PrimaryBootstrapAnalysis
     secondary: SecondarySignFlipAnalysis
-
-    def __post_init__(self) -> None:
-        if type(self.metric) is not str or not self.metric:
-            raise ForagerMatchedProtocolError("metric must be a non-empty string")
-        _require_sha256(self.metric_implementation_sha256, "metric_implementation_sha256")
-        if self.metric_direction != "maximize":
-            raise ForagerMatchedProtocolError("metric_direction must be maximize")
-        if not isinstance(self.primary, PrimaryBootstrapAnalysis):
-            raise ForagerMatchedProtocolError("primary must be a PrimaryBootstrapAnalysis")
-        if not isinstance(self.secondary, SecondarySignFlipAnalysis):
-            raise ForagerMatchedProtocolError("secondary must be a SecondarySignFlipAnalysis")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -1056,24 +830,6 @@ class ForagerMatchedSelectionResult:
     tuning_seeds: tuple[int, ...]
     ranked_groups: tuple[RankedSelectionGroup, ...]
 
-    def __post_init__(self) -> None:
-        if self.schema_version != "alberta.forager_matched_selection_result.v1":
-            raise ForagerMatchedProtocolError("invalid schema_version")
-        _require_sha256(self.open_protocol_sha256, "open_protocol_sha256")
-        _require_sha256(self.selection_plan_sha256, "selection_plan_sha256")
-        if type(self.tuning_seeds) is not tuple:
-            raise ForagerMatchedProtocolError("tuning_seeds must be a tuple")
-        for seed in self.tuning_seeds:
-            if type(seed) is not int or isinstance(seed, bool):
-                raise ForagerMatchedProtocolError("tuning_seeds item must be an integer")
-        if type(self.ranked_groups) is not tuple:
-            raise ForagerMatchedProtocolError("ranked_groups must be a tuple")
-        for group in self.ranked_groups:
-            if not isinstance(group, RankedSelectionGroup):
-                raise ForagerMatchedProtocolError(
-                    "ranked_groups item must be a RankedSelectionGroup"
-                )
-
     def to_dict(self) -> dict[str, Any]:
         return {
             "schema_version": self.schema_version,
@@ -1103,21 +859,6 @@ class ResolvedHypothesis:
     alternative: Literal["greater"]
     difference_order: Literal["intervention_minus_comparator"]
 
-    def __post_init__(self) -> None:
-        for attr in ("hypothesis_id", "intervention_candidate_id", "comparator_candidate_id"):
-            val = getattr(self, attr)
-            if type(val) is not str or not val:
-                raise ForagerMatchedProtocolError(f"{attr} must be a non-empty string")
-        if self.method not in (
-            "paired_percentile_bootstrap_lower_bound",
-            "paired_sign_flip",
-        ):
-            raise ForagerMatchedProtocolError("invalid method")
-        if self.alternative != "greater":
-            raise ForagerMatchedProtocolError("invalid alternative")
-        if self.difference_order != "intervention_minus_comparator":
-            raise ForagerMatchedProtocolError("invalid difference_order")
-
     def comparison_spec_payload(self) -> dict[str, str]:
         """Return the exact explicit-ID payload consumed by statistics ComparisonSpec."""
         return {
@@ -1141,45 +882,6 @@ class SealedProtocolValidation:
     primary_comparator_candidate_id: str
     resolved_hypotheses: tuple[ResolvedHypothesis, ...]
 
-    def __post_init__(self) -> None:
-        _require_sha256(self.open_protocol_sha256, "open_protocol_sha256")
-        _require_sha256(self.selection_result_sha256, "selection_result_sha256")
-        if type(self.resolved_slots) is not tuple:
-            raise ForagerMatchedProtocolError("resolved_slots must be a tuple")
-        for slot in self.resolved_slots:
-            if not isinstance(slot, ResolvedSelectionSlot):
-                raise ForagerMatchedProtocolError(
-                    "resolved_slots item must be a ResolvedSelectionSlot"
-                )
-        if type(self.evaluation_candidate_ids) is not tuple:
-            raise ForagerMatchedProtocolError("evaluation_candidate_ids must be a tuple")
-        for cid in self.evaluation_candidate_ids:
-            if type(cid) is not str or not cid:
-                raise ForagerMatchedProtocolError(
-                    "evaluation_candidate_ids item must be non-empty string"
-                )
-        if (
-            type(self.primary_intervention_candidate_id) is not str
-            or not self.primary_intervention_candidate_id
-        ):
-            raise ForagerMatchedProtocolError(
-                "primary_intervention_candidate_id must be non-empty string"
-            )
-        if (
-            type(self.primary_comparator_candidate_id) is not str
-            or not self.primary_comparator_candidate_id
-        ):
-            raise ForagerMatchedProtocolError(
-                "primary_comparator_candidate_id must be non-empty string"
-            )
-        if type(self.resolved_hypotheses) is not tuple:
-            raise ForagerMatchedProtocolError("resolved_hypotheses must be a tuple")
-        for h in self.resolved_hypotheses:
-            if not isinstance(h, ResolvedHypothesis):
-                raise ForagerMatchedProtocolError(
-                    "resolved_hypotheses item must be a ResolvedHypothesis"
-                )
-
 
 @dataclass(frozen=True)
 class MultiplicityPolicy:
@@ -1189,24 +891,6 @@ class MultiplicityPolicy:
     alpha: float
     hypothesis_ids: tuple[str, ...]
     primary_excluded: Literal[True]
-
-    def __post_init__(self) -> None:
-        if self.method != "holm":
-            raise ForagerMatchedProtocolError("invalid method")
-        if (
-            not isinstance(self.alpha, (int, float))
-            or isinstance(self.alpha, bool)
-            or not math.isfinite(self.alpha)
-            or not (0.0 < self.alpha < 1.0)
-        ):
-            raise ForagerMatchedProtocolError("alpha must be a float in (0.0, 1.0)")
-        if type(self.hypothesis_ids) is not tuple:
-            raise ForagerMatchedProtocolError("hypothesis_ids must be a tuple")
-        for hid in self.hypothesis_ids:
-            if type(hid) is not str or not hid:
-                raise ForagerMatchedProtocolError("hypothesis_ids item must be a non-empty string")
-        if self.primary_excluded is not True:
-            raise ForagerMatchedProtocolError("primary_excluded must be True")
 
     def to_dict(self) -> dict[str, Any]:
         return {
