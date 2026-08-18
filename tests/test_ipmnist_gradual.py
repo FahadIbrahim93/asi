@@ -87,6 +87,7 @@ def test_input_interpolation_is_outer_jit_safe() -> None:
     safe, valid = transact(jnp.array([jnp.inf]), jnp.array([2.0]))
     np.testing.assert_array_equal(safe, jnp.zeros(1))
     assert not bool(valid)
+    assert bool(jnp.all(jnp.isnan(interpolate(jnp.array([jnp.inf]), jnp.array([2.0])))))
 
 
 def test_input_interpolation_rejects_array_protocol_objects_without_calling_them() -> None:

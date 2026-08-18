@@ -71,6 +71,17 @@ def test_bimu_update_is_outer_jit_safe() -> None:
         assert bool(jnp.all(jnp.isfinite(safe)))
         assert not bool(valid)
 
+    invalid_update = update(jnp.array([jnp.nan, 0.0]), jnp.ones(2), jnp.zeros(2))
+    assert bool(jnp.all(jnp.isnan(invalid_update)))
+
+    posterior = jax.jit(posterior_probability)
+    assert bool(jnp.all(jnp.isnan(posterior(jnp.array([jnp.nan])))))
+    posterior_safe, posterior_valid = jax.jit(posterior_probability_transaction)(
+        jnp.array([jnp.nan])
+    )
+    np.testing.assert_array_equal(posterior_safe, jnp.array([0.5]))
+    assert not bool(posterior_valid)
+
 
 def test_bimu_rejects_array_protocol_object_without_calling_it() -> None:
     class Hostile:
@@ -104,3 +115,20 @@ def test_bimu_float32_overflow_is_invalid_not_laundered() -> None:
     )
     np.testing.assert_array_equal(finite_posterior, [0.5])
     assert not bool(finite_valid)
+
+
+def test_late_window_mean_does_not_hash_hostile_runtime_types() -> None:
+    class HostileMeta(type):
+        def __hash__(cls) -> int:
+            raise AssertionError("hostile metaclass hash must not run")
+
+    class HostileContainer(metaclass=HostileMeta):
+        pass
+
+    class HostileNumber(metaclass=HostileMeta):
+        pass
+
+    with pytest.raises(ValueError, match="exact bounded list or tuple"):
+        late_window_mean(HostileContainer())  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="exact real numbers"):
+        late_window_mean([HostileNumber()] * 5)  # type: ignore[list-item]
