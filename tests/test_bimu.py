@@ -268,6 +268,15 @@ def test_runner_replays_schedule_metrics_and_state_from_same_seed() -> None:
     assert first["counters"] == second["counters"]
 
 
+def test_runner_rejects_finite_overflow_before_transaction_commit() -> None:
+    train_x, train_y, test_x, test_y = _tiny_data()
+    train_x = np.full_like(train_x, np.finfo(np.float32).max)
+    with pytest.raises(ValueError, match="transaction"):
+        run_bimu_development(
+            train_x, train_y, test_x, test_y, config=_tiny_config(), seed=4
+        )
+
+
 def test_no_query_schedule_performs_no_updates() -> None:
     config = _tiny_config(query_threshold=1.0, memory_window=None)
     payload = run_bimu_development(*_tiny_data(), config=config, seed=5)

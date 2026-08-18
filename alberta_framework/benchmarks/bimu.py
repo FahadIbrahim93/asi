@@ -590,9 +590,9 @@ def _concrete_mean_gradient(
 
 
 @partial(jax.jit, static_argnames=("n_samples",))
-def _binary_predictions(
+def _binary_predictions_transaction(
     state: BiMUState, features: Array, key: Array, *, n_samples: int
-) -> Array:
+) -> tuple[Array, Array]:
     keys = jr.split(key, n_samples)
     logits = jnp.stack(
         [
@@ -602,7 +602,10 @@ def _binary_predictions(
             for item in keys
         ]
     )
-    return jnp.argmax(logits, axis=1)
+    valid = jnp.all(jnp.isfinite(logits))
+    predictions = jnp.argmax(logits, axis=1)
+    safe = jnp.where(valid, predictions, -jnp.ones_like(predictions))
+    return safe, valid
 
 
 def _majority_prediction(predictions: Array, n_classes: int) -> tuple[int, float]:
@@ -794,7 +797,19 @@ def _dataset_sha256(
 
 
 def _implementation_sha256() -> str:
-    return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+    framework_root = Path(__file__).resolve().parents[1]
+    digest = hashlib.sha256(b"asi.bimu.implementation-scope.v1\x00")
+    for relative in ("benchmarks/bimu.py", "_seed_validation.py"):
+        path = framework_root / relative
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(f"BiMU source inventory entry is unavailable: {relative}")
+        payload = path.read_bytes()
+        if len(payload) > _MAX_JSON_BYTES:
+            raise ValueError(f"BiMU source inventory entry exceeds its bound: {relative}")
+        digest.update(relative.encode("ascii"))
+        digest.update(len(payload).to_bytes(8, "big"))
+        digest.update(payload)
+    return digest.hexdigest()
 
 
 def _json_preflight(value: object) -> None:
@@ -887,6 +902,7 @@ def _runtime_identity() -> dict[str, object]:
         "platform": sys.platform,
         "machine": platform.machine(),
         "packages": {
+            "chex": importlib.metadata.version("chex"),
             "jax": jax.__version__,
             "jaxlib": importlib.metadata.version("jaxlib"),
             "numpy": np.__version__,
@@ -898,6 +914,8 @@ def _runtime_identity() -> dict[str, object]:
         "jax_default_matmul_precision": str(jax.config.jax_default_matmul_precision),
         "jax_random_seed_offset": int(jax.config.jax_random_seed_offset),
         "jax_threefry_partitionable": bool(jax.config.jax_threefry_partitionable),
+        "jax_numpy_dtype_promotion": str(jax.config.jax_numpy_dtype_promotion),
+        "jax_numpy_rank_promotion": str(jax.config.jax_numpy_rank_promotion),
         "environment": {name: os.environ.get(name) for name in environment_names},
         "consistency_not_attestation": True,
     }
@@ -986,12 +1004,13 @@ def run_bimu_development(
             features = jnp.asarray(train_x[int(example_index), permutation], dtype=jnp.float32)
             label = int(train_y[int(example_index)])
             query_key = jr.fold_in(root, _QUERY_DOMAIN + global_step)
-            predictions = _binary_predictions(
+            predictions, prediction_valid = _binary_predictions_transaction(
                 state, features, query_key, n_samples=config.query_samples
             )
             prediction_values = np.asarray(predictions)
             if (
-                prediction_values.shape != (config.query_samples,)
+                not bool(prediction_valid)
+                or prediction_values.shape != (config.query_samples,)
                 or not np.all((prediction_values >= 0) & (prediction_values < config.n_classes))
             ):
                 raise ValueError("BiMU query prediction transaction is invalid")
@@ -1031,7 +1050,7 @@ def run_bimu_development(
         task_correct = 0
         for test_index in range(config.test_examples_per_task):
             features = jnp.asarray(test_x[test_index, permutation], dtype=jnp.float32)
-            predictions = _binary_predictions(
+            predictions, prediction_valid = _binary_predictions_transaction(
                 state,
                 features,
                 jr.fold_in(
@@ -1042,7 +1061,8 @@ def run_bimu_development(
             )
             prediction_values = np.asarray(predictions)
             if (
-                prediction_values.shape != (config.test_samples,)
+                not bool(prediction_valid)
+                or prediction_values.shape != (config.test_samples,)
                 or not np.all((prediction_values >= 0) & (prediction_values < config.n_classes))
             ):
                 raise ValueError("BiMU test prediction transaction is invalid")
