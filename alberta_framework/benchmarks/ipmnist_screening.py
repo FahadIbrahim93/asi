@@ -183,6 +183,16 @@ from alberta_framework.benchmarks.replay_frozen_ipmnist import (
     make_replay_context_learner,
     replay_hyperparameters,
 )
+from alberta_framework.benchmarks.noise_curvature_ipmnist import (
+    PAPER_REVISION as NOISE_CURVATURE_PAPER_REVISION,
+)
+from alberta_framework.benchmarks.noise_curvature_ipmnist import (
+    NoiseCurvatureConfig,
+    NoiseCurvatureState,
+    init_noise_curvature_state,
+    noise_curvature_persistent_bytes,
+    noise_curvature_step,
+)
 from alberta_framework.benchmarks.upgd_ipmnist import (
     _PLASTICITY_LOSS_FLOOR,
     ADAMW_PROTOCOL_HYPERPARAMETERS,
@@ -263,6 +273,33 @@ from alberta_framework.evaluation.l2er_ipmnist_nonpromoting import (
 )
 from alberta_framework.evaluation.l2er_ipmnist_nonpromoting import (
     validate_l2er_development_result,
+)
+from alberta_framework.evaluation.noise_curvature_ipmnist_nonpromoting import (
+    COMPARISON_ID as NOISE_CURVATURE_COMPARISON_ID,
+)
+from alberta_framework.evaluation.noise_curvature_ipmnist_nonpromoting import (
+    DEVELOPMENT_SEEDS as NOISE_CURVATURE_DEVELOPMENT_SEEDS,
+)
+from alberta_framework.evaluation.noise_curvature_ipmnist_nonpromoting import (
+    LIVE_CONTROL as NOISE_CURVATURE_LIVE_CONTROL,
+)
+from alberta_framework.evaluation.noise_curvature_ipmnist_nonpromoting import (
+    OFFICIAL_CODE_STATUS as NOISE_CURVATURE_OFFICIAL_CODE_STATUS,
+)
+from alberta_framework.evaluation.noise_curvature_ipmnist_nonpromoting import (
+    PROTOCOL_DIFFERENCES as NOISE_CURVATURE_PROTOCOL_DIFFERENCES,
+)
+from alberta_framework.evaluation.noise_curvature_ipmnist_nonpromoting import (
+    RESULT_SCHEMA as NOISE_CURVATURE_RESULT_SCHEMA,
+)
+from alberta_framework.evaluation.noise_curvature_ipmnist_nonpromoting import (
+    registered_arms as noise_curvature_registered_arms,
+)
+from alberta_framework.evaluation.noise_curvature_ipmnist_nonpromoting import (
+    registered_hyperparameters as noise_curvature_registered_hyperparameters,
+)
+from alberta_framework.evaluation.noise_curvature_ipmnist_nonpromoting import (
+    validate_noise_curvature_development_result,
 )
 from alberta_framework.evaluation.recurring_ipmnist_retention import (
     RecurringIPMNISTPhase,
@@ -957,6 +994,73 @@ def _make_bounded_structure_learner(
             1.0 - loss_after / jnp.maximum(loss, _PLASTICITY_LOSS_FLOOR), 0.0, 1.0
         )
         return new_params, new_state, (accuracy, loss, plasticity)
+
+    return init_fn, full_step
+
+
+_NOISE_CURVATURE_MODE_NAMES = {
+    0.0: "fixed",
+    1.0: "gradient_only",
+    2.0: "volatility_only",
+    3.0: "combined",
+}
+
+
+def _make_noise_curvature_learner(
+    hp: Mapping[str, float], *, total_steps: int = 1_000_000
+) -> tuple[LearnerInitFn, ScreeningStepFn]:
+    """Adapt arXiv:2509.19698v3 to the current online IPMNIST MLP."""
+
+    if type(total_steps) is not int or not 1 <= total_steps <= (1 << 31) - 1:
+        raise ValueError("total_steps must be an exact positive signed-int32 integer")
+    if type(hp) is not dict:
+        raise ValueError("noise-curvature hyperparameters must be an exact object")
+    mode_value = hp.get("controller_mode")
+    if type(mode_value) is not float or mode_value not in _NOISE_CURVATURE_MODE_NAMES:
+        raise ValueError("controller_mode must identify one registered scheduler arm")
+    mode = _NOISE_CURVATURE_MODE_NAMES[mode_value]
+    arm = noise_curvature_registered_arms()[int(mode_value)]
+    expected = noise_curvature_registered_hyperparameters(arm)
+    if hp != expected or any(type(value) is not float for value in hp.values()):
+        raise ValueError("hyperparameters do not match the registered scheduler arm")
+    config = NoiseCurvatureConfig(
+        mode=mode,  # type: ignore[arg-type]
+        total_steps=total_steps,
+        control_interval=int(hp["control_interval"]),
+        power_iterations=int(hp["power_iterations"]),
+        base_step_size=hp["step_size"],
+        beta1=hp["beta1"],
+        beta2=hp["beta2"],
+        adam_epsilon=hp["eps"],
+        weight_decay=hp["weight_decay"],
+        ema_decay=hp["ema_decay"],
+        volatility_epsilon=hp["volatility_epsilon"],
+        volatility_inflation=hp["volatility_inflation"],
+        volatility_kappa=hp["volatility_kappa"],
+        safety_factor=hp["safety_factor"],
+        cool_rate=hp["cool_rate"],
+        warm_rate=hp["warm_rate"],
+        warm_fraction=hp["warm_fraction"],
+        timid_fraction=hp["timid_fraction"],
+        effective_step_floor=hp["effective_step_floor"],
+    )
+
+    def init_fn(params: dict[str, Array]) -> Any:
+        return init_noise_curvature_state(params, config)
+
+    def full_step(
+        params: dict[str, Array], state: Any, x: Array, y: Array, key: Array
+    ) -> tuple[dict[str, Array], Any, StepMetrics]:
+        del key
+        (loss, logits), grads = jax.value_and_grad(cross_entropy_loss, has_aux=True)(
+            params, x, y
+        )
+        new_params, new_state = noise_curvature_step(
+            params, state, grads, x, y, cross_entropy_loss, config
+        )
+        return new_params, new_state, _step_metrics(new_params, x, y, loss, logits)
+
+    return init_fn, full_step
 
     return init_fn, full_step
 
@@ -8214,6 +8318,36 @@ def _build_registry() -> dict[str, ScreeningSpec]:
                 ),
             )
         )
+    noise_curvature_descriptions = {
+        "noise_curvature_fixed_adam_l2": (
+            "Mechanism-off AdamW+L2 conditioning control; all diagnostics remain "
+            "executed and charged but cannot change a layer learning rate."
+        ),
+        "noise_curvature_gradient_only": (
+            "Gradient-noise-only Eq. 2 ablation (curvature inflation beta=0)."
+        ),
+        "noise_curvature_volatility_only": (
+            "Curvature-volatility-only Eq. 1 inverse-bound ablation."
+        ),
+        "noise_curvature_combined": (
+            "Joint layerwise gradient-noise and curvature-volatility Eq. 2 scheduler."
+        ),
+    }
+    for arm_name in noise_curvature_registered_arms():
+        specs.append(
+            ScreeningSpec(
+                name=arm_name,
+                base_learner="adamw",
+                mechanism="noise_curvature_scheduler",
+                hyperparameters=noise_curvature_registered_hyperparameters(arm_name),
+                factory=_make_noise_curvature_learner,
+                description=(
+                    noise_curvature_descriptions[arm_name]
+                    + " Adapted from arXiv:2509.19698v3 to the current online "
+                    "IPMNIST runner with a charged rolling diagnostic minibatch."
+                ),
+            )
+        )
     return {spec.name: spec for spec in specs}
 
 
@@ -10162,6 +10296,79 @@ def replay_frozen_development_result_payload(
     return validate_replay_frozen_result(payload)
 
 
+def noise_curvature_development_result_payload(
+    result: ScreeningRunResult, *, outcome: str
+) -> dict[str, object]:
+    """Build and strictly validate one nonpromoting scheduler receipt."""
+
+    spec = screening_spec(result.config_name)
+    if spec.mechanism != "noise_curvature_scheduler" or result.noise_mode != "step":
+        raise ValueError(
+            "a noise-curvature receipt requires an exact-step registered scheduler arm"
+        )
+    if result.hyperparameters != spec.hyperparameters:
+        raise ValueError("result hyperparameters drift from the registered scheduler arm")
+    config = result.config
+    observations = config.n_tasks * config.task_length
+    interval = int(spec.hyperparameters["control_interval"])
+    power_iterations = int(spec.hyperparameters["power_iterations"])
+    if config.task_length % interval:
+        raise ValueError("task_length must be divisible by control_interval")
+    controller_events = observations // interval
+    first_order_queries = observations + controller_events * interval
+    loss_queries = observations
+    hvp_queries = controller_events * 3 * power_iterations
+    persistent_bytes = noise_curvature_persistent_bytes(
+        parameter_count=config.parameter_count,
+        input_dim=config.input_dim,
+        control_interval=interval,
+    )
+    payload: dict[str, object] = {
+        "schema": NOISE_CURVATURE_RESULT_SCHEMA,
+        "comparison_id": NOISE_CURVATURE_COMPARISON_ID,
+        "paper_revision": NOISE_CURVATURE_PAPER_REVISION,
+        "official_code_status": NOISE_CURVATURE_OFFICIAL_CODE_STATUS,
+        "protocol_differences": list(NOISE_CURVATURE_PROTOCOL_DIFFERENCES),
+        "live_control": NOISE_CURVATURE_LIVE_CONTROL,
+        "arm": result.config_name,
+        "seed": result.seed,
+        "development_seed_protocol": list(NOISE_CURVATURE_DEVELOPMENT_SEEDS),
+        "n_tasks": config.n_tasks,
+        "task_length": config.task_length,
+        "input_dim": config.input_dim,
+        "hidden1": config.hidden1,
+        "hidden2": config.hidden2,
+        "n_classes": config.n_classes,
+        "observations": observations,
+        "updates": observations,
+        "allowed_boundary_information": [],
+        "allowed_task_information": ["current_example_label"],
+        "hyperparameters": dict(spec.hyperparameters),
+        "metrics": {
+            "mean_online_accuracy": float(np.mean(result.per_task_accuracy)),
+            "mean_loss": float(np.mean(result.per_task_loss)),
+            "mean_plasticity": float(np.mean(result.per_task_plasticity)),
+        },
+        "resources": {
+            "persistent_bytes": persistent_bytes,
+            "environment_steps": 0,
+            "data_steps": observations,
+            "model_queries": first_order_queries + loss_queries + hvp_queries,
+            "first_order_gradient_queries": first_order_queries,
+            "loss_only_queries": loss_queries,
+            "hessian_vector_product_queries": hvp_queries,
+            "controller_events": controller_events,
+            "timing_seconds": float(result.wall_clock_seconds),
+            "timing_is_telemetry_only": True,
+        },
+        "outcome": outcome,
+        "outcome_retained": True,
+        "development_only": True,
+        "scientific_promotion_allowed": False,
+    }
+    return validate_noise_curvature_development_result(payload)
+
+
 def run_screening_config(
     data_x: np.ndarray | Array,
     data_y: np.ndarray | Array,
@@ -10213,6 +10420,13 @@ def run_screening_config(
             raise ValueError("Intentional Updates persistent state exceeds 256 MiB")
     if spec.name.startswith("bounded_") and config.task_length != 5000:
         raise ValueError("bounded structure arms require the registered task_length=5000")
+    if spec.mechanism == "noise_curvature_scheduler":
+        interval = int(spec.hyperparameters["control_interval"])
+        if config.task_length % interval:
+            raise ValueError(
+                "noise-curvature scheduling requires task_length divisible by "
+                "control_interval"
+            )
     effective_noise_pool_steps = _validated_screening_noise_pool_steps(
         noise_mode,
         noise_pool_steps if noise_mode == "pool" else None,
@@ -10228,7 +10442,12 @@ def run_screening_config(
     data_y = jnp.asarray(resolved_y, dtype=jnp.int32)
     n_train = int(data_x.shape[0])
 
-    init_fn, step_fn = spec.factory(spec.hyperparameters)
+    if spec.mechanism == "noise_curvature_scheduler":
+        init_fn, step_fn = _make_noise_curvature_learner(
+            spec.hyperparameters, total_steps=config.n_steps
+        )
+    else:
+        init_fn, step_fn = spec.factory(spec.hyperparameters)
 
     root = jr.key(jnp.uint32(resolved_seed))
     key_init, key_schedule, key_noise = jr.split(root, 3)
@@ -10320,6 +10539,14 @@ def run_screening_config(
         if spec.mechanism == "l2_effective_rank":
             if type(state) is not L2ERState or not bool(state.transaction_valid):
                 raise RuntimeError("L2-ER update transaction became invalid")
+        if spec.mechanism == "noise_curvature_scheduler":
+            if not isinstance(state, NoiseCurvatureState):
+                raise RuntimeError("noise-curvature learner returned an invalid state")
+            failures = int(jax.device_get(state.diagnostic_failures))
+            if failures:
+                raise RuntimeError(
+                    "noise-curvature diagnostics became non-finite; refusing a result"
+                )
         task_accuracy.append(float(jnp.mean(accuracies)))
         task_loss.append(float(jnp.mean(losses)))
         task_plasticity.append(float(jnp.mean(plasticities)))
