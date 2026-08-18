@@ -35,6 +35,22 @@ class _StringSubclass(str):
     pass
 
 
+class _HostileType(type):
+    calls = 0
+
+    def __hash__(cls) -> int:  # pragma: no cover - must not execute
+        type(cls).calls += 1
+        raise AssertionError("metaclass hash hook")
+
+    def __eq__(cls, other: object) -> bool:  # pragma: no cover - must not execute
+        type(cls).calls += 1
+        raise AssertionError("metaclass equality hook")
+
+
+class _HostileTypedValue(metaclass=_HostileType):
+    pass
+
+
 def test_rejects_bool() -> None:
     with pytest.raises(TypeError, match="actual non-bool real"):
         round_real_to_float32(True)
@@ -128,6 +144,15 @@ def test_rejects_class_spoof_without_invoking_class_property() -> None:
     with pytest.raises(TypeError, match="actual non-bool real"):
         round_real_to_float32(ClassSpoof())
     assert calls == 0
+
+
+def test_rejects_before_hostile_metaclass_dispatch() -> None:
+    _HostileType.calls = 0
+    with pytest.raises(TypeError, match="actual non-bool real"):
+        round_real_to_float32(_HostileTypedValue())
+    with pytest.raises(ValueError, match="finite real"):
+        validated_float32_scalar("value", _HostileTypedValue())
+    assert _HostileType.calls == 0
 
 
 @pytest.mark.parametrize(
