@@ -32,6 +32,22 @@ class _HostileFloat(float):
         raise AssertionError("hostile float bool")
 
 
+class _HostileDict(dict[str, object]):
+    calls = 0
+
+    def items(self):  # type: ignore[no-untyped-def]
+        type(self).calls += 1
+        raise AssertionError("hostile mapping iteration")
+
+
+class _HostileList(list[object]):
+    calls = 0
+
+    def __iter__(self):  # type: ignore[no-untyped-def]
+        type(self).calls += 1
+        raise AssertionError("hostile list iteration")
+
+
 def test_flatten_json_rejects_hostile_str_before_dispatch() -> None:
     from alberta_framework.benchmarks.forager_results import _flatten_json
 
@@ -63,6 +79,16 @@ def test_flatten_json_rejects_hostile_float_before_isfinite() -> None:
     assert math.isfinite(1.0)
     with pytest.raises(ValueError, match="must be finite"):
         _flatten_json(float("inf"), prefix="p")
+
+
+@pytest.mark.parametrize("hostile", (_HostileDict({"x": 1}), _HostileList([1])))
+def test_flatten_json_rejects_container_subclasses_without_hooks(hostile: object) -> None:
+    from alberta_framework.benchmarks.forager_results import _flatten_json
+
+    type(hostile).calls = 0
+    with pytest.raises(ValueError, match="unsupported config hyperparameter"):
+        _flatten_json(hostile, prefix="p")
+    assert type(hostile).calls == 0
 
 
 def test_hostile_not_in_error_message() -> None:

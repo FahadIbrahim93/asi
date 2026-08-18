@@ -189,7 +189,7 @@ def _text_sha256(lines: Sequence[str]) -> str:
 
 def _flatten_json(value: Any, *, prefix: str = "") -> dict[str, Any]:
     """Match the dotted hyperparameter keys emitted by PyExpUtils v7."""
-    if isinstance(value, Mapping):
+    if type(value) in (dict, MappingProxyType):
         flattened: dict[str, Any] = {}
         for key, child in value.items():
             if type(key) is not str or not key:
@@ -197,7 +197,7 @@ def _flatten_json(value: Any, *, prefix: str = "") -> dict[str, Any]:
             child_prefix = f"{prefix}.{key}" if prefix else key
             flattened.update(_flatten_json(child, prefix=child_prefix))
         return flattened
-    if isinstance(value, list):
+    if type(value) is list:
         if not value:
             raise ValueError("legacy FOV configs with empty list hyperparameters are unsupported")
         flattened = {}
