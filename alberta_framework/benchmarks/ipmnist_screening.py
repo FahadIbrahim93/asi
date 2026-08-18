@@ -241,6 +241,11 @@ VALIDATION_SCHEMA = "alberta.ipmnist_screening.proxy_validation.v2"
 SOURCE_PROVENANCE_SCHEMA = "alberta.ipmnist_screening.source_provenance.v1"
 DATASET_PROVENANCE_SCHEMA = "alberta.ipmnist_screening.dataset_provenance.v1"
 RUNTIME_SCHEMA = "alberta.ipmnist_screening.runtime.v1"
+PARTIAL_RESET_RECORD_SCHEMA = "asi.ipmnist.calibrated_partial_reset.development.v1"
+CPR_PAPER_REVISION = "arXiv:2607.24996v1"
+CPR_OFFICIAL_CODE_REVISION = (
+    "LucMc/continual-learning@6fc2af34783159f5dda50c6915dda32c2d443604"
+)
 INTENTIONAL_UPDATES_RECORD_SCHEMA = "asi.ipmnist.intentional_updates.development.v1"
 INTENTIONAL_UPDATES_PAPER_REVISION = "arXiv:2604.19033v1"
 INTENTIONAL_UPDATES_CODE_REVISION = (
@@ -6042,6 +6047,114 @@ def _make_sigma0_gated_l2init_learner(
     return init_fn, full_step
 
 
+@chex.dataclass(frozen=True)
+class CPRIPMNISTState:
+    """Matched peak-state envelope for CPR and every registered control."""
+
+    utility: dict[str, Array]
+    init_params: dict[str, Array]
+    step: Array
+    norm: EMANormState
+
+
+def _make_cpr_ipmnist_learner(
+    hp: Mapping[str, float],
+) -> tuple[LearnerInitFn, ScreeningStepFn]:
+    """Calibrated partial reset and matched reduction family.
+
+    The paper defines per-neuron gradient utilities and periodic reset Eq. 7.
+    This batch-size-one IPMNIST port uses per-parameter absolute-gradient EMA
+    (a finer-grained utility) because the screening learner's state is
+    parameter-keyed.  It retains the paper's layer/tensor mean normalization,
+    Eq. 6 sigmoid shape (kappa=16), periodic pull, and reset-to-retained-init
+    operator.  This protocol difference is bound in the result receipt.
+    """
+    mode_code = int(hp["mode_code"])
+    if mode_code not in range(5):
+        raise ValueError("mode_code must select utility/hard/L2/uniform/off")
+    step_size = hp["step_size"]
+    utility_decay = hp["utility_decay"]
+    reset_fraction = hp["reset_fraction"]
+    reset_frequency = int(hp["reset_frequency"])
+    if reset_frequency < 1:
+        raise ValueError("reset_frequency must be positive")
+    kappa = hp["utility_sharpness"]
+    l2_strength = hp["l2_init_strength"]
+    norm_decay = hp["norm_decay"]
+    norm_epsilon = hp["norm_epsilon"]
+
+    def init_fn(params: dict[str, Array]) -> CPRIPMNISTState:
+        return CPRIPMNISTState(  # type: ignore[call-arg]
+            utility={name: jnp.ones_like(value) for name, value in params.items()},
+            init_params={name: value for name, value in params.items()},
+            step=jnp.asarray(0, dtype=jnp.int32),
+            norm=_init_input_norm_state(params),
+        )
+
+    def full_step(
+        params: dict[str, Array],
+        state: CPRIPMNISTState,
+        x: Array,
+        y: Array,
+        key: Array,
+    ) -> tuple[dict[str, Array], CPRIPMNISTState, StepMetrics]:
+        del key
+        x_norm, new_norm = ema_normalize(state.norm, x, norm_decay, norm_epsilon)
+        (loss, logits), grads = jax.value_and_grad(cross_entropy_loss, has_aux=True)(
+            params, x_norm, y
+        )
+        new_step = state.step + jnp.asarray(1, dtype=jnp.int32)
+        utility = {}
+        for name in params:
+            magnitude = jnp.abs(grads[name])
+            score = magnitude / (jnp.mean(magnitude) + norm_epsilon)
+            utility[name] = (
+                utility_decay * state.utility[name] + (1.0 - utility_decay) * score
+            )
+        sgd_params = {
+            name: params[name] - step_size * grads[name] for name in params
+        }
+        at_reset = jnp.equal(jnp.mod(new_step, reset_frequency), 0)
+        new_params: dict[str, Array] = {}
+        for name in params:
+            mean_utility = jnp.mean(utility[name])
+            normalized = utility[name] / jnp.maximum(mean_utility, norm_epsilon)
+            calibrated = jnp.minimum(
+                2.0 * jax.nn.sigmoid(-kappa * (normalized - 1.0)), 1.0
+            )
+            if mode_code == 0:  # CPR: periodic continuous utility-scaled pull
+                rate = jnp.where(at_reset, reset_fraction * calibrated, 0.0)
+            elif mode_code == 1:  # binary hard reset below tensor mean
+                rate = jnp.where(at_reset & (normalized <= 1.0), 1.0, 0.0)
+            elif mode_code == 2:  # L2-Init: uniform continuous regularization
+                rate = jnp.full_like(params[name], step_size * l2_strength)
+            elif mode_code == 3:  # utility-free periodic partial reset
+                rate = jnp.where(at_reset, reset_fraction, 0.0)
+            else:  # exact mechanism-off parameter path
+                rate = jnp.zeros_like(params[name])
+            pulled = sgd_params[name] + rate * (
+                state.init_params[name] - sgd_params[name]
+            )
+            new_params[name] = sgd_params[name] if mode_code == 4 else pulled
+        metrics = _step_metrics(new_params, x_norm, y, loss, logits)
+        recentered_utility = {
+            name: (
+                jnp.where(at_reset, jnp.ones_like(value), value)
+                if mode_code in (0, 1, 3)
+                else value
+            )
+            for name, value in utility.items()
+        }
+        return new_params, CPRIPMNISTState(  # type: ignore[call-arg]
+            utility=recentered_utility,
+            init_params=state.init_params,
+            step=new_step,
+            norm=new_norm,
+        ), metrics
+
+    return init_fn, full_step
+
+
 # =============================================================================
 # Config registry
 # =============================================================================
@@ -6858,6 +6971,54 @@ def _build_registry() -> dict[str, ScreeningSpec]:
             ),
         )
     )
+    cpr_base = {
+        "mode_code": 0.0,
+        "step_size": 0.01,
+        "utility_decay": 0.99,
+        "reset_fraction": 0.01,
+        "reset_frequency": 100.0,
+        "utility_sharpness": 16.0,
+        "l2_init_strength": 0.01,
+        "norm_decay": 0.99,
+        "norm_epsilon": 1e-8,
+    }
+    cpr_arms = (
+        (
+            "cpr_ipmnist",
+            0.0,
+            "CPR Eq. 6/7 supervised port: periodic utility-scaled partial pull to init.",
+        ),
+        (
+            "cpr_hard_reset",
+            1.0,
+            "Binary below-mean hard-reset control in the matched CPR state envelope.",
+        ),
+        (
+            "cpr_l2_init",
+            2.0,
+            "Continuous uniform L2-Init pull control in the matched CPR state envelope.",
+        ),
+        (
+            "cpr_utility_free",
+            3.0,
+            "Periodic uniform partial-pull control without utility calibration.",
+        ),
+        (
+            "cpr_off",
+            4.0,
+            "Exact mechanism-off normalized-SGD control with matched allocated state.",
+        ),
+    )
+    for name, mode_code, description in cpr_arms:
+        specs.append(ScreeningSpec(
+            name=name,
+            base_learner="upgd_w",
+            mechanism="calibrated_partial_reset",
+            hyperparameters={**cpr_base, "mode_code": mode_code},
+            factory=_make_cpr_ipmnist_learner,
+            frozen_probe_input=_ema_frozen_probe_input,
+            description=description,
+        ))
     # --- Wave 8: update-rule family swaps under the sigma0_ndecay099 champion's
     # conditioning (EMA input normalizer decay 0.99 + the exact UPGD utility
     # gate, no perturbation).  Only the descent direction changes per arm.
@@ -8974,6 +9135,239 @@ def l2er_development_result_payload(
         "scientific_promotion_allowed": False,
     }
     return validate_l2er_development_result(payload)
+
+
+def _partial_reset_peak_numeric_bytes(config: IPMNISTConfig) -> int:
+    parameter_bytes = config.parameter_count * np.dtype(np.float32).itemsize
+    normalizer_bytes = (2 * config.input_dim + 1) * np.dtype(np.float32).itemsize
+    # Live params + retained init + utility EMA + int32 step + normalizer.
+    return 3 * parameter_bytes + normalizer_bytes + np.dtype(np.int32).itemsize
+
+
+def partial_reset_development_record(result: ScreeningRunResult) -> dict[str, Any]:
+    """Create a strict in-memory receipt for one real CPR-family run."""
+    if type(result) is not ScreeningRunResult:
+        raise TypeError("result must be an exact ScreeningRunResult")
+    spec = SCREENING_REGISTRY.get(result.config_name)
+    if spec is None or spec.mechanism != "calibrated_partial_reset":
+        raise ValueError("result must use a registered calibrated partial-reset arm")
+    if result.hyperparameters != spec.hyperparameters:
+        raise ValueError("result hyperparameters must match the registered arm")
+    steps = result.config.n_steps
+    peak_bytes = _partial_reset_peak_numeric_bytes(result.config)
+    return {
+        "schema": PARTIAL_RESET_RECORD_SCHEMA,
+        "references": {
+            "paper": CPR_PAPER_REVISION,
+            "official_code": CPR_OFFICIAL_CODE_REVISION,
+            "protocol_difference": (
+                "batch-size-one IPMNIST; per-parameter rather than per-neuron gradient "
+                "utility; retained initialization rather than fresh keyed draws; pulls all "
+                "parameters rather than hidden incoming weights plus outgoing decay; no "
+                "task-boundary information"
+            ),
+        },
+        "arm": result.config_name,
+        "seed": result.seed,
+        "config": result.config.to_config(),
+        "hyperparameters": dict(result.hyperparameters),
+        "matched_axes": [
+            "seed",
+            "example_schedule",
+            "observations",
+            "updates",
+            "allowed_boundary_information:none",
+            "peak_state_envelope",
+        ],
+        "policy": {
+            "development_only": True,
+            "scientific_promotion_allowed": False,
+            "publication_equivalent": False,
+            "retain_negative_outcome": True,
+        },
+        "resources": {
+            "persistent_bytes": peak_bytes,
+            "peak_numeric_bytes": peak_bytes,
+            "environment_or_data_steps": steps,
+            "observations": steps,
+            "updates": steps,
+            "model_queries": 2 * steps,
+            "timing_telemetry_seconds": float(result.wall_clock_seconds),
+            "timing_is_selection_metric": False,
+        },
+        "metrics": {
+            "per_task_accuracy": result.per_task_accuracy.tolist(),
+            "per_task_loss": result.per_task_loss.tolist(),
+            "per_task_plasticity": result.per_task_plasticity.tolist(),
+        },
+    }
+
+
+def _partial_reset_exact_object(
+    value: object, *, keys: frozenset[str], context: str
+) -> dict[str, Any]:
+    if type(value) is not dict or frozenset(value) != keys:
+        raise ValueError(f"{context} must be an exact object with the frozen keys")
+    return cast(dict[str, Any], value)
+
+
+def _partial_reset_curve(value: object, *, length: int, context: str) -> list[float]:
+    if (
+        type(value) is not list
+        or len(value) != length
+        or any(type(item) is not float or not math.isfinite(item) for item in value)
+    ):
+        raise ValueError(f"{context} must be a bounded finite float list")
+    return cast(list[float], value)
+
+
+def validate_partial_reset_development_record(record: object) -> dict[str, Any]:
+    """Fail closed over CPR-family identity, counters, metrics, and policy."""
+    payload = _partial_reset_exact_object(
+        record,
+        keys=frozenset(
+            {
+                "schema",
+                "references",
+                "arm",
+                "seed",
+                "config",
+                "hyperparameters",
+                "matched_axes",
+                "policy",
+                "resources",
+                "metrics",
+            }
+        ),
+        context="partial-reset record",
+    )
+    policy = _partial_reset_exact_object(
+        payload["policy"],
+        keys=frozenset(
+            {
+                "development_only",
+                "scientific_promotion_allowed",
+                "publication_equivalent",
+                "retain_negative_outcome",
+            }
+        ),
+        context="policy",
+    )
+    if policy != {
+        "development_only": True,
+        "scientific_promotion_allowed": False,
+        "publication_equivalent": False,
+        "retain_negative_outcome": True,
+    }:
+        raise ValueError("partial-reset records are permanently nonpromoting")
+    try:
+        config_raw = _partial_reset_exact_object(
+            payload["config"],
+            keys=frozenset(
+                {
+                    "n_tasks",
+                    "task_length",
+                    "input_dim",
+                    "hidden1",
+                    "hidden2",
+                    "n_classes",
+                }
+            ),
+            context="config",
+        )
+        config = IPMNISTConfig(**config_raw)
+        metrics = _partial_reset_exact_object(
+            payload["metrics"],
+            keys=frozenset(
+                {"per_task_accuracy", "per_task_loss", "per_task_plasticity"}
+            ),
+            context="metrics",
+        )
+        resources = _partial_reset_exact_object(
+            payload["resources"],
+            keys=frozenset(
+                {
+                    "persistent_bytes",
+                    "peak_numeric_bytes",
+                    "environment_or_data_steps",
+                    "observations",
+                    "updates",
+                    "model_queries",
+                    "timing_telemetry_seconds",
+                    "timing_is_selection_metric",
+                }
+            ),
+            context="resources",
+        )
+        arm = payload["arm"]
+        if type(arm) is not str:
+            raise ValueError("arm must be an exact string")
+        spec = screening_spec(arm)
+        hyperparameters = _partial_reset_exact_object(
+            payload["hyperparameters"],
+            keys=frozenset(spec.hyperparameters),
+            context="hyperparameters",
+        )
+        if any(
+            type(value) is not float or not math.isfinite(value)
+            for value in hyperparameters.values()
+        ):
+            raise ValueError("hyperparameters must contain exact finite floats")
+        references = _partial_reset_exact_object(
+            payload["references"],
+            keys=frozenset({"paper", "official_code", "protocol_difference"}),
+            context="references",
+        )
+        if any(type(value) is not str for value in references.values()):
+            raise ValueError("references must contain exact strings")
+        matched_axes = payload["matched_axes"]
+        if type(matched_axes) is not list or any(
+            type(value) is not str for value in matched_axes
+        ):
+            raise ValueError("matched_axes must be an exact string list")
+        timing = resources["timing_telemetry_seconds"]
+        if type(timing) is not float or not math.isfinite(timing) or timing < 0.0:
+            raise ValueError("timing telemetry must be one finite nonnegative float")
+        result = ScreeningRunResult(
+            config_name=arm,
+            base_learner=spec.base_learner,
+            hyperparameters=hyperparameters,
+            seed=require_jax_seed(payload["seed"], name="record seed"),
+            config=config,
+            per_task_accuracy=np.asarray(
+                _partial_reset_curve(
+                    metrics["per_task_accuracy"],
+                    length=config.n_tasks,
+                    context="per_task_accuracy",
+                ),
+                dtype=np.float64,
+            ),
+            per_task_loss=np.asarray(
+                _partial_reset_curve(
+                    metrics["per_task_loss"],
+                    length=config.n_tasks,
+                    context="per_task_loss",
+                ),
+                dtype=np.float64,
+            ),
+            per_task_plasticity=np.asarray(
+                _partial_reset_curve(
+                    metrics["per_task_plasticity"],
+                    length=config.n_tasks,
+                    context="per_task_plasticity",
+                ),
+                dtype=np.float64,
+            ),
+            wall_clock_seconds=timing,
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("invalid partial-reset result fields") from error
+    expected = partial_reset_development_record(result)
+    if payload != expected:
+        if payload.get("resources") != expected["resources"]:
+            raise ValueError("partial-reset resource receipt does not match the run")
+        raise ValueError("partial-reset record does not match the frozen protocol")
+    return expected
 
 
 def _intentional_updates_persistent_numeric_bytes(

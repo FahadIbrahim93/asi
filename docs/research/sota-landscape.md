@@ -83,8 +83,12 @@ local same-runner development ranking, not a paper-level SOTA claim.
   plasticity loss to output churn and NTK-rank decline across several continual
   RL suites. [Calibrated Partial Resets
   (2026)](https://arxiv.org/abs/2607.24996) reports utility-scaled partial
-  resets on Continual MetaWorld, Continual MinAtar, and SlipperyAnt. Both are
-  candidates for causal ablations, not IPMNIST results.
+  resets on Continual MetaWorld, Continual MinAtar, and SlipperyAnt. ASI pins
+  CPR paper v1 and official repository commit
+  `6fc2af34783159f5dda50c6915dda32c2d443604`. The registered `cpr_*` IPMNIST
+  family is a documented supervised protocol port with matched hard-reset,
+  L2-Init, utility-free, and mechanism-off controls—not a source reproduction
+  or an IPMNIST result. C-CHAIN remains a candidate for a causal ablation.
 - [Intentional Updates](https://arxiv.org/abs/2604.19033v1) reports strong
   fully streaming reinforcement-learning results by solving for step sizes in
   prediction or policy units. ASI pins paper v1 and official code commit
