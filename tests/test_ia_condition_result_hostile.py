@@ -153,6 +153,18 @@ def test_ia_condition_result_owns_read_only_array_snapshots() -> None:
         result.rewards[0] = 1.0
 
 
+def test_ia_condition_result_preserves_executed_and_credited_array_roles() -> None:
+    executed = np.asarray([0, 1], dtype=np.int64)
+    credited = np.asarray([1, 1], dtype=np.int64)
+    result = _legal(
+        executed_actions=executed,
+        credited_actions=credited,
+        executed_action_credit_mismatches=1,
+    )
+    np.testing.assert_array_equal(result.executed_actions, executed)
+    np.testing.assert_array_equal(result.credited_actions, credited)
+
+
 def test_ia_condition_result_rejects_nested_subclasses() -> None:
     class BudgetSubclass(ControllerBudget):
         pass
