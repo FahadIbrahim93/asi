@@ -147,6 +147,107 @@ questions. They belong in an application comparison only after ASI names a
 matching allowance and metric; importing their headline accuracy into the
 IPMNIST or Forager table would be misleading.
 
+## Alberta Plan and adjacent programs
+
+The [Alberta Plan](https://arxiv.org/abs/2208.11173) is a research agenda for continual,
+computationally limited, model-based intelligence. It is neither a benchmark nor a completed
+architecture, so repositories that expose all twelve named surfaces are not automatically
+competitors at the whole-agent evidence level.
+
+- [`lalalune/alberta`](https://github.com/lalalune/alberta) is ASI's direct upstream. Its README
+  describes all twelve Steps as implemented and benchmarked; ASI's fork-point audit and current
+  evidence rules deliberately interpret mechanism/API presence more narrowly. See
+  [`VENDORING.md`](../../VENDORING.md).
+- [OpenMind Research Institute](https://www.openmindresearch.org/) explicitly uses the Alberta
+  Plan as a starting point and publishes adjacent research proposals. Monitor its work on
+  continual meta-learning, real-time robotics, average-reward learning, and big-world agents for
+  concrete algorithms and public code; an agenda reference alone is not a comparator.
+- [Position: Deployed RL Should Be Continual](https://arxiv.org/abs/2606.04029) (ICML 2026
+  position track) argues against train-then-fix deployment and emphasizes monitoring,
+  nonstationarity, and continual adaptation. It supports ASI's application framing but reports no
+  algorithmic result to beat.
+- Sutton's [publication index](https://incompleteideas.net/publications.html) is a useful primary
+  discovery route for SwiftTD/Swift-Sarsa, reward centering, big-world work, Horde, Dyna, options,
+  and follow-ons that may not use the words “Alberta Plan” in their titles.
+
+Searches for “ASI” are dominated by unrelated Artificial Superintelligence projects and do not
+define a technical comparison class. ASI comparisons should be selected by operational
+properties—continual updates, retention/reuse, prediction, planning, control, and bounded
+resources—not by name overlap.
+
+## Continual reinforcement learning and benchmarks
+
+The single machine-readable setup authority is
+[`external_qualification.py`](../../alberta_framework/benchmarks/external_qualification.py).
+It pins audited upstream revisions and bounded qualification contracts while keeping incompatible
+external stacks out of ASI's base environment. A registered source or smoke qualification does
+not mean an agent adapter or comparison result exists.
+
+| Benchmark or system | What it measures | Fit and gap for ASI |
+|---|---|---|
+| [Forager](https://arxiv.org/abs/2605.01131) / [agents](https://github.com/steventango/continual-foragax-agents) | Lightweight, constant-memory-footprint, partially observable continual RL; emphasizes state construction and unending tasks. | Closest active R3 benchmark. ASI has extensive tooling but no completed matched-resource scientific comparison. |
+| [Continual World](https://arxiv.org/abs/2105.10919) / [code](https://github.com/awarelab/continual_world) | Meta-World robot-task sequences emphasizing forward transfer, forgetting, and compute/capacity constraints. | Valuable R3→R4 bridge, but task boundaries, episodic resets, MuJoCo version, and million-step budgets differ from the current life. |
+| [CORA](https://arxiv.org/abs/2110.10067) / [code](https://github.com/AGI-Labs/continual_rl) | Atari, Procgen, NetHack, and CHORES with continual evaluation, isolated forgetting, and zero-shot forward transfer. | Strong metric and baseline source; expensive and predominantly task-sequence based. |
+| [COOM](https://github.com/TTomilin/COOM) | Pixel-based Doom task sequences with average performance, forgetting, and forward transfer. | Useful robustness/representation lane after a smaller R3 control closes. |
+| [Continual Bench / FTL Online Agent](https://arxiv.org/abs/2507.09177) | Online shallow world model plus MPC across reward-defined continual tasks, with a regret result under stated assumptions. | Closest model-based competitor to ASI's FTL line; reproduce before extending the historically accepted, currently invalid narrow decision-fidelity artifact. |
+| [C-CHAIN](https://arxiv.org/abs/2506.00592) | Continual nonstationarity across Gym Control, ProcGen, DMC, and MinAtar. | Contemporary plasticity baseline; audit precise task sequences and replay/batch settings first. |
+
+Additional project sources:
+
+- [Papers of Continual RL](https://github.com/datake/Papers-Of-Continual-RL) and
+  [ContinualAI papers](https://github.com/ContinualAI/continual-learning-papers) are discovery
+  indexes, not primary evidence.
+- [CompoNet](https://github.com/mikelma/componet) provides code for self-composing policies on
+  Atari and Meta-World; potentially relevant to options/composition after primitive reference-life
+  gates close.
+- [FAME](https://github.com/datake/FAME) is a contemporary continual-RL implementation to audit
+  for fast/meta learner controls after the reference baseline exists.
+
+## World models, JEPA, and prediction architectures
+
+World-model results answer at least four different questions: representation quality, prediction,
+planning/control, and continual retention/adaptation. ASI should not infer one from another.
+
+### Online and continual world models
+
+| Work | Main reported result | Required ASI comparison discipline |
+|---|---|---|
+| [DreamerV3](https://arxiv.org/abs/2301.04104) / [JAX code](https://github.com/danijar/dreamerv3) | One configuration across more than 150 tasks; learns behavior through latent imagination. | Charge replay capacity, train ratio, model size, imagination queries, and environment interaction. It is a strong general MBRL baseline, not inherently continual. |
+| [Continual-Dreamer](https://arxiv.org/abs/2211.15944) | Studies world-model design choices for continual RL and task-agnostic continual exploration. | Reproduce on a modern, version-pinned base before comparison. |
+| [WMAR](https://arxiv.org/abs/2401.16650) | Augments DreamerV3 replay for Procgen/Atari continual sequences and reports improved forgetting behavior. | Explicitly compare equal replay bytes and task sequences; separate retention from online utility. |
+| [FTL Online Agent](https://arxiv.org/abs/2507.09177) | Shallow online world model plus MPC reportedly outperforms deep-world-model CL variants on Continual Bench. | Priority because it is online and analytically bounded; reproduce model/planning assumptions exactly. |
+
+### JEPA and reconstruction-free prediction
+
+| Work | Main reported result | ASI use |
+|---|---|---|
+| [V-JEPA 2](https://arxiv.org/abs/2506.09985) | Large-scale self-supervised video model; action-conditioned post-training enables zero-shot image-goal robot planning. | R4 reference for physical prediction. Web-scale pretraining makes it incomparable to from-scratch continual learning; isolate architecture from imported data. |
+| [JEPA-WM physical planning study](https://arxiv.org/abs/2512.24497) / [code](https://github.com/facebookresearch/jepa-wms) | Studies architecture, objective, and planner choices and reports gains over DINO-WM and V-JEPA-2-AC on navigation/manipulation. | Best current design/ablation reference for latent physical planning; paper/code/checkpoints available. |
+| [Dreamer-CDP](https://arxiv.org/abs/2603.07083) / [code](https://github.com/fmi-basel/Dreamer-CDP) | JEPA-style continuous deterministic representation prediction matches reconstruction-based Dreamer on Crafter. | Highest-priority small reconstruction-free comparator; JAX and close to an actionable ablation. |
+| [JEDI](https://arxiv.org/abs/2605.13013) | End-to-end latent diffusion world model reports competitive Atari100k performance with lower VRAM and faster training/sampling than pixel diffusion. | Longer-term stochastic latent model; resource accounting is central, and it is not yet continual evidence. |
+| [NE-Dreamer](https://github.com/corl-team/nedreamer) | Decoder-free next-embedding prediction with a temporal transformer. | Candidate after Dreamer-CDP; reproduce only when its final paper/protocol is stable. |
+| [DayDreamer](https://github.com/danijar/daydreamer) | World-model learning on physical robots using replay and latent imagination. | Robotics systems reference for actor/learner separation, not evidence of continual adaptation or ASI readiness. |
+
+For each world-model proposal, measure one-step and rollout prediction only as diagnostics. The
+acceptance metric must include decision or control utility under a matched real-transition,
+model-query, update, memory, and latency budget. Test model error under recurrence and dynamics
+change, not only stationary held-out sequences.
+
+## Open-source comparison ecosystem
+
+| Project | Useful role | Caution |
+|---|---|---|
+| [Avalanche](https://github.com/ContinualAI/avalanche) | Standard strategies, scenarios, metrics, and dataset construction. | Mostly PyTorch and conventional experience-based CL; metrics are not automatically compatible with ASI streams. |
+| [Mammoth](https://github.com/aimagelab/mammoth) | Broad maintained method/dataset roster including Permuted MNIST and MNIST-360. | Many methods rely on pretrained encoders, replay, epochs, or task/class scenarios. Use as discovery and regression reference. |
+| [ContinualAI baselines](https://github.com/ContinualAI/continual-learning-baselines) | Reproduction ledger showing expected versus reproduced performance. | Excellent warning against trusting paper tables; not a common-runner result for ASI. |
+| [GM van de Ven continual-learning](https://github.com/GMvandeVen/continual-learning) | Clear implementations of replay, regularization, generative replay, and task-free streams. | PyTorch and different evaluation semantics; useful for algorithm audits. |
+| [lop-jax](https://github.com/KevinGuo27/lop-jax) | JAX implementations of L2-ER, CBP, layer norm, spectral controls across PMNIST, ImageNet, CIFAR, and Slippery Ant. | Most direct source for the priority L2-ER port; pin a revision and audit the PMNIST protocol. |
+| [UPGD](https://github.com/mohmdelsayed/upgd) | Official source for ASI's IPMNIST anchor. | Keep official reproduction distinct from local adaptations. |
+
+Repository popularity is not evidence quality. Before reusing code, inspect its license, last
+working revision, dependencies, configuration defaults, data preprocessing, metric implementation,
+and whether reported results can actually be regenerated.
+
 ## Measurement work required before any SOTA claim
 
 1. Stabilize and bind the source tree; the current merge work invalidates new
