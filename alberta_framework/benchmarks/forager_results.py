@@ -2309,14 +2309,14 @@ class ForagerPairedComparison:
             raise TypeError("candidate_privileged must be an exact boolean")
         if type(self.baseline_privileged) is not bool:
             raise TypeError("baseline_privileged must be an exact boolean")
-        if self.metric not in (
+        if type(self.metric) is not str or self.metric not in (
             "mean_reward",
             "final_window_mean_reward",
             "final_ewm_reward",
             "mean_ewm_reward",
             "fov_last_10pct_ema_auc",
         ):
-            raise ValueError(f"metric {self.metric!r} is not a valid ForagerMetric")
+            raise ValueError("metric is not a valid ForagerMetric")
         if type(self.seeds) is not tuple:
             raise TypeError("seeds must be an exact tuple")
         if not self.seeds:
@@ -2328,9 +2328,11 @@ class ForagerPairedComparison:
             raise ValueError("seeds must be unique")
         for name in ("mean_difference", "ci_low", "ci_high"):
             val = getattr(self, name)
-            if not isinstance(val, (int, float)) or not math.isfinite(val):
+            if type(val) not in (int, float) or not math.isfinite(val):
                 raise ValueError(f"{name} must be a finite float")
-        if not isinstance(self.confidence, (int, float)) or not (0.0 < self.confidence < 1.0):
+        if type(self.confidence) not in (int, float) or not (
+            0.0 < self.confidence < 1.0
+        ):
             raise ValueError("confidence must be a probability in (0, 1)")
 
     def to_dict(self) -> dict[str, Any]:
@@ -2478,16 +2480,16 @@ class ForagerComparisonReport:
     def __post_init__(self) -> None:
         if type(self.candidate) is not str or not self.candidate:
             raise ValueError("candidate must be a non-empty string")
-        if self.metric not in (
+        if type(self.metric) is not str or self.metric not in (
             "mean_reward",
             "final_window_mean_reward",
             "final_ewm_reward",
             "mean_ewm_reward",
             "fov_last_10pct_ema_auc",
         ):
-            raise ValueError(f"metric {self.metric!r} is not a valid ForagerMetric")
-        if not isinstance(self.summaries, Mapping):
-            raise TypeError("summaries must be a mapping")
+            raise ValueError("metric is not a valid ForagerMetric")
+        if type(self.summaries) is not dict:
+            raise TypeError("summaries must be an exact dictionary")
         for name, summary in self.summaries.items():
             if type(name) is not str or not name:
                 raise ValueError("summary names must be non-empty strings")

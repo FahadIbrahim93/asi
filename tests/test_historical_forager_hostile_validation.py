@@ -71,6 +71,29 @@ def test_historical_forager_pairing_identity_rejects_invalid_inputs() -> None:
             runtime_sha256="c" * 64,
         )
 
+
+def test_historical_adapter_mode_rejects_before_comparison_hook() -> None:
+    calls = 0
+
+    class Hostile:
+        def __eq__(self, _other: object) -> bool:
+            nonlocal calls
+            calls += 1
+            raise AssertionError("comparison hook reached")
+
+    with pytest.raises(HistoricalForagerContractError, match="adapter_mode is invalid"):
+        HistoricalForagerPairingIdentity(
+            family_id="family_1",
+            provenance_sha256="a" * 64,
+            seed=1,
+            aperture_size=9,
+            steps=100,
+            semantic_contract_sha256="b" * 64,
+            environment_adapter_mode=Hostile(),  # type: ignore[arg-type]
+            runtime_sha256="c" * 64,
+        )
+    assert calls == 0
+
     with pytest.raises(HistoricalForagerContractError, match="aperture_size must be one of"):
         HistoricalForagerPairingIdentity(
             family_id="family_1",

@@ -820,7 +820,7 @@ class IPMNISTRunResult:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "learner", _require_nonempty_string("learner", self.learner))
-        if not isinstance(self.hyperparameters, dict):
+        if type(self.hyperparameters) is not dict:
             raise TypeError("hyperparameters must be a dict")
         object.__setattr__(self, "seeds", _require_seed_identities(self.seeds, name="seeds"))
         if type(self.config) is not IPMNISTConfig:

@@ -100,9 +100,7 @@ def test_forager_tuning_selection_validation() -> None:
             selected_variants={},
         )
 
-    with pytest.raises(
-        ForagerMatrixManifestError, match="file_sha256 must be a 64-character hex string"
-    ):
+    with pytest.raises(ForagerMatrixManifestError, match="lowercase SHA-256 digest"):
         ForagerTuningSelection(
             report_path="tuning/report.json",
             file_sha256="invalid",

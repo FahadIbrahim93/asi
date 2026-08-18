@@ -433,13 +433,15 @@ class OfficialForagaxRunPlan:
             raise TypeError("request must be an OfficialForagaxRunRequest")
         _require_sha256(self.interpreter_sha256, label="interpreter_sha256")
         _require_sha256(self.package_freeze_sha256, label="package_freeze_sha256")
-        if not isinstance(self.command, tuple):
+        if type(self.command) is not tuple or any(type(item) is not str for item in self.command):
             raise TypeError("command must be a tuple")
-        if not isinstance(self.package_freeze, tuple):
+        if type(self.package_freeze) is not tuple or any(
+            type(item) is not str for item in self.package_freeze
+        ):
             raise TypeError("package_freeze must be a tuple")
-        if not isinstance(self.config_snapshot_bytes, (bytes, bytearray)):
+        if type(self.config_snapshot_bytes) is not bytes:
             raise TypeError("config_snapshot_bytes must be bytes")
-        if not isinstance(self.execution_config_bytes, (bytes, bytearray)):
+        if type(self.execution_config_bytes) is not bytes:
             raise TypeError("execution_config_bytes must be bytes")
 
     @property
@@ -509,13 +511,15 @@ class OfficialForagaxBatchRunPlan:
             raise TypeError("request must be an OfficialForagaxBatchRunRequest")
         _require_sha256(self.interpreter_sha256, label="interpreter_sha256")
         _require_sha256(self.package_freeze_sha256, label="package_freeze_sha256")
-        if not isinstance(self.command, tuple):
+        if type(self.command) is not tuple or any(type(item) is not str for item in self.command):
             raise TypeError("command must be a tuple")
-        if not isinstance(self.package_freeze, tuple):
+        if type(self.package_freeze) is not tuple or any(
+            type(item) is not str for item in self.package_freeze
+        ):
             raise TypeError("package_freeze must be a tuple")
-        if not isinstance(self.config_snapshot_bytes, (bytes, bytearray)):
+        if type(self.config_snapshot_bytes) is not bytes:
             raise TypeError("config_snapshot_bytes must be bytes")
-        if not isinstance(self.execution_config_bytes, (bytes, bytearray)):
+        if type(self.execution_config_bytes) is not bytes:
             raise TypeError("execution_config_bytes must be bytes")
 
     @property

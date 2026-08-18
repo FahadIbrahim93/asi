@@ -22,6 +22,18 @@ def dummy_rule() -> ForagerTuningRule:
     )
 
 
+def test_tuning_rule_accepts_parser_supported_conservative_statistic() -> None:
+    rule = ForagerTuningRule(
+        metric="mean_reward",
+        direction="maximize",
+        statistic="conservative_ci_endpoint",
+        confidence=0.95,
+        bootstrap_resamples=100,
+        bootstrap_seed=0,
+    )
+    assert rule.statistic == "conservative_ci_endpoint"
+
+
 def test_forager_matrix_manifest_rejects_invalid_inputs(
     dummy_rule: ForagerTuningRule,
 ) -> None:

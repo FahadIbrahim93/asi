@@ -1948,7 +1948,7 @@ class MicroTaskConfig:
     def __post_init__(self) -> None:
         _require_nonempty_string(self.name, context="MicroTaskConfig.name")
         _require_nonempty_string(self.kind, context="MicroTaskConfig.kind")
-        if self.role not in ("search", "holdout"):
+        if type(self.role) is not str or self.role not in ("search", "holdout"):
             raise ValueError("MicroTaskConfig.role must be 'search' or 'holdout'")
         for field_name in (
             "input_dim",
