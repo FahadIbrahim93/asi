@@ -174,7 +174,7 @@ def test_smoke_result_rejects_hostile_shape_without_hooks() -> None:
             steps=2,
             seed=0,
             final_window_mse=0.0,
-            metrics_shape=_HostileTuple((2, 2)),
+            metrics_shape=_HostileTuple((2, 4)),
             finite=True,
         )
     assert _HostileTuple.calls == 0
