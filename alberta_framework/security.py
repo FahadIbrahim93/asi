@@ -473,7 +473,7 @@ def validate_security_oracle_experience(
             schema.validate_observation(record.state)
         except ValueError as exc:
             raise ValueError(f"invalid oracle experience {idx}: {exc}") from exc
-        if not isinstance(record.outcome.get("label"), str) or not record.outcome["label"]:
+        if type(record.outcome.get("label")) is not str or not record.outcome["label"]:
             raise ValueError(f"invalid oracle experience {idx}: missing outcome label")
 
 

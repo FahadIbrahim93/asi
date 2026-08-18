@@ -2284,9 +2284,9 @@ class DualReplayMemory:
             raise ValueError("checkpoint memory and state must be mappings")
         config_digest = payload.get("config_digest")
         state_digest = payload.get("state_digest")
-        if not isinstance(config_digest, str) or config_digest != _payload_digest(memory_payload):
+        if type(config_digest) is not str or config_digest != _payload_digest(memory_payload):
             raise ValueError("dual replay checkpoint config digest mismatch")
-        if not isinstance(state_digest, str) or state_digest != _payload_digest(state_payload):
+        if type(state_digest) is not str or state_digest != _payload_digest(state_payload):
             raise ValueError("dual replay checkpoint state digest mismatch")
         memory = cls.from_config(memory_payload)
         cfg = memory.config
