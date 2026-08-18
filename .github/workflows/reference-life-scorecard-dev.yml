@@ -2,6 +2,9 @@ name: reference-life development scorecard
 
 on:
   workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/reference-life-scorecard-dev.yml
 
 permissions:
   contents: read
