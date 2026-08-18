@@ -2322,18 +2322,20 @@ class ForagerPairedComparison:
         if not self.seeds:
             raise ValueError("seeds must not be empty")
         for seed in self.seeds:
-            if type(seed) is not int or isinstance(seed, bool):
-                raise TypeError("seeds must contain integers")
+            if type(seed) is not int or seed < 0:
+                raise TypeError("seeds must contain nonnegative exact integers")
         if len(set(self.seeds)) != len(self.seeds):
             raise ValueError("seeds must be unique")
         for name in ("mean_difference", "ci_low", "ci_high"):
             val = getattr(self, name)
             if type(val) not in (int, float) or not math.isfinite(val):
                 raise ValueError(f"{name} must be a finite float")
-        if type(self.confidence) not in (int, float) or not (
-            0.0 < self.confidence < 1.0
-        ):
+            object.__setattr__(self, name, float(val))
+        if self.ci_low > self.ci_high:
+            raise ValueError("ci_low must not exceed ci_high")
+        if type(self.confidence) not in (int, float) or not 0.0 < self.confidence < 1.0:
             raise ValueError("confidence must be a probability in (0, 1)")
+        object.__setattr__(self, "confidence", float(self.confidence))
 
     def to_dict(self) -> dict[str, Any]:
         data = dataclasses.asdict(self)
@@ -2351,8 +2353,36 @@ def paired_forager_comparison(
     bootstrap_seed: int = 0,
 ) -> ForagerPairedComparison:
     """Compare methods using identical seeds and environment contracts."""
+    if type(metric) is not str or metric not in (
+        "mean_reward",
+        "final_window_mean_reward",
+        "final_ewm_reward",
+        "mean_ewm_reward",
+        "fov_last_10pct_ema_auc",
+    ):
+        raise ValueError("metric is not a valid ForagerMetric")
+    if type(candidate_runs) not in (list, tuple) or type(baseline_runs) not in (list, tuple):
+        raise TypeError("candidate_runs and baseline_runs must be exact lists or tuples")
     if not candidate_runs or not baseline_runs:
         raise ValueError("both candidate_runs and baseline_runs are required")
+    if any(type(run) is not ForagerRunResult for run in (*candidate_runs, *baseline_runs)):
+        raise TypeError("comparison inputs must contain exact ForagerRunResult records")
+    candidate_summary = summarize_forager_runs(
+        candidate_runs,
+        metric=metric,
+        confidence=confidence,
+        bootstrap_resamples=1,
+        bootstrap_seed=bootstrap_seed,
+    )
+    baseline_summary = summarize_forager_runs(
+        baseline_runs,
+        metric=metric,
+        confidence=confidence,
+        bootstrap_resamples=1,
+        bootstrap_seed=bootstrap_seed,
+    )
+    candidate_runs = candidate_summary.runs
+    baseline_runs = baseline_summary.runs
     candidate_legacy = {
         run.agent_metadata.get("result_source") == "official_fov_sqlite" for run in candidate_runs
     }
@@ -2382,20 +2412,6 @@ def paired_forager_comparison(
                         f"{label} contains an official archive without "
                         "reverified protocol attestation evidence"
                     ) from exc
-    summarize_forager_runs(
-        candidate_runs,
-        metric=metric,
-        confidence=confidence,
-        bootstrap_resamples=1,
-        bootstrap_seed=bootstrap_seed,
-    )
-    summarize_forager_runs(
-        baseline_runs,
-        metric=metric,
-        confidence=confidence,
-        bootstrap_resamples=1,
-        bootstrap_seed=bootstrap_seed,
-    )
     candidate_by_seed = {run.seed: run for run in candidate_runs}
     baseline_by_seed = {run.seed: run for run in baseline_runs}
     if len(candidate_by_seed) != len(candidate_runs) or len(baseline_by_seed) != len(baseline_runs):
@@ -2490,20 +2506,59 @@ class ForagerComparisonReport:
             raise ValueError("metric is not a valid ForagerMetric")
         if type(self.summaries) is not dict:
             raise TypeError("summaries must be an exact dictionary")
+        if type(self.paired_comparisons) is not tuple:
+            raise TypeError("paired_comparisons must be an exact tuple")
+        if type(self.unpaired_methods) is not tuple:
+            raise TypeError("unpaired_methods must be an exact tuple")
+        summaries: dict[str, ForagerBenchmarkSummary] = {}
         for name, summary in self.summaries.items():
             if type(name) is not str or not name:
                 raise ValueError("summary names must be non-empty strings")
             if type(summary) is not ForagerBenchmarkSummary:
                 raise TypeError("summaries must contain ForagerBenchmarkSummary instances")
-        if type(self.paired_comparisons) is not tuple:
-            raise TypeError("paired_comparisons must be an exact tuple")
+            validated_summary = ForagerBenchmarkSummary(
+                **{
+                    field.name: getattr(summary, field.name)
+                    for field in dataclasses.fields(summary)
+                }
+            )
+            if name != validated_summary.agent or validated_summary.metric != self.metric:
+                raise ValueError("summary keys and metrics must match the report")
+            summaries[name] = validated_summary
+        if self.candidate not in summaries:
+            raise ValueError("candidate must name one report summary")
         if any(type(comp) is not ForagerPairedComparison for comp in self.paired_comparisons):
             raise TypeError("paired_comparisons must contain ForagerPairedComparison instances")
-        if type(self.unpaired_methods) is not tuple:
-            raise TypeError("unpaired_methods must be an exact tuple")
+        comparisons = tuple(
+            ForagerPairedComparison(
+                **{field.name: getattr(comp, field.name) for field in dataclasses.fields(comp)}
+            )
+            for comp in self.paired_comparisons
+        )
+        for comparison in comparisons:
+            if (
+                comparison.candidate != self.candidate
+                or comparison.metric != self.metric
+                or comparison.baseline not in summaries
+            ):
+                raise ValueError("paired comparisons must match report identities")
+            if comparison.seeds != summaries[self.candidate].seeds:
+                raise ValueError("paired comparison seeds must match the candidate summary")
+            if comparison.seeds != summaries[comparison.baseline].seeds:
+                raise ValueError("paired comparison seeds must match the baseline summary")
         for method in self.unpaired_methods:
             if type(method) is not str or not method:
                 raise ValueError("unpaired_methods must contain non-empty strings")
+        unpaired = tuple(self.unpaired_methods)
+        if len(set(unpaired)) != len(unpaired) or tuple(sorted(unpaired)) != unpaired:
+            raise ValueError("unpaired_methods must be unique and sorted")
+        compared = {comparison.baseline for comparison in comparisons}
+        expected_others = set(summaries) - {self.candidate}
+        if compared & set(unpaired) or compared | set(unpaired) != expected_others:
+            raise ValueError("paired and unpaired methods must partition non-candidates")
+        object.__setattr__(self, "summaries", summaries)
+        object.__setattr__(self, "paired_comparisons", comparisons)
+        object.__setattr__(self, "unpaired_methods", unpaired)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -2526,11 +2581,21 @@ def build_forager_comparison_report(
     bootstrap_seed: int = 0,
 ) -> ForagerComparisonReport:
     """Group seed runs and compare every exactly paired method to Alberta."""
+    if type(candidate) is not str:
+        raise ValueError("candidate must be an exact string")
+    if type(runs) not in (list, tuple):
+        raise TypeError("runs must be an exact list or tuple")
+    if any(type(run) is not ForagerRunResult for run in runs):
+        raise TypeError("runs must contain exact ForagerRunResult records")
+    runs = tuple(
+        ForagerRunResult(
+            **{field.name: getattr(run, field.name) for field in dataclasses.fields(run)}
+        )
+        for run in runs
+    )
     grouped: dict[str, list[ForagerRunResult]] = {}
     for run in runs:
         grouped.setdefault(run.agent, []).append(run)
-    if type(candidate) is not str:
-        raise ValueError("candidate must be an exact string")
     if candidate not in grouped:
         raise ValueError("candidate is absent from runs")
     summaries = {

@@ -69,3 +69,20 @@ def test_candidate_rejects_hostile_before_membership() -> None:
 
     report = build_forager_comparison_report(runs, candidate="toy")
     assert report.candidate == "toy"
+
+
+def test_candidate_and_runs_are_admitted_before_traversal() -> None:
+    class HostileRuns(list[ForagerRunResult]):
+        def __iter__(self):  # type: ignore[no-untyped-def]  # pragma: no cover
+            raise AssertionError("hostile run traversal")
+
+    hostile = _HostileStr("toy")
+    with pytest.raises(ValueError, match="exact string"):
+        build_forager_comparison_report(HostileRuns(), candidate=hostile)  # type: ignore[arg-type]
+
+    run = _run()
+    object.__setattr__(run, "agent", hostile)
+    _HostileStr.calls = 0
+    with pytest.raises(ValueError, match="agent must be a non-empty string"):
+        build_forager_comparison_report([run], candidate="toy")
+    assert _HostileStr.calls == 0
