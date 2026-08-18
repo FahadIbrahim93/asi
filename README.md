@@ -241,6 +241,9 @@ The console scripts are grouped by responsibility; every command supports `--hel
 |---|---|
 | `alberta-step1-smoke`, `alberta-step2-smoke` | Nonpromoting mechanism smoke checks |
 | `asi-reference-life-scorecard` | Run or validate the permanently nonpromoting reference-life development scorecard |
+| `asi-ipmnist-ceiling` | Produce new, atomic no-replace stationary/carried/full or batch ceiling diagnostics |
+| `asi-ipmnist-campaign` | Recompute paired frontiers or ceiling summaries from explicit input directories |
+| `asi-rule-discovery-summary` | Rebuild the nonpromoting rule-discovery comparison from explicit inputs |
 | `alberta-evidence-status` | Validate the complete five-claim evidence registry |
 | `alberta-recurring-feature-evidence`, `alberta-scale-robust-evidence`, `alberta-ftl-evidence`, `alberta-multiagent-evidence`, `alberta-ia-evidence` | Validate or build one claim's versioned artifact under its strict protocol |
 | `alberta-forager-benchmark`, `alberta-historical-forager` | Run development Forager comparisons or inspect reconstructed historical families |
@@ -250,6 +253,10 @@ The console scripts are grouped by responsibility; every command supports `--hel
 Benchmark commands are not shortcuts around the evidence rules. Read
 [`FORAGER_BENCHMARK.md`](FORAGER_BENCHMARK.md) and the
 [`foragax-open-screen` runbook](docs/runbooks/foragax-open-screen.md) before using them.
+Use the [maintained IPMNIST campaign tools](docs/runbooks/ipmnist-maintained-tools.md) for
+ceiling, frontier, and rule-discovery reproduction. Programs stored under `outputs/` remain
+historical provenance, not the maintained implementation; existing bytes follow their pinned
+immutable or active-campaign append-only policy.
 
 ## Package layout
 
@@ -401,6 +408,7 @@ consumed seeds, or modify immutable `outputs/` records. See
 ### Runbooks
 
 - [Foragax open development screen](docs/runbooks/foragax-open-screen.md)
+- [Maintained IPMNIST campaign tools](docs/runbooks/ipmnist-maintained-tools.md)
 
 ### Research and historical audits
 
