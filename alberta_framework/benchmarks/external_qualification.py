@@ -1,8 +1,9 @@
 """Fail-closed plans for external continual-learning benchmark qualification.
 
-These records are development coordination metadata, not executable benchmarks or
-scientific evidence.  A lane may only acquire a runner after every qualification
-gate has a concrete, reviewable value.
+These records are development coordination metadata, not executable benchmarks,
+launch authorization, or scientific evidence.  A lane may only acquire a runner
+after every qualification gate has a concrete, reviewable value and a separate
+execution surface enforces its own explicit authorization.
 """
 
 from __future__ import annotations
@@ -119,6 +120,8 @@ class ExternalQualificationPlan:
     @property
     def blockers(self) -> tuple[str, ...]:
         completed = set(self.completed_gates)
+        if not self.code_revisions:
+            completed.discard("external_code_available_and_license_reviewed")
         return tuple(gate for gate in self.required_gates if gate not in completed)
 
     def require_ready(self) -> None:
@@ -126,10 +129,15 @@ class ExternalQualificationPlan:
             raise RuntimeError(
                 f"external lane {self.lane_id} is not qualified: {', '.join(self.blockers)}"
             )
+        raise RuntimeError(
+            "R0 qualification metadata cannot authorize external execution; "
+            "a separately reviewed runner and explicit launch authorization are required"
+        )
 
 
 COMMON_GATES: tuple[str, ...] = (
     "external_code_available_and_license_reviewed",
+    "paper_code_and_asset_provenance_verified",
     "isolated_runtime_locked",
     "assets_checksums_and_storage_approved",
     "observation_action_and_boundary_contract_matched",
@@ -137,6 +145,7 @@ COMMON_GATES: tuple[str, ...] = (
     "persistent_bytes_steps_queries_and_timing_accounted",
     "parity_and_mechanism_off_tests_pass",
     "development_only_result_schema_and_validator_registered",
+    "external_execution_separately_authorized",
 )
 
 

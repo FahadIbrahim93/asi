@@ -24,17 +24,38 @@ def test_registry_exactly_covers_research_wave_and_is_not_run_ready() -> None:
             plan.require_ready()
 
 
-def test_ready_plan_requires_every_gate_without_reordering() -> None:
+def test_completed_r0_plan_still_cannot_authorize_external_execution() -> None:
+    revision = ExternalCodeRevision("https://github.com/org/repo.git", "a" * 40)
+    plan = ExternalQualificationPlan(
+        issue=1,
+        lane_id="fixture",
+        paper_revisions=("paper-v1",),
+        code_revisions=(revision,),
+        required_gates=("first", "second"),
+        completed_gates=("second", "first"),
+    )
+    assert plan.blockers == ()
+    with pytest.raises(RuntimeError, match="cannot authorize external execution"):
+        plan.require_ready()
+
+
+def test_missing_official_code_remains_a_blocker_even_if_claimed_complete() -> None:
     plan = ExternalQualificationPlan(
         issue=1,
         lane_id="fixture",
         paper_revisions=("paper-v1",),
         code_revisions=(),
-        required_gates=("first", "second"),
-        completed_gates=("second", "first"),
+        required_gates=COMMON_GATES,
+        completed_gates=COMMON_GATES,
     )
-    assert plan.blockers == ()
-    plan.require_ready()
+    assert "external_code_available_and_license_reviewed" in plan.blockers
+    with pytest.raises(RuntimeError, match="external_code_available_and_license_reviewed"):
+        plan.require_ready()
+
+
+def test_common_gates_require_provenance_and_separate_launch_authorization() -> None:
+    assert "paper_code_and_asset_provenance_verified" in COMMON_GATES
+    assert "external_execution_separately_authorized" in COMMON_GATES
 
 
 @pytest.mark.parametrize("issue", [True, 1574.0, "1574"])
