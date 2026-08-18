@@ -59,6 +59,26 @@ CAUSAL_MAP_VARIANT_KIND = "alberta_causal_map"
 _CAUSAL_MAP_RNG_NAMESPACE = 0xCA05A14
 _CAUSAL_MAP_PRNG_IMPL = "threefry2x32"
 _CAUSAL_MAP_ENVIRONMENT_PRNG_IMPL = "threefry2x32"
+_EXACT_NUMPY_INTEGER_TYPES = (
+    np.int8,
+    np.int16,
+    np.int32,
+    np.int64,
+    np.uint8,
+    np.uint16,
+    np.uint32,
+    np.uint64,
+)
+_EXACT_INTEGER_TYPES = (int, *_EXACT_NUMPY_INTEGER_TYPES)
+_EXACT_REAL_TYPES = (
+    int,
+    float,
+    *_EXACT_NUMPY_INTEGER_TYPES,
+    np.float16,
+    np.float32,
+    np.float64,
+    np.longdouble,
+)
 
 
 def _require_exact_str(name: object, value: object) -> str:
@@ -196,8 +216,7 @@ class CausalMapForagerConfig:
         ):
             value = getattr(self, name)
             if (
-                isinstance(value, bool)
-                or not isinstance(value, (int, float, np.integer, np.floating))
+                type(value) not in _EXACT_REAL_TYPES
                 or not math.isfinite(value)
                 or not _finite_float32(value)
             ):
@@ -213,8 +232,7 @@ class CausalMapForagerConfig:
         for name in positive_float:
             value = getattr(self, name)
             if (
-                isinstance(value, bool)
-                or not isinstance(value, (int, float, np.integer, np.floating))
+                type(value) not in _EXACT_REAL_TYPES
                 or not math.isfinite(value)
                 or value <= 0.0
                 or not _finite_float32(value)
@@ -234,8 +252,7 @@ class CausalMapForagerConfig:
         for name in nonnegative_float:
             value = getattr(self, name)
             if (
-                isinstance(value, bool)
-                or not isinstance(value, (int, float, np.integer, np.floating))
+                type(value) not in _EXACT_REAL_TYPES
                 or not math.isfinite(value)
                 or value < 0.0
                 or not _finite_float32(value)
@@ -243,11 +260,7 @@ class CausalMapForagerConfig:
                 raise ValueError(f"{name} must be finite and non-negative")
             object.__setattr__(self, name, float(value))
         if (
-            isinstance(self.exploration_probability, bool)
-            or not isinstance(
-                self.exploration_probability,
-                (int, float, np.integer, np.floating),
-            )
+            type(self.exploration_probability) not in _EXACT_REAL_TYPES
             or not math.isfinite(self.exploration_probability)
             or not 0.0 <= self.exploration_probability <= 1.0
             or not _finite_float32(self.exploration_probability)
@@ -258,7 +271,7 @@ class CausalMapForagerConfig:
             "exploration_probability",
             float(self.exploration_probability),
         )
-        if not isinstance(self.arrival_aware_readiness, bool):
+        if type(self.arrival_aware_readiness) is not bool:
             raise ValueError("arrival_aware_readiness must be a boolean")
         positive_int = (
             "initial_retry_delay",
@@ -270,16 +283,14 @@ class CausalMapForagerConfig:
         for name in positive_int:
             value = getattr(self, name)
             if (
-                isinstance(value, bool)
-                or not isinstance(value, (int, np.integer))
+                type(value) not in _EXACT_INTEGER_TYPES
                 or value < 1
                 or value > _INT32_MAX
             ):
                 raise ValueError(f"{name} must be a positive integer")
             object.__setattr__(self, name, int(value))
         if (
-            isinstance(self.maximum_retry_exponent, bool)
-            or not isinstance(self.maximum_retry_exponent, (int, np.integer))
+            type(self.maximum_retry_exponent) not in _EXACT_INTEGER_TYPES
             or self.maximum_retry_exponent < 0
             or self.maximum_retry_exponent > _INT32_MAX
         ):
@@ -290,8 +301,7 @@ class CausalMapForagerConfig:
             int(self.maximum_retry_exponent),
         )
         if (
-            isinstance(self.maximum_exact_interval_width, bool)
-            or not isinstance(self.maximum_exact_interval_width, (int, np.integer))
+            type(self.maximum_exact_interval_width) not in _EXACT_INTEGER_TYPES
             or self.maximum_exact_interval_width < 0
             or self.maximum_exact_interval_width > _INT32_MAX
         ):
@@ -315,11 +325,7 @@ class CausalMapForagerConfig:
                 "maximum_respawn_delay must be at least minimum_respawn_delay"
             )
         if (
-            isinstance(self.respawn_safety_quantile, bool)
-            or not isinstance(
-                self.respawn_safety_quantile,
-                (int, float, np.integer, np.floating),
-            )
+            type(self.respawn_safety_quantile) not in _EXACT_REAL_TYPES
             or not math.isfinite(self.respawn_safety_quantile)
             or not 0.5 <= self.respawn_safety_quantile < 1.0
             or not _finite_float32(self.respawn_safety_quantile)
@@ -433,8 +439,7 @@ class CausalMapForagerConfig:
             raise ValueError(f"unknown causal-map config fields: {sorted(unknown)}")
         config = cls(**data)
         if declared_quantile_z is not None and (
-            isinstance(declared_quantile_z, bool)
-            or not isinstance(declared_quantile_z, (int, float))
+            type(declared_quantile_z) not in (int, float)
             or not math.isclose(
                 float(declared_quantile_z),
                 config.respawn_quantile_z,
@@ -2034,8 +2039,7 @@ def validate_causal_map_state(
     if channel_count < 1:
         raise ValueError("state must contain at least one observation channel")
     if observation_channels is not None and (
-        isinstance(observation_channels, bool)
-        or not isinstance(observation_channels, (int, np.integer))
+        type(observation_channels) not in _EXACT_INTEGER_TYPES
         or observation_channels < 1
     ):
         raise ValueError("observation_channels must be a positive integer")
@@ -2637,7 +2641,7 @@ class CausalMapForagerAgent:
         if config is not None and not isinstance(config, CausalMapForagerConfig):
             raise TypeError("config must be a CausalMapForagerConfig")
         self.config = config if config is not None else CausalMapForagerConfig()
-        if type(seed) is not int and not isinstance(seed, np.integer):
+        if type(seed) not in _EXACT_INTEGER_TYPES:
             raise ValueError("seed must be a uint32-compatible integer")
         self.seed = int(seed)
         if not 0 <= self.seed <= np.iinfo(np.uint32).max:
@@ -2848,8 +2852,7 @@ def _validate_benchmark_contract(
 ) -> None:
     env = benchmark_config.environment
     if (
-        isinstance(benchmark_config.steps, bool)
-        or not isinstance(benchmark_config.steps, int)
+        type(benchmark_config.steps) is not int
         or benchmark_config.steps < 1
         or benchmark_config.steps >= _INT32_MAX
     ):
@@ -2857,8 +2860,7 @@ def _validate_benchmark_contract(
             "causal-map benchmark steps must be a positive int below int32 maximum"
         )
     if (
-        isinstance(benchmark_config.jax_chunk_size, bool)
-        or not isinstance(benchmark_config.jax_chunk_size, int)
+        type(benchmark_config.jax_chunk_size) is not int
         or benchmark_config.jax_chunk_size < 1
         or benchmark_config.jax_chunk_size >= _INT32_MAX
     ):
@@ -3530,7 +3532,7 @@ def run_causal_map_forager_seeds(
     if not raw_seeds:
         raise ValueError("seeds must be non-empty")
     if any(
-        type(seed) is not int and not isinstance(seed, np.integer)
+        type(seed) not in _EXACT_INTEGER_TYPES
         for seed in raw_seeds
     ):
         raise ValueError("seeds must be uint32-compatible integers without coercion")

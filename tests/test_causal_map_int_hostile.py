@@ -25,6 +25,18 @@ class _HostileInt(int):
         raise AssertionError("hostile gt")
 
 
+class _HostileFloat(float):
+    calls = 0
+
+    def __float__(self) -> float:
+        type(self).calls += 1
+        raise AssertionError("hostile float conversion")
+
+    def __lt__(self, other: object) -> bool:
+        type(self).calls += 1
+        raise AssertionError("hostile float lt")
+
+
 def test_world_shape_rejects_hostile_before_lt() -> None:
     hostile = _HostileInt(2)
     _HostileInt.calls = 0
@@ -59,6 +71,20 @@ def test_seed_rejects_hostile_before_range() -> None:
         CausalMapForagerAgent(seed=hostile)  # type: ignore[arg-type]
     assert _HostileInt.calls == 0
     assert CausalMapForagerAgent(seed=0).seed == 0
+
+
+def test_config_rejects_hostile_numeric_subclasses_before_hooks() -> None:
+    from alberta_framework.benchmarks.causal_map_forager import CausalMapForagerConfig
+
+    hostile_int = _HostileInt(10)
+    hostile_float = _HostileFloat(0.1)
+    _HostileInt.calls = 0
+    _HostileFloat.calls = 0
+    with pytest.raises(Exception, match="initial_retry_delay"):
+        CausalMapForagerConfig(initial_retry_delay=hostile_int)  # type: ignore[arg-type]
+    with pytest.raises(Exception, match="distance_cost"):
+        CausalMapForagerConfig(distance_cost=hostile_float)  # type: ignore[arg-type]
+    assert _HostileInt.calls == _HostileFloat.calls == 0
 
 
 def test_seeds_rejects_hostile_before_lt() -> None:

@@ -31,6 +31,18 @@ class _ExplodingPattern:
         raise AssertionError("pattern matching must follow exact-type validation")
 
 
+class _HostileInt(int):
+    calls = 0
+
+    def __eq__(self, other: object) -> bool:
+        type(self).calls += 1
+        raise AssertionError("hostile integer equality must not execute")
+
+    def __lt__(self, other: object) -> bool:
+        type(self).calls += 1
+        raise AssertionError("hostile integer ordering must not execute")
+
+
 @pytest.fixture
 def dummy_rule() -> ForagerTuningRule:
     return ForagerTuningRule(
@@ -122,6 +134,27 @@ def test_state_payload_identity_gates_reject_string_subclasses_before_dispatch(
             description="hostile payload",
         )
     assert _HostileString.calls == _ExplodingPattern.calls == 0
+
+
+def test_source_snapshot_rejects_hostile_archive_size_before_comparison() -> None:
+    hostile = _HostileInt(1)
+    _HostileInt.calls = 0
+    with pytest.raises(ForagerMatrixStateError, match="archive size is invalid"):
+        matrix._validate_source_snapshot_bytes(
+            b"x",
+            {
+                "path": matrix.SOURCE_SNAPSHOT_FILENAME,
+                "archive_format": matrix.SOURCE_ARCHIVE_FORMAT,
+                "archive_sha256": hashlib.sha256(b"x").hexdigest(),
+                "archive_size": hostile,
+                "tree_sha256": "0" * 64,
+                "inventory_sha256": "0" * 64,
+                "inventory": {},
+                "source_execution_mode": matrix.SNAPSHOT_SOURCE_EXECUTION_MODE,
+            },
+            description="hostile snapshot",
+        )
+    assert _HostileInt.calls == 0
 
     with pytest.raises(ForagerMatrixStateError, match="UTC timestamp"):
         matrix._validate_utc_timestamp(hostile, "hostile timestamp")

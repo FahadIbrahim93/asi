@@ -874,8 +874,7 @@ def _validate_key_frame(value: KeyFrame, expected: KeyFrame, path: str) -> None:
             not isinstance(words, tuple)
             or len(words) != 2
             or any(
-                isinstance(word, bool)
-                or not isinstance(word, int)
+                type(word) is not int
                 or not 0 <= word <= _KEY_WORD_MAX
                 for word in words
             )
