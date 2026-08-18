@@ -100,7 +100,7 @@ def _require_int(
     minimum: int | None = None,
     maximum: int | None = None,
 ) -> int:
-    if type(value) not in _ACTUAL_INT_TYPES:
+    if all(type(value) is not allowed for allowed in _ACTUAL_INT_TYPES):
         raise ValueError(f"{name} must be an integer")
     number = operator.index(cast(SupportsIndex, value))
     if minimum is not None and number < minimum:
@@ -111,7 +111,7 @@ def _require_int(
 
 
 def _require_finite_real(name: str, value: object) -> float:
-    if type(value) not in _ALLOWED_REAL_TYPES:
+    if all(type(value) is not allowed for allowed in _ALLOWED_REAL_TYPES):
         raise ValueError(f"{name} must be a real number")
     # validated_float32_scalar ensures finite and canonical float32 domain;
     # use permissive domain to allow any finite real then check isfinite via validator.
@@ -515,7 +515,7 @@ def to_security_gym_action(
     ``action`` id and a one-element ``risk_score`` array. A one-element tuple is
     accepted by the environment and keeps this module dependency-free.
     """
-    if type(risk_score) not in _ALLOWED_REAL_TYPES:
+    if all(type(risk_score) is not allowed for allowed in _ALLOWED_REAL_TYPES):
         raise ValueError("risk_score must be a finite real number")
     try:
         val = validated_float32_scalar("risk_score", risk_score)
@@ -564,7 +564,7 @@ class ThroughputMeasurement:
 
     def __post_init__(self) -> None:
         n_events = _require_int("n_events", self.n_events, minimum=0, maximum=_INT32_MAX)
-        if type(self.elapsed_s) not in _ALLOWED_REAL_TYPES:
+        if all(type(self.elapsed_s) is not allowed for allowed in _ALLOWED_REAL_TYPES):
             raise ValueError("elapsed_s must be a real number")
         try:
             elapsed_s = float(self.elapsed_s)

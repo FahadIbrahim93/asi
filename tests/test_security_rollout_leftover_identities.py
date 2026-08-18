@@ -6,7 +6,21 @@ import json
 
 import pytest
 
-from alberta_framework.security import SecurityAction, SecurityRolloutStep
+from alberta_framework.security import (
+    SecurityAction,
+    SecurityRolloutStep,
+    ThroughputMeasurement,
+    to_security_gym_action,
+)
+
+
+class _ExplodingHashMeta(type):
+    def __hash__(cls) -> int:
+        raise AssertionError("hostile runtime-class hash executed")
+
+
+class _HostileScalar(metaclass=_ExplodingHashMeta):
+    pass
 
 
 def _legal_step(**overrides: object) -> SecurityRolloutStep:
@@ -55,3 +69,16 @@ def test_security_rollout_step_rejects_leftover_identities() -> None:
     assert '"reward": true' not in dumped
     assert '"terminated": 1' not in dumped
     assert legal.action is SecurityAction.PASS
+
+
+def test_real_type_gates_do_not_hash_hostile_runtime_classes() -> None:
+    hostile = _HostileScalar()
+
+    with pytest.raises(ValueError, match=r"state\[0\]"):
+        _legal_step(state=(hostile, 1.0))
+    with pytest.raises(ValueError, match="risk_score"):
+        to_security_gym_action(SecurityAction.PASS, hostile)
+    with pytest.raises(ValueError, match="n_events"):
+        ThroughputMeasurement(n_events=hostile, elapsed_s=1.0)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="elapsed_s"):
+        ThroughputMeasurement(n_events=1, elapsed_s=hostile)  # type: ignore[arg-type]

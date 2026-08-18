@@ -42,7 +42,7 @@ _ACTUAL_INT_TYPES = frozenset(
 
 def _require_tracking_interval(value: object) -> int:
     """Reject leftover bool/float identities before they become recording strides."""
-    if type(value) not in _ACTUAL_INT_TYPES:
+    if all(type(value) is not allowed for allowed in _ACTUAL_INT_TYPES):
         raise ValueError("interval must be a non-negative integer")
     number = operator.index(cast(SupportsIndex, value))
     if not 0 <= number <= _INT32_MAX:
