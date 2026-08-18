@@ -209,7 +209,9 @@ def _threefry_key(name: str, value: object) -> Array:
 def _finite_result(candidate: Array, fallback: Array, *, name: str) -> Array:
     valid = jnp.all(jnp.isfinite(candidate))
     safe = jnp.where(valid, candidate, fallback)
-    if not isinstance(valid, core.Tracer) and not bool(valid):
+    if isinstance(valid, core.Tracer):
+        return jnp.where(valid, safe, jnp.full_like(safe, jnp.nan))
+    if not bool(valid):
         raise ValueError(f"{name} must produce only finite values")
     return safe
 
@@ -229,9 +231,10 @@ def persistent_array_bytes(*arrays: Array | np.ndarray) -> int:
     total = 0
     for value in arrays:
         array: Array | np.ndarray
-        if type(value) is np.ndarray:
+        actual_type = type(value)
+        if actual_type is np.ndarray:
             array = value
-        elif isinstance(value, Array):
+        elif issubclass(actual_type, Array):
             array = value
         else:
             raise ValueError("persistent comparator values must be arrays")
@@ -381,14 +384,15 @@ def adamo_update(
         & jnp.all(jnp.isfinite(moment))
         & jnp.all(jnp.isfinite(variance))
     )
-    safe = (
-        jnp.where(valid, candidate, weights),
-        jnp.where(valid, moment, first_moment),
-        jnp.where(valid, variance, second_moment),
-    )
-    if not isinstance(valid, core.Tracer) and not bool(valid):
+    if isinstance(valid, core.Tracer):
+        return (
+            jnp.where(valid, candidate, jnp.full_like(candidate, jnp.nan)),
+            jnp.where(valid, moment, jnp.full_like(moment, jnp.nan)),
+            jnp.where(valid, variance, jnp.full_like(variance, jnp.nan)),
+        )
+    if not bool(valid):
         raise ValueError("AdamO update must produce only finite values")
-    return safe
+    return candidate, moment, variance
 
 
 def intentional_td_step_size(
@@ -453,16 +457,18 @@ def bounded_elastic_mask(
     prune: int,
 ) -> Array:
     """Static-shape adaptive elastic transition under a hard peak-width bound."""
-    if type(active) is not np.ndarray and not isinstance(active, Array):
+    active_type = type(active)
+    utilities_type = type(utilities)
+    if active_type is not np.ndarray and not issubclass(active_type, Array):
         raise ValueError("active must be a NumPy or JAX array")
-    if type(utilities) is not np.ndarray and not isinstance(utilities, Array):
+    if utilities_type is not np.ndarray and not issubclass(utilities_type, Array):
         raise ValueError("utilities must be a NumPy or JAX array")
     active_np = np.asarray(active)
     utilities_np = np.asarray(utilities)
     if active_np.ndim != 1 or utilities_np.shape != active_np.shape:
         raise ValueError("active and utilities must be matching vectors")
-    if active_np.size > _INT32_MAX:
-        raise ValueError("active mask exceeds the signed-int32 element limit")
+    if active_np.size > _MAX_ARRAY_ELEMENTS:
+        raise ValueError("active mask exceeds the 1000000-element limit")
     if active_np.dtype != np.bool_ or utilities_np.dtype.kind not in "iuf":
         raise ValueError("active must be bool and utilities must be real numeric")
     if not np.isfinite(utilities_np).all():
