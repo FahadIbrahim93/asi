@@ -1,5 +1,7 @@
 """Hostile validation for experiments facade."""
 
+from typing import Any
+
 import pytest
 
 from alberta_framework.core.learners import LinearLearner
@@ -38,7 +40,7 @@ def test_finite_metric_hostile_without_repr() -> None:
     evil = _EvilStr("metric")
     _EvilStr.calls = 0
     with pytest.raises(ValueError, match="must be an exact string") as exc:
-        _require_finite_metric_array(np.array([1.0]), evil)  # type: ignore[arg-type]
+        _require_finite_metric_array(np.array([1.0]), evil)
     assert _EvilStr.calls == 0
     assert "EvilStr" not in str(exc.value)
 
@@ -48,7 +50,7 @@ def test_finite_metric_string_subclass_rejected() -> None:
 
     with pytest.raises(ValueError, match="must be an exact string"):
         _require_finite_metric_array(
-            np.array([1.0]), _StringSubclass("metric")  # type: ignore[arg-type]
+            np.array([1.0]), _StringSubclass("metric")
         )
 
 
@@ -65,14 +67,14 @@ def test_hyperparam_coordinate_hostile_name() -> None:
     evil = _EvilStr("bad")
     _EvilStr.calls = 0
     with pytest.raises(ValueError, match="must be an exact string"):
-        _require_hyperparameter_coordinate(1.0, name=evil)  # type: ignore[arg-type]
+        _require_hyperparameter_coordinate(1.0, name=evil)
     assert _EvilStr.calls == 0
 
 
 def test_hyperparam_string_subclass_rejected() -> None:
     with pytest.raises(ValueError, match="must be an exact string"):
         _require_hyperparameter_coordinate(
-            1.0, name=_StringSubclass("bad")  # type: ignore[arg-type]
+            1.0, name=_StringSubclass("bad")
         )
 
 
@@ -80,7 +82,7 @@ def test_coordinate_hash_hostile_name() -> None:
     evil = _EvilStr("bad")
     _EvilStr.calls = 0
     with pytest.raises(ValueError, match="must be an exact string"):
-        _require_coordinate_hash(1.0, name=evil)  # type: ignore[arg-type]
+        _require_coordinate_hash(1.0, name=evil)
     assert _EvilStr.calls == 0
 
 
@@ -99,11 +101,11 @@ def test_multi_seed_rejects_hostile_config_name_before_hash_or_factories() -> No
     evil = _EvilStr("candidate")
     _EvilStr.calls = 0
 
-    def fail_factory():
+    def fail_factory() -> Any:
         raise AssertionError("factory must not run")
 
     with pytest.raises(ValueError, match="must be an exact string"):
-        ExperimentConfig(evil, fail_factory, fail_factory, 1)  # type: ignore[arg-type]
+        ExperimentConfig(evil, fail_factory, fail_factory, 1)
     assert _EvilStr.calls == 0
 
 
@@ -138,6 +140,12 @@ def test_experiment_records_accept_canonical_identities() -> None:
     assert config.num_steps == 2
     assert run.seed == 0
     assert run.config_name == "fixture"
+    assert isinstance(config, tuple)
+    assert isinstance(run, tuple)
+    assert config._fields == ("name", "learner_factory", "stream_factory", "num_steps")
+    assert run._fields == ("config_name", "seed", "metrics_history", "final_state")
+    assert config._asdict()["num_steps"] == 2
+    assert run._replace(seed=1).seed == 1
 
 
 def test_experiment_records_reject_leftover_integer_identities() -> None:
@@ -158,3 +166,27 @@ def test_experiment_records_reject_leftover_name_and_host_identities() -> None:
         _legal_config(learner_factory=None)
     with pytest.raises(ValueError, match="metrics_history must be an exact list"):
         _legal_run(metrics_history={"squared_error": 0.1})
+
+
+def test_single_run_result_validates_nested_sufficient_statistics() -> None:
+    class HostileMetrics(list[object]):
+        calls = 0
+
+        def __len__(self) -> int:
+            self.calls += 1
+            raise AssertionError("must not size")
+
+    hostile = HostileMetrics()
+    with pytest.raises(ValueError, match="exact list"):
+        _legal_run(metrics_history=hostile)
+    assert hostile.calls == 0
+    with pytest.raises(ValueError, match="exact dict"):
+        _legal_run(metrics_history=[type("Metrics", (dict,), {})()])
+    with pytest.raises(ValueError, match="same metric keys"):
+        _legal_run(metrics_history=[{"loss": 1.0}, {"accuracy": 1.0}])
+    with pytest.raises(ValueError, match="finite builtin number"):
+        _legal_run(metrics_history=[{"loss": True}])
+    source = [{"loss": 1}]
+    run = _legal_run(metrics_history=source)
+    source[0]["loss"] = 9
+    assert run.metrics_history == [{"loss": 1.0}]
