@@ -31,9 +31,9 @@ from alberta_framework.reference_agent import (
     DispatchCommand,
     DispatchStatus,
     ReferenceAgentUpdate,
-    SpaceSpec,
     ReferenceTransactionLedger,
     ReferenceTransactionReducer,
+    SpaceSpec,
     TransactionPhase,
 )
 from alberta_framework.reference_life import (
@@ -70,11 +70,25 @@ class _HostileInt(int):
         type(self).hook_calls += 1
         raise AssertionError("hostile integer comparison hook executed")
 
-    __eq__ = lambda self, other: self._explode()
-    __lt__ = lambda self, other: self._explode()
-    __le__ = lambda self, other: self._explode()
-    __gt__ = lambda self, other: self._explode()
-    __ge__ = lambda self, other: self._explode()
+    def __eq__(self, other: object) -> bool:
+        del other
+        return self._explode()
+
+    def __lt__(self, other: object) -> bool:
+        del other
+        return self._explode()
+
+    def __le__(self, other: object) -> bool:
+        del other
+        return self._explode()
+
+    def __gt__(self, other: object) -> bool:
+        del other
+        return self._explode()
+
+    def __ge__(self, other: object) -> bool:
+        del other
+        return self._explode()
 
 
 class _HostileHaltReason(str):
