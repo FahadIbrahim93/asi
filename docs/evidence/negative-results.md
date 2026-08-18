@@ -78,6 +78,22 @@ postmortem.
     replacing the readout. Record:
     [`summary_rls_head_confirm.json`](../../outputs/ipmnist_screening/summary_rls_head_confirm.json).
 
+12. **Detector-driven covariance reset is load-bearing for the selected
+    residual RLS head.** The permanently nonpromoting issue-#184 development
+    screen remeasured the reset incumbent and the otherwise identical no-reset
+    arm for seeds 0, 1, and 2. Candidate-minus-incumbent online-accuracy
+    differences were `[-0.008220, -0.007950, -0.008033]`; their mean was
+    `-0.00806778150000013` (standard error `0.00007982303614743532`). Every
+    seed was negative and the mean crossed the frozen `-0.002` threshold, so
+    the preregistered outcome is `reset_load_bearing`. The source was commit
+    `2f4f92afbdfea9f6b48144734f378b2af0987c60`, tree
+    `65b8390fd430149ddcca80ea8da75e1782ac8e3b`; GitHub Actions run
+    `32096417545` produced artifact `9310391499` (download SHA-256
+    `e15416fba53a3f1f408356da4748c3e19382447df17647c1a5c3de35ccf15ef8`).
+    The no-reset arm is retired from the live screening registry. This result
+    is development-only and cannot support scientific promotion. Record:
+    [`rls_preset_ablation_r1/`](../../outputs/ipmnist_screening/rls_preset_ablation_r1/).
+
 12. **Naive Bayes did not remove the post-permutation transient.** Its flat
     task-average curve hid poor early shifted-step performance, so ordinary
     voting added little. Resetting the member's annealing clock helped, but the

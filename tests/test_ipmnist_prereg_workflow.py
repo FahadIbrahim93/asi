@@ -6,8 +6,9 @@ import json
 import runpy
 import urllib.request
 import zipfile
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, cast
 
 import numpy as np
@@ -1459,7 +1460,9 @@ def _write_protocol_bundle(
     protocol_key: str,
     candidate_accuracy: float,
 ) -> Path:
+    import alberta_framework.benchmarks.ipmnist_screening as screening_module
     from alberta_framework.benchmarks.ipmnist_screening import (
+        SCREENING_REGISTRY,
         ScreeningRunResult,
         merge_shards,
         screening_spec,
@@ -1468,6 +1471,21 @@ def _write_protocol_bundle(
     from alberta_framework.benchmarks.upgd_ipmnist import IPMNISTConfig
 
     protocol = _PROTOCOLS[protocol_key]
+    if protocol_key == "issue184":
+        incumbent = screening_spec(protocol.control)
+        retired = replace(
+            incumbent,
+            name=protocol.candidate,
+            hyperparameters={
+                **incumbent.hyperparameters,
+                "rls_reset_frac": 2.0,
+            },
+        )
+        monkeypatch.setattr(
+            screening_module,
+            "SCREENING_REGISTRY",
+            MappingProxyType({**SCREENING_REGISTRY, protocol.candidate: retired}),
+        )
     namespace = root / "outputs" / "ipmnist_screening" / protocol.namespace
     shards_dir = namespace / "shards"
     shards_dir.mkdir(parents=True)
