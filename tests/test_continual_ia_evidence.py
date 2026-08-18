@@ -335,6 +335,20 @@ def test_artifact_is_valid_bound_deterministic_and_explicitly_narrow(
     assert not later_validation.accepted
 
 
+def test_old_schema_source_replay_cannot_validate_as_historical_evidence() -> None:
+    replay_path = (
+        Path(__file__).resolve().parents[1]
+        / "outputs/continual_ia/reproductions/nonpromoting_consumed_seed_replay.json"
+    )
+    validation = validate_ia_evidence_artifact(load_ia_evidence_artifact(replay_path))
+
+    assert not validation.valid
+    assert not validation.accepted
+    assert "historical v1 content digest is not the immutable recorded evaluation" in (
+        validation.errors
+    )
+
+
 def test_strict_json_round_trip_rejects_nonstandard_numbers(
     heldout_artifact: dict[str, object],
     tmp_path: Path,
