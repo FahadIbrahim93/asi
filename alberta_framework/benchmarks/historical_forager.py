@@ -1412,7 +1412,7 @@ class HistoricalForagerPairingIdentity:
             raise HistoricalForagerContractError(
                 "semantic_contract_sha256 must be a 64-character lowercase SHA-256"
             )
-        if self.environment_adapter_mode not in (
+        if type(self.environment_adapter_mode) is not str or self.environment_adapter_mode not in (
             "golden_verified_read_only_source",
             "development_unverified_factory",
         ):

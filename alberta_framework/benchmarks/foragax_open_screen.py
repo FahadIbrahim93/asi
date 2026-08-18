@@ -180,7 +180,7 @@ class ScreenError(RuntimeError):
 
 
 def _require_string(value: Any, label: str) -> str:
-    if not isinstance(value, str) or not value:
+    if type(value) is not str or not value:
         raise ScreenError(f"{label} must be a non-empty string")
     return value
 
@@ -261,6 +261,8 @@ class ProtocolSnapshot:
             raise ScreenError("protocol must be a FrozenProtocol")
         if type(self.inventory) is not tuple:
             raise ScreenError("inventory must be a tuple")
+        if any(type(item) is not dict for item in self.inventory):
+            raise ScreenError("inventory must contain exact dictionaries")
         _require_sha256(self.inventory_sha256, "inventory_sha256")
 
 
@@ -275,9 +277,9 @@ class ProcessCapture:
     def __post_init__(self) -> None:
         if type(self.returncode) is not int or isinstance(self.returncode, bool):
             raise ScreenError("returncode must be an integer")
-        if not isinstance(self.stdout, (bytes, bytearray)):
+        if type(self.stdout) is not bytes:
             raise ScreenError("stdout must be bytes")
-        if not isinstance(self.stderr, (bytes, bytearray)):
+        if type(self.stderr) is not bytes:
             raise ScreenError("stderr must be bytes")
 
 

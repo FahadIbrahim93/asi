@@ -86,7 +86,7 @@ def test_forager_paired_comparison_rejects_invalid_inputs() -> None:
 
 
 def test_forager_comparison_report_rejects_invalid_inputs() -> None:
-    with pytest.raises(TypeError, match="summaries must be a mapping"):
+    with pytest.raises(TypeError, match="summaries must be an exact dictionary"):
         ForagerComparisonReport(
             candidate="cand_1",
             metric="mean_reward",
@@ -94,6 +94,36 @@ def test_forager_comparison_report_rejects_invalid_inputs() -> None:
             paired_comparisons=(),
             unpaired_methods=(),
         )
+
+
+def test_forager_comparison_literals_reject_before_hooks() -> None:
+    calls = 0
+
+    class Hostile:
+        def __eq__(self, _other: object) -> bool:
+            nonlocal calls
+            calls += 1
+            raise AssertionError("comparison hook reached")
+
+        def __repr__(self) -> str:
+            nonlocal calls
+            calls += 1
+            raise AssertionError("repr hook reached")
+
+    with pytest.raises(ValueError, match="metric is not a valid ForagerMetric"):
+        ForagerPairedComparison(
+            candidate="candidate",
+            baseline="baseline",
+            candidate_privileged=False,
+            baseline_privileged=False,
+            metric=Hostile(),  # type: ignore[arg-type]
+            seeds=(0,),
+            mean_difference=0.0,
+            ci_low=0.0,
+            ci_high=0.0,
+            confidence=0.95,
+        )
+    assert calls == 0
 
     with pytest.raises(TypeError, match="paired_comparisons must be an exact tuple"):
         ForagerComparisonReport(

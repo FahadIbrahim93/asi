@@ -61,6 +61,28 @@ def test_process_capture_rejects_invalid_inputs() -> None:
         )
 
     with pytest.raises(ScreenError, match="stdout must be bytes"):
+        ProcessCapture(returncode=0, stdout=bytearray(), stderr=b"")
+
+
+def test_frozen_configuration_rejects_string_subclass_before_len_hook() -> None:
+    calls = 0
+
+    class HostileString(str):
+        def __len__(self) -> int:
+            nonlocal calls
+            calls += 1
+            raise AssertionError("length hook reached")
+
+    with pytest.raises(ScreenError, match="path must be a non-empty string"):
+        FrozenConfiguration(
+            path=HostileString("config.json"),
+            sha256="a" * 64,
+            agent="dqn",
+            entrypoint="main.py",
+        )
+    assert calls == 0
+
+    with pytest.raises(ScreenError, match="stdout must be bytes"):
         ProcessCapture(
             returncode=0,
             stdout="not bytes",  # type: ignore[arg-type]

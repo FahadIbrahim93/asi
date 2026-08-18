@@ -5326,7 +5326,7 @@ class ScreeningSpec:
             val = getattr(self, attr)
             if type(val) is not str or not val:
                 raise ValueError(f"{attr} must be a non-empty string")
-        if not isinstance(self.hyperparameters, dict):
+        if type(self.hyperparameters) is not dict:
             raise TypeError("hyperparameters must be a dict")
         if not callable(self.factory):
             raise TypeError("factory must be callable")
@@ -7694,15 +7694,15 @@ class ScreeningRunResult:
             val = getattr(self, attr)
             if type(val) is not str or not val:
                 raise ValueError(f"{attr} must be a non-empty string")
-        if not isinstance(self.hyperparameters, dict):
+        if type(self.hyperparameters) is not dict:
             raise TypeError("hyperparameters must be a dict")
         object.__setattr__(self, "seed", require_jax_seed(self.seed, name="seed"))
         if type(self.config) is not IPMNISTConfig:
             raise TypeError("config must be an IPMNISTConfig")
         for arr_name in ("per_task_accuracy", "per_task_loss", "per_task_plasticity"):
-            if not isinstance(getattr(self, arr_name), np.ndarray):
+            if type(getattr(self, arr_name)) is not np.ndarray:
                 raise TypeError(f"{arr_name} must be a numpy ndarray")
-        if not isinstance(self.wall_clock_seconds, (int, float)) or not math.isfinite(
+        if type(self.wall_clock_seconds) not in (int, float) or not math.isfinite(
             self.wall_clock_seconds
         ):
             raise ValueError("wall_clock_seconds must be a finite float")

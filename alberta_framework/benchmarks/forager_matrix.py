@@ -345,30 +345,32 @@ class ForagerTuningRule:
     def __post_init__(self) -> None:
         if type(self.metric) is not str or not self.metric:
             raise ForagerMatrixManifestError("metric must be a non-empty string")
-        if self.direction not in ("maximize", "minimize"):
+        if type(self.direction) is not str or self.direction not in ("maximize", "minimize"):
             raise ForagerMatrixManifestError("direction must be 'maximize' or 'minimize'")
-        if self.statistic not in ("mean", "median"):
-            raise ForagerMatrixManifestError("statistic must be 'mean' or 'median'")
+        if type(self.statistic) is not str or self.statistic not in (
+            "mean",
+            "conservative_ci_endpoint",
+        ):
+            raise ForagerMatrixManifestError(
+                "statistic must be 'mean' or 'conservative_ci_endpoint'"
+            )
         if (
-            isinstance(self.confidence, bool)
-            or not isinstance(self.confidence, (int, float))
+            type(self.confidence) not in (int, float)
             or not math.isfinite(float(self.confidence))
             or not 0.0 < float(self.confidence) < 1.0
         ):
             raise ForagerMatrixManifestError("confidence must be a finite float in (0.0, 1.0)")
         if (
-            isinstance(self.bootstrap_resamples, bool)
-            or not isinstance(self.bootstrap_resamples, int)
+            type(self.bootstrap_resamples) is not int
             or self.bootstrap_resamples < 1
         ):
             raise ForagerMatrixManifestError("bootstrap_resamples must be an integer >= 1")
         if (
-            isinstance(self.bootstrap_seed, bool)
-            or not isinstance(self.bootstrap_seed, int)
+            type(self.bootstrap_seed) is not int
             or not 0 <= self.bootstrap_seed <= 2**31 - 1
         ):
             raise ForagerMatrixManifestError("bootstrap_seed must be an integer in [0, 2**31 - 1]")
-        if self.tie_break != "variant_id_ascending":
+        if type(self.tie_break) is not str or self.tie_break != "variant_id_ascending":
             raise ForagerMatrixManifestError("tie_break must be 'variant_id_ascending'")
 
     def to_dict(self) -> dict[str, Any]:
@@ -432,8 +434,8 @@ class ForagerTuningSelection:
     def __post_init__(self) -> None:
         if type(self.report_path) is not str or not self.report_path:
             raise ForagerMatrixManifestError("report_path must be a non-empty string")
-        if type(self.file_sha256) is not str or len(self.file_sha256) != 64:
-            raise ForagerMatrixManifestError("file_sha256 must be a 64-character hex string")
+        if type(self.file_sha256) is not str or _SHA256.fullmatch(self.file_sha256) is None:
+            raise ForagerMatrixManifestError("file_sha256 must be a lowercase SHA-256 digest")
         if not isinstance(self.selected_variants, Mapping):
             raise ForagerMatrixManifestError("selected_variants must be a mapping")
 

@@ -46,6 +46,28 @@ def test_paper_baseline_rejects_invalid_inputs() -> None:
             source="paper",
         )
 
+
+def test_paper_baseline_role_rejects_before_comparison_hook() -> None:
+    calls = 0
+
+    class Hostile:
+        def __eq__(self, _other: object) -> bool:
+            nonlocal calls
+            calls += 1
+            raise AssertionError("comparison hook reached")
+
+    with pytest.raises(ValueError, match="role must be an exact string"):
+        PaperBaseline(
+            name="base",
+            family="family",
+            role=Hostile(),  # type: ignore[arg-type]
+            state_construction="raw",
+            selected_hyperparameters={},
+            in_tree_implementation=True,
+            source="paper",
+        )
+    assert calls == 0
+
     with pytest.raises(ValueError, match="role is invalid"):
         PaperBaseline(
             name="base",

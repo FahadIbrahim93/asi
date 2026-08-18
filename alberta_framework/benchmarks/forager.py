@@ -636,12 +636,12 @@ class ForagerFeatureState:
     def __post_init__(self) -> None:
         if type(self.last_action) is not int or isinstance(self.last_action, bool):
             raise ValueError("last_action must be an integer")
-        if not isinstance(self.last_reward, (int, float)) or not math.isfinite(self.last_reward):
+        if type(self.last_reward) not in (int, float) or not math.isfinite(self.last_reward):
             raise ValueError("last_reward must be a finite float")
         if type(self.reward_traces) is not tuple:
             raise ValueError("reward_traces must be a tuple")
         for trace in self.reward_traces:
-            if not isinstance(trace, (int, float)) or not math.isfinite(trace):
+            if type(trace) not in (int, float) or not math.isfinite(trace):
                 raise ValueError("reward_traces values must be finite floats")
 
 
