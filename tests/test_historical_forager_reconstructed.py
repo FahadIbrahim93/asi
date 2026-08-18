@@ -489,9 +489,8 @@ def test_pairing_identity_requires_same_seed_horizon_geometry_and_family(tmp_pat
         assert_historical_artifacts_pairable(identity, dishonest)
     with pytest.raises(HistoricalForagerContractError, match="canonical provenance"):
         assert_historical_artifacts_pairable(dishonest, dishonest)
-    invalid_coordinates = dataclasses.replace(identity, steps=0)
-    with pytest.raises(HistoricalForagerContractError, match="run coordinates"):
-        assert_historical_artifacts_pairable(invalid_coordinates, invalid_coordinates)
+    with pytest.raises(HistoricalForagerContractError, match="steps must lie"):
+        dataclasses.replace(identity, steps=0)
     verified_mode = dataclasses.replace(
         identity,
         environment_adapter_mode="golden_verified_read_only_source",

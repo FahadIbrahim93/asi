@@ -26,6 +26,8 @@ def test_step_size_tracking_config_rejects_leftover_identities() -> None:
         StepSizeTrackingConfig(interval=float("nan"))
     with pytest.raises(ValueError, match="interval"):
         StepSizeTrackingConfig(interval=-1)
+    with pytest.raises(ValueError, match="interval"):
+        StepSizeTrackingConfig(interval=2**31)
     with pytest.raises(ValueError, match="include_bias"):
         StepSizeTrackingConfig(interval=10, include_bias=1)
     with pytest.raises(ValueError, match="include_bias"):
@@ -54,6 +56,8 @@ def test_normalizer_tracking_config_rejects_leftover_identities() -> None:
         NormalizerTrackingConfig(interval=float("nan"))
     with pytest.raises(ValueError, match="interval"):
         NormalizerTrackingConfig(interval=-1)
+    with pytest.raises(ValueError, match="interval"):
+        NormalizerTrackingConfig(interval=np.uint64(2**31))
 
     legal = NormalizerTrackingConfig(interval=0)
     assert legal.interval == 0

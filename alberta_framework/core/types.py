@@ -45,8 +45,8 @@ def _require_tracking_interval(value: object) -> int:
     if type(value) not in _ACTUAL_INT_TYPES:
         raise ValueError("interval must be a non-negative integer")
     number = operator.index(cast(SupportsIndex, value))
-    if number < 0:
-        raise ValueError("interval must be a non-negative integer")
+    if not 0 <= number <= _INT32_MAX:
+        raise ValueError(f"interval must be an integer in [0, {_INT32_MAX}]")
     return number
 
 
