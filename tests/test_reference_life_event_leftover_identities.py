@@ -6,6 +6,12 @@ import json
 
 import pytest
 
+from alberta_framework.reference_agent import (
+    DispatchCommand,
+    DispatchReceipt,
+    StepResult,
+    Transaction,
+)
 from alberta_framework.reference_life import (
     PendingOutcome,
     ReferenceEnvironmentExecution,
@@ -27,10 +33,10 @@ class _HostileScalar(metaclass=_ExplodingHashMeta):
 
 def _legal_event(**overrides: object) -> ReferenceLifeEvent:
     payload: dict[str, object] = {
-        "command": object(),
-        "receipt": object(),
-        "transaction": object(),
-        "step_result": object(),
+        "command": object.__new__(DispatchCommand),
+        "receipt": object.__new__(DispatchReceipt),
+        "transaction": object.__new__(Transaction),
+        "step_result": object.__new__(StepResult),
         "regime_id": 0,
         "oracle_reward": 0.5,
         "transcript_sha256": _DIGEST,
@@ -75,6 +81,15 @@ def test_reference_life_event_rejects_leftover_identities() -> None:
     assert '"recovered": 1' not in dumped
     assert legal.recovered is True
     assert legal.regime_id == 0
+
+    with pytest.raises(ValueError, match="command"):
+        _legal_event(command=object())
+    with pytest.raises(ValueError, match="receipt"):
+        _legal_event(receipt=object())
+    with pytest.raises(ValueError, match="transaction"):
+        _legal_event(transaction=object())
+    with pytest.raises(ValueError, match="step_result"):
+        _legal_event(step_result=object())
 
 
 def test_reference_life_hosts_reject_leftover_regime_and_reward_identities() -> None:

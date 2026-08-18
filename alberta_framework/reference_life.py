@@ -23,7 +23,7 @@ import re
 import struct
 import threading
 from collections.abc import Callable, Mapping
-from typing import Any, Protocol, TypeVar
+from typing import Any, Protocol, TypeVar, cast
 
 import jax.numpy as jnp
 import jax.random as jr
@@ -120,7 +120,7 @@ def _require_finite_real(name: str, value: object) -> float:
     """Reject leftover bool/NaN identities before they become recorded rewards."""
     if type(value) is bool or type(value) not in (int, float):
         raise ValueError(f"{name} must be a finite real number")
-    number = float(value)
+    number = float(cast(int | float, value))
     if not math.isfinite(number):
         raise ValueError(f"{name} must be a finite real number")
     return number
@@ -698,7 +698,7 @@ class ReferenceEnvironmentStart:
 
     def __post_init__(self) -> None:
         _require_regime_id(self.regime_id, name="environment start regime_id")
-        if not isinstance(self.observation, ArrayValue):
+        if type(self.observation) is not ArrayValue:
             raise ValueError("environment start observation must be an ArrayValue")
 
 
@@ -731,11 +731,11 @@ class ReferenceEnvironmentExecution:
         object.__setattr__(self, "reward", reward)
         object.__setattr__(self, "discount", discount)
         object.__setattr__(self, "oracle_reward", oracle_reward)
-        if not isinstance(self.command, DispatchCommand):
+        if type(self.command) is not DispatchCommand:
             raise ValueError("environment execution requires a DispatchCommand")
-        if not isinstance(self.applied_action, ArrayValue):
+        if type(self.applied_action) is not ArrayValue:
             raise ValueError("applied_action must be an ArrayValue")
-        if not isinstance(self.next_observation, ArrayValue):
+        if type(self.next_observation) is not ArrayValue:
             raise ValueError("next_observation must be an ArrayValue")
 
 
@@ -1584,7 +1584,7 @@ class PendingOutcome:
             "pending outcome oracle reward", self.oracle_reward
         )
         object.__setattr__(self, "oracle_reward", oracle_reward)
-        if not isinstance(self.transaction, Transaction):
+        if type(self.transaction) is not Transaction:
             raise ValueError("pending outcome requires a Transaction")
 
 
@@ -1685,6 +1685,14 @@ class ReferenceLifeEvent:
         oracle_reward = _require_finite_real("oracle_reward", self.oracle_reward)
         _require_digest(self.transcript_sha256, name="transcript_sha256")
         object.__setattr__(self, "oracle_reward", oracle_reward)
+        for name, expected_type in (
+            ("command", DispatchCommand),
+            ("receipt", DispatchReceipt),
+            ("transaction", Transaction),
+            ("step_result", StepResult),
+        ):
+            if type(getattr(self, name)) is not expected_type:
+                raise ValueError(f"{name} has the wrong exact reference-life type")
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -1696,12 +1704,27 @@ class ReferenceLifeStep:
 
     def __post_init__(self) -> None:
         _require_exact_bool("accepted", self.accepted)
+        if type(self.state) is not ReferenceLifeState:
+            raise ValueError("state must be a ReferenceLifeState")
+        if self.event is not None and type(self.event) is not ReferenceLifeEvent:
+            raise ValueError("event must be a ReferenceLifeEvent or None")
         if self.accepted and self.rejection_reason is not None:
             raise ValueError("accepted life step cannot carry a rejection reason")
         if not self.accepted and (
-            not isinstance(self.rejection_reason, str) or not self.rejection_reason.strip()
+            type(self.rejection_reason) is not str or not self.rejection_reason.strip()
         ):
             raise ValueError("rejected life step requires a reason")
+        if self.accepted and self.event is None:
+            raise ValueError("accepted life step requires an event")
+        if self.event is not None:
+            if self.event.step_result.transaction_accepted is not self.accepted:
+                raise ValueError("life step acceptance disagrees with its event")
+            if self.event.transcript_sha256 != self.state.transcript_sha256:
+                raise ValueError("life step event transcript disagrees with state")
+            if not self.accepted and self.event.step_result.rejection_reason != (
+                self.rejection_reason
+            ):
+                raise ValueError("life step rejection reason disagrees with its event")
 
     @property
     def recovery_required(self) -> bool:
