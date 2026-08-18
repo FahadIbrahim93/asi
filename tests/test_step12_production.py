@@ -617,12 +617,9 @@ def test_step12_wraps_real_conversion_overflow_as_config_error() -> None:
 
 
 def test_step12_narrows_original_real_directly_without_double_rounding() -> None:
-    midpoint_plus = (
-        np.longdouble(1.0)
-        + np.longdouble(2.0) ** -24
-        + np.longdouble(2.0) ** -60
-    )
-    assert np.float32(midpoint_plus) != np.float32(float(midpoint_plus))
+    midpoint_plus = Fraction(1, 1) + Fraction(1, 2**24) + Fraction(1, 2**60)
+    directly_rounded = float(np.nextafter(np.float32(1.0), np.float32(2.0)))
+    assert directly_rounded != float(np.float32(float(midpoint_plus)))
 
     config = _config_with(
         subtask_specs=(
@@ -630,9 +627,7 @@ def test_step12_narrows_original_real_directly_without_double_rounding() -> None
         )
     )
 
-    assert config.subtask_specs[0].pseudo_reward_scale == float(
-        np.float32(midpoint_plus)
-    )
+    assert config.subtask_specs[0].pseudo_reward_scale == directly_rounded
 
 
 @pytest.mark.parametrize(
