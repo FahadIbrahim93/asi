@@ -956,8 +956,10 @@ class OffPolicyHordeLearner:
             "horde_spec": self._horde_spec.to_config(),
             "hidden_sizes": list(self._hidden_sizes),
             "optimizer": self._optimizer.to_config(),
-            "bounder": self._bounder.to_config() if self._bounder else None,
-            "normalizer": self._normalizer.to_config() if self._normalizer else None,
+            "bounder": self._bounder.to_config() if self._bounder is not None else None,
+            "normalizer": (
+                self._normalizer.to_config() if self._normalizer is not None else None
+            ),
             "sparsity": self._sparsity,
             "leaky_relu_slope": self._leaky_relu_slope,
             "use_layer_norm": self._use_layer_norm,

@@ -84,9 +84,9 @@ class TestActorCriticBounderConfigTruthiness:
         payload = agent.to_config()
         payload["bounder"] = _HostileBounderConfig(payload["bounder"])
 
-        restored = ActorCriticAgent.from_config(payload)
+        with pytest.raises(ValueError, match="bounder config must be an exact dict"):
+            ActorCriticAgent.from_config(payload)
 
-        assert restored.bounder is not None
         assert _HostileBounderConfig.calls == 0
 
     def test_continuous_actor_critic_config_does_not_invoke_truthiness(self) -> None:
@@ -98,9 +98,9 @@ class TestActorCriticBounderConfigTruthiness:
         payload = agent.to_config()
         payload["bounder"] = _HostileBounderConfig(payload["bounder"])
 
-        restored = ContinuousActorCriticAgent.from_config(payload)
+        with pytest.raises(ValueError, match="bounder config must be an exact dict"):
+            ContinuousActorCriticAgent.from_config(payload)
 
-        assert restored.bounder is not None
         assert _HostileBounderConfig.calls == 0
 
 
@@ -119,9 +119,9 @@ class TestHordeActorCriticBounderConfigTruthiness:
         payload = agent.to_config()
         payload["actor_bounder"] = _HostileBounderConfig(payload["actor_bounder"])
 
-        restored = HordeActorCriticAgent.from_config(payload)
+        with pytest.raises(ValueError, match="bounder config must be an exact dict"):
+            HordeActorCriticAgent.from_config(payload)
 
-        assert restored.actor_bounder is not None
         assert _HostileBounderConfig.calls == 0
 
     def test_q_horde_actor_critic_config_does_not_invoke_truthiness(self) -> None:
@@ -139,9 +139,9 @@ class TestHordeActorCriticBounderConfigTruthiness:
         payload = agent.to_config()
         payload["actor_bounder"] = _HostileBounderConfig(payload["actor_bounder"])
 
-        restored = QHordeActorCriticAgent.from_config(payload)
+        with pytest.raises(ValueError, match="bounder config must be an exact dict"):
+            QHordeActorCriticAgent.from_config(payload)
 
-        assert restored.actor_bounder is not None
         assert _HostileBounderConfig.calls == 0
 
     def test_nonlinear_horde_actor_critic_config_does_not_invoke_truthiness(self) -> None:
@@ -154,9 +154,9 @@ class TestHordeActorCriticBounderConfigTruthiness:
         payload = agent.to_config()
         payload["actor_bounder"] = _HostileBounderConfig(payload["actor_bounder"])
 
-        restored = NonlinearHordeActorCriticAgent.from_config(payload)
+        with pytest.raises(ValueError, match="bounder config must be an exact dict"):
+            NonlinearHordeActorCriticAgent.from_config(payload)
 
-        assert restored.actor_bounder is not None
         assert _HostileBounderConfig.calls == 0
 
     def test_nonlinear_q_horde_actor_critic_config_does_not_invoke_truthiness(self) -> None:
@@ -169,9 +169,9 @@ class TestHordeActorCriticBounderConfigTruthiness:
         payload = agent.to_config()
         payload["actor_bounder"] = _HostileBounderConfig(payload["actor_bounder"])
 
-        restored = NonlinearQHordeActorCriticAgent.from_config(payload)
+        with pytest.raises(ValueError, match="bounder config must be an exact dict"):
+            NonlinearQHordeActorCriticAgent.from_config(payload)
 
-        assert restored.actor_bounder is not None
         assert _HostileBounderConfig.calls == 0
 
 
@@ -186,9 +186,9 @@ class TestOffPolicyHordeBounderNormalizerConfigTruthiness:
         payload = horde.to_config()
         payload["bounder"] = _HostileBounderConfig(payload["bounder"])
 
-        restored = OffPolicyHordeLearner.from_config(payload)
+        with pytest.raises(ValueError, match="bounder config must be an exact dict"):
+            OffPolicyHordeLearner.from_config(payload)
 
-        assert restored._bounder is not None
         assert _HostileBounderConfig.calls == 0
 
     def test_off_policy_horde_normalizer_config_does_not_invoke_truthiness(self) -> None:
