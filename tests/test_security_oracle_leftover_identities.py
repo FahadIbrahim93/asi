@@ -224,8 +224,12 @@ def test_oracle_public_consumers_revalidate_forged_frozen_fields(
 
 def test_oracle_public_consumers_revalidate_forged_label_binding() -> None:
     record = _legal(action=SecurityAction.BLOCK)
-    object.__setattr__(record, "policy_metadata", {"is_malicious": True})
-    object.__setattr__(record, "outcome", {"label": "false_negative"})
+    object.__setattr__(
+        record, "policy_metadata", MappingProxyType({"is_malicious": True})
+    )
+    object.__setattr__(
+        record, "outcome", MappingProxyType({"label": "false_negative"})
+    )
 
     with pytest.raises(ValueError, match="does not match action metadata"):
         record.to_dict()
