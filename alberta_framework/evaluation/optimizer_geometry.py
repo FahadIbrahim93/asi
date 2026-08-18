@@ -231,8 +231,12 @@ def muon_ogd_dual_update(
         raise ValueError("dual must contain one multiplier per constraint")
     if type(dual_learning_rate) is not float or not math.isfinite(dual_learning_rate):
         raise ValueError("dual_learning_rate must be a finite float")
-    if dual_learning_rate < 0.0 or type(dual_steps) is not int or dual_steps < 1:
-        raise ValueError("dual learning rate must be non-negative and dual_steps positive")
+    if (
+        dual_learning_rate < 0.0
+        or type(dual_steps) is not int
+        or not 1 <= dual_steps <= 32
+    ):
+        raise ValueError("dual learning rate must be non-negative and dual_steps bounded positive")
     for _ in range(dual_steps):
         shifted = value + jnp.einsum("k,kij->ij", multipliers, protected)
         matrix_sign = spectral_matrix_sign(shifted, steps=newton_schulz_steps)
