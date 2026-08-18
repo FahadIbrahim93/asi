@@ -41,7 +41,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from types import FunctionType
-from typing import Literal, NoReturn, Protocol
+from typing import Literal, NoReturn, Protocol, cast
 
 from alberta_framework.evaluation.continual_ia import (
     ContinualIAConfig,
@@ -333,6 +333,8 @@ _PATH_TYPE = type(Path())
 _MAX_SPEC_TEXT_BYTES = 64 * 1024
 _MAX_SPEC_SEQUENCE_ITEMS = 256
 _MAX_SPEC_MAPPING_ITEMS = 256
+_MAX_SPEC_NESTING_DEPTH = 64
+_MAX_SPEC_TOTAL_VALUES = 4096
 
 DIRTY_STATE_POLICY: Mapping[str, object] = {
     "policy_version": DIRTY_STATE_POLICY_VERSION,
@@ -382,10 +384,16 @@ def _require_exact_bool(name: str, value: object) -> bool:
 def _require_exact_path(name: str, value: object) -> Path:
     if type(value) is not _PATH_TYPE:
         raise ValueError(f"{name} must be an exact platform Path")
-    encoded = value.as_posix().encode("utf-8")
-    if not encoded or len(encoded) > _MAX_SPEC_TEXT_BYTES:
-        raise ValueError(f"{name} must be a bounded non-empty Path")
-    return value
+    path = value
+    encoded = path.as_posix().encode("utf-8")
+    if (
+        not path.parts
+        or path.is_absolute()
+        or any(part == ".." for part in path.parts)
+        or len(encoded) > _MAX_SPEC_TEXT_BYTES
+    ):
+        raise ValueError(f"{name} must be a non-empty repository-relative Path")
+    return path
 
 
 def _require_exact_str_tuple(name: str, value: object) -> tuple[str, ...]:
@@ -407,20 +415,80 @@ def _require_path_tuple(name: str, value: object) -> tuple[Path, ...]:
         or len(value) > _MAX_SPEC_SEQUENCE_ITEMS
     ):
         raise ValueError(f"{name} must be a non-empty tuple of Path values")
-    for item in value:
-        _require_exact_path(name, item)
-    return value
+    return tuple(
+        _require_exact_path(f"{name}[{index}]", item)
+        for index, item in enumerate(value)
+    )
+
+
+def _require_exact_json_value(
+    name: str,
+    value: object,
+    *,
+    ancestors: frozenset[int] = frozenset(),
+    depth: int = 0,
+    remaining: int = _MAX_SPEC_TOTAL_VALUES,
+) -> int:
+    if depth > _MAX_SPEC_NESTING_DEPTH:
+        raise ValueError(f"{name} exceeds the maximum nesting depth")
+    if remaining < 1:
+        raise ValueError(f"{name} exceeds the aggregate value limit")
+    remaining -= 1
+    value_type = type(value)
+    if value_type is dict:
+        identity = id(value)
+        if identity in ancestors:
+            raise ValueError(f"{name} must not contain a cycle")
+        mapping = cast(dict[object, object], value)
+        if len(mapping) > _MAX_SPEC_MAPPING_ITEMS:
+            raise ValueError(f"{name} exceeds the mapping item limit")
+        next_ancestors = ancestors | {identity}
+        for key, item in mapping.items():
+            _require_exact_text(f"{name} key", key)
+            remaining = _require_exact_json_value(
+                f"{name}.{key}",
+                item,
+                ancestors=next_ancestors,
+                depth=depth + 1,
+                remaining=remaining,
+            )
+        return remaining
+    if value_type is list:
+        identity = id(value)
+        if identity in ancestors:
+            raise ValueError(f"{name} must not contain a cycle")
+        items = cast(list[object], value)
+        if len(items) > _MAX_SPEC_SEQUENCE_ITEMS:
+            raise ValueError(f"{name} exceeds the sequence item limit")
+        next_ancestors = ancestors | {identity}
+        for index, item in enumerate(items):
+            remaining = _require_exact_json_value(
+                f"{name}[{index}]",
+                item,
+                ancestors=next_ancestors,
+                depth=depth + 1,
+                remaining=remaining,
+            )
+        return remaining
+    if value_type is str:
+        if len(cast(str, value).encode("utf-8")) > _MAX_SPEC_TEXT_BYTES:
+            raise ValueError(f"{name} exceeds {_MAX_SPEC_TEXT_BYTES} UTF-8 bytes")
+        return remaining
+    if value_type is int:
+        if cast(int, value).bit_length() > _MAX_SPEC_TEXT_BYTES * 4:
+            raise ValueError(f"{name} exceeds the integer size limit")
+        return remaining
+    if value_type is bool or value is None:
+        return remaining
+    if value_type is float and math.isfinite(cast(float, value)):
+        return remaining
+    raise ValueError(f"{name} must contain only finite exact JSON values")
 
 
 def _require_identity_mapping(name: str, value: object) -> dict[str, object]:
-    if (
-        type(value) is not dict
-        or not value
-        or len(value) > _MAX_SPEC_MAPPING_ITEMS
-    ):
+    if type(value) is not dict or not value:
         raise ValueError(f"{name} must be a non-empty dict with exact string keys")
-    for key in value:
-        _require_exact_text(f"{name} key", key)
+    _require_exact_json_value(name, value)
     return value
 
 
@@ -775,6 +843,26 @@ EVIDENCE_SPECS: tuple[EvidenceSpec, ...] = (
         validator=validate_ia_evidence_artifact,
     ),
 )
+
+
+def _validated_evidence_specs(value: object) -> tuple[EvidenceSpec, ...]:
+    """Validate the exact registry roster before any claim is inspected."""
+
+    if type(value) is not tuple or not value:
+        raise ValueError("EVIDENCE_SPECS must be a non-empty exact tuple")
+    if not all(type(spec) is EvidenceSpec for spec in value):
+        raise ValueError("EVIDENCE_SPECS must contain only exact EvidenceSpec values")
+    specs = cast(tuple[EvidenceSpec, ...], value)
+    names = tuple(spec.name for spec in specs)
+    if len(set(names)) != len(names):
+        raise ValueError("EVIDENCE_SPECS claim names must be unique")
+    paths = tuple(spec.relative_path for spec in specs)
+    if len(set(paths)) != len(paths):
+        raise ValueError("EVIDENCE_SPECS artifact paths must be unique")
+    return specs
+
+
+EVIDENCE_SPECS = _validated_evidence_specs(EVIDENCE_SPECS)
 
 
 def _artifact_digest(artifact: Mapping[str, object]) -> str | None:
