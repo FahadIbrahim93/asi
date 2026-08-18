@@ -16,6 +16,7 @@ from alberta_framework.benchmarks.ipmnist_screening import (
     INTENTIONAL_UPDATES_CODE_REVISION,
     INTENTIONAL_UPDATES_PAPER_REVISION,
     IPMNISTConfig,
+    ScreeningRunResult,
     _make_intentional_updates_learner,
     _make_sgd_ema_norm_learner,
     intentional_updates_development_record,
@@ -278,14 +279,6 @@ def test_strict_development_record_binds_resources_gates_and_metrics() -> None:
     with pytest.raises(ValueError, match="frozen protocol"):
         validate_intentional_updates_development_record(hostile)
 
-    hostile = copy.deepcopy(record)
-    original_accuracy = hostile["metrics"]["per_task_accuracy"][0]
-    hostile["metrics"]["per_task_accuracy"][0] = (
-        0.25 if original_accuracy != 0.25 else 0.5
-    )
-    with pytest.raises(ValueError, match="derive exactly"):
-        validate_intentional_updates_development_record(hostile)
-
     class HostileArray:
         def __array__(self) -> Never:
             raise AssertionError("must not coerce")
@@ -315,6 +308,32 @@ def test_record_revalidates_forged_dataclasses() -> None:
     object.__setattr__(result.config, "n_tasks", True)
     with pytest.raises(ValueError, match="n_tasks"):
         intentional_updates_development_record(result)
+
+
+def test_record_preserves_valid_float32_accuracy_without_inferred_counts() -> None:
+    spec = screening_spec("intentional_updates_ipmnist")
+    config = IPMNISTConfig(
+        n_tasks=1, task_length=5000, input_dim=1, hidden1=1, hidden2=1, n_classes=1
+    )
+    accuracy = float(np.float32(2501 / 5000))
+    result = ScreeningRunResult(
+        config_name=spec.name,
+        base_learner=spec.base_learner,
+        hyperparameters=spec.hyperparameters,
+        seed=31,
+        config=config,
+        per_task_accuracy=np.asarray([accuracy], dtype=np.float64),
+        per_task_loss=np.asarray([0.5], dtype=np.float64),
+        per_task_plasticity=np.asarray([0.25], dtype=np.float64),
+        wall_clock_seconds=0.0,
+    )
+    record = intentional_updates_development_record(result)
+    assert record["metrics"] == {
+        "per_task_accuracy": [accuracy],
+        "per_task_loss": [0.5],
+        "per_task_plasticity": [0.25],
+    }
+    assert validate_intentional_updates_development_record(record) == record
 
 
 def test_matched_runs_share_seed_schedule_update_and_observation_budgets() -> None:

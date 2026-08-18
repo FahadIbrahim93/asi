@@ -8797,11 +8797,6 @@ def intentional_updates_development_record(
         raise ValueError("Intentional Updates model-query budget exceeds signed int32")
     if persistent_bytes > _INTENTIONAL_MAX_PERSISTENT_BYTES:
         raise ValueError("Intentional Updates persistent state exceeds 256 MiB")
-    scaled_correct = result.per_task_accuracy * result.config.task_length
-    correct_array = np.rint(scaled_correct)
-    if not np.allclose(scaled_correct, correct_array, rtol=0.0, atol=1e-5):
-        raise ValueError("per_task_accuracy must derive from integer correct counts")
-    per_task_correct = [int(value) for value in correct_array]
     return {
         "schema": INTENTIONAL_UPDATES_RECORD_SCHEMA,
         "references": {
@@ -8847,11 +8842,7 @@ def intentional_updates_development_record(
             "timing_is_selection_metric": False,
         },
         "metrics": {
-            "per_task_correct": per_task_correct,
-            "online_correct": sum(per_task_correct),
-            "per_task_accuracy": [
-                value / result.config.task_length for value in per_task_correct
-            ],
+            "per_task_accuracy": result.per_task_accuracy.tolist(),
             "per_task_loss": result.per_task_loss.tolist(),
             "per_task_plasticity": result.per_task_plasticity.tolist(),
         },
@@ -9020,8 +9011,6 @@ def validate_intentional_updates_development_record(
         payload["metrics"],
         frozenset(
             {
-                "per_task_correct",
-                "online_correct",
                 "per_task_accuracy",
                 "per_task_loss",
                 "per_task_plasticity",
@@ -9030,21 +9019,6 @@ def validate_intentional_updates_development_record(
         context="metrics",
     )
     n_tasks = config_raw["n_tasks"]
-    per_task_correct = metrics["per_task_correct"]
-    if (
-        type(per_task_correct) is not list
-        or len(per_task_correct) != n_tasks
-        or any(
-            type(value) is not int or not 0 <= value <= config_raw["task_length"]
-            for value in per_task_correct
-        )
-    ):
-        raise ValueError("per_task_correct must contain bounded exact integers")
-    online_correct = _intentional_exact_int(
-        metrics["online_correct"], context="metrics.online_correct"
-    )
-    if online_correct != sum(per_task_correct):
-        raise ValueError("online_correct must equal the per-task numerator sum")
     for key in ("per_task_accuracy", "per_task_loss", "per_task_plasticity"):
         values = metrics[key]
         if (
@@ -9053,9 +9027,6 @@ def validate_intentional_updates_development_record(
             or any(type(value) is not float or not math.isfinite(value) for value in values)
         ):
             raise ValueError(f"{key} must contain one exact finite float per task")
-    expected_accuracy = [value / config_raw["task_length"] for value in per_task_correct]
-    if metrics["per_task_accuracy"] != expected_accuracy:
-        raise ValueError("per_task_accuracy must derive exactly from per_task_correct")
     try:
         config = IPMNISTConfig(**config_raw)
         arm = payload["arm"]
