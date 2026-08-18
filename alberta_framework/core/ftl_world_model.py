@@ -119,9 +119,29 @@ def _configured_state_nbytes(
     return 4 * (float_count + 1)
 
 
-def _preflight_update_working_set(feature_dim: int) -> None:
-    # Live Gram, proposed Gram, plus feature-width dense/cross/weight copies.
-    update_scalars = 2 * feature_dim * feature_dim + 5 * feature_dim + 8
+def _preflight_update_working_set(
+    *,
+    projection_dim: int,
+    input_dim: int,
+    feature_dim: int,
+    observation_dim: int,
+    action_dim: int,
+) -> None:
+    """Reject the complete named logical update buffers before allocation."""
+
+    active_dim = 2 * projection_dim
+    update_scalars = (
+        projection_dim * input_dim  # fixed projection bank
+        + 2 * feature_dim * feature_dim  # stored and proposed Grams
+        + 4 * feature_dim * observation_dim  # stored/proposed cross and weights
+        + feature_dim  # dense sparse-feature materialization
+        + 2 * active_dim * active_dim  # active Gram and ridge system
+        + 4 * active_dim * observation_dim  # active solve/cross/weight intermediates
+        + 2 * active_dim  # sparse indices and values
+        + 6 * observation_dim  # observation/prediction/target/error vectors
+        + action_dim
+        + 8  # scalar statistics, counters, and update outputs
+    )
     if 4 * update_scalars > _INT32_MAX:
         raise ValueError(
             "sparse FTL update working set byte count must fit signed int32"
@@ -341,7 +361,13 @@ class SparseFTLWorldModel:
     def init(self, key: Array) -> SparseFTLWorldModelState:
         """Initialize fixed projections and zero sufficient statistics."""
         cfg = self._config
-        _preflight_update_working_set(cfg.feature_dim)
+        _preflight_update_working_set(
+            projection_dim=cfg.projection_dim,
+            input_dim=cfg.input_dim,
+            feature_dim=cfg.feature_dim,
+            observation_dim=cfg.observation_dim,
+            action_dim=cfg.action_dim,
+        )
         projection = jr.normal(
             key,
             (cfg.projection_dim, cfg.input_dim),
