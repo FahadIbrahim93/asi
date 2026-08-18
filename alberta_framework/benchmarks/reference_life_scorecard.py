@@ -507,8 +507,10 @@ class ReferenceLifeDevelopmentPlan:
         return _rotated_arms(SEED_ROSTER.index(seed))
 
     def arm_definition(self, arm: str) -> dict[str, Any]:
+        if type(arm) is not str:
+            raise ValueError("unsupported scorecard arm must be an exact string")
         if arm not in ARM_ROSTER:
-            raise ValueError(f"unsupported scorecard arm {arm!r}")
+            raise ValueError("unsupported scorecard arm")
         definitions = self.to_payload()["arm_definitions"]
         assert isinstance(definitions, list)
         for definition in definitions:
@@ -517,8 +519,10 @@ class ReferenceLifeDevelopmentPlan:
         raise AssertionError("canonical arm definition is missing")
 
     def protocol(self, environment_kind: str) -> dict[str, Any]:
+        if type(environment_kind) is not str:
+            raise ValueError("unsupported environment must be an exact string")
         if environment_kind not in ENVIRONMENT_ROSTER:
-            raise ValueError(f"unsupported environment {environment_kind!r}")
+            raise ValueError("unsupported environment")
         protocol = self.to_payload()["protocols"][environment_kind]
         assert isinstance(protocol, dict)
         return protocol
@@ -950,8 +954,10 @@ def _canonical_initial_resource_payload(
 def parameter_change_check(arm: str, parameter_change_events: int) -> dict[str, Any]:
     """Apply the fixed candidate/frozen/control learning-side-effect check."""
 
+    if type(arm) is not str:
+        raise ValueError("parameter_change_check arm must be an exact string")
     if arm not in ARM_ROSTER:
-        raise ValueError(f"unsupported scorecard arm {arm!r}")
+        raise ValueError("unsupported scorecard arm")
     if type(parameter_change_events) is not int or parameter_change_events < 0:
         raise ValueError("parameter_change_events must be nonnegative")
     must_change = arm in ("prototype", "differential_sarsa", "sarsa")
