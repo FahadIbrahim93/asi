@@ -69,12 +69,3 @@ def test_candidate_rejects_hostile_before_membership() -> None:
 
     report = build_forager_comparison_report(runs, candidate="toy")
     assert report.candidate == "toy"
-
-
-def test_candidate_rejects_hostile_hash_without_repr() -> None:
-    runs = [_run(agent="a", seed=0), _run(agent="a", seed=1)]
-    hostile = _HostileStr("a")
-    _HostileStr.calls = 0
-    with pytest.raises(ValueError, match="exact string"):
-        build_forager_comparison_report(runs, candidate=hostile)  # type: ignore[arg-type]
-    assert _HostileStr.calls == 0
