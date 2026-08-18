@@ -43,3 +43,38 @@ def test_score_archives_rejects_noncanonical_seeds_before_payload_io(
 ) -> None:
     with pytest.raises(ValueError, match="seeds"):
         score_archives(tmp_path, "results", seeds, 1)  # type: ignore[arg-type]
+
+
+class _RewardArraySubclass(np.ndarray):
+    pass
+
+
+@pytest.mark.parametrize(
+    "rewards",
+    [[0.0], np.zeros(1, dtype=np.float64).view(_RewardArraySubclass)],
+)
+def test_score_rewards_rejects_noncanonical_array_types(rewards: object) -> None:
+    with pytest.raises(ValueError, match="exact numpy ndarray"):
+        score_rewards(rewards, 1)  # type: ignore[arg-type]
+
+
+def test_score_rewards_rejects_arrays_beyond_archive_byte_bound() -> None:
+    rewards = np.zeros(4 * 1024**2 + 1, dtype=np.int8)
+    with pytest.raises(ValueError, match="byte bound"):
+        score_rewards(rewards, rewards.size)
+
+
+@pytest.mark.parametrize("seeds", [[], [0, 0]])
+def test_score_archives_requires_nonempty_unique_seeds(
+    tmp_path: Path,
+    seeds: list[int],
+) -> None:
+    with pytest.raises(ValueError, match="nonempty and unique"):
+        score_archives(tmp_path, "results", seeds, 1)
+
+
+def test_score_archives_rejects_noncanonical_path_identities(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="payload_root"):
+        score_archives(str(tmp_path), "results", [0], 1)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="result root"):
+        score_archives(tmp_path, True, [0], 1)  # type: ignore[arg-type]
