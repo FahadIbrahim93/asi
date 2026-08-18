@@ -169,7 +169,7 @@ class FixedActionProbeConfig:
             raise ForagerRngParityError("seed must be an integer")
         if not 0 <= self.seed <= MAX_SEED:
             raise ForagerRngParityError(f"seed must lie in [0, {MAX_SEED}]")
-        if not isinstance(self.actions, tuple):
+        if type(self.actions) is not tuple:
             raise ForagerRngParityError("actions must be an immutable tuple")
         if not self.actions or len(self.actions) > MAX_ACTIONS:
             raise ForagerRngParityError(f"actions must contain between 1 and {MAX_ACTIONS} entries")
