@@ -687,7 +687,7 @@ def _artifact_digest(artifact: Mapping[str, object]) -> str | None:
             continue
         value = record.get("sha256")
         if (
-            isinstance(value, str)
+            type(value) is str
             and len(value) == 64
             and all(character in "0123456789abcdef" for character in value)
         ):
@@ -760,7 +760,7 @@ def _load_strict_json_object(path: Path) -> dict[str, object]:
 
 def _is_sha256(value: object) -> bool:
     return (
-        isinstance(value, str)
+        type(value) is str
         and len(value) == 64
         and all(character in "0123456789abcdef" for character in value)
     )
