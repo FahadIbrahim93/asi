@@ -275,7 +275,7 @@ class ProcessCapture:
     stderr: bytes
 
     def __post_init__(self) -> None:
-        if type(self.returncode) is not int or isinstance(self.returncode, bool):
+        if type(self.returncode) is not int:
             raise ScreenError("returncode must be an integer")
         if type(self.stdout) is not bytes:
             raise ScreenError("stdout must be bytes")
@@ -621,9 +621,9 @@ def _validate_config_payload(
     if agent.startswith("PPO"):
         rollout = hypers.get("rollout_steps")
         updates = hypers.get("num_updates")
-        if not isinstance(rollout, int) or isinstance(rollout, bool):
+        if type(rollout) is not int or not 1 <= rollout <= horizon:
             raise ScreenError(f"PPO rollout_steps is not explicit: {relative}")
-        if not isinstance(updates, int) or isinstance(updates, bool):
+        if type(updates) is not int or not 1 <= updates <= horizon:
             raise ScreenError(f"PPO num_updates is not explicit: {relative}")
         if rollout * updates != horizon:
             raise ScreenError(f"PPO schedule does not match horizon: {relative}")
@@ -860,7 +860,7 @@ def load_frozen_protocol(protocol_dir: Path) -> FrozenProtocol:
         raise ScreenError("frozen screen must contain exactly two seeds")
     seeds: list[int] = []
     for index, value in enumerate(raw_seeds):
-        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        if type(value) is not int or value < 0:
             raise ScreenError(f"task.seeds[{index}] must be a non-negative integer")
         seeds.append(value)
     if seeds != sorted(set(seeds)) or seeds[1] != seeds[0] + 1:
@@ -3031,7 +3031,7 @@ def _validate_completed_run(
                 f"ineligible run unexpectedly records eligible rewards: {config.path}"
             )
         exit_code = process.get("exit_code")
-        if not isinstance(exit_code, int) or isinstance(exit_code, bool):
+        if type(exit_code) is not int:
             raise ScreenError(f"ineligible run exit code is invalid: {config.path}")
         if exit_code != 0 and failures != [f"process_exit_code:{exit_code}"]:
             raise ScreenError(

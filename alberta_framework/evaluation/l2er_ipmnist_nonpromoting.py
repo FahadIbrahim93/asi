@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from types import MappingProxyType
 from typing import Any, cast
 
@@ -30,6 +30,9 @@ L2ER_PROTOCOL = MappingProxyType(
             "ASI retains the 100-example ER buffer as charged persistent state",
             "ASI plasticity telemetry is an additional post-update metric",
             "ASI evaluates the same entropy-rank ratio with overflow-safe scaling",
+            "ASI follows the pinned official implementation by buffering raw examples and "
+            "recomputing features after each block, rather than buffering contemporaneous "
+            "hidden features as shown in paper Algorithm 1",
         ),
         "official_er_batch": 100,
         "official_er_steps_per_batch": 1,
@@ -293,12 +296,16 @@ def validate_l2er_development_result(payload: object) -> dict[str, object]:
 
 
 def validate_matched_l2er_development_results(
-    payloads: Sequence[object],
+    payloads: object,
 ) -> tuple[dict[str, object], ...]:
     """Validate the four-arm comparison and every required matched axis."""
-    if type(payloads) not in {list, tuple} or len(payloads) != len(_ARMS):
+    payload_type = type(payloads)
+    if not (payload_type is list or payload_type is tuple):
         raise ValueError("the matched comparison must contain exactly four results")
-    results = tuple(validate_l2er_development_result(payload) for payload in payloads)
+    trusted_payloads = cast(list[object] | tuple[object, ...], payloads)
+    if len(trusted_payloads) != len(_ARMS):
+        raise ValueError("the matched comparison must contain exactly four results")
+    results = tuple(validate_l2er_development_result(payload) for payload in trusted_payloads)
     if {result["arm"] for result in results} != set(_ARMS):
         raise ValueError("the matched comparison must contain each registered arm exactly once")
     first = results[0]

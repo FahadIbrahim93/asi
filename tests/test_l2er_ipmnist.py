@@ -14,6 +14,7 @@ from alberta_framework.benchmarks.ipmnist_screening import (
     l2er_development_result_payload,
     l2er_effective_rank,
     l2er_effective_rank_loss,
+    l2er_effective_rank_transaction,
     l2er_update,
     run_screening_config,
     screening_spec,
@@ -57,6 +58,16 @@ def test_effective_rank_matches_official_entropy_estimator() -> None:
     assert float(l2er_effective_rank(jnp.zeros((4, 3)))) == pytest.approx(1.0)
     huge = jnp.eye(4, dtype=jnp.float32) * jnp.asarray(1e38, dtype=jnp.float32)
     assert float(l2er_effective_rank(huge)) == pytest.approx(4.0, rel=1e-5)
+
+
+def test_effective_rank_preserves_invalidity_in_eager_and_traced_calls() -> None:
+    invalid = jnp.asarray([[jnp.inf]], dtype=jnp.float32)
+    with pytest.raises(ValueError, match="effective rank must be finite"):
+        l2er_effective_rank(invalid)
+    assert bool(jnp.isnan(jax.jit(l2er_effective_rank)(invalid)))
+    safe, valid = jax.jit(l2er_effective_rank_transaction)(invalid)
+    assert float(safe) == 0.0
+    assert not bool(valid)
 
 
 def test_l2_and_mechanism_off_are_exact_reductions() -> None:
@@ -306,12 +317,27 @@ def test_matched_validator_requires_all_arms_and_axes() -> None:
     with pytest.raises(ValueError, match="observations and updates"):
         validate_matched_l2er_development_results(mismatched)
 
+    class HostileMeta(type):
+        calls = 0
+
+        def __hash__(cls) -> int:
+            cls.calls += 1
+            raise AssertionError("runtime type must not be hashed")
+
+    class HostileContainer(metaclass=HostileMeta):
+        def __len__(self) -> int:
+            raise AssertionError("hostile length must not run")
+
+    with pytest.raises(ValueError, match="exactly four"):
+        validate_matched_l2er_development_results(HostileContainer())
+    assert HostileMeta.calls == 0
+
 
 def test_protocol_pins_sources_and_records_material_differences() -> None:
     assert L2ER_PROTOCOL["paper_revision"] == "arXiv:2509.22335v3"
     assert L2ER_PROTOCOL["official_commit"] == "52ae3eb0702a9e6923f252c1f7cb29340eb5b3d5"
     differences = L2ER_PROTOCOL["protocol_differences"]
     assert isinstance(differences, tuple)
-    assert len(differences) == 7
+    assert len(differences) == 8
     assert L2ER_PROTOCOL["development_only"] is True
     assert L2ER_PROTOCOL["scientific_promotion_allowed"] is False
