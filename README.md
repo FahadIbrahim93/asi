@@ -241,6 +241,7 @@ The console scripts are grouped by responsibility; every command supports `--hel
 |---|---|
 | `alberta-step1-smoke`, `alberta-step2-smoke` | Nonpromoting mechanism smoke checks |
 | `asi-clear-qualification` | Verify local CLEAR archive identities and emit a permanently nonpromoting matched setup plan |
+| `asi-coom-qualification-smoke` | Inspect or run the bounded, synthetic, permanently nonpromoting COOM qualification smoke |
 | `asi-cora-catalog` | Inspect the blocked CORA qualification catalog without importing external runtimes |
 | `asi-reference-life-scorecard` | Run or validate the permanently nonpromoting reference-life development scorecard |
 | `asi-ipmnist-ceiling` | Produce new, atomic no-replace stationary/carried/full or batch ceiling diagnostics |
