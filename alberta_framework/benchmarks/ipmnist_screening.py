@@ -1406,7 +1406,7 @@ def _make_sgd_ema_norm_learner(
 # =============================================================================
 
 
-@chex.dataclass(frozen=True)
+@chex.dataclass(frozen=True, mappable_dataclass=False)
 class IntentionalUpdatesIPMNISTState:
     """RMS direction and adaptive-error scale owned by the extension.
 
@@ -1421,6 +1421,72 @@ class IntentionalUpdatesIPMNISTState:
     clip_squared_error: Array
     clip_step: Array
     norm: EMANormState
+
+
+_INTENTIONAL_UPDATES_HP_KEYS = frozenset(
+    {
+        "intentional_enabled",
+        "intended_fraction",
+        "fixed_step_size",
+        "beta2",
+        "optimizer_epsilon",
+        "beta_clip",
+        "clip_mult",
+        "use_diagonal_normalization",
+        "use_adaptive_clip",
+        "update_features",
+        "weight_decay",
+        "norm_decay",
+        "norm_epsilon",
+    }
+)
+
+
+def _intentional_updates_hp(value: object) -> dict[str, float]:
+    if type(value) is not dict:
+        raise ValueError("Intentional Updates hyperparameters must be an exact dict")
+    raw = cast(dict[object, object], value)
+    if not all(type(key) is str for key in raw) or frozenset(raw) != _INTENTIONAL_UPDATES_HP_KEYS:
+        raise ValueError("Intentional Updates hyperparameter keys do not match the protocol")
+    hp = cast(dict[str, object], raw)
+    if any(type(item) is not float or not math.isfinite(item) for item in hp.values()):
+        raise ValueError("Intentional Updates hyperparameters must be finite exact floats")
+    checked = cast(dict[str, float], hp)
+    if (
+        checked["intentional_enabled"] not in (0.0, 1.0)
+        or checked["use_diagonal_normalization"] not in (0.0, 1.0)
+        or checked["use_adaptive_clip"] not in (0.0, 1.0)
+        or checked["update_features"] not in (0.0, 1.0)
+        or checked["intended_fraction"] <= 0.0
+        or checked["fixed_step_size"] < 0.0
+        or not 0.0 <= checked["beta2"] < 1.0
+        or checked["optimizer_epsilon"] <= 0.0
+        or not 0.0 <= checked["beta_clip"] < 1.0
+        or checked["clip_mult"] <= 0.0
+        or checked["weight_decay"] < 0.0
+        or not 0.0 <= checked["norm_decay"] < 1.0
+        or checked["norm_epsilon"] <= 0.0
+    ):
+        raise ValueError("Intentional Updates hyperparameters violate the frozen bounds")
+    return checked
+
+
+def _intentional_updates_scalar_int_array(value: object, *, name: str) -> Array:
+    actual_type = type(value)
+    if not issubclass(actual_type, (jax.Array, jax.core.Tracer)):
+        raise ValueError(f"{name} must be an exact JAX scalar integer array")
+    result = jnp.asarray(value)
+    if result.shape != () or result.dtype != jnp.dtype(jnp.int32):
+        raise ValueError(f"{name} must be an exact JAX scalar integer array")
+    return result
+
+
+def _intentional_updates_invalid_result(valid: Array, value: Array) -> Array:
+    if jnp.issubdtype(value.dtype, jnp.floating):
+        fallback = jnp.full_like(value, jnp.nan)
+    else:
+        fallback = jnp.zeros_like(value)
+    return jnp.where(valid, value, fallback)
 
 
 def _make_intentional_updates_learner(
@@ -1439,29 +1505,33 @@ def _make_intentional_updates_learner(
     which makes the mechanism-off path bit-for-bit identical rather than
     merely numerically close.
     """
-    if hp["intentional_enabled"] == 0.0:
+    checked_hp = _intentional_updates_hp(hp)
+    if checked_hp["intentional_enabled"] == 0.0:
         return _make_sgd_ema_norm_learner({
-            "step_size": hp["fixed_step_size"],
-            "weight_decay": hp["weight_decay"],
-            "norm_decay": hp["norm_decay"],
-            "norm_epsilon": hp["norm_epsilon"],
+            "step_size": checked_hp["fixed_step_size"],
+            "weight_decay": checked_hp["weight_decay"],
+            "norm_decay": checked_hp["norm_decay"],
+            "norm_epsilon": checked_hp["norm_epsilon"],
         })
 
-    eta = hp["intended_fraction"]
-    beta2 = hp["beta2"]
-    beta_clip = hp["beta_clip"]
-    clip_mult = hp["clip_mult"]
-    epsilon = hp["optimizer_epsilon"]
-    norm_decay = hp["norm_decay"]
-    norm_epsilon = hp["norm_epsilon"]
-    use_diagonal = hp["use_diagonal_normalization"] == 1.0
-    use_adaptive_clip = hp["use_adaptive_clip"] == 1.0
-    update_features = hp["update_features"] == 1.0
+    eta = checked_hp["intended_fraction"]
+    beta2 = checked_hp["beta2"]
+    beta_clip = checked_hp["beta_clip"]
+    clip_mult = checked_hp["clip_mult"]
+    epsilon = checked_hp["optimizer_epsilon"]
+    norm_decay = checked_hp["norm_decay"]
+    norm_epsilon = checked_hp["norm_epsilon"]
+    use_diagonal = checked_hp["use_diagonal_normalization"] == 1.0
+    use_adaptive_clip = checked_hp["use_adaptive_clip"] == 1.0
+    update_features = checked_hp["update_features"] == 1.0
 
     def init_fn(params: dict[str, Array]) -> IntentionalUpdatesIPMNISTState:
-        input_dim = params["w1"].shape[0]
+        checked_params = _l2er_params(params)
+        input_dim = checked_params["w1"].shape[0]
         return IntentionalUpdatesIPMNISTState(  # type: ignore[call-arg]
-            squared_gradient={name: jnp.zeros_like(value) for name, value in params.items()},
+            squared_gradient={
+                name: jnp.zeros_like(value) for name, value in checked_params.items()
+            },
             step=jnp.asarray(0, dtype=jnp.int32),
             clip_squared_error=jnp.asarray(0.0, dtype=jnp.float32),
             clip_step=jnp.asarray(0, dtype=jnp.int32),
@@ -1480,10 +1550,73 @@ def _make_intentional_updates_learner(
         key: Array,
     ) -> tuple[dict[str, Array], IntentionalUpdatesIPMNISTState, StepMetrics]:
         del key
-        x_norm, new_norm = ema_normalize(state.norm, x, norm_decay, norm_epsilon)
+        checked_params = _l2er_params(params)
+        checked_x = _l2er_array(x, name="x", ndim=1)
+        checked_y = _intentional_updates_scalar_int_array(y, name="y")
+        if checked_x.shape != (checked_params["w1"].shape[0],):
+            raise ValueError("x must match the current IPMNIST input width")
+        if type(state) is not IntentionalUpdatesIPMNISTState:
+            raise ValueError("state must be an exact IntentionalUpdatesIPMNISTState")
+        squared_gradient = _l2er_params(state.squared_gradient)
+        if any(
+            squared_gradient[name].shape != value.shape
+            for name, value in checked_params.items()
+        ):
+            raise ValueError("squared-gradient state must match the parameter tree")
+        step = _intentional_updates_scalar_int_array(state.step, name="state.step")
+        clip_step = _intentional_updates_scalar_int_array(
+            state.clip_step, name="state.clip_step"
+        )
+        clip_squared_error = _l2er_array(
+            state.clip_squared_error, name="state.clip_squared_error", ndim=0
+        )
+        if type(state.norm) is not EMANormState:
+            raise ValueError("state.norm must be an exact EMANormState")
+        norm_mean = _l2er_array(state.norm.mean, name="state.norm.mean", ndim=1)
+        norm_var = _l2er_array(state.norm.var, name="state.norm.var", ndim=1)
+        norm_count = _l2er_array(state.norm.count, name="state.norm.count", ndim=0)
+        if norm_mean.shape != checked_x.shape or norm_var.shape != checked_x.shape:
+            raise ValueError("normalizer state must match the IPMNIST input width")
+        if any(
+            value.dtype != jnp.dtype(jnp.float32)
+            for value in (checked_x, clip_squared_error, norm_mean, norm_var, norm_count)
+        ):
+            raise ValueError("Intentional Updates inputs and state must use float32")
+        valid = (
+            floating_tree_is_finite(checked_params)
+            & floating_tree_is_finite(squared_gradient)
+            & jnp.all(jnp.isfinite(checked_x))
+            & jnp.isfinite(clip_squared_error)
+            & jnp.all(jnp.isfinite(norm_mean))
+            & jnp.all(jnp.isfinite(norm_var))
+            & jnp.isfinite(norm_count)
+            & (step >= 0)
+            & (clip_step >= 0)
+            & (norm_count >= 0.0)
+            & (checked_y >= 0)
+            & (checked_y < checked_params["b3"].shape[0])
+        )
+        if not isinstance(valid, jax.core.Tracer) and not bool(valid):
+            raise ValueError("Intentional Updates inputs and state must be finite and valid")
+        safe_params = jax.tree.map(
+            lambda value: jnp.where(jnp.isfinite(value), value, jnp.zeros_like(value)),
+            checked_params,
+        )
+        safe_x = jnp.where(jnp.isfinite(checked_x), checked_x, jnp.zeros_like(checked_x))
+        safe_y = jnp.clip(checked_y, 0, checked_params["b3"].shape[0] - 1)
+        safe_norm = EMANormState(  # type: ignore[call-arg]
+            mean=jnp.where(jnp.isfinite(norm_mean), norm_mean, jnp.zeros_like(norm_mean)),
+            var=jnp.where(jnp.isfinite(norm_var), norm_var, jnp.ones_like(norm_var)),
+            count=jnp.where(
+                jnp.isfinite(norm_count) & (norm_count >= 0.0),
+                norm_count,
+                jnp.zeros_like(norm_count),
+            ),
+        )
+        x_norm, new_norm = ema_normalize(safe_norm, safe_x, norm_decay, norm_epsilon)
         (loss, logits), raw_grads = jax.value_and_grad(
             cross_entropy_loss, has_aux=True
-        )(params, x_norm, y)
+        )(safe_params, x_norm, safe_y)
         grads = {
             name: (
                 gradient
@@ -1492,9 +1625,9 @@ def _make_intentional_updates_learner(
             )
             for name, gradient in raw_grads.items()
         }
-        new_step = state.step + jnp.asarray(1, dtype=jnp.int32)
-        squared_gradient = {
-            name: beta2 * state.squared_gradient[name]
+        new_step = step + jnp.asarray(1, dtype=jnp.int32)
+        next_squared_gradient = {
+            name: beta2 * squared_gradient[name]
             + (1.0 - beta2) * jnp.square(gradient)
             for name, gradient in grads.items()
         }
@@ -1505,7 +1638,7 @@ def _make_intentional_updates_learner(
                 if use_diagonal
                 else jnp.ones_like(value)
             )
-            for name, value in squared_gradient.items()
+            for name, value in next_squared_gradient.items()
         }
         denominator = sum(
             (
@@ -1515,26 +1648,38 @@ def _make_intentional_updates_learner(
             jnp.asarray(0.0, dtype=jnp.float32),
         )
 
-        new_clip_step = state.clip_step + jnp.asarray(1, dtype=jnp.int32)
+        new_clip_step = clip_step + jnp.asarray(1, dtype=jnp.int32)
         clip_squared_error = (
-            beta_clip * state.clip_squared_error + (1.0 - beta_clip) * jnp.square(loss)
+            beta_clip * clip_squared_error + (1.0 - beta_clip) * jnp.square(loss)
         )
         clip_bias_correction = 1.0 - beta_clip ** new_clip_step.astype(jnp.float32)
         adaptive_cap = clip_mult * jnp.sqrt(clip_squared_error / clip_bias_correction)
         safe_loss = jnp.minimum(loss, adaptive_cap) if use_adaptive_clip else loss
         multiplier = eta * safe_loss / jnp.maximum(denominator, epsilon)
         new_params = {
-            name: params[name] - multiplier * scale[name] * grads[name]
-            for name in params
+            name: safe_params[name] - multiplier * scale[name] * grads[name]
+            for name in safe_params
         }
-        metrics = _step_metrics(new_params, x_norm, y, loss, logits)
-        return new_params, IntentionalUpdatesIPMNISTState(  # type: ignore[call-arg]
-            squared_gradient=squared_gradient,
+        metrics = _step_metrics(new_params, x_norm, safe_y, loss, logits)
+        new_state = IntentionalUpdatesIPMNISTState(  # type: ignore[call-arg]
+            squared_gradient=next_squared_gradient,
             step=new_step,
             clip_squared_error=clip_squared_error,
             clip_step=new_clip_step,
             norm=new_norm,
-        ), metrics
+        )
+        valid = valid & floating_tree_is_finite((new_params, new_state, metrics))
+        if not isinstance(valid, jax.core.Tracer) and not bool(valid):
+            raise ValueError("Intentional Updates produced a non-finite update")
+        return (
+            jax.tree.map(
+                lambda value: _intentional_updates_invalid_result(valid, value), new_params
+            ),
+            jax.tree.map(
+                lambda value: _intentional_updates_invalid_result(valid, value), new_state
+            ),
+            jax.tree.map(lambda value: _intentional_updates_invalid_result(valid, value), metrics),
+        )
 
     return init_fn, full_step
 
@@ -8553,6 +8698,8 @@ def l2er_development_result_payload(
         "scientific_promotion_allowed": False,
     }
     return validate_l2er_development_result(payload)
+
+
 def _intentional_updates_persistent_numeric_bytes(
     config: IPMNISTConfig, *, mechanism_enabled: bool
 ) -> int:
@@ -8640,13 +8787,38 @@ def intentional_updates_development_record(
     }
 
 
+def _trusted_intentional_json(value: object, *, context: str) -> object:
+    value_type = type(value)
+    if value_type is dict:
+        mapping = cast(dict[object, object], value)
+        if not all(type(key) is str for key in mapping):
+            raise ValueError(f"{context} keys must be exact strings")
+        return {
+            cast(str, key): _trusted_intentional_json(item, context=f"{context}.{key}")
+            for key, item in mapping.items()
+        }
+    if value_type is list:
+        sequence = cast(list[object], value)
+        return [
+            _trusted_intentional_json(item, context=f"{context}[{index}]")
+            for index, item in enumerate(sequence)
+        ]
+    if value_type is str or value_type is bool or value_type is int or value is None:
+        return value
+    if value_type is float and math.isfinite(cast(float, value)):
+        return value
+    raise ValueError(f"{context} must contain only finite exact JSON values")
+
+
 def validate_intentional_updates_development_record(
     record: object,
 ) -> dict[str, Any]:
     """Fail closed over an Intentional Updates development record."""
     if type(record) is not dict:
         raise ValueError("Intentional Updates record must be an exact object")
-    payload = cast(dict[str, Any], record)
+    payload = cast(
+        dict[str, Any], _trusted_intentional_json(record, context="Intentional Updates record")
+    )
     policy = payload.get("policy")
     if policy != {
         "development_only": True,

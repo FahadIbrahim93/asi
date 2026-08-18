@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+from typing import Never
 
 import jax
 import jax.numpy as jnp
@@ -96,6 +97,42 @@ def test_candidate_and_ablations_have_finite_jittable_autodiff_steps(name: str) 
     assert all(bool(jnp.all(jnp.isfinite(value))) for value in leaves)
 
 
+def test_candidate_invalid_jit_input_is_visible_and_eager_input_fails() -> None:
+    spec = screening_spec("intentional_updates_ipmnist")
+    init_fn, step_fn = spec.factory(spec.hyperparameters)
+    params = init_mlp_params(jr.key(1), SMALL)
+    invalid_params = {**params, "w1": params["w1"].at[0, 0].set(jnp.nan)}
+    state = init_fn(params)
+    x = jnp.zeros((SMALL.input_dim,), dtype=jnp.float32)
+    y = jnp.asarray(0, dtype=jnp.int32)
+    with pytest.raises(ValueError, match="finite and valid"):
+        step_fn(invalid_params, state, x, y, jr.key(2))
+    new_params, new_state, metrics = jax.jit(step_fn)(
+        invalid_params, state, x, y, jr.key(2)
+    )
+    assert all(bool(jnp.all(jnp.isnan(value))) for value in new_params.values())
+    assert bool(jnp.all(jnp.isnan(jnp.asarray(metrics))))
+    assert bool(jnp.all(jnp.isnan(new_state.clip_squared_error)))
+
+
+def test_factory_rejects_hostile_hyperparameter_container_without_hooks() -> None:
+    class HostileDict(dict[object, object]):
+        calls = 0
+
+        def __iter__(self) -> Never:
+            self.calls += 1
+            raise AssertionError("must not iterate")
+
+        def __getitem__(self, key: object) -> Never:
+            self.calls += 1
+            raise AssertionError("must not index")
+
+    hostile = HostileDict()
+    with pytest.raises(ValueError, match="exact dict"):
+        _make_intentional_updates_learner(hostile)
+    assert hostile.calls == 0
+
+
 def test_head_only_feature_control_freezes_hidden_parameters() -> None:
     spec = screening_spec("intentional_updates_head_only")
     init_fn, step_fn = spec.factory(spec.hyperparameters)
@@ -172,6 +209,24 @@ def test_strict_development_record_binds_resources_gates_and_metrics() -> None:
     hostile["gates"]["backpropagation"] = False
     with pytest.raises(ValueError, match="frozen protocol"):
         validate_intentional_updates_development_record(hostile)
+
+    class HostilePolicy(dict[object, object]):
+        calls = 0
+
+        def __eq__(self, other: object) -> Never:
+            self.calls += 1
+            raise AssertionError("must not compare")
+
+        def __iter__(self) -> Never:
+            self.calls += 1
+            raise AssertionError("must not iterate")
+
+    hostile = copy.deepcopy(record)
+    hostile_policy = HostilePolicy()
+    hostile["policy"] = hostile_policy
+    with pytest.raises(ValueError, match="exact JSON"):
+        validate_intentional_updates_development_record(hostile)
+    assert hostile_policy.calls == 0
 
     hostile = copy.deepcopy(record)
     hostile["references"]["official_code"] = "moving-main"
