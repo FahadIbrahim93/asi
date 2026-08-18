@@ -1415,6 +1415,35 @@ class _CellScan:
             raise ForagerMatchedCampaignError(
                 "retained_raw_bytes must be a non-negative int"
             )
+        completed = (
+            self.artifact,
+            self.completed_attempt,
+            self.raw_binding_sha256,
+            self.bundle_sha256,
+        )
+        if any(value is not None for value in completed) and not all(
+            value is not None for value in completed
+        ):
+            raise ForagerMatchedCampaignError(
+                "completed cell fields must be all present or all absent"
+            )
+        resumable = (self.resumable_attempt, self.resumable_binding)
+        if any(value is not None for value in resumable) and not all(
+            value is not None for value in resumable
+        ):
+            raise ForagerMatchedCampaignError(
+                "resumable cell fields must be both present or both absent"
+            )
+        if all(value is not None for value in completed) and all(
+            value is not None for value in resumable
+        ):
+            raise ForagerMatchedCampaignError(
+                "cell cannot be both completed and resumable"
+            )
+        if self.pointer_present and not all(value is not None for value in completed):
+            raise ForagerMatchedCampaignError(
+                "completion pointer requires a complete artifact binding"
+            )
 
 
 def _validate_failures(
