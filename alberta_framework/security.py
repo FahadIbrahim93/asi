@@ -128,6 +128,62 @@ def _copy_json_mapping(payload: object, *, name: str) -> dict[str, Any]:
     }
 
 
+def _freeze_json_value(value: Any) -> Any:
+    value_type = type(value)
+    if value_type is list:
+        return tuple(_freeze_json_value(item) for item in value)
+    if value_type is dict:
+        return MappingProxyType(
+            {key: _freeze_json_value(item) for key, item in value.items()}
+        )
+    return value
+
+
+def _freeze_json_mapping(payload: dict[str, Any]) -> Mapping[str, Any]:
+    return MappingProxyType(
+        {key: _freeze_json_value(value) for key, value in payload.items()}
+    )
+
+
+def _require_frozen_json_value(
+    value: object,
+    *,
+    name: str,
+    depth: int = 0,
+    budget: list[int] | None = None,
+) -> None:
+    if budget is None:
+        budget = [_JSON_MAX_NODES]
+    budget[0] -= 1
+    if budget[0] < 0:
+        raise ValueError(f"{name} exceeds the JSON value resource limit")
+    if depth > _JSON_MAX_DEPTH:
+        raise ValueError(f"{name} exceeds the JSON nesting limit")
+    value_type = type(value)
+    if (
+        value is None
+        or value_type is bool
+        or value_type is int
+        or value_type is float
+        or value_type is str
+    ):
+        return
+    if value_type is tuple:
+        for item in cast(tuple[object, ...], value):
+            _require_frozen_json_value(
+                item, name=name, depth=depth + 1, budget=budget
+            )
+        return
+    if value_type is MappingProxyType:
+        payload = _copy_mapping(value, name=name)
+        for item in payload.values():
+            _require_frozen_json_value(
+                item, name=name, depth=depth + 1, budget=budget
+            )
+        return
+    raise ValueError(f"{name} must contain immutable exact JSON values")
+
+
 def _require_exact_str(name: str, value: object) -> str:
     if type(value) is not str:
         raise ValueError(f"{name} must be an exact string")
@@ -484,8 +540,8 @@ class SecurityOracleExperience:
                 raise ValueError("security oracle outcome label does not match action metadata")
         object.__setattr__(self, "state", state)
         object.__setattr__(self, "reward", reward)
-        object.__setattr__(self, "outcome", MappingProxyType(outcome))
-        object.__setattr__(self, "policy_metadata", MappingProxyType(policy_metadata))
+        object.__setattr__(self, "outcome", _freeze_json_mapping(outcome))
+        object.__setattr__(self, "policy_metadata", _freeze_json_mapping(policy_metadata))
 
     def _revalidated_copy(self) -> SecurityOracleExperience:
         """Reconstruct the record before a public consumer trusts frozen fields."""
@@ -500,18 +556,18 @@ class SecurityOracleExperience:
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serializable oracle experience mapping."""
-        checked = self._revalidated_copy()
+        validated = _require_canonical_oracle_experience(self)
         payload = {
-            "schema": checked.schema,
-            "state": list(checked.state),
-            "action": int(checked.action),
-            "action_name": security_gym_action_name(checked.action),
-            "reward": checked.reward,
+            "schema": validated.schema,
+            "state": list(validated.state),
+            "action": int(validated.action),
+            "action_name": security_gym_action_name(validated.action),
+            "reward": validated.reward,
             "outcome": _copy_json_mapping(
-                checked.outcome, name="security oracle outcome"
+                validated.outcome, name="security oracle outcome"
             ),
             "policy_metadata": _copy_json_mapping(
-                checked.policy_metadata, name="policy_metadata"
+                validated.policy_metadata, name="policy_metadata"
             ),
         }
         _require_rfc_json_mapping(payload, name="security oracle experience")
@@ -568,16 +624,45 @@ def validate_security_oracle_experience(
         if type(record) is not SecurityOracleExperience:
             raise ValueError(f"invalid oracle experience {idx}: wrong record type")
         try:
-            checked = record._revalidated_copy()
+            validated = _require_canonical_oracle_experience(record)
         except ValueError as exc:
             raise ValueError(f"invalid oracle experience {idx}: {exc}") from exc
         try:
-            schema.validate_observation(checked.state)
+            schema.validate_observation(validated.state)
         except ValueError as exc:
             raise ValueError(f"invalid oracle experience {idx}: {exc}") from exc
-        label = checked.outcome.get("label")
+        label = validated.outcome.get("label")
         if type(label) is not str or len(label) == 0:
             raise ValueError(f"invalid oracle experience {idx}: missing outcome label")
+
+
+def _require_canonical_oracle_experience(
+    record: SecurityOracleExperience,
+) -> SecurityOracleExperience:
+    if type(record.state) is not tuple or any(
+        type(value) is not float for value in record.state
+    ):
+        raise ValueError("state must contain canonical float values")
+    if type(record.action) is not SecurityAction:
+        raise ValueError("action must be an exact SecurityAction")
+    if type(record.reward) is not float:
+        raise ValueError("reward must be a canonical float")
+    if type(record.schema) is not str or record.schema != _ORACLE_EXPERIENCE_SCHEMA:
+        raise ValueError("schema must identify the oracle-experience v1 contract")
+    if type(record.outcome) is not MappingProxyType:
+        raise ValueError("security oracle outcome must be an immutable mapping")
+    if type(record.policy_metadata) is not MappingProxyType:
+        raise ValueError("policy_metadata must be an immutable mapping")
+    _require_frozen_json_value(record.outcome, name="security oracle outcome")
+    _require_frozen_json_value(record.policy_metadata, name="policy_metadata")
+    return SecurityOracleExperience(
+        state=record.state,
+        action=record.action,
+        reward=record.reward,
+        outcome=record.outcome,
+        policy_metadata=record.policy_metadata,
+        schema=record.schema,
+    )
 
 
 def coerce_security_action(action: object) -> SecurityAction:
