@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import os
 from copy import deepcopy
 from pathlib import Path
@@ -240,7 +241,7 @@ def test_three_seed_interval_uses_student_t_not_normal_critical_value() -> None:
     assert critical.hex() == "0x1.135ea98e146bbp+2"
 
 
-@pytest.mark.parametrize("version", ("v1", "v2"))
+@pytest.mark.parametrize("version", ("v1",))
 def test_validator_rejects_obsolete_report_identity(
     monkeypatch: pytest.MonkeyPatch,
     version: str,
@@ -254,6 +255,24 @@ def test_validator_rejects_obsolete_report_identity(
     report["schema"] = f"asi.l2er-ipmnist.matched-development-report.{version}"
     with pytest.raises(ValueError, match="schema does not match"):
         matched.validate_report(report, require_current_source=False)
+
+
+def test_historical_v2_loader_accepts_only_exact_retained_artifact(tmp_path: Path) -> None:
+    encoded = matched.HISTORICAL_V2_PATH.read_bytes()
+    assert hashlib.sha256(encoded).hexdigest() == matched.HISTORICAL_V2_SHA256
+    loaded = matched.load_historical_v2_report()
+    assert loaded["schema"] == matched.HISTORICAL_V2_SCHEMA
+    assert matched.validate_report(loaded) == loaded
+
+    copied = tmp_path / "report.v2.json"
+    copied.write_bytes(encoded)
+    with pytest.raises(ValueError, match="exact retained artifact path"):
+        matched.load_historical_v2_report(copied)
+
+    tampered = deepcopy(loaded)
+    tampered["policy"]["scientific_promotion_allowed"] = True
+    with pytest.raises(ValueError, match="exact retained artifact"):
+        matched.validate_report(tampered)
 
 
 def test_report_revalidates_result_identity_before_reading_metrics(
@@ -378,6 +397,7 @@ def test_output_publication_uses_pinned_dirfd_and_strict_reload(
     monkeypatch.setattr(matched, "_validated_runtime_environment", lambda value, **_: value)
     monkeypatch.setattr(matched, "_screening_source_provenance", lambda: {})
     monkeypatch.setattr(matched, "_screening_runtime_environment", lambda: {})
+    monkeypatch.setattr(matched, "_V3_EXECUTION_AUTHORIZED", True)
     report = matched.build_report(
         _results(), source_provenance={}, dataset_provenance={}, environment={}
     )
@@ -393,3 +413,15 @@ def test_output_publication_uses_pinned_dirfd_and_strict_reload(
     assert matched.OUTPUT_PATH.is_file()
     with pytest.raises(FileExistsError, match="refusing to overwrite"):
         matched._open_output_transaction()
+
+
+def test_direct_publication_is_blocked_before_validation_or_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        matched,
+        "validate_report",
+        lambda *_args, **_kwargs: pytest.fail("blocked publication must not validate"),
+    )
+    with pytest.raises(RuntimeError, match="planned seeds were already consumed"):
+        matched._publish_report(-1, -1, "unused", {})
