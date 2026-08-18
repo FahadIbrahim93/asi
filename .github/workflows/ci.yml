@@ -393,7 +393,9 @@ jobs:
   # Stable aggregate check for branch rulesets: the runtime matrix has
   # dynamic job names, so merge gating requires this single context instead.
   ci-ok:
-    if: always()
+    # A superseded run must terminate instead of scheduling this aggregate
+    # after its dependencies were cancelled. Failures still reach the jq gate.
+    if: ${{ !cancelled() }}
     needs: [package, robot-floor, portability, lint, test-plan, test]
     runs-on: ubuntu-latest
     timeout-minutes: 5
