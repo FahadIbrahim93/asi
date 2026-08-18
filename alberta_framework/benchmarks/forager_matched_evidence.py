@@ -217,14 +217,14 @@ def _validate_json_complexity(value: Any) -> None:
 
 def decode_strict_json(raw: bytes | str) -> Any:
     """Decode bounded duplicate-free JSON with finite numeric values."""
-    if isinstance(raw, bytes):
+    if type(raw) is bytes:
         if len(raw) > _MAX_JSON_BYTES:
             raise ForagerMatchedEvidenceError("score evidence exceeds the byte bound")
         try:
             text = raw.decode("utf-8")
         except UnicodeDecodeError as exc:
             raise ForagerMatchedEvidenceError("score evidence is not UTF-8") from exc
-    elif isinstance(raw, str):
+    elif type(raw) is str:
         try:
             encoded = raw.encode("utf-8")
         except UnicodeEncodeError as exc:
@@ -837,18 +837,18 @@ def _parse_matched_selection_report_structure(
     try:
         result = (
             parse_forager_matched_selection_result(selection_result.to_dict())
-            if isinstance(selection_result, ForagerMatchedSelectionResult)
+            if type(selection_result) is ForagerMatchedSelectionResult
             else parse_forager_matched_selection_result(selection_result)
         )
     except ForagerMatchedProtocolError as exc:
         raise ForagerMatchedEvidenceError(f"selection result is invalid: {exc}") from exc
-    if isinstance(value, (bytes, str)):
-        decoded = decode_strict_json(value)
-        if isinstance(value, bytes):
+    if type(value) in (bytes, str):
+        decoded = decode_strict_json(cast(bytes | str, value))
+        if type(value) is bytes:
             input_bytes = value
         else:
             try:
-                input_bytes = value.encode("utf-8")
+                input_bytes = cast(str, value).encode("utf-8")
             except UnicodeEncodeError as exc:
                 raise ForagerMatchedEvidenceError(
                     "selection report contains invalid Unicode"
@@ -1177,10 +1177,10 @@ def parse_matched_score_evidence(
     expected_payload_sha256: str | None = None,
 ) -> MatchedScoreEvidence:
     """Parse and self-verify one canonical score-evidence bundle."""
-    if isinstance(value, (bytes, str)):
+    if type(value) in (bytes, str):
         raw = value
-        decoded = decode_strict_json(raw)
-        input_bytes = raw if isinstance(raw, bytes) else raw.encode("utf-8")
+        decoded = decode_strict_json(cast(bytes | str, raw))
+        input_bytes = raw if type(raw) is bytes else cast(str, raw).encode("utf-8")
         canonical_input = True
     elif isinstance(value, Mapping):
         decoded = decode_strict_json(_canonical_json_bytes(dict(value)))
@@ -1355,7 +1355,7 @@ def _protocol_instance(
     protocol: ForagerMatchedProtocol | Mapping[str, Any],
 ) -> ForagerMatchedProtocol:
     try:
-        if isinstance(protocol, ForagerMatchedProtocol):
+        if type(protocol) is ForagerMatchedProtocol:
             return parse_forager_matched_protocol(protocol.to_dict())
         return parse_forager_matched_protocol(protocol)
     except ForagerMatchedProtocolError as exc:
@@ -1370,8 +1370,10 @@ def matched_execution_closure_sha256(
     frozen = _protocol_instance(protocol)
     scores = (
         parse_matched_score_evidence(score_evidence.to_dict())
-        if isinstance(score_evidence, MatchedScoreEvidence)
-        else parse_matched_score_evidence(score_evidence)
+        if type(score_evidence) is MatchedScoreEvidence
+        else parse_matched_score_evidence(
+            cast(Mapping[str, Any] | bytes | str, score_evidence)
+        )
     )
     execution_receipts = tuple(
         candidate.execution_receipt_sha256 for candidate in scores.candidate_scores
@@ -1463,8 +1465,10 @@ def matched_verification_subject_sha256(
     frozen = _protocol_instance(protocol)
     scores = (
         parse_matched_score_evidence(score_evidence.to_dict())
-        if isinstance(score_evidence, MatchedScoreEvidence)
-        else parse_matched_score_evidence(score_evidence)
+        if type(score_evidence) is MatchedScoreEvidence
+        else parse_matched_score_evidence(
+            cast(Mapping[str, Any] | bytes | str, score_evidence)
+        )
     )
     return _verification_subject_sha256(
         stage=scores.stage,
@@ -1546,8 +1550,8 @@ def validate_score_evidence_against_protocol(
     frozen = _protocol_instance(protocol)
     scores = (
         parse_matched_score_evidence(evidence.to_dict())
-        if isinstance(evidence, MatchedScoreEvidence)
-        else parse_matched_score_evidence(evidence)
+        if type(evidence) is MatchedScoreEvidence
+        else parse_matched_score_evidence(cast(Mapping[str, Any] | bytes | str, evidence))
     )
     if expected_candidate_ids is None:
         expected_ids = (
@@ -1848,10 +1852,7 @@ def parse_matched_selection_report(
     try:
         supplied_result = (
             parse_forager_matched_selection_result(selection_result.to_dict())
-            if isinstance(
-                selection_result,
-                ForagerMatchedSelectionResult,
-            )
+            if type(selection_result) is ForagerMatchedSelectionResult
             else parse_forager_matched_selection_result(selection_result)
         )
     except ForagerMatchedProtocolError as exc:
@@ -1913,13 +1914,17 @@ def build_statistics_contract(
     sealed_value = _protocol_instance(sealed_protocol)
     open_score_value = (
         parse_matched_score_evidence(open_evidence.to_dict())
-        if isinstance(open_evidence, MatchedScoreEvidence)
-        else parse_matched_score_evidence(open_evidence)
+        if type(open_evidence) is MatchedScoreEvidence
+        else parse_matched_score_evidence(
+            cast(Mapping[str, Any] | bytes | str, open_evidence)
+        )
     )
     evaluation_score_value = (
         parse_matched_score_evidence(evaluation_evidence.to_dict())
-        if isinstance(evaluation_evidence, MatchedScoreEvidence)
-        else parse_matched_score_evidence(evaluation_evidence)
+        if type(evaluation_evidence) is MatchedScoreEvidence
+        else parse_matched_score_evidence(
+            cast(Mapping[str, Any] | bytes | str, evaluation_evidence)
+        )
     )
     replayed_selection = compute_open_selection(
         open_value,
@@ -1929,7 +1934,7 @@ def build_statistics_contract(
     try:
         result_value = (
             parse_forager_matched_selection_result(selection_result.to_dict())
-            if isinstance(selection_result, ForagerMatchedSelectionResult)
+            if type(selection_result) is ForagerMatchedSelectionResult
             else parse_forager_matched_selection_result(selection_result)
         )
         if result_value.to_dict() != replayed_selection.selection_result.to_dict():
