@@ -293,6 +293,9 @@ class DecisionProbeSet:
     true_rewards: NDArray[np.float64]
     true_returns: NDArray[np.float64]
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "seed", _require_int32("seed", self.seed, minimum=0))
+
 
 @dataclass(frozen=True)
 class PredictedRollouts:
