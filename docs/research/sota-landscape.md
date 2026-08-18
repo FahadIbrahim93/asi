@@ -95,6 +95,23 @@ local same-runner development ranking, not a paper-level SOTA claim.
   family is a documented supervised protocol port with matched hard-reset,
   L2-Init, utility-free, and mechanism-off controls—not a source reproduction
   or an IPMNIST result. C-CHAIN remains a candidate for a causal ablation.
+- [Experience Replay Addresses Loss of Plasticity
+  (2025)](https://arxiv.org/abs/2503.20018) argues that replay processed by a
+  Transformer can preserve plasticity through in-context learning. ASI now
+  registers a permanently nonpromoting four-arm adaptation: charged
+  mechanism-off, replay-gradient-only, label-attention-only, and combined.
+  Its 32-example label-attention context is not the paper's Transformer, and
+  arXiv v1 discloses no official implementation. Exact replay, query, memory,
+  and zero-pretraining costs are bound into every receipt; no run exists.
+- [RanDumb](https://arxiv.org/abs/2402.08823),
+  [RanPAC](https://arxiv.org/abs/2307.02251), and
+  [PROL](https://arxiv.org/abs/2507.12305) motivate frozen random or pretrained
+  representation ceilings. ASI registers raw-pixel adaptations at audited
+  revisions v3/v3/v1 and official commits `14a51ee…`, `cf4b301…`, and
+  `bfff841…`. RanPAC and PROL import no pretrained model and are explicitly
+  mechanism proxies, not reproductions. A charged PROL mechanism-off arm is
+  included; extractor, compatibility-ballast, and zero-pretraining costs are
+  exact. No comparison has been run.
 - [Intentional Updates](https://arxiv.org/abs/2604.19033v1) reports strong
   fully streaming reinforcement-learning results by solving for step sizes in
   prediction or policy units. ASI pins paper v1 and official code commit
@@ -211,6 +228,7 @@ not mean an agent adapter or comparison result exists.
 | [COOM](https://github.com/TTomilin/COOM) | Pixel-based Doom task sequences with average performance, forgetting, and forward transfer. | Useful robustness/representation lane after a smaller R3 control closes. |
 | [Continual Bench / FTL Online Agent](https://arxiv.org/abs/2507.09177) | Online shallow world model plus MPC across reward-defined continual tasks, with a regret result under stated assumptions. | Closest model-based competitor to ASI's FTL line; reproduce before extending the historically accepted narrow decision-fidelity artifact, and use the live evidence-status command for its current validity. |
 | [C-CHAIN](https://arxiv.org/abs/2506.00592) / [code](https://github.com/bluecontra/C-CHAIN) | Continual nonstationarity across Gym Control, ProcGen, DMC, and MinAtar. | Official arXiv v1 and code commit `2f8bedf…` are audited. The current ASI runner has a four-arm, nonpromoting IPMNIST adaptation with exact receipts but no run; official RL task/protocol reproduction remains open. |
+| Replay/frozen-feature controls | Replay/in-context adaptation plus RanDumb, RanPAC, and PROL-inspired ceilings. | Eight current-runner arms are registered with matched axes and strict nonpromoting receipts. Pretrained-paper claims remain incomparable until exact extractors, datasets, and their full costs are supplied. |
 
 Additional project sources:
 
