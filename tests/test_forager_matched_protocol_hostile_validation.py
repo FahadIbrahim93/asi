@@ -9,11 +9,13 @@ from alberta_framework.benchmarks.forager_matched_protocol import (
     DescriptiveContext,
     EnvironmentRNGContract,
     ForagerMatchedProtocolError,
+    ForagerMatchedSelectionResult,
     RankedSelectionGroup,
     ResolvedSelectionSlot,
     SelectionSlot,
     decode_strict_json,
     parse_forager_matched_protocol,
+    parse_forager_matched_selection_result,
 )
 
 
@@ -47,6 +49,14 @@ class _HostileInputMeta(type):
 
 class _HostileInput(metaclass=_HostileInputMeta):
     pass
+
+
+class _HostileSelectionResult(ForagerMatchedSelectionResult):
+    calls = 0
+
+    def to_dict(self) -> dict[str, object]:
+        type(self).calls += 1
+        raise AssertionError("hostile selection conversion executed")
 
 
 def test_environment_rng_contract_validation() -> None:
@@ -179,6 +189,8 @@ def test_protocol_string_boundaries_reject_subclasses_without_dispatch() -> None
         ),
         lambda: decode_strict_json(hostile),
         lambda: parse_forager_matched_protocol({"hostile": hostile}),
+        lambda: parse_forager_matched_protocol(hostile),
+        lambda: parse_forager_matched_selection_result(hostile),
     )
     for operation in operations:
         with pytest.raises(ForagerMatchedProtocolError):
@@ -191,3 +203,11 @@ def test_protocol_decoder_rejects_hostile_runtime_type_without_metaclass_hooks()
     with pytest.raises(ForagerMatchedProtocolError, match="exact bytes or string JSON"):
         decode_strict_json(_HostileInput())  # type: ignore[arg-type]
     assert _HostileInputMeta.calls == 0
+
+
+def test_selection_result_parser_rejects_subclass_without_conversion() -> None:
+    hostile = object.__new__(_HostileSelectionResult)
+    _HostileSelectionResult.calls = 0
+    with pytest.raises(ForagerMatchedProtocolError):
+        parse_forager_matched_selection_result(hostile)
+    assert _HostileSelectionResult.calls == 0
