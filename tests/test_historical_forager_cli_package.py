@@ -47,6 +47,7 @@ _WHEEL_FILES = tuple(
 )
 _EXPECTED_SCRIPT_NAMES = {
     "asi-clear-qualification",
+    "asi-coom-qualification-smoke",
     "asi-cora-catalog",
     "asi-ipmnist-campaign",
     "asi-ipmnist-ceiling",

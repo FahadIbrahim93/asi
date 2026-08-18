@@ -269,7 +269,7 @@ EXTERNAL_QUALIFICATION_PLANS: tuple[ExternalQualificationPlan, ...] = (
     ExternalQualificationPlan(
         1582,
         "coom-vizdoom",
-        ("COOM NeurIPS 2023 Datasets and Benchmarks",),
+        ("NeurIPS2023-DatasetsAndBenchmarks:d61d9f4fe4357296cb658795fd7999f0",),
         (
             _revision(
                 "https://github.com/TTomilin/COOM.git", "7929801176c6e2e036c7c1c7dd6ce9b84a9d1f3e"
