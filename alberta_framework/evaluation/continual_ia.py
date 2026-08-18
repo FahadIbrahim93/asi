@@ -25,7 +25,7 @@ from __future__ import annotations
 import functools
 import operator
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from time import perf_counter
 from typing import Any, Literal, SupportsIndex, cast
 
@@ -133,7 +133,9 @@ def _require_ndarray(
         raise ValueError(f"{name} must be one-dimensional")
     if length is not None and int(value.shape[0]) != length:
         raise ValueError(f"{name} must have length {length}")
-    return value
+    snapshot = np.array(value, copy=True, order="C")
+    snapshot.flags.writeable = False
+    return snapshot
 
 
 def _require_derived_int32(name: str, value: int) -> None:
@@ -462,6 +464,7 @@ class IAConditionResult:
         if type(self.condition) is not str or self.condition not in CONDITION_NAMES:
             raise ValueError("condition must be a known IA condition name")
         rewards = _require_ndarray("rewards", self.rewards, dtype=np.dtype(np.float64))
+        object.__setattr__(self, "rewards", rewards)
         steps = int(rewards.shape[0])
         if steps < 1:
             raise ValueError("rewards must contain at least one step")
@@ -472,18 +475,21 @@ class IAConditionResult:
             "recommendations",
             "partner_proposals",
         ):
-            action_arrays.append(_require_ndarray(
+            action = _require_ndarray(
                 name,
                 getattr(self, name),
                 dtype=np.dtype(np.int64),
                 length=steps,
-            ))
+            )
+            object.__setattr__(self, name, action)
+            action_arrays.append(action)
         accepted = _require_ndarray(
             "accepted_recommendations",
             self.accepted_recommendations,
             dtype=np.dtype(np.bool_),
             length=steps,
         )
+        object.__setattr__(self, "accepted_recommendations", accepted)
         mean_reward = finite_real("mean_reward", self.mean_reward)
         object.__setattr__(self, "mean_reward", mean_reward)
         phase_means = _require_ndarray(
@@ -491,11 +497,13 @@ class IAConditionResult:
             self.phase_mean_rewards,
             dtype=np.dtype(np.float64),
         )
+        object.__setattr__(self, "phase_mean_rewards", phase_means)
         recoveries = _require_ndarray(
             "recovery_lengths",
             self.recovery_lengths,
             dtype=np.dtype(np.int64),
         )
+        object.__setattr__(self, "recovery_lengths", recoveries)
         arrays = (rewards, *action_arrays, accepted, phase_means, recoveries)
         if sum(array.nbytes for array in arrays) > _MAX_CONDITION_RESULT_BYTES:
             raise ValueError("condition result arrays exceed the bounded record budget")
@@ -562,10 +570,21 @@ class IAConditionResult:
             raise ValueError("recommendation conditions must contain concrete actions")
         if type(self.controller_budget) is not ControllerBudget:
             raise ValueError("controller_budget must be a ControllerBudget")
-        if self.controller_budget.interaction_steps != steps:
+        controller_budget = ControllerBudget(
+            **{
+                field.name: getattr(self.controller_budget, field.name)
+                for field in fields(ControllerBudget)
+            }
+        )
+        object.__setattr__(self, "controller_budget", controller_budget)
+        if controller_budget.interaction_steps != steps:
             raise ValueError("controller budget interaction_steps must match result length")
         if type(self.timing) is not ConditionTiming:
             raise ValueError("timing must be a ConditionTiming")
+        timing = ConditionTiming(
+            **{field.name: getattr(self.timing, field.name) for field in fields(ConditionTiming)}
+        )
+        object.__setattr__(self, "timing", timing)
 
 
 @dataclass(frozen=True)
@@ -1299,8 +1318,30 @@ def aggregate_ia_evidence(
 ) -> IAAggregateEvidence:
     """Aggregate paired conditions without dropping seeds or failed recoveries."""
 
+    if type(config) is not ContinualIAConfig:
+        raise ValueError("config must be a ContinualIAConfig")
+    config = ContinualIAConfig(
+        **{field.name: getattr(config, field.name) for field in fields(ContinualIAConfig)}
+    )
     if not results:
         raise ValueError("results must be non-empty")
+    validated: list[IAConditionResult] = []
+    for result in results:
+        if type(result) is not IAConditionResult:
+            raise ValueError("results must contain exact IAConditionResult records")
+        result = IAConditionResult(
+            **{field.name: getattr(result, field.name) for field in fields(IAConditionResult)}
+        )
+        if result.rewards.size != config.num_steps:
+            raise ValueError("result length does not match config.num_steps")
+        expected_phase_means = _phase_means(result.rewards, config)
+        if not np.array_equal(result.phase_mean_rewards, expected_phase_means):
+            raise ValueError("phase_mean_rewards do not match rewards and config")
+        expected_recoveries = _recovery_lengths(result.rewards, config)
+        if not np.array_equal(result.recovery_lengths, expected_recoveries):
+            raise ValueError("recovery_lengths do not match rewards and config")
+        validated.append(result)
+    results = tuple(validated)
     groups = {condition: _condition_group(results, condition) for condition in CONDITION_NAMES}
     seed_sets = {
         condition: tuple(result.seed for result in group) for condition, group in groups.items()

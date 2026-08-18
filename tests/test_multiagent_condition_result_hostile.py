@@ -176,3 +176,25 @@ def test_aggregation_revalidates_records_at_consumption() -> None:
                 recovery_window=1,
             ),
         )
+
+
+def test_aggregation_revalidates_nested_records_at_consumption() -> None:
+    results = [
+        _legal(condition="frozen", learning_mask=(False, False)),
+        _legal(condition="learner_only", learning_mask=(True, False)),
+        _legal(condition="joint_adaptive", learning_mask=(True, True)),
+    ]
+    object.__setattr__(results[0].timing, "p95_update_latency_ms", float("nan"))
+
+    with pytest.raises(ValueError, match="p95_update_latency_ms must be a finite"):
+        aggregate_evidence(
+            results,
+            config=ContinualMultiAgentConfig(
+                phase_steps=2,
+                probe_horizon=2,
+                probe_tail_steps=2,
+                recovery_window=1,
+                stability_reference_reward=0.0,
+            ),
+            bootstrap_resamples=2,
+        )
