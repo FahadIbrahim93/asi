@@ -686,9 +686,9 @@ class StreamingRunSummary:
     ) -> None:
         if self._accepted_events >= self._horizon:
             raise ValueError("streaming summary already reached its horizon")
-        if type(reward) not in (int, float):
+        if type(reward) is not int and type(reward) is not float:
             raise ValueError("reward must be a finite number")
-        if type(oracle_reward) not in (int, float):
+        if type(oracle_reward) is not int and type(oracle_reward) is not float:
             raise ValueError("oracle_reward must be a finite number")
         if type(regime_id) is not int:
             raise ValueError("regime_id must be an integer")
@@ -1007,9 +1007,9 @@ def _reward_sum(record: Mapping[str, Any]) -> float:
     if not isinstance(outcome, Mapping):
         raise ValueError("completed run record lacks an outcome")
     value = outcome.get("reward_sum")
-    if type(value) not in (int, float):
+    if type(value) is not int and type(value) is not float:
         raise ValueError("completed run reward_sum must be finite")
-    result = float(value)  # type: ignore[arg-type]
+    result = float(value)
     if not math.isfinite(result):
         raise ValueError("completed run reward_sum must be finite")
     return result
@@ -1686,7 +1686,7 @@ def build_scorecard_artifact(
 
 
 def _require_finite_nonnegative(value: Any, *, path: str) -> float:
-    if type(value) not in (int, float):
+    if type(value) is not int and type(value) is not float:
         raise ValueError(f"{path} must be a finite nonnegative number")
     result = float(value)
     if not math.isfinite(result) or result < 0.0:
@@ -1701,7 +1701,7 @@ def _require_nonnegative_int(value: Any, *, path: str) -> int:
 
 
 def _require_finite_number(value: Any, *, path: str) -> float:
-    if type(value) not in (int, float):
+    if type(value) is not int and type(value) is not float:
         raise ValueError(f"{path} must be a finite number")
     result = float(value)
     if not math.isfinite(result):

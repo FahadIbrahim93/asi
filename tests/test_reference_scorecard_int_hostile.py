@@ -30,6 +30,19 @@ class _HostileInt(int):
         raise AssertionError("hostile eq")
 
 
+class _HostileMeta(type):
+    calls = 0
+
+    def __eq__(cls, other: object) -> bool:
+        del other
+        cls.calls += 1
+        raise AssertionError("hostile metaclass eq")
+
+
+class _MetaclassHostileInt(int, metaclass=_HostileMeta):
+    pass
+
+
 def test_streaming_observe_rejects_hostile_before_float() -> None:
     from alberta_framework.benchmarks.reference_life_scorecard import StreamingRunSummary
 
@@ -74,6 +87,22 @@ def test_streaming_observe_rejects_hostile_before_float() -> None:
         next_state_index=0,
     )
     assert summary.accepted_events == 1
+
+
+def test_streaming_observe_uses_type_identity_without_metaclass_equality() -> None:
+    from alberta_framework.benchmarks.reference_life_scorecard import StreamingRunSummary
+
+    summary = StreamingRunSummary.for_switching(horizon=10, phase_length=3, post_switch_window=2)
+    _HostileMeta.calls = 0
+    with pytest.raises(ValueError, match="reward must be a finite number"):
+        summary.observe(
+            reward=_MetaclassHostileInt(1),
+            oracle_reward=1.0,
+            regime_id=0,
+            parameters_changed=False,
+            next_state_index=0,
+        )
+    assert _HostileMeta.calls == 0
 
 
 def test_run_shard_rejects_hostile_regime_without_dispatching_hooks(
