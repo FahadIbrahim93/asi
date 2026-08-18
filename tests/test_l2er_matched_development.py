@@ -277,6 +277,9 @@ def test_output_namespace_is_one_new_development_path() -> None:
         "outputs/l2er_matched_development/report.v3.json"
     )
     assert matched.SEEDS == (1711, 1712, 1713)
+    assert matched.frozen_plan()["consumed_matched_execution_seeds"] == [1711, 1712, 1713]
+    assert matched.frozen_plan()["execution_authorized"] is False
+    assert "silent seed churn" in matched.frozen_plan()["future_authorization_policy"]
     critical = matched.frozen_plan()["confidence_critical"]
     assert isinstance(critical, float)
     assert critical.hex() == "0x1.135ea98e146bbp+2"
@@ -305,8 +308,32 @@ def test_output_namespace_is_one_new_development_path() -> None:
         "039b51d2e58313049b6b1e93a453b5a8b6cede9b"
     )
     assert invalid[1]["disposition"] == "invalid_unmerged_seed_churn_attempt"
+    assert invalid[2]["pull_request"] == 1753
+    assert invalid[2]["result_head_commit"] == (
+        "ce89338e33f2a085cbe4c7978bc342e6a7751b53"
+    )
+    assert invalid[2]["merge_commit"] == "ee6d8949fa3ffc267297f2e7ced7f83f589835e1"
+    assert invalid[2]["artifact_sha256"] == (
+        "c5a6b8efb050d3c6c05648a46689ca0903389340764f7c20b589bfc4e8b0c6f2"
+    )
+    assert invalid[2]["seeds"] == [1711, 1712, 1713]
+    assert {
+        item["outcome"] for item in invalid[2]["paired_outcomes_exposed"].values()
+    } == {"inconclusive"}
     assert matched.frozen_plan()["development_only"] is True
     assert matched.frozen_plan()["scientific_promotion_allowed"] is False
+
+
+def test_v3_execution_is_blocked_before_output_reservation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        matched,
+        "_open_output_transaction",
+        lambda: pytest.fail("blocked execution must not reserve an output"),
+    )
+    with pytest.raises(RuntimeError, match="planned seeds were already consumed"):
+        matched.main([])
 
 
 def test_output_directory_rejects_symlinked_segments_and_occupied_target(

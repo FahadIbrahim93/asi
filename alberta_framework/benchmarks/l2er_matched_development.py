@@ -50,6 +50,7 @@ _MAX_REPORT_BYTES = 16 * 1024 * 1024
 _PATH_TYPE = type(Path())
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 OUTPUT_PATH = _REPO_ROOT / "outputs/l2er_matched_development/report.v3.json"
+_V3_EXECUTION_AUTHORIZED = False
 
 
 def _invalid_execution_history() -> list[dict[str, object]]:
@@ -89,6 +90,44 @@ def _invalid_execution_history() -> list[dict[str, object]]:
                 "the invalid output is not retained and cannot replace the prospective v2 matrix",
             ],
         },
+        {
+            "schema": "asi.l2er-ipmnist.matched-development-report.v2",
+            "path": "outputs/l2er_matched_development/report.v2.json",
+            "artifact_sha256": (
+                "c5a6b8efb050d3c6c05648a46689ca0903389340764f7c20b589bfc4e8b0c6f2"
+            ),
+            "source_commit": "072cfee9d061a2e2a370eee21ea901aa9fbad870",
+            "result_head_commit": "ce89338e33f2a085cbe4c7978bc342e6a7751b53",
+            "merge_commit": "ee6d8949fa3ffc267297f2e7ced7f83f589835e1",
+            "pull_request": 1753,
+            "seeds": [1711, 1712, 1713],
+            "disposition": "invalid_unmerged_consumed_accounting_ambiguous_attempt",
+            "paired_outcomes_exposed": {
+                "l2er_l2_only": {
+                    "mean_delta": 0.00033333152532577515,
+                    "ci95_lower": -0.0034612491011267914,
+                    "ci95_upper": 0.004127912151778342,
+                    "outcome": "inconclusive",
+                },
+                "l2er_er_only": {
+                    "mean_delta": -0.050333338479201,
+                    "ci95_lower": -0.11270119820592364,
+                    "ci95_upper": 0.012034521247521641,
+                    "outcome": "inconclusive",
+                },
+                "l2er_combined": {
+                    "mean_delta": -0.054333336651325226,
+                    "ci95_lower": -0.12215228219740261,
+                    "ci95_upper": 0.013485608894752157,
+                    "outcome": "inconclusive",
+                },
+            },
+            "invalid_reasons": [
+                "the v2 updates field ambiguously combined supervised and auxiliary steps",
+                "all planned 1711-1713 outcomes were exposed before the v3 contract was final",
+                "the unmerged v2 artifact cannot authorize a prospective same-seed v3 rerun",
+            ],
+        },
     ]
 
 
@@ -98,6 +137,15 @@ def frozen_plan() -> dict[str, object]:
         "plan_id": PLAN_ID,
         "arms": list(ARMS),
         "seeds": list(SEEDS),
+        "consumed_matched_execution_seeds": list(SEEDS),
+        "execution_authorized": _V3_EXECUTION_AUTHORIZED,
+        "execution_status": (
+            "blocked: seeds 1711-1713 were consumed and their v2 outcomes were exposed"
+        ),
+        "future_authorization_policy": (
+            "requires a separately preregistered methodological disposition; "
+            "neither a same-seed prospective claim nor silent seed churn is authorized"
+        ),
         "consumed_preplan_audit_seeds": list(CONSUMED_AUDIT_SEEDS),
         "consumed_preplan_audit_note": (
             "seed 1701 ran once across all four arms during executable-path audit; "
@@ -264,14 +312,22 @@ def _validated_plan(value: object) -> dict[str, object]:
         "statistical_correction_seed_policy",
         "consumed_preplan_audit_note",
         "optimizer_update_matching_policy",
+        "execution_status",
+        "future_authorization_policy",
     ):
         if type(plan[key]) is not str:
             raise ValueError(f"plan.{key} must be an exact string")
-    for key in ("development_only", "scientific_promotion_allowed", "outcome_retention_required"):
+    for key in (
+        "development_only",
+        "scientific_promotion_allowed",
+        "outcome_retention_required",
+        "execution_authorized",
+    ):
         if type(plan[key]) is not bool:
             raise ValueError(f"plan.{key} must be an exact bool")
     arms = plan["arms"]
     seeds = plan["seeds"]
+    consumed_matched_seeds = plan["consumed_matched_execution_seeds"]
     consumed_seeds = plan["consumed_preplan_audit_seeds"]
     invalid_history = _bounded_json(
         plan["invalid_execution_history"], context="plan.invalid_execution_history"
@@ -292,6 +348,12 @@ def _validated_plan(value: object) -> dict[str, object]:
         or any(type(item) is not int for item in seeds)
     ):
         raise ValueError("plan.seeds must be an exact integer list")
+    if (
+        type(consumed_matched_seeds) is not list
+        or consumed_matched_seeds != list(SEEDS)
+        or any(type(item) is not int for item in consumed_matched_seeds)
+    ):
+        raise ValueError("plan.consumed_matched_execution_seeds must bind consumed seeds")
     if (
         type(consumed_seeds) is not list
         or len(consumed_seeds) != len(CONSUMED_AUDIT_SEEDS)
@@ -565,9 +627,10 @@ def validate_report(
 
 
 def run(*, data_home: Path) -> dict[str, object]:
-    """Execute the frozen matrix and return one current-source-bound report."""
+    """Execute only after a separate methodological disposition authorizes v3."""
     if type(data_home) is not _PATH_TYPE:
         raise ValueError("data_home must be an exact Path")
+    _require_execution_authorized()
     source = _screening_source_provenance()
     runtime = _screening_runtime_environment()
     data_x, data_y = load_mnist_train(data_home)
@@ -596,6 +659,14 @@ def run(*, data_home: Path) -> dict[str, object]:
         dataset_provenance=dataset,
         environment=runtime,
     )
+
+
+def _require_execution_authorized() -> None:
+    if _V3_EXECUTION_AUTHORIZED is not True:
+        raise RuntimeError(
+            "L2-ER v3 execution is blocked: planned seeds were already consumed; "
+            "a separately preregistered methodological disposition is required"
+        )
 
 
 def _open_output_transaction() -> tuple[int, int, str]:
@@ -700,6 +771,7 @@ def _publish_report(
 
 def main(argv: Sequence[str] | None = None) -> int:
     """Execute once and publish only to the explicit append-only development path."""
+    _require_execution_authorized()
     parser = argparse.ArgumentParser(description="Run the frozen L2-ER development screen")
     parser.add_argument("--data-home", type=Path, default=default_openml_data_home())
     args = parser.parse_args(argv)
