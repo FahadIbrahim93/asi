@@ -45,6 +45,14 @@ class _HostileArray:
         raise AssertionError("conversion executed before trusted metadata rejection")
 
 
+class _HostileTerminated:
+    shape = (1,)
+    dtype = np.dtype(np.float32)
+
+    def __jax_array__(self) -> jax.Array:
+        raise AssertionError("hostile terminated conversion executed")
+
+
 class _MalformedBounder(Bounder):
     def to_config(self) -> dict[str, Any]:
         return {"type": "test-only"}
@@ -118,6 +126,67 @@ def test_scan_rejects_hostile_input_before_jax_conversion(continuous: bool) -> N
             jnp.zeros((1, 2), dtype=jnp.float32),
             discounts=jnp.zeros((1,), dtype=jnp.float32),
         )
+
+
+def _terminated_scan_fixture(continuous: bool) -> tuple[Any, Any, Any, Array, Array]:
+    if continuous:
+        agent = ContinuousActorCriticAgent(ContinuousActorCriticConfig(action_dim=1))
+        state = agent.init(1, jr.key(0))
+        runner = run_continuous_actor_critic_from_arrays
+    else:
+        agent = ActorCriticAgent(ActorCriticConfig(n_actions=1))
+        state = agent.init(1, jr.key(0))
+        runner = run_actor_critic_from_arrays
+    observations = jnp.zeros((1, 1), dtype=jnp.float32)
+    rewards = jnp.zeros((1,), dtype=jnp.float32)
+    return runner, agent, state, observations, rewards
+
+
+@pytest.mark.parametrize("continuous", [False, True])
+@pytest.mark.parametrize(
+    ("terminated", "error", "message"),
+    [
+        (np.asarray([1.0], dtype=np.float16), TypeError, "dtype bool or float32"),
+        (np.asarray([1.0], dtype=np.float64), TypeError, "dtype bool or float32"),
+        ([False], ValueError, "trusted array metadata"),
+        (_HostileTerminated(), ValueError, "trusted array metadata"),
+    ],
+)
+def test_scan_validates_original_terminated_before_conversion(
+    continuous: bool,
+    terminated: object,
+    error: type[Exception],
+    message: str,
+) -> None:
+    runner, agent, state, observations, rewards = _terminated_scan_fixture(continuous)
+    with pytest.raises(error, match=message):
+        runner(  # type: ignore[arg-type]
+            agent, state, observations, rewards, terminated, observations
+        )
+
+
+@pytest.mark.parametrize("continuous", [False, True])
+@pytest.mark.parametrize("dtype", [np.bool_, np.float32])
+def test_scan_accepts_original_numpy_terminated_contract(
+    continuous: bool, dtype: type[np.generic]
+) -> None:
+    runner, agent, state, observations, rewards = _terminated_scan_fixture(continuous)
+    result = runner(  # type: ignore[arg-type]
+        agent, state, observations, rewards, np.asarray([1], dtype=dtype), observations
+    )
+    assert result.td_errors.shape == (1,)
+
+
+@pytest.mark.parametrize("continuous", [False, True])
+def test_scan_terminated_contract_accepts_jit_tracers(continuous: bool) -> None:
+    runner, agent, state, observations, rewards = _terminated_scan_fixture(continuous)
+    compiled = jax.jit(
+        lambda initial_state, flags: runner(  # type: ignore[arg-type]
+            agent, initial_state, observations, rewards, flags, observations
+        )
+    )
+    result = compiled(state, jnp.asarray([False], dtype=jnp.bool_))
+    assert result.td_errors.shape == (1,)
 
 
 def test_discrete_scan_working_set_formula_has_exact_byte_boundary() -> None:

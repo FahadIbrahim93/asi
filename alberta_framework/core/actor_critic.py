@@ -198,11 +198,13 @@ def _trusted_shape(name: str, value: object) -> tuple[int, ...]:
     return tuple(value.shape)
 
 
-def _checked_terminated(name: str, value: Array) -> Array:
+def _checked_terminated(name: str, value: object) -> Array:
     """Validate a ``terminated`` flag array dtype before boolean coercion."""
+    if not (type(value) is np.ndarray or isinstance(value, jax.Array)):
+        raise ValueError(f"{name} must expose trusted array metadata")
     if value.dtype not in (jnp.dtype(jnp.bool_), jnp.dtype(jnp.float32)):
         raise TypeError(f"{name} must have dtype bool or float32")
-    return value
+    return cast(Array, value)
 
 
 def _validated_bounder_result(
@@ -903,9 +905,7 @@ def run_actor_critic_from_arrays(
     next_observations = jnp.asarray(next_observations, dtype=jnp.float32)
     rewards = jnp.asarray(rewards, dtype=jnp.float32)
     if terminated is not None:
-        terminated = jnp.asarray(
-            _checked_terminated("terminated", jnp.asarray(terminated)), dtype=jnp.bool_
-        )
+        terminated = jnp.asarray(_checked_terminated("terminated", terminated), dtype=jnp.bool_)
     if discounts is not None:
         discounts = jnp.asarray(discounts, dtype=jnp.float32)
     if terminated is None:
@@ -1729,9 +1729,7 @@ def run_continuous_actor_critic_from_arrays(
     next_observations = jnp.asarray(next_observations, dtype=jnp.float32)
     rewards = jnp.asarray(rewards, dtype=jnp.float32)
     if terminated is not None:
-        terminated = jnp.asarray(
-            _checked_terminated("terminated", jnp.asarray(terminated)), dtype=jnp.bool_
-        )
+        terminated = jnp.asarray(_checked_terminated("terminated", terminated), dtype=jnp.bool_)
     if discounts is not None:
         discounts = jnp.asarray(discounts, dtype=jnp.float32)
     if terminated is None:
