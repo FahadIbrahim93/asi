@@ -183,3 +183,36 @@ def test_ia_aggregation_revalidates_config_at_consumption() -> None:
 
     with pytest.raises(ValueError, match="phase_length must be an integer"):
         aggregate_ia_evidence([_legal()], config=config)
+
+
+def test_ia_result_preflights_retained_bytes_before_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from alberta_framework.evaluation import continual_ia
+
+    monkeypatch.setattr(continual_ia, "_MAX_CONDITION_RESULT_BYTES", 0)
+    monkeypatch.setattr(
+        continual_ia.np,
+        "array",
+        lambda *_args, **_kwargs: pytest.fail("snapshot allocation must not start"),
+    )
+    with pytest.raises(ValueError, match="bounded record budget"):
+        _legal()
+
+
+def test_ia_aggregation_rejects_hostile_outer_sequence_without_hooks() -> None:
+    class HostileResults(list[IAConditionResult]):
+        calls = 0
+
+        def __len__(self) -> int:
+            self.calls += 1
+            raise AssertionError("must not size")
+
+        def __iter__(self):  # type: ignore[no-untyped-def]
+            self.calls += 1
+            raise AssertionError("must not iterate")
+
+    hostile = HostileResults()
+    with pytest.raises(ValueError, match="exact list or tuple"):
+        aggregate_ia_evidence(hostile, config=ContinualIAConfig())
+    assert hostile.calls == 0
