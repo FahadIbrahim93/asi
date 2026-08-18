@@ -51,6 +51,26 @@ def test_prototype_memory_hit_count_is_int32_and_saturates() -> None:
     assert int(final.state.counts[0, 0]) == 2**31 - 1
 
 
+def test_replacement_uses_exact_integer_minimum_past_float32_precision() -> None:
+    """An older, higher-count slot must not join the least-used tie set."""
+
+    learner = PrototypeMemoryLearner(
+        PrototypeMemoryConfig(feature_dim=2, n_classes=2, slots_per_class=2)
+    )
+    state = learner.init().replace(
+        counts=jnp.asarray([[2**24, 2**24 + 1], [0, 0]], dtype=jnp.int32),
+        last_update=jnp.asarray([[2, 1], [0, 0]], dtype=jnp.int32),
+        step_count=jnp.asarray(2, dtype=jnp.int32),
+    )
+    head = jnp.asarray(0, dtype=jnp.int32)
+
+    eager_slot = learner._replacement_slot(state, head)
+    jitted_slot = jax.jit(learner._replacement_slot)(state, head)
+
+    assert int(eager_slot) == 0
+    assert int(jitted_slot) == 0
+
+
 def test_empty_memory_predicts_uniformly() -> None:
     """With no prototypes, softmax logits should be neutral."""
     learner = PrototypeMemoryLearner(

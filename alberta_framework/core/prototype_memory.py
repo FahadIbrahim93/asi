@@ -467,7 +467,7 @@ class PrototypeMemoryLearner:
         class_counts = state.counts[head]
         class_last_update = state.last_update[head]
         min_count = jnp.min(class_counts)
-        tied = class_counts <= (min_count + 1e-6)
+        tied = class_counts == min_count
         oldest_among_tied = jnp.where(
             tied,
             class_last_update,
