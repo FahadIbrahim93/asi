@@ -237,7 +237,7 @@ def _require_builtin_int(
     maximum: int = _MAX_JAX_INT32,
 ) -> int:
     """Validate an integer-valued configuration field without bool coercion."""
-    if isinstance(value, bool) or not isinstance(value, int):
+    if type(value) is not int:
         raise ValueError(f"{name} must be an integer")
     if not minimum <= value <= maximum:
         raise ValueError(f"{name} must lie in [{minimum}, {maximum}]")
@@ -613,11 +613,10 @@ class ForagerFeatureConfig:
         ):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"{name} must be a boolean")
-        if not isinstance(self.reward_trace_decays, tuple):
+        if type(self.reward_trace_decays) is not tuple:
             raise ValueError("reward_trace_decays must be a tuple")
         if any(
-            isinstance(decay, bool)
-            or not isinstance(decay, (int, float))
+            type(decay) not in (int, float)
             or not math.isfinite(decay)
             or not _finite_jax_float32(decay)
             or decay < 0.0
@@ -626,8 +625,7 @@ class ForagerFeatureConfig:
         ):
             raise ValueError("reward_trace_decays must lie in [0, 1)")
         if (
-            isinstance(self.reward_scale, bool)
-            or not isinstance(self.reward_scale, (int, float))
+            type(self.reward_scale) not in (int, float)
             or not math.isfinite(self.reward_scale)
             or self.reward_scale <= 0.0
             or not _positive_jax_float32(self.reward_scale)
@@ -650,7 +648,7 @@ class ForagerFeatureState:
     reward_traces: tuple[float, ...]
 
     def __post_init__(self) -> None:
-        if type(self.last_action) is not int or isinstance(self.last_action, bool):
+        if type(self.last_action) is not int:
             raise ValueError("last_action must be an integer")
         if (
             type(self.last_reward) is not int
@@ -889,8 +887,7 @@ class RTURTRLForagerConfig:
         if not isinstance(self.features, ForagerFeatureConfig):
             raise ValueError("features must be a ForagerFeatureConfig")
         if self.freeze_after_steps is not None and (
-            isinstance(self.freeze_after_steps, bool)
-            or not isinstance(self.freeze_after_steps, int)
+            type(self.freeze_after_steps) is not int
             or not 0 <= self.freeze_after_steps <= _MAX_JAX_INT32
         ):
             raise ValueError("freeze_after_steps must be a non-negative integer")
@@ -955,8 +952,8 @@ class AlbertaForagerConfig:
             ("actor_hidden_sizes", self.actor_hidden_sizes),
             ("critic_hidden_sizes", self.critic_hidden_sizes),
         ):
-            if not isinstance(widths, tuple) or not widths or any(
-                isinstance(width, bool) or not isinstance(width, int) or width < 1
+            if type(widths) is not tuple or not widths or any(
+                type(width) is not int or width < 1
                 for width in widths
             ):
                 raise ValueError(f"{name} must contain positive integer widths")
@@ -967,16 +964,14 @@ class AlbertaForagerConfig:
         }
         for name, value in unit_interval.items():
             if (
-                isinstance(value, bool)
-                or not isinstance(value, (int, float))
+                type(value) not in (int, float)
                 or not math.isfinite(value)
                 or not _finite_jax_float32(value)
                 or not 0.0 <= value <= 1.0
             ):
                 raise ValueError(f"{name} must be finite and lie in [0, 1]")
         if (
-            isinstance(self.actor_epsilon, bool)
-            or not isinstance(self.actor_epsilon, (int, float))
+            type(self.actor_epsilon) not in (int, float)
             or not math.isfinite(self.actor_epsilon)
             or not _finite_jax_float32(self.actor_epsilon)
             or not 0.0 <= self.actor_epsilon < 1.0
@@ -992,16 +987,14 @@ class AlbertaForagerConfig:
         }
         for name, value in positive_finite.items():
             if (
-                isinstance(value, bool)
-                or not isinstance(value, (int, float))
+                type(value) not in (int, float)
                 or not math.isfinite(value)
                 or value <= 0.0
                 or not _positive_jax_float32(value)
             ):
                 raise ValueError(f"{name} must be finite and positive")
         if (
-            isinstance(self.sparsity, bool)
-            or not isinstance(self.sparsity, (int, float))
+            type(self.sparsity) not in (int, float)
             or not math.isfinite(self.sparsity)
             or not _finite_jax_float32(self.sparsity)
             or not 0.0 <= self.sparsity <= 1.0
@@ -1010,11 +1003,7 @@ class AlbertaForagerConfig:
         if (
             self.td_error_normalizer_decay is not None
             and (
-                isinstance(self.td_error_normalizer_decay, bool)
-                or not isinstance(
-                    self.td_error_normalizer_decay,
-                    (int, float),
-                )
+                type(self.td_error_normalizer_decay) not in (int, float)
                 or not math.isfinite(self.td_error_normalizer_decay)
                 or not _finite_jax_float32(self.td_error_normalizer_decay)
                 or not 0.0 <= self.td_error_normalizer_decay < 1.0
@@ -1026,44 +1015,38 @@ class AlbertaForagerConfig:
             ("actor_gradient_clip_norm", self.actor_gradient_clip_norm),
         ):
             if optional_value is not None and (
-                isinstance(optional_value, bool)
-                or not isinstance(optional_value, (int, float))
+                type(optional_value) not in (int, float)
                 or not math.isfinite(optional_value)
                 or optional_value <= 0.0
                 or not _positive_jax_float32(optional_value)
             ):
                 raise ValueError(f"{name} must be finite and positive when provided")
         if self.freeze_after_steps is not None and (
-            isinstance(self.freeze_after_steps, bool)
-            or not isinstance(self.freeze_after_steps, int)
+            type(self.freeze_after_steps) is not int
             or not 0 <= self.freeze_after_steps <= _MAX_JAX_INT32
         ):
             raise ValueError("freeze_after_steps must be a non-negative integer")
         if (
-            isinstance(self.recurrent_hidden_size, bool)
-            or not isinstance(self.recurrent_hidden_size, int)
+            type(self.recurrent_hidden_size) is not int
             or not 0 <= self.recurrent_hidden_size <= _MAX_JAX_INT32
         ):
             raise ValueError("recurrent_hidden_size must be a non-negative integer")
         if (
-            isinstance(self.recurrent_input_scale, bool)
-            or not isinstance(self.recurrent_input_scale, (int, float))
+            type(self.recurrent_input_scale) not in (int, float)
             or not math.isfinite(self.recurrent_input_scale)
             or self.recurrent_input_scale <= 0.0
             or not _positive_jax_float32(self.recurrent_input_scale)
         ):
             raise ValueError("recurrent_input_scale must be finite and positive")
         if (
-            isinstance(self.recurrent_scale, bool)
-            or not isinstance(self.recurrent_scale, (int, float))
+            type(self.recurrent_scale) not in (int, float)
             or not math.isfinite(self.recurrent_scale)
             or not _finite_jax_float32(self.recurrent_scale)
             or not 0.0 <= self.recurrent_scale < 1.0
         ):
             raise ValueError("recurrent_scale must be finite and lie in [0, 1)")
         if (
-            isinstance(self.recurrent_update_bias, bool)
-            or not isinstance(self.recurrent_update_bias, (int, float))
+            type(self.recurrent_update_bias) not in (int, float)
             or not math.isfinite(self.recurrent_update_bias)
             or not _finite_jax_float32(self.recurrent_update_bias)
         ):
@@ -3931,9 +3914,7 @@ def summarize_forager_runs(
             raise ValueError("run agent_metadata must be a mapping")
         metadata_seed = run.agent_metadata.get("seed")
         if metadata_seed is not None and (
-            isinstance(metadata_seed, bool)
-            or not isinstance(metadata_seed, (int, np.integer))
-            or int(metadata_seed) != run.seed
+            type(metadata_seed) is not int or metadata_seed != run.seed
         ):
             raise ValueError("agent and environment seeds must match within each run")
         if run.agent_metadata.get("name", run.agent) != run.agent:
