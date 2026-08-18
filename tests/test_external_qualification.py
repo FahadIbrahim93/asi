@@ -24,6 +24,18 @@ def test_registry_exactly_covers_research_wave_and_is_not_run_ready() -> None:
             plan.require_ready()
 
 
+def test_clear_uses_official_curation_source_without_claiming_asset_readiness() -> None:
+    plan = qualification_plan(1579)
+    assert plan.code_revisions == (
+        ExternalCodeRevision(
+            "https://github.com/linzhiqiu/continual-learning.git",
+            "620cab4a7d99921fde73b67b53879470533cb39a",
+        ),
+    )
+    assert "assets_checksums_and_storage_approved" in plan.blockers
+    assert "external_code_available_and_license_reviewed" in plan.blockers
+
+
 def test_completed_r0_plan_still_cannot_authorize_external_execution() -> None:
     revision = ExternalCodeRevision("https://github.com/org/repo.git", "a" * 40)
     plan = ExternalQualificationPlan(
