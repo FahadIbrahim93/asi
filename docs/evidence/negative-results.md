@@ -94,7 +94,7 @@ postmortem.
     is development-only and cannot support scientific promotion. Record:
     [`rls_preset_ablation_r1/`](../../outputs/ipmnist_screening/rls_preset_ablation_r1/).
 
-12. **Naive Bayes did not remove the post-permutation transient.** Its flat
+13. **Naive Bayes did not remove the post-permutation transient.** Its flat
     task-average curve hid poor early shifted-step performance, so ordinary
     voting added little. Resetting the member's annealing clock helped, but the
     per-example champion/NB oracle still bounded a two-member ensemble below
@@ -104,7 +104,7 @@ postmortem.
     [`summary_naive_bayes.json`](../../outputs/ipmnist_screening/summary_naive_bayes.json),
     and [`V1_assignment.md`](../../outputs/new_directions/V1_assignment.md).
 
-13. **Second-order permutation fingerprints cost more samples than they save.**
+14. **Second-order permutation fingerprints cost more samples than they save.**
     Pairwise pixel-pixel correlation reduced to per-pixel descriptors (row-sum,
     sorted top-16 profile, leading-8 spectral embedding) missed the same
     500-sample gate V1 missed, and by a wider margin: best 0.081 relevant-pixel
@@ -117,7 +117,7 @@ postmortem.
     is unusable at this budget, not in principle. V2 remains gated out. Record:
     [`V4_fingerprints.md`](../../outputs/new_directions/V4_fingerprints.md).
 
-14. **A shared network cannot fingerprint where a pixel used to live.** The
+15. **A shared network cannot fingerprint where a pixel used to live.** The
     model-side arm of the same pre-registration (input-hidden correlation and
     gradient coupling) failed its oracle gate at 0.002/0.000 against 0.95 while
     scoring 1.000 on the no-shift control — it recovers the identity map
