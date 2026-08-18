@@ -26,6 +26,10 @@ class _HostileFloat(float):
         type(self).calls += 1
         raise AssertionError("hostile float eq")
 
+    def __float__(self) -> float:
+        type(self).calls += 1
+        raise AssertionError("hostile float conversion")
+
 
 def test_require_int_rejects_hostile_before_range() -> None:
     from alberta_framework.benchmarks.forager import _require_builtin_int
@@ -41,21 +45,25 @@ def test_require_int_rejects_hostile_before_range() -> None:
 
 
 def test_widths_rejects_hostile_before_lt() -> None:
+    from alberta_framework.benchmarks.forager import AlbertaForagerConfig
+
     _HostileInt.calls = 0
     hostile = _HostileInt(1)
-    assert (type(hostile) is not int or hostile < 1) is True
+    with pytest.raises(ValueError, match="actor_hidden_sizes"):
+        AlbertaForagerConfig(actor_hidden_sizes=(hostile,))  # type: ignore[arg-type]
     assert _HostileInt.calls == 0
-    assert (int is not int or 2 < 1) is False
 
 
 def test_finite_rejects_hostile_before_isfinite() -> None:
-    _HostileInt.calls = 0
-    hostile = _HostileInt(1)
-    # type(value) not in (int,float) should reject hostile subclass before math.isfinite
-    assert (type(hostile) not in (int, float)) is True
-    assert _HostileInt.calls == 0
-    assert (float not in (int, float)) is False
-    assert (bool not in (int, float)) is True  # bool rejected
+    from alberta_framework.benchmarks.forager import ForagerFeatureConfig
+
+    hostile = _HostileFloat(0.9)
+    _HostileFloat.calls = 0
+    with pytest.raises(ValueError, match="reward_trace_decays"):
+        ForagerFeatureConfig(reward_trace_decays=(hostile,))  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="reward_scale"):
+        ForagerFeatureConfig(reward_scale=hostile)  # type: ignore[arg-type]
+    assert _HostileFloat.calls == 0
 
 
 def test_hostile_not_in_error_message() -> None:
