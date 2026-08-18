@@ -18,7 +18,11 @@ class _HostileString(str):
 
     def __bool__(self) -> bool:
         type(self).calls += 1
-        raise AssertionError("hostile string hook dispatched")
+        raise AssertionError("hostile string truthiness executed")
+
+    def __hash__(self) -> int:
+        type(self).calls += 1
+        raise AssertionError("hostile string hashing executed")
 
 
 class _HostileRealMeta(type):
@@ -83,16 +87,19 @@ def test_candidate_universe_verification_validation() -> None:
         )
 
 
-def test_candidate_universe_verification_rejects_string_subclass_without_hooks() -> None:
+def test_candidate_universe_string_boundaries_reject_subclasses_without_dispatch() -> None:
+    hostile = _HostileString("path.json")
     _HostileString.calls = 0
-    with pytest.raises(
-        ForagerMatchedCandidateUniverseError,
-        match="verified_json_paths must be a tuple of non-empty strings",
-    ):
-        CandidateUniverseVerification(
+    operations = (
+        lambda: BoundJsonArtifact(role=hostile, path="path.json", sha256="a" * 64),
+        lambda: CandidateUniverseVerification(
             candidate_universe_sha256="b" * 64,
-            verified_json_paths=(_HostileString("path.json"),),
-        )
+            verified_json_paths=(hostile,),
+        ),
+    )
+    for operation in operations:
+        with pytest.raises(ForagerMatchedCandidateUniverseError):
+            operation()
     assert _HostileString.calls == 0
 
 
