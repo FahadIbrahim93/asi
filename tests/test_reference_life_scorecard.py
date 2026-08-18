@@ -66,6 +66,19 @@ assert len(iter_run_specs(build_development_plan())) == 144
     assert result.returncode == 0, result.stderr
 
 
+def test_checkpoint_publication_fails_closed_without_posix_fcntl(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import alberta_framework.reference_life_checkpoint as checkpoint_module
+
+    monkeypatch.setattr(checkpoint_module, "fcntl", None)
+    with pytest.raises(OSError, match="requires POSIX fcntl support"):
+        checkpoint_module.save_reference_life_checkpoint(  # type: ignore[arg-type]
+            object(), object(), tmp_path
+        )
+
+
 def test_fixed_plan_is_immutable_canonical_and_explicit() -> None:
     plan = build_development_plan()
     payload = plan.to_payload()
