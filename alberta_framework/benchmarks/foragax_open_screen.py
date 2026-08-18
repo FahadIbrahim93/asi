@@ -2264,7 +2264,7 @@ def _canonical_results_database(contents: bytes) -> dict[str, Any]:
             row[0] not in {"index", "table"}
             or (
                 row[0] == "table"
-                and isinstance(row[3], str)
+                and type(row[3]) is str
                 and "VIRTUAL TABLE" in row[3].upper()
             )
             for row in schema
