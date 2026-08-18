@@ -99,6 +99,21 @@ def test_resource_accounting_names_state_and_gram() -> None:
     assert gram_working_bytes((3, 5)) == 3 * 3 * 4
 
 
+def test_resource_accounting_rejects_hostile_outer_objects_without_hooks() -> None:
+    class HostileShape:
+        def __len__(self) -> int:
+            raise AssertionError("shape hook must not run")
+
+    class HostileState:
+        def __getattribute__(self, name: str) -> object:
+            raise AssertionError(f"state hook must not run: {name}")
+
+    with pytest.raises(TypeError, match="exact tuple"):
+        gram_working_bytes(HostileShape())  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="exact AdamParamState"):
+        state_persistent_bytes(HostileState())  # type: ignore[arg-type]
+
+
 def test_update_is_jittable() -> None:
     optimizer = AdamO(AdamOConfig(isometry_strength=1e-3))
     weight = jnp.eye(2, dtype=jnp.float32)
@@ -133,3 +148,34 @@ def test_screening_inert_arm_reduces_to_adamw() -> None:
         np.testing.assert_array_equal(inert_params[name], control_params[name])
         np.testing.assert_array_equal(inert_state[name].m, control_state[name].m)
         np.testing.assert_array_equal(inert_state[name].v, control_state[name].v)
+
+
+def test_active_arm_runs_through_screening_runner() -> None:
+    from alberta_framework.benchmarks.ipmnist_screening import (
+        run_screening_config,
+        screening_spec,
+    )
+    from alberta_framework.benchmarks.upgd_ipmnist import IPMNISTConfig
+
+    data_x = np.linspace(-1.0, 1.0, 48, dtype=np.float32).reshape(12, 4)
+    data_y = np.arange(12, dtype=np.int32) % 2
+    config = IPMNISTConfig(
+        n_tasks=2,
+        task_length=3,
+        input_dim=4,
+        hidden1=3,
+        hidden2=2,
+        n_classes=2,
+    )
+    result = run_screening_config(
+        data_x,
+        data_y,
+        screening_spec("adamo_l1e3"),
+        seed=7,
+        config=config,
+    )
+
+    assert result.config_name == "adamo_l1e3"
+    assert result.base_learner == "adamw"
+    assert result.per_task_accuracy.shape == (2,)
+    assert np.all(np.isfinite(result.per_task_loss))

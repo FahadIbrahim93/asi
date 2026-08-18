@@ -28,8 +28,16 @@ from alberta_framework.core.update_safety import (
 ADAMO_PAPER_REVISION = "arXiv:2606.09762v1"
 ADAMO_PROTOCOL = {
     "paper_revision": ADAMO_PAPER_REVISION,
+    "paper_url": "https://arxiv.org/abs/2606.09762v1",
     "equations": (16, 19, 20),
     "official_code_available": False,
+    "official_code_search_date": "2026-08-17",
+    "paper_mlp_architecture": "depth-4 width-512 ReLU",
+    "adapter_architecture": "IPMNIST protocol 784-300-150-10 ReLU MLP",
+    "paper_initialization": "orthogonal weights",
+    "adapter_initialization": "IPMNIST protocol PyTorch-default Linear initialization",
+    "paper_mlp_step_size": 1e-4,
+    "adapter_step_size": 1e-4,
     "bias_regularization": False,
     "convolution_kernel_adapter": "not_implemented",
     "timing_is_telemetry_only": True,
@@ -132,6 +140,8 @@ def isometry_gradient(weight: Array) -> Array:
 def state_persistent_bytes(state: AdamOState) -> int:
     """Count the complete persisted moment state from concrete arrays."""
 
+    if type(state) is not AdamParamState:
+        raise TypeError("state must be an exact AdamParamState")
     leaves = (
         state.m,
         state.v,
@@ -147,6 +157,8 @@ def state_persistent_bytes(state: AdamOState) -> int:
 def gram_working_bytes(shape: tuple[int, ...], *, dtype_bytes: int = 4) -> int:
     """Return the named Gram-matrix working allocation for one weight leaf."""
 
+    if type(shape) is not tuple:
+        raise TypeError("shape must be an exact tuple")
     if len(shape) != 2 or any(type(dimension) is not int or dimension < 1 for dimension in shape):
         raise ValueError("shape must contain exactly two positive built-in integers")
     if type(dtype_bytes) is not int or dtype_bytes < 1:
