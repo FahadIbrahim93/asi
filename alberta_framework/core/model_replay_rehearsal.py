@@ -130,16 +130,18 @@ def _copy_mapping(payload: object, *, name: str) -> dict[str, Any]:
 
 
 def _preflight_model_replay_state_resources(config: ModelReplayRehearsalConfig) -> None:
-    """Reject an oversized combined state before either child allocates arrays."""
+    """Reject an oversized combined update before either child allocates arrays.
+
+    Each child already requires its three-copy update envelope to fit signed
+    int32.  Consequently their combined one-copy persistent state is bounded
+    below two thirds of that limit; a separate composer persistent-state check
+    is unreachable.
+    """
     _, ensemble_bytes = _ensemble_state_resource_counts(
         model=config.ensemble.model,
         ensemble_size=config.ensemble.ensemble_size,
     )
     replay_slot_bytes, replay_bytes = _allocation_sizes(config.replay)
-    persistent_bytes = ensemble_bytes + replay_bytes + _COMPOSER_ACCOUNTING_BYTES
-    if persistent_bytes > _INT32_MAX:
-        raise ValueError("model replay rehearsal state byte count must fit signed int32")
-
     model = config.ensemble.model
     ensemble_size = config.ensemble.ensemble_size
     target_dim = model.observation_dim + 2
