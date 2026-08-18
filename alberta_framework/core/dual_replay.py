@@ -2168,16 +2168,22 @@ class DualReplayMemory:
         shape: tuple[int, ...],
         dtype: Any,
     ) -> Array:
-        try:
-            untyped = np.asarray(value, dtype=object)
-        except ValueError as error:
-            raise ValueError(f"{name} must be a rectangular array") from error
-        if untyped.shape != shape:
-            raise ValueError(f"{name} must have shape {shape}; got {untyped.shape}")
+        def leaves(node: object, remaining_shape: tuple[int, ...]) -> list[object]:
+            if not remaining_shape:
+                return [node]
+            if type(node) is not list or len(node) != remaining_shape[0]:
+                raise ValueError(f"{name} must have shape {shape}")
+            result: list[object] = []
+            for child in node:
+                result.extend(leaves(child, remaining_shape[1:]))
+            return result
+
+        untyped = leaves(value, shape)
         expected = np.dtype(dtype)
         if np.issubdtype(expected, np.floating):
             if any(
-                type(item) not in (int, float) for item in untyped.flat
+                type(item) is not int and type(item) is not float
+                for item in untyped
             ):
                 raise ValueError(f"{name} must contain only JSON real numbers")
             with np.errstate(over="ignore", under="ignore", invalid="ignore"):
@@ -2186,14 +2192,15 @@ class DualReplayMemory:
                 raise ValueError(f"{name} must contain finite float32 values")
             return jnp.asarray(array, dtype=jnp.float32)
         if np.issubdtype(expected, np.bool_):
-            if any(not isinstance(item, bool) for item in untyped.flat):
+            if any(type(item) is not bool for item in untyped):
                 raise ValueError(f"{name} must contain only booleans")
             return jnp.asarray(value, dtype=jnp.bool_)
-        if any(type(item) is not int for item in untyped.flat):
+        if any(type(item) is not int for item in untyped):
             raise ValueError(f"{name} must contain only JSON integers")
+        integer_values = cast(list[int], untyped)
         minimum = 0 if expected == np.dtype(np.uint32) else -_INT32_MAX - 1
         maximum = _UINT32_MAX if expected == np.dtype(np.uint32) else _INT32_MAX
-        if any(item < minimum or item > maximum for item in untyped.flat):
+        if any(item < minimum or item > maximum for item in integer_values):
             raise ValueError(f"{name} contains an out-of-range integer")
         output_dtype = jnp.uint32 if expected == np.dtype(np.uint32) else jnp.int32
         return jnp.asarray(value, dtype=output_dtype)
