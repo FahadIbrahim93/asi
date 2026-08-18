@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -10,16 +11,21 @@ import pytest
 from alberta_framework.benchmarks.bimu import (
     BIMU_PAPER_CONFIG,
     BIMU_PROTOCOL,
+    RESULT_SCHEMA,
     BiMUConfig,
     BiMUState,
     _apply_gradient,
     bimu_update,
     bimu_update_transaction,
+    build_bimu_matched_report,
     build_task_schedule,
+    canonical_bimu_result_bytes,
     concrete_binary_weights,
     late_window_mean,
     posterior_probability,
     posterior_probability_transaction,
+    retain_bimu_matched_report,
+    retain_bimu_result,
     run_bimu_development,
     sample_binary_weights,
     validate_bimu_result,
@@ -83,6 +89,8 @@ def test_protocol_pins_official_source_and_paper_configuration() -> None:
     assert BIMU_PAPER_CONFIG.memory_window == 700
     assert BIMU_PAPER_CONFIG.gradient_scale == pytest.approx(4.9)
     assert BIMU_PAPER_CONFIG.matches_paper_configuration
+    with pytest.raises(TypeError):
+        BIMU_PROTOCOL["development_only"] = False  # type: ignore[index]
 
 
 def test_equation_update_is_jittable_and_matches_scaled_official_rule() -> None:
@@ -123,6 +131,10 @@ def test_binary_and_concrete_samples_are_explicit_and_reproducible() -> None:
         lambda x: concrete_binary_weights(x, key, temperature=0.7).sum()
     )(natural)
     assert bool(jnp.all(jnp.isfinite(derivative)))
+    with pytest.raises(ValueError, match="temperature"):
+        concrete_binary_weights(natural, key, temperature=0.0)
+    with pytest.raises(ValueError, match="Threefry"):
+        sample_binary_weights(natural, np.zeros(2, dtype=np.uint32))  # type: ignore[arg-type]
 
 
 def test_mechanism_off_removes_only_controlled_forgetting() -> None:
@@ -179,6 +191,19 @@ def test_task_schedule_is_deterministic_and_task_private() -> None:
     assert config.learner_observes_task_boundary is False
 
 
+def test_public_config_consumers_revalidate_frozen_instances() -> None:
+    config = _tiny_config()
+    object.__setattr__(config, "n_tasks", 2**100)
+    with pytest.raises(ValueError, match="n_tasks"):
+        build_task_schedule(config, seed=1)
+    with pytest.raises(ValueError, match="n_tasks"):
+        run_bimu_development(*_tiny_data(), config=config, seed=1)
+    with pytest.raises(ValueError, match="sample ceiling"):
+        _tiny_config(train_samples=129)
+    with pytest.raises(ValueError, match="runtime ceiling"):
+        run_bimu_development(*_tiny_data(), config=BIMU_PAPER_CONFIG, seed=1)
+
+
 def test_tiny_runner_is_end_to_end_strict_and_keeps_metrics_separate() -> None:
     config = _tiny_config()
     payload = run_bimu_development(*_tiny_data(), config=config, seed=23)
@@ -195,6 +220,8 @@ def test_tiny_runner_is_end_to_end_strict_and_keeps_metrics_separate() -> None:
     assert counters["label_queries"] == 20
     assert counters["optimizer_updates"] == 20
     assert counters["model_forward_queries"] == 20 * (3 + 2) + 5 * 2 * 3
+    assert counters["online_correct"] <= counters["observations"]
+    assert len(counters["per_task_test_correct"]) == config.n_tasks
     assert resources["parameter_numeric_bytes"] == (4 * 3 + 3 * 2) * 4
     assert resources["optimizer_state_numeric_bytes"] == 8
     assert resources["initial_persistent_numeric_bytes"] == (4 * 3 + 3 * 2) * 4 + 8
@@ -203,6 +230,32 @@ def test_tiny_runner_is_end_to_end_strict_and_keeps_metrics_separate() -> None:
     ]
     assert payload["comparison"]["paper_comparable"] is False
     assert payload["evidence_policy"]["scientific_promotion_allowed"] is False
+
+
+def test_result_canonical_retention_is_exclusive_and_strict(tmp_path: Path) -> None:
+    payload = run_bimu_development(*_tiny_data(), config=_tiny_config(), seed=23)
+    encoded = canonical_bimu_result_bytes(payload)
+    destination = retain_bimu_result(payload, repository_root=tmp_path)
+    assert destination.parent == tmp_path / "outputs/bimu/development.v1"
+    assert destination.read_bytes() == encoded
+    with pytest.raises(FileExistsError):
+        retain_bimu_result(payload, repository_root=tmp_path)
+
+
+def test_matched_report_keeps_paper_and_online_outcomes_separate(tmp_path: Path) -> None:
+    candidate = run_bimu_development(*_tiny_data(), config=_tiny_config(), seed=23)
+    control = run_bimu_development(
+        *_tiny_data(), config=_tiny_config(memory_window=None), seed=23
+    )
+    report = build_bimu_matched_report(candidate, control)
+    assert report["metric_deltas"] == {
+        "paper_late_five_test_accuracy": pytest.approx(0.3),
+        "paper_late_five_outcome": "improved",
+        "asi_whole_stream_online_accuracy": pytest.approx(-0.1),
+        "asi_whole_stream_online_outcome": "worse",
+    }
+    destination = retain_bimu_matched_report(report, repository_root=tmp_path)
+    assert destination.name.startswith("matched.")
 
 
 def test_runner_replays_schedule_metrics_and_state_from_same_seed() -> None:
@@ -231,6 +284,8 @@ def test_no_query_schedule_performs_no_updates() -> None:
         (("counters", "optimizer_updates"), 999),
         (("resources", "final_persistent_numeric_bytes"), 1),
         (("metrics", "paper_late_five_test_accuracy"), 0.123456),
+        (("counters", "online_correct"), 999),
+        (("counters", "per_task_test_correct"), [0, 0, 0, 0, 0]),
     ],
 )
 def test_validator_fails_closed_on_policy_accounting_and_metric_drift(
@@ -248,6 +303,26 @@ def test_validator_rejects_unknown_fields() -> None:
     payload["claim"] = "sota"
     with pytest.raises(ValueError, match="fields"):
         validate_bimu_result(payload)
+
+
+def test_validator_rejects_hostile_string_key_without_hooks() -> None:
+    class HostileKey(str):
+        calls = 0
+
+        def __hash__(self) -> int:
+            self.calls += 1
+            return super().__hash__()
+
+        def __eq__(self, other: object) -> bool:
+            self.calls += 1
+            return super().__eq__(other)
+
+    key = HostileKey("schema")
+    payload = {key: RESULT_SCHEMA}
+    key.calls = 0
+    with pytest.raises(ValueError, match="keys"):
+        validate_bimu_result(payload)
+    assert key.calls == 0
 
 
 def test_late_window_metric_remains_separate_from_whole_stream() -> None:
