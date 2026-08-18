@@ -444,7 +444,7 @@ def _required_string_tuple(
         if (
             isinstance(candidate, list)
             and candidate
-            and all(isinstance(item, str) and item for item in candidate)
+            and all(type(item) is str and item for item in candidate)
         ):
             return tuple(candidate)
     joined = " or ".join(f"{owner}.{key}" for key in keys)
@@ -458,7 +458,7 @@ def _required_string(
     owner: str,
 ) -> str:
     candidate = value.get(key)
-    if not isinstance(candidate, str) or not candidate:
+    if type(candidate) is not str or not candidate:
         raise RuntimeError(f"{owner}.{key} must be a non-empty string")
     return candidate
 
@@ -879,7 +879,7 @@ def _artifact_limitations(
         if (
             isinstance(candidate, list)
             and candidate
-            and all(isinstance(item, str) and item for item in candidate)
+            and all(type(item) is str and item for item in candidate)
         ):
             return tuple(candidate)
     return None
