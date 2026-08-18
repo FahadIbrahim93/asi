@@ -78,6 +78,7 @@ Issues = "https://github.com/elizaOS/asi/issues"
 Upstream = "https://github.com/lalalune/alberta"
 
 [project.scripts]
+asi-reference-life-scorecard = "alberta_framework.benchmarks.reference_life_scorecard:main"
 alberta-step1-smoke = "alberta_framework.cli:step1_smoke_main"
 alberta-step2-smoke = "alberta_framework.cli:step2_smoke_main"
 alberta-evidence-status = "alberta_framework.evaluation.evidence_manifest_cli:main"
