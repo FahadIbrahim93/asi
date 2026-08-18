@@ -1,5 +1,6 @@
 import copy
 import json
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -10,10 +11,13 @@ from alberta_framework.evaluation.optimizer_geometry import (
     FROZEN_GEOMETRY_CONFIG,
     GEOMETRY_PROTOCOL,
     GEOMETRY_RESULT_SCHEMA,
+    canonical_streaming_matrix_result_bytes,
     flad_noise_component,
     flad_noise_component_transaction,
     muon_ogd_dual_update,
+    muon_ogd_dual_update_transaction,
     orthogonal_correction,
+    retain_streaming_matrix_result,
     run_streaming_matrix_evaluation,
     spectral_matrix_sign,
     spectral_matrix_sign_transaction,
@@ -107,7 +111,30 @@ def test_streaming_matrix_evaluation_is_frozen_matched_and_nonpromoting() -> Non
         "scientific_promotion_allowed": False,
         "negative_outcomes_retained": True,
     }
+    assert set(result["identity"]) == {"source_sha256", "plan_sha256"}
+    assert all(len(result["identity"][field]) == 64 for field in result["identity"])
     validate_streaming_matrix_result(json.loads(json.dumps(result)))
+
+
+def test_geometry_result_has_canonical_bytes_and_exclusive_retention(tmp_path: Path) -> None:
+    result = run_streaming_matrix_evaluation()
+    encoded = canonical_streaming_matrix_result_bytes(result)
+    assert encoded == canonical_streaming_matrix_result_bytes(json.loads(encoded))
+    destination = retain_streaming_matrix_result(result, repository_root=tmp_path)
+    assert destination.parent == tmp_path / "outputs/optimizer_geometry/development.v1"
+    assert destination.read_bytes() == encoded
+    with pytest.raises(FileExistsError):
+        retain_streaming_matrix_result(result, repository_root=tmp_path)
+
+
+def test_geometry_retention_rejects_namespace_symlink(tmp_path: Path) -> None:
+    result = run_streaming_matrix_evaluation()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (tmp_path / "outputs").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(OSError):
+        retain_streaming_matrix_result(result, repository_root=tmp_path)
+    assert not (outside / "optimizer_geometry").exists()
 
 
 @pytest.mark.parametrize(
@@ -151,6 +178,26 @@ def test_streaming_matrix_validator_admits_exact_builtin_containers_before_hooks
     assert hostile.calls == 0
 
 
+def test_streaming_matrix_validator_rejects_hostile_exact_dict_key_without_hooks() -> None:
+    class HostileKey(str):
+        calls = 0
+
+        def __hash__(self) -> int:
+            self.calls += 1
+            return super().__hash__()
+
+        def __eq__(self, other: object) -> bool:
+            self.calls += 1
+            return super().__eq__(other)
+
+    key = HostileKey("schema")
+    hostile = {key: GEOMETRY_RESULT_SCHEMA}
+    key.calls = 0
+    with pytest.raises(ValueError, match="string-keyed"):
+        validate_streaming_matrix_result(hostile)
+    assert key.calls == 0
+
+
 @pytest.mark.parametrize("field", ["protocol", "arms"])
 def test_streaming_matrix_validator_rejects_nested_container_subclasses_without_hooks(
     field: str,
@@ -179,6 +226,17 @@ def test_streaming_matrix_validator_rejects_nested_container_subclasses_without_
     with pytest.raises(ValueError):
         validate_streaming_matrix_result(result)
     assert hostile.calls == 0
+
+
+def test_streaming_matrix_validator_rejects_oversized_exact_containers_before_iteration() -> None:
+    result = run_streaming_matrix_evaluation()
+    result["arms"] = [None] * 10_000
+    with pytest.raises(ValueError, match="arms"):
+        validate_streaming_matrix_result(result)
+    result = run_streaming_matrix_evaluation()
+    result["protocol"]["unexpected"] = [None] * 10_000  # type: ignore[index]
+    with pytest.raises(ValueError, match="protocol"):
+        validate_streaming_matrix_result(result)
 
 
 def test_streaming_matrix_validator_rejects_scalar_subclasses_without_equality_hooks() -> None:
@@ -252,3 +310,24 @@ def test_geometry_float32_overflow_is_invalid_not_laundered() -> None:
     )
     assert bool(jnp.all(jnp.isfinite(component)))
     assert not bool(component_valid)
+    update, dual, dual_valid = jax.jit(
+        lambda value: muon_ogd_dual_update_transaction(
+            value,
+            jnp.ones((1, 2, 2), dtype=jnp.float32),
+            jnp.zeros((1,), dtype=jnp.float32),
+            dual_learning_rate=0.25,
+            dual_steps=2,
+        )
+    )(jnp.full((2, 2), maximum))
+    assert bool(jnp.all(jnp.isfinite(update)))
+    assert bool(jnp.all(jnp.isfinite(dual)))
+    assert not bool(dual_valid)
+
+
+def test_geometry_runner_rejects_invalid_transactions(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "alberta_framework.evaluation.optimizer_geometry._frozen_stream",
+        lambda: jnp.full((8, 3, 2), jnp.nan, dtype=jnp.float32),
+    )
+    with pytest.raises(ValueError, match="transaction"):
+        run_streaming_matrix_evaluation()
