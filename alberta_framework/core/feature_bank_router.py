@@ -405,16 +405,39 @@ def _saturating_increment(value: Array) -> Array:
     return jnp.where(value < _INT32_MAX, value + jnp.int32(1), value)
 
 
-def _preflight_route_working_set(active_slots: int) -> None:
-    """Reject route tensors the host cannot name. Config persist is unchanged."""
+def _preflight_route_working_set(
+    active_slots: int,
+    *,
+    consumer_state_nbytes: int = 0,
+    consumer_dynamic_tail_nbytes: int = 0,
+) -> int:
+    """Reject the complete logical route result and its named working buffers."""
+
     persist_bytes = 4 * (2 * active_slots + 2)
     # Source and proposed router states plus three (slots, slots) bool
     # compare planes: old-bank duplicates, new-bank duplicates, identity match.
-    update_working_set_bytes = 2 * persist_bytes + 3 * active_slots * active_slots
+    compare_plane_bytes = 3 * active_slots * active_slots
+    proposed_descriptor_bytes = 2 * active_slots * 4
+    # Two nested descriptor validations plus route masks, source slots, counts,
+    # and scalar transaction diagnostics are returned with every route.
+    diagnostics_bytes = 17 * active_slots + 43
+    # Each consumer retains its source and returned arrays while a full-width
+    # candidate and the gathered/carried dynamic tails are formed.
+    consumer_working_bytes = (
+        3 * consumer_state_nbytes + 2 * consumer_dynamic_tail_nbytes
+    )
+    update_working_set_bytes = (
+        2 * persist_bytes
+        + compare_plane_bytes
+        + proposed_descriptor_bytes
+        + diagnostics_bytes
+        + consumer_working_bytes
+    )
     if update_working_set_bytes > _INT32_MAX:
         raise ValueError(
             "feature-bank router update working set byte count must fit signed int32"
         )
+    return update_working_set_bytes
 
 
 class FeatureBankRouter:
@@ -575,6 +598,21 @@ class FeatureBankRouter:
         consumer_leaves, consumer_tree, axes = self._consumer_layout(
             consumers,
             feature_axes,
+        )
+        consumer_state_nbytes = 0
+        consumer_dynamic_tail_nbytes = 0
+        for leaf, axis in zip(consumer_leaves, axes, strict=True):
+            scalar_count = int(leaf.size)
+            itemsize = int(leaf.dtype.itemsize)
+            feature_groups = scalar_count // int(leaf.shape[axis])
+            consumer_state_nbytes += scalar_count * itemsize
+            consumer_dynamic_tail_nbytes += (
+                feature_groups * self._config.active_slots * itemsize
+            )
+        _preflight_route_working_set(
+            self._config.active_slots,
+            consumer_state_nbytes=consumer_state_nbytes,
+            consumer_dynamic_tail_nbytes=consumer_dynamic_tail_nbytes,
         )
 
         old_validation = _descriptor_validation(
