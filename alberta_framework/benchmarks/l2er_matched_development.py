@@ -97,7 +97,8 @@ def _invalid_execution_history() -> list[dict[str, object]]:
                 "c5a6b8efb050d3c6c05648a46689ca0903389340764f7c20b589bfc4e8b0c6f2"
             ),
             "source_commit": "072cfee9d061a2e2a370eee21ea901aa9fbad870",
-            "result_head_commit": "ef2aa057c669f545f80723d74c31bd38a6445c75",
+            "result_head_commit": "ce89338e33f2a085cbe4c7978bc342e6a7751b53",
+            "merge_commit": "ee6d8949fa3ffc267297f2e7ced7f83f589835e1",
             "pull_request": 1753,
             "seeds": [1711, 1712, 1713],
             "disposition": "invalid_unmerged_consumed_accounting_ambiguous_attempt",

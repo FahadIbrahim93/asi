@@ -310,8 +310,9 @@ def test_output_namespace_is_one_new_development_path() -> None:
     assert invalid[1]["disposition"] == "invalid_unmerged_seed_churn_attempt"
     assert invalid[2]["pull_request"] == 1753
     assert invalid[2]["result_head_commit"] == (
-        "ef2aa057c669f545f80723d74c31bd38a6445c75"
+        "ce89338e33f2a085cbe4c7978bc342e6a7751b53"
     )
+    assert invalid[2]["merge_commit"] == "ee6d8949fa3ffc267297f2e7ced7f83f589835e1"
     assert invalid[2]["artifact_sha256"] == (
         "c5a6b8efb050d3c6c05648a46689ca0903389340764f7c20b589bfc4e8b0c6f2"
     )
