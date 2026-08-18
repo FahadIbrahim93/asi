@@ -2529,8 +2529,10 @@ def build_forager_comparison_report(
     grouped: dict[str, list[ForagerRunResult]] = {}
     for run in runs:
         grouped.setdefault(run.agent, []).append(run)
+    if type(candidate) is not str:
+        raise ValueError("candidate must be an exact string")
     if candidate not in grouped:
-        raise ValueError(f"candidate {candidate!r} is absent from runs")
+        raise ValueError("candidate is absent from runs")
     summaries = {
         name: summarize_forager_runs(
             method_runs,
