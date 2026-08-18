@@ -24,6 +24,7 @@ _ASI_SCRIPTS = {
     "asi-clear-qualification": (
         "alberta_framework.benchmarks.clear_qualification:main"
     ),
+    "asi-cora-catalog": ("alberta_framework.benchmarks.cora_development:main"),
     "asi-reference-life-scorecard": (
         "alberta_framework.benchmarks.reference_life_scorecard:main"
     ),
