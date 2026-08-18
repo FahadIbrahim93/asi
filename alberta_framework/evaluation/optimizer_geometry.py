@@ -10,9 +10,11 @@ of the validated protocol rather than being left implicit.
 from __future__ import annotations
 
 import hashlib
+import json
 import math
+import os
 import time
-from collections.abc import Mapping
+from pathlib import Path, PosixPath
 from types import MappingProxyType
 from typing import cast
 
@@ -90,6 +92,11 @@ _CONTROL_BY_CANDIDATE = {
 }
 
 _MAX_MATRIX_ELEMENTS = 1_000_000
+_MAX_RESULT_BYTES = 16 * 1024 * 1024
+_MAX_TEXT_BYTES = 4_096
+_MAX_RESOURCE_BYTES = 256 * 1024 * 1024
+_INT32_MAX = 2**31 - 1
+_INT64_MAX = 2**63 - 1
 
 
 def _trusted_array(value: object, *, name: str) -> Array:
@@ -213,7 +220,7 @@ def flad_noise_component_transaction(perturbation: Array, gradient: Array) -> tu
     return safe, valid
 
 
-def muon_ogd_dual_update(
+def muon_ogd_dual_update_transaction(
     momentum: Array,
     constraints: Array,
     dual: Array,
@@ -221,8 +228,8 @@ def muon_ogd_dual_update(
     dual_learning_rate: float,
     dual_steps: int,
     newton_schulz_steps: int = 5,
-) -> tuple[Array, Array]:
-    """Run the bounded matrix form of Muon-OGD v2 Algorithm 1."""
+) -> tuple[Array, Array, Array]:
+    """Run bounded Muon-OGD and return finite values plus a validity bit."""
     value = _trusted_array(momentum, name="momentum")
     protected = _trusted_array(constraints, name="constraints")
     multipliers = _trusted_array(dual, name="dual")
@@ -240,13 +247,62 @@ def muon_ogd_dual_update(
         or not 1 <= dual_steps <= 32
     ):
         raise ValueError("dual learning rate must be non-negative and dual_steps bounded positive")
+    valid = (
+        jnp.all(jnp.isfinite(value))
+        & jnp.all(jnp.isfinite(protected))
+        & jnp.all(jnp.isfinite(multipliers))
+    )
     for _ in range(dual_steps):
         shifted = value + jnp.einsum("k,kij->ij", multipliers, protected)
-        matrix_sign = spectral_matrix_sign(shifted, steps=newton_schulz_steps)
+        matrix_sign, sign_valid = spectral_matrix_sign_transaction(
+            shifted, steps=newton_schulz_steps
+        )
         conflicts = jnp.einsum("kij,ij->k", protected, matrix_sign)
-        multipliers = multipliers - dual_learning_rate * conflicts
+        next_multipliers = multipliers - dual_learning_rate * conflicts
+        valid = (
+            valid
+            & jnp.all(jnp.isfinite(shifted))
+            & sign_valid
+            & jnp.all(jnp.isfinite(conflicts))
+            & jnp.all(jnp.isfinite(next_multipliers))
+        )
+        multipliers = next_multipliers
     shifted = value + jnp.einsum("k,kij->ij", multipliers, protected)
-    return spectral_matrix_sign(shifted, steps=newton_schulz_steps), multipliers
+    update, sign_valid = spectral_matrix_sign_transaction(
+        shifted, steps=newton_schulz_steps
+    )
+    valid = valid & jnp.all(jnp.isfinite(shifted)) & sign_valid
+    safe_update = jnp.where(valid, update, jnp.zeros_like(update))
+    safe_dual = jnp.where(valid, multipliers, jnp.zeros_like(multipliers))
+    return safe_update, safe_dual, valid
+
+
+def muon_ogd_dual_update(
+    momentum: Array,
+    constraints: Array,
+    dual: Array,
+    *,
+    dual_learning_rate: float,
+    dual_steps: int,
+    newton_schulz_steps: int = 5,
+) -> tuple[Array, Array]:
+    """Compatibility wrapper that fails closed on invalid eager values."""
+    update, multipliers, valid = muon_ogd_dual_update_transaction(
+        momentum,
+        constraints,
+        dual,
+        dual_learning_rate=dual_learning_rate,
+        dual_steps=dual_steps,
+        newton_schulz_steps=newton_schulz_steps,
+    )
+    if issubclass(type(valid), jax.core.Tracer):
+        return (
+            jnp.where(valid, update, jnp.full_like(update, jnp.nan)),
+            jnp.where(valid, multipliers, jnp.full_like(multipliers, jnp.nan)),
+        )
+    if not bool(valid):
+        raise ValueError("Muon-OGD update must be finite")
+    return update, multipliers
 
 
 def flad_noise_component(perturbation: Array, gradient: Array) -> Array:
@@ -308,6 +364,42 @@ def _protocol_payload() -> dict[str, object]:
     }
 
 
+def _canonical_json_bytes_raw(value: object) -> bytes:
+    try:
+        encoded = json.dumps(
+            value,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeEncodeError) as error:
+        raise ValueError("geometry result must have finite canonical JSON") from error
+    if len(encoded) > _MAX_RESULT_BYTES:
+        raise ValueError("geometry result exceeds the byte ceiling")
+    return encoded
+
+
+def _source_sha256() -> str:
+    return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+
+
+def _plan_identity(source_sha256: str) -> str:
+    payload = {
+        "source_sha256": source_sha256,
+        "protocol": _protocol_payload(),
+        "config": dict(FROZEN_GEOMETRY_CONFIG),
+        "arm_specs": _ARM_SPECS,
+        "control_by_candidate": _CONTROL_BY_CANDIDATE,
+    }
+    return hashlib.sha256(_canonical_json_bytes_raw(payload)).hexdigest()
+
+
+def _require_valid(valid: Array, *, name: str) -> None:
+    if not bool(valid):
+        raise ValueError(f"{name} transaction is invalid")
+
+
 def _execute_frozen_stream(*, measure_timing: bool) -> dict[str, object]:
     config = FROZEN_GEOMETRY_CONFIG
     stream = _frozen_stream()
@@ -318,15 +410,16 @@ def _execute_frozen_stream(*, measure_timing: bool) -> dict[str, object]:
     dual_steps = cast(int, config["muon_dual_steps"])
     dual_learning_rate = cast(float, config["muon_dual_learning_rate"])
     constraints, basis = _protected_geometry(rows, columns)
-    target = jnp.sum(
-        jnp.stack(
-            [
-                orthogonal_correction(matrix.reshape(-1), basis).reshape((rows, columns))
-                for matrix in stream
-            ]
-        ),
-        axis=0,
-    )
+    target_updates: list[Array] = []
+    for matrix in stream:
+        target_update, target_valid = orthogonal_correction_transaction(
+            matrix.reshape(-1), basis
+        )
+        _require_valid(target_valid, name="target projection")
+        target_updates.append(target_update.reshape((rows, columns)))
+    target = jnp.sum(jnp.stack(target_updates), axis=0)
+    if not bool(jnp.all(jnp.isfinite(target))):
+        raise ValueError("target accumulation transaction is invalid")
     arm_records: list[dict[str, object]] = []
     for arm, mechanism, mode in _ARM_SPECS:
         started = time.perf_counter_ns() if measure_timing else 0
@@ -335,9 +428,9 @@ def _execute_frozen_stream(*, measure_timing: bool) -> dict[str, object]:
         processed_updates: list[Array] = []
         for matrix in stream:
             if arm == "muon_ns5_empty_constraints":
-                processed = spectral_matrix_sign(matrix, steps=ns_steps)
+                processed, valid = spectral_matrix_sign_transaction(matrix, steps=ns_steps)
             elif arm == "muon_ogd_v2_dual":
-                processed, dual = muon_ogd_dual_update(
+                processed, dual, valid = muon_ogd_dual_update_transaction(
                     matrix,
                     constraints,
                     dual,
@@ -346,23 +439,31 @@ def _execute_frozen_stream(*, measure_timing: bool) -> dict[str, object]:
                     newton_schulz_steps=ns_steps,
                 )
             elif arm == "fogo_empty_basis":
-                processed = orthogonal_correction(
+                flat_processed, valid = orthogonal_correction_transaction(
                     matrix.reshape(-1), jnp.zeros((0, rows * columns), dtype=matrix.dtype)
-                ).reshape((rows, columns))
+                )
+                processed = flat_processed.reshape((rows, columns))
             elif arm == "fogo_projection":
-                processed = orthogonal_correction(matrix.reshape(-1), basis).reshape(
-                    (rows, columns)
+                flat_processed, valid = orthogonal_correction_transaction(
+                    matrix.reshape(-1), basis
                 )
+                processed = flat_processed.reshape((rows, columns))
             elif arm == "flad_zero_gradient":
-                processed = flad_noise_component(
+                flat_processed, valid = flad_noise_component_transaction(
                     matrix.reshape(-1), jnp.zeros((rows * columns,), dtype=matrix.dtype)
-                ).reshape((rows, columns))
-            else:
-                processed = flad_noise_component(matrix.reshape(-1), basis[0]).reshape(
-                    (rows, columns)
                 )
+                processed = flat_processed.reshape((rows, columns))
+            else:
+                flat_processed, valid = flad_noise_component_transaction(
+                    matrix.reshape(-1), basis[0]
+                )
+                processed = flat_processed.reshape((rows, columns))
+            _require_valid(valid, name=f"{arm} update")
             processed_updates.append(processed)
-            state = state + processed
+            candidate_state = state + processed
+            if not bool(jnp.all(jnp.isfinite(candidate_state))):
+                raise ValueError(f"{arm} state transaction is invalid")
+            state = candidate_state
         if measure_timing:
             state.block_until_ready()
         elapsed = time.perf_counter_ns() - started if measure_timing else 0
@@ -370,6 +471,8 @@ def _execute_frozen_stream(*, measure_timing: bool) -> dict[str, object]:
         final_error = float(jnp.mean(jnp.square(state - target)))
         interference = float(jnp.mean(jnp.abs(stacked[:, 0, 0])))
         mean_update_norm = float(jnp.mean(jnp.linalg.norm(stacked, axis=(1, 2))))
+        if not all(math.isfinite(value) for value in (final_error, interference, mean_update_norm)):
+            raise ValueError(f"{arm} metric transaction is invalid")
         persistent_bytes = int(state.nbytes)
         if arm == "muon_ogd_v2_dual":
             persistent_bytes += int(dual.nbytes + constraints.nbytes)
@@ -402,8 +505,8 @@ def _execute_frozen_stream(*, measure_timing: bool) -> dict[str, object]:
     records_by_arm = {cast(str, record["arm"]): record for record in arm_records}
     comparisons: list[dict[str, object]] = []
     for candidate, control in _CONTROL_BY_CANDIDATE.items():
-        candidate_metrics = cast(Mapping[str, float], records_by_arm[candidate]["metrics"])
-        control_metrics = cast(Mapping[str, float], records_by_arm[control]["metrics"])
+        candidate_metrics = cast(dict[str, float], records_by_arm[candidate]["metrics"])
+        control_metrics = cast(dict[str, float], records_by_arm[control]["metrics"])
         delta = candidate_metrics["final_target_mse"] - control_metrics["final_target_mse"]
         comparisons.append(
             {
@@ -413,8 +516,13 @@ def _execute_frozen_stream(*, measure_timing: bool) -> dict[str, object]:
                 "outcome": _outcome(delta),
             }
         )
-    return {
+    source_sha256 = _source_sha256()
+    payload: dict[str, object] = {
         "schema": GEOMETRY_RESULT_SCHEMA,
+        "identity": {
+            "source_sha256": source_sha256,
+            "plan_sha256": _plan_identity(source_sha256),
+        },
         "protocol": _protocol_payload(),
         "config": dict(FROZEN_GEOMETRY_CONFIG),
         "stream": {
@@ -431,6 +539,8 @@ def _execute_frozen_stream(*, measure_timing: bool) -> dict[str, object]:
         "arms": arm_records,
         "comparisons": comparisons,
     }
+    payload["result_sha256"] = hashlib.sha256(_canonical_json_bytes_raw(payload)).hexdigest()
+    return payload
 
 
 def run_streaming_matrix_evaluation() -> dict[str, object]:
@@ -440,19 +550,26 @@ def run_streaming_matrix_evaluation() -> dict[str, object]:
     return result
 
 
-def _mapping(value: object, *, name: str) -> dict[str, object]:
+def _mapping(value: object, *, name: str, maximum_fields: int = 32) -> dict[str, object]:
     if type(value) is not dict:
         raise ValueError(f"{name} must be a string-keyed mapping")
     result = cast(dict[object, object], value)
+    if len(result) > maximum_fields:
+        raise ValueError(f"{name} exceeds the field ceiling")
     if not all(type(key) is str for key in result):
         raise ValueError(f"{name} must be a string-keyed mapping")
     return cast(dict[str, object], result)
 
 
-def _sequence(value: object, *, name: str) -> list[object]:
-    if type(value) is not list:
+def _sequence(value: object, *, name: str, maximum_items: int = 128) -> list[object]:
+    if type(value) is not list or len(cast(list[object], value)) > maximum_items:
         raise ValueError(f"{name} must be a list")
     return cast(list[object], value)
+
+
+def _fields(actual: dict[str, object], expected: tuple[str, ...], *, name: str) -> None:
+    if len(actual) != len(expected) or not all(field in actual for field in expected):
+        raise ValueError(f"{name} fields do not match the exact schema")
 
 
 def _same_float(actual: object, expected: object, *, name: str) -> None:
@@ -468,9 +585,14 @@ def _exact_equal(actual: object, expected: object) -> bool:
     if type(expected) is dict:
         actual_dict = cast(dict[object, object], actual)
         expected_dict = cast(dict[object, object], expected)
-        if len(actual_dict) != len(expected_dict):
+        if (
+            len(actual_dict) > 32
+            or len(actual_dict) != len(expected_dict)
+        ):
             return False
         if not all(type(key) is str for key in actual_dict):
+            return False
+        if not all(key in actual_dict for key in expected_dict):
             return False
         return all(
             key in actual_dict and _exact_equal(actual_dict[key], value)
@@ -479,18 +601,25 @@ def _exact_equal(actual: object, expected: object) -> bool:
     if type(expected) is list:
         actual_list = cast(list[object], actual)
         expected_list = cast(list[object], expected)
-        return len(actual_list) == len(expected_list) and all(
+        return len(actual_list) <= 128 and len(actual_list) == len(expected_list) and all(
             _exact_equal(left, right)
             for left, right in zip(actual_list, expected_list, strict=True)
         )
-    if (
-        type(expected) is str
-        or type(expected) is int
-        or type(expected) is float
-        or type(expected) is bool
-        or expected is None
-    ):
-        return bool(actual == expected)
+    if type(expected) is str:
+        actual_text = cast(str, actual)
+        try:
+            bounded = len(actual_text.encode("utf-8")) <= _MAX_TEXT_BYTES
+        except UnicodeEncodeError:
+            return False
+        return bounded and actual_text == expected
+    if type(expected) is int:
+        actual_integer = cast(int, actual)
+        return -_INT64_MAX <= actual_integer <= _INT64_MAX and actual_integer == expected
+    if type(expected) is float:
+        actual_float = cast(float, actual)
+        return math.isfinite(actual_float) and actual_float == expected
+    if type(expected) in (bool, type(None)):
+        return actual == expected
     return False
 
 
@@ -498,12 +627,21 @@ def validate_streaming_matrix_result(result: object) -> None:
     """Fail closed unless ``result`` is an exact current frozen-run record."""
     actual_result = _mapping(result, name="result")
     expected = _execute_frozen_stream(measure_timing=False)
-    required_top = {"schema", "protocol", "config", "stream", "policy", "arms", "comparisons"}
-    if set(actual_result) != required_top or not _exact_equal(
-        actual_result["schema"], GEOMETRY_RESULT_SCHEMA
-    ):
+    required_top = (
+        "schema",
+        "identity",
+        "protocol",
+        "config",
+        "stream",
+        "policy",
+        "arms",
+        "comparisons",
+        "result_sha256",
+    )
+    _fields(actual_result, required_top, name="result")
+    if not _exact_equal(actual_result["schema"], GEOMETRY_RESULT_SCHEMA):
         raise ValueError("result fields or schema do not match the frozen protocol")
-    for field in ("protocol", "config", "stream", "policy"):
+    for field in ("identity", "protocol", "config", "stream", "policy"):
         actual_mapping = _mapping(actual_result[field], name=field)
         expected_mapping = _mapping(expected[field], name=f"expected.{field}")
         if not _exact_equal(actual_mapping, expected_mapping):
@@ -515,27 +653,49 @@ def validate_streaming_matrix_result(result: object) -> None:
     for index, (raw_arm, raw_expected_arm) in enumerate(zip(arms, expected_arms, strict=True)):
         arm = _mapping(raw_arm, name=f"arms[{index}]")
         expected_arm = _mapping(raw_expected_arm, name=f"expected.arms[{index}]")
-        if set(arm) != {"arm", "mechanism", "mode", "metrics", "resources"}:
-            raise ValueError(f"arms[{index}] fields do not match the schema")
+        _fields(
+            arm,
+            ("arm", "mechanism", "mode", "metrics", "resources"),
+            name=f"arms[{index}]",
+        )
         for field in ("arm", "mechanism", "mode"):
             if not _exact_equal(arm[field], expected_arm[field]):
                 raise ValueError(f"arms[{index}].{field} does not match the frozen plan")
         metrics = _mapping(arm["metrics"], name=f"arms[{index}].metrics")
         expected_metrics = _mapping(expected_arm["metrics"], name=f"expected.arms[{index}].metrics")
-        if set(metrics) != set(expected_metrics):
-            raise ValueError(f"arms[{index}].metrics fields do not match the schema")
+        _fields(metrics, tuple(expected_metrics), name=f"arms[{index}].metrics")
         for metric, expected_value in expected_metrics.items():
             _same_float(metrics[metric], expected_value, name=f"arms[{index}].metrics.{metric}")
         resources = _mapping(arm["resources"], name=f"arms[{index}].resources")
         expected_resources = _mapping(
             expected_arm["resources"], name=f"expected.arms[{index}].resources"
         )
-        if set(resources) != set(expected_resources):
-            raise ValueError(f"arms[{index}].resources fields do not match the schema")
+        _fields(resources, tuple(expected_resources), name=f"arms[{index}].resources")
         for resource, expected_value in expected_resources.items():
             if resource == "timing_ns":
-                if type(resources[resource]) is not int or cast(int, resources[resource]) < 0:
+                if (
+                    type(resources[resource]) is not int
+                    or not 0 <= cast(int, resources[resource]) <= _INT64_MAX
+                ):
                     raise ValueError(f"arms[{index}].resources.timing_ns must be non-negative")
+            elif resource == "persistent_numeric_bytes" and (
+                type(resources[resource]) is not int
+                or not 0 <= cast(int, resources[resource]) <= _MAX_RESOURCE_BYTES
+            ):
+                raise ValueError(
+                    f"arms[{index}].resources.persistent_numeric_bytes exceeds its bound"
+                )
+            elif resource in {
+                "observations",
+                "updates",
+                "data_steps",
+                "environment_steps",
+                "model_queries",
+            } and (
+                type(resources[resource]) is not int
+                or not 0 <= cast(int, resources[resource]) <= _INT32_MAX
+            ):
+                raise ValueError(f"arms[{index}].resources.{resource} exceeds its bound")
             elif not _exact_equal(resources[resource], expected_value):
                 raise ValueError(f"arms[{index}].resources.{resource} is not canonical")
     comparisons = _sequence(actual_result["comparisons"], name="comparisons")
@@ -549,8 +709,11 @@ def validate_streaming_matrix_result(result: object) -> None:
         expected_comparison = _mapping(
             raw_expected_comparison, name=f"expected.comparisons[{index}]"
         )
-        if set(comparison) != {"candidate", "control", "final_target_mse_delta", "outcome"}:
-            raise ValueError(f"comparisons[{index}] fields do not match the schema")
+        _fields(
+            comparison,
+            ("candidate", "control", "final_target_mse_delta", "outcome"),
+            name=f"comparisons[{index}]",
+        )
         for field in ("candidate", "control", "outcome"):
             if not _exact_equal(comparison[field], expected_comparison[field]):
                 raise ValueError(f"comparisons[{index}].{field} is not canonical")
@@ -559,3 +722,80 @@ def validate_streaming_matrix_result(result: object) -> None:
             expected_comparison["final_target_mse_delta"],
             name=f"comparisons[{index}].final_target_mse_delta",
         )
+    claimed_digest = actual_result["result_sha256"]
+    if type(claimed_digest) is not str or len(claimed_digest) != 64:
+        raise ValueError("result_sha256 must be lowercase hexadecimal SHA-256")
+    unsigned = dict(actual_result)
+    del unsigned["result_sha256"]
+    actual_digest = hashlib.sha256(_canonical_json_bytes_raw(unsigned)).hexdigest()
+    if claimed_digest != actual_digest:
+        raise ValueError("result_sha256 does not bind the canonical result")
+
+
+def canonical_streaming_matrix_result_bytes(result: object) -> bytes:
+    """Validate and encode one finite canonical geometry development result."""
+    validate_streaming_matrix_result(result)
+    return _canonical_json_bytes_raw(result)
+
+
+def retain_streaming_matrix_result(result: object, *, repository_root: Path) -> Path:
+    """Atomically publish a new validated nonpromoting result without replacement."""
+    if type(repository_root) is not PosixPath or not repository_root.is_absolute():
+        raise ValueError("repository_root must be an exact absolute POSIX Path")
+    encoded = canonical_streaming_matrix_result_bytes(result)
+    actual = _mapping(result, name="result")
+    digest = cast(str, actual["result_sha256"])
+    segments = ("outputs", "optimizer_geometry", "development.v1")
+    directory = repository_root.joinpath(*segments)
+    destination = directory / f"result.{digest}.json"
+    temporary_name = f".result.{digest}.tmp"
+    destination_name = destination.name
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    directory_descriptor = os.open(repository_root, directory_flags)
+    try:
+        for segment in segments:
+            try:
+                os.mkdir(segment, mode=0o755, dir_fd=directory_descriptor)
+            except FileExistsError:
+                pass
+            next_descriptor = os.open(segment, directory_flags, dir_fd=directory_descriptor)
+            os.close(directory_descriptor)
+            directory_descriptor = next_descriptor
+        descriptor = os.open(
+            temporary_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o444,
+            dir_fd=directory_descriptor,
+        )
+        try:
+            with os.fdopen(descriptor, "wb", closefd=False) as stream:
+                stream.write(encoded)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.link(
+                temporary_name,
+                destination_name,
+                src_dir_fd=directory_descriptor,
+                dst_dir_fd=directory_descriptor,
+                follow_symlinks=False,
+            )
+        finally:
+            os.close(descriptor)
+            os.unlink(temporary_name, dir_fd=directory_descriptor)
+        read_descriptor = os.open(
+            destination_name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_descriptor
+        )
+        try:
+            with os.fdopen(read_descriptor, "rb", closefd=False) as stream:
+                loaded_bytes = stream.read(_MAX_RESULT_BYTES + 1)
+        finally:
+            os.close(read_descriptor)
+        if loaded_bytes != encoded:
+            raise RuntimeError("retained geometry result bytes changed during publication")
+        loaded = json.loads(loaded_bytes)
+        if canonical_streaming_matrix_result_bytes(loaded) != encoded:
+            raise RuntimeError("retained geometry result failed strict reload validation")
+        os.fsync(directory_descriptor)
+    finally:
+        os.close(directory_descriptor)
+    return destination
