@@ -79,6 +79,12 @@ local same-runner development ranking, not a paper-level SOTA claim.
   (ICLR 2025)](https://openreview.net/forum?id=G82uQztzxl) are strong modern
   plasticity comparators. Their reported task variants must be ported into the
   exact ASI runner before numerical ranking.
+- [Smooth-Leaky activations](https://arxiv.org/abs/2509.22562v4) and
+  [Activation by Interval-wise Dropout](https://arxiv.org/abs/2502.01342v2)
+  are low-cost activation comparators. The permanently nonpromoting matched
+  port, source audit, causal ablations, and explicit protocol gaps are in
+  [the #1566 comparison note](activation-feature-comparison.md); no benchmark
+  result has been run or claimed there.
 - [C-CHAIN (ICML 2025)](https://openreview.net/forum?id=EkoFXfSauv) links
   plasticity loss to output churn and NTK-rank decline across several continual
   RL suites. ASI now has four permanently nonpromoting `cchain_*` IPMNIST
