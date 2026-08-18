@@ -122,7 +122,7 @@ def _json_preflight(value: object) -> None:
         elif type(current) is float:
             if not math.isfinite(current):
                 raise ValueError("result float must be finite")
-        elif type(current) not in (bool, type(None)):
+        elif type(current) is not bool and current is not None:
             raise ValueError("result must be an exact JSON tree")
 
 
@@ -156,7 +156,12 @@ def _source_identity() -> dict[str, str]:
 
 
 def _text(value: object, *, name: str) -> str:
-    if type(value) is not str or not value or len(value.encode("utf-8")) > _MAX_TEXT_BYTES:
+    if (
+        type(value) is not str
+        or not value
+        or len(value) > _MAX_TEXT_BYTES
+        or len(value.encode("utf-8")) > _MAX_TEXT_BYTES
+    ):
         raise ValueError(f"{name} must be bounded non-empty text")
     return value
 
@@ -275,11 +280,44 @@ def _dataset_identity(data_x: object, data_y: object, config: IPMNISTConfig) -> 
 
 
 def _validated_run(
-    run: object, plan: GradualInputDevelopmentPlan, expected_seed: int
+    run: object,
+    plan: GradualInputDevelopmentPlan,
+    expected_seed: int,
+    *,
+    expected_dataset_rows: int,
+    expected_dataset_sha256: str,
 ) -> GradualInputPairResult:
     if type(run) is not GradualInputPairResult:
         raise ValueError("run must be an exact GradualInputPairResult")
-    result = run
+    try:
+        result = GradualInputPairResult(
+            schema=run.schema,
+            development_only=run.development_only,
+            scientific_promotion_allowed=run.scientific_promotion_allowed,
+            execution_attestation=run.execution_attestation,
+            arm_names=run.arm_names,
+            learner_name=run.learner_name,
+            learner_hyperparameters=run.learner_hyperparameters,
+            prng_implementation=run.prng_implementation,
+            seed=run.seed,
+            config=run.config,
+            transition_steps=run.transition_steps,
+            dataset_rows=run.dataset_rows,
+            dataset_sha256=run.dataset_sha256,
+            schedule_sha256=run.schedule_sha256,
+            example_order_sha256=run.example_order_sha256,
+            correct_counts=run.correct_counts,
+            loss_sums=run.loss_sums,
+            persistent_numeric_bytes=run.persistent_numeric_bytes,
+            timing_ns=run.timing_ns,
+            observations_per_arm=run.observations_per_arm,
+            updates_per_arm=run.updates_per_arm,
+            data_steps_per_arm=run.data_steps_per_arm,
+            environment_steps_per_arm=run.environment_steps_per_arm,
+            model_queries_per_arm=run.model_queries_per_arm,
+        )
+    except (TypeError, ValueError) as error:
+        raise ValueError("run receipt does not match the exact pair contract") from error
     if (
         type(result.arm_names) is not tuple
         or any(type(arm) is not str for arm in result.arm_names)
@@ -303,13 +341,18 @@ def _validated_run(
         or result.transition_steps != plan.transition_steps
     ):
         raise ValueError("run seed or transition width does not match the plan")
+    if (
+        result.dataset_rows != expected_dataset_rows
+        or result.dataset_sha256 != expected_dataset_sha256
+    ):
+        raise ValueError("run dataset identity does not match the supplied materialization")
     horizon = plan.config.n_steps
     counters = (
-        result.observations,
-        result.updates,
-        result.data_steps,
-        result.environment_steps,
-        result.model_queries,
+        result.observations_per_arm,
+        result.updates_per_arm,
+        result.data_steps_per_arm,
+        result.environment_steps_per_arm,
+        result.model_queries_per_arm,
     )
     if any(type(value) is not int for value in counters) or counters != (
         horizon,
@@ -386,6 +429,22 @@ def _schedule_identities(seed: int, config: IPMNISTConfig, n_train: int) -> tupl
     )
 
 
+def _pair_dataset_sha256(data_x: object, data_y: object, config: IPMNISTConfig) -> str:
+    x, y = validated_ipmnist_data(
+        cast(np.ndarray | jax.Array, data_x),
+        cast(np.ndarray | jax.Array, data_y),
+        input_dim=config.input_dim,
+        n_classes=config.n_classes,
+        min_length=config.task_length,
+    )
+    digest = hashlib.sha256(b"asi.ipmnist.gradual.dataset.v1\0")
+    for value in (x, y):
+        digest.update(value.dtype.str.encode("ascii"))
+        digest.update(str(value.shape).encode("ascii"))
+        digest.update(value.tobytes(order="C"))
+    return f"sha256:{digest.hexdigest()}"
+
+
 def build_gradual_input_development_report(
     plan: GradualInputDevelopmentPlan,
     runs: tuple[GradualInputPairResult, ...],
@@ -409,8 +468,16 @@ def build_gradual_input_development_report(
     arm_persistent_bytes: list[list[int]] = [[], []]
     arm_timing_ns: list[list[int]] = [[], []]
     horizon = checked_plan.config.n_steps
+    dataset = _dataset_identity(data_x, data_y, checked_plan.config)
+    pair_dataset_sha256 = _pair_dataset_sha256(data_x, data_y, checked_plan.config)
     for seed, raw_run in zip(checked_plan.seeds, runs, strict=True):
-        run = _validated_run(raw_run, checked_plan, seed)
+        run = _validated_run(
+            raw_run,
+            checked_plan,
+            seed,
+            expected_dataset_rows=cast(int, dataset["rows"]),
+            expected_dataset_sha256=pair_dataset_sha256,
+        )
         arms = []
         accuracies = []
         for index, arm in enumerate(_ARMS):
@@ -431,11 +498,11 @@ def build_gradual_input_development_report(
                         "mean_loss": loss_sum / horizon,
                     },
                     "resources": {
-                        "observations": run.observations,
-                        "updates": run.updates,
-                        "data_steps": run.data_steps,
-                        "environment_steps": run.environment_steps,
-                        "model_queries": run.model_queries,
+                        "observations": run.observations_per_arm,
+                        "updates": run.updates_per_arm,
+                        "data_steps": run.data_steps_per_arm,
+                        "environment_steps": run.environment_steps_per_arm,
+                        "model_queries": run.model_queries_per_arm,
                         "persistent_numeric_bytes": int(run.persistent_numeric_bytes[index]),
                         "timing_ns": int(run.timing_ns[index]),
                         "timing_qualified": False,
@@ -502,7 +569,7 @@ def build_gradual_input_development_report(
             "timing_is_telemetry_only": True,
         },
         "plan": plan_payload,
-        "dataset": _dataset_identity(data_x, data_y, checked_plan.config),
+        "dataset": dataset,
         "records": records,
         "aggregate": {
             "paired_accuracy_delta_mean": mean_delta,
@@ -634,6 +701,14 @@ def validate_gradual_input_development_report(
     expected_dataset = _dataset_identity(data_x, data_y, plan.config)
     if not _same(root["dataset"], expected_dataset):
         raise ValueError("dataset identity does not match supplied materialization")
+    expected_persistent_numeric_bytes = (
+        plan.config.parameter_count * 12
+        + 6 * 5 * 4
+        + cast(int, expected_dataset["rows"]) * (plan.config.input_dim + 1) * 4
+        + plan.config.n_tasks * (plan.config.input_dim + plan.config.task_length) * 4
+    )
+    if expected_persistent_numeric_bytes > _MAX_RESOURCE_BYTES:
+        raise ValueError("derived persistent numeric state exceeds 256 MiB")
     records = root["records"]
     if type(records) is not list or len(records) != len(plan.seeds):
         raise ValueError("records must contain one canonical seed record")
@@ -734,7 +809,8 @@ def validate_gradual_input_development_report(
                 raise ValueError("resource counters do not match the plan")
             if (
                 type(resources["persistent_numeric_bytes"]) is not int
-                or not 0 < resources["persistent_numeric_bytes"] <= _MAX_RESOURCE_BYTES
+                or resources["persistent_numeric_bytes"]
+                != expected_persistent_numeric_bytes
                 or type(resources["timing_ns"]) is not int
                 or not 0 <= resources["timing_ns"] <= _INT64_MAX
                 or resources["timing_qualified"] is not False

@@ -68,8 +68,8 @@ def test_gradual_report_revalidates_mutated_run_receipts() -> None:
         config=plan.config,
         transition_steps=1,
     )
-    object.__setattr__(run, "updates", 999)
-    with pytest.raises(ValueError, match="counter"):
+    object.__setattr__(run, "updates_per_arm", 999)
+    with pytest.raises(ValueError, match="pair contract"):
         build_gradual_input_development_report(plan, (run,), x, y)
 
 
@@ -91,6 +91,40 @@ def test_gradual_report_rejects_hostile_json_keys_without_hooks() -> None:
     with pytest.raises(ValueError, match="exact JSON"):
         validate_gradual_input_development_report(payload, np.zeros((2, 2)), np.zeros(2))
     assert key.calls == 0
+
+
+def test_gradual_report_rejects_hostile_json_metaclass_without_hooks() -> None:
+    class HostileType(type):
+        calls = 0
+
+        def __eq__(cls, other: object) -> bool:
+            cls.calls += 1
+            raise AssertionError("must not compare runtime types")
+
+    class Hostile(metaclass=HostileType):
+        pass
+
+    HostileType.calls = 0
+    with pytest.raises(ValueError, match="exact JSON tree"):
+        gradual_report._json_preflight({"value": Hostile()})
+    assert HostileType.calls == 0
+
+
+def test_gradual_report_reconstructs_exact_persistent_resource_formula() -> None:
+    x, y, plan = _tiny()
+    run = run_gradual_input_pair(
+        x,
+        y,
+        learner_name="adamw_control",
+        seed=19,
+        config=plan.config,
+        transition_steps=1,
+    )
+    report = build_gradual_input_development_report(plan, (run,), x, y)
+    forged = copy.deepcopy(report)
+    forged["records"][0]["arms"][0]["resources"]["persistent_numeric_bytes"] = 1
+    with pytest.raises(ValueError, match="resource receipt"):
+        validate_gradual_input_development_report(forged, x, y)
 
 
 def test_gradual_report_retention_is_exclusive_and_reload_validated(
