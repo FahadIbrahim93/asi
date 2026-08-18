@@ -14,7 +14,7 @@ from alberta_framework.core.off_policy_td import (
 
 _INT32_MAX = 2**31 - 1
 _INT32_MIN = -(2**31)
-_WORKING_SET_OVERFLOW = 100_000_000
+_WORKING_SET_OVERFLOW = 60_000_000
 
 
 class _IntSubclass(int):
@@ -38,9 +38,11 @@ def test_int32_wrap_forges_a_different_published_byte_identity() -> None:
 def test_off_policy_td_one_bank_and_persistent_fit_while_update_working_set_does_not() -> None:
     one_bank_bytes = 4 * _WORKING_SET_OVERFLOW
     persistent_bytes = 4 * (2 * _WORKING_SET_OVERFLOW + 3)
-    update_bytes = 4 * (8 * _WORKING_SET_OVERFLOW + 16)
+    contributor_update_bytes = 4 * (8 * _WORKING_SET_OVERFLOW + 16)
+    update_bytes = 4 * (9 * _WORKING_SET_OVERFLOW + 16)
     assert one_bank_bytes <= _INT32_MAX
     assert persistent_bytes <= _INT32_MAX
+    assert contributor_update_bytes <= _INT32_MAX
     assert update_bytes > _INT32_MAX
     with pytest.raises(ValueError, match="update working set byte count"):
         OffPolicyTDLinearLearner().init(_WORKING_SET_OVERFLOW)
@@ -49,21 +51,25 @@ def test_off_policy_td_one_bank_and_persistent_fit_while_update_working_set_does
 def test_etd_one_bank_and_persistent_fit_while_update_working_set_does_not() -> None:
     one_bank_bytes = 4 * _WORKING_SET_OVERFLOW
     persistent_bytes = 4 * (2 * _WORKING_SET_OVERFLOW + 5)
-    update_bytes = 4 * (8 * _WORKING_SET_OVERFLOW + 16)
+    contributor_update_bytes = 4 * (8 * _WORKING_SET_OVERFLOW + 16)
+    update_bytes = 4 * (9 * _WORKING_SET_OVERFLOW + 16)
     assert one_bank_bytes <= _INT32_MAX
     assert persistent_bytes <= _INT32_MAX
+    assert contributor_update_bytes <= _INT32_MAX
     assert update_bytes > _INT32_MAX
     with pytest.raises(ValueError, match="update working set byte count"):
         ETDLinearLearner().init(_WORKING_SET_OVERFLOW)
 
 
 def test_gradient_td_one_bank_and_persistent_fit_while_update_working_set_does_not() -> None:
-    width = _WORKING_SET_OVERFLOW + 1
+    width = 40_000_001
     one_bank_bytes = 4 * width
     persistent_bytes = 4 * (3 * width + 1)
-    update_bytes = 4 * (9 * width + 16)
+    contributor_update_bytes = 4 * (9 * width + 16)
+    update_bytes = 4 * (15 * width + 16)
     assert one_bank_bytes <= _INT32_MAX
     assert persistent_bytes <= _INT32_MAX
+    assert contributor_update_bytes <= _INT32_MAX
     assert update_bytes > _INT32_MAX
     with pytest.raises(ValueError, match="update working set byte count"):
         GradientTDLinearLearner().init(_WORKING_SET_OVERFLOW)
@@ -114,9 +120,9 @@ def test_legal_off_policy_td_update_identity_is_unchanged() -> None:
 @pytest.mark.parametrize(
     ("factory", "vectors", "augmented"),
     [
-        (OffPolicyTDLinearLearner, 8, False),
-        (ETDLinearLearner, 8, False),
-        (GradientTDLinearLearner, 9, True),
+        (OffPolicyTDLinearLearner, 9, False),
+        (ETDLinearLearner, 9, False),
+        (GradientTDLinearLearner, 15, True),
     ],
 )
 def test_every_off_policy_learner_rejects_first_overflowing_update_width(

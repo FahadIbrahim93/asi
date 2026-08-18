@@ -1190,9 +1190,12 @@ def load_micro_shard(path: Path | str) -> dict[str, Any]:
             f"{path}: suite_version mismatch (expected {MICRO_GAUSS_SUITE_VERSION!r}, "
             f"got {payload.get('suite_version')!r})"
         )
-    if payload.get("arm_name") not in MICRO_ARM_REGISTRY:
-        raise ValueError(f"{path}: unknown arm {payload.get('arm_name')!r}")
-    arm_spec = MICRO_ARM_REGISTRY[payload["arm_name"]]
+    arm_name = payload.get("arm_name")
+    if type(arm_name) is not str:
+        raise ValueError(f"{path}: arm_name must be an exact string")
+    if arm_name not in MICRO_ARM_REGISTRY:
+        raise ValueError(f"{path}: unknown arm {arm_name!r}")
+    arm_spec = MICRO_ARM_REGISTRY[arm_name]
     if not isinstance(payload.get("mechanism"), str) or not payload["mechanism"]:
         raise ValueError(f"{path}: mechanism must be a non-empty string")
     if not isinstance(payload.get("hyperparameters"), dict):

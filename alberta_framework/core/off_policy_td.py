@@ -495,7 +495,7 @@ class OffPolicyTDLinearLearner:
     def init(self, feature_dim: int) -> OffPolicyTDState:
         """Initialize learner state with zero weights and zero traces."""
         feature_dim = _require_feature_dim(
-            feature_dim, vectors=2, fixed_scalars=3, update_vectors=8
+            feature_dim, vectors=2, fixed_scalars=3, update_vectors=9
         )
         return OffPolicyTDState(  # type: ignore[call-arg]
             weights=jnp.zeros(feature_dim, dtype=jnp.float32),
@@ -711,7 +711,7 @@ class ETDLinearLearner:
     def init(self, feature_dim: int) -> ETDState:
         """Initialize learner state with zero weights and zero traces."""
         feature_dim = _require_feature_dim(
-            feature_dim, vectors=2, fixed_scalars=5, update_vectors=8
+            feature_dim, vectors=2, fixed_scalars=5, update_vectors=9
         )
         return ETDState(  # type: ignore[call-arg]
             weights=jnp.zeros(feature_dim, dtype=jnp.float32),
@@ -944,7 +944,7 @@ class GradientTDLinearLearner:
             feature_dim,
             vectors=3,
             fixed_scalars=1,
-            update_vectors=9,
+            update_vectors=15,
             augmented=True,
         )
         augmented_dim = feature_dim + 1
