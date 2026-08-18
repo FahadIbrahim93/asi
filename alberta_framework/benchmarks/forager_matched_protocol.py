@@ -1228,7 +1228,7 @@ def _require_optional_positive_int(value: Any, path: str) -> int | None:
 
 
 def _require_probability(value: Any, path: str) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    if type(value) not in (int, float):
         raise ForagerMatchedProtocolError(f"{path} must be a finite number")
     try:
         number = float(value)
@@ -1410,7 +1410,7 @@ def _parse_transform(value: Any, path: str) -> AllowedTransform:
             maximum=2**63 - 1,
         )
     elif value_type == "number":
-        if isinstance(raw_value, bool) or not isinstance(raw_value, (int, float)):
+        if type(raw_value) not in (int, float):
             raise ForagerMatchedProtocolError(f"{path}.value must be a finite number")
         try:
             normalized = float(raw_value)
