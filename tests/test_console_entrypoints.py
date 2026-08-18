@@ -28,6 +28,9 @@ _ASI_SCRIPTS = {
         "alberta_framework.benchmarks.coom_qualification:main"
     ),
     "asi-cora-catalog": ("alberta_framework.benchmarks.cora_development:main"),
+    "asi-forager-rerun-preflight": (
+        "alberta_framework.benchmarks.forager_scientific_rerun_preflight:main"
+    ),
     "asi-reference-life-scorecard": (
         "alberta_framework.benchmarks.reference_life_scorecard:main"
     ),

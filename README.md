@@ -243,6 +243,7 @@ The console scripts are grouped by responsibility; every command supports `--hel
 | `asi-clear-qualification` | Verify local CLEAR archive identities and emit a permanently nonpromoting matched setup plan |
 | `asi-coom-qualification-smoke` | Inspect or run the bounded, synthetic, permanently nonpromoting COOM qualification smoke |
 | `asi-cora-catalog` | Inspect the blocked CORA qualification catalog without importing external runtimes |
+| `asi-forager-rerun-preflight` | Report the fail-closed, read-only readiness state for a matched-current Forager rerun |
 | `asi-reference-life-scorecard` | Run or validate the permanently nonpromoting reference-life development scorecard |
 | `asi-ipmnist-ceiling` | Produce new, atomic no-replace stationary/carried/full or batch ceiling diagnostics |
 | `asi-ipmnist-campaign` | Recompute paired frontiers or ceiling summaries from explicit input directories |
@@ -352,7 +353,9 @@ checks before it is an integrated improvement. Do not infer an ASI, robotics, sc
 state-of-the-art claim from the screening record.
 
 Forager integration and comparator details are in
-[FORAGER_BENCHMARK.md](FORAGER_BENCHMARK.md).
+[FORAGER_BENCHMARK.md](FORAGER_BENCHMARK.md). The blocked matched-current rerun has a
+[read-only preflight](docs/runbooks/forager-matched-rerun-preflight.md) that never pulls or runs
+the missing frozen image.
 
 Before repeating a failed or bounded idea, check
 [the negative-results ledger](docs/evidence/negative-results.md).
