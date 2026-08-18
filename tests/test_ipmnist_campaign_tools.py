@@ -133,6 +133,20 @@ def test_frontier_rejects_empty_or_no_overlap_screen_seed_sets(tmp_path: Path) -
         build_frontier(tmp_path / "empty", confirm, base="base", arms=["candidate"])
 
 
+def test_current_frontier_legacy_numeric_payload_reconstructs() -> None:
+    campaign = _REPO_ROOT / "outputs" / "ipmnist_screening"
+    expected = json.loads((campaign / "frontier_results.json").read_text())
+    actual = build_frontier(
+        campaign / "shards",
+        campaign / "confirm_full",
+        created_unix=float(expected["created_unix"]),
+    )
+    actual.pop("schema")
+    actual.pop("provenance")
+
+    assert actual == expected
+
+
 def test_ceiling_summary_records_sample_spread_from_explicit_paths(tmp_path: Path) -> None:
     ceiling = tmp_path / "ceiling"
     confirm = tmp_path / "confirm"
