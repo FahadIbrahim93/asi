@@ -8704,6 +8704,7 @@ def l2er_development_result_payload(
         "n_classes": config.n_classes,
         "observations": observations,
         "updates": observations,
+        "effective_rank_updates": er_updates,
         "allowed_boundary_information": [],
         "allowed_task_information": ["current_example_label"],
         "hyperparameters": dict(spec.hyperparameters),

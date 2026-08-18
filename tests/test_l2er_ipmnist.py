@@ -280,6 +280,8 @@ def test_result_receipt_accounts_resources_and_is_permanently_nonpromoting() -> 
     assert payload["outcome_retained"] is True
     assert payload["development_only"] is True
     assert payload["scientific_promotion_allowed"] is False
+    assert payload["updates"] == 100
+    assert payload["effective_rank_updates"] == 1
     resources = payload["resources"]
     assert isinstance(resources, dict)
     assert resources["data_steps"] == 100
@@ -293,6 +295,11 @@ def test_result_receipt_accounts_resources_and_is_permanently_nonpromoting() -> 
     hostile_resources["model_queries"] = 200
     with pytest.raises(ValueError, match="model_queries"):
         validate_l2er_development_result(hostile)
+
+    hostile_er_updates = deepcopy(payload)
+    hostile_er_updates["effective_rank_updates"] = 0
+    with pytest.raises(ValueError, match="effective_rank_updates"):
+        validate_l2er_development_result(hostile_er_updates)
 
     hostile_bytes = deepcopy(payload)
     hostile_byte_resources = hostile_bytes["resources"]

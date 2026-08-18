@@ -9,7 +9,7 @@ from typing import Any, cast
 
 PAPER_REVISION = "arXiv:2509.22335v3"
 OFFICIAL_COMMIT = "52ae3eb0702a9e6923f252c1f7cb29340eb5b3d5"
-RESULT_SCHEMA = "asi.l2er-ipmnist.development-result.v1"
+RESULT_SCHEMA = "asi.l2er-ipmnist.development-result.v2"
 COMPARISON_ID = "asi.l2er-ipmnist.current-runner.v1"
 
 L2ER_PROTOCOL = MappingProxyType(
@@ -37,6 +37,10 @@ L2ER_PROTOCOL = MappingProxyType(
         "official_er_batch": 100,
         "official_er_steps_per_batch": 1,
         "effective_rank_epsilon": 1e-8,
+        "update_accounting": (
+            "updates counts one supervised update per observation; "
+            "effective_rank_updates separately counts arm-specific auxiliary ER steps"
+        ),
         "persistent_bytes_scope": (
             "float32 parameters plus the fixed 100-example float32 ER buffer, int32 count, "
             "and sticky bool transaction-validity flag; "
@@ -133,6 +137,7 @@ def validate_l2er_development_result(payload: object) -> dict[str, object]:
                 "n_classes",
                 "observations",
                 "updates",
+                "effective_rank_updates",
                 "allowed_boundary_information",
                 "allowed_task_information",
                 "hyperparameters",
@@ -166,6 +171,9 @@ def validate_l2er_development_result(payload: object) -> dict[str, object]:
     n_classes = _int(outer["n_classes"], context="n_classes", positive=True)
     observations = _int(outer["observations"], context="observations", positive=True)
     updates = _int(outer["updates"], context="updates", positive=True)
+    effective_rank_updates = _int(
+        outer["effective_rank_updates"], context="effective_rank_updates"
+    )
     if n_tasks > _INT32_MAX // task_length:
         raise ValueError("n_tasks * task_length exceeds signed int32")
     if observations != n_tasks * task_length or updates != observations:
@@ -237,6 +245,8 @@ def validate_l2er_development_result(payload: object) -> dict[str, object]:
     if environment_steps != 0 or data_steps != observations:
         raise ValueError("environment_steps/data_steps do not match the supervised protocol")
     er_updates = observations // 100 if expected_enabled == 1.0 else 0
+    if effective_rank_updates != er_updates:
+        raise ValueError("effective_rank_updates does not match the executed ER schedule")
     if model_queries != 2 * observations + er_updates:
         raise ValueError("model_queries does not match the executed update semantics")
     if resources["timing_is_telemetry_only"] is not True:
@@ -281,6 +291,7 @@ def validate_l2er_development_result(payload: object) -> dict[str, object]:
         "n_classes": n_classes,
         "observations": observations,
         "updates": updates,
+        "effective_rank_updates": effective_rank_updates,
         "allowed_boundary_information": list(boundary),
         "allowed_task_information": list(task_info),
         "hyperparameters": normalized_hp,
