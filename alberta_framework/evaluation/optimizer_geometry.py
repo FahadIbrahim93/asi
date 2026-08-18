@@ -53,6 +53,8 @@ GEOMETRY_PROTOCOL = MappingProxyType(
             "approximation, Hessian-vector product, sharpness objective, or schedule",
             "the synthetic target is a mechanism diagnostic defined by the protected complement; "
             "its outcome is not comparative performance evidence",
+            "resource receipts cover persistent numeric payload only; aggregate working-set and "
+            "compiler/runtime temporaries are not claimed",
         ),
         "matched_axes": (
             "seed",
@@ -63,7 +65,8 @@ GEOMETRY_PROTOCOL = MappingProxyType(
         ),
         "mechanism_off": "empty_basis_or_zero_gradient_exact_reduction",
         "finite_kernel_preflight_required": True,
-        "persistent_bytes_accounting_required": True,
+        "persistent_numeric_bytes_accounting_required": True,
+        "aggregate_working_set_bytes_claimed": False,
         "environment_steps_accounting_required": True,
         "model_queries_accounting_required": True,
         "timing_is_telemetry_only": True,
@@ -295,7 +298,8 @@ def _protocol_payload() -> dict[str, object]:
         "matched_axes": list(cast(tuple[str, ...], GEOMETRY_PROTOCOL["matched_axes"])),
         "mechanism_off": GEOMETRY_PROTOCOL["mechanism_off"],
         "finite_kernel_preflight_required": True,
-        "persistent_bytes_accounting_required": True,
+        "persistent_numeric_bytes_accounting_required": True,
+        "aggregate_working_set_bytes_claimed": False,
         "environment_steps_accounting_required": True,
         "model_queries_accounting_required": True,
         "timing_is_telemetry_only": True,
@@ -384,7 +388,7 @@ def _execute_frozen_stream(*, measure_timing: bool) -> dict[str, object]:
                     "mean_update_frobenius_norm": mean_update_norm,
                 },
                 "resources": {
-                    "persistent_bytes": persistent_bytes,
+                    "persistent_numeric_bytes": persistent_bytes,
                     "observations": updates,
                     "updates": updates,
                     "data_steps": updates,
@@ -464,9 +468,14 @@ def _exact_equal(actual: object, expected: object) -> bool:
     if type(expected) is dict:
         actual_dict = cast(dict[object, object], actual)
         expected_dict = cast(dict[object, object], expected)
-        if set(actual_dict) != set(expected_dict):
+        if len(actual_dict) != len(expected_dict):
             return False
-        return all(_exact_equal(actual_dict[key], value) for key, value in expected_dict.items())
+        if not all(type(key) is str for key in actual_dict):
+            return False
+        return all(
+            key in actual_dict and _exact_equal(actual_dict[key], value)
+            for key, value in expected_dict.items()
+        )
     if type(expected) is list:
         actual_list = cast(list[object], actual)
         expected_list = cast(list[object], expected)
@@ -474,7 +483,13 @@ def _exact_equal(actual: object, expected: object) -> bool:
             _exact_equal(left, right)
             for left, right in zip(actual_list, expected_list, strict=True)
         )
-    if type(expected) in (str, int, float, bool, type(None)):
+    if (
+        type(expected) is str
+        or type(expected) is int
+        or type(expected) is float
+        or type(expected) is bool
+        or expected is None
+    ):
         return bool(actual == expected)
     return False
 
