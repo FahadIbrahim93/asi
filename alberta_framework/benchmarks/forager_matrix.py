@@ -2967,10 +2967,10 @@ def _jax_configuration() -> dict[str, Any]:
             value = getattr(jax.config, name)
         except (AttributeError, RuntimeError):
             value = None
-        if value is None or isinstance(value, (bool, int, float, str)):
+        if value is None or type(value) in (bool, int, float, str):
             result[name] = value
         else:
-            result[name] = str(value)
+            result[name] = str.__str__(value) if isinstance(value, str) else str(value)
     return result
 
 
@@ -6684,7 +6684,7 @@ def run_forager_matrix(
     cryptographically and semantically validated, while a gap, unknown file,
     altered hash, or changed execution identity fails closed.
     """
-    if isinstance(manifest, (str, Path)):
+    if type(manifest) is str or isinstance(manifest, Path):
         loaded = load_forager_matrix_manifest(manifest)
     elif isinstance(manifest, ForagerMatrixManifest):
         if manifest.source_path is not None and not isinstance(
