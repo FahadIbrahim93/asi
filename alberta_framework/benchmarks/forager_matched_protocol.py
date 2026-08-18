@@ -2738,7 +2738,7 @@ def _validate_cross_references(
 
 def parse_forager_matched_protocol(value: Any) -> ForagerMatchedProtocol:
     """Decode if needed, then validate and normalize a matched protocol."""
-    if isinstance(value, (bytes, str)):
+    if type(value) in (bytes, str):
         value = decode_strict_json(value)
     _validate_json_complexity(value)
     payload = _require_object(value, "protocol")
@@ -2884,9 +2884,9 @@ def parse_forager_matched_protocol(value: Any) -> ForagerMatchedProtocol:
 
 def parse_forager_matched_selection_result(value: Any) -> ForagerMatchedSelectionResult:
     """Validate a canonicalizable, reward-opaque open-tuning selection result."""
-    if isinstance(value, ForagerMatchedSelectionResult):
+    if type(value) is ForagerMatchedSelectionResult:
         value = value.to_dict()
-    if isinstance(value, (bytes, str)):
+    if type(value) in (bytes, str):
         value = decode_strict_json(value)
     _validate_json_complexity(value)
     path = "selection_result"
