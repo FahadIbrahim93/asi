@@ -163,7 +163,7 @@ def _world_model_update_result_extras_bytes(*, observation_dim: int, n_heads: in
     """
     extras_scalars = (
         2 * observation_dim
-        + 7 * n_heads
+        + 11 * n_heads
         + 7
         + 4
     )
