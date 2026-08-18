@@ -14,6 +14,15 @@ class StringSubclass(str):
     """Leftover string identity that must not cross the spec boundary."""
 
 
+class PathSubclass(type(Path())):
+    """Leftover concrete-path identity that must not cross the spec boundary."""
+
+
+class CallableObject:
+    def __call__(self, _value: object) -> object:
+        return _value
+
+
 def _load(_path: Path) -> dict[str, object]:
     return {"ok": True}
 
@@ -92,8 +101,12 @@ def test_evidence_spec_rejects_leftover_class_level_and_bool_identities() -> Non
 
 
 def test_evidence_spec_rejects_leftover_path_tuple_and_mapping_identities() -> None:
-    with pytest.raises(ValueError, match="relative_path must be a Path"):
+    with pytest.raises(ValueError, match="relative_path must be an exact platform Path"):
         _legal(relative_path="fixture.json")
+    with pytest.raises(ValueError, match="relative_path must be an exact platform Path"):
+        _legal(relative_path=PathSubclass("fixture.json"))
+    with pytest.raises(ValueError, match="must remain under the repository root"):
+        _legal(relative_path=Path("../fixture.json"))
     with pytest.raises(ValueError, match="command_argv must be a non-empty tuple"):
         _legal(command_argv=["python"])
     with pytest.raises(ValueError, match="limitations must be a non-empty tuple"):
@@ -102,9 +115,20 @@ def test_evidence_spec_rejects_leftover_path_tuple_and_mapping_identities() -> N
         _legal(source_paths=["fixture.py"])
     with pytest.raises(ValueError, match="protocol must be a non-empty dict"):
         _legal(protocol=True)
-    with pytest.raises(ValueError, match="seeds must be a non-empty dict"):
+    with pytest.raises(ValueError, match="seeds key must be a non-empty string"):
         _legal(seeds={True: 0})
-    with pytest.raises(ValueError, match="loader must be callable"):
+    with pytest.raises(ValueError, match="loader must be an exact function"):
         _legal(loader=None)
-    with pytest.raises(ValueError, match="validator must be callable"):
+    with pytest.raises(ValueError, match="loader must be an exact function"):
+        _legal(loader=CallableObject())
+    with pytest.raises(ValueError, match="validator must be an exact function"):
         _legal(validator="validate")
+
+
+def test_evidence_spec_preflights_sequence_and_mapping_counts() -> None:
+    with pytest.raises(ValueError, match="command_argv must be a non-empty tuple"):
+        _legal(command_argv=("x",) * 257)
+    with pytest.raises(ValueError, match="protocol must be a non-empty dict"):
+        _legal(protocol={f"key-{index}": index for index in range(257)})
+    with pytest.raises(ValueError, match="exceeds 65536 UTF-8 bytes"):
+        _legal(name="x" * 65_537)

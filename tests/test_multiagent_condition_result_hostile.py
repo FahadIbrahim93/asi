@@ -37,7 +37,7 @@ def _legal(**overrides: object) -> ConditionResult:
         "seed": 30,
         "condition": "frozen",
         "learning_mask": (False, False),
-        "online_rewards": np.zeros(4, dtype=np.float64),
+        "online_rewards": np.zeros(6, dtype=np.float64),
         "phase_mean_rewards": np.zeros(3, dtype=np.float64),
         "performance_matrix": np.zeros((3, 2), dtype=np.float64),
         "summary": _summary(),
@@ -84,6 +84,8 @@ def test_condition_result_rejects_leftover_condition_and_mask_identities() -> No
         _legal(learning_mask=(1, 0))
     with pytest.raises(ValueError, match="learning_mask must be a pair of booleans"):
         _legal(learning_mask=[False, False])
+    with pytest.raises(ValueError, match="must match the named"):
+        _legal(condition="joint_adaptive", learning_mask=(False, False))
 
 
 def test_condition_result_rejects_invalid_arrays_and_hosts() -> None:
@@ -91,9 +93,32 @@ def test_condition_result_rejects_invalid_arrays_and_hosts() -> None:
         _legal(online_rewards=[0.0, 0.0, 0.0, 0.0])
     with pytest.raises(ValueError, match="performance_matrix must be 2-dimensional"):
         _legal(performance_matrix=np.zeros(3, dtype=np.float64))
+    with pytest.raises(ValueError, match="phase_mean_rewards must have shape"):
+        _legal(phase_mean_rewards=np.zeros(4, dtype=np.float64))
+    with pytest.raises(ValueError, match="floating arrays must contain only finite"):
+        _legal(online_rewards=np.full(6, np.nan, dtype=np.float64))
+    with pytest.raises(ValueError, match="must reconstruct from online_rewards"):
+        _legal(phase_mean_rewards=np.ones(3, dtype=np.float64))
+    with pytest.raises(ValueError, match="must match recovery_lengths"):
+        _legal(recurrence_recovery_steps=0)
+    with pytest.raises(ValueError, match="must reconstruct from performance_matrix"):
+        _legal(
+            performance_matrix=np.asarray(((1.0, 0.0), (0.0, 0.0), (0.0, 0.0))),
+        )
     with pytest.raises(ValueError, match="summary must be a ContinualLearningSummary"):
         _legal(summary=None)
     with pytest.raises(ValueError, match="controller_budget must be a ControllerBudget"):
         _legal(controller_budget=None)
     with pytest.raises(ValueError, match="timing must be a TimingMetrics"):
         _legal(timing=None)
+
+
+def test_condition_result_owns_read_only_array_snapshots() -> None:
+    rewards = np.zeros(6, dtype=np.float64)
+    result = _legal(online_rewards=rewards)
+    rewards[0] = 1.0
+    assert result.online_rewards[0] == 0.0
+    assert not result.online_rewards.flags.writeable
+    assert not result.phase_mean_rewards.flags.writeable
+    assert not result.performance_matrix.flags.writeable
+    assert not result.recovery_lengths.flags.writeable
