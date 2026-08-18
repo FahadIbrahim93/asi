@@ -329,7 +329,7 @@ class GradualInputPairResult:
         ):
             raise ValueError("loss_sums must be finite and nonnegative")
         expected_persistent_bytes = (
-            config.parameter_count * 12
+            config.parameter_count * 16
             + 6 * 5 * 4
             + dataset_rows * (config.input_dim + 1) * 4
             + config.n_tasks * (config.input_dim + config.task_length) * 4

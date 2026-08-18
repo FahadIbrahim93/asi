@@ -748,7 +748,7 @@ def validate_gradual_input_development_report(
     if not _same(root["dataset"], expected_dataset):
         raise ValueError("dataset identity does not match supplied materialization")
     expected_persistent_numeric_bytes = (
-        plan.config.parameter_count * 12
+        plan.config.parameter_count * 16
         + 6 * 5 * 4
         + cast(int, expected_dataset["rows"]) * (plan.config.input_dim + 1) * 4
         + plan.config.n_tasks * (plan.config.input_dim + plan.config.task_length) * 4
