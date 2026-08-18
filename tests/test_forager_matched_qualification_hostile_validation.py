@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -83,3 +84,10 @@ def test_probe_invocation_rejects_invalid_inputs() -> None:
             expected_agent=inv.expected_agent,
             horizon=0,
         )
+
+
+@pytest.mark.parametrize("field", ["probe_sha256", "configuration_sha256", "entrypoint_sha256"])
+def test_probe_invocation_rejects_nonhex_sha256(field: str) -> None:
+    inv = _make_probe_invocation()
+    with pytest.raises(ForagerMatchedQualificationError, match=f"{field} must be"):
+        replace(inv, **{field: "z" * 64})

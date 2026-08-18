@@ -447,7 +447,7 @@ class DecisionFidelityReport:
         if not isinstance(self.config, DecisionFidelityConfig):
             raise ValueError("config must be a DecisionFidelityConfig")
         if not isinstance(self.seeds, tuple) or not all(
-            type(s) is int and 0 <= s < _INT32_MAX for s in self.seeds
+            type(s) is int and 0 <= s <= _INT32_MAX for s in self.seeds
         ):
             raise ValueError("seeds must be a tuple of non-negative int32 seeds")
         if not isinstance(self.seed_results, tuple) or not all(

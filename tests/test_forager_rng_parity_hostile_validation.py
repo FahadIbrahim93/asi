@@ -103,3 +103,16 @@ def test_environment_trace_digest_validation() -> None:
             transitions=[_make_transition_digest()],  # type: ignore[arg-type]
             trace_sha256="d" * 64,
         )
+
+    for invalid_digest in (None, False, 0):
+        with pytest.raises(ForagerRngParityError, match="trace.trace_sha256 must be a string"):
+            td = _make_tree_digest()
+            EnvironmentTraceDigest(
+                seed=42,
+                action_sequence_sha256="c" * 64,
+                reset_keys=_make_key_frame(),
+                reset_observation=td,
+                reset_state=td,
+                transitions=(_make_transition_digest(),),
+                trace_sha256=invalid_digest,  # type: ignore[arg-type]
+            )

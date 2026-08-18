@@ -147,8 +147,14 @@ class _OpenDirectory:
             raise ForagerMatchedSealError("path must be a Path")
         if type(self.descriptor) is not int or self.descriptor < 0:
             raise ForagerMatchedSealError("descriptor must be a non-negative int")
-        if type(self.inode_identity) is not tuple or len(self.inode_identity) != 3:
-            raise ForagerMatchedSealError("inode_identity must be a 3-element tuple")
+        if (
+            type(self.inode_identity) is not tuple
+            or len(self.inode_identity) != 3
+            or any(type(part) is not int or part < 0 for part in self.inode_identity)
+        ):
+            raise ForagerMatchedSealError(
+                "inode_identity must be a 3-element tuple of non-negative ints"
+            )
 
 
 def _plain(value: Any) -> Any:

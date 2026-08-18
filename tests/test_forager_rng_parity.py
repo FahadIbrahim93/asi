@@ -153,6 +153,11 @@ def test_matching_traces_produce_canonical_hash_only_result() -> None:
         result.payload_sha256
         == hashlib.sha256(parity.canonical_json_bytes(result.unsigned_dict())).hexdigest()
     )
+
+    for invalid_digest in (None, False, 0):
+        with pytest.raises(parity.ForagerRngParityError, match="payload_sha256 must be a string"):
+            replace(result, payload_sha256=invalid_digest)  # type: ignore[arg-type]
+
     assert payload["status"] == parity.MATCH_STATUS
     assert payload["evidence_boundary"] == parity.CONTENT_IDENTITY_BOUNDARY
     assert payload["promotion_authorized"] is False
@@ -166,6 +171,14 @@ def test_matching_traces_produce_canonical_hash_only_result() -> None:
     }
     assert "values" not in transition["reward"]
     assert parity.validate_parity_result(result.canonical_bytes) == result
+
+
+def test_collector_result_rejects_falsey_nonstring_payload_digest() -> None:
+    config = parity.FixedActionProbeConfig(seed=2_300_001, actions=(0, 3, 1, 2))
+    result = _collector_result("wrapper", config, _trace(config))
+    for invalid_digest in (None, False, 0):
+        with pytest.raises(parity.ForagerRngParityError, match="payload_sha256 must be a string"):
+            replace(result, payload_sha256=invalid_digest)  # type: ignore[arg-type]
 
 
 def test_live_orchestration_uses_distinct_collectors_and_detects_mismatch(

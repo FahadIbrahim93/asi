@@ -478,7 +478,7 @@ class IAAcceptanceEvidence:
     def __post_init__(self) -> None:
         if type(self.name) is not str or not self.name:
             raise ValueError("name must be a non-empty string")
-        if self.scope not in ("primary", "secondary"):
+        if type(self.scope) is not str or self.scope not in ("primary", "secondary"):
             raise ValueError("scope must be 'primary' or 'secondary'")
         if type(self.passed) is not bool:
             raise ValueError("passed must be a boolean")
