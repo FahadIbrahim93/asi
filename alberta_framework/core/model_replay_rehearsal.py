@@ -1252,17 +1252,19 @@ def load_model_replay_rehearsal_checkpoint(
 ) -> tuple[ModelReplayRehearsal, ModelReplayRehearsalState]:
     """Restore a v1 composer and fail closed on metadata or state mismatch."""
     metadata = load_checkpoint_metadata(path)
-    if metadata.get("schema") != MODEL_REPLAY_REHEARSAL_SCHEMA:
+    schema = metadata.get("schema")
+    if type(schema) is not str or schema != MODEL_REPLAY_REHEARSAL_SCHEMA:
         raise ValueError("checkpoint is not a ModelReplayRehearsal v1 checkpoint")
-    if metadata.get("mechanism_status") != MECHANISM_STATUS:
+    mechanism_status = metadata.get("mechanism_status")
+    if type(mechanism_status) is not str or mechanism_status != MECHANISM_STATUS:
         raise ValueError("checkpoint does not describe the model-only mechanism")
     if metadata.get("accepted_scientific_evidence") is not False:
         raise ValueError("checkpoint cannot claim accepted scientific evidence")
     config = metadata.get("composer_config")
-    if not isinstance(config, dict):
+    if type(config) is not dict:
         raise ValueError("checkpoint is missing composer_config")
     digest = metadata.get("config_sha256")
-    if not isinstance(digest, str) or digest != _config_digest(config):
+    if type(digest) is not str or digest != _config_digest(config):
         raise ValueError("model replay rehearsal config digest does not match")
     composer = ModelReplayRehearsal.from_config(config)
     if composer.to_config() != config:
@@ -1270,7 +1272,8 @@ def load_model_replay_rehearsal_checkpoint(
     key = jr.key(0) if template_key is None else template_key
     template = composer.init(key)
     expected_budget = composer.resource_budget(template).to_config()
-    if metadata.get("resource_budget") != expected_budget:
+    resource_budget = metadata.get("resource_budget")
+    if type(resource_budget) is not dict or resource_budget != expected_budget:
         raise ValueError("model replay rehearsal resource budget does not match config")
     restored, restored_metadata = load_checkpoint(template, path)
     if restored_metadata != metadata:
