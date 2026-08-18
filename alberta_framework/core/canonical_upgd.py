@@ -1192,11 +1192,10 @@ def _require_exact_str_strict(name: object, value: object) -> str:
 def _require_exact_identity(value: Any, path: object, expected: str) -> str:
     host_path = _require_exact_str_strict("path", path)
     host_expected = _require_exact_str_strict("expected", expected)
-    host_value = _require_exact_str_strict("value", value)
+    host_value = _require_exact_str_strict(host_path, value)
     if host_value != host_expected:
         raise ValueError(f"{host_path} must equal the canonical identity '{host_expected}'")
     return host_value
-    return value
 
 
 def _require_exact_parity(value: Any, path: str, expected: bool) -> bool:
