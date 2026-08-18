@@ -306,12 +306,27 @@ def test_matched_validator_requires_all_arms_and_axes() -> None:
     with pytest.raises(ValueError, match="observations and updates"):
         validate_matched_l2er_development_results(mismatched)
 
+    class HostileMeta(type):
+        calls = 0
+
+        def __hash__(cls) -> int:
+            cls.calls += 1
+            raise AssertionError("runtime type must not be hashed")
+
+    class HostileContainer(metaclass=HostileMeta):
+        def __len__(self) -> int:
+            raise AssertionError("hostile length must not run")
+
+    with pytest.raises(ValueError, match="exactly four"):
+        validate_matched_l2er_development_results(HostileContainer())
+    assert HostileMeta.calls == 0
+
 
 def test_protocol_pins_sources_and_records_material_differences() -> None:
     assert L2ER_PROTOCOL["paper_revision"] == "arXiv:2509.22335v3"
     assert L2ER_PROTOCOL["official_commit"] == "52ae3eb0702a9e6923f252c1f7cb29340eb5b3d5"
     differences = L2ER_PROTOCOL["protocol_differences"]
     assert isinstance(differences, tuple)
-    assert len(differences) == 7
+    assert len(differences) == 8
     assert L2ER_PROTOCOL["development_only"] is True
     assert L2ER_PROTOCOL["scientific_promotion_allowed"] is False
