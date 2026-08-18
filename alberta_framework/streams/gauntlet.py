@@ -1247,8 +1247,10 @@ def early_window_mse(
         raise ValueError("segment must be a non-negative integer")
     if type(segment_length) is not int or segment_length < 1:
         raise ValueError("segment_length must be a positive integer")
-    if type(window) is not int or window < 1 or window > segment_length:
-        raise ValueError(f"window must be an integer in [1, {segment_length}], got {window!r}")
+    if type(window) is not int:
+        raise ValueError("window must be an integer")
+    if not 1 <= window <= segment_length:
+        raise ValueError(f"window must be an integer in [1, {segment_length}]")
     seg = segment_slice(sq_errors, segment, segment_length)
     return jnp.mean(seg[..., :window], axis=-1)
 
