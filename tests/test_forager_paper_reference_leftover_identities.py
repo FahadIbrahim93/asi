@@ -177,6 +177,12 @@ def test_forager_run_result_keeps_integer_json() -> None:
     assert '"privileged": false' in dumped
 
 
+def test_forager_run_result_preserves_zero_based_historical_curve_grid() -> None:
+    result = _legal_run_result(curve_steps=(0, 10), curve_window_reward=())
+    assert result.curve_steps == (0, 10)
+    assert result.curve_window_reward == ()
+
+
 def test_run_result_rejects_hostile_scalar_subclasses_before_hooks() -> None:
     calls = 0
 
@@ -203,6 +209,7 @@ def test_run_result_rejects_hostile_scalar_subclasses_before_hooks() -> None:
     "overrides",
     [
         {"curve_steps": ()},
+        {"curve_steps": (-1, 10)},
         {"curve_steps": (1, 1)},
         {"curve_steps": (1, 11)},
         {"curve_ewm_reward": (0.1,)},
