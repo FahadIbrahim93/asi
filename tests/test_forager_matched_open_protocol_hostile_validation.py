@@ -21,6 +21,18 @@ def _digest(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
 
 
+class _HostileString(str):
+    calls = 0
+
+    def __hash__(self) -> int:
+        type(self).calls += 1
+        raise AssertionError("hostile string hashing executed")
+
+    def __eq__(self, other: object) -> bool:
+        type(self).calls += 1
+        raise AssertionError("hostile string equality executed")
+
+
 def test_runtime_qualification_valid_construction() -> None:
     qual = MatchedCurrentRuntimeQualification(
         image_sha256=_digest(b"image"),
@@ -61,6 +73,19 @@ def test_runtime_qualification_rejects_invalid_inputs() -> None:
             executor_qualification_receipt_sha256=_digest(b"executor"),
             qualification_trust_anchor_identity="",
         )
+
+
+def test_runtime_qualification_rejects_digest_subclass_without_dispatch() -> None:
+    hostile = _HostileString(_digest(b"image"))
+    _HostileString.calls = 0
+    with pytest.raises(ForagerMatchedOpenProtocolBuildError, match="SHA-256"):
+        MatchedCurrentRuntimeQualification(
+            image_sha256=hostile,
+            runtime_profile_sha256=_digest(b"profile"),
+            executor_qualification_receipt_sha256=_digest(b"executor"),
+            qualification_trust_anchor_identity="anchor_id",
+        )
+    assert _HostileString.calls == 0
 
 
 def test_candidate_qualification_rejects_invalid_types() -> None:
