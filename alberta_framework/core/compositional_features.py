@@ -163,10 +163,12 @@ def _compositional_update_working_set_bytes(
         candidate_count,
         generator_resource_contexts,
     )
+    # JIT materializes the source and proposed state's Python birth/uptime
+    # fields as two float32 scalars each.  The remaining bytes are
     # predictions/errors, metrics, two slot ids, applied flag, plus the
     # published curation-trace banks that ride with one update result.
     result_extras = (
-        227 + 31 * n_features + 8 * n_tasks + 32 * candidate_count
+        243 + 31 * n_features + 8 * n_tasks + 32 * candidate_count
     )
     return 2 * persist_bytes + result_extras
 

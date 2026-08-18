@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import jax
 import jax.numpy as jnp
 import jax.random as jr
 import pytest
+from jax import Array
 
-from alberta_framework.core.compositional_features import CompositionalFeatureLearner
+from alberta_framework.core.compositional_features import (
+    CompositionalFeatureLearner,
+    _compositional_update_working_set_bytes,
+)
 
 _INT32_MAX = 2**31 - 1
 _INT32_MIN = -(2**31)
@@ -38,10 +43,18 @@ def _update_working_set_bytes(
     candidate_count: int = 0,
     generator_resource_contexts: int = 1,
 ) -> int:
-    extras = 227 + 31 * n_features + 8 * n_tasks + 32 * candidate_count
+    extras = 243 + 31 * n_features + 8 * n_tasks + 32 * candidate_count
     return 2 * _persist_bytes(
         n_features, n_tasks, candidate_count, generator_resource_contexts
     ) + extras
+
+
+def _tree_array_nbytes(tree: object) -> int:
+    return sum(
+        leaf.size * leaf.dtype.itemsize
+        for leaf in jax.tree.leaves(tree)
+        if isinstance(leaf, Array)
+    )
 
 
 def test_int32_wrap_forges_a_different_published_byte_identity() -> None:
@@ -59,6 +72,8 @@ def test_compositional_persist_fits_while_update_working_set_does_not() -> None:
     assert persist <= _INT32_MAX
     assert _update_working_set_bytes(_FIRST_WORKING_SET_OVERFLOW - 1) <= _INT32_MAX
     assert working > _INT32_MAX
+    assert _update_working_set_bytes(_FIRST_WORKING_SET_OVERFLOW - 1) == 2_147_483_638
+    assert working == 2_147_483_805
     learner = CompositionalFeatureLearner(_FIRST_WORKING_SET_OVERFLOW, 1)
     with pytest.raises(ValueError, match="update working set byte count"):
         learner.init(1, jr.key(0))
@@ -86,3 +101,47 @@ def test_legal_compositional_init_and_update_identity_is_unchanged() -> None:
     assert result.predictions.shape == (1,)
     assert _persist_bytes(4) <= _INT32_MAX
     assert _update_working_set_bytes(4) <= _INT32_MAX
+
+
+@pytest.mark.parametrize(
+    ("n_features", "n_tasks", "candidate_count", "resource_contexts", "feature_dim"),
+    [(4, 1, 0, 1, 1), (7, 3, 2, 4, 2)],
+)
+def test_update_working_set_formula_matches_every_returned_array(
+    n_features: int,
+    n_tasks: int,
+    candidate_count: int,
+    resource_contexts: int,
+    feature_dim: int,
+) -> None:
+    learner = CompositionalFeatureLearner(
+        n_features,
+        n_tasks,
+        candidate_count=candidate_count,
+        generator_resource_contexts=resource_contexts,
+    )
+    state = learner.init(feature_dim, jr.key(0))
+    first_result = learner.update(
+        state,
+        jnp.zeros((feature_dim,), dtype=jnp.float32),
+        jnp.zeros((n_tasks,), dtype=jnp.float32),
+    )
+    source_state = first_result.state
+    result = learner.update(
+        source_state,
+        jnp.zeros((feature_dim,), dtype=jnp.float32),
+        jnp.zeros((n_tasks,), dtype=jnp.float32),
+    )
+    expected = _update_working_set_bytes(
+        n_features,
+        n_tasks,
+        candidate_count,
+        resource_contexts,
+    )
+    assert expected == _compositional_update_working_set_bytes(
+        n_features,
+        n_tasks,
+        candidate_count,
+        resource_contexts,
+    )
+    assert expected == _tree_array_nbytes(source_state) + _tree_array_nbytes(result)
