@@ -1174,6 +1174,9 @@ def test_mocked_screen_preserves_initial_diagnostics_rescores_and_validates_comm
 
 
 def test_probe_exact_int_rejects_bool_and_non_int_aliases() -> None:
+    class IntSubclass(int):
+        pass
+
     assert probe._is_exact_int(1)
     assert probe._is_exact_int(0)
     assert not probe._is_exact_int(True)
@@ -1181,6 +1184,20 @@ def test_probe_exact_int_rejects_bool_and_non_int_aliases() -> None:
     assert not probe._is_exact_int(1.0)
     assert not probe._is_exact_int("1")
     assert not probe._is_exact_int(None)
+    assert not probe._is_exact_int(IntSubclass(1))
+
+
+def test_probe_relative_path_rejects_string_subclass_without_hooks() -> None:
+    class HostileString(str):
+        calls = 0
+
+        def __bool__(self) -> bool:
+            type(self).calls += 1
+            raise AssertionError("hostile string hook dispatched")
+
+    with pytest.raises(RuntimeError, match="must be a non-empty relative path"):
+        probe._relative_path(HostileString("config.json"), "path")
+    assert HostileString.calls == 0
 
 
 def test_probe_task_intake_accepts_exact_int_horizon_and_seeds() -> None:
