@@ -44,6 +44,18 @@ _INT32_MAX = 2**31 - 1
 _MAX_ARRAY_ELEMENTS = 1_000_000
 _MAX_RESOURCE_BYTES = 256 * 1024 * 1024
 _MAX_RUN_STEPS = 1_000_000
+_NUMPY_INTEGER_TYPES = (
+    np.int8,
+    np.int16,
+    np.int32,
+    np.int64,
+    np.longlong,
+    np.uint8,
+    np.uint16,
+    np.uint32,
+    np.uint64,
+    np.ulonglong,
+)
 
 GRADUAL_IPMNIST_PROTOCOL = MappingProxyType(
     {
@@ -69,7 +81,7 @@ GRADUAL_IPMNIST_PROTOCOL = MappingProxyType(
 
 
 def _exact_index(name: str, value: object, *, minimum: int) -> int:
-    if type(value) is not int and not isinstance(value, np.integer):
+    if type(value) is not int and type(value) not in _NUMPY_INTEGER_TYPES:
         raise ValueError(f"{name} must be an integer")
     try:
         resolved = operator.index(cast(SupportsIndex, value))
@@ -93,9 +105,10 @@ def _alpha(value: object) -> float:
 class GradualTransitionConfig:
     """One prospectively selectable transition rule.
 
-    ``transition_steps`` counts update opportunities from the old task at
-    alpha zero to the new task at alpha one.  Abrupt mode requires one step
-    and is the mechanism-off reduction.
+    ``transition_steps`` counts interpolation intervals.  A width ``k`` uses
+    coefficients ``0/k, 1/k, ..., k/k`` across ``k + 1`` update
+    opportunities; the last is exactly the ordinary new-task example.
+    Abrupt mode requires one step and is the mechanism-off reduction.
     """
 
     mode: TransitionMode
@@ -112,10 +125,15 @@ class GradualTransitionConfig:
 
 def transition_alpha(step: int, config: GradualTransitionConfig) -> float:
     """Return a deterministic uniform interpolation coefficient."""
+    if type(config) is not GradualTransitionConfig:
+        raise ValueError("config must be an exact GradualTransitionConfig")
+    checked = GradualTransitionConfig(
+        mode=config.mode, transition_steps=config.transition_steps
+    )
     resolved_step = _exact_index("step", step, minimum=0)
-    if config.mode == "abrupt":
+    if checked.mode == "abrupt":
         return 1.0
-    return min(resolved_step / config.transition_steps, 1.0)
+    return min(resolved_step / checked.transition_steps, 1.0)
 
 
 def input_interpolation_transaction(
@@ -282,10 +300,6 @@ def run_gradual_input_pair(
     checked_config = IPMNISTConfig(**config.to_config())
     if checked_config.n_steps > _MAX_RUN_STEPS:
         raise ValueError("run horizon exceeds the 1000000-step ceiling")
-    # AdamW retains parameters plus first/second moments.  Reject the exact
-    # derived lower bound before initialization can allocate any device array.
-    if checked_config.parameter_count * 12 > _MAX_RESOURCE_BYTES:
-        raise ValueError("learner persistent numeric allocation exceeds 256 MiB")
     width = _exact_index("transition_steps", transition_steps, minimum=1)
     if width >= checked_config.task_length:
         raise ValueError("transition_steps must be smaller than task_length")
@@ -294,7 +308,7 @@ def run_gradual_input_pair(
         actual_type = type(value)
         if not (
             actual_type is np.ndarray
-            or issubclass(actual_type, (jax.Array, jax.core.Tracer))
+            or issubclass(actual_type, jax.Array)
         ):
             raise ValueError(f"{name} must be an exact NumPy or JAX array")
     raw_x = cast(np.ndarray | Array, data_x)
@@ -310,8 +324,18 @@ def run_gradual_input_pair(
     schedule_elements = checked_config.n_tasks * (
         checked_config.input_dim + checked_config.task_length
     )
-    if schedule_elements > _MAX_RESOURCE_BYTES // 4:
-        raise ValueError("IPMNIST schedule exceeds 256 MiB")
+    # AdamW retains parameters plus first/second moments and one int32 count
+    # for each of the six parameter leaves.  Dataset and full evaluator
+    # schedule remain resident for the complete run.  Gate their exact sum
+    # before any protocol materialization or device initialization.
+    aggregate_persistent_bytes = (
+        checked_config.parameter_count * 12
+        + 6 * 4
+        + dataset_elements * 4
+        + schedule_elements * 4
+    )
+    if aggregate_persistent_bytes > _MAX_RESOURCE_BYTES:
+        raise ValueError("aggregate persistent numeric allocation exceeds 256 MiB")
     resolved_x, resolved_y = validated_ipmnist_data(
         cast(np.ndarray | Array, data_x),
         cast(np.ndarray | Array, data_y),

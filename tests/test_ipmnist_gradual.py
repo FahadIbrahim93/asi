@@ -49,6 +49,32 @@ def test_transition_alpha_is_deterministic_and_clamped() -> None:
     assert [transition_alpha(step, config) for step in range(6)] == [0.0, 0.25, 0.5, 0.75, 1.0, 1.0]
 
 
+def test_transition_width_counts_intervals_including_both_endpoints() -> None:
+    config = GradualTransitionConfig(mode="input_interpolation", transition_steps=2)
+    assert [transition_alpha(step, config) for step in range(4)] == [0.0, 0.5, 1.0, 1.0]
+
+
+def test_transition_config_rejects_forged_and_hostile_values_without_index_hooks() -> None:
+    config = GradualTransitionConfig(mode="input_interpolation", transition_steps=2)
+    object.__setattr__(config, "transition_steps", 0)
+    with pytest.raises(ValueError, match="transition_steps"):
+        transition_alpha(0, config)
+
+    class HostileInt(np.int64):
+        calls = 0
+
+        def __index__(self) -> int:
+            self.calls += 1
+            raise AssertionError("must not execute")
+
+    hostile = HostileInt(2)
+    with pytest.raises(ValueError, match="integer"):
+        GradualTransitionConfig(
+            mode="input_interpolation", transition_steps=hostile  # type: ignore[arg-type]
+        )
+    assert hostile.calls == 0
+
+
 def test_task_sampling_mask_is_matched_deterministic_and_monotone() -> None:
     first = task_sampling_mask(seed=7, transition_id=3, count=10, alpha=0.3)
     second = task_sampling_mask(seed=7, transition_id=3, count=10, alpha=0.3)
@@ -182,7 +208,7 @@ def test_gradual_pair_preflights_parameter_allocation_before_initialization() ->
         hidden2=2,
         n_classes=2,
     )
-    with pytest.raises(ValueError, match="persistent numeric allocation"):
+    with pytest.raises(ValueError, match="aggregate persistent numeric allocation"):
         run_gradual_input_pair(
             np.zeros((2, 100_000), dtype=np.float32),
             np.zeros(2, dtype=np.int32),
