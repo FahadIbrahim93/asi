@@ -102,8 +102,7 @@ def _require_environment_shape(
     ):
         raise ValueError("environment_kind must be switching_two_state or riverswim")
     if (
-        isinstance(observation_dim, bool)
-        or not isinstance(observation_dim, int)
+        type(observation_dim) is not int
         or observation_dim < 2
     ):
         raise ValueError("observation_dim must be an integer of at least two")
@@ -114,7 +113,7 @@ def _require_environment_shape(
             "RiverSwim controls require observation_dim <= "
             f"{_RIVERSWIM_REFERENCE_MAX_STATES}"
         )
-    if isinstance(n_actions, bool) or not isinstance(n_actions, int) or n_actions != 2:
+    if type(n_actions) is not int or n_actions != 2:
         raise ValueError("selected reference controls require exactly two actions")
 
 
@@ -235,8 +234,7 @@ def _canonical_switching_environment(
         raise ValueError("switching environment config has the wrong type")
     phase_length = config.phase_length
     if (
-        isinstance(phase_length, bool)
-        or not isinstance(phase_length, int)
+        type(phase_length) is not int
         or phase_length <= 0
         or phase_length > REFERENCE_CONTROL_MAX_ACCEPTED_EVENTS
     ):
@@ -265,8 +263,7 @@ def _canonical_riverswim_environment(
         raise ValueError("RiverSwim environment config has the wrong type")
     n_states = config.n_states
     if (
-        isinstance(n_states, bool)
-        or not isinstance(n_states, int)
+        type(n_states) is not int
         or n_states < 2
         or n_states > _RIVERSWIM_REFERENCE_MAX_STATES
     ):
@@ -276,8 +273,7 @@ def _canonical_riverswim_environment(
         )
     initial_state = config.initial_state
     if (
-        isinstance(initial_state, bool)
-        or not isinstance(initial_state, int)
+        type(initial_state) is not int
         or initial_state < 0
         or initial_state >= n_states
     ):
@@ -928,8 +924,7 @@ class ReferenceLifeControlState:
         ):
             raise ValueError("control state lifecycle_id must be a safe identifier")
         if (
-            isinstance(self.decision_index, bool)
-            or not isinstance(self.decision_index, int)
+            type(self.decision_index) is not int
             or self.decision_index < 0
             or self.decision_index > MAX_DECISION_INDEX
         ):
