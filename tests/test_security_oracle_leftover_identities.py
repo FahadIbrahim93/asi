@@ -140,3 +140,39 @@ def test_oracle_validator_rejects_hostile_outer_container_without_hooks() -> Non
         validate_security_oracle_experience(
             _HostileRecords([_legal()]), SecurityFeatureSchema(names=("risk",))
         )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "error"),
+    (
+        ("action", True, "action"),
+        ("reward", float("nan"), "reward"),
+        ("schema", "not-the-v1-schema", "schema"),
+        ("state", [0.5], "state"),
+    ),
+)
+def test_oracle_public_consumers_revalidate_forged_frozen_fields(
+    field: str, value: object, error: str
+) -> None:
+    record = _legal()
+    object.__setattr__(record, field, value)
+
+    with pytest.raises(ValueError, match=error):
+        record.to_dict()
+    with pytest.raises(ValueError, match=error):
+        validate_security_oracle_experience(
+            [record], SecurityFeatureSchema(names=("risk",))
+        )
+
+
+def test_oracle_public_consumers_revalidate_forged_label_binding() -> None:
+    record = _legal(action=SecurityAction.BLOCK)
+    object.__setattr__(record, "policy_metadata", {"is_malicious": True})
+    object.__setattr__(record, "outcome", {"label": "false_negative"})
+
+    with pytest.raises(ValueError, match="does not match action metadata"):
+        record.to_dict()
+    with pytest.raises(ValueError, match="does not match action metadata"):
+        validate_security_oracle_experience(
+            [record], SecurityFeatureSchema(names=("risk",))
+        )
