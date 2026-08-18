@@ -7,6 +7,7 @@ import pytest
 
 from alberta_framework.evaluation.continual_multiagent import (
     ConditionResult,
+    ContinualMultiAgentConfig,
     ControllerBudget,
     TimingMetrics,
     aggregate_evidence,
@@ -137,8 +138,17 @@ def test_aggregate_binds_stability_summary_to_live_reference() -> None:
         _legal(condition="learner_only", learning_mask=(True, False)),
         _legal(condition="joint_adaptive", learning_mask=(True, True)),
     )
-    with pytest.raises(ValueError, match="stability reference"):
-        aggregate_evidence(results, bootstrap_resamples=2)
+    with pytest.raises(ValueError, match="primitive arrays and config"):
+        aggregate_evidence(
+            results,
+            config=ContinualMultiAgentConfig(
+                phase_steps=2,
+                probe_horizon=2,
+                probe_tail_steps=2,
+                recovery_window=1,
+            ),
+            bootstrap_resamples=2,
+        )
 
 
 def test_condition_result_owns_read_only_array_snapshots() -> None:
@@ -150,3 +160,19 @@ def test_condition_result_owns_read_only_array_snapshots() -> None:
     assert not result.phase_mean_rewards.flags.writeable
     assert not result.performance_matrix.flags.writeable
     assert not result.recovery_lengths.flags.writeable
+
+
+def test_aggregation_revalidates_records_at_consumption() -> None:
+    result = _legal()
+    object.__setattr__(result, "recurrence_recovery_steps", 0)
+
+    with pytest.raises(ValueError, match="must match recovery_lengths"):
+        aggregate_evidence(
+            [result],
+            config=ContinualMultiAgentConfig(
+                phase_steps=2,
+                probe_horizon=2,
+                probe_tail_steps=2,
+                recovery_window=1,
+            ),
+        )
