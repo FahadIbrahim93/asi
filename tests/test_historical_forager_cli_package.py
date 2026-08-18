@@ -49,6 +49,7 @@ _EXPECTED_SCRIPT_NAMES = {
     "asi-ipmnist-campaign",
     "asi-ipmnist-ceiling",
     "asi-l2er-matched-development",
+    "asi-nap-ipmnist",
     "asi-native-supervised-catalog",
     "asi-plasticity-diagnostic",
     "asi-reference-life-scorecard",
