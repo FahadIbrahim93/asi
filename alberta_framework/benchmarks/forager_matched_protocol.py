@@ -1099,7 +1099,7 @@ def _validate_json_complexity(value: Any) -> None:
             pending.extend((child, depth + 1) for child in item.values())
         elif isinstance(item, list):
             pending.extend((child, depth + 1) for child in item)
-        elif isinstance(item, str):
+        elif type(item) is str:
             try:
                 item.encode("utf-8")
             except UnicodeEncodeError as exc:
@@ -1117,17 +1117,21 @@ def _validate_json_complexity(value: Any) -> None:
 
 def decode_strict_json(data: bytes | str) -> Any:
     """Decode duplicate-free finite UTF-8 JSON with bounded complexity."""
+    if type(data) not in (bytes, str):
+        raise ForagerMatchedProtocolError("protocol must be exact bytes or string JSON")
     try:
-        if isinstance(data, bytes):
-            if len(data) > _MAX_MANIFEST_BYTES:
+        if type(data) is bytes:
+            raw_bytes = cast(bytes, data)
+            if len(raw_bytes) > _MAX_MANIFEST_BYTES:
                 raise ForagerMatchedProtocolError("protocol exceeds the file-size limit")
-            text = data.decode("utf-8")
+            text = raw_bytes.decode("utf-8")
         else:
-            if len(data) > _MAX_MANIFEST_BYTES:
+            raw_text = cast(str, data)
+            if len(raw_text) > _MAX_MANIFEST_BYTES:
                 raise ForagerMatchedProtocolError("protocol exceeds the file-size limit")
-            if len(data.encode("utf-8")) > _MAX_MANIFEST_BYTES:
+            if len(raw_text.encode("utf-8")) > _MAX_MANIFEST_BYTES:
                 raise ForagerMatchedProtocolError("protocol exceeds the file-size limit")
-            text = data
+            text = raw_text
         decoded = json.loads(
             text,
             object_pairs_hook=_duplicate_free_object,

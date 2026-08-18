@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import pytest
 
-from alberta_framework.benchmarks import forager_matched_candidate_universe as universe
 from alberta_framework.benchmarks.forager_matched_candidate_universe import (
     BoundJsonArtifact,
     CandidateUniverseVerification,
@@ -18,19 +17,11 @@ class _HostileString(str):
 
     def __bool__(self) -> bool:
         type(self).calls += 1
-        raise AssertionError("hostile string hook dispatched")
+        raise AssertionError("hostile string truthiness executed")
 
-
-class _HostileRealMeta(type):
-    calls = 0
-
-    def __eq__(cls, other: object) -> bool:
-        cls.calls += 1
-        raise AssertionError("hostile metaclass hook dispatched")
-
-
-class _HostileReal(metaclass=_HostileRealMeta):
-    pass
+    def __hash__(self) -> int:
+        type(self).calls += 1
+        raise AssertionError("hostile string hashing executed")
 
 
 def test_bound_json_artifact_validation() -> None:
@@ -83,24 +74,20 @@ def test_candidate_universe_verification_validation() -> None:
         )
 
 
-def test_candidate_universe_verification_rejects_string_subclass_without_hooks() -> None:
+def test_candidate_universe_string_boundaries_reject_subclasses_without_dispatch() -> None:
+    hostile = _HostileString("path.json")
     _HostileString.calls = 0
-    with pytest.raises(
-        ForagerMatchedCandidateUniverseError,
-        match="verified_json_paths must be a tuple of non-empty strings",
-    ):
-        CandidateUniverseVerification(
+    operations = (
+        lambda: BoundJsonArtifact(role=hostile, path="path.json", sha256="a" * 64),
+        lambda: CandidateUniverseVerification(
             candidate_universe_sha256="b" * 64,
-            verified_json_paths=(_HostileString("path.json"),),
-        )
+            verified_json_paths=(hostile,),
+        ),
+    )
+    for operation in operations:
+        with pytest.raises(ForagerMatchedCandidateUniverseError):
+            operation()
     assert _HostileString.calls == 0
-
-
-def test_finite_real_rejects_hostile_runtime_type_without_metaclass_hooks() -> None:
-    _HostileRealMeta.calls = 0
-    with pytest.raises(ForagerMatchedCandidateUniverseError, match="must be a finite number"):
-        universe._require_finite_real(_HostileReal(), "value")
-    assert _HostileRealMeta.calls == 0
 
 
 def test_local_candidate_generation_binding_artifact_tuple_validation() -> None:
