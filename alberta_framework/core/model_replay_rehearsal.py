@@ -77,7 +77,6 @@ MODEL_REPLAY_REHEARSAL_SCHEMA = "alberta.model_replay_rehearsal.v1"
 MECHANISM_STATUS = "model-only-replay-mechanism-no-scientific-claim"
 _INT32_MAX = 2_147_483_647
 _UINT32_MAX = 4_294_967_295
-_MAX_EXACT_FLOAT32_INTEGER = 16_777_216
 _COMPOSER_ACCOUNTING_BYTES = 7 * 4
 _ACTUAL_INT_TYPES: tuple[type, ...] = (
     int,
@@ -201,8 +200,6 @@ class ModelReplayRehearsalConfig:
             raise ValueError("action_encoding must be 'scalar_index' or 'one_hot'")
         if self.ensemble.model.observation_dim != self.replay.observation_dim:
             raise ValueError("ensemble and replay observation dimensions must match")
-        if self.ensemble.model.n_actions > _MAX_EXACT_FLOAT32_INTEGER:
-            raise ValueError("n_actions exceeds exact float32 action-index storage")
         _require_int(
             "ensemble.model.n_actions",
             self.ensemble.model.n_actions,
