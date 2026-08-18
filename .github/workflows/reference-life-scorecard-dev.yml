@@ -2,67 +2,86 @@ name: reference-life development scorecard
 
 on:
   workflow_dispatch:
+    inputs:
+      launch_sha:
+        description: Exact 40-character main commit authorized for this development run
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: reference-life-development-scorecard
+  group: reference-life-development-scorecard-${{ inputs.launch_sha }}
   cancel-in-progress: false
 
 jobs:
   shards:
-    name: seed ${{ matrix.seed }}
+    name: ${{ matrix.environment }} / ${{ matrix.arm }} / ${{ matrix.seed }}
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
-        seed:
-          - 70000
-          - 70001
-          - 70002
-          - 70003
-          - 70004
-          - 70005
-          - 70006
-          - 70007
-          - 70008
-          - 70009
-          - 70010
-          - 70011
+        seed: [70000, 70001, 70002, 70003, 70004, 70005, 70006, 70007, 70008, 70009, 70010, 70011]
+        environment: [switching_two_state, riverswim]
+        arm: [prototype, prototype_frozen, random, privileged_oracle, differential_sarsa, sarsa]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.launch_sha }}
 
-      - name: Set up locked Python 3.12
+      - name: Verify exact authorized source before setup
+        shell: bash
+        env:
+          LAUNCH_SHA: ${{ inputs.launch_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$LAUNCH_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$GITHUB_SHA" = "$LAUNCH_SHA"
+          test "$(git rev-parse HEAD)" = "$LAUNCH_SHA"
+          test -z "$(git status --short)"
+
+      - name: Set up locked Python 3.12.12
         uses: ./.github/actions/setup-locked-python
         with:
-          python-version: "3.12"
+          python-version: "3.12.12"
           extras: --extra dev
 
-      - name: Run twelve fresh-process shards
+      - name: Verify and export runtime tools
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p scorecard/shards
-          for environment in switching_two_state riverswim; do
-            for arm in prototype prototype_frozen random privileged_oracle differential_sarsa sarsa; do
-              output="scorecard/shards/${environment}__${arm}__${{ matrix.seed }}.json"
-              uv run --no-sync python -m alberta_framework.benchmarks.reference_life_scorecard \
-                run-shard \
-                --environment "$environment" \
-                --arm "$arm" \
-                --seed "${{ matrix.seed }}" \
-                --output "$output"
-              uv run --no-sync python -m alberta_framework.benchmarks.reference_life_scorecard \
-                validate "$output"
-            done
-          done
+          python_path="$(realpath "$(command -v python)")"
+          uv_path="$(realpath "$(command -v uv)")"
+          test -x "$python_path"
+          test -x "$uv_path"
+          test "$("$python_path" -c 'import platform; print(platform.python_version())')" = "3.12.12"
+          uv_version="$("$uv_path" --version | sed -E 's/^uv ([0-9]+\.[0-9]+\.[0-9]+).*/\1/')"
+          test "$uv_version" = "0.9.24"
+          printf 'PYTHON_PATH=%s\nUV_PATH=%s\n' "$python_path" "$uv_path" >> "$GITHUB_ENV"
 
-      - name: Upload immutable shard records
+      - name: Run and validate one fresh-process shard
+        shell: bash
+        env:
+          ENVIRONMENT: ${{ matrix.environment }}
+          ARM: ${{ matrix.arm }}
+          SEED: ${{ matrix.seed }}
+        run: |
+          set -euo pipefail
+          mkdir -p scorecard/shards
+          output="scorecard/shards/${ENVIRONMENT}__${ARM}__${SEED}.json"
+          "$UV_PATH" run --no-sync "$PYTHON_PATH" \
+            -m alberta_framework.benchmarks.reference_life_scorecard \
+            run-shard --environment "$ENVIRONMENT" --arm "$ARM" --seed "$SEED" \
+            --output "$output"
+          "$UV_PATH" run --no-sync "$PYTHON_PATH" \
+            -m alberta_framework.benchmarks.reference_life_scorecard validate "$output"
+
+      - name: Upload immutable shard record
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: reference-life-shards-${{ matrix.seed }}
+          name: reference-life-shard-${{ inputs.launch_sha }}-${{ github.run_id }}-${{ matrix.environment }}-${{ matrix.arm }}-${{ matrix.seed }}
           path: scorecard/shards/*.json
           if-no-files-found: error
           retention-days: 90
@@ -74,40 +93,145 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.launch_sha }}
 
-      - name: Set up locked Python 3.12
+      - name: Verify exact authorized source before setup
+        shell: bash
+        env:
+          LAUNCH_SHA: ${{ inputs.launch_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$LAUNCH_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$GITHUB_SHA" = "$LAUNCH_SHA"
+          test "$(git rev-parse HEAD)" = "$LAUNCH_SHA"
+          test -z "$(git status --short)"
+
+      - name: Set up locked Python 3.12.12
         uses: ./.github/actions/setup-locked-python
         with:
-          python-version: "3.12"
+          python-version: "3.12.12"
           extras: --extra dev
 
-      - name: Download all shard records
+      - name: Verify and export runtime tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          python_path="$(realpath "$(command -v python)")"
+          uv_path="$(realpath "$(command -v uv)")"
+          test -x "$python_path"
+          test -x "$uv_path"
+          test "$("$python_path" -c 'import platform; print(platform.python_version())')" = "3.12.12"
+          uv_version="$("$uv_path" --version | sed -E 's/^uv ([0-9]+\.[0-9]+\.[0-9]+).*/\1/')"
+          test "$uv_version" = "0.9.24"
+          printf 'PYTHON_PATH=%s\nUV_PATH=%s\n' "$python_path" "$uv_path" >> "$GITHUB_ENV"
+
+      - name: Download all source-bound shard records
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          pattern: reference-life-shards-*
+          pattern: reference-life-shard-${{ inputs.launch_sha }}-${{ github.run_id }}-*
           path: scorecard/shards
           merge-multiple: true
 
-      - name: Build and strictly validate the aggregate
+      - name: Build, strictly validate, and receipt the aggregate
         shell: bash
+        env:
+          LAUNCH_SHA: ${{ inputs.launch_sha }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
           set -euo pipefail
           count=$(find scorecard/shards -maxdepth 1 -type f -name '*.json' | wc -l | tr -d ' ')
           test "$count" = 144
-          uv run --no-sync python -m alberta_framework.benchmarks.reference_life_scorecard \
+          "$UV_PATH" run --no-sync "$PYTHON_PATH" \
+            -m alberta_framework.benchmarks.reference_life_scorecard \
             plan --output scorecard/plan.json
-          uv run --no-sync python -m alberta_framework.benchmarks.reference_life_scorecard \
-            summarize \
-            --plan scorecard/plan.json \
-            --output scorecard/artifact.json \
+          "$UV_PATH" run --no-sync "$PYTHON_PATH" \
+            -m alberta_framework.benchmarks.reference_life_scorecard \
+            summarize --plan scorecard/plan.json --output scorecard/artifact.json \
             scorecard/shards/*.json
-          uv run --no-sync python -m alberta_framework.benchmarks.reference_life_scorecard \
+          "$UV_PATH" run --no-sync "$PYTHON_PATH" \
+            -m alberta_framework.benchmarks.reference_life_scorecard \
             validate scorecard/artifact.json
+          SOURCE_TREE="$(git rev-parse 'HEAD^{tree}')" \
+          WORKFLOW_BLOB="$(git hash-object .github/workflows/reference-life-scorecard-dev.yml)" \
+          UV_LOCK_SHA256="$(sha256sum uv.lock | cut -d' ' -f1)" \
+          "$PYTHON_PATH" - <<'PY'
+          import hashlib
+          import json
+          import os
+          import platform
+          from pathlib import Path
+
+          root = Path("scorecard")
+          environments = ("riverswim", "switching_two_state")
+          arms = (
+              "differential_sarsa", "privileged_oracle", "prototype",
+              "prototype_frozen", "random", "sarsa",
+          )
+          seeds = tuple(range(70_000, 70_012))
+          expected = sorted(
+              f"{environment}__{arm}__{seed}.json"
+              for environment in environments for arm in arms for seed in seeds
+          )
+          shards = sorted((root / "shards").glob("*.json"))
+          if [path.name for path in shards] != expected:
+              raise SystemExit("shard filenames do not match the frozen 144-job matrix")
+
+          def record(path: Path) -> dict[str, object]:
+              raw = path.read_bytes()
+              return {
+                  "path": path.as_posix(),
+                  "bytes": len(raw),
+                  "sha256": hashlib.sha256(raw).hexdigest(),
+              }
+
+          inventory = [record(path) for path in [root / "plan.json", root / "artifact.json", *shards]]
+          canonical_inventory = json.dumps(
+              inventory, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+          ).encode()
+          receipt = {
+              "schema": "asi.reference_life_scorecard.github_run.v1",
+              "policy": "development_only_permanently_nonpromoting",
+              "source": {
+                  "commit": os.environ["LAUNCH_SHA"],
+                  "tree": os.environ["SOURCE_TREE"],
+                  "workflow_blob_sha1": os.environ["WORKFLOW_BLOB"],
+                  "uv_lock_sha256": os.environ["UV_LOCK_SHA256"],
+              },
+              "run": {
+                  "github_run_id": os.environ["RUN_ID"],
+                  "github_run_attempt": os.environ["RUN_ATTEMPT"],
+                  "job_count": 144,
+                  "environments": list(environments),
+                  "arms": list(arms),
+                  "seeds": list(seeds),
+              },
+              "runtime": {
+                  "runner_os": os.environ["RUNNER_OS"],
+                  "runner_arch": os.environ["RUNNER_ARCH"],
+                  "python": platform.python_version(),
+                  "python_executable_sha256": hashlib.sha256(Path(os.environ["PYTHON_PATH"]).read_bytes()).hexdigest(),
+                  "uv": "0.9.24",
+                  "uv_executable_sha256": hashlib.sha256(Path(os.environ["UV_PATH"]).read_bytes()).hexdigest(),
+              },
+              "result": {
+                  "file_count": len(inventory),
+                  "shard_count": len(shards),
+                  "plan_sha256": inventory[0]["sha256"],
+                  "artifact_sha256": inventory[1]["sha256"],
+                  "campaign_inventory_sha256": hashlib.sha256(canonical_inventory).hexdigest(),
+                  "inventory": inventory,
+              },
+          }
+          encoded = json.dumps(receipt, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode() + b"\n"
+          (root / "run-receipt.v1.json").write_bytes(encoded)
+          PY
 
       - name: Upload complete validated campaign
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: reference-life-scorecard-validated-${{ github.sha }}
+          name: reference-life-scorecard-${{ inputs.launch_sha }}-${{ github.run_id }}-validated
           path: scorecard
           if-no-files-found: error
           retention-days: 90
