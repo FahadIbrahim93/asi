@@ -214,7 +214,18 @@ EXTERNAL_QUALIFICATION_PLANS: tuple[ExternalQualificationPlan, ...] = (
         ),
         COMMON_GATES,
     ),
-    ExternalQualificationPlan(1579, "clear", ("arXiv:2201.06289v3",), (), COMMON_GATES),
+    ExternalQualificationPlan(
+        1579,
+        "clear",
+        ("arXiv:2201.06289v3",),
+        (
+            _revision(
+                "https://github.com/linzhiqiu/continual-learning.git",
+                "620cab4a7d99921fde73b67b53879470533cb39a",
+            ),
+        ),
+        COMMON_GATES,
+    ),
     ExternalQualificationPlan(
         1580,
         "continual-world-cw20",
