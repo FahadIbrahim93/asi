@@ -12,6 +12,7 @@ from alberta_framework.benchmarks.forager_matched_campaign import (
     ForagerMatchedCampaignError,
     _CellScan,
 )
+from alberta_framework.benchmarks.forager_matched_executor import SeedExecutionArtifacts
 
 
 def test_campaign_status_valid_construction() -> None:
@@ -121,12 +122,25 @@ def _legal_cell_scan(**overrides: object) -> _CellScan:
     return _CellScan(**payload)  # type: ignore[arg-type]
 
 
+def _legal_artifact() -> SeedExecutionArtifacts:
+    return SeedExecutionArtifacts(
+        candidate_id="isolated_ppo",
+        seed=2_200_001,
+        score=1.25,
+        live_runtime_identity_sha256="c" * 64,
+        raw_artifact={"kind": "raw"},
+        trace_artifact={"kind": "trace"},
+        scoring_record={"kind": "score"},
+    )
+
+
 def test_cell_scan_legal_empty_and_completed_shapes() -> None:
     empty = _legal_cell_scan()
     assert empty.next_attempt_number == 1
     assert empty.pointer_present is False
     assert empty.retained_raw_bytes == 0
     completed = _legal_cell_scan(
+        artifact=_legal_artifact(),
         completed_attempt=Path("attempts/attempt-001"),
         raw_binding_sha256="a" * 64,
         bundle_sha256="b" * 64,
@@ -159,3 +173,27 @@ def test_cell_scan_rejects_bool_attempt_and_byte_identities(
 ) -> None:
     with pytest.raises(ForagerMatchedCampaignError, match=field):
         _legal_cell_scan(**{field: value})
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"completed_attempt": Path("attempt-001")}, "completed cell fields"),
+        ({"resumable_attempt": Path("attempt-001")}, "resumable cell fields"),
+        ({"pointer_present": True}, "completion pointer"),
+        (
+            {
+                "artifact": _legal_artifact(),
+                "completed_attempt": Path("attempt-001"),
+                "raw_binding_sha256": "a" * 64,
+                "bundle_sha256": "b" * 64,
+                "resumable_attempt": Path("attempt-002"),
+                "resumable_binding": {},
+            },
+            "both completed and resumable",
+        ),
+    ],
+)
+def test_cell_scan_rejects_incoherent_state(overrides: dict[str, object], message: str) -> None:
+    with pytest.raises(ForagerMatchedCampaignError, match=message):
+        _legal_cell_scan(**overrides)

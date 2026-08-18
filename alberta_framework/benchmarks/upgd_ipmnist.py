@@ -191,6 +191,7 @@ IPMNISTLearner = Literal["upgd_w", "adamw"]
 PARTIAL_SCHEMA_V1 = "upgd_ipmnist.partial.v1"
 PARTIAL_SCHEMA = "alberta.upgd_ipmnist.partial.v2"
 ARTIFACT_SCHEMA = "alberta.upgd_ipmnist.artifact.v2"
+_MAX_PARTIAL_JSON_BYTES = 16 * 1024 * 1024
 
 # Structured, factual departures from the selected released implementation.
 # These are emitted by v2 shards and artifacts; they are not a self-attested
@@ -1497,8 +1498,22 @@ def _decode_strict_json_object(raw: bytes, *, path: Path) -> dict[str, Any]:
 
 
 def _strict_json_object(path: Path) -> dict[str, Any]:
+    if not isinstance(path, Path):
+        raise ValueError("partial shard path must be a Path")
     resolved = Path(path)
-    return _decode_strict_json_object(resolved.read_bytes(), path=resolved)
+    try:
+        metadata = resolved.stat()
+    except OSError as exc:
+        raise ValueError(f"{resolved}: partial shard is not readable") from exc
+    if not resolved.is_file() or metadata.st_size > _MAX_PARTIAL_JSON_BYTES:
+        raise ValueError(
+            f"{resolved}: partial shard must be a regular file no larger than "
+            f"{_MAX_PARTIAL_JSON_BYTES} bytes"
+        )
+    raw = resolved.read_bytes()
+    if len(raw) != metadata.st_size or len(raw) > _MAX_PARTIAL_JSON_BYTES:
+        raise ValueError(f"{resolved}: partial shard changed while being read")
+    return _decode_strict_json_object(raw, path=resolved)
 
 
 def _v2_partial_manifest(paths: Sequence[Path]) -> list[dict[str, object]]:
@@ -1514,8 +1529,21 @@ def _v2_partial_manifest(paths: Sequence[Path]) -> list[dict[str, object]]:
 
     entries: list[dict[str, object]] = []
     for path_value in paths:
+        if not isinstance(path_value, Path):
+            raise ValueError("partial manifest paths must contain only Path values")
         path = Path(path_value)
+        try:
+            metadata = path.stat()
+        except OSError as exc:
+            raise ValueError(f"{path}: partial shard is not readable") from exc
+        if not path.is_file() or metadata.st_size > _MAX_PARTIAL_JSON_BYTES:
+            raise ValueError(
+                f"{path}: partial shard must be a regular file no larger than "
+                f"{_MAX_PARTIAL_JSON_BYTES} bytes"
+            )
         raw = path.read_bytes()
+        if len(raw) != metadata.st_size or len(raw) > _MAX_PARTIAL_JSON_BYTES:
+            raise ValueError(f"{path}: partial shard changed while being read")
         payload = _decode_strict_json_object(raw, path=path)
         if payload.get("schema") != PARTIAL_SCHEMA:
             raise ValueError(f"{path}: partial manifest accepts only strict v2 shards")
@@ -1558,7 +1586,7 @@ def _validated_partial_payload(
     if type(learner) is not str or learner not in _LEARNER_FACTORIES:
         raise ValueError(f"{path}: unsupported learner")
     hyperparameters = payload.get("hyperparameters")
-    if not isinstance(hyperparameters, Mapping) or not hyperparameters:
+    if type(hyperparameters) is not dict or not hyperparameters:
         raise ValueError(f"{path}: hyperparameters must be a non-empty object")
     for name, value in hyperparameters.items():
         if (
@@ -1586,7 +1614,7 @@ def _validated_partial_payload(
             f"{path}: hyperparameters must contain the complete learner configuration"
         )
     config_payload = payload.get("config")
-    if not isinstance(config_payload, Mapping) or set(config_payload) != set(
+    if type(config_payload) is not dict or set(config_payload) != set(
         IPMNISTConfig().to_config()
     ):
         raise ValueError(f"{path}: config fields do not match the v2 contract")
@@ -1612,7 +1640,7 @@ def _validated_partial_payload(
         if type(seed_count) is not int or seed_count != 1:
             raise ValueError(f"{path}: seed_count must equal one")
     else:
-        if not isinstance(raw_seeds, list) or not raw_seeds:
+        if type(raw_seeds) is not list or not raw_seeds:
             raise ValueError(f"{path}: {seed_field} must be a non-empty list")
         seed_ids = list(
             require_unique_jax_seeds(raw_seeds, name=f"{path}: {seed_field}")

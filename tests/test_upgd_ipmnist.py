@@ -975,6 +975,22 @@ class TestNoisePoolMode:
 
 
 class TestPartialMerge:
+    def test_partial_loader_rejects_non_path_and_oversized_shards(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        with pytest.raises(ValueError, match="path must be a Path"):
+            upgd_ipmnist._strict_json_object(str(tmp_path / "partial.json"))  # type: ignore[arg-type]
+
+        path = tmp_path / "oversized.json"
+        path.write_text("{}", encoding="utf-8")
+        monkeypatch.setattr(
+            upgd_ipmnist,
+            "_MAX_PARTIAL_JSON_BYTES",
+            1,
+        )
+        with pytest.raises(ValueError, match="no larger than"):
+            upgd_ipmnist._strict_json_object(path)
+
     def test_v2_partial_manifest_binds_identity_and_digest_to_one_read(
         self, tmp_path, monkeypatch
     ):
