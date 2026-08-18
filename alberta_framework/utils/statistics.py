@@ -4,11 +4,11 @@ Provides functions for computing confidence intervals, significance tests,
 effect sizes, and multiple comparison corrections.
 """
 
+import math
 import operator
-from collections.abc import Mapping
-from dataclasses import asdict, dataclass, replace
+from collections.abc import Iterable, Mapping
 from fractions import Fraction
-from typing import TYPE_CHECKING, Any, NamedTuple, SupportsIndex, cast
+from typing import TYPE_CHECKING, Any, NamedTuple, Self, SupportsIndex, cast
 
 import numpy as np
 from numpy.typing import NDArray
@@ -52,6 +52,26 @@ def _require_exact_bool(name: str, value: object) -> bool:
     return value
 
 
+def _require_result_probability(name: str, value: object, *, strict: bool) -> float:
+    if type(value) is not int and type(value) is not float:
+        raise ValueError(f"{name} must be a builtin probability")
+    result = float(value)
+    if not math.isfinite(result) or not 0.0 <= result <= 1.0:
+        raise ValueError(f"{name} must be a builtin probability")
+    if strict and not 0.0 < result < 1.0:
+        raise ValueError(f"{name} must lie strictly between zero and one")
+    return result
+
+
+def _require_extended_statistic(name: str, value: object) -> float:
+    if type(value) is not int and type(value) is not float:
+        raise ValueError(f"{name} must be a builtin extended-real number")
+    result = float(value)
+    if math.isnan(result):
+        raise ValueError(f"{name} must not be NaN")
+    return result
+
+
 class StatisticalSummary(NamedTuple):
     """Summary statistics for a set of values.
 
@@ -76,8 +96,18 @@ class StatisticalSummary(NamedTuple):
     n_seeds: int
 
 
-@dataclass(frozen=True, slots=True)
-class SignificanceResult:
+class _SignificanceResultTuple(NamedTuple):
+    test_name: str
+    statistic: float
+    p_value: float
+    significant: bool
+    alpha: float
+    effect_size: float
+    method_a: str
+    method_b: str
+
+
+class SignificanceResult(_SignificanceResultTuple):
     """Result of a statistical significance test.
 
     Attributes:
@@ -91,27 +121,59 @@ class SignificanceResult:
         method_b: Name of second method
     """
 
-    test_name: str
-    statistic: float
-    p_value: float
-    significant: bool
-    alpha: float
-    effect_size: float
-    method_a: str
-    method_b: str
+    __slots__ = ()
 
-    def __post_init__(self) -> None:
-        """Reject leftover bool/int/string identities before they become a verdict."""
-        _require_exact_str("test_name", self.test_name)
-        _require_exact_bool("significant", self.significant)
-        _require_exact_str("method_a", self.method_a)
-        _require_exact_str("method_b", self.method_b)
+    def __new__(
+        cls,
+        test_name: str,
+        statistic: float,
+        p_value: float,
+        significant: bool,
+        alpha: float,
+        effect_size: float,
+        method_a: str,
+        method_b: str,
+    ) -> "SignificanceResult":
+        checked_test_name = _require_exact_str("test_name", test_name)
+        checked_method_a = _require_exact_str("method_a", method_a)
+        checked_method_b = _require_exact_str("method_b", method_b)
+        if not checked_test_name or not checked_method_a or not checked_method_b:
+            raise ValueError("test and method names must be non-empty")
+        if checked_method_a == checked_method_b:
+            raise ValueError("method_a and method_b must be distinct")
+        checked_p = _require_result_probability("p_value", p_value, strict=False)
+        checked_alpha = _require_result_probability("alpha", alpha, strict=True)
+        checked_significant = _require_exact_bool("significant", significant)
+        if checked_significant is not (checked_p < checked_alpha):
+            raise ValueError("significant must exactly match p_value < alpha")
+        return tuple.__new__(
+            cls,
+            (
+                checked_test_name,
+                _require_extended_statistic("statistic", statistic),
+                checked_p,
+                checked_significant,
+                checked_alpha,
+                _require_extended_statistic("effect_size", effect_size),
+                checked_method_a,
+                checked_method_b,
+            ),
+        )
 
-    def _asdict(self) -> dict[str, object]:
-        return asdict(self)
+    @classmethod
+    def _make(cls, iterable: Iterable[Any]) -> Self:  # type: ignore[override]
+        values = tuple(iterable)
+        if len(values) != len(cls._fields):
+            raise TypeError(f"Expected {len(cls._fields)} arguments, got {len(values)}")
+        return cls(*values)
 
-    def _replace(self, **changes: Any) -> "SignificanceResult":
-        return replace(self, **changes)
+    def _replace(self, **changes: object) -> "SignificanceResult":
+        unexpected = changes.keys() - self._fields
+        if unexpected:
+            raise ValueError(f"Got unexpected field names: {sorted(unexpected)!r}")
+        values = self._asdict()
+        values.update(changes)
+        return type(self)(**values)
 
 
 def _validate_confidence_level(confidence_level: object) -> None:
@@ -655,29 +717,31 @@ def holm_correction(
         _require_p_value(p_value, name=f"p_values[{index}]")
         for index, p_value in enumerate(p_values)
     ]
-    n_tests = len(validated_p_values)
-
-    # Sort p-values and track original indices
-    sorted_indices = np.argsort(validated_p_values)
-    sorted_p = [validated_p_values[i] for i in sorted_indices]
-
-    # Apply Holm correction
-    significant_sorted = []
-    for i, p in enumerate(sorted_p):
-        corrected_alpha = alpha_value / (n_tests - i)
-        if p < corrected_alpha:
-            significant_sorted.append(True)
-        else:
-            # Once we fail to reject, all subsequent are not significant
-            significant_sorted.extend([False] * (n_tests - i))
-            break
-
-    # Restore original order
-    significant = [False] * n_tests
-    for orig_idx, sig in zip(sorted_indices, significant_sorted, strict=False):
-        significant[orig_idx] = sig
-
+    significant, _ = _holm_decisions(validated_p_values, alpha_value)
     return significant
+
+
+def _holm_decisions(
+    p_values: list[float], alpha: float
+) -> tuple[list[bool], list[float]]:
+    """Return Holm decisions and each record's effective step-down threshold."""
+
+    n_tests = len(p_values)
+    sorted_indices = np.argsort(p_values)
+    significant = [False] * n_tests
+    thresholds = [alpha] * n_tests
+    stopped_threshold: float | None = None
+    for rank, raw_index in enumerate(sorted_indices):
+        index = int(raw_index)
+        rank_threshold = alpha / (n_tests - rank)
+        if stopped_threshold is None and p_values[index] < rank_threshold:
+            significant[index] = True
+            thresholds[index] = rank_threshold
+        else:
+            if stopped_threshold is None:
+                stopped_threshold = rank_threshold
+            thresholds[index] = stopped_threshold
+    return significant, thresholds
 
 
 def common_final_window(step_counts: Mapping[str, int], window: int, metric: str) -> int:
@@ -838,21 +902,24 @@ def pairwise_comparisons(
 
     # Apply multiple comparison correction
     if correction == "bonferroni":
-        significant_list, _ = bonferroni_correction(p_values, alpha_value)
+        significant_list, corrected_alpha = bonferroni_correction(p_values, alpha_value)
+        decision_thresholds = [corrected_alpha] * len(p_values)
     elif correction == "holm":
-        significant_list = holm_correction(p_values, alpha_value)
+        significant_list, decision_thresholds = _holm_decisions(p_values, alpha_value)
     else:
         raise ValueError(f"Unknown correction: {correction}")
 
     # Update significance based on correction
     corrected_comparisons: dict[tuple[str, str], SignificanceResult] = {}
-    for (key, result), sig in zip(comparisons.items(), significant_list, strict=False):
+    for (key, result), sig, decision_threshold in zip(
+        comparisons.items(), significant_list, decision_thresholds, strict=True
+    ):
         corrected_comparisons[key] = SignificanceResult(
             test_name=f"{result.test_name} ({correction})",
             statistic=result.statistic,
             p_value=result.p_value,
             significant=sig,
-            alpha=alpha_value,
+            alpha=decision_threshold,
             effect_size=result.effect_size,
             method_a=result.method_a,
             method_b=result.method_b,

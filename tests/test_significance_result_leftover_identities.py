@@ -37,3 +37,20 @@ def test_significance_result_rejects_leftover_identities() -> None:
     assert type(legal.significant) is bool
     rejected = SignificanceResult("t", 1.0, 0.99, False, 0.05, 0.2, "a", "b")
     assert json.dumps(rejected._asdict(), allow_nan=False).count('"significant": false') == 1
+
+
+def test_significance_result_recomputes_domains_and_replacement_verdicts() -> None:
+    legal = SignificanceResult("t", 1.0, 0.01, True, 0.05, 0.2, "a", "b")
+    with pytest.raises(ValueError, match="exactly match"):
+        legal._replace(significant=False)
+    with pytest.raises(ValueError, match="p_value"):
+        legal._replace(p_value=float("nan"))
+    with pytest.raises(ValueError, match="alpha"):
+        legal._replace(alpha=0.0)
+    with pytest.raises(ValueError, match="statistic"):
+        legal._replace(statistic=float("nan"))
+    with pytest.raises(ValueError, match="distinct"):
+        legal._replace(method_b="a")
+    assert legal._replace(p_value=0.5, significant=False).significant is False
+    with pytest.raises(ValueError, match="significant"):
+        SignificanceResult._make(("t", 1.0, 0.01, 1, 0.05, 0.2, "a", "b"))

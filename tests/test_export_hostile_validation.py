@@ -257,6 +257,14 @@ def _significance() -> SignificanceResult:
     )
 
 
+def _forged_significance(**changes: object) -> SignificanceResult:
+    """Bypass the public constructor only to retain sink-defense coverage."""
+
+    fields = _significance()._asdict()
+    fields.update(changes)
+    return tuple.__new__(SignificanceResult, tuple(fields.values()))
+
+
 def test_significance_rejects_hostile_dictionary_before_iteration() -> None:
     hostile = _HostileDict({("a", "b"): _significance()})
     with pytest.raises(ValueError, match="exact dictionary"):
@@ -283,7 +291,7 @@ def test_significance_rejects_noncanonical_format(format: object) -> None:
 def test_significance_rejects_invalid_record_fields(
     field: str, value: object, message: str
 ) -> None:
-    result = _significance()._replace(**{field: value})
+    result = _forged_significance(**{field: value})
     with pytest.raises(ValueError, match=message):
         generate_significance_table({("a", "b"): result})
 

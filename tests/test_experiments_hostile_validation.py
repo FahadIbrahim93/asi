@@ -146,6 +146,12 @@ def test_experiment_records_accept_canonical_identities() -> None:
     assert run._fields == ("config_name", "seed", "metrics_history", "final_state")
     assert config._asdict()["num_steps"] == 2
     assert run._replace(seed=1).seed == 1
+    with pytest.raises(ValueError, match="num_steps"):
+        config._replace(num_steps=True)
+    with pytest.raises(ValueError, match="seed"):
+        run._replace(seed=True)
+    with pytest.raises(ValueError, match="seed"):
+        SingleRunResult._make(("fixture", True, run.metrics_history, run.final_state))
 
 
 def test_experiment_records_reject_leftover_integer_identities() -> None:
