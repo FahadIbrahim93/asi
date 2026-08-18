@@ -67,3 +67,48 @@ def test_completed_gates_must_be_known_and_unique() -> None:
         ExternalQualificationPlan(1, "lane", ("paper",), (), ("known",), ("unknown",))
     with pytest.raises(ValueError, match="duplicates"):
         ExternalQualificationPlan(1, "lane", ("paper",), (), ("known", "known"))
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("paper_revisions", tuple(f"paper-{index}" for index in range(17))),
+        ("code_revisions", tuple([object()] * 17)),
+        ("required_gates", tuple(f"gate-{index}" for index in range(33))),
+        ("completed_gates", tuple(f"gate-{index}" for index in range(33))),
+    ],
+)
+def test_plan_rejects_oversized_tuples_before_entry_validation(
+    field: str, value: tuple[object, ...]
+) -> None:
+    values: dict[str, object] = {
+        "issue": 1,
+        "lane_id": "lane",
+        "paper_revisions": ("paper",),
+        "code_revisions": (),
+        "required_gates": ("gate",),
+        "completed_gates": (),
+    }
+    values[field] = value
+    with pytest.raises(ValueError, match=f"{field} contains too many entries"):
+        ExternalQualificationPlan(**values)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("value", ["x" * 257, "invalid-\ud800"])
+def test_plan_rejects_oversized_or_invalid_unicode_strings(value: str) -> None:
+    with pytest.raises(ValueError, match="UTF-8 byte limit|valid Unicode"):
+        ExternalQualificationPlan(1, "lane", (value,), (), ("gate",))
+
+
+def test_plan_rejects_aggregate_payload_before_set_construction() -> None:
+    gates = tuple(f"{index:02d}-" + "x" * 180 for index in range(32))
+    with pytest.raises(ValueError, match="aggregate UTF-8 byte limit"):
+        ExternalQualificationPlan(1, "lane", ("paper",), (), gates, gates)
+
+
+def test_plan_revalidates_forged_nested_revision() -> None:
+    revision = object.__new__(ExternalCodeRevision)
+    object.__setattr__(revision, "repository", "https://github.com/org/repo.git")
+    object.__setattr__(revision, "commit", "invalid-\ud800")
+    with pytest.raises(ValueError, match="valid Unicode"):
+        ExternalQualificationPlan(1, "lane", ("paper",), (revision,), ("gate",))
