@@ -9,8 +9,8 @@ from typing import Any, cast
 
 PAPER_REVISION = "arXiv:2509.22335v3"
 OFFICIAL_COMMIT = "52ae3eb0702a9e6923f252c1f7cb29340eb5b3d5"
-RESULT_SCHEMA = "asi.l2er-ipmnist.development-result.v2"
-COMPARISON_ID = "asi.l2er-ipmnist.current-runner.v1"
+RESULT_SCHEMA = "asi.l2er-ipmnist.development-result.v3"
+COMPARISON_ID = "asi.l2er-ipmnist.current-runner.v2"
 
 L2ER_PROTOCOL = MappingProxyType(
     {
@@ -38,8 +38,8 @@ L2ER_PROTOCOL = MappingProxyType(
         "official_er_steps_per_batch": 1,
         "effective_rank_epsilon": 1e-8,
         "update_accounting": (
-            "updates equals supervised observations plus charged effective_rank_updates; "
-            "effective_rank_updates is retained as the arm-specific auxiliary ER subcount"
+            "supervised_updates matches observations across arms; effective_rank_updates "
+            "counts arm-specific auxiliary ER steps; total_optimizer_updates is their exact sum"
         ),
         "persistent_bytes_scope": (
             "float32 parameters plus the fixed 100-example float32 ER buffer, int32 count, "
@@ -139,8 +139,9 @@ def validate_l2er_development_result(payload: object) -> dict[str, object]:
                 "hidden2",
                 "n_classes",
                 "observations",
-                "updates",
+                "supervised_updates",
                 "effective_rank_updates",
+                "total_optimizer_updates",
                 "allowed_boundary_information",
                 "allowed_task_information",
                 "hyperparameters",
@@ -173,14 +174,21 @@ def validate_l2er_development_result(payload: object) -> dict[str, object]:
     hidden2 = _int(outer["hidden2"], context="hidden2", positive=True)
     n_classes = _int(outer["n_classes"], context="n_classes", positive=True)
     observations = _int(outer["observations"], context="observations", positive=True)
-    updates = _int(outer["updates"], context="updates", positive=True)
+    supervised_updates = _int(
+        outer["supervised_updates"], context="supervised_updates", positive=True
+    )
     effective_rank_updates = _int(
         outer["effective_rank_updates"], context="effective_rank_updates"
     )
+    total_optimizer_updates = _int(
+        outer["total_optimizer_updates"], context="total_optimizer_updates", positive=True
+    )
     if n_tasks > _INT32_MAX // task_length:
         raise ValueError("n_tasks * task_length exceeds signed int32")
-    if observations != n_tasks * task_length:
-        raise ValueError("observations must equal n_tasks * task_length")
+    if observations != n_tasks * task_length or supervised_updates != observations:
+        raise ValueError(
+            "observations and supervised_updates must equal n_tasks * task_length"
+        )
     boundary = _strings(
         outer["allowed_boundary_information"], context="allowed_boundary_information"
     )
@@ -194,9 +202,6 @@ def validate_l2er_development_result(payload: object) -> dict[str, object]:
         for key in _HYPERPARAMETER_KEYS
     }
     expected_wd, expected_er_lr, expected_enabled = _ARMS[arm]
-    er_updates = observations // 100 if expected_enabled == 1.0 else 0
-    if updates != observations + er_updates:
-        raise ValueError("updates must include supervised and effective-rank updates")
     expected_hp = {
         "step_size": 1e-3,
         "weight_decay": expected_wd,
@@ -250,8 +255,13 @@ def validate_l2er_development_result(payload: object) -> dict[str, object]:
         raise ValueError("resources exceed the bounded development protocol")
     if environment_steps != 0 or data_steps != observations:
         raise ValueError("environment_steps/data_steps do not match the supervised protocol")
+    er_updates = observations // 100 if expected_enabled == 1.0 else 0
     if effective_rank_updates != er_updates:
         raise ValueError("effective_rank_updates does not match the executed ER schedule")
+    if total_optimizer_updates != supervised_updates + effective_rank_updates:
+        raise ValueError(
+            "total_optimizer_updates must equal supervised_updates plus effective_rank_updates"
+        )
     if model_queries != 2 * observations + er_updates:
         raise ValueError("model_queries does not match the executed update semantics")
     if resources["timing_is_telemetry_only"] is not True:
@@ -295,8 +305,9 @@ def validate_l2er_development_result(payload: object) -> dict[str, object]:
         "hidden2": hidden2,
         "n_classes": n_classes,
         "observations": observations,
-        "updates": updates,
+        "supervised_updates": supervised_updates,
         "effective_rank_updates": effective_rank_updates,
+        "total_optimizer_updates": total_optimizer_updates,
         "allowed_boundary_information": list(boundary),
         "allowed_task_information": list(task_info),
         "hyperparameters": normalized_hp,
@@ -336,6 +347,7 @@ def validate_matched_l2er_development_results(
         "hidden2",
         "n_classes",
         "observations",
+        "supervised_updates",
         "allowed_boundary_information",
         "allowed_task_information",
     )
