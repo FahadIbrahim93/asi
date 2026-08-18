@@ -115,6 +115,49 @@ def _require_int32(name: str, value: object, *, minimum: int, maximum: int = _IN
     return canonical
 
 
+def _require_derived_int32(name: str, value: int, *, minimum: int = 0) -> int:
+    if not minimum <= value <= _INT32_MAX:
+        raise ValueError(f"derived {name} must fit signed int32")
+    return value
+
+
+def _require_float32_resource(name: str, *, float32_scalars: int) -> None:
+    _require_derived_int32(f"{name} scalar count", float32_scalars)
+    if 4 * float32_scalars > _INT32_MAX:
+        raise ValueError(f"derived {name} byte count must fit signed int32")
+
+
+def _preflight_cerebellum_resources(n_demons: int, obs_dim: int) -> None:
+    """Reject persistent and update working sets the cerebellum cannot name."""
+
+    weight_scalars = n_demons * obs_dim
+    # The agent owns the float32 weights, one int32 cumulant-index vector,
+    # one int32 telemetry scalar, and two uint32 lifetime words.  Every leaf
+    # occupies four bytes, so account for the aggregate rather than merely
+    # proving that the largest single array is nameable.
+    persistent_scalars = weight_scalars + n_demons + 3
+    _require_float32_resource(
+        "exo-cerebellum persistent state",
+        float32_scalars=persistent_scalars,
+    )
+    # During update, source weights, the outer-product delta, candidate
+    # weights, and the selected result weights are simultaneously live.  The
+    # remaining term covers the retained cumulant indices, predictions,
+    # targets, errors, neutral result vectors, two raw/safe observations,
+    # lifetime words, and transaction predicates. Charging every element as
+    # four bytes conservatively covers int32, uint32, and boolean arrays too.
+    update_scalars = 4 * weight_scalars + 6 * n_demons + 4 * obs_dim + 16
+    _require_float32_resource(
+        "exo-cerebellum update working set",
+        float32_scalars=update_scalars,
+    )
+    _require_derived_int32("augmented observation dim", n_demons + obs_dim, minimum=2)
+    _require_float32_resource(
+        "augmented observation",
+        float32_scalars=n_demons + obs_dim,
+    )
+
+
 def _positive_float32_scalar(name: str, value: object) -> float:
     """Validate and canonicalize a positive scalar in its execution dtype."""
     message = f"{name} must be a finite positive float32 scalar"
@@ -177,6 +220,7 @@ class ExoCerebellumConfig:
         )
         step_size = _positive_float32_scalar("step_size", self.step_size)
         object.__setattr__(self, "step_size", step_size)
+        _preflight_cerebellum_resources(self.n_demons, self.obs_dim)
 
     def to_config(self) -> dict[str, Any]:
         return {"type": "ExoCerebellumConfig", **dataclasses.asdict(self)}
@@ -623,6 +667,15 @@ class IAConfig:
                 f"cerebellum.obs_dim ({self.cerebellum.obs_dim}) must equal "
                 f"cortex.observation_dim ({self.cortex.observation_dim})"
             )
+        _require_derived_int32(
+            "augmented observation dim",
+            self.augmented_obs_dim,
+            minimum=2,
+        )
+        _require_float32_resource(
+            "augmented observation",
+            float32_scalars=self.augmented_obs_dim,
+        )
 
     @property
     def augmented_obs_dim(self) -> int:
