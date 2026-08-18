@@ -303,12 +303,18 @@ def _require_spec_bool(value: object, name: str) -> bool:
     return value
 
 
-def _require_spec_int(value: object, name: str, *, minimum: int) -> int:
+def _require_spec_int(
+    value: object,
+    name: str,
+    *,
+    minimum: int,
+    maximum: int = 2**31 - 1,
+) -> int:
     if isinstance(value, bool) or type(value) is not int:
         raise ForagerMatchedOpenProtocolBuildError(f"{name} must be an integer")
-    if value < minimum:
+    if not minimum <= value <= maximum:
         raise ForagerMatchedOpenProtocolBuildError(
-            f"{name} must be an integer >= {minimum}"
+            f"{name} must be an integer in [{minimum}, {maximum}]"
         )
     return value
 
@@ -358,10 +364,24 @@ class _CandidateSpec:
             ("direct", "top_level_seed", "adapter_injected"),
         )
         if self.rollout_steps is not None:
-            _require_spec_int(self.rollout_steps, "rollout_steps", minimum=1)
+            _require_spec_int(
+                self.rollout_steps,
+                "rollout_steps",
+                minimum=1,
+                maximum=MATCHED_CURRENT_HORIZON,
+            )
         _require_spec_text(self.update_semantics, "update_semantics")
         _require_spec_text(self.source_repository, "source_repository")
         _require_spec_text(self.source_base_commit, "source_base_commit")
+        if self.source_repository not in (
+            MATCHED_CURRENT_ALBERTA_REPOSITORY,
+            MATCHED_CURRENT_UPSTREAM_REPOSITORY,
+        ):
+            raise ForagerMatchedOpenProtocolBuildError("source_repository is invalid")
+        if re.fullmatch(r"[0-9a-f]{40}", self.source_base_commit) is None:
+            raise ForagerMatchedOpenProtocolBuildError(
+                "source_base_commit must be a lowercase Git commit"
+            )
         _require_spec_choice(
             self.source_provenance_kind,
             "source_provenance_kind",
@@ -409,6 +429,37 @@ class _CandidateSpec:
         ):
             raise ForagerMatchedOpenProtocolBuildError(
                 "exclusion_reasons must be a tuple of non-empty strings"
+            )
+        if (self.rollout_steps is None) != (
+            self.update_semantics == "environment_step_counted"
+        ):
+            raise ForagerMatchedOpenProtocolBuildError(
+                "rollout_steps and update_semantics are inconsistent"
+            )
+        if (
+            self.rollout_steps is not None
+            and MATCHED_CURRENT_HORIZON % self.rollout_steps != 0
+        ):
+            raise ForagerMatchedOpenProtocolBuildError(
+                "rollout_steps must divide the matched horizon"
+            )
+        shared_rng = self.agent_rng_identity == "shared_agent_environment_rng_v1"
+        if (
+            self.environment_key_shared is not shared_rng
+            or (self.environment_rng_identity == "shared_agent_environment_rng_v1")
+            is not shared_rng
+        ):
+            raise ForagerMatchedOpenProtocolBuildError(
+                "agent and environment RNG identities are inconsistent"
+            )
+        privileged_access = self.access_mode != "partial_observation"
+        if bool(self.privileged_fields) is not privileged_access:
+            raise ForagerMatchedOpenProtocolBuildError(
+                "privileged_fields do not match observation access"
+            )
+        if self.pairing_eligible == bool(self.exclusion_reasons):
+            raise ForagerMatchedOpenProtocolBuildError(
+                "pairing eligibility and exclusion reasons are inconsistent"
             )
 
 

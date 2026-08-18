@@ -3861,7 +3861,9 @@ def summarize_forager_runs(
     }
     if type(metric) is not str or metric not in supported_metrics:
         raise ValueError(f"unsupported Forager summary metric {metric!r}")
-    if any(not isinstance(run, ForagerRunResult) for run in runs):
+    if type(runs) not in (list, tuple):
+        raise TypeError("runs must be an actual list or tuple")
+    if any(type(run) is not ForagerRunResult for run in runs):
         raise TypeError("runs must contain only ForagerRunResult values")
     names = {run.agent for run in runs}
     privileged = {run.privileged for run in runs}
@@ -4017,8 +4019,8 @@ def compare_forager_agents(
     bootstrap_resamples: int = 10_000,
 ) -> dict[str, ForagerBenchmarkSummary]:
     """Evaluate every method on the same independent seed set."""
-    if not isinstance(agent_factories, Mapping):
-        raise TypeError("agent_factories must be a mapping")
+    if type(agent_factories) is not dict:
+        raise TypeError("agent_factories must be an actual dict")
     if not agent_factories:
         raise ValueError("at least one agent factory is required")
     if len(seeds) == 0:

@@ -1157,6 +1157,28 @@ _MICRO_CURVE_DOMAINS: dict[str, tuple[float, float | None]] = {
     "per_regime_loss": (0.0, None),
     "per_regime_plasticity": (0.0, 1.0),
 }
+_MICRO_SHARD_FIELDS = frozenset(
+    {
+        "schema",
+        "suite_version",
+        "evidence_policy",
+        "family",
+        "arm_name",
+        "mechanism",
+        "hyperparameters",
+        "seed",
+        "hidden1",
+        "hidden2",
+        "stream_config",
+        "per_regime_accuracy",
+        "per_regime_loss",
+        "per_regime_plasticity",
+        "overall_average_online_accuracy",
+        "wall_clock_seconds",
+        "created_unix",
+        "environment",
+    }
+)
 
 
 def _validated_curve(
@@ -1182,11 +1204,21 @@ def _validated_curve(
 
 def load_micro_shard(path: Path | str) -> dict[str, Any]:
     """Load and structurally validate one micro shard."""
-    path = Path(path)
+    if type(path) is str:
+        path = Path(path)
+    elif isinstance(path, Path) and type(path).__module__.startswith("pathlib"):
+        path = Path(path)
+    else:
+        raise ValueError("micro shard path must be an exact str or pathlib Path")
     payload = load_strict_json_object(path)
-    if payload.get("schema") != MICRO_SHARD_SCHEMA:
+    if set(payload) != _MICRO_SHARD_FIELDS:
+        raise ValueError(f"{path}: shard fields do not match the exact schema")
+    if type(payload.get("schema")) is not str or payload["schema"] != MICRO_SHARD_SCHEMA:
         raise ValueError(f"{path}: schema mismatch (expected {MICRO_SHARD_SCHEMA})")
-    if payload.get("suite_version") != MICRO_GAUSS_SUITE_VERSION:
+    if (
+        type(payload.get("suite_version")) is not str
+        or payload["suite_version"] != MICRO_GAUSS_SUITE_VERSION
+    ):
         raise ValueError(
             f"{path}: suite_version mismatch (expected {MICRO_GAUSS_SUITE_VERSION!r}, "
             f"got {payload.get('suite_version')!r})"
@@ -1216,9 +1248,13 @@ def load_micro_shard(path: Path | str) -> dict[str, Any]:
         )
     environment = payload.get("environment")
     required_environment_fields = ("jax", "numpy", "python", "platform")
-    if not isinstance(environment, dict) or any(
-        type(environment.get(field)) is not str or not environment[field]
-        for field in required_environment_fields
+    if (
+        type(environment) is not dict
+        or set(environment) != set(required_environment_fields)
+        or any(
+            type(environment.get(field)) is not str or not environment[field]
+            for field in required_environment_fields
+        )
     ):
         raise ValueError(
             f"{path}: environment must record non-empty jax, numpy, python, and platform strings"
@@ -1247,6 +1283,26 @@ def load_micro_shard(path: Path | str) -> dict[str, Any]:
         value = payload.get(fieldname)
         if type(value) is not int or value <= 0:
             raise ValueError(f"{path}: {fieldname} must be a positive integer")
+    if type(payload["evidence_policy"]) is not dict or payload["evidence_policy"] != dict(
+        NONPROMOTING_POLICY
+    ):
+        raise ValueError(f"{path}: evidence_policy mismatch")
+    overall = _require_finite_real(
+        payload["overall_average_online_accuracy"],
+        f"{path}: overall_average_online_accuracy",
+    )
+    if not 0.0 <= overall <= 1.0 or not math.isclose(
+        overall,
+        sum(payload["per_regime_accuracy"]) / config.n_regimes,
+        rel_tol=0.0,
+        abs_tol=1e-7,
+    ):
+        raise ValueError(f"{path}: overall_average_online_accuracy does not match curve")
+    payload["overall_average_online_accuracy"] = overall
+    created_unix = _require_finite_real(payload["created_unix"], f"{path}: created_unix")
+    if created_unix < 0.0:
+        raise ValueError(f"{path}: created_unix must be nonnegative")
+    payload["created_unix"] = created_unix
     return payload
 
 

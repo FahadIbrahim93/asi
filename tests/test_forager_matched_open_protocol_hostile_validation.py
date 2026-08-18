@@ -128,3 +128,21 @@ def test_candidate_spec_bool_rollout_would_collapse_horizon_identity() -> None:
         replace(legal, rollout_steps=True)
     with pytest.raises(ForagerMatchedOpenProtocolBuildError, match="aperture_size"):
         replace(legal, aperture_size=True)
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"rollout_steps": 127},
+        {"rollout_steps": None},
+        {"source_base_commit": "A" * 40},
+        {"environment_key_shared": True},
+        {"privileged_fields": ("global_objects",)},
+        {"pairing_eligible": False},
+    ],
+)
+def test_candidate_spec_rejects_cross_field_and_provenance_drift(
+    updates: dict[str, object],
+) -> None:
+    with pytest.raises(ForagerMatchedOpenProtocolBuildError):
+        replace(_legal_spec(), **updates)
