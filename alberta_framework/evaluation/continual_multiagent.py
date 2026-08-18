@@ -495,9 +495,7 @@ class ConditionResult:
             "per_task_forgetting",
             "per_task_backward_transfer",
         ):
-            if not np.array_equal(
-                getattr(summary, name), getattr(summary_without_reference, name)
-            ):
+            if not np.array_equal(getattr(summary, name), getattr(summary_without_reference, name)):
                 raise ValueError(f"summary.{name} must reconstruct from performance_matrix")
         recovery = _require_ndarray(
             "recovery_lengths",
@@ -1288,7 +1286,6 @@ def run_continual_multiagent_benchmark(
         confidence_level=benchmark_config.confidence_level,
         bootstrap_resamples=benchmark_config.bootstrap_resamples,
         bootstrap_seed=benchmark_config.bootstrap_seed,
-        stability_reference_reward=benchmark_config.stability_reference_reward,
     )
     acceptance = evaluate_acceptance(aggregate, acceptance_thresholds)
     return ContinualMultiAgentReport(
