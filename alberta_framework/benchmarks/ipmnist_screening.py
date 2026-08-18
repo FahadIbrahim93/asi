@@ -143,7 +143,7 @@ import platform
 import subprocess
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import FunctionType, MappingProxyType
 from typing import Any, cast
@@ -157,6 +157,18 @@ from jax import Array
 
 from alberta_framework._seed_validation import require_jax_seed
 from alberta_framework._strict_json import load_strict_json_object
+from alberta_framework.benchmarks.cchain_ipmnist import (
+    OFFICIAL_COMMIT as CCHAIN_OFFICIAL_COMMIT,
+)
+from alberta_framework.benchmarks.cchain_ipmnist import (
+    PAPER_REVISION as CCHAIN_PAPER_REVISION,
+)
+from alberta_framework.benchmarks.cchain_ipmnist import (
+    CChainState,
+    cchain_host_diagnostics,
+    cchain_hyperparameters,
+    make_cchain_learner,
+)
 from alberta_framework.benchmarks.upgd_ipmnist import (
     _PLASTICITY_LOSS_FLOOR,
     ADAMW_PROTOCOL_HYPERPARAMETERS,
@@ -204,6 +216,24 @@ from alberta_framework.evaluation.bounded_elastic_ipmnist_nonpromoting import (
     bounded_elastic_resource_expectations,
     registered_bounded_elastic_hyperparameters,
     validate_bounded_elastic_development_result,
+)
+from alberta_framework.evaluation.cchain_ipmnist_nonpromoting import (
+    ADAPTATION_ID as CCHAIN_ADAPTATION_ID,
+)
+from alberta_framework.evaluation.cchain_ipmnist_nonpromoting import (
+    COMPARABILITY_GAPS as CCHAIN_COMPARABILITY_GAPS,
+)
+from alberta_framework.evaluation.cchain_ipmnist_nonpromoting import (
+    COMPARISON_ID as CCHAIN_COMPARISON_ID,
+)
+from alberta_framework.evaluation.cchain_ipmnist_nonpromoting import (
+    DEVELOPMENT_SEEDS as CCHAIN_DEVELOPMENT_SEEDS,
+)
+from alberta_framework.evaluation.cchain_ipmnist_nonpromoting import (
+    RESULT_SCHEMA as CCHAIN_RESULT_SCHEMA,
+)
+from alberta_framework.evaluation.cchain_ipmnist_nonpromoting import (
+    validate_cchain_development_result,
 )
 from alberta_framework.evaluation.l2er_ipmnist_nonpromoting import (
     COMPARISON_ID as L2ER_COMPARISON_ID,
@@ -8008,6 +8038,71 @@ def _build_registry() -> dict[str, ScreeningSpec]:
             ),
         )
     )
+    # C-CHAIN is adapted from the official ICML-2025 implementation at
+    # 2f8bedf: Adam plus a recent-policy cross-entropy on a prior-update reference
+    # ring, adaptive relative-loss scaling, and the paper's two gradient
+    # component ablations.  The online prior-example ring and all remaining
+    # comparability gaps are frozen into its dedicated receipt validator.
+    for (
+        arm_name,
+        churn_enabled,
+        adaptive_coefficient,
+        target_relative_loss_scale,
+        gradient_component,
+        arm_description,
+    ) in (
+        (
+            "cchain_mechanism_off",
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            "Matched Adam control with all C-CHAIN reference and diagnostic overhead charged.",
+        ),
+        (
+            "cchain_full",
+            1.0,
+            1.0,
+            10_000.0,
+            0.0,
+            "Full C-CHAIN churn gradient with the official target relative-loss scale.",
+        ),
+        (
+            "cchain_orthogonal_only",
+            1.0,
+            1.0,
+            10_000.0,
+            1.0,
+            "Orthogonal churn-gradient component: the paper's NTK-decorrelation ablation.",
+        ),
+        (
+            "cchain_projective_only",
+            1.0,
+            1.0,
+            10_000.0,
+            2.0,
+            "Projective churn-gradient component: the paper's step-size ablation.",
+        ),
+    ):
+        specs.append(
+            ScreeningSpec(
+                name=arm_name,
+                base_learner="adamw",
+                mechanism="c_chain",
+                hyperparameters=cchain_hyperparameters(
+                    churn_enabled=churn_enabled,
+                    adaptive_coefficient=adaptive_coefficient,
+                    target_relative_loss_scale=target_relative_loss_scale,
+                    gradient_component=gradient_component,
+                ),
+                factory=make_cchain_learner,
+                description=(
+                    arm_description
+                    + " This is a permanently nonpromoting online-IPMNIST adaptation, "
+                    "not a reproduction of the paper's continual-RL protocols."
+                ),
+            )
+        )
     return {spec.name: spec for spec in specs}
 
 
@@ -9020,6 +9115,7 @@ class ScreeningRunResult:
     wall_clock_seconds: float
     noise_mode: str = "step"
     noise_pool_steps: int | None = None
+    mechanism_diagnostics: dict[str, float] | None = None
 
     def __post_init__(self) -> None:
         for attr in ("config_name", "base_learner", "noise_mode"):
@@ -9071,6 +9167,20 @@ class ScreeningRunResult:
             "noise_pool_steps",
             _validated_screening_noise_pool_steps(self.noise_mode, self.noise_pool_steps),
         )
+        diagnostics = self.mechanism_diagnostics
+        if diagnostics is not None:
+            if type(diagnostics) is not dict or not diagnostics:
+                raise ValueError("mechanism_diagnostics must be a non-empty exact dict or None")
+            normalized_diagnostics: dict[str, float] = {}
+            for name, value in diagnostics.items():
+                if type(name) is not str or not name or "\x00" in name:
+                    raise ValueError("mechanism diagnostic names must be non-empty strings")
+                if type(value) is not float or not math.isfinite(value) or value < 0.0:
+                    raise ValueError(
+                        "mechanism diagnostic values must be finite nonnegative floats"
+                    )
+                normalized_diagnostics[name] = value
+            object.__setattr__(self, "mechanism_diagnostics", normalized_diagnostics)
 
 
 def l2er_development_result_payload(
@@ -9767,6 +9877,104 @@ def bounded_elastic_development_result_payload(
     return validate_bounded_elastic_development_result(payload)
 
 
+def cchain_development_result_payload(
+    result: ScreeningRunResult, *, outcome: str
+) -> dict[str, object]:
+    """Build and strictly validate one nonpromoting C-CHAIN result receipt."""
+    spec = screening_spec(result.config_name)
+    if spec.mechanism != "c_chain" or result.noise_mode != "step":
+        raise ValueError("a C-CHAIN receipt requires an exact-step registered C-CHAIN arm")
+    if result.hyperparameters != spec.hyperparameters:
+        raise ValueError("result hyperparameters drift from the registered C-CHAIN arm")
+    diagnostics = result.mechanism_diagnostics
+    if type(diagnostics) is not dict:
+        raise ValueError("a C-CHAIN receipt requires measured mechanism diagnostics")
+    required_diagnostics = {
+        "mean_probability_kl",
+        "mean_logit_mse",
+        "final_coefficient",
+        "diagnostic_updates",
+        "ntk_threshold_rank",
+        "ntk_off_diagonal_abs_mean",
+        "ntk_diagonal_mean",
+        "ntk_examples",
+    }
+    if set(diagnostics) != required_diagnostics:
+        raise ValueError("C-CHAIN mechanism diagnostics have unexpected or missing fields")
+    config = result.config
+    observations = config.n_tasks * config.task_length
+    active_updates = max(observations - int(spec.hyperparameters["snapshot_warmup_updates"]), 0)
+    ntk_examples = int(diagnostics["ntk_examples"])
+    parameter_count = (
+        config.input_dim * config.hidden1
+        + config.hidden1
+        + config.hidden1 * config.hidden2
+        + config.hidden2
+        + config.hidden2 * config.n_classes
+        + config.n_classes
+    )
+    persistent_scalars = (
+        4 * parameter_count
+        + 5 * 6
+        + int(spec.hyperparameters["reference_capacity"]) * config.input_dim
+        + 2 * int(spec.hyperparameters["coefficient_window"])
+        + 9
+    )
+    ntk_rows = ntk_examples * config.n_classes
+    task_model_queries = 2 * observations
+    churn_model_queries = 2 * active_updates
+    ntk_model_queries = ntk_examples
+    payload: dict[str, object] = {
+        "schema": CCHAIN_RESULT_SCHEMA,
+        "comparison_id": CCHAIN_COMPARISON_ID,
+        "paper_revision": CCHAIN_PAPER_REVISION,
+        "official_commit": CCHAIN_OFFICIAL_COMMIT,
+        "adaptation_id": CCHAIN_ADAPTATION_ID,
+        "comparability_gaps": list(CCHAIN_COMPARABILITY_GAPS),
+        "arm": result.config_name,
+        "seed": result.seed,
+        "development_seed_protocol": list(CCHAIN_DEVELOPMENT_SEEDS),
+        "n_tasks": config.n_tasks,
+        "task_length": config.task_length,
+        "input_dim": config.input_dim,
+        "hidden1": config.hidden1,
+        "hidden2": config.hidden2,
+        "n_classes": config.n_classes,
+        "observations": observations,
+        "updates": observations,
+        "allowed_boundary_information": [],
+        "allowed_task_information": ["current_example_label"],
+        "hyperparameters": dict(spec.hyperparameters),
+        "metrics": {
+            "mean_online_accuracy": float(np.mean(result.per_task_accuracy)),
+            "mean_loss": float(np.mean(result.per_task_loss)),
+            "mean_plasticity": float(np.mean(result.per_task_plasticity)),
+            **diagnostics,
+        },
+        "resources": {
+            "persistent_bytes": 4 * persistent_scalars,
+            "ntk_jacobian_envelope_bytes": 2 * ntk_rows * parameter_count * 4,
+            "environment_steps": 0,
+            "data_steps": observations,
+            "optimizer_updates": observations,
+            "task_model_queries": task_model_queries,
+            "churn_reference_updates": active_updates,
+            "churn_model_queries": churn_model_queries,
+            "ntk_model_queries": ntk_model_queries,
+            "model_queries": (
+                task_model_queries + churn_model_queries + ntk_model_queries
+            ),
+            "timing_seconds": float(result.wall_clock_seconds),
+            "timing_is_telemetry_only": True,
+        },
+        "outcome": outcome,
+        "outcome_retained": True,
+        "development_only": True,
+        "scientific_promotion_allowed": False,
+    }
+    return validate_cchain_development_result(payload)
+
+
 def run_screening_config(
     data_x: np.ndarray | Array,
     data_y: np.ndarray | Array,
@@ -9943,6 +10151,11 @@ def run_screening_config(
                 task_accuracy[-1],
                 elapsed,
             )
+    mechanism_diagnostics = (
+        cchain_host_diagnostics(params, state)
+        if type(state) is CChainState
+        else None
+    )
     return ScreeningRunResult(
         config_name=spec.name,
         base_learner=spec.base_learner,
@@ -9955,6 +10168,7 @@ def run_screening_config(
         wall_clock_seconds=time.monotonic() - started,
         noise_mode=noise_mode,
         noise_pool_steps=effective_noise_pool_steps,
+        mechanism_diagnostics=mechanism_diagnostics,
     )
 
 
@@ -9984,6 +10198,7 @@ _V2_SHARD_FIELDS = frozenset(
         "environment",
     }
 )
+_V2_CCHAIN_SHARD_FIELDS = _V2_SHARD_FIELDS | frozenset({"mechanism_receipt"})
 
 
 def _require_exact_keys(
@@ -10382,6 +10597,23 @@ def shard_payload(
         "dataset_provenance": dataset_binding,
         "environment": runtime_binding,
     }
+    if spec.mechanism == "c_chain":
+        persisted_result = replace(
+            result,
+            per_task_accuracy=np.asarray(payload["per_task_accuracy"], dtype=np.float64),
+            per_task_loss=np.asarray(payload["per_task_loss"], dtype=np.float64),
+            per_task_plasticity=np.asarray(
+                payload["per_task_plasticity"], dtype=np.float64
+            ),
+            wall_clock_seconds=cast(float, payload["wall_clock_seconds"]),
+        )
+        payload["mechanism_receipt"] = cchain_development_result_payload(
+            persisted_result, outcome="inconclusive"
+        )
+    elif result.mechanism_diagnostics is not None:
+        raise ValueError(
+            "only a registered mechanism lane may persist mechanism diagnostics"
+        )
     try:
         json.dumps(payload, allow_nan=False)
     except (TypeError, ValueError) as exc:
@@ -10404,7 +10636,15 @@ def load_shard(
         )
     is_v2 = schema == SHARD_SCHEMA
     if is_v2:
-        _require_exact_keys(payload, _V2_SHARD_FIELDS, context=str(path))
+        config_name_value = payload.get("config_name")
+        expected_fields = (
+            _V2_CCHAIN_SHARD_FIELDS
+            if type(config_name_value) is str
+            and config_name_value in SCREENING_REGISTRY
+            and SCREENING_REGISTRY[config_name_value].mechanism == "c_chain"
+            else _V2_SHARD_FIELDS
+        )
+        _require_exact_keys(payload, expected_fields, context=str(path))
         payload["evidence_policy"] = _validated_nonpromoting_policy(
             payload["evidence_policy"], context=str(path)
         )
@@ -10474,6 +10714,44 @@ def load_shard(
         payload["hyperparameters"] = _validated_registered_hyperparameters(
             payload.get("hyperparameters"), spec, context=str(path)
         )
+        if spec.mechanism == "c_chain":
+            receipt = validate_cchain_development_result(payload["mechanism_receipt"])
+            expected_axes = {
+                "arm": config_name,
+                "seed": payload["seed"],
+                "n_tasks": config.n_tasks,
+                "task_length": config.task_length,
+                "input_dim": config.input_dim,
+                "hidden1": config.hidden1,
+                "hidden2": config.hidden2,
+                "n_classes": config.n_classes,
+                "hyperparameters": payload["hyperparameters"],
+            }
+            if any(receipt[name] != expected for name, expected in expected_axes.items()):
+                raise ValueError(f"{path}: C-CHAIN receipt drifts from its enclosing shard")
+            if receipt["outcome"] != "inconclusive":
+                raise ValueError(
+                    f"{path}: a single C-CHAIN shard must remain outcome-inconclusive"
+                )
+            receipt_metrics = cast(Mapping[str, float], receipt["metrics"])
+            expected_metrics = {
+                "mean_online_accuracy": float(np.mean(payload["per_task_accuracy"])),
+                "mean_loss": float(np.mean(payload["per_task_loss"])),
+                "mean_plasticity": float(np.mean(payload["per_task_plasticity"])),
+            }
+            if any(
+                receipt_metrics[name] != expected
+                for name, expected in expected_metrics.items()
+            ):
+                raise ValueError(
+                    f"{path}: C-CHAIN receipt metrics drift from persisted shard curves"
+                )
+            receipt_resources = cast(Mapping[str, object], receipt["resources"])
+            if receipt_resources["timing_seconds"] != payload["wall_clock_seconds"]:
+                raise ValueError(
+                    f"{path}: C-CHAIN receipt timing drifts from its enclosing shard"
+                )
+            payload["mechanism_receipt"] = receipt
     noise_mode = _validated_screening_noise_mode(
         payload.get("noise_mode", "step"), spec, context=path
     )
