@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import pytest
 
+from alberta_framework.benchmarks.causal_map_forager import CausalMapForagerConfig
+
 pytestmark = pytest.mark.unit
 
 
@@ -24,8 +26,6 @@ class _HostileInt(int):
 
 
 def test_world_shape_rejects_hostile_before_lt() -> None:
-    from alberta_framework.benchmarks.causal_map_forager import CausalMapForagerConfig
-
     hostile = _HostileInt(2)
     _HostileInt.calls = 0
     with pytest.raises(Exception, match="world_shape"):
@@ -34,6 +34,20 @@ def test_world_shape_rejects_hostile_before_lt() -> None:
     assert CausalMapForagerConfig(world_shape=(2, 2)).world_shape == (2, 2)
     with pytest.raises(Exception, match="world_shape"):
         CausalMapForagerConfig(world_shape=(True, 2))  # type: ignore[arg-type]
+
+
+def test_world_shape_rejects_hostile_tuple_before_length_hooks() -> None:
+    class HostileTuple(tuple[int, int]):
+        calls = 0
+
+        def __len__(self) -> int:
+            type(self).calls += 1
+            raise AssertionError("hostile len")
+
+    hostile = HostileTuple((2, 2))
+    with pytest.raises(ValueError, match="world_shape"):
+        CausalMapForagerConfig(world_shape=hostile)
+    assert HostileTuple.calls == 0
 
 
 def test_seed_rejects_hostile_before_range() -> None:
