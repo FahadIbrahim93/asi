@@ -59,13 +59,13 @@ the current external review and the correction to the dated output survey.
 ## Artifact-schema boundary
 
 Every stored screening shard and summary in this append-only campaign is a v1
-record. The runbook's historical v1 validation and merge examples are therefore
-not commands for the current implementation. Strict merge now accepts only
-`alberta.ipmnist_screening.shard.v2`, requires an explicit `--expected-seeds`
-set for every arm, requires the declared control to be present, and writes a
-`summary.v2` that rebinds and recomputes all input shards. V1 shards cannot be
-strictly merged; `--legacy-v1-quarantine` is available only to parse them for
-the nonpromoting proxy audit.
+record. New `run` invocations write `alberta.ipmnist_screening.shard.v2`.
+The live merge command accepts v1 or v2 inputs, never a mixture, and recomputes
+the derived summary from the supplied shards. It requires the declared control
+and exactly the same observed seed set for every arm, but it does not accept a
+separately declared expected-seed universe. A v1 merge remains a legacy,
+non-source-bound description; only a v2 merge carries the current strict
+source, dataset, runtime, arm, and input-shard bindings.
 
 V2 binds the exact post-cast array bytes, arm fields and callback descriptors,
 a package-wide Python disk snapshot plus available checkout lock documents,
@@ -78,13 +78,16 @@ and global state matches disk or that the active environment matches the bound
 lock document. The entire campaign remains permanently nonpromoting.
 
 The seed contract is exact for each supplied arm, but v2 does not declare or
-prove that a wider candidate-arm universe is complete. Summaries use canonical
-absolute shard paths and are therefore machine-location-bound. Their merge host
-is not attested, and mixed invocation/progress-logging settings make aggregated
-wall-clock totals diagnostic only, not a speed comparison.
+prove that a wider candidate-arm universe is complete. V2 summaries record each
+shard path exactly as supplied to the merge command and recheck the file binding
+before publication. Relative paths therefore remain working-directory-dependent,
+while absolute paths remain machine-location-dependent; neither form is a portable
+artifact locator. The merge host is not attested, and mixed invocation or
+progress-logging settings make aggregated wall-clock totals diagnostic only,
+not a speed comparison.
 
 New runs must target new output paths; the current writer refuses replacement
-of an existing shard or summary. Use the live CLI help for the exact v2 syntax:
+of an existing shard or summary. Use the live CLI help for the exact syntax:
 
 ```bash
 .venv/bin/python -m alberta_framework.benchmarks.ipmnist_screening run --help
