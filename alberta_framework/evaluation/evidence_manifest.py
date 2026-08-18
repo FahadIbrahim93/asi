@@ -40,6 +40,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from types import FunctionType
 from typing import Literal, NoReturn, Protocol
 
 from alberta_framework.evaluation.continual_ia import (
@@ -326,6 +327,12 @@ _IA_ATTESTATION_LIMITATIONS = (
 
 EvidenceClass = Literal["unit", "smoke", "scientific"]
 EvidenceLevel = Literal["L0", "L1", "L2", "L3"]
+_EVIDENCE_CLASSES: frozenset[str] = frozenset({"unit", "smoke", "scientific"})
+_EVIDENCE_LEVELS: frozenset[str] = frozenset({"L0", "L1", "L2", "L3"})
+_PATH_TYPE = type(Path())
+_MAX_SPEC_TEXT_BYTES = 64 * 1024
+_MAX_SPEC_SEQUENCE_ITEMS = 256
+_MAX_SPEC_MAPPING_ITEMS = 256
 
 DIRTY_STATE_POLICY: Mapping[str, object] = {
     "policy_version": DIRTY_STATE_POLICY_VERSION,
@@ -358,6 +365,71 @@ class ValidationResult(Protocol):
         """Fail-closed validation errors."""
 
 
+def _require_exact_text(name: str, value: object) -> str:
+    if type(value) is not str or not value:
+        raise ValueError(f"{name} must be a non-empty string")
+    if len(value) > _MAX_SPEC_TEXT_BYTES or len(value.encode("utf-8")) > _MAX_SPEC_TEXT_BYTES:
+        raise ValueError(f"{name} exceeds {_MAX_SPEC_TEXT_BYTES} UTF-8 bytes")
+    return value
+
+
+def _require_exact_bool(name: str, value: object) -> bool:
+    if type(value) is not bool:
+        raise ValueError(f"{name} must be a boolean")
+    return value
+
+
+def _require_exact_path(name: str, value: object) -> Path:
+    if type(value) is not _PATH_TYPE:
+        raise ValueError(f"{name} must be an exact platform Path")
+    encoded = value.as_posix().encode("utf-8")
+    if not encoded or len(encoded) > _MAX_SPEC_TEXT_BYTES:
+        raise ValueError(f"{name} must be a bounded non-empty Path")
+    return value
+
+
+def _require_exact_str_tuple(name: str, value: object) -> tuple[str, ...]:
+    if (
+        type(value) is not tuple
+        or not value
+        or len(value) > _MAX_SPEC_SEQUENCE_ITEMS
+    ):
+        raise ValueError(f"{name} must be a non-empty tuple of non-empty strings")
+    for item in value:
+        _require_exact_text(name, item)
+    return value
+
+
+def _require_path_tuple(name: str, value: object) -> tuple[Path, ...]:
+    if (
+        type(value) is not tuple
+        or not value
+        or len(value) > _MAX_SPEC_SEQUENCE_ITEMS
+    ):
+        raise ValueError(f"{name} must be a non-empty tuple of Path values")
+    for item in value:
+        _require_exact_path(name, item)
+    return value
+
+
+def _require_identity_mapping(name: str, value: object) -> dict[str, object]:
+    if (
+        type(value) is not dict
+        or not value
+        or len(value) > _MAX_SPEC_MAPPING_ITEMS
+    ):
+        raise ValueError(f"{name} must be a non-empty dict with exact string keys")
+    for key in value:
+        _require_exact_text(f"{name} key", key)
+    return value
+
+
+def _require_identity_callable(name: str, value: object) -> Callable[..., object]:
+    if type(value) is not FunctionType:
+        raise ValueError(f"{name} must be an exact function")
+    return value
+
+
 @dataclass(frozen=True)
 class EvidenceSpec:
     """One immutable evidence-claim contract."""
@@ -379,6 +451,33 @@ class EvidenceSpec:
     required_environment_fields: tuple[str, ...]
     loader: Callable[[Path], Mapping[str, object]]
     validator: Callable[[Mapping[str, object]], ValidationResult]
+
+    def __post_init__(self) -> None:
+        _require_exact_text("name", self.name)
+        _require_exact_text("claim_scope", self.claim_scope)
+        if type(self.evidence_class) is not str or self.evidence_class not in _EVIDENCE_CLASSES:
+            raise ValueError("evidence_class must be a known evidence class")
+        if type(self.evidence_level) is not str or self.evidence_level not in _EVIDENCE_LEVELS:
+            raise ValueError("evidence_level must be a known evidence level")
+        _require_exact_bool("promotes_scientific_claim", self.promotes_scientific_claim)
+        relative_path = _require_exact_path("relative_path", self.relative_path)
+        if relative_path.is_absolute() or ".." in relative_path.parts:
+            raise ValueError("relative_path must remain under the repository root")
+        _require_exact_text("expected_schema", self.expected_schema)
+        _require_exact_str_tuple("command_argv", self.command_argv)
+        _require_identity_mapping("protocol", self.protocol)
+        _require_identity_mapping("configuration", self.configuration)
+        _require_identity_mapping("seeds", self.seeds)
+        _require_identity_mapping("thresholds", self.thresholds)
+        _require_exact_str_tuple("limitations", self.limitations)
+        source_paths = _require_path_tuple("source_paths", self.source_paths)
+        if len(set(source_paths)) != len(source_paths):
+            raise ValueError("source_paths must be unique")
+        if any(path.is_absolute() or ".." in path.parts for path in source_paths):
+            raise ValueError("source_paths must remain under the repository root")
+        _require_exact_str_tuple("required_environment_fields", self.required_environment_fields)
+        _require_identity_callable("loader", self.loader)
+        _require_identity_callable("validator", self.validator)
 
 
 @dataclass(frozen=True)
