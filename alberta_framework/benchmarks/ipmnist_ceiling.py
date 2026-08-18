@@ -9,6 +9,7 @@ development-only.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import tempfile
@@ -335,10 +336,12 @@ def run_batch_reference(
 
     accuracy_jit = jax.jit(accuracy_fn)
     rng = np.random.default_rng(seed)
+    schedule_digest = hashlib.sha256()
     history: list[float] = []
     started = time.monotonic()
     for epoch in range(epochs):
         order = rng.permutation(60_000)
+        schedule_digest.update(memoryview(np.ascontiguousarray(order)).cast("B"))
         for start in range(0, 60_000 - batch_size + 1, batch_size):
             indices = order[start : start + batch_size]
             params, optimizer_state = train_step(
@@ -395,6 +398,7 @@ def run_batch_reference(
                 "seed": seed,
                 "epochs": epochs,
                 "batch_size": batch_size,
+                "epoch_order_sha256": schedule_digest.hexdigest(),
             },
             "inputs": {"config": config.to_config(), "optimizer": "adam(1e-3)"},
         },
