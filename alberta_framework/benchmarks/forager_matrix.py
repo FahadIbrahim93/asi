@@ -870,10 +870,10 @@ def _decode_strict_json(data: str, *, description: str) -> Any:
 
 
 def _require_object(value: Any, path: str) -> Mapping[str, Any]:
-    if not isinstance(value, Mapping):
+    if type(value) is not dict and type(value) is not MappingProxyType:
         raise ForagerMatrixManifestError(f"{path} must be a JSON object")
-    if any(not isinstance(key, str) for key in value):
-        raise ForagerMatrixManifestError(f"{path} object keys must be strings")
+    if any(type(key) is not str for key in value):
+        raise ForagerMatrixManifestError(f"{path} object keys must be exact strings")
     return cast(Mapping[str, Any], value)
 
 
@@ -894,8 +894,8 @@ def _require_exact_keys(
 
 
 def _require_string(value: Any, path: str) -> str:
-    if not isinstance(value, str):
-        raise ForagerMatrixManifestError(f"{path} must be a string")
+    if type(value) is not str:
+        raise ForagerMatrixManifestError(f"{path} must be an exact string")
     return value
 
 
@@ -1714,6 +1714,8 @@ def _assert_path_sanitized(value: Any, path: str = "artifact") -> None:
         return
     if not isinstance(value, str):
         return
+    if type(value) is not str:
+        value = str.__str__(value)
     home = Path.home().as_posix()
     repo = REPO_ROOT.as_posix()
     absolute_path_fragment = re.search(
@@ -1844,9 +1846,9 @@ def validate_verifier_issued_tuning_envelope(
     for name, expected in expected_digests.items():
         actual = evidence[name]
         if (
-            not isinstance(expected, str)
+            type(expected) is not str
             or _SHA256.fullmatch(expected) is None
-            or not isinstance(actual, str)
+            or type(actual) is not str
             or _SHA256.fullmatch(actual) is None
             or not hmac.compare_digest(actual, expected)
         ):
@@ -1950,7 +1952,7 @@ def _hashed_payload(value: Mapping[str, Any]) -> dict[str, Any]:
 def _verify_hashed_payload(value: Any, *, description: str) -> Mapping[str, Any]:
     payload = _require_object(value, description)
     supplied = payload.get("payload_sha256")
-    if not isinstance(supplied, str) or _SHA256.fullmatch(supplied) is None:
+    if type(supplied) is not str or _SHA256.fullmatch(supplied) is None:
         raise ForagerMatrixStateError(f"{description} has no valid payload_sha256")
     unhashed = {key: item for key, item in payload.items() if key != "payload_sha256"}
     actual = _json_sha256(unhashed)
@@ -2843,7 +2845,7 @@ def _validate_source_snapshot_bytes(
             raise ForagerMatrixStateError(
                 f"{description} inventory file exceeds the size limit"
             )
-        if not isinstance(digest, str) or _SHA256.fullmatch(digest) is None:
+        if type(digest) is not str or _SHA256.fullmatch(digest) is None:
             raise ForagerMatrixStateError(f"{description} inventory digest is invalid")
         expected_names.append(path)
         normalized_files.append((path, size, digest))
@@ -2942,7 +2944,7 @@ def _installed_distribution_inventory() -> list[str]:
     rows: set[str] = set()
     for distribution in importlib.metadata.distributions():
         name = distribution.metadata.get("Name")
-        if not isinstance(name, str) or not name.strip():
+        if type(name) is not str or not name.strip():
             continue
         normalized = re.sub(r"[-_.]+", "-", name.strip()).lower()
         rows.add(f"{normalized}=={distribution.version}")
@@ -4441,7 +4443,7 @@ def _validate_execution_manifest(
 
 
 def _validate_utc_timestamp(value: Any, path: str) -> datetime:
-    if not isinstance(value, str) or not value:
+    if type(value) is not str or not value:
         raise ForagerMatrixStateError(f"{path} must be a non-empty UTC timestamp")
     try:
         parsed = datetime.fromisoformat(value)
@@ -4493,7 +4495,7 @@ def _validate_execution_manifest_structure(payload: Mapping[str, Any]) -> None:
         "runtime_sha256",
     }
     for name in digest_names:
-        if not isinstance(identity[name], str) or _SHA256.fullmatch(identity[name]) is None:
+        if type(identity[name]) is not str or _SHA256.fullmatch(identity[name]) is None:
             raise ForagerMatrixStateError(f"execution identity {name} is invalid")
     if (
         isinstance(identity["source_archive_size"], bool)
@@ -4501,10 +4503,15 @@ def _validate_execution_manifest_structure(payload: Mapping[str, Any]) -> None:
         or not 0 < identity["source_archive_size"] <= _MAX_SOURCE_ARCHIVE_BYTES
     ):
         raise ForagerMatrixStateError("execution identity source_archive_size is invalid")
-    if identity["source_execution_mode"] not in SOURCE_EXECUTION_MODES:
+    if (
+        type(identity["source_execution_mode"]) is not str
+        or identity["source_execution_mode"] not in SOURCE_EXECUTION_MODES
+    ):
         raise ForagerMatrixStateError("execution source mode is invalid")
     if (
-        identity["source_isolation_mode"]
+        type(identity["source_isolation_mode"]) is not str
+        or type(identity["runtime_binding_mode"]) is not str
+        or identity["source_isolation_mode"]
         != (
             "content_verified_snapshot_subprocess"
             if identity["source_execution_mode"] == SNAPSHOT_SOURCE_EXECUTION_MODE
@@ -4574,12 +4581,12 @@ def _validate_execution_manifest_structure(payload: Mapping[str, Any]) -> None:
     if type(git["dirty"]) is not bool or not isinstance(git["status"], list):
         raise ForagerMatrixStateError("execution git provenance values are invalid")
     if git["commit"] is not None and (
-        not isinstance(git["commit"], str)
+        type(git["commit"]) is not str
         or _GIT_OBJECT.fullmatch(git["commit"]) is None
     ):
         raise ForagerMatrixStateError("execution git commit is invalid")
     if git["diff_sha256"] is not None and (
-        not isinstance(git["diff_sha256"], str)
+        type(git["diff_sha256"]) is not str
         or _SHA256.fullmatch(git["diff_sha256"]) is None
     ):
         raise ForagerMatrixStateError("execution git diff_sha256 is invalid")
@@ -4651,9 +4658,9 @@ def _validate_trace_descriptor(
         or not isinstance(steps, int)
         or steps != expected_steps
         or descriptor["biome_regret_present"] is not True
-        or not isinstance(location, str)
+        or type(location) is not str
         or (expected_output_path is not None and location != expected_output_path)
-        or not isinstance(descriptor["sha256"], str)
+        or type(descriptor["sha256"]) is not str
         or _SHA256.fullmatch(descriptor["sha256"]) is None
         or isinstance(descriptor["size"], bool)
         or not isinstance(descriptor["size"], int)
