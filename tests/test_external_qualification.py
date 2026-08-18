@@ -36,6 +36,15 @@ def test_clear_uses_official_curation_source_without_claiming_asset_readiness() 
     assert "external_code_available_and_license_reviewed" in plan.blockers
 
 
+def test_action_conditioned_lane_pins_official_dreamer_cdp_source() -> None:
+    plan = qualification_plan(1575)
+    assert plan.code_revisions[0] == ExternalCodeRevision(
+        "https://github.com/fmi-basel/Dreamer-CDP.git",
+        "a851fa3e3d70b624b094ee1810ad4bb602346092",
+    )
+    assert "isolated_runtime_locked" in plan.blockers
+
+
 def test_completed_r0_plan_still_cannot_authorize_external_execution() -> None:
     revision = ExternalCodeRevision("https://github.com/org/repo.git", "a" * 40)
     plan = ExternalQualificationPlan(

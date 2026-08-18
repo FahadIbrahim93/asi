@@ -165,6 +165,10 @@ EXTERNAL_QUALIFICATION_PLANS: tuple[ExternalQualificationPlan, ...] = (
         ("arXiv:2603.07083v2", "arXiv:2605.13013v1", "arXiv:2512.24497v3"),
         (
             _revision(
+                "https://github.com/fmi-basel/Dreamer-CDP.git",
+                "a851fa3e3d70b624b094ee1810ad4bb602346092",
+            ),
+            _revision(
                 "https://github.com/facebookresearch/jepa-wms.git",
                 "13cf1d9c7e476f53c17714d2e0f1dc239a883ce0",
             ),
