@@ -83,7 +83,8 @@ def _require_exact_bool(value: Any, path: str) -> bool:
 
 
 def _require_finite_real(value: Any, path: str) -> float:
-    if type(value) not in (int, float):
+    value_type = type(value)
+    if value_type is not int and value_type is not float:
         raise ForagerMatchedCandidateUniverseError(f"{path} must be a finite number")
     number = float(cast("int | float", value))
     if not math.isfinite(number):

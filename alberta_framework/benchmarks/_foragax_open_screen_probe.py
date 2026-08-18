@@ -92,7 +92,7 @@ def _sha256(path: Path) -> str:
 
 def _is_exact_int(value: Any) -> TypeGuard[int]:
     """True only for exact ints; bool is an int subclass and must not alias 0/1."""
-    return isinstance(value, int) and not isinstance(value, bool)
+    return type(value) is int
 
 
 def _validate_task_intake(protocol: dict[str, Any]) -> tuple[dict[str, Any], int, list[int]]:
