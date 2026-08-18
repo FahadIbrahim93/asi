@@ -324,9 +324,9 @@ def _strict_json_object_with_sha256(path: Path) -> tuple[dict[str, object], str]
 
 
 def _finite_number(value: object) -> float | None:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    if type(value) not in (int, float):
         return None
-    number = float(value)
+    number = float(value)  # type: ignore[arg-type]
     return number if math.isfinite(number) else None
 
 
