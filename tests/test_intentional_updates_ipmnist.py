@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import dataclasses
 from typing import Never
 
 import jax
@@ -155,6 +156,28 @@ def test_counter_exhaustion_is_visible_before_int32_wraparound() -> None:
     assert int(new_state.step) == 0
 
 
+def test_desynchronized_counters_are_visible_under_eager_and_jit_execution() -> None:
+    spec = screening_spec("intentional_updates_ipmnist")
+    init_fn, step_fn = spec.factory(spec.hyperparameters)
+    params = init_mlp_params(jr.key(46), SMALL)
+    state = init_fn(params).replace(clip_step=jnp.asarray(1, dtype=jnp.int32))
+    args = (
+        params,
+        state,
+        jnp.zeros((SMALL.input_dim,), dtype=jnp.float32),
+        jnp.asarray(0, dtype=jnp.int32),
+        jr.key(47),
+    )
+    with pytest.raises(ValueError, match="finite and valid"):
+        step_fn(*args)
+    new_params, new_state, metrics = jax.jit(step_fn)(*args)
+    assert all(bool(jnp.all(jnp.isnan(value))) for value in new_params.values())
+    assert bool(jnp.all(jnp.isnan(jnp.asarray(metrics))))
+    assert int(new_state.step) == 0
+    assert int(new_state.clip_step) == 0
+    assert bool(jnp.isnan(new_state.clip_squared_error))
+
+
 def test_head_only_feature_control_freezes_hidden_parameters() -> None:
     spec = screening_spec("intentional_updates_head_only")
     init_fn, step_fn = spec.factory(spec.hyperparameters)
@@ -281,6 +304,14 @@ def test_record_revalidates_forged_dataclasses() -> None:
     result = run_screening_config(
         x, y, screening_spec("intentional_updates_ipmnist"), seed=23, config=config
     )
+    with pytest.raises(ValueError, match="base learner"):
+        intentional_updates_development_record(
+            dataclasses.replace(result, base_learner="adamw")
+        )
+    with pytest.raises(ValueError, match="exact-step execution"):
+        intentional_updates_development_record(
+            dataclasses.replace(result, noise_mode="pool", noise_pool_steps=2)
+        )
     object.__setattr__(result.config, "n_tasks", True)
     with pytest.raises(ValueError, match="n_tasks"):
         intentional_updates_development_record(result)
