@@ -77,6 +77,7 @@ EVIDENCE_SEEDS = tuple(range(30, 60))
 _INT32_MAX = 2**31 - 1
 _UINT32_MAX = 2**32 - 1
 _BOOTSTRAP_MAX_SEED_OFFSET = 103
+_MAX_DECISION_RECORD_BYTES = 256 * 1024 * 1024
 _FLOAT32_MAX_BELOW_OVERFLOW = float(
     np.nextafter(np.float32(np.finfo(np.float32).max), np.float32(0.0))
 )
@@ -205,13 +206,17 @@ class DecisionFidelityConfig:
         rollout_scalars = _require_derived_int32(
             "probe rollout work", probe_count * menu_count * horizon
         )
-        _require_derived_int32(
+        probe_and_rollout_bytes = _require_derived_int32(
             "probe and rollout array bytes",
             16 * rollout_scalars
             + 8 * probe_count * menu_count
             + 8 * menu_count * horizon
             + 16 * probe_count,
         )
+        if probe_and_rollout_bytes > _MAX_DECISION_RECORD_BYTES:
+            raise ValueError(
+                "probe and rollout arrays exceed the bounded decision-record budget"
+            )
         menu_values: list[float] = []
         menu_ratios: list[tuple[int, int]] = []
         for index, value in enumerate(self.menu_amplitudes):
@@ -295,6 +300,53 @@ class DecisionProbeSet:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "seed", _require_int32("seed", self.seed, minimum=0))
+        arrays = (
+            ("initial_observations", self.initial_observations, np.dtype(np.float32)),
+            ("goals", self.goals, np.dtype(np.float32)),
+            ("domain_indices", self.domain_indices, np.dtype(np.int64)),
+            ("action_sequences", self.action_sequences, np.dtype(np.float32)),
+            ("true_next_observations", self.true_next_observations, np.dtype(np.float64)),
+            ("true_rewards", self.true_rewards, np.dtype(np.float64)),
+            ("true_returns", self.true_returns, np.dtype(np.float64)),
+        )
+        total_bytes = 0
+        for name, value, expected_dtype in arrays:
+            if type(value) is not np.ndarray:
+                raise ValueError(f"{name} must be an exact numpy.ndarray")
+            if value.dtype != expected_dtype:
+                raise ValueError(f"{name} must have dtype {expected_dtype}")
+            total_bytes += value.nbytes
+            if total_bytes > _MAX_DECISION_RECORD_BYTES:
+                raise ValueError("decision probe arrays exceed the bounded record budget")
+
+        if self.initial_observations.ndim != 2 or self.initial_observations.shape[1:] != (1,):
+            raise ValueError("initial_observations must have shape (probe_count, 1)")
+        probe_count = self.initial_observations.shape[0]
+        if probe_count < 2:
+            raise ValueError("decision probes must contain at least two probes")
+        if self.goals.shape != (probe_count, 1):
+            raise ValueError("goals must match the probe count and observation shape")
+        if self.domain_indices.shape != (probe_count,):
+            raise ValueError("domain_indices must match the probe count")
+        if self.action_sequences.ndim != 3 or self.action_sequences.shape[2:] != (1,):
+            raise ValueError("action_sequences must have shape (menu_count, horizon, 1)")
+        menu_count, horizon, _ = self.action_sequences.shape
+        if menu_count < 2 or horizon < 1:
+            raise ValueError("action_sequences must contain a non-empty multi-choice menu")
+        if self.true_next_observations.shape != (probe_count, menu_count, horizon, 1):
+            raise ValueError("true_next_observations does not match the probe/menu schedule")
+        if self.true_rewards.shape != (probe_count, menu_count, horizon):
+            raise ValueError("true_rewards does not match the probe/menu schedule")
+        if self.true_returns.shape != (probe_count, menu_count):
+            raise ValueError("true_returns does not match the probe/menu schedule")
+
+        for name, value, _ in arrays:
+            if name != "domain_indices" and not bool(np.all(np.isfinite(value))):
+                raise ValueError(f"{name} must contain only finite values")
+        if self.domain_indices.min() != 0 or self.domain_indices.max() != 1:
+            raise ValueError("domain_indices must contain both exact domains 0 and 1")
+        if not np.array_equal(self.true_returns, self.true_rewards.sum(axis=2)):
+            raise ValueError("true_returns must exactly equal the summed true rewards")
 
 
 @dataclass(frozen=True)
@@ -304,6 +356,26 @@ class PredictedRollouts:
     next_observations: NDArray[np.float64]
     rewards: NDArray[np.float64]
     returns: NDArray[np.float64]
+
+    def __post_init__(self) -> None:
+        arrays = (
+            ("next_observations", self.next_observations),
+            ("rewards", self.rewards),
+            ("returns", self.returns),
+        )
+        total_bytes = 0
+        for name, value in arrays:
+            if type(value) is not np.ndarray or value.dtype != np.dtype(np.float64):
+                raise ValueError(f"{name} must be an exact float64 numpy.ndarray")
+            total_bytes += value.nbytes
+            if total_bytes > _MAX_DECISION_RECORD_BYTES:
+                raise ValueError("predicted rollout arrays exceed the bounded record budget")
+        if self.next_observations.ndim != 4 or self.next_observations.shape[-1:] != (1,):
+            raise ValueError("next_observations must have shape (probes, menu, horizon, 1)")
+        if self.rewards.shape != self.next_observations.shape[:-1]:
+            raise ValueError("rewards must match the predicted rollout schedule")
+        if self.returns.shape != self.rewards.shape[:2]:
+            raise ValueError("returns must match the predicted probe/menu schedule")
 
 
 @dataclass(frozen=True)
@@ -347,10 +419,12 @@ class SeedDecisionResult:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "seed", _require_int32("seed", self.seed, minimum=0))
-        if not isinstance(self.metrics, tuple) or not all(
-            isinstance(m, DecisionMetrics) for m in self.metrics
+        if type(self.metrics) is not tuple or not all(
+            type(metric) is DecisionMetrics for metric in self.metrics
         ):
-            raise ValueError("metrics must be a tuple of DecisionMetrics")
+            raise ValueError("metrics must be an exact tuple of exact DecisionMetrics")
+        if tuple(metric.condition for metric in self.metrics) != CONDITION_NAMES:
+            raise ValueError("metrics must contain each frozen condition exactly once in order")
 
 
 @dataclass(frozen=True)
@@ -448,24 +522,32 @@ class DecisionFidelityReport:
     comparisons: tuple[PairedComparison, ...]
 
     def __post_init__(self) -> None:
-        if not isinstance(self.config, DecisionFidelityConfig):
+        if type(self.config) is not DecisionFidelityConfig:
             raise ValueError("config must be a DecisionFidelityConfig")
-        if not isinstance(self.seeds, tuple) or not all(
+        if type(self.seeds) is not tuple or not self.seeds or not all(
             type(s) is int and 0 <= s <= _INT32_MAX for s in self.seeds
         ):
-            raise ValueError("seeds must be a tuple of non-negative int32 seeds")
-        if not isinstance(self.seed_results, tuple) or not all(
-            isinstance(r, SeedDecisionResult) for r in self.seed_results
+            raise ValueError("seeds must be a non-empty exact tuple of non-negative int32 seeds")
+        if len(set(self.seeds)) != len(self.seeds):
+            raise ValueError("seeds must be unique")
+        if type(self.seed_results) is not tuple or not all(
+            type(result) is SeedDecisionResult for result in self.seed_results
         ):
-            raise ValueError("seed_results must be a tuple of SeedDecisionResult")
-        if not isinstance(self.aggregates, tuple) or not all(
-            isinstance(a, ConditionAggregate) for a in self.aggregates
+            raise ValueError("seed_results must be an exact tuple of exact SeedDecisionResult")
+        if tuple(result.seed for result in self.seed_results) != self.seeds:
+            raise ValueError("seed_results must exactly match the declared seed schedule")
+        if type(self.aggregates) is not tuple or not all(
+            type(aggregate) is ConditionAggregate for aggregate in self.aggregates
         ):
-            raise ValueError("aggregates must be a tuple of ConditionAggregate")
-        if not isinstance(self.comparisons, tuple) or not all(
-            isinstance(c, PairedComparison) for c in self.comparisons
+            raise ValueError("aggregates must be an exact tuple of exact ConditionAggregate")
+        if self.aggregates and (
+            tuple(aggregate.condition for aggregate in self.aggregates) != CONDITION_NAMES
         ):
-            raise ValueError("comparisons must be a tuple of PairedComparison")
+            raise ValueError("aggregates must contain each frozen condition exactly once in order")
+        if type(self.comparisons) is not tuple or not all(
+            type(comparison) is PairedComparison for comparison in self.comparisons
+        ):
+            raise ValueError("comparisons must be an exact tuple of exact PairedComparison")
 
     def aggregate(self, condition: str) -> ConditionAggregate:
         """Return one named condition or fail rather than silently substituting."""
