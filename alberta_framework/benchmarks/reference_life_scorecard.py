@@ -228,6 +228,13 @@ def _is_sha256(value: object) -> bool:
     )
 
 
+def _is_scorecard_lifecycle_id(value: object) -> bool:
+    if type(value) is not str or not value.startswith("prototype."):
+        return False
+    digest = value[len("prototype.") :]
+    return len(digest) == 16 and all(character in "0123456789abcdef" for character in digest)
+
+
 def _arm_definitions() -> list[dict[str, Any]]:
     return [
         {
@@ -1351,6 +1358,22 @@ class ScorecardRunSpec:
     arm: str
     seed: int
     lifecycle_id: str
+
+    def __post_init__(self) -> None:
+        schedule_size = len(SEED_ROSTER) * len(ENVIRONMENT_ROSTER) * len(ARM_ROSTER)
+        if type(self.schedule_index) is not int or not 0 <= self.schedule_index < schedule_size:
+            raise ValueError("schedule_index must be a nonnegative integer in the fixed schedule")
+        if (
+            type(self.environment_kind) is not str
+            or self.environment_kind not in ENVIRONMENT_ROSTER
+        ):
+            raise ValueError(f"unsupported environment {self.environment_kind!r}")
+        if type(self.arm) is not str or self.arm not in ARM_ROSTER:
+            raise ValueError(f"unsupported scorecard arm {self.arm!r}")
+        if type(self.seed) is not int or self.seed not in SEED_ROSTER:
+            raise ValueError("seed is not in the fixed scorecard roster")
+        if not _is_scorecard_lifecycle_id(self.lifecycle_id):
+            raise ValueError("lifecycle_id must be a prototype.<16-hex> identity")
 
 
 def iter_run_specs(plan: ReferenceLifeDevelopmentPlan) -> tuple[ScorecardRunSpec, ...]:
