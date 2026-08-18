@@ -14,6 +14,8 @@ Two conventions matter for downstream analysis:
   :func:`aggregate_metrics`.
 """
 
+from __future__ import annotations
+
 import math
 from collections.abc import Callable, Iterable, Sequence
 from decimal import Decimal
@@ -33,6 +35,8 @@ from alberta_framework.core.learners import (
 from alberta_framework.core.types import LearnerState
 from alberta_framework.streams.base import ScanStream
 from alberta_framework.utils.statistics import common_final_window
+
+_INT32_MAX = 2**31 - 1
 
 _NUMPY_COORDINATE_TYPES = frozenset(
     np.dtype(dtype_code).type
@@ -67,6 +71,48 @@ def _require_exact_str(name: str, value: object) -> str:
     return value
 
 
+def _require_positive_int(name: str, value: object) -> int:
+    if type(value) is not int or value < 1 or value > _INT32_MAX:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
+
+
+def _require_callable(name: str, value: object) -> Callable[..., object]:
+    if not callable(value):
+        raise ValueError(f"{name} must be callable")
+    return value
+
+
+def _require_metrics_history(value: object) -> list[dict[str, float]]:
+    if type(value) is not list:
+        raise ValueError("metrics_history must be an exact list")
+    if not value:
+        raise ValueError("metrics_history must contain at least one step")
+    canonical: list[dict[str, float]] = []
+    expected_keys: set[str] | None = None
+    for step_index, raw_metrics in enumerate(value):
+        if type(raw_metrics) is not dict:
+            raise ValueError(f"metrics_history[{step_index}] must be an exact dict")
+        metrics: dict[str, float] = {}
+        for key, raw_metric in raw_metrics.items():
+            if type(key) is not str or not key:
+                raise ValueError("metric names must be non-empty exact strings")
+            if type(raw_metric) is not int and type(raw_metric) is not float:
+                raise ValueError(f"metric '{key}' must be a finite builtin number")
+            metric = float(raw_metric)
+            if not math.isfinite(metric):
+                raise ValueError(f"metric '{key}' contains non-finite samples")
+            metrics[key] = metric
+        if not metrics:
+            raise ValueError("every metrics_history step must contain a metric")
+        if expected_keys is None:
+            expected_keys = set(metrics)
+        elif set(metrics) != expected_keys:
+            raise ValueError("all runs must contain the same metric keys at every step")
+        canonical.append(metrics)
+    return canonical
+
+
 def _type_identity_in(
     value_type: type[object],
     candidates: Iterable[type[object]],
@@ -84,7 +130,7 @@ class _CanonicalFractionCoordinate(tuple[int, int]):
         cls,
         numerator: int,
         denominator: int,
-    ) -> "_CanonicalFractionCoordinate":
+    ) -> _CanonicalFractionCoordinate:
         if type(numerator) is not int or type(denominator) is not int or denominator <= 0:
             raise ValueError("canonical Fraction coordinates require builtin integer components")
         normalized = Fraction(numerator, denominator)
@@ -143,7 +189,14 @@ _BYTES_COORDINATE_TYPES = (bytes, np.bytes_)
 _MAX_HYPERPARAMETER_COORDINATE_NESTING = 32
 
 
-class ExperimentConfig(NamedTuple):
+class _ExperimentConfigTuple(NamedTuple):
+    name: str
+    learner_factory: Callable[[], LinearLearner]
+    stream_factory: Callable[[], ScanStream[Any]]
+    num_steps: int
+
+
+class ExperimentConfig(_ExperimentConfigTuple):
     """Configuration for a single experiment.
 
     Attributes:
@@ -153,13 +206,42 @@ class ExperimentConfig(NamedTuple):
         num_steps: Number of learning steps to run
     """
 
-    name: str
-    learner_factory: Callable[[], LinearLearner]
-    stream_factory: Callable[[], ScanStream[Any]]
-    num_steps: int
+    __slots__ = ()
+
+    def __new__(
+        cls,
+        name: str,
+        learner_factory: Callable[[], LinearLearner],
+        stream_factory: Callable[[], ScanStream[Any]],
+        num_steps: int,
+    ) -> ExperimentConfig:
+        checked_learner = cast(
+            Callable[[], LinearLearner],
+            _require_callable("learner_factory", learner_factory),
+        )
+        checked_stream = cast(
+            Callable[[], ScanStream[Any]],
+            _require_callable("stream_factory", stream_factory),
+        )
+        return tuple.__new__(
+            cls,
+            (
+                _require_exact_str("name", name),
+                checked_learner,
+                checked_stream,
+                _require_positive_int("num_steps", num_steps),
+            ),
+        )
 
 
-class SingleRunResult(NamedTuple):
+class _SingleRunResultTuple(NamedTuple):
+    config_name: str
+    seed: int
+    metrics_history: list[dict[str, float]]
+    final_state: LearnerState
+
+
+class SingleRunResult(_SingleRunResultTuple):
     """Result from a single experiment run.
 
     Attributes:
@@ -169,10 +251,26 @@ class SingleRunResult(NamedTuple):
         final_state: Final learner state after training
     """
 
-    config_name: str
-    seed: int
-    metrics_history: list[dict[str, float]]
-    final_state: LearnerState
+    __slots__ = ()
+
+    def __new__(
+        cls,
+        config_name: str,
+        seed: int,
+        metrics_history: list[dict[str, float]],
+        final_state: LearnerState,
+    ) -> SingleRunResult:
+        if type(final_state) is not LearnerState:
+            raise TypeError("final_state must be an exact LearnerState")
+        return tuple.__new__(
+            cls,
+            (
+                _require_exact_str("config_name", config_name),
+                require_jax_seed(seed, name="seed"),
+                _require_metrics_history(metrics_history),
+                final_state,
+            ),
+        )
 
 
 class MetricSummary(NamedTuple):
@@ -234,6 +332,8 @@ def run_single_experiment(
     final_state, metrics = cast(tuple[LearnerState, Any], result)
     normalized = learner.normalizer is not None
     metrics_history = metrics_to_dicts(metrics, normalized=normalized)
+    if len(metrics_history) != config.num_steps:
+        raise ValueError("experiment metrics history must contain exactly num_steps records")
 
     return SingleRunResult(
         config_name=config_name,
@@ -283,6 +383,9 @@ def aggregate_metrics(results: list[SingleRunResult]) -> AggregatedResults:
     seeds = [require_jax_seed(r.seed, name="seed") for r in results]
     if len(set(seeds)) != len(seeds):
         raise ValueError(f"aggregate_metrics requires unique seed identities; got {seeds}")
+    step_counts = {len(r.metrics_history) for r in results}
+    if len(step_counts) != 1:
+        raise ValueError("aggregate_metrics requires one matched step count")
 
     # Get all metric keys from first result
     if any(
