@@ -207,9 +207,9 @@ def _flatten_json(value: Any, *, prefix: str = "") -> dict[str, Any]:
         return flattened
     if not prefix:
         raise ValueError("config metaParameters must be an object")
-    if isinstance(value, float) and not math.isfinite(value):
+    if type(value) is float and not math.isfinite(value):
         raise ValueError("config hyperparameters must be finite")
-    if not isinstance(value, (str, int, float, bool)) and value is not None:
+    if value is not None and type(value) not in (str, int, float, bool):
         raise ValueError(f"unsupported config hyperparameter type at {prefix!r}")
     return {prefix: value}
 
