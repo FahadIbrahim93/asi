@@ -90,6 +90,12 @@ def _invalid_execution_history() -> list[dict[str, object]]:
                 "the invalid output is not retained and cannot replace the prospective v2 matrix",
             ],
         },
+    ]
+
+
+def _retained_execution_history() -> list[dict[str, object]]:
+    """Bind accepted development results separately from invalid attempts."""
+    return [
         {
             "schema": "asi.l2er-ipmnist.matched-development-report.v2",
             "path": "outputs/l2er_matched_development/report.v2.json",
@@ -101,7 +107,7 @@ def _invalid_execution_history() -> list[dict[str, object]]:
             "merge_commit": "ee6d8949fa3ffc267297f2e7ced7f83f589835e1",
             "pull_request": 1753,
             "seeds": [1711, 1712, 1713],
-            "disposition": "invalid_unmerged_consumed_accounting_ambiguous_attempt",
+            "disposition": "accepted_retained_nonpromoting_inconclusive_development_result",
             "paired_outcomes_exposed": {
                 "l2er_l2_only": {
                     "mean_delta": 0.00033333152532577515,
@@ -122,10 +128,13 @@ def _invalid_execution_history() -> list[dict[str, object]]:
                     "outcome": "inconclusive",
                 },
             },
-            "invalid_reasons": [
-                "the v2 updates field ambiguously combined supervised and auxiliary steps",
-                "all planned 1711-1713 outcomes were exposed before the v3 contract was final",
-                "the unmerged v2 artifact cannot authorize a prospective same-seed v3 rerun",
+            "retention_and_limits": [
+                "the merged v2 artifact remains accepted and retained as a permanently "
+                "nonpromoting inconclusive development result",
+                "exposure of all planned 1711-1713 outcomes consumes those seeds for any "
+                "later prospective matched plan",
+                "v3 separately names supervised and auxiliary optimizer counters; that schema "
+                "clarification neither invalidates v2 nor authorizes a same-seed v3 rerun",
             ],
         },
     ]
@@ -152,6 +161,7 @@ def frozen_plan() -> dict[str, object]:
             "no complete report was produced"
         ),
         "invalid_execution_history": _invalid_execution_history(),
+        "retained_execution_history": _retained_execution_history(),
         "config": CONFIG.to_config(),
         "primary_metric": "mean_online_accuracy",
         "control_arm": "l2er_mechanism_off",
@@ -332,6 +342,9 @@ def _validated_plan(value: object) -> dict[str, object]:
     invalid_history = _bounded_json(
         plan["invalid_execution_history"], context="plan.invalid_execution_history"
     )
+    retained_history = _bounded_json(
+        plan["retained_execution_history"], context="plan.retained_execution_history"
+    )
     matched_axes = plan["matched_axes"]
     charged_axes = plan["arm_specific_charged_axes"]
     boundary = plan["allowed_boundary_information"]
@@ -362,6 +375,8 @@ def _validated_plan(value: object) -> dict[str, object]:
         raise ValueError("plan.consumed_preplan_audit_seeds must be an exact integer list")
     if invalid_history != _invalid_execution_history():
         raise ValueError("plan.invalid_execution_history does not match the audit record")
+    if retained_history != _retained_execution_history():
+        raise ValueError("plan.retained_execution_history does not match retained results")
     if (
         type(matched_axes) is not list
         or len(matched_axes) != 5
