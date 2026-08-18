@@ -1352,6 +1352,36 @@ def aggregate_ia_evidence(
         )
         if result.rewards.size != config.num_steps:
             raise ValueError("result length does not match config.num_steps")
+        if result.condition in RECOMMENDATION_CONDITIONS:
+            expected_actions = np.where(
+                result.accepted_recommendations,
+                result.recommendations,
+                result.partner_proposals,
+            )
+            if not np.array_equal(result.executed_actions, expected_actions):
+                raise ValueError("executed actions violate the recommendation protocol")
+            if bool(result.accepted_recommendations[0]):
+                raise ValueError("the first transition cannot have a prior acceptance")
+            if (
+                result.recommendations[0] != result.executed_actions[0]
+                or result.partner_proposals[0] != result.executed_actions[0]
+            ):
+                raise ValueError("first-transition provenance must equal the initial action")
+            if result.nominal_recommendation_decisions != config.num_steps:
+                raise ValueError("nominal recommendation decisions must equal config.num_steps")
+            executed_accepted = result.executed_accepted_recommendations
+            if result.nominal_accepted_recommendations not in {
+                executed_accepted,
+                executed_accepted + 1,
+            }:
+                raise ValueError("nominal accepted count is not bound to executed primitives")
+            if result.condition == "observe_only" and result.nominal_accepted_recommendations != 0:
+                raise ValueError("observe-only nominal accepts must be zero")
+            if (
+                result.condition == "accept_always"
+                and result.nominal_accepted_recommendations != config.num_steps
+            ):
+                raise ValueError("accept-always must accept every decision")
         expected_phase_means = _phase_means(result.rewards, config)
         if not np.array_equal(result.phase_mean_rewards, expected_phase_means):
             raise ValueError("phase_mean_rewards do not match rewards and config")
@@ -1362,6 +1392,10 @@ def aggregate_ia_evidence(
     if len(validated) % len(CONDITION_NAMES) != 0:
         raise ValueError("results must contain complete IA condition tuples")
     results = tuple(validated)
+    expected_budgets = _condition_budgets(config, _make_partner(config), _make_ia(config))
+    for result in results:
+        if result.controller_budget != expected_budgets[result.condition]:
+            raise ValueError("controller budget does not match the live configured components")
     groups = {condition: _condition_group(results, condition) for condition in CONDITION_NAMES}
     seed_sets = {
         condition: tuple(result.seed for result in group) for condition, group in groups.items()

@@ -197,6 +197,48 @@ def test_ia_aggregation_revalidates_config_at_consumption() -> None:
         aggregate_ia_evidence([_legal()], config=config)
 
 
+def test_ia_aggregation_binds_recommendation_protocol() -> None:
+    recommendation = {
+        "condition": "observe_only",
+        "recommendations": np.zeros(2, dtype=np.int64),
+        "partner_proposals": np.zeros(2, dtype=np.int64),
+        "nominal_recommendation_decisions": 2,
+    }
+    config = ContinualIAConfig(num_steps=2, phase_length=2, recovery_window=1)
+    invalid_actions = _legal(
+        **recommendation,
+        executed_actions=np.ones(2, dtype=np.int64),
+        credited_actions=np.ones(2, dtype=np.int64),
+    )
+    with pytest.raises(ValueError, match="executed actions violate"):
+        aggregate_ia_evidence([invalid_actions], config=config)
+    invalid_count = _legal(**(recommendation | {"nominal_recommendation_decisions": 1}))
+    with pytest.raises(ValueError, match="decisions must equal"):
+        aggregate_ia_evidence([invalid_count], config=config)
+
+
+def test_ia_aggregation_binds_live_component_budget() -> None:
+    results = []
+    for condition in CONDITION_NAMES:
+        overrides: dict[str, object] = {"condition": condition}
+        if condition in {"observe_only", "recommendation_p05", "accept_always"}:
+            accepted = np.array([False, condition == "accept_always"], dtype=np.bool_)
+            overrides.update(
+                recommendations=np.zeros(2, dtype=np.int64),
+                partner_proposals=np.zeros(2, dtype=np.int64),
+                accepted_recommendations=accepted,
+                nominal_recommendation_decisions=2,
+                nominal_accepted_recommendations=2 if condition == "accept_always" else 0,
+                executed_accepted_recommendations=int(np.count_nonzero(accepted)),
+            )
+        results.append(_legal(**overrides))
+    with pytest.raises(ValueError, match="live configured components"):
+        aggregate_ia_evidence(
+            results,
+            config=ContinualIAConfig(num_steps=2, phase_length=2, recovery_window=1),
+        )
+
+
 def test_ia_result_preflights_retained_bytes_before_snapshot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

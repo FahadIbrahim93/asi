@@ -200,6 +200,14 @@ def test_aggregation_revalidates_nested_records_at_consumption() -> None:
         )
 
 
+def test_aggregation_revalidates_config_at_consumption() -> None:
+    config = ContinualMultiAgentConfig()
+    object.__setattr__(config, "phase_steps", True)
+
+    with pytest.raises(ValueError, match="phase_steps must be an integer"):
+        aggregate_evidence([_legal()], config=config)
+
+
 def test_aggregation_rejects_hostile_outer_container_before_hooks() -> None:
     class HostileList(list[ConditionResult]):
         def __len__(self) -> int:  # pragma: no cover - must not run
@@ -252,7 +260,7 @@ def test_aggregation_preflights_retained_arrays_before_record_iteration(
         1,
     )
 
-    with pytest.raises(ValueError, match="aggregate condition result arrays requires"):
+    with pytest.raises(ValueError, match="bootstrap_resamples"):
         aggregate_evidence(
             [result],
             config=config,

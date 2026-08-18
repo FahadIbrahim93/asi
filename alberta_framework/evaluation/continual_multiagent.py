@@ -1052,6 +1052,9 @@ def aggregate_evidence(
 
     if type(config) is not ContinualMultiAgentConfig:
         raise ValueError("config must be a ContinualMultiAgentConfig")
+    config = ContinualMultiAgentConfig(
+        **{field.name: getattr(config, field.name) for field in fields(ContinualMultiAgentConfig)}
+    )
     if type(results) not in (list, tuple):
         raise ValueError("results must be an exact list or tuple")
     if not results:

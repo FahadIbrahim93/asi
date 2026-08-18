@@ -543,6 +543,17 @@ class SecurityOracleExperience:
         object.__setattr__(self, "outcome", _freeze_json_mapping(outcome))
         object.__setattr__(self, "policy_metadata", _freeze_json_mapping(policy_metadata))
 
+    def _revalidated_copy(self) -> SecurityOracleExperience:
+        """Reconstruct the record before a public consumer trusts frozen fields."""
+        return SecurityOracleExperience(
+            state=self.state,
+            action=self.action,
+            reward=self.reward,
+            outcome=self.outcome,
+            policy_metadata=self.policy_metadata,
+            schema=self.schema,
+        )
+
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serializable oracle experience mapping."""
         validated = _require_canonical_oracle_experience(self)
