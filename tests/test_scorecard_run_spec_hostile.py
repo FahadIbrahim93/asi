@@ -17,14 +17,21 @@ from alberta_framework.benchmarks.reference_life_scorecard import (
 class _StringSubclass(str):
     """Leftover string identity that must not cross the spec boundary."""
 
+    calls = 0
+
+    def __repr__(self) -> str:
+        type(self).calls += 1
+        raise AssertionError("hostile repr")
+
 
 def _legal_spec(**overrides: object) -> ScorecardRunSpec:
+    canonical = iter_run_specs(build_development_plan())[0]
     payload = {
-        "schedule_index": 0,
-        "environment_kind": ENVIRONMENT_ROSTER[0],
-        "arm": ARM_ROSTER[0],
-        "seed": SEED_ROSTER[0],
-        "lifecycle_id": "prototype." + ("a" * 16),
+        "schedule_index": canonical.schedule_index,
+        "environment_kind": canonical.environment_kind,
+        "arm": canonical.arm,
+        "seed": canonical.seed,
+        "lifecycle_id": canonical.lifecycle_id,
     }
     payload.update(overrides)
     return ScorecardRunSpec(**payload)  # type: ignore[arg-type]
@@ -52,13 +59,14 @@ def test_scorecard_run_spec_rejects_leftover_integer_identities() -> None:
 
 
 def test_scorecard_run_spec_rejects_leftover_and_unknown_string_identities() -> None:
-    with pytest.raises(ValueError, match="unsupported environment"):
+    with pytest.raises(ValueError, match="environment_kind is not"):
         _legal_spec(environment_kind=True)
-    with pytest.raises(ValueError, match="unsupported scorecard arm"):
+    with pytest.raises(ValueError, match="arm is not"):
         _legal_spec(arm=True)
-    with pytest.raises(ValueError, match="unsupported environment"):
+    _StringSubclass.calls = 0
+    with pytest.raises(ValueError, match="environment_kind is not"):
         _legal_spec(environment_kind=_StringSubclass(ENVIRONMENT_ROSTER[0]))
-    with pytest.raises(ValueError, match="unsupported scorecard arm"):
+    with pytest.raises(ValueError, match="arm is not"):
         _legal_spec(arm=_StringSubclass(ARM_ROSTER[0]))
     with pytest.raises(ValueError, match="lifecycle_id must be a prototype"):
         _legal_spec(lifecycle_id=True)
@@ -66,3 +74,16 @@ def test_scorecard_run_spec_rejects_leftover_and_unknown_string_identities() -> 
         _legal_spec(lifecycle_id=_StringSubclass("prototype." + ("a" * 16)))
     with pytest.raises(ValueError, match="lifecycle_id must be a prototype"):
         _legal_spec(lifecycle_id="prototype.not-hex")
+    assert _StringSubclass.calls == 0
+
+
+def test_scorecard_run_spec_cross_binds_schedule_and_lifecycle() -> None:
+    specs = iter_run_specs(build_development_plan())
+    assert len(specs) == 144
+    first = specs[0]
+    second = specs[1]
+    with pytest.raises(ValueError, match="does not match its fixed schedule_index"):
+        _legal_spec(arm=second.arm)
+    with pytest.raises(ValueError, match="does not match the fixed run identity"):
+        _legal_spec(lifecycle_id=second.lifecycle_id)
+    assert first.lifecycle_id != second.lifecycle_id

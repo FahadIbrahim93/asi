@@ -1367,13 +1367,33 @@ class ScorecardRunSpec:
             type(self.environment_kind) is not str
             or self.environment_kind not in ENVIRONMENT_ROSTER
         ):
-            raise ValueError(f"unsupported environment {self.environment_kind!r}")
+            raise ValueError("environment_kind is not in the fixed scorecard roster")
         if type(self.arm) is not str or self.arm not in ARM_ROSTER:
-            raise ValueError(f"unsupported scorecard arm {self.arm!r}")
+            raise ValueError("arm is not in the fixed scorecard roster")
         if type(self.seed) is not int or self.seed not in SEED_ROSTER:
             raise ValueError("seed is not in the fixed scorecard roster")
         if not _is_scorecard_lifecycle_id(self.lifecycle_id):
             raise ValueError("lifecycle_id must be a prototype.<16-hex> identity")
+        runs_per_seed = len(ENVIRONMENT_ROSTER) * len(ARM_ROSTER)
+        seed_index, within_seed = divmod(self.schedule_index, runs_per_seed)
+        environment_index, arm_index = divmod(within_seed, len(ARM_ROSTER))
+        expected_seed = SEED_ROSTER[seed_index]
+        expected_environment = ENVIRONMENT_ROSTER[environment_index]
+        expected_arm = _rotated_arms(seed_index)[arm_index]
+        if (
+            self.seed != expected_seed
+            or self.environment_kind != expected_environment
+            or self.arm != expected_arm
+        ):
+            raise ValueError("run identity does not match its fixed schedule_index")
+        identity = (
+            f"{REFERENCE_LIFE_SCORECARD_PLAN_V1_SHA256}:"
+            f"{expected_environment}:{expected_arm}:{expected_seed}"
+        )
+        lifecycle_hex = hashlib.sha256(identity.encode("ascii")).hexdigest()[:16]
+        expected_lifecycle = f"prototype.{lifecycle_hex}"
+        if self.lifecycle_id != expected_lifecycle:
+            raise ValueError("lifecycle_id does not match the fixed run identity")
 
 
 def iter_run_specs(plan: ReferenceLifeDevelopmentPlan) -> tuple[ScorecardRunSpec, ...]:
