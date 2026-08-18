@@ -61,6 +61,16 @@ local same-runner development ranking, not a paper-level SOTA claim.
   and a 100-by-100 MLP. Its curves are relevant evidence about adaptive
   activations and plasticity, but its data budget, batching, network, and
   reporting do not define an exact-protocol leaderboard entry.
+- [Plasticity of Growing and Elastic Neural Networks
+  (2026)](https://arxiv.org/abs/2608.01475) studies online permuted MNIST and
+  FashionMNIST with 10,000 or 40,000 examples per task, per-example SGD at
+  step size 0.001, and capacity that grows or is pruned at known task
+  boundaries. Adaptive growing and elastic variants retain high task accuracy,
+  while the elastic variants approach a compact steady size. This is a
+  particularly relevant Alberta-adjacent direction for autonomous structure,
+  but the longer tasks, boundary access, SGD configuration, and changing
+  parameter budget make its curves non-comparable to ASI's fixed 5,000-example
+  target without a matched port and explicit resource accounting.
 - [Learning Continually by Spectral Regularization
   (ICLR 2025)](https://openreview.net/forum?id=Hcb2cgPbMg),
   [Plastic Learning with Deep Fourier Features
