@@ -34,12 +34,8 @@ from alberta_framework.benchmarks.upgd_ipmnist import (
     validated_ipmnist_data,
 )
 
-TransitionMode = Literal[
-    "abrupt", "input_interpolation", "output_interpolation", "task_sampling"
-]
-_MODES = frozenset(
-    {"abrupt", "input_interpolation", "output_interpolation", "task_sampling"}
-)
+TransitionMode = Literal["abrupt", "input_interpolation", "output_interpolation", "task_sampling"]
+_MODES = frozenset({"abrupt", "input_interpolation", "output_interpolation", "task_sampling"})
 _INT32_MAX = 2**31 - 1
 _MAX_ARRAY_ELEMENTS = 1_000_000
 _MAX_RESOURCE_BYTES = 256 * 1024 * 1024
@@ -137,25 +133,19 @@ def transition_alpha(step: int, config: GradualTransitionConfig) -> float:
     """Return a deterministic uniform interpolation coefficient."""
     if type(config) is not GradualTransitionConfig:
         raise ValueError("config must be an exact GradualTransitionConfig")
-    checked = GradualTransitionConfig(
-        mode=config.mode, transition_steps=config.transition_steps
-    )
+    checked = GradualTransitionConfig(mode=config.mode, transition_steps=config.transition_steps)
     resolved_step = _exact_index("step", step, minimum=0)
     if checked.mode == "abrupt":
         return 1.0
     return min(resolved_step / checked.transition_steps, 1.0)
 
 
-def input_interpolation_transaction(
-    old: object, new: object, alpha: float
-) -> tuple[Array, Array]:
+def input_interpolation_transaction(old: object, new: object, alpha: float) -> tuple[Array, Array]:
     """Return a finite interpolation candidate and a traced validity bit."""
     resolved = _alpha(alpha)
     old_type = type(old)
     new_type = type(new)
-    if not (
-        old_type is np.ndarray or issubclass(old_type, (jax.Array, jax.core.Tracer))
-    ) or not (
+    if not (old_type is np.ndarray or issubclass(old_type, (jax.Array, jax.core.Tracer))) or not (
         new_type is np.ndarray or issubclass(new_type, (jax.Array, jax.core.Tracer))
     ):
         raise ValueError("old and new inputs must be exact NumPy or JAX arrays")
@@ -187,9 +177,7 @@ def input_interpolation(old: object, new: object, alpha: float) -> Array:
     return safe
 
 
-def output_interpolation(
-    old_label: int, new_label: int, alpha: float, *, n_classes: int
-) -> Array:
+def output_interpolation(old_label: int, new_label: int, alpha: float, *, n_classes: int) -> Array:
     """Interpolate old one-hot -> uniform -> new one-hot as paper section 4."""
     resolved_alpha = _alpha(alpha)
     classes = _exact_index("n_classes", n_classes, minimum=2)
@@ -207,9 +195,7 @@ def output_interpolation(
     return (2.0 * resolved_alpha - 1.0) * new_target + (2.0 - 2.0 * resolved_alpha) * uniform
 
 
-def task_sampling_mask(
-    *, seed: int, transition_id: int, count: int, alpha: float
-) -> np.ndarray:
+def task_sampling_mask(*, seed: int, transition_id: int, count: int, alpha: float) -> np.ndarray:
     """Select exactly ``floor(alpha * count)`` positions from the new task.
 
     A Threefry root and transition fold make selection independent across
@@ -387,10 +373,7 @@ def _numeric_tree_bytes(value: object) -> int:
     total = 0
     for leaf in jax.tree_util.tree_leaves(value):
         actual_type = type(leaf)
-        if not (
-            actual_type is np.ndarray
-            or issubclass(actual_type, (jax.Array, jax.core.Tracer))
-        ):
+        if not (actual_type is np.ndarray or issubclass(actual_type, (jax.Array, jax.core.Tracer))):
             continue
         array = jnp.asarray(leaf)
         if not bool(jnp.all(jnp.isfinite(array))):
@@ -435,10 +418,7 @@ def run_gradual_input_pair(
     resolved_seed = require_jax_seed(seed, name="seed")
     for name, value in (("data_x", data_x), ("data_y", data_y)):
         actual_type = type(value)
-        if not (
-            actual_type is np.ndarray
-            or issubclass(actual_type, jax.Array)
-        ):
+        if not (actual_type is np.ndarray or issubclass(actual_type, jax.Array)):
             raise ValueError(f"{name} must be an exact NumPy or JAX array")
     raw_x = cast(np.ndarray | Array, data_x)
     raw_y = cast(np.ndarray | Array, data_y)
@@ -453,12 +433,12 @@ def run_gradual_input_pair(
     schedule_elements = checked_config.n_tasks * (
         checked_config.input_dim + checked_config.task_length
     )
-    # AdamW retains parameters plus first/second moments and one int32 count
-    # for each of the six parameter leaves.  Dataset and full evaluator
-    # schedule remain resident for the complete run.  Gate their exact sum
-    # before any protocol materialization or device initialization.
+    # The matched restart retains initial parameters alongside the current
+    # parameters and Adam first/second moments, plus five float32 optimizer
+    # scalars for each of six parameter leaves. Dataset and the full evaluator
+    # schedule also remain resident. Gate their exact sum before allocation.
     aggregate_persistent_bytes = (
-        checked_config.parameter_count * 12
+        checked_config.parameter_count * 16
         + 6 * 5 * 4
         + dataset_elements * 4
         + schedule_elements * 4
@@ -481,9 +461,7 @@ def run_gradual_input_pair(
     def checked_step(
         params: dict[str, Array], state: Any, x: Array, y: Array, key: Array
     ) -> tuple[LearnerUpdateResult, Array, Array, Array]:
-        (loss, logits), grads = jax.value_and_grad(cross_entropy_loss, has_aux=True)(
-            params, x, y
-        )
+        (loss, logits), grads = jax.value_and_grad(cross_entropy_loss, has_aux=True)(params, x, y)
         transaction = step_fn(params, state, grads, key)
         if type(transaction) is not LearnerUpdateResult:
             raise TypeError("AdamW learner did not return its checked transaction")
@@ -495,9 +473,7 @@ def run_gradual_input_pair(
     key_init, key_schedule, key_noise = jr.split(root, 3)
     initial_params = init_mlp_params(key_init, checked_config)
     schedule = build_schedule(key_schedule, checked_config, int(data_x_array.shape[0]))
-    transition_config = GradualTransitionConfig(
-        mode="input_interpolation", transition_steps=width
-    )
+    transition_config = GradualTransitionConfig(mode="input_interpolation", transition_steps=width)
 
     def run_arm(gradual: bool) -> tuple[list[int], list[float], int, int]:
         params = initial_params
@@ -526,9 +502,7 @@ def run_gradual_input_pair(
                     x = new_x
                 y = data_y_array[example]
                 key, step_key = jr.split(key)
-                transaction, accuracy, loss, post_loss = checked_step(
-                    params, state, x, y, step_key
-                )
+                transaction, accuracy, loss, post_loss = checked_step(params, state, x, y, step_key)
                 if type(transaction) is not LearnerUpdateResult:
                     raise ValueError("AdamW learner did not return its checked transaction")
                 if not bool(transaction.update_applied):
@@ -547,7 +521,9 @@ def run_gradual_input_pair(
             if hasattr(leaf, "block_until_ready"):
                 leaf.block_until_ready()
         timing = time.perf_counter_ns() - started
-        persistent = dataset_numeric_bytes + _numeric_tree_bytes((params, state, schedule))
+        persistent = dataset_numeric_bytes + _numeric_tree_bytes(
+            (initial_params, params, state, schedule)
+        )
         if persistent > _MAX_RESOURCE_BYTES:
             raise ValueError("complete persistent numeric state exceeds 256 MiB")
         return correct_counts, loss_sums, persistent, timing
@@ -578,9 +554,7 @@ def run_gradual_input_pair(
         ),
         correct_counts=np.asarray([output[0] for output in arm_outputs], dtype=np.int32),
         loss_sums=np.asarray([output[1] for output in arm_outputs], dtype=np.float64),
-        persistent_numeric_bytes=np.asarray(
-            [output[2] for output in arm_outputs], dtype=np.int64
-        ),
+        persistent_numeric_bytes=np.asarray([output[2] for output in arm_outputs], dtype=np.int64),
         timing_ns=np.asarray([output[3] for output in arm_outputs], dtype=np.int64),
         observations_per_arm=horizon,
         updates_per_arm=horizon,
