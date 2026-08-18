@@ -118,7 +118,8 @@ def _require_regime_id(value: object, *, name: str = "regime_id") -> int:
 
 def _require_finite_real(name: str, value: object) -> float:
     """Reject leftover bool/NaN identities before they become recorded rewards."""
-    if type(value) is bool or type(value) not in (int, float):
+    value_type = type(value)
+    if value_type is not int and value_type is not float:
         raise ValueError(f"{name} must be a finite real number")
     number = float(cast(int | float, value))
     if not math.isfinite(number):
@@ -1693,6 +1694,12 @@ class ReferenceLifeEvent:
         ):
             if type(getattr(self, name)) is not expected_type:
                 raise ValueError(f"{name} has the wrong exact reference-life type")
+        if self.receipt.command is not self.command:
+            raise ValueError("receipt does not belong to the event command")
+        if self.transaction.receipt is not self.receipt:
+            raise ValueError("transaction does not belong to the event receipt")
+        if self.step_result.transaction is not self.transaction:
+            raise ValueError("step result does not belong to the event transaction")
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -1735,6 +1742,16 @@ class ReferenceLifeStep:
 class ReferenceLifeRun:
     state: ReferenceLifeState
     events: tuple[ReferenceLifeEvent, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.state) is not ReferenceLifeState:
+            raise ValueError("state must be a ReferenceLifeState")
+        if type(self.events) is not tuple:
+            raise ValueError("events must be an exact tuple")
+        if any(type(event) is not ReferenceLifeEvent for event in self.events):
+            raise ValueError("events must contain only ReferenceLifeEvent records")
+        if self.events and self.events[-1].transcript_sha256 != self.state.transcript_sha256:
+            raise ValueError("final event transcript disagrees with run state")
 
 
 @dataclasses.dataclass(slots=True)
