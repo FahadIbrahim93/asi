@@ -118,3 +118,22 @@ def test_ensemble_checkpoint_rejects_hostile_resource_metadata(tmp_path: object)
         with pytest.raises(ValueError, match="resource budget"):
             world.load_world_model_ensemble_checkpoint(path)
     assert _HostileDict.calls == 0
+
+
+def test_ensemble_checkpoint_rejects_hostile_config_mapping(tmp_path: object) -> None:
+    from pathlib import Path
+    from unittest.mock import patch
+
+    from alberta_framework.core import world_model_ensemble as world
+
+    metadata = {
+        "schema": world.WORLD_MODEL_ENSEMBLE_CHECKPOINT_SCHEMA,
+        "ensemble_config": _HostileDict({"ensemble": "test"}),
+    }
+    path = Path(str(tmp_path)) / "checkpoint"
+    path.write_bytes(b"dummy")
+    _HostileDict.calls = 0
+    with patch.object(world, "load_checkpoint_metadata", return_value=metadata):
+        with pytest.raises(ValueError, match="missing ensemble_config"):
+            world.load_world_model_ensemble_checkpoint(path)
+    assert _HostileDict.calls == 0

@@ -29,6 +29,14 @@ class _HostileStr(str):
         raise AssertionError("hostile repr executed")
 
 
+class _HostileDict(dict[str, object]):
+    calls = 0
+
+    def items(self):  # type: ignore[no-untyped-def, override]
+        type(self).calls += 1
+        raise AssertionError("hostile items executed")
+
+
 def test_prototype_digest_gate_rejects_hostile_before_eq() -> None:
     from alberta_framework.core.prototype_agent import _prototype_config_digest
 
@@ -120,6 +128,25 @@ def test_prototype_checkpoint_rejects_other_hostile_metadata_strings(
         with pytest.raises(ValueError, match=message):
             prototype.load_prototype_checkpoint(path)
     assert _HostileStr.calls == 0
+
+
+def test_prototype_checkpoint_rejects_hostile_config_mapping(tmp_path: object) -> None:
+    from pathlib import Path
+    from unittest.mock import patch
+
+    from alberta_framework.core import prototype_agent as prototype
+
+    path = Path(str(tmp_path)) / "checkpoint"
+    path.write_bytes(b"dummy")
+    metadata = {
+        "schema": prototype.PROTOTYPE_CHECKPOINT_SCHEMA,
+        "agent_config": _HostileDict({"prototype": "minimal"}),
+    }
+    _HostileDict.calls = 0
+    with patch.object(prototype, "load_checkpoint_metadata", return_value=metadata):
+        with pytest.raises(ValueError, match="missing agent_config"):
+            prototype.load_prototype_checkpoint(path)
+    assert _HostileDict.calls == 0
 
 
 def test_prototype_digest_text_has_no_repr_leak() -> None:

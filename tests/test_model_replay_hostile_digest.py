@@ -129,3 +129,24 @@ def test_model_replay_rejects_hostile_resource_metadata(tmp_path: object) -> Non
         with pytest.raises(ValueError, match="resource budget"):
             replay.load_model_replay_rehearsal_checkpoint(path)
     assert _HostileDict.calls == 0
+
+
+def test_model_replay_rejects_hostile_config_mapping(tmp_path: object) -> None:
+    from pathlib import Path
+    from unittest.mock import patch
+
+    from alberta_framework.core import model_replay_rehearsal as replay
+
+    metadata = {
+        "schema": replay.MODEL_REPLAY_REHEARSAL_SCHEMA,
+        "mechanism_status": replay.MECHANISM_STATUS,
+        "accepted_scientific_evidence": False,
+        "composer_config": _HostileDict({"composer": "test"}),
+    }
+    path = Path(str(tmp_path)) / "checkpoint"
+    path.write_bytes(b"dummy")
+    _HostileDict.calls = 0
+    with patch.object(replay, "load_checkpoint_metadata", return_value=metadata):
+        with pytest.raises(ValueError, match="missing composer_config"):
+            replay.load_model_replay_rehearsal_checkpoint(path)
+    assert _HostileDict.calls == 0

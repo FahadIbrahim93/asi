@@ -86,9 +86,10 @@ def _require_sha256(value: str, *, name: str) -> None:
 def _validate_json_value(value: Any, *, path: str, depth: int = 0) -> None:
     if depth > 64:
         raise ValueError(f"{path} exceeds the maximum canonical JSON nesting depth")
-    if value is None or isinstance(value, (str, bool, int)):
+    value_type = type(value)
+    if value is None or value_type is str or value_type is bool or value_type is int:
         return
-    if isinstance(value, float):
+    if value_type is float:
         if not math.isfinite(value):
             raise ValueError(f"{path} must contain only finite JSON numbers")
         return

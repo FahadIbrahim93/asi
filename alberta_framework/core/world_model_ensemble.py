@@ -2013,13 +2013,13 @@ def load_world_model_ensemble_checkpoint(
     """
     metadata = load_checkpoint_metadata(path)
     schema = metadata.get("schema")
-    if schema not in {
+    if type(schema) is not str or schema not in {
         WORLD_MODEL_ENSEMBLE_CHECKPOINT_SCHEMA,
         _WORLD_MODEL_ENSEMBLE_CHECKPOINT_SCHEMA_V1,
     }:
         raise ValueError("checkpoint is not a WorldModelEnsemble v1/v2 checkpoint")
     config = metadata.get("ensemble_config")
-    if not isinstance(config, dict):
+    if type(config) is not dict:
         raise ValueError("ensemble checkpoint is missing ensemble_config")
     digest = metadata.get("config_sha256")
     if type(digest) is not str or digest != _ensemble_config_digest(config):
@@ -2035,7 +2035,8 @@ def load_world_model_ensemble_checkpoint(
     else:
         expected_budget = _legacy_v1_resource_budget(ensemble, template)
         restore_template = _legacy_v1_template(template)
-    if metadata.get("resource_budget") != expected_budget:
+    resource_budget = metadata.get("resource_budget")
+    if type(resource_budget) is not dict or resource_budget != expected_budget:
         raise ValueError("ensemble checkpoint resource budget does not match config")
     restored, restored_metadata = load_checkpoint(restore_template, path)
     if restored_metadata != metadata:

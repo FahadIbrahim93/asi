@@ -7982,7 +7982,7 @@ def load_prototype_checkpoint(
 
     metadata = load_checkpoint_metadata(path)
     schema = metadata.get("schema")
-    if schema not in {
+    if type(schema) is not str or schema not in {
         PROTOTYPE_CHECKPOINT_SCHEMA,
         _PROTOTYPE_CHECKPOINT_SCHEMA_V2,
         _PROTOTYPE_CHECKPOINT_SCHEMA_V1,
@@ -7991,11 +7991,15 @@ def load_prototype_checkpoint(
             "checkpoint is not an Alberta PrototypeAgent v1/v2/v3 checkpoint"
         )
     empty_array_codec = metadata.get("empty_array_codec")
-    if empty_array_codec is not None and empty_array_codec != _PROTOTYPE_EMPTY_ARRAY_CODEC:
+    if empty_array_codec is not None and (
+        type(empty_array_codec) is not str
+        or empty_array_codec != _PROTOTYPE_EMPTY_ARRAY_CODEC
+    ):
         raise ValueError("prototype checkpoint uses an unknown empty-array codec")
     checkpoint_prng_impl = metadata.get("prng_impl")
-    if checkpoint_prng_impl is not None and checkpoint_prng_impl not in (
-        _PROTOTYPE_SUPPORTED_PRNG_IMPLS
+    if checkpoint_prng_impl is not None and (
+        type(checkpoint_prng_impl) is not str
+        or checkpoint_prng_impl not in _PROTOTYPE_SUPPORTED_PRNG_IMPLS
     ):
         raise ValueError("prototype checkpoint uses an unsupported PRNG implementation")
     if empty_array_codec is not None and schema != PROTOTYPE_CHECKPOINT_SCHEMA:
@@ -8005,7 +8009,7 @@ def load_prototype_checkpoint(
     if empty_array_codec is not None and checkpoint_prng_impl is None:
         raise ValueError("prototype checkpoint is missing PRNG implementation metadata")
     config = metadata.get("agent_config")
-    if not isinstance(config, dict):
+    if type(config) is not dict:
         raise ValueError("prototype checkpoint is missing agent_config")
     expected_digest = metadata.get("config_sha256")
     if type(expected_digest) is not str or expected_digest != (
