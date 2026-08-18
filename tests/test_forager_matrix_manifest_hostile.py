@@ -2,7 +2,15 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
+
+from alberta_framework.benchmarks.forager_matrix import (
+    ForagerMatrixManifestError,
+    load_forager_matrix_manifest,
+    run_forager_matrix,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -26,6 +34,14 @@ class _HostileStr(str):
     def __str__(self) -> str:  # type: ignore[override]
         type(self).calls += 1
         raise AssertionError("hostile str")
+
+
+class _HostilePath(type(Path())):
+    calls = 0
+
+    def expanduser(self):  # type: ignore[no-untyped-def]
+        type(self).calls += 1
+        raise AssertionError("hostile path expansion")
 
 
 def test_jax_config_rejects_hostile_before_str() -> None:
@@ -55,6 +71,21 @@ def test_manifest_loader_rejects_hostile_before_dispatch() -> None:
     assert _HostileStr.calls == 0
     assert (str is str or isinstance("/tmp/x", Path)) is True
     assert (type(Path("/tmp/x")) is str or isinstance(Path("/tmp/x"), Path)) is True
+
+
+def test_manifest_entry_points_reject_subclasses_without_hooks(tmp_path: Path) -> None:
+    hostile_string = _HostileStr("manifest.json")
+    hostile_path = _HostilePath("manifest.json")
+    _HostileStr.calls = 0
+    _HostilePath.calls = 0
+
+    with pytest.raises(ForagerMatrixManifestError, match="exact string or Path"):
+        load_forager_matrix_manifest(hostile_path)
+    with pytest.raises(TypeError, match="manifest"):
+        run_forager_matrix(hostile_string, tmp_path, dry_run=True)
+
+    assert _HostileStr.calls == 0
+    assert _HostilePath.calls == 0
 
 
 def test_hostile_not_in_error_message() -> None:

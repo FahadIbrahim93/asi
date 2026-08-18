@@ -1659,6 +1659,8 @@ def parse_forager_matrix_manifest(
 
 def load_forager_matrix_manifest(path: str | Path) -> ForagerMatrixManifest:
     """Load a UTF-8 strict JSON matrix manifest, rejecting duplicate keys."""
+    if type(path) not in (str, type(Path())):
+        raise ForagerMatrixManifestError("manifest path must be an exact string or Path")
     source = Path(path).expanduser()
     try:
         text = _read_regular_file_bytes(
@@ -1691,7 +1693,7 @@ def _json_safe(value: Any) -> Any:
         if not bool(np.isfinite(value)):
             raise ForagerMatrixError("matrix artifact identity is not finite JSON")
         return float(value)
-    if isinstance(value, Path):
+    if type(value) is type(Path()):
         if value.is_absolute():
             raise ForagerMatrixError("absolute host paths are forbidden in matrix artifacts")
         return value.as_posix()
@@ -6684,11 +6686,12 @@ def run_forager_matrix(
     cryptographically and semantically validated, while a gap, unknown file,
     altered hash, or changed execution identity fails closed.
     """
-    if type(manifest) is str or isinstance(manifest, Path):
-        loaded = load_forager_matrix_manifest(manifest)
-    elif isinstance(manifest, ForagerMatrixManifest):
-        if manifest.source_path is not None and not isinstance(
-            manifest.source_path, Path
+    if type(manifest) in (str, type(Path())):
+        loaded = load_forager_matrix_manifest(cast(str | Path, manifest))
+    elif type(manifest) is ForagerMatrixManifest:
+        if (
+            manifest.source_path is not None
+            and type(manifest.source_path) is not type(Path())
         ):
             raise ForagerMatrixManifestError(
                 "programmatic manifest source_path must be a pathlib.Path"
