@@ -216,6 +216,19 @@ class OfficialForagaxValidationError(ValueError):
     """Raised when provenance or artifact verification fails closed."""
 
 
+def _require_string(value: Any, *, label: str) -> str:
+    if type(value) is not str or not value:
+        raise OfficialForagaxValidationError(f"{label} must be a non-empty string")
+    return value
+
+
+def _require_sha256(value: Any, *, label: str) -> str:
+    result = _require_string(value, label=label)
+    if _SHA256_PATTERN.fullmatch(result) is None:
+        raise OfficialForagaxValidationError(f"{label} must be a lowercase SHA-256")
+    return result
+
+
 @dataclass(frozen=True)
 class OfficialForagaxRunRequest:
     """Inputs for one official seed/index execution.
@@ -415,6 +428,20 @@ class OfficialForagaxRunPlan:
     config_snapshot_bytes: bytes = dataclasses.field(repr=False)
     execution_config_bytes: bytes = dataclasses.field(repr=False)
 
+    def __post_init__(self) -> None:
+        if type(self.request) is not OfficialForagaxRunRequest:
+            raise TypeError("request must be an OfficialForagaxRunRequest")
+        _require_sha256(self.interpreter_sha256, label="interpreter_sha256")
+        _require_sha256(self.package_freeze_sha256, label="package_freeze_sha256")
+        if not isinstance(self.command, tuple):
+            raise TypeError("command must be a tuple")
+        if not isinstance(self.package_freeze, tuple):
+            raise TypeError("package_freeze must be a tuple")
+        if not isinstance(self.config_snapshot_bytes, (bytes, bytearray)):
+            raise TypeError("config_snapshot_bytes must be bytes")
+        if not isinstance(self.execution_config_bytes, (bytes, bytearray)):
+            raise TypeError("execution_config_bytes must be bytes")
+
     @property
     def output_dir(self) -> Path:
         return _absolute_without_resolving_symlinks(self.request.output_dir)
@@ -476,6 +503,20 @@ class OfficialForagaxBatchRunPlan:
     runtime: Mapping[str, Any]
     config_snapshot_bytes: bytes = dataclasses.field(repr=False)
     execution_config_bytes: bytes = dataclasses.field(repr=False)
+
+    def __post_init__(self) -> None:
+        if type(self.request) is not OfficialForagaxBatchRunRequest:
+            raise TypeError("request must be an OfficialForagaxBatchRunRequest")
+        _require_sha256(self.interpreter_sha256, label="interpreter_sha256")
+        _require_sha256(self.package_freeze_sha256, label="package_freeze_sha256")
+        if not isinstance(self.command, tuple):
+            raise TypeError("command must be a tuple")
+        if not isinstance(self.package_freeze, tuple):
+            raise TypeError("package_freeze must be a tuple")
+        if not isinstance(self.config_snapshot_bytes, (bytes, bytearray)):
+            raise TypeError("config_snapshot_bytes must be bytes")
+        if not isinstance(self.execution_config_bytes, (bytes, bytearray)):
+            raise TypeError("execution_config_bytes must be bytes")
 
     @property
     def output_dir(self) -> Path:
@@ -1332,19 +1373,6 @@ def _expect_exact_keys(
         raise OfficialForagaxValidationError(
             f"{label} has an unexpected schema: missing={missing}, extra={extra}"
         )
-
-
-def _require_string(value: Any, *, label: str) -> str:
-    if type(value) is not str or not value:
-        raise OfficialForagaxValidationError(f"{label} must be a non-empty string")
-    return value
-
-
-def _require_sha256(value: Any, *, label: str) -> str:
-    result = _require_string(value, label=label)
-    if _SHA256_PATTERN.fullmatch(result) is None:
-        raise OfficialForagaxValidationError(f"{label} must be a lowercase SHA-256")
-    return result
 
 
 def _require_git_sha1(value: Any, *, label: str) -> str:
