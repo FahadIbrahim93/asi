@@ -36,13 +36,14 @@ runs:
         if [[ -n "$ALBERTA_UV_EXTRAS" ]]; then
           read -r -a extra_args <<< "$ALBERTA_UV_EXTRAS"
         fi
+        python_path="$(python -c 'import sys; print(sys.executable)')"
         uv sync \
           --no-install-project \
           --locked \
-          --python "$(command -v python)" \
+          --python "$python_path" \
           "${extra_args[@]}"
         uv sync \
           --no-build-isolation \
           --locked \
-          --python "$(command -v python)" \
+          --python "$python_path" \
           "${extra_args[@]}"
