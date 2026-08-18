@@ -128,6 +128,21 @@ def test_prereg_workflow_invokes_only_setup_uv_pinned_binary() -> None:
     assert sum('"$UV_PATH" ' in line for line in shell_lines) >= 13
 
 
+def test_prereg_workflow_syncs_locked_test_and_research_environments() -> None:
+    workflow = (_ROOT / ".github" / "workflows" / "ipmnist-prereg.yml").read_text(
+        encoding="utf-8"
+    )
+    assert '          "$UV_PATH" sync \\\n' in workflow
+    assert "            --locked \\\n" in workflow
+    assert "            --extra dev \\\n" in workflow
+    assert "            --extra research\n" in workflow
+    assert 'pytest_version="$("$UV_PATH" run --no-sync python -c ' in workflow
+    assert '[[ "$pytest_version" != "9.1.1" ]]' in workflow
+    # Pytest enables the code-only gate but is not measurement provenance.
+    expected_packages = cast(dict[str, str], _DRIVER["EXPECTED_PACKAGES"])
+    assert "pytest" not in expected_packages
+
+
 def test_issue184_github_and_local_protocols_cannot_drift() -> None:
     github = _PROTOCOLS["issue184"]
     local = cast(dict[str, Any], _LOCAL_DRIVER["LOCAL_PROTOCOLS"])["issue184"]

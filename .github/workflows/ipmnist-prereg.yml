@@ -219,7 +219,14 @@ jobs:
           "$UV_PATH" sync \
             --locked \
             --python "$PYTHON_PATH" \
+            --extra dev \
             --extra research
+          pytest_version="$("$UV_PATH" run --no-sync python -c \
+            'import importlib.metadata; print(importlib.metadata.version("pytest"))')"
+          if [[ "$pytest_version" != "9.1.1" ]]; then
+            echo "locked pytest version differs from 9.1.1" >&2
+            exit 1
+          fi
           "$UV_PATH" run --no-sync python - \
             "$cpu_brand" "$RUNNER_TEMP/prereg-metadata/runner.json" <<'PY'
           import importlib.metadata
