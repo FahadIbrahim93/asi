@@ -344,13 +344,17 @@ def _verify_with_comment(
     monkeypatch: pytest.MonkeyPatch,
     comment: dict[str, Any],
     *,
+    prior_runs: list[dict[str, Any]] | None = None,
     current_overrides: dict[str, Any] | None = None,
     invocation_overrides: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     current, comments = _launch_api_payloads(comment)
     current.update(current_overrides or {})
     monkeypatch.setitem(_DRIVER_GLOBALS, "_github_json", lambda *_args, **_kwargs: current)
-    monkeypatch.setitem(_DRIVER_GLOBALS, "_workflow_runs", lambda *_args, **_kwargs: [current])
+    workflow_runs = [*(prior_runs or []), current]
+    monkeypatch.setitem(
+        _DRIVER_GLOBALS, "_workflow_runs", lambda *_args, **_kwargs: workflow_runs
+    )
     monkeypatch.setitem(_DRIVER_GLOBALS, "_github_pages", lambda *_args, **_kwargs: comments)
     arguments: dict[str, Any] = {
         "protocol_key": "issue51",
@@ -402,6 +406,31 @@ def test_launch_authorization_accepts_exact_unedited_project_owner_comment(
     assert payload["authorization_comment_id"] == 456
     assert payload["authorization_created_at"] == "2026-08-16T09:00:00Z"
     assert payload["authorization_updated_at"] == "2026-08-16T09:00:00Z"
+
+
+def test_launch_authorization_ignores_consumed_dispatches_for_prior_sources(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prior_run = {
+        "id": 122,
+        "event": "workflow_dispatch",
+        "head_sha": "0" * 40,
+        "display_title": f"ipmnist-issue51-{'0' * 40}",
+        "run_attempt": 1,
+        "path": ".github/workflows/ipmnist-prereg.yml",
+        "created_at": "2026-08-15T10:00:00Z",
+        "html_url": "https://github.com/elizaOS/asi/actions/runs/122",
+        "status": "completed",
+        "conclusion": "cancelled",
+    }
+
+    payload = _verify_with_comment(
+        monkeypatch,
+        _authorization_comment(),
+        prior_runs=[prior_run],
+    )
+
+    assert payload["run_id"] == 123
 
 
 def test_synchronized_preflight_binds_the_early_owner_receipt(
