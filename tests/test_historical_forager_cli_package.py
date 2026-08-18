@@ -50,6 +50,7 @@ _EXPECTED_SCRIPT_NAMES = {
     "asi-coom-qualification-smoke",
     "asi-cora-catalog",
     "asi-forager-rerun-preflight",
+    "asi-telapa-qualification-smoke",
     "asi-ipmnist-campaign",
     "asi-ipmnist-ceiling",
     "asi-l2er-matched-development",
