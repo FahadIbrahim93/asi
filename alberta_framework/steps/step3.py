@@ -14,6 +14,7 @@ Research-scale evidence and open boundaries for Step 3 are tracked in
 
 from __future__ import annotations
 
+import math
 import operator
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass, fields
@@ -84,6 +85,54 @@ _STEP3_CONFIG_FIELDS = frozenset(
         "routing",
     }
 )
+_MAX_SMOKE_CONFIG_NODES = 4096
+_MAX_SMOKE_CONFIG_TEXT_BYTES = 64 * 1024
+
+
+def _bounded_json_clone(value: object, *, path: str, budget: list[int]) -> Any:
+    """Copy one bounded exact JSON tree without invoking user hooks."""
+    budget[0] += 1
+    if budget[0] > _MAX_SMOKE_CONFIG_NODES:
+        raise ValueError(f"{path} exceeds the smoke config node limit")
+    if value is None or type(value) is bool:
+        return value
+    if type(value) is int:
+        if abs(value).bit_length() > 63:
+            raise ValueError(f"{path} integer must fit signed 64-bit magnitude")
+        return value
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise ValueError(f"{path} number must be finite")
+        return value
+    if type(value) is str:
+        if (
+            len(value) > _MAX_SMOKE_CONFIG_TEXT_BYTES
+            or len(value.encode("utf-8")) > _MAX_SMOKE_CONFIG_TEXT_BYTES
+        ):
+            raise ValueError(f"{path} text exceeds the smoke config byte limit")
+        return value
+    if type(value) is list:
+        if len(value) > _MAX_SMOKE_CONFIG_NODES - budget[0]:
+            raise ValueError(f"{path} exceeds the smoke config node limit")
+        return [
+            _bounded_json_clone(item, path=f"{path}[{index}]", budget=budget)
+            for index, item in enumerate(value)
+        ]
+    if type(value) is dict:
+        if len(value) > _MAX_SMOKE_CONFIG_NODES - budget[0]:
+            raise ValueError(f"{path} exceeds the smoke config node limit")
+        result: dict[str, Any] = {}
+        for key, item in value.items():
+            if type(key) is not str:
+                raise ValueError(f"{path} keys must be exact strings")
+            cloned_key = _bounded_json_clone(key, path=f"{path} key", budget=budget)
+            result[cloned_key] = _bounded_json_clone(
+                item,
+                path=f"{path}.{key}",
+                budget=budget,
+            )
+        return result
+    raise ValueError(f"{path} must contain only exact JSON values")
 
 
 def _require_exact_str(name: str, value: object) -> str:
@@ -353,10 +402,25 @@ class Step3SmokeResult:
         object.__setattr__(self, "finite", _require_bool("finite", self.finite))
         if type(self.handoff) is not Step3HandoffArrays:
             raise TypeError("handoff must be an exact Step3HandoffArrays")
-        if type(self.horde_config) is not dict or any(
-            type(key) is not str for key in self.horde_config
-        ):
+        if self.handoff.observations.shape[0] != self.steps:
+            raise ValueError("handoff rows must match steps")
+        if self.handoff.n_demons != self.config.n_demons:
+            raise ValueError("handoff demons must match config")
+        if self.per_demon_metrics_shape != (self.steps, self.config.n_demons, 3):
+            raise ValueError("per_demon_metrics_shape must match steps and config demons")
+        if self.td_errors_shape != (self.steps, self.config.n_demons):
+            raise ValueError("td_errors_shape must match steps and config demons")
+        if type(self.horde_config) is not dict:
             raise ValueError("horde_config must be an exact dict with exact string keys")
+        horde_config = _bounded_json_clone(
+            self.horde_config,
+            path="horde_config",
+            budget=[0],
+        )
+        expected_horde_config = make_step3_horde(self.config).to_config()
+        if horde_config != expected_horde_config:
+            raise ValueError("horde_config must match the exact Step3HordeConfig projection")
+        object.__setattr__(self, "horde_config", horde_config)
 
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-serializable representation."""
