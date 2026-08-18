@@ -244,6 +244,7 @@ The console scripts are grouped by responsibility; every command supports `--hel
 | `asi-coom-qualification-smoke` | Inspect or run the bounded, synthetic, permanently nonpromoting COOM qualification smoke |
 | `asi-cora-catalog` | Inspect the blocked CORA qualification catalog without importing external runtimes |
 | `asi-forager-rerun-preflight` | Report the fail-closed, read-only readiness state for a matched-current Forager rerun |
+| `asi-telapa-qualification-smoke` | Inspect or run the bounded, permanently nonpromoting TeLAPA archive smoke |
 | `asi-reference-life-scorecard` | Run or validate the permanently nonpromoting reference-life development scorecard |
 | `asi-ipmnist-ceiling` | Produce new, atomic no-replace stationary/carried/full or batch ceiling diagnostics |
 | `asi-ipmnist-campaign` | Recompute paired frontiers or ceiling summaries from explicit input directories |

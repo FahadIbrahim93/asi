@@ -201,6 +201,7 @@ not mean an agent adapter or comparison result exists.
 | [COOM](https://github.com/TTomilin/COOM) | Pixel-based Doom task sequences with average performance, forgetting, and forward transfer. | Useful robustness/representation lane after a smaller R3 control closes. |
 | [Continual Bench / FTL Online Agent](https://arxiv.org/abs/2507.09177) | Online shallow world model plus MPC across reward-defined continual tasks, with a regret result under stated assumptions. | Closest model-based competitor to ASI's FTL line; reproduce before extending the historically accepted narrow decision-fidelity artifact, and use the live evidence-status command for its current validity. |
 | [C-CHAIN](https://arxiv.org/abs/2506.00592) | Continual nonstationarity across Gym Control, ProcGen, DMC, and MinAtar. | Contemporary plasticity baseline; audit precise task sequences and replay/batch settings first. |
+| [TeLAPA](https://arxiv.org/abs/2604.15414v1) | Preserves per-task policy neighborhoods and maintains a shared learned trajectory latent for later retrieval and adaptation. | The [bounded qualification smoke](../runbooks/telapa-qualification.md) exercises only ASI's archive primitive in SwitchingTwoState. The disclosed anonymous code view lacks an established immutable revision, so paper parity fails closed. |
 
 Additional project sources:
 

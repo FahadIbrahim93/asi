@@ -31,6 +31,9 @@ _ASI_SCRIPTS = {
     "asi-forager-rerun-preflight": (
         "alberta_framework.benchmarks.forager_scientific_rerun_preflight:main"
     ),
+    "asi-telapa-qualification-smoke": (
+        "alberta_framework.benchmarks.telapa_qualification:main"
+    ),
     "asi-reference-life-scorecard": (
         "alberta_framework.benchmarks.reference_life_scorecard:main"
     ),
