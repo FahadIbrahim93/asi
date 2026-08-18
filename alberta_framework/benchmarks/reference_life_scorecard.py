@@ -1644,12 +1644,22 @@ def build_scorecard_artifact(
 ) -> dict[str, Any]:
     """Assemble one immutable aggregate and bind its deterministic summary."""
 
-    if any(
-        not isinstance(record, Mapping) or type(record.get("schedule_index")) is not int
-        for record in records
-    ):
-        raise ValueError("every run record must have an integer schedule_index")
-    ordered_records = sorted(records, key=lambda record: cast(int, record["schedule_index"]))
+    if type(records) is not list and type(records) is not tuple:
+        raise ValueError("run records must be an exact list or tuple")
+    canonical_records: list[dict[str, Any]] = []
+    for raw_record in records:
+        if type(raw_record) is not dict:
+            raise ValueError("every run record must be an exact string-keyed object")
+        record = cast(dict[object, Any], raw_record)
+        if any(type(key) is not str for key in record):
+            raise ValueError("every run record must be an exact string-keyed object")
+        canonical = cast(dict[str, Any], record)
+        if type(canonical.get("schedule_index")) is not int:
+            raise ValueError("every run record must have an integer schedule_index")
+        canonical_records.append(canonical)
+    ordered_records = sorted(
+        canonical_records, key=lambda record: cast(int, record["schedule_index"])
+    )
     summary = summarize_run_records(plan, ordered_records)
     run_order = [
         {

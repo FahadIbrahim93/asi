@@ -176,6 +176,45 @@ def test_artifact_builder_rejects_hostile_schedule_before_integer_coercion() -> 
     assert _HostileInt.calls == 0
 
 
+def test_artifact_builder_admits_exact_record_containers_before_hooks() -> None:
+    from collections.abc import Iterator, Mapping
+
+    from alberta_framework.benchmarks import reference_life_scorecard as scorecard
+
+    class HostileRecords(list[object]):
+        calls = 0
+
+        def __iter__(self) -> Iterator[object]:
+            self.calls += 1
+            raise AssertionError("must not iterate")
+
+    class HostileRecord(Mapping[str, object]):
+        calls = 0
+
+        def __getitem__(self, key: str) -> object:
+            self.calls += 1
+            raise AssertionError("must not index")
+
+        def __iter__(self) -> Iterator[str]:
+            self.calls += 1
+            raise AssertionError("must not iterate")
+
+        def __len__(self) -> int:
+            self.calls += 1
+            raise AssertionError("must not size")
+
+    plan = scorecard.build_development_plan()
+    hostile_records = HostileRecords()
+    with pytest.raises(ValueError, match="exact list or tuple"):
+        scorecard.build_scorecard_artifact(plan, hostile_records)
+    assert hostile_records.calls == 0
+
+    hostile_record = HostileRecord()
+    with pytest.raises(ValueError, match="exact string-keyed object"):
+        scorecard.build_scorecard_artifact(plan, [hostile_record])
+    assert hostile_record.calls == 0
+
+
 def test_reward_sum_rejects_hostile_before_float() -> None:
     from alberta_framework.benchmarks.reference_life_scorecard import _reward_sum
 
