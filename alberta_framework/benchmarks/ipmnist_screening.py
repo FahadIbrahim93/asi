@@ -532,6 +532,7 @@ class L2ERState:
 
     example_buffer: Array
     buffer_count: Array
+    transaction_valid: Array
 
 
 def l2er_effective_rank_transaction(
@@ -642,6 +643,11 @@ def l2er_update(
         count.shape != () or count.dtype != jnp.dtype(jnp.int32)
     ):
         raise ValueError("buffer_count must be one scalar int32 JAX array")
+    transaction_valid = state.transaction_valid
+    if not isinstance(transaction_valid, (jax.Array, jax.core.Tracer)) or (
+        transaction_valid.shape != () or transaction_valid.dtype != jnp.dtype(jnp.bool_)
+    ):
+        raise ValueError("transaction_valid must be one scalar bool JAX array")
     step_size = checked_hp["step_size"]
     weight_decay = checked_hp["weight_decay"]
     supervised_params = {
@@ -679,8 +685,14 @@ def l2er_update(
             complete, jnp.zeros_like, lambda value: value, buffered
         ),
         buffer_count=jnp.where(complete, jnp.asarray(0, dtype=jnp.int32), next_count),
+        transaction_valid=jnp.asarray(True, dtype=jnp.bool_),
     )
-    valid = count_valid & floating_tree_is_finite(params) & floating_tree_is_finite(grads)
+    valid = (
+        transaction_valid
+        & count_valid
+        & floating_tree_is_finite(params)
+        & floating_tree_is_finite(grads)
+    )
     valid = valid & floating_tree_is_finite(new_params) & floating_tree_is_finite(candidate_state)
     safe_prior_params = jax.tree.map(
         lambda value: jnp.where(jnp.isfinite(value), value, jnp.zeros_like(value)),
@@ -689,6 +701,7 @@ def l2er_update(
     safe_prior_state = L2ERState(  # type: ignore[call-arg]
         example_buffer=jnp.where(jnp.isfinite(buffer), buffer, jnp.zeros_like(buffer)),
         buffer_count=jnp.where(count_valid, count, jnp.asarray(0, dtype=jnp.int32)),
+        transaction_valid=jnp.asarray(False, dtype=jnp.bool_),
     )
     return (
         select_transaction(valid, new_params, safe_prior_params),
@@ -712,6 +725,7 @@ def _make_l2er_learner(
                 (int(checked_hp["er_batch_size"]), input_dim), dtype=jnp.float32
             ),
             buffer_count=jnp.asarray(0, dtype=jnp.int32),
+            transaction_valid=jnp.asarray(True, dtype=jnp.bool_),
         )
 
     def full_step(
@@ -8674,7 +8688,7 @@ def l2er_development_result_payload(
         + config.hidden2 * config.n_classes
         + config.n_classes
     )
-    persistent_bytes = 4 * (parameter_count + er_batch_size * config.input_dim + 1)
+    persistent_bytes = 4 * (parameter_count + er_batch_size * config.input_dim + 1) + 1
     payload: dict[str, object] = {
         "schema": L2ER_RESULT_SCHEMA,
         "comparison_id": L2ER_COMPARISON_ID,
@@ -9227,6 +9241,9 @@ def run_screening_config(
             schedule.permutations[task],
             schedule.example_indices[task],
         )
+        if spec.mechanism == "l2_effective_rank":
+            if type(state) is not L2ERState or not bool(state.transaction_valid):
+                raise RuntimeError("L2-ER update transaction became invalid")
         task_accuracy.append(float(jnp.mean(accuracies)))
         task_loss.append(float(jnp.mean(losses)))
         task_plasticity.append(float(jnp.mean(plasticities)))
