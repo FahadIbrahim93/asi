@@ -8,6 +8,7 @@ import pytest
 from alberta_framework.evaluation.bimu_matched_nonpromoting import (
     FROZEN_BIMU_MATCHED_PLAN,
     INVALID_PRIOR_ATTEMPT,
+    _plan_payload,
     build_bimu_execution_manifest,
     validate_bimu_execution_manifest,
 )
@@ -31,6 +32,21 @@ def test_frozen_bimu_plan_is_matched_and_prospective() -> None:
     assert plan.dataset_sha256 == "85c681c2f5fc5c274870b30c9accb3d2a6e9eb90a4575a2bf1ccca64f58b6227"
     assert INVALID_PRIOR_ATTEMPT["pull_request"] == 1686
     assert INVALID_PRIOR_ATTEMPT["seed"] == 23
+    payload = _plan_payload(plan)
+    assert payload["expected_counters_per_arm"]["observations"] == 1280
+    assert payload["expected_counters_per_arm"]["model_forward_queries"] == 10240
+    assert payload["expected_resources_per_arm"] == {
+        "trainable_scalar_count": 25408,
+        "parameter_numeric_bytes": 101632,
+        "optimizer_state_numeric_bytes": 8,
+        "initial_persistent_numeric_bytes": 101640,
+        "final_persistent_numeric_bytes": 101640,
+        "dataset_numeric_bytes": 1607680,
+        "timing_qualified": False,
+        "aggregate_working_set_bytes_claimed": False,
+        "numeric_resource_ceiling_bytes": 256 * 1024 * 1024,
+    }
+    assert payload["comparison_scope"]["paper_comparable"] is False
 
 
 def test_manifest_binds_exact_data_source_runtime_and_plan(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -66,13 +82,15 @@ def test_manifest_rejects_hostile_key_without_hooks() -> None:
 
         def __hash__(self) -> int:
             self.calls += 1
-            raise AssertionError("must not hash")
+            return super().__hash__()
 
         def __eq__(self, other: object) -> bool:
             self.calls += 1
             raise AssertionError("must not compare")
 
     key = Hostile("schema")
+    payload = {key: "x"}
+    key.calls = 0
     with pytest.raises(ValueError, match="exact JSON"):
-        validate_bimu_execution_manifest({key: "x"}, *_data())
+        validate_bimu_execution_manifest(payload, *_data())
     assert key.calls == 0
