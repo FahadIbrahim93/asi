@@ -378,6 +378,10 @@ def test_summary_retains_failures_and_reports_valid_baseline_failure() -> None:
     assert summary["status"] == "valid_baseline_failure"
 
 
+@pytest.mark.skipif(
+    not hasattr(os, "O_TMPFILE"),
+    reason="write_new_json publishes through Linux O_TMPFILE and linkat(AT_EMPTY_PATH)",
+)
 def test_new_json_publication_is_canonical_and_refuses_overwrite(tmp_path: Path) -> None:
     destination = tmp_path / "plan.json"
     payload = build_development_plan().to_payload()
@@ -391,6 +395,17 @@ def test_new_json_publication_is_canonical_and_refuses_overwrite(tmp_path: Path)
     ).encode("utf-8") + b"\n"
     with pytest.raises(FileExistsError, match="refusing to overwrite"):
         write_new_json(destination, {"different": math.pi})
+
+
+@pytest.mark.skipif(
+    hasattr(os, "O_TMPFILE"),
+    reason="Linux publishes the document instead of refusing",
+)
+def test_new_json_publication_fails_closed_without_o_tmpfile(tmp_path: Path) -> None:
+    destination = tmp_path / "plan.json"
+    with pytest.raises(OSError, match="requires Linux O_TMPFILE support"):
+        write_new_json(destination, build_development_plan().to_payload())
+    assert not destination.exists()
 
 
 def test_new_json_publication_rejects_a_symlinked_parent(tmp_path: Path) -> None:
@@ -994,7 +1009,8 @@ def test_validate_cli_accepts_the_canonical_plan(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     path = tmp_path / "plan.json"
-    scorecard.write_new_json(path, scorecard.build_development_plan().to_payload())
+    payload = scorecard.build_development_plan().to_payload()
+    path.write_text(json.dumps(payload), encoding="utf-8")
 
     assert scorecard.main(["validate", str(path)]) == 0
     result = json.loads(capsys.readouterr().out)
