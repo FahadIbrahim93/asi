@@ -10,6 +10,7 @@ from alberta_framework.benchmarks.forager_matched_campaign import (
     CampaignStatus,
     CompletedCampaignBundle,
     ForagerMatchedCampaignError,
+    _CellScan,
 )
 
 
@@ -102,3 +103,59 @@ def test_completed_campaign_bundle_validation() -> None:
             completion_summary={},
             final_file_sha256={},
         )
+
+
+def _legal_cell_scan(**overrides: object) -> _CellScan:
+    payload: dict[str, object] = {
+        "artifact": None,
+        "completed_attempt": None,
+        "raw_binding_sha256": None,
+        "bundle_sha256": None,
+        "resumable_attempt": None,
+        "resumable_binding": None,
+        "next_attempt_number": 1,
+        "pointer_present": False,
+        "retained_raw_bytes": 0,
+    }
+    payload.update(overrides)
+    return _CellScan(**payload)  # type: ignore[arg-type]
+
+
+def test_cell_scan_legal_empty_and_completed_shapes() -> None:
+    empty = _legal_cell_scan()
+    assert empty.next_attempt_number == 1
+    assert empty.pointer_present is False
+    assert empty.retained_raw_bytes == 0
+    completed = _legal_cell_scan(
+        completed_attempt=Path("attempts/attempt-001"),
+        raw_binding_sha256="a" * 64,
+        bundle_sha256="b" * 64,
+        next_attempt_number=2,
+        pointer_present=True,
+        retained_raw_bytes=1024,
+    )
+    assert completed.pointer_present is True
+    assert completed.next_attempt_number == 2
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("next_attempt_number", True),
+        ("next_attempt_number", False),
+        ("next_attempt_number", 0),
+        ("retained_raw_bytes", True),
+        ("retained_raw_bytes", False),
+        ("retained_raw_bytes", -1),
+        ("pointer_present", 1),
+        ("pointer_present", 0),
+        ("completed_attempt", "attempts/attempt-001"),
+        ("raw_binding_sha256", "not-a-digest"),
+        ("resumable_binding", ["not-a-mapping"]),
+    ],
+)
+def test_cell_scan_rejects_bool_attempt_and_byte_identities(
+    field: str, value: object
+) -> None:
+    with pytest.raises(ForagerMatchedCampaignError, match=field):
+        _legal_cell_scan(**{field: value})
