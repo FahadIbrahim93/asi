@@ -89,6 +89,8 @@ def test_streaming_matrix_evaluation_is_frozen_matched_and_nonpromoting() -> Non
     assert result["config"] == dict(FROZEN_GEOMETRY_CONFIG)
     assert GEOMETRY_PROTOCOL["stage"] == "frozen_small_streaming_matrix_pre_ipmnist"
     assert GEOMETRY_PROTOCOL["scientific_promotion_allowed"] is False
+    assert GEOMETRY_PROTOCOL["persistent_numeric_bytes_accounting_required"] is True
+    assert GEOMETRY_PROTOCOL["aggregate_working_set_bytes_claimed"] is False
     arms = result["arms"]
     assert isinstance(arms, list)
     assert len(arms) == 6
@@ -97,7 +99,7 @@ def test_streaming_matrix_evaluation_is_frozen_matched_and_nonpromoting() -> Non
         assert resources["observations"] == FROZEN_GEOMETRY_CONFIG["updates"]
         assert resources["updates"] == FROZEN_GEOMETRY_CONFIG["updates"]
         assert resources["data_steps"] == FROZEN_GEOMETRY_CONFIG["updates"]
-        assert resources["persistent_bytes"] > 0
+        assert resources["persistent_numeric_bytes"] > 0
         assert resources["timing_qualified"] is False
     assert result["policy"] == {
         "status": "development-only-nonpromoting",
