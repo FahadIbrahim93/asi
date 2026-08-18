@@ -105,6 +105,22 @@ def test_validate_json_value_rejects_hostile_key_before_dispatch() -> None:
     assert _HostileString.calls == 0
 
 
+def test_validate_json_value_rejects_hostile_scalar_aliases() -> None:
+    from alberta_framework.reference_agent import _validate_json_value
+
+    hostile = _HostileString("evil")
+    _HostileString.calls = 0
+    with pytest.raises(ValueError, match="not a canonical JSON value"):
+        _validate_json_value({"value": hostile}, path="config")
+    assert _HostileString.calls == 0
+
+    class IntSubclass(int):
+        pass
+
+    with pytest.raises(ValueError, match="not a canonical JSON value"):
+        _validate_json_value({"value": IntSubclass(1)}, path="config")
+
+
 def test_dispatch_authorization_veto_reason_rejects_hostile_before_strip() -> None:
     manifest = _manifest()
     decision = _decision(manifest)
