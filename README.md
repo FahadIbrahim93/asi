@@ -240,6 +240,7 @@ The console scripts are grouped by responsibility; every command supports `--hel
 | Commands | Purpose |
 |---|---|
 | `alberta-step1-smoke`, `alberta-step2-smoke` | Nonpromoting mechanism smoke checks |
+| `asi-adamo-diagnostic` | Catalog or run the bounded, permanently nonpromoting AdamO dynamical-isometry comparator |
 | `asi-reference-life-scorecard` | Run or validate the permanently nonpromoting reference-life development scorecard |
 | `asi-ipmnist-ceiling` | Produce new, atomic no-replace stationary/carried/full or batch ceiling diagnostics |
 | `asi-ipmnist-campaign` | Recompute paired frontiers or ceiling summaries from explicit input directories |
@@ -257,6 +258,9 @@ Use the [maintained IPMNIST campaign tools](docs/runbooks/ipmnist-maintained-too
 ceiling, frontier, and rule-discovery reproduction. Programs stored under `outputs/` remain
 historical provenance, not the maintained implementation; existing bytes follow their pinned
 immutable or active-campaign append-only policy.
+The AdamO adapter's exact paper/code audit, matched axes, accounting conventions, and
+comparability gaps are recorded in
+[`docs/research/adamo-diagnostic.md`](docs/research/adamo-diagnostic.md).
 
 ## Package layout
 
