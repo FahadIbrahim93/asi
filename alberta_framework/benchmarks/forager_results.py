@@ -307,11 +307,11 @@ class LegacyFOVSQLiteRunSpec:
         if not isinstance(self.privileged, bool):
             raise ValueError("privileged must be a boolean")
         if (
-            not isinstance(self.expected_config_agent, str)
+            type(self.expected_config_agent) is not str
             or self.expected_config_agent not in LEGACY_FOV_CONFIG_AGENTS
         ):
             raise ValueError("expected_config_agent must name a checked-in paper FOV configuration")
-        if not isinstance(self.agent, str) or not self.agent:
+        if type(self.agent) is not str or not self.agent:
             raise ValueError("agent must be a non-empty string")
         if not isinstance(self.expected_aperture_size, int) or isinstance(
             self.expected_aperture_size, bool
@@ -812,7 +812,7 @@ def _validated_environment_provenance(
     if implementation["package"] != "foragax":
         raise ValueError("environment implementation must identify the foragax package")
     version = implementation["version"]
-    if not isinstance(version, str) or not version.strip():
+    if type(version) is not str or not version.strip():
         raise ValueError("environment implementation version must be non-empty")
     direct_url = implementation["direct_url"]
     if direct_url is not None and not isinstance(direct_url, dict):
@@ -890,7 +890,7 @@ class OfficialForagaxRunSpec:
     attestation_evidence: VerifiedOfficialForagaxEvidence | None = None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.agent, str) or not self.agent.strip():
+        if type(self.agent) is not str or not self.agent.strip():
             raise ValueError("agent must be a non-empty string")
         if not isinstance(self.seed, int) or isinstance(self.seed, bool) or self.seed < 0:
             raise ValueError("seed must be a non-negative integer")
