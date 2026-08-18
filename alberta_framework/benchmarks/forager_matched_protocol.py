@@ -1117,7 +1117,8 @@ def _validate_json_complexity(value: Any) -> None:
 
 def decode_strict_json(data: bytes | str) -> Any:
     """Decode duplicate-free finite UTF-8 JSON with bounded complexity."""
-    if type(data) not in (bytes, str):
+    data_type = type(data)
+    if data_type is not bytes and data_type is not str:
         raise ForagerMatchedProtocolError("protocol must be exact bytes or string JSON")
     try:
         if type(data) is bytes:

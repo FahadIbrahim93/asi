@@ -37,6 +37,18 @@ class _HostileString(str):
         raise AssertionError("hostile string encoding executed")
 
 
+class _HostileInputMeta(type):
+    calls = 0
+
+    def __eq__(cls, other: object) -> bool:
+        cls.calls += 1
+        raise AssertionError("hostile metaclass equality executed")
+
+
+class _HostileInput(metaclass=_HostileInputMeta):
+    pass
+
+
 def test_environment_rng_contract_validation() -> None:
     contract = EnvironmentRNGContract(
         identity="env_rng.v1",
@@ -172,3 +184,10 @@ def test_protocol_string_boundaries_reject_subclasses_without_dispatch() -> None
         with pytest.raises(ForagerMatchedProtocolError):
             operation()
     assert _HostileString.calls == 0
+
+
+def test_protocol_decoder_rejects_hostile_runtime_type_without_metaclass_hooks() -> None:
+    _HostileInputMeta.calls = 0
+    with pytest.raises(ForagerMatchedProtocolError, match="exact bytes or string JSON"):
+        decode_strict_json(_HostileInput())  # type: ignore[arg-type]
+    assert _HostileInputMeta.calls == 0
