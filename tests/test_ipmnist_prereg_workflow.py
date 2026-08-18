@@ -113,6 +113,16 @@ def test_prereg_workflow_invokes_only_setup_uv_pinned_binary() -> None:
     assert "      - name: Set up exact uv 0.9.24\n        id: uv\n" in workflow
     assert 'UV_PATH: ${{ steps.uv.outputs.uv-path }}' in workflow
     assert '[[ "$UV_PATH" != /* || ! -x "$UV_PATH" ]]' in workflow
+    assert (
+        'UV_SHA256: "613eda52458300fa7af03231280d252b8cde8f96df56e43d10c0bcd0d583afea"'
+        in workflow
+    )
+    assert 'actual_uv_sha256="$(shasum -a 256 "$UV_PATH" | awk \'{print $1}\')"' in workflow
+    assert '[[ "$actual_uv_sha256" != "$UV_SHA256" ]]' in workflow
+    # Official release builds may decorate their display version with commit
+    # metadata. Identity is the pinned executable digest, not presentation.
+    assert '"$UV_PATH" --version' in workflow
+    assert '[[ "$("$UV_PATH" --version)" != "uv 0.9.24" ]]' not in workflow
     shell_lines = [line.strip() for line in workflow.splitlines()]
     assert not any(line.startswith("uv ") or "$(uv " in line for line in shell_lines)
     assert sum('"$UV_PATH" ' in line for line in shell_lines) >= 13
