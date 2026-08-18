@@ -113,9 +113,34 @@ def test_prereg_workflow_invokes_only_setup_uv_pinned_binary() -> None:
     assert "      - name: Set up exact uv 0.9.24\n        id: uv\n" in workflow
     assert 'UV_PATH: ${{ steps.uv.outputs.uv-path }}' in workflow
     assert '[[ "$UV_PATH" != /* || ! -x "$UV_PATH" ]]' in workflow
+    assert (
+        'UV_SHA256: "613eda52458300fa7af03231280d252b8cde8f96df56e43d10c0bcd0d583afea"'
+        in workflow
+    )
+    assert 'actual_uv_sha256="$(shasum -a 256 "$UV_PATH" | awk \'{print $1}\')"' in workflow
+    assert '[[ "$actual_uv_sha256" != "$UV_SHA256" ]]' in workflow
+    # Official release builds may decorate their display version with commit
+    # metadata. Identity is the pinned executable digest, not presentation.
+    assert '"$UV_PATH" --version' in workflow
+    assert '[[ "$("$UV_PATH" --version)" != "uv 0.9.24" ]]' not in workflow
     shell_lines = [line.strip() for line in workflow.splitlines()]
     assert not any(line.startswith("uv ") or "$(uv " in line for line in shell_lines)
     assert sum('"$UV_PATH" ' in line for line in shell_lines) >= 13
+
+
+def test_prereg_workflow_syncs_locked_test_and_research_environments() -> None:
+    workflow = (_ROOT / ".github" / "workflows" / "ipmnist-prereg.yml").read_text(
+        encoding="utf-8"
+    )
+    assert '          "$UV_PATH" sync \\\n' in workflow
+    assert "            --locked \\\n" in workflow
+    assert "            --extra dev \\\n" in workflow
+    assert "            --extra research\n" in workflow
+    assert 'pytest_version="$("$UV_PATH" run --no-sync python -c ' in workflow
+    assert '[[ "$pytest_version" != "9.1.1" ]]' in workflow
+    # Pytest enables the code-only gate but is not measurement provenance.
+    expected_packages = cast(dict[str, str], _DRIVER["EXPECTED_PACKAGES"])
+    assert "pytest" not in expected_packages
 
 
 def test_issue184_github_and_local_protocols_cannot_drift() -> None:
@@ -334,13 +359,17 @@ def _verify_with_comment(
     monkeypatch: pytest.MonkeyPatch,
     comment: dict[str, Any],
     *,
+    prior_runs: list[dict[str, Any]] | None = None,
     current_overrides: dict[str, Any] | None = None,
     invocation_overrides: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     current, comments = _launch_api_payloads(comment)
     current.update(current_overrides or {})
     monkeypatch.setitem(_DRIVER_GLOBALS, "_github_json", lambda *_args, **_kwargs: current)
-    monkeypatch.setitem(_DRIVER_GLOBALS, "_workflow_runs", lambda *_args, **_kwargs: [current])
+    workflow_runs = [*(prior_runs or []), current]
+    monkeypatch.setitem(
+        _DRIVER_GLOBALS, "_workflow_runs", lambda *_args, **_kwargs: workflow_runs
+    )
     monkeypatch.setitem(_DRIVER_GLOBALS, "_github_pages", lambda *_args, **_kwargs: comments)
     arguments: dict[str, Any] = {
         "protocol_key": "issue51",
@@ -392,6 +421,31 @@ def test_launch_authorization_accepts_exact_unedited_project_owner_comment(
     assert payload["authorization_comment_id"] == 456
     assert payload["authorization_created_at"] == "2026-08-16T09:00:00Z"
     assert payload["authorization_updated_at"] == "2026-08-16T09:00:00Z"
+
+
+def test_launch_authorization_ignores_consumed_dispatches_for_prior_sources(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prior_run = {
+        "id": 122,
+        "event": "workflow_dispatch",
+        "head_sha": "0" * 40,
+        "display_title": f"ipmnist-issue51-{'0' * 40}",
+        "run_attempt": 1,
+        "path": ".github/workflows/ipmnist-prereg.yml",
+        "created_at": "2026-08-15T10:00:00Z",
+        "html_url": "https://github.com/elizaOS/asi/actions/runs/122",
+        "status": "completed",
+        "conclusion": "cancelled",
+    }
+
+    payload = _verify_with_comment(
+        monkeypatch,
+        _authorization_comment(),
+        prior_runs=[prior_run],
+    )
+
+    assert payload["run_id"] == 123
 
 
 def test_synchronized_preflight_binds_the_early_owner_receipt(
