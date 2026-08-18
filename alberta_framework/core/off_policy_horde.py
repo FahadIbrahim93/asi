@@ -378,7 +378,9 @@ class OffPolicyHordeLearner:
 
         self._horde_spec = horde_spec
         self._hidden_sizes = hidden_sizes
-        self._optimizer: AnyOptimizer = optimizer or LMS(step_size=step_size)
+        self._optimizer: AnyOptimizer = (
+            optimizer if optimizer is not None else LMS(step_size=step_size)
+        )
         self._head_optimizer = head_optimizer
         self._bounder = bounder
         self._normalizer = normalizer
@@ -738,7 +740,9 @@ class OffPolicyHordeLearner:
         new_head_opt_states: list[tuple[Any, Any]] = []
         per_demon_metrics: list[Array] = []
         head_candidates_finite: list[Array] = []
-        head_optimizer = self._head_optimizer or self._optimizer
+        head_optimizer = (
+            self._head_optimizer if self._head_optimizer is not None else self._optimizer
+        )
         lamdas = self._horde_spec.lamdas
 
         for i in range(n_demons):
@@ -957,7 +961,11 @@ class OffPolicyHordeLearner:
             "sparsity": self._sparsity,
             "leaky_relu_slope": self._leaky_relu_slope,
             "use_layer_norm": self._use_layer_norm,
-            "head_optimizer": (self._head_optimizer.to_config() if self._head_optimizer else None),
+            "head_optimizer": (
+                self._head_optimizer.to_config()
+                if self._head_optimizer is not None
+                else None
+            ),
             "trace_mode": self._trace_mode.value,
             "utility_decay": self._utility_decay,
             "ratio_clip": self._ratio_clip,
