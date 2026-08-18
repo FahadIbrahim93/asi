@@ -9,6 +9,9 @@ import pytest
 
 from alberta_framework.recurring_feature_gate import (
     PAIRWISE_PROBE_SCOPE,
+    PHASE_TASKS,
+    TASK_NAMES,
+    TASK_PAIRS,
     FeatureMemoryBudget,
     PhaseEvidence,
     RecurringFeatureGateResult,
@@ -101,3 +104,69 @@ def test_unrecovered_and_degenerate_nmse_sentinels_remain_legal() -> None:
     )
     assert math.isinf(seed.final_heldout_nmse[0])
     assert seed.phase_evidence[0].recovery_steps is None
+
+
+def _decision_result() -> RecurringFeatureGateResult:
+    protocol = RecurringFeatureProtocol(heldout_samples=512)
+    occurrences = {task: 0 for task in TASK_NAMES}
+    phases = []
+    for index, task in enumerate(PHASE_TASKS):
+        occurrences[task] += 1
+        phases.append(PhaseEvidence(index, task, occurrences[task], 0.25, None))
+    recoveries = tuple(
+        TaskRecoveryEvidence(task, None, (None,) * (occurrences[task] - 1))
+        for task in TASK_NAMES
+    )
+    seed = RecurringFeatureSeedEvidence(
+        seed=30,
+        final_heldout_nmse=(0.1, 0.1, 0.1, 1.0),
+        active_pairs=TASK_PAIRS[:3],
+        candidate_pairs=tuple(
+            (left, right)
+            for left in range(protocol.feature_dim)
+            for right in range(left + 1, protocol.feature_dim)
+        ),
+        phase_evidence=tuple(phases),
+        task_recovery=recoveries,
+        steps_seen=protocol.total_steps,
+    )
+    return RecurringFeatureGateResult(
+        protocol=protocol,
+        memory_budget=FeatureMemoryBudget(3, 15, 4),
+        retained=RecurringFeatureVariantEvidence("retained", 0.999, (seed,)),
+        no_retention=RecurringFeatureVariantEvidence("no_retention", None, (seed,)),
+    )
+
+
+def test_decision_revalidates_forged_nested_evidence() -> None:
+    result = _decision_result()
+    phase = result.retained.seeds[0].phase_evidence[0]
+    object.__setattr__(phase, "prequential_nmse", True)
+
+    with pytest.raises(ValueError, match="prequential_nmse"):
+        result.decision()
+
+
+def test_decision_revalidates_forged_protocol_before_diagnostics() -> None:
+    result = _decision_result()
+    object.__setattr__(result.protocol, "feature_dim", True)
+
+    with pytest.raises(ValueError, match="feature_dim must be a built-in integer"):
+        result.decision()
+
+
+def test_decision_revalidates_and_cross_binds_memory_budget() -> None:
+    with pytest.raises(ValueError, match="active_pair_slots"):
+        FeatureMemoryBudget(True, 15, 4)
+
+    result = _decision_result()
+    object.__setattr__(result.memory_budget, "active_pair_slots", True)
+    with pytest.raises(ValueError, match="active_pair_slots"):
+        result.decision()
+
+    mismatched = replace(
+        _decision_result(),
+        memory_budget=FeatureMemoryBudget(2, 15, 4),
+    )
+    with pytest.raises(ValueError, match="capacities must match"):
+        mismatched.decision()
