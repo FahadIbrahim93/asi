@@ -540,6 +540,23 @@ class VerifiedOfficialForagaxEvidence:
     endorsement_descriptor_sha256: str
     endorsement_sha256: str
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.manifest_path, Path):
+            raise OfficialForagaxValidationError("manifest_path must be a Path")
+        _require_sha256(self.manifest_sha256, label="manifest_sha256")
+        if self.manifest_kind not in ("official_foragax_single", "official_foragax_batch"):
+            raise OfficialForagaxValidationError(
+                "manifest_kind must be 'official_foragax_single' or 'official_foragax_batch'"
+            )
+        _require_string(self.trust_descriptor_id, label="trust_descriptor_id")
+        _require_sha256(self.trust_descriptor_sha256, label="trust_descriptor_sha256")
+        _require_string(self.profile_id, label="profile_id")
+        _require_sha256(self.profile_sha256, label="profile_sha256")
+        _require_sha256(self.artifact_identities_sha256, label="artifact_identities_sha256")
+        _require_string(self.endorsement_descriptor_id, label="endorsement_descriptor_id")
+        _require_sha256(self.endorsement_descriptor_sha256, label="endorsement_descriptor_sha256")
+        _require_sha256(self.endorsement_sha256, label="endorsement_sha256")
+
 
 @dataclass(frozen=True)
 class VerifiedOfficialForagaxManifest:
@@ -549,6 +566,20 @@ class VerifiedOfficialForagaxManifest:
     artifact_path: Path
     manifest: Mapping[str, Any]
     evidence: VerifiedOfficialForagaxEvidence | None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.manifest_path, Path):
+            raise OfficialForagaxValidationError("manifest_path must be a Path")
+        if not isinstance(self.artifact_path, Path):
+            raise OfficialForagaxValidationError("artifact_path must be a Path")
+        if not isinstance(self.manifest, Mapping):
+            raise OfficialForagaxValidationError("manifest must be a Mapping")
+        if self.evidence is not None and not isinstance(
+            self.evidence, VerifiedOfficialForagaxEvidence
+        ):
+            raise OfficialForagaxValidationError(
+                "evidence must be a VerifiedOfficialForagaxEvidence or None"
+            )
 
 
 @dataclass(frozen=True)
@@ -560,6 +591,15 @@ class OfficialForagaxRun:
     manifest: Mapping[str, Any]
     resumed: bool
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.manifest_path, Path):
+            raise OfficialForagaxValidationError("manifest_path must be a Path")
+        if not isinstance(self.artifact_path, Path):
+            raise OfficialForagaxValidationError("artifact_path must be a Path")
+        if not isinstance(self.manifest, Mapping):
+            raise OfficialForagaxValidationError("manifest must be a Mapping")
+        _require_bool(self.resumed, label="resumed")
+
 
 @dataclass(frozen=True)
 class VerifiedOfficialForagaxBatchManifest:
@@ -570,6 +610,24 @@ class VerifiedOfficialForagaxBatchManifest:
     manifest: Mapping[str, Any]
     evidence: VerifiedOfficialForagaxEvidence | None
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.manifest_path, Path):
+            raise OfficialForagaxValidationError("manifest_path must be a Path")
+        if type(self.artifact_paths) is not tuple or not all(
+            isinstance(p, Path) for p in self.artifact_paths
+        ):
+            raise OfficialForagaxValidationError(
+                "artifact_paths must be a tuple of Path instances"
+            )
+        if not isinstance(self.manifest, Mapping):
+            raise OfficialForagaxValidationError("manifest must be a Mapping")
+        if self.evidence is not None and not isinstance(
+            self.evidence, VerifiedOfficialForagaxEvidence
+        ):
+            raise OfficialForagaxValidationError(
+                "evidence must be a VerifiedOfficialForagaxEvidence or None"
+            )
+
 
 @dataclass(frozen=True)
 class OfficialForagaxBatchRun:
@@ -579,6 +637,19 @@ class OfficialForagaxBatchRun:
     artifact_paths: tuple[Path, ...]
     manifest: Mapping[str, Any]
     resumed: bool
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.manifest_path, Path):
+            raise OfficialForagaxValidationError("manifest_path must be a Path")
+        if type(self.artifact_paths) is not tuple or not all(
+            isinstance(p, Path) for p in self.artifact_paths
+        ):
+            raise OfficialForagaxValidationError(
+                "artifact_paths must be a tuple of Path instances"
+            )
+        if not isinstance(self.manifest, Mapping):
+            raise OfficialForagaxValidationError("manifest must be a Mapping")
+        _require_bool(self.resumed, label="resumed")
 
 
 def _absolute_without_resolving_symlinks(path: Path) -> Path:
