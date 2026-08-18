@@ -17,7 +17,12 @@ from alberta_framework.benchmarks.ipmnist_campaign_tools import (
     build_frontier,
     validate_confirm_alignment,
 )
-from alberta_framework.benchmarks.ipmnist_ceiling import _atomic_publish, _publish_run
+from alberta_framework.benchmarks.ipmnist_ceiling import (
+    _atomic_publish,
+    _publish_run,
+    run_arm_per_step,
+    run_batch_reference,
+)
 from alberta_framework.benchmarks.rule_discovery_summary import (
     CHAMPION,
     SCREEN_ARMS,
@@ -27,6 +32,14 @@ from alberta_framework.benchmarks.rule_discovery_summary import (
 
 pytestmark = pytest.mark.unit
 _REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+class _HostileSeed(int):
+    def __index__(self) -> int:  # pragma: no cover
+        raise AssertionError("seed conversion hook executed")
+
+    def __repr__(self) -> str:  # pragma: no cover
+        raise AssertionError("seed representation hook executed")
 
 
 def _shard(path: Path, *, seed: int, accuracy: float) -> None:
@@ -62,6 +75,30 @@ def _ceiling_run(
         np.full((tasks, 5000), mean_accuracy, dtype=np.float64),
         allow_pickle=False,
     )
+
+
+@pytest.mark.parametrize(
+    "seed",
+    [True, False, _HostileSeed(1), -1, 2**32],
+    ids=("true", "false", "hostile-int", "negative", "above-uint32"),
+)
+def test_ceiling_runner_rejects_noncanonical_seed_before_work(seed: object) -> None:
+    with pytest.raises(ValueError, match="built-in integer.*uint32"):
+        run_arm_per_step("unused", seed, 1, "identity")  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "seed",
+    [True, False, _HostileSeed(1), -1, 2**32],
+    ids=("true", "false", "hostile-int", "negative", "above-uint32"),
+)
+def test_batch_reference_rejects_noncanonical_seed_before_publication(
+    tmp_path: Path, seed: object
+) -> None:
+    output_dir = tmp_path / "must-not-exist"
+    with pytest.raises(ValueError, match="built-in integer.*uint32"):
+        run_batch_reference(output_dir, seed=seed)  # type: ignore[arg-type]
+    assert not output_dir.exists()
 
 
 def test_across_seed_spread_uses_sample_estimator() -> None:

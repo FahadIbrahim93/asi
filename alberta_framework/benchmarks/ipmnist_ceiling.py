@@ -26,6 +26,7 @@ import numpy as np
 import alberta_framework.benchmarks.ipmnist_provenance as ipmnist_provenance_module
 import alberta_framework.benchmarks.ipmnist_screening as ipmnist_screening_module
 import alberta_framework.benchmarks.upgd_ipmnist as upgd_ipmnist_module
+from alberta_framework._seed_validation import require_jax_seed
 from alberta_framework.benchmarks.ipmnist_provenance import (
     array_identity,
     repository_specification_identities,
@@ -55,6 +56,7 @@ def run_arm_per_step(
     progress_every: int = 20,
 ) -> tuple[np.ndarray[Any, Any], np.ndarray[Any, Any], float, dict[str, Any]]:
     """Run one screening arm while retaining per-step online accuracy."""
+    seed = require_jax_seed(seed)
     config = IPMNISTConfig(n_tasks=n_tasks)
     spec = screening_spec(spec_name)
     init_fn, step_fn = spec.factory(spec.hyperparameters)
@@ -281,6 +283,7 @@ def run_batch_reference(
     batch_size: int = 128,
 ) -> Path:
     """Run the converged minibatch-Adam architecture reference."""
+    seed = require_jax_seed(seed)
     import optax  # type: ignore[import-not-found]
     from sklearn.datasets import fetch_openml  # type: ignore[import-untyped]
 
