@@ -172,9 +172,7 @@ def _bootstrap_working_nbytes(resamples: int, sample_size: int) -> int:
 
 def _require_resource_limit(name: str, nbytes: int) -> None:
     if nbytes > _MAX_CONFIGURED_ARRAY_NBYTES:
-        raise ValueError(
-            f"{name} requires {nbytes} bytes; limit is {_MAX_CONFIGURED_ARRAY_NBYTES}"
-        )
+        raise ValueError(f"{name} requires {nbytes} bytes; limit is {_MAX_CONFIGURED_ARRAY_NBYTES}")
 
 
 @dataclass(frozen=True)
@@ -233,9 +231,7 @@ class ContinualMultiAgentConfig:
         object.__setattr__(
             self,
             "learning_rate",
-            validated_float32_scalar(
-                "learning_rate", self.learning_rate, positive=True, upper=1.0
-            ),
+            validated_float32_scalar("learning_rate", self.learning_rate, positive=True, upper=1.0),
         )
         for name in (
             "exploration_rate",
@@ -298,9 +294,7 @@ class AcceptanceThresholds:
             "evidence_seed_start", self.evidence_seed_start, minimum=0
         )
         if evidence_seed_start + minimum_seed_count > _INT32_MAX + 1:
-            raise ValueError(
-                "evidence_seed_start + minimum_seed_count must not exceed 2147483648"
-            )
+            raise ValueError("evidence_seed_start + minimum_seed_count must not exceed 2147483648")
         object.__setattr__(
             self,
             "minimum_seed_count",
@@ -475,6 +469,30 @@ class ConditionResult:
             raise ValueError("phase_mean_rewards must reconstruct from online_rewards")
         if type(self.summary) is not ContinualLearningSummary:
             raise ValueError("summary must be a ContinualLearningSummary")
+        summary_without_reference = summarize_continual_learning(
+            performance,
+            [0, 1],
+            rewards,
+            0.0,
+        )
+        for name in (
+            "final_performance",
+            "prequential_performance",
+            "mean_forgetting",
+            "max_forgetting",
+            "backward_transfer",
+        ):
+            if getattr(self.summary, name) != getattr(summary_without_reference, name):
+                raise ValueError(f"summary.{name} must reconstruct from primitive arrays")
+        for name in (
+            "per_task_final_performance",
+            "per_task_forgetting",
+            "per_task_backward_transfer",
+        ):
+            if not np.array_equal(
+                getattr(self.summary, name), getattr(summary_without_reference, name)
+            ):
+                raise ValueError(f"summary.{name} must reconstruct from performance_matrix")
         recovery = _require_ndarray(
             "recovery_lengths",
             self.recovery_lengths,
@@ -899,11 +917,27 @@ def aggregate_evidence(
     confidence_level: float = 0.95,
     bootstrap_resamples: int = 10_000,
     bootstrap_seed: int = 2_026_073_000,
+    stability_reference_reward: float = 0.75,
 ) -> AggregateEvidence:
     """Aggregate paired condition results without discarding failed seeds."""
 
     if not results:
         raise ValueError("results must be non-empty")
+    reference = finite_real("stability_reference_reward", stability_reference_reward)
+    for result in results:
+        expected_summary = summarize_continual_learning(
+            result.performance_matrix,
+            [0, 1],
+            result.online_rewards,
+            reference,
+        )
+        if (
+            result.summary.stability_gap_mean != expected_summary.stability_gap_mean
+            or result.summary.stability_gap_max != expected_summary.stability_gap_max
+        ):
+            raise ValueError(
+                "condition summary must reconstruct from primitive arrays and stability reference"
+            )
     frozen = _condition_results(results, "frozen")
     learner_only = _condition_results(results, "learner_only")
     joint_adaptive = _condition_results(results, "joint_adaptive")
@@ -1066,8 +1100,7 @@ def evaluate_acceptance(
 
     limits = AcceptanceThresholds() if thresholds is None else thresholds
     seed_schedule_matches = len(aggregate.seeds) == limits.minimum_seed_count and all(
-        seed == limits.evidence_seed_start + offset
-        for offset, seed in enumerate(aggregate.seeds)
+        seed == limits.evidence_seed_start + offset for offset, seed in enumerate(aggregate.seeds)
     )
     checks = (
         _minimum_check(
@@ -1213,6 +1246,7 @@ def run_continual_multiagent_benchmark(
         confidence_level=benchmark_config.confidence_level,
         bootstrap_resamples=benchmark_config.bootstrap_resamples,
         bootstrap_seed=benchmark_config.bootstrap_seed,
+        stability_reference_reward=benchmark_config.stability_reference_reward,
     )
     acceptance = evaluate_acceptance(aggregate, acceptance_thresholds)
     return ContinualMultiAgentReport(
