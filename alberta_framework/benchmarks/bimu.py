@@ -69,7 +69,9 @@ def posterior_probability_transaction(natural_parameter: object) -> tuple[Array,
 def posterior_probability(natural_parameter: object) -> Array:
     """Return ``P(weight=+1) = sigmoid(2 lambda)`` (paper equation 2)."""
     safe, valid = posterior_probability_transaction(natural_parameter)
-    if not isinstance(valid, jax.core.Tracer) and not bool(valid):
+    if isinstance(valid, jax.core.Tracer):
+        return jnp.where(valid, safe, jnp.full_like(safe, jnp.nan))
+    if not bool(valid):
         raise ValueError("posterior probability must be finite")
     return safe
 
@@ -133,7 +135,7 @@ def bimu_update(
     memory_window: int | None,
     alpha_max: float,
 ) -> Array:
-    """Compatibility wrapper that fails closed eagerly and returns a traced safe value."""
+    """Compatibility wrapper; traced callers use NaN to expose invalid transactions."""
     safe, valid = bimu_update_transaction(
         natural_parameter,
         loss_gradient,
@@ -141,7 +143,9 @@ def bimu_update(
         memory_window=memory_window,
         alpha_max=alpha_max,
     )
-    if not isinstance(valid, jax.core.Tracer) and not bool(valid):
+    if isinstance(valid, jax.core.Tracer):
+        return jnp.where(valid, safe, jnp.full_like(safe, jnp.nan))
+    if not bool(valid):
         raise ValueError("BiMU update must produce only finite values")
     return safe
 
@@ -150,9 +154,12 @@ def late_window_mean(task_accuracies: list[float] | tuple[float, ...], *, window
     """Compute BiMU's late-task metric without conflating whole-stream accuracy."""
     if type(window) is not int or window < 1 or window > _MAX_VECTOR_ELEMENTS:
         raise ValueError("window must be an integer in [1, 1000000]")
-    if type(task_accuracies) not in {list, tuple} or len(task_accuracies) > _MAX_VECTOR_ELEMENTS:
+    if (
+        (type(task_accuracies) is not list and type(task_accuracies) is not tuple)
+        or len(task_accuracies) > _MAX_VECTOR_ELEMENTS
+    ):
         raise ValueError("task_accuracies must be an exact bounded list or tuple")
-    if any(type(value) not in {int, float} for value in task_accuracies):
+    if any(type(value) is not int and type(value) is not float for value in task_accuracies):
         raise ValueError("task_accuracies must contain exact real numbers")
     values = np.asarray(task_accuracies)
     if values.ndim != 1 or values.size < window or values.dtype.kind not in {"i", "u", "f"}:

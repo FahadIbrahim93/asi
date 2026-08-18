@@ -45,11 +45,20 @@ def test_protocol_is_small_matrix_first_and_nonpromoting() -> None:
 def test_geometry_primitives_are_outer_jit_safe() -> None:
     corrected = jax.jit(orthogonal_correction)(jnp.array([1.0, 2.0]), jnp.array([[1.0, 0.0]]))
     np.testing.assert_allclose(corrected, [0.0, 2.0])
+    invalid = jax.jit(flad_noise_component)(jnp.array([jnp.nan]), jnp.ones(1))
+    assert bool(jnp.all(jnp.isnan(invalid)))
+    safe, valid = jax.jit(flad_noise_component_transaction)(
+        jnp.array([jnp.nan]), jnp.ones(1)
+    )
+    np.testing.assert_array_equal(safe, jnp.zeros(1))
+    assert not bool(valid)
 
 
 def test_geometry_rejects_empty_flad_and_hostile_array() -> None:
     with pytest.raises(ValueError, match="non-empty"):
         flad_noise_component(jnp.zeros(0), jnp.zeros(0))
+    with pytest.raises(ValueError, match="non-empty"):
+        orthogonal_correction(jnp.zeros(0), jnp.zeros((0, 0)))
 
     class Hostile:
         calls = 0

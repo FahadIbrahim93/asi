@@ -51,6 +51,8 @@ def test_archive_preflights_host_dimensions() -> None:
         BoundedPolicyArchive(byte_budget=256 * 1024 * 1024 + 1, min_latent_distance=0.0)
     with pytest.raises(ValueError, match="identity"):
         _entry("x" * 1025, (0.0,), 1.0)
+    with pytest.raises(ValueError, match="UTF-8"):
+        _entry("\ud800", (0.0,), 1.0)
     entry = _entry("a", (0.0,), 1.0)
     with pytest.raises(ValueError, match="exact tuple"):
         BoundedPolicyArchive(

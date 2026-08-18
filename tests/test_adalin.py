@@ -5,7 +5,12 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from alberta_framework.benchmarks.adalin import ADALIN_PROTOCOL, adalin_relu, adalin_tanh
+from alberta_framework.benchmarks.adalin import (
+    ADALIN_PROTOCOL,
+    adalin_relu,
+    adalin_relu_transaction,
+    adalin_tanh,
+)
 
 
 def test_relu_reduction_and_prelu_identity() -> None:
@@ -33,6 +38,11 @@ def test_protocol_keeps_pmnist_difference_explicit() -> None:
 def test_adalin_is_outer_jit_safe() -> None:
     transformed = jax.jit(adalin_relu)(jnp.array([-1.0, 1.0]), jnp.array([0.2, 0.2]))
     np.testing.assert_allclose(transformed, [-0.2, 1.0])
+    invalid = jax.jit(adalin_relu)(jnp.array([jnp.nan]), jnp.array([0.2]))
+    assert bool(jnp.all(jnp.isnan(invalid)))
+    safe, valid = jax.jit(adalin_relu_transaction)(jnp.array([jnp.nan]), jnp.array([0.2]))
+    np.testing.assert_array_equal(safe, jnp.zeros(1))
+    assert not bool(valid)
 
 
 def test_adalin_preflights_cross_broadcast_and_hostile_array() -> None:

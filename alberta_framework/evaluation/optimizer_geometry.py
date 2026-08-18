@@ -48,8 +48,13 @@ def orthogonal_correction_transaction(update: Array, protected_basis: Array) -> 
     """Return a finite orthogonal correction and caller-visible validity bit."""
     vector = _trusted_array(update, name="update")
     basis = _trusted_array(protected_basis, name="protected_basis")
-    if vector.ndim != 1 or basis.ndim != 2 or basis.shape[1] != vector.shape[0]:
-        raise ValueError("update must be a vector and basis rows must match its width")
+    if (
+        vector.ndim != 1
+        or vector.size < 1
+        or basis.ndim != 2
+        or basis.shape[1] != vector.shape[0]
+    ):
+        raise ValueError("update must be a non-empty vector and basis rows must match its width")
     coordinates = basis @ vector
     projection = basis.T @ coordinates
     candidate = vector - projection
@@ -66,7 +71,9 @@ def orthogonal_correction_transaction(update: Array, protected_basis: Array) -> 
 
 def _unwrap_transaction(result: tuple[Array, Array], *, name: str) -> Array:
     safe, valid = result
-    if not isinstance(valid, jax.core.Tracer) and not bool(valid):
+    if isinstance(valid, jax.core.Tracer):
+        return jnp.where(valid, safe, jnp.full_like(safe, jnp.nan))
+    if not bool(valid):
         raise ValueError(f"{name} must be finite")
     return safe
 

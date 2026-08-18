@@ -73,7 +73,9 @@ def _adalin_transaction(
 
 def _unwrap_transaction(result: tuple[Array, Array]) -> Array:
     safe, valid = result
-    if not isinstance(valid, jax.core.Tracer) and not bool(valid):
+    if isinstance(valid, jax.core.Tracer):
+        return jnp.where(valid, safe, jnp.full_like(safe, jnp.nan))
+    if not bool(valid):
         raise ValueError("AdaLin activation must be finite")
     return safe
 
