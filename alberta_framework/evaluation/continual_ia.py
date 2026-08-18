@@ -95,6 +95,7 @@ RECOMMENDATION_CONDITIONS: tuple[IAConditionName, ...] = (
 _INT32_MAX = 2**31 - 1
 _MAX_BOOTSTRAP_RESAMPLES = 1_000_000
 _MAX_BOOTSTRAP_DRAW_COUNT = 50_000_000
+_MAX_CONDITION_RESULT_BYTES = 512 * 1024 * 1024
 _ACTUAL_INT_TYPES = frozenset(
     {int, *(np.dtype(code).type for code in ("b", "B", "h", "H", "i", "I", "l", "L", "q", "Q"))}
 )
@@ -464,35 +465,53 @@ class IAConditionResult:
         steps = int(rewards.shape[0])
         if steps < 1:
             raise ValueError("rewards must contain at least one step")
+        action_arrays: list[NDArray[Any]] = []
         for name in (
             "executed_actions",
             "credited_actions",
             "recommendations",
             "partner_proposals",
         ):
-            _require_ndarray(
+            action_arrays.append(_require_ndarray(
                 name,
                 getattr(self, name),
                 dtype=np.dtype(np.int64),
                 length=steps,
-            )
-        _require_ndarray(
+            ))
+        accepted = _require_ndarray(
             "accepted_recommendations",
             self.accepted_recommendations,
             dtype=np.dtype(np.bool_),
             length=steps,
         )
-        object.__setattr__(self, "mean_reward", finite_real("mean_reward", self.mean_reward))
-        _require_ndarray(
+        mean_reward = finite_real("mean_reward", self.mean_reward)
+        object.__setattr__(self, "mean_reward", mean_reward)
+        phase_means = _require_ndarray(
             "phase_mean_rewards",
             self.phase_mean_rewards,
             dtype=np.dtype(np.float64),
         )
-        _require_ndarray(
+        recoveries = _require_ndarray(
             "recovery_lengths",
             self.recovery_lengths,
             dtype=np.dtype(np.int64),
         )
+        arrays = (rewards, *action_arrays, accepted, phase_means, recoveries)
+        if sum(array.nbytes for array in arrays) > _MAX_CONDITION_RESULT_BYTES:
+            raise ValueError("condition result arrays exceed the bounded record budget")
+        if phase_means.size < 1 or recoveries.size != phase_means.size - 1:
+            raise ValueError("phase and recovery arrays do not describe one shared schedule")
+        if not bool(np.all(np.isfinite(rewards))) or not bool(np.all(np.isfinite(phase_means))):
+            raise ValueError("reward summaries must contain only finite values")
+        if mean_reward != float(np.mean(rewards)):
+            raise ValueError("mean_reward does not match the primitive rewards")
+        executed, credited, recommendations, proposals = action_arrays
+        if any(array.min() < 0 or array.max() > 1 for array in (executed, credited)):
+            raise ValueError("executed and credited actions must lie in [0, 1]")
+        if any(array.min() < -1 or array.max() > 1 for array in (recommendations, proposals)):
+            raise ValueError("recommendation and proposal actions must lie in {-1, 0, 1}")
+        if recoveries.size and (recoveries.min() < -1 or recoveries.max() > steps):
+            raise ValueError("recovery lengths must be -1 or lie within the interaction schedule")
         for name in (
             "nominal_recommendation_decisions",
             "nominal_accepted_recommendations",
@@ -512,9 +531,40 @@ class IAConditionResult:
         if not 0.0 <= rate <= 1.0:
             raise ValueError("changed_action_intervention_rate must lie in [0, 1]")
         object.__setattr__(self, "changed_action_intervention_rate", rate)
-        if not isinstance(self.controller_budget, ControllerBudget):
+        executed_accepted = int(np.count_nonzero(accepted))
+        changed = int(np.count_nonzero(accepted & (recommendations != proposals)))
+        mismatches = int(np.count_nonzero(executed != credited))
+        if self.executed_accepted_recommendations != executed_accepted:
+            raise ValueError("executed accepted count does not match accepted_recommendations")
+        if self.action_changing_interventions != changed:
+            raise ValueError("action-changing count does not match primitive actions")
+        if self.executed_action_credit_mismatches != mismatches:
+            raise ValueError("action-credit mismatch count does not match primitive actions")
+        if rate != changed / steps:
+            raise ValueError("changed action intervention rate does not match primitive actions")
+        if not (
+            self.nominal_accepted_recommendations <= self.nominal_recommendation_decisions <= steps
+            and self.executed_accepted_recommendations <= steps
+            and self.action_changing_interventions <= self.executed_accepted_recommendations
+        ):
+            raise ValueError("recommendation counts exceed the shared interaction schedule")
+        if self.condition not in RECOMMENDATION_CONDITIONS and (
+            bool(np.any(recommendations != -1))
+            or bool(np.any(proposals != -1))
+            or bool(np.any(accepted))
+            or self.nominal_recommendation_decisions != 0
+            or self.nominal_accepted_recommendations != 0
+        ):
+            raise ValueError("plain conditions must not contain recommendation activity")
+        if self.condition in RECOMMENDATION_CONDITIONS and (
+            bool(np.any(recommendations < 0)) or bool(np.any(proposals < 0))
+        ):
+            raise ValueError("recommendation conditions must contain concrete actions")
+        if type(self.controller_budget) is not ControllerBudget:
             raise ValueError("controller_budget must be a ControllerBudget")
-        if not isinstance(self.timing, ConditionTiming):
+        if self.controller_budget.interaction_steps != steps:
+            raise ValueError("controller budget interaction_steps must match result length")
+        if type(self.timing) is not ConditionTiming:
             raise ValueError("timing must be a ConditionTiming")
 
 
@@ -613,6 +663,34 @@ class ContinualIAReport:
     condition_results: tuple[IAConditionResult, ...]
     aggregate: IAAggregateEvidence
     acceptance: IAAcceptanceResult
+
+    def __post_init__(self) -> None:
+        if type(self.config) is not ContinualIAConfig:
+            raise ValueError("config must be a ContinualIAConfig")
+        if type(self.thresholds) is not IAAcceptanceThresholds:
+            raise ValueError("thresholds must be IAAcceptanceThresholds")
+        if type(self.condition_results) is not tuple or not self.condition_results:
+            raise ValueError("condition_results must be a non-empty exact tuple")
+        if not all(type(result) is IAConditionResult for result in self.condition_results):
+            raise ValueError("condition_results must contain exact IAConditionResult records")
+        if len(self.condition_results) % len(CONDITION_NAMES) != 0:
+            raise ValueError("condition_results must contain one complete tuple per seed")
+        seeds: list[int] = []
+        for offset in range(0, len(self.condition_results), len(CONDITION_NAMES)):
+            group = self.condition_results[offset : offset + len(CONDITION_NAMES)]
+            if tuple(result.condition for result in group) != CONDITION_NAMES:
+                raise ValueError("each seed must contain the exact ordered IA condition tuple")
+            if len({result.seed for result in group}) != 1:
+                raise ValueError("each IA condition tuple must share one seed")
+            seeds.append(group[0].seed)
+        if len(set(seeds)) != len(seeds):
+            raise ValueError("IA report seeds must be unique")
+        if type(self.aggregate) is not IAAggregateEvidence:
+            raise ValueError("aggregate must be an IAAggregateEvidence")
+        if tuple(seeds) != self.aggregate.seeds:
+            raise ValueError("aggregate seeds must match the ordered condition results")
+        if type(self.acceptance) is not IAAcceptanceResult:
+            raise ValueError("acceptance must be an IAAcceptanceResult")
 
 
 def paired_bootstrap_mean_interval(

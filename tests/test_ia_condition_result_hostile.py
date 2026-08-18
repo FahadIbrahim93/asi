@@ -23,7 +23,7 @@ def _budget() -> ControllerBudget:
         state_bytes=8,
         observation_scalars=2,
         action_scalars_per_step=1,
-        interaction_steps=1,
+        interaction_steps=2,
         ia_attached=True,
     )
 
@@ -40,12 +40,12 @@ def _legal(**overrides: object) -> IAConditionResult:
         "rewards": np.zeros(steps, dtype=np.float64),
         "executed_actions": np.zeros(steps, dtype=np.int64),
         "credited_actions": np.zeros(steps, dtype=np.int64),
-        "recommendations": np.zeros(steps, dtype=np.int64),
-        "partner_proposals": np.zeros(steps, dtype=np.int64),
+        "recommendations": np.full(steps, -1, dtype=np.int64),
+        "partner_proposals": np.full(steps, -1, dtype=np.int64),
         "accepted_recommendations": np.zeros(steps, dtype=np.bool_),
         "mean_reward": 0.0,
         "phase_mean_rewards": np.zeros(1, dtype=np.float64),
-        "recovery_lengths": np.zeros(1, dtype=np.int64),
+        "recovery_lengths": np.zeros(0, dtype=np.int64),
         "nominal_recommendation_decisions": 0,
         "nominal_accepted_recommendations": 0,
         "executed_accepted_recommendations": 0,
@@ -104,3 +104,36 @@ def test_ia_condition_result_rejects_invalid_arrays_and_hosts() -> None:
         _legal(controller_budget=None)
     with pytest.raises(ValueError, match="timing must be a ConditionTiming"):
         _legal(timing=None)
+
+
+def test_ia_condition_result_cross_binds_primitive_summaries() -> None:
+    with pytest.raises(ValueError, match="mean_reward does not match"):
+        _legal(rewards=np.ones(2, dtype=np.float64))
+    with pytest.raises(ValueError, match="mismatch count does not match"):
+        _legal(executed_action_credit_mismatches=1)
+    with pytest.raises(ValueError, match="rate does not match"):
+        _legal(changed_action_intervention_rate=0.5)
+    with pytest.raises(ValueError, match="interaction_steps must match"):
+        _legal(controller_budget=ControllerBudget(
+            state_scalars=1,
+            state_bytes=8,
+            observation_scalars=2,
+            action_scalars_per_step=1,
+            interaction_steps=1,
+            ia_attached=True,
+        ))
+
+
+def test_ia_condition_result_rejects_hostile_array_subclasses_without_hooks() -> None:
+    class HostileArray(np.ndarray):
+        calls = 0
+
+        def __array_function__(self, *args: object, **kwargs: object) -> object:
+            type(self).calls += 1
+            raise AssertionError("hostile array hook")
+
+    hostile = np.zeros(2, dtype=np.float64).view(HostileArray)
+    HostileArray.calls = 0
+    with pytest.raises(ValueError, match="rewards must be an exact numpy.ndarray"):
+        _legal(rewards=hostile)
+    assert HostileArray.calls == 0
