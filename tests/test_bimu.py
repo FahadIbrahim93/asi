@@ -69,6 +69,7 @@ def _tiny_data() -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
 def test_protocol_pins_official_source_and_paper_configuration() -> None:
     assert BIMU_PROTOCOL["paper_revision"] == "arXiv:2605.30198v1"
     assert BIMU_PROTOCOL["official_code_commit"] == ("1b8a1a1fb892fbe89401390b3ff9611d7f3a5168")
+    assert BIMU_PROTOCOL["prng_implementation"] == "threefry2x32"
     assert BIMU_PAPER_CONFIG.n_tasks == 1000
     assert BIMU_PAPER_CONFIG.train_examples_per_task == 60_000
     assert BIMU_PAPER_CONFIG.hidden_units == 100
@@ -188,6 +189,7 @@ def test_tiny_runner_is_end_to_end_strict_and_keeps_metrics_separate() -> None:
     assert counters["observations"] == 20
     assert counters["label_queries"] == 20
     assert counters["optimizer_updates"] == 20
+    assert counters["optimizer_seen"] == 20
     assert counters["model_forward_queries"] == 20 * (3 + 2) + 5 * 2 * 3
     assert resources["parameter_numeric_bytes"] == (4 * 3 + 3 * 2) * 4
     assert resources["optimizer_state_numeric_bytes"] == 8
@@ -218,20 +220,20 @@ def test_paper_metric_evaluation_occurs_only_after_the_complete_stream(
     test_x = np.full_like(test_x, 99.0)
     phases: list[str] = []
     original_gradient = module._concrete_mean_gradient
-    original_predictions = module._binary_predictions
+    original_logits = module._binary_logits
 
     def recording_gradient(*args: object, **kwargs: object) -> BiMUState:
         phases.append("train")
         return original_gradient(*args, **kwargs)
 
-    def recording_predictions(
+    def recording_logits(
         state: BiMUState, features: jax.Array, key: jax.Array, *, n_samples: int
     ) -> jax.Array:
         phases.append("test" if bool(jnp.all(features == 99.0)) else "train-query")
-        return original_predictions(state, features, key, n_samples=n_samples)
+        return original_logits(state, features, key, n_samples=n_samples)
 
     monkeypatch.setattr(module, "_concrete_mean_gradient", recording_gradient)
-    monkeypatch.setattr(module, "_binary_predictions", recording_predictions)
+    monkeypatch.setattr(module, "_binary_logits", recording_logits)
     run_bimu_development(train_x, train_y, test_x, test_y, config=_tiny_config(), seed=29)
     first_test = phases.index("test")
     assert "train" in phases[:first_test]
@@ -253,7 +255,50 @@ def test_no_query_schedule_performs_no_updates() -> None:
     validate_bimu_result(payload)
     assert payload["counters"]["label_queries"] == 0
     assert payload["counters"]["optimizer_updates"] == 0
-    assert payload["resources"]["state_changed"] is False
+    assert payload["counters"]["optimizer_seen"] == 20
+    assert payload["resources"]["state_changed"] is True
+
+
+def test_rng_domains_are_explicit_threefry_and_collision_free() -> None:
+    import alberta_framework.benchmarks.bimu as module
+
+    root = jax.random.key(23, impl="threefry2x32")
+    keys = [
+        module._stream_key(root, module._QUERY_DOMAIN, 102),
+        module._stream_key(root, module._TRAIN_DOMAIN, 0),
+        module._stream_key(root, module._TASK_PERMUTATION_DOMAIN, 96),
+        module._stream_key(root, module._EXAMPLE_ORDER_DOMAIN, 0),
+        module._stream_key(root, module._QUERY_DOMAIN, 200),
+        module._stream_key(root, module._TEST_DOMAIN, 0),
+    ]
+    encoded = {bytes(np.asarray(jax.random.key_data(key), dtype=np.uint32)) for key in keys}
+    assert len(encoded) == len(keys)
+
+
+def test_inference_matches_official_mean_log_probability_not_majority_vote() -> None:
+    import alberta_framework.benchmarks.bimu as module
+
+    logits = jnp.asarray([[0.1, 0.0], [0.1, 0.0], [0.0, 10.0]], dtype=jnp.float32)
+    prediction, _ = module._official_prediction_and_variation(logits)
+    assert prediction == 1
+    assert int(np.argmax(np.bincount(np.argmax(np.asarray(logits), axis=1)))) == 0
+
+
+def test_receipt_derives_metrics_and_disclaims_unverifiable_digests() -> None:
+    payload = run_bimu_development(*_tiny_data(), config=_tiny_config(), seed=37)
+    assurance = payload["receipt_assurance"]
+    assert assurance["content_digests_recomputed_by_validator"] is False
+    assert assurance["metrics_recomputed_from_execution_transcript"] is False
+    assert assurance["authenticated_execution_attestation"] is False
+
+    forged_metric = deepcopy(payload)
+    forged_metric["metrics"]["asi_whole_stream_online_accuracy"] = 0.123
+    with pytest.raises(ValueError, match="reported count"):
+        validate_bimu_result(forged_metric)
+
+    reported_identity = deepcopy(payload)
+    reported_identity["dataset_sha256"] = "0" * 64
+    validate_bimu_result(reported_identity)
 
 
 @pytest.mark.parametrize(
