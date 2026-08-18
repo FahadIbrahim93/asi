@@ -65,6 +65,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Canonicalized discounted-SARSA lifecycle timers at the exact-dispatch
+  reference-control boundary. The first compiled update can no longer grow
+  persistent numeric state by promoting two host floats into JAX leaves, so
+  scorecard resource accounting remains fixed from initialization.
 - Required `PartialObservationWrapper`'s RANDOM-mode `mask_prob` to be a
   concrete, non-bool real number in `[0, 1]` before use. The prior check
   compared the raw value directly (`0.0 <= mask_prob <= 1.0`) with no type
