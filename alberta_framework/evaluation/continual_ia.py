@@ -509,8 +509,8 @@ class IAConditionResult:
         for name, array in zip(
             (
                 "rewards",
-                "credited_actions",
                 "executed_actions",
+                "credited_actions",
                 "recommendations",
                 "partner_proposals",
                 "accepted_recommendations",
