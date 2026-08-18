@@ -690,6 +690,8 @@ class StreamingRunSummary:
             raise ValueError("reward must be a finite number")
         if type(oracle_reward) not in (int, float):
             raise ValueError("oracle_reward must be a finite number")
+        if type(regime_id) is not int:
+            raise ValueError("regime_id must be an integer")
         reward_value = float(reward)
         oracle_value = float(oracle_reward)
         if not math.isfinite(reward_value) or not math.isfinite(oracle_value):
@@ -1642,7 +1644,12 @@ def build_scorecard_artifact(
 ) -> dict[str, Any]:
     """Assemble one immutable aggregate and bind its deterministic summary."""
 
-    ordered_records = sorted(records, key=lambda record: int(record["schedule_index"]))
+    if any(
+        not isinstance(record, Mapping) or type(record.get("schedule_index")) is not int
+        for record in records
+    ):
+        raise ValueError("every run record must have an integer schedule_index")
+    ordered_records = sorted(records, key=lambda record: cast(int, record["schedule_index"]))
     summary = summarize_run_records(plan, ordered_records)
     run_order = [
         {
