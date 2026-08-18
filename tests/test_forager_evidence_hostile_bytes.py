@@ -53,18 +53,6 @@ def test_decode_rejects_hostile_str_subclass() -> None:
     assert _HostileStr.calls == 0
 
 
-def test_evidence_bytes_str_gate_rejects_hostile() -> None:
-    # Direct gate mirror
-    hostile_s = _HostileStr('{"x": 1}')
-    _HostileStr.calls = 0
-    assert (type(hostile_s) in (bytes, str)) is False
-    assert _HostileStr.calls == 0
-    hostile_b = _HostileBytes(b'{"x": 1}')
-    _HostileBytes.calls = 0
-    assert (type(hostile_b) in (bytes, str)) is False
-    assert _HostileBytes.calls == 0
-
-
 def test_score_evidence_rejects_hostile_without_encode() -> None:
     from alberta_framework.benchmarks.forager_matched_evidence import (
         parse_matched_score_evidence,

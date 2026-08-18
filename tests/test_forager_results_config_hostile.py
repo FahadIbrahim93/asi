@@ -91,13 +91,12 @@ def test_flatten_json_rejects_container_subclasses_without_hooks(hostile: object
     assert type(hostile).calls == 0
 
 
-def test_hostile_not_in_error_message() -> None:
+def test_flatten_json_error_does_not_invoke_hostile_string_hooks() -> None:
     from alberta_framework.benchmarks.forager_results import _flatten_json
 
     hostile = _HostileStr("bad")
     _HostileStr.calls = 0
-    try:
+    with pytest.raises(ValueError) as error:
         _flatten_json(hostile, prefix="p")  # type: ignore[arg-type]
-    except ValueError as exc:
-        assert "!r" not in str(exc)
-        assert _HostileStr.calls == 0
+    assert "!r" not in str(error.value)
+    assert _HostileStr.calls == 0

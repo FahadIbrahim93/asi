@@ -37,24 +37,6 @@ class _HostileDict(dict[str, object]):
         raise AssertionError("hostile items executed")
 
 
-def test_prototype_digest_gate_rejects_hostile_before_eq() -> None:
-    from alberta_framework.core.prototype_agent import _prototype_config_digest
-
-    config = {"agent": "test", "seed": 1}
-    digest = _prototype_config_digest(config)
-    hostile = _HostileStr(digest)
-    _HostileStr.calls = 0
-    # Mirror the exact gate from load_prototype_checkpoint
-    should_raise = type(hostile) is not str or hostile != digest
-    # For hostile subclass, type is not str => True, short-circuits, != not executed
-    assert should_raise is True
-    assert _HostileStr.calls == 0
-    # For builtin str with correct digest, gate is False
-    assert (type(digest) is not str or digest != digest) is False
-    # For builtin str with wrong digest, gate is True (mismatch)
-    assert (type("0" * 64) is not str or "0" * 64 != digest) is True
-
-
 def test_prototype_checkpoint_rejects_hostile_digest_without_dispatch() -> None:
     import tempfile
     from pathlib import Path

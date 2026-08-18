@@ -21,24 +21,26 @@ class _HostileProtocol(ForagerMatchedProtocol):  # type: ignore[type-arg]
 
 def test_parse_protocol_instance_rejects_hostile_before_to_dict() -> None:
     from alberta_framework.benchmarks.forager_matched_protocol import (
+        ForagerMatchedProtocolError,
         _parse_protocol_instance,
     )
 
     hostile = object.__new__(_HostileProtocol)
     _HostileProtocol.calls = 0
-    with pytest.raises(Exception):
+    with pytest.raises(ForagerMatchedProtocolError):
         _parse_protocol_instance(hostile)  # type: ignore[arg-type]
     assert _HostileProtocol.calls == 0
 
 
 def test_canonical_json_bytes_rejects_hostile_before_to_dict() -> None:
     from alberta_framework.benchmarks.forager_matched_protocol import (
+        ForagerMatchedProtocolError,
         canonical_json_bytes,
     )
 
     hostile = object.__new__(_HostileProtocol)
     _HostileProtocol.calls = 0
-    with pytest.raises(Exception):
+    with pytest.raises(ForagerMatchedProtocolError):
         canonical_json_bytes(hostile)  # type: ignore[arg-type]
     assert _HostileProtocol.calls == 0
 

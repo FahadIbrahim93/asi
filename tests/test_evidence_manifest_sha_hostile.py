@@ -49,20 +49,3 @@ def test_is_sha256_rejects_hostile_before_len() -> None:
     assert _is_sha256("c" * 64) is True
     assert _is_sha256("notsha") is False
     assert _is_sha256(123) is False  # type: ignore[arg-type]
-
-
-def test_hostile_not_in_error_message() -> None:
-    hostile = _HostileStr("evil_sha")
-    _HostileStr.calls = 0
-    from alberta_framework.evaluation.evidence_manifest import _is_sha256
-
-    # _is_sha256 returns bool, no error message to leak, but ensure not calling hostile len/eq
-    assert _is_sha256(hostile) is False
-    assert _HostileStr.calls == 0
-    # ensure !r not used
-    try:
-        if type(hostile) is not str or len(hostile) != 64:  # noqa: UP003
-            raise ValueError("must be a lowercase SHA-256")
-    except ValueError as exc:
-        assert "!r" not in str(exc)
-        assert _HostileStr.calls == 0

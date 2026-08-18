@@ -44,35 +44,6 @@ class _HostilePath(type(Path())):
         raise AssertionError("hostile path expansion")
 
 
-def test_jax_config_rejects_hostile_before_str() -> None:
-    hostile = _HostileStr("evil")
-    _HostileStr.calls = 0
-    assert (type(hostile) in (bool, int, float, str)) is False
-    assert _HostileStr.calls == 0
-    assert (str in (bool, int, float, str)) is True
-    assert (int in (bool, int, float, str)) is True
-    assert (float in (bool, int, float, str)) is True
-    assert (bool in (bool, int, float, str)) is True
-    # None case
-    assert (None is None or type(None) in (bool, int, float, str)) is True  # type: ignore[arg-type]
-    # safe else for hostile uses base str
-
-    # hostile via safe path
-    assert str.__str__(hostile) == "evil"
-    assert _HostileStr.calls == 0
-
-
-def test_manifest_loader_rejects_hostile_before_dispatch() -> None:
-    hostile = _HostileStr("/tmp/manifest.json")
-    _HostileStr.calls = 0
-    from pathlib import Path
-
-    assert (type(hostile) is str or isinstance(hostile, Path)) is False
-    assert _HostileStr.calls == 0
-    assert (str is str or isinstance("/tmp/x", Path)) is True
-    assert (type(Path("/tmp/x")) is str or isinstance(Path("/tmp/x"), Path)) is True
-
-
 def test_manifest_entry_points_reject_subclasses_without_hooks(tmp_path: Path) -> None:
     hostile_string = _HostileStr("manifest.json")
     hostile_path = _HostilePath("manifest.json")
@@ -86,14 +57,3 @@ def test_manifest_entry_points_reject_subclasses_without_hooks(tmp_path: Path) -
 
     assert _HostileStr.calls == 0
     assert _HostilePath.calls == 0
-
-
-def test_hostile_not_in_error_message() -> None:
-    hostile = _HostileStr("bad")
-    _HostileStr.calls = 0
-    try:
-        if type(hostile) is not str:
-            raise ValueError("manifest must be exact str or Path")
-    except ValueError as exc:
-        assert "!r" not in str(exc)
-        assert _HostileStr.calls == 0

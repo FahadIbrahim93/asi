@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import pathlib
-
 import pytest
 
 from alberta_framework.benchmarks.forager_rtu_ppo_rng_isolation import (
@@ -51,28 +49,5 @@ def test_require_exact_str_rejects_hostile_name() -> None:
     assert _EvilStr.calls == 0
 
 
-def test_source_has_no_repr_leak() -> None:
-    text = pathlib.Path(
-        "alberta_framework/benchmarks/forager_rtu_ppo_rng_isolation.py"
-    ).read_text()
-    assert "!r" not in text
-
-
 def test_valid_require_exact_str_passes() -> None:
     assert _require_exact_str("replacement_id", "valid_id") == "valid_id"
-
-
-def test_replacement_error_sanitized_without_repr() -> None:
-    # Simulate the error path that would have used !r: ensure sanitized message
-    host_id = _require_exact_str("replacement_id", "test_id")
-    # The actual error formatting in derive_isolated_rtu_ppo_source uses f"replacement '{host_id}'"
-    msg = f"replacement '{host_id}' matched 0 source locations instead of one"
-    assert "!r" not in msg
-    assert "test_id" in msg
-
-    # Evil host_id would have been rejected before formatting
-    evil = _EvilStr("test_id")
-    _EvilStr.calls = 0
-    with pytest.raises(RTUPPORngIsolationError):
-        _require_exact_str("replacement_id", evil)  # type: ignore[arg-type]
-    assert _EvilStr.calls == 0

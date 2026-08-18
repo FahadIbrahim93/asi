@@ -64,14 +64,3 @@ def test_finite_rejects_hostile_before_isfinite() -> None:
     with pytest.raises(ValueError, match="reward_scale"):
         ForagerFeatureConfig(reward_scale=hostile)  # type: ignore[arg-type]
     assert _HostileFloat.calls == 0
-
-
-def test_hostile_not_in_error_message() -> None:
-    hostile = _HostileInt(1)
-    _HostileInt.calls = 0
-    try:
-        if type(hostile) is not int:
-            raise ValueError("must be an integer")
-    except ValueError as exc:
-        assert "!r" not in str(exc)
-        assert _HostileInt.calls == 0
