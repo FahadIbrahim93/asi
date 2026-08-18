@@ -9,6 +9,7 @@ from alberta_framework.evaluation.continual_multiagent import (
     ConditionResult,
     ControllerBudget,
     TimingMetrics,
+    aggregate_evidence,
 )
 from alberta_framework.utils.metrics import ContinualLearningSummary
 
@@ -101,7 +102,7 @@ def test_condition_result_rejects_invalid_arrays_and_hosts() -> None:
         _legal(phase_mean_rewards=np.ones(3, dtype=np.float64))
     with pytest.raises(ValueError, match="must match recovery_lengths"):
         _legal(recurrence_recovery_steps=0)
-    with pytest.raises(ValueError, match="must reconstruct from performance_matrix"):
+    with pytest.raises(ValueError, match="must reconstruct"):
         _legal(
             performance_matrix=np.asarray(((1.0, 0.0), (0.0, 0.0), (0.0, 0.0))),
         )
@@ -111,6 +112,33 @@ def test_condition_result_rejects_invalid_arrays_and_hosts() -> None:
         _legal(controller_budget=None)
     with pytest.raises(ValueError, match="timing must be a TimingMetrics"):
         _legal(timing=None)
+
+
+def test_condition_result_binds_summary_to_primitive_arrays() -> None:
+    spoofed = ContinualLearningSummary(
+        final_performance=0.0,
+        prequential_performance=1.0,
+        mean_forgetting=0.0,
+        max_forgetting=0.0,
+        backward_transfer=0.0,
+        stability_gap_mean=0.0,
+        stability_gap_max=0.0,
+        per_task_final_performance=np.zeros(2, dtype=np.float64),
+        per_task_forgetting=np.zeros(2, dtype=np.float64),
+        per_task_backward_transfer=np.zeros(2, dtype=np.float64),
+    )
+    with pytest.raises(ValueError, match="prequential_performance must reconstruct"):
+        _legal(summary=spoofed)
+
+
+def test_aggregate_binds_stability_summary_to_live_reference() -> None:
+    results = (
+        _legal(condition="frozen", learning_mask=(False, False)),
+        _legal(condition="learner_only", learning_mask=(True, False)),
+        _legal(condition="joint_adaptive", learning_mask=(True, True)),
+    )
+    with pytest.raises(ValueError, match="stability reference"):
+        aggregate_evidence(results, bootstrap_resamples=2)
 
 
 def test_condition_result_owns_read_only_array_snapshots() -> None:
