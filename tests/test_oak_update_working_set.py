@@ -13,24 +13,26 @@ from alberta_framework.core.oak import (
     _oak_update_working_set_bytes,
     _preflight_oak_update_working_set,
 )
-from alberta_framework.core.options import STOMPConfig, SubtaskSpec
+from alberta_framework.core.options import (
+    STOMPConfig,
+    SubtaskSpec,
+    _stomp_direct_state_bytes,
+    _stomp_update_working_set_bytes,
+)
 
 _INT32_MAX = 2**31 - 1
 _INT32_MIN = -(2**31)
-_OVERFLOW_OBS = 20_000
-_LAST_FIT_OBS = 13_373
-_FIRST_OVERFLOW_OBS = 13_374
-_UNIT_STOMP = {
-    "n_primitive_actions": 1,
-    "base_hidden_sizes": (),
-}
+_LAST_OAK_FIT_HIDDEN = 19_884_101
+_FIRST_OAK_OVERFLOW_HIDDEN = 19_884_102
 
 
-def _unit_stomp(observation_dim: int) -> STOMPConfig:
+def _boundary_stomp(hidden_width: int) -> STOMPConfig:
+    """Return a valid STOMP config tuned to the narrower OaK-only boundary."""
     return STOMPConfig(
         subtask_specs=(SubtaskSpec(feature_index=0),),
-        observation_dim=observation_dim,
-        **_UNIT_STOMP,
+        observation_dim=1,
+        n_primitive_actions=1,
+        base_hidden_sizes=(hidden_width,),
     )
 
 
@@ -43,55 +45,59 @@ def test_int32_wrap_forges_a_different_published_byte_identity() -> None:
     assert wrapped_bytes != published_bytes
 
 
-def test_named_persist_and_width_still_fit_at_overflow() -> None:
-    stomp = _unit_stomp(_OVERFLOW_OBS)
+def test_valid_stomp_reaches_the_oak_only_update_boundary() -> None:
+    stomp = _boundary_stomp(_FIRST_OAK_OVERFLOW_HIDDEN)
+    stomp_persist_bytes = _stomp_direct_state_bytes(stomp)
+    stomp_working_set_bytes = _stomp_update_working_set_bytes(stomp)
     persist_bytes = _oak_direct_state_bytes(stomp)
     working_set_bytes = _oak_update_working_set_bytes(stomp)
     extras_bytes = working_set_bytes - 3 * persist_bytes
-    assert persist_bytes == 1_600_640_172
+
+    assert stomp_persist_bytes == 715_827_848
+    assert stomp_working_set_bytes == 2_147_483_608
+    assert stomp_working_set_bytes <= _INT32_MAX
+    assert persist_bytes == 715_827_872
     assert persist_bytes <= _INT32_MAX
     assert persist_bytes + extras_bytes <= _INT32_MAX
-    assert 4 * _OVERFLOW_OBS <= _INT32_MAX
+    assert 4 * _FIRST_OAK_OVERFLOW_HIDDEN <= _INT32_MAX
     assert 4 * 1 <= _INT32_MAX
-    assert working_set_bytes > _INT32_MAX
+    assert working_set_bytes == 2_147_483_672
     with pytest.raises(ValueError, match="update working set byte count"):
         OaKConfig(stomp=stomp)
 
 
-def test_last_fit_and_first_overflow_are_adjacent() -> None:
-    last_fit = None
-    first_overflow = None
-    for observation_dim in range(_LAST_FIT_OBS, _FIRST_OVERFLOW_OBS + 2):
-        stomp = _unit_stomp(observation_dim)
-        persist_bytes = _oak_direct_state_bytes(stomp)
-        working_set_bytes = _oak_update_working_set_bytes(stomp)
-        extras_bytes = working_set_bytes - 3 * persist_bytes
-        assert persist_bytes <= _INT32_MAX
-        assert persist_bytes + extras_bytes <= _INT32_MAX
-        assert 4 * observation_dim <= _INT32_MAX
-        if working_set_bytes <= _INT32_MAX:
-            last_fit = observation_dim
-        elif first_overflow is None:
-            first_overflow = observation_dim
-            break
-    assert last_fit is not None and first_overflow == last_fit + 1
-    assert last_fit == _LAST_FIT_OBS
-    config = OaKConfig(stomp=_unit_stomp(last_fit))
-    assert config.observation_dim == last_fit
+def test_adjacent_hidden_widths_straddle_only_the_oak_boundary() -> None:
+    assert _FIRST_OAK_OVERFLOW_HIDDEN == _LAST_OAK_FIT_HIDDEN + 1
+    last_stomp = _boundary_stomp(_LAST_OAK_FIT_HIDDEN)
+    first_stomp = _boundary_stomp(_FIRST_OAK_OVERFLOW_HIDDEN)
+
+    assert _stomp_update_working_set_bytes(last_stomp) <= _INT32_MAX
+    assert _stomp_update_working_set_bytes(first_stomp) <= _INT32_MAX
+    assert _oak_update_working_set_bytes(last_stomp) == 2_147_483_564
+    assert _oak_update_working_set_bytes(first_stomp) == 2_147_483_672
+
+    config = OaKConfig(stomp=last_stomp)
+    assert config.stomp.base_hidden_sizes == (_LAST_OAK_FIT_HIDDEN,)
     with pytest.raises(ValueError, match="update working set byte count"):
-        OaKConfig(stomp=_unit_stomp(first_overflow))
+        OaKConfig(stomp=first_stomp)
 
 
 def test_preflight_helper_rejects_the_same_working_set() -> None:
     with pytest.raises(ValueError, match="update working set byte count"):
-        _preflight_oak_update_working_set(_unit_stomp(_OVERFLOW_OBS))
+        _preflight_oak_update_working_set(
+            _boundary_stomp(_FIRST_OAK_OVERFLOW_HIDDEN)
+        )
 
 
-def test_persist_bound_still_fires_before_working_set() -> None:
-    stomp_only_limit = (2**29 - 1 - 22) // 4
-    stomp = STOMPConfig(observation_dim=stomp_only_limit, n_primitive_actions=1)
-    with pytest.raises(ValueError, match="OaK direct array bytes"):
-        OaKConfig(stomp=stomp)
+def test_nested_stomp_overflow_is_not_mislabeled_as_oak_coverage() -> None:
+    """The former observation-width fixture now fails in STOMP, before OaK."""
+    with pytest.raises(ValueError, match="STOMP update working set"):
+        STOMPConfig(
+            subtask_specs=(SubtaskSpec(feature_index=0),),
+            observation_dim=20_000,
+            n_primitive_actions=1,
+            base_hidden_sizes=(),
+        )
 
 
 def test_legal_small_oak_still_constructs() -> None:
