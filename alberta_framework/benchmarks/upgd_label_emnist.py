@@ -482,7 +482,11 @@ class LabelEMNISTRunResult:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "learner", _require_nonempty_string("learner", self.learner))
+        if not isinstance(self.hyperparameters, dict):
+            raise TypeError("hyperparameters must be a dict")
         object.__setattr__(self, "seeds", _require_seed_identities(self.seeds, name="seeds"))
+        if type(self.config) is not LabelEMNISTConfig:
+            raise TypeError("config must be a LabelEMNISTConfig")
         object.__setattr__(
             self,
             "wall_clock_seconds",
