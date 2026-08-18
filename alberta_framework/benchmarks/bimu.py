@@ -137,7 +137,7 @@ def _finite_float(
 
 
 def _stream_key(root: Array, domain: int, index: int = 0) -> Array:
-    """Derive a collision-free key from a semantic domain and local index."""
+    """Derive a domain-separated key from a semantic domain and local index."""
     return jr.fold_in(jr.fold_in(root, domain), index)
 
 
@@ -751,9 +751,7 @@ def run_bimu_development(
             features = jnp.asarray(train_x[int(example_index), permutation], dtype=jnp.float32)
             label = int(train_y[int(example_index)])
             query_key = _stream_key(root, _QUERY_DOMAIN, global_step)
-            logits = _binary_logits(
-                state, features, query_key, n_samples=config.query_samples
-            )
+            logits = _binary_logits(state, features, query_key, n_samples=config.query_samples)
             prediction, variation_ratio = _official_prediction_and_variation(logits)
             queried = variation_ratio >= config.query_threshold
             task_queries.append(queried)
@@ -815,9 +813,7 @@ def run_bimu_development(
             logits = _binary_logits(
                 state,
                 features,
-                _stream_key(
-                    root, _TEST_DOMAIN, task * config.test_examples_per_task + test_index
-                ),
+                _stream_key(root, _TEST_DOMAIN, task * config.test_examples_per_task + test_index),
                 n_samples=config.test_samples,
             )
             prediction, _ = _official_prediction_and_variation(logits)
@@ -1044,7 +1040,10 @@ def validate_bimu_result(value: object) -> None:
     assurance = _exact_mapping(
         payload["receipt_assurance"], set(_RECEIPT_ASSURANCE), "receipt_assurance"
     )
-    if dict(assurance) != _RECEIPT_ASSURANCE:
+    if (
+        any(type(assurance[field]) is not bool for field in _RECEIPT_ASSURANCE)
+        or dict(assurance) != _RECEIPT_ASSURANCE
+    ):
         raise ValueError("receipt assurance overstates validator coverage")
     for field in (
         "dataset_sha256",
@@ -1182,7 +1181,11 @@ def validate_bimu_result(value: object) -> None:
         payload["timing"], {"wall_clock_seconds", "qualified", "role"}, "timing"
     )
     _finite_float(timing["wall_clock_seconds"], "wall_clock_seconds", lower=0.0)
-    if timing["qualified"] is not False or timing["role"] != "telemetry_only":
+    if (
+        timing["qualified"] is not False
+        or type(timing["role"]) is not str
+        or timing["role"] != "telemetry_only"
+    ):
         raise ValueError("timing must remain unqualified telemetry")
     comparison = _exact_mapping(payload["comparison"], set(_comparison_payload()), "comparison")
     gaps = comparison["remaining_paper_gaps"]
