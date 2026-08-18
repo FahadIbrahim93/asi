@@ -33,8 +33,8 @@ from alberta_framework.evaluation.l2er_ipmnist_nonpromoting import (
     validate_l2er_development_result,
 )
 
-SCHEMA = "asi.l2er-ipmnist.matched-development-report.v1"
-PLAN_ID = "asi.l2er-ipmnist.cheap-screen.v1"
+SCHEMA = "asi.l2er-ipmnist.matched-development-report.v2"
+PLAN_ID = "asi.l2er-ipmnist.cheap-screen.v2"
 ARMS = (
     "l2er_mechanism_off",
     "l2er_l2_only",
@@ -48,7 +48,7 @@ _T95_DF2 = 4.302652729696142
 _MAX_REPORT_RECORDS = 32
 _PATH_TYPE = type(Path())
 _REPO_ROOT = Path(__file__).resolve().parents[2]
-OUTPUT_PATH = _REPO_ROOT / "outputs/l2er_matched_development/report.v1.json"
+OUTPUT_PATH = _REPO_ROOT / "outputs/l2er_matched_development/report.v2.json"
 
 
 def frozen_plan() -> dict[str, object]:

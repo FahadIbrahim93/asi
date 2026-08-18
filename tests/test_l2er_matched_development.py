@@ -159,6 +159,20 @@ def test_three_seed_interval_uses_student_t_not_normal_critical_value() -> None:
     assert matched.frozen_plan()["confidence_method"] == "two_sided_student_t"
 
 
+def test_validator_rejects_obsolete_v1_report_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(matched, "_validated_source_provenance", lambda value, **_: value)
+    monkeypatch.setattr(matched, "_validated_dataset_provenance", lambda value, **_: value)
+    monkeypatch.setattr(matched, "_validated_runtime_environment", lambda value, **_: value)
+    report = matched.build_report(
+        _results(), source_provenance={}, dataset_provenance={}, environment={}
+    )
+    report["schema"] = "asi.l2er-ipmnist.matched-development-report.v1"
+    with pytest.raises(ValueError, match="schema does not match"):
+        matched.validate_report(report, require_current_source=False)
+
+
 def test_report_revalidates_result_identity_before_reading_metrics(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -174,8 +188,10 @@ def test_report_revalidates_result_identity_before_reading_metrics(
 
 
 def test_output_namespace_is_one_new_development_path() -> None:
+    assert matched.SCHEMA == "asi.l2er-ipmnist.matched-development-report.v2"
+    assert matched.PLAN_ID == "asi.l2er-ipmnist.cheap-screen.v2"
     assert matched.OUTPUT_PATH.relative_to(matched._REPO_ROOT).as_posix() == (
-        "outputs/l2er_matched_development/report.v1.json"
+        "outputs/l2er_matched_development/report.v2.json"
     )
     assert matched.frozen_plan()["consumed_preplan_audit_seeds"] == [1701]
     assert matched.frozen_plan()["development_only"] is True
