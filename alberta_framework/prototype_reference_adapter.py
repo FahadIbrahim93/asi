@@ -83,17 +83,17 @@ class PrototypeReferenceState:
             raise ValueError(
                 f"schema must be '{PROTOTYPE_REFERENCE_STATE_SCHEMA}'"
             )
-        if not isinstance(self.manifest_id, str) or _SHA256_PATTERN.fullmatch(
+        if type(self.manifest_id) is not str or _SHA256_PATTERN.fullmatch(
             self.manifest_id
         ) is None:
             raise ValueError("manifest_id must be a lowercase SHA-256 digest")
-        if not isinstance(self.config_sha256, str) or _SHA256_PATTERN.fullmatch(
+        if type(self.config_sha256) is not str or _SHA256_PATTERN.fullmatch(
             self.config_sha256
         ) is None:
             raise ValueError("config_sha256 must be a lowercase SHA-256 digest")
         if not isinstance(self.agent_state, PrototypeAgentState):
             raise ValueError("agent_state must be a PrototypeAgentState")
-        if not isinstance(self.lifecycle_id, str) or _LIFECYCLE_PATTERN.fullmatch(
+        if type(self.lifecycle_id) is not str or _LIFECYCLE_PATTERN.fullmatch(
             self.lifecycle_id
         ) is None:
             raise ValueError("lifecycle_id must use the Prototype lifecycle codec")
@@ -105,7 +105,7 @@ class PrototypeReferenceState:
         ):
             raise ValueError("decision_index must be a uint64 integer")
         if self.current_observation_id is not None and (
-            not isinstance(self.current_observation_id, str)
+            type(self.current_observation_id) is not str
             or not self.current_observation_id.strip()
         ):
             raise ValueError("current_observation_id must be None or a nonempty string")
@@ -129,7 +129,7 @@ class PrototypeAdapterUpdate(ReferenceAgentUpdate):
 
 
 def _lifecycle_words(lifecycle_id: str) -> Array:
-    if not isinstance(lifecycle_id, str):
+    if type(lifecycle_id) is not str:
         raise ValueError("lifecycle_id must use the Prototype lifecycle codec")
     match = _LIFECYCLE_PATTERN.fullmatch(lifecycle_id)
     if match is None:
