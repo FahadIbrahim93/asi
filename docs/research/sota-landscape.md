@@ -85,6 +85,15 @@ local same-runner development ranking, not a paper-level SOTA claim.
   (2026)](https://arxiv.org/abs/2607.24996) reports utility-scaled partial
   resets on Continual MetaWorld, Continual MinAtar, and SlipperyAnt. Both are
   candidates for causal ablations, not IPMNIST results.
+- [Optimization Readiness](https://arxiv.org/abs/2605.09044v1) evaluates whether
+  a checkpoint diagnostic prospectively ranks future relative loss reduction.
+  Its empirical estimator uses a full-validation-set gradient for gradient
+  strength and the same numerator over 128 independently sampled mini-batch
+  squared-gradient norms for reliability; it compares against representation,
+  eNTK, and curvature rank diagnostics. ASI has only a development-only
+  equation-level utility and protocol descriptor for this direction. It has no
+  completed ranking result, and any future run must separately freeze tasks,
+  checkpoints, sampling, future-gain rollouts, and resource accounting.
 
 The defensible present statement is: ASI has a 20-seed local development leader
 at 0.87114 on its implementation of the ICLR-2024 protocol, but no current
