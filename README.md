@@ -347,6 +347,9 @@ Before repeating a failed or bounded idea, check
 
 ## Development and testing
 
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the inbound licensing terms and
+maintainer review policy.
+
 Run targeted tests first, then broaden verification as appropriate:
 
 ```bash
