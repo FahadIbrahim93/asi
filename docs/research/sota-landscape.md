@@ -81,7 +81,13 @@ local same-runner development ranking, not a paper-level SOTA claim.
   exact ASI runner before numerical ranking.
 - [C-CHAIN (ICML 2025)](https://openreview.net/forum?id=EkoFXfSauv) links
   plasticity loss to output churn and NTK-rank decline across several continual
-  RL suites. [Calibrated Partial Resets
+  RL suites. ASI now has four permanently nonpromoting `cchain_*` IPMNIST
+  arms through the current runner: a charged mechanism-off Adam control, the
+  full adaptive penalty, and its projective-only and orthogonal-only causal
+  ablations, with output-churn/full-logit-NTK diagnostics and strict resource
+  receipts. No comparison has been run, and the receipt freezes the substantial
+  supervised/online adaptation gaps; this is not a reproduction of the paper's
+  RL results. [Calibrated Partial Resets
   (2026)](https://arxiv.org/abs/2607.24996) reports utility-scaled partial
   resets on Continual MetaWorld, Continual MinAtar, and SlipperyAnt. ASI pins
   CPR paper v1 and official repository commit
@@ -204,7 +210,7 @@ not mean an agent adapter or comparison result exists.
 | [CORA](https://arxiv.org/abs/2110.10067) / [code](https://github.com/AGI-Labs/continual_rl) | Atari, Procgen, NetHack, and CHORES with continual evaluation, isolated forgetting, and zero-shot forward transfer. | Strong metric and baseline source; expensive and predominantly task-sequence based. |
 | [COOM](https://github.com/TTomilin/COOM) | Pixel-based Doom task sequences with average performance, forgetting, and forward transfer. | Useful robustness/representation lane after a smaller R3 control closes. |
 | [Continual Bench / FTL Online Agent](https://arxiv.org/abs/2507.09177) | Online shallow world model plus MPC across reward-defined continual tasks, with a regret result under stated assumptions. | Closest model-based competitor to ASI's FTL line; reproduce before extending the historically accepted narrow decision-fidelity artifact, and use the live evidence-status command for its current validity. |
-| [C-CHAIN](https://arxiv.org/abs/2506.00592) | Continual nonstationarity across Gym Control, ProcGen, DMC, and MinAtar. | Contemporary plasticity baseline; audit precise task sequences and replay/batch settings first. |
+| [C-CHAIN](https://arxiv.org/abs/2506.00592) / [code](https://github.com/bluecontra/C-CHAIN) | Continual nonstationarity across Gym Control, ProcGen, DMC, and MinAtar. | Official arXiv v1 and code commit `2f8bedf…` are audited. The current ASI runner has a four-arm, nonpromoting IPMNIST adaptation with exact receipts but no run; official RL task/protocol reproduction remains open. |
 
 Additional project sources:
 
