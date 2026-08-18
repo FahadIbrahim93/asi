@@ -924,19 +924,19 @@ def test_publish_orders_authentication_before_analysis_and_replays_offline(
     # executor, score, and selection identities from both campaign stages.
     golden_payload_sha256 = {
         "manifest.json": (
-            "b6eac95fa946d2ef25dc0f7511771454484385099d1609919483aa68acc2a94a"
+            "2cd3ca64f3e7f59e9a463d9a91c9ec80332c9c2815d11c9e98f9a992181bc9b1"
         ),
         "analysis/analysis-runtime-source.json": (
             "ca6656e3d1e12aeab5c660921cc3a9ce00611e9c41a612e646a2ca458f70f52b"
         ),
         "analysis/evaluation-authenticated-bindings-cache.json": (
-            "5ec971824840403822c4c5fa910c10916730b1df3f6f418b8599fcc001242146"
+            "16113cdaed428b31d579646d35d0d96cade9358b36c75cbd7287bece606168d7"
         ),
         "analysis/statistics-contract.json": (
-            "823f09a5f0e92e47786919d6c4d84c571e22284a3379ff16d91ab30a84762694"
+            "2444a37a4e77d6d9697d80a19f374208d0d3f2a17380eea650744fd5aff9412a"
         ),
         "analysis/statistics-result.json": (
-            "766810474dd08d5f5d4d932dcb09f94e99a9892f6f6d824b69730a33a13b363f"
+            "cd3e6972c1364c976180923c8e5035b180ddf8966a9fa4110601c8fd34d12492"
         ),
     }
     for relative, expected_sha256 in golden_payload_sha256.items():
@@ -946,7 +946,7 @@ def test_publish_orders_authentication_before_analysis_and_replays_offline(
             f"{expected_sha256}\n".encode("ascii")
         )
     assert content.manifest["payload_sha256"] == (
-        "f4db083c410857e4f51062eabd920318a713599edf5ce9abe6c93a09080657ac"
+        "7997b8e9b47db22d172b36864cb2ae740791ee2e5300fe70e0e2806bcb7f85bc"
     )
     assert content.analysis_runtime_source["payload_sha256"] == (
         "a23e65272f0785d4a2b3843610800088a5f2ca8352ef858d9ab4dfeed3caafd6"
