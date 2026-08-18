@@ -8,8 +8,9 @@ import json
 import os
 import runpy
 import threading
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, cast
 
 import numpy as np
@@ -821,7 +822,9 @@ def _write_stage(
     dataset_provenance: dict[str, Any] | None = None,
     created_unix: float | None = None,
 ) -> Path:
+    import alberta_framework.benchmarks.ipmnist_screening as screening_module
     from alberta_framework.benchmarks.ipmnist_screening import (
+        SCREENING_REGISTRY,
         ScreeningRunResult,
         merge_shards,
         screening_spec,
@@ -830,6 +833,20 @@ def _write_stage(
     from alberta_framework.benchmarks.upgd_ipmnist import IPMNISTConfig
 
     protocol = _PROTOCOLS[protocol_key]
+    historical_registry = None
+    if protocol_key == "issue184":
+        incumbent = screening_spec(protocol.control)
+        retired = replace(
+            incumbent,
+            name=protocol.candidate,
+            hyperparameters={
+                **incumbent.hyperparameters,
+                "rls_reset_frac": 2.0,
+            },
+        )
+        historical_registry = MappingProxyType(
+            {**SCREENING_REGISTRY, protocol.candidate: retired}
+        )
     stage = next(value for value in protocol.stages if value.key == stage_key)
     assert len(differences) == len(stage.seeds)
     dataset = _dataset_provenance() if dataset_provenance is None else dataset_provenance
@@ -851,7 +868,11 @@ def _write_stage(
             (protocol.control, 0.5),
             (protocol.candidate, 0.5 + difference),
         ):
-            spec = screening_spec(arm)
+            spec = (
+                historical_registry[arm]
+                if historical_registry is not None
+                else screening_spec(arm)
+            )
             result = ScreeningRunResult(
                 config_name=arm,
                 base_learner=spec.base_learner,
@@ -864,12 +885,19 @@ def _write_stage(
                 wall_clock_seconds=1.0,
             )
             path = shards_dir / f"{arm}_seed{seed}.json"
-            payload = shard_payload(
-                result,
-                source_provenance=_repository_identity()["source_provenance"],
-                dataset_provenance=dataset,
-                environment=_screening_environment(),
-            )
+            with pytest.MonkeyPatch.context() as registry_patch:
+                if historical_registry is not None:
+                    registry_patch.setattr(
+                        screening_module,
+                        "SCREENING_REGISTRY",
+                        historical_registry,
+                    )
+                payload = shard_payload(
+                    result,
+                    source_provenance=_repository_identity()["source_provenance"],
+                    dataset_provenance=dataset,
+                    environment=_screening_environment(),
+                )
             if created_unix is not None:
                 payload["created_unix"] = created_unix
             path.write_text(
@@ -879,11 +907,18 @@ def _write_stage(
     prior = Path.cwd()
     os.chdir(root)
     try:
-        summary = merge_shards(
-            [path.relative_to(root) for path in paths],
-            control_name=protocol.control,
-            slope_window=15,
-        )
+        with pytest.MonkeyPatch.context() as registry_patch:
+            if historical_registry is not None:
+                registry_patch.setattr(
+                    screening_module,
+                    "SCREENING_REGISTRY",
+                    historical_registry,
+                )
+            summary = merge_shards(
+                [path.relative_to(root) for path in paths],
+                control_name=protocol.control,
+                slope_window=15,
+            )
     finally:
         os.chdir(prior)
     summary_path = namespace / stage_name / "summary.json"
@@ -1114,16 +1149,49 @@ def _write_combined_summary(root: Path) -> Path:
 
 
 def _validate(root: Path, protocol_key: str) -> dict[str, Any]:
-    return cast(
-        dict[str, Any],
-        _validate_result_bundle(
-            protocol_key=protocol_key,
-            root=root,
-            repository_identity=_repository_identity(),
-            runner_receipt=_runner_receipt(),
-            verify_cache_file=False,
-        ),
+    if protocol_key != "issue184":
+        return cast(
+            dict[str, Any],
+            _validate_result_bundle(
+                protocol_key=protocol_key,
+                root=root,
+                repository_identity=_repository_identity(),
+                runner_receipt=_runner_receipt(),
+                verify_cache_file=False,
+            ),
+        )
+
+    import alberta_framework.benchmarks.ipmnist_screening as screening_module
+
+    protocol = _PROTOCOLS[protocol_key]
+    incumbent = screening_module.screening_spec(protocol.control)
+    retired = replace(
+        incumbent,
+        name=protocol.candidate,
+        hyperparameters={
+            **incumbent.hyperparameters,
+            "rls_reset_frac": 2.0,
+        },
     )
+    historical_registry = MappingProxyType(
+        {**screening_module.SCREENING_REGISTRY, protocol.candidate: retired}
+    )
+    with pytest.MonkeyPatch.context() as registry_patch:
+        registry_patch.setattr(
+            screening_module,
+            "SCREENING_REGISTRY",
+            historical_registry,
+        )
+        return cast(
+            dict[str, Any],
+            _validate_result_bundle(
+                protocol_key=protocol_key,
+                root=root,
+                repository_identity=_repository_identity(),
+                runner_receipt=_runner_receipt(),
+                verify_cache_file=False,
+            ),
+        )
 
 
 @pytest.mark.parametrize(

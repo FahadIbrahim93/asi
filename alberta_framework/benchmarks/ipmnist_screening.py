@@ -6341,14 +6341,6 @@ def _build_registry() -> dict[str, ScreeningSpec]:
             "rerun on the stable configuration)",
         ),
         (
-            "rls_head_resid_l1_noreset",
-            {"rls_lambda": 1.0, "rls_reset_frac": 2.0, "head_resid": 1.0},
-            "code-only issue-#184 endpoint: the standing residual-trained "
-            "incumbent with detector-driven covariance resets disabled; "
-            "this registry entry has no result artifact and does not "
-            "authorize execution",
-        ),
-        (
             "rls_head_resid_l1_preset005_nogate",
             {
                 "rls_lambda": 1.0,
