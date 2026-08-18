@@ -131,6 +131,28 @@ def test_factory_rejects_hostile_hyperparameter_container_without_hooks() -> Non
     with pytest.raises(ValueError, match="exact dict"):
         _make_intentional_updates_learner(hostile)
     assert hostile.calls == 0
+    drifted = dict(screening_spec("intentional_updates_ipmnist").hyperparameters)
+    drifted["intended_fraction"] = 0.25
+    with pytest.raises(ValueError, match="drift from the frozen protocol"):
+        _make_intentional_updates_learner(drifted)
+
+
+def test_counter_exhaustion_is_visible_before_int32_wraparound() -> None:
+    spec = screening_spec("intentional_updates_ipmnist")
+    init_fn, step_fn = spec.factory(spec.hyperparameters)
+    params = init_mlp_params(jr.key(44), SMALL)
+    state = init_fn(params).replace(
+        step=jnp.asarray((1 << 31) - 1, dtype=jnp.int32),
+        clip_step=jnp.asarray((1 << 31) - 1, dtype=jnp.int32),
+    )
+    x = jnp.zeros((SMALL.input_dim,), dtype=jnp.float32)
+    y = jnp.asarray(0, dtype=jnp.int32)
+    with pytest.raises(ValueError, match="finite and valid"):
+        step_fn(params, state, x, y, jr.key(45))
+    new_params, new_state, metrics = jax.jit(step_fn)(params, state, x, y, jr.key(45))
+    assert all(bool(jnp.all(jnp.isnan(value))) for value in new_params.values())
+    assert bool(jnp.all(jnp.isnan(jnp.asarray(metrics))))
+    assert int(new_state.step) == 0
 
 
 def test_head_only_feature_control_freezes_hidden_parameters() -> None:
@@ -232,6 +254,36 @@ def test_strict_development_record_binds_resources_gates_and_metrics() -> None:
     hostile["references"]["official_code"] = "moving-main"
     with pytest.raises(ValueError, match="frozen protocol"):
         validate_intentional_updates_development_record(hostile)
+
+    hostile = copy.deepcopy(record)
+    original_accuracy = hostile["metrics"]["per_task_accuracy"][0]
+    hostile["metrics"]["per_task_accuracy"][0] = (
+        0.25 if original_accuracy != 0.25 else 0.5
+    )
+    with pytest.raises(ValueError, match="derive exactly"):
+        validate_intentional_updates_development_record(hostile)
+
+    class HostileArray:
+        def __array__(self) -> Never:
+            raise AssertionError("must not coerce")
+
+    hostile = copy.deepcopy(record)
+    hostile["metrics"]["per_task_loss"] = HostileArray()
+    with pytest.raises(ValueError, match="exact JSON"):
+        validate_intentional_updates_development_record(hostile)
+
+
+def test_record_revalidates_forged_dataclasses() -> None:
+    x, y = _data()
+    config = IPMNISTConfig(
+        n_tasks=2, task_length=4, input_dim=6, hidden1=5, hidden2=4, n_classes=3
+    )
+    result = run_screening_config(
+        x, y, screening_spec("intentional_updates_ipmnist"), seed=23, config=config
+    )
+    object.__setattr__(result.config, "n_tasks", True)
+    with pytest.raises(ValueError, match="n_tasks"):
+        intentional_updates_development_record(result)
 
 
 def test_matched_runs_share_seed_schedule_update_and_observation_budgets() -> None:
