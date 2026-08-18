@@ -1441,6 +1441,9 @@ class TestShards:
         payload = micro_shard_payload(self._result())
         payload["per_regime_accuracy"] = [0] + list(payload["per_regime_accuracy"][1:])
         payload["per_regime_plasticity"] = [1] + list(payload["per_regime_plasticity"][1:])
+        payload["overall_average_online_accuracy"] = sum(
+            payload["per_regime_accuracy"]
+        ) / len(payload["per_regime_accuracy"])
         path = tmp_path / "ok.json"
         path.write_text(json.dumps(payload), encoding="utf-8")
         loaded = load_micro_shard(path)
