@@ -37,6 +37,7 @@ from alberta_framework.reference_agent import (
 from alberta_framework.reference_life import (
     ExactDispatchAdapter,
     HaltStage,
+    LifeHalt,
     LifePhase,
     RecoveryMode,
     ReferenceLifeConfig,
@@ -56,6 +57,19 @@ from alberta_framework.streams.closed_loop import (
 pytestmark = pytest.mark.unit
 
 _LIFECYCLE_ID = "prototype.0000000100000002"
+
+
+class _HostileHaltReason(str):
+    hook_calls = 0
+
+    def __bool__(self) -> bool:
+        type(self).hook_calls += 1
+        raise AssertionError("hostile halt-reason truth hook executed")
+
+    def strip(self, *args: str) -> str:
+        del args
+        type(self).hook_calls += 1
+        raise AssertionError("hostile halt-reason strip hook executed")
 
 
 def _agent_config() -> PrototypeAgentConfig:
@@ -1495,3 +1509,19 @@ def test_abort_is_terminal_and_preserves_pending_execution() -> None:
     assert aborted.halt.recovery_mode is RecoveryMode.ABORT_ONLY
     with pytest.raises(DecisionOwnershipError, match="aborted"):
         runner.step(aborted)
+
+
+def test_halt_and_abort_reject_hostile_reason_without_hooks() -> None:
+    _HostileHaltReason.hook_calls = 0
+    hostile = _HostileHaltReason("operator stop")
+    with pytest.raises(ValueError, match="halt reason"):
+        LifeHalt(
+            stage=HaltStage.PRE_DISPATCH,
+            recovery_mode=RecoveryMode.RETRY_OUTCOME,
+            reason=hostile,
+        )
+
+    runner = _runner(horizon=1)
+    with pytest.raises(ValueError, match="abort reason"):
+        runner.abort(runner.init(), reason=hostile)
+    assert _HostileHaltReason.hook_calls == 0
