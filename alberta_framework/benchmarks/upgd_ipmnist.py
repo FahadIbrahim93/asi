@@ -305,7 +305,7 @@ def _require_int32(name: str, value: object, *, minimum: int = 1) -> int:
 def _require_finite_real(name: str, value: object) -> float:
     if type(value) is not int and type(value) is not float:
         raise ValueError(f"{name} must be a finite real number")
-    number = float(cast("int | float", value))
+    number = float(value)
     if not math.isfinite(number):
         raise ValueError(f"{name} must be a finite real number")
     return number

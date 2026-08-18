@@ -106,3 +106,34 @@ def test_paper_reference_target_rejects_invalid_inputs() -> None:
             central_estimate=1.0,
             privileged="no",  # type: ignore[arg-type]
         )
+
+
+def test_numeric_records_reject_before_hostile_metaclass_dispatch() -> None:
+    class HostileType(type):
+        calls = 0
+
+        def __hash__(cls) -> int:  # pragma: no cover - must not execute
+            type(cls).calls += 1
+            raise AssertionError("metaclass hash hook must not run")
+
+        def __eq__(cls, _other: object) -> bool:  # pragma: no cover - must not execute
+            type(cls).calls += 1
+            raise AssertionError("metaclass equality hook must not run")
+
+    class HostileValue(metaclass=HostileType):
+        pass
+
+    hostile = HostileValue()
+    checks = (
+        lambda: ForagerFeatureState(last_action=0, last_reward=hostile, reward_traces=()),
+        lambda: ForagerFeatureState(last_action=0, last_reward=0.0, reward_traces=(hostile,)),
+        lambda: PaperReferenceTarget(
+            method="method_1",
+            metric="metric_1",
+            central_estimate=hostile,
+        ),
+    )
+    for check in checks:
+        with pytest.raises(ValueError):
+            check()
+    assert HostileType.calls == 0
