@@ -745,15 +745,12 @@ class TestFrequencyMismatchStream:
         assert bool(jnp.all(state.omegas < expected_max))
 
     def test_frequency_bounds_narrow_the_original_real_once(self) -> None:
-        midpoint_plus = (
-            np.longdouble(1.0)
-            + np.longdouble(2.0) ** -24
-            + np.longdouble(2.0) ** -60
-        )
-        assert np.float32(midpoint_plus) != np.float32(float(midpoint_plus))
+        midpoint_plus = Fraction(1, 1) + Fraction(1, 2**24) + Fraction(1, 2**60)
+        directly_rounded = float(np.nextafter(np.float32(1.0), np.float32(2.0)))
+        assert directly_rounded != float(np.float32(float(midpoint_plus)))
 
         stream = FrequencyMismatchStream(omega_min=1.0, omega_max=midpoint_plus)
-        assert stream._omega_max == float(np.float32(midpoint_plus))  # noqa: SLF001
+        assert stream._omega_max == directly_rounded  # noqa: SLF001
 
     @pytest.mark.parametrize(
         ("omega_max", "expected"),
@@ -1020,15 +1017,12 @@ class TestCompositionalStream:
         assert state.outer_w.dtype == jnp.float32
 
     def test_weight_scale_narrows_the_original_real_once(self) -> None:
-        midpoint_plus = (
-            np.longdouble(1.0)
-            + np.longdouble(2.0) ** -24
-            + np.longdouble(2.0) ** -60
-        )
-        assert np.float32(midpoint_plus) != np.float32(float(midpoint_plus))
+        midpoint_plus = Fraction(1, 1) + Fraction(1, 2**24) + Fraction(1, 2**60)
+        directly_rounded = float(np.nextafter(np.float32(1.0), np.float32(2.0)))
+        assert directly_rounded != float(np.float32(float(midpoint_plus)))
 
         stream = CompositionalStream(weight_scale=midpoint_plus)
-        assert stream._weight_scale == float(np.float32(midpoint_plus))
+        assert stream._weight_scale == directly_rounded
 
     @pytest.mark.parametrize(
         ("offset", "expected"),

@@ -177,6 +177,84 @@ jobs:
             --strict-config \
             --strict-markers
 
+  portability:
+    name: portability ${{ matrix.os }} py3.12
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up locked Python 3.12
+        uses: ./.github/actions/setup-locked-python
+        with:
+          python-version: "3.12"
+          extras: --extra dev
+
+      - name: Verify the portable JAX runtime
+        shell: bash
+        run: |
+          uv run --no-sync python - <<'PY'
+          import platform
+
+          import jax
+          import jax.numpy as jnp
+
+          @jax.jit
+          def update(weights, features):
+              prediction = jnp.dot(weights, features)
+              return weights + jnp.float32(0.1) * (jnp.float32(1.0) - prediction) * features
+
+          devices = jax.devices()
+          if jax.default_backend() != "cpu":
+              raise SystemExit(f"portable lane expected CPU JAX, got {jax.default_backend()}")
+          if not devices or any(device.platform != "cpu" for device in devices):
+              raise SystemExit(f"portable lane found unexpected JAX devices: {devices}")
+          result = update(jnp.zeros((3,), dtype=jnp.float32), jnp.ones((3,), dtype=jnp.float32))
+          if result.dtype != jnp.float32 or not bool(jnp.all(jnp.isfinite(result))):
+              raise SystemExit("portable JIT update did not produce finite float32 state")
+          print(platform.platform())
+          print(jax.__version__, devices)
+          PY
+
+      - name: Run cross-platform regression panel
+        shell: bash
+        run: |
+          uv run --no-sync python -m pytest \
+            tests/test_out_of_class_streams.py::TestFrequencyMismatchStream::test_frequency_bounds_narrow_the_original_real_once \
+            tests/test_out_of_class_streams.py::TestCompositionalStream::test_weight_scale_narrows_the_original_real_once \
+            tests/test_step11_production.py::test_step11_oak_validates_original_real_domain_before_narrowing \
+            tests/test_step11_production.py::test_step11_oak_narrows_the_original_real_once \
+            tests/test_step12_production.py::test_step12_narrows_original_real_directly_without_double_rounding \
+            tests/test_actor_critic.py::test_actor_critic_update_is_jittable \
+            tests/test_action_conditioned_world_model.py::test_action_conditioned_world_model_update_and_prediction_shapes \
+            -q \
+            -o addopts="" \
+            --strict-config \
+            --strict-markers
+
+      - name: Run installed model and benchmark smoke commands
+        shell: bash
+        run: |
+          uv run --no-sync alberta-step1-smoke --steps 16 --final-window 8 --seed 0
+          uv run --no-sync alberta-step2-smoke --steps 16 --final-window 8 --seed 0
+          uv run --no-sync asi-reference-life-scorecard --help
+          uv run --no-sync python - <<'PY'
+          from alberta_framework.benchmarks.reference_life_scorecard import (
+              build_development_plan,
+              iter_run_specs,
+          )
+
+          plan = build_development_plan()
+          specs = iter_run_specs(plan)
+          if len(specs) != 144:
+              raise SystemExit(f"expected 144 canonical scorecard shards, got {len(specs)}")
+          print(plan.plan_sha256, len(specs))
+          PY
+
   lint:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -316,7 +394,7 @@ jobs:
   # dynamic job names, so merge gating requires this single context instead.
   ci-ok:
     if: always()
-    needs: [package, robot-floor, lint, test-plan, test]
+    needs: [package, robot-floor, portability, lint, test-plan, test]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

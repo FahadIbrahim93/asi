@@ -474,8 +474,8 @@ def test_step11_oak_rejects_float32_overflow() -> None:
 
 
 def test_step11_oak_validates_original_real_domain_before_narrowing() -> None:
-    above_one = np.longdouble(1.0) + np.finfo(np.longdouble).eps
-    below_zero = -np.nextafter(np.longdouble(0.0), np.longdouble(1.0))
+    above_one = Fraction(2**53 + 1, 2**53)
+    below_zero = Fraction(-1, 10**400)
     assert float(above_one) == 1.0
     assert float(below_zero) == 0.0
 
@@ -491,20 +491,15 @@ def test_step11_oak_wraps_real_conversion_overflow() -> None:
 
 
 def test_step11_oak_narrows_the_original_real_once() -> None:
-    midpoint_plus = (
-        np.longdouble(1.0)
-        + np.longdouble(2.0) ** -24
-        + np.longdouble(2.0) ** -60
-    )
-    assert np.float32(midpoint_plus) != np.float32(float(midpoint_plus))
+    midpoint_plus = Fraction(1, 1) + Fraction(1, 2**24) + Fraction(1, 2**60)
+    directly_rounded = float(np.nextafter(np.float32(1.0), np.float32(2.0)))
+    assert directly_rounded != float(np.float32(float(midpoint_plus)))
     config = Step11OaKConfig(
         subtask_specs=(
             SubtaskSpec(feature_index=0, pseudo_reward_scale=midpoint_plus),
         ),
     )
-    assert config.subtask_specs[0].pseudo_reward_scale == float(
-        np.float32(midpoint_plus)
-    )
+    assert config.subtask_specs[0].pseudo_reward_scale == directly_rounded
 
 
 @pytest.mark.parametrize(
