@@ -78,6 +78,7 @@ MECHANISM_STATUS = "model-only-replay-mechanism-no-scientific-claim"
 _INT32_MAX = 2_147_483_647
 _UINT32_MAX = 4_294_967_295
 _MAX_EXACT_FLOAT32_INTEGER = 16_777_216
+_COMPOSER_ACCOUNTING_BYTES = 7 * 4
 _ACTUAL_INT_TYPES: tuple[type, ...] = (
     int,
     np.int8,
@@ -135,9 +136,18 @@ def _preflight_model_replay_state_resources(config: ModelReplayRehearsalConfig) 
         ensemble_size=config.ensemble.ensemble_size,
     )
     _, replay_bytes = _allocation_sizes(config.replay)
-    persistent_bytes = ensemble_bytes + replay_bytes + 7 * 4
+    persistent_bytes = ensemble_bytes + replay_bytes + _COMPOSER_ACCOUNTING_BYTES
     if persistent_bytes > _INT32_MAX:
         raise ValueError("model replay rehearsal state byte count must fit signed int32")
+    # The complete source composer, including its seven accounting leaves,
+    # remains live beside the proposed real-update ensemble.
+    update_working_set_bytes = (
+        2 * ensemble_bytes + replay_bytes + _COMPOSER_ACCOUNTING_BYTES
+    )
+    if update_working_set_bytes > _INT32_MAX:
+        raise ValueError(
+            "model replay rehearsal update working set byte count must fit signed int32"
+        )
 
 
 ReplayActionEncoding = Literal["scalar_index", "one_hot"]
