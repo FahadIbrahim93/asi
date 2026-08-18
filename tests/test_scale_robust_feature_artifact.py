@@ -350,9 +350,8 @@ def test_builder_rejects_duplicate_primitive_seed_condition_record():
 
 def test_builder_rejects_duplicate_declared_seed():
     report = synthetic_report()
-    changed = dataclasses.replace(report, seeds=(report.seeds[0], *report.seeds))
-    with pytest.raises(ValueError, match="must not contain duplicate seeds"):
-        build_evidence_artifact(changed)
+    with pytest.raises(ValueError, match="must contain unique seeds"):
+        dataclasses.replace(report, seeds=(report.seeds[0], *report.seeds))
 
 
 def test_builder_rejects_missing_primitive_seed_records():

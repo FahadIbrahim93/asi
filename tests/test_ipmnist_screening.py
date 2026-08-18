@@ -915,24 +915,17 @@ class TestCBPReplacement:
 class TestWeightClipping:
     """UPGD-W + weight clipping (Elsayed et al., RLC 2024)."""
 
-    def test_kappa_inf_reduces_exactly_to_control(self, small_data):
-        """With kappa=inf the clip is a no-op: bit-exact control trajectory."""
-        x, y = small_data
+    def test_kappa_inf_is_rejected_at_the_spec_boundary(self):
         hp = dict(UPGD_W_PROTOCOL_HYPERPARAMETERS)
         hp["clip_kappa"] = math.inf
-        spec = ScreeningSpec(
-            name="upgd_w_control",  # reuse control identity for shard plumbing
-            base_learner="upgd_w",
-            mechanism="weight_clipping",
-            hyperparameters=hp,
-            factory=_make_upgd_w_wclip_learner,
-        )
-        ours = run_screening_config(x, y, spec, seed=7, config=SMALL)
-        control = run_screening_config(
-            x, y, screening_spec("upgd_w_control"), seed=7, config=SMALL
-        )
-        np.testing.assert_array_equal(ours.per_task_accuracy, control.per_task_accuracy)
-        np.testing.assert_allclose(ours.per_task_loss, control.per_task_loss, rtol=1e-6)
+        with pytest.raises(ValueError, match="hyperparameter values must be finite"):
+            ScreeningSpec(
+                name="upgd_w_control",
+                base_learner="upgd_w",
+                mechanism="weight_clipping",
+                hyperparameters=hp,
+                factory=_make_upgd_w_wclip_learner,
+            )
 
     def test_clip_bounds_enforced_per_layer(self):
         """After one step every parameter obeys |w| <= kappa / sqrt(fan_in)."""
@@ -2057,26 +2050,24 @@ class TestPoolConfirmation:
             )
 
     @pytest.mark.parametrize("noise_pool_steps", [None, True, np.int64(8), 8.0, 1])
-    def test_shard_payload_rejects_noncanonical_pool_size(
+    def test_run_result_rejects_noncanonical_pool_size(
         self, noise_pool_steps: object
     ) -> None:
         spec = screening_spec("upgd_w_control")
-        result = ipmnist_screening.ScreeningRunResult(
-            config_name=spec.name,
-            base_learner=spec.base_learner,
-            hyperparameters=dict(spec.hyperparameters),
-            seed=0,
-            config=SMALL,
-            per_task_accuracy=np.zeros(SMALL.n_tasks),
-            per_task_loss=np.zeros(SMALL.n_tasks),
-            per_task_plasticity=np.zeros(SMALL.n_tasks),
-            wall_clock_seconds=0.0,
-            noise_mode="pool",
-            noise_pool_steps=noise_pool_steps,  # type: ignore[arg-type]
-        )
-
         with pytest.raises(ValueError, match="noise_pool_steps"):
-            _bound_shard_payload(result)
+            ipmnist_screening.ScreeningRunResult(
+                config_name=spec.name,
+                base_learner=spec.base_learner,
+                hyperparameters=dict(spec.hyperparameters),
+                seed=0,
+                config=SMALL,
+                per_task_accuracy=np.zeros(SMALL.n_tasks),
+                per_task_loss=np.zeros(SMALL.n_tasks),
+                per_task_plasticity=np.zeros(SMALL.n_tasks),
+                wall_clock_seconds=0.0,
+                noise_mode="pool",
+                noise_pool_steps=noise_pool_steps,  # type: ignore[arg-type]
+            )
 
     def test_pool_control_matches_run_ipmnist_pool(self, small_data):
         """Control arm under pool mode reproduces run_ipmnist's pool chain."""
@@ -4293,21 +4284,13 @@ class TestComparisonArms:
             factory=factory,
         )
 
-    def test_wclip_kappa_inf_reduces_to_sgd_base_bitwise(self, small_data):
-        """clip_kappa=inf makes the clip a no-op: bit-exact sgd_ema_norm_d099."""
-        x, y = small_data
+    def test_wclip_kappa_inf_is_rejected_at_the_spec_boundary(self):
         ref_spec = screening_spec("sgd_ema_norm_d099")
-        ours = run_screening_config(
-            x, y,
+        with pytest.raises(ValueError, match="hyperparameter values must be finite"):
             self._cloned(
                 "sgd_ema_norm_d099", _make_wclip_ema_norm_learner,
                 {**ref_spec.hyperparameters, "clip_kappa": math.inf},
-            ),
-            seed=5, config=SMALL,
-        )
-        ref = run_screening_config(x, y, ref_spec, seed=5, config=SMALL)
-        np.testing.assert_array_equal(ours.per_task_accuracy, ref.per_task_accuracy)
-        np.testing.assert_array_equal(ours.per_task_loss, ref.per_task_loss)
+            )
 
     def test_wclip_bounds_enforced_per_layer(self):
         """After any step every weight and bias obeys |w| <= kappa/sqrt(fan_in)
@@ -4340,7 +4323,7 @@ class TestComparisonArms:
                 {
                     **base_hp,
                     "fade_alpha": 0.005,
-                    "fade_gamma0": -math.inf,
+                    "fade_gamma0": -1.0e6,
                     "fade_theta_lambda": 0.0,
                 },
             ),
