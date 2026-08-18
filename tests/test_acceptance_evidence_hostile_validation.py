@@ -28,6 +28,10 @@ class HostileBool:
         return True
 
 
+class StringSubclass(str):
+    """A leftover string identity that must not cross strict record boundaries."""
+
+
 def test_acceptance_evidence_valid_construction() -> None:
     evidence = AcceptanceEvidence(
         name="coadaptation_uplift",
@@ -43,6 +47,19 @@ def test_acceptance_evidence_valid_construction() -> None:
     assert evidence.comparator == ">="
     assert evidence.threshold == 0.05
     assert evidence.detail == "p-value: 0.001"
+
+
+def test_ia_acceptance_evidence_rejects_scope_string_subclass() -> None:
+    with pytest.raises(ValueError, match="scope must be 'primary' or 'secondary'"):
+        IAAcceptanceEvidence(
+            name="check",
+            scope=StringSubclass("primary"),  # type: ignore[arg-type]
+            passed=True,
+            actual=0.1,
+            comparator=">=",
+            threshold=0.0,
+            detail="ok",
+        )
 
 
 @pytest.mark.parametrize(

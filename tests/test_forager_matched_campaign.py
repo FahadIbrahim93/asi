@@ -479,13 +479,13 @@ def test_open_campaign_v2_golden_byte_contract(tmp_path: Path) -> None:
             "6a9315cb996fe5698e4c1580d30da9b0524e9875ce085d1399bb975cc5b510a8"
         ),
         "execution-plan.json": (
-            "da881ac9300f6d3bb2668855ab0ccd931fc3e162758867f387657cd07721abbb"
+            "3a7f51da14a269d2a7b722f982e85f44ef74ea372bc29872b08c88d1dcbe6eb4"
         ),
         "source-manifest.json": (
             "9aa2a792a6e48438ed91d3ac180e87348ce3f4781fd6a87a987634593b604f23"
         ),
         "executor-manifest.json": (
-            "162c5037803e2bd25c2d63705a107fbdc67bfb8bb9acff3eeac31c6abba59df3"
+            "bd0068f2c053ffbc4c298b36ee73c1b0ccb3fdb2308b3282bd385d9b80dcb326"
         ),
         "qualification-manifest.json": (
             "0ac448b2686c7f7da8cc3f2a489bc764f76e215193de67cd62308ac21d83d24a"
@@ -494,10 +494,10 @@ def test_open_campaign_v2_golden_byte_contract(tmp_path: Path) -> None:
             "06cbe35d345bc3e4fdc79d7628a181a0ac126f929e0c0b70c2b25d9ef250d7d5"
         ),
         "live-runtime.json": (
-            "d3ea32b2091b84146ff276b34d72b00e9fa2084fe00a50810277f69a35e35be1"
+            "439968e03e99a563f32066e6787083ca633fc8f92b31e97deff5b94403b6215b"
         ),
         "campaign.json": (
-            "9cb3fca20ffd4dbb1950da8da88fe59cf6ebf3aaabe9b4c1cc15c116e912a3dc"
+            "4cbad0fbc079d8b24859ccbafc04eeb5f69127157e3b5bc7677d432248f5e858"
         ),
     }
     assert frozen_schedule["schedule_sha256"] == (
@@ -517,7 +517,7 @@ def test_open_campaign_v2_golden_byte_contract(tmp_path: Path) -> None:
         attempt,
     )
     assert binding_sha256 == (
-        "890d4c8b8c6d21803c1aa7efd78c27286aaab9ccf1976acbece4309eb0e9e0ca"
+        "a2a424e3b5d6f0b8e35dc7f770c4fa484bc338f709741ff25fec94513b7ea85e"
     )
     artifact = executor.score_seed_archive(
         context.rebuilt.plan,
@@ -538,7 +538,7 @@ def test_open_campaign_v2_golden_byte_contract(tmp_path: Path) -> None:
         artifact.to_dict(),
     )
     assert bundle_sha256 == (
-        "1a1130d342bf689e8fed389e45bb26205bf246f49b920691d8998c6e2c10f679"
+        "a52bcab0809dddc3c8d52e462868ee771cfcfb7790b7a2463ab95fab85f3749b"
     )
     pointer = campaign._completion_pointer(
         context,
@@ -549,7 +549,7 @@ def test_open_campaign_v2_golden_byte_contract(tmp_path: Path) -> None:
         bundle_sha256,
     )
     assert digest(campaign.canonical_json_bytes(pointer)) == (
-        "a9fa7c0057215eb0689587973b2dd8fa560ac64cae6d0e3326c07488df540388"
+        "be9dec9f11a2272ffd87e0aa8b0de96dbce64a0ddfcfcbdd8ee8bdf5b0f54c6a"
     )
     campaign._persist_failure(
         attempt,
@@ -567,16 +567,16 @@ def test_open_campaign_v2_golden_byte_contract(tmp_path: Path) -> None:
     _complete_loader_context(completed_context)
     expected_final = {
         "execution-receipt-index.json": (
-            "a8dcafdb050d2c0f32d2ef6743750d187d0cdec5cac6783315dd2342796a7691"
+            "8aab743e5a6fbc70bdb736f0b4e5283e340a055b7a010676f3cb69acfa4fae5e"
         ),
         "score-evidence.json": (
-            "6fdfe584ac705b62da1042ba35d035c29e1fd574a93381a5b536d91d78df2266"
+            "bf0ad65eedf80744c6a9b2c3b7ad1d6e144fa76d0ce5c2d1efb9dc1f602d815b"
         ),
         "verification-request.json": (
-            "91567672900044aa8d7a5f10983e3dac423d11985993dc6f27672bfa3da0c591"
+            "f878093a9ae49daec11c7b15ea311f12867dda8c293379231b8fdcaee3db85ca"
         ),
         "completion-summary.json": (
-            "9553ec581ca9660d5975b38e227dd30116a15ff7a63d92f5e1d57a27e3f9f9eb"
+            "747cbd3222bab0800d7d5398adf16ca239f07384d8e51a31d20cc98bf48c09e9"
         ),
     }
     for name, expected_digest in expected_final.items():
@@ -591,7 +591,7 @@ def test_open_campaign_v2_golden_byte_contract(tmp_path: Path) -> None:
     )
     normalized_status = replace(status, output_root=Path("/golden/open-campaign"))
     assert digest(campaign.canonical_json_bytes(normalized_status.to_dict())) == (
-        "817f793086abb911dd7b21bd46114aa9fbab21f72365030ad92428007146e970"
+        "279d14a0a524029c39ad619c19b0b04f6dee35a5c7c0898e489fcfc8b1b24b1d"
     )
 
 

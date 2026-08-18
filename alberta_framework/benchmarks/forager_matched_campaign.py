@@ -215,13 +215,13 @@ class CompletedCampaignBundle:
         if not isinstance(self.live_runtime, executor.LiveRuntimeIdentity):
             raise ForagerMatchedCampaignError("live_runtime must be a LiveRuntimeIdentity")
         if type(self.candidate_ids) is not tuple or not all(
-            isinstance(cid, str) and cid for cid in self.candidate_ids
+            type(cid) is str and bool(cid) for cid in self.candidate_ids
         ):
             raise ForagerMatchedCampaignError(
                 "candidate_ids must be a tuple of non-empty strings"
             )
         if type(self.active_seeds) is not tuple or not all(
-            isinstance(s, int) and s >= 0 for s in self.active_seeds
+            type(s) is int and s >= 0 for s in self.active_seeds
         ):
             raise ForagerMatchedCampaignError(
                 "active_seeds must be a tuple of non-negative ints"

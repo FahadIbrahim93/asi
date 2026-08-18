@@ -62,3 +62,10 @@ def test_open_directory_validation() -> None:
 
     with pytest.raises(ForagerMatchedSealError, match="inode_identity must be a 3-element tuple"):
         _OpenDirectory(path=Path("/tmp"), descriptor=3, inode_identity=(1, 2))  # type: ignore[arg-type]
+
+    with pytest.raises(ForagerMatchedSealError, match="inode_identity must be a 3-element tuple"):
+        _OpenDirectory(
+            path=Path("/tmp"),
+            descriptor=3,
+            inode_identity=(1, True, 3),
+        )

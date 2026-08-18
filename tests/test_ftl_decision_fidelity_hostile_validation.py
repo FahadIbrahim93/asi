@@ -180,6 +180,16 @@ def test_decision_fidelity_report_validation() -> None:
     assert report.config == config
     assert report.seeds == seeds
 
+    max_seed_result = SeedDecisionResult(seed=2**31 - 1, metrics=(_make_dummy_metrics(),))
+    max_seed_report = DecisionFidelityReport(
+        config=config,
+        seeds=(2**31 - 1,),
+        seed_results=(max_seed_result,),
+        aggregates=aggregates,
+        comparisons=comparisons,
+    )
+    assert max_seed_report.seeds == (2**31 - 1,)
+
     with pytest.raises(ValueError, match="config must be a DecisionFidelityConfig"):
         DecisionFidelityReport(
             config="invalid",  # type: ignore[arg-type]

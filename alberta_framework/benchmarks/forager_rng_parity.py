@@ -362,6 +362,8 @@ class EnvironmentTraceDigest:
             isinstance(t, TransitionDigest) for t in self.transitions
         ):
             raise ForagerRngParityError("transitions must be a tuple of TransitionDigest")
+        if type(self.trace_sha256) is not str:
+            raise ForagerRngParityError("trace.trace_sha256 must be a string")
         if self.trace_sha256:
             object.__setattr__(
                 self,
@@ -478,6 +480,8 @@ class ParityProbeResult:
             "direct_trace_sha256",
             _require_sha256(self.direct_trace_sha256, "direct_trace_sha256"),
         )
+        if type(self.payload_sha256) is not str:
+            raise ForagerRngParityError("payload_sha256 must be a string")
         if self.payload_sha256:
             object.__setattr__(
                 self,
@@ -524,7 +528,7 @@ class ParityCollectorResult:
     payload_sha256: str
 
     def __post_init__(self) -> None:
-        if self.collector not in ("wrapper", "direct"):
+        if type(self.collector) is not str or self.collector not in ("wrapper", "direct"):
             raise ForagerRngParityError("collector must be 'wrapper' or 'direct'")
         if not isinstance(self.runtime, VerifiedRuntimeIdentity):
             raise ForagerRngParityError("runtime must be a VerifiedRuntimeIdentity")
@@ -532,6 +536,8 @@ class ParityCollectorResult:
             raise ForagerRngParityError("config must be a FixedActionProbeConfig")
         if not isinstance(self.trace, EnvironmentTraceDigest):
             raise ForagerRngParityError("trace must be an EnvironmentTraceDigest")
+        if type(self.payload_sha256) is not str:
+            raise ForagerRngParityError("payload_sha256 must be a string")
         if self.payload_sha256:
             object.__setattr__(
                 self,
