@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import ctypes
 import errno
-import fcntl
 import hashlib
 import importlib.metadata
 import json
@@ -23,6 +22,11 @@ import tempfile
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, NoReturn, cast
+
+if sys.platform == "win32":
+    fcntl = None
+else:
+    import fcntl
 
 import jax
 import jax.numpy as jnp
@@ -1921,6 +1925,8 @@ def save_reference_life_checkpoint(
 ) -> tuple[ReferenceLifeState, Path]:
     """Atomically publish a new immutable quiescent whole-life generation."""
 
+    if fcntl is None:
+        raise OSError("reference-life checkpoint publication requires POSIX fcntl support")
     if not isinstance(runner, ReferenceLifeRunner):
         raise TypeError("runner must be a ReferenceLifeRunner")
     parent_path = Path(parent).absolute()

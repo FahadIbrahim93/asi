@@ -7,6 +7,8 @@ import dataclasses
 import json
 import math
 import os
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +37,46 @@ from alberta_framework.reference_life_controls import (
 from alberta_framework.streams.closed_loop import SwitchingTwoStateConfig
 
 pytestmark = pytest.mark.unit
+
+
+def test_scorecard_plan_import_does_not_require_linux_checkpoint_runtime() -> None:
+    script = """
+import builtins
+
+original_import = builtins.__import__
+
+def guarded_import(name, *args, **kwargs):
+    if name == "fcntl":
+        raise ModuleNotFoundError("blocked nonportable fcntl")
+    return original_import(name, *args, **kwargs)
+
+builtins.__import__ = guarded_import
+from alberta_framework.benchmarks.reference_life_scorecard import (
+    build_development_plan,
+    iter_run_specs,
+)
+assert len(iter_run_specs(build_development_plan())) == 144
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_checkpoint_publication_fails_closed_without_posix_fcntl(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import alberta_framework.reference_life_checkpoint as checkpoint_module
+
+    monkeypatch.setattr(checkpoint_module, "fcntl", None)
+    with pytest.raises(OSError, match="requires POSIX fcntl support"):
+        checkpoint_module.save_reference_life_checkpoint(  # type: ignore[arg-type]
+            object(), object(), tmp_path
+        )
 
 
 def test_fixed_plan_is_immutable_canonical_and_explicit() -> None:

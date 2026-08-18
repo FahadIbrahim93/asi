@@ -57,15 +57,6 @@ from alberta_framework.reference_life import (
     build_prototype_riverswim_life,
     build_prototype_switching_life,
 )
-from alberta_framework.reference_life_checkpoint import (
-    _dependency_identity as _checkpoint_dependency_identity,
-)
-from alberta_framework.reference_life_checkpoint import (
-    _runtime_identity as _checkpoint_runtime_identity,
-)
-from alberta_framework.reference_life_checkpoint import (
-    _source_identity as _checkpoint_source_identity,
-)
 from alberta_framework.streams.closed_loop import (
     RiverSwimConfig,
     RiverSwimMDP,
@@ -1574,6 +1565,19 @@ def _record_with_digest(payload: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _current_consistency_identities() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    # Whole-life checkpoint publication is intentionally Linux-only. Keep that
+    # dependency behind the artifact-construction boundary so the portable
+    # scorecard CLI, help, and deterministic plan remain importable elsewhere.
+    from alberta_framework.reference_life_checkpoint import (
+        _dependency_identity as _checkpoint_dependency_identity,
+    )
+    from alberta_framework.reference_life_checkpoint import (
+        _runtime_identity as _checkpoint_runtime_identity,
+    )
+    from alberta_framework.reference_life_checkpoint import (
+        _source_identity as _checkpoint_source_identity,
+    )
+
     return (
         _checkpoint_source_identity(),
         _checkpoint_runtime_identity(),
