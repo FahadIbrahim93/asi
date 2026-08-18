@@ -111,6 +111,8 @@ def input_interpolation(old: Array, new: Array, alpha: float) -> Array:
         raise ValueError("old and new inputs must have identical shapes")
     if old_array.dtype != new_array.dtype or not jnp.issubdtype(old_array.dtype, jnp.floating):
         raise ValueError("old and new inputs must share a floating dtype")
+    if not bool(jnp.all(jnp.isfinite(old_array))) or not bool(jnp.all(jnp.isfinite(new_array))):
+        raise ValueError("old and new inputs must contain only finite values")
     return (1.0 - resolved) * old_array + resolved * new_array
 
 

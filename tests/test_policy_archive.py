@@ -12,16 +12,16 @@ def _entry(name: str, latent: tuple[float, ...], score: float, size: int = 4) ->
 
 
 def test_diverse_archive_respects_exact_byte_budget() -> None:
-    archive = BoundedPolicyArchive(byte_budget=8, min_latent_distance=0.5)
+    archive = BoundedPolicyArchive(byte_budget=58, min_latent_distance=0.5)
     archive = archive.add(_entry("a", (0.0, 0.0), 1.0))
     archive = archive.add(_entry("b", (1.0, 0.0), 2.0))
-    assert archive.persistent_bytes == 8
+    assert archive.persistent_bytes == 58
     with pytest.raises(ValueError, match="byte budget"):
         archive.add(_entry("c", (0.0, 1.0), 3.0))
 
 
 def test_nearby_policy_only_replaces_on_higher_score() -> None:
-    archive = BoundedPolicyArchive(byte_budget=8, min_latent_distance=0.5).add(
+    archive = BoundedPolicyArchive(byte_budget=32, min_latent_distance=0.5).add(
         _entry("a", (0.0,), 1.0)
     )
     assert archive.add(_entry("low", (0.1,), 0.5)) == archive
@@ -30,12 +30,20 @@ def test_nearby_policy_only_replaces_on_higher_score() -> None:
 
 
 def test_one_model_and_fixed_snapshot_controls() -> None:
-    one = BoundedPolicyArchive(byte_budget=4, min_latent_distance=0.0, mode="one_model")
+    one = BoundedPolicyArchive(byte_budget=21, min_latent_distance=0.0, mode="one_model")
     one = one.add(_entry("a", (0.0,), 1.0)).add(_entry("b", (1.0,), 0.0))
     assert [entry.identity for entry in one.entries] == ["b"]
-    fixed = BoundedPolicyArchive(byte_budget=4, min_latent_distance=0.0, mode="fixed_snapshot")
+    fixed = BoundedPolicyArchive(byte_budget=21, min_latent_distance=0.0, mode="fixed_snapshot")
     fixed = fixed.add(_entry("a", (0.0,), 1.0)).add(_entry("b", (1.0,), 2.0))
     assert [entry.identity for entry in fixed.entries] == ["a"]
+
+
+def test_archive_rejects_duplicate_identity() -> None:
+    archive = BoundedPolicyArchive(byte_budget=42, min_latent_distance=0.0).add(
+        _entry("a", (0.0,), 1.0)
+    )
+    with pytest.raises(ValueError, match="identity already exists"):
+        archive.add(_entry("a", (1.0,), 2.0))
 
 
 def test_protocol_is_nonpromoting() -> None:

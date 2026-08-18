@@ -19,7 +19,7 @@ BIMU_PROTOCOL = MappingProxyType(
         "weight_domain": (-1, 1),
         "primary_metric": "mean_test_accuracy_over_last_5_tasks",
         "whole_stream_online_accuracy_is_separate": True,
-        "paper_axes": {"tasks": 1000, "hidden_units": 100, "batch_size": 1},
+        "paper_axes": (("tasks", 1000), ("hidden_units", 100), ("batch_size", 1)),
         "adaptation_difference": "ASI implementation exposes equation primitives; no run is frozen",
         "learner_observes_task_boundary": False,
         "matched_axes": ("seed", "updates", "observations", "label_queries"),

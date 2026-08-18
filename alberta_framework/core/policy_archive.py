@@ -48,6 +48,16 @@ class PolicyEntry:
         if type(self.score) is not float or not math.isfinite(self.score):
             raise ValueError("score must be a finite float")
 
+    @property
+    def persistent_bytes(self) -> int:
+        """Canonical retained payload: identity UTF-8, policy, latent, and score."""
+        return (
+            len(self.identity.encode("utf-8"))
+            + len(self.policy_bytes)
+            + 8 * len(self.latent)
+            + 8
+        )
+
 
 @dataclass(frozen=True)
 class BoundedPolicyArchive:
@@ -67,17 +77,31 @@ class BoundedPolicyArchive:
             or self.min_latent_distance < 0.0
         ):
             raise ValueError("min_latent_distance must be a finite non-negative float")
-        if self.mode not in {"diverse_archive", "one_model", "fixed_snapshot"}:
+        if type(self.mode) is not str or self.mode not in {
+            "diverse_archive",
+            "one_model",
+            "fixed_snapshot",
+        }:
             raise ValueError("unknown archive mode")
+        if type(self.entries) is not tuple or any(
+            type(entry) is not PolicyEntry for entry in self.entries
+        ):
+            raise ValueError("entries must be an exact tuple of PolicyEntry values")
+        if len({entry.identity for entry in self.entries}) != len(self.entries):
+            raise ValueError("entry identities must be unique")
         if self.persistent_bytes > self.byte_budget:
             raise ValueError("entries exceed byte budget")
 
     @property
     def persistent_bytes(self) -> int:
-        return sum(len(entry.policy_bytes) for entry in self.entries)
+        return sum(entry.persistent_bytes for entry in self.entries)
 
     def add(self, entry: PolicyEntry) -> BoundedPolicyArchive:
         """Return the deterministic successor archive."""
+        if type(entry) is not PolicyEntry:
+            raise ValueError("entry must be an exact PolicyEntry")
+        if any(old.identity == entry.identity for old in self.entries):
+            raise ValueError("entry identity already exists")
         candidates: tuple[PolicyEntry, ...]
         if self.entries and len(entry.latent) != len(self.entries[0].latent):
             raise ValueError("all latent descriptors must have equal width")
@@ -99,6 +123,6 @@ class BoundedPolicyArchive:
                 candidates = self.entries[:nearest] + (entry,) + self.entries[nearest + 1 :]
             else:
                 candidates = self.entries + (entry,)
-        if sum(len(item.policy_bytes) for item in candidates) > self.byte_budget:
+        if sum(item.persistent_bytes for item in candidates) > self.byte_budget:
             raise ValueError("candidate would exceed byte budget")
         return replace(self, entries=candidates)

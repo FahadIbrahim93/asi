@@ -13,8 +13,8 @@ CEILING_PROTOCOL = MappingProxyType(
         "schema": "asi.ipmnist-ceilings.protocol.v1",
         "paper_revisions": (
             "arXiv:2503.20018v1",
-            "arXiv:2402.08823v2",
-            "arXiv:2307.02251v4",
+            "arXiv:2402.08823v3",
+            "arXiv:2307.02251v3",
             "arXiv:2507.12305v1",
         ),
         "methods": _METHODS,
@@ -72,7 +72,7 @@ class FrozenFeatureCeiling:
     replay_capacity: int
 
     def __post_init__(self) -> None:
-        if self.method not in _METHODS:
+        if type(self.method) is not str or self.method not in _METHODS:
             raise ValueError("method is not a registered ceiling")
         if type(self.feature_dim) is not int or self.feature_dim < 1:
             raise ValueError("feature_dim must be a positive integer")
