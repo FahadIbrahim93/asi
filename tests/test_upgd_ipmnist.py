@@ -43,6 +43,22 @@ TINY = IPMNISTConfig(n_tasks=2, task_length=200, input_dim=16, hidden1=32, hidde
 N_TRAIN = 300
 
 
+class _HostileString(str):
+    """A string facade that must not cross external shard identity gates."""
+
+    calls = 0
+
+    def __bool__(self) -> bool:
+        type(self).calls += 1
+        raise AssertionError("untrusted __bool__ hook executed")
+
+    def __eq__(self, other: object) -> bool:
+        type(self).calls += 1
+        raise AssertionError("untrusted __eq__ hook executed")
+
+    __hash__ = str.__hash__
+
+
 def _synthetic_dataset(
     seed: int, n_train: int, input_dim: int, n_classes: int
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -990,6 +1006,60 @@ class TestPartialMerge:
         )
         with pytest.raises(ValueError, match="no larger than"):
             upgd_ipmnist._strict_json_object(path)
+
+    @staticmethod
+    def _minimal_v2_payload() -> dict[str, object]:
+        payload = {field: None for field in upgd_ipmnist._V2_PARTIAL_FIELDS}
+        payload.update(
+            {
+                "schema": PARTIAL_SCHEMA,
+                "schema_version": 2,
+                "evidence_policy": upgd_ipmnist.NONPROMOTING_POLICY,
+                "deviations": list(upgd_ipmnist.PROTOCOL_DEVIATIONS),
+                "learner": "adamw",
+                "hyperparameters": {"step_size": 0.001},
+            }
+        )
+        return payload
+
+    def test_v2_partial_manifest_rejects_hostile_learner_before_hooks(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = tmp_path / "hostile.json"
+        path.write_bytes(b"{}")
+        payload = {"schema": PARTIAL_SCHEMA, "learner": _HostileString("adamw"), "seed_id": 0}
+        _HostileString.calls = 0
+        monkeypatch.setattr(
+            upgd_ipmnist, "_decode_strict_json_object", lambda _raw, *, path: payload
+        )
+
+        with pytest.raises(ValueError, match="identity"):
+            upgd_ipmnist._v2_partial_manifest([path])
+
+        assert _HostileString.calls == 0
+
+    @pytest.mark.parametrize("location", ["learner", "hyperparameter_name"])
+    def test_partial_validation_rejects_hostile_names_before_hooks(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        location: str,
+    ) -> None:
+        payload = self._minimal_v2_payload()
+        hostile = _HostileString("adamw" if location == "learner" else "step_size")
+        if location == "learner":
+            payload["learner"] = hostile
+        else:
+            payload["hyperparameters"] = {hostile: 0.001}
+        _HostileString.calls = 0
+        monkeypatch.setattr(upgd_ipmnist, "_strict_json_object", lambda _path: payload)
+
+        with pytest.raises(ValueError, match="learner|hyperparameters"):
+            upgd_ipmnist._validated_partial_payload(
+                tmp_path / "hostile.json", schema=PARTIAL_SCHEMA, seed_field="seed_id"
+            )
+
+        assert _HostileString.calls == 0
 
     def test_v2_partial_manifest_binds_identity_and_digest_to_one_read(
         self, tmp_path, monkeypatch
