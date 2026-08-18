@@ -92,7 +92,7 @@ def test_paper_baseline_role_rejects_before_comparison_hook() -> None:
 
 
 def test_paper_reference_target_rejects_invalid_inputs() -> None:
-    with pytest.raises(ValueError, match="central_estimate must be a finite float"):
+    with pytest.raises(ValueError, match="central_estimate must be finite"):
         PaperReferenceTarget(
             method="method_1",
             metric="metric_1",
