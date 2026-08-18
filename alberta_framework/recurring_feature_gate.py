@@ -20,7 +20,7 @@ import functools
 import math
 import statistics
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal
 
 import jax
@@ -282,6 +282,20 @@ class FeatureMemoryBudget:
     active_pair_slots: int
     candidate_pair_slots: int
     output_heads: int
+
+    def __post_init__(self) -> None:
+        """Canonicalize the bounded capacities used by result accounting."""
+        for name in ("active_pair_slots", "candidate_pair_slots", "output_heads"):
+            object.__setattr__(
+                self,
+                name,
+                _require_builtin_int(
+                    name,
+                    getattr(self, name),
+                    minimum=1,
+                    maximum=2**31 - 1,
+                ),
+            )
 
     @property
     def total_pair_slots(self) -> int:
@@ -634,6 +648,103 @@ class RecurringFeatureGateResult:
         decision = self.decision(criteria)
         decision.require()
         return decision
+
+
+def _validated_protocol(protocol: object) -> RecurringFeatureProtocol:
+    if type(protocol) is not RecurringFeatureProtocol:
+        raise ValueError("protocol must be an exact RecurringFeatureProtocol")
+    checked = replace(protocol)
+    for name, expected in (
+        ("candidate_strategy", "all_pairs"),
+        ("utility_aggregation", "max"),
+        ("utility_task_balancing", "active"),
+    ):
+        if type(getattr(checked, name)) is not str:
+            raise ValueError(f"protocol.{name} must be an exact string")
+        if getattr(checked, name) != expected:
+            raise ValueError(f"protocol.{name} must be {expected!r}")
+    checked.validate()
+    return checked
+
+
+def _validated_phase_evidence(value: object) -> PhaseEvidence:
+    if type(value) is not PhaseEvidence:
+        raise ValueError("phase_evidence must contain exact PhaseEvidence records")
+    return PhaseEvidence(
+        phase_index=value.phase_index,
+        task=value.task,
+        occurrence=value.occurrence,
+        prequential_nmse=value.prequential_nmse,
+        recovery_steps=value.recovery_steps,
+    )
+
+
+def _validated_task_recovery(value: object) -> TaskRecoveryEvidence:
+    if type(value) is not TaskRecoveryEvidence:
+        raise ValueError("task_recovery must contain exact TaskRecoveryEvidence records")
+    return TaskRecoveryEvidence(
+        task=value.task,
+        acquisition_steps=value.acquisition_steps,
+        recurrence_steps=value.recurrence_steps,
+    )
+
+
+def _validated_seed_evidence(value: object) -> RecurringFeatureSeedEvidence:
+    if type(value) is not RecurringFeatureSeedEvidence:
+        raise ValueError("seeds must contain exact RecurringFeatureSeedEvidence records")
+    if type(value.phase_evidence) is not tuple:
+        raise ValueError("phase_evidence must be a bounded exact tuple")
+    if type(value.task_recovery) is not tuple:
+        raise ValueError("task_recovery must be a bounded exact tuple")
+    return RecurringFeatureSeedEvidence(
+        seed=value.seed,
+        final_heldout_nmse=value.final_heldout_nmse,
+        active_pairs=value.active_pairs,
+        candidate_pairs=value.candidate_pairs,
+        phase_evidence=tuple(_validated_phase_evidence(item) for item in value.phase_evidence),
+        task_recovery=tuple(_validated_task_recovery(item) for item in value.task_recovery),
+        steps_seen=value.steps_seen,
+    )
+
+
+def _validated_variant_evidence(value: object) -> RecurringFeatureVariantEvidence:
+    if type(value) is not RecurringFeatureVariantEvidence:
+        raise ValueError("variants must be exact RecurringFeatureVariantEvidence records")
+    if type(value.seeds) is not tuple:
+        raise ValueError("seeds must be a bounded exact tuple")
+    return RecurringFeatureVariantEvidence(
+        name=value.name,
+        utility_retention_decay=value.utility_retention_decay,
+        seeds=tuple(_validated_seed_evidence(seed) for seed in value.seeds),
+    )
+
+
+def _validated_gate_result(value: object) -> RecurringFeatureGateResult:
+    """Return a recursively validated snapshot before any evidence is consumed."""
+    if type(value) is not RecurringFeatureGateResult:
+        raise ValueError("result must be an exact RecurringFeatureGateResult")
+    protocol = _validated_protocol(value.protocol)
+    if type(value.memory_budget) is not FeatureMemoryBudget:
+        raise ValueError("memory_budget must be an exact FeatureMemoryBudget")
+    budget = FeatureMemoryBudget(
+        active_pair_slots=value.memory_budget.active_pair_slots,
+        candidate_pair_slots=value.memory_budget.candidate_pair_slots,
+        output_heads=value.memory_budget.output_heads,
+    )
+    expected_budget = FeatureMemoryBudget(
+        active_pair_slots=protocol.active_pair_budget,
+        candidate_pair_slots=protocol.candidate_pair_budget,
+        output_heads=protocol.output_heads,
+    )
+    if budget != expected_budget:
+        raise ValueError("memory_budget capacities must match the protocol")
+    return RecurringFeatureGateResult(
+        protocol=protocol,
+        memory_budget=budget,
+        retained=_validated_variant_evidence(value.retained),
+        no_retention=_validated_variant_evidence(value.no_retention),
+        scope=value.scope,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1035,6 +1146,7 @@ def evaluate_recurring_feature_gate(
     criteria: RecurringFeatureGateCriteria | None = None,
 ) -> RecurringFeatureGateDecision:
     """Recompute a fail-closed decision from raw per-seed evidence."""
+    result = _validated_gate_result(result)
     chosen = criteria or RecurringFeatureGateCriteria()
     chosen.validate()
     failures = _canonical_protocol_failures(result.protocol)
