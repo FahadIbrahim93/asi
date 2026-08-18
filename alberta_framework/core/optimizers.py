@@ -2415,6 +2415,8 @@ def bounder_from_config(config: dict[str, Any]) -> Bounder:
     Raises:
         ValueError: If the bounder type is unknown
     """
+    if type(config) is not dict:
+        raise ValueError("bounder config must be an exact dict")
     config = dict(config)
     type_name = config.pop("type")
     host_type = _require_exact_str("type_name", type_name)
