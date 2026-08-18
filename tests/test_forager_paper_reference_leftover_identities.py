@@ -214,6 +214,7 @@ def test_run_result_rejects_hostile_scalar_subclasses_before_hooks() -> None:
         {"curve_steps": (1, 11)},
         {"curve_ewm_reward": (0.1,)},
         {"curve_window_reward": (0.1,)},
+        {"curve_ewm_reward": (), "curve_window_reward": ()},
         {"duration_s": -1.0},
         {"frames_per_second": -1.0},
     ],
