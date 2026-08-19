@@ -11,7 +11,9 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import platform
+import stat
 import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
@@ -96,6 +98,53 @@ def _decode(raw: bytes, *, limit: int, label: str) -> Mapping[str, object]:
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ClearQualificationError(f"{label} is not valid JSON") from exc
     return _object(value, label)
+
+
+def load_dataset_manifest(path: Path) -> bytes:
+    """Read one local manifest without following links or exceeding the byte cap."""
+    if not isinstance(path, Path):
+        raise TypeError("path must be a Path")
+    try:
+        before = path.lstat()
+    except OSError as exc:
+        raise ClearQualificationError("dataset manifest metadata is unavailable") from exc
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+        raise ClearQualificationError("dataset manifest must be a regular non-symlink file")
+    if before.st_size > MAX_MANIFEST_BYTES:
+        raise ClearQualificationError("dataset manifest exceeds its byte limit")
+
+    descriptor: int | None = None
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+            or opened.st_size != before.st_size
+        ):
+            raise ClearQualificationError("dataset manifest changed before its bounded read")
+        with os.fdopen(descriptor, "rb") as stream:
+            descriptor = None
+            raw = stream.read(MAX_MANIFEST_BYTES + 1)
+            after = os.fstat(stream.fileno())
+    except ClearQualificationError:
+        raise
+    except OSError as exc:
+        raise ClearQualificationError("dataset manifest could not be read safely") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+    if len(raw) > MAX_MANIFEST_BYTES:
+        raise ClearQualificationError("dataset manifest exceeds its byte limit")
+    if (
+        len(raw) != opened.st_size
+        or (after.st_dev, after.st_ino, after.st_size)
+        != (opened.st_dev, opened.st_ino, opened.st_size)
+    ):
+        raise ClearQualificationError("dataset manifest changed during its bounded read")
+    return raw
 
 
 def _safe_relative_path(value: object) -> str:
@@ -383,7 +432,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("manifest", type=Path)
     parser.add_argument("--dataset-root", required=True, type=Path)
     args = parser.parse_args(argv)
-    raw = args.manifest.read_bytes()
+    raw = load_dataset_manifest(args.manifest)
     receipt = verify_dataset_manifest(raw, root=args.dataset_root)
     print(_canonical(qualification_plan(receipt)).decode())
     return 0

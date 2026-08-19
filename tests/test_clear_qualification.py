@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -18,6 +19,7 @@ from alberta_framework.benchmarks.clear_qualification import (
     ClearQualificationError,
     _metric_values,
     execution_config,
+    load_dataset_manifest,
     main,
     qualification_plan,
     validate_result,
@@ -88,6 +90,48 @@ def test_cli_verifies_local_data_and_emits_only_a_nonexecuting_plan(
     assert payload["classification"] == "development-only-permanently-nonpromoting"
     assert payload["execution_authorized"] is False
     assert payload["promotion_authorized"] is False
+
+
+def test_manifest_path_read_is_metadata_gated_bounded_and_does_not_use_read_bytes(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest = tmp_path / "manifest.json"
+    manifest.write_bytes(_manifest(tmp_path))
+    monkeypatch.setattr(Path, "read_bytes", lambda _self: pytest.fail("unbounded read_bytes"))
+    assert main((str(manifest), "--dataset-root", str(tmp_path))) == 0
+    assert json.loads(capsys.readouterr().out)["execution_authorized"] is False
+
+
+def test_manifest_path_rejects_oversize_before_open_symlink_and_fifo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    oversized = tmp_path / "oversized.json"
+    oversized.write_bytes(b" " * ((1 << 20) + 1))
+    monkeypatch.setattr(os, "open", lambda *_args, **_kwargs: pytest.fail("file was opened"))
+    with pytest.raises(ClearQualificationError, match="byte limit"):
+        load_dataset_manifest(oversized)
+    monkeypatch.undo()
+
+    target = tmp_path / "target.json"
+    target.write_bytes(b"{}")
+    link = tmp_path / "manifest-link.json"
+    link.symlink_to(target)
+    with pytest.raises(ClearQualificationError, match="non-symlink"):
+        load_dataset_manifest(link)
+
+    fifo = tmp_path / "manifest.fifo"
+    os.mkfifo(fifo)
+    with pytest.raises(ClearQualificationError, match="regular"):
+        load_dataset_manifest(fifo)
+
+
+def test_manifest_path_accepts_exact_byte_cap_without_overread(tmp_path: Path) -> None:
+    manifest = tmp_path / "exact-limit.json"
+    payload = b"{}" + b" " * ((1 << 20) - 2)
+    manifest.write_bytes(payload)
+    assert load_dataset_manifest(manifest) == payload
 
 
 def test_candidate_is_not_silently_present_in_mechanism_off() -> None:

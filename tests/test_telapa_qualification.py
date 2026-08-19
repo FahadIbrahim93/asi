@@ -11,11 +11,14 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from alberta_framework.benchmarks import telapa_qualification as telapa
 from alberta_framework.benchmarks.telapa_qualification import (
     SCHEMA,
     SwitchingPolicyLifeAdapter,
     TeLAPACatalogEntry,
     TeLAPASmokeConfig,
+    _bounded_json_bytes,
+    _preflight_json_tree,
     rollout_latent_descriptor,
     run_smoke,
     validate_result,
@@ -151,6 +154,55 @@ def test_validator_rejects_nan_extra_fields_and_unbounded_config() -> None:
         TeLAPASmokeConfig(seeds=(True,))
     with pytest.raises(ValueError, match="worst-case"):
         TeLAPASmokeConfig(seeds=(0,), steps=64, phase_length=1, archive_byte_budget=128)
+
+
+def test_json_preflight_rejects_deep_cyclic_and_oversized_trees_before_serialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    deep: list[object] = []
+    cursor = deep
+    for _ in range(65):
+        child: list[object] = []
+        cursor.append(child)
+        cursor = child
+    with pytest.raises(ValueError, match="depth"):
+        _preflight_json_tree(deep)
+
+    cyclic: list[object] = []
+    cyclic.append(cyclic)
+    with pytest.raises(ValueError, match="cycles"):
+        _preflight_json_tree(cyclic)
+
+    shared: list[object] = []
+    with pytest.raises(ValueError, match="aliases"):
+        _preflight_json_tree([shared, shared])
+
+    oversized = [None] * 10_001
+    monkeypatch.setattr(telapa.json, "dumps", lambda *_args, **_kwargs: pytest.fail("serialized"))
+    with pytest.raises(ValueError, match="item limit"):
+        _bounded_json_bytes(oversized)
+
+
+def test_json_preflight_rejects_nonexact_types_without_conversion_hooks() -> None:
+    class HostileList(list[object]):
+        def __iter__(self) -> object:
+            raise AssertionError("conversion hook ran")
+
+    with pytest.raises(ValueError, match="exact primitive"):
+        _preflight_json_tree(HostileList())
+    with pytest.raises(ValueError, match="exact primitive"):
+        _preflight_json_tree(("tuple",))
+
+
+def test_serializer_recursion_is_normalized_after_preflight(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_recursively(*_args: object, **_kwargs: object) -> str:
+        raise RecursionError("hostile serializer recursion")
+
+    monkeypatch.setattr(telapa.json, "dumps", fail_recursively)
+    with pytest.raises(ValueError, match="bounded exact tree"):
+        _bounded_json_bytes({"legal": [1, 2, 3]})
 
 
 def test_cli_executes_and_round_trips() -> None:
