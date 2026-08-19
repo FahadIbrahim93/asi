@@ -369,13 +369,17 @@ class OptionValueDurationLearner:
         shape: tuple[int, ...],
         dtype: Any,
     ) -> Array:
-        try:
-            array = jnp.asarray(value)
-        except Exception as error:
-            raise ValueError(f"{name} must be a readable array") from error
-        if array.shape != shape or array.dtype != dtype:
+        actual_type = type(value)
+        if not (
+            actual_type is np.ndarray
+            or issubclass(actual_type, (jax.Array, jax.core.Tracer))
+        ):
+            raise TypeError(f"{name} must expose trusted array metadata")
+        actual_shape = tuple(value.shape)
+        actual_dtype = jnp.dtype(value.dtype)
+        if actual_shape != shape or actual_dtype != jnp.dtype(dtype):
             raise ValueError(f"{name} must have shape {shape} and dtype {dtype}")
-        return array
+        return jnp.asarray(value)
 
     @staticmethod
     def _state_values_valid(state: OptionValueDurationState) -> Array:

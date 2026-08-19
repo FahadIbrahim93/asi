@@ -9677,8 +9677,13 @@ def shard_payload(
     return payload
 
 
-def load_shard(path: Path) -> dict[str, Any]:
+def load_shard(
+    path: Path,
+    *,
+    spec_registry: Mapping[str, ScreeningSpec] | None = None,
+) -> dict[str, Any]:
     """Load legacy v1 or strictly validate a source-bound v2 screening shard."""
+    registry = SCREENING_REGISTRY if spec_registry is None else spec_registry
     payload = load_strict_json_object(path)
     schema = payload.get("schema")
     if schema not in {LEGACY_SHARD_SCHEMA, SHARD_SCHEMA}:
@@ -9743,9 +9748,9 @@ def load_shard(path: Path) -> dict[str, Any]:
     config_name = _required_nonempty_string(
         payload.get("config_name"), context=f"{path}: config_name"
     )
-    if config_name not in SCREENING_REGISTRY:
+    if config_name not in registry:
         raise ValueError(f"{path}: unknown config_name")
-    spec = SCREENING_REGISTRY[config_name]
+    spec = registry[config_name]
     base_learner = _required_nonempty_string(
         payload.get("base_learner"), context=f"{path}: base_learner"
     )
@@ -9950,6 +9955,8 @@ def merge_shards(
     paths: Sequence[Path],
     control_name: str = "upgd_w_control",
     slope_window: int = 15,
+    *,
+    spec_registry: Mapping[str, ScreeningSpec] | None = None,
 ) -> dict[str, Any]:
     """Merge shards into a ranked screening summary with paired comparisons.
 
@@ -9961,7 +9968,9 @@ def merge_shards(
     input_bindings = _artifact_file_bindings(
         normalized_paths, context="screening shard input"
     )
-    shards = [load_shard(path) for path in normalized_paths]
+    shards = [
+        load_shard(path, spec_registry=spec_registry) for path in normalized_paths
+    ]
     if not shards:
         raise ValueError("no shards given")
     shard_schemas = {shard["schema"] for shard in shards}

@@ -1149,21 +1149,24 @@ def _write_combined_summary(root: Path) -> Path:
 
 
 def _validate(root: Path, protocol_key: str) -> dict[str, Any]:
-    if protocol_key != "issue184":
-        return cast(
-            dict[str, Any],
-            _validate_result_bundle(
-                protocol_key=protocol_key,
-                root=root,
-                repository_identity=_repository_identity(),
-                runner_receipt=_runner_receipt(),
-                verify_cache_file=False,
-            ),
-        )
+    return cast(
+        dict[str, Any],
+        _validate_result_bundle(
+            protocol_key=protocol_key,
+            root=root,
+            repository_identity=_repository_identity(),
+            runner_receipt=_runner_receipt(),
+            verify_cache_file=False,
+        ),
+    )
 
+
+def _historical_issue184_registry() -> dict[str, Any]:
+    """Build the explicit registry used to reconstruct a historical summary."""
     import alberta_framework.benchmarks.ipmnist_screening as screening_module
 
-    protocol = _PROTOCOLS[protocol_key]
+    protocol = _PROTOCOLS["issue184"]
+    assert protocol.candidate not in screening_module.SCREENING_REGISTRY
     incumbent = screening_module.screening_spec(protocol.control)
     retired = replace(
         incumbent,
@@ -1173,25 +1176,22 @@ def _validate(root: Path, protocol_key: str) -> dict[str, Any]:
             "rls_reset_frac": 2.0,
         },
     )
-    historical_registry = MappingProxyType(
-        {**screening_module.SCREENING_REGISTRY, protocol.candidate: retired}
+    return {**screening_module.SCREENING_REGISTRY, protocol.candidate: retired}
+
+
+def _publish_historical_issue184(root: Path) -> dict[str, Any]:
+    """Exercise publication without restoring the retired arm to the live registry."""
+    protocol = _PROTOCOLS["issue184"]
+    return cast(
+        dict[str, Any],
+        _validate_and_publish_result(
+            protocol_key=protocol.key,
+            root=root,
+            repository_identity=_repository_identity(),
+            runner_receipt=_runner_receipt(),
+            verify_cache_file=False,
+        ),
     )
-    with pytest.MonkeyPatch.context() as registry_patch:
-        registry_patch.setattr(
-            screening_module,
-            "SCREENING_REGISTRY",
-            historical_registry,
-        )
-        return cast(
-            dict[str, Any],
-            _validate_result_bundle(
-                protocol_key=protocol_key,
-                root=root,
-                repository_identity=_repository_identity(),
-                runner_receipt=_runner_receipt(),
-                verify_cache_file=False,
-            ),
-        )
 
 
 @pytest.mark.parametrize(
@@ -1370,25 +1370,13 @@ def test_issue14_full_bundle_reports_evaluation_and_combined_outcome(
 def test_result_publication_is_one_shot_after_success(tmp_path: Path) -> None:
     namespace = _write_protocol_receipts(tmp_path, "issue184")
     _write_stage(tmp_path, "issue184", "screen_60", differences=(0.003,) * 3)
-    result = _validate_and_publish_result(
-        protocol_key="issue184",
-        root=tmp_path,
-        repository_identity=_repository_identity(),
-        runner_receipt=_runner_receipt(),
-        verify_cache_file=False,
-    )
+    result = _publish_historical_issue184(tmp_path)
     assert result["outcome"] == "no_reset_win"
     assert (namespace / "result-claim.v1.json").is_file()
     assert (namespace / "result.v1.json").is_file()
     assert _validate(tmp_path, "issue184") == result
     with pytest.raises(FileExistsError):
-        _validate_and_publish_result(
-            protocol_key="issue184",
-            root=tmp_path,
-            repository_identity=_repository_identity(),
-            runner_receipt=_runner_receipt(),
-            verify_cache_file=False,
-        )
+        _publish_historical_issue184(tmp_path)
 
 
 def test_failed_result_validation_consumes_the_only_attempt(tmp_path: Path) -> None:
@@ -1428,6 +1416,7 @@ def test_result_validation_rejects_shards_created_before_cache_receipt(
             [path.relative_to(tmp_path) for path in paths],
             control_name="rls_head_resid_l1_preset005",
             slope_window=15,
+            spec_registry=_historical_issue184_registry(),
         )
     finally:
         os.chdir(prior)
@@ -1654,13 +1643,7 @@ def test_result_validation_rejects_malformed_or_premature_claim(
 def test_published_result_tamper_is_rejected_on_strict_reload(tmp_path: Path) -> None:
     namespace = _write_protocol_receipts(tmp_path, "issue184")
     _write_stage(tmp_path, "issue184", "screen_60", differences=(0.003,) * 3)
-    result = _validate_and_publish_result(
-        protocol_key="issue184",
-        root=tmp_path,
-        repository_identity=_repository_identity(),
-        runner_receipt=_runner_receipt(),
-        verify_cache_file=False,
-    )
+    result = _publish_historical_issue184(tmp_path)
     stored = json.loads((namespace / "result.v1.json").read_text(encoding="utf-8"))
     assert stored == result
     stored["outcome"] = "inconclusive"

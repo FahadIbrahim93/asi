@@ -67,6 +67,7 @@ from alberta_framework.core.checkpoints import (
     load_checkpoint_metadata,
     save_checkpoint,
 )
+from alberta_framework.core.normalizers import _saturating_int32_counter_increment
 from alberta_framework.core.types import TimeStep
 from alberta_framework.streams.base import ScanStream
 
@@ -232,21 +233,21 @@ class GauntletConfig:
     def __post_init__(self) -> None:
         """Validate the configuration."""
         if (
-            isinstance(self.relevant_dim, bool)
-            or not isinstance(self.relevant_dim, int)
+            type(self.relevant_dim) is bool
+            or type(self.relevant_dim) is not int
             or self.relevant_dim < 2
             or self.relevant_dim % 2 != 0
         ):
             raise ValueError("relevant_dim must be an even integer >= 2")
         if (
-            isinstance(self.irrelevant_dim, bool)
-            or not isinstance(self.irrelevant_dim, int)
+            type(self.irrelevant_dim) is bool
+            or type(self.irrelevant_dim) is not int
             or self.irrelevant_dim < 0
         ):
             raise ValueError("irrelevant_dim must be non-negative")
         if (
-            isinstance(self.segment_length, bool)
-            or not isinstance(self.segment_length, int)
+            type(self.segment_length) is bool
+            or type(self.segment_length) is not int
             or self.segment_length < 1
         ):
             raise ValueError("segment_length must be positive")
@@ -258,7 +259,9 @@ class GauntletConfig:
             "context_noise_std",
         ):
             value = getattr(self, name)
-            if isinstance(value, bool) or not isinstance(value, (int, float)):
+            if type(value) is bool or (
+                type(value) is not int and type(value) is not float
+            ):
                 raise ValueError(f"{name} must be a finite real number")
             if not math.isfinite(float(value)):
                 raise ValueError(f"{name} must be finite")
@@ -419,7 +422,7 @@ class GauntletStream:
         )
         new_state = GauntletState(
             key=key,
-            step_count=state.step_count + 1,
+            step_count=_saturating_int32_counter_increment(state.step_count),
             drift_weights=new_drift,
             w_a=state.w_a,
             w_c=state.w_c,

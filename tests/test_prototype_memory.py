@@ -28,6 +28,49 @@ def test_prototype_memory_init_shapes() -> None:
     chex.assert_tree_all_finite(state)
 
 
+def test_prototype_memory_hit_count_is_int32_and_saturates() -> None:
+    """Hit counts must be exact past 2**24 and saturate instead of stalling."""
+
+    config = PrototypeMemoryConfig(feature_dim=2, n_classes=2, slots_per_class=1)
+    learner = PrototypeMemoryLearner(config)
+    state = learner.init()
+    assert state.counts.dtype == jnp.dtype(jnp.int32)
+    target = jnp.asarray([1.0, 0.0], dtype=jnp.float32)
+
+    planted = state.replace(
+        counts=jnp.array([[16777216], [0]], dtype=jnp.int32),
+        means=jnp.array([[[1.0, 1.0]], [[0.0, 0.0]]], dtype=jnp.float32),
+    )
+    result = learner.update(planted, jnp.ones((2,), dtype=jnp.float32), target)
+    assert int(result.state.counts[0, 0]) == 16777217
+
+    exhausted = result.state.replace(
+        counts=result.state.counts.at[0, 0].set(2**31 - 1)
+    )
+    final = learner.update(exhausted, jnp.ones((2,), dtype=jnp.float32), target)
+    assert int(final.state.counts[0, 0]) == 2**31 - 1
+
+
+def test_replacement_uses_exact_integer_minimum_past_float32_precision() -> None:
+    """An older, higher-count slot must not join the least-used tie set."""
+
+    learner = PrototypeMemoryLearner(
+        PrototypeMemoryConfig(feature_dim=2, n_classes=2, slots_per_class=2)
+    )
+    state = learner.init().replace(
+        counts=jnp.asarray([[2**24, 2**24 + 1], [0, 0]], dtype=jnp.int32),
+        last_update=jnp.asarray([[2, 1], [0, 0]], dtype=jnp.int32),
+        step_count=jnp.asarray(2, dtype=jnp.int32),
+    )
+    head = jnp.asarray(0, dtype=jnp.int32)
+
+    eager_slot = learner._replacement_slot(state, head)
+    jitted_slot = jax.jit(learner._replacement_slot)(state, head)
+
+    assert int(eager_slot) == 0
+    assert int(jitted_slot) == 0
+
+
 def test_empty_memory_predicts_uniformly() -> None:
     """With no prototypes, softmax logits should be neutral."""
     learner = PrototypeMemoryLearner(

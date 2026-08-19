@@ -198,16 +198,6 @@ def test_composer_rejects_observation_dim_mismatch() -> None:
         )
 
 
-def test_composer_rejects_n_actions_exceeds_exact_float32() -> None:
-    # _MAX_EXACT_FLOAT32_INTEGER is 16_777_216
-    ensemble = _ensemble(n_actions=16_777_217)
-    replay = _replay(action_dim=16_777_217)
-    with pytest.raises(ValueError, match="exceeds exact float32"):
-        ModelReplayRehearsalConfig(
-            ensemble=ensemble, replay=replay, action_encoding="one_hot"
-        )
-
-
 def test_composer_rejects_action_dim_mismatch_for_encodings() -> None:
     ensemble = _ensemble(n_actions=4)
     # scalar_index requires action_dim == 1

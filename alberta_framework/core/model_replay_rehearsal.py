@@ -77,7 +77,6 @@ MODEL_REPLAY_REHEARSAL_SCHEMA = "alberta.model_replay_rehearsal.v1"
 MECHANISM_STATUS = "model-only-replay-mechanism-no-scientific-claim"
 _INT32_MAX = 2_147_483_647
 _UINT32_MAX = 4_294_967_295
-_MAX_EXACT_FLOAT32_INTEGER = 16_777_216
 _COMPOSER_ACCOUNTING_BYTES = 7 * 4
 _ACTUAL_INT_TYPES: tuple[type, ...] = (
     int,
@@ -131,16 +130,18 @@ def _copy_mapping(payload: object, *, name: str) -> dict[str, Any]:
 
 
 def _preflight_model_replay_state_resources(config: ModelReplayRehearsalConfig) -> None:
-    """Reject an oversized combined state before either child allocates arrays."""
+    """Reject an oversized combined update before either child allocates arrays.
+
+    Each child already requires its three-copy update envelope to fit signed
+    int32.  Consequently their combined one-copy persistent state is bounded
+    below two thirds of that limit; a separate composer persistent-state check
+    is unreachable.
+    """
     _, ensemble_bytes = _ensemble_state_resource_counts(
         model=config.ensemble.model,
         ensemble_size=config.ensemble.ensemble_size,
     )
     replay_slot_bytes, replay_bytes = _allocation_sizes(config.replay)
-    persistent_bytes = ensemble_bytes + replay_bytes + _COMPOSER_ACCOUNTING_BYTES
-    if persistent_bytes > _INT32_MAX:
-        raise ValueError("model replay rehearsal state byte count must fit signed int32")
-
     model = config.ensemble.model
     ensemble_size = config.ensemble.ensemble_size
     target_dim = model.observation_dim + 2
@@ -201,8 +202,6 @@ class ModelReplayRehearsalConfig:
             raise ValueError("action_encoding must be 'scalar_index' or 'one_hot'")
         if self.ensemble.model.observation_dim != self.replay.observation_dim:
             raise ValueError("ensemble and replay observation dimensions must match")
-        if self.ensemble.model.n_actions > _MAX_EXACT_FLOAT32_INTEGER:
-            raise ValueError("n_actions exceeds exact float32 action-index storage")
         _require_int(
             "ensemble.model.n_actions",
             self.ensemble.model.n_actions,

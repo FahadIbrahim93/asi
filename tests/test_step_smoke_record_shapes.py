@@ -33,7 +33,7 @@ def test_shared_shape_gate_rejects_noncanonical_or_inconsistent_values(value: ob
 
 def _records_and_shape_fields() -> tuple[tuple[object, tuple[str, ...]], ...]:
     return (
-        (Step1SmokeResult(Step1KernelConfig(), 8, 0, 0.0, (8,), True), ("metrics_shape",)),
+        (Step1SmokeResult(Step1KernelConfig(), 8, 0, 0.0, (8, 4), True), ("metrics_shape",)),
         (
             Step2SmokeResult(Step2KernelConfig(), 8, 0, 0.0, (8,), True, {}),
             ("metrics_shape",),

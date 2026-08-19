@@ -1,10 +1,17 @@
 # IPMNIST campaign index
 
+Last reconciled: 2026-08-18.
+
 This is the mutable index for the active IPMNIST development-screening and
 development-confirmation campaign. It is **permanently nonpromoting**. It
 tests one plasticity/conditioning subsystem and does not support an integrated
 ASI-agent, robotics, scientific-evidence, state-of-the-art, or Alberta Plan
 completion claim.
+
+Maintained ceiling, frontier, and rule-discovery reproduction commands live in
+the [IPMNIST campaign-tools runbook](../runbooks/ipmnist-maintained-tools.md).
+Programs stored beside historical `outputs/` artifacts remain provenance
+records and are not the maintained implementation.
 
 ## Current stored record
 
