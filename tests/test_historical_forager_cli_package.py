@@ -47,6 +47,8 @@ _WHEEL_FILES = tuple(
 )
 _EXPECTED_SCRIPT_NAMES = {
     "asi-action-conditioned-latent",
+    "asi-activation-feature-ipmnist",
+    "asi-adamo-diagnostic",
     "asi-ipmnist-campaign",
     "asi-ipmnist-ceiling",
     "asi-l2er-matched-development",

@@ -28,6 +28,10 @@ _ASI_SCRIPTS = {
     "asi-plasticity-diagnostic": (
         "alberta_framework.benchmarks.plasticity_diagnostics:main"
     ),
+    "asi-activation-feature-ipmnist": (
+        "alberta_framework.benchmarks.activation_feature_ipmnist:main"
+    ),
+    "asi-adamo-diagnostic": "alberta_framework.benchmarks.adamo_diagnostic:main",
     "asi-reference-life-scorecard": (
         "alberta_framework.benchmarks.reference_life_scorecard:main"
     ),

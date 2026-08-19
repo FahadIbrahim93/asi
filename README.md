@@ -241,6 +241,7 @@ The console scripts are grouped by responsibility; every command supports `--hel
 |---|---|
 | `alberta-step1-smoke`, `alberta-step2-smoke` | Nonpromoting mechanism smoke checks |
 | `asi-native-supervised-catalog`, `asi-plasticity-diagnostic` | Inspect or run bounded, permanently nonpromoting supervised diagnostics |
+| `asi-adamo-diagnostic` | Catalog or run the bounded, permanently nonpromoting AdamO dynamical-isometry comparator |
 | `asi-reference-life-scorecard` | Run or validate the permanently nonpromoting reference-life development scorecard |
 | `asi-ipmnist-ceiling` | Produce new, atomic no-replace stationary/carried/full or batch ceiling diagnostics |
 | `asi-ipmnist-campaign` | Recompute paired frontiers or ceiling summaries from explicit input directories |
@@ -260,6 +261,9 @@ historical provenance, not the maintained implementation; existing bytes follow 
 immutable or active-campaign append-only policy. The loss-of-plasticity lane has separate
 protocol and cost gates in the
 [`plasticity diagnostics` runbook](docs/research/plasticity-diagnostics.md).
+The AdamO adapter's exact paper/code audit, matched axes, accounting conventions, and
+comparability gaps are recorded in
+[`docs/research/adamo-diagnostic.md`](docs/research/adamo-diagnostic.md).
 
 ## Package layout
 
