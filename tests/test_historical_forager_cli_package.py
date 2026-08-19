@@ -49,6 +49,7 @@ _EXPECTED_SCRIPT_NAMES = {
     "asi-ipmnist-campaign",
     "asi-ipmnist-ceiling",
     "asi-l2er-matched-development",
+    "asi-new-directions-audit",
     "asi-reference-life-scorecard",
     "asi-rule-discovery-summary",
     "alberta-evidence-status",
