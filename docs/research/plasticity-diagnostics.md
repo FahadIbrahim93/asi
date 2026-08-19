@@ -53,8 +53,9 @@ replacement mechanism; it is not an exact port or parity result.
 Predictions are recorded before each online update. A second batched forward
 pass per task measures dead ReLU units and representation effective rank.
 Receipts count examples and bytes, prediction/diagnostic model queries,
-parameter updates, replacements, numeric persistent bytes including the RNG
-cursor, and telemetry-only elapsed nanoseconds. Every record also binds the
+parameter updates, replacements, and numeric learner-state persistent bytes.
+The runner-owned Threefry cursor is outside that learner-state byte field;
+elapsed nanoseconds remain telemetry-only. Every record also binds the
 full caller array bytes, current ASI module bytes, Python, JAX, NumPy, and JAX
 backend identities. Negative results must be retained and no result can promote.
 

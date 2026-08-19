@@ -36,6 +36,10 @@ INPUT_DIM = 784
 N_CLASSES = 10
 
 
+def _runtime_identity() -> tuple[str, str, str, str]:
+    return (platform.python_version(), jax.__version__, np.__version__, jax.default_backend())
+
+
 def _exact_int(value: object, name: str, low: int, high: int) -> int:
     if type(value) is not int:
         raise ValueError(f"{name} must be an exact integer")
@@ -332,15 +336,8 @@ class DiagnosticResult:
             raise ValueError("dataset identity drift")
         if self.source_sha256 != hashlib.sha256(Path(__file__).read_bytes()).hexdigest():
             raise ValueError("current ASI source identity drift")
-        if (
-            type(self.runtime_identity) is not tuple
-            or len(self.runtime_identity) != 4
-            or any(
-                type(value) is not str or not value or len(value.encode("utf-8")) > 256
-                for value in self.runtime_identity
-            )
-        ):
-            raise ValueError("runtime identity must be a bounded exact tuple")
+        if self.runtime_identity != _runtime_identity():
+            raise ValueError("current runtime identity drift")
         if (
             self.task_protocol != "cumulative-input-permutation"
             or self.labels_permuted is not False
@@ -520,7 +517,7 @@ def run_diagnostic(
         seed,
         _dataset_sha(data, targets),
         hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
-        (platform.python_version(), jax.__version__, np.__version__, jax.default_backend()),
+        _runtime_identity(),
         "cumulative-input-permutation",
         False,
         False,

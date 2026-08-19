@@ -67,6 +67,10 @@ ArmID = Literal[
 _NORMALIZATION_EPSILON = 1e-5
 
 
+def _runtime_identity() -> tuple[str, str, str, str]:
+    return (platform.python_version(), jax.__version__, np.__version__, jax.default_backend())
+
+
 def _exact_int(value: object, name: str, low: int, high: int) -> int:
     if type(value) is not int:
         raise ValueError(f"{name} must be an exact integer")
@@ -303,15 +307,8 @@ class NaPResult:
         nap_project_sha256 = hashlib.sha256(nap_project_path.read_bytes()).hexdigest()
         if self.nap_project_dependency_source_sha256 != nap_project_sha256:
             raise ValueError("nap_project dependency source identity drift")
-        if (
-            type(self.runtime_identity) is not tuple
-            or len(self.runtime_identity) != 4
-            or any(
-                type(value) is not str or not value or len(value.encode()) > 256
-                for value in self.runtime_identity
-            )
-        ):
-            raise ValueError("runtime identity must be a bounded exact tuple")
+        if self.runtime_identity != _runtime_identity():
+            raise ValueError("current runtime identity drift")
         if (
             type(self.task_protocol) is not str
             or self.task_protocol != "cumulative-input-permuted-mnist"
@@ -558,12 +555,7 @@ def run_comparator(
         nap_project_dependency_source_sha256=hashlib.sha256(
             Path(__file__).with_name("plasticity_comparators.py").read_bytes()
         ).hexdigest(),
-        runtime_identity=(
-            platform.python_version(),
-            jax.__version__,
-            np.__version__,
-            jax.default_backend(),
-        ),
+        runtime_identity=_runtime_identity(),
         task_protocol="cumulative-input-permuted-mnist",
         labels_permuted=False,
         task_boundaries_visible_to_learner=False,

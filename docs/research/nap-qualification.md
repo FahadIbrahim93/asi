@@ -30,7 +30,7 @@ non-official context at
 ## ASI development protocol
 
 The lane explicitly depends on #1583 commit
-`3222c4f0d1b9627c15b2d4a907856cc1d8dee7be`. It uses that lane's caller-supplied
+`8383d6438b81c7620189c6fedba30c345994cb12`. It uses that lane's caller-supplied
 MNIST validation, cumulative pixel-permutation schedule, two-hidden-layer
 predict-before-update network, frozen development profiles, and per-example
 updates. One material deviation is that this comparator uses unlearned
