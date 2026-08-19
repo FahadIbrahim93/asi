@@ -28,7 +28,7 @@ pytestmark = pytest.mark.unit
 
 
 def _result() -> dict[str, Any]:
-    return run_smoke(TeLAPASmokeConfig(seeds=(1_586_000,), steps=8, phase_length=2))
+    return run_smoke(TeLAPASmokeConfig(steps=8, phase_length=2))
 
 
 def test_catalog_fails_closed_without_immutable_anonymous_revision() -> None:
@@ -150,10 +150,25 @@ def test_validator_rejects_nan_extra_fields_and_unbounded_config() -> None:
         validate_result(payload)
     with pytest.raises(ValueError, match=r"\[1, 64\]"):
         TeLAPASmokeConfig(steps=65)
-    with pytest.raises(ValueError, match="exact nonnegative"):
+    with pytest.raises(ValueError, match="frozen"):
         TeLAPASmokeConfig(seeds=(True,))
     with pytest.raises(ValueError, match="worst-case"):
-        TeLAPASmokeConfig(seeds=(0,), steps=64, phase_length=1, archive_byte_budget=128)
+        TeLAPASmokeConfig(steps=64, phase_length=1, archive_byte_budget=128)
+
+
+def test_validator_rejects_forged_archive_totals_and_current_identity() -> None:
+    forged = copy.deepcopy(_result())
+    receipt = forged["records"][0]["resource_receipt"]
+    receipt["archive_entry_queries"] = 2**62
+    receipt["archive_persistent_bytes"] = 2**62
+    forged["records"][0]["archive_entry_count"] = 0
+    with pytest.raises(ValueError, match="budget|replay"):
+        validate_result(forged)
+
+    forged = copy.deepcopy(_result())
+    forged["identity"]["lane_source_sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="current tree/runtime"):
+        validate_result(forged)
 
 
 def test_json_preflight_rejects_deep_cyclic_and_oversized_trees_before_serialization(

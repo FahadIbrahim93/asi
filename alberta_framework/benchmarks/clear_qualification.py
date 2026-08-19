@@ -344,11 +344,42 @@ def _metric_values(matrix: list[list[float]]) -> Mapping[str, float]:
 def validate_result(
     raw: bytes,
     *,
-    expected_plan_sha256: str,
-    expected_resource_budget: Mapping[str, object] | None = None,
+    expected_plan: Mapping[str, object],
 ) -> Mapping[str, object]:
     """Validate the narrow result envelope; scores remain uninterpreted development data."""
-    plan_digest = _sha256(expected_plan_sha256, "expected plan sha256")
+    plan = _object(expected_plan, "expected CLEAR plan")
+    _keys(
+        plan,
+        {
+            "schema_version",
+            "classification",
+            "paper_revision",
+            "source_revisions",
+            "dataset_sha256",
+            "runtime",
+            "axes",
+            "control_config",
+            "mechanism_off_config",
+            "metrics",
+            "resource_budget_per_axis",
+            "negative_retention_required",
+            "promotion_authorized",
+            "execution_authorized",
+        },
+        "expected CLEAR plan",
+    )
+    if (
+        plan["schema_version"] != SCHEMA
+        or plan["classification"] != "development-only-permanently-nonpromoting"
+        or plan["negative_retention_required"] is not True
+        or plan["promotion_authorized"] is not False
+        or plan["execution_authorized"] is not False
+    ):
+        raise ClearQualificationError("expected plan violates the frozen qualification policy")
+    plan_digest = hashlib.sha256(_canonical(plan)).hexdigest()
+    expected_resource_budget = _object(
+        plan["resource_budget_per_axis"], "expected plan resource budget"
+    )
     payload = _decode(raw, limit=MAX_RESULT_BYTES, label="CLEAR result")
     _keys(
         payload,
@@ -408,22 +439,40 @@ def validate_result(
     for name in resources:
         maximum = (1 << 63) - 1 if name != "wall_seconds_telemetry" else (1 << 53)
         _exact_int(resources[name], name, maximum=maximum)
-    if expected_resource_budget is not None:
-        for name in (
+    _keys(
+        expected_resource_budget,
+        {
             "archive_bytes",
             "training_observations",
             "data_samples_read",
             "optimizer_updates",
             "model_queries",
             "environment_steps",
-        ):
-            expected = _exact_int(
-                expected_resource_budget.get(name),
-                f"expected {name}",
-                maximum=(1 << 63) - 1,
-            )
-            if resources[name] != expected:
-                raise ClearQualificationError(f"{name} does not match the frozen plan")
+            "timing",
+            "persistent_bytes",
+        },
+        "expected plan resource budget",
+    )
+    if (
+        expected_resource_budget["timing"] != "telemetry-only"
+        or expected_resource_budget["persistent_bytes"] != "runner-receipt-required"
+    ):
+        raise ClearQualificationError("expected resource policy differs from the frozen plan")
+    for name in (
+        "archive_bytes",
+        "training_observations",
+        "data_samples_read",
+        "optimizer_updates",
+        "model_queries",
+        "environment_steps",
+    ):
+        expected = _exact_int(
+            expected_resource_budget[name],
+            f"expected {name}",
+            maximum=(1 << 63) - 1,
+        )
+        if resources[name] != expected:
+            raise ClearQualificationError(f"{name} does not match the frozen plan")
     return payload
 
 

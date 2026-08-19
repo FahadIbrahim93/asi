@@ -15,6 +15,7 @@ import hashlib
 import importlib.util
 import json
 import operator
+import sys
 from collections.abc import Sequence
 from typing import Any, SupportsIndex, cast
 
@@ -23,7 +24,15 @@ import jax.numpy as jnp
 import jax.random as jr
 import numpy as np
 
+import alberta_framework.benchmarks.external_qualification as external_qualification_module
+import alberta_framework.core.sarsa as sarsa_module
 from alberta_framework.benchmarks.external_qualification import qualification_plan
+from alberta_framework.benchmarks.qualification_provenance import (
+    QualificationIdentity,
+    collect_qualification_identity,
+    identity_from_payload,
+    require_current_identity,
+)
 from alberta_framework.core.sarsa import SARSAAgent, SARSAConfig
 
 COOM_SMOKE_SCHEMA = "asi.coom_qualification_smoke.development.v1"
@@ -74,6 +83,28 @@ _LEARNING_EXTRAS = (
     "tensorflow-probability==0.19",
     "wandb",
 )
+_WORKLOAD_REGISTRY = (
+    ("arms", FROZEN_ARMS),
+    ("cd8_tasks", CD8_TASKS),
+    ("co8_tasks", CO8_TASKS),
+    ("development_seeds", FROZEN_DEVELOPMENT_SEEDS),
+    ("max_steps_per_task", _MAX_SMOKE_STEPS_PER_TASK),
+    ("observation_shape", _OBSERVATION_SHAPE),
+)
+_PAPER_REGISTRY = (
+    ("commit", COOM_COMMIT),
+    ("paper", COOM_PAPER),
+    ("repository", COOM_REPOSITORY),
+)
+
+
+def _current_identity() -> QualificationIdentity:
+    return collect_qualification_identity(
+        lane_module=sys.modules[__name__],
+        dependency_modules=(external_qualification_module, sarsa_module),
+        workload_registry=_WORKLOAD_REGISTRY,
+        paper_registry=_PAPER_REGISTRY,
+    )
 
 
 def _exact_int(value: object, *, name: str, minimum: int, maximum: int) -> int:
@@ -309,6 +340,7 @@ class COOMSmokeResult:
     dependencies: DependencyReceipt
     qualification_blockers: tuple[str, ...]
     arms: tuple[COOMArmReceipt, ...]
+    identity: QualificationIdentity
     synthetic_contract_trace: bool = True
     development_only: bool = True
     scientific_promotion_allowed: bool = False
@@ -324,6 +356,10 @@ class COOMSmokeResult:
             raise ValueError("catalog and protocol must use exact types")
         if type(self.dependencies) is not DependencyReceipt:
             raise ValueError("dependencies must use the exact receipt type")
+        COOMCatalogEntry.__post_init__(self.catalog)
+        COOMSmokeProtocol.__post_init__(self.protocol)
+        DependencyReceipt.__post_init__(self.dependencies)
+        require_current_identity(self.identity, _current_identity())
         expected_blockers = qualification_plan(1582).blockers
         if (
             type(self.qualification_blockers) is not tuple
@@ -379,6 +415,9 @@ class COOMSmokeResult:
                     raise ValueError("synthetic environment bytes differ from the contract")
                 if (arm_index == 1) != (resources.persistent_agent_bytes > 0):
                     raise ValueError("agent bytes disagree with the enabled mechanism")
+                expected_arm = _run_arm(self.protocol, arm.seed, arm.arm_id)
+                if arm != expected_arm:
+                    raise ValueError("deterministic arm replay or exact resource receipt mismatch")
             mechanism_off, fixed_parity = group[2], group[3]
             if (
                 mechanism_off.action_sha256 != fixed_parity.action_sha256
@@ -531,6 +570,7 @@ def run_coom_qualification_smoke(
         dependencies=_dependency_receipt(),
         qualification_blockers=plan.blockers,
         arms=arms,
+        identity=_current_identity(),
     )
 
 
@@ -575,6 +615,7 @@ def validate_coom_smoke_payload(payload: object) -> COOMSmokeResult:
         protocol_raw[name] = tuple(protocol_raw[name])
     protocol = COOMSmokeProtocol(**protocol_raw)
     dependencies = DependencyReceipt(**exact_nested("dependencies", DependencyReceipt))
+    identity = identity_from_payload(root["identity"])
     blockers = root["qualification_blockers"]
     if type(blockers) is not list:
         raise ValueError("serialized blockers must be an exact list")
@@ -600,6 +641,7 @@ def validate_coom_smoke_payload(payload: object) -> COOMSmokeResult:
         dependencies=dependencies,
         qualification_blockers=tuple(blockers),
         arms=tuple(arms),
+        identity=identity,
         synthetic_contract_trace=root["synthetic_contract_trace"],
         development_only=root["development_only"],
         scientific_promotion_allowed=root["scientific_promotion_allowed"],

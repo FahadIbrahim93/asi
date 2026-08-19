@@ -22,6 +22,14 @@ import jax.random as jr
 import numpy as np
 from jax import Array
 
+import alberta_framework.core.policy_archive as policy_archive_module
+import alberta_framework.streams.closed_loop as closed_loop_module
+from alberta_framework.benchmarks.qualification_provenance import (
+    QualificationIdentity,
+    collect_qualification_identity,
+    identity_from_payload,
+    require_current_identity,
+)
 from alberta_framework.core.policy_archive import BoundedPolicyArchive, PolicyEntry
 from alberta_framework.streams.closed_loop import SwitchingTwoStateConfig, SwitchingTwoStateMDP
 
@@ -36,10 +44,33 @@ _MAX_JSON_CONTAINER_ITEMS = 10_000
 _MAX_JSON_STRING_BYTES = 100_000
 _MAX_STEPS = 64
 _MAX_SEEDS = 4
+FROZEN_DEVELOPMENT_SEEDS = (1_586_000, 1_586_001, 1_586_002)
 _POLICY_SHAPE = (2, 2)
 _POLICY_BYTES = 16
 _ARMS = ("diverse_archive", "one_model", "fixed_snapshot", "mechanism_off")
 Arm = Literal["diverse_archive", "one_model", "fixed_snapshot", "mechanism_off"]
+_WORKLOAD_REGISTRY = (
+    ("arms", _ARMS),
+    ("development_seeds", FROZEN_DEVELOPMENT_SEEDS),
+    ("max_steps", _MAX_STEPS),
+    ("policy_shape", _POLICY_SHAPE),
+)
+_PAPER_REGISTRY = (
+    ("disclosed_repository", DISCLOSED_REPOSITORY),
+    ("paper_date", PAPER_DATE),
+    ("paper_revision", PAPER_REVISION),
+    ("repository_revision", None),
+    ("repository_tree_digest", None),
+)
+
+
+def _current_identity() -> QualificationIdentity:
+    return collect_qualification_identity(
+        lane_module=sys.modules[__name__],
+        dependency_modules=(policy_archive_module, closed_loop_module),
+        workload_registry=_WORKLOAD_REGISTRY,
+        paper_registry=_PAPER_REGISTRY,
+    )
 
 
 def _preflight_json_tree(value: object) -> None:
@@ -201,7 +232,7 @@ class TeLAPACatalogEntry:
 
 @dataclass(frozen=True, slots=True)
 class TeLAPASmokeConfig:
-    seeds: tuple[int, ...] = (1_586_000, 1_586_001, 1_586_002)
+    seeds: tuple[int, ...] = FROZEN_DEVELOPMENT_SEEDS
     steps: int = 32
     phase_length: int = 4
     archive_byte_budget: int = 4096
@@ -209,8 +240,8 @@ class TeLAPASmokeConfig:
     learning_rate: float = 0.125
 
     def __post_init__(self) -> None:
-        if type(self.seeds) is not tuple or not 1 <= len(self.seeds) <= _MAX_SEEDS:
-            raise ValueError("seeds must be a bounded non-empty exact tuple")
+        if type(self.seeds) is not tuple or self.seeds != FROZEN_DEVELOPMENT_SEEDS:
+            raise ValueError("development seeds are frozen")
         if any(type(seed) is not int or not 0 <= seed < 2**31 for seed in self.seeds):
             raise ValueError("seeds must contain exact nonnegative signed-int32 values")
         if len(set(self.seeds)) != len(self.seeds):
@@ -500,6 +531,7 @@ def run_smoke(config: TeLAPASmokeConfig | None = None) -> dict[str, Any]:
             raise AssertionError("mechanism-off reduction diverged from fixed snapshot")
     result = {
         "schema": SCHEMA,
+        "identity": _current_identity().to_payload(),
         "catalog": _catalog_payload(catalog),
         "config": _config_payload(config),
         "matched_axes": [
@@ -548,7 +580,7 @@ def validate_result(value: object) -> None:
     root = _require_exact_keys(
         value,
         {
-            "schema", "catalog", "config", "matched_axes", "allowed_information",
+            "schema", "identity", "catalog", "config", "matched_axes", "allowed_information",
             "mechanism_off_parity", "records", "negative_retention", "classification",
             "scientific_promotion_allowed", "paper_parity_claimed", "performance_claimed",
         },
@@ -561,6 +593,8 @@ def validate_result(value: object) -> None:
         or root["classification"] != "bounded_synthetic_development_smoke"
     ):
         raise ValueError("result identity mismatch")
+    identity = identity_from_payload(root["identity"])
+    require_current_identity(identity, _current_identity())
     for field in ("scientific_promotion_allowed", "paper_parity_claimed", "performance_claimed"):
         if root[field] is not False:
             raise ValueError(f"{field} must remain false")
@@ -694,6 +728,8 @@ def validate_result(value: object) -> None:
         ):
             if type(receipt[field]) is not int or receipt[field] < 0:
                 raise ValueError(f"{field} must be a nonnegative exact integer")
+        if receipt["archive_persistent_bytes"] > config.archive_byte_budget:
+            raise ValueError("archive persistent bytes exceed the frozen budget")
         if (
             receipt["timing"] is not None
             or type(receipt["timing_policy"]) is not str
@@ -709,6 +745,9 @@ def validate_result(value: object) -> None:
                 raise ValueError("mechanism-off resource reduction is invalid")
         elif receipt["mechanism_off_anchor_bytes"] != 0:
             raise ValueError("archive arms cannot retain mechanism-off anchor bytes")
+        expected_record = _run_arm(config, record["seed"], cast(Arm, record["arm"]))
+        if record != expected_record:
+            raise ValueError("deterministic arm replay or exact archive receipt mismatch")
     if observed_pairs != expected_pairs:
         raise ValueError("record matrix is incomplete")
     for seed in config.seeds:
