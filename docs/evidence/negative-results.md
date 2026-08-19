@@ -133,6 +133,35 @@ postmortem.
     6.55-6.82, so the nominal 300 dimensions were under 7. Record:
     [`V4_fingerprints.md`](../../outputs/new_directions/V4_fingerprints.md).
 
+16. **V5 is an invalid preregistered execution, not a model-side result.** Both
+    model-side controls failed, which required an abort before online scoring,
+    but the archived runner continued and emitted 216 cells. The raw JSON,
+    report, and runner remain byte-preserved; every online row is void under
+    the literal protocol, and the archived data-dependent promotion field has
+    no maintained effect. The F5c sample-floor observation is only a same-stack
+    descriptive consistency check using the same MNIST, schedules, and seeds
+    with a stronger hybrid batch estimator—not an independent replication.
+    The structural interpretation is restricted to novel permutations;
+    recurrence can replace per-pixel identification with repeat recognition.
+    Entry 15 therefore remains open. Record:
+    [`V5_model_side_amendment.v1.md`](../../outputs/new_directions/V5_model_side_amendment.v1.md).
+
+17. **V6 remains an inconclusive three-seed development observation.** The raw
+    runner checked family separation only for seed 0 before executing its 36
+    cells. An append-only audit reconstructs the deterministic schedule control
+    for all exact seeds without learner execution: M1 has 100 distinct
+    permutations and M4 exactly five for each of seeds 0, 1, and 2. A bound
+    matching-config Bayes summary supplies per-seed values `0.983350`,
+    `0.988170`, and `0.981415`; their matched mean is `0.9843116667`, making
+    Bayes minus the best M4 mean `0.2460436667`. All six registered arm gaps
+    were positive on all three consumed seeds, but that is the complete claim
+    scope. The post-hoc 7.9x grouping is not retained as causal or primary, and
+    this micro recurrence result is not IPMNIST headroom because IPMNIST has no
+    repeating permutation. Missing complete historical runtime, dependency,
+    and invocation identity keeps the result inconclusive and permanently
+    nonpromoting. Record:
+    [`V6_recurrence_headroom_amendment.v1.md`](../../outputs/new_directions/V6_recurrence_headroom_amendment.v1.md).
+
 ## Evidence and campaign closures
 
 1. **Continual-IA v1 is a valid rejection at its frozen gate.** Reward uplift
