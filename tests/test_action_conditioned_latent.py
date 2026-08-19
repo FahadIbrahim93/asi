@@ -128,6 +128,12 @@ def test_paper_registry_is_immutable() -> None:
         PINNED_RESEARCH["new"] = "mutable"  # type: ignore[index]
 
 
+def test_result_research_pins_are_deeply_immutable(lane_result) -> None:
+    assert lane_result.research_pins == tuple(sorted(PINNED_RESEARCH.items()))
+    with pytest.raises(TypeError):
+        lane_result.research_pins[0] = ("jedi_paper", "forged")  # type: ignore[index]
+
+
 @pytest.mark.parametrize(
     "kwargs",
     [

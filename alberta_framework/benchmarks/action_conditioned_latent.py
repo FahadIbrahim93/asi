@@ -57,6 +57,7 @@ PINNED_RESEARCH = MappingProxyType({
     "jepa_wm_paper": "arXiv:2512.24497v3",
     "jepa_wm_code": "13cf1d9c7e476f53c17714d2e0f1dc239a883ce0",
 })
+PINNED_RESEARCH_ITEMS = tuple(sorted(PINNED_RESEARCH.items()))
 _MAX_STEPS = 4096
 _MAX_SEEDS = 16
 _INT32_MAX = 2**31 - 1
@@ -205,7 +206,7 @@ class ActionLatentResult:
 
     schema: str
     protocol: ActionLatentProtocol
-    research_pins: dict[str, str]
+    research_pins: tuple[tuple[str, str], ...]
     arms: tuple[ActionLatentArmReceipt, ...]
     identity: DevelopmentIdentity
     development_only: bool = True
@@ -216,14 +217,7 @@ class ActionLatentResult:
             raise ValueError("unsupported action-latent schema")
         if type(self.protocol) is not ActionLatentProtocol:
             raise ValueError("protocol must be an exact ActionLatentProtocol")
-        if (
-            type(self.research_pins) is not dict
-            or any(
-                type(key) is not str or type(value) is not str
-                for key, value in self.research_pins.items()
-            )
-            or self.research_pins != PINNED_RESEARCH
-        ):
+        if self.research_pins != PINNED_RESEARCH_ITEMS:
             raise ValueError("research pins differ from the audited roster")
         if type(self.identity) is not DevelopmentIdentity:
             raise ValueError("identity must be exact")
@@ -293,7 +287,18 @@ class ActionLatentResult:
         """Return the canonical JSON-compatible receipt."""
         # Canonicalize tuples to JSON arrays now, rather than accepting two
         # subtly different in-memory encodings in the strict validator.
-        return cast(dict[str, object], json.loads(json.dumps(dataclasses.asdict(self))))
+        raw = dataclasses.asdict(self)
+        raw["research_pins"] = dict(self.research_pins)
+        return cast(dict[str, object], json.loads(json.dumps(raw)))
+
+
+def _research_pins_from_payload(value: object) -> tuple[tuple[str, str], ...]:
+    if type(value) is not dict:
+        raise ValueError("research pins must be an exact object")
+    pins = cast(dict[object, object], value)
+    if any(type(key) is not str or type(item) is not str for key, item in pins.items()):
+        raise ValueError("research pins must contain exact strings")
+    return tuple(sorted(cast(dict[str, str], pins).items()))
 
 
 def validate_action_latent_payload(payload: object) -> ActionLatentResult:
@@ -336,7 +341,7 @@ def validate_action_latent_payload(payload: object) -> ActionLatentResult:
     result = ActionLatentResult(
         schema=root["schema"],  # type: ignore[arg-type]
         protocol=protocol,
-        research_pins=cast(dict[str, str], root["research_pins"]),
+        research_pins=_research_pins_from_payload(root["research_pins"]),
         arms=tuple(arms),
         identity=identity_from_payload(root["identity"]),
         development_only=root["development_only"],  # type: ignore[arg-type]
@@ -598,7 +603,7 @@ def run_action_conditioned_latent_lane(
     return ActionLatentResult(
         schema=ACTION_LATENT_SCHEMA,
         protocol=protocol,
-        research_pins=dict(PINNED_RESEARCH),
+        research_pins=PINNED_RESEARCH_ITEMS,
         arms=tuple(receipts),
         identity=_current_identity(),
     )
