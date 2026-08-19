@@ -284,23 +284,18 @@ def compute_statistics(
     # Compute confidence interval
     try:
         from scipy import stats
-
-        if n > 1:
-            t_value = float(stats.t.ppf((1 + confidence_level) / 2, n - 1))
-            margin = t_value * sem
-            ci_lower = mean - margin
-            ci_upper = mean + margin
-        else:
-            ci_lower = ci_upper = mean
     except ImportError:
-        # Fallback without scipy: normal approximation.  Only two quantiles
-        # are wired in — 0.95 -> z=1.96; every other confidence level silently
-        # gets the 99% quantile z=2.576.  The normal approximation also
-        # understates the t-based interval width at small n.
-        z_value = 1.96 if confidence_level == 0.95 else 2.576  # 95% or 99%
-        margin = z_value * sem
+        raise ImportError(
+            "scipy is required for compute_statistics. Install with: pip install scipy"
+        )
+
+    if n > 1:
+        t_value = float(stats.t.ppf((1 + confidence_level) / 2, n - 1))
+        margin = t_value * sem
         ci_lower = mean - margin
         ci_upper = mean + margin
+    else:
+        ci_lower = ci_upper = mean
 
     return StatisticalSummary(
         mean=mean,
@@ -349,13 +344,12 @@ def compute_timeseries_statistics(
 
     try:
         from scipy import stats
-
-        t_value = stats.t.ppf((1 + confidence_level) / 2, n_seeds - 1)
     except ImportError:
-        # Same limitation as compute_statistics: 0.95 -> z=1.96, any other
-        # level silently gets the 99% quantile z=2.576.
-        t_value = 1.96 if confidence_level == 0.95 else 2.576
+        raise ImportError(
+            "scipy is required for compute_timeseries_statistics. Install with: pip install scipy"
+        )
 
+    t_value = stats.t.ppf((1 + confidence_level) / 2, n_seeds - 1)
     margin = t_value * sem
     ci_lower = mean - margin
     ci_upper = mean + margin
