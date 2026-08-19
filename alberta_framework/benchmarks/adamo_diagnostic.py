@@ -367,8 +367,14 @@ def validate_adamo_diagnostic(payload: object) -> dict[str, object]:
     runtime = result["runtime"]
     if type(runtime) is not dict or set(runtime) != {"python", "jax", "numpy", "backend"}:
         raise ValueError("invalid runtime identity")
-    if any(type(value) is not str or not value for value in runtime.values()):
-        raise ValueError("runtime identity values must be non-empty strings")
+    expected_runtime = {
+        "python": platform.python_version(),
+        "jax": jax.__version__,
+        "numpy": np.__version__,
+        "backend": jax.default_backend(),
+    }
+    if runtime != expected_runtime:
+        raise ValueError("runtime identity does not match the current runtime")
     sources = result["source"]
     if type(sources) is not dict or set(sources) != {"adapter_sha256", "runner_sha256"}:
         raise ValueError("invalid source receipt")

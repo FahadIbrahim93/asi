@@ -11,6 +11,7 @@ from alberta_framework.benchmarks.activation_feature_ipmnist import (
     ACTIVATION_FEATURE_SOURCES,
     ACTIVATION_FEATURE_SPECS,
     DEVELOPMENT_SEEDS,
+    _preflight_activation_feature_resources,
     activation_feature_result_payload,
     activation_feature_spec,
     run_activation_feature_arm,
@@ -92,6 +93,61 @@ def test_all_candidate_and_causal_arms_execute_end_to_end() -> None:
         assert np.isfinite(result.per_task_loss).all()
 
 
+def test_schedule_memory_is_bounded_before_runner_allocation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    huge = IPMNISTConfig(
+        n_tasks=2_000_000,
+        task_length=1,
+        input_dim=784,
+        hidden1=1,
+        hidden2=1,
+        n_classes=1,
+    )
+    calls = 0
+
+    def forbidden(*args: object, **kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        raise AssertionError("runner must not execute")
+
+    monkeypatch.setattr(
+        "alberta_framework.benchmarks.activation_feature_ipmnist.run_screening_config",
+        forbidden,
+    )
+    with pytest.raises(ValueError, match="schedule exceeds"):
+        run_activation_feature_arm(
+            np.zeros((1, 784), dtype=np.float32),
+            np.zeros(1, dtype=np.int32),
+            arm="aid",
+            seed=0,
+            config=huge,
+        )
+    assert calls == 0
+
+
+def test_schedule_memory_bound_has_exact_adjacent_boundary() -> None:
+    last_fit = IPMNISTConfig(
+        n_tasks=33_554_432,
+        task_length=1,
+        input_dim=1,
+        hidden1=1,
+        hidden2=1,
+        n_classes=1,
+    )
+    first_overflow = IPMNISTConfig(
+        n_tasks=33_554_433,
+        task_length=1,
+        input_dim=1,
+        hidden1=1,
+        hidden2=1,
+        n_classes=1,
+    )
+    _preflight_activation_feature_resources(last_fit)
+    with pytest.raises(ValueError, match="268435456-byte bound"):
+        _preflight_activation_feature_resources(first_overflow)
+
+
 def test_factories_are_jittable_and_aid_is_deterministic_per_seed() -> None:
     x, y = _data()
     first = run_activation_feature_arm(x, y, arm="aid", seed=7, config=SMALL)
@@ -166,6 +222,10 @@ def test_matched_validator_requires_all_arms_and_exact_comparison_axes() -> None
     drift[-1]["seed"] = 1
     with pytest.raises(ValueError, match="differs on seed"):
         validate_matched_activation_feature_results(drift)
+    identity_drift = copy.deepcopy(payloads)
+    identity_drift[-1]["execution_identity"]["dataset_sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="execution_identity"):
+        validate_matched_activation_feature_results(identity_drift)
 
 
 def test_receipt_rejects_unfrozen_seed_outcome_and_negative_retention_drift() -> None:
@@ -188,6 +248,40 @@ def test_receipt_rejects_unfrozen_seed_outcome_and_negative_retention_drift() ->
         validate_activation_feature_result(unfrozen)
 
 
+def test_receipt_rejects_config_whose_schedule_cannot_execute() -> None:
+    x, y = _data()
+    payload = activation_feature_result_payload(
+        run_activation_feature_arm(x, y, arm="aid", seed=0, config=SMALL),
+        outcome="inconclusive",
+    )
+    payload["config"] = {
+        "n_tasks": 2_000_000,
+        "task_length": 1,
+        "input_dim": 784,
+        "hidden1": 300,
+        "hidden2": 150,
+        "n_classes": 10,
+    }
+    with pytest.raises(ValueError, match="schedule exceeds"):
+        validate_activation_feature_result(payload)
+
+
+def test_receipt_rejects_forged_current_identity_and_peak_schedule_bytes() -> None:
+    x, y = _data()
+    payload = activation_feature_result_payload(
+        run_activation_feature_arm(x, y, arm="aid", seed=0, config=SMALL),
+        outcome="inconclusive",
+    )
+    forged_runtime = copy.deepcopy(payload)
+    forged_runtime["execution_identity"]["runtime"] = ["forged"] * 4
+    with pytest.raises(ValueError, match="current runtime identity"):
+        validate_activation_feature_result(forged_runtime)
+    forged_peak = copy.deepcopy(payload)
+    forged_peak["resources"]["peak_schedule_working_bytes"] = 1
+    with pytest.raises(ValueError, match="peak_schedule_working_bytes"):
+        validate_activation_feature_result(forged_peak)
+
+
 def test_receipt_revalidates_frozen_result_without_array_protocol_dispatch() -> None:
     x, y = _data()
     result = run_activation_feature_arm(x, y, arm="aid", seed=0, config=SMALL)
@@ -196,6 +290,6 @@ def test_receipt_revalidates_frozen_result_without_array_protocol_dispatch() -> 
         def __array__(self) -> np.ndarray:
             raise AssertionError("must reject before array coercion")
 
-    object.__setattr__(result, "per_task_accuracy", HostileArray())
+    object.__setattr__(result.screening, "per_task_accuracy", HostileArray())
     with pytest.raises(ValueError, match="per_task_accuracy"):
         activation_feature_result_payload(result, outcome="inconclusive")

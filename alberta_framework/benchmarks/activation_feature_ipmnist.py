@@ -10,7 +10,10 @@ nonpromoting and enumerate the remaining comparison gaps.
 from __future__ import annotations
 
 import argparse
+import dataclasses
+import hashlib
 import math
+import platform
 from collections.abc import Mapping
 from pathlib import Path
 from types import MappingProxyType
@@ -40,6 +43,7 @@ from alberta_framework.benchmarks.upgd_ipmnist import (
     _PLASTICITY_LOSS_FLOOR,
     IPMNISTConfig,
     atomic_write_new_json,
+    build_schedule,
     default_openml_data_home,
     load_mnist_train,
 )
@@ -308,11 +312,115 @@ ACTIVATION_FEATURE_SPECS: Final[Mapping[str, ScreeningSpec]] = MappingProxyType(
     {spec.name: spec for spec in _SPECS}
 )
 
+_MAX_SCHEDULE_BYTES: Final[int] = 256 * 1024 * 1024
+
 
 def activation_feature_spec(name: object) -> ScreeningSpec:
     if type(name) is not str or name not in ACTIVATION_FEATURE_SPECS:
         raise ValueError("unknown activation/feature arm")
     return ACTIVATION_FEATURE_SPECS[name]
+
+
+def _preflight_activation_feature_resources(
+    config: IPMNISTConfig, *, n_train: int | None = None
+) -> int:
+    """Reject schedules that exceed the lane's bounded persistent envelope."""
+    sampled_width = config.task_length if n_train is None else n_train
+    if type(sampled_width) is not int or sampled_width < 1:
+        raise ValueError("activation/feature training-row count must be positive")
+    # build_schedule vmaps a full n_train permutation before slicing each row.
+    schedule_scalars = config.n_tasks * (config.input_dim + sampled_width)
+    schedule_bytes = schedule_scalars * np.dtype(np.int32).itemsize
+    if schedule_bytes > _MAX_SCHEDULE_BYTES:
+        raise ValueError(
+            "activation/feature schedule exceeds its 268435456-byte bound"
+        )
+    return schedule_bytes
+
+
+def _array_bundle_sha256(data_x: np.ndarray, data_y: np.ndarray) -> str:
+    digest = hashlib.sha256(b"asi-activation-feature-dataset-v1\0")
+    for value in (data_x, data_y):
+        digest.update(np.asarray(value.shape, dtype="<i8").tobytes())
+        digest.update(value.dtype.str.encode())
+        digest.update(value.tobytes(order="C"))
+    return digest.hexdigest()
+
+
+def _schedule_sha256(permutations: Array, example_indices: Array) -> str:
+    digest = hashlib.sha256(b"asi-activation-feature-schedule-v1\0")
+    for value in (permutations, example_indices):
+        host = np.asarray(value, dtype=np.int32)
+        digest.update(np.asarray(host.shape, dtype="<i8").tobytes())
+        digest.update(host.astype("<i4", copy=False).tobytes(order="C"))
+    return digest.hexdigest()
+
+
+def _runtime_identity() -> tuple[str, str, str, str]:
+    return (platform.python_version(), jax.__version__, np.__version__, jax.default_backend())
+
+
+def _current_source_identity() -> tuple[str, str, str]:
+    names = ("activation_feature_ipmnist.py", "ipmnist_screening.py", "upgd_ipmnist.py")
+    digests = tuple(
+        hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
+        for name in names
+    )
+    return digests[0], digests[1], digests[2]
+
+
+def _host_array(value: object, *, name: str, dtype: np.dtype[Any]) -> np.ndarray:
+    actual_type = type(value)
+    if actual_type is not np.ndarray and not issubclass(actual_type, jax.Array):
+        raise TypeError(f"{name} must be an exact NumPy or JAX array")
+    return np.asarray(value, dtype=dtype)
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class ActivationFeatureRunResult:
+    screening: ScreeningRunResult
+    dataset_sha256: str
+    schedule_sha256: str
+    source_identity: tuple[str, str, str]
+    runtime_identity: tuple[str, str, str, str]
+    n_train: int
+    peak_schedule_working_bytes: int
+
+    @property
+    def config_name(self) -> str:
+        return self.screening.config_name
+
+    @property
+    def hyperparameters(self) -> dict[str, float]:
+        return self.screening.hyperparameters
+
+    @property
+    def seed(self) -> int:
+        return self.screening.seed
+
+    @property
+    def config(self) -> IPMNISTConfig:
+        return self.screening.config
+
+    @property
+    def per_task_accuracy(self) -> np.ndarray:
+        return self.screening.per_task_accuracy
+
+    @property
+    def per_task_loss(self) -> np.ndarray:
+        return self.screening.per_task_loss
+
+    @property
+    def per_task_plasticity(self) -> np.ndarray:
+        return self.screening.per_task_plasticity
+
+    @property
+    def wall_clock_seconds(self) -> float:
+        return self.screening.wall_clock_seconds
+
+    @property
+    def noise_mode(self) -> str:
+        return self.screening.noise_mode
 
 
 def run_activation_feature_arm(
@@ -322,14 +430,40 @@ def run_activation_feature_arm(
     arm: str,
     seed: int,
     config: IPMNISTConfig,
-) -> ScreeningRunResult:
+) -> ActivationFeatureRunResult:
     """Execute one arm using the current screening runner and its schedule."""
+    _preflight_activation_feature_resources(config)
     observations = config.n_tasks * config.task_length
     if observations > _MAX_STEPS:
         raise ValueError("activation/feature lane exceeds its 2000000-step bound")
+    if type(seed) is not int or not 0 <= seed <= 2**32 - 1:
+        raise ValueError("seed must be an exact uint32 value")
     if arm.startswith("deep_fourier") and (config.hidden1 % 2 or config.hidden2 % 2):
         raise ValueError("Deep Fourier arms require even hidden widths")
-    return run_screening_config(data_x, data_y, activation_feature_spec(arm), seed, config)
+    host_x = _host_array(data_x, name="data_x", dtype=np.dtype(np.float32))
+    host_y = _host_array(data_y, name="data_y", dtype=np.dtype(np.int32))
+    if host_x.ndim != 2 or host_y.ndim != 1 or host_x.shape[0] != host_y.shape[0]:
+        raise ValueError("activation/feature data must be matched rank-2/rank-1 arrays")
+    peak_schedule_bytes = _preflight_activation_feature_resources(
+        config, n_train=int(host_x.shape[0])
+    )
+    root = jr.key(np.uint32(seed))
+    _, key_schedule, _ = jr.split(root, 3)
+    schedule = build_schedule(key_schedule, config, int(host_x.shape[0]))
+    screening = run_screening_config(
+        host_x, host_y, activation_feature_spec(arm), seed, config
+    )
+    return ActivationFeatureRunResult(
+        screening=screening,
+        dataset_sha256=_array_bundle_sha256(host_x, host_y),
+        schedule_sha256=_schedule_sha256(
+            schedule.permutations, schedule.example_indices
+        ),
+        source_identity=_current_source_identity(),
+        runtime_identity=_runtime_identity(),
+        n_train=int(host_x.shape[0]),
+        peak_schedule_working_bytes=peak_schedule_bytes,
+    )
 
 
 _TOP_FIELDS = frozenset(
@@ -338,6 +472,7 @@ _TOP_FIELDS = frozenset(
         "comparison_id",
         "arm",
         "source",
+        "execution_identity",
         "seed",
         "development_seed_protocol",
         "config",
@@ -370,6 +505,7 @@ _RESOURCE_FIELDS = frozenset(
         "sigmoid_evaluations",
         "trigonometric_evaluations",
         "persistent_numeric_bytes",
+        "peak_schedule_working_bytes",
         "timing_seconds",
         "timing_is_telemetry_only",
     }
@@ -395,11 +531,13 @@ def _parameter_counts(config: IPMNISTConfig, arm: str) -> tuple[int, int]:
 
 
 def activation_feature_result_payload(
-    result: ScreeningRunResult, *, outcome: str
+    result: ActivationFeatureRunResult, *, outcome: str
 ) -> dict[str, object]:
     """Build and validate the strict nonpromotion/resource receipt."""
-    if type(result) is not ScreeningRunResult:
-        raise ValueError("result must be an exact ScreeningRunResult")
+    if type(result) is not ActivationFeatureRunResult:
+        raise ValueError("result must be an exact ActivationFeatureRunResult")
+    if type(result.screening) is not ScreeningRunResult:
+        raise ValueError("screening result must be exact")
     if type(result.config_name) is not str:
         raise ValueError("result config_name must be an exact string")
     spec = activation_feature_spec(result.config_name)
@@ -485,6 +623,13 @@ def activation_feature_result_payload(
         "comparison_id": COMPARISON_ID,
         "arm": result.config_name,
         "source": dict(ACTIVATION_FEATURE_SOURCES[family]),
+        "execution_identity": {
+            "dataset_sha256": result.dataset_sha256,
+            "schedule_sha256": result.schedule_sha256,
+            "source_sha256": list(result.source_identity),
+            "runtime": list(result.runtime_identity),
+            "n_train": result.n_train,
+        },
         "seed": result.seed,
         "development_seed_protocol": list(DEVELOPMENT_SEEDS),
         "config": {
@@ -518,6 +663,7 @@ def activation_feature_result_payload(
             "sigmoid_evaluations": sigmoid_evaluations,
             "trigonometric_evaluations": trig_evaluations,
             "persistent_numeric_bytes": 4 * (allocated + 2 * config.input_dim + 1),
+            "peak_schedule_working_bytes": result.peak_schedule_working_bytes,
             "timing_seconds": float(result.wall_clock_seconds),
             "timing_is_telemetry_only": True,
         },
@@ -570,6 +716,46 @@ def validate_activation_feature_result(payload: object) -> dict[str, object]:
             raise ValueError(f"config {name} must be a bounded exact integer")
     if cast(int, config["n_tasks"]) * cast(int, config["task_length"]) > _MAX_STEPS:
         raise ValueError("config step product exceeds bound")
+    try:
+        validated_config = IPMNISTConfig(
+            n_tasks=cast(int, config["n_tasks"]),
+            task_length=cast(int, config["task_length"]),
+            input_dim=cast(int, config["input_dim"]),
+            hidden1=cast(int, config["hidden1"]),
+            hidden2=cast(int, config["hidden2"]),
+            n_classes=cast(int, config["n_classes"]),
+        )
+    except ValueError as error:
+        raise ValueError("config violates the executable IPMNIST bounds") from error
+    _preflight_activation_feature_resources(validated_config)
+    identity = _exact_dict(
+        root["execution_identity"],
+        frozenset(
+            {"dataset_sha256", "schedule_sha256", "source_sha256", "runtime", "n_train"}
+        ),
+        "execution_identity",
+    )
+    for name in ("dataset_sha256", "schedule_sha256"):
+        value = identity[name]
+        if (
+            type(value) is not str
+            or len(value) != 64
+            or any(character not in "0123456789abcdef" for character in value)
+        ):
+            raise ValueError(f"{name} must be a lowercase SHA-256 digest")
+    if identity["source_sha256"] != list(_current_source_identity()):
+        raise ValueError("current runner/source identity drift")
+    if identity["runtime"] != list(_runtime_identity()):
+        raise ValueError("current runtime identity drift")
+    n_train_value = identity["n_train"]
+    if (
+        type(n_train_value) is not int
+        or not validated_config.task_length <= n_train_value <= _MAX_STEPS
+    ):
+        raise ValueError("n_train must be an exact bounded dataset row count")
+    peak_schedule_bytes = _preflight_activation_feature_resources(
+        validated_config, n_train=n_train_value
+    )
     hp = _exact_dict(root["hyperparameters"], frozenset(spec.hyperparameters), "hyperparameters")
     for name, expected in spec.hyperparameters.items():
         value = hp[name]
@@ -658,6 +844,7 @@ def validate_activation_feature_result(payload: object) -> dict[str, object]:
         "sigmoid_evaluations": sigmoid_evaluations,
         "trigonometric_evaluations": trig_evaluations,
         "persistent_numeric_bytes": 4 * (allocated + 2 * input_dim + 1),
+        "peak_schedule_working_bytes": peak_schedule_bytes,
     }
     for name, expected in expected_resources.items():
         if resources[name] != expected:
@@ -701,6 +888,7 @@ def validate_matched_activation_feature_results(payloads: object) -> list[dict[s
             "seed",
             "development_seed_protocol",
             "config",
+            "execution_identity",
             "allowed_boundary_information",
             "allowed_task_information",
         ):
@@ -737,6 +925,7 @@ def main(argv: list[str] | None = None) -> int:
     """Run one fresh development shard; benchmark work never runs in pytest."""
     args = _parser().parse_args(argv)
     config = IPMNISTConfig(n_tasks=args.tasks, task_length=args.task_length)
+    _preflight_activation_feature_resources(config)
     x, y = load_mnist_train(args.data_home)
     result = run_activation_feature_arm(x, y, arm=args.arm, seed=args.seed, config=config)
     payload = activation_feature_result_payload(result, outcome="inconclusive")

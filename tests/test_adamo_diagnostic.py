@@ -76,6 +76,9 @@ def test_inert_reduction_includes_curves_params_state_and_jacobian(
             jacobian_mean_singular_value=float("nan")), "finite"),
         (lambda value: value["arms"][1]["post_task_diagnostics"][0].update(
             parameter_sha256="0" * 64), "does not reduce"),
+        (lambda value: value.update(runtime={
+            "python": "forged", "jax": "forged", "numpy": "forged", "backend": "forged"
+        }), "current runtime"),
     ],
 )
 def test_hostile_receipts_fail_closed(
