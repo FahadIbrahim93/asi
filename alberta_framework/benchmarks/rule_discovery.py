@@ -868,17 +868,128 @@ def _require_unique_task_names(task_names: Sequence[str], *, name: str) -> tuple
     return names
 
 
-# Search ints feed allocations and `range(generations)`. Unbounded 10**12
-# values hang / OOM the micro-suite screen.
-_SEARCH_INT_MAX: int = 2**31 - 1
-
-
 def _require_search_int(name: str, value: object, *, minimum: int) -> int:
     if type(name) is not str:
         raise ValueError("name must be an exact string")
-    if type(value) is not int or value < minimum or value > _SEARCH_INT_MAX:
+    if type(value) is not int or value < minimum:
         raise ValueError(f"{name} must be an integer >= {minimum}")
     return value
+
+
+# Counts the actual candidate/online-step product rather than accepting any
+# value that merely fits an integer dtype. The gauss search defaults consume
+# about 2.01e9 candidate-steps; this ceiling permits a little over 2x that
+# development workload while failing closed before JAX allocation or loops.
+_MAX_SEARCH_CANDIDATE_STEPS = 4_500_000_000
+_MAX_SEARCH_GENOME_WORKING_BYTES = 512 * 1024**2
+_N_SEEDED_GENOMES = 19
+_BASELINE_TUNING_N_RANDOM = 256
+_BASELINE_TUNING_GENERATIONS = 4
+_BASELINE_TUNING_CHILDREN = 64
+_BASELINE_TUNING_CANDIDATES = (
+    1
+    + _BASELINE_TUNING_N_RANDOM
+    + _BASELINE_TUNING_GENERATIONS * _BASELINE_TUNING_CHILDREN
+)
+
+
+def _search_stream_steps(config: EvalConfig, *, name: str) -> int:
+    if type(config) is MicroTaskConfig:
+        return config.n_tasks * config.task_length
+    if type(config) is MicroStreamConfig:
+        return config.n_regimes * config.regime_length
+    raise ValueError(f"{name} must select an exact micro-suite configuration")
+
+
+def _preflight_search_resources(
+    *,
+    n_random: int,
+    population: int,
+    generations: int,
+    elite: int,
+    top_k: int,
+    eval_seed_count: int,
+    holdout_seed_count: int,
+    task_names: tuple[str, ...],
+    holdout_names: tuple[str, ...],
+    registry: Mapping[str, EvalConfig],
+) -> None:
+    """Bound aggregate search work and named genome storage before execution."""
+    initial_candidates = max(n_random, _N_SEEDED_GENOMES)
+    if population > initial_candidates:
+        raise ValueError("population must not exceed the initial candidate count")
+    if elite > population:
+        raise ValueError("elite must not exceed population")
+    if generations > 0 and elite == population:
+        raise ValueError("elite must be smaller than population when generations > 0")
+
+    children_per_generation = population - elite
+    search_candidates = initial_candidates + generations * children_per_generation
+    archive_candidates = search_candidates + _BASELINE_TUNING_CANDIDATES
+    holdout_candidates = 2 + min(top_k, archive_candidates)
+
+    try:
+        search_steps = sum(
+            _search_stream_steps(registry[name], name=name) for name in task_names
+        )
+        holdout_steps = sum(
+            _search_stream_steps(registry[name], name=name) for name in holdout_names
+        )
+    except KeyError as exc:
+        raise ValueError("search task name is absent from the selected suite") from exc
+
+    candidate_steps = (
+        (search_candidates + _BASELINE_TUNING_CANDIDATES)
+        * search_steps
+        * eval_seed_count
+        + holdout_candidates * holdout_steps * holdout_seed_count
+    )
+    if candidate_steps > _MAX_SEARCH_CANDIDATE_STEPS:
+        raise ValueError(
+            "rule-discovery candidate-step budget exceeds the development limit"
+        )
+
+    # Named float32 genome leaves at the archive/ranking barrier: retained
+    # per-candidate archive rows, the stacked archive, initial pool, current
+    # population, and holdout pool. Python/JAX allocator overhead is excluded.
+    named_genomes = (
+        2 * archive_candidates
+        + initial_candidates
+        + population
+        + holdout_candidates
+    )
+    genome_working_bytes = named_genomes * GENOME_SIZE * 4
+    if genome_working_bytes > _MAX_SEARCH_GENOME_WORKING_BYTES:
+        raise ValueError(
+            "rule-discovery named genome working set exceeds the development limit"
+        )
+
+
+def _preflight_tuning_resources(
+    *,
+    n_random: int,
+    generations: int,
+    children: int,
+    task_names: tuple[str, ...],
+    eval_seed_count: int,
+    suite: Mapping[str, EvalConfig],
+) -> None:
+    candidates = 1 + n_random + generations * children
+    try:
+        stream_steps = sum(
+            _search_stream_steps(suite[name], name=name) for name in task_names
+        )
+    except KeyError as exc:
+        raise ValueError("tuning task name is absent from the selected suite") from exc
+    if candidates * stream_steps * eval_seed_count > _MAX_SEARCH_CANDIDATE_STEPS:
+        raise ValueError(
+            "rule-discovery candidate-step budget exceeds the development limit"
+        )
+    named_genome_bytes = (2 * candidates + 1) * GENOME_SIZE * 4
+    if named_genome_bytes > _MAX_SEARCH_GENOME_WORKING_BYTES:
+        raise ValueError(
+            "rule-discovery named genome working set exceeds the development limit"
+        )
 
 
 def evaluate_suite(
@@ -1004,9 +1115,9 @@ def tune_champion_baseline(
     eval_seeds: Sequence[int],
     batch_size: int,
     suite: Mapping[str, EvalConfig],
-    n_random: int = 256,
-    generations: int = 4,
-    children: int = 64,
+    n_random: int = _BASELINE_TUNING_N_RANDOM,
+    generations: int = _BASELINE_TUNING_GENERATIONS,
+    children: int = _BASELINE_TUNING_CHILDREN,
 ) -> tuple[np.ndarray, float, list[tuple[np.ndarray, float]]]:
     """Tune the champion STRUCTURE's continuous constants at micro scale.
 
@@ -1022,6 +1133,16 @@ def tune_champion_baseline(
     n_random = _require_search_int("n_random", n_random, minimum=0)
     generations = _require_search_int("generations", generations, minimum=0)
     children = _require_search_int("children", children, minimum=1)
+    task_names = _require_unique_task_names(task_names, name="task_names")
+    eval_seeds = require_unique_jax_seeds(eval_seeds, name="eval_seeds")
+    _preflight_tuning_resources(
+        n_random=n_random,
+        generations=generations,
+        children=children,
+        task_names=task_names,
+        eval_seed_count=len(eval_seeds),
+        suite=suite,
+    )
     champion = champion_form_genome()
     flags = jnp.asarray(champion[:_N_FLAGS])
 
@@ -1102,12 +1223,26 @@ def run_search(
     if set(eval_seeds) & set(holdout_seeds):
         raise ValueError("search seeds and holdout seeds must be disjoint")
     registry = dict(MICRO_SUITE if suite is None else suite)
+    _preflight_search_resources(
+        n_random=n_random,
+        population=population,
+        generations=generations,
+        elite=elite,
+        top_k=top_k,
+        eval_seed_count=len(eval_seeds),
+        holdout_seed_count=len(holdout_seeds),
+        task_names=task_names,
+        holdout_names=holdout_names,
+        registry=registry,
+    )
     started = time.monotonic()
     root = jr.key(np.uint32(search_seed))
     key_random, key_evolve, key_baseline = jr.split(root, 3)
 
     seeds_block = seed_genomes()
     n_seeded = int(seeds_block.shape[0])
+    if n_seeded != _N_SEEDED_GENOMES:
+        raise RuntimeError("seed genome count drifted from search resource accounting")
     randoms = random_genomes(key_random, max(n_random - n_seeded, 0))
     pool = jnp.concatenate([seeds_block, randoms], axis=0)
     logger.info(

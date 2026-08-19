@@ -453,6 +453,64 @@ def test_run_search_rejects_invalid_search_identities_before_genome_generation(
         run_search(**payload)  # type: ignore[arg-type]
 
 
+@pytest.mark.parametrize(
+    ("override", "match"),
+    [
+        ({"n_random": 10**12}, "candidate-step budget"),
+        ({"population": 20, "n_random": 19}, "initial candidate count"),
+        ({"population": 2, "elite": 3}, "elite must not exceed population"),
+        (
+            {"population": 2, "elite": 2, "generations": 1},
+            "elite must be smaller than population",
+        ),
+    ],
+)
+def test_run_search_preflights_aggregate_resources_before_genome_generation(
+    monkeypatch: pytest.MonkeyPatch,
+    override: dict[str, int],
+    match: str,
+) -> None:
+    def unexpected_generation(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise AssertionError("invalid search resources reached genome generation")
+
+    monkeypatch.setattr(rule_discovery, "seed_genomes", unexpected_generation)
+    monkeypatch.setattr(rule_discovery, "random_genomes", unexpected_generation)
+    payload = {
+        "n_random": 19,
+        "population": 2,
+        "generations": 0,
+        "elite": 1,
+        "eval_seeds": (0,),
+        "holdout_seeds": (101,),
+        "top_k": 1,
+        "batch_size": 2,
+        **override,
+    }
+    with pytest.raises(ValueError, match=match):
+        run_search(**payload)
+
+
+def test_search_preflight_counts_named_genome_working_set() -> None:
+    tiny_suite = {
+        "M1": dataclasses.replace(MICRO_SUITE["M1"], n_tasks=1, task_length=1),
+        "M1p": dataclasses.replace(MICRO_SUITE["M1p"], n_tasks=1, task_length=1),
+    }
+    with pytest.raises(ValueError, match="named genome working set"):
+        rule_discovery._preflight_search_resources(
+            n_random=3_000_000,
+            population=1,
+            generations=0,
+            elite=1,
+            top_k=1,
+            eval_seed_count=1,
+            holdout_seed_count=1,
+            task_names=("M1",),
+            holdout_names=("M1p",),
+            registry=tiny_suite,
+        )
+
+
 @pytest.mark.parametrize("n_tasks", [True, 0, -1, 1.5])
 def test_resolved_suite_rejects_invalid_n_tasks_identities(n_tasks: object) -> None:
     with pytest.raises(ValueError, match="n_tasks"):
@@ -492,6 +550,25 @@ def test_tune_champion_baseline_rejects_invalid_search_identities(
             batch_size=2,
             suite=MICRO_SUITE,
             **kwargs,  # type: ignore[arg-type]
+        )
+
+
+def test_tune_champion_baseline_preflights_aggregate_work_before_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unexpected_generation(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise AssertionError("invalid tuning resources reached genome generation")
+
+    monkeypatch.setattr(rule_discovery, "random_genomes", unexpected_generation)
+    with pytest.raises(ValueError, match="candidate-step budget"):
+        tune_champion_baseline(
+            jr.key(0),
+            task_names=("M1",),
+            eval_seeds=(0,),
+            batch_size=2,
+            suite=MICRO_SUITE,
+            n_random=10**12,
         )
 
 
