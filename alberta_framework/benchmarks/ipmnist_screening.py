@@ -169,6 +169,16 @@ from alberta_framework.benchmarks.cchain_ipmnist import (
     cchain_hyperparameters,
     make_cchain_learner,
 )
+from alberta_framework.benchmarks.noise_curvature_ipmnist import (
+    PAPER_REVISION as NOISE_CURVATURE_PAPER_REVISION,
+)
+from alberta_framework.benchmarks.noise_curvature_ipmnist import (
+    NoiseCurvatureConfig,
+    NoiseCurvatureState,
+    init_noise_curvature_state,
+    noise_curvature_persistent_bytes,
+    noise_curvature_step,
+)
 from alberta_framework.benchmarks.replay_frozen_ipmnist import (
     PROL_COMMIT,
     PROL_PAPER_REVISION,
@@ -182,16 +192,6 @@ from alberta_framework.benchmarks.replay_frozen_ipmnist import (
     make_frozen_feature_learner,
     make_replay_context_learner,
     replay_hyperparameters,
-)
-from alberta_framework.benchmarks.noise_curvature_ipmnist import (
-    PAPER_REVISION as NOISE_CURVATURE_PAPER_REVISION,
-)
-from alberta_framework.benchmarks.noise_curvature_ipmnist import (
-    NoiseCurvatureConfig,
-    NoiseCurvatureState,
-    init_noise_curvature_state,
-    noise_curvature_persistent_bytes,
-    noise_curvature_step,
 )
 from alberta_framework.benchmarks.upgd_ipmnist import (
     _PLASTICITY_LOSS_FLOOR,
@@ -8275,7 +8275,7 @@ def _build_registry() -> dict[str, ScreeningSpec]:
                 ),
             )
         )
-    for name, method, mechanism, description in (
+    for name, method, mechanism_value, description in (
         (
             "randumb_random_features",
             0.0,
@@ -8307,7 +8307,7 @@ def _build_registry() -> dict[str, ScreeningSpec]:
                 base_learner="upgd_w",
                 mechanism="frozen_feature_ceiling",
                 hyperparameters=frozen_hyperparameters(
-                    method=method, mechanism=mechanism
+                    method=method, mechanism=mechanism_value
                 ),
                 factory=make_frozen_feature_learner,
                 frozen_probe_input=_rff_frozen_probe_input,
