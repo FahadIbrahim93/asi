@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+from collections.abc import Mapping
 from pathlib import Path
 
 import jax
@@ -16,6 +17,7 @@ from alberta_framework.benchmarks.plasticity_diagnostics import (
     INPUT_DIM,
     OFFICIAL_CODE_COMMIT,
     PAPER_REVISION,
+    PROFILES,
     costly_lane_gates,
     main,
     require_costly_lane,
@@ -75,9 +77,13 @@ def test_exact_resource_receipts_and_validator_reject_forgery() -> None:
     for arm in result.arms:
         assert arm.receipt.data_steps == 8
         assert arm.receipt.data_bytes_read == 8 * (INPUT_DIM * 4 + 4)
-        assert arm.receipt.model_queries == 16
+        assert arm.receipt.training_model_queries == 16
+        assert arm.receipt.diagnostic_model_queries == 8
+        assert arm.receipt.model_queries == 24
         assert arm.receipt.parameter_updates == 8
-        assert arm.receipt.persistent_bytes > 0
+        assert arm.receipt.logical_forward_macs == 24 * (INPUT_DIM * 8 + 8 * 8 + 8 * 10)
+        assert arm.receipt.logical_gradient_macs == 16 * (INPUT_DIM * 8 + 8 * 8 + 8 * 10)
+        assert arm.receipt.persistent_bytes == 25_904
         assert arm.receipt.timing_telemetry_only
     forged_receipt = dataclasses.replace(result.arms[0].receipt, model_queries=8)
     forged = dataclasses.replace(
@@ -88,6 +94,23 @@ def test_exact_resource_receipts_and_validator_reject_forgery() -> None:
         validate_result(forged)
     with pytest.raises(ValueError, match="exact DiagnosticResult"):
         validate_result(dataclasses.asdict(result))
+
+
+def test_profiles_are_immutable_and_result_binds_the_complete_profile() -> None:
+    assert isinstance(PROFILES, Mapping)
+    with pytest.raises(TypeError):
+        PROFILES["contract-smoke"] = dataclasses.replace(  # type: ignore[index]
+            PROFILES["contract-smoke"], n_tasks=3
+        )
+    result = run_diagnostic(*_fixture(), seed=FROZEN_SEEDS[0])
+    assert result.profile == PROFILES[result.profile_id]
+    with pytest.raises(ValueError, match="profile payload"):
+        validate_result(
+            dataclasses.replace(
+                result,
+                profile=dataclasses.replace(result.profile, maturity_threshold=3),
+            )
+        )
 
 
 def test_random_label_and_privileged_task_claims_fail_closed() -> None:

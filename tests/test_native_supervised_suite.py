@@ -40,6 +40,10 @@ def test_all_catalog_lanes_construct_and_run_end_to_end(benchmark_id: str) -> No
     assert tuple(arm.arm_id for arm in result.arms) == ARM_IDS
     assert result.development_only and not result.scientific_promotion_allowed
     assert result.negative_results_must_be_retained and not result.task_information_used_by_learner
+    assert len(result.dataset_sha256) == 64
+    assert len(result.schedule_sha256) == 64
+    assert len(result.source_sha256) == 64
+    assert len(result.runtime_identity) == 4
     for arm in result.arms:
         assert arm.receipt.data_steps == len(arm.task_accuracies) * 2
         assert arm.receipt.data_bytes_read > 0
@@ -58,6 +62,34 @@ def test_stream_is_deterministic_and_task_information_is_not_in_examples() -> No
         np.testing.assert_array_equal(left.inputs, right.inputs)
         np.testing.assert_array_equal(left.labels, right.labels)
         assert left.inputs.shape[1] == 16
+
+
+def test_result_binds_dataset_schedule_source_and_runtime_identities() -> None:
+    images, labels = _fixture(10, (4, 4))
+    first = run_native_suite(
+        "split_mnist", images, labels, seed=FROZEN_SEEDS[0], examples_per_task=2
+    )
+    replay = run_native_suite(
+        "split_mnist", images, labels, seed=FROZEN_SEEDS[0], examples_per_task=2
+    )
+    other_seed = run_native_suite(
+        "split_mnist", images, labels, seed=FROZEN_SEEDS[1], examples_per_task=2
+    )
+    changed_images = images.copy()
+    changed_images[0, 0, 0] += np.float32(0.25)
+    other_data = run_native_suite(
+        "split_mnist", changed_images, labels, seed=FROZEN_SEEDS[0], examples_per_task=2
+    )
+    assert first.dataset_sha256 == replay.dataset_sha256 == other_seed.dataset_sha256
+    assert first.schedule_sha256 == replay.schedule_sha256
+    assert first.schedule_sha256 != other_seed.schedule_sha256
+    assert first.dataset_sha256 != other_data.dataset_sha256
+    with pytest.raises(ValueError, match="source identity"):
+        validate_result(dataclasses.replace(first, source_sha256="0" * 64))
+    with pytest.raises(ValueError, match="runtime identity"):
+        validate_result(
+            dataclasses.replace(first, runtime_identity=("forged", *first.runtime_identity[1:]))
+        )
 
 
 def test_replay_and_mechanism_off_have_exact_causal_receipts() -> None:
