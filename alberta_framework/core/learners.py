@@ -565,6 +565,7 @@ def run_learning_loop[StreamStateT](
             the documented protocol ceiling (``10_000``)
     """
     num_steps = _require_learning_loop_steps("num_steps", num_steps)
+    _preflight_float32_resources("learning loop scan result", num_steps * 4)
     # Validate tracking configs
     if step_size_tracking is not None:
         if step_size_tracking.interval < 1:
@@ -1719,6 +1720,7 @@ def run_mlp_learning_loop[StreamStateT](
             exceeds the documented protocol ceiling (``10_000``)
     """
     num_steps = _require_learning_loop_steps("num_steps", num_steps)
+    _preflight_float32_resources("MLP learning loop scan result", num_steps * 4)
     # Validate tracking config
     if normalizer_tracking is not None:
         if normalizer_tracking.interval < 1:
@@ -2325,6 +2327,7 @@ def run_td_learning_loop[StreamStateT](
         mean_eligibility_trace]
     """
     num_steps = _require_learning_loop_steps("num_steps", num_steps)
+    _preflight_float32_resources("TD learning loop scan result", num_steps * 4)
     # Initialize states
     if learner_state is None:
         learner_state = learner.init(stream.feature_dim)
@@ -2363,6 +2366,7 @@ def run_true_online_td_loop[StreamStateT](
 ) -> tuple[TrueOnlineTDState, Array]:
     """Run True Online TD(lambda) over a TD stream with ``jax.lax.scan``."""
     num_steps = _require_learning_loop_steps("num_steps", num_steps)
+    _preflight_float32_resources("true online TD learning loop scan result", num_steps * 4)
     if learner_state is None:
         learner_state = learner.init(stream.feature_dim)
     stream_state = stream.init(key)

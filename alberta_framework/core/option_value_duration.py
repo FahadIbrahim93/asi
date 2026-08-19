@@ -597,6 +597,9 @@ def run_option_value_duration_from_arrays(
     num_steps = _require_option_duration_scan_steps(
         "num_steps", observations.shape[0]
     )
+    output_scalars = num_steps * (4 * learner.n_options + 3)
+    if output_scalars > _INT32_MAX or 4 * output_scalars > _INT32_MAX:
+        raise ValueError("option value duration scan result bytes must fit signed int32")
     next_observations = learner._require_array(
         "next_observations",
         next_observations,
