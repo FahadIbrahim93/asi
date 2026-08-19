@@ -17,6 +17,7 @@ import platform
 import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
+from types import MappingProxyType
 from typing import NamedTuple, SupportsIndex, cast
 
 import jax
@@ -69,12 +70,12 @@ class DiagnosticProfile:
             raise ValueError("replacement_rate must not exceed one")
 
 
-PROFILES: Mapping[str, DiagnosticProfile] = {
+PROFILES: Mapping[str, DiagnosticProfile] = MappingProxyType({
     "contract-smoke": DiagnosticProfile("contract-smoke", 2, 4, 8, 0.003, 0.25, 2),
     "bounded-development": DiagnosticProfile(
         "bounded-development", 8, 64, 64, 0.003, 0.0001, 100
     ),
-}
+})
 
 
 class MLPState(NamedTuple):
@@ -218,9 +219,13 @@ def _step(
 class ResourceReceipt:
     data_steps: int
     data_bytes_read: int
+    training_model_queries: int
+    diagnostic_model_queries: int
     model_queries: int
     parameter_updates: int
     replacements: int
+    logical_forward_macs: int
+    logical_gradient_macs: int
     persistent_bytes: int
     elapsed_ns: int
     timing_telemetry_only: bool = True
@@ -286,6 +291,7 @@ class DiagnosticResult:
     paper_revision: str
     official_code_commit: str
     profile_id: str
+    profile: DiagnosticProfile
     seed: int
     dataset_sha256: str
     source_sha256: str
@@ -314,6 +320,8 @@ class DiagnosticResult:
             raise ValueError("official code revision drift")
         if type(self.profile_id) is not str or self.profile_id not in PROFILES:
             raise ValueError("profile or frozen seed drift")
+        if type(self.profile) is not DiagnosticProfile or self.profile != PROFILES[self.profile_id]:
+            raise ValueError("profile payload differs from the immutable registry")
         if type(self.seed) is not int or self.seed not in FROZEN_SEEDS:
             raise ValueError("profile or frozen seed drift")
         if (
@@ -459,7 +467,15 @@ def _run_arm(
         ranks.append(_effective_rank(host2))
     elapsed = time.perf_counter_ns() - start
     steps = profile.n_tasks * profile.examples_per_task
-    state_bytes = sum(np.asarray(leaf).nbytes for leaf in jax.tree.leaves(state)) + 8
+    training_queries = steps * 2
+    diagnostic_queries = steps
+    model_queries = training_queries + diagnostic_queries
+    forward_macs = (
+        INPUT_DIM * profile.hidden_width
+        + profile.hidden_width * profile.hidden_width
+        + profile.hidden_width * N_CLASSES
+    )
+    state_bytes = sum(np.asarray(leaf).nbytes for leaf in jax.tree.leaves(state))
     return ArmResult(
         arm_id,
         tuple(accuracies),
@@ -470,9 +486,13 @@ def _run_arm(
         ResourceReceipt(
             data_steps=steps,
             data_bytes_read=steps * (INPUT_DIM * 4 + 4),
-            model_queries=steps * 2,
+            training_model_queries=training_queries,
+            diagnostic_model_queries=diagnostic_queries,
+            model_queries=model_queries,
             parameter_updates=steps,
             replacements=replacements,
+            logical_forward_macs=model_queries * forward_macs,
+            logical_gradient_macs=training_queries * forward_macs,
             persistent_bytes=state_bytes,
             elapsed_ns=elapsed,
         ),
@@ -496,6 +516,7 @@ def run_diagnostic(
         PAPER_REVISION,
         OFFICIAL_CODE_COMMIT,
         profile.profile_id,
+        profile,
         seed,
         _dataset_sha(data, targets),
         hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
@@ -524,13 +545,25 @@ def validate_result(value: object) -> DiagnosticResult:
         receipt = arm.receipt
         expected_persistent = sum(
             array.nbytes for array in jax.tree.leaves(_init_state(jr.key(0), profile.hidden_width))
-        ) + 8
+        )
+        training_queries = expected_steps * 2
+        diagnostic_queries = expected_steps
+        model_queries = training_queries + diagnostic_queries
+        forward_macs = (
+            INPUT_DIM * profile.hidden_width
+            + profile.hidden_width * profile.hidden_width
+            + profile.hidden_width * N_CLASSES
+        )
         if (
             len(arm.task_accuracy) != profile.n_tasks
             or receipt.data_steps != expected_steps
             or receipt.data_bytes_read != expected_steps * (INPUT_DIM * 4 + 4)
-            or receipt.model_queries != expected_steps * 2
+            or receipt.training_model_queries != training_queries
+            or receipt.diagnostic_model_queries != diagnostic_queries
+            or receipt.model_queries != model_queries
             or receipt.parameter_updates != expected_steps
+            or receipt.logical_forward_macs != model_queries * forward_macs
+            or receipt.logical_gradient_macs != training_queries * forward_macs
             or receipt.persistent_bytes != expected_persistent
             or not 0 <= receipt.replacements <= expected_steps * 2
         ):

@@ -9,10 +9,13 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import hashlib
 import json
 import math
 import operator
+import platform
 import time
+from pathlib import Path
 from typing import SupportsIndex, cast
 
 import jax
@@ -28,6 +31,24 @@ ARM_IDS = ("online_sgd", "replay_sgd", "running_centroid", "frozen_no_learning")
 MAX_EXAMPLES_PER_TASK = 64
 MAX_INPUT_DIM = 4096
 ROTATIONS = (0, 45, 90, 135, 180)
+
+
+def _digest(value: object, name: str) -> str:
+    if (
+        type(value) is not str
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ValueError(f"{name} must be a lowercase SHA-256 digest")
+    return value
+
+
+def _source_sha256() -> str:
+    return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+
+
+def _runtime_identity() -> tuple[str, str, str, str]:
+    return (platform.python_version(), jax.__version__, np.__version__, jax.default_backend())
 
 
 def _exact_int(value: object, name: str, low: int, high: int) -> int:
@@ -131,6 +152,30 @@ def _validated_arrays(
     if np.any(labels < 0) or np.any(labels >= n_classes):
         raise ValueError("labels lie outside the benchmark class range")
     return images, labels
+
+
+def _dataset_sha256(images: np.ndarray, labels: np.ndarray) -> str:
+    digest = hashlib.sha256()
+    digest.update(b"asi-native-supervised-caller-arrays-v1\0")
+    digest.update(str(images.dtype).encode("ascii"))
+    digest.update(np.asarray(images.shape, dtype="<i8").tobytes())
+    digest.update(np.ascontiguousarray(images).astype("<f4", copy=False).tobytes(order="C"))
+    digest.update(str(labels.dtype).encode("ascii"))
+    digest.update(np.asarray(labels.shape, dtype="<i8").tobytes())
+    digest.update(np.ascontiguousarray(labels).astype("<i4", copy=False).tobytes(order="C"))
+    return digest.hexdigest()
+
+
+def _schedule_sha256(tasks: tuple[TaskBatch, ...]) -> str:
+    digest = hashlib.sha256()
+    digest.update(b"asi-native-supervised-task-schedule-v1\0")
+    for task in tasks:
+        digest.update(task.task_index.to_bytes(4, "little"))
+        digest.update(np.asarray(task.inputs.shape, dtype="<i8").tobytes())
+        digest.update(task.inputs.astype("<f4", copy=False).tobytes(order="C"))
+        digest.update(np.asarray(task.labels.shape, dtype="<i8").tobytes())
+        digest.update(task.labels.astype("<i4", copy=False).tobytes(order="C"))
+    return digest.hexdigest()
 
 
 def _rotate_nearest(image: np.ndarray, degrees: int) -> np.ndarray:
@@ -273,6 +318,10 @@ class SuiteResult:
     replay_capacity: int
     input_dim: int
     n_classes: int
+    dataset_sha256: str
+    schedule_sha256: str
+    source_sha256: str
+    runtime_identity: tuple[str, str, str, str]
     arms: tuple[ArmResult, ...]
     development_only: bool = True
     scientific_promotion_allowed: bool = False
@@ -288,6 +337,12 @@ class SuiteResult:
         _exact_int(self.input_dim, "input_dim", 1, MAX_INPUT_DIM)
         if self.n_classes != spec.n_classes:
             raise ValueError("class count differs from the catalog")
+        for name in ("dataset_sha256", "schedule_sha256", "source_sha256"):
+            _digest(getattr(self, name), name)
+        if self.source_sha256 != _source_sha256():
+            raise ValueError("current ASI source identity drift")
+        if self.runtime_identity != _runtime_identity():
+            raise ValueError("current runtime identity drift")
         if type(self.arms) is not tuple or any(type(arm) is not ArmResult for arm in self.arms):
             raise ValueError("arms must contain exact ArmResult values")
         if tuple(arm.arm_id for arm in self.arms) != ARM_IDS:
@@ -406,8 +461,9 @@ def run_native_suite(
     host_seed = _exact_int(seed, "seed", 0, 2**32 - 1)
     count = _exact_int(examples_per_task, "examples_per_task", 1, MAX_EXAMPLES_PER_TASK)
     capacity = _exact_int(replay_capacity, "replay_capacity", 1, 64)
+    data, targets = _validated_arrays(images, labels, spec.n_classes)
     tasks = build_task_stream(
-        spec.benchmark_id, images, labels, seed=host_seed, examples_per_task=count
+        spec.benchmark_id, data, targets, seed=host_seed, examples_per_task=count
     )
     result = SuiteResult(
         schema=SCHEMA,
@@ -417,6 +473,10 @@ def run_native_suite(
         replay_capacity=capacity,
         input_dim=tasks[0].inputs.shape[1],
         n_classes=spec.n_classes,
+        dataset_sha256=_dataset_sha256(data, targets),
+        schedule_sha256=_schedule_sha256(tasks),
+        source_sha256=_source_sha256(),
+        runtime_identity=_runtime_identity(),
         arms=tuple(_run_arm(tasks, spec.n_classes, capacity, arm_id) for arm_id in ARM_IDS),
     )
     return validate_result(result)
