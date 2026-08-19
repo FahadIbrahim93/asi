@@ -1,0 +1,393 @@
+"""Bounded, nonexecuting qualification contracts for the CLEAR benchmark.
+
+This module never downloads data or trains a model.  It binds a caller-held
+local dataset receipt to a reviewed protocol and computes the exact workload
+accounting a future runner must reproduce.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import math
+import platform
+import sys
+from collections.abc import Mapping, Sequence
+from dataclasses import asdict, dataclass
+from importlib.metadata import PackageNotFoundError, version
+from pathlib import Path, PurePosixPath
+
+SCHEMA = "asi.clear.qualification.v1"
+PAPER_REVISION = "arXiv:2201.06289v3"
+CURATION_COMMIT = "620cab4a7d99921fde73b67b53879470533cb39a"
+REFERENCE_COMMIT = "75d5d2e7d412a787e0decf0417a4868c56691252"
+AVALANCHE_COMMIT = "eb075be393e1f458b2c352514ff6c17b5a2c0f4e"
+DATASET_NAME = "clear100"
+BUCKETS = tuple(range(1, 11))
+YEARS = tuple(range(2005, 2015))
+DEV_SEEDS = (0, 1, 2, 3, 4)
+MAX_MANIFEST_BYTES = 1 << 20
+MAX_ARCHIVES = 8
+MAX_SAMPLES_PER_BUCKET = 10_000_000
+MAX_RESULT_BYTES = 1 << 20
+
+
+class ClearQualificationError(ValueError):
+    """A CLEAR setup or result record failed closed."""
+
+
+def _canonical(value: object) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
+
+
+def _exact_int(value: object, label: str, *, minimum: int = 0, maximum: int) -> int:
+    if type(value) is not int or not minimum <= value <= maximum:
+        raise ClearQualificationError(f"{label} must be an exact integer in range")
+    return value
+
+
+def _exact_str(value: object, label: str, *, maximum: int = 512) -> str:
+    if type(value) is not str or not value or len(value.encode("utf-8")) > maximum:
+        raise ClearQualificationError(f"{label} must be a bounded non-empty exact string")
+    return value
+
+
+def _sha256(value: object, label: str) -> str:
+    text = _exact_str(value, label, maximum=64)
+    if len(text) != 64 or any(char not in "0123456789abcdef" for char in text):
+        raise ClearQualificationError(f"{label} must be a lowercase SHA-256")
+    return text
+
+
+def _object(value: object, label: str) -> Mapping[str, object]:
+    if type(value) is not dict:
+        raise ClearQualificationError(f"{label} must be an exact JSON object")
+    return value
+
+
+def _keys(value: Mapping[str, object], expected: set[str], label: str) -> None:
+    if set(value) != expected:
+        raise ClearQualificationError(f"{label} fields do not match the schema")
+
+
+@dataclass(frozen=True, slots=True)
+class ArchiveIdentity:
+    role: str
+    path: str
+    size_bytes: int
+    sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class ClearDatasetReceipt:
+    archives: tuple[ArchiveIdentity, ...]
+    samples_per_bucket: tuple[int, ...]
+    archive_bytes: int
+    sample_count: int
+    dataset_sha256: str
+
+
+def _decode(raw: bytes, *, limit: int, label: str) -> Mapping[str, object]:
+    if len(raw) > limit:
+        raise ClearQualificationError(f"{label} exceeds its byte limit")
+    try:
+        value = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ClearQualificationError(f"{label} is not valid JSON") from exc
+    return _object(value, label)
+
+
+def _safe_relative_path(value: object) -> str:
+    text = _exact_str(value, "archive path", maximum=256)
+    path = PurePosixPath(text)
+    if path.is_absolute() or ".." in path.parts or path.as_posix() != text:
+        raise ClearQualificationError("archive path must be canonical and relative")
+    return text
+
+
+def verify_dataset_manifest(raw: bytes, *, root: Path) -> ClearDatasetReceipt:
+    """Verify bounded local archive identities; never fetch or extract them."""
+    if type(raw) is not bytes or not isinstance(root, Path):
+        raise TypeError("raw must be bytes and root must be a Path")
+    payload = _decode(raw, limit=MAX_MANIFEST_BYTES, label="dataset manifest")
+    _keys(
+        payload,
+        {
+            "schema_version",
+            "dataset",
+            "protocol",
+            "buckets",
+            "years",
+            "samples_per_bucket",
+            "archives",
+            "provider_archive_checksums_published",
+        },
+        "dataset manifest",
+    )
+    if payload["schema_version"] != SCHEMA or payload["dataset"] != DATASET_NAME:
+        raise ClearQualificationError("dataset identity drift")
+    if payload["protocol"] != "streaming-near-future":
+        raise ClearQualificationError("only the streaming protocol is qualified")
+    if payload["buckets"] != list(BUCKETS) or payload["years"] != list(YEARS):
+        raise ClearQualificationError("temporal bucket identity drift")
+    if payload["provider_archive_checksums_published"] is not False:
+        raise ClearQualificationError("provider checksum disclosure must not be invented")
+    samples_value = payload["samples_per_bucket"]
+    if type(samples_value) is not list or len(samples_value) != len(BUCKETS):
+        raise ClearQualificationError("samples_per_bucket must cover every labeled bucket")
+    samples = tuple(
+        _exact_int(value, "bucket sample count", minimum=1, maximum=MAX_SAMPLES_PER_BUCKET)
+        for value in samples_value
+    )
+    archive_values = payload["archives"]
+    if type(archive_values) is not list or not 1 <= len(archive_values) <= MAX_ARCHIVES:
+        raise ClearQualificationError("archives must be a bounded non-empty exact list")
+    root_resolved = root.resolve(strict=True)
+    archives: list[ArchiveIdentity] = []
+    seen_paths: set[str] = set()
+    for index, value in enumerate(archive_values):
+        item = _object(value, f"archive {index}")
+        _keys(item, {"role", "path", "size_bytes", "sha256"}, f"archive {index}")
+        role = _exact_str(item["role"], "archive role", maximum=32)
+        path_text = _safe_relative_path(item["path"])
+        if path_text in seen_paths:
+            raise ClearQualificationError("archive paths must be unique")
+        seen_paths.add(path_text)
+        size = _exact_int(item["size_bytes"], "archive size", maximum=1 << 50)
+        digest = _sha256(item["sha256"], "archive sha256")
+        path = root_resolved / path_text
+        if (
+            path.is_symlink()
+            or not path.is_file()
+            or not path.resolve().is_relative_to(root_resolved)
+        ):
+            raise ClearQualificationError("archive must be a regular file below the dataset root")
+        if path.stat().st_size != size:
+            raise ClearQualificationError("archive size does not match the manifest")
+        actual = hashlib.sha256()
+        with path.open("rb") as stream:
+            while chunk := stream.read(1 << 20):
+                actual.update(chunk)
+        if actual.hexdigest() != digest:
+            raise ClearQualificationError("archive SHA-256 does not match the manifest")
+        archives.append(ArchiveIdentity(role, path_text, size, digest))
+    if len({archive.role for archive in archives}) != len(archives):
+        raise ClearQualificationError("archive roles must be unique")
+    identity = {
+        "dataset": DATASET_NAME,
+        "protocol": "streaming-near-future",
+        "buckets": BUCKETS,
+        "years": YEARS,
+        "samples_per_bucket": samples,
+        "archives": [asdict(archive) for archive in archives],
+    }
+    return ClearDatasetReceipt(
+        tuple(archives), samples, sum(item.size_bytes for item in archives), sum(samples),
+        hashlib.sha256(_canonical(identity)).hexdigest(),
+    )
+
+
+def runtime_identity() -> Mapping[str, str]:
+    packages: dict[str, str] = {}
+    for name in ("jax", "numpy"):
+        try:
+            packages[name] = version(name)
+        except PackageNotFoundError:
+            packages[name] = "absent"
+    return {
+        "python": platform.python_version(),
+        "implementation": platform.python_implementation(),
+        "platform": platform.platform(),
+        **packages,
+    }
+
+
+def execution_config(*, mechanism_enabled: bool) -> Mapping[str, object]:
+    if type(mechanism_enabled) is not bool:
+        raise TypeError("mechanism_enabled must be an exact bool")
+    base: dict[str, object] = {
+        "dataset": DATASET_NAME,
+        "protocol": "streaming-near-future",
+        "model": "resnet18-from-scratch",
+        "batch_size": 256,
+        "epochs_per_bucket": 100,
+        "optimizer": {"name": "sgd", "learning_rate": 0.01, "momentum": 0.9, "weight_decay": 1e-5},
+        "scheduler": {"name": "step", "step_size_epochs": 30, "gamma": 0.1},
+        "image_size": 224,
+        "normalization": {"mean": [0.485, 0.456, 0.406], "std": [0.229, 0.224, 0.225]},
+    }
+    if mechanism_enabled:
+        base["candidate_mechanism"] = "unimplemented-placeholder"
+    return base
+
+
+def qualification_plan(receipt: ClearDatasetReceipt) -> Mapping[str, object]:
+    """Create a matched plan.  It has no execution-authority field by design."""
+    control = execution_config(mechanism_enabled=False)
+    mechanism_off = execution_config(mechanism_enabled=False)
+    if control != mechanism_off:
+        raise AssertionError("mechanism-off must reduce exactly to the control")
+    epochs = 100
+    batch = 256
+    updates = sum(math.ceil(count / batch) * epochs for count in receipt.samples_per_bucket)
+    train_observations = receipt.sample_count * epochs
+    # The full 10x10 matrix is evaluated after each training bucket.
+    model_queries = receipt.sample_count * len(BUCKETS)
+    axes = [
+        {"seed": seed, "arm": arm}
+        for seed in DEV_SEEDS
+        for arm in ("control", "mechanism-off")
+    ]
+    return {
+        "schema_version": SCHEMA,
+        "classification": "development-only-permanently-nonpromoting",
+        "paper_revision": PAPER_REVISION,
+        "source_revisions": {
+            "curation": CURATION_COMMIT,
+            "reference_runner": REFERENCE_COMMIT,
+            "avalanche": AVALANCHE_COMMIT,
+        },
+        "dataset_sha256": receipt.dataset_sha256,
+        "runtime": runtime_identity(),
+        "axes": axes,
+        "control_config": control,
+        "mechanism_off_config": mechanism_off,
+        "metrics": [
+            "accuracy",
+            "in_domain",
+            "next_domain",
+            "forward_transfer",
+            "backward_transfer",
+        ],
+        "resource_budget_per_axis": {
+            "archive_bytes": receipt.archive_bytes,
+            "training_observations": train_observations,
+            "data_samples_read": train_observations + model_queries,
+            "optimizer_updates": updates,
+            "model_queries": model_queries,
+            "environment_steps": 0,
+            "timing": "telemetry-only",
+            "persistent_bytes": "runner-receipt-required",
+        },
+        "negative_retention_required": True,
+        "promotion_authorized": False,
+        "execution_authorized": False,
+    }
+
+
+def _metric_values(matrix: list[list[float]]) -> Mapping[str, float]:
+    rows = len(matrix)
+    diagonal = [matrix[index][index] for index in range(rows)]
+    lower = [matrix[i][j] for i in range(rows) for j in range(i)]
+    upper = [matrix[i][j] for i in range(rows) for j in range(i + 1, rows)]
+    seen = [matrix[i][j] for i in range(rows) for j in range(i + 1)]
+    next_domain = [matrix[index][index + 1] for index in range(rows - 1)]
+    return {
+        "accuracy": sum(seen) / len(seen),
+        "in_domain": sum(diagonal) / len(diagonal),
+        "next_domain": sum(next_domain) / len(next_domain),
+        "forward_transfer": sum(upper) / len(upper),
+        "backward_transfer": sum(lower) / len(lower),
+    }
+
+
+def validate_result(
+    raw: bytes,
+    *,
+    expected_plan_sha256: str,
+    expected_resource_budget: Mapping[str, object] | None = None,
+) -> Mapping[str, object]:
+    """Validate the narrow result envelope; scores remain uninterpreted development data."""
+    plan_digest = _sha256(expected_plan_sha256, "expected plan sha256")
+    payload = _decode(raw, limit=MAX_RESULT_BYTES, label="CLEAR result")
+    _keys(
+        payload,
+        {
+            "schema_version",
+            "plan_sha256",
+            "status",
+            "promotion_authorized",
+            "negative_retained",
+            "accuracy_matrix",
+            "metrics",
+            "resource_receipts",
+        },
+        "CLEAR result",
+    )
+    if payload["schema_version"] != SCHEMA or payload["plan_sha256"] != plan_digest:
+        raise ClearQualificationError("result provenance drift")
+    if payload["status"] not in ("completed-development", "negative-development"):
+        raise ClearQualificationError("result status is not allowed")
+    if payload["promotion_authorized"] is not False or payload["negative_retained"] is not True:
+        raise ClearQualificationError("result violates nonpromotion or negative retention")
+    matrix_value = payload["accuracy_matrix"]
+    if type(matrix_value) is not list or len(matrix_value) != len(BUCKETS):
+        raise ClearQualificationError("accuracy matrix must be an exact 10x10 list")
+    matrix: list[list[float]] = []
+    for row_value in matrix_value:
+        if type(row_value) is not list or len(row_value) != len(BUCKETS):
+            raise ClearQualificationError("accuracy matrix must be an exact 10x10 list")
+        row: list[float] = []
+        for score in row_value:
+            if type(score) is not float or not math.isfinite(score) or not 0.0 <= score <= 1.0:
+                raise ClearQualificationError("accuracy entries must be finite exact floats")
+            row.append(score)
+        matrix.append(row)
+    metric_value = _object(payload["metrics"], "CLEAR metrics")
+    expected_metrics = _metric_values(matrix)
+    _keys(metric_value, set(expected_metrics), "CLEAR metrics")
+    if any(type(value) is not float or not math.isfinite(value) for value in metric_value.values()):
+        raise ClearQualificationError("CLEAR metrics must be finite exact floats")
+    if metric_value != expected_metrics:
+        raise ClearQualificationError("CLEAR metrics do not replay from the accuracy matrix")
+    resources = _object(payload["resource_receipts"], "resource receipts")
+    _keys(
+        resources,
+        {
+            "persistent_bytes",
+            "archive_bytes",
+            "training_observations",
+            "data_samples_read",
+            "optimizer_updates",
+            "model_queries",
+            "environment_steps",
+            "wall_seconds_telemetry",
+        },
+        "resource receipts",
+    )
+    for name in resources:
+        maximum = (1 << 63) - 1 if name != "wall_seconds_telemetry" else (1 << 53)
+        _exact_int(resources[name], name, maximum=maximum)
+    if expected_resource_budget is not None:
+        for name in (
+            "archive_bytes",
+            "training_observations",
+            "data_samples_read",
+            "optimizer_updates",
+            "model_queries",
+            "environment_steps",
+        ):
+            expected = _exact_int(
+                expected_resource_budget.get(name),
+                f"expected {name}",
+                maximum=(1 << 63) - 1,
+            )
+            if resources[name] != expected:
+                raise ClearQualificationError(f"{name} does not match the frozen plan")
+    return payload
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("manifest", type=Path)
+    parser.add_argument("--dataset-root", required=True, type=Path)
+    args = parser.parse_args(argv)
+    raw = args.manifest.read_bytes()
+    receipt = verify_dataset_manifest(raw, root=args.dataset_root)
+    print(_canonical(qualification_plan(receipt)).decode())
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
