@@ -868,10 +868,15 @@ def _require_unique_task_names(task_names: Sequence[str], *, name: str) -> tuple
     return names
 
 
+# Search ints feed allocations and `range(generations)`. Unbounded 10**12
+# values hang / OOM the micro-suite screen.
+_SEARCH_INT_MAX: int = 2**31 - 1
+
+
 def _require_search_int(name: str, value: object, *, minimum: int) -> int:
     if type(name) is not str:
         raise ValueError("name must be an exact string")
-    if type(value) is not int or value < minimum:
+    if type(value) is not int or value < minimum or value > _SEARCH_INT_MAX:
         raise ValueError(f"{name} must be an integer >= {minimum}")
     return value
 
