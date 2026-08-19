@@ -18,15 +18,19 @@ renaming module internals is expected to require touching this file.
 
 from __future__ import annotations
 
+import ast
 import copy
 import dataclasses
 import hashlib
 import heapq
+import inspect
 import json
 import math
 import pickle
+import textwrap
 from collections.abc import Mapping
-from typing import Any, cast
+from statistics import NormalDist
+from typing import Any, Final, cast
 
 import chex
 import jax
@@ -2879,3 +2883,206 @@ def test_seed_batch_validation(monkeypatch: pytest.MonkeyPatch) -> None:
     unsafe = dataclasses.replace(benchmark, steps=np.iinfo(np.int32).max)
     with pytest.raises(ValueError, match="steps must be"):
         run_causal_map_forager_seeds(config, unsafe, (1,))
+
+
+# ---------------------------------------------------------------------------
+# Architecture-independent respawn quantile
+# ---------------------------------------------------------------------------
+
+# The exact ``respawn_quantile_z`` for every quantile the published
+# matched-current protocol uses.  These are the values the sealed campaign was
+# built from -- they appear in plaintext in the sealed configuration payloads
+# under ``outputs/forager/matched_current_qualification_2c3b214c_v1`` -- and are
+# pinned in hex so that a one-ULP drift cannot hide behind repr rounding.
+_REFERENCE_RESPAWN_QUANTILE_Z: Final = {
+    0.5: "0x0.0p+0",
+    0.75: "0x1.5956b87528a49p-1",
+    0.9: "0x1.4813c36e26d34p+0",
+}
+
+
+@pytest.mark.parametrize("quantile", sorted(_REFERENCE_RESPAWN_QUANTILE_Z))
+def test_respawn_quantile_z_matches_the_published_reference_bits(
+    quantile: float,
+) -> None:
+    """``respawn_quantile_z`` must be bit-exact on every host architecture.
+
+    The value feeds ``fingerprint()``, hence ``protocol_sha256`` and
+    ``schedule_sha256``, so a single ULP of drift changes the published
+    identity of a sealed campaign.  ``statistics.NormalDist().inv_cdf`` is a C
+    accelerator compiled with floating-point contraction enabled, which makes
+    that identity depend on whether the host has a fused multiply-add.  Pin the
+    bits, not the repr.
+    """
+
+    config = CausalMapForagerConfig(respawn_safety_quantile=quantile)
+    assert config.respawn_quantile_z.hex() == _REFERENCE_RESPAWN_QUANTILE_Z[quantile]
+
+
+def test_respawn_quantile_z_is_not_the_contracted_neighbour() -> None:
+    """Pin the drift direction, so a near-miss cannot pass as close enough.
+
+    A contracted evaluation lands on the adjacent representable double rather
+    than somewhere far away, so any assertion phrased as closeness would accept
+    the defect.  Name the wrong value explicitly instead.
+    """
+
+    reference = float.fromhex(_REFERENCE_RESPAWN_QUANTILE_Z[0.9])
+    contracted = math.nextafter(reference, 0.0)
+    assert reference != contracted
+
+    observed = CausalMapForagerConfig(respawn_safety_quantile=0.9).respawn_quantile_z
+    assert observed == reference
+    assert observed != contracted
+
+
+@pytest.mark.parametrize(
+    "quantile",
+    [
+        0.5,
+        0.6,
+        0.6886660381825473,  # measured worst-case divergence, 9 ULP
+        0.75,
+        0.837392,
+        0.9,
+        0.925,
+        0.95,
+        0.99,
+        0.999,
+        0.999999,
+        1.0 - 2.0**-40,
+    ],
+)
+def test_deterministic_inv_cdf_tracks_the_standard_library_structurally(
+    quantile: float,
+) -> None:
+    """Catch structural divergence across the whole admissible domain.
+
+    ``respawn_safety_quantile`` is validated into ``[0.5, 1.0)``, so the AS241
+    tail branches are reachable even though the published protocol only uses
+    the central one.  This holds the reimplementation to the shape of the
+    reference across that range -- a wrong branch cut, a transposed
+    numerator/denominator, or a mistyped exponent all show up here.
+
+    The tolerance is deliberately loose and is calibrated, not guessed: the
+    accelerator contracts and this implementation does not, so the two
+    legitimately disagree.  Enumerating five million consecutive doubles
+    through the worst region puts the maximum at **9 ULP** (at ``p =
+    0.6886660381825473``; the divergence histogram there is
+    ``{0: 1769290, ..., 7: 3272, 8: 315, 9: 4}``), so the bound below carries
+    the project's ``>=2x`` margin over the measured worst case.  A tight bound
+    is therefore impossible against this reference, which is exactly why
+    fine-grained coefficient integrity is pinned separately in
+    :func:`test_deterministic_inv_cdf_coefficients_are_pinned` rather than
+    inferred from agreement here.
+    """
+
+    observed = causal_map_module._deterministic_inv_cdf(quantile)  # noqa: SLF001
+    expected = NormalDist().inv_cdf(quantile)
+    assert observed == pytest.approx(expected, abs=20.0 * math.ulp(abs(expected) or 1.0))
+
+
+def test_deterministic_inv_cdf_negates_below_the_median() -> None:
+    """Cover the ``q < 0`` sign flip, which no other test reaches.
+
+    This pins branch structure, not the coefficients.  Oddness holds
+    bit-exactly for *any* coefficient values, so it cannot detect a
+    transcription error -- on the central branch it follows from the trailing
+    ``* q`` factor, and on the tail branches from the explicit ``x = -x`` sign
+    flip over a ``p``-symmetric intermediate.  Only the ``0.99``/``0.01`` pair
+    below reaches that flip; it is here because the negative-``q`` path is
+    otherwise unexecuted.
+    """
+
+    for quantile in (0.6, 0.75, 0.9, 0.99):
+        upper = causal_map_module._deterministic_inv_cdf(quantile)  # noqa: SLF001
+        lower = causal_map_module._deterministic_inv_cdf(1.0 - quantile)  # noqa: SLF001
+        assert lower == -upper
+
+
+_AS241_SOURCE_CONSTANTS: Final = (
+    0.5,
+    0.425,
+    5.0,
+    0.0,
+    0.180625,
+    1.0,
+    0.0,
+    1.0,
+    1.6,
+    1.4234371107496835,
+    1.0,
+    5.0,
+    6.657904643501103,
+    1.0,
+    3.3871328727963665,
+    42.31333070160091,
+    4.630337846156546,
+    2.053191626637759,
+    5.463784911164114,
+    0.599832206555888,
+    133.14166789178438,
+    687.1870074920579,
+    5.769497221460691,
+    1.6763848301838038,
+    1.7848265399172913,
+    0.1369298809227358,
+    1971.5909503065513,
+    5394.196021424751,
+    3.6478483247632045,
+    0.6897673349851,
+    0.29656057182850487,
+    0.014875361290850615,
+    13731.69376550946,
+    21213.794301586597,
+    1.2704582524523684,
+    0.14810397642748008,
+    0.026532189526576124,
+    0.0007868691311456133,
+    45921.95393154987,
+    39307.89580009271,
+    0.2417807251774506,
+    0.015198666563616457,
+    0.0012426609473880784,
+    1.8463183175100548e-05,
+    67265.7709270087,
+    28729.085735721943,
+    0.022723844989269184,
+    0.0005475938084995345,
+    2.7115555687434876e-05,
+    1.421511758316446e-07,
+    33430.57558358813,
+    5226.495278852854,
+    0.0007745450142783414,
+    1.0507500716444169e-09,
+    2.0103343992922881e-07,
+    2.0442631033899397e-15,
+    2509.0809287301227,
+)
+
+
+def test_deterministic_inv_cdf_coefficients_are_pinned() -> None:
+    """Freeze every literal in the quantile, to the bit.
+
+    The differential test above cannot resolve small coefficient drift,
+    because the accelerator it compares against is itself up to 7 ULP away.
+    Most single-ULP perturbations of these constants do change the function's
+    output somewhere in ``[0.5, 1.0)`` -- the exact count rises with probe
+    density, so no single figure is meaningful -- and every one of them stays
+    inside any tolerance loose enough to accommodate the accelerator.  So
+    agreement with the standard library is not sufficient evidence that the
+    transcription is intact.
+
+    Read the literals straight out of the source and compare them against a
+    frozen tuple.  The values were established by fuzzing this implementation
+    against CPython's own pure-Python ``_normal_dist_inv_cdf`` over 1,999,999
+    points with zero mismatches; this test's job is to keep them that way.
+    """
+
+    source = textwrap.dedent(inspect.getsource(causal_map_module._deterministic_inv_cdf))  # noqa: SLF001
+    observed = tuple(
+        node.value
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Constant) and isinstance(node.value, float)
+    )
+    assert observed == _AS241_SOURCE_CONSTANTS
