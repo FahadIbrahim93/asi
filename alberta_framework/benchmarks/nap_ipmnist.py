@@ -46,7 +46,7 @@ from alberta_framework.benchmarks.plasticity_diagnostics import (
 SCHEMA = "asi.nap_ipmnist_comparator.development.v1"
 PAPER_REVISION = "arXiv:2407.01800v1"
 PAPER_IDENTITY = "NeurIPS-2024:c04d37be05ba74419d2d5705972a9d64"
-DEPENDENCY_COMMIT = "3222c4f0d1b9627c15b2d4a907856cc1d8dee7be"
+DEPENDENCY_COMMIT = "8383d6438b81c7620189c6fedba30c345994cb12"
 PLASTICINE_REPOSITORY = "https://github.com/RLE-Foundation/Plasticine.git"
 PLASTICINE_COMMIT = "aa00b4bb18f7fe298a47e1ce36c32ba55ce064e8"
 FROZEN_SEEDS = (15_640, 15_641, 15_642, 15_643)
@@ -160,6 +160,8 @@ class NaPReceipt:
     data_steps: int
     observations: int
     data_bytes_read: int
+    training_model_queries: int
+    diagnostic_model_queries: int
     model_queries: int
     parameter_updates: int
     normalization_queries: int
@@ -252,11 +254,13 @@ class NaPResult:
     schema: str
     catalog: NaPCatalogEntry
     profile_id: str
+    profile: DiagnosticProfile
     seed: int
     dataset_sha256: str
     schedule_sha256: str
     source_sha256: str
     dependency_source_sha256: str
+    nap_project_dependency_source_sha256: str
     runtime_identity: tuple[str, str, str, str]
     task_protocol: str
     labels_permuted: bool
@@ -277,6 +281,8 @@ class NaPResult:
         self.catalog.validate()
         if type(self.profile_id) is not str or self.profile_id not in PROFILES:
             raise ValueError("unknown profile")
+        if type(self.profile) is not DiagnosticProfile or self.profile != PROFILES[self.profile_id]:
+            raise ValueError("profile payload differs from the immutable registry")
         if type(self.seed) is not int or self.seed not in FROZEN_SEEDS:
             raise ValueError("seed is outside the frozen NaP development schedule")
         for name in (
@@ -284,6 +290,7 @@ class NaPResult:
             "schedule_sha256",
             "source_sha256",
             "dependency_source_sha256",
+            "nap_project_dependency_source_sha256",
         ):
             _digest(getattr(self, name), name)
         if self.source_sha256 != hashlib.sha256(Path(__file__).read_bytes()).hexdigest():
@@ -292,6 +299,10 @@ class NaPResult:
         dependency_sha256 = hashlib.sha256(dependency_path.read_bytes()).hexdigest()
         if self.dependency_source_sha256 != dependency_sha256:
             raise ValueError("#1583 dependency source identity drift")
+        nap_project_path = Path(__file__).with_name("plasticity_comparators.py")
+        nap_project_sha256 = hashlib.sha256(nap_project_path.read_bytes()).hexdigest()
+        if self.nap_project_dependency_source_sha256 != nap_project_sha256:
+            raise ValueError("nap_project dependency source identity drift")
         if (
             type(self.runtime_identity) is not tuple
             or len(self.runtime_identity) != 4
@@ -462,7 +473,9 @@ def _run_arm(
         ranks.append(_effective_rank(host2))
     elapsed_ns = time.perf_counter_ns() - started
     steps = profile.n_tasks * profile.examples_per_task
-    model_queries = steps * 2
+    training_model_queries = steps * 2
+    diagnostic_model_queries = steps
+    model_queries = training_model_queries + diagnostic_model_queries
     forward_macs = (
         INPUT_DIM * profile.hidden_width
         + profile.hidden_width * profile.hidden_width
@@ -480,6 +493,8 @@ def _run_arm(
         data_steps=steps,
         observations=steps,
         data_bytes_read=steps * (INPUT_DIM * 4 + 4),
+        training_model_queries=training_model_queries,
+        diagnostic_model_queries=diagnostic_model_queries,
         model_queries=model_queries,
         parameter_updates=steps,
         normalization_queries=normalization_queries,
@@ -532,12 +547,16 @@ def run_comparator(
         schema=SCHEMA,
         catalog=NaPCatalogEntry(),
         profile_id=profile.profile_id,
+        profile=profile,
         seed=seed,
         dataset_sha256=_dataset_sha(data, targets),
         schedule_sha256=_schedule_sha(tasks),
         source_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         dependency_source_sha256=hashlib.sha256(
             Path(__file__).with_name("plasticity_diagnostics.py").read_bytes()
+        ).hexdigest(),
+        nap_project_dependency_source_sha256=hashlib.sha256(
+            Path(__file__).with_name("plasticity_comparators.py").read_bytes()
         ).hexdigest(),
         runtime_identity=(
             platform.python_version(),
@@ -574,7 +593,9 @@ def validate_result(value: object) -> NaPResult:
         NaPArmResult.__post_init__(arm)
         NaPReceipt.__post_init__(arm.receipt)
         normalize, project = _arm_flags(cast(ArmID, arm.arm_id))
-        model_queries = steps * 2
+        training_model_queries = steps * 2
+        diagnostic_model_queries = steps
+        model_queries = training_model_queries + diagnostic_model_queries
         norm_queries = model_queries * 2 if normalize else 0
         norm_elements = norm_queries * profile.hidden_width
         projection_events = steps if project else 0
@@ -585,6 +606,8 @@ def validate_result(value: object) -> NaPResult:
             "data_steps": steps,
             "observations": steps,
             "data_bytes_read": steps * (INPUT_DIM * 4 + 4),
+            "training_model_queries": training_model_queries,
+            "diagnostic_model_queries": diagnostic_model_queries,
             "model_queries": model_queries,
             "parameter_updates": steps,
             "normalization_queries": norm_queries,
