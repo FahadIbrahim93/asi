@@ -167,6 +167,17 @@ def test_noise_curvature_scheduler_and_off_reduction() -> None:
         safe_bound=no_noise_bound,
         early_training=False,
     ) == 0.1
+
+
+def test_noise_curvature_step_size_rejects_warming_overflow() -> None:
+    """A finite input may still overflow when Algorithm 1 warms it."""
+    with pytest.raises(ValueError, match="adjusted step size overflowed"):
+        noise_curvature_step_size(
+            float(np.finfo(np.float64).max),
+            effective_step_size=0.0,
+            safe_bound=1.0,
+            early_training=True,
+        )
     assert noise_curvature_step_size(
         0.1,
         effective_step_size=0.2,
