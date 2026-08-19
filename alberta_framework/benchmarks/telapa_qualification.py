@@ -30,12 +30,97 @@ PAPER_REVISION = "arXiv:2604.15414v1"
 PAPER_DATE = "2026-04-16"
 DISCLOSED_REPOSITORY = "https://anonymous.4open.science/r/telapa-map_elites-54E8/"
 _MAX_JSON_BYTES = 1_000_000
+_MAX_JSON_DEPTH = 64
+_MAX_JSON_NODES = 50_000
+_MAX_JSON_CONTAINER_ITEMS = 10_000
+_MAX_JSON_STRING_BYTES = 100_000
 _MAX_STEPS = 64
 _MAX_SEEDS = 4
 _POLICY_SHAPE = (2, 2)
 _POLICY_BYTES = 16
 _ARMS = ("diverse_archive", "one_model", "fixed_snapshot", "mechanism_off")
 Arm = Literal["diverse_archive", "one_model", "fixed_snapshot", "mechanism_off"]
+
+
+def _preflight_json_tree(value: object) -> None:
+    """Bound an exact primitive JSON tree before invoking the recursive serializer."""
+    stack: list[tuple[object, int]] = [(value, 0)]
+    seen_containers: set[int] = set()
+    nodes = 0
+    conservative_bytes = 0
+    while stack:
+        item, depth = stack.pop()
+        nodes += 1
+        if nodes > _MAX_JSON_NODES or depth > _MAX_JSON_DEPTH:
+            raise ValueError("JSON tree exceeds its node or depth limit")
+        if item is None or type(item) is bool:
+            conservative_bytes += 5
+        elif type(item) is int:
+            if not -(1 << 63) <= item <= (1 << 63) - 1:
+                raise ValueError("JSON integers must be signed 64-bit values")
+            conservative_bytes += 21
+        elif type(item) is float:
+            if not math.isfinite(item):
+                raise ValueError("result must be finite JSON")
+            conservative_bytes += 32
+        elif type(item) is str:
+            if len(item) > _MAX_JSON_STRING_BYTES:
+                raise ValueError("JSON string exceeds its character limit")
+            encoded_length = len(item.encode("utf-8"))
+            if encoded_length > _MAX_JSON_STRING_BYTES:
+                raise ValueError("JSON string exceeds its byte limit")
+            # ensure_ascii JSON can use two six-byte surrogate escapes per code point.
+            conservative_bytes += 2 + 12 * len(item)
+        elif type(item) is list:
+            identity = id(item)
+            if identity in seen_containers:
+                raise ValueError("JSON tree cannot contain cycles or container aliases")
+            seen_containers.add(identity)
+            if len(item) > _MAX_JSON_CONTAINER_ITEMS:
+                raise ValueError("JSON list exceeds its item limit")
+            conservative_bytes += len(item) + 2
+            stack.extend((child, depth + 1) for child in item)
+        elif type(item) is dict:
+            identity = id(item)
+            if identity in seen_containers:
+                raise ValueError("JSON tree cannot contain cycles or container aliases")
+            seen_containers.add(identity)
+            if len(item) > _MAX_JSON_CONTAINER_ITEMS:
+                raise ValueError("JSON object exceeds its item limit")
+            conservative_bytes += len(item) + 2
+            for key, child in item.items():
+                if type(key) is not str:
+                    raise ValueError("JSON object keys must be exact strings")
+                if len(key) > _MAX_JSON_STRING_BYTES:
+                    raise ValueError("JSON object key exceeds its character limit")
+                key_bytes = len(key.encode("utf-8"))
+                if key_bytes > _MAX_JSON_STRING_BYTES:
+                    raise ValueError("JSON object key exceeds its byte limit")
+                nodes += 1
+                if nodes > _MAX_JSON_NODES:
+                    raise ValueError("JSON tree exceeds its node limit")
+                conservative_bytes += 3 + 12 * len(key)
+                stack.append((child, depth + 1))
+        else:
+            raise ValueError("JSON tree values must use exact primitive JSON types")
+        if conservative_bytes > _MAX_JSON_BYTES:
+            raise ValueError("JSON tree exceeds its conservative byte limit")
+
+
+def _bounded_json_bytes(value: object) -> bytes:
+    _preflight_json_tree(value)
+    try:
+        raw = json.dumps(
+            value,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+    except (TypeError, ValueError, OverflowError, RecursionError) as error:
+        raise ValueError("result must be finite JSON with a bounded exact tree") from error
+    if len(raw) > _MAX_JSON_BYTES:
+        raise ValueError("result exceeds the bounded JSON size")
+    return raw
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,6 +243,19 @@ class TeLAPASmokeConfig:
         ):
             if type(value) is not float or not math.isfinite(value) or not 0.0 <= value <= upper:
                 raise ValueError(f"{name} must be a bounded finite exact float")
+
+
+def _catalog_payload(catalog: TeLAPACatalogEntry) -> dict[str, object]:
+    payload: dict[str, object] = asdict(catalog)
+    payload["protocol_differences"] = list(catalog.protocol_differences)
+    payload["paper_metrics"] = list(catalog.paper_metrics)
+    return payload
+
+
+def _config_payload(config: TeLAPASmokeConfig) -> dict[str, object]:
+    payload: dict[str, object] = asdict(config)
+    payload["seeds"] = list(config.seeds)
+    return payload
 
 
 @jax.jit
@@ -402,8 +500,8 @@ def run_smoke(config: TeLAPASmokeConfig | None = None) -> dict[str, Any]:
             raise AssertionError("mechanism-off reduction diverged from fixed snapshot")
     result = {
         "schema": SCHEMA,
-        "catalog": asdict(catalog),
-        "config": asdict(config),
+        "catalog": _catalog_payload(catalog),
+        "config": _config_payload(config),
         "matched_axes": [
             "seed",
             "environment_steps",
@@ -446,12 +544,7 @@ def _require_exact_keys(value: object, expected: set[str], name: str) -> dict[st
 def validate_result(value: object) -> None:
     """Strictly validate a bounded JSON-decoded smoke result."""
 
-    try:
-        raw = json.dumps(value, allow_nan=False, separators=(",", ":"), sort_keys=True).encode()
-    except (TypeError, ValueError) as error:
-        raise ValueError("result must be finite JSON") from error
-    if len(raw) > _MAX_JSON_BYTES:
-        raise ValueError("result exceeds the bounded JSON size")
+    _bounded_json_bytes(value)
     root = _require_exact_keys(
         value,
         {
@@ -639,11 +732,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.catalog:
         catalog = TeLAPACatalogEntry()
         catalog.validate()
-        payload = asdict(catalog)
+        payload = _catalog_payload(catalog)
     else:
         payload = run_smoke(TeLAPASmokeConfig(steps=args.steps, phase_length=args.phase_length))
-    json.dump(payload, sys.stdout, allow_nan=False, indent=2, sort_keys=True)
-    sys.stdout.write("\n")
+    sys.stdout.write(_bounded_json_bytes(payload).decode() + "\n")
     return 0
 
 
