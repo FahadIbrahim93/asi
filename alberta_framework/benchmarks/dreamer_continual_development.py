@@ -10,6 +10,7 @@ from __future__ import annotations
 import dataclasses
 import math
 import operator
+import sys
 import time
 from collections.abc import Mapping
 from typing import SupportsIndex, cast
@@ -18,6 +19,13 @@ import jax
 import jax.random as jr
 import numpy as np
 
+import alberta_framework.core.dreaming as dreaming_module
+import alberta_framework.core.world_model as world_model_module
+from alberta_framework.benchmarks.development_provenance import (
+    DevelopmentIdentity,
+    collect_development_identity,
+    require_current_identity,
+)
 from alberta_framework.core.dreaming import DreamingConfig, GuardedDreamer
 from alberta_framework.core.world_model import (
     ActionConditionedWorldModel,
@@ -35,6 +43,23 @@ FROZEN_TASK_TARGETS = (0, 1, 0)
 ARM_IDS = ("guarded_imagination", "imagination_off", "privileged_task_control")
 MAX_STEPS_PER_TASK = 16
 MAX_IMAGINATIONS_PER_STEP = 8
+WORKLOAD_REGISTRY = (
+    ("arm_ids", ARM_IDS),
+    ("frozen_seeds", FROZEN_SEEDS),
+    ("frozen_task_targets", FROZEN_TASK_TARGETS),
+    ("max_imaginations_per_step", MAX_IMAGINATIONS_PER_STEP),
+    ("max_steps_per_task", MAX_STEPS_PER_TASK),
+)
+PAPER_REGISTRY = (("dreamerv3_code", DREAMERV3_CODE), ("papers", PAPERS))
+
+
+def _current_identity() -> DevelopmentIdentity:
+    return collect_development_identity(
+        lane_module=sys.modules[__name__],
+        dependency_modules=(dreaming_module, world_model_module),
+        workload_registry=WORKLOAD_REGISTRY,
+        paper_registry=PAPER_REGISTRY,
+    )
 
 
 def _exact_int(value: object, name: str, low: int, high: int) -> int:
@@ -113,6 +138,7 @@ class DevelopmentResult:
     replay_capacity: int
     imaginations_per_step: int
     arms: tuple[ArmResult, ...]
+    identity: DevelopmentIdentity
     development_only: bool = True
     scientific_promotion_allowed: bool = False
     negative_results_must_be_retained: bool = True
@@ -133,6 +159,8 @@ class DevelopmentResult:
             raise ValueError("arms must contain exact ArmResult values")
         if tuple(arm.arm_id for arm in self.arms) != ARM_IDS:
             raise ValueError("arms differ from the frozen roster")
+        if type(self.identity) is not DevelopmentIdentity:
+            raise ValueError("identity must be exact")
         flags = (
             self.development_only,
             not self.scientific_promotion_allowed,
@@ -215,7 +243,11 @@ def _run_arm(
     persistent = (
         int(np.asarray(FROZEN_TASK_TARGETS, dtype=np.int32).nbytes)
         if arm_id == "privileged_task_control"
-        else max(initial_model_bytes, _tree_nbytes(state)) + int(values.nbytes)
+        else (
+            max(initial_model_bytes, _tree_nbytes(state))
+            + int(values.nbytes)
+            + sum(int(item.nbytes) for item in replay)
+        )
     )
     compute = (
         environment_steps + updates + queries + inserts + samples + proposals + imagined_updates
@@ -270,6 +302,7 @@ def run_development_lane(
             _run_arm(host_seed, steps, capacity, imagination_count, arm_id)
             for arm_id in ARM_IDS
         ),
+        identity=_current_identity(),
     )
     return validate_result(result)
 
@@ -282,6 +315,7 @@ def validate_result(value: object) -> DevelopmentResult:
             "mapping decoding is intentionally unavailable until a CLI schema is frozen"
         )
     DevelopmentResult.__post_init__(value)
+    require_current_identity(value.identity, _current_identity())
     steps = value.steps_per_task * len(FROZEN_TASK_TARGETS)
     for arm in value.arms:
         ArmResult.__post_init__(arm)
@@ -315,6 +349,23 @@ def validate_result(value: object) -> DevelopmentResult:
         expected_peak = min(steps, value.replay_capacity) * 2 * 4 if model_arm else 0
         if receipt.peak_replay_bytes != expected_peak:
             raise ValueError("replay byte receipt mismatch")
+        model = ActionConditionedWorldModel(
+            ActionConditionedWorldModelConfig(
+                observation_dim=2,
+                n_actions=2,
+                hidden_sizes=(),
+                step_size=0.05,
+                sparsity=0.0,
+                error_decay=0.0,
+            )
+        )
+        expected_persistent = (
+            int(np.asarray(FROZEN_TASK_TARGETS, dtype=np.int32).nbytes)
+            if not model_arm
+            else _tree_nbytes(model.init(jr.key(value.seed))) + 2 * 4 + expected_peak
+        )
+        if receipt.persistent_bytes != expected_persistent:
+            raise ValueError("persistent-byte receipt mismatch")
     return value
 
 

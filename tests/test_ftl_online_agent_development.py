@@ -6,6 +6,7 @@ import jax
 import pytest
 
 from alberta_framework.benchmarks.ftl_online_agent_development import (
+    ACTION_DELTAS,
     ARM_IDS,
     FROZEN_SEEDS,
     OFFICIAL_CODE_REVISION,
@@ -84,6 +85,10 @@ def test_validator_rejects_promotion_counter_forgery_and_extra_fields() -> None:
     with pytest.raises(ValueError, match="metric count"):
         validate_result(forged_metrics)
 
+    forged_identity = dataclasses.replace(result.identity, paper_registry_sha256="0" * 64)
+    with pytest.raises(ValueError, match="current source/runtime/registries"):
+        validate_result(dataclasses.replace(result, identity=forged_identity))
+
 
 def test_mechanism_off_is_causal_and_does_not_adopt_updates() -> None:
     result = run_development_lane(seed=FROZEN_SEEDS[2], steps_per_task=3, planning_horizon=1)
@@ -91,3 +96,8 @@ def test_mechanism_off_is_causal_and_does_not_adopt_updates() -> None:
     assert enabled.receipt.persistent_bytes == disabled.receipt.persistent_bytes
     assert enabled.prequential_squared_errors != disabled.prequential_squared_errors
     assert enabled.task_returns != disabled.task_returns
+
+
+def test_workload_action_registry_is_read_only() -> None:
+    with pytest.raises(ValueError):
+        ACTION_DELTAS[0, 0] = 7

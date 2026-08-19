@@ -13,6 +13,7 @@ import pytest
 from alberta_framework.benchmarks.action_conditioned_latent import (
     ACTION_LATENT_SCHEMA,
     FROZEN_ARM_IDS,
+    PINNED_RESEARCH,
     ActionLatentProtocol,
     run_action_conditioned_latent_lane,
     select_latent_action,
@@ -116,6 +117,15 @@ def test_validator_rejects_hostile_expanded_or_inconsistent_payloads(lane_result
     forged_bytes["arms"][0]["persistent_mechanism_bytes"] += 1  # type: ignore[index,operator]
     with pytest.raises(ValueError, match="mechanism bytes differ"):
         validate_action_latent_payload(forged_bytes)
+    forged_identity = copy.deepcopy(result.to_payload())
+    forged_identity["identity"]["dependency_versions"][0][1] = "forged"  # type: ignore[index]
+    with pytest.raises(ValueError, match="current source/runtime/registries"):
+        validate_action_latent_payload(forged_identity)
+
+
+def test_paper_registry_is_immutable() -> None:
+    with pytest.raises(TypeError):
+        PINNED_RESEARCH["new"] = "mutable"  # type: ignore[index]
 
 
 @pytest.mark.parametrize(

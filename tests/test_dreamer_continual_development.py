@@ -78,3 +78,18 @@ def test_validator_rejects_promotion_and_receipt_forgery() -> None:
         validate_result(forged)
     with pytest.raises(ValueError, match="decoding is intentionally unavailable"):
         validate_result({"schema": result.schema})
+
+    forged_persistent = dataclasses.replace(result.arms[0].receipt, persistent_bytes=1)
+    forged = dataclasses.replace(
+        result,
+        arms=(
+            dataclasses.replace(result.arms[0], receipt=forged_persistent),
+            *result.arms[1:],
+        ),
+    )
+    with pytest.raises(ValueError, match="persistent-byte"):
+        validate_result(forged)
+
+    forged_identity = dataclasses.replace(result.identity, lane_source_sha256="0" * 64)
+    with pytest.raises(ValueError, match="current source/runtime/registries"):
+        validate_result(dataclasses.replace(result, identity=forged_identity))

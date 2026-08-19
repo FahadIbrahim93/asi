@@ -17,8 +17,10 @@ import hashlib
 import json
 import math
 import operator
+import sys
 import time
 from collections.abc import Sequence
+from types import MappingProxyType
 from typing import Any, SupportsIndex, cast
 
 import jax
@@ -26,6 +28,15 @@ import jax.numpy as jnp
 import jax.random as jr
 import numpy as np
 
+import alberta_framework.core.latent_world_model as latent_world_model_module
+import alberta_framework.core.sarsa as sarsa_module
+import alberta_framework.streams.closed_loop as closed_loop_module
+from alberta_framework.benchmarks.development_provenance import (
+    DevelopmentIdentity,
+    collect_development_identity,
+    identity_from_payload,
+    require_current_identity,
+)
 from alberta_framework.core.latent_world_model import LatentWorldModel, LatentWorldModelConfig
 from alberta_framework.core.sarsa import SARSAAgent, SARSAConfig
 from alberta_framework.streams.closed_loop import SwitchingTwoStateConfig, SwitchingTwoStateMDP
@@ -41,15 +52,30 @@ FROZEN_ARM_IDS = (
     "mechanism_off",
     "sarsa_control",
 )
-PINNED_RESEARCH = {
+PINNED_RESEARCH = MappingProxyType({
     "jepa_wm_paper": "arXiv:2512.24497v3",
     "jepa_wm_code": "13cf1d9c7e476f53c17714d2e0f1dc239a883ce0",
     "vjepa2_paper": "arXiv:2506.09985v1",
     "vjepa2_code": "204698b45b3712590f06245fbfba32d3be539812",
-}
+})
 _MAX_STEPS = 4096
 _INT32_MAX = 2**31 - 1
 _LATENT_DIM = 4
+WORKLOAD_REGISTRY = (
+    ("arm_ids", FROZEN_ARM_IDS),
+    ("development_seeds", FROZEN_DEVELOPMENT_SEEDS),
+    ("latent_dim", _LATENT_DIM),
+    ("max_steps", _MAX_STEPS),
+)
+
+
+def _current_identity() -> DevelopmentIdentity:
+    return collect_development_identity(
+        lane_module=sys.modules[__name__],
+        dependency_modules=(latent_world_model_module, sarsa_module, closed_loop_module),
+        workload_registry=WORKLOAD_REGISTRY,
+        paper_registry=PINNED_RESEARCH,
+    )
 
 
 def _exact_int(value: object, *, name: str, minimum: int, maximum: int) -> int:
@@ -217,6 +243,7 @@ class JEPATransferResult:
     protocol: JEPATransferProtocol
     research_pins: dict[str, str]
     arms: tuple[TransferArmReceipt, ...]
+    identity: DevelopmentIdentity
     development_only: bool = True
     scientific_promotion_allowed: bool = False
     visual_robotics_parity_claimed: bool = False
@@ -228,6 +255,8 @@ class JEPATransferResult:
             raise ValueError("protocol must be exact")
         if type(self.research_pins) is not dict or self.research_pins != PINNED_RESEARCH:
             raise ValueError("research pins differ from the independently audited roster")
+        if type(self.identity) is not DevelopmentIdentity:
+            raise ValueError("identity must be exact")
         expected = tuple(
             (arm_id, seed) for seed in self.protocol.seeds for arm_id in FROZEN_ARM_IDS
         )
@@ -295,8 +324,41 @@ class JEPATransferResult:
             expected_encoder_bytes = 4 * (2 * _LATENT_DIM + _LATENT_DIM) if index < 5 else 0
             if resources.encoder_bytes != expected_encoder_bytes:
                 raise ValueError("encoder byte receipts differ from the frozen architecture")
-            if (index == 5) != (resources.persistent_mechanism_bytes == 0):
-                raise ValueError("persistent bytes disagree with the enabled mechanism")
+            env = SwitchingTwoStateMDP(
+                SwitchingTwoStateConfig(phase_length=self.protocol.phase_length)
+            )
+            env_key, agent_key = jr.split(jr.key(arm.seed))
+            expected_environment_bytes = _tree_nbytes(env.init(env_key))
+            if resources.persistent_environment_bytes != expected_environment_bytes:
+                raise ValueError("environment bytes differ from the derived state")
+            if index < 5:
+                if index == 3:
+                    pretrained, _, _, _ = _pretrain(self.protocol, arm.seed)
+                    expected_mechanism_bytes = _tree_nbytes(pretrained)
+                else:
+                    expected_mechanism_bytes = _tree_nbytes(
+                        _model(encoder_learning=False).init(
+                            jr.fold_in(jr.key(arm.seed), 2)
+                        )
+                    )
+            elif index == 5:
+                expected_mechanism_bytes = 0
+            else:
+                agent = SARSAAgent(
+                    SARSAConfig(
+                        n_actions=2,
+                        gamma=0.99,
+                        epsilon_start=0.1,
+                        epsilon_end=0.1,
+                        epsilon_decay_steps=1,
+                    ),
+                    hidden_sizes=(),
+                    sparsity=0.0,
+                    use_layer_norm=False,
+                )
+                expected_mechanism_bytes = _tree_nbytes(agent.init(2, agent_key))
+            if resources.persistent_mechanism_bytes != expected_mechanism_bytes:
+                raise ValueError("persistent mechanism bytes differ from the derived state")
 
     def to_payload(self) -> dict[str, object]:
         return cast(dict[str, object], json.loads(json.dumps(dataclasses.asdict(self))))
@@ -315,7 +377,7 @@ def validate_jepa_transfer_payload(payload: object) -> JEPATransferResult:
         "exploration_period", "seeds",
     }:
         raise ValueError("protocol payload differs from the schema")
-    protocol_values = cast(dict[str, Any], protocol_raw)
+    protocol_values = dict(cast(dict[str, Any], protocol_raw))
     seeds = protocol_values.pop("seeds")
     if type(seeds) is not list:
         raise ValueError("serialized seeds must be an exact list")
@@ -340,15 +402,18 @@ def validate_jepa_transfer_payload(payload: object) -> JEPATransferResult:
         values["resources"] = TransferResources(**resource_raw)
         values["timing"] = TimingTelemetry(**timing_raw)
         arms.append(TransferArmReceipt(**values))
-    return JEPATransferResult(
+    result = JEPATransferResult(
         schema=root["schema"],
         protocol=protocol,
         research_pins=cast(dict[str, str], root["research_pins"]),
         arms=tuple(arms),
+        identity=identity_from_payload(root["identity"]),
         development_only=root["development_only"],
         scientific_promotion_allowed=root["scientific_promotion_allowed"],
         visual_robotics_parity_claimed=root["visual_robotics_parity_claimed"],
     )
+    require_current_identity(result.identity, _current_identity())
+    return result
 
 
 def _model(*, encoder_learning: bool) -> LatentWorldModel:
@@ -611,6 +676,7 @@ def run_jepa_transfer_feasibility(
         protocol=protocol,
         research_pins=dict(PINNED_RESEARCH),
         arms=tuple(arms),
+        identity=_current_identity(),
     )
 
 
