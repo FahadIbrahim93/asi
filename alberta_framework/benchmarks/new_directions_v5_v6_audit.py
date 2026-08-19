@@ -36,6 +36,46 @@ _V6_SCHEDULE_SHA256 = {
     2: "fb4509df7511710668559b25a6b5453a4a08de0fb34b642da24d218d94b98aaf",
 }
 
+_V5_SUBJECT_BINDINGS = {
+    "raw_json": (
+        "outputs/new_directions/V5_model_side.json",
+        "d42a49bc7d5c696bc310c4864c4fc37c1edd56c4097dfd0ab6bcbca9b393351d",
+        90_159,
+    ),
+    "raw_report": (
+        "outputs/new_directions/V5_model_side.md",
+        "349e4bd6710f5cbfb097fdc054448d0bfb924d6687fbdc31f70daec3c66afd09",
+        5_858,
+    ),
+    "raw_runner": (
+        "outputs/new_directions/V5_model_side_runner.py",
+        "6573d26f9246c5f57b76b15fcceac44ac141180a1d2a579d92c05688bdb130f9",
+        19_054,
+    ),
+}
+_V6_SUBJECT_BINDINGS = {
+    "raw_json": (
+        "outputs/new_directions/V6_recurrence_headroom.json",
+        "5235c8067561e07cd81b98dde2a25af783dc38abe094edfccf2593499547bf26",
+        6_564,
+    ),
+    "raw_report": (
+        "outputs/new_directions/V6_recurrence_headroom.md",
+        "0abb02ce03e1f43082df59a266820fdff421d2c3ca8efd81e08d9d75366c3e84",
+        5_132,
+    ),
+    "raw_runner": (
+        "outputs/new_directions/V6_recurrence_headroom_runner.py",
+        "237426a246851068c77689bce516b76e6ae036109a3e1ec01362ed12220a2f02",
+        6_403,
+    ),
+    "bayes_source": (
+        "outputs/micro_continual/ladder_m1/summary_input_permutation.json",
+        "18148e29e1c40d30ae037274f6140d2b05366e7775c1ec94550b5451e311c038",
+        5_564,
+    ),
+}
+
 NONPROMOTING_POLICY = {
     "development_only": True,
     "negative_outcomes_retained": True,
@@ -348,13 +388,33 @@ def validate_v5_raw(raw: object) -> dict[str, Any]:
         raise ValueError("V5 raw control verdict does not recompute")
     if not any(recomputed_verdict[arm]["void"] for arm in V5_MODEL_ARMS):
         raise ValueError("V5 historical abort deviation is no longer present")
-    promotion = payload["promotion"]
-    if type(promotion) is not dict or promotion.get("promoted") is not False:
+    promotion = _exact_dict(
+        payload["promotion"],
+        {"best_configuration", "criterion", "promoted", "sample_floor_n_star"},
+        name="V5 raw promotion",
+    )
+    if promotion["promoted"] is not False:
         raise ValueError("the preserved V5 observation must not claim promotion")
+    sample_floors = _exact_dict(
+        promotion["sample_floor_n_star"],
+        {
+            "F5a_weight_path/greedy",
+            "F5a_weight_path/hungarian",
+            "F5b_gradient_affinity/greedy",
+            "F5b_gradient_affinity/hungarian",
+            "F5c_v1_data_side/greedy",
+            "F5c_v1_data_side/hungarian",
+        },
+        name="V5 raw sample floors",
+    )
+    sample_floor = _finite_float(
+        sample_floors["F5c_v1_data_side/hungarian"], name="V5 F5c sample floor"
+    )
     return {
         "cell_count": len(cells),
         "aggregate_count": len(computed),
         "failed_model_arms": [arm for arm in V5_MODEL_ARMS if recomputed_verdict[arm]["void"]],
+        "sample_floor_observation": sample_floor,
         "computed": computed,
     }
 
@@ -398,10 +458,12 @@ def validate_v6_raw(raw: object) -> dict[str, Any]:
         raise ValueError("V6 runs do not cover the exact frozen product")
 
     recomputed: dict[str, dict[str, Any]] = {}
+    exact_per_seed_gaps: dict[str, list[float]] = {}
     for arm in V6_ARMS:
         m1 = [values[(arm, "input_permutation", seed)] for seed in V6_SEEDS]
         m4 = [values[(arm, "recurrence", seed)] for seed in V6_SEEDS]
         per_seed = [right - left for left, right in zip(m1, m4, strict=True)]
+        exact_per_seed_gaps[arm] = per_seed
         recomputed[arm] = {
             "arm": arm,
             "per_seed_gap": [round(value, 6) for value in per_seed],
@@ -431,7 +493,20 @@ def validate_v6_raw(raw: object) -> dict[str, Any]:
         for field in ("all_seeds_positive", "exploits_recurrence"):
             if gap[field] is not expected_gap[field]:
                 raise ValueError(f"V6 {field} does not recompute")
-    return {"run_count": len(values), "gaps": recomputed}
+    best_m4_arm = max(V6_ARMS, key=lambda arm: cast(float, recomputed[arm]["m4_mean"]))
+    return {
+        "run_count": len(values),
+        "gaps": recomputed,
+        "best_m4_arm": best_m4_arm,
+        "arms_meeting_criterion": [
+            arm for arm in V6_ARMS if recomputed[arm]["exploits_recurrence"] is True
+        ],
+        "seeds_meeting_all_arm_criterion": [
+            seed
+            for index, seed in enumerate(V6_SEEDS)
+            if all(exact_per_seed_gaps[arm][index] > 0.0 for arm in V6_ARMS)
+        ],
+    }
 
 
 def _validate_policy(value: object) -> None:
@@ -439,15 +514,30 @@ def _validate_policy(value: object) -> None:
         raise ValueError("audit policy must be the exact permanently nonpromoting policy")
 
 
-def _validate_bound_file(root: Path, value: object, *, name: str) -> None:
+def _validate_bound_file(
+    root: Path,
+    value: object,
+    *,
+    name: str,
+    expected_path: str,
+    expected_sha256: str,
+    expected_size: int,
+) -> None:
     binding = _exact_dict(value, {"path", "sha256", "size_bytes"}, name=name)
-    if type(binding["path"]) is not str or type(binding["sha256"]) is not str:
-        raise ValueError(f"{name} path and sha256 must be exact strings")
-    if len(binding["sha256"]) != 64 or any(c not in "0123456789abcdef" for c in binding["sha256"]):
-        raise ValueError(f"{name} sha256 must be lowercase hexadecimal")
-    size = _exact_int(binding["size_bytes"], name=f"{name}.size_bytes")
-    path = root / binding["path"]
-    if not path.is_file() or path.stat().st_size != size or file_sha256(path) != binding["sha256"]:
+    if binding["path"] != expected_path:
+        raise ValueError(f"{name} must use its exact canonical path")
+    if binding["sha256"] != expected_sha256 or binding["size_bytes"] != expected_size:
+        raise ValueError(f"{name} file binding mismatch")
+    root_path = root.resolve(strict=True)
+    path = root_path / expected_path
+    try:
+        resolved_path = path.resolve(strict=True)
+        resolved_path.relative_to(root_path)
+    except (FileNotFoundError, ValueError) as exc:
+        raise ValueError(f"{name} must remain contained in the repository root") from exc
+    if resolved_path != path or not path.is_file():
+        raise ValueError(f"{name} must be a canonical contained regular file")
+    if path.stat().st_size != expected_size or file_sha256(path) != expected_sha256:
         raise ValueError(f"{name} file binding mismatch")
 
 
@@ -642,8 +732,15 @@ def validate_v5_amendment(root: Path, raw: object, amendment: object) -> dict[st
     )
     if subject["original_commit"] != "cd0bb80a641b5a92871f7d6073693f61516964dc":
         raise ValueError("unexpected V5 original commit")
-    for key in ("raw_json", "raw_report", "raw_runner"):
-        _validate_bound_file(root, subject[key], name=f"V5 subject.{key}")
+    for key, binding in _V5_SUBJECT_BINDINGS.items():
+        _validate_bound_file(
+            root,
+            subject[key],
+            name=f"V5 subject.{key}",
+            expected_path=binding[0],
+            expected_sha256=binding[1],
+            expected_size=binding[2],
+        )
     _validate_policy(record["policy"])
     protocol = _exact_dict(
         record["protocol"],
@@ -675,17 +772,23 @@ def validate_v5_amendment(root: Path, raw: object, amendment: object) -> dict[st
         "independent_aggregate_recomputation", "dataset_binding_limitation",
     }
     _exact_dict(audit, expected_audit_keys, name="V5 audit")
-    if audit["failed_model_arms"] != raw_summary["failed_model_arms"]:
-        raise ValueError("V5 amendment failed-arm list mismatch")
-    if audit["raw_online_cell_count"] != raw_summary["cell_count"]:
-        raise ValueError("V5 amendment cell count mismatch")
-    if (
-        audit["valid_online_cell_count"] != 0
-        or audit["raw_auto_promotion_field_ignored"] is not True
-    ):
-        raise ValueError("V5 online observations must be void and auto-promotion ignored")
-    if audit["independent_aggregate_recomputation"] != "matched-24-of-24":
-        raise ValueError("V5 aggregate recomputation status mismatch")
+    expected_audit = {
+        "original_execution_deviation": (
+            "both model-side arms failed the preregistered control gate, but the raw runner "
+            "continued through 216 online cells instead of aborting"
+        ),
+        "failed_model_arms": raw_summary["failed_model_arms"],
+        "raw_online_cell_count": raw_summary["cell_count"],
+        "valid_online_cell_count": 0,
+        "raw_auto_promotion_field_ignored": True,
+        "independent_aggregate_recomputation": "matched-24-of-24",
+        "dataset_binding_limitation": (
+            "the original cache bytes and exact argv were not recorded, so the canonical "
+            "MNIST cache digest is only a post-hoc reference"
+        ),
+    }
+    if audit != expected_audit:
+        raise ValueError("V5 audit status does not match the independently derived disposition")
     outcome = _exact_dict(
         record["outcome"],
         {
@@ -696,10 +799,28 @@ def validate_v5_amendment(root: Path, raw: object, amendment: object) -> dict[st
         },
         name="V5 outcome",
     )
-    if outcome.get("status") != "invalid-preregistered-execution" or outcome.get(
-        "scientific_claim_allowed"
-    ) is not False:
-        raise ValueError("V5 outcome must fail closed")
+    expected_outcome = {
+        "status": "invalid-preregistered-execution",
+        "scientific_claim_allowed": False,
+        "model_side_online_rows": "void",
+        "all_online_rows_under_literal_preregistration": (
+            "void-because-the-run-should-have-aborted"
+        ),
+        "data_side_scope": (
+            "same-stack descriptive consistency check using the same MNIST, schedule, seeds, "
+            "and a stronger hybrid batch estimator; not an independent replication"
+        ),
+        "sample_floor_observation": raw_summary["sample_floor_observation"],
+        "sample_floor_interpretation": "descriptive same-stack lower-bound consistency only",
+        "novel_permutation_scope": "the structural argument applies only to novel permutations",
+        "recurrence_scope": (
+            "not tested; repeat recognition can use stored whole-input signatures rather than "
+            "per-pixel identification"
+        ),
+        "entry_15_status": "open-model-side-family-untested",
+    }
+    if outcome != expected_outcome:
+        raise ValueError("V5 outcome does not match the independently derived disposition")
     _validate_v5_identity(record["identity"])
     return {"status": outcome["status"], "valid_online_cell_count": 0}
 
@@ -720,8 +841,15 @@ def validate_v6_amendment(root: Path, raw: object, amendment: object) -> dict[st
     )
     if subject["original_commit"] != "07034c49baad9ca9de07a602366ae0a4b5a9d948":
         raise ValueError("unexpected V6 original commit")
-    for key in ("raw_json", "raw_report", "raw_runner", "bayes_source"):
-        _validate_bound_file(root, subject[key], name=f"V6 subject.{key}")
+    for key, binding in _V6_SUBJECT_BINDINGS.items():
+        _validate_bound_file(
+            root,
+            subject[key],
+            name=f"V6 subject.{key}",
+            expected_path=binding[0],
+            expected_sha256=binding[1],
+            expected_size=binding[2],
+        )
     _validate_policy(record["policy"])
     protocol = _exact_dict(
         record["protocol"],
@@ -815,21 +943,25 @@ def validate_v6_amendment(root: Path, raw: object, amendment: object) -> dict[st
         },
         name="V6 audit",
     )
-    if audit.get("raw_run_count") != raw_summary["run_count"]:
-        raise ValueError("V6 run count mismatch")
-    if audit.get("controls_completed_for_all_seeds") is not True:
-        raise ValueError("V6 all-seed controls are required")
-    if audit.get("registered_all_arm_table_primary") is not True:
-        raise ValueError("V6 registered all-arm table must remain primary")
-    if audit.get("post_hoc_7_9x_grouping") != "not-retained-as-causal-or-primary":
-        raise ValueError("V6 post-hoc grouping must be demoted")
-    if (
-        audit["family_controls_reconstructed_without_learner_execution"] is not True
-        or audit["bayes_values_reused_from_bound_matching_default-config_summary"]
-        is not True
-        or audit["independent_all_arm_aggregate_recomputation"] != "matched-6-of-6"
-    ):
-        raise ValueError("V6 reconstructed audit status mismatch")
+    expected_audit = {
+        "original_execution_deviation": (
+            "the original runner checked family separation for seed 0 only before executing "
+            "36 cells"
+        ),
+        "controls_completed_for_all_seeds": True,
+        "family_controls_reconstructed_without_learner_execution": True,
+        "bayes_values_reused_from_bound_matching_default-config_summary": True,
+        "raw_run_count": raw_summary["run_count"],
+        "independent_all_arm_aggregate_recomputation": "matched-6-of-6",
+        "registered_all_arm_table_primary": True,
+        "post_hoc_7_9x_grouping": "not-retained-as-causal-or-primary",
+        "ipmnist_recurrence_scope": (
+            "the 200-task IPMNIST schedule contains no recurring permutation, so this result "
+            "is not champion-lane headroom"
+        ),
+    }
+    if audit != expected_audit:
+        raise ValueError("V6 audit status does not match the independently derived disposition")
     outcome = _exact_dict(
         record["outcome"],
         {
@@ -847,14 +979,34 @@ def validate_v6_amendment(root: Path, raw: object, amendment: object) -> dict[st
         mean_bayes - best_m4,
         name="V6 descriptive headroom",
     )
-    if outcome.get("criterion_met_on_consumed_seeds") != list(V6_SEEDS):
+    if outcome.get("criterion_met_on_consumed_seeds") != raw_summary[
+        "seeds_meeting_all_arm_criterion"
+    ]:
         raise ValueError("V6 criterion scope must be the three consumed seeds")
-    if outcome.get("arms_meeting_registered_criterion") != list(V6_ARMS):
+    if outcome.get("arms_meeting_registered_criterion") != raw_summary[
+        "arms_meeting_criterion"
+    ]:
         raise ValueError("V6 outcome arm roster mismatch")
-    if outcome.get("status") != "amended-inconclusive-development-result":
-        raise ValueError("V6 outcome must remain explicitly inconclusive")
-    if outcome.get("scientific_claim_allowed") is not False:
-        raise ValueError("V6 scientific promotion must remain forbidden")
+    expected_claims = {
+        "status": "amended-inconclusive-development-result",
+        "claim_scope": (
+            "the registered descriptive criterion was met for all six arms on exactly three "
+            "consumed development seeds"
+        ),
+        "mechanism_claim": (
+            "none; a recurrence-family gain does not establish an explicit recurrence-indexing "
+            "mechanism"
+        ),
+        "best_m4_arm": raw_summary["best_m4_arm"],
+        "scientific_claim_allowed": False,
+        "why_inconclusive": (
+            "complete original runtime/dependency/invocation identity was not recorded and the "
+            "all-seed controls are an append-only reconstruction, not controls executed before "
+            "the historical cells"
+        ),
+    }
+    if any(outcome[name] != expected for name, expected in expected_claims.items()):
+        raise ValueError("V6 outcome claim or status does not match the derived disposition")
     _validate_v6_identity(record["identity"])
     return {"status": outcome.get("status"), "run_count": raw_summary["run_count"]}
 
