@@ -25,7 +25,7 @@ from alberta_framework.benchmarks.nap_ipmnist import (
     run_comparator,
     validate_result,
 )
-from alberta_framework.benchmarks.plasticity_diagnostics import INPUT_DIM
+from alberta_framework.benchmarks.plasticity_diagnostics import INPUT_DIM, PROFILES
 
 pytestmark = pytest.mark.integration
 
@@ -97,7 +97,9 @@ def test_exact_matched_and_logical_compute_receipts() -> None:
         for arm in result.arms
     }
     assert common == {(8, 8, 8 * (INPUT_DIM * 4 + 4))}
-    assert {arm.receipt.model_queries for arm in result.arms} == {16}
+    assert {arm.receipt.training_model_queries for arm in result.arms} == {16}
+    assert {arm.receipt.diagnostic_model_queries for arm in result.arms} == {8}
+    assert {arm.receipt.model_queries for arm in result.arms} == {24}
     assert {arm.receipt.parameter_updates for arm in result.arms} == {8}
     assert len({arm.receipt.logical_forward_macs for arm in result.arms}) == 1
     assert len({arm.receipt.logical_gradient_macs for arm in result.arms}) == 1
@@ -138,6 +140,12 @@ def test_jit_and_eager_paths_match_except_timing_and_roundoff() -> None:
         (
             lambda result: dataclasses.replace(result, dependency_source_sha256="0" * 64),
             "dependency source",
+        ),
+        (
+            lambda result: dataclasses.replace(
+                result, nap_project_dependency_source_sha256="0" * 64
+            ),
+            "nap_project dependency source",
         ),
         (
             lambda result: dataclasses.replace(
@@ -197,6 +205,18 @@ def test_schedule_is_frozen_and_seed_specific() -> None:
     assert not first.labels_permuted
     assert not first.task_boundaries_visible_to_learner
     assert not first.task_ids_visible_to_learner
+
+
+def test_result_binds_the_complete_immutable_profile() -> None:
+    result = _result()
+    assert result.profile == PROFILES[result.profile_id]
+    with pytest.raises(ValueError, match="profile payload"):
+        validate_result(
+            dataclasses.replace(
+                result,
+                profile=dataclasses.replace(result.profile, learning_rate=0.004),
+            )
+        )
 
 
 def test_catalog_and_execution_cli_are_bounded(
