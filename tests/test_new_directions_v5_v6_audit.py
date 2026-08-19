@@ -223,6 +223,41 @@ def test_v5_amendment_rejects_promotion_or_provenance_drift() -> None:
     with pytest.raises(ValueError, match="binding mismatch"):
         validate_v5_amendment(ROOT, _v5_raw(), amendment)
 
+    amendment = _v5_amendment()
+    amendment["subject"]["raw_report"]["path"] = (
+        "outputs/new_directions/../new_directions/V5_model_side.md"
+    )
+    with pytest.raises(ValueError, match="canonical path"):
+        validate_v5_amendment(ROOT, _v5_raw(), amendment)
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    (
+        ("sample_floor_observation", 1.0),
+        ("model_side_online_rows", "usable"),
+        ("data_side_scope", "independent replication"),
+        ("sample_floor_interpretation", "scientific lower bound"),
+        ("novel_permutation_scope", "all schedules"),
+        ("recurrence_scope", "confirmed"),
+        ("entry_15_status", "closed"),
+    ),
+)
+def test_v5_amendment_derives_every_material_outcome_field(
+    field: str, replacement: object
+) -> None:
+    amendment = _v5_amendment()
+    amendment["outcome"][field] = replacement
+    with pytest.raises(ValueError, match="V5 outcome"):
+        validate_v5_amendment(ROOT, _v5_raw(), amendment)
+
+
+def test_v5_amendment_rejects_false_audit_status_text() -> None:
+    amendment = _v5_amendment()
+    amendment["audit"]["original_execution_deviation"] = "none"
+    with pytest.raises(ValueError, match="V5 audit"):
+        validate_v5_amendment(ROOT, _v5_raw(), amendment)
+
 
 def test_v6_amendment_requires_all_seed_controls_and_matched_bayes() -> None:
     amendment = _v6_amendment()
@@ -242,6 +277,33 @@ def test_v6_amendment_recomputes_matched_headroom() -> None:
     amendment = _v6_amendment()
     amendment["outcome"]["descriptive_bayes_minus_best_m4"] = 0.245
     with pytest.raises(ValueError, match="descriptive headroom"):
+        validate_v6_amendment(ROOT, _v6_raw(), amendment)
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    (
+        ("best_m4_arm", "fabricated"),
+        ("criterion_met_on_consumed_seeds", [0]),
+        ("arms_meeting_registered_criterion", ["sgd_raw"]),
+        ("claim_scope", "general recurrence result"),
+        ("mechanism_claim", "proved"),
+        ("why_inconclusive", "conclusive"),
+    ),
+)
+def test_v6_amendment_derives_every_material_outcome_field(
+    field: str, replacement: object
+) -> None:
+    amendment = _v6_amendment()
+    amendment["outcome"][field] = replacement
+    with pytest.raises(ValueError, match="V6 outcome|criterion scope|arm roster"):
+        validate_v6_amendment(ROOT, _v6_raw(), amendment)
+
+
+def test_v6_amendment_rejects_false_audit_status_text() -> None:
+    amendment = _v6_amendment()
+    amendment["audit"]["ipmnist_recurrence_scope"] = "IPMNIST headroom established"
+    with pytest.raises(ValueError, match="V6 audit"):
         validate_v6_amendment(ROOT, _v6_raw(), amendment)
 
 
