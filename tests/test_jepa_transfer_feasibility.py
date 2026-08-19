@@ -120,9 +120,18 @@ def test_hostile_and_expanded_payloads_fail_closed(result: lane.JEPATransferResu
         lane.validate_jepa_transfer_payload(forged_identity)
 
 
-def test_validator_is_pure_on_success_and_failure(result: lane.JEPATransferResult) -> None:
+def test_validator_is_pure_on_success_and_failure(
+    result: lane.JEPATransferResult, monkeypatch: pytest.MonkeyPatch
+) -> None:
     payload = result.to_payload()
     original = copy.deepcopy(payload)
+
+    def forbidden_execution(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("validation must not execute pretraining or replay")
+
+    monkeypatch.setattr(lane, "_pretrain", forbidden_execution)
+    monkeypatch.setattr(lane, "_base_actions", forbidden_execution)
+    monkeypatch.setattr(lane.LatentWorldModel, "update", forbidden_execution)
     lane.validate_jepa_transfer_payload(payload)
     assert payload == original
 
@@ -137,6 +146,12 @@ def test_validator_is_pure_on_success_and_failure(result: lane.JEPATransferResul
 def test_paper_registry_is_immutable() -> None:
     with pytest.raises(TypeError):
         lane.PINNED_RESEARCH["new"] = "mutable"  # type: ignore[index]
+
+
+def test_result_research_pins_are_deeply_immutable(result: lane.JEPATransferResult) -> None:
+    assert result.research_pins == tuple(sorted(lane.PINNED_RESEARCH.items()))
+    with pytest.raises(TypeError):
+        result.research_pins[0] = ("jepa_wm_paper", "forged")  # type: ignore[index]
 
 
 @pytest.mark.parametrize(

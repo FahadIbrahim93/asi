@@ -58,6 +58,7 @@ PINNED_RESEARCH = MappingProxyType({
     "vjepa2_paper": "arXiv:2506.09985v1",
     "vjepa2_code": "204698b45b3712590f06245fbfba32d3be539812",
 })
+PINNED_RESEARCH_ITEMS = tuple(sorted(PINNED_RESEARCH.items()))
 _MAX_STEPS = 4096
 _INT32_MAX = 2**31 - 1
 _LATENT_DIM = 4
@@ -241,7 +242,7 @@ class TransferArmReceipt:
 class JEPATransferResult:
     schema: str
     protocol: JEPATransferProtocol
-    research_pins: dict[str, str]
+    research_pins: tuple[tuple[str, str], ...]
     arms: tuple[TransferArmReceipt, ...]
     identity: DevelopmentIdentity
     development_only: bool = True
@@ -253,7 +254,7 @@ class JEPATransferResult:
             raise ValueError("unsupported JEPA-transfer schema")
         if type(self.protocol) is not JEPATransferProtocol:
             raise ValueError("protocol must be exact")
-        if type(self.research_pins) is not dict or self.research_pins != PINNED_RESEARCH:
+        if self.research_pins != PINNED_RESEARCH_ITEMS:
             raise ValueError("research pins differ from the independently audited roster")
         if type(self.identity) is not DevelopmentIdentity:
             raise ValueError("identity must be exact")
@@ -332,15 +333,25 @@ class JEPATransferResult:
             if resources.persistent_environment_bytes != expected_environment_bytes:
                 raise ValueError("environment bytes differ from the derived state")
             if index < 5:
+                # Model and optimizer array shapes are fixed across updates.
+                # JIT canonicalizes the learner's two process-local Python
+                # float telemetry leaves to scalar float32 arrays on its first
+                # update. The full-warm-start arm arrives in that structural
+                # state; other arms retain a larger fresh state at their peak.
+                structural_state = _model(encoder_learning=False).init(
+                    jr.fold_in(jr.key(arm.seed), 2)
+                )
                 if index == 3:
-                    pretrained, _, _, _ = _pretrain(self.protocol, arm.seed)
-                    expected_mechanism_bytes = _tree_nbytes(pretrained)
-                else:
-                    expected_mechanism_bytes = _tree_nbytes(
-                        _model(encoder_learning=False).init(
-                            jr.fold_in(jr.key(arm.seed), 2)
+                    learner_state = cast(Any, structural_state).learner_state
+                    structural_state = cast(Any, structural_state).replace(
+                        learner_state=learner_state.replace(
+                            birth_timestamp=jnp.asarray(
+                                learner_state.birth_timestamp, dtype=jnp.float32
+                            ),
+                            uptime_s=jnp.asarray(learner_state.uptime_s, dtype=jnp.float32),
                         )
                     )
+                expected_mechanism_bytes = _tree_nbytes(structural_state)
             elif index == 5:
                 expected_mechanism_bytes = 0
             else:
@@ -361,7 +372,18 @@ class JEPATransferResult:
                 raise ValueError("persistent mechanism bytes differ from the derived state")
 
     def to_payload(self) -> dict[str, object]:
-        return cast(dict[str, object], json.loads(json.dumps(dataclasses.asdict(self))))
+        raw = dataclasses.asdict(self)
+        raw["research_pins"] = dict(self.research_pins)
+        return cast(dict[str, object], json.loads(json.dumps(raw)))
+
+
+def _research_pins_from_payload(value: object) -> tuple[tuple[str, str], ...]:
+    if type(value) is not dict:
+        raise ValueError("research pins must be an exact object")
+    pins = cast(dict[object, object], value)
+    if any(type(key) is not str or type(item) is not str for key, item in pins.items()):
+        raise ValueError("research pins must contain exact strings")
+    return tuple(sorted(cast(dict[str, str], pins).items()))
 
 
 def validate_jepa_transfer_payload(payload: object) -> JEPATransferResult:
@@ -405,7 +427,7 @@ def validate_jepa_transfer_payload(payload: object) -> JEPATransferResult:
     result = JEPATransferResult(
         schema=root["schema"],
         protocol=protocol,
-        research_pins=cast(dict[str, str], root["research_pins"]),
+        research_pins=_research_pins_from_payload(root["research_pins"]),
         arms=tuple(arms),
         identity=identity_from_payload(root["identity"]),
         development_only=root["development_only"],
@@ -674,7 +696,7 @@ def run_jepa_transfer_feasibility(
     return JEPATransferResult(
         schema=JEPA_TRANSFER_SCHEMA,
         protocol=protocol,
-        research_pins=dict(PINNED_RESEARCH),
+        research_pins=PINNED_RESEARCH_ITEMS,
         arms=tuple(arms),
         identity=_current_identity(),
     )
