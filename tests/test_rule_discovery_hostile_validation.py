@@ -1,4 +1,8 @@
-"""Hostile validation for rule discovery int gates."""
+"""Hostile validation for rule discovery int gates.
+
+Search ints must stay inside [minimum, 2**31-1] so a 10**12 generations
+value cannot allocate or hang the micro-suite screen.
+"""
 
 from __future__ import annotations
 
@@ -61,3 +65,9 @@ def test_source_has_no_repr_leak() -> None:
 
 def test_valid_int_passes() -> None:
     assert _require_search_int("my_param", 5, minimum=1) == 5
+
+
+def test_require_search_int_rejects_unbounded_int() -> None:
+    with pytest.raises(ValueError, match="must be an integer"):
+        _require_search_int("task_length", 10**12, minimum=1)
+    assert _require_search_int("task_length", 2**31 - 1, minimum=1) == 2**31 - 1
