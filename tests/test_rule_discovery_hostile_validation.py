@@ -1,7 +1,8 @@
-"""Hostile validation for rule discovery int gates.
+"""Hostile validation for rule discovery search-resource gates.
 
-Search ints must stay inside [minimum, 2**31-1] so a 10**12 generations
-value cannot allocate or hang the micro-suite screen.
+Protocol-bound per-name caps plus combined work-unit products must reject
+before JAX allocation, stream construction, or range loops. The exact-type
+hostile gate stays; 2**31-1 is not a legal search int.
 """
 
 from __future__ import annotations
@@ -10,12 +11,15 @@ import pathlib
 
 import pytest
 
+from alberta_framework.benchmarks.micro_continual import MICRO_SUITE
 from alberta_framework.benchmarks.rule_discovery import (
-    _SEARCH_CANDIDATE_EVALS_MAX,
     _SEARCH_INT_MAX_BY_NAME,
     _SEARCH_STREAM_STEPS_MAX,
+    GENOME_SIZE,
     _require_search_int,
     _require_search_work_unit,
+    _resolved_suite,
+    evaluate_population,
 )
 
 
@@ -36,7 +40,7 @@ class _EvilStr(str):
 
     def __repr__(self) -> str:  # pragma: no cover
         type(self).calls += 1
-        raise AssertionError("repr hook")
+        raise AssertionError("str hook")
 
 
 def test_require_search_int_rejects_hostile_without_hooks() -> None:
@@ -73,9 +77,13 @@ def test_valid_int_passes() -> None:
     assert _require_search_int("my_param", 5, minimum=1) == 5
 
 
-def test_require_search_int_rejects_unbounded_int() -> None:
+def test_require_search_int_rejects_unbounded_and_int32_max() -> None:
     with pytest.raises(ValueError, match="must be an integer"):
         _require_search_int("task_length", 10**12, minimum=1)
+    with pytest.raises(ValueError, match="must be an integer"):
+        _require_search_int("n_random", 2**31 - 1, minimum=0)
+    with pytest.raises(ValueError, match="must be an integer"):
+        _require_search_int("generations", 2**31 - 1, minimum=0)
 
 
 def test_require_search_int_last_fit_and_first_overflow() -> None:
@@ -86,11 +94,55 @@ def test_require_search_int_last_fit_and_first_overflow() -> None:
 
 
 def test_require_search_work_unit_combined_product() -> None:
-    _require_search_work_unit(n_random=_SEARCH_CANDIDATE_EVALS_MAX)
-    with pytest.raises(ValueError, match="candidate evaluations"):
-        _require_search_work_unit(n_random=_SEARCH_CANDIDATE_EVALS_MAX + 1)
+    last_fit_rows = _SEARCH_INT_MAX_BY_NAME["n_random"]
+    _require_search_work_unit(n_random=last_fit_rows)
+    with pytest.raises(ValueError, match="candidate arrays"):
+        _require_search_work_unit(n_random=last_fit_rows + 1)
     _require_search_work_unit(
         n_random=0, n_tasks=2, task_length=_SEARCH_STREAM_STEPS_MAX // 2
     )
     with pytest.raises(ValueError, match="stream steps"):
         _require_search_work_unit(n_random=0, n_tasks=2, task_length=5_000_001)
+
+
+def test_require_search_work_unit_adjacent_population_generations() -> None:
+    _require_search_work_unit(n_random=0, population=1_024, generations=15)
+    with pytest.raises(ValueError, match="candidate evaluations"):
+        _require_search_work_unit(n_random=0, population=1_024, generations=16)
+
+
+def test_require_search_work_unit_adjacent_children_generations() -> None:
+    _require_search_work_unit(n_random=4_096, children=256, generations=48)
+    with pytest.raises(ValueError, match="candidate evaluations"):
+        _require_search_work_unit(n_random=4_097, children=256, generations=48)
+
+
+def test_resolved_suite_rejects_single_override_stream_product() -> None:
+    last_fit_length = _SEARCH_STREAM_STEPS_MAX // 12
+    _resolved_suite(None, last_fit_length)
+    with pytest.raises(ValueError, match="stream steps"):
+        _resolved_suite(None, last_fit_length + 1)
+
+
+def test_evaluate_population_rejects_oversize_block_before_materialize(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unexpected_materialization(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise AssertionError("oversize genome block reached stream materialization")
+
+    monkeypatch.setattr(
+        "alberta_framework.benchmarks.rule_discovery._materialize_eval",
+        unexpected_materialization,
+    )
+
+    class _Oversize:
+        shape = (_SEARCH_INT_MAX_BY_NAME["n_random"] + 1, GENOME_SIZE)
+
+    with pytest.raises(ValueError, match="must be an integer"):
+        evaluate_population(
+            _Oversize(),  # type: ignore[arg-type]
+            MICRO_SUITE["M1"],
+            seeds=(0,),
+            batch_size=1,
+        )
