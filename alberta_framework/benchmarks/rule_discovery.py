@@ -868,17 +868,56 @@ def _require_unique_task_names(task_names: Sequence[str], *, name: str) -> tuple
     return names
 
 
-# Search ints feed allocations and `range(generations)`. Unbounded 10**12
-# values hang / OOM the micro-suite screen.
-_SEARCH_INT_MAX: int = 2**31 - 1
+# Protocol search ceilings. Stream bounds match MicroTaskConfig. Search-budget
+# bounds are 4× the documented run_search / tune_champion_baseline defaults so
+# the maintained micro screen still fits and 2**31-1 cannot allocate.
+_SEARCH_INT_MAX_BY_NAME: dict[str, int] = {
+    "n_random": 12_288,
+    "population": 1_024,
+    "generations": 48,
+    "children": 256,
+    "elite": 128,
+    "top_k": 64,
+    "batch_size": 1_024,
+    "n_tasks": 4_096,
+    "task_length": 10_000_000,
+}
+_SEARCH_CANDIDATE_EVALS_MAX = 16_384
+_SEARCH_STREAM_STEPS_MAX = 10_000_000
 
 
 def _require_search_int(name: str, value: object, *, minimum: int) -> int:
     if type(name) is not str:
         raise ValueError("name must be an exact string")
-    if type(value) is not int or value < minimum or value > _SEARCH_INT_MAX:
+    maximum = _SEARCH_INT_MAX_BY_NAME.get(name)
+    if (
+        type(value) is not int
+        or value < minimum
+        or (maximum is not None and value > maximum)
+    ):
         raise ValueError(f"{name} must be an integer >= {minimum}")
     return value
+
+
+def _require_search_work_unit(
+    *,
+    n_random: int,
+    population: int = 0,
+    generations: int = 0,
+    children: int = 0,
+    n_tasks: int | None = None,
+    task_length: int | None = None,
+) -> None:
+    """Reject combined products that still hang after per-name caps."""
+    candidate_evals = n_random + population * (1 + generations) + children * generations
+    if candidate_evals > _SEARCH_CANDIDATE_EVALS_MAX:
+        raise ValueError("search candidate evaluations exceed the protocol budget")
+    if (
+        n_tasks is not None
+        and task_length is not None
+        and n_tasks * task_length > _SEARCH_STREAM_STEPS_MAX
+    ):
+        raise ValueError("search stream steps exceed the protocol budget")
 
 
 def evaluate_suite(
@@ -972,6 +1011,10 @@ def _resolved_suite(
         n_tasks = _require_search_int("n_tasks", n_tasks, minimum=1)
     if task_length is not None:
         task_length = _require_search_int("task_length", task_length, minimum=1)
+    if n_tasks is not None and task_length is not None:
+        _require_search_work_unit(
+            n_random=0, n_tasks=n_tasks, task_length=task_length
+        )
     suite: dict[str, EvalConfig]
     if suite_kind == "gauss":
         suite = dict(gauss_suite(n_tasks if n_tasks is not None else GAUSS_SEARCH_REGIMES))
@@ -1022,6 +1065,9 @@ def tune_champion_baseline(
     n_random = _require_search_int("n_random", n_random, minimum=0)
     generations = _require_search_int("generations", generations, minimum=0)
     children = _require_search_int("children", children, minimum=1)
+    _require_search_work_unit(
+        n_random=n_random, generations=generations, children=children
+    )
     champion = champion_form_genome()
     flags = jnp.asarray(champion[:_N_FLAGS])
 
@@ -1092,6 +1138,9 @@ def run_search(
     elite = _require_search_int("elite", elite, minimum=1)
     top_k = _require_search_int("top_k", top_k, minimum=1)
     batch_size = _require_search_int("batch_size", batch_size, minimum=1)
+    _require_search_work_unit(
+        n_random=n_random, population=population, generations=generations
+    )
     eval_seeds = require_unique_jax_seeds(eval_seeds, name="eval_seeds")
     holdout_seeds = require_unique_jax_seeds(holdout_seeds, name="holdout_seeds")
     search_seed = require_jax_seed(search_seed, name="search_seed")

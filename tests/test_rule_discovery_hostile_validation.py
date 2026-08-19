@@ -10,7 +10,13 @@ import pathlib
 
 import pytest
 
-from alberta_framework.benchmarks.rule_discovery import _require_search_int
+from alberta_framework.benchmarks.rule_discovery import (
+    _SEARCH_CANDIDATE_EVALS_MAX,
+    _SEARCH_INT_MAX_BY_NAME,
+    _SEARCH_STREAM_STEPS_MAX,
+    _require_search_int,
+    _require_search_work_unit,
+)
 
 
 class _HostileInt(int):
@@ -70,4 +76,21 @@ def test_valid_int_passes() -> None:
 def test_require_search_int_rejects_unbounded_int() -> None:
     with pytest.raises(ValueError, match="must be an integer"):
         _require_search_int("task_length", 10**12, minimum=1)
-    assert _require_search_int("task_length", 2**31 - 1, minimum=1) == 2**31 - 1
+
+
+def test_require_search_int_last_fit_and_first_overflow() -> None:
+    for name, maximum in _SEARCH_INT_MAX_BY_NAME.items():
+        assert _require_search_int(name, maximum, minimum=0) == maximum
+        with pytest.raises(ValueError, match="must be an integer"):
+            _require_search_int(name, maximum + 1, minimum=0)
+
+
+def test_require_search_work_unit_combined_product() -> None:
+    _require_search_work_unit(n_random=_SEARCH_CANDIDATE_EVALS_MAX)
+    with pytest.raises(ValueError, match="candidate evaluations"):
+        _require_search_work_unit(n_random=_SEARCH_CANDIDATE_EVALS_MAX + 1)
+    _require_search_work_unit(
+        n_random=0, n_tasks=2, task_length=_SEARCH_STREAM_STEPS_MAX // 2
+    )
+    with pytest.raises(ValueError, match="stream steps"):
+        _require_search_work_unit(n_random=0, n_tasks=2, task_length=5_000_001)
