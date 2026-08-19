@@ -24,6 +24,7 @@ import jax.numpy as jnp
 import jax.random as jr
 import numpy as np
 
+import alberta_framework.benchmarks.external_qualification as external_qualification_module
 import alberta_framework.core.sarsa as sarsa_module
 from alberta_framework.benchmarks.development_provenance import (
     DevelopmentIdentity,
@@ -87,7 +88,7 @@ _LEARNING_EXTRAS = (
 def _current_identity(protocol: COOMSmokeProtocol) -> DevelopmentIdentity:
     return collect_development_identity(
         lane_module=sys.modules[__name__],
-        dependency_modules=(sarsa_module,),
+        dependency_modules=(external_qualification_module, sarsa_module),
         workload_registry={
             "protocol": dataclasses.asdict(protocol),
             "arms": FROZEN_ARMS,
@@ -349,6 +350,9 @@ class COOMSmokeResult:
             raise ValueError("catalog and protocol must use exact types")
         if type(self.dependencies) is not DependencyReceipt:
             raise ValueError("dependencies must use the exact receipt type")
+        COOMCatalogEntry.__post_init__(self.catalog)
+        COOMSmokeProtocol.__post_init__(self.protocol)
+        DependencyReceipt.__post_init__(self.dependencies)
         require_current_identity(self.identity, _current_identity(self.protocol))
         expected_blockers = qualification_plan(1582).blockers
         if (

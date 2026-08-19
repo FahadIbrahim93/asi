@@ -43,7 +43,7 @@ _MAX_JSON_NODES = 50_000
 _MAX_JSON_CONTAINER_ITEMS = 10_000
 _MAX_JSON_STRING_BYTES = 100_000
 _MAX_STEPS = 64
-_MAX_SEEDS = 4
+FROZEN_DEVELOPMENT_SEEDS = (1_586_000, 1_586_001, 1_586_002)
 _POLICY_SHAPE = (2, 2)
 _POLICY_BYTES = 16
 _ARMS = ("diverse_archive", "one_model", "fixed_snapshot", "mechanism_off")
@@ -220,7 +220,7 @@ class TeLAPACatalogEntry:
 
 @dataclass(frozen=True, slots=True)
 class TeLAPASmokeConfig:
-    seeds: tuple[int, ...] = (1_586_000, 1_586_001, 1_586_002)
+    seeds: tuple[int, ...] = FROZEN_DEVELOPMENT_SEEDS
     steps: int = 32
     phase_length: int = 4
     archive_byte_budget: int = 4096
@@ -228,8 +228,8 @@ class TeLAPASmokeConfig:
     learning_rate: float = 0.125
 
     def __post_init__(self) -> None:
-        if type(self.seeds) is not tuple or not 1 <= len(self.seeds) <= _MAX_SEEDS:
-            raise ValueError("seeds must be a bounded non-empty exact tuple")
+        if type(self.seeds) is not tuple or self.seeds != FROZEN_DEVELOPMENT_SEEDS:
+            raise ValueError("development seeds are frozen")
         if any(type(seed) is not int or not 0 <= seed < 2**31 for seed in self.seeds):
             raise ValueError("seeds must contain exact nonnegative signed-int32 values")
         if len(set(self.seeds)) != len(self.seeds):
@@ -718,6 +718,8 @@ def validate_result(value: object) -> None:
         ):
             if type(receipt[field]) is not int or receipt[field] < 0:
                 raise ValueError(f"{field} must be a nonnegative exact integer")
+        if receipt["archive_persistent_bytes"] > config.archive_byte_budget:
+            raise ValueError("archive persistent bytes exceed the frozen budget")
         if (
             receipt["timing"] is not None
             or type(receipt["timing_policy"]) is not str

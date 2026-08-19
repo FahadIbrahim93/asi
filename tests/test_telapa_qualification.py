@@ -28,7 +28,7 @@ pytestmark = pytest.mark.unit
 
 
 def _result() -> dict[str, Any]:
-    return run_smoke(TeLAPASmokeConfig(seeds=(1_586_000,), steps=8, phase_length=2))
+    return run_smoke(TeLAPASmokeConfig(steps=8, phase_length=2))
 
 
 def test_catalog_fails_closed_without_immutable_anonymous_revision() -> None:
@@ -150,10 +150,10 @@ def test_validator_rejects_nan_extra_fields_and_unbounded_config() -> None:
         validate_result(payload)
     with pytest.raises(ValueError, match=r"\[1, 64\]"):
         TeLAPASmokeConfig(steps=65)
-    with pytest.raises(ValueError, match="exact nonnegative"):
+    with pytest.raises(ValueError, match="frozen"):
         TeLAPASmokeConfig(seeds=(True,))
     with pytest.raises(ValueError, match="worst-case"):
-        TeLAPASmokeConfig(seeds=(0,), steps=64, phase_length=1, archive_byte_budget=128)
+        TeLAPASmokeConfig(steps=64, phase_length=1, archive_byte_budget=128)
 
 
 def test_validator_replays_archive_accounting_and_binds_current_identity() -> None:
