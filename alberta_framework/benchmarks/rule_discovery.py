@@ -744,6 +744,8 @@ def _materialize_eval(
     streams use the canonical suite's ``_INIT_DOMAIN`` chain so genome runs
     are init-paired with the ladder anchors of ``run_micro_arm``.
     """
+    n_tasks, task_length = _eval_stream_bounds(config)
+    _require_search_work_unit(n_random=0, n_tasks=n_tasks, task_length=task_length)
     if isinstance(config, MicroStreamConfig):
         stream = generate_stream(config, int(seed))
         net = IPMNISTConfig(
@@ -787,6 +789,15 @@ def evaluate_population(
     seeds = require_unique_jax_seeds(seeds, name="seeds")
     if type(batch_size) is not int or batch_size < 1:
         raise ValueError("batch_size must be a positive built-in int")
+    batch_size = _require_search_int("batch_size", batch_size, minimum=1)
+    shape = getattr(genomes, "shape", None)
+    n_peek = 0
+    if isinstance(shape, tuple) and len(shape) >= 1:
+        n_peek = _require_search_int("n_random", int(shape[0]), minimum=0)
+    n_tasks, task_length = _eval_stream_bounds(config)
+    _require_search_work_unit(
+        n_random=n_peek, n_tasks=n_tasks, task_length=task_length
+    )
     genomes = jnp.asarray(genomes, dtype=jnp.float32)
     if genomes.ndim != 2 or genomes.shape[1] != GENOME_SIZE:
         raise ValueError(
@@ -868,12 +879,78 @@ def _require_unique_task_names(task_names: Sequence[str], *, name: str) -> tuple
     return names
 
 
+# Protocol search ceilings. Stream bounds match MicroTaskConfig. Search-budget
+# bounds are 4× the documented run_search / tune_champion_baseline defaults so
+# the maintained micro screen still fits and 2**31-1 cannot allocate.
+_SEARCH_INT_MAX_BY_NAME: dict[str, int] = {
+    "n_random": 12_288,
+    "population": 1_024,
+    "generations": 48,
+    "children": 256,
+    "elite": 128,
+    "top_k": 64,
+    "batch_size": 1_024,
+    "n_tasks": 4_096,
+    "task_length": 10_000_000,
+}
+_SEARCH_INT_MAX_FALLBACK = 10_000_000
+_SEARCH_CANDIDATE_EVALS_MAX = 16_384
+_SEARCH_STREAM_STEPS_MAX = 10_000_000
+_SEARCH_CANDIDATE_ROWS_MAX = 12_288
+
+
 def _require_search_int(name: str, value: object, *, minimum: int) -> int:
     if type(name) is not str:
         raise ValueError("name must be an exact string")
-    if type(value) is not int or value < minimum:
+    maximum = _SEARCH_INT_MAX_BY_NAME.get(name, _SEARCH_INT_MAX_FALLBACK)
+    if type(value) is not int or value < minimum or value > maximum:
         raise ValueError(f"{name} must be an integer >= {minimum}")
     return value
+
+
+def _require_search_work_unit(
+    *,
+    n_random: int,
+    population: int = 0,
+    generations: int = 0,
+    children: int = 0,
+    n_tasks: int | None = None,
+    task_length: int | None = None,
+) -> None:
+    """Reject combined products before JAX allocation, stream build, or range."""
+    candidate_rows = n_random
+    if population > candidate_rows:
+        candidate_rows = population
+    if children > candidate_rows:
+        candidate_rows = children
+    if candidate_rows > _SEARCH_CANDIDATE_ROWS_MAX:
+        raise ValueError("search candidate arrays exceed the protocol budget")
+    candidate_evals = n_random + population * (1 + generations) + children * generations
+    if candidate_evals > _SEARCH_CANDIDATE_EVALS_MAX:
+        raise ValueError("search candidate evaluations exceed the protocol budget")
+    if (
+        n_tasks is not None
+        and task_length is not None
+        and n_tasks * task_length > _SEARCH_STREAM_STEPS_MAX
+    ):
+        raise ValueError("search stream steps exceed the protocol budget")
+
+
+def _eval_stream_bounds(config: EvalConfig) -> tuple[int, int]:
+    if isinstance(config, MicroStreamConfig):
+        return config.n_regimes, config.regime_length
+    return config.n_tasks, config.task_length
+
+
+def _require_suite_streams(
+    suite: Mapping[str, EvalConfig],
+    **work_kwargs: int,
+) -> None:
+    for config in suite.values():
+        n_tasks, task_length = _eval_stream_bounds(config)
+        _require_search_work_unit(
+            n_tasks=n_tasks, task_length=task_length, **work_kwargs
+        )
 
 
 def evaluate_suite(
@@ -967,6 +1044,21 @@ def _resolved_suite(
         n_tasks = _require_search_int("n_tasks", n_tasks, minimum=1)
     if task_length is not None:
         task_length = _require_search_int("task_length", task_length, minimum=1)
+    if suite_kind == "gauss":
+        _require_search_work_unit(
+            n_random=0,
+            n_tasks=n_tasks if n_tasks is not None else GAUSS_SEARCH_REGIMES,
+            task_length=task_length if task_length is not None else 5000,
+        )
+    elif n_tasks is not None or task_length is not None:
+        for config in MICRO_SUITE.values():
+            _require_search_work_unit(
+                n_random=0,
+                n_tasks=n_tasks if n_tasks is not None else config.n_tasks,
+                task_length=(
+                    task_length if task_length is not None else config.task_length
+                ),
+            )
     suite: dict[str, EvalConfig]
     if suite_kind == "gauss":
         suite = dict(gauss_suite(n_tasks if n_tasks is not None else GAUSS_SEARCH_REGIMES))
@@ -1017,6 +1109,13 @@ def tune_champion_baseline(
     n_random = _require_search_int("n_random", n_random, minimum=0)
     generations = _require_search_int("generations", generations, minimum=0)
     children = _require_search_int("children", children, minimum=1)
+    batch_size = _require_search_int("batch_size", batch_size, minimum=1)
+    _require_suite_streams(
+        suite,
+        n_random=n_random,
+        generations=generations,
+        children=children,
+    )
     champion = champion_form_genome()
     flags = jnp.asarray(champion[:_N_FLAGS])
 
@@ -1087,6 +1186,8 @@ def run_search(
     elite = _require_search_int("elite", elite, minimum=1)
     top_k = _require_search_int("top_k", top_k, minimum=1)
     batch_size = _require_search_int("batch_size", batch_size, minimum=1)
+    if elite > population:
+        raise ValueError("elite must not exceed population")
     eval_seeds = require_unique_jax_seeds(eval_seeds, name="eval_seeds")
     holdout_seeds = require_unique_jax_seeds(holdout_seeds, name="holdout_seeds")
     search_seed = require_jax_seed(search_seed, name="search_seed")
@@ -1097,6 +1198,13 @@ def run_search(
     if set(eval_seeds) & set(holdout_seeds):
         raise ValueError("search seeds and holdout seeds must be disjoint")
     registry = dict(MICRO_SUITE if suite is None else suite)
+    _require_suite_streams(
+        registry,
+        n_random=n_random,
+        population=population,
+        generations=generations,
+        children=population - elite,
+    )
     started = time.monotonic()
     root = jr.key(np.uint32(search_seed))
     key_random, key_evolve, key_baseline = jr.split(root, 3)
