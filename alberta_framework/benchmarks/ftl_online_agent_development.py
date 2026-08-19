@@ -13,8 +13,10 @@ import dataclasses
 import itertools
 import math
 import operator
+import sys
 import time
 from collections.abc import Callable, Mapping
+from types import MappingProxyType
 from typing import SupportsIndex, cast
 
 import jax
@@ -22,6 +24,13 @@ import jax.numpy as jnp
 import jax.random as jr
 import numpy as np
 
+import alberta_framework.core.ftl_world_model as ftl_world_model_module
+from alberta_framework.benchmarks.development_provenance import (
+    DevelopmentIdentity,
+    collect_development_identity,
+    identity_from_payload,
+    require_current_identity,
+)
 from alberta_framework.core.ftl_world_model import SparseFTLWorldModel, SparseFTLWorldModelConfig
 
 SCHEMA = "asi.ftl_online_agent_development.v1"
@@ -31,7 +40,27 @@ FROZEN_SEEDS = (1701, 1702, 1703, 1704)
 FROZEN_GOALS = ((2.0, 0.0), (0.0, 2.0), (-2.0, 0.0))
 ARM_IDS = ("sparse_ftl_online", "sparse_ftl_frozen", "privileged_dynamics_mpc")
 ACTION_DELTAS = np.asarray(((1, 0), (-1, 0), (0, 1), (0, -1)), dtype=np.float32)
+ACTION_DELTAS.flags.writeable = False
 MAX_STEPS_PER_TASK = 16
+WORKLOAD_REGISTRY = (
+    ("arm_ids", ARM_IDS),
+    ("action_deltas", ((1, 0), (-1, 0), (0, 1), (0, -1))),
+    ("frozen_goals", FROZEN_GOALS),
+    ("frozen_seeds", FROZEN_SEEDS),
+    ("max_steps_per_task", MAX_STEPS_PER_TASK),
+)
+PAPER_REGISTRY = MappingProxyType(
+    {"paper": PAPER, "official_code_revision": OFFICIAL_CODE_REVISION}
+)
+
+
+def _current_identity() -> DevelopmentIdentity:
+    return collect_development_identity(
+        lane_module=sys.modules[__name__],
+        dependency_modules=(ftl_world_model_module,),
+        workload_registry=WORKLOAD_REGISTRY,
+        paper_registry=PAPER_REGISTRY,
+    )
 
 
 def _int(value: object, name: str, low: int, high: int) -> int:
@@ -103,6 +132,7 @@ class DevelopmentResult:
     steps_per_task: int
     planning_horizon: int
     arms: tuple[ArmResult, ...]
+    identity: DevelopmentIdentity
     allowed_boundary_information: tuple[str, ...] = ()
     allowed_task_information: tuple[str, ...] = ("current_goal",)
     development_only: bool = True
@@ -123,6 +153,8 @@ class DevelopmentResult:
             or tuple(x.arm_id for x in self.arms) != ARM_IDS
         ):
             raise ValueError("arms differ from the frozen roster")
+        if type(self.identity) is not DevelopmentIdentity:
+            raise ValueError("identity must be exact")
         if (
             type(self.allowed_boundary_information) is not tuple
             or self.allowed_boundary_information
@@ -254,6 +286,7 @@ def run_development_lane(
         steps_per_task=steps,
         planning_horizon=horizon,
         arms=tuple(_run_arm(host_seed, steps, horizon, arm_id) for arm_id in ARM_IDS),
+        identity=_current_identity(),
     )
     validate_result(result)
     return result
@@ -302,6 +335,7 @@ def validate_result(value: object) -> DevelopmentResult:
             schema=value["schema"], seed=value["seed"],
             steps_per_task=value["steps_per_task"], planning_horizon=value["planning_horizon"],
             arms=tuple(arms),
+            identity=identity_from_payload(value["identity"]),
             allowed_boundary_information=tuple(value["allowed_boundary_information"]),
             allowed_task_information=tuple(value["allowed_task_information"]),
             development_only=value["development_only"],
@@ -314,6 +348,7 @@ def validate_result(value: object) -> DevelopmentResult:
     if type(value) is not DevelopmentResult:
         raise ValueError("result must be an exact DevelopmentResult")
     DevelopmentResult.__post_init__(value)
+    require_current_identity(value.identity, _current_identity())
     expected_steps = value.steps_per_task * len(FROZEN_GOALS)
     expected_candidates = 4**value.planning_horizon * expected_steps
     planner_queries = expected_candidates * value.planning_horizon

@@ -110,6 +110,33 @@ def test_hostile_and_expanded_payloads_fail_closed(result: lane.JEPATransferResu
     forged_timing["arms"][0]["timing"]["clock"] = "benchmark"  # type: ignore[index]
     with pytest.raises(ValueError, match="timing scope"):
         lane.validate_jepa_transfer_payload(forged_timing)
+    forged_bytes = copy.deepcopy(result.to_payload())
+    forged_bytes["arms"][0]["resources"]["persistent_mechanism_bytes"] += 1  # type: ignore[index,operator]
+    with pytest.raises(ValueError, match="persistent mechanism bytes"):
+        lane.validate_jepa_transfer_payload(forged_bytes)
+    forged_identity = copy.deepcopy(result.to_payload())
+    forged_identity["identity"]["workload_registry_sha256"] = "0" * 64  # type: ignore[index]
+    with pytest.raises(ValueError, match="current source/runtime/registries"):
+        lane.validate_jepa_transfer_payload(forged_identity)
+
+
+def test_validator_is_pure_on_success_and_failure(result: lane.JEPATransferResult) -> None:
+    payload = result.to_payload()
+    original = copy.deepcopy(payload)
+    lane.validate_jepa_transfer_payload(payload)
+    assert payload == original
+
+    invalid = copy.deepcopy(payload)
+    invalid["arms"][0]["resources"]["persistent_environment_bytes"] += 1  # type: ignore[index,operator]
+    before_failure = copy.deepcopy(invalid)
+    with pytest.raises(ValueError, match="environment.*bytes"):
+        lane.validate_jepa_transfer_payload(invalid)
+    assert invalid == before_failure
+
+
+def test_paper_registry_is_immutable() -> None:
+    with pytest.raises(TypeError):
+        lane.PINNED_RESEARCH["new"] = "mutable"  # type: ignore[index]
 
 
 @pytest.mark.parametrize(

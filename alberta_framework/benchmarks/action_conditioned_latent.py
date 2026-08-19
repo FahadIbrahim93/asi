@@ -17,7 +17,9 @@ import hashlib
 import json
 import math
 import operator
+import sys
 from collections.abc import Sequence
+from types import MappingProxyType
 from typing import Any, SupportsIndex, cast
 
 import jax
@@ -25,6 +27,15 @@ import jax.numpy as jnp
 import jax.random as jr
 import numpy as np
 
+import alberta_framework.core.latent_world_model as latent_world_model_module
+import alberta_framework.core.sarsa as sarsa_module
+import alberta_framework.streams.closed_loop as closed_loop_module
+from alberta_framework.benchmarks.development_provenance import (
+    DevelopmentIdentity,
+    collect_development_identity,
+    identity_from_payload,
+    require_current_identity,
+)
 from alberta_framework.core.latent_world_model import LatentWorldModel, LatentWorldModelConfig
 from alberta_framework.core.sarsa import SARSAAgent, SARSAConfig
 from alberta_framework.streams.closed_loop import SwitchingTwoStateConfig, SwitchingTwoStateMDP
@@ -39,16 +50,31 @@ FROZEN_ARM_IDS = (
     "mechanism_off",
     "sarsa_control",
 )
-PINNED_RESEARCH = {
+PINNED_RESEARCH = MappingProxyType({
     "dreamer_cdp_paper": "arXiv:2603.07083v2",
     "dreamer_cdp_code": "a851fa3e3d70b624b094ee1810ad4bb602346092",
     "jedi_paper": "arXiv:2605.13013v1",
     "jepa_wm_paper": "arXiv:2512.24497v3",
     "jepa_wm_code": "13cf1d9c7e476f53c17714d2e0f1dc239a883ce0",
-}
+})
 _MAX_STEPS = 4096
 _MAX_SEEDS = 16
 _INT32_MAX = 2**31 - 1
+WORKLOAD_REGISTRY = (
+    ("arm_ids", FROZEN_ARM_IDS),
+    ("development_seeds", FROZEN_DEVELOPMENT_SEEDS),
+    ("max_steps", _MAX_STEPS),
+    ("max_seeds", _MAX_SEEDS),
+)
+
+
+def _current_identity() -> DevelopmentIdentity:
+    return collect_development_identity(
+        lane_module=sys.modules[__name__],
+        dependency_modules=(latent_world_model_module, sarsa_module, closed_loop_module),
+        workload_registry=WORKLOAD_REGISTRY,
+        paper_registry=PINNED_RESEARCH,
+    )
 
 
 def _exact_int(value: object, *, name: str, minimum: int, maximum: int) -> int:
@@ -181,6 +207,7 @@ class ActionLatentResult:
     protocol: ActionLatentProtocol
     research_pins: dict[str, str]
     arms: tuple[ActionLatentArmReceipt, ...]
+    identity: DevelopmentIdentity
     development_only: bool = True
     scientific_promotion_allowed: bool = False
 
@@ -198,6 +225,8 @@ class ActionLatentResult:
             or self.research_pins != PINNED_RESEARCH
         ):
             raise ValueError("research pins differ from the audited roster")
+        if type(self.identity) is not DevelopmentIdentity:
+            raise ValueError("identity must be exact")
         expected = tuple(
             (arm_id, seed) for seed in self.protocol.seeds for arm_id in FROZEN_ARM_IDS
         )
@@ -304,14 +333,17 @@ def validate_action_latent_payload(payload: object) -> ActionLatentResult:
         ):
             raise ValueError("serialized arm differs from the schema")
         arms.append(ActionLatentArmReceipt(**cast(dict[str, Any], item)))
-    return ActionLatentResult(
+    result = ActionLatentResult(
         schema=root["schema"],  # type: ignore[arg-type]
         protocol=protocol,
         research_pins=cast(dict[str, str], root["research_pins"]),
         arms=tuple(arms),
+        identity=identity_from_payload(root["identity"]),
         development_only=root["development_only"],  # type: ignore[arg-type]
         scientific_promotion_allowed=root["scientific_promotion_allowed"],  # type: ignore[arg-type]
     )
+    require_current_identity(result.identity, _current_identity())
+    return result
 
 
 def _latent_model(*, interactions: bool) -> LatentWorldModel:
@@ -568,6 +600,7 @@ def run_action_conditioned_latent_lane(
         protocol=protocol,
         research_pins=dict(PINNED_RESEARCH),
         arms=tuple(receipts),
+        identity=_current_identity(),
     )
 
 
