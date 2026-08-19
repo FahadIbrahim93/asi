@@ -222,6 +222,10 @@ def test_matched_validator_requires_all_arms_and_exact_comparison_axes() -> None
     drift[-1]["seed"] = 1
     with pytest.raises(ValueError, match="differs on seed"):
         validate_matched_activation_feature_results(drift)
+    identity_drift = copy.deepcopy(payloads)
+    identity_drift[-1]["execution_identity"]["dataset_sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="execution_identity"):
+        validate_matched_activation_feature_results(identity_drift)
 
 
 def test_receipt_rejects_unfrozen_seed_outcome_and_negative_retention_drift() -> None:
@@ -262,6 +266,22 @@ def test_receipt_rejects_config_whose_schedule_cannot_execute() -> None:
         validate_activation_feature_result(payload)
 
 
+def test_receipt_rejects_forged_current_identity_and_peak_schedule_bytes() -> None:
+    x, y = _data()
+    payload = activation_feature_result_payload(
+        run_activation_feature_arm(x, y, arm="aid", seed=0, config=SMALL),
+        outcome="inconclusive",
+    )
+    forged_runtime = copy.deepcopy(payload)
+    forged_runtime["execution_identity"]["runtime"] = ["forged"] * 4
+    with pytest.raises(ValueError, match="current runtime identity"):
+        validate_activation_feature_result(forged_runtime)
+    forged_peak = copy.deepcopy(payload)
+    forged_peak["resources"]["peak_schedule_working_bytes"] = 1
+    with pytest.raises(ValueError, match="peak_schedule_working_bytes"):
+        validate_activation_feature_result(forged_peak)
+
+
 def test_receipt_revalidates_frozen_result_without_array_protocol_dispatch() -> None:
     x, y = _data()
     result = run_activation_feature_arm(x, y, arm="aid", seed=0, config=SMALL)
@@ -270,6 +290,6 @@ def test_receipt_revalidates_frozen_result_without_array_protocol_dispatch() -> 
         def __array__(self) -> np.ndarray:
             raise AssertionError("must reject before array coercion")
 
-    object.__setattr__(result, "per_task_accuracy", HostileArray())
+    object.__setattr__(result.screening, "per_task_accuracy", HostileArray())
     with pytest.raises(ValueError, match="per_task_accuracy"):
         activation_feature_result_payload(result, outcome="inconclusive")
