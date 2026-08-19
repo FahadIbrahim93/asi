@@ -5,7 +5,9 @@ from __future__ import annotations
 import hashlib
 import io
 import os
+import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -137,12 +139,57 @@ def test_bounded_process_timeout_leaves_no_live_child_pid() -> None:
         os.kill(pid, 0)
 
 
+def _singly_linked_git(git: str, tmp_path: Path) -> Path:
+    """Return a singly linked path that runs the host Git.
+
+    `_bind_git_runtime` hashes the resolved executable through `_sha256_file`,
+    which admits only a singly linked regular file.  macOS Command Line Tools
+    ships `/usr/bin/git` as one of many hard links to a multi-call shim, so
+    binding the host path directly is refused there.  A `sh` wrapper that
+    `exec`s the host Git is itself a singly linked regular file, is accepted by
+    the bind, and forwards its argv unchanged -- so the archive contract below
+    is exercised on that platform instead of being skipped.
+    """
+
+    resolved = Path(git).resolve(strict=True)
+    metadata = resolved.stat()
+    if stat.S_ISREG(metadata.st_mode) and metadata.st_nlink == 1:
+        return resolved
+    wrapper = tmp_path / "git-wrapper"
+    wrapper.write_text(f'#!/bin/sh\nexec {shlex.quote(resolved.as_posix())} "$@"\n')
+    wrapper.chmod(0o755)
+    return wrapper
+
+
+def test_git_binding_refuses_a_multiply_linked_executable(tmp_path: Path) -> None:
+    executable = tmp_path / "git"
+    executable.write_bytes(b"multi-call-shim")
+    executable.chmod(0o755)
+    alias = tmp_path / "git-alias"
+    try:
+        os.link(executable, alias)
+    except OSError as error:  # pragma: no cover - filesystem without hard links
+        pytest.skip(f"filesystem does not support hard links: {error}")
+
+    with pytest.raises(
+        qualification.ForagerMatchedQualificationError,
+        match="is not a bounded regular file",
+    ):
+        qualification._bind_git_runtime(executable)  # noqa: SLF001
+
+    alias.unlink()
+    identity = qualification._bind_git_runtime(executable)  # noqa: SLF001
+    assert identity.executable == executable.resolve()
+    assert identity.executable_sha256 == hashlib.sha256(b"multi-call-shim").hexdigest()
+
+
 def test_builtin_git_tar_ignores_repository_local_archive_commands(
     tmp_path: Path,
 ) -> None:
     git = shutil.which("git", path=os.defpath)
     if git is None:
         pytest.skip("system Git is unavailable")
+    binding = _singly_linked_git(git, tmp_path)
     repository = tmp_path / "repository"
     environment = qualification._git_environment()  # noqa: SLF001
     commands = (
@@ -183,7 +230,7 @@ def test_builtin_git_tar_ignores_repository_local_archive_commands(
             timeout=10,
             env=environment,
         )
-    identity = qualification._bind_git_runtime(Path(git))  # noqa: SLF001
+    identity = qualification._bind_git_runtime(binding)  # noqa: SLF001
     completed = qualification._run_bounded_process(  # noqa: SLF001
         qualification._git_command(  # noqa: SLF001
             identity,
