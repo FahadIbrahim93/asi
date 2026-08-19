@@ -113,6 +113,12 @@ def test_profiles_are_immutable_and_result_binds_the_complete_profile() -> None:
         )
 
 
+def test_validator_rejects_forged_runtime_identity() -> None:
+    result = run_diagnostic(*_fixture(), seed=FROZEN_SEEDS[0])
+    with pytest.raises(ValueError, match="runtime identity drift"):
+        validate_result(dataclasses.replace(result, runtime_identity=("forged",) * 4))
+
+
 def test_random_label_and_privileged_task_claims_fail_closed() -> None:
     result = run_diagnostic(*_fixture(), seed=FROZEN_SEEDS[3])
     with pytest.raises(ValueError, match="random-label"):

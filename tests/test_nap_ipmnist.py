@@ -219,6 +219,11 @@ def test_result_binds_the_complete_immutable_profile() -> None:
         )
 
 
+def test_validator_rejects_forged_runtime_identity() -> None:
+    with pytest.raises(ValueError, match="runtime identity drift"):
+        validate_result(dataclasses.replace(_result(), runtime_identity=("forged",) * 4))
+
+
 def test_catalog_and_execution_cli_are_bounded(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
