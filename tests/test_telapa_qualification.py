@@ -156,6 +156,21 @@ def test_validator_rejects_nan_extra_fields_and_unbounded_config() -> None:
         TeLAPASmokeConfig(seeds=(0,), steps=64, phase_length=1, archive_byte_budget=128)
 
 
+def test_validator_replays_archive_accounting_and_binds_current_identity() -> None:
+    payload = copy.deepcopy(_result())
+    payload["records"][0]["resource_receipt"]["archive_entry_queries"] += 1
+    with pytest.raises(ValueError, match="replay"):
+        validate_result(payload)
+    payload = copy.deepcopy(_result())
+    payload["records"][0]["archive_entry_count"] = 0
+    with pytest.raises(ValueError, match="replay"):
+        validate_result(payload)
+    payload = copy.deepcopy(_result())
+    payload["identity"]["lane_source_sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="identity"):
+        validate_result(payload)
+
+
 def test_json_preflight_rejects_deep_cyclic_and_oversized_trees_before_serialization(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

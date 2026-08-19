@@ -298,6 +298,13 @@ def qualification_plan(receipt: ClearDatasetReceipt) -> Mapping[str, object]:
             "avalanche": AVALANCHE_COMMIT,
         },
         "dataset_sha256": receipt.dataset_sha256,
+        "dataset_receipt": {
+            "archives": [asdict(archive) for archive in receipt.archives],
+            "samples_per_bucket": list(receipt.samples_per_bucket),
+            "archive_bytes": receipt.archive_bytes,
+            "sample_count": receipt.sample_count,
+            "dataset_sha256": receipt.dataset_sha256,
+        },
         "runtime": runtime_identity(),
         "axes": axes,
         "control_config": control,
@@ -341,14 +348,121 @@ def _metric_values(matrix: list[list[float]]) -> Mapping[str, float]:
     }
 
 
+def _receipt_from_plan(value: object) -> ClearDatasetReceipt:
+    raw = _object(value, "expected dataset receipt")
+    _keys(
+        raw,
+        {"archives", "samples_per_bucket", "archive_bytes", "sample_count", "dataset_sha256"},
+        "expected dataset receipt",
+    )
+    archive_values = raw["archives"]
+    if type(archive_values) is not list or not 1 <= len(archive_values) <= MAX_ARCHIVES:
+        raise ClearQualificationError("expected dataset archives are not bounded")
+    archives: list[ArchiveIdentity] = []
+    for index, value in enumerate(archive_values):
+        item = _object(value, f"expected archive {index}")
+        _keys(item, {"role", "path", "size_bytes", "sha256"}, f"expected archive {index}")
+        archives.append(
+            ArchiveIdentity(
+                _exact_str(item["role"], "expected archive role", maximum=32),
+                _safe_relative_path(item["path"]),
+                _exact_int(item["size_bytes"], "expected archive size", maximum=1 << 50),
+                _sha256(item["sha256"], "expected archive sha256"),
+            )
+        )
+    if len({archive.role for archive in archives}) != len(archives) or len(
+        {archive.path for archive in archives}
+    ) != len(archives):
+        raise ClearQualificationError("expected archive identities must be unique")
+    sample_values = raw["samples_per_bucket"]
+    if type(sample_values) is not list or len(sample_values) != len(BUCKETS):
+        raise ClearQualificationError("expected sample counts must cover every bucket")
+    samples = tuple(
+        _exact_int(value, "expected bucket sample count", minimum=1, maximum=MAX_SAMPLES_PER_BUCKET)
+        for value in sample_values
+    )
+    archive_bytes = _exact_int(raw["archive_bytes"], "expected archive bytes", maximum=1 << 50)
+    sample_count = _exact_int(
+        raw["sample_count"], "expected sample count", maximum=MAX_SAMPLES_PER_BUCKET * len(BUCKETS)
+    )
+    dataset_sha256 = _sha256(raw["dataset_sha256"], "expected dataset sha256")
+    identity = {
+        "dataset": DATASET_NAME,
+        "protocol": "streaming-near-future",
+        "buckets": BUCKETS,
+        "years": YEARS,
+        "samples_per_bucket": samples,
+        "archives": [asdict(archive) for archive in archives],
+    }
+    if (
+        archive_bytes != sum(archive.size_bytes for archive in archives)
+        or sample_count != sum(samples)
+        or dataset_sha256 != hashlib.sha256(_canonical(identity)).hexdigest()
+    ):
+        raise ClearQualificationError("expected dataset receipt does not replay")
+    return ClearDatasetReceipt(
+        tuple(archives), samples, archive_bytes, sample_count, dataset_sha256
+    )
+
+
 def validate_result(
     raw: bytes,
     *,
-    expected_plan_sha256: str,
-    expected_resource_budget: Mapping[str, object] | None = None,
+    expected_plan: Mapping[str, object],
 ) -> Mapping[str, object]:
     """Validate the narrow result envelope; scores remain uninterpreted development data."""
-    plan_digest = _sha256(expected_plan_sha256, "expected plan sha256")
+    plan = _object(expected_plan, "expected CLEAR plan")
+    _keys(
+        plan,
+        {
+            "schema_version",
+            "classification",
+            "paper_revision",
+            "source_revisions",
+            "dataset_sha256",
+            "dataset_receipt",
+            "runtime",
+            "axes",
+            "control_config",
+            "mechanism_off_config",
+            "metrics",
+            "resource_budget_per_axis",
+            "negative_retention_required",
+            "promotion_authorized",
+            "execution_authorized",
+        },
+        "expected CLEAR plan",
+    )
+    receipt = _receipt_from_plan(plan["dataset_receipt"])
+    if plan != qualification_plan(receipt):
+        raise ClearQualificationError("expected plan differs from the reviewed protocol")
+    budget = _object(plan["resource_budget_per_axis"], "expected resource budget")
+    _keys(
+        budget,
+        {
+            "archive_bytes",
+            "training_observations",
+            "data_samples_read",
+            "optimizer_updates",
+            "model_queries",
+            "environment_steps",
+            "timing",
+            "persistent_bytes",
+        },
+        "expected resource budget",
+    )
+    numeric_budget = {
+        name: _exact_int(budget[name], f"expected {name}", maximum=(1 << 63) - 1)
+        for name in (
+            "archive_bytes",
+            "training_observations",
+            "data_samples_read",
+            "optimizer_updates",
+            "model_queries",
+            "environment_steps",
+        )
+    }
+    plan_digest = hashlib.sha256(_canonical(plan)).hexdigest()
     payload = _decode(raw, limit=MAX_RESULT_BYTES, label="CLEAR result")
     _keys(
         payload,
@@ -408,22 +522,9 @@ def validate_result(
     for name in resources:
         maximum = (1 << 63) - 1 if name != "wall_seconds_telemetry" else (1 << 53)
         _exact_int(resources[name], name, maximum=maximum)
-    if expected_resource_budget is not None:
-        for name in (
-            "archive_bytes",
-            "training_observations",
-            "data_samples_read",
-            "optimizer_updates",
-            "model_queries",
-            "environment_steps",
-        ):
-            expected = _exact_int(
-                expected_resource_budget.get(name),
-                f"expected {name}",
-                maximum=(1 << 63) - 1,
-            )
-            if resources[name] != expected:
-                raise ClearQualificationError(f"{name} does not match the frozen plan")
+    for name, expected in numeric_budget.items():
+        if resources[name] != expected:
+            raise ClearQualificationError(f"{name} does not match the frozen plan")
     return payload
 
 

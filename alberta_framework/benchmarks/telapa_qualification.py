@@ -22,6 +22,14 @@ import jax.random as jr
 import numpy as np
 from jax import Array
 
+import alberta_framework.core.policy_archive as policy_archive_module
+import alberta_framework.streams.closed_loop as closed_loop_module
+from alberta_framework.benchmarks.development_provenance import (
+    DevelopmentIdentity,
+    collect_development_identity,
+    identity_from_payload,
+    require_current_identity,
+)
 from alberta_framework.core.policy_archive import BoundedPolicyArchive, PolicyEntry
 from alberta_framework.streams.closed_loop import SwitchingTwoStateConfig, SwitchingTwoStateMDP
 
@@ -40,6 +48,17 @@ _POLICY_SHAPE = (2, 2)
 _POLICY_BYTES = 16
 _ARMS = ("diverse_archive", "one_model", "fixed_snapshot", "mechanism_off")
 Arm = Literal["diverse_archive", "one_model", "fixed_snapshot", "mechanism_off"]
+
+
+def _current_identity(
+    config: TeLAPASmokeConfig, catalog: TeLAPACatalogEntry
+) -> DevelopmentIdentity:
+    return collect_development_identity(
+        lane_module=sys.modules[__name__],
+        dependency_modules=(policy_archive_module, closed_loop_module),
+        workload_registry={"config": _config_payload(config), "arms": _ARMS},
+        paper_registry=_catalog_payload(catalog),
+    )
 
 
 def _preflight_json_tree(value: object) -> None:
@@ -502,6 +521,7 @@ def run_smoke(config: TeLAPASmokeConfig | None = None) -> dict[str, Any]:
         "schema": SCHEMA,
         "catalog": _catalog_payload(catalog),
         "config": _config_payload(config),
+        "identity": _current_identity(config, catalog).to_payload(),
         "matched_axes": [
             "seed",
             "environment_steps",
@@ -548,7 +568,7 @@ def validate_result(value: object) -> None:
     root = _require_exact_keys(
         value,
         {
-            "schema", "catalog", "config", "matched_axes", "allowed_information",
+            "schema", "catalog", "config", "identity", "matched_axes", "allowed_information",
             "mechanism_off_parity", "records", "negative_retention", "classification",
             "scientific_promotion_allowed", "paper_parity_claimed", "performance_claimed",
         },
@@ -569,12 +589,16 @@ def validate_result(value: object) -> None:
     )
     catalog_payload["protocol_differences"] = tuple(catalog_payload["protocol_differences"])
     catalog_payload["paper_metrics"] = tuple(catalog_payload["paper_metrics"])
-    TeLAPACatalogEntry(**catalog_payload).validate()
+    catalog = TeLAPACatalogEntry(**catalog_payload)
+    catalog.validate()
     config_payload = dict(
         _require_exact_keys(root["config"], set(asdict(TeLAPASmokeConfig())), "config")
     )
     config_payload["seeds"] = tuple(config_payload["seeds"])
     config = TeLAPASmokeConfig(**config_payload)
+    require_current_identity(
+        identity_from_payload(root["identity"]), _current_identity(config, catalog)
+    )
     expected_axes = [
         "seed", "environment_steps", "observations_consumed", "policy_updates",
         "policy_queries", "descriptor_model_queries", "task_boundary_disclosures",
@@ -709,6 +733,9 @@ def validate_result(value: object) -> None:
                 raise ValueError("mechanism-off resource reduction is invalid")
         elif receipt["mechanism_off_anchor_bytes"] != 0:
             raise ValueError("archive arms cannot retain mechanism-off anchor bytes")
+        expected_record = _run_arm(config, pair[0], cast(Arm, pair[1]))
+        if record != expected_record:
+            raise ValueError("record does not replay from the bound configuration")
     if observed_pairs != expected_pairs:
         raise ValueError("record matrix is incomplete")
     for seed in config.seeds:

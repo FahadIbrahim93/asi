@@ -142,6 +142,14 @@ def test_hostile_expanded_and_forged_payloads_fail_closed(result: COOMSmokeResul
     promoted["arms"][0]["performance_metrics_computed"] = True  # type: ignore[index]
     with pytest.raises(ValueError, match="may not compute"):
         validate_coom_smoke_payload(promoted)
+    forged_bytes = copy.deepcopy(result.to_payload())
+    forged_bytes["arms"][1]["resources"]["persistent_agent_bytes"] = 1  # type: ignore[index]
+    with pytest.raises(ValueError, match="replay"):
+        validate_coom_smoke_payload(forged_bytes)
+    forged_identity = copy.deepcopy(result.to_payload())
+    forged_identity["identity"]["lane_source_sha256"] = "0" * 64  # type: ignore[index]
+    with pytest.raises(ValueError, match="identity"):
+        validate_coom_smoke_payload(forged_identity)
 
 
 @pytest.mark.parametrize(

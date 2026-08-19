@@ -16,6 +16,8 @@ from alberta_framework.benchmarks.clear_qualification import (
     DEV_SEEDS,
     REFERENCE_COMMIT,
     SCHEMA,
+    ArchiveIdentity,
+    ClearDatasetReceipt,
     ClearQualificationError,
     _metric_values,
     execution_config,
@@ -27,6 +29,40 @@ from alberta_framework.benchmarks.clear_qualification import (
 )
 
 pytestmark = pytest.mark.unit
+
+
+def _result_plan() -> dict[str, object]:
+    archive = ArchiveIdentity("fixture", "fixture.zip", 2, "a" * 64)
+    identity = {
+        "dataset": "clear100",
+        "protocol": "streaming-near-future",
+        "buckets": BUCKETS,
+        "years": tuple(range(2005, 2015)),
+        "samples_per_bucket": (1,) * 10,
+        "archives": [
+            {"role": archive.role, "path": archive.path, "size_bytes": 2, "sha256": "a" * 64}
+        ],
+    }
+    dataset_sha = hashlib.sha256(
+        json.dumps(identity, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
+    ).hexdigest()
+    return dict(
+        qualification_plan(
+            ClearDatasetReceipt(
+                archives=(archive,),
+                samples_per_bucket=(1,) * 10,
+                archive_bytes=2,
+                sample_count=10,
+                dataset_sha256=dataset_sha,
+            )
+        )
+    )
+
+
+def _plan_sha256(plan: object) -> str:
+    return hashlib.sha256(
+        json.dumps(plan, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
+    ).hexdigest()
 
 
 def _manifest(root: Path) -> bytes:
@@ -223,7 +259,10 @@ def test_manifest_rejects_duplicate_paths_and_unknown_fields(tmp_path: Path) -> 
 
 
 def test_result_validator_enforces_receipts_nonpromotion_and_negative_retention() -> None:
-    plan_sha = "a" * 64
+    plan = _result_plan()
+    plan_sha = _plan_sha256(plan)
+    budget = plan["resource_budget_per_axis"]
+    assert isinstance(budget, dict)
     matrix = [[0.5 for _ in range(10)] for _ in range(10)]
     result = {
         "schema_version": SCHEMA,
@@ -242,35 +281,22 @@ def test_result_validator_enforces_receipts_nonpromotion_and_negative_retention(
         "resource_receipts": {
             "persistent_bytes": 1,
             "archive_bytes": 2,
-            "training_observations": 3,
-            "data_samples_read": 8,
-            "optimizer_updates": 4,
-            "model_queries": 5,
+            "training_observations": budget["training_observations"],
+            "data_samples_read": budget["data_samples_read"],
+            "optimizer_updates": budget["optimizer_updates"],
+            "model_queries": budget["model_queries"],
             "environment_steps": 0,
             "wall_seconds_telemetry": 6,
         },
     }
-    assert validate_result(json.dumps(result).encode(), expected_plan_sha256=plan_sha) == result
-    expected_resources = {
-        key: value
-        for key, value in result["resource_receipts"].items()
-        if key not in ("persistent_bytes", "wall_seconds_telemetry")
-    }
-    assert validate_result(
-        json.dumps(result).encode(),
-        expected_plan_sha256=plan_sha,
-        expected_resource_budget=expected_resources,
-    ) == result
-    mismatched_resources = {**expected_resources, "model_queries": 6}
+    assert validate_result(json.dumps(result).encode(), expected_plan=plan) == result
+    mismatched = json.loads(json.dumps(result))
+    mismatched["resource_receipts"]["model_queries"] += 1
     with pytest.raises(ClearQualificationError, match="model_queries"):
-        validate_result(
-            json.dumps(result).encode(),
-            expected_plan_sha256=plan_sha,
-            expected_resource_budget=mismatched_resources,
-        )
+        validate_result(json.dumps(mismatched).encode(), expected_plan=plan)
     hostile_metric = {**result, "metrics": {**result["metrics"], "accuracy": True}}
     with pytest.raises(ClearQualificationError, match="finite exact floats"):
-        validate_result(json.dumps(hostile_metric).encode(), expected_plan_sha256=plan_sha)
+        validate_result(json.dumps(hostile_metric).encode(), expected_plan=plan)
     for field, value, match in (
         ("promotion_authorized", True, "nonpromotion"),
         ("negative_retained", False, "negative retention"),
@@ -279,13 +305,19 @@ def test_result_validator_enforces_receipts_nonpromotion_and_negative_retention(
     ):
         hostile = {**result, field: value}
         with pytest.raises(ClearQualificationError, match=match):
-            validate_result(json.dumps(hostile).encode(), expected_plan_sha256=plan_sha)
+            validate_result(json.dumps(hostile).encode(), expected_plan=plan)
+
+    forged_plan = json.loads(json.dumps(plan))
+    forged_plan["resource_budget_per_axis"]["training_observations"] = 0
+    with pytest.raises(ClearQualificationError, match="reviewed protocol"):
+        validate_result(json.dumps(result).encode(), expected_plan=forged_plan)
 
 
 def test_result_rejects_scalar_alias_and_unbounded_payload() -> None:
+    plan = _result_plan()
     result = {
         "schema_version": SCHEMA,
-        "plan_sha256": "a" * 64,
+        "plan_sha256": _plan_sha256(plan),
         "status": "completed-development",
         "promotion_authorized": False,
         "negative_retained": True,
@@ -309,6 +341,6 @@ def test_result_rejects_scalar_alias_and_unbounded_payload() -> None:
         },
     }
     with pytest.raises(ClearQualificationError, match="exact integer"):
-        validate_result(json.dumps(result).encode(), expected_plan_sha256="a" * 64)
+        validate_result(json.dumps(result).encode(), expected_plan=plan)
     with pytest.raises(ClearQualificationError, match="byte limit"):
-        validate_result(b" " * ((1 << 20) + 1), expected_plan_sha256="a" * 64)
+        validate_result(b" " * ((1 << 20) + 1), expected_plan=plan)
