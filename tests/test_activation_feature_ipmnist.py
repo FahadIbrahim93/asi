@@ -11,6 +11,7 @@ from alberta_framework.benchmarks.activation_feature_ipmnist import (
     ACTIVATION_FEATURE_SOURCES,
     ACTIVATION_FEATURE_SPECS,
     DEVELOPMENT_SEEDS,
+    _preflight_activation_feature_resources,
     activation_feature_result_payload,
     activation_feature_spec,
     run_activation_feature_arm,
@@ -90,6 +91,61 @@ def test_all_candidate_and_causal_arms_execute_end_to_end() -> None:
         result = run_activation_feature_arm(x, y, arm=arm, seed=5, config=SMALL)
         assert result.per_task_accuracy.shape == (2,)
         assert np.isfinite(result.per_task_loss).all()
+
+
+def test_schedule_memory_is_bounded_before_runner_allocation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    huge = IPMNISTConfig(
+        n_tasks=2_000_000,
+        task_length=1,
+        input_dim=784,
+        hidden1=1,
+        hidden2=1,
+        n_classes=1,
+    )
+    calls = 0
+
+    def forbidden(*args: object, **kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        raise AssertionError("runner must not execute")
+
+    monkeypatch.setattr(
+        "alberta_framework.benchmarks.activation_feature_ipmnist.run_screening_config",
+        forbidden,
+    )
+    with pytest.raises(ValueError, match="schedule exceeds"):
+        run_activation_feature_arm(
+            np.zeros((1, 784), dtype=np.float32),
+            np.zeros(1, dtype=np.int32),
+            arm="aid",
+            seed=0,
+            config=huge,
+        )
+    assert calls == 0
+
+
+def test_schedule_memory_bound_has_exact_adjacent_boundary() -> None:
+    last_fit = IPMNISTConfig(
+        n_tasks=33_554_432,
+        task_length=1,
+        input_dim=1,
+        hidden1=1,
+        hidden2=1,
+        n_classes=1,
+    )
+    first_overflow = IPMNISTConfig(
+        n_tasks=33_554_433,
+        task_length=1,
+        input_dim=1,
+        hidden1=1,
+        hidden2=1,
+        n_classes=1,
+    )
+    _preflight_activation_feature_resources(last_fit)
+    with pytest.raises(ValueError, match="268435456-byte bound"):
+        _preflight_activation_feature_resources(first_overflow)
 
 
 def test_factories_are_jittable_and_aid_is_deterministic_per_seed() -> None:
@@ -186,6 +242,24 @@ def test_receipt_rejects_unfrozen_seed_outcome_and_negative_retention_drift() ->
     unfrozen["seed"] = 99
     with pytest.raises(ValueError, match="frozen development seed"):
         validate_activation_feature_result(unfrozen)
+
+
+def test_receipt_rejects_config_whose_schedule_cannot_execute() -> None:
+    x, y = _data()
+    payload = activation_feature_result_payload(
+        run_activation_feature_arm(x, y, arm="aid", seed=0, config=SMALL),
+        outcome="inconclusive",
+    )
+    payload["config"] = {
+        "n_tasks": 2_000_000,
+        "task_length": 1,
+        "input_dim": 784,
+        "hidden1": 300,
+        "hidden2": 150,
+        "n_classes": 10,
+    }
+    with pytest.raises(ValueError, match="schedule exceeds"):
+        validate_activation_feature_result(payload)
 
 
 def test_receipt_revalidates_frozen_result_without_array_protocol_dispatch() -> None:

@@ -308,11 +308,23 @@ ACTIVATION_FEATURE_SPECS: Final[Mapping[str, ScreeningSpec]] = MappingProxyType(
     {spec.name: spec for spec in _SPECS}
 )
 
+_MAX_SCHEDULE_BYTES: Final[int] = 256 * 1024 * 1024
+
 
 def activation_feature_spec(name: object) -> ScreeningSpec:
     if type(name) is not str or name not in ACTIVATION_FEATURE_SPECS:
         raise ValueError("unknown activation/feature arm")
     return ACTIVATION_FEATURE_SPECS[name]
+
+
+def _preflight_activation_feature_resources(config: IPMNISTConfig) -> None:
+    """Reject schedules that exceed the lane's bounded persistent envelope."""
+    schedule_scalars = config.n_tasks * (config.input_dim + config.task_length)
+    schedule_bytes = schedule_scalars * np.dtype(np.int32).itemsize
+    if schedule_bytes > _MAX_SCHEDULE_BYTES:
+        raise ValueError(
+            "activation/feature schedule exceeds its 268435456-byte bound"
+        )
 
 
 def run_activation_feature_arm(
@@ -324,6 +336,7 @@ def run_activation_feature_arm(
     config: IPMNISTConfig,
 ) -> ScreeningRunResult:
     """Execute one arm using the current screening runner and its schedule."""
+    _preflight_activation_feature_resources(config)
     observations = config.n_tasks * config.task_length
     if observations > _MAX_STEPS:
         raise ValueError("activation/feature lane exceeds its 2000000-step bound")
@@ -570,6 +583,18 @@ def validate_activation_feature_result(payload: object) -> dict[str, object]:
             raise ValueError(f"config {name} must be a bounded exact integer")
     if cast(int, config["n_tasks"]) * cast(int, config["task_length"]) > _MAX_STEPS:
         raise ValueError("config step product exceeds bound")
+    try:
+        validated_config = IPMNISTConfig(
+            n_tasks=cast(int, config["n_tasks"]),
+            task_length=cast(int, config["task_length"]),
+            input_dim=cast(int, config["input_dim"]),
+            hidden1=cast(int, config["hidden1"]),
+            hidden2=cast(int, config["hidden2"]),
+            n_classes=cast(int, config["n_classes"]),
+        )
+    except ValueError as error:
+        raise ValueError("config violates the executable IPMNIST bounds") from error
+    _preflight_activation_feature_resources(validated_config)
     hp = _exact_dict(root["hyperparameters"], frozenset(spec.hyperparameters), "hyperparameters")
     for name, expected in spec.hyperparameters.items():
         value = hp[name]
@@ -737,6 +762,7 @@ def main(argv: list[str] | None = None) -> int:
     """Run one fresh development shard; benchmark work never runs in pytest."""
     args = _parser().parse_args(argv)
     config = IPMNISTConfig(n_tasks=args.tasks, task_length=args.task_length)
+    _preflight_activation_feature_resources(config)
     x, y = load_mnist_train(args.data_home)
     result = run_activation_feature_arm(x, y, arm=args.arm, seed=args.seed, config=config)
     payload = activation_feature_result_payload(result, outcome="inconclusive")
