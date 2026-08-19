@@ -46,9 +46,11 @@ _WHEEL_FILES = tuple(
     and (path.suffix == ".py" or path.name == "py.typed")
 )
 _EXPECTED_SCRIPT_NAMES = {
+    "asi-action-conditioned-latent",
     "asi-ipmnist-campaign",
     "asi-ipmnist-ceiling",
     "asi-l2er-matched-development",
+    "asi-jepa-transfer-feasibility",
     "asi-reference-life-scorecard",
     "asi-rule-discovery-summary",
     "alberta-evidence-status",
