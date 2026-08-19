@@ -76,10 +76,12 @@ Issues = "https://github.com/elizaOS/asi/issues"
 Upstream = "https://github.com/lalalune/alberta"
 
 [project.scripts]
+asi-action-conditioned-latent = "alberta_framework.benchmarks.action_conditioned_latent:main"
 asi-ipmnist-campaign = "alberta_framework.benchmarks.ipmnist_campaign_tools:main"
 asi-ipmnist-ceiling = "alberta_framework.benchmarks.ipmnist_ceiling:main"
 asi-new-directions-audit = "alberta_framework.benchmarks.new_directions_v5_v6_audit:main"
 asi-rule-discovery-summary = "alberta_framework.benchmarks.rule_discovery_summary:main"
+asi-jepa-transfer-feasibility = "alberta_framework.benchmarks.jepa_transfer_feasibility:main"
 asi-reference-life-scorecard = "alberta_framework.benchmarks.reference_life_scorecard:main"
 asi-l2er-matched-development = "alberta_framework.benchmarks.l2er_matched_development:main"
 asi-native-supervised-catalog = "alberta_framework.benchmarks.native_supervised_suite:main"
