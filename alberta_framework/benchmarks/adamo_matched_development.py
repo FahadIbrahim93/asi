@@ -23,7 +23,7 @@ from alberta_framework.benchmarks.adamo_diagnostic import (
     ADAMO_MATCHED_DEVELOPMENT_SEEDS,
     ARMS,
     _load_dataset,
-    run_adamo_diagnostic,
+    _run_adamo_diagnostic_schedule,
     validate_adamo_diagnostic,
 )
 from alberta_framework.benchmarks.ipmnist_screening import (
@@ -42,6 +42,12 @@ CANDIDATE_ARMS: Final[tuple[str, ...]] = ("adamo_l1e3", "adam_iso_joint_l1e3")
 T95_DF3: Final[float] = 3.1824463052837078
 DATASET_SEMANTIC_SHA256: Final[str] = (
     "220e4a97a6d345a9f09bbee8e6ba65e8cc117604428392ae08fed2bd8ea0ab27"
+)
+DATASET_INPUTS_SHA256: Final[str] = (
+    "b8078cd833f53d89828a5e28d728517be9add34076f13fe973399f1f16381313"
+)
+DATASET_LABELS_SHA256: Final[str] = (
+    "4f1dd9551f104f8153409e0add59f0a71568f7bad5a5f8e2274480c186fe219a"
 )
 DATASET_NUMERIC_BYTES: Final[int] = 188_400_000
 _EXECUTION_AUTHORIZED: Final[bool] = False
@@ -121,8 +127,8 @@ def frozen_plan() -> dict[str, object]:
             },
             "materialization_id": "alberta.ipmnist.float32-neg1-pos1-int32-labels.v1",
             "array_sha256": {
-                "inputs": "b8078cd833f53d89828a5e28d728517be9add34076f13fe973399f1f16381313",
-                "labels": "4f1dd9551f104f8153409e0add59f0a71568f7bad5a5f8e2274480c186fe219a",
+                "inputs": DATASET_INPUTS_SHA256,
+                "labels": DATASET_LABELS_SHA256,
             },
             "materialization": (
                 "fetch_openml('mnist_784', version=1, as_frame=False), rows 0:60000; "
@@ -365,7 +371,7 @@ def build_report(
     by_seed: dict[int, dict[str, object]] = {}
     ordered: list[dict[str, object]] = []
     for index, raw_receipt in enumerate(receipts):
-        receipt = validate_adamo_diagnostic(raw_receipt)
+        receipt = validate_adamo_diagnostic(raw_receipt, seed_schedule=SEEDS)
         seed = receipt["seed"]
         if type(seed) is not int or seed != SEEDS[index] or seed in by_seed:
             raise ValueError("receipts must use deterministic frozen seed ordering")
@@ -481,7 +487,7 @@ def validate_report(
         raise ValueError("runs must contain the complete frozen seed schedule")
     by_seed: dict[int, dict[str, object]] = {}
     for index, raw_run in enumerate(runs):
-        run = validate_adamo_diagnostic(raw_run)
+        run = validate_adamo_diagnostic(raw_run, seed_schedule=SEEDS)
         seed = run["seed"]
         if type(seed) is not int or seed != SEEDS[index] or seed in by_seed:
             raise ValueError("runs must use deterministic frozen seed ordering")
@@ -695,11 +701,25 @@ def run_campaign(dataset_path: Path, output_path: Path = OUTPUT_PATH) -> dict[st
         source_before = _current_source_provenance()
         runtime_before = _current_runtime_environment()
         inputs, labels = _load_dataset(dataset_path)
-        _screening_dataset_provenance(inputs, labels)
+        dataset_provenance = _screening_dataset_provenance(inputs, labels)
+        dataset_x = cast(dict[str, object], dataset_provenance["x"])
+        dataset_y = cast(dict[str, object], dataset_provenance["y"])
+        if (
+            dataset_x.get("sha256") != DATASET_INPUTS_SHA256
+            or dataset_y.get("sha256") != DATASET_LABELS_SHA256
+        ):
+            raise ValueError("dataset arrays do not match the prospectively frozen input")
         if _sha256_file(dataset_path) != dataset_file_sha256:
             raise RuntimeError("dataset container changed while it was loaded")
         receipts = [
-            run_adamo_diagnostic(inputs, labels, profile=PROFILE, seed=seed) for seed in SEEDS
+            _run_adamo_diagnostic_schedule(
+                inputs,
+                labels,
+                profile=PROFILE,
+                seed=seed,
+                seed_schedule=SEEDS,
+            )
+            for seed in SEEDS
         ]
         if source_before != _current_source_provenance():
             raise RuntimeError("source identity changed during matched execution")

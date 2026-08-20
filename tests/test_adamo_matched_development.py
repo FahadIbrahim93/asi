@@ -11,7 +11,10 @@ import pytest
 
 from alberta_framework.benchmarks import adamo_diagnostic
 from alberta_framework.benchmarks import adamo_matched_development as matched
-from alberta_framework.benchmarks.adamo_diagnostic import run_adamo_diagnostic
+from alberta_framework.benchmarks.adamo_diagnostic import (
+    FROZEN_DEVELOPMENT_SEEDS,
+    run_adamo_diagnostic,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -29,7 +32,11 @@ def _patch_identities(
         "_current_runtime_environment",
         lambda: {"schema": "test-runtime", "backend": "cpu"},
     )
-    monkeypatch.setattr(matched, "validate_adamo_diagnostic", lambda value: value)
+    monkeypatch.setattr(
+        matched,
+        "validate_adamo_diagnostic",
+        lambda value, *, seed_schedule: value,
+    )
     semantic = receipts[0]["dataset"]["sha256"]
     monkeypatch.setattr(matched, "DATASET_SEMANTIC_SHA256", semantic)
 
@@ -42,12 +49,13 @@ def receipts() -> list[dict[str, object]]:
         inputs,
         labels,
         profile="contract-smoke",
-        seed=matched.SEEDS[0],
+        seed=FROZEN_DEVELOPMENT_SEEDS[0],
     )
     result = []
     for seed in matched.SEEDS:
         receipt = copy.deepcopy(first)
         receipt["seed"] = seed
+        receipt["frozen_development_seeds"] = list(matched.SEEDS)
         receipt["profile"] = matched.PROFILE
         result.append(receipt)
     return result
@@ -147,6 +155,18 @@ def test_atomic_publication_refuses_overwrite(
 def test_execution_gate_is_closed_until_plan_review() -> None:
     with pytest.raises(RuntimeError, match="not authorized"):
         matched.run_campaign(Path("unused.npz"), Path("unused.json"))
+
+
+def test_public_diagnostic_schedule_cannot_consume_reserved_matched_seed() -> None:
+    inputs = np.linspace(-1.0, 1.0, 32, dtype=np.float32).reshape(8, 4)
+    labels = np.arange(8, dtype=np.int32) % 2
+    with pytest.raises(ValueError, match="frozen, consumed development schedule"):
+        run_adamo_diagnostic(
+            inputs,
+            labels,
+            profile="contract-smoke",
+            seed=matched.SEEDS[0],
+        )
 
 
 def test_student_t_df3_constant_is_exact() -> None:

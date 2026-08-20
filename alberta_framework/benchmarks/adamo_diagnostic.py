@@ -44,6 +44,10 @@ ARMS = ("adamw_control", "adamo_inert", "adamo_l1e3", "adam_iso_joint_l1e3")
 # provenance interface. The matched campaign owns a distinct prospective schedule.
 FROZEN_DEVELOPMENT_SEEDS = (15600, 15601, 15602, 15603)
 ADAMO_MATCHED_DEVELOPMENT_SEEDS = (25600, 25601, 25602, 25603)
+_ALLOWED_SEED_SCHEDULES = (
+    FROZEN_DEVELOPMENT_SEEDS,
+    ADAMO_MATCHED_DEVELOPMENT_SEEDS,
+)
 _MAX_DATASET_BYTES = 256 * 1024 * 1024
 _HEX = frozenset("0123456789abcdef")
 _MAX_RECEIPT_NODES = 100_000
@@ -187,20 +191,43 @@ def _arm_payload(
 
 
 def run_adamo_diagnostic(
-    inputs: np.ndarray, labels: np.ndarray, *, profile: str, seed: int,
+    inputs: np.ndarray,
+    labels: np.ndarray,
+    *,
+    profile: str,
+    seed: int,
 ) -> dict[str, object]:
-    """Run all four matched arms through the current IPMNIST screening runner."""
+    """Run the public, qualification-consumed AdamO diagnostic schedule."""
+    return _run_adamo_diagnostic_schedule(
+        inputs,
+        labels,
+        profile=profile,
+        seed=seed,
+        seed_schedule=FROZEN_DEVELOPMENT_SEEDS,
+    )
+
+
+def _run_adamo_diagnostic_schedule(
+    inputs: np.ndarray,
+    labels: np.ndarray,
+    *,
+    profile: str,
+    seed: int,
+    seed_schedule: tuple[int, ...],
+) -> dict[str, object]:
+    """Run all four arms under one exact registered seed schedule."""
     if type(profile) is not str or profile not in PROFILES:
         raise ValueError("profile must name one registered AdamO diagnostic profile")
+    if (
+        type(seed_schedule) is not tuple
+        or len(seed_schedule) != len(FROZEN_DEVELOPMENT_SEEDS)
+        or any(type(value) is not int for value in seed_schedule)
+        or seed_schedule not in _ALLOWED_SEED_SCHEDULES
+    ):
+        raise ValueError("seed_schedule is not an exact registered AdamO schedule")
     resolved_seed = require_jax_seed(seed, name="seed")
-    allowed_seeds = FROZEN_DEVELOPMENT_SEEDS + ADAMO_MATCHED_DEVELOPMENT_SEEDS
-    if resolved_seed not in allowed_seeds:
-        raise ValueError("seed is not in a frozen AdamO development schedule")
-    receipt_seeds = (
-        ADAMO_MATCHED_DEVELOPMENT_SEEDS
-        if resolved_seed in ADAMO_MATCHED_DEVELOPMENT_SEEDS
-        else FROZEN_DEVELOPMENT_SEEDS
-    )
+    if resolved_seed not in seed_schedule:
+        raise ValueError("seed is not in the frozen, consumed development schedule")
     if type(inputs) is not np.ndarray or type(labels) is not np.ndarray:
         raise TypeError("inputs and labels must be exact numpy arrays")
     config = PROFILES[profile].config
@@ -252,7 +279,7 @@ def run_adamo_diagnostic(
         "official_parity_status": "blocked_no_author_maintained_code_located",
         "profile": profile,
         "seed": resolved_seed,
-        "frozen_development_seeds": list(receipt_seeds),
+        "frozen_development_seeds": list(seed_schedule),
         "config": asdict(config),
         "dataset": {
             "sha256": _sha256_arrays(inputs, labels),
@@ -288,7 +315,7 @@ def run_adamo_diagnostic(
         "development_only": True,
         "scientific_promotion_allowed": False,
     }
-    return validate_adamo_diagnostic(payload)
+    return validate_adamo_diagnostic(payload, seed_schedule=seed_schedule)
 
 
 def _exact_int(value: object, name: str, *, minimum: int = 0) -> int:
@@ -372,8 +399,19 @@ def _exact_object(
     return cast(dict[str, object], value)
 
 
-def validate_adamo_diagnostic(payload: object) -> dict[str, object]:
+def validate_adamo_diagnostic(
+    payload: object,
+    *,
+    seed_schedule: tuple[int, ...] = FROZEN_DEVELOPMENT_SEEDS,
+) -> dict[str, object]:
     """Fail closed on malformed, drifted, promoting, or unmatched receipts."""
+    if (
+        type(seed_schedule) is not tuple
+        or len(seed_schedule) != len(FROZEN_DEVELOPMENT_SEEDS)
+        or any(type(value) is not int for value in seed_schedule)
+        or seed_schedule not in _ALLOWED_SEED_SCHEDULES
+    ):
+        raise ValueError("seed_schedule is not an exact registered AdamO schedule")
     if type(payload) is not dict:
         raise TypeError("payload must be an exact dict")
     result = cast(dict[str, object], _bounded_exact_json(payload))
@@ -402,20 +440,14 @@ def validate_adamo_diagnostic(payload: object) -> dict[str, object]:
     if type(profile) is not str or profile not in PROFILES:
         raise ValueError("unknown profile")
     seed = _exact_int(result["seed"], "seed")
-    allowed_seeds = FROZEN_DEVELOPMENT_SEEDS + ADAMO_MATCHED_DEVELOPMENT_SEEDS
-    if seed not in allowed_seeds:
+    if seed not in seed_schedule:
         raise ValueError("seed is outside the frozen development schedule")
     frozen_seeds = result["frozen_development_seeds"]
-    expected_seeds = (
-        ADAMO_MATCHED_DEVELOPMENT_SEEDS
-        if seed in ADAMO_MATCHED_DEVELOPMENT_SEEDS
-        else FROZEN_DEVELOPMENT_SEEDS
-    )
     if (
         type(frozen_seeds) is not list
-        or len(frozen_seeds) != len(expected_seeds)
+        or len(frozen_seeds) != len(seed_schedule)
         or any(type(value) is not int for value in frozen_seeds)
-        or tuple(frozen_seeds) != expected_seeds
+        or tuple(frozen_seeds) != seed_schedule
     ):
         raise ValueError("frozen seed schedule drift")
     config = PROFILES[profile].config

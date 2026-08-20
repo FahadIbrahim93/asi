@@ -62,10 +62,11 @@ Before a scientific comparison: locate and pin official code or independently ve
 implement the exact paper dataset/task construction, architecture, initialization and full
 diagnostic definitions; qualify the missing model families; freeze a separate preregistered
 protocol and untouched seeds; and establish calibrated compute, memory, and timing gates. The
-original `15600`-`15603` schedule was consumed by executable qualification and is excluded from
-the retained matched screen. The prospectively frozen `25600`-`25603` schedule can execute only
-through `asi-adamo-matched-development` after a separate authorization review. Any exposed
-outcome consumes those seeds and can never promote a claim. The plan freezes the independently
+public `15600`-`15603` schedule was consumed by executable qualification and is excluded from
+the retained matched screen. The prospectively frozen `25600`-`25603` schedule is unavailable
+through the public diagnostic and can execute through `asi-adamo-matched-development` only after
+a separate authorization review. Any exposed outcome consumes those seeds and can never promote
+a claim. The plan freezes the independently
 reconstructable canonical IPMNIST materialization: OpenML `mnist_784` version 1 rows `0:60000`,
 float32 inputs scaled to `[-1,1]`, and int32 labels. Its input and label array hashes are
 `b8078cd833f53d89828a5e28d728517be9add34076f13fe973399f1f16381313` and
