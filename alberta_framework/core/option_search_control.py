@@ -425,6 +425,14 @@ class OptionSearchControl:
         self._config = config or OptionSearchControlConfig()
         if self._agent.config.n_options < 1:
             raise ValueError("option search control requires at least one option")
+        if (
+            type(self._agent.config.n_options) is not int
+            or self._agent.config.n_options > _MAX_BACKUP_BUDGET
+        ):
+            raise ValueError(
+                f"n_options must be an integer in [1, {_MAX_BACKUP_BUDGET}] "
+                "for option-search arange work"
+            )
         candidate_slots = self._agent.config.n_options * self._config.backup_budget
         if candidate_slots > _MAX_CANDIDATE_DIAGNOSTIC_SLOTS:
             raise ValueError(
